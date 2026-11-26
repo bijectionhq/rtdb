@@ -120,10 +120,11 @@
           ":current-time and :default-tz both reach the query")))
 
 (deftest tx-opts
+  (tu/set-log-clock! #inst "2022-01-01")
   (with-open [conn (open-conn)]
-    (t/is (anomalous? [:incorrect :xtdb/invalid-tx-option]
-                      (xt/execute-tx conn [[:put-docs :docs {:xt/id :foo}]] {:system-time #inst "2021-06-01"}))
-          ":system-time is refused: the store assigns it")
+    (t/is (= (serde/->TxKey 0 (time/->instant #inst "2021-06-01"))
+             (xt/execute-tx conn [[:put-docs :docs {:xt/id :foo}]] {:system-time #inst "2021-06-01"}))
+          ":system-time is honoured")
 
     (t/is (anomalous? [:unsupported :xtdb.flight-sql/metadata-unsupported]
                       (xt/execute-tx conn [[:put-docs :docs {:xt/id :bar}]] {:metadata {:foo "bar"}}))

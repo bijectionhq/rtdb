@@ -15,14 +15,18 @@ def automatic (maximum : Int) (previous : Option Int) (clock : Int) : Option Int
     else some clock
   | none => some clock
 
+-- A supplied time must be strictly later than its predecessor's and no later than the clock.
+def admitsSupplied (previous : Option Int) (clock requested : Int) : Bool :=
+  (match previous with
+   | some floor => decide (floor < requested)
+   | none => true) && decide (requested ≤ clock)
+
 def chosen (maximum : Int) (previous : Option Int) : Request → Option Int
   | .automatic clock => automatic maximum previous clock
   | .catalog clock => automatic maximum previous clock
   | .explicit clock requested =>
     (automatic maximum previous clock).map fun fallback =>
-      match previous with
-      | some floor => if requested ≤ floor then fallback else requested
-      | none => requested
+      if admitsSupplied previous clock requested then requested else fallback
 
 def trace (maximum : Int) (previous : Option Int) : List Request → List Int
   | [] => []
@@ -50,11 +54,18 @@ theorem chosen_time_advances (selected : chosen maximum (some previous) request 
     cases fallback : automatic maximum (some previous) clock with
     | none => simp [chosen, fallback] at selected
     | some next =>
-      by_cases invalid : requested ≤ previous
-      · simp [chosen, fallback, invalid] at selected
-        exact selected ▸ automatic_advances fallback
-      · simp [chosen, fallback, invalid] at selected
+      by_cases admitted : admitsSupplied (some previous) clock requested = true
+      · simp [chosen, fallback, admitted] at selected
+        simp [admitsSupplied] at admitted
         omega
+      · simp [chosen, fallback, admitted] at selected
+        exact selected ▸ automatic_advances fallback
+
+theorem an_admitted_time_follows_its_predecessor_and_not_the_clock
+    (admitted : admitsSupplied (some previous) clock requested = true) :
+    previous < requested ∧ requested ≤ clock := by
+  simp [admitsSupplied] at admitted
+  omega
 
 theorem staged_times_increase (maximum previous : Int) (requests : List Request) :
     (previous :: trace maximum (some previous) requests).Pairwise (· < ·) := by
@@ -105,10 +116,12 @@ theorem completed_prefix_can_seed_replay (maximum : Int) (previous : Option Int)
       exact ih (some time) completeRest
 
 theorem catalog_and_explicit_refusals_use_the_same_clock :
-    trace 100 none [.explicit 1 10, .catalog 2, .explicit 2 11, .automatic 8] = [10, 11, 12, 13] := by
+    trace 100 none [.explicit 10 5, .catalog 2, .explicit 20 6, .explicit 20 7, .explicit 20 30,
+      .explicit 30 25, .automatic 8] = [5, 6, 20, 21, 22, 25, 26] := by
   decide
 
 #print axioms chosen_time_advances
+#print axioms an_admitted_time_follows_its_predecessor_and_not_the_clock
 #print axioms staged_times_increase
 #print axioms a_fresh_trace_is_ordered
 #print axioms completed_prefix_can_seed_replay

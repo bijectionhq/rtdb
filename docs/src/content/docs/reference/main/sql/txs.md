@@ -239,8 +239,9 @@ return rr.Diagram(rr.Sequence('SET', 'TRANSACTION', rr.Choice(0, ro, rw)))
 * For read-write transactions:
   * `SYSTEM_TIME` overrides the system-time of the transaction, used for an initial backfill of the database.
     It must be strictly later than the system-time of the latest completed transaction — a backfill submitting several transactions gives each its own system-time rather than sharing one.
-    A system-time that doesn't advance aborts the transaction, and the abort is recorded in `xt.txs`.
-    The aborted transaction still takes a system-time of its own, 1µs past the latest completed one, so a retry has to advance on that rather than on the instant it asked for.
+    It must also be no later than the time the log records for the transaction: a system-time can't be in the future.
+    A system-time that doesn't advance aborts the transaction with `invalid-system-time`, one in the future with `rtdb/future-system-time`, and the abort is recorded in `xt.txs`.
+    The aborted transaction still takes a system-time of its own — the log's, or 1µs past the latest completed one if the log's isn't later — so a retry has to advance on that rather than on the instant it asked for.
     Otherwise, the system-time of the transaction will be defined by the log.
   * `ASYNC` affects whether the connection will wait for the transaction to be indexed before returning from `COMMIT`.
     If not provided, it defaults to `false` - i.e. the connection will wait for the transaction to be indexed before returning.

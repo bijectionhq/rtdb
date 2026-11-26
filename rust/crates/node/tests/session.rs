@@ -391,8 +391,9 @@ async fn pinned_read_basis_retains_submicrosecond_clock_and_commit_time_stays_mi
     service.state.lock().clock = 7;
     assert_eq!(session.read_basis().await.unwrap(),basis);
     session.rollback_tx().unwrap();
-    let result = session.submit_tx(vec![operation()], AutonomousTxOptions::default()).await.unwrap();
+    let result = session.submit_tx(vec![operation()],AutonomousTxOptions { system_time: Some(Timestamp(2)),..Default::default() }).await.unwrap();
     assert_eq!(result.tx_id,TxId(1));
+    assert_eq!(service.state.lock().submissions[0].2.system_time,Some(Timestamp(2)));
 }
 
 #[tokio::test]

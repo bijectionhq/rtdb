@@ -7,7 +7,7 @@ The resolving transaction evaluates it through its ordinary asynchronous query p
 `rtdb-tx` prepares source transactions, reads current and legacy source payloads, resolves operations against an explicit partition snapshot, and emits staged commit or abort values.
 The caller owns source-log submission, leadership, replica append order, durable read-back, catalog effects, completion handles, and publication.
 The crate starts no tasks.
-The resolver assigns SQL history time. Source transaction options carry timezone, user and user metadata.
+Source transaction options carry timezone, user, user metadata and an optional backfill system time.
 
 `prepare_submission` expands literal and parameter INSERT VALUES/RECORDS and PATCH RECORDS through SQL-owned binding.
 Submission reserves temporary SQL syntax work before lexing and holds the reservation until the static plan has been consumed or discarded.

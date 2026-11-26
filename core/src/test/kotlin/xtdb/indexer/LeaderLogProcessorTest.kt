@@ -180,7 +180,7 @@ internal class LeaderLogProcessorTest : LeaderTermTest() {
     private fun sourceRecord(msgId: Long, msg: SourceMessage) = Log.Record(0, msgId, Instant.now(), msg)
 
     private fun txRecord(msgId: Long) =
-        sourceRecord(msgId, SourceMessage.Tx(ByteString.EMPTY, ZoneId.of("UTC"), null, null))
+        sourceRecord(msgId, SourceMessage.Tx(ByteString.EMPTY, null, ZoneId.of("UTC"), null, null))
 
     /** A committing external-source tx, optionally parking in [writer] while the leader's persister holds it. */
     private suspend fun LeaderLogProcessor.commitTx(writer: suspend () -> Unit = {}) =
@@ -336,6 +336,24 @@ internal class LeaderLogProcessorTest : LeaderTermTest() {
             .mapNotNull { it.message as? ReplicaMessage.ResolvedTx }.toList()
         assertEquals((0 until n).toList(), resolvedTxs.map { it.txId }, "all $n txs land, in send order")
     }
+
+    @Test
+    fun `an external writer's system time steps past its predecessor and back from the future`() =
+        runTest(timeout = 5.seconds) {
+            val lp = leaderProc(StandardTestDispatcher(testScheduler))
+
+            suspend fun commitAt(systemTime: Instant?) =
+                lp.extSrcProc!!.executeTx(null, systemTime) { TxIndexer.TxResult.Committed() }.txKey.systemTime
+
+            val upstream = Instant.parse("2020-01-01T00:00:00Z")
+            assertEquals(upstream, commitAt(upstream))
+            assertEquals(upstream.plusNanos(1_000), commitAt(upstream))
+            assertEquals(upstream.plusNanos(2_000), commitAt(upstream.minusSeconds(1)))
+
+            val before = Instant.now()
+            val clamped = commitAt(before.plusSeconds(86_400))
+            assertTrue(clamped >= before && clamped <= Instant.now(), "a future time is clamped to now: $clamped")
+        }
 
     @Test
     fun `executeTx returns only once its tx is durable`() = runTest(timeout = 5.seconds) {

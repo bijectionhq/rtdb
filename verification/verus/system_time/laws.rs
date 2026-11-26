@@ -1,4 +1,4 @@
-use crate::production::{acceptance_relative_time, accepts_clock_lineage, clock_slot_admits, next_grid_reading, owned_deadline_is_live, owned_point_matches, original_funded_seat, advances, automatic_time};
+use crate::production::{acceptance_relative_time, accepts_clock_lineage, clock_slot_admits, next_grid_reading, owned_deadline_is_live, owned_point_matches, original_funded_seat, advances, automatic_time, admits_supplied_time, external_time};
 use vstd::prelude::*;
 
 verus! {
@@ -43,6 +43,55 @@ pub fn a_stalled_clock_advances_one_tick(previous: i64, candidate: i64)
 pub fn the_maximum_cannot_be_advanced(candidate: i64) {
     let assigned = automatic_time(Some(i64::MAX), candidate);
     assert(assigned.is_none());
+}
+
+// LAW TIME-SUPPLIED-STRICT. A supplied time that does not follow its predecessor's is refused.
+pub fn a_supplied_time_must_follow_its_predecessor(previous: i64, candidate: i64, now: i64)
+    requires candidate <= previous,
+{
+    let admitted = admits_supplied_time(Some(previous), candidate, now);
+    assert(!admitted);
+}
+
+// LAW TIME-SUPPLIED-FUTURE. A supplied time cannot lead now.
+pub fn a_supplied_time_cannot_lead_now(previous: Option<i64>, candidate: i64, now: i64)
+    requires now < candidate,
+{
+    let admitted = admits_supplied_time(previous, candidate, now);
+    assert(!admitted);
+}
+
+// LAW TIME-SUPPLIED-BACKFILL. A backfill time that advances and does not lead now is used unchanged.
+pub fn a_backfill_time_is_used_unchanged(previous: i64, candidate: i64, now: i64)
+    requires previous < candidate, candidate <= now,
+{
+    let admitted = admits_supplied_time(Some(previous), candidate, now);
+    let assigned = external_time(Some(previous), Some(candidate), now);
+    assert(admitted && assigned == Some(candidate));
+}
+
+// LAW TIME-EXTERNAL-MONOTONIC. An external source's time is stepped rather than refused, and always advances.
+pub fn every_external_time_advances(previous: i64, supplied: Option<i64>, now: i64) {
+    let assigned = external_time(Some(previous), supplied, now);
+    if let Some(time) = assigned {
+        assert(previous < time);
+    }
+}
+
+// LAW TIME-EXTERNAL-TIE. A tied external time advances one tick.
+pub fn a_tied_external_time_steps_one_tick(previous: i64, now: i64)
+    requires previous < now,
+{
+    let assigned = external_time(Some(previous), Some(previous), now);
+    assert(assigned == Some((previous + 1) as i64));
+}
+
+// LAW TIME-EXTERNAL-FUTURE. A future external time is brought back to now.
+pub fn a_future_external_time_is_brought_back_to_now(previous: i64, candidate: i64, now: i64)
+    requires previous < now, now < candidate,
+{
+    let assigned = external_time(Some(previous), Some(candidate), now);
+    assert(assigned == Some(now));
 }
 
 pub fn a_proposal_slot_checks_the_observation_independently_of_append() {

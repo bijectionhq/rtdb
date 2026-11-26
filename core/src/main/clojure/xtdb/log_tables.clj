@@ -66,7 +66,8 @@
      (let [^SourceMessage$Tx tx msg]
        {:type :tx
         :default-tz (str (.getDefaultTz tx))
-        :user (.getUser tx)})
+        :user (.getUser tx)
+        :system-time (.getSystemTime tx)})
 
      SourceMessage$FlushBlock
      {:type :flush-block

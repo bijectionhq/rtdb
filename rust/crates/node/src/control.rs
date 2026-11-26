@@ -418,6 +418,7 @@ async fn evaluate_transaction_settings(options: &TransactionOptions, parameters:
             clock_time: clock_update(options.clock_time.as_ref(), &eval).await?, await_token: update_string(options.await_token.as_ref(), &eval, "Transaction token").await?,
         })),
         Some(ControlAccessOptions::ReadWrite(options)) => Some(AccessSettings::ReadWrite(ReadWriteSettings {
+            system_time: update(options.system_time.as_ref(), &eval, instant).await?,
             user_metadata: update(options.metadata.as_ref(), &eval, |value| match value { Value::Null | Value::Undefined => Ok(None), value => UserMetadata::new(value, memory).map(Some) }).await?,
             asynchronous: update(options.asynchronous.as_ref(), &eval, |value| match value { Value::Null | Value::Undefined => Ok(None), Value::Bool(value) => Ok(Some(value)), _ => Err(invalid("ASYNC requires a boolean")) }).await?,
         })),

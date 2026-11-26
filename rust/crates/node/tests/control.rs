@@ -17,6 +17,16 @@ async fn retained_control_cast_uses_each_execution_timezone() {
 }
 
 #[tokio::test]
+async fn xtdb_transaction_options_resolve_timezone_before_system_time_even_when_listed_last() {
+    let ControlStatement::Begin(options) = parse("BEGIN READ WRITE WITH (SYSTEM_TIME TIMESTAMP '2024-01-01 00:00:00', TIMEZONE 'America/New_York')") else { panic!() };
+    let memory = MemoryBudget::new(1_000_000);
+    let allocation = rtdb_expr::EvaluationScope::new(&memory).unwrap();
+    let settings = transaction_settings(&options, &[], "UTC", "UTC", Timestamp(0), &memory, &allocation, None).await.unwrap();
+    let Some(AccessSettings::ReadWrite(settings)) = settings.access else { panic!() };
+    assert!(matches!(settings.system_time, OptionUpdate::Set(Timestamp(1_704_085_200_000_000))));
+}
+
+#[tokio::test]
 async fn write_metadata_resolves_timezone_even_when_listed_last() {
     let ControlStatement::Begin(options) = parse("BEGIN READ WRITE WITH (METADATA {sample: CAST(TIMESTAMP '2024-01-01 00:00:00' AS TIMESTAMPTZ)}, TIMEZONE 'America/New_York')") else { panic!() };
     let memory = MemoryBudget::new(1_000_000);

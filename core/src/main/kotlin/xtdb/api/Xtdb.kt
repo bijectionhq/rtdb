@@ -1077,7 +1077,7 @@ interface Xtdb : DataSource, AdbcDatabase, AutoCloseable {
 
                 is TxOptions.ReadWrite -> (tx.phase as? Writing).let { w ->
                     Writing(
-                        w?.systemTime,
+                        mode.systemTime.resolve(w?.systemTime) { coerceInstant(literal(it), tz) },
                         mode.userMetadata.resolve(w?.userMetadata) { literal(it) as Map<*, *>? },
                         mode.async.resolve(w?.async) { literal(it) as Boolean? } ?: false
                     )

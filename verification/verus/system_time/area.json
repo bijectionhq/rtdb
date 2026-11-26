@@ -1,5 +1,5 @@
 {
-  "summary": "The resolver assigns strictly advancing system time, smoothing a stalled clock one tick past its predecessor; ordered clock slots and receipts bind their original readings.",
+  "summary": "The resolver assigns strictly advancing system time, smoothing a stalled clock one tick past its predecessor; a supplied time is admitted only strictly after its predecessor and no later than now, refused on the source log and stepped for an external source; ordered clock slots and receipts bind their original readings.",
   "flags": [
     "--no-external-by-default",
     "--verify-module",
@@ -92,6 +92,11 @@
       ],
       "expect": [
         {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "function": "external_time",
+          "category": "postcondition not satisfied"
+        },
+        {
           "file": "verification/verus/system_time/laws.rs",
           "function": "every_automatic_assignment_advances",
           "category": "assertion failed"
@@ -145,6 +150,16 @@
         }
       ],
       "expect": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "function": "admits_supplied_time",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "function": "external_time",
+          "category": "postcondition not satisfied"
+        },
         {
           "file": "verification/verus/system_time/laws.rs",
           "function": "every_automatic_assignment_advances",
@@ -303,6 +318,67 @@
           "category": "postcondition not satisfied"
         }
       ]
+    },
+    "admit_an_equal_supplied_time": {
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "find": "    advances(previous, candidate) && candidate <= now\n",
+          "replace": "    (advances(previous, candidate) || previous == Some(candidate)) && candidate <= now\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "function": "admits_supplied_time",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 7
+    },
+    "admit_an_equal_supplied_time_with_weakened_contract": {
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "find": "    advances(previous, candidate) && candidate <= now\n",
+          "replace": "    (advances(previous, candidate) || previous == Some(candidate)) && candidate <= now\n"
+        },
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "find": "        Some(last) => last < candidate,\n        None => true,\n    } && candidate <= now),",
+          "replace": "        Some(last) => last <= candidate,\n        None => true,\n    } && candidate <= now),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "function": "external_time",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "verification/verus/system_time/laws.rs",
+          "function": "a_supplied_time_must_follow_its_predecessor",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 7
+    },
+    "admit_a_future_supplied_time": {
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "find": "    advances(previous, candidate) && candidate <= now\n",
+          "replace": "    advances(previous, candidate)\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "function": "admits_supplied_time",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 7
     }
   }
 }

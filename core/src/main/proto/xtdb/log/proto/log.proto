@@ -26,8 +26,7 @@ message SourceLogMessage {
 
 message Tx {
     bytes tx_ops = 1;
-    reserved 2;
-    reserved system_time_micros;
+    int64 system_time_micros = 2;
     string default_tz = 3;
     string user = 4;
     bytes user_metadata = 5;

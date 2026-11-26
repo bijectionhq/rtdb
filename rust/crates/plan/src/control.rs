@@ -20,6 +20,7 @@ pub struct ReadOnlyOptions<E = Expr> {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ReadWriteOptions<E = Expr> {
+    pub system_time: Option<ControlValue<E>>,
     pub metadata: Option<ControlValue<E>>,
     pub asynchronous: Option<ControlValue<E>>,
 }
@@ -40,7 +41,7 @@ impl<E> Default for ReadOnlyOptions<E> {
 }
 
 impl<E> Default for ReadWriteOptions<E> {
-    fn default() -> Self { Self { metadata: None, asynchronous: None } }
+    fn default() -> Self { Self { system_time: None, metadata: None, asynchronous: None } }
 }
 
 impl<E> Default for TransactionOptions<E> {
@@ -121,6 +122,7 @@ impl<E> TransactionOptions<E> {
                 await_token: map(options.await_token)?,
             })),
             Some(ControlAccessOptions::ReadWrite(options)) => Some(ControlAccessOptions::ReadWrite(ReadWriteOptions {
+                system_time: map(options.system_time)?,
                 metadata: map(options.metadata)?,
                 asynchronous: map(options.asynchronous)?,
             })),
@@ -162,7 +164,7 @@ impl TransactionOptions {
         let mut values = vec![self.timezone.as_ref()];
         match &self.access {
             Some(ControlAccessOptions::ReadOnly(options)) => values.extend([options.snapshot_token.as_ref(), options.snapshot_time.as_ref(), options.clock_time.as_ref(), options.await_token.as_ref()]),
-            Some(ControlAccessOptions::ReadWrite(options)) => values.extend([options.metadata.as_ref(), options.asynchronous.as_ref()]),
+            Some(ControlAccessOptions::ReadWrite(options)) => values.extend([options.system_time.as_ref(), options.metadata.as_ref(), options.asynchronous.as_ref()]),
             None => (),
         }
         values.into_iter().flatten().filter_map(|value| match value { ControlValue::Expression(expr) => Some(expr), ControlValue::Default | ControlValue::TimestampLiteral(_) => None }).collect()

@@ -283,7 +283,7 @@ impl ControlParser<'_> {
             } else {
                 let mut name = self.identifier()?.normalized();
                 if name == "time" { self.expect("ZONE")?; name = "timezone".into(); }
-                if !["timezone", "snapshot_token", "snapshot_time", "clock_time", "await_token", "metadata", "async"].contains(&name.as_str()) {
+                if !["timezone", "snapshot_token", "snapshot_time", "clock_time", "await_token", "system_time", "metadata", "async"].contains(&name.as_str()) {
                     return Err(self.error(format!("Unknown transaction option: {name}")));
                 }
                 let value = self.option_value(name == "async")?;
@@ -306,7 +306,7 @@ impl ControlParser<'_> {
                 snapshot_token: values.remove("snapshot_token"), snapshot_time: values.remove("snapshot_time"), clock_time: values.remove("clock_time"), await_token: values.remove("await_token"),
             })),
             Some(AccessMode::ReadWrite) => Some(ControlAccessOptions::ReadWrite(ReadWriteOptions {
-                metadata: values.remove("metadata"), asynchronous: values.remove("async"),
+                system_time: values.remove("system_time"), metadata: values.remove("metadata"), asynchronous: values.remove("async"),
             })),
             None => None,
         };

@@ -14,7 +14,7 @@ fn sql_parser_begin_with_preserves_defaults_parameters_and_access_specific_optio
     assert!(matches!(options.await_token, Some(ControlValue::Expression(Expr::Parameter { index: 2, .. }))));
     assert!(options.snapshot_time.is_none());
     assert!(parse_control("BEGIN READ ONLY, SYSTEM_TIME '2024-01-01'", &Default::default()).is_err());
-    assert!(parse_control("BEGIN READ WRITE WITH (SYSTEM_TIME = TIMESTAMP '2024-01-01')", &Default::default()).is_err());
+    assert!(parse_control("BEGIN SYSTEM_TIME '2024-01-01'", &Default::default()).is_err());
 }
 
 #[test]
@@ -26,8 +26,8 @@ fn bijection_at_is_a_session_control() {
 
 #[test]
 fn sql_parser_start_transaction_and_set_transaction_share_characteristics() {
-    let ControlStatement::Begin(begin) = parse("START TRANSACTION READ WRITE, METADATA ?, ASYNC TRUE, TIMEZONE DEFAULT") else { panic!() };
-    let ControlStatement::SetTransaction(set) = parse("SET TRANSACTION READ WRITE, METADATA ?, ASYNC TRUE, TIMEZONE DEFAULT") else { panic!() };
+    let ControlStatement::Begin(begin) = parse("START TRANSACTION SYSTEM_TIME ?, READ WRITE, ASYNC TRUE, TIMEZONE DEFAULT") else { panic!() };
+    let ControlStatement::SetTransaction(set) = parse("SET TRANSACTION SYSTEM_TIME ?, READ WRITE, ASYNC TRUE, TIMEZONE DEFAULT") else { panic!() };
     assert_eq!(begin, set);
     assert_eq!(parse("COMMIT ASYNC"), ControlStatement::Commit(Some(ControlCommitMode::Async)));
     assert_eq!(parse("COMMIT SYNC"), ControlStatement::Commit(Some(ControlCommitMode::Sync)));

@@ -13,8 +13,11 @@ import xtdb.log.proto.sourceLogMessage
 import xtdb.log.proto.triesAdded
 import xtdb.log.proto.tx
 import xtdb.storage.StorageEpoch
+import xtdb.time.InstantUtil
+import xtdb.time.InstantUtil.asMicros
 import xtdb.trie.BlockIndex
 import java.nio.ByteBuffer
+import java.time.Instant
 import java.time.ZoneId
 
 sealed interface SourceMessage {
@@ -74,6 +77,7 @@ sealed interface SourceMessage {
                             SourceLogMessage.MessageCase.TX -> msg.tx.let {
                                 Tx(
                                     txOps = it.txOps,
+                                    systemTime = if (it.hasSystemTimeMicros()) InstantUtil.fromMicros(it.systemTimeMicros) else null,
                                     defaultTz = ZoneId.of(it.defaultTz),
                                     user = if (it.hasUser()) it.user else null,
                                     userMetadata = if (it.userMetadata.isEmpty) null else it.userMetadata,
@@ -89,6 +93,7 @@ sealed interface SourceMessage {
 
     data class Tx(
         val txOps: ByteString,
+        val systemTime: Instant?,
         val defaultTz: ZoneId,
         val user: String?,
         val userMetadata: ByteString?,
@@ -97,6 +102,7 @@ sealed interface SourceMessage {
         override fun toLogMessage() = sourceLogMessage {
             tx = tx {
                 txOps = this@Tx.txOps
+                this@Tx.systemTime?.let { systemTimeMicros = it.asMicros }
                 defaultTz = this@Tx.defaultTz.id
                 this@Tx.user?.let { user = it }
                 this@Tx.userMetadata?.let { userMetadata = it }
@@ -107,6 +113,7 @@ sealed interface SourceMessage {
         override fun equals(other: Any?): Boolean =
             this === other || (other is Tx
                 && txOps == other.txOps
+                && systemTime == other.systemTime
                 && defaultTz == other.defaultTz
                 && user == other.user
                 && userMetadata == other.userMetadata
@@ -114,6 +121,7 @@ sealed interface SourceMessage {
 
         override fun hashCode(): Int {
             var result = txOps.hashCode()
+            result = 31 * result + (systemTime?.hashCode() ?: 0)
             result = 31 * result + defaultTz.hashCode()
             result = 31 * result + (user?.hashCode() ?: 0)
             result = 31 * result + (userMetadata?.hashCode() ?: 0)

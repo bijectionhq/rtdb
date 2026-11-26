@@ -241,6 +241,7 @@ fn source_message(message: Option<&SourceMessage>, render: bool) -> (&'static st
             ("type", ":tx".into()),
             ("default-tz", edn::quoted(tx.default_tz.as_deref().unwrap_or("UTC"))),
             ("user", tx.user.as_deref().map_or("nil".into(), edn::quoted)),
+            ("system-time", tx.system_time_micros.map_or("nil".into(), edn::instant)),
         ]))),
         Some(SourceMessage::Protobuf(SourceBody::FlushBlock(block))) => ("flush-block", render.then(|| edn::map([
             ("type", ":flush-block".into()), ("expected-block-idx", block.expected_block_idx.unwrap_or_default().to_string()),

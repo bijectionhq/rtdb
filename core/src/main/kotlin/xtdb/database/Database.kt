@@ -176,12 +176,10 @@ class Database(
                 mapOf("db-name" to name)
             )
 
-        if (opts.systemTime != null)
-            throw Incorrect("System time is assigned by the store", "xtdb/invalid-tx-option")
-
         val defaultTz = checkNotNull(opts.defaultTz) { "missing defaultTz" }
         val txMsg = SourceMessage.Tx(
             txOps = ops.toArrowBytes(allocator),
+            systemTime = opts.systemTime,
             defaultTz = defaultTz,
             user = opts.user,
             userMetadata = opts.userMetadata?.let { serializeUserMetadata(allocator, it) }

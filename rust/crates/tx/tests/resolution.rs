@@ -97,6 +97,55 @@ async fn ordinary_sql_asserts_the_ordered_ceiling_and_places_offsets_from_the_sa
 }
 
 #[tokio::test]
+async fn a_supplied_system_time_commits_only_strictly_after_its_predecessor_and_not_ahead_of_the_log() {
+    use rtdb_format::envelope::SourceMessage;
+
+    let context = context();
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let at = |time| {
+        let source = SourceTransaction::new(vec![put(&context, time, 0, i64::MAX)], SubmitOptions { system_time: Some(Timestamp(time)), ..Default::default() }, &context.memory).unwrap();
+        let encoded = source.encode().unwrap();
+        SourceTransaction::decode(&SourceMessage::decode(encoded.as_slice()).unwrap().unwrap(), &context.memory).unwrap()
+    };
+    for (position, appended, requested, outcome, system_time) in [
+        (0, 100, 50, None, 50),
+        (1, 100, 60, None, 60),
+        (2, 100, 60, Some("invalid-system-time"), 100),
+        (3, 150, 99, Some("invalid-system-time"), 150),
+        (4, 200, 201, Some("rtdb/future-system-time"), 200),
+        (5, 250, 250, None, 250),
+    ] {
+        let resolved = resolver.resolve_source(state.value().snapshot(), SourcePosition(position), Timestamp(appended), at(requested), &context).await.unwrap();
+        assert_eq!(resolved.result().error().map(|error| error.code.as_str()), outcome, "position {position}");
+        assert_eq!(resolved.result().tx_key().system_time, Timestamp(system_time), "position {position}");
+        assert_eq!(resolved.writes().tables().contains_key(&table()), outcome.is_none(), "position {position}");
+        state.apply(resolved.writes()).unwrap();
+        resolver.take_head().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn an_external_writer_time_steps_past_its_predecessor_and_back_from_the_future() {
+    struct Commit;
+    #[async_trait::async_trait]
+    impl TransactionWriter for Commit {
+        async fn write(&mut self, _: &mut OpenTransaction<'_>) -> Result<WriterResult> { Ok(WriterResult::Committed { user_metadata: None }) }
+    }
+
+    let context = context();
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    for (now, requested, system_time) in [(100, Some(50), 50), (100, Some(50), 51), (100, Some(40), 52), (100, Some(500), 100), (200, None, 200)] {
+        let resolved = resolver.resolve_external(state.value().snapshot(), Timestamp(now), requested.map(Timestamp), None, &mut Commit, &context).await.unwrap();
+        assert!(resolved.result().committed(), "{:?}", resolved.result());
+        assert_eq!(resolved.result().tx_key().system_time, Timestamp(system_time));
+        state.apply(resolved.writes()).unwrap();
+        resolver.take_head().unwrap();
+    }
+}
+
+#[tokio::test]
 async fn sql_source_replay_keeps_unreached_parameter_cells_in_arrow() {
     use arrow_array::{Int64Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};

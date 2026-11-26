@@ -190,3 +190,4 @@ The `!Docs` indexer halts on any record it can't index, such as one with an unus
 #### System time
 
 The system time of each row is the timestamp of the Kafka record, so ensure the topic carries meaningful timestamps — for example by setting `message.timestamp.type=LogAppendTime` on the topic, or by having producers set an explicit timestamp.
+An upstream timestamp that is in the future, or that doesn't follow the previous transaction's system time, isn't refused: XTDB takes the earlier of it and its own clock, moved 1µs past the previous transaction's system time where needed.

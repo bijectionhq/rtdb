@@ -87,6 +87,7 @@ pub struct ReadOnlySettings {
 
 #[derive(Clone, Debug, Default)]
 pub struct ReadWriteSettings {
+    pub system_time: OptionUpdate<Timestamp>,
     pub user_metadata: OptionUpdate<UserMetadata>,
     pub asynchronous: OptionUpdate<bool>,
 }
@@ -133,6 +134,7 @@ impl LastSubmittedTx {
 pub struct AutonomousTxOptions {
     pub database: Option<String>,
     pub default_timezone: Option<String>,
+    pub system_time: Option<Timestamp>,
     pub user_metadata: Option<UserMetadata>,
 }
 
@@ -146,6 +148,7 @@ struct ReadOptions {
 
 #[derive(Clone, Debug, Default)]
 struct WriteOptions {
+    system_time: Option<Timestamp>,
     user_metadata: Option<UserMetadata>,
     asynchronous: bool,
 }
@@ -489,7 +492,7 @@ impl Session {
             Some(AccessSettings::ReadWrite(settings)) => {
                 let old = match &tx.phase { Phase::Writing { options, .. } => options.clone(), _ => WriteOptions::default() };
                 Some(Phase::Writing { buffer: DmlBuffer::default(), options: WriteOptions {
-                    user_metadata: settings.user_metadata.apply(&old.user_metadata),
+                    system_time: settings.system_time.apply(&old.system_time), user_metadata: settings.user_metadata.apply(&old.user_metadata),
                     asynchronous: settings.asynchronous.apply(&Some(old.asynchronous)).unwrap_or(false),
                 } })
             }
@@ -716,7 +719,7 @@ impl Session {
         let timezone = rtdb_expr::normalize_timezone(options.default_timezone.as_deref().unwrap_or(&self.timezone))?;
         let database = options.database.unwrap_or_else(|| self.database.to_string());
         rtdb_types::boxed_with(self, |this| this.submit_to(database, operations,
-            SubmitOptions { default_tz: timezone, user: None, user_metadata: options.user_metadata }, mode, Submission::Ordinary)).await
+            SubmitOptions { default_tz: timezone, system_time: options.system_time, user: None, user_metadata: options.user_metadata }, mode, Submission::Ordinary)).await
     }
     pub async fn submit_tx(&mut self, operations: Vec<TxOp>, options: AutonomousTxOptions) -> Result<SubmittedTx> {
         match self.autonomous(operations, options, CommitMode::Async).await? {
@@ -779,7 +782,7 @@ impl Session {
         let mode = mode.unwrap_or(if options.asynchronous { CommitMode::Async } else { CommitMode::Sync });
         let (operations, reservations): (Vec<_>, Vec<_>) = buffer.operations.into_iter().map(|entry| (entry.operation, entry._reservation)).unzip();
         let result = self.submit_to(self.database.to_string(), operations, SubmitOptions {
-            default_tz: tx.timezone.to_string(),
+            default_tz: tx.timezone.to_string(), system_time: options.system_time,
             user: None, user_metadata: options.user_metadata,
         }, mode, replay.map_or(Submission::Ordinary, Submission::Replay)).await;
         drop(reservations);

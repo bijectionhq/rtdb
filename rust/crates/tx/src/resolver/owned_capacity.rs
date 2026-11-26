@@ -416,6 +416,12 @@ impl OpenTransaction<'_> {
         {
             return Err(unavailable());
         }
+        if self.options.system_time.is_some() {
+            return Err(Anomaly::incorrect(
+                "rtdb.owned/supplied-system-time",
+                "Hosted capacity publication takes the resolver's system time",
+            ));
+        }
         let context = self.context.query_context(
             self.buffer.base_snapshot(), self.tx_key().system_time, &self.options.default_tz, self.trace_parent,
         )?;

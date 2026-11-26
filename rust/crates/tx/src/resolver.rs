@@ -359,6 +359,7 @@ impl TxResolver {
         let base = self.resolving_snapshot(durable)?;
         let has_owned_operations = request.operations.iter().any(Operation::is_owned);
         let default_time = self.smooth(log_time)?;
+        let supplied_time = self.supplied_time(request.options.system_time, log_time, TxId(position.0))?;
         let attempt = request.placed_attempt(position)?;
         let decision = match &context.decision_clock {
             Some(clock) => Some(clock.observe().await?),
@@ -376,7 +377,7 @@ impl TxResolver {
                 count += usize::from(is_slot);
                 !is_slot
             });
-            if count != 1 || request.guard.is_some()
+            if count != 1 || request.options.system_time.is_some() || request.guard.is_some()
                 || request.idempotency_key().is_some() || attempt.is_none()
                 || attempt.map(PlacedAttempt::scope) != context.owned_witness_scope
                 || !request.operations.iter().any(|operation| matches!(operation,
@@ -400,7 +401,7 @@ impl TxResolver {
         }).transpose();
         let key = TransactionKey {
             tx_id: TxId(position.0),
-            system_time: default_time,
+            system_time: supplied_time.as_ref().ok().copied().flatten().unwrap_or(default_time),
         };
         let slot_reading = slot_time.as_ref().ok().copied().flatten();
         let terms_time = slot_reading.unwrap_or(key.system_time);
@@ -409,7 +410,7 @@ impl TxResolver {
         ));
         let placed_periods = request.guard.is_none() && request.idempotency_key().is_none()
             && attempt.map(PlacedAttempt::scope) == context.owned_witness_scope;
-        let placement = if slot_time.is_ok() {
+        let placement = if supplied_time.is_ok() && slot_time.is_ok() {
             request.place_owned_periods(acceptance_relative, placed_periods)
                 .and_then(|()| request.place_proposal_keys(terms_time, placed_periods))
         } else {
@@ -452,7 +453,7 @@ impl TxResolver {
         let mut constraint_failed = false;
         let mut prepared_writes = None;
         let mut settled = false;
-        let outcome = if let Some(error) = slot_time.err().or(placement.err()).or(plan_error).or(retry_error) {
+        let outcome = if let Some(error) = supplied_time.err().or(slot_time.err()).or(placement.err()).or(plan_error).or(retry_error) {
             Err(error)
         } else if has_owned_operations && matches!(request.guard, Some(SourceGuard::Bounded(_))) {
             Err(Anomaly::incorrect("rtdb/idempotency-owned-scope", "Bounded application retry metadata is supported on ordinary transactions"))
@@ -464,7 +465,7 @@ impl TxResolver {
             || request.guard.is_some() || request.idempotency_key().is_some()) {
             Err(Anomaly::incorrect("rtdb.owned/staging-deadline", "A staging deadline requires a fresh placed source attempt"))
         } else if let Some(generation) = request.prepared_landing.take() {
-            if request.guard.is_some() || request.options.user_metadata.is_some() {
+            if request.guard.is_some() || request.options.user_metadata.is_some() || request.options.system_time.is_some() {
                 return Err(Anomaly::fault("rtdb.owned/prepared-generation", "A prepared generation carried unsupported transaction options"));
             }
             if primary.iter().any(|operation| matches!(operation,
@@ -628,7 +629,9 @@ impl TxResolver {
         let durable = rtdb_query::retain_catalog_snapshot(durable, &context.storage).await?;
         let base = self.resolving_snapshot(durable)?;
         let id = self.resolved_head().map_or(-1, |key| key.tx_id.0).checked_add(1).ok_or_else(overflow)?;
-        let key = TransactionKey { tx_id: TxId(id), system_time: self.smooth(system_time.map_or(now, |time| Timestamp(time.0.min(now.0))))? };
+        let system_time = crate::system_time::external_time(self.previous_system_time(), system_time.map(|time| time.0), now.0)
+            .map(Timestamp).ok_or_else(|| Anomaly::incorrect("xtdb/time-overflow", "Timestamp has no following chronon"))?;
+        let key = TransactionKey { tx_id: TxId(id), system_time };
         let options = SubmitOptions { default_tz: context.default_tz.clone(), ..SubmitOptions::default() };
         let mut tx = OpenTransaction::new(base.clone(), key, &options, context)?;
         let (result, metadata) = match writer.write(&mut tx).await? {
@@ -671,6 +674,22 @@ impl TxResolver {
 
     pub fn prepared_publication_key(&self, position: SourcePosition, appended: Timestamp) -> Result<TransactionKey> {
         Ok(TransactionKey { tx_id: TxId(position.0), system_time: self.smooth(appended)? })
+    }
+
+    /// A supplied system time must be strictly later than the predecessor's and no later than the log's append time; otherwise the transaction aborts.
+    fn supplied_time(&self, requested: Option<Timestamp>, appended: Timestamp, tx_id: TxId) -> Result<std::result::Result<Option<Timestamp>, Anomaly>> {
+        let Some(requested) = requested else { return Ok(Ok(None)) };
+        if crate::system_time::admits_supplied_time(self.previous_system_time(), requested.0, appended.0) {
+            return Ok(Ok(Some(requested)));
+        }
+        let error = match self.resolved_head() {
+            Some(head) if !crate::system_time::advances(Some(head.system_time.0), requested.0) =>
+                Anomaly::incorrect("invalid-system-time", "specified system-time must be later than current tx")
+                    .with_context("latest-completed-tx", tx_key_context(head)?),
+            _ => Anomaly::incorrect("rtdb/future-system-time", "specified system-time is later than the source-log timestamp")
+                .with_context("log-time", transit::to_json_value(&T::instant(appended.into())?)?),
+        };
+        Ok(Err(error.with_context("tx-key", tx_key_context(TransactionKey { tx_id, system_time: requested })?)))
     }
 
     fn smooth(&self, candidate: Timestamp) -> Result<Timestamp> {

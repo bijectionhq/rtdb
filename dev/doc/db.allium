@@ -417,8 +417,9 @@ value ExternalSourceToken {
 value TransactionKey {
     -- tx_id is the increasing commit-order position, assigned by the source log or off the RESOLVED head for an external-source database.
     -- system_time is the strictly increasing projection used by temporal SQL.
-    -- A client transaction carries no system_time of its own: the resolver projects it from the append observation.
+    -- Without a supplied system time the resolver projects it from the append observation.
     -- That projection advances by a chronon when an observed clock ties or regresses.
+    -- A supplied system time is used unchanged or aborts the transaction; see AdmitSuppliedSystemTime.
     -- Native source outcomes retain the unmodified append observation in xt.txs.source_log_time.
     -- Strictness is what lets a read basis name a transaction by its system_time — see snapshot_token.
     tx_id: Integer
@@ -625,6 +626,8 @@ variant TxMessage : SourceMessage {
     -- An existing marker can resolve the duplicate before operation execution.
     -- Execution of the assertion aborts the transaction before any user operation.
     -- A document union leg retains columns in their first encounter order across document operations for the same table and mutation kind.
+    -- system_time is the caller's requested system time, for an initial backfill; see AdmitSuppliedSystemTime.
+    system_time: Timestamp?
     default_tz: ZoneId               -- always present
     user: String?
     user_metadata: Bytes?
@@ -1175,6 +1178,7 @@ rule ClientSubmitsTransaction {
 
     ensures:
         let msg = TxMessage.created(
+            system_time: opts.system_time,
             default_tz: opts.default_tz,
             user: opts.user,
             user_metadata: opts.user_metadata
@@ -1216,7 +1220,11 @@ rule LeaderProcessesTx {
     ensures:
         -- Resolve and stage on the resolver's queue, advancing the RESOLVED head.
         -- An aborted transaction is staged too, and still consumes a tx_id (live-index.allium, AbortTransaction).
-        -- The resolver assigns system time from the source append observation, smoothed one tick past the preceding transaction's when it does not exceed it.
+        -- Without a supplied system time, the resolver assigns system time from the source append observation, smoothed one tick past the preceding transaction's when it does not exceed it.
+        -- A supplied system time that AdmitSuppliedSystemTime admits becomes the transaction's system time unchanged.
+        -- One it refuses aborts the transaction before any operation is evaluated, under the system time it would have had without one.
+        -- The abort is incorrect: invalid-system-time when the time does not follow the preceding transaction's, rtdb/future-system-time when it follows the append observation.
+        -- A supplied system time is refused on a clock-slot, prepared-landing or hosted-capacity transaction.
         -- A version-one bounded application retry carries an exclusive cutoff and a nonce in a dedicated source field.
         -- Its engine advances the stored retry clock by the maximum of the preceding retry clock and the current bounded request's log timestamp.
         -- An elapsed identity cannot become admissible after a clock regression or after removal of its aged-out receipt.
@@ -1717,7 +1725,8 @@ rule ExternalSourceIndexesTx {
     -- It may await the result or not; the indexing below is identical either way, and the difference is caller-side.
     --
     -- Unlike a client-driven transaction, tx_id here is assigned off the RESOLVED head, not off a source-log position and not off the durable head.
-    -- system_time is smoothed strictly greater than the previous transaction's.
+    -- A system_time that AdmitSuppliedSystemTime admits against the resolver's clock is used unchanged.
+    -- Any other is stepped rather than refused: the earlier of it and the clock, smoothed strictly greater than the previous transaction's.
     --
     -- The caller's handle completes on READ-BACK (LeaderAppliesOwnTx), so it means durably replicated AND confirmed unfenced.
     -- Every path on which the transaction will never be applied MUST fail it instead, or the caller waits forever — see live-index.allium.
@@ -2339,12 +2348,19 @@ surface QueryAccess {
 
 ---- Deferred Specifications
 
+deferred AdmitSuppliedSystemTime
+  -- The one admission rule for a caller-supplied system time, shared by the source log and an external source.
+  -- A supplied time is admitted when it is strictly later than the resolved head's system time and no later than now.
+  -- For a source-log transaction, now is the record's append observation; for an external source, the resolver's clock.
+  -- Strictness is what lets a read basis name a transaction by its system time, so a backfill that submits several transactions gives each its own.
+  -- The two paths differ only in what follows a refusal: a source-log transaction aborts, an external source's time is stepped.
+
 deferred ResolveTx
   -- Resolve a source-log transaction — the put, delete and erase logic — stage it on the resolver's queue and advance the RESOLVED head.
   -- Covers the legacy payload form too.
   -- See: live-index.allium CommitTransaction / AbortTransaction
 deferred ResolveExternalSourceTx
-  -- Assign the next tx_id off the RESOLVED head, smooth the system time strictly greater than the previous transaction's, run the caller's writer against a fresh transaction, and stage the result with the caller's durability handle.
+  -- Assign the next tx_id off the RESOLVED head, admit or step the system time as ExternalSourceIndexesTx states, run the caller's writer against a fresh transaction, and stage the result with the caller's durability handle.
   -- See: live-index.allium CommitTransaction
 deferred ResolveDbOp
   -- Resolve an attach or detach as a transaction carrying the database operation, for the catalog to be brought into line with when the record is read back.

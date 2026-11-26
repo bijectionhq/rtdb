@@ -30,6 +30,42 @@ pub(crate) fn automatic_time(previous: Option<i64>, candidate: i64) -> Option<i6
     }
 }
 
+/// A supplied system time is admitted only when it advances the history and does not run ahead of now.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (match previous {
+        Some(last) => last < candidate,
+        None => true,
+    } && candidate <= now),
+))]
+pub(crate) fn admits_supplied_time(previous: Option<i64>, candidate: i64, now: i64) -> bool {
+    advances(previous, candidate) && candidate <= now
+}
+
+/// An external writer's time: its supplied time when admitted, otherwise the
+/// earlier of that time and now, stepped past the predecessor.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == match supplied {
+        Some(candidate) if match previous { Some(last) => last < candidate, None => true } && candidate <= now =>
+            Some(candidate),
+        Some(candidate) => match previous {
+            Some(last) if (if candidate < now { candidate } else { now }) <= last =>
+                if last < i64::MAX { Some((last + 1) as i64) } else { None },
+            _ => Some(if candidate < now { candidate } else { now }),
+        },
+        None => match previous {
+            Some(last) if now <= last => if last < i64::MAX { Some((last + 1) as i64) } else { None },
+            _ => Some(now),
+        },
+    },
+))]
+pub(crate) fn external_time(previous: Option<i64>, supplied: Option<i64>, now: i64) -> Option<i64> {
+    match supplied {
+        Some(candidate) if admits_supplied_time(previous, candidate, now) => Some(candidate),
+        Some(candidate) => automatic_time(previous, if candidate < now { candidate } else { now }),
+        None => automatic_time(previous, now),
+    }
+}
+
 const CLOCK_SLOT_WIDTH: i64 = 1_000_000;
 const CLOCK_SLOT_LEAD: i64 = 500_000;
 

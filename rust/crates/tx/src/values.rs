@@ -1842,11 +1842,12 @@ impl TxOp {
 #[derive(Clone, Debug)]
 pub struct SubmitOptions {
     pub default_tz: String,
+    pub system_time: Option<Timestamp>,
     pub user: Option<String>,
     pub user_metadata: Option<UserMetadata>,
 }
 impl Default for SubmitOptions {
-    fn default() -> Self { Self { default_tz: "UTC".into(), user: None, user_metadata: None } }
+    fn default() -> Self { Self { default_tz: "UTC".into(), system_time: None, user: None, user_metadata: None } }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

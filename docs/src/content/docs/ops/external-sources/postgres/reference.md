@@ -114,6 +114,8 @@ The system time of rows depends on the phase of the Postgres External Source.
 | Snapshot | XTDB's internal system time (i.e. it is unrelated to the upstream Postgres' system clock) |
 | Streaming | The timestamp of the Postgres transaction (the timestamp on the `commit` message) |
 
+An upstream timestamp that is in the future, or that doesn't follow the previous transaction's system time, isn't refused: XTDB takes the earlier of it and its own clock, moved 1µs past the previous transaction's system time where needed.
+
 
 ## Surviving a Postgres failover
 

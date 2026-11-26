@@ -1136,17 +1136,25 @@ class FlightSqlAdbcTest {
         cookieAwareClient().also { it.setSessionOptions(catalogOpt("xtdb"), *emptyCallOpts) }
 
     @Test
-    fun `SET TRANSACTION with SYSTEM_TIME is refused because the store assigns system time`() {
+    fun `SET TRANSACTION with SYSTEM_TIME backfills at the requested system-time`() {
         sessionClient().use { client ->
             val txn = client.beginTransaction(*emptyCallOpts)
-            val ex = assertThrows(FlightRuntimeException::class.java) {
-                client.executeUpdate(
-                    "SET TRANSACTION READ WRITE, SYSTEM_TIME = TIMESTAMP '2021-08-03T00:00:00Z'", txn, *emptyCallOpts
-                )
-            }
-            assertEquals(FlightStatusCode.INVALID_ARGUMENT, ex.status().code())
-            client.rollback(txn, *emptyCallOpts)
+            client.executeUpdate(
+                "SET TRANSACTION READ WRITE, SYSTEM_TIME = TIMESTAMP '2021-08-03T00:00:00Z'", txn, *emptyCallOpts
+            )
+            client.executeUpdate("INSERT INTO docs RECORDS {_id: 1, v: 'backfill'}", txn, *emptyCallOpts)
+            client.commit(txn, *emptyCallOpts)
         }
+
+        assertEquals(
+            listOf(
+                mapOf(
+                    "_id" to 1L, "v" to "backfill",
+                    "_system_from" to ZonedDateTime.parse("2021-08-03T00:00Z[UTC]")
+                )
+            ),
+            fsqlClient.execute("SELECT _id, v, _system_from FROM docs", *emptyCallOpts).readRows()
+        )
     }
 
     @Test
@@ -1230,14 +1238,14 @@ class FlightSqlAdbcTest {
     fun `a statement with no result set sent as a query runs in the Flight SQL transaction it names`() {
         sessionClient().use { client ->
             val txn = client.beginTransaction(*emptyCallOpts)
-            client.execute("SET TRANSACTION READ WRITE, METADATA = {source: 'mobile-app'}", txn, *emptyCallOpts)
+            client.execute("SET TRANSACTION READ WRITE, SYSTEM_TIME = TIMESTAMP '2021-08-03T00:00:00Z'", txn, *emptyCallOpts)
             client.execute("INSERT INTO docs RECORDS {_id: 1}", txn, *emptyCallOpts)
             client.commit(txn, *emptyCallOpts)
         }
 
         assertEquals(
-            listOf(mapOf("source" to "mobile-app")),
-            fsqlClient.execute("SELECT (user_metadata).source AS source FROM xt.txs", *emptyCallOpts).readRows()
+            listOf(mapOf("_id" to 1L, "_system_from" to ZonedDateTime.parse("2021-08-03T00:00Z[UTC]"))),
+            fsqlClient.execute("SELECT _id, _system_from FROM docs", *emptyCallOpts).readRows()
         )
     }
 

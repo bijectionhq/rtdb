@@ -4884,6 +4884,63 @@ async fn a_private_replay_marker_covers_out_of_order_samples_and_survives_restar
 }
 
 #[tokio::test]
+async fn a_backfill_commits_at_each_supplied_system_time_and_refuses_one_not_strictly_later_or_ahead_of_the_log() {
+    let (node, driver) = running(options(), services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let at = |time| AutonomousTxOptions { system_time: Some(Timestamp(time)), ..Default::default() };
+    let first = session.state_mut().execute_tx(vec![put(&node, 1, 10)], at(100)).await.unwrap();
+    assert!(first.committed(), "{:?}", first.error());
+    assert_eq!(first.tx_key().system_time, Timestamp(100));
+
+    let token = session.state().cancellation().child_token();
+    let parse = |sql| rtdb_sql::parse_control(sql, &Default::default()).unwrap().unwrap();
+    session.execute_control(&parse("BEGIN READ WRITE WITH (SYSTEM_TIME TIMESTAMP '1970-01-01T00:00:00.0002Z')"), &[], &token).await.unwrap();
+    session.state_mut().execute_operation(TxOp::Sql { sql: "INSERT INTO docs (_id, value) VALUES (1, 20)".into(), args: None }).await.unwrap();
+    let CommitResult::Executed(second) = session.state_mut().commit_tx(None).await.unwrap() else { panic!("expected a synchronous commit") };
+    assert!(second.committed(), "{:?}", second.error());
+    assert_eq!(second.tx_key().system_time, Timestamp(200));
+
+    for (requested, code) in [(200, "invalid-system-time"), (150, "invalid-system-time"), (i64::MAX / 2, "rtdb/future-system-time")] {
+        let refused = session.state_mut().execute_tx(vec![put(&node, 1, requested)], at(requested)).await.unwrap();
+        assert_eq!(refused.error().map(|error| error.code.as_str()), Some(code), "{requested}");
+        assert!(refused.tx_key().system_time.0 > 200 && refused.tx_key().system_time.0 < i64::MAX / 2);
+    }
+    assert_eq!(rows(session.query_sql("SELECT value FROM docs", vec![]).await.unwrap()).await, [vec![Value::I64(20)]]);
+    let between = "SELECT value FROM docs FOR SYSTEM_TIME AS OF TIMESTAMP '1970-01-01T00:00:00.00015Z'";
+    assert_eq!(rows(session.query_sql(between, vec![]).await.unwrap()).await, [vec![Value::I64(10)]]);
+    drop(session);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
+async fn a_keyed_transaction_rejected_before_its_duplicate_guard_keeps_its_error() {
+    let (node, driver) = running(options(), services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let metadata = rtdb_tx::UserMetadata::new(Value::Struct(StructFields::from([
+        ("idempotency_key".into(), Value::Utf8("order-1".into())),
+    ])), node.memory()).unwrap();
+    let original = session.state_mut().execute_tx(vec![put(&node, 1, 10)], AutonomousTxOptions {
+        user_metadata: Some(metadata.clone()),
+        ..AutonomousTxOptions::default()
+    }).await.unwrap();
+    assert!(original.committed());
+    let retry = session.state_mut().submit_tx(vec![put(&node, 2, 20)], AutonomousTxOptions {
+        system_time: Some(original.tx_key().system_time),
+        user_metadata: Some(metadata),
+        ..AutonomousTxOptions::default()
+    }).await.unwrap();
+    let cancellation = CancellationToken::new();
+    let result = node.await_transaction("xtdb", retry.tx_id, &Authority, &cancellation).await.unwrap();
+    assert_eq!(result.error().map(|error| error.code.as_str()), Some("invalid-system-time"));
+    assert!(session.state_mut().execute_tx(vec![put(&node, 3, 30)], AutonomousTxOptions::default()).await.unwrap().committed());
+    let delayed = node.await_transaction("xtdb", retry.tx_id, &Authority, &cancellation).await.unwrap();
+    assert_eq!(delayed.error().map(|error| error.code.as_str()), Some("invalid-system-time"));
+    assert_eq!(delayed.tx_key(), result.tx_key());
+    drop(session);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn a_command_resent_under_its_session_key_on_a_new_session_writes_nothing_again() {
     let (node, driver) = running(options(), services()).await;
     let command = |key: &'static str, ids: [i64; 2]| {
