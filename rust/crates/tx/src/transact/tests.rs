@@ -299,7 +299,7 @@ fn claim_guards_detect_writes_to_rows_and_both_sides_of_index_moves() {
     let range = Verified(evidence(1, [ClaimRegion::IndexRange {
         table: table(), index: "by_key".into(), lower: Some(b"a".to_vec()), upper: Some(b"c".to_vec()),
     }]));
-    let mut validation = request(5, Vec::new());
+    let mut validation = request(9, Vec::new());
     validation.guards.push(Guard::Unchanged(Claim::from_bytes(Vec::new())));
     assert_eq!(validation.claims().count(), 1);
     let outcome = |state: &TransactState, claim: &Verified| {
