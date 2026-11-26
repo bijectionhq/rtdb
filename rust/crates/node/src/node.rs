@@ -195,10 +195,28 @@ impl OutcomeQuery {
 /// `closed` answers the per-request check without taking the cancellation token's lock, which every session would share.
 struct NodeRun {
     token: CancellationToken,
+    /// Children of `token` that query contexts take their owner cancellation from, spread over threads so that opening and
+    /// dropping contexts does not serialize on `token` itself.
+    owners: Box<[CancellationToken]>,
     closed: std::sync::atomic::AtomicBool,
 }
 
+const QUERY_OWNER_SHARDS: usize = 16;
+static NEXT_QUERY_OWNER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 impl NodeRun {
+    fn new() -> Self {
+        let token = CancellationToken::new();
+        let owners = (0..QUERY_OWNER_SHARDS).map(|_| token.child_token()).collect();
+        Self { token, owners, closed: Default::default() }
+    }
+
+    /// Cancelled exactly when `token` is.
+    fn query_owner(&self) -> &CancellationToken {
+        thread_local! { static SHARD: usize = NEXT_QUERY_OWNER.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        &self.owners[SHARD.with(|shard| *shard) % self.owners.len()]
+    }
+
     fn end(&self) {
         self.closed.store(true, std::sync::atomic::Ordering::Release);
         self.token.cancel();
@@ -306,7 +324,7 @@ impl Node {
         let (commands, receiver) = mpsc::channel(factory.options.command_capacity);
         let placement_slots = catalog.is_placed().then(|| Arc::new(Semaphore::new(MAXIMUM_PLACED_OPENS)));
         let shared_plans = Arc::new(rtdb_query::SharedPlans::new(&factory.memory));
-        let node = Self { catalog, factory, commands, run: Arc::new(NodeRun { token: CancellationToken::new(), closed: Default::default() }), runtime, read_fence, scan_fragmenter, placement_slots,
+        let node = Self { catalog, factory, commands, run: Arc::new(NodeRun::new()), runtime, read_fence, scan_fragmenter, placement_slots,
             sql_snapshots: Arc::default(), outcome_queries: Default::default(), shared_plans };
         node.sql_snapshots.start(node.run.token.clone());
         let mut initial = Vec::new();
@@ -756,7 +774,7 @@ impl Node {
             CatalogReadCut::HostedApplied { memory, .. } => Arc::clone(memory),
             _ => self.factory.options.query.query_memory(&self.factory.memory),
         };
-        let context = QueryContext::with_owner(catalog, memory, basis.current_time, basis.timezone.clone(), self.factory.options.query.clone(), cancellation, &self.run.token)?
+        let context = QueryContext::with_owner(catalog, memory, basis.current_time, basis.timezone.clone(), self.factory.options.query.clone(), cancellation, self.run.query_owner())?
             .with_shared_plans(Arc::clone(&self.shared_plans));
         let context = if audience { context } else { context.with_accelerators(Arc::clone(&self.factory.accelerators)) };
         context
@@ -877,7 +895,7 @@ impl Node {
         let snapshots = BTreeMap::from([(database.name().to_owned(), DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(&database.storage) })]);
         let mut catalog = CatalogSnapshot::new(database.name(), snapshots, false)?;
         if let Some(lease) = &lease { catalog = catalog.with_read_lease(Arc::clone(lease)); }
-        let context = QueryContext::with_owner(catalog, Arc::clone(&self.factory.memory), self.query_instant(), fragment.timezone.clone(), self.factory.options.query.clone(), cancellation, &self.run.token)?;
+        let context = QueryContext::with_owner(catalog, Arc::clone(&self.factory.memory), self.query_instant(), fragment.timezone.clone(), self.factory.options.query.clone(), cancellation, self.run.query_owner())?;
         rtdb_storage::IoRegion::leased(lease, rtdb_query::evaluate_fragment_with_arguments(context, fragment, arguments)).await
     }
 
@@ -4808,3 +4826,26 @@ fn receipt_checkpoint_behind(database: &str) -> Anomaly {
     Anomaly::new(AnomalyCategory::Unavailable, "rtdb/checkpoint-behind", format!("This checkpoint of {database} does not cover the await token"))
 }
 fn timeout_error() -> Anomaly { Anomaly::new(AnomalyCategory::Unavailable, "xtdb/await-tx-timeout", "Timed out awaiting indexed progress") }
+
+#[cfg(test)]
+mod query_owner_tests {
+    use super::*;
+
+    #[test]
+    fn query_owners_are_cancelled_exactly_when_the_node_run_ends() {
+        let run = NodeRun::new();
+        let child = run.query_owner().child_token();
+        std::thread::scope(|scope| {
+            for _ in 0..2 * QUERY_OWNER_SHARDS {
+                scope.spawn(|| assert!(run.owners.iter().any(|owner| std::ptr::eq(owner, run.query_owner()))));
+            }
+        });
+        assert!(!child.is_cancelled());
+        assert!(run.owners.iter().all(|owner| !owner.is_cancelled()));
+        run.end();
+        assert!(run.ended());
+        assert!(child.is_cancelled());
+        assert!(run.owners.iter().all(CancellationToken::is_cancelled));
+        assert!(run.query_owner().child_token().is_cancelled());
+    }
+}
