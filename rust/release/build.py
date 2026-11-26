@@ -240,7 +240,7 @@ def build(args):
         raise ValueError("release packaging requires a clean source checkout")
     if git(REPOSITORY, "status", "--porcelain", "--untracked-files=all"):
         raise ValueError("release driver requires a clean implementation checkout")
-    driver_inputs = capture_driver_inputs(REPOSITORY, [Path(__file__).resolve(), HERE / "matrix.json", HERE / "Dockerfile", HERE / "default.yaml", HERE / "cluster-default.yaml", HERE / "cluster-multi.yaml",
+    driver_inputs = capture_driver_inputs(REPOSITORY, [Path(__file__).resolve(), HERE / "matrix.json", HERE / "Dockerfile", HERE / "default.yaml", HERE / "default-var-lib-rtdb.yaml", HERE / "entrypoint.sh", HERE / "cluster-default.yaml", HERE / "cluster-multi.yaml",
         HERE.parent / "conformance/run_controls.py", HERE.parent / "conformance/run_clients.py", HERE.parent / "conformance/client_results.py"])
     input_digests = {item["path"]: item["sha256"] for item in driver_inputs["files"]}
     matrix = json.loads((HERE / "matrix.json").read_bytes())

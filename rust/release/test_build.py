@@ -278,5 +278,24 @@ class ReleaseSelectionTests(unittest.TestCase):
             self.assertFalse(any(name.startswith("remove-artifact") for name, _ in commands.calls))
 
 
+
+class DefaultImageConfigurationTests(unittest.TestCase):
+    def test_the_earlier_data_path_configuration_differs_from_the_default_only_in_its_paths(self):
+        default = (HERE / "default.yaml").read_text()
+        earlier = (HERE / "default-var-lib-rtdb.yaml").read_text()
+        self.assertIn("/var/lib/xtdb/log", default)
+        self.assertIn("/var/lib/xtdb/buffers", default)
+        self.assertEqual(default.replace("/var/lib/xtdb/buffers", "/var/lib/rtdb/storage").replace("/var/lib/xtdb/", "/var/lib/rtdb/"), earlier)
+
+    def test_the_image_declares_upstreams_volume_and_serves_through_the_path_choosing_entrypoint(self):
+        dockerfile = (HERE / "Dockerfile").read_text()
+        self.assertIn("VOLUME /var/lib/xtdb\n", dockerfile)
+        self.assertNotIn("VOLUME /var/lib/rtdb", dockerfile)
+        self.assertIn('ENTRYPOINT ["/usr/local/bin/rtdb-entrypoint"]', dockerfile)
+        entrypoint = (HERE / "entrypoint.sh").read_text()
+        self.assertIn("/etc/rtdb/config-var-lib-rtdb.yaml", entrypoint)
+        self.assertTrue(entrypoint.rstrip().endswith('exec /usr/local/bin/rtdb "$@"'))
+
+
 if __name__ == "__main__":
     unittest.main()

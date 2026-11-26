@@ -1,7 +1,7 @@
 log: !Local
-  path: /var/lib/rtdb/log
+  path: /var/lib/xtdb/log
 storage: !Local
-  path: /var/lib/rtdb/storage
+  path: /var/lib/xtdb/buffers
 server:
   host: 0.0.0.0
   port: 5432

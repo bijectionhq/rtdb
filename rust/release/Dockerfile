@@ -41,7 +41,7 @@ RUN . /etc/os-release && test "$VERSION_CODENAME" = bookworm \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 20000 rtdb \
     && useradd --uid 20000 --gid rtdb --create-home --shell /usr/sbin/nologin rtdb \
-    && install -d -o rtdb -g rtdb /var/lib/rtdb
+    && install -d -o rtdb -g rtdb /var/lib/rtdb /var/lib/xtdb
 
 ARG RTDB_REVISION
 ARG RTDB_VERSION
@@ -87,13 +87,16 @@ COPY --from=build /source/rust/target/release/librtdb_ffi.so /usr/local/lib/libr
 COPY --from=build /source/rust/target/release/librtdb_ffi.a /usr/local/lib/librtdb_ffi.a
 COPY rust/crates/ffi/include/rtdb.h /usr/local/include/rtdb.h
 COPY rust/release/default.yaml /etc/rtdb/config.yaml
+COPY rust/release/default-var-lib-rtdb.yaml /etc/rtdb/config-var-lib-rtdb.yaml
+COPY --chmod=0555 rust/release/entrypoint.sh /usr/local/bin/rtdb-entrypoint
 COPY rust/release/cluster-default.yaml rust/release/cluster-multi.yaml /etc/rtdb/
 ENV LD_PRELOAD=libjemalloc.so.2
 ENV MALLOC_CONF=background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0
 USER rtdb
+WORKDIR /var/lib/xtdb
 EXPOSE 5432 3000 8080
-VOLUME /var/lib/rtdb
+VOLUME /var/lib/xtdb
 HEALTHCHECK --start-period=15s --timeout=3s \
     CMD wget -q --spider http://localhost:8080/healthz/alive || exit 1
-ENTRYPOINT ["/usr/local/bin/rtdb"]
+ENTRYPOINT ["/usr/local/bin/rtdb-entrypoint"]
 CMD ["node", "--file", "/etc/rtdb/config.yaml"]

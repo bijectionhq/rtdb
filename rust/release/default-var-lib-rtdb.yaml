@@ -1,0 +1,13 @@
+log: !Local
+  path: /var/lib/rtdb/log
+storage: !Local
+  path: /var/lib/rtdb/storage
+server:
+  host: 0.0.0.0
+  port: 5432
+flightSql:
+  host: 0.0.0.0
+  port: 3000
+healthz:
+  host: 0.0.0.0
+  port: 8080
