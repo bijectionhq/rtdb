@@ -284,6 +284,7 @@ impl RunningNode {
                 failure.get_or_insert(error);
             }
         }
+        self.agent.drop_subscriptions();
         self.storage_regions.close();
         if tokio::time::timeout(Duration::from_secs(10), self.storage_regions.wait()).await.is_err() {
             failure.get_or_insert_with(|| Anomaly::new(

@@ -345,6 +345,8 @@ impl NodeAgent {
     /// The deployments this node has open as snapshots.
     pub fn subscribed_snapshots(&self) -> Vec<String> { self.subscriptions.lock().iter().filter(|(_, subscription)| matches!(subscription.role, Role::Snapshot(_))).map(|(name, _)| name.clone()).collect() }
     pub fn subscribed(&self) -> Vec<String> { self.subscriptions.lock().keys().cloned().collect() }
+    /// Drops every subscription, and the checkpoint catalog hold a snapshot subscription keeps open with it.
+    pub(crate) fn drop_subscriptions(&self) { self.subscriptions.lock().clear(); }
     /// The fragments this node has read for other nodes, as (deployment, `schema.table`, prefix) with how often.
     pub fn fragments_read(&self) -> BTreeMap<(String, String, String), u64> { self.fragments_read.lock().clone() }
 
