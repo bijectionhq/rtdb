@@ -135,8 +135,8 @@ The transaction buffer positions every staged event (`EventPosition { transactio
 * A hosted observation admits a head that ties the present at a later position.
 * Already position-exact: the live stage's commit-position check (`validate_append`), compaction's row heap (`(iid, system_from, position order, ...)`; an erase's same-time grouping only places rows conservatively), owned change edges (`ChangeEdgeOrder::Publication`; a time projection refuses an unexamined tie), and exact publication reads (`with_owned_transaction_cut`).
 * As-of reads stay time reads: a world clock reading at system time `T`, an accepted held group at `T` and the classic Changes cursor read the state after every transaction stamped at or before `T`, ties included, and never name one transaction.
-
-Remaining: a historical (as-of time) world fork with no positioned basis still matches a checkpoint by its system time (`matches_fork_checkpoint`), so a checkpoint between two tied transactions could be selected. The historical session should resolve its cut to the last position at or before its time.
+* Every world fork cut names its basis by position, a historical (as-of time) one included: a historical hold's cut is the publication its session selected (`OwnedReadSession::historical_publication`), and `OwnedForkCut::positioned_basis` always answers a `TransactionKey`, whose system time is only a coordinate (`OwnedForkCut::basis`).
+  Checkpoints, suffix captures and suffix pins match it by position (`matches_fork_checkpoint`, `copy_fork_suffix`, `OwnedForkCut::matches_basis`, the agent's `SuffixCut`), so a checkpoint between two tied transactions is never selected.
 
 == Verification obligations (T7)
 

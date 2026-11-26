@@ -5492,10 +5492,7 @@ impl Service {
             previous.snapshot.check().map_err(status)?;
             if ((previous.world.as_bytes() == world) == sibling) || (if proposal_hold { previous.snapshot.clock_mode() != rtdb_types::WorldClockMode::Proposal }
                     else { previous.snapshot.clock_mode().is_writable() })
-                || (!renewal && cut.positioned_basis().map_or_else(
-                    || previous.snapshot.parent_basis().system_time >= cut.basis(),
-                    |basis| previous.snapshot.parent_basis().tx_id >= basis.tx_id,
-                ))
+                || (!renewal && previous.snapshot.parent_basis().tx_id >= cut.positioned_basis().tx_id)
                 || previous.snapshot.parent_pin().0 == *pin
             {
                 return Err(Status::failed_precondition("The original retained world cannot select this cut"));

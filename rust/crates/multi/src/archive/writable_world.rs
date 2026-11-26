@@ -115,10 +115,7 @@ fn checkpoint_source_tx(source: &DeploymentRecord, checkpoint: rtdb_directory::C
 fn matches_fork_checkpoint(
     source: &DeploymentRecord, cut: &rtdb_node::OwnedForkCut, checkpoint: rtdb_directory::Checkpoint,
 ) -> bool {
-    match cut.positioned_basis() {
-        Some(basis) => checkpoint_source_tx(source, checkpoint) == Some(basis.tx_id),
-        None => checkpoint.system_time == cut.basis().0,
-    }
+    checkpoint_source_tx(source, checkpoint) == Some(cut.positioned_basis().tx_id)
 }
 
 async fn copy_published_fork_input(
@@ -182,10 +179,7 @@ async fn copy_fork_suffix(
         base.archive == binding && base.media_bound && base.manifest_sha256.is_some()
             && base.checkpoint.root_sha256.is_some() && base.incarnation == source.incarnation
             && base.log_epoch == source.log_epoch
-            && (match cut.positioned_basis() {
-                Some(basis) => checkpoint_source_tx(source, base.checkpoint).is_some_and(|position| position < basis.tx_id),
-                None => base.checkpoint.system_time < cut.basis().0,
-            })
+            && checkpoint_source_tx(source, base.checkpoint).is_some_and(|position| position < cut.positioned_basis().tx_id)
             && restore_binding.is_none_or(|binding| base.world_replay == Some(binding))
             && require_capture_open(source, **capture).is_ok()
             && crate::hosted_recovery::capture_replay_start(source, base).is_ok()
@@ -245,7 +239,7 @@ pub(crate) async fn prepare_checkpoint_world_overlay(
     let (original, _charge) = live.world_registration(world).await?.filter(|(original, _)| {
         original.pin == pin && !original.dropped && matches_retention(original, retained)
     }).ok_or_else(unavailable)?;
-    let publication = cut.positioned_basis()
+    let publication = Some(cut.positioned_basis())
         .filter(|publication| publication.tx_id > original.basis.tx_id && original.basis.at_or_before(*publication))
         .ok_or_else(unavailable)?;
     if cut.until() <= now() { return Err(unavailable()); }
@@ -502,7 +496,7 @@ pub(crate) async fn retain_replayed_checkpoint_world(
         let suffix = archived.suffix.map(Uuid::from_bytes).ok_or_else(unavailable)?;
         let capture = Uuid::from_bytes(archived.capture);
         let (selected, _) = held.replayed_parent_cut(binding, original.publication, scope).await?;
-        let publication = selected.positioned_basis().ok_or_else(unavailable)?;
+        let publication = selected.positioned_basis();
         if floor.tx_id >= publication.tx_id || !floor.at_or_before(publication)
             || !publication.at_or_before(archived.basis)
             || (publication == archived.basis) != (original.publication == original.basis)
@@ -858,7 +852,7 @@ pub(crate) async fn fork_checkpoint_world_selected(
     ) {
         return Err(OwnedWorld::unavailable());
     }
-    let expected_basis = expected_basis.or(fork.cut.positioned_basis());
+    let expected_basis = expected_basis.or(Some(fork.cut.positioned_basis()));
     let live = session.open_owned_read().await?;
     let predecessor = if let Some(pin) = fork.previous.filter(|_| renewal) {
         let world = fork.sibling.unwrap_or(fork.world);

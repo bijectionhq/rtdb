@@ -36,17 +36,11 @@ enum SuffixCut<'a> {
 }
 
 impl SuffixCut<'_> {
-    fn time(&self) -> rtdb_types::Timestamp {
+    /// The cut's transaction, by position: a held cut always names one (T7).
+    fn position(&self) -> TxId {
         match self {
-            Self::Tip(key) => key.system_time,
-            Self::HeldPublication(cut, ..) => cut.basis(),
-        }
-    }
-
-    fn position(&self) -> Option<TxId> {
-        match self {
-            Self::Tip(key) => Some(key.tx_id),
-            Self::HeldPublication(cut, ..) => cut.positioned_basis().map(|basis| basis.tx_id),
+            Self::Tip(key) => key.tx_id,
+            Self::HeldPublication(cut, ..) => cut.positioned_basis().tx_id,
         }
     }
 
@@ -1095,12 +1089,9 @@ impl NodeAgent {
                 && archived.log_epoch == record.log_epoch && archived.checkpoint.root_sha256.is_some()
             ).ok_or_else(unavailable)?;
             let checkpoint = archived.checkpoint;
-            let precedes = match cutoff.position() {
-                Some(position) => rtdb_types::SourcePosition::from_epoch_offset(
-                    StorageEpoch(record.log_epoch), checkpoint.source,
-                )?.0 < position.0,
-                None => checkpoint.system_time < cutoff.time().0,
-            };
+            let precedes = rtdb_types::SourcePosition::from_epoch_offset(
+                StorageEpoch(record.log_epoch), checkpoint.source,
+            )?.0 < cutoff.position().0;
             if checkpoint.boundary < 0 || !precedes
                 || record.replica_anchor.as_ref().is_some_and(|anchor| anchor.root_incarnation != record.incarnation)
                 || capture_replay_start(record, archived).is_err()
@@ -1145,9 +1136,7 @@ impl NodeAgent {
             && applied.tx_key.is_some_and(|head| {
                 match &cutoff {
                     SuffixCut::Tip(basis) => head == *basis,
-                    SuffixCut::HeldPublication(..) => cutoff.position().map_or_else(
-                        || head.system_time >= cutoff.time(), |position| head.tx_id >= position,
-                    ),
+                    SuffixCut::HeldPublication(..) => head.tx_id >= cutoff.position(),
                 }
             })
         ).ok_or_else(unavailable)?;

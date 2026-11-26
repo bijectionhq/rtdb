@@ -1785,8 +1785,8 @@ impl OwnedReadSession {
             root_point: None,
             public_root: false,
             exact_retained: false,
-            basis: self.system_time(),
             live: self.historical.is_none().then_some(self.present),
+            held: self.historical_publication().unwrap_or(self.present),
             issued_on: self.present,
             publication: None,
             retained_world: None,
@@ -1817,7 +1817,6 @@ impl OwnedReadSession {
             .await?.filter(|publication| publication.tx_id <= head.tx_id && publication.system_time <= head.system_time)
             .ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
         self.check()?;
-        cut.basis = publication.system_time;
         cut.publication = Some(publication);
         Ok(cut)
     }
@@ -1837,7 +1836,6 @@ impl OwnedReadSession {
             return Err(unavailable());
         }
         self.check()?;
-        cut.basis = publication.system_time;
         cut.publication = Some(publication);
         cut.public_root = true;
         Ok(cut)
@@ -1850,7 +1848,7 @@ impl OwnedReadSession {
         &self, scope: rtdb_types::PlacedAttemptScope, requested: TransactionKey, mode: WorldClockRequest,
     ) -> Result<OwnedForkCut> {
         let mut cut = self.fork_publication_cut(scope).await?;
-        if requested.system_time > cut.basis() || requested.tx_id > cut.issued_on.tx_id {
+        if !requested.at_or_before(cut.positioned_basis()) {
             return Err(rtdb_types::OwnedWorld::unavailable());
         }
         let context = self.context.with_owned_transaction_cut(requested, &self.context.cancellation)?;
@@ -1858,7 +1856,6 @@ impl OwnedReadSession {
             .filter(|publication| *publication == requested)
             .ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
         self.check()?;
-        cut.basis = publication.system_time;
         cut.publication = Some(publication);
         cut.exact_retained = matches!(mode, WorldClockRequest::Retained);
         Ok(cut)
@@ -1888,7 +1885,6 @@ impl OwnedReadSession {
         };
         self.check_overlay_standing(world).await?;
         cut.live = None;
-        cut.basis = publication.system_time;
         cut.retained_world = Some(RetainedWorldCut::Overlay(world.id, world.pin, publication, clock));
         cut.until = cut.until.min(world.until);
         Ok(cut)
@@ -1911,7 +1907,6 @@ impl OwnedReadSession {
         }
         self.check_overlay_standing(world).await?;
         cut.live = Some(world.basis);
-        cut.basis = world.basis.system_time;
         cut.retained_world = Some(RetainedWorldCut::Parent(world.id, world.pin));
         cut.until = cut.until.min(world.until);
         Ok(cut)
@@ -1936,7 +1931,6 @@ impl OwnedReadSession {
             return Err(rtdb_types::OwnedWorld::unavailable());
         }
         cut.live = Some(predecessor);
-        cut.basis = predecessor.system_time;
         cut.renewal = true;
         Ok(cut)
     }
@@ -2029,7 +2023,6 @@ impl OwnedReadSession {
             return Err(rtdb_types::OwnedWorld::unavailable());
         }
         let mut cut = self.fork_cut(scope).await?;
-        cut.basis = destination.system_time;
         cut.live = None;
         cut.publication = Some(destination);
         Ok((cut, logical))
@@ -3539,8 +3532,10 @@ pub struct OwnedForkCut {
     root_point: Option<rtdb_types::OwnedPointVersion>,
     public_root: bool,
     exact_retained: bool,
-    basis: Timestamp,
     live: Option<TransactionKey>,
+    /// The hold's own position: the publication a historical hold selected,
+    /// else its present. A cut no other basis replaces is at it (T7).
+    held: TransactionKey,
     issued_on: TransactionKey,
     publication: Option<TransactionKey>,
     retained_world: Option<RetainedWorldCut>,
@@ -3556,16 +3551,22 @@ enum RetainedWorldCut {
 }
 
 impl OwnedForkCut {
-    pub fn basis(&self) -> Timestamp { self.basis }
+    /// The basis's system time, a coordinate of [`Self::positioned_basis`].
+    pub fn basis(&self) -> Timestamp { self.positioned_basis().system_time }
     pub fn original_root_point(&mut self, point: Option<rtdb_types::OwnedPointVersion>) {
         self.root_point = point;
     }
     pub fn live(&self) -> Option<TransactionKey> { self.live }
     pub fn is_publication(&self) -> bool { self.publication.is_some() }
-    pub fn positioned_basis(&self) -> Option<TransactionKey> {
+    /// The transaction the cut is at, named by its position: a retained
+    /// overlay's publication, else the selected publication, else the live
+    /// basis, else the hold's own position (a historical hold's selected
+    /// publication). Ties share a system time, so a cut never names its basis
+    /// by time alone (T7).
+    pub fn positioned_basis(&self) -> TransactionKey {
         match self.retained_world {
-            Some(RetainedWorldCut::Overlay(_, _, publication, _)) => Some(publication),
-            _ => self.publication.or(self.live),
+            Some(RetainedWorldCut::Overlay(_, _, publication, _)) => publication,
+            _ => self.publication.or(self.live).unwrap_or(self.held),
         }
     }
     pub fn overlay(&self) -> Option<(rtdb_types::Iid, rtdb_types::Iid, Timestamp)> {
@@ -3582,7 +3583,7 @@ impl OwnedForkCut {
     }
     pub fn is_renewal(&self) -> bool { self.renewal }
     pub fn matches_basis(&self, basis: TransactionKey) -> bool {
-        self.basis == basis.system_time && self.positioned_basis().is_none_or(|original| original == basis)
+        self.positioned_basis() == basis
             && basis.tx_id <= self.issued_on.tx_id && basis.system_time <= self.issued_on.system_time
     }
     pub fn admits_overlay(&self, media: TransactionKey, selected: TransactionKey) -> bool {
