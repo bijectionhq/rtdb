@@ -213,7 +213,7 @@ async fn a_fragment_requires_the_captured_residence_and_exact_transaction_head()
     fragmenter.enabled.store(true, Ordering::Relaxed);
     let _ = answers(&mut session).await;
     let fragment = fragmenter.last.lock().clone().unwrap();
-    node.scan_fragment(&fragment, Duration::ZERO, &CancellationToken::new()).await.unwrap();
+    let at_basis = node.scan_fragment(&fragment, Duration::ZERO, &CancellationToken::new()).await.unwrap();
     let mut other_store = fragment.clone();
     other_store.residence.as_mut().unwrap().storage = Arc::from("other-store");
     let error = node.scan_fragment(&other_store, Duration::ZERO, &CancellationToken::new()).await.unwrap_err();
@@ -232,8 +232,8 @@ async fn a_fragment_requires_the_captured_residence_and_exact_transaction_head()
     execute(&mut session, TxOp::Sql { sql: "DELETE FROM users".into(), args: None }).await;
     execute(&mut session, put(&node, "users", vec![StructFields::from([("_id".to_owned(), Value::I64(1000)), ("name".to_owned(), Value::Utf8("later".into()))])])).await;
     let _ = rows(session.query_sql("SELECT name FROM users WHERE _id = 1000", vec![]).await.unwrap()).await;
-    let error = node.scan_fragment(&fragment, Duration::ZERO, &CancellationToken::new()).await.unwrap_err();
-    assert_eq!(error.code, "rtdb.query/fragment-basis");
+    let replayed = node.scan_fragment(&fragment, Duration::ZERO, &CancellationToken::new()).await.unwrap();
+    assert!(replayed == at_basis, "the reader still holds the fragment's exact basis and answers as of it");
     stop(&node, driver).await;
 }
 
