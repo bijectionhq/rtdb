@@ -3585,6 +3585,52 @@ pub(crate) async fn predicate_selection(
     PredicateSelection::settled(BooleanArray::new(mask.finish(), None), count, reservation)
 }
 
+/// Each row's three-valued truth under the predicate, through the same evaluation tiers as `predicate_selection`,
+/// keeping unknown (null) apart from false. The charge for the truths lasts as long as the returned reservation.
+pub(crate) async fn predicate_truth(
+    batch: &ColumnBatch, predicate: &rtdb_plan::Expr, schema: &rtdb_plan::Schema, execution: &crate::context::Execution,
+) -> Result<(Vec<Option<bool>>, Arc<MemoryReservation>)> {
+    execution.context.check_cancelled()?;
+    let params = execution.parameters.evaluator();
+    let memory = &execution.context.memory;
+    let reservation = memory.reserve(batch.len.checked_mul(size_of::<Option<bool>>()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?)?;
+    let from_arrow = |values: &BooleanArray| (0..values.len()).map(|row| values.is_valid(row).then(|| values.value(row))).collect();
+    if search::shaped(predicate)
+        && let Some((Column::Arrow { array, .. }, _charge)) = search::funded_column(predicate, schema, batch, params, &execution.context)?
+        && let Some(values) = array.as_any().downcast_ref::<BooleanArray>()
+    {
+        return Ok((from_arrow(values), reservation));
+    }
+    let prepare_typed = || -> Result<()> {
+        if batch.columns.iter().any(|column| matches!(column, Column::Selected(_))) {
+            let metadata = execution.scope()?;
+            execution.prepare_expression(predicate, schema, &metadata)?;
+        }
+        Ok(())
+    };
+    if let Some(truth) = kernel::truth(predicate, schema, batch, params) {
+        prepare_typed()?;
+        return Ok((truth.into_iter().collect(), reservation));
+    }
+    if let Some(array) = crate::vector::evaluate(predicate, schema, batch, params)
+        && let Some(values) = array.as_any().downcast_ref::<BooleanArray>()
+    {
+        prepare_typed()?;
+        return Ok((from_arrow(values), reservation));
+    }
+    let metadata = execution.scope()?;
+    let invocation = execution.prepare_expression(predicate, schema, &metadata)?;
+    let scope = execution.scope()?;
+    let mut truths = Vec::with_capacity(batch.len);
+    for row in 0..batch.len {
+        let input = BatchRow { batch, row, admit_dates: false };
+        let value = execution.evaluate_invocation_row(&scope, &invocation, rtdb_expr::ExpressionRow::Borrowed(&input)).await?;
+        truths.push(if matches!(value, Value::Null | Value::Undefined) { None } else { Some(rtdb_expr::is_true(&value)?) });
+        scope.reset()?;
+    }
+    Ok((truths, reservation))
+}
+
 pub(crate) struct BatchRow<'a> { pub batch: &'a ColumnBatch, pub row: usize, pub admit_dates: bool }
 
 impl Column {

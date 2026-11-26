@@ -156,3 +156,49 @@ async fn outer_theta_keeps_projected_nonnullable_types_before_synthetic_null_row
     assert_eq!(collect(&join(left,right,JoinKind::Left,condition),&context).await.unwrap(),[vec![Value::I64(1),Value::Null]]);
     assert_eq!(context.memory.used_bytes(),0);assert_eq!(context.spill_bytes(),0);
 }
+
+fn measured(id: u32, rows: &[(i64, Option<f64>)]) -> Arc<Relation> {
+    let fields = vec![
+        Field { id: ColumnId(id), name: format!("k{id}"), qualifier: None, qualified_only: false, unnamed: false, data_type: LogicalType::Scalar(ScalarType::I64) },
+        Field { id: ColumnId(id + 1), name: format!("v{id}"), qualifier: None, qualified_only: false, unnamed: false, data_type: LogicalType::Scalar(ScalarType::F64).maybe() },
+    ];
+    let rows = rows.iter().map(|&(key, value)| vec![Expr::Literal(Value::I64(key)), Expr::Literal(value.map_or(Value::Null, Value::F64))]).collect();
+    Arc::new(Relation::new(Schema::new(fields).unwrap(), RelationNode::Values { rows }).unwrap())
+}
+
+#[tokio::test]
+async fn an_inner_join_residual_keeps_pairs_it_holds_for_and_meets_later_conjuncts_only_after_earlier_ones() {
+    let left = measured(0, &[(1, Some(1.0)), (2, Some(2.0)), (3, None), (4, Some(4.0)), (4, Some(5.0))]);
+    let right = measured(2, &[(1, Some(1.0)), (2, Some(3.0)), (3, Some(5.0)), (4, Some(4.5))]);
+    let (lk, lv) = (left.schema().fields()[0].expression(), left.schema().fields()[1].expression());
+    let (rk, rv) = (right.schema().fields()[0].expression(), right.schema().fields()[1].expression());
+    let key = Expr::binary(BinaryOp::Eq, lk, rk);
+    let differs = Expr::binary(BinaryOp::NotEq, lv.clone(), rv.clone());
+    let context = context(&CancellationToken::new());
+    let rows = collect(&join(left.clone(), right.clone(), JoinKind::Inner, Expr::binary(BinaryOp::And, key.clone(), differs.clone())), &context).await.unwrap();
+    let keys: Vec<_> = rows.iter().map(|row| (row[0].clone(), row[1].clone())).collect();
+    assert_eq!(keys, [(Value::I64(2), Value::F64(2.0)), (Value::I64(4), Value::F64(4.0)), (Value::I64(4), Value::F64(5.0))]);
+
+    let inverse = Expr::binary(BinaryOp::Gt, Expr::binary(BinaryOp::Divide, Expr::Literal(Value::F64(1.0)), Expr::binary(BinaryOp::Subtract, lv, rv)), Expr::Literal(Value::F64(0.0)));
+    let guarded = Expr::binary(BinaryOp::And, key, Expr::binary(BinaryOp::And, differs, inverse));
+    let rows = collect(&join(left, right, JoinKind::Inner, guarded), &context).await.unwrap();
+    assert_eq!(rows.iter().map(|row| row[1].clone()).collect::<Vec<_>>(), [Value::F64(5.0)], "the equal pair never meets the division");
+    assert_eq!(context.memory.used_bytes(), 0);
+}
+
+#[tokio::test]
+async fn an_inner_join_residual_is_evaluated_whole_for_every_key_matched_pair() {
+    for (left_rows, matched) in [(vec![(1, Some(1.0)), (3, None)], true), (vec![(1, Some(1.0))], true)] {
+        let left = measured(0, &left_rows);
+        let right = measured(2, &[(1, Some(1.0)), (3, Some(5.0))]);
+        let (lk, lv) = (left.schema().fields()[0].expression(), left.schema().fields()[1].expression());
+        let (rk, rv) = (right.schema().fields()[0].expression(), right.schema().fields()[1].expression());
+        let zero = Expr::binary(BinaryOp::Subtract, rk.clone(), rk.clone());
+        let divides = Expr::binary(BinaryOp::Gt, Expr::binary(BinaryOp::Divide, Expr::Literal(Value::I64(1)), zero), Expr::Literal(Value::I64(0)));
+        let condition = Expr::binary(BinaryOp::And, Expr::binary(BinaryOp::Eq, lk, rk), Expr::binary(BinaryOp::And, Expr::binary(BinaryOp::NotEq, lv, rv), divides));
+        let context = context(&CancellationToken::new());
+        let result = collect(&join(left, right, JoinKind::Inner, condition), &context).await;
+        if matched { assert_eq!(result.unwrap_err().code, "xtdb.expression/division-by-zero"); } else { assert!(result.unwrap().is_empty()); }
+        assert_eq!(context.memory.used_bytes(), 0);
+    }
+}

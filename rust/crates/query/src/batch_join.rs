@@ -39,6 +39,19 @@ enum ThetaOperand {
 
 pub(crate) struct ThetaTest { left: ThetaOperand, right: ThetaOperand, op: BinaryOp }
 
+/// Whether no value of the type can hold a date, which is all that admitting a projected input's dates changes.
+fn date_free(ty: &LogicalType) -> bool {
+    match ty {
+        LogicalType::Nothing | LogicalType::Null => true,
+        LogicalType::Scalar(ScalarType::DateDay | ScalarType::DateMilli) => false,
+        LogicalType::Scalar(_) => true,
+        LogicalType::List { element, .. } => date_free(element),
+        LogicalType::Struct(fields) => fields.values().all(date_free),
+        LogicalType::Maybe(value) | LogicalType::RunEndEncoded { value, .. } => date_free(value),
+        LogicalType::Union(legs) => legs.iter().all(date_free),
+    }
+}
+
 pub(crate) fn theta_tests(layout: &JoinLayout) -> Option<Vec<ThetaTest>> {
     fn integer(ty: &LogicalType) -> bool {
         match ty {
@@ -405,7 +418,14 @@ impl Spec {
         let mut runs = ProbeRuns::new();
         if self.theta.is_empty() && residual.is_none() {
             self.probe_arrow_keys(table, &probe, &mut build, &mut runs)?;
+        } else if let Some(predicates) = self.residual.as_ref().filter(|predicates| residual.is_some()
+            && (self.projected == [false, false] || predicates.schema.fields().iter().all(|field| date_free(&field.data_type))))
+            && self.probe_residual_columns(table, &probe, predicates, &mut build, &mut runs).await.is_ok()
+        {
         } else {
+            // The row path also reports the error a failed column-wise pass met, as it would have met it first.
+            build = JoinPositions::new();
+            runs = ProbeRuns::new();
             let equality = self.execution.scope()?;
             for row in 0..probe.len {
                 context.check_cancelled_at(row)?;
@@ -419,6 +439,85 @@ impl Spec {
         self.gather_matches(build.rows.len(), Some((&probe, runs)), |position| {
             gather_column_rows(|batch| &table.batches[batch], &build.rows, position, &context.memory)
         })
+    }
+
+    /// An inner join's residual over every key-matched pair of a probe batch at once: each conjunct is evaluated
+    /// column-wise over the pairs the earlier ones kept, so no pair meets a conjunct the row-at-a-time path would skip.
+    /// An inner join's residual over the key-matched pairs of a probe batch, column-wise, a bounded run of probe rows at a time.
+    /// As in the row path, a pair meets each conjunct until one is false; an unknown key or conjunct lets it go on,
+    /// for the later conjuncts' errors, but it never matches.
+    async fn probe_residual_columns(&self, table: &Table, probe: &ColumnBatch, residual: &Residual, build: &mut JoinPositions<(usize, usize)>, runs: &mut ProbeRuns)
+        -> Result<()> {
+        const PAIRS_PER_PASS: usize = 1 << 16;
+        let context = &self.execution.context;
+        let memory = &context.memory;
+        let equality = self.execution.scope()?;
+        let mut pairs = JoinPositions::new();
+        let mut probes = JoinPositions::new();
+        let mut known = Vec::new();
+        let mut first_row = 0;
+        for row in 0..probe.len {
+            context.check_cancelled_at(row)?;
+            let hash = self.key(probe, row, 1)?.vector_hash()?;
+            for (candidate, ordinal) in table.index.candidates(hash).enumerate() {
+                context.check_cancelled_at(candidate)?;
+                let (batch, offset) = table.position(ordinal);
+                let Some(keys) = self.residual_keys(&table.batches[batch], offset, probe, row, &equality)? else { continue; };
+                pairs.push((batch, offset), memory)?;
+                probes.push((0, row), memory)?;
+                known.push(keys);
+            }
+            if pairs.rows.len() >= PAIRS_PER_PASS || row + 1 == probe.len {
+                self.residual_pass(table, probe, residual, &pairs.rows, &probes.rows, &mut known, first_row..row + 1, build, runs).await?;
+                pairs = JoinPositions::new();
+                probes = JoinPositions::new();
+                known.clear();
+                first_row = row + 1;
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn residual_pass(&self, table: &Table, probe: &ColumnBatch, residual: &Residual, pairs: &[(usize, usize)], probes: &[(usize, usize)],
+        known: &mut [bool], rows: std::ops::Range<usize>, build: &mut JoinPositions<(usize, usize)>, runs: &mut ProbeRuns) -> Result<()> {
+        let memory = &self.execution.context.memory;
+        let index_bytes = pairs.len().checked_mul(3 * size_of::<(usize, usize)>()).ok_or_else(size_error)?;
+        let _indexes = memory.reserve(index_bytes)?;
+        let mut kept: Vec<usize> = (0..pairs.len()).collect();
+        for predicate in &residual.expressions {
+            if kept.is_empty() { break; }
+            let build_rows: Vec<(usize, usize)> = kept.iter().map(|&pair| pairs[pair]).collect();
+            let probe_rows: Vec<(usize, usize)> = kept.iter().map(|&pair| probes[pair]).collect();
+            let mut columns = Vec::with_capacity(residual.sides.len());
+            let mut charges = Vec::with_capacity(residual.sides.len());
+            for &(on_build, position) in &residual.sides {
+                let (column, charge) = if on_build {
+                    gather_column_rows(|batch| &table.batches[batch], &build_rows, position, memory)?
+                } else {
+                    gather_column_rows(|_| probe, &probe_rows, position, memory)?
+                };
+                columns.push(column);
+                charges.push(charge);
+            }
+            let pairs_batch = ColumnBatch::settled(columns, kept.len(), memory.reserve(256)?)?;
+            let (truths, _truths) = crate::columnar::predicate_truth(&pairs_batch, predicate, &residual.schema, &self.execution).await?;
+            kept = kept.into_iter().zip(truths).filter_map(|(pair, truth)| match truth {
+                Some(false) => None,
+                Some(true) => Some(pair),
+                None => { known[pair] = false; Some(pair) }
+            }).collect();
+        }
+        let mut kept = kept.into_iter().filter(|&pair| known[pair]).peekable();
+        for row in rows {
+            while let Some(&pair) = kept.peek() {
+                if probes[pair].1 != row { break; }
+                build.push(pairs[pair], memory)?;
+                kept.next();
+            }
+            runs.end_row(row, build.rows.len(), memory)?;
+        }
+        Ok(())
     }
 
     async fn probe_membership(&self, table: &Table, probe: ColumnBatch, residual: Option<&PreparedResidual<'_>>) -> Result<Option<ColumnBatch>> {
@@ -511,6 +610,21 @@ impl Spec {
 
     async fn matches_residual(&self, residual: &PreparedResidual<'_>, build: &ColumnBatch, build_row: usize,
         probe: &ColumnBatch, probe_row: usize, equality: &rtdb_expr::EvaluationScope) -> Result<bool> {
+        let Some(keys) = self.residual_keys(build, build_row, probe, probe_row, equality)? else { return Ok(false); };
+        let mut unknown = !keys;
+        let input = JoinRow { build, build_row, probe, probe_row, sides: residual.sides, admit_dates: self.projected };
+        for comparison in &residual.comparisons {
+            let scope = self.execution.scope()?;
+            let value = self.execution.evaluate_invocation_row(&scope, comparison, rtdb_expr::ExpressionRow::Borrowed(&input)).await?;
+            if matches!(value, Value::Null | Value::Undefined) { unknown = true; }
+            else if !rtdb_expr::is_true(&value)? { return Ok(false); }
+        }
+        Ok(!unknown)
+    }
+
+    /// The equality keys of a residual join's pair: `None` when a key is unequal, `Some(false)` when one is unknown.
+    fn residual_keys(&self, build: &ColumnBatch, build_row: usize, probe: &ColumnBatch, probe_row: usize, equality: &rtdb_expr::EvaluationScope)
+        -> Result<Option<bool>> {
         let memory = &self.execution.context.memory;
         let mut unknown = false;
         for ((&left, &right), &build_first) in self.build_keys.iter().zip(&self.probe_keys).zip(&self.order) {
@@ -532,16 +646,9 @@ impl Spec {
                     equal
                 }
             };
-            match equal { Some(false) => return Ok(false), None => unknown = true, Some(true) => {} }
+            match equal { Some(false) => return Ok(None), None => unknown = true, Some(true) => {} }
         }
-        let input = JoinRow { build, build_row, probe, probe_row, sides: residual.sides, admit_dates: self.projected };
-        for comparison in &residual.comparisons {
-            let scope = self.execution.scope()?;
-            let value = self.execution.evaluate_invocation_row(&scope, comparison, rtdb_expr::ExpressionRow::Borrowed(&input)).await?;
-            if matches!(value, Value::Null | Value::Undefined) { unknown = true; }
-            else if !rtdb_expr::is_true(&value)? { return Ok(false); }
-        }
-        Ok(!unknown)
+        Ok(Some(!unknown))
     }
 
     fn matches_theta(&self, build: &ColumnBatch, build_row: usize, probe: &ColumnBatch, probe_row: usize) -> Result<bool> {
