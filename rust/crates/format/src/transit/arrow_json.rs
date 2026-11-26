@@ -476,7 +476,8 @@ fn write_typed_leaf(output: &mut impl Write, cell: ArrowCell<'_>, key: bool, dep
         }
         (_, None) => {
             let Some((parameters, coefficient)) = cell.decimal_coefficient()? else { return Ok(false); };
-            let coefficient = num_bigint::BigInt::from_signed_bytes_be(&coefficient);
+            let width = usize::from(parameters.bit_width / 8);
+            let coefficient = num_bigint::BigInt::from_signed_bytes_be(&coefficient[coefficient.len() - width..]);
             let value = rtdb_types::jvm_number::decimal_parts_text(&coefficient, parameters.scale);
             quoted(output, top, |output| json(output, &format!("~f{value}")))?;
             return Ok(true);
