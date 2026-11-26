@@ -1808,10 +1808,11 @@ mod tests {
         let newer = full("~packs/b01.pack");
         let catalog = "blocks/b00.binpb";
         let table = "tables/t/blocks/b00.binpb";
-        let contents = |members: &[&str]| crate::packing::encode_pack(
-            &members.iter().map(|name| (name.to_string(), Bytes::from_static(b"metadata"))).collect(), Vec::new(), 0,
-        ).0;
-        bucket.put(&older, contents(&[catalog, table])).await.unwrap();
+        let mut members = BTreeMap::new();
+        for name in [catalog, table] {
+            members.insert(name.to_string(), cipher.seal(&ObjectKey::new(name).unwrap(), Bytes::from(vec![b'm'; 64])).await.unwrap());
+        }
+        bucket.put(&older, crate::packing::encode_pack(&members, Vec::new(), 0).0).await.unwrap();
         let successor = |sealed| crate::packing::encode_pack(
             &BTreeMap::from([("blocks/b01.binpb".into(), sealed)]), Vec::new(), 0,
         ).0;
