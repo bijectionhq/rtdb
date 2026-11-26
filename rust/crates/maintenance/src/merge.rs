@@ -913,6 +913,17 @@ mod tests {
     use rtdb_format::data::{StoredEvent, build_event_batch};
     use rtdb_types::{Iid, Value};
 
+    #[test]
+    fn a_memory_refusal_is_recognised_by_its_kind_not_its_code() {
+        let refused = MemoryBudget::new(1).reserve(2).map(drop);
+        assert_eq!(if_memory_available(refused).unwrap(), None);
+        let storage = rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Busy, "rtdb.storage/memory-limit", "full").with_kind(AnomalyKind::ResourceExhausted);
+        assert_eq!(if_memory_available::<()>(Err(storage)).unwrap(), None);
+        let code_only = rtdb_types::Anomaly::incorrect("rtdb/memory-budget-exceeded", "a code alone is not a refusal");
+        assert_eq!(if_memory_available::<()>(Err(code_only)).unwrap_err().code, "rtdb/memory-budget-exceeded");
+        assert!(MemoryBudget::new(1).try_reserve(2).is_none());
+    }
+
     struct WholeInput(bytes::Bytes);
 
     #[async_trait]
