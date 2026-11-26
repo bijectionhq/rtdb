@@ -33,7 +33,11 @@ async fn a_deposed_writer_fails_its_next_append_and_its_successor_holds_everythi
     for position in 0..10 { append(a.as_ref(), &format!("a{position}"), position).await; }
     let b = open_writer(ensemble.config("deposed"), 2, CancellationToken::new()).await.unwrap();
     assert_eq!(b.latest().unwrap(), LogOffset(9));
-    let refused = a.enqueue(Bytes::from_static(b"late"), Timestamp(10)).await.unwrap().durable().await;
+    // `a` may already have heard of the successor from its own background commit traffic, so the refusal can arrive at enqueue.
+    let refused = match a.enqueue(Bytes::from_static(b"late"), Timestamp(10)).await {
+        Ok(receipt) => receipt.durable().await.map(|_| ()),
+        Err(error) => Err(error),
+    };
     assert!(matches!(refused, Err(Error::Deposed { epoch: 1, promised: 2 })), "{refused:?}");
     let next = a.enqueue(Bytes::from_static(b"later"), Timestamp(11)).await;
     let anomaly = rtdb_types::Anomaly::from(next.err().unwrap());
