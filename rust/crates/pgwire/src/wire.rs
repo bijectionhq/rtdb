@@ -74,6 +74,19 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
     }
     pub async fn empty(&mut self, tag: u8) -> Result<()> { self.send(tag, &[]).await }
     pub async fn string(&mut self, tag: u8, text: &str) -> Result<()> { self.record(tag, text.len() + 1, |bytes| cstring(bytes, text)).await }
+    /// Writes the `CommandComplete` that `string(b'C', &format!("{command} {rows}"))` would.
+    pub async fn command_rows(&mut self, command: &str, rows: u64) -> Result<()> {
+        let digits = rows.checked_ilog10().map_or(1, |digits| digits as usize + 1);
+        self.record(b'C', command.len() + digits + 2, |bytes| {
+            if command.contains('\0') { return Err(protocol("PostgreSQL string contains a zero byte")); }
+            bytes.extend_from_slice(command.as_bytes());
+            bytes.push(b' ');
+            use std::io::Write as _;
+            write!(bytes, "{rows}").map_err(|_| protocol("Command tag is too large"))?;
+            bytes.push(0);
+            Ok(())
+        }).await
+    }
     pub async fn auth(&mut self, method: i32) -> Result<()> { self.send(b'R', &method.to_be_bytes()).await?; self.flush().await }
     pub async fn parameter(&mut self, key: &str, value: &str) -> Result<()> { self.record(b'S', key.len() + value.len() + 2, |bytes| { cstring(bytes, key)?; cstring(bytes, value) }).await?; self.flush().await }
     pub async fn gateway_await_token(&mut self, token: Option<&str>) -> Result<()> {
@@ -220,6 +233,22 @@ mod tests {
         let frame = reader.read(100).await.unwrap().unwrap(); assert_eq!(frame.body, b"x\0");
         let owner = Arc::clone(&frame.charge); drop(frame); assert!(memory.used_bytes() > 0);
         drop(owner); assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn row_count_command_tags_match_their_formatted_text() {
+        let memory = MemoryBudget::new(1 << 20);
+        for (command, rows) in [("SELECT", 0u64), ("SELECT", 1), ("SELECT", 9), ("SELECT", 10), ("WITH", 12_345), ("", 99), ("SELECT", u64::MAX)] {
+            let mut actual = Writer::new(Vec::new(), Arc::clone(&memory));
+            actual.command_rows(command, rows).await.unwrap();
+            let mut expected = Writer::new(Vec::new(), Arc::clone(&memory));
+            expected.string(b'C', &format!("{command} {rows}")).await.unwrap();
+            assert_eq!(actual.into_inner(), expected.into_inner());
+        }
+        let mut writer = Writer::new(Vec::new(), Arc::clone(&memory));
+        assert!(writer.command_rows("SEL\0ECT", 1).await.is_err());
+        assert!(writer.into_inner().is_empty());
+        assert_eq!(memory.used_bytes(), 0);
     }
 
     #[test]

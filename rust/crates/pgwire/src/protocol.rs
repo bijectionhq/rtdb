@@ -36,14 +36,15 @@ impl PreparedControl {
 }
 struct PreparedShape {
     kind: PreparedKind,
-    columns: Option<Vec<Column>>,
+    columns: Option<Arc<[Column]>>,
     parameter_count: usize,
 }
 enum PreparedBody {
-    Ordinary { source: String, kind: PreparedKind },
+    /// `command` is the upper-cased first word of `source`, which its command tags start with.
+    Ordinary { source: String, command: String, kind: PreparedKind },
     SqlPrepare(SqlPrepareSyntax),
 }
-struct Prepared { body: PreparedBody, oids: Vec<i32>, columns: Option<Vec<Column>>, _reservation: Arc<MemoryReservation> }
+struct Prepared { body: PreparedBody, oids: Vec<i32>, columns: Option<Arc<[Column]>>, _reservation: Arc<MemoryReservation> }
 impl Prepared {
     fn ordinary_kind(&self) -> Option<&PreparedKind> {
         match &self.body {
@@ -133,7 +134,7 @@ enum PortalState { Query(QueryPortal), Ready }
 struct Portal {
     prepared: Arc<Prepared>,
     arguments: Option<SqlArguments>,
-    columns: Option<Vec<Column>>,
+    columns: Option<Arc<[Column]>>,
     state: PortalState,
     cancellation: CancellationToken,
     _charges: Vec<Arc<MemoryReservation>>,
@@ -525,7 +526,7 @@ impl ProtocolSession {
         oids.try_reserve_exact(parameter_count.saturating_sub(oids.len()))
             .map_err(|cause| Anomaly::incorrect("rtdb/allocation-failed", cause.to_string()))?;
         oids.resize(parameter_count, 0);
-        Ok(Arc::new(Prepared { body: PreparedBody::Ordinary { source: source.into(), kind }, oids, columns, _reservation: reservation }))
+        Ok(Arc::new(Prepared { body: PreparedBody::Ordinary { source: source.into(), command: head(source), kind }, oids, columns, _reservation: reservation }))
     }
 
     fn retain_sql_prepare(&self, syntax: SqlPrepareSyntax, oids: Vec<i32>) -> Result<Arc<Prepared>> {
@@ -568,7 +569,7 @@ impl ProtocolSession {
         let token = self.token();
         let bound = prepared.columns.as_deref().unwrap_or_default().iter().try_fold(8192usize, |bytes, column| bytes.checked_add(column.name.len()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(|| protocol("Portal descriptors are too large")))?;
         charges.push(self.node.memory().reserve(bound)?);
-        let columns = prepared.columns.as_ref().map(|columns| columns.iter().enumerate().map(|(index, column)| Ok(Column { name: column.name.clone(), ty: column.ty, format: item_format(formats, columns.len(), index)? })).collect::<Result<Vec<_>>>()).transpose()?;
+        let columns = prepared.columns.as_ref().map(|columns| bound_columns(columns, formats)).transpose()?;
         let mut portal = Portal { prepared: Arc::clone(&prepared), arguments, columns, state: PortalState::Ready, cancellation: token.clone(), _charges: charges, _bind_storage: None };
         let control_options = self.control_options();
         let cursor = match (prepared.ordinary_kind(), prepared.control()) {
@@ -647,8 +648,8 @@ impl ProtocolSession {
         let failed = self.session.state().status() == TransactionStatus::Failed;
         let control = prepared.control();
         if failed && !matches!(control, Some(ControlStatement::Rollback)) { return Err(protocol("current transaction is aborted, commands ignored until ROLLBACK is received")); }
-        let (kind, source) = match &prepared.body {
-            PreparedBody::Ordinary { kind, source } => (kind, source.as_str()),
+        let (kind, source, command) = match &prepared.body {
+            PreparedBody::Ordinary { kind, source, command } => (kind, source.as_str(), command.as_str()),
             PreparedBody::SqlPrepare(syntax) => return self.execute_sql_prepare(syntax, portal, writer).await,
         };
         match (kind, control) {
@@ -660,7 +661,7 @@ impl ProtocolSession {
                     self.begin_implicit(Some(true))?;
                 }
                 let token = portal.cancellation.clone(); let _active = self.cancellations.enter(&token);
-                token.run_until_cancelled(self.stream(portal, source, limit, writer)).await.ok_or_else(cancelled)?
+                token.run_until_cancelled(self.stream(portal, command, limit, writer)).await.ok_or_else(cancelled)?
                     .map_err(|error| if token.is_cancelled() { cancelled() } else { error })
             }
             (PreparedKind::CopyOut(_, format), _) => {
@@ -683,7 +684,7 @@ impl ProtocolSession {
                 if commit_dml_before_reply { self.commit(permit).await?; }
                 match statement.ordered_index_command_tag() {
                     Some(tag) => writer.string(b'C', tag).await,
-                    None => writer.string(b'C', &dml_tag(source)).await,
+                    None => writer.string(b'C', dml_tag(command)).await,
                 }
             }
             (PreparedKind::Control(control), _) => {
@@ -735,7 +736,7 @@ impl ProtocolSession {
         }
     }
 
-    async fn stream<W: AsyncWrite + Unpin>(&mut self, portal: &mut Portal, source: &str, limit: usize, writer: &mut Writer<W>) -> Result<()> {
+    async fn stream<W: AsyncWrite + Unpin>(&mut self, portal: &mut Portal, command: &str, limit: usize, writer: &mut Writer<W>) -> Result<()> {
         let columns = portal.columns.as_deref().ok_or_else(|| protocol("Query portal has no column descriptors"))?;
         let PortalState::Query(query) = &mut portal.state else { return Err(protocol("Query portal has no cursor")); };
         let environment = self.environment()?; let mut emitted = 0;
@@ -780,7 +781,7 @@ impl ProtocolSession {
                 writer.empty(b's').await?;
                 writer.flush().await
             } else {
-                writer.string(b'C', &format!("{} {}", head(source), query.sent)).await?;
+                writer.command_rows(command, query.sent).await?;
                 if grant.is_bounded() { writer.flush().await?; }
                 Ok(())
             }
@@ -928,7 +929,7 @@ fn legacy_keyword_probe(source: &str) -> bool {
 fn keyword_shape() -> PreparedShape {
     PreparedShape {
         kind: PreparedKind::Keywords,
-        columns: Some(vec![Column { name: "col1".into(), ty: PgType::VarChar, format: Format::Text }]),
+        columns: Some(Arc::from([Column { name: "col1".into(), ty: PgType::VarChar, format: Format::Text }])),
         parameter_count: 0,
     }
 }
@@ -1078,7 +1079,14 @@ fn invalid_argument(error: Anomaly, index: usize, format: Format) -> Anomaly {
 }
 fn item_format(formats: &[Format], count: usize, index: usize) -> Result<Format> { match formats.len() { 0 => Ok(Format::Text), 1 => Ok(formats[0]), length if length == count => Ok(formats[index]), _ => Err(protocol("Invalid format code count")) } }
 fn head(source: &str) -> String { source.split_whitespace().next().unwrap_or_default().to_ascii_uppercase() }
-fn dml_tag(source: &str) -> String { match head(source).as_str() { "INSERT" => "INSERT 0 0".into(), "UPDATE" => "UPDATE 0".into(), "DELETE" => "DELETE 0".into(), "PATCH" => "PATCH 0".into(), "ERASE" => "ERASE 0".into(), "CREATE" => "CREATE TABLE".into(), value => value.into() } }
+fn dml_tag(command: &str) -> &str { match command { "INSERT" => "INSERT 0 0", "UPDATE" => "UPDATE 0", "DELETE" => "DELETE 0", "PATCH" => "PATCH 0", "ERASE" => "ERASE 0", "CREATE" => "CREATE TABLE", command => command } }
+/// A portal's descriptors in its result formats, shared with the statement's when the formats leave them unchanged.
+fn bound_columns(columns: &Arc<[Column]>, formats: &[Format]) -> Result<Arc<[Column]>> {
+    let mut unchanged = true;
+    for (index, column) in columns.iter().enumerate() { unchanged &= item_format(formats, columns.len(), index)? == column.format; }
+    if unchanged { return Ok(Arc::clone(columns)); }
+    columns.iter().enumerate().map(|(index, column)| Ok(Column { name: column.name.clone(), ty: column.ty, format: item_format(formats, columns.len(), index)? })).collect()
+}
 fn is_type_probe(source: &str) -> bool { let mut prior_space = false; source.chars().filter(|character| { let repeated = *character == ' ' && prior_space; prior_space = *character == ' '; !repeated }).collect::<String>() == "SELECT pg_type.oid, typname FROM pg_catalog.pg_type LEFT JOIN (select ns.oid as nspoid, ns.nspname, r.r from pg_namespace as ns join ( select s.r, (current_schemas(false))[s.r] as nspname from generate_series(1, array_upper(current_schemas(false), 1)) as s(r) ) as r using ( nspname ) ) as sp ON sp.nspoid = typnamespace WHERE typname = $1 ORDER BY sp.r, pg_type.oid DESC LIMIT 1" }
 const DBEAVER_NAMESPACE_QUERY: &str = "SELECT n.oid,n.*,d.description FROM pg_catalog.pg_namespace n LEFT OUTER JOIN pg_catalog.pg_description d ON d.objoid=n.oid AND d.objsubid=0 AND d.classoid='pg_namespace'::regclass ORDER BY nspname";
 const DBEAVER_NAMESPACE_REPLACEMENT: &str = "SELECT n.oid,n.nspname,n.nspowner,n.nspacl,d.description FROM pg_catalog.pg_namespace n LEFT OUTER JOIN pg_catalog.pg_description d ON d.objoid=n.oid AND d.objsubid=0 AND d.classoid='pg_namespace'::regclass ORDER BY nspname";
@@ -2244,6 +2252,34 @@ mod tests {
         assert_eq!(memory.used_bytes(), baseline);
         drop(frontend);
         driver.close_without_run().await.unwrap();
+    }
+
+    #[test]
+    fn portals_share_statement_descriptors_only_when_their_result_formats_match() {
+        let columns: Arc<[Column]> = Arc::from([
+            Column { name: "a".into(), ty: PgType::Int8, format: Format::Text },
+            Column { name: "b".into(), ty: PgType::Text, format: Format::Text },
+        ]);
+        for formats in [&[][..], &[Format::Text], &[Format::Text, Format::Text]] {
+            assert!(Arc::ptr_eq(&bound_columns(&columns, formats).unwrap(), &columns), "{formats:?}");
+        }
+        for (formats, expected) in [(&[Format::Binary][..], [Format::Binary, Format::Binary]), (&[Format::Text, Format::Binary][..], [Format::Text, Format::Binary])] {
+            let bound = bound_columns(&columns, formats).unwrap();
+            assert!(!Arc::ptr_eq(&bound, &columns));
+            assert_eq!(bound.iter().map(|column| column.format).collect::<Vec<_>>(), expected);
+            assert!(bound.iter().zip(columns.iter()).all(|(bound, column)| bound.name == column.name && bound.ty == column.ty));
+        }
+        let error = bound_columns(&columns, &[Format::Text; 3]).unwrap_err();
+        assert_eq!(error.message, item_format(&[Format::Text; 3], 2, 0).unwrap_err().message);
+        assert!(bound_columns(&Arc::<[Column]>::from(Vec::new()), &[Format::Text; 3]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn command_tags_come_from_the_upper_cased_first_word() {
+        assert_eq!(head("  select\n1"), "SELECT");
+        for (command, tag) in [("INSERT", "INSERT 0 0"), ("UPDATE", "UPDATE 0"), ("DELETE", "DELETE 0"), ("PATCH", "PATCH 0"), ("ERASE", "ERASE 0"), ("CREATE", "CREATE TABLE"), ("MERGE", "MERGE"), ("", "")] {
+            assert_eq!(dml_tag(command), tag);
+        }
     }
 }
 
