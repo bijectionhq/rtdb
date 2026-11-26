@@ -20,10 +20,10 @@ use rtdb_plan::{CatalogMetric, CatalogMetrics, CatalogRows, ConnectionEvent, Exe
 use rtdb_types::{Anomaly, Result, TableRef};
 
 const TIMERS: [ExecutionTimer; 10] = [ExecutionTimer::Query, ExecutionTimer::TxAwait, ExecutionTimer::TxSubmit, ExecutionTimer::TxExecute, ExecutionTimer::PgwireTransaction, ExecutionTimer::TxOp, ExecutionTimer::CompactorJob, ExecutionTimer::DurableCommitLag, ExecutionTimer::StagedCommitLag, ExecutionTimer::BlockUpload];
-struct Counters { query_errors: step::Counter, transaction_errors: step::Counter, collection_errors: step::Counter, durable_commit_clock_invalid: step::Counter, staged_commit_clock_invalid: step::Counter, kafka_warnings: [step::Counter; 5], connections: [step::Counter; 3] }
+struct Counters { query_errors: step::Counter, query_warnings: step::Counter, transaction_errors: step::Counter, collection_errors: step::Counter, durable_commit_clock_invalid: step::Counter, staged_commit_clock_invalid: step::Counter, kafka_warnings: [step::Counter; 5], connections: [step::Counter; 3] }
 impl Counters {
     fn roll(&mut self, now: i64, closing: bool) {
-        for counter in [&mut self.query_errors, &mut self.transaction_errors, &mut self.collection_errors, &mut self.durable_commit_clock_invalid, &mut self.staged_commit_clock_invalid].into_iter().chain(self.kafka_warnings.iter_mut()).chain(self.connections.iter_mut()) { counter.poll(now, closing); }
+        for counter in [&mut self.query_errors, &mut self.query_warnings, &mut self.transaction_errors, &mut self.collection_errors, &mut self.durable_commit_clock_invalid, &mut self.staged_commit_clock_invalid].into_iter().chain(self.kafka_warnings.iter_mut()).chain(self.connections.iter_mut()) { counter.poll(now, closing); }
     }
 }
 const SAMPLE_SHARDS: usize = 16;
@@ -72,7 +72,7 @@ impl Registry {
         let reservation = memory.reserve(std::mem::size_of::<Self>().checked_add(TIMERS.len() * histogram::Timer::RETAINED_BYTES).and_then(|bytes| bytes.checked_add(node_id.len())).and_then(|bytes| bytes.checked_add(samples)).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?)?;
         let now = wall_time_millis();
         Ok(Arc::new(Self { node_id: node_id.to_owned(), memory,
-            state: Mutex::new(State { timers: TIMERS.iter().map(|_| histogram::Timer::new(now)).collect(), counters: Counters { query_errors: step::Counter::new(now), transaction_errors: step::Counter::new(now), collection_errors: step::Counter::new(now), durable_commit_clock_invalid: step::Counter::new(now), staged_commit_clock_invalid: step::Counter::new(now), kafka_warnings: [step::Counter::new(now); 5], connections: [step::Counter::new(now); 3] }, pending: Vec::with_capacity(SAMPLE_SHARDS * SHARD_SAMPLES) }),
+            state: Mutex::new(State { timers: TIMERS.iter().map(|_| histogram::Timer::new(now)).collect(), counters: Counters { query_errors: step::Counter::new(now), query_warnings: step::Counter::new(now), transaction_errors: step::Counter::new(now), collection_errors: step::Counter::new(now), durable_commit_clock_invalid: step::Counter::new(now), staged_commit_clock_invalid: step::Counter::new(now), kafka_warnings: [step::Counter::new(now); 5], connections: [step::Counter::new(now); 3] }, pending: Vec::with_capacity(SAMPLE_SHARDS * SHARD_SAMPLES) }),
             shards: (0..SAMPLE_SHARDS).map(|_| Shard(Mutex::new(Vec::with_capacity(SHARD_SAMPLES)))).collect(), processor: Mutex::new(processor::CpuSampler::new()), _reservation: reservation, providers: Arc::new(Mutex::new(Providers::default())),
             #[cfg(feature = "kafka")]
             sources: Arc::new(Mutex::new(kafka::Sources::default())),
@@ -108,6 +108,7 @@ impl ExecutionObserver for Registry {
         let count = match error { ExecutionError::Query => &mut state.counters.query_errors, ExecutionError::Transaction => &mut state.counters.transaction_errors };
         count.add(1);
     }
+    fn record_query_warning(&self) { self.state.lock().counters.query_warnings.add(1); }
     fn connection_event(&self, event: ConnectionEvent) {
         let index = match event { ConnectionEvent::Opened => 0, ConnectionEvent::Cancelled => 1, ConnectionEvent::Refused => 2 };
         let mut state = self.state.lock(); state.counters.connections[index].add(1);
@@ -145,8 +146,8 @@ impl Registry {
         let provided_bytes = provided.iter().flat_map(|rows| rows.rows()).try_fold(0usize, |bytes, row| bytes.checked_add(metric_bytes(row)?).ok_or_else(overflow))?;
         #[cfg(feature = "kafka")]
         let mut sources = self.sources.lock();
-        // Five execution counters, three connections, five Kafka warnings and six gauges.
-        let mut count = (TIMERS.len() + 19).checked_add(provided_count).ok_or_else(overflow)?;
+        // Six execution counters, three connections, five Kafka warnings and six gauges.
+        let mut count = (TIMERS.len() + 20).checked_add(provided_count).ok_or_else(overflow)?;
         #[cfg(feature = "kafka")]
         let labels = { count = count.checked_add(sources.len().checked_mul(6).ok_or_else(overflow)?).ok_or_else(overflow)?; sources.label_bytes()? };
         #[cfg(not(feature = "kafka"))]
@@ -166,6 +167,7 @@ impl Registry {
                 p99_ns: Some(snapshot.percentiles[4] as i64), p999_ns: Some(snapshot.percentiles[5] as i64) });
         }
         rows.push(self.counter("query.error", state.counters.query_errors.value(now, step)));
+        rows.push(self.counter("query.warning", state.counters.query_warnings.value(now, step)));
         rows.push(self.counter("tx.error", state.counters.transaction_errors.value(now, step)));
         rows.push(self.counter("rtdb.gc.error", state.counters.collection_errors.value(now, step)));
         rows.push(self.counter("rtdb.replica.commit.clock_invalid", state.counters.durable_commit_clock_invalid.value(now, step)));
@@ -260,6 +262,15 @@ mod tests {
         assert_eq!((*count, *total_ns, *max_ns, *mean_ns), (expected.count, expected.total, Some(expected.maximum), Some(expected.mean)));
         assert_eq!(percentiles_ns.as_slice(), expected.percentiles.as_slice());
         assert!(registry.shards.iter().all(|shard| { let pending = shard.0.lock(); pending.is_empty() && pending.capacity() == SHARD_SAMPLES }));
+    }
+    #[test]
+    fn query_warnings_are_counted_from_zero() {
+        let registry = Registry::new("node-1", MemoryBudget::new(1 << 22)).unwrap();
+        let warnings = |registry: &Registry| registry.metrics().unwrap().rows().iter().find_map(|row| match row { CatalogMetric::Counter { name, count, .. } if name == "query.warning" => Some(*count), _ => None });
+        assert_eq!(warnings(&registry), Some(0.0));
+        registry.record_query_warning();
+        registry.record_query_warning();
+        assert_eq!(warnings(&registry), Some(2.0));
     }
     #[test]
     fn the_processor_count_is_a_gauge() {

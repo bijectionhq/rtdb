@@ -378,6 +378,7 @@ impl PreparedSql {
         for (index, ty) in &self.0.options.parameter_types { arguments[*index] = rtdb_expr::cast(&arguments[*index], &rtdb_columnar::execution_type(ty), &context.timezone)?; }
         let context = context.reopen_sql_snapshot(&self.0.snapshot_selector, rtdb_expr::Parameters::Values(&arguments)).await?;
         let query = deep(self.source(), || self.bind(&context, types, true))?;
+        if !self.notices().is_empty() && let Some(observer) = context.execution_observer() { observer.record_query_warning(); }
         let footprint = if track { query.claim_footprint(&context, &arguments) } else { Default::default() };
         if self.0.policy == ResultSignaturePolicy::Exact { self.check_signature(query.schema())?; }
         let cursor = if columnar {

@@ -534,6 +534,7 @@ impl QueryContext {
         Arc::make_mut(&mut self).delivery_guard = Some(guard);
         self
     }
+    pub fn execution_observer(&self) -> Option<&Arc<dyn rtdb_plan::ExecutionObserver>> { self.execution_observer.as_ref() }
     /// Applies only to cursors opened from this context; existing cursors retain their original observer.
     pub fn with_observer(mut self: Arc<Self>, observer: Option<Arc<dyn rtdb_plan::ExecutionObserver>>) -> Arc<Self> {
         Arc::make_mut(&mut self).execution_observer = observer;

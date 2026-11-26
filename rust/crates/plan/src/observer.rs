@@ -18,6 +18,8 @@ pub trait ExecutionObserver: Send + Sync {
     fn record_duration(&self, timer: ExecutionTimer, elapsed: Duration);
     fn record_error(&self, error: ExecutionError);
     fn connection_event(&self, _event: ConnectionEvent) {}
+    /// A query opened from a plan that carries warnings, upstream's `query.warning`.
+    fn record_query_warning(&self) {}
     /// An acknowledged placed commit, measured from its ordered timestamp to local observation of durability.
     /// `None` reports that the ordered and observed wall-clock coordinates could not be compared.
     fn record_durable_commit_lag(&self, lag: Option<Duration>) {

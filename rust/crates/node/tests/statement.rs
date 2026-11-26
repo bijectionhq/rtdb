@@ -662,6 +662,26 @@ async fn prepared_warnings_retain_occurrences_without_growing_during_rebinding()
     assert_eq!(memory.used_bytes(), 0);
 }
 
+#[derive(Default)]
+struct WarningCount(std::sync::atomic::AtomicUsize);
+impl rtdb_plan::ExecutionObserver for WarningCount {
+    fn record_duration(&self, _: rtdb_plan::ExecutionTimer, _: std::time::Duration) {}
+    fn record_error(&self, _: rtdb_plan::ExecutionError) {}
+    fn record_query_warning(&self) { self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
+}
+
+#[tokio::test]
+async fn each_query_opened_from_a_warned_plan_counts_one_query_warning() {
+    let memory = MemoryBudget::new(1 << 26);
+    let warnings = Arc::new(WarningCount::default());
+    let context = context(None, &memory).with_observer(Some(warnings.clone() as Arc<dyn rtdb_plan::ExecutionObserver>));
+    let warned = PreparedSql::prepare("SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY v NULLS FIRST) AS p FROM (VALUES (1), (3)) AS t(v)", &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let clean = PreparedSql::prepare("SELECT 1 AS one", &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    for _ in 0..2 { drop(warned.open_query(Arc::clone(&context), vec![]).await.unwrap()); }
+    drop(clean.open_query(Arc::clone(&context), vec![]).await.unwrap());
+    assert_eq!(warnings.0.load(std::sync::atomic::Ordering::SeqCst), 2, "upstream ticks query.warning once per query whose plan warned");
+}
+
 #[test]
 fn postgres_dml_warning_planning_is_best_effort_and_skips_supplied_parameter_oids() {
     let memory = MemoryBudget::new(1 << 26);
