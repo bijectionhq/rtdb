@@ -681,7 +681,10 @@ pub struct InstalledReceipt {
 }
 
 /// Durable receipts by receipt namespace, then idempotency key.
-pub(crate) type Receipts = BTreeMap<Option<[u8; 32]>, BTreeMap<Vec<u8>, StoredReceipt>>;
+/// Receipts by namespace and key. The per-namespace maps are persistent, so a
+/// writer can capture the whole state for a checkpoint in constant time.
+pub(crate) type Receipts = BTreeMap<Option<[u8; 32]>, NamespaceReceipts>;
+pub(crate) type NamespaceReceipts = imbl::OrdMap<Vec<u8>, StoredReceipt>;
 
 /// What a decision reads: an index, the durable receipts, and whether a timed write is pending.
 pub(crate) struct View<'a> {
@@ -743,16 +746,22 @@ impl TransactState {
         }
         let mut receipts = original.receipts.clone();
         let mut count = 0;
-        for stored in receipts.values_mut().flat_map(|namespace| namespace.values_mut()) {
-            let basis = stored.installed.and_then(&map).ok_or_else(invalid_record)?;
-            if stored.workload.is_some() || stored.receipt.decision_clock.is_some_and(FundedReceipt::is_appointment)
-                || self.index.exact(basis)?.system_time != stored.receipt.system_time
-            {
-                return Err(invalid_record());
+        for namespace in receipts.values_mut() {
+            let mut copied = NamespaceReceipts::new();
+            for (key, stored) in namespace.iter() {
+                let mut stored = stored.clone();
+                let basis = stored.installed.and_then(&map).ok_or_else(invalid_record)?;
+                if stored.workload.is_some() || stored.receipt.decision_clock.is_some_and(FundedReceipt::is_appointment)
+                    || self.index.exact(basis)?.system_time != stored.receipt.system_time
+                {
+                    return Err(invalid_record());
+                }
+                stored.receipt.basis = basis;
+                stored.installed = None;
+                count += 1;
+                copied.insert(key.clone(), stored);
             }
-            stored.receipt.basis = basis;
-            stored.installed = None;
-            count += 1;
+            *namespace = copied;
         }
         self.receipts = receipts;
         Ok(count)
@@ -914,19 +923,29 @@ impl TransactState {
         if self.pending_erasure.is_some() { return Err(erasure_pending()); }
         self.index.restore_in(incarnation)?;
         self.appointment_addresses.clear();
-        self.receipts.retain(|_, receipts| {
-            receipts.retain(|_, stored| !stored.receipt.decision_clock.is_some_and(|offer| offer.booked()));
-            !receipts.is_empty()
-        });
-        for stored in self.receipts.values_mut().flat_map(|namespace| namespace.values_mut()) {
-            stored.receipt.basis = Basis::new(incarnation, stored.receipt.basis.position());
-            stored.receipt.decision_clock = None;
-            stored.installed = None;
+        for receipts in self.receipts.values_mut() {
+            *receipts = receipts.iter()
+                .filter(|(_, stored)| !stored.receipt.decision_clock.is_some_and(|offer| offer.booked()))
+                .map(|(key, stored)| {
+                    let mut stored = stored.clone();
+                    stored.receipt.basis = Basis::new(incarnation, stored.receipt.basis.position());
+                    stored.receipt.decision_clock = None;
+                    stored.installed = None;
+                    (key.clone(), stored)
+                })
+                .collect();
         }
+        self.receipts.retain(|_, receipts| !receipts.is_empty());
         Ok(())
     }
 
     fn encode_checkpoint_index(&self, index: &BranchIndex) -> Result<Bytes> {
+        let (version, receipts) = self.checkpoint_receipts(index);
+        serde_json::to_vec(&(version, index, receipts)).map(Bytes::from)
+            .map_err(|error| Anomaly::fault("rtdb/transaction-checkpoint", error.to_string()))
+    }
+
+    fn checkpoint_receipts(&self, index: &BranchIndex) -> (u8, Vec<std::borrow::Cow<'_, StoredReceipt>>) {
         use std::borrow::Cow;
         let cut = index.head().basis;
         let receipts = self.receipts.values().flat_map(|namespace| namespace.values()).filter_map(|stored| {
@@ -934,14 +953,34 @@ impl TransactState {
             stored.receipt.decision_clock?.appointment_checkpoint(stored, cut).map(Cow::Owned)
         }).collect::<Vec<_>>();
         let version = receipts.iter().map(|stored| stored.receipt.record_version(stored.receipt_namespace)).max().unwrap_or(RECORD_VERSION);
-        serde_json::to_vec(&(version, index, receipts)).map(Bytes::from)
-            .map_err(|error| Anomaly::fault("rtdb/transaction-checkpoint", error.to_string()))
+        (version, receipts)
+    }
+
+    /// The checkpoint of [`Self::encode_checkpoint`] in CBOR instead of JSON:
+    /// the same fields, with byte arrays and integers in binary.
+    pub fn encode_binary_checkpoint(&self) -> Result<Bytes> {
+        if self.pending.is_some() { return Err(pending_error()); }
+        let (version, receipts) = self.checkpoint_receipts(&self.index);
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&(version, &self.index, receipts), &mut bytes)
+            .map_err(|error| Anomaly::fault("rtdb/transaction-checkpoint", error.to_string()))?;
+        Ok(Bytes::from(bytes))
+    }
+
+    pub fn decode_binary_checkpoint(bytes: &[u8], expected: BranchCut) -> Result<Self> {
+        let (version, index, receipts): (u8, BranchIndex, Vec<StoredReceipt>) = ciborium::from_reader(bytes)
+            .map_err(|error| Anomaly::fault("rtdb/transaction-checkpoint", error.to_string()))?;
+        Self::from_checkpoint(version, index, receipts, expected)
     }
 
     pub fn decode_checkpoint(bytes: &[u8], expected: BranchCut) -> Result<Self> {
-        let invalid = || Anomaly::fault("rtdb/transaction-checkpoint", "Checkpoint does not match the expected cut");
         let (version, index, receipts): (u8, BranchIndex, Vec<StoredReceipt>) = serde_json::from_slice(bytes)
             .map_err(|error| Anomaly::fault("rtdb/transaction-checkpoint", error.to_string()))?;
+        Self::from_checkpoint(version, index, receipts, expected)
+    }
+
+    fn from_checkpoint(version: u8, index: BranchIndex, receipts: Vec<StoredReceipt>, expected: BranchCut) -> Result<Self> {
+        let invalid = || Anomaly::fault("rtdb/transaction-checkpoint", "Checkpoint does not match the expected cut");
         if version != receipts.iter().map(|stored| stored.receipt.record_version(stored.receipt_namespace)).max().unwrap_or(RECORD_VERSION)
             || index.head() != expected || index.exact(expected.basis)? != expected
         {
