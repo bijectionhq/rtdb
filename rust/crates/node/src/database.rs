@@ -34,6 +34,7 @@ impl Drop for ReplicaReadSession {
 }
 
 pub struct Database {
+    attachment: u64,
     writes_event_history: bool,
     pub(crate) protected_equality_epoch: uuid::Uuid,
     tokens: Arc<tokens::DatabaseTokens>,
@@ -120,6 +121,8 @@ impl Database {
             && !matches!(self.configuration.log, Some(database_config::Log::OtherLog(_))))
     }
     pub fn name(&self) -> &str { &self.name }
+    /// Distinguishes this attachment from every other attachment this process has opened, including later ones under the same name.
+    pub fn attachment(&self) -> u64 { self.attachment }
     pub fn configuration(&self) -> &DatabaseConfig { &self.configuration }
     /// The immutable receipt authority of this live writer attachment.
     pub fn placed_writer_scope(&self) -> Option<rtdb_types::PlacedAttemptScope> {
@@ -693,7 +696,8 @@ impl DatabaseFactory {
                     writable: !read_only && self.options.replication.may_lead, write_features,
                 }));
             }
-            let database = Arc::new(Database { writes_event_history: event_history, protected_equality_epoch: uuid::Uuid::new_v4(), tokens, name, configuration, read_only, partition, storage, resolve,
+            static ATTACHMENTS: AtomicU64 = AtomicU64::new(0);
+            let database = Arc::new(Database { attachment: ATTACHMENTS.fetch_add(1, Ordering::Relaxed), writes_event_history: event_history, protected_equality_epoch: uuid::Uuid::new_v4(), tokens, name, configuration, read_only, partition, storage, resolve,
                 audience_storage: resources.audience_storage, logs, replication, serving, native_serving_authority: native_authority, default_native_handle,
                 custody_provider: Default::default(), replica_read_index: opened_logs.replica_read_index,
                 await_authority: opened_logs.await_authority,

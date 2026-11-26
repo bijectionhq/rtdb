@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use arrow_flight::FlightData;
 use arrow_schema::Schema;
 use bytes::Bytes;
-use rtdb_columnar::MemoryBudget;
+use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_node::{ControlExecutionOptions, ControlFrontend, ControlResult, NativeSession, PreparedSql, ResultSignaturePolicy, control_schema};
 use rtdb_plan::ControlStatement;
 use rtdb_query::{BoundParameters, QueryContext, QueryCursor};
@@ -10,7 +10,7 @@ use rtdb_tx::SqlArguments;
 use rtdb_types::{LogicalType, Timestamp};
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tonic::{Response, Status};
-use crate::{error::{cancelled, invalid, status}, service::{Call, Output, Service, query_ticket}, state::ConnectionResource, ticket::{Cut, Inspection, QueryRun, Ticket, TicketBasis}, wire};
+use crate::{error::{cancelled, invalid, status}, service::{Call, Output, Service, query_ticket}, state::ConnectionResource, ticket::{Cut, Inspection, QueryRun, Ticket, TicketBasis, Visible}, wire};
 
 pub(crate) struct Shape { pub schema: Option<wire::OwnedSchema>, pub parameters: usize, pub plan: Option<PreparedSql> }
 
@@ -55,14 +55,39 @@ async fn open_query(prepared: &PreparedSql, context: Arc<QueryContext>, params: 
 }
 
 /// Each database's last visible system time in a captured catalog, so that a later read can be capped to the same cut.
-fn visible_cut(context: &QueryContext) -> Result<BTreeMap<String, Option<Timestamp>>, Status> {
-    context.catalog.database_names().map(|name| {
+/// `attachments` were read before `context` was opened; an attachment that changed in between cannot be named for the cut.
+fn visible_cut(context: &QueryContext, attachments: &BTreeMap<String, u64>, node: &rtdb_node::Node, memory: &Arc<MemoryBudget>) -> Result<(BTreeMap<String, Visible>, Arc<MemoryReservation>), Status> {
+    let bytes = context.catalog.database_names().try_fold(256usize, |bytes, name| wire::add(bytes, wire::add(name.len(), 96)?))?;
+    let charge = memory.reserve(bytes).map_err(status)?;
+    let cut = context.catalog.database_names().map(|name| {
+        let attachment = attachments.get(name).copied()
+            .filter(|attachment| node.catalog().database(name).is_ok_and(|current| current.attachment() == *attachment))
+            .ok_or_else(|| Status::unavailable("A database was attached or replaced while the query was described"))?;
         let database = context.catalog.database(name).map_err(status)?;
-        let visible = database.partitions.first().and_then(|snapshot| snapshot.tx_basis().map(|head| {
+        let through = database.partitions.first().and_then(|snapshot| snapshot.tx_basis().map(|head| {
             snapshot.system_time_cap().map_or(head.system_time, |cap| cap.min(head.system_time))
         }));
-        Ok((name.to_owned(), visible))
-    }).collect()
+        Ok((name.to_owned(), Visible { attachment, through }))
+    }).collect::<Result<_, Status>>()?;
+    Ok((cut, charge))
+}
+
+fn attachments(node: &rtdb_node::Node) -> BTreeMap<String, u64> {
+    node.catalog().open_databases().into_iter().map(|(name, database)| (name, database.attachment())).collect()
+}
+
+/// A cut names the attachment it was taken from; a database replaced since then under the same name has an unrelated history.
+/// Checked before the cut is opened, so that a replacement reads as unknown rather than as a basis beyond its head, and again after, for one that raced the opening.
+fn check_attachments<'a>(names: impl Iterator<Item = &'a str>, cut: &Cut, node: &rtdb_node::Node) -> Result<(), Status> {
+    let Cut::Visible(cut) = cut else { return Ok(()) };
+    for name in names {
+        if let Some(visible) = cut.get(name)
+            && node.catalog().database(name).is_ok_and(|current| current.attachment() != visible.attachment)
+        {
+            return Err(Status::not_found("The query ticket's database was replaced"));
+        }
+    }
+    Ok(())
 }
 
 impl Service {
@@ -122,6 +147,7 @@ impl Service {
         let token = native.state().cancellation().child_token(); let _cancel = token.clone().drop_guard();
         let options = options(&native);
         let database = native.state().database().to_owned();
+        let mut cut_charge = None;
         let (schema, ticket) = if let Some(control) = rtdb_sql::parse_admitted_control_in(source, &options, self.memory()).map_err(status)? {
             let Some(schema) = control_schema(control.statement()).map_err(status)? else {
                 let arguments = params.as_ref().map(|params| params.arguments(self.memory())).transpose()?;
@@ -144,7 +170,8 @@ impl Service {
                 execute_prepared_update(&mut native, &prepared, arguments).await?;
                 return self.empty_update_info();
             }
-            let (basis, context) = native.read_context(&token).await.map_err(status)?;
+            let attachments = attachments(&self.0.node);
+            let (basis, context) = Box::pin(native.read_context(&token)).await.map_err(status)?;
             let types = match &params {
                 Some(params) => params.query_types(self.memory()).await?,
                 None => prepared.parameter_types(),
@@ -152,7 +179,10 @@ impl Service {
             let schema = self.parameterized_schema(&prepared, &context, types)?;
             drop(native);
             context.reading(async { Ok(()) }).await.map_err(status)?;
-            let cut = match &basis.resume_token { Some(token) => Cut::Snapshot(token.clone()), None => Cut::Visible(visible_cut(&context)?) };
+            let cut = match &basis.resume_token {
+                Some(token) => Cut::Snapshot(token.clone()),
+                None => { let (cut, charge) = visible_cut(&context, &attachments, &self.0.node, self.memory())?; cut_charge = Some(charge); Cut::Visible(cut) }
+            };
             let params = params.filter(|params| params.batch().num_columns() != 0)
                 .map(|params| wire::parameter_ipc(params.batch(), self.memory())).transpose()?.flatten();
             let basis = TicketBasis {
@@ -161,11 +191,16 @@ impl Service {
             };
             (schema, Ticket::Run(QueryRun { database, sql: source.to_owned(), search_path: options.search_path, basis, params }))
         };
-        let ticket = ticket.encode(&self.ticket_binding(call), self.memory())?;
-        if ticket.len() > self.0.config.maximum_message_bytes {
-            return Err(Status::resource_exhausted("The query ticket exceeds the maximum message size"));
+        let fields = self.memory().reserve(ticket.encoded_bound()?).map_err(status)?;
+        let encoded = ticket.encode(&self.ticket_binding(call), self.memory())?;
+        drop(ticket);
+        drop((fields, cut_charge));
+        let ticket = query_ticket(encoded, self.memory())?;
+        // DoGet sends the handle inside `flight::Ticket`, whose field tag and length add at most 16 bytes.
+        if wire::add(ticket.len(), 16)? > self.request_bytes() {
+            return Err(Status::resource_exhausted("The query ticket exceeds the largest request this server decodes"));
         }
-        Ok((schema, query_ticket(ticket, self.memory())?))
+        Ok((schema, ticket))
     }
 
     async fn redeem(&self, call: &Call, ticket: Ticket) -> Result<Option<(QueryCursor, Redemption)>, Status> {
@@ -184,23 +219,25 @@ impl Service {
         let control = rtdb_sql::parse_admitted_control_in(sql, &options, self.memory()).map_err(status)?;
         let cursor = match (&ticket, control) {
             (Ticket::Inspect(_), Some(control)) if control_schema(control.statement()).map_err(status)?.is_some() => {
-                let output = native.execute_control_with(control.statement(), &[], &token, ControlExecutionOptions {
+                let output = Box::pin(native.execute_control_with(control.statement(), &[], &token, ControlExecutionOptions {
                     frontend: ControlFrontend::FlightSql, implicit_transaction: false,
-                }).await.map_err(status)?;
+                })).await.map_err(status)?;
                 drop(native);
                 let ControlResult::Rows(cursor) = output else { return Err(invalid("query has no result set")); };
                 cursor
             }
             (Ticket::Run(run), None) => {
                 let databases = self.0.node.catalog().database_names();
-                let context = native.query_context_at(&run.basis.query_basis(databases), &token).await.map_err(status)?;
+                check_attachments(databases.iter().map(String::as_str), &run.basis.cut, &self.0.node)?;
+                let context = Box::pin(native.query_context_at(&run.basis.query_basis(databases), &token)).await.map_err(status)?;
+                check_attachments(context.catalog.database_names(), &run.basis.cut, &self.0.node)?;
                 drop(native);
                 let prepared = PreparedSql::prepare(sql, &context, options, ResultSignaturePolicy::Dynamic).map_err(status)?;
                 if prepared.is_dml() { return Err(invalid("invalid ticket")); }
                 let params = run.params.as_ref()
                     .map(|bytes| wire::BoundParameters::new(wire::parameter_batch(bytes, self.memory())?, self.memory())).transpose()?;
                 let deadline = context.retention_deadline().map(tokio::time::Instant::from);
-                within(deadline, open_query(&prepared, context, params.as_deref(), self.memory())).await?
+                within(deadline, Box::pin(open_query(&prepared, context, params.as_deref(), self.memory()))).await?
             }
             _ => return Err(invalid("invalid ticket")),
         };
@@ -214,7 +251,7 @@ impl Service {
         let ticket = Ticket::decode(&encoded, &self.ticket_binding(&call)).map_err(|error| call.error(error))?;
         let work = async {
             let _decoded = decoded;
-            let redeemed = self.redeem(&call, ticket).await?;
+            let redeemed = Box::pin(self.redeem(&call, ticket)).await?;
             if let Some((_, read)) = &redeemed { read.admit(self, &call).await?; }
             Ok::<_, Status>(redeemed)
         };
@@ -262,10 +299,10 @@ async fn execute_control_update(native: &mut NativeSession, control: &ControlSta
     let options = ControlExecutionOptions { frontend: ControlFrontend::FlightSql, implicit_transaction: false };
     let result = if let Some(arguments) = arguments && let Some(page) = arguments.first_arrow_page() {
         let params = BoundParameters::from_arrow(page.clone(), 0, arguments.execution_types().collect(), memory).map_err(status)?;
-        native.execute_control_arrow_with(control, Some(&params), token, options).await
+        Box::pin(native.execute_control_arrow_with(control, Some(&params), token, options)).await
     } else {
         let params = arguments.and_then(|arguments| arguments.rows().next()).transpose().map_err(status)?;
-        native.execute_control_with(control, params.as_deref().unwrap_or_default(), token, options).await
+        Box::pin(native.execute_control_with(control, params.as_deref().unwrap_or_default(), token, options)).await
     };
     match result.map_err(status)? {
         ControlResult::Command { .. } => Ok(()),
@@ -275,7 +312,7 @@ async fn execute_control_update(native: &mut NativeSession, control: &ControlSta
 
 async fn execute_prepared_update(native: &mut NativeSession, prepared: &PreparedSql, arguments: Option<SqlArguments>) -> Result<(), Status> {
     let operation = prepared.dml_operation(arguments).map_err(status)?;
-    if let Some(result) = native.state_mut().execute_operation(operation).await.map_err(status)? {
+    if let Some(result) = Box::pin(native.state_mut().execute_operation(operation)).await.map_err(status)? {
         if let Some(error) = result.error() { return Err(status(error.clone())); }
     }
     Ok(())

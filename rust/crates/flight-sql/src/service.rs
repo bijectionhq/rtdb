@@ -290,7 +290,12 @@ impl Service {
         }
     }
     pub fn memory(&self) -> &Arc<MemoryBudget> { self.0.node.memory() }
-    pub(crate) fn ticket_binding<'a>(&self, call: &'a Call) -> crate::ticket::Binding<'a> {
+    /// The largest request message the transport decodes.
+    pub(crate) fn request_bytes(&self) -> usize {
+        let maximum = self.0.config.maximum_message_bytes;
+        if self.0.config.audience.is_some() { maximum.min(crate::config::AUDIENCE_REQUEST_BYTES) } else { maximum }
+    }
+        pub(crate) fn ticket_binding<'a>(&self, call: &'a Call) -> crate::ticket::Binding<'a> {
         crate::ticket::Binding { mac: self.0.auth.ticket_mac(), session: &call.session.id, owner: call.session.caller.owner }
     }
     fn sessions(&self, reserved: bool) -> &Registry<String, Session> {
@@ -834,8 +839,8 @@ impl FlightService for Service {
         let descriptor = request.into_inner(); let cmd = command(&descriptor.cmd).map_err(|error| call.error(error))?;
         let work = async {
             let (schema, ticket) = match cmd {
-                Command::CommandStatementQuery(command) => { let connection = self.tx_or_session(&call, command.transaction_id.as_ref()).await?; self.query_info(&call, connection, command.transaction_id.as_ref(), &command.query, None, None).await? }
-                Command::CommandPreparedStatementQuery(command) => { let prepared = self.prepared(&call, &command.prepared_statement_handle)?; let params = prepared.params.lock().expect("parameters lock").clone(); let connection = self.scoped(&call, &prepared.scope).await?; let transaction = match &prepared.scope { PreparedScope::Transaction(handle) => Some(handle), PreparedScope::Session(_) => None }; self.query_info(&call, connection, transaction, &prepared.sql, prepared.plan.as_ref(), params).await? }
+                Command::CommandStatementQuery(command) => { let connection = self.tx_or_session(&call, command.transaction_id.as_ref()).await?; rtdb_types::boxed(|| self.query_info(&call, connection, command.transaction_id.as_ref(), &command.query, None, None)).await? }
+                Command::CommandPreparedStatementQuery(command) => { let prepared = self.prepared(&call, &command.prepared_statement_handle)?; let params = prepared.params.lock().expect("parameters lock").clone(); let connection = self.scoped(&call, &prepared.scope).await?; let transaction = match &prepared.scope { PreparedScope::Transaction(handle) => Some(handle), PreparedScope::Session(_) => None }; rtdb_types::boxed(|| self.query_info(&call, connection, transaction, &prepared.sql, prepared.plan.as_ref(), params)).await? }
                 command => (self.metadata_schema(&command)?, command.into_any().encode_to_vec().into()),
             };
             Ok::<_, Status>(flight::FlightInfo { schema: wire::schema_message(&schema, self.memory())?, flight_descriptor: Some(descriptor), endpoint: vec![flight::FlightEndpoint { ticket: Some(flight::Ticket { ticket }), ..Default::default() }], total_records: -1, total_bytes: -1, ordered: false, app_metadata: Bytes::new() })
@@ -871,13 +876,13 @@ impl FlightService for Service {
         let call = self.call(&request, request.get_ref().encoded_len()).await?;
         let command = command(&request.into_inner().ticket).map_err(|error| call.error(error))?;
         match command {
-            Command::TicketStatementQuery(ticket) => self.query_stream(call, ticket.statement_handle).await,
+            Command::TicketStatementQuery(ticket) => rtdb_types::boxed(|| self.query_stream(call, ticket.statement_handle)).await,
             command => self.metadata_stream(call, command).await,
         }
     }
     async fn do_put(&self, request: Request<Streaming<flight::FlightData>>) -> Result<Response<Self::DoPutStream>, Status> {
         let call = self.call(&request, 0).await?;
-        self.upload(call, request.into_inner()).await
+        rtdb_types::boxed(|| self.upload(call, request.into_inner())).await
     }
     async fn do_action(&self, request: Request<flight::Action>) -> Result<Response<Self::DoActionStream>, Status> {
         let name = request.get_ref().r#type.as_str();

@@ -100,28 +100,33 @@ impl rtdb_node::ResourceFactory for HostedFixtureResources {
 }
 
 type FixtureResources = Box<dyn FnOnce(Arc<dyn Clock>) -> Arc<dyn rtdb_node::ResourceFactory> + Send>;
+type StartFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Running> + Send + 'a>>;
 
 struct Running { node: Node, node_task: tokio::task::JoinHandle<Result<()>>, server: ServerHandle, server_task: tokio::task::JoinHandle<Result<()>>, clock: Arc<ManualClock> }
 impl Running {
-    async fn start(password: Option<&str>, config: FlightConfig) -> Self { Self::start_with_placements(password, config, &[]).await }
-    async fn start_with_placements(password: Option<&str>, config: FlightConfig, placements: &[&str]) -> Self {
-        Self::start_with_tracer(password, config, placements, None).await
+    // Each wrapper hands back the boxed start future: nested async frames each reserve the whole start state in debug builds and overflow the test thread's stack.
+    fn start<'a>(password: Option<&'a str>, config: FlightConfig) -> StartFuture<'a> { Self::start_with_placements(password, config, &[]) }
+    fn start_with_placements<'a>(password: Option<&'a str>, config: FlightConfig, placements: &'a [&'a str]) -> StartFuture<'a> {
+        Self::start_with_tracer(password, config, placements, None)
     }
-    async fn start_with_tracer(password: Option<&str>, config: FlightConfig, placements: &[&str], tracer: Option<Arc<dyn rtdb_plan::Tracer>>) -> Self {
-        Self::start_with_options(password, config, placements, tracer, NodeOptions::default()).await
+    fn start_with_tracer<'a>(password: Option<&'a str>, config: FlightConfig, placements: &'a [&'a str], tracer: Option<Arc<dyn rtdb_plan::Tracer>>) -> StartFuture<'a> {
+        Self::start_with_options(password, config, placements, tracer, NodeOptions::default())
     }
-    async fn start_with_options(password: Option<&str>, config: FlightConfig, placements: &[&str], tracer: Option<Arc<dyn rtdb_plan::Tracer>>, options: NodeOptions) -> Self {
-        Self::start_with_fence(password, config, placements, tracer, options, None).await
+    fn start_with_options<'a>(password: Option<&'a str>, config: FlightConfig, placements: &'a [&'a str], tracer: Option<Arc<dyn rtdb_plan::Tracer>>, options: NodeOptions) -> StartFuture<'a> {
+        Self::start_with_fence(password, config, placements, tracer, options, None)
     }
-    async fn start_with_fence(password: Option<&str>, config: FlightConfig, placements: &[&str], tracer: Option<Arc<dyn rtdb_plan::Tracer>>, options: NodeOptions, read_fence: Option<Arc<dyn rtdb_node::ReadFence>>) -> Self {
-        Self::start_with_resources(password, config, placements, tracer, options, read_fence, None).await
+    fn start_with_fence<'a>(password: Option<&'a str>, config: FlightConfig, placements: &'a [&'a str], tracer: Option<Arc<dyn rtdb_plan::Tracer>>, options: NodeOptions, read_fence: Option<Arc<dyn rtdb_node::ReadFence>>) -> StartFuture<'a> {
+        Self::start_with_resources(password, config, placements, tracer, options, read_fence, None)
     }
-    async fn start_with_resources(password: Option<&str>, config: FlightConfig, placements: &[&str], tracer: Option<Arc<dyn rtdb_plan::Tracer>>, options: NodeOptions, read_fence: Option<Arc<dyn rtdb_node::ReadFence>>, resources: Option<Arc<dyn rtdb_node::ResourceFactory>>) -> Self {
+    fn start_with_resources<'a>(password: Option<&'a str>, config: FlightConfig, placements: &'a [&'a str], tracer: Option<Arc<dyn rtdb_plan::Tracer>>, options: NodeOptions, read_fence: Option<Arc<dyn rtdb_node::ReadFence>>, resources: Option<Arc<dyn rtdb_node::ResourceFactory>>) -> StartFuture<'a> {
         let resources = resources.map(|resources| Box::new(move |_: Arc<dyn Clock>| resources) as FixtureResources);
-        Self::start_with_clocked_resources(password, config, placements, tracer, options, read_fence, resources).await
+        Self::start_with_clocked_resources(password, config, placements, tracer, options, read_fence, resources)
     }
     /// `resources` receives the node clock so that a local log stamps transactions on the same clock the node reads at.
-    async fn start_with_clocked_resources(password: Option<&str>, mut config: FlightConfig, placements: &[&str], tracer: Option<Arc<dyn rtdb_plan::Tracer>>, mut options: NodeOptions, read_fence: Option<Arc<dyn rtdb_node::ReadFence>>, resources: Option<FixtureResources>) -> Self {
+    fn start_with_clocked_resources<'a>(password: Option<&'a str>, config: FlightConfig, placements: &'a [&'a str], tracer: Option<Arc<dyn rtdb_plan::Tracer>>, options: NodeOptions, read_fence: Option<Arc<dyn rtdb_node::ReadFence>>, resources: Option<FixtureResources>) -> StartFuture<'a> {
+        Box::pin(Self::open(password, config, placements, tracer, options, read_fence, resources))
+    }
+    async fn open(password: Option<&str>, mut config: FlightConfig, placements: &[&str], tracer: Option<Arc<dyn rtdb_plan::Tracer>>, mut options: NodeOptions, read_fence: Option<Arc<dyn rtdb_node::ReadFence>>, resources: Option<FixtureResources>) -> Self {
         let node_clock: Arc<dyn Clock> = Arc::new(TickClock(AtomicI64::new(1_000_000)));
         let auth = Authenticator::open(AuthConfig::SingleRootUser { password: password.map(Secret::new) }, MemoryBudget::new(64 << 20), node_clock.clone(), Arc::new(NoHttp)).await.unwrap();
         let mut services = NodeServices { clock: node_clock.clone(), tracer, read_fence, ..NodeServices::local(auth.clone(), Arc::new(Observer), auth.clone(), Arc::new(Metrics)) };
@@ -457,6 +462,25 @@ async fn inspection_ticket_issued_in_a_transaction_reads_that_transaction_connec
     assert_ne!(timezone(client.redeem(&outside).await), "Europe/Paris");
     client.end(transaction, false).await.unwrap();
     let request = client.request(inside.endpoint[0].ticket.clone().unwrap());
+    assert_eq!(client.client.do_get(request).await.unwrap_err().code(), tonic::Code::NotFound);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn query_ticket_is_unknown_once_a_database_it_reads_is_attached_again() {
+    let running = Running::start(None, FlightConfig::default()).await;
+    running.node.database_or_attach("other".into(), Default::default()).await.unwrap().unwrap();
+    let mut client = Client::connect(&running.server, None).await;
+    let mut other = Client::connect_with_database(&running.server, None, Some("other")).await;
+    other.update("INSERT INTO docs (_id) VALUES (1)", None).await;
+    let info = client.info("SELECT count(*) AS n FROM other.public.docs", None).await;
+    assert_eq!(integer(&client.redeem(&info).await[0], 0, 0), 1);
+    client.update("DETACH DATABASE other", None).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while running.node.catalog().database("other").is_ok() || running.node.catalog().is_draining("other") { tokio::task::yield_now().await; }
+    }).await.unwrap();
+    running.node.database_or_attach("other".into(), Default::default()).await.unwrap().unwrap();
+    let request = client.request(info.endpoint[0].ticket.clone().unwrap());
     assert_eq!(client.client.do_get(request).await.unwrap_err().code(), tonic::Code::NotFound);
     running.stop().await;
 }

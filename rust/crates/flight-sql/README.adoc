@@ -81,11 +81,12 @@ The node's PostgreSQL TLS configuration does not apply to this endpoint.
 
 GetFlightInfo encodes the SQL, search path, Arrow parameters, query clock, timezone and read cut in a self-contained `TicketStatementQuery` handle, as the reference's `QueryTicket.Run` does.
 The server retains nothing per issued ticket, so the rate at which tickets are issued and redeemed is not bounded by `maximum_concurrent_calls`, and an unredeemed ticket holds no snapshot or catalog.
-The read cut is each database's last visible system time; a database without a visible transaction, or one attached after the ticket was issued, keeps an empty cut, which later transactions do not enter.
+The read cut is each database's last visible system time and the attachment it was read from; a database without a visible transaction, or one attached after the ticket was issued, keeps an empty cut, which later transactions do not enter.
+Redeeming a ticket after one of its databases was detached and attached again fails as not found, since the new attachment has an unrelated history.
 A read under a restored SQL snapshot carries that snapshot's token instead.
 The handle is signed with HMAC-SHA256 under a key generated when the service starts, over the issuing session's id and owner.
-A ticket presented by another session, another owner, or after a restart fails as not found, as does one whose signed bytes were altered; a truncated ticket is invalid.
-A ticket larger than `maximum_message_bytes` is refused when issued, since its parameter batch is carried whole.
+A ticket presented by another session, another owner, or after a restart fails as not found, as does an altered or truncated signed ticket; one too short to carry a signature is invalid.
+A ticket that would not fit the largest request the server decodes is refused when issued, since its parameter batch is carried whole; with an audience that limit is 512 KiB.
 It keeps the connection borrowed through statement classification, basis capture, and schema preparation against that basis.
 GetFlightInfo, GetSchema, CreatePreparedStatement and DoPut statement updates use the same selected Direct parser diagnostics for initial preparation.
 When the vendor parser rejects a first unquoted ASCII identifier outside both vocabularies, the frontend compares the byte range and accepts a matching extraneous-input or statement-head mismatch report.
@@ -97,8 +98,9 @@ DoGet revalidates the redeeming session, waits its visibility barrier, then open
 Each redemption reads the current indexed state capped at the captured cut, so one ticket can be redeemed repeatedly with the same result.
 Erased rows are no longer visible, as in the reference, and a cut that cannot be opened, such as one past the database's current head or under an SQL snapshot token that is no longer retained, fails the redemption with the query error.
 The SQL is re-prepared against the current catalog, so a table or column created after issue can make the redeemed schema differ from the announced one, as in the reference.
-A `SHOW` inspection ticket executes the inspection on each redemption, as the reference does, on the connection that issued it: the issuing transaction's connection while that transaction is open, otherwise the session's.
-An inspection therefore reports its values and errors at redemption rather than at GetFlightInfo.
+A `SHOW` inspection executes again on each redemption, as the reference executes every ticket again, so it reports its values and errors at redemption rather than at GetFlightInfo.
+The reference redeems on the session's connection for the ticket's database; a native inspection issued in a transaction redeems on that transaction's connection, and fails as not found once the transaction has ended.
+The ticket names that transaction only through its handle masked with a keystream derived from the ticket key, the session and a per-ticket nonce.
 Flight SQL opens a columnar query cursor where the operators can provide Arrow batches.
 An index-covered ordered point read streams typed results from the posting leaves under the ticket's captured basis.
 Query streams retain their cursor, connection, session lease, cancellation scope, and Arrow allocation owners through completion or cancellation.

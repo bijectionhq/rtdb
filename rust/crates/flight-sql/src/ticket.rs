@@ -12,6 +12,7 @@ use crate::{error::{invalid, status}, state::Owner, wire};
 
 const VERSION: &[u8] = b"RTDBFT\x03";
 const MAC_BYTES: usize = 32;
+const NONCE_BYTES: usize = 16;
 const RUN: u8 = 1;
 const INSPECT: u8 = 2;
 
@@ -50,8 +51,16 @@ pub(crate) struct TicketBasis {
 pub(crate) enum Cut {
     /// A restored SQL snapshot, which the token names.
     Snapshot(String),
-    /// Each database's last visible system time; `None`, or a database absent from the map, sees no transaction.
-    Visible(BTreeMap<String, Option<Timestamp>>),
+    /// Each database's cut; a database absent from the map sees no transaction.
+    Visible(BTreeMap<String, Visible>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Visible {
+    /// The `Database::attachment` the cut was taken from; another attachment under the same name has another history.
+    pub attachment: u64,
+    /// The last visible system time; `None` sees no transaction.
+    pub through: Option<Timestamp>,
 }
 
 impl TicketBasis {
@@ -60,7 +69,7 @@ impl TicketBasis {
         let (snapshot, resume_token) = match &self.cut {
             Cut::Snapshot(token) => (TimeBasis::default(), Some(token.clone())),
             Cut::Visible(visible) => (TimeBasis { databases: databases.into_iter().chain(visible.keys().cloned()).map(|name| {
-                let time = visible.get(&name).copied().flatten().unwrap_or(Timestamp::MIN);
+                let time = visible.get(&name).and_then(|visible| visible.through).unwrap_or(Timestamp::MIN);
                 (name, vec![Some(Instant::from(time))])
             }).collect() }, None),
         };
@@ -74,17 +83,37 @@ impl TicketBasis {
 /// Binds a ticket to the session that described it, under the service's ticket key.
 pub(crate) struct Binding<'a> { pub mac: Hmac<Sha256>, pub session: &'a str, pub owner: Owner }
 
+const SIGN: u8 = 0;
+const MASK: u8 = 1;
+
 impl Binding<'_> {
-    fn sign(&self, payload: &[u8]) -> Hmac<Sha256> {
+    fn keyed(&self, purpose: u8) -> Hmac<Sha256> {
         let mut mac = self.mac.clone();
+        mac.update(&[purpose]);
         mac.update(&(self.session.len() as u64).to_be_bytes());
         mac.update(self.session.as_bytes());
         match self.owner {
             Owner::Anonymous => mac.update(&[0]),
             Owner::Authenticated(id) => { mac.update(&[1]); mac.update(id.as_bytes()); }
         }
+        mac
+    }
+
+    fn sign(&self, payload: &[u8]) -> Hmac<Sha256> {
+        let mut mac = self.keyed(SIGN);
         mac.update(payload);
         mac
+    }
+
+    /// XORs `value` with a keystream bound to this session and the ticket's `nonce`, so that a ticket discloses neither the transaction handle it names nor how it relates to another ticket's.
+    fn mask(&self, nonce: &[u8; NONCE_BYTES], value: &[u8]) -> Vec<u8> {
+        value.chunks(MAC_BYTES).enumerate().flat_map(|(block, chunk)| {
+            let mut mac = self.keyed(MASK);
+            mac.update(nonce);
+            mac.update(&(block as u64).to_be_bytes());
+            let stream = mac.finalize().into_bytes();
+            chunk.iter().zip(stream).map(|(byte, key)| byte ^ key).collect::<Vec<_>>()
+        }).collect()
     }
 }
 
@@ -94,7 +123,7 @@ impl Ticket {
         Ok(wire::retain(VERSION.to_vec(), charge))
     }
 
-    fn encoded_bound(&self) -> Result<usize, Status> {
+    pub fn encoded_bound(&self) -> Result<usize, Status> {
         let strings = |values: &[String]| values.iter().try_fold(4usize, |bytes, value| wire::add(bytes, wire::add(4, value.len())?));
         let body = match self {
             Self::Empty => 0,
@@ -103,7 +132,7 @@ impl Ticket {
             Self::Run(run) => {
                 let cut = match &run.basis.cut {
                     Cut::Snapshot(token) => token.len(),
-                    Cut::Visible(databases) => databases.keys().try_fold(0usize, |bytes, name| wire::add(bytes, wire::add(name.len(), 16)?))?,
+                    Cut::Visible(databases) => databases.keys().try_fold(0usize, |bytes, name| wire::add(bytes, wire::add(name.len(), 32)?))?,
                 };
                 [run.database.len(), run.sql.len(), strings(&run.search_path)?, run.basis.timezone.len(), cut, run.params.as_ref().map_or(0, Bytes::len)]
                     .into_iter().try_fold(0usize, wire::add)?
@@ -122,7 +151,9 @@ impl Ticket {
             Self::Inspect(inspection) => {
                 bytes.push(INSPECT);
                 put_string(&mut bytes, &inspection.database)?;
-                put_bytes(&mut bytes, inspection.transaction.as_deref())?;
+                let nonce = *uuid::Uuid::new_v4().as_bytes();
+                bytes.extend_from_slice(&nonce);
+                put_bytes(&mut bytes, inspection.transaction.as_deref().map(|handle| binding.mask(&nonce, handle)).as_deref())?;
                 put_string(&mut bytes, &inspection.sql)?;
                 put_strings(&mut bytes, &inspection.search_path)?;
             }
@@ -142,7 +173,11 @@ impl Ticket {
                     Cut::Visible(databases) => {
                         bytes.push(1);
                         put_len(&mut bytes, databases.len())?;
-                        for (name, visible) in databases { put_string(&mut bytes, name)?; put_time(&mut bytes, *visible); }
+                        for (name, visible) in databases {
+                            put_string(&mut bytes, name)?;
+                            bytes.extend_from_slice(&visible.attachment.to_be_bytes());
+                            put_time(&mut bytes, visible.through);
+                        }
                     }
                 }
                 put_bytes(&mut bytes, run.params.as_deref())?;
@@ -163,9 +198,14 @@ impl Ticket {
         binding.sign(&bytes[..split]).verify_slice(&bytes[split..]).map_err(|_| Status::not_found("unknown query ticket"))?;
         let mut body = bytes.slice(VERSION.len()..split);
         let ticket = match body.get_u8() {
-            INSPECT => Self::Inspect(Inspection {
-                database: take_string(&mut body)?, transaction: take_bytes(&mut body)?, sql: take_string(&mut body)?, search_path: take_strings(&mut body)?,
-            }),
+            INSPECT => {
+                let database = take_string(&mut body)?;
+                need(&body, NONCE_BYTES)?;
+                let mut nonce = [0; NONCE_BYTES];
+                body.copy_to_slice(&mut nonce);
+                let transaction = take_bytes(&mut body)?.map(|handle| Bytes::from(binding.mask(&nonce, &handle)));
+                Self::Inspect(Inspection { database, transaction, sql: take_string(&mut body)?, search_path: take_strings(&mut body)? })
+            }
             RUN => {
                 let database = take_string(&mut body)?;
                 let sql = take_string(&mut body)?;
@@ -178,7 +218,12 @@ impl Ticket {
                 let cut = if take_flag(&mut body)? {
                     let count = take_len(&mut body)?;
                     let mut databases = BTreeMap::new();
-                    for _ in 0..count { databases.insert(take_string(&mut body)?, take_time(&mut body)?); }
+                    for _ in 0..count {
+                        let name = take_string(&mut body)?;
+                        need(&body, 8)?;
+                        let attachment = body.get_u64();
+                        databases.insert(name, Visible { attachment, through: take_time(&mut body)? });
+                    }
                     Cut::Visible(databases)
                 } else {
                     Cut::Snapshot(take_string(&mut body)?)
@@ -290,7 +335,10 @@ mod tests {
         let memory = MemoryBudget::new(1 << 20);
         let owner = Owner::Authenticated(Uuid::from_bytes([7; 16]));
         let signer = binding("session", owner, b"key");
-        let cut = Cut::Visible(BTreeMap::from([("empty".to_owned(), None), ("xtdb".to_owned(), Some(Timestamp(1_234_567)))]));
+        let cut = Cut::Visible(BTreeMap::from([
+            ("empty".to_owned(), Visible { attachment: 3, through: None }),
+            ("xtdb".to_owned(), Visible { attachment: u64::MAX, through: Some(Timestamp(1_234_567)) }),
+        ]));
         let params = Bytes::from_static(b"\xff\x00\x83\x59");
         {
             let encoded = run(cut, Some(params.clone())).encode(&signer, &memory).unwrap();
@@ -298,6 +346,8 @@ mod tests {
             assert_eq!((decoded.database.as_str(), decoded.sql.as_str()), ("xtdb", "SELECT ?"));
             assert_eq!(decoded.search_path, ["public", "other"]);
             assert_eq!(decoded.params, Some(params));
+            let Cut::Visible(cut) = &decoded.basis.cut else { panic!("visible cut") };
+            assert_eq!((cut["empty"], cut["xtdb"]), (Visible { attachment: 3, through: None }, Visible { attachment: u64::MAX, through: Some(Timestamp(1_234_567)) }));
             let basis = decoded.basis.query_basis(BTreeSet::from(["attached".to_owned()]));
             assert_eq!(basis.current_time, Instant::new(-1, 999_999_999).unwrap());
             assert_eq!((basis.timezone.as_str(), basis.snapshot_time, basis.has_await_floor, basis.resume_token), ("Europe/Paris", Some(Timestamp(-1)), true, None));
@@ -339,5 +389,13 @@ mod tests {
         let Ok(Ticket::Inspect(decoded)) = Ticket::decode(&encoded, &signer) else { panic!("inspection ticket") };
         assert_eq!((decoded.database.as_str(), decoded.sql.as_str(), decoded.search_path.as_slice()), ("xtdb", "SHOW search_path", &["public".to_owned()][..]));
         assert_eq!(decoded.transaction.as_deref(), Some(&b"tx"[..]));
+        let handle = [9u8; 40];
+        let inspect = || Ticket::Inspect(Inspection { database: "xtdb".into(), transaction: Some(Bytes::copy_from_slice(&handle)), sql: "SHOW search_path".into(), search_path: Vec::new() })
+            .encode(&signer, &memory).unwrap();
+        let (masked, again) = (inspect(), inspect());
+        assert!(!masked.windows(8).any(|window| window == &handle[..8]));
+        assert_ne!(masked, again);
+        let Ok(Ticket::Inspect(decoded)) = Ticket::decode(&masked, &signer) else { panic!("masked inspection ticket") };
+        assert_eq!(decoded.transaction.as_deref(), Some(&handle[..]));
     }
 }

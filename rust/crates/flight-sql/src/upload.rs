@@ -80,7 +80,7 @@ impl Service {
                     let connection = self.tx_or_session(&call, transaction_id.as_ref()).await?;
                     drop(transaction_id);
                     grant.shrink_to(retained).map_err(status)?;
-                    self.execute_update(&connection, &query, None).await?; Ok(update_ack())
+                    Box::pin(self.execute_update(&connection, &query, None)).await?; Ok(update_ack())
                 }
                 Command::CommandPreparedStatementQuery(command) => {
                     let prepared = self.prepared(&call, &command.prepared_statement_handle)?;
@@ -100,7 +100,7 @@ impl Service {
                     drop(charge);
                     let arguments = upload.all_arguments().await?;
                     let connection = self.scoped(&call, &prepared.scope).await?;
-                    self.execute_update(&connection, &prepared.sql, arguments).await?; Ok(update_ack())
+                    Box::pin(self.execute_update(&connection, &prepared.sql, arguments)).await?; Ok(update_ack())
                 }
                 Command::CommandStatementIngest(mut command) => {
                     validate_ingest(&command, &call.database)?;
@@ -123,7 +123,7 @@ impl Service {
                             }
                         };
                         let operation = TxOp::PutArrowDocs { table: table.clone(), documents };
-                        if let Some(result) = native.state_mut().execute_operation(operation).await.map_err(status)? { if let Some(error) = result.error() { return Err(status(error.clone())); } }
+                        if let Some(result) = Box::pin(native.state_mut().execute_operation(operation)).await.map_err(status)? { if let Some(error) = result.error() { return Err(status(error.clone())); } }
                     }
                     Ok(update_ack())
                 }

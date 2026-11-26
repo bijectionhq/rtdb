@@ -12,7 +12,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::server::{Connected, TcpConnectInfo};
 use crate::{FlightConfig, service::Service};
-use crate::config::{AUDIENCE_H2_CONNECTION_WINDOW, AUDIENCE_H2_STREAM_WINDOW, AUDIENCE_H2_STREAMS, AUDIENCE_HOLDER_TRANSPORT_BYTES, AUDIENCE_REPLY_BYTES, AUDIENCE_REQUEST_BYTES};
+use crate::config::{AUDIENCE_H2_CONNECTION_WINDOW, AUDIENCE_H2_STREAM_WINDOW, AUDIENCE_H2_STREAMS, AUDIENCE_HOLDER_TRANSPORT_BYTES, AUDIENCE_REPLY_BYTES};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ServerStatus { pub active_calls: usize, pub sessions: usize, pub transactions: usize, pub prepared_statements: usize, pub stopped: bool }
@@ -118,7 +118,7 @@ impl ServerDriver {
         });
         let maximum = self.service.0.config.maximum_message_bytes;
         let server = FlightServiceServer::new(self.service.clone())
-            .max_decoding_message_size(if audience.is_some() { maximum.min(AUDIENCE_REQUEST_BYTES) } else { maximum })
+            .max_decoding_message_size(self.service.request_bytes())
             .max_encoding_message_size(if audience.is_some() { maximum.min(AUDIENCE_REPLY_BYTES) } else { maximum });
         let mut http = tonic::transport::Server::builder().http2_max_header_list_size(8192);
         if audience.is_some() {
