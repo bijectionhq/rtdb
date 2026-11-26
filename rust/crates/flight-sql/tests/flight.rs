@@ -2857,7 +2857,12 @@ async fn held_read_batch_reuses_scalar_results_authentication_and_failure_order(
     use rtdb_format::ipc::write_arrow_stream;
 
     fn request(prefix: &[u8], columns: Vec<(&str, ArrayRef)>) -> Bytes {
-        let batch = RecordBatch::try_from_iter(columns).unwrap();
+        // A non-nullable Null column is the bottom type, so a null control is declared nullable.
+        let columns = columns.into_iter().map(|(name, column)| {
+            let nullable = column.null_count() > 0 || column.data_type() == &DataType::Null;
+            (name, column, nullable)
+        });
+        let batch = RecordBatch::try_from_iter_with_nullable(columns).unwrap();
         let mut body = prefix.to_vec();
         body.extend(write_arrow_stream(batch.schema_ref(), &[batch.clone()], IpcWriteOptions::default()).unwrap());
         body.into()
