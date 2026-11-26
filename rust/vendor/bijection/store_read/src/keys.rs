@@ -34,10 +34,119 @@ pub const FLOOR: u8 = 0x03;
 const RELATION_DOMAIN: &[u8] = b"bijection.owned.relation\0";
 const PATH_DOMAIN: &[u8] = b"bijection.owned.path\0";
 
-/// The 16-byte tablet of a relation.
+/// What a restore does with a relation, decided by its name alone
+/// ([`restore_class`], D50.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestoreClass {
+    /// Installation state, an application relation or a carried `bj_engine_*`
+    /// relation: archived and replayed live.
+    Carried,
+    /// Authority (D22): archived as history and retracted at readmission, so
+    /// nothing acts under it until it is re-issued.
+    Inert,
+    /// Inert, and a hold live at the archive cut comes back cancelled with its
+    /// unit shredded (the private replay holds, store-cut-13).
+    Cancelled,
+    /// Installation-local placement, custody binding or serving mechanism:
+    /// never archived. The destination writes its own.
+    Skipped,
+}
+
+/// The prefix every internal relation is named under. An application
+/// relation never is.
+pub const INTERNAL_PREFIX: &str = "bj_";
+
+/// The internal relation prefixes and their restore classes, the one place
+/// they are defined, first match wins (so `bj_engine_replay_` precedes
+/// `bj_engine_`):
+///
+/// - `bj_engine_replay_`: the ordered private replay holds
+///   (`bj_engine_replay_<hex16>`, store-cut-13);
+/// - `bj_engine_`: carried engine relations (assertion families and the
+///   other `bj_engine_*` installation state);
+/// - `bj_sys_`: the `sys.*` facts (D50: `sys.grants`, `sys.standings`,
+///   `sys.root`, `sys.grant_reach`, `sys.organization_registry`,
+///   `sys.browser_policy` and the steward condition inputs), one relation
+///   per table and incarnation (`bj_sys_<table>_<incarnation key>`), and the
+///   Root and component owners (`bj_sys_root_owner_<hex16>`, `bj_sys_component_owner_<hex16>`);
+/// - `bj_local_`: the installation's writer row (`bj_local_installation`)
+///   and the other placement-local relations.
+///
+/// Every other name is unclassified unless it is an application relation
+/// ([`is_application_relation`]), and the archive refuses it: a new internal
+/// relation that forgets its prefix is never restored silently.
+/// No hosted control writes a relation under these prefixes.
+pub const RESTORE_CLASSES: [(&str, RestoreClass); 4] = [
+    ("bj_engine_replay_", RestoreClass::Cancelled),
+    ("bj_engine_", RestoreClass::Carried),
+    ("bj_sys_", RestoreClass::Inert),
+    ("bj_local_", RestoreClass::Skipped),
+];
+
+/// The platform relation prefixes: the internal prefixes whose relations
+/// carry the tablet mark and come back inert from a restore (D22,
+/// `archive::RestorePolicy::inert_relations`).
+pub const PLATFORM_PREFIXES: [&str; 2] = ["bj_sys_", "bj_engine_replay_"];
+
+/// Whether `relation` is an application relation: exactly one of
+/// `store_points::Partition::relation`'s per-partition forms,
+/// `fact_<layout digest: 64 lowercase hex>` or
+/// `fact_<table: 32 hex>_<t | y<part: 2 hex>>_<label id: 32 hex>`, with an
+/// unmarked tablet.
+pub fn is_application_relation(relation: &str) -> bool {
+    let hex = |text: &str, length: usize| text.len() == length && text.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
+    let Some(rest) = relation.strip_prefix("fact_") else { return false };
+    let named = match rest.split('_').collect::<Vec<_>>().as_slice() {
+        [digest] => hex(digest, 64),
+        [table, part, label] => hex(table, 32) && hex(label, 32)
+            && (*part == "t" || part.strip_prefix('y').is_some_and(|part| hex(part, 2))),
+        _ => false,
+    };
+    named && !is_platform_tablet(&tablet(relation))
+}
+
+/// The restore class of a declared relation: an internal relation by its
+/// prefix, an application relation ([`is_application_relation`]) carried,
+/// and every other name refused.
+pub fn restore_class(relation: &str) -> anyhow::Result<RestoreClass> {
+    if let Some((_, class)) = RESTORE_CLASSES.iter().find(|(prefix, _)| relation.starts_with(prefix)) {
+        return Ok(*class);
+    }
+    anyhow::ensure!(
+        is_application_relation(relation),
+        "rtdb.owned/restore-unclassified: the relation {relation} has no restore class"
+    );
+    Ok(RestoreClass::Carried)
+}
+
+/// The high bit of a tablet's first byte marks a platform relation, so a
+/// stored key tells a platform row from an application row by itself
+/// ([`layout::row_tablet`] then [`is_platform_tablet`]).
+const PLATFORM_MARK: u8 = 0x80;
+
+/// Whether `relation` is one of the engine's platform relations.
+pub fn is_platform_relation(relation: &str) -> bool {
+    PLATFORM_PREFIXES.iter().any(|prefix| relation.starts_with(prefix))
+}
+
+/// Whether a stored tablet is a platform relation's (D50). Application
+/// tablets never carry the mark.
+pub fn is_platform_tablet(tablet: &[u8; 16]) -> bool {
+    tablet[0] & PLATFORM_MARK != 0
+}
+
+/// The 16-byte tablet of a relation: the first 16 bytes of its name's
+/// digest, with the first byte's high bit set for a platform relation and
+/// clear for every other.
 pub fn tablet(relation: &str) -> [u8; 16] {
     let digest = Sha256::digest([RELATION_DOMAIN, relation.as_bytes()].concat());
-    digest[..16].try_into().expect("A digest has 32 bytes")
+    let mut tablet: [u8; 16] = digest[..16].try_into().expect("A digest has 32 bytes");
+    if is_platform_relation(relation) {
+        tablet[0] |= PLATFORM_MARK;
+    } else {
+        tablet[0] &= !PLATFORM_MARK;
+    }
+    tablet
 }
 
 /// The 16-byte tablet of one path of a relation.
@@ -400,4 +509,50 @@ pub fn binary_id_prefix(place: impl Into<Place>, relation: &str, prefix: &[u8]) 
     let id = [&[2u8][..], prefix].concat();
     let segments = [segment::segment(&tablet(relation)), segment::escaped(&id)].concat();
     KeyRange::prefix(&layout::stored(place, Family::Row as u8, &segments))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The restore class is a closed match (D50.2): every internal prefix
+    /// has its class, application relations are carried, and any other
+    /// `bj_*` relation is refused.
+    #[test]
+    fn the_restore_class_is_a_closed_match() {
+        for (relation, class) in [
+            ("bj_sys_grants_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(), RestoreClass::Inert),
+            ("bj_sys_root_owner_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(), RestoreClass::Inert),
+            ("bj_engine_replay_aaaaaaaaaaaaaaaa".to_owned(), RestoreClass::Cancelled),
+            ("bj_engine_af_families".to_owned(), RestoreClass::Carried),
+            ("bj_local_installation".to_owned(), RestoreClass::Skipped),
+            (format!("fact_{}", "ab".repeat(32)), RestoreClass::Carried),
+            (format!("fact_{}_t_{}", "01".repeat(16), "02".repeat(16)), RestoreClass::Carried),
+            (format!("fact_{}_y0a_{}", "01".repeat(16), "02".repeat(16)), RestoreClass::Carried),
+        ] {
+            assert_eq!(restore_class(&relation).unwrap(), class, "{relation}");
+        }
+        for unclassified in [
+            "bj_installation".to_owned(), "bj_fact_root_admission".to_owned(), "bj_".to_owned(), "docs".to_owned(),
+            "fact_publications".to_owned(), "fact_attempts".to_owned(),
+            format!("fact_{}", "AB".repeat(32)), format!("fact_{}", "ab".repeat(31)),
+            format!("fact_{}_z_{}", "01".repeat(16), "02".repeat(16)),
+        ] {
+            assert!(restore_class(&unclassified).unwrap_err().to_string().contains("rtdb.owned/restore-unclassified"), "{unclassified}");
+        }
+    }
+
+    /// No application relation's tablet carries the platform mark, whatever
+    /// its name, and every platform relation's does.
+    #[test]
+    fn no_application_tablet_carries_the_platform_mark() {
+        for n in 0..20_000u32 {
+            for relation in [format!("fact_{n:064x}"), format!("bj_fact_{n}"), format!("r{n}"), format!("bj_sysx{n}")] {
+                assert!(!is_platform_tablet(&tablet(&relation)), "{relation}");
+            }
+            for prefix in PLATFORM_PREFIXES {
+                assert!(is_platform_tablet(&tablet(&format!("{prefix}{n:032x}"))));
+            }
+        }
+    }
 }
