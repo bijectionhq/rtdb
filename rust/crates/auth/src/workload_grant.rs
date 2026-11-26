@@ -541,7 +541,7 @@ impl VerifiedWorkloadGrant {
 
     pub(super) fn memory_bytes(&self) -> usize {
         self.database.capacity() + match &self.permission {
-            Permission::Create(_) | Permission::OriginalCustody(_) => 0,
+            Permission::Create(_) | Permission::OriginalCustody(_) | Permission::StoreFence(_) => 0,
             Permission::Assignment { .. } | Permission::OriginalFamily { .. } | Permission::FundedAppointment { .. } => 8192,
             Permission::OriginalFamilyReadback { .. } => 16 * 1024,
         }
