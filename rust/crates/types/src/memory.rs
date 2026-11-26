@@ -17,8 +17,9 @@ pub struct MemoryBudget {
 #[derive(Clone, Copy, Debug)]
 struct Refusal { bytes: usize, limit: usize, retained: usize }
 
-impl From<Refusal> for Anomaly {
-    fn from(Refusal { bytes, limit, retained }: Refusal) -> Self {
+impl Refusal {
+    fn into_anomaly(self) -> Anomaly {
+        let Self { bytes, limit, retained } = self;
         Anomaly::incorrect("rtdb/memory-budget-exceeded", format!("Cannot reserve {bytes} bytes from budget {limit} with {retained} retained"))
             .with_kind(AnomalyKind::ResourceExhausted)
     }
@@ -72,7 +73,7 @@ impl MemoryBudget {
     /// Reserves bytes without waiting; release occurs when the last reservation handle drops.
     /// Exceeding this budget or an ancestor limit, including size overflow, returns an error of kind `ResourceExhausted`.
     pub fn reserve(self: &Arc<Self>, bytes: usize) -> Result<Arc<MemoryReservation>> {
-        self.admit(bytes)?;
+        self.admit(bytes).map_err(Refusal::into_anomaly)?;
         Ok(self.lease(bytes))
     }
 
@@ -94,7 +95,7 @@ impl MemoryBudget {
         let bytes = backing.len().checked_mul(std::mem::size_of::<Arc<MemoryReservation>>())
             .and_then(|slots| bytes.checked_add(slots))
             .ok_or_else(|| Anomaly::incorrect("rtdb/reservation-size", "Combined reservation exceeds addressable memory"))?;
-        self.admit(bytes)?;
+        self.admit(bytes).map_err(Refusal::into_anomaly)?;
         Ok(Arc::new(MemoryReservation { budget: Arc::clone(self), bytes, backing: backing.collect() }))
     }
 
@@ -180,7 +181,7 @@ impl MemoryReservation {
     pub fn grow_to(&mut self, bytes: usize) -> Result<()> {
         let additional = bytes.checked_sub(self.bytes)
             .ok_or_else(|| Anomaly::incorrect("rtdb/reservation-shrink", "Reservation growth requires at least the held bytes"))?;
-        self.budget.admit(additional)?;
+        self.budget.admit(additional).map_err(Refusal::into_anomaly)?;
         self.bytes = bytes;
         Ok(())
     }
