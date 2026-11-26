@@ -249,17 +249,29 @@ impl MemoryBudget {
 
     /// Estimates the bytes available under this limit and all ancestor limits.
     /// A subsequent reservation still checks the shared limits.
-    /// Unspent credit on this chain counts as available, since a refused reservation reclaims it.
+    /// Unspent credit counts as available, since a refused reservation reclaims it: on a chain through a credited budget,
+    /// that budget's credit, and otherwise, at the root, the credit of every credited budget beneath it.
     pub fn available_bytes(&self) -> usize {
-        let mut available = self.limit_bytes.saturating_sub(self.used_bytes());
-        let mut credit = self.credit.as_ref().map_or(0, Credit::outstanding);
-        let mut budget = self;
-        while let Some(parent) = &budget.parent {
-            available = available.min(parent.limit_bytes.saturating_sub(parent.used_bytes().saturating_sub(credit)));
-            credit = credit.saturating_add(parent.credit.as_ref().map_or(0, Credit::outstanding));
-            budget = parent;
+        let mut available = usize::MAX;
+        let mut credit: Option<usize> = None;
+        let mut budget = Some(self);
+        while let Some(current) = budget {
+            let reclaimable = match credit {
+                Some(credit) => credit,
+                None if current.parent.is_none() => current.registered_credit(),
+                None => 0,
+            };
+            available = available.min(current.limit_bytes.saturating_sub(current.used_bytes().saturating_sub(reclaimable)));
+            if let Some(own) = &current.credit { credit = Some(credit.unwrap_or(0).saturating_add(own.outstanding())); }
+            budget = current.parent.as_deref();
         }
         available
+    }
+
+    fn registered_credit(&self) -> usize {
+        let Ok(credited) = self.credited.lock() else { return 0 };
+        credited.iter().filter_map(Weak::upgrade)
+            .fold(0usize, |total, budget| total.saturating_add(budget.credit.as_ref().map_or(0, Credit::outstanding)))
     }
 }
 

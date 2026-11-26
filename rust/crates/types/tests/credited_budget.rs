@@ -134,6 +134,24 @@ fn a_reservation_that_does_not_fit_is_refused_under_concurrent_credit() {
 }
 
 #[test]
+fn unspent_credit_counts_as_available_on_the_root_and_through_the_child() {
+    let limit = 64 << 10;
+    let root = MemoryBudget::new(limit);
+    let child = root.credited();
+    drop(child.reserve(100).unwrap());
+    assert!(root.used_bytes() > 0, "the child keeps its unspent credit");
+    assert_eq!(root.available_bytes(), limit);
+    assert_eq!(child.available_bytes(), limit);
+    assert_eq!(child.scope().available_bytes(), limit);
+    let whole = root.reserve(root.available_bytes()).unwrap();
+    assert_eq!(root.available_bytes(), 0);
+    assert!(root.reserve(1).is_err());
+    drop(whole);
+    drop(child);
+    assert_eq!(root.used_bytes(), 0);
+}
+
+#[test]
 fn growing_a_credited_reservation_is_admitted_exactly() {
     let root = MemoryBudget::new(20_000);
     let child = root.credited();
