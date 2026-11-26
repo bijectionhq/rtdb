@@ -144,7 +144,7 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
         let _scratch = self.memory.reserve(retained.checked_mul(32).and_then(|n| n.checked_add(8192)).ok_or_else(|| protocol("Error detail too large"))?)?;
         let detail = if error.context.contains_key("sql-state") { None } else { rtdb_pg_codec::encode_error(error, fallback).ok().and_then(|bytes| String::from_utf8(bytes).ok()) };
         let severity = if fatal { "FATAL" } else { "ERROR" };
-        let mut fields = vec![(b'S', severity), (b'V', severity), (b'C', crate::error::state(error)), (b'M', error.message.as_deref().unwrap_or(""))];
+        let mut fields = vec![(b'S', severity), (b'V', severity), (b'C', crate::error::frame_state(error)), (b'M', error.message.as_deref().unwrap_or(""))];
         if let Some(detail) = &detail { fields.push((b'D', detail)); }
         if matches!(error.code.as_str(), rtdb_node::NOT_HELD | "xtdb/ingestion-stopped" | "rtdb.storage/closed") { fields.push((ANOMALY_CODE_FIELD, &error.code)); }
         if matches!(error.code.as_str(), "xtdb/prepared-query-out-of-date" | "prepared-query-out-of-date") { fields.push((b'R', "RevalidateCachedQuery")); }
