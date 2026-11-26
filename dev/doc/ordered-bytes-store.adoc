@@ -10,6 +10,7 @@ The `rtdb.owned.*` and Bijection-specific `rtdb.v1.*` actions are retired onto t
 The wire is `rust/proto/rtdb.store.v1.proto`, served as Flight `DoAction` calls on an unscoped database route.
 
 `rtdb.store.v1.Read`:: Returns the live entries of each requested range, ascending by key, at one version.
+The reply carries the serving node's clock sample at the read, `clock_micros`, so the host opens its present in the clock domain that stamps commits.
 With `reverse`, each page descends by key: the limit counts from the range's end and a stopped page names its smallest key, before which the next page resumes.
 A reverse read equals the ascending read at the same version reversed, for every projection and filter, so "the latest at or before" is a one-entry read and no caller inverts its keys.
 All ranges of one request read the same version.
@@ -50,12 +51,18 @@ It always reports how far it inspected, so a caller resumes from there.
   The host makes labels key partitions, so a write the reader's label does not admit lies outside the reader's ranges and never refuses it.
 * Validation and invalidation are the same matching: `Watch` reports exactly the versions that would refuse an `Append` reading the same ranges.
   Conflicts are judged over the stamped keys.
-* Stamp micros never decrease along versions and are never raised to a predecessor's.
-  A sample at or behind the last commit's time (two commits in one microsecond, or a failover writer's clock) is waited out before the append is judged again.
-  So a stamp is seekable by time and by version alike, and whether an append is `outside` depends on the clock alone.
-* RTDB's stamps' micros in fact strictly increase, which the host's non-decreasing contract admits.
-  System time strictly increases along positions because Default's shared physical partition names a transaction by its system time: its stage carries no event position, and its recovery groups events into transactions by time.
-  So the writer samples its clock for each append at that append's ordering point, a batched group included, and a commit waits only when two samples fall in one microsecond.
+* Stamp micros never decrease along versions and are never raised.
+  *Ties are admitted:* versions order the commits sampled in one microsecond.
+  Whether an append is `outside` depends on its own sample and its window alone, never on another append's time.
+  The store decides regression, the window and the stamp through Bijection's `fact_store::persistence::judge::admit`, which RTDB vendors byte for byte as `rust/vendor/bijection-store-judge` (pinned by SHA-256 in both repositories).
+* The writer's clock never issues a sample below one it has issued, and the clock's own contract ensures it, not the appends.
+  A Multi writer holds a durable clock lease (`Record::Lease { until }`), renewed on the clock's schedule and never per append: it samples only while its clock plus the drift bound is before `until`, and a successor writer starts only once its clock passes the predecessor's `until` plus the drift bound.
+  The successor waits once, at takeover, and that wait depends on the lease alone, never on whether the last commits were hidden.
+  A sample below the head's time is the writer clock's fault (`rtdb.store/clock-regressed`), never a wait and never raised.
+* *Positions name transactions.*
+  A commit's system time is its sample, and so is a conflict's, a bound refusal's and a validation's record time: no record time is minted past the head's.
+  System time is a non-decreasing coordinate, and the position identifies a transaction.
+  The writer samples its clock for each append at that append's ordering point, a batched group included; samples may tie, and nothing waits.
 
 == Atomic multi-place commits
 
@@ -73,17 +80,39 @@ An entry's id is its key bytes and its `v` cell holds the value.
 The resolver judges the guards over the same branch index every other guard reads, then the window against its clock sample, which becomes the commit's system time, and then each `Bound` against the live 8-byte signed big-endian entry (absent = `0`).
 It fills the placeholders and applies the stamped writes and updated bound counters as puts and deletes of `store.entries`.
 A failing bound records `Outcome::Refused` with `rtdb.store/bound` and its index as a receipt under the append's key and writes nothing.
-A sample at or behind the head's time refuses as `rtdb.store/clock-behind`, and the Flight action waits it out and retries.
+The clock sample is judged by `store_judge::admit` (the vendored `judge.rs`): below the head's time it faults as `rtdb.store/clock-regressed`; outside the window it answers `outside`; otherwise a write-free append validates and any other commits with stamp `{ sample, position }`.
+No pending timed v1 transaction blocks a store append, and no shared-main time floor raises one: each append settles at its own position.
 
 == Ordering ceiling and sharded resolution
 
 An installation's appends share one version line.
 Today one holder bounds ordering, resolution and its resident set (object storage is elastic).
 RTDB's target splits an ordering tier from place-sharded resolvers and storage, with epoch-fenced place handoff and no change to commit order (`verification/tla/ShardedOrder.tla`).
-A conflict and a validation carry no stamp: their records take the next time past the head when the sample does not pass it, as a native transaction's does.
+A conflict and a validation carry no stamp, and their records take the sample as their time, as a commit does.
 A write-free append is therefore not a v1 validation (`Transact::validates_only`), which answers at the acquired basis without a record: it is ordered and appended like a commit, so every append needs write access.
 `Read` reads a branch view at the selected cut, and `Watch` filters the v1 change feed by key range.
 
 Scan pushdown, columnar projection and batching are mechanism under this contract.
 The host's contract suite (`fact_store::persistence::contract` in Bijection) runs one case list against this store and against its reference store.
 Each must return what an unpushed read followed by host-side filtering returns.
+
+== Remaining position cutover (T7)
+
+Ties reach the shared Default partition now. These sites still identify a transaction's events by system time and must name them by position (`EventPosition { transaction, ordinal }`, carried on every Default event) before tied transactions there are distinguished:
+
+* the Default live stage writes `position: None` for classic events (`rust/crates/index/src/live.rs`, `put`, `delete`, `erase_iid`), and the data files carry no `EVENT_POSITION_FIELD` for them (`rust/crates/format/src/data.rs`);
+* classic recovery refuses a second committed transaction at one system time and matches events to their transaction by `system_from` (`rust/crates/multi/src/archive/reader/classic_migration/application.rs`, `observe_transaction`, `observe_event`);
+* replica and replay decoders require `system_from == key.system_time` per transaction (`rust/crates/tx/src/replica.rs`, `rust/crates/tx/src/replica/worlds.rs`, `rust/crates/tx/src/hosted_control/replay_rank.rs`, `rust/crates/tx/src/resolver/relation_adoption.rs`);
+* event-to-transaction matching and position masks compare `system_from` (`rust/crates/index/src/event_revision.rs`, `rust/crates/query/src/scan.rs` position mask, `rust/crates/search/src/accelerate.rs`);
+* compaction groups an entity's versions by `system_from` (`rust/crates/maintenance/src/merge.rs`, `SameTimeState`), so two tied transactions writing one entity need a position tiebreak;
+* the owned wire and archive name a commit by its system time (`rust/crates/node/src/node/owned_changes.rs`, `rust/crates/multi/src/archive/writable_world*.rs`).
+
+Until then classic migration refuses a second committed transaction at one system time as invalid (`observe_transaction`), and the other sites above can attribute a tied transaction's events to its twin.
+
+== Verification obligations (T7)
+
+* V9′: `TransactState::resolve_store`'s clock decision equals `judge::admit(head, last, sample, not_before, before, write_free)` with no comparison of the sample against the last stamp beyond `admit`'s own regression check.
+  Control: re-adding `stamped && now == floor` must break it.
+* `PositionNamedRecovery.tla`: recovery groups events by position and keeps transactions atomic (`TxAtomic`); grouping by system time with ties merges two transactions (control config).
+* `WriterClockLease.tla`: samples stay monotone across takeover and restore, and the takeover wait is independent of hidden appends; fencing on the last stamp keeps monotonicity but breaks the paired-history invariant (control config).
+
