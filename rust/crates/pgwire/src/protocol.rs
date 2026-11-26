@@ -181,6 +181,8 @@ pub(crate) struct ProtocolSession {
     reported_settings: u64,
     statements: BTreeMap<String, RegisteredStatement>,
     portals: BTreeMap<String, Portal>,
+    /// Portals a finished transaction closed, dropped once the message that closed them has been answered.
+    retired: BTreeMap<String, Portal>,
     copy: Option<crate::copy::CopyInput>,
     replay_permit: Option<GatewayReplayPermit>,
     /// The encoding environment last built, with the session's parameters revision it copied.
@@ -190,7 +192,7 @@ impl ProtocolSession {
     pub fn new(session: NativeSession, node: Node, config: Arc<ServerConfig>, startup: Startup, cancellations: Arc<CancellationSlot>) -> Self {
         let reported_settings = session.state().settings_revision();
         Self { session, node, config, startup, cancellations, extended: false, skip_until_sync: false, implicit: false, transaction_generation: 0,
-            reported_await_token: 0, reported_settings, statements: BTreeMap::new(), portals: BTreeMap::new(), copy: None, replay_permit: None, environment_cache: None }
+            reported_await_token: 0, reported_settings, statements: BTreeMap::new(), portals: BTreeMap::new(), retired: BTreeMap::new(), copy: None, replay_permit: None, environment_cache: None }
     }
     pub fn extended(&self) -> bool { self.extended }
     pub fn portal_deadline(&self) -> Option<std::time::Instant> {
@@ -199,7 +201,7 @@ impl ProtocolSession {
     pub fn expire_portals(&mut self, now: std::time::Instant) {
         self.portals.retain(|_, portal| portal.retention_deadline().is_none_or(|deadline| deadline > now));
     }
-    pub fn close(&mut self) { self.copy = None; self.portals.clear(); self.statements.clear(); self.environment_cache = None; self.session.state_mut().close(); }
+    pub fn close(&mut self) { self.copy = None; self.portals.clear(); self.retired.clear(); self.statements.clear(); self.environment_cache = None; self.session.state_mut().close(); }
     fn environment(&mut self) -> Result<Arc<SessionEnvironment>> {
         let state = self.session.state();
         let revision = state.parameters_revision();
@@ -241,7 +243,7 @@ impl ProtocolSession {
     }
     fn options(&self) -> rtdb_sql::PrepareOptions { rtdb_sql::PrepareOptions { search_path: search_path(self.session.state().parameter("search_path").unwrap_or("public")), ..Default::default() } }
     fn begin_implicit(&mut self, read_only: Option<bool>) -> Result<()> { if self.session.state().status() != TransactionStatus::Idle { return Ok(()); } let mut settings = rtdb_node::TransactionSettings::default(); settings.access = read_only.map(|read_only| if read_only { rtdb_node::AccessSettings::ReadOnly(Default::default()) } else { rtdb_node::AccessSettings::ReadWrite(Default::default()) }); self.session.state_mut().begin_with(settings)?; self.implicit = true; Ok(()) }
-    fn end_transaction(&mut self) { self.portals.clear(); self.implicit = false; self.transaction_generation = self.transaction_generation.wrapping_add(1); }
+    fn end_transaction(&mut self) { self.retired.append(&mut self.portals); self.implicit = false; self.transaction_generation = self.transaction_generation.wrapping_add(1); }
     async fn commit(&mut self, permit: Option<ReplaySubmissionPermit>) -> Result<()> {
         let _sample = rtdb_plan::ExecutionSample::new(self.node.execution_observer(), rtdb_plan::ExecutionTimer::PgwireTransaction);
         let state = self.session.state_mut();
@@ -256,6 +258,12 @@ impl ProtocolSession {
     fn rollback(&mut self) -> Result<()> { self.session.state_mut().rollback_tx()?; self.end_transaction(); Ok(()) }
 
     pub async fn handle<W: AsyncWrite + Unpin>(&mut self, frame: Frame, writer: &mut Writer<W>) -> Result<()> {
+        let result = self.dispatch(frame, writer).await;
+        self.retired.clear();
+        result
+    }
+
+    async fn dispatch<W: AsyncWrite + Unpin>(&mut self, frame: Frame, writer: &mut Writer<W>) -> Result<()> {
         if self.replay_permit.is_some() && frame.tag != b'Q' {
             return Err(protocol("A gateway replay permit must be followed by a simple query"));
         }
@@ -860,6 +868,7 @@ impl ProtocolSession {
             let permit = if single_autocommit { permit.take() } else { None };
             let result = self.run_simple_statement(statement, single_autocommit, permit, writer).await;
             self.simple_statement_result(result, writer).await?;
+            self.retired.clear();
         }
         drop(batch);
         self.settle_simple_transaction().await.map_err(Into::into)
@@ -2280,6 +2289,73 @@ mod tests {
         for (command, tag) in [("INSERT", "INSERT 0 0"), ("UPDATE", "UPDATE 0"), ("DELETE", "DELETE 0"), ("PATCH", "PATCH 0"), ("ERASE", "ERASE 0"), ("CREATE", "CREATE TABLE"), ("MERGE", "MERGE"), ("", "")] {
             assert_eq!(dml_tag(command), tag);
         }
+    }
+
+    #[tokio::test]
+    async fn sync_answers_before_the_finished_transaction_releases_its_portals() {
+        use std::{io, pin::Pin, sync::{Mutex, Weak}, task::{Context, Poll}};
+
+        #[derive(Default)]
+        struct Log { bytes: Vec<u8>, watched: Option<Weak<MemoryReservation>>, flushes: Vec<bool> }
+        struct Probe(Arc<Mutex<Log>>);
+        impl AsyncWrite for Probe {
+            fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> {
+                self.0.lock().unwrap().bytes.extend_from_slice(bytes);
+                Poll::Ready(Ok(bytes.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                let mut log = self.0.lock().unwrap();
+                let alive = log.watched.as_ref().is_some_and(|charge| charge.upgrade().is_some());
+                log.flushes.push(alive);
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> { Poll::Ready(Ok(())) }
+        }
+
+        let (mut frontend, driver) = test_frontend(false).await;
+        let node = frontend.node.clone();
+        let driver = tokio::spawn(driver.run());
+        let memory = Arc::clone(node.memory());
+        let log = Arc::new(Mutex::new(Log::default()));
+        let mut writer = Writer::new(Probe(Arc::clone(&log)), Arc::clone(&memory));
+        let frame = |tag: u8, body: Vec<u8>| { let charge = memory.reserve(body.len() * 16 + 8192).unwrap(); Frame { tag, body, charge } };
+        let mut parse = Vec::new();
+        crate::wire::cstring(&mut parse, "one").unwrap();
+        crate::wire::cstring(&mut parse, "SELECT 1 AS n").unwrap();
+        parse.extend_from_slice(&0u16.to_be_bytes());
+        let mut bind = Vec::new();
+        crate::wire::cstring(&mut bind, "").unwrap();
+        crate::wire::cstring(&mut bind, "one").unwrap();
+        bind.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        let mut execute = Vec::new();
+        crate::wire::cstring(&mut execute, "").unwrap();
+        execute.extend_from_slice(&0i32.to_be_bytes());
+
+        for round in 0..2 {
+            if round == 0 { frontend.handle(frame(b'P', parse.clone()), &mut writer).await.unwrap(); }
+            let bind = frame(b'B', bind.clone());
+            log.lock().unwrap().watched = Some(Arc::downgrade(&bind.charge));
+            frontend.handle(bind, &mut writer).await.unwrap();
+            frontend.handle(frame(b'E', execute.clone()), &mut writer).await.unwrap();
+            assert!(frontend.portals.contains_key(""));
+            frontend.handle(frame(b'S', Vec::new()), &mut writer).await.unwrap();
+            assert!(frontend.portals.is_empty() && frontend.retired.is_empty());
+            let log = log.lock().unwrap();
+            assert!(log.watched.as_ref().unwrap().upgrade().is_none());
+            assert_eq!(log.flushes.last(), Some(&true));
+            assert_eq!(log.bytes.rchunks(6).next(), Some(&b"Z\0\0\0\x05I"[..]));
+        }
+        let bytes = std::mem::take(&mut log.lock().unwrap().bytes);
+        let mut reader = crate::wire::Reader::new(bytes.as_slice(), Arc::clone(&memory));
+        let mut tags = Vec::new();
+        while let Some(frame) = reader.read(1 << 20).await.unwrap() {
+            assert_ne!(frame.tag, b'E', "{}", String::from_utf8_lossy(&frame.body));
+            tags.push(frame.tag);
+        }
+        assert_eq!(tags, b"12DCZ2DCZ");
+        drop((writer, frontend));
+        node.shutdown();
+        driver.await.unwrap().unwrap();
     }
 }
 
