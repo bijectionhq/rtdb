@@ -25,6 +25,7 @@ mod pipeline;
 mod ranked;
 mod rotation;
 mod retirement;
+mod timing;
 pub use classic_migration::{ClassicInstallation, classic_import_basis};
 pub use pin::{NativeCheckpointInstallation, NativeDependentCarrier, NativeDependentOriginal, PinnedExport};
 pub use pipeline::WritePipeline;
@@ -581,13 +582,16 @@ impl MultiDatabase {
     }
 
     pub async fn checkpoint(&mut self, files: Vec<ObjectId>) -> Result<ObjectId> {
+        let mut timing = timing::Phases::start();
         self.refresh().await?;
+        timing.mark("refresh");
         let lease = self.authority()?;
         if self.state().transactions.pending_erasure().is_some() {
             return Err(erasure_pending());
         }
         self.require_destroyed_generation()?;
         let closure = self.reachability(lease).await?;
+        timing.mark("reachability");
         self.validate_files(&closure, &files)?;
         let manifest = Manifest {
             files,
@@ -599,6 +603,7 @@ impl MultiDatabase {
                 self.state().coordinates,
             )?,
         };
+        timing.mark("payload");
         let through = self.state().head;
         let generation = self.state().generation;
         let writer = self.writer.as_mut().ok_or_else(no_writer)?;
@@ -606,7 +611,9 @@ impl MultiDatabase {
             .objects
             .manifest(self.stream.kms.as_ref(), generation, &manifest)
             .await?;
+        timing.mark("seal");
         image.put(self.store.as_ref()).await?;
+        timing.mark("put");
         let checkpoint = Checkpoint {
             manifest: image.id(),
             through: through.0,
@@ -615,7 +622,10 @@ impl MultiDatabase {
         };
         self.append_control(lease, Record::Checkpoint(checkpoint))
             .await?;
+        timing.mark("append");
         self.trim(lease, through).await?;
+        timing.mark("trim");
+        timing.report(self.options.database, manifest.payload.len(), through);
         Ok(image.id())
     }
 
