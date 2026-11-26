@@ -305,6 +305,7 @@ pub async fn serve(launch: Launch, stop: CancellationToken) -> Result<()> {
     }
     let password = Secret::new(std::str::from_utf8(&password).expect("validated ASCII"));
     let mut flight = FlightSettings::default();
+    flight.store_only = true;
     if let Some(path) = &launch.custody_provider_config {
         let bytes = Zeroizing::new(read_bounded(private_input(path)?, 64 * 1024)?);
         let config = std::str::from_utf8(&bytes)

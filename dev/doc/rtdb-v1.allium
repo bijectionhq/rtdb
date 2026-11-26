@@ -183,6 +183,10 @@ surface StatelessDatabase {
         -- A null value conforms to any declared column.
         -- Checkpoints and followers retain whether a table is declared, its _id type and its declared columns.
 
+    @guarantee StandaloneStoreContract
+        -- A standalone installation's Flight listener serves rtdb.store.v1 and rtdb.admin.v1 of the v1 surface, and nothing else of it.
+        -- It refuses every other rtdb.v1 action and every rtdb.v1 query or changes ticket.
+
     @guarantee OrderedIndexCatalog
         -- An ordered index declaration preserves its columns in the order sent by the caller.
         -- Query of xt.ordered_indexes reads the definitions present at its selected applied cut.

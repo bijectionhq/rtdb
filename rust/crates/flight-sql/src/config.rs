@@ -142,6 +142,9 @@ pub struct FlightConfig {
     pub sweep_interval: Duration,
     pub maximum_message_bytes: usize,
     pub owned_native_actions: bool,
+    /// Serve only `rtdb.store.v1` and `rtdb.admin.v1` of the v1 surface: the
+    /// standalone installation's one contract with Bijection.
+    pub store_only: bool,
     pub hosted_controls: Option<HostedControlConfig>,
     pub custody_providers: std::collections::BTreeMap<String, Arc<crate::CustodyProviderRoute>>,
     /// An exclusive listener for this installed audience.
@@ -162,7 +165,7 @@ pub struct FlightConfig {
 }
 impl Default for FlightConfig {
     fn default() -> Self {
-        Self { address: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9839), transaction_idle_timeout: Duration::from_secs(1800), prepared_statement_idle_timeout: Duration::from_secs(1800), session_idle_timeout: Duration::from_secs(1800), session_unclaimed_timeout: Duration::from_secs(60), sweep_interval: Duration::from_secs(10), maximum_message_bytes: 64 * 1024 * 1024, owned_native_actions: false, hosted_controls: None, custody_providers: Default::default(), audience: None, reserved_applied_source: None, maximum_concurrent_calls: 256, playground: false, forwarded_peer: None, classic_flight_exclusion: None, owned_world_host: None,
+        Self { address: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9839), transaction_idle_timeout: Duration::from_secs(1800), prepared_statement_idle_timeout: Duration::from_secs(1800), session_idle_timeout: Duration::from_secs(1800), session_unclaimed_timeout: Duration::from_secs(60), sweep_interval: Duration::from_secs(10), maximum_message_bytes: 64 * 1024 * 1024, owned_native_actions: false, store_only: false, hosted_controls: None, custody_providers: Default::default(), audience: None, reserved_applied_source: None, maximum_concurrent_calls: 256, playground: false, forwarded_peer: None, classic_flight_exclusion: None, owned_world_host: None,
             #[cfg(feature = "multi")]
             deployment_admin: None,
             #[cfg(feature = "multi")]

@@ -328,6 +328,7 @@ fn owned_flight_settings(
     };
     Ok(Some(FlightSettings {
         owned_native_actions: true,
+        store_only: true,
         hosted_controls: relations.map(|relations| HostedControlConfig {
             owner: "xtdb".to_owned(),
             relations,

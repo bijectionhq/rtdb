@@ -371,7 +371,7 @@ impl ServerDriver {
             let ordinary = rtdb_flight_sql::FlightConfig { address: address(&settings.host, settings.port).await?,
                 transaction_idle_timeout: settings.transaction_idle_timeout, prepared_statement_idle_timeout: settings.prepared_statement_idle_timeout,
                 session_idle_timeout: settings.session_idle_timeout, session_unclaimed_timeout: settings.session_unclaimed_timeout, playground: config.playground,
-                forwarded_peer: flight_peer, classic_flight_exclusion, owned_world_host: flight_owned_worlds, owned_native_actions: settings.owned_native_actions,
+                forwarded_peer: flight_peer, classic_flight_exclusion, owned_world_host: flight_owned_worlds, owned_native_actions: settings.owned_native_actions, store_only: settings.store_only,
                 hosted_controls: settings.hosted_controls.clone(), custody_providers,
                 #[cfg(feature = "multi")]
                 deployment_admin: config.deployment_admin.clone(),

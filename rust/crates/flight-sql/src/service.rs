@@ -865,6 +865,9 @@ impl FlightService for Service {
     async fn do_get(&self, request: Request<flight::Ticket>) -> Result<Response<Self::DoGetStream>, Status> {
         let ticket = &request.get_ref().ticket;
         if let Some(command) = crate::v1::ticket(ticket) {
+            if self.0.config.store_only {
+                return Err(Status::unimplemented("This listener serves rtdb.store.v1, not rtdb.v1 queries"));
+            }
             let kind = match &command {
                 crate::v1::Ticket::Query(_) => CallKind::V1Query,
                 crate::v1::Ticket::Changes(_) => CallKind::V1Changes,
@@ -887,6 +890,9 @@ impl FlightService for Service {
     async fn do_action(&self, request: Request<flight::Action>) -> Result<Response<Self::DoActionStream>, Status> {
         let name = request.get_ref().r#type.as_str();
         if crate::v1::is_action(name) {
+            if self.0.config.store_only && !crate::v1::store_only_admits(name) {
+                return Err(Status::unimplemented(format!("This listener serves rtdb.store.v1, not {name}")));
+            }
             let kind = match name {
                 crate::v1::CAPABILITIES => CallKind::V1Capabilities,
                 crate::v1::exact_read::OPEN | crate::v1::exact_read::CLOSE => CallKind::V1ExactRead,

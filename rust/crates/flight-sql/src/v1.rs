@@ -77,6 +77,12 @@ pub(crate) fn ticket(bytes: &Bytes) -> Option<Ticket> {
     }
 }
 
+/// The v1 actions a store-only listener serves: the ordered-bytes store and
+/// deployment administration.
+pub(crate) fn store_only_admits(name: &str) -> bool {
+    store::ACTIONS.contains(&name) || name.starts_with("rtdb.admin.v1.")
+}
+
 pub(crate) fn is_action(name: &str) -> bool {
     ACTIONS.contains(&name) || store::ACTIONS.contains(&name) || name == custody::RELEASE || name == scoped_hold::ACTION || name == original_family_landing::ACTION || name == original_family_readback::ACTION || name == original_family_landing::private_replay::ACTION || name.starts_with("rtdb.admin.v1.")
 }
@@ -618,5 +624,20 @@ fn trailer(message: impl Message) -> FlightData {
     FlightData {
         app_metadata: message.encode_to_vec().into(),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod store_only_tests {
+    use super::*;
+
+    #[test]
+    fn a_store_only_listener_admits_the_store_and_administration_alone() {
+        for action in [store::READ, store::APPEND, store::WATCH, MANAGED_CREATE, "rtdb.admin.v1.DeleteDeployment"] {
+            assert!(store_only_admits(action), "{action}");
+        }
+        for action in [CAPABILITIES, TX_STATUS, MANAGED_WORKLOAD, "rtdb.v1.Transact", custody::RELEASE] {
+            assert!(!store_only_admits(action), "{action}");
+        }
     }
 }
