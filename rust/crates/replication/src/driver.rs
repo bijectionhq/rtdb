@@ -482,18 +482,19 @@ struct Resolution {
     future: BoxFuture<'static, (TxResolver, Result<Arc<ResolvedTx>>)>,
     completion: Completion,
 }
+/// Each stage carries the instant the block's production started, which `block.upload.timer` measures from.
 enum Production {
-    Writing(BoxFuture<'static, Result<crate::ProducedBlock>>),
-    Appending(BoxFuture<'static, Result<crate::ReplicaMetadata>>),
+    Writing(std::time::Instant, BoxFuture<'static, Result<crate::ProducedBlock>>),
+    Appending(std::time::Instant, BoxFuture<'static, Result<crate::ReplicaMetadata>>),
 }
-enum ProductionResult { Written(Result<crate::ProducedBlock>), Appended(Result<crate::ReplicaMetadata>) }
+enum ProductionResult { Written(std::time::Instant, Result<crate::ProducedBlock>), Appended(std::time::Instant, Result<crate::ReplicaMetadata>) }
 async fn pending_resolution(resolution: &mut Option<Resolution>) -> (TxResolver, Result<Arc<ResolvedTx>>) {
     match resolution { Some(resolution) => resolution.future.as_mut().await, None => futures::future::pending().await }
 }
 async fn pending_production(production: &mut Option<Production>) -> ProductionResult {
     match production {
-        Some(Production::Writing(future)) => ProductionResult::Written(future.as_mut().await),
-        Some(Production::Appending(future)) => ProductionResult::Appended(future.as_mut().await),
+        Some(Production::Writing(started, future)) => ProductionResult::Written(*started, future.as_mut().await),
+        Some(Production::Appending(started, future)) => ProductionResult::Appended(*started, future.as_mut().await),
         None => futures::future::pending().await,
     }
 }
@@ -1164,7 +1165,7 @@ impl ReplicationDriver {
             if let Some(resolver) = &mut leader.resolver { resolver.discard_staged(); }
             let result = if let Some(job) = leader.job.take() { job.await.map_err(join_error).and_then(|result| result) } else { Ok(()) };
             if let Some(production) = leader.production.take() {
-                match production { Production::Writing(future) => { if future.await.is_ok() { self.record_block_upload(); } }, Production::Appending(future) => { let _ = future.await; } }
+                match production { Production::Writing(_, future) => { if future.await.is_ok() { self.record_block_upload(); } }, Production::Appending(_, future) => { let _ = future.await; } }
             }
             self.publish_status(Role::Following);
             result?;
@@ -1270,6 +1271,10 @@ impl ReplicationDriver {
             complete_record(pending, Some(receipt.sequence), outcome);
             false
         });
+    }
+    /// From the cut to the durable append of its `BlockUploaded`, as upstream's `BlockCutter` times it.
+    fn time_block_upload(&self, started: std::time::Instant) {
+        if let Some(observer) = &self.resolve.execution_observer { observer.record_duration(rtdb_plan::ExecutionTimer::BlockUpload, started.elapsed()); }
     }
     fn record_block_upload(&self) {
         let upload_time = (self.clock)().0.div_euclid(1_000_000);
@@ -1514,7 +1519,10 @@ impl ReplicationDriver {
             };
             if closes {
                 if let Some(production) = self.leader.as_mut().and_then(|leader| leader.production.take()) {
-                    match production { Production::Writing(future) => { future.await?; self.record_block_upload(); }, Production::Appending(future) => { future.await?; } }
+                    match production {
+                        Production::Writing(_, future) => { future.await?; self.record_block_upload(); }
+                        Production::Appending(started, future) => { future.await?; self.time_block_upload(started); }
+                    }
                     if let Some(leader) = &mut self.leader { leader.confirmed = true; }
                 }
                 let ReplicaBody::BlockUploaded(message) = &record.envelope.message else { return Err(invalid("Matching upload changed type")); };
@@ -1958,7 +1966,7 @@ impl ReplicationDriver {
         let serving_checkpoint = self.serving.as_mut().map(|serving| serving.checkpoint(term, leader.confirmed && rewrite.is_none())).transpose()?;
         let logs = Arc::clone(&self.logs);
         let cancellation = leader.cancellation.clone();
-        leader.production = Some(Production::Writing(Box::pin(async move {
+        leader.production = Some(Production::Writing(std::time::Instant::now(), Box::pin(async move {
             if let Some(rewrite) = rewrite {
                 if !databases.is_empty() { return Err(default_erasure::unsupported()); }
                 return rewrite.produce(&blocks, &logs, &prepared, &boundary,
@@ -1971,14 +1979,14 @@ impl ReplicationDriver {
     async fn production_finished(&mut self, result: ProductionResult) -> Result<()> {
         let leader = self.leader.as_mut().ok_or_else(term_ended)?;
         leader.production = None;
-        let error = match &result { ProductionResult::Written(result) => result.as_ref().err(), ProductionResult::Appended(result) => result.as_ref().err() };
+        let error = match &result { ProductionResult::Written(_, result) => result.as_ref().err(), ProductionResult::Appended(_, result) => result.as_ref().err() };
         if let Some(error) = error {
             let error = error.clone();
             if leader.confirmed { return Err(error); }
             return self.promotion_failed(error).await;
         }
         match result {
-            ProductionResult::Written(result) => {
+            ProductionResult::Written(started, result) => {
                 let produced = result?;
                 let upload_time = (self.clock)().0.div_euclid(1_000_000);
                 self.status.send_modify(|status| status.last_block_upload_epoch_seconds = upload_time);
@@ -1993,9 +2001,9 @@ impl ReplicationDriver {
                 let write = PendingWrite::new(WriteBody::Message(message), pending.block_index(), None, &self.resolve.memory)?;
                 leader.pending.push_back(Arc::clone(&write));
                 let appender = leader.appender.clone();
-                leader.production = Some(Production::Appending(Box::pin(async move { appender.append_durable(write).await })));
+                leader.production = Some(Production::Appending(started, Box::pin(async move { appender.append_durable(write).await })));
             }
-            ProductionResult::Appended(result) => { result?; leader.confirmed = true; self.publish_status(self.role()); }
+            ProductionResult::Appended(started, result) => { result?; leader.confirmed = true; self.time_block_upload(started); self.publish_status(self.role()); }
         }
         Ok(())
     }

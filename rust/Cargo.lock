@@ -5729,6 +5729,7 @@ dependencies = [
  "rtdb-crypt",
  "rtdb-format",
  "rtdb-index",
+ "rtdb-plan",
  "rtdb-query",
  "rtdb-storage",
  "rtdb-store",

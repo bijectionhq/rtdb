@@ -50,6 +50,12 @@ async fn fixture_with_replica(config: ReplicationConfig, replica_message_limit: 
 /// The driver reads `store` through `objects`.
 async fn fixture_over(config: ReplicationConfig, replica_message_limit: usize, clock: Option<ReplicationClock>,
     wrap_replica: impl FnOnce(Arc<MemoryLog>) -> Arc<dyn Log>, store: Arc<MemoryStore>, objects: Arc<dyn ObjectStore>) -> Fixture {
+    fixture_observed_over(config, replica_message_limit, clock, wrap_replica, store, objects, None).await
+}
+
+async fn fixture_observed_over(config: ReplicationConfig, replica_message_limit: usize, clock: Option<ReplicationClock>,
+    wrap_replica: impl FnOnce(Arc<MemoryLog>) -> Arc<dyn Log>, store: Arc<MemoryStore>, objects: Arc<dyn ObjectStore>,
+    execution_observer: Option<Arc<dyn rtdb_plan::ExecutionObserver>>) -> Fixture {
     let memory = MemoryBudget::new(1 << 30);
     let source = Arc::new(MemoryLog::new(1 << 28));
     let replica = Arc::new(MemoryLog::new(replica_message_limit));
@@ -58,7 +64,7 @@ async fn fixture_over(config: ReplicationConfig, replica_message_limit: usize, c
     let blocks = BlockStore::new(objects, Arc::clone(&cache), Arc::clone(&memory), 100_000_000).unwrap();
     let recovered = blocks.recover(TrieConfig::new(2, 2).unwrap(), SourcePosition(-1), Timestamp(0), crate::BlockDiscovery::List).await.unwrap();
     let progress = ProgressMonitor::new(recovered.progress.clone());
-    let resolve = Arc::new(ResolveContext { decision_clock: None, write_event_origins: false, placed_receipt_retirement: false, owned_witness_scope: None, world_constraints: None, database: "xtdb".into(), storage: cache, memory: Arc::clone(&memory), query_options: Default::default(), scan_accelerators: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(AllowRoles), execution_observer: None, tracer: None });
+    let resolve = Arc::new(ResolveContext { decision_clock: None, write_event_origins: false, placed_receipt_retirement: false, owned_witness_scope: None, world_constraints: None, database: "xtdb".into(), storage: cache, memory: Arc::clone(&memory), query_options: Default::default(), scan_accelerators: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(AllowRoles), execution_observer, tracer: None });
     let effects = Arc::new(NoEffects);
     let cancellation = CancellationToken::new();
     let (handle, driver) = match clock {
@@ -1084,6 +1090,31 @@ async fn source_transaction_reads_back_applies_flushes_and_recovers() {
     let recovered = blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(1000), crate::BlockDiscovery::List).await.unwrap();
     assert_eq!(recovered.progress.tx_key.unwrap().tx_id, TxId(position.0));
     assert_eq!(recovered.partition.value().table_catalog().metadata(&TableRef::new("public", "docs")).unwrap().row_count, 1);
+}
+
+#[tokio::test]
+async fn block_production_records_the_upload_timer_once_the_block_is_appended() {
+    #[derive(Default)]
+    struct Timers(Mutex<Vec<rtdb_plan::ExecutionTimer>>);
+    impl rtdb_plan::ExecutionObserver for Timers {
+        fn record_duration(&self, timer: rtdb_plan::ExecutionTimer, _: Duration) { self.0.lock().push(timer); }
+        fn record_error(&self, _: rtdb_plan::ExecutionError) {}
+    }
+    let timers = Arc::new(Timers::default());
+    let store = Arc::new(MemoryStore::default());
+    let config = ReplicationConfig { rows_per_block: 2, assertion_interval: Duration::from_millis(10), ..Default::default() };
+    let fixture = fixture_observed_over(config, 1 << 27, None, |replica| replica, Arc::clone(&store), store, Some(timers.clone() as Arc<dyn rtdb_plan::ExecutionObserver>)).await;
+    let handle = fixture.handle.clone();
+    let writer = tokio::spawn(fixture.driver.run());
+    let transaction = SourceTransaction::new(vec![TxOp::PutDocs { table: TableRef::new("public", "docs"), documents: Documents::new(vec![StructFields::from([("_id".into(), Value::I64(1))])], &fixture.memory).unwrap(), valid_from: Some(Timestamp(0)), valid_to: None }], SubmitOptions::default(), &fixture.memory).unwrap();
+    let position = handle.submit_source_encoded(transaction.encode().unwrap().into_bytes(), Timestamp(100)).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), handle.await_tx(TxId(position.0), &CancellationToken::new())).await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !timers.0.lock().contains(&rtdb_plan::ExecutionTimer::BlockUpload) { tokio::time::sleep(Duration::from_millis(5)).await; }
+    }).await.unwrap();
+    handle.shutdown();
+    writer.await.unwrap().unwrap();
+    assert_eq!(timers.0.lock().iter().filter(|timer| **timer == rtdb_plan::ExecutionTimer::BlockUpload).count(), 1);
 }
 
 fn serving_source_put(key: u8) -> rtdb_tx::transact::Transact {

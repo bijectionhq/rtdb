@@ -2,6 +2,7 @@ mod histogram;
 mod disk;
 mod trace;
 mod step;
+mod processor;
 pub mod logging;
 pub use trace::{TracePayload, TraceReceiver, TraceRecord, TraceRecorder, TraceStats};
 #[cfg(feature = "pg-source")]
@@ -18,7 +19,7 @@ use rtdb_maintenance::CollectionObserver;
 use rtdb_plan::{CatalogMetric, CatalogMetrics, CatalogRows, ConnectionEvent, ExecutionError, ExecutionObserver, ExecutionTimer};
 use rtdb_types::{Anomaly, Result, TableRef};
 
-const TIMERS: [ExecutionTimer; 9] = [ExecutionTimer::Query, ExecutionTimer::TxAwait, ExecutionTimer::TxSubmit, ExecutionTimer::TxExecute, ExecutionTimer::PgwireTransaction, ExecutionTimer::TxOp, ExecutionTimer::CompactorJob, ExecutionTimer::DurableCommitLag, ExecutionTimer::StagedCommitLag];
+const TIMERS: [ExecutionTimer; 10] = [ExecutionTimer::Query, ExecutionTimer::TxAwait, ExecutionTimer::TxSubmit, ExecutionTimer::TxExecute, ExecutionTimer::PgwireTransaction, ExecutionTimer::TxOp, ExecutionTimer::CompactorJob, ExecutionTimer::DurableCommitLag, ExecutionTimer::StagedCommitLag, ExecutionTimer::BlockUpload];
 struct Counters { query_errors: step::Counter, transaction_errors: step::Counter, collection_errors: step::Counter, durable_commit_clock_invalid: step::Counter, staged_commit_clock_invalid: step::Counter, kafka_warnings: [step::Counter; 5], connections: [step::Counter; 3] }
 impl Counters {
     fn roll(&mut self, now: i64, closing: bool) {
@@ -57,6 +58,7 @@ pub struct Registry {
     memory: Arc<MemoryBudget>,
     state: Mutex<State>,
     shards: Box<[Shard]>,
+    processor: Mutex<processor::CpuSampler>,
     _reservation: Arc<MemoryReservation>,
     providers: Arc<Mutex<Providers>>,
     #[cfg(feature = "kafka")]
@@ -71,7 +73,7 @@ impl Registry {
         let now = wall_time_millis();
         Ok(Arc::new(Self { node_id: node_id.to_owned(), memory,
             state: Mutex::new(State { timers: TIMERS.iter().map(|_| histogram::Timer::new(now)).collect(), counters: Counters { query_errors: step::Counter::new(now), transaction_errors: step::Counter::new(now), collection_errors: step::Counter::new(now), durable_commit_clock_invalid: step::Counter::new(now), staged_commit_clock_invalid: step::Counter::new(now), kafka_warnings: [step::Counter::new(now); 5], connections: [step::Counter::new(now); 3] }, pending: Vec::with_capacity(SAMPLE_SHARDS * SHARD_SAMPLES) }),
-            shards: (0..SAMPLE_SHARDS).map(|_| Shard(Mutex::new(Vec::with_capacity(SHARD_SAMPLES)))).collect(), _reservation: reservation, providers: Arc::new(Mutex::new(Providers::default())),
+            shards: (0..SAMPLE_SHARDS).map(|_| Shard(Mutex::new(Vec::with_capacity(SHARD_SAMPLES)))).collect(), processor: Mutex::new(processor::CpuSampler::new()), _reservation: reservation, providers: Arc::new(Mutex::new(Providers::default())),
             #[cfg(feature = "kafka")]
             sources: Arc::new(Mutex::new(kafka::Sources::default())),
         }))
@@ -91,7 +93,7 @@ impl Registry {
 }
 impl ExecutionObserver for Registry {
     fn record_duration(&self, timer: ExecutionTimer, elapsed: Duration) {
-        let index = match timer { ExecutionTimer::Query => 0, ExecutionTimer::TxAwait => 1, ExecutionTimer::TxSubmit => 2, ExecutionTimer::TxExecute => 3, ExecutionTimer::PgwireTransaction => 4, ExecutionTimer::TxOp => 5, ExecutionTimer::CompactorJob => 6, ExecutionTimer::DurableCommitLag => 7, ExecutionTimer::StagedCommitLag => 8 };
+        let index = match timer { ExecutionTimer::Query => 0, ExecutionTimer::TxAwait => 1, ExecutionTimer::TxSubmit => 2, ExecutionTimer::TxExecute => 3, ExecutionTimer::PgwireTransaction => 4, ExecutionTimer::TxOp => 5, ExecutionTimer::CompactorJob => 6, ExecutionTimer::DurableCommitLag => 7, ExecutionTimer::StagedCommitLag => 8, ExecutionTimer::BlockUpload => 9 };
         let sample = Sample { timer: index, elapsed, now_ms: wall_time_millis() };
         let shard = &self.shards[shard_index()];
         loop {
@@ -143,8 +145,8 @@ impl Registry {
         let provided_bytes = provided.iter().flat_map(|rows| rows.rows()).try_fold(0usize, |bytes, row| bytes.checked_add(metric_bytes(row)?).ok_or_else(overflow))?;
         #[cfg(feature = "kafka")]
         let mut sources = self.sources.lock();
-        // Five execution counters, three connections, five Kafka warnings and three gauges.
-        let mut count = (TIMERS.len() + 16).checked_add(provided_count).ok_or_else(overflow)?;
+        // Five execution counters, three connections, five Kafka warnings and six gauges.
+        let mut count = (TIMERS.len() + 19).checked_add(provided_count).ok_or_else(overflow)?;
         #[cfg(feature = "kafka")]
         let labels = { count = count.checked_add(sources.len().checked_mul(6).ok_or_else(overflow)?).ok_or_else(overflow)?; sources.label_bytes()? };
         #[cfg(not(feature = "kafka"))]
@@ -178,6 +180,10 @@ impl Registry {
         rows.push(self.gauge("xtdb.allocator.root.memory.limit", self.memory.limit_bytes() as f64));
         let processors = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
         rows.push(CatalogMetric::Gauge { name: "system.cpu.count".into(), tags: self.tags(), unit: None, value: processors as f64 });
+        let reading = self.processor.lock().read(processors);
+        for (name, value) in [("system.cpu.usage", reading.system_cpu_usage), ("process.cpu.usage", reading.process_cpu_usage), ("system.load.average.1m", reading.load_average)] {
+            rows.push(CatalogMetric::Gauge { name: name.into(), tags: self.tags(), unit: None, value: value.unwrap_or(f64::NAN) });
+        }
         #[cfg(feature = "kafka")]
         sources.append_rows(&mut rows, &self.node_id, step);
         for metric in provided.iter().flat_map(|rows| rows.rows()) {
@@ -261,10 +267,18 @@ mod tests {
         assert!(registry.metrics().unwrap().rows().iter().any(|row| matches!(row, CatalogMetric::Gauge { name, value, .. } if name == "system.cpu.count" && *value >= 1.0)));
     }
     #[test]
+    fn processor_gauges_are_listed_with_micrometer_names() {
+        let registry = Registry::new("node-1", MemoryBudget::new(1 << 22)).unwrap();
+        let rows = registry.metrics().unwrap();
+        for expected in ["system.cpu.usage", "process.cpu.usage", "system.load.average.1m"] {
+            assert!(rows.rows().iter().any(|row| matches!(row, CatalogMetric::Gauge { name, unit: None, .. } if name == expected)), "{expected}");
+        }
+    }
+    #[test]
     fn reference_timers_are_listed_before_their_first_observation() {
         let registry = Registry::new("node-1", MemoryBudget::new(1 << 22)).unwrap();
         let rows = registry.metrics().unwrap();
-        for expected in ["query.timer", "tx.op.timer", "compactor.job.timer"] {
+        for expected in ["query.timer", "tx.op.timer", "compactor.job.timer", "block.upload.timer"] {
             assert!(rows.rows().iter().any(|row| matches!(row, CatalogMetric::Timer { name, count: 0, .. } if name == expected)), "{expected}");
         }
         drop(rows);

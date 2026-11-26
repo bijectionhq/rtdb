@@ -32,6 +32,10 @@ Source-derived fixtures cover fractional quantization, recorder draining, distin
 Executable comparison with the pinned Micrometer 1.17.1 and HdrHistogram implementation remains behind the implementation execution gate.
 The source references are https://github.com/micrometer-metrics/micrometer/tree/v1.17.1/micrometer-core/src/main/java/io/micrometer/core/instrument/distribution[Micrometer's distribution implementations] and https://github.com/HdrHistogram/HdrHistogram/tree/HdrHistogram-2.2.2/src/main/java/org/HdrHistogram[HdrHistogram 2.2.2].
 The supplied execution budget is exported under the root allocator gauge names; JVM heap, GC, thread and Netty metrics have no native equivalents here.
+Micrometer's `ProcessorMetrics` gauges come from the operating system: `system.cpu.count`, `process.cpu.usage` from `getrusage`, `system.cpu.usage` from Linux's `/proc/stat` and `system.load.average.1m` from `getloadavg`.
+Both usages are measured since the previous sample and normalised over every processor, as the JDK's beans are; a value the platform cannot report is NaN.
+`block.upload.timer` runs from the leader's block cut to the durable append of its `BlockUploaded`, as upstream's `BlockCutter` times it.
+The node provider adds upstream's `memory-cache.pinnedBytes`, `memory-cache.evictableBytes` (always zero) and `memory-cache.freeBytes` over the cache budget, and a per-database `compactor.jobs.available` gauge.
 
 The Kafka feature implements the existing configuration-warning and source-registration interfaces.
 Kafka source counters and instantaneous gauges retain the reference names and tags.

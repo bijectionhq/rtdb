@@ -16,9 +16,9 @@ impl CatalogMetrics for NodeMetrics {
     fn metrics(&self) -> Result<CatalogRows<CatalogMetric>> {
         let (Some(catalog), Some(factory)) = (self.catalog.upgrade(), self.factory.upgrade()) else { return Ok(CatalogRows::new(Vec::new(), self.memory.reserve(0)?)); };
         let databases = catalog.open_database_snapshot(&self.memory)?;
-        let bound = databases.rows().iter().try_fold(4096usize, |bytes, database| database.name().len().checked_add(1024).and_then(|size| size.checked_mul(6)).and_then(|size| bytes.checked_add(size)).ok_or_else(overflow))?;
+        let bound = databases.rows().iter().try_fold(4096usize, |bytes, database| database.name().len().checked_add(1024).and_then(|size| size.checked_mul(7)).and_then(|size| bytes.checked_add(size)).ok_or_else(overflow))?;
         let reservation = self.memory.reserve(bound)?;
-        let mut rows = Vec::with_capacity(2 + databases.rows().len() * 6);
+        let mut rows = Vec::with_capacity(5 + databases.rows().len() * 7);
         for database in databases.rows() {
             let completed = database.partition.value().live().latest_completed_tx().map_or(-1.0, |key| key.tx_id.0 as f64);
             let processed = database.progress().current().source_position.0;
@@ -31,6 +31,13 @@ impl CatalogMetrics for NodeMetrics {
                 let unit = (name == "xtdb.block.last_upload_time").then_some(rtdb_plan::CatalogMetricUnit::Seconds);
                 rows.push(CatalogMetric::Gauge { name: name.into(), tags: BTreeMap::from([("db".into(), database.name().into())]), unit, value });
             }
+            let available = rtdb_maintenance::available_jobs(&database.trie_catalog()).map_or(f64::NAN, |jobs| jobs.len() as f64);
+            rows.push(CatalogMetric::Gauge { name: "compactor.jobs.available".into(), tags: BTreeMap::from([("db".into(), database.name().into())]), unit: None, value: available });
+        }
+        let (retained, limit) = (factory.cache.retained_bytes(), factory.cache.limit_bytes());
+        // Upstream's memory cache holds nothing evictable: every cached buffer is pinned by its allocator.
+        for (name, value) in [("memory-cache.pinnedBytes", retained as f64), ("memory-cache.evictableBytes", 0.0), ("memory-cache.freeBytes", limit as f64 - retained as f64)] {
+            rows.push(CatalogMetric::Gauge { name: name.into(), tags: BTreeMap::new(), unit: Some(rtdb_plan::CatalogMetricUnit::Bytes), value });
         }
         rows.push(CatalogMetric::Gauge { name: "rtdb.cache.retained.bytes".into(), tags: BTreeMap::new(), unit: Some(rtdb_plan::CatalogMetricUnit::Bytes), value: factory.cache.retained_bytes() as f64 });
         rows.push(CatalogMetric::Gauge { name: "rtdb.cache.limit.bytes".into(), tags: BTreeMap::new(), unit: Some(rtdb_plan::CatalogMetricUnit::Bytes), value: factory.cache.limit_bytes() as f64 });

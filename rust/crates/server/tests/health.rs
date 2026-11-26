@@ -55,6 +55,27 @@ async fn health_listener_routes_real_requests_and_joins_idle_connections() {
     node_task.await.unwrap().unwrap();
 }
 
+#[tokio::test]
+async fn node_metrics_report_the_memory_cache_and_available_compaction_jobs() {
+    let mut options = NodeOptions::default();
+    options.automatic_compaction = false;
+    options.automatic_gc = false;
+    let services = NodeServices::local(Arc::new(Fixtures), Arc::new(Fixtures), Arc::new(Fixtures), Arc::new(Fixtures));
+    let (node, node_driver) = Node::open(options, services).await.unwrap();
+    let node_task = tokio::spawn(node_driver.run());
+    let rows = node.metrics_provider().unwrap().metrics().unwrap();
+    let gauge = |expected: &str| rows.rows().iter().find_map(|metric| match metric { CatalogMetric::Gauge { name, value, .. } if name == expected => Some(*value), _ => None });
+    let (retained, limit) = (gauge("rtdb.cache.retained.bytes").unwrap(), gauge("rtdb.cache.limit.bytes").unwrap());
+    assert_eq!(gauge("memory-cache.pinnedBytes"), Some(retained));
+    assert_eq!(gauge("memory-cache.evictableBytes"), Some(0.0));
+    assert_eq!(gauge("memory-cache.freeBytes"), Some(limit - retained));
+    assert!(rows.rows().iter().any(|metric| matches!(metric, CatalogMetric::Gauge { name, tags, value, .. }
+        if name == "compactor.jobs.available" && *value == 0.0 && tags.get("db").is_some_and(|db| db == "xtdb"))));
+    drop(rows);
+    node.shutdown();
+    node_task.await.unwrap().unwrap();
+}
+
 #[test]
 fn prometheus_names_escaping_units_and_payload_lifetime() {
     let memory = MemoryBudget::new(1_000_000);
