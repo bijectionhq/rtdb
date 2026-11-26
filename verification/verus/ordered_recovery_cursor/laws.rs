@@ -1,4 +1,3 @@
-use crate::image_digest::{AppliedImageDigest, applied_image_from_base};
 use crate::recovery_promotion::{may_promote, publish_installed_prefix, writer_activation};
 use crate::replay_cursor::{new_replay_cursor, next_in_hold, recovery_coordinates_match, select_record, starts_at};
 use vstd::prelude::*;
@@ -51,9 +50,9 @@ pub fn renewal_preserves_exact_cursor(next: u64, start: u64, exact_previous_cut:
 }
 
 pub fn unknown_prefix_cannot_promote(
-    image_complete: bool, may_lead: bool, already_leading: bool, holds_grant: bool,
+    prefix_applied: bool, may_lead: bool, already_leading: bool, holds_grant: bool,
 ) {
-    let accepted = may_promote(false, image_complete, may_lead, already_leading, holds_grant);
+    let accepted = may_promote(false, prefix_applied, may_lead, already_leading, holds_grant);
     assert(!accepted);
 }
 
@@ -74,58 +73,26 @@ pub fn writer_waits_for_the_recovered_prefix(received: i64, previous: i64)
     assert(recovered is Active);
 }
 
-/// A matching cut, watermark and transaction key with an omitted control row or
-/// receipt yields a mismatched applied image digest, blocking promotion,
-/// writer activation and installed-prefix publication.
-pub fn omitted_control_or_receipt_blocks_promotion_and_activation(
-    base_pos: i64,
-    next_pos: i64,
-    base_digest: [u8; 32],
-    expected_digest: [u8; 32],
-    omitted_applied_digest: [u8; 32],
-)
-    requires
-        base_pos < next_pos,
-        omitted_applied_digest@ != expected_digest@,
-{
-    let mut image = applied_image_from_base(base_pos, base_digest);
-    let observed = image.observe_authenticated(next_pos, expected_digest);
-    assert(observed);
-    let applied = image.record_applied(next_pos, omitted_applied_digest);
-    assert(!applied);
-    let complete = image.is_complete_at(next_pos);
-    assert(!complete);
-    let can_promote = may_promote(true, complete, true, false, true);
+/// A record read but not yet applied (held behind a pending block or an
+/// in-flight resolution) blocks promotion, writer activation and
+/// installed-prefix publication.
+pub fn unapplied_prefix_blocks_promotion_and_activation(next_pos: i64) {
+    let can_promote = may_promote(true, false, true, false, true);
     assert(!can_promote);
-    let published = publish_installed_prefix(true, Some(next_pos), complete);
+    let published = publish_installed_prefix(true, Some(next_pos), false);
     assert(published is None);
-    let activation = writer_activation(true).installed(true, true, complete, next_pos, Some(next_pos));
+    let activation = writer_activation(true).installed(true, true, false, next_pos, Some(next_pos));
     assert(activation is Recovering);
 }
 
-/// Matching authenticated and applied image digests at the exact cut enable
-/// promotion, writer activation and installed-prefix publication.
-pub fn complete_applied_image_enables_promotion_and_serving(
-    base_pos: i64,
-    next_pos: i64,
-    base_digest: [u8; 32],
-    expected_digest: [u8; 32],
-)
-    requires
-        base_pos < next_pos,
-{
-    let mut image = applied_image_from_base(base_pos, base_digest);
-    let observed = image.observe_authenticated(next_pos, expected_digest);
-    assert(observed);
-    let applied = image.record_applied(next_pos, expected_digest);
-    assert(applied);
-    let complete = image.is_complete_at(next_pos);
-    assert(complete);
-    let can_promote = may_promote(true, complete, true, false, true);
+/// A fully applied prefix at the exact cut enables promotion, writer
+/// activation and installed-prefix publication.
+pub fn applied_prefix_enables_promotion_and_serving(next_pos: i64) {
+    let can_promote = may_promote(true, true, true, false, true);
     assert(can_promote);
-    let published = publish_installed_prefix(true, Some(next_pos), complete);
+    let published = publish_installed_prefix(true, Some(next_pos), true);
     assert(published == Some(next_pos));
-    let activation = writer_activation(true).installed(true, true, complete, next_pos, Some(next_pos));
+    let activation = writer_activation(true).installed(true, true, true, next_pos, Some(next_pos));
     assert(activation is Active);
 }
 

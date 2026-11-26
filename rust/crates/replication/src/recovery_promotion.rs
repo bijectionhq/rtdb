@@ -4,21 +4,21 @@
 use vstd::prelude::*;
 
 #[cfg_attr(verus_keep_ghost, verus_spec(can_promote => ensures
-    can_promote == (recognized_prefix && image_complete && may_lead && !already_leading && holds_grant),
+    can_promote == (recognized_prefix && prefix_applied && may_lead && !already_leading && holds_grant),
 ))]
 pub(super) fn may_promote(
-    recognized_prefix: bool, image_complete: bool, may_lead: bool, already_leading: bool, holds_grant: bool,
+    recognized_prefix: bool, prefix_applied: bool, may_lead: bool, already_leading: bool, holds_grant: bool,
 ) -> bool {
-    recognized_prefix && image_complete && may_lead && !already_leading && holds_grant
+    recognized_prefix && prefix_applied && may_lead && !already_leading && holds_grant
 }
 
 #[cfg_attr(verus_keep_ghost, verus_spec(published => ensures
-    published == if recognized_prefix && image_complete { completed_through } else { None },
+    published == if recognized_prefix && prefix_applied { completed_through } else { None },
 ))]
 pub(super) fn publish_installed_prefix(
-    recognized_prefix: bool, completed_through: Option<i64>, image_complete: bool,
+    recognized_prefix: bool, completed_through: Option<i64>, prefix_applied: bool,
 ) -> Option<i64> {
-    if recognized_prefix && image_complete {
+    if recognized_prefix && prefix_applied {
         completed_through
     } else {
         None
@@ -45,15 +45,15 @@ impl WriterActivation {
     }
 
     /// Recovery writes can run before activation. Source resolution and the
-    /// public writer role wait for read-back and content-complete installation
-    /// of the authenticated prefix (including every control row and receipt).
+    /// public writer role wait for read-back and for every record of the read
+    /// prefix to be applied, not merely read.
     #[cfg_attr(verus_keep_ghost, verus_spec(next => ensures
-        next is Active <==> self is Active || (confirmed && recognized && image_complete && installed == Some(received)),
+        next is Active <==> self is Active || (confirmed && recognized && prefix_applied && installed == Some(received)),
     ))]
     pub(super) fn installed(
-        self, confirmed: bool, recognized: bool, image_complete: bool, received: i64, installed: Option<i64>,
+        self, confirmed: bool, recognized: bool, prefix_applied: bool, received: i64, installed: Option<i64>,
     ) -> Self {
-        if self.is_active() || (confirmed && recognized && image_complete && installed == Some(received)) {
+        if self.is_active() || (confirmed && recognized && prefix_applied && installed == Some(received)) {
             Self::Active
         } else {
             Self::Recovering

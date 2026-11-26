@@ -238,7 +238,6 @@ mod tests {
             installed: InstalledPrefix {
                 source: SourcePosition::from_epoch_offset(source, 4)?,
                 replica: ReplicaPosition::from_epoch_offset(replica, 5)?,
-                image_digest: [0; 32],
             },
         };
         let boundary = ReplicaPosition::from_epoch_offset(replica, 6)?;
@@ -378,7 +377,6 @@ mod tests {
             installed: InstalledPrefix {
                 source,
                 replica: ReplicaPosition::from_epoch_offset(replica_epoch, 5)?,
-                image_digest: [0; 32],
             },
         };
         let record = |offset, sequence, message| {

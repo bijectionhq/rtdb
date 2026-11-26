@@ -13,7 +13,7 @@ mod driver;
 mod default_erasure;
 pub use default_erasure::{DefaultErasureReadCut, DefaultErasureReadFence, LocalDefaultErasureReadFence, LocalErasureRead};
 mod fact_history;
-mod image_digest;
+mod applied_prefix;
 mod logs;
 mod maintenance_class;
 mod promotion;

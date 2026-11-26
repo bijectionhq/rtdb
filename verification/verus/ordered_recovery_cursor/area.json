@@ -1,25 +1,25 @@
 {
   "summary": "The shipped ordered writer open checks the certified checkpoint and head coordinates. The installed cursor binds the exact requested interval, delivers the selected successor, and advances only after successful delivery. A fenced writer activates only at its recognized and installed prefix after checkpoint confirmation.",
   "flags": ["--no-external-by-default"],
-  "min_verified_functions": 22,
+  "min_verified_functions": 17,
   "controls": {
     "accept_another_hold_extent": {
       "defect": "A reply for another terminal position can replace the interval requested by the cursor.",
       "mutate": [{ "file": "rust/crates/multi/src/journal/replay_cursor.rs", "find": " || terminal_position != requested_terminal", "replace": "" }],
       "expect": [{ "file": "rust/crates/multi/src/journal/replay_cursor.rs", "function": "bind", "category": "postcondition not satisfied" }],
-      "min_verified_functions": 21
+      "min_verified_functions": 16
     },
     "advance_before_delivery": {
       "defect": "A failed delivery spends its cut, so retry can lose the certified record.",
       "mutate": [{ "file": "rust/crates/multi/src/journal/replay_cursor.rs", "find": "        let record = result?;", "replace": "        let record = match result { Ok(record) => record, Err(error) => { self.next = cut.next; return Err(error); } };" }],
       "expect": [{ "file": "rust/crates/multi/src/journal/replay_cursor.rs", "function": "finish", "category": "postcondition not satisfied" }],
-      "min_verified_functions": 21
+      "min_verified_functions": 16
     },
     "finish_from_another_predecessor": {
       "defect": "An otherwise valid record prepared on an alien history spends this cursor's position.",
       "mutate": [{ "file": "rust/crates/multi/src/journal/replay_cursor.rs", "find": "        if !same_predecessor || self.from.is_none()", "replace": "        if self.from.is_none()" }],
       "expect": [{ "file": "rust/crates/multi/src/journal/replay_cursor.rs", "function": "finish", "category": "postcondition not satisfied" }],
-      "min_verified_functions": 21
+      "min_verified_functions": 16
     },
     "substitute_checkpoint_root": {
       "defect": "The opened catalog may come from another checkpoint at the same offset.",
@@ -47,35 +47,26 @@
     },
     "promote_after_unknown_frame": {
       "defect": "A grant holder promotes after encountering an unrecognized replica frame.",
-      "mutate": [{ "file": "rust/crates/replication/src/recovery_promotion.rs", "find": "    recognized_prefix && image_complete && may_lead && !already_leading && holds_grant", "replace": "    image_complete && may_lead && !already_leading && holds_grant" }],
+      "mutate": [{ "file": "rust/crates/replication/src/recovery_promotion.rs", "find": "    recognized_prefix && prefix_applied && may_lead && !already_leading && holds_grant", "replace": "    prefix_applied && may_lead && !already_leading && holds_grant" }],
       "expect": [{ "file": "rust/crates/replication/src/recovery_promotion.rs", "function": "may_promote", "category": "postcondition not satisfied" }],
       "min_verified_functions": 8
     },
-    "promote_with_incomplete_image": {
-      "defect": "A grant holder promotes when the applied image digest disagrees with the authenticated prefix.",
-      "mutate": [{ "file": "rust/crates/replication/src/recovery_promotion.rs", "find": "    recognized_prefix && image_complete && may_lead && !already_leading && holds_grant", "replace": "    recognized_prefix && may_lead && !already_leading && holds_grant" }],
+    "promote_with_unapplied_prefix": {
+      "defect": "A grant holder promotes while a record it has read is still unapplied.",
+      "mutate": [{ "file": "rust/crates/replication/src/recovery_promotion.rs", "find": "    recognized_prefix && prefix_applied && may_lead && !already_leading && holds_grant", "replace": "    recognized_prefix && may_lead && !already_leading && holds_grant" }],
       "expect": [{ "file": "rust/crates/replication/src/recovery_promotion.rs", "function": "may_promote", "category": "postcondition not satisfied" }],
       "min_verified_functions": 8
     },
     "activate_after_append_before_apply": {
       "defect": "A confirmed append can activate a replacement writer while its installed state is behind.",
-      "mutate": [{ "file": "rust/crates/replication/src/recovery_promotion.rs", "find": "        if self.is_active() || (confirmed && recognized && image_complete && installed == Some(received)) {", "replace": "        if self.is_active() || (confirmed && recognized && image_complete) {" }],
+      "mutate": [{ "file": "rust/crates/replication/src/recovery_promotion.rs", "find": "        if self.is_active() || (confirmed && recognized && prefix_applied && installed == Some(received)) {", "replace": "        if self.is_active() || (confirmed && recognized && prefix_applied) {" }],
       "expect": [{ "file": "rust/crates/replication/src/recovery_promotion.rs", "function": "installed", "category": "postcondition not satisfied" }],
       "min_verified_functions": 8
     },
-    "activate_with_incomplete_image": {
-      "defect": "A replacement writer activates at the received position despite an omitted control row or receipt.",
-      "mutate": [{ "file": "rust/crates/replication/src/recovery_promotion.rs", "find": "        if self.is_active() || (confirmed && recognized && image_complete && installed == Some(received)) {", "replace": "        if self.is_active() || (confirmed && recognized && installed == Some(received)) {" }],
+    "activate_with_unapplied_prefix": {
+      "defect": "A replacement writer activates at the received position while a record it has read is still unapplied.",
+      "mutate": [{ "file": "rust/crates/replication/src/recovery_promotion.rs", "find": "        if self.is_active() || (confirmed && recognized && prefix_applied && installed == Some(received)) {", "replace": "        if self.is_active() || (confirmed && recognized && installed == Some(received)) {" }],
       "expect": [{ "file": "rust/crates/replication/src/recovery_promotion.rs", "function": "installed", "category": "postcondition not satisfied" }],
-      "min_verified_functions": 8
-    },
-    "accept_mismatched_applied_digest": {
-      "defect": "Image digest tracking accepts an applied record whose digest differs from the authenticated expectation.",
-      "mutate": [{ "file": "rust/crates/replication/src/image_digest.rs", "find": "            || !same_digest(&next_applied_digest, &self.expected_digest)", "replace": "" }],
-      "expect": [
-        { "file": "rust/crates/replication/src/image_digest.rs", "function": "record_applied", "category": "postcondition not satisfied" },
-        { "file": "rust/crates/replication/src/image_digest.rs", "function": "record_applied", "category": "postcondition not satisfied" }
-      ],
       "min_verified_functions": 8
     }
   }

@@ -457,8 +457,8 @@ async fn trie_removal_receipt_waits_for_the_installed_catalog_cut() {
     let record = fixture.logs.decode_replica(readback).unwrap().unwrap();
     let position = record.metadata.position;
     let (_, admitted) = fixture.driver.fence.admit_record(record).unwrap();
-    // Stand in for the reader: every applied position is first admitted to the applied-image chain.
-    fixture.driver.admit_image_position(position).unwrap();
+    // Stand in for the reader, which admits every position to the applied prefix before applying it.
+    assert!(fixture.driver.applied_prefix.admit(position.0));
     fixture.driver.apply_admitted(admitted.unwrap()).await.unwrap();
 
     let view = fixture.driver.partition.value();
