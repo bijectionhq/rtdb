@@ -1444,7 +1444,7 @@ mod tests {
         assert_eq!((position, source), (1, Some(SourcePosition(2))));
         assert_eq!(record.admission().0, &[1; 16]);
         assert_eq!(record.admission().1, Timestamp(41));
-        assert_eq!(record.canonical_request().unwrap().get(), put(1).canonical_request().unwrap().get());
+        assert_eq!(record.canonical_request().unwrap().as_bytes(), put(1).canonical_request().unwrap().as_bytes());
         assert_eq!(serving.status(&[1; 16], None).unwrap_err().code, "rtdb/transaction-pending");
         assert_eq!(view.borrow().index.head().basis.position(), 0);
 

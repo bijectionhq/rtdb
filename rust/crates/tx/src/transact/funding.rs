@@ -30,7 +30,6 @@ pub enum FundingInput {
         owner: [u8; 32],
         booking: [u8; 16],
         observed: Option<DecisionObservation>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         certificate: Option<[u8; 32]>,
     },
     Appointment {
@@ -388,7 +387,7 @@ mod tests {
         assert_eq!(receipt.outcome, Outcome::Then);
         assert!(receipt.system_time > request.window.before.unwrap());
         assert_eq!(record.funded_guard().unwrap().unwrap().2.certificate_sha256(), [8; 32]);
-        assert_eq!(record.canonical_request().unwrap().get(), request.canonical_request().unwrap().get());
+        assert_eq!(record.canonical_request(), Some(&request.canonical_request().unwrap()));
         let view = pipeline.durable().index().view(MAIN_BRANCH, At::Latest, Layer::Merged, READING).unwrap();
         let row = view.row(&table, &EntityId::Integer(1), READING).unwrap();
         assert_eq!(row.image.as_ref().unwrap().cells.get("reading"), Some(&Value::Timestamp {

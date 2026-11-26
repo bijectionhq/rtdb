@@ -21,11 +21,11 @@ use rtdb_types::{
 };
 pub use rtdb_types::rtdb_v1::{ValidTime, ValidTimeBound};
 use serde::{Deserialize, Serialize, Serializer};
-use serde_json::value::{RawValue, to_raw_value};
 use sha2::{Digest, Sha256};
 
 mod custody_prepare;
 mod custody_release;
+pub mod encoding;
 mod funding;
 mod operations;
 mod pipeline;
@@ -55,7 +55,7 @@ pub struct Transact {
     pub guards: Vec<Guard>,
     pub ops: Vec<Op>,
     pub otherwise: Vec<Op>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub requires: Vec<Guard>,
     #[serde(skip)]
     pub custody_request_digest: Option<[u8; 32]>,
@@ -88,21 +88,22 @@ impl Transact {
     }
 
     pub fn logical_sha256(&self) -> Result<[u8; 32]> {
-        Ok(Sha256::digest(self.canonical_request()?.get().as_bytes()).into())
+        Ok(Sha256::digest(self.canonical_request()?.as_bytes()).into())
     }
 
-    pub fn canonical_request(&self) -> Result<Box<RawValue>> {
-        to_raw_value(self).map_err(|error| Anomaly::incorrect("rtdb/transaction-encoding", error.to_string()))
+    pub fn canonical_request(&self) -> Result<CanonicalRequest> {
+        encoding::encode(self).map(CanonicalRequest)
+            .map_err(|error| Anomaly::incorrect("rtdb/transaction-encoding", error.to_string()))
     }
 
     /// Decode a request captured by an input log. The caller still resolves it
     /// at the writer's ordered prefix with the route's verified authority.
     pub fn decode_canonical_request(bytes: &[u8]) -> Result<Self> {
-        let request: Self = serde_json::from_slice(bytes).map_err(|error| {
+        let request: Self = encoding::decode(bytes).map_err(|error| {
             Anomaly::incorrect("rtdb/transaction-encoding", error.to_string())
         })?;
         validate_key(&request.key)?;
-        if request.canonical_request()?.get().as_bytes() != bytes {
+        if request.canonical_request()?.as_bytes() != bytes {
             return Err(Anomaly::incorrect("rtdb/transaction-encoding", "The logged transaction request is not canonical"));
         }
         Ok(request)
@@ -188,6 +189,48 @@ impl Transact {
     }
 }
 
+/// A [`Transact`]'s canonical encoding, as its logs record it, digests cover it
+/// and peers forward it. [`Transact::decode_canonical_request`] decodes it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CanonicalRequest(Vec<u8>);
+
+impl CanonicalRequest {
+    pub fn as_bytes(&self) -> &[u8] { &self.0 }
+
+    pub fn decode(&self) -> Result<Transact> { Transact::decode_canonical_request(&self.0) }
+}
+
+impl Serialize for CanonicalRequest {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for CanonicalRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct Bytes;
+        impl<'de> serde::de::Visitor<'de> for Bytes {
+            type Value = CanonicalRequest;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("canonical request bytes")
+            }
+            fn visit_bytes<E: serde::de::Error>(self, bytes: &[u8]) -> std::result::Result<Self::Value, E> {
+                Ok(CanonicalRequest(bytes.to_vec()))
+            }
+            fn visit_byte_buf<E: serde::de::Error>(self, bytes: Vec<u8>) -> std::result::Result<Self::Value, E> {
+                Ok(CanonicalRequest(bytes))
+            }
+            // A JSON carrier writes the bytes as an array of numbers.
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error> {
+                let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(1 << 20));
+                while let Some(byte) = seq.next_element()? { bytes.push(byte); }
+                Ok(CanonicalRequest(bytes))
+            }
+        }
+        deserializer.deserialize_bytes(Bytes)
+    }
+}
+
 fn serialize_features<S: Serializer>(features: &[String], serializer: S) -> std::result::Result<S::Ok, S::Error> {
     // Flight already orders and deduplicates its feature list.
     if features.windows(2).all(|pair| pair[0] < pair[1]) {
@@ -246,12 +289,9 @@ pub struct Row {
     pub valid: Option<ValidTime>,
     #[serde(serialize_with = "serialize_cells")]
     pub cells: StructFields<Cell>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub custody_group: Option<CustodyGroupId>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[serde(serialize_with = "serialize_features")]
+    #[serde(default, serialize_with = "serialize_features")]
     pub protected_columns: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub custody_payload: Option<CustodyPayload>,
 }
 
@@ -271,18 +311,21 @@ pub enum Op {
     PlaceCustodyRow { branch: Branch, table: TableRef, row: Row, placement: CustodyPlacement },
     ReserveReviewedCustodyPlacement { group: CustodyGroupId, reservation: CustodyReservation, source: CustodyReview, read_proof: Vec<u8> },
     LandCustodyBranch { branch: Branch, placements: Vec<ReviewedCustodyPlacement> },
+    ScopedHold(ScopedHoldCommand),
+    /// `rtdb.store.v1.Append`'s writes and window: the request's only operation,
+    /// resolved by [`TransactState::resolve_store`], never executed as an operation.
+    Store(StoreAppend),
+    // The variants that skip deserializing stay last: a derived decoder numbers
+    // only the variants it accepts, so one placed earlier would shift the binary
+    // index of every accepted variant after it.
     #[serde(skip_deserializing)]
     CustodyRelease(CustodyRelease),
     #[serde(skip_deserializing)]
     AdmitCustodyResponse(CustodyResponseAdmission),
     #[serde(skip_deserializing)]
     NativeCustodyTransfer { custody: NativeCheckpointCustody, destination: Option<Basis> },
-    ScopedHold(ScopedHoldCommand),
     #[serde(skip_deserializing)]
     NativeDependentCustody(NativeDependentCustodyOrder),
-    /// `rtdb.store.v1.Append`'s writes and window: the request's only operation,
-    /// resolved by [`TransactState::resolve_store`], never executed as an operation.
-    Store(StoreAppend),
 }
 
 /// A store append (`dev/doc/ordered-bytes-store.adoc`): its writes, with stamp
@@ -292,7 +335,7 @@ pub enum Op {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoreAppend {
     pub writes: Vec<StoreWrite>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub bounds: Vec<StoreBound>,
     pub window: Window,
 }
@@ -355,11 +398,10 @@ fn native_dependent_key(scope: NativeDependentCustodyScope, disposition: bool) -
 pub struct CustodyPlacement {
     pub placement_id: CustodyPlacementId,
     pub reservation: Option<[u8; 32]>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub derived: Option<DerivedCustodyReservation>,
     pub carrier_column: String,
     pub link_column: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub commitments: Option<CustodyPlacementCommitments>,
 }
 
@@ -435,9 +477,9 @@ pub struct Receipt {
     pub system_time: Timestamp,
     pub outcome: Outcome,
     pub replayed: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub erasure: Option<Erasure>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub decision_clock: Option<FundedReceipt>,
 }
 
@@ -494,10 +536,10 @@ impl PreparedAppend {
     }
 }
 
-const RECORD_VERSION: u8 = 2;
-const FUNDED_RECORD_VERSION: u8 = 3;
-const APPOINTMENT_RECORD_VERSION: u8 = 4;
-const MANAGED_APPOINTMENT_RECORD_VERSION: u8 = 5;
+const RECORD_VERSION: u8 = 6;
+const FUNDED_RECORD_VERSION: u8 = 7;
+const APPOINTMENT_RECORD_VERSION: u8 = 8;
+const MANAGED_APPOINTMENT_RECORD_VERSION: u8 = 9;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum TransactionRecord {
@@ -511,17 +553,18 @@ impl TransactionRecord {
         if matches!(self, Self::Tx(tx) if tx.request.is_none()) {
             return Err(Anomaly::fault("rtdb/transaction-encoding", "An admitted transaction needs its canonical request"));
         }
-        let version = self.version();
-        serde_json::to_vec(&(version, self)).map(Bytes::from)
+        encoding::encode_versioned(self.version(), self).map(Bytes::from)
             .map_err(|error| Anomaly::fault("rtdb/transaction-encoding", error.to_string()))
     }
 
+    /// Decodes a record after its version byte, refusing a version this encoder does not write.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let (version, record): (u8, Self) = serde_json::from_slice(bytes)
+        let unknown = || Anomaly::unsupported("rtdb/transaction-version", "Unknown resolved transaction version");
+        let (&version, record) = bytes.split_first().ok_or_else(unknown)?;
+        if !(RECORD_VERSION..=MANAGED_APPOINTMENT_RECORD_VERSION).contains(&version) { return Err(unknown()); }
+        let record: Self = encoding::decode(record)
             .map_err(|error| Anomaly::fault("rtdb/transaction-decoding", error.to_string()))?;
-        if version != record.version() || version != RECORD_VERSION && !funded_record(bytes) {
-            return Err(Anomaly::unsupported("rtdb/transaction-version", "Unknown resolved transaction version"));
-        }
+        if version != record.version() { return Err(unknown()); }
         if let Self::Tx(tx) = &record {
             tx.validate_admission()?;
         }
@@ -543,8 +586,7 @@ impl TransactionRecord {
 }
 
 fn funded_record(bytes: &[u8]) -> bool {
-    // The admitted encoder emits this exact version prefix. A funded decode rejects alternate framing.
-    bytes.starts_with(b"[3,") || bytes.starts_with(b"[4,") || bytes.starts_with(b"[5,")
+    bytes.first().is_some_and(|version| (FUNDED_RECORD_VERSION..=MANAGED_APPOINTMENT_RECORD_VERSION).contains(version))
 }
 
 impl Receipt {
@@ -564,16 +606,11 @@ pub struct ResolvedTransact {
     receipt: Receipt,
     effects: Vec<BranchEffect>,
     before: Option<Timestamp>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     receipt_namespace: Option<[u8; 32]>,
-    #[serde(alias = "submitted_at")]
     admitted_at: Timestamp,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     workload: Option<WorkloadFamily>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     workload_digest: Option<[u8; 32]>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    request: Option<Box<RawValue>>,
+    request: Option<CanonicalRequest>,
 }
 
 impl ResolvedTransact {
@@ -582,7 +619,7 @@ impl ResolvedTransact {
         (&self.receipt.key, self.admitted_at, self.fingerprint)
     }
 
-    pub fn canonical_request(&self) -> Option<&RawValue> { self.request.as_deref() }
+    pub fn canonical_request(&self) -> Option<&CanonicalRequest> { self.request.as_ref() }
 
     pub fn effects(&self) -> &[BranchEffect] { &self.effects }
 
@@ -599,14 +636,12 @@ impl ResolvedTransact {
     }
 
     fn validate_admission(&self) -> Result<()> {
+        // The leading fields of `Transact`, in its declaration order.
         #[derive(Deserialize)]
         struct AdmissionFields {
             key: Vec<u8>,
-            window: AdmissionWindow,
-        }
-        #[derive(Deserialize)]
-        struct AdmissionWindow {
-            before: Option<Timestamp>,
+            _require: Vec<String>,
+            window: Window,
         }
 
         if self.workload_digest.is_some() && (self.workload.is_none() || self.request.is_none()) {
@@ -614,7 +649,7 @@ impl ResolvedTransact {
         }
         if let Some(funding) = self.receipt.decision_clock {
             let request = self.request.as_ref().ok_or_else(invalid_record)?;
-            let request = Transact::decode_canonical_request(request.get().as_bytes()).map_err(|_| invalid_record())?;
+            let request = request.decode().map_err(|_| invalid_record())?;
             if funding.is_appointment() { return funding.check_appointment_admission(self, &request); }
             request.check_funded_shape(self.receipt_namespace.is_some()).map_err(|_| invalid_record())?;
             funding.check_admission(&request, &self.receipt, self.receipt.basis.position(), self.receipt_namespace)?;
@@ -627,9 +662,9 @@ impl ResolvedTransact {
             }
             return Ok(());
         }
-        // Older v2 records are replayable using their stored effects and digest.
+        // A record without funding replays from its stored effects and digest.
         if let Some(request) = &self.request {
-            let fields: AdmissionFields = serde_json::from_str(request.get()).map_err(|_| invalid_record())?;
+            let fields: AdmissionFields = encoding::decode_prefix(request.as_bytes()).map_err(|_| invalid_record())?;
             let window_matches = if self.workload.is_some() {
                 self.receipt_namespace.is_some()
                     && fields.window.before.is_none_or(|before| self.before.is_some_and(|cutoff| cutoff <= before))
@@ -1150,7 +1185,7 @@ impl TransactState {
         let hold = if request.ops.iter().chain(&request.otherwise).any(|op| matches!(op, Op::ScopedHold(_))) {
             let [Op::ScopedHold(command)] = request.ops.as_slice() else { return Err(invalid_scoped_hold()); };
             if authority.is_none_or(|authority| authority.receipt_namespace != command.owner())
-                || workload.is_some() || request.canonical_request()?.get() != Transact::scoped_hold(command.clone()).canonical_request()?.get()
+                || workload.is_some() || request.canonical_request()? != Transact::scoped_hold(command.clone()).canonical_request()?
                 || request.custody_request_digest.is_some()
             {
                 return Err(invalid_scoped_hold());
@@ -1165,7 +1200,7 @@ impl TransactState {
         let workload_digest = workload.map(workload::Admission::authorization_digest);
         let canonical_request = request.canonical_request()?;
         let fingerprint = request.custody_request_digest
-            .unwrap_or_else(|| Sha256::digest(canonical_request.get().as_bytes()).into());
+            .unwrap_or_else(|| Sha256::digest(canonical_request.as_bytes()).into());
         let stored = view.receipts.get(&receipt_namespace).and_then(|namespace| namespace.get(&request.key));
         if let Some(stored) = stored && appointment.is_none() {
             let same_request = match workload_digest {
@@ -1356,7 +1391,7 @@ impl TransactState {
     #[allow(clippy::too_many_arguments)]
     fn resolve_store(
         view: View<'_>, request: &Transact, append: &StoreAppend, position: u64, now: Timestamp,
-        claims: &dyn ClaimVerifier, fingerprint: [u8; 32], canonical_request: Box<RawValue>,
+        claims: &dyn ClaimVerifier, fingerprint: [u8; 32], canonical_request: CanonicalRequest,
     ) -> Result<(Resolution, Option<BranchIndex>)> {
         if !request.otherwise.is_empty() || !request.requires.is_empty() || !request.require.is_empty()
             || request.window != Window::default() || request.custody_request_digest.is_some()

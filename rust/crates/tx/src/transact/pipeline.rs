@@ -222,7 +222,7 @@ impl TransactPipeline {
         let TransactionRecord::Tx(tx) = &prepared.record else { return Err(order_error("A decision prepares a Tx record")) };
         if let Some((_, limit)) = funding {
             let charge = if authority.is_some() {
-                tx.canonical_request().ok_or_else(invalid_record)?.get().len().saturating_mul(4).saturating_add(4096)
+                tx.canonical_request().ok_or_else(invalid_record)?.as_bytes().len().saturating_mul(4).saturating_add(4096)
             } else {
                 bytes.len()
             };
@@ -696,7 +696,7 @@ mod tests {
         assert_eq!(identity, request.key.as_slice());
         assert_eq!(submitted_at, Timestamp(42));
         assert_eq!(commitment, request.logical_sha256().unwrap());
-        assert_eq!(tx.canonical_request().unwrap().get(), request.canonical_request().unwrap().get());
+        assert_eq!(tx.canonical_request(), Some(&request.canonical_request().unwrap()));
     }
 
     #[test]
@@ -782,19 +782,24 @@ mod tests {
     }
 
     #[test]
-    fn canonical_admission_checks_the_request_key_and_replays_existing_v2_records() {
+    fn canonical_admission_checks_the_request_key_and_refuses_json_era_records() {
         let request = put(1, 1, false);
         let (_, record) = append(&mut pipeline(), &request, 42);
-        let mut legacy: serde_json::Value = serde_json::from_slice(&record).unwrap();
-        legacy[1]["Tx"]["request"]["key"] = serde_json::json!(key(2));
-        let mismatched = TransactionRecord::decode(&serde_json::to_vec(&legacy).unwrap()).unwrap_err();
+        let TransactionRecord::Tx(mut tx) = TransactionRecord::decode(&record).unwrap() else { panic!("expected a Tx") };
+        let mut other = request.clone();
+        other.key = key(2);
+        tx.request = Some(other.canonical_request().unwrap());
+        let mismatched = TransactionRecord::decode(&TransactionRecord::Tx(tx.clone()).encode().unwrap()).unwrap_err();
         assert_eq!(mismatched.code, "rtdb/invalid-resolved-transaction");
 
-        let tx = legacy[1]["Tx"].as_object_mut().unwrap();
-        tx.remove("request");
-        let admitted_at = tx.remove("admitted_at").unwrap();
-        tx.insert("submitted_at".into(), admitted_at);
-        let record = TransactionRecord::decode(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        tx.request = Some(request.canonical_request().unwrap());
+        let json = serde_json::to_vec(&(2u8, TransactionRecord::Tx(tx.clone()))).unwrap();
+        assert_eq!(TransactionRecord::decode(&json).unwrap_err().code, "rtdb/transaction-version");
+
+        tx.request = None;
+        let mut unrequested = vec![record[0]];
+        unrequested.extend(crate::transact::encoding::encode(&TransactionRecord::Tx(tx)).unwrap());
+        let record = TransactionRecord::decode(&unrequested).unwrap();
         assert!(record.encode().is_err());
         let mut follower = TransactState::new(INCARNATION);
         follower.apply(1, record).unwrap();

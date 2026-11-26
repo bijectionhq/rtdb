@@ -1511,7 +1511,7 @@ fn custody_admission_orders_the_whole_part_and_preserves_its_drain_after_restart
         read_proofs_sha256: Some([16; 32]), selected_basis: basis(3), key_generation: 7 };
     let admit = |admission| TrustedCustodyCommand::Admit(TrustedCustodyAdmission { admission, writer: writer.clone() }).into_request().unwrap();
     let exact = admit(admission.clone());
-    assert!(Transact::decode_canonical_request(exact.canonical_request().unwrap().get().as_bytes()).is_err());
+    assert!(Transact::decode_canonical_request(exact.canonical_request().unwrap().as_bytes()).is_err());
     for (at, registration) in [(4, registrations[0]), (6, registrations[1])] {
         assert_eq!(write(&mut state, at, &phase(registration, CustodyReleasePhase::Private)).outcome, Outcome::Then);
         let mut private = state.clone();
@@ -1600,4 +1600,90 @@ fn classic_receipt_import_preserves_fingerprints_and_separates_equal_keys_by_nam
         assert!(installed.installed.is_none());
         assert!(from.installed.is_some());
     }
+}
+
+fn every_shape() -> Transact {
+    let cells = StructFields::from([
+        ("z".into(), Cell::Value(Value::Struct(StructFields::from([
+            ("b".into(), Value::F64(-0.0)), ("a".into(), Value::List(vec![Value::F32(1.5), Value::Null, Value::Utf8("x".into())].into())),
+        ])))),
+        ("a".into(), Cell::Value(Value::Map { entries: vec![(Value::Keyword(rtdb_types::Keyword::from_name("k")), Value::Binary(vec![1, 2]))], sorted: false })),
+        ("d".into(), Cell::Value(Value::calendar_date(rtdb_types::CivilDate::parse_iso("+12000-01-02").unwrap(), rtdb_types::DateUnit::Day))),
+        ("t".into(), Cell::TxTime),
+    ]);
+    let relative = ValidTime::new(ValidTimeBound::TransactionMicros(-5), ValidTimeBound::Instant(Timestamp::MAX)).unwrap();
+    let row = Row {
+        id: EntityId::Binary(vec![9; 3]), valid: Some(relative), cells, custody_group: Some([4; 16]),
+        protected_columns: vec!["secret".into()], custody_payload: Some(CustodyPayload { binding: [5; 32], envelope: vec![6; 4] }),
+    };
+    Transact {
+        key: vec![1; 16], require: vec![TRANSACT_REQUIRES.into(), LINEARIZABLE.into()],
+        window: Window { not_before: Some(Timestamp(3)), before: None },
+        guards: vec![Guard::Version { branch: MAIN_BRANCH.into(), table: table(), id: EntityId::Uuid([7; 16]), valid_at: None, expect: Version::Written(basis(2)) }],
+        ops: vec![
+            Op::Put { branch: MAIN_BRANCH.into(), table: table(), rows: vec![row], if_absent: true },
+            Op::Delete { branch: MAIN_BRANCH.into(), table: table(), ids: vec![EntityId::Integer(-1)], valid: Some(ValidTime::Literal(Interval::from_micros(1, 2).unwrap())) },
+            Op::Declare { table: table(), change: Declaration::Index(IndexDefinition { name: "by".into(), column: "a".into(), additional_columns: Vec::new() }) },
+            Op::Store(StoreAppend { writes: vec![StoreWrite { key: vec![0; 16], value: None, key_stamp: Some(0), value_stamp: None }], bounds: vec![StoreBound { key: vec![1; 16], delta: -1, min: 0, max: 9 }], window: Window::default() }),
+        ],
+        otherwise: vec![Op::DropBranch { branch: "child".into() }],
+        requires: Vec::new(), custody_request_digest: None, request_memory: None,
+    }
+}
+
+#[test]
+fn a_canonical_request_round_trips_every_field_shape_and_encodes_deterministically() {
+    let request = every_shape();
+    let canonical = request.canonical_request().unwrap();
+    assert_eq!(request.canonical_request().unwrap(), canonical);
+    let decoded = canonical.decode().unwrap();
+    assert_eq!(decoded.canonical_request().unwrap(), canonical);
+    assert_eq!(decoded.require, [LINEARIZABLE, TRANSACT_REQUIRES]);
+    let Op::Put { rows, .. } = &decoded.ops[0] else { panic!("expected a Put"); };
+    assert_eq!(rows[0].cells.keys().collect::<Vec<_>>(), ["a", "d", "t", "z"]);
+    assert_eq!(rows[0].valid, request.ops.iter().find_map(|op| match op { Op::Put { rows, .. } => rows[0].valid, _ => None }));
+    assert!(matches!(decoded.ops[3], Op::Store(_)));
+}
+
+#[test]
+fn a_request_that_decodes_but_is_not_canonical_is_refused() {
+    let mut request = request(1, Vec::new());
+    request.require = vec!["a".into()];
+    let canonical = request.canonical_request().unwrap();
+    let bytes = canonical.as_bytes();
+    // The key's length and bytes, then the one feature: its count, its length, "a".
+    assert_eq!(&bytes[17..20], [1, 1, b'a']);
+    let duplicated = [&bytes[..17], &[2, 1, b'a', 1, b'a'], &bytes[20..]].concat();
+    let error = Transact::decode_canonical_request(&duplicated).unwrap_err();
+    assert_eq!(error.message.as_deref(), Some("The logged transaction request is not canonical"));
+    assert!(Transact::decode_canonical_request(&[bytes, &[0]].concat()).is_err());
+    assert!(Transact::decode_canonical_request(serde_json::to_string(&request).unwrap().as_bytes()).is_err());
+}
+
+#[test]
+fn a_transaction_record_round_trips_with_its_refusal_context_and_encodes_deterministically() {
+    let request = every_shape();
+    let error = Anomaly::incorrect("rtdb/test", "refused").with_context("detail", serde_json::json!({"n": 1, "s": [true, null]}));
+    let record = TransactionRecord::Tx(ResolvedTransact {
+        fingerprint: request.logical_sha256().unwrap(),
+        receipt: Receipt {
+            key: request.key.clone(), basis: basis(4), system_time: Timestamp(40), outcome: Outcome::Refused { error: error.clone() },
+            replayed: false, erasure: Some(Erasure::Armed { unreadable_by: Timestamp(50) }), decision_clock: None,
+        },
+        effects: Vec::new(), before: None, receipt_namespace: Some([3; 32]), admitted_at: Timestamp(39),
+        workload: None, workload_digest: None, request: Some(request.canonical_request().unwrap()),
+    });
+    let bytes = record.encode().unwrap();
+    assert_eq!(record.encode().unwrap(), bytes);
+    assert_eq!(bytes[0], RECORD_VERSION);
+    let TransactionRecord::Tx(decoded) = TransactionRecord::decode(&bytes).unwrap() else { panic!("expected a Tx") };
+    assert_eq!(decoded.receipt.outcome, Outcome::Refused { error });
+    assert_eq!(decoded.canonical_request(), Some(&request.canonical_request().unwrap()));
+    assert_eq!(TransactionRecord::Tx(decoded).encode().unwrap(), bytes);
+    for terminal in [TransactionRecord::Settle { tx_lsn: 300 }, TransactionRecord::Refuse { tx_lsn: 1 }] {
+        let bytes = terminal.encode().unwrap();
+        assert_eq!(TransactionRecord::decode(&bytes).unwrap().encode().unwrap(), bytes);
+    }
+    let json = serde_json::to_vec(&(2u8, TransactionRecord::Settle { tx_lsn: 1 })).unwrap();
+    assert_eq!(TransactionRecord::decode(&json).unwrap_err().code, "rtdb/transaction-version");
 }

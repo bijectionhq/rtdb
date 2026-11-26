@@ -1127,7 +1127,7 @@ async fn default_serving_recovers_a_lost_source_reply_and_consumes_retries_in_or
     assert_eq!(submit.await.unwrap_err().code, "rtdb/transaction-outcome-unknown");
 
     let forged = fixture.handle.submit_source(
-        &SourceMessage::Protobuf(SourceBody::ServingTransact(Bytes::copy_from_slice(request.canonical_request().unwrap().get().as_bytes()))),
+        &SourceMessage::Protobuf(SourceBody::ServingTransact(Bytes::copy_from_slice(request.canonical_request().unwrap().as_bytes()))),
         Timestamp(100),
     ).await.unwrap();
     assert_eq!(forged, SourcePosition(1));

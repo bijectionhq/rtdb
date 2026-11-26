@@ -405,7 +405,7 @@ async fn multi_driver_replays_genesis_settlement_and_a_file_checkpoint() {
     let TransactionRecord::Tx(record) = TransactionRecord::decode(&payload).unwrap()
         else { panic!("expected a resolved Tx"); };
     assert_eq!(record.admission(), (timed.key.as_slice(), Timestamp(10), timed.logical_sha256().unwrap()));
-    assert_eq!(record.canonical_request().unwrap().get(), timed.canonical_request().unwrap().get());
+    assert_eq!(record.canonical_request().unwrap().as_bytes(), timed.canonical_request().unwrap().as_bytes());
     assert!(record.admission().1 < receipt.system_time);
     assert_eq!(record.effects().len(), 1);
     writer.checkpoint(vec![]).await.unwrap();

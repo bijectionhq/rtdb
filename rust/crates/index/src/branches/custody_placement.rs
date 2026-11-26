@@ -99,7 +99,7 @@ pub struct CustodyOccurrence {
     pub written: Basis,
     /// Locator for the applied carrier receipt. Earlier records retain the
     /// occurrence identity but have no independently recoverable locator.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub receipt_key: Vec<u8>,
     pub ordinal: u64,
     pub carrier_sha256: [u8; 32],

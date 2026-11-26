@@ -37,7 +37,7 @@ pub struct BranchCut {
 pub struct IndexDefinition {
     pub name: String,
     pub column: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub additional_columns: Vec<String>,
 }
 
@@ -91,17 +91,17 @@ pub struct GroupedCount {
 pub struct BranchTable {
     pub schema: TableSchema,
     pub indexes: BTreeMap<String, IndexDefinition>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     pub ranked_indexes: BTreeMap<String, RankedIndexDeclaration>,
     pub ttl_micros: Option<u64>,
     pub constraints: BTreeMap<String, CountRange>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     pub grouped_constraints: BTreeMap<String, GroupedCount>,
     pub generation: u64,
     pub dropped: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub visibility: Option<Visibility>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default)]
     pub single_label_per_tx: bool,
 }
 
@@ -123,9 +123,9 @@ impl Visibility {
 pub struct RowImage {
     pub cells: StructFields<Value>,
     pub expires_at: Option<Timestamp>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub custody_group: Option<CustodyGroupId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub custody_payload: Option<CustodyPayload>,
 }
 
@@ -135,7 +135,7 @@ pub struct BranchEvent {
     pub valid: Interval,
     pub cut: BranchCut,
     pub image: Option<Arc<RowImage>>,
-    #[serde(default, skip_serializing_if = "WrittenVersion::is_branch")]
+    #[serde(default)]
     pub written: WrittenVersion,
 }
 
@@ -146,10 +146,6 @@ pub enum WrittenVersion {
     Custody(Option<u64>),
     Classic(TxId),
     Unpositioned,
-}
-
-impl WrittenVersion {
-    fn is_branch(&self) -> bool { *self == Self::Branch }
 }
 
 const CLASSIC_WRITTEN_BIT: u64 = 1 << 63;

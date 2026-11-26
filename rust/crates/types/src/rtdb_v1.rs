@@ -22,11 +22,52 @@ pub fn ranked_build_id(table: &TableRef, name: &str) -> String {
     format!("{}:{}{}:{}{name}", table.schema.len(), table.schema, table.table.len(), table.table)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ValidTime {
     Literal(Interval),
     Relative { from: ValidTimeBound, to: ValidTimeBound },
+}
+
+// JSON writes a valid time untagged; a binary encoding cannot tell the two shapes apart, so there it names the variant.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum UntaggedValidTime {
+    Literal(Interval),
+    Relative { from: ValidTimeBound, to: ValidTimeBound },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename = "ValidTime")]
+enum TaggedValidTime {
+    Literal(Interval),
+    Relative { from: ValidTimeBound, to: ValidTimeBound },
+}
+
+impl Serialize for ValidTime {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        match (serializer.is_human_readable(), *self) {
+            (true, Self::Literal(valid)) => UntaggedValidTime::Literal(valid).serialize(serializer),
+            (true, Self::Relative { from, to }) => UntaggedValidTime::Relative { from, to }.serialize(serializer),
+            (false, Self::Literal(valid)) => TaggedValidTime::Literal(valid).serialize(serializer),
+            (false, Self::Relative { from, to }) => TaggedValidTime::Relative { from, to }.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ValidTime {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        Ok(if deserializer.is_human_readable() {
+            match UntaggedValidTime::deserialize(deserializer)? {
+                UntaggedValidTime::Literal(valid) => Self::Literal(valid),
+                UntaggedValidTime::Relative { from, to } => Self::Relative { from, to },
+            }
+        } else {
+            match TaggedValidTime::deserialize(deserializer)? {
+                TaggedValidTime::Literal(valid) => Self::Literal(valid),
+                TaggedValidTime::Relative { from, to } => Self::Relative { from, to },
+            }
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

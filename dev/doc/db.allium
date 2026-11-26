@@ -94,6 +94,8 @@
 -- Nodes that submit or resolve branch requests share the database's source admission key through its private object store.
 -- The confirmed writer resolves source requests in source order and stamps the replica transaction decision with its own admission time.
 -- Each replica transaction decision carries the scoped key, canonical request and decided outcome with its effects.
+-- The canonical request is the request's deterministic binary encoding, and a decoder refuses bytes that do not re-encode to themselves.
+-- The source admission and the replica transaction decision are each that same binary encoding behind a leading version byte, and a decoder refuses a version it does not write.
 -- A deduplicated request or a request rejected before decision consumes its source position through a replica reply record.
 -- The matching term-admitted read-back advances the applied branch fold and source position, releases the receipt and publishes settled effect keys with the applied basis.
 -- A timed original retains its source position for recovery, and read-back of Settle or Refuse installs that source position and the final receipt.
@@ -635,6 +637,7 @@ variant TxMessage : SourceMessage {
 }
 
 variant ServingTransactMessage : SourceMessage {
+    -- The sealed source admission: the canonical request with its admission context, in the binary record encoding.
     authenticated_request: Bytes
 }
 

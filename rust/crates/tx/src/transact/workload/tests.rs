@@ -583,7 +583,7 @@ fn original_acknowledgement_at_the_grant_cutoff_refuses_the_timed_effect() {
     let fingerprint = transaction.logical_sha256().unwrap();
     assert_eq!(record.admission(), (transaction.key.as_slice(), journal.now, fingerprint));
     assert_eq!(record.workload_digest, Some([20; 32]));
-    assert_eq!(record.canonical_request().unwrap().get(), transaction.canonical_request().unwrap().get());
+    assert_eq!(record.canonical_request().unwrap().as_bytes(), transaction.canonical_request().unwrap().as_bytes());
     assert!(journal.pipeline.acknowledge(position).unwrap().is_empty());
     assert!(
         request

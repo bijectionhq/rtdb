@@ -2059,9 +2059,9 @@ async fn rtdb_v1_serving_driver_uses_one_applied_basis_for_query_claim_write_and
         let record = admission.as_ref().unwrap();
         assert_eq!(record.admission().0, key.as_slice());
         assert_eq!(record.admission().1, Timestamp(1));
-        let request: serde_json::Value = serde_json::from_str(record.canonical_request().unwrap().get()).unwrap();
-        assert_eq!(request["key"], serde_json::json!(key));
-        assert_eq!(request["ops"][0]["Put"]["table"]["table"], "wire_applied");
+        let request = record.canonical_request().unwrap().decode().unwrap();
+        assert_eq!(request.key, key);
+        assert!(matches!(&request.ops[..], [rtdb_tx::transact::Op::Put { table, .. }] if table.table == "wire_applied"));
         assert_eq!(record.effects().len(), 1);
     }
     let replay = transact_wire(

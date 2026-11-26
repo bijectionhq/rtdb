@@ -76,8 +76,8 @@ impl<'a> ReceiptPoint<'a> {
     }
 
     fn address(&self) -> Result<[u8; 32]> {
-        let coordinate = to_raw_value(&(self.table, self.id, self.at)).map_err(|_| appointment_invalid())?;
-        Ok(Sha256::digest(coordinate.get().as_bytes()).into())
+        let coordinate = serde_json::to_vec(&(self.table, self.id, self.at)).map_err(|_| appointment_invalid())?;
+        Ok(Sha256::digest(coordinate).into())
     }
 
     fn absent(&self, index: &BranchIndex) -> Result<()> {

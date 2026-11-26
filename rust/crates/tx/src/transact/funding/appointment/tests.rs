@@ -80,7 +80,7 @@ fn check_appointment_order(managed_until: Option<Timestamp>) -> Result<()> {
     };
     let prepared = decide(&mut pipeline, &prepare, prepare_command, sample(1, 100_000, 1_800_000, 1_900_000))?;
     let Decision::Append { record, .. } = &prepared else { panic!("expected preparation record"); };
-    assert_eq!(record[1], if namespace.is_some() { b'5' } else { b'4' });
+    assert_eq!(record[0], if namespace.is_some() { crate::transact::MANAGED_APPOINTMENT_RECORD_VERSION } else { crate::transact::APPOINTMENT_RECORD_VERSION });
     let (prepared, proof) = append(&mut pipeline, prepared);
     assert!(proof.is_none());
     assert_eq!(prepared.decision_clock.unwrap().reading(), READING);

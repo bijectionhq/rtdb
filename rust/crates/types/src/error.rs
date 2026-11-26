@@ -23,7 +23,28 @@ pub struct Anomaly {
     pub category: AnomalyCategory,
     pub code: String,
     pub message: Option<String>,
+    #[serde(with = "context")]
     pub context: BTreeMap<String, Value>,
+}
+
+/// A JSON value decodes only from a self-describing format, so a binary
+/// encoding carries each context value as its JSON text.
+mod context {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
+    use serde_json::Value;
+    use std::collections::BTreeMap;
+
+    pub fn serialize<S: Serializer>(context: &BTreeMap<String, Value>, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() { return context.serialize(serializer); }
+        serializer.collect_map(context.iter().map(|(key, value)| (key, value.to_string())))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<BTreeMap<String, Value>, D::Error> {
+        if deserializer.is_human_readable() { return BTreeMap::deserialize(deserializer); }
+        BTreeMap::<String, String>::deserialize(deserializer)?.into_iter()
+            .map(|(key, text)| serde_json::from_str(&text).map(|value| (key, value)).map_err(D::Error::custom))
+            .collect()
+    }
 }
 
 impl Anomaly {

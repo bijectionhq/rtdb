@@ -11,13 +11,12 @@ use rtdb_node::{
     Clock, MultiWriteAdmission, MultiWriteRoute, Node, SystemClock,
     serving::{ServingDriver, ServingScope},
 };
-use rtdb_tx::transact::{Receipt, Transact, workload};
+use rtdb_tx::transact::{CanonicalRequest, Receipt, Transact, workload};
 use rtdb_types::{
     Anomaly, AnomalyCategory, Result, Timestamp,
     rtdb_v1::{Basis, LabelScope, ManagedCheckpointReservation, ManagedCheckpointTarget, NativeCheckpointCustody, PinnedCheckpointIdentity},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -77,7 +76,7 @@ struct Request {
     database: String,
     incarnation: [u8; 16],
     admission: Admission,
-    request: Option<Box<RawValue>>,
+    request: Option<CanonicalRequest>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -573,7 +572,7 @@ impl Peer {
         &self,
         database: String,
         incarnation: [u8; 16],
-        request: Option<Box<RawValue>>,
+        request: Option<CanonicalRequest>,
         admission: Admission,
     ) -> Result<Option<Answer>> {
         let Some(to) = self
@@ -653,9 +652,8 @@ impl MultiWriteRoute for DatabaseRoute {
     }
 }
 
-fn transaction(raw: Option<Box<RawValue>>, reservation: Arc<MemoryReservation>) -> Result<Transact> {
-    let raw = raw.ok_or_else(unavailable)?;
-    let mut request = Transact::decode_canonical_request(raw.get().as_bytes())?;
+fn transaction(raw: Option<CanonicalRequest>, reservation: Arc<MemoryReservation>) -> Result<Transact> {
+    let mut request = raw.ok_or_else(unavailable)?.decode()?;
     request.request_memory = Some(reservation);
     Ok(request)
 }
@@ -748,5 +746,23 @@ mod tests {
         assert!(matches!(request.operation, workload::Operation::Settle { key, family: workload::Family::Write, digest }
             if key == vec![3; 16] && digest == [4; 32]));
         assert_ne!(WorkloadProfile::new(point, "https://issuer.example/", "another-cell", "workload-").identity, profile);
+    }
+
+    #[test]
+    fn a_forwarded_frame_carries_the_exact_canonical_request() {
+        let transaction = Transact {
+            key: vec![3; 16], require: Vec::new(), window: Default::default(), guards: Vec::new(),
+            ops: vec![rtdb_tx::transact::Op::DropBranch { branch: "child".into() }], otherwise: Vec::new(),
+            requires: Vec::new(), custody_request_digest: None, request_memory: None,
+        };
+        let canonical = transaction.canonical_request().unwrap();
+        let frame = Request {
+            nonce: Uuid::new_v4(), from: "192.0.2.1".parse().unwrap(), to: "192.0.2.2".parse().unwrap(),
+            expires: Timestamp(20), database: "original".into(), incarnation: [1; 16],
+            admission: Admission::Ordinary(None), request: Some(canonical.clone()),
+        };
+        let decoded: Request = serde_json::from_slice(&serde_json::to_vec(&frame).unwrap()).unwrap();
+        assert_eq!(decoded.request.as_ref(), Some(&canonical));
+        assert_eq!(decoded.request.unwrap().decode().unwrap().key, transaction.key);
     }
 }

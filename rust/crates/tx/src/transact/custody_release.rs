@@ -64,7 +64,6 @@ pub struct TrustedCustodyAdmission {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(untagged)]
 pub enum TrustedCustodyCommand {
     Phase(TrustedCustodyRelease),
     Admit(TrustedCustodyAdmission),

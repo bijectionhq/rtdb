@@ -3,10 +3,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use rtdb_crypt::{SourceAdmissionKey, tokens::VerifiedClaims};
 use rtdb_storage::{Error, ObjectKey, ObjectStore};
-use rtdb_tx::transact::{CUSTODY_RELEASE_NAMESPACE, Transact, TrustedCustodyCommand};
+use rtdb_tx::transact::{CUSTODY_RELEASE_NAMESPACE, CanonicalRequest, TrustedCustodyCommand, encoding};
 use rtdb_types::{Anomaly, Result, rtdb_v1::{Claim, ClaimEvidence, ClaimVerifier}};
 use serde::{Deserialize, Serialize};
-use serde_json::value::RawValue;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
@@ -18,22 +17,22 @@ pub(crate) struct SourceAuthority {
     key: OnceCell<SourceAdmissionKey>,
 }
 
+/// The version byte that leads a sealed admission's clear bytes.
+const ADMISSION_VERSION: u8 = 1;
+
 #[derive(Serialize, Deserialize)]
 struct Admission<C> {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    request: Option<Box<RawValue>>,
+    request: Option<CanonicalRequest>,
     scope: Option<NativeServingScope>,
     claims: C,
     custody_request_digest: Option<[u8; 32]>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     funded: Option<FundedAdmission>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     release: Option<ReleaseAdmission>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct FundedAdmission {
-    request: Box<RawValue>,
+    request: CanonicalRequest,
     input: rtdb_tx::transact::FundingInput,
 }
 
@@ -108,7 +107,7 @@ impl SourceAuthority {
             funded,
             release,
         };
-        let bytes = serde_json::to_vec(&admission).map_err(super::encoding_error)?;
+        let bytes = encoding::encode_versioned(ADMISSION_VERSION, &admission).map_err(|_| admission_encoding())?;
         Ok(self.key(true).await?.seal(self.incarnation, &bytes)?.into())
     }
 
@@ -117,7 +116,10 @@ impl SourceAuthority {
         let key = self.key(false).await?;
         let request = (|| {
             let clear = key.open(self.incarnation, bytes)?;
-            let admission: Admission<SourceClaims> = serde_json::from_slice(&clear).map_err(super::encoding_error)?;
+            let admission: Admission<SourceClaims> = match clear.split_first() {
+                Some((&ADMISSION_VERSION, admission)) => encoding::decode(admission).map_err(|_| admission_encoding())?,
+                _ => return Err(admission_encoding()),
+            };
             let (request, funding) = match (admission.request, admission.funded) {
                 (Some(request), None) => (request, None),
                 (None, Some(funded)) if admission.release.is_none() && admission.custody_request_digest.is_none() =>
@@ -132,14 +134,14 @@ impl SourceAuthority {
                         return Err(invalid_release());
                     }
                     let transaction = release.command.into_request()?;
-                    if transaction.canonical_request()?.get() != request.get() { return Err(invalid_release()); }
+                    if transaction.canonical_request()? != request { return Err(invalid_release()); }
                     transaction
                 }
                 None => {
                     if admission.scope.as_ref().is_some_and(|scope| scope.receipt_namespace == CUSTODY_RELEASE_NAMESPACE) {
                         return Err(invalid_release());
                     }
-                    Transact::decode_canonical_request(request.get().as_bytes())?
+                    request.decode()?
                 }
             };
             transaction.custody_request_digest = admission.custody_request_digest;
@@ -147,6 +149,10 @@ impl SourceAuthority {
         })();
         Ok(request)
     }
+}
+
+fn admission_encoding() -> Anomaly {
+    Anomaly::incorrect("rtdb/transaction-encoding", "The source admission is not in its binary encoding")
 }
 
 fn invalid_release() -> Anomaly {
@@ -158,7 +164,7 @@ mod tests {
     use async_trait::async_trait;
     use rtdb_crypt::{Generation, LocalKms, Kms, tokens::{TokenAuthority, TokenKey, TokenKeys}};
     use rtdb_storage::MemoryStore;
-    use rtdb_tx::transact::{Guard, Op, Window};
+    use rtdb_tx::transact::{Guard, Op, Transact, Window};
     use rtdb_types::rtdb_v1::{Basis, ClaimScope, LabelScope, Layer};
 
     use super::*;
@@ -203,7 +209,7 @@ mod tests {
 
         let writer = SourceAuthority::new(store, *database.as_bytes());
         let replay = writer.open(&bytes).await.unwrap().unwrap();
-        assert_eq!(replay.transaction.canonical_request().unwrap().get(), canonical.get());
+        assert_eq!(replay.transaction.canonical_request().unwrap().as_bytes(), canonical.as_bytes());
         let scope = replay.scope.unwrap();
         assert_eq!(scope.labels, labels);
         assert_eq!(scope.receipt_namespace, [4; 32]);
@@ -214,6 +220,8 @@ mod tests {
         assert!(matches!(writer.open(&changed).await.unwrap(), Err(error) if error.code == "rtdb/source-admission"));
         let key = writer.key(false).await.unwrap();
         assert!(matches!(key.open(Uuid::from_bytes([8; 16]), &bytes), Err(error) if error.code == "rtdb/source-admission"));
+        let json_era = key.seal(database, br#"{"request":null,"scope":null,"claims":[],"custody_request_digest":null}"#).unwrap();
+        assert!(matches!(writer.open(&json_era).await.unwrap(), Err(error) if error.code == "rtdb/transaction-encoding"));
     }
 }
 
@@ -222,7 +230,7 @@ mod release_tests {
     use std::num::NonZeroU64;
     use rtdb_index::branches::{CustodyCarrierAuthority, CustodyRelease, CustodyReleasePhase, CustodyReleaseRegistration, CustodyResponseAdmission, CustodyResponsePart};
     use rtdb_storage::MemoryStore;
-    use rtdb_tx::transact::{CustodyWriterFence, TrustedCustodyAdmission, TrustedCustodyRelease};
+    use rtdb_tx::transact::{CustodyWriterFence, Transact, TrustedCustodyAdmission, TrustedCustodyRelease};
     use rtdb_types::{EntityId, TableRef, Timestamp, rtdb_v1::Basis};
 
     use super::*;
@@ -252,12 +260,12 @@ mod release_tests {
         };
         let request = command.clone().into_request();
         let canonical = request.canonical_request().unwrap();
-        assert!(Transact::decode_canonical_request(canonical.get().as_bytes()).is_err());
+        assert!(Transact::decode_canonical_request(canonical.as_bytes()).is_err());
         let bytes = submitter.seal_release(TrustedCustodyCommand::Phase(command.clone())).await.unwrap();
         let reopened = writer.open(&bytes).await.unwrap().unwrap();
         assert!(reopened.scope.is_none());
         assert_eq!(reopened.transaction.receipt_namespace(None), Some(CUSTODY_RELEASE_NAMESPACE));
-        assert_eq!(reopened.transaction.canonical_request().unwrap().get(), canonical.get());
+        assert_eq!(reopened.transaction.canonical_request().unwrap().as_bytes(), canonical.as_bytes());
 
         let request = || NativeRequest { transaction: command.clone().into_request(), scope: None, claims: VerifiedClaims::default(), funding: None };
         assert!(submitter.seal(request()).await.is_err());
@@ -279,11 +287,11 @@ mod release_tests {
         });
         let transaction = admit.clone().into_request().unwrap();
         let canonical = transaction.canonical_request().unwrap();
-        assert!(Transact::decode_canonical_request(canonical.get().as_bytes()).is_err());
+        assert!(Transact::decode_canonical_request(canonical.as_bytes()).is_err());
         assert!(submitter.seal(NativeRequest { transaction, scope: None, claims: VerifiedClaims::default(), funding: None }).await.is_err());
         let sealed = submitter.seal_release(admit).await.unwrap();
         let reopened = writer.open(&sealed).await.unwrap().unwrap();
         assert_eq!(reopened.transaction.receipt_namespace(None), Some(CUSTODY_RELEASE_NAMESPACE));
-        assert_eq!(reopened.transaction.canonical_request().unwrap().get(), canonical.get());
+        assert_eq!(reopened.transaction.canonical_request().unwrap().as_bytes(), canonical.as_bytes());
     }
 }
