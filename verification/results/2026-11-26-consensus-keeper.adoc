@@ -1,7 +1,8 @@
 = RTDB Multi on consensus keepers, 2026-11-26
 
 RTDB Multi ran on Logkeeper's keeper-hosted consensus streams through `journal-contract`, as described in link:../../dev/doc/rtdb-multi-consensus-keeper.md[rtdb-multi-consensus-keeper.md].
-RTDB pins Logkeeper `749260efc462527b31609f6a3d22ae240a9e8b04` on Logkeeper `main`, which adds `ConsensusJournal` and the `consensus-testing` local cluster.
+The first runs pinned Logkeeper `749260efc462527b31609f6a3d22ae240a9e8b04`, which adds `ConsensusJournal` and the `consensus-testing` local cluster.
+The later runs pin Logkeeper `a2059e33063869675c726d3a3856cc362c684e74` on Logkeeper `main`, which adds keeper batches (`83fb9b9`), failure-domain placement (`3a299f5`), timed originals and transient-refusal retry (`a2059e3`).
 All runs used one Apple M6 host with keepers and RTDB on loopback.
 
 == Process qualification
@@ -10,6 +11,48 @@ All runs used one Apple M6 host with keepers and RTDB on loopback.
 It started release `rtdb dev --multi` with `--multi-journal-url logkeeper-consensus://...` and drove rtdb.v1 Transact commits over TLS Flight with 5-second phases.
 Each phase checked every key it acknowledged with rtdb.v1.TxStatus, which must return the exact original receipt.
 Each recheck replayed every key acknowledged since the start.
+
+=== With keeper batches, placement and timed originals at `a2059e3`
+
+[cols="2,1,1,1,1,1",options="header"]
+|===
+|Phase |Clients |Commits/s |p50 ms |p99 ms |Keys verified
+
+|Steady |1 |573 |1.6 |4.7 |3,151
+|Steady |4 |1,181 |3.2 |6.8 |6,464
+|Steady |16 |3,573 |4.2 |14.1 |19,577
+|One voter killed with SIGKILL 5 s into a 15 s phase |4 |1,032 |2.9 |13.5 |16,032
+|The killed voter restarted from its media |4 |1,244 |2.9 |10.1 |6,884
+|Recheck after the voter restart |– |– |– |– |52,108
+|RTDB killed with SIGKILL and reopened on the same data, then recheck |– |– |– |– |52,108
+|Commits after the RTDB reopen |4 |956 |3.9 |13.0 |5,315
+|Every keeper stopped and restarted with RTDB running, then recheck |– |– |– |– |57,423
+|Commits after the keeper restart |4 |1,086 |3.3 |14.6 |5,941
+|Final recheck |– |– |– |– |63,364
+|===
+
+Every phase passed, and no acknowledged commit was lost or changed.
+
+=== Comparison with the stream Writer and the local journal
+
+`rust/bench/v1_journal_comparison.py` ran the same release `rtdb dev --multi` and 10-second rtdb.v1 Transact phases on three journals: the local `FileJournal`, three stream keepers through the stream Writer, and the consensus keepers above.
+Every acknowledged commit was verified with TxStatus.
+
+[cols="1,1,1,1,1",options="header"]
+|===
+|Clients |File journal commits/s |Stream Writer commits/s |Consensus commits/s |Consensus p50 / p99 ms
+
+|1 |238 |542 |571 |1.6 / 4.3
+|4 |252 |1,243 |1,102 |3.3 / 14.8
+|16 |292 |4,347 |3,240 |4.2 / 21.2
+|64 |282 |6,750 |failed |–
+|===
+
+At 64 clients one Transact returned "The write outcome is unknown. Recover it with TxStatus", so the consensus run stopped.
+Before keeper batches the consensus journal stayed near 600 commits/s at every client count.
+The causes and the fixes are in Logkeeper's design proposal: per-round WAL cost, four entries per replication message, and a flat 500 ms backoff on refused peer frames.
+
+=== First run, before keeper batches, at `749260e`
 
 [cols="2,1,1,1,1,1",options="header"]
 |===
@@ -32,10 +75,7 @@ Every phase passed.
 No acknowledged commit was lost or changed across the voter loss, the RTDB kill and reopen, or the full keeper restart.
 The reopened RTDB process reported writer readiness again before the recheck.
 
-Throughput stays near 600 commits/s from 1 to 16 clients.
-The consensus batch appender commits a Multi group one record per keeper round trip, so one writer stream is bounded by that round trip.
-A keeper-side batch command is the next step.
-The phase after the voter restart ran at about half rate while the restarted voter caught up.
+In that first run throughput stayed near 600 commits/s from 1 to 16 clients, because each Multi group committed one record per keeper round trip.
 
 == In-process qualification
 
@@ -64,9 +104,26 @@ The two other server failures, `classic_opening_recovers_one_ordered_assignment_
 
 The debug `rtdb-db` test binary needs `RUST_MIN_STACK=16777216`. Without it, `native_checkpoint_keeps_original_occurrences_and_fences_reads_until_the_reciprocal_drain` overflows the default test thread stack, on `main` as well.
 
+=== Batches, placement, funded appends and the journal bound at `a2059e3`
+
+[cols="1,3",options="header"]
+|===
+|Evidence |Result
+
+|`RTDB_MULTI_JOURNAL=consensus` and default `rtdb-db` `multi::tests`
+|35 of 35 pass in both modes, including `multi_driver_checkpoints_once_the_retained_journal_suffix_reaches_its_bound`.
+
+|`rtdb-server --features multi`
+|34 of 36 pass. The new `multi_dev_moves_its_stream_off_a_draining_keeper` and `consensus_batch_proves_funded_timed_originals` pass. The same two tests as above fail identically on `main`.
+
+|`rtdb-journal-logkeeper`
+|4 of 4 pass.
+
+|Logkeeper `a2059e3`
+|The default workspace passed 240 tests and the all-features workspace 294 in two runs, including the five consensus journal conformance tests.
+|===
+
 == Open
 
-* Throughput: add a keeper-side batch append so one Multi group commits in one round.
-* Timed originals: consensus keepers do not sign quorum-sync evidence, so funded appends are unsupported on this journal.
-* Placement: streams use one configured voter triple. Directory placement and voter replacement are not wired.
+* Throughput above 16 clients and the 64-client unknown outcome, through the Logkeeper design proposal phases.
 * Bijection hosted cells and the installed ordered journals still use their existing journals. The old journals stay until this switch is qualified in a hosted cell.

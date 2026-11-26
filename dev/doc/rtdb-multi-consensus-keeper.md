@@ -17,8 +17,10 @@ it next to the stream Writer. The server selects it by journal URL.
 
 - `logkeeper-consensus:///absolute/path/journal.json` selects consensus
   streams. The JSON file is Logkeeper's `JournalConfig`, with the keeper
-  application addresses, the catalog keeper, the three voters and the quota
-  for each created stream, the record limit and the operation deadline.
+  application addresses, the catalog keeper, either fixed `voters` or a
+  `placement` of eligible keepers with their failure domains and an optional
+  `draining` list, the quota for each created stream, the record limit and
+  the operation deadline.
 - `logkeeper+tls://...` continues to select the stream Writer.
 - The node's client credentials are the same mutual-TLS files in both cases.
   Consensus keepers authorize principals under `urn:logkeeper:client:`.
@@ -38,21 +40,37 @@ Replication admission, the restart read rule and the read index sit inside
 the keepers, so the Multi driver needs no change to use them. Epoch zero is
 never a sealed writer epoch, and Multi always seals epoch one or later.
 
-## What remains different from the stream Writer
+## Batches, placement, funded appends and journal size
 
-- **Batches.** The `JournalBatchAppender` for consensus streams commits a group
-  in order, one record per keeper round trip. It acknowledges the group after
-  its last record and can leave a committed prefix on error, which Multi
-  already recovers. A single Multi writer measured about 600 commits per
-  second at 1, 4 and 16 clients. A keeper-side batch command is the next
-  step for throughput.
-- **Timed originals.** Consensus keepers do not yet sign quorum-sync evidence,
-  so `maximum_timed_original_bytes` is `None` and funded appends stay
-  unsupported. Settle and Refuse timed records are Multi records and work
-  unchanged.
-- **Placement.** Every stream a node creates uses the configured voter triple.
-  Directory-driven placement and replacement go through Logkeeper's
-  `configuration` and `replace`, which the RTDB adapter does not yet call.
+- **Batches.** The consensus `JournalBatchAppender` sends a Multi group as
+  keeper batches of up to 256 records and 4 MiB. The keeper checks a whole
+  batch before applying any record and commits it as one Raft entry. A
+  retained prefix must match exactly, and an error can leave a committed
+  prefix of whole batches, which Multi already recovers. Appends retry a
+  transient `Unavailable` refusal with backoff until the deadline.
+- **Placement.** With a `placement`, each created stream gets three eligible
+  keepers in distinct failure domains, chosen by rendezvous ranking of the
+  stream and keeper identities, so every node derives the same voters. Every
+  5 seconds the Multi writer of each database re-reads the configuration
+  file and, when one of its stream's voters is draining, ineligible or shares
+  a domain, replaces that voter through Logkeeper's `replace`. Every other
+  voter stays. A keeper that is down but still eligible is never replaced,
+  because the quorum tolerates it. Operators drain a keeper by listing it in
+  `draining` and stop it once no stream names it.
+- **Funded appends.** With `RTDB_TIMED_ORIGINAL_TRUST_FILE`, the same keeper
+  trust registry the stream Writer reads, consensus journals append and
+  prove timed originals. The writer stages the exact payload on the first
+  two voters of the stream's sorted roster. Each voter syncs it, samples its
+  commissioned clock and signs the bound. The record then commits with both
+  samples as evidence. Keepers need `timed_original` in their configuration
+  in the stream keeper's mount format. Without trust,
+  `maximum_timed_original_bytes` is `None` and funded appends stay
+  unsupported, as before.
+- **Journal size.** A consensus stream refuses appends at 65,536 retained
+  records. The Multi writer checkpoints and trims once its retained journal
+  suffix reaches 32,768 records. Before this, the server only checkpointed
+  for erasure, so a long-running writer would have stalled on consensus
+  streams. The stream Writer is limited only by its byte quota.
 
 ## Qualification
 
@@ -65,11 +83,17 @@ cd rust
 RTDB_MULTI_JOURNAL=consensus RUST_MIN_STACK=16777216 cargo test -p rtdb-db --lib multi::tests
 # The contract suite through the RTDB adapter.
 cargo test -p rtdb-journal-logkeeper
-# The development runtime across a full keeper restart.
+# The development runtime across a full keeper restart, a drained keeper,
+# and funded proofs through the RTDB adapter.
 cargo test -p rtdb-server --features multi --lib multi_dev_serves_and_reopens_on_consensus_keepers
+cargo test -p rtdb-server --features multi --lib multi_dev_moves_its_stream_off_a_draining_keeper
+cargo test -p rtdb-server --features multi --lib consensus_batch_proves_funded_timed_originals
 # Separate keeper processes, rtdb dev --multi and rtdb.v1 commits over Flight.
 python3 bench/v1_consensus_keepers.py --rtdb target/release/rtdb \
   --logkeeper /path/to/logkeeper output-directory
+# The same commits on the local FileJournal, the stream Writer and consensus.
+python3 bench/v1_journal_comparison.py --rtdb target/release/rtdb \
+  --logkeeper /path/to/logkeeper comparison-directory
 ```
 
 The process run needs OpenSSL, PyArrow and a release `logkeeper` built with

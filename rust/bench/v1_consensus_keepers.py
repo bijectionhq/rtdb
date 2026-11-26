@@ -50,6 +50,20 @@ def write_private(path, data):
     path.chmod(0o600)
 
 
+def wait_for_port(host, port, process, seconds=30):
+    deadline = time.monotonic() + seconds
+    while True:
+        if process.poll() is not None:
+            raise RuntimeError("process exited before listening; see its log")
+        try:
+            socket.create_connection((host, port), timeout=0.2).close()
+            return
+        except OSError:
+            if time.monotonic() > deadline:
+                raise
+            time.sleep(0.05)
+
+
 class Pki:
     def __init__(self, directory, name):
         self.directory = directory
@@ -104,6 +118,7 @@ class Keepers:
         self.journal.write_text(json.dumps(dict(
             keepers=lanes["keepers"], catalog=self.catalog, voters=self.voters,
             quota_bytes=8 << 30, max_record_bytes=4 << 20)))
+        self.url = f"logkeeper-consensus://{self.journal}"
 
     def start(self, keeper):
         log = (self.logs / f"keeper-{keeper}.log").open("a")
@@ -133,6 +148,9 @@ class Keepers:
 
 
 class Rtdb:
+    """rtdb dev --multi on one journal. `keepers` supplies the journal CA,
+    client credentials and URL. Without it RTDB uses its local FileJournal."""
+
     def __init__(self, binary, work, keepers, logs):
         self.binary, self.logs, self.process = binary, logs, None
         self.data = work / "rtdb"
@@ -145,20 +163,23 @@ class Rtdb:
         write_private(self.tls / "key.pem", key.read_bytes())
         self.password = os.urandom(32).hex()
         write_private(self.tls / "password", self.password)
-        client_cert, client_key = keepers.client
-        write_private(self.tls / "journal-certificate.pem", client_cert.read_bytes())
-        write_private(self.tls / "journal-key.pem", client_key.read_bytes())
-        write_private(self.tls / "journal-ca.pem", keepers.pki.ca.read_bytes())
         self.ca = flight.ca.read_bytes()
-        self.url = f"logkeeper-consensus://{keepers.journal}"
+        self.url = None
+        if keepers is not None:
+            client_cert, client_key = keepers.client
+            write_private(self.tls / "journal-certificate.pem", client_cert.read_bytes())
+            write_private(self.tls / "journal-key.pem", client_key.read_bytes())
+            write_private(self.tls / "journal-ca.pem", keepers.pki.ca.read_bytes())
+            self.url = keepers.url
 
     def start(self):
         ready = self.logs / "rtdb-ready.json"
         ready.write_text("")
         log = (self.logs / "rtdb.log").open("a")
+        journal = ["--multi-journal-url", self.url] if self.url else []
         self.process = subprocess.Popen([
             str(self.binary), "dev", "--multi", "--data", str(self.data), "--multi-tls-dir", str(self.tls),
-            "--incarnation", self.incarnation, "--multi-journal-url", self.url, "--flight-sql-port", "0",
+            "--incarnation", self.incarnation, *journal, "--flight-sql-port", "0",
         ], stdout=ready.open("w"), stderr=log)
         deadline = time.monotonic() + 120
         while time.monotonic() < deadline:
