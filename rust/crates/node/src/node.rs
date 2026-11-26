@@ -4570,7 +4570,14 @@ impl SessionService for NativeSessionService {
     }
     async fn fresh_query_instant(&self) -> Result<rtdb_types::Instant> {
         match &self.node.factory.decision_clock {
-            Some(_) => Ok(self.node.receiver_time().await?.into()),
+            Some(_) => {
+                let receiver: rtdb_types::Instant = self.node.receiver_time().await?.into();
+                // The receiver clock is sampled, so it can trail the system time already given to a transaction this database applied.
+                let applied = if self.node.catalog.is_placed() {
+                    self.database()?.partition.value().live().latest_completed_tx().map(|key| rtdb_types::Instant::from(key.system_time))
+                } else { None };
+                Ok(applied.map_or(receiver, |applied| receiver.max(applied)))
+            }
             None => Ok(self.node.query_instant()),
         }
     }
