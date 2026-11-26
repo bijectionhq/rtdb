@@ -34,6 +34,7 @@ pub use owned_world::{FrozenWorldWinner, OwnedWorldHost, OwnedWorldRead, Prepare
 /// Private Flight gateway request marker and response cutoff.
 pub const GATEWAY_ANSWER_DEADLINE_HEADER: &str = "x-rtdb-answer-deadline";
 
+mod action_route;
 mod v1;
 mod trace_scope;
 #[cfg(feature = "multi")]

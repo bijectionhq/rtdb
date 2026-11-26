@@ -5230,6 +5230,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "tonic",
+ "tonic-prost",
  "uuid",
  "zeroize",
 ]

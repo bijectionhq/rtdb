@@ -3308,5 +3308,18 @@ async fn prepared_control_uses_the_first_uploaded_arrow_parameter_row() {
     running.stop().await;
 }
 
+#[tokio::test]
+async fn do_action_decodes_bodies_past_its_starting_buffer_and_refuses_bodies_past_the_message_limit() {
+    let running = Running::start(None, FlightConfig { maximum_message_bytes: 64 * 1024, ..Default::default() }).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let handle = client.begin().await;
+    client.end(handle, false).await.unwrap();
+    let within = client.action("rtdb.test.Unknown", vec![7; 32 * 1024].into()).await.unwrap_err();
+    assert_ne!(within.code(), tonic::Code::OutOfRange, "{within:?}");
+    let beyond = client.action("rtdb.test.Unknown", vec![7; 128 * 1024].into()).await.unwrap_err();
+    assert_eq!(beyond.code(), tonic::Code::OutOfRange, "{beyond:?}");
+    running.stop().await;
+}
+
 #[path = "flight/v1_contract.rs"]
 mod v1_contract;

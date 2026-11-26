@@ -1,5 +1,4 @@
 use std::{future::Future, io::{self, IoSlice}, net::SocketAddr, pin::Pin, sync::{Arc, Mutex}, task::{Context, Poll}};
-use arrow_flight::flight_service_server::FlightServiceServer;
 use futures::{StreamExt, task::AtomicWaker};
 use rtdb_auth::Authenticator;
 use rtdb_columnar::MemoryReservation;
@@ -11,7 +10,7 @@ use tokio_rustls::{TlsAcceptor, rustls, server::TlsStream};
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::server::{Connected, TcpConnectInfo};
-use crate::{FlightConfig, service::Service};
+use crate::{FlightConfig, action_route::ActionRoute, service::Service};
 use crate::config::{AUDIENCE_H2_CONNECTION_WINDOW, AUDIENCE_H2_STREAM_WINDOW, AUDIENCE_H2_STREAMS, AUDIENCE_HOLDER_TRANSPORT_BYTES, AUDIENCE_REPLY_BYTES};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -117,9 +116,8 @@ impl ServerDriver {
             std::future::ready(result)
         });
         let maximum = self.service.0.config.maximum_message_bytes;
-        let server = FlightServiceServer::new(self.service.clone())
-            .max_decoding_message_size(self.service.request_bytes())
-            .max_encoding_message_size(if audience.is_some() { maximum.min(AUDIENCE_REPLY_BYTES) } else { maximum });
+        let encoding = if audience.is_some() { maximum.min(AUDIENCE_REPLY_BYTES) } else { maximum };
+        let server = ActionRoute::new(self.service.clone(), self.service.request_bytes(), encoding);
         let mut http = tonic::transport::Server::builder().http2_max_header_list_size(8192);
         if audience.is_some() {
             http = http.max_concurrent_streams(AUDIENCE_H2_STREAMS)
