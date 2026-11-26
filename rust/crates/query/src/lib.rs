@@ -12,6 +12,7 @@ mod parameters;
 pub use parameters::BoundParameters;
 mod cursor;
 mod runtime_schema;
+mod compiled;
 mod operators;
 mod set_keys;
 mod scalar_key;

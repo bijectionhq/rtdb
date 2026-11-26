@@ -7,6 +7,7 @@ use rtdb_plan::{ApplyKind, Expr, NamedExpr, Relation, RelationNode, Schema, SetO
 use rtdb_types::{LogicalType, Result, Value};
 
 use crate::columnar::PredicateSelection;
+use crate::compiled::{OperatorTemplate, Predicates, Projections, StackedFilters};
 use crate::context::Execution;
 use crate::limit_bounds::{checked_row_count, sort_prefix_len};
 use crate::runtime_schema::{EmittedRelation, RuntimeSchema};
@@ -88,9 +89,11 @@ async fn build_batches_at(
         }
         RelationNode::Scan(scan) if !crate::inspection::is_inspection(&scan.table.name.table) && crate::system_schema::definition(&scan.table.name.table).is_none() => {
             let batches: crate::columnar::BoxBatchCursor = Box::new(crate::scan::ScanCursor::new(scan.clone(),execution.clone(),pushdowns).await?);
-            let batches = match scan.predicates.iter().cloned().reduce(|left,right|Expr::binary(rtdb_plan::BinaryOp::And,left,right)) {
-                Some(predicate) => Box::new(crate::columnar::BatchFilter::new(batches,runtime.schema().clone(),predicate,execution)) as crate::columnar::BoxBatchCursor,
-                None => batches,
+            let template = runtime.operators().template(|| operator_template(&runtime))?;
+            let batches = match template.as_ref() {
+                OperatorTemplate::Scan { filter: Some(predicates) } => Box::new(crate::columnar::BatchFilter::admitted(batches,predicates,execution)) as crate::columnar::BoxBatchCursor,
+                OperatorTemplate::Scan { filter: None } => batches,
+                _ => return Err(template_mismatch()),
             };
             Ok(Some((batches,false)))
         }
@@ -102,50 +105,64 @@ async fn build_batches_at(
             Ok(Some((crate::column_table::open_columns(&execution, expr.clone()).await?, false)))
         }
         RelationNode::Filter { predicate,.. } => {
+            let template = runtime.operators().template(|| operator_template(&runtime))?;
+            let OperatorTemplate::Filter { single, stacked } = template.as_ref() else { return Err(template_mismatch()); };
             let mut input = runtime.child(0)?;
             let mut input_execution = execution.child(0);
-            let schema = input.schema().clone();
-            let mut stages = vec![predicate.clone()];
             let mut state = execution.context.memory.reserve(0)?;
-            while execution.analysis.is_none() && execution.context.trace_parent.is_none()
-                && let RelationNode::Filter { predicate, .. } = input.relation().node() {
-                let bound = crate::runtime_schema::local_allocation_bound(input.relation())?;
-                let lease = Arc::get_mut(&mut state).expect("Stacked filters own their reservation");
-                lease.grow_to(lease.bytes().checked_add(bound).ok_or_else(|| invalid("operator-size", "Filter stages exceed addressable memory"))?)?;
-                stages.push(predicate.clone());
-                input = input.child(0)?;
-                input_execution = input_execution.child(0);
-            }
+            let derived;
+            let predicates = match stacked {
+                _ if execution.analysis.is_some() || execution.context.trace_parent.is_some() => single,
+                Some(stacked) => {
+                    for bound in stacked.bounds.iter() {
+                        let lease = Arc::get_mut(&mut state).expect("Stacked filters own their reservation");
+                        lease.grow_to(lease.bytes().checked_add(*bound).ok_or_else(|| invalid("operator-size", "Filter stages exceed addressable memory"))?)?;
+                        input = input.child(0)?;
+                        input_execution = input_execution.child(0);
+                    }
+                    &stacked.predicates
+                }
+                None => {
+                    let mut stages = vec![predicate.clone()];
+                    while let RelationNode::Filter { predicate, .. } = input.relation().node() {
+                        let bound = crate::runtime_schema::local_allocation_bound(input.relation())?;
+                        let lease = Arc::get_mut(&mut state).expect("Stacked filters own their reservation");
+                        lease.grow_to(lease.bytes().checked_add(bound).ok_or_else(|| invalid("operator-size", "Filter stages exceed addressable memory"))?)?;
+                        stages.push(predicate.clone());
+                        input = input.child(0)?;
+                        input_execution = input_execution.child(0);
+                    }
+                    stages.reverse();
+                    derived = Predicates::new(Arc::clone(&single.schema), stages.into());
+                    &derived
+                }
+            };
             let Some((batches, projected)) = build_batch_input(input, input_execution, pushdowns, output).await? else { return Ok(None); };
-            stages.reverse();
             let context = Arc::clone(&execution.context);
-            let filter = Box::new(crate::columnar::BatchFilter::with_stages(batches, schema, stages, execution));
+            let filter = Box::new(crate::columnar::BatchFilter::admitted(batches, predicates, execution));
             let filter = crate::columnar::retain_batch_state(filter, state);
             let filter = if output.semantic_pages() { crate::columnar::coalesce_pages(filter, context) } else { filter };
             Ok(Some((filter, projected)))
         }
         RelationNode::Project { expressions,.. } | RelationNode::Rename { expressions,.. } => {
+            let template = runtime.operators().template(|| operator_template(&runtime))?;
+            let OperatorTemplate::Project { positions, expressions: projections } = template.as_ref() else { return Err(template_mismatch()); };
             let child = runtime.child(0)?;
-            let positions = expressions.iter().map(|named| match &named.expr { Expr::Column { id,.. } => child.schema().position(*id), _ => None }).collect::<Option<Vec<_>>>();
-            let scalar_fallback = !expressions.iter().all(|named| crate::columnar::projection::shaped(&named.expr));
-            let schema = child.schema().clone();
             let pushdowns = pushdowns.map(|filters|filters.project(expressions,&execution.context.memory)).transpose()?;
             let Some((batches,_)) = build_batch_input(child,execution.child(0),pushdowns,output).await? else { return Ok(None) };
             let batches: crate::columnar::BoxBatchCursor = match positions {
-                Some(positions) => Box::new(crate::columnar::BatchProject::new(batches,positions,Arc::clone(&execution.context.memory))),
-                None => Box::new(crate::columnar::BatchExpressions::new(batches,schema,expressions.iter().map(|named|named.expr.clone()).collect(),execution)
-                    .validating_input(scalar_fallback)),
+                Some(positions) => Box::new(crate::columnar::BatchProject::shared(batches,Arc::clone(positions),Arc::clone(&execution.context.memory))),
+                None => Box::new(crate::columnar::BatchExpressions::admitted(batches,projections,execution)
+                    .validating_input(projections.scalar_fallback)),
             };
             Ok(Some((batches,true)))
         }
-        RelationNode::Extend { expressions, .. } => {
+        RelationNode::Extend { .. } => {
+            let template = runtime.operators().template(|| operator_template(&runtime))?;
+            let OperatorTemplate::Extend { expressions: projections } = template.as_ref() else { return Err(template_mismatch()); };
             let child = runtime.child(0)?;
-            let scalar_fallback = !expressions.iter().all(|named| crate::columnar::projection::shaped(&named.expr));
-            let schema = child.schema().clone();
-            let projections = schema.fields().iter().map(rtdb_plan::Field::expression)
-                .chain(expressions.iter().map(|named| named.expr.clone())).collect();
             let Some((batches, _)) = build_batch_input(child, execution.child(0), pushdowns, output).await? else { return Ok(None); };
-            let expressions = crate::columnar::BatchExpressions::new(batches, schema, projections, execution).validating_input(scalar_fallback);
+            let expressions = crate::columnar::BatchExpressions::admitted(batches, projections, execution).validating_input(projections.scalar_fallback);
             Ok(Some((Box::new(expressions), true)))
         }
         RelationNode::Set { operator, all, .. } => {
@@ -269,8 +286,8 @@ async fn build_batches_at(
             if arguments.is_empty() => {
             let build = runtime.child(1)?;
             let probe = runtime.child(0)?;
-            let Some(probe_projected) = batch_shape(&probe, output)? else { return Ok(None); };
-            if batch_shape(&build, output)?.is_none() { return Ok(None); }
+            let Some(probe_projected) = batch_shape(&probe)? else { return Ok(None); };
+            if batch_shape(&build)?.is_none() { return Ok(None); }
             let keys = condition.is_none().then(|| crate::mark::batch_membership_keys(probe.schema(), build.schema(), comparison)).flatten();
             let schema = probe.schema().concat(build.schema())?;
             let build = crate::batch_join::ProbeInput { runtime: build, execution: execution.child(1), pushdowns: None, output };
@@ -354,7 +371,7 @@ async fn build_batches_at(
             Ok(Some((Box::new(join), left_projected || right_projected)))
         }
         RelationNode::Join { left, right, kind, condition } => {
-            let (Some(build_projected),Some(probe_projected)) = (batch_shape(&runtime.child(0)?, output)?,batch_shape(&runtime.child(1)?, output)?) else { return Ok(None) };
+            let (Some(build_projected),Some(probe_projected)) = (batch_shape(&runtime.child(0)?)?,batch_shape(&runtime.child(1)?)?) else { return Ok(None) };
             let swapped = !crate::join::build_left(left, right, *kind, &execution)?;
             let (build_side,probe_side,build_relation,probe_relation) = if swapped { (1,0,right,left) } else { (0,1,left,right) };
             let mut layout = crate::join_key::JoinLayout::new(build_relation,probe_relation,condition.as_ref(),&execution.context.memory)?;
@@ -391,7 +408,7 @@ pub(crate) async fn build_column_pages(runtime: Arc<EmittedRelation>, execution:
 
 async fn build_column_output(runtime: Arc<EmittedRelation>, execution: Execution, output: BatchOutput) -> Result<Option<crate::columnar::BoxBatchCursor>> {
     execution.context.check_cancelled()?;
-    if batch_shape(&runtime, output)?.is_none() { return Ok(None); }
+    if batch_shape(&runtime)?.is_none() { return Ok(None); }
     Ok(build_batch_input_with_state(runtime, execution, None, output, true).await?.map(|(cursor, _)| cursor))
 }
 
@@ -399,7 +416,7 @@ async fn build_materialized_columns(runtime: &Arc<EmittedRelation>, binding: &Ar
     execution: Execution, output: BatchOutput) -> Result<Option<(crate::columnar::BoxBatchCursor, bool)>> {
     let body = runtime.child(1)?;
     let bound = runtime.child(0)?;
-    if batch_shape(&body, output)?.is_none() || batch_shape(&bound, output)?.is_none() {
+    if batch_shape(&body)?.is_none() || batch_shape(&bound)?.is_none() {
         return Ok(None);
     }
     let reservation = state_reservation(runtime, &execution)?;
@@ -461,16 +478,67 @@ pub(crate) fn build_ordered_columns(
 }
 
 fn state_reservation(runtime: &Arc<EmittedRelation>, execution: &Execution) -> Result<Arc<rtdb_columnar::MemoryReservation>> {
-    let relation = runtime.relation();
-    let mut state_bound = crate::runtime_schema::local_allocation_bound(relation)?;
-    state_bound = state_bound.checked_add(crate::runtime_schema::schema_bound(runtime.schema())?).ok_or_else(||invalid("operator-size","Operator schema copies exceed addressable memory"))?;
-    for (index,_) in relation.children().iter().enumerate() { state_bound = state_bound.checked_add(crate::runtime_schema::schema_bound(runtime.child(index)?.schema())?).ok_or_else(|| invalid("operator-size", "Operator schema copies exceed addressable memory"))?; }
+    let state_bound = runtime.operators().state_bound(|| {
+        let relation = runtime.relation();
+        let mut state_bound = crate::runtime_schema::local_allocation_bound(relation)?;
+        state_bound = state_bound.checked_add(crate::runtime_schema::schema_bound(runtime.schema())?).ok_or_else(||invalid("operator-size","Operator schema copies exceed addressable memory"))?;
+        for (index,_) in relation.children().iter().enumerate() { state_bound = state_bound.checked_add(crate::runtime_schema::schema_bound(runtime.child(index)?.schema())?).ok_or_else(|| invalid("operator-size", "Operator schema copies exceed addressable memory"))?; }
+        Ok(state_bound)
+    })?;
     execution.context.memory.reserve(state_bound)
 }
 
-/// Whether the subtree opens as batches, and if so whether they pass through a projection.
-fn batch_shape(runtime: &Arc<EmittedRelation>, output: BatchOutput) -> Result<Option<bool>> {
-    stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || batch_shape_at(runtime, output))
+/// Whether the subtree opens as batches, and if so whether they pass through a projection; the same for either batch output.
+fn batch_shape(runtime: &Arc<EmittedRelation>) -> Result<Option<bool>> {
+    runtime.operators().shape(|| stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || batch_shape_at(runtime)))
+}
+
+fn template_mismatch() -> rtdb_types::Anomaly { invalid("operator-template", "Operator template disagrees with its plan") }
+
+/// What `runtime`'s node alone decides about its operator.
+fn operator_template(runtime: &EmittedRelation) -> Result<OperatorTemplate> {
+    let shaped = |expressions: &[NamedExpr]| expressions.iter().all(|named| crate::columnar::projection::shaped(&named.expr));
+    Ok(match runtime.relation().node() {
+        RelationNode::Scan(scan) => OperatorTemplate::Scan {
+            filter: scan.predicates.iter().cloned().reduce(|left, right| Expr::binary(rtdb_plan::BinaryOp::And, left, right))
+                .map(|predicate| Predicates::new(Arc::new(runtime.schema().clone()), vec![predicate].into())),
+        },
+        RelationNode::Filter { predicate, .. } => {
+            let input = runtime.child(0)?;
+            let schema = Arc::new(input.schema().clone());
+            let single = Predicates::new(Arc::clone(&schema), vec![predicate.clone()].into());
+            OperatorTemplate::Filter { single, stacked: stacked_filters(predicate, input, schema) }
+        }
+        RelationNode::Project { expressions, .. } | RelationNode::Rename { expressions, .. } => {
+            let child = runtime.child(0)?;
+            let positions = expressions.iter().map(|named| match &named.expr { Expr::Column { id, .. } => child.schema().position(*id), _ => None })
+                .collect::<Option<Arc<[usize]>>>();
+            let projections = Projections::new(Arc::new(child.schema().clone()), expressions.iter().map(|named| named.expr.clone()).collect(), !shaped(expressions));
+            OperatorTemplate::Project { positions, expressions: projections }
+        }
+        RelationNode::Extend { expressions, .. } => {
+            let child = runtime.child(0)?;
+            let schema = child.schema();
+            let projections = schema.fields().iter().map(rtdb_plan::Field::expression)
+                .chain(expressions.iter().map(|named| named.expr.clone())).collect();
+            OperatorTemplate::Extend { expressions: Projections::new(Arc::new(schema.clone()), projections, !shaped(expressions)) }
+        }
+        _ => OperatorTemplate::Other,
+    })
+}
+
+/// The filters directly beneath `predicate`'s, applied with it by one operator; none where a bound cannot be decided, which
+/// leaves the execution to decide it and report its error where it arises.
+fn stacked_filters(predicate: &Expr, mut input: Arc<EmittedRelation>, schema: Arc<Schema>) -> Option<StackedFilters> {
+    let mut stages = vec![predicate.clone()];
+    let mut bounds = Vec::new();
+    while let RelationNode::Filter { predicate, .. } = input.relation().node() {
+        bounds.push(crate::runtime_schema::local_allocation_bound(input.relation()).ok()?);
+        stages.push(predicate.clone());
+        input = input.child(0).ok()?;
+    }
+    stages.reverse();
+    Some(StackedFilters { predicates: Predicates::new(schema, stages.into()), bounds: bounds.into() })
 }
 
 fn project_sort_keys(
@@ -501,13 +569,13 @@ fn project_sort_keys(
     Ok(Some((input, output, order)))
 }
 
-fn batch_shape_at(runtime: &Arc<EmittedRelation>, output: BatchOutput) -> Result<Option<bool>> {
+fn batch_shape_at(runtime: &Arc<EmittedRelation>) -> Result<Option<bool>> {
     let relation = Arc::clone(runtime.relation());
     Ok(match relation.node() {
         RelationNode::Scan(_) => Some(false),
         RelationNode::Let { .. } => {
-            if batch_shape(&runtime.child(0)?, output)?.is_none() { return Ok(None); }
-            batch_shape(&runtime.child(1)?, output)?
+            if batch_shape(&runtime.child(0)?)?.is_none() { return Ok(None); }
+            batch_shape(&runtime.child(1)?)?
         }
         RelationNode::Reference { .. } => Some(false),
         RelationNode::Values { .. } | RelationNode::LiteralPages { .. } | RelationNode::ArrowLiteralPages { .. } | RelationNode::List { .. } => Some(false),
@@ -517,50 +585,50 @@ fn batch_shape_at(runtime: &Arc<EmittedRelation>, output: BatchOutput) -> Result
             while matches!(child.relation().node(), RelationNode::Filter { .. }) {
                 child = child.child(0)?;
             }
-            batch_shape(&child, output)?
+            batch_shape(&child)?
         }
         RelationNode::Project { .. } | RelationNode::Rename { .. } => {
             let child = runtime.child(0)?;
-            batch_shape(&child, output)?.map(|_| true)
+            batch_shape(&child)?.map(|_| true)
         }
         RelationNode::Extend { .. } => {
             let child = runtime.child(0)?;
-            batch_shape(&child, output)?.map(|_| true)
+            batch_shape(&child)?.map(|_| true)
         }
         RelationNode::Set { operator, .. } => {
-            batch_shape(&runtime.child(0)?, output)?.zip(batch_shape(&runtime.child(1)?, output)?)
+            batch_shape(&runtime.child(0)?)?.zip(batch_shape(&runtime.child(1)?)?)
                 .map(|(left, right)| left || (*operator == SetOperator::Union && right))
         }
-        RelationNode::Distinct { .. } => batch_shape(&runtime.child(0)?, output)?,
-        RelationNode::Aggregate { .. } => batch_shape(&runtime.child(0)?, output)?.map(|_| false),
+        RelationNode::Distinct { .. } => batch_shape(&runtime.child(0)?)?,
+        RelationNode::Aggregate { .. } => batch_shape(&runtime.child(0)?)?.map(|_| false),
         RelationNode::Mark { arguments, .. } if !arguments.is_empty() =>
-            batch_shape(&runtime.child(0)?, output)?,
+            batch_shape(&runtime.child(0)?)?,
         RelationNode::Mark { .. } => {
-            if batch_shape(&runtime.child(1)?, output)?.is_none() { return Ok(None); }
-            batch_shape(&runtime.child(0)?, output)?
+            if batch_shape(&runtime.child(1)?)?.is_none() { return Ok(None); }
+            batch_shape(&runtime.child(0)?)?
         }
         RelationNode::Apply { .. } =>
-            batch_shape(&runtime.child(0)?, output)?,
-        RelationNode::PatchGaps { .. } => batch_shape(&runtime.child(0)?, output)?,
+            batch_shape(&runtime.child(0)?)?,
+        RelationNode::PatchGaps { .. } => batch_shape(&runtime.child(0)?)?,
         RelationNode::Join { kind: rtdb_plan::JoinKind::Cross, .. } => {
-            batch_shape(&runtime.child(0)?, output)?.zip(batch_shape(&runtime.child(1)?, output)?).map(|(left, right)| left || right)
+            batch_shape(&runtime.child(0)?)?.zip(batch_shape(&runtime.child(1)?)?).map(|(left, right)| left || right)
         }
         RelationNode::Join { .. } => {
-            batch_shape(&runtime.child(0)?, output)?.zip(batch_shape(&runtime.child(1)?, output)?).map(|(left, right)| left || right)
+            batch_shape(&runtime.child(0)?)?.zip(batch_shape(&runtime.child(1)?)?).map(|(left, right)| left || right)
         }
-        RelationNode::Limit { .. } => batch_shape(&runtime.child(0)?, output)?,
-        RelationNode::Unnest { .. } => batch_shape(&runtime.child(0)?, output)?,
-        RelationNode::Ordinality { .. } => batch_shape(&runtime.child(0)?, output)?,
+        RelationNode::Limit { .. } => batch_shape(&runtime.child(0)?)?,
+        RelationNode::Unnest { .. } => batch_shape(&runtime.child(0)?)?,
+        RelationNode::Ordinality { .. } => batch_shape(&runtime.child(0)?)?,
         RelationNode::Window { partition_by, order_by, expressions, .. } => {
             let child = runtime.child(0)?;
             if !crate::window::BatchWindow::supports(child.schema(), partition_by, &[], expressions) { return Ok(None); }
             let computed = !order_by.is_empty() && !crate::sort::batches::BatchSort::supports(child.schema(), order_by);
-            batch_shape(&child, output)?.map(|projected| projected || computed)
+            batch_shape(&child)?.map(|projected| projected || computed)
         }
         RelationNode::Sort { order_by, .. } | RelationNode::SortLimit { order_by, .. } => {
             let child = runtime.child(0)?;
             let computed = !order_by.is_empty() && !crate::sort::batches::BatchSort::supports(child.schema(), order_by);
-            batch_shape(&child, output)?.map(|projected| projected || computed)
+            batch_shape(&child)?.map(|projected| projected || computed)
         }
     })
 }
@@ -1294,5 +1362,73 @@ mod equality_allocation_tests {
         }
         assert!(rows_equal(&[Value::Transit(vec![0xc1])],&row[..1],"UTC",&memory).is_err());
         assert_eq!(memory.used_bytes(),0);
+    }
+}
+
+#[cfg(test)]
+mod template_tests {
+    use super::*;
+    use rtdb_columnar::MemoryBudget;
+    use rtdb_plan::{ColumnId, Field, UnaryOp};
+    use rtdb_types::ScalarType;
+
+    fn catalog() -> crate::CatalogSnapshot {
+        let storage = Arc::new(rtdb_storage::cache::BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20));
+        let database = crate::DatabaseSnapshot { partitions: vec![], storage };
+        crate::CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap()
+    }
+
+    /// `$1` as `a`, extended with `a IS NULL` as `b`, under two stacked filters and a reordering projection.
+    fn plan() -> Arc<Relation> {
+        let field = |id: u32, name: &str, data_type: LogicalType| Field { id: ColumnId(id), name: name.into(), qualifier: None, qualified_only: false,
+            unnamed: false, data_type };
+        let a = field(0, "a", LogicalType::Scalar(ScalarType::I64));
+        let b = field(1, "b", LogicalType::Scalar(ScalarType::Bool));
+        let values = Arc::new(Relation::new(Schema::new(vec![a.clone()]).unwrap(),
+            RelationNode::Values { rows: vec![vec![Expr::Parameter { index: 0, data_type: a.data_type.clone() }]] }).unwrap());
+        let extended = Arc::new(values.extend(vec![NamedExpr { field: b.clone(), expr: Expr::unary(UnaryOp::IsNull, a.expression()) }]).unwrap());
+        let inner = Arc::new(extended.filter(Expr::unary(UnaryOp::IsNotNull, a.expression())).unwrap());
+        let outer = Arc::new(inner.filter(Expr::unary(UnaryOp::Not, b.expression())).unwrap());
+        Arc::new(outer.project(vec![NamedExpr { field: b.clone(), expr: b.expression() }, NamedExpr { field: a.clone(), expr: a.expression() }]).unwrap())
+    }
+
+    fn nodes(root: &Arc<EmittedRelation>) -> Vec<Arc<EmittedRelation>> {
+        let mut nodes = vec![Arc::clone(root)];
+        let mut next = 0;
+        while let Some(node) = nodes.get(next).cloned() {
+            nodes.extend((0..2).map_while(|index| node.child(index).ok()));
+            next += 1;
+        }
+        nodes
+    }
+
+    #[test]
+    fn a_kept_compiled_plan_keeps_what_a_fresh_build_decides() {
+        let relation = plan();
+        let (keeper, query) = (MemoryBudget::new(1 << 24), MemoryBudget::new(1 << 24));
+        let compiled = crate::compiled::CompiledQuery::kept_by(Some(Arc::clone(&keeper)));
+        let integers = [LogicalType::Scalar(ScalarType::I64)];
+        let mode = crate::runtime_schema::EmissionMode::Execution;
+        let kept = nodes(&compiled.emit(&relation, &catalog(), &integers, &query, mode).unwrap());
+        let fresh = nodes(&EmittedRelation::emit(Arc::clone(&relation), &catalog(), &integers, &query, mode).unwrap());
+        assert_eq!(kept.len(), fresh.len());
+        assert!(fresh.iter().any(|node| matches!(operator_template(node).unwrap(),
+            OperatorTemplate::Filter { stacked: Some(ref stacked), .. } if stacked.bounds.len() == 1)));
+        assert!(fresh.iter().any(|node| matches!(operator_template(node).unwrap(), OperatorTemplate::Project { positions: Some(_), .. })));
+        assert!(fresh.iter().any(|node| matches!(operator_template(node).unwrap(), OperatorTemplate::Extend { .. })));
+        let before = keeper.used_bytes();
+        for (kept, fresh) in kept.iter().zip(&fresh) {
+            let template = kept.operators().template(|| operator_template(kept)).unwrap();
+            assert_eq!(*template, operator_template(fresh).unwrap());
+            let again = kept.operators().template(|| panic!("a kept template is built once")).unwrap();
+            assert!(Arc::ptr_eq(&template, &again));
+            assert_eq!(batch_shape(kept).unwrap(), batch_shape_at(fresh).unwrap());
+            assert_eq!(batch_shape(kept).unwrap(), batch_shape_at(fresh).unwrap());
+        }
+        assert!(keeper.used_bytes() > before);
+        drop(fresh);
+        assert_eq!(query.used_bytes(), 0);
+        drop((kept, compiled));
+        assert_eq!(keeper.used_bytes(), 0);
     }
 }

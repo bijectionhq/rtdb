@@ -3498,21 +3498,27 @@ impl PredicateSelection {
 
 /// Filters batches, evaluating the predicate over whole columns where its shape and the columns' types allow,
 /// and row by row, exactly as the row filter does, for any batch where they don't.
-pub(crate) struct BatchFilter { input: BoxBatchCursor, schema: rtdb_plan::Schema, stages: Vec<rtdb_plan::Expr>, execution: crate::context::Execution }
+pub(crate) struct BatchFilter {
+    input: BoxBatchCursor, schema: Arc<rtdb_plan::Schema>, stages: Arc<[rtdb_plan::Expr]>,
+    admissions: Option<Arc<[crate::compiled::Admission]>>, execution: crate::context::Execution,
+}
 impl BatchFilter {
     pub fn new(input: BoxBatchCursor, schema: rtdb_plan::Schema, predicate: rtdb_plan::Expr, execution: crate::context::Execution) -> Self {
-        Self::with_stages(input, schema, vec![predicate], execution)
+        Self { input, schema: Arc::new(schema), stages: vec![predicate].into(), admissions: None, execution }
     }
-    pub fn with_stages(input: BoxBatchCursor, schema: rtdb_plan::Schema, stages: Vec<rtdb_plan::Expr>, execution: crate::context::Execution) -> Self {
-        Self { input, schema, stages, execution }
+    /// Applies a compiled plan's predicates, sharing their admissions with every execution of that plan.
+    pub(crate) fn admitted(input: BoxBatchCursor, predicates: &crate::compiled::Predicates, execution: crate::context::Execution) -> Self {
+        Self { input, schema: Arc::clone(&predicates.schema), stages: Arc::clone(&predicates.stages),
+            admissions: Some(Arc::clone(&predicates.admissions)), execution }
     }
 }
 #[async_trait::async_trait]
 impl BatchCursor for BatchFilter {
     async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
         'batches: while let Some(mut batch) = poll_nested_batch(self.input.as_mut()).await? {
-            for predicate in &self.stages {
-                let selection = predicate_selection(&batch, predicate, &self.schema, &self.execution).await?;
+            for (index, predicate) in self.stages.iter().enumerate() {
+                let admission = self.admissions.as_ref().map(|admissions| &admissions[index]);
+                let selection = admitted_predicate_selection(&batch, predicate, &self.schema, &self.execution, admission).await?;
                 if selection.count == 0 { continue 'batches; }
                 batch = batch.select_predicate(&selection, &self.execution.context.memory)?;
             }
@@ -3535,6 +3541,14 @@ pub(crate) fn typed_predicate_mask(
 pub(crate) async fn predicate_selection(
     batch: &ColumnBatch, predicate: &rtdb_plan::Expr, schema: &rtdb_plan::Schema, execution: &crate::context::Execution,
 ) -> Result<PredicateSelection> {
+    admitted_predicate_selection(batch, predicate, schema, execution, None).await
+}
+
+/// As `predicate_selection`, skipping the type admission of a kernel-evaluated predicate that `admission` already passed.
+async fn admitted_predicate_selection(
+    batch: &ColumnBatch, predicate: &rtdb_plan::Expr, schema: &rtdb_plan::Schema, execution: &crate::context::Execution,
+    admission: Option<&crate::compiled::Admission>,
+) -> Result<PredicateSelection> {
     execution.context.check_cancelled()?;
     let params = execution.parameters.evaluator();
     let memory = &execution.context.memory;
@@ -3547,9 +3561,10 @@ pub(crate) async fn predicate_selection(
         return PredicateSelection::from_arrow(values, reservation);
     }
     let prepare_typed = || -> Result<()> {
-        if batch.columns.iter().any(|column| matches!(column, Column::Selected(_))) {
+        if batch.columns.iter().any(|column| matches!(column, Column::Selected(_))) && !admission.is_some_and(crate::compiled::Admission::admitted) {
             let metadata = execution.scope()?;
             execution.prepare_expression(predicate, schema, &metadata)?;
+            if let Some(admission) = admission { admission.admit(); }
         }
         Ok(())
     };
@@ -4962,8 +4977,11 @@ mod tests {
 }
 
 /// Reorders, selects or renames a batch's columns, for a projection whose expressions are all input columns.
-pub(crate) struct BatchProject { input: BoxBatchCursor, positions: Vec<usize>, memory: Arc<MemoryBudget> }
-impl BatchProject { pub fn new(input: BoxBatchCursor, positions: Vec<usize>, memory: Arc<MemoryBudget>) -> Self { Self { input, positions, memory } } }
+pub(crate) struct BatchProject { input: BoxBatchCursor, positions: Arc<[usize]>, memory: Arc<MemoryBudget> }
+impl BatchProject {
+    pub fn new(input: BoxBatchCursor, positions: Vec<usize>, memory: Arc<MemoryBudget>) -> Self { Self::shared(input, positions.into(), memory) }
+    pub(crate) fn shared(input: BoxBatchCursor, positions: Arc<[usize]>, memory: Arc<MemoryBudget>) -> Self { Self { input, positions, memory } }
+}
 #[async_trait::async_trait]
 impl BatchCursor for BatchProject {
     async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
@@ -4978,8 +4996,8 @@ impl BatchCursor for BatchProject {
         let scratch = batch.columns.len().checked_mul(size_of::<usize>()).ok_or_else(size_error)?;
         let _uses = self.memory.reserve(scratch)?;
         let mut uses = vec![0usize; batch.columns.len()];
-        for &position in &self.positions { uses[position] += 1; }
-        for &position in &self.positions {
+        for &position in self.positions.iter() { uses[position] += 1; }
+        for &position in self.positions.iter() {
             uses[position] -= 1;
             let owner = batch.column_reservation(position);
             let (column, owner) = if uses[position] == 0 {
@@ -5040,9 +5058,20 @@ impl Column {
 
 /// Projects batches through expressions computed over whole columns where the kernel's arithmetic is exactly the
 /// evaluator's, and row by row through the evaluator for any expression or batch where it isn't.
-pub(crate) struct BatchExpressions { input: BoxBatchCursor, schema: rtdb_plan::Schema, expressions: Vec<rtdb_plan::Expr>, clocked: Option<Vec<rtdb_plan::Expr>>, cosine: Option<Vec<Option<crate::cosine::Projection>>>, execution: crate::context::Execution, validate_input: bool }
+pub(crate) struct BatchExpressions {
+    input: BoxBatchCursor, schema: Arc<rtdb_plan::Schema>, expressions: Arc<[rtdb_plan::Expr]>, clocked: Option<Arc<[rtdb_plan::Expr]>>,
+    cosine: Option<Vec<Option<crate::cosine::Projection>>>, admissions: Option<Arc<[crate::compiled::Admission]>>,
+    execution: crate::context::Execution, validate_input: bool,
+}
 impl BatchExpressions {
-    pub fn new(input: BoxBatchCursor, schema: rtdb_plan::Schema, expressions: Vec<rtdb_plan::Expr>, execution: crate::context::Execution) -> Self { Self { input, schema, expressions, clocked: None, cosine: None, execution, validate_input: false } }
+    pub fn new(input: BoxBatchCursor, schema: rtdb_plan::Schema, expressions: Vec<rtdb_plan::Expr>, execution: crate::context::Execution) -> Self {
+        Self { input, schema: Arc::new(schema), expressions: expressions.into(), clocked: None, cosine: None, admissions: None, execution, validate_input: false }
+    }
+    /// Computes a compiled plan's projections, sharing their admissions with every execution of that plan.
+    pub(crate) fn admitted(input: BoxBatchCursor, projections: &crate::compiled::Projections, execution: crate::context::Execution) -> Self {
+        Self { input, schema: Arc::clone(&projections.schema), expressions: Arc::clone(&projections.expressions), clocked: None, cosine: None,
+            admissions: Some(Arc::clone(&projections.admissions)), execution, validate_input: false }
+    }
     pub fn validating_input(mut self, validate: bool) -> Self {
         self.validate_input = validate;
         self
@@ -5051,9 +5080,9 @@ impl BatchExpressions {
 
 /// The expressions with each read of the query clock replaced by the instant the evaluator reads, for the kernels;
 /// a read the evaluator fails stays a call, which leaves its expression to the evaluator.
-async fn read_clock(expressions: &[rtdb_plan::Expr], execution: &crate::context::Execution) -> Result<Vec<rtdb_plan::Expr>> {
+async fn read_clock(expressions: &Arc<[rtdb_plan::Expr]>, execution: &crate::context::Execution) -> Result<Arc<[rtdb_plan::Expr]>> {
     let mut reads = Vec::new();
-    for expression in expressions {
+    for expression in expressions.iter() {
         expression.visit(&mut |expr| if let rtdb_plan::Expr::Call { name, args, .. } = expr && projection::clock(name, args) && !reads.contains(expr) { reads.push(expr.clone()); });
     }
     let schema = rtdb_plan::Schema::default();
@@ -5062,6 +5091,7 @@ async fn read_clock(expressions: &[rtdb_plan::Expr], execution: &crate::context:
         let scope = execution.scope()?;
         if let Ok(value) = execution.evaluate(&scope, &read, &schema, &[]).await { instants.push((read, value)); }
     }
+    if instants.is_empty() { return Ok(Arc::clone(expressions)); }
     Ok(expressions.iter().map(|expression| {
         let mut expression = expression.clone();
         expression.rewrite(&mut |expr| if let Some((_, value)) = instants.iter().find(|(read, _)| read == expr) { *expr = rtdb_plan::Expr::Literal(value.clone()); });
@@ -5175,8 +5205,12 @@ impl BatchCursor for BatchExpressions {
                 && matches!(plain_scalar(&expression.data_type()), Some(rtdb_types::ScalarType::Bool))
                 && let Some(truth) = kernel::truth(kernel, &self.schema, &batch, parameters)
             {
-                let metadata = self.execution.scope()?;
-                self.execution.prepare_expression(expression, &self.schema, &metadata)?;
+                let admission = self.admissions.as_ref().map(|admissions| &admissions[index]);
+                if !admission.is_some_and(crate::compiled::Admission::admitted) {
+                    let metadata = self.execution.scope()?;
+                    self.execution.prepare_expression(expression, &self.schema, &metadata)?;
+                    if let Some(admission) = admission { admission.admit(); }
+                }
                 let logical = if truth.iter().all(Option::is_none) {
                     LogicalType::Null
                 } else {

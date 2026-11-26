@@ -9,7 +9,8 @@ use rtdb_types::{ListKind, LogicalType, Result, ScalarType, Value};
 
 use crate::{QueryContext, context::{Execution, cancelled}, invalid};
 use crate::parameters::BoundParameters;
-use crate::runtime_schema::{EmissionMode, Emissions, EmittedRelation, RuntimeSchema, declared_field_types, declared_value_types};
+use crate::compiled::{CompiledQuery, Fact};
+use crate::runtime_schema::{EmissionMode, EmittedRelation, RuntimeSchema, declared_field_types, declared_value_types};
 
 /// A row and the lease charging it; a lease may be shared by the rows of one page, so the row records its own size.
 pub(crate) struct OwnedRow { pub values: Vec<Value>, _reservation: Arc<MemoryReservation>, _bytes: usize }
@@ -54,23 +55,13 @@ pub(crate) type BoxCursor = Box<dyn RowCursor>;
 
 #[derive(Clone)]
 pub struct PreparedQuery { relation: Arc<Relation>, settings: Arc<rtdb_plan::QuerySettings>, output: QueryOutput, required_parameter_count: usize, _plan_reservation: Option<Arc<MemoryReservation>>,
-    emissions: Arc<Emissions>, facts: Arc<PlanFacts> }
-
-/// What a plan's relation alone decides, worked out on first use and shared by every copy of the plan.
-#[derive(Default)]
-struct PlanFacts {
-    allocation_bound: std::sync::OnceLock<usize>,
-    requests_token: std::sync::OnceLock<bool>,
-    fills_row_batches: std::sync::OnceLock<bool>,
-    uses_row_batch_limit: std::sync::OnceLock<bool>,
-    projection_has_computation: std::sync::OnceLock<bool>,
-}
+    compiled: Arc<CompiledQuery> }
 #[derive(Clone)]
 enum QueryOutput { Rows, Plan(Arc<crate::explain::ExplainPlan>), Analyze(Schema) }
 
 impl PreparedQuery {
     /// The same plan, its retained bytes charged to `memory` instead.
-    /// The copy shares the original's emissions, which stay charged to the budget that held the original plan.
+    /// The copy shares the original's compilations, which stay charged to the budget that held the original plan.
     pub fn recharged(&self, memory: &Arc<MemoryBudget>) -> Result<Self> {
         if self._plan_reservation.as_ref().is_some_and(|reservation| Arc::ptr_eq(reservation.budget(), memory)) {
             return Ok(self.clone());
@@ -89,7 +80,7 @@ impl PreparedQuery {
     pub fn new_in(relation: Arc<Relation>, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let mut query = Self::new(relation)?;
         let reservation = reserve_plan(&query.relation, &query.settings, memory)?;
-        query.emissions = Arc::new(Emissions::kept_by(Some(Arc::clone(reservation.budget()))));
+        query.compiled = Arc::new(CompiledQuery::kept_by(Some(Arc::clone(reservation.budget()))));
         query._plan_reservation = Some(reservation);
         Ok(query)
     }
@@ -98,7 +89,7 @@ impl PreparedQuery {
         relation.validate()?;
         let relation = crate::optimize::prepare(relation)?;
         let required_parameter_count = relation.parameter_count().max(settings.parameter_count());
-        Ok(Self { relation, settings: Arc::new(settings), output: QueryOutput::Rows, required_parameter_count, _plan_reservation: None, emissions: Arc::new(Emissions::kept_by(None)), facts: Default::default() })
+        Ok(Self { relation, settings: Arc::new(settings), output: QueryOutput::Rows, required_parameter_count, _plan_reservation: None, compiled: Arc::new(CompiledQuery::kept_by(None)) })
     }
     /// Retains query metadata as well as the relation; SQL callers should use this constructor.
     pub fn from_prepared(prepared: rtdb_plan::PreparedStatement, memory: &Arc<MemoryBudget>) -> Result<Self> {
@@ -117,8 +108,8 @@ impl PreparedQuery {
         };
         relation.validate()?;
         let required_parameter_count = lexical_parameters.max(relation.parameter_count()).max(prepared.settings.parameter_count());
-        let emissions = Arc::new(Emissions::kept_by(Some(Arc::clone(plan_reservation.budget()))));
-        Ok(Self { relation, settings: Arc::new(prepared.settings), output, required_parameter_count, _plan_reservation: Some(plan_reservation), emissions, facts: Default::default() })
+        let compiled = Arc::new(CompiledQuery::kept_by(Some(Arc::clone(plan_reservation.budget()))));
+        Ok(Self { relation, settings: Arc::new(prepared.settings), output, required_parameter_count, _plan_reservation: Some(plan_reservation), compiled })
     }
     pub fn schema(&self) -> &Schema { match &self.output { QueryOutput::Rows => self.relation.schema(), QueryOutput::Plan(plan) => &plan.schema, QueryOutput::Analyze(schema) => schema } }
     pub fn relation(&self) -> &Arc<Relation> { &self.relation }
@@ -147,9 +138,9 @@ impl PreparedQuery {
     pub fn result_schema(&self, context: &QueryContext) -> Result<Arc<RuntimeSchema>> {
         self.emit_result_schema(context, &[])
     }
-    /// This plan's emission, kept with the plan where its charge has a keeper.
+    /// This plan compiled for `parameters`, kept with the plan where its charge has a keeper.
     fn emit(&self, catalog: &crate::CatalogSnapshot, parameters: &[LogicalType], memory: &Arc<MemoryBudget>, mode: EmissionMode) -> Result<Arc<EmittedRelation>> {
-        self.emissions.emit(&self.relation, catalog, parameters, memory, mode)
+        self.compiled.emit(&self.relation, catalog, parameters, memory, mode)
     }
     fn emit_result_schema(&self, context: &QueryContext, parameter_fields: &[LogicalType]) -> Result<Arc<RuntimeSchema>> {
         context.check_cancelled()?;
@@ -253,7 +244,7 @@ impl PreparedQuery {
         let runtime_schema = self.emit(&operator.catalog, types, &operator.memory, EmissionMode::Execution)?.output();
         let logical = runtime_schema.schema();
         let memory = &operator.memory;
-        let computed = if *self.facts.projection_has_computation.get_or_init(|| projection_has_computation(&self.relation)) {
+        let computed = if self.compiled.fact(Fact::ProjectionHasComputation, || projection_has_computation(&self.relation)) {
             let bytes = self.allocation_bound()?
                 .checked_add(rtdb_format::ipc::schema_translation_bound(batch.schema_ref())?)
                 .ok_or_else(parameter_projection_size)?;
@@ -361,7 +352,7 @@ impl PreparedQuery {
                 found
             }) || relation.children().into_iter().any(|child| requests_token(child))
         }
-        if context.snapshot_token().is_none() && context.snapshot_tokens.is_some() && *self.facts.requests_token.get_or_init(|| requests_token(&self.relation))
+        if context.snapshot_token().is_none() && context.snapshot_tokens.is_some() && self.compiled.fact(Fact::RequestsToken, || requests_token(&self.relation))
             && let Some(token) = context.issue_snapshot_token()?
         {
             return context.with_exact_snapshot_token(token);
@@ -369,13 +360,9 @@ impl PreparedQuery {
         Ok(context)
     }
 
-    fn declared(&self, width: usize, mode: EmissionMode) -> Arc<[Option<LogicalType>]> { self.emissions.declared(&self.relation, width, mode) }
+    fn declared(&self, width: usize, mode: EmissionMode) -> Arc<[Option<LogicalType>]> { self.compiled.declared(&self.relation, width, mode) }
 
-    fn allocation_bound(&self) -> Result<usize> {
-        if let Some(bound) = self.facts.allocation_bound.get() { return Ok(*bound); }
-        let bound = crate::runtime_schema::allocation_bound(&self.relation)?;
-        Ok(*self.facts.allocation_bound.get_or_init(|| bound))
-    }
+    fn allocation_bound(&self) -> Result<usize> { self.compiled.allocation_bound(&self.relation) }
 
     fn check_dependencies(&self, context: &QueryContext) -> Result<()> {
         for dependency in dependencies(&self.relation) {
@@ -428,11 +415,11 @@ impl PreparedQuery {
                 }
                 Batching::Rows | Batching::Columns | Batching::ColumnRows => match crate::operators::build_columns(Arc::clone(&operators), execution.clone()).await? {
                     Some(input) => {
-                        if matches!(batching, Batching::Rows | Batching::ColumnRows) || *self.facts.fills_row_batches.get_or_init(|| fills_row_batches(operators.relation())) {
+                        if matches!(batching, Batching::Rows | Batching::ColumnRows) || self.compiled.fact(Fact::FillsRowBatches, || fills_row_batches(operators.relation())) {
                             let input = Box::new(RowBatchedColumns { input, pending: None, context: Arc::clone(&context) });
                             return Ok(QueryInput::Columns(ColumnOutput { input, limit: usize::MAX, pending: None }));
                         }
-                        let limit = if *self.facts.uses_row_batch_limit.get_or_init(|| uses_row_batch_limit(operators.relation())) {
+                        let limit = if self.compiled.fact(Fact::UsesRowBatchLimit, || uses_row_batch_limit(operators.relation())) {
                             context.options.batch_rows
                         } else {
                             usize::MAX
@@ -1312,7 +1299,7 @@ mod tests {
         let integers = [LogicalType::Scalar(ScalarType::I64)];
         let (first_query, second_query) = (MemoryBudget::new(1 << 24), MemoryBudget::new(1 << 24));
         let (first, second) = (kept.recharged(&first_query)?, kept.recharged(&second_query)?);
-        assert!(Arc::ptr_eq(&first.emissions, &kept.emissions) && Arc::ptr_eq(&second.emissions, &kept.emissions));
+        assert!(Arc::ptr_eq(&first.compiled, &kept.compiled) && Arc::ptr_eq(&second.compiled, &kept.compiled));
         let emitted = first.emit(&catalog, &integers, &first_query, EmissionMode::Execution)?;
         let statement_bytes = statement.used_bytes();
         let again = second.emit(&catalog, &integers, &second_query, EmissionMode::Execution)?;
@@ -1342,6 +1329,55 @@ mod tests {
         Ok(())
     }
 
+    /// `$1` as `a`, extended with `a IS NULL` as `b`, kept where `a` is not null, and projected as `b, a`.
+    fn filtered_extension() -> Result<Arc<Relation>> {
+        use rtdb_plan::{ColumnId, Field, NamedExpr, UnaryOp};
+        let field = |id: u32, name: &str, data_type: LogicalType| Field { id: ColumnId(id), name: name.into(), qualifier: None, qualified_only: false,
+            unnamed: false, data_type };
+        let a = field(0, "a", LogicalType::Null);
+        let b = field(1, "b", LogicalType::Scalar(ScalarType::Bool));
+        let values = Arc::new(Relation::new(Schema::new(vec![a.clone()])?, RelationNode::Values { rows: vec![vec![Expr::Parameter { index: 0, data_type: LogicalType::Null }]] })?);
+        let extended = Arc::new(values.extend(vec![NamedExpr { field: b.clone(), expr: Expr::unary(UnaryOp::IsNull, a.expression()) }])?);
+        let filtered = Arc::new(extended.filter(Expr::unary(UnaryOp::IsNotNull, a.expression()))?);
+        Ok(Arc::new(filtered.project(vec![NamedExpr { field: b.clone(), expr: b.expression() }, NamedExpr { field: a.clone(), expr: a.expression() }])?))
+    }
+
+    async fn rows(query: &PreparedQuery, memory: &Arc<MemoryBudget>, value: Value) -> Result<Vec<Vec<Value>>> {
+        let context = QueryContext::new(empty_catalog()?, Arc::clone(memory), rtdb_types::Timestamp(10), "UTC",
+            crate::QueryOptions::default(), &tokio_util::sync::CancellationToken::new())?;
+        let mut cursor = query.execute_columns(context, vec![value]).await?;
+        let mut rows = Vec::new();
+        while let Some(page) = cursor.next_batch().await? {
+            let batch = page.batch();
+            for row in 0..batch.num_rows() {
+                rows.push((0..batch.num_columns()).map(|column| rtdb_columnar::read_value(batch.schema_ref().field(column), batch.column(column).as_ref(), row))
+                    .collect::<Result<Vec<_>>>()?);
+            }
+        }
+        Ok(rows)
+    }
+
+    #[tokio::test]
+    async fn a_kept_plan_returns_what_a_fresh_plan_returns_across_snapshots_and_parameter_types() -> Result<()> {
+        let statement = MemoryBudget::new(1 << 24);
+        let kept = PreparedQuery::new_in(filtered_extension()?, &statement)?;
+        let values = [Value::I64(7), Value::Utf8("x".into()), Value::Null, Value::I64(8), Value::Utf8("y".into()), Value::I64(7)];
+        let mut charged = Vec::new();
+        for value in values {
+            let (kept_memory, fresh_memory) = (MemoryBudget::new(1 << 24), MemoryBudget::new(1 << 24));
+            let fresh = PreparedQuery::new(filtered_extension()?)?;
+            let expected = rows(&fresh, &fresh_memory, value.clone()).await?;
+            let copy = kept.recharged(&kept_memory)?;
+            assert_eq!(rows(&copy, &kept_memory, value.clone()).await?, expected);
+            drop(copy);
+            assert_eq!((kept_memory.used_bytes(), fresh_memory.used_bytes()), (0, 0));
+            charged.push(statement.used_bytes());
+        }
+        assert_eq!(charged[3], charged[5], "a signature already compiled is charged once");
+        assert_eq!(charged[1], charged[4]);
+        Ok(())
+    }
+
     #[test]
     fn queries_of_a_kept_plan_share_its_result_schema() -> Result<()> {
         let statement = MemoryBudget::new(1 << 24);
@@ -1364,9 +1400,11 @@ mod tests {
         let fresh = crate::runtime_schema::allocation_bound(query.relation())?;
         assert_eq!(query.allocation_bound()?, fresh);
         let copy = query.recharged(&MemoryBudget::new(1 << 20))?;
-        assert!(Arc::ptr_eq(&copy.facts, &query.facts));
+        assert!(Arc::ptr_eq(&copy.compiled, &query.compiled));
         assert_eq!(copy.allocation_bound()?, fresh);
-        assert_eq!(*copy.facts.projection_has_computation.get_or_init(|| projection_has_computation(copy.relation())),
+        assert_eq!(copy.compiled.fact(Fact::ProjectionHasComputation, || projection_has_computation(copy.relation())),
+            projection_has_computation(query.relation()));
+        assert_eq!(query.compiled.fact(Fact::ProjectionHasComputation, || !projection_has_computation(query.relation())),
             projection_has_computation(query.relation()));
         Ok(())
     }
