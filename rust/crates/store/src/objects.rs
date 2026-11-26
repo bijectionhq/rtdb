@@ -39,19 +39,13 @@ impl WriterObjects {
         generation: u64,
         manifest: &Manifest,
     ) -> Result<PreparedObject> {
-        if manifest
-            .files
-            .iter()
-            .chain(manifest.pins.iter().map(|pin| &pin.manifest))
-            .any(|id| id.database != self.database || id.epoch > self.epoch)
-        {
-            return Err(Anomaly::incorrect(
-                "rtdb.store/manifest-scope",
-                "Manifest references an object outside the writer scope",
-            ));
-        }
-        self.prepare(kms, generation, ObjectKind::Manifest, &manifest.encode()?)
-            .await
+        self.reserve_manifest()?.seal(kms, generation, manifest).await
+    }
+
+    /// Allocates the next manifest slot now and seals it later, so a writer
+    /// can build a checkpoint without holding its allocator.
+    pub fn reserve_manifest(&mut self) -> Result<ReservedManifest> {
+        Ok(ReservedManifest(self.allocate(ObjectKind::Manifest)?))
     }
 
     pub(super) fn database(&self) -> Uuid {
@@ -65,6 +59,10 @@ impl WriterObjects {
         kind: ObjectKind,
         data: &[u8],
     ) -> Result<PreparedObject> {
+        seal(kms, generation, self.allocate(kind)?, data).await
+    }
+
+    fn allocate(&mut self, kind: ObjectKind) -> Result<ObjectId> {
         let seq = self.next.ok_or_else(|| {
             Anomaly::fault(
                 "rtdb.store/sequence-exhausted",
@@ -72,24 +70,48 @@ impl WriterObjects {
             )
         })?;
         self.next = seq.checked_add(1);
-        let mut id = ObjectId {
+        Ok(ObjectId {
             database: self.database,
             kind,
             epoch: self.epoch,
             seq,
             digest: [0; 32],
-        };
-        let generation = Generation {
-            database: self.database,
-            number: generation,
-        };
-        let bytes = rtdb_crypt::seal(kms, generation, context(id), data).await?;
-        id.digest = Sha256::digest(&bytes).into();
-        Ok(PreparedObject {
-            id,
-            bytes: Bytes::from(bytes),
         })
     }
+}
+
+/// A manifest slot allocated by one writer epoch and not yet sealed.
+pub struct ReservedManifest(ObjectId);
+
+impl ReservedManifest {
+    pub async fn seal(self, kms: &dyn Kms, generation: u64, manifest: &Manifest) -> Result<PreparedObject> {
+        let ObjectId { database, epoch, .. } = self.0;
+        if manifest
+            .files
+            .iter()
+            .chain(manifest.pins.iter().map(|pin| &pin.manifest))
+            .any(|id| id.database != database || id.epoch > epoch)
+        {
+            return Err(Anomaly::incorrect(
+                "rtdb.store/manifest-scope",
+                "Manifest references an object outside the writer scope",
+            ));
+        }
+        seal(kms, generation, self.0, &manifest.encode()?).await
+    }
+}
+
+async fn seal(kms: &dyn Kms, generation: u64, mut id: ObjectId, data: &[u8]) -> Result<PreparedObject> {
+    let generation = Generation {
+        database: id.database,
+        number: generation,
+    };
+    let bytes = rtdb_crypt::seal(kms, generation, context(id), data).await?;
+    id.digest = Sha256::digest(&bytes).into();
+    Ok(PreparedObject {
+        id,
+        bytes: Bytes::from(bytes),
+    })
 }
 
 /// An allocation and its immutable bytes, reusable for a retry of the same put.
@@ -138,6 +160,30 @@ impl VerifiedManifest {
 
     pub fn contents(&self) -> &Manifest {
         &self.manifest
+    }
+
+    /// The same verified manifest without its checkpoint payload. Reachability
+    /// reads only the files, pins and generation, so a writer can keep this
+    /// summary instead of reading the manifest again.
+    pub fn summary(&self) -> Self {
+        Self {
+            id: self.id,
+            manifest: Manifest { files: self.manifest.files.clone(), pins: self.manifest.pins.clone(), payload: Vec::new() },
+            generation: self.generation,
+        }
+    }
+}
+
+impl PreparedObject {
+    /// The summary of a manifest this writer sealed as `self`, for the same
+    /// reachability cache that [`VerifiedManifest::summary`] fills on read.
+    pub fn manifest_summary(&self, manifest: &Manifest, generation: Generation) -> Result<VerifiedManifest> {
+        require_kind(self.id, ObjectKind::Manifest)?;
+        Ok(VerifiedManifest {
+            id: self.id,
+            manifest: Manifest { files: manifest.files.clone(), pins: manifest.pins.clone(), payload: Vec::new() },
+            generation,
+        })
     }
 }
 

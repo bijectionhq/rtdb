@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use rtdb_format::journal::{ObjectId, ObjectKind, Pin, Record};
+use rtdb_format::journal::{Checkpoint, ObjectId, ObjectKind, Pin, Record};
 use rtdb_types::{Anomaly, Result};
 use uuid::Uuid;
 
@@ -37,9 +37,28 @@ impl Reachability {
     }
 
     /// Resolve retained journal records from floor through a committed head after sealing.
+    /// A checkpoint at the floor is the replay base: its pins are the pins held before the floor.
     pub fn from_records<'a>(
         database: Uuid,
         epoch: u64,
+        retained: &[Record],
+        manifests: impl IntoIterator<Item = &'a VerifiedManifest>,
+    ) -> Result<Self> {
+        let base = match retained.first() {
+            Some(Record::Checkpoint(checkpoint)) => Some(checkpoint),
+            _ => None,
+        };
+        Self::from_retained(database, epoch, base, retained, manifests)
+    }
+
+    /// Resolve retained records over an explicit replay base. The base holds
+    /// the state before the floor, including its pins. A deferred base is
+    /// announced by a later retained record, or not yet retained by a reader
+    /// whose head precedes the announcement.
+    pub fn from_retained<'a>(
+        database: Uuid,
+        epoch: u64,
+        base: Option<&Checkpoint>,
         retained: &[Record],
         manifests: impl IntoIterator<Item = &'a VerifiedManifest>,
     ) -> Result<Self> {
@@ -48,25 +67,20 @@ impl Reachability {
             .map(|manifest| (manifest.id, manifest))
             .collect();
         let mut reachable = Self::from_roots(database, epoch, [])?;
+        if let Some(base) = base {
+            let image = reachable.include_checkpoint(&manifests, base)?;
+            for pin in &image.manifest.pins {
+                reachable.include_pin(&manifests, pin)?;
+            }
+        }
 
-        for (index, record) in retained.iter().enumerate() {
+        for record in retained {
             match record {
                 Record::Checkpoint(checkpoint) => {
-                    let image = reachable.include_manifest(&manifests, checkpoint.manifest)?;
-                    reachable.rewrite_files |= !image.manifest.files.is_empty();
-                    if image.generation.number != checkpoint.key_generation {
-                        return Err(Anomaly::fault(
-                            "rtdb.store/checkpoint-generation",
-                            "Checkpoint and manifest use different key generations",
-                        ));
-                    }
+                    let image = reachable.include_checkpoint(&manifests, checkpoint)?;
                     for pin in &image.manifest.pins {
-                        if index == 0 {
-                            reachable.include_pin(&manifests, pin)?;
-                        } else {
-                            let pinned = reachable.include_manifest(&manifests, pin.manifest)?;
-                            reachable.rewrite_files |= !pinned.manifest.files.is_empty();
-                        }
+                        let pinned = reachable.include_manifest(&manifests, pin.manifest)?;
+                        reachable.rewrite_files |= !pinned.manifest.files.is_empty();
                     }
                 }
                 Record::RankedCatalog(catalog) => {
@@ -147,6 +161,22 @@ impl Reachability {
         GcPlan {
             keys: keys.into_iter().collect(),
         }
+    }
+
+    fn include_checkpoint<'a>(
+        &mut self,
+        manifests: &BTreeMap<ObjectId, &'a VerifiedManifest>,
+        checkpoint: &Checkpoint,
+    ) -> Result<&'a VerifiedManifest> {
+        let image = self.include_manifest(manifests, checkpoint.manifest)?;
+        self.rewrite_files |= !image.manifest.files.is_empty();
+        if image.generation.number != checkpoint.key_generation {
+            return Err(Anomaly::fault(
+                "rtdb.store/checkpoint-generation",
+                "Checkpoint and manifest use different key generations",
+            ));
+        }
+        Ok(image)
     }
 
     fn include_manifest<'a>(
