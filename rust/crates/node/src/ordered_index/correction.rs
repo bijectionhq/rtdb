@@ -104,6 +104,7 @@ pub(super) fn decode(
     if groups.is_empty() {
         return Err(invalid());
     }
+    let max_entries = max_entries.min(groups.len() / GROUP_HEADER_BYTES);
     let rows = batch.batch().num_rows();
     let keys_bytes = batch.bytes_excluding(&bytes)?
         .saturating_add(ProjectedKeys::allocation_bytes());
