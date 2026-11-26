@@ -60,7 +60,7 @@ impl PreparedSql {
                 return Err(statement_syntax_error(source, error, &context.memory));
             }
         };
-        deep(source, || Self::prepare_parsed(parsed, context, options, policy, false, false, source_reservation))
+        deep(source, || Self::prepare_parsed(parsed, context, options, &[], policy, false, false, source_reservation))
     }
 
     pub fn prepare_postgres(source: &str, context: &Arc<QueryContext>, search_path: Vec<String>, parameter_oids: &[i32]) -> Result<Self> {
@@ -94,24 +94,31 @@ impl PreparedSql {
         if parsed.kind() == StatementKind::Dml {
             let mut options = PrepareOptions { search_path, ..Default::default() };
             let source_reservation = admit_source(source, context, &mut options)?;
-            return Self::prepare_parsed(parsed, context, options, ResultSignaturePolicy::PostgreSql, false, parameter_oids.is_empty(), source_reservation);
+            return Self::prepare_parsed(parsed, context, options, &[], ResultSignaturePolicy::PostgreSql, false, parameter_oids.is_empty(), source_reservation);
         }
         let count = parsed.parameter_count();
         let _parameters = context.memory.reserve(count.checked_mul(1024).and_then(|n| n.checked_add(1024)).ok_or_else(size_error)?)?;
         let mut options = PrepareOptions { search_path, ..Default::default() };
         let mut dynamic = false;
+        let mut untyped = Vec::new();
         for index in 0..count {
-            match PgType::from_oid(parameter_oids.get(index).copied().unwrap_or(0)).and_then(PgType::logical_type) {
-                Some(ty) => { options.parameter_types.insert(index, ty.maybe()); }
+            let oid = parameter_oids.get(index).copied().unwrap_or(0);
+            match PgType::from_oid(oid).and_then(PgType::logical_type) {
+                Some(ty) => {
+                    options.parameter_types.insert(index, ty.maybe());
+                    if oid == 0 { untyped.push(index); }
+                }
                 None => { dynamic = true; }
             }
         }
         let source_reservation = admit_source(source, context, &mut options)?;
-        Self::prepare_parsed(parsed, context, options, ResultSignaturePolicy::PostgreSql, dynamic, parameter_oids.is_empty(), source_reservation)
+        Self::prepare_parsed(parsed, context, options, &untyped, ResultSignaturePolicy::PostgreSql, dynamic, parameter_oids.is_empty(), source_reservation)
     }
 
+    /// `untyped` parameters are planned and described with their type in `options`, as PostgreSQL describes an
+    /// untyped parameter as text, but declare nothing: each execution binds them with its argument's type.
     fn prepare_parsed(
-        parsed: ParsedStatement<'_>, context: &Arc<QueryContext>, options: PrepareOptions, policy: ResultSignaturePolicy,
+        parsed: ParsedStatement<'_>, context: &Arc<QueryContext>, mut options: PrepareOptions, untyped: &[usize], policy: ResultSignaturePolicy,
         dynamic_pg: bool, dml_notices: bool, source_reservation: Arc<MemoryReservation>,
     ) -> Result<Self> {
         let source = parsed.source();
@@ -161,6 +168,7 @@ impl PreparedSql {
             }
             StatementKind::Session => return Err(session_statement(source, &options, &context.memory)),
         };
+        for index in untyped { options.parameter_types.remove(index); }
         let source = source.to_owned();
         let bytes = retained_bytes(&source, &options, &parameters, &notices, &result)?;
         let bytes = bytes.checked_add(snapshot_selector.retained_bytes()?).ok_or_else(size_error)?;
