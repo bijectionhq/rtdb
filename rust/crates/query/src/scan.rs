@@ -645,6 +645,9 @@ pub(crate) struct PartitionScan {
 
 use crate::analysis::ScanCounts;
 
+/// A scan selecting fewer IIDs than a leaf's rows over this locates only those IIDs' rows of the leaf rather than all of them.
+const LOCATED_IID_FRACTION: usize = 8;
+
 /// The IIDs an `_id` predicate selects, as the reference's scan narrows to them: `_id = v`, or an OR of such, with every
 /// `v` a literal or parameter of an ID type. `None` where some `v` can't be proven to name known IIDs — `_id = 7.0` still
 /// matches the integer ID 7 — so the scan reads every IID; the predicate itself is applied either way.
@@ -2121,6 +2124,14 @@ impl PartitionScan {
                 audience_work::scan_items(leaf.len())?;
                 let rows = if audience_work::is_bounded() {
                     segment.located_rows_in(leaf, &self.execution.context.memory)?
+                } else if let Some(iids) = self.scan.iids.as_ref()
+                    .filter(|iids| self.candidate_iids.is_none() && iids.len().saturating_mul(LOCATED_IID_FRACTION) < leaf.len())
+                {
+                    // The merge drops rows of other IIDs, so the page never needs them located; a page left with no rows
+                    // contributes nothing, and an empty summary would stop the file pages' pruning.
+                    let rows = segment.located_rows_of(leaf, iids, &self.execution.context.memory)?;
+                    if rows.located.is_empty() { return Ok(()); }
+                    rows
                 } else {
                     segment.located_rows(leaf)?
                 };

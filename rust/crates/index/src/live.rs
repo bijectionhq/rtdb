@@ -329,19 +329,59 @@ impl LiveTable {
     /// `leaf`'s rows located and their headers copied, once per snapshot; `leaf` is one of this table's trie leaves.
     pub fn located_rows(&self, leaf: &rtdb_trie::Leaf) -> Result<Arc<LocatedRows>> {
         let key = leaf as *const rtdb_trie::Leaf as usize;
-        if let Some(rows) = self.located.0.lock().map_err(|_| invalid("Located leaf cache is poisoned"))?.get(&key) { return Ok(Arc::clone(rows)); }
+        if let Some(rows) = self.cached_located_rows(leaf)? { return Ok(rows); }
         let rows = leaf.sorted_rows(self)?;
         let bytes = Self::located_row_bytes(rows.len())?;
-        let reservation = self.chunks.first().map(|(_, batch)| batch.owned.reservation().budget().reserve(bytes)).transpose()?;
+        let reservation = self.shared_located_budget().map(|budget| budget.reserve(bytes)).transpose()?;
         let rows = self.copy_located_rows(&rows, reservation)?;
         Ok(Arc::clone(self.located.0.lock().map_err(|_| invalid("Located leaf cache is poisoned"))?.entry(key).or_insert(rows)))
     }
+
+    fn cached_located_rows(&self, leaf: &rtdb_trie::Leaf) -> Result<Option<Arc<LocatedRows>>> {
+        let key = leaf as *const rtdb_trie::Leaf as usize;
+        Ok(self.located.0.lock().map_err(|_| invalid("Located leaf cache is poisoned"))?.get(&key).cloned())
+    }
+
+    /// The budget that funds rows this table locates for its snapshot's readers: its data's own.
+    fn shared_located_budget(&self) -> Option<&Arc<MemoryBudget>> { self.chunks.first().map(|(_, batch)| batch.owned.reservation().budget()) }
 
     /// Locates the leaf under the caller's prepaid memory with no shared cache dependency.
     pub fn located_rows_in(&self, leaf: &rtdb_trie::Leaf, memory: &Arc<MemoryBudget>) -> Result<Arc<LocatedRows>> {
         let reservation = memory.reserve(Self::located_row_bytes(leaf.len())?)?;
         let (rows, _sorted) = leaf.sorted_rows_in(self, memory)?;
         self.copy_located_rows(&rows, Some(reservation))
+    }
+
+    /// The rows of `leaf` whose IID is one of `iids`, in the leaf's order, located with their headers copied.
+    /// `leaf` is one of this table's trie leaves, and `memory` funds the copy; the leaf's other rows are neither sorted, located nor copied.
+    pub fn located_rows_of(&self, leaf: &rtdb_trie::Leaf, iids: &std::collections::BTreeSet<Iid>, memory: &Arc<MemoryBudget>) -> Result<Arc<LocatedRows>> {
+        self.locate_iid_rows(leaf, iids.iter().copied(), Some(memory))
+    }
+
+    /// `located_rows_of` for ascending, distinct `iids`, funded by `memory` where there is one.
+    fn locate_iid_rows(&self, leaf: &rtdb_trie::Leaf, iids: impl IntoIterator<Item = Iid>, memory: Option<&Arc<MemoryBudget>>) -> Result<Arc<LocatedRows>> {
+        // A leaf orders its rows by IID, then newest row first; its sorted part already is, so only its short log needs reading in full.
+        let data = leaf.data();
+        let mut pending = leaf.pending().iter().map(|&row| Ok((self.iid(row)?, row))).collect::<Result<Vec<_>>>()?;
+        pending.sort_unstable();
+        let mut rows = Vec::new();
+        for iid in iids {
+            let (mut low, mut high) = (0, data.len());
+            while low < high {
+                let middle = low + (high - low) / 2;
+                if self.iid(data[middle])? < iid { low = middle + 1; } else { high = middle; }
+            }
+            let first = rows.len();
+            for &row in &data[low..] {
+                if self.iid(row)? != iid { break; }
+                rows.push(row);
+            }
+            let logged = pending.partition_point(|(logged, _)| *logged < iid);
+            rows.extend(pending[logged..].iter().take_while(|(logged, _)| *logged == iid).map(|(_, row)| *row));
+            rows[first..].sort_unstable_by(|left, right| right.cmp(left));
+        }
+        let reservation = memory.map(|memory| memory.reserve(Self::located_row_bytes(rows.len())?)).transpose()?;
+        self.copy_located_rows(&rows, reservation)
     }
 
     fn located_row_bytes(count: usize) -> Result<usize> {
@@ -396,7 +436,11 @@ impl LiveTable {
         };
         let rows = leaf.map(|leaf| match prepaid {
             Some(memory) => self.located_rows_in(leaf, memory),
-            None => self.located_rows(leaf),
+            // A snapshot that hasn't located the leaf yet, usually one a write just made, locates only this IID's rows.
+            None => match self.cached_located_rows(leaf)? {
+                Some(rows) => Ok(rows),
+                None => self.locate_iid_rows(leaf, std::iter::once(iid), self.shared_located_budget()),
+            },
         }).transpose()?;
         let (first, end) = rows.as_ref().map_or((0, 0), |rows| {
             let first = rows.headers.partition_point(|header| header.iid < iid);
@@ -2052,6 +2096,59 @@ mod row_column_type_tests {
 mod chunk_tests {
     use super::*;
     use rtdb_types::EntityId;
+
+    #[test]
+    fn locating_some_iids_of_a_leaf_keeps_exactly_their_rows_in_leaf_order() {
+        let state = crate::PartitionState::empty(TrieConfig::new(4, 32).unwrap()).unwrap();
+        let table = TableRef::new("public", "docs");
+        for round in 0..4i64 {
+            let key = TransactionKey { tx_id: rtdb_types::TxId(round), system_time: Timestamp(10 + round) };
+            let mut transaction = TransactionBuffer::new(state.value().snapshot(), key, MemoryBudget::new(1 << 24)).unwrap();
+            for id in (0..120i64).filter(|id| (id + round) % 3 != 0) {
+                let from = Timestamp(100 * round + id % 7);
+                let document = StructFields::from([("_id".into(), Value::I64(id)), ("v".into(), Value::I64(round))]);
+                transaction.put(table.clone(), document, Interval::new(from, Timestamp::MAX).unwrap()).unwrap();
+            }
+            state.apply(&transaction.stage().unwrap()).unwrap();
+        }
+        let snapshot = state.value().snapshot();
+        let segment = snapshot.iter_segments(&table).next().unwrap();
+        let memory = MemoryBudget::new(1 << 24);
+        let (mut leaves, mut pending) = (0, 0);
+        segment.trie().try_visit_leaves(|leaf| -> Result<()> {
+            leaves += 1;
+            if leaf.sorted_rows(segment.as_ref())?.len() != leaf.len() { return Err(invalid("A leaf's sorted rows must cover it")); }
+            let all = segment.located_rows_in(leaf, &memory)?;
+            let iids: Vec<Iid> = all.headers.iter().map(|header| header.iid).collect();
+            let history = |iid: Iid| -> Result<Vec<((u32, u32), EventHeader)>> {
+                let (rows, range) = segment.iid_rows(iid, None)?;
+                let rows = rows.expect("a stored IID has a leaf");
+                Ok(range.map(|row| (rows.located[row], rows.headers[row])).collect())
+            };
+            let expected = |iid: Iid| -> Vec<((u32, u32), EventHeader)> {
+                all.located.iter().copied().zip(all.headers.iter().copied()).filter(|(_, header)| header.iid == iid).collect()
+            };
+            for &iid in &iids { assert_eq!(history(iid)?, expected(iid), "located afresh"); }
+            segment.located_rows(leaf)?;
+            for &iid in &iids { assert_eq!(history(iid)?, expected(iid), "located by the snapshot's cache"); }
+            if !leaf.pending().is_empty() && iids.windows(2).any(|pair| pair[0] == pair[1]) { pending += 1; }
+            let selections = [
+                std::collections::BTreeSet::new(),
+                iids.iter().copied().take(1).collect(),
+                iids.iter().copied().step_by(3).collect(),
+                iids.iter().copied().chain([Iid([0; 16]), Iid([0xff; 16])]).collect(),
+            ];
+            for selected in selections {
+                let some = segment.located_rows_of(leaf, &selected, &memory)?;
+                let expected: Vec<_> = all.located.iter().zip(&all.headers).filter(|(_, header)| selected.contains(&header.iid)).collect();
+                let got: Vec<_> = some.located.iter().zip(&some.headers).collect();
+                assert_eq!(got, expected);
+            }
+            Ok(())
+        }).unwrap();
+        assert!(leaves > 1 && pending > 0, "the table must span several leaves, some logging further versions of an entity: {leaves} leaves, {pending} logging");
+        assert_eq!(memory.used_bytes(), 0);
+    }
 
     #[test]
     fn direct_replay_distinguishes_original_effects_from_regenerated_writes() {
