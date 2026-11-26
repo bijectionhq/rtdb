@@ -518,6 +518,11 @@ impl MultiDatabase {
         self.committed.as_ref().map(|state| state.generation)
     }
 
+    /// The journal stream holding this database.
+    pub fn journal_stream(&self) -> journal_contract::StreamId {
+        journal_contract::StreamId(u128::from_be_bytes(*self.stream.database.as_bytes()))
+    }
+
     pub fn retained_floor(&self) -> Option<Lsn> {
         self.committed.as_ref().map(|state| state.floor)
     }
@@ -540,6 +545,25 @@ impl MultiDatabase {
             .uploaded
             .insert(file.id());
         Ok(file.id())
+    }
+
+    /// Checkpoints and trims when the writer retains at least `limit`
+    /// journal records. A journal that bounds its retained records, such as
+    /// a consensus stream, refuses appends once it reaches that bound.
+    /// Returns the new checkpoint, or `None` when no checkpoint is due or
+    /// this node is not the writer.
+    pub async fn checkpoint_retained_suffix(&mut self, limit: u64) -> Result<Option<ObjectId>> {
+        if self.writer.is_none() || self.authority().is_err() {
+            return Ok(None);
+        }
+        let Some(state) = self.committed.as_ref() else {
+            return Ok(None);
+        };
+        let retained = state.head.0.saturating_add(1).saturating_sub(state.floor.0);
+        if retained < limit || self.state().transactions.pending_erasure().is_some() {
+            return Ok(None);
+        }
+        self.checkpoint(Vec::new()).await.map(Some)
     }
 
     pub async fn checkpoint(&mut self, files: Vec<ObjectId>) -> Result<ObjectId> {

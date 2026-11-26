@@ -79,7 +79,25 @@ impl AsRef<[u8]> for ChargedBytes {
     }
 }
 
+/// The retained journal records that trigger a writer checkpoint. A
+/// consensus journal stream refuses appends at 65,536 retained records, so
+/// the writer checkpoints and trims at half that bound.
+pub const JOURNAL_CHECKPOINT_RECORDS: u64 = 32_768;
+
 impl MultiServing {
+    /// Checkpoints and trims once the writer's retained journal suffix
+    /// reaches [`JOURNAL_CHECKPOINT_RECORDS`].
+    /// The journal stream number of this database when this node is its
+    /// writer.
+    pub async fn written_stream(&self) -> Option<u128> {
+        let database = self.database.lock().await;
+        matches!(database.role(), rtdb_db::Role::Writer(_)).then(|| database.journal_stream().0)
+    }
+
+    pub async fn maintain_journal_bound(&self) -> Result<()> {
+        self.writes.bound_journal(JOURNAL_CHECKPOINT_RECORDS).await.map(|_| ())
+    }
+
     pub async fn maintain_ranked_catalog(&self, cancellation: &CancellationToken) -> Result<()> {
         {
             let mut schedule = self.ranked_schedule.lock().await;

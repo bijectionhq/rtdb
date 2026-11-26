@@ -2073,3 +2073,28 @@ async fn multi_driver_resumes_after_every_keeper_restarts() {
     follower.fresh_index().await.unwrap();
     assert_eq!(text_at(&mut follower, MAIN_BRANCH, 3).await, Some(Value::Utf8("after restart".into())));
 }
+
+#[tokio::test]
+async fn multi_driver_checkpoints_once_the_retained_journal_suffix_reaches_its_bound() {
+    let journal = journals().await;
+    let cluster = Cluster::new();
+    let mut writer = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
+    writer.create().await.unwrap();
+    assert_eq!(writer.tick(&live(1)).await.unwrap(), Role::Writer(Epoch(1)));
+    for id in 1..=4 {
+        writer.transact(&put(id as u8, id, "bounded")).await.unwrap();
+    }
+    let floor = writer.retained_floor().unwrap();
+    // Below the bound nothing is checkpointed.
+    assert_eq!(writer.checkpoint_retained_suffix(1_000).await.unwrap(), None);
+    assert_eq!(writer.retained_floor(), Some(floor));
+    // At the bound the writer checkpoints and trims its journal.
+    assert!(writer.checkpoint_retained_suffix(4).await.unwrap().is_some());
+    assert!(writer.retained_floor().unwrap() > floor);
+    // A follower never checkpoints.
+    let mut follower = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY)));
+    assert_eq!(follower.tick(&live(1)).await.unwrap(), Role::Follower);
+    assert_eq!(follower.checkpoint_retained_suffix(1).await.unwrap(), None);
+    cluster.at(50);
+    assert_eq!(text_at(&mut follower, MAIN_BRANCH, 4).await, Some(Value::Utf8("bounded".into())));
+}

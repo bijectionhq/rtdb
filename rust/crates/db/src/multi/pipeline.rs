@@ -58,6 +58,7 @@ enum Command {
         memory: Arc<rtdb_types::MemoryBudget>,
         reply: Reply<()>,
     },
+    BoundJournal { limit: u64, reply: Reply<Option<rtdb_format::journal::ObjectId>> },
     Export { pin: Uuid, basis: Basis, until: Option<Timestamp>, reply: Reply<Vec<u8>> },
     OpenExport { ticket: Vec<u8>, reply: Reply<PinnedExport> },
     ReleaseExport { ticket: Vec<u8>, reply: Reply<()> },
@@ -116,6 +117,12 @@ impl WritePipeline {
         memory: Arc<rtdb_types::MemoryBudget>,
     ) -> Result<()> {
         self.request(|reply| Command::PublishRanked { build, inventory, files, memory, reply }).await
+    }
+
+    /// Checkpoints between ordered writes once the retained journal suffix
+    /// reaches `limit` records.
+    pub async fn bound_journal(&self, limit: u64) -> Result<Option<rtdb_format::journal::ObjectId>> {
+        self.request(|reply| Command::BoundJournal { limit, reply }).await
     }
 
     pub fn start(database: Arc<Mutex<MultiDatabase>>) -> Self {
@@ -377,6 +384,10 @@ async fn run(database: Arc<Mutex<MultiDatabase>>, mut input: mpsc::Receiver<Comm
             }
             Command::PublishRanked { build, inventory, files, memory, reply } => {
                 let result = database.lock().await.publish_ranked_catalog(build, inventory, files, &memory).await;
+                let _ = reply.send(result);
+            }
+            Command::BoundJournal { limit, reply } => {
+                let result = database.lock().await.checkpoint_retained_suffix(limit).await;
                 let _ = reply.send(result);
             }
             Command::Export { pin, basis, until, reply } => {
