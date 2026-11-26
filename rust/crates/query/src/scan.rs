@@ -865,7 +865,7 @@ enum Part { Local(PartitionScan), Fragment(Fragment), Resolved(Option<crate::col
 
 /// A fragment dispatched to the node it belongs to, read here instead when that node is this one or does not answer.
 struct Fragment { request: Arc<ScanFragment>, fallback: PartitionScan, state: FragmentState }
-enum FragmentState { Pending, Dispatched(Dispatch), Remote(VecDeque<crate::columnar::ColumnBatch>), Local }
+enum FragmentState { Pending, Dispatched(Dispatch), Remote(VecDeque<crate::columnar::ColumnBatch>), Local, Failed }
 
 /// A dispatch in flight, abandoned with the scan.
 struct Dispatch(tokio::task::JoinHandle<Result<Option<crate::FragmentReply>>>);
@@ -880,20 +880,30 @@ impl Fragment {
         self.state = FragmentState::Dispatched(Dispatch(tokio::spawn(rtdb_columnar::arrow_flow::traced(work))));
     }
     async fn next_batch(&mut self, memory: &Arc<MemoryBudget>) -> Result<Option<crate::columnar::ColumnBatch>> {
-        if let FragmentState::Dispatched(dispatch) = &mut self.state {
-            let answer = (&mut dispatch.0).await;
-            self.state = match answer {
-                Ok(Ok(Some(reply))) => match reply.await.and_then(|bytes| crate::fragment::decode_batches(bytes.into_ipc_buffer(), memory)) {
-                    Ok(batches) => FragmentState::Remote(batches.into()),
-                    Err(_) => FragmentState::Local,
-                },
-                Ok(Ok(None) | Err(_)) | Err(_) => FragmentState::Local,
-            };
+        if matches!(self.state, FragmentState::Dispatched(_)) {
+            let FragmentState::Dispatched(mut dispatch) = std::mem::replace(&mut self.state, FragmentState::Failed) else { unreachable!() };
+            self.state = Self::answered(&mut dispatch, memory).await?;
         }
         match &mut self.state {
             FragmentState::Remote(batches) => Ok(batches.pop_front()),
             FragmentState::Pending | FragmentState::Local => self.fallback.next_batch().await,
             FragmentState::Dispatched(_) => Err(invalid("fragment-state", "A dispatched fragment was not awaited")),
+            FragmentState::Failed => Err(invalid("fragment-state", "A failed fragment has no further rows")),
+        }
+    }
+    /// Only a declined fragment or an unavailable reader leaves the fragment to this node; every other failure fails the scan.
+    async fn answered(dispatch: &mut Dispatch, memory: &Arc<MemoryBudget>) -> Result<FragmentState> {
+        let answer = (&mut dispatch.0).await
+            .map_err(|error| Anomaly::fault("rtdb.query/fragment-dispatch", format!("A fragment dispatch did not complete: {error}")))?;
+        let bytes = match answer {
+            Ok(Some(reply)) => reply.await,
+            Ok(None) => return Ok(FragmentState::Local),
+            Err(error) => Err(error),
+        };
+        match bytes {
+            Ok(bytes) => Ok(FragmentState::Remote(crate::fragment::decode_batches(bytes.into_ipc_buffer(), memory)?.into())),
+            Err(error) if error.category == rtdb_types::AnomalyCategory::Unavailable => Ok(FragmentState::Local),
+            Err(error) => Err(error),
         }
     }
 }

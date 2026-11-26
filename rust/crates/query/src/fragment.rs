@@ -201,7 +201,7 @@ pub trait ScanFragmenter: Send + Sync {
     /// The depth a scan of `table` splits at, given the bytes of persisted tries the whole database holds; `None` scans it whole.
     fn depth(&self, database: &str, table: &TableRef, persisted_bytes: u64) -> Option<FragmentDepth>;
     /// The fragment's rows as encoded by `encode_fragment` on the node it belongs to, or `None` when that node is this one.
-    /// An error, like `None`, has the coordinator scan the fragment itself.
+    /// An `Unavailable` error, from a reader that did not answer or refused, has the coordinator scan the fragment itself like `None`; any other error fails the scan.
     async fn dispatch(&self, fragment: &ScanFragment) -> Result<Option<Vec<u8>>>;
 
     async fn dispatch_reply(&self, fragment: &ScanFragment, memory: &Arc<MemoryBudget>) -> Result<Option<FragmentReply>> {

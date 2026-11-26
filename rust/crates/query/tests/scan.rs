@@ -72,6 +72,51 @@ async fn delegated_scan_refuses_a_later_erase_horizon_and_falls_back() {
 }
 
 #[tokio::test]
+async fn a_fragment_reads_locally_only_when_declined_or_unavailable() {
+    use rtdb_query::{FragmentDepth, ScanFragment, ScanFragmenter};
+    use rtdb_types::{Anomaly, AnomalyCategory};
+
+    enum Answer { Declined, Unavailable, Faulted, Corrupt }
+    struct Peer(Answer);
+
+    #[async_trait::async_trait]
+    impl ScanFragmenter for Peer {
+        fn depth(&self, _: &str, _: &TableRef, _: u64) -> Option<FragmentDepth> { FragmentDepth::new(1).ok() }
+
+        async fn dispatch(&self, _: &ScanFragment) -> Result<Option<Vec<u8>>> {
+            match self.0 {
+                Answer::Declined => Ok(None),
+                Answer::Unavailable => Err(Anomaly::new(AnomalyCategory::Unavailable, "test/peer-down", "The fragment's reader is down")),
+                Answer::Faulted => Err(Anomaly::fault("test/peer-fault", "The fragment's reader failed")),
+                Answer::Corrupt => Ok(Some(vec![0, 0, 0, 0, 0, 0, 0, 4, 0xff, 0xff, 0xff, 0xff])),
+            }
+        }
+    }
+
+    let state = PartitionState::empty(TrieConfig::default()).unwrap();
+    let memory = MemoryBudget::new(1 << 27);
+    let store = Arc::new(MemoryStore::default());
+    let mut put = tx(&state, &memory, 0, 10);
+    put.put(table(), document(1, Value::Utf8("persisted".into())), Interval::ALL).unwrap();
+    state.apply(&put.stage().unwrap()).unwrap();
+    persist(&state, &store).await;
+    let snapshot = state.snapshot();
+    let run = async |answer| {
+        let database = DatabaseSnapshot { partitions: vec![snapshot.clone()], storage: Arc::new(BufferPool::new(Arc::clone(&store) as Arc<dyn rtdb_storage::ObjectStore>, 1 << 26)) };
+        let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap()
+            .with_fragmenter(Some(Arc::new(Peer(answer))), None);
+        let context = QueryContext::new(catalog, Arc::clone(&memory), Timestamp(50), "UTC", QueryOptions::default(), &CancellationToken::new()).unwrap();
+        let relation = scan(&context, &["v"], TemporalFilter::All, at(10), None);
+        collect(relation, context).await
+    };
+    let local = vec![vec![Value::Utf8("persisted".into())]];
+    assert_eq!(run(Answer::Declined).await.unwrap(), local);
+    assert_eq!(run(Answer::Unavailable).await.unwrap(), local);
+    assert_eq!(run(Answer::Faulted).await.unwrap_err().code, "test/peer-fault");
+    assert!(run(Answer::Corrupt).await.is_err(), "a corrupt reply must not be replaced by a local read");
+}
+
+#[tokio::test]
 async fn a_cold_fragment_sends_selected_fixed_lists_as_arrow() {
     use arrow_array::{Array, cast::AsArray};
     use arrow_schema::DataType;
