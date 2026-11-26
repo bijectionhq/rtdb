@@ -12,27 +12,24 @@
    `income_statement` (duration flows), `balance_sheet` (instant balances), plus
    a static `issuer` reference.
 
-   System-time replay (see `filing-batches`): a filing (accession) is atomic —
-   all its rows commit in one transaction, never split. Filings are sorted and
+   Filing replay (see `filing-batches`): a filing (accession) is atomic — all
+   its rows commit in one transaction, never split. Filings are sorted and
    partitioned by `filed`, so whole filings sharing a date coalesce into one
-   transaction stamped with that date as system-time, submitted in ascending
-   order. System-time is monotonic non-decreasing in XTDB, so forward replay
-   reproduces the calendar-accurate vintage history a node would have built had
-   it consumed each filing as it landed — prior, since-restated values included,
-   recoverable via FOR SYSTEM_TIME AS OF. Quarters are replayed oldest-first so
-   system-time stays non-decreasing across the boundary.
+   transaction, submitted in ascending order. XTDB assigns system-time itself, so
+   the historical dates live on the valid-time axis.
 
-   valid-time differs by statement: duration figures are fixed for their period
-   (valid-from = filed, corrections live on the system axis); instant balances
-   are as-of a date (valid-from = period end, a real valid-time timeline)."
+   valid-time is when a figure became known, and differs by statement: a
+   duration figure becomes known when it is filed (valid-from = filed), so a
+   restatement supersedes the prior figure from its own filing date and the
+   vintage trail is recoverable via FOR VALID_TIME AS OF; an instant balance is
+   true as of its date (valid-from = period end)."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.tools.logging :as log]
             [xtdb.api :as xt]
             [xtdb.datasets.edgar.parse :as parse]
             [xtdb.serde :as serde])
-  (:import [java.time LocalDate ZoneOffset]
-           [java.util.zip GZIPInputStream]))
+  (:import [java.util.zip GZIPInputStream]))
 
 (defn read-records
   "Curated observation maps from a mirrored transit.json.gz — plain transit + the
@@ -69,24 +66,21 @@
               [(:filed (ffirst filing-groups)) (apply concat filing-groups)]))))
 
 (defn- submit-filing-batch!
-  "Submit one date-batch as a transaction at that date's system-time. One put-docs
-   per table (a put-docs targets a single table); rows carry their own
-   :xt/valid-from."
-  [node ^LocalDate filed docs]
-  (let [opts {:system-time (.toInstant (.atStartOfDay filed ZoneOffset/UTC))}
-        tx-ops (->> (group-by #(:table (meta %)) docs)
+  "Submit one date-batch as a transaction. One put-docs per table (a put-docs
+   targets a single table); rows carry their own :xt/valid-from."
+  [node docs]
+  (let [tx-ops (->> (group-by #(:table (meta %)) docs)
                     (map (fn [[table table-docs]]
                            (into [:put-docs {:into table}] (map doc->row table-docs)))))]
-    (xt/submit-tx node (vec tx-ops) opts)))
+    (xt/submit-tx node (vec tx-ops))))
 
 (defn submit-docs!
   "Submit a seq of statement/issuer docs as a bitemporal basis: one transaction
-   per filing date (see `filing-batches`), stamped at that date's system-time, in
-   ascending order — so each filing's view is recorded as of when it was filed
-   and a later restatement supersedes it in system-time without overwriting the
-   prior basis. Returns the last tx-key."
+   per filing date (see `filing-batches`), in ascending order — a later
+   restatement supersedes the prior figure in valid-time from its filing date,
+   leaving the prior figure valid before it. Returns the last tx-key."
   [node docs]
-  (reduce (fn [_ [filed batch-docs]] (submit-filing-batch! node filed batch-docs))
+  (reduce (fn [_ [_filed batch-docs]] (submit-filing-batch! node batch-docs))
           nil
           (filing-batches docs)))
 
@@ -119,7 +113,7 @@
 (defn submit-edgar!
   "Replays the mirrored EDGAR dataset into `node`, one quarter at a time so only a
    single quarter is held in memory. Quarters replay oldest-first (the `dataset`
-   order) so system-time stays non-decreasing across the boundary."
+   order)."
   [node {:keys [quarters]}]
   (log/info "Loading" (count quarters) "EDGAR quarter(s)...")
   (reduce (fn [_ file]
@@ -133,29 +127,29 @@
 ;;; Demo queries — run via (xt/q node [<query> & params]).
 
 #_{:clj-kondo/ignore [:clojure-lsp/unused-public-var]}
-(def q-income-as-of-system-time
-  "An income-statement figure as XTDB knew it at a given system-time — FOR SYSTEM_TIME
-   AS OF returns the belief current at T, and a restatement supersedes the prior in
-   system-time. Run before vs after a restatement's filing date to see the value
-   change; the earlier instant still yields the original, since prior system-time is
-   immutable. A period_end can carry both a quarterly and a year-to-date duration
+(def q-income-as-of-valid-time
+  "An income-statement figure as it had been reported at a given instant — a
+   figure's valid-from is its filing date, so FOR VALID_TIME AS OF returns the
+   figure in force at T, and a restatement supersedes the prior from its own
+   filing date. Run before vs after a restatement's filing date to see the value
+   change. A period_end can carry both a quarterly and a year-to-date duration
    (distinct statements), so period_start is selected to tell them apart."
-  ;; params: [system-time-instant, cik, period-end-date]
+  ;; params: [valid-time-instant, cik, period-end-date]
   "SELECT s.period_start, s.net_income_loss, s.form, s.filed
-   FROM income_statement FOR SYSTEM_TIME AS OF ? AS s
+   FROM income_statement FOR VALID_TIME AS OF ? AS s
    WHERE s.cik = ? AND s.period_end = ?
    ORDER BY s.period_start")
 
 #_{:clj-kondo/ignore [:clojure-lsp/unused-public-var]}
 (def q-income-restatement-history
   "Every vintage of an income statement for a period_end, oldest filing first — the
-   restatement trail. FOR ALL SYSTEM_TIME yields each belief we held; where a value
+   restatement trail. FOR ALL VALID_TIME yields each reported figure; where a value
    changes between consecutive `filed` dates, a restatement occurred. A period_end can
    carry both a quarterly and a year-to-date duration (distinct statements), so
    period_start is selected and ordered on to keep each duration's trail together."
   ;; params: [cik, period-end-date]
   "SELECT s.period_start, s.net_income_loss, s.form, s.filed, s.accession
-   FROM income_statement FOR ALL SYSTEM_TIME AS s
+   FROM income_statement FOR ALL VALID_TIME AS s
    WHERE s.cik = ? AND s.period_end = ?
    ORDER BY s.period_start, s.filed")
 
@@ -244,7 +238,7 @@ $$"]))
   ;;    restatement (net income that actually changed across vintages) first:
   ;;      (jdbc/execute! pg-conn
   ;;        ["SELECT cik, period_start, period_end
-  ;;          FROM income_statement FOR ALL SYSTEM_TIME
+  ;;          FROM income_statement FOR ALL VALID_TIME
   ;;          GROUP BY cik, period_start, period_end
   ;;          HAVING COUNT(DISTINCT net_income_loss) > 1 LIMIT 5"]).
   (with-open [conn (.build (-> (.createConnectionBuilder node) (.database "edgar")))]

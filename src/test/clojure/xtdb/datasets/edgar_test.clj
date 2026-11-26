@@ -45,14 +45,15 @@
           (tu/flush-block! node)
           (f))))))
 
-(defn- net-income-as-of-system-time [t]
-  (-> (xt/q *node* [edgar/q-income-as-of-system-time t aapl-cik q1-end])
+(defn- net-income-as-of-valid-time [t]
+  (-> (xt/q *node* [edgar/q-income-as-of-valid-time t aapl-cik q1-end])
       first :net-income-loss))
 
 (t/deftest test-income-loads-via-transit
-  ;; the income figure is readable at a system-time after its filing date.
+  ;; the income figure is valid from its filing date, and not before it.
   (t/is (= 33916000000M
-           (net-income-as-of-system-time (Instant/parse "2024-03-01T00:00:00Z")))))
+           (net-income-as-of-valid-time (Instant/parse "2024-03-01T00:00:00Z"))))
+  (t/is (nil? (net-income-as-of-valid-time (Instant/parse "2024-02-01T00:00:00Z")))))
 
 (t/deftest test-income-restatement-history
   ;; a single filing → one vintage on the restatement trail.

@@ -541,13 +541,13 @@
              {:t :do
               :stage :ingest
               :tasks [(letfn [(submit-txs [node txs]
-                                (doseq [{:keys [ops system-time]} txs]
+                                (doseq [{:keys [ops timestamp]} txs]
                                   (when (Thread/interrupted) (throw (InterruptedException.)))
 
-                                  (when (= LocalTime/MIDNIGHT (.toLocalTime (time/->zdt system-time)))
-                                    (log/debug "submitting" system-time))
+                                  (when (= LocalTime/MIDNIGHT (.toLocalTime (time/->zdt timestamp)))
+                                    (log/debug "submitting" timestamp))
 
-                                  (xt/submit-tx node ops {:system-time system-time})))]
+                                  (xt/submit-tx node ops)))]
 
                         (if txs-file
                           {:t :call

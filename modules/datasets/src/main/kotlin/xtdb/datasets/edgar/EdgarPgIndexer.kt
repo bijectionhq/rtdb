@@ -22,15 +22,15 @@ import com.google.protobuf.Any as ProtoAny
  * The Postgres tables are current-state — keyed by their natural ids, with no `_id` and no
  * `_valid_from`, and a latest-`filed`-wins UPSERT. This indexer derives both from each row's own
  * columns, so the XTDB side accrues the bitemporal history the source-of-record never held: every
- * filing that streams through Postgres lands as its own system-time version, and a restatement
- * supersedes the prior belief rather than overwriting it.
+ * filing that streams through Postgres lands as its own version, and a restatement supersedes the
+ * prior figure from its filing date rather than overwriting it.
  *
  *  - `_id` matches the native [xtdb.datasets.edgar] loader exactly (so a native bulk load and a CDC
  *    stream produce identical identities): `cik` (issuer);
  *    `cik__income_statement__{start}__{end}` (income_statement);
  *    `cik__balance_sheet__{end}` (balance_sheet).
- *  - `_valid_from`: `filed` for issuer/income_statement (the figure is fixed for its period, so a
- *    correction lives on the system axis); `period_end` for balance_sheet (an instant balance is
+ *  - `_valid_from`: `filed` for issuer/income_statement (a figure becomes known when it is filed, so a
+ *    correction supersedes it from the correction's own filing date); `period_end` for balance_sheet (an instant balance is
  *    as-of that date — a real valid-time timeline).
  *
  * Dates are derived from the row's `date` columns via [LocalDate], whose canonical ISO-8601

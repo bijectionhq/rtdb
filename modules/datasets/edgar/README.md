@@ -2,7 +2,7 @@
 
 This demo loads a curated slice of SEC EDGAR company fundamentals into plain Postgres — a current-state system-of-record — then has XTDB *follow Postgres over CDC*, deriving a bitemporal history the source never held.
 EDGAR is the vehicle because its bitemporality is real, not synthesised.
-Companies restate: they re-file corrected figures for a period they already reported, so the system-time axis carries a genuine "what we believed, and when".
+Companies restate: they re-file corrected figures for a period they already reported, and each figure's valid-from is its filing date, so the valid-time axis carries a genuine "what had been reported, and when".
 And instant balances, which a later as-of supersedes, give the valid-time axis a real timeline.
 
 The federation *is* the XTDB-population story.
@@ -47,7 +47,7 @@ The REPL snippets live in a `(comment …)` block at the bottom of the relevant 
 
 After the load, `SELECT count(*) FROM income_statement;` confirms the dataset and loader landed.
 Once the `edgar` database is attached, `q-income-restatement-history` (defined in `xtdb.datasets.edgar`) walks every vintage of a statement for one period — where a value changes between consecutive `filed` dates, a restatement occurred.
-`q-income-as-of-system-time` and `q-balance-as-of-valid-time` show truth-as-of-then versus corrected-truth-now — the point the federation makes.
+`q-income-as-of-valid-time` and `q-balance-as-of-valid-time` show truth-as-of-then versus corrected-truth-now — the point the federation makes.
 
 ## Replica identity — the EDGAR-specific gotcha
 
@@ -103,10 +103,10 @@ You should see ingestion, query and storage metrics within a few seconds of the 
 
 **Data.**
 XTDB is also provisioned as a `postgres` data source (`grafana/datasource.yml`), for querying the EDGAR tables directly.
-Add a visualization on a new dashboard, pick the **XTDB** data source, and write SQL — e.g. the restatement trail of an income-statement figure along system-time:
+Add a visualization on a new dashboard, pick the **XTDB** data source, and write SQL — e.g. the restatement trail of an income-statement figure along valid-time:
 ```sql
 SELECT net_income_loss, form, filed, accession
-FROM income_statement FOR ALL SYSTEM_TIME
+FROM income_statement FOR ALL VALID_TIME
 WHERE cik = '<cik>' AND period_end = '<period-end>'
 ORDER BY filed
 ```
