@@ -415,32 +415,28 @@ pub fn ordered(value: i64) -> u64 {
 
 /// Whether the union of `intervals` covers every instant in `[from, to)`.
 ///
-/// Advances a watermark `covered` from `from` toward `to`: every pass that
-/// does not reach `to` moves it strictly up to some interval's end, so at
-/// most `intervals.len()` passes decide. Every instant in `[from, covered)`
-/// is covered, and when no interval extends `covered` before `to`, `covered`
-/// itself is an uncovered witness.
+/// Advances a watermark `covered` from `from` toward `to`: every instant in
+/// `[from, covered)` is covered, each pass that does not stop raises
+/// `covered` strictly (so `to - covered` bounds the passes), and when no
+/// interval extends `covered`, `covered` itself is an uncovered witness.
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
     requires from < to,
     ensures out == interval_covered(intervals@, from, to),
 ))]
 pub fn covers_interval(intervals: &[(i64, i64)], from: i64, to: i64) -> bool {
     let mut covered = from;
-    let mut pass = 0usize;
     #[cfg_attr(verus_keep_ghost, verus_spec(invariant
         from <= covered,
-        pass <= intervals@.len() + 1,
         forall|t: i64| in_interval(t, from, covered) ==> point_covered(intervals@, t),
-        decreases intervals@.len() + 1 - pass,
+        decreases (to as int) - (covered as int),
     ))]
-    while pass <= intervals.len() {
-        if covered >= to {
-            return true;
-        }
+    while covered < to {
         let mut next = covered;
         let mut i = 0usize;
         #[cfg_attr(verus_keep_ghost, verus_spec(invariant
             i <= intervals@.len(),
+            from <= covered,
+            covered < to,
             covered <= next,
             forall|t: i64| in_interval(t, from, next) ==> point_covered(intervals@, t),
             forall|k: int| 0 <= k < i && (#[trigger] intervals@[k]).0 <= covered ==> intervals@[k].1 <= next,
@@ -478,11 +474,8 @@ pub fn covers_interval(intervals: &[(i64, i64)], from: i64, to: i64) -> bool {
             return false;
         }
         covered = next;
-        pass += 1;
     }
-    // Each pass raised `covered` to a distinct interval end, so after
-    // `intervals.len() + 1` passes it has passed every end: it reached `to`.
-    covered >= to
+    true
 }
 
 /// Partition prefix length of `key`: a big-endian `u16` length `n` followed by
@@ -654,7 +647,14 @@ pub fn edged_key(identity: &[u8], edge: i64, stamp: &[u8], ordinal: u64) -> Vec<
         edged.push(bytes[e]);
         e += 1;
     }
-    stamped_key(&edged, stamp, ordinal)
+    let out = stamped_key(&edged, stamp, ordinal);
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        assert forall|j: int| 0 <= j < identity@.len() implies #[trigger] out@[j] == identity@[j] by {
+            assert(out@[j] == edged@[j]);
+        };
+    };
+    out
 }
 
 /// Resolve a `DeriveInterval` against the commit's `stamp_micros`. Total: a
