@@ -57,9 +57,10 @@ pub trait OrderedIndexInventory: Send + Sync {
 #[derive(Clone)]
 pub struct CatalogSnapshot {
     pub(crate) default_database: String,
-    pub(crate) databases: Arc<BTreeMap<String, DatabaseSnapshot>>,
+    databases: Arc<BTreeMap<String, DatabaseSnapshot>>,
     transaction_scoped: bool,
     archive_history: bool,
+    /// Derived from `databases` and `owned_relation`; reset by every change to either.
     relation_names: Arc<Mutex<Option<Arc<RelationNames>>>>,
     owned_relation: Option<(QualifiedTable, OwnedSelection)>,
     pub(crate) owned_position_mask: Option<(Timestamp, u32)>,
@@ -139,6 +140,12 @@ impl CatalogSnapshot {
             (Some(lease), Some(cutoff)) => Some(lease.earlier(Arc::new(rtdb_storage::ReadLease::until(cutoff)))),
             (None, Some(cutoff)) => Some(Arc::new(rtdb_storage::ReadLease::until(cutoff))),
         }
+    }
+    pub(crate) fn database_snapshots(&self) -> &Arc<BTreeMap<String, DatabaseSnapshot>> { &self.databases }
+    /// Clones keep sharing the relation-name memo of the snapshots they were cloned with; this one leaves it.
+    pub(crate) fn databases_mut(&mut self) -> &mut BTreeMap<String, DatabaseSnapshot> {
+        self.relation_names = Default::default();
+        Arc::make_mut(&mut self.databases)
     }
     pub(crate) fn reset_sql_snapshot_view(
         &mut self, suffix: Option<Arc<dyn Send + Sync>>, owner: Option<Arc<BufferPool>>,

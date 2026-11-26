@@ -35,7 +35,8 @@ impl SqlSnapshotView {
         protected_storage: Option<Arc<rtdb_storage::cache::BufferPool>>,
     ) -> Result<Self> {
         let mut catalog = current.catalog.clone();
-        let database = Arc::make_mut(&mut catalog.databases).get_mut(&catalog.default_database)
+        let default_database = catalog.default_database.clone();
+        let database = catalog.databases_mut().get_mut(&default_database)
             .filter(|database| database.partitions.len() == 1)
             .ok_or_else(|| invalid("snapshot-scope", "An exact partition must replace one admitted partition"))?;
         database.partitions[0] = snapshot;
@@ -64,7 +65,7 @@ fn basis_bound(basis: &TimeBasis) -> Result<usize> {
 
 fn catalog_bound(catalog: &CatalogSnapshot) -> Result<usize> {
     let mut bytes = 4096usize.checked_add(catalog.default_database.len()).ok_or_else(size_error)?;
-    for (name, database) in catalog.databases.iter() {
+    for (name, database) in catalog.database_snapshots().iter() {
         bytes = bytes.checked_add(name.len().checked_mul(8).ok_or_else(size_error)?).and_then(|bytes| database.partitions.len().checked_mul(512).and_then(|size| bytes.checked_add(size))).ok_or_else(size_error)?;
         for partition in &database.partitions { bytes = bytes.checked_add(partition.clone_allocation_bound()?.checked_mul(4).ok_or_else(size_error)?).ok_or_else(size_error)?; }
     }
@@ -152,7 +153,7 @@ impl QueryContext {
         let times = TimeBasis { databases: BTreeMap::from([(database.clone(), vec![cut.map(Into::into)])]) };
         self = self.with_read_options(&times, Some(system_time), current_time)?;
         let context = Arc::make_mut(&mut self);
-        let database = Arc::make_mut(&mut context.catalog.databases).get_mut(&database)
+        let database = context.catalog.databases_mut().get_mut(&database)
             .ok_or_else(|| invalid("wire-cut", "The read requires its captured database"))?;
         let [snapshot] = database.partitions.as_mut_slice() else {
             return Err(invalid("wire-cut", "The read requires one partition"));
@@ -167,7 +168,8 @@ impl QueryContext {
     ) -> Result<Arc<Self>> {
         let context = Arc::make_mut(&mut self);
         let catalog = &mut context.catalog;
-        let database = Arc::make_mut(&mut catalog.databases).get_mut(&catalog.default_database)
+        let default_database = catalog.default_database.clone();
+        let database = catalog.databases_mut().get_mut(&default_database)
             .ok_or_else(|| invalid("wire-cut", "The read requires its captured database"))?;
         let physical = snapshot.catalog_cut().is_some();
         database.partitions = vec![snapshot];
@@ -205,7 +207,8 @@ impl QueryContext {
         let charge = self.memory.reserve(basis_bound(&times)?.checked_add(catalog_bound(&self.catalog)?)
             .ok_or_else(size_error)?)?;
         let mut context = (*self).clone();
-        let database = Arc::make_mut(&mut context.catalog.databases).get_mut(&context.catalog.default_database)
+        let default_database = context.catalog.default_database.clone();
+        let database = context.catalog.databases_mut().get_mut(&default_database)
             .ok_or_else(|| invalid("owned-system-cut", "An owned historical read requires its captured database"))?;
         database.partitions[0] = snapshot.clone().with_system_time_cap(Some(system_time))?;
         context.current_time = system_time.into();
@@ -308,14 +311,14 @@ impl QueryContext {
             Ok(cap.or(snapshot_time).zip(partition.tx_basis()).map(|(cap, head)| cap.min(head.system_time)))
         };
         let mut recapped = false;
-        'databases: for (name, database) in self.catalog.databases.iter() {
+        'databases: for (name, database) in self.catalog.database_snapshots().iter() {
             for (index, partition) in database.partitions.iter().enumerate() {
                 if visible(name, index, partition)? != partition.system_time_cap() { recapped = true; break 'databases; }
             }
         }
         let catalog = if recapped {
             let mut catalog = self.catalog.clone();
-            for (name, database) in Arc::make_mut(&mut catalog.databases) {
+            for (name, database) in catalog.databases_mut() {
                 for (index, partition) in database.partitions.iter_mut().enumerate() {
                     let visible = visible(name, index, partition)?;
                     *partition = partition.clone().with_system_time_cap(visible)?;
@@ -342,7 +345,7 @@ fn setting_value<'a>(expression: &'a SettingValue, parameters: rtdb_expr::Parame
 }
 
 fn captured_caps(catalog: &CatalogSnapshot) -> Option<TimeBasis> {
-    let databases: BTreeMap<_, _> = catalog.databases.iter().filter_map(|(name, database)| {
+    let databases: BTreeMap<_, _> = catalog.database_snapshots().iter().filter_map(|(name, database)| {
         let times: Vec<_> = database.partitions.iter().map(|snapshot| snapshot.system_time_cap().map(Into::into)).collect();
         times.iter().any(Option::is_some).then(|| (name.clone(), times))
     }).collect();
@@ -350,7 +353,7 @@ fn captured_caps(catalog: &CatalogSnapshot) -> Option<TimeBasis> {
 }
 
 fn validate_basis(basis: Option<&TimeBasis>, catalog: &CatalogSnapshot) -> Result<()> {
-    for (name, database) in catalog.databases.iter() {
+    for (name, database) in catalog.database_snapshots().iter() {
         for (index, snapshot) in database.partitions.iter().enumerate() {
             if let Some(requested) = basis.and_then(|basis| basis.databases.get(name)).and_then(|times| times.get(index)).copied().flatten() {
                 if !head_covers(snapshot.tx_basis(), requested) {
@@ -406,14 +409,41 @@ mod tests {
         let database = crate::DatabaseSnapshot { partitions: vec![state.value().snapshot()], storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)) };
         let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
         let context = QueryContext::new(catalog, memory, Timestamp(100), "UTC", crate::QueryOptions::default(), &tokio_util::sync::CancellationToken::new()).unwrap();
-        let cap = |context: &QueryContext| context.catalog.databases["xtdb"].partitions[0].system_time_cap();
+        let cap = |context: &QueryContext| context.catalog.database_snapshots()["xtdb"].partitions[0].system_time_cap();
         let kept = Arc::clone(&context).apply_settings(&QuerySettings::default(), rtdb_expr::Parameters::Values(&[])).unwrap();
-        assert!(Arc::ptr_eq(&kept.catalog.databases, &context.catalog.databases));
+        assert!(Arc::ptr_eq(kept.catalog.database_snapshots(), context.catalog.database_snapshots()));
         assert_eq!((cap(&kept), cap(&context)), (Some(Timestamp(2)), Some(Timestamp(2))));
         let times = TimeBasis { databases: BTreeMap::from([("xtdb".to_owned(), vec![Some(Timestamp(1).into())])]) };
         let earlier = Arc::clone(&context).with_read_options(&times, None, Timestamp(100)).unwrap();
         let capped = Arc::clone(&earlier).apply_settings(&QuerySettings::default(), rtdb_expr::Parameters::Values(&[])).unwrap();
-        assert!(!Arc::ptr_eq(&capped.catalog.databases, &earlier.catalog.databases));
+        assert!(!Arc::ptr_eq(capped.catalog.database_snapshots(), earlier.catalog.database_snapshots()));
         assert_eq!((cap(&capped), cap(&earlier)), (Some(Timestamp(1)), Some(Timestamp(2))));
+    }
+
+    #[test]
+    fn relation_lookups_after_an_exact_partition_swap_answer_from_the_new_snapshot() {
+        use rtdb_expr::PgCatalogLookup;
+        let memory = MemoryBudget::new(1 << 26);
+        let partition = |table: &str| {
+            let state = PartitionState::empty(Default::default()).unwrap();
+            let key = TransactionKey { tx_id: TxId(1), system_time: Timestamp(1) };
+            let mut buffer = TransactionBuffer::new(state.value().snapshot(), key, Arc::clone(&memory)).unwrap();
+            buffer.put(TableRef::new("public", table), StructFields::from([("_id".into(), Value::I64(1))]), Interval::from_micros(0, i64::MAX).unwrap()).unwrap();
+            state.apply(&buffer.stage().unwrap()).unwrap();
+            state.value().snapshot()
+        };
+        let database = crate::DatabaseSnapshot { partitions: vec![partition("before")], storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)) };
+        let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
+        let context = QueryContext::new(catalog, Arc::clone(&memory), Timestamp(100), "UTC", crate::QueryOptions::default(), &tokio_util::sync::CancellationToken::new()).unwrap();
+        let scope = rtdb_expr::EvaluationScope::new(&memory).unwrap();
+        let before = context.catalog.relation_oid(Some("public"), "before", &scope).unwrap();
+        assert!(before.is_some());
+
+        let view = SqlSnapshotView::from_exact_partition(&context, partition("after"), Timestamp(100).into(), None, None).unwrap();
+        assert_eq!(view.catalog.relation_oid(Some("public"), "before", &scope).unwrap(), None);
+        let after = view.catalog.relation_oid(Some("public"), "after", &scope).unwrap().unwrap();
+        assert_eq!(view.catalog.relation_name(after, &scope).unwrap().as_deref(), Some("after"));
+        assert_eq!(context.catalog.relation_oid(Some("public"), "before", &scope).unwrap(), before);
+        assert_eq!(context.catalog.relation_oid(Some("public"), "after", &scope).unwrap(), None);
     }
 }
