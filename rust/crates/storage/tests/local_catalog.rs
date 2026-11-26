@@ -110,3 +110,38 @@ async fn malformed_repair_anchor_prevents_collection_after_reopen() -> rtdb_type
     assert_eq!(reopened.get(&file).await?, Bytes::from_static(b"replica bytes"));
     Ok(())
 }
+
+fn reader_tickets(root: &std::path::Path) -> usize {
+    std::fs::read_dir(root.join(".tmp/catalog-ledger")).map_or(0, |entries| {
+        entries.filter(|entry| entry.as_ref().is_ok_and(|entry| entry.file_name().to_string_lossy().starts_with("reader-"))).count()
+    })
+}
+
+#[tokio::test]
+async fn reads_of_one_catalog_share_a_storage_hold_that_lapses_after_its_readers() -> rtdb_types::Result<()> {
+    let location = tempfile::tempdir().unwrap();
+    let store: std::sync::Arc<dyn ObjectStore> =
+        std::sync::Arc::new(LocalStore::open(location.path()).unwrap().with_catalog_ledger(StorageEpoch(0)));
+    let pool = rtdb_storage::cache::BufferPool::new(store, 1 << 20);
+    let cut = CatalogCut {
+        storage_version: StorageVersion(6), storage_epoch: StorageEpoch(0), replica_epoch: StorageEpoch(0),
+        through: ReplicaPosition(1),
+    };
+
+    let first = pool.hold_catalog(Some(cut)).await?;
+    let concurrent = pool.hold_catalog(Some(cut)).await?;
+    assert!(std::sync::Arc::ptr_eq(&first, &concurrent));
+    assert_eq!(reader_tickets(location.path()), 1);
+    drop((first, concurrent));
+
+    let consecutive = pool.hold_catalog(Some(cut)).await?;
+    assert_eq!(reader_tickets(location.path()), 1, "a read right after the last one reuses its hold");
+    let newer = pool.hold_catalog(Some(CatalogCut { storage_version: StorageVersion(7), ..cut })).await?;
+    assert!(!std::sync::Arc::ptr_eq(&consecutive, &newer));
+    assert_eq!(reader_tickets(location.path()), 2);
+    drop((consecutive, newer));
+
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    assert_eq!(reader_tickets(location.path()), 0, "an idle pool keeps no catalog held");
+    Ok(())
+}
