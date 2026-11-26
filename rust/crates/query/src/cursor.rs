@@ -154,12 +154,11 @@ impl PreparedQuery {
     fn emit_result_schema(&self, context: &QueryContext, parameter_fields: &[LogicalType]) -> Result<Arc<RuntimeSchema>> {
         context.check_cancelled()?;
         let emitted = self.emit(&context.catalog, parameter_fields, &context.memory, EmissionMode::ArrowFields)?;
-        let schema = match &self.output {
-            QueryOutput::Rows => emitted.schema(),
-            QueryOutput::Plan(plan) => &plan.schema,
-            QueryOutput::Analyze(schema) => schema,
-        };
-        RuntimeSchema::fixed(schema, &context.memory)
+        match &self.output {
+            QueryOutput::Rows => Ok(emitted.output()),
+            QueryOutput::Plan(plan) => RuntimeSchema::fixed(&plan.schema, &context.memory),
+            QueryOutput::Analyze(schema) => RuntimeSchema::fixed(schema, &context.memory),
+        }
     }
     /// Opens referenced materializations before returning; ANALYZE consumes and closes the query first.
     /// Dropping this future releases partially opened cursors and their reservations.
@@ -1322,6 +1321,22 @@ mod tests {
         assert_eq!(emitted.schema(), fresh.schema());
         drop((first, second, emitted, again));
         assert_eq!((first_query.used_bytes(), second_query.used_bytes()), (0, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn queries_of_a_kept_plan_share_its_result_schema() -> Result<()> {
+        let statement = MemoryBudget::new(1 << 24);
+        let kept = PreparedQuery::new_in(parameter_values()?, &statement)?;
+        let context = |memory: &Arc<MemoryBudget>| QueryContext::new(empty_catalog()?, Arc::clone(memory), rtdb_types::Timestamp(10), "UTC",
+            crate::QueryOptions::default(), &tokio_util::sync::CancellationToken::new());
+        let (first_memory, second_memory) = (MemoryBudget::new(1 << 24), MemoryBudget::new(1 << 24));
+        let first = kept.recharged(&first_memory)?.result_schema(&*context(&first_memory)?)?;
+        let second = kept.recharged(&second_memory)?.result_schema(&*context(&second_memory)?)?;
+        assert!(Arc::ptr_eq(&first, &second));
+        let unkept = PreparedQuery::new(parameter_values()?)?.result_schema(&*context(&first_memory)?)?;
+        assert_eq!(first.schema(), unkept.schema());
+        assert_eq!(second_memory.used_bytes(), 0);
         Ok(())
     }
 
