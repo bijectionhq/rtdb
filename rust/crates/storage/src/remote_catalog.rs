@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::Path as VaultPath, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, path::Path as VaultPath, sync::Arc};
 
 use bytes::Bytes;
 use object_store::{Error as ProviderError, ObjectStore as ProviderStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion, path::Path};
@@ -7,7 +7,8 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::{IoRegion, ObjectKey, classic_catalog_drain::{CatalogReadWitness, ClassicCatalogDrain, selected_vault},
-    io_region::IoAdmission, local_catalog::{CatalogHold, covers, same_storage, well_formed}};
+    io_region::IoAdmission, local_catalog::{CatalogHold, covers, same_storage, well_formed},
+    release::{Backoff, Settled, settle}};
 
 const MAX_LEDGER_BYTES: usize = 1024 * 1024;
 type CatalogHolds = BTreeMap<Uuid, HeldCatalog>;
@@ -74,14 +75,31 @@ impl CatalogLedger {
             })).is_ok();
             drop(admission);
             if opened && delivered { let _ = drained.await; }
-            if opened || uncertain {
-                // Even an absent ticket needs a CAS after a lost registration reply.
-                while ledger.update(|state| Ok((state.holds.remove(&ticket).is_some() || !opened, ()))).await.is_err() {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+            if !(opened || uncertain) {
+                if let Some(witness) = witness {
+                    let _ = ledger.reads.run(move || witness.forget()).await;
                 }
+                return;
             }
-            if let Some(witness) = witness {
-                let _ = ledger.reads.run(move || witness.forget()).await;
+            let ledger = &ledger;
+            // Even an absent ticket needs a CAS after a lost registration reply.
+            let release = move || async move {
+                ledger.update(move |state| Ok((state.holds.remove(&ticket).is_some() || !opened, ()))).await
+            };
+            match witness {
+                // The witness stays in the vault, unlocked, until the ledger no
+                // longer names the ticket: `drained_holds` clears it otherwise.
+                Some(witness) => match release().await {
+                    Ok(()) => { let _ = ledger.reads.run(move || witness.forget()).await; }
+                    Err(error) => eprintln!("Remote catalog hold {ticket} is left to drained-hold reconciliation: {}", error.code),
+                },
+                None => {
+                    let settled = settle(Backoff::RELEASE, release, |attempt, error, delay| eprintln!(
+                        "Remote catalog hold {ticket} release attempt {attempt} failed, retrying in {delay:?}: {}", error.code)).await;
+                    if let Settled::Refused(error) = settled {
+                        eprintln!("Remote catalog hold {ticket} cannot be released: {}", error.code);
+                    }
+                }
             }
         });
         result.await.map_err(|_| unavailable("Remote catalog admission ended"))?
@@ -199,4 +217,41 @@ fn clear_drained(holds: &mut CatalogHolds, drained: &[(Uuid, ClassicCatalogDrain
 
 fn unavailable(message: impl std::fmt::Display) -> Anomaly {
     Anomaly::new(AnomalyCategory::Unavailable, "rtdb.storage/remote-catalog-ledger", message.to_string())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::{fs::File, time::Duration};
+
+    use fs2::FileExt;
+    use object_store::memory::InMemory;
+
+    use super::*;
+    use crate::classic_catalog_drain::within_vault;
+
+    #[tokio::test]
+    async fn a_hold_whose_release_fails_is_left_drained_for_reconciliation() {
+        let vault = tempfile::tempdir().unwrap();
+        let vault_path: Arc<VaultPath> = Arc::from(vault.path());
+        let client: Arc<dyn ProviderStore> = Arc::new(InMemory::new());
+        let path = Path::from("catalog-ledger");
+        let ledger = CatalogLedger::new(Arc::clone(&client), ObjectKey::new("catalog-ledger").unwrap(), path.clone());
+        let io = IoRegion::new();
+        let permit = within_vault(Some(Arc::clone(&vault_path)), ledger.retain(None, None, &io)).await.unwrap();
+        assert_eq!(ledger.read().await.unwrap().0.holds.len(), 1);
+        let registered = client.get(&path).await.unwrap().bytes().await.unwrap();
+
+        client.put_opts(&path, Bytes::from_static(b"not a ledger").into(), PutOptions::default()).await.unwrap();
+        drop(permit);
+        let witness = std::fs::read_dir(vault.path().join("catalog-readers")).unwrap().next().unwrap().unwrap().path();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while File::open(&witness).unwrap().try_lock_exclusive().is_err() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+
+        client.put_opts(&path, registered.into(), PutOptions::default()).await.unwrap();
+        assert!(witness.exists());
+        assert_eq!(ledger.drained_holds(Some(vault_path)).await.unwrap().len(), 1);
+    }
 }

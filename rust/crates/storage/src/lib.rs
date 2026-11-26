@@ -8,6 +8,7 @@ pub mod io_region;
 pub mod log;
 pub mod object_store;
 pub mod read_lease;
+pub mod release;
 pub mod sealing;
 mod lease_decision;
 mod local_catalog;
