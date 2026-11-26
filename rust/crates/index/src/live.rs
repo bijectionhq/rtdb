@@ -1762,6 +1762,8 @@ impl TransactionBuffer {
         Ok(())
     }
     pub fn has_pending_table(&self, table: &TableRef) -> bool { self.tables.contains_key(table) }
+    /// Whether [`Self::snapshot`] contains `table`, answered without building the snapshot's transaction segments.
+    pub fn contains_table(&self, table: &TableRef) -> bool { self.has_pending_table(table) || self.base.contains_table(table) }
 
     pub fn pending_tables(&self) -> impl Iterator<Item = &TableRef> { self.tables.keys() }
     /// The column types this transaction declares or puts into one table so far.
@@ -2429,6 +2431,28 @@ mod row_column_type_tests {
 mod chunk_tests {
     use super::*;
     use rtdb_types::EntityId;
+
+    #[test]
+    fn a_transaction_contains_the_tables_its_snapshot_contains() {
+        let state = crate::PartitionState::empty(TrieConfig::default()).unwrap();
+        let (base, pending, absent) = (TableRef::new("public", "base"), TableRef::new("public", "pending"), TableRef::new("public", "absent"));
+        let put = |transaction: &mut TransactionBuffer, table: &TableRef| {
+            let document = StructFields::from([("_id".into(), Value::I64(1))]);
+            transaction.put(table.clone(), document, Interval::new(Timestamp(10), Timestamp::MAX).unwrap()).unwrap();
+        };
+        let first = TransactionKey { tx_id: rtdb_types::TxId(0), system_time: Timestamp(10) };
+        let mut transaction = TransactionBuffer::new(state.value().snapshot(), first, MemoryBudget::new(1 << 24)).unwrap();
+        put(&mut transaction, &base);
+        state.apply(&transaction.stage().unwrap()).unwrap();
+        let second = TransactionKey { tx_id: rtdb_types::TxId(1), system_time: Timestamp(11) };
+        let mut transaction = TransactionBuffer::new(state.value().snapshot(), second, MemoryBudget::new(1 << 24)).unwrap();
+        put(&mut transaction, &pending);
+        let snapshot = transaction.snapshot().unwrap();
+        for table in [&base, &pending, &absent] {
+            assert_eq!(transaction.contains_table(table), snapshot.contains_table(table), "{table:?}");
+        }
+        assert!(transaction.contains_table(&base) && transaction.contains_table(&pending) && !transaction.contains_table(&absent));
+    }
 
     #[test]
     fn locating_some_iids_of_a_leaf_keeps_exactly_their_rows_in_leaf_order() {

@@ -155,7 +155,7 @@ impl OpenTransaction<'_> {
         if !clock.collect_at(self.tx_key().tx_id) { return Ok(()); }
         let observed = clock.time;
         let receipts = super::receipts_table();
-        if self.sees_table(&receipts) {
+        if self.buffer.contains_table(&receipts) {
             self.retire_receipt_rows(
                 receipts,
                 "SELECT _id FROM xt.idempotency_receipts FOR ALL VALID_TIME GROUP BY _id HAVING MAX(_valid_to) <= ? ORDER BY CAST(_id AS TEXT) LIMIT 128",
@@ -163,7 +163,7 @@ impl OpenTransaction<'_> {
             ).await?;
         }
         let bounded = crate::bounded_retry::bounded_receipts_table();
-        if self.sees_table(&bounded) {
+        if self.buffer.contains_table(&bounded) {
             self.retire_receipt_rows(
                 bounded,
                 "SELECT _id FROM xt.bounded_retry_receipts FOR ALL VALID_TIME WHERE _valid_to <= ? ORDER BY _id LIMIT 128",
@@ -171,7 +171,7 @@ impl OpenTransaction<'_> {
             ).await?;
         }
         let private = crate::replay_submission::replay_table();
-        if self.sees_table(&private) {
+        if self.buffer.contains_table(&private) {
             self.retire_receipt_rows(
                 private,
                 "SELECT _id FROM xt.rtdb_replay_keys FOR ALL VALID_TIME GROUP BY _id HAVING MAX(_valid_to) <= ? ORDER BY CAST(_id AS TEXT) LIMIT 128",
@@ -184,7 +184,7 @@ impl OpenTransaction<'_> {
     pub(super) async fn retire_placed_outcomes(&mut self, clock: RetentionClock) -> Result<()> {
         let outcomes = rtdb_types::TableRef::new("xt", rtdb_types::PLACED_ATTEMPT_OUTCOME_TABLE);
         if !self.context.placed_receipt_retirement || !clock.collect_at(self.tx_key().tx_id)
-            || !self.sees_table(&outcomes)
+            || !self.buffer.contains_table(&outcomes)
         {
             return Ok(());
         }

@@ -911,10 +911,6 @@ impl<'a> OpenTransaction<'a> {
     }
 
     pub fn snapshot(&self) -> Result<Snapshot> { self.buffer.snapshot() }
-    /// Whether `snapshot()` would contain `table`, without materializing the transaction's pending writes into it.
-    fn sees_table(&self, table: &TableRef) -> bool {
-        self.buffer.has_pending_table(table) || self.buffer.base_snapshot().contains_table(table)
-    }
     pub fn append(&mut self, table: TableRef, event: StoredEvent) -> Result<()> {
         self.context.check_cancelled()?;
         check_writer_table(&table)?;
@@ -1028,7 +1024,7 @@ impl<'a> OpenTransaction<'a> {
 
     /// Whether a live receipt names this retry identity: the same body is a duplicate of the original, a different one a conflict.
     async fn receipt_outcome(&self, id: &str, digest: &str, log_time: Timestamp) -> Result<Result<()>> {
-        if !self.snapshot()?.contains_table(&receipts_table()) { return Ok(Ok(())); }
+        if !self.buffer.contains_table(&receipts_table()) { return Ok(Ok(())); }
         let bucket = receipt_bucket(log_time);
         let mut query = self.open_query(
             "SELECT digest, tx_id, tx_system_time FROM xt.idempotency_receipts FOR ALL VALID_TIME WHERE _id IN (?, ?) AND (_valid_to IS NULL OR _valid_to > ?) ORDER BY tx_system_time DESC LIMIT 1",
@@ -1089,7 +1085,7 @@ impl<'a> OpenTransaction<'a> {
     }
 
     async fn index_exists(&self, catalog: &str, name: &str) -> Result<bool> {
-        if !self.snapshot()?.contains_table(&TableRef::new("xt", catalog)) { return Ok(false); }
+        if !self.buffer.contains_table(&TableRef::new("xt", catalog)) { return Ok(false); }
         let sql = format!("SELECT _id FROM xt.{catalog} WHERE _id = ?");
         let mut query = self.open_query(&sql, vec![Value::Utf8(name.into())]).await?;
         Ok(query.next_batch().await?.is_some())
@@ -6484,8 +6480,8 @@ mod tests {
         let options = SubmitOptions::default();
         let mut tx = OpenTransaction::new(base.snapshot(), key, &options, &context)?;
         tx.buffer.put(items.clone(), StructFields::from([("_id".into(), Value::I64(1))]), Interval::new(Timestamp(10), Timestamp::MAX)?)?;
-        for table in &tables { assert_eq!(tx.sees_table(table), tx.snapshot()?.contains_table(table), "{table:?}"); }
-        assert!(tx.sees_table(&items) && !tx.sees_table(&receipts));
+        for table in &tables { assert_eq!(tx.buffer.contains_table(table), tx.snapshot()?.contains_table(table), "{table:?}"); }
+        assert!(tx.buffer.contains_table(&items) && !tx.buffer.contains_table(&receipts));
 
         let clock = tx.observe_retention_clock(Timestamp(10), None).await?;
         tx.retire_expired_receipts(clock).await?;
@@ -6493,7 +6489,7 @@ mod tests {
         assert!(tables[1..].iter().all(|table| !tx.buffer.has_pending_table(table)));
 
         tx.buffer.put(receipts.clone(), StructFields::from([("_id".into(), Value::Utf8("0/key".into()))]), Interval::new(Timestamp(0), Timestamp(5))?)?;
-        for table in &tables { assert_eq!(tx.sees_table(table), tx.snapshot()?.contains_table(table), "{table:?}"); }
+        for table in &tables { assert_eq!(tx.buffer.contains_table(table), tx.snapshot()?.contains_table(table), "{table:?}"); }
         tx.retire_expired_receipts(clock).await?;
         Ok(())
     }
