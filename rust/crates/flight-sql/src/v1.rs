@@ -36,8 +36,10 @@ const FOLLOWER_PROGRESS: &str = "query.follower-progress";
 pub const OWNED_HOSTED_FEATURE: &str = "owned.hosted";
 /// The attested contract Bijection speaks (`rtdb.store.v1`).
 pub const STORE_API: &str = "rtdb.store.v1";
-/// The store admits Bijection's placement fence grant (version 6).
-pub const STORE_PLACEMENT_FENCE_FEATURE: &str = "store.placement-fence";
+/// The store admits scoped store grants: Bijection's placement fence
+/// (version 6) and managed provisioning (version 7), each confined to the
+/// key prefixes its scope names.
+pub const STORE_SCOPED_GRANTS_FEATURE: &str = "store.scoped-grants";
 pub const RETIRED_ORIGINAL_FAMILY_FEATURE: &str = "owned.retired-original-family";
 pub const RETIRED_ORIGINAL_FAMILY_RECOVERY_FEATURE: &str = "owned.retired-original-family-recovery";
 const MAX_PAGE_ROWS: u32 = 4096;

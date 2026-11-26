@@ -375,11 +375,12 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             provenance: rtdb_types::compiled_build_info(),
             standalone_protocol: process::STANDALONE_PROTOCOL,
             hosted_protocol: if cfg!(feature = "s3-key-vault") { 227 } else { 56 },
-            // Bijection speaks only the ordered-bytes store; the placement
-            // fence grant admits its workload issuer's store sessions.
+            // Bijection speaks only the ordered-bytes store; scoped store
+            // grants admit its workload issuer's fence and provisioning
+            // sessions inside their key scopes.
             capabilities: cfg!(feature = "s3-key-vault").then_some(HostedCapabilities {
                 api: rtdb_flight_sql::STORE_API,
-                features: [rtdb_flight_sql::STORE_PLACEMENT_FENCE_FEATURE],
+                features: [rtdb_flight_sql::STORE_SCOPED_GRANTS_FEATURE],
             }),
             pgwire_arrow_copy_out: true,
             placed_receipt_retirement: true,

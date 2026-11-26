@@ -72,7 +72,7 @@ class ReleaseSelectionTests(unittest.TestCase):
             release.verify_hosted_protocol({}, {"hosted_protocol": 8})
 
     def test_multi_image_attests_only_compiled_hosted_features(self):
-        hosted = {"api": "rtdb.store.v1", "features": ["store.placement-fence"]}
+        hosted = {"api": "rtdb.store.v1", "features": ["store.scoped-grants"]}
         compiled = {"hosted_protocol": 227, "capabilities": hosted}
         labels = {"io.rtdb.hosted-protocol": "227", "io.rtdb.capabilities": json.dumps(hosted)}
         image = {"Config": {"Labels": labels}}

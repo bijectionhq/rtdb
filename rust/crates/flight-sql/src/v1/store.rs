@@ -8,6 +8,13 @@
 //! the next version that wrote into its ranges. Every append outcome but
 //! `outside` is a receipt under its key, a write-free validation included, so a
 //! retry returns the first one.
+//!
+//! A store grant's caller (a placement fence or a provisioning grant,
+//! `rtdb_auth::StoreScope`) is confined to its scope: every read range,
+//! append guard and watch range lies inside one read prefix, every written
+//! key and bounded counter under one write prefix, and its appends carry no
+//! derives, whose keys the scope cannot bound. Anything else refuses with
+//! `rtdb.store/outside-grant` before it is read or ordered.
 
 use std::time::Duration;
 
@@ -21,7 +28,8 @@ use rtdb_node::{DatabaseAccess, serving::{ChangeImages, ChangeOrder, Changes}};
 use rtdb_tx::transact::{
     Guard, Op, Outcome, STORE_BOUND, STORE_OUTSIDE_EARLY, STORE_OUTSIDE_LATE, StoreAppend, Transact, Window,
 };
-use rtdb_types::{EntityId, Timestamp, rtdb_v1::{At, Basis, MAIN_BRANCH}};
+use rtdb_auth::StoreScope;
+use rtdb_types::{Anomaly, AnomalyCategory, EntityId, Timestamp, rtdb_v1::{At, Basis, MAIN_BRANCH}};
 use tonic::Status;
 
 use super::{MAX_CHANGE_GROUPS, MAX_WAIT, check_key, error};
@@ -46,6 +54,22 @@ fn ranges(ranges: Vec<proto::KeyRange>) -> Result<Vec<KeyRange>, Status> {
     ranges.into_iter().map(range).collect()
 }
 
+/// Refuse unless `scope` (none for an unscoped principal) admits `admitted`.
+fn within(scope: Option<&StoreScope>, admitted: impl FnOnce(&StoreScope) -> bool) -> Result<(), Status> {
+    if scope.is_none_or(admitted) {
+        return Ok(());
+    }
+    Err(error::anomaly(Anomaly::new(
+        AnomalyCategory::Forbidden,
+        "rtdb.store/outside-grant",
+        "The store grant's scope does not cover the request's keys",
+    )))
+}
+
+fn reads_within(scope: Option<&StoreScope>, ranges: &[KeyRange]) -> Result<(), Status> {
+    within(scope, |scope| ranges.iter().all(|range| scope.admits_read(&range.start, range.end.as_deref())))
+}
+
 fn incarnation(bytes: &[u8]) -> Result<[u8; 16], Status> {
     bytes.try_into().map_err(|_| error::incorrect("A store incarnation has 16 bytes"))
 }
@@ -61,24 +85,28 @@ impl Service {
     }
 
     /// Selects the unscoped serving driver and checks a stated incarnation.
-    async fn store_database(
-        &self, call: &Call, access: DatabaseAccess, stated: Option<&[u8]>,
-    ) -> Result<(std::sync::Arc<rtdb_node::Database>, [u8; 16]), Status> {
+    /// A store grant is admitted on its exact database and current
+    /// incarnation while it lives, and its scope returned: the action keeps
+    /// every key it touches inside it before any effect.
+    async fn store_database<'c>(
+        &self, call: &'c Call, access: DatabaseAccess, stated: Option<&[u8]>,
+    ) -> Result<(std::sync::Arc<rtdb_node::Database>, [u8; 16], Option<&'c StoreScope>), Status> {
         if call.session.caller.principal.label_scope().is_some() {
             return Err(error::unsupported("rtdb.store.v1 on a scoped route"));
         }
         let database = self.wire_attachment(call, access).await?;
         let driver = database.serving_driver().ok_or_else(|| error::unsupported("rtdb.store.v1"))?;
         let current = driver.incarnation();
-        if let Some(grant) = call.session.caller.principal.workload_grant().filter(|grant| grant.is_store_fence()) {
-            grant.admit_store_fence(&call.database, current, self.0.node.now()).map_err(error::anomaly)?;
-        }
+        let scope = match call.session.caller.principal.workload_grant().filter(|grant| grant.is_store_grant()) {
+            Some(grant) => Some(grant.admit_store(&call.database, current, self.0.node.now()).map_err(error::anomaly)?),
+            None => None,
+        };
         if let Some(stated) = stated.filter(|stated| !stated.is_empty())
             && incarnation(stated)? != current
         {
             return Err(Status::failed_precondition("The store incarnation changed"));
         }
-        Ok((database, current))
+        Ok((database, current, scope))
     }
 
     async fn store_read(&self, call: &Call, request: proto::ReadRequest) -> Result<Vec<u8>, Status> {
@@ -88,7 +116,9 @@ impl Service {
         if request.at.is_some() && request.incarnation.is_empty() {
             return Err(error::incorrect("A versioned read states its incarnation"));
         }
-        let (database, incarnation) = self.store_database(call, DatabaseAccess::Read, Some(&request.incarnation)).await?;
+        let (database, incarnation, scope) = self.store_database(call, DatabaseAccess::Read, Some(&request.incarnation)).await?;
+        let read_ranges = ranges(request.ranges)?;
+        reads_within(scope, &read_ranges)?;
         let driver = database.serving_driver().ok_or_else(|| error::unsupported("rtdb.store.v1"))?;
         let mut at = request.at.map_or(At::Latest, |at| At::Exactly(Basis::new(incarnation, at)));
         let limit = (request.limit as usize).clamp(1, MAX_PAGE_ENTRIES);
@@ -103,10 +133,10 @@ impl Service {
             .map(ValueFilter::decode)
             .transpose()
             .map_err(|refused| error::incorrect(&refused.to_string()))?;
-        let mut pages = Vec::with_capacity(request.ranges.len());
+        let mut pages = Vec::with_capacity(read_ranges.len());
         let mut read_at = None;
         let clock = self.0.node.now();
-        for key_range in ranges(request.ranges)? {
+        for key_range in read_ranges {
             let after = request.after.clone().filter(|after| key_range.contains(after));
             let read = StoreRead { range: key_range, after, limit, projection, filter: filter.clone(), reverse: request.reverse };
             let page = driver.read_store(read, at, clock, &call.cancellation).await.map_err(error::anomaly)?;
@@ -161,10 +191,17 @@ impl Service {
         }
         // Every append records its outcome under its key, a write-free one included.
         let validation = writes.is_empty() && bounds.is_empty() && request.derives.is_empty();
-        let (database, incarnation) = self.store_database(call, DatabaseAccess::Write, Some(&request.incarnation)).await?;
+        let (database, incarnation, scope) = self.store_database(call, DatabaseAccess::Write, Some(&request.incarnation)).await?;
+        let read_guards = ranges(request.reads)?;
+        reads_within(scope, &read_guards)?;
+        within(scope, |scope| {
+            request.derives.is_empty()
+                && writes.iter().all(|write| scope.admits_write(&write.key, write.key_stamp))
+                && bounds.iter().all(|bound| scope.admits_write(&bound.key, None))
+        })?;
         let driver = database.serving_driver().ok_or_else(|| error::unsupported("rtdb.store.v1"))?;
         let since = Basis::new(incarnation, request.since);
-        let guards = ranges(request.reads)?.into_iter()
+        let guards = read_guards.into_iter()
             .map(|range| Guard::Unwritten { range, since })
             .collect::<Vec<_>>();
         let transaction = Transact {
@@ -213,9 +250,10 @@ impl Service {
         if request.incarnation.is_empty() {
             return Err(error::incorrect("A watch states its incarnation"));
         }
-        let (database, incarnation) = self.store_database(call, DatabaseAccess::Read, Some(&request.incarnation)).await?;
-        let driver = database.serving_driver().ok_or_else(|| error::unsupported("rtdb.store.v1"))?;
+        let (database, incarnation, scope) = self.store_database(call, DatabaseAccess::Read, Some(&request.incarnation)).await?;
         let watched = ranges(request.ranges)?;
+        reads_within(scope, &watched)?;
+        let driver = database.serving_driver().ok_or_else(|| error::unsupported("rtdb.store.v1"))?;
         let wait = Duration::from_millis(request.wait_millis).min(MAX_WAIT);
         let deadline = tokio::time::Instant::now() + wait;
         let mut after = Basis::new(incarnation, request.after);

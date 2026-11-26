@@ -92,8 +92,9 @@ impl CallKind {
         matches!(self, Self::Handshake | Self::ManagedCreate | Self::ManagedWorkload | Self::TxStatus)
     }
 
-    /// A placement fence credential reaches only the store contract.
-    fn allows_store_fence(self) -> bool {
+    /// A store grant (a placement fence or a provisioning grant) reaches only
+    /// the store contract, whose actions keep it inside its scope.
+    fn allows_store_grant(self) -> bool {
         matches!(self, Self::Handshake | Self::Store)
     }
 
@@ -416,8 +417,8 @@ impl Service {
         let forwarded_peer = request.metadata().get(FORWARDED_PEER_HEADER);
         let admit_workload = |principal: &rtdb_auth::Principal, fresh_replica| {
             if let Some(grant) = principal.workload_grant() {
-                let allowed = if grant.is_store_fence() {
-                    kind.allows_store_fence()
+                let allowed = if grant.is_store_grant() {
+                    kind.allows_store_grant()
                 } else if grant.is_original_private_replay() {
                     matches!(kind, CallKind::Handshake | CallKind::V1OriginalPrivateReplay)
                 } else if grant.is_original_custody_control() {

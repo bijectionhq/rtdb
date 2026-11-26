@@ -44,6 +44,7 @@ The existing Flight `Client` authorization scheme selects exactly one prefix and
 The profile requires client credentials and a verified workload grant for every authentication.
 The Create issuer can authenticate only version 1 `create-deployment` for the name and UUID authorized by the accepted INSTALL.
 The assignment issuer can authenticate only version 2 with one typed authority for the exact Original name and UUID.
+It also authenticates the scoped store grants, versions 6 and 7 (<<_scoped_store_grants,Scoped store grants>>).
 The issuer establishes the exact permission, and the native ordered writer applies the existing placement, writer and expiry checks before an effect.
 
 For Create, match `issuerUrl` to the cell-management `rtdb_create_issuer.oidc_origin` and match `audience` and `clientIdPrefix` to `rtdb_admin.workload_issuer.audience` and `client_id_prefix`.
@@ -366,3 +367,45 @@ If settlement wins, retain a negative outcome and refuse a later positive submis
 
 Qualify the interface against old-grant races across ordered closure, replacement and restart, including a displaced writer version still visible at its original valid time.
 Also qualify cross-incarnation and cross-assignment status, partial attempts and lost replies across a checkpoint, and each operation that could modify fence or writer authority.
+
+== Scoped store grants
+
+A store grant admits `rtdb.store.v1` Read, Append and Watch on its exact database and current incarnation, confined to a key scope.
+The assignment issuer is the only issuer that can authenticate one; the assignment profile and its `authorityPoint` must be configured.
+There are two roles, each its own grant version, with the same top-level `audience`, `database`, `incarnation`, `grant_id` and `expires_at_micros` as every workload grant.
+
+[cols="1,1,3"]
+|===
+| Version | Claim field | Role and fields
+
+| 6
+| `store_fence`
+| `{ "role": "fence-placement", "epoch", "scope" }`: Bijection's managed placement fence, which closes the Original's writer row at one positive placement epoch.
+| 7
+| `store_provisioning`
+| `{ "role": "install-declarations", "scope" }`: a managed Original's provisioning, which installs its catalog's declarations at its first placement.
+|===
+
+Supply exactly one of the two fields, matching the version, and none of `operations`, `authority`, `original_custody`, `original_family` or `original_family_readback`.
+Every other version refuses either field.
+The issuer mints a store grant only for the cell's current retained placement intent, and a provisioning grant only for a first placement.
+Keep both short-lived: the 300-second grant and token bounds apply.
+
+The scope is `{ "reads": [prefix, ...], "writes": [prefix, ...] }`, each prefix a byte array.
+A prefix covers every key that starts with it.
+Supply at least one read prefix and at most 64 prefixes in all, each 1 to 512 bytes long.
+Every prefix starts with one whole partition prefix, a big-endian `u16` length then that many bytes, so a scope names exact partitions.
+The store knows no relations: the issuer derives the prefixes from the relations and partitions the role touches.
+
+RTDB admits a store call of a store grant only inside its scope, before anything is read or ordered:
+
+* every Read range, every Append read guard and every Watch range lies inside one read prefix, so an unbounded range is refused unless its prefix is all `0xff`;
+* every Append write lies under one write prefix, and a stamped key's 16-byte placeholder begins at or past that prefix's end, so the stamped key stays under it;
+* every Append bounded counter lies under one write prefix;
+* the Append carries no derives, whose written keys the scope cannot bound.
+
+Anything else is refused with `rtdb.store/outside-grant`.
+A write prefix does not admit reads: list a prefix in both when the role reads what it writes.
+Store grants reach only the authentication handshake and the store actions on the ordinary managed listener.
+
+The Multi image attests `{"api":"rtdb.store.v1","features":["store.scoped-grants"]}` in its `io.rtdb.capabilities` label.

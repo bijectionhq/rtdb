@@ -2,6 +2,7 @@ mod http;
 mod managed_workload_oidc;
 mod oidc;
 mod password;
+mod store_scope;
 mod visibility_scope;
 mod workload_grant;
 
@@ -24,8 +25,9 @@ pub use http::{HttpRequest, HttpResponse, HttpTransport, NativeHttp};
 pub use managed_workload_oidc::{ManagedWorkloadOidcConfig, ScopedAudienceIssuerConfig, WorkloadIssuerConfig};
 pub use oidc::{DeviceAuthorization, OidcConfig};
 pub use password::PasswordHash;
+pub use store_scope::StoreScope;
 pub use visibility_scope::VerifiedLabelScope;
-pub use workload_grant::{OriginalCustodyOperation, OriginalFamilyGrant, OriginalFamilyReadbackGrant, OriginalFamilyReadbackProjection, VerifiedWorkloadGrant, WorkloadGrantConfig, WorkloadOperation};
+pub use workload_grant::{OriginalCustodyOperation, OriginalFamilyGrant, OriginalFamilyReadbackGrant, OriginalFamilyReadbackProjection, StoreFence, StoreProvisioning, VerifiedWorkloadGrant, WorkloadGrantConfig, WorkloadOperation};
 
 #[derive(Clone)]
 pub struct Secret(Zeroizing<String>);
