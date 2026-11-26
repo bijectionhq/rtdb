@@ -18,6 +18,7 @@ impl DecimalSchema {
         })?;
         Ok(Self { native: Arc::new(schema.clone()), wire: Arc::new(wire), decimals })
     }
+    pub fn native(&self) -> &Schema { &self.native }
     pub fn validate_batch(&self, batch: &arrow_array::RecordBatch) -> Result<()> {
         if batch.schema().as_ref() != self.native.as_ref() {
             return Err(Anomaly::incorrect("rtdb.format/arrow-schema", "Arrow page schema differs from its declared stream schema"));

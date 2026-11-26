@@ -80,6 +80,31 @@ impl<W> JavaLayout<W> {
     }
 }
 
+/// A stream's Java-layout schema message and the batch layouts it implies.
+pub(crate) struct StreamSchema { metadata: Vec<u8>, layouts: Option<Vec<FieldLayout>> }
+
+impl StreamSchema {
+    /// Rewrites `metadata`, an Arrow schema message exactly as a stream writer frames it, without its prefix.
+    pub(super) fn new(metadata: &[u8]) -> Result<Self, String> {
+        let mut layouts = None;
+        let rewritten = rewrite(&mut layouts, metadata)?;
+        match rewritten {
+            Rewritten { metadata: Some(metadata), plan: None, body: 0, header: MessageHeader::Schema } => Ok(Self { metadata, layouts }),
+            _ => Err("Arrow message is not a schema".into()),
+        }
+    }
+}
+
+impl<W: Write> JavaLayout<W> {
+    /// A stream that has already been given `schema` as its first, continuation-framed message.
+    pub(super) fn resume_stream(inner: W, schema: &StreamSchema) -> io::Result<Self> {
+        let mut layout = Self::new(inner, None);
+        frame(&mut Output { inner: &mut layout.inner, footer: None }, &schema.metadata, true)?;
+        layout.layouts = schema.layouts.clone();
+        Ok(layout)
+    }
+}
+
 impl<W: Write> Write for JavaLayout<W> {
     fn write(&mut self, mut bytes: &[u8]) -> io::Result<usize> {
         let written = bytes.len();
