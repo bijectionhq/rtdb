@@ -64,7 +64,7 @@ pub struct LocalLogDriver {
     queue: mpsc::Receiver<Queued>,
     progress: Arc<Progress>,
     recent: Arc<RecentFrames>,
-    syncs: Arc<LogSyncs>,
+    syncs: Arc<LocalLogSyncs>,
     /// A moving average of recent batch sizes: above one, appenders are concurrent and a batch may wait to share its sync.
     recent_batch: f64,
 }
@@ -72,21 +72,20 @@ pub struct LocalLogDriver {
 /// The longest a batch waits for another log's sync to complete.
 const APPEND_LINGER_LIMIT: Duration = Duration::from_millis(10);
 
-/// The local log syncs this process has in flight.
+/// The syncs in flight across local logs that share one drive; whoever opens those logs shares one value between them.
 /// A full sync flushes the whole drive cache, and the drive runs them one at a time, so a batch whose sync would queue
 /// behind another's loses nothing by taking the frames that arrive until that one completes.
-struct LogSyncs(watch::Sender<SyncCount>);
+pub struct LocalLogSyncs(watch::Sender<SyncCount>);
 
 #[derive(Clone, Copy, Default)]
 struct SyncCount { in_flight: usize, completed: u64 }
 
-impl LogSyncs {
-    fn new() -> Self { Self(watch::channel(SyncCount::default()).0) }
+impl Default for LocalLogSyncs {
+    fn default() -> Self { Self(watch::channel(SyncCount::default()).0) }
+}
 
-    fn process() -> Arc<Self> {
-        static PROCESS: std::sync::LazyLock<Arc<LogSyncs>> = std::sync::LazyLock::new(|| Arc::new(LogSyncs::new()));
-        Arc::clone(&PROCESS)
-    }
+impl LocalLogSyncs {
+    pub fn new() -> Arc<Self> { Arc::new(Self::default()) }
 
     fn begin(self: &Arc<Self>) -> SyncInFlight {
         self.0.send_modify(|count| count.in_flight += 1);
@@ -102,7 +101,7 @@ impl LogSyncs {
     }
 }
 
-struct SyncInFlight(Arc<LogSyncs>);
+struct SyncInFlight(Arc<LocalLogSyncs>);
 
 impl Drop for SyncInFlight {
     fn drop(&mut self) {
@@ -309,7 +308,7 @@ pub(crate) fn physical_maximum(maximum: usize, sealed: bool) -> Result<usize> {
 }
 
 impl LocalLog {
-    /// Opens the exact LOG/REPLICA_LOG file selected by the caller.
+    /// Opens the exact LOG/REPLICA_LOG file selected by the caller, coordinating its syncs with no other log.
     /// The database owner runs the returned driver, cancels and joins it, then calls `close_and_wait` before runtime shutdown.
     pub fn open(path: impl AsRef<Path>, options: LocalLogOptions) -> Result<(Arc<Self>, LocalLogDriver)> {
         Self::open_with_timestamp_source(path, options, Arc::new(SuppliedTimestamp))
@@ -323,25 +322,26 @@ impl LocalLog {
 
     /// Uses a caller-owned reader I/O region; the caller closes that region after consumers and the writer join.
     pub fn open_with_timestamp_source_in(path: impl AsRef<Path>, options: LocalLogOptions, timestamps: Arc<dyn AppendTimestampSource>, reads: Arc<IoRegion>) -> Result<(Arc<Self>, LocalLogDriver)> {
-        Self::open_with_key_slots(path, options, timestamps, reads, None)
+        Self::open_with_key_slots(path, options, timestamps, reads, None, LocalLogSyncs::new())
     }
 
+    /// `syncs` is shared with the other logs on the same drive, whose syncs this log's batches may wait to follow.
     pub fn open_with_key_slots(path: impl AsRef<Path>, options: LocalLogOptions, timestamps: Arc<dyn AppendTimestampSource>,
-        reads: Arc<IoRegion>, keys: Option<Arc<ClassicObjectKeys>>,
+        reads: Arc<IoRegion>, keys: Option<Arc<ClassicObjectKeys>>, syncs: Arc<LocalLogSyncs>,
     ) -> Result<(Arc<Self>, LocalLogDriver)> {
-        Self::open_journal(path.as_ref(), options, timestamps, reads, keys, false)
+        Self::open_journal(path.as_ref(), options, timestamps, reads, keys, false, syncs)
     }
 
     /// Durably binds a native replica journal's lineage, preserving any existing record offsets.
     /// The returned driver has the same run/cancel/join obligation as [`Self::open`].
     pub fn open_replica(path: impl AsRef<Path>, options: LocalLogOptions, timestamps: Arc<dyn AppendTimestampSource>,
-        reads: Arc<IoRegion>, keys: Option<Arc<ClassicObjectKeys>>,
+        reads: Arc<IoRegion>, keys: Option<Arc<ClassicObjectKeys>>, syncs: Arc<LocalLogSyncs>,
     ) -> Result<(Arc<Self>, LocalLogDriver)> {
-        Self::open_journal(path.as_ref(), options, timestamps, reads, keys, true)
+        Self::open_journal(path.as_ref(), options, timestamps, reads, keys, true, syncs)
     }
 
     fn open_journal(path: &Path, options: LocalLogOptions, timestamps: Arc<dyn AppendTimestampSource>,
-        reads: Arc<IoRegion>, keys: Option<Arc<ClassicObjectKeys>>, bind_lineage: bool,
+        reads: Arc<IoRegion>, keys: Option<Arc<ClassicObjectKeys>>, bind_lineage: bool, syncs: Arc<LocalLogSyncs>,
     ) -> Result<(Arc<Self>, LocalLogDriver)> {
         let path = Arc::new(path.to_path_buf());
         let _operation = reads.admit_read(path.clone(), ())?;
@@ -376,7 +376,7 @@ impl LocalLog {
         let log = Arc::new(Self { path: path.clone(), lineage: file.lineage(), queue: send, progress: progress.clone(),
             maximum_message_bytes: options.maximum_message_bytes, keys: keys.clone(), reads, recent: recent.clone() });
         Ok((log, LocalLogDriver { writer: Some(Writer { file, path, timestamps, keys }), queue, progress, recent,
-            syncs: LogSyncs::process(), recent_batch: 1.0 }))
+            syncs, recent_batch: 1.0 }))
     }
 
     /// Closes and drains reader I/O; the caller must cancel and join the writer driver first.
@@ -824,7 +824,7 @@ mod tests {
     fn replica_options() -> LocalLogOptions { LocalLogOptions { maximum_message_bytes: 1024, queue_capacity: 2 } }
 
     fn open_replica(path: &Path) -> Result<(Arc<LocalLog>, LocalLogDriver)> {
-        LocalLog::open_replica(path, replica_options(), Arc::new(SuppliedTimestamp), IoRegion::new(), None)
+        LocalLog::open_replica(path, replica_options(), Arc::new(SuppliedTimestamp), IoRegion::new(), None, LocalLogSyncs::new())
     }
 
     #[test]
@@ -1023,7 +1023,7 @@ mod tests {
         let slots = vault.log_keys(&path, true, Arc::clone(&io))?;
         let (log, driver) = LocalLog::open_with_key_slots(
             &path, LocalLogOptions { maximum_message_bytes: 1024, queue_capacity: 2 },
-            Arc::new(SuppliedTimestamp), Arc::clone(&io), Some(slots),
+            Arc::new(SuppliedTimestamp), Arc::clone(&io), Some(slots), LocalLogSyncs::new(),
         )?;
         let shutdown = CancellationToken::new();
         let writer = tokio::spawn(driver.run(shutdown.clone()));
@@ -1088,9 +1088,35 @@ mod tests {
 
     fn isolated_driver(capacity: usize) -> Result<(tempfile::TempDir, Arc<LocalLog>, LocalLogDriver)> {
         let directory = tempfile::tempdir().unwrap();
-        let (log, mut driver) = LocalLog::open(directory.path().join("LOG"), LocalLogOptions { maximum_message_bytes: 1024, queue_capacity: capacity })?;
-        driver.syncs = Arc::new(LogSyncs::new());
+        let (log, driver) = LocalLog::open(directory.path().join("LOG"), LocalLogOptions { maximum_message_bytes: 1024, queue_capacity: capacity })?;
         Ok((directory, log, driver))
+    }
+
+    #[tokio::test]
+    async fn only_logs_opened_with_one_sync_set_wait_on_each_others_syncs() -> Result<()> {
+        let directory = tempfile::tempdir().unwrap();
+        let options = || LocalLogOptions { maximum_message_bytes: 1024, queue_capacity: 16 };
+        let open = |name: &str, syncs: &Arc<LocalLogSyncs>| LocalLog::open_with_key_slots(
+            directory.path().join(name), options(), Arc::new(SuppliedTimestamp), IoRegion::new(), None, Arc::clone(syncs),
+        );
+        let drive = LocalLogSyncs::new();
+        let (_source_log, source) = open("LOG", &drive)?;
+        let (replica_log, mut replica) = open("REPLICA_LOG", &drive)?;
+        let (stranger_log, mut stranger) = open("OTHER_LOG", &LocalLogSyncs::new())?;
+        let _syncing = source.syncs.begin();
+
+        let _first = stranger_log.enqueue(Bytes::from_static(b"first"), Timestamp(1)).await?;
+        let mut records = vec![stranger.queue.try_recv().unwrap()];
+        let started = Instant::now();
+        assert!(stranger.linger(&mut records, false).await.is_none());
+        assert!(started.elapsed() < APPEND_LINGER_LIMIT, "a log on another sync set syncs at once");
+
+        let _first = replica_log.enqueue(Bytes::from_static(b"first"), Timestamp(1)).await?;
+        let mut records = vec![replica.queue.try_recv().unwrap()];
+        let started = Instant::now();
+        assert!(replica.linger(&mut records, false).await.is_none());
+        assert!(started.elapsed() >= APPEND_LINGER_LIMIT, "a log on the same sync set waits for the source's sync");
+        Ok(())
     }
 
     #[tokio::test]

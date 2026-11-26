@@ -556,6 +556,11 @@ const MAPPED_OBJECT_LIMIT: usize = 512;
 
 /// Read-only mappings of local objects, shared between scan reads so that a read does not open and map its file again.
 /// Every use compares the file's identity with the mapped one, so a removed or replaced object is never read through an older mapping.
+/// The mappings are not charged to a memory budget: they are read-only and file-backed, so their resident pages are clean
+/// page cache that the kernel reclaims under pressure without writeback and shares with every other reader of the file,
+/// whereas a budget bounds the allocations the kernel cannot take back.
+/// What a mapping does hold is address space and, once its file is removed, that file's disk blocks, which is what
+/// `MAPPED_OBJECT_LIMIT` and the sweep bound.
 #[derive(Default)]
 struct MappedObjects {
     entries: HashMap<PathBuf, MappedObject>,

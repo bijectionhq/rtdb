@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use futures::{FutureExt, future::BoxFuture};
 use prost_types::Any;
 use rtdb_format::{database::proto::{DatabaseConfig, database_config}, keys::{CURRENT_STORAGE_VERSION, StorageRoot}};
-use rtdb_storage::{IoRegion, LocalStore, MemoryStore, ObjectKey, ObjectStore, log::{AppendTimestampSource, LocalLog, LocalLogOptions, Log, MemoryLog, ReadOnlyLocalLog, ReadOnlyLocalLogOptions}};
+use rtdb_storage::{IoRegion, LocalStore, MemoryStore, ObjectKey, ObjectStore, log::{AppendTimestampSource, LocalLog, LocalLogOptions, LocalLogSyncs, Log, MemoryLog, ReadOnlyLocalLog, ReadOnlyLocalLogOptions}};
 use rtdb_storage::disk_cache::DiskCache;
 use rtdb_types::{Anomaly, Result, SourcePosition, StorageEpoch, StorageVersion, Timestamp};
 use tokio_util::sync::CancellationToken;
@@ -260,6 +260,8 @@ pub struct NativeResources {
     local_checkpoint_vault: Option<PathBuf>,
     kafka_checkpoint_vault: Option<PathBuf>,
     io: Arc<IoRegion>,
+    /// Shared by every local log this node opens, which it takes to sit on one drive.
+    log_syncs: Arc<LocalLogSyncs>,
     memory_transaction_clock: Option<Arc<TransactionClock>>,
     local_log_clock: Arc<TransactionClock>,
     local_log_uses_clock_for_non_transactions: bool,
@@ -269,7 +271,7 @@ pub struct NativeResources {
 impl Default for NativeResources {
     fn default() -> Self {
         Self { maximum_log_message_bytes: 64 * 1024 * 1024, log_queue_capacity: 64, read_only_log: ReadOnlyLocalLogOptions::default(),
-            log_factories: BTreeMap::new(), storage_factories: BTreeMap::new(), disk_cache: None, classic_vault: None, token_kms: None, native_checkpoint_kms: None, local_checkpoint_vault: None, kafka_checkpoint_vault: None, io: IoRegion::new(),
+            log_factories: BTreeMap::new(), storage_factories: BTreeMap::new(), disk_cache: None, classic_vault: None, token_kms: None, native_checkpoint_kms: None, local_checkpoint_vault: None, kafka_checkpoint_vault: None, io: IoRegion::new(), log_syncs: LocalLogSyncs::new(),
             memory_transaction_clock: None, local_log_clock: Arc::new(|| Ok(crate::Clock::now(&crate::SystemClock))), local_log_uses_clock_for_non_transactions: false,
             serving_authorities: BTreeMap::new() }
     }
@@ -343,9 +345,9 @@ impl NativeResources {
         let timestamps = Arc::new(NativeLogTimestamps { clock: Arc::clone(&self.local_log_clock), source, use_for_non_transactions: self.local_log_uses_clock_for_non_transactions });
         let options = LocalLogOptions { maximum_message_bytes: self.maximum_log_message_bytes, queue_capacity: self.log_queue_capacity };
         let (log, driver) = if bind_lineage {
-            LocalLog::open_replica(path, options, timestamps, io, keys)?
+            LocalLog::open_replica(path, options, timestamps, io, keys, Arc::clone(&self.log_syncs))?
         } else {
-            LocalLog::open_with_key_slots(path, options, timestamps, io, keys)?
+            LocalLog::open_with_key_slots(path, options, timestamps, io, keys, Arc::clone(&self.log_syncs))?
         };
         Ok((log, Some(async move { driver.run(cancellation).await.map_err(Into::into) }.boxed())))
     }
