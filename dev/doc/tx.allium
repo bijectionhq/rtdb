@@ -613,8 +613,8 @@ value CommitOpts {
     -- grammar). Their very presence implies the transaction is Writing.
     -- The transaction's effective timezone is NOT a commit-opt: it is set by BEGIN or SET TRANSACTION as the tx's tx_default_tz (see Transaction), not deferred to COMMIT.
     --   system_time   — the system-time to record the transaction at, for an initial backfill.
-    --                   It must be strictly later than the preceding transaction's system time and no later than the source-log append observation for its record (db.allium, AdmitSuppliedSystemTime).
-    --                   An earlier or equal time aborts with invalid-system-time; a later one aborts with rtdb/future-system-time.
+    --                   It must be strictly later than the preceding transaction's system time (db.allium, AdmitSuppliedSystemTime), and as in XTDB it may lie ahead of the source-log append observation.
+    --                   An earlier or equal time aborts with invalid-system-time.
     --                   Without one, system time is the append observation, or one tick past the preceding value when the observation does not exceed it.
     --   user_metadata — per-transaction metadata.
     --                   New source-log and external submissions project user metadata in xt.txs until the installed receipt clock reaches one hour after admission.

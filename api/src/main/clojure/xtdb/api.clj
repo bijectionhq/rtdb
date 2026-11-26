@@ -287,8 +287,8 @@
 
    - :system-time
      overrides system-time for the transaction, for an initial backfill:
-     must be strictly later than the latest completed transaction's system-time
-     and no later than the time the log records for it, or the transaction aborts
+     must be strictly later than the latest completed transaction's system-time,
+     or the transaction aborts; it may be later than the time the log records for it
 
    - :default-tz
      overrides the default time zone for the transaction,
@@ -348,8 +348,8 @@
 
    - :system-time
      overrides system-time for the transaction, for an initial backfill:
-     must be strictly later than the latest completed transaction's system-time
-     and no later than the time the log records for it, or the transaction aborts
+     must be strictly later than the latest completed transaction's system-time,
+     or the transaction aborts; it may be later than the time the log records for it
 
    - :default-tz
      overrides the default time zone for the transaction,

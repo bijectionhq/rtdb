@@ -17,8 +17,6 @@
            (xtdb.api Xtdb)
            (xtdb.arrow ArrowUnloader$Mode Relation RunEndEncodedVector)))
 
-(t/use-fixtures :each tu/with-mock-clock)
-
 (def ^:private ree-iid-field
   (Field. "_iid" (FieldType/notNullable ArrowType$RunEndEncoded/INSTANCE)
           [(Field. "run_ends" (FieldType/notNullable (ArrowType$Int. 32 true)) nil)
@@ -81,12 +79,12 @@
 (defn- ingest! [node ticks]
   (doseq [tick ticks
           :let [at (.plusHours start (* tick 6))]]
-    (tu/set-log-clock! (.toInstant at))
     (xt/execute-tx node
                    (cond-> [(into [:put-docs {:into :readings, :valid-from at}]
                                   (for [id (range 30)]
                                     {:xt/id id, :value tick}))]
-                     (zero? (mod tick 10)) (conj [:delete-docs {:from :readings, :valid-from (.plusHours at 1)} 0 1 2]))))
+                     (zero? (mod tick 10)) (conj [:delete-docs {:from :readings, :valid-from (.plusHours at 1)} 0 1 2]))
+                   {:system-time (.toInstant at)}))
 
   (tu/flush-block! node)
   (c/compact-all! node #xt/duration "PT2M"))
@@ -119,8 +117,8 @@
                                {:node node})})
 
 (defn- patch! [node]
-  (tu/set-log-clock! #inst "2021-01-01")
-  (xt/execute-tx node ["PATCH INTO readings FOR VALID_TIME FROM TIMESTAMP '2020-01-03T00:00:00Z' RECORDS {_id: 7, extra: 1}"])
+  (xt/execute-tx node ["PATCH INTO readings FOR VALID_TIME FROM TIMESTAMP '2020-01-03T00:00:00Z' RECORDS {_id: 7, extra: 1}"]
+                 {:system-time #inst "2021-01-01"})
   (xt/q node "SELECT *, _valid_from, _valid_to FROM readings FOR ALL VALID_TIME WHERE _id = 7 ORDER BY _valid_from"))
 
 (defn- flight-sql-iids
@@ -152,7 +150,7 @@
             c/*ignore-signal-block?* true]
     (let [control-dir (util/->path "target/mixed-iid-encoding/control")
           mixed-dir (util/->path "target/mixed-iid-encoding/mixed")
-          opts {:rows-per-block 200, :instant-src (tu/->log-clock tu/*log-clock*)}]
+          opts {:rows-per-block 200}]
       (util/delete-dir control-dir)
       (util/delete-dir mixed-dir)
 

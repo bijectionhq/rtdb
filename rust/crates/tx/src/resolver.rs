@@ -365,7 +365,7 @@ impl TxResolver {
         let base = self.resolving_snapshot(durable)?;
         let has_owned_operations = request.operations.iter().any(Operation::is_owned);
         let default_time = self.smooth(log_time)?;
-        let supplied_time = self.supplied_time(request.options.system_time, log_time, TxId(position.0))?;
+        let supplied_time = self.supplied_time(request.options.system_time, TxId(position.0))?;
         let attempt = request.placed_attempt(position)?;
         let decision = match &context.decision_clock {
             Some(clock) => Some(clock.observe().await?),
@@ -727,20 +727,18 @@ impl TxResolver {
         Ok(TransactionKey { tx_id: TxId(position.0), system_time: self.smooth(appended)? })
     }
 
-    /// A supplied system time must be strictly later than the predecessor's and no later than the log's append time; otherwise the transaction aborts.
-    fn supplied_time(&self, requested: Option<Timestamp>, appended: Timestamp, tx_id: TxId) -> Result<std::result::Result<Option<Timestamp>, Anomaly>> {
+    /// As in XTDB, a supplied system time must be strictly later than the predecessor's, and may lie ahead of
+    /// the log's append time; otherwise the transaction aborts with `invalid-system-time`.
+    fn supplied_time(&self, requested: Option<Timestamp>, tx_id: TxId) -> Result<std::result::Result<Option<Timestamp>, Anomaly>> {
         let Some(requested) = requested else { return Ok(Ok(None)) };
-        if crate::system_time::admits_supplied_time(self.previous_system_time(), requested.0, appended.0) {
-            return Ok(Ok(Some(requested)));
-        }
-        let error = match self.resolved_head() {
-            Some(head) if !crate::system_time::advances(Some(head.system_time.0), requested.0) =>
+        match self.resolved_head() {
+            Some(head) if !crate::system_time::advances(Some(head.system_time.0), requested.0) => Ok(Err(
                 Anomaly::incorrect("invalid-system-time", "specified system-time must be later than current tx")
+                    .with_context("tx-key", tx_key_context(TransactionKey { tx_id, system_time: requested })?)
                     .with_context("latest-completed-tx", tx_key_context(head)?),
-            _ => Anomaly::incorrect("rtdb/future-system-time", "specified system-time is later than the source-log timestamp")
-                .with_context("log-time", transit::to_json_value(&T::instant(appended.into())?)?),
-        };
-        Ok(Err(error.with_context("tx-key", tx_key_context(TransactionKey { tx_id, system_time: requested })?)))
+            )),
+            _ => Ok(Ok(Some(requested))),
+        }
     }
 
     fn smooth(&self, candidate: Timestamp) -> Result<Timestamp> {

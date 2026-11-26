@@ -631,13 +631,13 @@ def verify_system_time(args, scratch):
         "admit-an-equal-time": (
             "| some floor => decide (floor < requested)",
             "| some floor => decide (floor ≤ requested)",
-            ["an_admitted_time_follows_its_predecessor_and_not_the_clock", "catalog_and_explicit_refusals_use_the_same_clock",
+            ["an_admitted_time_follows_its_predecessor", "catalog_and_explicit_refusals_use_the_same_clock",
              "chosen_time_advances"],
         ),
-        "admit-a-future-time": (
-            "| none => true) && decide (requested ≤ clock)",
-            "| none => true)",
-            ["an_admitted_time_follows_its_predecessor_and_not_the_clock", "catalog_and_explicit_refusals_use_the_same_clock"],
+        "refuse-a-future-time": (
+            "| some floor => decide (floor < requested)",
+            "| some floor => decide (floor < requested) && decide (requested ≤ 25)",
+            ["catalog_and_explicit_refusals_use_the_same_clock"],
         ),
     }
     verify_lean_model(args, scratch, path, "system-time", controls, 6)

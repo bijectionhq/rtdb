@@ -176,20 +176,23 @@
     (binding [c/*page-size* 32
               cat/*file-size-target* (* 1024 16)
               c/*ignore-signal-block?* true]
-      (util/with-open [node (tu/->local-node {:node-dir node-dir, :rows-per-block 120, :instant-src (tu/->log-clock tu/*log-clock*)})]
+      (util/with-open [node (tu/->local-node {:node-dir node-dir, :rows-per-block 120})]
         (doseq [tick (range 25)
                 [batch-idx batch] (map-indexed vector (->> (range 100)
                                                            (partition-all 64)))
                 :let [tick-at (-> (time/->zdt #inst "2020-01-01") (.plusHours (* tick 12)))
+                      ;; distinct system-time per batch within a tick — the indexer rejects
+                      ;; txs whose system-time equals the previous one (smoothing collision).
                       tx-st (.plusNanos tick-at (* batch-idx 1000))]]
-          (tu/set-log-clock! tx-st)
           (xt/execute-tx node [(into [:put-docs {:into :readings, :valid-from tick-at, :valid-to (.plusHours tick-at 12)}]
                                      (for [x batch]
                                        {:xt/id x, :reading tick}))
 
                                (into [:put-docs {:into :prices, :valid-from tick-at}]
                                      (for [x batch]
-                                       {:xt/id x, :price tick}))]))
+                                       {:xt/id x, :price tick}))]
+
+                         {:system-time tx-st}))
 
         (c/compact-all! node #xt/duration "PT60S")
 
@@ -210,19 +213,19 @@
               cat/*file-size-target* (* 1024 16)
               c/*ignore-signal-block?* true]
       ;; TODO(#6263): recency branching won't need the opt-in
-      (util/with-open [node (tu/->local-node {:node-dir node-dir, :opt-in-221? true, :instant-src (tu/->log-clock tu/*log-clock*)})]
+      (util/with-open [node (tu/->local-node {:node-dir node-dir, :opt-in-221? true})]
         (doseq [block (partition-all 6 (range 24))]
           (doseq [tick block
                   :let [tick-at (.plusHours start tick)]]
-            (tu/set-log-clock! tick-at)
             (xt/execute-tx node [(into [:put-docs :readings]
                                        (for [x (range 4)]
-                                         {:xt/id x, :reading tick}))])
+                                         {:xt/id x, :reading tick}))]
+                           {:system-time tick-at})
 
             (when (= 18 tick)
               (doseq [n (range 1 13)]
-                (tu/set-log-clock! (.plusMinutes tick-at (* n 4)))
-                (xt/execute-tx node [[:put-docs :readings {:xt/id :solo, :reading n}]]))))
+                (xt/execute-tx node [[:put-docs :readings {:xt/id :solo, :reading n}]]
+                               {:system-time (.plusMinutes tick-at (* n 4))}))))
 
           (tu/flush-block! node))
 

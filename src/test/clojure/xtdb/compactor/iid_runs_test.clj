@@ -7,7 +7,7 @@
            (org.apache.arrow.vector.types.pojo ArrowType$RunEndEncoded)
            (xtdb.arrow Relation RunEndEncodedVector)))
 
-(t/use-fixtures :each tu/with-allocator tu/with-mock-clock)
+(t/use-fixtures :each tu/with-allocator)
 
 (defn- foo-l1-data-files [^Path node-dir]
   (with-open [paths (Files/walk node-dir (make-array FileVisitOption 0))]
@@ -30,10 +30,10 @@
             (range (.getPageCount loader)))))
 
 (defn- compact! [node-dir node-opts]
-  (with-open [node (tu/->local-node (into {:node-dir node-dir, :instant-src (tu/->log-clock tu/*log-clock*)} node-opts))]
+  (with-open [node (tu/->local-node (into {:node-dir node-dir} node-opts))]
     (doseq [[v system-time] [[0 #inst "2020-01-01"] [1 #inst "2020-01-02"] [2 #inst "2020-01-03"]]]
-      (tu/set-log-clock! system-time)
-      (xt/execute-tx node [(into [:put-docs :foo] (for [id (range 20)] {:xt/id id, :v v}))]))
+      (xt/execute-tx node [(into [:put-docs :foo] (for [id (range 20)] {:xt/id id, :v v}))]
+                     {:system-time system-time}))
     (tu/flush-block! node)
     (c/compact-all! node #xt/duration "PT5S")
 

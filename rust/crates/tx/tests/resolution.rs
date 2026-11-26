@@ -97,26 +97,31 @@ async fn ordinary_sql_asserts_the_ordered_ceiling_and_places_offsets_from_the_sa
 }
 
 #[tokio::test]
-async fn a_supplied_system_time_commits_only_strictly_after_its_predecessor_and_not_ahead_of_the_log() {
+async fn a_supplied_system_time_commits_only_strictly_after_its_predecessor_even_ahead_of_the_log() {
     use rtdb_format::envelope::SourceMessage;
 
     let context = context();
     let state = PartitionState::empty(Default::default()).unwrap();
     let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
-    let at = |time| {
-        let source = SourceTransaction::new(vec![put(&context, time, 0, i64::MAX)], SubmitOptions { system_time: Some(Timestamp(time)), ..Default::default() }, &context.memory).unwrap();
+    let at = |value, time: Option<i64>| {
+        let source = SourceTransaction::new(vec![put(&context, value, 0, i64::MAX)], SubmitOptions { system_time: time.map(Timestamp), ..Default::default() }, &context.memory).unwrap();
         let encoded = source.encode().unwrap();
         SourceTransaction::decode(&SourceMessage::decode(encoded.as_slice()).unwrap().unwrap(), &context.memory).unwrap()
     };
+    // As in XTDB: a supplied time later than the log's append time commits, and the transactions after it take
+    // system times one tick past it until the log catches up; only a time that does not advance aborts.
     for (position, appended, requested, outcome, system_time) in [
-        (0, 100, 50, None, 50),
-        (1, 100, 60, None, 60),
-        (2, 100, 60, Some("invalid-system-time"), 100),
-        (3, 150, 99, Some("invalid-system-time"), 150),
-        (4, 200, 201, Some("rtdb/future-system-time"), 200),
-        (5, 250, 250, None, 250),
+        (0, 100, Some(50), None, 50),
+        (1, 100, Some(60), None, 60),
+        (2, 100, Some(60), Some("invalid-system-time"), 100),
+        (3, 150, Some(99), Some("invalid-system-time"), 150),
+        (4, 200, Some(1_000), None, 1_000),
+        (5, 250, Some(1_000), Some("invalid-system-time"), 1_001),
+        (6, 300, None, None, 1_002),
+        (7, 350, Some(1_003), None, 1_003),
+        (8, 2_000, None, None, 2_000),
     ] {
-        let resolved = resolver.resolve_source(state.value().snapshot(), SourcePosition(position), Timestamp(appended), at(requested), &context).await.unwrap();
+        let resolved = resolver.resolve_source(state.value().snapshot(), SourcePosition(position), Timestamp(appended), at(position, requested), &context).await.unwrap();
         assert_eq!(resolved.result().error().map(|error| error.code.as_str()), outcome, "position {position}");
         assert_eq!(resolved.result().tx_key().system_time, Timestamp(system_time), "position {position}");
         assert_eq!(resolved.writes().tables().contains_key(&table()), outcome.is_none(), "position {position}");
@@ -126,7 +131,7 @@ async fn a_supplied_system_time_commits_only_strictly_after_its_predecessor_and_
 }
 
 #[tokio::test]
-async fn an_external_writer_time_steps_past_its_predecessor_and_back_from_the_future() {
+async fn an_external_writer_time_steps_past_its_predecessor_and_keeps_a_future_time() {
     struct Commit;
     #[async_trait::async_trait]
     impl TransactionWriter for Commit {
@@ -136,7 +141,9 @@ async fn an_external_writer_time_steps_past_its_predecessor_and_back_from_the_fu
     let context = context();
     let state = PartitionState::empty(Default::default()).unwrap();
     let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
-    for (now, requested, system_time) in [(100, Some(50), 50), (100, Some(50), 51), (100, Some(40), 52), (100, Some(500), 100), (200, None, 200)] {
+    for (now, requested, system_time) in [
+        (100, Some(50), 50), (100, Some(50), 51), (100, Some(40), 52), (100, Some(500), 500), (200, None, 501), (600, None, 600),
+    ] {
         let resolved = resolver.resolve_external(state.value().snapshot(), Timestamp(now), requested.map(Timestamp), None, &mut Commit, &context).await.unwrap();
         assert!(resolved.result().committed(), "{:?}", resolved.result());
         assert_eq!(resolved.result().tx_key().system_time, Timestamp(system_time));

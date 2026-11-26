@@ -210,21 +210,20 @@ internal class TxResolver(
             if (lcSysTime >= msgTimestamp) lcSysTime.plusNanos(1_000) else null
         } ?: msgTimestamp
 
-        // The aborted tx-key takes the default system-time, not the rejected one, so it still advances the clock.
-        if (systemTime != null && !admitsSuppliedSystemTime(systemTime, msgTimestamp)) {
-            val txKeyData = "tx-key" to TransactionKey(msgId, systemTime)
-            val err =
-                if (lcTx != null && systemTime <= lcTx.systemTime)
-                    Incorrect(
-                        "specified system-time must be later than current tx", "invalid-system-time",
-                        mapOf(txKeyData, "latest-completed-tx" to lcTx),
-                    )
-                else
-                    Incorrect(
-                        "specified system-time is later than the source-log timestamp", "rtdb/future-system-time",
-                        mapOf(txKeyData, "log-time" to msgTimestamp),
-                    )
-            LOG.warn { "[$dbName] rejecting specified system-time '$systemTime': ${err.message}" }
+        // Equal is rejected as well as older — a read basis names a tx by its system-time, so two txs
+        // sharing one leaves it ambiguous (#6086).
+        // The aborted tx-key uses the *default* (smoothed) systemTime, not the rejected one,
+        // so the tx-key still satisfies the monotonicity invariant.
+        if (systemTime != null && lcTx != null && systemTime <= lcTx.systemTime) {
+            val err = Incorrect(
+                "specified system-time must be later than current tx",
+                "invalid-system-time",
+                mapOf(
+                    "tx-key" to TransactionKey(msgId, systemTime),
+                    "latest-completed-tx" to lcTx,
+                ),
+            )
+            LOG.warn { "specified system-time '$systemTime' not later than current tx '$lcTx'" }
 
             return@withSpan stageStandaloneTx(
                 msgId, TransactionKey(msgId, defaultSystemTime), err, userMetadataMap, countError = true
@@ -320,18 +319,6 @@ internal class TxResolver(
         }
     }
 
-    /**
-     * A supplied system-time must be strictly later than the latest completed tx's — a read basis names a tx by
-     * its system-time — and no later than [now]. A source-log tx that fails this aborts; an external source's
-     * time is stepped instead, see [externalSystemTime].
-     */
-    private fun admitsSuppliedSystemTime(systemTime: Instant, now: Instant): Boolean =
-        latestCompletedTx?.systemTime.let { it == null || systemTime > it } && systemTime <= now
-
-    private fun externalSystemTime(systemTime: Instant?, now: Instant): Instant =
-        if (systemTime != null && admitsSuppliedSystemTime(systemTime, now)) systemTime
-        else smoothSystemTime(minOf(systemTime ?: now, now))
-
     private fun smoothSystemTime(systemTime: Instant): Instant {
         val lct = latestCompletedTx?.systemTime ?: return systemTime
         val floor = fromMicros(lct.asMicros + 1)
@@ -349,7 +336,7 @@ internal class TxResolver(
     suspend fun indexTx(msg: ExtSourceMessage): ResolvedTx {
         val txKey = TransactionKey(
             (latestCompletedTx?.txId ?: -1) + 1,
-            externalSystemTime(msg.systemTime, instantSource.instant())
+            smoothSystemTime(msg.systemTime ?: instantSource.instant())
         )
 
         var openTx = openTx(txKey, msg.externalSourceToken)

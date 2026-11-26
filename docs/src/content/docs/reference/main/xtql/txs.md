@@ -218,4 +218,4 @@ Transaction options are an optional map of the following keys:
 ```
 
 `:system-time` overrides the system-time of the transaction, for an initial backfill — the same rule as SQL's [`SYSTEM_TIME`](/reference/main/sql/txs#set-transaction-v22) applies.
-It must be strictly later than the system-time of the latest completed transaction and no later than the time the log records for the transaction; otherwise the transaction aborts.
+It must be strictly later than the system-time of the latest completed transaction, otherwise the transaction aborts with `invalid-system-time`; it may be later than the time the log records for the transaction.

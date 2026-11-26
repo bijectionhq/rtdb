@@ -4989,7 +4989,7 @@ async fn a_private_replay_marker_covers_out_of_order_samples_and_survives_restar
 }
 
 #[tokio::test]
-async fn a_backfill_commits_at_each_supplied_system_time_and_refuses_one_not_strictly_later_or_ahead_of_the_log() {
+async fn a_supplied_system_time_commits_even_ahead_of_the_log_and_refuses_one_not_strictly_later() {
     let (node, driver) = running(options(), services()).await;
     let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
     let at = |time| AutonomousTxOptions { system_time: Some(Timestamp(time)), ..Default::default() };
@@ -5005,14 +5005,29 @@ async fn a_backfill_commits_at_each_supplied_system_time_and_refuses_one_not_str
     assert!(second.committed(), "{:?}", second.error());
     assert_eq!(second.tx_key().system_time, Timestamp(200));
 
-    for (requested, code) in [(200, "invalid-system-time"), (150, "invalid-system-time"), (i64::MAX / 2, "rtdb/future-system-time")] {
+    for requested in [200, 150] {
         let refused = session.state_mut().execute_tx(vec![put(&node, 1, requested)], at(requested)).await.unwrap();
-        assert_eq!(refused.error().map(|error| error.code.as_str()), Some(code), "{requested}");
-        assert!(refused.tx_key().system_time.0 > 200 && refused.tx_key().system_time.0 < i64::MAX / 2);
+        assert_eq!(refused.error().map(|error| error.code.as_str()), Some("invalid-system-time"), "{requested}");
+        assert!(refused.tx_key().system_time.0 > 200);
     }
     assert_eq!(rows(session.query_sql("SELECT value FROM docs", vec![]).await.unwrap()).await, [vec![Value::I64(20)]]);
     let between = "SELECT value FROM docs FOR SYSTEM_TIME AS OF TIMESTAMP '1970-01-01T00:00:00.00015Z'";
     assert_eq!(rows(session.query_sql(between, vec![]).await.unwrap()).await, [vec![Value::I64(10)]]);
+
+    // As in XTDB, a time ahead of the log commits, and the next default time follows it by one tick.
+    let future = 4_102_444_800_000_000; // 2100-01-01T00:00:00Z
+    let ahead = session.state_mut().execute_tx(vec![put(&node, 1, 30)], at(future)).await.unwrap();
+    assert!(ahead.committed(), "{:?}", ahead.error());
+    assert_eq!(ahead.tx_key().system_time, Timestamp(future));
+    let tied = session.state_mut().execute_tx(vec![put(&node, 1, 35)], at(future)).await.unwrap();
+    assert_eq!(tied.error().map(|error| error.code.as_str()), Some("invalid-system-time"));
+    assert_eq!(tied.tx_key().system_time, Timestamp(future + 1));
+    let next = session.state_mut().execute_tx(vec![put(&node, 1, 40)], AutonomousTxOptions::default()).await.unwrap();
+    assert!(next.committed(), "{:?}", next.error());
+    assert_eq!(next.tx_key().system_time, Timestamp(future + 2));
+    let latest = "SELECT value FROM docs FOR VALID_TIME AS OF TIMESTAMP '2100-01-01T00:00:00.000002Z' \
+        FOR SYSTEM_TIME AS OF TIMESTAMP '2100-01-01T00:00:00.000002Z'";
+    assert_eq!(rows(session.query_sql(latest, vec![]).await.unwrap()).await, [vec![Value::I64(40)]]);
     drop(session);
     stop(&node, driver).await;
 }

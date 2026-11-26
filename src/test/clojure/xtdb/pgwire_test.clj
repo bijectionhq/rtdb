@@ -1293,7 +1293,6 @@
         "version would have been 1 if snapshot was not set")))
 
 (t/deftest test-setting-import-system-time-3616
-  (tu/set-log-clock! #inst "2022-01-01")
   (with-open [conn (jdbc-conn)]
     (let [sql #(q conn [%])]
       (t/testing "as part of START TRANSACTION"
@@ -1321,23 +1320,15 @@
         (q conn ["BEGIN READ WRITE WITH (SYSTEM_TIME ?)" "2021-08-02Z"])
         (sql "INSERT INTO foo (_id, version) VALUES ('foo', 2)")
         (t/is (thrown-with-msg? PSQLException #"specified system-time must be later than current tx"
-                                (sql "COMMIT"))))
-
-      (t/testing "future system time"
-        (sql "BEGIN READ WRITE WITH (SYSTEM_TIME = TIMESTAMP '2100-01-01T00:00:00Z')")
-        (sql "INSERT INTO foo (_id, version) VALUES ('foo', 3)")
-        (t/is (thrown-with-msg? PSQLException #"specified system-time is later than the source-log timestamp"
                                 (sql "COMMIT")))))))
 
 (t/deftest a-system-time-equal-to-the-latest-completed-tx-is-rejected
   (with-open [conn (jdbc-conn)]
     (let [sql #(q conn [%])]
-      (tu/set-log-clock! #inst "2026-01-01")
       (sql "BEGIN READ WRITE WITH (SYSTEM_TIME = TIMESTAMP '2026-01-01T00:00:00Z')")
       (sql "INSERT INTO t (_id, v) VALUES (1, 'a')")
       (sql "COMMIT")
 
-      (tu/set-log-clock! #inst "2026-01-01")
       (sql "BEGIN READ WRITE WITH (SYSTEM_TIME = TIMESTAMP '2026-01-01T00:00:00Z')")
       (sql "INSERT INTO t (_id, v) VALUES (1, 'b')")
       (t/is (thrown-with-msg? PSQLException #"specified system-time must be later than current tx"

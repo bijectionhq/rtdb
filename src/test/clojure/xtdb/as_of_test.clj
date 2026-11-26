@@ -116,12 +116,12 @@
                      (q-ids "SELECT _id FROM docs FOR SYSTEM_TIME FROM TIMESTAMP '2020-01-01Z' TO TIMESTAMP '2020-01-01T12:00:00Z'"))
                   (str "window ending before the erase, " when-str)))]
 
-    (tu/set-log-clock! #inst "2020-01-01")
-    (xt/execute-tx tu/*node* [[:put-docs :docs {:xt/id :doc} {:xt/id :other-doc}]])
+    (xt/execute-tx tu/*node* [[:put-docs :docs {:xt/id :doc} {:xt/id :other-doc}]]
+                   {:system-time #inst "2020-01-01"})
     (tu/flush-block! tu/*node*)
 
-    (tu/set-log-clock! #inst "2020-01-03")
-    (xt/execute-tx tu/*node* [[:erase-docs :docs :doc]])
+    (xt/execute-tx tu/*node* [[:erase-docs :docs :doc]]
+                   {:system-time #inst "2020-01-03"})
     (check! "erase in the live index")
 
     (tu/flush-block! tu/*node*)

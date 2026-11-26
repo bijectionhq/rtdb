@@ -15,18 +15,18 @@ def automatic (maximum : Int) (previous : Option Int) (clock : Int) : Option Int
     else some clock
   | none => some clock
 
--- A supplied time must be strictly later than its predecessor's and no later than the clock.
-def admitsSupplied (previous : Option Int) (clock requested : Int) : Bool :=
-  (match previous with
-   | some floor => decide (floor < requested)
-   | none => true) && decide (requested ≤ clock)
+-- As in XTDB, a supplied time must be strictly later than its predecessor's; it may lead the clock.
+def admitsSupplied (previous : Option Int) (requested : Int) : Bool :=
+  match previous with
+  | some floor => decide (floor < requested)
+  | none => true
 
 def chosen (maximum : Int) (previous : Option Int) : Request → Option Int
   | .automatic clock => automatic maximum previous clock
   | .catalog clock => automatic maximum previous clock
   | .explicit clock requested =>
     (automatic maximum previous clock).map fun fallback =>
-      if admitsSupplied previous clock requested then requested else fallback
+      if admitsSupplied previous requested then requested else fallback
 
 def trace (maximum : Int) (previous : Option Int) : List Request → List Int
   | [] => []
@@ -54,16 +54,16 @@ theorem chosen_time_advances (selected : chosen maximum (some previous) request 
     cases fallback : automatic maximum (some previous) clock with
     | none => simp [chosen, fallback] at selected
     | some next =>
-      by_cases admitted : admitsSupplied (some previous) clock requested = true
+      by_cases admitted : admitsSupplied (some previous) requested = true
       · simp [chosen, fallback, admitted] at selected
         simp [admitsSupplied] at admitted
         omega
       · simp [chosen, fallback, admitted] at selected
         exact selected ▸ automatic_advances fallback
 
-theorem an_admitted_time_follows_its_predecessor_and_not_the_clock
-    (admitted : admitsSupplied (some previous) clock requested = true) :
-    previous < requested ∧ requested ≤ clock := by
+theorem an_admitted_time_follows_its_predecessor
+    (admitted : admitsSupplied (some previous) requested = true) :
+    previous < requested := by
   simp [admitsSupplied] at admitted
   omega
 
@@ -117,11 +117,11 @@ theorem completed_prefix_can_seed_replay (maximum : Int) (previous : Option Int)
 
 theorem catalog_and_explicit_refusals_use_the_same_clock :
     trace 100 none [.explicit 10 5, .catalog 2, .explicit 20 6, .explicit 20 7, .explicit 20 30,
-      .explicit 30 25, .automatic 8] = [5, 6, 20, 21, 22, 25, 26] := by
+      .explicit 30 25, .automatic 8] = [5, 6, 20, 21, 30, 31, 32] := by
   decide
 
 #print axioms chosen_time_advances
-#print axioms an_admitted_time_follows_its_predecessor_and_not_the_clock
+#print axioms an_admitted_time_follows_its_predecessor
 #print axioms staged_times_increase
 #print axioms a_fresh_trace_is_ordered
 #print axioms completed_prefix_can_seed_replay

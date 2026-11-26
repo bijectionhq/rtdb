@@ -8,7 +8,7 @@ The second review's Multi serving and custody boundaries extend that design.
 == Owner decisions
 
 * The resolver assigns system time from the authenticated source-log append observation and the preceding history coordinate. Owned publications use distinct history coordinates.
-* A client-supplied system time must be strictly later than the preceding system time and cannot lead the authenticated source-log append observation for the original request; otherwise the transaction aborts.
+* A client-supplied system time must be strictly later than the preceding system time, otherwise the transaction aborts; as in XTDB, it may lead the source-log append observation, and later automatic assignments are smoothed past it.
 * An await token establishes a causal lower bound.
   A system-time cap filters the chosen prefix, and a fresh admission can include later corrections below that cap.
   An issued exact snapshot token identifies the same applied cut on every successful re-admission under current authorization, retention and custody.
@@ -30,7 +30,7 @@ A decision's identity and serialization order use its authenticated history, par
 Operation ordinals preserve the original order within each decision.
 Temporal SQL system time is nondecreasing and may tie.
 An automatic assignment uses the maximum of the previous system time and the original append observation, or the append observation at genesis.
-A corrected external hint retains its provenance and follows the same explicit bound if admitted as system time.
+A corrected external hint retains its provenance and is admitted as system time under the same rule, stepped past the preceding system time when it does not advance it.
 Resolve SQL precedence inside a selected positional cut, filtering by system and valid time, and resolve equal system times by position and ordinal.
 Equal-time overwritten events remain identifiable at their positional cuts.
 A superseded equal-time event has no positive-length SQL system-time interval.

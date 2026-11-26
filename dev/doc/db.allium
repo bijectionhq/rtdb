@@ -1227,7 +1227,8 @@ rule LeaderProcessesTx {
         -- Without a supplied system time, the resolver assigns system time from the source append observation, smoothed one tick past the preceding transaction's when it does not exceed it.
         -- A supplied system time that AdmitSuppliedSystemTime admits becomes the transaction's system time unchanged.
         -- One it refuses aborts the transaction before any operation is evaluated, under the system time it would have had without one.
-        -- The abort is incorrect: invalid-system-time when the time does not follow the preceding transaction's, rtdb/future-system-time when it follows the append observation.
+        -- The abort is incorrect, with code invalid-system-time.
+        -- As in XTDB, a supplied system time may follow the append observation; later transactions without one are then smoothed one tick past it.
         -- A supplied system time is refused on a clock-slot, prepared-landing or hosted-capacity transaction.
         -- A version-one bounded application retry carries an exclusive cutoff and a nonce in a dedicated source field.
         -- Its engine advances the stored retry clock by the maximum of the preceding retry clock and the current bounded request's log timestamp.
@@ -1729,8 +1730,8 @@ rule ExternalSourceIndexesTx {
     -- It may await the result or not; the indexing below is identical either way, and the difference is caller-side.
     --
     -- Unlike a client-driven transaction, tx_id here is assigned off the RESOLVED head, not off a source-log position and not off the durable head.
-    -- A system_time that AdmitSuppliedSystemTime admits against the resolver's clock is used unchanged.
-    -- Any other is stepped rather than refused: the earlier of it and the clock, smoothed strictly greater than the previous transaction's.
+    -- A system_time that AdmitSuppliedSystemTime admits is used unchanged, even one ahead of the resolver's clock.
+    -- Any other is stepped rather than refused: smoothed strictly greater than the previous transaction's, as is the resolver's clock when the source supplies none.
     --
     -- The caller's handle completes on READ-BACK (LeaderAppliesOwnTx), so it means durably replicated AND confirmed unfenced.
     -- Every path on which the transaction will never be applied MUST fail it instead, or the caller waits forever — see live-index.allium.
@@ -2354,8 +2355,8 @@ surface QueryAccess {
 
 deferred AdmitSuppliedSystemTime
   -- The one admission rule for a caller-supplied system time, shared by the source log and an external source.
-  -- A supplied time is admitted when it is strictly later than the resolved head's system time and no later than now.
-  -- For a source-log transaction, now is the record's append observation; for an external source, the resolver's clock.
+  -- A supplied time is admitted when it is strictly later than the resolved head's system time, as in XTDB.
+  -- It is not bounded by now (the record's append observation, or the external source's clock): a supplied time ahead of now is admitted, and the automatic times after it are smoothed one tick past it until now overtakes it.
   -- Strictness is what lets a read basis name a transaction by its system time, so a backfill that submits several transactions gives each its own.
   -- The two paths differ only in what follows a refusal: a source-log transaction aborts, an external source's time is stepped.
 

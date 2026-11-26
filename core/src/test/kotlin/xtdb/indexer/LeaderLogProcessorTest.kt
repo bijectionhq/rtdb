@@ -338,7 +338,7 @@ internal class LeaderLogProcessorTest : LeaderTermTest() {
     }
 
     @Test
-    fun `an external writer's system time steps past its predecessor and back from the future`() =
+    fun `an external writer's system time steps past its predecessor and keeps a future time`() =
         runTest(timeout = 5.seconds) {
             val lp = leaderProc(StandardTestDispatcher(testScheduler))
 
@@ -350,9 +350,9 @@ internal class LeaderLogProcessorTest : LeaderTermTest() {
             assertEquals(upstream.plusNanos(1_000), commitAt(upstream))
             assertEquals(upstream.plusNanos(2_000), commitAt(upstream.minusSeconds(1)))
 
-            val before = Instant.now()
-            val clamped = commitAt(before.plusSeconds(86_400))
-            assertTrue(clamped >= before && clamped <= Instant.now(), "a future time is clamped to now: $clamped")
+            val future = Instant.now().plusSeconds(86_400).truncatedTo(java.time.temporal.ChronoUnit.MICROS)
+            assertEquals(future, commitAt(future), "as in XTDB, a future time is kept")
+            assertEquals(future.plusNanos(1_000), commitAt(null), "and the clock is smoothed past it")
         }
 
     @Test

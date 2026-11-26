@@ -142,11 +142,9 @@
                         '(from :xt/txs [{:xt/id tx-id, :committed committed?} system-time error])))))))
 
 (t/deftest a-system-time-equal-to-the-latest-completed-tx-is-rejected
-  (tu/set-log-clock! #inst "2026-01-01")
   (xt/execute-tx *conn* [[:sql "INSERT INTO docs (_id, v) VALUES (1, 'a')"]]
                  {:system-time #inst "2026-01-01"})
 
-  (tu/set-log-clock! #inst "2026-01-01")
   (t/is (anomalous? [:incorrect :invalid-system-time]
                     (xt/execute-tx *conn* [[:sql "INSERT INTO docs (_id, v) VALUES (1, 'b')"]]
                                    {:system-time #inst "2026-01-01"})))
@@ -161,16 +159,6 @@
                  {:system-time #xt/instant "2026-01-01T00:00:00.000002Z"})
 
   (t/is (= [{:v "c"}] (xt/q *conn* "SELECT v FROM docs"))))
-
-(t/deftest a-system-time-later-than-the-log-is-rejected
-  (tu/set-log-clock! #inst "2026-01-01")
-  (t/is (anomalous? [:incorrect :rtdb/future-system-time]
-                    (xt/execute-tx *conn* [[:sql "INSERT INTO docs (_id, v) VALUES (1, 'a')"]]
-                                   {:system-time #xt/instant "2026-01-01T00:00:00.000001Z"})))
-
-  (t/is (= [{:tx-id 0, :system-time #xt/zoned-date-time "2026-01-01T00:00Z[UTC]"}]
-           (xt/q *conn* "SELECT _id AS tx_id, system_time FROM xt.txs WHERE NOT committed"))
-        "the rejected tx takes the log's system-time"))
 
 (t/deftest the-log-assigns-system-time-and-smooths-a-tie-past-the-latest-completed-tx
   (tu/set-log-clock! #inst "2026-01-01")

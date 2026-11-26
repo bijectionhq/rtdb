@@ -30,40 +30,18 @@ pub(crate) fn automatic_time(previous: Option<i64>, candidate: i64) -> Option<i6
     }
 }
 
-/// A supplied system time is admitted only when it advances the history and does not run ahead of now.
+/// An external writer's time: its supplied time, or now when it supplies none,
+/// stepped one tick past the predecessor when it does not advance it. As in
+/// XTDB, a supplied time may lie ahead of now.
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
-    ensures out == (match previous {
-        Some(last) => last < candidate,
-        None => true,
-    } && candidate <= now),
-))]
-pub(crate) fn admits_supplied_time(previous: Option<i64>, candidate: i64, now: i64) -> bool {
-    advances(previous, candidate) && candidate <= now
-}
-
-/// An external writer's time: its supplied time when admitted, otherwise the
-/// earlier of that time and now, stepped past the predecessor.
-#[cfg_attr(verus_keep_ghost, verus_spec(out =>
-    ensures out == match supplied {
-        Some(candidate) if match previous { Some(last) => last < candidate, None => true } && candidate <= now =>
-            Some(candidate),
-        Some(candidate) => match previous {
-            Some(last) if (if candidate < now { candidate } else { now }) <= last =>
-                if last < i64::MAX { Some((last + 1) as i64) } else { None },
-            _ => Some(if candidate < now { candidate } else { now }),
-        },
-        None => match previous {
-            Some(last) if now <= last => if last < i64::MAX { Some((last + 1) as i64) } else { None },
-            _ => Some(now),
-        },
+    ensures out == match previous {
+        Some(last) if (match supplied { Some(candidate) => candidate, None => now }) <= last =>
+            if last < i64::MAX { Some((last + 1) as i64) } else { None },
+        _ => Some(match supplied { Some(candidate) => candidate, None => now }),
     },
 ))]
 pub(crate) fn external_time(previous: Option<i64>, supplied: Option<i64>, now: i64) -> Option<i64> {
-    match supplied {
-        Some(candidate) if admits_supplied_time(previous, candidate, now) => Some(candidate),
-        Some(candidate) => automatic_time(previous, if candidate < now { candidate } else { now }),
-        None => automatic_time(previous, now),
-    }
+    automatic_time(previous, match supplied { Some(candidate) => candidate, None => now })
 }
 
 const CLOCK_SLOT_WIDTH: i64 = 1_000_000;
@@ -207,7 +185,18 @@ mod tests {
     use rtdb_types::{Timestamp, TransactionKey, TxId};
 
     use crate::{DecisionObservation, OwnedClockSlot};
-    use super::{clock_slot_reading, clock_slot_time, clock_slot_wait};
+    use super::{advances, clock_slot_reading, clock_slot_time, clock_slot_wait, external_time};
+
+    #[test]
+    fn a_supplied_time_ahead_of_now_is_kept_as_in_xtdb() {
+        assert!(advances(Some(100), 10_000));
+        assert!(!advances(Some(100), 100));
+        assert_eq!(external_time(Some(100), Some(10_000), 200), Some(10_000));
+        assert_eq!(external_time(Some(10_000), None, 200), Some(10_001));
+        assert_eq!(external_time(Some(10_000), Some(150), 200), Some(10_001));
+        assert_eq!(external_time(Some(100), None, 200), Some(200));
+        assert_eq!(external_time(Some(i64::MAX), None, 200), None);
+    }
 
     #[test]
     fn clock_slot_wait_admits_every_reading_a_slot_can_offer() {

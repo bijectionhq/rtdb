@@ -1,4 +1,4 @@
-use crate::production::{acceptance_relative_time, accepts_clock_lineage, clock_slot_admits, next_grid_reading, owned_deadline_is_live, owned_point_matches, original_funded_seat, advances, automatic_time, admits_supplied_time, external_time};
+use crate::production::{acceptance_relative_time, accepts_clock_lineage, clock_slot_admits, next_grid_reading, owned_deadline_is_live, owned_point_matches, original_funded_seat, advances, automatic_time, external_time};
 use vstd::prelude::*;
 
 verus! {
@@ -46,28 +46,29 @@ pub fn the_maximum_cannot_be_advanced(candidate: i64) {
 }
 
 // LAW TIME-SUPPLIED-STRICT. A supplied time that does not follow its predecessor's is refused.
-pub fn a_supplied_time_must_follow_its_predecessor(previous: i64, candidate: i64, now: i64)
+pub fn a_supplied_time_must_follow_its_predecessor(previous: i64, candidate: i64)
     requires candidate <= previous,
 {
-    let admitted = admits_supplied_time(Some(previous), candidate, now);
+    let admitted = advances(Some(previous), candidate);
     assert(!admitted);
 }
 
-// LAW TIME-SUPPLIED-FUTURE. A supplied time cannot lead now.
-pub fn a_supplied_time_cannot_lead_now(previous: Option<i64>, candidate: i64, now: i64)
-    requires now < candidate,
+// LAW TIME-SUPPLIED-FUTURE. As in XTDB, a supplied time that follows its predecessor is admitted however far it
+// leads now, and the automatic time after it steps one tick past it.
+pub fn a_supplied_time_may_lead_now(previous: i64, candidate: i64, now: i64)
+    requires previous < candidate, now < candidate, candidate < i64::MAX,
 {
-    let admitted = admits_supplied_time(previous, candidate, now);
-    assert(!admitted);
+    let admitted = advances(Some(previous), candidate);
+    let following = automatic_time(Some(candidate), now);
+    assert(admitted && following == Some((candidate + 1) as i64));
 }
 
-// LAW TIME-SUPPLIED-BACKFILL. A backfill time that advances and does not lead now is used unchanged.
-pub fn a_backfill_time_is_used_unchanged(previous: i64, candidate: i64, now: i64)
-    requires previous < candidate, candidate <= now,
+// LAW TIME-SUPPLIED-BACKFILL. An external time that advances is used unchanged, behind or ahead of now.
+pub fn an_advancing_external_time_is_used_unchanged(previous: i64, candidate: i64, now: i64)
+    requires previous < candidate,
 {
-    let admitted = admits_supplied_time(Some(previous), candidate, now);
     let assigned = external_time(Some(previous), Some(candidate), now);
-    assert(admitted && assigned == Some(candidate));
+    assert(assigned == Some(candidate));
 }
 
 // LAW TIME-EXTERNAL-MONOTONIC. An external source's time is stepped rather than refused, and always advances.
@@ -86,11 +87,11 @@ pub fn a_tied_external_time_steps_one_tick(previous: i64, now: i64)
     assert(assigned == Some((previous + 1) as i64));
 }
 
-// LAW TIME-EXTERNAL-FUTURE. A future external time is brought back to now.
-pub fn a_future_external_time_is_brought_back_to_now(previous: i64, candidate: i64, now: i64)
-    requires previous < now, now < candidate,
+// LAW TIME-EXTERNAL-NOW. An external writer that supplies no time takes now, stepped past its predecessor.
+pub fn an_unsupplied_external_time_takes_now(previous: i64, now: i64)
+    requires previous < now,
 {
-    let assigned = external_time(Some(previous), Some(candidate), now);
+    let assigned = external_time(Some(previous), None, now);
     assert(assigned == Some(now));
 }
 
