@@ -84,7 +84,29 @@ impl Snapshot {
     }
     /// Complete paths for compacted primaries and their recorded artefacts, and published search runs.
     /// A claim exceeding the bound retains the conservative scope.
+    /// The collectable file paths the captured catalogs name, computed once per pair of catalogs, which are replaced rather than changed.
     pub fn catalog_file_paths(&self) -> Option<Arc<[String]>> {
+        type Inventories = Vec<(std::sync::Weak<TrieCatalog>, std::sync::Weak<TableCatalog>, Option<Arc<[String]>>)>;
+        static INVENTORIES: std::sync::LazyLock<parking_lot::Mutex<Inventories>> = std::sync::LazyLock::new(Default::default);
+        const KEPT: usize = 8;
+        let held = |trie: &std::sync::Weak<TrieCatalog>, table: &std::sync::Weak<TableCatalog>| {
+            std::ptr::eq(trie.as_ptr(), Arc::as_ptr(&self.trie_catalog)) && std::ptr::eq(table.as_ptr(), Arc::as_ptr(&self.table_catalog))
+        };
+        {
+            let mut inventories = INVENTORIES.lock();
+            inventories.retain(|(trie, table, _)| trie.strong_count() > 0 && table.strong_count() > 0);
+            if let Some((_, _, paths)) = inventories.iter().find(|(trie, table, _)| held(trie, table)) { return paths.clone(); }
+        }
+        let paths = self.inventory_file_paths();
+        let mut inventories = INVENTORIES.lock();
+        if !inventories.iter().any(|(trie, table, _)| held(trie, table)) {
+            if inventories.len() >= KEPT { inventories.remove(0); }
+            inventories.push((Arc::downgrade(&self.trie_catalog), Arc::downgrade(&self.table_catalog), paths.clone()));
+        }
+        paths
+    }
+
+    fn inventory_file_paths(&self) -> Option<Arc<[String]>> {
         let mut paths = Vec::new();
         let mut bytes = 0usize;
         let mut retain = |path: String| {
@@ -368,6 +390,18 @@ mod owned_routing_tests {
         assert!(!(OwnedRoutingInventory { has_journal_tries: true, ..empty }).journal_exhausted());
         assert!(!(OwnedRoutingInventory { journal_events: 1, ..empty }).journal_exhausted());
     }
+}
+
+#[test]
+fn catalog_file_paths_are_computed_once_per_pair_of_catalogs() {
+    let live = Arc::new(LiveIndex::new(BlockIndex(0), None, rtdb_trie::TrieConfig::default()));
+    let (trie, table) = (Arc::new(TrieCatalog::default()), Arc::new(TableCatalog::default()));
+    let first = Snapshot::new(Arc::clone(&trie), Arc::clone(&table), Arc::clone(&live)).catalog_file_paths().unwrap();
+    let again = Snapshot::new(Arc::clone(&trie), Arc::clone(&table), Arc::clone(&live)).catalog_file_paths().unwrap();
+    assert!(Arc::ptr_eq(&first, &again));
+    let replaced = Snapshot::new(Arc::new(TrieCatalog::default()), table, live).catalog_file_paths().unwrap();
+    assert!(!Arc::ptr_eq(&first, &replaced), "a replaced catalog has its own inventory");
+    assert_eq!(first, replaced);
 }
 
 #[test]
