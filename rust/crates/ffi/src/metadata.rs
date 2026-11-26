@@ -140,7 +140,7 @@ pub(crate) fn objects_schema() -> Schema {
 }
 fn info(codes: Option<&[u32]>, memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<OwnedBatch> {
     let reservation = memory.reserve(131_072)?;
-    let entries = [(0, "XTDB"), (1, env!("CARGO_PKG_VERSION")), (100, "XTDB ADBC Driver"), (101, env!("CARGO_PKG_VERSION"))];
+    let entries = [(0, "XTDB"), (1, rtdb_types::runtime_version()), (100, "XTDB ADBC Driver"), (101, rtdb_types::runtime_version())];
     let entries: Vec<_> = entries.into_iter().filter(|(code, _)| codes.is_none_or(|codes| codes.contains(code))).collect();
     let map = DataType::Map(Arc::new(Field::new("entries", DataType::Struct(vec![Field::new("key", DataType::Int32, false), Field::new("value", DataType::Int32, true)].into()), false)), false);
     let fields: Vec<_> = [("string_value", DataType::Utf8), ("bool_value", DataType::Boolean), ("int64_value", DataType::Int64), ("int32_bitmask", DataType::Int32), ("string_list", DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))), ("int32_to_int32_list_map", map)].into_iter().map(|(name, ty)| Arc::new(Field::new(name, ty, true))).collect();
@@ -220,4 +220,17 @@ fn struct_fields(list: &Field) -> &arrow_schema::Fields {
     let DataType::List(child) = list.data_type() else { unreachable!() };
     let DataType::Struct(fields) = child.data_type() else { unreachable!() };
     fields
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_array::{UnionArray, cast::AsArray};
+
+    #[test]
+    fn adbc_vendor_and_driver_versions_are_the_runtime_version() {
+        let memory = rtdb_columnar::MemoryBudget::new(1 << 20);
+        let batch = super::info(Some(&[1, 101]), &memory).unwrap();
+        let union = batch.batch().column(1).as_any().downcast_ref::<UnionArray>().unwrap();
+        assert_eq!(union.child(0).as_string::<i32>().iter().collect::<Vec<_>>(), [Some(rtdb_types::runtime_version()); 2]);
+    }
 }

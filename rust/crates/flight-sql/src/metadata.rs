@@ -29,7 +29,7 @@ impl Service {
     fn sql_info(&self) -> Result<SqlInfoData, Status> {
         let mut builder = SqlInfoDataBuilder::new();
         builder.append(SqlInfo::FlightSqlServerName, "XTDB");
-        builder.append(SqlInfo::FlightSqlServerVersion, env!("CARGO_PKG_VERSION"));
+        builder.append(SqlInfo::FlightSqlServerVersion, rtdb_types::runtime_version());
         builder.append(SqlInfo::FlightSqlServerTransaction, 1i32);
         builder.append(SqlInfo::FlightSqlServerStatementTimeout, self.0.config.prepared_statement_idle_timeout.as_millis().min(i32::MAX as u128) as i32);
         builder.append(SqlInfo::FlightSqlServerTransactionTimeout, self.0.config.transaction_idle_timeout.as_millis().min(i32::MAX as u128) as i32);

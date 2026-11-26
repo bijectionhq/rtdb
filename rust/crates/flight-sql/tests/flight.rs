@@ -662,6 +662,18 @@ async fn bulk_ingestion_uses_each_arrow_batch_and_catalog_metadata_uses_dense_un
 }
 
 #[tokio::test]
+async fn sql_info_reports_the_server_version_that_sql_version_reports() {
+    use arrow_array::cast::AsArray;
+
+    let running = Running::start(None, FlightConfig::default()).await; let mut client = Client::connect(&running.server, None).await;
+    let request = client.request(FlightDescriptor::new_cmd(CommandGetSqlInfo { info: vec![arrow_flight::sql::SqlInfo::FlightSqlServerVersion as u32] }.as_any().encode_to_vec()));
+    let info = client.client.get_flight_info(request).await.unwrap().into_inner(); let batches = client.redeem(&info).await;
+    let union = batches[0].column(1).as_any().downcast_ref::<arrow_array::UnionArray>().unwrap();
+    assert_eq!(union.child(0).as_string::<i32>().iter().collect::<Vec<_>>(), [Some(rtdb_types::runtime_version())]);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn table_metadata_preserves_flight_filters_order_and_selected_schemas() {
     use arrow_array::cast::AsArray;
     use arrow_flight::sql::CommandGetDbSchemas;

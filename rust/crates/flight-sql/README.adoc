@@ -164,7 +164,7 @@ Typed batches with zero rows still carry their parameter field types.
 Without a bound parameter batch, result-schema binding borrows the prepared parameter types.
 HTTP/2, prost, TLS-free tonic buffers, ordinary SQL parser scratch, and scalar-expression peak allocations still require end-to-end accounting qualification.
 Leases use the shared microsecond clock and have not been compared with the JVM nanosecond clock at submicrosecond timeout boundaries.
-Native server-version metadata uses the Rust package version.
+SqlInfo `FLIGHT_SQL_SERVER_VERSION` reports the process runtime version that SQL `version()` reports.
 Ticket timestamps use chrono's supported calendar range, which is narrower than the JVM Instant range.
 Query metrics count pull and Arrow-encoding failures; transport failures after an encoded message has been yielded are owned by tonic and do not currently increment the query consumer-error counter.
 

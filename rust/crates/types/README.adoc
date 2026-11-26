@@ -15,8 +15,10 @@ The parser, decoding, equality and ASCII rendering source regressions are unexec
 Isolated UTF-16 surrogate inputs remain outside the current UTF-8 string carrier and require a wider representation for complete Java parity.
 
 Runtime version metadata is one immutable process value initialized on the first version or revision lookup.
-The initialization monitor captures a nonblank `XTDB_VERSION` override or the Cargo package version, plus `GIT_SHA` or the build-time `RTDB_REVISION` when available.
-The command-line version and SQL session-information functions share that value.
+The initialization monitor captures a nonblank `XTDB_VERSION` override or `DEFAULT_RUNTIME_VERSION`, plus `GIT_SHA` or the build-time `RTDB_REVISION` when available.
+`DEFAULT_RUNTIME_VERSION` is `XTDB_COMPATIBLE_VERSION`, the version the reference's build of the tracked `main` reports (`2.x-SNAPSHOT`), with the Cargo package version as semantic-version build metadata: `2.x-SNAPSHOT+rtdb.0.1.0`.
+The command-line version, SQL session-information functions, Flight SqlInfo and the native ADBC vendor and driver versions share that value.
+The pgwire `server_version` parameter stays the PostgreSQL major version `16`, as in the reference.
 Release builds embed their recorded source revision in the native executable.
 `compiled_build_info()` returns the full build revision, crate version and selected TZDB version and digest without consulting runtime overrides.
 The server and configuration migrator expose that same immutable report through `--build-info` for release-package validation.

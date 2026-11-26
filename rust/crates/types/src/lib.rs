@@ -80,7 +80,7 @@ pub use scalar_list::ScalarList;
 pub use value::{DecimalValue, Value};
 pub use uri::UriParts;
 pub use utf8::decode_java_utf8;
-pub use version::{BuildInfo, compiled_build_info, runtime_version, runtime_revision};
+pub use version::{BuildInfo, DEFAULT_RUNTIME_VERSION, XTDB_COMPATIBLE_VERSION, compiled_build_info, runtime_version, runtime_revision};
 pub use object_sort::ObjectSort;
 pub use memory::{MemoryBudget, MemoryReservation};
 pub use allocation::AllocationScope;
