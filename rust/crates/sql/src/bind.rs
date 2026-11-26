@@ -127,19 +127,24 @@ pub(crate) fn bind(parsed: ParsedStatement<'_>, catalog: &dyn Catalog, options: 
     })
 }
 
+/// Whether `parsed` is a statement `bind_static_document_source` binds at all: records, or an INSERT of plain VALUES with named columns.
+/// Any other statement has no static source, whatever the catalog and options.
+pub(crate) fn has_static_document_shape(parsed: &ParsedStatement<'_>) -> bool {
+    match &parsed.tree.statement {
+        Syntax::Records { .. } => true,
+        Syntax::Standard(ast::Statement::Insert(insert)) => !insert.columns.is_empty() && insert.source.as_ref().is_some_and(|query|
+            matches!(query.body.as_ref(), ast::SetExpr::Values(_)) && query.with.is_none() && query.order_by.is_none() && query.limit_clause.is_none()),
+        _ => false,
+    }
+}
+
 pub(crate) fn bind_static_document_source(
     parsed: ParsedStatement<'_>,
     catalog: &dyn Catalog,
     options: &PrepareOptions,
 ) -> Result<Option<crate::StaticMutation>> {
     use crate::{StaticMutation, StaticMutationKind};
-    match &parsed.tree.statement {
-        Syntax::Records { .. } => (),
-        Syntax::Standard(ast::Statement::Insert(insert))
-            if !insert.columns.is_empty() && insert.source.as_ref().is_some_and(|query|
-                matches!(query.body.as_ref(), ast::SetExpr::Values(_)) && query.with.is_none() && query.order_by.is_none() && query.limit_clause.is_none()) => (),
-        _ => return Ok(None),
-    }
+    if !has_static_document_shape(&parsed) { return Ok(None); }
     bind_using(parsed, catalog, options, |context, statement, _settings| {
         if context.literals.has_errors() { return Ok(None); }
         let result = match statement {

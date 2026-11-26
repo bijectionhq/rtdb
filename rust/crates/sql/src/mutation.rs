@@ -53,10 +53,39 @@ pub fn prepare_static_in(sql: &str, catalog: &dyn Catalog, options: &crate::Prep
     prepare_static_with(sql, catalog, options, crate::bind::FormAllocation::Tracked(memory))
 }
 
+/// Texts that parsed into one statement without a static document shape, so `prepare_static` of each is `None` whatever the catalog
+/// and options; a parse depends on the text alone, so a submission repeating one, such as a prepared UPDATE, is not parsed again.
+/// Bounded in count and text length, and emptied when full.
+struct ShapelessTexts(std::sync::Mutex<std::collections::HashSet<Box<str>>>);
+
+impl ShapelessTexts {
+    const TEXTS: usize = 1024;
+    const TEXT_BYTES: usize = 4096;
+
+    fn contains(&self, sql: &str) -> bool {
+        self.0.lock().is_ok_and(|texts| texts.contains(sql))
+    }
+
+    fn insert(&self, sql: &str) {
+        if sql.len() > Self::TEXT_BYTES { return; }
+        if let Ok(mut texts) = self.0.lock() {
+            if texts.len() >= Self::TEXTS { texts.clear(); }
+            texts.insert(sql.into());
+        }
+    }
+}
+
+static SHAPELESS_TEXTS: std::sync::LazyLock<ShapelessTexts> = std::sync::LazyLock::new(|| ShapelessTexts(Default::default()));
+
 fn prepare_static_with(sql: &str, catalog: &dyn Catalog, options: &crate::PrepareOptions, forms: crate::bind::FormAllocation<'_>) -> Result<Option<StaticMutation>> {
+    if SHAPELESS_TEXTS.contains(sql) { return Ok(None); }
     let mut parsed = crate::parse::parse_with(sql, forms)?;
     if parsed.len() != 1 { return Err(invalid("A transaction operation must contain one statement")); }
     let statement = parsed.remove(0);
+    if !crate::bind::has_static_document_shape(&statement) {
+        SHAPELESS_TEXTS.insert(sql);
+        return Ok(None);
+    }
     let Some(output) = crate::bind::bind_static_document_source(statement, catalog, options)? else { return Ok(None); };
     fn decimal_target(target: &CastTarget) -> bool {
         match target {

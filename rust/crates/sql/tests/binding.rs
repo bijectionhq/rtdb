@@ -394,3 +394,30 @@ fn temporal_literal_plan_errors_remain_sql_in_the_source_transaction() {
         assert_eq!(error.context["errors"][0][key], input);
     }
 }
+
+#[test]
+fn repeated_submissions_prepare_the_same_static_source_or_error_each_time() {
+    let options = PrepareOptions::default();
+    for sql in [
+        "UPDATE foo SET v = v + 1 WHERE _id = $1 /* repeated static probe */",
+        "DELETE FROM foo WHERE _id = 1 /* repeated static probe */",
+        "INSERT INTO foo (_id, v) SELECT _id, v FROM foo /* repeated static probe */",
+    ] {
+        for _ in 0..3 {
+            assert!(rtdb_sql::prepare_static(sql, &Fixture, &options).unwrap().is_none(), "{sql}");
+        }
+    }
+    for _ in 0..3 {
+        assert!(rtdb_sql::prepare_static("INSERT INTO foo (_id, v) VALUES (1, 7) /* repeated static probe */", &Fixture, &options).unwrap().is_some());
+    }
+    for sql in [
+        "UPDATE foo SET /* repeated static probe */",
+        "UPDATE foo SET v = 1 WHERE _id = 1; UPDATE foo SET v = 2 WHERE _id = 2 /* repeated static probe */",
+    ] {
+        let first = rtdb_sql::prepare_static(sql, &Fixture, &options).unwrap_err();
+        for _ in 0..2 {
+            let again = rtdb_sql::prepare_static(sql, &Fixture, &options).unwrap_err();
+            assert_eq!((&again.code, &again.message), (&first.code, &first.message), "{sql}");
+        }
+    }
+}
