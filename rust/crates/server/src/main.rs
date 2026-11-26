@@ -5,7 +5,21 @@ use rtdb_types::{Anomaly, Result};
 #[cfg(all(feature = "multi", feature = "s3"))]
 mod follower_process;
 
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOCATOR: dhat::Alloc = dhat::Alloc;
+
+/// Writes `rtdb-<pid>.json` into `BIJECTION_DHAT_DIR` when `main` returns.
+#[cfg(feature = "dhat-heap")]
+fn heap_profiler() -> Option<dhat::Profiler> {
+    let directory = std::env::var_os("BIJECTION_DHAT_DIR")?;
+    let file = std::path::Path::new(&directory).join(format!("rtdb-{}.json", std::process::id()));
+    Some(dhat::Profiler::builder().file_name(file).build())
+}
+
 fn main() -> ExitCode {
+    #[cfg(feature = "dhat-heap")]
+    let _heap_profiler = heap_profiler();
     let runtime = match tokio::runtime::Builder::new_multi_thread().thread_stack_size(rtdb_node::WORKER_STACK_BYTES).enable_all().build() {
         Ok(runtime) => runtime,
         Err(error) => { eprintln!("{error}"); return ExitCode::FAILURE; }
