@@ -1917,6 +1917,24 @@ async fn sql_execute_binds_an_untyped_id_parameter_as_the_integer_it_is_given() 
     assert_eq!(rows(&client.query("SELECT v FROM docs WHERE _id = 2").await), [vec![Some(b"bob".to_vec())]]);
     assert_eq!(tags(&client.query("PREPARE by_cast AS SELECT v FROM docs WHERE _id = CAST($1 AS BIGINT)").await), b"CZ");
     assert_eq!(rows(&client.query("EXECUTE by_cast (2)").await), [vec![Some(b"bob".to_vec())]]);
+
+    // R1 was seen over persisted blocks, after session statements and a DISCARD ALL, as a driver sends each statement:
+    // the point lookup then reads the entity directory and the persisted tries rather than the live index alone.
+    running.node.flush_all(Duration::from_secs(10)).await.unwrap();
+    assert!(!tags(&client.query("SET TIME ZONE 'Europe/Paris'").await).contains(&b'E'));
+    assert!(!tags(&client.query("DISCARD ALL").await).contains(&b'E'));
+    assert_eq!(tags(&client.query("PREPARE by_id AS SELECT v FROM docs WHERE _id = $1").await), b"CZ");
+    assert_eq!(rows(&client.query("EXECUTE by_id (2)").await), [vec![Some(b"bob".to_vec())]]);
+    assert_eq!(rows(&client.query("EXECUTE by_id (3)").await), [vec![Some(b"dee".to_vec())]]);
+    assert_eq!(rows(&client.query("EXECUTE by_id (4)").await), Vec::<Vec<Option<Vec<u8>>>>::new());
+    client.parse("", "EXECUTE by_id (2)", &[]).await;
+    client.bind("", "").await;
+    client.send(b'D', b"P\0").await;
+    client.execute("", 0).await;
+    client.send(b'S', &[]).await;
+    let frames = client.through(b'Z').await;
+    assert_eq!(tags(&frames), b"12TDCZ", "{frames:?}");
+    assert_eq!(rows(&frames), [vec![Some(b"bob".to_vec())]]);
     drop(client);
     running.stop().await;
 }
