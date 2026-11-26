@@ -662,7 +662,7 @@ async fn a_receipted_checkpoint_checks_the_exact_root_bytes_before_opening() {
     fixture.store.put(&key, different.into()).await.unwrap();
     let error = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0), admitted)
         .await.err().expect("receipt validation must read the current root bytes");
-    assert_eq!(error.message.as_deref(), Some("The stored checkpoint root does not match the directory receipt"));
+    assert_eq!(error.message.as_deref(), Some("The stored checkpoint root or manifest does not match the directory receipt"));
 }
 
 #[tokio::test]
