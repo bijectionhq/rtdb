@@ -76,6 +76,31 @@ pub(crate) struct RetirementObservation {
     pub(crate) unreadable_by: Option<i64>,
 }
 
+/// Why a replay stopped short of the position it was asked to reach.
+pub(crate) enum ReplayError {
+    /// The journal ends at `head`, before the `replayed` position this process
+    /// already applied: a recovery lost the records between them.
+    Shortened { head: Lsn, replayed: Lsn },
+    /// `resume` is the longest prefix replay had fully applied, which a later
+    /// replay continues from instead of starting over.
+    Failed { error: Anomaly, resume: Option<Box<Committed>> },
+}
+
+impl ReplayError {
+    fn failed(error: Anomaly, resume: Option<Committed>) -> Self {
+        // A state with no records was never seeded from the journal.
+        let resume = resume.filter(|state| !state.records.is_empty()).map(Box::new);
+        Self::Failed { error, resume }
+    }
+
+    pub(crate) fn into_anomaly(self) -> Anomaly {
+        match self {
+            Self::Shortened { head, replayed } => journal_shortened(head, replayed),
+            Self::Failed { error, .. } => error,
+        }
+    }
+}
+
 pub(crate) struct Committed {
     pub(crate) transactions: TransactState,
     pub(crate) floor: Lsn,
@@ -114,10 +139,14 @@ impl Committed {
         store: &dyn ObjectStore,
         end: Lsn,
         previous: Option<Self>,
-    ) -> Result<Self> {
+    ) -> std::result::Result<Self, ReplayError> {
         match Self::read_prefix(stream, store, end, previous).await {
-            Err(error) if error.code == "rtdb/erased-under-view" => {
-                let cut = find_clean_checkpoint(stream, end).await?.ok_or(error)?;
+            Err(ReplayError::Failed { error, resume }) if error.code == "rtdb/erased-under-view" => {
+                let cut = match find_clean_checkpoint(stream, end).await {
+                    Ok(Some(cut)) => cut,
+                    Ok(None) => return Err(ReplayError::Failed { error, resume }),
+                    Err(error) => return Err(ReplayError::Failed { error, resume }),
+                };
                 Self::read_prefix(stream, store, end, Some(Self::empty(stream, cut))).await
             }
             result => result,
@@ -129,11 +158,12 @@ impl Committed {
         store: &dyn ObjectStore,
         end: Lsn,
         mut previous: Option<Self>,
-    ) -> Result<Self> {
+    ) -> std::result::Result<Self, ReplayError> {
         if let Some(state) = previous.as_ref().filter(|state| state.head > end) {
-            return Err(journal_shortened(end, state.head));
+            return Err(ReplayError::Shortened { head: end, replayed: state.head });
         }
-        let mut from = next(previous.as_ref().map_or(Lsn(0), |state| state.head))?;
+        let mut from = next(previous.as_ref().map_or(Lsn(0), |state| state.head))
+            .map_err(|error| ReplayError::failed(error, previous.take()))?;
         loop {
             let page = match stream.read(from).await {
                 Ok(page) => page,
@@ -142,10 +172,10 @@ impl Committed {
                     from = floor;
                     continue;
                 }
-                Err(error) => return Err(journal_error(error)),
+                Err(error) => return Err(ReplayError::failed(journal_error(error), previous)),
             };
             if page.floor == Lsn(0) || page.head < Lsn(page.floor.0 - 1) {
-                return Err(invalid("The journal page has invalid bounds"));
+                return Err(ReplayError::failed(invalid("The journal page has invalid bounds"), previous));
             }
             if previous
                 .as_ref()
@@ -159,16 +189,25 @@ impl Committed {
                 .take()
                 .unwrap_or_else(|| Self::empty(stream, page.floor));
             for (lsn, bytes) in page.records.into_iter().take_while(|(lsn, _)| *lsn <= end) {
-                let entry = stream.decode(lsn, &bytes).await?;
-                state.apply_entry(stream, store, lsn, entry).await?;
+                let entry = match stream.decode(lsn, &bytes).await {
+                    Ok(entry) => entry,
+                    Err(error) => return Err(ReplayError::failed(error, Some(state))),
+                };
+                // A failed entry may have applied part of itself, so the state
+                // is no longer a prefix of the journal.
+                state
+                    .apply_entry(stream, store, lsn, entry)
+                    .await
+                    .map_err(|error| ReplayError::failed(error, None))?;
             }
             if state.head == end {
                 return Ok(state);
             }
-            let following = next(state.head)?;
-            if following <= from {
-                return Err(journal_error(JournalError::Unavailable));
-            }
+            let following = match next(state.head) {
+                Ok(following) if following > from => following,
+                Ok(_) => return Err(ReplayError::failed(journal_error(JournalError::Unavailable), Some(state))),
+                Err(error) => return Err(ReplayError::failed(error, Some(state))),
+            };
             from = following;
             previous = Some(state);
         }

@@ -1237,6 +1237,32 @@ async fn multi_driver_never_retargets_a_recovery_cut_overtaken_by_trim() {
 }
 
 #[tokio::test]
+async fn failed_journal_read_keeps_the_replayed_prefix() {
+    let journal = journals().await;
+    let cluster = Cluster::new();
+    let mut writer = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
+    let faults = Arc::new(FaultJournal::new(Arc::new(journal.handle(NODE_2_IDENTITY))));
+    let mut reader = cluster.node(2, faults.clone());
+    writer.create().await.unwrap();
+    assert_eq!(writer.tick(&live(1)).await.unwrap(), Role::Writer(Epoch(1)));
+    writer.transact(&put(1, 1, "first")).await.unwrap();
+    reader.refresh().await.unwrap();
+    let replayed = reader.state().head;
+    cluster.at(11);
+    writer.transact(&put(2, 1, "second")).await.unwrap();
+    let end = reader.stream.head().await.unwrap();
+    assert!(end > replayed);
+
+    faults.inject(Fault::Unavailable);
+    assert_eq!(reader.catch_up(end).await.unwrap_err().code, "rtdb/journal-unavailable");
+    assert_eq!(reader.committed.as_ref().map(|state| state.head), Some(replayed));
+
+    reader.catch_up(end).await.unwrap();
+    assert_eq!(reader.state().head, end);
+    assert_eq!(text_at(&mut reader, MAIN_BRANCH, 1).await, Some(Value::Utf8("second".into())));
+}
+
+#[tokio::test]
 async fn multi_driver_late_upload_cannot_reenter_reachability() {
     let journal = journals().await;
     let cluster = Cluster::new();

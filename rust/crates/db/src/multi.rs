@@ -16,7 +16,7 @@ use uuid::Uuid;
 use crate::{
     journal::{Entry, JournalBatchAppender, Stream, journal_error, next},
     placement::preferred,
-    replay::{ChangeHistory, Committed, JournalCoordinates},
+    replay::{ChangeHistory, Committed, JournalCoordinates, ReplayError},
 };
 
 mod classic_migration;
@@ -865,17 +865,31 @@ impl MultiDatabase {
     async fn catch_up(&mut self, end: Lsn) -> Result<()> {
         let previous = self.committed.take();
         let replayed = match Committed::read_through(&self.stream, self.store.as_ref(), end, previous).await {
+            Ok(replayed) => replayed,
             // Only an acknowledged recovery lets a seal return a head below
             // what this process replayed. Report the lost range once, then
             // continue from the recovered journal.
-            Err(error) if error.code == "rtdb/journal-shortened" => {
-                eprintln!("Multi database {}: {}", self.options.database, error.message.as_deref().unwrap_or(""));
-                Committed::read_through(&self.stream, self.store.as_ref(), end, None).await?
+            Err(shortened @ ReplayError::Shortened { .. }) => {
+                let shortened = shortened.into_anomaly();
+                eprintln!("Multi database {}: {}", self.options.database, shortened.message.as_deref().unwrap_or(""));
+                Committed::read_through(&self.stream, self.store.as_ref(), end, None)
+                    .await
+                    .map_err(|error| self.keep_replayed(error))?
             }
-            result => result?,
+            Err(error) => return Err(self.keep_replayed(error)),
         };
         self.committed = Some(replayed);
         Ok(())
+    }
+
+    fn keep_replayed(&mut self, error: ReplayError) -> Anomaly {
+        match error {
+            ReplayError::Failed { error, resume } => {
+                self.committed = resume.map(|resume| *resume);
+                error
+            }
+            shortened => shortened.into_anomaly(),
+        }
     }
 
     fn state(&self) -> &Committed {
