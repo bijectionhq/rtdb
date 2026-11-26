@@ -501,7 +501,8 @@ enum StrictSource {
 }
 
 enum SourceWork {
-    Resolve(SourceTransaction),
+    /// The decoded transaction, and its operations stream as it arrived, which a crash log copies.
+    Resolve(SourceTransaction, Option<Bytes>),
     Skip(SourceMessage),
     Fence,
 }
@@ -2004,10 +2005,15 @@ impl ReplicationDriver {
                 let work = if self.config.skipped_transactions.contains(&position) {
                     SourceWork::Skip(message)
                 } else {
-                    SourceWork::Resolve(SourceTransaction::decode(&message, &self.resolve.memory)?)
+                    let operations = match &message {
+                        SourceMessage::Protobuf(SourceBody::Tx(tx)) => tx.tx_ops.clone(),
+                        SourceMessage::LegacyTransaction(bytes) => Some(bytes.clone()),
+                        _ => None,
+                    };
+                    SourceWork::Resolve(SourceTransaction::decode(&message, &self.resolve.memory)?, operations)
                 };
                 let original = match &work {
-                    SourceWork::Resolve(request) => request.placed_attempt(position)?,
+                    SourceWork::Resolve(request, _) => request.placed_attempt(position)?,
                     SourceWork::Skip(message) => SourceTransaction::skipped_attempt(message, position)?,
                     SourceWork::Fence => unreachable!("only recovery constructs a placed fence"),
                 };
@@ -2015,7 +2021,7 @@ impl ReplicationDriver {
                 let source = SourceInput { position, log_time: metadata.timestamp, work, reservation, _decode_charge: decode_charge };
                 // Keep this position as the source head until every previously queued replica
                 // write has been read back. In particular, none can still be offloading a body.
-                if (reservation.is_some() || matches!(&source.work, SourceWork::Resolve(request) if request.requires_durable_predecessor()))
+                if (reservation.is_some() || matches!(&source.work, SourceWork::Resolve(request, _) if request.requires_durable_predecessor()))
                     && !leader.drained_for_strict_source()
                 {
                     leader.waiting_strict_source = Some(StrictSource::Transaction(source));
@@ -2254,10 +2260,11 @@ impl ReplicationDriver {
         let maximum_inline_bytes = self.logs.replica_guarded_append_limit();
         let maximum_timed_original_bytes = self.logs.replica_timed_original_append_limit();
         let node_id = self.config.node_id.clone();
+        let partition = Arc::clone(&self.partition);
         leader.resolution = Some(Resolution { completion: Completion(None), future: Box::pin(async move {
             let SourceInput { position, log_time, work, reservation, _decode_charge } = source;
             let result = match work {
-                SourceWork::Resolve(mut request) => {
+                SourceWork::Resolve(mut request, operations) => {
                     let prepared = async {
                         if request.proposal_generation_reading()?.is_some() {
                             let key = resolver.prepared_publication_key(position, log_time)?;
@@ -2270,7 +2277,9 @@ impl ReplicationDriver {
                             let result = resolver.resolve_source_with_authority(durable, position, log_time, request, &context,
                                 Some(WriterPublication { clock: clock.as_ref(), maximum_inline_bytes, maximum_timed_original_bytes }), classic_authority.as_ref()).await;
                             if let Err(error) = &result && crate::crash_log::applies(error) {
-                                crate::crash_log::write(&**context.storage.object_store(), &node_id, clock(), error, &context.memory).await;
+                                let value = partition.value();
+                                let slices = crate::crash_log::Slices { tx_ops: operations.as_ref(), live: value.live() };
+                                crate::crash_log::write(&**context.storage.object_store(), &node_id, clock(), error, slices, &context.memory).await;
                             }
                             result
                         }
