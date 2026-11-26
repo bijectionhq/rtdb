@@ -1034,7 +1034,9 @@ impl Service {
             };
             let (page, context) = if call.session.caller.principal.workload_grant().is_some() {
                 let started = tokio::time::Instant::now();
+                let mut applied = driver.watch_applied().await;
                 let (page, cut) = loop {
+                    if let Some(applied) = &mut applied { let _ = applied.borrow_and_update(); }
                     let (admitted, cut) = self.workload_root_cut(&call).await?;
                     if !Arc::ptr_eq(&admitted, &database) || cut.custody_groups.is_some() {
                         return Err(error::unavailable("The Original Changes attachment is unavailable"));
@@ -1042,11 +1044,16 @@ impl Service {
                     let page = driver.changes_workload_root(change.clone(), cut.basis, &call.cancellation)
                         .await.map_err(error::anomaly)?;
                     let remaining = wait.saturating_sub(started.elapsed());
-                    if !page.groups.is_empty() || until.is_some() && page.complete || remaining.is_zero() {
+                    let answered = !page.groups.is_empty() || until.is_some() && page.complete || remaining.is_zero();
+                    let Some(applied) = applied.as_mut().filter(|_| !answered) else {
                         break (page, cut);
-                    }
-                    call.cancellation.run_until_cancelled(tokio::time::sleep(remaining.min(Duration::from_millis(50))))
+                    };
+                    let change = tokio::time::timeout(remaining, applied.changed());
+                    let changed = call.cancellation.run_until_cancelled(change)
                         .await.ok_or_else(crate::error::cancelled).map_err(error::map_status)?;
+                    if let Ok(Err(_)) = changed {
+                        return Err(error::unavailable("The Original Changes attachment is unavailable"));
+                    }
                 };
                 let now = self.0.node.now();
                 let source = rtdb_node::serving::QuerySource {

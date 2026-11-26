@@ -1014,7 +1014,7 @@ impl MultiDatabase {
                 state.apply_entry(&self.stream, self.store.as_ref(), at, entry).await?;
             }
         }
-        self.committed = Some(state);
+        self.install_committed(state);
         self.require_authority(lease)?;
         let coordinates = self.state().coordinates;
         let reloaded = reload.then(|| self.new_pipeline()).transpose()?;

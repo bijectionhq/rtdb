@@ -73,6 +73,7 @@ pub struct MultiDatabase {
     tokens: TokenAuthority,
     row_custody: bool,
     committed: Option<Committed>,
+    applied: tokio::sync::watch::Sender<u64>,
     writer: Option<Writer>,
     candidate: Option<Lease>,
     last_allocated: Epoch,
@@ -109,6 +110,7 @@ impl MultiDatabase {
             tokens,
             row_custody: false,
             committed: None,
+            applied: tokio::sync::watch::channel(0).0,
             writer: None,
             candidate: None,
             last_allocated: Epoch(0),
@@ -518,6 +520,18 @@ impl MultiDatabase {
         self.committed.as_ref().map(|state| state.generation)
     }
 
+    /// The journal position this residence has applied, marked changed
+    /// whenever it moves.
+    pub fn watch_applied(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.applied.subscribe()
+    }
+
+    fn install_committed(&mut self, state: Committed) {
+        let head = state.head.0;
+        self.applied.send_if_modified(|applied| std::mem::replace(applied, head) != head);
+        self.committed = Some(state);
+    }
+
     /// The journal stream holding this database.
     pub fn journal_stream(&self) -> journal_contract::StreamId {
         journal_contract::StreamId(u128::from_be_bytes(*self.stream.database.as_bytes()))
@@ -773,7 +787,7 @@ impl MultiDatabase {
                 return Err(error);
             }
         };
-        self.committed = Some(state);
+        self.install_committed(state);
         self.require_authority(lease)?;
         Ok(receipt)
     }
@@ -878,7 +892,7 @@ impl MultiDatabase {
             }
             Err(error) => return Err(self.keep_replayed(error)),
         };
-        self.committed = Some(replayed);
+        self.install_committed(replayed);
         Ok(())
     }
 

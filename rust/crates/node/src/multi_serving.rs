@@ -586,7 +586,9 @@ impl ServingDriver for MultiServing {
                           scope: &ServingScope, cancellation: &CancellationToken) -> Result<QueryView> {
         cancellation.run_until_cancelled(async {
             let deadline = Instant::now() + Duration::from_secs(30);
+            let mut applied = self.database.lock().await.watch_applied();
             loop {
+                let _ = applied.borrow_and_update();
                 let (index, generation) = self.database.lock().await.fresh_view().await?;
                 index.require_local_custody()?;
                 let vault = index.has_custody_groups().then(|| self.tokens.custody_vault());
@@ -600,7 +602,7 @@ impl ServingDriver for MultiServing {
                         return Ok(view);
                     }
                     Err(error) if error.code == "rtdb/basis-ahead" && Instant::now() < deadline => {
-                        tokio::time::sleep_until((Instant::now() + Duration::from_millis(50)).min(deadline)).await;
+                        applied_change(&mut applied, deadline).await?;
                     }
                     Err(error) => return Err(error),
                 }
@@ -738,7 +740,9 @@ impl ServingDriver for MultiServing {
                             cancellation: &CancellationToken) -> Result<ChangePage> {
         cancellation.run_until_cancelled(async {
             let start = Instant::now();
+            let mut applied = self.database.lock().await.watch_applied();
             loop {
+                let _ = applied.borrow_and_update();
                 let (index, generation) = self.database.lock().await.fresh_view().await?;
                 index.require_local_custody()?;
                 let mut page = scope.changes(&index, &request)?;
@@ -751,7 +755,7 @@ impl ServingDriver for MultiServing {
                     }
                     return Ok(page);
                 }
-                tokio::time::sleep(remaining.min(Duration::from_millis(50))).await;
+                applied_change(&mut applied, Instant::now() + remaining).await?;
             }
         }).await.ok_or_else(interrupted)?
     }
@@ -860,6 +864,10 @@ impl ServingDriver for MultiServing {
                 key_generation: Some(generation),
             })
         }).await.ok_or_else(interrupted)?
+    }
+
+    async fn watch_applied(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        Some(self.database.lock().await.watch_applied())
     }
 
     async fn changes_workload_root(
@@ -1006,7 +1014,9 @@ impl ServingDriver for MultiServing {
         cancellation
             .run_until_cancelled(async {
                 let start = Instant::now();
+                let mut applied = self.database.lock().await.watch_applied();
                 loop {
+                    let _ = applied.borrow_and_update();
                     let mut database = self.database.lock().await;
                     let history = database.fresh_history().await?;
                     history.index.require_local_custody()?;
@@ -1021,7 +1031,7 @@ impl ServingDriver for MultiServing {
                         };
                     }
                     drop(database);
-                    tokio::time::sleep(remaining.min(Duration::from_millis(50))).await;
+                    applied_change(&mut applied, Instant::now() + remaining).await?;
                 }
             })
             .await
@@ -1170,6 +1180,15 @@ fn changes_page(
 
 fn matches_table(request: &Changes, table: &TableRef) -> bool {
     request.tables.is_empty() || request.tables.contains(table)
+}
+
+/// Waits, without holding the database, until the residence applies a journal
+/// position `applied` has not seen, or until `until`.
+async fn applied_change(applied: &mut tokio::sync::watch::Receiver<u64>, until: Instant) -> Result<()> {
+    match tokio::time::timeout_at(until, applied.changed()).await {
+        Ok(changed) => changed.map_err(|_| interrupted()),
+        Err(_) => Ok(()),
+    }
 }
 
 fn interrupted() -> Anomaly {
@@ -1564,6 +1583,40 @@ mod tests {
         let from_beginning = Changes { after: None, ..changes() };
         let error = driver.changes(from_beginning, &cancel).await.err().unwrap();
         assert_eq!(error.code, "rtdb/cursor-expired");
+    }
+
+    #[tokio::test]
+    async fn a_waiting_change_page_answers_when_the_next_write_applies() {
+        let journal = MemoryJournal::default();
+        let node = IpAddr::from([127, 0, 0, 1]);
+        let database = MultiDatabase::new(
+            MultiOptions { database: Uuid::from_u128(1), node, lease_micros: 100, drift_micros: 1 },
+            Arc::new(journal.handle(Identity::from_static("urn:rtdb:test:1"))),
+            Arc::new(MemoryStore::default()),
+            Arc::new(LocalKms::new(|| 10)),
+            Arc::new(|| Timestamp(10)),
+        )
+        .unwrap();
+        database.create().await.unwrap();
+        let driver = Arc::new(MultiServing::new(database, MemoryBudget::new(64 * 1024 * 1024)));
+        driver.tick(&BTreeSet::from([node])).await.unwrap();
+        let cancel = CancellationToken::new();
+        let first = driver.transact(write(1, "one", None), &cancel).await.unwrap();
+        let wait = Duration::from_secs(30);
+        let request = Changes {
+            branch: MAIN_BRANCH.into(), tables: BTreeSet::new(), after: Some(first.basis), until: None,
+            order: ChangeOrder::Ascending, images: ChangeImages::Both, limit: 1, wait,
+        };
+        let waiting = tokio::spawn({
+            let (driver, cancel) = (Arc::clone(&driver), cancel.clone());
+            async move { driver.changes(request, &cancel).await }
+        });
+        tokio::task::yield_now().await;
+        let second = driver.transact(write(2, "two", None), &cancel).await.unwrap();
+        let page = tokio::time::timeout(Duration::from_secs(10), waiting).await
+            .expect("the page answers when the write applies, not when the wait runs out").unwrap().unwrap();
+        assert_eq!(page.groups.len(), 1);
+        assert_eq!(page.through, second.basis);
     }
 
     #[tokio::test]

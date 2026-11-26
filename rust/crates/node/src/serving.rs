@@ -311,6 +311,12 @@ pub trait ServingDriver: Send + Sync {
         Err(workload::denied())
     }
 
+    /// Subscribes to the journal position this attachment has applied; a long
+    /// poll over `changes_workload_root` waits on it between pages.
+    async fn watch_applied(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        None
+    }
+
     async fn transact_scoped(&self, _request: Transact, _scope: ServingScope,
                              _cancellation: &CancellationToken) -> Result<Receipt> {
         Err(visibility::unsupported())
