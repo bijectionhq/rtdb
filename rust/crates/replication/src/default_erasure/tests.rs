@@ -100,9 +100,11 @@ async fn predecessor_destruction_preserves_the_successor_across_vault_restart() 
     use crate::NativeCheckpointAuthority;
     use rtdb_crypt::{FileKms, Generation, Kms};
 
-    let directory = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let vault = root.path().join("vault");
+    FileKms::create_directory(&vault)?;
     let incarnation = [3; 16];
-    let keys = Arc::new(FileKms::open(directory.path(), || 50)?);
+    let keys = Arc::new(FileKms::open(&vault, || 50)?);
     let database = uuid::Uuid::from_bytes(incarnation);
     let predecessor = Generation {
         database,
@@ -151,7 +153,7 @@ async fn predecessor_destruction_preserves_the_successor_across_vault_restart() 
             .destroy_predecessor(&authority, Timestamp(50))
             .await?
     );
-    let reopened = Arc::new(FileKms::open(directory.path(), || 50)?);
+    let reopened = Arc::new(FileKms::open(&vault, || 50)?);
     assert!(reopened.generation_destroyed(predecessor).await?);
     reopened.check_readable(successor).await?;
     let authority = NativeServingAuthority {
