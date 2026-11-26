@@ -177,7 +177,7 @@ class Database(
             )
 
         if (opts.systemTime != null)
-            throw Incorrect("System time is assigned by the store", "xtdb/invalid-tx-option", emptyMap())
+            throw Incorrect("System time is assigned by the store", "xtdb/invalid-tx-option")
 
         val defaultTz = checkNotNull(opts.defaultTz) { "missing defaultTz" }
         val txMsg = SourceMessage.Tx(
