@@ -49,8 +49,37 @@ fn declared_parameter_types(relation: &Relation, width: usize, mode: EmissionMod
 /// Result fields emitted from the plan and a catalog snapshot, with their memory reservation.
 pub struct RuntimeSchema { schema: Schema, _reservation: Arc<MemoryReservation> }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EmissionMode { ArrowFields, Execution }
+
+/// A plan's emitted relations, by mode and parameter types: the catalog contributes nothing an emission reads but the
+/// plan's own table bindings and the fixed system schemas, so every snapshot emits a plan the same way.
+#[derive(Default)]
+pub(crate) struct Emissions(std::sync::Mutex<Vec<(EmissionMode, Vec<L>, Arc<EmittedRelation>)>>);
+
+impl Emissions {
+    const MAXIMUM: usize = 4;
+
+    /// `relation`'s emission, kept and charged to `keeper` where the plan has one, or emitted in `memory` for this use alone.
+    pub(crate) fn emit(&self, relation: &Arc<Relation>, catalog: &CatalogSnapshot, parameters: &[L], memory: &Arc<MemoryBudget>,
+        keeper: Option<&Arc<MemoryBudget>>, mode: EmissionMode) -> Result<Arc<EmittedRelation>> {
+        let kept = |emissions: &[(EmissionMode, Vec<L>, Arc<EmittedRelation>)]| emissions.iter()
+            .find(|(kept_mode, types, _)| *kept_mode == mode && types.as_slice() == parameters).map(|(_, _, emitted)| Arc::clone(emitted));
+        let emissions = || self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(emitted) = kept(&emissions()) { return Ok(emitted); }
+        let Some(keeper) = keeper.filter(|_| emissions().len() < Self::MAXIMUM) else {
+            return EmittedRelation::emit(Arc::clone(relation), catalog, parameters, memory, mode);
+        };
+        let emitted = match EmittedRelation::emit(Arc::clone(relation), catalog, parameters, keeper, mode) {
+            Err(error) if error.code == "rtdb/memory-budget-exceeded" => return EmittedRelation::emit(Arc::clone(relation), catalog, parameters, memory, mode),
+            emitted => emitted?,
+        };
+        let mut emissions = emissions();
+        if let Some(raced) = kept(&emissions) { return Ok(raced); }
+        if emissions.len() < Self::MAXIMUM { emissions.push((mode, parameters.to_vec(), Arc::clone(&emitted))); }
+        Ok(emitted)
+    }
+}
 
 impl EmissionMode {
     pub(crate) fn field_type(self, ty: &L) -> L {
@@ -532,5 +561,43 @@ mod parameter_tests {
         for relation in [&apply, &mark] {
             assert_eq!(parameter_types(relation, &[Value::I64(-1)], EmissionMode::Execution), [L::Scalar(ScalarType::I64).maybe()]);
         }
+    }
+}
+
+#[cfg(test)]
+mod emission_tests {
+    use super::*;
+    use rtdb_plan::{ColumnId, Field};
+    use rtdb_storage::{MemoryStore, cache::BufferPool};
+
+    fn catalog() -> CatalogSnapshot {
+        let database = crate::DatabaseSnapshot { partitions: vec![], storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)) };
+        CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap()
+    }
+
+    #[test]
+    fn a_plan_keeps_one_emission_per_mode_and_parameter_types_charged_to_its_keeper() {
+        let field = Field { id: ColumnId(0), name: "a".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: L::Scalar(ScalarType::I64) };
+        let parameter = Expr::Parameter { index: 0, data_type: L::Scalar(ScalarType::I64) };
+        let relation = Arc::new(Relation::new(Schema::new(vec![field]).unwrap(), RelationNode::Values { rows: vec![vec![parameter]] }).unwrap());
+        let (keeper, query) = (MemoryBudget::new(1 << 24), MemoryBudget::new(1 << 24));
+        let emissions = Emissions::default();
+        let integers = [L::Scalar(ScalarType::I64)];
+        let texts = [L::Scalar(ScalarType::Utf8)];
+        let first = emissions.emit(&relation, &catalog(), &integers, &query, Some(&keeper), EmissionMode::Execution).unwrap();
+        let again = emissions.emit(&relation, &catalog(), &integers, &query, Some(&keeper), EmissionMode::Execution).unwrap();
+        assert!(Arc::ptr_eq(&first, &again));
+        for (types, mode) in [(&texts, EmissionMode::Execution), (&integers, EmissionMode::ArrowFields)] {
+            let kept = emissions.emit(&relation, &catalog(), types, &query, Some(&keeper), mode).unwrap();
+            let fresh = EmittedRelation::emit(Arc::clone(&relation), &catalog(), types, &query, mode).unwrap();
+            assert!(!Arc::ptr_eq(&kept, &first));
+            assert_eq!(kept.schema(), fresh.schema());
+        }
+        assert_eq!(query.used_bytes(), 0);
+        assert!(keeper.used_bytes() > 0);
+        let unkept = Emissions::default().emit(&relation, &catalog(), &integers, &query, None, EmissionMode::Execution).unwrap();
+        assert!(query.used_bytes() > 0);
+        drop(unkept);
+        assert_eq!(query.used_bytes(), 0);
     }
 }

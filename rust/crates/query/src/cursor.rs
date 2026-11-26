@@ -53,7 +53,8 @@ pub(crate) trait RowCursor: Send {
 pub(crate) type BoxCursor = Box<dyn RowCursor>;
 
 #[derive(Clone)]
-pub struct PreparedQuery { relation: Arc<Relation>, settings: Arc<rtdb_plan::QuerySettings>, output: QueryOutput, required_parameter_count: usize, _plan_reservation: Option<Arc<MemoryReservation>> }
+pub struct PreparedQuery { relation: Arc<Relation>, settings: Arc<rtdb_plan::QuerySettings>, output: QueryOutput, required_parameter_count: usize, _plan_reservation: Option<Arc<MemoryReservation>>,
+    emissions: Arc<crate::runtime_schema::Emissions> }
 #[derive(Clone)]
 enum QueryOutput { Rows, Plan(Arc<crate::explain::ExplainPlan>), Analyze(Schema) }
 
@@ -68,7 +69,7 @@ impl PreparedQuery {
             QueryOutput::Plan(plan) => QueryOutput::Plan(plan.recharged(memory)?),
             output => output.clone(),
         };
-        Ok(Self { output, _plan_reservation, ..self.clone() })
+        Ok(Self { output, _plan_reservation, emissions: Default::default(), ..self.clone() })
     }
     pub fn new(relation: Arc<Relation>) -> Result<Self> { Self::with_settings(relation, rtdb_plan::QuerySettings::default()) }
     /// Retains a validated relation with its existing operator shape.
@@ -84,7 +85,7 @@ impl PreparedQuery {
         relation.validate()?;
         let relation = crate::optimize::prepare(relation)?;
         let required_parameter_count = relation.parameter_count().max(settings.parameter_count());
-        Ok(Self { relation, settings: Arc::new(settings), output: QueryOutput::Rows, required_parameter_count, _plan_reservation: None })
+        Ok(Self { relation, settings: Arc::new(settings), output: QueryOutput::Rows, required_parameter_count, _plan_reservation: None, emissions: Default::default() })
     }
     /// Retains query metadata as well as the relation; SQL callers should use this constructor.
     pub fn from_prepared(prepared: rtdb_plan::PreparedStatement, memory: &Arc<MemoryBudget>) -> Result<Self> {
@@ -103,7 +104,7 @@ impl PreparedQuery {
         };
         relation.validate()?;
         let required_parameter_count = lexical_parameters.max(relation.parameter_count()).max(prepared.settings.parameter_count());
-        Ok(Self { relation, settings: Arc::new(prepared.settings), output, required_parameter_count, _plan_reservation: Some(plan_reservation) })
+        Ok(Self { relation, settings: Arc::new(prepared.settings), output, required_parameter_count, _plan_reservation: Some(plan_reservation), emissions: Default::default() })
     }
     pub fn schema(&self) -> &Schema { match &self.output { QueryOutput::Rows => self.relation.schema(), QueryOutput::Plan(plan) => &plan.schema, QueryOutput::Analyze(schema) => schema } }
     pub fn relation(&self) -> &Arc<Relation> { &self.relation }
@@ -132,9 +133,13 @@ impl PreparedQuery {
     pub fn result_schema(&self, context: &QueryContext) -> Result<Arc<RuntimeSchema>> {
         self.emit_result_schema(context, &[])
     }
+    /// This plan's emission, kept with the plan where its charge has a keeper.
+    fn emit(&self, catalog: &crate::CatalogSnapshot, parameters: &[LogicalType], memory: &Arc<MemoryBudget>, mode: EmissionMode) -> Result<Arc<EmittedRelation>> {
+        self.emissions.emit(&self.relation, catalog, parameters, memory, self._plan_reservation.as_ref().map(|reservation| reservation.budget()), mode)
+    }
     fn emit_result_schema(&self, context: &QueryContext, parameter_fields: &[LogicalType]) -> Result<Arc<RuntimeSchema>> {
         context.check_cancelled()?;
-        let emitted = EmittedRelation::emit(Arc::clone(&self.relation), &context.catalog, parameter_fields, &context.memory, EmissionMode::ArrowFields)?;
+        let emitted = self.emit(&context.catalog, parameter_fields, &context.memory, EmissionMode::ArrowFields)?;
         let schema = match &self.output {
             QueryOutput::Rows => emitted.schema(),
             QueryOutput::Plan(plan) => &plan.schema,
@@ -232,7 +237,7 @@ impl PreparedQuery {
             context.operator_scope()
         } else { Arc::clone(&context) };
         let schema = self.emit_result_schema(&operator, types)?;
-        let runtime_schema = EmittedRelation::derive(Arc::clone(&self.relation), &operator.catalog, types, &operator.memory)?.output();
+        let runtime_schema = self.emit(&operator.catalog, types, &operator.memory, EmissionMode::Execution)?.output();
         let logical = runtime_schema.schema();
         let memory = &operator.memory;
         let computed = if projection_has_computation(&self.relation) {
@@ -376,7 +381,7 @@ impl PreparedQuery {
             return Ok(cursor);
         }
         let parameters = Arc::new(bind(&context.memory)?);
-        let runtime_schema = EmittedRelation::derive(Arc::clone(&self.relation), &context.catalog, parameters.types(), &context.memory)?;
+        let runtime_schema = self.emit(&context.catalog, parameters.types(), &context.memory, EmissionMode::Execution)?;
         let analysis = if matches!(&self.output, QueryOutput::Analyze(_)) { Some(crate::analysis::AnalysisNode::new(&self.relation, &context)?) } else { None };
         let execution = Execution { context: Arc::clone(&context), parameters, outer: crate::context::OuterRows::empty(&context.memory)?, bindings: None, analysis: analysis.clone() };
         let cancellation = context.cancellation.clone();
