@@ -1265,7 +1265,11 @@ mod tests {
             Ok(true)
         }
 
-        async fn absent(&self, _key: &ObjectKey, _version: &PhysicalObjectVersion) -> Result<bool> { Ok(false) }
+        async fn absent(&self, key: &ObjectKey, _version: &PhysicalObjectVersion) -> Result<bool> {
+            if key.as_str().contains("/~garbage/") { return Ok(self.markers.load(Ordering::Relaxed) > 0); }
+            // The first erase loses its reply, so only a later attempt removes the version.
+            Ok(self.attempts.load(Ordering::Relaxed) > 1)
+        }
 
         async fn erase(&self, key: &ObjectKey, version: &PhysicalObjectVersion) -> Result<()> {
             assert_eq!(version.key, format!("cell/{}", key.as_str().replace('~', "%7E")));
