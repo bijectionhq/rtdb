@@ -1109,7 +1109,7 @@ impl<'a> OpenTransaction<'a> {
                 return self.buffer.record_sql_declaration(&table, &columns);
             },
             Mutation::CreateSearchIndex { name, table, columns, analyzer, history, if_not_exists } => {
-                if table.database != self.context.database { return Err(Anomaly::incorrect("xtdb/table-not-found", "A search index cannot cover another database's table")); }
+                if table.database != self.context.database { return Err(rtdb_plan::table_not_found("A search index cannot cover another database's table")); }
                 if TableRef::owned_schema(&table.table.schema) { check_table(&table.table)?; }
                 check_search_index_name(&name)?;
                 if if_not_exists && self.index_exists("search_indexes", &name).await? { return Ok(()); }
@@ -1125,7 +1125,7 @@ impl<'a> OpenTransaction<'a> {
                 return self.buffer.delete(TableRef::new("xt", "search_indexes"), &rtdb_types::EntityId::String(name), interval(self.tx_key().system_time, Timestamp::MAX)?);
             }
             Mutation::CreateOrderedIndex { name, table, columns, if_not_exists } => {
-                if table.database != self.context.database { return Err(Anomaly::incorrect("xtdb/table-not-found", "An ordered index must cover a table in this database")); }
+                if table.database != self.context.database { return Err(rtdb_plan::table_not_found("An ordered index must cover a table in this database")); }
                 check_table(&table.table)?;
                 check_ordered_index_name(&name)?;
                 if columns.iter().collect::<std::collections::BTreeSet<_>>().len() != columns.len()
@@ -1154,7 +1154,7 @@ impl<'a> OpenTransaction<'a> {
                 return self.buffer.delete(TableRef::new("xt", "ordered_indexes"), &rtdb_types::EntityId::String(name), interval(self.tx_key().system_time, Timestamp::MAX)?);
             }
             Mutation::CreateVectorIndex { name, table, column, partition, dimensions, method, recall, if_not_exists } => {
-                if table.database != self.context.database { return Err(Anomaly::incorrect("xtdb/table-not-found", "A vector index must cover a table in this database")); }
+                if table.database != self.context.database { return Err(rtdb_plan::table_not_found("A vector index must cover a table in this database")); }
                 check_table(&table.table)?;
                 check_search_index_name(&name)?;
                 let method = method.to_ascii_lowercase();
@@ -1202,7 +1202,7 @@ impl<'a> OpenTransaction<'a> {
             }
         };
         let table = table.ok_or_else(|| Anomaly::fault("rtdb.tx/mutation-table", "Mutation has no target"))?;
-        if table.database != self.context.database { return Err(Anomaly::incorrect("xtdb/table-not-found", "Mutation cannot write to another database")); }
+        if table.database != self.context.database { return Err(rtdb_plan::table_not_found("Mutation cannot write to another database")); }
         if matches!(kind, MutationKind::Put)
             && table.table.schema == "xt" && table.table.table == HOSTED_CAPACITY_DECLARATIONS
         {

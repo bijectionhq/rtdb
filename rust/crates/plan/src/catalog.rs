@@ -1,6 +1,6 @@
 use rtdb_types::StructFields;
 use crate::{ColumnId, Expr};
-use rtdb_types::{Anomaly, LogicalType, Result, ScalarType, TableRef, TimeUnit};
+use rtdb_types::{Anomaly, AnomalyKind, LogicalType, Result, ScalarType, TableRef, TimeUnit};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -67,7 +67,7 @@ pub fn resolve_table(catalog: &dyn Catalog, name: &[Identifier], search_path: &[
             candidates
         }
         [database, schema, table] => {
-            if catalog.transaction_scoped() && database != default_database { return Err(Anomaly::incorrect("xtdb/table-not-found", format!("A transaction resolves tables only within its own database ('{default_database}')"))); }
+            if catalog.transaction_scoped() && database != default_database { return Err(table_not_found(format!("A transaction resolves tables only within its own database ('{default_database}')"))); }
             if !catalog.databases().contains(database) { return Err(Anomaly::incorrect("xtdb/unknown-db", format!("Unknown database: {database}"))); }
             vec![QualifiedTable { database: database.clone(), table: TableRef::new(schema, table) }]
         }
@@ -88,7 +88,11 @@ pub fn resolve_table(catalog: &dyn Catalog, name: &[Identifier], search_path: &[
         _ => {}
     }
     let suffix = if catalog.transaction_scoped() { format!(" - a transaction resolves tables only within its own database ('{default_database}'), reading a two-part name as schema.table") } else { String::new() };
-    Err(Anomaly::incorrect("xtdb/table-not-found", format!("Table not found: {}{suffix}", normalized.join("."))))
+    Err(table_not_found(format!("Table not found: {}{suffix}", normalized.join("."))))
+}
+
+pub fn table_not_found(message: impl Into<String>) -> Anomaly {
+    Anomaly::incorrect("xtdb/table-not-found", message).with_kind(AnomalyKind::TableNotFound)
 }
 
 /// Identifier components are normalized before construction.

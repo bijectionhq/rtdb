@@ -33,7 +33,7 @@ use rtdb_plan::{CatalogMetrics, CatalogUsers};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryCursor};
 use rtdb_storage::cache::{BufferPool, CacheBudget};
 use rtdb_tx::{IDEMPOTENCY_GUARD_RESULT, RetainedAnomaly, SubmitOptions, SubmittedTx, TransactionAuthorization, TransactionResult, TxOp, prepare_submission_with_sql_options};
-use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, EntityId, Interval, LogicalType, PlacedAttempt, PlacedDecision, ReplicaPosition, Result, ScalarType, SourcePosition, TimeBasis, TimeUnit, Timestamp, TransactionKey, TxBasis, TxId, Value};
+use rtdb_types::{Anomaly, AnomalyCategory, AnomalyKind, CatalogCut, EntityId, Interval, LogicalType, PlacedAttempt, PlacedDecision, ReplicaPosition, Result, ScalarType, SourcePosition, TimeBasis, TimeUnit, Timestamp, TransactionKey, TxBasis, TxId, Value};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -996,7 +996,7 @@ impl Node {
         let arguments = vec![timestamp(retry_time), timestamp(submitted_at), Value::Utf8(key.to_owned())];
         let prepared = match self.outcome_query(OutcomeQuery::Historical, &context, &arguments) {
             Ok(prepared) => prepared,
-            Err(error) if error.code == "xtdb/table-not-found" || error.code.contains("unknown-table") => return Ok(None),
+            Err(error) if error.is(AnomalyKind::TableNotFound) => return Ok(None),
             Err(error) => return Err(error),
         };
         let mut cursor = prepared.execute(context, arguments).await?;
@@ -1016,7 +1016,7 @@ impl Node {
         let arguments = vec![Value::Utf8(attempt.outcome_key())];
         let prepared = match self.outcome_query(OutcomeQuery::Placed, &context, &arguments) {
             Ok(prepared) => prepared,
-            Err(error) if error.code == "xtdb/table-not-found" || error.code.contains("unknown-table") => return Ok(None),
+            Err(error) if error.is(AnomalyKind::TableNotFound) => return Ok(None),
             Err(error) => return Err(error),
         };
         let mut cursor = prepared.execute(context, arguments).await?;

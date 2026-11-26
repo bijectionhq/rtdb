@@ -30,6 +30,8 @@ pub enum AnomalyKind {
     ProgramLimitExceeded,
     /// A number did not fit the type it was to be stored or sent as.
     NumericValueOutOfRange,
+    /// A table name resolved to no table.
+    TableNotFound,
 }
 
 impl AnomalyKind {
@@ -42,6 +44,7 @@ impl AnomalyKind {
             "rtdb.query/spill-limit" => Some(Self::ConfigurationLimitExceeded),
             "rtdb.expr/regex-limit" | "rtdb.expr/regex-host-limit" | "rtdb.query/sort-size" => Some(Self::ProgramLimitExceeded),
             "rtdb/decimal-precision" | "rtdb.pgwire/integer-out-of-range" => Some(Self::NumericValueOutOfRange),
+            "xtdb/table-not-found" => Some(Self::TableNotFound),
             _ => None,
         }
     }
@@ -173,6 +176,7 @@ mod tests {
         assert_eq!(AnomalyKind::from_wire_code("rtdb.expr/regex-limit"), Some(AnomalyKind::ProgramLimitExceeded));
         assert_eq!(AnomalyKind::from_wire_code("rtdb/decimal-precision"), Some(AnomalyKind::NumericValueOutOfRange));
         assert_eq!(AnomalyKind::from_wire_code("rtdb.pgwire/integer-out-of-range"), Some(AnomalyKind::NumericValueOutOfRange));
+        assert_eq!(AnomalyKind::from_wire_code("xtdb/table-not-found"), Some(AnomalyKind::TableNotFound));
         assert_eq!(AnomalyKind::from_wire_code("xtdb/sql-error"), None);
         assert_eq!(AnomalyKind::from_wire_code("xtdb.expression/overflow-error"), None);
     }
@@ -180,7 +184,8 @@ mod tests {
     #[test]
     fn every_kind_serialises_under_its_kebab_case_name() {
         for (kind, name) in [(AnomalyKind::ResourceExhausted, "resource-exhausted"), (AnomalyKind::ConfigurationLimitExceeded, "configuration-limit-exceeded"),
-            (AnomalyKind::ProgramLimitExceeded, "program-limit-exceeded"), (AnomalyKind::NumericValueOutOfRange, "numeric-value-out-of-range")] {
+            (AnomalyKind::ProgramLimitExceeded, "program-limit-exceeded"), (AnomalyKind::NumericValueOutOfRange, "numeric-value-out-of-range"),
+            (AnomalyKind::TableNotFound, "table-not-found")] {
             assert_eq!(serde_json::to_value(kind).unwrap(), name);
             assert_eq!(serde_json::from_value::<AnomalyKind>(name.into()).unwrap(), kind);
         }
