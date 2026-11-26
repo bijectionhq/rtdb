@@ -1,9 +1,9 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock, PoisonError, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_plan::{Expr, Relation, Schema};
-use rtdb_types::{LogicalType as L, Result};
+use rtdb_types::{Anomaly, LogicalType as L, Result};
 
 use crate::runtime_schema::{EmissionMode, EmittedRelation, declared_parameter_types, expression_bound, schema_bound};
 use crate::{CatalogSnapshot, invalid};
@@ -11,11 +11,14 @@ use crate::{CatalogSnapshot, invalid};
 /// A prepared query compiled once for each parameter-type signature it runs with, beside what its relation alone decides.
 /// The catalog contributes nothing a compilation reads but the plan's own table bindings and the fixed system schemas,
 /// so every snapshot runs a signature's compiled plan the same way.
-/// Everything kept is charged to `keeper`; without one, each execution compiles for itself and nothing is kept.
+/// Everything kept is charged to `keeper`.
+/// At most `KEPT` signatures of each kind are kept, and a new one past that, or one the keeper refuses, evicts the least
+/// recently used.
+/// Without a keeper, each execution compiles for itself and nothing is kept.
 pub(crate) struct CompiledQuery {
     keeper: Option<Arc<MemoryBudget>>,
-    plans: RwLock<Vec<CompiledPlan>>,
-    declarations: RwLock<Vec<Declarations>>,
+    plans: Kept<CompiledPlan>,
+    declarations: Kept<Declarations>,
     allocation_bound: OnceLock<usize>,
     facts: [OnceLock<bool>; 4],
 }
@@ -30,10 +33,12 @@ struct Declarations { mode: EmissionMode, width: usize, types: Arc<[Option<L>]>,
 pub(crate) enum Fact { RequestsToken, FillsRowBatches, UsesRowBatchLimit, ProjectionHasComputation }
 
 impl CompiledQuery {
-    const MAXIMUM: usize = 4;
+    /// Signatures kept of each kind: a statement runs with very few parameter-type signatures, and one that sees more
+    /// keeps the ones it uses most recently.
+    const KEPT: usize = 4;
 
     pub(crate) fn kept_by(keeper: Option<Arc<MemoryBudget>>) -> Self {
-        Self { keeper, plans: Default::default(), declarations: Default::default(), allocation_bound: OnceLock::new(), facts: Default::default() }
+        Self { keeper, plans: Kept::new(Self::KEPT), declarations: Kept::new(Self::KEPT), allocation_bound: OnceLock::new(), facts: Default::default() }
     }
 
     pub(crate) fn fact(&self, fact: Fact, decide: impl FnOnce() -> bool) -> bool { *self.facts[fact as usize].get_or_init(decide) }
@@ -45,50 +50,93 @@ impl CompiledQuery {
     }
 
     /// The parameter types `relation` declares for `width` parameters.
-    pub(crate) fn declared(&self, relation: &Relation, width: usize, mode: EmissionMode) -> Arc<[Option<L>]> {
-        let kept = |declarations: &[Declarations]| declarations.iter()
-            .find(|kept| kept.mode == mode && kept.width == width).map(|kept| Arc::clone(&kept.types));
-        if let Some(types) = kept(&self.declarations.read().unwrap_or_else(PoisonError::into_inner)) { return types; }
+    pub(crate) fn declared(&self, relation: &Relation, width: usize, mode: EmissionMode) -> Result<Arc<[Option<L>]>> {
+        let found = |kept: &Declarations| (kept.mode == mode && kept.width == width).then(|| Arc::clone(&kept.types));
+        if let Some(types) = self.declarations.find(&found) { return Ok(types); }
         let types: Arc<[Option<L>]> = declared_parameter_types(relation, width, mode).into();
-        let Some(keeper) = &self.keeper else { return types; };
-        let mut declarations = self.declarations.write().unwrap_or_else(PoisonError::into_inner);
-        if let Some(raced) = kept(&declarations) { return raced; }
-        if declarations.len() >= Self::MAXIMUM { return types; }
-        let bytes = || -> Result<usize> {
-            let inline = width.checked_mul(std::mem::size_of::<Option<L>>()).ok_or_else(size_error)?;
-            let bytes = types.iter().flatten().try_fold(inline, |bytes, ty| bytes.checked_add(ty.retained_bytes()?).ok_or_else(size_error))?;
-            bytes.checked_add(256).ok_or_else(size_error)
-        };
-        let Ok(reservation) = bytes().and_then(|bytes| keeper.reserve(bytes)) else { return types; };
-        declarations.push(Declarations { mode, width, types: Arc::clone(&types), _reservation: reservation });
-        types
+        let Some(keeper) = &self.keeper else { return Ok(types); };
+        let inline = width.checked_mul(std::mem::size_of::<Option<L>>()).ok_or_else(size_error)?;
+        let bytes = types.iter().flatten().try_fold(inline, |bytes, ty| bytes.checked_add(ty.retained_bytes()?).ok_or_else(size_error))?;
+        let bytes = bytes.checked_add(256).ok_or_else(size_error)?;
+        let Some(reservation) = self.declarations.admit(|| keeper.reserve(bytes))? else { return Ok(types); };
+        Ok(self.declarations.insert(Declarations { mode, width, types, _reservation: reservation }, &found))
     }
 
-    /// The plan compiled for `parameters` in `mode`, kept where there is a keeper, or compiled in `memory` for this use alone.
+    /// The plan compiled for `parameters` in `mode`, kept where there is a keeper, or compiled in `memory` for this use
+    /// alone where there is none or it cannot hold the plan even with nothing else kept.
     pub(crate) fn emit(&self, relation: &Arc<Relation>, catalog: &CatalogSnapshot, parameters: &[L], memory: &Arc<MemoryBudget>,
         mode: EmissionMode) -> Result<Arc<EmittedRelation>> {
-        let kept = |plans: &[CompiledPlan]| plans.iter()
-            .find(|plan| plan.mode == mode && plan.parameters.as_slice() == parameters).map(|plan| Arc::clone(&plan.emitted));
-        let read = || self.plans.read().unwrap_or_else(PoisonError::into_inner);
-        if let Some(emitted) = kept(&read()) { return Ok(emitted); }
-        let Some(keeper) = self.keeper.as_ref().filter(|_| read().len() < Self::MAXIMUM) else {
-            return EmittedRelation::emit(Arc::clone(relation), catalog, parameters, memory, mode);
+        let found = |plan: &CompiledPlan| (plan.mode == mode && plan.parameters.as_slice() == parameters).then(|| Arc::clone(&plan.emitted));
+        if let Some(emitted) = self.plans.find(&found) { return Ok(emitted); }
+        let unkept = || EmittedRelation::emit(Arc::clone(relation), catalog, parameters, memory, mode);
+        let Some(keeper) = &self.keeper else { return unkept(); };
+        let Some(emitted) = self.plans.admit(|| EmittedRelation::emit(Arc::clone(relation), catalog, parameters, keeper, mode))? else {
+            return unkept();
         };
-        let emitted = match EmittedRelation::emit(Arc::clone(relation), catalog, parameters, keeper, mode) {
-            Err(error) if error.code == "rtdb/memory-budget-exceeded" => return EmittedRelation::emit(Arc::clone(relation), catalog, parameters, memory, mode),
-            emitted => emitted?,
-        };
-        let mut plans = self.plans.write().unwrap_or_else(PoisonError::into_inner);
-        if let Some(raced) = kept(&plans) { return Ok(raced); }
-        if plans.len() < Self::MAXIMUM {
-            emitted.keep_operators(keeper);
-            plans.push(CompiledPlan { mode, parameters: parameters.to_vec(), emitted: Arc::clone(&emitted) });
-        }
-        Ok(emitted)
+        emitted.keep_operators(keeper);
+        Ok(self.plans.insert(CompiledPlan { mode, parameters: parameters.to_vec(), emitted }, &found))
     }
 }
 
-fn size_error() -> rtdb_types::Anomaly { invalid("compiled-plan-size", "Compiled plan exceeds addressable memory") }
+/// At most `capacity` entries, each stamped with its last use.
+struct Kept<T> { entries: RwLock<Vec<KeptEntry<T>>>, clock: AtomicU64, capacity: usize }
+
+struct KeptEntry<T> { value: T, used: AtomicU64 }
+
+impl<T> Kept<T> {
+    fn new(capacity: usize) -> Self { Self { entries: RwLock::new(Vec::new()), clock: AtomicU64::new(0), capacity } }
+    fn read(&self) -> RwLockReadGuard<'_, Vec<KeptEntry<T>>> { self.entries.read().unwrap_or_else(PoisonError::into_inner) }
+    fn write(&self) -> RwLockWriteGuard<'_, Vec<KeptEntry<T>>> { self.entries.write().unwrap_or_else(PoisonError::into_inner) }
+    fn tick(&self) -> u64 { self.clock.fetch_add(1, Ordering::Relaxed) }
+
+    /// What `found` answers for the first entry it matches, which counts as a use of that entry.
+    fn find<R>(&self, found: &impl Fn(&T) -> Option<R>) -> Option<R> {
+        self.read().iter().find_map(|entry| {
+            let answer = found(&entry.value)?;
+            entry.used.store(self.tick(), Ordering::Relaxed);
+            Some(answer)
+        })
+    }
+
+    /// Runs `admit`, evicting the least recently used entry after each refusal by the keeper.
+    /// `None` once a refusal leaves nothing to evict; any other error is returned.
+    fn admit<A>(&self, mut admit: impl FnMut() -> Result<A>) -> Result<Option<A>> {
+        loop {
+            match admit() {
+                Ok(admitted) => return Ok(Some(admitted)),
+                Err(error) if refused(&error) => if !self.evict() { return Ok(None); },
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn evict(&self) -> bool { Self::evict_from(&mut self.write()) }
+
+    fn evict_from(entries: &mut Vec<KeptEntry<T>>) -> bool {
+        let Some(oldest) = entries.iter().enumerate().min_by_key(|(_, entry)| entry.used.load(Ordering::Relaxed)).map(|(index, _)| index) else {
+            return false;
+        };
+        entries.swap_remove(oldest);
+        true
+    }
+
+    /// Keeps `value` unless another caller kept a matching entry first, and answers `found` for whichever is kept.
+    fn insert<R>(&self, value: T, found: &impl Fn(&T) -> Option<R>) -> R {
+        let mut entries = self.write();
+        if let Some(raced) = entries.iter().find_map(|entry| found(&entry.value)) { return raced; }
+        let answer = found(&value).expect("a kept entry matches its own signature");
+        while entries.len() >= self.capacity && Self::evict_from(&mut entries) {}
+        entries.push(KeptEntry { value, used: AtomicU64::new(self.tick()) });
+        answer
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize { self.read().len() }
+}
+
+fn refused(error: &Anomaly) -> bool { error.code == "rtdb/memory-budget-exceeded" }
+
+fn size_error() -> Anomaly { invalid("compiled-plan-size", "Compiled plan exceeds addressable memory") }
 
 /// What building one emitted node's operator decides from the plan and its types alone, decided once per node.
 /// Only a node of a kept compiled plan keeps its template, charged to that plan's keeper.
@@ -118,12 +166,16 @@ impl Operators {
         self.state_bound.get_or_init(|| bound).clone()
     }
 
-    /// The node's template, built by `build` unless kept; one the keeper cannot hold serves this execution alone.
+    /// The node's template, built by `build` unless kept; one the keeper refuses serves this execution alone.
     pub(crate) fn template(&self, build: impl FnOnce() -> Result<OperatorTemplate>) -> Result<Arc<OperatorTemplate>> {
         if let Some(kept) = self.template.get() { return Ok(Arc::clone(&kept.template)); }
         let template = Arc::new(build()?);
         let Some(keeper) = self.keeper.get() else { return Ok(template); };
-        let Ok(reservation) = template.retained_bytes().and_then(|bytes| keeper.reserve(bytes)) else { return Ok(template); };
+        let reservation = match keeper.reserve(template.retained_bytes()?) {
+            Ok(reservation) => reservation,
+            Err(error) if refused(&error) => return Ok(template),
+            Err(error) => return Err(error),
+        };
         Ok(Arc::clone(&self.template.get_or_init(|| KeptTemplate { template, _reservation: reservation }).template))
     }
 
@@ -213,19 +265,35 @@ impl OperatorTemplate {
 }
 
 /// Whether an expression has been prepared without error over its compiled plan's input and parameter types, kept only
-/// where preparation reads nothing else: a regex replacement compiles a pattern a parameter may supply, and a correlated
-/// column takes its type from the outer row.
+/// where preparing each of its nodes reads nothing its compiled signature does not fix.
 #[derive(Debug)]
 pub(crate) struct Admission { invariant: bool, admitted: AtomicBool }
 
 impl Admission {
     pub(crate) fn of(expression: &Expr) -> Self {
         let mut invariant = true;
-        expression.visit(&mut |expression| invariant &= !matches!(expression, Expr::RegexReplace { .. } | Expr::Correlated { .. }));
+        expression.visit(&mut |expression| invariant &= prepared_from_signature(expression));
         Self { invariant, admitted: AtomicBool::new(false) }
     }
     pub(crate) fn admitted(&self) -> bool { self.admitted.load(Ordering::Acquire) }
     pub(crate) fn admit(&self) { if self.invariant { self.admitted.store(true, Ordering::Release); } }
+}
+
+/// Whether preparing this node, apart from its children, reads only its plan's input types and parameter types.
+/// Every variant is listed, so that a new one is classified before any plan can skip its preparation.
+fn prepared_from_signature(expression: &Expr) -> bool {
+    match expression {
+        // A replacement compiles the pattern a parameter's value may supply.
+        Expr::RegexReplace { .. } => false,
+        // A correlated column takes its type from the outer row.
+        Expr::Correlated { .. } => false,
+        // A parameter typed nowhere in its plan takes its type from its value where the execution binds no type for it.
+        Expr::Parameter { data_type: L::Nothing, .. } => false,
+        Expr::Literal(_) | Expr::Column { .. } | Expr::Parameter { .. } | Expr::Unary { .. } | Expr::Binary { .. } | Expr::Call { .. }
+        | Expr::Cast { .. } | Expr::Case { .. } | Expr::SimpleCase { .. } | Expr::Between { .. } | Expr::Coalesce(_) | Expr::Field { .. }
+        | Expr::Subscript { .. } | Expr::List(_) | Expr::Struct(_) | Expr::RowCopy(_) | Expr::In { .. } | Expr::Like { .. }
+        | Expr::DurationLiteral(_) => true,
+    }
 }
 
 #[cfg(test)]
@@ -282,15 +350,70 @@ mod tests {
         let relation = parameter_values(L::Scalar(ScalarType::U32));
         let keeper = MemoryBudget::new(1 << 24);
         let compiled = CompiledQuery::kept_by(Some(Arc::clone(&keeper)));
-        let first = compiled.declared(&relation, 1, EmissionMode::Execution);
-        assert!(Arc::ptr_eq(&first, &compiled.declared(&relation, 1, EmissionMode::Execution)));
+        let first = compiled.declared(&relation, 1, EmissionMode::Execution).unwrap();
+        assert!(Arc::ptr_eq(&first, &compiled.declared(&relation, 1, EmissionMode::Execution).unwrap()));
         assert!(keeper.used_bytes() > 0);
         for (width, mode) in [(1, EmissionMode::Execution), (3, EmissionMode::Execution), (1, EmissionMode::ArrowFields), (0, EmissionMode::Execution),
             (2, EmissionMode::Execution), (2, EmissionMode::ArrowFields)] {
-            assert_eq!(&*compiled.declared(&relation, width, mode), declared_parameter_types(&relation, width, mode).as_slice());
+            assert_eq!(&*compiled.declared(&relation, width, mode).unwrap(), declared_parameter_types(&relation, width, mode).as_slice());
         }
         let unkept = CompiledQuery::kept_by(None);
-        assert!(!Arc::ptr_eq(&unkept.declared(&relation, 1, EmissionMode::Execution), &unkept.declared(&relation, 1, EmissionMode::Execution)));
+        assert!(!Arc::ptr_eq(&unkept.declared(&relation, 1, EmissionMode::Execution).unwrap(), &unkept.declared(&relation, 1, EmissionMode::Execution).unwrap()));
+    }
+
+    fn scalars() -> [L; 5] {
+        [ScalarType::I64, ScalarType::F64, ScalarType::Utf8, ScalarType::Bool, ScalarType::I32].map(L::Scalar)
+    }
+
+    #[test]
+    fn a_signature_past_the_kept_ones_evicts_the_least_recently_used_and_is_kept() {
+        let relation = parameter_values(L::Scalar(ScalarType::I64));
+        let (keeper, query) = (MemoryBudget::new(1 << 24), MemoryBudget::new(1 << 24));
+        let compiled = CompiledQuery::kept_by(Some(Arc::clone(&keeper)));
+        let [first, second, third, fourth, fifth] = scalars();
+        let emit = |ty: &L| compiled.emit(&relation, &catalog(), std::slice::from_ref(ty), &query, EmissionMode::Execution).unwrap();
+        let kept_first = emit(&first);
+        let kept_second = emit(&second);
+        for ty in [&third, &fourth] { emit(ty); }
+        assert!(Arc::ptr_eq(&kept_first, &emit(&first)), "a use refreshes the first signature");
+        let kept_fifth = emit(&fifth);
+        assert_eq!(compiled.plans.len(), CompiledQuery::KEPT);
+        assert!(Arc::ptr_eq(&kept_fifth, &emit(&fifth)), "the fifth signature is kept rather than compiled again");
+        assert!(Arc::ptr_eq(&kept_first, &emit(&first)));
+        assert!(!Arc::ptr_eq(&kept_second, &emit(&second)), "the least recently used signature was evicted");
+        assert_eq!(compiled.plans.len(), CompiledQuery::KEPT);
+        assert_eq!(query.used_bytes(), 0, "every signature compiled into the keeper");
+    }
+
+    #[test]
+    fn a_signature_the_keeper_refuses_evicts_a_kept_one_instead_of_compiling_unkept() {
+        let relation = parameter_values(L::Scalar(ScalarType::I64));
+        let query = MemoryBudget::new(1 << 24);
+        let [integers, doubles, ..] = scalars();
+        let measured = MemoryBudget::new(1 << 24);
+        drop(CompiledQuery::kept_by(Some(Arc::clone(&measured))).emit(&relation, &catalog(), std::slice::from_ref(&integers), &query, EmissionMode::Execution).unwrap());
+        let keeper = MemoryBudget::new(measured.peak_bytes());
+        let compiled = CompiledQuery::kept_by(Some(Arc::clone(&keeper)));
+        drop(compiled.emit(&relation, &catalog(), std::slice::from_ref(&integers), &query, EmissionMode::Execution).unwrap());
+        assert_eq!(compiled.plans.len(), 1);
+        let kept = compiled.emit(&relation, &catalog(), std::slice::from_ref(&doubles), &query, EmissionMode::Execution).unwrap();
+        assert_eq!(compiled.plans.len(), 1);
+        assert!(Arc::ptr_eq(&kept, &compiled.emit(&relation, &catalog(), std::slice::from_ref(&doubles), &query, EmissionMode::Execution).unwrap()));
+        assert_eq!(query.used_bytes(), 0);
+    }
+
+    #[test]
+    fn a_plan_the_keeper_cannot_hold_alone_compiles_for_its_execution() {
+        let relation = parameter_values(L::Scalar(ScalarType::I64));
+        let (keeper, query) = (MemoryBudget::new(0), MemoryBudget::new(1 << 24));
+        let compiled = CompiledQuery::kept_by(Some(keeper));
+        let unkept = compiled.emit(&relation, &catalog(), &[L::Scalar(ScalarType::I64)], &query, EmissionMode::Execution).unwrap();
+        assert_eq!(compiled.plans.len(), 0);
+        assert!(query.used_bytes() > 0);
+        drop(unkept);
+        assert_eq!(query.used_bytes(), 0);
+        assert_eq!(&*compiled.declared(&relation, 1, EmissionMode::Execution).unwrap(), declared_parameter_types(&relation, 1, EmissionMode::Execution).as_slice());
+        assert_eq!(compiled.declarations.len(), 0);
     }
 
     #[test]
@@ -344,8 +467,11 @@ mod tests {
         typed.admit();
         assert!(typed.admitted());
         let correlated = Expr::Correlated { depth: 0, id: ColumnId(0), data_type: L::Scalar(ScalarType::I64) };
-        let outer = Admission::of(&Expr::binary(rtdb_plan::BinaryOp::Eq, parameter, correlated));
+        let outer = Admission::of(&Expr::binary(rtdb_plan::BinaryOp::Eq, parameter.clone(), correlated));
         outer.admit();
         assert!(!outer.admitted());
+        let untyped = Admission::of(&Expr::binary(rtdb_plan::BinaryOp::Eq, parameter, Expr::Parameter { index: 1, data_type: L::Nothing }));
+        untyped.admit();
+        assert!(!untyped.admitted(), "a parameter its plan does not type is typed by its value");
     }
 }
