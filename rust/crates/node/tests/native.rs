@@ -59,40 +59,6 @@ async fn running(options: NodeOptions, services: NodeServices) -> (Node, tokio::
     (node, tokio::spawn(driver.run()))
 }
 
-#[tokio::test]
-async fn a_replicated_query_without_a_current_catalog_lease_is_refused_before_evaluation() {
-    struct ClockAtLimit(TickClock);
-    impl Clock for ClockAtLimit {
-        fn now(&self) -> Timestamp { self.0.now() }
-        fn monotonic_micros(&self) -> i64 { i64::MAX }
-    }
-
-    for replicated in [true, false] {
-        let mut config = options();
-        config.replication.enabled = replicated;
-        let clock = Arc::new(ClockAtLimit(TickClock(AtomicI64::new(1_000_000))));
-        let (node, owner) = running(config, NodeServices { clock, ..services() }).await;
-        let basis = QueryBasis {
-            snapshot: node.snapshot_basis().unwrap(),
-            replica_capture: None,
-            resume_token: None,
-            has_await_floor: false,
-            snapshot_time: None,
-            current_time: node.query_instant(),
-            timezone: "UTC".into(),
-        };
-        let context = node.query_context("xtdb", &basis, &Authority, node.cancellation()).await;
-        if replicated {
-            let Err(error) = context else { panic!("a replicated query exposed a snapshot without a current lease") };
-            assert_eq!(error.code, "rtdb.node/catalog-not-current");
-        } else {
-            assert!(context.is_ok(), "offline snapshots do not need a replica lease");
-        }
-        node.shutdown();
-        owner.await.unwrap().unwrap();
-    }
-}
-
 #[derive(Default)]
 struct PausedReadFence {
     entered: tokio::sync::Notify,
@@ -2307,8 +2273,7 @@ async fn compactor_reset_preserves_checkpoint_history_and_resumes_retirement_aft
         settings.compaction_threads = 1;
         settings.automatic_gc = true;
         settings.garbage.blocks_to_keep = usize::MAX;
-        settings.garbage.reader_lease = Duration::from_secs(1);
-        settings.garbage.reader_lease_margin = Duration::from_millis(200);
+        settings.garbage.page_grace = Duration::from_secs(1);
         let (node, driver) = running(settings, fresh_local_services(&runtime_services)).await;
         let database = node.catalog().database("xtdb").unwrap();
         let mut status = database.watch_status();
@@ -2918,8 +2883,7 @@ async fn a_successor_retires_an_old_leaders_trie_only_after_its_query_finishes()
         config.compaction_threads = 1;
         config.garbage.blocks_to_keep = 1;
         config.garbage.garbage_lifetime = Duration::ZERO;
-        config.garbage.reader_lease = Duration::from_secs(1);
-        config.garbage.reader_lease_margin = Duration::from_millis(100);
+        config.garbage.page_grace = Duration::from_secs(1);
 
         let mut predecessor_config = config.clone();
         predecessor_config.replication.idle_heartbeat = false;

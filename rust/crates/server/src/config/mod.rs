@@ -61,7 +61,7 @@ pub struct CompactorSettings {
 #[derive(Clone, Debug)]
 pub struct SearchSettings { pub enabled: bool, pub threads: usize, pub write_format: rtdb_node::SearchFileFormat }
 #[derive(Clone, Debug)]
-pub struct GarbageSettings { pub enabled: bool, pub blocks_to_keep: usize, pub garbage_lifetime: Duration, pub reader_lease: Duration, pub reader_lease_margin: Duration }
+pub struct GarbageSettings { pub enabled: bool, pub blocks_to_keep: usize, pub garbage_lifetime: Duration }
 #[derive(Clone, Debug)]
 pub struct TracingSettings { pub enabled: bool, pub endpoint: String, pub service_name: String, pub query_tracing: bool, pub transaction_tracing: bool }
 /// Physical erasure enrolment for fresh Default primaries; both are off unless configured.
@@ -397,8 +397,9 @@ fn compactor(value: Option<Yaml>, environment: &impl Fn(&str) -> Option<String>)
 }
 fn garbage(value: Option<Yaml>) -> Result<GarbageSettings> {
     let mut fields = YamlFields::new(value.unwrap_or_else(empty), "garbageCollector")?;
-    let result = GarbageSettings { enabled: fields.boolean("enabled")?.unwrap_or(true), blocks_to_keep: positive(fields.integer("blocksToKeep")?.unwrap_or(10) as i64, "blocksToKeep")?, garbage_lifetime: duration(&mut fields, "garbageLifetime", 24 * 3600)?,
-        reader_lease: duration(&mut fields, "readerLease", 3600)?, reader_lease_margin: duration(&mut fields, "readerLeaseMargin", 60)? };
+    let blocks_to_keep = fields.string("blocksToKeep")?.map(|text| yaml_int(&text).ok_or_else(|| invalid("'blocksToKeep' must be a 32-bit integer"))).transpose()?;
+    let result = GarbageSettings { enabled: fields.boolean("enabled")?.unwrap_or(true), blocks_to_keep: positive(i64::from(blocks_to_keep.unwrap_or(10)), "blocksToKeep")?,
+        garbage_lifetime: duration(&mut fields, "garbageLifetime", 24 * 3600)? };
     fields.finish()?;
     Ok(result)
 }
@@ -449,6 +450,13 @@ fn decode_port(fields: &mut YamlFields, key: &str, default: i32) -> Result<i32> 
     let port = fields.integer(key)?.unwrap_or(default);
     if !(-1..=65535).contains(&port) { return Err(Anomaly::incorrect("xtdb.error/illegal-arg", format!("Port value out of range: {port}")).with_context("key", key.into())); }
     Ok(port)
+}
+/// A 32-bit integer as XTDB's YAML decoder (kaml) reads one: decimal, or `0x` hexadecimal or `0o` octal, each optionally negated.
+fn yaml_int(text: &str) -> Option<i32> {
+    let (negative, body) = text.strip_prefix('-').map_or((false, text), |rest| (true, rest));
+    let (radix, digits) = if let Some(hex) = body.strip_prefix("0x") { (16, hex) } else if let Some(octal) = body.strip_prefix("0o") { (8, octal) } else { return join_threshold(text).and_then(|value| i32::try_from(value).ok()); };
+    if digits.starts_with(['+', '-']) && negative { return None; }
+    i32::from_str_radix(&if negative { format!("-{digits}") } else { digits.to_owned() }, radix).ok()
 }
 fn positive(value: i64, key: &str) -> Result<usize> { usize::try_from(value).ok().filter(|value| *value > 0).ok_or_else(|| invalid(format!("{key} must be positive"))) }
 fn integer(fields: &mut YamlFields, key: &str, default: i64) -> Result<i64> { fields.string(key)?.map(|value| value.parse().map_err(|_| invalid(format!("{key} must be an integer")))).transpose().map(|value| value.unwrap_or(default)) }

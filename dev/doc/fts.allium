@@ -298,7 +298,7 @@ rule RetireSearchFiles {
     -- A format 16 run retires on ordered replacement or when its definition leaves force.
     -- Collection orders abandonment of a completed upload once the source cut is installed and the staging owner has drained.
     -- An ordered upload receipt for a rejected replacement is itself eligible for retirement.
-    -- Collection waits for active catalog captures, the latest recovery checkpoint, and the reader lease before releasing a retired run.
+    -- Collection releases a retired run superseded at or before the garbage-as-of horizon once the latest recovery checkpoint no longer needs it.
     -- Every node's lane retires on its own, so a removal may be appended more than once, and a second changes nothing.
     -- A builder on another node may still record an object a retiring lane deleted; its own lane retires that record at its next look.
     when: DefinitionsInForceChanged(table)

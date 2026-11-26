@@ -5184,52 +5184,6 @@ def verify_multi_trim_admission(args, source):
     print(f"{label}: directory floor enforced before physical trim, missing check rejected")
 
 
-def verify_native_current_catalog(args, source):
-    env = os.environ | {
-        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
-        "CARGO_PROFILE_TEST_DEBUG": "0",
-    }
-    test = "a_replicated_query_without_a_current_catalog_lease_is_refused_before_evaluation"
-    command = ["cargo", "test", "--locked", "-p", "rtdb-node", "--test", "native", test, "--", "--exact"]
-    baseline = run_case(command, source / "rust", args.evidence, "rust-current-catalog-admission", env)
-    if baseline.returncode or f"{test} ... ok" not in baseline.stdout:
-        raise ValueError("the replicated query must refuse a snapshot without a current catalog lease")
-    path = source / "rust/crates/node/src/node.rs"
-    original = path.read_bytes()
-    try:
-        replace_once(path, "        crate::read_currency::require_current(database, lease.as_deref())?;\n", "")
-        control = run_case(command, source / "rust", args.evidence, "rust-current-catalog-admission-without-check", env)
-    finally:
-        path.write_bytes(original)
-    if (control.returncode != 101 or f"{test} ... FAILED" not in control.stdout
-        or "a replicated query exposed a snapshot without a current lease" not in control.stdout):
-        raise ValueError("the admission replay did not catch removal of the currency gate")
-    print("rust-current-catalog-admission: baseline passed and the omitted gate was rejected")
-
-
-def verify_native_collector_turnover(args, source):
-    env = os.environ | {
-        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
-        "CARGO_PROFILE_TEST_DEBUG": "0",
-    }
-    test = "a_replacement_collector_waits_a_whole_lease_on_its_own_clock"
-    command = ["cargo", "test", "--locked", "-p", "rtdb-maintenance", "--test", "gc", test, "--", "--exact"]
-    baseline = run_case(command, source / "rust", args.evidence, "rust-collector-turnover", env)
-    if baseline.returncode or f"{test} ... ok" not in baseline.stdout:
-        raise ValueError("the replacement collector must wait a full reader lease and then reclaim")
-    path = source / "rust/crates/maintenance/src/gc.rs"
-    original = path.read_bytes()
-    try:
-        replace_once(path, ".or_insert(now);", ".and_modify(|first| *first = now).or_insert(now);")
-        control = run_case(command, source / "rust", args.evidence, "rust-collector-turnover-restart-window", env)
-    finally:
-        path.write_bytes(original)
-    if (control.returncode != 101 or f"{test} ... FAILED" not in control.stdout
-        or "the replacement collector must reclaim at the elapsed lease boundary" not in control.stdout):
-        raise ValueError("the collection replay did not catch a lease window restarted at every observation")
-    print("rust-collector-turnover: successor waited a full lease, and restarting the window was rejected")
-
-
 def verify_native_trie_gc_retry(args, source):
     env = os.environ | {
         "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
@@ -6499,8 +6453,6 @@ def main():
         "rust/crates/query/src/scan.rs",
         "rust/crates/query/tests/scan.rs",
         "rust/crates/node/src/node.rs",
-        "rust/crates/node/src/read_currency.rs",
-        "rust/crates/node/src/read_currency/step.rs",
         "rust/crates/storage/src/io_region.rs",
         "rust/crates/maintenance/src/merge.rs",
         "rust/crates/maintenance/src/merge/planner.rs",
@@ -6639,8 +6591,6 @@ def main():
             verify_native_reference_read(args, source)
             verify_native_reference_disposal(args, source)
             verify_native_residence_trace(args, source, directory)
-            verify_native_current_catalog(args, source)
-            verify_native_collector_turnover(args, source)
             verify_native_trie_gc_retry(args, source)
             verify_native_reader_drain(args, source)
             verify_native_transaction_catalog_hold(args, source)

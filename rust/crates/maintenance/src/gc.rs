@@ -26,16 +26,15 @@ pub struct GarbageConfig {
     pub table_parallelism: usize,
     pub delete_parallelism: usize,
     pub chunk_size: usize,
-    /// How long a reader on any node may begin provider requests after its catalog was confirmed current.
-    /// The collector waits this long on its own clock after first observing a trie as garbage.
-    pub reader_lease: Duration,
-    /// Subtracted from a reader's lease: twice the bound on clock skew between nodes, plus the longest provider request.
-    pub reader_lease_margin: Duration,
+    /// RTDB-only entity and term directory pages carry no supersession time in the catalog, so the collector releases
+    /// one this long after it first sees it unreferenced; an uploaded page also needs this long to become reachable
+    /// through its published root. Tries and search runs follow the window alone.
+    pub page_grace: Duration,
 }
 
 impl Default for GarbageConfig {
     fn default() -> Self { Self { blocks_to_keep: 10, garbage_lifetime: Duration::from_secs(24 * 60 * 60), table_parallelism: 8, delete_parallelism: 64, chunk_size: 1024,
-        reader_lease: Duration::from_secs(60 * 60), reader_lease_margin: Duration::from_secs(60) } }
+        page_grace: Duration::from_secs(60 * 60) } }
 }
 
 impl GarbageConfig {
@@ -43,19 +42,16 @@ impl GarbageConfig {
         if self.blocks_to_keep == 0 || self.table_parallelism == 0 || self.delete_parallelism == 0 || self.chunk_size == 0 || self.chunk_size > 1024 {
             return Err(crate::invalid("Garbage collection requires positive retention and concurrency, with at most 1024 trie keys per chunk"));
         }
-        if self.reader_lease_margin >= self.reader_lease && !(self.reader_lease.is_zero() && self.reader_lease_margin.is_zero()) {
-            return Err(crate::invalid("The reader lease must exceed its margin; a zero lease admits no provider request from another node"));
-        }
-        self.reader_lease_micros()?;
-        self.reader_lease_margin_micros()?;
+        self.page_grace_micros()?;
         Ok(())
     }
-    pub fn reader_lease_micros(&self) -> Result<i64> { micros(self.reader_lease) }
-    pub fn reader_lease_margin_micros(&self) -> Result<i64> { micros(self.reader_lease_margin) }
+    fn page_grace_micros(&self) -> Result<i64> {
+        i64::try_from(self.page_grace.as_micros()).map_err(|_| crate::invalid("Page grace exceeds the timestamp range"))
+    }
 }
 
-fn micros(duration: Duration) -> Result<i64> {
-    i64::try_from(duration.as_micros()).map_err(|_| crate::invalid("Reader lease exceeds the timestamp range"))
+fn grace_elapsed(first_observed: i64, grace: i64, now: i64) -> bool {
+    first_observed.checked_add(grace).is_some_and(|end| end <= now)
 }
 
 pub trait CollectionObserver: Send + Sync {
@@ -66,17 +62,15 @@ pub fn block_is_garbage(block: BlockIndex, latest: BlockIndex, keep: usize) -> b
     crate::retention::block_is_eligible(block.0, latest.0, keep)
 }
 
-/// Monotonic microseconds; the collector measures only the time elapsed since it first observed a trie.
+/// Monotonic microseconds; the collector measures only the time elapsed since it first observed an unreferenced page.
 pub type CollectorClock = Arc<dyn Fn() -> i64 + Send + Sync>;
 
 pub struct TrieCollector {
     clock: CollectorClock,
-    /// When this collector first saw each trie as eligible; a new collector starts empty and waits afresh.
-    first_observed: Mutex<BTreeMap<(TableRef, TrieKey), i64>>,
+    /// When this collector first saw each page unreferenced; a new collector starts empty and waits afresh.
     first_directory_observed: Mutex<BTreeMap<(TableRef, rtdb_format::cow_tree::PageDigest), i64>>,
     first_term_page_observed: Mutex<BTreeMap<(TableRef, rtdb_format::cow_tree::PageDigest), i64>>,
     directory: Option<(Arc<dyn ArtefactPublisher>, rtdb_types::StorageVersion, rtdb_types::StorageEpoch)>,
-    first_search_observed: Mutex<BTreeMap<(TableRef, [u8; 32]), i64>>,
     search: Option<(Arc<dyn ArtefactPublisher>, rtdb_types::StorageVersion, rtdb_types::StorageEpoch)>,
     retirements: Option<Arc<dyn TableRetirements>>,
     store: Arc<dyn ObjectStore>,
@@ -90,7 +84,7 @@ impl TrieCollector {
     pub fn new(store: Arc<dyn ObjectStore>, partition: Arc<PartitionState>, publisher: Arc<dyn TrieDeletionPublisher>,
         observer: Arc<dyn CollectionObserver>, config: GarbageConfig, clock: CollectorClock) -> Result<Self> {
         config.validate()?;
-        Ok(Self { clock, first_observed: Mutex::default(), first_search_observed: Mutex::default(), search: None,
+        Ok(Self { clock, search: None,
             first_directory_observed: Mutex::default(), first_term_page_observed: Mutex::default(), directory: None, retirements: None, store, partition, publisher, observer, config })
     }
 
@@ -118,20 +112,6 @@ impl TrieCollector {
         epoch: rtdb_types::StorageEpoch) -> Self {
         self.directory = Some((publisher, version, epoch));
         self
-    }
-
-    /// Keeps the eligible tries whose reader lease has elapsed since this collector first observed them.
-    fn leased_out(&self, table: &TableRef, eligible: Vec<TrieKey>) -> Result<Vec<TrieKey>> {
-        let lease = self.config.reader_lease_micros()?;
-        let now = (self.clock)();
-        let mut first_observed = self.first_observed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let current: BTreeSet<&TrieKey> = eligible.iter().collect();
-        first_observed.retain(|(observed, key), _| observed != table || current.contains(key));
-        drop(current);
-        Ok(eligible.into_iter().filter(|key| {
-            let first = *first_observed.entry((table.clone(), key.clone())).or_insert(now);
-            rtdb_storage::read_lease::collection_waited(first, lease, now)
-        }).collect())
     }
 
     pub async fn default_garbage_as_of(&self) -> Result<Option<Timestamp>> {
@@ -190,16 +170,9 @@ impl TrieCollector {
                     eligible.extend(collection.eligible_l0_artefacts(&entry.table, as_of).cloned());
                 }
                 // Every candidate was superseded at or before the garbage-as-of horizon, which is the only protection a
-                // reader has: no reader registers its catalog. A coordinated store releases compacted tries through its
-                // retirement grant at once; the rest wait the reader lease on this collector's clock.
-                let coordinated = self.store.defers_trie_releases();
-                let (due, timed): (Vec<_>, Vec<_>) = eligible.into_iter()
-                    .partition(|key| coordinated && (key.level() > 0 || receipt_l0));
-                let timed = match self.leased_out(&entry.table, timed) {
-                    Ok(ready) => ready,
-                    Err(error) => { self.observer.table_failed(Some(&entry.table), &error); return; }
-                };
-                let (seals, keys): (Vec<_>, Vec<_>) = due.into_iter().chain(timed)
+                // reader has, as in XTDB: no reader registers its catalog, and a read of a catalog older than the window
+                // may find its files gone.
+                let (seals, keys): (Vec<_>, Vec<_>) = eligible.into_iter()
                     .partition(|key| key.level() == 0 && !receipt_l0);
                 let groups = finished_groups(collection.current().trie_catalog(), &entry.table, &keys);
                 let result = IoRegion::retaining(collection.clone(), async {
@@ -249,14 +222,14 @@ impl TrieCollector {
         }
         let roots: BTreeSet<_> = held.iter().map(|root| root.digest).collect();
         let now = (self.clock)();
-        let lease = self.config.reader_lease_micros()?;
+        let grace = self.config.page_grace_micros()?;
         let eligible = {
             let candidates: BTreeSet<_> = retired.iter().filter(|(_, root)| !roots.contains(&root.digest)).map(|(_, root)| root.digest).collect();
             let mut first = self.first_directory_observed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             first.retain(|(recorded, digest), _| recorded != table || candidates.contains(digest));
             candidates.into_iter().filter(|&digest| {
                 let observed = *first.entry((table.clone(), digest)).or_insert(now);
-                rtdb_storage::read_lease::collection_waited(observed, lease, now)
+                grace_elapsed(observed, grace, now)
             }).collect::<BTreeSet<_>>()
         };
         if eligible.is_empty() { return Ok(()); }
@@ -291,7 +264,7 @@ impl TrieCollector {
     }
 
     // Each build writes fresh digests, so a sweep candidate cannot acquire a new reference through a rebuild of the same rows.
-    // The reader lease gives newly uploaded pages time to become reachable through the published root.
+    // The page grace gives newly uploaded pages time to become reachable through the published root.
     async fn collect_term_directory_pages(&self, entry: &TableEntry, collection: &rtdb_index::TrieCollection,
         cut: Option<CatalogCut>, cancellation: &CancellationToken) -> Result<()> {
         use rtdb_format::{cow_tree, term_directory};
@@ -331,13 +304,13 @@ impl TrieCollector {
             if !reachable.contains(&root.digest) { reachable.extend(cow_tree::reachable(&pages, root).await?); }
         }
         let now = (self.clock)();
-        let lease = self.config.reader_lease_micros()?;
+        let grace = self.config.page_grace_micros()?;
         let unreachable = {
             let mut first = self.first_term_page_observed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             first.retain(|(recorded, digest), _| recorded != table || (stored.contains(digest) && !reachable.contains(digest)));
             stored.into_iter().filter(|digest| !reachable.contains(digest)).filter(|&digest| {
                 let observed = *first.entry((table.clone(), digest)).or_insert(now);
-                rtdb_storage::read_lease::collection_waited(observed, lease, now)
+                grace_elapsed(observed, grace, now)
             }).collect::<Vec<_>>()
         };
         if cancellation.is_cancelled() { return Err(crate::closed()); }
@@ -428,22 +401,8 @@ impl TrieCollector {
     async fn collect_search_runs(&self, entry: &TableEntry, collection: &rtdb_index::TrieCollection, as_of: Timestamp,
         cut: Option<CatalogCut>, cancellation: &CancellationToken) -> Result<()> {
         let Some((publisher, version, epoch)) = &self.search else { return Ok(()); };
-        let eligible: BTreeMap<_, _> = collection.eligible_search_runs(&entry.table, as_of)
-            .filter_map(|run| run.identity().ok().map(|id| (id, run))).collect();
-        let ready: Vec<_> = if self.store.releases_exact_search_runs() {
-            eligible.into_values().collect()
-        } else {
-            let lease = self.config.reader_lease_micros()?;
-            let now = (self.clock)();
-            let mut first = self.first_search_observed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            first.retain(|(table, digest), _| table != &entry.table || eligible.contains_key(digest));
-            eligible.into_iter().filter_map(|(digest, run)| {
-                let first = *first.entry((entry.table.clone(), digest)).or_insert(now);
-                rtdb_storage::read_lease::collection_waited(first, lease, now).then_some(run)
-            }).collect()
-        };
         let mut entries = Vec::new();
-        for run in ready {
+        for run in collection.eligible_search_runs(&entry.table, as_of) {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
             let key = ObjectKey::new(run.object_key(&entry.slug)?)?;
             if !self.store.permits_search_release(&key, run.publication.as_ref(), cut).await? { continue; }

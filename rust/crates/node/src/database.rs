@@ -16,7 +16,9 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::ordered_index::OrderedIndexMaintenance;
-use crate::read_currency::ReadCurrency;
+
+/// How long Default erasure keeps the prior generation after it observes the retirement; RTDB-only, as Default erasure is.
+const DEFAULT_ERASURE_GRANT: Duration = Duration::from_secs(60 * 60 + 60);
 use crate::{Clock, DatabaseCatalog, ExternalSource, ExternalSourceFactory, ExternalSources, NodeOptions, REPLICA_BEHIND, ReplicaReadIndex, ResourceDriver, ResourceFactory, catalog::{CatalogCommand, CatalogEffects}};
 
 pub(crate) mod tokens;
@@ -65,7 +67,6 @@ pub struct Database {
     ordered_cycle: Option<OrderedIndexCycle>,
     cancellation: CancellationToken,
     io: Arc<IoRegion>,
-    currency: Arc<ReadCurrency>,
 }
 
 impl Database {
@@ -294,31 +295,6 @@ impl Database {
         Ok(self.progress().current().tx_key)
     }
 
-    /// The lease for a snapshot of this database captured after this returns.
-    /// A node whose catalog cannot be confirmed current waits up to the lease margin for it, then returns an expired lease for admission to refuse.
-    pub(crate) async fn read_lease(&self, clock: &Arc<dyn Clock>, garbage: &rtdb_maintenance::GarbageConfig) -> Result<Arc<rtdb_storage::ReadLease>> {
-        use rtdb_storage::read_lease::{lease_admits, lease_deadline};
-        let (lease, margin) = (garbage.reader_lease_micros()?, garbage.reader_lease_margin_micros()?);
-        let deadline = |anchor: Option<i64>| anchor.and_then(|anchor| lease_deadline(anchor, lease, margin));
-        let observed_at = clock.monotonic_micros();
-        let installed = self.replication.status().installed.map(|prefix| prefix.replica);
-        if self.currency.needs_observation(installed, observed_at, lease / 4) {
-            let logs = Arc::clone(&self.logs);
-            if let Ok(Ok(tip)) = self.io.run_blocking(move || Ok(logs.latest_replica_position())).await { self.currency.observe(observed_at, tip); }
-        }
-        let mut current = deadline(self.currency.anchor(self.replication.status().installed.map(|prefix| prefix.replica)));
-        if current.is_none_or(|deadline| !lease_admits(clock.monotonic_micros(), deadline)) {
-            if let Some(tip) = self.currency.pending_tip() {
-                let mut status = self.replication.watch_status();
-                let caught_up = status.wait_for(|status| status.installed.is_some_and(|prefix| prefix.replica >= tip));
-                let _ = tokio::time::timeout(garbage.reader_lease_margin, self.cancellation.run_until_cancelled(caught_up)).await;
-                current = deadline(self.currency.anchor(self.replication.status().installed.map(|prefix| prefix.replica)));
-            }
-        }
-        let clock = Arc::clone(clock);
-        Ok(Arc::new(rtdb_storage::ReadLease::new(current, Arc::new(move || clock.monotonic_micros()))))
-    }
-
     /// Blocks in the store beyond the one this database has adopted.
     /// The leader is the only block writer, so it has adopted every block there is; a follower probes forward from the highest block it has adopted or seen,
     /// listing `blocks/` only when it knows of no block that is still stored.
@@ -456,13 +432,7 @@ pub(crate) struct OpenedDatabase {
 impl DatabaseFactory {
     pub(crate) async fn catalog_read_lease(&self, database: &Database) -> Result<Option<Arc<rtdb_storage::ReadLease>>> {
         let objects = database.object_store();
-        if let Some(lease) = objects.catalog_delivery_lease().await? {
-            return Ok(Some(lease));
-        }
-        if !self.options.replication.enabled || objects.defers_trie_releases() {
-            return Ok(None);
-        }
-        database.read_lease(&self.clock, &self.options.garbage).await.map(Some)
+        objects.catalog_delivery_lease().await
     }
 
     pub fn validate(&self, name: &str, configuration: &DatabaseConfig) -> Result<()> {
@@ -640,10 +610,9 @@ impl DatabaseFactory {
                         && self.resources.has_private_storage(&configuration)),
             )));
             let ordered_cycle = ordered_worker.as_ref().map(|_| watch::channel(None).0);
-            let currency = Arc::<ReadCurrency>::default();
             let mut maintenance_options = self.options.clone();
             if sealed_local_erasure { maintenance_options.automatic_gc = false; }
-            let supervisor = MaintenanceSupervisor { database: name.clone(), storage: Arc::clone(&storage), memory: Arc::clone(&self.memory), currency: Arc::clone(&currency), logs: Arc::clone(&logs), store: resources.store, partition: Arc::clone(&partition), replication: replication.clone(), compaction: compaction.clone(), artefacts: artefacts.clone(),
+            let supervisor = MaintenanceSupervisor { database: name.clone(), storage: Arc::clone(&storage), memory: Arc::clone(&self.memory), logs: Arc::clone(&logs), store: resources.store, partition: Arc::clone(&partition), replication: replication.clone(), compaction: compaction.clone(), artefacts: artefacts.clone(),
                 observer: Arc::clone(&self.observer), options: maintenance_options, source, ordered_worker, ordered_cycle: ordered_cycle.clone(), clock: Arc::clone(&self.clock) };
             let fragment_residence = resources.fragment_storage.map(|storage| rtdb_query::FragmentResidence {
                 storage, replica_epoch: logs.replica_epoch.0,
@@ -695,9 +664,7 @@ impl DatabaseFactory {
                     write_features.push(rtdb_tx::transact::PHYSICAL_ERASURE);
                 }
                 if authority.checkpoints.is_some() && !read_only {
-                    let garbage = &self.options.garbage;
-                    let grant = garbage.reader_lease_micros()?.checked_add(garbage.reader_lease_margin_micros()?)
-                        .ok_or_else(|| Anomaly::incorrect("rtdb/default-erasure-grant", "The Default erasure grant horizon overflows"))?;
+                    let grant = DEFAULT_ERASURE_GRANT.as_micros() as i64;
                     let grant = if sealed_local_erasure {
                         grant.max(rtdb_storage::sealing::PLAINTEXT_DELIVERY_WINDOW.as_micros() as i64)
                     } else {
@@ -722,7 +689,7 @@ impl DatabaseFactory {
                 custody_provider: Default::default(), replica_read_index: opened_logs.replica_read_index,
                 await_authority: opened_logs.await_authority,
                 transaction_admission: RwLock::default(), submitted_bytes: AtomicU64::new(0), replica_read_sessions: AtomicUsize::new(0), latest_stored_block: AtomicI64::new(-1),
-                query_cpu, fragment_residence, compaction, artefacts, ordered_cycle, cancellation: cancellation.clone(), io: Arc::clone(&io), currency });
+                query_cpu, fragment_residence, compaction, artefacts, ordered_cycle, cancellation: cancellation.clone(), io: Arc::clone(&io) });
             let driver = DatabaseDriver { database: Arc::clone(&database), replication: replica_driver, compactor,
                 artefacts: artefact_drivers, live_artefacts, supervisor, logs: opened_logs.drivers, log_cancellation };
             Ok(OpenedDatabase { database, driver, secondaries })
@@ -940,7 +907,6 @@ struct MaintenanceSupervisor {
     ordered_worker: Option<Arc<OrderedIndexMaintenance>>,
     ordered_cycle: Option<OrderedIndexCycle>,
     clock: Arc<dyn Clock>,
-    currency: Arc<ReadCurrency>,
     logs: Arc<PartitionLogs>,
 }
 
@@ -988,25 +954,13 @@ impl MaintenanceSupervisor {
         let mut status = self.replication.watch_status();
         let mut region: Option<TermRegion> = None;
         let mut adopted = None;
-        let mut trie_retry = tokio::time::interval(self.options.garbage.reader_lease.clamp(
+        let mut trie_retry = tokio::time::interval(self.options.garbage.page_grace.clamp(
             Duration::from_millis(100), Duration::from_secs(60),
         ));
         trie_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let result = loop {
             if cancellation.is_cancelled() { break Ok(()); }
             let current = status.borrow_and_update().clone();
-            // Keeps the read lease anchor fresh while the log processor applies records, so queries rarely observe the tip themselves.
-            if self.options.replication.enabled && !self.store.defers_trie_releases() {
-                if let Ok(lease) = self.options.garbage.reader_lease_micros() {
-                    let observed_at = self.clock.monotonic_micros();
-                    let installed = current.installed.map(|prefix| prefix.replica);
-                    if self.currency.needs_observation(installed, observed_at, lease / 4) {
-                        let logs = Arc::clone(&self.logs);
-                        if let Ok(Ok(tip)) = tokio::task::spawn_blocking(move || logs.latest_replica_position()).await { self.currency.observe(observed_at, tip); }
-                        self.currency.anchor(installed);
-                    }
-                }
-            }
             let term = match current.role { Role::Leading(term) => Some(term), _ => None };
             if region.as_ref().map(|region| region.term) != term {
                 if let Some(cycle) = &self.ordered_cycle { cycle.send_replace(None); }

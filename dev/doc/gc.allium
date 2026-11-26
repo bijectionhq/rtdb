@@ -12,9 +12,9 @@
 -- The node that leads this database's replica log owns its trie GC.
 -- The leader signals at block adoption and transaction processing continues without waiting for the cycle.
 -- In native Rust, the term supervisor also signals on term entry and periodically while automatic trie GC is enabled.
--- The period is the configured reader lease clamped to 100 milliseconds through 60 seconds.
+-- The period is the page grace clamped to 100 milliseconds through 60 seconds.
 -- A retry gives an eligible trie or pending receipt a fresh collection opportunity even if no new block arrives.
--- The timer only schedules cycles. The collector still checks eligibility against the garbage window and elapsed read leases.
+-- The timer only schedules cycles. The collector still checks eligibility against the garbage window and the page grace.
 -- In installed-journal mode, a storage delete request queues the owned serving object for reclamation under journal custody.
 --
 -- Tries transition to `garbage` during addTries (see trie-cat.allium); this
@@ -33,26 +33,20 @@
 -- Block adoption installs the replacement protection from the persisted table blocks together with the new block index.
 -- Pending tries remain required because a retained replica notice can complete their compaction cohort after recovery.
 -- An admitted provider operation retains its captured values through completion, including after caller cancellation.
--- Query execution checks its read lease before returning a memory or provider answer.
+-- Query execution checks a provider's read lease, where a hosted journal or sealed delivery grants one, before returning a memory or provider answer.
 -- Compactor reset starts a new naming epoch, so a deletion authorized before it can never reach an output planned after it.
 --
 -- Only a hosted journal grants per-read custody: an anchored catalog's exact checkpoint and suffix are protected by the
 -- journal, with the erasure custody of its plaintext delivery, for as long as the read holds them. That custody is the
 -- hosted journal's own protocol and refuses a catalog its erasure floor has passed; it is not a collection registration.
--- Replicated snapshots on uncoordinated storage hold a bounded read lease.
--- A node anchors its lease at a monotonic clock reading taken before it reads the replica log's tip, once its catalog has applied that tip.
--- A node confirms any pending observation its catalog has already applied before deciding whether to sample the tip again.
--- A snapshot captured after that confirmation may begin provider requests strictly before the anchor plus `reader_lease` minus `reader_lease_margin`.
--- Each provider request checks the lease when it is admitted; a request admitted in time runs to completion.
--- Objects are immutable, so a request that overruns the deadline can only fail; a missing object it then reports is classified as the expired lease.
--- A node reading a scan fragment for another node's query captures its own snapshot and holds its own lease.
--- A later request fails with `rtdb.storage/read-lease-expired` rather than reading a file that may be gone.
--- A node whose catalog cannot be confirmed current waits up to the margin for its log processor.
--- A replicated query or delegated fragment without a current lease is refused at snapshot admission.
--- An admitted snapshot still checks the lease before beginning each provider request.
--- On uncoordinated storage the collector also waits `reader_lease` on its own monotonic clock after first observing a
--- level-0 trie, retired search run or directory page as eligible; on coordinated storage the garbage window alone
--- governs compacted tries.
+-- No other reader holds a lease: as in XTDB, a replicated snapshot on uncoordinated storage reads its captured catalog
+-- until a file it needs is gone, and then fails with `rtdb.storage/missing-object`. The collector waits for no reader on
+-- any store, and keeps no first sightings for tries or search runs: the garbage-as-of horizon, computed from stored
+-- blocks, alone decides, so a restart neither postpones nor hastens collection.
+-- Entity and term directory pages are RTDB-only and their retirement carries no supersession time in the catalog, so the
+-- collector releases one `page_grace` (default one hour, not configurable from YAML) after it first sees it unreferenced.
+-- That grace also gives an uploaded term page time to become reachable through its published root. A restarted
+-- collector observes pages afresh, which only postpones their release.
 -- In Multi, an installed trie release can settle as soon as its floor, recovery coverage and provider publication authorize retirement.
 -- Path releases and checkpoint pack collection still use a separate grace.
 -- Local Multi can also erase an original L0 pack under independent replay archive custody.
@@ -101,8 +95,7 @@
 -- A new collector checks pending intents in the same storage root and journal.
 -- Where the installed catalog and checkpoint already exclude the requested keys, it can re-confirm their removal through replication.
 -- Source-residence retirement metadata stays outside fork publication and cell materialization.
--- A new collector, after restart or failover, observes afresh.
--- Both sides measure elapsed time, so clocks need no synchronization; the margin covers twice the rate drift over one lease plus the longest provider request.
+-- A new collector, after restart or failover, observes directory pages afresh.
 --
 -- Each cycle first retires the tables of owned relations whose retention has passed (rule RetireDueTables).
 -- Their tries then become garbage like any superseded trie, and the deletion rules below collect them unchanged.
@@ -355,13 +348,13 @@ rule TrieGcLoopRunsCycle {
 rule GarbageCollectTries {
     -- Run one cycle: collect garbage from every table in the table catalog.
     -- The same cycle releases logical search runs superseded at or before the garbage-as-of horizon once the current checkpoint has moved past their receipts.
-    -- Stores without exact search-run retirement wait for the collection lease to elapse.
+    -- Every store releases them at once; the horizon alone protects readers, as for tries.
     -- Hosted release binds the provider publication to a catalog floor before acknowledgement.
-    -- Entity-directory collection marks all pages reachable from the current root, retained checkpoints, and retired roots still within their reader lease; a captured reader marks nothing.
-    -- After its reader lease, a retired root can release its unmarked pages.
+    -- Entity-directory collection marks all pages reachable from the current root, retained checkpoints, and retired roots still within the page grace; a captured reader marks nothing.
+    -- After the page grace, a retired root can release its unmarked pages.
     -- Hosted fork and archive holds continue to protect the pages in their checkpoint closures.
     -- A replay checkpoint holds every page reached by each active entity directory.
-    -- Term-directory pages have no retirement ledger: collection releases a stored page that no current or checkpointed root reaches, once the reader lease has passed since it was first seen unreachable.
+    -- Term-directory pages have no retirement ledger: collection releases a stored page that no current or checkpointed root reaches, once the page grace has passed since it was first seen unreachable.
     -- Each term-directory build gives newly written pages distinct digests so a rebuild cannot revive a page selected by a concurrent sweep.
     -- Hosted release of a retired search run, an exact sealed artefact, or a directory page waits for an open lineage, drained fork preparations, and the withdrawal of declared fork references to the publication.
     -- A hosted directory page release requires an observed immutable provider publication.
@@ -474,7 +467,7 @@ rule DeleteAndCommitChunkRule {
     -- A member the catalog holds and this cycle does not collect, live or not yet past its garbage lifetime, keeps them.
     -- A search pack follows the same retention rule using the member list in its object name.
     -- finished_pack_files selects packs whose held members are all eligible and whose final held member is in the current deletion chunk.
-    -- A sealed search file on a garbage level-0 trie can retire when no checkpoint needs that trie and the read lease has elapsed.
+    -- A sealed search file on a garbage level-0 trie can retire when no checkpoint needs that trie and it was superseded at or before the horizon.
     -- Its primary data and metadata retain their recovery custody.
     -- See: maintenance/src/gc.rs (collect_table, finished_groups)
     when: DeleteAndCommitChunk(table, chunk)
@@ -541,7 +534,7 @@ rule RetireDueTables {
     -- World overlays of the relation stay outside: they go with their world.
     -- The collector publishes the due tables in chunks of tries_deleted_chunk_size, each with the applied present as its retirement time, and awaits each record's application.
     -- The cycle that publishes still collects from the catalog it captured before, so the newly garbage tries wait for a later cycle.
-    -- From then on they are garbage like any superseded trie: the eligibility window, checkpoint protection, reader lease and DeleteAndCommitChunk rules apply unchanged.
+    -- From then on they are garbage like any superseded trie: the eligibility window, checkpoint protection and DeleteAndCommitChunk rules apply unchanged.
     -- L0 recovery files of a retired table stay, as every table's do.
     -- A failure is reported to the observer and leaves the rest of the cycle running.
     -- See: maintenance/src/gc.rs (retire_due_tables), node/src/table_retirement.rs

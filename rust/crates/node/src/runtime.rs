@@ -42,7 +42,6 @@ impl CatalogRuntime for NodeCatalogRuntime {
         let Ok(database) = self.node.catalog.database("xtdb") else { return empty(); };
         let lease = self.node.factory.catalog_read_lease(&database).await?;
         let snapshot = database.partition.snapshot();
-        crate::read_currency::require_current(database.name(), lease.as_deref())?;
         if !snapshot.contains_table(&TableRef::new("xt", "role_membership")) { return empty(); }
         let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(&database.storage) })]), false)?;
         let catalog = match lease { Some(lease) => catalog.with_read_lease(lease), None => catalog };

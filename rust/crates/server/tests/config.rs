@@ -136,8 +136,6 @@ fn startup_defaults_match_the_pinned_factories() {
     assert_eq!(config.indexer.flush_duration, Duration::from_secs(900));
     assert_eq!(config.garbage.blocks_to_keep, 10);
     assert_eq!(config.garbage.garbage_lifetime, Duration::from_secs(86400));
-    assert_eq!(config.garbage.reader_lease, Duration::from_secs(3600));
-    assert_eq!(config.garbage.reader_lease_margin, Duration::from_secs(60));
     assert_eq!(config.memory_cache.maximum_ratio, 0.5);
     assert!(config.disk_cache.is_none());
     assert!(matches!(config.auth, AuthConfig::SingleRootUser { password: None }));
@@ -371,7 +369,7 @@ fn compactor_opt_in_221_turns_on_both_formats_from_yaml_or_environment() {
 
 #[test]
 fn node_options_apply_indexer_compactor_gc_and_shared_memory_settings() {
-    let config = decode("memoryCache: {maxSizeBytes: 1024}\nindexer: {enabled: false, rowsPerBlock: 42, pageLimit: 16, logLimit: 8, skipTxs: [3, 9], flushDuration: PT5S}\ncompactor: {threads: 0, optIn221: true}\ngarbageCollector: {enabled: false, blocksToKeep: 4, garbageLifetime: PT12H, readerLease: PT30M, readerLeaseMargin: PT20S}\nreadOnlyDatabases: true").unwrap();
+    let config = decode("memoryCache: {maxSizeBytes: 1024}\nindexer: {enabled: false, rowsPerBlock: 42, pageLimit: 16, logLimit: 8, skipTxs: [3, 9], flushDuration: PT5S}\ncompactor: {threads: 0, optIn221: true}\ngarbageCollector: {enabled: false, blocksToKeep: 4, garbageLifetime: PT12H}\nreadOnlyDatabases: true").unwrap();
     let options = config.node_options(8192).unwrap();
     assert_eq!(options.cache_bytes, 1024);
     assert_eq!(options.execution_memory_bytes, 7168);
@@ -386,10 +384,31 @@ fn node_options_apply_indexer_compactor_gc_and_shared_memory_settings() {
     assert!(options.compaction.within_file_recency_branching);
     assert!(!options.automatic_gc);
     assert_eq!(options.garbage.blocks_to_keep, 4);
-    assert_eq!(options.garbage.reader_lease, Duration::from_secs(1800));
-    assert_eq!(options.garbage.reader_lease_margin, Duration::from_secs(20));
+    assert_eq!(options.garbage.garbage_lifetime, Duration::from_secs(43200));
     assert!(options.read_only);
     assert!(config.node_options(1024).is_err());
+}
+
+#[test]
+fn garbage_collector_settings_accept_the_forms_xtdb_yaml_accepts() {
+    for (text, blocks) in [("4", 4), ("+4", 4), ("'4'", 4), ("0x1A", 26), ("0o17", 15), ("0x+2", 2), ("-0x-1", 0), ("0x", 0), ("4.0", 0), ("0", 0), ("-0x1", 0)] {
+        let decoded = decode(&format!("garbageCollector:\n  blocksToKeep: {text}\n"));
+        match blocks {
+            0 => assert!(decoded.is_err(), "{text}"),
+            blocks => assert_eq!(decoded.unwrap().garbage.blocks_to_keep, blocks, "{text}"),
+        }
+    }
+    for (text, seconds) in [("PT12H", 43_200.0), ("P1D", 86_400.0), ("p1dt1h", 90_000.0), ("PT1H-30M", 1_800.0), ("-PT-1H", 3_600.0), ("PT0.5S", 0.5), ("PT1,25S", 1.25), ("PT", -1.0), ("P", -1.0), ("1h", -1.0)] {
+        let decoded = decode(&format!("garbageCollector:\n  garbageLifetime: {text}\n"));
+        if seconds < 0.0 {
+            assert!(decoded.is_err(), "{text}");
+        } else {
+            assert_eq!(decoded.unwrap().garbage.garbage_lifetime, Duration::from_secs_f64(seconds), "{text}");
+        }
+    }
+    for key in ["readerLease", "readerLeaseMargin"] {
+        assert!(decode(&format!("garbageCollector: {{{key}: PT1H}}")).is_err(), "{key} is not an XTDB key");
+    }
 }
 
 #[test]

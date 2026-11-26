@@ -343,9 +343,8 @@ It also exercises the Azure adapter against a loopback provider and separately m
   Apalache independently checks the safety conjunction and loss of the pending plan.
   `lean/HostedTrieRelease.lean` checks release authority and complete accounting for arbitrary file plans over finite histories.
 * `tla/ReadCurrencyAnchor.tla` checks competing clock and tip observations and the replica prefix needed to confirm them.
-  `verus/read_currency` checks the two Rust decisions shared by foreground and maintenance observers.
   `lean/ReadCurrencyAnchor.lean` proves prefix coverage and monotonicity for arbitrary finite histories in the reference model.
-  The native replay verifies early refusal of a replicated query without a current lease, with a matching omission control.
+  Production no longer implements the currency anchor: the reader lease it served was removed for XTDB's garbage window, so these models are historical.
 * `tla/ResidenceComposition.tla` models snapshot admission, log trimming, exact-version retirement and whole-residence disposal in a common state.
   Its controls test cross-domain dependencies, including a canceled query's provider read, an older recovery cursor, fork publication and transfer before erasure.
   `tla/ResidenceCompositionReplay.tla` checks an authored event trace against the same transitions and refuses five invalid variants at their first unmatched step.
@@ -379,7 +378,7 @@ It also exercises the Azure adapter against a loopback provider and separately m
   The model treats reference accounting and collection authorization as atomic and requires a conclusive provider completion for the deletion step.
   Verus checks the native reader selection decision over the locally captured catalog list.
   The selected Rust maintenance and storage tests exercise the single-partition authority and the transfer of its lifetime into provider I/O.
-  `verus/read_lease` verifies the production lease deadline, admission and collection-wait decisions, and the law that an admitted request finishes before collection under bounded skew and request duration.
+  `verus/read_lease` verifies that a provider request begins only strictly before its read lease deadline.
 * `tla/CompactionGroup.tla` checks durable, complete sibling publication for one replacement.
   `tla/CompactionOverlap.tla` compares exact sibling membership with a high-water mark across two interleaved generations.
   The Rust catalog regression checks the corresponding admission behavior.

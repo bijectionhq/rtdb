@@ -403,15 +403,16 @@ async fn recover_during_block_collection(pause: RecoveryPause) {
 }
 
 #[tokio::test]
-async fn a_follower_cursor_keeps_its_files_while_its_lease_lasts() {
+async fn a_follower_cursor_keeps_its_files_while_the_window_keeps_them() {
     follower_cursor_during_collection(false).await;
 }
 
 #[tokio::test]
-async fn a_follower_cursor_past_its_lease_is_refused_before_reading_collected_files() {
+async fn a_follower_cursor_on_a_catalog_older_than_the_window_finds_its_files_gone() {
     follower_cursor_during_collection(true).await;
 }
 
+/// As in XTDB, readers register nothing: the garbage window alone decides how long a superseded trie stays.
 async fn follower_cursor_during_collection(expire: bool) {
     use rtdb_format::keys::TrieKey;
     use rtdb_replication::Role;
@@ -438,9 +439,10 @@ async fn follower_cursor_during_collection(expire: bool) {
     let mut writer_options = options(directory.path());
     writer_options.compaction_threads = 1;
     writer_options.automatic_gc = true;
-    writer_options.garbage.blocks_to_keep = 1;
-    writer_options.garbage.garbage_lifetime = Duration::ZERO;
-    let lease = writer_options.garbage.reader_lease;
+    if expire {
+        writer_options.garbage.blocks_to_keep = 1;
+        writer_options.garbage.garbage_lifetime = Duration::ZERO;
+    }
     let writer_resources = Arc::new(NativeResources::default().with_local_log_clock(clock.clone(), true));
     let writer_services = NodeServices {
         resources: FaultResources::new(writer_resources, schedule.clone()),
@@ -480,8 +482,7 @@ async fn follower_cursor_during_collection(expire: bool) {
         let deleted = schedule.wait_for_rule(0);
         tokio::pin!(deleted);
         for id in 3.. {
-            assert!(id < 10, "the writer must collect the superseded trie once a lease has passed");
-            clock.0.fetch_add(i64::try_from(lease.as_micros()).unwrap() * 2, Ordering::Relaxed);
+            assert!(id < 10, "the writer must collect the superseded trie once it leaves the window");
             assert!(writer_session.state_mut().execute_tx(put(id), AutonomousTxOptions::default()).await.unwrap().committed());
             flush_and_adopt(&database).await;
             if tokio::time::timeout(Duration::from_millis(500), &mut deleted).await.is_ok() { break; }
@@ -511,8 +512,8 @@ async fn follower_cursor_during_collection(expire: bool) {
     schedule.assert_exhausted().unwrap();
 
     if expire {
-        let Err(error) = resumed else { panic!("the follower cursor read past its lease") };
-        assert_eq!(error.code, "rtdb.storage/read-lease-expired", "{error}");
+        let Err(error) = resumed else { panic!("the follower cursor read a collected trie") };
+        assert_eq!(error.code, "rtdb.storage/missing-object", "{error}");
     } else {
         let batch = resumed.unwrap().expect("the follower cursor returns its admitted row");
         assert_eq!(batch.batch().num_rows(), 1);

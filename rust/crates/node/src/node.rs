@@ -783,7 +783,6 @@ impl Node {
             };
             snapshots.insert(name, DatabaseSnapshot { partitions: vec![snapshot], storage });
         }
-        crate::read_currency::require_current(database, lease.as_deref())?;
         let applied_basis = applied.map(|selected| QueryBasis {
             snapshot: TimeBasis { databases: BTreeMap::from([(database.to_owned(), vec![Some(selected.system_time.into())])]) },
             replica_capture: None,
@@ -880,7 +879,6 @@ impl Node {
         }
         let lease = self.catalog_read_lease(&database).await?;
         let snapshot = database.partition.open_snapshot(Some(fragment.basis.tx_id));
-        crate::read_currency::require_current(database.name(), lease.as_deref())?;
         let snapshots = BTreeMap::from([(database.name().to_owned(), DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(&database.storage) })]);
         let mut catalog = CatalogSnapshot::new(database.name(), snapshots, false)?;
         if let Some(lease) = &lease { catalog = catalog.with_read_lease(Arc::clone(lease)); }

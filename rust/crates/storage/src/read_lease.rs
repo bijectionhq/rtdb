@@ -5,7 +5,7 @@ use std::{
 
 use crate::{Error, Result};
 
-pub use crate::lease_decision::{collection_waited, lease_admits, lease_deadline};
+pub use crate::lease_decision::lease_admits;
 
 /// A reader's entitlement to begin provider requests for files its catalog references.
 /// Checked when each request is admitted; a request already admitted runs to completion.
