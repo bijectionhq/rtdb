@@ -1625,9 +1625,9 @@ async fn rtdb_v1_ranks_rows_at_the_native_receipt_basis() {
         assert!(!trailer.claim.unwrap().value.is_empty());
     }
     let mut request = input(
-        "WITH staged(_id, embedding) AS (
-             VALUES (2, ARRAY[CAST(0 AS REAL), CAST(0 AS REAL)]),
-                    (3, ARRAY[CAST(1 AS REAL), CAST(0 AS REAL)])
+        "WITH staged AS (
+             SELECT _id, embedding FROM (VALUES (2, ARRAY[CAST(0 AS REAL), CAST(0 AS REAL)]),
+                    (3, ARRAY[CAST(1 AS REAL), CAST(0 AS REAL)])) AS staged_rows(_id, embedding)
          ), MATERIALIZED candidates AS (
              SELECT _id, embedding FROM ranked_rows
              WHERE _id NOT IN (SELECT _id FROM staged)
