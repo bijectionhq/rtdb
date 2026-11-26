@@ -294,6 +294,11 @@ impl AggregateCursor {
         Ok((columns, reservation))
     }
 
+    /// The bytes the groups hold: their keys and every aggregate's per-group state, collected values included.
+    fn state_bytes(index: &BatchKeyIndex, columns: &[AggregateColumn]) -> usize {
+        columns.iter().fold(index.retained_bytes(), |bytes, column| bytes.saturating_add(column.retained_bytes()))
+    }
+
     async fn reduce_grouped(&mut self, input: AggregateInput) -> Result<Option<ReducedGroups>> {
         let AggregateInput { mut batches, projected } = input;
         let context = &self.execution.context;
@@ -304,16 +309,14 @@ impl AggregateCursor {
         let (group_positions, arguments) = positions.split_at(group_width);
         let mut index = BatchKeyIndex::vector_hashing(context)?;
         let (mut columns, reservation) = self.accumulators()?;
-        let mut baseline = None;
         let mut overflow: Option<crate::spill::HashPartitions> = None;
         while let Some(batch) = crate::columnar::poll_nested_batch(batches.as_mut()).await? {
             context.check_cancelled()?;
             crate::operators::validate_distinct_types(&key_schema)?;
             if batch.len == 0 { continue; }
-            let baseline = *baseline.get_or_insert_with(|| memory.used_bytes());
             // Spilling starts only once a group is held, so that each partitioning level makes progress.
             if overflow.is_none() && index.len() != 0
-                && crate::spill::hash_spill_due(&context.options, self.depth, memory.used_bytes().saturating_sub(baseline))
+                && crate::spill::hash_spill_due(&context.options, self.depth, Self::state_bytes(&index, &columns))
             {
                 overflow = Some(crate::spill::HashPartitions::new(self.depth, context)?);
             }
@@ -420,7 +423,7 @@ impl AggregateCursor {
                     continue;
                 }
             };
-            states.ensure(batch.len, &self.execution)?;
+            states.ensure(batch.len)?;
             let bytes = batch.len.checked_mul(std::mem::size_of::<Value>().max(40)).and_then(|bytes| bytes.checked_add(field.name.len()))
                 .and_then(|bytes| bytes.checked_add(512)).ok_or_else(|| invalid("aggregate-size", "Aggregate output exceeds addressable memory"))?;
             let reservation = context.memory.reserve(bytes)?;
@@ -543,11 +546,10 @@ impl AggregateCursor {
     fn reduce_typed(&self, batch: &ColumnBatch, mapping: GroupMapping<'_>, group_count: usize, columns: &mut [AggregateColumn]) -> Result<()> {
         use AggregateFunction as A;
         let types = self.runtime.aggregates()?;
-        let memory = &self.execution.context.memory;
         for ((column,aggregate),types) in columns.iter_mut().zip(&self.aggregates).zip(types) {
             validate_aggregate_input(aggregate,types)?;
             let Accumulation::Scalar(states) = &mut column.accumulation else { return Err(invalid("aggregate-input","A typed aggregate collects its rows")) };
-            states.ensure(group_count,&self.execution)?;
+            states.ensure(group_count)?;
             let argument = aggregate.argument.as_ref().map(|argument|argument_position(argument,&self.schema)).transpose()?;
             match (&aggregate.function,argument) {
                 (A::CountStar,_) => for (row, group) in mapping.iter().enumerate() {
@@ -572,7 +574,7 @@ impl AggregateCursor {
                             let Value::F64(sum) = &mut accumulator.values[0] else { return Err(sum_state()); };
                             *sum += value;
                         } else {
-                            state.accumulator = Some(OwnedRow::new(vec![Value::F64(value)], memory)?);
+                            state.accumulator = Some(OwnedRow::new(vec![Value::F64(value)], &states.state)?);
                         }
                         if aggregate.function == A::Average { state.count = state.count.wrapping_add(1); }
                     }
@@ -588,11 +590,20 @@ struct AggregateColumn { accumulation: Accumulation, distinct: Option<DistinctSe
 /// The distinct arguments each group has taken so far, by the group and the hash of the argument.
 enum DistinctSeen {
     FirstBatch,
-    Rows { index: HashMap<(usize, u32), Vec<usize>>, values: Vec<OwnedRow> },
+    /// `bytes` sums the rows `values` holds.
+    Rows { index: HashMap<(usize, u32), Vec<usize>>, values: Vec<OwnedRow>, bytes: usize },
     Columns(Box<BatchKeyIndex>),
 }
 
 impl DistinctSeen {
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::FirstBatch => 0,
+            Self::Rows { index, bytes, .. } => index.capacity().saturating_mul(std::mem::size_of::<((usize, u32), Vec<usize>)>()).saturating_add(*bytes),
+            Self::Columns(index) => index.retained_bytes(),
+        }
+    }
+
     fn select(
         &mut self, input: Rows<'_>, mapping: GroupMapping<'_>, mask: &mut [bool], argument: Option<usize>,
         types: &AggregateTypes, execution: &Execution,
@@ -600,7 +611,7 @@ impl DistinctSeen {
         if matches!(self, Self::FirstBatch) {
             *self = match (input, argument) {
                 (_, Some(_)) => Self::Columns(Box::new(BatchKeyIndex::vector_hashing(&execution.context)?)),
-                _ => Self::Rows { index: HashMap::new(), values: Vec::new() },
+                _ => Self::Rows { index: HashMap::new(), values: Vec::new(), bytes: 0 },
             };
         }
         let mut retained_source = None;
@@ -619,7 +630,7 @@ impl DistinctSeen {
                     };
                     *selected = index.insert_distinct_argument(batch, argument, row, group, projected, &mut retained_source, &execution.context)?;
                 }
-                Self::Rows { index, values } => {
+                Self::Rows { index, values, bytes } => {
                     let cell = input.value(row, argument)?;
                     let value = cell.as_ref();
                     let hash = crate::join_storage::hash_values(std::iter::once(value))?;
@@ -633,7 +644,9 @@ impl DistinctSeen {
                     }
                     if *selected {
                         candidates.push(values.len());
-                        values.push(OwnedRow::copy_parts(&[std::slice::from_ref(value)], 0, 0, &execution.context.memory)?);
+                        let row = OwnedRow::copy_parts(&[std::slice::from_ref(value)], 0, 0, &execution.context.memory)?;
+                        *bytes = bytes.saturating_add(row.bytes());
+                        values.push(row);
                     }
                 }
                 Self::FirstBatch => unreachable!(),
@@ -644,6 +657,15 @@ impl DistinctSeen {
 }
 enum Accumulation { Scalar(ScalarGroups), Vectors(CollectionVectors) }
 impl AggregateColumn {
+    /// The bytes this aggregate's per-group state holds, which a grouped aggregation spills on.
+    fn retained_bytes(&self) -> usize {
+        let accumulated = match &self.accumulation {
+            Accumulation::Scalar(states) => states.retained_bytes(),
+            Accumulation::Vectors(vectors) => vectors.retained_bytes(),
+        };
+        accumulated.saturating_add(self.distinct.as_ref().map_or(0, DistinctSeen::retained_bytes))
+    }
+
     fn new(aggregate: &AggregateExpr,schema: &Schema,execution: &Execution) -> Result<Self> {
         let accumulation = match aggregate.function {
             AggregateFunction::ArrayAgg | AggregateFunction::VecAgg | AggregateFunction::Percentile { .. } => {
@@ -720,11 +742,22 @@ struct CollectionVectors {
     reservation: Arc<rtdb_columnar::MemoryReservation>,
     order: Option<CollectionOrder>,
     projected: bool,
+    /// The charges the collected pages retain, counted once per page as it is collected.
+    page_bytes: usize,
 }
 
 impl CollectionVectors {
     fn new(memory: &Arc<rtdb_columnar::MemoryBudget>, order: Option<CollectionOrder>) -> Result<Self> {
-        Ok(Self { batches: Vec::new(), groups: Vec::new(), selected: 0, present: false, reservation: memory.reserve(4096)?, order, projected: false })
+        Ok(Self { batches: Vec::new(), groups: Vec::new(), selected: 0, present: false, reservation: memory.reserve(4096)?, order, projected: false, page_bytes: 0 })
+    }
+
+    /// The bytes the collected values hold: their positions and the pages they are read from.
+    fn retained_bytes(&self) -> usize { self.reservation.bytes().saturating_add(self.page_bytes) }
+
+    fn push_page(&mut self, page: ColumnBatch, memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<()> {
+        self.page_bytes = self.page_bytes.saturating_add(page.working_set_bytes(memory)?);
+        self.batches.push(page);
+        Ok(())
     }
 
     fn append(&mut self, batch: &ColumnBatch, position: usize, mapping: GroupMapping<'_>, mask: &[bool], groups: usize, projected: bool, context: &crate::QueryContext) -> Result<()> {
@@ -734,8 +767,7 @@ impl CollectionVectors {
             if batch.len == 0 { return Ok(()); }
             let batch = order.page(batch, mapping, mask, context)?;
             self.account_pages(self.selected, groups)?;
-            self.batches.push(batch);
-            return Ok(());
+            return self.push_page(batch, &context.memory);
         }
         self.collect(batch, position, mapping.iter().zip(mask).enumerate()
             .filter_map(|(row, (group, &selected))| selected.then_some((row, group))), groups, context)
@@ -746,7 +778,7 @@ impl CollectionVectors {
         if count == 0 { return Ok(()); }
         self.admit_positions(count, groups)?;
         let page = self.batches.len();
-        self.batches.push(batch.key_projection(&[position], &context.memory)?);
+        self.push_page(batch.key_projection(&[position], &context.memory)?, &context.memory)?;
         for (row, group) in picks {
             self.push_position(group, page, row)?;
         }
@@ -1185,13 +1217,20 @@ impl<'a> NumericColumn<'a> {
     }
 }
 
-struct ScalarGroups { values: Vec<ScalarAccumulator>, reservation: Arc<rtdb_columnar::MemoryReservation> }
+/// Per-group scalar states; `state` is a scope of the query budget that charges only what the groups retain, so that the
+/// aggregation can tell its own growth from the rest of the query's.
+struct ScalarGroups { values: Vec<ScalarAccumulator>, state: Arc<rtdb_columnar::MemoryBudget>, reservation: Arc<rtdb_columnar::MemoryReservation> }
 impl ScalarGroups {
-    fn new(execution: &Execution) -> Result<Self> { Ok(Self { values: Vec::new(),reservation: execution.context.memory.reserve(0)? }) }
-    fn ensure(&mut self,count: usize,execution: &Execution) -> Result<()> {
+    fn new(execution: &Execution) -> Result<Self> {
+        let state = execution.context.memory.scope();
+        let reservation = state.reserve(0)?;
+        Ok(Self { values: Vec::new(), state, reservation })
+    }
+    fn retained_bytes(&self) -> usize { self.state.used_bytes() }
+    fn ensure(&mut self,count: usize) -> Result<()> {
         if self.values.len() >= count { return Ok(()); }
         let bytes = count.checked_mul(std::mem::size_of::<ScalarAccumulator>()).ok_or_else(||invalid("aggregate-size","Aggregate group accumulator capacity overflow"))?;
-        let reservation = execution.context.memory.reserve(bytes)?;
+        let reservation = self.state.reserve(bytes)?;
         self.values.reserve_exact(count - self.values.len());
         self.values.resize_with(count,ScalarAccumulator::default);
         self.reservation = reservation;
@@ -1202,7 +1241,7 @@ impl ScalarGroups {
         match aggregate.function {
             A::Sum | A::Average => {
                 let summer = SumFactory::new(&types.input,types.output_type())?;
-                self.ensure(group_count,execution)?;
+                self.ensure(group_count)?;
                 self.sum_page(page,mapping,mask,argument,&summer,execution)?;
                 if aggregate.function == A::Average { self.count_page(page,mapping,mask,argument,false,execution)?; }
             }
@@ -1210,7 +1249,7 @@ impl ScalarGroups {
                 let squares = square_column(page,argument,&types.input,scope,execution)?;
                 let sum_type = LogicalType::Scalar(ScalarType::F64);
                 let summer = SumFactory::new(&types.input,&sum_type)?;
-                self.ensure(group_count,execution)?;
+                self.ensure(group_count)?;
                 self.sum_page(page,mapping,mask,argument,&summer,execution)?;
                 for ((value,group),selected) in squares.into_iter().zip(mapping.iter()).zip(mask) {
                     execution.context.check_cancelled()?;
@@ -1222,11 +1261,11 @@ impl ScalarGroups {
                 self.count_page(page,mapping,mask,argument,false,execution)?;
             }
             A::Count | A::CountStar => {
-                self.ensure(group_count,execution)?;
+                self.ensure(group_count)?;
                 self.count_page(page,mapping,mask,argument,aggregate.function == A::CountStar,execution)?;
             }
             _ => {
-                self.ensure(group_count,execution)?;
+                self.ensure(group_count)?;
                 let extrema = matches!(aggregate.function, A::Min | A::Max).then(|| {
                     NumericColumn::bind(page.arrow_column(argument)?, Some(types.output_type()))
                 }).flatten();
@@ -1236,11 +1275,11 @@ impl ScalarGroups {
                         let state = &mut self.values[group];
                         if let Some(column) = &extrema {
                             if let Some(value) = column.get(row) {
-                                state.numeric_extremum(value, types.output_type(), aggregate.function == A::Min, execution)?;
+                                state.numeric_extremum(value, types.output_type(), aggregate.function == A::Min, &self.state)?;
                             }
                         } else {
                             let value = page.value(row,argument)?;
-                            state.step(value.as_ref(),aggregate,types,execution)?;
+                            state.step(value.as_ref(),aggregate,types,execution,&self.state)?;
                         }
                     }
                 }
@@ -1258,7 +1297,7 @@ impl ScalarGroups {
             let state = &mut self.values[group];
             if let Some(column) = &numeric {
                 if let Some(value) = column.get(index) {
-                    state.add_numeric(value, summer.output, execution)?;
+                    state.add_numeric(value, summer.output, &self.state)?;
                 }
                 continue;
             }
@@ -1267,7 +1306,7 @@ impl ScalarGroups {
                 match &mut state.accumulator {
                     // A sum that retains what the previous one did reuses its cell and charge.
                     Some(accumulator) if accumulator.values[0].retained_bytes()? == next.retained_bytes()? => accumulator.values[0] = next,
-                    accumulator => *accumulator = Some(OwnedRow::new(vec![next],&execution.context.memory)?),
+                    accumulator => *accumulator = Some(OwnedRow::new(vec![next],&self.state)?),
                 }
             }
         }
@@ -1287,7 +1326,7 @@ impl ScalarGroups {
 #[derive(Default)]
 struct ScalarAccumulator { count: i64, accumulator: Option<OwnedRow>, squares: Option<f64> }
 impl ScalarAccumulator {
-    fn add_numeric(&mut self, value: NumericCell, output: &LogicalType, execution: &Execution) -> Result<()> {
+    fn add_numeric(&mut self, value: NumericCell, output: &LogicalType, state: &Arc<rtdb_columnar::MemoryBudget>) -> Result<()> {
         let previous = self.accumulator.as_mut().map(|row| &mut row.values[0]);
         let next = match (output, previous, value) {
             (LogicalType::Scalar(ScalarType::I32), Some(Value::I32(sum)), NumericCell::Integer(value)) => {
@@ -1312,11 +1351,11 @@ impl ScalarAccumulator {
             (LogicalType::Scalar(ScalarType::F64), None, value) => Value::F64(value.as_f64()),
             _ => return Err(sum_state()),
         };
-        self.accumulator = Some(OwnedRow::new(vec![next], &execution.context.memory)?);
+        self.accumulator = Some(OwnedRow::new(vec![next], state)?);
         Ok(())
     }
 
-    fn numeric_extremum(&mut self, value: NumericCell, output: &LogicalType, minimum: bool, execution: &Execution) -> Result<()> {
+    fn numeric_extremum(&mut self, value: NumericCell, output: &LogicalType, minimum: bool, state: &Arc<rtdb_columnar::MemoryBudget>) -> Result<()> {
         use crate::scalar_key::ScalarKey;
         if let Some(previous) = &self.accumulator {
             let previous = match &previous.values[0] {
@@ -1341,11 +1380,11 @@ impl ScalarAccumulator {
             (LogicalType::Scalar(ScalarType::F64), NumericCell::Float64(value)) => Value::F64(value),
             _ => return Err(invalid("aggregate-state", "Numeric extremum does not match its output vector")),
         };
-        self.accumulator = Some(OwnedRow::new(vec![next], &execution.context.memory)?);
+        self.accumulator = Some(OwnedRow::new(vec![next], state)?);
         Ok(())
     }
 
-    fn step(&mut self,value: &Value,aggregate: &AggregateExpr,types: &AggregateTypes,execution: &Execution) -> Result<()> {
+    fn step(&mut self,value: &Value,aggregate: &AggregateExpr,types: &AggregateTypes,execution: &Execution,state: &Arc<rtdb_columnar::MemoryBudget>) -> Result<()> {
         let _value = execution.context.memory.reserve(value.retained_bytes()?)?;
         let value = value.clone();
         if matches!(value, Value::Null | Value::Undefined) { return Ok(()); }
@@ -1371,7 +1410,7 @@ impl ScalarAccumulator {
             }
             _ => unreachable!(),
         };
-        if let Some(next) = next { self.accumulator = Some(OwnedRow::new(vec![next], &execution.context.memory)?); }
+        if let Some(next) = next { self.accumulator = Some(OwnedRow::new(vec![next], state)?); }
         Ok(())
     }
     fn average_double(&self) -> Option<f64> {

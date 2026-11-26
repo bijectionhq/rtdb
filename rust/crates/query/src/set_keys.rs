@@ -402,6 +402,8 @@ pub(crate) struct BatchKeyIndex {
     hashing: KeyHash,
     /// Stored keys already decoded for comparison, by position.
     decoded: DecodedKeys,
+    /// The charges the stored pages retain, counted once per page as it is stored.
+    page_bytes: usize,
 }
 
 /// Owned copies of stored direct keys, decoded on their first comparison, so that a key met again is not read again.
@@ -521,11 +523,25 @@ impl BatchKeyIndex {
             reservation: context.memory.reserve(0)?,
             hashing,
             decoded: DecodedKeys::default(),
+            page_bytes: 0,
         })
     }
 
     pub fn len(&self) -> usize {
         self.positions.rows.len()
+    }
+
+    /// The bytes this index holds: its positions, its decoded keys and the pages its keys are read from.
+    /// A hash operator spills on this, not on what the shared budget holds, which other operators move too.
+    pub fn retained_bytes(&self) -> usize {
+        let decoded = self.decoded.charge.as_ref().map_or(0, |charge| charge.bytes());
+        self.reservation.bytes().saturating_add(decoded).saturating_add(self.page_bytes)
+    }
+
+    fn push_page(&mut self, batch: ColumnBatch, projected: bool, bytes: usize) -> usize {
+        self.page_bytes = self.page_bytes.saturating_add(bytes);
+        self.batches.push((batch, projected));
+        self.batches.len() - 1
     }
 
     pub fn group_keys(&self, width: usize, context: &QueryContext) -> Result<Option<ColumnBatch>> {
@@ -581,10 +597,10 @@ impl BatchKeyIndex {
             .grow_to(bytes)
     }
 
-    fn append(&mut self, batch: ColumnBatch, projected: bool, hashes: &[u32]) -> Result<()> {
+    fn append(&mut self, batch: ColumnBatch, projected: bool, hashes: &[u32], memory: &Arc<MemoryBudget>) -> Result<()> {
+        let bytes = batch.working_set_bytes(memory)?;
         self.reserve_page(hashes.len())?;
-        let page = self.batches.len();
-        self.batches.push((batch, projected));
+        let page = self.push_page(batch, projected, bytes);
         for (row, &hash) in hashes.iter().enumerate() {
             self.positions.push(u64::from(hash), page, row);
         }
@@ -601,6 +617,7 @@ impl BatchKeyIndex {
             return Ok(());
         }
         context.check_cancelled()?;
+        let page_bytes = batch.working_set_bytes(&context.memory)?;
         let previous_charge = self.reservation.bytes();
         self.reserve_page(batch.len)?;
         let page = self.batches.len();
@@ -619,7 +636,7 @@ impl BatchKeyIndex {
                 .expect("The build reserved at least its previous charge");
             return Err(error);
         }
-        self.batches.push((batch, projected));
+        self.push_page(batch, projected, page_bytes);
         Ok(())
     }
 
@@ -712,8 +729,9 @@ impl BatchKeyIndex {
         let page = match *retained_source {
             Some(page) => page,
             None => {
-                let page = self.batches.len();
-                self.batches.push((batch.key_projection(&[column], &context.memory)?, projected));
+                let source = batch.key_projection(&[column], &context.memory)?;
+                let bytes = source.working_set_bytes(&context.memory)?;
+                let page = self.push_page(source, projected, bytes);
                 *retained_source = Some(page);
                 page
             }
@@ -806,7 +824,7 @@ impl BatchKeyIndex {
             (None, KeyHash::Set) => batch.select_keys(&picks, &context.memory)?,
             _ => batch.compact_group_key_columns(&picks, positions, &context.memory)?,
         };
-        self.append(compact, projected, &hashes)
+        self.append(compact, projected, &hashes, &context.memory)
     }
 }
 

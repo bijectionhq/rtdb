@@ -25,7 +25,6 @@ impl OwnedRow {
         if bytes > reservation.bytes() { return Err(invalid("row-reservation", "Decoded row exceeds its memory reservation")); }
         Ok(Self { values, _reservation: reservation, _bytes: bytes })
     }
-    #[cfg(test)]
     pub fn bytes(&self) -> usize { self._bytes }
     pub fn copy_parts(parts: &[&[Value]], prefix_nulls: usize, suffix_nulls: usize, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let nulls = prefix_nulls.checked_add(suffix_nulls).ok_or_else(|| invalid("row-size", "Row copy width overflow"))?;

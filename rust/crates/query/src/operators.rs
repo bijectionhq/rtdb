@@ -870,7 +870,6 @@ struct BatchDistinct {
     projected: bool,
     /// Hash partitioning levels above this DISTINCT; each spilled partition is deduplicated one level deeper.
     depth: u32,
-    baseline: Option<usize>,
     /// Rows whose keys the index did not hold once it began to spill; every row of such a key goes to the same partition.
     overflow: Option<crate::spill::HashPartitions>,
     spilled: Vec<Arc<crate::spill::SpillFile>>,
@@ -884,7 +883,7 @@ impl BatchDistinct {
 
     fn at_depth(input: crate::columnar::BoxBatchCursor, schema: Arc<RuntimeSchema>, execution: Execution, projected: bool, depth: u32) -> Result<Self> {
         let seen = crate::set_keys::BatchKeyIndex::new(&execution.context)?;
-        Ok(Self { input: Some(input), seen, schema, execution, projected, depth, baseline: None, overflow: None, spilled: Vec::new(), partition: None })
+        Ok(Self { input: Some(input), seen, schema, execution, projected, depth, overflow: None, spilled: Vec::new(), partition: None })
     }
 }
 
@@ -904,10 +903,9 @@ impl crate::columnar::BatchCursor for BatchDistinct {
             if batch.len == 0 { continue; }
             let context = &self.execution.context;
             let memory = &context.memory;
-            let baseline = *self.baseline.get_or_insert_with(|| memory.used_bytes());
             // Spilling starts only once a key is held, so that each partitioning level makes progress.
             if self.overflow.is_none() && self.seen.len() != 0
-                && crate::spill::hash_spill_due(&context.options, self.depth, memory.used_bytes().saturating_sub(baseline))
+                && crate::spill::hash_spill_due(&context.options, self.depth, self.seen.retained_bytes())
             {
                 self.overflow = Some(crate::spill::HashPartitions::new(self.depth, context)?);
             }

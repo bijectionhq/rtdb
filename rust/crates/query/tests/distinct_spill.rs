@@ -77,3 +77,32 @@ async fn cancelling_a_spilled_distinct_deletes_its_pending_partitions() {
     assert_eq!(context.spill_bytes(), 0);
     assert_eq!(context.memory.used_bytes(), 0);
 }
+
+#[tokio::test]
+async fn distinct_spills_on_the_keys_it_holds_not_on_what_else_the_budget_holds() {
+    let reference = context(usize::MAX);
+    let mut expected = rows(&reference).await;
+    expected.sort();
+
+    let context = context(1 << 20);
+    let mut cursor = PreparedQuery::new(distinct_pairs()).unwrap().execute(Arc::clone(&context), vec![]).await.unwrap();
+    let first = cursor.next_batch().await.unwrap().expect("the distinct emits its first keys");
+    let mut actual = Vec::new();
+    let mut collect = |page: &rtdb_columnar::OwnedBatch| {
+        let batch = page.batch();
+        for row in 0..batch.num_rows() {
+            let values = (0..batch.num_columns())
+                .map(|column| read_value(batch.schema().field(column), batch.column(column).as_ref(), row).unwrap())
+                .collect::<Vec<_>>();
+            actual.push(format!("{values:?}"));
+        }
+    };
+    collect(&first);
+    // Another holder of the query's budget grows well past the distinct's share while the distinct runs.
+    let elsewhere = context.memory.reserve(16 << 20).unwrap();
+    while let Some(page) = cursor.next_batch().await.unwrap() { collect(&page); }
+    drop(elsewhere);
+    actual.sort();
+    assert_eq!(actual, expected);
+    assert_eq!(context.spill_peak_bytes(), 0, "the distinct's own keys stay far below its share");
+}

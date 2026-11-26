@@ -459,11 +459,11 @@ pub(crate) fn write_page(writer: &mut SpillWriter, batch: &ColumnBatch, schema: 
     Ok(())
 }
 
-/// Whether a hash operator at partitioning level `depth`, grown by `grown` bytes since its first page, should send rows
-/// of new keys to disk: past its configured share, and while it has partitioning levels left.
-/// The share alone decides, never what the budget has free.
-pub(crate) fn hash_spill_due(options: &crate::QueryOptions, depth: u32, grown: usize) -> bool {
-    options.spill_limit_bytes != 0 && depth < options.max_spill_depth && grown > options.hash_memory_bytes
+/// Whether a hash operator at partitioning level `depth`, whose keys and per-key state hold `retained` bytes, should send
+/// rows of new keys to disk: past its configured share, and while it has partitioning levels left.
+/// The operator's own state alone decides, never what the budget has free or what other operators hold.
+pub(crate) fn hash_spill_due(options: &crate::QueryOptions, depth: u32, retained: usize) -> bool {
+    options.spill_limit_bytes != 0 && depth < options.max_spill_depth && retained > options.hash_memory_bytes
 }
 
 /// The buffer of each spill writer, charged by the hash partitions that hold one writer per partition.
