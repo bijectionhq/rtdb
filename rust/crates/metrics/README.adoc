@@ -85,8 +85,38 @@ They are source only under the implementation execution gate.
 It reads the environment variables upstream's `log4j2.xml` and `xtdb.logging/set-from-env!` read.
 `XTDB_LOG_FORMAT` is `text` (the default) or `json`; any other value refuses startup.
 Text lines follow upstream's `HH:mm:ss | LEVEL logger | message` pattern in local time, with event fields appended as `name=value`.
-JSON lines carry upstream's CloudWatch layout fields: a UTC `timestamp`, `level`, `logger`, `message`, `thread` and, when the event has fields, `context`.
+JSON lines follow the template `XTDB_LOG_JSON_TEMPLATE` names, out of upstream's bundled three; any other template refuses startup, and an empty value is the default.
+
+[cols="2,3"]
+|===
+|`XTDB_LOG_JSON_TEMPLATE` |Fields
+
+|`classpath:xtdb/logging/AwsCloudWatchLayout.json` (default)
+|UTC `timestamp`, `level`, `logger`, `message`, `thread` and, when the event has fields, `context`
+
+|`classpath:xtdb/logging/AzureMonitorLayout.json`
+|`Timestamp`, `Severity`, `Message`, `OperationId` / `ParentId` from a `trace_id` / `span_id` field, and `Attributes` with `log.logger.name`, `thread.name` and `custom.context`
+
+|`classpath:GcpLayout.json`
+|`timestamp`, `severity` (`WARNING` for WARN, `DEBUG` for TRACE), `message`, `logging.googleapis.com/labels`, `/trace`, `/spanId`, `/sourceLocation` (file, line and the Rust module as `function`), `/insertId`, `_thread` and `_logger`
+|===
+
+Event exceptions have no `tracing` counterpart, so no layout writes an exception field.
 `XTDB_LOGGING_LEVEL` sets the `xtdb` logger and `XTDB_LOGGING_LEVEL_<NS>` sets `xtdb.<ns>`, with `_` separating components; values are log4j2 level names, and an unknown one refuses startup.
 A `rtdb_<crate>::<module>` target is the logger `xtdb.<crate>.<module>`, with `_` inside a component written as `-`, so `XTDB_LOGGING_LEVEL_STORAGE_DISK-CACHE=debug` reaches `rtdb_storage::disk_cache`.
+Targets that stand for one of upstream's main loggers also answer to that logger's name, and the more specific configured level of the two applies:
+
+[cols="1,1"]
+|===
+|Rust target |Upstream logger
+
+|`rtdb_tx`, `rtdb_index` |`xtdb.indexer`
+|`rtdb_maintenance::gc`, `rtdb_maintenance::retention` |`xtdb.garbage-collector`
+|`rtdb_maintenance` (otherwise) |`xtdb.compactor`
+|`rtdb_pgwire` |`xtdb.pgwire`
+|`rtdb_flight_sql` |`xtdb.flight-sql`
+|===
+
+Every other target is reachable only by its `xtdb.<crate>.<module>` name; lines name the logger by that name.
 RTDB's loggers default to INFO; other crates' loggers default to WARN, in place of the dependency loggers upstream quietens individually.
 `rtdb node`, `rtdb node --multi` and `rtdb dev` log to stdout as upstream does; commands that print their own results to stdout, Multi development qualification, the standalone and follower protocols, and `rtdb-multi` log to stderr.

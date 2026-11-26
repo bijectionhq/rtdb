@@ -129,8 +129,8 @@ impl CollectionObserver for Registry {
     fn table_failed(&self, table: Option<&TableRef>, error: &Anomaly) {
         let mut state = self.state.lock(); state.counters.collection_errors.add(1); drop(state);
         match table {
-            Some(table) => tracing::error!(table = %table.schema_and_table(), "Garbage collection failed: {error}"),
-            None => tracing::error!("Garbage collection failed: {error}"),
+            Some(table) => tracing::error!(target: "rtdb_maintenance::gc", table = %table.schema_and_table(), "Garbage collection failed: {error}"),
+            None => tracing::error!(target: "rtdb_maintenance::gc", "Garbage collection failed: {error}"),
         }
     }
 }
