@@ -79,8 +79,13 @@ The node's PostgreSQL TLS configuration does not apply to this endpoint.
 
 == Queries, writes, and metadata
 
-GetFlightInfo captures the query plan, Arrow parameters, catalog and clock behind a bounded opaque `TicketStatementQuery` handle.
-Authenticated ticket redemption requires the original session and deployment attachment.
+GetFlightInfo encodes the SQL, search path, Arrow parameters, query clock, timezone and read cut in a self-contained `TicketStatementQuery` handle, as the reference's `QueryTicket.Run` does.
+The server retains nothing per issued ticket, so the rate at which tickets are issued and redeemed is not bounded by `maximum_concurrent_calls`, and an unredeemed ticket holds no snapshot or catalog.
+The read cut is each database's last visible system time; a database without a visible transaction, or one attached after the ticket was issued, keeps an empty cut, which later transactions do not enter.
+A read under a restored SQL snapshot carries that snapshot's token instead.
+The handle is signed with HMAC-SHA256 under a key generated when the service starts, over the issuing session's id and owner.
+A ticket presented by another session, another owner, or after a restart fails as not found, as does one whose signed bytes were altered; a truncated ticket is invalid.
+A ticket larger than `maximum_message_bytes` is refused when issued, since its parameter batch is carried whole.
 It keeps the connection borrowed through statement classification, basis capture, and schema preparation against that basis.
 GetFlightInfo, GetSchema, CreatePreparedStatement and DoPut statement updates use the same selected Direct parser diagnostics for initial preparation.
 When the vendor parser rejects a first unquoted ASCII identifier outside both vocabularies, the frontend compares the byte range and accepts a matching extraneous-input or statement-head mismatch report.
@@ -88,8 +93,12 @@ The gRPC description carries the report’s line, column and message.
 Anomaly metadata includes the message, category `incorrect` and code `xtdb/sql-error` when its encoding fits the 4 KiB limit.
 A Direct parser admission failure after eligibility returns its resource error, and other Direct outcomes retain the original preparation error.
 Paired Flight SQL diagnostic execution remains pending.
-DoGet revalidates the redeeming session, waits its visibility barrier, then opens the captured basis through `NativeSession::query_context_at`.
-A ticket remains usable by a different authorized caller.
+DoGet revalidates the redeeming session, waits its visibility barrier, then opens the captured basis on the session's connection for the ticket's database through `NativeSession::query_context_at`, re-preparing the SQL as the reference's `getStreamStatement` does.
+Each redemption reads the current indexed state capped at the captured cut, so one ticket can be redeemed repeatedly with the same result.
+Erased rows are no longer visible, as in the reference, and a cut that cannot be opened, such as one past the database's current head or under an SQL snapshot token that is no longer retained, fails the redemption with the query error.
+The SQL is re-prepared against the current catalog, so a table or column created after issue can make the redeemed schema differ from the announced one, as in the reference.
+A `SHOW` inspection ticket executes the inspection on each redemption, as the reference does, on the connection that issued it: the issuing transaction's connection while that transaction is open, otherwise the session's.
+An inspection therefore reports its values and errors at redemption rather than at GetFlightInfo.
 Flight SQL opens a columnar query cursor where the operators can provide Arrow batches.
 An index-covered ordered point read streams typed results from the posting leaves under the ticket's captured basis.
 Query streams retain their cursor, connection, session lease, cancellation scope, and Arrow allocation owners through completion or cancellation.
@@ -101,9 +110,9 @@ SQL BEGIN, COMMIT, and ROLLBACK use the shared Flight SQL control rejection; tra
 Prepared handles are re-prepared against the current execution context on each use.
 Their parameter metadata uses positional unnamed nullable fields, and the source's field-4 `is_update` extension is retained.
 Prepared query binding retains the first Arrow batch.
-Flight SQL derives the result schema from the admitted parameter types and retains the batch and types with the query ticket.
+Flight SQL derives the result schema from the admitted parameter types and encodes the batch, whose IPC schema carries those types, in the query ticket.
 Rebinding the prepared statement leaves previously issued tickets associated with their original batch and types.
-Ticket redemption validates the argument batch and reads the first parameter row when opening the query.
+Ticket redemption decodes and validates the argument batch and reads the first parameter row when opening the query.
 A pure projection of compatible bound parameters stays in Arrow.
 Compatible nested lists, fixed-size lists, and structs are projected as Arrow columns.
 Supported addition, subtraction, and multiplication read integer and floating-point arguments through the query engine's Arrow projection kernel.
@@ -128,7 +137,7 @@ SQL-info values use the standard dense-union string and int32 legs with child-lo
 The `FlightSqlTransaction` prose in `dev/doc/tx.allium` describes a handle reachable from any session.
 The pinned `XtdbProducer` instead compares caller identity for transaction and prepared handles.
 The native implementation preserves authenticated-session ownership and the shared anonymous owner; the specification retains an open question about that distinction.
-Query tickets are independently transferable, as in the reference.
+The reference's query tickets are transferable between callers; native query tickets are bound to the issuing session.
 
 Arrow Java 19 advertises eight standard actions through ListActions, including savepoint, Substrait, and CancelQuery actions that XTDB leaves unimplemented.
 The native server preserves that advertisement and returns unimplemented for those actions.
@@ -148,7 +157,7 @@ A classified control command retains an estimated parsing and binding allowance 
 Flight SQL charges each upload frame while it awaits and undergoes Arrow decoding, and charges command decoding from the descriptor's command bytes.
 Decoded command fields that survive command parsing keep their share of the charge until consumed.
 Flight SQL reserves a schema allowance before converting Arrow parameter fields to logical types.
-Prepared query descriptions and ticket redemptions share the retained parameter types from that conversion.
+Prepared query descriptions share the retained parameter types from that conversion, and ticket redemption converts the decoded batch's fields again.
 Typed batches with zero rows still carry their parameter field types.
 Without a bound parameter batch, result-schema binding borrows the prepared parameter types.
 HTTP/2, prost, TLS-free tonic buffers, ordinary SQL parser scratch, and scalar-expression peak allocations still require end-to-end accounting qualification.
@@ -160,8 +169,8 @@ Query metrics count pull and Arrow-encoding failures; transport failures after a
 == Regression source mapping
 
 `tests/flight.rs` uses an actual native Node and tonic Flight client in its test source.
-Cases cover captured read bases, effect-free empty-ticket redemption, positional and multi-batch parameters, rebind isolation, authenticated handle and ticket ownership, anonymous cross-session transaction completion, immediate lease expiry, bulk ingestion, metadata union offsets, and shutdown while an upload waits for its first message.
-Internal cases cover idle leases and tombstones, nested session calls, credential parsing, cookie selection, Kotlin ticket JSON with required nullable fields, retained Arrow ownership, empty argument distinctions, and malformed IPC extents.
+Cases cover captured read bases, effect-free empty-ticket redemption, positional and multi-batch parameters, rebind isolation, authenticated handle and ticket ownership, anonymous cross-session transaction completion, immediate lease expiry, query tickets issued and redeemed far beyond the concurrent-call bound, bulk ingestion, metadata union offsets, and shutdown while an upload waits for its first message.
+Internal cases cover idle leases and tombstones, nested session calls, credential parsing, cookie selection, signed ticket round trips, rejection of tickets from another session, owner or service and of tampered tickets, retained Arrow ownership, empty argument distinctions, and malformed IPC extents.
 The reserved metadata API has a source regression in `rtdb-query` for clone lifetime and reservation failure.
 
 These cases map to `core/src/test/kotlin/xtdb/flight_sql/LeaseTest.kt`, `src/test/kotlin/xtdb/FlightSqlAuthnTest.kt`, `src/test/kotlin/xtdb/FlightSqlAdbcTest.kt`, and the Flight SQL/ADBC Clojure tests under `src/test/clojure/xtdb`.
@@ -170,7 +179,7 @@ The implementation uses https://docs.rs/arrow-flight/58.4.1/arrow_flight/[Arrow 
 Interop with Java, Go, Python, R, and ADBC drivers, external authentication, flow-control cancellation races, concurrent expiry/claim races, and every test listed here remain unexecuted qualification work.
 
 Ticket `currentTime` retains the query clock's nanoseconds through serialization and later execution.
-The captured snapshot-time cap retains its separate microsecond representation.
+The captured snapshot-time cap and each database's cut retain their separate microsecond representation.
 
 An existing anomaly with an absent message uses its `xtdb.api.error` category class name as the general Flight status description.
 An empty message remains empty.

@@ -105,6 +105,16 @@ impl NativeSession {
         }).await.ok_or_else(cancelled)?
     }
 
+    /// Opens a checked read like [`Self::query_context_with`] and also returns the basis it pinned, so that a caller can replay that basis later.
+    /// `cancellation` must descend from `state().cancellation()`.
+    pub async fn read_context(&mut self, cancellation: &CancellationToken) -> Result<(crate::QueryBasis, Arc<QueryContext>)> {
+        cancellation.run_until_cancelled(async {
+            let basis = self.state.read_basis().await?;
+            let context = self.instrument_query_context(self.service.query_context(self.state.database(), &basis, cancellation).await?);
+            Ok((basis, context))
+        }).await.ok_or_else(cancelled)?
+    }
+
     /// `cancellation` must descend from `state().cancellation()`.
     /// Unchecked reads are for EXECUTE arguments and the frontend's exact pgjdbc type probe.
     pub async fn query_context_with(&mut self, cancellation: &CancellationToken, checked: bool) -> Result<Arc<QueryContext>> {

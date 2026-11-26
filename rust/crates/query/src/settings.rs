@@ -341,13 +341,19 @@ fn validate_basis(basis: Option<&TimeBasis>, catalog: &CatalogSnapshot) -> Resul
     for (name, database) in catalog.databases.iter() {
         for (index, snapshot) in database.partitions.iter().enumerate() {
             if let Some(requested) = basis.and_then(|basis| basis.databases.get(name)).and_then(|times| times.get(index)).copied().flatten() {
-                if snapshot.tx_basis().is_none_or(|head| requested > head.system_time.into()) {
+                if !head_covers(snapshot.tx_basis(), requested) {
                     return Err(unindexed_tx(requested, snapshot.tx_basis()));
                 }
             }
         }
     }
     Ok(())
+}
+
+/// Whether a partition head can serve a read capped at `requested`.
+/// A cut at the earliest system time admits no transaction, so every head, including an empty one, covers it.
+pub fn head_covers(head: Option<TransactionKey>, requested: Instant) -> bool {
+    requested <= Timestamp::MIN.into() || head.is_some_and(|head| requested <= head.system_time.into())
 }
 
 /// The anomaly for a read basis whose system time is after a database's latest completed transaction.

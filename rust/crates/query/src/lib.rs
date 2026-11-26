@@ -73,7 +73,7 @@ pub use fragment::{FragmentBytes, FragmentDepth, FragmentReply, FragmentResidenc
 pub use cursor::{PreparedQuery, QueryCursor, encoding_ordered_batch};
 pub use rtdb_storage::sealing::{DeliveryIo, current_delivery_deadline};
 pub use query_cpu::QueryCpu;
-pub use settings::unindexed_tx;
+pub use settings::{head_covers, unindexed_tx};
 pub use runtime_schema::RuntimeSchema;
 
 fn invalid(code: &str, message: impl std::fmt::Display) -> rtdb_types::Anomaly {

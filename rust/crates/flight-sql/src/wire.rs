@@ -1,5 +1,4 @@
 use std::{collections::HashMap, sync::Arc};
-#[cfg(test)]
 use std::io::Cursor;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_buffer::Buffer;
@@ -377,15 +376,13 @@ fn validate_lz4_lengths(message: &arrow_ipc::Message<'_>, body: &[u8]) -> Result
     }
     Ok(())
 }
-#[cfg(test)]
-fn parameter_ipc(batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<Option<Bytes>, Status> {
+pub(crate) fn parameter_ipc(batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<Option<Bytes>, Status> {
     if batch.num_columns() == 0 { return Ok(None); }
     let charge = memory.reserve(add(mul(batch.get_array_memory_size(), 4)?, schema_bound(batch.schema().as_ref())?)?).map_err(status)?;
     let output = rtdb_format::ipc::write_arrow_stream(batch.schema().as_ref(), std::slice::from_ref(batch), IpcWriteOptions::default()).map_err(status)?;
     Ok(Some(retain(output, charge)))
 }
-#[cfg(test)]
-fn parameter_batch(bytes: &Bytes, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch, Status> {
+pub(crate) fn parameter_batch(bytes: &Bytes, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch, Status> {
     let mut charge = memory.reserve(ipc_bound(bytes)?).map_err(status)?;
     let mut reader = rtdb_format::ipc::ArrowStream::from_reader(Cursor::new(bytes.as_ref()), None).map_err(status)?;
     let batch = reader.next().transpose().map_err(status)?.unwrap_or_else(|| RecordBatch::new_empty(reader.schema()));
@@ -460,7 +457,6 @@ impl BoundParameters {
         arguments(&self.batch, memory)
     }
 }
-#[cfg(test)]
 fn ipc_bound(bytes: &[u8]) -> Result<usize, Status> {
     let mut position = 0usize; let mut bound = 8192;
     while position < bytes.len() {
@@ -478,7 +474,6 @@ fn ipc_bound(bytes: &[u8]) -> Result<usize, Status> {
     }
     Ok(bound)
 }
-#[cfg(test)]
 fn read_i32(bytes: &[u8], position: &mut usize) -> Result<i32, Status> { let end = add(*position, 4)?; let value = i32::from_le_bytes(bytes.get(*position..end).ok_or_else(|| invalid("Truncated parameter IPC"))?.try_into().map_err(arrow)?); *position = end; Ok(value) }
 fn logical_parameter_types(schema: &Schema) -> Result<Vec<LogicalType>, Status> {
     schema.fields().iter().map(|field| from_field(field).map_err(status)).collect()

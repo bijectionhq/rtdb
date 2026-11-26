@@ -665,10 +665,12 @@ impl Node {
                 }
             };
             let requested = basis.snapshot.databases.get(&name).and_then(|partitions| partitions.first()).copied().flatten();
-            if let Some(requested) = requested.filter(|requested| snapshot.tx_basis().is_none_or(|head| *requested > head.system_time.into())) {
+            if let Some(requested) = requested.filter(|requested| !rtdb_query::head_covers(snapshot.tx_basis(), *requested)) {
                 return Err(rtdb_query::unindexed_tx(requested, snapshot.tx_basis()));
             }
             let cap = requested.map(|time| time.as_micros()).transpose()?;
+            // An empty head cannot carry a cap, and has nothing for one to hide.
+            let cap = cap.filter(|_| snapshot.tx_basis().is_some());
             let upper = applied.map(|selected| selected.system_time).or(basis.snapshot_time);
             let cap = match (cap, upper) { (Some(time), Some(upper)) => Some(time.min(upper)), (time, _) => time };
             let snapshot = snapshot.with_system_time_cap(cap)?;

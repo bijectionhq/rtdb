@@ -402,6 +402,28 @@ async fn query_ticket_keeps_an_empty_cut_and_the_original_clock() {
 }
 
 #[tokio::test]
+async fn query_tickets_are_unbounded_by_concurrent_calls_and_redeem_repeatedly_at_their_basis() {
+    let config = FlightConfig { maximum_concurrent_calls: 4, ..Default::default() };
+    let running = Running::start(None, config).await;
+    let mut client = Client::connect(&running.server, None).await;
+    client.update("INSERT INTO docs (_id,n) VALUES (0,0)", None).await;
+    let mut infos = Vec::new();
+    for n in 1..=40 {
+        infos.push(client.info("SELECT count(*) AS n FROM docs", None).await);
+        client.update(&format!("INSERT INTO docs (_id,n) VALUES ({n},{n})"), None).await;
+    }
+    for (index, info) in infos.iter().enumerate() {
+        let expected = i64::try_from(index).unwrap() + 1;
+        assert_eq!(integer(&client.redeem(info).await[0], 0, 0), expected);
+        assert_eq!(integer(&client.redeem(info).await[0], 0, 0), expected);
+    }
+    for _ in 0..200 {
+        assert_eq!(integer(&client.query("SELECT count(*) AS n FROM docs").await[0], 0, 0), 41);
+    }
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn prepared_parameters_are_positional_all_batches_update_and_old_ticket_keeps_old_bind() {
     let running = Running::start(None, FlightConfig::default()).await; let mut client = Client::connect(&running.server, None).await;
     let update = client.prepare("INSERT INTO docs (_id) VALUES (?)", None).await;
@@ -422,7 +444,25 @@ async fn prepared_parameters_are_positional_all_batches_update_and_old_ticket_ke
 }
 
 #[tokio::test]
-async fn retained_ticket_pins_arrow_parameters_after_rebind() {
+async fn inspection_ticket_issued_in_a_transaction_reads_that_transaction_connection() {
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let transaction = client.begin().await;
+    let set = client.info("SET TIME ZONE 'Europe/Paris'", Some(transaction.clone())).await;
+    assert!(client.redeem(&set).await.is_empty());
+    let inside = client.info("SHOW TIME ZONE", Some(transaction.clone())).await;
+    let outside = client.info("SHOW TIME ZONE", None).await;
+    let timezone = |batches: Vec<RecordBatch>| batches[0].column(0).as_any().downcast_ref::<StringArray>().unwrap().value(0).to_owned();
+    assert_eq!(timezone(client.redeem(&inside).await), "Europe/Paris");
+    assert_ne!(timezone(client.redeem(&outside).await), "Europe/Paris");
+    client.end(transaction, false).await.unwrap();
+    let request = client.request(inside.endpoint[0].ticket.clone().unwrap());
+    assert_eq!(client.client.do_get(request).await.unwrap_err().code(), tonic::Code::NotFound);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn ticket_carries_its_arrow_parameters_across_rebind() {
     use arrow_flight::sql::TicketStatementQuery;
 
     let running = Running::start(None, FlightConfig::default()).await;
@@ -435,8 +475,7 @@ async fn retained_ticket_pins_arrow_parameters_after_rebind() {
     let info = client.client.get_flight_info(request).await.unwrap().into_inner();
     let ticket = Any::decode(info.endpoint[0].ticket.as_ref().unwrap().ticket.as_ref()).unwrap();
     let handle = TicketStatementQuery::decode(ticket.value).unwrap().statement_handle;
-    assert!(handle.starts_with(b"RTDBFT\x02"));
-    assert_eq!(handle.len(), 7 + 16);
+    assert!(handle.starts_with(b"RTDBFT\x03"));
 
     let text = RecordBatch::try_from_iter([("label", Arc::new(StringArray::from(vec!["new"])) as arrow_array::ArrayRef)]).unwrap();
     client.upload(command, vec![text]).await;

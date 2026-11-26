@@ -34,11 +34,13 @@ impl<'a> Credentials<'a> {
 pub(crate) fn cookie<T>(request: &Request<T>) -> Option<&str> {
     request.metadata().get_all("cookie").iter().filter_map(|value| value.to_str().ok()).flat_map(|value| value.split(';')).filter_map(|part| part.trim().split_once('=')).find_map(|(name, value)| (name == COOKIE && !value.is_empty()).then_some(value))
 }
+fn random_key() -> Zeroizing<[u8; 32]> { let mut key = [0; 32]; key[..16].copy_from_slice(Uuid::new_v4().as_bytes()); key[16..].copy_from_slice(Uuid::new_v4().as_bytes()); Zeroizing::new(key) }
 pub(crate) fn equal(left: &[u8], right: &[u8]) -> bool { bool::from(left.ct_eq(right)) }
-pub(crate) struct Authentication { authenticator: Arc<Authenticator>, key: Zeroizing<[u8; 32]> }
+pub(crate) struct Authentication { authenticator: Arc<Authenticator>, key: Zeroizing<[u8; 32]>, ticket_key: Zeroizing<[u8; 32]> }
 impl Authentication {
-    pub fn new(authenticator: Arc<Authenticator>) -> Self { let mut key = [0; 32]; key[..16].copy_from_slice(Uuid::new_v4().as_bytes()); key[16..].copy_from_slice(Uuid::new_v4().as_bytes()); Self { authenticator, key: Zeroizing::new(key) } }
+    pub fn new(authenticator: Arc<Authenticator>) -> Self { Self { authenticator, key: random_key(), ticket_key: random_key() } }
     pub fn mac(&self, raw: &str) -> [u8; 32] { let mut mac = Hmac::<Sha256>::new_from_slice(self.key.as_ref()).expect("HMAC key"); mac.update(raw.as_bytes()); mac.finalize().into_bytes().into() }
+    pub fn ticket_mac(&self) -> Hmac<Sha256> { Hmac::<Sha256>::new_from_slice(self.ticket_key.as_ref()).expect("HMAC key") }
     pub async fn authenticate(&self, credentials: &Credentials<'_>, peer: Option<&str>) -> Result<Arc<Caller>, Status> {
         let (principal, verified_credential) = match credentials {
             Credentials::None => { if self.authenticator.method_for(None, peer) != Some(Method::Trust) { return Err(unauthenticated("credentials required")); } (self.authenticator.unauthenticated().map_err(auth_error)?, false) }
