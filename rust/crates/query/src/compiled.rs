@@ -3,7 +3,7 @@ use std::sync::{Arc, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWrite
 
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_plan::{Expr, Relation, Schema};
-use rtdb_types::{Anomaly, LogicalType as L, Result};
+use rtdb_types::{Anomaly, AnomalyKind, LogicalType as L, Result};
 
 use crate::runtime_schema::{EmissionMode, EmittedRelation, declared_parameter_types, expression_bound, schema_bound};
 use crate::{CatalogSnapshot, invalid};
@@ -58,7 +58,7 @@ impl CompiledQuery {
         let inline = width.checked_mul(std::mem::size_of::<Option<L>>()).ok_or_else(size_error)?;
         let bytes = types.iter().flatten().try_fold(inline, |bytes, ty| bytes.checked_add(ty.retained_bytes()?).ok_or_else(size_error))?;
         let bytes = bytes.checked_add(256).ok_or_else(size_error)?;
-        let Some(reservation) = self.declarations.admit(|| keeper.reserve(bytes))? else { return Ok(types); };
+        let Some(reservation) = self.declarations.admit(|| Ok(keeper.try_reserve(bytes)))? else { return Ok(types); };
         Ok(self.declarations.insert(Declarations { mode, width, types, _reservation: reservation }, &found))
     }
 
@@ -70,7 +70,12 @@ impl CompiledQuery {
         if let Some(emitted) = self.plans.find(&found) { return Ok(emitted); }
         let unkept = || EmittedRelation::emit(Arc::clone(relation), catalog, parameters, memory, mode);
         let Some(keeper) = &self.keeper else { return unkept(); };
-        let Some(emitted) = self.plans.admit(|| EmittedRelation::emit(Arc::clone(relation), catalog, parameters, keeper, mode))? else {
+        let Some(emitted) = self.plans.admit(|| match EmittedRelation::emit(Arc::clone(relation), catalog, parameters, keeper, mode) {
+            Ok(emitted) => Ok(Some(emitted)),
+            // Emission charges only the keeper, so running out of memory here is the keeper refusing the plan.
+            Err(error) if error.is(AnomalyKind::ResourceExhausted) => Ok(None),
+            Err(error) => Err(error),
+        })? else {
             return unkept();
         };
         emitted.keep_operators(keeper);
@@ -98,15 +103,13 @@ impl<T> Kept<T> {
         })
     }
 
-    /// Runs `admit`, evicting the least recently used entry after each refusal by the keeper.
-    /// `None` once a refusal leaves nothing to evict; any other error is returned.
-    fn admit<A>(&self, mut admit: impl FnMut() -> Result<A>) -> Result<Option<A>> {
+    /// Runs `admit`, evicting the least recently used entry after each refusal by the keeper, which `admit` answers
+    /// with `None`.
+    /// `None` once a refusal leaves nothing to evict; an error is returned as it is.
+    fn admit<A>(&self, mut admit: impl FnMut() -> Result<Option<A>>) -> Result<Option<A>> {
         loop {
-            match admit() {
-                Ok(admitted) => return Ok(Some(admitted)),
-                Err(error) if refused(&error) => if !self.evict() { return Ok(None); },
-                Err(error) => return Err(error),
-            }
+            if let Some(admitted) = admit()? { return Ok(Some(admitted)); }
+            if !self.evict() { return Ok(None); }
         }
     }
 
@@ -133,8 +136,6 @@ impl<T> Kept<T> {
     #[cfg(test)]
     fn len(&self) -> usize { self.read().len() }
 }
-
-fn refused(error: &Anomaly) -> bool { error.code == "rtdb/memory-budget-exceeded" }
 
 fn size_error() -> Anomaly { invalid("compiled-plan-size", "Compiled plan exceeds addressable memory") }
 
@@ -171,11 +172,7 @@ impl Operators {
         if let Some(kept) = self.template.get() { return Ok(Arc::clone(&kept.template)); }
         let template = Arc::new(build()?);
         let Some(keeper) = self.keeper.get() else { return Ok(template); };
-        let reservation = match keeper.reserve(template.retained_bytes()?) {
-            Ok(reservation) => reservation,
-            Err(error) if refused(&error) => return Ok(template),
-            Err(error) => return Err(error),
-        };
+        let Some(reservation) = keeper.try_reserve(template.retained_bytes()?) else { return Ok(template); };
         Ok(Arc::clone(&self.template.get_or_init(|| KeptTemplate { template, _reservation: reservation }).template))
     }
 
