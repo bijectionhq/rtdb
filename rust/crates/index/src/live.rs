@@ -289,8 +289,8 @@ pub struct LiveTable {
     chunks: Vec<(u32, Arc<IndexBatch>)>,
     row_count: u32,
     lineage: LiveRowLineage,
-    column_types: StructFields<LogicalType>,
-    declared_columns: StructFields<LogicalType>,
+    column_types: Arc<StructFields<LogicalType>>,
+    declared_columns: Arc<StructFields<LogicalType>>,
     trie: MemoryHashTrie,
     last_system_time: Option<Timestamp>,
     canonical_entity_iids: bool,
@@ -302,7 +302,7 @@ pub struct LiveTable {
 }
 
 #[derive(Debug)]
-struct SchemaMerge { table: StructFields<LogicalType>, appended: StructFields<LogicalType>, merged: StructFields<LogicalType> }
+struct SchemaMerge { table: Arc<StructFields<LogicalType>>, appended: StructFields<LogicalType>, merged: Arc<StructFields<LogicalType>> }
 
 /// This table's column types joined with a table catalog's contributed types, for the last catalog they were joined with.
 /// Both are replaced rather than changed, so a cloned table, about to become another version, starts empty.
@@ -322,7 +322,7 @@ impl Clone for LocatedLeaves { fn clone(&self) -> Self { Self::default() } }
 
 impl LiveTable {
     pub fn new(table: TableRef, block_index: BlockIndex, config: TrieConfig) -> Self {
-        Self { table, block_index, chunks: Vec::new(), row_count: 0, lineage: LiveRowLineage::empty(), column_types: StructFields::new(), declared_columns: StructFields::new(), trie: MemoryHashTrie::new(config), last_system_time: None, canonical_entity_iids: true, located: LocatedLeaves::default(), joined_types: JoinedTypes::default(), schema_merge: None }
+        Self { table, block_index, chunks: Vec::new(), row_count: 0, lineage: LiveRowLineage::empty(), column_types: Arc::default(), declared_columns: Arc::default(), trie: MemoryHashTrie::new(config), last_system_time: None, canonical_entity_iids: true, located: LocatedLeaves::default(), joined_types: JoinedTypes::default(), schema_merge: None }
     }
     pub fn table(&self) -> &TableRef { &self.table }
     pub fn block_index(&self) -> BlockIndex { self.block_index }
@@ -513,7 +513,9 @@ impl LiveTable {
     }
     pub fn append(&self, write: &TableWrite, system_time: Timestamp) -> Result<Self> {
         let mut next = self.with_appended_schema(&write.column_types, system_time)?;
-        crate::catalog::add_declarations(&mut next.declared_columns, &write.declared_columns);
+        if !write.declared_columns.is_empty() {
+            crate::catalog::add_declarations(Arc::make_mut(&mut next.declared_columns), &write.declared_columns);
+        }
         if let Some(batch) = &write.batch {
             self.validate_append(std::iter::once(batch.as_ref()), write.adopted_history, system_time)?;
             next.canonical_entity_iids = self.canonical_entity_iids && batch.has_canonical_iids().unwrap_or(false);
@@ -527,19 +529,23 @@ impl LiveTable {
         if self.last_system_time.is_some_and(|previous| previous > system_time) {
             return Err(invalid("Live table system time moved backwards"));
         }
-        let mut next = self.clone();
-        next.column_types = match &self.schema_merge {
-            Some(memo) if identical_types(&memo.table, &self.column_types) && identical_types(&memo.appended, column_types) => memo.merged.clone(),
+        let (column_types, schema_merge) = match &self.schema_merge {
+            Some(memo) if (Arc::ptr_eq(&memo.table, &self.column_types) || identical_types(&memo.table, &self.column_types))
+                && identical_types(&memo.appended, column_types) => (Arc::clone(&memo.merged), Arc::clone(memo)),
             _ => {
                 let merged = merge_column_types(&self.column_types, column_types);
-                next.schema_merge = Some(Arc::new(SchemaMerge {
-                    table: self.column_types.clone(), appended: column_types.clone(), merged: merged.clone(),
-                }));
-                merged
+                // A merge that changes nothing shares the table's types, so the next append recognises its memo by identity.
+                let merged = if identical_types(&merged, &self.column_types) { Arc::clone(&self.column_types) } else { Arc::new(merged) };
+                let memo = Arc::new(SchemaMerge { table: Arc::clone(&self.column_types), appended: column_types.clone(), merged: Arc::clone(&merged) });
+                (merged, memo)
             }
         };
-        next.last_system_time = Some(system_time);
-        Ok(next)
+        Ok(Self {
+            table: self.table.clone(), block_index: self.block_index, chunks: self.chunks.clone(), row_count: self.row_count,
+            lineage: self.lineage.clone(), column_types, declared_columns: Arc::clone(&self.declared_columns), trie: self.trie.clone(),
+            last_system_time: Some(system_time), canonical_entity_iids: self.canonical_entity_iids, located: LocatedLeaves::default(),
+            joined_types: JoinedTypes::default(), schema_merge: Some(schema_merge),
+        })
     }
 
     fn validate_append<'a>(
@@ -709,7 +715,7 @@ impl LiveTable {
         } else {
             (BTreeMap::new(), None)
         };
-        let metadata = TableMeta { column_types: self.column_types.clone(), declared_columns: self.declared_columns.clone(), row_count: i64::from(self.row_count), hlls };
+        let metadata = TableMeta { column_types: self.column_types.as_ref().clone(), declared_columns: self.declared_columns.as_ref().clone(), row_count: i64::from(self.row_count), hlls };
         Ok((metadata, reservation))
     }
 }
@@ -768,7 +774,7 @@ impl BlockPages<'_> {
             let batch = &self.table.chunks[chunk].1;
             batch.view().event_ref(offset as usize, &batch.put_field_types)
         }).collect::<Result<Vec<_>>>()?;
-        let batch = owned_event_batch(&events, Some(self.table.column_types.clone()), true, &self.memory)?;
+        let batch = owned_event_batch(&events, Some(self.table.column_types.as_ref().clone()), true, &self.memory)?;
         let batch = if self.table.table.is_owned_world_topology() {
             rtdb_format::data::with_topology_commit_positions(batch, &self.memory)?
         } else {
@@ -2111,6 +2117,40 @@ fn repeated_appends_merge_column_types_as_a_fresh_merge_does_in_field_order() {
         live = live.append(&TableWrite::new(types.clone(), None), Timestamp(1)).unwrap();
         expected = merge_column_types(&expected, types);
         assert!(identical_types(live.column_types(), &expected), "{:?} differs from {expected:?}", live.column_types());
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn appended_versions_keep_their_own_column_types_and_declarations_while_sharing_unchanged_ones() {
+    use rtdb_types::ScalarType;
+    let int = LogicalType::Scalar(ScalarType::I64);
+    let text = LogicalType::Scalar(ScalarType::Utf8);
+    let a = StructFields::from([("a".to_owned(), int.clone())]);
+    let ab = StructFields::from([("a".to_owned(), int.clone()), ("b".to_owned(), text.clone())]);
+    let declared_b = StructFields::from([("b".to_owned(), text.clone().maybe())]);
+    let declared_c = StructFields::from([("c".to_owned(), int.clone())]);
+    let none = StructFields::new();
+    let mut versions = vec![LiveTable::new(TableRef::new("public", "docs"), BlockIndex(0), TrieConfig::default())];
+    let mut expected = vec![(StructFields::new(), StructFields::new())];
+    for (types, declared) in [(&a, &none), (&a, &none), (&a, &declared_b), (&ab, &none), (&ab, &none), (&a, &declared_c), (&a, &none), (&none, &declared_b)] {
+        let write = TableWrite::new(types.clone(), None).with_declarations(declared.clone());
+        let previous = versions.last().unwrap();
+        let next = previous.append(&write, Timestamp(1)).unwrap();
+        let (column_types, declarations) = expected.last().unwrap();
+        let column_types = merge_column_types(column_types, write.column_types());
+        let mut declarations = declarations.clone();
+        crate::catalog::add_declarations(&mut declarations, write.declared_columns());
+        if identical_types(&column_types, previous.column_types()) {
+            assert!(Arc::ptr_eq(&next.column_types, &previous.column_types));
+        }
+        if declared.is_empty() { assert!(Arc::ptr_eq(&next.declared_columns, &previous.declared_columns)); }
+        versions.push(next);
+        expected.push((column_types, declarations));
+    }
+    for (live, (column_types, declarations)) in versions.iter().zip(&expected) {
+        assert!(identical_types(live.column_types(), column_types), "{:?} differs from {column_types:?}", live.column_types());
+        assert!(identical_types(live.declared_columns(), declarations), "{:?} differs from {declarations:?}", live.declared_columns());
     }
 }
 
