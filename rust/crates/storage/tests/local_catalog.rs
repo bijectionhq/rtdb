@@ -34,7 +34,7 @@ async fn a_local_trie_release_waits_for_held_catalogs_and_refuses_stale_reopens(
     let mut forged = bytes.to_vec();
     forged[7] = 3;
     assert_eq!(collector.release_trie_files(&receipt, forged.into()).await.unwrap_err().code, "rtdb.storage/trie-release");
-    assert!(reader.retain_catalog(Some(selected)).await?.is_some());
+    assert_eq!(reader.retain_catalog(Some(selected)).await.err().unwrap().code, "rtdb.storage/catalog-not-current");
 
     let recovery = reader.hold_recovery_open().await?;
     let old_catalog = ObjectKey::new("blocks/b00.binpb")?;
@@ -47,6 +47,9 @@ async fn a_local_trie_release_waits_for_held_catalogs_and_refuses_stale_reopens(
 
     collector.collect_recovery_file(&old_catalog).await?;
     assert!(matches!(reader.head(&old_catalog).await, Err(Error::MissingObject(_))));
+    assert!(!collector.release_trie_files(&receipt, bytes.clone()).await?, "a hold without a file inventory keeps every exact file");
+    assert!(reader.head(&file).await.is_ok());
+    drop(current);
     assert!(collector.release_trie_files(&receipt, bytes.clone()).await?);
     let new_reader = open();
     assert_eq!(new_reader.retain_catalog(Some(selected)).await.err().unwrap().code, "rtdb.storage/catalog-not-current");
@@ -55,7 +58,6 @@ async fn a_local_trie_release_waits_for_held_catalogs_and_refuses_stale_reopens(
     assert!(collector.release_trie_files(&receipt, bytes).await?);
     assert!(matches!(collector.head(&file).await, Err(Error::MissingObject(_))));
     assert!(collector.list(None).await?.iter().all(|object| !object.key.as_str().contains("catalog-ledger")));
-    drop(current);
     Ok(())
 }
 
