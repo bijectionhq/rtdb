@@ -124,6 +124,12 @@ fn scalar_text(value: &Value, context: &EvalContext<'_>) -> Result<String> {
     render::text(value)
 }
 
+/// SUBSTRING of text by character position, as the scalar call takes it from its integer arguments.
+pub(crate) fn text_substring(source: &str, position: i64, length: Option<i64>) -> Result<&str> {
+    let slice = substring(source.as_bytes(), position as i32, length.map(|length| length as i32), true)?;
+    std::str::from_utf8(slice).map_err(|_| illegal("String operation produced invalid UTF-8"))
+}
+
 fn substring(source: &[u8], position: i32, length: Option<i32>, utf8: bool) -> Result<&[u8]> {
     if length.is_some_and(|length| length < 0) { return Err(illegal("Negative substring length")); }
     let zero = position.wrapping_sub(1);

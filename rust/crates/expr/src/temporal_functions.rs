@@ -94,22 +94,39 @@ fn extract(field: F,value: &Value) -> Result<Value> {
                 if !(0..86_400_000_000_000).contains(&nanos) { return Err(inapplicable("extract",&[])); }
                 clock_field(field,nanos / 1_000_000_000)?
             }
-            Value::Timestamp { value,unit,timezone } => {
-                let seconds = value.div_euclid(unit.units_per_second());
-                let offset = timezone.as_deref().map(ZoneId::parse).transpose()?.map(|zone|zone.offset_at(seconds)).transpose()?.map_or(0,|offset|offset.seconds());
-                match field {
-                    F::TimezoneHour if timezone.is_some() => i64::from(offset / 3600), F::TimezoneMinute if timezone.is_some() => i64::from((offset / 60) % 60), F::Epoch if timezone.is_some() => seconds,
-                    _ => {
-                        let local = seconds.checked_add(i64::from(offset)).ok_or_else(overflow)?;
-                        if matches!(field,F::Hour | F::Minute | F::Second) { clock_field(field,local.rem_euclid(86_400))? }
-                        else { date_field(field,CivilDate::from_epoch_day(local.div_euclid(86_400))?)? }
-                    }
-                }
-            }
+            Value::Timestamp { value,unit,timezone } => timestamp_field(field,*value,*unit,timezone.as_deref().map(ZoneId::parse).transpose()?)?,
             _ => return Err(inapplicable("extract",&[value])),
         }
     };
-    Ok(Value::I32(i32::try_from(result).map_err(|_|overflow())?))
+    Ok(Value::I32(extracted(result)?))
+}
+fn extracted(result: i64) -> Result<i32> { i32::try_from(result).map_err(|_|overflow()) }
+/// A timestamp's field under its zone label's rules, `zone` being the parsed label of a zoned timestamp.
+fn timestamp_field(field: F,value: i64,unit: U,zone: Option<ZoneId>) -> Result<i64> {
+    let seconds = value.div_euclid(unit.units_per_second());
+    let offset = zone.map(|zone|zone.offset_at(seconds)).transpose()?.map_or(0,|offset|offset.seconds());
+    Ok(match field {
+        F::TimezoneHour if zone.is_some() => i64::from(offset / 3600), F::TimezoneMinute if zone.is_some() => i64::from((offset / 60) % 60), F::Epoch if zone.is_some() => seconds,
+        _ => {
+            let local = seconds.checked_add(i64::from(offset)).ok_or_else(overflow)?;
+            if matches!(field,F::Hour | F::Minute | F::Second) { clock_field(field,local.rem_euclid(86_400))? }
+            else { date_field(field,CivilDate::from_epoch_day(local.div_euclid(86_400))?)? }
+        }
+    })
+}
+
+/// EXTRACT over microsecond timestamps sharing one zone label, cell for cell as the scalar call computes it.
+/// `None` where the field doesn't apply, the label isn't a zone, or any cell fails: the scalar call raises that error.
+pub(crate) fn extract_timestamps(field: &str,values: &arrow_array::TimestampMicrosecondArray,timezone: Option<&str>) -> Option<arrow_array::Int32Array> {
+    use arrow_array::Array;
+    let field = F::parse(field).ok()?;
+    field.validate_for("extract",&S::Timestamp { unit: U::Microsecond,timezone: timezone.map(str::to_owned) }).ok()?;
+    let zone = timezone.map(ZoneId::parse).transpose().ok()?;
+    let mut cells = Vec::with_capacity(values.len());
+    for row in 0..values.len() {
+        cells.push(if values.is_null(row) { None } else { Some(timestamp_field(field,values.value(row),U::Microsecond,zone).and_then(extracted).ok()?) });
+    }
+    Some(arrow_array::Int32Array::from(cells))
 }
 
 fn truncated_date(field: F,date: CivilDate) -> Result<CivilDate> {

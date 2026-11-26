@@ -611,15 +611,20 @@ impl LikePattern {
         Ok(Value::Bool(self.matches(source) != negated))
     }
 
+    fn matches(&self,source: &str) -> bool { self.matches_in(source,&mut Vec::new(),&mut Vec::new()) }
+
     /// Simulates the pattern's automaton: `active[i]` holds when the input read so far can leave the first `i` tokens matched.
-    fn matches(&self,source: &str) -> bool {
+    /// The two state vectors are scratch that a caller matching many inputs reuses.
+    pub(crate) fn matches_in(&self,source: &str,active: &mut Vec<bool>,next: &mut Vec<bool>) -> bool {
         let terminator = |c: char| matches!(c,'\n' | '\r' | '\u{85}' | '\u{2028}' | '\u{2029}');
         let width = self.tokens.len() + 1;
-        let mut active = vec![false; width];
-        let mut next = vec![false; width];
+        active.clear();
+        active.resize(width,false);
+        next.clear();
+        next.resize(width,false);
         let close = |states: &mut [bool]| for index in 0..self.tokens.len() { if states[index] && matches!(self.tokens[index],LikeToken::Any) { states[index + 1] = true; } };
         active[0] = true;
-        close(&mut active);
+        close(&mut active[..]);
         for character in source.chars() {
             next.iter_mut().for_each(|state| *state = false);
             for (index,token) in self.tokens.iter().enumerate() {
@@ -630,8 +635,8 @@ impl LikePattern {
                     LikeToken::Literal(literal) => if literal == character || (self.insensitive && fancy_regex::java_case_equivalent(literal,character)) { next[index + 1] = true; },
                 }
             }
-            close(&mut next);
-            std::mem::swap(&mut active,&mut next);
+            close(&mut next[..]);
+            std::mem::swap(active,next);
             if !active.iter().any(|state| *state) { return false; }
         }
         active[self.tokens.len()]

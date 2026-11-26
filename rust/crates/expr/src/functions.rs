@@ -252,11 +252,7 @@ pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Res
             let x = number(&args[0]).ok_or_else(|| inapplicable(&name, &[&args[0]]))?;
             if name == "round" {
                 if !x.is_finite() { return Ok(Value::F64(x)); }
-                let scale = i64::try_from(scale).map_err(|_| overflow())?;
-                let factor = 10.0_f64.powf((scale as f64).abs());
-                let value = if scale >= 0 { x * factor } else { x / factor };
-                if !value.is_finite() { return Err(overflow()); }
-                return Ok(Value::F64(if scale >= 0 { value.round() / factor } else { value.round() * factor }));
+                return round_float(x, i64::try_from(scale).map_err(|_| overflow())?).map(Value::F64);
             }
             Ok(floating_value(x.abs(), &ty))
         }
@@ -276,11 +272,29 @@ pub(crate) fn is_float_math(name: &str) -> bool {
 }
 
 pub(crate) fn float_math(name: &str, x: f64, y: Option<f64>) -> Result<f64> {
+    if let Some(function) = unary_float_math(name) { return Ok(function(x)); }
     Ok(match name {
-        "sqrt" => x.sqrt(), "exp" => x.exp(), "ln" => x.ln(),
-        "log10" => x.log10(), "sinh" => x.sinh(), "cosh" => x.cosh(), "tanh" => x.tanh(), "double" => x,
         "log" => y.map_or_else(|| x.log10(), |y| y.log(x)), "power" => x.powf(y.ok_or_else(|| inapplicable(name, &[]))?),
-        "sin" => x.sin(), "cos" => x.cos(), "tan" => x.tan(), "asin" => x.asin(), "acos" => x.acos(),
-        "atan" => x.atan(), _ => return Err(inapplicable(name, &[])),
+        _ => return Err(inapplicable(name, &[])),
     })
+}
+
+/// The float math functions of one argument, which ignore any second.
+pub(crate) fn unary_float_math(name: &str) -> Option<fn(f64) -> f64> {
+    let function: fn(f64) -> f64 = match name {
+        "sqrt" => f64::sqrt, "exp" => f64::exp, "ln" => f64::ln,
+        "log10" => f64::log10, "sinh" => f64::sinh, "cosh" => f64::cosh, "tanh" => f64::tanh, "double" => |x| x,
+        "sin" => f64::sin, "cos" => f64::cos, "tan" => f64::tan, "asin" => f64::asin, "acos" => f64::acos,
+        "atan" => f64::atan, _ => return None,
+    };
+    Some(function)
+}
+
+/// ROUND of a double to `scale` decimal places, half away from zero; a non-finite double rounds to itself.
+pub(crate) fn round_float(x: f64, scale: i64) -> Result<f64> {
+    if !x.is_finite() { return Ok(x); }
+    let factor = 10.0_f64.powf((scale as f64).abs());
+    let value = if scale >= 0 { x * factor } else { x / factor };
+    if !value.is_finite() { return Err(overflow()); }
+    Ok(if scale >= 0 { value.round() / factor } else { value.round() * factor })
 }
