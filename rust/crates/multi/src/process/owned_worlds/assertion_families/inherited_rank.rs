@@ -117,7 +117,8 @@ fn current_pin(
     let unavailable = OwnedWorld::unavailable;
     if Uuid::parse_str(&record.id).ok() != Some(deployment)
         || record.writer_pool().is_none() || record.holder.is_none()
-        || record.incarnation != cut.incarnation || record.storage_generation != cut.storage_generation
+        || record.incarnation != cut.incarnation || record.log_epoch != cut.log_epoch
+        || record.storage_generation != cut.storage_generation
         || PlacedAttemptScope::new(&record.stream("replica"), record.epoch)? != cut.writer
         || cut.until.0 <= rtdb_directory::now_ms().saturating_mul(1000)
     {
@@ -194,6 +195,7 @@ mod tests {
             registration,
             writer: PlacedAttemptScope::new(&record.stream("replica"), record.epoch)?,
             incarnation: record.incarnation,
+            log_epoch: record.log_epoch,
             storage_generation: record.storage_generation,
             until,
         };

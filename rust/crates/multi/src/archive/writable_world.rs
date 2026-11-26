@@ -1150,6 +1150,7 @@ fn admit_world_media(
 
 struct OpenWorld {
     incarnation: u64,
+    log_epoch: i32,
     writer: PlacedAttemptScope,
     storage_generation: Option<Uuid>,
     retained: CheckpointWorldRetention,
@@ -1202,6 +1203,7 @@ async fn open_world(
     }
     Ok(OpenWorld {
         incarnation: installation.incarnation,
+        log_epoch: installation.log_epoch,
         writer: PlacedAttemptScope::new(&installation.stream("replica"), installation.epoch)?,
         storage_generation: installation.storage_generation,
         retained: retained.clone(),

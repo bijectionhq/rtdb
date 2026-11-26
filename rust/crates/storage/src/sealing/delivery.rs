@@ -126,6 +126,7 @@ pub struct InheritedRootRankCut {
     pub registration: rtdb_types::OwnedPointVersion,
     pub writer: rtdb_types::PlacedAttemptScope,
     pub incarnation: u64,
+    pub log_epoch: i32,
     pub storage_generation: Option<uuid::Uuid>,
     pub until: rtdb_types::Timestamp,
 }

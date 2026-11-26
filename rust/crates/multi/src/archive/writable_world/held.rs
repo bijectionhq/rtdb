@@ -501,6 +501,7 @@ impl HeldCheckpointWorld {
             registration,
             writer: open.writer,
             incarnation: open.incarnation,
+            log_epoch: open.log_epoch,
             storage_generation: open.storage_generation,
             until: open.retained.until,
         }))
