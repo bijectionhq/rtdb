@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, sync::{Arc, Weak}, time::Duration};
+use std::{collections::HashMap, sync::{Arc, Weak}, time::Duration};
 
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_query::QueryContext;
@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-const CAPACITY: usize = 128;
+/// How long a token's exact catalog cut stays readable: the read lease it holds against storage GC.
+/// A cut is a set of trie and block objects rather than a system time XTDB could re-read at will, so a token outliving the
+/// lease would name objects GC is free to delete.
 const HOLD_FOR: Duration = Duration::from_secs(60);
 const DURABLE_PREFIX: &str = "rtdb-snapshot-v2:";
 const MAX_ENVELOPE_BYTES: usize = 2048;
@@ -75,9 +77,11 @@ impl ExactSnapshot {
     }
 }
 
+/// The views behind the node's live snapshot tokens.
+/// Each entry is charged to the node's memory and held by its read lease alone, so one session's tokens never evict another's.
 #[derive(Default)]
 pub(crate) struct SqlSnapshots {
-    entries: parking_lot::Mutex<VecDeque<(String, Arc<SqlSnapshot>)>>,
+    entries: parking_lot::Mutex<HashMap<String, Arc<SqlSnapshot>>>,
 }
 
 pub(crate) struct SqlSnapshot {
@@ -114,13 +118,8 @@ impl SqlSnapshots {
         }
         let view = with_expiry(view, expires.into_std());
         let entry = Arc::new(SqlSnapshot { owner, view, expires, _charge: charge });
-        let evicted = {
-            let mut entries = self.entries.lock();
-            let evicted = (entries.len() >= CAPACITY).then(|| entries.pop_front()).flatten();
-            entries.push_back((token.clone(), entry));
-            evicted
-        };
-        drop(evicted);
+        let replaced = self.entries.lock().insert(token.clone(), entry);
+        drop(replaced);
         Ok(token)
     }
 
@@ -134,18 +133,20 @@ impl SqlSnapshots {
                     _ = ticks.tick() => {}
                 }
                 let Some(registry) = registry.upgrade() else { break; };
-                let now = tokio::time::Instant::now();
-                registry.entries.lock().retain(|(_, entry)| entry.expires > now);
+                registry.release_expired(tokio::time::Instant::now());
             }
         });
     }
 
+    fn release_expired(&self, now: tokio::time::Instant) {
+        self.entries.lock().retain(|_, entry| entry.expires > now);
+    }
+
     fn select(&self, token: &str, owner: Option<&str>, database: &str) -> Option<Arc<SqlSnapshot>> {
-        self.entries.lock().iter().find_map(|(key, entry)| {
-            (key == token && entry.owner.as_deref() == owner && entry.view.database() == database
-                && tokio::time::Instant::now() < entry.expires)
-                .then(|| Arc::clone(entry))
-        })
+        self.entries.lock().get(token).filter(|entry| {
+            entry.owner.as_deref() == owner && entry.view.database() == database
+                && tokio::time::Instant::now() < entry.expires
+        }).map(Arc::clone)
     }
 
     pub(crate) fn with_issuer(
@@ -269,6 +270,35 @@ mod tests {
     use super::*;
     use rtdb_index::{PartitionState, TransactionBuffer};
     use rtdb_types::{StorageEpoch, StorageVersion, TxId};
+
+    #[tokio::test]
+    async fn one_owners_tokens_never_evict_anothers_and_each_releases_its_charge_on_expiry() {
+        use rtdb_query::{CatalogSnapshot, DatabaseSnapshot};
+        use rtdb_storage::{MemoryStore, cache::BufferPool};
+
+        let view = || rtdb_query::SqlSnapshotView {
+            catalog: CatalogSnapshot::new("xtdb", [("xtdb".into(), DatabaseSnapshot {
+                partitions: vec![],
+                storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)),
+            })].into_iter().collect(), false).unwrap(),
+            current_time: Instant::new(60, 0).unwrap(),
+            timezone: "UTC".into(),
+        };
+        let memory = MemoryBudget::new(1 << 30);
+        let registry = SqlSnapshots::default();
+        let alice: Option<Arc<str>> = Some("alice".into());
+        let first = registry.issue(alice.clone(), view(), &memory, None, Timestamp(0)).unwrap();
+        for _ in 0..1000 {
+            registry.issue(Some("mallory".into()), view(), &memory, None, Timestamp(0)).unwrap();
+        }
+        assert!(registry.select(&first, Some("alice"), "xtdb").is_some());
+        assert!(registry.select(&first, Some("mallory"), "xtdb").is_none());
+
+        assert!(memory.used_bytes() > 0);
+        registry.release_expired(tokio::time::Instant::now() + HOLD_FOR);
+        assert!(registry.select(&first, Some("alice"), "xtdb").is_none());
+        assert_eq!(memory.used_bytes(), 0);
+    }
 
     #[test]
     fn an_exact_resume_distinguishes_tied_appends_and_keeps_the_original_clock() {
