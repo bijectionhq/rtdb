@@ -143,7 +143,7 @@ impl PartitionScan {
             table, columns, valid_time, system_time: TemporalFilter::Default, clamp_valid_time: false,
             iids, predicates: Vec::new(), top_k: None, ordered_top_k: None, matches: Vec::new(),
         };
-        ScanCursor::over(scan, self.execution.clone(), None, std::slice::from_ref(snapshot), &self.storage, false, None).await.map(Some)
+        Box::pin(ScanCursor::over(scan, self.execution.clone(), None, std::slice::from_ref(snapshot), &self.storage, false, None)).await.map(Some)
     }
 }
 

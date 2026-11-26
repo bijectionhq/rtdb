@@ -2563,7 +2563,7 @@ impl PartitionScan {
         let keyed = self.scan.table.name.table.is_owned_event_data();
         let owned = self.execution.context.catalog.admits_owned_event_positions(&self.scan.table.name);
         for (group, rows) in groups.iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
-            let mut metadata = self.retained_transaction_metadata(rows, &batches).await?;
+            let mut metadata = Box::pin(self.retained_transaction_metadata(rows, &batches)).await?;
             let page = &self.pages.entries[selected[group]].source;
             let memory = &self.execution.context.memory;
             let output = crate::columnar::gather_with_funded_columns(rows, &batches, &self.scan.columns, memory, |position| {
