@@ -3522,8 +3522,7 @@ impl BatchFilter {
     /// A fused stage's time covers its input and the stages below it, as its own operator's would.
     fn observe_stages(&self, from: usize, to: usize, started: std::time::Instant, rows: Option<usize>) -> Result<()> {
         let Some(nodes) = self.stage_analysis.get(from..to.min(self.stage_analysis.len())) else { return Ok(()) };
-        let peak = self.execution.context.memory.peak_bytes();
-        for node in nodes.iter().flatten() { node.observe_stage(started.elapsed(), rows, peak)?; }
+        for node in nodes.iter().flatten() { node.observe_stage(started.elapsed(), rows)?; }
         Ok(())
     }
 }

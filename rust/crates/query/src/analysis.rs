@@ -41,9 +41,10 @@ impl AnalysisNode {
         Ok(())
     }
 
-    /// Records one call of a filter fused into the operator above it.
-    pub fn observe_stage(&self, elapsed: Duration, rows: Option<usize>, peak_memory: usize) -> Result<()> {
-        self.observe(elapsed, rows, None, peak_memory)
+    /// Records one call of a filter fused into the operator above it. A fused stage holds no memory of its own apart
+    /// from its operator's, so it reports no peak rather than the query's.
+    pub fn observe_stage(&self, elapsed: Duration, rows: Option<usize>) -> Result<()> {
+        self.observe(elapsed, rows, None, 0)
     }
 
     pub fn new(relation: &Relation, context: &Arc<QueryContext>) -> Result<Arc<Self>> {
