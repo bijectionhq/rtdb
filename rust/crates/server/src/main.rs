@@ -14,7 +14,7 @@ static ALLOCATOR: dhat::Alloc = dhat::Alloc;
 fn heap_profiler() -> Option<dhat::Profiler> {
     let directory = std::env::var_os("BIJECTION_DHAT_DIR")?;
     let file = std::path::Path::new(&directory).join(format!("rtdb-{}.json", std::process::id()));
-    Some(dhat::Profiler::builder().file_name(file).build())
+    Some(dhat::Profiler::builder().file_name(file).trim_backtraces(None).build())
 }
 
 fn main() -> ExitCode {
