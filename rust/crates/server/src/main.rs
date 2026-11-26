@@ -9,6 +9,10 @@ mod follower_process;
 #[global_allocator]
 static ALLOCATOR: dhat::Alloc = dhat::Alloc;
 
+#[cfg(not(feature = "dhat-heap"))]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// Writes `rtdb-<pid>.json` into `BIJECTION_DHAT_DIR` when `main` returns.
 #[cfg(feature = "dhat-heap")]
 fn heap_profiler() -> Option<dhat::Profiler> {
