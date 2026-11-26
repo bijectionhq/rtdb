@@ -23,6 +23,9 @@ use crate::values::{BoundArgumentRow, IngestMode, LegacyOwnedPresence, plain_sca
 use crate::{ArrowDocumentWrite, ArrowDocuments, SourceTransaction, SubmitOptions, TransactionResult, TxOp, UserMetadata, source::{Operation, SourceGuard, decode_arguments, is_reserved_write_schema, table_name}};
 
 mod hosted_control;
+mod mutation_plans;
+#[cfg(test)]
+use mutation_plans::MutationPlans;
 mod relation_adoption;
 mod prepared_landing;
 mod prepared_landing_basis;
@@ -255,12 +258,13 @@ pub struct TxResolver {
     memory: Arc<MemoryBudget>,
     token_reservation: Arc<MemoryReservation>,
     queue_reservation: Arc<MemoryReservation>,
+    plans: Arc<mutation_plans::MutationPlans>,
 }
 impl TxResolver {
     pub fn new(seed: Option<TransactionKey>, source_position: SourcePosition, external_token: Option<Vec<u8>>, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let token_reservation = memory.reserve(external_token.as_ref().map_or(0, Vec::capacity).checked_add(512).ok_or_else(overflow)?)?;
         let queue_reservation = memory.reserve(128)?;
-        Ok(Self { resolved_head: seed.map(|key| ResolvedHead { key, receipt_time: None }), source_position, external_token, queue: VecDeque::new(), memory: Arc::clone(memory), token_reservation, queue_reservation })
+        Ok(Self { resolved_head: seed.map(|key| ResolvedHead { key, receipt_time: None }), source_position, external_token, queue: VecDeque::new(), memory: Arc::clone(memory), token_reservation, queue_reservation, plans: mutation_plans::MutationPlans::new(memory) })
     }
     pub fn resolved_head(&self) -> Option<TransactionKey> { self.resolved_head.as_ref().map(|head| head.key) }
     fn latest_receipt_time(&self) -> Option<Timestamp> { self.resolved_head.as_ref().and_then(|head| head.receipt_time) }
@@ -417,6 +421,7 @@ impl TxResolver {
             Ok(())
         };
         let mut tx = OpenTransaction::new(base.clone(), key, &request.options, context)?;
+        tx.plans = Some(Arc::clone(&self.plans));
         tx.terms_time = terms_time;
         tx.clock_slot = slot.filter(|_| slot_time.is_ok());
         tx.decision = decision;
@@ -802,10 +807,12 @@ pub struct OpenTransaction<'a> {
     decision: Option<crate::DecisionObservation>,
     clock_slot: Option<crate::OwnedClockSlot>,
     terms_time: Timestamp,
+    /// The resolver's kept plans, where this transaction may reuse and keep them.
+    plans: Option<Arc<mutation_plans::MutationPlans>>,
 }
 impl<'a> OpenTransaction<'a> {
     fn new(base: Snapshot, key: TransactionKey, options: &'a SubmitOptions, context: &'a ResolveContext) -> Result<Self> {
-        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), capacity_changes: OwnedCapacityChanges::default(), owned_worlds: BTreeMap::new(), timed_world_overlays: BTreeMap::new(), owned_changes: BTreeMap::new(), bounded_period_writes: BTreeMap::new(), hosted_replay: None, search_erasure_admitted: false, replay_rank_erases: None, placed_attempt: None, decision: None, clock_slot: None, terms_time: key.system_time })
+        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), capacity_changes: OwnedCapacityChanges::default(), owned_worlds: BTreeMap::new(), timed_world_overlays: BTreeMap::new(), owned_changes: BTreeMap::new(), bounded_period_writes: BTreeMap::new(), hosted_replay: None, search_erasure_admitted: false, replay_rank_erases: None, placed_attempt: None, decision: None, clock_slot: None, terms_time: key.system_time, plans: None })
     }
     pub fn tx_key(&self) -> TransactionKey { self.buffer.tx_key() }
 
@@ -934,12 +941,12 @@ impl<'a> OpenTransaction<'a> {
     /// `planned` carries one operation's mutation from each argument row to the next, which reuses it while the
     /// transaction's catalog answers the planning's lookups the same.
     async fn execute_sql_typed(&mut self, sql: &str, arguments: Option<BoundArgumentRow<'_>>, planned: &mut Option<PlannedMutation>) -> Result<()> {
-        let (mutation, context, syntax) = self.plan_sql_mutation(sql, arguments, planned)?;
-        self.execute_mutation(mutation, context, arguments, Some(syntax)).await.map_err(|error| error.with_context("sql", sql.into()))
+        let (mutation, query, context, syntax) = self.plan_sql_mutation(sql, arguments, planned)?;
+        self.execute_mutation(mutation, query, context, arguments, Some(syntax)).await.map_err(|error| error.with_context("sql", sql.into()))
     }
 
     fn plan_sql_mutation(&self, sql: &str, arguments: Option<BoundArgumentRow<'_>>, planned: &mut Option<PlannedMutation>)
-        -> Result<(rtdb_sql::Mutation, Arc<QueryContext>, Arc<MemoryReservation>)> {
+        -> Result<(rtdb_sql::Mutation, Option<PreparedQuery>, Arc<QueryContext>, Arc<MemoryReservation>)> {
         self.context.check_cancelled()?;
         // A statement whose plan reads no table can't see the transaction's own writes, so it skips extending the snapshot with them.
         let snapshot = if planned.as_ref().is_some_and(|planned| !planned.reads) { self.buffer.base_snapshot() } else { self.snapshot()? };
@@ -954,20 +961,25 @@ impl<'a> OpenTransaction<'a> {
         let options = rtdb_sql::PrepareOptions { parameter_types, default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
         let with_sql = |error: Anomaly| error.with_context("sql", sql.into());
         let syntax = admit_sql_syntax(sql, &context.memory).map_err(with_sql)?;
+        if planned.is_none() && let Some(plans) = &self.plans { *planned = plans.get(sql); }
         let reused = match planned.as_ref().filter(|planned| planned.options == options) {
-            Some(planned) if planned.lookups.replay(&context.catalog).map_err(with_sql)? => Some(planned.mutation.clone()),
+            Some(planned) if planned.lookups.replay(&context.catalog).map_err(with_sql)? => Some((planned.mutation.clone(), planned.query.clone())),
             _ => None,
         };
-        let mutation = match reused {
-            Some(mutation) => mutation,
+        let (mutation, query) = match reused {
+            Some(reused) => reused,
             None => {
                 let recording = rtdb_plan::RecordingCatalog::new(&context.catalog);
-                let mutation = rtdb_sql::prepare_tx_in(sql, &recording, &options, &context.memory).map_err(with_sql)?;
-                *planned = recording.finish().map(|lookups| PlannedMutation { options, lookups, reads: reads_tables(&mutation), mutation: mutation.clone() });
-                mutation
+                // Planning into its own scope shows whether the plan retains any memory, which would keep it to this transaction.
+                let planning = context.memory.scope();
+                let mutation = rtdb_sql::prepare_tx_in(sql, &recording, &options, &planning).map_err(with_sql)?;
+                let retained_bytes = planning.used_bytes();
+                *planned = recording.finish().map(|lookups| PlannedMutation { options, lookups, reads: reads_tables(&mutation), mutation: mutation.clone(), query: None });
+                if let (Some(plans), Some(planned)) = (&self.plans, planned.as_ref()) { plans.remember(sql, planned, retained_bytes); }
+                (mutation, None)
             }
         };
-        Ok((mutation, context, syntax))
+        Ok((mutation, query, context, syntax))
     }
 
     /// Whether a live receipt names this retry identity: the same body is a duplicate of the original, a different one a conflict.
@@ -1039,7 +1051,8 @@ impl<'a> OpenTransaction<'a> {
         Ok(query.next_batch().await?.is_some())
     }
 
-    async fn execute_mutation(&mut self, mutation: rtdb_sql::Mutation, context: Arc<QueryContext>, arguments: Option<BoundArgumentRow<'_>>, syntax: Option<Arc<MemoryReservation>>) -> Result<()> {
+    /// `query` is `mutation`'s input already prepared, where its planning prepared one.
+    async fn execute_mutation(&mut self, mutation: rtdb_sql::Mutation, query: Option<PreparedQuery>, context: Arc<QueryContext>, arguments: Option<BoundArgumentRow<'_>>, syntax: Option<Arc<MemoryReservation>>) -> Result<()> {
         use rtdb_sql::Mutation;
         let (table, input, kind) = match mutation {
             Mutation::Put { table, input } => (Some(table), input, MutationKind::Put),
@@ -1158,7 +1171,10 @@ impl<'a> OpenTransaction<'a> {
             return self.stage_hosted_capacity_declarations(cursor, writer).await;
         }
         check_table(&table.table)?;
-        let mut cursor = execute(input, context, arguments, syntax).await?;
+        let mut cursor = match query {
+            Some(query) => execute_prepared(&input, query, context, arguments, syntax).await?,
+            None => execute(input, context, arguments, syntax).await?,
+        };
         let system_time = self.tx_key().system_time;
         while let Some(batch) = cursor.next_batch().await? {
             match kind {
@@ -1455,7 +1471,7 @@ impl<'a> OpenTransaction<'a> {
         };
         let table = QualifiedTable { database: self.context.database.clone(), table: table.clone() };
         let mutation = rtdb_sql::prepare_patch(table, input, temporal, &context.catalog)?;
-        self.execute_mutation(mutation, context, arguments, None).await
+        self.execute_mutation(mutation, None, context, arguments, None).await
     }
     async fn declare_owned_relation(&mut self, relation: &rtdb_types::OwnedRelation, schema: &rtdb_types::OwnedSchema) -> Result<()> {
         let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
@@ -4133,7 +4149,8 @@ fn admit_sql_syntax(sql: &str, memory: &Arc<MemoryBudget>) -> Result<Arc<MemoryR
 }
 
 /// A mutation planned for one argument row, and what its planning read from the catalog.
-struct PlannedMutation { options: rtdb_sql::PrepareOptions, lookups: rtdb_plan::CatalogLookups, reads: bool, mutation: rtdb_sql::Mutation }
+#[derive(Clone)]
+struct PlannedMutation { options: rtdb_sql::PrepareOptions, lookups: rtdb_plan::CatalogLookups, reads: bool, mutation: rtdb_sql::Mutation, query: Option<PreparedQuery> }
 
 /// Whether a mutation's input may read a table: anything but literal rows and the expressions over them may.
 fn reads_tables(mutation: &rtdb_sql::Mutation) -> bool {
@@ -4149,11 +4166,31 @@ fn reads_tables(mutation: &rtdb_sql::Mutation) -> bool {
 }
 
 async fn execute(input: Arc<rtdb_plan::Relation>, context: Arc<QueryContext>, arguments: Option<BoundArgumentRow<'_>>, syntax: Option<Arc<MemoryReservation>>) -> Result<QueryCursor> {
+    check_argument_count(&input, arguments)?;
+    let query = PreparedQuery::new_in(input, &context.memory)?;
+    run_prepared(query, context, arguments, syntax).await
+}
+/// Runs `query`, prepared from `input`.
+async fn execute_prepared(input: &rtdb_plan::Relation, query: PreparedQuery, context: Arc<QueryContext>, arguments: Option<BoundArgumentRow<'_>>, syntax: Option<Arc<MemoryReservation>>) -> Result<QueryCursor> {
+    check_argument_count(input, arguments)?;
+    run_prepared(query, context, arguments, syntax).await
+}
+/// The input of a put, delete or erase, prepared for execution.
+pub(super) fn mutation_query(mutation: &rtdb_sql::Mutation, memory: &Arc<MemoryBudget>) -> Result<Option<PreparedQuery>> {
+    match mutation {
+        rtdb_sql::Mutation::Put { input, .. } | rtdb_sql::Mutation::Delete { input, .. } | rtdb_sql::Mutation::Erase { input, .. } =>
+            PreparedQuery::new_in(Arc::clone(input), memory).map(Some),
+        _ => Ok(None),
+    }
+}
+fn check_argument_count(input: &rtdb_plan::Relation, arguments: Option<BoundArgumentRow<'_>>) -> Result<()> {
     let count = input.parameter_count();
     if arguments.is_none() && count != 0 { return Err(Anomaly::incorrect("xtdb.indexer/missing-sql-args", "Arguments list was expected but not provided").with_context("param-count", count.into())); }
     let width = arguments.map_or(0, BoundArgumentRow::width);
     if width != count { return Err(Anomaly::incorrect("xtdb.indexer/incorrect-sql-arg-count", format!("Parameter error: {width} provided, {count} expected")).with_context("param-count", count.into()).with_context("arg-count", width.into())); }
-    let query = PreparedQuery::new_in(input, &context.memory)?;
+    Ok(())
+}
+async fn run_prepared(query: PreparedQuery, context: Arc<QueryContext>, arguments: Option<BoundArgumentRow<'_>>, syntax: Option<Arc<MemoryReservation>>) -> Result<QueryCursor> {
     drop(syntax);
     match arguments {
         Some(BoundArgumentRow::Arrow { batch, row, types }) => query.execute_arrow_columns(context, batch.clone(), row, types, None).await,
@@ -5068,6 +5105,45 @@ mod tests {
         let error = resolver.resolve_source(state.snapshot(), SourcePosition(1), Timestamp(101), request, &context).await
             .err().expect("source resolution must check catalog admission");
         assert_eq!(error.code, "rtdb.storage/catalog-not-current");
+    }
+
+    #[tokio::test]
+    async fn a_resolver_keeps_only_plans_that_hold_no_transaction_memory() {
+        let memory = MemoryBudget::new(1 << 26);
+        let resolve = ResolveContext { decision_clock: None,
+            write_event_origins: false,
+            placed_receipt_retirement: false,
+            owned_witness_scope: None,
+            world_constraints: None,
+            database: "xtdb".into(), storage: Arc::new(BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
+            memory: Arc::clone(&memory), query_options: QueryOptions { batch_rows: 1, ..Default::default() },
+            scan_accelerators: Default::default(),
+            cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(NoRoleChecks),
+            execution_observer: None, tracer: None,
+        };
+        let state = rtdb_index::PartitionState::empty(Default::default()).unwrap();
+        let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &memory).unwrap();
+        let plans = Arc::clone(&resolver.plans);
+        let mut position = 0;
+        let mut resolve_sql = async |sql: &str, args: Option<Vec<Value>>| {
+            let args = args.map(|args| crate::SqlArguments::from_rows(vec![args], &memory).unwrap());
+            let request = SourceTransaction::new(vec![crate::TxOp::Sql { sql: sql.into(), args }], SubmitOptions::default(), &memory).unwrap();
+            let resolved = resolver.resolve_source(state.value().snapshot(), SourcePosition(position), Timestamp(100 + position), request, &resolve).await.unwrap();
+            assert!(resolved.result().committed(), "{sql}: {:?}", resolved.result().error());
+            state.apply(resolved.writes()).unwrap();
+            resolver.take_head().unwrap();
+            position += 1;
+        };
+        resolve_sql("INSERT INTO docs (_id, v, name) VALUES (1, 1, 'one'), (2, 2, 'two')", None).await;
+        let kept = plans.len();
+        for id in [1, 2, 1] { resolve_sql("UPDATE docs SET v = v + 1 WHERE _id = ?", Some(vec![Value::I64(id)])).await; }
+        assert_eq!(plans.len(), kept + 1, "one statement run in three transactions is kept once");
+        resolve_sql("DELETE FROM docs WHERE name LIKE_REGEX 'x.z'", None).await;
+        assert_eq!(plans.len(), kept + 2, "a pattern evaluated as an ordinary argument holds no memory");
+        for _ in 0..2 { resolve_sql("UPDATE docs SET name = REGEXP_REPLACE(name, 'o', '0') WHERE _id = 1", None).await; }
+        let long = format!("UPDATE docs SET v = v + 1 WHERE _id = 2 /*{}*/", "x".repeat(MutationPlans::MAXIMUM_SQL_BYTES));
+        resolve_sql(&long, None).await;
+        assert_eq!(plans.len(), kept + 2, "a plan holding compiled regular-expression forms, or keyed by a long statement, is not kept");
     }
 
     #[tokio::test]

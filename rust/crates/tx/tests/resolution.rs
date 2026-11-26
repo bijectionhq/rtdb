@@ -1972,3 +1972,70 @@ async fn a_versioned_placed_outcome_retires_expired_receipts_and_replays_its_cur
     ).await.unwrap();
     assert!(read.result().committed(), "{:?}", read.result().error());
 }
+
+/// Statements a long-lived resolver plans once and reuses across transactions must resolve exactly as a resolver that
+/// plans each from scratch: same outcome, same column types, same events. The schema changes as the statements run,
+/// so reused plans meet catalogs other than the one they were planned against.
+#[tokio::test]
+async fn keyed_writes_resolve_the_same_whether_their_plans_are_reused_or_planned_afresh() {
+    use rtdb_format::envelope::SourceMessage;
+
+    let context = context();
+    let time = |micros: i64| Value::Timestamp { value: micros, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) };
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move |bound: u64| { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) % bound };
+    let statement = |choice: u64, id: i64, value: i64, from: i64| -> (&'static str, Vec<Value>) {
+        match choice {
+            0 => ("INSERT INTO docs (_id, v, name) VALUES (?, ?, ?)", vec![Value::I64(id), Value::I64(value), Value::Utf8(format!("n{value}"))]),
+            1 => ("UPDATE docs SET v = v + 1 WHERE _id = ?", vec![Value::I64(id)]),
+            2 => ("UPDATE docs SET name = ? WHERE _id = ?", vec![Value::Utf8(format!("renamed{value}")), Value::I64(id)]),
+            3 => ("UPDATE docs FOR PORTION OF VALID_TIME FROM ? TO ? SET v = ? WHERE _id = ?",
+                  vec![time(from), time(from + 50), Value::I64(value), Value::I64(id)]),
+            4 => ("DELETE FROM docs WHERE _id = ?", vec![Value::I64(id)]),
+            5 => ("DELETE FROM docs FOR PORTION OF VALID_TIME FROM ? TO ? WHERE _id = ?", vec![time(from), time(from + 30), Value::I64(id)]),
+            6 => ("UPDATE docs SET v = ? WHERE _id = ?", vec![Value::Utf8(format!("text{value}")), Value::I64(id)]),
+            7 => ("INSERT INTO docs (_id, extra) VALUES (?, ?)", vec![Value::I64(id), Value::F64(value as f64 / 4.0)]),
+            8 => ("UPDATE docs SET v = v WHERE _id = ?", vec![Value::I64(id)]),
+            9 => ("UPDATE docs SET extra = ? WHERE _id = ? AND v > 3", vec![Value::I64(value), Value::I64(id)]),
+            _ => ("ERASE FROM docs WHERE _id = ?", vec![Value::I64(id)]),
+        }
+    };
+    let reused = PartitionState::empty(Default::default()).unwrap();
+    let fresh = PartitionState::empty(Default::default()).unwrap();
+    let mut long_lived = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let mut previous = None;
+    let (mut committed, mut rows) = (0, 0);
+    for position in 0..400i64 {
+        let operations = 1 + next(3);
+        let ops: Vec<_> = (0..operations).map(|_| {
+            let choice = if position < 8 { 0 } else { next(11) };
+            let (sql, args) = statement(choice, next(6) as i64, next(10) as i64, 100 + 10 * position + next(40) as i64);
+            TxOp::Sql { sql: sql.into(), args: Some(SqlArguments::from_rows(vec![args], &context.memory).unwrap()) }
+        }).collect();
+        let encoded = request(ops, &context).encode().unwrap();
+        let message = SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
+        let decode = || SourceTransaction::decode(&message, &context.memory).unwrap();
+        let log_time = Timestamp(1_000 + 10 * position);
+        let mut afresh = TxResolver::new(previous, SourcePosition(position - 1), None, &context.memory).unwrap();
+        let planned = afresh.resolve_source(fresh.value().snapshot(), SourcePosition(position), log_time, decode(), &context).await.unwrap();
+        let kept = long_lived.resolve_source(reused.value().snapshot(), SourcePosition(position), log_time, decode(), &context).await.unwrap();
+        let outcome = |resolved: &ResolvedTx| (resolved.result().committed(), resolved.result().error().map(|error| error.code.clone()), resolved.result().tx_key());
+        assert_eq!(outcome(&kept), outcome(&planned), "position {position}");
+        let (kept_writes, planned_writes) = (kept.writes(), planned.writes());
+        assert_eq!(kept_writes.tables().keys().collect::<Vec<_>>(), planned_writes.tables().keys().collect::<Vec<_>>(), "position {position}");
+        for (table, write) in kept_writes.tables() {
+            let other = &planned_writes.tables()[table];
+            assert_eq!(write.column_types(), other.column_types(), "position {position} {table:?}");
+            assert_eq!(write.declared_columns(), other.declared_columns(), "position {position} {table:?}");
+            assert_eq!(write.batch().map(|batch| batch.arrow().clone()), other.batch().map(|batch| batch.arrow().clone()), "position {position} {table:?}");
+        }
+        if planned.result().committed() { committed += 1; }
+        rows += planned_writes.tables().get(&table()).map_or(0, |write| write.row_count());
+        previous = Some(planned.result().tx_key());
+        reused.apply(kept_writes).unwrap();
+        fresh.apply(planned_writes).unwrap();
+        long_lived.take_head().unwrap();
+        afresh.take_head().unwrap();
+    }
+    assert!(committed > 300 && rows > 250, "the statements must mostly commit and write: {committed} committed, {rows} rows");
+}

@@ -34,7 +34,7 @@ impl OpenTransaction<'_> {
             && let Some((index, first)) = rows.next().transpose()?
         {
             let at_argument = |error: Anomaly| error.with_context("arg-idx", index.into());
-            let (mutation, context, syntax) = self.plan_sql_mutation(sql, Some(first), &mut planned).map_err(at_argument)?;
+            let (mutation, query, context, syntax) = self.plan_sql_mutation(sql, Some(first), &mut planned).map_err(at_argument)?;
             if let rtdb_sql::Mutation::Put { table, input } = &mutation
                 && table.database == self.context.database
                 && !(table.table.schema == "xt" && table.table.table == HOSTED_CAPACITY_DECLARATIONS)
@@ -55,7 +55,7 @@ impl OpenTransaction<'_> {
             {
                 return Ok(());
             }
-            self.execute_mutation(mutation, context, Some(first), Some(syntax))
+            self.execute_mutation(mutation, query, context, Some(first), Some(syntax))
                 .await
                 .map_err(|error| at_argument(error.with_context("sql", sql.into())))?;
         }
