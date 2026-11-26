@@ -18,7 +18,7 @@ use std::time::Duration;
 use store::{Outcome, Store, failed};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -209,6 +209,50 @@ async fn authority_connection(
     }
 }
 
+/// The most bytes of decided, unwritten replies one connection holds.
+const OUTBOX_BYTES: usize = 64 * 1024 * 1024;
+/// The most requests one connection has in flight on tasks of their own.
+const CONNECTION_REQUEST_TASKS: usize = 1024;
+
+/// Replies decided and not yet written, bounded by their encoded bytes. A
+/// producer waits for room, so a client that does not read its replies stops
+/// the reader taking more of its requests.
+#[derive(Clone)]
+struct Outbox {
+    sender: mpsc::UnboundedSender<(Response, OwnedSemaphorePermit)>,
+    room: Arc<Semaphore>,
+    bytes: usize,
+    cancellation: CancellationToken,
+}
+
+impl Outbox {
+    fn open(bytes: usize, cancellation: CancellationToken) -> (Self, mpsc::UnboundedReceiver<(Response, OwnedSemaphorePermit)>) {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        (Self { sender, room: Arc::new(Semaphore::new(bytes)), bytes, cancellation }, receiver)
+    }
+
+    /// Queues the reply once there is room for it; a reply larger than the
+    /// whole outbox waits for it to empty. Once the connection is cancelled a
+    /// reply is still queued if there is room, and dropped otherwise.
+    async fn send(&self, reply: Response) {
+        let charge = u32::try_from(prost::Message::encoded_len(&reply).clamp(1, self.bytes)).unwrap_or(u32::MAX);
+        let permit = match Arc::clone(&self.room).try_acquire_many_owned(charge) {
+            Ok(permit) => permit,
+            Err(_) => match self.cancellation.run_until_cancelled(Arc::clone(&self.room).acquire_many_owned(charge)).await {
+                Some(Ok(permit)) => permit,
+                Some(Err(_)) | None => return,
+            },
+        };
+        let _ = self.sender.send((reply, permit));
+    }
+}
+
+/// Admits one more request to a task of its own, waiting while the connection
+/// has `CONNECTION_REQUEST_TASKS` in flight.
+async fn admit(requests: &Arc<Semaphore>, cancellation: &CancellationToken) -> Option<OwnedSemaphorePermit> {
+    cancellation.run_until_cancelled(Arc::clone(requests).acquire_owned()).await?.ok()
+}
+
 /// One task reads and decides, another writes replies; a reply that waits on durability or a long poll gets a short-lived task of its own.
 async fn connection(
     mut reader: impl AsyncRead + Unpin,
@@ -218,7 +262,8 @@ async fn connection(
     tasks: TaskTracker,
     cancellation: CancellationToken,
 ) {
-    let (replies, outbox) = mpsc::unbounded_channel::<Response>();
+    let (replies, outbox) = Outbox::open(OUTBOX_BYTES, cancellation.clone());
+    let requests = Arc::new(Semaphore::new(CONNECTION_REQUEST_TASKS));
     let writing = tasks.spawn(write_replies(writer, outbox));
     loop {
         let (request, frame_bytes) = tokio::select! {
@@ -228,7 +273,7 @@ async fn connection(
         let id = request.id;
         let reply = |body: ResponseBody| Response { id, body: Some(body) };
         if !request.target_journal.is_empty() && request.target_journal != *identity {
-            let _ = replies.send(reply(failed("the operation addresses another journal")));
+            replies.send(reply(failed("the operation addresses another journal"))).await;
             continue;
         }
         if let Some(RequestBody::AppendObserved(append)) = &request.body
@@ -236,11 +281,11 @@ async fn connection(
             && let Some(origin) = &entry.timed_origin
             && (request.target_journal.is_empty() || !origin.journals.iter().any(|journal| journal == identity.as_ref()))
         {
-            let _ = replies.send(reply(failed("a timed original append must address a member of its ensemble")));
+            replies.send(reply(failed("a timed original append must address a member of its ensemble"))).await;
             continue;
         }
         match request.body {
-            None => { let _ = replies.send(reply(failed("a request without a body"))); }
+            None => { replies.send(reply(failed("a request without a body"))).await; }
             Some(RequestBody::Identify(request)) => {
                 let body = match <&[u8; 16]>::try_from(request.nonce.as_ref()) {
                     Ok(nonce) => {
@@ -253,66 +298,78 @@ async fn connection(
                     }
                     Err(_) => failed("invalid journal identity challenge"),
                 };
-                let _ = replies.send(reply(body));
+                replies.send(reply(body)).await;
             }
             Some(RequestBody::Fetch(fetch)) => {
                 match store.fetch(&fetch.stream, fetch.from_lsn, fetch.to_lsn, fetch.max_entries as usize, fetch.max_bytes as usize).map(|selected| selected.ready()) {
-                    Ok(Ok(body)) | Err(body) => { let _ = replies.send(reply(body)); }
+                    Ok(Ok(body)) | Err(body) => { replies.send(reply(body)).await; }
                     Ok(Err(selected)) => {
+                        let Some(admitted) = admit(&requests, &cancellation).await else { break };
                         let (store, replies) = (Arc::clone(&store), replies.clone());
                         tasks.spawn(async move {
+                            let _admitted = admitted;
                             let body = store.entries(selected).await;
-                            let _ = replies.send(Response { id, body: Some(body) });
+                            replies.send(Response { id, body: Some(body) }).await;
                         });
                     }
                 }
             }
             Some(RequestBody::ConfirmAuthority(_)) => {
-                let _ = replies.send(reply(failed("writer authority requires its dedicated listener")));
+                replies.send(reply(failed("writer authority requires its dedicated listener"))).await;
             }
-            Some(RequestBody::Check(check)) => { let _ = replies.send(reply(store.check(&check.stream, check.epoch))); }
+            Some(RequestBody::Check(check)) => { replies.send(reply(store.check(&check.stream, check.epoch))).await; }
             Some(RequestBody::Retire(retire)) => {
+                let Some(admitted) = admit(&requests, &cancellation).await else { break };
                 let (store, replies) = (Arc::clone(&store), replies.clone());
                 tasks.spawn(async move {
+                    let _admitted = admitted;
                     let body = store.retire(retire, frame_bytes).await;
-                    let _ = replies.send(Response { id, body: Some(body) });
+                    replies.send(Response { id, body: Some(body) }).await;
                 });
             }
             Some(RequestBody::VoteDecision(request)) => {
+                let Some(admitted) = admit(&requests, &cancellation).await else { break };
                 let (store, replies) = (Arc::clone(&store), replies.clone());
                 tasks.spawn(async move {
+                    let _admitted = admitted;
                     let body = store.vote_decision(request).await;
-                    let _ = replies.send(Response { id, body: Some(body) });
+                    replies.send(Response { id, body: Some(body) }).await;
                 });
             }
             Some(RequestBody::DigestPage(page)) => {
+                let Some(admitted) = admit(&requests, &cancellation).await else { break };
                 let (store, replies) = (Arc::clone(&store), replies.clone());
                 tasks.spawn(async move {
+                    let _admitted = admitted;
                     let body = store.digest_page(page).await;
-                    let _ = replies.send(Response { id, body: Some(body) });
+                    replies.send(Response { id, body: Some(body) }).await;
                 });
             }
             Some(RequestBody::Read(read)) => {
+                let Some(admitted) = admit(&requests, &cancellation).await else { break };
                 let (store, replies, cancellation) = (Arc::clone(&store), replies.clone(), cancellation.clone());
                 tasks.spawn(async move {
+                    let _admitted = admitted;
                     let body = store.read(&read.stream, read.from_lsn, read.max_entries as usize, read.max_bytes as usize, Duration::from_millis(read.wait_ms.into()), &cancellation).await;
-                    let _ = replies.send(Response { id, body: Some(body) });
+                    replies.send(Response { id, body: Some(body) }).await;
                 });
             }
             Some(mutation) => match tokio::select! {
                 _ = cancellation.cancelled() => break,
                 outcome = store.mutate(mutation, frame_bytes) => outcome,
             } {
-                Outcome::Now(body) => { let _ = replies.send(reply(body)); }
+                Outcome::Now(body) => { replies.send(reply(body)).await; }
                 Outcome::Durable(durable, body) => {
+                    let Some(admitted) = admit(&requests, &cancellation).await else { break };
                     let replies = replies.clone();
                     tasks.spawn(async move {
+                        let _admitted = admitted;
                         let body = match durable.await {
                             Ok(Ok(())) => body,
                             Ok(Err(error)) => failed(format!("journal write failed: {error}")),
                             Err(_) => failed("the journal stopped"),
                         };
-                        let _ = replies.send(Response { id, body: Some(body) });
+                        replies.send(Response { id, body: Some(body) }).await;
                     });
                 }
             },
@@ -322,16 +379,20 @@ async fn connection(
     let _ = writing.await;
 }
 
-async fn write_replies(mut writer: impl AsyncWrite + Unpin, mut outbox: mpsc::UnboundedReceiver<Response>) {
+async fn write_replies(mut writer: impl AsyncWrite + Unpin, mut outbox: mpsc::UnboundedReceiver<(Response, OwnedSemaphorePermit)>) {
     let mut buffer = FrameParts::default();
-    while let Some(reply) = outbox.recv().await {
+    let mut written = Vec::with_capacity(WIRE_BATCH_FRAMES);
+    while let Some((reply, room)) = outbox.recv().await {
         buffer.push_wire(&reply);
+        written.push(room);
         for _ in 1..WIRE_BATCH_FRAMES {
             if buffer.wire_batch_full() { break; }
-            let Ok(reply) = outbox.try_recv() else { break };
+            let Ok((reply, room)) = outbox.try_recv() else { break };
             buffer.push_wire(&reply);
+            written.push(room);
         }
         if buffer.send_wire(&mut writer).await.is_err() { return; }
+        written.clear();
     }
     let _ = writer.shutdown().await;
 }
@@ -366,5 +427,25 @@ mod tests {
         }
         stop.cancel();
         task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_full_outbox_holds_its_producer_until_the_writer_takes_a_reply() {
+        let cancellation = CancellationToken::new();
+        let (outbox, mut written) = Outbox::open(1, cancellation.clone());
+        let reply = |id| Response { id, body: Some(failed("a reply")) };
+        outbox.send(reply(1)).await;
+        let mut second = std::pin::pin!(outbox.send(reply(2)));
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut second).await.is_err(), "no room until the first reply is written");
+        let (first, room) = written.recv().await.unwrap();
+        assert_eq!(first.id, 1);
+        drop(room);
+        second.await;
+        let (second, _room) = written.recv().await.unwrap();
+        assert_eq!(second.id, 2);
+
+        cancellation.cancel();
+        outbox.send(reply(3)).await;
+        assert!(written.try_recv().is_err(), "a cancelled connection drops a reply it has no room for");
     }
 }
