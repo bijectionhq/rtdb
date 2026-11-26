@@ -13,7 +13,7 @@
 //! maintenance rule covers every write, and conflicts and wakes are exact per
 //! row: a write that leaves an entry unchanged writes no key for it.
 //!
-//! Four entry kinds, four exact laws:
+//! Five entry kinds, five exact laws:
 //! - [`EntryKind::Marker`] (path and posting entries): a stamped enter where
 //!   coverage begins and a stamped leave marker (empty value) where an entry
 //!   the new image does not re-enter loses coverage. Readers resolve each
@@ -32,14 +32,25 @@
 //!   ruling): both shells use this one mechanism.
 //! - [`EntryKind::Single`] (expiry entries): one key, deleted when the entry
 //!   loses coverage.
+//! - [`EntryKind::Claim`] (unique claims, T7-4): an edged count of the
+//!   claimed value, which the store judges once the append applies: no
+//!   instant of the claim's coverage may count two claimants
+//!   ([`claim_exceeded`]). This is the one judgment that may refuse an
+//!   append, and it reads only the claimed value's records at the row's
+//!   place and the levels it inherits.
 //!
 //! An entry's identity may carry placeholders the store fills at ordering:
 //! a [`KeyStamp`] (the 16-byte stamp, for a `t.accepted()` column) and any
 //! number of [`KeyInstant`]s (the stamp's micros plus an offset in the
 //! instant encoding, for a value whose time is acceptance-relative: a
 //! default-validity series `at` or timeline `validFrom`, an aggregate
-//! boundary at the stamp, a field placed as `now + d`). Each is escaped for
-//! the segments enclosing it, so a filled key sorts where its value does.
+//! boundary at the stamp, a field placed as `now + d`, wherever an ordered,
+//! claim, vector filter, spatial partition or aggregate group key holds
+//! it). Each is escaped for the segments enclosing it, so a filled key
+//! sorts where its value does. Its values may carry [`ValueInstant`]s, the
+//! stamp added to a maintained sum over such a field. The engine plans every
+//! template from the new image; this function alone fills them, at the
+//! stamp, before it diffs the line (T7-4: one owner of the fill).
 //!
 //! A row's line also keeps the exact inventory of every key it ever
 //! emitted (each manifest version's `written_keys`): markers, singles,
@@ -58,8 +69,11 @@
 //! return a result for every input, and a malformed derive is a request error
 //! [`check`] decides before ordering. Every emitted key lies at the
 //! manifest's own `(partition, world)` (P10, `emission_confined`), and
-//! nothing here judges the append: its outcome never depends on a manifest
-//! (P8). Emitted writes count toward no request limit.
+//! [`apply`] judges nothing: its outcome never depends on a manifest (P8).
+//! The claim judgment ([`claims`], [`claim_levels`], [`claim_record`],
+//! [`claim_exceeded`]) runs after every derive of the append applied, over
+//! the claimed values' records, never over a manifest. Emitted writes count
+//! toward no request limit.
 //!
 //! Both `fact_store::persistence::memory::MemoryPersistence` and RTDB's
 //! resolver (`rtdb-index::branches::store::resolve_derives`, via the vendored
@@ -112,18 +126,40 @@ pub struct ValidInterval {
     pub to: i64,
 }
 
-/// How a derive's valid interval is resolved once the store assigns the
-/// append's stamp.
+/// One bound of a derive's valid interval, resolved once the store assigns
+/// the append's stamp (T7: a bound named relative to the present takes the
+/// stamp).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(verus_keep_ghost, verifier::external_derive)]
-pub enum DeriveInterval {
-    /// Explicit half-open interval `[from, to)` with `from < to`.
-    Fixed { from: i64, to: i64 },
-    /// Starts at the stamp's micros and ends at `to` (typically [`OPEN_END`]).
-    FromStamp { to: i64 },
-    /// Starts at the stamp's micros and ends `after > 0` later (a lifetime
-    /// relation's acceptance interval).
-    FromStampFor { after: i64 },
+pub enum DeriveBound {
+    /// A fixed instant ([`OPEN_END`] for an open end).
+    At(i64),
+    /// The stamp's micros plus this offset (saturating): a default-validity
+    /// start (`Stamp(0)`), a lifetime's end (`Stamp(lifetime)`) or any
+    /// period bound placed as `now + d`.
+    Stamp(i64),
+}
+
+/// A derive's half-open valid interval `[from, to)`, each bound fixed or
+/// acceptance-relative. A resolved interval may be empty, and an empty one
+/// changes nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(verus_keep_ghost, verifier::external_derive)]
+pub struct DeriveInterval {
+    pub from: DeriveBound,
+    pub to: DeriveBound,
+}
+
+impl DeriveInterval {
+    /// The fixed interval `[from, to)`.
+    pub const fn fixed(from: i64, to: i64) -> Self {
+        Self { from: DeriveBound::At(from), to: DeriveBound::At(to) }
+    }
+
+    /// `[stamp, to)`: default validity.
+    pub const fn from_stamp(to: i64) -> Self {
+        Self { from: DeriveBound::Stamp(0), to: DeriveBound::At(to) }
+    }
 }
 
 /// How an entry's identity key carries the append's commit stamp (for
@@ -166,6 +202,22 @@ pub struct KeyInstant {
     pub plus_micros: i64,
 }
 
+/// Encoded width of a maintained sum a [`ValueInstant`] adds to: a
+/// big-endian `i128`, as `store_read::tally` writes each measure.
+pub const SUM_BYTES: usize = 16;
+
+/// An acceptance-relative measure inside an entry's values (T7-4): the
+/// store adds the stamp's micros plus `plus_micros` (saturating) to the
+/// big-endian `i128` at `offset` of `enter_value` and subtracts it at the
+/// same offset of `leave_value`, before the diff. A maintained aggregate's
+/// sum over a field placed as `now + d` counts the stamp, never the entry
+/// instant.
+#[cfg_attr(not(verus_keep_ghost), derive(Clone, Copy, Debug, PartialEq, Eq))]
+pub struct ValueInstant {
+    pub offset: u32,
+    pub plus_micros: i64,
+}
+
 /// The kind of one derived entry on a row's derived line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(verus_keep_ghost, verifier::external_derive)]
@@ -189,6 +241,17 @@ pub enum EntryKind {
     /// enter writes `identity ‖ stamp ‖ ordinal → enter_value` (when
     /// `stamped`) or `identity → enter_value`; leave deletes that exact key.
     Single { stamped: bool },
+    /// A unique claim (T7-4): the claimed value's count, kept as an
+    /// [`EntryKind::Edged`] record pair under the value's identity
+    /// (`identity ‖ ordered(edge) ‖ stamp ‖ ordinal → enter_value` where
+    /// coverage begins, `→ leave_value` where it ends), each value a
+    /// big-endian `i64` count (`+1`, `−1`). Once the append's derives apply,
+    /// the store sums the identity's records over the derive's levels and
+    /// refuses the whole append when any instant of the claim's new coverage
+    /// counts more than one claimant ([`claim_exceeded`]): the one judgment
+    /// of a unique claim, made on the filled key at ordering. Its records
+    /// are listed in the purge inventory, so an erasure deletes them.
+    Claim,
 }
 
 /// One derived entry planned by the writer for the new image.
@@ -204,6 +267,8 @@ pub struct DeriveEntry {
     /// Instant-encoded stamp placeholders inside `identity`, disjoint from
     /// each other and from `key_stamp`'s region.
     pub key_instants: Vec<KeyInstant>,
+    /// Acceptance-relative measures inside the values, disjoint sums.
+    pub value_instants: Vec<ValueInstant>,
     /// Value written where coverage begins.
     pub enter_value: Vec<u8>,
     /// Value written where coverage ends (`[]` for `Marker` and `Single`,
@@ -748,21 +813,47 @@ pub fn edged_key(identity: &[u8], edge: i64, stamp: &[u8], ordinal: u64) -> Vec<
 /// resolved interval may be empty, and an empty one changes nothing.
 #[cfg_attr(verus_keep_ghost, verifier::external)]
 pub fn resolve_interval(interval: DeriveInterval, stamp_micros: i64) -> ValidInterval {
-    match interval {
-        DeriveInterval::Fixed { from, to } => ValidInterval { from, to },
-        DeriveInterval::FromStamp { to } => ValidInterval { from: stamp_micros, to },
-        DeriveInterval::FromStampFor { after } => ValidInterval { from: stamp_micros, to: stamp_micros.saturating_add(after) },
-    }
+    let resolve = |bound: DeriveBound| match bound {
+        DeriveBound::At(instant) => instant,
+        DeriveBound::Stamp(plus) => stamp_micros.saturating_add(plus),
+    };
+    ValidInterval { from: resolve(interval.from), to: resolve(interval.to) }
+}
+
+/// The micros of an encoded stamp (its first eight bytes, big-endian with
+/// the sign bit flipped).
+#[cfg_attr(verus_keep_ghost, verifier::external)]
+pub fn stamp_micros(stamp: &[u8; STAMP_BYTES]) -> i64 {
+    let mut word = [0u8; 8];
+    word.copy_from_slice(&stamp[..8]);
+    (u64::from_be_bytes(word) ^ (1 << 63)) as i64
 }
 
 /// The instant encoding of `stamp`'s micros plus `plus_micros`
 /// (saturating): big-endian with the sign bit flipped.
 #[cfg_attr(verus_keep_ghost, verifier::external)]
 fn instant_fill(stamp: &[u8; STAMP_BYTES], plus_micros: i64) -> [u8; INSTANT_BYTES] {
-    let mut word = [0u8; INSTANT_BYTES];
-    word.copy_from_slice(&stamp[..INSTANT_BYTES]);
-    let micros = (u64::from_be_bytes(word) ^ (1 << 63)) as i64;
-    ((micros.saturating_add(plus_micros) as u64) ^ (1 << 63)).to_be_bytes()
+    ((stamp_micros(stamp).saturating_add(plus_micros) as u64) ^ (1 << 63)).to_be_bytes()
+}
+
+/// `value` with the stamp's micros plus each instant's offset added
+/// (`sign` 1) or subtracted (`sign` −1) at each sum of `instants`
+/// (saturating). Total: a sum outside the value (which [`check`] refuses)
+/// leaves it as it is.
+#[cfg_attr(verus_keep_ghost, verifier::external)]
+fn fill_values(value: &[u8], instants: &[ValueInstant], stamp: &[u8; STAMP_BYTES], sign: i128) -> Vec<u8> {
+    let mut out = value.to_vec();
+    for instant in instants {
+        let start = instant.offset as usize;
+        let Some(cell) = start.checked_add(SUM_BYTES).and_then(|end| out.get_mut(start..end)) else {
+            continue;
+        };
+        let mut word = [0u8; SUM_BYTES];
+        word.copy_from_slice(cell);
+        let added = i128::from(stamp_micros(stamp).saturating_add(instant.plus_micros)).saturating_mul(sign);
+        cell.copy_from_slice(&i128::from_be_bytes(word).saturating_add(added).to_be_bytes());
+    }
+    out
 }
 
 /// Every placeholder region of an entry: `(start, width, escapes)`, the
@@ -841,12 +932,12 @@ pub fn check(derive: &Derive) -> Result<(), DeriveError> {
         return Err(DeriveError::new("A backfilled entry must stay in the manifest's partition and world"));
     }
     if let DeriveMode::Replace { interval, entries } = &derive.mode {
-        match *interval {
-            DeriveInterval::Fixed { from, to } if from >= to => {
+        // Two bounds of one kind order statically; a fixed bound against an
+        // acceptance-relative one resolves at the stamp, and an empty
+        // resolution changes nothing.
+        match (interval.from, interval.to) {
+            (DeriveBound::At(from), DeriveBound::At(to)) | (DeriveBound::Stamp(from), DeriveBound::Stamp(to)) if from >= to => {
                 return Err(DeriveError::new("A derive valid interval must be nonempty"));
-            },
-            DeriveInterval::FromStampFor { after } if after <= 0 => {
-                return Err(DeriveError::new("A derive lifetime duration must be positive"));
             },
             _ => {},
         }
@@ -890,6 +981,26 @@ pub fn check(derive: &Derive) -> Result<(), DeriveError> {
             regions.sort_by_key(|region| region.0);
             if regions.windows(2).any(|pair| pair[0].0 + pair[0].1 > pair[1].0) {
                 return Err(DeriveError::new("A derived entry's key placeholders overlap"));
+            }
+            if !entry.value_instants.is_empty() && !matches!(entry.kind, EntryKind::Edged { .. }) {
+                return Err(DeriveError::new("Only an edged entry's values carry an acceptance-relative sum"));
+            }
+            let mut sums: Vec<usize> = Vec::with_capacity(entry.value_instants.len());
+            for instant in &entry.value_instants {
+                let start = instant.offset as usize;
+                let end = start.checked_add(SUM_BYTES)
+                    .ok_or_else(|| DeriveError::new("A derived entry value instant offset overflows"))?;
+                if end > entry.enter_value.len() || end > entry.leave_value.len() {
+                    return Err(DeriveError::new("A derived entry value instant lies outside its values"));
+                }
+                sums.push(start);
+            }
+            sums.sort_unstable();
+            if sums.windows(2).any(|pair| pair[0] + SUM_BYTES > pair[1]) {
+                return Err(DeriveError::new("A derived entry's value instants overlap"));
+            }
+            if entry.kind == EntryKind::Claim && (entry.enter_value.len() < 8 || entry.leave_value.len() < 8) {
+                return Err(DeriveError::new("A claim's values are its big-endian counts"));
             }
         }
     }
@@ -989,7 +1100,8 @@ pub fn apply(
         .collect();
     let horizon = previous.horizon.max(interval.to);
 
-    // 2. The new entries over the interval, stamp placeholders filled.
+    // 2. The new entries over the interval, stamp placeholders filled in
+    //    their keys and their values.
     let new: Vec<Segment> = entries
         .iter()
         .filter(|entry| same_place(&entry.identity, manifest_prefix))
@@ -998,8 +1110,8 @@ pub fn apply(
             to: interval.to,
             kind: entry.kind,
             identity: fill_key_stamp(&entry.identity, entry.key_stamp, &entry.key_instants, &stamp),
-            enter_value: entry.enter_value.clone(),
-            leave_value: entry.leave_value.clone(),
+            enter_value: fill_values(&entry.enter_value, &entry.value_instants, &stamp, 1),
+            leave_value: fill_values(&entry.leave_value, &entry.value_instants, &stamp, -1),
             live_key: Vec::new(),
         })
         .collect();
@@ -1056,7 +1168,8 @@ pub fn apply(
             },
             // The live set's difference, below.
             EntryKind::Boundary => {},
-            EntryKind::Edged { retain } => {
+            EntryKind::Edged { .. } | EntryKind::Claim => {
+                let retain = segment.kind == (EntryKind::Edged { retain: true });
                 let overlap_from = segment.from.max(interval.from);
                 let overlap_to = segment.to.min(interval.to);
                 let key = edged_key(&segment.identity, overlap_from, &stamp, ordinal);
@@ -1103,7 +1216,8 @@ pub fn apply(
                 writes.push(put(key, entry.enter_value.clone()));
             },
             EntryKind::Boundary => {},
-            EntryKind::Edged { retain } => {
+            EntryKind::Edged { .. } | EntryKind::Claim => {
+                let retain = entry.kind == (EntryKind::Edged { retain: true });
                 let key = edged_key(&entry.identity, entry.from, &stamp, ordinal);
                 ordinal = ordinal.wrapping_add(1);
                 record(&mut written_keys, retain, &key);
@@ -1164,7 +1278,7 @@ pub fn apply(
 /// `manifest_prefix` (supplied in ascending stamp order, newest last). Total.
 ///
 /// Emits a delete of every key any manifest version recorded as written
-/// (markers, singles, statistics deltas and unretained edged records, at
+/// (markers, singles, statistics deltas, claims and unretained edged records, at
 /// every stamp: the row's whole derived history), and of every manifest key
 /// itself (so a later write finds no line), each once and confined to the
 /// manifest's place. Nothing is retracted at the purge's own stamp: with
@@ -1211,6 +1325,93 @@ pub fn line_through<'a>(manifest_prefix: &[u8], stored_manifests: &'a [(Vec<u8>,
         })
         .map(|(_, manifest)| manifest)
         .next_back()
+}
+
+// ---------------------------------------------------------------- Claims
+
+/// The claims a [`Derive`] makes once the append's stamp fills it: each
+/// [`EntryKind::Claim`] entry's filled identity, with the derive's resolved
+/// coverage. A purge, an empty coverage or an entry outside the manifest's
+/// place claims nothing.
+#[cfg_attr(verus_keep_ghost, verifier::external)]
+pub fn claims(derive: &Derive, stamp: &[u8; STAMP_BYTES]) -> Vec<(Vec<u8>, ValidInterval)> {
+    let DeriveMode::Replace { interval, entries } = &derive.mode else { return Vec::new() };
+    let coverage = resolve_interval(*interval, stamp_micros(stamp));
+    if coverage.from >= coverage.to {
+        return Vec::new();
+    }
+    entries
+        .iter()
+        .filter(|entry| entry.kind == EntryKind::Claim && same_place(&entry.identity, &derive.manifest_prefix))
+        .map(|entry| (fill_key_stamp(&entry.identity, entry.key_stamp, &entry.key_instants, stamp), coverage))
+        .collect()
+}
+
+/// Where a claim's records lie: its filled `identity` at each level of
+/// `derive` (the target world first, then each inherited level, re-rooted
+/// into that level's world, P10), with the stamp through which the level
+/// counts (`None`: every record, the target's own and this append's). A
+/// world's records retract what it overrides of its parents, so the claim's
+/// count at an instant is the sum over every level.
+#[cfg_attr(verus_keep_ghost, verifier::external)]
+pub fn claim_levels(derive: &Derive, identity: &[u8]) -> Vec<(Vec<u8>, Option<[u8; STAMP_BYTES]>)> {
+    let mut out: Vec<(Vec<u8>, Option<[u8; STAMP_BYTES]>)> = Vec::with_capacity(derive.levels.len().max(1));
+    out.push((identity.to_vec(), None));
+    for level in &derive.levels {
+        let Some(through) = level.through else { continue };
+        let Some((p_len, end)) = place_bounds(&level.prefix) else { continue };
+        let Some(rerooted) = reroot(identity, &level.prefix[p_len + 1..end]) else { continue };
+        out.push((rerooted, Some(through)));
+    }
+    out
+}
+
+/// The `(edge, count)` of a stored record of a claim at `identity` (one of
+/// [`claim_levels`]): a key `identity ‖ ordered(edge) ‖ stamp ‖ ordinal`
+/// stamped at or before `through`, whose value starts with its big-endian
+/// `i64` count. `None` for any other key.
+#[cfg_attr(verus_keep_ghost, verifier::external)]
+pub fn claim_record(identity: &[u8], through: Option<&[u8; STAMP_BYTES]>, key: &[u8], value: &[u8]) -> Option<(i64, i64)> {
+    let rest = key.strip_prefix(identity).filter(|rest| rest.len() == EDGE_BYTES + PRECEDENCE_BYTES)?;
+    if through.is_some_and(|through| &rest[EDGE_BYTES..EDGE_BYTES + STAMP_BYTES] > through.as_slice()) {
+        return None;
+    }
+    let mut edge = [0u8; EDGE_BYTES];
+    edge.copy_from_slice(&rest[..EDGE_BYTES]);
+    let mut count = [0u8; 8];
+    count.copy_from_slice(value.get(..8)?);
+    Some(((u64::from_be_bytes(edge) ^ (1 << 63)) as i64, i64::from_be_bytes(count)))
+}
+
+/// Whether a claim's records (`(edge, count)`, every level's, after the
+/// append applied) count more than one claimant at some instant of
+/// `coverage`: the count at instant `t` is the sum of the records with edge
+/// `≤ t`, so it is checked at the coverage's start and at each edge inside
+/// it.
+#[cfg_attr(verus_keep_ghost, verifier::external)]
+pub fn claim_exceeded(records: &[(i64, i64)], coverage: ValidInterval) -> bool {
+    let mut records = records.to_vec();
+    records.sort_unstable();
+    let mut count: i128 = 0;
+    let mut at = 0usize;
+    while at < records.len() && records[at].0 <= coverage.from {
+        count += i128::from(records[at].1);
+        at += 1;
+    }
+    if count > 1 {
+        return true;
+    }
+    while at < records.len() && records[at].0 < coverage.to {
+        let edge = records[at].0;
+        while at < records.len() && records[at].0 == edge {
+            count += i128::from(records[at].1);
+            at += 1;
+        }
+        if count > 1 {
+            return true;
+        }
+    }
+    false
 }
 
 /// Apply one `DeriveMode::Backfill` step to the row's previous line: emit
@@ -1282,6 +1483,7 @@ fn encode_kind(kind: EntryKind) -> u8 {
         EntryKind::Single { stamped: true } => 4,
         EntryKind::Edged { retain: false } => 5,
         EntryKind::Edged { retain: true } => 6,
+        EntryKind::Claim => 7,
     }
 }
 
@@ -1294,6 +1496,7 @@ fn decode_kind(tag: u8) -> Result<EntryKind, DeriveError> {
         4 => Ok(EntryKind::Single { stamped: true }),
         5 => Ok(EntryKind::Edged { retain: false }),
         6 => Ok(EntryKind::Edged { retain: true }),
+        7 => Ok(EntryKind::Claim),
         _ => Err(DeriveError::new("Unknown derive entry kind")),
     }
 }
@@ -1382,20 +1585,13 @@ impl Derive {
             },
             DeriveMode::Replace { interval, entries } => {
                 out.push(1);
-                match *interval {
-                    DeriveInterval::Fixed { from, to } => {
-                        out.push(1);
-                        out.extend_from_slice(&from.to_be_bytes());
-                        out.extend_from_slice(&to.to_be_bytes());
-                    },
-                    DeriveInterval::FromStamp { to } => {
-                        out.push(2);
-                        out.extend_from_slice(&to.to_be_bytes());
-                    },
-                    DeriveInterval::FromStampFor { after } => {
-                        out.push(3);
-                        out.extend_from_slice(&after.to_be_bytes());
-                    },
+                for bound in [interval.from, interval.to] {
+                    let (tag, value) = match bound {
+                        DeriveBound::At(instant) => (1u8, instant),
+                        DeriveBound::Stamp(plus) => (2u8, plus),
+                    };
+                    out.push(tag);
+                    out.extend_from_slice(&value.to_be_bytes());
                 }
                 out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
                 for entry in entries {
@@ -1420,6 +1616,11 @@ impl Derive {
                     for instant in &entry.key_instants {
                         out.extend_from_slice(&instant.offset.to_be_bytes());
                         out.push(instant.escapes);
+                        out.extend_from_slice(&instant.plus_micros.to_be_bytes());
+                    }
+                    out.extend_from_slice(&(entry.value_instants.len() as u32).to_be_bytes());
+                    for instant in &entry.value_instants {
+                        out.extend_from_slice(&instant.offset.to_be_bytes());
                         out.extend_from_slice(&instant.plus_micros.to_be_bytes());
                     }
                     put_bytes(&mut out, &entry.enter_value);
@@ -1467,12 +1668,16 @@ impl Derive {
                 DeriveMode::Backfill { writes }
             },
             1 => {
-                let interval = match take_u8(&mut rest)? {
-                    1 => DeriveInterval::Fixed { from: take_i64(&mut rest)?, to: take_i64(&mut rest)? },
-                    2 => DeriveInterval::FromStamp { to: take_i64(&mut rest)? },
-                    3 => DeriveInterval::FromStampFor { after: take_i64(&mut rest)? },
-                    _ => return Err(DeriveError::new("Invalid derive interval tag")),
+                let mut bound = || -> Result<DeriveBound, DeriveError> {
+                    match take_u8(&mut rest)? {
+                        1 => Ok(DeriveBound::At(take_i64(&mut rest)?)),
+                        2 => Ok(DeriveBound::Stamp(take_i64(&mut rest)?)),
+                        _ => Err(DeriveError::new("Invalid derive interval bound tag")),
+                    }
                 };
+                let from = bound()?;
+                let to = bound()?;
+                let interval = DeriveInterval { from, to };
                 let entry_count = take_u32(&mut rest)? as usize;
                 let mut entries = Vec::with_capacity(entry_count.min(256));
                 for _ in 0..entry_count {
@@ -1493,9 +1698,16 @@ impl Derive {
                         let plus_micros = take_i64(&mut rest)?;
                         key_instants.push(KeyInstant { offset, escapes, plus_micros });
                     }
+                    let value_count = take_u32(&mut rest)? as usize;
+                    let mut value_instants = Vec::with_capacity(value_count.min(16));
+                    for _ in 0..value_count {
+                        let offset = take_u32(&mut rest)?;
+                        let plus_micros = take_i64(&mut rest)?;
+                        value_instants.push(ValueInstant { offset, plus_micros });
+                    }
                     let enter_value = take_bytes(&mut rest)?;
                     let leave_value = take_bytes(&mut rest)?;
-                    entries.push(DeriveEntry { kind, identity, key_stamp, key_instants, enter_value, leave_value });
+                    entries.push(DeriveEntry { kind, identity, key_stamp, key_instants, value_instants, enter_value, leave_value });
                 }
                 DeriveMode::Replace { interval, entries }
             },
@@ -1539,7 +1751,7 @@ mod tests {
     }
 
     fn entry(kind: EntryKind, family: u8, name: &[u8], enter: &[u8], leave: &[u8]) -> DeriveEntry {
-        DeriveEntry { kind, identity: key(b"p", family, [0; 16], name), key_stamp: None, key_instants: Vec::new(), enter_value: enter.to_vec(), leave_value: leave.to_vec() }
+        DeriveEntry { kind, identity: key(b"p", family, [0; 16], name), key_stamp: None, key_instants: Vec::new(), value_instants: Vec::new(), enter_value: enter.to_vec(), leave_value: leave.to_vec() }
     }
 
     fn prefix() -> Vec<u8> {
@@ -1683,12 +1895,13 @@ mod tests {
             manifest_prefix: prefix.clone(),
             levels: vec![DeriveLevel { prefix: prefix.clone(), through: None }],
             mode: DeriveMode::Replace {
-                interval: DeriveInterval::FromStamp { to: OPEN_END },
+                interval: DeriveInterval::from_stamp(OPEN_END),
                 entries: vec![DeriveEntry {
                     kind: EntryKind::Edged { retain: true },
                     identity: key(b"p", PERSISTENCE, [1; 16], b"agg"),
                     key_stamp: None,
                     key_instants: vec![KeyInstant { offset: 40, escapes: 2, plus_micros: -7 }],
+                    value_instants: Vec::new(),
                     enter_value: vec![0, 1],
                     leave_value: vec![0xff, 0xff],
                 }],
@@ -1725,16 +1938,72 @@ mod tests {
         let derive = Derive {
             manifest_prefix: prefix(),
             levels: Vec::new(),
-            mode: DeriveMode::Replace { interval: DeriveInterval::FromStamp { to: OPEN_END }, entries: vec![marker.clone()] },
+            mode: DeriveMode::Replace { interval: DeriveInterval::from_stamp(OPEN_END), entries: vec![marker.clone()] },
         };
         check(&derive).unwrap();
         let applied = apply(&prefix(), &Manifest::empty(), ValidInterval { from: 1, to: OPEN_END }, &[marker.clone()], stamp, DERIVE_ORDINAL_BASE);
         assert_eq!(applied.manifest.segments[0].identity, filled, "the line keeps the filled identity");
         let overlapping = DeriveEntry { key_instants: vec![instant, KeyInstant { offset: offset + 4, ..instant }], ..marker.clone() };
-        let refused = Derive { mode: DeriveMode::Replace { interval: DeriveInterval::FromStamp { to: OPEN_END }, entries: vec![overlapping] }, ..derive.clone() };
+        let refused = Derive { mode: DeriveMode::Replace { interval: DeriveInterval::from_stamp(OPEN_END), entries: vec![overlapping] }, ..derive.clone() };
         assert!(check(&refused).is_err());
         let nonzero = DeriveEntry { identity: [&template[..start], &[1u8][..], &template[start + 1..]].concat(), ..marker };
-        let refused = Derive { mode: DeriveMode::Replace { interval: DeriveInterval::FromStamp { to: OPEN_END }, entries: vec![nonzero] }, ..derive };
+        let refused = Derive { mode: DeriveMode::Replace { interval: DeriveInterval::from_stamp(OPEN_END), entries: vec![nonzero] }, ..derive };
         assert!(check(&refused).is_err());
+    }
+
+    #[test]
+    fn a_relative_interval_resolves_at_the_stamp_and_round_trips() {
+        let interval = DeriveInterval { from: DeriveBound::Stamp(5), to: DeriveBound::Stamp(9) };
+        assert_eq!(resolve_interval(interval, 100), ValidInterval { from: 105, to: 109 });
+        assert_eq!(resolve_interval(DeriveInterval { from: DeriveBound::At(3), to: DeriveBound::Stamp(1) }, 100), ValidInterval { from: 3, to: 101 });
+        let derive = Derive { manifest_prefix: prefix(), levels: Vec::new(), mode: DeriveMode::Replace { interval, entries: Vec::new() } };
+        check(&derive).unwrap();
+        assert_eq!(Derive::decode(&derive.encode()).unwrap(), derive);
+        let empty = Derive { mode: DeriveMode::Replace { interval: DeriveInterval { from: DeriveBound::Stamp(9), to: DeriveBound::Stamp(9) }, entries: Vec::new() }, ..derive };
+        assert!(check(&empty).is_err(), "two relative bounds order statically");
+    }
+
+    #[test]
+    fn a_value_instant_adds_the_stamp_to_its_sum_and_takes_it_back_on_leave() {
+        let sum = |value: i128| [&1i64.to_be_bytes()[..], &1u16.to_be_bytes()[..], &value.to_be_bytes()[..]].concat();
+        let mut edged = entry(EntryKind::Edged { retain: false }, PERSISTENCE, b"agg", &sum(2), &sum(-2));
+        edged.value_instants = vec![ValueInstant { offset: 10, plus_micros: 3 }];
+        let applied = apply(&prefix(), &Manifest::empty(), ValidInterval { from: 7, to: OPEN_END }, &[edged.clone()], stamp(7, 1), DERIVE_ORDINAL_BASE);
+        assert_eq!(applied.writes[0].value, Some(sum(2 + 7 + 3)), "the sum counts the stamp plus its offset");
+        assert_eq!(applied.manifest.segments[0].leave_value, sum(-(2 + 7 + 3)));
+        let bad = DeriveEntry { value_instants: vec![ValueInstant { offset: 20, plus_micros: 0 }], ..edged };
+        let derive = Derive { manifest_prefix: prefix(), levels: Vec::new(), mode: DeriveMode::Replace { interval: DeriveInterval::from_stamp(OPEN_END), entries: vec![bad] } };
+        assert!(check(&derive).is_err(), "a sum outside the values");
+    }
+
+    #[test]
+    fn a_claim_counts_its_claimants_at_every_instant_of_its_coverage() {
+        let count = |n: i64| n.to_be_bytes().to_vec();
+        let claim = entry(EntryKind::Claim, PERSISTENCE, b"claim", &count(1), &count(-1));
+        let first = apply(&prefix(), &Manifest::empty(), ValidInterval { from: 10, to: 20 }, &[claim.clone()], stamp(1, 1), DERIVE_ORDINAL_BASE);
+        assert_eq!(first.writes.len(), 2, "+1 at 10, -1 at 20");
+        let records: Vec<(i64, i64)> = first.writes.iter().filter_map(|write| claim_record(&claim.identity, None, &write.key, write.value.as_deref()?)).collect();
+        assert_eq!(records, vec![(10, 1), (20, -1)]);
+        assert!(!claim_exceeded(&records, ValidInterval { from: 10, to: 20 }));
+        let other = [records.clone(), vec![(15, 1)]].concat();
+        assert!(claim_exceeded(&other, ValidInterval { from: 15, to: OPEN_END }), "a second claimant inside the first's coverage");
+        let after = [records.clone(), vec![(20, 1)]].concat();
+        assert!(!claim_exceeded(&after, ValidInterval { from: 20, to: OPEN_END }), "a claimant after the first's coverage ends");
+        let through = stamp(0, 9);
+        assert_eq!(claim_record(&claim.identity, Some(&through), &first.writes[0].key, &count(1)), None, "a record stamped after its level's cut");
+        let derive = Derive {
+            manifest_prefix: prefix(),
+            levels: vec![
+                DeriveLevel { prefix: prefix(), through: None },
+                DeriveLevel { prefix: key(b"p", ROW, [1; 16], b"row\x04"), through: Some(through) },
+            ],
+            mode: DeriveMode::Replace { interval: DeriveInterval::fixed(10, 20), entries: vec![claim.clone()] },
+        };
+        assert_eq!(claims(&derive, &stamp(1, 1)), vec![(claim.identity.clone(), ValidInterval { from: 10, to: 20 })]);
+        let levels = claim_levels(&derive, &claim.identity);
+        assert_eq!(levels.len(), 2);
+        assert_eq!(levels[1], (key(b"p", PERSISTENCE, [1; 16], b"claim"), Some(through)), "the parent's records under its own world");
+        let purged = purge(&prefix(), &[(stamped_key(&prefix(), &stamp(1, 1), DERIVE_ORDINAL_BASE), first.manifest)]);
+        assert!(first.writes.iter().all(|write| purged.iter().any(|deleted| deleted.key == write.key && deleted.value.is_none())), "a purge deletes the claim's records");
     }
 }

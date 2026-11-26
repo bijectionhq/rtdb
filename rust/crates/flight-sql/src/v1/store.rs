@@ -26,7 +26,7 @@ use rtdb_index::branches::store::{
 };
 use rtdb_node::{DatabaseAccess, serving::{ChangeImages, ChangeOrder, Changes}};
 use rtdb_tx::transact::{
-    Guard, Op, Outcome, STORE_BOUND, STORE_OUTSIDE_EARLY, STORE_OUTSIDE_LATE, StoreAppend, Transact, Window,
+    Guard, Op, Outcome, STORE_BOUND, STORE_CLAIM, STORE_OUTSIDE_EARLY, STORE_OUTSIDE_LATE, StoreAppend, Transact, Window,
 };
 use rtdb_auth::StoreScope;
 use rtdb_types::{Anomaly, AnomalyCategory, EntityId, Timestamp, rtdb_v1::{At, Basis, MAIN_BRANCH}};
@@ -232,6 +232,11 @@ impl Service {
                         let bound = error.context.get("bound").and_then(|value| value.as_u64())
                             .ok_or_else(|| Status::internal("A failed bound names no index"))?;
                         proto::append_reply::Outcome::Bound(u32::try_from(bound).map_err(|_| Status::internal("Bound index overflow"))?)
+                    }
+                    Outcome::Refused { error } if error.code == STORE_CLAIM => {
+                        let derive = error.context.get("derive").and_then(|value| value.as_u64())
+                            .ok_or_else(|| Status::internal("A failed claim names no derive"))?;
+                        proto::append_reply::Outcome::Claimed(u32::try_from(derive).map_err(|_| Status::internal("Derive index overflow"))?)
                     }
                     Outcome::Refused { error } => return Err(error::anomaly(error)),
                 }

@@ -20,7 +20,7 @@ pub use store_filter::ValueFilter;
 
 /// SHA-256 of Bijection's `crates/store_read/src/derive.rs`, vendored verbatim
 /// as `rust/vendor/bijection-store-derive/src/lib.rs`.
-pub const DERIVE_DIGEST: &str = "b58873edcc3e8d03f9e16bfbbe741e58b538f2588e95980457f5112d5d7f6896";
+pub const DERIVE_DIGEST: &str = "393bb8281a901e3edcc1c8cfff3e1837563e567920a4b04c58636193c7a6649b";
 
 pub const STORE_SCHEMA: &str = "store";
 pub const STORE_RELATION: &str = "entries";
@@ -370,6 +370,68 @@ pub fn resolve_derives(
         }
     }
     Ok(out)
+}
+
+/// The first derive whose unique claim (`EntryKind::Claim`, Bijection T7-4)
+/// counts a second claimant once `derived` (the append's derived writes,
+/// in order, from [`resolve_derives`]) applies over `view`: each claim's
+/// filled key, read at every level it inherits, judged by the vendored
+/// `store_derive::claim_exceeded`. One judgment, at the ordering point; a
+/// refusal writes nothing.
+pub fn claim_refused(
+    view: &BranchView<'_>,
+    derives: &[store_derive::Derive],
+    derived: &[(Vec<u8>, Option<Vec<u8>>)],
+    stamp: StoreStamp,
+) -> Result<Option<usize>> {
+    let stamp_bytes = stamp.encode();
+    let overlay: BTreeMap<&[u8], Option<&[u8]>> = derived.iter().map(|(key, value)| (key.as_slice(), value.as_deref())).collect();
+    for (index, derive) in derives.iter().enumerate() {
+        for (identity, coverage) in store_derive::claims(derive, &stamp_bytes) {
+            let mut records = Vec::new();
+            for (level, through) in store_derive::claim_levels(derive, &identity) {
+                let range = KeyRange { start: level.clone(), end: prefix_successor(&level) };
+                let mut held: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+                let mut after = None;
+                loop {
+                    let page = view.store_page(&StoreRead {
+                        range: range.clone(),
+                        after: after.take(),
+                        limit: MAX_PAGE_ENTRIES,
+                        projection: Projection::Values,
+                        filter: None,
+                        reverse: false,
+                    })?;
+                    for entry in page.entries {
+                        if let Some(value) = entry.value {
+                            held.insert(entry.key, value);
+                        }
+                    }
+                    match page.resume {
+                        Some(resume) => after = Some(resume),
+                        None => break,
+                    }
+                }
+                // This append's own records lie at the target's place only (P10).
+                if through.is_none() {
+                    for (key, value) in overlay.range::<[u8], _>((Bound::Included(level.as_slice()), Bound::Unbounded)) {
+                        if !key.starts_with(&level) {
+                            break;
+                        }
+                        match value {
+                            Some(value) => held.insert(key.to_vec(), value.to_vec()),
+                            None => held.remove(*key),
+                        };
+                    }
+                }
+                records.extend(held.iter().filter_map(|(key, value)| store_derive::claim_record(&level, through.as_ref(), key, value)));
+            }
+            if store_derive::claim_exceeded(&records, coverage) {
+                return Ok(Some(index));
+            }
+        }
+    }
+    Ok(None)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

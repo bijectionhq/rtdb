@@ -158,8 +158,10 @@ message AppendRequest {
   repeated Bound bounds = 7;
   // Derived writes (vendor/bijection-store-derive, T3): each entry is an
   // encoded store_read::derive::Derive. Applied in order after the reads, window
-  // and bounds are judged and before plain writes. Never change the append's
-  // outcome, and emitted writes do not count toward any request size limit.
+  // and bounds are judged and before plain writes. Applying one never changes
+  // the append's outcome; the unique claims they make are judged once all
+  // apply, on their filled keys (claimed). Emitted writes do not count toward
+  // any request size limit.
   repeated bytes derives = 8;
   // Optional SHA-256 digest of Bijection's store_read::derive source; when
   // present it must match RTDB's vendored DERIVE_DIGEST or the append fails
@@ -185,6 +187,11 @@ message AppendReply {
     // The index of the first bound whose sum left [min, max] or overflowed.
     // Nothing was written; recorded as a receipt under the append's key.
     uint32 bound = 6;
+    // The index of the first derive whose unique claim, filled at the stamp,
+    // counted a second claimant at an instant of its coverage once the
+    // append's derives applied (store_derive::claim_exceeded). Nothing was
+    // written; recorded as a receipt under the append's key.
+    uint32 claimed = 7;
   }
 }
 

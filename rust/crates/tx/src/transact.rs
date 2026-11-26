@@ -12,7 +12,7 @@ pub use rtdb_index::branches::{
     store::{KeyRange, StoreBound, StoreWrite},
 };
 use rtdb_index::branches::store::{
-    StoreStamp, VALUE_COLUMN, check_bounds, check_derives, check_placeholders, decode_bound_value, resolve_derives, stamp_writes,
+    StoreStamp, VALUE_COLUMN, check_bounds, check_derives, check_placeholders, claim_refused, decode_bound_value, resolve_derives, stamp_writes,
     store_table,
 };
 use rtdb_types::{
@@ -353,6 +353,9 @@ pub const STORE_OUTSIDE_EARLY: &str = "rtdb.store/outside-early";
 pub const STORE_OUTSIDE_LATE: &str = "rtdb.store/outside-late";
 /// A `Bound` check left `[min, max]` or overflowed `i64`; nothing was written.
 pub const STORE_BOUND: &str = "rtdb.store/bound";
+/// A derive's unique claim, filled at the stamp, counted a second claimant
+/// (Bijection T7-4, `store_derive::claim_exceeded`); nothing was written.
+pub const STORE_CLAIM: &str = "rtdb.store/claim";
 
 fn store_append_shape() -> Anomaly {
     Anomaly::incorrect("rtdb.store/append-shape", "A store append carries only its store operation and read guards")
@@ -1494,7 +1497,22 @@ impl TransactState {
         if position <= head.basis.position() {
             return Err(Anomaly::fault("rtdb/transaction-order", "The append must follow the applied prefix"));
         }
-        let commits = mutates && failed.is_empty() && failed_bound.is_none();
+        // Derived writes resolve at the ordering point against the line the
+        // prior state holds, after the reads, window and bounds are judged
+        // and before plain writes (T3). Applying them never changes the
+        // outcome; the unique claims they make are judged once they all
+        // apply, on their filled keys (Bijection T7-4).
+        let stamp = StoreStamp { micros: now.0, version: position };
+        let mut failed_claim: Option<usize> = None;
+        let derived = if mutates && failed.is_empty() && failed_bound.is_none() {
+            let prior_view = view.index.view(MAIN_BRANCH, At::Latest, Layer::Merged, guard_time)?;
+            let derived = resolve_derives(&prior_view, &decoded_derives, stamp)?;
+            failed_claim = claim_refused(&prior_view, &decoded_derives, &derived, stamp)?;
+            derived
+        } else {
+            Vec::new()
+        };
+        let commits = mutates && failed.is_empty() && failed_bound.is_none() && failed_claim.is_none();
         // Every store record takes the writer's own clock sample: a conflict's,
         // a bound refusal's and a validation's too. Ties are admitted and ordered
         // by position, so no record's time is minted past the head's.
@@ -1508,14 +1526,12 @@ impl TransactState {
             let error = Anomaly::new(AnomalyCategory::Conflict, STORE_BOUND, "A store bound check failed")
                 .with_context("bound", (bound_idx as u64).into());
             (Outcome::Refused { error }, Vec::new(), index)
+        } else if let Some(derive_idx) = failed_claim {
+            let error = Anomaly::new(AnomalyCategory::Conflict, STORE_CLAIM, "A derive's unique claim counted a second claimant")
+                .with_context("derive", (derive_idx as u64).into());
+            (Outcome::Refused { error }, Vec::new(), index)
         } else if commits {
-            let stamp = StoreStamp { micros: now.0, version: position };
             let mut ops: Vec<Op> = Vec::new();
-            // Derived writes resolve at the ordering point against the line the
-            // prior state holds, after the reads, window and bounds are judged
-            // and before plain writes (T3). They never change the outcome.
-            let prior_view = view.index.view(MAIN_BRANCH, At::Latest, Layer::Merged, guard_time)?;
-            let derived = resolve_derives(&prior_view, &decoded_derives, stamp)?;
             let bound_writes = bound_updates.into_iter().map(|(key, next)| (key, Some(next.to_be_bytes().to_vec())));
             for (key, value) in derived.into_iter().chain(stamp_writes(&append.writes, stamp)?).chain(bound_writes) {
                 let id = EntityId::Binary(key);

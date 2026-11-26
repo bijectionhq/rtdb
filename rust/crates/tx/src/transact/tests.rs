@@ -153,6 +153,7 @@ fn a_store_derive_diffs_retires_and_purges_atomically() {
         identity: id.clone(),
         key_stamp: None,
         key_instants: Vec::new(),
+        value_instants: Vec::new(),
         enter_value: vec![1],
         leave_value: Vec::new(),
     };
@@ -170,12 +171,12 @@ fn a_store_derive_diffs_retires_and_purges_atomically() {
     let d_a = Derive {
         manifest_prefix: manifest_prefix.clone(),
         levels: level.clone(),
-        mode: DeriveMode::Replace { interval: DeriveInterval::FromStamp { to: i64::MAX }, entries: vec![marker(&idx_a)] },
+        mode: DeriveMode::Replace { interval: DeriveInterval::from_stamp(i64::MAX), entries: vec![marker(&idx_a)] },
     };
     let d_b = Derive {
         manifest_prefix: manifest_prefix.clone(),
         levels: level,
-        mode: DeriveMode::Replace { interval: DeriveInterval::FromStamp { to: i64::MAX }, entries: vec![marker(&idx_b)] },
+        mode: DeriveMode::Replace { interval: DeriveInterval::from_stamp(i64::MAX), entries: vec![marker(&idx_b)] },
     };
     let d_purge = Derive { manifest_prefix: manifest_prefix.clone(), levels: Vec::new(), mode: DeriveMode::Purge };
 
@@ -198,6 +199,64 @@ fn a_store_derive_diffs_retires_and_purges_atomically() {
     apply(&mut state, 6, c6.record()).unwrap();
     let read_a = StoreRead { range: range_a, after: None, limit: 16, projection: Projection::Keys, filter: None, reverse: false };
     assert!(state.index().view(MAIN_BRANCH, At::Latest, Layer::Merged, Timestamp(600)).unwrap().store_page(&read_a).unwrap().entries.is_empty());
+}
+
+#[test]
+fn a_store_derive_claim_is_judged_on_its_filled_key_at_ordering() {
+    use rtdb_index::branches::store::store_derive::{Derive, DeriveEntry, DeriveInterval, DeriveLevel, DeriveMode, EntryKind, KeyInstant};
+    let mut state = TransactState::new(INCARNATION);
+    let place = |family: u8, inner: &[u8]| {
+        let world: Vec<u8> = [0u8; 16].iter().flat_map(|_| [0u8, 0xff]).chain([0u8, 1]).collect();
+        [vec![0u8, 1, b'p', family], world, inner.to_vec()].concat()
+    };
+    // A claim of the stamp's micros plus 7: eight zero bytes the resolver
+    // fills, then a fixed claim of the value it filled to.
+    let template = [place(32, b"claim/"), vec![0; 8]].concat();
+    let offset = u32::try_from(template.len() - 8).unwrap();
+    let claim = |row: &[u8], identity: Vec<u8>, key_instants: Vec<KeyInstant>| {
+        let manifest_prefix = place(16, row);
+        Derive {
+            levels: vec![DeriveLevel { prefix: manifest_prefix.clone(), through: None }],
+            manifest_prefix,
+            mode: DeriveMode::Replace {
+                interval: DeriveInterval::from_stamp(i64::MAX),
+                entries: vec![DeriveEntry {
+                    kind: EntryKind::Claim,
+                    identity,
+                    key_stamp: None,
+                    key_instants,
+                    value_instants: Vec::new(),
+                    enter_value: 1i64.to_be_bytes().to_vec(),
+                    leave_value: (-1i64).to_be_bytes().to_vec(),
+                }],
+            },
+        }
+    };
+    let make = |key: u8, derive: Derive| Transact {
+        key: vec![key; 16],
+        require: Vec::new(),
+        window: Window::default(),
+        guards: Vec::new(),
+        ops: vec![Op::Store(StoreAppend { writes: Vec::new(), bounds: Vec::new(), derives: vec![derive.encode()], window: Window::default() })],
+        otherwise: Vec::new(),
+        requires: Vec::new(),
+        custody_request_digest: None,
+        request_memory: None,
+    };
+    let first = plan(&state, &make(1, claim(b"row1\x04", template.clone(), vec![KeyInstant { offset, escapes: 0, plus_micros: 7 }])), 1, 100, DEFAULT);
+    assert_eq!(apply(&mut state, 1, first.record()).unwrap().outcome, Outcome::Then);
+    let filled = [place(32, b"claim/"), ((107u64) ^ (1 << 63)).to_be_bytes().to_vec()].concat();
+    let second = plan(&state, &make(2, claim(b"row2\x04", filled.clone(), Vec::new())), 2, 200, DEFAULT);
+    match apply(&mut state, 2, second.record()).unwrap().outcome {
+        Outcome::Refused { error } => {
+            assert_eq!(error.code, STORE_CLAIM);
+            assert_eq!(error.context.get("derive").and_then(|value| value.as_u64()), Some(0));
+        },
+        other => panic!("a second claimant of the filled value is refused, got {other:?}"),
+    }
+    let other = [place(32, b"claim/"), ((108u64) ^ (1 << 63)).to_be_bytes().to_vec()].concat();
+    let third = plan(&state, &make(3, claim(b"row3\x04", other, Vec::new())), 3, 300, DEFAULT);
+    assert_eq!(apply(&mut state, 3, third.record()).unwrap().outcome, Outcome::Then);
 }
 
 #[test]
