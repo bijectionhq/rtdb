@@ -171,7 +171,7 @@ async fn regional_replay_rechecks_the_observed_tip_and_reports_disappearance_and
     let read = || reserve(&memory, head.allocation_bound);
 
     overwrite(&path, second.0 as u64, &[0]);
-    assert_corrupt_at(replay.read_head(head, read()).await, &path, second, "expected record separator 0x1e");
+    assert_corrupt_at(replay.read_head(head, read()).await, &path, second, "invalid local log record separator");
     overwrite(&path, second.0 as u64, &[0x1e]);
     overwrite(&path, second.0 as u64 - 8, &1i64.to_be_bytes());
     assert_corrupt_at(replay.read_head(head, read()).await, &path, first, "record trailer does not name its start offset");
@@ -293,8 +293,8 @@ async fn local_log_inspection_reports_corrupt_resume_and_tip_frames_at_their_byt
     assert!(tail.poll(Duration::ZERO).await.unwrap().is_empty());
 
     overwrite(&path, second.0 as u64, &[0]);
-    assert_corrupt_at(read_only.latest(), &path, second, "expected record separator 0x1e");
-    assert_corrupt_at(tail.poll(Duration::ZERO).await, &path, second, "expected record separator 0x1e");
+    assert_corrupt_at(read_only.latest(), &path, second, "invalid local log record separator");
+    assert_corrupt_at(tail.poll(Duration::ZERO).await, &path, second, "invalid local log record separator");
 }
 
 #[tokio::test]
