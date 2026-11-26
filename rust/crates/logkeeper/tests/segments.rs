@@ -140,9 +140,10 @@ async fn share_compact_and_replay(cache_bytes: usize) {
     }
     assert!(compacted.1 < before / 2 && compacted.0 == 1, "a trim leaving the segments mostly dead compacts them: {before} bytes became {compacted:?}");
     drop(writers);
-    server.stop().await;
+    let (_, address) = server.stop().await;
 
-    let server = start(directory.path(), cache_bytes).await;
+    // The streams' address-identified ensembles bind their journal, so it comes back at the same address.
+    let server = Server::start_with(directory.path(), address, cache_bytes).await;
     for stream in 1..streams {
         let reader = open_reader(config(&server, stream), CancellationToken::new()).await.unwrap();
         assert_eq!(payloads(reader.as_ref(), 0).await, (0..3).map(|position| format!("{stream}:{position}")).collect::<Vec<_>>());

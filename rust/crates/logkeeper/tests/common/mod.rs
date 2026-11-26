@@ -2,7 +2,7 @@
 
 use bytes::Bytes;
 use prost::Message;
-use rtdb_logkeeper::{ServerOptions, StreamConfig, serve};
+use rtdb_logkeeper::{JournalEndpoint, PreparedJournal, ServerOptions, StreamConfig};
 use rtdb_storage::log::{Log, LogMetadata};
 use rtdb_types::Timestamp;
 use std::net::SocketAddr;
@@ -34,7 +34,11 @@ impl Server {
         let address = listener.local_addr().unwrap();
         let cancellation = CancellationToken::new();
         let options = ServerOptions { data_dir: data_dir.to_path_buf(), fsync, cache_bytes };
-        let task = tokio::spawn(serve(listener, options, cancellation.clone()));
+        // Opening before returning means the journal's JOURNAL_ID exists by the time a test reads it.
+        let task = match PreparedJournal::open(options).await {
+            Ok(journal) => tokio::spawn(journal.serve(listener, cancellation.clone())),
+            Err(error) => tokio::spawn(async move { Err(error) }),
+        };
         Self { address, data_dir: data_dir.to_path_buf(), cancellation, task }
     }
 
@@ -66,6 +70,16 @@ impl Ensemble {
 
     pub fn config_of(&self, servers: &[usize], stream: &str) -> StreamConfig {
         StreamConfig { servers: servers.iter().map(|&server| self.addresses[server].to_string().into()).collect(), stream: stream.into(), write_quorum: 1, maximum_message_bytes: 1024 }
+    }
+
+    pub fn journal(&self, server: usize) -> String {
+        std::fs::read_to_string(self.directories[server].path().join("JOURNAL_ID")).unwrap()
+    }
+
+    /// Names each journal by its identity, so the ensemble stays the same one whichever route reaches it.
+    pub fn members(&self, routes: &[(usize, SocketAddr)], stream: &str) -> StreamConfig {
+        let servers = routes.iter().map(|&(server, address)| JournalEndpoint::Member { address: address.to_string(), journal: self.journal(server) }).collect();
+        StreamConfig { servers, stream: stream.into(), write_quorum: 2, maximum_message_bytes: 1024 }
     }
 
     pub async fn stop(&mut self, server: usize) { self.servers[server].take().unwrap().stop().await; }
@@ -235,6 +249,7 @@ impl CountingProxy {
     pub fn appends(&self) -> usize { self.appends.load(std::sync::atomic::Ordering::SeqCst) }
     pub fn commits(&self) -> usize { self.commits.load(std::sync::atomic::Ordering::SeqCst) }
     pub fn drop_commits(&self) { self.drop_commits.store(true, std::sync::atomic::Ordering::SeqCst); }
+    pub fn pass_commits(&self) { self.drop_commits.store(false, std::sync::atomic::Ordering::SeqCst); }
     pub fn drop_appends(&self) { self.drop_appends.store(true, std::sync::atomic::Ordering::SeqCst); }
     pub fn accepted_commits(&self) -> usize { self.accepted_commits.load(std::sync::atomic::Ordering::SeqCst) }
     pub fn accepted_appends(&self) -> usize { self.accepted_appends.load(std::sync::atomic::Ordering::SeqCst) }
