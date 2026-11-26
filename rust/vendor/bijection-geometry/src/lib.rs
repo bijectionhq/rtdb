@@ -46,6 +46,7 @@ pub const TOLERANCE: f64 = bounds::GEOMETRY_TOLERANCE_DEGREES;
 pub mod predicates;
 pub mod space;
 pub mod spatial_tree;
+mod sphere;
 mod standardize;
 mod topology;
 pub use space::{
@@ -1238,8 +1239,10 @@ impl Admission<'_, '_> {
         }
         let refused = || {
             invalid(match (&self.space.frame, &self.space.dimensions) {
-                (CoordinateFrame::Wgs84, Dimensions::Xy) => "expected WGS84 longitude/latitude",
-                (CoordinateFrame::Wgs84, Dimensions::Xyz { .. }) => {
+                (CoordinateFrame::Wgs84 | CoordinateFrame::Wgs84Sphere { .. }, Dimensions::Xy) => {
+                    "expected WGS84 longitude/latitude"
+                },
+                (CoordinateFrame::Wgs84 | CoordinateFrame::Wgs84Sphere { .. }, Dimensions::Xyz { .. }) => {
                     "expected WGS84 longitude/latitude and height"
                 },
                 (CoordinateFrame::Cartesian { .. }, Dimensions::Xy) => {
@@ -1256,7 +1259,7 @@ impl Admission<'_, '_> {
         }
         let mut next = || items.next().and_then(ValueView::number).ok_or_else(refused);
         let (x, y) = (next()?, next()?);
-        if self.space.frame == CoordinateFrame::Wgs84 && (x.abs() > 180.0 || y.abs() > 90.0) {
+        if self.space.frame.is_geographic() && (x.abs() > 180.0 || y.abs() > 90.0) {
             return Err(refused());
         }
         if let Some(heights) = &mut self.heights {
@@ -1360,7 +1363,7 @@ impl Admission<'_, '_> {
             positions.push(ps);
             rings.push(ring);
         }
-        let geographic = self.space.frame == CoordinateFrame::Wgs84;
+        let geographic = self.space.frame.is_geographic();
         if let Some(defect) = topology::polygon_defect(geographic, &rings, self.work)? {
             return Err(invalid(defect));
         }
@@ -1507,7 +1510,7 @@ fn admit_coordinates_nested<'a>(
                 .collect::<Result<Vec<_>, GeometryRefusal>>()?
                 .into_iter()
                 .unzip();
-            let geographic = space.frame == CoordinateFrame::Wgs84;
+            let geographic = space.frame.is_geographic();
             // Parts may touch at isolated points, never overlap or share an
             // edge, except the two sides of a cut at the antimeridian (+180
             // in one part, -180 in the other).

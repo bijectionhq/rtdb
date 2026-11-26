@@ -341,7 +341,7 @@ impl PackedEdges {
             .collect();
         let tree = PackedBoxes::new(&boxes, work)?;
         let past_seam =
-            *frame == crate::CoordinateFrame::Wgs84 && boxes.iter().any(|b| b[2] > 180.0);
+            frame.is_geographic() && boxes.iter().any(|b| b[2] > 180.0);
         Ok(Self {
             edges,
             tree,
@@ -366,7 +366,7 @@ impl PackedEdges {
         bbox: [f64; 4],
         work: &mut GeometryWork,
     ) -> Result<Vec<(crate::Pos, crate::Pos)>, GeometryRefusal> {
-        let geographic = self.frame == crate::CoordinateFrame::Wgs84;
+        let geographic = self.frame.is_geographic();
         let mut queries = crate::arcs::turns(geographic, bbox);
         // The query's own images cover a query that passes the seam; an
         // edge box that passes 180 meets a query west of the seam only at

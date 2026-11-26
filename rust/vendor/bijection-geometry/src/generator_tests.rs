@@ -225,3 +225,156 @@ fn realize_recasts_through_a_chart() {
     assert_eq!(dense["value"]["deviation_m"], json!(0.0), "{dense}");
     assert!(realize(json!({"kind":"densify","of":value(square(0., 0.)),"segments":"coordinate_linear"}), 1.0, "nearest").get("refusal").is_some());
 }
+
+fn sphere() -> serde_json::Value {
+    json!({"frame":{"kind":"wgs84_sphere","radius_m":6_371_008.8},"dimensions":{"kind":"xy"},"segments":"great_circle",
+        "numerics":{"topology":"binary64_exact","distance_absolute_m":0.001,"distance_relative":1e-7}})
+}
+
+#[test]
+fn a_sphere_space_measures_on_its_sphere_and_relates_as_wgs84() {
+    let r = 6_371_008.8_f64;
+    // Topology: the great circle is WGS84's great elliptic curve.
+    assert_eq!(relate_in(sphere(), square(0., 0.), square(0.5, 0.5)), relate(square(0., 0.), square(0.5, 0.5)));
+    // inverse and direct are the sphere's.
+    let inverse = invoke(json!({"operation":"inverse","space":sphere(),"from":[0.,0.],"to":[1.,0.]}))["value"].clone();
+    let distance = inverse["distance_m"].as_f64().unwrap_or_else(|| panic!("{inverse}"));
+    assert!((distance - r * 1f64.to_radians()).abs() < 1e-6, "{inverse}");
+    assert!((inverse["azimuth_from_degrees"].as_f64().unwrap() - 90.).abs() < 1e-9);
+    assert_eq!(inverse["area_under_m2"], json!(0.0));
+    let up = invoke(json!({"operation":"inverse","space":sphere(),"from":[0.,0.],"to":[90.,90.]}))["value"].clone();
+    // From the equator to the pole: a quarter meridian, and the area under
+    // it is that of the zone up to the pole along no longitude.
+    assert!((up["distance_m"].as_f64().unwrap() - r * std::f64::consts::FRAC_PI_2).abs() < 1e-6, "{up}");
+    let direct = invoke(json!({"operation":"direct","space":sphere(),"from":[0.,0.],"azimuth_degrees":90.,"distance_m":distance}))["value"].clone();
+    assert!((direct[0].as_f64().unwrap() - 1.).abs() < 1e-12 && direct[1].as_f64().unwrap().abs() < 1e-12, "{direct}");
+    // Areas are spherical excess: an octant is an eighth of the sphere.
+    let space: crate::GeometrySpace = serde_json::from_value(sphere()).unwrap();
+    let octant = crate::admit_geometry(
+        &crate::Gv::from(&json!({"type":"Polygon","coordinates":[[[0.,0.],[90.,0.],[0.,90.],[0.,0.]]]})),
+        &space,
+        &crate::STANDARD,
+    )
+    .unwrap();
+    let area = crate::measure::measure(&octant, crate::measure::Measurement::Area, &mut crate::GeometryWork::default()).unwrap();
+    assert!((area / (4.0 * std::f64::consts::PI * r * r / 8.0) - 1.0).abs() < 1e-12, "{area}");
+    let perimeter = crate::measure::measure(&octant, crate::measure::Measurement::Perimeter, &mut crate::GeometryWork::default()).unwrap();
+    assert!((perimeter - 3.0 * r * std::f64::consts::FRAC_PI_2).abs() < 1e-6, "{perimeter}");
+    // sep reads the sphere's metric.
+    let apart = invoke(json!({"operation":"sep","space":sphere(),
+        "left":value(json!({"type":"Point","coordinates":[0.,0.]})),"right":value(json!({"type":"Point","coordinates":[0.,1.]}))}))["value"].clone();
+    assert!((apart["distance_m"].as_f64().unwrap() - r * 1f64.to_radians()).abs() < 1e-6, "{apart}");
+    assert_eq!(apart["deviation_m"], json!(0.0));
+    // A point to an edge's middle: the arc's nearest point, not a vertex.
+    let off = invoke(json!({"operation":"sep","space":sphere(),
+        "left":value(json!({"type":"Point","coordinates":[0.5,1.]})),
+        "right":value(json!({"type":"LineString","coordinates":[[0.,0.],[1.,0.]]}))}))["value"].clone();
+    assert!((off["distance_m"].as_f64().unwrap() - r * 1f64.to_radians()).abs() < 1e-3, "{off}");
+    // A buffer is the sphere's disc.
+    let disc = realize_in(sphere(), json!({"kind":"buffer","of":value(json!({"type":"Point","coordinates":[10.,20.]})),"metres":1000.0}), 1.0, "outer");
+    for p in disc["value"]["value"]["coordinates"][0].as_array().unwrap_or_else(|| panic!("{disc}")) {
+        let d = r * crate::sphere::angle([10., 20.], [p[0].as_f64().unwrap(), p[1].as_f64().unwrap()]);
+        assert!((1000.0..=1001.0).contains(&d), "{d}");
+    }
+}
+
+#[test]
+fn recast_joins_wgs84_and_its_sphere_exactly() {
+    let term = json!({"kind":"recast","of":value(square(0., 0.)),"target":sphere(),"via":null});
+    let answer = realize(term, 0.0, "outer");
+    assert_eq!(answer["value"]["deviation_m"], json!(0.0), "{answer}");
+    assert_eq!(relate_in(sphere(), answer["value"]["value"].clone(), square(0., 0.)), json!("2FFF1FFF2"), "{answer}");
+    // And back, into WGS84 from the sphere.
+    let back = realize_in(sphere(), json!({"kind":"recast","of":value(square(0., 0.)),"target":space(),"via":null}), 0.0, "inner");
+    assert_eq!(back["value"]["deviation_m"], json!(0.0), "{back}");
+    // A change of edge model is a change of frame: densify refuses it.
+    let dense = realize(json!({"kind":"densify","of":value(square(0., 0.)),"segments":"great_circle"}), 1.0, "nearest");
+    assert_eq!(dense["refusal"]["code"], json!("UnsupportedCoordinateSpace"), "{dense}");
+    let own = realize_in(sphere(), json!({"kind":"densify","of":value(square(0., 0.)),"segments":"great_circle"}), 0.0, "outer");
+    assert_eq!(own["value"]["deviation_m"], json!(0.0), "{own}");
+    // A sphere value reaches a projected frame through a chart.
+    let utm = json!({"frame":{"kind":"cartesian","name":"utm-31n","unit":{"metres_per_unit":1.0}},"dimensions":{"kind":"xy"},
+        "segments":"coordinate_linear","numerics":{"topology":"binary64_exact","distance_absolute_m":0.001,"distance_relative":1e-7}});
+    let projected = realize_in(sphere(), json!({"kind":"recast","of":value(square(2., 45.)),"target":utm,"via":{"kind":"utm","zone":31,"hemisphere":"north"}}), 0.5, "nearest");
+    assert!(projected["value"]["deviation_m"].as_f64().is_some_and(|d| d > 0.0 && d <= 0.5), "{projected}");
+}
+
+#[test]
+fn relate_and_sep_read_terms_that_create_coordinates() {
+    let overlap = json!({"kind":"intersection","left":value(square(0., 0.)),"right":value(square(0.5, 0.5))});
+    let realized = realize(overlap.clone(), 1.0, "nearest");
+    let deviation = realized["value"]["deviation_m"].as_f64().unwrap_or_else(|| panic!("{realized}"));
+    let relate_term = |term: &serde_json::Value, other: serde_json::Value| {
+        invoke(json!({"operation":"relate","space":space(),"left":term,"right":value(other)}))
+    };
+    // Far from the crossings, the realization's matrix is the term's.
+    let inside = relate_term(&overlap, json!({"type":"Point","coordinates":[0.75,0.75]}));
+    assert_eq!(inside["value"], json!("0F2FF1FF2"), "{inside}");
+    let far = relate_term(&overlap, json!({"type":"Point","coordinates":[5.,5.]}));
+    assert_eq!(far["value"], json!("FF2FF10F2"), "{far}");
+    let neighbour = relate_term(&overlap, square(3., 3.));
+    assert_eq!(neighbour["value"], json!("FF2FF1212"), "{neighbour}");
+    if deviation > 0.0 {
+        // At a crossing, the rounding could change the answer: refused.
+        let crossing = realized["value"]["value"]["coordinates"][0]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p[0] == json!(1.0) && p[1] != json!(1.0) || p[1] == json!(1.0) && p[0] != json!(1.0))
+            .cloned();
+        if let Some(c) = crossing {
+            let near = relate_term(&overlap, json!({"type":"Point","coordinates":c}));
+            assert!(near.get("refusal").is_some(), "{near}");
+        }
+    }
+    // sep reads the realization and reports its bound.
+    let apart = invoke(json!({"operation":"sep","space":space(),"left":overlap,"right":value(json!({"type":"Point","coordinates":[3.,0.75]}))}))["value"].clone();
+    assert_eq!(apart["deviation_m"].as_f64(), Some(deviation), "{apart}");
+    assert!(apart["distance_m"].as_f64().is_some_and(|d| d > 200_000.0), "{apart}");
+    // A buffer: decided away from its boundary, refused next to it.
+    let point = json!({"type":"Point","coordinates":[10.,20.]});
+    let buffer = json!({"kind":"buffer","of":value(point),"metres":1000.0});
+    let east = |metres: f64| {
+        let to = crate::geodesy::direct(20., 10., 90., metres);
+        json!({"type":"Point","coordinates":[to.lon2, to.lat2]})
+    };
+    assert_eq!(relate_term(&buffer, east(500.))["value"], json!("0F2FF1FF2"));
+    assert_eq!(relate_term(&buffer, east(1500.))["value"], json!("FF2FF10F2"));
+    assert!(relate_term(&buffer, east(1000.)).get("refusal").is_some());
+    let reach = invoke(json!({"operation":"sep","space":space(),"left":buffer,"right":value(east(1500.))}))["value"].clone();
+    assert!(reach["distance_m"].as_f64().is_some_and(|d| (d - 500.0).abs() < 5e-3), "{reach}");
+    assert!(reach["deviation_m"].as_f64().is_some_and(|d| d > 0.0 && d <= 4e-3), "{reach}");
+}
+
+#[test]
+fn overlays_turn_around_a_pole() {
+    // A cap north of 80°, cut along the antimeridian, and one north of 85°.
+    let cap = |lat: f64| {
+        json!({"type":"Polygon","coordinates":[[[-180.,lat],[-90.,lat],[0.,lat],[90.,lat],[180.,lat],[180.,90.],[-180.,90.],[-180.,lat]]]})
+    };
+    let notch = json!({"type":"Polygon","coordinates":[[[-10.,70.],[10.,70.],[10.,85.],[-10.,85.],[-10.,70.]]]});
+    // The cap less a notch: one ring around the pole.
+    let less = realize(json!({"kind":"difference","left":value(cap(80.)),"right":value(notch.clone())}), 1.0, "nearest");
+    let ring = less["value"]["value"].clone();
+    assert_eq!(ring["type"], json!("Polygon"), "{less}");
+    let at = |lon: f64, lat: f64| json!({"type":"Point","coordinates":[lon, lat]});
+    assert_eq!(relate(ring.clone(), at(100., 85.)), json!("0F2FF1FF2"), "{ring}");
+    assert_eq!(relate(ring.clone(), at(0., 90.)), json!("0F2FF1FF2"), "{ring}");
+    assert_eq!(relate(ring.clone(), at(0., 82.)), json!("FF2FF10F2"), "{ring}");
+    // Nested caps: the inner one, with no new coordinate, and an annulus.
+    let inner = realize(json!({"kind":"intersection","left":value(cap(80.)),"right":value(cap(85.))}), 0.0, "outer");
+    assert_eq!(relate(inner["value"]["value"].clone(), cap(85.)), json!("2FFF1FFF2"), "{inner}");
+    let annulus = realize(json!({"kind":"difference","left":value(cap(80.)),"right":value(cap(85.))}), 0.0, "inner");
+    let band = annulus["value"]["value"].clone();
+    assert_eq!(band["coordinates"].as_array().map(Vec::len), Some(2), "{annulus}");
+    assert_eq!(relate(band.clone(), at(0., 82.)), json!("0F2FF1FF2"), "{band}");
+    assert_eq!(relate(band, at(0., 88.)), json!("FF2FF10F2"));
+    // A ring that turns at the pole between two longitudes.
+    let lens = json!({"type":"Polygon","coordinates":[[[-90.,80.],[0.,80.],[90.,80.],[90.,90.],[-90.,90.],[-90.,80.]]]});
+    let clipped = realize(json!({"kind":"intersection","left":value(lens),"right":value(notch)}), 1.0, "nearest");
+    assert!(clipped.get("value").is_some(), "{clipped}");
+    assert_eq!(relate(clipped["value"]["value"].clone(), at(0., 82.)).as_str().map(|m| &m[..1]), Some("0"), "{clipped}");
+    // A buffer around the pole.
+    let polar = realize(json!({"kind":"buffer","of":value(at(0., 89.99)),"metres":5000.0}), 1.0, "outer");
+    assert_eq!(relate(polar["value"]["value"].clone(), at(0., 90.)), json!("0F2FF1FF2"), "{polar}");
+}

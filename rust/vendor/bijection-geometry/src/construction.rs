@@ -126,11 +126,14 @@ pub fn bounding_cap(
     value: &Geometry,
     work: &mut GeometryWork,
 ) -> Result<BoundingCap, GeometryRefusal> {
-    if value.space.frame != crate::CoordinateFrame::Wgs84 || !value.space.is_ground() {
+    if !value.space.frame.is_geographic() || !value.space.is_ground() {
         return Err(crate::invalid(
-            "A bounding cap requires WGS84 ground coordinates",
+            "A bounding cap requires WGS84 or sphere ground coordinates",
         ));
     }
+    // A sphere frame's cap lives on its own sphere, where caps smaller than
+    // a hemisphere hold the great-circle arcs between their positions.
+    let sphere = value.space.frame.sphere_radius_m();
     work.allocate(value.position_count().saturating_mul(48))?;
     let mut keyed = Vec::new();
     let mut index = 0u32;
@@ -138,7 +141,10 @@ pub fn bounding_cap(
         index = index.wrapping_add(1);
         keyed.push((
             index.wrapping_mul(0x9e37_79b1),
-            crate::arcs::unit(crate::arcs::direction(*p)),
+            match sphere {
+                Some(_) => crate::sphere::unit(*p),
+                None => crate::arcs::unit(crate::arcs::direction(*p)),
+            },
         ));
     });
     work.charge(keyed.len().saturating_mul(4))?;
@@ -213,11 +219,17 @@ pub fn bounding_cap(
             libm::atan2(dot(&c, &c).sqrt(), dot(p, &cap.0))
         })
         .fold(0.0, f64::max);
-    let centre = crate::arcs::position(cap.0);
+    let centre = match sphere {
+        Some(_) => [
+            libm::atan2(cap.0[1], cap.0[0]).to_degrees(),
+            libm::atan2(cap.0[2], libm::hypot(cap.0[0], cap.0[1])).to_degrees(),
+        ],
+        None => crate::arcs::position(cap.0),
+    };
     if angle >= std::f64::consts::FRAC_PI_2 * 0.99 {
         return Ok(BoundingCap::Extent);
     }
-    let reach = geodesy::SEMI_MAJOR_AXIS_METRES * angle;
+    let reach = sphere.unwrap_or(geodesy::SEMI_MAJOR_AXIS_METRES) * angle;
     Ok(if reach > 0.0 {
         BoundingCap::Cap {
             centre,

@@ -113,7 +113,7 @@ impl Shape {
         parts: Parts,
         work: &mut GeometryWork,
     ) -> Result<Self, GeometryRefusal> {
-        let geographic = *frame == CoordinateFrame::Wgs84;
+        let geographic = frame.is_geographic();
         let mut edges = Vec::new();
         let mut rings = Vec::new();
         let mut polygons = Vec::new();
@@ -203,11 +203,6 @@ impl Shape {
 
     pub(crate) fn has_areas(&self) -> bool {
         !self.polygons.is_empty()
-    }
-
-    /// Whether a ring turns around a pole between two of its longitudes.
-    pub(crate) fn has_pole_turns(&self) -> bool {
-        !self.pole_turns.is_empty()
     }
 
     /// The polygon an edge bounds, if any.
@@ -434,7 +429,7 @@ fn collect(
         }
         return Ok(());
     }
-    let geographic = *frame == CoordinateFrame::Wgs84;
+    let geographic = frame.is_geographic();
     work.allocate(
         value
             .position_count()
@@ -541,7 +536,7 @@ pub(crate) fn antipodal_edge(
     b: Pos,
     work: &mut GeometryWork,
 ) -> Result<bool, GeometryRefusal> {
-    if *frame != CoordinateFrame::Wgs84 {
+    if !frame.is_geographic() {
         return Ok(false);
     }
     arcs::antipodal_vertices(arcs::embed(frame, a), arcs::embed(frame, b), work)

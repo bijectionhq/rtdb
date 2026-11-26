@@ -119,19 +119,32 @@ fn turn(p: Pos, q: Pos) -> f64 {
     }
 }
 
-/// The integral of the authalic zone area along the great elliptic arc p-q
-/// against longitude, in square metres, and its longitude turn in degrees.
-/// An arc from or to a pole runs along a meridian; an arc over a pole is two
-/// meridians joined by a half turn there.
-fn arc_zone(p: Pos, q: Pos, work: &mut GeometryWork) -> Result<(f64, f64), GeometryRefusal> {
+/// The zone area between the equator and latitude `phi` (radians) per
+/// radian of longitude, in square metres: authalic on WGS84, R² sin φ on a
+/// sphere frame.
+pub(crate) fn zone_per_radian(frame: &CoordinateFrame, phi: f64) -> f64 {
+    match frame.sphere_radius_m() {
+        Some(radius) => radius * radius * libm::sin(phi),
+        None => geodesy::zone_area_per_radian(phi),
+    }
+}
+
+/// The area of a geographic frame's whole surface, in square metres.
+pub(crate) fn surface_area(frame: &CoordinateFrame) -> f64 {
+    4.0 * std::f64::consts::PI * zone_per_radian(frame, std::f64::consts::FRAC_PI_2)
+}
+
+/// The integral of the zone area along the arc p-q against longitude, in
+/// square metres, and its longitude turn in degrees. The great elliptic and
+/// great-circle edges are one longitude/latitude curve, so only the zone
+/// area differs between the frames. An arc from or to a pole runs along a
+/// meridian; an arc over a pole is two meridians joined by a half turn there.
+pub(crate) fn arc_zone(frame: &CoordinateFrame, p: Pos, q: Pos, work: &mut GeometryWork) -> Result<(f64, f64), GeometryRefusal> {
     work.charge(1)?;
     if p[1].abs() == 90.0 && p[1] == q[1] {
         // Two longitudes of one pole: the boundary turns there.
         let d = turn(p, q);
-        return Ok((
-            geodesy::zone_area_per_radian(p[1].to_radians()) * d.to_radians(),
-            d,
-        ));
+        return Ok((zone_per_radian(frame, p[1].to_radians()) * d.to_radians(), d));
     }
     if p[1].abs() == 90.0 || q[1].abs() == 90.0 {
         return Ok((0.0, 0.0));
@@ -146,10 +159,7 @@ fn arc_zone(p: Pos, q: Pos, work: &mut GeometryWork) -> Result<(f64, f64), Geome
         } else {
             -90.0
         };
-        return Ok((
-            geodesy::zone_area_per_radian(pole.to_radians()) * std::f64::consts::PI,
-            d,
-        ));
+        return Ok((zone_per_radian(frame, pole.to_radians()) * std::f64::consts::PI, d));
     }
     // On the auxiliary sphere the arc's plane, normal n, gives
     // tan β = −(n_x cos λ + n_y sin λ) / n_z along it; tan φ = tan β / (1 − f).
@@ -171,16 +181,12 @@ fn arc_zone(p: Pos, q: Pos, work: &mut GeometryWork) -> Result<(f64, f64), Geome
         work,
         |lambda| {
             let tan_beta = -(n[0] * libm::cos(lambda) + n[1] * libm::sin(lambda)) / n[2];
-            geodesy::zone_area_per_radian(libm::atan(tan_beta / (1.0 - geodesy::FLATTENING)))
+            zone_per_radian(frame, libm::atan(tan_beta / (1.0 - geodesy::FLATTENING)))
         },
     )?;
     Ok((zone, d))
 }
 
-/// The area of the whole ellipsoid, in square metres.
-pub(crate) fn ellipsoid_area() -> f64 {
-    4.0 * std::f64::consts::PI * geodesy::zone_area_per_radian(std::f64::consts::FRAC_PI_2)
-}
 
 pub(crate) fn edge_length(
     p: Pos,
@@ -194,6 +200,8 @@ pub(crate) fn edge_length(
             libm::hypot(q[0] - p[0], q[1] - p[1]) * unit.metres_per_unit.get()
         },
         CoordinateFrame::Wgs84 => arc_length(p, q, work)?,
+        // A great-circle edge is the sphere's geodesic.
+        CoordinateFrame::Wgs84Sphere { radius_m } => radius_m.get() * crate::sphere::angle(p, q),
     })
 }
 
@@ -217,7 +225,7 @@ pub(crate) fn ring_area(
                 .sum();
             area / 2.0 * unit.metres_per_unit.get() * unit.metres_per_unit.get()
         },
-        CoordinateFrame::Wgs84 => {
+        frame @ (CoordinateFrame::Wgs84 | CoordinateFrame::Wgs84Sphere { .. }) => {
             // Each arc sweeps the authalic zone between the equator and its
             // path. The result is the area left of the ring up to a multiple
             // of the ellipsoid's, which callers reduce: a ring around a pole
@@ -226,7 +234,7 @@ pub(crate) fn ring_area(
             let mut zone = 0.0;
             let mut turned = 0.0;
             for edge in ring.windows(2) {
-                let (swept, turn_degrees) = arc_zone(edge[0], edge[1], work)?;
+                let (swept, turn_degrees) = arc_zone(frame, edge[0], edge[1], work)?;
                 zone += swept;
                 turned += turn_degrees;
             }
@@ -238,13 +246,12 @@ pub(crate) fn ring_area(
                     if vertex[1].abs() == 90.0 && before[1].abs() != 90.0 && after[1].abs() != 90.0
                     {
                         let d = turn(before, after);
-                        zone +=
-                            geodesy::zone_area_per_radian(vertex[1].to_radians()) * d.to_radians();
+                        zone += zone_per_radian(frame, vertex[1].to_radians()) * d.to_radians();
                         turned += d;
                     }
                 }
                 if (turned / 360.0).round() != 0.0 {
-                    zone -= ellipsoid_area() / 2.0;
+                    zone -= surface_area(frame) / 2.0;
                 }
             }
             -zone
@@ -266,7 +273,7 @@ pub fn measure(
     work.scoped(|work| {
         let mut west = false;
         let mut east = false;
-        if geometry.space.frame == CoordinateFrame::Wgs84 && measurement == Measurement::Perimeter {
+        if geometry.space.frame.is_geographic() && measurement == Measurement::Perimeter {
             work.charge(geometry.position_count())?;
             geometry.for_each(|point| {
                 west |= point[0] == -180.0;
@@ -297,7 +304,7 @@ pub fn measure(
                             piece.interior_left,
                             work,
                         )?,
-                        CoordinateFrame::Wgs84 => {
+                        CoordinateFrame::Wgs84 | CoordinateFrame::Wgs84Sphere { .. } => {
                             let value = ring_area(&[piece.start, piece.end], geometry, work)?;
                             sum += if piece.interior_left { value } else { -value };
                         },
@@ -314,7 +321,9 @@ pub fn measure(
                             * unit.metres_per_unit.get()
                             * unit.metres_per_unit.get();
                     },
-                    CoordinateFrame::Wgs84 => sum = sum.rem_euclid(ellipsoid_area()),
+                    frame @ (CoordinateFrame::Wgs84 | CoordinateFrame::Wgs84Sphere { .. }) => {
+                        sum = sum.rem_euclid(surface_area(frame))
+                    },
                 }
             }
             return finite(sum);
@@ -341,18 +350,18 @@ pub fn measure(
             Measurement::Area => {
                 // Outer rings run counterclockwise and holes clockwise, so the
                 // signed areas add up to the region's, modulo the ellipsoid.
-                let geographic = geometry.space.frame == CoordinateFrame::Wgs84;
+                let geographic = geometry.space.frame.is_geographic();
                 for polygon in geometry.polygons() {
                     let mut area = 0.0;
                     for ring in polygon {
                         area += ring_area(&crate::arcs::without_seam_cuts(geographic, ring), geometry, work)?;
                     }
-                    sum += area.rem_euclid(ellipsoid_area());
+                    sum += area.rem_euclid(surface_area(&geometry.space.frame));
                 }
             },
             Measurement::Length | Measurement::Perimeter => {
                 // A ring's cut along the antimeridian is interior, no perimeter.
-                let geographic = geometry.space.frame == CoordinateFrame::Wgs84;
+                let geographic = geometry.space.frame.is_geographic();
                 let lines: Vec<std::borrow::Cow<'_, [Pos]>> = if measurement == Measurement::Length {
                     geometry.lines().into_iter().map(|line| std::borrow::Cow::Borrowed(&line[..])).collect()
                 } else {
@@ -470,7 +479,7 @@ mod tests {
         let octant = polygon(&[[0.0, 0.0], [90.0, 0.0], [0.0, 90.0], [0.0, 0.0]])?;
         let area = measure(&octant, Measurement::Area, &mut work)?;
         assert!(
-            (area / (ellipsoid_area() / 8.0) - 1.0).abs() < 1e-12,
+            (area / (surface_area(&CoordinateFrame::Wgs84) / 8.0) - 1.0).abs() < 1e-12,
             "{area}"
         );
         let perimeter = measure(&octant, Measurement::Perimeter, &mut work)?;

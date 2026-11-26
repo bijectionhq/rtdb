@@ -7,7 +7,6 @@ use crate::{
         visit_boundary,
         BoundaryDomain,
     },
-    CoordinateFrame,
     Coords,
     Geometry,
     GeometryRefusal,
@@ -59,7 +58,7 @@ pub fn centroid(value: &Geometry, work: &mut GeometryWork) -> Result<Geometry, G
                 value.space.clone(),
             ));
         };
-        let spherical = value.space.frame == CoordinateFrame::Wgs84;
+        let spherical = value.space.frame.is_geographic();
         let mut moment = [0.0; 3];
         let mut mass = 0.0;
         if dimension == 0 {
@@ -203,6 +202,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::CoordinateFrame;
 
     #[test]
     fn centroid_uses_unique_highest_dimensional_support_and_preserves_space() -> anyhow::Result<()>

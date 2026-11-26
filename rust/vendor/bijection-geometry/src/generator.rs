@@ -3,11 +3,15 @@
 //! values in one declared space; the reply is `{ value, usage }` or
 //! `{ refusal, usage }`, as the `geometry` operation's.
 //!
-//! - `relate`: the exact DE-9IM matrix of two terms that realize exactly.
-//! - `inverse`: the geodesic inverse problem, with the area under the geodesic.
+//! - `relate`: the exact DE-9IM matrix of two terms. A term that creates
+//!   coordinates is read through its realization when the other operand
+//!   keeps clear of what it created by more than twice its bound
+//!   (`readable`), else refused.
+//! - `inverse`: the geodesic inverse problem, with the area under the
+//!   geodesic (the great circle on a sphere frame).
 //! - `direct`: the geodesic direct problem.
-//! - `sep`: the separation of two such terms (or a value's boundary) and a
-//!   witness pair attaining it.
+//! - `sep`: the separation of two terms (or a term's boundary) and a witness
+//!   pair attaining it, within the operands' summed bounds (`deviation_m`).
 //! - `chart`: positions through the closed chart table (UTM, UPS, cube face,
 //!   affine) and back.
 //! - `realize`: a term as an admitted value, with the Hausdorff bound it
@@ -33,7 +37,10 @@ use serde_json::Value;
 use crate::{
     binding::GeometryAllowance,
     offset::Side,
-    overlay::Overlay,
+    overlay::{
+        Created,
+        Overlay,
+    },
     CoordinateFrame,
     GeometryDeclaration,
     GeometryRefusal,
@@ -145,27 +152,105 @@ fn refused(message: impl std::fmt::Display) -> GeometryRefusal {
     crate::invalid(message)
 }
 
-fn wgs84(space: &GeometrySpace, operation: &str) -> Result<(), GeometryRefusal> {
+/// A space of longitude/latitude ground positions: WGS84, or a sphere frame.
+fn geographic(space: &GeometrySpace, operation: &str) -> Result<(), GeometryRefusal> {
     space.validate().map_err(crate::unsupported_space)?;
-    if space.frame != CoordinateFrame::Wgs84 || !space.is_ground() {
-        return Err(crate::unsupported_space(format!("{operation} is defined on WGS84 XY positions")));
+    if !space.frame.is_geographic() || !space.is_ground() {
+        return Err(crate::unsupported_space(format!("{operation} is defined on WGS84 or sphere XY positions")));
     }
     Ok(())
 }
 
-/// An operand of `relate` or `sep`: a value leaf, admitted in `space` at the
-/// large tier (generator operands are values a caller already admitted), or
-/// a term that realizes exactly (with no new coordinate).
-fn value_of(space: &GeometrySpace, term: &Term, work: &mut GeometryWork) -> Result<crate::Geometry, GeometryRefusal> {
-    let Term::Value { value } = term else {
-        let realized = realize_term(space, term, 0.0, Side::Nearest, work)?;
-        if realized.deviation_m > 0.0 {
-            return Err(refused("this term creates coordinates; realize it within a bound and relate its value"));
-        }
-        return Ok(realized.geometry);
-    };
+/// A value leaf, admitted in `space` at the large tier (generator operands
+/// are values a caller already admitted).
+fn leaf(space: &GeometrySpace, value: &Value, work: &mut GeometryWork) -> Result<crate::Geometry, GeometryRefusal> {
     let declaration = GeometryDeclaration::parse(space.clone(), "large").map_err(crate::unsupported_space)?;
     crate::admit_value_with_work(&Gv::from(value), &declaration, work)
+}
+
+/// The largest buffer distance in a term, in metres.
+fn widest_buffer(term: &Term) -> f64 {
+    match term {
+        Term::Value { .. } => 0.0,
+        Term::Buffer { of, metres } => metres.abs().max(widest_buffer(of)),
+        Term::Union { left, right } | Term::Intersection { left, right } | Term::Difference { left, right } => {
+            widest_buffer(left).max(widest_buffer(right))
+        },
+        Term::Boundary { of } | Term::Densify { of, .. } | Term::Recast { of, .. } => widest_buffer(of),
+    }
+}
+
+/// The bound `relate` and `sep` realize an operand term within: half the
+/// space's absolute distance band, so a separation read through it stays in
+/// its band, widened for a buffer to four millionths of its distance (a few
+/// thousand vertices a turn). Overlays and boundaries round by far less than
+/// either.
+fn operand_budget(space: &GeometrySpace, term: &Term) -> f64 {
+    (space.numerics.distance_absolute_m.get() / 2.0).max(4e-6 * widest_buffer(term))
+}
+
+/// An operand of `relate` or `sep`: a value leaf, or a term realized within
+/// `operand_budget` with what it created.
+fn operand(space: &GeometrySpace, term: &Term, work: &mut GeometryWork) -> Result<Realized, GeometryRefusal> {
+    realize_term(space, term, operand_budget(space, term), Side::Nearest, work)
+}
+
+/// The least distance from a value to created pieces, 0 when the value
+/// holds one of their ends.
+fn clearance(space: &GeometrySpace, value: &crate::Geometry, created: &[(Pos, Pos)], work: &mut GeometryWork) -> Result<f64, GeometryRefusal> {
+    let pieces = crate::predicates::segments(value);
+    let mut best = f64::INFINITY;
+    for &z in created {
+        let end = crate::Geometry::new(crate::Kind::Point, crate::Coords::Point(z.0), space.clone());
+        if !value.is_empty() && crate::predicates::covered_by(&end, value, work)? {
+            return Ok(0.0);
+        }
+        for &piece in &pieces {
+            work.charge(1)?;
+            best = best.min(crate::predicates::space_segment_distance(space, z, piece, best, work)?);
+        }
+    }
+    Ok(best)
+}
+
+/// The bound and side rule `relate` reads a rounded operand by. `own` is
+/// within δ of its exact term T, and the two are one set, with one interior,
+/// boundary and exterior, outside the 2δ neighbourhood of what `own` created
+/// (`Created`). When the other operand's exact set stays out of that
+/// neighbourhood (its realization is clear of the created pieces by more than
+/// 2δ, its own bound and the band), every cell the other's interior or
+/// boundary enters is the realization's; and the cells of its exterior are
+/// too, since next to each created piece both T and `own` have the same parts
+/// (interior, boundary and exterior) inside that neighbourhood, unless
+/// rounding collapsed a part of T, which is refused.
+fn readable(space: &GeometrySpace, own: &Realized, other: &Realized, work: &mut GeometryWork) -> Result<(), GeometryRefusal> {
+    if own.deviation_m == 0.0 {
+        return Ok(());
+    }
+    if own.created.collapsed {
+        return Err(refused(
+            "rounding collapses a part of this term, so relate cannot read it exactly; realize it within a bound and relate its value",
+        ));
+    }
+    let d = clearance(space, &other.geometry, &own.created.pieces, work)?;
+    let band = space.numerics.distance_absolute_m.get() + space.numerics.distance_relative.get() * d;
+    if d - band <= 2.0 * own.deviation_m + other.deviation_m {
+        return Err(refused(format!(
+            "the operands meet within {} m of a coordinate this term creates, so relate cannot read it exactly; realize it within a bound and relate its value",
+            2.0 * own.deviation_m + other.deviation_m
+        )));
+    }
+    Ok(())
+}
+
+/// `relate`: the exact DE-9IM matrix of two terms, read through their
+/// realizations under the bound and side rule (`readable`).
+fn relate(space: &GeometrySpace, left: &Term, right: &Term, work: &mut GeometryWork) -> Result<Value, GeometryRefusal> {
+    let a = operand(space, left, work)?;
+    let b = operand(space, right, work)?;
+    readable(space, &a, &b, work)?;
+    readable(space, &b, &a, work)?;
+    Ok(Value::String(crate::topology::relation::matrix(&a.geometry, &b.geometry, work)?))
 }
 
 /// The area under the geodesic of `inverse` from `from`, in square metres:
@@ -281,19 +366,20 @@ fn chart(chart: Chart, direction: Direction, positions: &[[f64; 2]], work: &mut 
     Ok(Value::Array(out))
 }
 
-/// One operand of `sep`: a value, or the boundary of one (the pieces of its
-/// areas' rings, else its lines' ends).
-fn sep_pieces(space: &GeometrySpace, term: &Term, work: &mut GeometryWork) -> Result<(crate::Geometry, Vec<(Pos, Pos)>, bool), GeometryRefusal> {
+/// One operand of `sep`: a term's realization, or the boundary of one (the
+/// pieces of its areas' rings, else its lines' ends), with the bound δ it
+/// realizes within.
+fn sep_pieces(space: &GeometrySpace, term: &Term, work: &mut GeometryWork) -> Result<(crate::Geometry, Vec<(Pos, Pos)>, bool, f64), GeometryRefusal> {
     match term {
         Term::Boundary { of } => {
-            let geometry = value_of(space, of, work)?;
-            let pieces = boundary_pieces(&geometry);
-            Ok((geometry, pieces, true))
+            let realized = operand(space, of, work)?;
+            let pieces = boundary_pieces(&realized.geometry);
+            Ok((realized.geometry, pieces, true, realized.deviation_m))
         },
         _ => {
-            let geometry = value_of(space, term, work)?;
-            let pieces = crate::predicates::segments(&geometry);
-            Ok((geometry, pieces, false))
+            let realized = operand(space, term, work)?;
+            let pieces = crate::predicates::segments(&realized.geometry);
+            Ok((realized.geometry, pieces, false, realized.deviation_m))
         },
     }
 }
@@ -316,8 +402,9 @@ fn boundary_pieces(geometry: &crate::Geometry) -> Vec<(Pos, Pos)> {
 }
 
 /// The position at parameter `t` of a kernel piece: along the great
-/// elliptic arc (the auxiliary sphere's great circle) in WGS84, the straight
-/// line in a Cartesian frame.
+/// elliptic arc (the auxiliary sphere's great circle) in WGS84 and the great
+/// circle of a sphere frame, which is the same curve, the straight line in a
+/// Cartesian frame.
 pub(crate) fn along(space: &GeometrySpace, piece: (Pos, Pos), t: f64) -> Pos {
     if t <= 0.0 || piece.0 == piece.1 {
         return piece.0;
@@ -326,7 +413,8 @@ pub(crate) fn along(space: &GeometrySpace, piece: (Pos, Pos), t: f64) -> Pos {
         return piece.1;
     }
     match space.frame {
-        CoordinateFrame::Wgs84 => {
+        // One longitude/latitude curve in both geographic frames.
+        CoordinateFrame::Wgs84 | CoordinateFrame::Wgs84Sphere { .. } => {
             let (a, b) = (crate::arcs::direction(piece.0), crate::arcs::direction(piece.1));
             let norm = |v: [f64; 3]| libm::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
             let (a, b) = (a.map(|x| x / norm(a)), b.map(|x| x / norm(b)));
@@ -381,13 +469,18 @@ fn witness(space: &GeometrySpace, a: (Pos, Pos), b: (Pos, Pos), work: &mut Geome
 }
 
 /// `sep`: the infimum of distance between two sets and a pair attaining it,
-/// or null when either is empty. Zero is decided by the exact topology.
+/// or null when either is empty. Zero is decided by the exact topology. A
+/// term that creates coordinates is read through its realization: the
+/// separation is 1-Lipschitz in Hausdorff distance, so the answer is within
+/// `deviation_m`, the operands' bounds summed (0 when both are exact), of
+/// the terms' separation, and the witnesses lie on the realizations.
 fn sep(space: &GeometrySpace, left: &Term, right: &Term, work: &mut GeometryWork) -> Result<Value, GeometryRefusal> {
-    let (a, a_pieces, a_boundary) = sep_pieces(space, left, work)?;
-    let (b, b_pieces, b_boundary) = sep_pieces(space, right, work)?;
+    let (a, a_pieces, a_boundary, a_deviation) = sep_pieces(space, left, work)?;
+    let (b, b_pieces, b_boundary, b_deviation) = sep_pieces(space, right, work)?;
     if a_pieces.is_empty() || b_pieces.is_empty() {
         return Ok(Value::Null);
     }
+    let deviation = a_deviation + b_deviation;
     if !a_boundary && !b_boundary && crate::predicates::intersects(&a, &b, work)? {
         // A shared position: a vertex of one the other covers, else the
         // closest pair of their pieces (which then meet).
@@ -395,7 +488,7 @@ fn sep(space: &GeometrySpace, left: &Term, right: &Term, work: &mut GeometryWork
             for piece in crate::predicates::segments(own) {
                 let point = crate::Geometry::new(crate::Kind::Point, crate::Coords::Point(piece.0), space.clone());
                 if crate::predicates::covered_by(&point, other, work)? {
-                    return Ok(serde_json::json!({ "distance_m": 0.0, "witness": [piece.0, piece.0] }));
+                    return Ok(serde_json::json!({ "distance_m": 0.0, "witness": [piece.0, piece.0], "deviation_m": deviation }));
                 }
             }
         }
@@ -415,29 +508,40 @@ fn sep(space: &GeometrySpace, left: &Term, right: &Term, work: &mut GeometryWork
         return Ok(Value::Null);
     };
     let (x, y, _) = witness(space, p, q, work)?;
-    Ok(serde_json::json!({ "distance_m": distance, "witness": [x, y] }))
+    Ok(serde_json::json!({ "distance_m": distance, "witness": [x, y], "deviation_m": deviation }))
 }
 
 /// A realized term: its admitted value (in the large tier until the reply
-/// admits it at the request's), the Hausdorff bound it meets and the sides
-/// it holds (both when exact; `nearest` always).
+/// admits it at the request's), the Hausdorff bound it meets, the sides it
+/// holds (both when exact; `nearest` always) and what it created.
 struct Realized {
     geometry: crate::Geometry,
     deviation_m: f64,
     outer: bool,
     inner: bool,
+    created: Created,
 }
 
 impl Realized {
     fn exact(geometry: crate::Geometry) -> Self {
-        Self { geometry, deviation_m: 0.0, outer: true, inner: true }
+        Self { geometry, deviation_m: 0.0, outer: true, inner: true, created: Created::default() }
     }
 
     /// A value rounded by `deviation_m`, which holds the nearest side only
     /// unless it is exact.
-    fn rounded(geometry: crate::Geometry, deviation_m: f64) -> Self {
+    fn rounded(geometry: crate::Geometry, deviation_m: f64, created: Created) -> Self {
         let exact = deviation_m == 0.0;
-        Self { geometry, deviation_m, outer: exact, inner: exact }
+        Self { geometry, deviation_m, outer: exact, inner: exact, created }
+    }
+
+    /// A re-expression rounded by `deviation_m`: every edge may move, so
+    /// every piece is created.
+    fn reexpressed(geometry: crate::Geometry, deviation_m: f64) -> Self {
+        let created = Created {
+            pieces: if deviation_m > 0.0 { crate::predicates::segments(&geometry) } else { Vec::new() },
+            collapsed: false,
+        };
+        Self::rounded(geometry, deviation_m, created)
     }
 
     fn holds(&self, side: Side) -> bool {
@@ -469,7 +573,8 @@ use crate::overlay::construct;
 /// 2 rule); areas' is the exposed boundary of their union, cut where edges
 /// cross (each crossing rounded to binary64) and joined into lines. A cut
 /// along the antimeridian is interior and no part of it.
-fn boundary(space: &GeometrySpace, geometry: &crate::Geometry, work: &mut GeometryWork) -> Result<(crate::Geometry, f64), GeometryRefusal> {
+fn boundary(space: &GeometrySpace, geometry: &crate::Geometry, work: &mut GeometryWork) -> Result<(crate::Geometry, f64, Created), GeometryRefusal> {
+    let mut created = Created::default();
     let empty = || serde_json::json!({ "type": "GeometryCollection", "geometries": [] });
     let key = |p: Pos| crate::arcs::embed(&space.frame, p).map(f64::to_bits);
     let value = match dimensions(geometry) {
@@ -499,7 +604,11 @@ fn boundary(space: &GeometrySpace, geometry: &crate::Geometry, work: &mut Geomet
             let mut chains: Vec<Vec<Pos>> = Vec::new();
             let mut rounding = 0.0_f64;
             crate::topology::visit_boundary(geometry, &[geometry], crate::topology::BoundaryDomain::Areas, work, &mut |piece, _| {
+                if piece.rounding_error_m > 0.0 {
+                    created.pieces.push((piece.start, piece.end));
+                }
                 if key(piece.start) == key(piece.end) {
+                    created.collapsed |= piece.rounding_error_m > 0.0;
                     return Ok(false);
                 }
                 rounding = rounding.max(piece.rounding_error_m);
@@ -517,7 +626,7 @@ fn boundary(space: &GeometrySpace, geometry: &crate::Geometry, work: &mut Geomet
         },
         _ => return Err(refused("realize: boundary takes points, lines or areas, not a mix of dimensions")),
     };
-    Ok((construct(space, value.0, work)?, value.1))
+    Ok((construct(space, value.0, work)?, value.1, created))
 }
 
 /// The space a realized term lands in: its operands' space, except a
@@ -549,7 +658,7 @@ fn exact_operand(realized: &Realized, what: &str) -> Result<(), GeometryRefusal>
 fn chart_position(c: Chart, direction: Direction, source: &GeometrySpace, target: &GeometrySpace, p: Pos, work: &mut GeometryWork) -> Result<Pos, GeometryRefusal> {
     let metres = |space: &GeometrySpace| match &space.frame {
         CoordinateFrame::Cartesian { unit, .. } => unit.metres_per_unit.get(),
-        CoordinateFrame::Wgs84 => 1.0,
+        CoordinateFrame::Wgs84 | CoordinateFrame::Wgs84Sphere { .. } => 1.0,
     };
     let projected = matches!(c, Chart::Utm { .. } | Chart::Ups { .. });
     let input = if projected && direction == Direction::Inverse { p.map(|x| x * metres(source)) } else { p };
@@ -569,19 +678,27 @@ fn recast(source: &GeometrySpace, target: &GeometrySpace, via: Option<&Value>, o
         if source == target {
             return Ok((of.clone(), 0.0));
         }
+        if source.frame.is_geographic() && target.frame.is_geographic() {
+            // WGS84 and its sphere readings share coordinates and edge
+            // curves (`SegmentModel::GreatCircle`): the same positions name
+            // the same set, in the target's metric.
+            let mut geometry = of.clone();
+            geometry.space = target.clone();
+            return Ok((geometry, 0.0));
+        }
         if source.frame != target.frame {
             return Err(crate::unsupported_space("a recast between frames names a chart"));
         }
         return crate::offset::reexpress(source, target, of, &mut |p, _| Ok(p), budget, 0.0, work);
     };
     let c: Chart = serde_json::from_value(via.clone()).map_err(crate::invalid)?;
-    let geographic = |space: &GeometrySpace| space.frame == CoordinateFrame::Wgs84;
+    let geographic = |space: &GeometrySpace| space.frame.is_geographic();
     let direction = match (c, geographic(source), geographic(target)) {
         (Chart::Affine { .. }, false, false) => Direction::Forward,
         (Chart::Affine { .. }, ..) => return Err(crate::unsupported_space("an affine chart joins Cartesian frames")),
         (_, true, false) => Direction::Forward,
         (_, false, true) => Direction::Inverse,
-        _ => return Err(crate::unsupported_space("a UTM, UPS or cube chart joins WGS84 and a Cartesian frame")),
+        _ => return Err(crate::unsupported_space("a UTM, UPS or cube chart joins WGS84 (or a sphere reading of it) and a Cartesian frame")),
     };
     // The map's own error: the projection series, else binary64 rounding.
     let mut largest = 0.0_f64;
@@ -595,7 +712,7 @@ fn recast(source: &GeometrySpace, target: &GeometrySpace, via: Option<&Value>, o
     let numeric = match (&target.frame, c) {
         (_, Chart::Utm { .. } | Chart::Ups { .. }) => 1e-6,
         (CoordinateFrame::Cartesian { unit, .. }, _) => 4.0 * f64::EPSILON * largest.max(1.0) * unit.metres_per_unit.get(),
-        (CoordinateFrame::Wgs84, _) => 1e-6,
+        (CoordinateFrame::Wgs84 | CoordinateFrame::Wgs84Sphere { .. }, _) => 1e-6,
     };
     let deviation = deviation + numeric;
     if deviation > budget {
@@ -611,13 +728,21 @@ fn recast(source: &GeometrySpace, target: &GeometrySpace, via: Option<&Value>, o
 /// opposite side.
 fn realize_term(space: &GeometrySpace, term: &Term, budget: f64, side: Side, work: &mut GeometryWork) -> Result<Realized, GeometryRefusal> {
     match term {
-        Term::Value { .. } => Ok(Realized::exact(value_of(space, term, work)?)),
+        Term::Value { value } => Ok(Realized::exact(leaf(space, value, work)?)),
         Term::Union { left, right } => {
             // The union of sets within δ of two sets is within δ of theirs,
             // on the side both hold.
             let (a, b) = (realize_term(space, left, budget, side, work)?, realize_term(space, right, budget, side, work)?);
             let geometry = crate::union::reduce([a.geometry, b.geometry], &term_space(space, left)?, work)?;
-            Ok(Realized { geometry, deviation_m: a.deviation_m.max(b.deviation_m), outer: a.outer && b.outer, inner: a.inner && b.inner })
+            let mut created = a.created;
+            created.extend(b.created);
+            Ok(Realized {
+                geometry,
+                deviation_m: a.deviation_m.max(b.deviation_m),
+                outer: a.outer && b.outer,
+                inner: a.inner && b.inner,
+                created,
+            })
         },
         Term::Intersection { left, right } | Term::Difference { left, right } => {
             let operation = if matches!(term, Term::Intersection { .. }) { Overlay::Intersection } else { Overlay::Difference };
@@ -629,8 +754,8 @@ fn realize_term(space: &GeometrySpace, term: &Term, budget: f64, side: Side, wor
                 return Err(crate::unsupported_space("an overlay's operands are in one space"));
             }
             let target = a.geometry.space.clone();
-            let (value, deviation_m) = crate::overlay::overlay(&target, &a.geometry, &b.geometry, operation, work)?;
-            Ok(Realized::rounded(construct(&target, value, work)?, deviation_m))
+            let (value, deviation_m, created) = crate::overlay::overlay(&target, &a.geometry, &b.geometry, operation, work)?;
+            Ok(Realized::rounded(construct(&target, value, work)?, deviation_m, created))
         },
         Term::Boundary { of } => {
             let of = realize_term(space, of, budget, Side::Nearest, work)?;
@@ -639,34 +764,44 @@ fn realize_term(space: &GeometrySpace, term: &Term, budget: f64, side: Side, wor
                 return Err(refused("realize: the boundary of a rounded term has no bound from it; realize the term itself"));
             }
             let target = of.geometry.space.clone();
-            let (geometry, deviation_m) = boundary(&target, &of.geometry, work)?;
-            Ok(Realized::rounded(geometry, deviation_m))
+            let (geometry, deviation_m, created) = boundary(&target, &of.geometry, work)?;
+            Ok(Realized::rounded(geometry, deviation_m, created))
         },
         Term::Buffer { of, metres } => {
             // A buffer is 1-Lipschitz in Hausdorff distance and monotone, so
             // its operand's bound and side carry through it.
             let of = realize_term(space, of, budget, side, work)?;
             let target = of.geometry.space.clone();
-            let (geometry, own) = crate::offset::buffer(&target, &of.geometry, *metres, budget - of.deviation_m, side, work)?;
+            let (geometry, own, mut created) = crate::offset::buffer(&target, &of.geometry, *metres, budget - of.deviation_m, side, work)?;
             let curved = own > 0.0;
+            created.extend(of.created);
             Ok(Realized {
                 geometry,
                 deviation_m: of.deviation_m + own,
                 outer: of.outer && (!curved || side == Side::Outer),
                 inner: of.inner && (!curved || side == Side::Inner),
+                created,
             })
         },
         Term::Densify { of, .. } => {
             let target = term_space(space, term)?;
             let of = realize_term(space, of, budget, Side::Nearest, work)?;
             exact_operand(&of, "densification")?;
+            if target.frame.is_geographic() && target.validate().is_err() {
+                // Each geographic frame has one edge model, and both models
+                // name the same curve: a change of model is a change of
+                // frame, which `recast` makes exactly.
+                return Err(crate::unsupported_space(
+                    "great_elliptic edges belong to WGS84 and great_circle edges to a wgs84_sphere frame; recast between them",
+                ));
+            }
             target.validate().map_err(crate::unsupported_space)?;
             if target == of.geometry.space {
                 return Ok(of);
             }
             let source = of.geometry.space.clone();
             let (geometry, deviation_m) = crate::offset::reexpress(&source, &target, &of.geometry, &mut |p, _| Ok(p), budget, 0.0, work)?;
-            Ok(Realized::rounded(geometry, deviation_m))
+            Ok(Realized::reexpressed(geometry, deviation_m))
         },
         Term::Recast { of, via, .. } => {
             let target = term_space(space, term)?;
@@ -674,7 +809,7 @@ fn realize_term(space: &GeometrySpace, term: &Term, budget: f64, side: Side, wor
             exact_operand(&of, "recast")?;
             let source = of.geometry.space.clone();
             let (geometry, deviation_m) = recast(&source, &target, via.as_ref(), &of.geometry, budget, work)?;
-            Ok(Realized::rounded(geometry, deviation_m))
+            Ok(Realized::reexpressed(geometry, deviation_m))
         },
     }
 }
@@ -708,15 +843,25 @@ fn evaluate(request: GeneratorRequest, work: &mut GeometryWork) -> Result<Value,
     Ok(match request {
         GeneratorRequest::Relate { space, left, right, .. } => {
             space.validate().map_err(crate::unsupported_space)?;
-            let a = value_of(&space, &left, work)?;
-            let b = value_of(&space, &right, work)?;
-            Value::String(crate::topology::relation::matrix(&a, &b, work)?)
+            relate(&space, &left, &right, work)?
         },
         GeneratorRequest::Inverse { space, from, to, .. } => {
-            wgs84(&space, "inverse")?;
+            geographic(&space, "inverse")?;
             crate::trajectory::validate_position(from)?;
             crate::trajectory::validate_position(to)?;
             work.charge(1)?;
+            if let Some(radius) = space.frame.sphere_radius_m() {
+                // The sphere's geodesic is the great-circle edge, so the area
+                // under it is that edge's zone integral.
+                let (sigma, azi1, azi2) = crate::sphere::inverse(from, to);
+                let (area, _) = crate::measure::arc_zone(&space.frame, from, to, work)?;
+                return Ok(serde_json::json!({
+                    "distance_m": radius * sigma,
+                    "azimuth_from_degrees": azi1,
+                    "azimuth_to_degrees": azi2,
+                    "area_under_m2": area,
+                }));
+            }
             let solved = crate::geodesy::inverse(from[1], from[0], to[1], to[0]);
             let area = area_under(from, solved.azi1, solved.s12, work)?;
             serde_json::json!({
@@ -727,19 +872,23 @@ fn evaluate(request: GeneratorRequest, work: &mut GeometryWork) -> Result<Value,
             })
         },
         GeneratorRequest::Direct { space, from, azimuth_degrees, distance_m, .. } => {
-            wgs84(&space, "direct")?;
+            geographic(&space, "direct")?;
             crate::trajectory::validate_position(from)?;
             if !azimuth_degrees.is_finite() || !distance_m.is_finite() {
                 return Err(refused("an azimuth and a distance are finite numbers"));
             }
             work.charge(1)?;
+            if let Some(radius) = space.frame.sphere_radius_m() {
+                let (to, _) = crate::sphere::direct(from, azimuth_degrees, distance_m / radius);
+                return Ok(serde_json::json!(to));
+            }
             let to = crate::geodesy::direct(from[1], from[0], azimuth_degrees, distance_m);
             serde_json::json!([to.lon2, to.lat2])
         },
         GeneratorRequest::Chart { space, chart: c, direction, positions, .. } => {
             space.validate().map_err(crate::unsupported_space)?;
             if !matches!(c, Chart::Affine { .. }) {
-                wgs84(&space, "chart")?;
+                geographic(&space, "chart")?;
             }
             chart(c, direction, &positions, work)?
         },

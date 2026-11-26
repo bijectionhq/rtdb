@@ -159,7 +159,7 @@ pub(crate) fn standardize(
                 .saturating_add(count.saturating_mul(32))
                 .saturating_add(value.component_count().saturating_mul(256)),
         )?;
-        let planar = value.space.frame != crate::CoordinateFrame::Wgs84;
+        let planar = !value.space.frame.is_geographic();
         let mut input_heights = value.heights.take().map(Vec::into_iter);
         let mut output_heights = input_heights.as_ref().map(|_| Vec::with_capacity(count));
         value.coords = match value.coords {

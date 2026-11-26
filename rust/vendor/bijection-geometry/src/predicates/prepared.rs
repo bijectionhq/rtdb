@@ -570,7 +570,7 @@ mod tests {
                 &mut preparation,
             )?;
             // WGS84 directions separate longitudes down to about 1e-300 degrees.
-            let tiny = if space.frame == crate::CoordinateFrame::Wgs84 {
+            let tiny = if space.frame.is_geographic() {
                 1e-300
             } else {
                 f64::from_bits(1)

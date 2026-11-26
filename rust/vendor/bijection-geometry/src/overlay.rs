@@ -84,6 +84,25 @@ impl Piece {
     }
 }
 
+/// What a construction created beyond its operands' coordinates: each piece
+/// with a new coordinate, in the result's coordinates (a point as a piece
+/// from itself to itself), and whether rounding collapsed a part of the
+/// exact result. Outside a neighbourhood of these pieces of twice the bound,
+/// the exact result and its realization are one set, with one interior,
+/// boundary and exterior; `relate` reads a term through them.
+#[derive(Debug, Default)]
+pub(crate) struct Created {
+    pub pieces: Vec<(Pos, Pos)>,
+    pub collapsed: bool,
+}
+
+impl Created {
+    pub(crate) fn extend(&mut self, other: Created) {
+        self.pieces.extend(other.pieces);
+        self.collapsed |= other.collapsed;
+    }
+}
+
 fn refused(message: impl std::fmt::Display) -> GeometryRefusal {
     crate::invalid(format!("realize: {message}"))
 }
@@ -176,16 +195,14 @@ fn end(frame: &CoordinateFrame, cut: &(Point, Option<Pos>), work: &mut GeometryW
     }
 }
 
-/// The overlay of two admitted values in `space`: its value and the largest
-/// rounding of a coordinate it keeps, in metres.
-pub(crate) fn overlay(space: &GeometrySpace, a: &Geometry, b: &Geometry, operation: Overlay, work: &mut GeometryWork) -> Result<(Value, f64), GeometryRefusal> {
+/// The overlay of two admitted values in `space`: its value, the largest
+/// rounding of a coordinate it keeps, in metres, and what it created.
+pub(crate) fn overlay(space: &GeometrySpace, a: &Geometry, b: &Geometry, operation: Overlay, work: &mut GeometryWork) -> Result<(Value, f64, Created), GeometryRefusal> {
     work.scoped(|work| {
+        let mut created = Created::default();
         let frame = &space.frame;
         let all = Parts { areas: true, lines: true, points: true };
         let shapes = [Shape::new(frame, &[a], all, work)?, Shape::new(frame, &[b], all, work)?];
-        if shapes.iter().any(Shape::has_pole_turns) {
-            return Err(refused("an overlay of a ring turning around a pole is not supported; split it at the antimeridian"));
-        }
         let mut areas: Vec<Piece> = Vec::new();
         let mut lines: Vec<Piece> = Vec::new();
         // Points the result may hold beyond its pieces: point members, and
@@ -236,7 +253,13 @@ pub(crate) fn overlay(space: &GeometrySpace, a: &Geometry, b: &Geometry, operati
                     }
                     let (start, start_error_m) = end(frame, &pair[0], work)?;
                     let (finish, end_error_m) = end(frame, &pair[1], work)?;
+                    if start_error_m > 0.0 || end_error_m > 0.0 {
+                        work.allocate(std::mem::size_of::<(Pos, Pos)>())?;
+                        created.pieces.push((start, finish));
+                    }
                     if key(frame, start) == key(frame, finish) {
+                        // Distinct exact cuts that round to one vertex.
+                        created.collapsed = true;
                         continue;
                     }
                     work.allocate(std::mem::size_of::<Piece>())?;
@@ -252,8 +275,8 @@ pub(crate) fn overlay(space: &GeometrySpace, a: &Geometry, b: &Geometry, operati
             }
         }
         let mut deviation = 0.0_f64;
-        let rings = rings(frame, areas, &mut deviation, work)?;
-        let polygons = polygons(space, rings, work)?;
+        let rings = rings(frame, areas, &mut deviation, &mut created.collapsed, work)?;
+        let polygons = polygons(space, rings, &mut created.collapsed, work)?;
         let lines = chains(frame, lines, &mut deviation, work)?;
         // Loose points held by the result and reached by none of its parts.
         let mut reached: std::collections::BTreeSet<[u64; 3]> = std::collections::BTreeSet::new();
@@ -274,6 +297,9 @@ pub(crate) fn overlay(space: &GeometrySpace, a: &Geometry, b: &Geometry, operati
                 Overlay::Difference => member(&shapes[0], &cut.0, work)? && !member(&shapes[1], &cut.0, work)?,
             };
             if held {
+                if error > 0.0 {
+                    created.pieces.push((position, position));
+                }
                 points.push((position, error));
             }
         }
@@ -292,7 +318,7 @@ pub(crate) fn overlay(space: &GeometrySpace, a: &Geometry, b: &Geometry, operati
             deviation = deviation.max(*error);
         }
         let positions: Vec<Pos> = points.into_iter().map(|(p, _)| p).collect();
-        Ok((assemble(&polygons, &lines, &positions), deviation))
+        Ok((assemble(&polygons, &lines, &positions), deviation, created))
     })
 }
 
@@ -333,7 +359,7 @@ pub(crate) fn assemble(polygons: &[Vec<Vec<Pos>>], lines: &[Vec<Pos>], points: &
 /// keeps the order of directions around a point.
 fn heading(frame: &CoordinateFrame, from: Pos, to: Pos) -> f64 {
     match frame {
-        CoordinateFrame::Wgs84 => {
+        CoordinateFrame::Wgs84 | CoordinateFrame::Wgs84Sphere { .. } => {
             let unit = |v: [f64; 3]| {
                 let n = libm::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
                 v.map(|x| x / n)
@@ -359,9 +385,12 @@ fn heading(frame: &CoordinateFrame, from: Pos, to: Pos) -> f64 {
 /// vertex with several ways on, a ring takes the sharpest left turn, so
 /// regions meeting at a point stay separate rings. A vertex between two
 /// pieces of one operand edge is dropped (with its rounding); `deviation`
-/// rises to the largest rounding of a vertex kept.
-pub(crate) fn rings(frame: &CoordinateFrame, pieces: Vec<Piece>, deviation: &mut f64, work: &mut GeometryWork) -> Result<Vec<Vec<Pos>>, GeometryRefusal> {
+/// rises to the largest rounding of a vertex kept, and `collapsed` is set when
+/// a piece or ring rounds to nothing.
+pub(crate) fn rings(frame: &CoordinateFrame, pieces: Vec<Piece>, deviation: &mut f64, collapsed: &mut bool, work: &mut GeometryWork) -> Result<Vec<Vec<Pos>>, GeometryRefusal> {
+    let count = pieces.len();
     let pieces: Vec<Piece> = pieces.into_iter().filter(|p| key(frame, p.start) != key(frame, p.end)).collect();
+    *collapsed |= pieces.len() < count;
     work.charge(pieces.len().saturating_mul(4))?;
     work.allocate(pieces.len().saturating_mul(64))?;
     let mut outgoing: BTreeMap<[u64; 3], Vec<usize>> = BTreeMap::new();
@@ -434,6 +463,8 @@ pub(crate) fn rings(frame: &CoordinateFrame, pieces: Vec<Piece>, deviation: &mut
         }
         if ring.len() >= 4 {
             out.push(ring);
+        } else {
+            *collapsed = true;
         }
     }
     Ok(out)
@@ -466,10 +497,11 @@ fn chains(frame: &CoordinateFrame, pieces: Vec<Piece>, deviation: &mut f64, work
     Ok(out.into_iter().map(|(chain, ..)| chain).collect())
 }
 
-/// Twice the signed lon/lat (or x/y) area of a ring, and its longitude
-/// winding in turns: counterclockwise is positive.
+/// Twice the signed lon/lat (or x/y) area of a ring and its longitude
+/// winding in turns: counterclockwise is positive. Only picks which ring of a
+/// geographic polygon is written first; topology never reads it.
 fn orientation(frame: &CoordinateFrame, ring: &[Pos]) -> (f64, f64) {
-    let geographic = *frame == CoordinateFrame::Wgs84;
+    let geographic = frame.is_geographic();
     let origin = ring[0];
     let mut x = 0.0_f64;
     let mut winding = 0.0_f64;
@@ -488,53 +520,101 @@ fn orientation(frame: &CoordinateFrame, ring: &[Pos]) -> (f64, f64) {
     (twice, winding / 360.0)
 }
 
-/// Group rings (interior on the left) into polygons: counterclockwise rings
-/// are shells, clockwise ones holes, each in the smallest shell holding it.
-pub(crate) fn polygons(space: &GeometrySpace, rings: Vec<Vec<Pos>>, work: &mut GeometryWork) -> Result<Vec<Vec<Vec<Pos>>>, GeometryRefusal> {
-    let frame = &space.frame;
-    let mut shells: Vec<(f64, Vec<Pos>, Option<Geometry>, Vec<Vec<Pos>>)> = Vec::new();
-    let mut holes = Vec::new();
-    for ring in rings {
-        work.charge(ring.len())?;
-        let (twice, winding) = orientation(frame, &ring);
-        if winding.abs() > 0.5 {
-            return Err(refused("a result ring turning around a pole is not supported"));
-        }
-        if twice > 0.0 {
-            shells.push((twice, ring, None, Vec::new()));
-        } else {
-            holes.push(ring);
+/// Whether ring `inner` lies in the open left side of `outer`: a point
+/// strictly inside one of `inner`'s edges, located exactly. Rings of one
+/// arrangement never cross or share an edge, so the first edge off `outer`
+/// decides.
+fn inside(inner: &arcs::Ring, outer: &arcs::Ring, work: &mut GeometryWork) -> Result<bool, GeometryRefusal> {
+    let vertices = inner.vertices();
+    let n = vertices.len();
+    for i in 0..n {
+        let m = arcs::between(&Point::vertex(vertices[i]), &Point::vertex(vertices[(i + 1) % n]), work)?;
+        match outer.locate_point(&m, work)? {
+            Rel::Inside => return Ok(true),
+            Rel::Outside => return Ok(false),
+            Rel::Boundary => {},
         }
     }
-    shells.sort_by(|a, b| a.0.total_cmp(&b.0));
-    for hole in holes {
-        let probe = along_middle(space, hole[0], hole[1]);
-        let point = Geometry::new(crate::Kind::Point, crate::Coords::Point(probe), space.clone());
-        let mut home = None;
-        for (index, shell) in shells.iter_mut().enumerate() {
-            let polygon = match &shell.2 {
-                Some(polygon) => polygon,
-                None => {
-                    shell.2 = Some(construct(space, json!({ "type": "Polygon", "coordinates": [shell.1] }), work)?);
-                    shell.2.as_ref().expect("built")
-                },
-            };
-            if crate::predicates::covered_by(&point, polygon, work)? {
-                home = Some(index);
-                break;
-            }
-        }
-        let Some(index) = home else {
-            return Err(refused("a hole of the overlay lies in no shell"));
-        };
-        shells[index].3.push(hole);
-    }
-    Ok(shells
-        .into_iter()
-        .map(|(_, shell, _, holes)| std::iter::once(shell).chain(holes).collect())
-        .collect())
+    Err(refused("two rings of the overlay share every edge"))
 }
 
-fn along_middle(space: &GeometrySpace, a: Pos, b: Pos) -> Pos {
-    crate::generator::along(space, (a, b), 0.5)
+/// Group rings (interior on the left) into polygons, exactly on the sphere
+/// or plane the frame's arcs live on. Rings i and j bound one component when
+/// each lies on the other's interior side and every other ring holds both or
+/// neither: no ring separates them. This needs no lon/lat orientation, so a
+/// ring turning around a pole, or holding one, is grouped like any other.
+/// A planar polygon is written shell first, its counterclockwise ring; a
+/// geographic one reads the same region whichever ring comes first (a
+/// shell's area is its left, a hole removes its right), so the first ring is
+/// one that is counterclockwise in lon/lat without winding when there is one.
+pub(crate) fn polygons(space: &GeometrySpace, rings: Vec<Vec<Pos>>, collapsed: &mut bool, work: &mut GeometryWork) -> Result<Vec<Vec<Vec<Pos>>>, GeometryRefusal> {
+    let frame = &space.frame;
+    let geographic = frame.is_geographic();
+    let mut exact = Vec::with_capacity(rings.len());
+    let mut kept = Vec::with_capacity(rings.len());
+    for ring in rings {
+        work.charge(ring.len())?;
+        // A ring of fewer than three directions bounds nothing.
+        match arcs::Ring::of_positions(geographic, &ring, work)? {
+            Some(admitted) => {
+                exact.push(admitted);
+                kept.push(ring);
+            },
+            None => *collapsed = true,
+        }
+    }
+    let rings = kept;
+    let n = rings.len();
+    work.charge(n.saturating_mul(n))?;
+    // holds[i][j]: ring j lies on ring i's interior side.
+    let mut holds = vec![vec![false; n]; n];
+    for i in 0..n {
+        for j in 0..n {
+            if i != j {
+                holds[i][j] = inside(&exact[j], &exact[i], work)?;
+            }
+        }
+    }
+    let together = |i: usize, j: usize| holds[i][j] && holds[j][i] && (0..n).all(|k| k == i || k == j || holds[k][i] == holds[k][j]);
+    let mut group = vec![usize::MAX; n];
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for i in 0..n {
+        if group[i] != usize::MAX {
+            continue;
+        }
+        group[i] = groups.len();
+        let mut members = vec![i];
+        for j in i + 1..n {
+            if group[j] == usize::MAX && together(i, j) {
+                group[j] = groups.len();
+                members.push(j);
+            }
+        }
+        groups.push(members);
+    }
+    let mut out = Vec::with_capacity(groups.len());
+    for members in groups {
+        let first = if geographic {
+            members
+                .iter()
+                .position(|&r| {
+                    let (twice, winding) = orientation(frame, &rings[r]);
+                    twice > 0.0 && winding.abs() < 0.5
+                })
+                .unwrap_or(0)
+        } else {
+            let Some(first) = members.iter().position(|&r| exact[r].counterclockwise()) else {
+                return Err(refused("a planar polygon of the overlay has no outer ring"));
+            };
+            first
+        };
+        let shell = members[first];
+        out.push(
+            std::iter::once(shell)
+                .chain(members.iter().copied().filter(|&r| r != shell))
+                .map(|r| rings[r].clone())
+                .collect(),
+        );
+    }
+    Ok(out)
 }

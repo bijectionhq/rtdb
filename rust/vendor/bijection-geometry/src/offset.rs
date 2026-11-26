@@ -82,13 +82,15 @@ const MAX_TURN: usize = 4096;
 const MAX_STATIONS: usize = 1 << 16;
 
 /// The position `metres` from `p` at `azimuth` degrees (clockwise from
-/// north, or from +y): along the geodesic in WGS84, straight in a plane.
+/// north, or from +y): along the geodesic in WGS84 and on a sphere frame,
+/// straight in a plane.
 fn offset(space: &GeometrySpace, p: Pos, azimuth: f64, metres: f64) -> Pos {
     match &space.frame {
         CoordinateFrame::Wgs84 => {
             let to = crate::geodesy::direct(p[1], p[0], azimuth, metres);
             [to.lon2, to.lat2]
         },
+        CoordinateFrame::Wgs84Sphere { radius_m } => crate::sphere::direct(p, azimuth, metres / radius_m.get()).0,
         CoordinateFrame::Cartesian { unit, .. } => {
             let (sin, cos) = crate::geodesy::sincosd(azimuth);
             let units = metres / unit.metres_per_unit.get();
@@ -104,6 +106,10 @@ fn towards(space: &GeometrySpace, from: Pos, to: Pos) -> (f64, f64, f64) {
         CoordinateFrame::Wgs84 => {
             let solved = crate::geodesy::inverse(from[1], from[0], to[1], to[0]);
             (solved.s12, solved.azi1, solved.azi2)
+        },
+        CoordinateFrame::Wgs84Sphere { radius_m } => {
+            let (sigma, azi1, azi2) = crate::sphere::inverse(from, to);
+            (radius_m.get() * sigma, azi1, azi2)
         },
         CoordinateFrame::Cartesian { unit, .. } => {
             let (dx, dy) = (to[0] - from[0], to[1] - from[1]);
@@ -230,14 +236,18 @@ fn pieces(geometry: &Geometry) -> Vec<(Pos, Pos)> {
 }
 
 /// `{p : sep(p, of) <= metres}` within `budget` metres on `side`: the
-/// admitted value and the Hausdorff bound it meets.
-pub(crate) fn buffer(space: &GeometrySpace, of: &Geometry, metres: f64, budget: f64, side: Side, work: &mut GeometryWork) -> Result<(Geometry, f64), GeometryRefusal> {
+/// admitted value, the Hausdorff bound it meets and what it created. The
+/// exact buffer and the realized one differ only near the stadia's chords
+/// (each stadium is within the bound of its exact one, and the union of the
+/// exact stadia and the operand's areas is the exact buffer), so every chord
+/// is created, dissolved or not.
+pub(crate) fn buffer(space: &GeometrySpace, of: &Geometry, metres: f64, budget: f64, side: Side, work: &mut GeometryWork) -> Result<(Geometry, f64, overlay::Created), GeometryRefusal> {
     if !(metres.is_finite() && metres >= 0.0) {
         return Err(refused("a buffer distance is finite and non-negative metres"));
     }
     if metres == 0.0 || of.is_empty() {
         // The closed value is its own zero buffer.
-        return Ok((of.clone(), 0.0));
+        return Ok((of.clone(), 0.0, overlay::Created::default()));
     }
     if !space.is_ground() {
         return Err(crate::unsupported_space("a buffer is defined on XY positions"));
@@ -263,9 +273,10 @@ pub(crate) fn buffer(space: &GeometrySpace, of: &Geometry, metres: f64, budget: 
         Side::Nearest => metres,
         Side::Outer => metres / libm::cos(core::f64::consts::PI / turn as f64) + margin,
     };
-    let earth = crate::geodesy::SEMI_MAJOR_AXIS_METRES;
+    let earth = space.frame.sphere_radius_m().unwrap_or(crate::geodesy::SEMI_MAJOR_AXIS_METRES);
     let mut components = Vec::new();
     let mut deviation = 0.0_f64;
+    let mut created = overlay::Created::default();
     for piece in pieces(of) {
         let (length, ..) = towards(space, piece.0, piece.1);
         let reach = earth * libm::sqrt(8.0 * sag / base.max(sag));
@@ -303,6 +314,8 @@ pub(crate) fn buffer(space: &GeometrySpace, of: &Geometry, metres: f64, budget: 
             return Err(bound_refusal(format!("a buffer of {metres} m does not meet the bound of {budget} m on its side")));
         };
         deviation = deviation.max(off);
+        work.allocate(ring.len().saturating_mul(std::mem::size_of::<(Pos, Pos)>()))?;
+        created.pieces.extend(ring.windows(2).map(|w| (w[0], w[1])));
         components.push(overlay::construct(space, json!({ "type": "Polygon", "coordinates": [ring] }), work)?);
     }
     for polygon in of.polygons() {
@@ -326,13 +339,15 @@ pub(crate) fn buffer(space: &GeometrySpace, of: &Geometry, metres: f64, budget: 
         Ok(false)
     })?;
     let mut rounding = 0.0_f64;
-    let rings = overlay::rings(&space.frame, found, &mut rounding, work)?;
+    // A dissolve that rounds a piece away stays within the stadia's chords.
+    let mut collapsed = false;
+    let rings = overlay::rings(&space.frame, found, &mut rounding, &mut collapsed, work)?;
     if side != Side::Nearest && rounding > margin / 2.0 {
         return Err(bound_refusal("the buffer's crossings round past its side's margin"));
     }
-    let polygons = overlay::polygons(space, rings, work)?;
+    let polygons = overlay::polygons(space, rings, &mut collapsed, work)?;
     let value = overlay::assemble(&polygons, &[], &[]);
-    Ok((overlay::construct(space, value, work)?, deviation + rounding))
+    Ok((overlay::construct(space, value, work)?, deviation + rounding, created))
 }
 
 /// Re-express a value from `source` into `target` through `map`,

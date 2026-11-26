@@ -80,8 +80,23 @@ pub fn position(v: Vector) -> Pos {
 /// names the pole; a longitude names its turn, so ±180 are one meridian.
 pub(crate) fn embed(frame: &CoordinateFrame, p: Pos) -> Vector {
     match frame {
-        CoordinateFrame::Wgs84 => direction([p[0], p[1].clamp(-90.0, 90.0)]),
+        // A sphere frame's great circle through (cos λ, sin λ, tan φ) is the
+        // auxiliary sphere's through the z-scaled direction: one curve, so
+        // one embedding decides both frames' topology.
+        CoordinateFrame::Wgs84 | CoordinateFrame::Wgs84Sphere { .. } => {
+            direction([p[0], p[1].clamp(-90.0, 90.0)])
+        },
         CoordinateFrame::Cartesian { .. } => [p[0] + 0.0, p[1] + 0.0, 1.0],
+    }
+}
+
+/// The metres an auxiliary-sphere radian spans at most in a geographic
+/// frame: the semi-major axis on WGS84; on a sphere of radius R, R stretched
+/// by the z-scaling between the two directions (at most 1 / (1 − f)²).
+pub(crate) fn radian_metres(frame: &CoordinateFrame) -> f64 {
+    match frame {
+        CoordinateFrame::Wgs84Sphere { radius_m } => radius_m.get() / (F1 * F1),
+        CoordinateFrame::Wgs84 | CoordinateFrame::Cartesian { .. } => geodesy::SEMI_MAJOR_AXIS_METRES,
     }
 }
 
@@ -871,15 +886,14 @@ pub(crate) fn snap(
     work: &mut GeometryWork,
 ) -> Result<(Pos, f64), GeometryRefusal> {
     match frame {
-        CoordinateFrame::Wgs84 => {
+        CoordinateFrame::Wgs84 | CoordinateFrame::Wgs84Sphere { .. } => {
             let approx = p.approx;
             let rounded = position(approx);
             let back = direction(rounded);
             let (x, y) = (norm(approx), norm(back));
             let chord = norm([0, 1, 2].map(|i| approx[i] / x - back[i] / y));
             // The approximation and normalization add a few ulps of angle.
-            let error = (chord * (1.0 + 1e-12) + 16.0 * f64::EPSILON)
-                * geodesy::SEMI_MAJOR_AXIS_METRES;
+            let error = (chord * (1.0 + 1e-12) + 16.0 * f64::EPSILON) * radian_metres(frame);
             if !rounded.iter().all(|v| v.is_finite()) || !error.is_finite() {
                 return Err(crate::invalid("Arrangement exceeds the numerical domain"));
             }
@@ -988,7 +1002,9 @@ pub(crate) fn arc_box(geographic: bool, a: Vector, b: Vector) -> [f64; 4] {
 /// The box of an edge between two positions of a frame.
 pub(crate) fn edge_bounds(frame: &CoordinateFrame, p: Pos, q: Pos) -> [f64; 4] {
     match frame {
-        CoordinateFrame::Wgs84 => arc_box(true, embed(frame, p), embed(frame, q)),
+        CoordinateFrame::Wgs84 | CoordinateFrame::Wgs84Sphere { .. } => {
+            arc_box(true, embed(frame, p), embed(frame, q))
+        },
         CoordinateFrame::Cartesian { .. } => crate::edge_box(&(p, q)),
     }
 }
@@ -1231,7 +1247,7 @@ impl Ring {
         if open.first() != Some(last) {
             return Err(crate::invalid("A ring must end at its first position"));
         }
-        let geographic = *frame == CoordinateFrame::Wgs84;
+        let geographic = frame.is_geographic();
         let positions = without_seam_cuts(geographic, positions);
         let open = &positions[..positions.len() - 1];
         work.charge(open.len())?;

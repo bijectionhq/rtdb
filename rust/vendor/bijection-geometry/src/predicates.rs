@@ -488,6 +488,7 @@ pub fn space_point_distance(
     }
     let distance = match &space.frame {
         crate::CoordinateFrame::Wgs84 => point_distance(a, b),
+        crate::CoordinateFrame::Wgs84Sphere { radius_m } => radius_m.get() * crate::sphere::angle(a, b),
         crate::CoordinateFrame::Cartesian { unit, .. } => {
             libm::hypot(a[0] - b[0], a[1] - b[1]) * unit.metres_per_unit.get()
         },
@@ -508,7 +509,12 @@ fn distance_lower_bound(space: &crate::GeometrySpace, a: [f64; 4], b: [f64; 4]) 
         crate::CoordinateFrame::Cartesian { unit, .. } => {
             libm::hypot(horizontal, vertical) * unit.metres_per_unit.get()
         },
-        crate::CoordinateFrame::Wgs84 => {
+        frame @ (crate::CoordinateFrame::Wgs84 | crate::CoordinateFrame::Wgs84Sphere { .. }) => {
+            // A sphere frame measures on the unit sphere these balls live on.
+            let (scale, body) = match frame.sphere_radius_m() {
+                Some(radius) => (1.0, radius),
+                None => (LOWER_SCALE, R),
+            };
             let ball = |bounds: [f64; 4]| {
                 let center = [(bounds[0] + bounds[2]) / 2.0, (bounds[1] + bounds[3]) / 2.0];
                 let near = if bounds[1] * bounds[3] <= 0.0 {
@@ -533,7 +539,7 @@ fn distance_lower_bound(space: &crate::GeometrySpace, a: [f64; 4], b: [f64; 4]) 
             let (a, ar) = ball(a);
             let (b, br) = ball(b);
             let chord = libm::hypot(libm::hypot(a[0] - b[0], a[1] - b[1]), a[2] - b[2]);
-            (LOWER_SCALE * R * vertical.to_radians().max(chord - ar - br) - R * 1e-12).max(0.0)
+            (scale * body * vertical.to_radians().max(chord - ar - br) - body * 1e-12).max(0.0)
         },
     }
 }
@@ -557,7 +563,7 @@ pub fn segments_distance(
         if point.iter().any(|coordinate| !coordinate.is_finite()) {
             return Err(crate::invalid("Segment coordinates must be finite"));
         }
-        if space.frame == crate::CoordinateFrame::Wgs84
+        if space.frame.is_geographic()
             && (point[0].abs() > 540.0 || point[1].abs() > 90.0)
         {
             return Err(crate::invalid(
@@ -594,6 +600,15 @@ pub(crate) fn space_segment_distance(
     }
     if crate::topology::contact(&space.frame, a, b, work)? {
         return Ok(0.0);
+    }
+    if let Some(radius) = space.frame.sphere_radius_m() {
+        // Two great-circle arcs that do not meet are nearest at an end of one.
+        work.charge(4)?;
+        let mut distance = best;
+        for (point, edge) in [(a.0, b), (a.1, b), (b.0, a), (b.1, a)] {
+            distance = distance.min(radius * crate::sphere::point_arc_angle(point, edge.0, edge.1));
+        }
+        return Ok(distance);
     }
     let point_segment = |p: Pos, edge: (Pos, Pos)| -> Result<f64, GeometryRefusal> {
         let d = [edge.1[0] - edge.0[0], edge.1[1] - edge.0[1]];

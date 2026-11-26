@@ -69,7 +69,7 @@ pub(super) fn classify(
             work,
             &mut |piece, work| {
                 if piece.is_area
-                    && geometry.space.frame == crate::CoordinateFrame::Wgs84
+                    && geometry.space.frame.is_geographic()
                     && piece.start[1].abs() == 90.0
                     && piece.end[1] == piece.start[1]
                 {
