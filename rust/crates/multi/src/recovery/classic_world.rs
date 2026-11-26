@@ -379,6 +379,7 @@ mod tests {
         let world = Uuid::new_v4();
         let world_retention = CheckpointWorldRetention {
             fork_reservation: None,
+            fork_request_link: None,
             world,
             ancestors: vec![],
             owner: "owner".into(),

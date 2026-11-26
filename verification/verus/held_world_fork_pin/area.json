@@ -1,5 +1,5 @@
 {
-  "summary": "An exact provisional held-world pin can settle only from the original attempt's terminal outcome.",
+  "summary": "An exact provisional held-world pin can settle only from the original attempt's terminal outcome, including replacement recovery from the durable V8 refusal/decision record after source confirmation and content-complete image apply.",
   "flags": [
     "--no-external-by-default",
     "--verify-module",
@@ -7,7 +7,7 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 4,
+  "min_verified_functions": 9,
   "controls": {
     "release_without_confirmation": {
       "defect": "Treat an ordered observation without certified confirmation as a terminal refusal.",
@@ -25,7 +25,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 3
+      "min_verified_functions": 8
     },
     "ignore_reservation_replacement": {
       "defect": "Allow a different reservation at the same directory pin to receive a delayed settlement.",
@@ -43,7 +43,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 3
+      "min_verified_functions": 8
     },
     "drop_certified_refusal": {
       "defect": "Keep the provisional pin after obtaining the exact certified refusal.",
@@ -61,7 +61,61 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 3
+      "min_verified_functions": 8
+    },
+    "recover_with_incomplete_image": {
+      "defect": "Certify a recovered V8 refusal record even when the applied image digest is incomplete.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/archive/writable_world/fork_pin.rs",
+          "find": "    if !source.image_complete\n",
+          "replace": "    if false\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/archive/writable_world/fork_pin.rs",
+          "function": "recover_fork_disposition",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 8
+    },
+    "recover_ignores_request_digest": {
+      "defect": "Accept a V8 decision record whose request digest differs from the reservation link.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/archive/writable_world/fork_pin.rs",
+          "find": "        || !same_bytes32(&rec.request_digest, expected_digest)\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/archive/writable_world/fork_pin.rs",
+          "function": "recover_fork_disposition",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 8
+    },
+    "recover_ignores_source_confirmation": {
+      "defect": "Certify a recovered V8 refusal before source prefix confirmation covers its transaction.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/archive/writable_world/fork_pin.rs",
+          "find": "        ForkDecisionOutcome::Refused { tx_id, .. } => {\n            let certified = source.confirmed_tx_id >= tx_id;",
+          "replace": "        ForkDecisionOutcome::Refused { tx_id: _, .. } => {\n            let certified = true;"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/archive/writable_world/fork_pin.rs",
+          "function": "recover_fork_disposition",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 8
     }
   }
 }

@@ -842,10 +842,22 @@ pub enum WorldForkReservation {
     Registering(uuid::Uuid),
 }
 
+/// Durable link from a provisional held-world directory reservation to the
+/// ordered V8 decision record (applied or definitively refused), enabling a
+/// replacement process to recover the original refusal and retry pin release.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorldForkRequestLink {
+    pub request_key: [u8; 32],
+    pub request_digest: [u8; 32],
+    pub retain_until: rtdb_types::Timestamp,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointWorldRetention {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fork_reservation: Option<WorldForkReservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_request_link: Option<WorldForkRequestLink>,
     pub world: uuid::Uuid,
     pub ancestors: Vec<CheckpointWorldAncestor>,
     pub owner: String,

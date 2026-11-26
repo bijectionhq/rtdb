@@ -556,6 +556,7 @@ mod tests {
             });
             record.checkpoint_worlds.insert(world, CheckpointWorldRetention {
                 fork_reservation: None,
+                fork_request_link: None,
                 ancestors: vec![rtdb_directory::CheckpointWorldAncestor {
                     world: Uuid::new_v4(),
                     pin: Uuid::new_v4(),
@@ -661,6 +662,7 @@ mod tests {
             world,
             CheckpointWorldRetention {
                 fork_reservation: None,
+                fork_request_link: None,
                 ancestors: Vec::new(),
                 world,
                 owner: "owner".into(),

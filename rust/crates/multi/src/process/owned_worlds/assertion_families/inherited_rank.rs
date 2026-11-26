@@ -172,6 +172,7 @@ mod tests {
         let until = Timestamp::MAX;
         record.checkpoint_worlds.insert(pin, CheckpointWorldRetention {
             fork_reservation: None,
+            fork_request_link: None,
             world,
             ancestors: Vec::new(),
             owner: "owner".into(),

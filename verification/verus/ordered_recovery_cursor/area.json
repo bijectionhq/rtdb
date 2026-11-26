@@ -47,14 +47,35 @@
     },
     "promote_after_unknown_frame": {
       "defect": "A grant holder promotes after encountering an unrecognized replica frame.",
-      "mutate": [{ "file": "rust/crates/replication/src/recovery_promotion.rs", "find": "    recognized_prefix && may_lead && !already_leading && holds_grant", "replace": "    may_lead && !already_leading && holds_grant" }],
+      "mutate": [{ "file": "rust/crates/replication/src/recovery_promotion.rs", "find": "    recognized_prefix && image_complete && may_lead && !already_leading && holds_grant", "replace": "    image_complete && may_lead && !already_leading && holds_grant" }],
+      "expect": [{ "file": "rust/crates/replication/src/recovery_promotion.rs", "function": "may_promote", "category": "postcondition not satisfied" }],
+      "min_verified_functions": 8
+    },
+    "promote_with_incomplete_image": {
+      "defect": "A grant holder promotes when the applied image digest disagrees with the authenticated prefix.",
+      "mutate": [{ "file": "rust/crates/replication/src/recovery_promotion.rs", "find": "    recognized_prefix && image_complete && may_lead && !already_leading && holds_grant", "replace": "    recognized_prefix && may_lead && !already_leading && holds_grant" }],
       "expect": [{ "file": "rust/crates/replication/src/recovery_promotion.rs", "function": "may_promote", "category": "postcondition not satisfied" }],
       "min_verified_functions": 8
     },
     "activate_after_append_before_apply": {
       "defect": "A confirmed append can activate a replacement writer while its installed state is behind.",
-      "mutate": [{ "file": "rust/crates/replication/src/recovery_promotion.rs", "find": "        if self.is_active() || (confirmed && recognized && installed == Some(received)) {", "replace": "        if self.is_active() || (confirmed && recognized) {" }],
+      "mutate": [{ "file": "rust/crates/replication/src/recovery_promotion.rs", "find": "        if self.is_active() || (confirmed && recognized && image_complete && installed == Some(received)) {", "replace": "        if self.is_active() || (confirmed && recognized && image_complete) {" }],
       "expect": [{ "file": "rust/crates/replication/src/recovery_promotion.rs", "function": "installed", "category": "postcondition not satisfied" }],
+      "min_verified_functions": 8
+    },
+    "activate_with_incomplete_image": {
+      "defect": "A replacement writer activates at the received position despite an omitted control row or receipt.",
+      "mutate": [{ "file": "rust/crates/replication/src/recovery_promotion.rs", "find": "        if self.is_active() || (confirmed && recognized && image_complete && installed == Some(received)) {", "replace": "        if self.is_active() || (confirmed && recognized && installed == Some(received)) {" }],
+      "expect": [{ "file": "rust/crates/replication/src/recovery_promotion.rs", "function": "installed", "category": "postcondition not satisfied" }],
+      "min_verified_functions": 8
+    },
+    "accept_mismatched_applied_digest": {
+      "defect": "Image digest tracking accepts an applied record whose digest differs from the authenticated expectation.",
+      "mutate": [{ "file": "rust/crates/replication/src/image_digest.rs", "find": "            || !same_digest(&next_applied_digest, &self.expected_digest)", "replace": "" }],
+      "expect": [
+        { "file": "rust/crates/replication/src/image_digest.rs", "function": "record_applied", "category": "postcondition not satisfied" },
+        { "file": "rust/crates/replication/src/image_digest.rs", "function": "record_applied", "category": "postcondition not satisfied" }
+      ],
       "min_verified_functions": 8
     }
   }
