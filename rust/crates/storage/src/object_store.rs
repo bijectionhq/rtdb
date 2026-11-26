@@ -2,7 +2,7 @@ use crate::{Error, IoRegion, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::RwLock;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Range;
@@ -524,6 +524,119 @@ pub struct LocalStore {
     root: Arc<PathBuf>,
     io: Arc<IoRegion>,
     catalog: Option<Arc<crate::local_catalog::LocalCatalogLedger>>,
+    mapped: Arc<parking_lot::Mutex<MappedObjects>>,
+}
+
+/// How many local objects stay mapped for scan reads at once.
+const MAPPED_OBJECT_LIMIT: usize = 512;
+
+/// Read-only mappings of local objects, shared between scan reads so that a read does not open and map its file again.
+/// Every use compares the file's identity with the mapped one, so a removed or replaced object is never read through an older mapping.
+#[derive(Default)]
+struct MappedObjects {
+    entries: HashMap<PathBuf, MappedObject>,
+    clock: u64,
+    swept: Option<std::time::Instant>,
+}
+
+/// The least time between two checks of every mapped object's file.
+const MAPPED_OBJECT_SWEEP: std::time::Duration = std::time::Duration::from_secs(1);
+
+struct MappedObject {
+    map: Arc<memmap2::Mmap>,
+    identity: FileIdentity,
+    used: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+    length: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl FileIdentity {
+    fn of(metadata: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        let (device, inode) = { use std::os::unix::fs::MetadataExt; (metadata.dev(), metadata.ino()) };
+        #[cfg(not(unix))]
+        let (device, inode) = (0, 0);
+        Self { device, inode, length: metadata.len(), modified: metadata.modified().ok() }
+    }
+}
+
+impl MappedObjects {
+    fn get(&mut self, path: &Path, identity: FileIdentity) -> Option<Arc<memmap2::Mmap>> {
+        self.clock += 1;
+        let clock = self.clock;
+        let entry = self.entries.get_mut(path)?;
+        if entry.identity != identity { return None; }
+        entry.used = clock;
+        Some(Arc::clone(&entry.map))
+    }
+}
+
+/// A slice of a shared object mapping.
+struct MappedSlice {
+    map: Arc<memmap2::Mmap>,
+    range: Range<usize>,
+}
+
+impl AsRef<[u8]> for MappedSlice {
+    fn as_ref(&self) -> &[u8] { &self.map[self.range.clone()] }
+}
+
+/// The object's current mapping and length; an empty object has no mapping.
+fn mapped_object(mapped: &parking_lot::Mutex<MappedObjects>, path: &Path, key: &ObjectKey)
+    -> Result<(Option<Arc<memmap2::Mmap>>, u64)> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            let evicted = mapped.lock().entries.remove(path);
+            drop(evicted);
+            return Err(if error.kind() == std::io::ErrorKind::NotFound { Error::MissingObject(key.to_string()) } else { Error::io(path, error) });
+        }
+    };
+    let identity = FileIdentity::of(&metadata);
+    if identity.length == 0 { return Ok((None, 0)); }
+    if let Some(map) = mapped.lock().get(path, identity) { return Ok((Some(map), identity.length)); }
+
+    let file = open_object(path, key)?;
+    let opened = FileIdentity::of(&file.metadata().map_err(|error| Error::io(path, error))?);
+    if opened.length == 0 { return Ok((None, 0)); }
+    // SAFETY: object files are published atomically and never modified in place; a replacement is a new file with its own identity.
+    let map = Arc::new(unsafe { memmap2::Mmap::map(&file) }.map_err(|error| Error::io(path, error))?);
+    remember_mapping(mapped, path, opened, Arc::clone(&map));
+    Ok((Some(map), opened.length))
+}
+
+fn remember_mapping(mapped: &parking_lot::Mutex<MappedObjects>, path: &Path, identity: FileIdentity, map: Arc<memmap2::Mmap>) {
+    // A new object usually follows others' removal, so a miss first releases mappings whose files are gone.
+    let held: Vec<(PathBuf, FileIdentity)> = {
+        let mut objects = mapped.lock();
+        let due = objects.swept.is_none_or(|swept| swept.elapsed() >= MAPPED_OBJECT_SWEEP);
+        if due { objects.swept = Some(std::time::Instant::now()); }
+        if due { objects.entries.iter().map(|(path, entry)| (path.clone(), entry.identity)).collect() } else { Vec::new() }
+    };
+    let stale: Vec<PathBuf> = held.into_iter()
+        .filter(|(path, identity)| fs::metadata(path).map_or(true, |metadata| FileIdentity::of(&metadata) != *identity))
+        .map(|(path, _)| path).collect();
+    let mut evicted = Vec::new();
+    {
+        let mut objects = mapped.lock();
+        for path in &stale {
+            if let Some(entry) = objects.entries.remove(path) { evicted.push(entry); }
+        }
+        while objects.entries.len() >= MAPPED_OBJECT_LIMIT {
+            let Some(oldest) = objects.entries.iter().min_by_key(|(_, entry)| entry.used).map(|(path, _)| path.clone()) else { break; };
+            if let Some(entry) = objects.entries.remove(&oldest) { evicted.push(entry); }
+        }
+        objects.clock += 1;
+        let used = objects.clock;
+        objects.entries.insert(path.to_path_buf(), MappedObject { map, identity, used });
+    }
+    drop(evicted);
 }
 
 struct AdmittedFile {
@@ -553,7 +666,7 @@ impl LocalStore {
         let root = selected.as_path();
         fs::create_dir_all(root).map_err(|err| Error::io(root, err))?;
         let root = fs::canonicalize(root).map_err(|err| Error::io(root, err))?;
-        Ok(Self { root: Arc::new(root), io, catalog: None })
+        Ok(Self { root: Arc::new(root), io, catalog: None, mapped: Arc::default() })
     }
     /// Joins the catalog admission and retirement ledger on a shared local filesystem.
     pub fn with_catalog_ledger(mut self, replica_epoch: rtdb_types::StorageEpoch) -> Self {
@@ -779,8 +892,9 @@ impl ObjectStore for LocalStore {
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {
         self.io.read(self.root.clone(), key.clone(), move |root, key| {
             let path = root.join(key.as_str());
-            let file = open_object(&path, key)?;
-            let size = file.metadata().map_err(|error| Error::io(&path, error))?.len();
+            let size = fs::metadata(&path).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound { Error::MissingObject(key.to_string()) } else { Error::io(&path, error) }
+            })?.len();
             Ok(StoredObject { key: key.clone(), size })
         }).await
     }
@@ -825,8 +939,15 @@ impl ObjectStore for LocalStore {
     }
 
     async fn get_reserved_scan_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
+        reservation.check_range(&range)?;
+        let mapped = Arc::clone(&self.mapped);
         self.io.read(self.root.clone(), (key.clone(), range), move |root, (key, range)| {
-            map_range(LocalFile::new(open_object(&root.join(key.as_str()), key)?, None), key, range.clone(), reservation)
+            let (map, length) = mapped_object(&mapped, &root.join(key.as_str()), key)?;
+            let range = checked_range(key, range.clone(), length)?;
+            match map {
+                Some(map) if !range.is_empty() => reservation.finish(Bytes::from_owner(MappedSlice { map, range })),
+                _ => reservation.finish(Bytes::new()),
+            }
         }).await
     }
 

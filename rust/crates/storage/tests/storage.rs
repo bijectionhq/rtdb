@@ -343,3 +343,25 @@ async fn a_local_objects_file_reads_its_bytes_even_after_a_delete() {
     assert!(rtdb_storage::MemoryStore::default().local_file(&key).await.unwrap().is_none(), "a memory store has no local file");
     store.close_and_wait().await;
 }
+
+#[tokio::test]
+async fn local_scan_reads_follow_removed_and_republished_objects() {
+    let location = tempfile::tempdir().unwrap();
+    let store = std::sync::Arc::new(rtdb_storage::LocalStore::open(location.path()).unwrap());
+    let pool = rtdb_storage::cache::BufferPool::new(store.clone(), 1 << 20);
+    let key = rtdb_storage::ObjectKey::new("tables/orders/data/l00-rc-b00.arrow").unwrap();
+    store.put(&key, bytes::Bytes::from_static(b"first version of the page")).await.unwrap();
+
+    assert_eq!(pool.get_scan_range(&key, 0..5).await.unwrap().as_slice(), b"first");
+    assert_eq!(pool.get_scan_range(&key, 6..13).await.unwrap().as_slice(), b"version");
+    let held = pool.get_scan_range(&key, 0..5).await.unwrap();
+
+    store.delete(&key).await.unwrap();
+    assert!(matches!(pool.get_scan_range(&key, 0..5).await, Err(rtdb_storage::Error::MissingObject(_))));
+    assert_eq!(held.as_slice(), b"first", "a lease keeps the bytes it was given");
+
+    store.put(&key, bytes::Bytes::from_static(b"second version, longer than the first")).await.unwrap();
+    assert_eq!(pool.get_scan_range(&key, 0..6).await.unwrap().as_slice(), b"second");
+    assert_eq!(pool.get_scan_range(&key, 32..37).await.unwrap().as_slice(), b"first");
+    assert_eq!(pool.scan_length(&key).await.unwrap(), 37);
+}
