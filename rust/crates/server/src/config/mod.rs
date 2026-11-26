@@ -181,9 +181,8 @@ impl NodeConfiguration {
         let health = fields.take_nullable("healthz").map(health).transpose()?;
         let indexer = indexer(fields.take("indexer"), environment)?;
         let node_id = fields.string("nodeId")?.or_else(|| environment("XTDB_NODE_ID")).unwrap_or_else(|| uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("rtdb").into());
-        let join_build_rows = environment("XTDB_JOIN_SPILL_THRESHOLD")
-            .map(|text| join_threshold(&text).ok_or_else(|| invalid("XTDB_JOIN_SPILL_THRESHOLD must be a signed 64-bit integer")))
-            .transpose()?.unwrap_or(100_000);
+        // As XTDB's `parse-long`, a value that is not a signed 64-bit integer keeps the default.
+        let join_build_rows = environment("XTDB_JOIN_SPILL_THRESHOLD").and_then(|text| join_threshold(&text)).unwrap_or(100_000);
         let query_spill_limit_bytes = query_spill_limit(fields.take("query"), environment)?;
         let host_timezone = host_zone::host_timezone(environment)?;
         let key_vaults = KeyVaultSettings::decode(environment);
