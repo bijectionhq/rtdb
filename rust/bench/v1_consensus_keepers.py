@@ -151,8 +151,9 @@ class Rtdb:
     """rtdb dev --multi on one journal. `keepers` supplies the journal CA,
     client credentials and URL. Without it RTDB uses its local FileJournal."""
 
-    def __init__(self, binary, work, keepers, logs):
+    def __init__(self, binary, work, keepers, logs, checkpoints="deferred"):
         self.binary, self.logs, self.process = binary, logs, None
+        self.env = checkpoint_environment(checkpoints)
         self.data = work / "rtdb"
         self.incarnation = str(uuid.uuid4())
         self.tls = work / "flight-tls"
@@ -180,7 +181,7 @@ class Rtdb:
         self.process = subprocess.Popen([
             str(self.binary), "dev", "--multi", "--data", str(self.data), "--multi-tls-dir", str(self.tls),
             "--incarnation", self.incarnation, *journal, "--flight-sql-port", "0",
-        ], stdout=ready.open("w"), stderr=log)
+        ], stdout=ready.open("w"), stderr=log, env=self.env)
         deadline = time.monotonic() + 120
         while time.monotonic() < deadline:
             if self.process.poll() is not None:
@@ -202,6 +203,22 @@ class Rtdb:
 
     def connect(self):
         return driver.connector(self.endpoint, "xtdb", "xtdb", self.password.encode(), self.ca)
+
+
+CHECKPOINT_MODES = ("classic", "binary", "deferred")
+
+
+def checkpoint_environment(mode):
+    """The RTDB environment for a checkpoint mode: `classic` writes JSON
+    checkpoints under the database lock, `binary` writes CBOR ones, and
+    `deferred` also builds them off the commit path. Phase timings of each
+    checkpoint go to rtdb.log."""
+    if mode not in CHECKPOINT_MODES:
+        raise ValueError(f"unknown checkpoint mode {mode}")
+    env = dict(os.environ, RTDB_CHECKPOINT_TIMING="1")
+    env["RTDB_MULTI_BINARY_CHECKPOINTS"] = "0" if mode == "classic" else "1"
+    env["RTDB_MULTI_DEFERRED_CHECKPOINTS"] = "1" if mode == "deferred" else "0"
+    return env
 
 
 def commit(rtdb, clients, seconds, phase, results, acknowledged):
@@ -254,6 +271,7 @@ def main():
     parser.add_argument("--logkeeper", type=pathlib.Path, required=True)
     parser.add_argument("output", type=pathlib.Path)
     parser.add_argument("--seconds", type=float, default=5)
+    parser.add_argument("--checkpoints", choices=CHECKPOINT_MODES, default="deferred")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     work, logs = args.output / "work", args.output / "logs"
@@ -262,7 +280,7 @@ def main():
     keepers = Keepers(args.logkeeper.resolve(), work, logs)
     for keeper in keepers.all():
         keepers.start(keeper)
-    rtdb = Rtdb(args.rtdb.resolve(), work, keepers, logs)
+    rtdb = Rtdb(args.rtdb.resolve(), work, keepers, logs, args.checkpoints)
     results, acknowledged = [], []
     try:
         results.append(dict(phase="readiness", **rtdb.start()))

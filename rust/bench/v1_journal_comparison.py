@@ -77,7 +77,7 @@ def run_backend(name, args, results):
         keepers = harness.Keepers(args.logkeeper.resolve(), work, logs)
         for keeper in keepers.all():
             keepers.start(keeper)
-    rtdb = harness.Rtdb(args.rtdb.resolve(), work, keepers, logs)
+    rtdb = harness.Rtdb(args.rtdb.resolve(), work, keepers, logs, args.checkpoints)
     acknowledged = []
     try:
         rtdb.start()
@@ -102,6 +102,7 @@ def main():
     parser.add_argument("--backends", nargs="+", default=["file", "stream", "consensus"])
     parser.add_argument("--clients", type=int, nargs="+", default=[1, 4, 16, 64])
     parser.add_argument("--seconds", type=float, default=10)
+    parser.add_argument("--checkpoints", choices=harness.CHECKPOINT_MODES, default="deferred")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     results = []
