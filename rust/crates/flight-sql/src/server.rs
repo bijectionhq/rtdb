@@ -127,7 +127,7 @@ impl ServerDriver {
                 .initial_connection_window_size(AUDIENCE_H2_CONNECTION_WINDOW)
                 .http2_adaptive_window(Some(false));
         }
-        let server = http.add_service(server);
+        let server = http.add_service(crate::trace_scope::TraceScope(server));
         let stop = cancellation.clone().cancelled_owned();
         let tls = self.tls.take();
         let serving = async {

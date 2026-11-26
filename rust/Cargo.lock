@@ -5181,6 +5181,7 @@ dependencies = [
  "chrono",
  "futures",
  "hmac 0.12.1",
+ "http-body 1.1.0",
  "lz4_flex",
  "prost",
  "prost-build",

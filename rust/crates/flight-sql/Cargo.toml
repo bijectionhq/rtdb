@@ -33,6 +33,7 @@ arrow-select.workspace = true
 lz4_flex.workspace = true
 bytes.workspace = true
 futures.workspace = true
+http-body = "1"
 serde.workspace = true
 serde_json.workspace = true
 prost.workspace = true
