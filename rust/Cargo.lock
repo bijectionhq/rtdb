@@ -1306,6 +1306,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "bijection-store-derive"
+version = "0.1.0"
+
+[[package]]
 name = "bijection-store-filter"
 version = "0.1.0"
 
@@ -5304,6 +5308,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "arrow-select",
+ "bijection-store-derive",
  "bijection-store-filter",
  "bytes",
  "chrono",
