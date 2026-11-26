@@ -19,7 +19,7 @@ use rtdb_maintenance::CollectionObserver;
 use rtdb_plan::{CatalogMetric, CatalogMetrics, CatalogRows, ConnectionEvent, ExecutionError, ExecutionObserver, ExecutionTimer};
 use rtdb_types::{Anomaly, Result, TableRef};
 
-const TIMERS: [ExecutionTimer; 10] = [ExecutionTimer::Query, ExecutionTimer::TxAwait, ExecutionTimer::TxSubmit, ExecutionTimer::TxExecute, ExecutionTimer::PgwireTransaction, ExecutionTimer::TxOp, ExecutionTimer::CompactorJob, ExecutionTimer::DurableCommitLag, ExecutionTimer::StagedCommitLag, ExecutionTimer::BlockUpload];
+const TIMERS: [ExecutionTimer; 11] = [ExecutionTimer::Query, ExecutionTimer::TxAwait, ExecutionTimer::TxSubmit, ExecutionTimer::TxExecute, ExecutionTimer::PgwireTransaction, ExecutionTimer::TxOp, ExecutionTimer::CompactorJob, ExecutionTimer::DurableCommitLag, ExecutionTimer::StagedCommitLag, ExecutionTimer::BlockUpload, ExecutionTimer::TrieDelete];
 struct Counters { query_errors: step::Counter, query_warnings: step::Counter, transaction_errors: step::Counter, collection_errors: step::Counter, durable_commit_clock_invalid: step::Counter, staged_commit_clock_invalid: step::Counter, kafka_warnings: [step::Counter; 5], connections: [step::Counter; 3] }
 impl Counters {
     fn roll(&mut self, now: i64, closing: bool) {
@@ -93,7 +93,7 @@ impl Registry {
 }
 impl ExecutionObserver for Registry {
     fn record_duration(&self, timer: ExecutionTimer, elapsed: Duration) {
-        let index = match timer { ExecutionTimer::Query => 0, ExecutionTimer::TxAwait => 1, ExecutionTimer::TxSubmit => 2, ExecutionTimer::TxExecute => 3, ExecutionTimer::PgwireTransaction => 4, ExecutionTimer::TxOp => 5, ExecutionTimer::CompactorJob => 6, ExecutionTimer::DurableCommitLag => 7, ExecutionTimer::StagedCommitLag => 8, ExecutionTimer::BlockUpload => 9 };
+        let index = match timer { ExecutionTimer::Query => 0, ExecutionTimer::TxAwait => 1, ExecutionTimer::TxSubmit => 2, ExecutionTimer::TxExecute => 3, ExecutionTimer::PgwireTransaction => 4, ExecutionTimer::TxOp => 5, ExecutionTimer::CompactorJob => 6, ExecutionTimer::DurableCommitLag => 7, ExecutionTimer::StagedCommitLag => 8, ExecutionTimer::BlockUpload => 9, ExecutionTimer::TrieDelete => 10 };
         let sample = Sample { timer: index, elapsed, now_ms: wall_time_millis() };
         let shard = &self.shards[shard_index()];
         loop {
@@ -134,6 +134,7 @@ impl CollectionObserver for Registry {
             None => tracing::error!(target: "rtdb_maintenance::gc", "Garbage collection failed: {error}"),
         }
     }
+    fn trie_deleted(&self, elapsed: Duration) { self.record_duration(ExecutionTimer::TrieDelete, elapsed); }
 }
 impl Registry {
     fn provider_snapshot(&self) -> Result<(Vec<Arc<dyn CatalogMetrics>>, Arc<MemoryReservation>)> {
@@ -295,6 +296,13 @@ mod tests {
         drop(rows);
         registry.record_duration(ExecutionTimer::CompactorJob, Duration::from_nanos(10));
         assert!(registry.metrics().unwrap().rows().iter().any(|row| matches!(row, CatalogMetric::Timer { name, count: 1, .. } if name == "compactor.job.timer")));
+    }
+    #[test]
+    fn the_collector_reports_trie_deletes_under_the_upstream_timer() {
+        let registry = Registry::new("node-1", MemoryBudget::new(1 << 22)).unwrap();
+        assert!(registry.metrics().unwrap().rows().iter().any(|row| matches!(row, CatalogMetric::Timer { name, count: 0, .. } if name == "xtdb.gc.tries.delete.timer")));
+        CollectionObserver::trie_deleted(registry.as_ref(), Duration::from_nanos(10));
+        assert!(registry.metrics().unwrap().rows().iter().any(|row| matches!(row, CatalogMetric::Timer { name, count: 1, .. } if name == "xtdb.gc.tries.delete.timer")));
     }
     #[tokio::test]
     async fn closing_step_preserves_cumulative_catalog_totals_and_timer_percentiles() {

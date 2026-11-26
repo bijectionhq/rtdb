@@ -96,6 +96,7 @@
 -- Where the installed catalog and checkpoint already exclude the requested keys, it can re-confirm their removal through replication.
 -- Source-residence retirement metadata stays outside fork publication and cell materialization.
 -- A new collector, after restart or failover, observes directory pages afresh.
+-- Each cycle times the deletion of each collected trie's files under XTDB's `xtdb.gc.tries.delete.timer`.
 --
 -- Each cycle first retires the tables of owned relations whose retention has passed (rule RetireDueTables).
 -- Their tries then become garbage like any superseded trie, and the deletion rules below collect them unchanged.

@@ -56,6 +56,8 @@ fn grace_elapsed(first_observed: i64, grace: i64, now: i64) -> bool {
 
 pub trait CollectionObserver: Send + Sync {
     fn table_failed(&self, table: Option<&TableRef>, error: &Anomaly);
+    /// The time taken to delete one collected trie's files, as XTDB's `xtdb.gc.tries.delete.timer`.
+    fn trie_deleted(&self, _elapsed: Duration) {}
 }
 
 pub fn block_is_garbage(block: BlockIndex, latest: BlockIndex, keep: usize) -> bool {
@@ -568,7 +570,9 @@ impl TrieCollector {
                 let results = stream::iter(trie_files).map(|files| async move {
                     let _permit = deletes.acquire().await.map_err(crate::invalid)?;
                     if cancellation.is_cancelled() { return Err(crate::closed()); }
+                    let started = std::time::Instant::now();
                     for file in files { self.store.delete(&file).await?; }
+                    self.observer.trie_deleted(started.elapsed());
                     Ok::<_, Anomaly>(())
                 }).buffer_unordered(self.config.delete_parallelism).collect::<Vec<_>>().await;
                 for result in results { result?; }
