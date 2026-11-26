@@ -329,7 +329,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pinned_catalog_prevents_retired_search_run_collection() {
+    fn a_retired_search_run_is_collected_after_the_horizon_whatever_a_reader_holds() {
         use rtdb_format::keys::TrieKey;
         use rtdb_types::{BlockIndex, TableRef};
 
@@ -340,12 +340,13 @@ mod tests {
         state.add_tries(&BTreeMap::from([(table.clone(), vec![source])]), Timestamp(1)).unwrap();
         let notify = |run, replaces| SearchRunChange { run: Some(run), replaces, ..Default::default() }.to_artefact().unwrap();
         state.add_artefacts_at(&table, vec![(key.clone(), notify(run(1, &[0]), Vec::new()))], Timestamp(2));
-        let pinned = state.snapshot();
+        let reader = state.snapshot();
         state.add_artefacts_at(&table, vec![(key, notify(run(2, &[0]), vec![vec![1; 32]]))], Timestamp(3));
-        assert_eq!(state.trie_collection().eligible_search_runs(&table, Timestamp(4)).count(), 0);
-        assert_eq!(pinned.trie_catalog().search_runs(&table).next(), Some(&run(1, &[0])));
-        drop(pinned);
-        assert_eq!(state.trie_collection().eligible_search_runs(&table, Timestamp(2)).count(), 0);
-        assert_eq!(state.trie_collection().eligible_search_runs(&table, Timestamp(4)).count(), 1);
+        assert_eq!(reader.trie_catalog().search_runs(&table).next(), Some(&run(1, &[0])));
+        assert_eq!(state.trie_collection().eligible_search_runs(&table, Timestamp(2)).count(), 0,
+            "a run superseded after the garbage-as-of horizon is kept");
+        assert_eq!(state.trie_collection().eligible_search_runs(&table, Timestamp(4)).count(), 1,
+            "an open reader of the older catalog does not hold the run past the horizon");
+        drop(reader);
     }
 }

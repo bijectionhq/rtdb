@@ -58,7 +58,7 @@ pub(super) async fn recover(index: &mut BranchIndex, snapshot: Snapshot, storage
     memory: &Arc<MemoryBudget>, cancellation: &CancellationToken) -> Result<Vec<Arc<MemoryReservation>>> {
     let snapshot = Arc::new(snapshot);
     let hold = HeldView::catalog_at(storage.object_store().as_ref(), snapshot.clone(), snapshot.catalog_cut(),
-        snapshot.catalog_checkpoint()?, snapshot.catalog_file_paths()).await?;
+        snapshot.catalog_checkpoint()?).await?;
     IoRegion::reading(hold, async {
         let mut events = Vec::new();
         let mut charges = Vec::new();

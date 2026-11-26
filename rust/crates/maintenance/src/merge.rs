@@ -570,7 +570,7 @@ impl CompactionExecutor for SegmentCompactor {
                 "The compaction selection no longer names live inputs"));
         }
         let captured = snapshot.snapshot();
-        let view = HeldView::catalog_at(self.store.as_ref(), snapshot.clone(), captured.catalog_cut(), captured.catalog_checkpoint()?, captured.catalog_file_paths()).await?;
+        let view = HeldView::catalog_at(self.store.as_ref(), snapshot.clone(), captured.catalog_cut(), captured.catalog_checkpoint()?).await?;
         IoRegion::reading(view, self.execute_job(job, snapshot, cancellation)).await
     }
 }

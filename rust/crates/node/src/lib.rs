@@ -7,7 +7,6 @@ mod resources;
 mod catalog;
 mod config;
 mod database;
-mod current_catalog;
 mod read_currency;
 mod read_selection;
 mod table_retirement;

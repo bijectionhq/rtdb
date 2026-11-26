@@ -319,7 +319,6 @@ impl TxResolver {
     pub async fn resolve_source_abort(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp, attempt: Option<PlacedAttempt>, context: &ResolveContext, reason: Anomaly, fenced: bool) -> Result<Arc<ResolvedTx>> {
         let _span = context.transaction_span(None, "xtdb.transaction", &[("operations.count", rtdb_plan::TraceValue::Unsigned(0))]);
         context.check_cancelled()?;
-        let durable = rtdb_query::retain_catalog_snapshot(durable, &context.storage).await?;
         let base = self.resolving_snapshot(durable)?;
         let key = TransactionKey { tx_id: TxId(position.0), system_time: self.smooth(log_time)? };
         let options = SubmitOptions { default_tz: context.default_tz.clone(), ..SubmitOptions::default() };
@@ -361,7 +360,6 @@ impl TxResolver {
         if request.requires_durable_predecessor() && !self.queue.is_empty() {
             return Err(Anomaly::fault("rtdb.tx/strict-predecessor", "A strict source transaction requires a durable predecessor"));
         }
-        let durable = rtdb_query::retain_catalog_snapshot(durable, &context.storage).await?;
         let base = self.resolving_snapshot(durable)?;
         let has_owned_operations = request.operations.iter().any(Operation::is_owned);
         let default_time = self.smooth(log_time)?;
@@ -677,7 +675,6 @@ impl TxResolver {
 
     pub async fn resolve_external(&mut self, durable: Snapshot, now: Timestamp, system_time: Option<Timestamp>, token: Option<Vec<u8>>, writer: &mut dyn TransactionWriter, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
         context.check_cancelled()?;
-        let durable = rtdb_query::retain_catalog_snapshot(durable, &context.storage).await?;
         let base = self.resolving_snapshot(durable)?;
         let id = self.resolved_head().map_or(-1, |key| key.tx_id.0).checked_add(1).ok_or_else(overflow)?;
         let system_time = crate::system_time::external_time(self.previous_system_time(), system_time.map(|time| time.0), now.0)
@@ -703,7 +700,6 @@ impl TxResolver {
     }
 
     pub async fn resolve_db_op(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp, operation: DbOp, verdict: Result<()>, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
-        let durable = rtdb_query::retain_catalog_snapshot(durable, &context.storage).await?;
         let base = self.resolving_snapshot(durable)?;
         let key = TransactionKey { tx_id: TxId(position.0), system_time: self.smooth(log_time)? };
         let (result, operation) = match verdict {
@@ -5106,8 +5102,8 @@ mod tests {
         async fn write(&mut self, tx: &mut OpenTransaction<'_>) -> Result<WriterResult> {
             use rtdb_storage::ObjectStore;
 
-            assert!(!self.store.advance_catalog_floor(self.proposed_floor).await?,
-                "an active transaction must retain its durable catalog");
+            assert!(self.store.advance_catalog_floor(self.proposed_floor).await?,
+                "an active transaction registers no catalog and never holds the floor back");
             tx.execute_sql("INSERT INTO docs RECORDS {_id: 42}", None).await?;
             self.cursor = Some(tx.open_query("SELECT _id FROM docs", Vec::new()).await?);
             Ok(WriterResult::Committed { user_metadata: None })
@@ -5115,7 +5111,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_transaction_cursor_retains_its_catalog_until_dropped() {
+    async fn transaction_resolution_registers_no_catalog_with_storage() {
         use rtdb_storage::{LocalStore, ObjectStore};
         use rtdb_types::{CatalogCut, ReplicaPosition, StorageEpoch, StorageVersion};
 
@@ -5155,18 +5151,19 @@ mod tests {
         let mut resolver = TxResolver::new(None, SourcePosition(0), None, &memory).unwrap();
         let outcome = resolver.resolve_external(state.snapshot(), Timestamp(100), None, None, &mut writer, &context).await.unwrap();
         assert!(outcome.result().committed());
-        assert!(!writer.store.advance_catalog_floor(writer.proposed_floor).await.unwrap(),
-            "the transaction cursor must retain its catalog after resolution");
+        let tickets = || std::fs::read_dir(directory.path().join(".tmp/catalog-ledger")).map_or(0, |entries| entries
+            .filter(|entry| entry.as_ref().is_ok_and(|entry| entry.file_name().to_string_lossy().starts_with("reader-"))).count());
+        assert_eq!(tickets(), 0, "resolution writes no reader ticket on the commit path");
         let mut cursor = writer.cursor.take().unwrap();
-        assert_eq!(cursor.next_batch().await.unwrap().unwrap().batch().num_rows(), 1);
+        assert_eq!(cursor.next_batch().await.unwrap().unwrap().batch().num_rows(), 1,
+            "the open cursor still reads its catalog inside the GC window");
         assert!(cursor.next_batch().await.unwrap().is_none());
         drop(cursor);
-        assert!(writer.store.advance_catalog_floor(writer.proposed_floor).await.unwrap());
 
         let request = SourceTransaction::new(Vec::new(), SubmitOptions::default(), &memory).unwrap();
-        let error = resolver.resolve_source(state.snapshot(), SourcePosition(1), Timestamp(101), request, &context).await
-            .err().expect("source resolution must check catalog admission");
-        assert_eq!(error.code, "rtdb.storage/catalog-not-current");
+        resolver.resolve_source(state.snapshot(), SourcePosition(1), Timestamp(101), request, &context).await
+            .expect("a catalog older than the latest retirement is resolved without a storage admission");
+        assert_eq!(tickets(), 0);
     }
 
     #[tokio::test]

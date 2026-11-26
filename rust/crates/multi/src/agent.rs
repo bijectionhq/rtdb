@@ -14,7 +14,6 @@ use rtdb_directory::{Cas, Checkpoint, CheckpointSuffixCustody, CheckpointSuffixP
 use rtdb_format::catalog::BlockCatalog;
 use rtdb_node::{Database, Node};
 use rtdb_replication::Role as DriverRole;
-use rtdb_storage::cache::HeldCatalogRead;
 use rtdb_types::{Anomaly, AnomalyCategory, Result, StorageEpoch, TransactionKey, TxId};
 use tokio_util::sync::CancellationToken;
 
@@ -256,7 +255,6 @@ struct LocalSubscription {
     opened: Instant,
     role: Role,
     fragments: bool,
-    snapshot_hold: Option<Arc<HeldCatalogRead>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -619,7 +617,7 @@ impl NodeAgent {
                 let opened = Instant::now();
                 self.subscriptions.lock().insert(name.into(), LocalSubscription {
                     id: placement.record.id.clone(), database: Arc::downgrade(&database), last_touch: opened,
-                    opened, role: Role::Subscriber, snapshot_hold: None, fragments: false,
+                    opened, role: Role::Subscriber, fragments: false,
                 });
                 Ok(response())
             }
@@ -1516,7 +1514,7 @@ impl NodeAgent {
         self.stop_running(name).await;
         let database = self.node.database_or_attach(name.to_owned(), configuration).await?
             .ok_or_else(|| Anomaly::fault("rtdb.multi/not-opened", "The node declined to open the replica"))?;
-        self.subscriptions.lock().insert(name.to_owned(), LocalSubscription { id: record.id, database: Arc::downgrade(&database), last_touch: Instant::now(), opened: Instant::now(), role: Role::Subscriber, snapshot_hold: None, fragments });
+        self.subscriptions.lock().insert(name.to_owned(), LocalSubscription { id: record.id, database: Arc::downgrade(&database), last_touch: Instant::now(), opened: Instant::now(), role: Role::Subscriber, fragments });
         Ok(Response::Subscribed { address: self.address.clone() })
     }
 
@@ -1559,17 +1557,12 @@ impl NodeAgent {
         if record.lifecycle != Lifecycle::Live { return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/not-live", format!("{name} is not live"))); }
         if self.holdings.lock().contains_key(name) && self.node.catalog().database(name).is_ok() { return Ok(Response::Subscribed { address: self.address.clone() }); }
         let existing = self.subscriptions.lock().get(name).filter(|subscription| subscription.id == record.id)
-            .and_then(|subscription| subscription.database.upgrade().map(|database| (database, subscription.snapshot_hold.clone())));
-        if let Some((database, held)) = existing
+            .and_then(|subscription| subscription.database.upgrade());
+        if let Some(database) = existing
             && self.node.catalog().database(name).is_ok_and(|current| Arc::ptr_eq(&current, &database))
         {
-            let renewed = match held {
-                Some(held) => Some(database.storage().renew_catalog(&held).await?),
-                None => None,
-            };
             if let Some(subscription) = self.subscriptions.lock().get_mut(name) {
                 subscription.last_touch = Instant::now();
-                subscription.snapshot_hold = renewed;
             }
             return Ok(Response::Subscribed { address: self.address.clone() });
         }
@@ -1580,26 +1573,13 @@ impl NodeAgent {
             let configuration = database_config(&record, Vec::new(), &self.options.storage, Role::Snapshot(checkpoint));
             match self.node.database_or_attach(name.to_owned(), configuration).await {
                 Ok(Some(database)) => {
-                    let snapshot = database.snapshot();
-                    let cut = snapshot.catalog_cut();
-                    let held = database.storage().hold_catalog_with_paths(cut, cut.and_then(|_| snapshot.catalog_file_paths())).await;
-                    match held {
-                        Ok(held) if held.is_registered() => {
-                            let opened = Instant::now();
-                            self.subscriptions.lock().insert(name.to_owned(), LocalSubscription {
-                                id: record.id, database: Arc::downgrade(&database), last_touch: opened, opened,
-                                role: Role::Snapshot(checkpoint), fragments: false, snapshot_hold: Some(held),
-                            });
-                            return Ok(Response::Subscribed { address: self.address.clone() });
-                        }
-                        outcome => {
-                            self.stop_running(name).await;
-                            return Err(outcome.err().unwrap_or_else(|| Anomaly::new(
-                                AnomalyCategory::Unavailable, "rtdb.storage/catalog-not-held",
-                                "The checkpoint subscription did not obtain a coordinated catalog hold",
-                            )));
-                        }
-                    }
+                    // The checkpoint's files stay readable for the GC window; the subscription registers nothing.
+                    let opened = Instant::now();
+                    self.subscriptions.lock().insert(name.to_owned(), LocalSubscription {
+                        id: record.id, database: Arc::downgrade(&database), last_touch: opened, opened,
+                        role: Role::Snapshot(checkpoint), fragments: false,
+                    });
+                    return Ok(Response::Subscribed { address: self.address.clone() });
                 }
                 Err(error) if error.code == crate::store::CHECKPOINT_ADVANCED => {
                     record = self.directory.deployment(&record.id).await?
@@ -1768,7 +1748,7 @@ impl NodeAgent {
             let Ok(servers) = ensemble_servers(&record, &members) else { continue };
             let configuration = database_config(&record, servers, &self.options.storage, Role::Compactor);
             if let Ok(Some(database)) = self.node.database_or_attach(name.clone(), configuration).await {
-                self.subscriptions.lock().insert(name.clone(), LocalSubscription { id: record.id, database: Arc::downgrade(&database), last_touch: Instant::now(), opened: Instant::now(), role: Role::Compactor, fragments: false, snapshot_hold: None });
+                self.subscriptions.lock().insert(name.clone(), LocalSubscription { id: record.id, database: Arc::downgrade(&database), last_touch: Instant::now(), opened: Instant::now(), role: Role::Compactor, fragments: false });
             }
         }
     }

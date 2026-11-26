@@ -69,7 +69,7 @@ pub use cow_pages::ObjectPageStore;
 pub mod entity_directory;
 mod entity_history;
 pub use entity_history::{HistoryObject, table_point_rows, uncovered_history_iids};
-pub use context::{CatalogSnapshot, DatabaseSnapshot, OrderedIndexInventory, OrderedIndexStorage, QueryContext, QueryDeliveryGuard, QueryOptions, retain_catalog_snapshot};
+pub use context::{CatalogSnapshot, DatabaseSnapshot, OrderedIndexInventory, OrderedIndexStorage, QueryContext, QueryDeliveryGuard, QueryOptions};
 pub use fragment::{FragmentBytes, FragmentDepth, FragmentReply, FragmentResidence, ScanFragment, ScanFragmenter, TriePrefix, evaluate_fragment, evaluate_fragment_retained, evaluate_fragment_with_arguments};
 pub use cursor::{PreparedQuery, QueryCursor, encoding_ordered_batch};
 pub use rtdb_storage::sealing::{DeliveryIo, current_delivery_deadline};

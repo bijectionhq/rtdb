@@ -86,7 +86,6 @@ impl SourceTransaction {
         let (primary, refusal) = constraint_receipt::split(&operations.operations, true)?;
         require_landing(primary, refusal)?;
 
-        let base = rtdb_query::retain_catalog_snapshot(base, &context.storage).await?;
         let mut tx = OpenTransaction::new(base.clone(), key, &self.options, context)?;
         tx.terms_time = time;
         tx.check_owned_preconditions(primary, Some(scope), true).await?;

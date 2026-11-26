@@ -287,9 +287,8 @@ impl ClassicKeyVault {
         store: Arc<dyn ObjectStore>,
         keys: Arc<ClassicObjectKeys>,
     ) -> Result<EncryptingStore> {
-        let vault = Arc::clone(&keys.path);
         let erasure = keys.erasure.clone();
-        Ok(EncryptingStore::with_units(store, keys).with_classic_control(ObjectKey::new(OWNER)?, vault)
+        Ok(EncryptingStore::with_units(store, keys).with_classic_control(ObjectKey::new(OWNER)?)
             .with_local_erasure_custody(erasure))
     }
 }

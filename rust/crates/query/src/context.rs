@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_index::Snapshot;
 use rtdb_plan::{Catalog, CatalogRuntime, QualifiedTable, TableBinding};
-use rtdb_storage::{cache::{BufferPool, HeldCatalogRead}, sealing::{PlaintextDelivery, PlaintextView}};
+use rtdb_storage::{cache::{BufferPool, CatalogAdmission}, sealing::{PlaintextDelivery, PlaintextView}};
 use rtdb_types::{Anomaly, AnomalyCategory, LogicalType, Result, TableRef, Timestamp, Value};
 use tokio_util::sync::CancellationToken;
 
@@ -19,24 +19,17 @@ use crate::{
 #[derive(Clone)]
 pub struct DatabaseSnapshot { pub partitions: Vec<Snapshot>, pub storage: Arc<BufferPool> }
 
-/// Binds the physical catalog in this snapshot to the store that will serve its reads.
-pub async fn retain_catalog_snapshot(snapshot: Snapshot, storage: &BufferPool) -> Result<Snapshot> {
-    let permit = hold_snapshot(&snapshot, storage).await?;
-    Ok(snapshot.with_catalog_read(permit))
-}
-
-async fn hold_snapshot(snapshot: &Snapshot, storage: &BufferPool) -> Result<Arc<HeldCatalogRead>> {
+/// The custody the storage owner grants for reading this snapshot's captured catalog, reusing custody already attached
+/// to the snapshot. Only a hosted journal grants any; every other store keeps no reader state and returns `None`.
+async fn admit_snapshot(snapshot: &Snapshot, storage: &BufferPool) -> Result<Option<Arc<dyn Send + Sync>>> {
     let cut = snapshot.catalog_cut();
-    let paths = cut.and_then(|_| snapshot.catalog_file_paths());
-    if let Some(hold) = snapshot.catalog_read_permit::<HeldCatalogRead>()
-        && storage.holds_catalog_with_paths(&hold, cut, paths.as_deref())
+    if let Some(admission) = snapshot.catalog_read_permit::<CatalogAdmission>()
+        && storage.admitted(&admission, cut)
     {
-        return Ok(hold);
+        return Ok(Some(admission as Arc<dyn Send + Sync>));
     }
-    if let Some((cut, anchor)) = cut.zip(snapshot.catalog_checkpoint()?) {
-        return storage.hold_anchored_catalog(cut, anchor, paths).await;
-    }
-    storage.hold_catalog_with_paths(cut, paths).await
+    let checkpoint = match cut { Some(_) => snapshot.catalog_checkpoint()?, None => None };
+    Ok(storage.admit_catalog(cut, checkpoint).await?.map(|admission| admission as Arc<dyn Send + Sync>))
 }
 
 #[derive(Clone, Debug)]
@@ -174,16 +167,16 @@ impl CatalogSnapshot {
             }
         }
         self.read_view.get_or_try_init(|| async {
-            let mut registrations = Vec::new();
+            let mut admissions = Vec::new();
             for database in self.databases.values() {
                 for snapshot in &database.partitions {
                     if snapshot.catalog_cut().is_some() || snapshot.read_custody_deadline().is_none() {
-                        registrations.push(hold_snapshot(snapshot, &database.storage).await?);
+                        admissions.extend(admit_snapshot(snapshot, &database.storage).await?);
                     }
                 }
             }
             let owners = Arc::new((Arc::clone(&self.databases), self.snapshot_suffix.clone(), self.delivery_owner.clone()));
-            Ok(Arc::new(rtdb_storage::HeldView::new(owners, registrations)))
+            Ok(Arc::new(rtdb_storage::HeldView::new(owners, admissions)))
         }).await.map(Arc::clone)
     }
     pub(crate) fn check_view_lease(&self) -> Result<()> {

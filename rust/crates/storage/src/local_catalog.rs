@@ -4,38 +4,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fs2::FileExt;
-use rtdb_format::{catalog::same_publication_digest, keys::{is_catalog_retirement_file, is_compacted_primary_file}, search_manifest::is_ranged_run};
-use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, CATALOG_FILE_PATH_BYTES, CatalogCut, CatalogFilePaths, ReplicaPosition, Result, StorageEpoch};
+use rtdb_format::{catalog::same_publication_digest, keys::is_compacted_primary_file, search_manifest::is_ranged_run};
+use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, CatalogCut, ReplicaPosition, Result, StorageEpoch};
 
 use crate::{Error, repair_anchor_decision::{self, AnchorInstallation, RecoveryCollection}};
-
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct CatalogHold {
-    pub(crate) cut: Option<CatalogCut>,
-    catalog_file_paths: Option<CatalogFilePaths>,
-}
-
-impl CatalogHold {
-    pub(super) fn new(cut: Option<CatalogCut>, paths: Option<&[String]>) -> Self {
-        let catalog_file_paths = paths.filter(|paths| {
-            cut.is_some() && paths.windows(2).all(|pair| pair[0] < pair[1])
-                && paths.iter().all(|path| is_catalog_retirement_file(path))
-                && paths.iter().fold(0usize, |charge, path| charge.saturating_add(path.len().saturating_mul(6).saturating_add(16)))
-                    <= CATALOG_FILE_PATH_BYTES
-        }).map(|paths| CatalogFilePaths { members: paths.to_vec() });
-        Self { cut, catalog_file_paths }
-    }
-
-    pub(super) fn retains(&self, cut: CatalogCut, path: Option<&str>) -> bool {
-        match path {
-            Some(path) => self.catalog_file_paths.as_ref().is_none_or(|paths| {
-                paths.binary_search_by(|held| held.as_str().cmp(path)).is_ok()
-            }),
-            None => self.cut.is_none_or(|held| !covers(held, cut)),
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LocalRepairAnchor {
@@ -53,8 +25,10 @@ fn terminal_name(key: &str) -> bool {
     is_compacted_primary_file(key) || is_ranged_run(key)
 }
 
+/// The retirement and erasure ledger of one local storage root, shared by every process on that filesystem.
+/// Readers register nothing here: a superseded file stays readable for the garbage-collection window, and only an
+/// erasure installs a floor below which a captured catalog is refused.
 pub(crate) struct LocalCatalogLedger {
-    id: u64,
     directory: PathBuf,
     root: Arc<PathBuf>,
     replica_epoch: StorageEpoch,
@@ -63,99 +37,27 @@ pub(crate) struct LocalCatalogLedger {
 
 impl LocalCatalogLedger {
     pub(crate) fn new(root: Arc<PathBuf>, replica_epoch: StorageEpoch) -> Self {
-        static LEDGERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        Self { id: LEDGERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed), directory: root.join(".tmp/catalog-ledger"), root, replica_epoch,
+        Self { directory: root.join(".tmp/catalog-ledger"), root, replica_epoch,
             search_witness: parking_lot::Mutex::new(None) }
     }
 
-    pub(crate) fn retain(&self, cut: Option<CatalogCut>, paths: Option<&[String]>) -> Result<tempfile::NamedTempFile> {
-        let _gate = self.lock()?;
-        let claim = CatalogHold::new(cut, paths);
-        self.admit_floor(cut, self.floor()?)?;
-        if let Some(paths) = &claim.catalog_file_paths {
-            for name in paths.iter().filter(|name| terminal_name(name)) {
-                if self.is_terminal(name)? {
-                    return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.storage/catalog-not-current",
-                        "The captured catalog names a terminal local publication"));
-                }
-            }
-        }
-        let mut ticket = tempfile::Builder::new().prefix("reader-").tempfile_in(&self.directory)
-            .map_err(|error| Error::io(&self.directory, error))?;
-        fs2::FileExt::lock_shared(ticket.as_file()).map_err(|error| Error::io(ticket.path(), error))?;
-        ticket.write_all(&serde_json::to_vec(&claim).map_err(invalid)?)
-            .map_err(|error| Error::io(ticket.path(), error))?;
-        Ok(ticket)
-    }
-
-    /// Admits another reader of a catalog whose ticket this process holds, as `retain` would admit it.
-    /// The held ticket keeps every path its claim names from turning terminal, but a retirement naming paths or an erasure
-    /// installs the floor past held tickets, so the floor is checked again.
-    /// The floor file is replaced by rename, so it reads whole without the gate, and the ticket already orders this read
-    /// before any later floor.
-    pub(crate) fn readmit(&self, cut: Option<CatalogCut>) -> Result<()> {
-        self.admit_floor(cut, self.current_floor()?)
-    }
-
-    /// The floor as `floor` reads it, parsed again only when the floor file has been replaced since this thread last read it.
-    #[cfg(unix)]
-    fn current_floor(&self) -> Result<Option<CatalogCut>> {
-        use std::os::unix::fs::MetadataExt;
-        type Seen = Option<(u64, (u64, u64, i64, i64, u64), Option<CatalogCut>)>;
-        thread_local! { static SEEN: std::cell::Cell<Seen> = const { std::cell::Cell::new(None) }; }
-        let path = self.directory.join("floor");
-        let stamp = match fs::metadata(&path) {
-            Ok(metadata) => (metadata.dev(), metadata.ino(), metadata.mtime(), metadata.mtime_nsec(), metadata.size()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(Error::io(path, error).into()),
-        };
-        if let Some((id, seen, floor)) = SEEN.get() && id == self.id && seen == stamp { return Ok(floor); }
-        let floor = self.floor()?;
-        SEEN.set(Some((self.id, stamp, floor)));
-        Ok(floor)
-    }
-
-    #[cfg(not(unix))]
-    fn current_floor(&self) -> Result<Option<CatalogCut>> { self.floor() }
-
-    fn admit_floor(&self, cut: Option<CatalogCut>, floor: Option<CatalogCut>) -> Result<()> {
-        if cut.is_some_and(|cut| cut.replica_epoch != self.replica_epoch || !well_formed(cut))
-            || floor.is_some_and(|floor| floor.replica_epoch >= self.replica_epoch
-                && !cut.is_some_and(|cut| covers(cut, floor)))
-        {
-            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.storage/catalog-not-current",
-                "The captured catalog precedes the local collection floor or belongs to another journal"));
-        }
-        Ok(())
-    }
-
+    /// Records an installed retirement and closes the publication of each exact path it names, so a retired name is never
+    /// published again. No reader holds a catalog here, so every candidate is released.
     pub(crate) fn close_admission(&self, cut: CatalogCut, paths: &[Option<&str>]) -> Result<Vec<bool>> {
         let _gate = self.lock()?;
-        if paths.iter().flatten().any(|path| !terminal_name(path))
-        {
+        if paths.iter().flatten().any(|path| !terminal_name(path)) {
             return Err(invalid("Invalid local catalog retirement"));
         }
-        let closed = self.covers_floor(cut)?;
-        let holds = self.held_catalogs()?;
-        let advance = !closed && (paths.iter().any(Option::is_some)
-            || holds.iter().all(|hold| !hold.retains(cut, None)));
-        if advance { self.install_floor(cut)?; }
-        if !closed && !advance { return Ok(vec![false; paths.len()]); }
-        self.sync_ledger()?;
-        let mut allowed = Vec::with_capacity(paths.len());
-        for path in paths {
-            let release = holds.iter().all(|hold| !hold.retains(cut, *path));
-            if release && let Some(path) = path { self.close_publication(path)?; }
-            allowed.push(release);
-        }
-        Ok(allowed)
+        self.check_cut(cut)?;
+        for path in paths.iter().flatten() { self.close_publication(path)?; }
+        Ok(vec![true; paths.len()])
     }
 
-    pub(crate) fn close_erasure_admission(&self, cut: CatalogCut) -> Result<bool> {
+    /// Installs the erasure floor: a catalog captured before `cut` is refused from now on.
+    pub(crate) fn close_erasure_admission(&self, cut: CatalogCut) -> Result<()> {
         let _gate = self.lock()?;
         if !self.covers_floor(cut)? { self.install_floor(cut)?; }
-        self.sync_ledger()?;
-        Ok(self.held_catalogs()?.iter().all(|hold| !hold.retains(cut, None)))
+        self.sync_ledger()
     }
 
     pub(crate) fn require_erasure_admission(&self, cut: Option<CatalogCut>) -> Result<()> {
@@ -169,15 +71,20 @@ impl LocalCatalogLedger {
 
     pub(crate) fn verifies_erasure_admission(&self, cut: CatalogCut) -> Result<bool> {
         let _gate = self.lock()?;
-        Ok(self.covers_floor(cut)? && self.held_catalogs()?.iter().all(|hold| !hold.retains(cut, None)))
+        self.covers_floor(cut)
     }
 
-    fn covers_floor(&self, cut: CatalogCut) -> Result<bool> {
+    fn check_cut(&self, cut: CatalogCut) -> Result<()> {
         if cut.replica_epoch != self.replica_epoch || !well_formed(cut)
             || cut.through.after_offset(cut.replica_epoch) < 0
         {
             return Err(invalid("Invalid local catalog retirement"));
         }
+        Ok(())
+    }
+
+    fn covers_floor(&self, cut: CatalogCut) -> Result<bool> {
+        self.check_cut(cut)?;
         let prior = self.floor()?;
         let closed = prior.is_some_and(|prior| covers(prior, cut));
         if !closed && prior.is_some_and(|prior| {
@@ -195,30 +102,6 @@ impl LocalCatalogLedger {
         let path = self.directory.join("floor");
         next.persist(&path).map_err(|error| Error::io(&path, error.error))?;
         Ok(())
-    }
-
-    fn held_catalogs(&self) -> Result<Vec<CatalogHold>> {
-        let mut holds = Vec::new();
-        for entry in fs::read_dir(&self.directory).map_err(|error| Error::io(&self.directory, error))? {
-            let path = entry.map_err(|error| Error::io(&self.directory, error))?.path();
-            if !path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with("reader-")) { continue; }
-            let mut ticket = match File::open(&path) {
-                Ok(file) => file,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(Error::io(&path, error).into()),
-            };
-            match FileExt::try_lock_exclusive(&ticket) {
-                Ok(()) => remove_ticket(&path)?,
-                Err(error) if error.kind() == fs2::lock_contended_error().kind() => {
-                    let mut bytes = Vec::new();
-                    Read::by_ref(&mut ticket).take((CATALOG_FILE_PATH_BYTES + 1024) as u64)
-                        .read_to_end(&mut bytes).map_err(|error| Error::io(&path, error))?;
-                    holds.push(serde_json::from_slice(&bytes).map_err(invalid)?);
-                }
-                Err(error) => return Err(Error::io(&path, error).into()),
-            }
-        }
-        Ok(holds)
     }
 
     /// The same gate serializes immutable creation and terminal retirement.
@@ -397,14 +280,6 @@ impl LocalCatalogLedger {
     }
 }
 
-fn remove_ticket(path: &Path) -> Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(Error::io(path, error).into()),
-    }
-}
-
 pub(crate) fn well_formed(cut: CatalogCut) -> bool {
     cut.through.after_offset(cut.replica_epoch) >= 0
         || ReplicaPosition::from_epoch_offset(cut.replica_epoch, -1).ok() == Some(cut.through)
@@ -428,26 +303,40 @@ mod tests {
     use super::*;
     use rtdb_format::keys::{CURRENT_STORAGE_VERSION, TableSlug, TrieKey};
 
-    #[test]
-    fn exact_local_close_preserves_only_the_primary_named_by_a_held_catalog() {
-        let root = tempfile::tempdir().unwrap();
-        let epoch = StorageEpoch(0);
-        let ledger = LocalCatalogLedger::new(Arc::new(root.path().to_owned()), epoch);
-        let cut = |offset| CatalogCut {
+    fn cut(epoch: StorageEpoch, offset: i64) -> CatalogCut {
+        CatalogCut {
             storage_version: CURRENT_STORAGE_VERSION,
             storage_epoch: epoch,
             replica_epoch: epoch,
             through: ReplicaPosition::from_epoch_offset(epoch, offset).unwrap(),
-        };
+        }
+    }
+
+    #[test]
+    fn a_retirement_releases_every_candidate_and_closes_each_exact_name_for_good() {
+        let root = tempfile::tempdir().unwrap();
+        let epoch = StorageEpoch(0);
+        let ledger = LocalCatalogLedger::new(Arc::new(root.path().to_owned()), epoch);
         let name = |block| TableSlug::recorded("public$docs").unwrap()
             .data_key(&TrieKey::new(1, None, Vec::new(), BlockIndex(block)).unwrap());
-        let held = name(2);
-        let unrelated = name(3);
-        let registration = ledger.retain(Some(cut(7)), Some(std::slice::from_ref(&held))).unwrap();
-        assert_eq!(ledger.close_admission(cut(8), &[Some(&held), Some(&unrelated), None]).unwrap(), [false, true, false]);
-        assert!(ledger.retain(Some(cut(9)), Some(std::slice::from_ref(&unrelated))).is_err());
-        assert!(ledger.publication_gate(&crate::ObjectKey::new(unrelated).unwrap()).is_err());
-        drop(registration);
-        assert_eq!(ledger.close_admission(cut(8), &[Some(&held)]).unwrap(), [true]);
+        let (retired, other) = (name(2), name(3));
+        assert_eq!(ledger.close_admission(cut(epoch, 8), &[Some(&retired), None]).unwrap(), [true, true]);
+        assert!(ledger.publication_gate(&crate::ObjectKey::new(retired).unwrap()).is_err(), "a retired name is never published again");
+        assert!(ledger.publication_gate(&crate::ObjectKey::new(other).unwrap()).unwrap().is_some());
+        assert!(ledger.floor().unwrap().is_none(), "a retirement installs no floor: readers are bounded by the GC window alone");
+        assert!(ledger.require_erasure_admission(Some(cut(epoch, 0))).is_ok());
+    }
+
+    #[test]
+    fn only_an_erasure_floor_refuses_an_older_catalog() {
+        let root = tempfile::tempdir().unwrap();
+        let epoch = StorageEpoch(0);
+        let ledger = LocalCatalogLedger::new(Arc::new(root.path().to_owned()), epoch);
+        ledger.close_erasure_admission(cut(epoch, 8)).unwrap();
+        assert_eq!(ledger.require_erasure_admission(Some(cut(epoch, 7))).unwrap_err().code, "rtdb/erased-under-view");
+        assert_eq!(ledger.require_erasure_admission(None).unwrap_err().code, "rtdb/erased-under-view");
+        assert!(ledger.require_erasure_admission(Some(cut(epoch, 8))).is_ok());
+        assert!(ledger.verifies_erasure_admission(cut(epoch, 8)).unwrap());
+        assert!(!ledger.verifies_erasure_admission(cut(epoch, 9)).unwrap());
     }
 }

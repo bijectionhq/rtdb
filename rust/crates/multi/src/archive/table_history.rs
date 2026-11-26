@@ -323,7 +323,7 @@ impl TableHistorySource for HostedTableReplay {
             return Ok(None);
         };
         let store = read.storage.object_store();
-        let hold = store.retain_catalog(read.snapshot.catalog_cut()).await?;
+        let hold = store.admit_catalog(read.snapshot.catalog_cut(), None).await?;
         let replay = with_region(
             self.directory.as_ref(),
             self.keys.as_ref(),

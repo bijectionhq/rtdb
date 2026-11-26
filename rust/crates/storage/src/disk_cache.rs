@@ -318,22 +318,10 @@ impl ObjectStore for DiskCachedStore {
     fn index_page_lifecycle(&self) -> Option<&dyn crate::object_store::IndexPageLifecycle> {
         self.remote.index_page_lifecycle()
     }
-    async fn retain_catalog(&self, cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
-        self.remote.retain_catalog(cut).await
-    }
-    async fn retain_catalog_with_paths(&self, cut: Option<rtdb_types::CatalogCut>, paths: Arc<[String]>)
-        -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
-        self.remote.retain_catalog_with_paths(cut, paths).await
-    }
-    async fn retain_anchored_catalog(
-        &self, cut: rtdb_types::CatalogCut, checkpoint: rtdb_types::CatalogCheckpoint, paths: Option<Arc<[String]>>,
+    async fn admit_catalog(
+        &self, cut: Option<rtdb_types::CatalogCut>, checkpoint: Option<rtdb_types::CatalogCheckpoint>,
     ) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
-        self.remote.retain_anchored_catalog(cut, checkpoint, paths).await
-    }
-    async fn readmit_catalog(
-        &self, cut: Option<rtdb_types::CatalogCut>, paths: Option<Arc<[String]>>, checkpoint: Option<rtdb_types::CatalogCheckpoint>,
-    ) -> rtdb_types::Result<()> {
-        self.remote.readmit_catalog(cut, paths, checkpoint).await
+        self.remote.admit_catalog(cut, checkpoint).await
     }
     fn defers_trie_releases(&self) -> bool { self.remote.defers_trie_releases() }
     fn releases_receipt_l0(&self) -> bool { self.remote.releases_receipt_l0() }

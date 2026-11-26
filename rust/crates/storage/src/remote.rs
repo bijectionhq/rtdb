@@ -224,30 +224,11 @@ impl ObjectStore for RemoteStore {
     }
 
     fn permits_shared_read_cache(&self) -> bool { true }
-    async fn retain_catalog(&self, cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
-        let Some(ledger) = &self.catalog else { return Ok(None); };
-        ledger.retain(cut, None, &self.io).await.map(Some)
-    }
-
-    async fn retain_catalog_with_paths(&self, cut: Option<rtdb_types::CatalogCut>, paths: Arc<[String]>)
-        -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
-        let Some(ledger) = &self.catalog else { return Ok(None); };
-        ledger.retain(cut, self.classic_versions.as_ref().map(|_| paths), &self.io).await.map(Some)
-    }
-
-    async fn readmit_catalog(
-        &self, cut: Option<rtdb_types::CatalogCut>, _paths: Option<Arc<[String]>>, _checkpoint: Option<rtdb_types::CatalogCheckpoint>,
-    ) -> rtdb_types::Result<()> {
-        let Some(ledger) = &self.catalog else { return Ok(()); };
-        ledger.readmit(cut).await
-    }
-
     fn defers_trie_releases(&self) -> bool { self.catalog.is_some() }
 
     async fn advance_catalog_floor(&self, cut: rtdb_types::CatalogCut) -> rtdb_types::Result<bool> {
         let Some(ledger) = self.catalog.clone() else { return Ok(true); };
-        let vault = crate::classic_catalog_drain::selected_vault();
-        self.io.run_async(async move { Ok(ledger.advance(cut, vault).await) }).await?
+        self.io.run_async(async move { Ok(ledger.advance(cut).await) }).await?
     }
 
     async fn release_trie_files(&self, receipt: &ObjectKey, contents: Bytes) -> rtdb_types::Result<bool> {
@@ -275,10 +256,9 @@ impl ObjectStore for RemoteStore {
             return Ok(vec![self.advance_catalog_floor(cut).await?; paths.len()]);
         };
         let paths = paths.iter().map(|path| path.map(str::to_owned)).collect::<Vec<_>>();
-        let vault = crate::classic_catalog_drain::selected_vault();
         self.io.run_async(async move {
             let paths = paths.iter().map(Option::as_deref).collect::<Vec<_>>();
-            Ok(ledger.close_admission(cut, &paths, vault).await)
+            Ok(ledger.close_admission(cut, &paths).await)
         }).await?
     }
 

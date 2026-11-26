@@ -18,6 +18,9 @@ use crate::retirement_intent::{self, FileRelease, PendingRetirement};
 
 #[derive(Clone, Debug)]
 pub struct GarbageConfig {
+    /// The garbage window, as in XTDB: a superseded trie is collected only once it was superseded at or before the
+    /// latest completed transaction of the oldest of the newest `blocks_to_keep` blocks, less `garbage_lifetime`.
+    /// Readers register nothing, so a read of a catalog older than the window may find its files gone.
     pub blocks_to_keep: usize,
     pub garbage_lifetime: Duration,
     pub table_parallelism: usize,
@@ -186,6 +189,9 @@ impl TrieCollector {
                 } else {
                     eligible.extend(collection.eligible_l0_artefacts(&entry.table, as_of).cloned());
                 }
+                // Every candidate was superseded at or before the garbage-as-of horizon, which is the only protection a
+                // reader has: no reader registers its catalog. A coordinated store releases compacted tries through its
+                // retirement grant at once; the rest wait the reader lease on this collector's clock.
                 let coordinated = self.store.defers_trie_releases();
                 let (due, timed): (Vec<_>, Vec<_>) = eligible.into_iter()
                     .partition(|key| coordinated && (key.level() > 0 || receipt_l0));

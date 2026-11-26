@@ -14,7 +14,7 @@
 -- In native Rust, the term supervisor also signals on term entry and periodically while automatic trie GC is enabled.
 -- The period is the configured reader lease clamped to 100 milliseconds through 60 seconds.
 -- A retry gives an eligible trie or pending receipt a fresh collection opportunity even if no new block arrives.
--- The timer only schedules cycles. The collector still checks eligibility, elapsed reader leases and the catalog admission floor.
+-- The timer only schedules cycles. The collector still checks eligibility against the garbage window and elapsed read leases.
 -- In installed-journal mode, a storage delete request queues the owned serving object for reclamation under journal custody.
 --
 -- Tries transition to `garbage` during addTries (see trie-cat.allium); this
@@ -22,23 +22,23 @@
 -- those deletions to the replica log so followers drop them from their
 -- in-memory catalogs at the same logical position.
 --
--- Native collection within one partition authority captures eligibility and reader references together.
--- A trie that is live in any captured reader catalog stays out of the collection batch.
+-- Retention is a window, as in XTDB: the collector deletes a superseded trie only once it was superseded at or before
+-- the garbage-as-of horizon, which keeps the newest `blocks_to_keep` blocks (default 10) and anything superseded within
+-- `garbage_lifetime` (default 24 hours) of the latest completed transaction of the oldest kept block.
+-- Readers register nothing with the collector or with storage. A query, transaction resolution, fragment, compaction or
+-- artefact build reads its captured catalog without a reader list, catalog pin, reader ticket or ledger claim, and a
+-- reader never blocks or delays a collection. A read whose captured catalog is older than the window may find its
+-- files gone and fail, exactly as an XTDB query would.
 -- At the same cut, the native collector excludes tries recorded as live or nascent in the latest installed checkpoint.
 -- Block adoption installs the replacement protection from the persisted table blocks together with the new block index.
 -- Pending tries remain required because a retained replica notice can complete their compaction cohort after recovery.
--- Query and transaction snapshots register at the partition owner's state boundary.
--- An admitted provider operation retains that registration through completion, including after caller cancellation.
--- Query execution carries the selected storage registration through provider admission and checks its lease before returning a memory or provider answer.
+-- An admitted provider operation retains its captured values through completion, including after caller cancellation.
+-- Query execution checks its read lease before returning a memory or provider answer.
 -- Compactor reset starts a new naming epoch, so a deletion authorized before it can never reach an output planned after it.
 --
--- Query and fragment snapshots on coordinated storage register with the catalog floor before storage access.
--- An admitted capture retains that registration through its provider requests.
--- The captures of one catalog version through one buffer pool share one registration, which ends when the last of them ends.
--- Each capture that joins a held registration is admitted against the floor exactly as a new registration would be.
--- A database holds its own share of the registration for the cut its partition publishes, from that cut's first capture until it publishes another.
--- Compaction and stored artefact builds register their input catalogs on coordinated storage.
--- A fallback build registers the catalog it recaptures for its own reads.
+-- Only a hosted journal grants per-read custody: an anchored catalog's exact checkpoint and suffix are protected by the
+-- journal, with the erasure custody of its plaintext delivery, for as long as the read holds them. That custody is the
+-- hosted journal's own protocol and refuses a catalog its erasure floor has passed; it is not a collection registration.
 -- Replicated snapshots on uncoordinated storage hold a bounded read lease.
 -- A node anchors its lease at a monotonic clock reading taken before it reads the replica log's tip, once its catalog has applied that tip.
 -- A node confirms any pending observation its catalog has already applied before deciding whether to sample the tip again.
@@ -50,27 +50,25 @@
 -- A node whose catalog cannot be confirmed current waits up to the margin for its log processor.
 -- A replicated query or delegated fragment without a current lease is refused at snapshot admission.
 -- An admitted snapshot still checks the lease before beginning each provider request.
--- The native collector deletes an eligible trie only once `reader_lease` has passed on its own monotonic clock since it first observed that trie as eligible.
+-- On uncoordinated storage the collector also waits `reader_lease` on its own monotonic clock after first observing a
+-- level-0 trie, retired search run or directory page as eligible; on coordinated storage the garbage window alone
+-- governs compacted tries.
 -- In Multi, an installed trie release can settle as soon as its floor, recovery coverage and provider publication authorize retirement.
 -- Path releases and checkpoint pack collection still use a separate grace.
 -- Local Multi can also erase an original L0 pack under independent replay archive custody.
 -- That erasure retains logical L0 descriptors so ordered-index replay can resolve the same inputs.
--- Native nodes with a local journal and local storage share a catalog floor at the storage root.
--- Catalog admission and floor advancement use the same filesystem lock.
--- A reader's shared ticket lock retains its catalog until its last provider operation completes or its process exits.
+-- Native nodes with a local journal and local storage share a retirement and erasure ledger at the storage root.
+-- A retirement closes the publication of each exact compacted name it releases, so a retired name is never published
+-- again; it installs no reader floor. Only an erasure installs the ledger's floor, below which a captured catalog is
+-- refused with `rtdb/erased-under-view`.
 -- The collector submits an installed receipt to the storage owner.
 -- The classic grant binds that receipt's immutable file identities to the storage owner.
--- The current conservative decision persists the admission floor before issuing the grant.
 -- A native local trie deletion grant holds the recovery gate exclusively through the physical deletion.
 -- A startup hold shares that gate through checkpoint discovery and cursor admission.
--- A capture in the floor's journal must supply a cut at or above the durable floor.
 -- A successor journal can open from the latest durable checkpoint after offline replacement.
--- Held catalogs from the predecessor and opaque captures delay the successor floor.
--- Installing the successor floor fences earlier journals.
--- Classic remote storage orders holds and floor advancement on one conditional-write object in the storage root.
--- The object sequence advances even when rescinding an absent hold after an uncertain registration.
--- A remote hold remains through its last admitted provider request.
--- Loss of the holder without a drain retains its ticket.
+-- A retirement from an older journal than one the ledger has recorded is refused.
+-- Classic remote storage records the installed retirement floor on one conditional-write object in the storage root.
+-- A ledger written by an older node may still list reader holds; they are ignored.
 -- An exclusive compactor reset resumes cut publication after it adopts its new naming epoch.
 -- The installed prefix covers the new catalog before the reset completes.
 -- A coordinated reset stages the compacted file identities with the successor block and naming epoch before adoption.
@@ -81,14 +79,14 @@
 -- A skipped replay record or an unrecognized prefix cannot supply this acknowledgement.
 -- When its partition has an installed catalog cut, the native collector persists an intent for each batch before releasing files or submitting the removal.
 -- It records a later receipt from that journal before releasing the intent marker.
--- In Multi the serving writer proposes that installed cut as the admission floor for its storage root.
--- If an older or opaque catalog is still held, the marker stays pending until a successor can install or observe the floor.
+-- In Multi the serving writer records that installed cut as the retirement floor for its storage root.
+-- Reader claims an older node left in the directory record never hold the floor back; they leave with their region.
 -- A hosted trie batch queues its files only after the durable receipt and floor cover the same installed cut.
 -- The release operation loads the installed receipt by its exact plan digest.
 -- Its release records carry the residence, object namespace and installed cut.
 -- The cell reaper admits the release when its directory observation carries that residence and namespace and covers the installed cut in the same storage root and journal.
 -- The published recovery inventory must cover the installed removal.
--- Older recovery and metadata admissions retain the released files until their provider work drains.
+-- Recovery and metadata admissions retain the released files until their provider work drains.
 -- A coordinated receipt L0 release requires a successor omitting the compacted input.
 -- Directory custody authenticates the exact publication and uses the certified replay anchor to exclude the removal position.
 -- On Classic local storage, the same grant owner requires the retained repair anchor and the exclusive recovery gate before deleting a receipt L0.
@@ -97,7 +95,7 @@
 -- Files in that plan release in artefact, data and metadata order.
 -- An interrupted release retains the plan so a successor can retry the files before releasing the intent marker.
 -- Hosted collection waits for an installed catalog cut before selecting a batch.
--- The floor is a bound on future reader admission; physical erasure continues through the timed release path.
+-- Physical erasure continues through the timed release path.
 -- An observed version of a loose data or metadata file matches the publication only when it equals the version the selected catalog recorded.
 -- A file without a matching publication remains eligible for collection through the existing timed path.
 -- A new collector checks pending intents in the same storage root and journal.
@@ -356,14 +354,14 @@ rule TrieGcLoopRunsCycle {
 
 rule GarbageCollectTries {
     -- Run one cycle: collect garbage from every table in the table catalog.
-    -- The same cycle releases superseded logical search runs once the current checkpoint and all admitted readers have moved past their receipts.
+    -- The same cycle releases logical search runs superseded at or before the garbage-as-of horizon once the current checkpoint has moved past their receipts.
     -- Stores without exact search-run retirement wait for the collection lease to elapse.
     -- Hosted release binds the provider publication to a catalog floor before acknowledgement.
-    -- Entity-directory collection marks all pages reachable from the current root, retained checkpoints, captured readers, and retired roots still within their reader lease.
+    -- Entity-directory collection marks all pages reachable from the current root, retained checkpoints, and retired roots still within their reader lease; a captured reader marks nothing.
     -- After its reader lease, a retired root can release its unmarked pages.
     -- Hosted fork and archive holds continue to protect the pages in their checkpoint closures.
     -- A replay checkpoint holds every page reached by each active entity directory.
-    -- Term-directory pages have no retirement ledger: collection releases a stored page that no current, checkpointed or captured root reaches, once the reader lease has passed since it was first seen unreachable.
+    -- Term-directory pages have no retirement ledger: collection releases a stored page that no current or checkpointed root reaches, once the reader lease has passed since it was first seen unreachable.
     -- Each term-directory build gives newly written pages distinct digests so a rebuild cannot revive a page selected by a concurrent sweep.
     -- Hosted release of a retired search run, an exact sealed artefact, or a directory page waits for an open lineage, drained fork preparations, and the withdrawal of declared fork references to the publication.
     -- A hosted directory page release requires an observed immutable provider publication.
@@ -458,7 +456,7 @@ rule DeleteAndCommitChunkRule {
     -- The ordered release records the replica position at which the abandoned allocation settled.
     -- A checkpoint preserves the released abandonment until collection orders its removal.
     -- Collection requires the oldest recoverable checkpoint boundary to follow settlement, and a fresh observation that the drained writer's staging intent is absent.
-    -- Open catalog captures and local recovery admissions can retain an older view.
+    -- Local recovery admissions can retain an older view; open catalog captures register nothing.
     -- Classic local collection holds the recovery gate exclusively through durable publication of the prune to the source log.
     -- The collector releases the gate before waiting for ordered application.
     -- Directory-page collection precedes search tombstone pruning within a table's sweep.
@@ -476,7 +474,7 @@ rule DeleteAndCommitChunkRule {
     -- A member the catalog holds and this cycle does not collect, live or not yet past its garbage lifetime, keeps them.
     -- A search pack follows the same retention rule using the member list in its object name.
     -- finished_pack_files selects packs whose held members are all eligible and whose final held member is in the current deletion chunk.
-    -- A sealed search file on a garbage level-0 trie can retire when neither a checkpoint nor a reader needs that trie and the read lease has elapsed.
+    -- A sealed search file on a garbage level-0 trie can retire when no checkpoint needs that trie and the read lease has elapsed.
     -- Its primary data and metadata retain their recovery custody.
     -- See: maintenance/src/gc.rs (collect_table, finished_groups)
     when: DeleteAndCommitChunk(table, chunk)
@@ -543,7 +541,7 @@ rule RetireDueTables {
     -- World overlays of the relation stay outside: they go with their world.
     -- The collector publishes the due tables in chunks of tries_deleted_chunk_size, each with the applied present as its retirement time, and awaits each record's application.
     -- The cycle that publishes still collects from the catalog it captured before, so the newly garbage tries wait for a later cycle.
-    -- From then on they are garbage like any superseded trie: the eligibility, reader and checkpoint protection, reader lease and DeleteAndCommitChunk rules apply unchanged.
+    -- From then on they are garbage like any superseded trie: the eligibility window, checkpoint protection, reader lease and DeleteAndCommitChunk rules apply unchanged.
     -- L0 recovery files of a retired table stay, as every table's do.
     -- A failure is reported to the observer and leaves the rest of the cycle running.
     -- See: maintenance/src/gc.rs (retire_due_tables), node/src/table_retirement.rs

@@ -1,5 +1,5 @@
 {
-  "summary": "An open serving residence admits catalog captures at or above its installed admission floor.",
+  "summary": "An open serving residence admits only its own owner, residence and journal epoch.",
   "flags": [
     "--no-external-by-default",
     "--verify-module",
@@ -7,7 +7,7 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 11,
+  "min_verified_functions": 6,
   "controls": {
     "ignore_serving": {
       "defect": "The deployment no longer serves reads.",
@@ -25,7 +25,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 10
+      "min_verified_functions": 5
     },
     "weaken_serving": {
       "defect": "The function and contract both admit a reader in this case. The deployment no longer serves reads.",
@@ -48,7 +48,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 10
+      "min_verified_functions": 5
     },
     "ignore_owner": {
       "defect": "The storage owner is closed.",
@@ -66,7 +66,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 10
+      "min_verified_functions": 5
     },
     "weaken_owner": {
       "defect": "The function and contract both admit a reader in this case. The storage owner is closed.",
@@ -89,7 +89,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 10
+      "min_verified_functions": 5
     },
     "ignore_residence": {
       "defect": "The deployment has changed residence.",
@@ -107,7 +107,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 10
+      "min_verified_functions": 5
     },
     "weaken_residence": {
       "defect": "The function and contract both admit a reader in this case. The deployment has changed residence.",
@@ -130,7 +130,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 10
+      "min_verified_functions": 5
     },
     "ignore_journal": {
       "defect": "The installation now uses a different journal epoch.",
@@ -148,7 +148,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 10
+      "min_verified_functions": 5
     },
     "weaken_journal": {
       "defect": "The function and contract both admit a reader in this case. The installation now uses a different journal epoch.",
@@ -171,130 +171,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 10
-    },
-    "admit_stale": {
-      "defect": "The acknowledged floor permits an older capture.",
-      "mutate": [
-        {
-          "file": "rust/crates/multi/src/catalog_reader_admission.rs",
-          "find": "            Some(position) => position >= lower,\n        },\n    }\n}",
-          "replace": "            Some(_position) => true,\n        },\n    }\n}"
-        }
-      ],
-      "expect": [
-        {
-          "file": "rust/crates/multi/src/catalog_reader_admission.rs",
-          "function": "admits_after_floor",
-          "category": "postcondition not satisfied"
-        }
-      ],
-      "min_verified_functions": 10
-    },
-    "weaken_admit_stale": {
-      "defect": "The acknowledged floor permits an older capture.",
-      "mutate": [
-        {
-          "file": "rust/crates/multi/src/catalog_reader_admission.rs",
-          "find": "            Some(position) => position >= lower,\n        },\n    }\n}",
-          "replace": "            Some(_position) => true,\n        },\n    }\n}"
-        },
-        {
-          "file": "rust/crates/multi/src/catalog_reader_admission.rs",
-          "find": "            Some(position) => position >= lower,\n        },\n    }),",
-          "replace": "            Some(_position) => true,\n        },\n    }),"
-        }
-      ],
-      "expect": [
-        {
-          "file": "verification/verus/catalog_reader_admission/laws.rs",
-          "function": "an_older_capture_refuses",
-          "category": "assertion failed"
-        }
-      ],
-      "min_verified_functions": 10
-    },
-    "admit_opaque": {
-      "defect": "An opaque capture is admitted while a floor exists.",
-      "mutate": [
-        {
-          "file": "rust/crates/multi/src/catalog_reader_admission.rs",
-          "find": "            None => false,\n            Some(position) => position >= lower,\n        },\n    }\n}",
-          "replace": "            None => true,\n            Some(position) => position >= lower,\n        },\n    }\n}"
-        }
-      ],
-      "expect": [
-        {
-          "file": "rust/crates/multi/src/catalog_reader_admission.rs",
-          "function": "admits_after_floor",
-          "category": "postcondition not satisfied"
-        }
-      ],
-      "min_verified_functions": 10
-    },
-    "weaken_admit_opaque": {
-      "defect": "An opaque capture is admitted while a floor exists.",
-      "mutate": [
-        {
-          "file": "rust/crates/multi/src/catalog_reader_admission.rs",
-          "find": "            None => false,\n            Some(position) => position >= lower,\n        },\n    }\n}",
-          "replace": "            None => true,\n            Some(position) => position >= lower,\n        },\n    }\n}"
-        },
-        {
-          "file": "rust/crates/multi/src/catalog_reader_admission.rs",
-          "find": "            None => false,\n            Some(position) => position >= lower,\n        },\n    }),",
-          "replace": "            None => true,\n            Some(position) => position >= lower,\n        },\n    }),"
-        }
-      ],
-      "expect": [
-        {
-          "file": "verification/verus/catalog_reader_admission/laws.rs",
-          "function": "an_opaque_capture_refuses_when_a_floor_exists",
-          "category": "assertion failed"
-        }
-      ],
-      "min_verified_functions": 10
-    },
-    "refuse_equal": {
-      "defect": "A capture at the floor is refused.",
-      "mutate": [
-        {
-          "file": "rust/crates/multi/src/catalog_reader_admission.rs",
-          "find": "            Some(position) => position >= lower,\n        },\n    }\n}",
-          "replace": "            Some(position) => position > lower,\n        },\n    }\n}"
-        }
-      ],
-      "expect": [
-        {
-          "file": "rust/crates/multi/src/catalog_reader_admission.rs",
-          "function": "admits_after_floor",
-          "category": "postcondition not satisfied"
-        }
-      ],
-      "min_verified_functions": 10
-    },
-    "weaken_refuse_equal": {
-      "defect": "A capture at the floor is refused.",
-      "mutate": [
-        {
-          "file": "rust/crates/multi/src/catalog_reader_admission.rs",
-          "find": "            Some(position) => position >= lower,\n        },\n    }\n}",
-          "replace": "            Some(position) => position > lower,\n        },\n    }\n}"
-        },
-        {
-          "file": "rust/crates/multi/src/catalog_reader_admission.rs",
-          "find": "            Some(position) => position >= lower,\n        },\n    }),",
-          "replace": "            Some(position) => position > lower,\n        },\n    }),"
-        }
-      ],
-      "expect": [
-        {
-          "file": "verification/verus/catalog_reader_admission/laws.rs",
-          "function": "a_capture_at_or_after_the_floor_is_admitted",
-          "category": "assertion failed"
-        }
-      ],
-      "min_verified_functions": 10
+      "min_verified_functions": 5
     }
   }
 }

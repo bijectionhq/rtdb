@@ -37,8 +37,7 @@ async fn remote_namespaces_share_a_provider_without_aliasing() {
 }
 
 #[tokio::test]
-async fn classic_remote_collection_closes_catalog_admission_only_after_the_held_read_drains() {
-    use rtdb_storage::IoRegion;
+async fn remote_collection_advances_the_floor_without_waiting_for_any_reader() {
     use rtdb_types::{CatalogCut, ReplicaPosition, StorageEpoch, StorageVersion};
 
     let provider = Arc::new(object_store::memory::InMemory::new());
@@ -48,33 +47,9 @@ async fn classic_remote_collection_closes_catalog_admission_only_after_the_held_
     let older = CatalogCut { storage_version: StorageVersion(6), storage_epoch: StorageEpoch(0),
         replica_epoch: StorageEpoch(0), through: ReplicaPosition(1) };
     let newer = CatalogCut { through: ReplicaPosition(2), ..older };
-    let permit = reader.retain_catalog(Some(older)).await.unwrap().unwrap();
-
-    let io = IoRegion::new();
-    let worker = Arc::clone(&io);
-    let (entered, running) = tokio::sync::oneshot::channel();
-    let (finish, drained) = std::sync::mpsc::channel();
-    let waiter = tokio::spawn(IoRegion::retaining(permit, async move {
-        worker.run_blocking(move || {
-            entered.send(()).unwrap();
-            drained.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-            Ok(())
-        }).await
-    }));
-    running.await.unwrap();
-    waiter.abort();
-    assert!(waiter.await.unwrap_err().is_cancelled());
-    assert!(!collector.advance_catalog_floor(newer).await.unwrap());
-
-    finish.send(()).unwrap();
-    io.close_and_wait().await;
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while !collector.advance_catalog_floor(newer).await.unwrap() {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    }).await.unwrap();
-    assert_eq!(reader.retain_catalog(Some(older)).await.err().unwrap().code, "rtdb.storage/catalog-not-current");
-    assert!(reader.retain_catalog(Some(newer)).await.unwrap().is_some());
+    assert!(reader.admit_catalog(Some(older), None).await.unwrap().is_none(), "an object store grants no per-read custody");
+    assert!(collector.advance_catalog_floor(newer).await.unwrap(), "a reader of an older catalog never holds the floor back");
+    assert!(reader.admit_catalog(Some(older), None).await.unwrap().is_none());
     assert!(collector.list(None).await.unwrap().is_empty());
 }
 

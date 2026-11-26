@@ -126,9 +126,7 @@ impl Service {
             if view.cut.basis != basis {
                 return Err(expired());
             }
-            let snapshot = rtdb_query::retain_catalog_snapshot(view.snapshot, database.storage())
-                .await
-                .map_err(error::anomaly)?;
+            let snapshot = view.snapshot;
             let time = view.cut.system_time;
             let captured = DatabaseSnapshot {
                 partitions: vec![snapshot],

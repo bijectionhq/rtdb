@@ -13,7 +13,6 @@ pub mod sealing;
 mod lease_decision;
 mod local_catalog;
 mod local_erasure;
-mod classic_catalog_drain;
 mod classic_retirement;
 mod repair_anchor_decision;
 mod remote_version_step;

@@ -137,7 +137,7 @@ impl OpenTransaction<'_> {
         rtdb_types::OwnedRetirement::at(self.tx_key().system_time, retain_micros)?;
 
         let store = self.context.storage.object_store().as_ref();
-        let hold = HeldView::catalog_at(store, base.clone(), base.catalog_cut(), base.catalog_checkpoint()?, base.catalog_file_paths()).await?;
+        let hold = HeldView::catalog_at(store, base.clone(), base.catalog_cut(), base.catalog_checkpoint()?).await?;
         let (mut data_history, journal_history) = IoRegion::reading(hold, async {
             let mut bytes_left = MAX_FILE_BYTES;
             let mut file_slots = MAX_FILES;

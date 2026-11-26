@@ -13,15 +13,15 @@ tokio::task_local! {
     static AUDIENCE_OBJECT_READ: ();
 }
 
-/// Registrations covering the physical catalogs used by one execution.
+/// The owners an execution keeps alive while it reads the physical catalogs it captured: the captured values themselves
+/// and any custody a hosted storage owner granted for them. No reader registers with local or object-store storage.
 pub struct HeldView {
     _owners: Arc<[Arc<dyn Send + Sync>]>,
 }
 
 impl HeldView {
-    pub fn new(catalog: Arc<dyn Send + Sync>, registrations: Vec<Arc<crate::cache::HeldCatalogRead>>) -> Self {
-        let owners = std::iter::once(catalog).chain(registrations.into_iter().map(|hold| hold as Arc<dyn Send + Sync>)).collect();
-        Self { _owners: owners }
+    pub fn new(catalog: Arc<dyn Send + Sync>, admissions: Vec<Arc<dyn Send + Sync>>) -> Self {
+        Self { _owners: std::iter::once(catalog).chain(admissions).collect() }
     }
 
     /// Carries a recovery registration issued by the owner of the opened storage residence.
@@ -29,28 +29,19 @@ impl HeldView {
         Arc::new(Self { _owners: Arc::from([registration]) })
     }
 
-    /// Acquires the serving hold before reading files selected from the captured catalog.
+    /// Admits the captured catalog with its storage owner before reading files selected from it.
     pub async fn catalog(
         store: &dyn crate::ObjectStore, owner: Arc<dyn Send + Sync>, cut: Option<rtdb_types::CatalogCut>,
-        paths: Option<Arc<[String]>>,
     ) -> rtdb_types::Result<Arc<Self>> {
-        Self::catalog_at(store, owner, cut, None, paths).await
+        Self::catalog_at(store, owner, cut, None).await
     }
 
     pub async fn catalog_at(
         store: &dyn crate::ObjectStore, owner: Arc<dyn Send + Sync>, cut: Option<rtdb_types::CatalogCut>,
-        checkpoint: Option<rtdb_types::CatalogCheckpoint>, paths: Option<Arc<[String]>>,
+        checkpoint: Option<rtdb_types::CatalogCheckpoint>,
     ) -> rtdb_types::Result<Arc<Self>> {
-        let registration = match (cut.zip(checkpoint), paths) {
-            (Some((cut, checkpoint)), paths) => store.retain_anchored_catalog(cut, checkpoint, paths).await?,
-            (None, Some(paths)) => store.retain_catalog_with_paths(cut, paths).await?,
-            (None, None) => store.retain_catalog(cut).await?,
-        };
-        if store.defers_trie_releases() && registration.is_none() {
-            return Err(rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.storage/catalog-not-held",
-                "The coordinated storage owner returned no catalog hold"));
-        }
-        Ok(Arc::new(Self { _owners: std::iter::once(owner).chain(registration).collect() }))
+        let admission = store.admit_catalog(cut, checkpoint).await?;
+        Ok(Arc::new(Self { _owners: std::iter::once(owner).chain(admission).collect() }))
     }
 }
 

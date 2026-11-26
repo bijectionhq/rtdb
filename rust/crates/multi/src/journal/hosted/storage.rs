@@ -622,10 +622,13 @@ impl ObjectStore for ServingStore {
         source.open(files, objects.clone(), Arc::clone(&self.upper)).await
     }
 
-    async fn retain_anchored_catalog(
-        &self, cut: rtdb_types::CatalogCut, base: rtdb_types::CatalogCheckpoint,
-        _paths: Option<Arc<[String]>>,
+    /// The hosted journal protects the exact checkpoint and suffix of an anchored catalog, with its erasure custody, for
+    /// the read. This custody is the hosted journal's own protocol, not a GC registration: it refuses a catalog the
+    /// journal's erasure floor has passed.
+    async fn admit_catalog(
+        &self, cut: Option<rtdb_types::CatalogCut>, checkpoint: Option<rtdb_types::CatalogCheckpoint>,
     ) -> Result<Option<Arc<dyn Send + Sync>>> {
+        let Some((cut, base)) = cut.zip(checkpoint) else { return Ok(None); };
         let source = self.snapshot.as_ref().ok_or_else(|| invalid("This serving store has no snapshot owner"))?;
         source.retain(cut, base).await.map(Some)
     }

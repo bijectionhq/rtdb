@@ -198,45 +198,24 @@ pub trait ObjectStore: Send + Sync {
     async fn catalog_delivery_lease(&self) -> rtdb_types::Result<Option<Arc<crate::ReadLease>>> {
         Ok(None)
     }
-    /// Registers a captured catalog in a shared serving store.
-    /// A missing cut represents an opaque capture. Standalone stores need no remote registration.
-    async fn retain_catalog(&self, _cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
-        Ok(None)
-    }
-    /// Admits the physical dependencies of one exact catalog checkpoint and suffix.
-    async fn retain_anchored_catalog(
-        &self, cut: rtdb_types::CatalogCut, _base: rtdb_types::CatalogCheckpoint,
-        paths: Option<Arc<[String]>>,
+    /// Admits one read of a captured catalog where the storage owner grants per-read custody: a hosted journal's
+    /// protected snapshot and the erasure custody its plaintext delivery holds. The returned value keeps that custody
+    /// while it lives.
+    /// Every other store returns `None` and keeps no reader state: a superseded file stays readable for the
+    /// garbage-collection window (the newest blocks to keep and the garbage lifetime), and a read of a catalog older than
+    /// that window may find its files gone, as in XTDB.
+    async fn admit_catalog(
+        &self, _cut: Option<rtdb_types::CatalogCut>, _checkpoint: Option<rtdb_types::CatalogCheckpoint>,
     ) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
-        match paths {
-            Some(paths) => self.retain_catalog_with_paths(Some(cut), paths).await,
-            None => self.retain_catalog(Some(cut)).await,
-        }
-    }
-    /// Registers the complete collectable file paths of the captured catalog.
-    async fn retain_catalog_with_paths(&self, cut: Option<rtdb_types::CatalogCut>, _paths: Arc<[String]>)
-        -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
-        self.retain_catalog(cut).await
-    }
-    /// Admits another reader of a catalog whose registration this process holds throughout the call, refusing it exactly
-    /// when a new registration of the same cut, paths and checkpoint would be refused, without registering again.
-    async fn readmit_catalog(
-        &self, cut: Option<rtdb_types::CatalogCut>, paths: Option<Arc<[String]>>, checkpoint: Option<rtdb_types::CatalogCheckpoint>,
-    ) -> rtdb_types::Result<()> {
-        let registration = match (cut, checkpoint, paths) {
-            (Some(cut), Some(base), paths) => self.retain_anchored_catalog(cut, base, paths).await?,
-            (cut, _, Some(paths)) => self.retain_catalog_with_paths(cut, paths).await?,
-            (cut, _, None) => self.retain_catalog(cut).await?,
-        };
-        drop(registration);
-        Ok(())
+        Ok(None)
     }
     /// Whether physical trie retirement belongs to a coordinated storage authority.
     fn defers_trie_releases(&self) -> bool { false }
     /// The custodian can settle covered receipt L0 after releasing its recovery dependencies.
     fn releases_receipt_l0(&self) -> bool { false }
-    /// Records an installed retirement as a lower bound for new catalog captures.
-    /// Returns false while a reader still needs a catalog before the proposed floor.
+    /// Records an installed retirement with its storage authority before its files are released.
+    /// Readers never hold it back: the retirement was selected from tries superseded before the garbage-as-of horizon.
+    /// Returns false only while the authority cannot record it yet and expects the caller to retry.
     async fn advance_catalog_floor(&self, _installed: rtdb_types::CatalogCut) -> rtdb_types::Result<bool> {
         Ok(true)
     }
@@ -245,8 +224,9 @@ pub trait ObjectStore: Send + Sync {
     async fn release_trie_files(&self, _receipt: &ObjectKey, _contents: Bytes) -> rtdb_types::Result<bool> {
         Err(rtdb_types::Anomaly::unsupported("rtdb.storage/trie-release", "This store has no coordinated trie release"))
     }
-    /// Closes stale catalog admissions and checks current holds for each Classic candidate.
-    /// A path is supplied only when the installed receipt identifies an immutable file of a compacted trie.
+    /// Records the installed retirement and closes the publication of each exact Classic candidate, so a retired name is
+    /// never published again. A path is supplied only when the installed receipt identifies an immutable file of a
+    /// compacted trie.
     async fn close_classic_trie_admission(&self, cut: rtdb_types::CatalogCut, paths: &[Option<&str>]) -> rtdb_types::Result<Vec<bool>> {
         Ok(vec![self.advance_catalog_floor(cut).await?; paths.len()])
     }
@@ -287,7 +267,7 @@ pub trait ObjectStore: Send + Sync {
     /// Checks storage-side dependencies before attempting to release a retired search run.
     async fn permits_search_release(&self, _key: &ObjectKey, _publication: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
         _cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<bool> { Ok(true) }
-    /// Checks catalog retention.
+    /// Checks that the retirement is recorded before a search tombstone is pruned.
     /// On Classic local storage the caller holds the exclusive recovery gate during this check and durable publication.
     async fn permits_search_tombstone_prune(&self, key: &ObjectKey, publication: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
         _checkpoint: rtdb_types::BlockIndex, cut: rtdb_types::CatalogCut) -> rtdb_types::Result<bool> {
@@ -709,7 +689,7 @@ impl LocalStore {
         let mapped = root_mappings(&root);
         Ok(Self { root: Arc::new(root), io, catalog: None, mapped })
     }
-    /// Joins the catalog admission and retirement ledger on a shared local filesystem.
+    /// Joins the retirement and erasure ledger on a shared local filesystem.
     pub fn with_catalog_ledger(mut self, replica_epoch: rtdb_types::StorageEpoch) -> Self {
         self.catalog = Some(Arc::new(crate::local_catalog::LocalCatalogLedger::new(self.root.clone(), replica_epoch)));
         self
@@ -740,7 +720,8 @@ impl LocalStore {
         Ok(gate.map(|gate| Arc::new(gate) as Arc<dyn Send + Sync>))
     }
 
-    pub async fn close_erasure_catalog(&self, cut: rtdb_types::CatalogCut) -> rtdb_types::Result<bool> {
+    /// Installs the erasure floor at `cut`; a catalog captured before it is refused from then on.
+    pub async fn close_erasure_catalog(&self, cut: rtdb_types::CatalogCut) -> rtdb_types::Result<()> {
         let ledger = self.catalog.clone().ok_or_else(|| rtdb_types::Anomaly::unsupported(
             "rtdb.storage/erasure-catalog", "This store has no local catalog ledger"))?;
         self.io.read(ledger, cut, |ledger, &cut| Ok(ledger.close_erasure_admission(cut))).await?
@@ -868,26 +849,6 @@ impl ObjectStore for LocalStore {
     fn permits_shared_read_cache(&self) -> bool { true }
     fn local_maintenance_store(&self) -> Option<&LocalStore> { Some(self) }
     fn syncs_checkpoints(&self) -> bool { true }
-
-    async fn retain_catalog(&self, cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
-        let Some(ledger) = self.catalog.clone() else { return Ok(None); };
-        Ok(Some(Arc::new(self.io.read(ledger, cut, |ledger, &cut| Ok(ledger.retain(cut, None))).await??)))
-    }
-
-    async fn retain_catalog_with_paths(&self, cut: Option<rtdb_types::CatalogCut>, paths: Arc<[String]>)
-        -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
-        let Some(ledger) = self.catalog.clone() else { return Ok(None); };
-        Ok(Some(Arc::new(self.io.read(ledger, (cut, paths), |ledger, (cut, paths)| {
-            Ok(ledger.retain(*cut, Some(paths)))
-        }).await??)))
-    }
-
-    async fn readmit_catalog(
-        &self, cut: Option<rtdb_types::CatalogCut>, _paths: Option<Arc<[String]>>, _checkpoint: Option<rtdb_types::CatalogCheckpoint>,
-    ) -> rtdb_types::Result<()> {
-        let Some(ledger) = &self.catalog else { return Ok(()); };
-        self.io.read_inline(|| Ok(ledger.readmit(cut)))?
-    }
 
     fn defers_trie_releases(&self) -> bool { self.catalog.is_some() }
     fn releases_receipt_l0(&self) -> bool { self.catalog.is_some() }

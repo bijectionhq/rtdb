@@ -2289,7 +2289,8 @@ async fn compactor_reset_preserves_checkpoint_history_and_resumes_retirement_aft
         let plan = node.prepare_compactor_reset("xtdb", &CancellationToken::new()).await.unwrap();
         let database = node.catalog().database("xtdb").unwrap();
         let cut = database.snapshot().catalog_cut().unwrap();
-        let old_reader = database.object_store().retain_catalog(Some(cut)).await.unwrap().unwrap();
+        // A reader of the pre-reset catalog registers nothing with storage and does not defer the reset's release.
+        let old_reader = database.snapshot();
         let published = plan.apply(&CancellationToken::new()).await.unwrap();
         assert!(database.status().adopted_block.as_ref().is_some_and(|block| block.block_index() >= published));
         for key in &compacted { assert!(storage_root.join(key.as_str()).is_file()); }
@@ -2315,15 +2316,13 @@ async fn compactor_reset_preserves_checkpoint_history_and_resumes_retirement_aft
         let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
         assert_eq!(rows(session.query_sql(sql, vec![]).await.unwrap()).await, before);
         assert_eq!(database.snapshot().trie_catalog().naming_epoch(), 1, "the reset's block carries the new naming epoch through restart");
-        for key in &compacted { assert!(storage_root.join(key.as_str()).is_file()); }
-        drop(old_reader);
         tokio::time::timeout(Duration::from_secs(10), async {
             while compacted.iter().any(|key| storage_root.join(key.as_str()).exists()) {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         }).await.unwrap();
         assert_eq!(database.status().adopted_block.as_ref().unwrap().block_index(), published);
-        assert_eq!(database.object_store().retain_catalog(Some(cut)).await.err().unwrap().code, "rtdb.storage/catalog-not-current");
+        assert!(old_reader.catalog_cut().is_some_and(|captured| captured == cut));
         let data_directory = storage_root.join("tables").join(slug.as_str()).join("data");
         let recovered: BTreeSet<_> = std::fs::read_dir(&data_directory).unwrap()
             .map(|entry| entry.unwrap().file_name()).collect();
@@ -3400,8 +3399,8 @@ async fn default_sealed_local_erase_waits_for_the_original_generation_and_resume
         let view = serving.query(QuerySource { branch: MAIN_BRANCH.into(), at: At::Linearizable, layer: Layer::Merged },
             false, node.now(), &cancel).await.unwrap();
         let generation = view.key_generation.unwrap();
+        // A SQL reader of the pre-erasure catalog registers nothing; the erasure floor refuses it once installed.
         let old_sql_cut = database.snapshot().catalog_cut().unwrap();
-        let old_sql = database.storage().hold_catalog(Some(old_sql_cut)).await.unwrap();
         let incarnation = uuid::Uuid::from_bytes(serving.incarnation());
         let key = b"sealed-local-erase".to_vec();
         let request = Transact {
@@ -3419,9 +3418,7 @@ async fn default_sealed_local_erase_waits_for_the_original_generation_and_resume
         assert!(database.object_store().require_erasure_catalog(Some(old_sql_cut)).await.is_err());
         assert_eq!(serving.tx_status(&key, &cancel).await.unwrap_err().code, "rtdb/erasure-pending");
         drop(view);
-        assert_eq!(serving.tx_status(&key, &cancel).await.unwrap_err().code, "rtdb/erasure-pending");
         stop(&node, owner).await;
-        drop(old_sql);
         drop(sql);
         drop(database);
         drop(node);

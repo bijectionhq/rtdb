@@ -4631,8 +4631,8 @@ def verify_checkpoint_trie_retention(args, source):
     partition = source / "rust/crates/index/src/partition.rs"
     original = partition.read_bytes()
     try:
-        replace_once(partition, "any_reference_requires(checkpoint_requires, self.readers.len(),",
-                     "any_reference_requires(false, self.readers.len(),")
+        replace_once(partition, "self.current.checkpoint_tries.as_ref().is_some_and(|checkpoint| checkpoint.requires(table, key))",
+                     "false")
         checked = run_case(command, source / "rust", args.evidence, "rust-checkpoint-trie-retention-ignore-checkpoint", env)
         if (
             checked.returncode != 101
@@ -4720,39 +4720,6 @@ def verify_durable_trie_retirement(args, source):
         finally:
             path.write_bytes(original)
     print("rust-trie-retirement-intent: restart passed, early release and six weakened journal rules failed")
-
-
-def verify_catalog_admission_floor(args, source):
-    env = os.environ | {
-        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
-        "CARGO_PROFILE_TEST_DEBUG": "0",
-    }
-    test = "catalog_readers::tests::floor_installation_and_reader_admission_share_one_cas"
-    command = ["cargo", "test", "--locked", "-p", "rtdb-multi", "--features", "dynamodb", "--lib", test, "--", "--exact"]
-    baseline = run_case(command, source / "rust", args.evidence, "rust-catalog-floor-baseline", env)
-    if baseline.returncode or f"{test} ... ok" not in baseline.stdout or "1 passed; 0 failed" not in baseline.stdout:
-        raise ValueError("the residence did not coordinate reader admission with the floor")
-
-    readers = source / "rust/crates/multi/src/catalog_readers.rs"
-    original = readers.read_bytes()
-    controls = {
-        "skip-reader-check": ("if all_readers_allow {", "if true {", "an older held catalog must block the floor"),
-        "ignore-floor": (
-            "if !admits_after_floor(cut.map(|cut| cut.through.0), self.floor(record).map(|floor| floor.0)) {",
-            "if false && !admits_after_floor(cut.map(|cut| cut.through.0), self.floor(record).map(|floor| floor.0)) {",
-            "a capture older than the installed floor must refuse",
-        ),
-    }
-    for name, (before, after, failure) in controls.items():
-        try:
-            replace_once(readers, before, after)
-            checked = run_case(command, source / "rust", args.evidence, f"rust-catalog-floor-{name}", env)
-            if (checked.returncode != 101 or f"{test} ... FAILED" not in checked.stdout
-                or failure not in checked.stdout or "0 passed; 1 failed" not in checked.stdout):
-                raise ValueError(f"catalog floor control {name} did not fail at its declared assertion")
-        finally:
-            readers.write_bytes(original)
-    print("rust-catalog-floor: directory replay passed, both missing-admission controls failed")
 
 
 def verify_trie_naming_epoch(args, source):
@@ -6664,7 +6631,6 @@ def main():
             verify_checkpoint_trie_retention(args, source)
             verify_trie_removal_readback(args, source)
             verify_durable_trie_retirement(args, source)
-            verify_catalog_admission_floor(args, source)
             verify_trie_naming_epoch(args, source)
             verify_s3_object_version(args, source)
             verify_s3_exact_retirement(args, source)

@@ -751,21 +751,21 @@ impl Node {
             };
             let snapshot = if let Some((fence, expected_history, admission)) = hosted_fence {
                 let cut = snapshot.catalog_cut().ok_or_else(applied_catalog_unretained)?;
+                // An anchored catalog is a hosted journal's protected snapshot, which must grant custody. Any other store
+                // keeps no reader state: the GC window keeps the captured catalog readable.
                 let permit = if database.requires_anchored_catalog() {
                     if let AppliedCatalogAdmission::PreparedAudience(preparation) = admission {
                         preparation.pin(&database, cut)?;
                     }
                     let checkpoint = snapshot.catalog_checkpoint()?.ok_or_else(applied_catalog_unretained)?;
-                    storage.hold_anchored_catalog(cut, checkpoint, None).await?
+                    Some(storage.admit_catalog(Some(cut), Some(checkpoint)).await?.ok_or_else(applied_catalog_unretained)?)
                 } else {
                     match admission {
                         AppliedCatalogAdmission::PreparedAudience(preparation) => preparation.pin(&database, cut)?,
-                        AppliedCatalogAdmission::PrepareAudience(_) => storage.hold_catalog(Some(cut)).await?,
-                        AppliedCatalogAdmission::Ordinary =>
-                            storage.hold_catalog_with_paths(Some(cut), snapshot.catalog_file_paths()).await?,
+                        AppliedCatalogAdmission::PrepareAudience(_) | AppliedCatalogAdmission::Ordinary =>
+                            storage.admit_catalog(Some(cut), None).await?,
                     }
                 };
-                if !permit.is_registered() { return Err(applied_catalog_unretained()); }
                 let history = match admission {
                     AppliedCatalogAdmission::Ordinary => fence.confirm_hosted(&database).await?,
                     AppliedCatalogAdmission::PrepareAudience(_) | AppliedCatalogAdmission::PreparedAudience(_) =>
@@ -775,12 +775,11 @@ impl Node {
                     return Err(hosted_source_unavailable());
                 }
                 self.attached_database(&name, placement)?;
-                snapshot.with_catalog_read(permit)
-            } else {
-                let snapshot = rtdb_query::retain_catalog_snapshot(snapshot, &database.storage).await?;
-                if let Some(hold) = snapshot.catalog_read_permit::<rtdb_storage::cache::HeldCatalogRead>() {
-                    database.current_catalog.offer(&hold);
+                match permit {
+                    Some(permit) => snapshot.with_catalog_read(permit),
+                    None => snapshot,
                 }
+            } else {
                 snapshot
             };
             snapshots.insert(name, DatabaseSnapshot { partitions: vec![snapshot], storage });
@@ -855,15 +854,13 @@ impl Node {
         ).await.ok_or_else(cancelled)??;
         let installed = &database.storage;
         installed.object_store().require_erasure_catalog(Some(cut)).await?;
-        let (storage, catalog_hold) = if let Some(owner) = replay.provider() {
+        let storage = if let Some(owner) = replay.provider() {
             let view = installed.object_store().open_log_snapshot(owner).await?;
-            (Arc::new(BufferPool::with_budget(view, Arc::clone(installed.budget()))), None)
+            Arc::new(BufferPool::with_budget(view, Arc::clone(installed.budget())))
         } else {
-            let hold = installed.hold_catalog(Some(cut)).await?;
-            if !hold.is_registered() { return Err(crate::sql_snapshots::unretained()); }
-            (Arc::clone(installed), Some(hold))
+            Arc::clone(installed)
         };
-        let dependencies = Arc::new((catalog_hold.clone(), replay.custody()));
+        let dependencies = Arc::new(replay.custody());
         rtdb_storage::IoRegion::retaining(dependencies, async {
             let blocks = rtdb_replication::BlockStore::new(Arc::clone(storage.object_store()),
                 Arc::clone(&storage), Arc::clone(self.memory()), self.factory.options.file_size_target)?;
@@ -876,9 +873,7 @@ impl Node {
             let replay = replay.with_serving(database.native_serving_authority.clone(), Arc::clone(&storage));
             let suffix = recovered.replay_snapshot_suffix(&database.logs, replay, cancellation).await?;
             recovered.partition.publish_catalog_cut(cut)?;
-            let snapshot = recovered.partition.snapshot();
-            let snapshot = if let Some(hold) = catalog_hold { snapshot.with_catalog_read(hold) } else { snapshot };
-            let partition = rtdb_query::retain_catalog_snapshot(snapshot, &storage).await?;
+            let partition = recovered.partition.snapshot();
             let storage = (!Arc::ptr_eq(installed, &storage)).then_some(storage);
             Ok(crate::sql_snapshots::RecoveredSqlSnapshot { partition, suffix, storage })
         }).await
@@ -921,7 +916,6 @@ impl Node {
         }
         let lease = self.catalog_read_lease(&database).await?;
         let snapshot = database.partition.open_snapshot(Some(fragment.basis.tx_id));
-        let snapshot = rtdb_query::retain_catalog_snapshot(snapshot, &database.storage).await?;
         crate::read_currency::require_current(database.name(), lease.as_deref())?;
         let snapshots = BTreeMap::from([(database.name().to_owned(), DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(&database.storage) })]);
         let mut catalog = CatalogSnapshot::new(database.name(), snapshots, false)?;

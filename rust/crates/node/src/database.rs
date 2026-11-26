@@ -43,7 +43,6 @@ pub struct Database {
     read_only: bool,
     pub(crate) partition: Arc<PartitionState>,
     pub(crate) storage: Arc<BufferPool>,
-    pub(crate) current_catalog: Arc<crate::current_catalog::CurrentCatalog>,
     pub(crate) resolve: Arc<ResolveContext>,
     pub(crate) audience_storage: Option<crate::AudienceReadStorage>,
     pub(crate) logs: Arc<PartitionLogs>,
@@ -231,22 +230,19 @@ impl Database {
                 }
             };
             if let Some(snapshot) = snapshot {
-                return tokio::select! {
-                    biased;
-                    _ = cancellation.cancelled() => Err(Anomaly::new(AnomalyCategory::Interrupted, "xtdb/operation-cancelled", "Operation was cancelled")),
-                    _ = self.cancellation.cancelled() => Err(self.replica_behind()),
-                    retained = rtdb_query::retain_catalog_snapshot(snapshot, &self.storage) => {
-                        let retained = retained.map_err(|error| self.replica_behind().with_context("cause", error.code.into()))?;
-                        if let Some(read) = &barrier.certified_read {
-                            if retained.catalog_cut().is_none_or(|cut| cut.through.after_offset(cut.replica_epoch) != read.through) {
-                                return Err(self.replica_behind());
-                            }
-                            read.observe("certified-catalog-capture");
-                            Ok(retained.with_certified_read(read.clone()))
-                        } else {
-                            Ok(retained)
-                        }
+                if cancellation.is_cancelled() {
+                    return Err(Anomaly::new(AnomalyCategory::Interrupted, "xtdb/operation-cancelled", "Operation was cancelled"));
+                }
+                if self.cancellation.is_cancelled() { return Err(self.replica_behind()); }
+                // The captured catalog is read without registering it: the GC window keeps its files readable.
+                return if let Some(read) = &barrier.certified_read {
+                    if snapshot.catalog_cut().is_none_or(|cut| cut.through.after_offset(cut.replica_epoch) != read.through) {
+                        return Err(self.replica_behind());
                     }
+                    read.observe("certified-catalog-capture");
+                    Ok(snapshot.with_certified_read(read.clone()))
+                } else {
+                    Ok(snapshot)
                 };
             }
         }
@@ -713,8 +709,7 @@ impl DatabaseFactory {
                 }));
             }
             static ATTACHMENTS: AtomicU64 = AtomicU64::new(0);
-            let current_catalog = crate::current_catalog::CurrentCatalog::observe(&partition);
-            let database = Arc::new(Database { attachment: ATTACHMENTS.fetch_add(1, Ordering::Relaxed), writes_event_history: event_history, protected_equality_epoch: uuid::Uuid::new_v4(), tokens, name, configuration, read_only, partition, storage, current_catalog, resolve,
+            let database = Arc::new(Database { attachment: ATTACHMENTS.fetch_add(1, Ordering::Relaxed), writes_event_history: event_history, protected_equality_epoch: uuid::Uuid::new_v4(), tokens, name, configuration, read_only, partition, storage, resolve,
                 audience_storage: resources.audience_storage, logs, replication, serving, native_serving_authority: native_authority, default_native_handle,
                 custody_provider: Default::default(), replica_read_index: opened_logs.replica_read_index,
                 await_authority: opened_logs.await_authority,

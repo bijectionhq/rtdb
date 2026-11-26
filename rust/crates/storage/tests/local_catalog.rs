@@ -4,7 +4,7 @@ use rtdb_storage::{Error, LocalStore, ObjectKey, ObjectStore};
 use rtdb_types::{CatalogCut, ReplicaPosition, StorageEpoch, StorageVersion, TableRef};
 
 #[tokio::test]
-async fn a_local_trie_release_waits_for_held_catalogs_and_refuses_stale_reopens() -> rtdb_types::Result<()> {
+async fn a_local_trie_release_waits_for_recovery_but_never_for_a_reader() -> rtdb_types::Result<()> {
     let location = tempfile::tempdir().unwrap();
     let open = || LocalStore::open(location.path()).unwrap().with_catalog_ledger(StorageEpoch(0));
     let reader = open();
@@ -25,21 +25,14 @@ async fn a_local_trie_release_waits_for_held_catalogs_and_refuses_stale_reopens(
     let bytes = Bytes::from([installed.through.0.to_be_bytes().as_slice(), &plan].concat());
     collector.put(&receipt, bytes.clone()).await?;
 
-    let old = reader.retain_catalog(Some(selected)).await?.unwrap();
-    let current = reader.retain_catalog(Some(installed)).await?.unwrap();
-    assert!(!collector.release_trie_files(&receipt, bytes.clone()).await?);
-    assert!(collector.head(&file).await.is_ok());
-
-    drop(old);
     let mut forged = bytes.to_vec();
     forged[7] = 3;
     assert_eq!(collector.release_trie_files(&receipt, forged.into()).await.unwrap_err().code, "rtdb.storage/trie-release");
-    assert_eq!(reader.retain_catalog(Some(selected)).await.err().unwrap().code, "rtdb.storage/catalog-not-current");
 
     let recovery = reader.hold_recovery_open().await?;
     let old_catalog = ObjectKey::new("blocks/b00.binpb")?;
     collector.put(&old_catalog, Bytes::from_static(b"protected checkpoint metadata")).await?;
-    assert!(!collector.release_trie_files(&receipt, bytes.clone()).await?);
+    assert!(!collector.release_trie_files(&receipt, bytes.clone()).await?, "recovery custody still defers the release");
     collector.collect_recovery_file(&old_catalog).await?;
     assert_eq!(reader.get(&old_catalog).await?, Bytes::from_static(b"protected checkpoint metadata"));
     assert!(reader.head(&file).await.is_ok());
@@ -47,22 +40,18 @@ async fn a_local_trie_release_waits_for_held_catalogs_and_refuses_stale_reopens(
 
     collector.collect_recovery_file(&old_catalog).await?;
     assert!(matches!(reader.head(&old_catalog).await, Err(Error::MissingObject(_))));
-    assert!(!collector.release_trie_files(&receipt, bytes.clone()).await?, "a hold without a file inventory keeps every exact file");
-    assert!(reader.head(&file).await.is_ok());
-    drop(current);
+    // The retirement was selected from tries superseded before the GC window, so no reader of an older catalog holds it.
     assert!(collector.release_trie_files(&receipt, bytes.clone()).await?);
-    let new_reader = open();
-    assert_eq!(new_reader.retain_catalog(Some(selected)).await.err().unwrap().code, "rtdb.storage/catalog-not-current");
-    assert_eq!(new_reader.retain_catalog(None).await.err().unwrap().code, "rtdb.storage/catalog-not-current");
-    assert!(new_reader.retain_catalog(Some(installed)).await?.is_some());
-    assert!(collector.release_trie_files(&receipt, bytes).await?);
     assert!(matches!(collector.head(&file).await, Err(Error::MissingObject(_))));
+    assert!(collector.release_trie_files(&receipt, bytes).await?, "a repeated release is idempotent");
+    assert!(reader.require_erasure_catalog(Some(selected)).await.is_ok(), "a retirement installs no floor");
     assert!(collector.list(None).await?.iter().all(|object| !object.key.as_str().contains("catalog-ledger")));
+    assert_eq!(reader_tickets(location.path()), 0);
     Ok(())
 }
 
 #[tokio::test]
-async fn a_newer_local_journal_keeps_prior_holds_and_can_install_its_own_floor() -> rtdb_types::Result<()> {
+async fn a_newer_local_journal_retires_without_waiting_for_the_prior_journal() -> rtdb_types::Result<()> {
     let location = tempfile::tempdir().unwrap();
     let open = |epoch| LocalStore::open(location.path()).unwrap().with_catalog_ledger(epoch);
     let old = CatalogCut {
@@ -75,20 +64,9 @@ async fn a_newer_local_journal_keeps_prior_holds_and_can_install_its_own_floor()
     };
     let predecessor = open(old.replica_epoch);
     assert!(predecessor.advance_catalog_floor(old).await?);
-    let old_hold = predecessor.retain_catalog(Some(old)).await?.unwrap();
-
     let successor = open(replica_epoch);
-    let checkpoint = successor.retain_catalog(None).await?.unwrap();
-    assert!(successor.retain_catalog(Some(old)).await.is_err());
-    assert!(!successor.advance_catalog_floor(current).await?);
-    drop(old_hold);
-    assert!(!successor.advance_catalog_floor(current).await?);
-    drop(checkpoint);
     assert!(successor.advance_catalog_floor(current).await?);
-
-    assert!(predecessor.retain_catalog(Some(old)).await.is_err());
-    assert!(predecessor.advance_catalog_floor(old).await.is_err());
-    assert!(successor.retain_catalog(Some(current)).await?.is_some());
+    assert!(predecessor.advance_catalog_floor(current).await.is_err(), "a ledger refuses a cut of another journal");
     Ok(())
 }
 
@@ -118,40 +96,7 @@ fn reader_tickets(root: &std::path::Path) -> usize {
 }
 
 #[tokio::test]
-async fn readers_of_one_catalog_version_share_one_registration_released_by_the_last_of_them() -> rtdb_types::Result<()> {
-    let location = tempfile::tempdir().unwrap();
-    let store: std::sync::Arc<dyn ObjectStore> =
-        std::sync::Arc::new(LocalStore::open(location.path()).unwrap().with_catalog_ledger(StorageEpoch(0)));
-    let pool = rtdb_storage::cache::BufferPool::new(store, 1 << 20);
-    let cut = CatalogCut {
-        storage_version: StorageVersion(6), storage_epoch: StorageEpoch(0), replica_epoch: StorageEpoch(0),
-        through: ReplicaPosition(1),
-    };
-
-    let first = pool.hold_catalog(Some(cut)).await?;
-    let concurrent = pool.hold_catalog(Some(cut)).await?;
-    assert!(std::sync::Arc::ptr_eq(&first, &concurrent));
-    assert_eq!(reader_tickets(location.path()), 1);
-    drop(first);
-    assert_eq!(reader_tickets(location.path()), 1, "a remaining reader keeps the registration");
-    drop(concurrent);
-    assert_eq!(reader_tickets(location.path()), 0, "the last reader releases the registration at once");
-
-    let consecutive = pool.hold_catalog(Some(cut)).await?;
-    assert_eq!(reader_tickets(location.path()), 1);
-    let later = pool.hold_catalog(Some(CatalogCut { through: ReplicaPosition(2), ..cut })).await?;
-    assert!(!std::sync::Arc::ptr_eq(&consecutive, &later));
-    assert_eq!(later.cut(), Some(CatalogCut { through: ReplicaPosition(2), ..cut }));
-    assert_eq!(reader_tickets(location.path()), 2, "another catalog version registers on its own");
-    let other_version = pool.hold_catalog(Some(CatalogCut { storage_version: StorageVersion(7), ..cut })).await?;
-    assert_eq!(reader_tickets(location.path()), 3);
-    drop((consecutive, later, other_version));
-    assert_eq!(reader_tickets(location.path()), 0, "an idle pool keeps no catalog held");
-    Ok(())
-}
-
-#[tokio::test]
-async fn a_shared_catalog_hold_blocks_the_floor_until_its_last_reader_and_readmits_each_new_reader() -> rtdb_types::Result<()> {
+async fn reading_a_catalog_registers_nothing_and_never_blocks_the_floor() -> rtdb_types::Result<()> {
     let location = tempfile::tempdir().unwrap();
     let open = || LocalStore::open(location.path()).unwrap().with_catalog_ledger(StorageEpoch(0));
     let reader: std::sync::Arc<dyn ObjectStore> = std::sync::Arc::new(open());
@@ -162,37 +107,11 @@ async fn a_shared_catalog_hold_blocks_the_floor_until_its_last_reader_and_readmi
         through: ReplicaPosition(1),
     };
     let installed = CatalogCut { through: ReplicaPosition(2), ..selected };
-
-    let held = pool.hold_catalog(Some(selected)).await?;
-    assert!(!collector.advance_catalog_floor(installed).await?, "a held catalog blocks the floor");
-    let joined = pool.hold_catalog(Some(selected)).await?;
-    drop(held);
-    assert!(!collector.advance_catalog_floor(installed).await?, "the floor stays blocked while any reader holds the catalog");
-    drop(joined);
-    assert!(collector.advance_catalog_floor(installed).await?, "the floor advances as soon as the last reader drops");
-
-    let current = pool.hold_catalog(Some(installed)).await?;
-    let joiner = pool.hold_catalog(Some(installed)).await?;
-    assert!(std::sync::Arc::ptr_eq(&current, &joiner), "a joiner admitted at the installed floor shares the hold");
-    drop(joiner);
-    let file = ObjectKey::new("tables/orders/data/l01-rc-b01.arrow")?;
-    collector.put(&file, Bytes::from_static(b"retired data")).await?;
-    let plan = serde_json::to_vec(&RetirementIntent {
-        selected: installed, table: TableRef::new("public", "orders"), tries: vec!["l01-rc-b01".into()],
-        files: vec![RetirementFile { key: file.to_string(), version: None, matches_publication: false, terminal_publication: None }],
-        after_reset: None,
-    }).unwrap();
-    let later = CatalogCut { through: ReplicaPosition(3), ..selected };
-    let receipt = ObjectKey::new(format!("{}/installed/{}", journal_directory(installed), intent_digest(&plan)))?;
-    let bytes = Bytes::from([later.through.0.to_be_bytes().as_slice(), &plan].concat());
-    collector.put(&receipt, bytes.clone()).await?;
-    assert!(!collector.release_trie_files(&receipt, bytes.clone()).await?, "the held catalog keeps the retired file");
-    assert!(collector.head(&file).await.is_ok());
-    assert_eq!(pool.hold_catalog(Some(installed)).await.err().unwrap().code, "rtdb.storage/catalog-not-current",
-        "a new reader of a held catalog is refused once the floor passes it, as a new registration would be");
-    assert_eq!(reader_tickets(location.path()), 1);
-    drop(current);
-    assert!(collector.release_trie_files(&receipt, bytes).await?);
-    assert!(matches!(collector.head(&file).await, Err(Error::MissingObject(_))));
+    for _ in 0..100 {
+        assert!(pool.admit_catalog(Some(selected), None).await?.is_none(), "local storage grants no per-read custody");
+    }
+    assert_eq!(reader_tickets(location.path()), 0, "no reader ticket is written on the read path");
+    assert!(collector.advance_catalog_floor(installed).await?, "an older reader never holds the floor back");
+    assert!(pool.admit_catalog(Some(selected), None).await?.is_none(), "a read older than a retirement is not refused up front");
     Ok(())
 }

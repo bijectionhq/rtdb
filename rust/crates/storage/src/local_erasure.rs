@@ -143,8 +143,10 @@ impl LocalStore {
             if self.erasure_recovery_fence().await? != Some(fence) {
                 return Err(invalid().into());
             }
-            let drained = self.close_erasure_catalog(cut).await?;
-            if !drained || now_lower < fence.unreadable_by {
+            // No reader registers a catalog: the floor refuses every later capture before `cut`, and the plaintext
+            // delivery window bounds a read already in flight, which `unreadable_by` waits out.
+            self.close_erasure_catalog(cut).await?;
+            if now_lower < fence.unreadable_by {
                 return Ok(false);
             }
             let path = self.object_progress_path(fence);
@@ -351,7 +353,7 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
-    async fn object_retirement_drains_old_catalogs_and_resumes_the_exact_batch() -> Result<()> {
+    async fn object_retirement_refuses_old_catalogs_and_resumes_the_exact_batch() -> Result<()> {
         use crate::sealing::ClassicKeyVault;
         use bytes::Bytes;
         use rtdb_types::{StorageEpoch, StorageVersion};
@@ -395,20 +397,19 @@ mod tests {
         for key in objects.iter().chain([&survivor]) {
             store.put(key, bytes.clone()).await?;
         }
-        let held = store.retain_catalog(Some(prior)).await?.unwrap();
         assert!(raw.close_erasure_recovery(fence).await?);
-        assert!(
-            !raw.settle_erasure_objects(&store, fence, cut, &objects, Timestamp(55))
-                .await?
-        );
-        assert!(store.retain_catalog(Some(prior)).await.is_err());
-        assert!(store.retain_catalog(Some(cut)).await?.is_some());
-        assert_eq!(store.get_fresh(&objects[0]).await?, bytes);
-        drop(held);
+        // Before the plaintext delivery window has passed the floor is installed but nothing is withdrawn yet.
         assert!(
             !raw.settle_erasure_objects(&store, fence, cut, &objects, Timestamp(54))
                 .await?
         );
+        assert_eq!(
+            raw.require_erasure_catalog(Some(prior)).await.unwrap_err().code,
+            "rtdb/erased-under-view"
+        );
+        assert!(raw.require_erasure_catalog(Some(cut)).await.is_ok());
+        assert_eq!(store.get_fresh(&objects[0]).await?, bytes);
+        // No reader registration delays erasure: once the window has passed the first batch is withdrawn and deleted.
         assert!(
             !raw.settle_erasure_objects(&store, fence, cut, &objects, Timestamp(55))
                 .await?

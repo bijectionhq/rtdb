@@ -80,7 +80,7 @@ async fn building_all_records_every_available_artefact_once() {
 }
 
 #[tokio::test]
-async fn a_stored_artefact_holds_its_catalog_until_the_build_drains() {
+async fn a_stored_artefact_build_registers_no_catalog() {
     use rtdb_storage::LocalStore;
     use rtdb_types::{CatalogCut, ReplicaPosition};
     use tokio::sync::Notify;
@@ -120,7 +120,7 @@ async fn a_stored_artefact_holds_its_catalog_until_the_build_drains() {
     let build = tokio::spawn(async move { handle.build_all().await });
     tokio::time::timeout(std::time::Duration::from_secs(5), builder.started.notified()).await.unwrap();
     let newer = CatalogCut { through: ReplicaPosition(2), ..selected };
-    assert!(!collector.advance_catalog_floor(newer).await.unwrap());
+    assert!(collector.advance_catalog_floor(newer).await.unwrap(), "a running build registers no catalog and never holds the floor");
     builder.finish.notify_one();
     build.await.unwrap().unwrap();
     assert!(collector.advance_catalog_floor(newer).await.unwrap());

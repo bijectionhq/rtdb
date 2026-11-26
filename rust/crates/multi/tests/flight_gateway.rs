@@ -77,9 +77,7 @@ async fn check_applied_owned_read_pins_the_catalog() {
         assert_eq!(&result.body[16..24], &floor.system_time.0.to_be_bytes());
         assert_eq!(&result.body[24..32], &floor.tx_id.0.to_be_bytes());
         let pinned = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
-        let (&reader, pin) = pinned.catalog_readers.iter()
-            .find(|(reader, _)| !before.catalog_readers.contains_key(*reader)).unwrap();
-        assert!(pin.cut.is_some());
+        assert_eq!(pinned.catalog_readers, before.catalog_readers, "an applied read registers nothing in the directory");
 
         let mut scoped = result.body[..16].to_vec();
         scoped.extend_from_slice(&1u16.to_be_bytes());
@@ -94,11 +92,6 @@ async fn check_applied_owned_read_pins_the_catalog() {
         let mut closed = raw.do_action(action("rtdb.owned.CloseRead.v1", result.body[..16].to_vec()))
             .await.unwrap().into_inner();
         assert!(closed.message().await.unwrap().is_none());
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while cell.directory.deployment(&deployment.id).await.unwrap().unwrap().catalog_readers.contains_key(&reader) {
-                tokio::task::yield_now().await;
-            }
-        }).await.unwrap();
     }
     assert_eq!(node.latest_completed_transactions().unwrap()["shop"][0], Some(floor));
 

@@ -2,7 +2,7 @@ use std::{sync::{Arc, Mutex, Weak}, time::Duration};
 
 use arrow_array::{Int64Array, RecordBatch, TimestampMicrosecondArray};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, selected_cell};
-use rtdb_storage::cache::{BufferPool, HeldCatalogRead};
+use rtdb_storage::cache::{BufferPool, CatalogAdmission};
 use rtdb_tx::HostedControlWrite;
 use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, EntityId, Interval, LogicalType, OwnedRelation, PlacedAttemptScope, Result, ScalarType, Timestamp, TransactionKey, Value};
 
@@ -11,12 +11,13 @@ use super::{AppliedCatalogAdmission, CatalogReadCut, DurableRange, NativeSession
 use super::transaction_evidence::exact_transaction_row;
 use rtdb_query::QueryContext;
 
-/// One storage registration for a lower bound on the physical catalogs read by a prepared session.
+/// A lower bound on the physical catalogs read by a prepared session, with any custody its storage owner granted.
+/// Only a hosted journal grants custody; other storage keeps the catalog readable for the GC window.
 pub(super) struct PreparedAppliedCatalog {
     attachment: Weak<Database>,
     floor: CatalogCut,
     storage: Arc<BufferPool>,
-    registration: Arc<Mutex<Option<Arc<HeldCatalogRead>>>>,
+    registration: Arc<Mutex<Option<Arc<CatalogAdmission>>>>,
     expires_at: tokio::time::Instant,
     expiry: tokio::task::JoinHandle<()>,
     _reservation: Arc<MemoryReservation>,
@@ -28,9 +29,9 @@ impl PreparedAppliedCatalog {
         let database = read.context.catalog.database(&read.database)?;
         let [snapshot] = database.partitions.as_slice() else { return Err(unavailable()); };
         let floor = snapshot.catalog_cut().ok_or_else(unavailable)?;
-        let registration = snapshot.catalog_read_permit::<HeldCatalogRead>()
-            .filter(|hold| hold.is_registered() && database.storage.holds_catalog(hold, Some(floor))).ok_or_else(unavailable)?;
-        let registration = Arc::new(Mutex::new(Some(registration)));
+        let registration = snapshot.catalog_read_permit::<CatalogAdmission>()
+            .filter(|admission| database.storage.admitted(admission, Some(floor)));
+        let registration = Arc::new(Mutex::new(registration));
         let weak = Arc::downgrade(&registration);
         let expires_at = tokio::time::Instant::now() + Duration::from_secs(180);
         let expiry = tokio::spawn(async move {
@@ -59,15 +60,15 @@ impl PreparedAppliedCatalog {
         Ok(())
     }
 
-    pub(super) fn pin(&self, database: &Arc<Database>, cut: CatalogCut) -> Result<Arc<HeldCatalogRead>> {
+    /// The custody granted for the prepared floor, which a later capture at or after it shares.
+    pub(super) fn pin(&self, database: &Arc<Database>, cut: CatalogCut) -> Result<Option<Arc<CatalogAdmission>>> {
         self.check_live()?;
         if !self.attachment.upgrade().is_some_and(|original| Arc::ptr_eq(&original, database))
             || !covers_catalog(self.floor, cut)
         {
             return Err(unavailable());
         }
-        // The older durable registration prevents advancing the retirement floor past this capture.
-        self.registration.lock().expect("applied catalog lease").as_ref().cloned().ok_or_else(unavailable)
+        Ok(self.registration.lock().expect("applied catalog lease").as_ref().cloned())
     }
 }
 

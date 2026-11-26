@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
 use rtdb_format::{catalog::{BlockCatalog, TableBlock}, keys::TrieKey};
@@ -7,7 +7,6 @@ use rtdb_trie::TrieConfig;
 use rtdb_types::{Anomaly, BlockIndex, ReplicaPosition, Result, TableRef, Timestamp, TransactionKey, TxId};
 
 use crate::{CatalogCut, CatalogTrie, LiveIndex, ServingSearch, Snapshot, StagedWrite, TableCatalog, TableMeta, TrieCatalog, TrieState};
-use crate::reader_retention::any_reference_requires;
 
 mod read_selection;
 
@@ -129,14 +128,11 @@ fn preserve_sealed_term_directories<'a>(tries: impl Iterator<Item = &'a CatalogT
     }
 }
 
-#[derive(Debug, Default)]
-struct Retention {
-    readers: Vec<Weak<TrieCatalog>>,
-}
-
+/// The catalog a collection cycle selects garbage from.
+/// Readers register nothing: a trie superseded before the garbage-as-of horizon is eligible whatever catalog an
+/// in-flight read captured, as in XTDB. Only the recorded checkpoint, which recovery restores, protects a trie.
 pub struct TrieCollection {
     current: Arc<PartitionValue>,
-    readers: Vec<Arc<TrieCatalog>>,
 }
 
 impl TrieCollection {
@@ -170,10 +166,7 @@ impl TrieCollection {
             let run = retired.run.as_ref()?;
             let id = run.identity().ok()?;
             let checkpoint = self.current.checkpoint_tries.as_ref().and_then(|checkpoint| checkpoint.search.get(table));
-            let protected = any_reference_requires(checkpoint.is_some_and(|keys| keys.contains(&id)), self.readers.len(), |reader| {
-                self.readers[reader].search_runs(table).any(|run| run.identity().is_ok_and(|key| key == id))
-            });
-            (!protected).then_some(run)
+            (!checkpoint.is_some_and(|keys| keys.contains(&id))).then_some(run)
         })
     }
 
@@ -182,27 +175,22 @@ impl TrieCollection {
             if !retired.abandoned() || !retired.released() { return false; }
             let Some(settled_at) = retired.settled_at_replica_msg_id else { return true; };
             let Some(id) = retired.run.as_ref().and_then(|run| run.identity().ok()) else { return false; };
-            self.readers.iter().all(|reader| reader.search_tombstone_settled_at(table, &id) == Some(settled_at))
+            self.current.trie_catalog().search_tombstone_settled_at(table, &id) == Some(settled_at)
         })
     }
 
     pub fn held_entity_directories<'a>(&'a self, table: &'a TableRef) -> impl Iterator<Item = &'a rtdb_format::log::proto::EntityDirectoryRoot> + 'a {
         self.current.trie_catalog().entity_directory(table).into_iter()
             .chain(self.current.checkpoint_tries.as_ref().and_then(|checkpoint| checkpoint.entity_directories.get(table)))
-            .chain(self.readers.iter().filter_map(move |reader| reader.entity_directory(table)))
     }
 
     pub fn held_term_directories<'a>(&'a self, table: &'a TableRef) -> impl Iterator<Item = &'a rtdb_format::log::proto::TermDirectoryRoot> + 'a {
         self.current.trie_catalog().term_directories(table)
             .chain(self.current.checkpoint_tries.as_ref().and_then(|checkpoint| checkpoint.term_directories.get(table)).into_iter().flatten())
-            .chain(self.readers.iter().flat_map(move |reader| reader.term_directories(table)))
     }
 
     fn protected(&self, table: &TableRef, key: &TrieKey) -> bool {
-        let checkpoint_requires = self.current.checkpoint_tries.as_ref().is_some_and(|checkpoint| checkpoint.requires(table, key));
-        any_reference_requires(checkpoint_requires, self.readers.len(), |index| {
-            self.readers[index].trie(table, key).is_some_and(|trie| trie.state == TrieState::Live)
-        })
+        self.current.checkpoint_tries.as_ref().is_some_and(|checkpoint| checkpoint.requires(table, key))
     }
 }
 
@@ -210,32 +198,6 @@ impl TrieCollection {
 pub struct PartitionState {
     value: RwLock<Arc<PartitionValue>>,
     published: Mutex<Option<Arc<PartitionValue>>>,
-    retention: Mutex<Retention>,
-    observers: Observers,
-}
-
-/// Told of each change to the catalog cut a partition publishes.
-pub trait CatalogPublicationObserver: Send + Sync {
-    /// The partition now publishes `cut`, or nothing.
-    /// Called under the partition's state lock; what it returns is dropped after the lock is released.
-    fn published(&self, cut: Option<CatalogCut>) -> Option<Box<dyn Send>>;
-}
-
-#[derive(Default)]
-struct Observers(Mutex<Vec<Weak<dyn CatalogPublicationObserver>>>);
-
-impl std::fmt::Debug for Observers {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("Observers") }
-}
-
-impl Observers {
-    /// What the observers release, and their handles, for the caller to drop once it has released the state lock.
-    fn notify(&self, cut: Option<CatalogCut>) -> Vec<Box<dyn Send>> {
-        let observers: Vec<_> = self.0.lock().iter().filter_map(Weak::upgrade).collect();
-        let mut released: Vec<Box<dyn Send>> = observers.iter().filter_map(|observer| observer.published(cut)).collect();
-        released.extend(observers.into_iter().map(|observer| Box::new(observer) as Box<dyn Send>));
-        released
-    }
 }
 
 pub struct PreparedWrite {
@@ -253,8 +215,6 @@ impl PartitionState {
         Self {
             value: RwLock::new(Arc::new(initial)),
             published: Mutex::new(None),
-            retention: Mutex::new(Retention::default()),
-            observers: Observers::default(),
         }
     }
     pub fn empty(config: TrieConfig) -> Result<Self> {
@@ -262,47 +222,14 @@ impl PartitionState {
     }
     pub fn value(&self) -> Arc<PartitionValue> { Arc::clone(&self.value.read()) }
 
-    /// Tells `observer` the cut published now and every later change, in publication order, while the observer lives.
-    pub fn observe_publication(&self, observer: &Arc<dyn CatalogPublicationObserver>) {
-        let value = self.value.read();
-        {
-            let mut observers = self.observers.0.lock();
-            observers.retain(|observer| observer.strong_count() > 0);
-            observers.push(Arc::downgrade(observer));
-        }
-        let cut = match value.catalog_publication {
-            CatalogPublication::Installed(cut) => Some(cut),
-            CatalogPublication::Untracked | CatalogPublication::Suspended => None,
-        };
-        let released = observer.published(cut);
-        drop(value);
-        drop(released);
-    }
-
-    /// Records each live catalog a reader captures once, however its captures interleave with other catalogs'.
-    fn retain_catalog(&self, value: &PartitionValue) {
-        let mut retention = self.retention.lock();
-        let identity = Arc::as_ptr(value.trie_catalog());
-        if retention.readers.last().is_some_and(|reader| reader.as_ptr() == identity) {
-            return;
-        }
-        retention.readers.retain(|reader| reader.strong_count() != 0 && reader.as_ptr() != identity);
-        retention.readers.push(Arc::downgrade(value.trie_catalog()));
-    }
-
-    /// Captures the current catalog and open read references under the same state lock as snapshot admission.
+    /// Captures the current catalog for a collection cycle.
     pub fn trie_collection(&self) -> TrieCollection {
-        let value = self.value.read();
-        let retention = self.retention.lock();
-        let readers = retention.readers.iter().filter_map(Weak::upgrade).collect();
-        TrieCollection { current: Arc::clone(&value), readers }
+        TrieCollection { current: self.value() }
     }
 
     /// Captures the latest applied state for a reader, including transaction resolution.
     pub fn snapshot(&self) -> Snapshot {
-        let value = self.value.read();
-        self.retain_catalog(&value);
-        value.snapshot()
+        self.value.read().snapshot()
     }
 
     /// Captures the version published by the driver at this exact cut.
@@ -313,9 +240,7 @@ impl PartitionState {
             return None;
         }
         let published = self.published.lock();
-        let published = published.as_ref()?;
-        self.retain_catalog(published);
-        Some(published.snapshot())
+        Some(published.as_ref()?.snapshot())
     }
 
     /// Captures the physical catalog and its replica coordinate from one installation.
@@ -323,9 +248,7 @@ impl PartitionState {
         let value = self.value.read();
         let CatalogPublication::Installed(_) = value.catalog_publication else { return None; };
         let published = self.published.lock();
-        let published = published.as_ref()?;
-        self.retain_catalog(published);
-        Some(published.snapshot())
+        Some(published.as_ref()?.snapshot())
     }
 
     /// Publishes a prefix after the replica driver has finished installing it.
@@ -347,12 +270,8 @@ impl PartitionState {
         let mut next = value.as_ref().clone();
         next.catalog_publication = CatalogPublication::Installed(cut);
         let next = Arc::new(next);
-        self.retain_catalog(&next);
         *self.published.lock() = Some(Arc::clone(&next));
         *value = next;
-        let released = self.observers.notify(Some(cut));
-        drop(value);
-        drop(released);
         Ok(())
     }
 
@@ -364,14 +283,10 @@ impl PartitionState {
         {
             let value = self.value.read();
             if let Some(live) = &value.live_snapshot {
-                if fresh(live) {
-                    self.retain_catalog(&value);
-                    return value.snapshot_with_live(live);
-                }
+                if fresh(live) { return value.snapshot_with_live(live); }
             }
         }
         let mut value = self.value.write();
-        self.retain_catalog(&value);
         if let Some(live) = &value.live_snapshot {
             if fresh(live) { return value.snapshot_with_live(live); }
         }
@@ -512,9 +427,6 @@ impl PartitionState {
         next.catalog_publication = CatalogPublication::Suspended;
         *self.published.lock() = None;
         *value = Arc::new(next);
-        let released = self.observers.notify(None);
-        drop(value);
-        drop(released);
         Ok(())
     }
     pub fn prepare_block(&self) -> Result<BlockPreparation> {
@@ -550,9 +462,6 @@ impl PartitionState {
         *value = Arc::new(PartitionValue { trie_catalog: Arc::new(durable), checkpoint_tries,
             table_catalog: Arc::new(tables), live: Arc::new(live), live_snapshot: None,
             catalog_publication: CatalogPublication::Untracked });
-        let released = self.observers.notify(None);
-        drop(value);
-        drop(released);
         Ok(())
     }
 
@@ -608,18 +517,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn alternating_captures_of_two_catalogs_retain_each_once() {
+    fn a_reader_of_a_superseded_catalog_never_protects_a_garbage_trie() {
         let state = PartitionState::empty(TrieConfig::default()).unwrap();
-        let other = PartitionValue::loaded(TrieCatalog::default(), TableCatalog::default().with_system_tables().unwrap(), TrieConfig::default()).unwrap();
-        let current = state.value();
-        for _ in 0..100 {
-            state.retain_catalog(&current);
-            state.retain_catalog(&other);
-        }
-        assert_eq!(state.retention.lock().readers.len(), 2, "readers are bounded by the live catalogs, not by captures");
-        assert_eq!(state.trie_collection().readers.len(), 2);
-        drop(other);
-        state.retain_catalog(&current);
-        assert_eq!(state.retention.lock().readers.len(), 1, "a catalog no reader holds is forgotten");
+        let reader = state.snapshot();
+        let collection = state.trie_collection();
+        assert!(Arc::ptr_eq(collection.current().trie_catalog(), reader.trie_catalog_ref()),
+            "a collection selects from the current catalog alone");
+        drop(collection);
+        assert!(state.trie_collection().current().trie_catalog().tables().next().is_none());
     }
 }

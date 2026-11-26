@@ -47,13 +47,6 @@ impl DefaultServing {
         if count == 0 {
             return rtdb_query::branch_snapshot(branch, &self.memory);
         }
-        let physical = match rtdb_query::retain_catalog_snapshot(physical, &self.storage).await {
-            Ok(physical) => physical,
-            Err(error) if error.category != AnomalyCategory::Interrupted => {
-                return rtdb_query::branch_snapshot(branch, &self.memory);
-            }
-            Err(error) => return Err(error),
-        };
         let catalog = CatalogSnapshot::new(database, BTreeMap::from([(database.into(), DatabaseSnapshot {
             partitions: vec![physical], storage: Arc::clone(&self.storage),
         })]), false)?;
@@ -92,7 +85,6 @@ impl DefaultServing {
                 return Err(Anomaly::unsupported("rtdb/classic-query-scope", "The Classic catalog only serves untracked queries on merged main"));
             }
             let (snapshot, cut) = self.handle.classic_read(source.at, cancellation).await?;
-            let snapshot = rtdb_query::retain_catalog_snapshot(snapshot, &self.storage).await?;
             return Ok(QueryView { snapshot, cut, claim: None, custody_groups: BTreeSet::new(), custody_contributors: None, scoped_source_basis: None, key_generation: None });
         }
         let snapshot = self.handle.view(source.at, cancellation).await?;
@@ -220,7 +212,7 @@ impl ServingDriver for DefaultServing {
             .ok_or_else(ranked_ivf::uncovered)?;
         let physical = self.handle.ranked_catalog(&selected, cut).ok_or_else(ranked_ivf::uncovered)?;
         let catalog_cut = physical.catalog_cut().ok_or_else(ranked_ivf::uncovered)?;
-        let snapshot = rtdb_query::retain_catalog_snapshot(physical, &self.storage).await?;
+        let snapshot = physical;
         let view = QueryView { snapshot, cut, claim: None, custody_groups: BTreeSet::new(),
             custody_contributors: Some(BTreeSet::new()), scoped_source_basis: None, key_generation: selected.key_generation };
         let catalog = ranked_ivf::Catalog { target: target.clone(), declaration: declaration.clone(),

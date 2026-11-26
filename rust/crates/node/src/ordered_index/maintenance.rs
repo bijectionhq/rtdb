@@ -230,9 +230,7 @@ impl CycleWorker for OrderedIndexMaintenance {
     async fn collect(&self, cancellation: &CancellationToken) -> Result<()> {
         let partition = self.snapshots.snapshot();
         let snapshot = partition.snapshot();
-        let cut = snapshot.catalog_cut();
-        let paths = cut.and_then(|_| snapshot.catalog_file_paths());
-        let view = HeldView::catalog(self.storage.object_store().as_ref(), partition, cut, paths).await?;
+        let view = HeldView::catalog(self.storage.object_store().as_ref(), partition, snapshot.catalog_cut()).await?;
         IoRegion::reading(view, self.refresh(&snapshot, cancellation)).await
     }
 }

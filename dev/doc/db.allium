@@ -22,7 +22,7 @@
 -- The Default erasure rewrite binds its fresh physical membership to the pending canonical receipt and its original source position, replica position and term.
 -- Recovery accepts the rewrite only when the authenticated checkpoint contains that same receipt installation.
 -- An authenticated inventory binds prior checkpoint and replay objects to the exact replacement.
--- A Local retirement closes admission to prior catalogs and waits for their reader holds and the original deadline.
+-- A Local retirement installs the erasure floor, refusing prior catalogs, and waits for the original deadline; no reader hold delays it.
 -- Object retirement follows settlement of both ordered log prefixes.
 -- Recovery resumes object retirement from the same inventory and cursor after an interruption.
 -- Generation retirement requires durable closure of earlier views, plaintext caches and exports at the original deadline.
@@ -67,7 +67,7 @@
 -- Before a new erasure decision, the Kafka writer verifies the exact sealed publication census and replica reference evidence through the applied cut.
 -- The enrolled Local writer closes predecessor generation and Classic catalog admission before recording the reader deadline.
 -- Native Queries and Changes retain the selected generation through delivery.
--- Classic SQL rechecks the Local catalog floor and keeps its original catalog hold through delivery.
+-- Classic SQL rechecks the Local erasure floor before reading; it registers no catalog hold.
 -- The provider persists the exact read-closure evidence after admitted holds drain.
 -- The ordered retirement intent arms the predecessor key against its original deadline.
 -- The terminal verifies the provider evidence, retired object inventory and predecessor key destruction before arming the canonical erasure receipt.
@@ -2101,7 +2101,7 @@ contract CompactorReset {
         -- A reset with a completed transaction publishes the replacement catalog in a new block.
         -- A coordinated store records the compacted file identities and required block and naming epoch before publication.
         -- The adopted root must cover the required block and naming epoch in the selected journal, and its catalog and checkpoint must have withdrawn the named tries, before the leader confirms their removal.
-        -- Physical retirement follows the installed removal receipt and coordinated catalog floor.
+        -- Physical retirement follows the installed removal receipt; no reader registration defers it.
         -- An exclusive reset on an uncoordinated store deletes each compacted trie's metadata before its data after adoption.
 
     @invariant CapturedCatalogIdentity
@@ -2111,7 +2111,7 @@ contract CompactorReset {
     @invariant InterruptedResetRetainsRecovery
         -- A reset interrupted before its block is adopted retains all compacted files.
         -- An interruption during retirement leaves the published replacement catalog and a durable retirement intent for each unsettled batch on a coordinated store.
-        -- Collection can finish eligible reset retirements after restart and after earlier reader tickets drain.
+        -- Collection can finish eligible reset retirements after restart; readers of the earlier catalog hold nothing back.
 
     @invariant SuccessorJournalCatalogCut
         -- A native node that reopens a recovered checkpoint in a fresh journal initially leaves the catalog cut untracked.

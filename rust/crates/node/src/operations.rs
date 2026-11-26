@@ -190,7 +190,7 @@ impl Node {
         let expected = captured.publication_sha256();
         let store = Arc::clone(database.storage.object_store());
         let cut = value.snapshot().catalog_cut();
-        let hold = HeldView::catalog(store.as_ref(), Arc::clone(&value) as Arc<dyn Send + Sync>, cut, None).await?;
+        let hold = HeldView::catalog(store.as_ref(), Arc::clone(&value) as Arc<dyn Send + Sync>, cut).await?;
         let blocks = rtdb_replication::BlockStore::new(
             Arc::clone(&store),
             Arc::clone(&database.storage),

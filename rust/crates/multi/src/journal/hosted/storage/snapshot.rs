@@ -125,7 +125,9 @@ impl ObjectStore for SnapshotStore {
         Ok(Some(Arc::new(ReadLease::until(self.scope.serving().await?))))
     }
 
-    async fn retain_catalog(&self, _cut: Option<rtdb_types::CatalogCut>) -> Result<Option<Arc<dyn Send + Sync>>> {
+    /// An exact snapshot's files and its erasure custody, kept for the read.
+    async fn admit_catalog(&self, _cut: Option<rtdb_types::CatalogCut>, _checkpoint: Option<rtdb_types::CatalogCheckpoint>)
+        -> Result<Option<Arc<dyn Send + Sync>>> {
         let custody = self.placement.hold_query_custody(&self.tasks).await?;
         self.scope.serving().await?;
         Ok(Some(Arc::new((Arc::clone(&self.files), custody))))

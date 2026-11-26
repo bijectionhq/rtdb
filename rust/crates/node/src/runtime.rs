@@ -44,7 +44,6 @@ impl CatalogRuntime for NodeCatalogRuntime {
         let snapshot = database.partition.snapshot();
         crate::read_currency::require_current(database.name(), lease.as_deref())?;
         if !snapshot.contains_table(&TableRef::new("xt", "role_membership")) { return empty(); }
-        let snapshot = rtdb_query::retain_catalog_snapshot(snapshot, &database.storage).await?;
         let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(&database.storage) })]), false)?;
         let catalog = match lease { Some(lease) => catalog.with_read_lease(lease), None => catalog };
         let context = QueryContext::with_owner(catalog, Arc::clone(&self.node.factory.memory), self.node.factory.clock.now(), "UTC", QueryOptions::default(), &self.cancellation, &self.node.owner)?;

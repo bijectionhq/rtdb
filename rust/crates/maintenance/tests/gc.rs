@@ -7,7 +7,7 @@ use rtdb_format::{block::proto as pb, catalog::BlockCatalog, cow_tree::RootRef, 
     log::proto::{ArtefactsAdded, ArtefactsRemoved, EntityDirectoryChange, EntityDirectoryRoot}};
 use rtdb_index::{CatalogTrie, PartitionState, PartitionValue, TableCatalog, TrieCatalog, TrieState};
 use rtdb_maintenance::{ArtefactPublisher, BlockCollector, CollectionObserver, CycleWorker, GarbageConfig, TableRetirements, TrieCollector, TrieDeletionPublisher, block_is_garbage};
-use rtdb_storage::{IoRegion, LocalStore, MemoryStore, ObjectKey, ObjectStore};
+use rtdb_storage::{LocalStore, MemoryStore, ObjectKey, ObjectStore};
 use rtdb_trie::TrieConfig;
 use rtdb_types::{Anomaly, BlockIndex, CatalogCut, ReplicaPosition, Result, PhysicalObjectVersion, S3ObjectNamespace, SourcePosition, StorageEpoch, StorageVersion, TableRef, Timestamp};
 use tokio_util::sync::CancellationToken;
@@ -385,7 +385,7 @@ async fn durable_retirement_intents_survive_writer_stop_on_both_sides_of_install
 }
 
 #[tokio::test]
-async fn local_trie_collection_resumes_an_installed_batch_after_the_last_reader_drains() {
+async fn local_trie_collection_keeps_the_window_and_never_waits_for_a_reader() {
     let table = TableRef::new("public", "docs");
     let tables = TableCatalog::default().with_seeded_table(table.clone(), Vec::new()).unwrap();
     let obsolete: TrieKey = "l01-rc-b00".parse().unwrap();
@@ -404,11 +404,11 @@ async fn local_trie_collection_resumes_an_installed_batch_after_the_last_reader_
     let directory = tempfile::tempdir().unwrap();
     let open = || Arc::new(LocalStore::open(directory.path()).unwrap().with_catalog_ledger(StorageEpoch(0)));
     let reader = open();
-    let hold = reader.retain_catalog(Some(scope)).await.unwrap().unwrap();
+    // A reader of the catalog that still names the obsolete trie registers nothing with storage.
+    let captured = state.snapshot();
     let writer = open();
     for key in [&data, &metadata] { writer.put(key, Bytes::from_static(b"trie file")).await.unwrap(); }
     let pending = ObjectKey::new(format!("{TRIE_RETIREMENT_DIRECTORY}/6-0-0/pending")).unwrap();
-    let installed = ObjectKey::new(format!("{TRIE_RETIREMENT_DIRECTORY}/6-0-0/installed")).unwrap();
     let publisher = Arc::new(InstallingPublisher {
         phase: Removal::Complete, state: state.clone(), scope, store: writer.clone(),
         pending: pending.clone(), requests: Mutex::new(Vec::new()),
@@ -417,27 +417,23 @@ async fn local_trie_collection_resumes_an_installed_batch_after_the_last_reader_
     let collect = |store: Arc<LocalStore>| TrieCollector::new(store, state.clone(), publisher.clone(),
         observer.clone(), unleased(), fixed_clock()).unwrap();
     let cancellation = CancellationToken::new();
+    collect(writer.clone()).collect_as_of(Timestamp(99), &cancellation).await.unwrap();
+    assert!(state.value().retains_trie(&table, &obsolete), "a trie superseded inside the garbage window is kept");
+    assert!(publisher.requests.lock().unwrap().is_empty());
+    for key in [&data, &metadata] { assert!(reader.get(key).await.is_ok()); }
+
     collect(writer.clone()).collect_as_of(Timestamp(100), &cancellation).await.unwrap();
     assert!(!state.value().retains_trie(&table, &obsolete));
-    assert_eq!(writer.list(Some(&installed)).await.unwrap().len(), 1);
-    assert_eq!(writer.list(Some(&pending)).await.unwrap().len(), 1);
-    for key in [&data, &metadata] { assert!(reader.get(key).await.is_ok()); }
-
+    // A successor resumes any installed batch the first cycle left; nothing a reader holds can defer it.
     let successor = collect(open());
     successor.collect_as_of(Timestamp(100), &cancellation).await.unwrap();
-    assert_eq!(writer.list(Some(&pending)).await.unwrap().len(), 1);
-    assert_eq!(writer.list(Some(&installed)).await.unwrap().len(), 1);
-    assert_eq!(publisher.requests.lock().unwrap().len(), 1);
-    for key in [&data, &metadata] { assert!(reader.get(key).await.is_ok()); }
-
-    drop(hold);
-    successor.collect_as_of(Timestamp(100), &cancellation).await.unwrap();
-    assert_eq!(*publisher.requests.lock().unwrap(), [vec![obsolete]]);
-    assert!(writer.list(Some(&pending)).await.unwrap().is_empty());
+    assert_eq!(*publisher.requests.lock().unwrap(), [vec![obsolete]], "the removal is published once");
+    assert!(writer.list(Some(&pending)).await.unwrap().is_empty(), "the installed batch is released");
     for key in [&data, &metadata] {
-        assert!(matches!(reader.get(key).await, Err(rtdb_storage::Error::MissingObject(_))));
+        assert!(matches!(reader.get(key).await, Err(rtdb_storage::Error::MissingObject(_))),
+            "a reader of a catalog older than the window does not hold its files");
     }
-    assert_eq!(reader.retain_catalog(Some(scope)).await.err().unwrap().code, "rtdb.storage/catalog-not-current");
+    assert!(captured.catalog_cut().is_some());
     assert!(observer.0.lock().unwrap().is_empty());
 }
 
@@ -501,68 +497,47 @@ async fn collection_preserves_live_and_pending_tries_of_the_installed_checkpoint
 }
 
 #[tokio::test]
-async fn collection_preserves_open_readers_and_their_inflight_io() {
+async fn collection_keeps_the_garbage_window_and_ignores_open_readers() {
     let table = TableRef::new("public", "docs");
     let tables = TableCatalog::default().with_seeded_table(table.clone(), Vec::new()).unwrap();
     let entry = tables.entry(&table).unwrap().clone();
     let trie = |key: &str| CatalogTrie {
         key: key.parse().unwrap(), data_file_size: 1, metadata: None, state: TrieState::Live, artefacts: Vec::new(), published_files: None,
     };
-    let preserved = trie("l01-rc-b00");
+    let superseded = trie("l01-rc-b00");
     let unreferenced = trie("l01-rc-b01");
-    let catalog = TrieCatalog::new(16).unwrap().with_tries(table.clone(), [preserved.clone()], Timestamp(100)).unwrap();
+    let catalog = TrieCatalog::new(16).unwrap().with_tries(table.clone(), [superseded.clone()], Timestamp(100)).unwrap();
     let state = Arc::new(PartitionState::new(PartitionValue::loaded(catalog, tables, TrieConfig::default()).unwrap()));
-    let first = state.open_snapshot(None);
-    let second = state.snapshot();
+    let reader = state.open_snapshot(None);
     state.add_tries(&BTreeMap::from([(table.clone(), vec![unreferenced.clone(), trie("l01-rc-b02")])]), Timestamp(100)).unwrap();
-    assert_eq!(first.trie_entries(&table)[0].key, preserved.key);
-    assert_eq!(state.open_snapshot(None).trie_entries(&table)[0].key, trie("l01-rc-b02").key);
+    assert_eq!(reader.trie_entries(&table)[0].key, superseded.key);
 
     let store = Arc::new(MemoryStore::default());
-    let mut pinned_objects = Vec::new();
-    for candidate in [&preserved, &unreferenced] {
-        let objects = [
+    let mut objects = Vec::new();
+    for candidate in [&superseded, &unreferenced] {
+        for path in [
             entry.slug.data_key(&candidate.key),
             entry.slug.metadata_key(&candidate.key),
             entry.slug.artefact_key(&candidate.key, "search", "body", 1).unwrap(),
-        ];
-        for path in objects {
+        ] {
             let key = ObjectKey::new(path).unwrap();
             store.put(&key, Bytes::from_static(b"contents")).await.unwrap();
-            if candidate.key == preserved.key { pinned_objects.push(key); }
+            objects.push(key);
         }
     }
     let publisher = Arc::new(DeletedPublisher { store: store.clone(), table: entry, commits: Mutex::new(Vec::new()) });
     let collector = TrieCollector::new(store.clone(), state.clone(), publisher.clone(), Arc::new(Observer::default()), unleased(), fixed_clock()).unwrap();
     let cancellation = CancellationToken::new();
-    collector.collect_as_of(Timestamp(100), &cancellation).await.unwrap();
-    assert_eq!(publisher.commits.lock().unwrap().as_slice(), &[vec![unreferenced.key.clone()]]);
-    state.delete_tries(&BTreeMap::from([(table, [unreferenced.key].into())]));
+    collector.collect_as_of(Timestamp(99), &cancellation).await.unwrap();
+    assert!(publisher.commits.lock().unwrap().is_empty(), "a trie superseded after the garbage-as-of horizon is kept");
+    for key in &objects { assert!(store.get(key).await.is_ok()); }
 
-    let region = IoRegion::new();
-    let worker = region.clone();
-    let (started, in_flight) = tokio::sync::oneshot::channel();
-    let (finish, release) = std::sync::mpsc::channel();
-    let caller = tokio::spawn(IoRegion::retaining(Arc::new(second), async move {
-        worker.run_blocking(move || {
-            started.send(()).unwrap();
-            release.recv().unwrap();
-            Ok(())
-        }).await
-    }));
-    in_flight.await.unwrap();
-    caller.abort();
-    assert!(caller.await.unwrap_err().is_cancelled());
-    drop(first);
     collector.collect_as_of(Timestamp(100), &cancellation).await.unwrap();
-    assert_eq!(publisher.commits.lock().unwrap().len(), 1);
-    for key in &pinned_objects { assert!(store.get(key).await.is_ok()); }
-
-    finish.send(()).unwrap();
-    region.close_and_wait().await;
-    collector.collect_as_of(Timestamp(100), &cancellation).await.unwrap();
-    assert_eq!(publisher.commits.lock().unwrap()[1], vec![preserved.key]);
-    for key in &pinned_objects { assert!(store.head(key).await.is_err()); }
+    let committed: std::collections::BTreeSet<_> = publisher.commits.lock().unwrap().iter().flatten().cloned().collect();
+    assert_eq!(committed, std::collections::BTreeSet::from([superseded.key.clone(), unreferenced.key.clone()]),
+        "an open reader of the superseded catalog never blocks collection past the horizon");
+    for key in &objects { assert!(store.head(key).await.is_err()); }
+    drop(reader);
 }
 
 struct ObservedStore {
@@ -985,11 +960,7 @@ async fn a_search_upload_without_catalog_adoption_is_fenced_before_release() {
     assert_eq!(settlement(), Some((true, Some(2))));
     store.delete(&old).await.unwrap();
 
-    let held_catalog = store.retain_catalog(Some(cut)).await.unwrap().unwrap();
-    collector.collect_as_of(at, &stop).await.unwrap();
-    assert_eq!(settlement(), Some((true, Some(2))));
-    drop(held_catalog);
-
+    // A reader of the older catalog registers nothing; only recovery custody defers the prune.
     let startup = store.hold_recovery_open().await.unwrap();
     collector.collect_as_of(at, &stop).await.unwrap();
     assert_eq!(settlement(), Some((true, Some(2))));
@@ -1027,7 +998,7 @@ fn adopt_directory(state: &PartitionState, table: &TableRef, through: i64, root:
 }
 
 #[tokio::test]
-async fn directory_collection_keeps_pages_held_by_a_reader_and_reused_by_the_next_root() {
+async fn directory_collection_keeps_only_pages_the_next_root_reuses_whatever_a_reader_holds() {
     use rtdb_format::{cow_tree::{self, Edit, NoSummary, Row}, entity_directory};
     use rtdb_storage::{cache::BufferPool, cow_pages::ObjectPageStore};
     use rtdb_types::MemoryBudget;
@@ -1060,10 +1031,10 @@ async fn directory_collection_keeps_pages_held_by_a_reader_and_reused_by_the_nex
         .with_entity_directories(Arc::new(DirectoryPublisher(state.clone())), StorageVersion(6), StorageEpoch(0));
     let cancellation = CancellationToken::new();
     collector.collect_as_of(Timestamp(1), &cancellation).await.unwrap();
-    assert!(store.head(&ObjectKey::new(cow_tree::page_key(&input.prefix, old.digest)).unwrap()).await.is_ok());
-    drop(reader);
-    collector.collect_as_of(Timestamp(1), &cancellation).await.unwrap();
     assert!(observer.0.lock().unwrap().is_empty());
+    assert!(store.head(&ObjectKey::new(cow_tree::page_key(&input.prefix, old.digest)).unwrap()).await.is_err(),
+        "a reader of the old root does not hold its pages once the lease has elapsed");
+    drop(reader);
     for page in old_pages {
         assert_eq!(store.head(&ObjectKey::new(cow_tree::page_key(&input.prefix, page)).unwrap()).await.is_ok(), new_pages.contains(&page));
     }

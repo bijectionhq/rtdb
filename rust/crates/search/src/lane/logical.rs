@@ -319,9 +319,7 @@ impl SearchBuilder {
     }
 
     async fn hold_logical_input(&self, snapshot: &Snapshot) -> Result<Arc<HeldView>> {
-        let cut = snapshot.catalog_cut();
-        let paths = cut.and_then(|_| snapshot.catalog_file_paths());
-        HeldView::catalog(self.store.as_ref(), Arc::new(snapshot.clone()), cut, paths).await
+        HeldView::catalog(self.store.as_ref(), Arc::new(snapshot.clone()), snapshot.catalog_cut()).await
     }
 
     pub(super) async fn seal_logical(&self, index: &LogicalIndex, definition: &ArtefactDefinition, snapshot: &Arc<PartitionValue>,

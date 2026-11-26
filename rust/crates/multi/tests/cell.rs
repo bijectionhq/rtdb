@@ -4434,7 +4434,7 @@ fn fragments_read(cell: &Cell) -> Vec<std::collections::BTreeMap<(String, String
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_held_reader_keeps_the_cut_of_its_captured_catalog() {
+async fn a_held_reader_keeps_its_captured_cut_without_registering_it() {
     struct Reader;
     #[async_trait::async_trait]
     impl rtdb_node::SessionIdentity for Reader {
@@ -4455,10 +4455,7 @@ async fn a_held_reader_keeps_the_cut_of_its_captured_catalog() {
     let capture = node.query_context("shop", &basis, &Reader, &cancellation).await.unwrap();
     let cut = capture.catalog.database("shop").unwrap().partitions[0].catalog_cut().unwrap();
     let record = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
-    let (&reader, pin) = record.catalog_readers.iter().find(|(_, pin)| pin.cut == Some(cut)).unwrap();
-    assert!(record.storage_regions.contains_key(&pin.owner));
-    assert_eq!(pin.replica_epoch, record.log_epoch);
-    assert_eq!(pin.storage_root, rtdb_format::keys::StorageRoot::new(cut.storage_version, cut.storage_epoch).unwrap().key());
+    assert!(record.catalog_readers.is_empty(), "a read registers nothing in the directory");
 
     client.simple_query("UPDATE docs SET v = 25 WHERE _id = 1").await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -4471,17 +4468,11 @@ async fn a_held_reader_keeps_the_cut_of_its_captured_catalog() {
     let next = node.query_context("shop", &next_basis, &Reader, &cancellation).await.unwrap();
     let next_cut = next.catalog.database("shop").unwrap().partitions[0].catalog_cut().unwrap();
     assert!(cut.through < next_cut.through);
-    let record = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
-    assert_eq!(record.catalog_readers[&reader].cut, Some(cut));
-    assert!(record.catalog_readers.values().any(|pin| pin.cut == Some(next_cut)));
+    assert!(cell.directory.deployment(&deployment.id).await.unwrap().unwrap().catalog_readers.is_empty());
+    assert_eq!(capture.catalog.database("shop").unwrap().partitions[0].catalog_cut(), Some(cut),
+        "the older capture keeps its own cut while a newer one is open");
     drop(next);
     drop(capture);
-
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while cell.directory.deployment(&deployment.id).await.unwrap().unwrap().catalog_readers.contains_key(&reader) {
-            tokio::task::yield_now().await;
-        }
-    }).await.unwrap();
     drop(client);
     cell.stop().await;
 }

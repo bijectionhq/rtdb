@@ -5,7 +5,7 @@ use std::any::{Any, TypeId};
 
 use rtdb_types::{Anomaly, BlockIndex, CatalogCheckpoint, CatalogCut, LogicalType, OwnedRelation, ReplicaPosition, Result, TableRef, Timestamp, TransactionKey};
 
-use crate::{CatalogTrie, LiveIndex, LiveTable, StagedWrite, TableCatalog, TableEntry, TrieCatalog, TrieState, absent_type};
+use crate::{CatalogTrie, LiveIndex, LiveTable, StagedWrite, TableCatalog, TableEntry, TrieCatalog, absent_type};
 
 #[derive(Clone)]
 struct CatalogRead { permit: Arc<dyn std::any::Any + Send + Sync> }
@@ -86,68 +86,7 @@ impl Snapshot {
             None => Some(CatalogCheckpoint { boundary: ReplicaPosition::from_epoch_offset(cut.replica_epoch, -1)?, root: [0; 32] }),
         })
     }
-    /// Complete paths for compacted primaries and their recorded artefacts, and published search runs.
-    /// A claim exceeding the bound retains the conservative scope.
-    /// The collectable file paths the captured catalogs name, computed once per pair of catalogs, which are replaced rather than changed.
-    pub fn catalog_file_paths(&self) -> Option<Arc<[String]>> {
-        type Inventories = Vec<(std::sync::Weak<TrieCatalog>, std::sync::Weak<TableCatalog>, Option<Arc<[String]>>)>;
-        static INVENTORIES: std::sync::LazyLock<parking_lot::Mutex<Inventories>> = std::sync::LazyLock::new(Default::default);
-        const KEPT: usize = 8;
-        let held = |trie: &std::sync::Weak<TrieCatalog>, table: &std::sync::Weak<TableCatalog>| {
-            std::ptr::eq(trie.as_ptr(), Arc::as_ptr(&self.trie_catalog)) && std::ptr::eq(table.as_ptr(), Arc::as_ptr(&self.table_catalog))
-        };
-        {
-            let mut inventories = INVENTORIES.lock();
-            inventories.retain(|(trie, table, _)| trie.strong_count() > 0 && table.strong_count() > 0);
-            if let Some((_, _, paths)) = inventories.iter().find(|(trie, table, _)| held(trie, table)) { return paths.clone(); }
-        }
-        let paths = self.inventory_file_paths();
-        let mut inventories = INVENTORIES.lock();
-        if !inventories.iter().any(|(trie, table, _)| held(trie, table)) {
-            if inventories.len() >= KEPT { inventories.remove(0); }
-            inventories.push((Arc::downgrade(&self.trie_catalog), Arc::downgrade(&self.table_catalog), paths.clone()));
-        }
-        paths
-    }
-
-    fn inventory_file_paths(&self) -> Option<Arc<[String]>> {
-        let mut paths = Vec::new();
-        let mut bytes = 0usize;
-        let mut retain = |path: String| {
-            bytes = bytes.checked_add(path.len().checked_mul(6)?.checked_add(16)?)?;
-            if bytes > rtdb_types::CATALOG_FILE_PATH_BYTES { return None; }
-            paths.push(path);
-            Some(())
-        };
-        for table in self.trie_catalog.tables() {
-            if self.trie_catalog.entity_directory(table).is_some() || self.trie_catalog.term_directories(table).next().is_some() {
-                return None;
-            }
-            let entry = self.table_catalog.entry(table)?;
-            for trie in self.trie_catalog.iter_tries(table).filter(|trie| trie.key.level() > 0) {
-                if trie.state == TrieState::Live {
-                    retain(entry.slug.data_key(&trie.key))?;
-                    retain(entry.slug.metadata_key(&trie.key))?;
-                }
-                for record in &trie.artefacts {
-                    if !matches!(rtdb_format::keys::ArtefactOwner::of(&trie.key, record).ok()?,
-                        rtdb_format::keys::ArtefactOwner::Trie(_))
-                    {
-                        continue;
-                    }
-                    retain(entry.slug.recorded_artefact_key(&trie.key, record).ok()?)?;
-                }
-            }
-            for run in self.trie_catalog.search_runs(table) {
-                retain(run.object_key(&entry.slug).ok()?)?;
-            }
-        }
-        paths.sort_unstable();
-        paths.dedup();
-        Some(paths.into())
-    }
-
-    /// Transfers the store's captured catalog registration into this snapshot and its clones.
+    /// Transfers custody a storage owner granted for this captured catalog into this snapshot and its clones.
     pub fn with_catalog_read(mut self, permit: Arc<dyn std::any::Any + Send + Sync>) -> Self {
         self.catalog_read = Some(CatalogRead { permit });
         self
@@ -162,7 +101,7 @@ impl Snapshot {
         self.read_custody.as_ref().map(|(_, deadline)| *deadline)
     }
 
-    /// Clones the storage registration that was attached when the catalog was captured.
+    /// Clones the storage custody that was attached when the catalog was captured.
     pub fn catalog_read_permit<T: std::any::Any + Send + Sync>(&self) -> Option<Arc<T>> {
         Arc::clone(&self.catalog_read.as_ref()?.permit).downcast().ok()
     }
@@ -420,18 +359,6 @@ fn column_types_are_joined_again_under_another_table_catalog() {
     assert_eq!(state.value().snapshot().column_types(&table), types, "a later snapshot of the same segment reuses the join");
     let other = Snapshot::new(Arc::new(TrieCatalog::default()), Arc::new(TableCatalog::default()), Arc::clone(&applied.durable));
     assert_eq!(other.column_types(&table), other.column_types_for(&table, other.column_names(&table)));
-}
-
-#[test]
-fn catalog_file_paths_are_computed_once_per_pair_of_catalogs() {
-    let live = Arc::new(LiveIndex::new(BlockIndex(0), None, rtdb_trie::TrieConfig::default()));
-    let (trie, table) = (Arc::new(TrieCatalog::default()), Arc::new(TableCatalog::default()));
-    let first = Snapshot::new(Arc::clone(&trie), Arc::clone(&table), Arc::clone(&live)).catalog_file_paths().unwrap();
-    let again = Snapshot::new(Arc::clone(&trie), Arc::clone(&table), Arc::clone(&live)).catalog_file_paths().unwrap();
-    assert!(Arc::ptr_eq(&first, &again));
-    let replaced = Snapshot::new(Arc::new(TrieCatalog::default()), table, live).catalog_file_paths().unwrap();
-    assert!(!Arc::ptr_eq(&first, &replaced), "a replaced catalog has its own inventory");
-    assert_eq!(first, replaced);
 }
 
 #[test]

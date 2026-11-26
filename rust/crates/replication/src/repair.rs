@@ -259,9 +259,8 @@ impl PrimaryReset {
     ) -> Result<Self> {
         let target = installed.latest_completed_tx().ok_or_else(no_reset_transactions)?;
         let store = Arc::clone(source.storage());
-        // Open the authenticated root under a conservative claim, then narrow
-        // custody to the immutable files this reset can open.
-        let selection = HeldView::catalog(store.as_ref(), Arc::new(installed.clone()), cut, None).await?;
+        // The GC window keeps the installed root's files readable; only a hosted owner grants custody here.
+        let selection = HeldView::catalog(store.as_ref(), Arc::new(installed.clone()), cut).await?;
         let load = async {
             let blocks = source.recovery_block_store(file_size_target)?;
             let (root, tables) = blocks.load(installed.block_index()).await?;
@@ -271,10 +270,7 @@ impl PrimaryReset {
             if root.table_entries()?.iter().any(|entry| root.table_block_digest(entry.oid).is_none()) {
                 return Err(reset_inventory("The checkpoint has no bound table manifest"));
             }
-            let paths: Arc<[String]> = crate::replay_closure::checkpoint_files(&root, &tables, CheckpointContents::Primary)?
-                .into_iter().filter(|key| rtdb_format::keys::is_catalog_retirement_file(key.as_str()))
-                .map(|key| key.to_string()).collect();
-            let hold = HeldView::catalog(store.as_ref(), Arc::new(root.clone()), cut, Some(paths)).await?;
+            let hold = HeldView::catalog(store.as_ref(), Arc::new(root.clone()), cut).await?;
             IoRegion::reading(Arc::clone(&hold), cancellation.run_until_cancelled(blocks.verify_primary_inventory(&root, &tables)))
                 .await.ok_or_else(crate::progress::cancelled)?
                 .map_err(|error| match error.code.as_str() {

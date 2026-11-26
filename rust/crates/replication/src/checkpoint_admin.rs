@@ -343,7 +343,7 @@ impl NativeServingHandle {
         let cut = CatalogCut { storage_version: logs.storage_version, storage_epoch: logs.storage_epoch,
             replica_epoch: logs.replica_epoch, through: selection.boundary };
         let checkpoint = CatalogCheckpoint { boundary: selection.boundary, root: selection.root };
-        let hold = HeldView::catalog_at(store, Arc::new(snapshot.clone()), Some(cut), Some(checkpoint), None).await?;
+        let hold = HeldView::catalog_at(store, Arc::new(snapshot.clone()), Some(cut), Some(checkpoint)).await?;
         let control = IoRegion::reading(hold, stage_export(&blocks, &self.authority, selection, logs.memory(), cancellation)).await?;
         term.pin_checkpoint(control.clone(), cancellation).await?;
         let receipt = read_receipt(store, self.authority.incarnation, pin).await?.ok_or_else(unavailable)?;

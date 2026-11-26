@@ -46,7 +46,7 @@ impl ReleaseWitness {
     }
 
     fn permits(&self, owner: &DeploymentRecord, store: &str) -> bool {
-        permits_release(owner, store, &self.record, self.pack.is_none() && (self.version.is_some() || self.terminal.is_some())) && recovery_covers_release(owner, &self.record)
+        permits_release(owner, store, &self.record) && recovery_covers_release(owner, &self.record)
             && super::oversized_payload_collectable(owner, &self.record.key, rtdb_directory::now_ms())
     }
 }
@@ -1185,7 +1185,7 @@ mod tests {
         let bucket = Arc::new(VersionedReleaseStore::default());
         let mut store = super::super::open_deployment_store(bucket.clone(), &scope, crate::packing::PackDiscovery::List, Arc::new(|| 0)).await.unwrap();
         Arc::get_mut(&mut store).unwrap().catalog_readers = Some(crate::catalog_readers::CatalogReaders::new(
-            directory.clone(), TaskTracker::new(), &record, root.clone(), namespaces, region, Some(record.epoch),
+            directory.clone(), &record, root.clone(), namespaces, region, Some(record.epoch),
         ));
         let cut = CatalogCut { storage_version: CURRENT_STORAGE_VERSION, storage_epoch: epoch, replica_epoch: epoch, through: ReplicaPosition(0) };
 
@@ -1287,14 +1287,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_exact_reaper_resumes_an_installed_trie_release_after_its_reader_drains() {
+    async fn the_exact_reaper_resumes_an_installed_trie_release_without_waiting_for_readers() {
         use rtdb_directory::MemberId;
         use rtdb_format::trie_retirement::{RetirementFile, RetirementIntent, intent_digest, journal_directory};
-        use rtdb_storage::IoRegion;
         use rtdb_types::TableRef;
         use std::sync::{Arc, atomic::AtomicBool};
-        use tokio::sync::oneshot;
-        use tokio_util::task::TaskTracker;
 
         struct Inventory {
             bucket: Arc<VersionedReleaseStore>,
@@ -1343,9 +1340,8 @@ mod tests {
         let bucket = Arc::new(VersionedReleaseStore::default());
         let inventory = Inventory { bucket: bucket.clone(), lose_reply: AtomicBool::new(true) };
         let mut serving = super::super::open_deployment_store(bucket.clone(), &scope, crate::packing::PackDiscovery::List, Arc::new(|| 0)).await.unwrap();
-        let tracker = TaskTracker::new();
         Arc::get_mut(&mut serving).unwrap().catalog_readers = Some(crate::catalog_readers::CatalogReaders::new(
-            directory.clone(), tracker.clone(), &record, root, namespaces, region, Some(record.epoch),
+            directory.clone(), &record, root, namespaces, region, Some(record.epoch),
         ));
         let serving = super::super::EncryptingStore::new(serving, &[7; 32]).unwrap();
         let relative = ObjectKey::new("tables/orders/data/l01-rc-b00.arrow").unwrap();
@@ -1353,21 +1349,7 @@ mod tests {
         bucket.versions.lock().insert(target.clone(), "trie-1".into());
         serving.put(&relative, Bytes::from_static(b"retained trie")).await.unwrap();
         let version = serving.retirement_version(&relative).await.unwrap().unwrap();
-        let hold = serving.retain_catalog(Some(cut)).await.unwrap().unwrap();
-        let io = IoRegion::new();
-        let work = io.child();
-        let (entered, running) = oneshot::channel();
-        let (release_work, finish_work) = std::sync::mpsc::channel();
-        let waiter = tokio::spawn(IoRegion::retaining(hold, async move {
-            work.run_blocking(move || {
-                entered.send(()).unwrap();
-                finish_work.recv_timeout(Duration::from_secs(5)).unwrap();
-                Ok(())
-            }).await
-        }));
-        tokio::time::timeout(Duration::from_secs(5), running).await.unwrap().unwrap();
-        waiter.abort();
-        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert!(serving.admit_catalog(Some(cut), None).await.unwrap().is_none(), "a read registers nothing");
 
         let plan = RetirementIntent {
             selected: cut, table: TableRef::new("public", "orders"), tries: vec!["l01-rc-b00".into()],
@@ -1382,17 +1364,13 @@ mod tests {
         let receipt = ObjectKey::new(format!("{}/installed/{}", journal_directory(cut), intent_digest(&encoded))).unwrap();
         let contents = Bytes::from([installed.0.to_be_bytes().as_slice(), &encoded].concat());
         serving.put(&receipt, contents.clone()).await.unwrap();
-        assert!(!serving.advance_catalog_floor(floor).await.unwrap());
-        let held = directory.deployment(&record.id).await.unwrap().unwrap();
-        assert_eq!(held.catalog_readers.len(), 1);
-        reap(directory.as_ref(), bucket.as_ref(), &inventory, &held, None, None).await.unwrap();
-        assert_eq!(serving.get(&relative).await.unwrap(), Bytes::from_static(b"retained trie"));
+        let before = directory.deployment(&record.id).await.unwrap().unwrap();
+        assert!(before.catalog_readers.is_empty());
+        reap(directory.as_ref(), bucket.as_ref(), &inventory, &before, None, None).await.unwrap();
+        assert_eq!(serving.get(&relative).await.unwrap(), Bytes::from_static(b"retained trie"), "nothing is reaped before the release");
 
-        release_work.send(()).unwrap();
-        io.close_and_wait().await;
-        tracker.close();
-        tokio::time::timeout(Duration::from_secs(5), tracker.wait()).await.unwrap();
         assert!(serving.release_trie_files(&receipt, contents).await.unwrap());
+        assert!(serving.advance_catalog_floor(floor).await.unwrap());
         let markers = ObjectKey::new(format!("{scope}/{GARBAGE_DIRECTORY}")).unwrap();
         let queued = bucket.list(Some(&markers)).await.unwrap();
         assert_eq!(queued.len(), 1);

@@ -1329,7 +1329,7 @@ mod tests {
                 .unwrap().with_wire_cut(first.system_time, first.system_time.into()).unwrap()
         };
         let original = context(original);
-        let snapshot = rtdb_query::retain_catalog_snapshot(view.snapshot, &storage).await.unwrap();
+        let snapshot = view.snapshot;
         let retained = context(snapshot);
         retained.retain_wire_scope((Instant::now() + Duration::from_secs(2)).into_std()).await.unwrap();
         for (sql, expected) in [

@@ -314,7 +314,7 @@ impl RemoteStorageFactory for CellStoreFactory {
             serving.index_pages = Some(pages);
             serving.requires_search_publication = matches!(config.storage, CellStorage::S3 { .. });
             serving.catalog_readers = Some(CatalogReaders::new(
-                self.directory.clone(), self.storage_regions.clone(), &record, storage_root.to_string(), self.storage_namespaces, owner, config.writer_epoch,
+                self.directory.clone(), &record, storage_root.to_string(), self.storage_namespaces, owner, config.writer_epoch,
             ));
             Ok::<_, Anomaly>((opened, audience_reads, publications))
         }).await?;
@@ -1376,8 +1376,9 @@ impl ObjectStore for AudienceObjectStore {
     fn index_page_lifecycle(&self) -> Option<&dyn IndexPageLifecycle> {
         self.0.index_page_lifecycle()
     }
-    async fn retain_catalog(&self, cut: Option<rtdb_types::CatalogCut>) -> Result<Option<Arc<dyn Send + Sync>>> {
-        self.0.retain_catalog(cut).await
+    async fn admit_catalog(&self, cut: Option<rtdb_types::CatalogCut>, checkpoint: Option<rtdb_types::CatalogCheckpoint>)
+        -> Result<Option<Arc<dyn Send + Sync>>> {
+        self.0.admit_catalog(cut, checkpoint).await
     }
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
         IoRegion::audience_object_read(self.0.head(key)).await
@@ -1548,7 +1549,7 @@ fn is_collected_trie_file(key: &str) -> bool {
         || rtdb_format::term_directory::page_digest(key).is_some()
 }
 
-fn permits_release(record: &DeploymentRecord, store: &str, release: &GarbageRecord, exact: bool) -> bool {
+fn permits_release(record: &DeploymentRecord, store: &str, release: &GarbageRecord) -> bool {
     if release.key.starts_with("oversized/") { return false; }
     let Some(required) = &release.trie_floor else {
         return record.storage_namespaces.is_none() || !is_collected_trie_file(&release.key);
@@ -1561,8 +1562,6 @@ fn permits_release(record: &DeploymentRecord, store: &str, release: &GarbageReco
         && store == format!("{residence}/{root}")
         && record.storage_namespaces.is_some_and(|value| value.objects == required.object_namespace)
         && cut.replica_epoch.0 == record.log_epoch
-        && crate::catalog_readers::readers_allow(record, &root, cut,
-            (exact && rtdb_format::keys::is_catalog_retirement_file(&release.key)).then_some(release.key.as_str()))
         && record.catalog_admission_floors.get(&root).is_some_and(|floor| {
             floor.residence == required.residence && floor.object_namespace == required.object_namespace
                 && floor.cut.storage_version == cut.storage_version && floor.cut.storage_epoch == cut.storage_epoch
@@ -1641,15 +1640,6 @@ impl ObjectStore for GarbageStore {
     }
     fn index_page_lifecycle(&self) -> Option<&dyn IndexPageLifecycle> {
         self.index_pages.as_ref().map(|pages| pages as &dyn IndexPageLifecycle)
-    }
-    async fn retain_catalog(&self, cut: Option<rtdb_types::CatalogCut>) -> Result<Option<Arc<dyn Send + Sync>>> {
-        let Some(readers) = &self.catalog_readers else { return Ok(None); };
-        readers.retain(cut).await.map(Some)
-    }
-    async fn retain_catalog_with_paths(&self, cut: Option<rtdb_types::CatalogCut>, paths: Arc<[String]>)
-        -> Result<Option<Arc<dyn Send + Sync>>> {
-        let Some(readers) = &self.catalog_readers else { return Ok(None); };
-        readers.retain_with_paths(cut, Some(paths)).await.map(Some)
     }
     fn defers_trie_releases(&self) -> bool { self.catalog_readers.is_some() }
     fn releases_receipt_l0(&self) -> bool { self.catalog_readers.is_some() }
@@ -1899,7 +1889,7 @@ async fn reap_path_releases(bucket: &dyn ObjectStore, record: &DeploymentRecord,
                 StoredRelease::Path(record) => record,
             };
             if ordered_index_storage::page_generation(&released.key).is_some()
-                || !permits_release(record, &store, &released, false) || !recovery_covers_release(record, &released)
+                || !permits_release(record, &store, &released) || !recovery_covers_release(record, &released)
                 || !oversized_payload_collectable(record, &released.key, now_ms)
                 || released.released_at_ms > threshold || checkpoint_metadata_block(&released.key)
                 .is_some_and(|block| !checkpoint_metadata_collectable(block, published, oldest))
@@ -2374,7 +2364,7 @@ mod tests {
         let bucket: crate::reference::Bucket = Arc::new(MemoryStore::default());
         let mut store = open_deployment_store(bucket.clone(), &scope, crate::packing::PackDiscovery::List, wall_clock()).await.unwrap();
         Arc::get_mut(&mut store).unwrap().catalog_readers = Some(CatalogReaders::new(
-            directory.clone(), TaskTracker::new(), &record, root.clone(), namespaces, owner, Some(record.epoch),
+            directory.clone(), &record, root.clone(), namespaces, owner, Some(record.epoch),
         ));
         let store = EncryptingStore::new(store, &[7; 32]).unwrap();
         let cut = CatalogCut { storage_version: CURRENT_STORAGE_VERSION, storage_epoch: epoch, replica_epoch: epoch, through: ReplicaPosition(1) };
@@ -2617,7 +2607,7 @@ mod tests {
         record.storage_regions.insert(old_owner, remote_storage_region(None, None));
         let record = directory.create_deployment(record).await.unwrap();
         let mut store = GarbageStore::new(Arc::new(MemoryStore::default()), wall_clock(), None);
-        store.catalog_readers = Some(CatalogReaders::new(directory.clone(), TaskTracker::new(), &record,
+        store.catalog_readers = Some(CatalogReaders::new(directory.clone(), &record,
             root, namespaces, owner, Some(record.epoch)));
         let run = key(&format!("tables/docs/search-runs/{}.f16.arrow", "ab".repeat(32)));
         let cut = CatalogCut { storage_version: CURRENT_STORAGE_VERSION, storage_epoch: epoch, replica_epoch: epoch, through: ReplicaPosition(0) };
@@ -2635,7 +2625,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trie_release_waits_for_its_installed_catalog_floor() {
+    async fn trie_release_records_its_floor_without_waiting_for_any_reader() {
         use rtdb_directory::{MemoryDirectory, StorageNamespaces};
         use rtdb_format::keys::CURRENT_STORAGE_VERSION;
         use rtdb_format::trie_retirement::{RetirementFile, RetirementIntent, intent_digest, journal_directory};
@@ -2658,15 +2648,13 @@ mod tests {
         let scope = format!("{}/{root}", record.storage_prefix());
         let bucket: crate::reference::Bucket = Arc::new(MemoryStore::default());
         let mut store = open_deployment_store(bucket.clone(), &scope, crate::packing::PackDiscovery::List, wall_clock()).await.unwrap();
-        let tasks = TaskTracker::new();
-        let readers = CatalogReaders::new(directory.clone(), tasks.clone(), &record, root, namespaces, owner, Some(record.epoch));
+        let readers = CatalogReaders::new(directory.clone(), &record, root, namespaces, owner, Some(record.epoch));
         Arc::get_mut(&mut store).unwrap().catalog_readers = Some(readers);
         let store = Arc::new(EncryptingStore::new(store, &[7; 32]).unwrap());
         let buffer = rtdb_storage::cache::BufferPool::new(store.clone(), 1 << 20);
         let cut = CatalogCut { storage_version: CURRENT_STORAGE_VERSION, storage_epoch: epoch, replica_epoch: epoch, through: ReplicaPosition(0) };
-        let hold = buffer.hold_catalog(Some(cut)).await.unwrap();
-        let renewed = buffer.renew_catalog(&hold).await.unwrap();
-        assert_eq!(directory.deployment(&record.id).await.unwrap().unwrap().catalog_readers.len(), 2);
+        assert!(buffer.admit_catalog(Some(cut), None).await.unwrap().is_none(), "a read registers nothing");
+        assert!(directory.deployment(&record.id).await.unwrap().unwrap().catalog_readers.is_empty());
         let file = key("tables/orders/data/l01-rc-b00.arrow");
         let physical = key(&format!("{scope}/{file}"));
         store.put(&file, Bytes::from_static(b"admitted")).await.unwrap();
@@ -2692,24 +2680,16 @@ mod tests {
         let receipt = key(&format!("{}/installed/{}", journal_directory(cut), intent_digest(&plan)));
         let receipt_bytes = Bytes::from([installed.0.to_be_bytes().as_slice(), &plan].concat());
         store.put(&receipt, receipt_bytes.clone()).await.unwrap();
-        assert!(!store.advance_catalog_floor(floor).await.unwrap());
-        assert!(!store.release_trie_files(&receipt, receipt_bytes.clone()).await.unwrap());
 
         let held = directory.deployment(&record.id).await.unwrap().unwrap();
-        assert_eq!(held.catalog_readers.len(), 2);
         let refs = crate::reference::References::default();
         reap_as_of(bucket.as_ref(), &held, i64::MAX, Duration::ZERO, &refs).await.unwrap();
-        assert_eq!(store.get(&file).await.unwrap(), Bytes::from_static(b"admitted"));
-        drop(renewed);
-        // The original cohort still prevents advancement after the renewal drains.
-        assert!(!store.advance_catalog_floor(floor).await.unwrap());
-        drop(hold);
-        tasks.close();
-        tasks.wait().await;
+        assert_eq!(store.get(&file).await.unwrap(), Bytes::from_static(b"admitted"), "a legacy release without a floor reaps nothing");
         let mut forged = receipt_bytes.to_vec();
         forged[7] = 2;
         assert!(store.release_trie_files(&receipt, forged.into()).await.is_err());
-        assert!(store.release_trie_files(&receipt, receipt_bytes).await.unwrap());
+        assert!(store.release_trie_files(&receipt, receipt_bytes).await.unwrap(), "no reader registration defers the release");
+        assert!(store.advance_catalog_floor(floor).await.unwrap(), "the release recorded its floor");
         reap_as_of(bucket.as_ref(), &held, i64::MAX, Duration::ZERO, &refs).await.unwrap();
         assert!(bucket.head(&physical).await.is_ok());
         let mut current = directory.deployment(&record.id).await.unwrap().unwrap();
@@ -3879,7 +3859,7 @@ mod tests {
             let region = Uuid::new_v4();
             let mut store = open_deployment_store(bucket.clone(), &scope, crate::packing::PackDiscovery::List, wall_clock()).await.unwrap();
             Arc::get_mut(&mut store).unwrap().catalog_readers = Some(CatalogReaders::new(
-                directory.clone(), TaskTracker::new(), &record, root.clone(), namespaces, region, config.writer_epoch,
+                directory.clone(), &record, root.clone(), namespaces, region, config.writer_epoch,
             ));
             let owner = store.search_staging_owner().await;
             if config.compactor {

@@ -33,7 +33,7 @@ pub(crate) async fn admit(
 ) -> Result<()> {
     let snapshot = Arc::new(snapshot);
     let hold = HeldView::catalog_at(store, snapshot.clone(), snapshot.catalog_cut(),
-        snapshot.catalog_checkpoint()?, snapshot.catalog_file_paths()).await?;
+        snapshot.catalog_checkpoint()?).await?;
     IoRegion::reading(hold, async {
         let current = snapshot.trie_catalog();
         for (table, tries) in additions.iter().filter(|(table, _)| TableRef::owned_schema(&table.schema)) {
