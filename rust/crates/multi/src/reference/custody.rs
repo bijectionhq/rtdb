@@ -78,14 +78,14 @@ impl ReferenceReads {
             if ready.send(accepted.map(|_| Arc::new(release) as Arc<dyn Send + Sync>).map_err(Anomaly::from)).is_ok() && opened {
                 let _ = drained.await;
             }
-            if opened || uncertain {
+            let released = if opened || uncertain {
                 let (directory, installation) = (&worker.directory, deployment.as_str());
                 release_hold(format!("reference read {id} for {deployment}"),
-                    move || crate::store::release_region(directory.as_ref(), installation, id, uncertain)).await;
-            }
+                    move || crate::store::release_region(directory.as_ref(), installation, id, uncertain)).await.is_released()
+            } else { true };
             if let Some(witness) = witness {
                 drop(witness);
-                if let Err(error) = worker.keys.forget_local_storage_region(id) {
+                if released && let Err(error) = worker.keys.forget_local_storage_region(id) {
                     eprintln!("Could not remove reference read witness {id}: {}", error.code);
                 }
             }
@@ -108,6 +108,42 @@ mod tests {
     use crate::deployment::{CellStorage, storage_namespaces};
     use crate::keys::LocalKeyService;
     use crate::reference::{Base, PrefixedStore, ReferencingStore, key, simulate_fork};
+
+    #[tokio::test]
+    async fn a_refused_release_leaves_its_witness_for_reconciliation() {
+        use crate::hold_release::tests::{Fault, ScriptedDirectory};
+
+        let files = tempfile::tempdir().unwrap();
+        let storage = CellStorage::Local { root: files.path().join("objects") };
+        let keys = Arc::new(LocalKeyService::new(files.path().join("keys")).unwrap());
+        let directory = ScriptedDirectory::new();
+        let namespaces = StorageNamespaces { objects: Uuid::new_v4(), keys: [0; 32] };
+        let mut owner = DeploymentRecord::new("owner", "org", Vec::new(), 0);
+        owner.storage_namespaces = Some(namespaces);
+        let owner = directory.create_deployment(owner).await.unwrap();
+        let source = format!("{}/v06", owner.storage_prefix());
+        let tasks = TaskTracker::new();
+        let custody = ReferenceReads::new(directory.clone(), keys.clone(), tasks.clone(), &owner, "v06", namespaces, ReplayCustody::Local);
+        let permit = custody.retain(&source, &key(&format!("{source}/payload")).unwrap()).await.unwrap();
+        let reads = |record: &DeploymentRecord| record.storage_regions.iter()
+            .filter(|(_, region)| matches!(region, StorageRegion::ReferenceRead { .. }))
+            .map(|(id, _)| *id).collect::<Vec<_>>();
+        let admitted = reads(&directory.deployment(&owner.id).await.unwrap().unwrap());
+        assert_eq!(admitted.len(), 1);
+        let region = admitted[0];
+
+        directory.inject(Fault::Refuse);
+        drop(permit);
+        tasks.close();
+        tokio::time::timeout(Duration::from_secs(5), tasks.wait()).await.unwrap();
+        let held = directory.deployment(&owner.id).await.unwrap().unwrap();
+        assert_eq!(reads(&held), [region], "the refused release leaves the read registered");
+        assert!(keys.local_storage_region_drained(region).unwrap(), "the witness survives, unlocked");
+
+        crate::store::reconcile_storage_regions(directory.as_ref(), &storage, keys.as_ref(), &held).await.unwrap();
+        assert!(reads(&directory.deployment(&owner.id).await.unwrap().unwrap()).is_empty());
+        assert!(!keys.local_storage_region_drained(region).unwrap(), "reconciliation forgets the witness");
+    }
 
     #[tokio::test]
     async fn inherited_io_holds_its_physical_residence_through_cancellation_and_disposal() {

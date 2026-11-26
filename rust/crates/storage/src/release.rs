@@ -24,6 +24,12 @@ pub enum Settled {
     Refused(Anomaly),
 }
 
+impl Settled {
+    pub fn is_released(&self) -> bool {
+        matches!(self, Self::Released)
+    }
+}
+
 /// Whether another attempt can succeed where this one failed.
 pub fn transient(error: &Anomaly) -> bool {
     matches!(error.category,

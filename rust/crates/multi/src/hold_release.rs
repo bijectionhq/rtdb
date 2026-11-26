@@ -60,6 +60,8 @@ pub(crate) mod tests {
     pub(crate) enum Fault {
         /// The next deployment read fails.
         Read,
+        /// The next deployment read is refused with an error no retry can clear.
+        Refuse,
         /// The next replace applies and then loses its reply.
         LostReply,
     }
@@ -113,6 +115,9 @@ pub(crate) mod tests {
         }
         async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>> {
             if self.take(|fault| matches!(fault, Fault::Read)) { return Err(unavailable()); }
+            if self.take(|fault| matches!(fault, Fault::Refuse)) {
+                return Err(Anomaly::incorrect("rtdb.test/directory-refused", "The scripted directory refused the read"));
+            }
             self.inner.deployment(id).await
         }
         async fn deployment_by_name(&self, name: &str) -> Result<Option<DeploymentRecord>> { self.inner.deployment_by_name(name).await }

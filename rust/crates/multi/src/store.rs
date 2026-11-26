@@ -558,11 +558,13 @@ impl CellStoreFactory {
             drop(io);
             // A failed registration may already be committed. Compare and
             // replace even if absent to fence that attempt's old version.
-            if opened || uncertain {
+            let released = if opened || uncertain {
                 let (directory, deployment) = (&directory, &config.deployment);
-                release_hold(format!("storage region {id} in {deployment}"), move || release_region(directory.as_ref(), deployment, id, uncertain)).await;
-            }
-            if witnessed && let Err(error) = keys.forget_local_storage_region(id) {
+                release_hold(format!("storage region {id} in {deployment}"), move || release_region(directory.as_ref(), deployment, id, uncertain)).await
+                    .is_released()
+            } else { true };
+            // An unreleased region keeps its witness, unlocked, for `reconcile_storage_regions`.
+            if witnessed && released && let Err(error) = keys.forget_local_storage_region(id) {
                 eprintln!("Could not remove storage region witness {id}: {}", error.code);
             }
         });

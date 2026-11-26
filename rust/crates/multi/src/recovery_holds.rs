@@ -114,7 +114,7 @@ impl RecoveryAdmission {
             if ready.send(outcome).is_ok() && opened {
                 let _ = closed.await;
             }
-            if attempted {
+            let released = if attempted {
                 let (directory, deployment) = (&worker.holds.directory, &worker.deployment);
                 let settled = release_hold(format!("recovery hold {id} for {deployment}"),
                     move || crate::store::release_region(directory.as_ref(), deployment, id, !opened)).await;
@@ -123,10 +123,11 @@ impl RecoveryAdmission {
                         "installation": worker.deployment, "stream": worker.stream, "epoch": worker.log_epoch, "hold": id,
                     }));
                 }
-            }
+                settled.is_released()
+            } else { true };
             if witness.is_some() {
                 drop(witness);
-                if let Err(error) = worker.holds.keys.forget_local_storage_region(id) {
+                if released && let Err(error) = worker.holds.keys.forget_local_storage_region(id) {
                     eprintln!("Could not remove recovery hold witness {id}: {}", error.code);
                 }
             }
