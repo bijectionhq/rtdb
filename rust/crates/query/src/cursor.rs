@@ -893,7 +893,7 @@ impl QueryCursor {
                 let deferred = ResultArrowSchema::new(schema, 0..schema.len(), &skip, memory)?;
                 emit_columns(schema, &deferred, memory, &input, (0..schema.len()).map(|index| (index, index)), &skip, false)
             })() {
-                Err(error) if error.code == "rtdb/memory-budget-exceeded" => {
+                Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => {
                     drop(replacements);
                     drop(charge);
                     return cached_column_batch(schema, arrow, memory, input);

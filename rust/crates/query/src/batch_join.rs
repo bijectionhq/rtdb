@@ -557,7 +557,7 @@ impl Spec {
             match probe.take_sorted_span(span.clone(), &columns, memory) {
                 Ok(Some(output)) => return Ok(Some(output)),
                 Ok(None) => {}
-                Err(error) if error.code == "rtdb/memory-budget-exceeded" => {}
+                Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => {}
                 Err(error) => return Err(error),
             }
             for row in span {

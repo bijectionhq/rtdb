@@ -477,13 +477,13 @@ fn append_frame(batch: &ColumnBatch, rows: Range<usize>, memory: &Arc<MemoryBudg
     if let Err(error) = &result {
         out.bytes.truncate(prefix);
         // Cache admission is optional, including when its charge would force a frame split.
-        if fields.as_deref_mut().is_some_and(WireFields::clear) && error.code == "rtdb/memory-budget-exceeded" {
+        if fields.as_deref_mut().is_some_and(WireFields::clear) && error.is(rtdb_types::AnomalyKind::ResourceExhausted) {
             result = encode_frame(batch, rows.clone(), memory, out, None);
             if result.is_err() { out.bytes.truncate(prefix); }
         }
     }
     if rows.len() > 1 && result.as_ref().is_err_and(|error| {
-        matches!(error.code.as_ref(), "rtdb/run-end-selection-width" | "rtdb/memory-budget-exceeded")
+        error.is(rtdb_types::AnomalyKind::ResourceExhausted) || error.code == "rtdb/run-end-selection-width"
     }) {
         let middle = rows.start + rows.len() / 2;
         let mut split_fields;
@@ -570,7 +570,7 @@ fn encode_frame(batch: &ColumnBatch, rows: Range<usize>, memory: &Arc<MemoryBudg
     match try_write_spanned_frame(&record, &options, memory, out) {
         Ok(true) => return Ok(()),
         Ok(false) => (),
-        Err(error) if error.code == "rtdb/memory-budget-exceeded" => (),
+        Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => (),
         Err(error) => return Err(error),
     }
 
@@ -627,7 +627,7 @@ fn try_write_spanned_frame(record: &RecordBatch, options: &IpcWriteOptions, memo
 /// The batches `encode_batch` wrote into `bytes`, each charged to `memory` for what it retains.
 pub(crate) fn decode_batches(bytes: Buffer, memory: &Arc<MemoryBudget>) -> Result<Vec<ColumnBatch>> {
     match decode_fragment_frames(bytes.clone(), memory, true) {
-        Err(error) if error.code == "rtdb/memory-budget-exceeded" => {
+        Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => {
             // A retained prefix can tie up more of the budget than an entirely copied reply.
             decode_fragment_frames(bytes, memory, false)
         }
@@ -649,7 +649,7 @@ fn decode_fragment_frames(mut rest: Buffer, memory: &Arc<MemoryBudget>, retain: 
             let prefix = batches.len();
             match decode_retained_fragment(frame.clone(), memory, &mut batches) {
                 Ok(()) => continue,
-                Err(error) if error.code == "rtdb/memory-budget-exceeded" => batches.truncate(prefix),
+                Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => batches.truncate(prefix),
                 Err(error) => return Err(error),
             }
         }

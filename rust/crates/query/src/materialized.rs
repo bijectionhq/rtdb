@@ -57,7 +57,7 @@ impl BufferedReplay {
             let lease = Arc::get_mut(&mut self.reservation).expect("Unpublished materialization owns its page reservation");
             match lease.grow_to(capacity) {
                 Ok(()) => self.pages.reserve_exact(capacity / std::mem::size_of::<ColumnBatch>() - self.pages.len()),
-                Err(error) if error.code == "rtdb/memory-budget-exceeded" => return Ok(Some(page)),
+                Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => return Ok(Some(page)),
                 Err(error) => return Err(error),
             }
         }
@@ -105,7 +105,7 @@ impl ReplayBinding {
             rows = rows.saturating_add(batch.len);
             let retained = match batch.working_set_bytes(memory) {
                 Ok(bytes) => bytes,
-                Err(error) if error.code == "rtdb/memory-budget-exceeded" => usize::MAX,
+                Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => usize::MAX,
                 Err(error) => return Err(error),
             };
             bytes = bytes.saturating_add(retained).saturating_add(std::mem::size_of::<ColumnBatch>());

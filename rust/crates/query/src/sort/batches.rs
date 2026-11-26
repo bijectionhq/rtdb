@@ -684,7 +684,7 @@ fn compare_scalar_keys(
     if let Some(keys) = cache {
         match keys.compare(left, right, plan, &read) {
             // The cache must not consume the memory the two-key comparator needs to run.
-            Err(error) if error.code == "rtdb/memory-budget-exceeded" => *cache = None,
+            Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => *cache = None,
             result => return result,
         }
     }

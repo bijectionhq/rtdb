@@ -1028,7 +1028,7 @@ impl ScanCursor {
             Ok::<_, Anomaly>(ranking.winners())
         }).await;
         let mut winners = match query_winners {
-            Err(error) if matches!(error.code.as_str(), "rtdb/memory-budget-exceeded" | "rtdb.storage/memory-limit") => None,
+            Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) || error.code == "rtdb.storage/memory-limit" => None,
             result => result?,
         };
         let mut parts = VecDeque::new();
@@ -1057,7 +1057,7 @@ impl ScanCursor {
                             else { verified = selection.scores; }
                         }
                         Ok(None) => {}
-                        Err(error) if error.code == "rtdb/memory-budget-exceeded" => {}
+                        Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => {}
                         Err(error) => return Err(error),
                     }
                 }
@@ -1090,7 +1090,7 @@ impl ScanCursor {
                                         || scan.iids.as_ref().is_none_or(|existing| existing.contains(&iid)),
                                         |existing: &crate::CandidateIids| existing.contains(iid))
                             }, &execution.context.memory) {
-                                Err(error) if error.code == "rtdb/memory-budget-exceeded" => continue,
+                                Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => continue,
                                 result => result?,
                             };
                         }
@@ -1116,7 +1116,7 @@ impl ScanCursor {
                             return Ok::<_, Anomaly>((parts, verified_counts));
                         }
                         Ok(None) => {}
-                        Err(error) if error.code == "rtdb/memory-budget-exceeded" => {
+                        Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => {
                             if let Some(rank) = &mut ranking && let Some(scores) = &mut rank.verified { scores.release_rows(); }
                             drop(verified.take());
                         }

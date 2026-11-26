@@ -298,7 +298,7 @@ impl SpillWriter {
 fn exact_spill_spans(batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<Option<RecordSpans>> {
     match RecordSpans::exact(batch, IPC_ALIGNMENT, memory) {
         // A small record can fit its generic encoding reservation even when span planning runs out of scratch.
-        Err(error) if matches!(error.code.as_str(), "rtdb/memory-budget-exceeded" | "rtdb.format/invalid-arrow") => Ok(None),
+        Err(error) if error.is(AnomalyKind::ResourceExhausted) || error.code == "rtdb.format/invalid-arrow" => Ok(None),
         result => result,
     }
 }

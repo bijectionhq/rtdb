@@ -130,7 +130,7 @@ async fn assemble_flat_pages(
         .ok_or_else(size_error)?;
     let reservation = match context.memory.reserve(bound) {
         Ok(reservation) => reservation,
-        Err(error) if error.code == "rtdb/memory-budget-exceeded" => return Ok(None),
+        Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => return Ok(None),
         Err(error) => return Err(error),
     };
     let arrow_error = |error| invalid("column-gather", error);

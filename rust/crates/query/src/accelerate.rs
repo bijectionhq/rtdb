@@ -129,7 +129,7 @@ impl<'a> ScanRequest<'a> {
         let iids = CandidateIids::build(scores.iids.len(), scores.iter().map(|(iid, _)| iid), self.memory)?;
         let rows = match self.verifier.gather_ranked(rows).await {
             Ok(rows) => rows,
-            Err(error) if error.code == "rtdb/memory-budget-exceeded" => BTreeMap::new(),
+            Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => BTreeMap::new(),
             Err(error) => return Err(error),
         };
         Ok(Some(ScanSelection { iids, scores: Some(scores.with_rows(rows)) }))
@@ -543,7 +543,7 @@ pub trait ScanAccelerator: Send + Sync {
         let Some(iids) = self.candidate_iids(request).await? else { return Ok(None); };
         match CandidateIids::from_set(iids, request.memory) {
             Ok(iids) => Ok(Some(ScanSelection { iids, scores: None })),
-            Err(error) if error.code == "rtdb/memory-budget-exceeded" => Ok(None),
+            Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => Ok(None),
             Err(error) => Err(error),
         }
     }
