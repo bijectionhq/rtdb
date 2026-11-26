@@ -15,6 +15,10 @@ pub(crate) fn case_language() -> Result<rtdb_types::CaseLanguage> {
     LANGUAGE.get_or_init(|| rtdb_java_date::process_language().map(|language| rtdb_types::CaseLanguage::of(&language))).clone()
 }
 
+/// Reads the process defaults the evaluator fixes at startup, as the JVM does, so that a host without them fails to
+/// start rather than failing its first UPPER or LOWER.
+pub fn host_defaults() -> Result<()> { case_language().map(drop) }
+
 pub(crate) fn call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Option<Result<Value>> {
     if matches!(name,"like" | "ilike") { return Some(pattern::like(&args[0],&args[1],None,name == "ilike",false,context)); }
     if !matches!(name, "str" | "format" | "concat" | "trim" | "trim_leading" | "trim_trailing" | "substring" | "overlay" | "position" | "octet_position" | "character_length" | "octet_length" | "default_overlay_length" | "replace" | "reverse" | "string_to_array" | "parse_ident" | "quote_ident") { return None; }

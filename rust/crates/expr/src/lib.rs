@@ -34,6 +34,7 @@ pub use pg_catalog::{PgCatalogLookup, format_relation_name, requires_pg_catalog}
 pub use string::render::allocation_bound as text_allocation_bound;
 pub use string::render::arrow_text;
 pub use string::pattern::JavaFullMatcher;
+pub use string::host_defaults;
 
 pub use cast::{cast, cast_target, parse_timestamp, query_clock_instant, timestamp_micros};
 pub use temporal::local_micros;

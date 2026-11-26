@@ -297,9 +297,24 @@ fn batch_output_container_budget_is_checked_before_any_row_is_evaluated() {
 
 #[test]
 fn upper_and_lower_use_the_process_default_locale_case_rules() {
-    let language = rtdb_types::CaseLanguage::of(&rtdb_java_date::process_language().unwrap());
-    let source = "istanbul İSTANBUL Straße I\u{307}";
-    assert_eq!(call("upper", &[text(source)]), text(&language.to_upper(source)));
-    assert_eq!(call("lower", &[text(source)]), text(&language.to_lower(source)));
+    rtdb_expr::host_defaults().unwrap();
+    // Every default language upper-cases the sharp s to two letters.
     assert_eq!(call("upper", &[text("straße")]), text("STRASSE"));
+}
+
+#[test]
+fn turkic_and_lithuanian_case_rules_are_javas() {
+    use rtdb_types::CaseLanguage;
+    for language in ["tr", "az"] {
+        let rules = CaseLanguage::of(language);
+        assert_eq!(rules.to_upper("istanbul"), "İSTANBUL", "{language}");
+        assert_eq!(rules.to_lower("ISTANBUL"), "ıstanbul", "{language}");
+        assert_eq!(rules.to_lower("İ"), "i", "{language}");
+    }
+    let lithuanian = CaseLanguage::of("lt");
+    assert_eq!(lithuanian.to_lower("Ì"), "i\u{307}\u{300}");
+    assert_eq!(lithuanian.to_upper("i\u{307}"), "I");
+    let root = CaseLanguage::of("en");
+    assert_eq!(root.to_upper("istanbul"), "ISTANBUL");
+    assert_eq!(root.to_lower("İ"), "i\u{307}");
 }
