@@ -109,26 +109,55 @@ impl ReplayError {
 /// Verified manifest summaries without their checkpoint payloads, by object.
 /// Manifests are immutable and named by their ciphertext digest, so a summary
 /// never goes stale. Reachability reads them instead of the object store.
-#[derive(Default)]
-pub(crate) struct ManifestCache(Mutex<BTreeMap<ObjectId, Arc<VerifiedManifest>>>);
+///
+/// The cache holds the manifests the last reachability closure reached, plus
+/// those inserted since it started: each closure drops the rest, so the cache
+/// is bounded by the retained journal suffix rather than by a count.
+pub(crate) type ManifestCache = SummaryCache<VerifiedManifest>;
 
-/// Summaries kept before the cache starts over. Each holds only object
-/// identities and pins.
-const CACHED_MANIFESTS: usize = 16_384;
+pub(crate) struct SummaryCache<T>(Mutex<Summaries<T>>);
 
-impl ManifestCache {
-    fn get(&self, id: ObjectId) -> Option<Arc<VerifiedManifest>> {
-        self.0.lock().expect("manifest cache").get(&id).cloned()
+struct Summaries<T> {
+    entries: BTreeMap<ObjectId, (u64, Arc<T>)>,
+    inserted: u64,
+}
+
+impl<T> Default for SummaryCache<T> {
+    fn default() -> Self {
+        Self(Mutex::new(Summaries { entries: BTreeMap::new(), inserted: 0 }))
+    }
+}
+
+impl<T> SummaryCache<T> {
+    fn get(&self, id: ObjectId) -> Option<Arc<T>> {
+        self.0.lock().expect("manifest cache").entries.get(&id).map(|(_, summary)| Arc::clone(summary))
     }
 
-    pub(crate) fn insert(&self, manifest: VerifiedManifest) -> Arc<VerifiedManifest> {
-        let manifest = Arc::new(manifest);
+    fn insert_as(&self, id: ObjectId, summary: T) -> Arc<T> {
+        let summary = Arc::new(summary);
         let mut cache = self.0.lock().expect("manifest cache");
-        if cache.len() >= CACHED_MANIFESTS {
-            cache.clear();
-        }
-        cache.insert(manifest.id(), Arc::clone(&manifest));
-        manifest
+        cache.inserted += 1;
+        let stamp = cache.inserted;
+        cache.entries.insert(id, (stamp, Arc::clone(&summary)));
+        summary
+    }
+
+    /// Marks the start of a closure, for [`Self::retain_reached`].
+    fn mark(&self) -> u64 {
+        self.0.lock().expect("manifest cache").inserted
+    }
+
+    /// Keeps the summaries a closure started at `mark` reached, and every
+    /// summary inserted after it, which a newer closure may need.
+    fn retain_reached(&self, mark: u64, reached: &BTreeMap<ObjectId, Arc<T>>) {
+        self.0.lock().expect("manifest cache").entries
+            .retain(|id, (stamp, _)| *stamp > mark || reached.contains_key(id));
+    }
+}
+
+impl ManifestCache {
+    pub(crate) fn insert(&self, manifest: VerifiedManifest) -> Arc<VerifiedManifest> {
+        self.insert_as(manifest.id(), manifest)
     }
 }
 
@@ -776,6 +805,7 @@ async fn closure(
             _ => {}
         }
     }
+    let mark = stream.manifests.mark();
     let mut manifests = BTreeMap::<ObjectId, Arc<VerifiedManifest>>::new();
     while let Some(id) = roots.pop_first() {
         if manifests.contains_key(&id) {
@@ -793,6 +823,7 @@ async fn closure(
         }
         manifests.insert(id, manifest);
     }
+    stream.manifests.retain_reached(mark, &manifests);
     Reachability::from_retained(stream.database, epoch.0, base, records, manifests.values().map(Arc::as_ref))
 }
 
@@ -886,4 +917,31 @@ async fn find_clean_checkpoint(stream: &Stream, head: Lsn) -> Result<Option<Lsn>
 
 fn invalid(message: &str) -> Anomaly {
     Anomaly::fault("rtdb/multi-replay", message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(seq: u64) -> ObjectId {
+        ObjectId { database: Uuid::nil(), kind: ObjectKind::Manifest, epoch: 1, seq, digest: [0; 32] }
+    }
+
+    #[test]
+    fn a_closure_drops_the_summaries_it_no_longer_reaches() {
+        let cache = SummaryCache::<u64>::default();
+        for seq in 0..4 {
+            cache.insert_as(id(seq), seq);
+        }
+        let mark = cache.mark();
+        // Committed while the closure ran, so the closure could not reach it.
+        cache.insert_as(id(9), 9);
+        let reached: BTreeMap<_, _> = [2, 3].into_iter().map(|seq| (id(seq), cache.get(id(seq)).unwrap())).collect();
+        cache.retain_reached(mark, &reached);
+        assert!(cache.get(id(0)).is_none());
+        assert!(cache.get(id(1)).is_none());
+        assert_eq!(cache.get(id(2)).as_deref(), Some(&2));
+        assert_eq!(cache.get(id(3)).as_deref(), Some(&3));
+        assert_eq!(cache.get(id(9)).as_deref(), Some(&9));
+    }
 }
