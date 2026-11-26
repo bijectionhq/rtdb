@@ -354,7 +354,17 @@ Private page and replay tests cover retained-buffer lifetime and cancellation wh
 These tests have not run.
 Full optimizer equivalence, including decorrelation, projection fusion, symbol allocation, and scan-column order, remains unqualified.
 Decorrelation ports the reference's rules 1, 2, 8 and 9, `apply-table-col->unnest`, `select-mark-join->semi-join` and selection pushdown past applies: a correlated scalar subquery becomes a single join, which keeps its cardinality check, and a lateral subquery over an aggregate with groups becomes a grouping over the join with numbered input rows.
-A dependent plan with a volatile call, and an ungrouped aggregate under a lateral join, keep their applies.
+Its selection lifting also ports `push-decorrelated-selection-down-past-unnest`, `-past-group-by`, `push-decorrelated-predicate-down-past-period-constructor` and `push-decorrelated-selections-with-fewer-variables-down`: a correlated selection on grouping columns moves above an aggregate with groups, the uncorrelated selections staying beneath it or beneath an unnest, and a computed column, such as a period, that only a selection reads no longer keeps a left or single apply.
+Selections are lifted conjunct by conjunct, so their order never matters.
+Unlike the reference, which pulls no correlated selection above an unnest, a correlated selection beneath an unnest whose list reads no bound parameter moves above it, which keeps the same rows.
+These shapes still run once per input row, and keep their applies:
+
+* a dependent plan with a volatile call, or an outer reference to an enclosing apply;
+* an ungrouped aggregate under a lateral join, which gives a row even for an input row with no matches;
+* outside a lateral inner join, which rule 8 handles, a correlated selection beneath a grouping that reads a column the grouping drops, or a grouping or aggregate that reads a bound parameter itself, including a percentile fraction;
+* outside a lateral inner join, which `apply-table-col->unnest` handles, an unnest whose list reads a bound parameter, or a computed column that does;
+* a correlated selection beneath an outer, semi, anti, single or mark join, a set operation, a window, a row numbering or ordinality, or, outside an existence test, DISTINCT, a sort or a limit;
+* a left or single apply whose dependent returns a value computed from a bound parameter, which over the rows the join supplies nulls for could differ from the apply's null.
 Append projections, windows and UNNEST retain the input columns required by their expressions and those requested by their parents.
 For conjunctive filters, expressions with fewer column dependencies can reach the scan before multi-column expressions.
 Scan explanations use the reference traversal order of the symbol set and the resulting text set.

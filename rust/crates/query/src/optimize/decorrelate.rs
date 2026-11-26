@@ -159,20 +159,23 @@ fn uncorrelated(input: &Arc<Relation>, dependent: &Arc<Relation>, kind: ApplyKin
 fn lateral(input: &Arc<Relation>, dependent: &Arc<Relation>, correlation: &Correlation<'_>, kind: ApplyKind, schema: &Schema) -> Result<Option<Arc<Relation>>> {
     let Some(lifted) = lift(dependent, correlation, matches!(kind, ApplyKind::Semi | ApplyKind::Anti))? else { return Ok(None) };
     let conditions: Vec<Expr> = lifted.filters.into_iter().map(|filter| correlation.substitute(filter)).collect();
+    // A computed column the dependent does not return was read only by selections, into which it is already inlined, as
+    // the reference's `push-decorrelated-predicate-down-past-period-constructor` inlines a period into its predicate.
+    let computed: Vec<NamedExpr> = lifted.computed.into_iter().filter(|named| dependent.schema().get(named.field.id).is_some()).collect();
     let spanning = spans(&conditions, input.schema(), lifted.base.schema());
     let join_kind = match kind {
         ApplyKind::Inner if conditions.is_empty() => JoinKind::Cross,
         ApplyKind::Inner => JoinKind::Inner,
         // Over the rows a left join supplies nulls for, a projection could compute a value the apply would not.
-        ApplyKind::Left if spanning && lifted.computed.is_empty() => JoinKind::Left,
-        ApplyKind::Single if spanning && lifted.computed.is_empty() => JoinKind::Single,
+        ApplyKind::Left if spanning && computed.is_empty() => JoinKind::Left,
+        ApplyKind::Single if spanning && computed.is_empty() => JoinKind::Single,
         ApplyKind::Semi if spanning => JoinKind::Semi,
         ApplyKind::Anti if spanning => JoinKind::Anti,
         _ => return Ok(None),
     };
     let joined = Arc::new(Relation::join(Arc::clone(input), lifted.base, join_kind, conjunction(conditions))?);
-    let rows = if matches!(join_kind, JoinKind::Inner | JoinKind::Cross) && !lifted.computed.is_empty() {
-        let computed = lifted.computed.into_iter().map(|named| NamedExpr { field: named.field, expr: correlation.substitute(named.expr) }).collect();
+    let rows = if matches!(join_kind, JoinKind::Inner | JoinKind::Cross) && !computed.is_empty() {
+        let computed = computed.into_iter().map(|named| NamedExpr { field: named.field, expr: correlation.substitute(named.expr) }).collect();
         Arc::new(joined.extend(computed)?)
     } else { joined };
     restore(rows, schema)
@@ -496,8 +499,11 @@ fn quantified_join(outer: &Arc<Relation>, dependent: &Arc<Relation>, correlation
 /// `computed` columns read only `base` and the bound parameters.
 struct Lifted { base: Arc<Relation>, filters: Vec<Expr>, computed: Vec<NamedExpr> }
 
-/// Moves the correlated selections of a dependent plan above its projections and inner joins, as the reference's
-/// `pull-correlated-selection-up-towards-apply` does.
+/// Moves the correlated selections of a dependent plan above its projections, inner joins, unnests and groupings, as the
+/// reference's `pull-correlated-selection-up-towards-apply` does, leaving its uncorrelated selections beneath an unnest or
+/// grouping, as its `push-decorrelated-selection-down-past-unnest` and `-past-group-by` do.
+/// Conjuncts are lifted one by one, so a selection need not be ordered before another reading more columns, as the
+/// reference's `push-decorrelated-selections-with-fewer-variables-down` orders them.
 /// Where only the dependent's existence matters, operators that keep it, such as DISTINCT and sorts, are dropped.
 fn lift(relation: &Arc<Relation>, correlation: &Correlation<'_>, existence: bool) -> Result<Option<Lifted>> {
     stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || lift_at(relation, correlation, existence))
@@ -546,8 +552,57 @@ fn lift_at(relation: &Arc<Relation>, correlation: &Correlation<'_>, existence: b
             let kind = if kept.is_empty() { JoinKind::Cross } else { JoinKind::Inner };
             Some(Lifted { base: Arc::new(Relation::join(left.base, right.base, kind, conjunction(kept))?), filters, computed })
         }
+        // A selection on the unnested relation's columns keeps the same rows whether it is evaluated before or after
+        // each row is repeated for its elements.
+        RelationNode::Unnest { input, expr, element, ordinality, outer } => {
+            if correlation.in_expression(expr) { return Ok(None); }
+            let Some(lifted) = lift(input, correlation, false)? else { return Ok(None) };
+            let Some((base, filters)) = settle(lifted, correlation)? else { return Ok(None) };
+            let fields = base.schema().fields().iter().cloned().chain([element.clone()]).chain(ordinality.clone()).collect();
+            let unnested = Relation::new(Schema::new(fields)?, RelationNode::Unnest {
+                input: base, expr: expr.clone(), element: element.clone(), ordinality: ordinality.clone(), outer: *outer,
+            })?;
+            Some(Lifted { base: Arc::new(unnested), filters, computed: Vec::new() })
+        }
+        // A selection on grouping columns keeps the same groups whether it is evaluated before or after grouping.
+        // Without groups, an aggregate gives a row even over the empty input the selection would leave it.
+        RelationNode::Aggregate { input, groups, aggregates } if !groups.is_empty() => {
+            if relation.expressions().into_iter().any(|expression| correlation.in_expression(expression)) || correlation.in_fractions(aggregates) {
+                return Ok(None);
+            }
+            let Some(lifted) = lift(input, correlation, false)? else { return Ok(None) };
+            let keys: Vec<(ColumnId, Expr)> = groups.iter().filter_map(|group| match inline(group.expr.clone(), &lifted.computed)? {
+                Expr::Column { id, .. } => Some((id, group.field.expression())),
+                _ => None,
+            }).collect();
+            let Some((base, filters)) = settle(lifted, correlation)? else { return Ok(None) };
+            let mut regrouped = Vec::with_capacity(filters.len());
+            for mut filter in filters {
+                let mut copied = false;
+                filter.visit(&mut |expression| copied |= matches!(expression, Expr::RowCopy(_)));
+                if copied || !filter.referenced_columns().iter().all(|id| keys.iter().any(|(key, _)| key == id)) { return Ok(None); }
+                filter.rewrite(&mut |expression| {
+                    let Expr::Column { id, .. } = expression else { return };
+                    let id = *id;
+                    if let Some((_, group)) = keys.iter().find(|(key, _)| *key == id) { *expression = group.clone(); }
+                });
+                regrouped.push(filter);
+            }
+            let grouped = Relation::new(relation.schema().clone(), RelationNode::Aggregate { input: base, groups: groups.clone(), aggregates: aggregates.clone() })?;
+            Some(Lifted { base: Arc::new(grouped), filters: regrouped, computed: Vec::new() })
+        }
         _ => None,
     })
+}
+
+/// The lifted plan with its computed columns and uncorrelated selections evaluated over its base, to go beneath an
+/// operator only its correlated selections, returned beside it, move above; `None` where a computed column reads a
+/// bound parameter.
+fn settle(lifted: Lifted, correlation: &Correlation<'_>) -> Result<Option<(Arc<Relation>, Vec<Expr>)>> {
+    if lifted.computed.iter().any(|named| correlation.in_expression(&named.expr)) { return Ok(None); }
+    let base = if lifted.computed.is_empty() { lifted.base } else { Arc::new(lifted.base.extend(lifted.computed)?) };
+    let (correlated, uncorrelated): (Vec<Expr>, Vec<Expr>) = lifted.filters.into_iter().partition(|filter| correlation.in_expression(filter));
+    Ok(Some((finish(base, uncorrelated)?, correlated)))
 }
 
 fn positive(fetch: &Expr) -> bool {

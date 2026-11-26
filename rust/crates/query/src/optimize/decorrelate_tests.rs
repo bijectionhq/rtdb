@@ -143,6 +143,55 @@ fn unnested(numbered: bool, selected: Option<Expr>) -> Arc<Relation> {
     apply(&tagged(), table, vec![(0, tags().expression()), (1, customer_id().expression())], ApplyKind::Inner, None)
 }
 
+fn owner() -> Field { integer(50, "owner") }
+fn owned_tags() -> Field { typed(51, "owned_tags", LogicalType::list(int().maybe()).maybe()) }
+fn owned_tag() -> Field { integer(52, "owned_tag") }
+
+/// Tag lists by owner: two lists for one customer, an empty and a null list, a null owner, a list with a null element, and
+/// an owner who is no customer.
+fn tag_lists() -> Arc<Relation> {
+    let list = |elements: &[Option<i64>]| Expr::Literal(Value::list(elements.iter().map(|element| element.map_or(Value::Null, Value::I64)).collect()));
+    let rows = vec![
+        vec![literal(1), list(&[Some(10), Some(20)])], vec![literal(1), list(&[Some(30)])], vec![literal(2), list(&[])],
+        vec![literal(3), Expr::Literal(Value::Null)], vec![Expr::Literal(Value::Null), list(&[Some(40)])],
+        vec![literal(5), list(&[Some(60), None])], vec![literal(9), list(&[Some(90)])],
+    ];
+    Arc::new(Relation::new(Schema::new(vec![owner(), owned_tags()]).unwrap(), RelationNode::Values { rows }).unwrap())
+}
+
+/// The elements of the non-null tag lists of the customer bound to parameter 0, with their positions where `numbered`, and
+/// a row for each empty list where `outer`: the correlated selection is beneath the unnest.
+fn customer_tags(numbered: bool, outer: bool) -> Arc<Relation> {
+    let lists = select(tag_lists(), Expr::binary(BinaryOp::And,
+        equals(owner().expression(), parameter(0, &customer_id())), Expr::unary(UnaryOp::IsNotNull, owned_tags().expression())));
+    let ordinality = numbered.then(|| typed(53, "position", LogicalType::Scalar(ScalarType::I32).maybe()));
+    let fields = lists.schema().fields().iter().cloned().chain([owned_tag()]).chain(ordinality.clone()).collect();
+    Arc::new(Relation::new(Schema::new(fields).unwrap(), RelationNode::Unnest {
+        input: lists, expr: owned_tags().expression(), element: owned_tag(), ordinality, outer,
+    }).unwrap())
+}
+
+fn per_customer() -> Field { typed(25, "per_customer", int()) }
+
+/// `SELECT o.customer, count(*) FROM o WHERE o.customer = ? AND o.amount > 40 GROUP BY o.customer`: the correlated
+/// selection reads only the grouping column, and the uncorrelated one a column the grouping drops.
+fn customer_group() -> Arc<Relation> {
+    let selected = select(orders(), Expr::binary(BinaryOp::And,
+        equals(order_customer().expression(), parameter(0, &customer_id())), Expr::binary(BinaryOp::Gt, order_amount().expression(), literal(40))));
+    grouped(selected, vec![NamedExpr { field: integer(24, "customer_group"), expr: order_customer().expression() }],
+        vec![counted(per_customer(), AggregateFunction::CountStar, None, None)])
+}
+
+/// Orders of the customer bound to parameter 0 whose amount plus one exceeds the region bound to parameter 1, selected on
+/// a computed column the dependent plan does not return, as a period constructor is.
+fn shifted_orders() -> Arc<Relation> {
+    let shifted = integer(26, "shifted");
+    let extended = Arc::new(orders().extend(vec![NamedExpr { field: shifted.clone(), expr: Expr::binary(BinaryOp::Add, order_amount().expression(), literal(1)) }]).unwrap());
+    keep(select(extended, Expr::binary(BinaryOp::And,
+        equals(order_customer().expression(), parameter(0, &customer_id())), Expr::binary(BinaryOp::Gt, shifted.expression(), parameter(1, &customer_region())))),
+        &[order_customer(), order_amount()])
+}
+
 /// Each correlated query, and whether its applies are all rewritten into joins.
 fn corpus() -> Vec<(&'static str, Arc<Relation>, bool)> {
     let count = typed(12, "count", int());
@@ -195,6 +244,17 @@ fn corpus() -> Vec<(&'static str, Arc<Relation>, bool)> {
         ("lateral unnest", unnested(false, None), true),
         ("lateral unnest with ordinality", unnested(true, None), true),
         ("lateral unnest with a correlated selection", unnested(true, Some(Expr::binary(BinaryOp::Gt, integer(41, "tag").expression(), parameter(1, &customer_id())))), true),
+        ("lateral unnest of a correlated selection", apply(&customers(), customer_tags(false, false), by_customer(), ApplyKind::Inner, None), true),
+        ("lateral left outer unnest of a correlated selection with ordinality", apply(&customers(), customer_tags(true, true), by_customer(), ApplyKind::Left, None), true),
+        ("exists over an unnest of a correlated selection", exists(one(customer_tags(false, false)), by_customer(), false, None), true),
+        ("lateral grouped on the correlated column", apply(&customers(), customer_group(), by_customer(), ApplyKind::Inner, None), true),
+        ("lateral left grouped on the correlated column", apply(&customers(), customer_group(), by_customer(), ApplyKind::Left, None), true),
+        ("scalar count of a group on the correlated column", scalar(keep(customer_group(), &[per_customer()]), by_customer()), true),
+        ("not exists over a group on the correlated column", exists(one(customer_group()), by_customer(), true, None), true),
+        // The correlated selection reads a column the grouping drops, so it cannot move above it.
+        ("lateral left grouped on another column", apply(&customers(), Arc::clone(&per_amount), by_customer(), ApplyKind::Left, None), false),
+        ("lateral left over a computed column only its selection reads", apply(&customers(), shifted_orders(),
+            vec![(0, customer_id().expression()), (1, customer_region().expression())], ApplyKind::Left, None), true),
     ]
 }
 
@@ -309,6 +369,20 @@ fn a_lateral_list_table_becomes_an_unnest() {
     let prepared = prepare(unnested(true, None)).unwrap();
     assert_eq!(applies(&prepared), 0, "{prepared:?}");
     assert_eq!(count_nodes(&prepared, &|node: &RelationNode| matches!(node, RelationNode::Unnest { ordinality: Some(_), outer: false, .. })), 1, "{prepared:?}");
+}
+
+#[test]
+fn a_correlated_selection_on_a_grouping_column_moves_above_the_grouping() {
+    let prepared = prepare(apply(&customers(), customer_group(), by_customer(), ApplyKind::Left, None)).unwrap();
+    assert_eq!((applies(&prepared), joins(&prepared, JoinKind::Left)), (0, 1), "{prepared:?}");
+    assert_eq!(count_nodes(&prepared, &|node: &RelationNode| matches!(node, RelationNode::Ordinality { .. })), 0, "no row numbers: {prepared:?}");
+}
+
+#[test]
+fn a_correlated_selection_beneath_an_unnest_moves_above_it() {
+    let prepared = prepare(apply(&customers(), customer_tags(true, true), by_customer(), ApplyKind::Left, None)).unwrap();
+    assert_eq!((applies(&prepared), joins(&prepared, JoinKind::Left)), (0, 1), "{prepared:?}");
+    assert_eq!(count_nodes(&prepared, &|node: &RelationNode| matches!(node, RelationNode::Unnest { outer: true, ordinality: Some(_), .. })), 1, "{prepared:?}");
 }
 
 #[test]
