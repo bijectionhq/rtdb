@@ -44,7 +44,7 @@ impl NativeNearest<'_> {
             return Err(native_uncovered());
         }
         let context = context.with_plaintext();
-        context.reading(self.rank(&context, query, overlay, mounted)).await
+        rtdb_types::boxed(|| context.reading(self.rank(&context, query, overlay, mounted))).await
     }
 
     async fn rank(

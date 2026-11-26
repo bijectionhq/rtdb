@@ -336,13 +336,13 @@ impl TxResolver {
     }
 
     pub async fn resolve_source(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp, request: SourceTransaction, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
-        self.resolve_source_for_writer(durable, position, log_time, request, context, None).await
+        rtdb_types::boxed_with(self, |this| this.resolve_source_for_writer(durable, position, log_time, request, context, None)).await
     }
 
     pub async fn resolve_source_for_writer(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp, request: SourceTransaction, context: &ResolveContext,
         writer: Option<WriterPublication<'_>>,
     ) -> Result<Arc<ResolvedTx>> {
-        self.resolve_source_with_authority(durable, position, log_time, request, context, writer, None).await
+        rtdb_types::boxed_with(self, |this| this.resolve_source_with_authority(durable, position, log_time, request, context, writer, None)).await
     }
 
     pub async fn resolve_source_with_authority(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp,
@@ -1242,7 +1242,7 @@ impl<'a> OpenTransaction<'a> {
         };
         let parent = self.trace_parent;
         self.trace_parent = span.as_ref().map(|span| span.context()).or(parent);
-        let result = self.apply_inner(operation).await;
+        let result = rtdb_types::boxed_with(&mut *self, |this| this.apply_inner(operation)).await;
         self.trace_parent = parent;
         result?;
         if direct {

@@ -714,8 +714,9 @@ impl Session {
         self.ensure_open()?;
         if self.transaction().is_some() { return Err(Anomaly::incorrect("xtdb/tx-already-in-progress", "Cannot submit a transaction while another is in progress on this connection - commit or roll back first")); }
         let timezone = rtdb_expr::normalize_timezone(options.default_timezone.as_deref().unwrap_or(&self.timezone))?;
-        self.submit_to(options.database.unwrap_or_else(|| self.database.to_string()), operations,
-            SubmitOptions { default_tz: timezone, user: None, user_metadata: options.user_metadata }, mode, Submission::Ordinary).await
+        let database = options.database.unwrap_or_else(|| self.database.to_string());
+        rtdb_types::boxed_with(self, |this| this.submit_to(database, operations,
+            SubmitOptions { default_tz: timezone, user: None, user_metadata: options.user_metadata }, mode, Submission::Ordinary)).await
     }
     pub async fn submit_tx(&mut self, operations: Vec<TxOp>, options: AutonomousTxOptions) -> Result<SubmittedTx> {
         match self.autonomous(operations, options, CommitMode::Async).await? {
@@ -724,7 +725,7 @@ impl Session {
         }
     }
     pub async fn execute_tx(&mut self, operations: Vec<TxOp>, options: AutonomousTxOptions) -> Result<TransactionResult> {
-        match self.autonomous(operations, options, CommitMode::Sync).await? {
+        match rtdb_types::boxed_with(&mut *self, |this| this.autonomous(operations, options, CommitMode::Sync)).await? {
             CommitResult::Executed(result) => Ok(result),
             _ => Err(Anomaly::fault("rtdb.node/execute-result", "Synchronous execution returned no transaction result")),
         }

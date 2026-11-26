@@ -186,6 +186,7 @@ impl PlaintextView {
     }
 
     pub async fn reading<F: Future>(self: &Arc<Self>, work: F) -> F::Output {
+        let work = Box::pin(work);
         let mut views = PLAINTEXT_VIEWS
             .try_with(|views| views.to_vec())
             .unwrap_or_default();

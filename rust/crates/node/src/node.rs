@@ -2653,8 +2653,8 @@ impl OwnedReadSession {
         &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation, query: &str,
     ) -> Result<rtdb_text::Corpus> {
         self.admit_read().await?;
-        let work = rtdb_search::owned_corpus(self.relation_context(relation)?, &self.owner, relation, path, query);
-        let corpus = self.context.reading(work).await?;
+        let relation_context = self.relation_context(relation)?;
+        let corpus = rtdb_types::boxed(|| self.context.reading(rtdb_search::owned_corpus(relation_context, &self.owner, relation, path, query))).await?;
         self.check_relation(relation)?;
         Ok(corpus)
     }
@@ -2664,7 +2664,7 @@ impl OwnedReadSession {
     pub async fn ranked_search(
         &self, partitions: &[(rtdb_types::OwnedRelation, rtdb_types::OwnedRelation)], query: &str, limit: usize, observe: bool,
     ) -> Result<(Vec<rtdb_search::OwnedSearchHit>, Vec<OwnedRangeWitness>)> {
-        let (page, witnesses) = self.ranked_search_page(partitions, query, 0, limit, observe).await?;
+        let (page, witnesses) = rtdb_types::boxed(|| self.ranked_search_page(partitions, query, 0, limit, observe)).await?;
         Ok((page.hits, witnesses))
     }
 
@@ -2674,7 +2674,7 @@ impl OwnedReadSession {
         &self, partitions: &[(rtdb_types::OwnedRelation, rtdb_types::OwnedRelation)], query: &str,
         offset: usize, limit: usize, observe: bool,
     ) -> Result<(rtdb_search::OwnedSearchPage, Vec<OwnedRangeWitness>)> {
-        self.ranked_search_with_overlay(partitions, query, offset, limit, observe, None, None).await
+        rtdb_types::boxed(|| self.ranked_search_with_overlay(partitions, query, offset, limit, observe, None, None)).await
     }
 
     #[cfg(feature = "search")]
@@ -2682,7 +2682,7 @@ impl OwnedReadSession {
         &self, partitions: &[(rtdb_types::OwnedRelation, rtdb_types::OwnedRelation)], query: &str,
         offset: usize, limit: usize, observe: bool, valid: Option<Timestamp>, overlay: Option<rtdb_search::HeldTextCorpus>,
     ) -> Result<(rtdb_search::OwnedSearchPage, Vec<OwnedRangeWitness>)> {
-        let (batch, witnesses) = self.ranked_search_batch(partitions, query, offset, limit, observe, valid, overlay).await?;
+        let (batch, witnesses) = rtdb_types::boxed(|| self.ranked_search_batch(partitions, query, offset, limit, observe, valid, overlay)).await?;
         Ok((batch.into_page()?, witnesses))
     }
 
@@ -4179,11 +4179,11 @@ impl NativeSession {
     }
     /// Retains the exact applied catalog at one store-reserved transaction for repeated reads.
     pub async fn open_owned_read(&mut self) -> Result<OwnedReadSession> {
-        self.retain_owned_read(OwnedReadBasis::ClockReservation).await
+        rtdb_types::boxed_with(self, |this| this.retain_owned_read(OwnedReadBasis::ClockReservation)).await
     }
 
     pub async fn open_fresh_owned_read(&mut self, deployment: uuid::Uuid, required: Option<&AppliedReadFloor>) -> Result<OwnedReadSession> {
-        self.retain_owned_read(OwnedReadBasis::Fresh { deployment, required }).await
+        rtdb_types::boxed_with(self, |this| this.retain_owned_read(OwnedReadBasis::Fresh { deployment, required })).await
     }
 
     /// Enrolls one nonrenewable lower catalog pin for a prepaid session before use.

@@ -586,6 +586,8 @@ impl QueryContext {
 
     /// Holds the selected catalogs from before the first read through answer production.
     pub async fn reading<T>(self: &Arc<Self>, work: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+        // Each wrapper below moves `work`; boxing it first keeps those moves pointer-sized.
+        let work = Box::pin(work);
         self.check_cancelled()?;
         let view = self.owner_cancellation.run_until_cancelled(
             self.cancellation.run_until_cancelled(self.catalog.held_view()),
