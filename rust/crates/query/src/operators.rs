@@ -916,33 +916,46 @@ pub(crate) fn rows_equal(left: &[Value], right: &[Value], timezone: &str, memory
 }
 /// A hash that rows equal under `rows_equal` share.
 /// A date or timestamp equals one of another unit or zone once the session zone localizes it, so it hashes as the
-/// wall-clock time it reads as there; date-times nested in a container hash alike, and `rows_equal` tells them apart.
+/// wall-clock time it reads as there, at any depth inside lists and structs.
 pub(crate) fn equality_hash(values: &[Value], timezone: &str) -> u32 {
     values.iter().fold(0, |hash, value| combine_equality_hash(hash, equality_cell_hash(value, timezone)))
 }
 
-pub(crate) fn equality_cell_hash(value: &Value, timezone: &str) -> u32 {
-    fn temporal(value: &Value) -> bool {
-        match value {
-            Value::Timestamp { .. } | Value::DateDay(_) | Value::DateMilli(_) | Value::Date(_) | Value::TimestampTzRange { .. } => true,
-            Value::Set(values) => values.iter().any(temporal),
-            Value::List(values) | Value::FixedSizeList(values) => match values.view() {
-                rtdb_types::ListView::Values(values) => values.iter().any(temporal),
-                rtdb_types::ListView::Scalars(_) => values.element_type().legs().iter().any(|leg|
-                    matches!(leg, LogicalType::Scalar(rtdb_types::ScalarType::Timestamp { .. }
-                        | rtdb_types::ScalarType::DateDay | rtdb_types::ScalarType::DateMilli))),
-                _ => false,
-            },
-            Value::Struct(fields) => fields.values().any(temporal),
-            Value::Map { entries, .. } => entries.iter().any(|(key, value)| temporal(key) || temporal(value)),
-            _ => false,
-        }
-    }
+const TEMPORAL_HASH: u32 = 0x7e3a_11c5;
+
+fn holds_temporal(value: &Value) -> bool {
     match value {
-            Value::Timestamp { .. } | Value::DateDay(_) | Value::DateMilli(_) => rtdb_expr::local_micros(value, timezone)
-                .and_then(|micros| rtdb_columnar::hash_value(&Value::I64(micros), 0).ok()).map_or(0x7e3a_11c5, |cell| (cell as u32) ^ 0x7e3a_11c5),
-            value if temporal(value) => 0x7e3a_11c5,
-            value => rtdb_columnar::hash_value(value, 0).map_or(0x5bd1_e995, |cell| cell as u32),
+        Value::Timestamp { .. } | Value::DateDay(_) | Value::DateMilli(_) | Value::Date(_) | Value::TimestampTzRange { .. } => true,
+        Value::Set(values) => values.iter().any(holds_temporal),
+        Value::List(values) | Value::FixedSizeList(values) => match values.view() {
+            rtdb_types::ListView::Values(values) => values.iter().any(holds_temporal),
+            rtdb_types::ListView::Scalars(_) => values.element_type().legs().iter().any(|leg|
+                matches!(leg, LogicalType::Scalar(rtdb_types::ScalarType::Timestamp { .. }
+                    | rtdb_types::ScalarType::DateDay | rtdb_types::ScalarType::DateMilli))),
+            rtdb_types::ListView::Union(_) => values.iter().any(|value| holds_temporal(value.as_ref())),
+            _ => false,
+        },
+        Value::Struct(fields) => fields.values().any(holds_temporal),
+        Value::Map { entries, .. } => entries.iter().any(|(key, value)| holds_temporal(key) || holds_temporal(value)),
+        _ => false,
+    }
+}
+
+pub(crate) fn equality_cell_hash(value: &Value, timezone: &str) -> u32 {
+    match value {
+        Value::Timestamp { .. } | Value::DateDay(_) | Value::DateMilli(_) => rtdb_expr::local_micros(value, timezone)
+            .and_then(|micros| rtdb_columnar::hash_value(&Value::I64(micros), 0).ok()).map_or(TEMPORAL_HASH, |cell| (cell as u32) ^ TEMPORAL_HASH),
+        // Lists and structs compare element by element under the session zone, so their date-times hash as above.
+        Value::List(values) | Value::FixedSizeList(values) if holds_temporal(value) => values.iter()
+            .fold(TEMPORAL_HASH ^ values.len() as u32, |hash, value| combine_equality_hash(hash, equality_cell_hash(value.as_ref(), timezone))),
+        Value::Struct(fields) if holds_temporal(value) => fields.values()
+            .fold(TEMPORAL_HASH ^ fields.len() as u32, |hash, value| combine_equality_hash(hash, equality_cell_hash(value, timezone))),
+        // Ranges compare structurally; sets and maps do too, but their struct members compare regardless of field order.
+        Value::TimestampTzRange { .. } => rtdb_columnar::hash_value(value, 0).map_or(TEMPORAL_HASH, |cell| cell as u32),
+        Value::Set(values) if holds_temporal(value) => TEMPORAL_HASH ^ values.len() as u32,
+        Value::Map { entries, .. } if holds_temporal(value) => TEMPORAL_HASH ^ entries.len() as u32,
+        value if holds_temporal(value) => TEMPORAL_HASH,
+        value => rtdb_columnar::hash_value(value, 0).map_or(0x5bd1_e995, |cell| cell as u32),
     }
 }
 
@@ -1349,6 +1362,43 @@ mod equality_allocation_tests {
         assert_eq!(equality_hash(&packed, "UTC"), equality_hash(&scalar, "UTC"));
         let memory = rtdb_columnar::MemoryBudget::new(1 << 20);
         assert!(rows_equal(&packed, &scalar, "UTC", &memory).unwrap());
+    }
+
+    fn timestamp(value: i64, unit: rtdb_types::TimeUnit, timezone: Option<&str>) -> Value {
+        Value::Timestamp { value, unit, timezone: timezone.map(str::to_owned) }
+    }
+
+    fn holder(value: Value) -> Value {
+        Value::Struct(rtdb_types::StructFields::from([("at".to_owned(), Value::list(vec![value])), ("n".to_owned(), Value::I64(1))]))
+    }
+
+    #[test]
+    fn nested_date_times_equal_under_the_session_zone_share_a_hash() {
+        use rtdb_types::TimeUnit::{Microsecond, Millisecond};
+        let memory = rtdb_columnar::MemoryBudget::new(1 << 20);
+        let micros = [holder(timestamp(86_400_000_000, Microsecond, None))];
+        let equal = [
+            [holder(timestamp(86_400_000, Millisecond, None))],
+            [holder(timestamp(86_400_000_000, Microsecond, Some("UTC")))],
+            [holder(Value::DateDay(1))],
+        ];
+        assert!(rows_equal(&micros, &equal[0], "UTC", &memory).unwrap());
+        for other in &equal {
+            if rows_equal(&micros, other, "UTC", &memory).unwrap() {
+                assert_eq!(equality_hash(&micros, "UTC"), equality_hash(other, "UTC"), "{other:?}");
+            }
+        }
+        let later = [holder(timestamp(86_400_000_001, Microsecond, None))];
+        assert!(!rows_equal(&micros, &later, "UTC", &memory).unwrap());
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn distinct_nested_date_times_spread_across_hashes() {
+        let hashes: std::collections::HashSet<u32> = (0..1_000i64)
+            .map(|second| equality_hash(&[holder(timestamp(second * 1_000_000, rtdb_types::TimeUnit::Microsecond, None))], "UTC"))
+            .collect();
+        assert!(hashes.len() > 990, "{} distinct hashes", hashes.len());
     }
 
     #[test]
