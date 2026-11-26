@@ -4,6 +4,7 @@ use crate::{Error, IoRegion, Result, object_store::ReadReservation, sealing::{Cl
 use async_trait::async_trait;
 use bytes::Bytes;
 use rtdb_types::Timestamp;
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, ErrorKind, IoSlice, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -30,6 +31,7 @@ const APPEND_BATCH_BYTES: usize = 256 * 1024;
 const APPEND_BATCH_TIME: Duration = Duration::from_millis(1);
 const MAXIMUM_POLL_RECORDS: usize = 1024;
 const DEFAULT_MAXIMUM_POLL_PAYLOAD_BYTES: usize = 128 * 1024 * 1024;
+const RECENT_FRAMES: usize = 256;
 
 pub struct LocalLogOptions {
     pub maximum_message_bytes: usize,
@@ -53,12 +55,14 @@ pub struct LocalLog {
     maximum_message_bytes: usize,
     keys: Option<Arc<ClassicObjectKeys>>,
     reads: Arc<IoRegion>,
+    recent: Arc<RecentFrames>,
 }
 
 pub struct LocalLogDriver {
     writer: Option<Writer>,
     queue: mpsc::Receiver<Queued>,
     progress: Arc<Progress>,
+    recent: Arc<RecentFrames>,
     /// A moving average of recent batch sizes: above one, appenders are concurrent and a batch waits briefly to share its sync.
     recent_batch: f64,
 }
@@ -74,6 +78,7 @@ pub(super) fn corrupt(path: &Path, offset: u64, reason: impl Into<String>) -> Er
     Error::CorruptLog { path: path.to_path_buf(), offset, reason: reason.into() }
 }
 
+#[derive(Clone, Copy, Debug)]
 pub(super) struct RecordHeader {
     metadata: LogMetadata,
     payload_size: usize,
@@ -89,6 +94,26 @@ impl RecordHeader {
             allocation_bound: self.payload_size.saturating_mul(if self.sealed { 2 } else { 1 })
                 .saturating_add(LOG_RECORD_OVERHEAD_BYTES),
         }
+    }
+}
+
+/// The heads of the frames this process last made durable, published before the durable tip moves over them,
+/// so that a tail prepares a frame its own writer has just written without reading the file.
+#[derive(Default)]
+struct RecentFrames(parking_lot::Mutex<VecDeque<RecordHeader>>);
+
+impl RecentFrames {
+    fn publish(&self, frames: &[RecordHeader]) {
+        let mut recent = self.0.lock();
+        recent.extend(frames.iter().copied());
+        let excess = recent.len().saturating_sub(RECENT_FRAMES);
+        recent.drain(..excess);
+    }
+
+    fn get(&self, offset: u64) -> Option<RecordHeader> {
+        let recent = self.0.lock();
+        let index = recent.binary_search_by_key(&(offset as i64), |frame| frame.metadata.offset.0).ok()?;
+        Some(recent[index])
     }
 }
 
@@ -308,10 +333,11 @@ impl LocalLog {
             JournalFile::remove_lineage_sidecar(file_path)?;
         }
         let progress = Arc::new(Progress::new(latest));
+        let recent = Arc::new(RecentFrames::default());
         let (send, queue) = mpsc::channel(options.queue_capacity);
         let log = Arc::new(Self { path: path.clone(), lineage: file.lineage(), queue: send, progress: progress.clone(),
-            maximum_message_bytes: options.maximum_message_bytes, keys: keys.clone(), reads });
-        Ok((log, LocalLogDriver { writer: Some(Writer { file, path, timestamps, keys }), queue, progress, recent_batch: 1.0 }))
+            maximum_message_bytes: options.maximum_message_bytes, keys: keys.clone(), reads, recent: recent.clone() });
+        Ok((log, LocalLogDriver { writer: Some(Writer { file, path, timestamps, keys }), queue, progress, recent, recent_batch: 1.0 }))
     }
 
     /// Closes and drains reader I/O; the caller must cancel and join the writer driver first.
@@ -320,13 +346,13 @@ impl LocalLog {
 }
 
 impl Writer {
-    fn append(&mut self, records: &[Queued]) -> Result<Vec<LogMetadata>> {
+    fn append(&mut self, records: &[Queued]) -> Result<Vec<RecordHeader>> {
         let start = self.file.seek(SeekFrom::End(0)).map_err(|error| Error::io(self.path.as_ref(), error))?;
         let result = (|| {
             let sealed = self.keys.is_some();
             let separator = if sealed { SEALED_SEPARATOR } else { RECORD_SEPARATOR };
             let mut frames = Vec::with_capacity(records.len());
-            let mut metadata = Vec::with_capacity(records.len());
+            let mut heads = Vec::with_capacity(records.len());
             let mut offset = start;
             for record in records {
                 let timestamp = self.timestamps.timestamp(&record.payload, record.timestamp)?;
@@ -337,8 +363,9 @@ impl Writer {
                 let end = offset.checked_add(HEADER_BYTES + payload.len() as u64 + TRAILER_BYTES)
                     .filter(|end| *end < 1 << 48)
                     .ok_or_else(|| corrupt(&self.path, offset, "local log offset space exhausted"))?;
+                heads.push(RecordHeader { metadata: LogMetadata { offset: LogOffset(offset as i64), timestamp },
+                    payload_size: payload.len(), retired: false, sealed });
                 frames.push((record_header(separator, payload.len(), timestamp), payload, (offset as i64).to_be_bytes()));
-                metadata.push(LogMetadata { offset: LogOffset(offset as i64), timestamp });
                 offset = end;
             }
             let mut slices: Vec<_> = frames.iter().flat_map(|(header, payload, trailer)| {
@@ -346,7 +373,7 @@ impl Writer {
             }).collect();
             write_frames(&mut self.file, &mut slices).map_err(|error| Error::io(self.path.as_ref(), error))?;
             self.file.sync().map_err(|error| Error::io(self.path.as_ref(), error))?;
-            Ok(metadata)
+            Ok(heads)
         })();
         if result.is_err() {
             if let Err(rollback) = self.file.truncate_records(start).and_then(|_| self.file.sync()) {
@@ -445,9 +472,10 @@ impl LocalLogDriver {
             };
             self.writer = Some(writer);
             match result {
-                Ok(metadata) => {
-                    if let Some(last) = metadata.last() { self.progress.advance(last.offset); }
-                    for (record, metadata) in records.into_iter().zip(metadata) { let _ = record.durable.send(Ok(metadata)); }
+                Ok(frames) => {
+                    self.recent.publish(&frames);
+                    if let Some(last) = frames.last() { self.progress.advance(last.metadata.offset); }
+                    for (record, frame) in records.into_iter().zip(frames) { let _ = record.durable.send(Ok(frame.metadata)); }
                 }
                 Err(error) => {
                     let reason = error.to_string();
@@ -532,7 +560,8 @@ impl LocalLog {
             }).await?
         };
         if let Some(keys) = &self.keys { keys.require_local_offset(next as i64)?; }
-        Ok(LocalTail { path, lineage, progress, maximum, after, next, reads: Arc::clone(&self.reads), keys: self.keys.clone(), held: None })
+        Ok(LocalTail { path, lineage, progress, maximum, after, next, reads: Arc::clone(&self.reads), keys: self.keys.clone(), held: None,
+            recent: Arc::clone(&self.recent) })
     }
 }
 
@@ -612,6 +641,7 @@ struct LocalTail {
     keys: Option<Arc<ClassicObjectKeys>>,
     /// The journal the last read went through, kept open for the next one.
     held: Option<JournalFile>,
+    recent: Arc<RecentFrames>,
 }
 
 impl LocalTail {
@@ -676,6 +706,7 @@ impl LogReplayTail for LocalTail {
         let tip = await_tip(&self.progress, self.after, timeout).await?;
         if tip <= self.after { return Ok(None); }
         if self.next > tip.0 as u64 { return Err(corrupt(&self.path, self.next, "durable tip yielded no record")); }
+        if let Some(frame) = self.recent.get(self.next) { return Ok(Some(frame.replay_head())); }
 
         let maximum = self.maximum;
         let lineage = self.lineage;
@@ -1020,8 +1051,9 @@ mod tests {
         let record = |payload: &'static [u8], time| Queued {
             payload: Bytes::from_static(payload), timestamp: Timestamp(time), durable: oneshot::channel().0,
         };
-        let committed = writer.append(&[record(b"acknowledged", 1)])?[0];
-        let metadata = writer.append(&[record(b"complete", 2), record(b"torn", 3), record(b"absent", 4)])?;
+        let committed = writer.append(&[record(b"acknowledged", 1)])?[0].metadata;
+        let metadata: Vec<_> = writer.append(&[record(b"complete", 2), record(b"torn", 3), record(b"absent", 4)])?
+            .into_iter().map(|frame| frame.metadata).collect();
         writer.file.truncate_records(metadata[1].offset.0 as u64 + HEADER_BYTES + 2)
             .map_err(|error| Error::io(&path, error))?;
         drop(writer);
@@ -1036,6 +1068,76 @@ mod tests {
         let records = reopened.read_range(committed.offset, metadata[1].offset).await?;
         assert_eq!(records.iter().map(|record| record.payload.as_ref()).collect::<Vec<_>>(),
             [b"acknowledged".as_slice(), b"complete".as_slice()]);
+        Ok(())
+    }
+
+    async fn replay_heads(log: &LocalLog, count: usize) -> Result<Vec<ReplayHead>> {
+        let mut tail = log.tail(LogOffset(-1)).await?;
+        let replay = tail.replay().unwrap();
+        let mut heads = Vec::new();
+        for _ in 0..count {
+            let head = replay.poll_head(Duration::ZERO).await?.unwrap();
+            heads.push(head);
+            replay.read_head(head, ReadReservation::new(head.allocation_bound, ())).await?;
+        }
+        assert!(replay.poll_head(Duration::ZERO).await?.is_none());
+        Ok(heads)
+    }
+
+    #[tokio::test]
+    async fn a_tail_prepares_frames_its_writer_just_made_durable_without_reader_io_and_as_the_journal_records_them() -> Result<()> {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("LOG");
+        let options = || LocalLogOptions { maximum_message_bytes: 1024, queue_capacity: 4 };
+        let (log, driver) = LocalLog::open(&path, options())?;
+        let shutdown = CancellationToken::new();
+        let writer = tokio::spawn(driver.run(shutdown.clone()));
+        let payloads: [&'static [u8]; 3] = [b"first", b"", b"third frame"];
+        let mut written = Vec::new();
+        for (time, payload) in payloads.iter().enumerate() {
+            written.push(log.enqueue(Bytes::from_static(payload), Timestamp(time as i64)).await?.durable().await?);
+        }
+        let prepared = replay_heads(&log, payloads.len()).await?;
+        assert_eq!(prepared.iter().map(|head| head.metadata).collect::<Vec<_>>(), written);
+        assert_eq!(prepared.iter().map(|head| head.payload_len).collect::<Vec<_>>(),
+            payloads.iter().map(|payload| payload.len()).collect::<Vec<_>>());
+
+        let mut tail = log.tail(LogOffset(-1)).await?;
+        log.reads.close();
+        let replay = tail.replay().unwrap();
+        let head = replay.poll_head(Duration::ZERO).await?.unwrap();
+        assert_eq!(head, prepared[0]);
+        assert!(matches!(replay.read_head(head, ReadReservation::new(head.allocation_bound, ())).await, Err(Error::Closed(_))));
+        shutdown.cancel();
+        writer.await.unwrap()?;
+        drop((tail, log));
+
+        let (reopened, _driver) = LocalLog::open(&path, options())?;
+        assert_eq!(replay_heads(&reopened, payloads.len()).await?, prepared);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_frame_prepared_from_its_writer_and_retired_before_delivery_reports_the_retired_range() -> Result<()> {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("LOG");
+        let (log, mut driver) = LocalLog::open(&path, LocalLogOptions { maximum_message_bytes: 1024, queue_capacity: 2 })?;
+        let mut writer = driver.writer.take().unwrap();
+        let record = |payload: &'static [u8]| Queued {
+            payload: Bytes::from_static(payload), timestamp: Timestamp(5), durable: oneshot::channel().0,
+        };
+        let frames = writer.append(&[record(b"old receipt"), record(b"surviving suffix")])?;
+        driver.recent.publish(&frames);
+        driver.progress.advance(frames[1].metadata.offset);
+
+        let mut tail = log.tail(LogOffset(-1)).await?;
+        let replay = tail.replay().unwrap();
+        let head = replay.poll_head(Duration::ZERO).await?.unwrap();
+        assert_eq!(head.metadata, frames[0].metadata);
+        let end = prefix_end(&mut writer.file, &path, 1024, frames[1].metadata.offset, false)?;
+        settle_prefix(&mut writer.file, &path, 1024, end, None)?;
+        assert!(matches!(replay.read_head(head, ReadReservation::new(head.allocation_bound, ())).await,
+            Err(Error::UnavailableLogRange { requested: 0, .. })));
         Ok(())
     }
 
@@ -1063,6 +1165,7 @@ mod tests {
             reads: Arc::clone(&log.reads),
             keys: None,
             held: None,
+            recent: Arc::clone(&log.recent),
         };
         for (limit, from, to) in [(8, 0, 2), (5, 2, 3), (5, 3, 4), (5, 4, 5)] {
             let batch = tail.poll_with_payload_limit(Duration::ZERO, limit).await.unwrap();
@@ -1099,7 +1202,8 @@ mod retention_tests {
         let record = |payload: &'static [u8]| Queued {
             payload: Bytes::from_static(payload), timestamp: Timestamp(5), durable: oneshot::channel().0,
         };
-        let records = writer.append(&[record(b"old payload"), record(b"retained boundary")])?;
+        let records: Vec<_> = writer.append(&[record(b"old payload"), record(b"retained boundary")])?
+            .into_iter().map(|frame| frame.metadata).collect();
         let maximum = physical_maximum(1024, true)?;
         let end = prefix_end(&mut writer.file, &path, maximum, records[1].offset, false)?;
         let header = read_record_header_at(&mut writer.file, &path, maximum, 0, end)?;
@@ -1128,7 +1232,8 @@ mod retention_tests {
         let record = |payload: &'static [u8]| Queued {
             payload: Bytes::from_static(payload), timestamp: Timestamp(5), durable: oneshot::channel().0,
         };
-        let records = writer.append(&[record(b"old receipt"), record(b"surviving suffix")])?;
+        let records: Vec<_> = writer.append(&[record(b"old receipt"), record(b"surviving suffix")])?
+            .into_iter().map(|frame| frame.metadata).collect();
         let before = records[1].offset;
         let end = prefix_end(&mut writer.file, &path, 1024, before, false)?;
         for _ in 0..2 { settle_prefix(&mut writer.file, &path, 1024, end, None)?; }
