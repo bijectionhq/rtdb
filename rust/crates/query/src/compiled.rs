@@ -278,6 +278,9 @@ impl Admission {
 
 /// Whether preparing this node, apart from its children, reads only its plan's input types and parameter types.
 /// Every variant is listed, so that a new one is classified before any plan can skip its preparation.
+/// Preparation reads a parameter's value only to compile a regex replacement's pattern and to type a parameter its plan
+/// leaves untyped: list preparation takes literal items alone, and calls, LIKE and casts are typed from their arguments'
+/// types, their patterns and conversions applied to each execution's values as they are evaluated.
 fn prepared_from_signature(expression: &Expr) -> bool {
     match expression {
         // A replacement compiles the pattern a parameter's value may supply.
@@ -470,5 +473,21 @@ mod tests {
         let untyped = Admission::of(&Expr::binary(rtdb_plan::BinaryOp::Eq, parameter, Expr::Parameter { index: 1, data_type: L::Nothing }));
         untyped.admit();
         assert!(!untyped.admitted(), "a parameter its plan does not type is typed by its value");
+    }
+
+    #[test]
+    fn calls_patterns_and_casts_of_typed_parameters_are_prepared_from_their_signature() {
+        let text = Expr::Parameter { index: 0, data_type: L::Scalar(ScalarType::Utf8) };
+        let column = Expr::Column { id: ColumnId(0), data_type: L::Scalar(ScalarType::Utf8) };
+        let call = Expr::Call { name: "upper".into(), args: vec![text.clone()], return_type: L::Scalar(ScalarType::Utf8) };
+        let cast = Expr::Cast { expr: Box::new(text.clone()), target: rtdb_plan::CastTarget::Fixed(L::Scalar(ScalarType::I64)) };
+        for expression in [call, cast] {
+            let admission = Admission::of(&expression);
+            admission.admit();
+            assert!(admission.admitted(), "{expression:?}");
+        }
+        let compared = Admission::of(&Expr::binary(rtdb_plan::BinaryOp::Eq, column, text));
+        compared.admit();
+        assert!(compared.admitted());
     }
 }
