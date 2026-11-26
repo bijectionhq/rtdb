@@ -20,17 +20,19 @@
         (.getRootPath)
         (.resolve (.getTablePath (.slug (.snap (.getTableCatalog db)) (table/->ref table-name)))))))
 
+(t/use-fixtures :each tu/with-mock-clock)
+
 (def ^:private start (time/->zdt #inst "2020-01-01"))
 
 (defn- load-history! [node]
   (doseq [tick (range 120)]
+    (tu/set-log-clock! (.plusHours start tick))
     (xt/execute-tx node [(into [:put-docs :docs]
-                               (for [x (range 40)] {:xt/id x, :v tick}))]
-                   {:system-time (.plusHours start tick)}))
+                               (for [x (range 40)] {:xt/id x, :v tick}))]))
 
   (doseq [n (range 50)]
-    (xt/execute-tx node [[:put-docs :docs {:xt/id :solo, :v n}]]
-                   {:system-time (.plusSeconds (.plusHours start 130) (* n 30))})))
+    (tu/set-log-clock! (.plusSeconds (.plusHours start 130) (* n 30)))
+    (xt/execute-tx node [[:put-docs :docs {:xt/id :solo, :v n}]])))
 
 (defn- historical-trie-keys [node]
   (with-open [s (Files/list (.resolve (table-path node "public/docs") "meta"))]
@@ -106,7 +108,7 @@
                 cat/*file-size-target* (* 1024 16)
                 c/*ignore-signal-block?* true]
         ;; TODO(#6263): recency branching won't need the opt-in
-        (with-open [node (tu/->local-node {:node-dir node-dir, :rows-per-block 400, :opt-in-221? true})]
+        (with-open [node (tu/->local-node {:node-dir node-dir, :rows-per-block 400, :opt-in-221? true, :instant-src (tu/->log-clock tu/*log-clock*)})]
           (load-history! node)
           (tu/flush-block! node)
 
@@ -153,7 +155,7 @@
       (binding [c/*page-size* 8
                 cat/*file-size-target* (* 1024 16)
                 c/*ignore-signal-block?* true]
-        (with-open [node (tu/->local-node {:node-dir node-dir, :rows-per-block 400, :opt-in-221? true})]
+        (with-open [node (tu/->local-node {:node-dir node-dir, :rows-per-block 400, :opt-in-221? true, :instant-src (tu/->log-clock tu/*log-clock*)})]
           (load-history! node)
           (tu/flush-block! node)
           (c/compact-all! node #xt/duration "PT30S")
@@ -174,12 +176,12 @@
                 cat/*file-size-target* (* 1024 16)
                 c/*ignore-signal-block?* true]
         ;; TODO(#6263): recency branching won't need the opt-in
-        (with-open [node (tu/->local-node {:node-dir node-dir, :rows-per-block 400, :opt-in-221? true})]
+        (with-open [node (tu/->local-node {:node-dir node-dir, :rows-per-block 400, :opt-in-221? true, :instant-src (tu/->log-clock tu/*log-clock*)})]
           (load-history! node)
-          (xt/execute-tx node [(into [:delete-docs :docs] (range 0 5))]
-                         {:system-time (.plusHours start 140)})
-          (xt/execute-tx node [(into [:erase-docs :docs] (cons :solo (range 5 10)))]
-                         {:system-time (.plusHours start 141)})
+          (tu/set-log-clock! (.plusHours start 140))
+          (xt/execute-tx node [(into [:delete-docs :docs] (range 0 5))])
+          (tu/set-log-clock! (.plusHours start 141))
+          (xt/execute-tx node [(into [:erase-docs :docs] (cons :solo (range 5 10)))])
           (tu/flush-block! node)
 
           (let [before (query-results node)]

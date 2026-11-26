@@ -12,8 +12,10 @@
   (xt/q tu/*node* query {:snapshot-token (basis/->time-basis-str {"xtdb" [system-time]}), :default-tz #xt/zone "UTC"}))
 
 (t/deftest all-system-time
-  (xt/submit-tx tu/*node* [[:put-docs :foo {:xt/id :my-doc, :last-updated "tx1"}]] {:system-time #inst "2000"})
-  (xt/submit-tx tu/*node* [[:put-docs :foo {:xt/id :my-doc, :last-updated "tx2"}]] {:system-time #inst "2001"})
+  (tu/set-log-clock! #inst "2000")
+  (xt/submit-tx tu/*node* [[:put-docs :foo {:xt/id :my-doc, :last-updated "tx1"}]])
+  (tu/set-log-clock! #inst "2001")
+  (xt/submit-tx tu/*node* [[:put-docs :foo {:xt/id :my-doc, :last-updated "tx2"}]])
 
   (t/is (= {{:last-updated "tx1"} 1, {:last-updated "tx2"}, 1}
            (frequencies (xt/q tu/*node* "SELECT foo.last_updated FROM foo FOR ALL VALID_TIME"))))
@@ -26,8 +28,8 @@
            (frequencies (xt/q tu/*node* "SELECT foo.last_updated FROM foo FOR SYSTEM_TIME ALL FOR VALID_TIME ALL")))))
 
 (t/deftest system-time-as-of
-  (let [tx (xt/execute-tx tu/*node* [[:put-docs :foo {:xt/id :my-doc, :last-updated "tx1"}]] {:system-time #inst "3000"})
-        tx2 (xt/execute-tx tu/*node* [[:put-docs :foo {:xt/id :my-doc, :last-updated "tx2"}]] {:system-time #inst "3001"})]
+  (let [tx (do (tu/set-log-clock! #inst "3000") (xt/execute-tx tu/*node* [[:put-docs :foo {:xt/id :my-doc, :last-updated "tx1"}]]))
+        tx2 (do (tu/set-log-clock! #inst "3001") (xt/execute-tx tu/*node* [[:put-docs :foo {:xt/id :my-doc, :last-updated "tx2"}]]))]
 
     (t/is (= []
              (query-at
@@ -45,8 +47,8 @@
                    tx2))))))
 
 (t/deftest system-time-from-a-to-b
-  (let [tx (xt/execute-tx tu/*node* [[:put-docs :foo {:xt/id :my-doc, :last-updated "tx1"}]] {:system-time #inst "3000"})
-        tx2 (xt/execute-tx tu/*node* [[:put-docs :foo {:xt/id :my-doc, :last-updated "tx2"}]] {:system-time #inst "3001"})]
+  (let [tx (do (tu/set-log-clock! #inst "3000") (xt/execute-tx tu/*node* [[:put-docs :foo {:xt/id :my-doc, :last-updated "tx1"}]]))
+        tx2 (do (tu/set-log-clock! #inst "3001") (xt/execute-tx tu/*node* [[:put-docs :foo {:xt/id :my-doc, :last-updated "tx2"}]]))]
 
     (t/is (= []
              (query-at
@@ -73,8 +75,8 @@
                    tx2))))))
 
 (t/deftest system-time-between-a-to-b
-  (let [tx (xt/execute-tx tu/*node* [[:put-docs :foo {:xt/id :my-doc, :last-updated "tx1"}]] {:system-time #inst "3000"})
-        tx2 (xt/execute-tx tu/*node* [[:put-docs :foo {:xt/id :my-doc, :last-updated "tx2"}]] {:system-time #inst "3001"})]
+  (let [tx (do (tu/set-log-clock! #inst "3000") (xt/execute-tx tu/*node* [[:put-docs :foo {:xt/id :my-doc, :last-updated "tx1"}]]))
+        tx2 (do (tu/set-log-clock! #inst "3001") (xt/execute-tx tu/*node* [[:put-docs :foo {:xt/id :my-doc, :last-updated "tx2"}]]))]
     (t/is (= []
              (query-at
               "SELECT foo.last_updated FROM foo FOR SYSTEM_TIME BETWEEN DATE '2998-01-01' AND TIMESTAMP '2999-01-01 00:00:00+00:00'"
@@ -364,12 +366,12 @@
   (t/is (= [] (xt/q tu/*node* "SELECT *, _valid_from, _valid_to FROM users FOR ALL VALID_TIME WHERE _id = 1 "))))
 
 (t/deftest from-explicit-null-behaviour
+  (tu/set-log-clock! #inst "2000")
   (xt/execute-tx tu/*node* [[:sql "INSERT INTO users RECORDS {_id: ?, version: 1, _valid_from: ?, _valid_to: ?}"
-                             [1 #inst "2010" #inst "2040"]]]
-                 {:system-time #inst "2000"})
+                             [1 #inst "2010" #inst "2040"]]])
+  (tu/set-log-clock! #inst "2001")
   (xt/execute-tx tu/*node* [[:sql "INSERT INTO users RECORDS {_id: ?, version: 2, _valid_from: ?, _valid_to: ?}"
-                             [1 #inst "2020" #inst "2030"]]]
-                 {:system-time #inst "2001"})
+                             [1 #inst "2020" #inst "2030"]]])
 
   (t/is (= [{:xt/id 1, :version 2} {:xt/id 1, :version 1} {:xt/id 1, :version 1}]
            (xt/q tu/*node* "SELECT * FROM users FOR VALID_TIME FROM NULL TO NULL" {:current-time #inst "2020"})

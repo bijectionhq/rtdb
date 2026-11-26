@@ -1389,45 +1389,37 @@
                   {:snapshot-token (basis/->time-basis-str {"xtdb" [system-time]})
                    :current-time current-time}))]
 
-    (let [tx0 (xt/execute-tx tu/*node*
+    (let [tx0 (do (tu/set-log-clock! #inst "1998-01-10") (xt/execute-tx tu/*node*
                              [[:put-docs {:into :docs, :valid-from #inst "1998-01-10"}
-                               {:xt/id 1 :customer-number 145 :property-number 7797}]]
-                             {:system-time #inst "1998-01-10"})
+                               {:xt/id 1 :customer-number 145 :property-number 7797}]]))
 
-          tx1 (xt/execute-tx tu/*node*
+          tx1 (do (tu/set-log-clock! #inst "1998-01-15") (xt/execute-tx tu/*node*
                              [[:put-docs {:into :docs, :valid-from #inst "1998-01-15"}
-                               {:xt/id 1 :customer-number 827 :property-number 7797}]]
-                             {:system-time #inst "1998-01-15"})
+                               {:xt/id 1 :customer-number 827 :property-number 7797}]]))
 
-          _tx2 (xt/execute-tx tu/*node*
-                              [[:delete-docs {:from :docs, :valid-from #inst "1998-01-20"} 1]]
-                              {:system-time #inst "1998-01-20"})
+          _tx2 (do (tu/set-log-clock! #inst "1998-01-20") (xt/execute-tx tu/*node*
+                              [[:delete-docs {:from :docs, :valid-from #inst "1998-01-20"} 1]]))
 
-          _tx3 (xt/execute-tx tu/*node*
+          _tx3 (do (tu/set-log-clock! #inst "1998-01-23") (xt/execute-tx tu/*node*
                               [[:put-docs {:into :docs, :valid-from #inst "1998-01-03", :valid-to #inst "1998-01-10"}
-                                {:xt/id 1 :customer-number 145 :property-number 7797}]]
-                              {:system-time #inst "1998-01-23"})
+                                {:xt/id 1 :customer-number 145 :property-number 7797}]]))
 
-          _tx4 (xt/execute-tx tu/*node*
-                              [[:delete-docs {:from :docs, :valid-from #inst "1998-01-03", :valid-to #inst "1998-01-05"} 1]]
-                              {:system-time #inst "1998-01-26"})
+          _tx4 (do (tu/set-log-clock! #inst "1998-01-26") (xt/execute-tx tu/*node*
+                              [[:delete-docs {:from :docs, :valid-from #inst "1998-01-03", :valid-to #inst "1998-01-05"} 1]]))
 
-          tx5 (xt/execute-tx tu/*node*
+          tx5 (do (tu/set-log-clock! #inst "1998-01-28") (xt/execute-tx tu/*node*
                              [[:put-docs {:into :docs, :valid-from #inst "1998-01-05", :valid-to #inst "1998-01-12"}
                                {:xt/id 1 :customer-number 145 :property-number 7797}]
                               [:put-docs {:into :docs, :valid-from #inst "1998-01-12", :valid-to #inst "1998-01-20"}
-                               {:xt/id 1 :customer-number 827 :property-number 7797}]]
-                             {:system-time #inst "1998-01-28"})
+                               {:xt/id 1 :customer-number 827 :property-number 7797}]]))
 
-          tx6 (xt/execute-tx tu/*node*
+          tx6 (do (tu/set-log-clock! #inst "1998-01-30") (xt/execute-tx tu/*node*
                              ["DELETE FROM docs FOR VALID_TIME FROM TIMESTAMP '1998-01-05Z' TO TIMESTAMP '1998-01-12Z'
-                               WHERE customer_number = 145"]
-                             {:system-time #inst "1998-01-30"})
+                               WHERE customer_number = 145"]))
 
-          tx7 (xt/execute-tx tu/*node*
+          tx7 (do (tu/set-log-clock! #inst "1998-01-31") (xt/execute-tx tu/*node*
                              [[:put-docs {:into :docs, :valid-from #inst "1998-01-15"}
-                               {:xt/id 2 :customer-number 827 :property-number 3621}]]
-                             {:system-time #inst "1998-01-31"})]
+                               {:xt/id 2 :customer-number 827 :property-number 3621}]]))]
 
       (t/is (= [{:cust 145 :app-from (time/->zdt #inst "1998-01-10")}]
                (q '(from :docs {:bind [{:customer-number cust, :xt/valid-from app-from}]
@@ -1894,7 +1886,8 @@
 
         _
         (doseq [[doc system-time] inputs]
-          (xt/submit-tx tu/*node* [[:put-docs :x doc]] {:system-time system-time}))
+          (tu/set-log-clock! system-time)
+          (xt/submit-tx tu/*node* [[:put-docs :x doc]]))
 
         q (partial xt/q tu/*node*)]
 

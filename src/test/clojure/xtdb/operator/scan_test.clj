@@ -298,9 +298,11 @@
                                {:node tu/*node*}))))))
 
 (t/deftest test-aligns-temporal-columns-correctly-363
-  (xt/submit-tx tu/*node* [[:put-docs :foo {:xt/id :my-doc, :last_updated "tx1"}]] {:system-time #inst "2000"})
+  (tu/set-log-clock! #inst "2000")
+  (xt/submit-tx tu/*node* [[:put-docs :foo {:xt/id :my-doc, :last_updated "tx1"}]])
 
-  (xt/submit-tx tu/*node* [[:put-docs :foo {:xt/id :my-doc, :last_updated "tx2"}]] {:system-time #inst "2001"})
+  (tu/set-log-clock! #inst "2001")
+  (xt/submit-tx tu/*node* [[:put-docs :foo {:xt/id :my-doc, :last_updated "tx2"}]])
 
   (tu/flush-block! tu/*node*)
 
@@ -970,14 +972,14 @@
         "the plan names a database the resolved set lacks"))
 
 (t/deftest a-page-overlapping-no-emitted-page-in-valid-time-is-pruned
-  (with-open [node (xtn/start-node {:compactor {:threads 0}})]
+  (with-open [node (xtn/start-node (merge tu/*node-opts* {:compactor {:threads 0}}))]
     (doseq [[system-time v valid-from valid-to] [[#inst "2020-01-01" 1 #inst "2020-01-01" #inst "2020-01-02"]
                                                  [#inst "2020-01-02" 2 #inst "2020-01-03" #inst "2020-01-04"]
                                                  [#inst "2020-01-03" 1 #inst "2020-01-05" #inst "2020-01-07"]
                                                  [#inst "2020-01-04" 3 #inst "2020-01-06" #inst "2020-01-08"]]]
+      (tu/set-log-clock! system-time)
       (xt/execute-tx node [[:put-docs {:into :docs, :valid-from valid-from, :valid-to valid-to}
-                            {:xt/id :reading, :v v}]]
-                     {:system-time system-time})
+                            {:xt/id :reading, :v v}]])
       (tu/flush-block! node))
 
     (let [sql "SELECT _valid_from, _valid_to FROM docs FOR ALL VALID_TIME WHERE v = 1 ORDER BY _valid_from"]

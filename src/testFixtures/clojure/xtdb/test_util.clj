@@ -153,8 +153,28 @@
   (reify InstantSource
     (instant [_] (time/->instant @!inst))))
 
+(defn ->log-clock
+  "A mock clock that reads `!next` (an atom holding an instant-coercible value) and then steps it on a day,
+   so a test gives its next transaction a system time by `reset!`ing the atom before submitting it."
+  ^java.time.InstantSource [!next]
+  (reify InstantSource
+    (instant [_]
+      (let [[inst _] (swap-vals! !next #(.plus ^Instant (time/->instant %) (Period/ofDays 1)))]
+        (time/->instant inst)))))
+
+(def ^:dynamic *log-clock*
+  "The atom behind `with-mock-clock`'s log clock - see `set-log-clock!`."
+  nil)
+
 (defn with-mock-clock [f]
-  (with-opts {:log [:in-memory {:instant-src (->mock-clock)}]} f))
+  (let [!next (atom #inst "2020-01-01")]
+    (binding [*log-clock* !next]
+      (with-opts {:log [:in-memory {:instant-src (->log-clock !next)}]} f))))
+
+(defn set-log-clock!
+  "The store assigns system time from the log clock, so this is how a `with-mock-clock` test chooses the system time of the transaction it submits next."
+  [inst]
+  (reset! *log-clock* inst))
 
 (defn ->tstz-range ^xtdb.types.ZonedDateTimeRange [from to]
   (ZonedDateTimeRange. (time/->zdt from) (some-> to time/->zdt)))
