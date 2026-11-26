@@ -320,7 +320,7 @@ impl TxResolver {
         let _span = context.transaction_span(None, "xtdb.transaction", &[("operations.count", rtdb_plan::TraceValue::Unsigned(0))]);
         context.check_cancelled()?;
         let base = self.resolving_snapshot(durable)?;
-        let key = TransactionKey { tx_id: TxId(position.0), system_time: self.smooth(log_time)? };
+        let key = TransactionKey { tx_id: TxId(position.0), system_time: self.smooth(log_time) };
         let options = SubmitOptions { default_tz: context.default_tz.clone(), ..SubmitOptions::default() };
         let mut tx = OpenTransaction::new(base, key, &options, context)?;
         let error = crate::RetainedAnomaly::new(reason, &context.memory)?;
@@ -362,7 +362,7 @@ impl TxResolver {
         }
         let base = self.resolving_snapshot(durable)?;
         let has_owned_operations = request.operations.iter().any(Operation::is_owned);
-        let default_time = self.smooth(log_time)?;
+        let default_time = self.smooth(log_time);
         let supplied_time = self.supplied_time(request.options.system_time, TxId(position.0))?;
         let attempt = request.placed_attempt(position)?;
         let decision = match &context.decision_clock {
@@ -677,8 +677,7 @@ impl TxResolver {
         context.check_cancelled()?;
         let base = self.resolving_snapshot(durable)?;
         let id = self.resolved_head().map_or(-1, |key| key.tx_id.0).checked_add(1).ok_or_else(overflow)?;
-        let system_time = crate::system_time::external_time(self.previous_system_time(), system_time.map(|time| time.0), now.0)
-            .map(Timestamp).ok_or_else(|| Anomaly::incorrect("xtdb/time-overflow", "Timestamp has no following chronon"))?;
+        let system_time = Timestamp(crate::system_time::external_time(self.previous_system_time(), system_time.map(|time| time.0), now.0));
         let key = TransactionKey { tx_id: TxId(id), system_time };
         let options = SubmitOptions { default_tz: context.default_tz.clone(), ..SubmitOptions::default() };
         let mut tx = OpenTransaction::new(base.clone(), key, &options, context)?;
@@ -701,7 +700,7 @@ impl TxResolver {
 
     pub async fn resolve_db_op(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp, operation: DbOp, verdict: Result<()>, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
         let base = self.resolving_snapshot(durable)?;
-        let key = TransactionKey { tx_id: TxId(position.0), system_time: self.smooth(log_time)? };
+        let key = TransactionKey { tx_id: TxId(position.0), system_time: self.smooth(log_time) };
         let (result, operation) = match verdict {
             Ok(()) => (TransactionResult::Committed { tx_key: key }, Some(operation)),
             Err(error) if error.is_caller_error() => (TransactionResult::Aborted { tx_key: key, error: Some(crate::RetainedAnomaly::new(error, &context.memory)?) }, None),
@@ -720,16 +719,16 @@ impl TxResolver {
     }
 
     pub fn prepared_publication_key(&self, position: SourcePosition, appended: Timestamp) -> Result<TransactionKey> {
-        Ok(TransactionKey { tx_id: TxId(position.0), system_time: self.smooth(appended)? })
+        Ok(TransactionKey { tx_id: TxId(position.0), system_time: self.smooth(appended) })
     }
 
-    /// As in XTDB, a supplied system time must be strictly later than the predecessor's, and may lie ahead of
-    /// the log's append time; otherwise the transaction aborts with `invalid-system-time`.
+    /// A supplied system time may tie the predecessor's (its position orders it, T7) and may lie ahead of the
+    /// log's append time, as in XTDB; an earlier one aborts the transaction with `invalid-system-time`.
     fn supplied_time(&self, requested: Option<Timestamp>, tx_id: TxId) -> Result<std::result::Result<Option<Timestamp>, Anomaly>> {
         let Some(requested) = requested else { return Ok(Ok(None)) };
         match self.resolved_head() {
-            Some(head) if !crate::system_time::advances(Some(head.system_time.0), requested.0) => Ok(Err(
-                Anomaly::incorrect("invalid-system-time", "specified system-time must be later than current tx")
+            Some(head) if !crate::system_time::follows(Some(head.system_time.0), requested.0) => Ok(Err(
+                Anomaly::incorrect("invalid-system-time", "specified system-time must not be earlier than current tx")
                     .with_context("tx-key", tx_key_context(TransactionKey { tx_id, system_time: requested })?)
                     .with_context("latest-completed-tx", tx_key_context(head)?),
             )),
@@ -737,10 +736,11 @@ impl TxResolver {
         }
     }
 
-    fn smooth(&self, candidate: Timestamp) -> Result<Timestamp> {
-        crate::system_time::automatic_time(self.previous_system_time(), candidate.0)
-            .map(Timestamp)
-            .ok_or_else(|| Anomaly::incorrect("xtdb/time-overflow", "Timestamp has no following chronon"))
+    /// The log's time, held at the predecessor's when it would go back: never a
+    /// minted tick, so a shared-main store append is never judged against a time
+    /// no clock issued (T7).
+    fn smooth(&self, candidate: Timestamp) -> Timestamp {
+        Timestamp(crate::system_time::automatic_time(self.previous_system_time(), candidate.0))
     }
 
     fn previous_system_time(&self) -> Option<i64> { self.resolved_head().map(|key| key.system_time.0) }
@@ -758,8 +758,8 @@ impl TxResolver {
                 return Err(Anomaly::fault("rtdb.tx/transaction-order", "Resolved transaction position does not advance its predecessor")),
             control_order::SourceOrder::Admitted => (),
         }
-        if resolved.writes.tx_key() != key || !crate::system_time::advances(self.previous_system_time(), key.system_time.0) {
-            return Err(Anomaly::fault("rtdb.tx/system-time", "Resolved transaction does not advance its predecessor's system time"));
+        if resolved.writes.tx_key() != key || !crate::system_time::follows(self.previous_system_time(), key.system_time.0) {
+            return Err(Anomaly::fault("rtdb.tx/system-time", "Resolved transaction precedes its predecessor's system time"));
         }
         let next_token_charge = resolved.external_token.as_ref().map(|token| self.memory.reserve(token.capacity().checked_add(512).ok_or_else(overflow)?)).transpose()?;
         if self.queue.len() == self.queue.capacity() {
@@ -2242,20 +2242,22 @@ impl<'a> OpenTransaction<'a> {
                         } else {
                             held_publication || world.mode == WorldClockMode::Retained
                         };
-                        if world.dropped || world.basis.system_time >= self.tx_key().system_time
+                        // The basis precedes this transaction by position; its
+                        // time may tie (T7).
+                        if world.dropped || world.basis.system_time > self.tx_key().system_time
+                            || world.basis.tx_id >= self.tx_key().tx_id
                             || deadline.is_none_or(|until| until > world.until)
                             || sibling.is_some() != sibling_fork
                             || (with_root && ((previous.is_some() != bounded_write)
                                 || !valid_mode
-                                || ((proposal_publication || bounded_write) && world.parent_publication != Some(world.basis.system_time))
-                                || world.basis.tx_id >= self.tx_key().tx_id))
+                                || ((proposal_publication || bounded_write) && world.parent_publication != Some(world.basis.system_time))))
                         {
                             return Err(unavailable());
                         }
                         if let Some((source_id, source_pin)) = overlay_source {
                             if with_root || previous.is_some() || sibling.is_some()
                                 || world.ancestors.iter().any(|ancestor|
-                                    ancestor.basis.system_time >= self.tx_key().system_time
+                                    ancestor.basis.system_time > self.tx_key().system_time
                                         || ancestor.basis.tx_id >= self.tx_key().tx_id)
                             {
                                 return Err(unavailable());
@@ -3203,7 +3205,9 @@ impl<'a> OpenTransaction<'a> {
             let record = rtdb_types::OwnedWorld::from_record(&documents.rows()[0])?;
             let ordered = self.tx_key().system_time;
             if create_only {
-                if record.dropped || record.basis.system_time >= ordered || record.until <= ordered {
+                if record.dropped || record.basis.system_time > ordered || record.basis.tx_id >= self.tx_key().tx_id
+                    || record.until <= ordered
+                {
                     return Err(unavailable());
                 }
             } else {

@@ -2,7 +2,7 @@ use crate::control_order::{SourceOrder, fingerprint_bytes, fingerprint_matches, 
 use crate::control_order::{HostedStamp, LandingMarker, hosted_stamps_current, landing_marker_matches, writes_hosted_control};
 use crate::event_revision::matches_transaction;
 use crate::prepared_landing;
-use crate::system_time::{advances, owned_deadline_is_live};
+use crate::system_time::{follows, owned_deadline_is_live};
 use vstd::prelude::*;
 
 verus! {
@@ -106,11 +106,11 @@ pub fn placed_publication_advances_reopened_claim(
     requires claim_position <= predecessor_position, claim_revision <= predecessor_revision,
 {
     let order = source_order(true, source, Some(predecessor_position), transaction);
-    let advancing_time = advances(Some(predecessor_revision), revision);
+    let following_time = follows(Some(predecessor_revision), revision);
     let writer = revision_matches(observed, Some(claim_revision));
-    if advancing_time && writer && matches!(order, SourceOrder::Admitted) {
+    if following_time && writer && matches!(order, SourceOrder::Admitted) {
         assert(observed == Some(claim_revision));
-        assert(source == transaction && claim_position < source && claim_revision < revision);
+        assert(source == transaction && claim_position < source && claim_revision <= revision);
     }
 }
 

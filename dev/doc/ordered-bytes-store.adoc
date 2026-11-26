@@ -143,6 +143,19 @@ The transaction buffer positions every staged event (`EventPosition { transactio
 Every transaction time that shares a log with store appends follows the store's rule: it never goes back, ties are admitted, and positions order them.
 
 * A Multi workload is judged at the time it commits at, `now.max(head.system_time)`, as `TransactState` commits it (`db/src/multi/pipeline.rs`: `check_managed_appointment`, the classic placement path, `managed_workload_serial`), never one tick past the head.
+* The classic resolver's time is non-decreasing (`tx/src/system_time.rs`: `follows`, `automatic_time`, `external_time`; Verus area `system_time`).
+  A stalled or regressed log ties its predecessor, and no tick is minted past it.
+  In shared main a classic transaction becomes the branch index head (`serving::classic::apply_live`, `BranchIndex::advance_classic`), and the next store append's sample is judged against that head, so a minted tick would make the append a clock regression (`rtdb.store/clock-regressed`).
+  The classic resolver already admits a serving transaction that ties its head (`Resolver::observe_applied_serving`).
+  A supplied system time may tie its predecessor's, a later position ordering it, and an earlier one still aborts with `invalid-system-time`.
+  A classic world registration needs its basis before it by position, its time allowed to tie (`check_owned_preconditions`, `write_owned` on the world catalog).
+  This diverges from XTDB, which refuses a supplied time equal to the latest completed transaction's (`xtdb.api-test/a-system-time-equal-to-the-latest-completed-tx-is-rejected`) and steps a stalled clock one tick.
+  A read that names a classic transaction by its system time alone reads every transaction tied with it, as every as-of read does; a snapshot token names its position.
+* A held world's clock keeps its one-tick step (`publish_owned_world`, `WorldClockMode::Held`).
+  A reading is the logical name of one held-world publication: overlays and ancestors match it as `logical`, and a fork's overlay cut carries it.
+  It is application data in the world clock table, not a transaction time, and no store append is judged against it.
+
+Remaining: a supplied system time ahead of the writer's clock, which XTDB admits, still raises a shared-main head past that clock until the clock catches up, and so does a log append time from a clock ahead of the serving node's.
 
 == Verification obligations (T7)
 

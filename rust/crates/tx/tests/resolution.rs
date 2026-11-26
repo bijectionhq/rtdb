@@ -73,14 +73,15 @@ async fn ordinary_sql_asserts_the_ordered_ceiling_and_places_offsets_from_the_sa
     let message = SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
     let replay = || SourceTransaction::decode(&message, &context.memory).unwrap();
 
-    for previous in [100, 101] {
+    // The log stalls behind its predecessor, so the transaction ties it (T7: no tick is minted).
+    for previous in [101, 102] {
         let state = PartitionState::empty(Default::default()).unwrap();
         let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
         resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(previous), request(vec![], &context), &context).await.unwrap();
         state.apply(resolver.take_head().unwrap().writes()).unwrap();
         let result = resolver.resolve_source(state.value().snapshot(), SourcePosition(1), Timestamp(90), replay(), &context).await.unwrap();
-        assert_eq!(result.result().tx_key().system_time, Timestamp(previous + 1));
-        if previous == 101 {
+        assert_eq!(result.result().tx_key().system_time, Timestamp(previous));
+        if previous == 102 {
             assert_eq!(result.result().error().unwrap().code, "xtdb/assert-failed");
             assert!(!result.writes().tables().contains_key(&table()));
             continue;
@@ -97,7 +98,7 @@ async fn ordinary_sql_asserts_the_ordered_ceiling_and_places_offsets_from_the_sa
 }
 
 #[tokio::test]
-async fn a_supplied_system_time_commits_only_strictly_after_its_predecessor_even_ahead_of_the_log() {
+async fn a_supplied_system_time_commits_at_or_after_its_predecessor_even_ahead_of_the_log() {
     use rtdb_format::envelope::SourceMessage;
 
     let context = context();
@@ -108,17 +109,18 @@ async fn a_supplied_system_time_commits_only_strictly_after_its_predecessor_even
         let encoded = source.encode().unwrap();
         SourceTransaction::decode(&SourceMessage::decode(encoded.as_slice()).unwrap().unwrap(), &context.memory).unwrap()
     };
-    // As in XTDB: a supplied time later than the log's append time commits, and the transactions after it take
-    // system times one tick past it until the log catches up; only a time that does not advance aborts.
+    // As in XTDB, a supplied time later than the log's append time commits. The transactions after it tie it
+    // until the log catches up, and a supplied time equal to its predecessor's commits at a later position
+    // (T7); only an earlier time aborts.
     for (position, appended, requested, outcome, system_time) in [
         (0, 100, Some(50), None, 50),
         (1, 100, Some(60), None, 60),
-        (2, 100, Some(60), Some("invalid-system-time"), 100),
-        (3, 150, Some(99), Some("invalid-system-time"), 150),
+        (2, 100, Some(60), None, 60),
+        (3, 150, Some(59), Some("invalid-system-time"), 150),
         (4, 200, Some(1_000), None, 1_000),
-        (5, 250, Some(1_000), Some("invalid-system-time"), 1_001),
-        (6, 300, None, None, 1_002),
-        (7, 350, Some(1_003), None, 1_003),
+        (5, 250, Some(999), Some("invalid-system-time"), 1_000),
+        (6, 300, None, None, 1_000),
+        (7, 350, Some(1_000), None, 1_000),
         (8, 2_000, None, None, 2_000),
     ] {
         let resolved = resolver.resolve_source(state.value().snapshot(), SourcePosition(position), Timestamp(appended), at(position, requested), &context).await.unwrap();
@@ -131,7 +133,7 @@ async fn a_supplied_system_time_commits_only_strictly_after_its_predecessor_even
 }
 
 #[tokio::test]
-async fn an_external_writer_time_steps_past_its_predecessor_and_keeps_a_future_time() {
+async fn an_external_writer_time_is_held_at_its_predecessor_and_keeps_a_future_time() {
     struct Commit;
     #[async_trait::async_trait]
     impl TransactionWriter for Commit {
@@ -142,7 +144,7 @@ async fn an_external_writer_time_steps_past_its_predecessor_and_keeps_a_future_t
     let state = PartitionState::empty(Default::default()).unwrap();
     let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
     for (now, requested, system_time) in [
-        (100, Some(50), 50), (100, Some(50), 51), (100, Some(40), 52), (100, Some(500), 500), (200, None, 501), (600, None, 600),
+        (100, Some(50), 50), (100, Some(50), 50), (100, Some(40), 50), (100, Some(500), 500), (200, None, 500), (600, None, 600),
     ] {
         let resolved = resolver.resolve_external(state.value().snapshot(), Timestamp(now), requested.map(Timestamp), None, &mut Commit, &context).await.unwrap();
         assert!(resolved.result().committed(), "{:?}", resolved.result());

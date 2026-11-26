@@ -3,44 +3,50 @@
 #[cfg(verus_keep_ghost)]
 use vstd::prelude::*;
 
+/// Whether `candidate` keeps the system-time order after `previous`: it never
+/// goes back. Ties are admitted, and positions order them (T7): a transaction
+/// is named by its position, and its system time is a non-decreasing
+/// coordinate.
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
     ensures out == match previous {
-        Some(last) => last < candidate,
+        Some(last) => last <= candidate,
         None => true,
     },
 ))]
-pub(crate) fn advances(previous: Option<i64>, candidate: i64) -> bool {
+pub(crate) fn follows(previous: Option<i64>, candidate: i64) -> bool {
     match previous {
-        Some(last) => last < candidate,
+        Some(last) => last <= candidate,
         None => true,
     }
 }
 
+/// A transaction's automatic time: its clock candidate, or its predecessor's
+/// time when the clock stalls or steps back. No time is minted past the
+/// predecessor's, so a store append sampled after it is never judged against
+/// a time no clock issued (T7).
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
     ensures out == match previous {
-        Some(last) if candidate <= last =>
-            if last == i64::MAX { None } else { Some((last + 1) as i64) },
-        _ => Some(candidate),
+        Some(last) if candidate < last => last,
+        _ => candidate,
     },
 ))]
-pub(crate) fn automatic_time(previous: Option<i64>, candidate: i64) -> Option<i64> {
+pub(crate) fn automatic_time(previous: Option<i64>, candidate: i64) -> i64 {
     match previous {
-        Some(last) if !advances(previous, candidate) => last.checked_add(1),
-        _ => Some(candidate),
+        Some(last) if !follows(previous, candidate) => last,
+        _ => candidate,
     }
 }
 
 /// An external writer's time: its supplied time, or now when it supplies none,
-/// stepped one tick past the predecessor when it does not advance it. As in
-/// XTDB, a supplied time may lie ahead of now.
+/// held at the predecessor's when it would go back. As in XTDB, a supplied time
+/// may lie ahead of now.
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
     ensures out == match previous {
-        Some(last) if (match supplied { Some(candidate) => candidate, None => now }) <= last =>
-            if last < i64::MAX { Some((last + 1) as i64) } else { None },
-        _ => Some(match supplied { Some(candidate) => candidate, None => now }),
+        Some(last) if (match supplied { Some(candidate) => candidate, None => now }) < last => last,
+        _ => match supplied { Some(candidate) => candidate, None => now },
     },
 ))]
-pub(crate) fn external_time(previous: Option<i64>, supplied: Option<i64>, now: i64) -> Option<i64> {
+pub(crate) fn external_time(previous: Option<i64>, supplied: Option<i64>, now: i64) -> i64 {
     automatic_time(previous, match supplied { Some(candidate) => candidate, None => now })
 }
 
@@ -185,17 +191,26 @@ mod tests {
     use rtdb_types::{Timestamp, TransactionKey, TxId};
 
     use crate::{DecisionObservation, OwnedClockSlot};
-    use super::{advances, clock_slot_reading, clock_slot_time, clock_slot_wait, external_time};
+    use super::{automatic_time, clock_slot_reading, clock_slot_time, clock_slot_wait, external_time, follows};
 
     #[test]
     fn a_supplied_time_ahead_of_now_is_kept_as_in_xtdb() {
-        assert!(advances(Some(100), 10_000));
-        assert!(!advances(Some(100), 100));
-        assert_eq!(external_time(Some(100), Some(10_000), 200), Some(10_000));
-        assert_eq!(external_time(Some(10_000), None, 200), Some(10_001));
-        assert_eq!(external_time(Some(10_000), Some(150), 200), Some(10_001));
-        assert_eq!(external_time(Some(100), None, 200), Some(200));
-        assert_eq!(external_time(Some(i64::MAX), None, 200), None);
+        assert!(follows(Some(100), 10_000));
+        assert!(follows(Some(100), 100));
+        assert!(!follows(Some(100), 99));
+        assert_eq!(external_time(Some(100), Some(10_000), 200), 10_000);
+        assert_eq!(external_time(Some(10_000), None, 200), 10_000);
+        assert_eq!(external_time(Some(10_000), Some(150), 200), 10_000);
+        assert_eq!(external_time(Some(100), None, 200), 200);
+        assert_eq!(external_time(Some(i64::MAX), None, 200), i64::MAX);
+    }
+
+    #[test]
+    fn a_stalled_clock_ties_its_predecessor_and_never_mints_a_time() {
+        assert_eq!(automatic_time(None, 5), 5);
+        assert_eq!(automatic_time(Some(5), 5), 5);
+        assert_eq!(automatic_time(Some(5), 3), 5);
+        assert_eq!(automatic_time(Some(5), 9), 9);
     }
 
     #[test]
