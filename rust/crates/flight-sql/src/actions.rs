@@ -176,7 +176,7 @@ impl Service {
                 }
             }
             use crate::owned_actions::{
-                COMMIT_ORDERED_V1, COMMIT_OWNED_V1, COMMIT_OWNED_V2, COMMIT_OWNED_V3, COMMIT_OWNED_V4,
+                COMMIT_ORDERED_V1, COMMIT_OWNED_V1, COMMIT_OWNED_V3, COMMIT_OWNED_V4,
                 CommitFormat, OwnedReplyFormat, PointTime, SPATIAL_HELD_OWNED_V1, SPATIAL_HELD_OWNED_V2, SPATIAL_HELD_OWNED_V3,
                 SPATIAL_OPEN_OWNED, SPATIAL_PROBE_OWNED, SPATIAL_RANK_OPEN_OWNED, SPATIAL_RANK_OPEN_OWNED_V2, SpatialHeldWire,
                 WorldHistoricalRead::{Current, EarlierEffective, EarlierParent},
@@ -255,10 +255,8 @@ impl Service {
                     return Box::pin(self.read_held_root_catalog_action(&call, &action.body, ipc_stream)).await.map(ActionReplies::Owned),
                 crate::owned_actions::OFFER_FUNDED_MUTATION_CLOCK_V1 => Ok(vec![Ok(self.offer_funded_mutation_clock_action(&call, &action.body).await?)]),
                 crate::owned_actions::OFFER_CLOCK_SLOT_V2 => Ok(vec![Ok(self.offer_clock_slot_action(&call, &action.body).await?)]),
-                COMMIT_OWNED_V1 | COMMIT_OWNED_V2 => {
-                    let format = if action_type == COMMIT_OWNED_V1 { CommitFormat::Single } else { CommitFormat::Grouped };
-                    return self.commit_owned_action(&call, &action.body, format, ipc_stream).await.map(ActionReplies::Owned);
-                }
+                COMMIT_OWNED_V1 =>
+                    return self.commit_owned_action(&call, &action.body, CommitFormat::Single, ipc_stream).await.map(ActionReplies::Owned),
                 COMMIT_OWNED_V3 | COMMIT_ORDERED_V1 | COMMIT_OWNED_V4 => {
                     let format = if action_type == COMMIT_ORDERED_V1 { CommitFormat::Ordered } else { CommitFormat::Grouped };
                     return self.commit_owned_witnessed_action(&call, &action.body, format, action_type == COMMIT_OWNED_V4, ipc_stream).await.map(ActionReplies::Owned);

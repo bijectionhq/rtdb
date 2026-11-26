@@ -112,7 +112,6 @@ pub(crate) const CREATE_OWNED_V1: &str = "rtdb.owned.Create.v1";
 pub(crate) const OFFER_FUNDED_MUTATION_CLOCK_V1: &str = "rtdb.owned.OfferFundedMutationClock.v1";
 pub(crate) const OFFER_CLOCK_SLOT_V2: &str = "rtdb.owned.OfferClockSlot.v2";
 pub(crate) const COMMIT_OWNED_V1: &str = "rtdb.owned.Commit.v1";
-pub(crate) const COMMIT_OWNED_V2: &str = "rtdb.owned.Commit.v2";
 pub(crate) const COMMIT_ORDERED_V1: &str = "rtdb.owned.CommitOrdered.v1";
 pub(crate) const COMMIT_OWNED_V7: &str = "rtdb.owned.Commit.v7";
 pub(crate) const COMMIT_OWNED_V4: &str = "rtdb.owned.Commit.v4";

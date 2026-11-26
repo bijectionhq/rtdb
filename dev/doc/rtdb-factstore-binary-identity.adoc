@@ -31,7 +31,7 @@ Public pgwire accepts the existing text, keyword, signed integer and UUID entity
 
 == Request and response mapping
 
-* For `Create.v1`, `Commit.v1`, `Commit.v2`, `CommitOrdered.v1` and hosted/import/restore groups, put Binary in the existing Arrow `_id` field for fact rows.
+* For `Create.v1`, `Commit.v1`, `CommitOrdered.v1` and hosted/import/restore groups, put Binary in the existing Arrow `_id` field for fact rows.
   The point condition fields, operation names, schedule, deadlines and row or group order are identical.
   A batch with a text control row and a Binary fact row can use the corresponding typed legs when its existing operation layout admits a dense union.
 * Scalar Root and world points, positioned points, valid-window and version requests send Binary in the existing Arrow `_id`.

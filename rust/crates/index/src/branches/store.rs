@@ -187,6 +187,22 @@ mod tests {
 
     const INCARNATION: [u8; 16] = [7; 16];
 
+    /// The SHA-256 of Bijection's `crates/fact_store/src/persistence/filter.rs`.
+    /// Bijection's `fact_store` pins the same digest of its own copy
+    /// (`persistence::tests::the_store_filter_matches_rtdbs_vendored_copy`),
+    /// so a change on either side alone fails a test. Change the filter in
+    /// Bijection, copy it to `vendor/bijection-store-filter/src/lib.rs` and
+    /// update both pins in the paired commits.
+    const BIJECTION_STORE_FILTER_SHA256: &str = "2c3d799315a33af3f086db6cb9a461a304293f6f567ab354870e960bdc3d191d";
+
+    #[test]
+    fn the_vendored_store_filter_is_bijections_pinned_copy() {
+        use sha2::{Digest, Sha256};
+        let source = include_bytes!("../../../../vendor/bijection-store-filter/src/lib.rs");
+        let digest = Sha256::digest(source).iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        assert_eq!(digest, BIJECTION_STORE_FILTER_SHA256, "vendor/bijection-store-filter drifted from Bijection's filter.rs");
+    }
+
     fn cut(position: u64) -> BranchCut {
         BranchCut { basis: Basis::new(INCARNATION, position), system_time: Timestamp(position as i64 * 10) }
     }

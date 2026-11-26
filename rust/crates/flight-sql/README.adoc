@@ -226,7 +226,7 @@ For a present row it also includes `rtdb.owned.revision_micros` as signed decima
 A successful commit reply has the same schema as the create reply.
 An expired deadline or stale observation aborts the entire transaction before mutations apply.
 
-`rtdb.owned.Commit.v2` applies the same row schema and reply format to multiple relations in one transaction.
+The grouped commit body applies the same row schema and reply format to multiple relations in one transaction. `rtdb.owned.Commit.v3` and the hosted decisions carry it; it has no action of its own.
 Its body starts with one exclusive signed 64-bit big-endian microsecond deadline and an unsigned 16-bit big-endian group count.
 Each group is an unsigned 16-bit big-endian relation-name length, the ASCII relation name, an unsigned 32-bit big-endian IPC length, and exactly that many bytes of a terminated IPC stream.
 Each group contains one nonempty batch.
@@ -471,7 +471,7 @@ The response uses the same covering schema and held time metadata as v1, with no
 A covered v2 page on a placed attachment with a live catalogue lease also returns `rtdb.owned.range_witness`, an opaque 32-digit hexadecimal nonce in the response schema.
 A covered empty page can carry a witness.
 Each held handle issues one nonce per observed relation, up to 32 relations.
-`rtdb.owned.Commit.v3` prefixes an unchanged Commit.v2 body with an unsigned 16-bit big-endian witness count (1–32), then that many entries of 16 raw held-handle bytes, 16 raw nonce bytes, and an unsigned 16-bit big-endian length followed by that many bytes of the range's revealed projection in the `_read_revealed` encoding (empty keeps exact frontier validation).
+`rtdb.owned.Commit.v3` prefixes an unchanged grouped commit body with an unsigned 16-bit big-endian witness count (1–32), then that many entries of 16 raw held-handle bytes, 16 raw nonce bytes, and an unsigned 16-bit big-endian length followed by that many bytes of the range's revealed projection in the `_read_revealed` encoding (empty keeps exact frontier validation).
 When the relation frontier moved, a range with a revealed projection is still valid if every later change leaves each touched row's projection the same at the witness basis and at acceptance, and constant over the clock interval; erasure, redaction and expiry always count as changes.
 Acceptance outside the projection's clock interval, or at or after the witness's valid-time cutoff (the earliest boundary among the matched rows and the covered absence of a `cover_valid` page), leaves the range undetermined.
 The commit reply is unchanged.
@@ -1103,7 +1103,7 @@ The resolver compares the proof with the live authority at the ordered predecess
 A refusal alternative shares that check.
 With hosted controls installed, generic placed Flight fact writes can address only `fact_layout_readiness`.
 The optional sections and the ordering deadline precede the ordered fact and control groups as described below.
-Both sections use the Commit.v2 relation-group sequence framing. The control section has at least one group. A check-only transaction may omit fact groups.
+Both sections use the grouped commit relation-group sequence framing. The control section has at least one group. A check-only transaction may omit fact groups.
 Fact groups may repeat a relation to preserve run order. The combined sections admit at most 32 distinct fact and control groups and 4096 total rows.
 
 Each control group contains one terminated Arrow batch with distinct field names.
