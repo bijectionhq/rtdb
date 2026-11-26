@@ -308,6 +308,7 @@ impl ServerDriver {
         let cancellation = CancellationToken::new();
         let listeners = async {
         registrations.push(metrics.register_provider(node.metrics_provider()?)?);
+        registrations.push(metrics.register_memory_cache(node.cache_budget())?);
         let mut addresses = ListenerAddresses::default();
         let mut pgwire = Vec::new();
         if let Some(settings) = &config.server {

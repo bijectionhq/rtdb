@@ -33,9 +33,17 @@ pub struct DiskCache {
     operations: Arc<IoRegion>,
     cancellation: CancellationToken,
     _directory_lock: File,
+    traffic: Traffic,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DiskCacheStats { pub maximum_bytes: u64, pub pinned_bytes: u64, pub evictable_bytes: u64 }
+
+/// Upstream's `RemoteBufferPool` counters, accumulated since the cache opened.
+#[derive(Default)]
+struct Traffic { misses: AtomicU64, read: AtomicU64, written: AtomicU64 }
+/// Reads the cache could not serve from disk, and bytes read from and written to the remote store through it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DiskCacheTraffic { pub misses: u64, pub network_read_bytes: u64, pub network_write_bytes: u64 }
 
 pub struct DiskLease { cache: Arc<DiskCache>, entry: Arc<Entry> }
 impl DiskLease {
@@ -81,7 +89,7 @@ impl DiskCache {
             if item.file_type().map_err(|error| Error::io(&path, error))?.is_dir() { fs::remove_dir_all(&path) } else { fs::remove_file(&path) }.map_err(|error| Error::io(&path, error))?;
         }
         let cache = Arc::new(Self { root, maximum_bytes, memory, state: Mutex::new(State { entries: BTreeMap::new(), clock: 0 }),
-            operations, cancellation: CancellationToken::new(), _directory_lock: directory_lock });
+            operations, cancellation: CancellationToken::new(), _directory_lock: directory_lock, traffic: Traffic::default() });
         cache.discover(&cache.root)?;
         cache.trim(None);
         Ok(cache)
@@ -89,6 +97,15 @@ impl DiskCache {
     fn begin_operation(&self) -> Result<crate::io_region::IoAdmission> {
         self.operations.admit()
     }
+    pub fn traffic(&self) -> DiskCacheTraffic {
+        DiskCacheTraffic { misses: self.traffic.misses.load(Ordering::Relaxed), network_read_bytes: self.traffic.read.load(Ordering::Relaxed),
+            network_write_bytes: self.traffic.written.load(Ordering::Relaxed) }
+    }
+    fn missed(&self, read_bytes: u64) {
+        self.traffic.misses.fetch_add(1, Ordering::Relaxed);
+        self.traffic.read.fetch_add(read_bytes, Ordering::Relaxed);
+    }
+    fn wrote(&self, bytes: u64) { self.traffic.written.fetch_add(bytes, Ordering::Relaxed); }
     /// Rejects new cache work, cancels downloads, and joins all admitted work, including blocking reads whose callers were cancelled.
     /// Existing leases remain pinned and keep the directory lock until released.
     pub async fn close_and_wait(&self) {
@@ -204,6 +221,7 @@ impl DiskCache {
                 offset = end;
             }
             self.publish(cache_key, &lease.entry, temporary, object.size)?;
+            self.missed(object.size);
         }
         drop(guard);
         self.trim(None);
@@ -461,8 +479,11 @@ impl ObjectStore for DiskCachedStore {
         let scope = self.io.admit_read(self.cache.clone(), self.key(key)?)?;
         let operation = self.cache.begin_operation()?.and(scope);
         let Some(lease) = self.cache.cached_file(&self.key(key)?) else {
-            return self.cache.cancellation.run_until_cancelled(self.remote.get_reserved_scan_range(key, range, reservation))
-                .await.ok_or_else(cache_closed)?;
+            let length = reservation.length() as u64;
+            let bytes = self.cache.cancellation.run_until_cancelled(self.remote.get_reserved_scan_range(key, range, reservation))
+                .await.ok_or_else(cache_closed)??;
+            self.cache.missed(length);
+            return Ok(bytes);
         };
         let key = key.clone();
         IoRegion::run_admitted(operation, move || {
@@ -470,7 +491,14 @@ impl ObjectStore for DiskCachedStore {
             crate::object_store::map_range(crate::LocalFile::new(file, Some(lease)), &key, range, reservation)
         }).await
     }
-    async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()> { let _scope = self.io.admit()?; let _operation = self.cache.begin_operation()?; self.remote.put(key, bytes).await }
+    async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()> {
+        let _scope = self.io.admit()?;
+        let _operation = self.cache.begin_operation()?;
+        let length = bytes.len() as u64;
+        self.remote.put(key, bytes).await?;
+        self.cache.wrote(length);
+        Ok(())
+    }
     /// The lease pins the cached file, so the cache neither evicts nor counts as free what a reader still maps.
     async fn local_file(&self, key: &ObjectKey) -> Result<Option<crate::LocalFile>> {
         let scope = self.io.admit_read(self.cache.clone(), self.key(key)?)?;
@@ -493,7 +521,10 @@ impl ObjectStore for DiskCachedStore {
     async fn put_with_publication(&self, key: &ObjectKey, bytes: Bytes) -> Result<Option<rtdb_types::PhysicalObjectPublication>> {
         let _scope = self.io.admit()?;
         let _operation = self.cache.begin_operation()?;
-        self.remote.put_with_publication(key, bytes).await
+        let length = bytes.len() as u64;
+        let publication = self.remote.put_with_publication(key, bytes).await?;
+        self.cache.wrote(length);
+        Ok(publication)
     }
     async fn put_file(&self, key: &ObjectKey, source: &Path) -> Result<()> {
         self.put_file_with_publication(key, source).await.map(drop)
@@ -502,6 +533,7 @@ impl ObjectStore for DiskCachedStore {
         let scope = self.io.admit()?;
         let _operation = self.cache.begin_operation()?;
         let written = self.remote.put_file_with_publication(key, source).await?;
+        self.cache.wrote(fs::metadata(source).map_err(|error| Error::io(source, error))?.len());
         self.cache.put_file_admitted(&self.key(key)?, source, Some(scope)).await?;
         Ok(written)
     }

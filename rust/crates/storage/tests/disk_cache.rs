@@ -670,3 +670,31 @@ async fn a_cold_scan_range_does_not_fill_the_disk_cache() {
     store.forget(&key).await.unwrap();
     assert_eq!(page.as_slice(), b"page");
 }
+
+#[tokio::test]
+async fn traffic_counts_disk_misses_network_reads_and_writes_and_pool_misses() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = DiskCache::open(directory.path(), 1024, MemoryBudget::new(4 * 1024 * 1024)).unwrap();
+    let remote = Arc::new(MemoryStore::default());
+    let store = cache.scope(ObjectKey::new("db/0").unwrap(), remote.clone()).unwrap();
+    let fetched = ObjectKey::new("table/fetched.arrow").unwrap();
+    remote.put(&fetched, Bytes::from_static(b"twelve bytes")).await.unwrap();
+    assert_eq!(cache.traffic(), rtdb_storage::disk_cache::DiskCacheTraffic::default());
+
+    assert_eq!(store.get(&fetched).await.unwrap().as_ref(), b"twelve bytes");
+    assert_eq!(store.get(&fetched).await.unwrap().as_ref(), b"twelve bytes");
+    let traffic = cache.traffic();
+    assert_eq!((traffic.misses, traffic.network_read_bytes), (1, 12), "the second read is served from disk");
+
+    store.put(&ObjectKey::new("table/put").unwrap(), Bytes::from_static(b"four")).await.unwrap();
+    let source = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(source.path(), b"arrow file").unwrap();
+    store.put_file(&ObjectKey::new("table/uploaded.arrow").unwrap(), source.path()).await.unwrap();
+    assert_eq!(cache.traffic().network_write_bytes, 14);
+
+    let budget = CacheBudget::new(1 << 20);
+    let pool = BufferPool::with_budget(store, Arc::clone(&budget));
+    assert_eq!(pool.get(&fetched).await.unwrap().as_slice(), b"twelve bytes");
+    assert_eq!(pool.get(&fetched).await.unwrap().as_slice(), b"twelve bytes");
+    assert_eq!(budget.misses(), 1, "the second read is served from memory");
+}

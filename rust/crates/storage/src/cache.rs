@@ -136,16 +136,21 @@ pub struct CacheBudget {
     memory: Arc<MemoryBudget>,
     lru: Mutex<Lru>,
     pools: AtomicU64,
+    /// Reads any pool on this budget sent to its store, upstream's `memory-cache-misses`.
+    misses: AtomicU64,
 }
 
 impl CacheBudget {
     pub fn new(limit: usize) -> Arc<Self> { Self::with_memory(MemoryBudget::new(limit)) }
     pub fn with_memory(memory: Arc<MemoryBudget>) -> Arc<Self> {
-        Arc::new(Self { memory, lru: Mutex::new(Lru::new()), pools: AtomicU64::new(0) })
+        Arc::new(Self { memory, lru: Mutex::new(Lru::new()), pools: AtomicU64::new(0), misses: AtomicU64::new(0) })
     }
     pub fn prepaid_by(&self, parent: &Arc<MemoryBudget>) -> bool { self.memory.prepaid_by(parent) }
     pub fn retained_bytes(&self) -> usize { self.memory.used_bytes() }
     pub fn limit_bytes(&self) -> usize { self.memory.limit_bytes() }
+    /// The reads, since the budget opened, that its pools could not serve from memory.
+    pub fn misses(&self) -> u64 { self.misses.load(Ordering::Relaxed) }
+    fn missed(&self) { self.misses.fetch_add(1, Ordering::Relaxed); }
 
     fn limit_error(&self, requested: usize) -> Error {
         Error::MemoryLimit { requested, limit: self.limit_bytes(), retained: self.retained_bytes() }
@@ -395,6 +400,7 @@ impl BufferPool {
             .ok_or_else(|| Error::Task("Object range is inverted or exceeds addressable memory".into()))?;
         let allocation = self.store.scan_range_allocation(key, length)?;
         let reservation = reserve_read(length, allocation, reserve)?;
+        self.budget.missed();
         let allocation = Arc::new(self.store.get_reserved_range(key, range, reservation).await?);
         Ok(CacheLease { allocation, range: 0..length })
     }
@@ -434,6 +440,7 @@ impl BufferPool {
             .ok_or_else(|| Error::Task("Scan range is inverted or exceeds addressable memory".into()))?;
         let allocation = self.store.scan_range_allocation(key, length)?;
         let reservation = reserve_read(length, allocation, reserve)?;
+        self.budget.missed();
         let started = std::time::Instant::now();
         let allocation = Arc::new(self.store.get_reserved_scan_range(key, range, reservation).await?);
         self.scan_timing.observe(length, started.elapsed());
@@ -454,6 +461,7 @@ impl BufferPool {
     /// Reopens the persisted immutable object without using a resident pool allocation.
     pub async fn get_fresh_exact_or(&self, key: &ObjectKey, length: usize, fallback: &Arc<MemoryBudget>) -> Result<CacheLease> {
         let reservation = self.reserve_exact_read(key, length, fallback)?;
+        self.budget.missed();
         let bytes = reservation.retaining_io(self.store.get_fresh_exact(key, length)).await?;
         let allocation = Arc::new(reservation.finish(bytes)?);
         Ok(CacheLease { allocation, range: 0..length })
@@ -464,6 +472,7 @@ impl BufferPool {
         &self, key: &ObjectKey, length: usize, publication: Option<&PublishedObjectVersion>, fallback: &Arc<MemoryBudget>,
     ) -> Result<Option<CacheLease>> {
         let reservation = self.reserve_exact_read(key, length, fallback)?;
+        self.budget.missed();
         let observed = reservation.retaining_io(self.store.observe_fresh_exact(key, length)).await?;
         let observed_publication = observed.version.map(PublishedObjectVersion::from);
         if observed_publication.as_ref() != publication { return Ok(None); }
@@ -492,6 +501,7 @@ impl BufferPool {
                 None => {
                     let allocation = self.store.exact_object_allocation(key, length)?;
                     if let Ok(reservation) = reserve_read(length, allocation, |bytes| self.reserve(bytes)) {
+                        self.budget.missed();
                         let bytes = reservation.retaining_io(self.store.get_fresh_exact(key, length)).await?;
                         let allocation = Arc::new(reservation.finish(bytes)?);
                         *slot = Some(allocation.clone());
@@ -508,6 +518,7 @@ impl BufferPool {
     async fn fetch_whole(&self, key: &ObjectKey, length: usize, reserve: impl Fn(usize) -> Result<Arc<MemoryReservation>>) -> Result<Arc<RetainedBytes>> {
         let allocation = self.store.whole_object_allocation(key, length)?;
         let reservation = reserve_read(length, allocation, reserve)?;
+        self.budget.missed();
         Ok(Arc::new(self.store.get_reserved_object(key, reservation).await?))
     }
 
