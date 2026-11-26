@@ -24,6 +24,7 @@ enum Shape {
     Array {
         child: usize,
         packed: bool,
+        layout: Option<datum::PackedLayout>,
     },
     Entries(usize),
     Map(usize),
@@ -110,18 +111,17 @@ impl Projection {
                 }
                 Value::Struct(result)
             }
-            (Shape::Array { child, packed }, Node::Array(values)) => {
-                let output = values
-                    .into_iter()
-                    .map(|id| self.value(tape, id, *child, depth + 1));
-                if *packed {
-                    let mut list = ListBuilder::with_capacity(output.len());
-                    for value in output {
-                        list.push(value?);
-                    }
-                    Value::List(list.finish())
+            (Shape::Array { child, packed, .. }, Node::Array(values)) => {
+                self.array(tape, values, *child, *packed, depth)?
+            }
+            (Shape::Array { child, packed, layout }, Node::Scalar(Avro::PackedArray(array))) => {
+                if *layout == Some((array.kind, array.branches))
+                    && (array.values.is_empty() || depth + 1 + usize::from(array.branches.is_some()) <= 128)
+                {
+                    Value::List(array.values)
                 } else {
-                    Value::list(output.collect::<Result<_>>()?)
+                    let values = array.into_physical_values().into_iter().map(|value| tape.physical(value)).collect();
+                    self.array(tape, values, *child, *packed, depth)?
                 }
             }
             (Shape::Entries(child), Node::Array(values)) => {
@@ -226,6 +226,21 @@ impl Projection {
             }
         };
         logical.convert(value)
+    }
+
+    fn array(&self, tape: &mut Tape, values: Vec<usize>, child: usize, packed: bool, depth: usize) -> Result<Value> {
+        let output = values
+            .into_iter()
+            .map(|id| self.value(tape, id, child, depth + 1));
+        Ok(if packed {
+            let mut list = ListBuilder::with_capacity(output.len());
+            for value in output {
+                list.push(value?);
+            }
+            Value::List(list.finish())
+        } else {
+            Value::list(output.collect::<Result<_>>()?)
+        })
     }
 
     fn entry(
@@ -537,9 +552,12 @@ impl Compiler<'_> {
                         | SchemaKind::F32
                         | SchemaKind::F64
                 ) && matches!(Logical::compile(&view), Logical::Plain);
+                let layout = datum::PackedArray::layout(&array.items)
+                    .filter(|(kind, _)| packed && kind.matches_connect(&view.kind));
                 Shape::Array {
                     child: self.compile(&array.items, child, depth + 1),
                     packed,
+                    layout,
                 }
             }
             (Schema::Array(array), SchemaKind::Map(_, _)) => {

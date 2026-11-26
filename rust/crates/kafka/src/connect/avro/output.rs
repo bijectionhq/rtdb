@@ -148,8 +148,27 @@ pub(super) fn retarget(tape: &mut wire::Tape, target: &Schema, actual: &Schema, 
             Ok(value)
         }
         Schema::Array(target) => {
-            let (Schema::Array(actual), wire::Node::Array(mut values)) = (actual, tape.take(value)) else { return Err(invalid()); };
+            let Schema::Array(actual) = actual else { return Err(invalid()); };
             let child = match &connect.kind { SchemaKind::Array(child) => child.as_ref(), SchemaKind::Map(_, _) => connect.as_ref(), _ => return Err(invalid()) };
+            let mut values = match tape.take(value) {
+                wire::Node::Scalar(Avro::PackedArray(mut packed)) => {
+                    if let Some((kind, branches)) = datum::PackedArray::layout(&target.items)
+                        && kind == packed.kind
+                        && datum::PackedArray::layout(&actual.items) == Some((packed.kind, packed.branches))
+                        && (branches.is_none_or(|(null, _)| null.is_some()) || target_plan.unions.flatten_singleton)
+                        && (packed.values.is_empty() || depth + 1 + usize::from(branches.is_some()) <= 128)
+                        && ((child.resolved().optional && branches.is_some_and(|(null, _)| null.is_some()))
+                            || packed.values.array().is_some_and(|array| array.logical_null_count() == 0))
+                    {
+                        packed.branches = branches;
+                        tape.replace(value, wire::Node::Scalar(Avro::PackedArray(packed)));
+                        return Ok(value);
+                    }
+                    packed.into_physical_values().into_iter().map(|value| tape.physical(value)).collect()
+                }
+                wire::Node::Array(values) => values,
+                _ => return Err(invalid()),
+            };
             for id in &mut values {
                 *id = retarget(tape, &target.items, &actual.items, *id, child, target_plan, actual_plan, next_union, context, depth + 1)?;
             }

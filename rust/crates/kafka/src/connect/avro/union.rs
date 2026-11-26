@@ -51,7 +51,7 @@ impl From<&Avro> for Probe {
             Avro::Double(_) => Self::Double,
             Avro::String(_) | Avro::Utf8(_) => Self::Text,
             Avro::Bytes(bytes) | Avro::Fixed(_, bytes) => Self::Binary(bytes.len()),
-            Avro::Array(_) => Self::Array,
+            Avro::Array(_) | Avro::PackedArray(_) => Self::Array,
             Avro::Map(_) => Self::Map,
             Avro::Record(_) => Self::Record,
             _ => Self::Other,
