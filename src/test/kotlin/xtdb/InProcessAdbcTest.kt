@@ -839,19 +839,13 @@ class InProcessAdbcTest {
     }
 
     @Test
-    fun `READ WRITE, SYSTEM_TIME applies the requested system-time`() {
+    fun `READ WRITE, SYSTEM_TIME is refused because the store assigns system time`() {
         xtdb.connect().use { conn ->
             conn.begin()
-            conn.update("SET TRANSACTION READ WRITE, SYSTEM_TIME TIMESTAMP '2021-08-03T00:00:00'")
-            conn.update("INSERT INTO foo RECORDS {_id: 1}")
-            conn.commitSync()
-
-            // connection defaultTz is UTC, so a zoneless TIMESTAMP literal anchors there
-            assertEquals(
-                listOf(mapOf("_system_from" to "2021-08-03T00:00Z[UTC]")),
-                conn.select("SELECT _system_from FROM foo").map { row -> mapOf("_system_from" to row["_system_from"].toString()) },
-                "the row's system-from is the requested system-time"
-            )
+            assertThrows(Incorrect::class.java) {
+                conn.update("SET TRANSACTION READ WRITE, SYSTEM_TIME TIMESTAMP '2021-08-03T00:00:00'")
+            }
+            conn.rollbackTx()
         }
     }
 
@@ -934,27 +928,27 @@ class InProcessAdbcTest {
     fun `SET TRANSACTION READ WRITE shapes a bare begin before its first statement`() {
         xtdb.connect().use { conn ->
             conn.begin()
-            conn.update("SET TRANSACTION READ WRITE, SYSTEM_TIME = TIMESTAMP '2021-08-03T00:00:00Z'")
+            conn.update("SET TRANSACTION READ WRITE, METADATA = {source: 'mobile-app'}")
             conn.update("INSERT INTO foo RECORDS {_id: 1}")
             conn.commitSync()
 
-            assertEquals(listOf("2021-08-03T00:00Z[UTC]"), conn.systemFroms())
+            assertEquals(listOf("mobile-app"), conn.txSources())
         }
     }
 
-    private fun Xtdb.Connection.systemFroms() =
-        select("SELECT _system_from FROM foo").map { it["_system_from"].toString() }
+    private fun Xtdb.Connection.txSources() =
+        select("SELECT (user_metadata).source AS source FROM xt.txs ORDER BY _id").map { it["source"] }
 
     @Test
     fun `a later SET TRANSACTION in the same access mode keeps the options it doesn't name`() {
         xtdb.connect().use { conn ->
             conn.begin()
-            conn.update("SET TRANSACTION READ WRITE, SYSTEM_TIME = TIMESTAMP '2021-08-03T00:00:00Z'")
+            conn.update("SET TRANSACTION READ WRITE, METADATA = {source: 'mobile-app'}")
             conn.update("SET TRANSACTION READ WRITE, ASYNC = FALSE")
             conn.update("INSERT INTO foo RECORDS {_id: 1}")
             conn.commitSync()
 
-            assertEquals(listOf("2021-08-03T00:00Z[UTC]"), conn.systemFroms())
+            assertEquals(listOf("mobile-app"), conn.txSources())
         }
     }
 
@@ -988,12 +982,12 @@ class InProcessAdbcTest {
     fun `SET TRANSACTION with DEFAULT clears an option`() {
         xtdb.connect().use { conn ->
             conn.begin()
-            conn.update("SET TRANSACTION READ WRITE, SYSTEM_TIME = TIMESTAMP '2021-08-03T00:00:00Z'")
-            conn.update("SET TRANSACTION READ WRITE, SYSTEM_TIME = DEFAULT")
+            conn.update("SET TRANSACTION READ WRITE, METADATA = {source: 'mobile-app'}")
+            conn.update("SET TRANSACTION READ WRITE, METADATA = DEFAULT")
             conn.update("INSERT INTO foo RECORDS {_id: 1}")
             conn.commitSync()
 
-            assertNotEquals(listOf("2021-08-03T00:00Z[UTC]"), conn.systemFroms())
+            assertEquals(listOf(null), conn.txSources())
         }
     }
 
@@ -1001,13 +995,13 @@ class InProcessAdbcTest {
     fun `switching access mode drops the other mode's options`() {
         xtdb.connect().use { conn ->
             conn.begin()
-            conn.update("SET TRANSACTION READ WRITE, SYSTEM_TIME = TIMESTAMP '2021-08-03T00:00:00Z'")
+            conn.update("SET TRANSACTION READ WRITE, METADATA = {source: 'mobile-app'}")
             conn.update("SET TRANSACTION READ ONLY")
             conn.update("SET TRANSACTION READ WRITE")
             conn.update("INSERT INTO foo RECORDS {_id: 1}")
             conn.commitSync()
 
-            assertNotEquals(listOf("2021-08-03T00:00Z[UTC]"), conn.systemFroms())
+            assertEquals(listOf(null), conn.txSources())
         }
     }
 
@@ -1111,12 +1105,12 @@ class InProcessAdbcTest {
             conn.rollbackTx()
 
             conn.begin()
-            conn.setTransactionReadWrite(systemTime = Instant.parse("2021-08-03T00:00:00Z"))
+            conn.setTransactionReadWrite(userMetadata = mapOf("source" to "mobile-app"))
             conn.setTransactionReadWrite(async = false)
             conn.update("INSERT INTO foo RECORDS {_id: 1}")
             conn.commitSync()
 
-            assertEquals(listOf("2021-08-03T00:00Z[UTC]"), conn.systemFroms())
+            assertEquals(listOf("mobile-app"), conn.txSources())
         }
     }
 

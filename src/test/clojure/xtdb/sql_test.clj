@@ -2635,7 +2635,7 @@ SELECT PERIOD(DATE '2022-12-31', TIMESTAMP '2023-01-02') CONTAINS (DATE '2023-01
 
 (t/deftest test-sql->static-ops-non-dml-5856
   (t/are [sql] (nil? (sql/sql->static-ops sql vw/empty-args))
-    "BEGIN READ WRITE WITH (SYSTEM_TIME TIMESTAMP '2021-08-03T00:00:00Z')"
+    "BEGIN READ WRITE WITH (ASYNC = true, TIMEZONE = 'UTC')"
     "BEGIN"
     "COMMIT"
     "ROLLBACK"

@@ -103,62 +103,26 @@
                (set (xt/q *conn* "SELECT b._id, b.v FROM bar b"
                           {:default-tz (ZoneId/of "Europe/London")})))))))
 
-(t/deftest can-manually-specify-system-time-47
-  (let [tx1 (xt/execute-tx *conn* [[:put-docs :docs {:xt/id :foo}]]
-                           {:system-time #inst "2012"})
+(t/deftest a-caller-supplied-system-time-is-refused
+  (t/is (anomalous? [:incorrect :xtdb/invalid-tx-option]
+                    (xt/execute-tx *conn* [[:put-docs :docs {:xt/id :foo}]]
+                                   {:system-time #inst "2012"})))
 
-        _ (t/is (anomalous? [:incorrect nil]
-                            (xt/execute-tx *conn* [[:put-docs :docs {:xt/id :bar}]]
-                                           {:system-time #inst "2011"})))
+  (t/is (= [] (xt/q *conn* "SELECT _id FROM xt.txs"))
+        "nothing reaches the log"))
 
-        tx3 (xt/execute-tx *conn* [[:put-docs :docs {:xt/id :baz}]])]
+(t/deftest the-log-assigns-system-time-and-smooths-a-tie-past-the-latest-completed-tx
+  (tu/set-log-clock! #inst "2026-01-01")
+  (xt/execute-tx *conn* [[:sql "INSERT INTO docs (_id, v) VALUES (1, 'a')"]])
 
-    (t/is (= (serde/->TxKey 0 (time/->instant #inst "2012"))
-             tx1))
+  (tu/set-log-clock! #inst "2026-01-01")
+  (xt/execute-tx *conn* [[:sql "INSERT INTO docs (_id, v) VALUES (1, 'b')"]])
 
-    (letfn [(q-at [tx]
-              (->> (xt/q *conn* '(from :docs [{:xt/id id}])
-                         {:snapshot-time (:system-time tx)
-                          :tx-timeout (Duration/ofSeconds 1)})
-                   (into #{} (map :id))))]
+  (t/is (= [{:tx-id 0, :system-time #xt/zoned-date-time "2026-01-01T00:00Z[UTC]", :committed true}
+            {:tx-id 1, :system-time #xt/zoned-date-time "2026-01-01T00:00:00.000001Z[UTC]", :committed true}]
+           (xt/q *conn* "SELECT _id AS tx_id, system_time, committed FROM xt.txs ORDER BY _id")))
 
-      (t/is (= #{:foo} (q-at tx1)))
-      (t/is (= #{:foo :baz} (q-at tx3))))
-
-    (t/is (= #{{:tx-id 0,
-                :system-time #xt/zoned-date-time "2012-01-01T00:00Z[UTC]",
-                :committed? true}
-               {:tx-id 1,
-                :system-time #xt/zoned-date-time "2020-01-02T00:00Z[UTC]",
-                :committed? false,
-                :error #xt/error [:incorrect :invalid-system-time
-                                  "specified system-time must be later than current tx"
-                                  {:tx-key #xt/tx-key {:tx-id 1, :system-time #xt/instant "2011-01-01T00:00:00Z"}
-                                   :latest-completed-tx #xt/tx-key {:tx-id 0, :system-time #xt/instant "2012-01-01T00:00:00Z"}}]}
-               {:tx-id 2,
-                :system-time #xt/zoned-date-time "2020-01-03T00:00Z[UTC]",
-                :committed? true}}
-             (set (xt/q *conn*
-                        '(from :xt/txs [{:xt/id tx-id, :committed committed?} system-time error])))))))
-
-(t/deftest a-system-time-equal-to-the-latest-completed-tx-is-rejected
-  (xt/execute-tx *conn* [[:sql "INSERT INTO docs (_id, v) VALUES (1, 'a')"]]
-                 {:system-time #inst "2026-01-01"})
-
-  (t/is (anomalous? [:incorrect :invalid-system-time]
-                    (xt/execute-tx *conn* [[:sql "INSERT INTO docs (_id, v) VALUES (1, 'b')"]]
-                                   {:system-time #inst "2026-01-01"})))
-
-  (t/is (= [{:v "a"}] (xt/q *conn* "SELECT v FROM docs")))
-
-  (t/is (= [{:tx-id 1, :system-time #xt/zoned-date-time "2026-01-01T00:00:00.000001Z[UTC]"}]
-           (xt/q *conn* "SELECT _id AS tx_id, system_time FROM xt.txs WHERE NOT committed"))
-        "the rejected tx takes the smoothed system-time, advancing the clock past the one it asked for")
-
-  (xt/execute-tx *conn* [[:sql "INSERT INTO docs (_id, v) VALUES (1, 'c')"]]
-                 {:system-time #xt/instant "2026-01-01T00:00:00.000002Z"})
-
-  (t/is (= [{:v "c"}] (xt/q *conn* "SELECT v FROM docs"))))
+  (t/is (= [{:v "b"}] (xt/q *conn* "SELECT v FROM docs"))))
 
 (def ^:private devs
   [[:put-docs :users {:xt/id :jms, :name "James"}]
