@@ -7,7 +7,7 @@ use arrow_buffer::{Buffer, NullBuffer, NullBufferBuilder, OffsetBuffer, ScalarBu
 use arrow_schema::{DataType, Field, Schema, UnionFields, UnionMode};
 use bytes::{BufMut, Bytes};
 use prost::{Message, encoding::{WireType, encode_key, encode_varint, encoded_len_varint, key_len}};
-use rtdb_columnar::{ArrowCell, BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch, build_array, copy_array, estimate_builder_bytes, estimate_builder_bytes_refs, estimate_read_value_bytes, from_field, read_value, struct_field_cell, to_field};
+use rtdb_columnar::{ArrowCell, BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch, build_array, copy_array_refs, estimate_builder_bytes, estimate_builder_bytes_refs, estimate_read_value_bytes, from_field, read_value, struct_field_cell, to_field};
 use rtdb_format::{PROTOBUF_LOG_HEADER, envelope::{SourceBody, SourceMessage}};
 use rtdb_types::{Anomaly, EntityId, Iid, LogicalType, OrderedSet, PlacedAttempt, PlacedAttemptSeed, Result, ScalarType, SourcePosition, TableRef, TimeUnit, Timestamp, Value};
 
@@ -1341,7 +1341,7 @@ fn operation_leg(
         } else {
             let cells = || values.iter().map(|value| struct_field_cell(value, &name, &ty));
             let bound = estimate_builder_bytes_refs(&ty, cells())?;
-            arrays.column(bound, || copy_array(&ty, &cells().cloned().collect::<Vec<_>>()))?
+            arrays.column(bound, || copy_array_refs(&ty, &cells().collect::<Vec<_>>()))?
         };
         columns.push(column);
         fields.push(field);
@@ -1603,8 +1603,8 @@ fn mixed_document_struct(lists: &[SourceDocuments<'_>], length: usize, arrays: &
         columns.push(write_document_column(arrays, &field, bound, |selection, scratch| {
             lists.iter().map(|list| match list {
                 SourceDocuments::Rows(documents) => {
-                    let values = documents.rows().iter().map(|row| struct_field_cell(row, field.name(), &ty).clone()).collect::<Vec<_>>();
-                    copy_array(&ty, &values)
+                    let values = documents.rows().iter().map(|row| struct_field_cell(row, field.name(), &ty)).collect::<Vec<_>>();
+                    copy_array_refs(&ty, &values)
                 }
                 SourceDocuments::Arrow(documents) | SourceDocuments::Canonical { documents, .. } => align_document_column(documents.array(), &field, selection, scratch),
             }).collect()
@@ -3300,9 +3300,31 @@ fn invalid(message: impl Into<String>) -> Anomaly { Anomaly::incorrect("rtdb.tx/
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rtdb_columnar::copy_array;
     use rtdb_types::ListKind;
 
     fn budget() -> Arc<MemoryBudget> { MemoryBudget::new(128 * 1024 * 1024) }
+
+    #[test]
+    fn borrowed_operation_cells_build_the_columns_owned_cells_do() {
+        let values = [
+            Value::Utf8("INSERT INTO docs (_id) VALUES (1)".into()),
+            Value::list(vec![Value::I64(1), Value::Null]),
+            Value::Struct(StructFields::from([("a".into(), Value::I64(1)), ("b".into(), Value::Utf8("x".into()))])),
+        ];
+        for value in &values {
+            let ty = value.logical_type().maybe();
+            let owned = copy_array(&ty, &[value.clone(), Value::Null]).unwrap();
+            let borrowed = copy_array_refs(&ty, &[value, &Value::Null]).unwrap();
+            assert_eq!(owned.to_data(), borrowed.to_data());
+        }
+        let memory = budget();
+        let source = SourceTransaction::new(vec![
+            TxOp::Sql { sql: "INSERT INTO docs (_id) VALUES (1)".into(), args: None },
+            TxOp::Sql { sql: "INSERT INTO docs (_id) VALUES (2)".into(), args: None },
+        ], SubmitOptions::default(), &memory).unwrap();
+        assert_eq!(roundtrip(&source).encode().unwrap().as_slice(), source.encode().unwrap().as_slice());
+    }
     fn roundtrip(source: &SourceTransaction) -> SourceTransaction {
         let encoded = source.encode().unwrap();
         let message = SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
