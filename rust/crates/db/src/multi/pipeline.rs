@@ -411,7 +411,11 @@ async fn run(
                             building = true;
                             let announcements = announcements.clone();
                             tokio::spawn(async move {
-                                let prepared = builder.build(capture).await;
+                                // A failed build still reaches the pipeline, which then
+                                // accepts the next capture.
+                                let prepared = tokio::spawn(async move { builder.build(capture).await })
+                                    .await
+                                    .unwrap_or_else(|error| Err(Anomaly::fault("rtdb/checkpoint-build", error.to_string())));
                                 if let Some(input) = announcements.upgrade() {
                                     let _ = input.send(Command::AnnounceCheckpoint { prepared, reply }).await;
                                 }
