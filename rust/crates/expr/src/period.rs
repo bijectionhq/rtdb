@@ -1,6 +1,13 @@
 use crate::{EvalContext, cast};
 use crate::{compare::nullish, numeric::inapplicable};
-use rtdb_types::{LogicalType, Result, ScalarType, TimeUnit, Value};
+use rtdb_types::{Anomaly, LogicalType, Result, ScalarType, TimeUnit, Value};
+
+/// Checks the ordering of canonical microsecond period endpoints, including the infinity sentinels.
+pub fn validate_period_bounds(lower: i64, upper: i64) -> Result<()> {
+    if lower < upper { return Ok(()); }
+    Err(Anomaly::incorrect("xtdb/invalid-period", "'from' must be earlier than 'to' when constructing a period")
+        .with_context("from", lower.into()).with_context("to", upper.into()))
+}
 
 pub(crate) fn intersection(left: &Value, right: &Value) -> Option<Value> {
     let (Value::TimestampTzRange { lower: lf, upper: lt }, Value::TimestampTzRange { lower: rf, upper: rt }) = (left, right) else { return None; };

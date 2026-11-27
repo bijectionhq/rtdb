@@ -174,6 +174,14 @@ pub(crate) fn date_to_timestamp(days: i64, unit: TimeUnit, zoned: bool, timezone
     seconds.checked_mul(unit.units_per_second()).ok_or_else(overflow)
 }
 
+pub(crate) fn month_day_duration(months: i32, days: i32, nanos: i64, unit: TimeUnit) -> Result<i64> {
+    if months > 0 {
+        return Err(Anomaly::incorrect("xtdb.expression/cannot-cast-mdn-interval-with-months", "Cannot cast month-day-micro/nano intervals when month component is non-zero."));
+    }
+    let nanos = i128::from(days) * 86_400_000_000_000i128 + i128::from(nanos);
+    rescale_units(i64::try_from(nanos).map_err(|_| overflow())?, TimeUnit::Nanosecond, unit)
+}
+
 pub(crate) fn timestamp_to_time(value: i64, source: TimeUnit, unit: TimeUnit, timezone: Option<&str>) -> Result<i64> {
     let seconds = local_seconds(value, source, timezone)?;
     let nanos = seconds.rem_euclid(86_400) * 1_000_000_000
@@ -316,9 +324,7 @@ fn cast_from(value: &Value, source: &LogicalType, data_type: &LogicalType, timez
             Value::IntervalDayTime { .. } => Err(Anomaly::incorrect("xtdb.expression/invalid-cast", "Cannot cast a day-time interval to a duration").with_context("interval-unit", "day-time".into())),
             value if crate::temporal::IntervalParts::of(value).is_some() => {
                 let parts = crate::temporal::IntervalParts::of(value).ok_or_else(overflow)?;
-                if parts.months > 0 { return Err(Anomaly::incorrect("xtdb.expression/cannot-cast-mdn-interval-with-months", "Cannot cast month-day-micro/nano intervals when month component is non-zero.")); }
-                let nanos = i128::from(parts.days) * 86_400_000_000_000i128 + i128::from(parts.nanos);
-                Ok(Value::Duration { value: rescale_units(i64::try_from(nanos).map_err(|_| overflow())?, TimeUnit::Nanosecond, *unit)?, unit: *unit })
+                Ok(Value::Duration { value: month_day_duration(parts.months, parts.days, parts.nanos, *unit)?, unit: *unit })
             }
             _ => Err(inapplicable("duration", &[value])),
         },

@@ -530,10 +530,7 @@ pub(crate) fn call_resolved(function: ResolvedFunction<'_>, args: &[Value], cont
             };
             let lower = endpoint(&args[0], i64::MIN)?;
             let upper = endpoint(&args[1], i64::MAX)?;
-            if lower >= upper {
-                return Err(Anomaly::incorrect("xtdb/invalid-period", "'from' must be earlier than 'to' when constructing a period")
-                    .with_context("from", lower.into()).with_context("to", upper.into()));
-            }
+            crate::period::validate_period_bounds(lower, upper)?;
             return Ok(Value::TimestampTzRange { lower, upper });
         }
         ScalarFunction::Set => {

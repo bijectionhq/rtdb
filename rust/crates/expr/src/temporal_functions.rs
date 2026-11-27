@@ -362,6 +362,12 @@ impl RangeBins {
         NonZeroI64::new(value).ok_or_else(division_by_zero)
     }
 
+    /// Casts month-day-micro or month-day-nano stride cells with the scalar duration checks.
+    pub fn stride_parts_micros(months: i32, days: i32, nanos: i64) -> Result<NonZeroI64> {
+        let micros = crate::cast::month_day_duration(months, days, nanos, U::Microsecond)?;
+        NonZeroI64::new(micros).ok_or_else(division_by_zero)
+    }
+
     pub fn from_micros(stride: NonZeroI64, from: i64, to: i64, origin: i64) -> Self {
         let stride = stride.get();
         let base = from.wrapping_sub(origin).wrapping_div(stride).wrapping_mul(stride).wrapping_add(origin);
