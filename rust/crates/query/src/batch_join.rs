@@ -1,6 +1,6 @@
 //! Equi-joins of batch inputs on column equalities.
 //! Build rows are indexed in input order and the probe gathers its matches from the saved column positions.
-use std::{collections::VecDeque, ops::ControlFlow};
+use std::{cmp::Ordering, collections::VecDeque, ops::ControlFlow};
 use std::sync::Arc;
 
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
@@ -34,7 +34,37 @@ pub(crate) fn key_order(layout: &JoinLayout) -> Option<Vec<bool>> {
 enum ThetaOperand {
     Build(usize),
     Probe(usize),
-    Literal(Option<i128>),
+    Literal(Option<ThetaNumber>),
+}
+
+#[derive(Clone, Copy)]
+enum ThetaNumber {
+    Integer(i128),
+    Float(f64),
+}
+
+impl ThetaNumber {
+    fn from_value(value: &Value) -> Option<Self> {
+        match value {
+            Value::F32(value) => Some(Self::Float(f64::from(*value))),
+            Value::F64(value) => Some(Self::Float(*value)),
+            _ => rtdb_expr::integer(value).map(Self::Integer),
+        }
+    }
+
+    fn compare(self, other: Self, equality: bool) -> Option<Ordering> {
+        fn floats(left: f64, right: f64, equality: bool) -> Option<Ordering> {
+            if equality { return left.partial_cmp(&right); }
+            if left.is_nan() || right.is_nan() { return None; }
+            Some(left.total_cmp(&right))
+        }
+        match (self, other) {
+            (Self::Integer(left), Self::Integer(right)) => Some(left.cmp(&right)),
+            (Self::Integer(left), Self::Float(right)) => floats(left as f64, right, equality),
+            (Self::Float(left), Self::Integer(right)) => floats(left, right as f64, equality),
+            (Self::Float(left), Self::Float(right)) => floats(left, right, equality),
+        }
+    }
 }
 
 pub(crate) struct ThetaTest { left: ThetaOperand, right: ThetaOperand, op: BinaryOp }
@@ -53,27 +83,27 @@ fn date_free(ty: &LogicalType) -> bool {
 }
 
 pub(crate) fn theta_tests(layout: &JoinLayout) -> Option<Vec<ThetaTest>> {
-    fn integer(ty: &LogicalType) -> bool {
+    fn supported(ty: &LogicalType) -> bool {
         match ty {
-            LogicalType::Scalar(ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64) | LogicalType::Null => true,
-            LogicalType::Maybe(ty) => integer(ty),
+            LogicalType::Scalar(ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64 | ScalarType::F32 | ScalarType::F64)
+            | LogicalType::Null => true,
+            LogicalType::Maybe(ty) => supported(ty),
             _ => false,
         }
     }
     fn operand(layout: &JoinLayout, expr: &Expr) -> Option<ThetaOperand> {
         match expr {
             Expr::Column { id, .. } => {
-                if let Some(position) = layout.left.schema.position(*id)
-                    && integer(&layout.left.schema.fields()[position].data_type) {
-                    Some(ThetaOperand::Build(position))
+                if let Some(position) = layout.left.schema.position(*id) {
+                    supported(&layout.left.schema.fields()[position].data_type).then_some(ThetaOperand::Build(position))
                 } else {
                     let position = layout.right.schema.position(*id)?;
-                    integer(&layout.right.schema.fields()[position].data_type).then_some(ThetaOperand::Probe(position))
+                    supported(&layout.right.schema.fields()[position].data_type).then_some(ThetaOperand::Probe(position))
                 }
             }
             Expr::Literal(Value::Null) => Some(ThetaOperand::Literal(None)),
-            Expr::Literal(value) if integer(&value.logical_type()) =>
-                rtdb_expr::integer(value).map(|integer| ThetaOperand::Literal(Some(integer))),
+            Expr::Literal(value) if supported(&value.logical_type()) =>
+                ThetaNumber::from_value(value).map(|number| ThetaOperand::Literal(Some(number))),
             _ => None,
         }
     }
@@ -267,7 +297,7 @@ impl DiskJoin {
 pub(crate) struct BatchJoin { state: State, spec: Spec }
 
 struct Spec {
-    order: Vec<bool>, build_keys: Vec<usize>, probe_keys: Vec<usize>, widths: [usize; 2], kind: JoinKind,
+    order: Vec<bool>, build_keys: Vec<usize>, probe_keys: Vec<usize>, widths: [usize; 2], kind: JoinKind, count_only: bool,
     projected: [bool; 2], swapped: bool, _original_layout_charge: Option<Arc<MemoryReservation>>, theta: Vec<ThetaTest>, residual: Option<Residual>, execution: Execution,
 }
 
@@ -276,7 +306,7 @@ impl BatchJoin {
         let build_keys = layout.left.key_positions().to_vec();
         let probe_keys = layout.right.key_positions().to_vec();
         let widths = [layout.left.original.len(), layout.right.original.len()];
-        Self { state: State::Build { build, probe, layout }, spec: Spec { order, build_keys, probe_keys, widths, kind: JoinKind::Inner,
+        Self { state: State::Build { build, probe, layout }, spec: Spec { order, build_keys, probe_keys, widths, kind: JoinKind::Inner, count_only: false,
             projected, swapped: false, _original_layout_charge: None, theta: Vec::new(), residual: None, execution } }
     }
 }
@@ -289,6 +319,8 @@ impl BatchJoin {
     }
 
     pub fn with_kind(mut self, kind: JoinKind) -> Self { self.spec.kind = kind; self }
+
+    pub fn counting_rows(mut self) -> Self { self.spec.count_only = true; self }
 
     pub fn with_theta(mut self, theta: Vec<ThetaTest>) -> Self { self.spec.theta = theta; self }
     pub fn with_residual(mut self, residual: Option<Residual>) -> Self { self.spec.residual = residual; self }
@@ -414,39 +446,41 @@ impl Spec {
             JoinKind::Left | JoinKind::Right | JoinKind::Full | JoinKind::Single => return self.probe_outer(table, &probe, residual.as_ref()).await,
             _ => {}
         }
-        let mut build = JoinPositions::new();
-        let mut runs = ProbeRuns::new();
+        let mut matches = InnerMatches::new(self.count_only);
         if self.theta.is_empty() && residual.is_none() {
-            self.probe_arrow_keys(table, &probe, &mut build, &mut runs)?;
+            self.probe_arrow_keys(table, &probe, &mut matches)?;
         } else if let Some(predicates) = self.residual.as_ref().filter(|predicates| residual.is_some()
             && (self.projected == [false, false] || predicates.schema.fields().iter().all(|field| date_free(&field.data_type))))
-            && self.probe_residual_columns(table, &probe, predicates, &mut build, &mut runs).await.is_ok()
+            && self.probe_residual_columns(table, &probe, predicates, &mut matches).await.is_ok()
         {
         } else {
             // The row path also reports the error a failed column-wise pass met, as it would have met it first.
-            build = JoinPositions::new();
-            runs = ProbeRuns::new();
+            matches = InnerMatches::new(self.count_only);
             let equality = self.execution.scope()?;
             for row in 0..probe.len {
                 context.check_cancelled_at(row)?;
-                self.matching_build_rows(table, &probe, row, &equality, residual.as_ref(), |ordinal| {
-                    build.push(table.position(ordinal), &context.memory)?;
+                self.matching_build_rows(table, &probe, row, &equality, residual.as_ref(), |_, position| {
+                    matches.push(position, &context.memory)?;
                     Ok(ControlFlow::Continue(()))
                 }).await?;
-                runs.end_row(row, build.rows.len(), &context.memory)?;
+                matches.end_row(row, &context.memory)?;
             }
         }
-        self.gather_matches(build.rows.len(), Some((&probe, runs)), |position| {
-            gather_column_rows(|batch| &table.batches[batch], &build.rows, position, &context.memory)
-        })
+        match matches {
+            InnerMatches::Count(0) => Ok(None),
+            InnerMatches::Count(rows) => ColumnBatch::settled(Vec::new(), rows, context.memory.reserve(256)?).map(Some),
+            InnerMatches::Positions { build, probe: runs } => {
+                self.gather_matches(build.rows.len(), Some((&probe, runs)), |position| {
+                    gather_column_rows(|batch| &table.batches[batch], &build.rows, position, &context.memory)
+                })
+            }
+        }
     }
 
-    /// An inner join's residual over every key-matched pair of a probe batch at once: each conjunct is evaluated
-    /// column-wise over the pairs the earlier ones kept, so no pair meets a conjunct the row-at-a-time path would skip.
     /// An inner join's residual over the key-matched pairs of a probe batch, column-wise, a bounded run of probe rows at a time.
     /// As in the row path, a pair meets each conjunct until one is false; an unknown key or conjunct lets it go on,
     /// for the later conjuncts' errors, but it never matches.
-    async fn probe_residual_columns(&self, table: &Table, probe: &ColumnBatch, residual: &Residual, build: &mut JoinPositions<(usize, usize)>, runs: &mut ProbeRuns)
+    async fn probe_residual_columns(&self, table: &Table, probe: &ColumnBatch, residual: &Residual, matches: &mut InnerMatches)
         -> Result<()> {
         const PAIRS_PER_PASS: usize = 1 << 16;
         let context = &self.execution.context;
@@ -468,7 +502,7 @@ impl Spec {
                 known.push(keys);
             }
             if pairs.rows.len() >= PAIRS_PER_PASS || row + 1 == probe.len {
-                self.residual_pass(table, probe, residual, &pairs.rows, &probes.rows, &mut known, first_row..row + 1, build, runs).await?;
+                self.residual_pass(table, probe, residual, &pairs.rows, &probes.rows, &mut known, first_row..row + 1, matches).await?;
                 pairs = JoinPositions::new();
                 probes = JoinPositions::new();
                 known.clear();
@@ -480,7 +514,7 @@ impl Spec {
 
     #[allow(clippy::too_many_arguments)]
     async fn residual_pass(&self, table: &Table, probe: &ColumnBatch, residual: &Residual, pairs: &[(usize, usize)], probes: &[(usize, usize)],
-        known: &mut [bool], rows: std::ops::Range<usize>, build: &mut JoinPositions<(usize, usize)>, runs: &mut ProbeRuns) -> Result<()> {
+        known: &mut [bool], rows: std::ops::Range<usize>, matches: &mut InnerMatches) -> Result<()> {
         let memory = &self.execution.context.memory;
         let index_bytes = pairs.len().checked_mul(3 * size_of::<(usize, usize)>()).ok_or_else(size_error)?;
         let _indexes = memory.reserve(index_bytes)?;
@@ -512,10 +546,10 @@ impl Spec {
         for row in rows {
             while let Some(&pair) = kept.peek() {
                 if probes[pair].1 != row { break; }
-                build.push(pairs[pair], memory)?;
+                matches.push(pairs[pair], memory)?;
                 kept.next();
             }
-            runs.end_row(row, build.rows.len(), memory)?;
+            matches.end_row(row, memory)?;
         }
         Ok(())
     }
@@ -528,7 +562,7 @@ impl Spec {
         let equality = self.execution.scope()?;
         for row in 0..probe.len {
             context.check_cancelled_at(row)?;
-            let matched = self.matching_build_rows(table, &probe, row, &equality, residual, |_| Ok(ControlFlow::Break(()))).await?;
+            let matched = self.matching_build_rows(table, &probe, row, &equality, residual, |_, _| Ok(ControlFlow::Break(()))).await?;
             if matched != (self.kind == JoinKind::Semi) { continue; }
             if span.is_empty() {
                 span = row..row + 1;
@@ -566,7 +600,7 @@ impl Spec {
     async fn matching_build_rows(
         &self, table: &Table, probe: &ColumnBatch, row: usize, equality: &rtdb_expr::EvaluationScope,
         residual: Option<&PreparedResidual<'_>>,
-        mut accept: impl FnMut(usize) -> Result<ControlFlow<()>>,
+        mut accept: impl FnMut(usize, (usize, usize)) -> Result<ControlFlow<()>>,
     ) -> Result<bool> {
         let mut key = None;
         let mut hashed = if self.kind != JoinKind::Anti {
@@ -588,7 +622,7 @@ impl Spec {
             if let Some(residual) = residual {
                 if self.matches_residual(residual, build, offset, probe, row, equality).await? {
                     matched = true;
-                    if accept(ordinal)?.is_break() { break; }
+                    if accept(ordinal, (batch, offset))?.is_break() { break; }
                 }
                 continue;
             }
@@ -597,7 +631,7 @@ impl Spec {
             let build_key = self.key(build, offset, 0)?;
             if self.equal_keys(&build_key, probe_key, Some(equality))? && self.matches_theta(build, offset, probe, row)? {
                 matched = true;
-                if accept(ordinal)?.is_break() { break; }
+                if accept(ordinal, (batch, offset))?.is_break() { break; }
             }
         }
         Ok(matched)
@@ -647,32 +681,34 @@ impl Spec {
     }
 
     fn matches_theta(&self, build: &ColumnBatch, build_row: usize, probe: &ColumnBatch, probe_row: usize) -> Result<bool> {
-        let read = |operand| -> Result<Option<i128>> {
+        let read = |operand| -> Result<Option<ThetaNumber>> {
             let (column, row, side) = match operand {
                 ThetaOperand::Literal(value) => return Ok(value),
                 ThetaOperand::Build(position) => (&build.columns[position], build_row, 0),
                 ThetaOperand::Probe(position) => (&probe.columns[position], probe_row, 1),
             };
             match ScalarKey::read(column, row) {
-                Some(ScalarKey::Signed(value)) => Ok(Some(i128::from(value))),
+                Some(ScalarKey::Signed(value)) => Ok(Some(ThetaNumber::Integer(i128::from(value)))),
+                Some(ScalarKey::Float(value)) => Ok(Some(ThetaNumber::Float(value))),
                 Some(ScalarKey::Null) => Ok(None),
                 _ => {
                     let _scratch = self.execution.context.memory.reserve(column.bound(row)?)?;
                     let value = self.cell(column, row, side)?;
                     if matches!(value, Value::Null | Value::Undefined) { return Ok(None); }
-                    rtdb_expr::integer(&value).map(Some).ok_or_else(|| invalid("join-key", "Expected an integer comparison operand"))
+                    ThetaNumber::from_value(&value).map(Some).ok_or_else(|| invalid("join-key", "Expected a numeric comparison operand"))
                 }
             }
         };
         for test in &self.theta {
             let (Some(left), Some(right)) = (read(test.left)?, read(test.right)?) else { return Ok(false); };
+            let order = left.compare(right, matches!(test.op, BinaryOp::Eq | BinaryOp::NotEq));
             let accepted = match test.op {
-                BinaryOp::Eq => left == right,
-                BinaryOp::NotEq => left != right,
-                BinaryOp::Lt => left < right,
-                BinaryOp::LtEq => left <= right,
-                BinaryOp::Gt => left > right,
-                BinaryOp::GtEq => left >= right,
+                BinaryOp::Eq => order == Some(Ordering::Equal),
+                BinaryOp::NotEq => order != Some(Ordering::Equal),
+                BinaryOp::Lt => order == Some(Ordering::Less),
+                BinaryOp::LtEq => matches!(order, Some(Ordering::Less | Ordering::Equal)),
+                BinaryOp::Gt => order == Some(Ordering::Greater),
+                BinaryOp::GtEq => matches!(order, Some(Ordering::Greater | Ordering::Equal)),
                 _ => unreachable!("The comparison was checked"),
             };
             if !accepted { return Ok(false); }
@@ -689,11 +725,11 @@ impl Spec {
         for row in 0..probe.len {
             context.check_cancelled_at(row)?;
             let mut matched_once = false;
-            let matched = self.matching_build_rows(table, probe, row, &equality, residual, |ordinal| {
+            let matched = self.matching_build_rows(table, probe, row, &equality, residual, |ordinal, position| {
                 if matched_once && self.kind == JoinKind::Single { return Err(crate::cardinality_violation()); }
                 matched_once = true;
                 if let Some((unmatched, _)) = &mut unmatched { unmatched[ordinal] = 0; }
-                build.push_outer(Some(table.position(ordinal)), &context.memory)?;
+                build.push_outer(Some(position), &context.memory)?;
                 Ok(ControlFlow::Continue(()))
             }).await?;
             if !matched && self.preserves_probe() { build.push_outer(None, &context.memory)?; }
@@ -748,7 +784,7 @@ impl Spec {
         ColumnBatch::settled(columns, count, reservation).map(Some)
     }
 
-    fn probe_arrow_keys(&self, table: &Table, probe: &ColumnBatch, build: &mut JoinPositions<(usize, usize)>, runs: &mut ProbeRuns) -> Result<()> {
+    fn probe_arrow_keys(&self, table: &Table, probe: &ColumnBatch, matches: &mut InnerMatches) -> Result<()> {
         let context = &self.execution.context;
         for row in 0..probe.len {
             context.check_cancelled_at(row)?;
@@ -759,10 +795,10 @@ impl Spec {
                 let (batch_index, build_row) = table.position(ordinal);
                 let build_key = self.key(&table.batches[batch_index], build_row, 0)?;
                 if self.equal_keys(&build_key, &probe_key, None)? {
-                    build.push((batch_index, build_row), &context.memory)?;
+                    matches.push((batch_index, build_row), &context.memory)?;
                 }
             }
-            runs.end_row(row, build.rows.len(), &context.memory)?;
+            matches.end_row(row, &context.memory)?;
         }
         Ok(())
     }
@@ -778,6 +814,32 @@ impl Spec {
             }
         }
         Ok(!unknown)
+    }
+}
+
+enum InnerMatches {
+    Count(usize),
+    Positions { build: JoinPositions<(usize, usize)>, probe: ProbeRuns },
+}
+
+impl InnerMatches {
+    fn new(count_only: bool) -> Self {
+        if count_only { Self::Count(0) }
+        else { Self::Positions { build: JoinPositions::new(), probe: ProbeRuns::new() } }
+    }
+
+    fn push(&mut self, position: (usize, usize), memory: &Arc<MemoryBudget>) -> Result<()> {
+        match self {
+            Self::Count(count) => { *count = count.checked_add(1).ok_or_else(size_error)?; Ok(()) }
+            Self::Positions { build, .. } => build.push(position, memory),
+        }
+    }
+
+    fn end_row(&mut self, row: usize, memory: &Arc<MemoryBudget>) -> Result<()> {
+        match self {
+            Self::Count(_) => Ok(()),
+            Self::Positions { build, probe } => probe.end_row(row, build.rows.len(), memory),
+        }
     }
 }
 
@@ -826,40 +888,59 @@ struct ProbeRun {
     end: usize,
 }
 
-pub(crate) struct ProbeRuns(JoinPositions<ProbeRun>);
+pub(crate) struct ProbeRuns {
+    identity_len: usize,
+    runs: JoinPositions<ProbeRun>,
+}
 
 impl ProbeRuns {
-    fn new() -> Self { Self(JoinPositions::new()) }
+    fn new() -> Self { Self { identity_len: 0, runs: JoinPositions::new() } }
 
     fn end_row(&mut self, row: usize, end: usize, memory: &Arc<MemoryBudget>) -> Result<()> {
-        if self.0.rows.last().map_or(0, |run| run.end) == end { return Ok(()); }
-        self.0.push(ProbeRun { row, end }, memory)
+        let previous_end = self.runs.rows.last().map_or(self.identity_len, |run| run.end);
+        if previous_end == end { return Ok(()); }
+        if self.runs.rows.is_empty() && row == self.identity_len && end - previous_end == 1 {
+            self.identity_len = end;
+            return Ok(());
+        }
+        self.runs.push(ProbeRun { row, end }, memory)
     }
 
     fn run_at(&self, output_row: usize) -> usize {
-        self.0.rows.partition_point(|run| run.end <= output_row)
+        if output_row < self.identity_len
+            || self.runs.rows.last().is_some_and(|run| run.end - self.identity_len == self.runs.rows.len())
+        {
+            return output_row;
+        }
+        self.identity_len + self.runs.rows.partition_point(|run| run.end <= output_row)
+    }
+
+    fn row_at_run(&self, run: usize) -> usize {
+        if run < self.identity_len { run } else { self.runs.rows[run - self.identity_len].row }
     }
 
     pub(crate) fn input_row(&self, output_row: usize) -> usize {
-        self.0.rows[self.run_at(output_row)].row
+        self.row_at_run(self.run_at(output_row))
     }
 
     pub(crate) fn contiguous(&self, rows: &std::ops::Range<usize>) -> bool {
         let first = self.run_at(rows.start);
         let last = self.run_at(rows.end - 1);
-        last - first + 1 == rows.len() && self.0.rows[last].row - self.0.rows[first].row + 1 == rows.len()
+        last - first + 1 == rows.len() && self.row_at_run(last) - self.row_at_run(first) + 1 == rows.len()
     }
 
     pub(crate) fn owner(&self) -> Option<&Arc<MemoryReservation>> {
-        self.0.reservation.as_ref()
+        self.runs.reservation.as_ref()
     }
 
     pub(crate) fn picks(&self) -> impl Iterator<Item = Option<(usize, usize)>> + Clone + '_ {
-        self.0.rows.iter().scan(0, |start, run| {
+        let identity = (0..self.identity_len).map(|row| Some((0, row)));
+        let tail = self.runs.rows.iter().scan(self.identity_len, |start, run| {
             let count = run.end - *start;
             *start = run.end;
             Some(std::iter::repeat_n(Some((0, run.row)), count))
-        }).flatten()
+        }).flatten();
+        identity.chain(tail)
     }
 }
 
@@ -888,4 +969,25 @@ impl BatchCursor for BatchJoin {
 }
 
 fn size_error() -> rtdb_types::Anomaly { invalid("join-size", "Join output exceeds addressable memory") }
+
+#[test]
+fn join_probe_positions_keep_identity_gaps_and_fanout_in_output_order() {
+    let memory = MemoryBudget::new(1 << 20);
+    let mut rows = ProbeRuns::new();
+    rows.end_row(0, 1, &memory).unwrap();
+    rows.end_row(1, 2, &memory).unwrap();
+    assert!(rows.owner().is_none());
+    assert!(rows.contiguous(&(0..2)));
+    rows.end_row(2, 2, &memory).unwrap();
+    rows.end_row(3, 3, &memory).unwrap();
+    assert_eq!(rows.input_row(2), 3);
+    assert!(!rows.contiguous(&(1..3)));
+
+    rows.end_row(4, 5, &memory).unwrap();
+    rows.end_row(5, 6, &memory).unwrap();
+    assert_eq!((0..6).map(|row| rows.input_row(row)).collect::<Vec<_>>(), [0, 1, 3, 4, 4, 5]);
+    assert_eq!(rows.picks().flatten().map(|(_, row)| row).collect::<Vec<_>>(), [0, 1, 3, 4, 4, 5]);
+    assert!(rows.contiguous(&(2..4)));
+    assert!(!rows.contiguous(&(3..6)));
+}
 

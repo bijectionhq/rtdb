@@ -202,3 +202,79 @@ async fn an_inner_join_residual_is_evaluated_whole_for_every_key_matched_pair() 
         assert_eq!(context.memory.used_bytes(), 0);
     }
 }
+
+#[tokio::test]
+async fn float_join_residuals_distinguish_unordered_values_from_nulls_and_order_signed_zero() {
+    let left = measured(0, &[(1, Some(-0.0)), (2, Some(f64::NAN)), (3, None), (4, Some(f64::NEG_INFINITY))]);
+    let right = measured(2, &[(1, Some(0.0)), (2, Some(f64::NAN)), (3, Some(1.0)), (4, Some(f64::INFINITY))]);
+    let expr = |op| Expr::binary(BinaryOp::And,
+        Expr::binary(BinaryOp::Eq, left.schema().fields()[0].expression(), right.schema().fields()[0].expression()),
+        Expr::binary(op, left.schema().fields()[1].expression(), right.schema().fields()[1].expression()),
+    );
+    let context = context(&CancellationToken::new());
+    for (op, expected) in [(BinaryOp::NotEq, vec![2, 4]), (BinaryOp::Lt, vec![1, 4]), (BinaryOp::GtEq, vec![])] {
+        let query = join(left.clone(), right.clone(), JoinKind::Inner, expr(op));
+        let rows = collect(&query, &context).await.unwrap();
+        let keys: Vec<_> = rows.into_iter().map(|row| row[0].clone()).collect();
+        assert_eq!(keys, expected.into_iter().map(Value::I64).collect::<Vec<_>>(), "{op:?}");
+    }
+}
+
+#[tokio::test]
+async fn count_of_changed_float_values_in_a_temporal_self_join_matches_across_spill() {
+    use rtdb_index::{PartitionState, TransactionBuffer};
+    use rtdb_plan::{AggregateExpr, AggregateFunction, Catalog, QualifiedTable, Scan, TemporalFilter};
+    use rtdb_trie::TrieConfig;
+    use rtdb_types::{Interval, StructFields, TableRef, TransactionKey, TxId};
+
+    let state = PartitionState::empty(TrieConfig::default()).unwrap();
+    let memory = MemoryBudget::new(1 << 26);
+    let table = TableRef::new("public", "accounts");
+    for (version, rows) in [
+        (1, vec![(1, Some(1.0)), (2, Some(-0.0)), (3, None), (4, Some(4.0))]),
+        (2, vec![(1, Some(2.0)), (2, Some(0.0)), (3, Some(3.0)), (5, Some(5.0))]),
+    ] {
+        let mut tx = TransactionBuffer::new(state.snapshot(), TransactionKey {
+            tx_id: TxId(version), system_time: Timestamp(version * 10),
+        }, memory.clone()).unwrap();
+        for (id, value) in rows {
+            tx.put(table.clone(), StructFields::from([
+                ("_id".into(), Value::I64(id)), ("balance".into(), value.map_or(Value::Null, Value::F64)),
+            ]), Interval::ALL).unwrap();
+        }
+        state.apply(&tx.stage().unwrap()).unwrap();
+    }
+    let database = DatabaseSnapshot { partitions: vec![state.snapshot()], storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)) };
+    let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
+    let binding = catalog.table(&QualifiedTable { database: "xtdb".into(), table }).unwrap().unwrap();
+    let scan = |first, system_time| {
+        let columns = ["_id", "balance"].into_iter().enumerate().map(|(offset, name)| Field {
+            id: ColumnId(first + offset as u32), name: name.into(), qualifier: None, qualified_only: false, unnamed: false,
+            data_type: binding.columns[name].clone(),
+        }).collect();
+        Arc::new(Relation::scan(Scan { table: binding.clone(), columns, valid_time: TemporalFilter::Default, system_time,
+            clamp_valid_time: false, iids: None, predicates: vec![], top_k: None, ordered_top_k: None, matches: vec![],
+        }).unwrap())
+    };
+    let current = scan(0, TemporalFilter::Default);
+    let past = scan(2, TemporalFilter::At(Expr::Literal(Value::Timestamp {
+        value: 10, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()),
+    })));
+    let key = Expr::binary(BinaryOp::Eq, current.schema().fields()[0].expression(), past.schema().fields()[0].expression());
+    let changed = Expr::binary(BinaryOp::NotEq, current.schema().fields()[1].expression(), past.schema().fields()[1].expression());
+    let input = Arc::new(Relation::join(current, past, JoinKind::Inner, Some(Expr::binary(BinaryOp::And, key, changed))).unwrap());
+    let field = Field { id: ColumnId(4), name: "count".into(), qualifier: None, qualified_only: false, unnamed: false,
+        data_type: LogicalType::Scalar(ScalarType::I64) };
+    let aggregate = AggregateExpr { field: field.clone(), function: AggregateFunction::CountStar, argument: None,
+        distinct: false, filter: None, order_by: vec![] };
+    let query = PreparedQuery::new(Arc::new(Relation::new(Schema::new(vec![field]).unwrap(), RelationNode::Aggregate {
+        input, groups: vec![], aggregates: vec![aggregate],
+    }).unwrap())).unwrap();
+    for join_build_rows in [i64::MAX, 1] {
+        let context = QueryContext::new(catalog.clone(), memory.clone(), Timestamp(30), "UTC", QueryOptions {
+            join_build_rows, ..Default::default()
+        }, &CancellationToken::new()).unwrap();
+        assert_eq!(collect(&query, &context).await.unwrap(), [vec![Value::I64(1)]]);
+        assert_eq!(context.spill_bytes(), 0);
+    }
+}

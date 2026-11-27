@@ -2316,7 +2316,8 @@ surface QueryAccess {
         -- A grouping batch with bound scalar columns hashes each column in turn and compares same-batch key candidates through those readers.
         -- Key readers follow logical union leg names and run ends to borrow the selected scalar or vector values.
         -- URI keys retain the raw hash check and the SQL comparison of their spellings.
-        -- Arrow join pushdown retains the IID candidates of supported identity cells alongside their Bloom positions.
+        -- Arrow join pushdown retains at most 1024 distinct IID candidates of supported identity cells alongside their Bloom positions.
+        -- When an additional distinct candidate exceeds that bound, the probe scan uses the Bloom filter and the join still checks exact equality.
         -- A composite set key reads an owned scalar cell for each column that requires scalar hashing or equality.
         -- Unfiltered counts and double-precision sums and averages without DISTINCT can reduce compatible Arrow vectors and selections without materialising a row mask.
         -- A null-extended selected position contributes a row to COUNT(*) and is null for argument reductions.
@@ -2333,7 +2334,8 @@ surface QueryAccess {
         -- Scalar membership uses the raw vector hash to select candidates before comparing them.
         -- A spilled scalar membership join retains the probe payloads and the build's global null facts through Arrow partition replay.
         -- An Arrow join can evaluate a residual predicate from borrowed cells on either side while gathering the result payloads from the input batches.
-        -- Hash join fan-out shares one charged run per contributing probe row across the retained Arrow probe columns.
+        -- An inner hash join feeding only unfiltered row counts can emit batch cardinalities without gathering payload columns.
+        -- A hash join shares probe positions across the retained Arrow probe columns and represents an initial one-to-one span by its length.
         -- Join partitions retain flat and nested layouts in Arrow IPC, including selected cells whose physical fields differ.
         -- An Arrow equijoin uses the raw vector hash of compatible floating-point list keys and compares their selected components.
         -- Join, sort, membership, and materialized-relation spills replay Arrow batches under the query's spill budget, which is unlimited by default and refuses bytes past any configured limit (including zero).

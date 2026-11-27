@@ -23,11 +23,12 @@ impl BatchOutput {
 pub(crate) fn build_batch_input(
     runtime: Arc<EmittedRelation>, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, output: BatchOutput,
 ) -> futures::future::BoxFuture<'static, Result<Option<(crate::columnar::BoxBatchCursor, bool)>>> {
-    build_batch_input_with_state(runtime, execution, pushdowns, output, false)
+    build_batch_input_with_state(runtime, execution, pushdowns, output, false, false)
 }
 
 fn build_batch_input_with_state(
-    runtime: Arc<EmittedRelation>, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, output: BatchOutput, reserve_state: bool,
+    runtime: Arc<EmittedRelation>, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, output: BatchOutput,
+    reserve_state: bool, count_join_rows: bool,
 ) -> futures::future::BoxFuture<'static, Result<Option<(crate::columnar::BoxBatchCursor, bool)>>> {
     let mut build = Box::pin(async move {
         let relation = Arc::clone(runtime.relation());
@@ -46,7 +47,7 @@ fn build_batch_input_with_state(
         } else { None };
         let metadata_scan = matches!(relation.node(), RelationNode::Scan(scan) if
             crate::inspection::is_inspection(&scan.table.name.table) || crate::system_schema::definition(&scan.table.name.table).is_some());
-        let Some((mut input, projected)) = build_batches_at(runtime, execution, pushdowns, output).await? else { return Ok(None); };
+        let Some((mut input, projected)) = build_batches_at(runtime, execution, pushdowns, output, count_join_rows).await? else { return Ok(None); };
         if let Some(reservation) = reservation { input = crate::columnar::retain_batch_state(input, reservation); }
         let input = if !already_in_operator && !metadata_scan {
             let input = crate::analysis::wrap_batches(input, analysis, &context.memory);
@@ -61,6 +62,7 @@ fn build_batch_input_with_state(
 
 async fn build_batches_at(
     runtime: Arc<EmittedRelation>, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, output: BatchOutput,
+    count_join_rows: bool,
 ) -> Result<Option<(crate::columnar::BoxBatchCursor, bool)>> {
     use crate::{columnar::{BoxBatchCursor, ColumnBatch, single_batch}, sort::batches::BatchSort};
 
@@ -235,7 +237,13 @@ async fn build_batches_at(
         RelationNode::Aggregate { groups, aggregates, .. } => {
             let child = runtime.child(0)?;
             let schema = child.schema().clone();
-            let Some((input, projected)) = build_batch_input(child, execution.child(0), pushdowns, output).await? else { return Ok(None); };
+            let count_join_rows = groups.is_empty() && !aggregates.is_empty()
+                && matches!(child.relation().node(), RelationNode::Join { kind: rtdb_plan::JoinKind::Inner, .. })
+                && aggregates.iter().all(|aggregate| aggregate.function.canonical() == rtdb_plan::AggregateFunction::CountStar
+                    && aggregate.argument.is_none() && aggregate.filter.is_none() && !aggregate.distinct && aggregate.order_by.is_empty());
+            let Some((input, projected)) = build_batch_input_with_state(
+                child, execution.child(0), pushdowns, output, false, count_join_rows,
+            ).await? else { return Ok(None); };
             let (input, schema, groups) = crate::aggregate::project_group_keys(input, schema, groups, &execution)?;
             let aggregate = crate::aggregate::AggregateCursor::from_batches(input, projected, schema,
                 groups, aggregates.clone(), runtime, execution)?;
@@ -396,6 +404,7 @@ async fn build_batches_at(
             let join = crate::batch_join::BatchJoin::new(build, probe, layout, order, [projected, probe_projected], execution)
                 .swapped(original_layout_charge).with_kind(*kind)
                 .with_theta(theta).with_residual(residual);
+            let join = if count_join_rows { join.counting_rows() } else { join };
             Ok(Some((Box::new(join) as crate::columnar::BoxBatchCursor, projected || probe_projected)))
         }
     }
@@ -413,7 +422,7 @@ pub(crate) async fn build_column_pages(runtime: Arc<EmittedRelation>, execution:
 async fn build_column_output(runtime: Arc<EmittedRelation>, execution: Execution, output: BatchOutput) -> Result<Option<crate::columnar::BoxBatchCursor>> {
     execution.context.check_cancelled()?;
     if batch_shape(&runtime)?.is_none() { return Ok(None); }
-    Ok(build_batch_input_with_state(runtime, execution, None, output, true).await?.map(|(cursor, _)| cursor))
+    Ok(build_batch_input_with_state(runtime, execution, None, output, true, false).await?.map(|(cursor, _)| cursor))
 }
 
 async fn build_materialized_columns(runtime: &Arc<EmittedRelation>, binding: &Arc<rtdb_plan::MaterializedBinding>,

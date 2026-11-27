@@ -1,11 +1,35 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeSet, sync::Arc};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{bloom::BloomFilter, transit::{TransitValue, encode_msgpack}};
 use rtdb_plan::{BinaryOp, ColumnId, Expr, Field, NamedExpr, Schema};
 use rtdb_types::{EntityId, Iid, LogicalType, Result, ScalarType, Value};
 use crate::{columnar::ColumnBatch, context::Execution, invalid, scalar_key::ScalarKey};
 
-type IidEntries = BTreeMap<Iid, Arc<MemoryReservation>>;
+#[derive(Default)]
+struct IidEntries {
+    values: BTreeSet<Iid>,
+    reservation: Option<Arc<MemoryReservation>>,
+}
+
+impl IidEntries {
+    const MAX_CANDIDATES: usize = 1024;
+
+    fn insert(&mut self, iid: Iid, memory: &Arc<MemoryBudget>) -> Result<bool> {
+        if self.values.contains(&iid) { return Ok(true); }
+        let len = self.values.len();
+        if len == Self::MAX_CANDIDATES { return Ok(false); }
+        if len == 0 || len.is_power_of_two() {
+            let bytes = (len * 2).max(1) * 256;
+            if let Some(reservation) = &mut self.reservation {
+                Arc::get_mut(reservation).expect("The IID builder owns its reservation").grow_to(bytes)?;
+            } else {
+                self.reservation = Some(memory.reserve(bytes)?);
+            }
+        }
+        self.values.insert(iid);
+        Ok(true)
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EntityIdDomain { Integer, String, Keyword, Uuid }
@@ -40,19 +64,19 @@ enum IidCandidates {
 impl IidCandidates {
     fn for_probe(field: &Field) -> Option<Self> {
         match field.name.as_str() {
-            "_iid" => Some(Self::Raw(BTreeMap::new())),
+            "_iid" => Some(Self::Raw(IidEntries::default())),
             "_id" => Some(EntityIdDomain::of_type(&field.data_type)
-                .map_or(Self::UnresolvedEntity, |domain| Self::Entity(domain, BTreeMap::new()))),
+                .map_or(Self::UnresolvedEntity, |domain| Self::Entity(domain, IidEntries::default()))),
             _ => None,
         }
     }
 
-    fn entries_for(&self, field: &Field, canonical_entity_iids: bool) -> Option<&IidEntries> {
+    fn entries_for(&self, field: &Field, canonical_entity_iids: bool) -> Option<&BTreeSet<Iid>> {
         match self {
-            Self::Raw(entries) if field.name == "_iid" => Some(entries),
+            Self::Raw(entries) if field.name == "_iid" => Some(&entries.values),
             Self::Entity(domain, entries) if field.name == "_id"
-                && (canonical_entity_iids || entries.is_empty())
-                && EntityIdDomain::of_type(&field.data_type) == Some(*domain) => Some(entries),
+                && (canonical_entity_iids || entries.values.is_empty())
+                && EntityIdDomain::of_type(&field.data_type) == Some(*domain) => Some(&entries.values),
             _ => None,
         }
     }
@@ -61,7 +85,7 @@ impl IidCandidates {
         if matches!(self, Self::UnresolvedEntity) && field.name == "_id" {
             Some(0)
         } else {
-            self.entries_for(field, canonical_entity_iids).map(BTreeMap::len)
+            self.entries_for(field, canonical_entity_iids).map(BTreeSet::len)
         }
     }
 
@@ -78,10 +102,7 @@ impl IidCandidates {
             }
             _ => return Ok(false),
         };
-        if !entries.contains_key(&iid) {
-            entries.insert(iid, memory.reserve(256)?);
-        }
-        Ok(true)
+        entries.insert(iid, memory)
     }
 
     fn insert_scalar(&mut self, key: ScalarKey<'_>, memory: &Arc<MemoryBudget>) -> Result<bool> {
@@ -96,10 +117,7 @@ impl IidCandidates {
             }
             _ => return Ok(false),
         };
-        if !entries.contains_key(&iid) {
-            entries.insert(iid, memory.reserve(256)?);
-        }
-        Ok(true)
+        entries.insert(iid, memory)
     }
 }
 
@@ -148,12 +166,12 @@ impl Pushdowns {
             .is_some_and(|entries| !entries.is_empty())
     }
     pub fn iid_matches(&self, schema: &[Field], iid: Iid, canonical_entity_iids: bool) -> bool {
-        self.iid_filter(schema, canonical_entity_iids).is_none_or(|iids| iids.is_empty() || iids.contains_key(&iid))
+        self.iid_filter(schema, canonical_entity_iids).is_none_or(|iids| iids.is_empty() || iids.contains(&iid))
     }
     pub fn path_matches(&self, schema: &[Field], lower: Iid, upper: Iid, canonical_entity_iids: bool) -> bool {
         self.iid_filter(schema, canonical_entity_iids).is_none_or(|iids| iids.is_empty() || iids.range(lower..=upper).next().is_some())
     }
-    fn iid_filter(&self, schema: &[Field], canonical_entity_iids: bool) -> Option<&IidEntries> {
+    fn iid_filter(&self, schema: &[Field], canonical_entity_iids: bool) -> Option<&BTreeSet<Iid>> {
         ["_iid", "_id"].into_iter().find_map(|name| {
             let field = schema.iter().find(|field| field.name == name)?;
             self.columns.iter().find(|(id, _)| *id == field.id)?.1.iids.as_ref()?.entries_for(field, canonical_entity_iids)
@@ -378,7 +396,58 @@ mod tests {
         builder.insert_arrow(&schema, &batch, 0, &memory).unwrap();
         let filters = builder.finish(&memory).unwrap().unwrap();
         let candidates = filters.iid_filter(schema.fields(), true).unwrap();
-        assert_eq!(candidates.keys().copied().collect::<Vec<_>>(), [EntityId::keyword_iid(&spelling)]);
+        assert_eq!(candidates.iter().copied().collect::<Vec<_>>(), [EntityId::keyword_iid(&spelling)]);
+    }
+
+    #[test]
+    fn large_join_drops_the_entire_iid_filter_and_keeps_adding_to_the_bloom() {
+        use arrow_array::Int64Array;
+        use crate::columnar::Column;
+
+        let memory = MemoryBudget::new(2 << 20);
+        let logical = LogicalType::Scalar(ScalarType::I64);
+        let field = Field { id: ColumnId(0), name: "_id".into(), qualifier: None, qualified_only: false, unnamed: false,
+            data_type: logical.clone() };
+        let schema = Schema::new(vec![field.clone()]).unwrap();
+        let last = IidEntries::MAX_CANDIDATES as i64 + 1;
+        let values = (0..last).chain([0, last]).collect::<Vec<_>>();
+        let len = values.len();
+        let batch = ColumnBatch::settled(vec![Column::Arrow {
+            array: Arc::new(Int64Array::from(values)),
+            field: Arc::new(rtdb_columnar::to_field("_id", &logical).unwrap()),
+            logical: Some(logical),
+        }], len, memory.reserve(64 << 10).unwrap()).unwrap();
+        let mut builder = PushdownBuilder {
+            keys: vec![Key {
+                expression: field.expression(),
+                probe: field.id,
+                filter: ColumnFilter { bloom: Some(BloomFilter::default()), iids: IidCandidates::for_probe(&field),
+                    _reservation: memory.reserve(128 << 10).unwrap() },
+                pending: Pending::Sorted(Vec::new()),
+                recorded: RecordedIntegers::default(),
+            }],
+            _reservation: memory.reserve(1024).unwrap(),
+        };
+
+        for row in 0..IidEntries::MAX_CANDIDATES {
+            builder.insert_arrow(&schema, &batch, row, &memory).unwrap();
+        }
+        let iids = builder.keys[0].filter.iids.as_ref().unwrap();
+        assert_eq!(iids.entries_for(&field, true).unwrap().len(), IidEntries::MAX_CANDIDATES);
+        builder.insert_arrow(&schema, &batch, len - 2, &memory).unwrap();
+        assert!(builder.keys[0].filter.iids.is_some());
+        builder.insert_arrow(&schema, &batch, IidEntries::MAX_CANDIDATES, &memory).unwrap();
+        assert!(builder.keys[0].filter.iids.is_none());
+        builder.insert_arrow(&schema, &batch, len - 1, &memory).unwrap();
+
+        let filters = builder.finish(&memory).unwrap().unwrap();
+        assert!(!filters.needs_entity_iid_proof(schema.fields()));
+        for value in [0, last - 1, last, last + 1] {
+            assert!(filters.iid_matches(schema.fields(), EntityId::Integer(value).iid(), true));
+        }
+        let mut last_bloom = BloomFilter::default();
+        last_bloom.insert_value(&Value::I64(last)).unwrap();
+        assert!(filters.columns[0].1.bloom.as_ref().unwrap().intersects(&last_bloom));
     }
 
     #[test]
