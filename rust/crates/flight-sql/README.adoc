@@ -80,7 +80,9 @@ The node's PostgreSQL TLS configuration does not apply to this endpoint.
 == Queries, writes, and metadata
 
 GetFlightInfo encodes the SQL, Arrow parameters (a base64 Arrow stream), query clock, timezone and read cut in a self-contained `TicketStatementQuery` handle in the reference's `QueryTicket.Run` JSON, with the read cut as an XTDB snapshot token.
-Two RTDB-only keys are written only when they matter: `searchPath`, when it is not the default `public`, and `awaitFloor`; the reference refuses a ticket carrying either, and RTDB redeems the reference's tickets.
+When the search path differs from `public`, the ticket includes the RTDB-only `searchPath` key.
+The server awaits the issuing session's writes before capturing the cut, so ordinary tickets remain compatible with the reference after a write.
+RTDB accepts the boolean `awaitFloor` key on previously issued JSON tickets.
 A ticket issued by an earlier RTDB in its binary format is invalid.
 The server retains nothing per issued ticket, so the rate at which tickets are issued and redeemed is not bounded by `maximum_concurrent_calls`, and an unredeemed ticket holds no snapshot or catalog.
 The read cut names each database by name with its last visible system time; a database without a visible transaction, or one attached after the ticket was issued, keeps an empty cut, which later transactions do not enter.
@@ -103,6 +105,8 @@ Erased rows are no longer visible, as in the reference, and a cut that cannot be
 The SQL is re-prepared against the current catalog, so a table or column created after issue can make the redeemed schema differ from the announced one, as in the reference.
 A `SHOW` inspection executes again on each redemption, as the reference executes every ticket again, so it reports its values and errors at redemption rather than at GetFlightInfo.
 The reference redeems on the session's connection for the ticket's database; a native inspection issued in a transaction redeems on that transaction's connection, and fails as not found once the transaction has ended.
+RTDB accepts the reference's run tickets for session `SHOW` commands and evaluates them on the redeeming connection.
+The reference's run tickets for `SHOW CLOCK_TIME`, `SHOW SNAPSHOT_TOKEN`, `SHOW TIME ZONE`, and `SHOW TRANSACTION ISOLATION LEVEL` evaluate against the captured basis.
 The ticket names that transaction only through its handle masked with a keystream derived from the ticket key, the session and a per-ticket nonce.
 Flight SQL opens a columnar query cursor where the operators can provide Arrow batches.
 An index-covered ordered point read streams typed results from the posting leaves under the ticket's captured basis.
@@ -112,6 +116,7 @@ GetFlightInfo issues DML and SET once.
 An open write transaction buffers DML for commit.
 Their empty ticket sends an empty Arrow schema when redeemed and performs no further effect.
 SQL BEGIN, COMMIT, and ROLLBACK use the shared Flight SQL control rejection; transaction actions own those operations.
+An update route given a query reports the ADBC `xtdb.adbc/not-an-update` anomaly after successful preparation.
 Prepared handles are re-prepared against the current execution context on each use.
 Their parameter metadata uses positional unnamed nullable fields, and the source's field-4 `is_update` extension is retained.
 Prepared query binding retains the first Arrow batch.
@@ -136,6 +141,7 @@ The custom commit action sends the last submitted transaction result before a co
 Catalogs, schemas, tables with optional IPC schemas, table types, and the five pinned SQL-info values are exposed.
 Schema and table patterns use the Arrow LIKE kernel, including escaped wildcard characters.
 SQL-info values use the standard dense-union string and int32 legs with child-local offsets.
+The server builds the union for the requested supported codes, in code order.
 
 == Compatibility qualifications and resource accounting
 

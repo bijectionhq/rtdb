@@ -3,7 +3,7 @@ use std::sync::Arc;
 use arrow_array::{RecordBatch, builder::BinaryBuilder, cast::AsArray};
 use arrow_flight::{
     FlightData,
-    sql::{Command, CommandGetTables, SqlInfo, metadata::{SqlInfoData, SqlInfoDataBuilder}},
+    sql::{Command, CommandGetTables, SqlInfo, SqlSupportedTransaction, metadata::SqlInfoDataBuilder},
 };
 use arrow_schema::{Schema, SchemaRef};
 use bytes::Bytes;
@@ -26,21 +26,31 @@ impl Service {
             _ => Err(unsupported()),
         })
     }
-    fn sql_info(&self) -> Result<SqlInfoData, Status> {
+    fn sql_info(&self, requested: &[u32]) -> Result<RecordBatch, Status> {
+        let includes = |info: SqlInfo| requested.is_empty() || requested.contains(&(info as u32));
+        let millis = |timeout: std::time::Duration| timeout.as_millis().min(i32::MAX as u128) as i32;
         let mut builder = SqlInfoDataBuilder::new();
-        builder.append(SqlInfo::FlightSqlServerName, "XTDB");
-        builder.append(SqlInfo::FlightSqlServerVersion, rtdb_types::runtime_version());
-        builder.append(SqlInfo::FlightSqlServerTransaction, 1i32);
-        builder.append(SqlInfo::FlightSqlServerStatementTimeout, self.0.config.prepared_statement_idle_timeout.as_millis().min(i32::MAX as u128) as i32);
-        builder.append(SqlInfo::FlightSqlServerTransactionTimeout, self.0.config.transaction_idle_timeout.as_millis().min(i32::MAX as u128) as i32);
-        builder.build().map_err(arrow)
+        for (info, value) in [
+            (SqlInfo::FlightSqlServerName, "XTDB"),
+            (SqlInfo::FlightSqlServerVersion, rtdb_types::runtime_version()),
+        ] {
+            if includes(info) { builder.append(info, value); }
+        }
+        for (info, value) in [
+            (SqlInfo::FlightSqlServerTransaction, SqlSupportedTransaction::Transaction as i32),
+            (SqlInfo::FlightSqlServerStatementTimeout, millis(self.0.config.prepared_statement_idle_timeout)),
+            (SqlInfo::FlightSqlServerTransactionTimeout, millis(self.0.config.transaction_idle_timeout)),
+        ] {
+            if includes(info) { builder.append(info, value); }
+        }
+        builder.build().and_then(|info| info.record_batch([])).map_err(arrow)
     }
     pub async fn metadata_stream(&self, call: Call, command: Command) -> Result<Response<Output<FlightData>>, Status> {
         self.metadata_schema(&command).map_err(|error| call.error(error))?;
         let work = async {
             let mut charges = vec![self.memory().reserve(65_536).map_err(status)?];
             let batch = match command {
-                Command::CommandGetSqlInfo(command) => self.sql_info()?.record_batch(command.info).map_err(arrow)?,
+                Command::CommandGetSqlInfo(command) => self.sql_info(&command.info)?,
                 Command::CommandGetTableTypes(command) => { self.connection(&call, &call.database).await?; let mut builder = command.into_builder(); builder.append("TABLE"); builder.build().map_err(arrow)? }
                 Command::CommandGetCatalogs(command) => {
                     self.connection(&call, &call.database).await?;
@@ -64,9 +74,10 @@ impl Service {
                     let catalog = &context.catalog;
                     let memory = self.memory();
                     match command {
-                        Command::CommandGetDbSchemas(command) => {
+                        Command::CommandGetDbSchemas(mut command) => {
+                            let filter = command.catalog.take();
                             let mut builder = command.into_builder();
-                            for database in catalog.database_names() {
+                            for database in catalog.database_names().filter(|database| filter.as_deref().is_none_or(|name| *database == name)) {
                                 let names = catalog.table_names_reserved(database, memory).map_err(status)?;
                                 let mut previous = None;
                                 for table in names.rows() {
@@ -82,13 +93,15 @@ impl Service {
                             }
                             builder.build().map_err(arrow)?
                         }
-                        Command::CommandGetTables(command) => {
+                        Command::CommandGetTables(mut command) => {
+                            let filter = command.catalog.take();
+                            let includes_table = command.table_types.is_empty() || command.table_types.iter().any(|kind| kind == "TABLE");
                             let output_schema = command.include_schema.then(|| {
                                 CommandGetTables { include_schema: true, ..Default::default() }.into_builder().schema()
                             });
                             let mut names = CommandGetTables { include_schema: false, ..command }.into_builder();
                             let empty = Schema::empty();
-                            for database in catalog.database_names() {
+                            for database in catalog.database_names().filter(|database| includes_table && filter.as_deref().is_none_or(|name| *database == name)) {
                                 let tables = catalog.table_names_reserved(database, memory).map_err(status)?;
                                 let bytes = tables.rows().iter().try_fold(8192, |bytes, table| {
                                     let name = wire::add(database.len(), wire::add(table.schema.len(), table.table.len())?)?;

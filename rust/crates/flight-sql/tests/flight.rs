@@ -504,6 +504,7 @@ async fn ticket_carries_its_arrow_parameters_across_rebind() {
 
     let running = Running::start(None, FlightConfig::default()).await;
     let mut client = Client::connect(&running.server, None).await;
+    client.update("INSERT INTO docs (_id) VALUES (1)", None).await;
     let query = client.prepare("SELECT ? AS n", None).await;
     let command = CommandPreparedStatementQuery { prepared_statement_handle: query.prepared_statement_handle };
     client.upload(command.clone(), vec![arguments(vec![41, 99])]).await;
@@ -516,6 +517,9 @@ async fn ticket_carries_its_arrow_parameters_across_rebind() {
     let json: serde_json::Value = serde_json::from_slice(&handle).unwrap();
     assert_eq!((json["type"].as_str(), json["dbName"].as_str(), json["sql"].as_str()), (Some("run"), Some("xtdb"), Some("SELECT ? AS n")));
     assert!(json["params"].is_string() && json["basis"]["snapshotToken"].is_string() && json["basis"]["currentTime"].is_string());
+    assert_eq!(json.as_object().unwrap().len(), 5, "a prior write must not add fields unknown to XTDB");
+    let snapshot = rtdb_format::basis::decode_time_basis(json["basis"]["snapshotToken"].as_str().unwrap()).unwrap();
+    assert!(snapshot.databases["xtdb"][0].is_some(), "the issued cut includes the prior write");
 
     let text = RecordBatch::try_from_iter([("label", Arc::new(StringArray::from(vec!["new"])) as arrow_array::ArrayRef)]).unwrap();
     client.upload(command, vec![text]).await;
@@ -528,6 +532,70 @@ async fn ticket_carries_its_arrow_parameters_across_rebind() {
     assert_eq!(rows[0].column(0).as_any().downcast_ref::<StringArray>().unwrap().value(0), "new");
     let mut other = Client::connect(&running.server, None).await;
     assert_eq!(integer(&other.redeem(&info).await[0], 0, 0), 41, "another session redeems a query ticket, as the reference's QueryTicket.Run");
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn upstream_show_tickets_use_the_redeeming_session_or_the_captured_clock() {
+    use arrow_array::cast::AsArray;
+    use arrow_flight::{Ticket, sql::TicketStatementQuery};
+
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    client.update("SET application_name = 'ticket-redeemer'", None).await;
+    let info = |sql: &str| {
+        let handle = serde_json::to_vec(&serde_json::json!({
+            "type": "run", "dbName": "xtdb", "sql": sql, "params": null,
+            "basis": {
+                "currentTime": "1970-01-01T00:00:42.123Z", "defaultTz": "Europe/Paris",
+                "snapshotToken": "", "snapshotTime": null,
+            },
+        })).unwrap();
+        let ticket = TicketStatementQuery { statement_handle: handle.into() }.as_any().encode_to_vec();
+        FlightInfo { endpoint: vec![arrow_flight::FlightEndpoint {
+            ticket: Some(Ticket { ticket: ticket.into() }), ..Default::default()
+        }], ..Default::default() }
+    };
+
+    let result = client.redeem(&info("SHOW application_name")).await;
+    assert_eq!(result[0].column(0).as_string::<i32>().value(0), "ticket-redeemer");
+    let result = client.redeem(&info("SHOW CLOCK_TIME")).await;
+    assert_eq!(result[0].schema().field(0).name(), "clock_time");
+    assert_eq!(result[0].schema().field(0).data_type(), &DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("Europe/Paris".into())));
+    let clock = result[0].column(0).as_any().downcast_ref::<arrow_array::TimestampMicrosecondArray>().unwrap();
+    assert_eq!(clock.value(0), 42_123_000);
+    let result = client.redeem(&info("SHOW TIME ZONE")).await;
+    assert_eq!(result[0].column(0).as_string::<i32>().value(0), "Europe/Paris");
+
+    for sql in ["SET application_name = 'changed'", "INSERT INTO docs (_id) VALUES (1)", "SHOW rtdb_source_barrier"] {
+        let ticket = info(sql).endpoint.pop().unwrap().ticket.unwrap();
+        let error = client.client.do_get(client.request(ticket)).await.unwrap_err();
+        assert_eq!((error.code(), error.message()), (tonic::Code::InvalidArgument, "invalid ticket"));
+    }
+    let result = client.redeem(&info("SHOW application_name")).await;
+    assert_eq!(result[0].column(0).as_string::<i32>().value(0), "ticket-redeemer");
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn unnamed_duplicate_parameter_fields_bind_by_position_in_the_first_batch() {
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let prepared = client.prepare("SELECT ?::BIGINT AS first_arg, ?::BIGINT AS second_arg", None).await;
+    let schema = rtdb_format::ipc::read_schema_message(&prepared.parameter_schema).unwrap();
+    assert_eq!(schema.fields().len(), 2);
+    assert!(schema.fields().iter().all(|field| field.name().is_empty() && field.data_type() == &DataType::Null));
+    let schema = Arc::new(Schema::new(vec![Field::new("", DataType::Int64, false); 2]));
+    let batch = |left, right| RecordBatch::try_new(Arc::clone(&schema), vec![
+        Arc::new(Int64Array::from(vec![left])), Arc::new(Int64Array::from(vec![right])),
+    ]).unwrap();
+    let command = CommandPreparedStatementQuery { prepared_statement_handle: prepared.prepared_statement_handle };
+    client.upload(command.clone(), vec![batch(10, 20), batch(30, 40)]).await;
+    let request = client.request(FlightDescriptor::new_cmd(command.as_any().encode_to_vec()));
+    let info = client.client.get_flight_info(request).await.unwrap().into_inner();
+    let result = client.redeem(&info).await;
+    assert_eq!(result.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    assert_eq!((integer(&result[0], 0, 0), integer(&result[0], 1, 0)), (10, 20));
     running.stop().await;
 }
 
@@ -684,6 +752,36 @@ async fn sql_info_reports_the_server_version_that_sql_version_reports() {
 }
 
 #[tokio::test]
+async fn selected_sql_info_uses_compact_offsets_and_reports_timeouts_in_milliseconds() {
+    use arrow_array::{Int32Array, UInt32Array, UnionArray};
+    use arrow_flight::sql::{SqlInfo, SqlSupportedTransaction};
+
+    let config = FlightConfig {
+        prepared_statement_idle_timeout: Duration::from_millis(12_345),
+        transaction_idle_timeout: Duration::from_millis(23_456),
+        ..Default::default()
+    };
+    let running = Running::start(None, config).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let transaction = SqlInfo::FlightSqlServerTransaction as u32;
+    let statement_timeout = SqlInfo::FlightSqlServerStatementTimeout as u32;
+    let transaction_timeout = SqlInfo::FlightSqlServerTransactionTimeout as u32;
+    let command = CommandGetSqlInfo { info: vec![transaction_timeout, statement_timeout, transaction, u32::MAX, transaction_timeout] };
+    let request = client.request(FlightDescriptor::new_cmd(command.as_any().encode_to_vec()));
+    let info = client.client.get_flight_info(request).await.unwrap().into_inner();
+    let batches = client.redeem(&info).await;
+    let batch = &batches[0];
+    let names = batch.column(0).as_any().downcast_ref::<UInt32Array>().unwrap();
+    assert_eq!(names.values().as_ref(), &[transaction, statement_timeout, transaction_timeout]);
+    let values = batch.column(1).as_any().downcast_ref::<UnionArray>().unwrap();
+    assert_eq!(values.type_ids().as_ref(), &[3, 3, 3]);
+    assert_eq!(values.offsets().unwrap().as_ref(), &[0, 1, 2]);
+    let integers = values.child(3).as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(integers.values().as_ref(), &[SqlSupportedTransaction::Transaction as i32, 12_345, 23_456]);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn table_metadata_preserves_flight_filters_order_and_selected_schemas() {
     use arrow_array::cast::AsArray;
     use arrow_flight::sql::CommandGetDbSchemas;
@@ -743,6 +841,33 @@ async fn table_metadata_preserves_flight_filters_order_and_selected_schemas() {
     let batch = &client.redeem(&info).await[0];
     assert_eq!(batch.column(0).as_string::<i32>().iter().collect::<Vec<_>>(), [Some("xtdb"), Some("xtdb")]);
     assert_eq!(batch.column(1).as_string::<i32>().iter().collect::<Vec<_>>(), [Some("pg_catalog"), Some("public")]);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn bulk_ingest_refuses_dictionary_and_view_columns_before_submission() {
+    use arrow_array::{ArrayRef, StringViewArray, builder::StringDictionaryBuilder, types::Int8Type};
+
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let mut dictionary = StringDictionaryBuilder::<Int8Type>::new();
+    dictionary.append("dictionary").unwrap();
+    let columns: [ArrayRef; 2] = [Arc::new(dictionary.finish()), Arc::new(StringViewArray::from(vec!["view"]))];
+    for label in columns {
+        let batch = RecordBatch::try_from_iter([("_id", Arc::new(Int64Array::from(vec![1])) as ArrayRef), ("label", label)]).unwrap();
+        let schema = batch.schema();
+        let mut data = arrow_flight::utils::batches_to_flight_data(schema.as_ref(), vec![batch]).unwrap();
+        let command = CommandStatementIngest { table: "docs".into(), ..Default::default() };
+        data[0].flight_descriptor = Some(FlightDescriptor::new_cmd(command.as_any().encode_to_vec()));
+        let request = client.request(futures::stream::iter(data));
+        let error = match client.client.do_put(request).await {
+            Ok(response) => response.into_inner().try_collect::<Vec<_>>().await.unwrap_err(),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), tonic::Code::Unimplemented);
+        assert!(error.message().starts_with("Unsupported XTDB Arrow type:"));
+    }
+    assert_eq!(integer(&client.query("SELECT count(*) AS n FROM xt.txs FOR ALL VALID_TIME").await[0], 0, 0), 0);
     running.stop().await;
 }
 
@@ -1031,6 +1156,52 @@ async fn custom_commit_sends_result_with_await_token_and_durable_transaction_ide
     let tx = client.begin().await; client.update("INSERT INTO docs (_id) VALUES (1)", Some(tx.clone())).await;
     let results = client.action("xtdb.CommitTransaction", tx).await.unwrap(); assert_eq!(results.len(), 1);
     let value: serde_json::Value = serde_json::from_slice(&results[0].body).unwrap(); assert_eq!(value["committed"], true); assert!(value["txId"].is_i64()); assert!(value["systemTime"].is_string()); assert!(value["awaitToken"].is_string()); assert!(value["error"].is_null()); running.stop().await;
+}
+
+#[tokio::test]
+async fn custom_commit_returns_the_aborted_outcome_before_the_transaction_error() {
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let tx = client.begin().await;
+    client.update("ASSERT FALSE", Some(tx.clone())).await;
+    let request = client.request(Action { r#type: "xtdb.CommitTransaction".into(), body: tx.clone() });
+    let mut stream = client.client.do_action(request).await.unwrap().into_inner();
+    let outcome = stream.message().await.unwrap().unwrap();
+    let outcome: serde_json::Value = serde_json::from_slice(&outcome.body).unwrap();
+    assert_eq!(outcome["committed"], false);
+    assert_eq!(outcome["error"]["category"], "conflict");
+    let error = stream.message().await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    let anomaly = error.metadata().get_bin("xtdb-anomaly-bin").unwrap().to_bytes().unwrap();
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&anomaly).unwrap(), outcome["error"]);
+    assert_eq!(client.end(tx, false).await.unwrap_err().code(), tonic::Code::NotFound);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn update_routes_return_the_adbc_not_an_update_anomaly_for_queries() {
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let prepared = client.prepare("SELECT 1", None).await;
+    let commands = [
+        CommandStatementUpdate { query: "SELECT 1".into(), transaction_id: None }.as_any(),
+        CommandStatementUpdate { query: "SHOW application_name".into(), transaction_id: None }.as_any(),
+        CommandPreparedStatementUpdate { prepared_statement_handle: prepared.prepared_statement_handle }.as_any(),
+    ];
+    for command in commands {
+        let descriptor = FlightDescriptor::new_cmd(command.encode_to_vec());
+        let data = arrow_flight::FlightData { flight_descriptor: Some(descriptor), ..Default::default() };
+        let request = client.request(futures::stream::iter([data]));
+        let error = match client.client.do_put(request).await {
+            Ok(response) => response.into_inner().try_collect::<Vec<_>>().await.unwrap_err(),
+            Err(error) => error,
+        };
+        assert_eq!((error.code(), error.message()), (tonic::Code::InvalidArgument, "not an update"));
+        let metadata = error.metadata().get_bin("xtdb-anomaly-bin").unwrap().to_bytes().unwrap();
+        let anomaly: serde_json::Value = serde_json::from_slice(&metadata).unwrap();
+        assert_eq!(anomaly["code"], "xtdb.adbc/not-an-update");
+    }
+    running.stop().await;
 }
 
 #[tokio::test]

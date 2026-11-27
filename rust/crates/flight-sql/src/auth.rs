@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use base64::{Engine, engine::general_purpose::STANDARD};
+use base64::Engine;
 use hmac::{Hmac, Mac};
 use rtdb_auth::{Authenticator, Method};
 use rtdb_node::SessionIdentity;
@@ -9,12 +9,12 @@ use subtle::ConstantTimeEq;
 use tonic::{Request, Status};
 use uuid::Uuid;
 use zeroize::Zeroizing;
-use crate::state::{Caller, Owner};
+use crate::{protocol::XTDB_BASE64, state::{Caller, Owner}};
 
 pub(crate) const COOKIE: &str = "arrow_flight_session_id";
 fn decode_pair(encoded: &str, scheme: &str) -> Result<(Zeroizing<String>, Zeroizing<String>), Status> {
     let malformed = || unauthenticated(format!("malformed {scheme} credentials"));
-    let bytes = Zeroizing::new(STANDARD.decode(encoded).map_err(|_| malformed())?);
+    let bytes = Zeroizing::new(XTDB_BASE64.decode(encoded).map_err(|_| malformed())?);
     let decoded = std::str::from_utf8(&bytes).map_err(|_| malformed())?;
     let (user, secret) = decoded.split_once(':').filter(|(user, _)| !user.is_empty()).ok_or_else(malformed)?;
     Ok((Zeroizing::new(user.into()), Zeroizing::new(secret.into())))
@@ -84,6 +84,7 @@ pub(crate) fn unauthenticated(message: impl Into<String>) -> Status { Status::un
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::STANDARD;
 
     #[tokio::test]
     async fn label_scope_survives_flight_credential_authentication() {
@@ -165,7 +166,7 @@ mod tests {
         let mut request = Request::new(()); request.metadata_mut().insert("authorization", "  bAsIc dXNlcjo=  ".parse().unwrap());
         let Credentials::Basic { raw, user, secret } = Credentials::parse(&request).unwrap() else { panic!("basic credentials"); };
         assert_eq!(raw, "  bAsIc dXNlcjo=  "); assert_eq!(&*user, "user"); assert!(secret.is_empty());
-        request.metadata_mut().insert("authorization", "Client aWQ6c2VjcmV0OnRhaWw=".parse().unwrap());
+        request.metadata_mut().insert("authorization", "Client aWQ6c2VjcmV0OnRhaWw".parse().unwrap());
         let Credentials::Client { id, secret, .. } = Credentials::parse(&request).unwrap() else { panic!("client credentials"); };
         assert_eq!(&*id, "id"); assert_eq!(&*secret, "secret:tail");
     }
@@ -182,7 +183,7 @@ mod tests {
     #[test]
     fn authorization_parsing_matches_xtdb_whitespace_and_error_messages() {
         let mut request = Request::new(());
-        request.metadata_mut().insert("authorization", "Basic   dXNlcjpwdw==".parse().unwrap());
+        request.metadata_mut().insert("authorization", "Basic   dXNlcjpwdw".parse().unwrap());
         let Credentials::Basic { user, secret, .. } = Credentials::parse(&request).ok().unwrap() else { panic!("basic") };
         assert_eq!((user.as_str(), secret.as_str()), ("user", "pw"));
         request.metadata_mut().insert("authorization", "Bearer   tok-1".parse().unwrap());

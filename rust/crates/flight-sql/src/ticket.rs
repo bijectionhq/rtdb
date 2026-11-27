@@ -10,7 +10,7 @@ use serde_json::{Map, Value};
 use sha2::Sha256;
 use tonic::Status;
 
-use crate::{error::{invalid, status}, state::Owner, wire};
+use crate::{error::{invalid, status}, protocol::XTDB_BASE64, state::Owner, wire};
 
 const MAC_BYTES: usize = 32;
 const NONCE_BYTES: usize = 16;
@@ -46,7 +46,6 @@ pub(crate) struct TicketBasis {
     pub current_time: Instant,
     pub timezone: String,
     pub snapshot_time: Option<Timestamp>,
-    pub has_await_floor: bool,
     pub cut: Cut,
 }
 
@@ -68,7 +67,7 @@ impl TicketBasis {
             }).collect() }, None),
         };
         QueryBasis {
-            snapshot, replica_capture: None, resume_token, has_await_floor: self.has_await_floor,
+            snapshot, replica_capture: None, resume_token, has_await_floor: false,
             snapshot_time: self.snapshot_time, current_time: self.current_time, timezone: self.timezone.clone(),
         }
     }
@@ -176,10 +175,8 @@ impl Ticket {
                 object.insert("sql".into(), run.sql.clone().into());
                 object.insert("params".into(), run.params.as_ref().map_or(Value::Null, |params| STANDARD.encode(params).into()));
                 object.insert("basis".into(), query_basis.into());
-                // RTDB-only, and written only when they differ from what a ticket without them means, so that the reference's
-                // decoder, which refuses unknown keys, reads every ticket that does not depend on them.
+                // XTDB's decoder refuses unknown keys, so omit the default search path.
                 if run.search_path != default_search_path() { object.insert("searchPath".into(), run.search_path.clone().into()); }
-                if basis.has_await_floor { object.insert("awaitFloor".into(), true.into()); }
             }
         }
         let mut bytes = Vec::with_capacity(bound);
@@ -197,10 +194,10 @@ impl Ticket {
             "run" => {
                 let database = take_string(&mut object, "dbName")?;
                 let sql = take_string(&mut object, "sql")?;
-                let params = take_base64(&mut object, "params")?.map(Bytes::from);
+                let params = take_base64(&mut object, "params", &XTDB_BASE64)?.map(Bytes::from);
                 let Some(Value::Object(mut basis)) = object.remove("basis") else { return Err(invalid_ticket()); };
                 let current_time = Instant::parse_iso(&take_string(&mut basis, "currentTime")?).map_err(|_| invalid_ticket())?;
-                let timezone = take_string(&mut basis, "defaultTz")?;
+                let timezone = rtdb_expr::normalize_timezone(&take_string(&mut basis, "defaultTz")?).map_err(|_| invalid_ticket())?;
                 let snapshot_token = take_string(&mut basis, "snapshotToken")?;
                 let snapshot_time = match basis.remove("snapshotTime") {
                     Some(Value::Null) => None,
@@ -209,7 +206,7 @@ impl Ticket {
                 };
                 if !basis.is_empty() { return Err(invalid_ticket()); }
                 let search_path = match object.remove("searchPath") { None => default_search_path(), Some(value) => strings(value)? };
-                let has_await_floor = match object.remove("awaitFloor") { None => false, Some(Value::Bool(flag)) => flag, Some(_) => return Err(invalid_ticket()) };
+                if object.remove("awaitFloor").is_some_and(|flag| !flag.is_boolean()) { return Err(invalid_ticket()); }
                 let cut = match rtdb_format::basis::decode_time_basis(&snapshot_token) {
                     Ok(time_basis) => Cut::Visible(time_basis.databases.into_iter().map(|(name, times)| match times.as_slice() {
                         [through] => Ok((name, through.map(Instant::as_micros).transpose().map_err(|_| invalid_ticket())?)),
@@ -217,15 +214,15 @@ impl Ticket {
                     }).collect::<Result<_, Status>>()?),
                     Err(_) => Cut::Snapshot(snapshot_token),
                 };
-                Self::Run(QueryRun { database, sql, search_path, basis: TicketBasis { current_time, timezone, snapshot_time, has_await_floor, cut }, params })
+                Self::Run(QueryRun { database, sql, search_path, basis: TicketBasis { current_time, timezone, snapshot_time, cut }, params })
             }
             "inspect" => {
                 let database = take_string(&mut object, "dbName")?;
                 let sql = take_string(&mut object, "sql")?;
                 let search_path = strings(object.remove("searchPath").ok_or_else(invalid_ticket)?)?;
-                let nonce: [u8; NONCE_BYTES] = take_base64(&mut object, "nonce")?.and_then(|nonce| nonce.try_into().ok()).ok_or_else(invalid_ticket)?;
-                let transaction = take_base64(&mut object, "transaction")?;
-                let tag = take_base64(&mut object, "mac")?.ok_or_else(invalid_ticket)?;
+                let nonce: [u8; NONCE_BYTES] = take_base64(&mut object, "nonce", &STANDARD)?.and_then(|nonce| nonce.try_into().ok()).ok_or_else(invalid_ticket)?;
+                let transaction = take_base64(&mut object, "transaction", &STANDARD)?;
+                let tag = take_base64(&mut object, "mac", &STANDARD)?.ok_or_else(invalid_ticket)?;
                 binding.sign(&inspection_payload(&database, &nonce, transaction.as_deref(), &sql, &search_path)?).verify_slice(&tag)
                     .map_err(|_| Status::not_found("unknown query ticket"))?;
                 let transaction = transaction.map(|handle| Bytes::from(binding.mask(&nonce, &handle)));
@@ -270,10 +267,10 @@ fn take_string(object: &mut Map<String, Value>, key: &str) -> Result<String, Sta
 }
 
 /// A key that must be present, holding base64 or null.
-fn take_base64(object: &mut Map<String, Value>, key: &str) -> Result<Option<Vec<u8>>, Status> {
+fn take_base64(object: &mut Map<String, Value>, key: &str, engine: &impl Engine) -> Result<Option<Vec<u8>>, Status> {
     match object.remove(key) {
         Some(Value::Null) => Ok(None),
-        Some(Value::String(text)) => STANDARD.decode(text).map(Some).map_err(|_| invalid_ticket()),
+        Some(Value::String(text)) => engine.decode(text).map(Some).map_err(|_| invalid_ticket()),
         _ => Err(invalid_ticket()),
     }
 }
@@ -303,7 +300,7 @@ mod tests {
     fn run(cut: Cut, params: Option<Bytes>) -> Ticket {
         Ticket::Run(QueryRun {
             database: "xtdb".into(), sql: "SELECT ?".into(), search_path: vec!["public".into(), "other".into()],
-            basis: TicketBasis { current_time: Instant::new(-1, 999_999_999).unwrap(), timezone: "Europe/Paris".into(), snapshot_time: Some(Timestamp(-1)), has_await_floor: true, cut },
+            basis: TicketBasis { current_time: Instant::new(-1, 999_999_999).unwrap(), timezone: "Europe/Paris".into(), snapshot_time: Some(Timestamp(-1)), cut },
             params,
         })
     }
@@ -325,7 +322,7 @@ mod tests {
             assert_eq!((cut["empty"], cut["xtdb"]), (None, Some(Timestamp(1_234_567))));
             let basis = decoded.basis.query_basis(BTreeSet::from(["attached".to_owned()]));
             assert_eq!(basis.current_time, Instant::new(-1, 999_999_999).unwrap());
-            assert_eq!((basis.timezone.as_str(), basis.snapshot_time, basis.has_await_floor, basis.resume_token), ("Europe/Paris", Some(Timestamp(-1)), true, None));
+            assert_eq!((basis.timezone.as_str(), basis.snapshot_time, basis.resume_token), ("Europe/Paris", Some(Timestamp(-1)), None));
             assert_eq!(basis.snapshot.databases["empty"], [Some(Instant::from(Timestamp::MIN))]);
             assert_eq!(basis.snapshot.databases["xtdb"], [Some(Instant::from(Timestamp(1_234_567)))]);
             assert_eq!(basis.snapshot.databases["attached"], [Some(Instant::from(Timestamp::MIN))]);
@@ -368,7 +365,7 @@ mod tests {
         let signer = binding("session", Owner::Anonymous, b"key");
         let ticket = Ticket::Run(QueryRun {
             database: "xtdb".into(), sql: "SELECT 1".into(), search_path: vec!["public".into()],
-            basis: TicketBasis { current_time: Instant::new(1_577_836_800, 0).unwrap(), timezone: "Europe/London".into(), snapshot_time: None, has_await_floor: false,
+            basis: TicketBasis { current_time: Instant::new(1_577_836_800, 0).unwrap(), timezone: "Europe/London".into(), snapshot_time: None,
                 cut: Cut::Visible(BTreeMap::from([("xtdb".to_owned(), Some(Timestamp(1_577_836_800_000_000)))])) },
             params: Some(Bytes::from_static(b"\x01\x02\x03")),
         });
@@ -385,9 +382,25 @@ mod tests {
         assert_eq!(decoded.search_path, ["public"]);
         assert_eq!(decoded.basis.snapshot_time, Some(Timestamp(1_577_836_800_000_000)));
         assert_eq!(decoded.basis.current_time, Instant::new(1_577_836_800, 123_000_000).unwrap());
-        assert!(!decoded.basis.has_await_floor && decoded.params.is_none());
+        assert!(decoded.params.is_none());
         let Cut::Visible(cut) = decoded.basis.cut else { panic!("visible cut") };
         assert_eq!(cut["xtdb"], Some(Timestamp(1_577_836_800_000_000)));
+    }
+
+    #[test]
+    fn old_json_tickets_still_decode_and_parameter_base64_accepts_optional_padding() {
+        let signer = binding("session", Owner::Anonymous, b"key");
+        let previous_rtdb = Bytes::from_static(br#"{"type":"run","dbName":"xtdb","sql":"SELECT ?","params":"AQI","basis":{"currentTime":"2020-01-01T00:00:00Z","defaultTz":"Z","snapshotToken":"","snapshotTime":null},"awaitFloor":true}"#);
+        let Ok(Ticket::Run(decoded)) = Ticket::decode(&previous_rtdb, &signer) else { panic!("previous RTDB run ticket") };
+        assert_eq!(decoded.params.as_deref(), Some(&[1, 2][..]));
+    }
+
+    #[test]
+    fn an_unknown_ticket_timezone_is_an_invalid_ticket() {
+        let signer = binding("session", Owner::Anonymous, b"key");
+        let ticket = Bytes::from_static(br#"{"type":"run","dbName":"xtdb","sql":"SELECT 1","params":null,"basis":{"currentTime":"2020-01-01T00:00:00Z","defaultTz":"Invalid/Zone","snapshotToken":"","snapshotTime":null}}"#);
+        let error = Ticket::decode(&ticket, &signer).err().unwrap();
+        assert_eq!((error.code(), error.message()), (tonic::Code::InvalidArgument, "invalid ticket"));
     }
 
     #[test]

@@ -4,10 +4,10 @@ use arrow_schema::Schema;
 use bytes::Bytes;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_node::{ControlExecutionOptions, ControlFrontend, ControlResult, NativeSession, PreparedSql, ResultSignaturePolicy, control_schema};
-use rtdb_plan::ControlStatement;
+use rtdb_plan::{Binder, ControlStatement};
 use rtdb_query::{BoundParameters, QueryContext, QueryCursor};
 use rtdb_tx::SqlArguments;
-use rtdb_types::{Anomaly, LogicalType, Timestamp};
+use rtdb_types::{Anomaly, LogicalType, ScalarType, TimeUnit, Timestamp, Value};
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tonic::{Response, Status};
 use crate::{error::{cancelled, invalid, status}, service::{Call, Output, Service, query_ticket}, state::ConnectionResource, ticket::{Cut, Inspection, QueryRun, Ticket, TicketBasis, invalid_ticket}, wire};
@@ -117,7 +117,7 @@ impl Service {
         let token = native.state().cancellation().child_token(); let _cancel = token.clone().drop_guard();
         let options = options(native);
         if let Some(control) = rtdb_sql::parse_admitted_control_in(source, &options, self.memory()).map_err(status)? {
-            if control_schema(control.statement()).map_err(status)?.is_some() { return Err(invalid("executeUpdate does not support queries")); }
+            if control.statement().is_show() { return Err(not_an_update()); }
             return execute_control_update(native, control.statement(), arguments.as_ref(), &token, self.memory()).await;
         }
         let context = native.prepare_context(&token).await.map_err(status)?;
@@ -177,7 +177,7 @@ impl Service {
                 .map(|params| wire::parameter_ipc(params.batch(), self.memory())).transpose()?.flatten();
             let basis = TicketBasis {
                 current_time: basis.current_time, timezone: basis.timezone, snapshot_time: basis.snapshot_time,
-                has_await_floor: basis.has_await_floor, cut,
+                cut,
             };
             (schema, Ticket::Run(QueryRun { database, sql: source.to_owned(), search_path: options.search_path, basis, params }))
         };
@@ -207,25 +207,41 @@ impl Service {
         let cancel = token.clone().drop_guard();
         let options = rtdb_sql::PrepareOptions { search_path: search_path.clone(), ..Default::default() };
         let control = rtdb_sql::parse_admitted_control_in(sql, &options, self.memory()).map_err(status)?;
-        let cursor = match (&ticket, control) {
-            (Ticket::Inspect(_), Some(control)) if control_schema(control.statement()).map_err(status)?.is_some() => {
-                let output = Box::pin(native.execute_control_with(control.statement(), &[], &token, ControlExecutionOptions {
-                    frontend: ControlFrontend::FlightSql, implicit_transaction: false,
-                })).await.map_err(status)?;
+        let cursor = match (&ticket, control.as_ref().map(|control| control.statement())) {
+            (Ticket::Inspect(_), Some(statement)) if statement.is_show() => {
+                let cursor = execute_inspection(&mut native, statement, &token).await?;
                 drop(native);
-                let ControlResult::Rows(cursor) = output else { return Err(invalid("query has no result set")); };
                 cursor
             }
-            (Ticket::Run(run), None) => {
+            (Ticket::Run(run), Some(statement))
+                if run.params.is_none() && statement.is_show() && !statement.requires_read_transaction()
+                    && !matches!(statement, ControlStatement::Show { name } if name.starts_with("rtdb_")) => {
+                let cursor = execute_inspection(&mut native, statement, &token).await?;
+                drop(native);
+                cursor
+            }
+            (Ticket::Run(run), statement) => {
+                let source = match statement {
+                    None => Some(sql.as_str()),
+                    Some(ControlStatement::Show { name }) if name == "clock_time" && run.params.is_none() => None,
+                    Some(ControlStatement::Show { name }) if name == "snapshot_token" && run.params.is_none() => Some("SELECT SNAPSHOT_TOKEN AS snapshot_token"),
+                    Some(ControlStatement::Show { name }) if name == "timezone" && run.params.is_none() => Some("SELECT current_timezone() AS timezone"),
+                    Some(ControlStatement::ShowTransactionIsolationLevel) if run.params.is_none() => Some("SELECT 'read committed' AS transaction_isolation"),
+                    _ => return Err(invalid_ticket()),
+                };
                 let databases = self.0.node.catalog().database_names();
                 let context = Box::pin(native.query_context_at(&run.basis.query_basis(databases), &token)).await.map_err(status)?;
                 drop(native);
-                let prepared = PreparedSql::prepare(sql, &context, options, ResultSignaturePolicy::Dynamic).map_err(status)?;
-                if prepared.is_dml() { return Err(invalid_ticket()); }
-                let params = run.params.as_ref()
-                    .map(|bytes| wire::BoundParameters::new(wire::parameter_batch(bytes, self.memory())?, self.memory())).transpose()?;
-                let deadline = context.retention_deadline().map(tokio::time::Instant::from);
-                within(deadline, Box::pin(open_query(&prepared, context, params.as_deref(), self.memory()))).await?
+                if let Some(source) = source {
+                    let prepared = PreparedSql::prepare(source, &context, options, ResultSignaturePolicy::Dynamic).map_err(status)?;
+                    if prepared.is_dml() { return Err(invalid_ticket()); }
+                    let params = run.params.as_ref()
+                        .map(|bytes| wire::BoundParameters::new(wire::parameter_batch(bytes, self.memory())?, self.memory())).transpose()?;
+                    let deadline = context.retention_deadline().map(tokio::time::Instant::from);
+                    within(deadline, Box::pin(open_query(&prepared, context, params.as_deref(), self.memory()))).await?
+                } else {
+                    clock_cursor(context)?
+                }
             }
             _ => return Err(invalid_ticket()),
         };
@@ -283,6 +299,26 @@ impl Service {
         let mut response = Response::new(stream); *response.metadata_mut() = headers; Ok(response)
     }
 }
+
+async fn execute_inspection(native: &mut NativeSession, statement: &ControlStatement, token: &CancellationToken) -> Result<QueryCursor, Status> {
+    let output = Box::pin(native.execute_control_with(statement, &[], token, ControlExecutionOptions {
+        frontend: ControlFrontend::FlightSql, implicit_transaction: false,
+    })).await.map_err(status)?;
+    let ControlResult::Rows(cursor) = output else { return Err(invalid_ticket()); };
+    Ok(cursor)
+}
+
+fn clock_cursor(context: Arc<QueryContext>) -> Result<QueryCursor, Status> {
+    let reservation = context.memory.reserve(8192).map_err(status)?;
+    let timezone = Some(context.timezone.clone());
+    let unit = TimeUnit::Microsecond;
+    let ty = LogicalType::Scalar(ScalarType::Timestamp { unit, timezone: timezone.clone() });
+    let field = Binder::default().field("clock_time", None, ty).map_err(status)?;
+    let schema = rtdb_plan::Schema::new(vec![field]).map_err(status)?;
+    let value = Value::Timestamp { value: context.current_time.as_micros().map_err(status)?.0, unit, timezone };
+    QueryCursor::from_rows(schema, vec![vec![value]], context, reservation).map_err(status)
+}
+
 async fn execute_control_update(native: &mut NativeSession, control: &ControlStatement, arguments: Option<&SqlArguments>, token: &CancellationToken, memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<(), Status> {
     let options = ControlExecutionOptions { frontend: ControlFrontend::FlightSql, implicit_transaction: false };
     let result = if let Some(arguments) = arguments && let Some(page) = arguments.first_arrow_page() {
@@ -299,11 +335,14 @@ async fn execute_control_update(native: &mut NativeSession, control: &ControlSta
 }
 
 async fn execute_prepared_update(native: &mut NativeSession, prepared: &PreparedSql, arguments: Option<SqlArguments>) -> Result<(), Status> {
+    if !prepared.is_dml() { return Err(not_an_update()); }
     let operation = prepared.dml_operation(arguments).map_err(status)?;
     if let Some(result) = Box::pin(native.state_mut().execute_operation(operation)).await.map_err(status)? {
         if let Some(error) = result.error() { return Err(status(error.clone())); }
     }
     Ok(())
 }
+
+fn not_an_update() -> Status { status(Anomaly::incorrect("xtdb.adbc/not-an-update", "not an update")) }
 
 pub(crate) fn options(native: &NativeSession) -> rtdb_sql::PrepareOptions { rtdb_sql::PrepareOptions { search_path: native.state().parameter("search_path").unwrap_or("public").split(',').map(|name| name.trim().trim_matches('"').to_owned()).collect(), ..Default::default() } }
