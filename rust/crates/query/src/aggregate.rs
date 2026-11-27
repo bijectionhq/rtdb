@@ -349,6 +349,17 @@ impl AggregateCursor {
         for (((column, aggregate), field), types) in columns.into_iter().zip(&self.aggregates).zip(fields).zip(self.runtime.aggregates()?) {
             context.check_cancelled()?;
             let mut states = match column.accumulation {
+                Accumulation::Counts(mut counts) => {
+                    counts.ensure(batch.len)?;
+                    for _ in (0..batch.len).step_by(1024) {
+                        context.check_cancelled()?;
+                    }
+                    let logical = field.data_type.clone();
+                    let field = Arc::new(rtdb_columnar::to_field(&field.name, &logical)?);
+                    let array = Arc::new(arrow_array::Int64Array::from(counts.values));
+                    batch.append_column(Column::Arrow { array, field, logical: Some(logical) }, counts.reservation, &context.memory)?;
+                    continue;
+                }
                 Accumulation::Scalar(states) => states,
                 Accumulation::Vectors(vectors) => {
                     validate_collection_order(aggregate, types, &self.schema, &self.execution)?;
@@ -366,14 +377,6 @@ impl AggregateCursor {
                 .and_then(|bytes| bytes.checked_add(512)).ok_or_else(|| invalid("aggregate-size", "Aggregate output exceeds addressable memory"))?;
             let reservation = context.memory.reserve(bytes)?;
             let array: arrow_array::ArrayRef = match aggregate.function {
-                AggregateFunction::Count | AggregateFunction::CountStar => {
-                    let mut counts = Vec::with_capacity(batch.len);
-                    for (index, state) in states.values.iter().enumerate() {
-                        context.check_cancelled_at(index)?;
-                        counts.push(state.count);
-                    }
-                    Arc::new(arrow_array::Int64Array::from(counts))
-                }
                 AggregateFunction::Sum | AggregateFunction::Average
                     if without_nullability(&field.data_type) == &LogicalType::Scalar(ScalarType::F64) => {
                     let mut sums = Vec::with_capacity(batch.len);
@@ -410,7 +413,7 @@ impl AggregateCursor {
                     let mut values = Vec::with_capacity(batch.len);
                     for (row, state) in states.values.iter().enumerate() {
                         context.check_cancelled_at(row)?;
-                        let value = state.finish(aggregate, &scope)?;
+                        let value = state.finish(aggregate, types.output_type(), &scope)?;
                         lease.grow_to(lease.bytes().checked_add(value.retained_bytes()?)
                             .ok_or_else(|| invalid("aggregate-size", "Aggregate output exceeds addressable memory"))?)?;
                         values.push(value);
@@ -473,6 +476,24 @@ fn accepts_typed_column(column: &Column, accepts_type: impl Fn(&DataType) -> boo
 
 fn present_column_cell(column: &Column, row: usize) -> Result<Option<(&dyn Array, usize)>> {
     let cell = column.arrow_cell(row).ok_or_else(|| invalid("column-row", "Column row is outside its page"))?;
+    present_arrow_cell(cell)
+}
+
+fn present_column_cells(column: &Column) -> impl Iterator<Item = Result<Option<(&dyn Array, usize)>>> + '_ {
+    let mut selected = match column {
+        Column::Selected(column) => Some(column.arrow_cells()),
+        _ => None,
+    };
+    (0..).map(move |row| match &mut selected {
+        Some(cells) => {
+            let cell = cells.next().ok_or_else(|| invalid("column-row", "Column row is outside its page"))?;
+            present_arrow_cell(cell)
+        }
+        None => present_column_cell(column, row),
+    })
+}
+
+fn present_arrow_cell<'a>(cell: Option<(&'a dyn Array, &arrow_schema::Field, Option<&LogicalType>, usize)>) -> Result<Option<(&'a dyn Array, usize)>> {
     let Some((array, _, _, offset)) = cell else { return Ok(None); };
     if offset >= array.len() {
         return Err(rtdb_types::Anomaly::incorrect("rtdb/array-layout", "Arrow array and logical field layout disagree"));
@@ -507,16 +528,19 @@ impl AggregateCursor {
         let float = LogicalType::Scalar(ScalarType::F64);
         for ((column,aggregate),types) in columns.iter_mut().zip(&self.aggregates).zip(types) {
             validate_aggregate_input(aggregate,types)?;
-            let Accumulation::Scalar(states) = &mut column.accumulation else { return Err(invalid("aggregate-input","A typed aggregate collects its rows")) };
-            states.ensure(group_count)?;
             let argument = aggregate.argument.as_ref().map(|argument|argument_position(argument,&self.schema)).transpose()?;
-            match (&aggregate.function,argument) {
-                (A::CountStar,_) => for (row, group) in mapping.iter().enumerate() {
-                    self.execution.context.check_cancelled_at(row)?;
-                    states.values[group].count = states.values[group].count.wrapping_add(1);
-                },
-                (A::Count,Some(position)) => {
+            match (&aggregate.function, argument, &mut column.accumulation) {
+                (A::CountStar, _, Accumulation::Counts(counts)) => {
+                    counts.ensure(group_count)?;
+                    for (row, group) in mapping.iter().enumerate() {
+                        self.execution.context.check_cancelled_at(row)?;
+                        counts.values[group] = counts.values[group].wrapping_add(1);
+                    }
+                }
+                (A::Count, Some(position), Accumulation::Counts(counts)) => {
+                    counts.ensure(group_count)?;
                     let column = &batch.columns[position];
+                    let mut cells = present_column_cells(column);
                     let direct = match column {
                         Column::Arrow { array, .. } if array.len() >= batch.len && array.data_type() != &DataType::Null => Some(array.as_ref()),
                         _ => None,
@@ -525,13 +549,15 @@ impl AggregateCursor {
                         self.execution.context.check_cancelled_at(row)?;
                         let present = match direct {
                             Some(array) => !array.is_null(row),
-                            None => present_column_cell(column, row)?.is_some(),
+                            None => cells.next().expect("The reader reports missing cells")?.is_some(),
                         };
-                        if present { states.values[group].count = states.values[group].count.wrapping_add(1); }
+                        if present { counts.values[group] = counts.values[group].wrapping_add(1); }
                     }
                 }
-                (A::Sum | A::Average,Some(position)) => {
+                (A::Sum | A::Average, Some(position), Accumulation::Scalar(states)) => {
+                    states.ensure(group_count)?;
                     let column = &batch.columns[position];
+                    let mut cells = present_column_cells(column);
                     let direct = match column {
                         Column::Arrow { array, .. } if array.len() >= batch.len =>
                             array.as_any().downcast_ref::<arrow_array::Float64Array>(),
@@ -542,7 +568,8 @@ impl AggregateCursor {
                         self.execution.context.check_cancelled_at(row)?;
                         let value = match direct {
                             Some(array) => (!array.is_null(row)).then(|| array.value(row)),
-                            None => present_column_cell(column, row)?.map(|(array, offset)| array.as_primitive::<Float64Type>().value(offset)),
+                            None => cells.next().expect("The reader reports missing cells")?
+                                .map(|(array, offset)| array.as_primitive::<Float64Type>().value(offset)),
                         };
                         let Some(value) = value else { continue; };
                         let state = &mut states.values[group];
@@ -612,13 +639,18 @@ impl DistinctSeen {
                 Self::FirstBatch => unreachable!(),
             }
         }
+        if let Self::Columns(index) = self {
+            index.finish_distinct_argument(retained_source, &execution.context)?;
+        }
         Ok(())
     }
 }
-enum Accumulation { Scalar(ScalarGroups), Vectors(CollectionVectors) }
+enum Accumulation { Counts(GroupStates<i64>), Scalar(ScalarGroups), Vectors(CollectionVectors) }
 impl AggregateColumn {
     fn new(aggregate: &AggregateExpr,schema: &Schema,execution: &Execution) -> Result<Self> {
         let accumulation = match aggregate.function {
+            AggregateFunction::Count | AggregateFunction::CountStar =>
+                Accumulation::Counts(GroupStates::new(execution)?),
             AggregateFunction::ArrayAgg | AggregateFunction::VecAgg | AggregateFunction::Percentile { .. } => {
                 let order = CollectionOrder::new(aggregate, schema)?;
                 Accumulation::Vectors(CollectionVectors::new(&execution.context.memory, order)?)
@@ -652,6 +684,16 @@ impl AggregateColumn {
         }
         validate_aggregate_input(aggregate,types)?;
         match &mut self.accumulation {
+            Accumulation::Counts(counts) => {
+                counts.ensure(group_count)?;
+                let all = aggregate.function == AggregateFunction::CountStar;
+                for (row, (group, selected)) in mapping.iter().zip(&mask).enumerate() {
+                    execution.context.check_cancelled_at(row)?;
+                    if *selected && (all || !input.is_null(row, argument)?) {
+                        counts.values[group] = counts.values[group].wrapping_add(1);
+                    }
+                }
+            }
             Accumulation::Scalar(states) => {
                 states.aggregate(input,mapping,&mask,group_count,argument,aggregate,types,&scope,execution)?;
             }
@@ -1158,9 +1200,13 @@ impl<'a> NumericColumn<'a> {
     }
 }
 
-/// Per-group scalar states, charged to `state`, the query budget.
-struct ScalarGroups { values: Vec<ScalarAccumulator>, state: Arc<rtdb_columnar::MemoryBudget>, reservation: Arc<rtdb_columnar::MemoryReservation> }
-impl ScalarGroups {
+struct GroupStates<T> {
+    values: Vec<T>,
+    state: Arc<rtdb_columnar::MemoryBudget>,
+    reservation: Arc<MemoryReservation>,
+}
+
+impl<T: Default> GroupStates<T> {
     fn new(execution: &Execution) -> Result<Self> {
         let state = Arc::clone(&execution.context.memory);
         let reservation = state.reserve(0)?;
@@ -1168,13 +1214,19 @@ impl ScalarGroups {
     }
     fn ensure(&mut self,count: usize) -> Result<()> {
         if self.values.len() >= count { return Ok(()); }
-        let bytes = count.checked_mul(std::mem::size_of::<ScalarAccumulator>()).ok_or_else(||invalid("aggregate-size","Aggregate group accumulator capacity overflow"))?;
+        let bytes = count.checked_mul(size_of::<T>())
+            .ok_or_else(|| invalid("aggregate-size", "Aggregate group accumulator capacity overflow"))?;
         let reservation = self.state.reserve(bytes)?;
         self.values.reserve_exact(count - self.values.len());
-        self.values.resize_with(count,ScalarAccumulator::default);
+        self.values.resize_with(count, T::default);
         self.reservation = reservation;
         Ok(())
     }
+}
+
+type ScalarGroups = GroupStates<ScalarAccumulator>;
+
+impl ScalarGroups {
     fn aggregate(&mut self,page: Rows<'_>,mapping: GroupMapping<'_>,mask: &[bool],group_count: usize,argument: Option<usize>,aggregate: &AggregateExpr,types: &AggregateTypes,scope: &rtdb_expr::EvaluationScope,execution: &Execution) -> Result<()> {
         use AggregateFunction as A;
         match aggregate.function {
@@ -1182,7 +1234,7 @@ impl ScalarGroups {
                 let summer = SumFactory::new(&types.input,types.output_type())?;
                 self.ensure(group_count)?;
                 self.sum_page(page,mapping,mask,argument,&summer,execution)?;
-                if aggregate.function == A::Average { self.count_page(page,mapping,mask,argument,false,execution)?; }
+                if aggregate.function == A::Average { self.count_page(page,mapping,mask,argument,execution)?; }
             }
             A::VariancePopulation | A::VarianceSample | A::StddevPopulation | A::StddevSample => {
                 let squares = square_column(page,argument,&types.input,scope,execution)?;
@@ -1197,24 +1249,31 @@ impl ScalarGroups {
                         state.squares = Some(state.squares.map_or(value,|previous|previous + value));
                     } }
                 }
-                self.count_page(page,mapping,mask,argument,false,execution)?;
-            }
-            A::Count | A::CountStar => {
-                self.ensure(group_count)?;
-                self.count_page(page,mapping,mask,argument,aggregate.function == A::CountStar,execution)?;
+                self.count_page(page,mapping,mask,argument,execution)?;
             }
             _ => {
                 self.ensure(group_count)?;
-                let extrema = matches!(aggregate.function, A::Min | A::Max).then(|| {
+                let extremum = matches!(aggregate.function, A::Min | A::Max);
+                let minimum = aggregate.function == A::Min;
+                let extrema = extremum.then(|| {
                     NumericColumn::bind(page.arrow_column(argument)?, Some(types.output_type()))
                 }).flatten();
+                let text = page.arrow_column(argument).filter(|column| {
+                    extremum && without_nullability(types.output_type()) == &LogicalType::Scalar(ScalarType::Utf8)
+                        && accepts_typed_column(column, |ty| *ty == DataType::Utf8)
+                });
                 for (row,(group,selected)) in mapping.iter().zip(mask).enumerate() {
                     execution.context.check_cancelled_at(row)?;
                     if *selected {
                         let state = &mut self.values[group];
                         if let Some(column) = &extrema {
                             if let Some(value) = column.get(row) {
-                                state.numeric_extremum(value, types.output_type(), aggregate.function == A::Min, &self.state)?;
+                                state.numeric_extremum(value, types.output_type(), minimum, &self.state)?;
+                            }
+                        } else if let Some(column) = text {
+                            if let Some((array, offset)) = present_column_cell(column, row)? {
+                                let value = array.as_string::<i32>().value(offset);
+                                state.text_extremum(value, minimum, &self.state)?;
                             }
                         } else {
                             let value = page.value(row,argument)?;
@@ -1230,6 +1289,13 @@ impl ScalarGroups {
         let _scratch = execution.context.memory.reserve(4096)?;
         let numeric = matches!(summer.output, LogicalType::Scalar(ScalarType::I32 | ScalarType::I64 | ScalarType::F32 | ScalarType::F64))
             .then(|| NumericColumn::bind(page.arrow_column(argument)?, None)).flatten();
+        let decimal = match (without_nullability(summer.input), page.arrow_column(argument)) {
+            (LogicalType::Scalar(ScalarType::Decimal { scale, bit_width: 128, .. }), Some(column))
+                if accepts_typed_column(column, |ty| {
+                    matches!(ty, DataType::Decimal128(_, storage_scale) if i32::from(*storage_scale) == *scale)
+                }) => Some((column, *scale)),
+            _ => None,
+        };
         for (index,(group,selected)) in mapping.iter().zip(mask).enumerate() {
             execution.context.check_cancelled_at(index)?;
             if !*selected { continue; }
@@ -1240,15 +1306,35 @@ impl ScalarGroups {
                 }
                 continue;
             }
+            if let Some((column, input_scale)) = decimal {
+                let coefficient = || Ok::<_, rtdb_types::Anomaly>(present_column_cell(column, index)?
+                    .map(|(array, offset)| array.as_primitive::<Decimal128Type>().value(offset)));
+                match summer.output {
+                    LogicalType::Scalar(ScalarType::F64) => {
+                        if let Some(coefficient) = coefficient()? {
+                            let value = rtdb_types::jvm_number::decimal_bytes_to_f64(&coefficient.to_be_bytes(), input_scale);
+                            state.add_numeric(NumericCell::Float64(value), summer.output)?;
+                        }
+                        continue;
+                    }
+                    LogicalType::Scalar(ScalarType::Decimal { scale, bit_width: 128, .. })
+                        if *scale == input_scale && *scale >= 0 && !matches!(state.accumulator, ScalarState::Retained(_)) =>
+                    {
+                        state.add_decimal128(coefficient()?.unwrap_or(0))?;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
             let value = page.value(index,argument)?;
             summer.add(state, value.as_ref(), index, &self.state)?;
         }
         Ok(())
     }
-    fn count_page(&mut self,page: Rows<'_>,mapping: GroupMapping<'_>,mask: &[bool],argument: Option<usize>,all: bool,execution: &Execution) -> Result<()> {
+    fn count_page(&mut self,page: Rows<'_>,mapping: GroupMapping<'_>,mask: &[bool],argument: Option<usize>,execution: &Execution) -> Result<()> {
         for (row,(group,selected)) in mapping.iter().zip(mask).enumerate() {
             execution.context.check_cancelled_at(row)?;
-            if *selected && (all || !page.is_null(row,argument)?) {
+            if *selected && !page.is_null(row,argument)? {
                 let state = &mut self.values[group];
                 state.count = state.count.wrapping_add(1);
             }
@@ -1264,6 +1350,8 @@ enum ScalarState {
     I64(i64),
     F32(f32),
     F64(f64),
+    Duration(i64, rtdb_types::TimeUnit),
+    Decimal128([u8; 16]),
     Retained(OwnedRow),
 }
 
@@ -1279,6 +1367,34 @@ impl ScalarState {
 #[derive(Default)]
 struct ScalarAccumulator { count: i64, accumulator: ScalarState, squares: Option<f64> }
 impl ScalarAccumulator {
+    fn add_decimal128(&mut self, coefficient: i128) -> Result<()> {
+        let sum = match self.accumulator {
+            ScalarState::Empty => coefficient,
+            ScalarState::Decimal128(sum) => i128::from_ne_bytes(sum).checked_add(coefficient).ok_or_else(|| {
+                rtdb_types::Anomaly::incorrect("xtdb.expression/overflow-error", "data exception - overflow error")
+            })?,
+            _ => return Err(sum_state()),
+        };
+        self.accumulator = ScalarState::Decimal128(sum.to_ne_bytes());
+        Ok(())
+    }
+
+    fn text_extremum(&mut self, text: &str, minimum: bool, memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<()> {
+        if let Some(previous) = self.accumulator.retained() {
+            let Value::Utf8(previous) = previous else {
+                return Err(invalid("aggregate-state", "Expected a text extremum"));
+            };
+            if text.as_bytes().cmp(previous.as_bytes()) != if minimum { Ordering::Less } else { Ordering::Greater } {
+                return Ok(());
+            }
+        }
+        let bytes = text.len().checked_add(size_of::<Value>() + 256)
+            .ok_or_else(|| invalid("aggregate-size", "Text aggregate state exceeds addressable memory"))?;
+        let reservation = memory.reserve(bytes)?;
+        self.accumulator = ScalarState::Retained(OwnedRow::with_reservation(vec![Value::Utf8(text.to_owned())], reservation)?);
+        Ok(())
+    }
+
     fn add_numeric(&mut self, value: NumericCell, output: &LogicalType) -> Result<()> {
         use ScalarState as S;
         self.accumulator = match (output, &mut self.accumulator, value) {
@@ -1382,14 +1498,13 @@ impl ScalarAccumulator {
         Some(if matches!(function, A::StddevPopulation | A::StddevSample) { variance.sqrt() } else { variance })
     }
 
-    fn finish(&self,aggregate: &AggregateExpr,output: &rtdb_expr::EvaluationScope) -> Result<Value> {
+    fn finish(&self,aggregate: &AggregateExpr,ty: &LogicalType,output: &rtdb_expr::EvaluationScope) -> Result<Value> {
         use AggregateFunction as A;
         if let Some(value) = self.accumulator.retained() { output.reserve(value.retained_bytes()?)?; }
         let value = match &aggregate.function {
-            A::Count | A::CountStar => Value::I64(self.count),
             A::Average if self.count == 0 => Value::Null,
-            A::Average => match self.accumulator.retained() {
-                Some(Value::Duration { value, unit }) => Value::Duration { value: value.wrapping_div(self.count), unit: *unit },
+            A::Average => match self.accumulator {
+                ScalarState::Duration(value, unit) => Value::Duration { value: value.wrapping_div(self.count), unit },
                 _ => self.average_double().map_or(Value::Null, Value::F64),
             },
             A::VariancePopulation | A::VarianceSample | A::StddevPopulation | A::StddevSample =>
@@ -1400,6 +1515,12 @@ impl ScalarAccumulator {
                 ScalarState::I64(sum) => Value::I64(*sum),
                 ScalarState::F32(sum) => Value::F32(*sum),
                 ScalarState::F64(sum) => Value::F64(*sum),
+                ScalarState::Duration(value, unit) => Value::Duration { value: *value, unit: *unit },
+                ScalarState::Decimal128(coefficient) => {
+                    let Some((precision, scale, 128)) = decimal_type(ty) else { return Err(sum_state()); };
+                    output.reserve(16)?;
+                    Value::Decimal(decimal128_value(i128::from_ne_bytes(*coefficient), precision, scale)?)
+                }
                 ScalarState::Retained(row) => row.values[0].clone(),
             },
         };
@@ -1431,6 +1552,9 @@ fn decimal_type(logical: &LogicalType) -> Option<(i32, i32, u16)> {
 }
 fn decimal_value(value: &Value) -> Result<&rtdb_types::DecimalValue> {
     if let Value::Decimal(value) = value { Ok(value) } else { Err(invalid("decimal-sum", "Reference decimal SUM accepts decimal input vectors")) }
+}
+fn decimal128_value(coefficient: i128, precision: i32, scale: i32) -> Result<rtdb_types::DecimalValue> {
+    rtdb_types::DecimalValue::new(coefficient.to_be_bytes().to_vec(), precision, scale, 128)
 }
 fn validate_aggregate_input(aggregate: &AggregateExpr, types: &AggregateTypes) -> Result<()> {
     if matches!(aggregate.function, AggregateFunction::Min | AggregateFunction::Max)
@@ -1466,7 +1590,6 @@ impl<'a> SumFactory<'a> {
         }
         if null && !matches!((without_nullability(self.input),self.output),
             (LogicalType::Scalar(S::Decimal { .. }),LogicalType::Scalar(S::Decimal { .. }))) { return Ok(()); }
-        let previous = state.accumulator.retained();
         let next = match self.output {
             LogicalType::Scalar(S::I32 | S::I64) =>
                 return state.add_numeric(NumericCell::Integer(signed_integer(value)?), self.output),
@@ -1476,13 +1599,40 @@ impl<'a> SumFactory<'a> {
             LogicalType::Scalar(S::F64) => {
                 return state.add_numeric(NumericCell::Float64(vector_double(value)?), self.output);
             }
-            LogicalType::Scalar(S::Decimal { precision,scale,bit_width }) => Value::Decimal(rtdb_expr::decimal_sum(previous.map(decimal_value).transpose()?,if null { None } else { Some(decimal_value(value)?) },*precision,*scale,*bit_width)?),
+            LogicalType::Scalar(S::Decimal { precision, scale, bit_width }) => {
+                let input = if null { None } else { Some(decimal_value(value)?) };
+                if *bit_width == 128 && *scale >= 0 && !matches!(state.accumulator, ScalarState::Retained(_))
+                    && let Some(coefficient) = match input {
+                        None => Some(0),
+                        Some(value) if value.bit_width == 128 && value.scale == *scale =>
+                            value.unscaled.as_slice().try_into().ok().map(i128::from_be_bytes),
+                        _ => None,
+                    }
+                {
+                    return state.add_decimal128(coefficient);
+                }
+                let compact;
+                let previous = match state.accumulator {
+                    ScalarState::Decimal128(coefficient) => {
+                        compact = decimal128_value(i128::from_ne_bytes(coefficient), *precision, *scale)?;
+                        Some(&compact)
+                    }
+                    _ => state.accumulator.retained().map(decimal_value).transpose()?,
+                };
+                Value::Decimal(rtdb_expr::decimal_sum(previous, input, *precision, *scale, *bit_width)?)
+            }
             LogicalType::Scalar(S::Duration(unit)) => {
                 let value = match value {
                     Value::Duration { value,unit: input } if input <= unit => value.wrapping_mul(unit.units_per_second() / input.units_per_second()),
                     _ => return Err(sum_state()),
                 };
-                Value::Duration { value: match previous { Some(Value::Duration { value: previous,unit: previous_unit }) if previous_unit == unit => previous.wrapping_add(value),None => value,_ => return Err(sum_state()) },unit: *unit }
+                let sum = match state.accumulator {
+                    ScalarState::Empty => value,
+                    ScalarState::Duration(previous, previous_unit) if previous_unit == *unit => previous.wrapping_add(value),
+                    _ => return Err(sum_state()),
+                };
+                state.accumulator = ScalarState::Duration(sum, *unit);
+                return Ok(());
             }
             _ => return Err(sum_state()),
         };

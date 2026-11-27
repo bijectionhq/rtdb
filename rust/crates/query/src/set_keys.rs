@@ -818,7 +818,7 @@ impl BatchKeyIndex {
     ) -> Result<Option<usize>> {
         let batches = &self.batches;
         let decoded = &mut self.decoded;
-        let direct = key.decodable();
+        let direct = key.typed.is_none() && key.decodable();
         self.positions.find(u64::from(hash), all, context, |index, position| {
             let (batch, projected) = &batches[position.batch];
             if direct
@@ -833,7 +833,7 @@ impl BatchKeyIndex {
 
     pub fn insert_distinct_argument(
         &mut self, batch: &ColumnBatch, column: usize, row: usize, group: usize, projected: bool,
-        retained_source: &mut Option<usize>, context: &QueryContext,
+        retained_source: &mut Option<(usize, usize)>, context: &QueryContext,
     ) -> Result<bool> {
         let columns = std::slice::from_ref(&batch.columns[column]);
         let key = Key::read(ArrowKey { columns, row, projected }, None, context)?;
@@ -855,16 +855,47 @@ impl BatchKeyIndex {
             .ok_or_else(size_error)?;
         Arc::get_mut(&mut self.reservation).expect("The key index owns its reservation").grow_to(bytes)?;
         let page = match *retained_source {
-            Some(page) => page,
+            Some((page, _)) => page,
             None => {
                 let source = batch.key_projection(&[column], &context.memory)?;
                 let page = self.push_page(source, projected);
-                *retained_source = Some(page);
+                *retained_source = Some((page, self.positions.rows.len()));
                 page
             }
         };
         self.positions.push(bucket, page, row);
         Ok(true)
+    }
+
+    pub fn finish_distinct_argument(&mut self, retained_source: Option<(usize, usize)>, context: &QueryContext) -> Result<()> {
+        let Some((page, start)) = retained_source else { return Ok(()); };
+        let source = &mut self.batches[page].0;
+        let positions = &mut self.positions.rows[start..];
+        if positions.len() > source.len / 2 || TypedKeyColumn::bind(&source.columns[0]).is_none() {
+            return Ok(());
+        }
+        let bytes = positions.len().checked_mul(size_of::<(usize, usize)>()).ok_or_else(size_error)?;
+        let _scratch = match context.memory.reserve(bytes) {
+            Ok(scratch) => scratch,
+            Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let mut picks = Vec::with_capacity(positions.len());
+        for (index, position) in positions.iter().enumerate() {
+            context.check_cancelled_at(index)?;
+            picks.push((0, position.row));
+        }
+        match source.select_keys(&picks, &context.memory) {
+            Ok(keys) => {
+                *source = keys;
+                for (row, position) in positions.iter_mut().enumerate() {
+                    position.row = row;
+                }
+                Ok(())
+            }
+            Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn distinct(
@@ -894,20 +925,15 @@ impl BatchKeyIndex {
         let KeyColumns { batch, positions } = columns;
         let typed = columns.bind_typed(context)?;
         let width = positions.map_or(batch.columns.len(), <[usize]>::len);
-        let bytes = batch
-            .len
-            .checked_mul(size_of::<(usize, usize)>() + size_of::<u32>())
+        let bytes = batch.len
+            .checked_mul(size_of::<u32>())
             .and_then(|bytes| width.checked_mul(size_of::<usize>()).and_then(|columns| bytes.checked_add(columns)))
             .ok_or_else(size_error)?;
-        let _scratch = context.memory.reserve(
-            bytes
-                .checked_add(Positions::allocation_bound(batch.len)?)
-                .ok_or_else(size_error)?,
-        )?;
+        let mut scratch = context.memory.reserve(bytes)?;
+        let mut admitted = 0usize;
         let mut current = Positions::default();
         let mut current_decoded = DecodedKeys::default();
         let previous = self.positions.rows.len();
-        let mut picks = Vec::with_capacity(batch.len);
         let mut hashes = Vec::with_capacity(batch.len);
         if let Some(typed) = &typed && batch.len != 0 {
             context.check_cancelled()?;
@@ -950,19 +976,33 @@ impl BatchKeyIndex {
                 .ok_or_else(size_error)?;
             visit(row, index, known.is_none())?;
             if known.is_none() {
+                let first_seen = current.rows.len();
+                if first_seen == admitted {
+                    let next = admitted.saturating_mul(2).max(1).min(batch.len);
+                    let key_bytes = next.checked_mul(size_of::<(usize, usize)>())
+                        .and_then(|keys| keys.checked_add(bytes))
+                        .and_then(|base| base.checked_add(Positions::allocation_bound(next).ok()?))
+                        .ok_or_else(size_error)?;
+                    Arc::get_mut(&mut scratch).expect("The grouping page owns its scratch").grow_to(key_bytes)?;
+                    admitted = next;
+                }
                 current.push(u64::from(hash), 0, row);
                 if typed.is_some() {
                     // Compact first-seen hashes into the already visited prefix.
-                    hashes[picks.len()] = hash;
+                    hashes[first_seen] = hash;
                 } else {
                     hashes.push(hash);
                 }
-                picks.push((0, row));
             }
         }
-        if picks.is_empty() {
+        if current.rows.is_empty() {
             return Ok(());
         }
+        let picks: Vec<_> = current.rows.iter().map(|position| (0, position.row)).collect();
+        drop((current, current_decoded));
+        let remaining = picks.len().checked_mul(size_of::<(usize, usize)>())
+            .and_then(|picks| picks.checked_add(bytes)).ok_or_else(size_error)?;
+        Arc::get_mut(&mut scratch).expect("The grouping page owns its scratch").shrink_to(remaining)?;
         let compact = match (positions, self.hashing) {
             (None, KeyHash::Set) => batch.select_keys(&picks, &context.memory)?,
             _ => batch.compact_group_key_columns(&picks, positions, &context.memory)?,
@@ -1144,6 +1184,65 @@ mod tests {
         {
             assert_eq!(keys.columns[1].value(row).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn typed_keys_reuse_first_seen_text_and_nulls_across_reversed_selections() {
+        let context = context();
+        let count = 768;
+        let texts = (0..count).map(|i| format!("clé {i}")).collect::<Vec<_>>();
+        let input = batch(Arc::new(Int64Array::from_iter((0..count as i64).map(Some).chain([None]))),
+            texts.iter().map(|text| Some(text.as_str())).chain([None]).collect(), &context);
+        let picks = Arc::new(std::iter::once((1, 0)).chain((0..count).rev().map(|row| (0, row))).collect());
+        let columns = input.columns.iter().enumerate().map(|(index, column)| {
+            let Column::Arrow { array, field, logical } = column else { panic!("Expected an Arrow vector"); };
+            let source = (Arc::clone(array), Arc::clone(field), logical.clone(),
+                Some(Arc::clone(input.column_reservation(index))));
+            Column::Selected(SelectedColumn::new(vec![Some(source), None], Arc::clone(&picks)))
+        }).collect();
+        let selected = ColumnBatch::settled(columns, count + 1, context.memory.reserve(16_384).unwrap()).unwrap();
+        let schema = rtdb_plan::Schema::default();
+        for vector in [false, true] {
+            let mut index = if vector { BatchKeyIndex::vector_hashing(&context) } else { BatchKeyIndex::new(&context) }.unwrap();
+            index.identify(&input, false, &context, &schema, |row, ordinal, first| {
+                assert_eq!((ordinal, first), (row, true));
+                Ok(())
+            }).unwrap();
+            let retained = context.memory.used_bytes();
+            index.identify(&selected, false, &context, &schema, |row, ordinal, first| {
+                assert_eq!((ordinal, first), (count - row, false));
+                Ok(())
+            }).unwrap();
+            assert_eq!(context.memory.used_bytes(), retained);
+            let keys = index.group_keys(2, &context).unwrap().unwrap();
+            assert_eq!(keys.len, count + 1);
+            for (row, text) in texts.iter().enumerate() {
+                assert_eq!(keys.columns[1].value(row).unwrap(), Value::Utf8(text.clone()));
+            }
+            assert_eq!(keys.columns[1].value(count).unwrap(), Value::Null);
+        }
+    }
+
+    #[test]
+    fn sparse_distinct_arguments_keep_group_membership_and_detach_text_backing() {
+        let context = context();
+        let oversized = "x".repeat(1 << 16);
+        let input = batch(Arc::new(Int64Array::from(vec![0; 4])),
+            vec![Some(&oversized), Some("é"), None, Some(&oversized)], &context);
+        let mut index = BatchKeyIndex::vector_hashing(&context).unwrap();
+        let mut source = None;
+        for row in [1, 2] {
+            assert!(index.insert_distinct_argument(&input, 1, row, 2, false, &mut source, &context).unwrap());
+        }
+        index.finish_distinct_argument(source, &context).unwrap();
+        drop(input);
+        assert!(context.memory.used_bytes() < oversized.len());
+
+        let probe = batch(Arc::new(Int64Array::from(vec![0; 2])), vec![Some("é"), None], &context);
+        let mut source = None;
+        assert!(!index.insert_distinct_argument(&probe, 1, 0, 2, false, &mut source, &context).unwrap());
+        assert!(index.insert_distinct_argument(&probe, 1, 0, 3, false, &mut source, &context).unwrap());
+        assert!(index.insert_distinct_argument(&probe, 1, 1, 2, false, &mut source, &context).unwrap());
     }
 
     /// Each hashing mode reads a cell either directly from Arrow or as a decoded value; a cell must hash alike either way,

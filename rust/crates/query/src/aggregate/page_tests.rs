@@ -291,6 +291,48 @@ async fn grouped_floating_reductions_keep_input_order_across_selected_and_value_
 }
 
 #[tokio::test]
+async fn selected_decimal_and_text_reductions_keep_exact_values_and_nulls() {
+    use arrow_array::StringArray;
+    use crate::columnar::SelectedColumn;
+
+    let execution = execution(8);
+    let memory = &execution.context.memory;
+    let decimal = LogicalType::Scalar(ScalarType::Decimal { precision: 2, scale: 1, bit_width: 128 }).maybe();
+    let text = LogicalType::Scalar(ScalarType::Utf8).maybe();
+    let schema = Schema::new(vec![field(0, decimal.clone()), field(1, text.clone())]).unwrap();
+    let aggregate = |id, function, position: usize, output| AggregateExpr {
+        field: field(id, output), function, argument: Some(schema.fields()[position].expression()),
+        distinct: false, filter: None, order_by: vec![],
+    };
+    let aggregates = vec![
+        aggregate(2, AggregateFunction::Sum, 0, decimal.clone()),
+        aggregate(3, AggregateFunction::Average, 0, LogicalType::Scalar(ScalarType::F64).maybe()),
+        aggregate(4, AggregateFunction::Min, 1, text.clone()),
+        aggregate(5, AggregateFunction::Max, 1, text.clone()),
+    ];
+    let output = Schema::new(aggregates.iter().map(|agg| agg.field.clone()).collect()).unwrap();
+    let relation = Arc::new(Relation::new(output, RelationNode::Aggregate {
+        input: Arc::new(Relation::empty(schema.clone())), groups: vec![], aggregates: aggregates.clone(),
+    }).unwrap());
+    let runtime = EmittedRelation::derive(relation, &execution.context.catalog, &[], memory).unwrap();
+    let number = |coefficient| Value::Decimal(decimal128_value(coefficient, 2, 1).unwrap());
+    let decimals = rtdb_columnar::copy_array(&decimal, &[number(15), number(25), Value::Null]).unwrap();
+    let strings = Arc::new(StringArray::from(vec![Some("é"), Some("b"), None]));
+    let picks = Arc::new(vec![(1, 0), (0, 1), (0, 2), (0, 0)]);
+    let selected = |array: arrow_array::ArrayRef, name: &str, ty: LogicalType| {
+        let field = Arc::new(rtdb_columnar::to_field(name, &ty).unwrap());
+        Column::Selected(SelectedColumn::new(vec![Some((array, field, Some(ty), None)), None], Arc::clone(&picks)))
+    };
+    let input = ColumnBatch::settled(vec![selected(decimals, "c0", decimal), selected(strings, "c1", text)],
+        picks.len(), memory.reserve(4096).unwrap()).unwrap();
+    let mut cursor = AggregateCursor::from_batches(Box::new(Batches(Some(input))), false,
+        schema, vec![], aggregates, runtime, execution.clone()).unwrap();
+    let result = cursor.next_batch().await.unwrap().unwrap();
+    assert_eq!(batch_row(&result, 0),
+        vec![number(40), Value::F64(2.0), Value::Utf8("b".into()), Value::Utf8("é".into())]);
+}
+
+#[tokio::test]
 async fn global_counts_fit_without_a_group_ordinal_for_each_row() {
     for filtered in [false, true] {
         let execution = execution(1024);
@@ -818,6 +860,51 @@ fn primitive_group_sums_wrap_within_the_reserved_state() {
     assert_eq!(memory.used_bytes(), baseline);
 }
 
+#[test]
+fn decimal_and_duration_group_sums_fit_in_the_reserved_state() {
+    let execution = execution(1024);
+    let memory = &execution.context.memory;
+    let decimal = LogicalType::Scalar(ScalarType::Decimal { precision: 1, scale: 0, bit_width: 128 });
+    let duration = LogicalType::Scalar(ScalarType::Duration(TimeUnit::Millisecond));
+    let decimal_sum = SumFactory::new(&decimal, &decimal).unwrap();
+    let duration_sum = SumFactory::new(&duration, &duration).unwrap();
+    let nine = Value::Decimal(decimal128_value(9, 1, 0).unwrap());
+    let millis = Value::Duration { value: i64::MAX, unit: TimeUnit::Millisecond };
+    let mut decimals = ScalarGroups::new(&execution).unwrap();
+    let mut durations = ScalarGroups::new(&execution).unwrap();
+    decimals.ensure(1024).unwrap();
+    durations.ensure(1024).unwrap();
+    let _pressure = memory.reserve(memory.available_bytes()).unwrap();
+    for (decimal, duration) in decimals.values.iter_mut().zip(&mut durations.values) {
+        decimal_sum.add(decimal, &Value::Null, 0, memory).unwrap();
+        for index in [1, 2] {
+            decimal_sum.add(decimal, &nine, index, memory).unwrap();
+            duration_sum.add(duration, &millis, index, memory).unwrap();
+        }
+        assert!(matches!(decimal.accumulator, ScalarState::Decimal128(bytes) if i128::from_ne_bytes(bytes) == 18));
+        assert!(matches!(duration.accumulator, ScalarState::Duration(-2, TimeUnit::Millisecond)));
+    }
+}
+
+#[test]
+fn decimal_sum_switches_to_scale_alignment_and_reports_physical_overflow() {
+    let execution = execution(8);
+    let memory = &execution.context.memory;
+    let decimal = LogicalType::Scalar(ScalarType::Decimal { precision: 4, scale: 2, bit_width: 128 });
+    let other = LogicalType::Scalar(ScalarType::Decimal { precision: 4, scale: 1, bit_width: 128 });
+    let input = decimal.join(&other);
+    let sum = SumFactory::new(&input, &decimal).unwrap();
+    let number = |coefficient, scale| Value::Decimal(decimal128_value(coefficient, 4, scale).unwrap());
+    let mut mixed = ScalarAccumulator::default();
+    sum.add(&mut mixed, &number(5, 2), 0, memory).unwrap();
+    sum.add(&mut mixed, &number(2, 1), 1, memory).unwrap();
+    assert_eq!(mixed.accumulator.retained(), Some(&number(25, 2)));
+
+    let mut wide = ScalarAccumulator::default();
+    sum.add(&mut wide, &number(i128::MAX, 2), 0, memory).unwrap();
+    assert_eq!(sum.add(&mut wide, &number(1, 2), 1, memory).unwrap_err().code, "xtdb.expression/overflow-error");
+}
+
 #[tokio::test]
 async fn duration_sum_wraps_conversion_and_distinguishes_null_vector_slots() {
     let execution = execution(1);let baseline = execution.context.memory.used_bytes();
@@ -867,7 +954,7 @@ fn failing_duration_average_sum_does_not_start_the_count_pass() {
     let mut states = ScalarGroups::new(&execution).unwrap();
     assert_eq!(states.aggregate(Rows { batch: &page, projected: false, memory: &execution.context.memory },GroupMapping::Global(2),&[true,true],1,Some(0),&aggregate,&types,&scope,&execution).unwrap_err().code,"xtdb.error/unknown");
     assert_eq!(states.values[0].count,0);
-    assert_eq!(states.values[0].accumulator.retained(), Some(&Value::Duration { value: 10,unit: TimeUnit::Millisecond }));
+    assert!(matches!(states.values[0].accumulator, ScalarState::Duration(10, TimeUnit::Millisecond)));
     drop(states);drop(scope);drop(page);
     assert_eq!(execution.context.memory.used_bytes(),baseline);
 }
