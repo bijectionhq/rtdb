@@ -681,6 +681,7 @@ fn execute_scalar_cell(
 ) -> Result<Option<(arrow_schema::Field, arrow_array::ArrayRef)>> {
     use arrow_array::{NullArray, UInt64Array};
     use arrow_schema::{DataType, Field};
+    use rtdb_types::ScalarType;
 
     let data_type = cell.field.data_type();
     let plain = cell.field.metadata().is_empty() && matches!(data_type,
@@ -689,8 +690,13 @@ fn execute_scalar_cell(
         | DataType::Date32 | DataType::Date64 | DataType::Time32(_) | DataType::Time64(_)
         | DataType::Timestamp(..) | DataType::Duration(_) | DataType::FixedSizeBinary(_)
     );
-    let uuid = data_type == &DataType::FixedSizeBinary(16) && cell.field.extension_type_name() == Some("uuid");
-    if !plain && !uuid {
+    let extension = match (data_type, cell.field.extension_type_name()) {
+        (DataType::FixedSizeBinary(16), Some("uuid")) => Some(ScalarType::Uuid),
+        (DataType::Utf8, Some("xt/clj-keyword")) => Some(ScalarType::Keyword),
+        (DataType::Binary, Some("xt/transit+msgpack")) => Some(ScalarType::Transit),
+        _ => None,
+    };
+    if !plain && extension.is_none() {
         return Ok(None);
     }
     if cell.is_null()? {
@@ -699,8 +705,8 @@ fn execute_scalar_cell(
         return Ok(Some((field, array)));
     }
     let bound = size(512, cell.payload_bytes()?)?;
-    let field = if uuid {
-        rtdb_columnar::to_field(name, &LogicalType::Scalar(rtdb_types::ScalarType::Uuid))?
+    let field = if let Some(extension) = extension {
+        rtdb_columnar::to_field(name, &LogicalType::Scalar(extension))?
     } else {
         Field::new(name, data_type.clone(), false)
     };
@@ -901,6 +907,33 @@ mod tests {
                 let field = output.schema_ref().field(index);
                 assert_eq!(rtdb_columnar::from_field(field).unwrap(), expected.logical_type());
                 assert_eq!(rtdb_columnar::read_value(field, output.column(index).as_ref(), 0).unwrap(), expected);
+                assert!(parameters.evaluator().known(index).is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_forwards_keyword_and_transit_cells_in_their_canonical_layout() {
+        use rtdb_types::{Keyword, ScalarType, Value};
+
+        let memory = MemoryBudget::new(1 << 20);
+        let types = [ScalarType::Keyword, ScalarType::Transit].map(|ty| LogicalType::Scalar(ty).maybe());
+        let values = [Value::Keyword(Keyword::from_name("space/symbol")), Value::Transit(vec![0, 0xfd, 0xff])];
+        let fields = types.iter().enumerate().map(|(index, ty)| rtdb_columnar::to_field(&index.to_string(), ty).unwrap()).collect::<Vec<_>>();
+        let columns = types.iter().zip(&values).map(|(ty, value)| rtdb_columnar::copy_array(ty, &[Value::Null, value.clone()]).unwrap()).collect();
+        let batch = OwnedBatch::new(RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns).unwrap(), &memory).unwrap();
+        let expressions = [0, 1].map(|index| Expr::Parameter { index, data_type: LogicalType::Nothing });
+        for row in 0..2 {
+            let parameters = BoundParameters::from_arrow(batch.clone(), row, types.to_vec(), &memory).unwrap();
+            let allocation = EvaluationScope::new(&memory).unwrap();
+            let eval = EvalContext { parameters: parameters.evaluator(), allocation: Some(&allocation), ..Default::default() };
+            let output = execute_arguments(&expressions, &eval, &memory, &allocation).await.unwrap();
+            let output = output.batch();
+            for (index, value) in values.iter().enumerate() {
+                let expected = if row == 0 { &Value::Null } else { value };
+                let field = output.schema_ref().field(index);
+                assert_eq!(*field, rtdb_columnar::to_field(&format!("?_{index}"), &expected.logical_type()).unwrap());
+                assert_eq!(rtdb_columnar::read_value(field, output.column(index).as_ref(), 0).unwrap(), *expected);
                 assert!(parameters.evaluator().known(index).is_none());
             }
         }

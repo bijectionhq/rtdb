@@ -50,6 +50,7 @@
 -- A direct floating-point list argument in pgwire EXECUTE is rebound from its selected Arrow cell.
 -- A direct unannotated Boolean, signed integer, float, text or binary argument in pgwire EXECUTE is selected in Arrow.
 -- A direct date, time, timestamp, duration or UUID argument with compatible storage is selected with its observed type and canonical field.
+-- A direct keyword or Transit EXECUTE argument retains its selected bytes and canonical extension field, with nulls bound as SQL null.
 -- A computed EXECUTE expression can bind a selected floating-point list from Arrow or use the packed child of a compatible expression result.
 -- A prepared embedded ADBC query that only projects compatible bindings uses the Arrow columns of its single argument row.
 -- The embedded logical relation entry point captures the same connection read basis as a SQL query.
