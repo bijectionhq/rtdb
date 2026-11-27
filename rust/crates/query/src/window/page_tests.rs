@@ -266,3 +266,41 @@ async fn window_assigns_nullable_composite_partitions_in_first_seen_order() {
     drop(cursor);
     assert_eq!(execution.context.memory.used_bytes(), baseline);
 }
+
+#[tokio::test]
+async fn incompatible_physical_window_order_key_replays_the_prefix_and_tail() {
+    use crate::runtime_schema::EmittedRelation;
+    use rtdb_plan::{Expr, Relation, RelationNode};
+
+    let execution = execution(1);
+    let baseline = execution.context.memory.used_bytes();
+    let schema = schema();
+    let [partition, value] = schema.fields() else { unreachable!() };
+    let sort_key = |expr| SortExpr { expr, descending: false, nulls_first: false };
+    let partition_by = [partition.id];
+    let order_by = vec![sort_key(value.expression())];
+    let source = Arc::new(Relation::new(schema.clone(), RelationNode::Values {
+        rows: vec![vec![Expr::Literal(Value::I64(1)), Expr::Literal(Value::I64(10))]],
+    }).unwrap());
+    let plan = Arc::new(Relation::new(schema.clone(), RelationNode::Sort {
+        input: source, order_by: vec![sort_key(partition.expression()), order_by[0].clone()],
+    }).unwrap());
+    let runtime = EmittedRelation::derive(plan, &execution.context.catalog, execution.parameters.types(), &execution.context.memory).unwrap();
+    let proof = InputOrder::bind(&runtime, &partition_by, &order_by, &execution.context.memory).unwrap();
+    let pages = vec![vec![row(1, 10)], vec![vec![Value::I64(1), Value::I32(2)]], vec![row(2, 3)]];
+    let mut cursor = BatchWindow::with_input_order(
+        input(pages, &execution), schema, &partition_by, order_by, &expressions(&[WindowFunction::RowNumber]),
+        false, execution.clone(), Some(proof),
+    ).unwrap();
+    let mut result = Vec::new();
+    while let Some(batch) = cursor.next_batch().await.unwrap() {
+        result.extend((0..batch.len).map(|row| batch.columns.iter().map(|column| column.value(row).unwrap()).collect::<Vec<_>>()));
+    }
+    assert_eq!(result, [
+        vec![Value::I64(1), Value::I32(2), Value::I64(1)],
+        vec![Value::I64(1), Value::I64(10), Value::I64(2)],
+        vec![Value::I64(2), Value::I64(3), Value::I64(1)],
+    ]);
+    drop((cursor, runtime));
+    assert_eq!(execution.context.memory.used_bytes(), baseline);
+}

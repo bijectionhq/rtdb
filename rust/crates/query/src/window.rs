@@ -1,29 +1,43 @@
 use std::{collections::VecDeque, ops::Range, sync::Arc};
 use async_trait::async_trait;
+use rtdb_columnar::MemoryReservation;
 use rtdb_plan::{Binder, ColumnId, Schema, SortExpr, WindowExpr, WindowFunction};
 use rtdb_types::{LogicalType, Result, ScalarType};
 use crate::{context::Execution, invalid};
 use crate::columnar::{BatchCursor, BoxBatchCursor, Column, ColumnBatch, gather_nullable_column, ordinal_column_by, poll_nested_batch};
 use crate::columnar::window::{WindowSpan, lend_window_spans};
 use crate::{scalar_key::ScalarKey, set_keys::{BatchKeyIndex, KeyColumns}};
+use crate::sort::batches::BatchSort;
+
+mod order;
+pub(crate) use order::InputOrder;
 
 pub(crate) struct BatchWindow {
     input: Option<BoxBatchCursor>,
     schema: Schema,
     partition_column: Option<usize>,
     expressions: Vec<WindowExpr>,
-    ready: Option<(VecDeque<ColumnBatch>, Arc<rtdb_columnar::MemoryReservation>)>,
+    ready: Option<(VecDeque<ColumnBatch>, Arc<MemoryReservation>)>,
+    ordered_input: Option<(InputOrder, WindowSort)>,
+    reused_input_order: Option<bool>,
     execution: Execution,
 }
 
 impl BatchWindow {
     pub fn supports(schema: &Schema, partition_by: &[ColumnId], order_by: &[SortExpr], _expressions: &[WindowExpr]) -> bool {
         partition_by.iter().all(|column| schema.position(*column).is_some())
-            && (order_by.is_empty() || crate::sort::batches::BatchSort::supports(schema, order_by))
+            && (order_by.is_empty() || BatchSort::supports(schema, order_by))
     }
 
-    pub fn new(input: BoxBatchCursor, schema: Schema, partition_by: &[ColumnId], mut order_by: Vec<SortExpr>, expressions: &[WindowExpr],
+    pub fn new(input: BoxBatchCursor, schema: Schema, partition_by: &[ColumnId], order_by: Vec<SortExpr>, expressions: &[WindowExpr],
         projected: bool, execution: Execution) -> Result<Self> {
+        Self::with_input_order(input, schema, partition_by, order_by, expressions, projected, execution, None)
+    }
+
+    pub fn with_input_order(
+        input: BoxBatchCursor, schema: Schema, partition_by: &[ColumnId], mut order_by: Vec<SortExpr>, expressions: &[WindowExpr],
+        projected: bool, execution: Execution, input_order: Option<InputOrder>,
+    ) -> Result<Self> {
         let mut input: BoxBatchCursor = Box::new(WindowInput { input, context: Arc::clone(&execution.context) });
         let mut sort_schema = schema.clone();
         let partition_column = if partition_by.is_empty() { None } else {
@@ -45,13 +59,17 @@ impl BatchWindow {
             sort_schema = schema.concat(&Schema::new(vec![field])?)?;
             Some(schema.len())
         };
-        let input = if order_by.is_empty() { input } else {
-            Box::new(crate::sort::batches::BatchSort::new(input, sort_schema, order_by, execution.clone(), projected, 0, i64::MAX as u64)?)
+        let sort = WindowSort { schema: sort_schema, order_by, projected };
+        let (input, ordered_input) = match input_order {
+            Some(proof) => (input, Some((proof, sort))),
+            None => (sort.open(input, &execution)?, None),
         };
-        Ok(Self { input: Some(input), schema, partition_column, expressions: expressions.to_vec(), ready: None, execution })
+        let reused_input_order = crate::trace::operator_evidence_enabled(&execution.context).then_some(false);
+        Ok(Self { input: Some(input), schema, partition_column, expressions: expressions.to_vec(), ready: None,
+            ordered_input, reused_input_order, execution })
     }
 
-    async fn evaluate(&mut self, mut input: BoxBatchCursor) -> Result<(VecDeque<ColumnBatch>, Arc<rtdb_columnar::MemoryReservation>)> {
+    async fn evaluate(&mut self, mut input: BoxBatchCursor) -> Result<(VecDeque<ColumnBatch>, Arc<MemoryReservation>)> {
         use std::mem::size_of;
         let context = &self.execution.context;
         let memory = &context.memory;
@@ -59,17 +77,40 @@ impl BatchWindow {
         let mut offsets = Vec::new();
         let mut total = 0usize;
         let mut inventory = memory.reserve(256)?;
+        let mut ordered_input = self.ordered_input.take();
+        let mut short_page = false;
         while let Some(batch) = poll_nested_batch(input.as_mut()).await? {
             if batch.len == 0 { continue; }
             let entry = 3 * size_of::<ColumnBatch>() + 2 * size_of::<usize>();
             let storage = batches.len().checked_add(1usize).and_then(|count| count.checked_mul(entry))
                 .and_then(|bytes| bytes.checked_add(256)).ok_or_else(window_size)?;
-            Arc::get_mut(&mut inventory).expect("Window owns the batch inventory reservation").grow_to(storage)?;
+            let mut admit = || Arc::get_mut(&mut inventory).expect("Window owns the batch inventory reservation").grow_to(storage);
+            if let Some((proof, _)) = &ordered_input {
+                let page_rows = context.options.batch_rows;
+                // A short page can be the tail; another page would change the ordinary sort's pull boundaries.
+                if short_page || batch.len > page_rows || !proof.admits(&batch) || admit().is_err() {
+                    let (_, sort) = ordered_input.take().expect("Window has an upstream order candidate");
+                    let replay = ReplayWindowInput { prefix: batches.into_iter(), pending: Some(batch), tail: input,
+                        inventory: Some(std::mem::replace(&mut inventory, memory.reserve(256)?)) };
+                    input = sort.open(Box::new(replay), &self.execution)?;
+                    batches = Vec::new();
+                    offsets = Vec::new();
+                    total = 0;
+                    continue;
+                }
+                short_page = batch.len < page_rows;
+            } else {
+                admit()?;
+            }
             offsets.push(total);
             total = total.checked_add(batch.len).filter(|total| i64::try_from(*total).is_ok())
                 .ok_or_else(|| invalid("window-count", "Window row number overflow"))?;
             batches.push(batch);
+            if ordered_input.is_some() { tokio::task::consume_budget().await; }
         }
+        drop(input);
+        let reused_order = ordered_input.take().is_some() && total != 0;
+        if let Some(reused) = &mut self.reused_input_order { *reused = reused_order; }
 
         let mut partitions = Vec::new();
         let mut partition_storage = memory.reserve(0)?;
@@ -153,6 +194,39 @@ impl BatchWindow {
             }
         }
         Ok((batches.into(), inventory))
+    }
+}
+
+struct WindowSort {
+    schema: Schema,
+    order_by: Vec<SortExpr>,
+    projected: bool,
+}
+
+impl WindowSort {
+    fn open(self, input: BoxBatchCursor, execution: &Execution) -> Result<BoxBatchCursor> {
+        if self.order_by.is_empty() { return Ok(input); }
+        Ok(Box::new(BatchSort::new(input, self.schema, self.order_by, execution.clone(), self.projected, 0, i64::MAX as u64)?))
+    }
+}
+
+struct ReplayWindowInput {
+    prefix: std::vec::IntoIter<ColumnBatch>,
+    pending: Option<ColumnBatch>,
+    tail: BoxBatchCursor,
+    inventory: Option<Arc<MemoryReservation>>,
+}
+
+#[async_trait]
+impl BatchCursor for ReplayWindowInput {
+    async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
+        if let Some(batch) = self.prefix.next() { return Ok(Some(batch)); }
+        if self.inventory.is_some() {
+            self.prefix = std::vec::IntoIter::default();
+            self.inventory = None;
+        }
+        if let Some(batch) = self.pending.take() { return Ok(Some(batch)); }
+        poll_nested_batch(self.tail.as_mut()).await
     }
 }
 
@@ -272,6 +346,12 @@ impl BatchCursor for BatchWindow {
         let batch = self.ready.as_mut().and_then(|(ready, _)| ready.pop_front());
         if batch.is_none() { self.ready = None; }
         Ok(batch)
+    }
+
+    fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) {
+        if let Some(reused) = self.reused_input_order {
+            crate::trace::OperatorCounter::WindowInputOrderReused.record(span, u64::from(reused));
+        }
     }
 }
 

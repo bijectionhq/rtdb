@@ -1,6 +1,6 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, sync::{Arc, Mutex}, time::SystemTime};
 use rtdb_columnar::{MemoryBudget, read_value};
-use rtdb_plan::{Schema, Statement};
+use rtdb_plan::{Schema, SpanContext, Statement, TraceSpan, TraceValue, Tracer};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryOptions};
 use rtdb_sql::{PrepareOptions, prepare};
 use rtdb_storage::{MemoryStore, cache::BufferPool};
@@ -8,13 +8,20 @@ use rtdb_types::{LogicalType as T, Result, ScalarType as S, Timestamp, Value as 
 use tokio_util::sync::CancellationToken;
 
 fn context() -> Arc<QueryContext> {
+    context_with_sort_memory(1)
+}
+
+fn context_with_sort_memory(sort_memory_bytes: usize) -> Arc<QueryContext> {
     let database = DatabaseSnapshot { partitions: Vec::new(), storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)) };
     let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
-    QueryContext::new(catalog, MemoryBudget::new(1 << 27), Timestamp(0), "UTC", QueryOptions { batch_rows: 1, sort_memory_bytes: 1, ..Default::default() }, &CancellationToken::new()).unwrap()
+    QueryContext::new(catalog, MemoryBudget::new(1 << 27), Timestamp(0), "UTC", QueryOptions { batch_rows: 1, sort_memory_bytes, ..Default::default() }, &CancellationToken::new()).unwrap()
 }
 
 async fn query(sql: &str) -> Result<(Schema, Vec<Vec<V>>)> {
-    let context = context();
+    query_at(sql, context()).await
+}
+
+async fn query_at(sql: &str, context: Arc<QueryContext>) -> Result<(Schema, Vec<Vec<V>>)> {
     let Statement::Query(relation) = prepare(sql, &context.catalog, &PrepareOptions::default())?.statement else { panic!("Expected query") };
     let schema = relation.schema().clone();
     let mut cursor = PreparedQuery::new(relation)?.execute(Arc::clone(&context), vec![]).await?;
@@ -29,6 +36,92 @@ async fn query(sql: &str) -> Result<(Schema, Vec<Vec<V>>)> {
     assert_eq!(context.spill_bytes(), 0);
     assert_eq!(context.memory.used_bytes(), 0);
     Ok((schema, rows))
+}
+
+#[derive(Default)]
+struct WindowTrace(Arc<Mutex<Vec<u64>>>);
+
+impl Tracer for WindowTrace {
+    fn query_enabled(&self) -> bool { true }
+    fn transaction_enabled(&self) -> bool { false }
+    fn start(&self, _: Option<SpanContext>, name: &str, _: &[(&str, TraceValue<'_>)]) -> Option<Box<dyn TraceSpan>> {
+        let window = (name == "query.cursor.window").then(|| Arc::clone(&self.0));
+        Some(Box::new(WindowSpan(window)))
+    }
+}
+
+struct WindowSpan(Option<Arc<Mutex<Vec<u64>>>>);
+
+impl TraceSpan for WindowSpan {
+    fn context(&self) -> SpanContext { SpanContext { trace_id: [1; 16], span_id: [1; 8] } }
+    fn attribute(&mut self, name: &str, value: TraceValue<'_>) {
+        if name == "cursor.window.input_order_reused"
+            && let (Some(values), TraceValue::Unsigned(reused)) = (&self.0, value)
+        {
+            values.lock().unwrap().push(reused);
+        }
+    }
+    fn end_at(&mut self, _: SystemTime) {}
+}
+
+#[tokio::test]
+async fn partitioned_windows_reuse_composite_order_and_keep_peers_across_spill() {
+    let input = "SELECT a AS p,b AS q,score AS v,id FROM (VALUES
+        (1,'x',8,30),(2,'x',4,21),(2,NULL,1,10),(2,'x',4,20),
+        (2,'x',NULL,22),(NULL,'x',7,40),(2,NULL,9,11)) AS t(a,b,score,id)
+        ORDER BY p DESC NULLS LAST,q ASC NULLS FIRST,v DESC NULLS LAST";
+    for sort_memory in [1, 1 << 26] {
+        for (call, expected) in [
+            ("ROW_NUMBER()", vec![V::I64(1), V::I64(2), V::I64(1), V::I64(2), V::I64(3), V::I64(1), V::I64(1)]),
+            ("LEAD(id)", vec![V::I64(10), V::Null, V::I64(20), V::I64(22), V::Null, V::Null, V::Null]),
+            ("LAG(id)", vec![V::Null, V::I64(11), V::Null, V::I64(21), V::I64(20), V::Null, V::Null]),
+        ] {
+            let tracer = Arc::new(WindowTrace::default());
+            let context = context_with_sort_memory(sort_memory).with_tracer(Some(tracer.clone()), None);
+            let sql = format!("SELECT id,{call} OVER(PARTITION BY p,q ORDER BY v DESC NULLS LAST) AS w FROM ({input}) AS s");
+            let (_, rows) = query_at(&sql, Arc::clone(&context)).await.unwrap();
+            let expected = [11,10,21,20,22,30,40].into_iter().zip(expected)
+                .map(|(id,value)| vec![V::I64(id), value]).collect::<Vec<_>>();
+            assert_eq!(rows, expected, "{call}, {sort_memory}");
+            assert_eq!(*tracer.0.lock().unwrap(), [1], "{call}, {sort_memory}");
+            assert_eq!(context.spill_peak_bytes() > 0, sort_memory == 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn partitioned_windows_sort_when_the_input_order_proof_does_not_match() {
+    let input = "SELECT p,v,id FROM (VALUES (1,2,20),(2,0,40),(1,1,10),(1,NULL,30)) AS t(p,v,id)";
+    for (suffix, expected_ids, expected_ordinals) in [
+        ("", [10,20,30,40], [1,2,3,1]),
+        ("ORDER BY v ASC NULLS LAST,p", [40,10,20,30], [1,1,2,3]),
+        ("ORDER BY p,v DESC NULLS LAST", [10,20,30,40], [1,2,3,1]),
+        ("ORDER BY p,v ASC NULLS FIRST", [10,20,30,40], [1,2,3,1]),
+        ("ORDER BY p,v ASC NULLS LAST LIMIT 4", [10,20,30,40], [1,2,3,1]),
+    ] {
+        let tracer = Arc::new(WindowTrace::default());
+        let context = context().with_tracer(Some(tracer.clone()), None);
+        let sql = format!("SELECT id,ROW_NUMBER() OVER(PARTITION BY p ORDER BY v ASC NULLS LAST) AS rn FROM ({input} {suffix}) AS s");
+        let (_, rows) = query_at(&sql, context).await.unwrap();
+        let expected = expected_ids.into_iter().zip(expected_ordinals).map(|(id,rn)| vec![V::I64(id), V::I64(rn)]).collect::<Vec<_>>();
+        assert_eq!(rows, expected, "{suffix}");
+        assert_eq!(*tracer.0.lock().unwrap(), [0], "{suffix}");
+    }
+}
+
+#[tokio::test]
+async fn partitioned_window_order_reuse_keeps_limit_error_reach() {
+    let query = "SELECT LEAD(v,9223372036854775807) OVER(PARTITION BY p ORDER BY v)
+        FROM (SELECT p,v FROM (VALUES (1,2),(1,1)) AS t(p,v) ORDER BY p,v) AS s";
+    let tracer = Arc::new(WindowTrace::default());
+    let context = context().with_tracer(Some(tracer.clone()), None);
+    assert!(query_at(&format!("{query} LIMIT 0"), Arc::clone(&context)).await.unwrap().1.is_empty());
+    assert!(tracer.0.lock().unwrap().is_empty());
+    let result = query_at(&format!("{query} LIMIT 1"), Arc::clone(&context)).await;
+    assert_eq!(result.unwrap_err().code, "rtdb.query/window-offset");
+    assert_eq!(*tracer.0.lock().unwrap(), [1]);
+    assert_eq!(context.spill_bytes(), 0);
+    assert_eq!(context.memory.used_bytes(), 0);
 }
 
 #[tokio::test]

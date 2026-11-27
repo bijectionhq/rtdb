@@ -2476,6 +2476,14 @@ surface QueryAccess {
         -- The literal page preserves URI text until expression evaluation admits it.
         -- A regex recipe of text, integer, Boolean and null literals retains each argument's literal kind in the page.
         -- Packed vector literals borrow the page's typed child buffers.
+
+    @guarantee PartitionedWindowOrdering
+        -- A partitioned window emits the partitions in first-seen order and retains input order among peers within a partition.
+        -- It can reuse the order of a stable input sort when the bound partition keys form the leading columns and the following columns match the window keys, directions, and null placement.
+        -- Reuse admits key layouts whose comparison and partition equality agree.
+        -- Other inputs use the ordinary window sort.
+        -- The window validates and consumes the reached input before publishing results.
+        -- Row numbers and shifts use complete partitions across Arrow batches and spill replay.
 }
 
 ---- Deferred Specifications

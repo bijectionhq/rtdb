@@ -216,7 +216,7 @@ async fn build_batches_at(
             let schema = child.schema().clone();
             let computed = !order_by.is_empty() && !BatchSort::supports(&schema, order_by);
             if !crate::window::BatchWindow::supports(&schema, partition_by, &[], expressions) { return Ok(None); }
-            let Some((input, projected)) = build_batch_input(child, execution.child(0), None, output).await? else { return Ok(None); };
+            let Some((input, projected)) = build_batch_input(Arc::clone(&child), execution.child(0), None, output).await? else { return Ok(None); };
             if computed {
                 let width = schema.len();
                 let Some((input, schema, order)) = project_sort_keys(input, schema, order_by, &execution)? else { return Ok(None); };
@@ -226,7 +226,12 @@ async fn build_batches_at(
                 let window = crate::columnar::BatchProject::new(Box::new(window), positions, memory);
                 return Ok(Some((Box::new(window), true)));
             }
-            let window = crate::window::BatchWindow::new(input, schema, partition_by, order_by.clone(), expressions, projected, execution)?;
+            let input_order = if output.semantic_pages() { None } else {
+                crate::window::InputOrder::bind(&child, partition_by, order_by, &execution.context.memory)
+            };
+            let window = crate::window::BatchWindow::with_input_order(
+                input, schema, partition_by, order_by.clone(), expressions, projected, execution, input_order,
+            )?;
             Ok(Some((Box::new(window), projected)))
         }
         RelationNode::Distinct { .. } => {
