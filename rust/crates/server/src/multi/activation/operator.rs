@@ -625,7 +625,7 @@ impl Request {
                     operation_id: intent.operation_id,
                 };
                 if let Some(installed) = authority
-                    .object_release_installation(&database, operation, hold.generation.database)
+                    .object_release_installation(&database, operation, intent.cell, hold.generation.database)
                     .await?
                 {
                     let retained = verified.journal_hold.ok_or_else(super::conflict)?;

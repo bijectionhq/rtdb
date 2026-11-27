@@ -1253,6 +1253,8 @@ contract PortableApplicationBackup {
 
     @invariant HostedAbandonment
         -- The activation broker proves abandonment at the original binding before authorizing settlement.
+        -- Before replacing a recovery publication, the activation authority preserves the previous publication in an immutable record addressed by its predecessor binding.
+        -- A retained publication identifies the original chosen recovery and settles the disposition of other candidates derived from the same predecessor.
         -- For an interrupted acquisition, the broker confirms the selected checkpoint with the custodian enrolled for the destination cell.
         -- Interrupted acquisition settlement obtains authorization from the activation broker on every attempt and uses the recorded version plan.
         -- The original keeper records a terminal checkpoint custody disposition even when attestation never acquired its hold.

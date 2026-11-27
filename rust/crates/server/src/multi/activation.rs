@@ -19,6 +19,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 mod clock;
+mod history;
 pub(super) mod journal_custody;
 pub(crate) mod operator;
 pub(super) mod recovery;
@@ -599,19 +600,7 @@ impl ActivationAuthority {
             let Some(state) = next(observed.as_ref())? else {
                 return observed.ok_or_else(corrupt);
             };
-            let sealed = if local {
-                self.journal
-                    .seal(stream, epoch)
-                    .await
-                    .map(|head| (head, Fence::Local(epoch)))
-            } else {
-                let session = WriterSessionId(Uuid::new_v4().as_u128());
-                self.journal
-                    .seal_session(stream, epoch, session)
-                    .await
-                    .map(|receipt| (receipt.sealed_head_lsn, Fence::Immutable(receipt.fence)))
-            };
-            let fence = match sealed {
+            let fence = match self.seal_fence(stream, epoch).await {
                 Ok((sealed_head, fence)) if sealed_head == head => fence,
                 Ok(_) => continue,
                 Err(JournalError::Fenced { current }) => {
@@ -673,6 +662,16 @@ impl ActivationAuthority {
             }
         }
         Err(unavailable())
+    }
+
+    async fn seal_fence(&self, stream: StreamId, epoch: Epoch) -> journal_contract::Result<(Lsn, Fence)> {
+        if self.access.is_local() {
+            self.journal.seal(stream, epoch).await.map(|head| (head, Fence::Local(epoch)))
+        } else {
+            let session = WriterSessionId(Uuid::new_v4().as_u128());
+            self.journal.seal_session(stream, epoch, session).await
+                .map(|receipt| (receipt.sealed_head_lsn, Fence::Immutable(receipt.fence)))
+        }
     }
 }
 

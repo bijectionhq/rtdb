@@ -353,7 +353,9 @@ Run `rtdb multi-backup abandon-object-acquisition --stage-receipt FILE --authori
 The original activation broker verifies abandonment and the destination journal selection on each attempt.
 The command settles the keeper's exact checkpoint hold, deletes the exact planned S3 versions, verifies their absence, and releases the held key generation.
 The S3 custodian needs version listing, legal-hold read and write access, `s3:DeleteObjectVersion`, and conditional writes for tombstones that keep older versions hidden.
-Use the same stage receipt and provider settings to retry a partial settlement while the activation authority retains the abandonment decision.
+Use the same stage receipt and provider settings to retry a partial settlement.
+Before advancing the binding again, the activation authority archives the previous recovery publication in its own immutable journal.
+The broker can use that publication to settle older acquisitions after activation compaction.
 The custodian owns the create-only `multi/recovery-custody/` ledger prefix and needs to read its records, with absence distinguishable from denied access.
 Protect acquisition records against deletion and replacement through settlement.
 Scope the custodian's S3 version reads and legal-hold writes to the operation-exclusive candidate paths.

@@ -203,16 +203,22 @@ impl State {
                 loss_policy: completed.loss_policy,
             },
             binding: self.binding,
-            installation: Installation {
-                manifest_digest: publication.manifest_digest,
-                source_cut: completed.source_cut,
-                key_hold: completed.key_hold,
-                journal_hold: completed.journal_hold,
-                objects_sha256: completed.objects_sha256,
-            },
+            installation: completed.installation(publication.manifest_digest),
             final_source_lsn: completed.final_source_lsn,
             ranked_closure: completed.ranked_closure,
         }))
+    }
+}
+
+impl Completed {
+    fn installation(self, manifest_digest: [u8; 32]) -> Installation {
+        Installation {
+            manifest_digest,
+            source_cut: self.source_cut,
+            key_hold: self.key_hold,
+            journal_hold: self.journal_hold,
+            objects_sha256: self.objects_sha256,
+        }
     }
 }
 
@@ -305,20 +311,23 @@ impl ActivationAuthority {
         let unrecorded = CustodySettlement::Unrecorded {
             hosted_custody: protocol >= RECOVERY_HOSTED_CUSTODY_PROTOCOL,
         };
-        if state.binding.revision > selected_revision {
-            return Ok(unrecorded);
-        }
-        if state.binding.revision == selected_revision
-            && let Some(publication) = state.publication
-            && publication.predecessor == operation.predecessor
-        {
+        let publication = match state.binding.revision.cmp(&selected_revision) {
+            std::cmp::Ordering::Greater => match self.archived_publication(name, operation.predecessor).await? {
+                Some(publication) => Some(publication),
+                None => return Ok(unrecorded),
+            },
+            std::cmp::Ordering::Equal => state.publication.filter(|publication| publication.predecessor == operation.predecessor),
+            std::cmp::Ordering::Less => None,
+        };
+        if let Some(publication) = publication {
             if publication.operation != operation.operation_id {
                 return Ok(if publication.recovery.is_some() { CustodySettlement::Abandoned } else { unrecorded });
             }
-            if publication.recovery.is_some() && publication.destination_cell == cell && state.binding.incarnation == candidate
-                && let Some(Status::Published { installation, .. }) = state.publication_status(operation)?
+            if publication.destination_cell == cell
+                && (state.binding.revision > selected_revision || state.binding.incarnation == candidate)
+                && let Some(completed) = publication.recovery
             {
-                return Ok(CustodySettlement::Published(installation));
+                return Ok(CustodySettlement::Published(completed.installation(publication.manifest_digest)));
             }
         }
         Err(Anomaly::new(
@@ -330,25 +339,14 @@ impl ActivationAuthority {
 
     #[cfg(unix)]
     pub(super) async fn object_release_installation(
-        &self, name: &str, operation: Operation, candidate: Uuid,
+        &self, name: &str, operation: Operation, cell: Option<Uuid>, candidate: Uuid,
     ) -> Result<Option<Installation>> {
-        let (_, state) = self.read(self.stream_id(name)?).await?;
-        let state = state.ok_or_else(unavailable)?;
-        let superseded = state.binding == operation.predecessor
-            && state.superseded_recoveries.contains(&operation.operation_id);
-        let replaced = operation.predecessor.revision.checked_add(1) == Some(state.binding.revision)
-            && state.publication.is_some_and(|publication| {
-                publication.predecessor == operation.predecessor
-                    && publication.operation != operation.operation_id
-                    && publication.recovery.is_some()
-            });
-        if state.binding.incarnation != candidate && (superseded || replaced) {
-            return Ok(None);
-        }
-        if let Some(Status::Published { binding, installation, .. }) = state.publication_status(operation)?
-            && binding.incarnation == candidate
-        {
-            return Ok(Some(installation));
+        match self.require_custody_release(name, operation, cell, candidate).await {
+            Ok(CustodySettlement::Abandoned) => return Ok(None),
+            Ok(CustodySettlement::Published(installation)) => return Ok(Some(installation)),
+            Ok(CustodySettlement::Unrecorded { .. }) => (),
+            Err(error) if error.code == "rtdb/activation-custody-pending" => (),
+            Err(error) => return Err(error),
         }
         Err(Anomaly::new(
             rtdb_types::AnomalyCategory::Conflict,
@@ -577,6 +575,7 @@ impl ActivationAuthority {
                 objects_sha256: installation.objects_sha256,
             }),
         };
+        self.preserve_publication(name, &frozen).await?;
         clock::wait_out(
             self.clock.as_ref(),
             clock::drain_window(frozen.grants_end.is_some()),
@@ -680,10 +679,12 @@ mod tests {
             .finalize_version(CLUSTER_VERSION_CURRENT)
             .await
             .unwrap();
-        let data = tempfile::tempdir().unwrap();
+        let mut authority_keepers = LocalCluster::start_independent_catalog(&[PRINCIPAL]).await.unwrap();
+        let authority_config = authority_keepers.journal_config(64 << 20, 4 << 20);
+        let authority_journal = Arc::new(authority_keepers.journal(PRINCIPAL, &authority_config).unwrap());
+        authority_journal.finalize_version(CLUSTER_VERSION_CURRENT).await.unwrap();
         let identity = Uuid::new_v4();
-        let mut authority =
-            ActivationAuthority::open_local(&data.path().join("authority"), identity).unwrap();
+        let mut authority = ActivationAuthority::new(authority_journal.clone(), identity).unwrap();
         let ticks = AtomicU64::new(0);
         Arc::get_mut(&mut authority).unwrap().clock =
             Arc::new(move || Some(Duration::from_secs(ticks.fetch_add(6, Ordering::SeqCst))));
@@ -844,6 +845,42 @@ mod tests {
                 ..
             }
         ));
+        #[cfg(unix)]
+        {
+            let current = authority.binding("xtdb").await.unwrap();
+            let operation_after = Operation { predecessor: current, operation_id: Uuid::new_v4() };
+            let intent_after = Intent {
+                operation: operation_after, destination_cell: None, loss_policy: LossPolicy::AcceptUnknownTail,
+            };
+            let Status::Pending { candidate: successor, .. } =
+                authority.begin_recovery("xtdb", intent_after, None).await.unwrap()
+            else { panic!("expected recovery to start from the published successor"); };
+            authority.record_recovery_installation("xtdb", operation_after, VerifiedSuccessor {
+                predecessor: current.incarnation, successor, ..installed(3)
+            }).await.unwrap();
+            authority.freeze_recovery("xtdb", operation_after).await.unwrap();
+            authority.publish_recovery("xtdb", operation_after).await.unwrap();
+
+            let reopened = ActivationAuthority::new(authority_journal, identity).unwrap();
+            assert!(matches!(
+                reopened.require_custody_release("xtdb", operation, None, candidate).await.unwrap(),
+                CustodySettlement::Abandoned
+            ));
+            assert!(matches!(
+                reopened.require_custody_release("xtdb", replacement, None, replacement_candidate).await.unwrap(),
+                CustodySettlement::Published(installation) if installation.source_cut.lsn == 2
+            ));
+            let untaken = Operation {
+                predecessor: Binding { incarnation: Uuid::new_v4(), revision: predecessor.revision },
+                ..operation
+            };
+            let unknown = reopened.successor_incarnation_in_cell("xtdb", untaken.predecessor, untaken.operation_id, None).unwrap();
+            assert!(matches!(
+                reopened.require_custody_release("xtdb", untaken, None, unknown).await.unwrap(),
+                CustodySettlement::Unrecorded { .. }
+            ));
+        }
+        authority_keepers.shutdown().await.unwrap();
         keepers.shutdown().await.unwrap();
     }
 }
