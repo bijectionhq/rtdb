@@ -192,11 +192,22 @@ impl BlockWriter {
         Ok(())
     }
 
-    pub fn finish(mut self, context: &QueryContext) -> Result<SpilledBlocks> {
+    pub fn finish(self, context: &QueryContext) -> Result<SpilledBlocks> {
+        self.finish_counted(context, None)
+    }
+
+    pub fn finish_counted(mut self, context: &QueryContext, total: Option<&mut u64>) -> Result<SpilledBlocks> {
         self.flush(context)?;
         let blocks = self.blocks.checked_add(usize::from(self.block_rows != 0)).ok_or_else(size_error)?;
-        Ok(SpilledBlocks { file: self.writer.finish()?, blocks, schema: self.schema })
+        Ok(SpilledBlocks { file: finish_file(self.writer, total)?, blocks, schema: self.schema })
     }
+}
+
+fn finish_file(mut writer: SpillWriter, total: Option<&mut u64>) -> Result<Arc<SpillFile>> {
+    let bytes = if total.is_some() { writer.position()? } else { 0 };
+    let file = writer.finish()?;
+    if let Some(total) = total { *total = total.saturating_add(bytes); }
+    Ok(file)
 }
 
 fn write_compacted_records(
@@ -224,15 +235,16 @@ impl SpilledBlocks {
         self, minimum: usize, context: &QueryContext,
         hash: impl Fn(&ColumnBatch, usize) -> Result<u32>,
     ) -> Result<Partitions> {
-        self.shuffle_with(minimum, context, |batch, partitions| {
+        self.shuffle_with(minimum, context, None, |batch, partitions| {
             partition_rows(batch.len, partitions, context, |row| hash(batch, row))
         })
     }
 
     pub fn shuffle_keys(
         self, minimum: usize, context: &QueryContext, positions: &[usize], projected: bool, hashing: JoinHash,
+        total: Option<&mut u64>,
     ) -> Result<Partitions> {
-        self.shuffle_with(minimum, context, |batch, partitions| {
+        self.shuffle_with(minimum, context, total, |batch, partitions| {
             if !positions.is_empty()
                 && let Some(keys) = KeyColumns::projection(batch, positions).bind_typed(context)?
             {
@@ -248,7 +260,7 @@ impl SpilledBlocks {
     }
 
     fn shuffle_with(
-        self, minimum: usize, context: &QueryContext,
+        self, minimum: usize, context: &QueryContext, total: Option<&mut u64>,
         partition: impl Fn(&ColumnBatch, &mut [Vec<(usize, usize)>]) -> Result<()>,
     ) -> Result<Partitions> {
         let memory = &context.memory;
@@ -284,7 +296,7 @@ impl SpilledBlocks {
                 offsets.push(at);
             }
         }
-        Ok(Partitions { reader: writer.finish()?.reader(Arc::clone(memory))?, offsets, schema: self.schema, _reservation: reservation })
+        Ok(Partitions { reader: finish_file(writer, total)?.reader(Arc::clone(memory))?, offsets, schema: self.schema, _reservation: reservation })
     }
 }
 

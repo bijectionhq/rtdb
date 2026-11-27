@@ -568,6 +568,7 @@ struct Spec {
     order: Vec<bool>, build_keys: Vec<usize>, probe_keys: Vec<usize>, widths: [usize; 2], kind: JoinKind, count_only: bool,
     projected: [bool; 2], swapped: bool, _original_layout_charge: Option<Arc<MemoryReservation>>, theta: ThetaTests, residual: Option<Residual>, execution: Execution,
     hash: JoinHash,
+    spill_bytes_written: Option<u64>,
 }
 
 impl BatchJoin {
@@ -575,8 +576,10 @@ impl BatchJoin {
         let build_keys = layout.left.key_positions().to_vec();
         let probe_keys = layout.right.key_positions().to_vec();
         let widths = [layout.left.original.len(), layout.right.original.len()];
+        let spill_bytes_written = crate::trace::operator_evidence_enabled(&execution.context).then_some(0);
         Self { state: State::Build { build, probe, layout }, spec: Spec { order, build_keys, probe_keys, widths, kind: JoinKind::Inner, count_only: false,
-            projected, swapped: false, _original_layout_charge: None, theta: ThetaTests::default(), residual: None, execution, hash: JoinHash::Vector } }
+            projected, swapped: false, _original_layout_charge: None, theta: ThetaTests::default(), residual: None, execution, hash: JoinHash::Vector,
+            spill_bytes_written } }
     }
 }
 
@@ -749,7 +752,7 @@ impl Spec {
     }
 
     async fn spill_arrow(
-        &self, held: Vec<ColumnBatch>, mut rest: BoxBatchCursor, probe: ProbeInput, layout: &JoinLayout,
+        &mut self, held: Vec<ColumnBatch>, mut rest: BoxBatchCursor, probe: ProbeInput, layout: &JoinLayout,
     ) -> Result<DiskJoin> {
         let context = &self.execution.context;
         let mut build = BlockWriter::new(&layout.left.schema, context)?;
@@ -759,7 +762,8 @@ impl Spec {
             build.append(batch, context)?;
         }
         drop(rest);
-        let build = build.finish(context)?.shuffle_keys(1, context, &self.build_keys, self.projected[0], self.hash)?;
+        let build = build.finish_counted(context, self.spill_bytes_written.as_mut())?;
+        let build = build.shuffle_keys(1, context, &self.build_keys, self.projected[0], self.hash, self.spill_bytes_written.as_mut())?;
         let Some((input, projected)) = build_batch_input(probe.runtime, probe.execution, probe.pushdowns, probe.output).await? else {
             return Err(crate::join_spill::layout_error());
         };
@@ -770,7 +774,8 @@ impl Spec {
             batch.validate_readable(context)?;
             probe.append(batch, context)?;
         }
-        let probe = probe.finish(context)?.shuffle_keys(build.count(), context, &self.probe_keys, self.projected[1], self.hash)?;
+        let probe = probe.finish_counted(context, self.spill_bytes_written.as_mut())?;
+        let probe = probe.shuffle_keys(build.count(), context, &self.probe_keys, self.projected[1], self.hash, self.spill_bytes_written.as_mut())?;
         Ok(DiskJoin { build, probe, table: None, build_partition: 0, probe_partition: 0, ready: None })
     }
 
@@ -1401,6 +1406,12 @@ impl BatchCursor for BatchJoin {
                 }
                 State::Done => return Ok(None),
             }
+        }
+    }
+
+    fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) {
+        if let Some(bytes) = self.spec.spill_bytes_written {
+            crate::trace::OperatorCounter::SpillBytesWritten.record(span, bytes);
         }
     }
 }

@@ -132,6 +132,42 @@ async fn spill_shuffle_replays_probe_partitions_within_each_build_partition() {
 }
 
 #[tokio::test]
+async fn hash_join_traces_completed_spill_bytes_after_replay() {
+    use rtdb_plan::Tracer;
+
+    for threshold in [1, 100] {
+        let mut execution = execution(32, threshold);
+        let (tracer, mut receiver) = rtdb_metrics::TraceRecorder::new(MemoryBudget::new(1 << 20), 16, true, false).unwrap();
+        let parent = tracer.start(None, "xtdb.query", &[]).unwrap();
+        execution.context = Arc::clone(&execution.context).with_tracer(Some(tracer.clone()), Some(parent.context()));
+        let build = numbers(0, &[1, 1]);
+        let probe = numbers(1, &[1]);
+        let condition = equal(&build, &probe);
+        let output = collect(open(join(build, probe, JoinKind::Inner, Some(condition)), &execution).await).await;
+        assert_eq!(output.iter().map(Vec::len).sum::<usize>(), 2);
+        assert_eq!(execution.context.spill_bytes(), 0);
+        drop(parent);
+        tracer.close();
+
+        let mut bytes = None;
+        while let Some(span) = receiver.next().await {
+            if let Some((_, written)) = span.attributes().find(|(name, _)| *name == "cursor.spill.bytes_written") {
+                assert_eq!(span.name, "query.cursor.inner-join");
+                assert!(bytes.replace(written.parse::<u64>().unwrap()).is_none());
+            }
+        }
+        let bytes = bytes.unwrap();
+        if threshold == 1 {
+            let peak = execution.context.spill_peak_bytes();
+            assert!(peak > 0);
+            assert!(bytes > peak);
+        } else {
+            assert_eq!(bytes, 0);
+        }
+    }
+}
+
+#[tokio::test]
 async fn complete_probe_page_errors_before_limit_can_publish_its_first_match() {
     for threshold in [0,100] {
         let execution = execution(1,threshold);let baseline = execution.context.memory.used_bytes();

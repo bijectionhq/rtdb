@@ -2385,6 +2385,7 @@ surface QueryAccess {
         -- Equijoin shuffle and partition replay hash admitted scalar key columns in equality-pair order, using ordered row hashing for other layouts.
         -- Equijoins over compatible primitive scalar key types hash either floating zero sign as positive zero in the join index and both shuffles.
         -- Anti joins with fallible predicates or keys keep their raw partition routing and ordered comparison of the reached build rows.
+        -- A hash join cursor span reports bytes written in completed spill files, including frame overhead, for its input spools and shuffles.
         -- An Arrow equijoin uses the raw vector hash of compatible floating-point list keys and compares their selected components.
         -- Join, sort, membership, and materialized-relation spills replay Arrow batches under the query's spill budget, which is unlimited by default and refuses bytes past any configured limit (including zero).
         -- Each spilled page is written whole under its encoding reservation, and a budget or quota refusal fails the query.
