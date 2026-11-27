@@ -1463,6 +1463,48 @@ class InProcessAdbcTest {
     }
 
     @Test
+    fun `getObjects preserves depth validity and numbers filtered columns within each ordered table`() {
+        insertData("INSERT INTO reporting.zoos RECORDS {_id: 1, item_name: 'zoo'}")
+        insertData("INSERT INTO reporting.animals RECORDS {_id: 2, item_name: 'lion', item_colour: 'gold'}")
+        insertData("INSERT INTO reporting.emptyfilter RECORDS {_id: 3}")
+
+        xtdb.connect().use { conn ->
+            conn.getObjects(GetObjectsDepth.DB_SCHEMAS, "xtdb", "reporting", null, null, null).use { rdr ->
+                assertTrue(rdr.loadNextBatch())
+                val schema = rdr.vectorSchemaRoot.dbSchemasOf("xtdb").single()
+                assertEquals("reporting", schema["db_schema_name"].toString())
+                assertNull(schema["db_schema_tables"])
+            }
+
+            conn.getObjects(GetObjectsDepth.TABLES, "xtdb", "reporting", null, null, "item_%").use { rdr ->
+                assertTrue(rdr.loadNextBatch())
+                val tables = rdr.vectorSchemaRoot.dbSchemasOf("xtdb").single()["db_schema_tables"].asList()
+                assertEquals(listOf("animals", "emptyfilter", "zoos"), tables.map { it.asMap()["table_name"].toString() })
+                tables.forEach { assertNull(it.asMap()["table_columns"]) }
+            }
+
+            conn.getObjects(GetObjectsDepth.ALL, "xtdb", "reporting", null, null, "item_%").use { rdr ->
+                assertTrue(rdr.loadNextBatch())
+                val tables = rdr.vectorSchemaRoot.dbSchemasOf("xtdb").single()["db_schema_tables"].asList()
+                assertEquals(listOf("animals", "zoos"), tables.map { it.asMap()["table_name"].toString() })
+                val expectedColumnsByTable = listOf(listOf("item_colour", "item_name"), listOf("item_name"))
+                tables.zip(expectedColumnsByTable).forEach { (tableValue, expected) ->
+                    val table = tableValue.asMap()
+                    val columns = table["table_columns"].asList().map { col -> col.asMap() }
+                    assertEquals(expected, columns.map { col -> col["column_name"].toString() })
+                    assertEquals(expected.indices.map { idx -> idx + 1 }, columns.map { col -> col["ordinal_position"] })
+                    assertNull(table["table_constraints"])
+                }
+            }
+
+            conn.getObjects(GetObjectsDepth.ALL, "xtdb", "reporting", null, arrayOf("VIEW"), null).use { rdr ->
+                assertTrue(rdr.loadNextBatch())
+                assertTrue(rdr.vectorSchemaRoot.dbSchemasOf("xtdb").isEmpty())
+            }
+        }
+    }
+
+    @Test
     fun `getObjects tolerates schema table column patterns that aren't valid SQL string literals`() {
         insertData("INSERT INTO foo RECORDS {_id: 1, name: 'a'}")
 
