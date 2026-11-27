@@ -110,13 +110,13 @@ pub(crate) fn client_extensions(certificate: &X509Ref, memory: &Arc<MemoryBudget
     match CertificateExtendedKeyUsage::decode(&encoded, memory).and_then(|usage| usage.permits_client_authentication()) {
         Ok(true) => {},
         Ok(false) => return Ok(false),
-        Err(error) if error.code == "rtdb.tls/invalid-keystore" => return Ok(false),
-        Err(error) => return Err(error),
+        Err(rtdb_tls::TlsError::InvalidKeystore(_)) => return Ok(false),
+        Err(error) => return Err(error.into_anomaly()),
     }
     let bits = match CertificateKeyUsage::decode(&encoded, memory) {
         Ok(usage) => usage.permitted_bits(),
-        Err(error) if error.code == "rtdb.tls/invalid-keystore" => return Ok(false),
-        Err(error) => return Err(error),
+        Err(rtdb_tls::TlsError::InvalidKeystore(_)) => return Ok(false),
+        Err(error) => return Err(error.into_anomaly()),
     };
     if bits & 0x88 == 0x88 { return Ok(true); }
     Ok(match certificate.public_key().map(|key| key.id()) {

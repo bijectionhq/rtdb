@@ -40,8 +40,15 @@ fn verifies_names(tls: &BTreeMap<&str, &str>, registry_hostname_policy: bool) ->
     !registry_hostname_policy || !matches!(tls.get("endpoint.identification.algorithm").copied(), None | Some("" | "none"))
 }
 
-fn tls_error(cause: rtdb_types::Anomaly) -> rtdb_types::Anomaly {
-    if cause.code == "xtdb.kafka/invalid-tls-config" { rtdb_types::Anomaly::new_nullable(rtdb_types::AnomalyCategory::Incorrect, "xtdb.kafka-connect-source/invalid-plugin-config", cause.message) } else { cause }
+fn tls_error(cause: crate::tls::TlsConfigError) -> rtdb_types::Anomaly {
+    match cause {
+        crate::tls::TlsConfigError::Invalid(message) => rtdb_types::Anomaly::new_nullable(
+            rtdb_types::AnomalyCategory::Incorrect,
+            "xtdb.kafka-connect-source/invalid-plugin-config",
+            message,
+        ),
+        crate::tls::TlsConfigError::Other(cause) => cause,
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -49,14 +56,13 @@ mod tests {
     #[test]
     fn registry_tls_reclassification_preserves_optional_messages_and_other_errors() {
         for message in [None, Some(String::new()), Some("invalid TLS configuration".into())] {
-            let cause = rtdb_types::Anomaly::new_nullable(rtdb_types::AnomalyCategory::Incorrect, "xtdb.kafka/invalid-tls-config", message.clone()).with_context("source", "tls".into());
-            let error = tls_error(cause);
+            let error = tls_error(crate::tls::TlsConfigError::Invalid(message.clone()));
             assert_eq!(error.category, rtdb_types::AnomalyCategory::Incorrect);
             assert_eq!(error.code, "xtdb.kafka-connect-source/invalid-plugin-config");
             assert_eq!(error.message, message);
             assert!(error.context.is_empty());
             let cause = rtdb_types::Anomaly::new_nullable(rtdb_types::AnomalyCategory::Busy, "rtdb/memory-budget-exceeded", message).with_context("source", "budget".into());
-            assert_eq!(tls_error(cause.clone()), cause);
+            assert_eq!(tls_error(crate::tls::TlsConfigError::Other(cause.clone())), cause);
         }
     }
     #[test]

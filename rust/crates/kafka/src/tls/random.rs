@@ -28,18 +28,18 @@ impl Algorithm {
 enum Random { Native(Arc<SharedNative>), Sha1(Sha1), Drbg(HashDrbg), Windows(Windows) }
 
 impl Random {
-    fn new(algorithm: Algorithm, budget: &Arc<MemoryBudget>) -> Result<Self> {
+    fn new(algorithm: Algorithm, budget: &Arc<MemoryBudget>) -> super::TlsConfigResult<Self> {
         match algorithm {
             Algorithm::Native | Algorithm::Blocking | Algorithm::NonBlocking => SharedNative::new(algorithm, budget).map(Self::Native),
             Algorithm::Sha1 => {
                 let mut seed = Zeroizing::new([0; 20]);
-                entropy(seed.as_mut())?;
+                entropy(seed.as_mut()).map_err(super::TlsConfigError::from_invalid_anomaly)?;
                 Ok(Self::Sha1(Sha1::new(seed.as_ref())))
             }
             Algorithm::Drbg => {
-                Ok(Self::Drbg(HashDrbg::from_default_entropy(entropy, &DRBG_NONCE)?))
+                Ok(Self::Drbg(HashDrbg::from_default_entropy(entropy, &DRBG_NONCE).map_err(super::TlsConfigError::from_invalid_anomaly)?))
             }
-            Algorithm::Windows => Windows::new().map(Self::Windows),
+            Algorithm::Windows => Windows::new().map(Self::Windows).map_err(super::TlsConfigError::from_invalid_anomaly),
         }
     }
 
@@ -133,14 +133,15 @@ static NATIVE_SOURCES: Mutex<BTreeMap<(usize, Algorithm), Weak<SharedNative>>> =
 const NATIVE_ALLOCATION_BOUND: usize = 73_728;
 
 impl SharedNative {
-    fn new(algorithm: Algorithm, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
+    fn new(algorithm: Algorithm, budget: &Arc<MemoryBudget>) -> super::TlsConfigResult<Arc<Self>> {
         let registration = (Arc::as_ptr(budget) as usize, algorithm);
-        let mut sources = NATIVE_SOURCES.lock().map_err(|_| super::invalid("SecureRandom source registry is unavailable"))?;
+        let mut sources = NATIVE_SOURCES.lock().map_err(|_| super::TlsConfigError::invalid("SecureRandom source registry is unavailable"))?;
         if let Some(source) = sources.get(&registration).and_then(Weak::upgrade) {
             drop(sources);
             return Ok(source);
         }
-        let random = Native::new(algorithm, budget.reserve(NATIVE_ALLOCATION_BOUND)?)?;
+        let random = Native::new(algorithm, budget.reserve(NATIVE_ALLOCATION_BOUND).map_err(super::TlsConfigError::Other)?)
+            .map_err(super::TlsConfigError::from_invalid_anomaly)?;
         let source = Arc::new(Self { random: Mutex::new(random), registration });
         sources.insert(registration, Arc::downgrade(&source));
         drop(sources);

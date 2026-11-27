@@ -1,12 +1,11 @@
 use std::cmp::Ordering;
-use rtdb_types::Result;
 
 struct Entry { value: usize, parent: Option<usize>, left: Option<usize>, right: Option<usize>, red: bool }
 #[derive(Default)]
 struct Tree { entries: Vec<Entry>, root: Option<usize> }
 
 // OpenJDK 25.0.1 TreeMap.put/fixAfterInsertion: PKIXCertComparator's equal-preference result is not antisymmetric.
-pub(super) fn ordered(values: impl IntoIterator<Item = usize>, mut compare: impl FnMut(usize, usize) -> Result<Ordering>) -> Result<Vec<usize>> {
+pub(super) fn ordered<E>(values: impl IntoIterator<Item = usize>, mut compare: impl FnMut(usize, usize) -> std::result::Result<Ordering, E>) -> std::result::Result<Vec<usize>, E> {
     let mut tree = Tree::default();
     for value in values { tree.insert(value, &mut compare)?; }
     let mut result = Vec::with_capacity(tree.entries.len());
@@ -22,7 +21,7 @@ pub(super) fn ordered(values: impl IntoIterator<Item = usize>, mut compare: impl
 }
 
 impl Tree {
-    fn insert(&mut self, value: usize, compare: &mut impl FnMut(usize, usize) -> Result<Ordering>) -> Result<()> {
+    fn insert<E>(&mut self, value: usize, compare: &mut impl FnMut(usize, usize) -> std::result::Result<Ordering, E>) -> std::result::Result<(), E> {
         let Some(mut parent) = self.root else {
             compare(value, value)?;
             self.root = Some(0);
@@ -90,13 +89,13 @@ mod tests {
 
     #[test]
     fn comparable_keys_follow_rotations_and_keep_first_equal_key() {
-        assert_eq!(ordered([3, 1, 2, 0, 4, 2], |left, right| Ok(left.cmp(&right))).unwrap(), [0, 1, 2, 3, 4]);
-        assert_eq!(ordered([0, 4, 2, 3, 1], |left, right| Ok(left.cmp(&right))).unwrap(), [0, 1, 2, 3, 4]);
+        assert_eq!(ordered([3, 1, 2, 0, 4, 2], |left, right| Ok::<_, ()>(left.cmp(&right))).unwrap(), [0, 1, 2, 3, 4]);
+        assert_eq!(ordered([0, 4, 2, 3, 1], |left, right| Ok::<_, ()>(left.cmp(&right))).unwrap(), [0, 1, 2, 3, 4]);
     }
 
     #[test]
     fn equally_preferred_distinct_certificates_take_the_java_left_branch() {
-        let compare = |left, right| Ok(if left == right { Ordering::Equal } else { Ordering::Less });
+        let compare = |left, right| Ok::<_, ()>(if left == right { Ordering::Equal } else { Ordering::Less });
         assert_eq!(ordered(0..6, compare).unwrap(), [5, 4, 3, 2, 1, 0]);
         assert_eq!(ordered([0, 1, 2, 3, 4, 5, 0], compare).unwrap(), [0, 5, 4, 3, 2, 1, 0]);
         let mut tree = Tree::default();

@@ -1,4 +1,5 @@
 use super::*;
+use crate::tls::{TlsConfigError, TlsConfigResult};
 use openssl::{nid::Nid, x509::{X509NameRef, store::X509StoreBuilder}};
 use rtdb_tls::CertificateIdentifiers;
 
@@ -76,64 +77,65 @@ impl Search<'_> {
     fn ordered(&mut self, length: usize) -> Result<Vec<X509>> { build::ordered(self, length) }
     fn build(&mut self) -> Result<Vec<X509>> { build::verify(self) }
 
-    fn same_name(&self, left: &X509NameRef, right: &X509NameRef) -> Result<bool> {
-        super::super::super::names::same(left, right, self.charge.budget())
+    fn same_name(&self, left: &X509NameRef, right: &X509NameRef) -> TlsConfigResult<bool> {
+        super::super::super::names::same_typed(left, right, self.charge.budget())
     }
 
-    fn validate(&self, chain: &[&X509Ref]) -> Result<()> {
+    fn validate(&self, chain: &[&X509Ref]) -> TlsConfigResult<()> {
         for pair in chain.windows(2) {
             if pair[0].issuer_name().entries().next().is_none() || !self.same_name(pair[0].issuer_name(), pair[1].subject_name())? {
-                return Err(invalid("TLS selected path has a mismatched issuer name"));
+                return Err(TlsConfigError::invalid("TLS selected path has a mismatched issuer name"));
             }
         }
         for certificate in chain { identifiers(certificate, self.charge)?; }
-        let metadata = super::super::super::security::PathMetadata::decode(chain, self.charge.budget())?;
-        metadata.verify_ssl_algorithms()?;
-        super::policy::verify(chain, self.charge)?;
+        let metadata = super::super::super::security::PathMetadata::decode_typed(chain, self.charge.budget())?;
+        metadata.verify_ssl_algorithms().map_err(TlsConfigError::from_invalid_anomaly)?;
+        super::policy::verify_typed(chain, self.charge)?;
         for certificate in &chain[..chain.len() - 1] {
             super::super::critical_extensions(certificate, &[Nid::BASIC_CONSTRAINTS, Nid::NAME_CONSTRAINTS, Nid::CERTIFICATE_POLICIES,
-                Nid::POLICY_MAPPINGS, Nid::POLICY_CONSTRAINTS, Nid::INHIBIT_ANY_POLICY, Nid::SUBJECT_ALT_NAME, Nid::KEY_USAGE, Nid::EXT_KEY_USAGE])?;
-            if certificate.not_before().compare(self.now).map_err(invalid)?.is_gt() || certificate.not_after().compare(self.now).map_err(invalid)?.is_lt() {
-                return Err(invalid("TLS certificate is outside its validity interval"));
+                Nid::POLICY_MAPPINGS, Nid::POLICY_CONSTRAINTS, Nid::INHIBIT_ANY_POLICY, Nid::SUBJECT_ALT_NAME, Nid::KEY_USAGE, Nid::EXT_KEY_USAGE])
+                .map_err(TlsConfigError::from_invalid_anomaly)?;
+            if certificate.not_before().compare(self.now).map_err(TlsConfigError::invalid)?.is_gt() || certificate.not_after().compare(self.now).map_err(TlsConfigError::invalid)?.is_lt() {
+                return Err(TlsConfigError::invalid("TLS certificate is outside its validity interval"));
             }
         }
-        let _scratch = reserve(chain.iter().copied(), self.charge)?;
-        let store = X509StoreBuilder::new().map_err(invalid)?.build();
-        let untrusted = Stack::new().map_err(invalid)?;
-        let mut originals = Stack::new().map_err(invalid)?;
+        let _scratch = reserve_typed(chain.iter().copied(), self.charge)?;
+        let store = X509StoreBuilder::new().map_err(TlsConfigError::invalid)?.build();
+        let untrusted = Stack::new().map_err(TlsConfigError::invalid)?;
+        let mut originals = Stack::new().map_err(TlsConfigError::invalid)?;
         for certificate in chain {
-            originals.push((*certificate).to_owned()).map_err(invalid)?;
+            originals.push((*certificate).to_owned()).map_err(TlsConfigError::invalid)?;
         }
-        let mut context = X509StoreContext::new().map_err(invalid)?;
+        let mut context = X509StoreContext::new().map_err(TlsConfigError::invalid)?;
         context.init(&store, chain[0], &untrusted, |context| {
-            let result = (|| -> Result<()> {
-                configure_parameters(context, self.now)?;
+            let result = (|| -> TlsConfigResult<()> {
+                configure_parameters(context, self.now).map_err(TlsConfigError::from_invalid_anomaly)?;
                 let ssl_index = unsafe { openssl_sys::SSL_get_ex_data_X509_STORE_CTX_idx() };
-                if ssl_index < 0 { return Err(invalid(openssl::error::ErrorStack::get())); }
+                if ssl_index < 0 { return Err(TlsConfigError::invalid(openssl::error::ErrorStack::get())); }
                 let ssl = unsafe { openssl_sys::X509_STORE_CTX_get_ex_data(self.source.as_ptr(), ssl_index) };
-                if !ssl.is_null() && unsafe { X509_STORE_CTX_set_ex_data(context.as_ptr(), ssl_index, ssl) } != 1 { return Err(invalid(openssl::error::ErrorStack::get())); }
+                if !ssl.is_null() && unsafe { X509_STORE_CTX_set_ex_data(context.as_ptr(), ssl_index, ssl) } != 1 { return Err(TlsConfigError::invalid(openssl::error::ErrorStack::get())); }
                 unsafe { X509_STORE_CTX_set_verify_cb(context.as_ptr(), X509_STORE_CTX_get_verify_cb(self.source.as_ptr())); }
-                if !verify_java_with_dates(context, self.now, &originals, &metadata)? { return Err(invalid(context.error())); }
-                let selected = context.chain().ok_or_else(|| invalid("TLS PKIX validation produced no chain"))?;
+                if !verify_java_with_dates(context, self.now, &originals, &metadata).map_err(TlsConfigError::from_invalid_anomaly)? { return Err(TlsConfigError::invalid(context.error())); }
+                let selected = context.chain().ok_or_else(|| TlsConfigError::invalid("TLS PKIX validation produced no chain"))?;
                 if selected.len() != chain.len() || selected.iter().zip(chain.iter()).any(|(selected, expected)| selected.as_ptr() != expected.as_ptr()) {
-                    return Err(invalid("TLS PKIX validation changed the selected certificate path"));
+                    return Err(TlsConfigError::invalid("TLS PKIX validation changed the selected certificate path"));
                 }
                 Ok(())
             })();
             Ok(result)
-        }).map_err(invalid)?
+        }).map_err(TlsConfigError::invalid)?
     }
 }
 
-fn identifiers(certificate: &X509Ref, charge: &MemoryReservation) -> Result<CertificateIdentifiers> {
+fn identifiers(certificate: &X509Ref, charge: &MemoryReservation) -> TlsConfigResult<CertificateIdentifiers> {
     let length = unsafe { openssl_sys::i2d_X509(certificate.as_ptr(), ptr::null_mut()) };
-    let bound = usize::try_from(length).ok().and_then(|length| length.checked_add(64)).ok_or_else(|| invalid("TLS certificate encoding exceeds allocation range"))?;
-    let _scratch = charge.budget().reserve(bound)?;
-    CertificateIdentifiers::decode(&certificate.to_der().map_err(invalid)?, charge.budget())
-        .map_err(|error| if error.code == "rtdb.tls/invalid-keystore" { invalid(error) } else { error })
+    let bound = usize::try_from(length).ok().and_then(|length| length.checked_add(64)).ok_or_else(|| TlsConfigError::invalid("TLS certificate encoding exceeds allocation range"))?;
+    let _scratch = charge.budget().reserve(bound).map_err(TlsConfigError::Other)?;
+    CertificateIdentifiers::decode(&certificate.to_der().map_err(TlsConfigError::invalid)?, charge.budget())
+        .map_err(TlsConfigError::from_tls)
 }
 
-fn ordered_anchor(child: &X509Ref, anchor: &X509Ref, charge: &MemoryReservation) -> Result<bool> {
+fn ordered_anchor(child: &X509Ref, anchor: &X509Ref, charge: &MemoryReservation) -> TlsConfigResult<bool> {
     let child = identifiers(child, charge)?;
     if child.authority_key_identifier().is_none() && child.authority_serial_number().is_none() { return Ok(true); }
     let candidate = identifiers(anchor, charge)?;

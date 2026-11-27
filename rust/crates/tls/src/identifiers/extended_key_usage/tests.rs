@@ -39,8 +39,8 @@ fn malformed_noncritical_eku_is_queryable_as_an_error_without_discarding_the_cer
     for value in [vec![], encoded(5, &[]), encoded(0x31, &[]), encoded(4, &usages(&[SERVER])),
         [usages(&[SERVER]), vec![0]].concat(), encoded(0x30, &encoded(5, &[])), encoded(0x30, &encoded(6, &[]))] {
         let usage = decode(&[extension(false, &value)]);
-        assert_eq!(usage.permits_server_authentication().unwrap_err().code, "rtdb.tls/invalid-keystore");
-        assert_eq!(CertificateExtendedKeyUsage::decode(&certificate(&[extension(true, &value)]), &MemoryBudget::new(1 << 20)).unwrap_err().code, "rtdb.tls/invalid-keystore");
+        assert_eq!(usage.permits_server_authentication().unwrap_err().code(), "rtdb.tls/invalid-keystore");
+        assert_eq!(CertificateExtendedKeyUsage::decode(&certificate(&[extension(true, &value)]), &MemoryBudget::new(1 << 20)).unwrap_err().code(), "rtdb.tls/invalid-keystore");
     }
 }
 
@@ -98,7 +98,7 @@ fn eku_admission_covers_absent_unparseable_and_parsed_states_until_drop() {
     assert!(CertificateExtendedKeyUsage::decode(&certificate(&[extension(true, &[5, 0])]), &memory).is_err());
     assert_eq!(memory.used_bytes(), baseline);
     drop(parsed); assert_eq!(memory.used_bytes(), 0);
-    assert_eq!(CertificateExtendedKeyUsage::decode(&[0xff], &MemoryBudget::new(0)).unwrap_err().code, "rtdb/memory-budget-exceeded");
+    assert_eq!(CertificateExtendedKeyUsage::decode(&[0xff], &MemoryBudget::new(0)).unwrap_err().code(), "rtdb/memory-budget-exceeded");
 }
 
 #[test]
@@ -116,7 +116,7 @@ fn client_usage_accepts_absence_any_and_client_purposes_without_server_sgc_permi
 #[test]
 fn client_usage_preserves_unparseable_and_parsed_duplicate_decisions_independently_of_server_usage() {
     let bad = encoded(5, &[]);
-    assert_eq!(decode(&[extension(false, &bad)]).permits_client_authentication().unwrap_err().code, "rtdb.tls/invalid-keystore");
+    assert_eq!(decode(&[extension(false, &bad)]).permits_client_authentication().unwrap_err().code(), "rtdb.tls/invalid-keystore");
     for (good, client, server) in [(usages(&[]), false, false), (usages(&[CLIENT]), true, false), (usages(&[SERVER]), false, true), (usages(&[ANY]), true, true)] {
         for extensions in [vec![extension(false, &bad), extension(false, &good)], vec![extension(false, &good), extension(false, &bad)]] {
             let usage = decode(&extensions);

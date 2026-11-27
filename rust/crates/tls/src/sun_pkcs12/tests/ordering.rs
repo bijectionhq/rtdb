@@ -7,8 +7,8 @@ const DH: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 3, 1];
 fn input(tag: u8, oid: &[u8], parameter: &[u8], version: u8) -> Vec<u8> {
     encoded(tag, &[encoded(2, &[version]), seq(&[encoded(6, oid), parameter.to_vec()])].concat())
 }
-fn recover(plaintext: &[u8], memory: &Arc<MemoryBudget>) -> Result<PrivateKey> {
-    PrivateKey::from_pkcs12(FactoryInput::pkcs12(plaintext)?, memory)
+fn recover(plaintext: &[u8], memory: &Arc<MemoryBudget>) -> crate::TlsResult<PrivateKey> {
+    PrivateKey::from_pkcs12(FactoryInput::pkcs12(plaintext).map_err(crate::TlsError::from_invalid_anomaly)?, memory)
 }
 
 #[test]
@@ -53,11 +53,11 @@ fn sun_pkcs12_empty_password_retries_preparse_and_factory_errors_and_returns_the
         else { assert_eq!(password, "\0"); recover(&second, &memory) }
     }).err().unwrap();
     assert_eq!(attempts, 2);
-    assert_eq!(error, invalid("Java HSS/LMS does not generate private keys"));
+    assert_eq!(error.into_anomaly(), invalid("Java HSS/LMS does not generate private keys"));
     assert_eq!(memory.used_bytes(), 0);
     let none = MemoryBudget::new(0); let mut attempts = 0;
     let error = protection::retry(Some(""), |_| { attempts += 1; recover(&second, &none) }).err().unwrap();
     assert_eq!(attempts, 1);
-    assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+    assert_eq!(error.code(), "rtdb/memory-budget-exceeded");
     assert_eq!(none.used_bytes(), 0);
 }

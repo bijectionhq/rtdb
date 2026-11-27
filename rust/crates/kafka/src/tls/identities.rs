@@ -5,7 +5,7 @@ use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_tls::{KeyStore, ProtectedKeyStore, StoreFormat, StoreUse, SunX509JksStore, SunX509Pkcs12Store};
 use rtdb_types::Result;
 use zeroize::Zeroizing;
-use super::{Algorithm, KeyManager, KeyType, invalid, overflow, random, security};
+use super::{Algorithm, KeyManager, KeyType, TlsConfigError, TlsConfigResult, invalid, overflow, random, security};
 
 #[derive(Clone)]
 /// Admitted client material; every exposed identity has a nonempty leaf-first certificate chain.
@@ -49,52 +49,56 @@ impl Material {
     /// The returned owner's reservation must outlive SSL connections retaining its certificates.
     /// Deferred material requires NewSunX509; loading metadata does not attempt private-key recovery.
     pub(super) fn native(&self, algorithm: Algorithm, random: &Arc<random::Context>, charge: &Arc<MemoryReservation>) -> Result<NativeIdentities> {
-        if matches!(self, Self::Deferred(_)) && algorithm != Algorithm::NewSunX509 { return Err(invalid("Deferred private keys require NewSunX509")); }
-        if matches!(self, Self::SunJks(_) | Self::SunPkcs12(_)) && algorithm != Algorithm::SunX509 { return Err(invalid("Eager SunX509 material requires SunX509")); }
+        self.native_typed(algorithm, random, charge).map_err(TlsConfigError::into_anomaly)
+    }
+
+    pub(super) fn native_typed(&self, algorithm: Algorithm, random: &Arc<random::Context>, charge: &Arc<MemoryReservation>) -> TlsConfigResult<NativeIdentities> {
+        if matches!(self, Self::Deferred(_)) && algorithm != Algorithm::NewSunX509 { return Err(TlsConfigError::invalid("Deferred private keys require NewSunX509")); }
+        if matches!(self, Self::SunJks(_) | Self::SunPkcs12(_)) && algorithm != Algorithm::SunX509 { return Err(TlsConfigError::invalid("Eager SunX509 material requires SunX509")); }
         let mut bound = 65_536usize;
         match self {
             Self::Eager(store) => for identity in store.identities() {
-                bound = native_bound(bound, identity.private_key_pkcs8().len())?;
-                for certificate in identity.certificates() { bound = native_bound(bound, certificate.len())?; }
+                bound = native_bound(bound, identity.private_key_pkcs8().len()).map_err(TlsConfigError::from_invalid_anomaly)?;
+                for certificate in identity.certificates() { bound = native_bound(bound, certificate.len()).map_err(TlsConfigError::from_invalid_anomaly)?; }
             },
             Self::SunJks(store) => for identity in store.identities() {
-                bound = native_bound(bound, identity.private_key_pkcs8().len())?;
-                for certificate in identity.certificates() { bound = native_bound(bound, certificate.len())?; }
+                bound = native_bound(bound, identity.private_key_pkcs8().len()).map_err(TlsConfigError::from_invalid_anomaly)?;
+                for certificate in identity.certificates() { bound = native_bound(bound, certificate.len()).map_err(TlsConfigError::from_invalid_anomaly)?; }
             },
             Self::SunPkcs12(store) => for identity in store.identities() {
-                bound = native_bound(bound, identity.private_key_pkcs8().len())?;
-                for certificate in identity.certificates() { bound = native_bound(bound, certificate.len())?; }
+                bound = native_bound(bound, identity.private_key_pkcs8().len()).map_err(TlsConfigError::from_invalid_anomaly)?;
+                for certificate in identity.certificates() { bound = native_bound(bound, certificate.len()).map_err(TlsConfigError::from_invalid_anomaly)?; }
             },
             Self::Deferred(owner) => for identity in owner.store.identities() {
-                for certificate in identity.certificates() { bound = native_bound(bound, certificate.len())?; }
+                for certificate in identity.certificates() { bound = native_bound(bound, certificate.len()).map_err(TlsConfigError::from_invalid_anomaly)?; }
             },
         }
-        let charge = charge.budget().reserve(bound)?;
+        let charge = charge.budget().reserve(bound).map_err(TlsConfigError::Other)?;
         let (manager, identities) = match self {
             Self::Eager(store) => {
                 let manager = KeyManager::new(algorithm, store.identities());
                 let identities = store.identities().iter().map(|identity| {
-                    let key = unsafe { random.private_key_from_pkcs8(identity.private_key_pkcs8())? };
+                    let key = unsafe { random.private_key_from_pkcs8(identity.private_key_pkcs8()).map_err(TlsConfigError::from_invalid_anomaly)? };
                     ClientIdentity::new(identity.certificates(), Key::Eager { key, _random: Arc::clone(random) }, algorithm, charge.budget())
-                }).collect::<Result<Vec<_>>>()?;
+                }).collect::<TlsConfigResult<Vec<_>>>()?;
                 (manager, identities)
             }
             Self::SunJks(store) => {
                 let aliases = store.identities().iter().map(|identity| identity.alias()).collect::<Vec<_>>();
                 let manager = KeyManager::from_aliases(algorithm, &aliases);
                 let identities = store.identities().iter().map(|identity| {
-                    let key = unsafe { random.private_key_from_pkcs8(identity.private_key_pkcs8())? };
+                    let key = unsafe { random.private_key_from_pkcs8(identity.private_key_pkcs8()).map_err(TlsConfigError::from_invalid_anomaly)? };
                     ClientIdentity::new(identity.certificates(), Key::Eager { key, _random: Arc::clone(random) }, algorithm, charge.budget())
-                }).collect::<Result<Vec<_>>>()?;
+                }).collect::<TlsConfigResult<Vec<_>>>()?;
                 (manager, identities)
             }
             Self::SunPkcs12(store) => {
                 let aliases = store.identities().iter().map(|identity| identity.alias()).collect::<Vec<_>>();
                 let manager = KeyManager::from_aliases(algorithm, &aliases);
                 let identities = store.identities().iter().map(|identity| {
-                    let key = unsafe { random.private_key_from_pkcs8(identity.private_key_pkcs8())? };
+                    let key = unsafe { random.private_key_from_pkcs8(identity.private_key_pkcs8()).map_err(TlsConfigError::from_invalid_anomaly)? };
                     ClientIdentity::new(identity.certificates(), Key::Eager { key, _random: Arc::clone(random) }, algorithm, charge.budget())
-                }).collect::<Result<Vec<_>>>()?;
+                }).collect::<TlsConfigResult<Vec<_>>>()?;
                 (manager, identities)
             }
             Self::Deferred(owner) => {
@@ -102,7 +106,7 @@ impl Material {
                 let manager = KeyManager::from_aliases(algorithm, &aliases);
                 let identities = owner.store.identities().iter().enumerate().map(|(index, identity)| {
                     ClientIdentity::new(identity.certificates(), Key::Deferred { owner: Arc::clone(owner), index }, algorithm, charge.budget())
-                }).collect::<Result<Vec<_>>>()?;
+                }).collect::<TlsConfigResult<Vec<_>>>()?;
                 (manager, identities)
             }
         };
@@ -117,12 +121,12 @@ impl NativeIdentities {
 }
 
 impl ClientIdentity {
-    fn new(certificates: &[Vec<u8>], key: Key, algorithm: Algorithm, memory: &Arc<MemoryBudget>) -> Result<Self> {
-        let certificate = X509::from_der(&certificates[0]).map_err(invalid)?;
-        let kind = KeyType::of(&certificate)?;
-        let mut chain = Stack::new().map_err(invalid)?;
-        for certificate in &certificates[1..] { chain.push(X509::from_der(certificate).map_err(invalid)?).map_err(invalid)?; }
-        let eligible = algorithm == Algorithm::SunX509 || security::java_client_chain_eligible(&std::iter::once(certificate.as_ref()).chain(chain.iter()).collect::<Vec<_>>(), memory)?;
+    fn new(certificates: &[Vec<u8>], key: Key, algorithm: Algorithm, memory: &Arc<MemoryBudget>) -> TlsConfigResult<Self> {
+        let certificate = X509::from_der(&certificates[0]).map_err(TlsConfigError::invalid)?;
+        let kind = KeyType::of(&certificate).map_err(TlsConfigError::from_invalid_anomaly)?;
+        let mut chain = Stack::new().map_err(TlsConfigError::invalid)?;
+        for certificate in &certificates[1..] { chain.push(X509::from_der(certificate).map_err(TlsConfigError::invalid)?).map_err(TlsConfigError::invalid)?; }
+        let eligible = algorithm == Algorithm::SunX509 || security::java_client_chain_eligible(&std::iter::once(certificate.as_ref()).chain(chain.iter()).collect::<Vec<_>>(), memory).map_err(TlsConfigError::Other)?;
         Ok(Self { certificate, chain, kind, eligible, key })
     }
 
@@ -155,8 +159,8 @@ impl ProtectedKeys {
     fn recover(&self, index: usize, random: &Arc<random::Context>, signature_random: &Arc<random::Context>) -> Result<Option<SelectedKey>> {
         let recovered = match self.store.identities()[index].recover(self.password.as_ref().map(|password| password.as_str()), self._password_charge.budget()) {
             Ok(key) => key,
-            Err(error) if error.code == "rtdb.tls/invalid-keystore" => return Ok(None),
-            Err(error) => return Err(error),
+            Err(rtdb_tls::TlsError::InvalidKeystore(_)) => return Ok(None),
+            Err(error) => return Err(error.into_anomaly()),
         };
         let key = unsafe { random.private_key_from_pkcs8(recovered.private_key_pkcs8())? };
         Ok(Some(SelectedKey { key, _charge: recovered.reservation(), _random: Arc::clone(random), _signature_random: Arc::clone(signature_random) }))

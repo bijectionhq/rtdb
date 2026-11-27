@@ -278,7 +278,7 @@ fn recovered_private_keys_own_charges_after_the_protected_store_drops() {
     assert_eq!(memory.used_bytes(), original + charge * 2);
     let empty = MemoryBudget::new(0);
     let error = store.identities()[0].recover(Some("12345678"), &empty).err().unwrap();
-    assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+    assert_eq!(error.code(), "rtdb/memory-budget-exceeded");
     drop(store); assert_eq!(memory.used_bytes(), charge * 2);
     assert!(openssl::pkey::PKey::private_key_from_pkcs8(first.private_key_pkcs8()).is_ok());
     let retained = first.reservation(); drop(first); assert_eq!(memory.used_bytes(), charge * 2);

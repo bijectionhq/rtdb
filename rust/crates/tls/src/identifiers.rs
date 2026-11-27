@@ -1,7 +1,7 @@
 use std::{borrow::Cow, sync::Arc};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_types::{Anomaly, Result, UriParts};
-use crate::{DistinguishedName, invalid};
+use crate::{DistinguishedName, TlsError, TlsResult, invalid};
 use crate::java_der::{Der, encoded, malformed, octets, single, valid_oid};
 
 mod alternative_names;
@@ -33,10 +33,10 @@ impl CertificateIdentifiers {
     /// Malformed noncritical identifiers follow Java's absence/fallback rules; malformed critical identifiers and duplicate parsed identifiers fail.
     /// Parsing and retained bytes own an independent reservation; budget errors remain budget errors.
     /// URI authority names requiring interface lookup or DNS return `rtdb.tls/unsupported-identifier`.
-    pub fn decode(certificate_der: &[u8], memory: &Arc<MemoryBudget>) -> Result<Self> {
+    pub fn decode(certificate_der: &[u8], memory: &Arc<MemoryBudget>) -> TlsResult<Self> {
         let bound = certificate_der.len().checked_mul(512).and_then(|bytes| bytes.checked_add(65_536))
-            .ok_or_else(|| invalid("Certificate identifiers exceed allocation range"))?;
-        let reservation = memory.reserve(bound)?;
+            .ok_or_else(|| TlsError::invalid_keystore("Certificate identifiers exceed allocation range"))?;
+        let reservation = memory.reserve(bound).map_err(TlsError::Other)?;
         let mut subject = None;
         let mut unparseable_subject = None;
         let mut authority = None;
@@ -47,7 +47,7 @@ impl CertificateIdentifiers {
                         if subject.is_some() { return Err(duplicate()); }
                         subject = Some(value);
                     }
-                    Err(error) if !critical && error.code == "rtdb.tls/invalid-keystore" => unparseable_subject = Some(value),
+                    Err(TlsError::InvalidKeystore(_)) if !critical => unparseable_subject = Some(value),
                     Err(error) => return Err(error),
                 },
                 [0x55, 0x1d, 0x23] => match authority_identifier(&value, memory) {
@@ -55,7 +55,7 @@ impl CertificateIdentifiers {
                         if authority.is_some() { return Err(duplicate()); }
                         authority = Some(value);
                     }
-                    Err(error) if !critical && error.code == "rtdb.tls/invalid-keystore" => {},
+                    Err(TlsError::InvalidKeystore(_)) if !critical => {},
                     Err(error) => return Err(error),
                 },
                 _ => {},
@@ -75,36 +75,38 @@ impl CertificateIdentifiers {
     pub fn serial_number(&self) -> &[u8] { &self.serial }
 }
 
-fn scan_certificate(certificate_der: &[u8], mut visit: impl FnMut(&[u8], bool, Vec<u8>) -> Result<()>) -> Result<Vec<u8>> {
-    let certificate = single(certificate_der, 0x30)?;
+fn der_err(error: Anomaly) -> TlsError { TlsError::from_invalid_anomaly(error) }
+
+fn scan_certificate(certificate_der: &[u8], mut visit: impl FnMut(&[u8], bool, Vec<u8>) -> TlsResult<()>) -> TlsResult<Vec<u8>> {
+    let certificate = single(certificate_der, 0x30).map_err(der_err)?;
     let mut certificate = Der(&certificate);
-    let tbs = certificate.expect(0x30)?;
-    certificate.expect(0x30)?;
-    certificate.expect(3)?;
-    certificate.end()?;
+    let tbs = certificate.expect(0x30).map_err(der_err)?;
+    certificate.expect(0x30).map_err(der_err)?;
+    certificate.expect(3).map_err(der_err)?;
+    certificate.end().map_err(der_err)?;
     let mut tbs = Der(&tbs);
-    if tbs.0.first().is_some_and(|tag| tag & 0xdf == 0x80) { tbs.next()?; }
-    let serial = signed(&tbs.expect(2)?)?;
-    for _ in 0..5 { tbs.expect(0x30)?; }
+    if tbs.0.first().is_some_and(|tag| tag & 0xdf == 0x80) { tbs.next().map_err(der_err)?; }
+    let serial = signed(&tbs.expect(2).map_err(der_err)?).map_err(der_err)?;
+    for _ in 0..5 { tbs.expect(0x30).map_err(der_err)?; }
     for tag in [1, 2] {
-        if tbs.0.first().is_some_and(|value| value & 0xdf == (0x80 | tag)) { tbs.next()?; }
+        if tbs.0.first().is_some_and(|value| value & 0xdf == (0x80 | tag)) { tbs.next().map_err(der_err)?; }
     }
     if !tbs.0.is_empty() {
-        let (tag, extensions) = tbs.next()?;
+        let (tag, extensions) = tbs.next().map_err(der_err)?;
         if tag == 0xa3 {
-            let extensions = Der(&extensions).expect(0x30)?;
+            let extensions = Der(&extensions).expect(0x30).map_err(der_err)?;
             let mut extensions = Der(&extensions);
             while !extensions.0.is_empty() {
-                let extension = extensions.next()?;
-                if !matches!(extension.0, 0x30 | 0x31) { return Err(malformed()); }
+                let extension = extensions.next().map_err(der_err)?;
+                if !matches!(extension.0, 0x30 | 0x31) { return Err(der_err(malformed())); }
                 let mut extension = Der(&extension.1);
-                let oid = extension.expect(6)?;
-                valid_oid(&oid)?;
-                let (tag, content) = extension.next()?;
+                let oid = extension.expect(6).map_err(der_err)?;
+                valid_oid(&oid).map_err(der_err)?;
+                let (tag, content) = extension.next().map_err(der_err)?;
                 let (critical, value) = if tag == 1 {
-                    if content.len() != 1 { return Err(malformed()); }
-                    (content[0] != 0, octets(extension.next()?)?)
-                } else { (false, octets((tag, content))?) };
+                    if content.len() != 1 { return Err(der_err(malformed())); }
+                    (content[0] != 0, octets(extension.next().map_err(der_err)?).map_err(der_err)?)
+                } else { (false, octets((tag, content)).map_err(der_err)?) };
                 visit(&oid, critical, value)?;
             }
         }
@@ -118,56 +120,56 @@ fn signed(mut bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(bytes.to_vec())
 }
 
-fn subject_identifier(bytes: &[u8]) -> Result<()> {
+fn subject_identifier(bytes: &[u8]) -> TlsResult<()> {
     let mut encoded = Der(bytes);
-    let value = encoded.next()?;
-    encoded.end()?;
-    octets(value)?;
+    let value = encoded.next().map_err(der_err)?;
+    encoded.end().map_err(der_err)?;
+    octets(value).map_err(der_err)?;
     Ok(())
 }
 
-fn authority_identifier(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result<Authority> {
-    let sequence = single(bytes, 0x30)?;
+fn authority_identifier(bytes: &[u8], memory: &Arc<MemoryBudget>) -> TlsResult<Authority> {
+    let sequence = single(bytes, 0x30).map_err(der_err)?;
     let mut fields = Der(&sequence);
     let mut result = Authority { key: None, serial: None };
     let mut names = false;
     while !fields.0.is_empty() {
-        let (tag, content) = fields.next()?;
+        let (tag, content) = fields.next().map_err(der_err)?;
         match tag {
             0x80 if result.key.is_none() => result.key = Some(encoded(4, &content)),
             0xa1 if !names => { general_names(&content, memory)?; names = true; },
-            0x82 if result.serial.is_none() => result.serial = Some(signed(&content)?),
-            _ => return Err(malformed()),
+            0x82 if result.serial.is_none() => result.serial = Some(signed(&content).map_err(der_err)?),
+            _ => return Err(der_err(malformed())),
         }
     }
     Ok(result)
 }
 
-fn general_names(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result<()> {
-    if bytes.is_empty() { return Err(malformed()); }
+fn general_names(bytes: &[u8], memory: &Arc<MemoryBudget>) -> TlsResult<()> {
+    if bytes.is_empty() { return Err(der_err(malformed())); }
     let mut names = Der(bytes);
     while !names.0.is_empty() {
-        let (tag, content) = names.next()?;
+        let (tag, content) = names.next().map_err(der_err)?;
         match tag {
             0xa0 => {
                 let mut name = Der(&content);
-                let oid = name.expect(6)?;
-                valid_oid(&oid)?;
-                name.expect(0xa0)?;
-                if builtin_extension_oid(&oid) { return Err(malformed()); }
+                let oid = name.expect(6).map_err(der_err)?;
+                valid_oid(&oid).map_err(der_err)?;
+                name.expect(0xa0).map_err(der_err)?;
+                if builtin_extension_oid(&oid) { return Err(der_err(malformed())); }
             },
             0x81 => {
                 let name = ascii(&content);
                 let domain = name.find('@').map_or(name.as_str(), |index| &name[index + 1..]);
-                if domain.is_empty() || domain == "." { return Err(malformed()); }
+                if domain.is_empty() || domain == "." { return Err(der_err(malformed())); }
             },
             0x82 | 0xa3 => {},
             0xa4 => { DistinguishedName::decode(&content, memory)?; },
-            0xa5 => edi_name(&content)?,
+            0xa5 => edi_name(&content).map_err(der_err)?,
             0x86 => uri_name(&content)?,
             0x87 if matches!(content.len(), 4 | 8 | 16 | 32) => {},
-            0x88 => valid_oid(&content)?,
-            _ => return Err(malformed()),
+            0x88 => valid_oid(&content).map_err(der_err)?,
+            _ => return Err(der_err(malformed())),
         }
     }
     Ok(())
@@ -190,23 +192,23 @@ fn edi_name(bytes: &[u8]) -> Result<()> {
     if party { Ok(()) } else { Err(malformed()) }
 }
 
-fn uri_name(bytes: &[u8]) -> Result<()> {
+fn uri_name(bytes: &[u8]) -> TlsResult<()> {
     let text = ascii(bytes);
-    let uri = UriParts::parse(&text).map_err(invalid)?;
-    if uri.scheme().is_none() { return Err(malformed()); }
+    let uri = UriParts::parse(&text).map_err(TlsError::invalid_keystore)?;
+    if uri.scheme().is_none() { return Err(der_err(malformed())); }
     if let Some(host) = uri.host() {
         if let Some(address) = host.strip_prefix('[').and_then(|host| host.strip_suffix(']')) {
             if let Some((address, scope)) = address.split_once('%') {
-                let mapped = ipv4_mapped(address)?;
-                if mapped { return Err(malformed()); }
+                let mapped = ipv4_mapped(address).map_err(der_err)?;
+                if mapped { return Err(der_err(malformed())); }
                 if scope.bytes().try_fold(0i32, |zone, byte| {
                     if !byte.is_ascii_digit() { None } else { zone.checked_mul(10)?.checked_add(i32::from(byte - b'0')) }
                 }).is_none() {
-                    return Err(Anomaly::unsupported("rtdb.tls/unsupported-identifier", "Certificate authority URI requires IPv6 interface-scope resolution"));
+                    return Err(TlsError::unsupported_identifier("Certificate authority URI requires IPv6 interface-scope resolution"));
                 }
             }
         } else if host.ends_with('.') {
-            return Err(Anomaly::unsupported("rtdb.tls/unsupported-identifier", "Certificate authority URI requires Java host-resolution fallback"));
+            return Err(TlsError::unsupported_identifier("Certificate authority URI requires Java host-resolution fallback"));
         }
     }
     Ok(())
@@ -241,7 +243,7 @@ fn builtin_extension_oid(oid: &[u8]) -> bool {
     }
 }
 
-fn duplicate() -> Anomaly { invalid("Certificate contains duplicate parsed identifier extensions") }
+fn duplicate() -> TlsError { TlsError::invalid_keystore("Certificate contains duplicate parsed identifier extensions") }
 
 #[cfg(test)]
 mod tests;

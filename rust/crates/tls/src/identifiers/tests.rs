@@ -139,7 +139,7 @@ fn uri_hosts_distinguish_java_syntax_numeric_scope_and_environmental_resolution(
     for name in ["https://[fe80::1%eth0]/", "https://[fe80::1%2147483648]/", "https://ca.example./"] {
         let bytes = certificate(&[1], &[extension(35, false, &with_names(&der(0x86, name.as_bytes())))]);
         let error = CertificateIdentifiers::decode(&bytes, &MemoryBudget::new(1 << 20)).unwrap_err();
-        assert_eq!(error.code, "rtdb.tls/unsupported-identifier", "{name}");
+        assert_eq!(error.code(), "rtdb.tls/unsupported-identifier", "{name}");
     }
 }
 
@@ -192,7 +192,7 @@ fn identifier_ownership_and_error_paths_release_independent_reservations() {
     drop(value);
     assert_eq!(memory.used_bytes(), 0);
     let tiny = MemoryBudget::new(1);
-    assert_eq!(CertificateIdentifiers::decode(&[], &tiny).unwrap_err().code, "rtdb/memory-budget-exceeded");
+    assert_eq!(CertificateIdentifiers::decode(&[], &tiny).unwrap_err().code(), "rtdb/memory-budget-exceeded");
     assert!(CertificateIdentifiers::decode(&[], &memory).is_err());
     assert_eq!(memory.used_bytes(), 0);
     assert_eq!(tiny.used_bytes(), 0);
@@ -202,6 +202,6 @@ fn identifier_ownership_and_error_paths_release_independent_reservations() {
 fn nested_directory_name_admission_errors_are_not_noncritical_parse_failures() {
     let bytes = certificate(&[1], &[extension(35, false, &with_names(&directory()))]);
     let memory = MemoryBudget::new(bytes.len() * 512 + 65_536);
-    assert_eq!(CertificateIdentifiers::decode(&bytes, &memory).unwrap_err().code, "rtdb/memory-budget-exceeded");
+    assert_eq!(CertificateIdentifiers::decode(&bytes, &memory).unwrap_err().code(), "rtdb/memory-budget-exceeded");
     assert_eq!(memory.used_bytes(), 0);
 }

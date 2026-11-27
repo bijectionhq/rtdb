@@ -4,25 +4,25 @@ use openssl::x509::X509Ref;
 use rtdb_columnar::MemoryBudget;
 use rtdb_tls::CertificatePublicKeyEncoding;
 use rtdb_types::Result;
-use super::invalid;
+use super::{TlsConfigError, TlsConfigResult};
 
 pub(super) fn same(left: &X509Ref, right: &X509Ref, memory: &Arc<MemoryBudget>) -> Result<bool> {
+    same_typed(left, right, memory).map_err(TlsConfigError::into_anomaly)
+}
+
+pub(super) fn same_typed(left: &X509Ref, right: &X509Ref, memory: &Arc<MemoryBudget>) -> TlsConfigResult<bool> {
     let left = decode(left, memory)?;
     let right = decode(right, memory)?;
-    left.same_public_key(&right).map_err(material_error)
+    left.same_public_key(&right).map_err(TlsConfigError::from_tls)
 }
 
-fn decode(certificate: &X509Ref, memory: &Arc<MemoryBudget>) -> Result<CertificatePublicKeyEncoding> {
+fn decode(certificate: &X509Ref, memory: &Arc<MemoryBudget>) -> TlsConfigResult<CertificatePublicKeyEncoding> {
     let length = unsafe { openssl_sys::i2d_X509(certificate.as_ptr(), std::ptr::null_mut()) };
     let bound = usize::try_from(length).ok().and_then(|length| length.checked_add(128))
-        .ok_or_else(|| invalid("TLS public-key certificate encoding exceeds allocation range"))?;
-    let _encoding = memory.reserve(bound)?;
-    let encoded = certificate.to_der().map_err(invalid)?;
-    CertificatePublicKeyEncoding::decode(&encoded, memory).map_err(material_error)
-}
-
-fn material_error(error: rtdb_types::Anomaly) -> rtdb_types::Anomaly {
-    if error.code == "rtdb.tls/invalid-keystore" { invalid(error) } else { error }
+        .ok_or_else(|| TlsConfigError::invalid("TLS public-key certificate encoding exceeds allocation range"))?;
+    let _encoding = memory.reserve(bound).map_err(TlsConfigError::Other)?;
+    let encoded = certificate.to_der().map_err(TlsConfigError::invalid)?;
+    CertificatePublicKeyEncoding::decode(&encoded, memory).map_err(TlsConfigError::from_tls)
 }
 
 #[cfg(test)]
@@ -47,7 +47,7 @@ mod tests {
         content.extend_from_slice(&der(3, &bits));
         der(0x30, &content)
     }
-    fn parse(key: &[u8]) -> Result<CertificatePublicKeyEncoding> {
+    fn parse(key: &[u8]) -> rtdb_tls::TlsResult<CertificatePublicKeyEncoding> {
         let mut signed = der(2, &[1]);
         for _ in 0..4 { signed.extend(der(0x30, &[])); }
         signed.extend_from_slice(key);

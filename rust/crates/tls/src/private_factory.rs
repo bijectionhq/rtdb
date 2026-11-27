@@ -2,7 +2,7 @@ use std::sync::Arc;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_types::{Anomaly, Result};
 use zeroize::Zeroizing;
-use crate::{invalid, java_der::Der, secret_der::{self, Algorithm, SecretBytes, concatenate, encode}};
+use crate::{TlsError, TlsResult, invalid, java_der::Der, secret_der::{self, Algorithm, SecretBytes, concatenate, encode}};
 use failure::{FactoryFailure, FactoryResult};
 mod curves;
 mod failure;
@@ -37,9 +37,10 @@ impl PrivateKey {
         Ok(Self { encoded, _reservation: reservation })
     }
 
-    pub(crate) fn from_pkcs12(input: FactoryInput<'_>, memory: &Arc<MemoryBudget>) -> Result<Self> {
-        let reservation = memory.reserve(allocation_bound(input.encoded.len())?)?;
-        let encoded = input.generate().map_err(FactoryFailure::into_anomaly)?;
+    pub(crate) fn from_pkcs12(input: FactoryInput<'_>, memory: &Arc<MemoryBudget>) -> TlsResult<Self> {
+        let bound = allocation_bound(input.encoded.len()).map_err(TlsError::from_invalid_anomaly)?;
+        let reservation = memory.reserve(bound).map_err(TlsError::Other)?;
+        let encoded = input.generate().map_err(|failure| TlsError::from_invalid_anomaly(failure.into_anomaly()))?;
         Self::from_admitted(encoded, reservation)
     }
 
@@ -47,9 +48,10 @@ impl PrivateKey {
 
     pub(crate) fn parse_jks(encoded: &[u8], memory: &Arc<MemoryBudget>) -> Result<Self> { raw::parse_key(encoded, memory) }
 
-    fn from_admitted(encoded: Zeroizing<Vec<u8>>, mut reservation: Arc<MemoryReservation>) -> Result<Self> {
-        let retained = encoded.capacity().checked_add(std::mem::size_of::<Self>()).and_then(|bytes| bytes.checked_add(128)).ok_or_else(overflow)?;
-        Arc::get_mut(&mut reservation).expect("unpublished private key reservation").shrink_to(retained)?;
+    fn from_admitted(encoded: Zeroizing<Vec<u8>>, mut reservation: Arc<MemoryReservation>) -> TlsResult<Self> {
+        let retained = encoded.capacity().checked_add(std::mem::size_of::<Self>()).and_then(|bytes| bytes.checked_add(128))
+            .ok_or_else(|| TlsError::from_invalid_anomaly(overflow()))?;
+        Arc::get_mut(&mut reservation).expect("unpublished private key reservation").shrink_to(retained).map_err(TlsError::Other)?;
         Ok(Self { encoded, _reservation: reservation })
     }
 

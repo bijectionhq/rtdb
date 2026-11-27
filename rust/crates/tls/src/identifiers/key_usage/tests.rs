@@ -49,7 +49,7 @@ fn malformed_key_usage_is_absent_only_when_noncritical() {
     for value in [vec![], encoded(3, &[]), encoded(3, &[1]), encoded(3, &[8, 0]), encoded(3, &[0xff, 4]),
         encoded(5, &[]), [encoded(3, &[0, 4]), vec![0]].concat(), vec![3, 0x80, 0, 4, 0, 0]] {
         assert!(decode(&[extension(false, &value)]).permits_certificate_signing());
-        assert_eq!(CertificateKeyUsage::decode(&certificate(&[extension(true, &value)]), &MemoryBudget::new(1 << 20)).unwrap_err().code, "rtdb.tls/invalid-keystore");
+        assert_eq!(CertificateKeyUsage::decode(&certificate(&[extension(true, &value)]), &MemoryBudget::new(1 << 20)).unwrap_err().code(), "rtdb.tls/invalid-keystore");
     }
 }
 
@@ -78,7 +78,7 @@ fn key_usage_reservations_cover_success_absence_and_error_until_drop() {
     assert!(CertificateKeyUsage::decode(&certificate(&[extension(true, &[5, 0])]), &memory).is_err());
     assert_eq!(memory.used_bytes(), retained);
     drop(parsed); assert_eq!(memory.used_bytes(), 0);
-    assert_eq!(CertificateKeyUsage::decode(&[0xff], &MemoryBudget::new(0)).unwrap_err().code, "rtdb/memory-budget-exceeded");
+    assert_eq!(CertificateKeyUsage::decode(&[0xff], &MemoryBudget::new(0)).unwrap_err().code(), "rtdb/memory-budget-exceeded");
 }
 
 #[test]

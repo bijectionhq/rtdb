@@ -28,8 +28,8 @@ pub(super) fn ordered(source: &Search<'_>, length: usize) -> Result<Vec<X509>> {
         let chain = source.peer[..length].iter().copied().chain(std::iter::once(anchor)).collect::<Vec<_>>();
         match source.validate(&chain) {
             Ok(()) => return Ok(chain.into_iter().map(X509Ref::to_owned).collect()),
-            Err(error) if error.code == "xtdb.kafka/invalid-tls-config" => {},
-            Err(error) => return Err(error),
+            Err(TlsConfigError::Invalid(_)) => {},
+            Err(TlsConfigError::Other(error)) => return Err(error),
         }
     }
     Err(invalid("TLS PKIX ordered path validation failed"))
@@ -81,8 +81,8 @@ impl<'a, 'source> Builder<'a, 'source> {
             let intermediates = frame.intermediates;
             let _attempt = self.source.charge.budget().reserve(256)?;
             match self.forward(index, false) {
-                Err(error) if error.code == "xtdb.kafka/invalid-tls-config" => continue,
-                Err(error) => return Err(error),
+                Err(TlsConfigError::Invalid(_)) => continue,
+                Err(TlsConfigError::Other(error)) => return Err(error),
                 Ok(()) => {},
             }
             let candidate = self.candidates[index].certificate;
@@ -91,8 +91,8 @@ impl<'a, 'source> Builder<'a, 'source> {
                     .chain(std::iter::once(self.candidates[anchor].certificate)).collect::<Vec<_>>();
                 match self.source.validate(&chain) {
                     Ok(()) => return Ok(chain.into_iter().map(X509Ref::to_owned).collect()),
-                    Err(error) if error.code == "xtdb.kafka/invalid-tls-config" => continue,
-                    Err(error) => return Err(error),
+                    Err(TlsConfigError::Invalid(_)) => continue,
+                    Err(TlsConfigError::Other(error)) => return Err(error),
                 }
             }
             let self_issued = self.source.same_name(candidate.subject_name(), candidate.issuer_name())?;
@@ -104,17 +104,17 @@ impl<'a, 'source> Builder<'a, 'source> {
             path.push(index);
             match self.frame(&path, count) {
                 Ok(frame) => frames.push(frame),
-                Err(error) if error.code == "xtdb.kafka/invalid-tls-config" => { path.pop(); },
-                Err(error) => return Err(error),
+                Err(TlsConfigError::Invalid(_)) => { path.pop(); },
+                Err(TlsConfigError::Other(error)) => return Err(error),
             }
         }
         Err(invalid("TLS PKIX path building found no permitted path"))
     }
 
-    fn frame(&self, path: &[usize], intermediates: usize) -> Result<Frame> {
+    fn frame(&self, path: &[usize], intermediates: usize) -> TlsConfigResult<Frame> {
         let bound = self.candidates.len().checked_mul(512).and_then(|length| length.checked_add(65_536))
-            .ok_or_else(|| invalid("TLS builder candidates exceed allocation range"))?;
-        let charge = self.source.charge.budget().reserve(bound)?;
+            .ok_or_else(|| TlsConfigError::invalid("TLS builder candidates exceed allocation range"))?;
+        let charge = self.source.charge.budget().reserve(bound).map_err(TlsConfigError::Other)?;
         let previous = *path.last().expect("nonempty builder path");
         let mut selected = Vec::new();
         for index in &self.trusted {
@@ -126,7 +126,7 @@ impl<'a, 'source> Builder<'a, 'source> {
                 match self.matches(index, previous, Some(intermediates)) {
                     Ok(true) => certificates.push(index),
                     Ok(false) => {},
-                    Err(error) if error.code == "xtdb.kafka/invalid-tls-config" => {},
+                    Err(TlsConfigError::Invalid(_)) => {},
                     Err(error) => return Err(error),
                 }
             }
@@ -141,7 +141,7 @@ impl<'a, 'source> Builder<'a, 'source> {
                 match self.repeated(*previous, candidate) {
                     Ok(true) => { repeated = true; break; },
                     Ok(false) => {},
-                    Err(error) if error.code == "xtdb.kafka/invalid-tls-config" => { repeated = true; break; },
+                    Err(TlsConfigError::Invalid(_)) => { repeated = true; break; },
                     Err(error) => return Err(error),
                 }
             }
@@ -150,38 +150,38 @@ impl<'a, 'source> Builder<'a, 'source> {
         Ok(Frame { candidates: selected, next: 0, intermediates, _charge: charge })
     }
 
-    fn matches(&self, index: usize, previous: usize, intermediates: Option<usize>) -> Result<bool> {
+    fn matches(&self, index: usize, previous: usize, intermediates: Option<usize>) -> TlsConfigResult<bool> {
         let candidate = &self.candidates[index];
         let child = self.candidates[previous].certificate;
         if !self.source.same_name(candidate.certificate.subject_name(), child.issuer_name())? { return Ok(false); }
-        if candidate.certificate.version() < 2 && (candidate.certificate.not_before().compare(child.not_before()).map_err(invalid)?.is_gt()
-            || candidate.certificate.not_after().compare(child.not_after()).map_err(invalid)?.is_lt()) { return Ok(false); }
+        if candidate.certificate.version() < 2 && (candidate.certificate.not_before().compare(child.not_before()).map_err(TlsConfigError::invalid)?.is_gt()
+            || candidate.certificate.not_after().compare(child.not_after()).map_err(TlsConfigError::invalid)?.is_lt()) { return Ok(false); }
         if let Some(intermediates) = intermediates {
-            if candidate.certificate.not_before().compare(self.source.now).map_err(invalid)?.is_gt()
-                || candidate.certificate.not_after().compare(self.source.now).map_err(invalid)?.is_lt() { return Ok(false); }
-            let constraints = CertificateBasicConstraints::decode(&candidate.encoded, self.source.charge.budget()).map_err(material_error)?;
+            if candidate.certificate.not_before().compare(self.source.now).map_err(TlsConfigError::invalid)?.is_gt()
+                || candidate.certificate.not_after().compare(self.source.now).map_err(TlsConfigError::invalid)?.is_lt() { return Ok(false); }
+            let constraints = CertificateBasicConstraints::decode(&candidate.encoded, self.source.charge.budget()).map_err(TlsConfigError::from_tls)?;
             if constraints.path_length() < intermediates as i32 { return Ok(false); }
         }
         Ok(true)
     }
 
-    fn forward(&self, index: usize, initial: bool) -> Result<()> {
+    fn forward(&self, index: usize, initial: bool) -> TlsConfigResult<()> {
         let candidate = &self.candidates[index];
-        security::verify_untrusted_certificate(candidate.certificate)?;
+        security::verify_untrusted_certificate(candidate.certificate).map_err(TlsConfigError::from_invalid_anomaly)?;
         if self.anchor(index).is_some() { return Ok(()); }
         super::super::super::critical_extensions(candidate.certificate, &[Nid::BASIC_CONSTRAINTS, Nid::NAME_CONSTRAINTS,
             Nid::CERTIFICATE_POLICIES, Nid::POLICY_MAPPINGS, Nid::POLICY_CONSTRAINTS, Nid::INHIBIT_ANY_POLICY,
-            Nid::SUBJECT_ALT_NAME, Nid::KEY_USAGE, Nid::EXT_KEY_USAGE])?;
+            Nid::SUBJECT_ALT_NAME, Nid::KEY_USAGE, Nid::EXT_KEY_USAGE]).map_err(TlsConfigError::from_invalid_anomaly)?;
         if !initial {
-            let path_length = CertificateBasicConstraints::decode(&candidate.encoded, self.source.charge.budget()).map_err(material_error)?.path_length();
-            if path_length == -1 { return Err(invalid("TLS builder candidate is not a certificate authority")); }
-            let usage = CertificateKeyUsage::decode(&candidate.encoded, self.source.charge.budget()).map_err(material_error)?;
-            if !usage.permits_certificate_signing() { return Err(invalid("TLS builder candidate excludes certificate signing")); }
+            let path_length = CertificateBasicConstraints::decode(&candidate.encoded, self.source.charge.budget()).map_err(TlsConfigError::from_tls)?.path_length();
+            if path_length == -1 { return Err(TlsConfigError::invalid("TLS builder candidate is not a certificate authority")); }
+            let usage = CertificateKeyUsage::decode(&candidate.encoded, self.source.charge.budget()).map_err(TlsConfigError::from_tls)?;
+            if !usage.permits_certificate_signing() { return Err(TlsConfigError::invalid("TLS builder candidate excludes certificate signing")); }
         }
         Ok(())
     }
 
-    fn compare(&self, key: Option<&[u8]>, left: usize, right: usize) -> Result<Ordering> {
+    fn compare(&self, key: Option<&[u8]>, left: usize, right: usize) -> TlsConfigResult<Ordering> {
         if self.candidates[left].encoded == self.candidates[right].encoded { return Ok(Ordering::Equal); }
         if let Some(key) = key {
             if self.identifiers(left)?.subject_key_identifier() == Some(key) { return Ok(Ordering::Less); }
@@ -203,20 +203,20 @@ impl<'a, 'source> Builder<'a, 'source> {
         Ok(Ordering::Less)
     }
 
-    fn repeated(&self, left: usize, right: usize) -> Result<bool> {
+    fn repeated(&self, left: usize, right: usize) -> TlsConfigResult<bool> {
         let left = &self.candidates[left]; let right = &self.candidates[right];
         if left.encoded == right.encoded { return Ok(true); }
-        if !self.source.same_name(left.certificate.subject_name(), right.certificate.subject_name())? || !public_key::same(left.certificate, right.certificate, self.source.charge.budget())? { return Ok(false); }
-        let left = CertificateAlternativeNames::decode(&left.encoded, self.source.charge.budget()).map_err(material_error)?;
-        let right = CertificateAlternativeNames::decode(&right.encoded, self.source.charge.budget()).map_err(material_error)?;
+        if !self.source.same_name(left.certificate.subject_name(), right.certificate.subject_name())? || !public_key::same_typed(left.certificate, right.certificate, self.source.charge.budget())? { return Ok(false); }
+        let left = CertificateAlternativeNames::decode(&left.encoded, self.source.charge.budget()).map_err(TlsConfigError::from_tls)?;
+        let right = CertificateAlternativeNames::decode(&right.encoded, self.source.charge.budget()).map_err(TlsConfigError::from_tls)?;
         Ok(left.extension_value() == right.extension_value())
     }
 
-    fn name(&self, name: &X509NameRef) -> Result<DistinguishedName> {
-        DistinguishedName::decode(&name.to_der().map_err(invalid)?, self.source.charge.budget()).map_err(material_error)
+    fn name(&self, name: &X509NameRef) -> TlsConfigResult<DistinguishedName> {
+        DistinguishedName::decode(&name.to_der().map_err(TlsConfigError::invalid)?, self.source.charge.budget()).map_err(TlsConfigError::from_tls)
     }
-    fn identifiers(&self, index: usize) -> Result<CertificateIdentifiers> {
-        CertificateIdentifiers::decode(&self.candidates[index].encoded, self.source.charge.budget()).map_err(material_error)
+    fn identifiers(&self, index: usize) -> TlsConfigResult<CertificateIdentifiers> {
+        CertificateIdentifiers::decode(&self.candidates[index].encoded, self.source.charge.budget()).map_err(TlsConfigError::from_tls)
     }
     fn anchor(&self, index: usize) -> Option<usize> {
         self.anchors.iter().copied().find(|anchor| self.candidates[*anchor].encoded == self.candidates[index].encoded)
@@ -240,9 +240,6 @@ impl<'a, 'source> Builder<'a, 'source> {
 
 fn capacity(size: usize) -> Result<usize> {
     size.checked_mul(4).map(|size| size.div_ceil(3)).ok_or_else(|| invalid("TLS Java collection capacity exceeds allocation range"))
-}
-fn material_error(error: rtdb_types::Anomaly) -> rtdb_types::Anomaly {
-    if error.code == "rtdb.tls/invalid-keystore" { invalid(error) } else { error }
 }
 
 #[cfg(test)]

@@ -22,6 +22,64 @@ pub use sun_pkcs12::{SunX509Pkcs12Identity, SunX509Pkcs12Store};
 mod identifiers;
 pub use identifiers::{CertificateAlternativeNames, CertificateBasicConstraints, CertificateExtendedKeyUsage, CertificateIdentifiers, CertificateKeyUsage, CertificatePublicKeyEncoding};
 
+pub type TlsResult<T> = std::result::Result<T, TlsError>;
+
+/// Typed failure from `rtdb_tls` parsing and recovery, keeping wire codes unchanged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TlsError {
+    InvalidKeystore(String),
+    UnsupportedIdentifier(String),
+    Other(Anomaly),
+}
+
+impl TlsError {
+    pub fn invalid_keystore(error: impl std::fmt::Display) -> Self {
+        Self::InvalidKeystore(error.to_string())
+    }
+
+    pub fn unsupported_identifier(message: impl Into<String>) -> Self {
+        Self::UnsupportedIdentifier(message.into())
+    }
+
+    pub(crate) fn from_invalid_anomaly(error: Anomaly) -> Self {
+        Self::InvalidKeystore(error.message.unwrap_or_default())
+    }
+
+    pub fn code(&self) -> &str {
+        match self {
+            Self::InvalidKeystore(_) => "rtdb.tls/invalid-keystore",
+            Self::UnsupportedIdentifier(_) => "rtdb.tls/unsupported-identifier",
+            Self::Other(anomaly) => &anomaly.code,
+        }
+    }
+
+    pub fn into_anomaly(self) -> Anomaly {
+        self.into()
+    }
+}
+
+impl From<TlsError> for Anomaly {
+    fn from(error: TlsError) -> Self {
+        match error {
+            TlsError::InvalidKeystore(message) => Anomaly::incorrect("rtdb.tls/invalid-keystore", message),
+            TlsError::UnsupportedIdentifier(message) => Anomaly::unsupported("rtdb.tls/unsupported-identifier", message),
+            TlsError::Other(anomaly) => anomaly,
+        }
+    }
+}
+
+impl std::fmt::Display for TlsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidKeystore(message) => write!(f, "rtdb.tls/invalid-keystore: {message}"),
+            Self::UnsupportedIdentifier(message) => write!(f, "rtdb.tls/unsupported-identifier: {message}"),
+            Self::Other(anomaly) => std::fmt::Display::fmt(anomaly, f),
+        }
+    }
+}
+
+impl std::error::Error for TlsError {}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StoreFormat { Java, Pem }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

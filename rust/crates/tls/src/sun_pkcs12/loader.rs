@@ -3,7 +3,7 @@ use openssl::x509::X509;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_types::Result;
 use zeroize::Zeroizing;
-use crate::{CertificateIdentifiers, DistinguishedName, invalid, java_der::{Der, valid_oid}, private_factory::{FactoryInput, PrivateKey}, secret_der::{self, SecretBytes, Value, next}, x500::{equals_ignore_case_utf16, lowercase_utf16}};
+use crate::{CertificateIdentifiers, DistinguishedName, TlsError, TlsResult, invalid, java_der::{Der, valid_oid}, private_factory::{FactoryInput, PrivateKey}, secret_der::{self, SecretBytes, Value, next}, x500::{equals_ignore_case_utf16, lowercase_utf16}};
 use super::{SunX509Pkcs12Identity, attributes::{self, Attributes}, der::{expect, fields, integer, malformed, octets, oid, values}, overflow, protection::{self, Protection}, scratch};
 
 const DATA: &[u8] = b"\x2a\x86\x48\x86\xf7\x0d\x01\x07\x01";
@@ -44,7 +44,7 @@ pub(super) fn load(bytes: &[u8], password: Option<&str>, memory: &Arc<MemoryBudg
                 ciphertext.tag = 4 | (ciphertext.tag & 0x20);
                 let ciphertext = octets(ciphertext)?;
                 let protection = Protection::parse(algorithm)?;
-                protection::retry(Some(password), |password| loaded.read(&protection.decrypt(&ciphertext, password)?, memory))?;
+                protection::retry(Some(password), |password| loaded.read(&protection.decrypt(&ciphertext, password).map_err(TlsError::from_invalid_anomaly)?, memory))?;
             },
             _ => return Err(invalid("Public-key protected PKCS12 content is unsupported")),
         }
@@ -67,37 +67,38 @@ fn content_info(value: Value<'_>) -> Result<ContentInfo> {
 }
 
 impl LoadedPkcs12 {
-    fn read(&mut self, bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result<()> {
-        let contents = expect(&mut Der(bytes), 0x30)?;
-        for (index, bag) in values(&contents)?.into_iter().enumerate() {
-            let mut bag = fields(&bag)?;
-            let kind = oid(&mut bag)?;
-            let wrapper = next(&mut bag)?;
-            if wrapper.tag & 0xdf != 0x80 { return Err(malformed()); }
-            let value = next(&mut Der(&wrapper.content))?;
+    fn read(&mut self, bytes: &[u8], memory: &Arc<MemoryBudget>) -> TlsResult<()> {
+        let inv = TlsError::from_invalid_anomaly;
+        let contents = expect(&mut Der(bytes), 0x30).map_err(inv)?;
+        for (index, bag) in values(&contents).map_err(inv)?.into_iter().enumerate() {
+            let mut bag = fields(&bag).map_err(inv)?;
+            let kind = oid(&mut bag).map_err(inv)?;
+            let wrapper = next(&mut bag).map_err(inv)?;
+            if wrapper.tag & 0xdf != 0x80 { return Err(inv(malformed())); }
+            let value = next(&mut Der(&wrapper.content)).map_err(inv)?;
             let kind = kind.strip_prefix(BAG_PREFIX).and_then(|suffix| if let [kind] = suffix { Some(*kind) } else { None });
             enum Item { Private(Zeroizing<Vec<u8>>), Secret(Zeroizing<Vec<u8>>), Certificate(Vec<u8>, X509), Ignored }
             let item = match kind {
                 Some(2) => {
-                    self.private_keys = self.private_keys.checked_add(1).ok_or_else(overflow)?;
+                    self.private_keys = self.private_keys.checked_add(1).ok_or_else(|| inv(overflow()))?;
                     Item::Private(secret_der::encode(value.tag, &value.content))
                 }
                 Some(3 | 5) => {
-                    if value.tag != 0x30 { return Err(malformed()); }
-                    let [id, wrapper]: [Value<'_>; 2] = values(&value.content)?.try_into().map_err(|_| malformed())?;
-                    if id.tag != 6 { return Err(malformed()); } valid_oid(&id.content)?;
-                    if wrapper.tag & 0xdf != 0x80 { return Err(malformed()); }
-                    let bytes = octets(next(&mut Der(&wrapper.content))?)?;
+                    if value.tag != 0x30 { return Err(inv(malformed())); }
+                    let [id, wrapper]: [Value<'_>; 2] = values(&value.content).map_err(inv)?.try_into().map_err(|_| inv(malformed()))?;
+                    if id.tag != 6 { return Err(inv(malformed())); } valid_oid(&id.content).map_err(inv)?;
+                    if wrapper.tag & 0xdf != 0x80 { return Err(inv(malformed())); }
+                    let bytes = octets(next(&mut Der(&wrapper.content)).map_err(inv)?).map_err(inv)?;
                     if kind == Some(3) {
-                        let native = X509::from_der(&bytes).or_else(|_| X509::from_pem(&bytes)).map_err(invalid)?;
-                        let der = native.to_der().map_err(invalid)?;
+                        let native = X509::from_der(&bytes).or_else(|_| X509::from_pem(&bytes)).map_err(TlsError::invalid_keystore)?;
+                        let der = native.to_der().map_err(TlsError::invalid_keystore)?;
                         CertificateIdentifiers::decode(&der, memory)?;
                         Item::Certificate(der, native)
                     } else { Item::Secret(bytes) }
                 }
                 _ => Item::Ignored,
             };
-            let mut attributes = attributes::parse(&mut bag)?;
+            let mut attributes = attributes::parse(&mut bag).map_err(inv)?;
             match item {
                 Item::Private(protected) => {
                     let key_id = match attributes.key_id.take() {
@@ -105,19 +106,19 @@ impl LoadedPkcs12 {
                         None if self.private_keys == 1 => b"01".to_vec(),
                         None => continue,
                     };
-                    let alias = self.name(attributes.alias.take())?;
+                    let alias = self.name(attributes.alias.take()).map_err(inv)?;
                     let index = self.keys.len();
                     self.keys.push(PrivateEntry { protected, alias: alias.clone(), key_id });
                     self.insert(alias, Entry::Private(index));
                 }
                 Item::Secret(protected) => {
-                    let alias = self.name(attributes.alias.take())?;
+                    let alias = self.name(attributes.alias.take()).map_err(inv)?;
                     self.insert(alias, Entry::Secret(protected));
                 }
                 Item::Certificate(der, native) => {
                     if attributes.key_id.is_none() && self.private_keys == 1 && index == 0 { attributes.key_id = Some(b"01".to_vec()); }
                     if attributes.trusted {
-                        let alias = self.name(attributes.alias.take())?;
+                        let alias = self.name(attributes.alias.take()).map_err(inv)?;
                         self.insert(alias.clone(), Entry::Trusted);
                         attributes.alias = Some(alias);
                     }
@@ -199,11 +200,11 @@ impl LoadedPkcs12 {
             let protection = Protection::parse(next(&mut fields)?)?;
             let ciphertext = octets(next(&mut fields)?)?; fields.end()?;
             let key = protection::retry(password, |password| {
-                let plaintext = protection.decrypt(&ciphertext, password)?;
+                let plaintext = protection.decrypt(&ciphertext, password).map_err(TlsError::from_invalid_anomaly)?;
                 if private.is_some() {
-                    let input = FactoryInput::pkcs12(&plaintext)?;
+                    let input = FactoryInput::pkcs12(&plaintext).map_err(TlsError::from_invalid_anomaly)?;
                     PrivateKey::from_pkcs12(input, memory).map(Some)
-                } else { protection::secret_key(&plaintext)?; Ok(None) }
+                } else { protection::secret_key(&plaintext).map_err(TlsError::from_invalid_anomaly)?; Ok(None) }
             })?;
             let Some((key, index)) = key.zip(private) else { continue; };
             let chain = &chains[index].certificates;

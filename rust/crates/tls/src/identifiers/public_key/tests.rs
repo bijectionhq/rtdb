@@ -173,5 +173,5 @@ fn public_key_encoding_owns_retained_bytes_and_releases_scratch_and_failures() {
     assert!(CertificatePublicKeyEncoding::decode(&certificate(&spki(UNKNOWN, &[5, 1, 0], &[0])), &memory).is_err());
     assert_eq!(memory.used_bytes(), retained);
     drop(first); assert_eq!(memory.used_bytes(), 0);
-    assert_eq!(CertificatePublicKeyEncoding::decode(&[0xff], &MemoryBudget::new(0)).unwrap_err().code, "rtdb/memory-budget-exceeded");
+    assert_eq!(CertificatePublicKeyEncoding::decode(&[0xff], &MemoryBudget::new(0)).unwrap_err().code(), "rtdb/memory-budget-exceeded");
 }

@@ -195,6 +195,49 @@ unsafe extern "C" {
     fn SSL_check_chain(ssl: *mut openssl_sys::SSL, certificate: *mut openssl_sys::X509, key: *mut openssl_sys::EVP_PKEY, chain: *mut openssl_sys::stack_st_X509) -> i32;
     fn SSL_certs_clear(ssl: *mut openssl_sys::SSL);
 }
+pub(crate) type TlsConfigResult<T> = std::result::Result<T, TlsConfigError>;
+
+/// Typed failure for Kafka TLS configuration and PKIX path validation, keeping wire codes unchanged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TlsConfigError {
+    Invalid(Option<String>),
+    Other(Anomaly),
+}
+
+impl TlsConfigError {
+    pub(crate) fn invalid(cause: impl std::fmt::Display) -> Self {
+        Self::Invalid(Some(cause.to_string()))
+    }
+
+    pub(crate) fn from_tls(error: rtdb_tls::TlsError) -> Self {
+        match error {
+            rtdb_tls::TlsError::InvalidKeystore(message) => Self::Invalid(Some(message)),
+            other => Self::Other(other.into_anomaly()),
+        }
+    }
+
+    pub(crate) fn from_invalid_anomaly(error: Anomaly) -> Self {
+        Self::Invalid(error.message)
+    }
+
+    pub(crate) fn into_anomaly(self) -> Anomaly {
+        self.into()
+    }
+}
+
+impl From<TlsConfigError> for Anomaly {
+    fn from(error: TlsConfigError) -> Self {
+        match error {
+            TlsConfigError::Invalid(message) => Anomaly::new_nullable(rtdb_types::AnomalyCategory::Incorrect, "xtdb.kafka/invalid-tls-config", message),
+            TlsConfigError::Other(anomaly) => anomaly,
+        }
+    }
+}
+
+pub(crate) fn material_error(error: rtdb_tls::TlsError) -> Anomaly {
+    TlsConfigError::from_tls(error).into_anomaly()
+}
+
 fn invalid(cause: impl std::fmt::Display) -> Anomaly { Anomaly::incorrect("xtdb.kafka/invalid-tls-config", cause.to_string()) }
 fn overflow() -> Anomaly { invalid("Kafka TLS material exceeds allocation range") }
 

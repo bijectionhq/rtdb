@@ -12,19 +12,19 @@ impl CertificateBasicConstraints {
     /// - Signatures, validity, other extension contents and trust are not verified.
     /// - Parsing scratch owns a reservation until this value drops.
     /// - Budget errors propagate unchanged.
-    pub fn decode(certificate_der: &[u8], memory: &Arc<MemoryBudget>) -> Result<Self> {
+    pub fn decode(certificate_der: &[u8], memory: &Arc<MemoryBudget>) -> TlsResult<Self> {
         let bound = certificate_der.len().checked_mul(512).and_then(|bytes| bytes.checked_add(65_536))
-            .ok_or_else(|| invalid("Certificate basic constraints exceed allocation range"))?;
-        let reservation = memory.reserve(bound)?;
+            .ok_or_else(|| TlsError::invalid_keystore("Certificate basic constraints exceed allocation range"))?;
+        let reservation = memory.reserve(bound).map_err(TlsError::Other)?;
         let mut path_length = None;
         scan_certificate(certificate_der, |oid, critical, encoded| {
             if oid != [0x55, 0x1d, 0x13] { return Ok(()); }
-            match decode_path_length(&encoded) {
+            match decode_path_length(&encoded).map_err(der_err) {
                 Ok(value) => {
-                    if path_length.is_some() { return Err(invalid("Certificate contains duplicate parsed basic-constraints extensions")); }
+                    if path_length.is_some() { return Err(TlsError::invalid_keystore("Certificate contains duplicate parsed basic-constraints extensions")); }
                     path_length = Some(value);
                 }
-                Err(error) if !critical && error.code == "rtdb.tls/invalid-keystore" => {},
+                Err(TlsError::InvalidKeystore(_)) if !critical => {},
                 Err(error) => return Err(error),
             }
             Ok(())

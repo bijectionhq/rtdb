@@ -109,11 +109,16 @@ unsafe extern "C" fn check_date(mut verified: i32, context: *mut openssl_sys::X5
 }
 
 fn reserve<'a>(certificates: impl IntoIterator<Item = &'a X509Ref>, charge: &MemoryReservation) -> Result<Arc<MemoryReservation>> {
+    reserve_typed(certificates, charge).map_err(super::super::TlsConfigError::into_anomaly)
+}
+
+fn reserve_typed<'a>(certificates: impl IntoIterator<Item = &'a X509Ref>, charge: &MemoryReservation) -> super::super::TlsConfigResult<Arc<MemoryReservation>> {
     let bound = certificates.into_iter().try_fold(65_536usize, |bytes, certificate| {
         let length = unsafe { openssl_sys::i2d_X509(certificate.as_ptr(), ptr::null_mut()) };
-        usize::try_from(length).ok().and_then(|length| length.checked_mul(32)).and_then(|length| bytes.checked_add(length)).ok_or_else(|| invalid("TLS peer chain exceeds allocation range"))
+        usize::try_from(length).ok().and_then(|length| length.checked_mul(32)).and_then(|length| bytes.checked_add(length))
+            .ok_or_else(|| super::super::TlsConfigError::invalid("TLS peer chain exceeds allocation range"))
     })?;
-    charge.budget().reserve(bound)
+    charge.budget().reserve(bound).map_err(super::super::TlsConfigError::Other)
 }
 
 // The installed verifier borrows the reservation until this context and its SSL objects are destroyed.

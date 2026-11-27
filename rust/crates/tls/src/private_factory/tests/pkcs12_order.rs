@@ -122,12 +122,12 @@ fn strict_pkcs12_preparation_and_factory_admission_preserve_their_separate_calle
     assert_eq!(PrivateKey::decode(&[], &none).err().unwrap().code, "rtdb/memory-budget-exceeded");
     let input = key(UNKNOWN, &[], &[], &[0], &[]);
     let prepared = FactoryInput::pkcs12(&input).unwrap();
-    assert_eq!(PrivateKey::from_pkcs12(prepared, &none).err().unwrap().code, "rtdb/memory-budget-exceeded");
+    assert_eq!(PrivateKey::from_pkcs12(prepared, &none).err().unwrap().code(), "rtdb/memory-budget-exceeded");
     assert_eq!(none.used_bytes(), 0);
     let bound = allocation_bound(input.len()).unwrap();
     let memory = MemoryBudget::new(bound);
     let prepared = FactoryInput::pkcs12(&input).unwrap();
-    assert_eq!(PrivateKey::from_pkcs12(prepared, &memory).err().unwrap(), invalid("Unsupported Java private-key factory"));
+    assert_eq!(PrivateKey::from_pkcs12(prepared, &memory).err().unwrap().into_anomaly(), invalid("Unsupported Java private-key factory"));
     assert_eq!(memory.used_bytes(), 0);
     let input = named(&[0x2b, 0x65, 112], 32);
     let memory = MemoryBudget::new(allocation_bound(input.len()).unwrap());

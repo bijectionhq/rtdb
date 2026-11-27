@@ -4,19 +4,28 @@ use openssl::{ssl::SslRef, stack::StackRef, x509::{X509Name, X509NameRef, X509Re
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_tls::DistinguishedName;
 use rtdb_types::Result;
-use super::invalid;
+use super::{TlsConfigError, TlsConfigResult, invalid};
 
 pub(super) fn decode(name: &X509NameRef, budget: &Arc<MemoryBudget>) -> Result<DistinguishedName> {
+    decode_typed(name, budget).map_err(TlsConfigError::into_anomaly)
+}
+
+pub(super) fn decode_typed(name: &X509NameRef, budget: &Arc<MemoryBudget>) -> TlsConfigResult<DistinguishedName> {
     let length = unsafe { openssl_sys::i2d_X509_NAME(name.as_ptr(), ptr::null_mut()) };
-    let length = usize::try_from(length).map_err(|_| invalid("TLS distinguished name encoding failed"))?;
-    let _charge = budget.reserve(length.checked_add(64).ok_or_else(|| invalid("TLS distinguished name exceeds allocation range"))?)?;
-    DistinguishedName::decode(&name.to_der().map_err(invalid)?, budget)
-        .map_err(|error| if error.code == "rtdb.tls/invalid-keystore" { invalid(error) } else { error })
+    let length = usize::try_from(length).map_err(|_| TlsConfigError::invalid("TLS distinguished name encoding failed"))?;
+    let _charge = budget.reserve(length.checked_add(64).ok_or_else(|| TlsConfigError::invalid("TLS distinguished name exceeds allocation range"))?)
+        .map_err(TlsConfigError::Other)?;
+    DistinguishedName::decode(&name.to_der().map_err(TlsConfigError::invalid)?, budget)
+        .map_err(TlsConfigError::from_tls)
 }
 
 pub(super) fn same(left: &X509NameRef, right: &X509NameRef, budget: &Arc<MemoryBudget>) -> Result<bool> {
+    same_typed(left, right, budget).map_err(TlsConfigError::into_anomaly)
+}
+
+pub(super) fn same_typed(left: &X509NameRef, right: &X509NameRef, budget: &Arc<MemoryBudget>) -> TlsConfigResult<bool> {
     if left.as_ptr() == right.as_ptr() { return Ok(true); }
-    Ok(decode(left, budget)? == decode(right, budget)?)
+    Ok(decode_typed(left, budget)? == decode_typed(right, budget)?)
 }
 
 pub(super) struct Authorities { names: Vec<DistinguishedName>, _charge: Arc<MemoryReservation> }

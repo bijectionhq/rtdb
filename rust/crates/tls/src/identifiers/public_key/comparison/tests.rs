@@ -102,7 +102,7 @@ fn dh_y_must_start_with_a_nonempty_integer_without_provider_fallback() {
     for bits in [vec![0], vec![0, 2, 0], vec![0, 4, 1, 8], vec![0, 2, 2, 8], vec![0, 2, 0x80, 0, 0], vec![0, 0x30, 0x80, 0, 0]] {
         let bad = read(PKCS3, &parameter(&[23], &[5], None), &bits);
         assert_eq!(bad, bad);
-        assert_eq!(bad.same_public_key(&bad).unwrap_err().code, "rtdb.tls/invalid-keystore");
+        assert_eq!(bad.same_public_key(&bad).unwrap_err().code(), "rtdb.tls/invalid-keystore");
         assert!(bad.same_public_key(&unknown).is_err());
         assert!(unknown.same_public_key(&bad).is_err());
     }

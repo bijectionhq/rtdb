@@ -13,19 +13,19 @@ impl CertificateAlternativeNames {
     /// - Signatures, validity, other extension contents and trust are not verified.
     /// - Parsing scratch and retained bytes own a reservation until this value drops.
     /// - Budget and environmental URI-resolution errors propagate unchanged.
-    pub fn decode(certificate_der: &[u8], memory: &Arc<MemoryBudget>) -> Result<Self> {
+    pub fn decode(certificate_der: &[u8], memory: &Arc<MemoryBudget>) -> TlsResult<Self> {
         let bound = certificate_der.len().checked_mul(512).and_then(|bytes| bytes.checked_add(65_536))
-            .ok_or_else(|| invalid("Certificate alternative names exceed allocation range"))?;
-        let reservation = memory.reserve(bound)?;
+            .ok_or_else(|| TlsError::invalid_keystore("Certificate alternative names exceed allocation range"))?;
+        let reservation = memory.reserve(bound).map_err(TlsError::Other)?;
         let mut value = None;
         scan_certificate(certificate_der, |oid, critical, encoded| {
             if oid != [0x55, 0x1d, 0x11] { return Ok(()); }
-            match single(&encoded, 0x30).and_then(|names| general_names(&names, memory)) {
+            match single(&encoded, 0x30).map_err(der_err).and_then(|names| general_names(&names, memory)) {
                 Ok(()) => {
-                    if value.is_some() { return Err(invalid("Certificate contains duplicate parsed subject-alternative-name extensions")); }
+                    if value.is_some() { return Err(TlsError::invalid_keystore("Certificate contains duplicate parsed subject-alternative-name extensions")); }
                     value = Some(encoded);
                 }
-                Err(error) if !critical && error.code == "rtdb.tls/invalid-keystore" => {},
+                Err(TlsError::InvalidKeystore(_)) if !critical => {},
                 Err(error) => return Err(error),
             }
             Ok(())

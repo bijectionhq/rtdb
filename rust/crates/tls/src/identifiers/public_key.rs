@@ -15,14 +15,14 @@ impl CertificatePublicKeyEncoding {
     /// - Invalid framing, OIDs and bit lengths return a TLS-material error.
     /// - Reserves before parsing and releases scratch admission before returning independently owned encoding bytes.
     /// - The borrowed input has its own owner, and budget errors propagate unchanged.
-    pub fn decode(certificate_der: &[u8], memory: &Arc<MemoryBudget>) -> Result<Self> {
+    pub fn decode(certificate_der: &[u8], memory: &Arc<MemoryBudget>) -> TlsResult<Self> {
         let bound = certificate_der.len().checked_mul(512).and_then(|bytes| bytes.checked_add(65_536))
-            .ok_or_else(|| invalid("Certificate public-key encoding exceeds allocation range"))?;
-        let mut reservation = memory.reserve(bound)?;
-        let encoded = decode_certificate(certificate_der)?;
+            .ok_or_else(|| TlsError::invalid_keystore("Certificate public-key encoding exceeds allocation range"))?;
+        let mut reservation = memory.reserve(bound).map_err(TlsError::Other)?;
+        let encoded = decode_certificate(certificate_der).map_err(der_err)?;
         let retained = encoded.capacity().checked_add(std::mem::size_of::<Self>()).and_then(|bytes| bytes.checked_add(128))
-            .ok_or_else(|| invalid("Certificate public-key encoding exceeds allocation range"))?;
-        Arc::get_mut(&mut reservation).expect("unpublished public-key reservation").shrink_to(retained)?;
+            .ok_or_else(|| TlsError::invalid_keystore("Certificate public-key encoding exceeds allocation range"))?;
+        Arc::get_mut(&mut reservation).expect("unpublished public-key reservation").shrink_to(retained).map_err(TlsError::Other)?;
         Ok(Self { encoded, _reservation: reservation })
     }
 
@@ -36,9 +36,9 @@ impl CertificatePublicKeyEncoding {
     /// - Invalid DH fields return a TLS-material error, including when an encoding is compared with itself.
     /// - Comparison borrows both values' admitted bytes without retaining additional state.
     /// - Other provider acceptance checks, custom provider equality and certificate admission remain outside this method.
-    pub fn same_public_key(&self, other: &Self) -> Result<bool> {
-        let left = comparison::Key::read(self)?;
-        let right = comparison::Key::read(other)?;
+    pub fn same_public_key(&self, other: &Self) -> TlsResult<bool> {
+        let left = comparison::Key::read(self).map_err(der_err)?;
+        let right = comparison::Key::read(other).map_err(der_err)?;
         Ok(left == right)
     }
 }

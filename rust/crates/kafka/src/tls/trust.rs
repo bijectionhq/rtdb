@@ -20,8 +20,14 @@ pub(crate) fn allocation_bound() -> Result<usize> {
 }
 
 pub(crate) fn decode(reservation: Arc<MemoryReservation>) -> Result<KeyStore> {
-    if reservation.bytes() < allocation_bound()? { return Err(super::invalid("Default trust store reservation is too small")); }
-    KeyStore::decode(CACERTS, StoreFormat::Java, StoreUse::Trust, Some("changeit"), None, reservation)
+    decode_typed(reservation).map_err(super::TlsConfigError::into_anomaly)
+}
+
+pub(crate) fn decode_typed(reservation: Arc<MemoryReservation>) -> super::TlsConfigResult<KeyStore> {
+    if reservation.bytes() < allocation_bound().map_err(super::TlsConfigError::from_invalid_anomaly)? {
+        return Err(super::TlsConfigError::invalid("Default trust store reservation is too small"));
+    }
+    KeyStore::decode(CACERTS, StoreFormat::Java, StoreUse::Trust, Some("changeit"), None, reservation).map_err(super::TlsConfigError::Other)
 }
 
 #[cfg(test)]

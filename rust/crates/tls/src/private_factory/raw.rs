@@ -11,7 +11,7 @@ pub(super) fn parse_key(encoded: &[u8], memory: &Arc<MemoryBudget>) -> Result<Pr
             match (FactoryInput { encoded: &raw.encoded, target: raw.target }).generate() {
                 Ok(encoded) => {
                     drop(raw);
-                    PrivateKey::from_admitted(encoded, reservation)
+                    PrivateKey::from_admitted(encoded, reservation).map_err(Anomaly::from)
                 }
                 Err(FactoryFailure::NoSuchAlgorithm(_) | FactoryFailure::InvalidKeySpec(_)) => {
                     drop(reservation);
@@ -32,7 +32,7 @@ impl RawPrivateKey {
 
     fn into_private_key(self) -> Result<PrivateKey> {
         let Self { encoded, target: _, reservation } = self;
-        PrivateKey::from_admitted(encoded, reservation)
+        PrivateKey::from_admitted(encoded, reservation).map_err(Anomaly::from)
     }
 }
 

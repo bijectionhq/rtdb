@@ -25,26 +25,30 @@ impl std::fmt::Debug for Context {
 
 impl Context {
     pub(crate) fn new(name: Option<&str>, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
+        Self::new_typed(name, budget).map_err(super::super::TlsConfigError::into_anomaly)
+    }
+
+    pub(crate) fn new_typed(name: Option<&str>, budget: &Arc<MemoryBudget>) -> super::super::TlsConfigResult<Arc<Self>> {
         let algorithm = match name {
-            Some(name) => Algorithm::parse(name)?,
+            Some(name) => Algorithm::parse(name).map_err(super::super::TlsConfigError::from_invalid_anomaly)?,
             None if cfg!(unix) && std::fs::File::open("/dev/random").is_ok() && std::fs::File::open("/dev/urandom").is_ok() => Algorithm::Native,
             None => Algorithm::Drbg,
         };
-        let charge = budget.reserve(262_144)?;
+        let charge = budget.reserve(262_144).map_err(super::super::TlsConfigError::Other)?;
         let mut random = Random::new(algorithm, budget)?;
-        random.fill(Zeroizing::new([0; 4]).as_mut())?;
-        let context = LibCtx::new().map_err(super::super::invalid)?;
-        let default_provider = Provider::load(Some(&context), "default").map_err(super::super::invalid)?;
+        random.fill(Zeroizing::new([0; 4]).as_mut()).map_err(super::super::TlsConfigError::from_invalid_anomaly)?;
+        let context = LibCtx::new().map_err(super::super::TlsConfigError::invalid)?;
+        let default_provider = Provider::load(Some(&context), "default").map_err(super::super::TlsConfigError::invalid)?;
         if unsafe { OSSL_PROVIDER_add_builtin(context.as_ptr(), c"rtdb-secure-random".as_ptr(), Some(initialize)) } != 1 {
-            return Err(super::super::invalid("Unable to register SecureRandom provider"));
+            return Err(super::super::TlsConfigError::invalid("Unable to register SecureRandom provider"));
         }
-        let random_provider = Provider::load(Some(&context), "rtdb-secure-random").map_err(|_| super::super::invalid("Unable to initialize SecureRandom algorithm"))?;
+        let random_provider = Provider::load(Some(&context), "rtdb-secure-random").map_err(|_| super::super::TlsConfigError::invalid("Unable to initialize SecureRandom algorithm"))?;
         let state = unsafe { OSSL_PROVIDER_get0_provider_ctx(random_provider.as_ptr()) };
-        if state.is_null() { return Err(super::super::invalid("Unable to initialize SecureRandom provider state")); }
+        if state.is_null() { return Err(super::super::TlsConfigError::invalid("Unable to initialize SecureRandom provider state")); }
         let state = unsafe { &*state.cast::<Mutex<Option<Random>>>() };
-        *state.lock().map_err(|_| super::super::invalid("SecureRandom state is unavailable"))? = Some(random);
+        *state.lock().map_err(|_| super::super::TlsConfigError::invalid("SecureRandom state is unavailable"))? = Some(random);
         if unsafe { RAND_set1_random_provider(context.as_ptr(), random_provider.as_ptr()) } != 1 {
-            return Err(super::super::invalid("Unable to select SecureRandom provider"));
+            return Err(super::super::TlsConfigError::invalid("Unable to select SecureRandom provider"));
         }
         Ok(Arc::new(Self { _random_provider: random_provider, _default_provider: default_provider, context, _charge: charge }))
     }

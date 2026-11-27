@@ -3,6 +3,7 @@ use foreign_types::ForeignTypeRef;
 use openssl::{nid::Nid, x509::X509Ref};
 use rtdb_columnar::MemoryReservation;
 use rtdb_types::Result;
+use crate::tls::{TlsConfigError, TlsConfigResult};
 use super::invalid;
 
 const ANY_POLICY: &[u8] = &[0x55, 0x1d, 0x20, 0];
@@ -21,39 +22,43 @@ struct Constraints { require: i32, inhibit: i32 }
 
 // OpenJDK 25.0.1 PolicyChecker, with the default initial anyPolicy set; only the current depth affects policy-tree survival.
 pub(super) fn verify(leaf_first_with_anchor: &[&X509Ref], charge: &Arc<MemoryReservation>) -> Result<()> {
+    verify_typed(leaf_first_with_anchor, charge).map_err(TlsConfigError::into_anomaly)
+}
+
+pub(super) fn verify_typed(leaf_first_with_anchor: &[&X509Ref], charge: &Arc<MemoryReservation>) -> TlsConfigResult<()> {
     let Some((_, nonanchors)) = leaf_first_with_anchor.split_last() else { return Ok(()); };
     if nonanchors.is_empty() { return Ok(()); }
     let bound = nonanchors.iter().try_fold(65_536usize, |bytes, certificate| {
         let length = unsafe { openssl_sys::i2d_X509(certificate.as_ptr(), ptr::null_mut()) };
         usize::try_from(length).ok().and_then(|length| length.checked_mul(512)).and_then(|length| bytes.checked_add(length))
-            .ok_or_else(|| invalid("TLS certificate policy state exceeds allocation range"))
+            .ok_or_else(|| TlsConfigError::invalid("TLS certificate policy state exceeds allocation range"))
     })?;
-    let _reservation = charge.budget().reserve(bound)?;
+    let _reservation = charge.budget().reserve(bound).map_err(TlsConfigError::Other)?;
     let mut frontier = Frontier::from([(ANY_POLICY.into(), Expected::new(ANY_POLICY.into()))]);
-    let mut mapping = i64::try_from(leaf_first_with_anchor.len()).map_err(|_| invalid("TLS certificate path exceeds policy counter range"))?;
+    let mut mapping = i64::try_from(leaf_first_with_anchor.len()).map_err(|_| TlsConfigError::invalid("TLS certificate path exceeds policy counter range"))?;
     let mut any = mapping;
     let mut explicit = mapping;
     for (index, certificate) in nonanchors.iter().enumerate().rev() {
-        let policies = parsed(certificate, Nid::CERTIFICATE_POLICIES, policies)?;
-        let mappings = parsed(certificate, Nid::POLICY_MAPPINGS, mappings)?;
-        let constraints = parsed(certificate, Nid::POLICY_CONSTRAINTS, constraints)?.map(|(_, value)| value)
+        let policies = parsed(certificate, Nid::CERTIFICATE_POLICIES, policies).map_err(TlsConfigError::from_invalid_anomaly)?;
+        let mappings = parsed(certificate, Nid::POLICY_MAPPINGS, mappings).map_err(TlsConfigError::from_invalid_anomaly)?;
+        let constraints = parsed(certificate, Nid::POLICY_CONSTRAINTS, constraints).map_err(TlsConfigError::from_invalid_anomaly)?.map(|(_, value)| value)
             .unwrap_or(Constraints { require: -1, inhibit: -1 });
-        let inhibit_any = parsed(certificate, Nid::INHIBIT_ANY_POLICY, inhibit_any)?.map(|(_, value)| value);
+        let inhibit_any = parsed(certificate, Nid::INHIBIT_ANY_POLICY, inhibit_any).map_err(TlsConfigError::from_invalid_anomaly)?.map(|(_, value)| value);
         let final_certificate = index == 0;
         let self_issued = self_issued(certificate, charge)?;
         if !frontier.is_empty() {
             if let Some((critical, policies)) = policies {
-                frontier = advance(&frontier, &policies, critical, any > 0 || (!final_certificate && self_issued))?;
+                frontier = advance(&frontier, &policies, critical, any > 0 || (!final_certificate && self_issued)).map_err(TlsConfigError::from_invalid_anomaly)?;
             } else { frontier.clear(); }
             if !frontier.is_empty() && !final_certificate {
-                if let Some((_, mappings)) = mappings { apply_mappings(&mut frontier, &mappings, mapping)?; }
+                if let Some((_, mappings)) = mappings { apply_mappings(&mut frontier, &mappings, mapping).map_err(TlsConfigError::from_invalid_anomaly)?; }
             }
         }
         if final_certificate {
             if explicit > 0 && !self_issued { explicit -= 1; }
             if constraints.require == 0 { explicit = 0; }
         }
-        if explicit == 0 && frontier.is_empty() { return Err(invalid("TLS certificate path requires a nonempty policy tree")); }
+        if explicit == 0 && frontier.is_empty() { return Err(TlsConfigError::invalid("TLS certificate path requires a nonempty policy tree")); }
         if !final_certificate {
             if !self_issued {
                 if explicit > 0 { explicit -= 1; }
@@ -104,11 +109,10 @@ fn apply_mappings(frontier: &mut Frontier, mappings: &[(Oid, Oid)], permitted: i
     Ok(())
 }
 
-fn self_issued(certificate: &X509Ref, charge: &MemoryReservation) -> Result<bool> {
-    let subject = certificate.subject_name().to_der().map_err(invalid)?;
-    let issuer = certificate.issuer_name().to_der().map_err(invalid)?;
-    let decode = |encoded: &[u8]| rtdb_tls::DistinguishedName::decode(encoded, charge.budget())
-        .map_err(|error| if error.code == "rtdb.tls/invalid-keystore" { invalid(error) } else { error });
+fn self_issued(certificate: &X509Ref, charge: &MemoryReservation) -> TlsConfigResult<bool> {
+    let subject = certificate.subject_name().to_der().map_err(TlsConfigError::invalid)?;
+    let issuer = certificate.issuer_name().to_der().map_err(TlsConfigError::invalid)?;
+    let decode = |encoded: &[u8]| rtdb_tls::DistinguishedName::decode(encoded, charge.budget()).map_err(TlsConfigError::from_tls);
     let subject = decode(&subject)?;
     let issuer = decode(&issuer)?;
     Ok(subject == issuer)

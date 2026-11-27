@@ -136,7 +136,7 @@ fn name_reservations_are_admitted_before_parsing_and_released_with_each_value() 
     assert_eq!(memory.used_bytes(), retained * 2);
     drop(first); assert_eq!(memory.used_bytes(), retained);
     drop(second); assert_eq!(memory.used_bytes(), 0);
-    assert_eq!(DistinguishedName::decode(&[0xff], &MemoryBudget::new(0)).err().unwrap().code, "rtdb/memory-budget-exceeded");
+    assert_eq!(DistinguishedName::decode(&[0xff], &MemoryBudget::new(0)).err().unwrap().code(), "rtdb/memory-budget-exceeded");
 }
 
 #[test]

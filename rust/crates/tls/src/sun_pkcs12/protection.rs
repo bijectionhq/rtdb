@@ -2,7 +2,7 @@ use openssl::{hash::{Hasher, MessageDigest}, pkey::PKey, provider::Provider, sig
 use rtdb_types::Result;
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
-use crate::{invalid, java_der::Der, secret_der::{self, Value, next}};
+use crate::{TlsError, TlsResult, invalid, java_der::Der, secret_der::{self, Value, next}};
 use super::der::{expect, integer, malformed, octets, oid};
 
 const PKCS12_PBE: &[u8] = b"\x2a\x86\x48\x86\xf7\x0d\x01\x0c\x01";
@@ -106,10 +106,10 @@ impl Protection {
     }
 }
 
-pub(super) fn retry<T>(password: Option<&str>, mut attempt: impl FnMut(&str) -> Result<T>) -> Result<T> {
-    let password = password.ok_or_else(|| invalid("PKCS12 key recovery requires a password"))?;
+pub(super) fn retry<T>(password: Option<&str>, mut attempt: impl FnMut(&str) -> TlsResult<T>) -> TlsResult<T> {
+    let password = password.ok_or_else(|| TlsError::invalid_keystore("PKCS12 key recovery requires a password"))?;
     match attempt(password) {
-        Err(error) if password.is_empty() && error.code == "rtdb.tls/invalid-keystore" => attempt("\0"),
+        Err(TlsError::InvalidKeystore(_)) if password.is_empty() => attempt("\0"),
         result => result,
     }
 }
@@ -127,14 +127,15 @@ pub(super) fn verify_mac(value: Value<'_>, authenticated: &[u8], password: &str)
     fields.end()?;
     if salt.len() < 8 { return Err(invalid("Invalid SunJCE MAC salt length")); }
     retry(Some(password), |password| {
-        let password = password_bytes(password, false)?;
-        let key = derive(hash, &password, &salt, count, 3, hash.size())?;
-        let key = PKey::hmac(&key).map_err(invalid)?;
-        let mut signer = Signer::new(hash, &key).map_err(invalid)?;
-        signer.update(authenticated).map_err(invalid)?;
-        let actual = Zeroizing::new(signer.sign_to_vec().map_err(invalid)?);
-        if bool::from(actual.as_slice().ct_eq(&expected)) { Ok(()) } else { Err(invalid("PKCS12 integrity check failed")) }
-    })
+        let password = password_bytes(password, false).map_err(TlsError::from_invalid_anomaly)?;
+        let key = derive(hash, &password, &salt, count, 3, hash.size()).map_err(TlsError::from_invalid_anomaly)?;
+        let key = PKey::hmac(&key).map_err(TlsError::invalid_keystore)?;
+        let mut signer = Signer::new(hash, &key).map_err(TlsError::invalid_keystore)?;
+        signer.update(authenticated).map_err(TlsError::invalid_keystore)?;
+        let actual = Zeroizing::new(signer.sign_to_vec().map_err(TlsError::invalid_keystore)?);
+        if bool::from(actual.as_slice().ct_eq(&expected)) { Ok(()) } else { Err(TlsError::invalid_keystore("PKCS12 integrity check failed")) }
+    })?;
+    Ok(())
 }
 
 pub(super) fn secret_key(encoded: &[u8]) -> Result<()> {

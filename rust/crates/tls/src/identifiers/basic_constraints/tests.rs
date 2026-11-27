@@ -66,7 +66,7 @@ fn malformed_basic_constraints_obey_criticality_even_for_non_ca() {
         constraints(1, Some(&[0xff, 0x7f, 0xff, 0xff, 0xff]))];
     for value in values {
         assert_eq!(decode(&[extension(false, &value)]).path_length(), -1);
-        assert_eq!(CertificateBasicConstraints::decode(&certificate(&[extension(true, &value)]), &MemoryBudget::new(1 << 20)).unwrap_err().code, "rtdb.tls/invalid-keystore");
+        assert_eq!(CertificateBasicConstraints::decode(&certificate(&[extension(true, &value)]), &MemoryBudget::new(1 << 20)).unwrap_err().code(), "rtdb.tls/invalid-keystore");
     }
 }
 
@@ -96,5 +96,5 @@ fn basic_constraints_ber_framing_and_reservation_lifetimes_follow_the_shared_sca
     assert!(CertificateBasicConstraints::decode(&certificate(&[extension(true, &[5, 0])]), &memory).is_err());
     assert_eq!(memory.used_bytes(), retained);
     drop(parsed); assert_eq!(memory.used_bytes(), 0);
-    assert_eq!(CertificateBasicConstraints::decode(&[0xff], &MemoryBudget::new(0)).unwrap_err().code, "rtdb/memory-budget-exceeded");
+    assert_eq!(CertificateBasicConstraints::decode(&[0xff], &MemoryBudget::new(0)).unwrap_err().code(), "rtdb/memory-budget-exceeded");
 }

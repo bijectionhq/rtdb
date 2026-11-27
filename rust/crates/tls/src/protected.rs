@@ -1,9 +1,9 @@
 use std::{collections::BTreeMap, sync::Arc};
 use openssl::{pkey::{Id, PKey}, x509::X509};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_types::Result;
+use rtdb_types::{Anomaly, Result};
 use zeroize::Zeroizing;
-use super::{JksEntry, KeyStore, invalid, x500::lowercase_utf16};
+use super::{JksEntry, KeyStore, TlsError, TlsResult, invalid, x500::lowercase_utf16};
 
 /// Immutable Java keystore metadata and protected private keys for selection before key recovery.
 /// Loading completes on the caller and retains its supplied reservation; no key password is retained.
@@ -62,24 +62,25 @@ impl ProtectedIdentity {
     /// Password, protected-key framing, unsupported algorithms and Java private-key-entry algorithm mismatch errors occur here.
     /// Java compares key algorithms rather than public-key values; handshake proof of possession remains the transport's responsibility.
     /// Recovery does not cache success or failure and does not try other aliases.
-    pub fn recover(&self, password: Option<&str>, memory: &Arc<MemoryBudget>) -> Result<RecoveredKey> {
-        let password = password.ok_or_else(|| invalid("Java private-key recovery requires a password"))?;
+    pub fn recover(&self, password: Option<&str>, memory: &Arc<MemoryBudget>) -> TlsResult<RecoveredKey> {
+        let password = password.ok_or_else(|| TlsError::invalid_keystore("Java private-key recovery requires a password"))?;
         let protected = match &self.entry.key { ProtectedKey::Jks(bytes) | ProtectedKey::Pkcs12(bytes) => bytes };
-        let leaf = self.entry.certificates.first().ok_or_else(|| invalid("Protected private key has no certificate"))?;
-        let bytes = protected.len().checked_add(leaf.len()).ok_or_else(|| invalid("Private-key recovery allocation exceeds range"))?;
-        let reservation = memory.reserve(KeyStore::allocation_bound_with_passwords(bytes, None, Some(password))?)?;
+        let leaf = self.entry.certificates.first().ok_or_else(|| TlsError::invalid_keystore("Protected private key has no certificate"))?;
+        let bytes = protected.len().checked_add(leaf.len()).ok_or_else(|| TlsError::invalid_keystore("Private-key recovery allocation exceeds range"))?;
+        let bound = KeyStore::allocation_bound_with_passwords(bytes, None, Some(password)).map_err(TlsError::from_invalid_anomaly)?;
+        let reservation = memory.reserve(bound).map_err(TlsError::Other)?;
         let private_key = match &self.entry.key {
             ProtectedKey::Jks(protected) => {
                 let password = Zeroizing::new(password.encode_utf16().flat_map(u16::to_be_bytes).collect::<Vec<_>>());
-                super::decrypt_jks_key(protected, &password)?
+                super::decrypt_jks_key(protected, &password).map_err(TlsError::from_invalid_anomaly)?
             }
-            ProtectedKey::Pkcs12(protected) => super::pkcs12::recover_key(protected, Some(password))?,
+            ProtectedKey::Pkcs12(protected) => super::pkcs12::recover_key(protected, Some(password)).map_err(TlsError::from_invalid_anomaly)?,
         };
-        let key = PKey::private_key_from_pkcs8(&private_key).map_err(invalid)?;
-        let certificate = X509::from_der(leaf).map_err(invalid)?;
-        let algorithm = java_algorithm(key.id()).ok_or_else(|| invalid("Unsupported Java private-key algorithm"))?;
-        if java_algorithm(certificate.public_key().map_err(invalid)?.id()) != Some(algorithm) {
-            return Err(invalid("Private-key algorithm differs from its leaf certificate"));
+        let key = PKey::private_key_from_pkcs8(&private_key).map_err(TlsError::invalid_keystore)?;
+        let certificate = X509::from_der(leaf).map_err(TlsError::invalid_keystore)?;
+        let algorithm = java_algorithm(key.id()).ok_or_else(|| TlsError::invalid_keystore("Unsupported Java private-key algorithm"))?;
+        if java_algorithm(certificate.public_key().map_err(TlsError::invalid_keystore)?.id()) != Some(algorithm) {
+            return Err(TlsError::invalid_keystore("Private-key algorithm differs from its leaf certificate"));
         }
         Ok(RecoveredKey { private_key, reservation })
     }
@@ -94,7 +95,7 @@ impl RecoveredKey {
 }
 
 fn jks(bytes: &[u8], password: Option<&str>, memory: &Arc<MemoryBudget>) -> Result<Vec<ProtectedIdentity>> {
-    let entries = super::jks_entries(bytes, password, |certificate| super::CertificateIdentifiers::decode(certificate, memory).map(|_| ()))?.into_enumeration().collect::<Vec<_>>();
+    let entries = super::jks_entries(bytes, password, |certificate| super::CertificateIdentifiers::decode(certificate, memory).map(|_| ()).map_err(Anomaly::from))?.into_enumeration().collect::<Vec<_>>();
     let mut material = BTreeMap::new();
     for (alias, entry) in &entries {
         if let JksEntry::Key { protected, certificates } = entry {

@@ -2,7 +2,7 @@ use std::{borrow::Cow, fmt::Write, sync::Arc};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_types::Result;
 use unicode_normalization::UnicodeNormalization;
-use crate::invalid;
+use crate::{TlsError, TlsResult, invalid};
 
 mod case;
 pub(crate) use case::{equals_ignore_case_utf16, lowercase_utf16};
@@ -17,42 +17,12 @@ impl DistinguishedName {
     /// Attribute value types, RDN order and repeated assertions remain significant.
     /// Accepts the outer sequence or unwrapped RDN sets, including Java's BER length forms; bytes after the outer sequence are ignored.
     /// Invalid framing, OIDs or decoded BMP supplementary characters return a TLS-material error; insufficient memory returns the budget error before parsing.
-    pub fn decode(encoded: &[u8], memory: &Arc<MemoryBudget>) -> Result<Self> {
+    pub fn decode(encoded: &[u8], memory: &Arc<MemoryBudget>) -> TlsResult<Self> {
         let bound = encoded.len().checked_mul(512).and_then(|length| length.checked_add(65_536))
-            .ok_or_else(|| invalid("Distinguished name exceeds allocation range"))?;
-        let reservation = memory.reserve(bound)?;
-        let mut outer = Der(encoded);
-        let content = if encoded.first() == Some(&0x30) { outer.expect(0x30)?.content } else { Cow::Borrowed(encoded) };
-        let mut rdns = Der(&content);
-        let mut canonical = Vec::new();
-        while !rdns.0.is_empty() {
-            let rdn = rdns.expect(0x31)?;
-            let mut assertions = Der(&rdn.content);
-            let mut values = Vec::new();
-            let mut geographical = false;
-            while !assertions.0.is_empty() {
-                let sequence = assertions.expect(0x30)?;
-                let mut assertion = Der(&sequence.content);
-                let oid = assertion.expect(6)?.content;
-                geographical |= matches!(oid.as_ref(), [0x55, 4, 6 | 7 | 8 | 9]);
-                let value = assertion.next()?;
-                assertion.end()?;
-                values.push(canonical_assertion(&oid, value)?);
-            }
-            values.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.encode_utf16().cmp(right.1.encode_utf16())));
-            let count = values.len();
-            canonical.push((values.into_iter().map(|(_, value)| value).collect::<Vec<_>>().join("+"), count, geographical));
-        }
-        let mut text = String::new();
-        let mut rdns = Vec::with_capacity(canonical.len());
-        for (value, assertions, geographical) in canonical.into_iter().rev() {
-            if !rdns.is_empty() { text.push(','); }
-            let start = text.len();
-            text.push_str(&value);
-            rdns.push(CanonicalRdn { range: start..text.len(), assertions, geographical });
-        }
-        rdns.reverse();
-        Ok(Self { canonical: text, rdns, _reservation: reservation })
+            .ok_or_else(|| TlsError::invalid_keystore("Distinguished name exceeds allocation range"))?;
+        let reservation = memory.reserve(bound).map_err(TlsError::Other)?;
+        let (canonical, rdns) = decode_canonical(encoded).map_err(TlsError::from_invalid_anomaly)?;
+        Ok(Self { canonical, rdns, _reservation: reservation })
     }
 
     /// Borrows the RFC2253 canonical spelling used for Java principal equality and hashing.
@@ -74,6 +44,41 @@ impl PartialEq for DistinguishedName { fn eq(&self, other: &Self) -> bool { self
 impl Eq for DistinguishedName {}
 impl std::fmt::Debug for DistinguishedName {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { formatter.debug_tuple("DistinguishedName").field(&self.canonical).finish() }
+}
+
+fn decode_canonical(encoded: &[u8]) -> Result<(String, Vec<CanonicalRdn>)> {
+    let mut outer = Der(encoded);
+    let content = if encoded.first() == Some(&0x30) { outer.expect(0x30)?.content } else { Cow::Borrowed(encoded) };
+    let mut rdns = Der(&content);
+    let mut canonical = Vec::new();
+    while !rdns.0.is_empty() {
+        let rdn = rdns.expect(0x31)?;
+        let mut assertions = Der(&rdn.content);
+        let mut values = Vec::new();
+        let mut geographical = false;
+        while !assertions.0.is_empty() {
+            let sequence = assertions.expect(0x30)?;
+            let mut assertion = Der(&sequence.content);
+            let oid = assertion.expect(6)?.content;
+            geographical |= matches!(oid.as_ref(), [0x55, 4, 6 | 7 | 8 | 9]);
+            let value = assertion.next()?;
+            assertion.end()?;
+            values.push(canonical_assertion(&oid, value)?);
+        }
+        values.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.encode_utf16().cmp(right.1.encode_utf16())));
+        let count = values.len();
+        canonical.push((values.into_iter().map(|(_, value)| value).collect::<Vec<_>>().join("+"), count, geographical));
+    }
+    let mut text = String::new();
+    let mut rdns = Vec::with_capacity(canonical.len());
+    for (value, assertions, geographical) in canonical.into_iter().rev() {
+        if !rdns.is_empty() { text.push(','); }
+        let start = text.len();
+        text.push_str(&value);
+        rdns.push(CanonicalRdn { range: start..text.len(), assertions, geographical });
+    }
+    rdns.reverse();
+    Ok((text, rdns))
 }
 
 fn canonical_assertion(oid: &[u8], value: Value<'_>) -> Result<(bool, String)> {

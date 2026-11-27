@@ -12,19 +12,19 @@ impl CertificateKeyUsage {
     /// - Signatures, validity, other extension contents and trust are not verified.
     /// - Parsing scratch owns a reservation until this value drops.
     /// - Budget errors propagate unchanged.
-    pub fn decode(certificate_der: &[u8], memory: &Arc<MemoryBudget>) -> Result<Self> {
+    pub fn decode(certificate_der: &[u8], memory: &Arc<MemoryBudget>) -> TlsResult<Self> {
         let bound = certificate_der.len().checked_mul(512).and_then(|bytes| bytes.checked_add(65_536))
-            .ok_or_else(|| invalid("Certificate key usage exceeds allocation range"))?;
-        let reservation = memory.reserve(bound)?;
+            .ok_or_else(|| TlsError::invalid_keystore("Certificate key usage exceeds allocation range"))?;
+        let reservation = memory.reserve(bound).map_err(TlsError::Other)?;
         let mut permits = None;
         scan_certificate(certificate_der, |oid, critical, encoded| {
             if oid != [0x55, 0x1d, 0x0f] { return Ok(()); }
-            match decode_permissions(&encoded) {
+            match decode_permissions(&encoded).map_err(der_err) {
                 Ok(value) => {
-                    if permits.is_some() { return Err(invalid("Certificate contains duplicate parsed key-usage extensions")); }
+                    if permits.is_some() { return Err(TlsError::invalid_keystore("Certificate contains duplicate parsed key-usage extensions")); }
                     permits = Some(value);
                 }
-                Err(error) if !critical && error.code == "rtdb.tls/invalid-keystore" => {},
+                Err(TlsError::InvalidKeystore(_)) if !critical => {},
                 Err(error) => return Err(error),
             }
             Ok(())

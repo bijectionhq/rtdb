@@ -14,19 +14,19 @@ impl CertificateExtendedKeyUsage {
     /// - Every parsed usage OID is validated, including unrecognized purposes.
     /// - Signatures, validity, other extension contents and trust are not verified.
     /// - Parsing scratch owns a reservation until this value drops, and budget errors propagate unchanged.
-    pub fn decode(certificate_der: &[u8], memory: &Arc<MemoryBudget>) -> Result<Self> {
+    pub fn decode(certificate_der: &[u8], memory: &Arc<MemoryBudget>) -> TlsResult<Self> {
         let bound = certificate_der.len().checked_mul(512).and_then(|bytes| bytes.checked_add(65_536))
-            .ok_or_else(|| invalid("Certificate extended key usage exceeds allocation range"))?;
-        let reservation = memory.reserve(bound)?;
+            .ok_or_else(|| TlsError::invalid_keystore("Certificate extended key usage exceeds allocation range"))?;
+        let reservation = memory.reserve(bound).map_err(TlsError::Other)?;
         let mut usage = Usage::Absent;
         scan_certificate(certificate_der, |oid, critical, encoded| {
             if oid != [0x55, 0x1d, 0x25] { return Ok(()); }
-            match decode_authentication(&encoded) {
+            match decode_authentication(&encoded).map_err(der_err) {
                 Ok((server_authentication, client_authentication)) => {
-                    if matches!(usage, Usage::Parsed { .. }) { return Err(invalid("Certificate contains duplicate parsed extended-key-usage extensions")); }
+                    if matches!(usage, Usage::Parsed { .. }) { return Err(TlsError::invalid_keystore("Certificate contains duplicate parsed extended-key-usage extensions")); }
                     usage = Usage::Parsed { server_authentication, client_authentication };
                 }
-                Err(error) if !critical && error.code == "rtdb.tls/invalid-keystore" => {
+                Err(TlsError::InvalidKeystore(_)) if !critical => {
                     if !matches!(usage, Usage::Parsed { .. }) { usage = Usage::Unparseable; }
                 }
                 Err(error) => return Err(error),
@@ -41,11 +41,11 @@ impl CertificateExtendedKeyUsage {
     /// - Absence, anyExtendedKeyUsage, serverAuth and the Microsoft/Netscape SGC purposes permit server authentication.
     /// - Other parsed lists, including an empty list, deny permission.
     /// - Unparseable-only noncritical copies return a TLS-material error, following X509CertImpl.getExtendedKeyUsage.
-    pub fn permits_server_authentication(&self) -> Result<bool> {
+    pub fn permits_server_authentication(&self) -> TlsResult<bool> {
         match self.usage {
             Usage::Absent => Ok(true),
             Usage::Parsed { server_authentication, .. } => Ok(server_authentication),
-            Usage::Unparseable => Err(invalid("Certificate extended key usage is unparseable")),
+            Usage::Unparseable => Err(TlsError::invalid_keystore("Certificate extended key usage is unparseable")),
         }
     }
 
@@ -54,11 +54,11 @@ impl CertificateExtendedKeyUsage {
     /// - Absence, anyExtendedKeyUsage and clientAuth permit client authentication.
     /// - Other parsed lists, including server-only and SGC purposes, deny permission.
     /// - Unparseable-only noncritical copies return a TLS-material error, following X509CertImpl.getExtendedKeyUsage.
-    pub fn permits_client_authentication(&self) -> Result<bool> {
+    pub fn permits_client_authentication(&self) -> TlsResult<bool> {
         match self.usage {
             Usage::Absent => Ok(true),
             Usage::Parsed { client_authentication, .. } => Ok(client_authentication),
-            Usage::Unparseable => Err(invalid("Certificate extended key usage is unparseable")),
+            Usage::Unparseable => Err(TlsError::invalid_keystore("Certificate extended key usage is unparseable")),
         }
     }
 }

@@ -4,7 +4,7 @@ use openssl::x509::X509Ref;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_tls::{CertificateBasicConstraints, CertificateExtendedKeyUsage, CertificateKeyUsage};
 use rtdb_types::Result;
-use super::super::invalid;
+use super::super::{TlsConfigError, TlsConfigResult, invalid};
 
 #[repr(C)]
 pub(crate) struct JavaCertificateFacts {
@@ -21,23 +21,27 @@ pub(crate) struct PathMetadata<'a> {
 
 impl<'a> PathMetadata<'a> {
     pub(crate) fn decode(chain: &'a [&'a X509Ref], memory: &Arc<MemoryBudget>) -> Result<Self> {
+        Self::decode_typed(chain, memory).map_err(TlsConfigError::into_anomaly)
+    }
+
+    pub(crate) fn decode_typed(chain: &'a [&'a X509Ref], memory: &Arc<MemoryBudget>) -> TlsConfigResult<Self> {
         let count = chain.len().checked_sub(1).filter(|count| *count > 0 && *count < i32::MAX as usize)
-            .ok_or_else(|| invalid("TLS selected metadata requires a nontrivial certificate path"))?;
+            .ok_or_else(|| TlsConfigError::invalid("TLS selected metadata requires a nontrivial certificate path"))?;
         let bound = count.checked_mul(std::mem::size_of::<JavaCertificateFacts>()).and_then(|bytes| bytes.checked_add(128))
-            .ok_or_else(|| invalid("TLS selected-chain metadata exceeds allocation range"))?;
+            .ok_or_else(|| TlsConfigError::invalid("TLS selected-chain metadata exceeds allocation range"))?;
         let bound = chain[..count].iter().try_fold(bound, |bound, certificate| {
-            encoded_length(certificate)?.checked_mul(64).and_then(|length| length.checked_add(65_536))
-                .and_then(|length| bound.checked_add(length)).ok_or_else(|| invalid("TLS selected-chain metadata exceeds allocation range"))
+            encoded_length(certificate).map_err(TlsConfigError::from_invalid_anomaly)?.checked_mul(64).and_then(|length| length.checked_add(65_536))
+                .and_then(|length| bound.checked_add(length)).ok_or_else(|| TlsConfigError::invalid("TLS selected-chain metadata exceeds allocation range"))
         })?;
-        let reservation = memory.reserve(bound)?;
+        let reservation = memory.reserve(bound).map_err(TlsConfigError::Other)?;
         let mut facts = Vec::with_capacity(count);
         for certificate in &chain[..count] {
-            let _encoding = reserve_encoding(certificate, memory)?;
-            let encoded = certificate.to_der().map_err(invalid)?;
-            let basic_constraints = CertificateBasicConstraints::decode(&encoded, memory).map_err(material_error)?.path_length();
-            let key_usage = CertificateKeyUsage::decode(&encoded, memory).map_err(material_error)?.permitted_bits();
-            drop(CertificateExtendedKeyUsage::decode(&encoded, memory).map_err(material_error)?);
-            let self_issued = u8::from(super::super::names::same(certificate.subject_name(), certificate.issuer_name(), memory)?);
+            let _encoding = reserve_encoding_typed(certificate, memory)?;
+            let encoded = certificate.to_der().map_err(TlsConfigError::invalid)?;
+            let basic_constraints = CertificateBasicConstraints::decode(&encoded, memory).map_err(TlsConfigError::from_tls)?.path_length();
+            let key_usage = CertificateKeyUsage::decode(&encoded, memory).map_err(TlsConfigError::from_tls)?.permitted_bits();
+            drop(CertificateExtendedKeyUsage::decode(&encoded, memory).map_err(TlsConfigError::from_tls)?);
+            let self_issued = u8::from(super::super::names::same_typed(certificate.subject_name(), certificate.issuer_name(), memory)?);
             facts.push(JavaCertificateFacts { basic_constraints, self_issued, key_usage });
         }
         Ok(Self { chain, facts, _reservation: reservation })
@@ -60,12 +64,17 @@ fn encoded_length(certificate: &X509Ref) -> Result<usize> {
 }
 
 fn reserve_encoding(certificate: &X509Ref, memory: &Arc<MemoryBudget>) -> Result<Arc<MemoryReservation>> {
-    let bound = encoded_length(certificate)?.checked_add(64).ok_or_else(|| invalid("TLS certificate encoding exceeds allocation range"))?;
-    memory.reserve(bound)
+    reserve_encoding_typed(certificate, memory).map_err(TlsConfigError::into_anomaly)
 }
 
-fn material_error(error: rtdb_types::Anomaly) -> rtdb_types::Anomaly {
-    if error.code == "rtdb.tls/invalid-keystore" { invalid(error) } else { error }
+fn reserve_encoding_typed(certificate: &X509Ref, memory: &Arc<MemoryBudget>) -> TlsConfigResult<Arc<MemoryReservation>> {
+    let bound = encoded_length(certificate).map_err(TlsConfigError::from_invalid_anomaly)?.checked_add(64)
+        .ok_or_else(|| TlsConfigError::invalid("TLS certificate encoding exceeds allocation range"))?;
+    memory.reserve(bound).map_err(TlsConfigError::Other)
+}
+
+fn material_error(error: rtdb_tls::TlsError) -> rtdb_types::Anomaly {
+    super::super::material_error(error)
 }
 
 pub(crate) fn verify_pkix_server_usage(certificate: &X509Ref, memory: &Arc<MemoryBudget>) -> Result<()> {
@@ -87,7 +96,6 @@ pub(crate) fn verify_pkix_anchor(anchor: &X509Ref, memory: &Arc<MemoryBudget>) -
         .ok_or_else(|| invalid("TLS anchor encoding exceeds allocation range"))?;
     let _encoding = memory.reserve(bound)?;
     let encoded = anchor.to_der().map_err(invalid)?;
-    let material_error = |error: rtdb_types::Anomaly| if error.code == "rtdb.tls/invalid-keystore" { invalid(error) } else { error };
     if CertificateBasicConstraints::decode(&encoded, memory).map_err(material_error)?.path_length() == -1 {
         return Err(invalid("TLS PKIX trust anchor is not a certificate authority"));
     }

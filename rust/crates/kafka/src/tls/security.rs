@@ -108,18 +108,19 @@ pub(crate) fn verify_server_distrust(chain: &[&X509Ref]) -> Result<()> {
 
 #[cfg(test)]
 pub(crate) fn verify_client_chain(chain: &[&X509Ref]) -> Result<()> {
-    verify_client_chain_with_usage(chain, key_usage)
+    verify_client_chain_with_usage(chain, |certificate| key_usage(certificate).map_err(super::TlsConfigError::from_invalid_anomaly))
+        .map_err(super::TlsConfigError::into_anomaly)
 }
 
-fn verify_client_chain_with_usage(chain: &[&X509Ref], usage: impl Fn(&X509Ref) -> Result<()>) -> Result<()> {
+fn verify_client_chain_with_usage(chain: &[&X509Ref], usage: impl Fn(&X509Ref) -> super::TlsConfigResult<()>) -> super::TlsConfigResult<()> {
     let mut issuer: Option<Key> = None;
     for certificate in chain.iter().rev() {
         usage(certificate)?;
-        signature(certificate, false, false)?;
-        let key = Key::of(certificate.public_key().map_err(invalid)?.as_ref());
-        key.check()?;
-        if let Some(issuer) = issuer { issuer.check()?; }
-        issuer = Some(key.inherit(issuer)?);
+        signature(certificate, false, false).map_err(super::TlsConfigError::from_invalid_anomaly)?;
+        let key = Key::of(certificate.public_key().map_err(super::TlsConfigError::invalid)?.as_ref());
+        key.check().map_err(super::TlsConfigError::from_invalid_anomaly)?;
+        if let Some(issuer) = issuer { issuer.check().map_err(super::TlsConfigError::from_invalid_anomaly)?; }
+        issuer = Some(key.inherit(issuer).map_err(super::TlsConfigError::from_invalid_anomaly)?);
     }
     Ok(())
 }

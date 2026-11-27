@@ -73,7 +73,7 @@ fn san_environmental_uri_resolution_errors_are_not_malformed_absence() {
         let value = encoded(0x30, &encoded(0x86, uri.as_bytes()));
         for critical in [false, true] {
             let result = CertificateAlternativeNames::decode(&certificate(&[extension(critical, &value)]), &MemoryBudget::new(1 << 20));
-            assert_eq!(result.unwrap_err().code, "rtdb.tls/unsupported-identifier");
+            assert_eq!(result.unwrap_err().code(), "rtdb.tls/unsupported-identifier");
         }
     }
 }
@@ -90,5 +90,5 @@ fn san_reservation_covers_success_absence_and_error_lifetimes() {
     assert!(CertificateAlternativeNames::decode(&certificate(&[extension(true, &[5, 0])]), &memory).is_err());
     assert_eq!(memory.used_bytes(), retained);
     drop(first); assert_eq!(memory.used_bytes(), 0);
-    assert_eq!(CertificateAlternativeNames::decode(&good, &MemoryBudget::new(1)).unwrap_err().code, "rtdb/memory-budget-exceeded");
+    assert_eq!(CertificateAlternativeNames::decode(&good, &MemoryBudget::new(1)).unwrap_err().code(), "rtdb/memory-budget-exceeded");
 }

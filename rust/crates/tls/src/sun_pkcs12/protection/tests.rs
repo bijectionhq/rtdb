@@ -130,6 +130,6 @@ fn sun_secret_key_ignores_inner_parameters_and_tail_but_rejects_outer_tail() {
 #[test]
 fn sun_empty_retry_does_not_repeat_memory_admission_failure() {
     let memory = MemoryBudget::new(0); let mut calls = 0;
-    let result = retry(Some(""), |_| { calls += 1; memory.reserve(1) });
-    assert_eq!(result.err().unwrap().code, "rtdb/memory-budget-exceeded"); assert_eq!(calls, 1);
+    let result = retry(Some(""), |_| { calls += 1; memory.reserve(1).map_err(TlsError::Other) });
+    assert_eq!(result.err().unwrap().code(), "rtdb/memory-budget-exceeded"); assert_eq!(calls, 1);
 }
