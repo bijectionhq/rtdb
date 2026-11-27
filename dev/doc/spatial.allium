@@ -107,6 +107,7 @@ entity SpatialPostings {
 -- Unsupported clear measurements keep their original projected values.
 -- Omission evidence owns the admitted size arrays and their field metadata.
 -- A covered deferred field that needs a full value is restored for the selected row positions.
+-- The same projection gathers its other fields from the conformed Arrow page produced during the probe.
 -- The Point intersection certificate binds the complete equality partition and canonical Bijection geometry column to an admitted Point region.
 -- Every matching row inspected on the first page has a canonical Point geometry before the held filter can certify matches.
 -- A winner gather resolves the selected complete identity at the original present and requires the same winning system revision.

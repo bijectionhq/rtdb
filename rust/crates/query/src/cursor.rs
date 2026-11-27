@@ -895,7 +895,7 @@ impl QueryCursor {
             let skip = |index| replacements.binary_search_by_key(&index, |(index, _)| *index).is_ok();
             let output = match (|| {
                 let deferred = ResultArrowSchema::new(schema, 0..schema.len(), &skip, memory)?;
-                emit_columns(schema, &deferred, memory, &input, (0..schema.len()).map(|index| (index, index)), &skip, false)
+                emit_columns(schema, &deferred, memory, &input, &skip)
             })() {
                 Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => {
                     drop(replacements);
@@ -1079,63 +1079,75 @@ pub(crate) fn column_batch(schema: &Schema, memory: &Arc<MemoryBudget>, batch: c
 fn cached_column_batch(
     schema: &Schema, arrow: &ResultArrowSchema, memory: &Arc<MemoryBudget>, batch: crate::columnar::ColumnBatch,
 ) -> Result<OwnedBatch> {
-    emit_columns(schema, arrow, memory, &batch, (0..schema.len()).map(|index| (index, index)), &|_| false, false)
+    emit_columns(schema, arrow, memory, &batch, &|_| false)
 }
 
 fn emit_columns(
     schema: &Schema, arrow: &ResultArrowSchema, memory: &Arc<MemoryBudget>, batch: &crate::columnar::ColumnBatch,
-    indices: impl Iterator<Item = (usize, usize)>, defer: &impl Fn(usize) -> bool, selected_probe: bool,
+    defer: &impl Fn(usize) -> bool,
 ) -> Result<OwnedBatch> {
-    use crate::columnar::Column;
+    let mut indices = 0..schema.len();
+    emit_result_page(arrow, memory, batch.len, |field, page| {
+        let index = indices.next().expect("Each output field has an input column");
+        let (array, scratch, funding) = if defer(index) {
+            let scratch = memory.reserve(256)?;
+            (Arc::new(NullArray::new(batch.len)) as ArrayRef, scratch, ResultArrayFunding::Copy)
+        } else {
+            emit_result_column(batch, index, &schema.fields()[index].data_type, field, false, memory)?
+        };
+        retain_result_array(array, scratch, funding, page, &arrow.reservation)
+    })
+}
 
+fn emit_result_page(
+    arrow: &ResultArrowSchema, memory: &Arc<MemoryBudget>, rows: usize,
+    mut emit: impl FnMut(&ArrowField, &mut MemoryReservation) -> Result<ArrayRef>,
+) -> Result<OwnedBatch> {
     let overflow = || invalid("batch-size", "Output batch allocation bound overflow");
     let fields = arrow.schema.fields();
     let bytes = fields.len().checked_mul(std::mem::size_of::<ArrayRef>())
         .and_then(|bytes| bytes.checked_add(std::mem::size_of::<OwnedBatch>() + 256)).ok_or_else(overflow)?;
     let mut reservation = memory.reserve(bytes)?;
     let page = Arc::get_mut(&mut reservation).expect("Output batch construction owns its reservation");
-    let mut arrays = Vec::with_capacity(fields.len());
-    for ((index, source), field) in indices.zip(fields) {
-        let column = &batch.columns[source];
-        let logical = &schema.fields()[index].data_type;
-        let layout = field.as_ref();
-        let (array, scratch, funding) = if defer(index) {
-            let scratch = memory.reserve(256)?;
-            (Arc::new(NullArray::new(batch.len)) as ArrayRef, scratch, ResultArrayFunding::Copy)
-        } else {
-            if let Column::Arrow { logical: Some(_), .. } = column {
-                let bound = layout.size().checked_mul(4).and_then(|bytes| bytes.checked_add(512)).ok_or_else(overflow)?;
-                let scratch = memory.reserve(bound)?;
-                if let Some(array) = crate::columnar::conform(column, logical, layout) {
-                    let funding = ResultArrayFunding::Shared(batch.column_reservation(source));
-                    arrays.push(retain_result_array(array, scratch, funding, page, &arrow.reservation)?);
-                    continue;
-                }
-            }
-            let relayout = if selected_probe {
-                crate::columnar::relayout_spatial_probe_output(column, logical, layout, memory)
-            } else {
-                crate::columnar::relayout_output(column, logical, layout, memory)
-            };
-            if let Some((array, scratch)) = relayout? {
-                let funding = match column {
-                    Column::Arrow { array, .. } => ResultArrayFunding::Relayout(array, batch.column_reservation(source)),
-                    _ => ResultArrayFunding::Copy,
-                };
-                (array, scratch, funding)
-            } else if let Some((array, scratch)) = crate::columnar::float_vector::relayout(column, batch.len, layout, memory)? {
-                (array, scratch, ResultArrayFunding::Copy)
-            } else {
-                let (array, scratch) = rtdb_columnar::copy_evaluated_cells(logical, batch.len, memory,
-                    |row| column.bound(row), |row| column.value(row))?;
-                (array, scratch, ResultArrayFunding::Copy)
-            }
-        };
-        arrays.push(retain_result_array(array, scratch, funding, page, &arrow.reservation)?);
-    }
-    let options = RecordBatchOptions::new().with_row_count(Some(batch.len));
+    let arrays = fields.iter().map(|field| emit(field, page)).collect::<Result<Vec<_>>>()?;
+    let options = RecordBatchOptions::new().with_row_count(Some(rows));
     let output = RecordBatch::try_new_with_options(Arc::clone(&arrow.schema), arrays, &options).map_err(|error| invalid("output-arrow", error))?;
     Ok(OwnedBatch::with_funded_columns(output, reservation).with_schema_reservation(Arc::clone(&arrow.reservation)))
+}
+
+fn emit_result_column<'a>(
+    batch: &'a crate::columnar::ColumnBatch, source: usize, logical: &LogicalType, layout: &ArrowField,
+    selected_probe: bool, memory: &Arc<MemoryBudget>,
+) -> Result<(ArrayRef, Arc<MemoryReservation>, ResultArrayFunding<'a>)> {
+    use crate::columnar::Column;
+
+    let column = &batch.columns[source];
+    if let Column::Arrow { logical: Some(_), .. } = column {
+        let bound = layout.size().checked_mul(4).and_then(|bytes| bytes.checked_add(512))
+            .ok_or_else(|| invalid("batch-size", "Output batch allocation bound overflow"))?;
+        let scratch = memory.reserve(bound)?;
+        if let Some(array) = crate::columnar::conform(column, logical, layout) {
+            return Ok((array, scratch, ResultArrayFunding::Shared(batch.column_reservation(source))));
+        }
+    }
+    let relayout = if selected_probe {
+        crate::columnar::relayout_spatial_probe_output(column, logical, layout, memory)
+    } else {
+        crate::columnar::relayout_output(column, logical, layout, memory)
+    };
+    if let Some((array, scratch)) = relayout? {
+        let funding = match column {
+            Column::Arrow { array, .. } => ResultArrayFunding::Relayout(array, batch.column_reservation(source)),
+            _ => ResultArrayFunding::Copy,
+        };
+        return Ok((array, scratch, funding));
+    }
+    if let Some((array, scratch)) = crate::columnar::float_vector::relayout(column, batch.len, layout, memory)? {
+        return Ok((array, scratch, ResultArrayFunding::Copy));
+    }
+    let (array, scratch) = rtdb_columnar::copy_evaluated_cells(logical, batch.len, memory,
+        |row| column.bound(row), |row| column.value(row))?;
+    Ok((array, scratch, ResultArrayFunding::Copy))
 }
 
 #[doc(hidden)]
@@ -1200,32 +1212,48 @@ impl<P> SpatialProbeFallback<P> {
         Some((plan, SpatialProbeCells { column: &self.input.columns[index], logical }))
     }
 
-    /// The row positions address the returned page directly when the second value is true.
-    pub fn project_rows(&self, indices: &[usize], rows: &[usize], memory: &Arc<MemoryBudget>) -> Result<(OwnedBatch, bool)> {
+    /// Restores deferred columns for `rows` and gathers the other columns from the page returned with this fallback.
+    pub fn project_rows(&self, emitted: &OwnedBatch, indices: &[usize], rows: &[usize], memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
         let schema = self.runtime.schema();
         check_output_width(schema, &self.input)?;
+        if rows.is_empty() || rows.iter().any(|&row| row >= self.input.len) {
+            return Err(invalid("column-gather", "Row position is outside its source batch"));
+        }
         let arrow = ResultArrowSchema::new(schema, indices.iter().copied(), &|_| false, memory)?;
-        let original = indices.iter().copied().map(|index| (index, index));
-        if rows.iter().copied().eq(0..self.input.len) {
-            return emit_columns(schema, &arrow, memory, &self.input, original, &|_| false, false).map(|page| (page, true));
-        }
-        let can_select = indices.iter().zip(arrow.schema.fields()).all(|(&index, field)| {
-            if self.plan(index).is_some() {
-                return true;
-            }
-            let declared = &schema.fields()[index].data_type;
-            crate::columnar::conform(&self.input.columns[index], declared, field).is_some()
-                || SpatialProbeCells { column: &self.input.columns[index], logical: declared }
-                    .layouts().is_some()
-        });
-        if !can_select {
-            return emit_columns(schema, &arrow, memory, &self.input, original, &|_| false, false).map(|page| (page, false));
-        }
-        let _positions = memory.reserve(size_of_val(rows) * 2)?;
-        let picks = rows.iter().map(|&row| (0, row)).collect::<Vec<_>>();
-        let selected = crate::columnar::ColumnBatch::take_rows_with_custody(&[&self.input], &picks, indices, true, memory)?;
-        let selected_indices = indices.iter().copied().zip(0..indices.len());
-        emit_columns(schema, &arrow, memory, &selected, selected_indices, &|_| false, true).map(|page| (page, true))
+        let whole_page = rows.iter().copied().eq(0..self.input.len);
+        let selected = if whole_page {
+            None
+        } else {
+            let bytes = size_of_val(rows).checked_mul(2).and_then(|bytes| bytes.checked_add(size_of_val(indices)))
+                .ok_or_else(|| invalid("batch-size", "Output selection allocation bound overflow"))?;
+            let _positions = memory.reserve(bytes)?;
+            let picks = rows.iter().map(|&row| (0, row)).collect::<Vec<_>>();
+            let deferred = indices.iter().copied().filter(|&index| self.plan(index).is_some()).collect::<Vec<_>>();
+            Some(crate::columnar::ColumnBatch::take_rows_with_custody(&[&self.input], &picks, &deferred, true, memory)?)
+        };
+        let mut indices = indices.iter().copied();
+        let mut next_deferred = 0;
+        emit_result_page(&arrow, memory, rows.len(), |field, page| {
+            let index = indices.next().expect("Each probe field has an input column");
+            let (array, scratch, funding) = if self.plan(index).is_some() {
+                let (input, source) = if let Some(selected) = &selected {
+                    let source = next_deferred;
+                    next_deferred += 1;
+                    (selected, source)
+                } else { (&self.input, index) };
+                emit_result_column(input, source, &schema.fields()[index].data_type, field, !whole_page, memory)?
+            } else {
+                let array = emitted.batch().column(index);
+                if whole_page {
+                    let scratch = memory.reserve(512)?;
+                    (Arc::clone(array), scratch, ResultArrayFunding::Shared(emitted.reservation()))
+                } else {
+                    let (array, scratch) = crate::columnar::compact_arrow_rows(array.as_ref(), field, rows.iter().copied(), memory)?;
+                    (array, scratch, ResultArrayFunding::Copy)
+                }
+            };
+            retain_result_array(array, scratch, funding, page, &arrow.reservation)
+        })
     }
 }
 enum ReportRows {
@@ -1491,7 +1519,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spatial_probe_defers_covered_columns_and_keeps_uncovered_read_errors() -> Result<()> {
+    async fn spatial_probe_restores_selected_rows_and_keeps_uncovered_read_errors() -> Result<()> {
         use std::collections::BTreeMap;
         use rtdb_types::{StructFields, Timestamp};
 
@@ -1509,16 +1537,18 @@ mod tests {
         let bottom = wrap(LogicalType::Nothing);
         let value = |item| Value::Struct(StructFields::from([("v2_value".into(), Value::list(vec![item]))]));
         let expected = value(Value::Bool(true));
-        let schema = Schema::new(vec![rtdb_plan::Field {
-            id: rtdb_plan::ColumnId(0), name: "c_fact".into(), qualifier: None,
-            qualified_only: false, unnamed: false, data_type: covered.clone().maybe(),
-        }])?;
+        let schema = Schema::new([("c_fact", covered.clone().maybe()), ("evaluated", LogicalType::Scalar(ScalarType::I64))]
+            .into_iter().enumerate().map(|(index, (name, data_type))| rtdb_plan::Field {
+                id: rtdb_plan::ColumnId(index as u32), name: name.into(), qualifier: None,
+                qualified_only: false, unnamed: false, data_type,
+            }).collect())?;
         let runtime = RuntimeSchema::fixed(&schema, &memory)?;
         let open = |logical, cell| -> Result<QueryCursor> {
             let field = to_field("c_fact", &logical)?;
             let array = rtdb_columnar::build_array(&logical, &[cell])?;
             let batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(vec![field])), vec![array]).unwrap();
-            let batch = crate::columnar::ColumnBatch::from_owned(OwnedBatch::new(batch, &memory)?)?;
+            let mut batch = crate::columnar::ColumnBatch::from_owned(OwnedBatch::new(batch, &memory)?)?;
+            batch.append_column(crate::columnar::Column::Values(vec![Value::I64(7)]), memory.reserve(1024)?, &memory)?;
             let input = crate::columnar::single_batch(Some(batch), Arc::clone(&context));
             Ok(QueryCursor {
                 schema: Arc::clone(&runtime), runtime_schema: Arc::clone(&runtime), result_arrow: None,
@@ -1537,11 +1567,15 @@ mod tests {
         let (_, cells) = deferred.plan(0).unwrap();
         let (cell, _) = cells.cell(0).unwrap().unwrap();
         assert_eq!(rtdb_columnar::read_value(cell.field, cell.array, cell.row)?, expected);
-        let (restored, compact) = deferred.project_rows(&[0], &[0, 0], &memory)?;
-        assert!(compact);
+        let restored = deferred.project_rows(&page, &[1, 0], &[0, 0], &memory)?;
+        drop((page, deferred));
         assert_eq!(restored.batch().num_rows(), 2);
-        assert_eq!(rtdb_columnar::read_value(restored.batch().schema_ref().field(0), restored.batch().column(0).as_ref(), 0)?, expected);
-        assert_eq!(rtdb_columnar::read_value(restored.batch().schema_ref().field(0), restored.batch().column(0).as_ref(), 1)?, expected);
+        assert_eq!(restored.batch().schema_ref().field(0).name(), "evaluated");
+        for row in 0..2 {
+            let read = |column| rtdb_columnar::read_value(restored.batch().schema_ref().field(column), restored.batch().column(column).as_ref(), row);
+            assert_eq!(read(0)?, Value::I64(7));
+            assert_eq!(read(1)?, expected);
+        }
 
         let value = value(Value::Undefined);
         let error = open(bottom.clone(), value.clone())?.next_batch().await.unwrap_err();
@@ -1622,6 +1656,97 @@ mod tests {
         for row in 0..2 {
             assert_eq!(rtdb_columnar::read_value(&field, array.as_ref(), row)?, small);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn result_conformance_uses_only_active_scalar_legs_of_mixed_selections() -> Result<()> {
+        use crate::columnar::{ColumnBatch, relayout_output};
+
+        let source_memory = MemoryBudget::new(1 << 22);
+        let output_memory = MemoryBudget::new(64 << 10);
+        let text = LogicalType::Scalar(ScalarType::Utf8);
+        let target = text.clone().maybe();
+        let mixed = target.join(&LogicalType::Scalar(ScalarType::I64));
+        let input = |logical, values: &[Value]| -> Result<ColumnBatch> {
+            let field = to_field("v", &logical)?;
+            let batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(vec![field])), vec![copy_array(&logical, values)?]).unwrap();
+            ColumnBatch::from_owned(OwnedBatch::new(batch, &source_memory)?)
+        };
+        let first = input(mixed, &[Value::I64(19), Value::Utf8("first".into()), Value::Null])?;
+        let second = input(text, &[Value::Utf8("x".repeat(1 << 20)), Value::Utf8("second".into())])?;
+        let select = |rows| ColumnBatch::take_rows_with_custody(&[&first, &second], rows, &[0], true, &output_memory);
+        let schema = Schema::new(vec![rtdb_plan::Field {
+            id: rtdb_plan::ColumnId(0), name: "v".into(), qualifier: None,
+            qualified_only: false, unnamed: false, data_type: target.clone(),
+        }])?;
+        let field = to_field("v", &target)?;
+
+        let incompatible = select(&[(0, 0)])?;
+        assert!(relayout_output(&incompatible.columns[0], &target, &field, &output_memory)?.is_none());
+        assert_eq!(column_batch(&schema, &output_memory, incompatible).unwrap_err().code, "rtdb/column-type-mismatch");
+
+        let selected = select(&[(1, 1), (0, 2), (0, 1), (1, 1)])?;
+        assert!(relayout_output(&selected.columns[0], &target, &field, &output_memory)?.is_some());
+        let output = column_batch(&schema, &output_memory, selected)?;
+        assert_eq!(output.batch().schema_ref().field(0), &field);
+        let values = Arc::clone(output.batch().column(0));
+        drop((output, first, second));
+        assert_eq!(source_memory.used_bytes(), 0);
+        assert!(output_memory.used_bytes() > 0);
+        let texts = values.as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
+        assert_eq!(texts.iter().collect::<Vec<_>>(), [Some("second"), None, Some("first"), Some("second")]);
+        drop(values);
+        assert_eq!(output_memory.used_bytes(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn result_conformance_compacts_sparse_sources_before_widening_to_a_union() -> Result<()> {
+        use crate::columnar::{ColumnBatch, relayout_output};
+
+        let source_memory = MemoryBudget::new(1 << 22);
+        let output_memory = MemoryBudget::new(64 << 10);
+        let text = LogicalType::Scalar(ScalarType::Utf8).maybe();
+        let target = text.join(&LogicalType::Scalar(ScalarType::I64));
+        let mut values = vec![Value::Null; 4096];
+        values[0] = Value::Utf8("x".repeat(256 << 10));
+        values[1] = Value::Utf8("winner".into());
+        let input = RecordBatch::try_new(Arc::new(ArrowSchema::new(vec![to_field("v", &text)?])), vec![copy_array(&text, &values)?]).unwrap();
+        let input = ColumnBatch::from_owned(OwnedBatch::new(input, &source_memory)?)?;
+        let picked = ColumnBatch::take_rows_with_custody(&[&input], &[(0, 2), (0, 1), (0, 1)], &[0], true, &output_memory)?;
+        let field = to_field("v", &target)?;
+        let (output, _scratch) = relayout_output(&picked.columns[0], &target, &field, &output_memory)?.unwrap();
+        let read = |row| rtdb_columnar::read_value(&field, output.as_ref(), row);
+        assert_eq!([read(0)?, read(1)?, read(2)?], [Value::Null, values[1].clone(), values[1].clone()]);
+        Ok(())
+    }
+
+    #[test]
+    fn result_conformance_preserves_decimal_parameters_when_selecting_a_union_leg() -> Result<()> {
+        use crate::columnar::ColumnBatch;
+        use rtdb_types::DecimalValue;
+
+        let memory = MemoryBudget::new(1 << 20);
+        let value = Value::Decimal(DecimalValue::new(123i128.to_be_bytes().to_vec(), 5, 2, 128)?);
+        let decimal = value.logical_type();
+        let mixed = decimal.join(&LogicalType::Scalar(ScalarType::I64));
+        let source = RecordBatch::try_new(Arc::new(ArrowSchema::new(vec![to_field("v", &mixed)?])),
+            vec![copy_array(&mixed, &[Value::I64(19), value.clone()])?]).unwrap();
+        let source = ColumnBatch::from_owned(OwnedBatch::new(source, &memory)?)?;
+        let select = || ColumnBatch::take_rows_with_custody(&[&source], &[(0, 1)], &[0], true, &memory);
+        let schema = |data_type| Schema::new(vec![rtdb_plan::Field {
+            id: rtdb_plan::ColumnId(0), name: "v".into(), qualifier: None,
+            qualified_only: false, unnamed: false, data_type,
+        }]);
+        let output = column_batch(&schema(decimal.clone())?, &memory, select()?)?;
+        let field = output.batch().schema_ref().field(0);
+        assert_eq!(field, &to_field("v", &decimal)?);
+        assert_eq!(rtdb_columnar::read_value(field, output.batch().column(0).as_ref(), 0)?, value);
+
+        let other_scale = LogicalType::Scalar(ScalarType::Decimal { precision: 5, scale: 3, bit_width: 128 });
+        let error = column_batch(&schema(other_scale)?, &memory, select()?).unwrap_err();
+        assert_eq!(error.code, "rtdb/column-type-mismatch");
         Ok(())
     }
 

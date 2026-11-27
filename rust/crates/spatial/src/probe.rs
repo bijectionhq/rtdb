@@ -126,7 +126,7 @@ pub(super) fn gather(hits: &[SelectedHit], columns: &[usize], memory: &Arc<Memor
             && columns.iter().any(|&column| fallback.plan(column).is_some())
         {
             let rows = positions.iter().map(|&position| hits[position].row).collect::<Vec<_>>();
-            fallback.project_rows(columns, &rows, memory)?
+            (fallback.project_rows(&first.source, columns, &rows, memory)?, true)
         } else {
             let batch = first.source.batch().project(columns).map_err(|error| {
                 rtdb_types::Anomaly::fault("rtdb.spatial/projection", error.to_string())

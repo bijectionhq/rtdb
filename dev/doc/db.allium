@@ -2606,6 +2606,8 @@ surface QueryAccess {
         -- Reading a selected struct during evaluation preserves which keys its source has.
         -- Compatible fixed-size lists stay in Arrow through sparse selection and output.
         -- Cursor output gathers selected floating-point components and compatible interpreted fields into their declared Arrow layouts.
+        -- A sparse result selection can compact source rows before aligning their Arrow layouts.
+        -- A declared plain scalar result can gather compatible active union cells and nulls from mixed Arrow selections.
         -- Struct and collection output align selected child fields by position and preserve their validity.
         -- Compatible packed component unions retain the numeric tags and stored bits of selected masked children.
         -- A selected vector component must belong to an admitted width in the declared output field.

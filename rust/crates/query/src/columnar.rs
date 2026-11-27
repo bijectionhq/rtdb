@@ -3510,7 +3510,7 @@ pub(crate) fn conform(column: &Column, target: &LogicalType, field: &ArrowField)
 pub(crate) fn relayout_output(column: &Column, target: &LogicalType, field: &ArrowField, memory: &Arc<MemoryBudget>)
     -> Result<Option<(ArrayRef, Arc<MemoryReservation>)>> {
     if let Column::Selected(column) = column {
-        return column.relayout(target, field, memory, false);
+        return column.relayout_result(target, field, memory, false);
     }
     let Column::Arrow { array, field: source, logical: Some(logical) } = column else { return Ok(None) };
     if !stable_read_layout(logical, source) || logical.join(target) != *target { return Ok(None); }
@@ -3527,24 +3527,90 @@ pub(crate) fn relayout_spatial_probe_output(
     column: &Column, target: &LogicalType, field: &ArrowField, memory: &Arc<MemoryBudget>,
 ) -> Result<Option<(ArrayRef, Arc<MemoryReservation>)>> {
     match column {
-        Column::Selected(column) => column.relayout(target, field, memory, true),
+        Column::Selected(column) => column.relayout_result(target, field, memory, true),
         _ => relayout_output(column, target, field, memory),
     }
 }
 
 impl SelectedColumn {
+    fn relayout_result(&self, target: &LogicalType, field: &ArrowField, memory: &Arc<MemoryBudget>, compact_sources: bool)
+        -> Result<Option<(ArrayRef, Arc<MemoryReservation>)>> {
+        if let Some(output) = self.relayout(target, field, memory, compact_sources)? {
+            return Ok(Some(output));
+        }
+        self.gather_scalar_result(target, field, memory)
+    }
+
+    fn gather_scalar_result(&self, target: &LogicalType, field: &ArrowField, memory: &Arc<MemoryBudget>)
+        -> Result<Option<(ArrayRef, Arc<MemoryReservation>)>> {
+        let Some(scalar) = plain_scalar(target).filter(|scalar| copyable(scalar)) else { return Ok(None); };
+        let base = self.cells.len().checked_mul(192)
+            .and_then(|bytes| bytes.checked_add(field.size().checked_mul(8)?))
+            .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size_error)?;
+        let Ok(mut scratch) = memory.reserve(base) else { return Ok(None); };
+        let mut layouts = HashMap::new();
+        let mut arrays = Vec::new();
+        let mut picks = Vec::with_capacity(self.cells.len());
+        let null_bytes = rtdb_columnar::estimate_null_copy_cell_bytes(field)?;
+        let mut bound = base;
+        for (source, row) in self.cells.iter() {
+            let mut pick = None;
+            let mut bytes = null_bytes;
+            if let Some((array, source_field, logical, _)) = &self.sources[source] {
+                let Some(logical) = logical else { return Ok(None); };
+                let cell = rtdb_columnar::ArrowCell { field: source_field, array: array.as_ref(), row };
+                let Ok(active) = cell.physical() else { return Ok(None); };
+                let key = (source, std::ptr::from_ref(active.field), std::ptr::from_ref(active.array).addr());
+                let input = match layouts.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let Ok((_, actual)) = cell.logical_position(Some(logical)) else { return Ok(None); };
+                        let index = if actual == LogicalType::Null && active.field.data_type() == &DataType::Null && active.field.is_nullable() {
+                            None
+                        } else if plain_scalar(&actual) == Some(scalar) && rtdb_columnar::execution_type(&actual) == actual
+                            && active.field.data_type() == field.data_type() && active.field.metadata() == field.metadata()
+                        {
+                            let index = arrays.len();
+                            arrays.push(active.array);
+                            Some(index)
+                        } else { return Ok(None); };
+                        *entry.insert(index)
+                    }
+                };
+                if let Some(input) = input && active.array.is_valid(active.row) {
+                    pick = Some((input, active.row));
+                    let Ok(size) = rtdb_columnar::estimate_copy_cell_bytes(field, active.array, active.row) else { return Ok(None); };
+                    bytes = size;
+                }
+            }
+            if pick.is_none() && !target.nullable() { return Ok(None); }
+            bound = bytes.checked_mul(4).and_then(|bytes| bound.checked_add(bytes)).ok_or_else(size_error)?;
+            picks.push(pick);
+        }
+        let lease = Arc::get_mut(&mut scratch).expect("A selected scalar result owns its scratch");
+        if lease.grow_to(bound).is_err() { return Ok(None); }
+        let empty;
+        if arrays.is_empty() {
+            empty = arrow_array::new_empty_array(field.data_type());
+            arrays.push(empty.as_ref());
+        }
+        let Ok(array) = rtdb_columnar::copy_nullable_cells(&arrays, &picks) else { return Ok(None); };
+        Ok(Some((array, scratch)))
+    }
+
     fn relayout(&self, target: &LogicalType, field: &ArrowField, memory: &Arc<MemoryBudget>, compact_sources: bool)
         -> Result<Option<(ArrayRef, Arc<MemoryReservation>)>> {
         let base = self.cells.len().checked_mul(64).and_then(|bytes| self.sources.len().checked_mul(128).and_then(|extra| bytes.checked_add(extra)))
             .and_then(|bytes| field.size().checked_mul(8).and_then(|extra| bytes.checked_add(extra))).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size_error)?;
         let Ok(mut scratch) = memory.reserve(base) else { return Ok(None); };
-        let mut used = vec![false; self.sources.len()];
-        for (source, _) in self.cells.iter() { used[source] = true; }
+        let mut counts = vec![0; self.sources.len()];
+        for (source, _) in self.cells.iter() { counts[source] += 1; }
         let mut positions = vec![0; self.sources.len()];
         let mut arrays = Vec::new();
-        let mut row_indices = compact_sources.then(|| self.cells.iter().map(|(_, row)| row).collect::<Vec<_>>());
+        let mut row_indices = None;
+        let mut rows_by_source = None;
         let null = ArrowField::new(field.name(), DataType::Null, true);
-        for (position, source) in self.sources.iter().enumerate().filter(|(position, _)| used[*position]) {
+        for (position, source) in self.sources.iter().enumerate().filter(|(position, _)| counts[*position] != 0) {
             let (source, mut array, logical) = match source {
                 Some((array, source, Some(logical), _)) if *logical != LogicalType::Nothing && stable_read_layout(logical, source) => {
                     (source.as_ref(), Arc::clone(array), logical)
@@ -3556,16 +3622,27 @@ impl SelectedColumn {
                 array
             } else {
                 if logical.join(target) != *target { return Ok(None); }
-                if let Some(row_indices) = &mut row_indices
-                    && self.sources[position].is_some()
-                {
-                    let mut picks = Vec::new();
-                    for (index, (source, row)) in self.cells.iter().enumerate() {
-                        if source == position {
-                            row_indices[index] = picks.len();
-                            picks.push((0, row));
+                let reserve_relayout = |scratch: &mut Arc<MemoryReservation>, array: &dyn Array| -> Result<bool> {
+                    let bound = rtdb_columnar::arrow_relayout_bound(array, source, field)?;
+                    let lease = Arc::get_mut(scratch).expect("A selection owns its scratch");
+                    Ok(lease.grow_to(lease.bytes().checked_add(bound).ok_or_else(size_error)?).is_ok())
+                };
+                let missing = self.sources[position].is_none();
+                let compact = compact_sources && !missing;
+                if compact || !reserve_relayout(&mut scratch, array.as_ref())? {
+                    if missing || (!compact && counts[position] >= array.len()) { return Ok(None); }
+                    let groups = rows_by_source.get_or_insert_with(|| {
+                        let mut groups = counts.iter().map(|&count| Vec::with_capacity(count)).collect::<Vec<_>>();
+                        for (index, (source, row)) in self.cells.iter().enumerate() {
+                            groups[source].push((index, row));
                         }
-                    }
+                        groups
+                    });
+                    let row_indices = row_indices.get_or_insert_with(|| self.cells.iter().map(|(_, row)| row).collect::<Vec<_>>());
+                    let picks = groups[position].iter().enumerate().map(|(offset, &(index, row))| {
+                        row_indices[index] = offset;
+                        (0, row)
+                    }).collect::<Vec<_>>();
                     let lease = Arc::get_mut(&mut scratch).expect("a selection owns its scratch");
                     let bound = picks.iter().try_fold(lease.bytes(), |bytes, &(_, row)| {
                         rtdb_columnar::estimate_copy_cell_bytes(source, array.as_ref(), row)?.checked_mul(4)
@@ -3574,10 +3651,8 @@ impl SelectedColumn {
                     if lease.grow_to(bound).is_err() { return Ok(None); }
                     let Ok(compact) = copy_selected_cells(&[array.as_ref()], &picks) else { return Ok(None); };
                     array = compact;
+                    if !reserve_relayout(&mut scratch, array.as_ref())? { return Ok(None); }
                 }
-                let bound = rtdb_columnar::arrow_relayout_bound(array.as_ref(), source, field)?;
-                let lease = Arc::get_mut(&mut scratch).expect("A selection owns its scratch");
-                if lease.grow_to(lease.bytes().checked_add(bound).ok_or_else(size_error)?).is_err() { return Ok(None); }
                 let Ok((physical, array)) = rtdb_columnar::relayout_arrow_column(array, source, field) else { return Ok(None); };
                 if physical.data_type() != field.data_type() { return Ok(None); }
                 array
