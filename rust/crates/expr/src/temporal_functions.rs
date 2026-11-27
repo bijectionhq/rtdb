@@ -318,17 +318,14 @@ pub struct FixedDateBin {
 }
 
 impl FixedDateBin {
-    pub fn new(stride: &Value, source_unit: U, origin: i64, origin_unit: U) -> Option<Self> {
-        let output_unit = match stride {
-            Value::IntervalMonthDayMicro { months: 0, days: 0, .. } => origin_unit.max(U::Microsecond),
-            Value::IntervalMonthDayNano { months: 0, days: 0, .. } => U::Nanosecond,
-            _ => return None,
-        };
-        let stride_nanos = IntervalParts::of(stride)?.nanos;
-        Some(Self { source_unit, origin, origin_unit, stride_nanos, output_unit })
-    }
+    /// Computes the output unit for fixed-time interval strides of the given precision.
+    pub fn output_unit(stride_unit: U, origin_unit: U) -> U { stride_unit.max(origin_unit) }
 
-    pub fn output_unit(&self) -> U { self.output_unit }
+    /// Binds the time component of an interval with zero months and days.
+    pub fn new(stride_nanos: i64, stride_unit: U, source_unit: U, origin: i64, origin_unit: U) -> Self {
+        let output_unit = Self::output_unit(stride_unit, origin_unit);
+        Self { source_unit, origin, origin_unit, stride_nanos, output_unit }
+    }
 
     pub fn cell(&self, source: i64) -> Result<i64> {
         use crate::{numeric::signed_quotient, temporal::{interval_ticks, rescale}};

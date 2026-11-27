@@ -6118,7 +6118,7 @@ impl BatchCursor for BatchExpressions {
                 owners[index] = Some(owner);
                 continue;
             }
-            if let Some((column, owner)) = calendar::project(kernel, &self.schema, &batch, &self.execution.context)? {
+            if let Some((column, owner)) = calendar::project(kernel, &self.schema, &batch, &self.execution.parameters, &self.execution.context)? {
                 columns.push(column);
                 owners[index] = Some(owner);
                 continue;

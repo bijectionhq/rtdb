@@ -2602,8 +2602,10 @@ surface QueryAccess {
         -- A DATE_TRUNC projection with a literal field and compatible date or timestamp input can write Arrow cells in the input unit and retain the timestamp's zone label.
         -- Whole-second and coarser truncation of zoned timestamps uses the timestamp's zone rules or the explicit override, preserving the scalar result at gaps and overlaps.
         -- Truncation raises errors in reached row order.
-        -- A DATE_BIN projection with a fixed-time interval literal and a compatible timestamp origin can write Arrow timestamp ticks with the origin's zone label.
+        -- A DATE_BIN projection with a compatible fixed-time stride and timestamp origin can write Arrow timestamp ticks with the origin's zone label.
+        -- A null DATE_BIN stride or origin skips the source, and a reached calendar stride uses scalar interval arithmetic.
         -- An AGE projection over compatible date or timestamp inputs can write Arrow intervals using the session-zone calendar and the scalar result precision.
+        -- A compatible non-nullable timestamp cast inside AGE applies the scalar cast after both operands reach a non-null cell.
         -- A column table over a compatible Arrow list parameter reads the bound row's child slice as one semantic page.
         -- Its columnar result is split to the transport row limit after the operators have processed the complete page.
         -- Scalar evaluation in columnar projections, filters, aggregate filters, and evaluated UNNEST can borrow the cells demanded by the expression.

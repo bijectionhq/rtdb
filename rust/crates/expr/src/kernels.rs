@@ -16,6 +16,16 @@ fn reads(selection: Selection<'_>, row: usize) -> bool { selection.is_none_or(|r
 
 pub use crate::temporal_functions::{AgeOperand, FixedDateBin, timestamp_truncation_zone, truncate_date32, truncate_date64, truncate_timestamp};
 
+/// Casts a physical timestamp cell using scalar cast rules for units and local time.
+pub fn cast_timestamp_ticks(ticks: i64, source: rtdb_types::TimeUnit, source_zoned: bool, unit: rtdb_types::TimeUnit, zoned: bool, timezone: &str) -> Result<i64> {
+    crate::cast::timestamp_raw(ticks, source, source_zoned, unit, zoned, timezone)
+}
+
+/// Casts an epoch day to midnight using the scalar cast's timezone and overflow rules.
+pub fn cast_date_timestamp_ticks(days: i64, unit: rtdb_types::TimeUnit, zoned: bool, timezone: &str) -> Result<i64> {
+    crate::cast::date_to_timestamp(days, unit, zoned, timezone)
+}
+
 pub fn calendar_age(end: AgeOperand<'_>, start: AgeOperand<'_>) -> Result<(i32, i32, i64)> {
     let parts = crate::temporal_functions::calendar_age(end, start)?;
     Ok((parts.months, parts.days, parts.nanos))
