@@ -2110,6 +2110,73 @@ async fn produce_newer_memory_checkpoint(fixture: &Fixture) -> ReplicationDriver
 }
 
 #[tokio::test]
+async fn classic_replay_refuses_conflicting_oids_and_restart_keeps_the_recorded_registry() {
+    use rtdb_format::{catalog::BlockCatalog, keys::block_key};
+    use rtdb_tx::TxResolver;
+
+    let fixture = produced_memory_checkpoint(true).await;
+    let config = ReplicationConfig { may_lead: false, ..Default::default() };
+    let (handle, mut follower) = reopen_memory_checkpoint_with_config(&fixture, config.clone()).await;
+    let base = follower.partition.value();
+    let bmp = TableRef::new("public", "oidＡ");
+    let supplementary = TableRef::new("public", "oid𐐀");
+    let operations = ["INSERT INTO \"oid𐐀\" (_id) VALUES (1)", "INSERT INTO \"oidＡ\" (_id) VALUES (2)"]
+        .into_iter().map(|sql| TxOp::Sql { sql: sql.into(), args: None }).collect();
+    let tx = SourceTransaction::new(operations, SubmitOptions::default(), &fixture.memory).unwrap();
+    let tx_time = Timestamp(100);
+    let position = handle.submit_source_encoded(tx.encode().unwrap().into_bytes(), tx_time).await.unwrap();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &fixture.memory).unwrap();
+    let resolved = resolver.resolve_source(base.snapshot(), position, tx_time, tx, &follower.resolve).await.unwrap();
+    assert!(resolved.result().committed());
+    let body = resolved.to_replica_body(&fixture.memory).unwrap();
+    for (sequence, message) in [
+        (0, ReplicaBody::NoOp(proto::NoOp::default())),
+        (1, body.body().clone()),
+        (2, boundary(1, position.0)),
+    ] {
+        deliver_checkpoint_record(&fixture, &mut follower, 2, sequence, message).await.unwrap();
+    }
+    let replayed = follower.partition.value();
+    let native_bmp_oid = replayed.table_catalog().entry(&bmp).unwrap().oid;
+    let native_supplementary_oid = replayed.table_catalog().entry(&supplementary).unwrap().oid;
+    assert_eq!(native_bmp_oid + 1, native_supplementary_oid);
+
+    let pending = follower.pending_block.as_ref().unwrap();
+    let mut produced = follower.blocks.produce(&pending.prepared, &pending.boundary, BTreeMap::new()).await.unwrap();
+    let mut utf16_root = produced.catalog.as_proto().clone();
+    utf16_root.table_block_manifest = None;
+    for entry in &mut utf16_root.tables {
+        entry.oid = match entry.oid {
+            Some(oid) if oid == native_bmp_oid => Some(native_supplementary_oid),
+            Some(oid) if oid == native_supplementary_oid => Some(native_bmp_oid),
+            oid => oid,
+        };
+    }
+    produced.catalog = BlockCatalog::from_proto(utf16_root).unwrap();
+    let root_key = ObjectKey::new(block_key(BlockIndex(1)).unwrap()).unwrap();
+    fixture.store.delete(&root_key).await.unwrap();
+    let root_bytes = Bytes::from(produced.catalog.encode_for_publication());
+    fixture.store.put(&root_key, root_bytes.clone()).await.unwrap();
+
+    let upload = produced_upload(&produced, 1, position.0);
+    let error = deliver_checkpoint_record(&fixture, &mut follower, 2, 3, upload).await.unwrap_err();
+    assert_eq!(error.code, "rtdb.index/invalid-table-catalog");
+    assert_eq!(error.message.as_deref(), Some("Block changes a previously allocated table OID or slug"));
+    assert!(Arc::ptr_eq(&follower.partition.value(), &replayed));
+    assert_eq!(handle.status().adopted_block.unwrap().block_index(), BlockIndex(0));
+    assert_eq!(fixture.store.get(&root_key).await.unwrap(), root_bytes);
+
+    let (handle, restarted) = reopen_memory_checkpoint_with_config(&fixture, config).await;
+    assert_eq!(handle.status().adopted_block.unwrap().block_index(), BlockIndex(1));
+    let restored = restarted.partition.value();
+    assert_eq!(restored.table_catalog().entry(&bmp).unwrap().oid, native_supplementary_oid);
+    assert_eq!(restored.table_catalog().entry(&supplementary).unwrap().oid, native_bmp_oid);
+    for entry in base.table_catalog().entries() {
+        assert_eq!(restored.table_catalog().entry(&entry.table), Some(entry));
+    }
+}
+
+#[tokio::test]
 async fn promotion_ignores_a_deleted_historical_catalog_still_present_in_the_disk_cache() {
     let fixture = produced_memory_checkpoint(true).await;
     produce_newer_memory_checkpoint(&fixture).await;

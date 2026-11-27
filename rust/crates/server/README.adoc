@@ -188,8 +188,10 @@ Repeat `--allocate SCHEMA/TABLE` for the exact relation names in one proposed al
 The comparison accounts for missing startup system relations and reports both OIDs for each fresh relation.
 It also reports collisions among existing recorded slugs and XTDB's proposed escaped slugs for the startup relations and the batch.
 `allocation_batch.eligible` includes the checkpoint result, and `allocation_batch` is null when no batch was supplied.
-The command checks the supplied identities only.
-Replay qualification still requires the actual ordered source and replica suffix, and storage qualification requires the referenced table and trie objects.
+Replay qualification requires the actual ordered source and replica suffix, including which fresh relations appear together in each transaction.
+Native RTDB can allocate different OIDs during replay and then refuse the checkpoint upload even when the successor's recorded registry is eligible on its own.
+Starting directly at an explicit checkpoint loads the recorded OIDs and slugs.
+Storage qualification requires the referenced table and trie objects.
 
 Tracing and cloud metric exporter construction and lifecycle paths are source-written; executable compatibility qualification remains pending.
 The local-log `useInstantSourceForNonTx` option controls the writer's timestamp policy.
