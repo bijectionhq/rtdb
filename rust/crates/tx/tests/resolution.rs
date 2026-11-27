@@ -202,8 +202,9 @@ async fn sql_source_replay_validates_an_unreached_uri_before_evaluation() {
     let fields = vec![Field::new("id", DataType::Int64, false), to_field("payload", &LogicalType::Scalar(ScalarType::Uri)).unwrap()];
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), vec![Arc::new(Int64Array::from(vec![1])), Arc::new(StringArray::from(vec!["http://["]))]).unwrap();
     let arguments = SqlArguments::from_arrow(OwnedBatch::new(batch, &context.memory).unwrap(), &context.memory).unwrap();
+    let statement = "INSERT INTO docs (_id, v) SELECT $1, CASE WHEN $1 < 0 THEN $2 IS NOT NULL ELSE TRUE END";
     let source = request(vec![TxOp::Sql {
-        sql: "INSERT INTO docs (_id, v) SELECT $1, CASE WHEN $1 < 0 THEN $2 IS NOT NULL ELSE TRUE END".into(),
+        sql: statement.into(),
         args: Some(arguments),
     }], &context);
     let encoded = source.encode().unwrap();
@@ -213,6 +214,8 @@ async fn sql_source_replay_validates_an_unreached_uri_before_evaluation() {
     let result = resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), decoded, &context).await.unwrap();
     let error = result.result().error().unwrap();
     assert_eq!(error.code, "xtdb/invalid-uri");
+    assert_eq!(error.context["sql"], statement);
+    assert_eq!(error.context["tx-op-idx"], 0);
     assert!(error.context.get("arg-idx").is_none());
 }
 

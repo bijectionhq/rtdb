@@ -1269,6 +1269,7 @@ rule BufferDml {
     -- A static write can project a floating-point vector from its bound Arrow row and retain that position through valid-time grouping.
     -- A bound record can supply the vector position for a static RECORDS write.
     -- At commit, the database applies the submission and resolution rules for those SQL arguments.
+    -- Ordered SQL failures include the statement text, including failures while decoding or validating its bindings.
     when: ExecuteStatement(frontend, connection, kind, statement)
     requires: kind = dml
     requires: connection.tx != null

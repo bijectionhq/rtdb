@@ -1331,11 +1331,13 @@ impl<'a> OpenTransaction<'a> {
             Operation::Public(TxOp::Sql { sql, args }) => match args {
                 Some(arguments) => self.execute_sql_arguments(sql, arguments).await,
                 None => self.execute_sql(sql, None).await,
-            },
+            }.map_err(|error| error.with_context("sql", sql.as_str().into())),
             Operation::Public(TxOp::SqlBytes { sql, arg_bytes }) => {
-                if arg_bytes.as_slice().is_empty() { return self.execute_sql(sql, None).await; }
-                let arguments = decode_arguments(arg_bytes.clone().into_bytes(), &self.context.memory)?;
-                self.execute_sql_arguments(sql, &arguments).await
+                async {
+                    if arg_bytes.as_slice().is_empty() { return self.execute_sql(sql, None).await; }
+                    let arguments = decode_arguments(arg_bytes.clone().into_bytes(), &self.context.memory)?;
+                    self.execute_sql_arguments(sql, &arguments).await
+                }.await.map_err(|error| error.with_context("sql", sql.as_str().into()))
             }
             Operation::Public(TxOp::PutArrowDocs { table, documents }) => self.put_arrow_documents(table, documents, None, None, None, false).await,
             Operation::Public(TxOp::WriteArrowDocs { table, documents, write, valid_from, valid_to }) => match write {
