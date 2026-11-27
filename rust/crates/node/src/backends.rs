@@ -2,8 +2,10 @@
 use std::sync::Arc;
 #[cfg(any(feature = "kafka", feature = "s3", feature = "azure", feature = "gcs"))]
 use async_trait::async_trait;
-#[cfg(any(feature = "kafka", feature = "s3", feature = "azure", feature = "gcs"))]
+#[cfg(any(feature = "kafka", feature = "azure", feature = "gcs"))]
 use prost::Message;
+#[cfg(feature = "s3")]
+use rtdb_format::config::{S3_JVM_LITERAL_STORE, S3_STORE, unpack_s3_store};
 #[cfg(any(feature = "kafka", feature = "s3", feature = "azure", feature = "gcs"))]
 use prost_types::Any;
 #[cfg(any(feature = "kafka", feature = "s3", feature = "azure", feature = "gcs"))]
@@ -30,7 +32,8 @@ impl NativeResources {
     }
     #[cfg(feature = "s3")]
     pub fn with_s3(self, remotes: Arc<dyn rtdb_s3::S3CredentialResolver>) -> Result<Self> {
-        self.register_storage("xtdb.aws.proto.S3ObjectStoreConfig", Arc::new(S3Factory { remotes }))
+        self.register_storage(S3_STORE, Arc::new(S3Factory { remotes: remotes.clone(), literal: false }))?
+            .register_storage(S3_JVM_LITERAL_STORE, Arc::new(S3Factory { remotes, literal: true }))
     }
     #[cfg(feature = "azure")]
     pub fn with_azure(self, remotes: Arc<dyn rtdb_azure::AzureCredentialResolver>) -> Result<Self> {
@@ -41,20 +44,27 @@ impl NativeResources {
 }
 
 #[cfg(feature = "s3")]
-struct S3Factory { remotes: Arc<dyn rtdb_s3::S3CredentialResolver> }
+struct S3Factory {
+    remotes: Arc<dyn rtdb_s3::S3CredentialResolver>,
+    literal: bool,
+}
 #[cfg(feature = "s3")]
 #[async_trait]
 impl RemoteStorageFactory for S3Factory {
     fn uses_classic_custody(&self) -> bool { true }
 
     fn storage_location(&self, configuration: &Any, storage_root: &ObjectKey) -> Result<Option<String>> {
-        let wire = rtdb_format::generated::xtdb::aws::proto::S3ObjectStoreConfig::decode(configuration.value.as_slice()).map_err(invalid)?;
+        if self.literal { return Ok(None); }
+        let wire = unpack_s3_store(configuration)?;
         rtdb_s3::S3Config::from_proto(&wire).storage_location(storage_root).map(Some)
     }
 
     async fn open(&self, configuration: &Any, storage_root: &ObjectKey, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>> {
-        let wire = rtdb_format::generated::xtdb::aws::proto::S3ObjectStoreConfig::decode(configuration.value.as_slice()).map_err(invalid)?;
-        rtdb_s3::S3Config::from_proto(&wire).open(storage_root, self.remotes.as_ref(), io).await
+        let config = rtdb_s3::S3Config::from_proto(&unpack_s3_store(configuration)?);
+        if self.literal {
+            return config.open_classic_jvm_literal(storage_root, self.remotes.as_ref(), io).await;
+        }
+        config.open(storage_root, self.remotes.as_ref(), io).await
     }
 }
 

@@ -16,7 +16,7 @@ use aws_credential_types::provider::SharedCredentialsProvider;
 use object_store::{RetryConfig, StaticCredentialProvider, aws::{AmazonS3Builder, AmazonS3ConfigKey, AwsCredential, S3ConditionalPut, S3CopyIfNotExists}, client::ReqwestConnector};
 use rtdb_format::generated::xtdb::aws::proto as pb;
 use rtdb_format::keys::StorageRoot;
-use rtdb_storage::{IoRegion, ObjectKey, ObjectStore, remote::{RemoteStore, cache_http}};
+use rtdb_storage::{IoRegion, ObjectKey, ObjectStore, remote::{RemoteKeyLayout, RemoteStore, cache_http}};
 use rtdb_types::{Anomaly, Result, S3ObjectNamespace};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -61,6 +61,12 @@ pub struct S3Config {
     pub remote: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_scope: Option<TerminalS3Scope>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StoreKind {
+    Classic(RemoteKeyLayout),
+    Cell,
 }
 
 enum S3Authorization {
@@ -144,11 +150,27 @@ impl S3Config {
     /// Credential aliases are resolved at opening; default credentials refresh during requests.
     /// The owner closes and joins `io` after store consumers finish and before shutting down the runtime.
     pub async fn open(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>> {
+        self.open_classic(storage_root, remotes, io, RemoteKeyLayout::Escaped).await
+    }
+
+    pub async fn open_classic_jvm_literal(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>> {
+        let (declared, _) = self.declared_classic_key_scope(storage_root)?;
+        let (endpoint, _) = self.endpoint_addressing()?;
+        let express = AmazonS3Builder::from_env().get_config_value(&AmazonS3ConfigKey::S3Express);
+        if endpoint.as_ref().map(url::Url::as_str) != declared.endpoint.as_deref()
+            || express.as_deref() == Some("true")
+        {
+            return Err(Anomaly::incorrect("rtdb.s3/classic-key-scope", "Literal S3 requires the declared provider addressing"));
+        }
+        self.open_classic(storage_root, remotes, io, RemoteKeyLayout::LiteralS3).await
+    }
+
+    async fn open_classic(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver, io: Arc<IoRegion>, layout: RemoteKeyLayout) -> Result<Arc<dyn ObjectStore>> {
         if self.terminal_scope.is_some() {
             return Err(Anomaly::incorrect("xtdb.aws/terminal-scope", "A terminal S3 allocation must be opened as a cell"));
         }
         self.require_cell_root(storage_root)?;
-        Ok(self.open_store(storage_root, remotes, io, false).await?)
+        Ok(self.open_store(storage_root, remotes, io, StoreKind::Classic(layout)).await?)
     }
 
     /// Opens the cell's immutable namespace. Any result that leaves an
@@ -159,7 +181,7 @@ impl S3Config {
         if self.terminal_scope.is_some() {
             return Err(Anomaly::incorrect("xtdb.aws/terminal-scope", "Terminal cells require S3 inventory support"));
         }
-        let store = self.open_store(storage_root, remotes, io, true).await?;
+        let store = self.open_store(storage_root, remotes, io, StoreKind::Cell).await?;
         #[cfg(feature = "versioning")]
         if let Some(scope) = &self.terminal_scope {
             terminal::require_enrollment(store.as_ref(), &self.object_prefix(storage_root)?, scope).await?;
@@ -167,14 +189,14 @@ impl S3Config {
         Ok(store)
     }
 
-    async fn open_store(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver, io: Arc<IoRegion>, cell: bool) -> Result<Arc<RemoteStore>> {
+    async fn open_store(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver, io: Arc<IoRegion>, kind: StoreKind) -> Result<Arc<RemoteStore>> {
         if self.bucket.is_empty() { return Err(Anomaly::incorrect("xtdb.aws/invalid-config", "S3 bucket is empty")); }
         let prefix = self.object_prefix(storage_root)?;
         let authorization = match self.resolve_credentials(remotes)? {
             Some(credentials) => S3Authorization::Static(credentials),
             None => self.default_authorization().await?,
         };
-        self.open_authorized(prefix, authorization, io, cell)
+        self.open_authorized(prefix, authorization, io, kind)
     }
 
     async fn default_authorization(&self) -> Result<S3Authorization> {
@@ -185,7 +207,8 @@ impl S3Config {
         Ok(S3Authorization::Rotating { provider, region: configuration.region().map(|region| region.as_ref().to_owned()) })
     }
 
-    fn open_authorized(&self, prefix: ObjectKey, authorization: S3Authorization, io: Arc<IoRegion>, cell: bool) -> Result<Arc<RemoteStore>> {
+    fn open_authorized(&self, prefix: ObjectKey, authorization: S3Authorization, io: Arc<IoRegion>, kind: StoreKind) -> Result<Arc<RemoteStore>> {
+        let cell = kind == StoreKind::Cell;
         #[cfg(feature = "versioning")]
         let uploads = (cell && io.publication_journal().is_some())
             .then(|| self.authorized_inventory(prefix.clone(), &authorization)).transpose()?;
@@ -193,8 +216,6 @@ impl S3Config {
         if cell && io.publication_journal().is_some() {
             return Err(Anomaly::incorrect("xtdb.aws/managed-uploads", "Managed cell publications require S3 inventory support"));
         }
-        #[cfg(feature = "versioning")]
-        let classic_inventory = (!cell).then(|| self.authorized_inventory(prefix.clone(), &authorization)).transpose()?;
         let (endpoint, virtual_hosted) = self.endpoint_addressing()?;
         let mut builder = AmazonS3Builder::from_env().with_bucket_name(&self.bucket)
             .with_virtual_hosted_style_request(virtual_hosted)
@@ -206,6 +227,11 @@ impl S3Config {
         };
         if let Some(region) = &self.region { builder = builder.with_region(region); }
         if let Some(endpoint) = &endpoint { builder = builder.with_config(AmazonS3ConfigKey::S3Endpoint, endpoint.as_str()).with_allow_http(endpoint.scheme() == "http"); }
+        #[cfg(feature = "versioning")]
+        let classic_inventory = match kind {
+            StoreKind::Classic(layout) => Some(self.authorized_inventory(prefix.clone(), &authorization)?.with_key_layout(layout)),
+            StoreKind::Cell => None,
+        };
         let ordinary = configure_authorization(builder, authorization)?;
         let region = ordinary.get_config_value(&AmazonS3ConfigKey::Region);
         let namespace = S3ObjectNamespace {
@@ -213,12 +239,18 @@ impl S3Config {
             endpoint: endpoint.map(|endpoint| endpoint.to_string()),
             region: Some(region.unwrap_or_else(|| "us-east-1".into())),
         };
-        if !cell {
+        if let StoreKind::Classic(layout) = kind {
+            #[cfg(feature = "versioning")]
+            if layout == RemoteKeyLayout::LiteralS3
+                && classic_inventory.as_ref().is_some_and(|inventory| inventory.namespace() != &namespace)
+            {
+                return Err(Anomaly::incorrect("rtdb.s3/classic-key-scope", "The store and inventory resolve to different S3 namespaces"));
+            }
             let client = build_client(ordinary.clone())?;
             let downloads = cache_http::open(ReqwestConnector::default(), |connector, retry| {
                 ordinary.with_http_connector(connector).with_retry(retry).build()
             }).map_err(|error| Anomaly::incorrect("xtdb.aws/invalid-config", error.to_string()))?;
-            let store = RemoteStore::new_in(client, Some(prefix), io).with_catalog_ledger()?
+            let store = RemoteStore::new_classic_s3(client, prefix, io, layout).with_catalog_ledger()?
                 .with_cache_downloads(downloads);
             #[cfg(feature = "versioning")]
             let store = store.with_s3_versioning(namespace)
@@ -419,6 +451,82 @@ mod tests {
         config.endpoint = Some("https://s3.example.test/custom/".into());
         assert_eq!(config.storage_location(&root).unwrap(), "https://s3.example.test/custom/bucket/v06");
     }
+    #[cfg(feature = "versioning")]
+    #[tokio::test]
+    async fn classic_literal_s3_keeps_exact_keys_in_reads_listings_and_grants() {
+        use std::{collections::BTreeMap, time::Duration};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = S3Config::new("bucket");
+        config.endpoint = Some(format!("http://{}", listener.local_addr().unwrap()));
+        config.region = Some("us-east-1".into());
+        config.credentials = Some(S3Credentials { access_key: "test".into(), secret_key: "test-secret".into() });
+        let root = ObjectKey::new("root%3F").unwrap();
+        let remotes = BTreeMap::new();
+        let literal_io = IoRegion::new();
+        let legacy_io = IoRegion::new();
+        let store = config.open_classic_jvm_literal(&root, &remotes, literal_io.clone()).await.unwrap();
+        let legacy = config.open(&root, &remotes, legacy_io.clone()).await.unwrap();
+        let server = tokio::spawn(async move {
+            let listing = "<ListBucketResult><Contents><Key>root%3F/data/t?</Key><Size>1</Size><LastModified>2026-01-01T00:00:00Z</LastModified></Contents><Contents><Key>root%3F/data/t%3F</Key><Size>1</Size><LastModified>2026-01-01T00:00:00Z</LastModified></Contents></ListBucketResult>";
+            let versions = "<ListVersionsResult><IsTruncated>false</IsTruncated><Version><Key>root%3F/data/t?</Key><VersionId>literal-question</VersionId><IsLatest>true</IsLatest></Version></ListVersionsResult>";
+            for (method, target, version, body) in [
+                ("GET", "/bucket/root%253F/data/t%3F", "literal-question", "q"),
+                ("GET", "/bucket/root%253F/data/t%253F", "literal-percent", "p"),
+                ("GET", "/bucket/root%25253F/data/t%253F", "escaped-question", "l"),
+                ("GET", "/bucket?list-type=2&prefix=root%253F%2Fdata%2F", "", listing),
+                ("HEAD", "/bucket/root%253F/data/t%3F", "literal-question", ""),
+                ("HEAD", "/bucket/root%253F/data/t%3F", "literal-question", ""),
+                ("GET", "/bucket", "", versions),
+            ] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                if body == versions {
+                    let target = line.strip_prefix("GET ").unwrap().strip_suffix(" HTTP/1.1\r\n").unwrap();
+                    let (path, query) = target.split_once('?').unwrap();
+                    assert_eq!(path.trim_end_matches('/'), "/bucket");
+                    let query: BTreeMap<_, _> = url::form_urlencoded::parse(query.as_bytes()).into_owned().collect();
+                    assert!(query.contains_key("versions"));
+                    assert_eq!(query["prefix"], "root%3F/data/t?");
+                } else {
+                    assert_eq!(line, format!("{method} {target} HTTP/1.1\r\n"));
+                }
+                while line != "\r\n" {
+                    line.clear();
+                    assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+                }
+                let reply = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nx-amz-version-id: {version}\r\nConnection: close\r\n\r\n{body}", body.len());
+                reader.get_mut().write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let question = ObjectKey::new("data/t?").unwrap();
+            let percent = ObjectKey::new("data/t%3F").unwrap();
+            let observed = store.observe_fresh_exact(&question, 1).await.unwrap();
+            assert_eq!(observed.value.as_ref(), b"q");
+            let exact = observed.version.unwrap();
+            assert_eq!(exact.key, "root%3F/data/t?");
+            assert_eq!(exact.version, "literal-question");
+            let observed = store.observe_fresh_exact(&percent, 1).await.unwrap();
+            assert_eq!(observed.value.as_ref(), b"p");
+            assert_eq!(observed.version.unwrap().key, "root%3F/data/t%3F");
+            let escaped = legacy.observe_fresh_exact(&question, 1).await.unwrap().version.unwrap();
+            assert_eq!(escaped.key, "root%253F/data/t%3F");
+            let listed = store.list(Some(&ObjectKey::new("data").unwrap())).await.unwrap();
+            assert_eq!(listed.into_iter().map(|entry| entry.key).collect::<Vec<_>>(), [percent, question.clone()]);
+
+            assert!(!store.classic_trie_retirement_ready(&question, Some(&escaped)).await.unwrap());
+            assert!(store.classic_trie_retirement_ready(&question, Some(&exact)).await.unwrap());
+            server.await.unwrap();
+        }).await.unwrap();
+        literal_io.close_and_wait().await;
+        legacy_io.close_and_wait().await;
+    }
+
     #[tokio::test]
     async fn ranged_observation_uses_the_version_from_the_payload_response() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};

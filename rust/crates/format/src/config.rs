@@ -100,6 +100,18 @@ pub fn decode_storage(value: Yaml) -> Result<Storage> {
     Ok(storage)
 }
 
+pub const S3_STORE: &str = "xtdb.aws.proto.S3ObjectStoreConfig";
+pub const S3_JVM_LITERAL_STORE: &str = "xtdb.aws.proto.S3JvmLiteralObjectStoreConfig";
+
+pub fn unpack_s3_store(config: &Any) -> Result<aws::S3ObjectStoreConfig> {
+    match config.type_url.rsplit('/').next() {
+        Some(S3_STORE) => Ok(aws::S3ObjectStoreConfig::decode(config.value.as_slice()).map_err(|error| invalid(error.to_string()))?),
+        Some(S3_JVM_LITERAL_STORE) => aws::S3JvmLiteralObjectStoreConfig::decode(config.value.as_slice())
+            .map_err(|error| invalid(error.to_string()))?.store.ok_or_else(|| invalid("Literal S3 storage is missing its provider configuration")),
+        _ => Err(invalid("Expected a Classic S3 object store configuration")),
+    }
+}
+
 pub fn decode_object_store(value: Yaml) -> Result<Any> {
     let (tag, mut fields) = YamlFields::tagged(value, "objectStore")?;
     let object_store = match tag.as_str() {
@@ -116,10 +128,17 @@ pub fn decode_object_store(value: Yaml) -> Result<Any> {
                 credentials.finish()?;
                 Ok::<_, Anomaly>(result)
             }).transpose()?;
-            pack("xtdb.aws.proto.S3ObjectStoreConfig", aws::S3ObjectStoreConfig {
+            let store = aws::S3ObjectStoreConfig {
                 bucket, region, prefix, endpoint, path_style_access_enabled,
                 credentials: if remote.is_some() { None } else { credentials }, remote,
-            })
+            };
+            match fields.string("keyLayout")?.as_deref() {
+                None | Some("legacy_rtdb") => pack(S3_STORE, store),
+                Some("jvm_literal") if store.region.as_ref().is_some_and(|region| !region.is_empty()) =>
+                    pack(S3_JVM_LITERAL_STORE, aws::S3JvmLiteralObjectStoreConfig { store: Some(store) }),
+                Some("jvm_literal") => return Err(invalid("The JVM literal S3 layout requires an explicit region")),
+                Some(layout) => return Err(invalid(format!("Unknown Classic S3 key layout '{layout}'"))),
+            }
         }
         "!Azure" => {
             let storage_account = Some(fields.required_string("storageAccount")?);

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use prost::Message;
 use rtdb_auth::{AuthConfig, WorkloadGrantConfig, WorkloadIssuerConfig};
-use rtdb_format::{database::proto::{DatabaseConfig, database_config::{Log, Storage}}, generated::xtdb::{aws, azure, gcp, kafka, postgres}, keys::{CURRENT_STORAGE_VERSION, storage_root}};
+use rtdb_format::{database::proto::{DatabaseConfig, database_config::{Log, Storage}}, generated::xtdb::{azure, gcp, kafka, postgres}, keys::{CURRENT_STORAGE_VERSION, storage_root}};
 use rtdb_server::config::{ModuleSettings, NodeConfiguration, RemoteConfig};
 use rtdb_storage::ObjectKey;
 use rtdb_types::{SourcePosition, StorageEpoch};
@@ -181,9 +181,9 @@ fn database_report(name: &str, database: &DatabaseConfig, node: &NodeConfigurati
 
 fn object_store(any: &prost_types::Any, root: Option<&str>, node: &NodeConfiguration, path: &str, report: &mut QualificationReport) -> Value {
     match kind(any) {
-        "xtdb.aws.proto.S3ObjectStoreConfig" => {
+        kind @ (rtdb_format::config::S3_STORE | rtdb_format::config::S3_JVM_LITERAL_STORE) => {
             report.feature("s3", path);
-            let Ok(config) = aws::proto::S3ObjectStoreConfig::decode(any.value.as_slice()) else { return malformed(path, report); };
+            let Ok(config) = rtdb_format::config::unpack_s3_store(any) else { return malformed(path, report); };
             nonempty(config.bucket.as_deref(), path, report);
             if let Some(alias) = &config.remote { remote(alias, "s3", node, path, report); }
             let prefix = prefix(config.prefix.as_deref(), root, path, report);
@@ -191,7 +191,7 @@ fn object_store(any: &prost_types::Any, root: Option<&str>, node: &NodeConfigura
             if let Some(root) = root.and_then(|root| ObjectKey::new(root).ok()) {
                 if rtdb_s3::S3Config::from_proto(&config).object_prefix(&root).is_err() { report.gap("invalid-native-prefix", path, "The production provider rejected its object prefix."); }
             }
-            json!({"kind":"s3", "bucket":config.bucket, "region":config.region, "root":prefix, "endpoint":config.endpoint.as_deref().map(|value| endpoint(value,path,report)), "path_style":config.path_style_access_enabled, "credential_alias":config.remote, "credentials":"[redacted]"})
+            json!({"kind":"s3", "bucket":config.bucket, "region":config.region, "root":prefix, "endpoint":config.endpoint.as_deref().map(|value| endpoint(value,path,report)), "path_style":config.path_style_access_enabled, "credential_alias":config.remote, "credentials":"[redacted]", "key_layout":if kind == rtdb_format::config::S3_JVM_LITERAL_STORE { "jvm_literal" } else { "legacy_rtdb" }})
         }
         "xtdb.azure.proto.AzureBlobStorageConfig" => {
             report.feature("azure", path);

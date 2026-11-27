@@ -56,6 +56,8 @@
 -- refused with `rtdb/erased-under-view`.
 -- The collector submits an installed receipt to the storage owner.
 -- The classic grant binds that receipt's immutable file identities to the storage owner.
+-- The Classic S3 inventory resolves each grant and staging upload with the open namespace's configured key layout.
+-- An exact grant is valid only when its provider namespace, stored key and immutable version match the selected publication.
 -- A native local trie deletion grant holds the recovery gate exclusively through the physical deletion.
 -- A startup hold shares that gate through checkpoint discovery and cursor admission.
 -- A successor journal can open from the latest durable checkpoint after offline replacement.

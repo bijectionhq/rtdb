@@ -6,7 +6,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{ChecksumAlgorithm, CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier, RequestPayer};
 use bytes::Bytes;
 use object_store::path::Path;
-use rtdb_storage::{Error, IoRegion, ObjectKey, remote::{ClassicVersionRetirement, PublicationResult, PublicationUploads, S3_RETIREMENT_ATTRIBUTE, strong_entity_tag, valid_object_version}};
+use rtdb_storage::{Error, IoRegion, ObjectKey, remote::{ClassicVersionRetirement, PublicationResult, PublicationUploads, RemoteKeyLayout, S3_RETIREMENT_ATTRIBUTE, strong_entity_tag, valid_object_version}};
 use rtdb_types::{Anomaly, AnomalyCategory, PhysicalObjectVersion, Result, S3ObjectNamespace, S3TombstoneCondition, S3TombstoneTarget};
 
 #[path = "never_versioned.rs"]
@@ -27,6 +27,7 @@ pub struct VersionedInventory {
     client: Client,
     namespace: S3ObjectNamespace,
     root: ObjectKey,
+    key_layout: RemoteKeyLayout,
     request_payer: Option<RequestPayer>,
     scope_multipart_listing: bool,
     terminal_allocation: Option<uuid::Uuid>,
@@ -62,7 +63,7 @@ impl ClassicVersionRetirement for VersionedInventory {
     }
 
     async fn settle_staging_upload(&self, upload: uuid::Uuid, version: Option<&str>) -> rtdb_storage::Result<()> {
-        let path = Path::from(format!("{}/.tmp/upload-{upload}", self.root));
+        let path = self.key_layout.provider_path(&format!("{}/.tmp/upload-{upload}", self.root))?;
         let result = async {
             if let Some(version) = version.filter(|version| valid_object_version(version.as_bytes())) {
                 return self.retire_version_at_path(path.as_ref(), version).await;
@@ -87,7 +88,12 @@ fn retirement_error(key: &ObjectKey, error: Anomaly) -> Error {
 
 impl VersionedInventory {
     pub(crate) fn new(client: Client, namespace: S3ObjectNamespace, root: ObjectKey, requester_pays: bool, scope_multipart_listing: bool) -> Self {
-        Self { reads: IoRegion::new(), client, namespace, root, request_payer: requester_pays.then_some(RequestPayer::Requester), scope_multipart_listing, terminal_allocation: None }
+        Self { reads: IoRegion::new(), client, namespace, root, key_layout: RemoteKeyLayout::Escaped, request_payer: requester_pays.then_some(RequestPayer::Requester), scope_multipart_listing, terminal_allocation: None }
+    }
+
+    pub(crate) fn with_key_layout(mut self, layout: RemoteKeyLayout) -> Self {
+        self.key_layout = layout;
+        self
     }
 
     async fn inspect<T, A, F>(&self, selection: A, inspect: impl FnOnce(Arc<Self>, A) -> F + Send + 'static) -> Result<T>
@@ -420,7 +426,7 @@ impl VersionedInventory {
     }
 
     fn observed_path(&self, key: &ObjectKey, observed: &PhysicalObjectVersion) -> Result<Path> {
-        let path = Path::from(format!("{}/{key}", self.root));
+        let path = self.key_layout.provider_path(&format!("{}/{key}", self.root))?;
         if observed.namespace != self.namespace || observed.key != path.as_ref() || !valid_object_version(observed.version.as_bytes()) {
             return Err(unavailable("The retirement does not identify an immutable version of this key"));
         }

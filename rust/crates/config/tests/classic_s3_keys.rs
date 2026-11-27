@@ -89,6 +89,27 @@ fn literal_percent_path_and_encoded_question_mark_collide_at_the_same_exact_key(
 }
 
 #[test]
+fn classic_literal_s3_configuration_retains_the_preflight_scope() {
+    use rtdb_format::config::{S3_JVM_LITERAL_STORE, S3_STORE, decode_object_store, parse_yaml};
+
+    let yaml = "!S3 {bucket: fixture-bucket, region: us-east-1, prefix: snapshots}";
+    let configured = yaml.replace("prefix: snapshots", "prefix: snapshots, keyLayout: jvm_literal");
+    let legacy = decode_object_store(parse_yaml(yaml).unwrap()).unwrap();
+    let literal = decode_object_store(parse_yaml(&configured).unwrap()).unwrap();
+    assert!(legacy.type_url.ends_with(S3_STORE));
+    assert!(literal.type_url.ends_with(S3_JVM_LITERAL_STORE));
+    assert!(decode_object_store(parse_yaml("!S3 {bucket: fixture-bucket, keyLayout: jvm_literal}").unwrap()).is_err());
+    assert!(decode_object_store(parse_yaml("!S3 {bucket: fixture-bucket, keyLayout: auto}").unwrap()).is_err());
+
+    let mut input = fixture();
+    input["logical_objects"] = json!([input["logical_objects"][1].clone()]);
+    let configured = CONFIG.replace(yaml, &configured);
+    let checked = report(&configured, b"{}", &input);
+    assert_eq!(checked["classic_s3_key_preflight"]["layout"], "jvm_literal");
+    assert_eq!(checked["databases"][0]["storage"]["provider"]["key_layout"], "jvm_literal");
+}
+
+#[test]
 fn the_same_exact_version_is_attributed_by_recorded_logical_key() {
     for (logical_index, expected) in [(0, "legacy_rtdb"), (1, "jvm_literal")] {
         let mut input = fixture();
@@ -226,7 +247,7 @@ fn the_capture_must_cover_both_raw_prefixes_and_match_the_declared_provider() {
     let literal_root = "snapshots/é~/v06_e02/";
     let legacy_root = "snapshots/%C3%A9%7E/v06_e02/";
     let key = format!("{legacy_root}tables/public$t%3F/data/l00-rc-b00.arrow");
-    let assert_report = |input| report(&config, b"{}", input)["classic_s3_key_preflight"].clone();
+    let assert_report = |input: &Value| report(&config, b"{}", input)["classic_s3_key_preflight"].clone();
     let mut input = fixture();
     input["logical_objects"].as_array_mut().unwrap().truncate(1);
     input["versions"] = json!([version(&key, "old+/=", "object", true)]);

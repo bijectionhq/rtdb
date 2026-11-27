@@ -962,6 +962,11 @@ config {
 -- A follower that reopens loads the latest reported checkpoint and applies its retained suffix.
 -- In the Rust partition owner, trie collection preserves the data and metadata of live and nascent tries in the latest installed checkpoint.
 -- Recovery derives that protection from the restored catalog. Block adoption derives it from the persisted table blocks.
+-- The native Classic S3 provider defaults to the legacy escaped key layout.
+-- The literal Classic S3 profile records its layout in a distinct provider configuration type.
+-- Its reads, listings, publications, and internal staging keys use literal storage paths.
+-- Its disk cache is scoped to the literal provider configuration.
+-- A declared literal namespace must be fresh or qualified for literal access at the fenced catalog and log cut.
 -- Ordinary latest-block recovery refreshes discovery after a missing root or table block.
 -- It retries only when the refreshed listing reveals a strictly newer block.
 -- With a provider that admits a cursor during recovery, ordinary startup opens the replica tail before installing the checkpoint.

@@ -16,6 +16,10 @@ message S3ObjectStoreConfig {
     string remote = 7;
 }
 
+message S3JvmLiteralObjectStoreConfig {
+    S3ObjectStoreConfig store = 1;
+}
+
 message S3Credentials {
     string access_key = 1;
     string secret_key = 2;

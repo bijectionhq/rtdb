@@ -25,7 +25,7 @@ fn walk(value: &Yaml, shape: Shape, path: &str, report: &mut QualificationReport
             (Shape::Storage, "!InMemory") => Some(&["epoch"]),
             (Shape::Storage, "!Local") => Some(&["epoch", "path"]),
             (Shape::Storage, "!Remote") => Some(&["epoch", "objectStore"]),
-            (Shape::Store, "!S3") => Some(&["bucket", "region", "prefix", "endpoint", "pathStyleAccessEnabled", "remote", "credentials"]),
+            (Shape::Store, "!S3") => Some(&["bucket", "region", "prefix", "endpoint", "pathStyleAccessEnabled", "remote", "credentials", "keyLayout"]),
             (Shape::Store, "!Azure") => Some(&["storageAccount", "container", "prefix", "storageAccountKey", "userManagedIdentityClientId", "storageAccountEndpoint", "remote"]),
             (Shape::Store, "!GoogleCloud") => Some(&["projectId", "bucket", "prefix"]),
             (Shape::Remote, "!Kafka") => Some(&["bootstrapServers", "propertiesMap", "propertiesFile", "schemaRegistryUrl"]),

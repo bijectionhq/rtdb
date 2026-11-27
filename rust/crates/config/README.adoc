@@ -155,6 +155,30 @@ The report includes the raw input digest and, for matched scope, each logical pa
 The report's separate `cutover_eligible` remains false and a completed report still exits with status 2.
 See the link:tests/fixtures/classic-s3-alias-collision.json[collision fixture] for a capture that the preflight refuses.
 
+=== Open a literal-key Classic namespace
+
+Native RTDB accepts the optional `keyLayout: jvm_literal` field on the Classic `!S3` object store.
+The default is `legacy_rtdb`.
+Specify the region and declare any custom endpoint in the same configuration.
+
+[source,yaml]
+----
+storage: !Remote
+  objectStore: !S3
+    bucket: fixture-bucket
+    region: us-east-1
+    prefix: snapshots
+    keyLayout: jvm_literal
+----
+
+Use a newly allocated namespace or qualify an existing namespace at a fenced cut.
+For an existing namespace, require `jvm_literal` or `shared` from the preflight and verify that every retained version grant names the exact literal key before opening it.
+The profile selects a single spelling for all provider operations and isolates its disk cache by provider configuration.
+The persisted profile has its own native configuration type.
+Every RTDB process that can open the namespace must understand that type and select the same layout, including after restart or replacement.
+Keep an existing `legacy_rtdb` namespace on its original profile until an offline migration has reconciled its physical keys and grants.
+Multi cell storage uses its own key layout and configuration.
+
 === Upgrade and rollback
 
 . Keep serving with the current layout while resolving refusals and qualifying a protected shadow restore at the same catalog and log basis.

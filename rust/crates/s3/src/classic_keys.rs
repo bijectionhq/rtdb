@@ -1,5 +1,4 @@
-use object_store::path::Path;
-use rtdb_storage::ObjectKey;
+use rtdb_storage::{ObjectKey, remote::RemoteKeyLayout};
 use rtdb_types::{Anomaly, Result, S3ObjectNamespace};
 
 use crate::{S3Config, parse_endpoint};
@@ -32,16 +31,15 @@ impl S3Config {
 
 /// Returns the literal JVM and legacy RTDB S3 keys for a fully rooted logical path.
 pub fn classic_key_aliases(key: &ObjectKey) -> Result<(String, String)> {
-    let literal = key.as_str();
-    Path::parse(literal)
-        .map_err(|_| invalid("The logical path is outside the shared Classic S3 key domain"))?;
-    let legacy = Path::from(literal).to_string();
-    if legacy.len() > 1024 || literal.len() > 1024 {
+    let legacy = RemoteKeyLayout::Escaped.provider_path(key.as_str())?;
+    if legacy.as_ref().len() > 1024 || key.as_str().len() > 1024 {
         return Err(invalid(
             "A Classic S3 key spelling exceeds the provider's key length limit",
         ));
     }
-    Ok((literal.to_owned(), legacy))
+    let literal = RemoteKeyLayout::LiteralS3.provider_path(key.as_str())
+        .map_err(|_| invalid("The logical path is outside the shared Classic S3 key domain"))?;
+    Ok((literal.to_string(), legacy.to_string()))
 }
 
 fn invalid(message: &'static str) -> Anomaly {

@@ -65,6 +65,31 @@ pub fn decode_provider_key(relative: &str) -> Result<ObjectKey> {
     ObjectKey::new(decoded)
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RemoteKeyLayout {
+    #[default]
+    Escaped,
+    LiteralS3,
+}
+
+impl RemoteKeyLayout {
+    pub fn provider_path(self, key: &str) -> Result<Path> {
+        match self {
+            Self::Escaped => Ok(Path::from(key)),
+            Self::LiteralS3 if key.len() <= 1024 =>
+                Path::parse(key).map_err(|_| Error::InvalidKey(key.to_owned())),
+            Self::LiteralS3 => Err(Error::InvalidKey(key.to_owned())),
+        }
+    }
+
+    fn logical_key(self, relative: &str) -> Result<ObjectKey> {
+        match self {
+            Self::Escaped => decode_provider_key(relative),
+            Self::LiteralS3 => ObjectKey::new(relative),
+        }
+    }
+}
+
 /// The result of this specific conditional publication.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PublicationResult {
@@ -114,13 +139,19 @@ impl RemoteStore {
     /// Uses the owner's I/O region, which must be closed and joined after all store consumers finish.
     /// Every admitted operation remains owned through caller cancellation, including publication cleanup.
     pub fn new_in(client: Arc<dyn ProviderStore>, prefix: Option<ObjectKey>, io: Arc<IoRegion>) -> Self {
-        Self { objects: Arc::new(RemoteObjects { client, prefix, uploads: None, hide_tombstones: false, read_drain: None }), cache_downloads: None, io, cell: false, version_namespace: None, terminal_allocation: None, catalog: None, classic_versions: None }
+        Self { objects: Arc::new(RemoteObjects { client, prefix, key_layout: RemoteKeyLayout::Escaped, uploads: None, hide_tombstones: false, read_drain: None }), cache_downloads: None, io, cell: false, version_namespace: None, terminal_allocation: None, catalog: None, classic_versions: None }
+    }
+
+    pub fn new_classic_s3(client: Arc<dyn ProviderStore>, prefix: ObjectKey, io: Arc<IoRegion>, key_layout: RemoteKeyLayout) -> Self {
+        let mut store = Self::new_in(client, Some(prefix), io);
+        Arc::make_mut(&mut store.objects).key_layout = key_layout;
+        store
     }
 
     /// Cell storage publishes a final object with one conditional provider
     /// write for untracked cell operations.
     pub fn new_single_put(client: Arc<dyn ProviderStore>, prefix: ObjectKey, io: Arc<IoRegion>) -> Self {
-        Self { objects: Arc::new(RemoteObjects { client, prefix: Some(prefix), uploads: None, hide_tombstones: true, read_drain: None }), cache_downloads: None, io, cell: true, version_namespace: None, terminal_allocation: None, catalog: None, classic_versions: None }
+        Self { objects: Arc::new(RemoteObjects { client, prefix: Some(prefix), key_layout: RemoteKeyLayout::Escaped, uploads: None, hide_tombstones: true, read_drain: None }), cache_downloads: None, io, cell: true, version_namespace: None, terminal_allocation: None, catalog: None, classic_versions: None }
     }
 
     /// Opens a cell store with abortable, journaled publication.
@@ -130,7 +161,7 @@ impl RemoteStore {
         io: Arc<IoRegion>,
         uploads: Arc<dyn PublicationUploads>,
     ) -> Self {
-        let objects = Arc::new(RemoteObjects { client, prefix: Some(prefix), uploads: Some(uploads), hide_tombstones: true, read_drain: None });
+        let objects = Arc::new(RemoteObjects { client, prefix: Some(prefix), key_layout: RemoteKeyLayout::Escaped, uploads: Some(uploads), hide_tombstones: true, read_drain: None });
         Self { objects, cache_downloads: None, io, cell: true, version_namespace: None, terminal_allocation: None, catalog: None, classic_versions: None }
     }
 
@@ -143,10 +174,7 @@ impl RemoteStore {
 
     pub fn with_catalog_ledger(mut self) -> Result<Self> {
         let key = ObjectKey::new("catalog-ledger")?;
-        let path = Path::from(match &self.objects.prefix {
-            Some(prefix) => format!("{prefix}/.tmp/{key}"),
-            None => format!(".tmp/{key}"),
-        });
+        let path = self.objects.path_for(&format!(".tmp/{key}"))?;
         self.catalog = Some(catalog::CatalogLedger::new(Arc::clone(&self.objects.client), key, path));
         Ok(self)
     }
@@ -187,7 +215,8 @@ impl RemoteStore {
     pub fn s3_namespace(&self) -> Option<&S3ObjectNamespace> { self.version_namespace.as_deref() }
 
     pub fn s3_object_key(&self, key: &ObjectKey) -> Option<String> {
-        self.s3_namespace().map(|_| self.objects.path(key).to_string())
+        self.s3_namespace()?;
+        Some(self.objects.path(key).ok()?.to_string())
     }
 
     pub fn with_terminal_allocation(mut self, allocation: uuid::Uuid) -> Self {
@@ -227,7 +256,7 @@ impl RemoteStore {
 #[async_trait]
 impl ObjectStore for RemoteStore {
     fn s3_publication_address(&self, key: &ObjectKey) -> Option<(S3ObjectNamespace, String)> {
-        Some((self.s3_namespace()?.clone(), self.objects.path(key).to_string()))
+        Some((self.s3_namespace()?.clone(), self.objects.path(key).ok()?.to_string()))
     }
 
     fn permits_shared_read_cache(&self) -> bool { true }
@@ -318,7 +347,7 @@ impl ObjectStore for RemoteStore {
     async fn observe_head(&self, key: &ObjectKey) -> Result<ObjectObservation<StoredObject>> {
         let namespace = self.version_namespace.clone();
         self.io.read_async(self.objects.clone(), key.clone(), move |objects, key| async move {
-            let path = objects.path(&key);
+            let path = objects.path(&key)?;
             let metadata = objects.metadata(&key).await?;
             Ok(ObjectObservation {
                 version: physical_version(namespace.as_deref(), &path, metadata.version),
@@ -329,7 +358,7 @@ impl ObjectStore for RemoteStore {
     async fn retirement_version(&self, key: &ObjectKey) -> Result<Option<PhysicalObjectVersion>> {
         let Some(namespace) = self.version_namespace.clone() else { return Ok(None); };
         self.io.read_async(self.objects.clone(), key.clone(), move |objects, key| async move {
-            let path = objects.path(&key);
+            let path = objects.path(&key)?;
             let metadata = match objects.metadata(&key).await {
                 Ok(metadata) => metadata,
                 Err(Error::MissingObject(_)) => return Ok(None),
@@ -349,7 +378,7 @@ impl ObjectStore for RemoteStore {
                 Err(Error::MissingObject(_)) => return Ok(None),
                 Err(error) => return Err(error),
             };
-            Ok(observed_terminal(&namespace, &objects.path(&key), allocation, metadata.version.as_deref(), metadata.e_tag))
+            Ok(observed_terminal(&namespace, &objects.path(&key)?, allocation, metadata.version.as_deref(), metadata.e_tag))
         }).await
     }
     async fn get(&self, key: &ObjectKey) -> Result<Bytes> {
@@ -377,7 +406,7 @@ impl ObjectStore for RemoteStore {
             return Err(Error::InvalidRange { key: key.to_string(), start: range.start, end: range.end, length: observed.value.size });
         }
         self.io.read_async(self.objects.clone(), (key.clone(), range), move |objects, (key, range)| async move {
-            let path = objects.path(&key);
+            let path = objects.path(&key)?;
             let length = usize::try_from(range.end - range.start)
                 .map_err(|_| Error::Task("The reserved provider range exceeds addressable memory".into()))?;
             let mut check_tombstone = false;
@@ -409,7 +438,7 @@ impl ObjectStore for RemoteStore {
         let Some(client) = &self.cache_downloads else { return Ok(None); };
         if self.cell || self.objects.read_drain.is_some() { return Ok(None); }
         let Ok(charge) = memory.reserve(CACHE_DOWNLOAD_BYTES) else { return Ok(None); };
-        let selection = Arc::new((Arc::clone(client), self.objects.path(key)));
+        let selection = Arc::new((Arc::clone(client), self.objects.path(key)?));
         let view = HeldView::recovery(selection.clone());
         let lease = IoRegion::current_read_lease();
         let result = IoRegion::reading(view, async {
@@ -446,7 +475,7 @@ impl ObjectStore for RemoteStore {
         let terminal_allocation = self.terminal_allocation;
         self.io.run_async(async move {
             let published = objects.put(&key, bytes, cell.then_some(io.as_ref())).await?;
-            let path = objects.path(&key);
+            let path = objects.path(&key)?;
             let Some(namespace) = namespace.as_deref() else { return Ok(None); };
             if let Some(allocation) = terminal_allocation {
                 if published.version.as_deref().is_some_and(|version| version != "null") {
@@ -477,7 +506,7 @@ impl ObjectStore for RemoteStore {
             let publication = objects.put_opened_file(
                 &key, tokio::fs::File::from_std(input), &source, inventory.as_deref(), namespace.is_some(),
             ).await?;
-            Ok(physical_version(namespace.as_deref(), &objects.path(&key), publication.and_then(|object| object.version))
+            Ok(physical_version(namespace.as_deref(), &objects.path(&key)?, publication.and_then(|object| object.version))
                 .map(PhysicalObjectPublication::Version))
         }).await
     }
@@ -498,6 +527,7 @@ impl ObjectStore for RemoteStore {
 struct RemoteObjects {
     client: Arc<dyn ProviderStore>,
     prefix: Option<ObjectKey>,
+    key_layout: RemoteKeyLayout,
     uploads: Option<Arc<dyn PublicationUploads>>,
     hide_tombstones: bool,
     read_drain: Option<ReadDrainOwner>,
@@ -511,7 +541,7 @@ struct ReadDrainOwner {
 
 impl RemoteObjects {
     async fn copy_to(&self, source: &ObjectKey, destination: &RemoteObjects, key: &ObjectKey) -> Result<()> {
-        match self.client.copy_if_not_exists(&self.path(source), &destination.path(key)).await {
+        match self.client.copy_if_not_exists(&self.path(source)?, &destination.path(key)?).await {
             Ok(()) => Ok(()),
             Err(object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }) => {
                 let length = self.head(source).await?.size;
@@ -531,8 +561,15 @@ impl RemoteObjects {
         }
     }
 
-    fn path(&self, key: &ObjectKey) -> Path {
-        Path::from(match &self.prefix { Some(prefix) => format!("{prefix}/{key}"), None => key.to_string() })
+    fn path(&self, key: &ObjectKey) -> Result<Path> {
+        self.path_for(key.as_str())
+    }
+
+    fn path_for(&self, relative: &str) -> Result<Path> {
+        match &self.prefix {
+            Some(prefix) => self.key_layout.provider_path(&format!("{prefix}/{relative}")),
+            None => self.key_layout.provider_path(relative),
+        }
     }
 
     fn read_drain<'a>(&'a self, key: &'a ObjectKey) -> Option<read_drain::ReadDrain<'a>> {
@@ -551,11 +588,6 @@ impl RemoteObjects {
             Some(drain) => drain.read(work).await,
             None => work.await,
         }
-    }
-
-    fn key(relative: &str) -> Result<ObjectKey> {
-        // A provider path is percent-encoded segment by segment, so a key it lists is the key that was put only once decoded.
-        decode_provider_key(relative)
     }
 
     async fn compare_file(&self, key: &ObjectKey, file: &mut tokio::fs::File, source: &std::path::Path,
@@ -637,7 +669,7 @@ async fn collect_exact_body(object: GetResult, key: &ObjectKey, length: usize, w
 
 impl RemoteObjects {
     async fn read(&self, key: &ObjectKey, options: GetOptions) -> Result<GetResult> {
-        let response = self.client.get_opts(&self.path(key), options).await.map_err(|error| provider_error(key, error))?;
+        let response = self.client.get_opts(&self.path(key)?, options).await.map_err(|error| provider_error(key, error))?;
         if self.is_tombstone(&response) {
             return Err(Error::MissingObject(key.to_string()));
         }
@@ -658,7 +690,7 @@ impl RemoteObjects {
         if self.hide_tombstones {
             return Ok(self.read(key, GetOptions { head: true, ..GetOptions::default() }).await?.meta);
         }
-        self.client.head(&self.path(key)).await.map_err(|error| provider_error(key, error))
+        self.client.head(&self.path(key)?).await.map_err(|error| provider_error(key, error))
     }
 
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {
@@ -677,7 +709,7 @@ impl RemoteObjects {
     }
 
     async fn read_exact(&self, key: &ObjectKey, length: usize, namespace: Option<&S3ObjectNamespace>) -> Result<ObjectObservation<Bytes>> {
-        let path = self.path(key);
+        let path = self.path(key)?;
         let object = self.read(key, GetOptions::default()).await?;
         let wrong_size = || crate::object_store::wrong_size(key, length);
         if object.meta.size != length as u64 || object.range != (0..length as u64) {
@@ -698,7 +730,7 @@ impl RemoteObjects {
     }
 
     async fn read_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes> {
-        let bytes = self.client.get_range(&self.path(key), range.clone()).await.map_err(|error| provider_error(key, error))?;
+        let bytes = self.client.get_range(&self.path(key)?, range.clone()).await.map_err(|error| provider_error(key, error))?;
         if bytes.len() as u64 != range.end - range.start {
             return Err(Error::Remote { key: key.to_string(), message: "provider returned an incomplete byte range".into() });
         }
@@ -710,7 +742,7 @@ impl RemoteObjects {
             return self.put_journaled(key, bytes, journal).await;
         }
         let options = PutOptions { mode: PutMode::Create, ..Default::default() };
-        match self.client.put_opts(&self.path(key), bytes.clone().into(), options).await {
+        match self.client.put_opts(&self.path(key)?, bytes.clone().into(), options).await {
             Ok(written) => Ok(ProviderPublication { version: written.version, etag: written.e_tag }),
             Err(object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }) => {
                 self.compare_existing(key, bytes).await
@@ -725,7 +757,7 @@ impl RemoteObjects {
         })?;
         let unit = journal.unit_attempt(key, &bytes).await?;
         let attempt = unit.unwrap_or_else(uuid::Uuid::new_v4);
-        let path = self.path(key);
+        let path = self.path(key)?;
         if let Some(unit) = unit
             && let Some(chosen) = journal.active_unit_upload(key, unit).await?
         {
@@ -780,7 +812,7 @@ impl RemoteObjects {
     }
 
     async fn read_existing(&self, key: &ObjectKey, bytes: Bytes) -> Result<ProviderPublication> {
-        let object = self.client.get(&self.path(key)).await.map_err(|error| provider_error(key, error))?;
+        let object = self.client.get(&self.path(key)?).await.map_err(|error| provider_error(key, error))?;
         let version = object.meta.version.clone();
         let etag = object.meta.e_tag.clone();
         if self.is_tombstone(&object) || object.bytes().await.map_err(|error| provider_error(key, error))? != bytes {
@@ -794,7 +826,7 @@ impl RemoteObjects {
     }
 
     async fn read_publication(&self, key: &ObjectKey, attempt: uuid::Uuid) -> Result<PublicationResult> {
-        match self.client.get_opts(&self.path(key), GetOptions::new().with_head(true)).await {
+        match self.client.get_opts(&self.path(key)?, GetOptions::new().with_head(true)).await {
             Ok(object) => {
                 let expected = attempt.to_string();
                 if object.attributes.get(&publication_attribute())
@@ -821,7 +853,7 @@ impl RemoteObjects {
         if length == 0 { return self.put(key, Bytes::new(), None).await.map(Some); }
         let upload_id = uuid::Uuid::new_v4();
         let temporary = format!(".tmp/upload-{upload_id}");
-        let temporary = Path::from(match &self.prefix { Some(prefix) => format!("{prefix}/{temporary}"), None => temporary });
+        let temporary = self.path_for(&temporary)?;
         let mut upload = self.client.put_multipart(&temporary).await.map_err(|error| provider_error(key, error))?;
         let uploaded: Result<Option<String>> = async {
             let mut remaining = length;
@@ -844,7 +876,7 @@ impl RemoteObjects {
                 return Err(error);
             }
         };
-        let published = match self.client.copy_if_not_exists(&temporary, &self.path(key)).await {
+        let published = match self.client.copy_if_not_exists(&temporary, &self.path(key)?).await {
             Ok(()) if !bind_publication => Ok(None),
             Ok(()) | Err(object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }) => {
                 // The conditional copy returns no destination version.
@@ -864,8 +896,8 @@ impl RemoteObjects {
     }
 
     async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>> {
-        let namespace = self.prefix.as_ref().map(|key| Path::from(key.as_str()));
-        let path = directory.map(|key| self.path(key)).or_else(|| namespace.clone());
+        let namespace = self.prefix.as_ref().map(|key| self.key_layout.provider_path(key.as_str())).transpose()?;
+        let path = directory.map(|key| self.path(key)).transpose()?.or_else(|| namespace.clone());
         let prefix = namespace.map(|path| format!("{path}/"));
         let mut stream = self.client.list(path.as_ref());
         let mut result = Vec::new();
@@ -884,7 +916,7 @@ impl RemoteObjects {
                 None => metadata.location.as_ref(),
             };
             if relative.split('/').any(|part| part == ".tmp") { continue; }
-            let key = Self::key(relative)?;
+            let key = self.key_layout.logical_key(relative)?;
             if directory.is_some_and(|directory| !key.is_under(directory)) { continue; }
             if self.hide_tombstones && metadata.size == 0 {
                 match self.metadata(&key).await {
@@ -903,7 +935,7 @@ impl RemoteObjects {
     }
 
     async fn delete(&self, key: &ObjectKey) -> Result<()> {
-        match self.client.delete(&self.path(key)).await {
+        match self.client.delete(&self.path(key)?).await {
             Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
             Err(error) => Err(provider_error(key, error)),
         }
@@ -953,6 +985,33 @@ mod tests {
             store: "test", source: Box::new(std::io::Error::other("403 AccessDenied PermissionDenied")),
         };
         assert!(matches!(provider_error(&key, error), Error::Remote { .. }));
+    }
+
+    #[tokio::test]
+    async fn classic_literal_s3_writes_and_copies_to_literal_keys() {
+        let provider = Arc::new(object_store::memory::InMemory::new());
+        let root = ObjectKey::new("root%3F").unwrap();
+        let store = RemoteStore::new_classic_s3(provider.clone(), root, IoRegion::new(), RemoteKeyLayout::LiteralS3);
+        let question = ObjectKey::new("data/t?").unwrap();
+        let percent = ObjectKey::new("data/t%3F").unwrap();
+        let copied = ObjectKey::new("data/key#2").unwrap();
+        let input = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(input.path(), b"percent").unwrap();
+
+        store.put(&question, Bytes::from_static(b"question")).await.unwrap();
+        store.put_file(&percent, input.path()).await.unwrap();
+        store.copy(&percent, &copied).await.unwrap();
+        for (physical, expected) in [
+            ("root%3F/data/t?", b"question".as_slice()),
+            ("root%3F/data/t%3F", b"percent".as_slice()),
+            ("root%3F/data/key#2", b"percent".as_slice()),
+        ] {
+            let path = Path::parse(physical).unwrap();
+            assert_eq!(provider.get(&path).await.unwrap().bytes().await.unwrap().as_ref(), expected);
+        }
+        assert!(matches!(provider.head(&Path::parse("root%253F/data/t%3F").unwrap()).await,
+            Err(object_store::Error::NotFound { .. })));
+        store.close_and_wait().await;
     }
 
     #[tokio::test]

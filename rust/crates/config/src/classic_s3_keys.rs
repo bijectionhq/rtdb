@@ -60,10 +60,9 @@ pub(super) use s3::inspect;
 mod s3 {
     use std::collections::{BTreeMap, BTreeSet};
 
-    use prost::Message;
     use rtdb_format::{
         database::proto::{DatabaseConfig, database_config::Storage},
-        generated::xtdb::aws::proto::S3ObjectStoreConfig,
+        config::unpack_s3_store,
         keys::{CURRENT_STORAGE_VERSION, storage_root},
     };
     use rtdb_s3::{S3Config, classic_key_aliases};
@@ -311,10 +310,7 @@ mod s3 {
             return None;
         };
         let provider = storage.object_store.as_ref()?;
-        if provider.type_url.rsplit('/').next()? != "xtdb.aws.proto.S3ObjectStoreConfig" {
-            return None;
-        }
-        let config = S3ObjectStoreConfig::decode(provider.value.as_slice()).ok()?;
+        let config = unpack_s3_store(provider).ok()?;
         let root = storage_root(
             CURRENT_STORAGE_VERSION,
             StorageEpoch(storage.epoch.unwrap_or(0)),
