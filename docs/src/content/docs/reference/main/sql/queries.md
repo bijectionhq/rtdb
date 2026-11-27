@@ -65,7 +65,8 @@ return rr.Diagram(rr.Sequence("WITH", rr.OneOrMore(withClause, ",")))
 - `WITH` clauses in XTDB are 'optimization fences' - XTDB will not attempt to optimize an outer query into a `WITH` clause, or across `WITH` clauses.
 - Supply `MATERIALIZED` to eagerly materialize a `WITH` clause, so that the results can be re-used multiple times in the same query.
 
-    Past an internal threshold, the results spill to disk under the JVM's temporary directory (`java.io.tmpdir`), as ORDER BY and joins do, rather than being held in memory, so a query needs temp space in proportion to them.
+    Past an internal threshold, the results spill to disk under the temporary directory (as `ORDER BY`, joins, and percentiles do), rather than being held in memory, so a query needs temp space in proportion to them.
+    On RTDB, spill is unlimited by default and can be capped with [`query.spillLimitBytes`](/ops/config#query-execution-and-spill-policy).
 - `WITH RECURSIVE` is not yet supported in XTDB.
 
 ### query term
@@ -417,6 +418,10 @@ return rr.Diagram(rr.Sequence(rr.Optional(setting, "skip"), "<query>"))
 * Setting the default valid-time/system-time applies to any `FROM` clause that doesn't have any valid-time/system-time specification explicitly set.
 * Setting the `SNAPSHOT_TOKEN` enforces an upper-bound on the transactions visible to the query - i.e. no matter what the per-table system-time clauses specify, they will not see anything newer than this snapshot-token.
   If not provided, this defaults to the latest-completed transaction on the queried node.
+  A plain snapshot token is a stateless, base64-encoded protobuf `TimeBasis` mapping each database with a completed transaction to its partitions' system times, so tokens carry no server-side hold or expiry and are interchangeable between XTDB and RTDB nodes.
+  Redeeming a token caps each named database's current catalog at its recorded times using the redeeming session's clock and time zone (so `CLOCK_TIME` can be combined with `SNAPSHOT_TOKEN` in a read-only transaction).
+  A database or partition omitted from the token reads through its current head; a time later than the database's latest completed transaction fails with `xtdb/unindexed-tx`, a malformed token fails with `xtdb.basis/invalid-basis`, and erased rows stay erased.
+  On a placed RTDB deployment, tokens use a sealed form (`rtdb-sealed-snapshot-v4:`) bound to the issuing principal, journal history, and storage generation, which an XTDB node refuses as `xtdb.basis/invalid-basis`.
 * Setting the `CLOCK_TIME` defines a fixed value for any functions that depend on the current time - e.g. `CURRENT_TIMESTAMP`.
   It also defines the default valid-time selection for any tables in `FROM` clauses that don't otherwise have a valid-time specification.
   If not provided, it defaults to the clock-time fixed at the transaction's first query.

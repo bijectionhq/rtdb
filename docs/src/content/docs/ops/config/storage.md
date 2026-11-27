@@ -170,3 +170,9 @@ Each Object Store implementation is configured separately - see the individual c
 - [AWS](../aws#storage)
 - [Azure](../azure#storage)
 - [Google Cloud](../google-cloud#storage)
+
+## Reading an RTDB store with an XTDB node
+
+RTDB writes the same block and trie storage formats as XTDB, so an XTDB node can open a store written by RTDB until the database uses an RTDB-only feature (such as owned relations, receipt tables, serving checkpoints, derived artefacts, table retirements, or a later naming epoch).
+When a block or table-block file records one of those features, RTDB prefixes the file's protobuf bytes with a zero byte so an XTDB node stops in `Block.parseFrom` or `TableBlock.parseFrom` (`Protocol message contained an invalid tag (zero).`) rather than opening the store without the feature.
+See [Reading an RTDB log with an XTDB node](/ops/config/log#reading-an-rtdb-log-with-an-xtdb-node) for the full list of features and errors.

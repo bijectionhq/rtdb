@@ -215,6 +215,30 @@ A `TZ` the JVM does not recognise gives the host's current offset, such as `GMT+
 The server reports that zone in the `TimeZone` parameter status, and it decides how casts between local and zoned dates and timestamps read.
 Set `TZ=UTC` in the server's environment to keep sessions in UTC on a host configured for another zone.
 
+#### Error SQLSTATEs
+
+Over the Postgres wire protocol, RTDB maps errors to PostgreSQL SQLSTATE codes by explicit state, then by error kind, then by XTDB's category-and-code table:
+
+`XX000` (internal error)
+
+: Memory exhaustion (when a memory budget, byte limit, or allocator has no room), as well as internal faults, unavailable backends, busy errors, and not-found errors.
+  Every error frame taking this fall-through `XX000` path is logged at `ERROR` on the server before it is sent, matching XTDB's Arrow out-of-memory handling.
+  Conflicts reported as `XX000` are not logged as uncaught errors.
+
+`53400` (configuration limit exceeded)
+
+: Work that exceeds an operator-configured limit, such as `query.spillLimitBytes` (`rtdb.query/spill-limit`), a log message limit, or an OIDC response size limit.
+
+`54000` (program limit exceeded)
+
+: Work that exceeds a fixed implementation limit, such as compiled regular-expression size bounds, sort or plan size limits, or container offset limits.
+
+`22003` (numeric value out of range)
+
+: A numeric value that does not fit its target type, such as decimal precision overflow, an integer cell wider than its PostgreSQL wire type, or a time-value overflow.
+
+Other errors keep XTDB's standard SQLSTATEs: for example, `0B000` for `xtdb/unindexed-tx`, `P0004` for `xtdb/assert-failed`, `0A000` for unsupported operations and stale prepared queries, `57014` for cancelled queries, `28P01` / `28000` / `42501` for authentication and authorization errors, `22P02` / `22P03` for invalid parameter representations, `25001` for `DISCARD` inside a transaction, and `08P01` for other caller (`incorrect`) errors.
+
 ### Flight SQL Server
 
 By default a Flight SQL server is started on localhost, on a port the server picks; the XTDB Docker images pin it to 3000.
@@ -339,6 +363,35 @@ Defaults to `!Env XTDB_NODE_ID` otherwise is a short random string.
 ### Default TZ
 
 Defaults to UTC.
+
+On RTDB, set `RTDB_TZDB_FILE` to the path of an OpenJDK `tzdb.dat` file to replace the bundled time-zone database at runtime without rebuilding.
+
+### Query execution and spill policy
+
+On RTDB, a query's disk spill is unlimited by default for both server and embedded nodes, matching XTDB.
+To cap the temporary disk space one query's spill files may hold at once, set `query.spillLimitBytes` in the node YAML or `RTDB_QUERY_SPILL_LIMIT_BYTES` in the environment:
+
+```yaml
+query:
+  # Optional maximum bytes one query's spill files may hold at once.
+  # Unset by default (unlimited). Set to 0 to refuse any spilling.
+  spillLimitBytes: 1073741824
+```
+
+`query.spillLimitBytes` takes precedence over `RTDB_QUERY_SPILL_LIMIT_BYTES` when both are set.
+A value of `0` refuses the first spilled byte, and any value that is not a non-negative integer fails startup.
+A query that exceeds its configured spill limit fails with `rtdb.query/spill-limit` (SQLSTATE `53400`).
+
+Spilling operators decide when to spill from their own configured memory shares rather than from free bytes in the node memory budget:
+
+- `ORDER BY`, hash joins (build side), set operations (`INTERSECT`, `EXCEPT`, `UNION`), `WITH MATERIALIZED`, and ordered-set percentiles (`PERCENTILE_CONT`, `PERCENTILE_DISC`) spill to disk past their thresholds.
+- `GROUP BY`, `DISTINCT`, and all other aggregate functions (including ordered `ARRAY_AGG`) keep their state in memory, matching XTDB.
+  A query whose grouping or aggregate state exceeds the memory budget fails with a memory error (SQLSTATE `XX000`) rather than spilling.
+
+Set `XTDB_JOIN_SPILL_THRESHOLD` (default `100000`) to control the build-row threshold above which join Bloom/IID pushdown filters are disabled; values of `0` or less disable those filters for nonempty builds, and non-integer values keep the default.
+
+On RTDB, `--memory-limit` or `RTDB_MEMORY_LIMIT_BYTES` sets the allocation ceiling shared by the cache and query execution regions.
+When neither is set, RTDB defaults to half of the memory available to the process: physical memory capped by the tightest cgroup memory limit (`memory.max` on cgroup v2 or `memory.limit_in_bytes` on cgroup v1), falling back to 1 GiB only when neither limit can be determined.
 
 ## Ingest-only nodes (v2.2+)
 

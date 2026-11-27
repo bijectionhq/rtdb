@@ -24,16 +24,40 @@ You can start a 'standalone' (i.e. non-production, non-distributed) XTDB server 
 
 docker run -it --pull=always \
   -p 5432:5432 \
+  -p 3000:3000 \
   -p 8080:8080 \
   ghcr.io/xtdb/xtdb
 
 ## 5432: Postgres wire-compatible server (primary API)
+## 3000: Arrow Flight SQL / ADBC server
 ## 8080: Monitoring/healthz HTTP endpoints
 ```
 
-This command starts a Postgres wire-compatible endpoint on port 5432.
+This command starts a Postgres wire-compatible endpoint on port 5432, an Arrow Flight SQL endpoint on port 3000, and the healthz/metrics server on port 8080.
+By default, the root `xtdb` user accepts connections without a password; set `XTDB_PASSWORD` to require a password for `xtdb`, or mount a configuration file with explicit [authentication rules](/ops/config/authentication).
+The container image includes a `HEALTHCHECK` that polls `http://localhost:8080/healthz/alive` after a 15-second start period.
 
-By default your data will only be stored temporarily using a local directory within the Docker container.
+By default your data will only be stored temporarily using a local directory within the Docker container (`/var/lib/xtdb/log` and `/var/lib/xtdb/buffers`).
+
+### (Optional) Mount a custom configuration file
+
+The image's working directory is `/usr/local/lib/xtdb` and its default command is `-f config.yaml`.
+Mount your own YAML configuration at `/usr/local/lib/xtdb/config.yaml` to replace the bundled standalone configuration:
+
+``` bash
+docker run -it --pull=always \
+  -p 5432:5432 \
+  -p 3000:3000 \
+  -p 8080:8080 \
+  -v ./my-config.yaml:/usr/local/lib/xtdb/config.yaml \
+  ghcr.io/xtdb/xtdb
+```
+
+On the RTDB native image, the entrypoint keeps two fallbacks for volumes and mounts from earlier RTDB images when running the default command:
+
+- If `/usr/local/lib/xtdb/config.yaml` still holds the bundled default and a custom file is mounted at `/etc/rtdb/config.yaml`, the entrypoint serves `/etc/rtdb/config.yaml` and logs a notice to stderr.
+- If neither `/var/lib/xtdb/log` nor `/var/lib/xtdb/buffers` exists and data is present under `/var/lib/rtdb/log` or `/var/lib/rtdb/storage`, the entrypoint serves that directory (via `/etc/rtdb/config-var-lib-rtdb.yaml`) and logs a notice to stderr.
+  Move the data to `/var/lib/xtdb/log` and `/var/lib/xtdb/buffers` to drop the fallback.
 
 ### (Optional) Mount a host directory
 

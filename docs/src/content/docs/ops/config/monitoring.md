@@ -47,7 +47,37 @@ These can be accessed at the following endpoint on the **Healthz Server**:
 
     <node_url>:<healthz_port>/metrics
 
+Each family includes `# HELP` and `# TYPE` lines, with timer and distribution-summary maximums published as separate `_max` gauge families.
 Metrics that relate to a specific database are tagged with `db=<database-name>` (v2.2+), so dashboards can slice per database on nodes serving more than one.
+
+### Published metric families
+
+The metrics endpoint and SQL metric catalog expose these core families (all tagged with `node-id`):
+
+Queries and transactions
+
+: `query.timer`, `query.error`, `query.warning` (queries opened from a plan with planning warnings), `tx.error`, `tx.op.timer`, `node.tx.submit`, `node.tx.execute`, `node.tx.await`, `pgwire.tx.latency`, `pgwire.total_connections`, `pgwire.cancelled_connections`, `pgwire.connections_refused`, and per-database (`db`) gauges `node.tx.latestCompletedTxId`, `node.tx.latestSubmittedMsgId`, `node.tx.latestProcessedMsgId`, and `node.tx.lag.MsgId`.
+
+Replication and blocks
+
+: `block.upload.timer` (leader block cut to durable `BlockUploaded` append), per-database (`db`) gauges `xtdb.log.leader` and `xtdb.block.last_upload_time`, and per-database follower replica metrics registered on a database's first follower observation:
+
+  - `xtdb.replica.process.timer` (tagged `db` and `msg.type` in `ResolvedTx`, `TriesAdded`, `BlockBoundary`, `BlockUploaded`, `TriesDeleted`) — time to apply each replica record.
+  - `xtdb.replica.block.buffer.timer` (tagged `db`) — boundary-to-upload duration for each adopted block on a follower.
+  - `xtdb.replica.block.buffered.records` (distribution summary, tagged `db`) — count of records buffered behind a pending block on a follower.
+
+Compaction and garbage collection
+
+: `compactor.job.timer`, `compactor.jobs.available` (tagged `db`), and `xtdb.gc.tries.delete.timer` (time to delete each collected trie's data and metadata files).
+
+Buffer pool and caches
+
+: `memory-cache.pinnedBytes`, `memory-cache.evictableBytes`, `memory-cache.freeBytes`, and `memory-cache-misses` (reads sent from a buffer pool to its store).
+  When a remote disk cache is configured: `disk-cache.pinnedBytes`, `disk-cache.evictableBytes`, `disk-cache.freeBytes`, `disk-cache.maxSizeBytes`, `disk-cache-misses`, `buffer-pool.network.read` (bytes downloaded or read around the cache), and `buffer-pool.network.write` (bytes uploaded through the cache).
+
+Host and allocator
+
+: `xtdb.allocator.root.memory.allocated`, `xtdb.allocator.root.memory.limit`, `system.cpu.count`, `system.cpu.usage`, `process.cpu.usage`, and `system.load.average.1m`.
 
 ### Cloud Integrations
 

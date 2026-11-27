@@ -14,15 +14,39 @@ The simplest way to modify XTDB's logging level is through environment variables
 - You can also set the logging level for individual components - for example:
 - `XTDB_LOGGING_LEVEL_COMPACTOR`
 - `XTDB_LOGGING_LEVEL_INDEXER`
+- `XTDB_LOGGING_LEVEL_GARBAGE-COLLECTOR`
 - `XTDB_LOGGING_LEVEL_PGWIRE`
+- `XTDB_LOGGING_LEVEL_FLIGHT-SQL`
 
-Valid levels are `TRACE`, `DEBUG`, `INFO` (default), `WARN`, and `ERROR`.
+Valid levels are `OFF`, `FATAL`, `ERROR`, `WARN`, `INFO` (default), `DEBUG`, `TRACE`, and `ALL`.
 
 ### JSON log output
 
 Set `XTDB_LOG_FORMAT=json` to enable structured JSON log output, suitable for cloud log aggregation services.
 
 `docker run -e XTDB_LOG_FORMAT=json …​`
+
+Set `XTDB_LOG_JSON_TEMPLATE` to choose a Log4j2 `JsonTemplateLayout` event template:
+
+`classpath:xtdb/logging/AwsCloudWatchLayout.json` (default)
+
+: Used when `XTDB_LOG_JSON_TEMPLATE` is unset or empty.
+  Writes UTC `timestamp`, `level`, `logger`, `message`, `thread`, and event `context`.
+
+`classpath:xtdb/logging/AzureMonitorLayout.json`
+
+: Formats lines for Azure Monitor (`Timestamp`, `Severity`, `Message`, `OperationId`, `ParentId`, and `Attributes`).
+
+`classpath:GcpLayout.json`
+
+: Formats lines using Log4j2's GCP layout (`timestampSeconds`, `timestampNanos`, `severity`, `message`, `logging.googleapis.com/labels`, `/sourceLocation`, `/trace`, `/spanId`, `/trace_sampled`, `thread`, and `logger`).
+
+`file:///path/to/layout.json` (also `file://localhost/...` or `file:/...`)
+
+: Loads a custom `JsonTemplateLayout` JSON file (up to 1 MiB) from disk at startup.
+
+On RTDB, templates are compiled at startup and support the `timestamp` (`pattern` with UTC or fixed offset, or `epoch`), `level` (`name`, `severity`), `logger`, `thread`, `message`, `mdc` (`key`, `flatten`), `source` (`fileName`, `lineNumber`, `className`), `counter`, `pattern` (a PatternLayout subset), and `endOfBatch` resolvers (plus `exception`, `exceptionRootCause`, and `marker`, which tracing events do not carry).
+An unknown `classpath:` template, an unreadable or invalid `file:` template, or an unsupported resolver or option refuses startup rather than emitting a different layout.
 
 ### Custom logging configuration
 

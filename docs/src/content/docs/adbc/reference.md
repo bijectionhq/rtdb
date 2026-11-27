@@ -125,6 +125,18 @@ val result = stmt.executeQuery()
 
     Because it runs before any bind, a result schema that depends on parameter types is resolved against null-typed placeholders. For `SELECT cols FROM t WHERE _id = ?` (where the projection doesn't depend on the parameter) the schema is accurate; a query that projects a parameter directly (`SELECT ?`, `SELECT ? + 1`) comes back `null`-typed for those fields. Project through a column expression that fixes the type if you need it resolved.
 
+### Query tickets
+
+Over Flight SQL, `GetFlightInfo` returns a self-contained JSON ticket in XTDB's `QueryTicket` format:
+
+- A query ticket (`"type": "run"`) carries `dbName`, `sql`, `params` (a base64-encoded Arrow IPC stream, or `null`), and `basis` (`currentTime`, `defaultTz`, `snapshotToken` as an XTDB `TimeBasis`, and `snapshotTime`).
+  It is unsigned and retains no server-side state, so any session can redeem it and it remains redeemable across node restarts.
+  `DoGet` re-prepares the SQL on the redeeming session's connection under that session's identity, so a ticket grants no access the redeemer does not already have.
+- DML and `SET` statements executed through `GetFlightInfo` return `{"type":"empty"}`, whose redemption streams an empty Arrow schema without repeating the statement.
+- RTDB redeems query tickets issued by XTDB, and XTDB redeems RTDB run tickets unless they carry RTDB-only fields (`searchPath` when it differs from `["public"]`, `awaitFloor` when `true`, or a sealed snapshot token on a placed deployment).
+- Inspection statements (such as `SHOW`) use an RTDB JSON ticket of `"type": "inspect"` signed with HMAC-SHA256 for the issuing session and owner.
+  Presenting an inspection ticket from another session, another owner, or after a restart fails with `NOT_FOUND`.
+
 ## Bulk ingest
 
 `bulkIngest(table, mode)`

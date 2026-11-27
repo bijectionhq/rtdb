@@ -95,6 +95,7 @@ title: String functions
 
 `LOWER(str)`
 : lower-case, using the case rules of the server process's default locale: Turkish and Azeri (`İ` → `i`, `I` → `ı`) and Lithuanian locales have their own rules, and every other locale uses the Unicode defaults.
+  The process default locale is read once at startup and falls back to the root Unicode locale if the host locale cannot be read.
 
 `OVERLAY(str PLACING replacement FROM start_pos [FOR length])`
 : replace `length` characters of `str` starting at `start_pos` with `replacement`

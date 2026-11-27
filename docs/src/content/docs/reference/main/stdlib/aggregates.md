@@ -102,4 +102,6 @@ Both functions accept `ORDER BY col DESC`, which measures `fraction` from the la
 
 A `fraction` outside `[0, 1]`, NaN included, is an error.
 
-Past an internal threshold, both functions spill their input to disk under the JVM's temporary directory (`java.io.tmpdir`), as ORDER BY and joins do, rather than hold it in memory, so a query needs temp space in proportion to its input.
+Past an internal threshold, both functions spill their input to disk under the temporary directory, as `ORDER BY` and joins do, rather than holding it in memory, so a query needs temp space in proportion to its input.
+On RTDB, spill is unlimited by default and can be capped with [`query.spillLimitBytes`](/ops/config#query-execution-and-spill-policy).
+`GROUP BY`, `DISTINCT`, and all other aggregate functions (including ordered `ARRAY_AGG`) keep their state in memory and fail with a memory error when the memory budget cannot hold them.
