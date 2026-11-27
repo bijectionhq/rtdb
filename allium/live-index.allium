@@ -13,11 +13,11 @@
 --   A live table is a VALUE, and a transaction writes it through a TRANSIENT derived from that value.
 --   The transient appends only, and what it appends the value it came from cannot see; committing it yields the table's next value, and applying a transaction installs those values.
 --   A table's immutable row lineage advances when rows are appended.
---   Appending to a live table adds one chunk to its tail and publishes the new row count and trie root, without copying or merging the chunks the previous value holds.
---   A value reads only the tail chunks it counts, each set once and never changed, so neither a later append nor another append from the same value changes the rows or row addresses it sees.
---   A full tail merges into the table's merged chunks, preserving row addresses and lineage.
---   An incremental transaction snapshot appends the pending Arrow runs written since its last read as one chunk.
---   A holder of an earlier snapshot retains its original chunks and their funding.
+--   Each live table holds a single growing relation of appended batches with no fixed slot limit; appending extends the relation and publishes the new row count and trie root without mutating any previous value.
+--   Each snapshot value shares and reads only its own stable prefix of the relation, so concurrent readers never see later appends or partially written rows, and row addresses within a prefix never change.
+--   A discarded append or forked branch leaves no orphaned slots in any earlier value's relation and releases its unretained batch funding immediately.
+--   An incremental transaction snapshot appends the pending Arrow runs written since its last read as one batch.
+--   A holder of an earlier snapshot retains its prefix batches and their funding.
 --   The row lineage starts a new generation at its revision limit.
 --   The derived index builds coverage anew for that generation.
 --   A derived posting page can serve a related snapshot when its covered rows lie in both snapshots' shared prefix.

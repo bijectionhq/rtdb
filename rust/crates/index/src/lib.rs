@@ -4,6 +4,7 @@ mod event_revision;
 mod live;
 mod prepared_order;
 mod partition;
+#[allow(dead_code)]
 mod row_address;
 mod snapshot;
 mod tiered_publication;

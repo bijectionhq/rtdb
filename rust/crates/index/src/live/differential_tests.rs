@@ -143,7 +143,7 @@ fn appended_live_versions_hold_exactly_their_writes_rows_and_keep_them_after_lat
         verify_index(&base, &base_expected, &memory);
         versions.push((next, expected));
     }
-    assert!(versions.iter().any(|(live, _)| live.tables().values().any(|table| !table.chunks.merged.is_empty())));
+    assert!(versions.iter().any(|(live, _)| live.tables().values().any(|table| table.relation.len() > TrieConfig::default().log_limit())));
     for (live, expected) in &versions { verify_index(live, expected, &memory); }
     drop(versions);
     assert_eq!(memory.used_bytes(), 0);
@@ -163,6 +163,7 @@ fn appending_from_a_version_whose_next_slot_is_taken_keeps_both_branches() {
     };
     let mut base = LiveTable::new(table, BlockIndex(0), TrieConfig::default());
     for id in 0..5 { base = base.append(&write(id, id), Timestamp(id)).unwrap(); }
+    let bytes_at_base = memory.used_bytes();
     let left = base.append(&write(100, 10), Timestamp(10)).unwrap();
     let right = base.append(&write(200, 11), Timestamp(11)).unwrap();
     let right_next = right.append(&write(300, 12), Timestamp(12)).unwrap();
@@ -175,26 +176,108 @@ fn appending_from_a_version_whose_next_slot_is_taken_keeps_both_branches() {
     for row in 0..5 {
         assert_eq!(left.header(row).unwrap(), base.header(row).unwrap());
         assert_eq!(right.header(row).unwrap(), base.header(row).unwrap());
+        assert!(Arc::ptr_eq(left.batch_at((row, 0)).unwrap().0, base.batch_at((row, 0)).unwrap().0));
+        assert!(Arc::ptr_eq(right.batch_at((row, 0)).unwrap().0, base.batch_at((row, 0)).unwrap().0));
     }
+    drop((left, right, right_next));
+    assert_eq!(memory.used_bytes(), bytes_at_base, "discarded branches release their batches with no orphaned slots");
+    drop(base);
+    assert_eq!(memory.used_bytes(), 0);
 }
 
 #[test]
-fn a_table_merges_its_tail_into_the_merged_chunks_once_the_tail_is_full() {
+fn growing_relation_exceeds_trie_log_limit_with_stable_prefix_and_no_orphaned_slots() {
     let memory = MemoryBudget::new(1 << 26);
     let mut live = LiveTable::new(TableRef::new("public", "docs"), BlockIndex(0), TrieConfig::default());
-    let tail_chunks = TrieConfig::default().log_limit();
-    for id in 0..=tail_chunks as i64 {
+    let beyond_limit = TrieConfig::default().log_limit() * 3 + 7;
+    let mut snapshots = Vec::new();
+    for id in 0..beyond_limit as i64 {
         let event = StoredEvent {
             position: None, origin: None, commit_position: 0, entity_key: None, iid: EntityId::Integer(id).iid(),
             system_from: Timestamp(id), valid_time: Interval::ALL, recency: None,
             operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(id))])),
         };
         let batch = IndexBatch::copy_events(&[event], &StructFields::new(), &memory).unwrap();
-        let previous = live.clone();
         live = live.append(&TableWrite::new(StructFields::new(), Some(batch)), Timestamp(id)).unwrap();
-        assert!(Arc::ptr_eq(&previous.chunks.merged, &live.chunks.merged) || id == tail_chunks as i64);
+        if id % 13 == 0 {
+            snapshots.push((id as u32 + 1, live.clone()));
+        }
     }
-    assert_eq!(live.chunks.merged.iter().map(|(start, batch)| (*start, batch.len())).collect::<Vec<_>>(), [(0, tail_chunks)]);
-    assert_eq!(live.chunks.tail_len, 1);
-    assert_eq!(live.locate(tail_chunks as u32).unwrap(), (1, 0));
+    assert_eq!(live.relation.len(), beyond_limit);
+    assert_eq!(live.row_count(), beyond_limit as u32);
+    for (prefix_rows, snap) in &snapshots {
+        assert_eq!(snap.row_count(), *prefix_rows);
+        assert_eq!(snap.relation.len(), *prefix_rows as usize);
+        assert!(snap.header(*prefix_rows).is_err());
+        for row in 0..*prefix_rows {
+            assert_eq!(snap.locate(row).unwrap(), (row, 0));
+            assert_eq!(live.locate(row).unwrap(), (row, 0));
+            assert!(Arc::ptr_eq(snap.batch_at((row, 0)).unwrap().0, live.batch_at((row, 0)).unwrap().0));
+        }
+    }
+    let bytes_before_discard = memory.used_bytes();
+    let discarded_event = StoredEvent {
+        position: None, origin: None, commit_position: 0, entity_key: None, iid: EntityId::Integer(999_999).iid(),
+        system_from: Timestamp(beyond_limit as i64), valid_time: Interval::ALL, recency: None,
+        operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(999_999))])),
+    };
+    let discarded = live.append(
+        &TableWrite::new(StructFields::new(), Some(IndexBatch::copy_events(&[discarded_event], &StructFields::new(), &memory).unwrap())),
+        Timestamp(beyond_limit as i64),
+    ).unwrap();
+    assert!(memory.used_bytes() > bytes_before_discard);
+    drop(discarded);
+    assert_eq!(memory.used_bytes(), bytes_before_discard, "discarded optimistic append leaves no orphaned slot");
+    let committed_event = StoredEvent {
+        position: None, origin: None, commit_position: 0, entity_key: None, iid: EntityId::Integer(beyond_limit as i64).iid(),
+        system_from: Timestamp(beyond_limit as i64), valid_time: Interval::ALL, recency: None,
+        operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(beyond_limit as i64))])),
+    };
+    let next = live.append(
+        &TableWrite::new(StructFields::new(), Some(IndexBatch::copy_events(&[committed_event], &StructFields::new(), &memory).unwrap())),
+        Timestamp(beyond_limit as i64),
+    ).unwrap();
+    assert_eq!(next.locate(beyond_limit as u32).unwrap(), (beyond_limit as u32, 0));
+    assert_eq!(next.header(beyond_limit as u32).unwrap().iid, EntityId::Integer(beyond_limit as i64).iid());
+    drop((snapshots, live, next));
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn concurrent_readers_see_stable_prefix_while_writer_appends() {
+    let memory = MemoryBudget::new(1 << 26);
+    let mut live = LiveTable::new(TableRef::new("public", "docs"), BlockIndex(0), TrieConfig::default());
+    let make_write = |id: i64| {
+        let event = StoredEvent {
+            position: None, origin: None, commit_position: 0, entity_key: None, iid: EntityId::Integer(id).iid(),
+            system_from: Timestamp(id), valid_time: Interval::ALL, recency: None,
+            operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(id))])),
+        };
+        TableWrite::new(StructFields::new(), Some(IndexBatch::copy_events(&[event], &StructFields::new(), &memory).unwrap()))
+    };
+    for id in 0..32i64 {
+        live = live.append(&make_write(id), Timestamp(id)).unwrap();
+    }
+    let pinned = Arc::new(live.clone());
+    let readers: Vec<_> = (0..4).map(|_| {
+        let snapshot = Arc::clone(&pinned);
+        std::thread::spawn(move || {
+            for _ in 0..64 {
+                assert_eq!(snapshot.row_count(), 32);
+                assert!(snapshot.header(32).is_err());
+                for row in 0..32u32 {
+                    assert_eq!(snapshot.locate(row).unwrap(), (row, 0));
+                    assert_eq!(snapshot.header(row).unwrap().iid, EntityId::Integer(i64::from(row)).iid());
+                }
+            }
+        })
+    }).collect();
+    for id in 32..256i64 {
+        live = live.append(&make_write(id), Timestamp(id)).unwrap();
+    }
+    for reader in readers { reader.join().unwrap(); }
+    assert_eq!(live.row_count(), 256);
+    assert_eq!(pinned.row_count(), 32);
+    drop((pinned, live));
+    assert_eq!(memory.used_bytes(), 0);
 }
