@@ -146,7 +146,9 @@ impl Context<'_> {
                         return Ok(if name == "rtdb.sql/regex/not" { Expr::unary(UnaryOp::Not,expression) } else { expression });
                     }
                     if let Some(name) = name.strip_prefix("rtdb.sql/string/") {
-                        return call(name.into(), vec![self.expr_bound(left, input, replacements)?, self.expr_bound(right, input, replacements)?]);
+                        let left = self.expr_bound(left, input, replacements)?;
+                        let right = self.expr_bound(right, input, replacements)?;
+                        return call(string_operator_function(name)?.into(), vec![left, right]);
                     }
                     if let Some(name) = name.strip_prefix("rtdb.sql/period/") {
                         let left = self.expr_bound(left, input, replacements)?;
@@ -516,6 +518,15 @@ pub(crate) fn character_length_function(units: &ast::CharacterLengthUnits) -> Re
         Ok(function)
     } else {
         Err(rtdb_types::Anomaly::incorrect("xtdb.error/illegal-arg", format!("No matching clause: {}", unit.value)))
+    }
+}
+
+pub(crate) fn string_operator_function(name: &str) -> Result<&str> {
+    match name.strip_prefix("position/") {
+        Some("CHARACTERS") => Ok("position"),
+        Some("OCTETS") => Ok("octet_position"),
+        Some(units) => Err(rtdb_types::Anomaly::incorrect("xtdb.error/illegal-arg", format!("No matching clause: {units}"))),
+        None => Ok(name),
     }
 }
 

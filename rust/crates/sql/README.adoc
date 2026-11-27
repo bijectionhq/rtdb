@@ -639,6 +639,7 @@ Window partition clauses retain column-reference syntax.
 `tests/window_order_projection.rs` records projection shape, competing errors, sleep effects and visible output as unexecuted regression source.
 
 POSITION parses a complete expression on each side of its IN delimiter, retaining nested predicates, CASE and parenthesized haystacks.
+Binding visits both operands before requiring the unit spelling `CHARACTERS` or `OCTETS` in uppercase.
 Nested POSITION delimiter retries share a cumulative work limit that includes token snapshot payloads; exhausting it returns a SQL error before further speculative parsing.
 Delimiter speculation keeps the existing parser's recursion budget and restores its token stream before returning.
 The source regression modules retain full-expression type admission, nested delimiter selection, failed speculation and recursion-limit behavior.

@@ -119,6 +119,28 @@ async fn sql_concat_stringifies_arguments_and_treats_null_as_empty_text() {
     for sql in ["SELECT CONCAT()", "SELECT STR()"] { assert!(prepare(sql, &context().catalog, &PrepareOptions::default()).is_err(), "{sql}"); }
 }
 
+#[test]
+fn position_preserves_unit_spelling_through_binding() {
+    let context = context();
+    let options = PrepareOptions::default();
+    for units in ["OCTETS", "CHARACTERS"] {
+        let sql = format!("SELECT position('a' in 'ba' using {units})");
+        prepare(&sql, &context.catalog, &options).unwrap();
+    }
+    for units in ["octets", "Characters"] {
+        let sql = format!("SELECT POSITION('a' IN 'ba' USING {units})");
+        assert!(rtdb_sql::parse(&sql).is_ok(), "{sql}");
+        let error = prepare(&sql, &context.catalog, &options).unwrap_err();
+        assert_eq!(error.code, "xtdb.error/illegal-arg");
+        assert_eq!(error.message.as_deref(), Some(format!("No matching clause: {units}").as_str()));
+    }
+    let sql = "SELECT POSITION('a' IN 'ba' USING \"OCTETS\")";
+    assert_eq!(rtdb_sql::parse(sql).unwrap_err().code, "xtdb/sql-error");
+    let nested = "SELECT POSITION(CAST(POSITION('a' IN 'ba' USING Characters) AS TEXT) IN '1' USING octets)";
+    let error = prepare(nested, &context.catalog, &options).unwrap_err();
+    assert_eq!(error.message.as_deref(), Some("No matching clause: Characters"));
+}
+
 #[tokio::test]
 async fn stringutil_sql_overlay_position_units_and_binary_functions() {
     assert_eq!(query("SELECT POSITION('é' IN 'a😀éz'),POSITION('é' IN 'a😀éz' USING OCTETS) AS test_output_2,POSITION('é' IN 'a😀éz' USING CHARACTERS) AS test_output_3").await.unwrap(), [vec![V::I32(3), V::I32(6), V::I32(3)]]);

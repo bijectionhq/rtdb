@@ -300,16 +300,16 @@ impl Dialect for SqlDialect {
                         let needle = parse_before_token(parser,delimiter,self)?;
                         parser.expect_keyword_is(Keyword::IN)?;
                         let haystack = parser.parse_expr()?;
-                        let octets = if parser.parse_keyword(Keyword::USING) {
+                        let function = if parser.parse_keyword(Keyword::USING) {
                             let units = parser.next_token();
                             match units.token {
-                                Token::Word(word) if word.quote_style.is_none() && word.value.eq_ignore_ascii_case("OCTETS") => true,
-                                Token::Word(word) if word.quote_style.is_none() && word.value.eq_ignore_ascii_case("CHARACTERS") => false,
+                                Token::Word(word) if word.quote_style.is_none() && matches!(word.keyword, Keyword::CHARACTERS | Keyword::OCTETS) =>
+                                    format!("rtdb.sql/string/position/{}", word.value),
                                 _ => return Err(ParserError::ParserError("Expected CHARACTERS or OCTETS after USING".into())),
                             }
-                        } else { false };
+                        } else { "rtdb.sql/string/position".into() };
                         parser.expect_token(&Token::RParen)?;
-                        Ok(ast::Expr::BinaryOp { left: Box::new(needle), op: ast::BinaryOperator::Custom(if octets { "rtdb.sql/string/octet_position" } else { "rtdb.sql/string/position" }.into()), right: Box::new(haystack) })
+                        Ok(ast::Expr::BinaryOp { left: Box::new(needle), op: ast::BinaryOperator::Custom(function), right: Box::new(haystack) })
                     }))? { return Ok(expression); }
                 }
                 Err(ParserError::ParserError("Expected POSITION needle IN haystack".into()))
@@ -568,7 +568,7 @@ mod position_tests {
     }
     fn operands(value: &ast::Expr) -> (&ast::Expr,&ast::Expr) {
         let ast::Expr::BinaryOp { left,op: ast::BinaryOperator::Custom(name),right } = value else { panic!("position: {value:?}") };
-        assert!(matches!(name.as_str(),"rtdb.sql/string/position" | "rtdb.sql/string/octet_position"));
+        assert!(name == "rtdb.sql/string/position" || name.starts_with("rtdb.sql/string/position/"));
         (left,right)
     }
     #[test]
