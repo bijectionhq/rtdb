@@ -10,6 +10,7 @@ mod timsort;
 mod legacy;
 mod select;
 mod native_keys;
+pub(crate) use native_keys::Kind as NativeKeyKind;
 
 const BLOCK_ROWS: usize = 102_400;
 const MERGE_FAN_IN: usize = 4;

@@ -602,6 +602,120 @@ async fn spilled_percentiles_use_original_positions_across_mixed_runs() {
 }
 
 #[tokio::test]
+async fn typed_percentile_ranks_keep_decimal_peers_and_copy_nullable_winners() {
+    for object_sort in [rtdb_types::ObjectSort::TimSort, rtdb_types::ObjectSort::LegacyMergeSort] {
+        let execution = execution_with_options(QueryOptions { object_sort, ..Default::default() });
+        let baseline = execution.context.memory.used_bytes();
+        let int = LogicalType::Scalar(ScalarType::I64);
+        let decimal = LogicalType::Scalar(ScalarType::Decimal { precision: 20, scale: 0, bit_width: 128 }).maybe();
+        let schema = Schema::new(vec![field(0, int.clone()), field(1, decimal.clone())]).unwrap();
+        let groups = vec![NamedExpr { field: field(2, int), expr: schema.fields()[0].expression() }];
+        let percentile = |id, kind, ty| AggregateExpr {
+            field: field(id, ty),
+            function: AggregateFunction::Percentile { kind, fraction: PercentileFraction::Literal(0.5), descending: true },
+            argument: Some(schema.fields()[1].expression()),
+            distinct: false,
+            filter: None,
+            order_by: vec![],
+        };
+        let aggregates = vec![
+            percentile(3, PercentileKind::Discrete, decimal),
+            percentile(4, PercentileKind::Continuous, LogicalType::Scalar(ScalarType::F64).maybe()),
+        ];
+        let decimal = |value: i128| Value::Decimal(
+            rtdb_types::DecimalValue::new(value.to_be_bytes().to_vec(), 20, 0, 128).unwrap()
+        );
+        let first = decimal(9_007_199_254_740_992);
+        let second = decimal(9_007_199_254_740_993);
+        let pages = vec![
+            vec![vec![Value::I64(1), first.clone()], vec![Value::I64(2), Value::Null]],
+            vec![vec![Value::I64(1), second], vec![Value::I64(2), Value::Null]],
+        ];
+        let (mut cursor, _) = cursor(&execution, schema, pages, groups, aggregates, None);
+        let result = cursor.next_batch().await.unwrap().unwrap();
+        let Column::Arrow { array, field, .. } = &result.columns[1] else { panic!("Expected one nullable decimal array"); };
+        assert_eq!(array.data_type(), &DataType::Decimal128(20, 0));
+        assert!(field.is_nullable());
+        assert_eq!(batch_row(&result, 0), [Value::I64(1), first, Value::F64(9_007_199_254_740_992.0)]);
+        assert_eq!(batch_row(&result, 1), [Value::I64(2), Value::Null, Value::Null]);
+        drop((cursor, result));
+        assert_eq!(execution.context.memory.used_bytes(), baseline);
+    }
+}
+
+#[tokio::test]
+async fn typed_percentile_ranks_validate_only_the_discrete_decimal_winner() {
+    let execution = execution(8);
+    let baseline = execution.context.memory.used_bytes();
+    let ty = LogicalType::Scalar(ScalarType::Decimal { precision: 2, scale: 0, bit_width: 128 });
+    let decimal = |value: i128| Value::Decimal(
+        rtdb_types::DecimalValue::new(value.to_be_bytes().to_vec(), 2, 0, 128).unwrap()
+    );
+    let percentile = |kind, fraction| primitive_cursor(
+        &execution,
+        AggregateFunction::Percentile { kind, fraction: PercentileFraction::Literal(fraction), descending: false },
+        ty.clone(), ty.clone(), vec![vec![decimal(100), decimal(10)]], None,
+    );
+
+    assert_eq!(primitive_result(percentile(PercentileKind::Discrete, 0.0)).await, decimal(10));
+    assert_eq!(primitive_result(percentile(PercentileKind::Continuous, 1.0)).await, Value::F64(100.0));
+    let mut discrete = percentile(PercentileKind::Discrete, 1.0);
+    assert_eq!(discrete.next_batch().await.err().unwrap().code, "rtdb/decimal-precision");
+    drop(discrete);
+    assert_eq!(execution.context.memory.used_bytes(), baseline);
+}
+
+#[tokio::test]
+async fn typed_percentile_ranks_keep_date_peers_and_reach_mixed_timestamp_overflow() {
+    let execution = execution(8);
+    let baseline = execution.context.memory.used_bytes();
+    let function = AggregateFunction::Percentile {
+        kind: PercentileKind::Discrete, fraction: PercentileFraction::Literal(0.5), descending: false,
+    };
+    let ty = LogicalType::Scalar(ScalarType::DateMilli);
+    let mut percentile = primitive_cursor(&execution, function.clone(), ty.clone(), ty,
+        vec![vec![Value::DateMilli(999)], vec![Value::DateMilli(1)]], None);
+    let result = percentile.next_batch().await.unwrap().unwrap();
+    assert_eq!(result.columns[0].value(0).unwrap(), Value::DateMilli(999));
+    drop((percentile, result));
+
+    let timestamp = |value, unit| Value::Timestamp { value, unit, timezone: Some("America/New_York".into()) };
+    let start = timestamp(i64::MAX, TimeUnit::Second);
+    let end = timestamp(0, TimeUnit::Nanosecond);
+    let mixed = start.logical_type().join(&end.logical_type());
+    let mut percentile = primitive_cursor(&execution, function, mixed.clone(), mixed, vec![vec![start], vec![end]], None);
+    assert_eq!(percentile.next_batch().await.err().unwrap().code, "xtdb.expression/overflow-error");
+    drop(percentile);
+    assert_eq!(execution.context.memory.used_bytes(), baseline);
+}
+
+#[test]
+fn typed_percentile_ranks_copy_timestamp_results_with_independent_backing() {
+    let memory = MemoryBudget::new(1 << 20);
+    let ty = LogicalType::Scalar(ScalarType::Timestamp {
+        unit: TimeUnit::Microsecond, timezone: Some("America/New_York".into()),
+    });
+    let field = rtdb_columnar::to_field("value", &ty).unwrap();
+    let values = arrow_array::TimestampMicrosecondArray::from(vec![i64::MIN, i64::MAX]).with_timezone("America/New_York");
+    let original = values.values().as_ptr();
+    let batch = ColumnBatch::settled(vec![Column::Arrow {
+        array: Arc::new(values), field: Arc::new(field.clone()), logical: Some(ty.clone()),
+    }], 2, memory.reserve(0).unwrap()).unwrap();
+    let source = Arc::downgrade(batch.column_reservation(0));
+    let (column, charge) = copy_ranked_cells(&[batch], &[Some((0, 1)), None], field, &memory).unwrap();
+    assert!(source.upgrade().is_none());
+    let Column::Arrow { array, logical, .. } = &column else { panic!("Expected a timestamp array"); };
+    assert_eq!(logical.as_ref(), Some(&ty.maybe()));
+    assert_ne!(array.as_primitive::<TimestampMicrosecondType>().values().as_ptr(), original);
+    assert_eq!(column.value(0).unwrap(), Value::Timestamp {
+        value: i64::MAX, unit: TimeUnit::Microsecond, timezone: Some("America/New_York".into()),
+    });
+    assert_eq!(column.value(1).unwrap(), Value::Null);
+    drop((column, charge));
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[tokio::test]
 async fn aggregate_columns_complete_their_page_masks_before_the_next_column() {
     for batch_rows in [1,1024] {
         let execution = execution(batch_rows);let baseline = execution.context.memory.used_bytes();

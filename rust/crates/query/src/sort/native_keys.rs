@@ -10,7 +10,7 @@ use rtdb_types::{LogicalType, ScalarType, TimeUnit, Value};
 use crate::columnar::{Column, ColumnBatch};
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum Kind {
+pub(crate) enum Kind {
     Number,
     Text,
     Keyword,
@@ -26,7 +26,7 @@ enum Kind {
 }
 
 impl Kind {
-    fn of(ty: &LogicalType) -> Option<Self> {
+    pub(crate) fn of(ty: &LogicalType) -> Option<Self> {
         let mut kind = None;
         for leg in ty.legs() {
             let next = match leg {
@@ -216,6 +216,12 @@ impl Kind {
         }
     }
 
+    pub(crate) fn compare(
+        self, left: (&Column, usize), right: (&Column, usize), descending: bool, nulls_first: bool,
+    ) -> rtdb_types::Result<Ordering> {
+        self.read(left.0, left.1).compare(self.read(right.0, right.1), descending, nulls_first)
+    }
+
     fn read_arrow(cell: ArrowCell<'_>) -> Key<'_> {
         let ArrowCell { field, array, row } = cell.physical().expect("admitted sort cell");
         if field.data_type() == &DataType::Null || array.is_null(row) {
@@ -347,14 +353,14 @@ impl Key<'_> {
         }
     }
 
-    fn compare(self, right: Self, order: &SortExpr) -> rtdb_types::Result<Ordering> {
+    fn compare(self, right: Self, descending: bool, nulls_first: bool) -> rtdb_types::Result<Ordering> {
         let comparison = match (self, right) {
             (Self::Null, Self::Null) => return Ok(Ordering::Equal),
             (Self::Null, _) => {
-                return Ok(if order.nulls_first { Ordering::Less } else { Ordering::Greater });
+                return Ok(if nulls_first { Ordering::Less } else { Ordering::Greater });
             }
             (_, Self::Null) => {
-                return Ok(if order.nulls_first { Ordering::Greater } else { Ordering::Less });
+                return Ok(if nulls_first { Ordering::Greater } else { Ordering::Less });
             }
             (Self::Integer(left), Self::Integer(right)) => left.cmp(&right),
             (Self::Float(left), Self::Float(right)) => float_order(left, right),
@@ -373,7 +379,7 @@ impl Key<'_> {
             }
             _ => unreachable!("sort key columns have one admitted kind"),
         };
-        Ok(if order.descending { comparison.reverse() } else { comparison })
+        Ok(if descending { comparison.reverse() } else { comparison })
     }
 }
 
@@ -479,9 +485,10 @@ impl NativeOrder {
         order: &[SortExpr],
     ) -> rtdb_types::Result<Ordering> {
         for (&(column, kind), order) in self.keys[start..].iter().zip(&order[start..]) {
-            let left = kind.read(&left.columns[column], left_row);
-            let right = kind.read(&right.columns[column], right_row);
-            let comparison = left.compare(right, order)?;
+            let comparison = kind.compare(
+                (&left.columns[column], left_row), (&right.columns[column], right_row),
+                order.descending, order.nulls_first,
+            )?;
             if !comparison.is_eq() {
                 return Ok(comparison);
             }
@@ -662,7 +669,7 @@ fn arrow_wave4_native_sort_matches_scalar_order_for_index_key_families() {
                     };
                     assert_eq!(
                         kind.read(&column, left)
-                            .compare(kind.read(&column, right), &order).unwrap(),
+                            .compare(kind.read(&column, right), order.descending, order.nulls_first).unwrap(),
                         expected
                     );
                 }

@@ -1,9 +1,9 @@
 use std::{cmp::Ordering, collections::{HashMap, HashSet}, mem::size_of, sync::Arc};
 
 use arrow_array::{Array, cast::AsArray, types::*};
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Field as ArrowField};
 use async_trait::async_trait;
-use rtdb_columnar::{CellReadCheck, MemoryReservation};
+use rtdb_columnar::{ArrowCell, CellReadCheck, MemoryReservation};
 use rtdb_expr::{cast, compare_in_timezone, is_true, number, sql_eq_in_timezone};
 use rtdb_plan::{AggregateExpr, AggregateFunction, Binder, NamedExpr, PercentileFraction, PercentileKind, Schema};
 use rtdb_types::{LogicalType, Result, ScalarType, Value};
@@ -13,6 +13,7 @@ use crate::columnar::{BatchCursor, Column, ColumnBatch};
 use crate::cursor::OwnedRow;
 use crate::runtime_schema::{EmissionMode, EmittedRelation};
 use crate::set_keys::{BatchKeyIndex, KeyColumns};
+use crate::sort::NativeKeyKind;
 use crate::invalid;
 
 #[derive(Clone, Copy)]
@@ -451,6 +452,108 @@ fn direct_rank_type(ty: &LogicalType) -> bool {
         S::Bool | S::I8 | S::I16 | S::I32 | S::I64 | S::F32 | S::F64 | S::Utf8 | S::Binary))
 }
 
+enum PercentileKey {
+    Native(NativeKeyKind),
+    Decimal,
+}
+
+impl PercentileKey {
+    fn bind(ty: &LogicalType, batches: &[ColumnBatch], reservation: &mut MemoryReservation)
+        -> Result<Option<(Self, ArrowField)>> {
+        use ScalarType as S;
+        if batches.is_empty() { return Ok(None); }
+        let ty = without_nullability(ty);
+        let key = match ty {
+            LogicalType::Scalar(S::Decimal { .. }) => Self::Decimal,
+            LogicalType::Scalar(S::Timestamp { .. } | S::Time { .. } | S::Duration(_) | S::DateDay | S::DateMilli
+                | S::Uuid | S::Interval(rtdb_types::IntervalUnit::YearMonth)) =>
+                Self::Native(NativeKeyKind::of(ty).expect("Fixed-width percentile key has a native sort reader")),
+            _ => return Ok(None),
+        };
+        let previous_bytes = reservation.bytes();
+        let bytes = ty.retained_bytes()?.checked_mul(8).and_then(|bytes| bytes.checked_add(512))
+            .and_then(|bytes| bytes.checked_add(previous_bytes))
+            .ok_or_else(|| invalid("aggregate-size", "Percentile field exceeds addressable memory"))?;
+        reservation.grow_to(bytes)?;
+        let Ok(field) = rtdb_columnar::to_field("value", ty) else {
+            reservation.shrink_to(previous_bytes)?;
+            return Ok(None);
+        };
+        let accepts = |array: &dyn Array, source: &ArrowField, logical: Option<&LogicalType>| {
+            source.data_type() == array.data_type() && (if source.data_type() == &DataType::Null {
+                source.is_nullable() && logical.is_none_or(|ty| *ty == LogicalType::Null)
+            } else {
+                source.data_type() == field.data_type() && source.metadata() == field.metadata()
+                    && logical.is_none_or(|logical| without_nullability(logical) == ty)
+            })
+        };
+        let matches = batches.iter().all(|batch| match &batch.columns[0] {
+            Column::Arrow { array, field, logical } => accepts(array.as_ref(), field, logical.as_ref()),
+            Column::Selected(selected) => selected.source_layouts().all(|(array, field, logical)| accepts(array, field, logical)),
+            Column::Values(_) => false,
+        });
+        if !matches {
+            drop(field);
+            reservation.shrink_to(previous_bytes)?;
+            return Ok(None);
+        }
+        if matches!(key, Self::Decimal) {
+            reservation.grow_to(bytes.checked_add(4096)
+                .ok_or_else(|| invalid("aggregate-size", "Percentile decimal conversion exceeds addressable memory"))?)?;
+        }
+        Ok(Some((key, field)))
+    }
+
+    fn decimal(position: (&Column, usize)) -> Result<f64> {
+        let ArrowCell { array, field, row } = ranked_arrow_cell(position);
+        rtdb_columnar::decimal_cell_as_f64(field, array, row)
+    }
+
+    fn compare(&self, left: (&Column, usize), right: (&Column, usize)) -> Result<Ordering> {
+        match self {
+            Self::Native(kind) => kind.compare(left, right, false, false),
+            Self::Decimal => Ok(Self::decimal(left)?.total_cmp(&Self::decimal(right)?)),
+        }
+    }
+}
+
+fn ranked_arrow_cell((column, row): (&Column, usize)) -> ArrowCell<'_> {
+    let (array, field, _, row) = column.arrow_cell(row).flatten().expect("A ranked Arrow cell is present");
+    ArrowCell { array, field, row }
+}
+
+fn copy_ranked_cells(
+    batches: &[ColumnBatch], positions: &[Option<(usize, usize)>], field: ArrowField, memory: &Arc<rtdb_columnar::MemoryBudget>,
+) -> Result<(Column, Arc<MemoryReservation>)> {
+    // Fixed-size binary interleave also allocates ArrayData and extension closures for its sources.
+    let bytes_per_position = if matches!(field.data_type(), DataType::FixedSizeBinary(_)) { 512 } else { 256 };
+    let bytes = positions.len().checked_mul(bytes_per_position)
+        .and_then(|bytes| field.size().checked_mul(8).and_then(|field| bytes.checked_add(field)))
+        .and_then(|bytes| bytes.checked_add(4096))
+        .ok_or_else(|| invalid("aggregate-size", "Percentile output exceeds addressable memory"))?;
+    let reservation = memory.reserve(bytes)?;
+    let mut sources = HashMap::new();
+    let mut arrays = Vec::new();
+    let picks = positions.iter().map(|position| position.map(|(page, row)| {
+        let ArrowCell { array, row, .. } = ranked_arrow_cell((&batches[page].columns[0], row));
+        let source = *sources.entry(std::ptr::from_ref(array).cast::<()>()).or_insert_with(|| {
+            let source = arrays.len();
+            arrays.push(array);
+            source
+        });
+        (source, row)
+    })).collect::<Vec<_>>();
+    let (array, field) = if arrays.is_empty() {
+        (Arc::new(arrow_array::NullArray::new(picks.len())) as arrow_array::ArrayRef, ArrowField::new("value", DataType::Null, true))
+    } else {
+        let array = rtdb_columnar::copy_nullable_cells(&arrays, &picks)?;
+        let field = field.with_nullable(array.null_count() != 0);
+        (array, field)
+    };
+    let logical = rtdb_columnar::from_field(&field)?;
+    Ok((Column::Arrow { array, field: Arc::new(field), logical: Some(logical) }, reservation))
+}
+
 fn count_layout(data_type: &DataType) -> bool {
     use DataType as T;
     matches!(data_type, T::Boolean | T::Int8 | T::Int16 | T::Int32 | T::Int64
@@ -826,16 +929,23 @@ impl CollectionVectors {
         let bytes = groups.checked_mul(2 * std::mem::size_of::<Value>()).and_then(|bytes| bytes.checked_add(512))
             .ok_or_else(|| invalid("aggregate-size", "Percentile results exceed addressable memory"))?;
         let mut reservation = memory.reserve(bytes)?;
-        let gather = kind == PercentileKind::Discrete && direct_rank_type(&output.data_type);
+        let typed = PercentileKey::bind(&input_type, &self.batches,
+            Arc::get_mut(&mut reservation).expect("The percentile aggregate owns its result reservation"))?;
+        let copy_typed = kind == PercentileKind::Discrete && typed.is_some()
+            && without_nullability(&input_type) == without_nullability(&output.data_type);
+        let gather = kind == PercentileKind::Discrete && (copy_typed || direct_rank_type(&output.data_type));
         let mut values = Vec::with_capacity(if kind == PercentileKind::Discrete && !gather { groups } else { 0 });
         let mut picks = Vec::with_capacity(if gather { groups } else { 0 });
         let mut interpolated = Vec::with_capacity(if kind == PercentileKind::Continuous { groups } else { 0 });
         let batches = Arc::new(self.batches);
         let mut positions = self.groups.into_iter();
         let read = |(batch, row): (usize, usize)| Rows { batch: &batches[batch], projected: self.projected, memory }.value(row, Some(0));
+        let source = |(batch, row): (usize, usize)| (&batches[batch].columns[0], row);
         let read_number = |position: (usize, usize)| -> Result<f64> {
-            let (batch, row) = position;
-            let column = &batches[batch].columns[0];
+            if let Some((PercentileKey::Decimal, _)) = &typed {
+                return PercentileKey::decimal(source(position));
+            }
+            let (column, row) = source(position);
             match ScalarKey::read(column, row) {
                 Some(ScalarKey::Signed(value)) => return Ok(value as f64),
                 Some(ScalarKey::Float(value)) => return Ok(value),
@@ -871,6 +981,9 @@ impl CollectionVectors {
                 let key = |(batch, row): (usize, usize)| ScalarKey::read(&batches[batch].columns[0], row);
                 let indices = crate::sort::sort_ordinals(rows.len(), context, |left, right| {
                     let (left, right) = if descending { (rows[right], rows[left]) } else { (rows[left], rows[right]) };
+                    if let Some((key, _)) = &typed {
+                        return key.compare(source(left), source(right));
+                    }
                     if let (Some(left), Some(right)) = (key(left), key(right))
                         && let Some(order) = left.ordered_compare(right) { return Ok(order); }
                     rtdb_expr::ordered_compare_in_timezone(read(left)?.as_ref(), read(right)?.as_ref(), false, &context.timezone)
@@ -878,6 +991,12 @@ impl CollectionVectors {
                 (rows[indices.values[low as usize]], rows[indices.values[high as usize]])
             };
             if gather {
+                if copy_typed {
+                    context.check_cancelled()?;
+                    if matches!(&typed, Some((PercentileKey::Decimal, _))) {
+                        ranked_arrow_cell(source(lower)).validate_decimal_precision()?;
+                    }
+                }
                 picks.push(Some(lower));
                 continue;
             }
@@ -900,6 +1019,10 @@ impl CollectionVectors {
             let lease = Arc::get_mut(&mut reservation).expect("The percentile aggregate owns its result reservation");
             lease.grow_to(lease.bytes().checked_add(value.retained_bytes()?).ok_or_else(|| invalid("aggregate-size", "Percentile output overflow"))?)?;
             values.push(value);
+        }
+        if copy_typed {
+            let (_, field) = typed.expect("A typed percentile result has a field");
+            return copy_ranked_cells(&batches, &picks, field, memory);
         }
         if gather {
             return crate::columnar::gather_nullable_column(|batch| &batches[batch], &picks, 0, memory);

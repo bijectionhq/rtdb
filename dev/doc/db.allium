@@ -2460,7 +2460,9 @@ surface QueryAccess {
         -- Aggregate DISTINCT indexes its selected argument positions within each group and retains arguments whose SQL equality is unknown.
         -- A sparsely retained typed DISTINCT argument page can compact to the positions that entered the index.
         -- List aggregates collect selected Arrow positions after applying filters and distinctness, and sort Arrow keys in memory when the aggregate specifies an order.
-        -- Percentile aggregates order each group's selected positions through the spilling sort path and read the ranked arguments from their source vectors.
+        -- Percentile aggregates order each group's selected nonnull positions in memory or through the spilling sort path.
+        -- Compatible fixed-width percentile keys can be compared at their Arrow positions.
+        -- Discrete percentiles can copy compatible fixed-width winners directly to nullable Arrow results, with the selected values' exact types and bits.
         -- Continuous percentiles interpolate compatible numeric operands into a nullable Arrow result.
         -- A compatible scalar membership join indexes the build key vectors and appends nullable Boolean marks to the probe batches.
         -- Scalar membership uses the raw vector hash to select candidates before comparing them.

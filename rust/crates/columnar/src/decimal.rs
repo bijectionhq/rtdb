@@ -30,7 +30,17 @@ pub fn validate_projected_decimals(field: &Field, array: &dyn Array) -> Result<(
         if cell.is_null()? { return Ok(()); }
         if let Some(mut children) = cell.structure() { return children.try_for_each(validate); }
         if let Some(mut children) = cell.sequence() { return children.try_for_each(validate); }
-        let Some((parameters, mut coefficient)) = cell.decimal_coefficient()? else { return Ok(()); };
+        cell.validate_decimal_precision()
+    }
+
+    if !has_decimal(field.data_type()) { return Ok(()); }
+    (0..array.len()).try_for_each(|row| validate(ArrowCell { field, array, row }))
+}
+
+impl ArrowCell<'_> {
+    /// Applies the computed-output precision check to the reached decimal cell.
+    pub fn validate_decimal_precision(self) -> Result<()> {
+        let Some((parameters, mut coefficient)) = self.decimal_coefficient()? else { return Ok(()); };
         let width = usize::from(parameters.bit_width / 8);
         let start = coefficient.len() - width;
         let sign = if coefficient[start] & 0x80 == 0 { 0 } else { 0xff };
@@ -41,9 +51,6 @@ pub fn validate_projected_decimals(field: &Field, array: &dyn Array) -> Result<(
             Err(precision_error())
         }
     }
-
-    if !has_decimal(field.data_type()) { return Ok(()); }
-    (0..array.len()).try_for_each(|row| validate(ArrowCell { field, array, row }))
 }
 
 pub(crate) fn precision_bound(precision: i32) -> Option<i256> {
