@@ -349,6 +349,9 @@ pub struct LiveTable {
 #[derive(Clone, Debug, Default)]
 struct LiveRelation {
     batches: imbl::Vector<(u32, Arc<IndexBatch>)>,
+    /// Each batch's start row, in batch order. Every trie comparison looks a row up, and a binary search over
+    /// contiguous starts costs a fraction of one that indexes the persistent vector at each step.
+    starts: Arc<Vec<u32>>,
     retained_bytes: u64,
 }
 
@@ -376,8 +379,8 @@ impl LiveRelation {
     }
     /// The last batch starting at or before `row`, and `row`'s offset in it.
     fn last_started(&self, row: u32) -> Option<(usize, u32)> {
-        let index = self.partition_point(|(start, _)| *start <= row).checked_sub(1)?;
-        Some((index, row - self.batches[index].0))
+        let index = self.starts.partition_point(|start| *start <= row).checked_sub(1)?;
+        Some((index, row - self.starts[index]))
     }
     fn push(&mut self, mut start: u32, mut batch: Arc<IndexBatch>, pack: bool) {
         if pack {
@@ -386,11 +389,13 @@ impl LiveRelation {
                 start = *previous_start;
                 self.retained_bytes -= previous.retained_bytes();
                 self.batches.pop_back();
+                Arc::make_mut(&mut self.starts).pop();
                 batch = joined;
             }
         }
         self.retained_bytes += batch.retained_bytes();
         self.batches.push_back((start, batch));
+        Arc::make_mut(&mut self.starts).push(start);
     }
 }
 
@@ -2856,6 +2861,7 @@ mod chunk_tests {
         let rows = &live.tables()[&table];
         assert_eq!(rows.row_count(), 1000);
         assert!(rows.relation.len() <= 14);
+        assert_eq!(*rows.relation.starts, rows.relation.iter().map(|(start, _)| *start).collect::<Vec<_>>());
         assert!(live.live_batch_bytes() < 4_096 * 1000);
         for id in 0..1000u32 {
             assert_eq!(rows.header(id).unwrap().system_from, Timestamp(i64::from(id)));
@@ -2863,6 +2869,7 @@ mod chunk_tests {
         let saved = saved.unwrap();
         let prior = &saved.tables()[&table];
         assert_eq!(prior.row_count(), 100);
+        assert_eq!(*prior.relation.starts, prior.relation.iter().map(|(start, _)| *start).collect::<Vec<_>>());
         for id in 0..100u32 {
             assert_eq!(prior.header(id).unwrap(), rows.header(id).unwrap());
         }
