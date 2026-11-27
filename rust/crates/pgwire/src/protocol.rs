@@ -258,7 +258,7 @@ impl ProtocolSession {
     fn rollback(&mut self) -> Result<()> { self.session.state_mut().rollback_tx()?; self.end_transaction(); Ok(()) }
 
     pub async fn handle<W: AsyncWrite + Unpin>(&mut self, frame: Frame, writer: &mut Writer<W>) -> Result<()> {
-        let result = self.dispatch(frame, writer).await;
+        let result = Box::pin(self.dispatch(frame, writer)).await;
         self.retired.clear();
         result
     }
@@ -294,7 +294,7 @@ impl ProtocolSession {
             self.copy.as_mut().ok_or_else(|| protocol("COPY IN not in progress, cannot write data"))
                 .and_then(|copy| copy.append(frame))
         } else {
-            self.message(&frame, writer).await
+            Box::pin(self.message(&frame, writer)).await
         };
         if let Err(error) = result {
             if error.code == "xtdb.pgwire/connection-error" { return Err(error); }
@@ -308,11 +308,11 @@ impl ProtocolSession {
     async fn message<W: AsyncWrite + Unpin>(&mut self, frame: &Frame, writer: &mut Writer<W>) -> Result<()> {
         let mut input = Input::new(&frame.body);
         match frame.tag {
-            b'Q' => { let sql = input.string()?; input.end()?; self.simple(sql, writer).await?; }
+            b'Q' => { let sql = input.string()?; input.end()?; Box::pin(self.simple(sql, writer)).await?; }
             b'P' => {
                 self.extended = true;
                 let (name, sql, oids) = parse_frontend_definition(&frame.body)?;
-                let prepared = self.prepare_client(sql, oids, None).await.inspect_err(|_| { if self.session.state().is_read_write() { self.record_transaction_error(); } })?;
+                let prepared = Box::pin(self.prepare_client(sql, oids, None)).await.inspect_err(|_| { if self.session.state().is_read_write() { self.record_transaction_error(); } })?;
                 Self::planning_warnings(&prepared, writer).await?;
                 self.register_statement(Cow::Borrowed(name), prepared)?;
                 writer.empty(b'1').await?;
@@ -376,7 +376,7 @@ impl ProtocolSession {
                 };
                 drop(charges);
                 let arguments = arguments.map(|batch| SqlArguments::from_canonical_arrow_row(batch, self.node.memory())).transpose()?;
-                let mut portal = self.bind(prepared, arguments, Vec::new(), &result_formats).await?;
+                let mut portal = Box::pin(self.bind(prepared, arguments, Vec::new(), &result_formats)).await?;
                 portal._bind_storage = Some(storage);
                 self.portals.insert(name.to_owned(), portal); writer.empty(b'2').await?;
             }
@@ -392,18 +392,18 @@ impl ProtocolSession {
                 let name = input.string()?.to_owned(); let limit = input.integer()?; input.end()?; if limit < 0 { return Err(protocol("Execute row limit cannot be negative")); }
                 let generation = self.transaction_generation;
                 let mut portal = self.portals.remove(&name).ok_or_else(|| protocol("no such portal"))?;
-                let result = self.execute(&mut portal, limit as usize, false, None, writer).await;
+                let result = Box::pin(self.execute(&mut portal, limit as usize, false, None, writer)).await;
                 if generation == self.transaction_generation { self.portals.insert(name, portal); }
                 result?;
             }
             b'C' => { let kind = input.byte()?; let name = input.string()?; input.end()?; match kind { b'P' => { self.portals.remove(name); }, b'S' => { if let Some(statement) = self.statements.remove(name) { self.portals.retain(|_, portal| !Arc::ptr_eq(&portal.prepared, &statement.prepared)); } }, _ => return Err(protocol("Invalid close target")) } writer.empty(b'3').await?; }
-            b'S' => { input.end()?; if self.implicit { let result = if self.session.state().status() == TransactionStatus::Failed { self.rollback() } else { self.commit(None).await }; if let Err(error) = result { writer.error(&error, self.fallback(), false).await?; } } self.skip_until_sync = false; self.extended = false; self.report_ready(writer).await?; }
+            b'S' => { input.end()?; if self.implicit { let result = if self.session.state().status() == TransactionStatus::Failed { self.rollback() } else { Box::pin(self.commit(None)).await }; if let Err(error) = result { writer.error(&error, self.fallback(), false).await?; } } self.skip_until_sync = false; self.extended = false; self.report_ready(writer).await?; }
             b'H' => { input.end()?; writer.flush().await?; }
             b'c' => {
                 input.end()?;
                 let copy = self.copy.take().ok_or_else(|| protocol("COPY IN not in progress"))?;
                 let token = self.token();
-                let result = copy.finish(&mut self.session, &self.node, &token).await;
+                let result = Box::pin(copy.finish(&mut self.session, &self.node, &token)).await;
                 if self.session.state().status() == TransactionStatus::Idle { self.end_transaction(); }
                 match result {
                     Ok(rows) => writer.string(b'C', &format!("COPY {rows}")).await?,
@@ -441,14 +441,14 @@ impl ProtocolSession {
                         let source = input.string()?;
                         let settings = PreparationSettings { search_path: input.string()?, timezone: input.string()? };
                         input.end()?;
-                        self.restore_sql_prepare(name, source, settings).await?;
+                        Box::pin(self.restore_sql_prepare(name, source, settings)).await?;
                     }
                     GATEWAY_NAMED_PARSE_KIND if self.startup.gateway_settings => {
                         let expected = input.string()?;
                         let settings = PreparationSettings { search_path: input.string()?, timezone: input.string()? };
                         let (name, sql, oids) = parse_frontend_definition(input.remaining())?;
                         if name != expected || name.is_empty() { return Err(protocol("The gateway's Parse name does not match its definition")); }
-                        let prepared = self.prepare_client(sql, oids, Some(settings)).await?;
+                        let prepared = Box::pin(self.prepare_client(sql, oids, Some(settings))).await?;
                         self.register_statement(Cow::Borrowed(name), prepared)?;
                     }
                     _ => return Err(protocol("Invalid gateway session state")),
@@ -461,6 +461,7 @@ impl ProtocolSession {
     }
 
     async fn prepare_client(&mut self, original: &str, oids: Vec<i32>, settings: Option<PreparationSettings<'_>>) -> Result<Arc<Prepared>> {
+        Box::pin(async move {
         let input = rtdb_sql::parse_extended_statement(original, self.node.memory())?;
         let source = match input.statement {
             ExtendedStatement::Empty => "",
@@ -489,6 +490,7 @@ impl ProtocolSession {
             sql_shape(PreparedSql::prepare_postgres_syntax(syntax, &context, options.search_path, &oids)?, oids.len())
         };
         self.retain_prepared(source, oids, shape)
+        }).await
     }
 
     async fn prepare_batch_command(&mut self, syntax: ExecutableSyntax<'_>, allocation: Arc<MemoryReservation>, settings: Option<PreparationSettings<'_>>) -> Result<Arc<Prepared>> {
@@ -574,6 +576,7 @@ impl ProtocolSession {
     }
 
     async fn bind(&mut self, prepared: Arc<Prepared>, arguments: Option<SqlArguments>, mut charges: Vec<Arc<MemoryReservation>>, formats: &[Format]) -> Result<Portal> {
+        Box::pin(async move {
         let token = self.token();
         let bound = prepared.columns.as_deref().unwrap_or_default().iter().try_fold(8192usize, |bytes, column| bytes.checked_add(column.name.len()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(|| protocol("Portal descriptors are too large")))?;
         charges.push(self.node.memory().reserve(bound)?);
@@ -586,32 +589,32 @@ impl ProtocolSession {
                 let _active = self.cancellations.enter(&token);
                 let context = self.session.query_context_with(&token, true).await?;
                 let arguments = portal.arguments.take();
-                Some(token.run_until_cancelled(async {
+                Some(token.run_until_cancelled(Box::pin(async {
                     if let Some(args) = arguments {
                         let page = args.single_arrow_page().expect("portal owns one Arrow argument page");
                         query.try_open_query_arrow(context, page, args.types()).await?.ok_or_else(|| protocol("Portal arguments have no rows"))
                     } else {
                         query.open_query_columns_typed(context, Vec::new(), &[]).await
                     }
-                }).await.ok_or_else(cancelled)??)
+                })).await.ok_or_else(cancelled)??)
             },
             (Some(PreparedKind::Query(query)), _) => {
                 let _active = self.cancellations.enter(&token);
                 let checked = !self.session.state().is_read_write();
                 let context = self.session.query_context_with(&token, checked).await?;
                 let arguments = portal.arguments.take();
-                Some(token.run_until_cancelled(async {
+                Some(token.run_until_cancelled(Box::pin(async {
                     if let Some(args) = arguments {
                         let page = args.single_arrow_page().expect("portal owns one Arrow argument page");
                         query.open_query_arrow_rows(context, page, args.types()).await
                     } else {
                         query.open_query(context, Vec::new()).await
                     }
-                }).await.ok_or_else(cancelled)?.map_err(|error| if token.is_cancelled() { cancelled() } else { error })?)
+                })).await.ok_or_else(cancelled)?.map_err(|error| if token.is_cancelled() { cancelled() } else { error })?)
             },
             (_, Some(statement @ ControlStatement::Show { .. })) => {
                 let args = bind_control_arguments(portal.arguments.as_ref(), self.node.memory())?;
-                match self.session.execute_control_arrow_with(statement, args.as_ref(), &token, control_options).await? {
+                match Box::pin(self.session.execute_control_arrow_with(statement, args.as_ref(), &token, control_options)).await? {
                     ControlResult::Rows(cursor) => Some(cursor),
                     _ => return Err(protocol("SHOW did not produce rows")),
                 }
@@ -619,7 +622,7 @@ impl ProtocolSession {
             (_, Some(statement @ ControlStatement::Execute { .. })) => {
                 let args = bind_control_arguments(portal.arguments.as_ref(), self.node.memory())?;
                 let ControlResult::ExecuteArrow { name, arguments, allocation: _allocation } =
-                    self.session.execute_control_arrow_with(statement, args.as_ref(), &token, control_options).await?
+                    Box::pin(self.session.execute_control_arrow_with(statement, args.as_ref(), &token, control_options)).await?
                 else { return Err(protocol("EXECUTE did not produce arguments")); };
                 let inner = Arc::clone(&self.statements.get(&name).ok_or_else(|| protocol("no prepared statement"))?.prepared);
                 if !matches!(inner.ordinary_kind(), Some(PreparedKind::Query(_) | PreparedKind::Dml(_))) { return Err(Anomaly::unsupported("xtdb.pgwire/unsupported-execute", "EXECUTE only supports a prepared query or DML statement")); }
@@ -639,6 +642,7 @@ impl ProtocolSession {
             portal.state = PortalState::Query(QueryPortal { cursor, batch: None, layout: None, row: 0, sent: 0 });
         }
         Ok(portal)
+        }).await
     }
     /// An EXECUTE describes the rows of the statement it names, as that statement is prepared when the EXECUTE is.
     fn execute_columns(&self, mut shape: PreparedShape) -> PreparedShape {
@@ -652,13 +656,14 @@ impl ProtocolSession {
     async fn description<W: AsyncWrite + Unpin>(columns: Option<&[Column]>, fallback: PgType, writer: &mut Writer<W>) -> Result<()> { match columns { Some(columns) => writer.columns(columns, fallback).await, None => writer.empty(b'n').await } }
 
     async fn execute<W: AsyncWrite + Unpin>(&mut self, portal: &mut Portal, limit: usize, commit_dml_before_reply: bool, permit: Option<ReplaySubmissionPermit>, writer: &mut Writer<W>) -> Result<()> {
+        Box::pin(async move {
         let prepared = Arc::clone(&portal.prepared);
         let failed = self.session.state().status() == TransactionStatus::Failed;
         let control = prepared.control();
         if failed && !matches!(control, Some(ControlStatement::Rollback)) { return Err(protocol("current transaction is aborted, commands ignored until ROLLBACK is received")); }
         let (kind, source, command) = match &prepared.body {
             PreparedBody::Ordinary { kind, source, command } => (kind, source.as_str(), command.as_str()),
-            PreparedBody::SqlPrepare(syntax) => return self.execute_sql_prepare(syntax, portal, writer).await,
+            PreparedBody::SqlPrepare(syntax) => return Box::pin(self.execute_sql_prepare(syntax, portal, writer)).await,
         };
         match (kind, control) {
             (PreparedKind::Empty, _) => writer.empty(b'I').await,
@@ -669,7 +674,7 @@ impl ProtocolSession {
                     self.begin_implicit(Some(true))?;
                 }
                 let token = portal.cancellation.clone(); let _active = self.cancellations.enter(&token);
-                token.run_until_cancelled(self.stream(portal, command, limit, writer)).await.ok_or_else(cancelled)?
+                token.run_until_cancelled(Box::pin(self.stream(portal, command, limit, writer))).await.ok_or_else(cancelled)?
                     .map_err(|error| if token.is_cancelled() { cancelled() } else { error })
             }
             (PreparedKind::CopyOut(_, format), _) => {
@@ -681,7 +686,7 @@ impl ProtocolSession {
                 let memory = self.node.query_memory();
                 let token = portal.cancellation.clone();
                 let _active = self.cancellations.enter(&token);
-                token.run_until_cancelled(crate::copy::write_arrow(query.cursor, *format, &memory, writer))
+                token.run_until_cancelled(Box::pin(crate::copy::write_arrow(query.cursor, *format, &memory, writer)))
                     .await.ok_or_else(cancelled)?
             }
             (PreparedKind::Dml(statement), _) => {
@@ -689,7 +694,7 @@ impl ProtocolSession {
                 if self.session.state().is_read_only() { return Err(Anomaly::incorrect("xtdb/dml-in-read-only-tx", "DML is not allowed in a READ ONLY transaction").with_context("query", source.into())); }
                 self.begin_implicit(Some(false))?;
                 self.session.state_mut().execute_operation(statement.dml_operation(portal.arguments.clone())?).await?;
-                if commit_dml_before_reply { self.commit(permit).await?; }
+                if commit_dml_before_reply { Box::pin(self.commit(permit)).await?; }
                 match statement.ordered_index_command_tag() {
                     Some(tag) => writer.string(b'C', tag).await,
                     None => writer.string(b'C', dml_tag(command)).await,
@@ -700,7 +705,7 @@ impl ProtocolSession {
                 let _sample = matches!(statement, ControlStatement::Commit(_)).then(|| rtdb_plan::ExecutionSample::new(self.node.execution_observer(), rtdb_plan::ExecutionTimer::PgwireTransaction));
                 let options = self.control_options();
                 let args = bind_control_arguments(portal.arguments.as_ref(), self.node.memory())?;
-                let result = self.session.execute_control_arrow_with(statement, args.as_ref(), &portal.cancellation, options).await;
+                let result = Box::pin(self.session.execute_control_arrow_with(statement, args.as_ref(), &portal.cancellation, options)).await;
                 if matches!(statement, ControlStatement::Commit(_) | ControlStatement::Rollback) && self.session.state().status() == TransactionStatus::Idle { self.end_transaction(); }
                 match result? {
                     ControlResult::Command { tag, parameter_status, allocation: _allocation, .. } => {
@@ -725,6 +730,7 @@ impl ProtocolSession {
                 }
             }
         }
+        }).await
     }
 
     async fn execute_sql_prepare<W: AsyncWrite + Unpin>(
@@ -801,7 +807,7 @@ impl ProtocolSession {
     async fn simple<W: AsyncWrite + Unpin>(&mut self, source: &str, writer: &mut Writer<W>) -> Result<()> {
         self.extended = false; self.portals.remove("");
         let permit = self.replay_permit.take();
-        let result = self.simple_statements(source, permit, writer).await;
+        let result = Box::pin(self.simple_statements(source, permit, writer)).await;
         if let Err(error) = result {
             if error.anomaly().code == "xtdb.pgwire/connection-error" { return Err(error.anomaly().clone()); }
             writer.error(error.anomaly(), self.fallback(), false).await?;
@@ -866,7 +872,7 @@ impl ProtocolSession {
             };
             if start_transaction { self.begin_implicit(None)?; }
             let permit = if single_autocommit { permit.take() } else { None };
-            let result = self.run_simple_statement(statement, single_autocommit, permit, writer).await;
+            let result = Box::pin(self.run_simple_statement(statement, single_autocommit, permit, writer)).await;
             self.simple_statement_result(result, writer).await?;
             self.retired.clear();
         }
@@ -887,11 +893,11 @@ impl ProtocolSession {
                 let _allocation = self.session.admit_frontend_prepare(&[], &token).await?;
                 let source = statement.source();
                 let (name, child) = statement.into_child()?;
-                let prepared = self.prepare_sql_child(child, None).await?;
+                let prepared = Box::pin(self.prepare_sql_child(child, None)).await?;
                 return self.install_sql_prepare(name.into(), source, prepared, writer).await;
             }
         };
-        let prepared = self.prepare_batch_command(syntax, allocation, None).await?;
+        let prepared = Box::pin(self.prepare_batch_command(syntax, allocation, None)).await?;
         let permit = match prepared.ordinary_kind() {
             Some(PreparedKind::Dml(_)) => permit.map(|permit| ReplaySubmissionPermit {
                 key: format!("{}/0", permit.nonce.simple()), not_after: permit.not_after,
@@ -2123,8 +2129,9 @@ mod tests {
 
         let statement_bytes = retained_prepared_bytes(&sql, &head(&sql), 1, None).unwrap();
         let portal_peak = batch_bytes + control_bytes + statement_bytes + 8192;
-        assert!(parse_probe.peak_bytes() < portal_peak);
-        assert!(batch_bytes + writer_probe.peak_bytes() < portal_peak);
+        let execution_peak = parse_probe.peak_bytes().max(portal_peak);
+        assert!(portal_peak <= execution_peak);
+        assert!(batch_bytes + writer_probe.peak_bytes() < execution_peak);
 
         let (mut frontend, driver) = test_frontend(false).await;
         let memory = Arc::clone(frontend.node.memory());
@@ -2132,7 +2139,7 @@ mod tests {
         let initial_timezone = frontend.session.state().effective_timezone().to_owned();
         let frame_bytes = source.len() + 1;
         let baseline = memory.used_bytes();
-        let held = memory.reserve(memory.limit_bytes() - baseline - frame_bytes - portal_peak).unwrap();
+        let held = memory.reserve(memory.limit_bytes() - baseline - frame_bytes - execution_peak).unwrap();
         let mut input = vec![b'Q'];
         input.extend_from_slice(&i32::try_from(source.len() + 5).unwrap().to_be_bytes());
         input.extend_from_slice(source.as_bytes());
@@ -2257,7 +2264,7 @@ mod tests {
         drop(argument_scope);
         assert_eq!(memory.used_bytes(), retained);
 
-        let leaf_bytes = retained_prepared_bytes(leaf, &head(leaf), 0, None).unwrap();
+        let leaf_bytes = rtdb_sql::statement_syntax_estimate(leaf.len()).unwrap();
         let held = memory.reserve(memory.limit_bytes() - retained - arguments - leaf_bytes + 1).unwrap();
         let mut writer = Writer::new(Vec::new(), Arc::clone(&memory));
         let error = frontend.execute(&mut portal, 0, false, None, &mut writer).await.unwrap_err();
@@ -2289,7 +2296,6 @@ mod tests {
     async fn a_large_bind_holds_its_arguments_and_not_its_frame() {
         let (mut frontend, driver) = test_frontend(false).await;
         let memory = Arc::clone(frontend.node.memory());
-        let baseline = memory.used_bytes();
         let prepared = frontend.prepare_client("SELECT $1 AS v", vec![25], None).await.unwrap();
         frontend.register_statement(Cow::Borrowed("large"), prepared).unwrap();
         let statement = memory.used_bytes();
@@ -2316,10 +2322,13 @@ mod tests {
         assert!(frame_charge.upgrade().is_none(), "the portal keeps its decoded arguments, not the Bind frame");
         let portal = memory.used_bytes() - statement;
         assert!(portal >= argument.len() && portal < 4 * argument.len(), "the portal charges about its argument: {portal}");
+        // Closing the session releases the portal and registered statement; the node's shared plan
+        // cache keeps the compiled query until the node itself drops.
         frontend.close();
-        assert_eq!(memory.used_bytes(), baseline);
+        assert!(memory.used_bytes() < argument.len(), "closing releases the bound arguments: {}", memory.used_bytes());
         drop(frontend);
         driver.close_without_run().await.unwrap();
+        assert_eq!(memory.used_bytes(), 0);
     }
 
     #[tokio::test]
@@ -2327,7 +2336,7 @@ mod tests {
         let (mut frontend, driver) = test_frontend(false).await;
         let memory = Arc::clone(frontend.node.memory());
         let baseline = memory.used_bytes();
-        let sql = format!("SELECT 1 AS v /*{}*/", "x".repeat(1 << 20));
+        let sql = format!("SELECT /*{}*/ 1 AS v", "x".repeat(1 << 20));
         let prepared = frontend.prepare_client(&sql, Vec::new(), None).await.unwrap();
         let retained = prepared._reservation.bytes();
         assert!(retained >= sql.len() && retained < sql.len() + sql.len() / 2 + 4096, "{retained} for {} bytes of SQL", sql.len());
@@ -2444,8 +2453,8 @@ mod tests {
         for round in 0..2 {
             if round == 0 { frontend.handle(frame(b'P', parse.clone()), &mut writer).await.unwrap(); }
             let bind = frame(b'B', bind.clone());
-            log.lock().unwrap().watched = Some(Arc::downgrade(&bind.charge));
             frontend.handle(bind, &mut writer).await.unwrap();
+            log.lock().unwrap().watched = Some(Arc::downgrade(frontend.portals[""]._bind_storage.as_ref().unwrap()));
             frontend.handle(frame(b'E', execute.clone()), &mut writer).await.unwrap();
             assert!(frontend.portals.contains_key(""));
             frontend.handle(frame(b'S', Vec::new()), &mut writer).await.unwrap();

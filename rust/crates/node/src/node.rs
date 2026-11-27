@@ -303,7 +303,7 @@ impl Node {
     /// The budget limit must equal `options.execution_memory_bytes`.
     pub async fn open_with_memory(options: NodeOptions, services: NodeServices, memory: Arc<MemoryBudget>) -> Result<(Self, NodeDriver)> {
         let resources = Arc::clone(&services.resources);
-        match Self::open_region(options, services, memory).await {
+        match Box::pin(Self::open_region(options, services, memory)).await {
             Ok(opened) => Ok(opened),
             Err(error) => match resources.close().await { Ok(()) => Err(error), Err(close) => Err(error.with_context("resource-close-error", close.to_string().into())) },
         }
@@ -1375,7 +1375,7 @@ impl NodeDriver {
                 command = self.commands.recv() => match command {
                     Some(command) => {
                         let token = self.node.run.token.clone();
-                        if token.run_until_cancelled(self.command(command, &mut tasks)).await.is_none() { break; }
+                        if token.run_until_cancelled(Box::pin(self.command(command, &mut tasks))).await.is_none() { break; }
                     }
                     None => break,
                 },

@@ -445,6 +445,7 @@ impl DatabaseFactory {
         self.external_sources.get(name).cloned().ok_or_else(|| Anomaly::incorrect("xtdb.db-catalog/invalid-db-config", format!("No native external-source factory is registered for {}", source.type_url)))
     }
     pub async fn open(&self, name: String, configuration: DatabaseConfig, catalog: Arc<DatabaseCatalog>, commands: mpsc::Sender<CatalogCommand>, parent: &CancellationToken) -> Result<OpenedDatabase> {
+        Box::pin(async move {
         self.validate(&name, &configuration)?;
         let default_restore = crate::node::default_restore::read_install(&name, &configuration)?;
         if default_restore.is_some() && (!self.resources.supports_default_local_restore() || !self.options.replication.enabled) {
@@ -463,7 +464,7 @@ impl DatabaseFactory {
         let checkpoint_metadata = resources.checkpoint_metadata.take();
         let recovery_storage = Arc::clone(&resources.store);
         let local_recovery = recovery_storage.local_maintenance_store().filter(|store| store.defers_trie_releases());
-        let assembly = async {
+        let assembly = Box::pin(async {
             let storage = Arc::new(BufferPool::with_metadata_budget(Arc::clone(&resources.store), Arc::clone(&self.cache), Arc::clone(&self.memory)));
             let blocks = BlockStore::new(Arc::clone(&resources.store), Arc::clone(&storage), Arc::clone(&self.memory), self.options.file_size_target)?;
             let recovered = blocks.recover(self.options.trie, SourcePosition(-1), self.clock.now(), resources.blocks).await?;
@@ -695,7 +696,7 @@ impl DatabaseFactory {
             let driver = DatabaseDriver { database: Arc::clone(&database), replication: replica_driver, compactor,
                 artefacts: artefact_drivers, live_artefacts, supervisor, logs: opened_logs.drivers, log_cancellation };
             Ok(OpenedDatabase { database, driver, secondaries })
-        };
+        });
         let opened = async {
             let hold = match (checkpoint_metadata, local_recovery) {
                 (Some(hold), _) => Some(hold),
@@ -709,6 +710,7 @@ impl DatabaseFactory {
         }.await;
         if opened.is_err() { io.close_and_wait().await; }
         opened
+        }).await
     }
 }
 

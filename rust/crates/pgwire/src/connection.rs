@@ -30,7 +30,7 @@ impl ConnectionDriver {
         let _region = memory.reserve(32 * 1024)?;
         let mut stream = Some(self.stream);
         let startup = self.cancellation.run_until_cancelled(tokio::time::timeout(self.config.authentication_timeout,
-            startup(self.process, &mut stream, self.address, self.encrypted, &self.node, &self.auth, &self.config, &self.registry, &self.cancellation))).await;
+            Box::pin(startup(self.process, &mut stream, self.address, self.encrypted, &self.node, &self.auth, &self.config, &self.registry, &self.cancellation)))).await;
         let (session, settings) = match startup {
             None | Some(Err(_)) | Some(Ok(Ok(None))) => return Ok(()),
             Some(Ok(Err(error))) => { if let Some(stream) = &mut stream { let mut writer = Writer::new(stream, Arc::clone(&memory)); let send = writer.error(&error, PgType::Json, error.context.get("sql-state").and_then(serde_json::Value::as_str) == Some("3D000")); let _ = tokio::time::timeout(std::time::Duration::from_secs(1), self.cancellation.run_until_cancelled(send)).await; } return Err(error); },
