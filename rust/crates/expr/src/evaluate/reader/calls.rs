@@ -499,6 +499,12 @@ pub(super) fn apply<'a>(function: ResolvedFunction<'a>, mut values: Vec<EvalValu
             }
             _ => {}
         }
+        if let [EvalValue::Scalar(value)] = values.as_slice()
+            && matches!(function, ResolvedFunction::Known(ScalarFunction::Floor | ScalarFunction::Ceil | ScalarFunction::Ceiling))
+        {
+            let result = crate::functions::call_resolved(function, std::slice::from_ref(value), frame.context)?;
+            return from_value(result, frame);
+        }
         frame.context.reserve(values.len().checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?)?;
         let mut materialized = Vec::with_capacity(values.len());
         for value in values { materialized.push(materialize(value, frame)?.await?); }
@@ -516,6 +522,31 @@ mod tests {
     use super::*;
     use arrow_array::{Array, ListArray, types::Int64Type};
     use arrow_schema::Field;
+
+    #[tokio::test]
+    async fn scalar_floor_and_ceiling_borrow_the_reached_argument() {
+        let schema = Schema::default();
+        let context = EvalContext::default();
+        let frame = EvaluationFrame { schema: &schema, row: ExpressionRow::Values(&[]), context: &context,
+            asynchronous: true, replacements: None };
+        for (function, input, expected) in [
+            (ScalarFunction::Floor, Value::F32(-1.25), Value::F64(-2.0)),
+            (ScalarFunction::Ceil, Value::F64(-0.25), Value::F64(-0.0)),
+            (ScalarFunction::Ceiling, Value::Null, Value::Null),
+        ] {
+            let function = ResolvedFunction::Known(function);
+            let actual = apply(function, vec![scalar(input)], &frame).unwrap().await.unwrap();
+            match (actual, expected) {
+                (EvalValue::Scalar(Value::F64(actual)), Value::F64(expected)) => assert_eq!(actual.to_bits(), expected.to_bits()),
+                (EvalValue::Scalar(Value::Null), Value::Null) => (),
+                _ => panic!("Unexpected scalar result"),
+            }
+        }
+        let function = ResolvedFunction::Known(ScalarFunction::Floor);
+        let expected = crate::functions::call_resolved(function, &[Value::Bool(true)], &context).unwrap_err();
+        let actual = apply(function, vec![scalar(Value::Bool(true))], &frame).unwrap().await.err().unwrap();
+        assert_eq!((actual.code, actual.message), (expected.code, expected.message));
+    }
 
     struct BoundList {
         field: Field,

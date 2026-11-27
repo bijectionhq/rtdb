@@ -20,7 +20,7 @@ use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
 use arrow_schema::{DataType, Field as ArrowField};
 use rtdb_columnar::{CellReadCheck, MemoryBudget, MemoryReservation, copy_selected_cells, read_execution_value, read_execution_value_as};
 use rtdb_index::IndexBatch;
-use rtdb_plan::{CastTarget, Expr, Field};
+use rtdb_plan::{CastTarget, Expr, Field, UnaryOp};
 use rtdb_temporal::ResolvedRow;
 use rtdb_types::{ListKind, LogicalType, Result, ScalarType, Timestamp, Value};
 
@@ -4456,12 +4456,25 @@ mod tests {
             expr: Box::new(Expr::Literal(Value::Utf8(text.into()))),
             target: CastTarget::Fixed(LogicalType::Scalar(scalar)),
         };
+        let floor = |expr| Expr::Call { name: "floor".into(), args: vec![expr], return_type: LogicalType::Scalar(ScalarType::F64).maybe() };
         let nan = f64::from_bits(0x7ff8_0000_0000_0042);
         let doubles = case(vec![
-            (0, cast("-0.0", ScalarType::F64)),
+            (0, floor(cast("-0.0", ScalarType::F64))),
             (1, Expr::Literal(Value::F64(nan))),
             (1, cast("unreached double", ScalarType::F64)),
         ], Expr::Literal(Value::Null));
+        let floored = floor(case(vec![
+            (0, Expr::Literal(Value::F64(-1.25))),
+            (1, Expr::Literal(Value::F64(-0.0))),
+            (1, cast("unreached floor argument", ScalarType::F64)),
+        ], Expr::Literal(Value::Null)));
+        let double_type = LogicalType::Scalar(ScalarType::F64).maybe();
+        for expression in [&doubles, &floored] {
+            assert!(matches!(ProjectionValues::new(expression, &double_type, len), ProjectionValues::F64(_)));
+        }
+        let truth = Expr::Unary { op: UnaryOp::IsTrue, expr: Box::new(case(vec![(0, Expr::Literal(Value::Bool(true)))], Expr::Literal(Value::Null))) };
+        let bool_type = LogicalType::Scalar(ScalarType::Bool);
+        assert!(matches!(ProjectionValues::new(&truth, &bool_type, len), ProjectionValues::Bool(_)));
         let single_nan = f32::from_bits(0x7fc0_0042);
         let singles = case(vec![
             (0, cast("-0.0", ScalarType::F32)),
@@ -4481,10 +4494,12 @@ mod tests {
         let nulls = case(vec![(3, cast("unreached integer", ScalarType::I64))], Expr::Literal(Value::Null));
         let mixed = case(vec![(0, Expr::Literal(Value::I64(5)))], Expr::Literal(Value::F64(0.5)));
 
-        let mut cursor = BatchExpressions::new(input(len), schema.clone(), vec![doubles, singles, single_nulls, integers, nulls, mixed], execution.clone());
+        let mut cursor = BatchExpressions::new(input(len), schema.clone(), vec![doubles, floored, truth, singles, single_nulls, integers, nulls, mixed], execution.clone());
         let page = cursor.next_batch().await.unwrap().unwrap();
         let [
             Column::Arrow { array: doubles, field: double_field, logical: Some(double) },
+            Column::Arrow { array: floored, logical: Some(floored_type), .. },
+            Column::Arrow { array: truths, logical: Some(truth_type), .. },
             Column::Arrow { array: singles, field: single_field, logical: Some(single) },
             Column::Arrow { array: single_nulls, logical: Some(LogicalType::Null), .. },
             Column::Arrow { array: integers, field: integer_field, logical: Some(integer) },
@@ -4492,6 +4507,8 @@ mod tests {
             mixed,
         ] = page.columns.as_slice() else { panic!("Expected Arrow columns with observed nullability"); };
         assert_eq!(*double, LogicalType::Scalar(ScalarType::F64).maybe());
+        assert_eq!(*floored_type, double_type);
+        assert_eq!(*truth_type, bool_type);
         assert!(double_field.is_nullable());
         assert_eq!(*single, single_type);
         assert!(single_field.is_nullable());
@@ -4502,9 +4519,17 @@ mod tests {
         assert_eq!(nulls.data_type(), &DataType::Null);
         assert_eq!(nulls.len(), len);
         let doubles = doubles.as_any().downcast_ref::<Float64Array>().unwrap();
+        let floored = floored.as_any().downcast_ref::<Float64Array>().unwrap();
+        let truths = truths.as_any().downcast_ref::<BooleanArray>().unwrap();
         let singles = singles.as_any().downcast_ref::<Float32Array>().unwrap();
         let integers = integers.as_any().downcast_ref::<Int64Array>().unwrap();
-        for row in 0..len {
+        for (row, floor) in floored.iter().enumerate() {
+            assert_eq!(floor.map(f64::to_bits), match row % 3 {
+                0 => Some((-2.0_f64).to_bits()),
+                1 => Some((-0.0_f64).to_bits()),
+                _ => None,
+            });
+            assert_eq!(truths.value(row), row % 3 == 0);
             match row % 3 {
                 0 => {
                     assert!(!doubles.is_null(row));
@@ -4583,7 +4608,7 @@ mod tests {
                 (1, cast("first projection, second row", scalar.clone())),
                 (2, cast("first projection, third row", scalar)),
             ], Expr::Literal(zero));
-            let later_column = case(vec![(0, cast("second projection, first row", ScalarType::I64))], Expr::Literal(Value::I64(0)));
+            let later_column = floor(case(vec![(0, cast("second projection, first row", ScalarType::I64))], Expr::Literal(Value::I64(0))));
             let projections = vec![later_row, later_column];
             let mut cursor = BatchExpressions::new(input(0), schema.clone(), projections.clone(), execution.clone());
             assert_eq!(cursor.next_batch().await.unwrap().unwrap().len, 0);
@@ -5603,7 +5628,7 @@ impl BatchCursor for BatchExpressions {
             if let Some(fallbacks) = &mut self.scalar_fallbacks && batch.len != 0 {
                 *fallbacks = fallbacks.saturating_add(1);
             }
-            // Extra CASE shapes must leave at least as much room for row evaluation as the value buffer would.
+            // The bounded score writer must leave at least as much room for row evaluation as the value buffer would.
             if crate::cosine::has_score_output(expression, primitive_bound <= value_slots)
                 && let Some(column) = evaluate_score_column(&batch, &self.execution, &invocation, &scope, lease, primitive_bound).await?
             {
@@ -5621,7 +5646,7 @@ impl BatchCursor for BatchExpressions {
                 let value = self.execution.evaluate_invocation_row(
                     &scope, &invocation, rtdb_expr::ExpressionRow::Borrowed(&input),
                 ).await?;
-                // Keep the same per-row admission for typed CASEs so a tight budget fails at the same row.
+                // Keep the same per-row admission so a tight budget fails at the same row.
                 lease.grow_to(lease.bytes().checked_add(value.retained_bytes()?).ok_or_else(size_error)?)?;
                 values.push(value)?;
                 scope.reset()?;
@@ -5736,8 +5761,7 @@ impl ProjectionValues {
                 ScalarType::Bool | ScalarType::I8 | ScalarType::I16 | ScalarType::I32
                     | ScalarType::I64 | ScalarType::F32 | ScalarType::F64
             )
-                && matches!(expression, Expr::Case { .. } | Expr::SimpleCase { .. })
-                && fixed_case_result(expression, scalar)
+                && fixed_projection_result(expression, scalar)
         });
         match fixed {
             Some(ScalarType::Bool) => Self::Bool(BooleanBuilder::with_capacity(len)),
@@ -5768,7 +5792,7 @@ impl ProjectionValues {
             (Self::F32(values), Value::Null) => values.append_null(),
             (Self::F64(values), Value::F64(value)) => values.append_value(value),
             (Self::F64(values), Value::Null) => values.append_null(),
-            _ => return Err(rtdb_types::Anomaly::fault("rtdb.query/case-result", "CASE returned a value outside its fixed result type")),
+            _ => return Err(rtdb_types::Anomaly::fault("rtdb.query/scalar-result", "Projection returned a value outside its fixed result type")),
         }
         Ok(())
     }
@@ -5787,12 +5811,19 @@ impl ProjectionValues {
     }
 }
 
-fn fixed_case_result(expression: &Expr, scalar: &ScalarType) -> bool {
+fn fixed_projection_result(expression: &Expr, scalar: &ScalarType) -> bool {
     match expression {
         Expr::Case { branches, otherwise } | Expr::SimpleCase { branches, otherwise, .. } => {
             branches.iter().map(|(_, value)| value).chain([otherwise.as_ref()]).all(|value| {
-                stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || fixed_case_result(value, scalar))
+                stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || fixed_projection_result(value, scalar))
             })
+        }
+        Expr::Call { name, args, .. } if args.len() == 1 && *scalar == ScalarType::F64 => matches!(
+            rtdb_expr::kernels::Function::resolve(name),
+            Some(rtdb_expr::kernels::Function::Floor | rtdb_expr::kernels::Function::Ceil),
+        ),
+        Expr::Unary { op: UnaryOp::IsNull | UnaryOp::IsNotNull | UnaryOp::IsUnknown | UnaryOp::IsTrue | UnaryOp::IsFalse, .. } => {
+            *scalar == ScalarType::Bool
         }
         Expr::Literal(Value::Null) => true,
         Expr::Literal(Value::Bool(_)) => *scalar == ScalarType::Bool,

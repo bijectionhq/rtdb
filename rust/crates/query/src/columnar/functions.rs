@@ -416,6 +416,20 @@ impl Projection {
     pub(crate) fn bind(expr: &Expr, schema: &Schema) -> Option<Self> {
         if matches!(expr, Expr::Column { .. } | Expr::Literal(_) | Expr::Parameter { .. }) { return None; }
         Node::bind_vector(expr, schema, None).map(|(node, _)| Self(node))
+            .or_else(|| Self::bind_double_column_cast(expr, schema))
+    }
+
+    fn bind_double_column_cast(expr: &Expr, schema: &Schema) -> Option<Self> {
+        let Expr::Cast { expr: input, target: CastTarget::Fixed(LogicalType::Scalar(ScalarType::F64)) } = expr else { return None; };
+        if !matches!(input.as_ref(), Expr::Column { .. }) { return None; }
+        let declared = expr.data_type();
+        if VectorType::of(&declared)? != VectorType::F64 { return None; }
+        let (operand, kinds) = Node::bind_operand(input, schema, None)?;
+        if kinds.is_empty() || !kinds.iter().all(|kind| matches!(kind, predicate::CellKind::Int | predicate::CellKind::Float)) {
+            return None;
+        }
+        let kind = Kind::Double(|value| value, Box::new(operand));
+        Some(Self(Node { kind, declared }))
     }
 
     fn bind_with_parameters(expr: &Expr, schema: &Schema, parameters: &[Option<LogicalType>]) -> Option<Self> {
@@ -2088,6 +2102,60 @@ mod tests {
         assert_eq!(values.value(2).to_bits(), (-0.0_f64).to_bits());
         assert!(values.is_null(3));
         assert!(values.value(4).is_nan());
+    }
+
+    #[test]
+    fn cast_to_double_borrows_selected_numeric_layouts() {
+        use arrow_array::{Float32Array, RunArray};
+
+        let long = LogicalType::Scalar(ScalarType::I64);
+        let real = LogicalType::Scalar(ScalarType::F32);
+        let double = LogicalType::Scalar(ScalarType::F64);
+        let encoded_type = LogicalType::RunEndEncoded {
+            width: rtdb_types::RunEndWidth::I32,
+            value: Box::new(real.clone().maybe()),
+        };
+        let input = Field { data_type: LogicalType::from_legs([long.clone(), real, LogicalType::Null]), ..field(0) };
+        let schema = Schema::new(vec![input.clone()]).unwrap();
+        let source = |array: ArrayRef, logical: LogicalType| {
+            let field = Arc::new(rtdb_columnar::to_field("c0", &logical).unwrap());
+            Some((array, field, Some(logical), None))
+        };
+        let reals = RunArray::<Int32Type>::try_new(
+            &Int32Array::from(vec![2, 3, 5]),
+            &Float32Array::from(vec![Some(-0.0), None, Some(f32::from_bits(0x7fc0_0042))]),
+        ).unwrap().slice(1, 4);
+        let longs = Int64Array::from(vec![(1_i64 << 53) + 1, -7]);
+        let sources = vec![source(Arc::new(reals), encoded_type), source(Arc::new(longs), long), None];
+        let rows = Arc::new(vec![(1, 0), (0, 0), (2, 0), (0, 1), (0, 3), (1, 1)]);
+        let len = rows.len();
+        let input_budget = MemoryBudget::new(1 << 20);
+        let batch = ColumnBatch::settled(vec![Column::Selected(SelectedColumn::new(sources, rows))], len, input_budget.reserve(0).unwrap()).unwrap();
+        let cast = Expr::Cast { expr: Box::new(input.expression()), target: CastTarget::Fixed(double.clone()) };
+        let context = rtdb_expr::EvalContext::default();
+        let output_bound = len * size_of::<f64>() + PredicateSelection::bitmap_bound(len);
+        let budget = MemoryBudget::new(output_bound);
+        let Some(Column::Arrow { array, logical, .. }) = project(&cast, &schema, &batch, &budget).unwrap() else {
+            panic!("Expected Arrow doubles");
+        };
+        assert_eq!(logical, Some(double.maybe()));
+        let result = array.as_any().downcast_ref::<Float64Array>().unwrap();
+        for (row, actual) in result.iter().enumerate() {
+            let cell = batch.columns[0].value(row).unwrap();
+            let expected = rtdb_expr::evaluate(&cast, &schema, &[cell], &context).unwrap();
+            match expected {
+                Value::Null => assert_eq!(actual, None),
+                Value::F64(expected) => assert_eq!(actual.map(f64::to_bits), Some(expected.to_bits())),
+                value => panic!("Unexpected scalar result: {value:?}"),
+            }
+        }
+        let refused = MemoryBudget::new(output_bound - 1);
+        let error = project(&cast, &schema, &batch, &refused).err().expect("kernel output requires admission");
+        assert!(error.is(rtdb_types::AnomalyKind::ResourceExhausted));
+        assert_eq!(refused.used_bytes(), 0);
+
+        let division = Expr::binary(BinaryOp::Divide, cast, Expr::Literal(Value::F64(0.0)));
+        assert!(Projection::bind(&division, &schema).is_none());
     }
 
     #[test]
