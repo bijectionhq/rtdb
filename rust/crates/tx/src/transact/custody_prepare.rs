@@ -6,7 +6,6 @@ use super::{Cell, CustodyPayload, CustodyPlacement, CustodyPlacementCommitments,
 
 pub async fn prepare_custody(request: &mut Transact, vault: &CustodyVault) -> Result<()> {
     let fingerprint = request.logical_sha256()?;
-    request.custody_request_digest = Some(fingerprint);
     for action in request.ops.iter().chain(&request.otherwise) {
         if let Op::CreateCustodyGroup { group } = action {
             if let Err(error) = vault.create(*group).await
@@ -16,13 +15,22 @@ pub async fn prepare_custody(request: &mut Transact, vault: &CustodyVault) -> Re
             }
         }
     }
-    for (arm, actions) in [&mut request.ops, &mut request.otherwise].into_iter().enumerate() {
+    let mut ops = request.ops.clone();
+    let mut otherwise = request.otherwise.clone();
+    for (arm, actions) in [&mut ops, &mut otherwise].into_iter().enumerate() {
         if let Err(error) = prepare_arm(actions, vault, fingerprint, arm).await {
             // The fold can recover the exact receipt from the logical digest after key destruction.
-            if error.code == "rtdb/erased-under-view" { return Ok(()); }
+            // Leave the request unsealed rather than committing a partial seal.
+            if error.code == "rtdb/erased-under-view" {
+                request.custody_request_digest = Some(fingerprint);
+                return Ok(());
+            }
             return Err(error);
         }
     }
+    request.custody_request_digest = Some(fingerprint);
+    request.ops = ops;
+    request.otherwise = otherwise;
     Ok(())
 }
 

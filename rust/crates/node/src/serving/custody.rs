@@ -353,4 +353,43 @@ mod tests {
         assert!(matches!(reopened.resolve(&retry_after_destruction, 3, Timestamp(12), &[ROW_CUSTODY], &claims).unwrap(),
             Resolution::Answer(receipt) if receipt.replayed && receipt.outcome == Outcome::Then));
     }
+
+    #[tokio::test]
+    async fn prepare_leaves_request_unsealed_when_a_later_row_is_erased() {
+        let incarnation = [11; 16];
+        let live_group = [12; 16];
+        let erased_group = [13; 16];
+        let table = TableRef::new("public", "documents");
+        let vault = CustodyVault::new(Uuid::from_bytes(incarnation), Arc::new(LocalKms::new(|| 10)));
+        vault.create(live_group).await.unwrap();
+        vault.create(erased_group).await.unwrap();
+        vault.retire(erased_group, 0).await.unwrap();
+        vault.destroy(erased_group).await.unwrap();
+
+        let row = |id: i64, group: [u8; 16], text: &str| Row {
+            id: EntityId::Integer(id), valid: None,
+            cells: StructFields::from([("private".into(), Cell::Value(Value::Utf8(text.into())))]),
+            custody_group: Some(group), protected_columns: vec!["private".into()], custody_payload: None,
+        };
+        let mut request = Transact {
+            key: vec![1; 16], require: Vec::new(), window: Window::default(), guards: Vec::new(),
+            ops: vec![Op::Put {
+                branch: MAIN_BRANCH.into(), table, if_absent: false,
+                rows: vec![row(1, live_group, "first"), row(2, erased_group, "second")],
+            }],
+            otherwise: Vec::new(), requires: Vec::new(),
+            custody_request_digest: None, request_memory: None,
+        };
+        let expected_digest = request.logical_sha256().unwrap();
+
+        prepare(&mut request, &vault).await.unwrap();
+
+        assert_eq!(request.custody_request_digest, Some(expected_digest));
+        let [Op::Put { rows, .. }] = request.ops.as_slice() else { panic!("expected put"); };
+        assert_eq!(rows.len(), 2);
+        for (row, expected) in rows.iter().zip(["first", "second"]) {
+            assert!(row.custody_payload.is_none());
+            assert!(matches!(row.cells.get("private"), Some(Cell::Value(Value::Utf8(text))) if text == expected));
+        }
+    }
 }
