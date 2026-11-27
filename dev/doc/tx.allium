@@ -22,6 +22,7 @@
 -- Prepared Flight SQL and embedded ADBC queries can bind an Arrow batch row by position.
 -- A v1 Query can bind an admitted batch by position for unencoded scalar fields and nullable Arrow Null fields.
 -- List and positive-width FixedSizeList cells can bind in Arrow when their fields are unannotated and their Float32 or Float64 children use the canonical name.
+-- A v1 Query can also bind a mixed parameter row in Arrow when each additional plain record or list has the declared type at its selected position.
 -- A tracked v1 Query can use the same Arrow bindings when their representation preserves claim identity.
 -- Unsigned scalar columns share their value and validity buffers with signed columns at the same width during execution.
 -- Other parameter layouts and plans that decline direct binding use the scalar binding path.

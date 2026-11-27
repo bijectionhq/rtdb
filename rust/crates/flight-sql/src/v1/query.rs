@@ -16,7 +16,7 @@ use arrow_buffer::{Buffer, ScalarBuffer};
 use arrow_flight::FlightData;
 use arrow_schema::{DataType, Field, Schema};
 use prost::Message;
-use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
+use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_crypt::tokens::{PageToken, ReceiverClockObservation, TokenIssuer};
 use rtdb_node::{Database, PreparedSql, ResultSignaturePolicy, serving::{QuerySource, QueryView, ServingDriver, ServingScope, ranked_ivf}};
 use rtdb_query::{QueryContext, QueryCursor};
@@ -851,19 +851,21 @@ impl Parameters {
                 })
     }
 
-    fn can_bind_arrow(&self, track: bool) -> bool {
+    fn can_bind_arrow(&self, track: bool, admit_collections: bool, memory: &Arc<MemoryBudget>) -> bool {
         let batch = self.batch.batch();
         batch.num_columns() != 0
             && batch
                 .schema_ref()
                 .fields()
                 .iter()
+                .zip(batch.columns())
                 .zip(self.types.as_slice())
-                .all(|(field, logical)| match field.data_type() {
+                .all(|((field, array), logical)| match field.data_type() {
                     DataType::Union(..) | DataType::RunEndEncoded(..) => false,
-                    DataType::List(child) => plain_float_list(field, child),
-                    DataType::FixedSizeList(child, width) => {
-                        plain_float_list(field, child) && *width > 0
+                    DataType::List(child) if plain_float_list(field, child) => true,
+                    DataType::FixedSizeList(child, width) if plain_float_list(field, child) && *width > 0 => true,
+                    DataType::Struct(_) | DataType::List(_) | DataType::FixedSizeList(..) => {
+                        admit_collections && compatible_collection(ArrowCell { field, array: array.as_ref(), row: 0 }, logical, memory)
                     }
                     _ if track => tracked_scalar(field),
                     _ => match logical {
@@ -912,7 +914,8 @@ impl Parameters {
         }
         let skip_row_admission = self.binds_arrow_without_row_admission();
         if !skip_row_admission {
-            if prepared.parameter_count() != types.len() || !self.can_bind_arrow(track) {
+            let admit_collections = track || prepared.notices().is_empty() || context.execution_observer().is_none();
+            if prepared.parameter_count() != types.len() || !self.can_bind_arrow(track, admit_collections, &context.memory) {
                 return Ok(None);
             }
             if !track {
@@ -1017,13 +1020,33 @@ fn plain_float_list(field: &Field, child: &Field) -> bool {
         && matches!(child.data_type(), DataType::Float32 | DataType::Float64)
 }
 
+fn compatible_collection(cell: ArrowCell<'_>, declared: &LogicalType, memory: &Arc<MemoryBudget>) -> bool {
+    fn plain(field: &Field) -> bool {
+        if !field.metadata().is_empty() { return false; }
+        match field.data_type() {
+            DataType::Struct(fields) => fields.iter().all(|field| plain(field)),
+            DataType::List(child) => child.name() == "$data$" && plain(child),
+            DataType::FixedSizeList(child, width) => *width > 0 && child.name() == "$data$" && plain(child),
+            data_type => !data_type.is_unsigned_integer() && tracked_scalar(field),
+        }
+    }
+
+    if !plain(cell.field) { return false; }
+    if cell.array.is_null(cell.row) { return true; }
+    let declared = match declared { LogicalType::Maybe(inner) => inner.as_ref(), ty => ty };
+    let Ok(_scratch) = cell.observed_type_bytes().and_then(|bytes| memory.reserve(bytes)) else { return false; };
+    cell.observed_type().is_ok_and(|observed| observed == *declared)
+}
+
 fn tracked_scalar(field: &Field) -> bool {
     // The claim's IID readers must see the same identity as the scalar binding.
     match (field.data_type(), field.metadata().get(rtdb_columnar::EXTENSION_NAME_KEY).map(String::as_str)) {
         (DataType::FixedSizeBinary(16), Some("uuid")) | (DataType::Utf8, Some("xt/clj-keyword")) => true,
         (DataType::Null, None) => field.is_nullable() && field.metadata().is_empty(),
         (data_type, None) => field.metadata().is_empty()
-            && (data_type.is_integer() || matches!(data_type, DataType::Boolean | DataType::Utf8 | DataType::Binary | DataType::Float32 | DataType::Float64)),
+            && (data_type.is_integer() || matches!(data_type, DataType::Boolean | DataType::Utf8 | DataType::Binary
+                | DataType::Float32 | DataType::Float64 | DataType::Date32 | DataType::Date64
+                | DataType::Time32(_) | DataType::Time64(_) | DataType::Timestamp(..) | DataType::Duration(_))),
         _ => false,
     }
 }
@@ -1170,8 +1193,33 @@ mod tests {
                 rtdb_format::ipc::write_stream(batch.schema_ref(), std::slice::from_ref(&batch))
                     .unwrap();
             let parameters = Parameters::read(Buffer::from_vec(ipc), &memory).unwrap();
-            assert_eq!(parameters.can_bind_arrow(false), expected);
-            assert_eq!(parameters.can_bind_arrow(true), expected && !annotated);
+            assert_eq!(parameters.can_bind_arrow(false, true, &memory), expected);
+            assert_eq!(parameters.can_bind_arrow(true, true, &memory), expected && !annotated);
+        }
+    }
+
+    #[test]
+    fn mixed_parameters_admit_stable_integer_lists_and_keep_unstable_layouts_on_the_row_path() {
+        let memory = MemoryBudget::new(1 << 20);
+        let schema_cell = |child_name: &str, nullable: bool, values: Vec<Option<i64>>| {
+            let len = values.len() as i32;
+            let child = Arc::new(Field::new(child_name, DataType::Int64, nullable));
+            Arc::new(ListArray::new(child, OffsetBuffer::new(vec![0, len].into()), Arc::new(Int64Array::from(values)), None)) as ArrayRef
+        };
+        for (list, expected) in [
+            (schema_cell("$data$", false, vec![Some(7)]), true),
+            (schema_cell("$data$", true, vec![Some(7), None]), true),
+            (schema_cell("$data$", false, vec![]), false),
+            (schema_cell("client-name", false, vec![Some(7)]), false),
+        ] {
+            let id = Arc::new(UInt64Array::from(vec![u64::MAX])) as ArrayRef;
+            let batch = RecordBatch::try_from_iter([("id", id), ("xs", list)]).unwrap();
+            let ipc = rtdb_format::ipc::write_stream(batch.schema_ref(), std::slice::from_ref(&batch)).unwrap();
+            let parameters = Parameters::read(Buffer::from_vec(ipc), &memory).unwrap();
+            parameters.validate_columns(&memory).unwrap();
+            assert_eq!(parameters.can_bind_arrow(true, true, &memory), expected);
+            assert_eq!(parameters.can_bind_arrow(false, true, &memory), expected);
+            assert!(!parameters.can_bind_arrow(false, false, &memory));
         }
     }
 
