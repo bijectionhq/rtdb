@@ -1167,7 +1167,8 @@ async fn recoverable_cluster_with_lagging(cluster: &Cluster, journal: &Arc<Recov
     let kept = writer.stream.head().await.unwrap();
     assert_eq!(text_at(&mut lagging, MAIN_BRANCH, 1).await, Some(Value::Utf8("kept".into())));
     writer.transact(&put(2, 2, "lost")).await.unwrap();
-    writer.transact(&put(3, 3, "lost")).await.unwrap();
+    let lost = writer.transact(&put(3, 3, "lost")).await.unwrap();
+    cluster.at(lost.system_time.0);
     assert_eq!(text_at(&mut follower, MAIN_BRANCH, 3).await, Some(Value::Utf8("lost".into())));
     (writer, follower, lagging, kept)
 }
@@ -1246,7 +1247,8 @@ async fn multi_followers_rebuild_their_state_across_a_journal_recovery() {
     cluster.at(10 + LEASE + DRIFT + 1);
     assert_eq!(successor.tick(&live(3)).await.unwrap(), Role::Writer(Epoch(RECOVERY_FENCE.0 + 1)));
     for id in 10..16 {
-        successor.transact(&put(id as u8, id, "new")).await.unwrap();
+        let receipt = successor.transact(&put(id as u8, id, "new")).await.unwrap();
+        cluster.at(receipt.system_time.0);
     }
     assert!(successor.stream.head().await.unwrap() > lost);
     let recovery = successor.journal_recovery();
