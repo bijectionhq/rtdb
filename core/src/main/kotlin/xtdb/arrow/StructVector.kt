@@ -158,6 +158,18 @@ class StructVector private constructor(
 
     override fun writeValue0(v: ValueReader) = writeObject(v.readStruct())
 
+    internal fun canCopyObjectValueTo(dest: StructVector, idx: Int): Boolean =
+        nullable == dest.nullable && childFields == dest.childFields && hasObjectIdentityChildren(idx)
+
+    private fun hasObjectIdentityChildren(idx: Int): Boolean =
+        childWriters.values.all { child ->
+            child.type.encoding == Encoding.Plain && !child.isNull(idx) && when (child) {
+                is StructVector -> child.hasObjectIdentityChildren(idx)
+                is Utf8Vector -> child.hasValidUtf8(idx)
+                else -> child.arrowType.hasScalarObjectIdentity()
+            }
+        }
+
     override fun valueReader() = object : RowValueReader {
         val readers = childWriters.mapValues { it.value.valueReader() }
         private var structRead = false

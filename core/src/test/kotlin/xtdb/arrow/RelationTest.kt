@@ -35,6 +35,40 @@ class RelationTest {
     }
 
     @Test
+    fun `bound rows copy matching nested structs with complete reached children`() {
+        val nestedType = VectorType.structOf("text" to maybe(VectorType.UTF8), "flag" to VectorType.BOOL)
+        val types = linkedMapOf("number" to VectorType.I64, "nested" to nestedType)
+        val complete = linkedMapOf("number" to 3L, "nested" to linkedMapOf("text" to "é😀", "flag" to false))
+        val sparse = linkedMapOf("number" to 4L, "nested" to linkedMapOf("flag" to true))
+        Vector.open(allocator, "arg", VectorType.structOf(types)).use { src ->
+            src.writeObject(complete)
+            src.writeObject(sparse)
+            src.vectorFor("number").writeLong(5L)
+            val nested = src.vectorFor("nested")
+            nested.vectorFor("text").writeBytes(byteArrayOf(0xff.toByte()))
+            nested.vectorFor("flag").writeBoolean(false)
+            nested.endStruct()
+            src.endStruct()
+
+            Relation(allocator, types).use { dst ->
+                assertTrue(dst.tryCopyStructRow(src, 0))
+                assertFalse(dst.tryCopyStructRow(src, 1))
+                assertFalse(dst.tryCopyStructRow(src, 2))
+                assertEquals(1, dst.rowCount)
+                assertEquals(listOf(3L), dst["number"].asList)
+                dst.writeRow(src.getObject(1) as Map<*, *>)
+                dst.writeRow(src.getObject(2) as Map<*, *>)
+                assertEquals(listOf(3L, 4L, 5L), dst["number"].asList)
+                assertEquals(
+                    listOf(complete["nested"], sparse["nested"], mapOf("text" to "\uFFFD", "flag" to false)),
+                    dst["nested"].asList
+                )
+                assertEquals(ByteBuffer.wrap("\uFFFD".toByteArray()), dst["nested"].vectorFor("text").getBytes(2))
+            }
+        }
+    }
+
+    @Test
     fun testScalarRoundTrip() {
         val buf = ByteArrayOutputStream()
 

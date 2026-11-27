@@ -53,12 +53,16 @@ interface RelationWriter : RelationReader {
         val children = src.keyNames?.mapNotNull { name ->
             val child = src.vectorFor(name)
             val out = vectorForOrNull(name) ?: return false
-            val target = out.scalarObjectTarget(child, idx) ?: return false
+            val target = if (child is StructVector && out is StructVector) {
+                if (!child.isNull(idx) && !child.canCopyObjectValueTo(out, idx)) return false
+                out
+            } else out.scalarObjectTarget(child, idx) ?: return false
             if (child.isNull(idx)) null else child to target
         } ?: return false
 
         for ((child, target) in children) {
-            target.copyNonNullScalar(child, idx)
+            if (child is StructVector) child.rowCopier(target).copyRow(idx)
+            else target.copyNonNullScalar(child, idx)
         }
 
         endRow()
