@@ -3952,7 +3952,8 @@ mod kernel {
                     }
                 }
                 Expr::Literal(value) => scalar(value).ok().map(Self::Constant),
-                Expr::Parameter { index, .. } => scalar(parameters.known(*index)?).ok().map(Self::Constant),
+                // An Arrow-bound parameter is decoded on first read, so `known` alone would decline it.
+                Expr::Parameter { index, .. } => scalar(parameters.get(*index).ok()??).ok().map(Self::Constant),
                 Expr::Binary { .. } | Expr::Unary { .. } | Expr::Cast { .. } | Expr::Call { .. } | Expr::Case { .. } =>
                     ComputedOperand::of(expr, schema, batch, parameters).map(Self::Computed),
                 _ => None,
@@ -4033,7 +4034,7 @@ mod kernel {
             Expr::Like { expr, pattern, escape, case_insensitive, negated } => {
                 let pattern = match pattern.as_ref() {
                     Expr::Literal(Value::Utf8(pattern)) => pattern.as_str(),
-                    Expr::Parameter { index, .. } => match parameters.known(*index)? { Value::Utf8(pattern) => pattern.as_str(), _ => return None },
+                    Expr::Parameter { index, .. } => match parameters.get(*index).ok()?? { Value::Utf8(pattern) => pattern.as_str(), _ => return None },
                     _ => return None,
                 };
                 let like = rtdb_expr::kernels::LikeMatcher::compile(pattern, *escape, *case_insensitive, *negated)?;
@@ -4062,6 +4063,35 @@ mod kernel {
             }
             _ => None,
         }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn a_parameter_not_yet_decoded_still_compares_in_the_kernel() {
+        use arrow_array::ArrayRef;
+        use rtdb_plan::{ColumnId, Field};
+        use rtdb_types::LogicalType;
+        use crate::columnar::{ArrowField, MemoryBudget};
+
+        struct Undecoded(Value);
+        impl rtdb_expr::ParameterLookup for Undecoded {
+            fn width(&self) -> usize { 1 }
+            fn value(&self, index: usize) -> rtdb_types::Result<Option<&Value>> { Ok((index == 0).then_some(&self.0)) }
+            fn known_value(&self, _: usize) -> Option<&Value> { None }
+            fn arrow_cell(&self, _: usize) -> Option<rtdb_expr::ArrowParameterCell<'_>> { None }
+        }
+        let memory = MemoryBudget::new(1 << 20);
+        let lookup = Undecoded(Value::I64(2));
+        let parameters = rtdb_expr::Parameters::Lookup(&lookup);
+        let logical = LogicalType::Scalar(ScalarType::I64);
+        let field = Field { id: ColumnId(0), name: "_id".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: logical.clone() };
+        let schema = Schema::new(vec![field.clone()]).unwrap();
+        let array: ArrayRef = Arc::new(Int64Array::from(vec![1, 2]));
+        let column = Column::Arrow { field: Arc::new(ArrowField::new("_id", array.data_type().clone(), false)), array, logical: Some(logical) };
+        let batch = ColumnBatch::settled(vec![column], 2, memory.reserve(0).unwrap()).unwrap();
+        let parameter = Expr::Parameter { index: 0, data_type: LogicalType::Scalar(ScalarType::I64).maybe() };
+        let predicate = Expr::binary(BinaryOp::Eq, field.expression(), parameter);
+        assert_eq!(truth(&predicate, &schema, &batch, parameters), Some(vec![Some(false), Some(true)]));
     }
 
     #[cfg(test)]
