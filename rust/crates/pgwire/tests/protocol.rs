@@ -26,12 +26,13 @@ struct Running { node: Node, node_task: JoinHandle<Result<()>>, server: ServerHa
 impl Running {
     async fn start(config: ServerConfig, password: Option<&str>) -> Self { Self::start_with(config, AuthConfig::SingleRootUser { password: password.map(Secret::new) }).await }
     async fn start_with(config: ServerConfig, authentication: AuthConfig) -> Self {
-        Self::start_with_tracer(config, authentication, None).await
+        Self::start_with_services(config, authentication, |_| {}).await
     }
-    async fn start_with_tracer(config: ServerConfig, authentication: AuthConfig, tracer: Option<Arc<dyn rtdb_plan::Tracer>>) -> Self {
+    async fn start_with_services(config: ServerConfig, authentication: AuthConfig, configure: impl FnOnce(&mut NodeServices)) -> Self {
         let clock: Arc<dyn Clock> = Arc::new(TickClock(AtomicI64::new(1_000_000)));
         let auth = Authenticator::open(authentication, MemoryBudget::new(64 << 20), Arc::clone(&clock), Arc::new(NoHttp)).await.unwrap();
-        let services = NodeServices { clock, tracer, ..NodeServices::local(auth.clone(), Arc::new(Observer), auth.clone(), Arc::new(Metrics)) };
+        let mut services = NodeServices { clock, ..NodeServices::local(auth.clone(), Arc::new(Observer), auth.clone(), Arc::new(Metrics)) };
+        configure(&mut services);
         let mut options = NodeOptions::default(); options.automatic_compaction = false; options.automatic_gc = false;
         options.replication.assertion_interval = Duration::from_millis(1); options.replication.election_seed = 1;
         let (node, driver) = Node::open(options, services).await.unwrap(); let node_task = tokio::spawn(driver.run());
@@ -152,7 +153,9 @@ async fn date64_arrow_copy_can_be_read_as_binary_postgres_dates() {
 #[tokio::test]
 async fn query_spans_follow_pgwire_application_name_across_entry_points() {
     let (recorder, mut receiver) = rtdb_metrics::TraceRecorder::new(MemoryBudget::new(8 << 20), 128, true, false).unwrap();
-    let running = Running::start_with_tracer(ServerConfig::default(), AuthConfig::SingleRootUser { password: None }, Some(recorder.clone())).await;
+    let running = Running::start_with_services(ServerConfig::default(), AuthConfig::SingleRootUser { password: None }, |services| {
+        services.tracer = Some(recorder.clone());
+    }).await;
     let mut default_client = Client::connect(&running.server, None).await;
     assert_eq!(rows(&default_client.query("SELECT 101 AS app_probe").await), [vec![Some(b"101".to_vec())]]);
     let mut client = Client::connect_named(&running.server, None, Some("startup-app")).await;
@@ -796,6 +799,93 @@ async fn describe_sends_parameter_oids_only_for_the_reference_statement_kinds() 
         }
     }
     drop(client); running.stop().await;
+}
+
+#[tokio::test]
+async fn classic_xt_txs_wildcard_exclude_keeps_native_columns_selectable() {
+    struct OutcomeDecisionClock;
+    #[async_trait]
+    impl rtdb_tx::DecisionClock for OutcomeDecisionClock {
+        async fn observe(&self) -> Result<rtdb_tx::DecisionObservation> {
+            Ok(rtdb_tx::DecisionObservation { domain: [1; 16], epoch: 1, sequence: 1, instant: Timestamp(1_000_000) })
+        }
+    }
+
+    fn column_names(mut description: &[u8]) -> Vec<&str> {
+        let count = u16::from_be_bytes(description[..2].try_into().unwrap());
+        description = &description[2..];
+        let mut names = Vec::with_capacity(usize::from(count));
+        for _ in 0..count {
+            let end = description.iter().position(|&byte| byte == 0).unwrap();
+            names.push(std::str::from_utf8(&description[..end]).unwrap());
+            description = &description[end + 1 + 18..];
+        }
+        assert!(description.is_empty());
+        names
+    }
+
+    let running = Running::start_with_services(ServerConfig::default(), AuthConfig::SingleRootUser { password: None }, |services| {
+        services.decision_clock = Some(Arc::new(OutcomeDecisionClock));
+    }).await;
+    let mut first = Client::connect(&running.server, None).await;
+    let mut second = Client::connect(&running.server, None).await;
+    let classic = ["_id", "committed", "error", "system_time", "user_metadata"];
+    let native = ["_id", "committed", "decision_clock", "error", "receipt_time", "source_log_time", "system_time", "user_metadata"];
+    let excluded = "EXCLUDE (receipt_time, source_log_time, decision_clock)";
+    let from = "FROM xt.txs AS tx ORDER BY _id";
+    let portable_sql = format!("SELECT * {excluded} {from}");
+
+    let empty = first.query(&portable_sql).await;
+    assert_eq!(tags(&empty), b"TCZ");
+    assert_eq!(column_names(&empty[0].1), classic);
+    assert_eq!(tags(&first.query("INSERT INTO docs (_id) VALUES (1)").await), b"CZ");
+
+    let baseline = first.query(&format!("SELECT {} {from}", native.join(", "))).await;
+    assert_eq!(tags(&baseline), b"TDCZ");
+    let baseline = rows(&baseline);
+    let [outcome] = baseline.as_slice() else { panic!("Expected one transaction outcome"); };
+    assert_eq!(outcome[1].as_deref(), Some(b"t".as_slice()));
+    let clock_columns = ["receipt_time", "source_log_time", "decision_clock"];
+    let cell = |name: &str| outcome[native.iter().position(|&column| column == name).unwrap()].clone();
+    assert!(clock_columns.iter().all(|name| cell(name).is_some()));
+
+    for (name, sql, expected_names) in [
+        ("classic", portable_sql, classic.as_slice()),
+        ("native", format!("SELECT * {from}"), native.as_slice()),
+        ("classic_qualified", format!("SELECT tx.* {excluded} {from}"), classic.as_slice()),
+        ("native_qualified", format!("SELECT tx.* {from}"), native.as_slice()),
+        ("classic_explicit", format!("SELECT {} {from}", classic.join(", ")), classic.as_slice()),
+        ("clocks_explicit", format!("SELECT tx.receipt_time, tx.source_log_time, tx.decision_clock {from}"), clock_columns.as_slice()),
+        ("classic_with_clock", format!("SELECT tx.* {excluded}, tx.decision_clock {from}"),
+            &["_id", "committed", "error", "system_time", "user_metadata", "decision_clock"]),
+    ] {
+        let expected_row = expected_names.iter().map(|name| cell(name)).collect::<Vec<_>>();
+        let simple = first.query(&sql).await;
+        assert_eq!(tags(&simple), b"TDCZ", "{sql}");
+        assert_eq!(column_names(&simple[0].1), expected_names, "{sql}");
+        assert_eq!(rows(&simple), [expected_row.clone()], "{sql}");
+
+        let mut description = vec![b'S'];
+        description.extend_from_slice(&cstring(name));
+        for client in [&mut first, &mut second] {
+            client.parse(name, &sql, &[]).await;
+            description[0] = b'S';
+            client.send(b'D', &description).await;
+            client.bind(name, name).await;
+            description[0] = b'P';
+            client.send(b'D', &description).await;
+            client.execute(name, 0).await;
+            client.send(b'S', &[]).await;
+            let prepared = client.through(b'Z').await;
+            assert_eq!(tags(&prepared), b"1tT2TDCZ", "{sql}");
+            assert_eq!(prepared[2].1, simple[0].1, "statement description for {sql}");
+            assert_eq!(prepared[4].1, simple[0].1, "portal description for {sql}");
+            assert_eq!(rows(&prepared), [expected_row.clone()], "{sql}");
+        }
+    }
+
+    drop((first, second));
+    running.stop().await;
 }
 
 #[tokio::test]

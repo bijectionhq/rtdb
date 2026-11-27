@@ -335,6 +335,21 @@ The caller-owned token scan and preparation context build these descriptors and 
 Additional sources cover repeated and missing renames, outer nulls, correlated fallback, optional AS, identifier spans, and rejected modifier shapes.
 These sources have not been compiled or executed.
 
+=== Classic transaction outcome projection
+
+Use wildcard `EXCLUDE` to select the five transaction outcome columns in pinned XTDB Classic order (`_id`, `committed`, `error`, `system_time`, `user_metadata`).
+
+[source,sql]
+----
+SELECT * EXCLUDE (receipt_time, source_log_time, decision_clock) FROM xt.txs;
+SELECT tx.* EXCLUDE (receipt_time, source_log_time, decision_clock) FROM xt.txs AS tx;
+----
+
+The exclusions apply only to the wildcard that declares them, including in prepared result descriptions.
+The same SQL works when some or all of the extension columns are absent.
+A bare wildcard includes whichever of the native columns the catalog has observed, and those columns can also be selected by name.
+An explicit `SELECT _id, committed, error, system_time, user_metadata FROM xt.txs` fixes the output even if more columns are introduced later.
+
 == Window functions
 
 Each SELECT supports one ROW_NUMBER, LEAD, or LAG call, including a call inside a scalar output expression.
