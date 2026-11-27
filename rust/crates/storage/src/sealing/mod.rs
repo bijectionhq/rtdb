@@ -357,7 +357,10 @@ impl EncryptingStore {
         if !matches!(written, Err(Error::ConflictingObject(_))) {
             return written;
         }
-        let existing = self.inner.get_fresh(key).await?;
+        let existing = match self.inner.get_fresh(key).await {
+            Err(Error::MissingObject(_)) => return written,
+            result => result?,
+        };
         let matches = match publication {
             Some(publication) => publication.matches_sealed(key, existing, sealed).await?,
             None => self.crypt(key, UnitOperation::CompareSealed { existing, expected: sealed }).await?.matches()?,
@@ -796,7 +799,7 @@ impl ObjectStore for EncryptingStore {
             None => return Ok(()),
         };
         match self.inner.put(key, sealed).await {
-            Err(Error::ConflictingObject(_)) if self.get_fresh(key).await? == bytes => Ok(()),
+            Err(Error::ConflictingObject(_)) if self.existing_for_put(key).await?.as_ref() == Some(&bytes) => Ok(()),
             written => written,
         }
     }
@@ -836,7 +839,7 @@ impl ObjectStore for EncryptingStore {
             self.seal(key, bytes.clone()).await?
         };
         match self.inner.put_with_publication(key, sealed).await {
-            Err(Error::ConflictingObject(_)) if self.get_fresh(key).await? == bytes => {
+            Err(Error::ConflictingObject(_)) if self.existing_for_put(key).await?.as_ref() == Some(&bytes) => {
                 if ordered { Ok(None) } else { self.inner.retirement_publication(key).await }
             }
             written => written,
