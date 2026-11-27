@@ -2636,6 +2636,12 @@ pub async fn confirm_suspicions(directory: &dyn Directory, failures: &mut BTreeM
     Ok(confirmed)
 }
 
+fn log_controller_error<T>(task: &str, result: Result<T>) {
+    if let Err(error) = result {
+        tracing::warn!(task, code = %error.code, message = ?error.message, "Multi controller task failed");
+    }
+}
+
 pub async fn run_controller(directory: Arc<dyn Directory>, options: ControllerOptions, cancellation: CancellationToken) {
     let mut failures = BTreeMap::new();
     let mut samples = crate::load::LoadSamples::default();
@@ -2644,23 +2650,25 @@ pub async fn run_controller(directory: Arc<dyn Directory>, options: ControllerOp
         tokio::select! {
             _ = cancellation.cancelled() => return,
             _ = tokio::time::sleep(options.interval) => {
-                let _ = reap_members(directory.as_ref(), options.grace).await;
-                if options.suspicion_probes > 0 { let _ = confirm_suspicions(directory.as_ref(), &mut failures, &options).await; }
+                log_controller_error("reap_members", reap_members(directory.as_ref(), options.grace).await);
+                if options.suspicion_probes > 0 {
+                    log_controller_error("confirm_suspicions", confirm_suspicions(directory.as_ref(), &mut failures, &options).await);
+                }
                 if let Some(policy) = options.read_width {
-                    let _ = read_width.adjust(directory.as_ref(), policy, &options.control, options.probe_timeout).await;
+                    log_controller_error("read_width_adjust", read_width.adjust(directory.as_ref(), policy, &options.control, options.probe_timeout).await);
                 }
                 if options.rebalance_moves > 0 {
                     if options.load_limits.enabled() {
-                        let _ = crate::load::rebalance(directory.as_ref(), options.rebalance_moves, options.load_limits, &options.control, &mut samples).await;
+                        log_controller_error("load_rebalance", crate::load::rebalance(directory.as_ref(), options.rebalance_moves, options.load_limits, &options.control, &mut samples).await);
                     } else {
-                        let _ = rebalance(directory.as_ref(), options.rebalance_moves, &options.control).await;
+                        log_controller_error("rebalance", rebalance(directory.as_ref(), options.rebalance_moves, &options.control).await);
                     }
                 }
                 if options.journal_moves > 0 {
-                    let _ = balance_journals(directory.as_ref(), options.journal_moves).await;
-                    let _ = release_journal_copies(directory.as_ref(), options.journal_moves).await;
+                    log_controller_error("balance_journals", balance_journals(directory.as_ref(), options.journal_moves).await);
+                    log_controller_error("release_journal_copies", release_journal_copies(directory.as_ref(), options.journal_moves).await);
                 }
-                let _ = certify_logkeeper_decommissions(directory.as_ref()).await;
+                log_controller_error("certify_logkeeper_decommissions", certify_logkeeper_decommissions(directory.as_ref()).await);
             }
         }
     }
