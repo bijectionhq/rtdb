@@ -38,6 +38,7 @@ const RECOVERY_JOURNAL_CUSTODY_PROTOCOL: u8 = 6;
 const RECOVERY_HOSTED_CUSTODY_PROTOCOL: u8 = 7;
 const RANKED_RECOVERY_PROTOCOL: u8 = 8;
 const FUNDED_RECOVERY_PROTOCOL: u8 = 9;
+const FUNDED_SETTLEMENT_PROTOCOL: u8 = 10;
 #[cfg(any(unix, feature = "backup-object-holds"))]
 const BROKER_FRAME_BYTES: usize = 16 * 1024;
 const RENEW_AHEAD: Duration = Duration::from_secs(1);

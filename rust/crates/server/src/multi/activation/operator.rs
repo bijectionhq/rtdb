@@ -34,10 +34,14 @@ pub const HELP: &str = "Usage: rtdb multi-activation status DATABASE AUTHORITY
                  --expected-incarnation UUID --expected-revision N [--operation-id UUID]
        rtdb multi-activation commission-funded DATABASE --authority-socket PATH
                  --expected-incarnation UUID --expected-revision N --issuer-id UUID
-                 --issuer-key HEX --receiver-certificate-sha256 HEX
+                 --issuer-key HEX --receiver-certificate-sha256 HEX [--journal-trust FILE]
        rtdb multi-activation funded-scopes DATABASE --authority-socket PATH [--offset N]
                  --expected-incarnation UUID --expected-revision N
        rtdb multi-activation record-funded-closure DATABASE --authority-socket PATH --closure FILE
+                 --expected-incarnation UUID --expected-revision N
+       rtdb multi-activation record-funded-outcome DATABASE --authority-socket PATH --outcome FILE
+                 --expected-incarnation UUID --expected-revision N
+       rtdb multi-activation funded-outcome DATABASE --authority-socket PATH --scope-sha256 HEX --index N
                  --expected-incarnation UUID --expected-revision N
        rtdb multi-activation seal-source DATABASE --authority-socket PATH
                  --expected-incarnation UUID --expected-revision N --operation-id UUID
@@ -115,6 +119,8 @@ enum Action {
     CommissionFunded {
         expected: Binding,
         enrollment: funded::Enrollment,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        journal: Option<funded::settlement::JournalTrust>,
     },
     FundedScopes {
         predecessor: Binding,
@@ -123,6 +129,15 @@ enum Action {
     RecordFundedClosure {
         predecessor: Binding,
         closure: funded::Closure,
+    },
+    RecordFundedOutcome {
+        predecessor: Binding,
+        resolution: funded::settlement::Resolution,
+    },
+    FundedOutcome {
+        predecessor: Binding,
+        scope_sha256: [u8; 32],
+        index: u64,
     },
     Freeze {
         expected: Binding,
@@ -413,6 +428,7 @@ impl Options {
                     receiver_certificate_sha256: hex_digest(take(&mut fields, "--receiver-certificate-sha256")?)?,
                     verification_key: hex_digest(take(&mut fields, "--issuer-key")?)?,
                 },
+                journal: fields.remove("--journal-trust").as_deref().map(read_funded_document).transpose()?,
             },
             "funded-scopes" => Action::FundedScopes {
                 predecessor: binding(&mut fields)?,
@@ -422,7 +438,18 @@ impl Options {
             #[cfg(unix)]
             "record-funded-closure" => Action::RecordFundedClosure {
                 predecessor: binding(&mut fields)?,
-                closure: read_funded_closure(&take(&mut fields, "--closure")?)?,
+                closure: read_funded_document(&take(&mut fields, "--closure")?)?,
+            },
+            #[cfg(unix)]
+            "record-funded-outcome" => Action::RecordFundedOutcome {
+                predecessor: binding(&mut fields)?,
+                resolution: read_funded_document(&take(&mut fields, "--outcome")?)?,
+            },
+            #[cfg(unix)]
+            "funded-outcome" => Action::FundedOutcome {
+                predecessor: binding(&mut fields)?,
+                scope_sha256: hex_digest(take(&mut fields, "--scope-sha256")?)?,
+                index: take(&mut fields, "--index")?.parse().map_err(|_| arguments_error())?,
             },
             "freeze" => Action::Freeze {
                 expected: binding(&mut fields)?,
@@ -493,6 +520,7 @@ impl Options {
 
         if matches!(request.action, Action::CommissionRanked { .. } | Action::RankedOutcomes { .. }
             | Action::CommissionFunded { .. } | Action::FundedScopes { .. } | Action::RecordFundedClosure { .. }
+            | Action::RecordFundedOutcome { .. } | Action::FundedOutcome { .. }
             | Action::Recovery { action: RecoveryAction::SealSource | RecoveryAction::RankedOutcomes { .. }, .. })
         {
             return Err(arguments_error());
@@ -686,14 +714,20 @@ impl Request {
             Action::RankedOutcomes { predecessor, after } => {
                 return ranked.outcomes(authority, &database, predecessor, None, after).await;
             }
-            Action::CommissionFunded { expected, enrollment } => {
-                return Ok(json!(authority.commission_funded(&database, expected, enrollment).await?));
+            Action::CommissionFunded { expected, enrollment, journal } => {
+                return Ok(json!(authority.commission_funded(&database, expected, enrollment, journal).await?));
             }
             Action::FundedScopes { predecessor, offset } => {
                 return Ok(json!(authority.funded_scope_page(&database, predecessor, offset).await?));
             }
             Action::RecordFundedClosure { predecessor, closure } => {
                 return Ok(json!(authority.record_funded_closure(&database, predecessor, closure).await?));
+            }
+            Action::RecordFundedOutcome { predecessor, resolution } => {
+                return Ok(json!(authority.record_funded_outcome(&database, predecessor, resolution).await?));
+            }
+            Action::FundedOutcome { predecessor, scope_sha256, index } => {
+                return Ok(json!(authority.funded_outcome(&database, predecessor, scope_sha256, index).await?));
             }
             #[cfg(all(unix, feature = "backup-object-holds"))]
             Action::AuthorizeAbandonedAcquisition { intent, hold, head, anchor, object_namespace } => {
@@ -950,7 +984,8 @@ async fn seal_source(
 
     let status = authority.recovery_status(database, operation).await?;
     match status {
-        recovery::Status::Published { .. } | recovery::Status::Pending { final_source_lsn: Some(_), .. } => {
+        recovery::Status::Published { .. }
+        | recovery::Status::Pending { final_source_lsn: Some(_), funded_source_fence_needed: false, .. } => {
             return Ok(status);
         }
         recovery::Status::Pending { grants_closed: true, intent, .. }
@@ -976,7 +1011,7 @@ async fn seal_source(
             return Err(super::conflict());
         }
         stopped.database.check_activation_scope(head).await?;
-        authority.seal_recovery_source(database, operation, &*stopped.journal, source.cell).await
+        authority.seal_recovery_source(database, operation, &*stopped.journal, source.cell, Some(stopped.journal_catalog)).await
     }.await;
     stopped.io.close_and_wait().await;
     result
@@ -1081,7 +1116,7 @@ fn hex_digest(input: String) -> Result<[u8; 32]> {
 }
 
 #[cfg(unix)]
-fn read_funded_closure(path: &str) -> Result<funded::Closure> {
+fn read_funded_document<T: serde::de::DeserializeOwned>(path: &str) -> Result<T> {
     use std::io::Read;
 
     let mut bytes = Vec::new();
@@ -1241,6 +1276,7 @@ async fn require_hold_release(
 struct StoppedDatabase {
     _lock: std::fs::File,
     journal: std::sync::Arc<dyn journal_contract::Journal>,
+    journal_catalog: Uuid,
     keys: std::sync::Arc<rtdb_crypt::FileKms>,
     database: rtdb_db::MultiDatabase,
     io: std::sync::Arc<rtdb_storage::IoRegion>,
@@ -1288,9 +1324,10 @@ impl StoppedDatabase {
             &destination.journal_url,
             &destination.journal_tls_dir,
         )?;
-        let journal = rtdb_stream_journal::connect_consensus(&connection.url, &connection.credentials)
-            .ok_or_else(missing_installation)?
-            .map_err(io_error)?;
+        let journal_path = connection.url.strip_prefix(CONSENSUS_SCHEME).ok_or_else(missing_installation)?;
+        let journal_config = crate::multi::JournalConfig::read(std::path::Path::new(journal_path)).map_err(io_error)?;
+        let journal_catalog = journal_config.catalog;
+        let journal = rtdb_stream_journal::ConsensusJournal::new(&connection.credentials, &journal_config).map_err(io_error)?;
         let journal: Arc<dyn journal_contract::Journal> = Arc::new(journal);
         let keys = Arc::new(FileKms::open(&data.join("keys"), || SystemClock.now().0)?);
         let objects = data.join("objects");
@@ -1314,7 +1351,7 @@ impl StoppedDatabase {
         )?
         .with_immutable_journal()
         .with_activation_scope(scope)?;
-        Ok(Self { _lock: lock, journal, keys, database, io })
+        Ok(Self { _lock: lock, journal, journal_catalog, keys, database, io })
     }
 }
 

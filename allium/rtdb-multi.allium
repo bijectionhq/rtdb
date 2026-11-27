@@ -488,7 +488,7 @@ contract OriginalFundedAdmission {
         -- The matching activation decision closing predecessor grants fixes the scope roster and authorizes each issuer closure.
         -- Each original issuer durably closes its funded scopes under that binding against new bookings and new authorizations for accepting appends.
         -- Each scope closure authenticates a complete immutable inventory of the bookings ordered before it, including bookings whose replies were lost.
-        -- Activation publication requires a matching signed admission closure from every enrolled predecessor scope.
+        -- Activation publication requires a matching signed admission closure and a verified outcome for every booking in every enrolled predecessor scope.
         -- The authority retains the roster and its closures through publication and exposes them by predecessor binding.
         -- Recovery can resume enumeration against the same closure after issuer restart or recovery operation replacement.
         -- A closure can be recorded while earlier authorized work still awaits a terminal decision.
@@ -508,6 +508,7 @@ contract OriginalFundedAdmission {
         -- Recovery leaves an authorized stage unresolved when it cannot verify the original evidence needed for settlement.
         -- RTDB verifies every predecessor scope closure against its enrolled issuer and reconciles the complete inventories before the successor advertises or admits commissioned funded work.
         -- A retained RTDB recovery record binds the verified original issuer evidence to its booking and scope.
+        -- The authority retains verified outcomes in issuer inventory order and publishes only when the installed cut covers every committed stage.
         -- A successor uses its own commissioned scope and preserves the original booking identity for retry and outcome lookup.
 }
 

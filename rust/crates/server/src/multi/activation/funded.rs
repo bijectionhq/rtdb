@@ -6,9 +6,11 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
-    ActivationAuthority, Binding, ELAPSED_GRANT_PROTOCOL, FUNDED_RECOVERY_PROTOCOL, State,
-    conflict, corrupt, unavailable,
+    ActivationAuthority, Binding, ELAPSED_GRANT_PROTOCOL, FUNDED_RECOVERY_PROTOCOL,
+    FUNDED_SETTLEMENT_PROTOCOL, State, conflict, corrupt, unavailable,
 };
+
+pub(super) mod settlement;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -84,6 +86,8 @@ pub(super) struct Scope {
     enrollment: Enrollment,
     scope_sha256: [u8; 32],
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    journal: Option<settlement::JournalTrust>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     closure: Option<Closure>,
 }
 
@@ -102,13 +106,27 @@ pub(super) struct ScopePage {
     scope: Option<Scope>,
 }
 
+fn scope_catalog(scopes: &[Scope]) -> Option<Uuid> {
+    scopes.iter().find_map(|scope| {
+        scope
+            .journal
+            .as_ref()
+            .map(settlement::JournalTrust::catalog)
+    })
+}
+
 fn valid_scopes(activation: StreamId, predecessor: Binding, scopes: &[Scope]) -> bool {
+    let catalog = scope_catalog(scopes);
     scopes
         .windows(2)
         .all(|pair| pair[0].enrollment.key() < pair[1].enrollment.key())
         && scopes.iter().all(|scope| {
             scope.enrollment.valid()
                 && scope.scope_sha256 == scope.enrollment.scope(activation, predecessor)
+                && scope
+                    .journal
+                    .as_ref()
+                    .is_none_or(|journal| journal.valid() && Some(journal.catalog()) == catalog)
                 && scope.closure.as_ref().is_none_or(|receipt| {
                     receipt.scope_sha256 == scope.scope_sha256 && receipt.valid()
                 })
@@ -138,8 +156,10 @@ impl State {
         });
         match &self.funded {
             Some(funded) => {
-                self.version == FUNDED_RECOVERY_PROTOCOL
-                    && funded.base_version >= ELAPSED_GRANT_PROTOCOL
+                matches!(
+                    self.version,
+                    FUNDED_RECOVERY_PROTOCOL | FUNDED_SETTLEMENT_PROTOCOL
+                ) && funded.base_version >= ELAPSED_GRANT_PROTOCOL
                     && valid_scopes(stream, self.binding, &funded.scopes)
                     && funded
                         .scopes
@@ -151,14 +171,20 @@ impl State {
                     })
             }
             None => {
-                self.version != FUNDED_RECOVERY_PROTOCOL
-                    && closed.is_none_or(|(_, scopes)| scopes.is_empty())
+                !matches!(
+                    self.version,
+                    FUNDED_RECOVERY_PROTOCOL | FUNDED_SETTLEMENT_PROTOCOL
+                ) && closed.is_none_or(|(_, scopes)| scopes.is_empty())
             }
         }
     }
 
     fn funded_scopes(&self) -> &[Scope] {
         self.funded.as_ref().map_or(&[], |funded| &funded.scopes)
+    }
+
+    pub(super) fn funded_catalog(&self) -> Option<Uuid> {
+        scope_catalog(self.funded_scopes())
     }
 
     pub(super) fn require_funded_closures(&self) -> Result<&[Scope]> {
@@ -180,9 +206,10 @@ impl ActivationAuthority {
         name: &str,
         binding: Binding,
         enrollment: Enrollment,
+        journal: Option<settlement::JournalTrust>,
     ) -> Result<Scope> {
         let stream = self.stream_id(name)?;
-        if !enrollment.valid() {
+        if !enrollment.valid() || journal.as_ref().is_some_and(|journal| !journal.valid()) {
             return Err(conflict());
         }
         let scope_sha256 = enrollment.scope(stream, binding);
@@ -191,10 +218,33 @@ impl ActivationAuthority {
                 let state = state.ok_or_else(unavailable)?;
                 state.require(binding)?;
                 let scopes = state.funded_scopes();
+                if let (Some(catalog), Some(journal)) = (state.funded_catalog(), journal.as_ref())
+                    && catalog != journal.catalog()
+                {
+                    return Err(conflict());
+                }
                 let offset = match scopes
                     .binary_search_by_key(&enrollment.key(), |scope| scope.enrollment.key())
                 {
-                    Ok(index) if scopes[index].enrollment == enrollment => return Ok(None),
+                    Ok(index)
+                        if scopes[index].enrollment == enrollment
+                            && (journal.is_none() || scopes[index].journal == journal) =>
+                    {
+                        return Ok(None);
+                    }
+                    Ok(index)
+                        if scopes[index].enrollment == enrollment
+                            && scopes[index].journal.is_none() =>
+                    {
+                        if state.grants_closed || state.recovery.is_some() {
+                            return Err(conflict());
+                        }
+                        let mut next = state.clone();
+                        next.funded.as_mut().ok_or_else(corrupt)?.scopes[index].journal =
+                            journal.clone();
+                        next.version = FUNDED_SETTLEMENT_PROTOCOL;
+                        return Ok(Some(next));
+                    }
                     Ok(_) => return Err(conflict()),
                     Err(index) => index,
                 };
@@ -214,10 +264,11 @@ impl ActivationAuthority {
                     Scope {
                         enrollment,
                         scope_sha256,
+                        journal: journal.clone(),
                         closure: None,
                     },
                 );
-                next.version = FUNDED_RECOVERY_PROTOCOL;
+                next.version = FUNDED_SETTLEMENT_PROTOCOL;
                 Ok(Some(next))
             })
             .await?;
@@ -261,6 +312,7 @@ impl ActivationAuthority {
                 let mut next = state.clone();
                 next.funded.as_mut().ok_or_else(corrupt)?.scopes[index].closure =
                     Some(closure.clone());
+                next.version = FUNDED_SETTLEMENT_PROTOCOL;
                 Ok(Some(next))
             })
             .await?;
@@ -309,6 +361,18 @@ impl ActivationAuthority {
         state: &State,
         predecessor: Binding,
     ) -> Result<Vec<Scope>> {
+        Ok(self
+            .archived_funded_recovery(name, state, predecessor)
+            .await?
+            .funded_scopes)
+    }
+
+    async fn archived_funded_recovery(
+        &self,
+        name: &str,
+        state: &State,
+        predecessor: Binding,
+    ) -> Result<super::recovery::Completed> {
         if predecessor.revision >= state.binding.revision {
             return Err(conflict());
         }
@@ -319,13 +383,16 @@ impl ActivationAuthority {
                 .await?
                 .ok_or_else(conflict)?,
         };
-        let scopes = publication.recovery.ok_or_else(conflict)?.funded_scopes;
-        if !valid_scopes(self.stream_id(name)?, predecessor, &scopes)
-            || scopes.iter().any(|scope| scope.closure.is_none())
+        let recovery = publication.recovery.ok_or_else(conflict)?;
+        if !valid_scopes(self.stream_id(name)?, predecessor, &recovery.funded_scopes)
+            || recovery
+                .funded_scopes
+                .iter()
+                .any(|scope| scope.closure.is_none())
         {
             return Err(corrupt());
         }
-        Ok(scopes)
+        Ok(recovery)
     }
 }
 
@@ -446,7 +513,7 @@ mod tests {
             verification_key: issuer.public_key().as_ref().try_into().unwrap(),
         };
         let earlier = authority
-            .commission_funded("xtdb", predecessor, enrollment)
+            .commission_funded("xtdb", predecessor, enrollment, None)
             .await
             .unwrap();
         let ranked_scope = authority
@@ -466,13 +533,14 @@ mod tests {
                     receiver_certificate_sha256: [4; 32],
                     ..enrollment
                 },
+                None,
             )
             .await
             .unwrap();
         assert_ne!(earlier.scope_sha256, later.scope_sha256);
         assert_eq!(
             authority
-                .commission_funded("xtdb", predecessor, enrollment)
+                .commission_funded("xtdb", predecessor, enrollment, None)
                 .await
                 .unwrap(),
             earlier
@@ -483,7 +551,7 @@ mod tests {
         };
         assert!(
             authority
-                .commission_funded("xtdb", predecessor, different_key)
+                .commission_funded("xtdb", predecessor, different_key, None)
                 .await
                 .is_err()
         );
@@ -493,7 +561,7 @@ mod tests {
                 .await
                 .unwrap()
                 .grant_protocol_version,
-            FUNDED_RECOVERY_PROTOCOL
+            FUNDED_SETTLEMENT_PROTOCOL
         );
         assert!(authority.close_grants("xtdb", predecessor).await.is_err());
 
@@ -502,7 +570,7 @@ mod tests {
             .begin_recovery("xtdb", abandoned, None)
             .await
             .unwrap();
-        let earlier_receipt = closure(&issuer, &earlier, 2);
+        let earlier_receipt = closure(&issuer, &earlier, 0);
         assert!(
             authority
                 .record_funded_closure("xtdb", predecessor, earlier_receipt.clone())
@@ -547,7 +615,8 @@ mod tests {
                     Enrollment {
                         receiver_certificate_sha256: [5; 32],
                         ..enrollment
-                    }
+                    },
+                    None,
                 )
                 .await
                 .is_err()

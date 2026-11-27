@@ -468,8 +468,9 @@ A hold on the selected checkpoint preceding a funded append keeps its timed proo
 Logkeeper accepts one checkpoint hold identity per stream and retains its terminal release record through later checkpoint replacements. [Exact checkpoint hold](https://github.com/bijectionhq/logkeeper/blob/14d7b7ec7c3d74667d95bebbe9ee143ca6eb8d98/src/stream/consensus/state/checkpoint.rs#L99-L123) [Released custody regression](https://github.com/bijectionhq/logkeeper/blob/14d7b7ec7c3d74667d95bebbe9ee143ca6eb8d98/src/stream/consensus/keeper/tests/authority.rs#L748-L761)
 Logkeeper can export a portable commitment receipt with `attest_timed_original` on immutable streams after cluster feature level 13 is finalized. The original keeper signs the commitment after a quorum read barrier. The receipt includes the original signed timing samples. Retain the receipt at the original issuer before a covering trim or retirement. Verification uses the enrolled catalog and historical keeper keys and works after the source keepers shut down. [Commitment receipt](https://github.com/bijectionhq/logkeeper/blob/0f056c0570a2a68b74991e1a45f211a280dcfc6e/src/stream/timed.rs)
 Read the complete funded scope roster from the original activation decision that closed predecessor grants, including scopes closed before certificate rotation.
-Upgrade the activation broker and serving readers to activation protocol 9 before enrolling a funded scope.
+Upgrade the activation broker and serving readers to activation protocol 10 before enrolling a funded scope.
 Use the activation broker's `commission-funded` operation to enroll the original issuer's Ed25519 public key and exact receiver certificate against the current binding.
+Use `--journal-trust FILE` to pin the original catalog UUID and historical keeper public keys before the predecessor starts recovery. The file contains `catalog` and a `keepers` array of `identity` and `verification_key` entries.
 The authority orders enrollments by issuer identity and certificate digest and freezes that roster with the predecessor's grants.
 After `freeze-recovery`, page through `funded-scopes` by predecessor incarnation and revision and follow `next_offset`.
 The same lookup returns the frozen roster and recorded closures after supersession, publication, or later recoveries.
@@ -479,8 +480,17 @@ The closure is JSON with `scope_sha256`, `bookings`, `inventory_sha256`, and `si
 Digests and signatures are arrays of unsigned bytes.
 The issuer signs the concatenation of the UTF-8 domain `rtdb.activation.funded-closure/v1` followed by one zero byte, the 32-byte scope digest returned by the broker, the eight-byte big-endian booking count, and the 32-byte inventory digest.
 An empty inventory uses count zero and an all-zero digest.
-The authority verifies the receipt against the enrolled issuer and refuses publication until every predecessor scope has an admission closure.
-These broker operations enroll issuers and import closures. Funded dispatch and per-booking reconciliation still require the original issuer integration.
+The authority verifies the receipt against the enrolled issuer. Publication requires each enrolled closure and its complete verified booking inventory.
+
+Send the issuer's terminal resolutions to `record-funded-outcome` in one-based inventory order. Use `funded-outcome` with the predecessor binding, scope digest and index to recover the exact verified booking and its evidence.
+The issuer orders its frozen inventory by receipt namespace and idempotency key. An absent namespace sorts first, and present namespaces and keys sort by their raw bytes.
+The 32-byte inventory prefix starts at zero. For each booking, hash the UTF-8 domain `rtdb.activation.funded-inventory/v1` followed by one zero byte, the previous prefix and the booking digest. The last prefix must equal the signed closure's inventory digest.
+The booking digest hashes the UTF-8 domain `rtdb.activation.funded-booking/v1` followed by one zero byte and these fields in order. Use the raw booking UUID, a one-byte namespace presence flag and any namespace bytes, the length-prefixed key, the owner digest, the predecessor basis, the intent digest, one kind byte, and the count and contents of the accepting authorizations.
+Encode the predecessor basis as incarnation UUID and position. Each authorization contains one stage byte, writer epoch, position, payload digest, decision cutoff and journal cutoff. All integer lengths, counts, positions, epochs and cutoffs use eight big-endian bytes. The kind is zero for a transaction and one for an appointment. The stage is zero for activation and one for consumption.
+The issuer signs a resolution over the UTF-8 domain `rtdb.activation.funded-resolution/v1` followed by one zero byte, the scope digest, the signed inventory digest, the index, the prefix for that index, the disposition byte, and the count and contents of the stage evidence.
+Disposition zero means accepted and one means refused. A committed stage contributes byte zero and the SHA-256 digest of its encoded keeper commitment. An excluded stage contributes byte one and requires the original lossless seal.
+RTDB re-verifies the pinned keeper receipt for each committed stage and checks the original source fence for each excluded stage. It retains earlier appointment activation evidence even when consumption ends in refusal.
+These broker operations reconcile closures and terminal resolutions supplied by the issuer. Live funded dispatch still requires the original issuer integration.
 
 Obtain a durable closure for each scope and enumerate its complete booking inventory, including bookings whose replies were lost.
 Resume from that same closure after a restart or replacement recovery operation.

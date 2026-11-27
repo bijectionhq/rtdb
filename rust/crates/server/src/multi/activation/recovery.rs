@@ -4,7 +4,7 @@ use super::{
     clock, conflict, journal_custody::RetainedJournal, journal_error, unavailable,
 };
 
-use journal_contract::{Epoch, Journal, JournalError, Lsn, StreamId, WriterSessionId};
+use journal_contract::{Epoch, Journal, JournalError, Lsn, SealReceipt, StreamId, WriterSessionId};
 use rtdb_types::{Anomaly, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -59,6 +59,8 @@ pub(super) struct Pending {
     intent: Intent,
     installation: Option<Installation>,
     final_source_lsn: Option<Lsn>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    final_source_epoch: Option<Epoch>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -71,6 +73,8 @@ pub(super) struct Completed {
     loss_policy: LossPolicy,
     source_cut: SourceCut,
     final_source_lsn: Option<Lsn>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    final_source_epoch: Option<Epoch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     key_hold: Option<rtdb_crypt::RecoveryKeyHold>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -88,6 +92,8 @@ pub(crate) enum Status {
         grants_closed: bool,
         installation: Option<Installation>,
         final_source_lsn: Option<Lsn>,
+        #[serde(skip)]
+        funded_source_fence_needed: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         ranked_closure: Option<super::ranked::RankedClosure>,
     },
@@ -143,6 +149,7 @@ impl State {
                     .destination_cell
                     .is_none_or(|cell| !cell.is_nil())
                 && (pending.final_source_lsn.is_none() || self.grants_closed)
+                && pending.final_source_epoch.is_none_or(|epoch| epoch != Epoch(0) && pending.final_source_lsn.is_some())
                 && pending.installation.is_none_or(|installation| {
                     installation.source_cut.lsn != 0
                         && custody_protocol(installation.key_hold, installation.journal_hold, installation.objects_sha256)
@@ -165,6 +172,7 @@ impl State {
                     })
                     && publication.predecessor.revision.checked_add(1)
                         == Some(self.binding.revision)
+                    && completed.final_source_epoch.is_none_or(|epoch| epoch != Epoch(0) && completed.final_source_lsn.is_some())
                     && match completed.loss_policy {
                         LossPolicy::Lossless => {
                             completed.final_source_lsn == Some(Lsn(completed.source_cut.lsn))
@@ -215,6 +223,10 @@ impl State {
 }
 
 impl Completed {
+    pub(super) fn source_fence(&self) -> Option<(Epoch, Lsn)> {
+        self.final_source_epoch.zip(self.final_source_lsn)
+    }
+
     fn installation(&self, manifest_digest: [u8; 32]) -> Installation {
         Installation {
             manifest_digest,
@@ -223,6 +235,12 @@ impl Completed {
             journal_hold: self.journal_hold,
             objects_sha256: self.objects_sha256,
         }
+    }
+}
+
+impl Pending {
+    pub(super) fn source_fence(self) -> Option<(Epoch, Lsn)> {
+        self.final_source_epoch.zip(self.final_source_lsn)
     }
 }
 
@@ -256,6 +274,7 @@ impl ActivationAuthority {
                 }
                 let mut next = state.clone();
                 let mut final_source_lsn = None;
+                let mut final_source_epoch = None;
                 if let Some(pending) = state.recovery {
                     if pending.intent == intent {
                         return Ok(None);
@@ -271,6 +290,7 @@ impl ActivationAuthority {
                         .insert(pending.intent.operation.operation_id);
                     if intent.loss_policy == LossPolicy::Lossless {
                         final_source_lsn = pending.final_source_lsn;
+                        final_source_epoch = pending.final_source_epoch;
                     }
                 } else if supersedes.is_some() {
                     return Err(conflict());
@@ -280,6 +300,7 @@ impl ActivationAuthority {
                     intent,
                     installation: None,
                     final_source_lsn,
+                    final_source_epoch,
                 });
                 Ok(Some(next))
             })
@@ -375,6 +396,7 @@ impl ActivationAuthority {
             grants_closed: state.grants_closed,
             installation: pending.installation,
             final_source_lsn: pending.final_source_lsn,
+            funded_source_fence_needed: state.funded_catalog().is_some() && pending.final_source_epoch.is_none(),
             ranked_closure: state.ranked.and_then(|ranked| ranked.closure),
         })
     }
@@ -477,6 +499,7 @@ impl ActivationAuthority {
         operation: Operation,
         source: &dyn Journal,
         source_cell: Option<Uuid>,
+        source_catalog: Option<Uuid>,
     ) -> Result<Status> {
         self.access.require_operator()?;
         let stream = self.stream_id(name)?;
@@ -489,10 +512,13 @@ impl ActivationAuthority {
         if !state.grants_closed
             || pending.intent.loss_policy != LossPolicy::Lossless
             || state.destination_cell() != source_cell
+            || state.funded_catalog().is_some_and(|original| Some(original) != source_catalog)
         {
             return Err(conflict());
         }
-        if pending.final_source_lsn.is_some() {
+        if pending.final_source_lsn.is_some()
+            && (state.funded_catalog().is_none() || pending.final_source_epoch.is_some())
+        {
             return self.recovery_status_at(name, &state, operation);
         }
         clock::wait_out(
@@ -502,7 +528,8 @@ impl ActivationAuthority {
         .await?;
         // The source verifier has opened this commissioned predecessor. A new quorum
         // writer fence orders all still in-flight writer requests before this cut.
-        let final_source_lsn = sealed_head(source, operation).await?;
+        let seal = seal_predecessor(source, operation).await?;
+        let final_source_lsn = seal.sealed_head_lsn;
         let state = self
             .change(stream, |state| {
                 let state = state.ok_or_else(unavailable)?;
@@ -521,17 +548,22 @@ impl ActivationAuthority {
                 if !state.grants_closed
                     || pending.intent.loss_policy != LossPolicy::Lossless
                     || state.destination_cell() != source_cell
+                    || state.funded_catalog().is_some_and(|original| Some(original) != source_catalog)
                 {
                     return Err(conflict());
                 }
-                if let Some(prior) = pending.final_source_lsn {
-                    return if prior == final_source_lsn {
-                        Ok(None)
-                    } else {
-                        Err(conflict())
-                    };
+                if pending.final_source_lsn.is_some_and(|prior| prior != final_source_lsn)
+                    || pending.final_source_epoch.is_some_and(|prior| prior != seal.fence.writer_epoch)
+                {
+                    return Err(conflict());
+                }
+                if pending.final_source_epoch.is_some() {
+                    return Ok(None);
                 }
                 pending.final_source_lsn = Some(final_source_lsn);
+                if state.funded_catalog().is_some() {
+                    pending.final_source_epoch = Some(seal.fence.writer_epoch);
+                }
                 let mut next = state.clone();
                 next.recovery = Some(pending);
                 Ok(Some(next))
@@ -564,6 +596,7 @@ impl ActivationAuthority {
         })?;
         let ranked_closure = frozen.require_ranked_closure()?;
         let funded_scopes = frozen.require_funded_closures()?;
+        self.require_funded_settlements(&frozen, Lsn(installation.source_cut.lsn)).await?;
         let successor = self.candidate(name, pending.intent)?;
         let publication = Publication {
             operation: operation.operation_id,
@@ -576,6 +609,7 @@ impl ActivationAuthority {
                 loss_policy: pending.intent.loss_policy,
                 source_cut: installation.source_cut,
                 final_source_lsn: pending.final_source_lsn,
+                final_source_epoch: pending.final_source_epoch,
                 key_hold: installation.key_hold,
                 journal_hold: installation.journal_hold,
                 objects_sha256: installation.objects_sha256,
@@ -616,7 +650,7 @@ impl ActivationAuthority {
     }
 }
 
-async fn sealed_head(source: &dyn Journal, operation: Operation) -> Result<Lsn> {
+async fn seal_predecessor(source: &dyn Journal, operation: Operation) -> Result<SealReceipt> {
     let stream = StreamId(operation.predecessor.incarnation.as_u128());
     source
         .require_immutable(stream)
@@ -632,16 +666,12 @@ async fn sealed_head(source: &dyn Journal, operation: Operation) -> Result<Lsn> 
     let mut expected = Epoch(0);
     for _ in 0..super::ATTEMPTS {
         match source.seal_session(stream, expected, session).await {
-            Ok(receipt) if receipt.sealed_head_lsn != Lsn(0) => return Ok(receipt.sealed_head_lsn),
-            Ok(_) => return Err(conflict()),
+            Ok(receipt) => return checked_seal(receipt, stream, session),
             Err(JournalError::Fenced { current }) if current != expected => {
                 // Reopen the original receipt after a crash following the source seal.
                 if let Some(previous) = current.0.checked_sub(1) {
                     match source.seal_session(stream, Epoch(previous), session).await {
-                        Ok(receipt) if receipt.sealed_head_lsn != Lsn(0) => {
-                            return Ok(receipt.sealed_head_lsn);
-                        }
-                        Ok(_) => return Err(conflict()),
+                        Ok(receipt) => return checked_seal(receipt, stream, session),
                         Err(JournalError::Fenced { .. }) => (),
                         Err(error) => return Err(journal_error(error)),
                     }
@@ -652,6 +682,15 @@ async fn sealed_head(source: &dyn Journal, operation: Operation) -> Result<Lsn> 
         }
     }
     Err(unavailable())
+}
+
+fn checked_seal(receipt: SealReceipt, stream: StreamId, session: WriterSessionId) -> Result<SealReceipt> {
+    if receipt.fence.stream != stream || receipt.fence.writer_session_id != session
+        || receipt.fence.writer_epoch == Epoch(0) || receipt.sealed_head_lsn == Lsn(0)
+    {
+        return Err(conflict());
+    }
+    Ok(receipt)
 }
 
 fn same_installation(prior: Installation, supplied: Installation) -> Result<Option<State>> {
@@ -752,7 +791,7 @@ mod tests {
         );
         assert_eq!(
             authority
-                .seal_recovery_source("xtdb", operation, &journal, None)
+                .seal_recovery_source("xtdb", operation, &journal, None, None)
                 .await
                 .unwrap_err()
                 .code,
@@ -773,7 +812,7 @@ mod tests {
             .await
             .unwrap();
         let sealed = authority
-            .seal_recovery_source("xtdb", operation, &journal, None)
+            .seal_recovery_source("xtdb", operation, &journal, None, None)
             .await
             .unwrap();
         assert!(matches!(
