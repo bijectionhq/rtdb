@@ -2502,8 +2502,10 @@ surface QueryAccess {
         -- A same-scale Decimal128 sum at non-negative scale accumulates its exact coefficient and checks physical overflow.
         -- Compatible Decimal128 extrema compare exact coefficients at the result scale and keep the winning coefficient inline.
         -- A compatible decimal input to a double result converts its coefficient at the field's logical scale.
+        -- A double sum or average can reduce a compatible mixture of integer, floating-point and decimal Arrow cells in input order.
         -- Duration sums and averages keep the declared unit and use wrapping signed arithmetic for unit conversion and addition.
         -- A duration sum or average reads compatible Arrow cells in selection order using each cell's unit and reports the first selected null at its page index for a concrete duration input.
+        -- A duration sum or average over an admitted union skips null arguments.
         -- Compatible timestamp, time and duration extrema compare Arrow ticks at the result type's precision.
         -- An extremum requiring temporal conversion casts each reached candidate before comparison and preserves the result type's unit and timezone label.
         -- Date extrema compare calendar days and preserve the first winner's ticks among peers.

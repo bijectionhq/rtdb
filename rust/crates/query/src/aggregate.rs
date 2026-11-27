@@ -732,10 +732,7 @@ impl PercentileKey {
         let Some(cell) = present_column_position(column, row)? else {
             return Err(invalid("percentile-input", "A ranked numeric cell must be present"));
         };
-        if decimal_storage(cell.field.data_type()) {
-            return Ok(NumericCell::Float64(rtdb_columnar::decimal_cell_as_f64(cell.field, cell.array, cell.row)?));
-        }
-        NumericCell::read_arrow(cell)
+        NumericCell::read_number_arrow(cell)
     }
 
     fn compare(&self, left: (&Column, usize), right: (&Column, usize)) -> Result<Ordering> {
@@ -837,8 +834,14 @@ fn masked_count_layout(data_type: &DataType) -> bool {
     count_layout(data_type) || matches!(data_type,
         DataType::Date32 | DataType::Date64 | DataType::Timestamp(..) | DataType::Duration(_)
         | DataType::Time32(ArrowTimeUnit::Second | ArrowTimeUnit::Millisecond)
-        | DataType::Time64(ArrowTimeUnit::Microsecond | ArrowTimeUnit::Nanosecond)
-        | DataType::Decimal32(..) | DataType::Decimal64(..) | DataType::Decimal128(..) | DataType::Decimal256(..))
+        | DataType::Time64(ArrowTimeUnit::Microsecond | ArrowTimeUnit::Nanosecond))
+}
+
+fn accepts_masked_count(column: &Column) -> bool {
+    admits_reduction_column(column, |field, logical| {
+        if decimal_storage(field.data_type()) { return decimal_leaf(field, logical); }
+        admits_plain_leaf(field, logical, masked_count_layout)
+    })
 }
 
 fn count_is_present(page: Rows<'_>, typed: Option<&Column>, row: usize, argument: Option<usize>) -> Result<bool> {
@@ -849,14 +852,16 @@ fn count_is_present(page: Rows<'_>, typed: Option<&Column>, row: usize, argument
 }
 
 fn accepts_typed_column(column: &Column, accepts_type: impl Fn(&DataType) -> bool) -> bool {
-    admits_reduction_column(column, |field, logical| {
-        if !field.metadata().is_empty() { return false; }
-        if field.data_type() == &DataType::Null {
-            return field.is_nullable() && logical.is_none_or(|ty| *ty == LogicalType::Null);
-        }
-        accepts_type(field.data_type())
-            && logical.is_none_or(|ty| crate::columnar::stable_read_layout(ty, field))
-    })
+    admits_reduction_column(column, |field, logical| admits_plain_leaf(field, logical, &accepts_type))
+}
+
+fn admits_plain_leaf(field: &ArrowField, logical: Option<&LogicalType>, accepts_type: impl Fn(&DataType) -> bool) -> bool {
+    if !field.metadata().is_empty() { return false; }
+    if field.data_type() == &DataType::Null {
+        return field.is_nullable() && logical.is_none_or(|ty| *ty == LogicalType::Null);
+    }
+    accepts_type(field.data_type())
+        && logical.is_none_or(|ty| crate::columnar::stable_read_layout(ty, field))
 }
 
 fn admits_reduction_column(column: &Column, leaf: impl Fn(&ArrowField, Option<&LogicalType>) -> bool) -> bool {
@@ -1195,7 +1200,7 @@ impl AggregateColumn {
             Accumulation::Counts(counts) => {
                 counts.ensure(group_count)?;
                 let all = aggregate.function == AggregateFunction::CountStar;
-                let typed = input.arrow_column(argument).filter(|column| accepts_typed_column(column, masked_count_layout));
+                let typed = input.arrow_column(argument).filter(|column| accepts_masked_count(column));
                 for (row, group) in mapping.iter().enumerate() {
                     execution.context.check_cancelled_at(row)?;
                     if mask.contains(row) && (all || count_is_present(input, typed, row, argument)?) {
@@ -1210,7 +1215,7 @@ impl AggregateColumn {
                 let Rows { batch, projected, .. } = input;
                 let argument = argument.ok_or_else(|| invalid("aggregate-state", "Collected aggregate argument is absent"))?;
                 if matches!(aggregate.function, AggregateFunction::Percentile { .. }) {
-                    let typed = input.arrow_column(Some(argument)).filter(|column| accepts_typed_column(column, masked_count_layout));
+                    let typed = input.arrow_column(Some(argument)).filter(|column| accepts_masked_count(column));
                     for (row, selected) in mask.flags(input.len(), &scope)?.iter_mut().enumerate() {
                         execution.context.check_cancelled_at(row)?;
                         if *selected { *selected = count_is_present(input, typed, row, Some(argument))?; }
@@ -1671,6 +1676,13 @@ enum NumericCell {
 }
 
 impl NumericCell {
+    fn read_number_arrow(cell: ArrowCell<'_>) -> Result<Self> {
+        if decimal_storage(cell.field.data_type()) {
+            return Ok(Self::Float64(rtdb_columnar::decimal_cell_as_f64(cell.field, cell.array, cell.row)?));
+        }
+        Self::read_arrow(cell)
+    }
+
     fn read_arrow(cell: ArrowCell<'_>) -> Result<Self> {
         Ok(match cell.field.data_type() {
             DataType::Float32 => Self::Float32(cell.array.as_primitive::<Float32Type>().value(cell.row)),
@@ -1874,16 +1886,25 @@ impl ScalarGroups {
     }
     fn sum_page(&mut self,page: Rows<'_>,mapping: GroupMapping<'_>,selected: impl Fn(usize) -> bool + Copy,argument: Option<usize>,summer: &SumFactory<'_>,execution: &Execution) -> Result<()> {
         let _scratch = execution.context.memory.reserve(4096)?;
+        let source = page.arrow_column(argument);
+        let input = without_nullability(summer.input);
         let numeric = matches!(summer.output, LogicalType::Scalar(ScalarType::I32 | ScalarType::I64 | ScalarType::F32 | ScalarType::F64))
-            .then(|| NumericColumn::bind(page.arrow_column(argument)?, None)).flatten();
-        let decimal = page.arrow_column(argument).filter(|column| {
-            matches!(without_nullability(summer.input), LogicalType::Scalar(ScalarType::Decimal { .. }))
-                && admits_reduction_column(column, decimal_leaf)
+            .then(|| NumericColumn::bind(source?, None)).flatten();
+        let double = source.filter(|column| {
+            numeric.is_none() && summer.output == &LogicalType::Scalar(ScalarType::F64)
+                && admits_reduction_column(column, |field, logical| {
+                    NumericColumn::admits_leaf(field, logical, None) || decimal_leaf(field, logical)
+                })
         });
-        let duration = match (without_nullability(summer.input), summer.output) {
-            (LogicalType::Scalar(ScalarType::Duration(_)), LogicalType::Scalar(ScalarType::Duration(output))) =>
-                page.arrow_column(argument).filter(|column| accepts_typed_column(column, |ty| matches!(ty, DataType::Duration(_))))
-                    .map(|column| (column, *output)),
+        let decimal = match summer.output {
+            LogicalType::Scalar(ScalarType::Decimal { scale, bit_width: 128, .. }) if *scale >= 0 =>
+                source.filter(|column| admits_reduction_column(column, decimal_leaf)).map(|column| (column, *scale)),
+            _ => None,
+        };
+        let duration = match summer.output {
+            LogicalType::Scalar(ScalarType::Duration(output)) => source
+                .filter(|column| accepts_typed_column(column, |ty| matches!(ty, DataType::Duration(_))))
+                .map(|column| (column, *output)),
             _ => None,
         };
         for (index, group) in mapping.iter().enumerate() {
@@ -1896,40 +1917,32 @@ impl ScalarGroups {
                 }
                 continue;
             }
+            if let Some(column) = double {
+                if let Some(cell) = present_column_position(column, index)? {
+                    state.add_numeric(NumericCell::read_number_arrow(cell)?, summer.output)?;
+                }
+                continue;
+            }
             if let Some((column, output)) = duration {
                 let Some((array, offset)) = present_column_cell(column, index)? else {
-                    return Err(duration_null(index));
+                    if matches!(input, LogicalType::Scalar(ScalarType::Duration(_))) { return Err(duration_null(index)); }
+                    continue;
                 };
                 let DataType::Duration(unit) = array.data_type() else { return Err(sum_state()); };
                 state.add_duration(temporal_ticks(array, offset)?, time_unit(unit), output)?;
                 continue;
             }
-            if let Some(column) = decimal {
-                let cell = present_column_position(column, index)?;
-                match summer.output {
-                    LogicalType::Scalar(ScalarType::F64) => {
-                        if let Some(ArrowCell { field, array, row }) = cell {
-                            let value = rtdb_columnar::decimal_cell_as_f64(field, array, row)?;
-                            state.add_numeric(NumericCell::Float64(value), summer.output)?;
-                        }
+            if let Some((column, scale)) = decimal && !matches!(state.accumulator, ScalarState::Retained(_)) {
+                if let Some(cell) = present_column_position(column, index)? {
+                    if let Some((parameters, bytes)) = cell.decimal_coefficient()?
+                        && parameters.bit_width == 128 && parameters.scale == scale
+                    {
+                        state.add_decimal128(i128::from_be_bytes(bytes[16..].try_into().expect("Decimal128 coefficient width")))?;
                         continue;
                     }
-                    LogicalType::Scalar(ScalarType::Decimal { scale, bit_width: 128, .. })
-                        if *scale >= 0 && !matches!(state.accumulator, ScalarState::Retained(_)) =>
-                    {
-                        if let Some(cell) = cell {
-                            if let Some((parameters, bytes)) = cell.decimal_coefficient()?
-                                && parameters.bit_width == 128 && parameters.scale == *scale
-                            {
-                                state.add_decimal128(i128::from_be_bytes(bytes[16..].try_into().expect("Decimal128 coefficient width")))?;
-                                continue;
-                            }
-                        } else {
-                            state.add_decimal128(0)?;
-                            continue;
-                        }
-                    }
-                    _ => {}
+                } else {
+                    if matches!(input, LogicalType::Scalar(ScalarType::Decimal { .. })) { state.add_decimal128(0)?; }
+                    continue;
                 }
             }
             let value = page.value(index,argument)?;
@@ -1938,7 +1951,7 @@ impl ScalarGroups {
         Ok(())
     }
     fn count_page(&mut self,page: Rows<'_>,mapping: GroupMapping<'_>,selected: impl Fn(usize) -> bool + Copy,argument: Option<usize>,execution: &Execution) -> Result<()> {
-        let typed = page.arrow_column(argument).filter(|column| accepts_typed_column(column, masked_count_layout));
+        let typed = page.arrow_column(argument).filter(|column| accepts_masked_count(column));
         for (row, group) in mapping.iter().enumerate() {
             execution.context.check_cancelled_at(row)?;
             if !selected(row) { continue; }

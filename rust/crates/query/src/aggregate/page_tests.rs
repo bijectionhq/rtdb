@@ -1290,6 +1290,50 @@ fn decimal_average_reads_the_annotated_scale_before_rounding_to_double() {
 }
 
 #[tokio::test]
+async fn mixed_numeric_average_preserves_input_order_and_counts_nonnull_values() {
+    let execution = execution(8);
+    let decimal = Value::Decimal(decimal128_value(-100_000_000_000_000_000, 20, 1).unwrap());
+    let integer = Value::I64(10_000_000_000_000_000);
+    let ty = decimal.logical_type().join(&integer.logical_type()).maybe();
+    let result = primitive_cursor(&execution, AggregateFunction::Average, ty.clone(), ty,
+        vec![vec![integer, decimal, Value::I64(3), Value::Null]], None);
+    assert_eq!(primitive_result(result).await, Value::F64(1.0));
+}
+
+#[test]
+fn duration_average_skips_a_null_in_an_admitted_union() {
+    use crate::columnar::SelectedColumn;
+    let execution = execution(8);
+    let memory = &execution.context.memory;
+    let seconds = LogicalType::Scalar(ScalarType::Duration(TimeUnit::Second));
+    let millis = LogicalType::Scalar(ScalarType::Duration(TimeUnit::Millisecond));
+    let input = seconds.join(&millis).maybe();
+    let sources = vec![
+        Some((
+            Arc::new(arrow_array::DurationSecondArray::from(vec![2])) as arrow_array::ArrayRef,
+            Arc::new(rtdb_columnar::to_field("c0", &seconds).unwrap()), None, None,
+        )),
+        Some((
+            Arc::new(arrow_array::DurationMillisecondArray::from(vec![9])) as arrow_array::ArrayRef,
+            Arc::new(rtdb_columnar::to_field("c0", &millis).unwrap()), None, None,
+        )),
+        None,
+    ];
+    let selected = SelectedColumn::new(sources, Arc::new(vec![(0, 0), (2, 0), (1, 0)]));
+    let batch = ColumnBatch::settled(vec![Column::Selected(selected)], 3, memory.reserve(4096).unwrap()).unwrap();
+    let rows = Rows::columns(&batch, &[0], false, &execution.context).unwrap();
+    let mut states = ScalarGroups::new(&execution).unwrap();
+    states.ensure(1).unwrap();
+    let factory = SumFactory::new(&input, &millis).unwrap();
+    let pressure = memory.reserve(memory.available_bytes() - 4096).unwrap();
+    states.sum_page(rows, GroupMapping::Global(3), |_| true, Some(0), &factory, &execution).unwrap();
+    states.count_page(rows, GroupMapping::Global(3), |_| true, Some(0), &execution).unwrap();
+    drop(pressure);
+    assert!(matches!(states.values[0].accumulator, ScalarState::Duration(2009, TimeUnit::Millisecond)));
+    assert_eq!(states.values[0].count, 2);
+}
+
+#[tokio::test]
 async fn aggregate_input_timestamp_extremum_keeps_units_and_casts_each_reached_value() {
     let execution = execution(8);
     let memory = &execution.context.memory;
