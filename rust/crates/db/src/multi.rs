@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, net::IpAddr, sync::{Arc, Weak}};
+use std::{collections::BTreeSet, net::IpAddr, sync::{Arc, Weak}, time::Duration};
 
 use journal_contract::{Epoch, Journal, JournalError, Lsn};
 use rtdb_crypt::{Generation, Kms, tokens::TokenAuthority};
@@ -69,6 +69,25 @@ impl AppliedWatch {
             held = self.stream.wait_after(applied, until) => held,
             _ = tokio::time::sleep_until(until) => Ok(()),
         }
+    }
+
+    /// Waits until this residence applies a local journal position not yet marked seen,
+    /// without starting a journal long poll.
+    pub async fn local_changed(&mut self) -> Result<()> {
+        self.applied.changed().await.map_err(|_| Anomaly::new(
+            AnomalyCategory::Unavailable, "rtdb/residence-closed", "The database residence closed",
+        ))
+    }
+
+    /// Waits until this residence's applied position reaches at least `target`.
+    pub async fn wait_local_at_least(&mut self, target: u64) -> Result<()> {
+        self.applied
+            .wait_for(|&applied| applied >= target)
+            .await
+            .map(|_| ())
+            .map_err(|_| Anomaly::new(
+                AnomalyCategory::Unavailable, "rtdb/residence-closed", "The database residence closed",
+            ))
     }
 }
 
@@ -662,6 +681,60 @@ impl MultiDatabase {
     /// Watches the journal position this residence has applied, and the journal past it.
     pub fn watch_applied(&self) -> AppliedWatch {
         AppliedWatch { applied: self.applied.subscribe(), stream: self.stream.clone() }
+    }
+
+    /// Duration until the next lease renewal, predecessor or competing-seal lapse,
+    /// or armed key-rotation destruction deadline, relative to this residence's clock.
+    pub fn next_deadline(&self, live_nodes: &BTreeSet<IpAddr>) -> Option<Duration> {
+        if self.assigned_follower.strong_count() != 0
+            || self.committed.as_ref().is_some_and(|state| state.retired.is_some())
+        {
+            return None;
+        }
+        let now = (self.clock)().0;
+        let mut earliest: Option<i64> = None;
+        let mut consider = |at: i64| {
+            earliest = Some(earliest.map_or(at, |previous| previous.min(at)));
+        };
+        if let Some(writer) = &self.writer {
+            let renew_at = writer
+                .lease
+                .until
+                .saturating_sub(self.options.drift_micros)
+                .saturating_sub(self.options.lease_micros / 2);
+            consider(renew_at);
+            if let Some(destroy_at) = writer.rotation.and_then(|armed| armed.pending_destruction_at()) {
+                consider(destroy_at);
+            }
+        } else if preferred(self.options.database, live_nodes) == Some(self.options.node)
+            && let Some(state) = &self.committed
+        {
+            if let Some((_, until)) = state.lease
+                && !self.observed_deadline(until)
+            {
+                consider(until.saturating_add(self.options.drift_micros).saturating_add(1));
+            } else {
+                let seen = state.epoch.max(self.last_allocated);
+                if let Some(lease) = self.competing_seal.filter(|lease| lease.epoch > seen)
+                    && !self.observed_deadline(lease.until)
+                {
+                    consider(lease.until.saturating_add(self.options.drift_micros).saturating_add(1));
+                } else {
+                    consider(now);
+                }
+            }
+        }
+        earliest.map(|at| Duration::from_micros(at.saturating_sub(now).max(0) as u64))
+    }
+
+    /// The journal position at which `checkpoint_retained_suffix(limit)` becomes due,
+    /// or `None` when this node is not an active writer.
+    pub fn next_checkpoint_lsn(&self, limit: u64) -> Option<u64> {
+        if self.writer.is_none() || self.authority().is_err() {
+            return None;
+        }
+        let state = self.committed.as_ref()?;
+        Some(state.floor.0.saturating_add(limit).saturating_sub(1))
     }
 
     fn install_committed(&mut self, state: Committed) {

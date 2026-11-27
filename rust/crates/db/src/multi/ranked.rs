@@ -66,6 +66,14 @@ impl AsRef<[u8]> for HeldFile {
 }
 
 impl MultiDatabase {
+    pub fn has_ranked_work(&self) -> bool {
+        self.authority().is_ok()
+            && self
+                .committed
+                .as_ref()
+                .is_some_and(|state| self.may_publish_ranked(state.transactions.index().head()))
+    }
+
     pub fn ranked_build(&self) -> Result<Option<RankedBuild>> {
         let lease = self.authority()?;
         let state = self.state();

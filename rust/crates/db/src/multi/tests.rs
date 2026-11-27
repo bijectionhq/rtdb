@@ -2899,3 +2899,33 @@ async fn applied_watch_waiters_share_one_journal_long_poll() {
     // A woken waiter that re-checks before its refresh lands may poll once more, but never one poll per waiter.
     assert!(polls.count.load(Ordering::SeqCst) < 4, "the waiters shared their long polls");
 }
+
+#[tokio::test]
+async fn next_deadline_tracks_writer_renewal_and_follower_lapse() {
+    let journal = journals().await;
+    let cluster = Cluster::new();
+    let mut writer = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
+    let mut follower = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY)));
+    writer.create().await.unwrap();
+    assert_eq!(writer.next_deadline(&live(1)), None);
+
+    writer.tick(&live(1)).await.unwrap();
+    assert_eq!(
+        writer.next_deadline(&live(1)),
+        Some(Duration::from_micros((LEASE / 2 - DRIFT) as u64)),
+    );
+    assert!(writer.next_checkpoint_lsn(10).is_some());
+
+    follower.fresh_index().await.unwrap();
+    assert_eq!(follower.next_deadline(&live(1)), None);
+    assert_eq!(
+        follower.next_deadline(&live(2)),
+        Some(Duration::from_micros((LEASE + DRIFT + 1) as u64)),
+    );
+    assert_eq!(follower.next_checkpoint_lsn(10), None);
+
+    cluster.at(10 + LEASE + DRIFT + 1);
+    assert_eq!(writer.next_deadline(&live(1)), Some(Duration::ZERO));
+    assert_eq!(follower.next_deadline(&live(2)), Some(Duration::ZERO));
+    assert_eq!(follower.next_deadline(&live(1)), None);
+}

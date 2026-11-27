@@ -21,6 +21,12 @@ pub(super) struct ArmedRotation {
     destroyed: bool,
 }
 
+impl ArmedRotation {
+    pub(super) fn pending_destruction_at(&self) -> Option<i64> {
+        (!self.destroyed).then(|| self.retirement.unreadable_by())
+    }
+}
+
 impl MultiDatabase {
     pub(super) async fn check_erase_storage(&self, lease: Lease) -> Result<()> {
         self.require_destroyed_generation()?;

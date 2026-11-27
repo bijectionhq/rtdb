@@ -198,6 +198,17 @@ impl Catalog {
         matches!(self.database.lock().await.role(), rtdb_db::Role::Writer(_))
     }
 
+    pub(super) async fn watch_applied(&self) -> rtdb_db::AppliedWatch {
+        self.database.lock().await.watch_applied()
+    }
+
+    pub(super) async fn next_deadline(
+        &self,
+        live_nodes: &std::collections::BTreeSet<std::net::IpAddr>,
+    ) -> Option<std::time::Duration> {
+        self.database.lock().await.next_deadline(live_nodes)
+    }
+
     pub(super) async fn read(&self) -> Result<BTreeMap<String, Deployment>> {
         read(&mut *self.database.lock().await).await
     }

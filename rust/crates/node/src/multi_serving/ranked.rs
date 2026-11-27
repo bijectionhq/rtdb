@@ -84,6 +84,15 @@ impl AsRef<[u8]> for ChargedBytes {
 /// the writer checkpoints and trims at half that bound.
 pub const JOURNAL_CHECKPOINT_RECORDS: u64 = 131_072;
 
+/// The next journal position and ranked-catalog timestamps that wake
+/// background maintenance for one [`MultiServing`] residence.
+#[derive(Clone, Copy, Default)]
+pub struct MaintenanceSchedule {
+    pub checkpoint_lsn: Option<u64>,
+    pub ranked_due: Option<Instant>,
+    pub ranked_cooldown: Option<Instant>,
+}
+
 impl MultiServing {
     /// Checkpoints and trims once the writer's retained journal suffix
     /// reaches [`JOURNAL_CHECKPOINT_RECORDS`].
@@ -92,6 +101,25 @@ impl MultiServing {
     pub async fn written_stream(&self) -> Option<u128> {
         let database = self.database.lock().await;
         matches!(database.role(), rtdb_db::Role::Writer(_)).then(|| database.journal_stream().0)
+    }
+
+    pub async fn maintenance_schedule(&self) -> MaintenanceSchedule {
+        let (checkpoint_lsn, has_ranked) = {
+            let database = self.database.lock().await;
+            (
+                database.next_checkpoint_lsn(JOURNAL_CHECKPOINT_RECORDS),
+                database.has_ranked_work(),
+            )
+        };
+        let schedule = *self.ranked_schedule.lock().await;
+        let now = Instant::now();
+        let ranked_cooldown = schedule.filter(|&allowed| now < allowed);
+        let ranked_due = has_ranked.then(|| schedule.unwrap_or(now));
+        MaintenanceSchedule {
+            checkpoint_lsn,
+            ranked_due,
+            ranked_cooldown,
+        }
     }
 
     pub async fn maintain_journal_bound(&self) -> Result<()> {

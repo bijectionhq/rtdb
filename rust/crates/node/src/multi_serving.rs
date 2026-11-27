@@ -25,6 +25,7 @@ use crate::serving::{
 use crate::{Database, DatabaseCatalog};
 
 mod ranked;
+pub use ranked::MaintenanceSchedule;
 
 pub(crate) struct MultiSqlDelivery {
     pub(crate) catalog: Arc<DatabaseCatalog>,
@@ -515,6 +516,18 @@ impl MultiServing {
             Role::Follower => None,
             Role::Writer(epoch) => Some(epoch.0),
         }
+    }
+
+    pub async fn watch_applied(&self) -> rtdb_db::AppliedWatch {
+        self.database.lock().await.watch_applied()
+    }
+
+    pub async fn next_deadline(&self, live_nodes: &BTreeSet<IpAddr>) -> Option<Duration> {
+        self.database.lock().await.next_deadline(live_nodes)
+    }
+
+    pub async fn is_writer(&self) -> bool {
+        matches!(self.database.lock().await.role(), Role::Writer(_))
     }
 
     pub async fn retire_deployment(&self) -> Result<rtdb_db::DeploymentRetirement> {

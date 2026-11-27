@@ -54,6 +54,9 @@ use catalog::{Status, TransferExport};
 
 const WRITER_LEASE_MICROS: i64 = 5_000_000;
 const CLOCK_DRIFT_MICROS: i64 = 250_000;
+const RETRY_DELAY: Duration = Duration::from_millis(250);
+const IDLE_WATCH_TIMEOUT: Duration = Duration::from_secs(30);
+const PEER_DISCOVERY_INTERVAL: Duration = Duration::from_secs(1);
 pub const DEVELOPMENT_DATABASE: &str = "xtdb";
 
 type ServingDatabases = Arc<RwLock<BTreeMap<String, Arc<MultiServing>>>>;
@@ -110,6 +113,7 @@ impl DevelopmentStreamJournal {
 #[derive(Clone)]
 pub struct MultiRuntime {
     databases: ServingDatabases,
+    databases_changed: Arc<tokio::sync::watch::Sender<u64>>,
     catalog: Arc<catalog::Catalog>,
     bootstrap: Arc<BTreeMap<String, Uuid>>,
     configuration: DatabaseConfig,
@@ -441,6 +445,7 @@ impl MultiRuntime {
         config.playground = false;
         Ok(Self {
             databases: Arc::new(RwLock::new(serving)),
+            databases_changed: Arc::new(tokio::sync::watch::channel(0).0),
             catalog: Arc::new(catalog),
             bootstrap: Arc::new(databases),
             configuration: config.primary.clone(),
@@ -952,10 +957,7 @@ impl MultiRuntime {
     pub async fn drive(&self, node: &Node, stop: &CancellationToken) -> Result<()> {
         if let Some(assignment) = &self.follower {
             let replica = self.follower_driver(assignment)?;
-            return drive_multi(stop, async || match replica.replay_follower().await {
-                Err(error) if retryable(&error) => Ok(()),
-                result => result,
-            }).await;
+            return drive_follower(stop, replica).await;
         }
         tokio::select! {
             result = self.drive_databases(node, stop) => result,
@@ -973,57 +975,196 @@ impl MultiRuntime {
 
     async fn drive_databases(&self, node: &Node, stop: &CancellationToken) -> Result<()> {
         let maintenance = stop.child_token();
-        let mut placement_due: Option<std::time::Instant> = None;
         let result = tokio::try_join!(
             async {
-                let result = drive_multi(stop, async || self.tick(node).await).await;
+                let result = self.drive_control(node, stop).await;
                 maintenance.cancel();
                 result
             },
-            drive_multi(&maintenance, async || {
-                let databases = self.databases.read().expect("Multi serving catalog")
-                    .values().cloned().collect::<Vec<_>>();
-                if let Some(placement) = &self.backends.placement
-                    && placement_due.is_none_or(|due| std::time::Instant::now() >= due)
-                {
-                    placement_due = Some(std::time::Instant::now() + PLACEMENT_INTERVAL);
-                    reconcile_placement(placement, &databases).await;
+            self.drive_maintenance(&maintenance),
+        );
+        result.map(|_| ())
+    }
+
+    async fn drive_control(&self, node: &Node, stop: &CancellationToken) -> Result<()> {
+        let mut databases_rx = self.databases_changed.subscribe();
+        let mut catalog_watch = self.catalog.watch_applied().await;
+        let mut follower_watches: BTreeMap<Uuid, rtdb_db::AppliedWatch> = BTreeMap::new();
+        stop.run_until_cancelled(async {
+            loop {
+                let _ = databases_rx.borrow_and_update();
+                catalog_watch.mark_seen();
+                for watch in follower_watches.values_mut() {
+                    watch.mark_seen();
                 }
-                for driver in databases {
+                let schedule = self.tick_once(node).await?;
+                let databases = self
+                    .databases
+                    .read()
+                    .expect("Multi serving catalog")
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let mut active_followers = BTreeSet::new();
+                for driver in &databases {
+                    if !driver.is_writer().await {
+                        let id = Uuid::from_bytes(driver.incarnation());
+                        active_followers.insert(id);
+                        if !follower_watches.contains_key(&id) {
+                            let mut watch = driver.watch_applied().await;
+                            watch.mark_seen();
+                            follower_watches.insert(id, watch);
+                        }
+                    }
+                }
+                follower_watches.retain(|id, _| active_followers.contains(id));
+
+                let mut deadline = schedule.next_deadline;
+                if schedule.retry {
+                    let retry_at = tokio::time::Instant::now() + RETRY_DELAY;
+                    deadline = Some(deadline.map_or(retry_at, |due| due.min(retry_at)));
+                }
+                let until = deadline
+                    .unwrap_or_else(|| tokio::time::Instant::now() + IDLE_WATCH_TIMEOUT);
+                tokio::select! {
+                    changed = databases_rx.changed() => {
+                        if changed.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    result = wait_applied_watches(&mut catalog_watch, &mut follower_watches, until) => {
+                        if let Err(error) = result
+                            && retryable(&error)
+                        {
+                            let retry_until = until.min(tokio::time::Instant::now() + RETRY_DELAY);
+                            tokio::select! {
+                                changed = databases_rx.changed() => {
+                                    if changed.is_err() {
+                                        return Ok(());
+                                    }
+                                }
+                                _ = tokio::time::sleep_until(retry_until) => (),
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep_until(until) => (),
+                }
+            }
+        })
+        .await
+        .unwrap_or(Ok(()))
+    }
+
+    async fn drive_maintenance(&self, stop: &CancellationToken) -> Result<()> {
+        let mut databases_rx = self.databases_changed.subscribe();
+        let mut watches: BTreeMap<Uuid, rtdb_db::AppliedWatch> = BTreeMap::new();
+        let mut placement_due: Option<tokio::time::Instant> = None;
+        stop.run_until_cancelled(async {
+            loop {
+                let _ = databases_rx.borrow_and_update();
+                let databases = self
+                    .databases
+                    .read()
+                    .expect("Multi serving catalog")
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let mut present = BTreeSet::new();
+                for driver in &databases {
+                    let id = Uuid::from_bytes(driver.incarnation());
+                    present.insert(id);
+                    if !watches.contains_key(&id) {
+                        watches.insert(id, driver.watch_applied().await);
+                    }
+                }
+                watches.retain(|id, _| present.contains(id));
+                for watch in watches.values_mut() {
+                    watch.mark_seen();
+                }
+
+                if let Some(placement) = &self.backends.placement {
+                    let now = tokio::time::Instant::now();
+                    if placement_due.is_none_or(|due| now >= due) {
+                        placement_due = Some(now + PLACEMENT_INTERVAL);
+                        reconcile_placement(placement, &databases).await;
+                    }
+                }
+                let mut schedules = BTreeMap::new();
+                let mut next_deadline = placement_due;
+                for driver in &databases {
+                    let mut checkpoint_deferred = false;
                     match driver.maintain_journal_bound().await {
                         Err(error) if !error.is(AnomalyKind::NoWriter) && error.category != AnomalyCategory::Interrupted => {
                             ::tracing::warn!("Multi journal checkpoint deferred: {error}");
+                            checkpoint_deferred = true;
                         }
                         _ => (),
                     }
-                    match driver.maintain_ranked_catalog(&maintenance).await {
+                    match driver.maintain_ranked_catalog(stop).await {
                         Err(error) if !error.is(AnomalyKind::NoWriter) && error.category != AnomalyCategory::Interrupted => {
                             ::tracing::warn!("Multi ranked catalogue publication deferred: {error}");
                         }
                         _ => (),
                     }
+                    let mut schedule = driver.maintenance_schedule().await;
+                    if checkpoint_deferred {
+                        schedule.checkpoint_lsn = None;
+                        let retry_at = tokio::time::Instant::now() + RETRY_DELAY;
+                        next_deadline = Some(next_deadline.map_or(retry_at, |previous| previous.min(retry_at)));
+                    }
+                    if let Some(due) = schedule.ranked_due {
+                        next_deadline = Some(next_deadline.map_or(due, |previous| previous.min(due)));
+                    }
+                    schedules.insert(Uuid::from_bytes(driver.incarnation()), schedule);
                 }
-                Ok(())
-            }),
-        );
-        result.map(|_| ())
+
+                tokio::select! {
+                    changed = databases_rx.changed() => {
+                        if changed.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    () = wait_maintenance_watches(&mut watches, &schedules) => (),
+                    _ = async { tokio::time::sleep_until(next_deadline.expect("deadline")).await },
+                        if next_deadline.is_some() => (),
+                }
+            }
+        })
+        .await
+        .unwrap_or(Ok(()))
     }
 
+    #[cfg(test)]
     async fn tick(&self, node: &Node) -> Result<()> {
+        self.tick_once(node).await.map(|_| ())
+    }
+
+    async fn tick_once(&self, node: &Node) -> Result<TickSchedule> {
+        let mut schedule = TickSchedule::default();
         let live = match &self.backends.peers {
             None => BTreeSet::from([self.backends.node]),
             Some(host) => match discover_nodes(host).await {
-                Ok(live) => live,
-                Err(error) if error.category == AnomalyCategory::Unavailable => return Ok(()),
+                Ok(live) => {
+                    schedule.consider(tokio::time::Instant::now() + PEER_DISCOVERY_INTERVAL);
+                    live
+                }
+                Err(error) if error.category == AnomalyCategory::Unavailable => {
+                    schedule.retry = true;
+                    return Ok(schedule);
+                }
                 Err(error) => return Err(error),
             },
         };
         if let Some(peer) = &self.peer {
             peer.observe(&live);
         }
-        match self.reconcile(node, &live).await {
-            Ok(()) => (),
-            Err(error) if retryable(&error) => (),
+        match self.reconcile(node, &live, &mut schedule).await {
+            Ok(()) => {
+                if let Some(wait) = self.catalog.next_deadline(&live).await {
+                    schedule.consider(tokio::time::Instant::now() + wait);
+                }
+            }
+            Err(error) if retryable(&error) => schedule.retry = true,
             Err(error) => return Err(error),
         }
         let databases = self
@@ -1035,15 +1176,24 @@ impl MultiRuntime {
             .collect::<Vec<_>>();
         for driver in databases {
             match driver.tick(&live).await {
-                Ok(_) => (),
-                Err(error) if retryable(&error) => (),
+                Ok(_) => {
+                    if let Some(wait) = driver.next_deadline(&live).await {
+                        schedule.consider(tokio::time::Instant::now() + wait);
+                    }
+                }
+                Err(error) if retryable(&error) => schedule.retry = true,
                 Err(error) => return Err(error),
             }
         }
-        Ok(())
+        Ok(schedule)
     }
 
-    async fn reconcile(&self, node: &Node, live: &BTreeSet<IpAddr>) -> Result<()> {
+    async fn reconcile(
+        &self,
+        node: &Node,
+        live: &BTreeSet<IpAddr>,
+        schedule: &mut TickSchedule,
+    ) -> Result<()> {
         let writer = matches!(self.catalog.tick(live).await?, Role::Writer(_));
         let mut rows = self.catalog.read().await?;
         if writer {
@@ -1054,9 +1204,9 @@ impl MultiRuntime {
             }
         }
         for (name, entry) in rows {
-            match self.reconcile_entry(node, &name, entry, writer).await {
+            match self.reconcile_entry(node, &name, entry, writer, schedule).await {
                 Ok(()) => (),
-                Err(error) if retryable(&error) => (),
+                Err(error) if retryable(&error) => schedule.retry = true,
                 Err(error) => return Err(error),
             }
         }
@@ -1069,6 +1219,7 @@ impl MultiRuntime {
         name: &str,
         entry: catalog::Deployment,
         writer: bool,
+        schedule: &mut TickSchedule,
     ) -> Result<()> {
         match &entry.status {
             Status::Reserved if !writer => return Ok(()),
@@ -1091,15 +1242,15 @@ impl MultiRuntime {
                         .await
                     {
                         Ok(_) => self.attach(node, name).await?,
+                        Err(error) if retryable(&error) => schedule.retry = true,
                         Err(error)
-                            if retryable(&error)
-                                || matches!(
-                                    error.category,
-                                    AnomalyCategory::Incorrect
-                                        | AnomalyCategory::NotFound
-                                        | AnomalyCategory::Forbidden
-                                        | AnomalyCategory::Unsupported
-                                ) =>
+                            if matches!(
+                                error.category,
+                                AnomalyCategory::Incorrect
+                                    | AnomalyCategory::NotFound
+                                    | AnomalyCategory::Forbidden
+                                    | AnomalyCategory::Unsupported
+                            ) =>
                         {
                             ()
                         }
@@ -1109,15 +1260,37 @@ impl MultiRuntime {
                 return Ok(());
             }
             Status::Retiring(_) | Status::Erased { .. } => {
-                self.databases
+                let removed = self
+                    .databases
                     .write()
                     .expect("Multi serving catalog")
-                    .remove(name);
+                    .remove(name)
+                    .is_some();
+                if removed {
+                    self.notify_databases_changed();
+                }
                 if node.catalog().database(name).is_ok() {
                     node.detach_local(name.to_owned()).await?;
                 }
                 if writer {
-                    self.settle_retirement(name, entry).await?;
+                    let destroy_after = match entry.status {
+                        Status::Retiring(retirement) => Some(retirement.destroy_after),
+                        _ => None,
+                    };
+                    match self.settle_retirement(name, entry).await {
+                        Ok(_) => (),
+                        Err(error) if error.code == "rtdb/deployment-retirement-pending" => {
+                            if let Some(cutoff) = destroy_after {
+                                let wait = Duration::from_micros(
+                                    cutoff.0.saturating_sub(SystemClock.now().0).max(0) as u64,
+                                );
+                                schedule.consider(tokio::time::Instant::now() + wait);
+                            } else {
+                                schedule.retry = true;
+                            }
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
                 return Ok(());
             }
@@ -1134,6 +1307,11 @@ impl MultiRuntime {
             self.catalog.mark_ready(name, entry.database).await?;
         }
         self.attach(node, name).await
+    }
+
+    fn notify_databases_changed(&self) {
+        self.databases_changed
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
 
     async fn ensure_driver(&self, name: &str, id: Uuid) -> Result<Arc<MultiServing>> {
@@ -1158,9 +1336,11 @@ impl MultiRuntime {
             database.token_authority().issuer().await?;
         }
         let mut databases = self.databases.write().expect("Multi serving catalog");
+        let mut inserted = false;
         let driver = databases
             .entry(name.to_owned())
             .or_insert_with(|| {
+                inserted = true;
                 if let Some(fence) = fence {
                     let driver = MultiServing::new(database, Arc::clone(&self.memory))
                         .with_classic_workload_fence(fence.clone());
@@ -1174,7 +1354,12 @@ impl MultiRuntime {
             });
         check_incarnation(driver, id)?;
         if driver.classic_workload_fence() != fence { return Err(catalog::conflict()); }
-        Ok(Arc::clone(driver))
+        let driver = Arc::clone(driver);
+        drop(databases);
+        if inserted {
+            self.notify_databases_changed();
+        }
+        Ok(driver)
     }
 
     async fn attach(&self, node: &Node, name: &str) -> Result<()> {
@@ -1343,20 +1528,93 @@ async fn reconcile_placement(placement: &PlacementSource, databases: &[Arc<Multi
     }
 }
 
-async fn drive_multi(
-    stop: &CancellationToken,
-    mut tick: impl AsyncFnMut() -> Result<()>,
-) -> Result<()> {
-    let mut interval = tokio::time::interval(Duration::from_millis(250));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+#[derive(Default)]
+struct TickSchedule {
+    next_deadline: Option<tokio::time::Instant>,
+    retry: bool,
+}
+
+impl TickSchedule {
+    fn consider(&mut self, deadline: tokio::time::Instant) {
+        self.next_deadline = Some(
+            self.next_deadline
+                .map_or(deadline, |previous| previous.min(deadline)),
+        );
+    }
+}
+
+async fn drive_follower(stop: &CancellationToken, replica: Arc<MultiServing>) -> Result<()> {
+    let mut watch = replica.watch_applied().await;
     stop.run_until_cancelled(async {
         loop {
-            interval.tick().await;
-            tick().await?;
+            watch.mark_seen();
+            match replica.replay_follower().await {
+                Ok(()) => {
+                    let until = tokio::time::Instant::now() + IDLE_WATCH_TIMEOUT;
+                    if let Err(error) = watch.changed(until).await {
+                        if retryable(&error) {
+                            tokio::time::sleep(RETRY_DELAY).await;
+                        } else {
+                            return Err(error);
+                        }
+                    }
+                }
+                Err(error) if retryable(&error) => tokio::time::sleep(RETRY_DELAY).await,
+                Err(error) => return Err(error),
+            }
         }
     })
     .await
     .unwrap_or(Ok(()))
+}
+
+async fn wait_applied_watches(
+    catalog: &mut rtdb_db::AppliedWatch,
+    followers: &mut BTreeMap<Uuid, rtdb_db::AppliedWatch>,
+    until: tokio::time::Instant,
+) -> Result<()> {
+    let waiters: Vec<_> = std::iter::once(catalog)
+        .chain(followers.values_mut())
+        .map(|watch| Box::pin(watch.changed(until)))
+        .collect();
+    let (result, _, _) = futures::future::select_all(waiters).await;
+    result
+}
+
+async fn wait_maintenance_watches(
+    watches: &mut BTreeMap<Uuid, rtdb_db::AppliedWatch>,
+    schedules: &BTreeMap<Uuid, rtdb_node::MaintenanceSchedule>,
+) {
+    let waiters: Vec<_> = watches
+        .iter_mut()
+        .map(|(id, watch)| {
+            let schedule = schedules.get(id).copied().unwrap_or_default();
+            Box::pin(async move {
+                match schedule.checkpoint_lsn {
+                    Some(target) => {
+                        tokio::select! {
+                            _ = watch.wait_local_at_least(target) => (),
+                            result = watch.local_changed() => {
+                                if result.is_ok()
+                                    && let Some(cooldown) = schedule.ranked_cooldown
+                                {
+                                    tokio::time::sleep_until(cooldown).await;
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        let _ = watch.local_changed().await;
+                    }
+                }
+            })
+        })
+        .collect();
+    if waiters.is_empty() {
+        futures::future::pending::<()>().await;
+    } else {
+        let _ = futures::future::select_all(waiters).await;
+    }
 }
 
 fn require_ready_follower(
@@ -2527,5 +2785,175 @@ mod tests {
         );
         drop(lock);
         assert_eq!(claim_credential_slot(directory.path(), 2).unwrap().0, first);
+    }
+
+    #[test]
+    fn drive_reconciles_a_catalog_reservation_on_watch_without_polling() {
+        std::thread::Builder::new()
+            .stack_size(rtdb_node::WORKER_STACK_BYTES)
+            .spawn(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .thread_stack_size(rtdb_node::WORKER_STACK_BYTES)
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let data = tempfile::tempdir().unwrap();
+                        let limit = 256 << 20;
+                        let mut config =
+                            NodeConfiguration::from_yaml_with_environment("", &|_| None, false)
+                                .unwrap();
+                        config.flight_sql = None;
+                        config.health = None;
+                        let memory = MemoryBudget::new(
+                            config.node_options(limit).unwrap().execution_memory_bytes,
+                        );
+                        let runtime = MultiRuntime::development(
+                            data.path(),
+                            &mut config,
+                            Arc::clone(&memory),
+                        )
+                        .await
+                        .unwrap();
+                        let incarnation = runtime.bootstrap[DEVELOPMENT_DATABASE];
+                        let (handle, server) =
+                            crate::ServerDriver::open_with_multi(config, limit, memory, &runtime)
+                                .await
+                                .unwrap();
+                        let server = tokio::spawn(server.run());
+                        let stop = CancellationToken::new();
+                        let drive_runtime = runtime.clone();
+                        let drive_node = handle.node().clone();
+                        let drive_stop = stop.clone();
+                        let driver = tokio::spawn(async move {
+                            drive_runtime.drive(&drive_node, &drive_stop).await
+                        });
+
+                        runtime
+                            .await_development_writer(handle.node(), incarnation)
+                            .await
+                            .unwrap();
+                        // Let `drive_control` settle onto its catalog watch and ~2.25s lease timer.
+                        tokio::time::sleep(Duration::from_millis(30)).await;
+
+                        let id = runtime.catalog.deployment_id("instant");
+                        runtime.catalog.reserve("instant", id).await.unwrap();
+                        tokio::time::timeout(Duration::from_secs(1), async {
+                            loop {
+                                if handle.node().catalog().database("instant").is_ok() {
+                                    break;
+                                }
+                                tokio::time::sleep(Duration::from_millis(5)).await;
+                            }
+                        })
+                        .await
+                        .expect("catalog watch wakes drive before the next lease deadline");
+
+                        stop.cancel();
+                        driver.await.unwrap().unwrap();
+                        handle.shutdown();
+                        server.await.unwrap().unwrap();
+                        drop(handle);
+                        runtime.close().await;
+                    });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drive_follower_wakes_on_writer_commit() {
+        let data = tempfile::tempdir().unwrap();
+        let vault = data.path().join("keys");
+        FileKms::create_directory(&vault).unwrap();
+        let kms: Arc<dyn Kms> = Arc::new(FileKms::open(&vault, || SystemClock.now().0).unwrap());
+        let journal = FileJournal::open(data.path().join("journal"), Limits::default()).unwrap();
+        let io = IoRegion::new();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalStore::open_in(data.path().join("objects"), Arc::clone(&io)).unwrap());
+        let id = Uuid::from_u128(0x42);
+        let open = |ip: [u8; 4], identity: &'static str| {
+            MultiDatabase::new(
+                MultiOptions {
+                    database: id,
+                    node: IpAddr::from(ip),
+                    lease_micros: WRITER_LEASE_MICROS,
+                    drift_micros: CLOCK_DRIFT_MICROS,
+                },
+                Arc::new(journal.handle(Identity::from_static(identity))),
+                Arc::clone(&store),
+                Arc::clone(&kms),
+                Arc::new(|| SystemClock.now()),
+            )
+            .unwrap()
+        };
+        let mut writer = open([127, 0, 0, 1], "urn:rtdb:test:writer");
+        writer.create().await.unwrap();
+        writer
+            .tick(&BTreeSet::from([IpAddr::from([127, 0, 0, 1])]))
+            .await
+            .unwrap();
+        let write = |key: u8, value: i64| Transact {
+            custody_request_digest: None,
+            request_memory: None,
+            key: vec![key; 16],
+            require: vec![],
+            window: Default::default(),
+            guards: vec![],
+            requires: vec![],
+            otherwise: vec![],
+            ops: vec![Op::Put {
+                branch: rtdb_types::rtdb_v1::MAIN_BRANCH.into(),
+                table: TableRef::new("public", "docs"),
+                if_absent: false,
+                rows: vec![Row {
+                    id: EntityId::Integer(value),
+                    valid: None,
+                    custody_group: None,
+                    protected_columns: vec![],
+                    custody_payload: None,
+                    cells: rtdb_types::StructFields::from([(
+                        "value".into(),
+                        Cell::Value(Value::I64(value)),
+                    )]),
+                }],
+            }],
+        };
+        assert_eq!(
+            writer.transact(&write(1, 1)).await.unwrap().outcome,
+            Outcome::Then,
+        );
+
+        let follower = Arc::new(MultiServing::new(
+            open([127, 0, 0, 2], "urn:rtdb:test:follower"),
+            MemoryBudget::new(64 << 20),
+        ));
+        let _reader = follower.assign_follower().await.unwrap();
+        let mut applied = follower.watch_applied().await;
+        applied.mark_seen();
+
+        let stop = CancellationToken::new();
+        let drive_stop = stop.clone();
+        let drive_replica = Arc::clone(&follower);
+        let task = tokio::spawn(async move { drive_follower(&drive_stop, drive_replica).await });
+
+        // Let `drive_follower` park on its journal watch.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            writer.transact(&write(2, 2)).await.unwrap().outcome,
+            Outcome::Then,
+        );
+        tokio::time::timeout(Duration::from_secs(2), applied.local_changed())
+            .await
+            .expect("journal watch wakes drive_follower on writer commit")
+            .unwrap();
+
+        stop.cancel();
+        task.await.unwrap().unwrap();
+        drop(_reader);
+        drop(follower);
+        drop(writer);
+        io.close_and_wait().await;
     }
 }
