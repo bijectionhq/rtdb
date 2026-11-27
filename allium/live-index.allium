@@ -13,7 +13,10 @@
 --   A live table is a VALUE, and a transaction writes it through a TRANSIENT derived from that value.
 --   The transient appends only, and what it appends the value it came from cannot see; committing it yields the table's next value, and applying a transaction installs those values.
 --   A table's immutable row lineage advances when rows are appended.
---   Each live table holds a single growing relation of appended batches with no fixed slot limit; appending extends the relation and publishes the new row count and trie root without mutating any previous value.
+--   Each live table holds a single growing relation of appended batches with no fixed slot limit.
+--   Appending extends the relation and publishes the new row count and trie root without mutating any previous value.
+--   Native application can pack adjacent small batches of the same layout into one reserved segment in the successor relation.
+--   Packing preserves event order and logical row addresses, and each older relation retains its original segments and reservations.
 --   Each snapshot value shares and reads only its own stable prefix of the relation, so concurrent readers never see later appends or partially written rows, and row addresses within a prefix never change.
 --   Applied live index values share their ordered table inventory structurally across transactions.
 --   A discarded append or forked branch leaves no orphaned slots in any earlier value's relation and releases its unretained batch funding immediately.

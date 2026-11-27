@@ -863,7 +863,14 @@ impl ReplicationDriver {
     async fn prepare_turn(&mut self) -> Result<()> {
         self.drive_serving_terminal().await?;
         self.drive_default_erasure().await?;
-        self.drive_placed_slot()
+        self.drive_placed_slot()?;
+        if !self.waiting_for_checkpoint() && self.default_erasure.is_none()
+            && self.leader.as_ref().is_some_and(LeaderState::accepting_commands)
+            && self.block_needs_cut()
+        {
+            self.cut().await?;
+        }
+        Ok(())
     }
     /// Whether the leader may resolve its next source record at `now`.
     fn ready_source(&self) -> bool {
@@ -958,7 +965,7 @@ impl ReplicationDriver {
         leader.cycle.resolved(1)?;
         let block = self.partition.value().live().block_index();
         leader.enqueue(WriteBody::Message(ReplicaBody::NoOp(message)), block, None, &self.resolve.memory)?;
-        if leader.cycle.is_full(self.config.rows_per_block) { self.cut().await?; }
+        if self.block_needs_cut() { self.cut().await?; }
         Ok(())
     }
 
@@ -1705,7 +1712,7 @@ impl ReplicationDriver {
                         }
                     }
                     if own && (placed || message.acceptance_stage.is_some())
-                        && self.leader.as_ref().is_some_and(|leader| leader.cycle.is_full(self.config.rows_per_block) || self.deferred_cut)
+                        && self.leader.is_some() && (self.block_needs_cut() || self.deferred_cut)
                     {
                         self.cut().await?;
                     }
@@ -2230,7 +2237,7 @@ impl ReplicationDriver {
         leader.cycle.resolved(1)?;
         leader.enqueue(WriteBody::Message(ReplicaBody::NoOp(message)), block, None, &self.resolve.memory)?;
         leader.resolver_mut()?.advance_source(position)?;
-        if leader.cycle.is_full(self.config.rows_per_block) { self.cut().await?; }
+        if self.block_needs_cut() { self.cut().await?; }
         Ok(())
     }
 
@@ -2419,7 +2426,7 @@ impl ReplicationDriver {
                 leader.pending.push_back(write);
             } else {
                 leader.enqueue(WriteBody::Resolved(resolved, search_delta), block, completion.0.take(), &self.resolve.memory)?;
-                if !strict && leader.cycle.is_full(self.config.rows_per_block) { self.cut().await?; }
+                if !strict && self.block_needs_cut() { self.cut().await?; }
             }
             Ok(())
         }.await;
@@ -2440,6 +2447,25 @@ impl ReplicationDriver {
             }
         }
         }
+    }
+
+    fn block_needs_cut(&self) -> bool {
+        let Some(leader) = &self.leader else { return false; };
+        leader.cycle.is_full(self.config.rows_per_block) || self.block_needs_memory_cut(leader)
+    }
+
+    fn block_needs_memory_cut(&self, leader: &LeaderState) -> bool {
+        if !leader.cycle.accepting() { return false; }
+        let block = self.partition.value();
+        let bytes = leader.pending.iter().fold(block.live().live_batch_bytes(), |bytes, pending| {
+            match &pending.body {
+                WriteBody::Resolved(tx, _) if block.live().latest_completed_tx().is_none_or(|key| tx.writes().tx_key().tx_id > key.tx_id) =>
+                    bytes.saturating_add(tx.writes().retained_batch_bytes()),
+                _ => bytes,
+            }
+        });
+        let memory = &self.resolve.memory;
+        leader.cycle.should_cut_for_memory(bytes, memory.available_bytes(), memory.limit_bytes())
     }
 
     async fn cut(&mut self) -> Result<()> {

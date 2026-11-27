@@ -51,6 +51,12 @@ pub enum BlockCycle { Filling { rows: u64 }, Cut }
 impl BlockCycle {
     pub fn accepting(self) -> bool { matches!(self, Self::Filling { .. }) }
     pub fn is_full(self, threshold: u64) -> bool { matches!(self, Self::Filling { rows } if rows > 0 && rows >= threshold) }
+    pub fn should_cut_for_memory(self, block_bytes: u64, available: usize, limit: usize) -> bool {
+        let ceiling = (limit / 3).max(1) as u64;
+        matches!(self, Self::Filling { rows } if rows > 0)
+            && (block_bytes >= ceiling
+                || block_bytes >= (ceiling / 8).max(1) && available as u64 <= ceiling)
+    }
     pub fn resolved(&mut self, added: u64) -> Result<()> {
         let Self::Filling { rows } = self else { return Err(invalid("Resolution attempted while a block cut is pending")); };
         *rows = rows.checked_add(added).ok_or_else(|| invalid("Resolved row gauge overflow"))?;

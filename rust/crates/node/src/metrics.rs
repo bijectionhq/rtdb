@@ -41,8 +41,13 @@ impl CatalogMetrics for NodeMetrics {
             let status = database.status();
             let leader = if matches!(status.role, rtdb_replication::Role::Leading(_)) { 1.0 } else { 0.0 };
             for (name, value) in [("node.tx.latestCompletedTxId", completed), ("node.tx.latestSubmittedMsgId", submitted.map_or(f64::NAN, |position| position.0 as f64)),
-                ("node.tx.latestProcessedMsgId", processed as f64), ("node.tx.lag.MsgId", lag), ("xtdb.log.leader", leader), ("xtdb.block.last_upload_time", status.last_block_upload_epoch_seconds as f64)] {
-                let unit = (name == "xtdb.block.last_upload_time").then_some(rtdb_plan::CatalogMetricUnit::Seconds);
+                ("node.tx.latestProcessedMsgId", processed as f64), ("node.tx.lag.MsgId", lag), ("xtdb.log.leader", leader), ("xtdb.block.last_upload_time", status.last_block_upload_epoch_seconds as f64),
+                ("rtdb.live.retained", database.live_batch_bytes() as f64)] {
+                let unit = match name {
+                    "xtdb.block.last_upload_time" => Some(rtdb_plan::CatalogMetricUnit::Seconds),
+                    "rtdb.live.retained" => Some(rtdb_plan::CatalogMetricUnit::Bytes),
+                    _ => None,
+                };
                 rows.push(CatalogMetric::Gauge { name: name.into(), tags: BTreeMap::from([("db".into(), database.name().into())]), unit, value });
             }
             let available = rtdb_maintenance::available_jobs(&database.trie_catalog()).map_or(f64::NAN, |jobs| jobs.len() as f64);

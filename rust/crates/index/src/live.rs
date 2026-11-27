@@ -34,6 +34,9 @@ pub struct IndexBatch {
 #[derive(Clone, Copy)]
 enum EventBuild { Write, CopyInferred, CopyCaptured }
 
+const MAX_PACKED_LIVE_ROWS: usize = 128;
+const MAX_PACKED_LIVE_INPUT_BYTES: usize = 256 << 10;
+
 impl IndexBatch {
     pub fn new(batch: RecordBatch, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
         Self::from_owned(OwnedBatch::new(batch, budget)?)
@@ -191,6 +194,36 @@ impl IndexBatch {
     pub fn header(&self, row: usize) -> Result<EventHeader> {
         self.headers.0.get(row).copied().ok_or_else(|| Anomaly::incorrect("rtdb.index/event-row", "Event row exceeds batch length"))
     }
+    fn retained_bytes(&self) -> u64 {
+        (self.owned.reservation().bytes() as u64).saturating_add(self.headers.1.bytes() as u64)
+    }
+
+    fn try_join_live_tail(&self, following: &Self) -> Option<Arc<Self>> {
+        if self.len() != following.len() || !self.len().is_power_of_two() || self.len() >= MAX_PACKED_LIVE_ROWS
+            || self.arrow().schema_ref() != following.arrow().schema_ref()
+            || self.events.has_entity_keys() || self.events.has_commit_positions() || self.events.has_origin_column()
+        {
+            return None;
+        }
+        let budget = self.arrow_reservation().budget().snapshot_budget()?;
+        if !Arc::ptr_eq(budget, following.arrow_reservation().budget().snapshot_budget()?) {
+            return None;
+        }
+        let reserved_input = self.arrow().get_array_memory_size().checked_add(following.arrow().get_array_memory_size())?;
+        if reserved_input > MAX_PACKED_LIVE_INPUT_BYTES { return None; }
+        let schema = self.arrow().schema_ref();
+        let schema_bytes = schema.fields().iter().try_fold(4096usize, |bytes, field| bytes.checked_add(field.size()))?;
+        let schema_bytes = schema.metadata().iter().try_fold(schema_bytes, |bytes, (key, value)| {
+            bytes.checked_add(128)?.checked_add(key.capacity())?.checked_add(value.capacity())
+        })?;
+        let peak = reserved_input.checked_mul(4)?.checked_add(schema_bytes)?.checked_add(4096)?;
+        let mut reservation = budget.try_reserve(peak)?;
+        let batch = arrow_select::concat::concat_batches(schema, [self.arrow(), following.arrow()]).ok()?;
+        Arc::get_mut(&mut reservation)?.shrink_to(batch.get_array_memory_size().checked_add(schema_bytes)?).ok()?;
+        let owned = OwnedBatch::with_reservation(batch, reservation).ok()?;
+        Self::from_owned_rows_of(owned, [self, following].into_iter()).ok()
+    }
+
     pub fn arrow(&self) -> &RecordBatch { self.owned.batch() }
     /// Any retained Arrow child can keep this entire allocation charged.
     pub fn arrow_reservation(&self) -> &Arc<MemoryReservation> { self.owned.reservation() }
@@ -316,6 +349,7 @@ pub struct LiveTable {
 #[derive(Clone, Debug, Default)]
 struct LiveRelation {
     batches: imbl::Vector<(u32, Arc<IndexBatch>)>,
+    retained_bytes: u64,
 }
 
 impl LiveRelation {
@@ -345,7 +379,17 @@ impl LiveRelation {
         let index = self.partition_point(|(start, _)| *start <= row).checked_sub(1)?;
         Some((index, row - self.batches[index].0))
     }
-    fn push(&mut self, start: u32, batch: Arc<IndexBatch>) {
+    fn push(&mut self, mut start: u32, mut batch: Arc<IndexBatch>, pack: bool) {
+        if pack {
+            while let Some((previous_start, previous)) = self.batches.back() {
+                let Some(joined) = previous.try_join_live_tail(&batch) else { break; };
+                start = *previous_start;
+                self.retained_bytes -= previous.retained_bytes();
+                self.batches.pop_back();
+                batch = joined;
+            }
+        }
+        self.retained_bytes += batch.retained_bytes();
         self.batches.push_back((start, batch));
     }
 }
@@ -540,6 +584,10 @@ impl LiveTable {
         Ok(self.relation.get(chunk as usize).ok_or_else(|| invalid("Live table chunk is absent"))?.0.checked_add(offset))
     }
     pub fn append(&self, write: &TableWrite, system_time: Timestamp) -> Result<Self> {
+        self.append_with_layout(write, system_time, false)
+    }
+
+    fn append_with_layout(&self, write: &TableWrite, system_time: Timestamp, pack: bool) -> Result<Self> {
         let mut next = self.with_appended_schema(&write.column_types, system_time)?;
         if !write.declared_columns.is_empty() {
             crate::catalog::add_declarations(Arc::make_mut(&mut next.declared_columns), &write.declared_columns);
@@ -547,7 +595,7 @@ impl LiveTable {
         if let Some(batch) = &write.batch {
             self.validate_append(std::iter::once(batch.as_ref()), write.adopted_history, system_time)?;
             next.canonical_entity_iids = self.canonical_entity_iids && batch.has_canonical_iids().unwrap_or(false);
-            next.append_relation_batch(Arc::clone(batch))?;
+            next.append_relation_batch(Arc::clone(batch), pack && !write.adopted_history)?;
         }
         Ok(next)
     }
@@ -608,13 +656,13 @@ impl LiveTable {
         Ok(())
     }
 
-    fn append_relation_batch(&mut self, batch: Arc<IndexBatch>) -> Result<()> {
+    fn append_relation_batch(&mut self, batch: Arc<IndexBatch>, pack: bool) -> Result<()> {
         let count = u32::try_from(batch.len()).map_err(invalid)?;
         if count == 0 { return Ok(()); }
         let first_new_row = self.row_count;
         let row_count = first_new_row.checked_add(count).ok_or_else(|| invalid("Live table exceeds u32 row address space"))?;
         let trie = self.trie.add_range(&AppendIids { table: self, batch: &batch }, first_new_row, count)?;
-        self.relation.push(first_new_row, batch);
+        self.relation.push(first_new_row, batch, pack);
         self.row_count = row_count;
         self.trie = trie;
         self.lineage.append(self.row_count);
@@ -1005,6 +1053,10 @@ impl StagedWrite {
     pub fn predecessor(&self) -> Option<TransactionKey> { self.predecessor }
     pub fn block_index(&self) -> BlockIndex { self.block_index }
     pub fn tables(&self) -> &BTreeMap<TableRef, TableWrite> { &self.tables }
+    pub fn retained_batch_bytes(&self) -> u64 {
+        self.tables.values().filter_map(TableWrite::batch)
+            .fold(0u64, |total, batch| total.saturating_add(batch.retained_bytes()))
+    }
     pub fn row_count(&self) -> Result<u64> { self.tables.values().try_fold(0u64, |count, write| count.checked_add(write.row_count() as u64).ok_or_else(|| invalid("Transaction row count overflow"))) }
 
     pub(crate) fn staged_segments(&self) -> Result<&BTreeMap<TableRef, Arc<LiveTable>>> {
@@ -1117,9 +1169,7 @@ impl LiveIndex {
     pub fn latest_completed_tx(&self) -> Option<TransactionKey> { self.latest_completed_tx }
     pub fn block_row_count(&self) -> u64 { self.block_row_count }
     pub fn live_batch_bytes(&self) -> u64 {
-        self.tables.values().flat_map(|table| table.batches()).fold(0u64, |bytes, batch| {
-            bytes.saturating_add(batch.owned.reservation().bytes() as u64).saturating_add(batch.headers.1.bytes() as u64)
-        })
+        self.tables.values().fold(0u64, |bytes, table| bytes.saturating_add(table.relation.retained_bytes))
     }
     pub fn tables(&self) -> &imbl::OrdMap<TableRef, Arc<LiveTable>> { &self.tables }
     pub fn apply(&self, staged: &StagedWrite) -> Result<Self> {
@@ -1128,7 +1178,7 @@ impl LiveIndex {
         let system_time = staged.tx_key.system_time;
         for (table, write) in &staged.tables {
             let updated = match self.tables.get(table) {
-                Some(table) => table.append(write, system_time)?,
+                Some(table) => table.append_with_layout(write, system_time, true)?,
                 None => LiveTable::new(table.clone(), self.block_index, self.config).append(write, system_time)?,
             };
             next.tables.insert(table.clone(), Arc::new(updated));
@@ -2734,6 +2784,7 @@ mod chunk_tests {
         let memory = MemoryBudget::new(1 << 26);
         let table = TableRef::new("public", "keys");
         let mut live = LiveIndex::new(BlockIndex(0), None, TrieConfig::default());
+        let mut saved = None;
         for id in 0..1000i64 {
             let key = format!("{id:032x}/0");
             let event = StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None, iid: EntityId::String(key.clone()).iid(), system_from: Timestamp(id), valid_time: Interval::ALL,
@@ -2743,8 +2794,22 @@ mod chunk_tests {
             let transaction = TransactionKey { tx_id: rtdb_types::TxId(id), system_time: Timestamp(id) };
             let staged = StagedWrite::new(transaction, live.latest_completed_tx(), live.block_index(), BTreeMap::from([(table.clone(), write)])).unwrap();
             live = live.apply(&staged).unwrap_or_else(|error| panic!("row {id}: {error:?}"));
+            if id == 99 { saved = Some(live.clone()); }
         }
-        assert_eq!(live.tables()[&table].relation.len(), 1000);
+        let rows = &live.tables()[&table];
+        assert_eq!(rows.row_count(), 1000);
+        assert!(rows.relation.len() <= 14);
+        assert!(live.live_batch_bytes() < 4_096 * 1000);
+        for id in 0..1000u32 {
+            assert_eq!(rows.header(id).unwrap().system_from, Timestamp(i64::from(id)));
+        }
+        let saved = saved.unwrap();
+        let prior = &saved.tables()[&table];
+        assert_eq!(prior.row_count(), 100);
+        for id in 0..100u32 {
+            assert_eq!(prior.header(id).unwrap(), rows.header(id).unwrap());
+        }
+        drop(saved);
         assert_eq!(live.live_batch_bytes(), memory.used_bytes() as u64);
         assert_eq!(live.next_block().unwrap().live_batch_bytes(), 0);
     }

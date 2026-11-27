@@ -84,6 +84,22 @@ fn resolved_rows_seed_from_applied_rows_and_resolution_stops_until_adoption() {
 }
 
 #[test]
+fn live_bytes_cut_a_nonempty_block_at_low_row_count_and_leave_working_headroom() {
+    let mut cycle = BlockCycle::Filling { rows: 0 };
+    assert!(!cycle.should_cut_for_memory(200, 0, 300));
+    cycle.resolved(1).unwrap();
+    assert!(!cycle.is_full(10));
+    assert!(!cycle.should_cut_for_memory(99, 200, 300));
+    assert!(cycle.should_cut_for_memory(100, 200, 300));
+    assert!(cycle.should_cut_for_memory(13, 100, 300));
+    assert!(!cycle.should_cut_for_memory(11, 100, 300));
+    cycle.cut().unwrap();
+    assert!(!cycle.should_cut_for_memory(200, 0, 300));
+    cycle.adopted();
+    assert!(!cycle.should_cut_for_memory(200, 0, 300));
+}
+
+#[test]
 fn flush_timeout_rearms_when_persisted_transaction_changes_and_cuts_idle_empty_blocks() {
     let mut timer = FlushTimer::new(Timestamp(0), None, Duration::from_micros(10)).unwrap();
     assert!(!timer.should_flush(Timestamp(10), None));
