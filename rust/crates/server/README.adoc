@@ -159,6 +159,9 @@ The target remains explicit, so an operator can repair to any later retained cut
 It opens no pgwire or Flight listeners and never claims leadership; the configured health listener remains available.
 A separate writer must apply its source-log notifications before jobs are acknowledged.
 Concurrent operation therefore requires a log provider that supports multiple source writers; the local log retains its exclusive writer lock.
+
+`indexer.optimisticConflictLimit` (1 to 255, default 3) sets the optimistic conflicts a work key's durable footprint grant debit absorbs when its `DebitOnConflict` operation names no limit.
+
 `compactor.scanTieOrderFromNamingEpoch` optionally selects scan precedence for same-system-time ties, starting at the specified positive output naming epoch.
 Choose a fresh epoch before enabling it. Stop existing compactor workers, use the exclusive `reset-compactor` workflow to publish that epoch, and start upgraded workers with the same setting before resuming compaction.
 Keep the cutover setting when restarting workers in that epoch or any later epoch.

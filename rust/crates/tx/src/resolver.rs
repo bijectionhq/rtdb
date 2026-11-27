@@ -35,6 +35,7 @@ mod resolution_candidate;
 mod control_order;
 mod footprint_grant;
 mod footprint_grant_state;
+pub use footprint_grant_state::FootprintGrantOptions;
 mod owned_flight_decision;
 use owned_flight_decision::{PrimaryResult, Publish, select_publication, stage_marker};
 mod schedule_order;
@@ -67,6 +68,7 @@ pub trait TransactionAuthorization: Send + Sync {
 }
 
 pub struct ResolveContext {
+    pub footprint_grants: FootprintGrantOptions,
     pub decision_clock: Option<Arc<dyn crate::DecisionClock>>,
     pub write_event_origins: bool,
     pub placed_receipt_retirement: bool,
@@ -5023,7 +5025,7 @@ mod tests {
     async fn legacy_lifetime_replay_stages_arrow_and_preserves_the_replica_tables() -> Result<()> {
         let memory = MemoryBudget::new(1 << 24);
         let context = ResolveContext {
-            decision_clock: None,
+            footprint_grants: Default::default(), decision_clock: None,
             write_event_origins: false, placed_receipt_retirement: false, owned_witness_scope: None,
             world_constraints: None, database: "application".into(),
             storage: Arc::new(BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
@@ -5125,7 +5127,7 @@ mod tests {
         let state = rtdb_index::PartitionState::empty(Default::default()).unwrap();
         state.publish_catalog_cut(CatalogCut { through: ReplicaPosition(0), ..writer.proposed_floor }).unwrap();
         let memory = MemoryBudget::new(1 << 24);
-        let context = ResolveContext { decision_clock: None,
+        let context = ResolveContext { footprint_grants: Default::default(), decision_clock: None,
             write_event_origins: false,
             placed_receipt_retirement: false,
             owned_witness_scope: None,
@@ -5163,7 +5165,7 @@ mod tests {
     #[tokio::test]
     async fn a_resolver_keeps_only_plans_that_hold_no_transaction_memory() {
         let memory = MemoryBudget::new(1 << 26);
-        let resolve = ResolveContext { decision_clock: None,
+        let resolve = ResolveContext { footprint_grants: Default::default(), decision_clock: None,
             write_event_origins: false,
             placed_receipt_retirement: false,
             owned_witness_scope: None,
@@ -5202,7 +5204,7 @@ mod tests {
     #[tokio::test]
     async fn mutation_syntax_is_charged_until_the_plan_takes_ownership() {
         let memory = MemoryBudget::new(1 << 24);
-        let resolve = ResolveContext { decision_clock: None,
+        let resolve = ResolveContext { footprint_grants: Default::default(), decision_clock: None,
             write_event_origins: false,
             placed_receipt_retirement: false,
             owned_witness_scope: None,
@@ -5286,7 +5288,7 @@ mod tests {
         }
 
         let memory = MemoryBudget::new(1 << 24);
-        let context = ResolveContext { decision_clock: None,
+        let context = ResolveContext { footprint_grants: Default::default(), decision_clock: None,
             write_event_origins: false,
             placed_receipt_retirement: false,
             owned_witness_scope: Some(rtdb_types::PlacedAttemptScope::new("native-capacity", 1)?),
@@ -5338,7 +5340,7 @@ mod tests {
 
         let scope = PlacedAttemptScope::new("spatial-catalog", 1)?;
         let memory = MemoryBudget::new(1 << 24);
-        let context = ResolveContext { decision_clock: None,
+        let context = ResolveContext { footprint_grants: Default::default(), decision_clock: None,
             write_event_origins: false,
             placed_receipt_retirement: false,
             owned_witness_scope: Some(scope),
@@ -5466,7 +5468,7 @@ mod tests {
         use rtdb_types::{EntityId, OwnedRelation, OwnedSchema, OwnedWorld, WorldClockMode, WorldSchemas, WorldShadow};
 
         let memory = MemoryBudget::new(1 << 24);
-        let context = ResolveContext { decision_clock: None,
+        let context = ResolveContext { footprint_grants: Default::default(), decision_clock: None,
             write_event_origins: false,
             placed_receipt_retirement: false,
             owned_witness_scope: None,
@@ -5553,7 +5555,7 @@ mod tests {
         }
 
         let memory = MemoryBudget::new(1 << 24);
-        let context = ResolveContext { decision_clock: None,
+        let context = ResolveContext { footprint_grants: Default::default(), decision_clock: None,
             write_event_origins: false,
             placed_receipt_retirement: false,
             owned_witness_scope: Some(rtdb_types::PlacedAttemptScope::new("native-world-unique", 1)?),
@@ -5650,7 +5652,7 @@ mod tests {
         }
 
         let memory = MemoryBudget::new(1 << 24);
-        let context = ResolveContext { decision_clock: None,
+        let context = ResolveContext { footprint_grants: Default::default(), decision_clock: None,
             write_event_origins: false,
             placed_receipt_retirement: false,
             owned_witness_scope: Some(rtdb_types::PlacedAttemptScope::new("native-world-capacity", 1)?),
@@ -5810,7 +5812,7 @@ mod tests {
         use rtdb_types::{EntityId, OwnedRelation, OwnedSchema};
 
         let memory = MemoryBudget::new(1 << 24);
-        let context = ResolveContext { decision_clock: None,
+        let context = ResolveContext { footprint_grants: Default::default(), decision_clock: None,
             write_event_origins: false,
             placed_receipt_retirement: false,
             owned_witness_scope: Some(rtdb_types::PlacedAttemptScope::new("valid-unique", 1)?),
@@ -6169,7 +6171,7 @@ mod tests {
         let staged = |limit: usize| -> Result<Vec<u8>> {
             let memory = MemoryBudget::new(limit);
             let context = ResolveContext {
-                decision_clock: None, write_event_origins: false, placed_receipt_retirement: false,
+                footprint_grants: Default::default(), decision_clock: None, write_event_origins: false, placed_receipt_retirement: false,
                 owned_witness_scope: None, world_constraints: None, database: "xtdb".into(),
                 storage: Arc::new(BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
                 memory: Arc::clone(&memory), query_options: QueryOptions::default(),
@@ -6455,7 +6457,7 @@ mod tests {
     async fn receipt_retention_without_receipt_tables_skips_and_sees_what_the_transaction_snapshot_sees() -> Result<()> {
         let memory = MemoryBudget::new(1 << 26);
         let context = ResolveContext {
-            decision_clock: None, write_event_origins: false, placed_receipt_retirement: true,
+            footprint_grants: Default::default(), decision_clock: None, write_event_origins: false, placed_receipt_retirement: true,
             owned_witness_scope: None, world_constraints: None, database: "xtdb".into(),
             storage: Arc::new(BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
             memory: Arc::clone(&memory), query_options: QueryOptions::default(),
@@ -6492,7 +6494,7 @@ mod tests {
     fn source_delete_pages_keep_the_valid_prefix_and_first_row_error() -> Result<()> {
         let memory = MemoryBudget::new(256 << 10);
         let context = ResolveContext {
-            decision_clock: None, write_event_origins: false, placed_receipt_retirement: false,
+            footprint_grants: Default::default(), decision_clock: None, write_event_origins: false, placed_receipt_retirement: false,
             owned_witness_scope: None, world_constraints: None, database: "xtdb".into(),
             storage: Arc::new(BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
             memory: Arc::clone(&memory), query_options: QueryOptions::default(),
@@ -6546,7 +6548,7 @@ mod tests {
     #[tokio::test]
     async fn a_mutation_read_a_column_at_a_time_writes_the_events_a_row_by_row_read_does() {
         let memory = MemoryBudget::new(1 << 26);
-        let resolve = ResolveContext { decision_clock: None,
+        let resolve = ResolveContext { footprint_grants: Default::default(), decision_clock: None,
             write_event_origins: false,
             placed_receipt_retirement: false,
             owned_witness_scope: None,

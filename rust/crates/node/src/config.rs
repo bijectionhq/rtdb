@@ -28,6 +28,8 @@ pub struct NodeOptions {
     pub trie: TrieConfig,
     pub query: QueryOptions,
     pub replication: ReplicationConfig,
+    /// The resolver's durable footprint grant settings, such as the default optimistic conflict limit.
+    pub footprint_grants: rtdb_tx::FootprintGrantOptions,
     pub compaction: MergeConfig,
     pub compaction_threads: usize,
     pub garbage: GarbageConfig,
@@ -60,7 +62,7 @@ impl Default for NodeOptions {
         Self { membership: Membership::Durable { primary: Default::default(), skipped: Default::default() }, read_only: false, default_v1_serving: false, owned_relations: false,
             default_timezone: Self::DEFAULT_TIMEZONE.into(), execution_memory_bytes: 512 * 1024 * 1024, cache_bytes: 256 * 1024 * 1024,
             command_capacity: 64, file_size_target: 100 * 1024 * 1024, trie: TrieConfig::default(), query: QueryOptions::default(),
-            replication: ReplicationConfig::default(), compaction: MergeConfig::default(),
+            replication: ReplicationConfig::default(), footprint_grants: rtdb_tx::FootprintGrantOptions::default(), compaction: MergeConfig::default(),
             compaction_threads: Self::default_compaction_threads(|_| None),
             garbage: GarbageConfig::default(), automatic_compaction: true, automatic_gc: true,
             artefact_threads: 1, automatic_artefacts: true, scan_acceleration: true, ordered_index_arrow_references: false,

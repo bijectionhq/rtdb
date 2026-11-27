@@ -51,7 +51,9 @@ impl Default for MemoryCacheSettings { fn default() -> Self { Self { maximum_byt
 #[derive(Clone, Debug)]
 pub struct DiskCacheSettings { pub path: PathBuf, pub maximum_bytes: Option<u64>, pub maximum_ratio: f64 }
 #[derive(Clone, Debug)]
-pub struct IndexerSettings { pub log_limit: usize, pub page_limit: usize, pub rows_per_block: u64, pub flush_duration: Duration, pub skip_transactions: BTreeSet<SourcePosition>, pub enabled: bool }
+/// `optimistic_conflict_limit` (`indexer.optimisticConflictLimit`, an RTDB extension) is the credits a work key's durable
+/// footprint grant debit starts from when its operation names none.
+pub struct IndexerSettings { pub log_limit: usize, pub page_limit: usize, pub rows_per_block: u64, pub flush_duration: Duration, pub skip_transactions: BTreeSet<SourcePosition>, pub enabled: bool, pub optimistic_conflict_limit: std::num::NonZeroU8 }
 #[derive(Clone, Debug)]
 pub struct CompactorSettings {
     pub threads: usize,
@@ -394,8 +396,12 @@ fn indexer(value: Option<Yaml>, environment: &impl Fn(&str) -> Option<String>) -
         None => environment("XTDB_SKIP_TXS").into_iter().flat_map(|value| value.split(',').map(str::trim).map(str::to_owned).collect::<Vec<_>>()).map(|value| value.parse::<i64>().map(SourcePosition).map_err(|_| invalid("XTDB_SKIP_TXS must contain message IDs"))).collect::<Result<_>>()?,
     };
     let enabled = fields.boolean("enabled")?.unwrap_or(true);
+    let optimistic_conflict_limit = fields.integer("optimisticConflictLimit")?
+        .map(|limit| u8::try_from(limit).ok().and_then(std::num::NonZeroU8::new)
+            .ok_or_else(|| invalid("indexer.optimisticConflictLimit must be between 1 and 255"))).transpose()?
+        .unwrap_or(rtdb_tx::FootprintGrantOptions::DEFAULT_OPTIMISTIC_CONFLICT_LIMIT);
     fields.finish()?;
-    Ok(IndexerSettings { log_limit, page_limit, rows_per_block, flush_duration, skip_transactions, enabled })
+    Ok(IndexerSettings { log_limit, page_limit, rows_per_block, flush_duration, skip_transactions, enabled, optimistic_conflict_limit })
 }
 fn compactor(value: Option<Yaml>, environment: &impl Fn(&str) -> Option<String>) -> Result<CompactorSettings> {
     let mut fields = YamlFields::new(value.unwrap_or_else(empty), "compactor")?;

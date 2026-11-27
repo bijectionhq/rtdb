@@ -353,6 +353,18 @@ fn scan_tie_order_uses_an_explicit_positive_naming_epoch() {
 }
 
 #[test]
+fn the_optimistic_conflict_limit_reaches_the_resolver_options() {
+    let default = decode("").unwrap();
+    assert_eq!(default.indexer.optimistic_conflict_limit.get(), 3);
+    assert_eq!(default.node_options(1 << 20).unwrap().footprint_grants, rtdb_tx::FootprintGrantOptions::default());
+    for limit in ["0", "-1", "256", "many"] {
+        assert!(decode(&format!("indexer: {{optimisticConflictLimit: {limit}}}")).is_err(), "{limit}");
+    }
+    let options = decode("indexer: {optimisticConflictLimit: 5}").unwrap().node_options(1 << 20).unwrap();
+    assert_eq!(options.footprint_grants.optimistic_conflict_limit.get(), 5);
+}
+
+#[test]
 fn a_malformed_auth_rule_remote_address_stops_the_configuration_loading() {
     let error = decode("authn: !UserList\n  users: {}\n  rules:\n    - method: TRUST\n      remoteAddress: 10.0.0.0/33\n").unwrap_err();
     assert_eq!(error.code, "xtdb.authn/invalid-remote-address");

@@ -88,7 +88,7 @@
         {
           "file": "rust/crates/tx/src/resolver/footprint_grant.rs",
           "find": "    if remaining == 0 {\n        0\n    } else {\n        remaining - 1\n    }",
-          "replace": "    let _ = remaining;\n    DEFAULT_OPTIMISTIC_CONFLICT_LIMIT"
+          "replace": "    let _ = remaining;\n    3"
         }
       ],
       "expect": [

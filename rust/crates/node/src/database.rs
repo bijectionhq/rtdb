@@ -525,6 +525,7 @@ impl DatabaseFactory {
             let partition = Arc::clone(&recovered.partition);
             let progress = ProgressMonitor::new(recovered.progress.clone());
             let resolve = Arc::new(ResolveContext {
+                footprint_grants: self.options.footprint_grants,
                 decision_clock: self.decision_clock.clone(),
                 write_event_origins: event_history || !read_only && matches!(&opened_logs.await_authority, crate::AwaitAuthority::Live { .. }),
                 placed_receipt_retirement: matches!(&opened_logs.await_authority, crate::AwaitAuthority::Live { placed_receipt_retirement: true, .. }),

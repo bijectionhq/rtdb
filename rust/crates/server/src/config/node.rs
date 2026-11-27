@@ -45,6 +45,7 @@ impl NodeConfiguration {
         options.replication.flush_timeout = self.indexer.flush_duration;
         options.replication.skipped_transactions = self.indexer.skip_transactions.clone();
         options.replication.node_id = self.node_id.clone();
+        options.footprint_grants.optimistic_conflict_limit = self.indexer.optimistic_conflict_limit;
         options.compaction.page_size = self.indexer.page_limit;
         options.compaction.run_end_encoded_iids = self.compactor.run_end_encoded_iids;
         options.compaction.within_file_recency_branching = self.compactor.within_file_recency_branching;

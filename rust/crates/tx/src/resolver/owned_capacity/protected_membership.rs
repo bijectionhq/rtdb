@@ -176,7 +176,7 @@ mod tests {
     async fn binary_pages_and_final_count_cover_the_same_scope_and_the_ordered_unit_fence() -> Result<()> {
         let memory = MemoryBudget::new(64 << 20);
         let context = ResolveContext {
-            decision_clock: None, write_event_origins: false, placed_receipt_retirement: false,
+            footprint_grants: Default::default(), decision_clock: None, write_event_origins: false, placed_receipt_retirement: false,
             owned_witness_scope: None, world_constraints: None, database: "app".into(),
             storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)),
             memory: Arc::clone(&memory), query_options: QueryOptions::default(), scan_accelerators: Default::default(),

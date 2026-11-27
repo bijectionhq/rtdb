@@ -10,11 +10,27 @@ use rtdb_types::{
 use sha2::{Digest, Sha256};
 
 use super::footprint_grant::{
-    self, DEFAULT_OPTIMISTIC_CONFLICT_LIMIT, GrantHolder, GrantProposalVerdict, TransferVerdict,
+    self, GrantHolder, GrantProposalVerdict, TransferVerdict,
     WaiterEntry, WriterKind,
 };
 use super::{OpenTransaction, interval};
 use crate::OwnedFootprintGrantOp;
+
+/// The resolver's durable footprint grant settings, configured from the node configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FootprintGrantOptions {
+    /// The optimistic conflicts a work key may absorb before its durable debit is exhausted, where its
+    /// `DebitOnConflict` operation names no limit of its own.
+    pub optimistic_conflict_limit: std::num::NonZeroU8,
+}
+
+impl FootprintGrantOptions {
+    pub const DEFAULT_OPTIMISTIC_CONFLICT_LIMIT: std::num::NonZeroU8 = std::num::NonZeroU8::new(3).unwrap();
+}
+
+impl Default for FootprintGrantOptions {
+    fn default() -> Self { Self { optimistic_conflict_limit: Self::DEFAULT_OPTIMISTIC_CONFLICT_LIMIT } }
+}
 
 pub(crate) const SS8_WORK_DEBITS: &str = "ss8_work_debits";
 pub(crate) const SS8_FOOTPRINT_GRANTS: &str = "ss8_footprint_grants";
@@ -57,6 +73,11 @@ fn footprint_grant_fenced() -> Anomaly {
 /// fenced by another work key's grant. These are the only conflicts raised with the optimistic-conflict kind; the resolver's
 /// other conflicts (expired deadlines, existing declarations, stale owned observations) are not debited.
 pub(crate) fn is_definite_occ_conflict(error: &Anomaly) -> bool { error.is(AnomalyKind::OptimisticConflict) }
+
+/// The credits a work key's first durable debit starts from: the operation's own limit, else the configured one.
+fn initial_occ_credits(limit: u8, options: FootprintGrantOptions) -> u8 {
+    if limit == 0 { options.optimistic_conflict_limit.get() } else { limit }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct DurableGrantRow {
@@ -278,18 +299,15 @@ impl OpenTransaction<'_> {
     }
 
     /// Record a durable work-keyed OCC conflict debit atomically with a
-    /// definite OCC abort.
+    /// definite OCC abort. An operation limit of zero takes the configured
+    /// optimistic conflict limit.
     pub(super) async fn record_ss8_occ_debit(
         &mut self,
         work_key: &str,
         work_age: u64,
         limit: u8,
     ) -> Result<()> {
-        let initial = if limit == 0 {
-            DEFAULT_OPTIMISTIC_CONFLICT_LIMIT
-        } else {
-            limit
-        };
+        let initial = initial_occ_credits(limit, self.context.footprint_grants);
         let (retained_age, current_credits) = match self.load_ss8_debit(work_key).await? {
             Some((age, credits)) => (age, credits),
             None => (work_age, initial),
@@ -528,5 +546,14 @@ mod tests {
         for error in [footprint_grant_fenced(), assert_failed("Assert failed".into())] {
             assert_eq!(AnomalyKind::from_wire_code(&error.code), error.kind, "{error}");
         }
+    }
+
+    #[test]
+    fn an_unlimited_debit_starts_from_the_configured_optimistic_conflict_limit() {
+        assert_eq!(FootprintGrantOptions::default().optimistic_conflict_limit.get(), 3);
+        assert_eq!(initial_occ_credits(0, FootprintGrantOptions::default()), 3);
+        let configured = FootprintGrantOptions { optimistic_conflict_limit: std::num::NonZeroU8::new(7).unwrap() };
+        assert_eq!(initial_occ_credits(0, configured), 7);
+        assert_eq!(initial_occ_credits(2, configured), 2, "an operation's own limit wins over the configured one");
     }
 }

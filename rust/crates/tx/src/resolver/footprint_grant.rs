@@ -6,8 +6,6 @@
 #[cfg(verus_keep_ghost)]
 use vstd::prelude::*;
 
-pub const DEFAULT_OPTIMISTIC_CONFLICT_LIMIT: u8 = 3;
-
 #[derive(Clone, Copy)]
 #[cfg_attr(not(verus_keep_ghost), derive(Debug, PartialEq, Eq))]
 pub enum WriterKind {

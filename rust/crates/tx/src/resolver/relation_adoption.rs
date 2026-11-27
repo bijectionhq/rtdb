@@ -576,7 +576,7 @@ mod tests {
         let scope = PlacedAttemptScope::new("field-adoption", 1)?;
         let memory = MemoryBudget::new(64 << 20);
         let context = ResolveContext {
-            decision_clock: None, write_event_origins: true, placed_receipt_retirement: false,
+            footprint_grants: Default::default(), decision_clock: None, write_event_origins: true, placed_receipt_retirement: false,
             owned_witness_scope: Some(scope), world_constraints: None, database: "app".into(),
             storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)),
             memory: Arc::clone(&memory), query_options: QueryOptions::default(), scan_accelerators: Default::default(),

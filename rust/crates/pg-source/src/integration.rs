@@ -88,7 +88,7 @@ async fn native_source_applies_snapshot_streams_and_confirms_only_the_adopted_ex
     let blocks = BlockStore::new(store, Arc::clone(&cache), Arc::clone(&memory), 100_000_000).unwrap();
     let recovered = blocks.recover(rtdb_trie::TrieConfig::default(), SourcePosition(-1), Timestamp(0), rtdb_replication::BlockDiscovery::List).await.unwrap();
     let partition = Arc::clone(&recovered.partition); let progress = ProgressMonitor::new(recovered.progress.clone());
-    let resolve = Arc::new(rtdb_tx::ResolveContext { decision_clock: None, write_event_origins: false, placed_receipt_retirement: false, owned_witness_scope: None, world_constraints: None, database: "cdc".into(), storage: cache, memory: Arc::clone(&memory), query_options: Default::default(), scan_accelerators: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(Authority), execution_observer: None, tracer: None });
+    let resolve = Arc::new(rtdb_tx::ResolveContext { footprint_grants: Default::default(), decision_clock: None, write_event_origins: false, placed_receipt_retirement: false, owned_witness_scope: None, world_constraints: None, database: "cdc".into(), storage: cache, memory: Arc::clone(&memory), query_options: Default::default(), scan_accelerators: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(Authority), execution_observer: None, tracer: None });
     let (handle, driver) = ReplicationDriver::new(ReplicationConfig { external_source: true, ..Default::default() }, logs, Arc::clone(&blocks), recovered, progress, resolve, Arc::new(Effects), CancellationToken::new()).unwrap();
     let replica_job = tokio::spawn(driver.run()); wait_for(|| matches!(handle.status().role, Role::Leading(_))).await;
     let mut control = Connection::open(&remote, false, Arc::clone(&memory)).await.unwrap();
@@ -140,7 +140,7 @@ async fn native_source_recovers_confirmed_local_journal_transactions_before_the_
         let recovered = blocks.recover(rtdb_trie::TrieConfig::default(), SourcePosition(-1), Timestamp(0), Default::default()).await.unwrap();
         let partition = recovered.partition.clone();
         let progress = ProgressMonitor::new(recovered.progress.clone());
-        let resolve = Arc::new(rtdb_tx::ResolveContext { decision_clock: None, write_event_origins: false, placed_receipt_retirement: false, owned_witness_scope: None, world_constraints: None, database: "cdc".into(), storage: cache, memory: memory.clone(), query_options: Default::default(), scan_accelerators: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(Authority), execution_observer: None, tracer: None });
+        let resolve = Arc::new(rtdb_tx::ResolveContext { footprint_grants: Default::default(), decision_clock: None, write_event_origins: false, placed_receipt_retirement: false, owned_witness_scope: None, world_constraints: None, database: "cdc".into(), storage: cache, memory: memory.clone(), query_options: Default::default(), scan_accelerators: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(Authority), execution_observer: None, tracer: None });
         let (handle, driver) = ReplicationDriver::new(ReplicationConfig { external_source: true, ..Default::default() },
             logs, blocks, recovered, progress, resolve, Arc::new(Effects), CancellationToken::new()).unwrap();
         let replication = tokio::spawn(driver.run());
@@ -227,7 +227,7 @@ async fn pg_source_arrow_wal_keeps_replica_table_bytes_and_event_ordinals() {
     let context = rtdb_tx::ResolveContext {
         database: "cdc".into(), storage, memory: Arc::clone(&memory), cancellation: CancellationToken::new(),
         default_tz: "UTC".into(), authorization: Arc::new(Authority), query_options: Default::default(),
-        scan_accelerators: Default::default(), decision_clock: None, world_constraints: None,
+        scan_accelerators: Default::default(), footprint_grants: Default::default(), decision_clock: None, world_constraints: None,
         execution_observer: None, tracer: None, write_event_origins: false, placed_receipt_retirement: false,
         owned_witness_scope: None,
     };
