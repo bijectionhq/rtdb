@@ -159,22 +159,6 @@ impl<'a> FloatVector<'a> {
     }
 }
 
-pub(crate) fn logical_vector(ty: &LogicalType) -> bool {
-    ty.legs().iter().all(|leg| match leg {
-        LogicalType::Null => true,
-        LogicalType::List {
-            kind: ListKind::List | ListKind::FixedSizeList(_),
-            element,
-        } => element.legs().iter().all(|leg| {
-            matches!(
-                leg,
-                LogicalType::Null | LogicalType::Scalar(ScalarType::F32 | ScalarType::F64)
-            )
-        }),
-        _ => false,
-    })
-}
-
 fn vector_width(field: &Field) -> Option<Option<i32>> {
     let width = list_width(field)?;
     match field.data_type() {

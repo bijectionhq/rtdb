@@ -315,6 +315,7 @@ impl<'a> DirectKey<'a> {
         let Some((array, field, logical, row)) = column.arrow_cell(row)? else {
             return Some(Self::Scalar(ScalarKey::Null));
         };
+        if row >= array.len() { return None; }
         if let Some(scalar) = ScalarColumn::bind(array, field, logical) {
             return Some(Self::Scalar(scalar.read(row)));
         }
@@ -940,7 +941,7 @@ impl BatchKeyIndex {
             if row != 0 {
                 context.check_cancelled_at(row)?;
             }
-            Key::bind(&batch, row, projected, context, hashing, matches!(hashing, KeyHash::Set)).map(|(hash, _)| hash)
+            Key::bind(&batch, row, projected, context, hashing, true).map(|(hash, _)| hash)
         });
         if let Err(error) = built {
             Arc::get_mut(&mut self.reservation)
@@ -961,7 +962,7 @@ impl BatchKeyIndex {
         all: bool,
         context: &QueryContext,
     ) -> Result<bool> {
-        let (hash, key) = Key::bind(batch, row, projected, context, self.hashing, matches!(self.hashing, KeyHash::Set))?;
+        let (hash, key) = Key::bind(batch, row, projected, context, self.hashing, true)?;
         self.matches_key(hash, &key, all, context)
     }
 
@@ -969,18 +970,25 @@ impl BatchKeyIndex {
         self.find(hash, key, all, context).map(|found| found.is_some())
     }
 
-    pub(crate) fn matches_column(
+    pub(crate) fn mark_column(
         &mut self,
         batch: &ColumnBatch,
         position: usize,
         row: usize,
         projected: bool,
         context: &QueryContext,
-    ) -> Result<bool> {
+    ) -> Result<Option<bool>> {
+        let null = batch.columns[position].null_at(row);
+        if null == Some(true) { return Ok(None); }
         let positions = [position];
-        let columns = KeyColumns::projection(batch, &positions);
-        let (hash, key) = Key::bind(columns, row, projected, context, self.hashing, false)?;
-        self.matches_key(hash, &key, false, context)
+        let key = Key::for_columns(batch, row, projected, &positions, context)?;
+        if null.is_none() && match key.cached(0) {
+            Some(value) => matches!(value, Value::Null | Value::Undefined),
+            None => matches!(key.direct(0), Some(DirectKey::Scalar(ScalarKey::Null))),
+        } {
+            return Ok(None);
+        }
+        self.matches_key(key.vector_hash()?, &key, false, context).map(Some)
     }
 
     fn find(
@@ -1544,6 +1552,27 @@ mod tests {
             }
         }
         assert_eq!(context.memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn timestamp_keys_with_different_units_keep_the_checked_comparator() {
+        let context = context();
+        let timestamp = |value, unit, timezone: Option<&str>| Value::Timestamp { value, unit, timezone: timezone.map(str::to_owned) };
+        let values = ColumnBatch::settled(vec![
+            Column::Values(vec![timestamp(1, TimeUnit::Second, Some("UTC")), timestamp(i64::MAX, TimeUnit::Second, None), timestamp(7, TimeUnit::Second, Some("Europe/Paris"))]),
+            Column::Values(vec![timestamp(1000, TimeUnit::Millisecond, Some("Europe/Paris")), timestamp(1, TimeUnit::Nanosecond, None), timestamp(7, TimeUnit::Second, None)]),
+        ], 3, context.memory.reserve(4096).unwrap()).unwrap();
+        let left = Key::for_columns(&values, 0, false, &[0], &context).unwrap();
+        let right = Key::for_columns(&values, 0, false, &[1], &context).unwrap();
+        assert_eq!(left.equal_at(&right, 0, false, &context, None).unwrap(), Some(true));
+        assert_eq!(left.vector_hash().unwrap(), right.vector_hash().unwrap());
+        let left = Key::for_columns(&values, 1, false, &[0], &context).unwrap();
+        let right = Key::for_columns(&values, 1, false, &[1], &context).unwrap();
+        assert_eq!(left.equal_at(&right, 0, false, &context, None).unwrap_err().code, "xtdb.expression/overflow-error");
+        let left = Key::for_columns(&values, 2, false, &[0], &context).unwrap();
+        let right = Key::for_columns(&values, 2, false, &[1], &context).unwrap();
+        assert!(direct_key_equal(&values.columns[0], 2, &values.columns[1], 2, false).is_none());
+        assert_eq!(left.equal_at(&right, 0, false, &context, None).unwrap(), Some(true));
     }
 
     #[test]

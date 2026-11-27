@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use async_trait::async_trait;
 use rtdb_plan::{BinaryOp, Expr, Relation, RelationNode, Schema, TemporalFilter, TraceSpan, TraceValue};
-use rtdb_types::{LogicalType, Result, ScalarType, Value};
+use rtdb_types::{ListKind, LogicalType, Result, ScalarType, Value};
 use crate::{context::Execution, invalid};
 use crate::columnar::{BatchCursor, BoxBatchCursor, Column, ColumnBatch, poll_nested_batch};
 use crate::set_keys::BatchKeyIndex;
@@ -156,13 +156,10 @@ impl BatchMembership {
         let mut marks = arrow_array::builder::BooleanBuilder::with_capacity(batch.len);
         for row in 0..batch.len {
             context.check_cancelled_at(row)?;
-            let null = Self::is_null(&batch.columns[probe_key], row, context)?;
-            if !null && index.matches_column(&batch, probe_key, row, projected, context)? {
-                marks.append_value(true);
-            } else if !self.facts.empty && (self.facts.null || null) {
-                marks.append_null();
-            } else {
-                marks.append_value(false);
+            match index.mark_column(&batch, probe_key, row, projected, context)? {
+                Some(true) => marks.append_value(true),
+                equal if !self.facts.empty && (self.facts.null || equal.is_none()) => marks.append_null(),
+                _ => marks.append_value(false),
             }
         }
         let logical = LogicalType::Scalar(rtdb_types::ScalarType::Bool).maybe();
@@ -222,15 +219,6 @@ impl MembershipSpill {
 }
 
 fn membership_hash(batch: &ColumnBatch, row: usize, key: usize, context: &crate::QueryContext) -> Result<u32> {
-    if let Some(Some((array, field, Some(logical), row))) = batch.columns[key].arrow_cell(row)
-        && let LogicalType::Scalar(scalar @ ScalarType::Timestamp { .. }) =
-            crate::columnar::float_vector::nonnull(logical)
-        && field.metadata().is_empty()
-        && (rtdb_columnar::ArrowCell { array, field, row }).has_scalar_storage(scalar)
-        && let Ok(hash) = rtdb_columnar::hash_cell(field, array, row, 0)
-    {
-        return Ok(crate::join_storage::combine_cell_hash(0, hash));
-    }
     crate::set_keys::Key::for_columns(batch, row, false, &[key], context)?.vector_hash()
 }
 
@@ -290,9 +278,33 @@ impl rtdb_expr::RowInput for MarkRow<'_> {
     }
 }
 
+fn mark_keys(schema: &Schema, comparison: &Expr, probe_width: usize) -> Option<(usize, usize)> {
+    let Expr::Binary { op: BinaryOp::Eq, left, right } = comparison else { return None; };
+    fn admitted(ty: &LogicalType, child: bool) -> bool {
+        match ty {
+            LogicalType::Maybe(value) | LogicalType::RunEndEncoded { value, .. } => admitted(value, child),
+            LogicalType::Union(legs) => legs.iter().all(|leg| admitted(leg, child)),
+            LogicalType::Null => true,
+            LogicalType::Scalar(ScalarType::Timestamp { .. }) => !child,
+            LogicalType::List { kind: ListKind::List | ListKind::FixedSizeList(_), element } => !child && admitted(element, true),
+            LogicalType::Scalar(ScalarType::Bool | ScalarType::I8 | ScalarType::I16 | ScalarType::I32
+                | ScalarType::I64 | ScalarType::F32 | ScalarType::F64 | ScalarType::Utf8 | ScalarType::Binary) => child,
+            _ => false,
+        }
+    }
+    let position = |expr: &Expr| {
+        let Expr::Column { id, .. } = expr else { return None; };
+        let index = schema.position(*id)?;
+        admitted(&schema.fields()[index].data_type, false).then_some(index)
+    };
+    let (left, right) = (position(left)?, position(right)?);
+    let (probe, build) = if left < right { (left, right) } else { (right, left) };
+    (probe < probe_width && build >= probe_width).then(|| (probe, build - probe_width))
+}
+
 async fn compare_page(
     probe: &crate::columnar::BatchRow<'_>, page: &ColumnBatch, invocation: &rtdb_expr::ExpressionInvocation<'_>,
-    mark: &mut Option<bool>, short_circuit: bool, vector_keys: Option<(usize, usize)>, execution: &Execution,
+    mark: &mut Option<bool>, short_circuit: bool, keys: Option<(usize, usize)>, execution: &Execution,
 ) -> Result<()> {
     for row in 0..page.len {
         execution.context.check_cancelled_at(row)?;
@@ -300,8 +312,8 @@ async fn compare_page(
             probe: crate::columnar::BatchRow { batch: probe.batch, row: probe.row, admit_dates: probe.admit_dates },
             candidate: crate::columnar::BatchRow { batch: page, row, admit_dates: true },
         };
-        let direct = vector_keys.and_then(|(left, right)| {
-            crate::set_keys::direct_key_equal(&probe.batch.columns[left], probe.row, &page.columns[right], row, false)
+        let direct = keys.and_then(|(left, right)| {
+            crate::set_keys::direct_key_equal(probe.batch.columns.get(left)?, probe.row, page.columns.get(right)?, row, false)
         });
         let equal = if let Some(equal) = direct {
             equal
@@ -329,11 +341,12 @@ pub(crate) async fn correlated_batch_mark(batch: &ColumnBatch, row: usize, mut d
     schema: &Schema, execution: &Execution) -> Result<Option<bool>> {
     let mut mark = Some(false);
     let probe = crate::columnar::BatchRow { batch, row, admit_dates: true };
+    let keys = mark_keys(schema, comparison, batch.columns.len());
     while let Some(page) = poll_nested_batch(dependent.as_mut()).await? {
         page.validate_readable(&execution.context)?;
         let metadata = execution.scope()?;
         let invocation = execution.prepare_expression(comparison, schema, &metadata)?;
-        compare_page(&probe, &page, &invocation, &mut mark, false, None, execution).await?;
+        compare_page(&probe, &page, &invocation, &mut mark, false, keys, execution).await?;
         if mark == Some(true) { break; }
     }
     Ok(mark)
@@ -397,24 +410,12 @@ impl SharedBatchMark {
         }
     }
 
-    fn vector_keys(&self, probe_width: usize) -> Option<(usize, usize)> {
-        let Expr::Binary { op: BinaryOp::Eq, left, right } = &self.comparison else { return None; };
-        let position = |expr: &Expr| {
-            let Expr::Column { id, .. } = expr else { return None; };
-            let index = self.schema.position(*id)?;
-            crate::columnar::float_vector::logical_vector(&self.schema.fields()[index].data_type).then_some(index)
-        };
-        let (left, right) = (position(left)?, position(right)?);
-        let (probe, build) = if left < right { (left, right) } else { (right, left) };
-        (probe < probe_width && build >= probe_width).then(|| (probe, build - probe_width))
-    }
-
     async fn apply(&mut self, mut batch: ColumnBatch, candidates: &CandidatePages) -> Result<ColumnBatch> {
         let context = &self.execution.context;
         batch.validate_readable(context)?;
         let memory = &context.memory;
         let reservation = memory.reserve(batch.len.checked_mul(2).and_then(|bytes| bytes.checked_add(256)).ok_or_else(mark_size)?)?;
-        let vector_keys = self.vector_keys(batch.columns.len());
+        let keys = mark_keys(&self.schema, &self.comparison, batch.columns.len());
         let metadata = self.execution.scope()?;
         let invocation = self.execution.prepare_expression(&self.comparison, &self.schema, &metadata)?;
         let mut marks = arrow_array::builder::BooleanBuilder::with_capacity(batch.len);
@@ -429,7 +430,7 @@ impl SharedBatchMark {
             let mut mark = Some(false);
             match candidates {
                 CandidatePages::Memory(pages, _charge) => for page in pages {
-                    compare_page(&probe, page, &invocation, &mut mark, true, vector_keys, &self.execution).await?;
+                    compare_page(&probe, page, &invocation, &mut mark, true, keys, &self.execution).await?;
                     if mark == Some(true) { break; }
                 },
                 CandidatePages::Spill { width, multiple_pages, .. } => {
@@ -440,12 +441,12 @@ impl SharedBatchMark {
                         first_page = read_mark_candidate(reader, *width, replay_frames)?;
                     }
                     if let Some(page) = &first_page {
-                        compare_page(&probe, page, &invocation, &mut mark, true, vector_keys, &self.execution).await?;
+                        compare_page(&probe, page, &invocation, &mut mark, true, keys, &self.execution).await?;
                         if mark != Some(true) {
                             if *multiple_pages {
                                 drop(first_page.take());
                                 while let Some(page) = read_mark_candidate(reader, *width, replay_frames)? {
-                                    compare_page(&probe, &page, &invocation, &mut mark, true, vector_keys, &self.execution).await?;
+                                    compare_page(&probe, &page, &invocation, &mut mark, true, keys, &self.execution).await?;
                                     if mark == Some(true) { break; }
                                 }
                             } else if context.cancellation.is_cancelled() || context.owner_cancellation.is_cancelled() {

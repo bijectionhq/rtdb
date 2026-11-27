@@ -2499,7 +2499,9 @@ surface QueryAccess {
         -- A compatible scalar membership join indexes the build key vectors and appends nullable Boolean marks to the probe batches.
         -- Scalar membership uses the raw vector hash to select candidates before comparing them.
         -- A spilled scalar membership join retains the probe payloads and the build's global null facts through Arrow partition replay.
-        -- Membership shuffle can hash compatible timestamp cells directly from their Arrow vectors.
+        -- Membership shuffle, indexing and probing hash compatible timestamp keys directly from their Arrow positions.
+        -- The membership probe can use the same reached value for its null check and lookup.
+        -- A generic mark comparing two compatible plain list columns evaluates their child keys at the reached positions.
         -- An Arrow join can evaluate a residual predicate from borrowed cells on either side while gathering the result payloads from the input batches.
         -- A single residual testing whether a period contains a zoned microsecond timestamp can compare the stored endpoints and timestamp directly.
         -- This comparison includes the lower endpoint and excludes the upper endpoint, and null operands do not match.

@@ -563,3 +563,28 @@ async fn arrow_vector_membership_preserves_unknown_and_signed_zero_across_candid
         assert_eq!(marks, [Value::Bool(true), Value::Null, Value::Null, Value::Null]);
     }
 }
+
+#[tokio::test]
+async fn plain_list_marks_keep_unknown_and_later_true_across_candidate_pages() {
+    let list = |first, second: &str| Value::list(vec![first, Value::Utf8(second.into())]);
+    let probe = [list(Value::Utf8("a".into()), "x"), list(Value::Utf8("b".into()), "x"), list(Value::Null, "z"), Value::Null];
+    let build = [list(Value::Null, "x"), list(Value::Utf8("a".into()), "x")];
+    let ty = LogicalType::list(LogicalType::Scalar(ScalarType::Utf8).maybe()).maybe();
+    for threshold in [0, 10] {
+        let execution = execution_threshold(2, threshold);
+        let baseline = execution.context.memory.used_bytes();
+        let input = typed_table(0, &probe, ty.clone());
+        let candidates = union(typed_table(1, &build[..1], ty.clone()), typed_table(1, &build[1..], ty.clone()));
+        let comparison = Expr::binary(BinaryOp::Eq, candidates.schema().fields()[0].expression(), input.schema().fields()[0].expression());
+        let mut cursor = open(mark(input, candidates, comparison, false), &execution).await;
+        let mut marks = Vec::new();
+        while let Some(page) = cursor.next_batch().await.unwrap() {
+            marks.extend((0..page.len).map(|row| page.columns[1].value(row).unwrap()));
+        }
+        assert_eq!(marks, [Value::Bool(true), Value::Null, Value::Bool(false), Value::Null]);
+        drop(cursor);
+        assert_eq!(execution.context.memory.used_bytes(), baseline);
+        assert_eq!(execution.context.spill_peak_bytes() > 0, threshold == 0);
+        assert_eq!(execution.context.spill_bytes(), 0);
+    }
+}
