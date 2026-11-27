@@ -271,7 +271,7 @@ impl SpilledBlocks {
         let width = self.schema.logical.len();
         let _columns = memory.reserve(width.checked_mul(size_of::<usize>()).ok_or_else(size_error)?)?;
         let positions: Vec<_> = (0..width).collect();
-        let mut input = self.file.reader(Arc::clone(memory))?;
+        let mut input = self.file.reader(context)?;
         let mut writer = context.spill.create()?;
         while let Some(batch) = self.schema.read(&mut input)? {
             let scratch = count.checked_mul(size_of::<Vec<(usize, usize)>>())
@@ -296,7 +296,7 @@ impl SpilledBlocks {
                 offsets.push(at);
             }
         }
-        Ok(Partitions { reader: finish_file(writer, total)?.reader(Arc::clone(memory))?, offsets, schema: self.schema, _reservation: reservation })
+        Ok(Partitions { reader: finish_file(writer, total)?.reader(context)?, offsets, schema: self.schema, _reservation: reservation })
     }
 }
 

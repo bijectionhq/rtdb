@@ -17,9 +17,11 @@ use rtdb_types::Result;
 #[cfg(test)]
 use rtdb_types::AnomalyKind;
 use tempfile::{NamedTempFile, TempDir, TempPath};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     columnar::ColumnBatch,
+    context::{QueryContext, cancelled},
     fragment::{FragmentBytes, decode_batches, encode_batch},
     invalid,
 };
@@ -146,10 +148,14 @@ impl Drop for SpillFile {
     fn drop(&mut self) { self.region.retained.fetch_sub(self.bytes.load(Ordering::Relaxed), Ordering::AcqRel); }
 }
 impl SpillFile {
-    pub fn reader(self: &Arc<Self>, memory: Arc<MemoryBudget>) -> Result<SpillReader> {
+    pub fn reader(self: &Arc<Self>, context: &QueryContext) -> Result<SpillReader> {
+        self.open_reader(Arc::clone(&context.memory), [context.cancellation.clone(), context.owner_cancellation.clone()])
+    }
+
+    fn open_reader(self: &Arc<Self>, memory: Arc<MemoryBudget>, cancellation: [CancellationToken; 2]) -> Result<SpillReader> {
         let file = File::open(&self.path).map_err(io_error)?;
         let cipher = self.key.map(|key| key.cipher_at(0).map(|cipher| (key, cipher))).transpose().map_err(io_error)?;
-        Ok(SpillReader { file: BufReader::new(SpillSource { file, cipher }), retained: Arc::clone(self), memory })
+        Ok(SpillReader { file: BufReader::new(SpillSource { file, cipher }), retained: Arc::clone(self), memory, cancellation })
     }
 }
 
@@ -289,7 +295,28 @@ impl SpillWriter {
     }
 }
 
-pub(crate) struct SpillReader { file: BufReader<SpillSource>, retained: Arc<SpillFile>, memory: Arc<MemoryBudget> }
+pub(crate) struct SpillReader {
+    file: BufReader<SpillSource>,
+    retained: Arc<SpillFile>,
+    memory: Arc<MemoryBudget>,
+    cancellation: [CancellationToken; 2],
+}
+
+const REPLAY_CHUNK_BYTES: usize = 64 << 10;
+
+fn check_cancelled(cancellation: &[CancellationToken; 2]) -> Result<()> {
+    if cancellation.iter().any(CancellationToken::is_cancelled) { return Err(cancelled()); }
+    Ok(())
+}
+
+fn read_frame_body(file: &mut impl Read, bytes: &mut [u8], cancellation: &[CancellationToken; 2]) -> Result<()> {
+    for chunk in bytes.chunks_mut(REPLAY_CHUNK_BYTES) {
+        check_cancelled(cancellation)?;
+        file.read_exact(chunk).map_err(io_error)?;
+    }
+    Ok(())
+}
+
 impl SpillReader {
     pub fn seek(&mut self, offset: u64) -> Result<()> {
         if offset > self.retained.bytes.load(Ordering::Relaxed) { return Err(invalid("invalid-spill","Spill offset exceeds its file")); }
@@ -305,13 +332,14 @@ impl SpillReader {
     }
 
     pub fn read_frame(&mut self, expansion: usize) -> Result<Option<(Vec<u8>, Arc<MemoryReservation>)>> {
+        check_cancelled(&self.cancellation)?;
         let Some(length) = self.read_frame_length().map_err(io_error)? else { return Ok(None); };
         let length = usize::try_from(length).map_err(io_error)?;
         if length as u64 > self.retained.bytes.load(Ordering::Relaxed) { return Err(invalid("invalid-spill", "Spill row exceeds its file")); }
         let bound = length.checked_mul(expansion).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| invalid("row-size", "Decoded spill size overflow"))?;
         let reservation = self.memory.reserve(bound)?;
         let mut bytes = vec![0; length];
-        self.file.read_exact(&mut bytes).map_err(io_error)?;
+        read_frame_body(&mut self.file, &mut bytes, &self.cancellation)?;
         Ok(Some((bytes, reservation)))
     }
 
@@ -339,6 +367,7 @@ impl SpillReader {
     }
 
     pub fn read_columns(&mut self, width: usize) -> Result<Option<ColumnBatch>> {
+        check_cancelled(&self.cancellation)?;
         let Some(length) = self.read_frame_length()
             .map_err(|error| io_error(format_args!("Reading spill page marker length: {error}")))? else { return Ok(None); };
         if length != 1 { return Err(invalid("invalid-spill", "Spill page marker must be one byte")); }
@@ -405,6 +434,79 @@ fn ipc_error(error: impl std::fmt::Display) -> rtdb_types::Anomaly { invalid("jo
 
 fn io_error(error: impl std::fmt::Display) -> rtdb_types::Anomaly { rtdb_types::Anomaly::fault("rtdb.query/spill-io", error.to_string()) }
 
+#[cfg(test)]
+impl SpillFile {
+    fn test_reader(self: &Arc<Self>, memory: &Arc<MemoryBudget>) -> Result<SpillReader> {
+        self.open_reader(Arc::clone(memory), [CancellationToken::new(), CancellationToken::new()])
+    }
+}
+
+#[test]
+fn cancelled_spill_body_stops_before_the_next_chunk() {
+    struct CancelAfterRead<'a> {
+        input: std::io::Cursor<&'a [u8]>,
+        cancellation: &'a CancellationToken,
+    }
+
+    impl Read for CancelAfterRead<'_> {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            let read = self.input.read(bytes)?;
+            self.cancellation.cancel();
+            Ok(read)
+        }
+    }
+
+    let cancellation = [CancellationToken::new(), CancellationToken::new()];
+    let data = vec![7; REPLAY_CHUNK_BYTES + 1];
+    let mut reader = CancelAfterRead { input: std::io::Cursor::new(&data[..]), cancellation: &cancellation[0] };
+    let mut output = vec![0; data.len()];
+
+    assert_eq!(read_frame_body(&mut reader, &mut output, &cancellation).unwrap_err(), cancelled());
+    assert_eq!(reader.input.position(), REPLAY_CHUNK_BYTES as u64);
+}
+
+#[test]
+fn spill_replay_honours_execution_and_owner_cancellation_and_releases_its_file() -> Result<()> {
+    use crate::{CatalogSnapshot, DatabaseSnapshot, QueryOptions};
+    use rtdb_storage::{MemoryStore, cache::BufferPool};
+    use std::collections::BTreeMap;
+
+    for cancel_owner in [false, true] {
+        let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), DatabaseSnapshot {
+            partitions: vec![],
+            storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)),
+        })]), false)?;
+        let parent = CancellationToken::new();
+        let owner = CancellationToken::new();
+        let memory = MemoryBudget::new(1 << 20);
+        let context = QueryContext::with_owner(catalog, Arc::clone(&memory), rtdb_types::Timestamp(0), "UTC",
+            QueryOptions::default(), &parent, &owner)?;
+        let execution = context.execution_child();
+        let mut writer = context.spill.create()?;
+        writer.write_frame(b"first")?;
+        writer.write_frame(&[0])?;
+        let file = writer.finish()?;
+        let path = file.path.to_path_buf();
+        let mut reader = file.reader(&execution)?;
+        let (bytes, charge) = reader.read_frame(1)?.unwrap();
+        assert_eq!(bytes.as_slice(), b"first");
+
+        if cancel_owner { owner.cancel(); } else { execution.cancellation.cancel(); }
+        assert!(!context.cancellation.is_cancelled());
+        assert_eq!(reader.read_frame(1).err().unwrap(), cancelled());
+        assert_eq!(reader.read_columns(0).err().unwrap(), cancelled());
+        assert_eq!(memory.used_bytes(), charge.bytes());
+        assert_eq!(context.spill_bytes(), 22);
+
+        drop((reader, file));
+        assert!(!path.exists());
+        assert_eq!(context.spill_bytes(), 0);
+        drop((bytes, charge));
+        assert_eq!(memory.used_bytes(), 0);
+    }
+    Ok(())
+}
+
 #[test]
 fn every_node_spills_without_limit_by_default_and_a_configured_limit_refuses_past_it() {
     assert_eq!(crate::QueryOptions::default().spill_limit_bytes, crate::QueryOptions::UNLIMITED_SPILL);
@@ -425,7 +527,7 @@ fn empty_spill_page_needs_only_its_output_reservation() {
     writer.write_columns(&batch, &rtdb_plan::Schema::default(), &memory).unwrap();
     drop(batch);
 
-    let mut reader = writer.finish().unwrap().reader(Arc::clone(&memory)).unwrap();
+    let mut reader = writer.finish().unwrap().test_reader(&memory).unwrap();
     let page = reader.read_columns(0).unwrap().unwrap();
     assert_eq!(page.len, 0);
     assert!(page.columns.is_empty());
@@ -451,7 +553,7 @@ fn malformed_column_spill_markers_fail_before_body_admission() {
     ] {
         let mut writer = spill.create().unwrap();
         writer.file.write_all(bytes).unwrap();
-        let mut reader = writer.finish().unwrap().reader(Arc::clone(&memory)).unwrap();
+        let mut reader = writer.finish().unwrap().test_reader(&memory).unwrap();
         let error = reader.read_columns(0).err().unwrap();
         assert_eq!(error.code, code);
         assert!(error.message.as_deref().unwrap().starts_with(message));
@@ -480,7 +582,7 @@ fn join_spill_replays_small_records_across_offsets() {
     let offset = writer.position().unwrap();
     writer.write_single_join_record(&second, &scratch).unwrap();
     assert_eq!(scratch.used_bytes(), 0);
-    let mut reader = writer.finish().unwrap().reader(Arc::clone(&memory)).unwrap();
+    let mut reader = writer.finish().unwrap().test_reader(&memory).unwrap();
     reader.seek(offset).unwrap();
     assert_eq!(reader.read_frame(1).unwrap().unwrap().0, [3]);
     assert_eq!(reader.read_record(&schema, 0).unwrap().unwrap().batch(), &second);
@@ -529,7 +631,7 @@ fn single_join_spill_matches_the_encoded_record_with_only_span_scratch() {
     assert_eq!(spill.retained_bytes(), size + 9);
     assert_eq!(scratch.used_bytes(), 0);
 
-    let mut reader = writer.finish().unwrap().reader(Arc::clone(&memory)).unwrap();
+    let mut reader = writer.finish().unwrap().test_reader(&memory).unwrap();
     assert_eq!(reader.read_frame(1).unwrap().unwrap().0, [3]);
     assert_eq!(reader.read_frame(1).unwrap().unwrap().0, expected);
     assert_eq!(reader.read_frame(1).unwrap().unwrap().0, [3]);
@@ -568,7 +670,7 @@ fn homogeneous_spill_writes_exact_ipc_framing_and_checks_quota_before_writing() 
     assert_eq!(writer.write_arrow(None, &batch, 0, &memory, "spill-columns").unwrap_err().code, "rtdb.query/spill-limit");
     assert_eq!(writer.position().unwrap(), size);
     assert_eq!(spill.retained_bytes(), size);
-    let mut reader = writer.finish().unwrap().reader(Arc::clone(&memory)).unwrap();
+    let mut reader = writer.finish().unwrap().test_reader(&memory).unwrap();
     assert_eq!(reader.read_frame(1).unwrap().unwrap().0, expected);
     assert!(reader.read_frame(1).unwrap().is_none());
     drop((reader, batch));
@@ -627,7 +729,7 @@ fn homogeneous_spill_streams_exact_ipc_with_only_span_scratch() {
     assert_eq!(spill.retained_bytes(), size);
     assert_eq!(spill.peak_bytes(), size);
     assert_eq!(scratch.used_bytes(), 0);
-    let mut reader = writer.finish().unwrap().reader(Arc::clone(&memory)).unwrap();
+    let mut reader = writer.finish().unwrap().test_reader(&memory).unwrap();
     assert_eq!(reader.read_frame(1).unwrap().unwrap().0, [1]);
     assert_eq!(reader.read_frame(1).unwrap().unwrap().0, expected);
     assert!(reader.read_frame(1).unwrap().is_none());
@@ -654,7 +756,7 @@ fn homogeneous_spill_preserves_unused_bits_in_aligned_bitmap_slices() {
         writer.write_arrow(None, &batch, 0, &memory, "spill-columns").unwrap();
         reference.into_inner().unwrap()
     }).collect::<Vec<_>>();
-    let mut reader = writer.finish().unwrap().reader(Arc::clone(&memory)).unwrap();
+    let mut reader = writer.finish().unwrap().test_reader(&memory).unwrap();
     for frame in expected { assert_eq!(reader.read_frame(1).unwrap().unwrap().0, frame); }
     assert!(reader.read_frame(1).unwrap().is_none());
 }
@@ -683,7 +785,7 @@ fn spill_replays_mixed_struct_fields_as_arrow_positions() {
     let file = writer.finish().unwrap();
     let wire_bytes = usize::try_from(spill.retained_bytes()).unwrap();
     let tight_memory = MemoryBudget::new(wire_bytes + (56 << 10));
-    let mut tight_reader = file.reader(Arc::clone(&tight_memory)).unwrap();
+    let mut tight_reader = file.test_reader(&tight_memory).unwrap();
     let detached = tight_reader.read_columns(1).unwrap().unwrap();
     for (row, expected) in values.iter().enumerate() {
         assert_eq!(&detached.columns[0].value(row).unwrap(), expected);
@@ -693,8 +795,8 @@ fn spill_replays_mixed_struct_fields_as_arrow_positions() {
     assert_eq!(tight_memory.used_bytes(), 0);
 
     let replay_memory = MemoryBudget::new(1 << 23);
-    let mut reader = file.reader(Arc::clone(&replay_memory)).unwrap();
-    let mut wide_reader = file.reader(Arc::clone(&replay_memory)).unwrap();
+    let mut reader = file.test_reader(&replay_memory).unwrap();
+    let mut wide_reader = file.test_reader(&replay_memory).unwrap();
     assert_eq!(wide_reader.read_columns(2).err().unwrap().code, "rtdb.query/column-gather");
     drop(wide_reader);
     drop(file);
@@ -766,7 +868,7 @@ fn malformed_spill_fragments_keep_the_decoder_error() {
     let mut writer = spill.create().unwrap();
     writer.write_frame(&[2]).unwrap();
     writer.write_frame(&[0; 7]).unwrap();
-    let mut reader = writer.finish().unwrap().reader(Arc::clone(&memory)).unwrap();
+    let mut reader = writer.finish().unwrap().test_reader(&memory).unwrap();
     let error = reader.read_columns(1).err().unwrap();
     assert_eq!(error.code, "rtdb.query/fragment-decode");
     assert!(error.message.as_deref().unwrap().contains("fragment frame is truncated"));
@@ -776,9 +878,9 @@ fn malformed_spill_fragments_keep_the_decoder_error() {
 fn sealed_spill_files_hold_no_readable_rows_and_replay_from_any_offset() {
     let memory = MemoryBudget::new(1 << 20);
     let secret = b"an erased row's payload, which must not reach the disk in the clear".to_vec();
-    let long = vec![7; SEAL_CHUNK_BYTES * 2 + 3];
+    let long = vec![7; REPLAY_CHUNK_BYTES * 2 + 3];
     let mut ciphertexts = Vec::new();
-    for (region, readable) in [(SpillRegion::new(1 << 16).unwrap(), true), (SpillRegion::sealed(1 << 16).unwrap(), false), (SpillRegion::sealed(1 << 16).unwrap(), false)] {
+    for (region, readable) in [(SpillRegion::new(1 << 18).unwrap(), true), (SpillRegion::sealed(1 << 18).unwrap(), false), (SpillRegion::sealed(1 << 18).unwrap(), false)] {
         let spill = Arc::new(region);
         let mut writer = spill.create().unwrap();
         writer.write_frame(b"first").unwrap();
@@ -790,7 +892,7 @@ fn sealed_spill_files_hold_no_readable_rows_and_replay_from_any_offset() {
         assert_eq!(raw.len() as u64, spill.retained_bytes(), "sealing keeps every frame's length");
         assert_eq!(raw.windows(secret.len()).any(|window| window == secret.as_slice()), readable);
         if !readable { ciphertexts.push(raw); }
-        let mut reader = file.reader(Arc::clone(&memory)).unwrap();
+        let mut reader = file.test_reader(&memory).unwrap();
         reader.seek(start).unwrap();
         assert_eq!(reader.read_frame(1).unwrap().unwrap().0, secret);
         assert_eq!(reader.read_frame(1).unwrap().unwrap().0, long);

@@ -239,7 +239,7 @@ impl BatchSort {
             .files
             .pop()
             .ok_or_else(|| invalid("sort-state", "Sort spill has no output run"))?;
-        Ok(Sorted::Spill(file.reader(context.memory.clone())?))
+        Ok(Sorted::Spill(file.reader(context)?))
     }
 
     async fn spill(
@@ -275,7 +275,7 @@ impl BatchSort {
             .iter()
             .map(|file| {
                 Ok(Run {
-                    reader: file.reader(context.memory.clone())?,
+                    reader: file.reader(context)?,
                     batch: None,
                     row: 0,
                     key: None,

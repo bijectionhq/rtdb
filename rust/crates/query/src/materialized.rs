@@ -155,7 +155,7 @@ struct ColumnReference { reader: SpillReader, context: Arc<QueryContext>, width:
 
 impl ColumnReference {
     fn new(file: &Arc<SpillFile>, context: &Arc<QueryContext>, width: usize) -> Result<Self> {
-        Ok(Self { reader: file.reader(Arc::clone(&context.memory))?, context: Arc::clone(context), width })
+        Ok(Self { reader: file.reader(context)?, context: Arc::clone(context), width })
     }
 }
 

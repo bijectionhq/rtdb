@@ -2405,6 +2405,7 @@ surface QueryAccess {
         -- An Arrow equijoin uses the raw vector hash of compatible floating-point list keys and compares their selected components.
         -- Join, sort, membership, and materialized-relation spills replay Arrow batches under the query's spill budget, which is unlimited by default and refuses bytes past any configured limit (including zero).
         -- Each spilled page is written whole under its encoding reservation, and a budget or quota refusal fails the query.
+        -- Replay checks for query and owner cancellation before each reached spill frame and between bounded reads of its body.
         -- Compatible mixed-layout spill vectors retain their charged IPC body storage through replay.
         -- A replayed fragment shares the decoded buffers' existing admission, and a nested fragment column selects its complete decoded span.
         -- Fragment and mixed-layout spill replay always retain their decoded frames and fail the query when the memory budget refuses them.

@@ -387,7 +387,7 @@ impl SharedBatchMark {
         let invocation = self.execution.prepare_expression(&self.comparison, &self.schema, &metadata)?;
         let mut marks = arrow_array::builder::BooleanBuilder::with_capacity(batch.len);
         let mut spill = match candidates {
-            CandidatePages::Spill(file, width) => Some((file.reader(Arc::clone(memory))?, *width)),
+            CandidatePages::Spill(file, width) => Some((file.reader(context)?, *width)),
             _ => None,
         };
         for row in 0..batch.len {
