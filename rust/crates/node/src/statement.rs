@@ -736,21 +736,34 @@ fn cast_arrow_timestamp(
     cell: rtdb_columnar::ArrowCell<'_>, source: &LogicalType, target: &LogicalType,
     timezone: &str, allocation: &rtdb_expr::EvaluationScope,
 ) -> Result<Option<(arrow_schema::Field, arrow_array::ArrayRef)>> {
-    use arrow_array::{ArrayRef, TimestampSecondArray, TimestampMillisecondArray, TimestampMicrosecondArray, TimestampNanosecondArray};
+    use arrow_array::{ArrayRef, TimestampSecondArray, TimestampMillisecondArray, TimestampMicrosecondArray, TimestampNanosecondArray,
+        cast::AsArray, types::{Date32Type, Date64Type}};
+    use arrow_schema::DataType;
     use rtdb_types::{ScalarType, TimeUnit};
 
     fn required(ty: &LogicalType) -> &LogicalType {
         match ty { LogicalType::Maybe(inner) => inner, ty => ty }
     }
     let logical @ LogicalType::Scalar(ScalarType::Timestamp { unit, timezone: zone }) = required(target) else { return Ok(None); };
-    if !cell.field.metadata().is_empty() || !matches!(cell.field.data_type(), arrow_schema::DataType::Timestamp(..) | arrow_schema::DataType::Utf8) {
+    if !cell.field.metadata().is_empty() || !matches!(cell.field.data_type(), DataType::Timestamp(..) | DataType::Utf8 | DataType::Date32 | DataType::Date64) {
         return Ok(None);
     }
     allocation.reserve(cell.field.name().len().checked_add(zone.as_ref().map_or(0, String::len))
         .and_then(|bytes| bytes.checked_add(cell.field.size()))
         .and_then(|bytes| bytes.checked_add(1024)).ok_or_else(size_error)?)?;
     if required(source) != &cell.logical_type()? { return Ok(None); }
-    let Some(raw) = rtdb_expr::cast_bound_timestamp(cell, *unit, zone.is_some(), timezone)? else { return Ok(None); };
+    let raw = match cell.field.data_type() {
+        DataType::Date32 => Some(i64::from(cell.array.as_primitive::<Date32Type>().value(cell.row))),
+        DataType::Date64 => Some(cell.array.as_primitive::<Date64Type>().value(cell.row)
+            .div_euclid(rtdb_types::java_date::MILLIS_PER_DAY)),
+        _ => None,
+    };
+    let raw = if let Some(days) = raw {
+        rtdb_expr::kernels::cast_date_timestamp_ticks(days, *unit, zone.is_some(), timezone)?
+    } else {
+        let Some(raw) = rtdb_expr::cast_bound_timestamp(cell, *unit, zone.is_some(), timezone)? else { return Ok(None); };
+        raw
+    };
     let zone = zone.as_deref();
     let array: ArrayRef = match unit {
         TimeUnit::Second => Arc::new(TimestampSecondArray::from(vec![raw]).with_timezone_opt(zone)),
@@ -1371,6 +1384,45 @@ mod argument_cast_tests {
         let error = cast_arrow_timestamp(cell, &source, &target, session_zone, &allocation).unwrap_err();
         let expected = rtdb_expr::cast(&Value::Utf8(text.into()), &target, session_zone).unwrap_err();
         assert_eq!((error.code, error.kind, error.message), (expected.code, expected.kind, expected.message));
+    }
+
+    #[test]
+    fn prepared_date_cells_match_scalar_timestamp_casts_at_local_midnight_and_overflow() {
+        use arrow_array::{ArrayRef, Date32Array, Date64Array};
+        use rtdb_columnar::ArrowCell;
+        use rtdb_types::TimeUnit;
+
+        let memory = MemoryBudget::new(1 << 20);
+        let allocation = rtdb_expr::EvaluationScope::new(&memory).unwrap();
+        let arrays: [ArrayRef; 3] = [
+            Arc::new(Date32Array::from(vec![0, 20_030])),
+            Arc::new(Date64Array::from(vec![-1, -86_400_001])),
+            Arc::new(Date64Array::from(vec![i64::MAX])),
+        ];
+        for array in arrays {
+            let field = ArrowField::new("date", array.data_type().clone(), true);
+            let source = rtdb_columnar::from_field(&field).unwrap();
+            for row in 0..array.len() {
+                let cell = ArrowCell { field: &field, array: array.as_ref(), row };
+                let value = rtdb_columnar::read_execution_value_as(&source, &field, array.as_ref(), row).unwrap();
+                for zone in [None, Some("UTC".into())] {
+                    let target = LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Nanosecond, timezone: zone });
+                    let expected = rtdb_expr::cast(&value, &target, "America/New_York");
+                    let actual = cast_arrow_timestamp(cell, &source, &target, "America/New_York", &allocation.scratch());
+                    match expected {
+                        Ok(expected) => {
+                            let (field, array) = actual.unwrap().unwrap();
+                            assert_eq!(field, rtdb_columnar::to_field("date", &target).unwrap());
+                            assert_eq!(rtdb_columnar::read_value(&field, array.as_ref(), 0).unwrap(), expected);
+                        }
+                        Err(expected) => {
+                            let actual = actual.unwrap_err();
+                            assert_eq!((actual.code, actual.kind, actual.message), (expected.code, expected.kind, expected.message));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

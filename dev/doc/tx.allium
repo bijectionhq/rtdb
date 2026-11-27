@@ -40,6 +40,7 @@
 -- Declared query parameters retain compatible argument columns and cast incompatible columns individually.
 -- A representable integer-width conversion writes the declared width directly to the prepared argument batch.
 -- A plain text or timestamp cell cast to a declared timestamp uses the scalar conversion's zone, precision and errors and writes directly to the declared storage.
+-- A plain date cell cast to a declared timestamp writes its calendar day's midnight directly, in the session time zone for a zoned target.
 -- A packed float list cast used to bind a declared parameter keeps the converted child in the one-row Arrow argument batch.
 -- Unchanged argument buffers retain their original admission for the lifetime of the reader.
 -- Native control evaluation reads reached expressions against positional Arrow parameters.
