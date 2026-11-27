@@ -31,14 +31,12 @@ pub fn sync_file(file: &File, policy: AppleSync) -> std::io::Result<()> {
     #[cfg(target_vendor = "apple")]
     {
         use std::os::fd::AsRawFd;
-        // SAFETY: the descriptor is owned by `file`, which outlives both calls.
         if policy == AppleSync::Full {
-            if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) } != -1 { return Ok(()); }
-            let error = std::io::Error::last_os_error();
-            if !matches!(error.raw_os_error(), Some(libc::ENOTSUP | libc::EINVAL | libc::ENOTTY)) { return Err(error); }
+            let Some(error) = unsupported_full_sync(file)? else { return Ok(()); };
             static REPORTED: std::sync::Once = std::sync::Once::new();
             REPORTED.call_once(|| tracing::warn!("RTDB durable writes fall back from F_FULLFSYNC to fsync where it is unsupported: {error}"));
         }
+        // SAFETY: the descriptor is owned by `file`, which outlives the call.
         if unsafe { libc::fsync(file.as_raw_fd()) } == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
     }
     #[cfg(not(target_vendor = "apple"))]
@@ -48,6 +46,18 @@ pub fn sync_file(file: &File, policy: AppleSync) -> std::io::Result<()> {
     }
 }
 
+#[cfg(target_vendor = "apple")]
+pub(crate) fn unsupported_full_sync(file: &File) -> std::io::Result<Option<std::io::Error>> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: the descriptor is owned by `file`, which outlives the call.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) } != -1 { return Ok(None); }
+    let error = std::io::Error::last_os_error();
+    if matches!(error.raw_os_error(), Some(libc::ENOTSUP | libc::EINVAL | libc::ENOTTY)) {
+        Ok(Some(error))
+    } else {
+        Err(error)
+    }
+}
 
 /// Flushes the directory entries that publish or remove durable files.
 pub fn sync_directory(path: &Path, policy: AppleSync) -> std::io::Result<()> {

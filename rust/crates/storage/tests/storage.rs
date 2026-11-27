@@ -75,6 +75,35 @@ async fn local_streamed_publication_accepts_exact_retries_and_rejects_same_size_
 }
 
 #[tokio::test]
+async fn local_nested_publication_survives_reopen_and_accepts_exact_retries() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = directory.path().join("objects");
+    let source = directory.path().join("source.arrow");
+    let data_key = ObjectKey::new("tables/products/data/l00-r00.arrow").unwrap();
+    let table_key = ObjectKey::new("tables/products/blocks/b00.binpb").unwrap();
+    let root_key = ObjectKey::new("blocks/b00.binpb").unwrap();
+    let data = b"trie data";
+    let table = Bytes::from_static(b"table block");
+    let root = Bytes::from_static(b"root block");
+    std::fs::write(&source, data).unwrap();
+
+    let store = LocalStore::open(&storage).unwrap();
+    store.put_file(&data_key, &source).await.unwrap();
+    store.put(&table_key, table.clone()).await.unwrap();
+    store.put(&root_key, root.clone()).await.unwrap();
+    store.close_and_wait().await;
+
+    let reopened = LocalStore::open(&storage).unwrap();
+    assert_eq!(reopened.get(&data_key).await.unwrap().as_ref(), data);
+    assert_eq!(reopened.get(&table_key).await.unwrap(), table);
+    assert_eq!(reopened.get(&root_key).await.unwrap(), root);
+    reopened.put_file(&data_key, &source).await.unwrap();
+    reopened.put(&root_key, root).await.unwrap();
+    assert!(matches!(reopened.put(&root_key, Bytes::from_static(b"conflict")).await, Err(Error::ConflictingObject(_))));
+    reopened.close_and_wait().await;
+}
+
+#[tokio::test]
 async fn memory_file_publication_has_the_same_immutable_contract() {
     immutable_file_upload(Arc::new(MemoryStore::default())).await;
 }

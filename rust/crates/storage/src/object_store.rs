@@ -816,7 +816,7 @@ impl LocalStore {
                 }
                 Err(error) => return Err(Error::io(&path, error.error)),
             }
-            sync_parents(&path, &root, apple_sync)
+            sync_publication_parents(&path, &root, apple_sync)
         }).await
     }
 }
@@ -839,6 +839,31 @@ fn sync_parents(path: &Path, root: &Path, apple_sync: AppleSync) -> Result<()> {
         if current == root { return Ok(()); }
         current = current.parent().ok_or_else(|| Error::InvalidKey(path.display().to_string()))?;
     }
+}
+
+fn sync_publication_parents(path: &Path, root: &Path, apple_sync: AppleSync) -> Result<()> {
+    #[cfg(target_vendor = "apple")]
+    if apple_sync == AppleSync::Full && try_sync_publication_volume(path, root)? {
+        return Ok(());
+    }
+    sync_parents(path, root, apple_sync)
+}
+
+#[cfg(target_vendor = "apple")]
+fn try_sync_publication_volume(path: &Path, root: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let root_directory = rtdb_types::directory_io::open_for_sync(root).map_err(|error| Error::io(root, error))?;
+    let device = root_directory.metadata().map_err(|error| Error::io(root, error))?.dev();
+    for parent in path.ancestors().skip(1).take_while(|parent| *parent != root) {
+        let directory = rtdb_types::directory_io::open_for_sync(parent).map_err(|error| Error::io(parent, error))?;
+        if directory.metadata().map_err(|error| Error::io(parent, error))?.dev() != device {
+            return Ok(false);
+        }
+        crate::sync_file(&directory, AppleSync::Fsync).map_err(|error| Error::io(parent, error))?;
+    }
+    // F_FULLFSYNC flushes the device cache, including the preceding fsyncs on this device.
+    Ok(crate::durability::unsupported_full_sync(&root_directory).map_err(|error| Error::io(root, error))?.is_none())
 }
 
 fn equal_local_files(left: &Path, right: &Path) -> Result<bool> {
@@ -1012,7 +1037,7 @@ impl ObjectStore for LocalStore {
                 }
                 Err(error) => return Err(Error::io(&path, error.error)),
             }
-            sync_parents(&path, &root, apple_sync)
+            sync_publication_parents(&path, &root, apple_sync)
         }).await
     }
 
