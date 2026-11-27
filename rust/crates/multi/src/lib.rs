@@ -2,6 +2,7 @@
 //!
 //! A deployment is one RTDB database, held by one node under a directory-allocated epoch, with its logs on a logkeeper ensemble.
 //! This crate wires the directory, the logkeepers and the engine together: node agents claim and open deployments, gateways route clients to their holders.
+#![recursion_limit = "256"]
 
 pub mod admin;
 pub mod agent;

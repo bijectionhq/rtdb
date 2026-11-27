@@ -1352,7 +1352,7 @@ mod tests {
 
     #[test]
     fn posting_read_error_preserves_read_lease_expiry_and_access_denials_without_marking_corrupt() {
-        let expired = posting_read_error(rtdb_storage::Error::ReadLeaseExpired { deadline: Some(10), now: 20 });
+        let expired = posting_read_error(rtdb_storage::Error::ReadLeaseExpired { cutoff: rtdb_storage::LeaseCutoff::Clocked });
         assert_eq!(expired.code, "rtdb.storage/read-lease-expired");
         let erased = posting_read_error(rtdb_storage::Error::ErasedUnderView);
         assert_eq!(erased.code, "rtdb/erased-under-view");
