@@ -30,7 +30,7 @@ Executions made from the same context share its memory budget and spill quota.
 `QueryCursor` owns the operator tree and advances it on the caller's coroutine.
 Dropping a cursor releases its operator state and spill files.
 A context over a store under local erasure custody encrypts each spill file under a key made for that file and held only in memory; other contexts spill as written.
-The spill quota is unlimited by default, as XTDB has none; a node may configure one (`QueryOptions::spill_limit_bytes`).
+The spill quota is unlimited by default, as XTDB has none; a node may configure one (`QueryOptions::spill_limit_bytes`), and zero is a quota like any other, refusing the first spilled byte.
 A spill a configured quota refuses fails with `rtdb.query/spill-limit`, of kind `ConfigurationLimitExceeded`, reported as SQLSTATE `53400` as PostgreSQL reports an exceeded `temp_file_limit`.
 For eligible Arrow queries, UNION ALL forwards its inputs' batches, preserving duplicates and input order.
 A sort over input columns retains the batches and orders their row positions using the SQL key comparator.
@@ -113,10 +113,13 @@ Spill files are scoped temporary resources with a retained-byte quota.
 * Projection, filters, offset/fetch, union-all, and unnest advance incrementally.
 * Inner, outer, semi, and anti joins accumulate complete build pages and use in-memory hashing or shuffled spill partitions.
 * Cross joins retain left pages and publish each left/right page product in right-page, left-page order.
-* Distinct and set operations use exact equality checks against spill files, including occurrence tracking for INTERSECT ALL and EXCEPT ALL.
+* DISTINCT holds every key it has seen in memory, as XTDB's `DistinctRelationMap` does, and fails rather than spills when the memory budget cannot hold them.
+* Set operations use exact equality checks against spill files, including occurrence tracking for INTERSECT ALL and EXCEPT ALL.
 * Sort preserves complete input-page accumulation, applies the configured stable object sorter within each run, and merges four adjacent runs per pass.
 * Grouping assigns first-seen group IDs across complete input pages, then updates each aggregate column in specification order.
   Count, sum, average, min/max, boolean, variance, standard deviation, ordered array aggregates, and `vec-agg` share that page schedule.
+  Groups and their per-group state stay in memory until the input ends, as in XTDB's group-by, and an ordered `ARRAY_AGG` sorts its rows in memory as XTDB's does; a query whose groups the memory budget cannot hold fails with a memory error rather than spilling.
+  Percentiles are the exception: XTDB sorts their values with its external sorter, and so they spill as a sort does.
 * Window execution assigns first-seen partition IDs, orders partitions through the shared sort path, and completes each ROW_NUMBER, LEAD, and LAG output column over the retained sorted relation.
 * Apply implements inner, left, scalar, exists, pull, and pull-many results, including cardinality errors and empty dependent relations.
 
@@ -222,9 +225,8 @@ PULL-many returns null for zero rows and a one-element list for a single empty d
 The executor is row-oriented and does not establish vectorized execution or expected production throughput.
 Keyless joins, anti-join candidate scans, spill-backed membership checks, and repeated group scans can be quadratic or worse across several grouping and aggregate operations.
 Sort spills its record backing when its block and the scratch to order it reach `sort_memory_bytes`; semantic run and output-page boundaries remain determined by complete input callbacks.
-Spill decisions read only the operator's configured share in `QueryOptions` (`sort_memory_bytes`, `hash_memory_bytes`, `materialized_memory_bytes`, `top_k_rows`, `spill_partitions`, `max_spill_depth`), never the budget's free bytes.
-Hash aggregation and DISTINCT compare their share with the bytes their own keys and per-group state retain (collected `ARRAY_AGG` values included), not with the growth of the shared budget, which other operators move too.
-Rows of keys not yet held then go to disk, so a grouped collecting aggregate spills by key; a single group, or a global `ARRAY_AGG`, is one output value and stays in memory, as in XTDB.
+Spill decisions read only the operator's configured share in `QueryOptions` (`sort_memory_bytes`, `materialized_memory_bytes`, `materialized_spill_rows`, `join_build_rows`, `top_k_rows`), never the budget's free bytes.
+Grouping, aggregates and DISTINCT never spill, as in XTDB.
 There is no parallel partition scheduling or coordinated scan-page spilling.
 A single large output row, aggregate array, or set of overlapping active pages can exhaust the configured memory budget and return an error.
 

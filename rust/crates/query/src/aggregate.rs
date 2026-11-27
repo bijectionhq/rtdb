@@ -194,14 +194,7 @@ impl AggregateTypes {
 pub(crate) struct AggregateCursor {
     input: Option<AggregateInput>, schema: Schema, groups: Vec<NamedExpr>, aggregates: Vec<AggregateExpr>,
     runtime: Arc<EmittedRelation>, execution: Execution,
-    /// Hash partitioning levels above this aggregation; each spilled partition aggregates one level deeper.
-    depth: u32,
-    spilled: SpilledGroups,
 }
-
-/// Input rows whose keys were not yet grouped when the aggregation began to spill, with the partition being aggregated.
-#[derive(Default)]
-struct SpilledGroups { files: Vec<Arc<crate::spill::SpillFile>>, projected: bool, current: Option<Box<AggregateCursor>> }
 
 struct ReducedGroups {
     keys: ColumnBatch,
@@ -231,17 +224,7 @@ impl AggregateCursor {
                 }
             }
         }
-        Ok(Self { input: Some(input), schema, groups, aggregates, runtime, execution, depth: 0, spilled: SpilledGroups::default() })
-    }
-
-    /// Aggregates one spilled partition, whose rows hold every row of their keys in input order.
-    fn partition(&self, file: Arc<crate::spill::SpillFile>) -> Result<Self> {
-        let replay = crate::spill::SpillReplay::new(file, self.schema.len(), &self.execution.context)?;
-        let input = AggregateInput { batches: Box::new(replay), projected: self.spilled.projected };
-        let mut partition = Self::with_input(input, self.schema.clone(), self.groups.clone(), self.aggregates.clone(),
-            Arc::clone(&self.runtime), self.execution.clone())?;
-        partition.depth = self.depth + 1;
-        Ok(partition)
+        Ok(Self { input: Some(input), schema, groups, aggregates, runtime, execution })
     }
     fn positions(schema: &Schema, groups: &[NamedExpr], aggregates: &[AggregateExpr]) -> Option<Vec<usize>> {
         let mut positions = Vec::new();
@@ -294,11 +277,6 @@ impl AggregateCursor {
         Ok((columns, reservation))
     }
 
-    /// The bytes the groups hold: their keys and every aggregate's per-group state, collected values included.
-    fn state_bytes(index: &BatchKeyIndex, columns: &[AggregateColumn]) -> usize {
-        columns.iter().fold(index.retained_bytes(), |bytes, column| bytes.saturating_add(column.retained_bytes()))
-    }
-
     async fn reduce_grouped(&mut self, input: AggregateInput) -> Result<Option<ReducedGroups>> {
         let AggregateInput { mut batches, projected } = input;
         let context = &self.execution.context;
@@ -309,45 +287,21 @@ impl AggregateCursor {
         let (group_positions, arguments) = positions.split_at(group_width);
         let mut index = BatchKeyIndex::vector_hashing(context)?;
         let (mut columns, reservation) = self.accumulators()?;
-        let mut overflow: Option<crate::spill::HashPartitions> = None;
         while let Some(batch) = crate::columnar::poll_nested_batch(batches.as_mut()).await? {
             context.check_cancelled()?;
             crate::operators::validate_distinct_types(&key_schema)?;
             if batch.len == 0 { continue; }
-            // Spilling starts only once a group is held, so that each partitioning level makes progress.
-            if overflow.is_none() && index.len() != 0
-                && crate::spill::hash_spill_due(&context.options, self.depth, Self::state_bytes(&index, &columns))
-            {
-                overflow = Some(crate::spill::HashPartitions::new(self.depth, context)?);
-            }
             let _mapping = memory.reserve(batch.len.checked_mul(std::mem::size_of::<usize>() + std::mem::size_of::<Option<usize>>())
                 .ok_or_else(|| invalid("aggregate-size", "Group mapping exceeds addressable memory"))?)?;
             let keys = KeyColumns::projection(&batch, group_positions);
             let mut mapping = Vec::with_capacity(batch.len);
-            let batch = if let Some(partitions) = &mut overflow {
-                // Rows of held groups aggregate here; rows of any other key go to disk, where all of that key's rows follow.
-                let mut targets = Vec::with_capacity(batch.len);
-                for row in 0..batch.len {
-                    context.check_cancelled_at(row)?;
-                    match index.lookup(keys, row, projected, context)? {
-                        (_, Some(ordinal)) => { mapping.push(ordinal); targets.push(None); }
-                        (hash, None) => targets.push(Some(partitions.partition(hash))),
-                    }
+            index.identify(keys, projected, context, &key_schema, |_, ordinal, _| {
+                if ordinal >= i32::MAX as usize {
+                    return Err(invalid("group-count", "Aggregate group count exceeds the reference vector limit"));
                 }
-                partitions.write(&batch, &targets, &self.schema, context)?;
-                if mapping.is_empty() { continue; }
-                let held = targets.iter().map(Option::is_none).collect::<Vec<_>>();
-                batch.select(&held, memory)?
-            } else {
-                index.identify(keys, projected, context, &key_schema, |_, ordinal, _| {
-                    if ordinal >= i32::MAX as usize {
-                        return Err(invalid("group-count", "Aggregate group count exceeds the reference vector limit"));
-                    }
-                    mapping.push(ordinal);
-                    Ok(())
-                })?;
-                batch
-            };
+                mapping.push(ordinal);
+                Ok(())
+            })?;
             let mapping = GroupMapping::Grouped(&mapping);
             if self.accepts_typed_aggregates(&batch)? {
                 self.reduce_typed(&batch, mapping, index.len(), &mut columns)?;
@@ -359,10 +313,6 @@ impl AggregateCursor {
             }
         }
         drop(batches);
-        if let Some(partitions) = overflow {
-            self.spilled.files = partitions.finish()?;
-            self.spilled.projected = projected;
-        }
         Ok(index.group_keys(group_width, context)?.map(|keys| ReducedGroups { keys, columns, _reservation: reservation }))
     }
 }
@@ -371,24 +321,14 @@ impl AggregateCursor {
 impl BatchCursor for AggregateCursor {
     async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
         self.execution.context.check_cancelled()?;
-        if let Some(input) = self.input.take()
-            && let Some(batch) = self.reduce(input).await?
-        {
-            return Ok(Some(batch));
-        }
-        loop {
-            if let Some(partition) = &mut self.spilled.current {
-                if let Some(batch) = partition.next_batch().await? { return Ok(Some(batch)); }
-                self.spilled.current = None;
-            }
-            let Some(file) = self.spilled.files.pop() else { return Ok(None); };
-            self.spilled.current = Some(Box::new(self.partition(file)?));
-        }
+        let Some(input) = self.input.take() else { return Ok(None); };
+        self.reduce(input).await
     }
 }
 
 impl AggregateCursor {
-    /// The groups held in memory; groups whose rows spilled follow, one partition at a time.
+    /// Every group, held in memory until the input ends, as XTDB's group-by holds them; it fails when the query budget
+    /// cannot hold them rather than spilling.
     async fn reduce(&mut self, input: AggregateInput) -> Result<Option<ColumnBatch>> {
         let (mut batch, columns, _reservation) = if self.groups.is_empty() {
             let (columns, _reservation) = self.reduce_global(input).await?;
@@ -396,10 +336,8 @@ impl AggregateCursor {
             (batch, columns, _reservation)
         } else {
             let Some(ReducedGroups { keys, columns, _reservation }) = self.reduce_grouped(input).await? else {
-                if self.spilled.files.is_empty() {
-                    for (aggregate, types) in self.aggregates.iter().zip(self.runtime.aggregates()?) {
-                        validate_collection_order(aggregate, types, &self.schema, &self.execution)?;
-                    }
+                for (aggregate, types) in self.aggregates.iter().zip(self.runtime.aggregates()?) {
+                    validate_collection_order(aggregate, types, &self.schema, &self.execution)?;
                 }
                 return Ok(None);
             };
@@ -590,20 +528,11 @@ struct AggregateColumn { accumulation: Accumulation, distinct: Option<DistinctSe
 /// The distinct arguments each group has taken so far, by the group and the hash of the argument.
 enum DistinctSeen {
     FirstBatch,
-    /// `bytes` sums the rows `values` holds.
-    Rows { index: HashMap<(usize, u32), Vec<usize>>, values: Vec<OwnedRow>, bytes: usize },
+    Rows { index: HashMap<(usize, u32), Vec<usize>>, values: Vec<OwnedRow> },
     Columns(Box<BatchKeyIndex>),
 }
 
 impl DistinctSeen {
-    fn retained_bytes(&self) -> usize {
-        match self {
-            Self::FirstBatch => 0,
-            Self::Rows { index, bytes, .. } => index.capacity().saturating_mul(std::mem::size_of::<((usize, u32), Vec<usize>)>()).saturating_add(*bytes),
-            Self::Columns(index) => index.retained_bytes(),
-        }
-    }
-
     fn select(
         &mut self, input: Rows<'_>, mapping: GroupMapping<'_>, mask: &mut [bool], argument: Option<usize>,
         types: &AggregateTypes, execution: &Execution,
@@ -611,7 +540,7 @@ impl DistinctSeen {
         if matches!(self, Self::FirstBatch) {
             *self = match (input, argument) {
                 (_, Some(_)) => Self::Columns(Box::new(BatchKeyIndex::vector_hashing(&execution.context)?)),
-                _ => Self::Rows { index: HashMap::new(), values: Vec::new(), bytes: 0 },
+                _ => Self::Rows { index: HashMap::new(), values: Vec::new() },
             };
         }
         let mut retained_source = None;
@@ -630,7 +559,7 @@ impl DistinctSeen {
                     };
                     *selected = index.insert_distinct_argument(batch, argument, row, group, projected, &mut retained_source, &execution.context)?;
                 }
-                Self::Rows { index, values, bytes } => {
+                Self::Rows { index, values } => {
                     let cell = input.value(row, argument)?;
                     let value = cell.as_ref();
                     let hash = crate::join_storage::hash_values(std::iter::once(value))?;
@@ -644,9 +573,7 @@ impl DistinctSeen {
                     }
                     if *selected {
                         candidates.push(values.len());
-                        let row = OwnedRow::copy_parts(&[std::slice::from_ref(value)], 0, 0, &execution.context.memory)?;
-                        *bytes = bytes.saturating_add(row.bytes());
-                        values.push(row);
+                        values.push(OwnedRow::copy_parts(&[std::slice::from_ref(value)], 0, 0, &execution.context.memory)?);
                     }
                 }
                 Self::FirstBatch => unreachable!(),
@@ -657,15 +584,6 @@ impl DistinctSeen {
 }
 enum Accumulation { Scalar(ScalarGroups), Vectors(CollectionVectors) }
 impl AggregateColumn {
-    /// The bytes this aggregate's per-group state holds, which a grouped aggregation spills on.
-    fn retained_bytes(&self) -> usize {
-        let accumulated = match &self.accumulation {
-            Accumulation::Scalar(states) => states.retained_bytes(),
-            Accumulation::Vectors(vectors) => vectors.retained_bytes(),
-        };
-        accumulated.saturating_add(self.distinct.as_ref().map_or(0, DistinctSeen::retained_bytes))
-    }
-
     fn new(aggregate: &AggregateExpr,schema: &Schema,execution: &Execution) -> Result<Self> {
         let accumulation = match aggregate.function {
             AggregateFunction::ArrayAgg | AggregateFunction::VecAgg | AggregateFunction::Percentile { .. } => {
@@ -742,22 +660,11 @@ struct CollectionVectors {
     reservation: Arc<rtdb_columnar::MemoryReservation>,
     order: Option<CollectionOrder>,
     projected: bool,
-    /// The charges the collected pages retain, counted once per page as it is collected.
-    page_bytes: usize,
 }
 
 impl CollectionVectors {
     fn new(memory: &Arc<rtdb_columnar::MemoryBudget>, order: Option<CollectionOrder>) -> Result<Self> {
-        Ok(Self { batches: Vec::new(), groups: Vec::new(), selected: 0, present: false, reservation: memory.reserve(4096)?, order, projected: false, page_bytes: 0 })
-    }
-
-    /// The bytes the collected values hold: their positions and the pages they are read from.
-    fn retained_bytes(&self) -> usize { self.reservation.bytes().saturating_add(self.page_bytes) }
-
-    fn push_page(&mut self, page: ColumnBatch, memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<()> {
-        self.page_bytes = self.page_bytes.saturating_add(page.working_set_bytes(memory)?);
-        self.batches.push(page);
-        Ok(())
+        Ok(Self { batches: Vec::new(), groups: Vec::new(), selected: 0, present: false, reservation: memory.reserve(4096)?, order, projected: false })
     }
 
     fn append(&mut self, batch: &ColumnBatch, position: usize, mapping: GroupMapping<'_>, mask: &[bool], groups: usize, projected: bool, context: &crate::QueryContext) -> Result<()> {
@@ -767,7 +674,8 @@ impl CollectionVectors {
             if batch.len == 0 { return Ok(()); }
             let batch = order.page(batch, mapping, mask, context)?;
             self.account_pages(self.selected, groups)?;
-            return self.push_page(batch, &context.memory);
+            self.batches.push(batch);
+            return Ok(());
         }
         self.collect(batch, position, mapping.iter().zip(mask).enumerate()
             .filter_map(|(row, (group, &selected))| selected.then_some((row, group))), groups, context)
@@ -778,7 +686,7 @@ impl CollectionVectors {
         if count == 0 { return Ok(()); }
         self.admit_positions(count, groups)?;
         let page = self.batches.len();
-        self.push_page(batch.key_projection(&[position], &context.memory)?, &context.memory)?;
+        self.batches.push(batch.key_projection(&[position], &context.memory)?);
         for (row, group) in picks {
             self.push_position(group, page, row)?;
         }
@@ -1031,7 +939,7 @@ impl CollectionOrder {
         let mut output = CollectionVectors::new(memory, None)?;
         output.present = input.present;
         let source = Box::new(CollectionInput { batches: input.batches.into_iter(), _reservation: input.reservation });
-        let mut sorted = BatchSort::new(source, self.schema, order.to_vec(), execution.clone(), input.projected, 0, i64::MAX as u64)?;
+        let mut sorted = BatchSort::new(source, self.schema, order.to_vec(), execution.clone(), input.projected, 0, i64::MAX as u64)?.in_memory();
         while let Some(batch) = sorted.next_batch().await? {
             let group_at = |row| -> Result<Option<usize>> {
                 Ok(match ScalarKey::read(&batch.columns[group], row) {
@@ -1217,16 +1125,14 @@ impl<'a> NumericColumn<'a> {
     }
 }
 
-/// Per-group scalar states; `state` is a scope of the query budget that charges only what the groups retain, so that the
-/// aggregation can tell its own growth from the rest of the query's.
+/// Per-group scalar states, charged to `state`, the query budget.
 struct ScalarGroups { values: Vec<ScalarAccumulator>, state: Arc<rtdb_columnar::MemoryBudget>, reservation: Arc<rtdb_columnar::MemoryReservation> }
 impl ScalarGroups {
     fn new(execution: &Execution) -> Result<Self> {
-        let state = execution.context.memory.scope();
+        let state = Arc::clone(&execution.context.memory);
         let reservation = state.reserve(0)?;
         Ok(Self { values: Vec::new(), state, reservation })
     }
-    fn retained_bytes(&self) -> usize { self.state.used_bytes() }
     fn ensure(&mut self,count: usize) -> Result<()> {
         if self.values.len() >= count { return Ok(()); }
         let bytes = count.checked_mul(std::mem::size_of::<ScalarAccumulator>()).ok_or_else(||invalid("aggregate-size","Aggregate group accumulator capacity overflow"))?;

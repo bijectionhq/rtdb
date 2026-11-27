@@ -95,12 +95,13 @@ Without the YAML key, each reads `RTDB_DEFAULT_LOCAL_ERASURE` or `RTDB_DEFAULT_K
 `RTDB_APPLE_SYNC` selects the durable-write policy on Apple platforms for every `rtdb` and `rtdb-multi` command: absent, empty or `full` keeps `F_FULLFSYNC`, `fsync` selects plain `fsync`, and any other value fails startup.
 `RTDB_TZDB_FILE` names an OpenJDK `tzdb.dat` that replaces the bundled time-zone rules without a rebuild, as replacing a JDK's `lib/tzdb.dat` does for XTDB; it is read on the first region-zone lookup, and a file that cannot be read or decoded fails every region-zone lookup (see link:../types/data/tzdb/README.adoc[timezone data]).
 The binary validates and installs it once before dispatching the command; library code performs no lookup, and an embedding host that installs nothing gets `F_FULLFSYNC`.
-`query.spillLimitBytes`, or `RTDB_QUERY_SPILL_LIMIT_BYTES` when the YAML sets none, caps the bytes one query's spill files may hold at once, and zero disables spilling.
+`query.spillLimitBytes`, or `RTDB_QUERY_SPILL_LIMIT_BYTES` when the YAML sets none, caps the bytes one query's spill files may hold at once; zero is a limit like any other and refuses the first spilled byte.
 XTDB has no such setting, so it carries the RTDB prefix; the earlier `XTDB_QUERY_SPILL_LIMIT_BYTES` spelling is no longer read.
 Without either, a query's spill is unlimited, as in XTDB, for server and embedded nodes alike; a configured limit is an opt-in, and a query that passes it fails with SQLSTATE 53400 (`rtdb.query/spill-limit`, `ConfigurationLimitExceeded`), as PostgreSQL's `temp_file_limit` does.
 A value that is not a non-negative integer, or another key in the `query` section, fails startup.
 Each spilling operator decides from its configured share of memory, never from what the budget has free.
-Sorts spill sorted runs once their block, ordering scratch included, passes `sort_memory_bytes`, and merge them; hash aggregation and DISTINCT send rows of keys they do not yet hold to hash partitions on disk once they grow past `hash_memory_bytes` (64 MiB by default), then process each partition in turn.
+Sorts spill sorted runs once their block, ordering scratch included, passes `sort_memory_bytes`, and merge them, as XTDB's external sort does.
+GROUP BY, aggregates and DISTINCT hold their state in memory, as XTDB's do, and a query whose state the memory budget cannot hold fails with a memory error rather than spilling.
 A sort with a small `LIMIT` keeps only its candidate rows, whatever the input size.
 `-Djava.util.Arrays.useLegacyMergeSort=true` selects the legacy OpenJDK object sorter for this node's queries and transaction-time queries.
 The option may precede the command or appear among startup and maintenance options; repeated occurrences use the last value.

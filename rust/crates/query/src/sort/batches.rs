@@ -31,6 +31,8 @@ pub(crate) struct BatchSort {
     spilled: bool,
     semantic_page_rows: Option<usize>,
     spill_pending: Option<(Arc<ColumnBatch>, usize)>,
+    /// Sorts one block in memory however large, never spilling: the in-memory sort of an operator XTDB never spills.
+    in_memory: bool,
 }
 
 impl BatchSort {
@@ -77,11 +79,19 @@ impl BatchSort {
             spilled: false,
             semantic_page_rows: None,
             spill_pending: None,
+            in_memory: false,
         })
     }
 
     pub fn preserving_pages(mut self) -> Self {
         self.semantic_page_rows = Some(0);
+        self
+    }
+
+    /// Holds every row in one block and sorts it there, as XTDB sorts the rows of an ordered `ARRAY_AGG` in memory; a
+    /// budget that cannot hold them fails the query.
+    pub fn in_memory(mut self) -> Self {
+        self.in_memory = true;
         self
     }
 
@@ -121,7 +131,7 @@ impl BatchSort {
             }
             let payload_bytes = batch.working_set_bytes(&context.memory)?;
             let rows = block.positions.len().saturating_add(batch.len);
-            if !block.positions.is_empty()
+            if !self.in_memory && !block.positions.is_empty()
                 && (block.charged().saturating_add(payload_bytes).saturating_add(ordering_bytes(rows))
                     > context.options.sort_memory_bytes
                     || (retained_rows.is_none() || !self.orders_consistently(&block, &key_types))
@@ -186,7 +196,7 @@ impl BatchSort {
             key_types.validate()?;
         }
         self.used_native |= block.native && !block.positions.is_empty();
-        let spill_tail = !block.positions.is_empty() && block.charged() > context.options.sort_memory_bytes;
+        let spill_tail = !self.in_memory && !block.positions.is_empty() && block.charged() > context.options.sort_memory_bytes;
         let tail = block.order(&self.plan, &self.key_columns, self.native.as_ref(), self.projected)?;
         if runs.files.is_empty() && !spill_tail {
             return Ok(Sorted::Memory(tail));

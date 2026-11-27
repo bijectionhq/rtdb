@@ -436,16 +436,9 @@ pub struct QueryOptions {
     pub sort_memory_bytes: usize,
     /// The largest limit a sort answers by keeping only its candidates; a larger one sorts blocks and spills them.
     pub top_k_rows: usize,
-    /// Bytes a hash aggregation or DISTINCT may grow by before it sends rows of new keys to disk.
-    pub hash_memory_bytes: usize,
-    /// Fan-out of one level of hash partitioning; at least two, so that each level separates keys.
-    pub spill_partitions: usize,
-    /// Hash partitioning levels after which an operator holds what remains in memory: keys sharing a 32-bit hash never
-    /// separate, so this bounds the levels hash collisions alone would add.
-    pub max_spill_depth: u32,
     /// Build-row threshold for join Bloom/IID filters; exceeding it disables the filters.
     pub join_build_rows: i64,
-    /// Disk bytes one query's spill files may hold at once; zero disables spilling.
+    /// Disk bytes one query's spill files may hold at once; zero refuses the first spilled byte.
     /// [`QueryOptions::UNLIMITED_SPILL`], the default, sets no limit, as XTDB sets none; a node may configure one.
     pub spill_limit_bytes: u64,
     pub materialized_spill_rows: usize,
@@ -464,8 +457,8 @@ impl QueryOptions {
 impl Default for QueryOptions {
     fn default() -> Self {
         Self {
-            batch_rows: 1024, list_batch_rows: 1024, sort_memory_bytes: 64 << 20, top_k_rows: 12_800, hash_memory_bytes: 64 << 20,
-            spill_partitions: 16, max_spill_depth: 6, join_build_rows: 100_000, spill_limit_bytes: Self::UNLIMITED_SPILL, materialized_spill_rows: 100_000,
+            batch_rows: 1024, list_batch_rows: 1024, sort_memory_bytes: 64 << 20, top_k_rows: 12_800,
+            join_build_rows: 100_000, spill_limit_bytes: Self::UNLIMITED_SPILL, materialized_spill_rows: 100_000,
             materialized_memory_bytes: 64 << 20, bypass_temporal_pruning: false, generate_series_end_exclusive: false,
             object_sort: rtdb_types::ObjectSort::default(),
         }
@@ -513,7 +506,6 @@ impl QueryContext {
         if options.batch_rows == 0 || options.list_batch_rows == 0 || options.sort_memory_bytes == 0 {
             return Err(invalid("invalid-options", "Batch rows and sort bytes must be positive"));
         }
-        if options.spill_partitions < 2 { return Err(invalid("invalid-options", "Spill partitions must be at least two")); }
         // Under local erasure custody no readable copy of an erased row may outlive the query, so its spill files are sealed.
         let spill = Arc::new(if catalog.databases.values().any(|database| database.storage.object_store().local_erasure_custody().is_some()) {
             SpillRegion::sealed(options.spill_limit_bytes)?

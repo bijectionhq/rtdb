@@ -25,9 +25,12 @@ fn execution(batch_rows: usize) -> Execution {
     execution_with_options(QueryOptions { batch_rows,..Default::default() })
 }
 fn execution_with_options(options: QueryOptions) -> Execution {
+    execution_with_budget(options, 1 << 27)
+}
+fn execution_with_budget(options: QueryOptions, bytes: usize) -> Execution {
     let database = DatabaseSnapshot { partitions: vec![],storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()),1 << 20)) };
     let catalog = CatalogSnapshot::new("xtdb",BTreeMap::from([("xtdb".into(),database)]),false).unwrap();
-    let context = QueryContext::new(catalog,MemoryBudget::new(1 << 27),Timestamp(0),"UTC",options,&CancellationToken::new()).unwrap();
+    let context = QueryContext::new(catalog,MemoryBudget::new(bytes),Timestamp(0),"UTC",options,&CancellationToken::new()).unwrap();
     Execution { parameters: Arc::new(BoundParameters::infer(vec![],&context.memory).unwrap()),outer: OuterRows::empty(&context.memory).unwrap(),context,bindings: None,analysis: None }
 }
 fn field(id: u32,ty: LogicalType) -> Field { Field { id: ColumnId(id),name: format!("c{id}"),qualifier: None,qualified_only: false,unnamed: false,data_type: ty } }
@@ -578,7 +581,8 @@ async fn ordered_array_agg_lends_small_backing_and_detaches_wide_sort_keys() {
 }
 
 #[tokio::test]
-async fn spilled_ordered_array_agg_keeps_mixed_children_and_empty_group_offsets() {
+/// XTDB sorts an ordered `ARRAY_AGG`'s rows in memory, so a sort share far smaller than they are spills nothing.
+async fn ordered_array_agg_past_its_sort_share_stays_in_memory_and_keeps_mixed_children_and_empty_group_offsets() {
     let execution = execution_with_options(QueryOptions { batch_rows: 4, sort_memory_bytes: 1024, ..Default::default() });
     let baseline = execution.context.memory.used_bytes();
     let int = LogicalType::Scalar(ScalarType::I64);
@@ -606,7 +610,7 @@ async fn spilled_ordered_array_agg_keeps_mixed_children_and_empty_group_offsets(
     assert_eq!(batch_row(&result, 1), [Value::I64(2), Value::Null]);
     let Column::Arrow { array, .. } = &result.columns[1] else { panic!("Expected an Arrow list"); };
     assert_eq!(array.as_list::<i32>().value_offsets(), &[0, 3, 3]);
-    assert!(execution.context.spill_peak_bytes() > 0);
+    assert_eq!(execution.context.spill_peak_bytes(), 0);
     assert_eq!(execution.context.spill_bytes(), 0);
     drop(result);
     assert_eq!(execution.context.memory.used_bytes(), baseline);
@@ -900,36 +904,38 @@ async fn drain_groups(cursor: &mut AggregateCursor) -> BTreeMap<String, Vec<Valu
 }
 
 #[tokio::test]
-async fn grouping_past_its_hash_memory_spills_partitions_and_matches_the_in_memory_result() {
+async fn grouping_holds_every_group_in_memory_and_never_spills() {
+    let (schema, pages) = spread_pages();
+    let (groups, aggregates) = spread_aggregates(&schema);
+    let execution = execution_with_options(QueryOptions { batch_rows: 50, ..Default::default() });
+    let baseline = execution.context.memory.used_bytes();
+    let (mut grouped, _) = cursor(&execution, schema, pages, groups, aggregates, None);
+    assert_eq!(drain_groups(&mut grouped).await.len(), 614);
+    assert_eq!(execution.context.spill_peak_bytes(), 0);
+    drop(grouped);
+    assert_eq!(execution.context.memory.used_bytes(), baseline);
+}
+
+/// XTDB's group-by keeps its groups in memory and fails the query when its allocator refuses them; so does this.
+#[tokio::test]
+async fn grouping_past_the_query_budget_fails_rather_than_spilling() {
     let (schema, pages) = spread_pages();
     let (groups, aggregates) = spread_aggregates(&schema);
     let reference = execution_with_options(QueryOptions { batch_rows: 50, ..Default::default() });
-    let (mut in_memory, _) = cursor(&reference, schema.clone(), pages.clone(), groups.clone(), aggregates.clone(), None);
-    let expected = drain_groups(&mut in_memory).await;
-    assert_eq!(expected.len(), 614);
-    assert_eq!(reference.context.spill_peak_bytes(), 0);
+    let (mut grouped, _) = cursor(&reference, schema.clone(), pages.clone(), groups.clone(), aggregates.clone(), None);
+    drain_groups(&mut grouped).await;
+    drop(grouped);
+    let peak = reference.context.memory.peak_bytes();
 
-    let spilling = execution_with_options(QueryOptions { batch_rows: 50, hash_memory_bytes: 1, ..Default::default() });
-    let baseline = spilling.context.memory.used_bytes();
-    let (mut spilled, _) = cursor(&spilling, schema, pages, groups, aggregates, None);
-    assert_eq!(drain_groups(&mut spilled).await, expected);
-    assert!(spilling.context.spill_peak_bytes() > 0);
-    drop(spilled);
-    assert_eq!(spilling.context.spill_bytes(), 0);
-    assert_eq!(spilling.context.memory.used_bytes(), baseline);
-}
-
-#[tokio::test]
-async fn cancelling_a_spilled_grouping_deletes_its_pending_partitions() {
-    let (schema, pages) = spread_pages();
-    let (groups, aggregates) = spread_aggregates(&schema);
-    let execution = execution_with_options(QueryOptions { batch_rows: 50, hash_memory_bytes: 1, ..Default::default() });
-    let (mut spilled, _) = cursor(&execution, schema, pages, groups, aggregates, None);
-    let held = spilled.next_batch().await.unwrap().unwrap();
-    assert!(held.len < 614);
-    assert!(execution.context.spill_bytes() > 0);
-    execution.context.cancellation.cancel();
-    assert_eq!(spilled.next_batch().await.err().unwrap().code, "xtdb/query-cancelled");
-    drop((spilled, held));
-    assert_eq!(execution.context.spill_bytes(), 0);
+    let execution = execution_with_budget(QueryOptions { batch_rows: 50, ..Default::default() }, peak - 1);
+    let (mut grouped, _) = cursor(&execution, schema, pages, groups, aggregates, None);
+    let error = loop {
+        match grouped.next_batch().await {
+            Ok(Some(_)) => (),
+            Ok(None) => panic!("the grouping fits a budget below its peak"),
+            Err(error) => break error,
+        }
+    };
+    assert!(error.is(rtdb_types::AnomalyKind::ResourceExhausted), "{error:?}");
+    assert_eq!(execution.context.spill_peak_bytes(), 0);
 }

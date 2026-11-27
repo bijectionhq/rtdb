@@ -402,8 +402,6 @@ pub(crate) struct BatchKeyIndex {
     hashing: KeyHash,
     /// Stored keys already decoded for comparison, by position.
     decoded: DecodedKeys,
-    /// The charges the stored pages retain, counted once per page as it is stored.
-    page_bytes: usize,
 }
 
 /// Owned copies of stored direct keys, decoded on their first comparison, so that a key met again is not read again.
@@ -523,7 +521,6 @@ impl BatchKeyIndex {
             reservation: context.memory.reserve(0)?,
             hashing,
             decoded: DecodedKeys::default(),
-            page_bytes: 0,
         })
     }
 
@@ -531,15 +528,7 @@ impl BatchKeyIndex {
         self.positions.rows.len()
     }
 
-    /// The bytes this index holds: its positions, its decoded keys and the pages its keys are read from.
-    /// A hash operator spills on this, not on what the shared budget holds, which other operators move too.
-    pub fn retained_bytes(&self) -> usize {
-        let decoded = self.decoded.charge.as_ref().map_or(0, |charge| charge.bytes());
-        self.reservation.bytes().saturating_add(decoded).saturating_add(self.page_bytes)
-    }
-
-    fn push_page(&mut self, batch: ColumnBatch, projected: bool, bytes: usize) -> usize {
-        self.page_bytes = self.page_bytes.saturating_add(bytes);
+    fn push_page(&mut self, batch: ColumnBatch, projected: bool) -> usize {
         self.batches.push((batch, projected));
         self.batches.len() - 1
     }
@@ -597,10 +586,9 @@ impl BatchKeyIndex {
             .grow_to(bytes)
     }
 
-    fn append(&mut self, batch: ColumnBatch, projected: bool, hashes: &[u32], memory: &Arc<MemoryBudget>) -> Result<()> {
-        let bytes = batch.working_set_bytes(memory)?;
+    fn append(&mut self, batch: ColumnBatch, projected: bool, hashes: &[u32]) -> Result<()> {
         self.reserve_page(hashes.len())?;
-        let page = self.push_page(batch, projected, bytes);
+        let page = self.push_page(batch, projected);
         for (row, &hash) in hashes.iter().enumerate() {
             self.positions.push(u64::from(hash), page, row);
         }
@@ -617,7 +605,6 @@ impl BatchKeyIndex {
             return Ok(());
         }
         context.check_cancelled()?;
-        let page_bytes = batch.working_set_bytes(&context.memory)?;
         let previous_charge = self.reservation.bytes();
         self.reserve_page(batch.len)?;
         let page = self.batches.len();
@@ -636,7 +623,7 @@ impl BatchKeyIndex {
                 .expect("The build reserved at least its previous charge");
             return Err(error);
         }
-        self.push_page(batch, projected, page_bytes);
+        self.push_page(batch, projected);
         Ok(())
     }
 
@@ -690,19 +677,6 @@ impl BatchKeyIndex {
         })
     }
 
-    /// The key's hash, with the ordinal `identify` gave the key if the index holds it; the index is left unchanged.
-    pub fn lookup<'a>(
-        &mut self,
-        columns: impl Into<KeyColumns<'a>>,
-        row: usize,
-        projected: bool,
-        context: &QueryContext,
-    ) -> Result<(u32, Option<usize>)> {
-        let (hash, key) = Key::bind(columns, row, projected, context, self.hashing)?;
-        let found = self.find(hash, &key, false, context)?;
-        Ok((hash, found))
-    }
-
     pub fn insert_distinct_argument(
         &mut self, batch: &ColumnBatch, column: usize, row: usize, group: usize, projected: bool,
         retained_source: &mut Option<usize>, context: &QueryContext,
@@ -730,8 +704,7 @@ impl BatchKeyIndex {
             Some(page) => page,
             None => {
                 let source = batch.key_projection(&[column], &context.memory)?;
-                let bytes = source.working_set_bytes(&context.memory)?;
-                let page = self.push_page(source, projected, bytes);
+                let page = self.push_page(source, projected);
                 *retained_source = Some(page);
                 page
             }
@@ -824,7 +797,7 @@ impl BatchKeyIndex {
             (None, KeyHash::Set) => batch.select_keys(&picks, &context.memory)?,
             _ => batch.compact_group_key_columns(&picks, positions, &context.memory)?,
         };
-        self.append(compact, projected, &hashes, &context.memory)
+        self.append(compact, projected, &hashes)
     }
 }
 

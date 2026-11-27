@@ -17,7 +17,7 @@ use rtdb_types::{Anomaly, AnomalyKind, Result};
 use tempfile::{NamedTempFile, TempDir, TempPath};
 
 use crate::{
-    columnar::{BatchCursor, ColumnBatch},
+    columnar::ColumnBatch,
     fragment::{FragmentBytes, decode_batches, encode_batch},
     invalid,
 };
@@ -450,85 +450,8 @@ fn page_span_rows(len: usize, page_bytes: usize, schema_bytes: usize, memory: &A
     Ok(rows)
 }
 
-/// Whether a hash operator at partitioning level `depth`, whose keys and per-key state hold `retained` bytes, should send
-/// rows of new keys to disk: past its configured share, and while it has partitioning levels left.
-/// The operator's own state alone decides, never what the budget has free or what other operators hold.
-pub(crate) fn hash_spill_due(options: &crate::QueryOptions, depth: u32, retained: usize) -> bool {
-    options.spill_limit_bytes != 0 && depth < options.max_spill_depth && retained > options.hash_memory_bytes
-}
-
-/// The buffer of each spill writer, charged by the hash partitions that hold one writer per partition.
+/// The buffer of each spill writer.
 const WRITER_BUFFER_BYTES: usize = 8 << 10;
-
-/// Rows routed by key hash to one spill file per partition, so that every row of a key lands in one file, in input order.
-pub(crate) struct HashPartitions { writers: Vec<Option<SpillWriter>>, depth: u32, _buffers: Arc<MemoryReservation> }
-
-impl HashPartitions {
-    pub fn new(depth: u32, context: &crate::QueryContext) -> Result<Self> {
-        let partitions = context.options.spill_partitions;
-        let bytes = partitions.checked_mul(WRITER_BUFFER_BYTES + 256)
-            .ok_or_else(|| invalid("row-size", "Spill partition buffers exceed addressable memory"))?;
-        let buffers = context.memory.reserve(bytes)?;
-        Ok(Self { writers: (0..partitions).map(|_| None).collect(), depth, _buffers: buffers })
-    }
-
-    /// Each level mixes the hash with its depth, so that one partition's keys spread again at the next level.
-    pub fn partition(&self, hash: u32) -> usize {
-        let mut mixed = hash ^ self.depth.wrapping_add(1).wrapping_mul(0x9e37_79b9);
-        mixed ^= mixed >> 16;
-        mixed = mixed.wrapping_mul(0x85eb_ca6b);
-        mixed ^= mixed >> 13;
-        mixed = mixed.wrapping_mul(0xc2b2_ae35);
-        mixed ^= mixed >> 16;
-        mixed as usize % self.writers.len()
-    }
-
-    /// Appends each row to the partition `targets` names for it; a row without one stays with the caller.
-    pub fn write(&mut self, batch: &ColumnBatch, targets: &[Option<usize>], schema: &rtdb_plan::Schema, context: &crate::QueryContext) -> Result<()> {
-        if targets.len() != batch.len { return Err(invalid("invalid-spill", "Spill partition targets disagree with their page")); }
-        let memory = &context.memory;
-        let bytes = batch.len.checked_mul(std::mem::size_of::<(usize, usize)>())
-            .and_then(|bytes| bytes.checked_add(batch.columns.len().checked_mul(std::mem::size_of::<usize>())?))
-            .ok_or_else(|| invalid("row-size", "Spill partition selection exceeds addressable memory"))?;
-        let _picks = memory.reserve(bytes)?;
-        let positions = (0..batch.columns.len()).collect::<Vec<_>>();
-        for partition in 0..self.writers.len() {
-            context.check_cancelled()?;
-            let rows = targets.iter().enumerate().filter(|(_, target)| **target == Some(partition))
-                .map(|(row, _)| (0, row)).collect::<Vec<_>>();
-            if rows.is_empty() { continue; }
-            let page = ColumnBatch::take_rows(&[batch], &rows, &positions, memory)?;
-            if self.writers[partition].is_none() { self.writers[partition] = Some(context.spill.create()?); }
-            let writer = self.writers[partition].as_mut().expect("the partition's writer is open");
-            write_page(writer, &page, schema, memory)?;
-        }
-        Ok(())
-    }
-
-    /// The partitions that received rows; dropping one deletes its file.
-    pub fn finish(self) -> Result<Vec<Arc<SpillFile>>> {
-        self.writers.into_iter().flatten().map(SpillWriter::finish).collect()
-    }
-}
-
-/// Replays the pages of one spill file, which is deleted once the replay is dropped.
-pub(crate) struct SpillReplay { reader: SpillReader, width: usize, context: Arc<crate::QueryContext> }
-
-impl SpillReplay {
-    pub fn new(file: Arc<SpillFile>, width: usize, context: &Arc<crate::QueryContext>) -> Result<Self> {
-        Ok(Self { reader: file.reader(Arc::clone(&context.memory))?, width, context: Arc::clone(context) })
-    }
-}
-
-#[async_trait::async_trait]
-impl BatchCursor for SpillReplay {
-    async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
-        self.context.check_cancelled()?;
-        let page = self.reader.read_columns(self.width)?;
-        tokio::task::consume_budget().await;
-        Ok(page)
-    }
-}
 
 fn ipc_error(error: impl std::fmt::Display) -> rtdb_types::Anomaly { invalid("join-spill", error) }
 
@@ -555,46 +478,6 @@ fn a_spill_page_spans_what_the_budget_admits_and_never_less_than_a_row() {
     assert_eq!(page_span_rows(1024, usize::MAX / 16, 64, &MemoryBudget::new(0)).unwrap(), 1);
     assert_eq!(page_span_rows(0, 0, 64, &memory).unwrap(), 1);
     assert_eq!(memory.used_bytes(), 0, "sizing holds nothing");
-}
-
-#[cfg(test)]
-fn options_context(options: crate::QueryOptions) -> Arc<crate::QueryContext> {
-    use std::collections::BTreeMap;
-    use rtdb_storage::{MemoryStore, cache::BufferPool};
-    let database = crate::DatabaseSnapshot { partitions: vec![], storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)) };
-    let catalog = crate::CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
-    crate::QueryContext::new(catalog, MemoryBudget::new(1 << 20), rtdb_types::Timestamp(0), "UTC", options, &tokio_util::sync::CancellationToken::new()).unwrap()
-}
-
-#[test]
-fn hash_partitions_separate_a_partitions_keys_at_the_next_level() {
-    let context = options_context(crate::QueryOptions::default());
-    let partitions = context.options.spill_partitions;
-    let (top, next) = (HashPartitions::new(0, &context).unwrap(), HashPartitions::new(1, &context).unwrap());
-    let hashes = (0..4096u32).map(|key| key.wrapping_mul(0x2545_f491)).collect::<Vec<_>>();
-    let first = hashes.iter().copied().filter(|&hash| top.partition(hash) == 0).collect::<Vec<_>>();
-    assert!(!first.is_empty());
-    let spread = first.iter().map(|&hash| next.partition(hash)).collect::<std::collections::BTreeSet<_>>();
-    assert!(spread.len() > partitions / 2, "{spread:?}");
-}
-
-#[test]
-fn hash_partitions_fan_out_to_the_configured_partitions_and_charge_their_writer_buffers() {
-    let context = options_context(crate::QueryOptions { spill_partitions: 3, ..Default::default() });
-    let partitions = HashPartitions::new(0, &context).unwrap();
-    assert_eq!(context.memory.used_bytes(), 3 * (WRITER_BUFFER_BYTES + 256));
-    let used = (0..4096u32).map(|hash| partitions.partition(hash)).collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(used, std::collections::BTreeSet::from([0, 1, 2]));
-}
-
-#[test]
-fn a_hash_operator_spills_past_its_share_alone_while_levels_remain() {
-    let options = crate::QueryOptions { hash_memory_bytes: 1 << 10, max_spill_depth: 2, ..Default::default() };
-    assert!(!hash_spill_due(&options, 0, 1 << 10));
-    assert!(hash_spill_due(&options, 0, (1 << 10) + 1));
-    assert!(hash_spill_due(&options, 1, usize::MAX));
-    assert!(!hash_spill_due(&options, 2, usize::MAX), "the last level holds what remains");
-    assert!(!hash_spill_due(&crate::QueryOptions { spill_limit_bytes: 0, ..options }, 0, usize::MAX), "spilling is disabled");
 }
 
 #[test]

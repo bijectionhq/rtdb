@@ -862,28 +862,20 @@ impl crate::columnar::BatchCursor for BatchUnion {
     }
 }
 
+/// DISTINCT over its input, holding every key it has seen in memory, as XTDB's `DistinctRelationMap` does; it fails
+/// when the query budget cannot hold them rather than spilling.
 struct BatchDistinct {
     input: Option<crate::columnar::BoxBatchCursor>,
     seen: crate::set_keys::BatchKeyIndex,
     schema: Arc<RuntimeSchema>,
     execution: Execution,
     projected: bool,
-    /// Hash partitioning levels above this DISTINCT; each spilled partition is deduplicated one level deeper.
-    depth: u32,
-    /// Rows whose keys the index did not hold once it began to spill; every row of such a key goes to the same partition.
-    overflow: Option<crate::spill::HashPartitions>,
-    spilled: Vec<Arc<crate::spill::SpillFile>>,
-    partition: Option<Box<BatchDistinct>>,
 }
 
 impl BatchDistinct {
     fn new(input: crate::columnar::BoxBatchCursor, schema: Arc<RuntimeSchema>, execution: Execution, projected: bool) -> Result<Self> {
-        Self::at_depth(input, schema, execution, projected, 0)
-    }
-
-    fn at_depth(input: crate::columnar::BoxBatchCursor, schema: Arc<RuntimeSchema>, execution: Execution, projected: bool, depth: u32) -> Result<Self> {
         let seen = crate::set_keys::BatchKeyIndex::new(&execution.context)?;
-        Ok(Self { input: Some(input), seen, schema, execution, projected, depth, overflow: None, spilled: Vec::new(), partition: None })
+        Ok(Self { input: Some(input), seen, schema, execution, projected })
     }
 }
 
@@ -893,49 +885,17 @@ impl crate::columnar::BatchCursor for BatchDistinct {
         while let Some(input) = self.input.as_mut() {
             let Some(batch) = crate::columnar::poll_nested_batch(input.as_mut()).await? else {
                 self.input = None;
-                if let Some(partitions) = self.overflow.take() {
-                    self.spilled = partitions.finish()?;
-                    // The partitions hold only keys the index lacks, so their rows never consult it.
-                    self.seen = crate::set_keys::BatchKeyIndex::new(&self.execution.context)?;
-                }
                 break;
             };
             if batch.len == 0 { continue; }
             let context = &self.execution.context;
             let memory = &context.memory;
-            // Spilling starts only once a key is held, so that each partitioning level makes progress.
-            if self.overflow.is_none() && self.seen.len() != 0
-                && crate::spill::hash_spill_due(&context.options, self.depth, self.seen.retained_bytes())
-            {
-                self.overflow = Some(crate::spill::HashPartitions::new(self.depth, context)?);
-            }
-            if let Some(partitions) = &mut self.overflow {
-                validate_distinct_types(self.schema.schema())?;
-                let _targets = memory.reserve(batch.len.saturating_mul(std::mem::size_of::<Option<usize>>()).saturating_add(256))?;
-                let mut targets = Vec::with_capacity(batch.len);
-                for row in 0..batch.len {
-                    context.check_cancelled_at(row)?;
-                    let (hash, held) = self.seen.lookup(&batch, row, self.projected, context)?;
-                    targets.push(held.is_none().then(|| partitions.partition(hash)));
-                }
-                partitions.write(&batch, &targets, self.schema.schema(), context)?;
-                continue;
-            }
             let selection = PredicateSelection::build(batch.len, memory, |bits| {
                 self.seen.distinct(&batch, self.projected, bits, context, self.schema.schema(), |_| Ok(true))
             })?;
             if !selection.is_empty() { return batch.select_predicate(&selection, memory).map(Some); }
         }
-        loop {
-            if let Some(partition) = &mut self.partition {
-                if let Some(batch) = partition.next_batch().await? { return Ok(Some(batch)); }
-                self.partition = None;
-            }
-            let Some(file) = self.spilled.pop() else { return Ok(None); };
-            let replay = crate::spill::SpillReplay::new(file, self.schema.schema().len(), &self.execution.context)?;
-            let partition = Self::at_depth(Box::new(replay), Arc::clone(&self.schema), self.execution.clone(), self.projected, self.depth + 1)?;
-            self.partition = Some(Box::new(partition));
-        }
+        Ok(None)
     }
 }
 
