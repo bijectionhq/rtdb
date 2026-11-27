@@ -554,7 +554,7 @@ const PRUNED_STORE_CHECKPOINT_VERSION: u8 = 10;
 const RETIRED_FUNDING_CHECKPOINT_VERSION: u8 = 11;
 
 mod funded_transfer;
-pub use funded_transfer::{FundedOutcome, FundedSettlement, HistoricalFunding, funded_settlement_digest};
+pub use funded_transfer::{FundedOutcome, FundedSettlement, FundedStatus, HistoricalFunding, funded_settlement_digest};
 use funded_transfer::RetiredFunding;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -754,6 +754,7 @@ pub struct TransactState {
     index: BranchIndex,
     receipts: Receipts,
     appointment_addresses: BTreeSet<[u8; 32]>,
+    scoped_funding_origins: BTreeSet<[u8; 16]>,
     pending: Option<Pending>,
     pending_erasure: Option<TxKey>,
 }
@@ -762,6 +763,7 @@ impl TransactState {
     pub fn new(incarnation: [u8; 16]) -> Self {
         Self {
             index: BranchIndex::new(incarnation), receipts: BTreeMap::new(), appointment_addresses: BTreeSet::new(),
+            scoped_funding_origins: BTreeSet::new(),
             pending: None, pending_erasure: None,
         }
     }
@@ -990,6 +992,7 @@ impl TransactState {
         self.index.restore_native_checkpoint(custody)?;
         self.receipts.clear();
         self.appointment_addresses.clear();
+        self.scoped_funding_origins.clear();
         Ok(())
     }
 
@@ -1074,7 +1077,8 @@ impl TransactState {
             return Err(invalid());
         }
         let mut state = Self {
-            index, receipts: BTreeMap::new(), appointment_addresses: BTreeSet::new(), pending: None, pending_erasure: None,
+            index, receipts: BTreeMap::new(), appointment_addresses: BTreeSet::new(),
+            scoped_funding_origins: BTreeSet::new(), pending: None, pending_erasure: None,
         };
         for stored in receipts {
             let receipt = &stored.receipt;
@@ -1111,6 +1115,12 @@ impl TransactState {
     }
 
     fn store_receipt(&mut self, stored: StoredReceipt) -> Option<StoredReceipt> {
+        if stored.receipt_namespace.is_some()
+            && let Some(retired) = &stored.retired_funding
+            && !retired.history.outcome.appointment
+        {
+            self.scoped_funding_origins.insert(retired.history.source);
+        }
         let key = stored.receipt.key.clone();
         if let Some(address) = stored.receipt.decision_clock.and_then(FundedReceipt::appointment_address) {
             self.appointment_addresses.insert(address);
@@ -1157,16 +1167,19 @@ impl TransactState {
 
     /// Compare a retry to an already applied admission without resolving it or recording a new write.
     pub fn recover_exact(&self, key: &[u8], namespace: Option<[u8; 32]>, fingerprint: [u8; 32]) -> Result<Receipt> {
-        let receipt = self.tx_status_with_namespace(key, namespace)?;
-        let stored = self.receipts.get(&namespace).and_then(|namespace| namespace.get(key)).ok_or_else(invalid_record)?;
+        let stored = self.lookup_receipt(key, namespace)?;
         if stored.fingerprint != fingerprint || stored.retired_funding.is_some() {
             return Err(conflicting_key());
         }
-        Ok(receipt)
+        Ok(replay(&stored.receipt))
     }
 
     fn tx_status_with_namespace(&self, key: &[u8], namespace: Option<[u8; 32]>) -> Result<Receipt> {
-        self.lookup_receipt(key, namespace).map(|stored| replay(&stored.receipt))
+        let stored = self.lookup_receipt(key, namespace)?;
+        if stored.retired_funding.as_ref().is_some_and(|retired| retired.history.outcome.appointment) {
+            return Err(unknown_receipt());
+        }
+        Ok(replay(&stored.receipt))
     }
 
     fn lookup_receipt(&self, key: &[u8], namespace: Option<[u8; 32]>) -> Result<&StoredReceipt> {

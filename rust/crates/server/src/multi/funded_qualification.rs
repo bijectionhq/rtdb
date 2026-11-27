@@ -429,7 +429,7 @@ async fn offloaded_funded_record_keeps_its_exact_timed_proof() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn portable_backup_reopens_a_reconciled_funded_receipt_without_its_source() {
     use rtdb_crypt::FileKms;
-    use rtdb_tx::transact::{FundedOutcome, FundedSettlement, Outcome, funded_settlement_digest};
+    use rtdb_tx::transact::{FundedOutcome, FundedSettlement, FundedStatus, Outcome, ScopedTransact, funded_settlement_digest};
 
     const PRINCIPAL: &str = "urn:logkeeper:client:portable-funded";
     let home = tempfile::tempdir().unwrap();
@@ -474,7 +474,22 @@ async fn portable_backup_reopens_a_reconciled_funded_receipt_without_its_source(
         consumption_lsn: None,
         evidence_sha256: [11; 32],
     };
-    let settlements = [FundedSettlement { namespace: None, key: key.clone(), outcome }];
+    let scoped_key = vec![12; 16];
+    let appointment_key = vec![8; 16];
+    let appointment_owner = [17; 32];
+    let original_namespace = [13; 32];
+    let successor_namespace = [14; 32];
+    let settlements = [
+        FundedSettlement { namespace: None, key: key.clone(), outcome: outcome.clone() },
+        FundedSettlement {
+            namespace: None, key: appointment_key.clone(),
+            outcome: FundedOutcome { owner: appointment_owner, booking: [18; 16], appointment: true, ..outcome.clone() },
+        },
+        FundedSettlement {
+            namespace: Some(original_namespace), key: scoped_key.clone(),
+            outcome: FundedOutcome { owner: original_namespace, booking: [15; 16], ..outcome },
+        },
+    ];
     let digest = funded_settlement_digest(*source_incarnation.as_bytes(), &settlements).unwrap();
     let head = source_journal.head(original.journal_stream()).await.unwrap();
     assert!(original.portable_backup_with_funding(Some(Lsn(head.0 + 1)), &settlements).await.is_err());
@@ -502,6 +517,27 @@ async fn portable_backup_reopens_a_reconciled_funded_receipt_without_its_source(
     let receipt = reopened.tx_status(&key).await.unwrap();
     assert!(matches!(&receipt.outcome, Outcome::Refused { error } if error.code == "rtdb/funded-booking-closed"));
     assert!(receipt.replayed && receipt.decision_clock.is_none());
+    assert_eq!(reopened.tx_status(&appointment_key).await.unwrap_err().code, "rtdb/unknown-transaction");
+    assert_eq!(reopened.tx_status_with_funded_history(&appointment_key, None, FundedStatus::Owner([19; 32]))
+        .await.unwrap_err().code, "rtdb/unknown-transaction");
+    let receipt = reopened.tx_status_with_funded_history(&appointment_key, None, FundedStatus::Owner(appointment_owner))
+        .await.unwrap();
+    assert_eq!(receipt.key, appointment_key);
+    assert!(matches!(&receipt.outcome, Outcome::Refused { error } if error.code == "rtdb/funded-booking-closed"));
+    assert!(receipt.replayed && receipt.decision_clock.is_none());
+    let labels = Default::default();
+    let scoped = ScopedTransact { receipt_namespace: successor_namespace, labels: &labels };
+    let unrelated = |_| [16; 32];
+    let same_caller = |incarnation| if incarnation == *source_incarnation.as_bytes() {
+        original_namespace
+    } else {
+        successor_namespace
+    };
+    assert!(reopened.tx_status_scoped(&scoped_key, scoped).await.is_err());
+    assert!(reopened.tx_status_with_funded_history(&scoped_key, Some(scoped), FundedStatus::Scoped(&unrelated)).await.is_err());
+    let receipt = reopened.tx_status_with_funded_history(&scoped_key, Some(scoped), FundedStatus::Scoped(&same_caller)).await.unwrap();
+    assert_eq!(receipt.key, scoped_key);
+    assert!(matches!(&receipt.outcome, Outcome::Refused { error } if error.code == "rtdb/funded-booking-closed"));
     destination.shutdown().await.unwrap();
 }
 

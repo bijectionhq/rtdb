@@ -54,10 +54,16 @@ pub struct HistoricalFunding {
     pub outcome: FundedOutcome,
 }
 
+/// Identity admitted at the serving incarnation before looking up a retired booking.
+pub enum FundedStatus<'a> {
+    Owner([u8; 32]),
+    Scoped(&'a (dyn Fn([u8; 16]) -> [u8; 32] + Sync)),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RetiredFunding {
-    history: HistoricalFunding,
+    pub(super) history: HistoricalFunding,
     pub(super) appointment_address: Option<[u8; 32]>,
 }
 
@@ -191,6 +197,9 @@ impl TransactState {
                 None => return Err(invalid_settlement()),
             };
             receipts.insert(settled.key.clone(), stored);
+            if settled.namespace.is_some() && !settled.outcome.appointment {
+                portable.scoped_funding_origins.insert(source);
+            }
         }
         portable.require_portable_checkpoint()?;
         if portable.funded_inventory_digest(source)? != expected {
@@ -231,6 +240,32 @@ impl TransactState {
                 let history = stored.retired_funding.as_ref()?.history.clone();
                 Some((replay(&stored.receipt), history))
             }))
+    }
+
+    /// Resolves a retired appointment by its owner or a retired scoped transaction by its namespace.
+    pub fn historical_funding_status(&self, key: &[u8], access: FundedStatus<'_>) -> Result<Receipt> {
+        let namespace_at = match access {
+            FundedStatus::Owner(owner) => {
+                return self.historical_funding(key, None)?
+                    .filter(|(_, history)| history.outcome.appointment && history.outcome.owner == owner)
+                    .map(|(receipt, _)| receipt)
+                    .ok_or_else(unknown_receipt);
+            }
+            FundedStatus::Scoped(namespace_at) => namespace_at,
+        };
+        let mut matched = None;
+        for &origin in &self.scoped_funding_origins {
+            let Some((receipt, history)) = self.historical_funding(key, Some(namespace_at(origin)))? else {
+                continue;
+            };
+            if history.source != origin || history.outcome.appointment {
+                continue;
+            }
+            if matched.replace(receipt).is_some() {
+                return Err(conflicting_key());
+            }
+        }
+        matched.ok_or_else(unknown_receipt)
     }
 }
 

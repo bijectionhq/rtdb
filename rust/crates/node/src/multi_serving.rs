@@ -7,7 +7,7 @@ use rtdb_db::{ChangeHistory, MultiDatabase, NativeCheckpointInstallation, Native
 use rtdb_index::branches::{BranchCut, BranchEffect, BranchIndex, BranchWrite};
 use rtdb_index::branches::store::{KeyRange, StorePage, StoreRead, sizes::StorageSizes};
 use rtdb_tx::transact::{
-    CustodyGroupId, CustodyWriterFence, PHYSICAL_ERASURE, ROW_CUSTODY, Receipt, Transact, TrustedCustodyCommand, workload,
+    CustodyGroupId, CustodyWriterFence, FundedStatus, PHYSICAL_ERASURE, ROW_CUSTODY, Receipt, Transact, TrustedCustodyCommand, workload,
 };
 use rtdb_types::{
     Anomaly, AnomalyCategory, AnomalyKind, EntityId, MemoryBudget, MemoryReservation, Result, TableRef, Timestamp,
@@ -904,6 +904,19 @@ impl ServingDriver for MultiServing {
         self.serve(async {
             cancellation.run_until_cancelled(async {
                 self.database.lock().await.tx_status_scoped(key, scope.transaction_scope()).await
+            }).await.ok_or_else(interrupted)?
+        }).await
+    }
+
+    async fn tx_status_with_funded_history(
+        &self, key: &[u8], scope: Option<&ServingScope>, funding: FundedStatus<'_>,
+        cancellation: &CancellationToken,
+    ) -> Result<Receipt> {
+        self.serve(async {
+            cancellation.run_until_cancelled(async {
+                self.database.lock().await
+                    .tx_status_with_funded_history(key, scope.map(ServingScope::transaction_scope), funding)
+                    .await
             }).await.ok_or_else(interrupted)?
         }).await
     }

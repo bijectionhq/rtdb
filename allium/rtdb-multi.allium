@@ -512,6 +512,9 @@ contract OriginalFundedAdmission {
         -- The portable cut preserves reconciled bookings under their original namespaces and keys as terminal receipts.
         -- Installation attests the funded receipt inventory, and activation matches it against the predecessor's retained reconciliation.
         -- A successor uses its own commissioned scope and preserves the original booking identity for retry and outcome lookup.
+        -- A label-scoped status request authenticates against the current binding before looking up a retained funded receipt under the original incarnation.
+        -- A retained unscoped appointment receipt is visible through status only to the authenticated original owner.
+        -- That lookup requires the original receipt's issuer, caller, database and label scope to match, and projects the result through the current label scope.
 }
 
 contract Directory {

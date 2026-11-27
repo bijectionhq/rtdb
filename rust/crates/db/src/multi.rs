@@ -9,7 +9,8 @@ use rtdb_store::{
     ObjectKey, ObjectStore, Reachability, StoredTokenKeys, VerifiedManifest, WriterObjects, read_manifest,
 };
 use rtdb_tx::transact::{
-    Erasure, Receipt, ScopedTransact, Transact, TransactPipeline, TransactState, TransactionRecord,
+    Erasure, FundedStatus, Receipt, ScopedTransact, Transact, TransactPipeline, TransactState,
+    TransactionRecord,
 };
 use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::Basis};
 use sha2::{Digest, Sha256};
@@ -654,7 +655,7 @@ impl MultiDatabase {
     }
 
     pub async fn tx_status(&mut self, key: &[u8]) -> Result<Receipt> {
-        self.tx_status_in(key, None).await
+        self.tx_status_in(key, None, None).await
     }
 
     pub async fn tx_status_scoped(
@@ -662,13 +663,23 @@ impl MultiDatabase {
         key: &[u8],
         scope: ScopedTransact<'_>,
     ) -> Result<Receipt> {
-        self.tx_status_in(key, Some(scope)).await
+        self.tx_status_in(key, Some(scope), None).await
+    }
+
+    pub async fn tx_status_with_funded_history(
+        &mut self,
+        key: &[u8],
+        scope: Option<ScopedTransact<'_>>,
+        funding: FundedStatus<'_>,
+    ) -> Result<Receipt> {
+        self.tx_status_in(key, scope, Some(funding)).await
     }
 
     async fn tx_status_in(
         &mut self,
         key: &[u8],
         scope: Option<ScopedTransact<'_>>,
+        funding: Option<FundedStatus<'_>>,
     ) -> Result<Receipt> {
         self.refresh().await?;
         self.require_active()?;
@@ -678,7 +689,16 @@ impl MultiDatabase {
             (Some(writer), None) => writer.pipeline.tx_status(key),
             (None, Some(scope)) => self.state().transactions.tx_status_scoped(key, scope),
             (None, None) => self.state().transactions.tx_status(key),
-        }?;
+        };
+        let receipt = match (receipt, scope, funding) {
+            (Err(error), None, Some(funding @ FundedStatus::Owner(_)))
+            | (Err(error), Some(_), Some(funding @ FundedStatus::Scoped(_)))
+                if error.code == "rtdb/unknown-transaction" =>
+            {
+                self.durable_transactions().historical_funding_status(key, funding)?
+            }
+            (receipt, _, _) => receipt?,
+        };
         if receipt.erasure == Some(Erasure::Pending) {
             return Err(erasure_pending());
         }

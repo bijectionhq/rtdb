@@ -6,7 +6,7 @@ use rtdb_index::{
     Snapshot,
     branches::{BranchCut, BranchIndex, BranchView, BranchWrite, RowImage, store::{KeyRange, StorePage, StoreRead, sizes::StorageSizes}},
 };
-use rtdb_tx::transact::{CustodyGroupId, CustodyWriterFence, Receipt, Transact, TrustedCustodyCommand, workload};
+use rtdb_tx::transact::{CustodyGroupId, CustodyWriterFence, FundedStatus, Receipt, Transact, TrustedCustodyCommand, workload};
 pub use rtdb_replication::{NativeCheckpointAuthority, NativeServingAuthority};
 use rtdb_types::{
     EntityId, Interval, MemoryReservation, Result, TableRef, Timestamp,
@@ -368,6 +368,16 @@ pub trait ServingDriver: Send + Sync {
     async fn tx_status_scoped(&self, _key: &[u8], _scope: &ServingScope,
                               _cancellation: &CancellationToken) -> Result<Receipt> {
         Err(visibility::unsupported())
+    }
+
+    async fn tx_status_with_funded_history(
+        &self, key: &[u8], scope: Option<&ServingScope>, _funding: FundedStatus<'_>,
+        cancellation: &CancellationToken,
+    ) -> Result<Receipt> {
+        match scope {
+            Some(scope) => self.tx_status_scoped(key, scope, cancellation).await,
+            None => self.tx_status(key, cancellation).await,
+        }
     }
 
     async fn changes_scoped(&self, _request: Changes, _scope: &ServingScope,

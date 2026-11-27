@@ -470,9 +470,18 @@ impl Service {
         let driver = database
             .serving_driver()
             .ok_or_else(|| error::unsupported("tx-status"))?;
+        use rtdb_tx::transact::FundedStatus;
+
         let receipt = match self.serving_scope(call, driver)? {
-            Some(scope) => driver.tx_status_scoped(&request.key, &scope, &call.cancellation).await,
-            None => driver.tx_status(&request.key, &call.cancellation).await,
+            Some(scope) => {
+                let credential = call.session.caller.principal.label_scope().expect("admitted label scope");
+                let namespace_at = |incarnation| credential.funded_receipt_namespace_at(incarnation);
+                driver.tx_status_with_funded_history(&request.key, Some(&scope), FundedStatus::Scoped(&namespace_at), &call.cancellation).await
+            }
+            None => match appointment::owner(call) {
+                Some(owner) => driver.tx_status_with_funded_history(&request.key, None, FundedStatus::Owner(owner), &call.cancellation).await,
+                None => driver.tx_status(&request.key, &call.cancellation).await,
+            }
         }.map_err(error::anomaly)?;
         self.check_attachment(call, &database)?;
         if receipt.decision_clock.is_some_and(rtdb_tx::transact::FundedReceipt::is_appointment) {
