@@ -33,6 +33,22 @@ fn log_requires_base_and_operand_as_in_xtdb() {
 }
 
 #[test]
+fn power_matches_java_math_pow_special_values() {
+    for (base, exponent) in [
+        (1.0, f64::NAN), (-1.0, f64::NAN),
+        (1.0, f64::INFINITY), (1.0, f64::NEG_INFINITY),
+        (-1.0, f64::INFINITY), (-1.0, f64::NEG_INFINITY),
+    ] {
+        let V::F64(value) = call("power", &[V::F64(base), V::F64(exponent)]).unwrap() else { panic!() };
+        assert!(value.is_nan(), "POWER({base}, {exponent}) = {value}");
+    }
+    assert_eq!(call("power", &[V::F64(f64::NAN), V::F64(0.0)]).unwrap(), V::F64(1.0));
+    assert_eq!(call("power", &[V::F64(f64::NAN), V::F64(-0.0)]).unwrap(), V::F64(1.0));
+    assert_eq!(call("power", &[V::F64(2.0), V::F64(f64::INFINITY)]).unwrap(), V::F64(f64::INFINITY));
+    assert_eq!(call("power", &[V::F64(2.0), V::F64(f64::NEG_INFINITY)]).unwrap(), V::F64(0.0));
+}
+
+#[test]
 fn hyperbolic_calls_preserve_signed_zero_nan_and_infinite_limits() {
     for name in ["sinh", "tanh", "double"] {
         let V::F64(value) = call(name, &[V::F64(-0.0)]).unwrap() else { panic!() };

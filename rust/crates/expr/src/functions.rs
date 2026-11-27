@@ -312,9 +312,16 @@ impl FloatMath {
         if let Some(function) = self.unary() { return Ok(function(x)); }
         Ok(match self {
             Self::Log => y.ok_or_else(|| inapplicable("log", &[]))?.log(x),
-            _ => x.powf(y.ok_or_else(|| inapplicable("power", &[]))?),
+            _ => java_pow(x, y.ok_or_else(|| inapplicable("power", &[]))?),
         })
     }
+}
+
+/// `java.lang.Math.pow`: differs from IEEE 754 / C99 `pow` when the exponent is `NaN` or when `|base| == 1` and the
+/// exponent is infinite, both of which yield `NaN` rather than `1.0`.
+fn java_pow(base: f64, exponent: f64) -> f64 {
+    if exponent.is_nan() || (base.abs() == 1.0 && exponent.is_infinite()) { return f64::NAN; }
+    base.powf(exponent)
 }
 
 /// ROUND of a double to `scale` decimal places, half away from zero; a non-finite double rounds to itself.
