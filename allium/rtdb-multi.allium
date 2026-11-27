@@ -770,6 +770,7 @@ contract LogService {
         -- An ordinary native checkpoint cut is the inclusive replica boundary plus one.
         -- The custodian names the selected checkpoint and its exact cut when advancing the retained floor.
         -- An immutable Multi journal trim requires the exact retained checkpoint announcement in an applied journal view covering the writer's observed head.
+        -- The keeper verifies the announcement position and retained bytes under the current writer fence before ordering the cut.
         -- The certified trim retains its announcement and is scoped to the stream and writer session.
         -- A live replay reservation protects its exact interval, and an independent checkpoint hold protects its original root.
 

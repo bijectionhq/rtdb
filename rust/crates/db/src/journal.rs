@@ -1,7 +1,7 @@
 use std::{sync::{Arc, RwLock}, time::Duration};
 
 use bytes::Bytes;
-use journal_contract::{BoxFuture, Epoch, Journal, JournalError, Lsn, Page, RecoveryFence, StreamId, WriterFence, WriterSessionId};
+use journal_contract::{BoxFuture, CheckpointAnchor, Epoch, Journal, JournalError, Lsn, Page, RecoveryFence, StreamId, WriterFence, WriterSessionId};
 use rtdb_crypt::{Context, Generation, Kms};
 use rtdb_format::journal::Record;
 use rtdb_tx::transact::TransactionRecord;
@@ -104,7 +104,12 @@ struct WriterSession {
 pub(crate) struct CertifiedCheckpoint {
     stream_id: StreamId,
     writer_session_id: Option<WriterSessionId>,
-    through: Lsn,
+    trim: CheckpointTrim,
+}
+
+enum CheckpointTrim {
+    Local(Lsn),
+    Immutable(CheckpointAnchor),
 }
 
 /// One journal long poll shared by every waiter of a stream: the first waiter
@@ -403,7 +408,7 @@ impl Stream {
         {
             return Err(invalid());
         }
-        if self.immutable_history() {
+        let trim = if self.immutable_history() {
             let page = self
                 .page(base.announced, minimum_head, 1, Duration::ZERO)
                 .await
@@ -420,11 +425,18 @@ impl Stream {
             {
                 return Err(invalid());
             }
-        }
+            CheckpointTrim::Immutable(CheckpointAnchor {
+                announced_at: *announced,
+                covered_through: through,
+                record_sha256: Sha256::digest(bytes).into(),
+            })
+        } else {
+            CheckpointTrim::Local(through)
+        };
         Ok(CertifiedCheckpoint {
             stream_id: self.id(),
             writer_session_id: self.session.as_ref().map(|session| session.id),
-            through,
+            trim,
         })
     }
 
@@ -439,9 +451,12 @@ impl Stream {
             return Err(JournalError::Unsupported);
         }
         self.authorize_mutation().await?;
-        match self.session_fence(epoch)? {
-            Some(fence) => self.journal.trim_session(fence, checkpoint.through).await,
-            None => self.journal.trim(self.id(), epoch, checkpoint.through).await,
+        match (self.session_fence(epoch)?, checkpoint.trim) {
+            (Some(fence), CheckpointTrim::Immutable(anchor)) => {
+                self.journal.trim_checkpoint(fence, anchor).await
+            }
+            (None, CheckpointTrim::Local(through)) => self.journal.trim(self.id(), epoch, through).await,
+            _ => Err(JournalError::Unsupported),
         }
     }
 

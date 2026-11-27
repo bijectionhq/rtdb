@@ -1712,7 +1712,7 @@ async fn multi_resumes_after_a_real_keeper_recovery_and_followers_rebuild() {
     let handle = |keepers: &LocalCluster, identity: Identity| -> Arc<dyn Journal> {
         Arc::new(keepers.journal(&keeper_principal(&identity), &config).unwrap())
     };
-    let [survivor, lost_b, lost_c] = keepers.voters();
+    let [survivor, lost_b, lost_c]: [Uuid; 3] = keepers.voters().as_slice().try_into().unwrap();
 
     let cluster = Cluster::new();
     let mut writer = cluster.node(1, handle(&keepers, NODE_1_IDENTITY));

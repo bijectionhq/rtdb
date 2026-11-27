@@ -50,6 +50,7 @@ A residence verifies the durable stream mode before opening the history and pres
 Seal binds that session to the exact committed head, and subsequent appends and trims carry its fence.
 Followers request pages that cover their observed head and resume at the next LSN.
 A trim of an immutable Multi stream checks the exact retained checkpoint announcement in a journal view that covers the writer's observed head.
+Multi decodes the authenticated record and submits its position, cut and SHA-256 digest. The keeper checks the retained bytes before ordering the trim under the current writer fence.
 The trim removes records through the checkpoint's cut and retains its announcement for replay.
 A history change under the same ID faults the residence.
 The keeper manages replica replacement for immutable streams.
