@@ -6,6 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+arrow-array.workspace = true
 arrow-buffer.workspace = true
 rtdb-types.workspace = true
 rtdb-format.workspace = true
@@ -34,7 +35,6 @@ sha2.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-arrow-array.workspace = true
 
 [lints]
 workspace = true

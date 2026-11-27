@@ -2278,7 +2278,7 @@ impl ReplicationDriver {
                                 Some(WriterPublication { clock: clock.as_ref(), maximum_inline_bytes, maximum_timed_original_bytes }), classic_authority.as_ref()).await;
                             if let Err(error) = &result && crate::crash_log::applies(error) {
                                 let value = partition.value();
-                                let slices = crate::crash_log::Slices { tx_ops: operations.as_ref(), live: value.live() };
+                                let slices = crate::crash_log::Slices { tx_ops: operations.as_ref(), live: value.live(), site: None };
                                 crate::crash_log::write(&**context.storage.object_store(), &node_id, clock(), error, slices, &context.memory).await;
                             }
                             result
