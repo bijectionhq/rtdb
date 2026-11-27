@@ -109,6 +109,7 @@ These are source regressions; none has executed in Phase 1.
 INSERT, UPDATE, and DELETE accept RETURNING select lists and ignore them, as in the pinned planner.
 This includes INSERT RECORDS; ERASE and PATCH reject RETURNING.
 The parser validates select-list syntax without binding its names, functions, subqueries, or typed expressions.
+It checks cast types, literal forms and expression modifiers inside the list and its subqueries.
 Its passive borrowed `ReturningClause` descriptor retains the original token spans while the mutation prefix supplies parameter requirements and inline-XTQL descriptors.
 RETURNING-only parameters do not increase the prepared parameter count, and mutation-prefix question marks keep their original indices.
 The retained source SQL and statement span still include the clause.
@@ -118,9 +119,9 @@ These sources have not been compiled or executed.
 The separate PostgreSQL DML parameter-description path still needs qualification: pinned pgwire retains the client-supplied OID count, while the native shared preparation uses the parsed effective count.
 `WITH RECURSIVE` retains the pinned planner's Unsupported anomaly `xtdb.sql/recursive-ctes`, including when the body does not refer to itself.
 Prepared-statement commands, COPY, and database lifecycle commands use the separate shared control parser described below.
-The parser uses sqlparser's keyword classification, so XTDB's complete semi-reserved keyword grammar still requires qualification.
-Table names are the exception: an unquoted reserved word naming a FROM table or a DML target is a grammar rejection, as `Sql.g4`'s `identifier` admits only non-reserved keywords, so `SELECT FROM WHERE` is a parse error rather than a missing table `where`.
-Column references and aliases still use sqlparser's classification.
+Table names, table aliases and their column lists, INSERT column lists, UPDATE assignment targets, and JOIN USING columns apply XTDB's reserved-word rules.
+Non-reserved keywords can appear unquoted in these positions, and double quotes delimit a reserved word or a case-sensitive name.
+INSERT columns, UPDATE assignment targets, and JOIN USING columns are unqualified.
 Query-level `SETTING` prefixes bind default valid/system extents into table scans, with explicit table extents taking precedence.
 The passive `QuerySettings` value retains clock, snapshot-token and snapshot-time metadata alongside the prepared relation; repeated settings are all planned and the last occurrence determines the value.
 Its passive `SettingValue` distinguishes literals, unadmitted `CLOCK_TIME` timestamp literals, parameters and unevaluated forms, retaining the parameter count of forms whose scalar type is never needed.

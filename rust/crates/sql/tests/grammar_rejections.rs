@@ -2,7 +2,7 @@ use rtdb_types::StructFields;
 use std::collections::BTreeSet;
 
 use rtdb_plan::*;
-use rtdb_sql::{PrepareOptions, parse, prepare, prepare_in};
+use rtdb_sql::{PrepareOptions, parse, prepare, prepare_in, prepare_static};
 use rtdb_types::{Anomaly, AnomalyCategory, LogicalType, MemoryBudget, Result, ScalarType};
 
 struct Fixture;
@@ -228,6 +228,68 @@ fn non_grammar_dml_ddl_and_transaction_forms_are_rejected() {
     ] {
         let error = rejection(sql);
         assert_eq!((error.category, error.code.as_str()), (AnomalyCategory::Incorrect, "xtdb/sql-error"), "{sql}");
+    }
+}
+
+#[test]
+fn mutation_columns_require_unqualified_identifiers() {
+    for sql in [
+        "INSERT INTO docs (_id, where) VALUES (1, 2)",
+        "INSERT INTO docs (_id, where) VALUES (1)",
+        "INSERT INTO docs (_id, docs.a) VALUES (1, 2)",
+        "INSERT INTO docs (_id, where) SELECT _id, a FROM absent",
+        "UPDATE docs SET where = 1",
+        "UPDATE docs SET docs.a = 1",
+    ] {
+        let error = rejection(sql);
+        assert_eq!((error.category, error.code.as_str()), (AnomalyCategory::Incorrect, "xtdb/sql-error"), "{sql}");
+        assert!(error.message.as_deref().unwrap().starts_with("Errors parsing SQL statement:\n  - "), "{sql}");
+    }
+    let options = PrepareOptions::default();
+    for sql in [
+        "INSERT INTO docs (_id, where) VALUES (1, 2)",
+        "INSERT INTO docs (_id, docs.a) VALUES (1, 2)",
+    ] {
+        assert!(prepare_static(sql, &Fixture, &options).is_err(), "{sql}");
+    }
+    for sql in [
+        "INSERT INTO docs (_id, \"Where\", DATE) VALUES (1, 2, 3)",
+        "UPDATE docs SET \"Where\" = 1, DATE = 2",
+    ] {
+        assert!(matches!(prepare(sql, &Fixture, &options).unwrap().statement, Statement::Dml(_)), "{sql}");
+    }
+}
+
+#[test]
+fn join_and_projection_names_use_their_identifier_grammar() {
+    for sql in [
+        "SELECT * FROM (VALUES (1)) AS l(x) JOIN (VALUES (1)) AS r(x) USING (l.x)",
+        "SELECT * FROM (VALUES (1)) AS l(\"where\") JOIN (VALUES (1)) AS r(\"where\") USING (where)",
+        "SELECT * FROM (VALUES (1)) AS l(where)",
+        "SELECT * FROM ABS(1) AS l(x INT)",
+        "SELECT * FROM docs AS 't'",
+        "SELECT 1 AS 'label'",
+        "UPDATE docs AS d(a) SET a = 1",
+    ] {
+        let error = rejection(sql);
+        assert_eq!((error.category, error.code.as_str()), (AnomalyCategory::Incorrect, "xtdb/sql-error"), "{sql}");
+        assert!(error.message.as_deref().unwrap().starts_with("Errors parsing SQL statement:\n  - "), "{sql}");
+    }
+    let sql = "SELECT \"where\" AS \"label\" FROM (VALUES (1)) AS l(\"where\") JOIN (VALUES (1)) AS r(\"where\") USING (\"where\")";
+    let prepared = prepare(sql, &Fixture, &PrepareOptions::default()).unwrap();
+    let Statement::Query(query) = prepared.statement else { panic!("query"); };
+    assert_eq!(query.schema().fields()[0].name, "label");
+}
+
+#[test]
+fn malformed_window_arguments_are_grammar_errors() {
+    for window in ["LEAD() OVER ()", "LAG(a, ?, 0) OVER ()", "LEAD(a, 1, 0, 0) OVER ()",
+        "ROW_NUMBER() OVER (PARTITION BY a + 1)"]
+    {
+        let sql = format!("SELECT {window} FROM docs");
+        let error = rejection(&sql);
+        assert_eq!((error.category, error.code.as_str()), (AnomalyCategory::Incorrect, "xtdb/sql-error"), "{sql}");
+        assert!(error.message.as_deref().unwrap().starts_with("Errors parsing SQL statement:\n  - "), "{sql}");
     }
 }
 

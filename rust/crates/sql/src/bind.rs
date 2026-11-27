@@ -461,9 +461,11 @@ impl Context<'_> {
             return Err(grammar_rejected("An INSERT modifier").into());
         }
         let ast::TableObject::TableName(name) = &insert.table else { return Err(grammar_rejected("A dynamic INSERT target").into()); };
+        let names = insert.columns.iter().map(|name| grammar_column_name(name, "INSERT column"))
+            .collect::<Result<Vec<_>>>()?;
         let table = self.target(name)?;
         let source = insert.source.as_ref().ok_or_else(|| grammar_rejected("INSERT DEFAULT VALUES"))?;
-        let expected = insert.columns.len();
+        let expected = names.len();
         if let ast::SetExpr::Values(values) = source.body.as_ref() {
             if expected == 0 {
                 return Err(PlanningDiagnostic::new("INSERT with VALUES needs column name list").into_anomaly([insert_missing_id()]).into());
@@ -471,9 +473,7 @@ impl Context<'_> {
             let given = values.rows.iter().map(|row| row.expressions().len())
                 .filter(|width| *width != expected).collect::<Vec<_>>();
             if !given.is_empty() {
-                let declares_id = insert.columns.iter().any(|name| {
-                    matches!(name.0.as_slice(), [part] if part.as_ident().is_some_and(|name| identifier(name).normalized() == "_id"))
-                });
+                let declares_id = names.iter().any(|name| name == "_id");
                 return Err(InsertRowsError::Projection { expected, given, declares_id });
             }
         }
@@ -482,11 +482,6 @@ impl Context<'_> {
             if expected != input.schema().len() {
                 return Err(InsertRowsError::Projection { expected, given: vec![input.schema().len()], declares_id: false });
             }
-            let names = insert.columns.iter().map(|name| {
-                let names = identifiers(name)?;
-                if names.len() != 1 { return Err(error("INSERT columns must be unqualified")); }
-                Ok(names[0].normalized())
-            }).collect::<Result<Vec<_>>>()?;
             if names.iter().collect::<BTreeSet<_>>().len() != names.len() { return Err(error("INSERT repeats a column").into()); }
             input = self.rename(input, None, Some(names))?;
         }
@@ -531,17 +526,17 @@ impl Context<'_> {
             ast::Statement::Update(update) => {
                 if update.returning.is_some() { return Err(unsupported("UPDATE RETURNING")); }
                 if update.from.is_some() || update.output.is_some() || update.or.is_some() || !update.order_by.is_empty() || update.limit.is_some() || !update.table.joins.is_empty() { return Err(grammar_rejected("UPDATE FROM, a conflict clause, a joined target or ordering")); }
+                let assignments = update.assignments.iter().map(|assignment| {
+                    let ast::AssignmentTarget::ColumnName(name) = &assignment.target else { return Err(grammar_rejected("A tuple assignment")); };
+                    Ok((grammar_column_name(name, "UPDATE assignment target")?, &assignment.value))
+                }).collect::<Result<Vec<_>>>()?;
                 let mut input = self.mutation_table(&update.table.relation, false)?;
                 let (target, valid_time) = scan_target(&input)?;
                 let target_columns = input.schema().fields().iter().filter(|field| !matches!(field.name.as_str(), "_valid_time" | "_system_time")).map(|field| field.id).collect();
                 if let Some(predicate) = &update.selection { let predicate = self.relational_expr(predicate, &mut input, &BTreeMap::new())?; input = Arc::new(input.filter(predicate)?); }
-                let assignments = update.assignments.iter().map(|assignment| {
-                    let ast::AssignmentTarget::ColumnName(name) = &assignment.target else { return Err(grammar_rejected("A tuple assignment")); };
-                    let names = identifiers(name)?;
-                    if names.len() != 1 { return Err(error("UPDATE assignment target must be a column")); }
-                    let name = names[0].normalized();
+                let assignments = assignments.into_iter().map(|(name, value)| {
                     if name.starts_with('_') { return Err(error(format!("Cannot UPDATE {name} column"))); }
-                    Ok((name, self.relational_expr(&assignment.value, &mut input, &BTreeMap::new())?))
+                    Ok((name, self.relational_expr(value, &mut input, &BTreeMap::new())?))
                 }).collect::<Result<Vec<_>>>()?;
                 if assignments.iter().map(|(name, _)| name).collect::<BTreeSet<_>>().len() != assignments.len() { return Err(error("UPDATE repeats an assignment")); }
                 Statement::Dml(Dml::Update { table: target, input, target_columns, assignments, valid_time })
@@ -600,6 +595,7 @@ impl Context<'_> {
         if let Some(with) = &query.with {
             if with.recursive { return Err(Anomaly::unsupported("xtdb.sql/recursive-ctes", "Recursive CTEs are not supported yet")); }
             for cte in &with.cte_tables {
+                grammar_table_alias(&cte.alias)?;
                 if !cte.alias.columns.is_empty() { return Err(unsupported("Column aliases are not supported yet")); }
                 if cte.materialized == Some(ast::CteAsMaterialized::NotMaterialized) { return Err(grammar_rejected("AS NOT MATERIALIZED")); }
                 if cte.from.is_some() { return Err(grammar_rejected("CTE FROM clause")); }
@@ -920,6 +916,11 @@ impl Context<'_> {
         }
         let mut windows = Vec::new();
         for item in projection {
+            if let ast::SelectItem::ExprWithAlias { alias, .. } = item
+                && matches!(alias.quote_style, Some(quote) if quote != '"')
+            {
+                return Err(grammar_rejected("A string literal as a column alias"));
+            }
             if let ast::SelectItem::UnnamedExpr(expression) | ast::SelectItem::ExprWithAlias { expr: expression, .. } = item { crate::expression::window_calls(expression, &mut windows); }
         }
         if windows.len() > 1 { return Err(unsupported("TODO: only one window function supported at the moment!")); }
@@ -972,8 +973,17 @@ impl Context<'_> {
                 ast::JoinOperator::LeftOuter(constraint) | ast::JoinOperator::Left(constraint) => (JoinKind::Left, Some(constraint)),
                 ast::JoinOperator::RightOuter(constraint) | ast::JoinOperator::Right(constraint) => (JoinKind::Right, Some(constraint)),
                 ast::JoinOperator::FullOuter(constraint) => (JoinKind::Full, Some(constraint)),
-                ast::JoinOperator::CrossJoin(_) => (JoinKind::Cross, None),
+                ast::JoinOperator::CrossJoin(ast::JoinConstraint::None) => (JoinKind::Cross, None),
                 _ => return Err(grammar_rejected("A dialect-specific join operator")),
+            };
+            let using = match constraint {
+                Some(ast::JoinConstraint::Using(names)) if !names.is_empty() => {
+                    Some(names.iter().map(|name| grammar_column_name(name, "USING column"))
+                        .collect::<Result<BTreeSet<_>>>()?)
+                }
+                Some(ast::JoinConstraint::Using(_)) => return Err(grammar_rejected("An empty USING clause")),
+                Some(ast::JoinConstraint::None) => return Err(grammar_rejected("A JOIN without ON or USING")),
+                _ => None,
             };
             let (right, mut arguments) = self.from_scope(left.schema().clone(), |context, start| {
                 let start = if kind == JoinKind::Cross || matches!(constraint, Some(ast::JoinConstraint::Natural)) { start } else { lateral_start };
@@ -982,16 +992,11 @@ impl Context<'_> {
             if !arguments.is_empty() && matches!(kind, JoinKind::Right | JoinKind::Full) { return Err(unsupported("Correlated LATERAL in RIGHT or FULL OUTER JOIN")); }
             let schema = left.schema().concat(right.schema())?;
             let common = match constraint {
-                Some(ast::JoinConstraint::Using(names)) => Some(names.iter().map(|name| {
-                    let names = identifiers(name)?;
-                    if names.len() != 1 { return Err(error("USING columns must be unqualified")); }
-                    Ok(names[0].normalized())
-                }).collect::<Result<BTreeSet<_>>>()?),
                 Some(ast::JoinConstraint::Natural) => {
                     let names = |input: &Relation| input.schema().fields().iter().filter(|field| !self.hidden_columns.contains_key(&field.id)).map(|field| field.name.clone()).collect::<BTreeSet<_>>();
                     Some(names(&left).intersection(&names(&right)).cloned().collect())
                 }
-                _ => None,
+                _ => using,
             };
             if let Some(common) = common {
                 let predicates = common.iter().map(|name| {
@@ -1043,7 +1048,6 @@ impl Context<'_> {
             }
             let condition = match constraint {
                 Some(ast::JoinConstraint::On(expr)) => Some(self.expr(expr, &schema, &BTreeMap::new())?),
-                Some(ast::JoinConstraint::None) => return Err(grammar_rejected("A JOIN without ON or USING")),
                 None => None,
                 _ => return Err(error("Named join constraint was not lowered")),
             };
@@ -1107,6 +1111,17 @@ impl Context<'_> {
     }
 
     fn table_for(&mut self, table: &ast::TableFactor, purpose: TablePurpose, lateral_start: usize) -> Result<Arc<Relation>> {
+        let alias = match table {
+            ast::TableFactor::Table { alias, .. } | ast::TableFactor::Derived { alias, .. }
+            | ast::TableFactor::ExpressionDerived { alias, .. } | ast::TableFactor::UNNEST { alias, .. } => alias.as_ref(),
+            _ => None,
+        };
+        if let Some(alias) = alias {
+            grammar_table_alias(alias)?;
+            if purpose != TablePurpose::Query && !alias.columns.is_empty() {
+                return Err(grammar_rejected("A mutation target alias column list"));
+            }
+        }
         match table {
             ast::TableFactor::Table { name, alias, args, version, with_hints, partitions, sample, with_ordinality, json_path, index_hints } => {
                 if version.is_some() || !with_hints.is_empty() || !partitions.is_empty() || sample.is_some() || json_path.is_some() || !index_hints.is_empty() { return Err(grammar_rejected("A table sample or dialect-specific table modifier")); }
@@ -1151,8 +1166,6 @@ impl Context<'_> {
                 let (valid_time, system_time, clamp_valid_time) = self.temporal_filters(name, purpose == TablePurpose::Mutation)?;
                 let binding = resolve_table(self.catalog, &names, &self.options.search_path)?;
                 let qualifier = alias.as_ref().map(|alias| identifier(&alias.name).normalized()).unwrap_or_else(|| binding.name.table.table.clone());
-                if purpose != TablePurpose::Query && alias.as_ref().is_some_and(|alias| !alias.columns.is_empty()) { return Err(error("Mutation targets do not accept column lists")); }
-                if alias.as_ref().is_some_and(|alias| alias.columns.iter().any(|column| column.data_type.is_some())) { return Err(grammar_rejected("Typed table alias columns")); }
                 let mut visible = alias.as_ref().filter(|alias| !alias.columns.is_empty()).map(|alias| alias.columns.iter().map(|column| identifier(&column.name).normalized()).collect::<Vec<_>>())
                     .unwrap_or_else(|| binding.columns.keys().cloned().collect());
                 let archive_column = |name: &str| matches!(name, rtdb_types::ARCHIVE_TX_FROM | rtdb_types::ARCHIVE_TX_TO);
@@ -1416,9 +1429,6 @@ impl Context<'_> {
             self.diagnostics.push(PlanningDiagnostic::table_projection(name, names));
             return Ok(Arc::new(Relation::empty(Schema::default())));
         }
-        if columns.iter().any(|column| column.data_type.is_some()) {
-            return Err(error("Table projections specify column names"));
-        }
         let value_name = match columns.first() {
             Some(column) => identifier(&column.name).normalized(),
             None => format!("_column_{}", self.allocate_symbol()?),
@@ -1439,7 +1449,6 @@ impl Context<'_> {
 
     fn list_table(&mut self, expr: Expr, alias: Option<&ast::TableAlias>, with_ordinality: bool, kind: ListTableKind) -> Result<Arc<Relation>> {
         let alias = alias.ok_or_else(|| error("List tables require an alias"))?;
-        if alias.columns.iter().any(|column| column.data_type.is_some()) { return Err(grammar_rejected("Typed table alias columns")); }
         if !alias.columns.is_empty() && alias.columns.len() != 1 + usize::from(with_ordinality) {
             let name = identifier(&alias.name).normalized();
             let columns = alias.columns.iter().map(|column| identifier(&column.name).normalized()).collect();
@@ -1559,7 +1568,6 @@ impl Context<'_> {
     }
 
     fn alias(&mut self, input: Arc<Relation>, alias: &ast::TableAlias) -> Result<Arc<Relation>> {
-        if alias.columns.iter().any(|column| column.data_type.is_some()) { return Err(grammar_rejected("Typed table alias columns")); }
         let columns = if alias.columns.is_empty() { None } else { Some(alias.columns.iter().map(|column| identifier(&column.name).normalized()).collect()) };
         self.rename(input, Some(identifier(&alias.name).normalized()), columns)
     }
@@ -1632,12 +1640,33 @@ pub(crate) fn grammar_rejected(construct: impl std::fmt::Display) -> Anomaly {
         .with_kind(AnomalyKind::GrammarRejected)
 }
 
-/// `Sql.g4`'s `identifier` admits an unquoted keyword only when it is non-reserved, whereas the vendor parser reads any word as a table name.
-fn grammar_table_name(name: &ast::ObjectName) -> Result<()> {
-    match name.0.iter().filter_map(ast::ObjectNamePart::as_ident).find(|part| part.quote_style.is_none() && !crate::parser::is_unquoted_identifier(&part.value)) {
-        Some(reserved) => Err(grammar_rejected(format!("The reserved word {} as a table name", reserved.value))),
-        None => Ok(()),
+pub(crate) fn grammar_identifier(name: &ast::Ident, position: &str) -> Result<()> {
+    match name.quote_style {
+        Some('"') => Ok(()),
+        None if crate::parser::is_unquoted_identifier(&name.value) => Ok(()),
+        _ => Err(grammar_rejected(format!("{name} as a {position}"))),
     }
+}
+
+fn grammar_table_name(name: &ast::ObjectName) -> Result<()> {
+    name.0.iter().filter_map(ast::ObjectNamePart::as_ident)
+        .try_for_each(|part| grammar_identifier(part, "table name"))
+}
+
+fn grammar_column_name(name: &ast::ObjectName, position: &str) -> Result<String> {
+    let [part] = name.0.as_slice() else { return Err(grammar_rejected(format!("A qualified {position}"))); };
+    let name = part.as_ident().ok_or_else(|| grammar_rejected(format!("A computed {position}")))?;
+    grammar_identifier(name, position)?;
+    Ok(identifier(name).normalized())
+}
+
+fn grammar_table_alias(alias: &ast::TableAlias) -> Result<()> {
+    grammar_identifier(&alias.name, "table alias")?;
+    for column in &alias.columns {
+        if column.data_type.is_some() { return Err(grammar_rejected("Typed table alias columns")); }
+        grammar_identifier(&column.name, "table alias column")?;
+    }
+    Ok(())
 }
 
 fn is_grammar_rejection(error: &Anomaly) -> bool { error.is(AnomalyKind::GrammarRejected) }

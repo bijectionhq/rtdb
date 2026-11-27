@@ -74,3 +74,37 @@ fn returning_requires_select_list_syntax_and_is_rejected_by_erase_and_patch() {
     let error = parse(sql).unwrap_err();
     assert_eq!(error.context["span"]["start"], serde_json::json!(sql.find("WHERE").unwrap()));
 }
+
+#[test]
+fn ignored_returning_expressions_still_require_sql_syntax() {
+    for suffix in [
+        "CAST(missing AS BLOB)",
+        "TRY_CAST(missing AS INT)",
+        "CAST(missing AS INT(10))",
+        "missing::BLOB",
+        "TIMESTAMP(3) '2000-01-01'",
+        "unknown_function(CAST(missing AS BLOB))",
+        "(SELECT CAST(missing AS BLOB) FROM absent)",
+        "(SELECT _id FROM absent FOR VALID_TIME AS OF CAST(missing AS BLOB))",
+        "(SELECT _id FROM absent FOR VALID_TIME FROM DATE '2000-01-01')",
+        "1 <=> 2",
+        "SUBSTRING('abc')",
+        "TRIM('abc', 'a')",
+        "COALESCE()",
+        "COUNT(ALL *)",
+        "ARRAY_AGG(DISTINCT missing)",
+        "ABS('abc' USING OCTETS)",
+    ] {
+        let sql = format!("INSERT INTO docs (_id) VALUES (1) RETURNING {suffix}");
+        let error = parse(&sql).unwrap_err();
+        assert_eq!(error.code, "xtdb/sql-error", "{sql}");
+        assert!(prepare_static(&sql, &Fixture, &PrepareOptions::default()).is_err(), "{sql}");
+    }
+
+    let sql = "DELETE FROM docs RETURNING CAST(missing AS INT), missing::TEXT, \
+        COUNT(*), CARDINALITY(ARRAY[missing]), SUBSTRING('abc' FROM 1), \
+        ABS(9223372036854775808), (SELECT a FROM absent FOR VALID_TIME FROM ? TO $7)";
+    let prepared = prepare(sql, &Fixture, &PrepareOptions::default()).unwrap();
+    assert!(prepared.parameter_types.is_empty());
+    assert!(matches!(prepared.statement, Statement::Dml(_)));
+}
