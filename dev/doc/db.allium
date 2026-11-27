@@ -2404,6 +2404,7 @@ surface QueryAccess {
         -- A transaction metadata projection requiring value reads owns its decoded results under a separate charge.
         -- Archive history and owned event projections write resolved transaction bounds, physical timestamps and assertion coordinates into typed Arrow columns.
         -- COALESCE over compatible floating-point vector columns selects the first non-null vector in each row by Arrow position.
+        -- COALESCE over compatible selected or mixed-layout scalar columns retains the first non-null cell by Arrow position and keeps its source charged.
         -- It emits a null where every operand is null.
         -- A mixed gather packs evaluated cells independently of compatible nested Arrow payloads, which it selects by position.
         -- Evaluated vectors of one list kind pack into a single Arrow column across row and component nulls.
@@ -2425,7 +2426,8 @@ surface QueryAccess {
         -- A located point read decodes the event headers and the put fields needed by its projection and predicates.
         -- Equality selection on a keyword ID includes the native and reference persisted digests.
         -- For columnar query output, stacked filters apply in plan order to the surviving vectors and row positions.
-        -- A projection concatenating two compatible UTF-8 columns reads their selected cells from Arrow and reserves the output buffers per page before writing them.
+        -- A binary UTF-8 concatenation projection reads compatible column cells, including active run ends and union legs, or uses a literal operand.
+        -- It reserves the output buffers per page before writing them.
         -- It preserves each nonnull pair's bytes in operand order and yields SQL null when either operand is null.
         -- A columnar limit applies its offset and row count to batches and slices compatible Arrow arrays.
         -- DISTINCT and set operations with columnar inputs select their output positions from those Arrow batches.
@@ -2523,6 +2525,7 @@ surface QueryAccess {
         -- A column table over a compatible Arrow list parameter reads the bound row's child slice as one semantic page.
         -- Its columnar result is split to the transport row limit after the operators have processed the complete page.
         -- Scalar evaluation in columnar projections, filters, aggregate filters, and evaluated UNNEST can borrow the cells demanded by the expression.
+        -- Scalar COALESCE can pass the selected Arrow string through to concatenation or regular expression replacement as borrowed text.
         -- Character and octet lengths and supported unary floating-point calls can read the active cells of selected and run-end encoded inputs and write fixed-width Arrow results.
         -- ROUND with a literal or omitted scale can read Float32 and Float64 column cells in place through compatible selections, unions and run ends, writing admitted Float64 results and reporting overflow only for reached non-null cells.
         -- A projection casting a numeric column to double precision can read supported signed integer and floating-point cells through compatible selections, unions and run ends and write admitted Float64 results.

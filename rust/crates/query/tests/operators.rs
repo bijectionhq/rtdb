@@ -574,6 +574,47 @@ async fn grouping_packs_computed_text_keys_under_pressure() -> Result<()> {
 }
 
 #[tokio::test]
+async fn arrow_coalesce_text_lane_projects_selected_run_text_with_offset_and_limit() -> Result<()> {
+    use arrow_array::{Int64Array, RecordBatch};
+    use rtdb_columnar::{OwnedBatch, copy_array, to_field};
+    use rtdb_plan::LiteralArrowPages;
+    use rtdb_types::RunEndWidth;
+
+    let (tracer, mut spans) = rtdb_metrics::TraceRecorder::new(MemoryBudget::new(1 << 20), 16, true, false)?;
+    let context = query_context(Default::default()).with_tracer(Some(tracer.clone()), None);
+    let baseline = context.memory.used_bytes();
+    let text = scalar(ScalarType::Utf8).maybe();
+    let runs = text.clone().run_end_encoded(RunEndWidth::I32)?;
+    let fields = vec![field(0, "ordinal", scalar(ScalarType::I64)), field(1, "source", runs.clone())];
+    let arrow_fields = fields.iter().map(|field| to_field(&field.name, &field.data_type)).collect::<Result<Vec<_>>>()?;
+    let string = |value: &str| Value::Utf8(value.into());
+    let input = [string("skip"), string("skip"), string(""), string("e\u{301}\0"), Value::Null, string("😀")];
+    let array = copy_array(&runs, &input)?;
+    let page = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(arrow_fields)), vec![
+        Arc::new(Int64Array::from(vec![0, 1, 2, 3, 4, 5])), array,
+    ]).unwrap();
+    let relation = Relation::new(Schema::new(fields.clone())?, RelationNode::ArrowLiteralPages {
+        pages: LiteralArrowPages::new(vec![OwnedBatch::new(page.slice(1, input.len() - 1), &context.memory)?]),
+    })?;
+    let filtered = relation.filter(Expr::binary(BinaryOp::NotEq, fields[0].expression(), Expr::Literal(Value::I64(2))))?;
+    let expression = Expr::binary(BinaryOp::Concat, fields[1].expression(), Expr::Literal(string("—ß")));
+    let projected = filtered.project(vec![NamedExpr { field: field(2, "text", text), expr: expression }])?;
+    let limited = projected.limit(Some(Expr::Literal(Value::I64(1))), Some(Expr::Literal(Value::I64(3))))?;
+    assert_eq!(collect(Arc::new(limited), Arc::clone(&context)).await?, vec![vec![string("e\u{301}\0—ß")], vec![Value::Null], vec![string("😀—ß")]]);
+    assert_eq!(context.memory.used_bytes(), baseline);
+    tracer.close();
+    let mut scalar_fallbacks = None;
+    while let Some(span) = spans.next().await {
+        if span.name == "query.cursor.project" {
+            scalar_fallbacks = span.attributes().find(|(name, _)| *name == "cursor.projection.scalar_fallbacks")
+                .map(|(_, value)| value.parse::<u64>().unwrap());
+        }
+    }
+    assert_eq!(scalar_fallbacks, Some(0));
+    Ok(())
+}
+
+#[tokio::test]
 async fn array_aggregate_orders_selected_rows_and_distinct_retains_null_arguments() {
     let input = values(0, "v", scalar(ScalarType::I64).maybe(), vec![Value::I64(2), Value::Null, Value::I64(1), Value::I64(2), Value::Null]);
     let argument = input.schema().fields()[0].expression();

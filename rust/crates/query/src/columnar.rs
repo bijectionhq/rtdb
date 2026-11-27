@@ -5534,10 +5534,9 @@ impl BatchCursor for BatchExpressions {
                 columns.push(column);
                 continue;
             }
-            if let Some((column, mut charge)) = projection::coalesce_vectors(kernel, &self.schema, &batch, &self.execution.context.memory)? {
-                let lease = Arc::get_mut(&mut reservation).expect("Batch projection owns its reservation");
-                lease.absorb(Arc::get_mut(&mut charge).expect("A vector selection owns its reservation"))?;
+            if let Some((column, owner)) = projection::coalesce_selection(kernel, &self.schema, &batch, memory)? {
                 columns.push(column);
+                owners[index] = Some(owner);
                 continue;
             }
             // An ordinal such as 0::BIGINT is shared by every row of a probe.
@@ -6591,7 +6590,7 @@ pub(crate) mod projection {
         (arrays.first()?.data_type() == child.data_type()).then_some((arrays, logical))
     }
 
-    pub(crate) fn coalesce_vectors(
+    pub(super) fn coalesce_selection(
         expr: &Expr, schema: &Schema, batch: &ColumnBatch, memory: &Arc<MemoryBudget>,
     ) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
         let args = match expr {
@@ -6603,40 +6602,65 @@ pub(crate) mod projection {
         let bytes = args.len().checked_mul(64).and_then(|bytes| bytes.checked_add(256)).ok_or_else(super::size_error)?;
         let Ok(_inputs) = memory.reserve(bytes) else { return Ok(None); };
         let mut inputs = Vec::with_capacity(args.len());
-        let layout = |field: &ArrowField, logical: Option<&LogicalType>| {
-            if !logical.is_some_and(|logical| super::stable_read_layout(logical, field)) { return false; }
+        fn layout(field: &ArrowField, logical: Option<&LogicalType>) -> bool {
+            let Some(logical) = logical.filter(|logical| super::stable_read_layout(logical, field)) else { return false; };
             match field.data_type() {
                 DataType::Null => field.is_nullable(),
+                DataType::Union(fields, arrow_schema::UnionMode::Dense) if field.metadata().is_empty() => fields.iter().all(|(_, child)| {
+                    super::scalar_layout(child.data_type()) && rtdb_columnar::from_field(child).is_ok_and(|ty| {
+                        rtdb_columnar::leg_name(&ty).is_ok_and(|name| name == *child.name()) && layout(child, Some(&ty))
+                    })
+                }),
                 DataType::List(child) | DataType::FixedSizeList(child, _) if field.metadata().is_empty() && child.metadata().is_empty() => {
                     matches!(child.data_type(), DataType::Float32 | DataType::Float64)
                         || rtdb_types::ListValue::supports_float_union(child.data_type())
                 }
-                _ => false,
+                data_type => super::scalar_layout(data_type) && super::plain_scalar(logical).is_some_and(super::copyable),
             }
-        };
+        }
+        let mut direct_layout = None;
+        let mut needs_selection = false;
+        let mut literal_tail = None;
         for arg in args {
             let position = match arg {
                 Expr::Literal(Value::Null | Value::Undefined) => continue,
+                Expr::Literal(value) if literal(value) => { literal_tail = Some(value); break; }
                 Expr::Column { id, .. } => match schema.position(*id) { Some(position) => position, None => return Ok(None) },
                 _ => return Ok(None),
             };
             let column = &batch.columns[position];
             let compatible = match column {
-                Column::Arrow { field, logical, .. } => layout(field, logical.as_ref()),
-                Column::Selected(column) => column.source_layouts().all(|(_, field, logical)| layout(field, logical)),
+                Column::Arrow { field, logical, .. } => {
+                    let data_type = field.data_type();
+                    let physical_and_scalar = (data_type, logical.as_ref().and_then(super::plain_scalar));
+                    needs_selection |= !super::scalar_layout(data_type) || *direct_layout.get_or_insert(physical_and_scalar) != physical_and_scalar;
+                    layout(field, logical.as_ref())
+                }
+                Column::Selected(column) => {
+                    needs_selection = true;
+                    column.source_layouts().all(|(_, field, logical)| layout(field, logical))
+                }
                 Column::Values(_) => false,
             };
             if !compatible { return Ok(None); }
             inputs.push((column, batch.column_reservation(position)));
         }
-        if inputs.is_empty() { return Ok(None); }
+        if !needs_selection { return Ok(None); }
+        let tail = if let Some(value) = literal_tail {
+            let Ok(bound) = super::repeated_cell_bound(value, 1) else { return Ok(None); };
+            let Ok(mut owner) = memory.reserve(bound) else { return Ok(None); };
+            let Ok(column) = super::repeat_cell(value, 1) else { return Ok(None); };
+            Arc::get_mut(&mut owner).expect("The COALESCE literal owns its reservation")
+                .shrink_to(super::owned_projection_bytes(&column)?)?;
+            Some((column, owner))
+        } else { None };
         let picks = (0..batch.len).map(|row| inputs.iter().find_map(|&(column, charge)| {
             let (array, field, _, offset) = column.arrow_cell(row)??;
             (super::arrow_cell_is_null(field, array, offset) == Some(false)).then_some((column, charge, row))
-        }));
+        }).or_else(|| tail.as_ref().map(|(column, charge)| (column, charge, 0))));
         let selection = super::take_arrow_rows(picks, batch.len, true, memory, None).and_then(|(column, mut charge)| {
             let bytes = column.retained_bytes()?;
-            let lease = Arc::get_mut(&mut charge).expect("A vector selection owns its reservation");
+            let lease = Arc::get_mut(&mut charge).expect("The COALESCE selection owns its reservation");
             if bytes <= lease.bytes() { lease.shrink_to(bytes)?; } else { lease.grow_to(bytes)?; }
             Ok((column, charge))
         });
@@ -6759,7 +6783,7 @@ pub(crate) mod projection {
 }
 
 #[test]
-fn vector_coalesce_uses_arrow_validity_and_retains_both_layouts() {
+fn arrow_coalesce_text_lane_retains_both_vector_layouts() {
     let memory = MemoryBudget::new(1 << 20);
     let left = Value::FixedSizeList(vec![Value::F32(-0.0), Value::Null].into());
     let right = Value::list(vec![Value::F64(1.0)]);
@@ -6779,7 +6803,7 @@ fn vector_coalesce_uses_arrow_validity_and_retains_both_layouts() {
     let expr = rtdb_plan::Expr::Coalesce(fields.iter().map(Field::expression).collect());
     let schema = rtdb_plan::Schema::new(fields).unwrap();
     let batch = ColumnBatch::settled(columns, 3, memory.reserve(4096).unwrap()).unwrap();
-    let (column, _charge) = projection::coalesce_vectors(&expr, &schema, &batch, &memory).unwrap().unwrap();
+    let (column, _charge) = projection::coalesce_selection(&expr, &schema, &batch, &memory).unwrap().unwrap();
     for (row, expected) in [left, right].into_iter().enumerate() {
         let (input, ..) = batch.columns[row].arrow_cell(row).unwrap().unwrap();
         let (retained, ..) = column.arrow_cell(row).unwrap().unwrap();
@@ -6787,6 +6811,57 @@ fn vector_coalesce_uses_arrow_validity_and_retains_both_layouts() {
         assert_eq!(column.value(row).unwrap(), expected);
     }
     assert_eq!(column.value(2).unwrap(), Value::Null);
+}
+
+#[test]
+fn arrow_coalesce_text_lane_retains_selected_scalar_winners_and_custody() {
+    use rtdb_plan::{ColumnId, Expr, Schema};
+
+    let memory = MemoryBudget::new(1 << 20);
+    let text = Value::Utf8("e\u{301}\0😀".into());
+    let number = Value::I32(7);
+    let types = [text.logical_type().join(&LogicalType::Scalar(ScalarType::Bool)).maybe(), number.logical_type().maybe()];
+    let schema = Schema::new(types.iter().enumerate().map(|(index, ty)| Field {
+        id: ColumnId(index as u32), name: format!("input{index}"), qualifier: None,
+        qualified_only: false, unnamed: false, data_type: ty.clone(),
+    }).collect()).unwrap();
+    let text_array = rtdb_columnar::copy_array(&types[0], &[Value::Null, text.clone(), Value::Bool(true)]).unwrap();
+    let number_array = rtdb_columnar::copy_array(&types[1], &[Value::I32(1), number.clone(), Value::Null]).unwrap();
+    let selected = Column::Selected(SelectedColumn::new(vec![Some((
+        Arc::clone(&text_array), Arc::new(rtdb_columnar::to_field("input0", &types[0]).unwrap()), Some(types[0].clone()), None,
+    )), None], Arc::new(vec![(0, 1), (1, 0), (0, 0)])));
+    let direct = Column::Arrow {
+        array: Arc::clone(&number_array), field: Arc::new(rtdb_columnar::to_field("input1", &types[1]).unwrap()), logical: Some(types[1].clone()),
+    };
+    let batch = ColumnBatch::settled(vec![selected, direct], 3, memory.reserve(4096).unwrap()).unwrap();
+    let backing = Arc::downgrade(batch.column_reservation(0));
+    let args = schema.fields().iter().map(Field::expression).collect::<Vec<_>>();
+    let expression = Expr::Coalesce(args.clone());
+    let (column, charge) = projection::coalesce_selection(&expression, &schema, &batch, &memory).unwrap().unwrap();
+    for (row, source) in [text_array, number_array].iter().enumerate() {
+        let (array, _, _, offset) = column.arrow_cell(row).unwrap().unwrap();
+        assert!(std::ptr::eq(array, source.as_ref()));
+        assert_eq!(offset, 1);
+    }
+    let ty = expression.data_type();
+    let field = rtdb_columnar::to_field("output", &ty).unwrap();
+    let (array, output_charge) = relayout_output(&column, &ty, &field, &memory).unwrap().unwrap();
+    for (row, value) in [text.clone(), number.clone(), Value::Null].into_iter().enumerate() {
+        assert_eq!(rtdb_columnar::read_value(&field, array.as_ref(), row).unwrap(), value);
+    }
+
+    let tail = Value::Utf8("fallback".into());
+    let expression = Expr::Coalesce([args, vec![Expr::Literal(tail.clone())]].concat());
+    let (with_tail, tail_charge) = projection::coalesce_selection(&expression, &schema, &batch, &memory).unwrap().unwrap();
+    drop(batch);
+    assert!(backing.upgrade().is_some());
+    assert!(matches!(with_tail, Column::Selected(_)));
+    assert_eq!(with_tail.value(0).unwrap(), text);
+    assert_eq!(with_tail.value(1).unwrap(), number);
+    assert_eq!(with_tail.value(2).unwrap(), tail);
+    drop((with_tail, tail_charge, column, charge, array, output_charge));
+    assert!(backing.upgrade().is_none());
+    assert_eq!(memory.used_bytes(), 0);
 }
 
 #[cfg(test)]

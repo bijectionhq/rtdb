@@ -288,6 +288,13 @@ fn numeric_octet(value: &Value) -> Result<u8> {
 fn count(value: usize) -> Result<Value> { Ok(Value::I32(i32::try_from(value).map_err(|_| overflow())?)) }
 fn from_bytes(bytes: Vec<u8>, binary: bool) -> Result<Value> { if binary { Ok(Value::Binary(bytes)) } else { String::from_utf8(bytes).map(Value::Utf8).map_err(|_| illegal("String operation produced invalid UTF-8")) } }
 fn concat_text(parts: &[String]) -> Result<String> { let size = parts.iter().try_fold(0, |size, part| add(size, part.len()))?; let mut result = String::with_capacity(size); for part in parts { result.push_str(part); } Ok(result) }
+pub(crate) fn concat_utf8<'a>(parts: impl Iterator<Item = &'a str> + Clone, context: &EvalContext<'_>) -> Result<Value> {
+    let size = parts.clone().try_fold(0, |size, part| add(size, part.len()))?;
+    context.reserve(size)?;
+    let mut result = String::with_capacity(size);
+    for part in parts { result.push_str(part); }
+    Ok(Value::Utf8(result))
+}
 fn add(left: usize, right: usize) -> Result<usize> { check_size(left.checked_add(right).ok_or_else(overflow)?) }
 fn check_size(size: usize) -> Result<usize> { if size > i32::MAX as usize { Err(overflow()) } else { Ok(size) } }
 fn illegal(message: &str) -> Anomaly { Anomaly::incorrect("xtdb.expression/illegal-argument-exception", message) }

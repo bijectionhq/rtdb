@@ -2,12 +2,14 @@ use std::cmp::Ordering;
 
 use rtdb_types::{NumericCell, ScalarType, decimal_arrow::DecimalParameters};
 
+use crate::admission::Admission;
 use crate::decimal::ScalarDecimal;
 use super::*;
 
 pub(super) enum Output<'a> {
     Number(NumericCell),
     Decimal(ScalarDecimal),
+    Text(&'a str, Admission<'a>),
     Value(EvalValue<'a>),
 }
 
@@ -16,8 +18,20 @@ impl<'a> Output<'a> {
         Ok(match self {
             Self::Number(number) => EvalValue::Scalar(number.into_value()),
             Self::Decimal(decimal) => EvalValue::Scalar(decimal.into_cell()?.into_value()),
+            Self::Text(text, admission) => {
+                admission.reserve(text.len())?;
+                scalar(Value::Utf8(text.to_owned()))
+            }
             Self::Value(value) => value,
         })
+    }
+
+    pub(super) fn text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text, _) => Some(text),
+            Self::Value(EvalValue::Scalar(Value::Utf8(text))) => Some(text),
+            _ => None,
+        }
     }
 
     pub(super) fn number(&self) -> Option<NumericCell> {
@@ -33,7 +47,7 @@ impl<'a> Output<'a> {
         match self {
             Self::Value(value) => is_null(value),
             Self::Number(number) => *number == NumericCell::Null,
-            Self::Decimal(_) => false,
+            Self::Decimal(_) | Self::Text(..) => false,
         }
     }
 
@@ -75,6 +89,7 @@ impl<'a> Output<'a> {
                 Ok(scalar(number.into_value()))
             }
             Self::Value(value) => clone_value(value, frame),
+            Self::Text(text, admission) => Self::Text(text, *admission).into_value(),
             Self::Decimal(_) => Err(overflow()),
         }
     }
@@ -149,6 +164,7 @@ fn wide_order(left: &Output<'_>, right: &Output<'_>, frame: &EvaluationFrame<'_>
     if let Some(order) = decimal_order(left, right, frame, true)? { return Ok(order); }
     let ty = |output: &Output<'_>| match output {
         Output::Value(value) => value_type(value, frame),
+        Output::Text(..) => Ok(LogicalType::Scalar(ScalarType::Utf8)),
         _ => Ok(output.scalar_type().map_or(LogicalType::Null, LogicalType::Scalar)),
     };
     Err(rtdb_types::function_type_mismatch("compare", &[ty(left)?, ty(right)?]))

@@ -1,3 +1,4 @@
+use crate::admission::Admission;
 use crate::collection::CollectionFunction;
 use crate::functions::{FloatMath, ResolvedFunction, ScalarFunction};
 use crate::string::StringFunction;
@@ -23,6 +24,7 @@ fn deferred_output<'a>(ty: LogicalType,payload: impl Future<Output=Result<Output
 fn ready_output<'a>(value: Output<'a>, frame: &EvaluationFrame<'_>) -> Result<Continuation<'a>> {
     match value {
         Output::Value(value) => ready(value, frame),
+        Output::Text(..) => deferred_output(LogicalType::Scalar(ScalarType::Utf8), async move { Ok(value) }, frame),
         Output::Number(number) => {
             frame.context.reserve(4096 + number_value_bytes(number) * 8)?;
             let ty = number.scalar_type().map_or(LogicalType::Null, LogicalType::Scalar);
@@ -172,6 +174,11 @@ pub(super) fn prepare<'a>(expr: &'a Expr,frame: &'a EvaluationFrame<'a>) -> Resu
 
 fn prepare_inner<'a>(expr: &'a Expr,ty: LogicalType,frame: &'a EvaluationFrame<'a>) -> Result<Pending<'a,Continuation<'a>>> {
     boxed(async move {
+        if matches!(expr, Expr::Column { .. } | Expr::Field { .. })
+            && let Some(text) = frame.arrow_input(expr).and_then(ArrowCell::utf8)
+        {
+            return ready_output(Output::Text(text, Admission::for_context(frame.context.allocation)), frame);
+        }
         match expr {
             Expr::Case { branches,otherwise } => {
                 for (condition,value) in branches {
@@ -284,6 +291,16 @@ fn prepare_inner<'a>(expr: &'a Expr,ty: LogicalType,frame: &'a EvaluationFrame<'
                     if matches!(op, BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq | BinaryOp::IsDistinctFrom | BinaryOp::IsNotDistinctFrom) {
                         return computed::predicate(*op, left, right, Some(left_expr), right_expr, frame).await;
                     }
+                    if *op == BinaryOp::Concat && (matches!(left, Output::Text(..)) || matches!(right, Output::Text(..)))
+                        && let (Some(left), Some(right)) = (left.text(), right.text())
+                    {
+                        let size = left.len().checked_add(right.len()).ok_or_else(overflow)?;
+                        frame.context.reserve(size)?;
+                        let mut result = String::with_capacity(size);
+                        result.push_str(left);
+                        result.push_str(right);
+                        return Ok(scalar(Value::Utf8(result)));
+                    }
                     calls::binary_values(*op, left.into_value()?, right.into_value()?, frame)?.await
                 },frame)
             }
@@ -304,9 +321,12 @@ fn prepare_inner<'a>(expr: &'a Expr,ty: LogicalType,frame: &'a EvaluationFrame<'
                 let source = prepare(source,frame)?.await?;
                 if source.is_null() { return nil(frame); }
                 deferred(ty,async move {
-                    let source = source.demand().await?;
-                    let Value::Utf8(source) = scalar_ref(&source)? else { return Err(invalid("regexp_replace")); };
-                    frame.replacements.ok_or_else(||Anomaly::fault("rtdb.expr/replacement-binding","Replacement invocation is unavailable"))?.get(expr)?.replace(source,frame.context).map(scalar)
+                    let source = source.demand_output().await?;
+                    let text = match source.text() {
+                        Some(text) => text,
+                        None => { scalar_ref(&source.into_value()?)?; return Err(invalid("regexp_replace")); }
+                    };
+                    frame.replacements.ok_or_else(||Anomaly::fault("rtdb.expr/replacement-binding","Replacement invocation is unavailable"))?.get(expr)?.replace(text,frame.context).map(scalar)
                 },frame)
             }
             Expr::Subscript { expr,index,.. } => {
@@ -496,6 +516,27 @@ fn call<'a>(function: ResolvedFunction<'a>, args: &'a [Expr], ty: LogicalType, f
             let argument = prepare(expr, frame)?.await?;
             if argument.is_null() && shortcut_null { return nil(frame); }
             arguments.push(argument);
+        }
+        if function == ResolvedFunction::Known(ScalarFunction::String(StringFunction::Concat))
+            && plain_type(&ty) == &LogicalType::Scalar(ScalarType::Utf8)
+        {
+            return deferred(ty, async move {
+                frame.context.reserve(arguments.len().checked_mul(std::mem::size_of::<Output<'_>>()).ok_or_else(overflow)?)?;
+                let mut inputs = Vec::with_capacity(arguments.len());
+                for argument in arguments {
+                    let output = argument.demand_output().await?;
+                    inputs.push(match output {
+                        Output::Text(..) => output,
+                        other => Output::Value(other.into_value()?),
+                    });
+                }
+                if inputs.iter().all(|input| input.text().is_some()) {
+                    return crate::string::concat_utf8(inputs.iter().filter_map(Output::text), frame.context).map(scalar);
+                }
+                frame.context.reserve(inputs.len().checked_mul(std::mem::size_of::<EvalValue<'_>>()).ok_or_else(overflow)?)?;
+                let values = inputs.into_iter().map(Output::into_value).collect::<Result<Vec<_>>>()?;
+                calls::apply(function, values, frame)?.await
+            }, frame);
         }
         if let ResolvedFunction::Known(ScalarFunction::Interval(interval_fn)) = function {
             let name = interval_fn.canonical_name();
@@ -725,4 +766,88 @@ fn call<'a>(function: ResolvedFunction<'a>, args: &'a [Expr], ty: LogicalType, f
         };
         if selects_element { ready(payload.await?, frame) } else { deferred(ty, payload, frame) }
     }, frame)
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_array::StringArray;
+    use arrow_schema::DataType;
+    use rtdb_columnar::ArrowCell;
+    use rtdb_plan::{BinaryOp, CastTarget, ColumnId, Expr, Field, RegexFormBuilder, RegexReplacement, Schema, function_type_with_args};
+    use rtdb_types::{Anomaly, LogicalType, Result, ScalarType, Value};
+
+    use super::{EvalContext, EvaluationFrame, ExpressionRow, Output, evaluate, is_null, materialize, prepare};
+
+    struct TextRow<'a>(ArrowCell<'a>);
+
+    impl crate::RowInput for TextRow<'_> {
+        fn arrow_cell(&self, index: usize) -> Option<ArrowCell<'_>> {
+            (index == 0).then_some(self.0)
+        }
+
+        fn value(&self, _: usize, _: Option<&crate::EvaluationScope>) -> Result<Option<Value>> {
+            Err(Anomaly::fault("test/scalar-read", "Expected an Arrow text cell"))
+        }
+    }
+
+    #[tokio::test]
+    async fn arrow_coalesce_text_lane_borrows_the_winner_through_scalar_continuations() {
+        let data_type = LogicalType::Scalar(ScalarType::Utf8);
+        let field = Field { id: ColumnId(0), name: "source".into(), qualifier: None,
+            qualified_only: false, unnamed: false, data_type: data_type.clone().maybe() };
+        let column = field.expression();
+        let schema = Schema::new(vec![field]).unwrap();
+        let field = arrow_schema::Field::new("source", DataType::Utf8, true);
+        let original = "e\u{301}\0😀";
+        let array = StringArray::from(vec![Some("unused"), Some(original), None]);
+        let context = EvalContext::default();
+        let failing_text = Expr::Cast {
+            expr: Box::new(Expr::binary(BinaryOp::Divide, Expr::Literal(Value::I64(1)), Expr::Literal(Value::I64(0)))),
+            target: CastTarget::fixed(data_type),
+        };
+        let coalesce = Expr::Coalesce(vec![column.clone(), failing_text.clone()]);
+        let suffix = Expr::Literal(Value::Utf8("—ß".into()));
+        let named_concat = |args: Vec<Expr>| Expr::Call {
+            name: "concat".into(), return_type: function_type_with_args("concat", &args).unwrap(), args,
+        };
+
+        let input = TextRow(ArrowCell { field: &field, array: &array, row: 1 });
+        let frame = EvaluationFrame { schema: &schema, row: ExpressionRow::Borrowed(&input), context: &context,
+            asynchronous: true, replacements: None };
+        let Output::Text(winner, _) = prepare(&coalesce, &frame).unwrap().await.unwrap().demand_output().await.unwrap() else {
+            panic!("Expected COALESCE to keep the original borrowed string");
+        };
+        assert_eq!(winner.as_ptr(), array.value(1).as_ptr());
+        for expression in [
+            Expr::binary(BinaryOp::Concat, coalesce.clone(), suffix.clone()),
+            named_concat(vec![coalesce.clone(), suffix.clone()]),
+        ] {
+            assert_eq!(materialize(evaluate(&expression, &frame).unwrap().await.unwrap(), &frame).unwrap().await.unwrap(),
+                Value::Utf8(format!("{original}—ß")));
+        }
+
+        let form = |text: &str| {
+            let mut builder = RegexFormBuilder::new_untracked();
+            builder.literal(&Value::Utf8(text.into())).unwrap();
+            builder.finish().unwrap()
+        };
+        let replaced = Expr::regex_replace(coalesce.clone(), RegexReplacement {
+            pattern: form("😀"), replacement: form("Q"), ..Default::default()
+        });
+        let invocation = crate::ExpressionInvocation::prepare(&replaced, &schema, &context).unwrap();
+        let value = invocation.evaluate_projection_row_async(ExpressionRow::Borrowed(&input), &context).await.unwrap();
+        assert_eq!(value, Value::Utf8("e\u{301}\0Q".into()));
+
+        let input = TextRow(ArrowCell { field: &field, array: &array, row: 2 });
+        let frame = EvaluationFrame { row: ExpressionRow::Borrowed(&input), ..frame };
+        let error = prepare(&coalesce, &frame).unwrap().await.unwrap().demand().await.err().unwrap();
+        assert_eq!(error.code, "xtdb.expression/division-by-zero");
+        for expression in [
+            Expr::binary(BinaryOp::Concat, column.clone(), failing_text.clone()),
+            named_concat(vec![column, failing_text]),
+        ] {
+            let result = evaluate(&expression, &frame).unwrap().await.unwrap();
+            assert!(is_null(&result));
+        }
+    }
 }
