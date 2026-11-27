@@ -1,11 +1,13 @@
-use std::sync::Arc;
+use std::{ops::Range, sync::Arc};
 
-use arrow_array::{Float32Array, Float64Array, RecordBatch, cast::AsArray};
+use arrow_array::{Array, ArrayRef, BinaryArray, FixedSizeListArray, Float32Array, Float64Array, ListArray, NullArray, RecordBatch, StringArray,
+    builder::{Float32Builder, Float64Builder}, cast::AsArray, types::{Float32Type, Float64Type}};
+use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field};
 use futures::future::BoxFuture;
 use rtdb_columnar::{ArrowCell, MemoryReservation};
 use rtdb_node::{OwnedChangeEdge, Database, NativeSession, Node, OwnedCountRequest, OwnedRangeCount, OwnedRangePage, OwnedRangeRequest, OwnedWorldWitness};
-use rtdb_types::{EntityId, Iid, Interval, LogicalType, OwnedRelation, OwnedWorldAssertion, Result, ScalarType, StructFields, Timestamp, TransactionKey, Value, WorldClockMode};
+use rtdb_types::{EntityId, Iid, Interval, ListKind, LogicalType, OwnedRelation, OwnedWorldAssertion, Result, ScalarType, StructFields, Timestamp, TransactionKey, Value, WorldClockMode};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -125,31 +127,189 @@ pub struct WorldPointRow {
 impl WorldPointRow {
     #[doc(hidden)]
     pub fn document_bytes(batch: &RecordBatch) -> Result<usize> {
-        let shape = batch.schema_ref().fields().iter().map(|field| Ok((field.name().clone(), Value::Null)))
-            .collect::<Result<StructFields<_>>>()?;
-        let size = Value::document_retained_bytes(&shape)?;
-        batch.schema_ref().fields().iter().zip(batch.columns()).try_fold(size, |bytes, (field, array)| {
-            let selected = ArrowCell { field, array: array.as_ref(), row: 0 }.physical()?;
-            let logical = selected.logical_type()?;
-            let heap = match &logical {
-                LogicalType::List { .. } | LogicalType::Struct(_) => {
-                    let cell = ArrowCell { field, array: array.as_ref(), row: 0 };
-                    let concrete = rtdb_columnar::to_field(field.name(), &logical).ok()
-                        .and_then(|target| concrete_point_bytes(cell, selected, &logical, &target));
-                    match concrete {
-                        Some(bytes) => bytes,
-                        None => {
-                            let value = rtdb_columnar::read_value(field, array.as_ref(), 0)?;
-                            value.retained_bytes()?.checked_sub(std::mem::size_of::<Value>())
-                                .ok_or_else(rtdb_types::OwnedWorld::unavailable)?
-                        }
-                    }
-                }
-                _ => scalar_point_bytes(selected, &logical),
-            };
-            bytes.checked_add(heap).ok_or_else(rtdb_types::OwnedWorld::unavailable)
+        let base = Self::document_header_bytes(batch)?;
+        Self::cells(batch).try_fold(base, |bytes, cell| {
+            bytes.checked_add(PointCell::prepare(cell)?.heap_bytes()).ok_or_else(rtdb_types::OwnedWorld::unavailable)
         })
     }
+
+    pub(crate) fn cells(batch: &RecordBatch) -> impl Iterator<Item = ArrowCell<'_>> {
+        batch.schema_ref().fields().iter().zip(batch.columns())
+            .map(|(field, array)| ArrowCell { field, array: array.as_ref(), row: 0 })
+    }
+
+    pub(crate) fn document_header_bytes(batch: &RecordBatch) -> Result<usize> {
+        let shape = batch.schema_ref().fields().iter().map(|field| Ok((field.name().clone(), Value::Null)))
+            .collect::<Result<StructFields<_>>>()?;
+        Value::document_retained_bytes(&shape)
+    }
+}
+
+pub(crate) struct PointCell<'a> {
+    logical: LogicalType,
+    bytes: usize,
+    storage: PointStorage<'a>,
+}
+
+enum PointStorage<'a> {
+    Empty,
+    Slice(ArrowCell<'a>),
+    Compact { cell: ArrowCell<'a>, validate_uri: bool },
+    FloatList { values: &'a dyn Array, rows: Range<usize> },
+    Struct(Vec<PointCell<'a>>),
+    Decoded(Value),
+    Read(ArrowCell<'a>),
+}
+
+impl<'a> PointCell<'a> {
+    pub(crate) fn prepare(cell: ArrowCell<'a>) -> Result<Self> {
+        let selected = cell.physical()?;
+        let logical = selected.logical_type()?;
+        let storage = match &logical {
+            LogicalType::Null => PointStorage::Empty,
+            LogicalType::Scalar(scalar) => match rtdb_columnar::to_field(cell.field.name(), &logical) {
+                Ok(field) if selected.field.data_type() == field.data_type() && selected.field.metadata() == field.metadata() =>
+                    PointStorage::Slice(selected),
+                Ok(field) if selected.field.data_type() == field.data_type()
+                    && cell.logical_position(None).is_ok_and(|(_, ty)| required_point_type(&ty) == &logical) =>
+                    PointStorage::Compact { cell: selected, validate_uri: *scalar == ScalarType::Uri },
+                _ => PointStorage::Read(cell),
+            },
+            LogicalType::List { .. } | LogicalType::Struct(_) => {
+                if std::ptr::eq(cell.field, selected.field)
+                    || cell.logical_position(None).is_ok_and(|(_, ty)| required_point_type(&ty) == &logical)
+                {
+                    if let Some(nested) = Self::try_concrete(selected, logical)? { return Ok(nested); }
+                }
+                return Self::decoded(rtdb_columnar::read_value(cell.field, cell.array, cell.row)?);
+            }
+            _ => PointStorage::Read(cell),
+        };
+        Ok(Self { bytes: scalar_point_bytes(selected, &logical), logical, storage })
+    }
+
+    pub(crate) fn heap_bytes(&self) -> usize { self.bytes }
+
+    fn decoded(value: Value) -> Result<Self> {
+        let bytes = value.retained_bytes()?.checked_sub(size_of::<Value>()).ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
+        Ok(Self { logical: value.logical_type(), bytes, storage: PointStorage::Decoded(value) })
+    }
+
+    fn try_nested(cell: ArrowCell<'a>, declared: &LogicalType) -> Result<Option<Self>> {
+        if *declared == LogicalType::Nothing {
+            return Ok(Some(Self { logical: LogicalType::Nothing, bytes: 0, storage: PointStorage::Empty }));
+        }
+        let Ok((selected, interpreted)) = cell.logical_position(Some(declared)) else { return Ok(None); };
+        let Ok(logical) = selected.logical_type() else { return Ok(None); };
+        if logical != LogicalType::Null && required_point_type(&interpreted) != &logical { return Ok(None); }
+        Self::try_concrete(selected, logical)
+    }
+
+    fn try_concrete(selected: ArrowCell<'a>, logical: LogicalType) -> Result<Option<Self>> {
+        let (logical, bytes, storage) = match &logical {
+            LogicalType::Null => (logical, 0, PointStorage::Empty),
+            LogicalType::Scalar(scalar) => {
+                if !rtdb_columnar::to_field(selected.field.name(), &logical)
+                    .is_ok_and(|field| field.data_type() == selected.field.data_type())
+                {
+                    return Ok(None);
+                }
+                if *scalar == ScalarType::Uri {
+                    rtdb_types::UriParts::parse(selected.array.as_string::<i32>().value(selected.row))?;
+                }
+                let bytes = scalar_point_bytes(selected, &logical);
+                (logical, bytes, PointStorage::Compact { cell: selected, validate_uri: false })
+            }
+            LogicalType::Struct(types) => {
+                let Some(children) = selected.structure().filter(|children| children.len() == types.len()) else { return Ok(None); };
+                let mut shape = StructFields::new();
+                let mut fields = StructFields::new();
+                let mut output = Vec::new();
+                let mut bytes = 0usize;
+                for child in children {
+                    let name = child.field.name();
+                    let Some(declared) = types.get(name) else { return Ok(None); };
+                    let planned = match Self::try_nested(child, declared)? {
+                        Some(planned) => planned,
+                        None => Self::decoded(rtdb_columnar::read_value_as(declared, child.field, child.array, child.row)?)?,
+                    };
+                    bytes = bytes.checked_add(planned.heap_bytes()).ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
+                    shape.insert(name.clone(), Value::Null);
+                    fields.insert(name.clone(), planned.logical.clone());
+                    output.push(planned);
+                }
+                let bytes = bytes.checked_add(Value::document_retained_bytes(&shape)?).ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
+                (LogicalType::Struct(fields), bytes, PointStorage::Struct(output))
+            }
+            LogicalType::List { kind: kind @ (ListKind::List | ListKind::FixedSizeList(_)), element } => {
+                let Some((item, values, rows)) = selected.sequence_range() else { return Ok(None); };
+                if rows.is_empty() || !item.metadata().is_empty()
+                    || values.nulls().is_some_and(|nulls| nulls.slice(rows.start, rows.len()).null_count() != 0)
+                {
+                    return Ok(None);
+                }
+                let element = match element.as_ref() { LogicalType::Maybe(inner) => inner.as_ref(), ty => ty };
+                let (header, width) = match (element, item.data_type()) {
+                    (LogicalType::Scalar(ScalarType::F32), DataType::Float32) => (size_of::<Float32Array>(), 4),
+                    (LogicalType::Scalar(ScalarType::F64), DataType::Float64) => (size_of::<Float64Array>(), 8),
+                    _ => return Ok(None),
+                };
+                let bytes = rows.len().checked_mul(width).and_then(|bytes| header.checked_add(bytes))
+                    .ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
+                let logical = LogicalType::List { kind: kind.clone(), element: Box::new(element.clone()) };
+                (logical, bytes, PointStorage::FloatList { values, rows })
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(Self { logical, bytes, storage }))
+    }
+
+    pub(crate) fn write(self, name: &str) -> Result<(Field, ArrayRef)> {
+        if let PointStorage::Read(cell) = &self.storage {
+            let value = rtdb_columnar::read_value(cell.field, cell.array, cell.row)?;
+            let logical = value.logical_type();
+            return Ok((rtdb_columnar::to_field(name, &logical)?, rtdb_columnar::build_array(&logical, &[value])?));
+        }
+        let field = rtdb_columnar::to_field(name, &self.logical)?;
+        let array = self.write_as(&field)?;
+        Ok((field, array))
+    }
+
+    fn write_as(self, field: &Field) -> Result<ArrayRef> {
+        Ok(match self.storage {
+            PointStorage::Empty => Arc::new(NullArray::new(1)),
+            PointStorage::Slice(cell) => {
+                cell.validate_decimal_precision()?;
+                let array = cell.array.slice(cell.row, 1);
+                if array.nulls().is_some() {
+                    let data = array.to_data().into_builder().nulls(None).build().map_err(point_arrow)?;
+                    arrow_array::make_array(data)
+                } else { array }
+            }
+            PointStorage::Compact { cell, validate_uri } => {
+                if validate_uri { rtdb_types::UriParts::parse(cell.array.as_string::<i32>().value(cell.row))?; }
+                cell.validate_decimal_precision()?;
+                match field.data_type() {
+                    DataType::Utf8 => Arc::new(StringArray::from(vec![Some(cell.array.as_string::<i32>().value(cell.row))])),
+                    DataType::Binary => Arc::new(BinaryArray::from(vec![Some(cell.array.as_binary::<i32>().value(cell.row))])),
+                    _ => rtdb_columnar::copy_selected_cells(&[cell.array], &[(0, cell.row)])?,
+                }
+            }
+            PointStorage::FloatList { values, rows } => compact_float_list(field, values, rows)?,
+            PointStorage::Struct(children) => {
+                let DataType::Struct(fields) = field.data_type() else { unreachable!("Prepared point struct") };
+                let arrays = children.into_iter().zip(fields.iter()).map(|(child, field)| child.write_as(field))
+                    .collect::<Result<Vec<_>>>()?;
+                rtdb_columnar::build_struct_array(fields.clone(), &arrays, 1, None)?
+            }
+            PointStorage::Decoded(value) => rtdb_columnar::build_array(&self.logical, &[value])?,
+            PointStorage::Read(_) => unreachable!("Deferred top-level point read"),
+        })
+    }
+}
+
+fn required_point_type(logical: &LogicalType) -> &LogicalType {
+    match logical { LogicalType::Maybe(inner) => inner.as_ref(), ty => ty }
 }
 
 fn scalar_point_bytes(cell: ArrowCell<'_>, logical: &LogicalType) -> usize {
@@ -166,49 +326,37 @@ fn scalar_point_bytes(cell: ArrowCell<'_>, logical: &LogicalType) -> usize {
     }
 }
 
-pub(crate) fn concrete_point_bytes(cell: ArrowCell<'_>, selected: ArrowCell<'_>, logical: &LogicalType, target: &Field) -> Option<usize> {
-    if selected.field.data_type() != target.data_type() || selected.field.metadata() != target.metadata() {
-        return None;
-    }
-    if !std::ptr::eq(cell.field, selected.field) {
-        let (_, interpreted) = cell.logical_position(None).ok()?;
-        if &rtdb_columnar::from_field(selected.field).ok()? != &interpreted { return None; }
-    }
-    concrete_heap_bytes(selected, logical)
+fn compact_float_list(field: &Field, values: &dyn Array, rows: Range<usize>) -> Result<ArrayRef> {
+    let (item, width) = match field.data_type() {
+        DataType::List(item) => (item, None),
+        DataType::FixedSizeList(item, width) => (item, Some(*width)),
+        _ => unreachable!("Prepared point float list"),
+    };
+    let length = rows.len();
+    let array: ArrayRef = match item.data_type() {
+        DataType::Float32 => {
+            let mut output = Float32Builder::with_capacity(length);
+            output.append_slice(&values.as_primitive::<Float32Type>().values()[rows]);
+            Arc::new(output.finish())
+        }
+        DataType::Float64 => {
+            let mut output = Float64Builder::with_capacity(length);
+            output.append_slice(&values.as_primitive::<Float64Type>().values()[rows]);
+            Arc::new(output.finish())
+        }
+        _ => unreachable!("Prepared point float components"),
+    };
+    Ok(match width {
+        Some(width) => Arc::new(FixedSizeListArray::try_new(Arc::clone(item), width, array, None).map_err(point_arrow)?),
+        None => {
+            let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, i32::try_from(length).expect("An Arrow list has i32 offsets")]));
+            Arc::new(ListArray::try_new(Arc::clone(item), offsets, array, None).map_err(point_arrow)?)
+        }
+    })
 }
 
-fn concrete_heap_bytes(cell: ArrowCell<'_>, logical: &LogicalType) -> Option<usize> {
-    match logical {
-        LogicalType::Null | LogicalType::Nothing => Some(0),
-        LogicalType::Scalar(ScalarType::Uri) => None,
-        LogicalType::Scalar(_) if !cell.array.is_null(cell.row) => Some(scalar_point_bytes(cell, logical)),
-        LogicalType::Struct(types) => {
-            let mut shape = StructFields::new();
-            let mut heap = 0usize;
-            for child in cell.structure()? {
-                let logical = types.get(child.field.name())?;
-                heap = heap.checked_add(concrete_heap_bytes(child, logical)?)?;
-                shape.insert(child.field.name().clone(), Value::Null);
-            }
-            heap.checked_add(Value::document_retained_bytes(&shape).ok()?)
-        }
-        LogicalType::List { kind: rtdb_types::ListKind::List | rtdb_types::ListKind::FixedSizeList(_), element } => {
-            let (item, values, range) = cell.sequence_range()?;
-            if range.is_empty() || item.is_nullable() || !item.metadata().is_empty()
-                || values.nulls().is_some_and(|nulls| nulls.slice(range.start, range.len()).null_count() != 0)
-            {
-                return None;
-            }
-            let (header, width) = match (element.as_ref(), item.data_type()) {
-                (LogicalType::Scalar(ScalarType::F32), DataType::Float32) => (std::mem::size_of::<Float32Array>(), 4),
-                (LogicalType::Scalar(ScalarType::F64), DataType::Float64) => (std::mem::size_of::<Float64Array>(), 8),
-                _ => return None,
-            };
-            // The owned float reader copies the selected components into a Vec of this length.
-            header.checked_add(range.len().checked_mul(width)?)
-        }
-        _ => None,
-    }
+fn point_arrow(error: arrow_schema::ArrowError) -> rtdb_types::Anomaly {
+    rtdb_types::Anomaly::incorrect("rtdb/invalid-arrow", error.to_string())
 }
 
 

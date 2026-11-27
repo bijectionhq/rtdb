@@ -36,6 +36,7 @@ use tonic::Status;
 use uuid::Uuid;
 
 use crate::owned_landing_wire::{self, ControlCommand};
+use crate::owned_world::PointCell;
 use self::ordered_controls::OrderedControls;
 use crate::{
     actions::{OwnedIpcReply, SelectionEncoder},
@@ -5203,10 +5204,8 @@ impl Service {
                     metadata.insert(OWNED_ASSERTION_HELD_READING.into(), reading.0.to_string());
                 }
             }
-            let bytes = crate::WorldPointRow::document_bytes(&row).map_err(status)?;
-            let _encoding = call.reserve(wire::add(4096, wire::mul(bytes, 8)?)?)?;
-            let (fields, columns) = row.schema_ref().fields().iter().zip(row.columns())
-                .map(|(field, array)| world_point_cell(ArrowCell { field, array: array.as_ref(), row: 0 }).map_err(status))
+            let (cells, _encoding) = prepare_world_point(&row, call.memory())?;
+            let (fields, columns) = cells.into_iter().zip(row.schema_ref().fields()).map(|(cell, field)| cell.write(field.name()).map_err(status))
                 .collect::<Result<Vec<_>, _>>()?.into_iter().unzip::<_, _, Vec<_>, Vec<_>>();
             let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
             let batch = RecordBatch::try_new(Arc::clone(&schema), columns).map_err(arrow)?;
@@ -6588,76 +6587,38 @@ fn owned_point_expectation(history: Option<Timestamp>, position: Option<&[u8]>) 
     }
 }
 
-fn world_point_cell(cell: ArrowCell<'_>) -> rtdb_types::Result<(Field, ArrayRef)> {
-    use rtdb_types::LogicalType;
-    let selected = cell.physical()?;
-    let logical = selected.logical_type()?;
-    let field = rtdb_columnar::to_field(cell.field.name(), &logical)?;
-    if logical == LogicalType::Null {
-        return Ok((field, Arc::new(arrow_array::NullArray::new(1))));
-    }
-    if matches!(&logical, LogicalType::Scalar(_)) && selected.field.data_type() == field.data_type()
-        && selected.field.metadata() == field.metadata()
-    {
-        let array = selected.array.slice(selected.row, 1);
-        rtdb_columnar::validate_projected_decimals(&field, array.as_ref())?;
-        let array = if array.nulls().is_some() {
-            let data = array.to_data().into_builder().nulls(None).build()
-                .map_err(|error| rtdb_types::Anomaly::incorrect("rtdb/invalid-arrow", error.to_string()))?;
-            arrow_array::make_array(data)
-        } else { array };
-        return Ok((field, array));
-    }
-    if matches!(logical, LogicalType::List { .. } | LogicalType::Struct(_))
-        && crate::owned_world::concrete_point_bytes(cell, selected, &logical, &field).is_some()
-    {
-        // IPC admission counts buffer capacities, including backing buffers held by slices.
-        let array = build_concrete_point_cell(selected, &logical, &field)?;
-        return Ok((field, array));
-    }
-    let value = rtdb_columnar::read_value(cell.field, cell.array, cell.row)?;
-    let logical = value.logical_type();
-    let field = rtdb_columnar::to_field(cell.field.name(), &logical)?;
-    let array = rtdb_columnar::build_array(&logical, &[value])?;
-    Ok((field, array))
-}
-
-fn build_concrete_point_cell(cell: ArrowCell<'_>, logical: &rtdb_types::LogicalType, field: &Field) -> rtdb_types::Result<ArrayRef> {
-    use arrow_array::cast::AsArray;
-    use rtdb_types::{ListKind, ListValue, LogicalType, ScalarType};
-
-    let array = match (logical, field.data_type()) {
-        (LogicalType::Struct(types), DataType::Struct(fields)) => {
-            let children = cell.structure().expect("admitted point struct");
-            let arrays = children.zip(fields.iter()).map(|(child, field)| {
-                build_concrete_point_cell(child, &types[field.name()], field)
-            }).collect::<rtdb_types::Result<Vec<_>>>()?;
-            rtdb_columnar::build_struct_array(fields.clone(), &arrays, 1, None)?
+fn prepare_world_point<'a>(batch: &'a RecordBatch, memory: &Arc<MemoryBudget>)
+    -> Result<(Vec<PointCell<'a>>, Arc<MemoryReservation>), Status> {
+    let encoding_bytes = |bytes| wire::mul(bytes, 8).and_then(|size| wire::add(4096, size));
+    let mut bytes = crate::WorldPointRow::document_header_bytes(batch).map_err(status)?;
+    let mut cells = Vec::new();
+    let mut reservation = memory.reserve(0).map_err(status)?;
+    let lease = Arc::get_mut(&mut reservation).expect("Point preparation owns its reservation");
+    let mut refused = false;
+    for cell in crate::WorldPointRow::cells(batch) {
+        let cell = PointCell::prepare(cell).map_err(status)?;
+        bytes = bytes.checked_add(cell.heap_bytes()).ok_or_else(|| status(rtdb_types::OwnedWorld::unavailable()))?;
+        if refused { continue; }
+        match encoding_bytes(bytes).and_then(|size| {
+            if size == lease.bytes() { Ok(()) } else { lease.grow_to(size).map_err(status) }
+        }) {
+            Ok(()) => cells.push(cell),
+            Err(_) => {
+                cells = Vec::new();
+                lease.shrink_to(0).map_err(status)?;
+                // Document reads precede reply admission, even if a prefix exceeds the budget.
+                refused = true;
+            }
         }
-        (LogicalType::List { kind, .. }, _) => {
-            let (item, values, range) = cell.sequence_range().expect("admitted point float list");
-            let list = match item.data_type() {
-                DataType::Float32 => ListValue::from_f32(values.as_primitive::<arrow_array::types::Float32Type>().slice(range.start, range.len())),
-                DataType::Float64 => ListValue::from_f64(values.as_primitive::<arrow_array::types::Float64Type>().slice(range.start, range.len())),
-                _ => unreachable!("admitted point list components"),
-            };
-            let value = match kind {
-                ListKind::List => Value::List(list),
-                _ => Value::FixedSizeList(list),
-            };
-            rtdb_columnar::build_array(logical, &[value])?
-        }
-        (LogicalType::Null | LogicalType::Nothing, _) => Arc::new(arrow_array::NullArray::new(1)),
-        (LogicalType::Scalar(ScalarType::Utf8 | ScalarType::Keyword), _) =>
-            Arc::new(StringArray::from(vec![Some(cell.array.as_string::<i32>().value(cell.row))])),
-        (LogicalType::Scalar(ScalarType::Binary | ScalarType::Transit), _) =>
-            Arc::new(BinaryArray::from(vec![Some(cell.array.as_binary::<i32>().value(cell.row))])),
-        _ => {
-            let value = rtdb_columnar::read_value_as(logical, cell.field, cell.array, cell.row)?;
-            rtdb_columnar::build_array(logical, &[value])?
-        }
-    };
-    Ok(array)
+    }
+    let bound = encoding_bytes(bytes)?;
+    if refused {
+        let reservation = memory.reserve(bound).map_err(status)?;
+        let cells = crate::WorldPointRow::cells(batch).map(PointCell::prepare).collect::<rtdb_types::Result<_>>().map_err(status)?;
+        return Ok((cells, reservation));
+    }
+    if lease.bytes() != bound { lease.grow_to(bound).map_err(status)?; }
+    Ok((cells, reservation))
 }
 
 fn optional_micros(value: Option<Value>) -> Result<Option<Timestamp>, Status> {
@@ -6806,8 +6767,13 @@ mod world_point_tests {
     use super::*;
     use arrow_array::cast::AsArray;
     use arrow_ipc::writer::IpcWriteOptions;
+    use rtdb_columnar::to_field;
     use rtdb_format::ipc::write_arrow_stream;
     use rtdb_types::{ListKind, LogicalType, ScalarType};
+
+    fn world_point_cell(cell: ArrowCell<'_>) -> rtdb_types::Result<(Field, ArrayRef)> {
+        PointCell::prepare(cell)?.write(cell.field.name())
+    }
 
     #[test]
     fn world_point_narrows_to_the_selected_leg_and_retains_its_payload() {
@@ -6887,11 +6853,9 @@ mod world_point_tests {
 
         let (field, narrowed) = world_point_cell(cell).unwrap();
         assert_eq!(field, rtdb_columnar::to_field("payload", &baseline.logical_type()).unwrap());
-        let source = cell.physical().unwrap();
-        assert!(crate::owned_world::concrete_point_bytes(cell, source, &logical, &field).is_some());
         let schema = Arc::new(Schema::new(vec![field]));
         let baseline = rtdb_columnar::build_array(&baseline.logical_type(), &[baseline]).unwrap();
-        assert_eq!(narrowed.get_array_memory_size(), baseline.get_array_memory_size());
+        assert!(narrowed.get_array_memory_size() <= baseline.get_array_memory_size());
         let ipc = |array| {
             let batch = RecordBatch::try_new(Arc::clone(&schema), vec![array]).unwrap();
             write_arrow_stream(&schema, &[batch], IpcWriteOptions::default()).unwrap()
@@ -6917,5 +6881,85 @@ mod world_point_tests {
         let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![Arc::new(array)]).unwrap();
         assert_eq!(crate::WorldPointRow::document_bytes(&batch).unwrap_err(), baseline);
         assert_eq!(world_point_cell(ArrowCell::named(&batch, "payload", 0).unwrap()).unwrap_err(), baseline);
+    }
+
+    #[test]
+    fn world_point_keeps_the_exact_document_charge_for_mixed_children() {
+        let text = LogicalType::Scalar(ScalarType::Utf8);
+        let logical = LogicalType::Struct(StructFields::from([
+            ("nullable".into(), text.clone().maybe()),
+            ("omitted".into(), LogicalType::Nothing),
+            ("explicit_null".into(), LogicalType::Null),
+            ("set".into(), LogicalType::List { kind: ListKind::Set, element: Box::new(text) }),
+        ]));
+        let value = Value::Struct(StructFields::from([
+            ("nullable".into(), Value::Utf8("present".into())),
+            ("omitted".into(), Value::Undefined),
+            ("explicit_null".into(), Value::Null),
+            ("set".into(), Value::Set(vec![Value::Utf8("first".into()), Value::Utf8("second".into())])),
+        ]));
+        let field = to_field("payload", &logical).unwrap();
+        let array = rtdb_columnar::build_array(&logical, std::slice::from_ref(&value)).unwrap();
+        let baseline = rtdb_columnar::read_value(&field, array.as_ref(), 0).unwrap();
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![array]).unwrap();
+        let document = StructFields::from([("payload".into(), baseline)]);
+        let expected_bytes = Value::document_retained_bytes(&document).unwrap();
+        assert_eq!(crate::WorldPointRow::document_bytes(&batch).unwrap(), expected_bytes);
+        let memory = MemoryBudget::new(1 << 20);
+        let (mut cells, charge) = prepare_world_point(&batch, &memory).unwrap();
+        assert_eq!(charge.bytes(), 4096 + 8 * expected_bytes);
+        let (field, array) = cells.pop().unwrap().write("payload").unwrap();
+        assert_eq!(field, to_field("payload", &value.logical_type()).unwrap());
+        assert_eq!(rtdb_columnar::read_value(&field, array.as_ref(), 0).unwrap(), value);
+        drop((field, array, charge));
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn world_point_validates_only_the_selected_nested_decimal() {
+        use arrow_array::Decimal128Array;
+
+        let logical = LogicalType::Scalar(ScalarType::Decimal { precision: 3, scale: 2, bit_width: 128 });
+        let amount = Arc::new(to_field("amount", &logical).unwrap());
+        let DataType::Decimal128(precision, scale) = *amount.data_type() else { unreachable!() };
+        let cents = Decimal128Array::from(vec![1234, -125]).with_precision_and_scale(precision, scale).unwrap();
+        let array = StructArray::new(vec![amount].into(), vec![Arc::new(cents)], None);
+        let field = Field::new("payload", array.data_type().clone(), false);
+        let read = |row| ArrowCell { field: &field, array: &array, row };
+        let invalid = rtdb_columnar::read_value(&field, &array, 0).unwrap();
+        let expected = rtdb_columnar::build_array(&invalid.logical_type(), &[invalid]).unwrap_err();
+        assert_eq!(world_point_cell(read(0)).unwrap_err(), expected);
+        let (actual, narrowed) = world_point_cell(read(1)).unwrap();
+        assert_eq!(actual, field);
+        assert_eq!(rtdb_columnar::read_value(&actual, narrowed.as_ref(), 0).unwrap(), rtdb_columnar::read_value(&field, &array, 1).unwrap());
+    }
+
+    #[test]
+    fn world_point_reads_later_fields_before_reporting_a_reply_budget_refusal() {
+        let uri = Arc::new(to_field("uri", &LogicalType::Scalar(ScalarType::Uri)).unwrap());
+        let first = Arc::new(StringArray::from(vec!["first"]));
+        let second = Arc::new(StructArray::new(vec![uri].into(), vec![Arc::new(StringArray::from(vec!["not a URI"]))], None));
+        let field = Field::new("payload", second.data_type().clone(), false);
+        let expected = rtdb_columnar::read_value(&field, second.as_ref(), 0).unwrap_err();
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new("prefix", DataType::Utf8, false), field])), vec![first, second]).unwrap();
+        let memory = MemoryBudget::new(1);
+        let error = prepare_world_point(&batch, &memory).err().unwrap();
+        assert_eq!(error.message(), status(expected).message());
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn world_point_budget_refusal_uses_the_complete_document_charge() {
+        let first = Arc::new(StringArray::from(vec!["first"]));
+        let long = "x".repeat(8192);
+        let second = Arc::new(StringArray::from(vec![long.as_str()]));
+        let schema = Schema::new(vec![Field::new("prefix", DataType::Utf8, false), Field::new("payload", DataType::Utf8, false)]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![first, second]).unwrap();
+        let memory = MemoryBudget::new(50_000);
+        let bytes = crate::WorldPointRow::document_bytes(&batch).unwrap();
+        let expected = status(memory.reserve(4096 + 8 * bytes).unwrap_err());
+        let error = prepare_world_point(&batch, &memory).err().unwrap();
+        assert_eq!((error.code(), error.message()), (expected.code(), expected.message()));
+        assert_eq!(memory.used_bytes(), 0);
     }
 }
