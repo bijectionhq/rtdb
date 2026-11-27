@@ -29,22 +29,6 @@ impl SqlSnapshotView {
         self.timezone.capacity().checked_add(catalog_bound(&self.catalog)?).ok_or_else(size_error)
     }
 
-    pub fn from_exact_partition(
-        current: &QueryContext, snapshot: rtdb_index::Snapshot, current_time: Instant,
-        suffix: Option<Arc<dyn Send + Sync>>,
-        protected_storage: Option<Arc<rtdb_storage::cache::BufferPool>>,
-    ) -> Result<Self> {
-        let mut catalog = current.catalog.clone();
-        let default_database = catalog.default_database.clone();
-        let database = catalog.databases_mut().get_mut(&default_database)
-            .filter(|database| database.partitions.len() == 1)
-            .ok_or_else(|| invalid("snapshot-scope", "An exact partition must replace one admitted partition"))?;
-        database.partitions[0] = snapshot;
-        let original_storage = protected_storage.map(|store| std::mem::replace(&mut database.storage, store));
-        catalog.reset_sql_snapshot_view(suffix, original_storage);
-        Ok(Self { catalog, current_time, timezone: current.timezone.clone() })
-    }
-
     /// The current catalog with each named database's partitions replaced, read at the current clock and zone,
     /// as a redeemed XTDB snapshot token is.
     pub fn from_partitions(current: &QueryContext, partitions: BTreeMap<String, Vec<rtdb_index::Snapshot>>) -> Result<Self> {
@@ -55,7 +39,7 @@ impl SqlSnapshotView {
                 .ok_or_else(|| invalid("snapshot-scope", "A redeemed snapshot must replace admitted partitions"))?;
             database.partitions = replaced;
         }
-        catalog.reset_sql_snapshot_view(None, None);
+        catalog.reset_sql_snapshot_view();
         Ok(Self { catalog, current_time: current.current_time, timezone: current.timezone.clone() })
     }
 }
@@ -187,7 +171,7 @@ impl QueryContext {
             .ok_or_else(|| invalid("wire-cut", "The read requires its captured database"))?;
         let physical = snapshot.catalog_cut().is_some();
         database.partitions = vec![snapshot];
-        catalog.reset_sql_snapshot_view(None, None);
+        catalog.reset_sql_snapshot_view();
         if !physical {
             catalog.runtime = None;
             catalog.ordered_indexes = None;
@@ -435,7 +419,7 @@ mod tests {
     }
 
     #[test]
-    fn relation_lookups_after_an_exact_partition_swap_answer_from_the_new_snapshot() {
+    fn relation_lookups_after_a_partition_swap_answer_from_the_new_snapshot() {
         use rtdb_expr::PgCatalogLookup;
         let memory = MemoryBudget::new(1 << 26);
         let partition = |table: &str| {
@@ -453,7 +437,7 @@ mod tests {
         let before = context.catalog.relation_oid(Some("public"), "before", &scope).unwrap();
         assert!(before.is_some());
 
-        let view = SqlSnapshotView::from_exact_partition(&context, partition("after"), Timestamp(100).into(), None, None).unwrap();
+        let view = SqlSnapshotView::from_partitions(&context, BTreeMap::from([("xtdb".into(), vec![partition("after")])])).unwrap();
         assert_eq!(view.catalog.relation_oid(Some("public"), "before", &scope).unwrap(), None);
         let after = view.catalog.relation_oid(Some("public"), "after", &scope).unwrap().unwrap();
         assert_eq!(view.catalog.relation_name(after, &scope).unwrap().as_deref(), Some("after"));

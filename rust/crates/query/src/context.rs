@@ -66,9 +66,7 @@ pub struct CatalogSnapshot {
     pub(crate) fragment_residence: Option<crate::FragmentResidence>,
     read_lease: Option<Arc<rtdb_storage::ReadLease>>,
     read_view: Arc<tokio::sync::OnceCell<Arc<rtdb_storage::HeldView>>>,
-    snapshot_suffix: Option<Arc<dyn Send + Sync>>,
     delivery_owner: Option<(Arc<dyn Send + Sync>, std::time::Instant)>,
-    resumed_storage_owner: Option<Arc<BufferPool>>,
 }
 
 #[derive(Clone)]
@@ -93,7 +91,7 @@ impl CatalogSnapshot {
         if transaction_scoped && databases.get(&default_database).is_none_or(|database| database.partitions.len() != 1) {
             return Err(invalid("transaction-partition-scope", "An index-time query must contain exactly its resolving partition"));
         }
-        Ok(Self { default_database, databases: Arc::new(databases), transaction_scoped, archive_history: false, owned_relation: None, owned_position_mask: None, owned_transaction_cut: None, owned_read_guard: None, runtime: None, ordered_indexes: None, fragmenter: None, fragment_residence: None, read_lease: None, read_view: Arc::default(), snapshot_suffix: None, delivery_owner: None, resumed_storage_owner: None })
+        Ok(Self { default_database, databases: Arc::new(databases), transaction_scoped, archive_history: false, owned_relation: None, owned_position_mask: None, owned_transaction_cut: None, owned_read_guard: None, runtime: None, ordered_indexes: None, fragmenter: None, fragment_residence: None, read_lease: None, read_view: Arc::default(), delivery_owner: None })
     }
     /// Enable explicit positional control history on a dedicated archive reader.
     pub fn with_archive_history(mut self) -> Self {
@@ -139,21 +137,15 @@ impl CatalogSnapshot {
     pub(crate) fn databases_mut(&mut self) -> &mut BTreeMap<String, DatabaseSnapshot> {
         Arc::make_mut(&mut self.databases)
     }
-    pub(crate) fn reset_sql_snapshot_view(
-        &mut self, suffix: Option<Arc<dyn Send + Sync>>, owner: Option<Arc<BufferPool>>,
-    ) {
+    pub(crate) fn reset_sql_snapshot_view(&mut self) {
         self.read_view = Arc::default();
-        self.snapshot_suffix = suffix;
-        self.resumed_storage_owner = owner;
         self.fragmenter = None;
         self.fragment_residence = None;
     }
     /// Checks the placement that authorized the captured or reconstructed catalog.
     pub fn belongs_to_storage(&self, database: &str, current: &Arc<BufferPool>) -> Result<bool> {
         let captured = self.database(database)?;
-        let owner = self.resumed_storage_owner.as_ref().filter(|_| database == self.default_database)
-            .unwrap_or(&captured.storage);
-        Ok(Arc::ptr_eq(owner, current))
+        Ok(Arc::ptr_eq(&captured.storage, current))
     }
 
     pub(crate) async fn held_view(&self) -> Result<Arc<rtdb_storage::HeldView>> {
@@ -174,7 +166,7 @@ impl CatalogSnapshot {
                     }
                 }
             }
-            let owners = Arc::new((Arc::clone(&self.databases), self.snapshot_suffix.clone(), self.delivery_owner.clone()));
+            let owners = Arc::new((Arc::clone(&self.databases), self.delivery_owner.clone()));
             Ok(Arc::new(rtdb_storage::HeldView::new(owners, admissions)))
         }).await.map(Arc::clone)
     }
