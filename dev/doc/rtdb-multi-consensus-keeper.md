@@ -452,12 +452,22 @@ The provider closure drains an outstanding recorded multipart upload and binds t
 Derivative custody must retain or retire the exact primary cut, derivative object versions and generation keys.
 An assertion erasure report also needs signed settlements from each backup and derivative custodian in its ordered roster.
 
-The installed `fundedReceiverClock` transport supplies authenticated clock observations for the pinned receiver certificate and source incarnation.
-`RTDB_TIMED_ORIGINAL_TRUST_FILE` pins the keeper clock signers used to verify the original accepted append and its cutoff.
-Commission the receiver and keepers on the same guarded clock scale.
-Commissioned funded dispatch also requires an original admission authority that can durably close booking admission for the exact predecessor activation binding and receiver certificate.
-Its closed inventory must be independently readable after restart and identify every issued booking by its original receipt namespace, idempotency key and decision cutoff.
-The recovery operator needs the original terminal decision for each booking, with a matching keeper timed-original proof for accepting appends, before the successor can admit funded work.
+RTDB keeps commissioned funded dispatch fenced pending integration with an original booking issuer.
+Commissioning requires the issuer to be enrolled for the exact activation authority, database, serving binding and receiver certificate. [Original funded admission contract](../../allium/rtdb-multi.allium)
+The installed `fundedReceiverClock` transport supplies clock observations for that certificate and source incarnation.
+`RTDB_TIMED_ORIGINAL_TRUST_FILE` pins the original keeper proof signers, and the receiver and keepers use the same guarded clock scale.
+Give recovery an independently authenticated route to the original issuer and retain the original issuer and keeper verification identities through settlement.
+Read the complete funded scope roster from the original activation decision that closed predecessor grants, including scopes closed before certificate rotation.
+Obtain a durable closure for each scope and enumerate its complete booking inventory, including bookings whose replies were lost.
+Resume from that same closure after a restart or replacement recovery operation.
+Reconcile each booking with its original terminal disposition and verify the original keeper proof of every accepting append, including an accepted appointment activation followed by a refusal.
+Keep successor funded admission closed until the original evidence settles every booking.
+
+Bijection's managed inbox records a slot by commit label and scheduled reading, then binds it in the transaction that records the call's receipt. [Slot offer](https://github.com/bijectionhq/bijection/blob/56843bdd7c095fd209c3ea74e03b95eaa146b140/crates/kernel/src/pipeline/mod.rs#L5641-L5684) [Receipt binding](https://github.com/bijectionhq/bijection/blob/56843bdd7c095fd209c3ea74e03b95eaa146b140/crates/kernel/src/pipeline/mod.rs#L5858-L5898)
+If the slot offer commits and its reply is lost before receipt binding, a retry chooses from the current store time and can select a new slot.
+RTDB's original issuer must recover the exact same booking by request identity in that case.
+Bijection's managed RTDB placement issuer mints version 6 writer-fence and version 7 first-placement provisioning grants. [Placement grant roles](https://github.com/bijectionhq/bijection/blob/56843bdd7c095fd209c3ea74e03b95eaa146b140/crates/cell_catalog/src/catalog/managed_workload.rs#L251-L285)
+Managed funded appointments require an enrolled issuer for the version 2 funded-appointment grant. [Funded appointment contract](rtdb-v1.allium)
 
 A hosted qualification requires a named non-production allocation with scoped object and key provider credentials, an independent activation quorum, and separate reader, operator and custodian identities.
 Drive the same recovery through lost replies and process restart, prove the selected versions and keys stay usable with the verifier offline, and verify that supersession or publication settles only the selected operation's hold.

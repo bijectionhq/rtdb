@@ -472,6 +472,34 @@ contract RecoveryJournalCustody {
         -- The custodian releases only the matching hold after an authoritative publication or supersession.
 }
 
+contract OriginalFundedAdmission {
+    @invariant IssuerOwnsBooking
+        -- Commissioning enrolls an original booking issuer for an exact activation authority, database name, serving binding and receiver certificate.
+        -- The activation authority retains the complete roster of issuer and certificate scopes enrolled for that binding through recovery, including scopes closed before certificate rotation.
+        -- The issuer authorizes the start of a funded command under its open commissioned scope.
+        -- The issuer durably orders each booking before returning its receipt or authorizing its accepting appends.
+        -- The booking carries the original receipt namespace, idempotency key, authenticated owner, predecessor basis, canonical request or appointment intent digest, and exclusive decision and journal cutoffs.
+        -- Exact retries recover the same booking and ordered stages, and a changed request for the same stage conflicts.
+        -- The issuer authenticates booking authority, the receiver authenticates clock evidence, and the original journal quorum authenticates timed appends.
+
+    @invariant ClosureFixesTheInventory
+        -- The matching activation decision closing predecessor grants fixes the scope roster and authorizes each issuer closure.
+        -- Each original issuer durably closes its funded scopes under that binding against new bookings and new authorizations for accepting appends.
+        -- Each scope closure authenticates a complete immutable inventory of the bookings ordered before it, including bookings whose replies were lost.
+        -- Recovery can resume enumeration against the same closure after issuer restart or recovery operation replacement.
+        -- A closure can be recorded while earlier authorized work still awaits a terminal decision.
+
+    @invariant SettlementUsesOriginalEvidence
+        -- The original issuer returns one durable terminal disposition for each inventoried booking under its original identity.
+        -- For each accepting append, the verifier checks the original keeper proof for its exact stream, writer epoch, position, payload digest, receiver certificate and exclusive journal cutoff.
+        -- An accepted appointment activation retains its original proof even when the final appointment disposition is a refusal.
+        -- A terminal refusal requires original evidence excluding an earlier accepting quorum and a fence against any later acceptance of that stage.
+        -- Expiry removes the right to start a new acceptance and leaves an earlier possible acceptance unresolved until the original authorities determine its outcome.
+        -- RTDB verifies every predecessor scope closure against its enrolled issuer and reconciles the complete inventories before the successor advertises or admits commissioned funded work.
+        -- A retained RTDB recovery record binds the verified original issuer evidence to its booking and scope.
+        -- A successor uses its own commissioned scope and preserves the original booking identity for retry and outcome lookup.
+}
+
 contract Directory {
     -- A cell's linearizable, transactional, sharded key-value store.
     -- Holds deployment records and member records.
@@ -1100,7 +1128,7 @@ contract FencedStreamWriter {
         -- Refuse returns the unsent suffix for redecision against the refused state.
 
     @invariant ActivationEffectAdmission
-        -- A commissioned incarnation requires funded effect authority before contacting the receiver clock for a funded command.
+        -- A commissioned incarnation requires start authorization under OriginalFundedAdmission before contacting the receiver clock for a funded command.
         -- A commissioned incarnation requires derivative custody authority before staging or publishing a ranked catalogue.
 
     @invariant SpeculativeWriteSuffix
@@ -4559,6 +4587,8 @@ surface TerminalStorageMaintenance {
 ------------------------------------------------------------
 -- Open Questions
 ------------------------------------------------------------
+
+open question "Which original funded issuer will be installed, and how will RTDB enroll and authenticate its admission, closure and terminal evidence?"
 
 open question "What does an idle RTDB database cost in memory today, and what is the least it can be made to cost?"
     -- resident_idle_target_bytes is a target, not a measurement.
