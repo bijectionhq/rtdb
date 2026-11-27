@@ -85,6 +85,8 @@ enum Action {
         hold: rtdb_crypt::RecoveryKeyHold,
         head: journal_contract::Lsn,
         anchor: Option<journal_contract::CheckpointAnchor>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        object_namespace: Option<rtdb_types::S3ObjectNamespace>,
     },
     Bootstrap {
         incarnation: Uuid,
@@ -178,6 +180,8 @@ struct JournalReader {
     journal_tls_dir: PathBuf,
     #[serde(default)]
     require_object_custody: bool,
+    #[serde(default)]
+    object_namespace: Option<rtdb_types::S3ObjectNamespace>,
 }
 
 impl JournalReader {
@@ -611,7 +615,7 @@ impl Request {
                 return ranked.outcomes(authority, &database, predecessor, None, after).await;
             }
             #[cfg(all(unix, feature = "backup-object-holds"))]
-            Action::AuthorizeAbandonedAcquisition { intent, hold, head, anchor } => {
+            Action::AuthorizeAbandonedAcquisition { intent, hold, head, anchor, object_namespace } => {
                 use recovery::CustodySettlement;
                 let cell = intent.cell.ok_or_else(super::conflict)?;
                 let candidate = intent.candidate()?;
@@ -622,7 +626,14 @@ impl Request {
                 {
                     return Err(super::conflict());
                 }
-                let reader = journals.get(&cell).ok_or_else(super::configuration)?.connect()?;
+                let reader = journals.get(&cell).ok_or_else(super::configuration)?;
+                if let Some(namespace) = object_namespace.as_ref()
+                    && (!reader.require_object_custody || reader.object_namespace.as_ref() != Some(namespace))
+                {
+                    return Err(Anomaly::incorrect("rtdb/activation-custody-allocation",
+                        "The acquisition plan must come from the object allocation enrolled for its destination cell"));
+                }
+                let reader = reader.connect()?;
                 let selected = reader.selected_for_abandonment(candidate, head, anchor).await?;
                 return serde_json::to_value(selected.retained(hold)).map_err(|_| super::conflict());
             }
@@ -767,10 +778,11 @@ pub(in crate::multi) async fn authorize_object_release(
 pub(in crate::multi) async fn authorize_abandoned_acquisition(
     socket: &std::path::Path, intent: Intent, hold: rtdb_crypt::RecoveryKeyHold,
     head: journal_contract::Lsn, anchor: Option<journal_contract::CheckpointAnchor>,
+    object_namespace: Option<rtdb_types::S3ObjectNamespace>,
 ) -> Result<super::journal_custody::RetainedJournal> {
     let response = broker::call(socket, Request {
         database: intent.database.clone(),
-        action: Action::AuthorizeAbandonedAcquisition { intent, hold, head, anchor },
+        action: Action::AuthorizeAbandonedAcquisition { intent, hold, head, anchor, object_namespace },
     }).await?;
     serde_json::from_value(response).map_err(|_| super::conflict())
 }

@@ -38,7 +38,8 @@ Usage: rtdb multi-backup export --data DIR --archive FILE [--journal-url URL --t
                     --readback FILE --stage-receipt FILE --attestation-signing-key PKCS8 --journal-custodian-tls-dir DIR
        rtdb multi-backup release-object-holds --readback FILE --installation-proof FILE --authority-socket PATH
                     --bucket BUCKET [--region REGION] [--s3-endpoint URL]
-       rtdb multi-backup abandon-object-acquisition --stage-receipt FILE --authority-socket PATH
+       rtdb multi-backup abandon-object-acquisition --authority-socket PATH
+                    (--stage-receipt FILE | --authority-id UUID --incarnation UUID)
                     --journal-url URL --journal-custodian-tls-dir DIR --key-vault DIR
                     --bucket BUCKET [--region REGION] [--s3-endpoint URL]
 Export and restore operate on stopped, local RTDB Multi development data.

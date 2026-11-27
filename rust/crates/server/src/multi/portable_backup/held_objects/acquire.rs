@@ -3,7 +3,7 @@ use rtdb_s3::VersionedInventory;
 use rtdb_storage::{Error, ObjectKey, remote::decode_provider_key};
 
 use super::*;
-use crate::multi::activation::ActivationAuthority;
+use crate::multi::activation::{ActivationAuthority, operator::attestation};
 
 #[cfg(unix)]
 mod abandon;
@@ -19,6 +19,8 @@ pub(in super::super) struct Acquirer(Verifier);
 #[serde(deny_unknown_fields)]
 struct HoldPlan {
     key_hold: RecoveryKeyHold,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    intent: Option<attestation::Intent>,
     journal_head: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     journal_anchor: Option<journal_contract::CheckpointAnchor>,
@@ -70,7 +72,7 @@ impl Acquirer {
             return Err(invalid_plan());
         }
         let key_hold = receipt.key_hold;
-        let plan_key = acquisition_key(key_hold, "acquisition")?;
+        let plan_key = acquisition_key(key_hold.authority, key_hold.generation.database)?;
         let saved = read_plan(store.as_ref(), &plan_key).await?;
         if saved.as_ref().is_some_and(|plan| plan.key_hold != key_hold) {
             return Err(invalid_plan());
@@ -87,6 +89,7 @@ impl Acquirer {
         let journal_anchor = observed.journal_anchor.ok_or_else(invalid_plan)?;
         let plan = HoldPlan {
             key_hold,
+            intent: saved.as_ref().is_none_or(|plan| plan.intent.is_some()).then(|| receipt.intent.clone()),
             journal_head: observed.journal_head.0,
             journal_anchor: saved.as_ref().is_none_or(|plan| plan.journal_anchor.is_some()).then_some(journal_anchor),
             checkpoint: observed.checkpoint.to_string(),
@@ -159,8 +162,8 @@ impl HoldPlan {
     }
 }
 
-fn acquisition_key(hold: RecoveryKeyHold, entry: &str) -> Result<ObjectKey> {
-    Ok(ObjectKey::new(format!("recovery-custody/{}/{}/{entry}", hold.authority, hold.generation.database))?)
+fn acquisition_key(authority: Uuid, candidate: Uuid) -> Result<ObjectKey> {
+    Ok(ObjectKey::new(format!("recovery-custody/{authority}/{candidate}/acquisition"))?)
 }
 
 async fn read_plan(store: &dyn ObjectStore, key: &ObjectKey) -> Result<Option<HoldPlan>> {

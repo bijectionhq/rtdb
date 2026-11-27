@@ -655,6 +655,7 @@ mod tests {
             "destination_attestors": {(cell.to_string()): attestor_public_key},
             "destination_journal_readers": {(cell.to_string()): {
                 "journal_url": journal_url, "journal_tls_dir": reader_tls, "require_object_custody": true,
+                "object_namespace": receipt["object_namespace"],
             }},
         })).unwrap()).unwrap();
         fs::set_permissions(&broker_config, fs::Permissions::from_mode(0o600)).unwrap();
@@ -770,16 +771,21 @@ mod tests {
         release().await.unwrap();
         assert!(verify(Some(&readback), &receipt_path).await.is_err());
         assert_eq!(journal.head(stream).await.unwrap(), head);
-        let abandon_from = |receipt: &Path, key_vault: &Path| MultiBackupOptions::parse([
-            "abandon-object-acquisition".into(), "--stage-receipt".into(), receipt.display().to_string(),
+        let abandon_from = |selection: Vec<String>, key_vault: &Path| MultiBackupOptions::parse([
+            "abandon-object-acquisition".into(),
             "--authority-socket".into(), socket.display().to_string(),
             "--journal-url".into(), journal_url.clone(),
             "--journal-custodian-tls-dir".into(), custodian_tls.display().to_string(),
             "--key-vault".into(), key_vault.display().to_string(),
             "--bucket".into(), bucket.clone(), "--region".into(), "us-east-1".into(),
             "--s3-endpoint".into(), endpoint.clone(),
-        ].into_iter()).unwrap().run(rtdb_storage::AppleSync::Full);
-        let abandon = |receipt: &Path| abandon_from(receipt, &vault);
+        ].into_iter().chain(selection)).unwrap().run(rtdb_storage::AppleSync::Full);
+        let abandon = |receipt: &Path| abandon_from(vec![
+            "--stage-receipt".into(), receipt.display().to_string(),
+        ], &vault);
+        let discover = |candidate: Uuid, key_vault: &Path| abandon_from(vec![
+            "--authority-id".into(), authority.to_string(), "--incarnation".into(), candidate.to_string(),
+        ], key_vault);
         let settling_operation = replacement_intent.operation;
         let Status::Pending { candidate: abandoned, .. } = activation.recovery_status(DATABASE, settling_operation).await.unwrap()
         else { panic!("expected the staged recovery"); };
@@ -795,6 +801,7 @@ mod tests {
         aws("put-object", &["--key", &older.key, "--body", retry_bytes.to_str().unwrap()]);
         let document = acquire(abandoned, &abandoned_receipt).await.unwrap();
         let plan: Readback = serde_json::from_value(document).unwrap();
+        let stage_evidence: staged::StageReceipt = read_receipt(&abandoned_receipt, 4096).unwrap();
         let journal_stream = journal_contract::StreamId(abandoned.as_u128());
         assert!(reader.journal.checkpoint_custody(journal_stream).await.unwrap().is_none());
         assert!(abandon(&abandoned_receipt).await.is_err());
@@ -812,14 +819,22 @@ mod tests {
             ..replacement_intent
         };
         activation.begin_recovery(DATABASE, serving_intent, Some(settling_operation.operation_id)).await.unwrap();
+        let mut unrelated_namespace = stage_evidence.object_namespace.unwrap();
+        unrelated_namespace.bucket = "uncommissioned-staging".into();
+        let substituted = crate::multi::activation::operator::authorize_abandoned_acquisition(
+            &socket, stage_evidence.intent, stage_evidence.key_hold, journal_contract::Lsn(plan.journal_head), None, Some(unrelated_namespace),
+        ).await.unwrap_err();
+        assert_eq!(substituted.code, "rtdb/activation-custody-allocation");
+        assert!(reader.journal.checkpoint_custody(journal_stream).await.unwrap().is_none());
+        fs::remove_file(&abandoned_receipt).unwrap();
         let empty_vault = home.path().join("empty-custody-vault");
         FileKms::create_directory(&empty_vault).unwrap();
-        assert!(abandon_from(&abandoned_receipt, &empty_vault).await.is_err());
+        assert!(discover(abandoned, &empty_vault).await.is_err());
         let original_keys = FileKms::open(&vault, || SystemClock.now().0).unwrap();
         original_keys.require_recovery_key(plan.key_hold.unwrap()).await.unwrap();
-        let abandoned_result = abandon(&abandoned_receipt).await.unwrap();
+        let abandoned_result = discover(abandoned, &vault).await.unwrap();
         assert_eq!(abandoned_result["retired_versions"], plan.held_versions.len());
-        assert_eq!(abandon(&abandoned_receipt).await.unwrap(), abandoned_result);
+        assert_eq!(discover(abandoned, &vault).await.unwrap(), abandoned_result);
         assert_eq!(observe_hold(&unrelated)["LegalHold"]["Status"], "ON");
         for version in &plan.held_versions {
             let listed = aws("list-object-versions", &["--prefix", &version.key]);
@@ -928,7 +943,7 @@ mod tests {
         }
         let archive_digest: [u8; 32] = Sha256::digest(&archive).into();
         assert_eq!(serving.installed_backup().await.unwrap().unwrap().manifest_sha256(), archive_digest);
-        assert_eq!(abandon(&abandoned_receipt).await.unwrap(), abandoned_result);
+        assert_eq!(discover(abandoned, &vault).await.unwrap(), abandoned_result);
         broker.abort();
         assert!(broker.await.unwrap_err().is_cancelled());
         let completion = format!("multi/recovery-custody/{authority}/{incarnation}/released");

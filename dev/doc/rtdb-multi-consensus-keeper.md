@@ -346,16 +346,21 @@ Give it the stage receipt and configure the independent activation reader used f
 Acquisition requires the original S3 namespace in that receipt.
 For an earlier receipt without that namespace, rerun `stage` against the original allocation while the recovery is pending.
 Acquisition authenticates the staged checkpoint, files and token key envelope and records their exact versions before applying legal holds.
+The saved acquisition plan also carries the original activation intent.
 Use the same settings and stage receipt to retry a partial acquisition.
 The command reopens the recorded versions on retry and returns the verified readback after the original provider confirms every hold.
 Keep current-name visibility on the held versions for the later `attest` step.
 Finish acquisition and save the signed installation proof before recording the installation.
 To settle an acquisition interrupted before attestation, first supersede the candidate in the activation authority.
 Run `rtdb multi-backup abandon-object-acquisition --stage-receipt FILE --authority-socket PATH --journal-url URL --journal-custodian-tls-dir DIR --key-vault DIR --bucket BUCKET` with the original destination providers.
+To recover a saved acquisition when the local stage receipt is lost, configure the destination's `object_namespace` in the broker's `destination_journal_readers` entry with `require_object_custody` enabled.
+Use the bucket, endpoint and region reported in the stage receipt for the commissioned allocation.
+Run the same command with `--authority-id UUID --incarnation UUID` in place of `--stage-receipt FILE` to load the plan from that allocation.
+Plans created before the original intent was recorded still require the stage receipt.
 The original activation broker verifies abandonment and the destination journal selection on each attempt.
 The command settles the keeper's exact checkpoint hold, deletes the exact planned S3 versions, verifies their absence, and releases the held key generation.
 The S3 custodian needs version listing, legal-hold read and write access, `s3:DeleteObjectVersion`, and conditional writes for tombstones that keep older versions hidden.
-Use the same stage receipt and provider settings to retry a partial settlement.
+Use the same acquisition identity and provider settings to retry a partial settlement.
 Before advancing the binding again, the activation authority archives the previous recovery publication in its own immutable journal.
 The broker can use that publication to settle older acquisitions after activation compaction.
 The custodian owns the create-only `multi/recovery-custody/` ledger prefix and needs to read its records, with absence distinguishable from denied access.

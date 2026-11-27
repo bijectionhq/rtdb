@@ -1259,6 +1259,8 @@ contract PortableApplicationBackup {
         -- A retained publication identifies the original chosen recovery and settles the disposition of other candidates derived from the same predecessor.
         -- For an interrupted acquisition, the broker confirms the selected checkpoint with the custodian enrolled for the destination cell.
         -- Interrupted acquisition settlement obtains authorization from the activation broker on every attempt and uses the recorded version plan.
+        -- The original custodian keeps the activation intent with the plan so settlement can discover it after the stage receipt is lost.
+        -- Receipt-free discovery requires the broker to match the original object allocation enrolled for the destination cell.
         -- The original keeper records a terminal checkpoint custody disposition even when attestation never acquired its hold.
         -- The original object provider confirms every version in the interrupted acquisition's plan is absent before the vault releases its generation hold.
         -- A conditional tombstone keeps any older version hidden when the current version is retired.
