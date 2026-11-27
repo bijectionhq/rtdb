@@ -2015,3 +2015,45 @@ async fn show_transaction_isolation_reads_session_parameter_unlike_isolation_lev
     drop(client);
     running.stop().await;
 }
+
+#[tokio::test]
+async fn startup_sends_default_application_name_before_server_parameters() {
+    async fn connect_params(server: &ServerHandle, extra: &[(&str, &str)]) -> (Client, Vec<(String, String)>) {
+        let mut stream = TcpStream::connect(server.address()).await.unwrap();
+        let mut bytes = 196608i32.to_be_bytes().to_vec();
+        for (key, value) in [("user", "xtdb"), ("database", "xtdb")].into_iter().chain(extra.iter().copied()) {
+            bytes.extend_from_slice(&cstring(key));
+            bytes.extend_from_slice(&cstring(value));
+        }
+        bytes.push(0);
+        stream.write_i32((bytes.len() + 4) as i32).await.unwrap();
+        stream.write_all(&bytes).await.unwrap();
+        let mut client = Client { stream, process: 0 };
+        let frames = client.through(b'Z').await;
+        assert_eq!(frames[0], (b'R', 0i32.to_be_bytes().to_vec()));
+        let params: Vec<(String, String)> = frames.iter().filter(|(tag, _)| *tag == b'S').map(|(_, body)| {
+            let mut parts = body.split(|&byte| byte == 0);
+            let key = std::str::from_utf8(parts.next().unwrap()).unwrap().to_owned();
+            let value = std::str::from_utf8(parts.next().unwrap()).unwrap().to_owned();
+            (key, value)
+        }).collect();
+        (client, params)
+    }
+
+    let running = Running::start(ServerConfig::default(), None).await;
+    let (mut default_client, default_params) = connect_params(&running.server, &[("TimeZone", "+00:00")]).await;
+    assert_eq!(default_params.first().map(|(k, v)| (k.as_str(), v.as_str())), Some(("application_name", "XTDB PGWire")));
+    assert_eq!(default_params.iter().filter(|(k, _)| k == "application_name").count(), 1);
+    assert!(default_params.iter().any(|(k, v)| k == "TimeZone" && v == "Z"), "{default_params:?}");
+
+    let discard = default_client.query("DISCARD ALL").await;
+    assert!(!discard.iter().any(|(tag, body)| *tag == b'S' && body.starts_with(b"application_name\0")));
+
+    let (custom_client, custom_params) = connect_params(&running.server, &[("application_name", "custom-client")]).await;
+    let custom_apps: Vec<(&str, &str)> = custom_params.iter().filter(|(k, _)| k == "application_name").map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    assert_eq!(custom_apps, [("application_name", "custom-client")]);
+    assert!(!custom_params.iter().any(|(_, v)| v == "XTDB PGWire"));
+
+    drop((default_client, custom_client));
+    running.stop().await;
+}
