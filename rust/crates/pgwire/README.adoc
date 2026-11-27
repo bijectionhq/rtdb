@@ -72,6 +72,7 @@ Interactive DML warning planning is best-effort and is skipped when the client s
 DML, BEGIN, and SET TRANSACTION parameter descriptions retain the supplied OID list.
 Query and EXECUTE descriptions use their planned placeholder count, describing unspecified parameters as text and truncating excess OIDs.
 SHOW describes zero parameters, and other classic controls describe only NoData.
+Describing a prepared COPY FROM STDIN returns an empty ParameterDescription followed by NoData.
 BEGIN, SET TRANSACTION, SET TIME ZONE, and SET AWAIT_TOKEN use the OID list supplied in Parse when decoding non-null Bind arguments.
 OID zero decodes as text, and a missing OID for one of these arguments reports the reference's `XX000` error.
 The keyword probe always describes and sends text.

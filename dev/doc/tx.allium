@@ -1774,6 +1774,7 @@ surface PgwireTxControl {
 
     @guarantee CopyInputRespectsListenerAndSync
         -- A read-only listener refuses COPY input before accepting bytes.
+        -- Describing a prepared COPY input command reports zero parameters and no result columns.
         -- Extended COPY can stream input and ignores Sync until the transfer ends.
         -- The next Sync completes the extended query cycle.
 }

@@ -781,6 +781,7 @@ async fn describe_sends_parameter_oids_only_for_the_reference_statement_kinds() 
         ("control_extra", "SET TIME ZONE 'UTC'", vec![25], None, b'n'),
         ("begin", "BEGIN", vec![23], Some(vec![23]), b'n'),
         ("set_tx", "SET TRANSACTION READ ONLY", vec![23], Some(vec![23]), b'n'),
+        ("copy_input", "COPY docs FROM STDIN WITH (FORMAT 'transit-json')", vec![], Some(vec![]), b'n'),
         ("show", "SHOW TIME ZONE", vec![23], Some(vec![]), b'T'),
         ("query_extra", "SELECT $1 AS value", vec![23, 999_999], Some(vec![23]), b'T'),
         ("query_missing", "SELECT $2 AS value", vec![23], Some(vec![23, 25]), b'T'),

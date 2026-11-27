@@ -65,6 +65,7 @@ impl Prepared {
             Some(PreparedKind::Control(control)) => matches!(
                 control.statement(),
                 ControlStatement::Begin(_) | ControlStatement::SetTransaction(_) | ControlStatement::Execute { .. }
+                    | ControlStatement::CopyIn { .. }
             ) || control.statement().is_show(),
             _ => false,
         }
@@ -1057,6 +1058,7 @@ fn control_shape(control: PreparedControl, declared_parameters: usize) -> Result
     let statement = control.statement();
     let parameter_count = match statement {
         ControlStatement::Execute { .. } => statement.parameter_count(),
+        ControlStatement::CopyIn { .. } => 0,
         statement if statement.is_show() => 0,
         _ => declared_parameters,
     };
