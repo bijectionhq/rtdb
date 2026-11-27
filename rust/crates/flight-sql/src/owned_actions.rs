@@ -5979,6 +5979,7 @@ fn world_write(
     let shadow = match (operation, payload) {
         ("delete", Value::Null) => WorldShadow::Deleted,
         ("replace" | "insert", Value::Struct(mut fields)) => {
+            let input_fields = fields.len();
             strip_owned_absence(&mut fields)?;
             if let Some(slots) = fields.remove("_ordered_micros") {
                 ordered_keys = match slots {
@@ -5990,13 +5991,75 @@ fn world_write(
             if fields.keys().any(|name| name.starts_with('_')) {
                 return Err(invalid("Owned world fact contains a reserved field"));
             }
-            let mut fact = StructFields::from([("_id".into(), id.as_value())]);
-            fact.extend(fields);
-            WorldShadow::Present(fact)
+            if !fields.is_empty() && fields.len() == input_fields {
+                fields.shift_insert(0, "_id".into(), id.as_value());
+            } else {
+                let mut fact = StructFields::from([("_id".into(), id.as_value())]);
+                fact.extend(fields);
+                fields = fact;
+            }
+            WorldShadow::Present(fields)
         }
         _ => return Err(invalid("Owned world writes require a complete fact or a null deletion")),
     };
     Ok(rtdb_node::OwnedWorldWrite { relation: relation.clone(), id, shadow, valid, create_only, ordered_keys })
+}
+
+#[test]
+fn world_shadow_reuses_plain_facts_at_the_legacy_retained_size() {
+    use rtdb_types::WorldShadow;
+
+    let relation = OwnedRelation::new("facts").unwrap();
+    let id = EntityId::Integer(-42);
+    for count in 0..=64 {
+        let fact_fields = || {
+            let mut fields = StructFields::new();
+            for index in 0..count {
+                fields.insert(format!("field_{index}"), Value::Utf8("payload".into()));
+            }
+            fields
+        };
+        let mut legacy = StructFields::from([("_id".into(), id.as_value())]);
+        legacy.extend(fact_fields());
+        let legacy = WorldShadow::Present(legacy);
+        let fields = fact_fields();
+        let decoded_map = std::ptr::from_ref(&*fields);
+        let local = world_write(&relation, id.clone(), "replace", None, None, Value::Struct(fields), false).unwrap().shadow;
+        let WorldShadow::Present(local_fields) = &local else { panic!("expected a present fact"); };
+        if count > 0 {
+            assert_eq!(std::ptr::from_ref(&**local_fields), decoded_map);
+        }
+        assert_eq!(local.allocation_bound().unwrap(), legacy.allocation_bound().unwrap());
+        let local = local.record(&id).unwrap();
+        let legacy = legacy.record(&id).unwrap();
+        assert_eq!(local.keys().collect::<Vec<_>>(), legacy.keys().collect::<Vec<_>>());
+        assert_eq!(local, legacy);
+        assert_eq!(Value::document_retained_bytes(&local).unwrap(), Value::document_retained_bytes(&legacy).unwrap());
+    }
+}
+
+#[test]
+fn world_shadow_preserves_normalized_field_order_and_explicit_nulls() {
+    let relation = OwnedRelation::new("facts").unwrap();
+    let id = EntityId::Integer(-42);
+    let fact = Value::Struct(StructFields::from([
+        ("z".into(), Value::Utf8("payload".into())),
+        ("omitted".into(), Value::Undefined),
+        ("_absent".into(), Value::list(vec![Value::Utf8("omitted".into())])),
+        ("a".into(), Value::Null),
+        ("_ordered_micros".into(), Value::Binary(vec![3, 4])),
+    ]));
+    let write = world_write(&relation, id.clone(), "insert", None, None, fact, true).unwrap();
+    assert!(write.create_only);
+    assert_eq!(write.ordered_keys, Some(vec![3, 4]));
+    let row = write.shadow.record(&id).unwrap();
+    assert_eq!(row.keys().map(String::as_str).collect::<Vec<_>>(), ["_id", "z", "a", "_world_fields"]);
+    assert_eq!(row.get("_id"), Some(&id.as_value()));
+    assert_eq!(row.get("z"), Some(&Value::Utf8("payload".into())));
+    assert_eq!(row.get("a"), Some(&Value::Null));
+    assert_eq!(row.get("_world_fields"), Some(&Value::list(vec![
+        Value::Utf8("z".into()), Value::Utf8("a".into()),
+    ])));
 }
 
 #[test]
