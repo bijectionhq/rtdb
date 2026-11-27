@@ -736,6 +736,9 @@ value CommitOpts {
     --                   An earlier or equal time aborts with invalid-system-time.
     --                   Without one, system time is the append observation, or one tick past the preceding value when the observation does not exceed it.
     --   user_metadata — per-transaction metadata.
+    --                   When every present metadata child is admitted by the destination layout, a JVM source receipt copies those children from their Arrow positions.
+    --                   Day-resolution dates retain their signed epoch-day values.
+    --                   A null-only top-level child leaves the corresponding receipt field absent for that row.
     --                   New source-log and external submissions project user metadata in xt.txs until the installed receipt clock reaches one hour after admission.
     --                   A reusable SQL retry key has separate stored receipt identities for separate hour buckets.
     --                   Lookup covers the current and previous buckets and checks the exclusive expiry.

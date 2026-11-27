@@ -313,7 +313,7 @@ private fun Vector.isDirectMetadata(): Boolean {
         }
         is Utf8Vector -> (0 until valueCount).all { UnsafeByteOperations.unsafeWrap(getBytes(it)).isValidUtf8 }
         is BitVector, is ByteVector, is ShortVector, is IntVector, is LongVector,
-        is FloatVector, is DoubleVector, is VarBinaryVector, is UuidVector -> true
+        is FloatVector, is DoubleVector, is VarBinaryVector, is UuidVector, is DateDayVector -> true
         else -> false
     }
 }
@@ -332,10 +332,20 @@ private fun Vector.matchesMetadataDestination(dest: VectorWriter?): Boolean {
 }
 
 internal fun sourceUserMetadataWriter(source: Vector?): (VectorWriter) -> Unit {
-    if (source is StructVector && source.valueCount == 1 && !source.isNull(0) && source.isDirectMetadata()) {
-        return { dest ->
-            if (source.matchesMetadataDestination(dest)) dest.appendRange(source, 0, 1)
-            else dest.writeObject(source.getObject(0))
+    if (source is StructVector && source.valueCount == 1 && !source.isNull(0)) {
+        // A null-only field is omitted by the struct object reader, so it cannot declare a receipt field.
+        val children = source.vectors.filterNot { it is NullVector }
+        if (children.all { !it.nullable && it.isDirectMetadata() }) {
+            return { dest ->
+                if (dest is StructVector && children.all { it.matchesMetadataDestination(dest.vectorForOrNull(it.name)) }) {
+                    for (child in children) {
+                        dest.vectorFor(child.name, child.arrowType, false).appendRange(child, 0, 1)
+                    }
+                    dest.endStruct()
+                } else {
+                    dest.writeObject(source.getObject(0))
+                }
+            }
         }
     }
 
