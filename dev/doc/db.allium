@@ -2500,7 +2500,10 @@ surface QueryAccess {
         -- List aggregates collect selected Arrow positions after applying filters and distinctness, and sort Arrow keys in memory when the aggregate specifies an order.
         -- Percentile aggregates order each group's selected nonnull positions in memory or through the spilling sort path.
         -- Compatible fixed-width percentile keys can be compared at their Arrow positions.
+        -- Compatible mixed-layout percentile keys can use the shared ordered reader or compare numeric cells in the ordered numeric comparator's precision.
         -- Discrete percentiles can copy compatible fixed-width winners directly to nullable Arrow results, with the selected values' exact types and bits.
+        -- A compatible mixed-layout discrete result can retain the selected Arrow positions under their source owners.
+        -- Decimal precision is checked for the winners of a discrete percentile.
         -- Continuous percentiles interpolate compatible numeric operands into a nullable Arrow result.
         -- A compatible scalar membership join indexes the build key vectors and appends nullable Boolean marks to the probe batches.
         -- Scalar membership uses the raw vector hash to select candidates before comparing them.

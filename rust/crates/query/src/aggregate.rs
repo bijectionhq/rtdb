@@ -647,6 +647,7 @@ fn direct_rank_type(ty: &LogicalType) -> bool {
 enum PercentileKey {
     Native(NativeKeyKind),
     Decimal,
+    Number,
 }
 
 impl PercentileKey {
@@ -701,12 +702,76 @@ impl PercentileKey {
         rtdb_columnar::decimal_cell_as_f64(field, array, row)
     }
 
+    fn compatible(ty: &LogicalType, batches: &[ColumnBatch]) -> Option<Self> {
+        if let Some(kind) = NativeKeyKind::of(ty)
+            && batches.iter().all(|batch| {
+                let column = &batch.columns[0];
+                admits_reduction_column(column, |field, logical| {
+                    !matches!(field.data_type(), DataType::Union(..))
+                        && logical.is_none_or(|ty| crate::columnar::stable_read_layout(ty, field))
+                }) && kind.accepts(column)
+            })
+        {
+            return Some(Self::Native(kind));
+        }
+        if ty.legs().iter().all(|ty| matches!(ty, LogicalType::Null | LogicalType::Scalar(
+            ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64
+            | ScalarType::U8 | ScalarType::U16 | ScalarType::U32 | ScalarType::U64
+            | ScalarType::F32 | ScalarType::F64 | ScalarType::Decimal { .. }
+        ))) && batches.iter().all(|batch| admits_reduction_column(&batch.columns[0], |field, logical| {
+            NumericColumn::admits_leaf(field, logical, None) || decimal_leaf(field, logical)
+        })) {
+            return Some(Self::Number);
+        }
+        None
+    }
+
+    fn number((column, row): (&Column, usize)) -> Result<NumericCell> {
+        let Some(cell) = present_column_position(column, row)? else {
+            return Err(invalid("percentile-input", "A ranked numeric cell must be present"));
+        };
+        if decimal_storage(cell.field.data_type()) {
+            return Ok(NumericCell::Float64(rtdb_columnar::decimal_cell_as_f64(cell.field, cell.array, cell.row)?));
+        }
+        NumericCell::read_arrow(cell)
+    }
+
     fn compare(&self, left: (&Column, usize), right: (&Column, usize)) -> Result<Ordering> {
         match self {
             Self::Native(kind) => kind.compare(left, right, false, false),
             Self::Decimal => Ok(Self::decimal(left)?.total_cmp(&Self::decimal(right)?)),
+            Self::Number => Self::number(left)?.key().ordered_compare(Self::number(right)?.key())
+                .ok_or_else(|| invalid("percentile-input", "Expected two numeric rank keys")),
         }
     }
+}
+
+fn admits_discrete_winners(ty: &LogicalType, batches: &[ColumnBatch]) -> bool {
+    let legs = ty.legs();
+    let accepts = |array: &dyn Array, field: &ArrowField, logical: Option<&LogicalType>| {
+        if array.data_type() != field.data_type() { return false; }
+        let Ok(actual) = rtdb_columnar::from_field(field) else { return false; };
+        if logical.is_some_and(|ty| *ty != actual) { return false; }
+        let scalar = without_nullability(&actual);
+        if *scalar == LogicalType::Null { return field.is_nullable(); }
+        if !legs.contains(scalar) || !matches!(scalar, LogicalType::Scalar(
+            ScalarType::Bool | ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64
+            | ScalarType::F32 | ScalarType::F64 | ScalarType::Utf8 | ScalarType::Binary
+            | ScalarType::Keyword | ScalarType::FixedSizeBinary(_) | ScalarType::Uuid
+            | ScalarType::DateDay | ScalarType::DateMilli | ScalarType::Timestamp { .. }
+            | ScalarType::Time { .. } | ScalarType::Duration(_) | ScalarType::Decimal { .. }
+            | ScalarType::Interval(rtdb_types::IntervalUnit::YearMonth)
+        )) {
+            return false;
+        }
+        rtdb_columnar::to_field(field.name(), &actual)
+            .is_ok_and(|expected| expected.data_type() == field.data_type() && expected.metadata() == field.metadata())
+    };
+    !batches.is_empty() && batches.iter().all(|batch| match &batch.columns[0] {
+        Column::Arrow { array, field, logical } => accepts(array.as_ref(), field, logical.as_ref()),
+        Column::Selected(selected) => selected.source_layouts().all(|(array, field, logical)| accepts(array, field, logical)),
+        Column::Values(_) => false,
+    })
 }
 
 fn ranked_arrow_cell((column, row): (&Column, usize)) -> ArrowCell<'_> {
@@ -751,6 +816,19 @@ fn count_layout(data_type: &DataType) -> bool {
     matches!(data_type, T::Boolean | T::Int8 | T::Int16 | T::Int32 | T::Int64
         | T::UInt8 | T::UInt16 | T::UInt32 | T::UInt64 | T::Float32 | T::Float64
         | T::Utf8 | T::Binary | T::FixedSizeBinary(_))
+}
+
+fn decimal_storage(data_type: &DataType) -> bool {
+    matches!(data_type, DataType::Decimal32(..) | DataType::Decimal64(..) | DataType::Decimal128(..) | DataType::Decimal256(..))
+}
+
+fn decimal_leaf(field: &ArrowField, logical: Option<&LogicalType>) -> bool {
+    if field.data_type() == &DataType::Null {
+        return field.metadata().is_empty() && field.is_nullable() && logical.is_none_or(|ty| *ty == LogicalType::Null);
+    }
+    decimal_storage(field.data_type())
+        && rtdb_columnar::decimal_field_parameters(field).is_ok_and(|parameters| parameters.is_some())
+        && logical.is_none_or(|ty| crate::columnar::stable_read_layout(ty, field))
 }
 
 fn masked_count_layout(data_type: &DataType) -> bool {
@@ -1115,9 +1193,10 @@ impl AggregateColumn {
                 let Rows { batch, projected, .. } = input;
                 let argument = argument.ok_or_else(|| invalid("aggregate-state", "Collected aggregate argument is absent"))?;
                 if matches!(aggregate.function, AggregateFunction::Percentile { .. }) {
+                    let typed = input.arrow_column(Some(argument)).filter(|column| accepts_typed_column(column, masked_count_layout));
                     for (row, selected) in mask.flags(input.len(), &scope)?.iter_mut().enumerate() {
                         execution.context.check_cancelled_at(row)?;
-                        if *selected { *selected = !input.is_null(row, Some(argument))?; }
+                        if *selected { *selected = count_is_present(input, typed, row, Some(argument))?; }
                     }
                 }
                 vectors.append(batch, argument, mapping, |row| mask.contains(row), group_count, projected, &execution.context)?;
@@ -1242,9 +1321,24 @@ impl CollectionVectors {
         let mut reservation = memory.reserve(bytes)?;
         let typed = PercentileKey::bind(&input_type, &self.batches,
             Arc::get_mut(&mut reservation).expect("The percentile aggregate owns its result reservation"))?;
+        let mut compatible = typed.is_none().then(|| PercentileKey::compatible(&input_type, &self.batches)).flatten();
+        if matches!(compatible, Some(PercentileKey::Number)) {
+            let lease = Arc::get_mut(&mut reservation).expect("The percentile aggregate owns its result reservation");
+            let bytes = lease.bytes().checked_add(4096)
+                .ok_or_else(|| invalid("aggregate-size", "Percentile decimal conversion exceeds addressable memory"))?;
+            match lease.grow_to(bytes) {
+                Ok(()) => {},
+                Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => compatible = None,
+                Err(error) => return Err(error),
+            }
+        }
+        let comparison_key = typed.as_ref().map(|(key, _)| key).or(compatible.as_ref());
         let copy_typed = kind == PercentileKind::Discrete && typed.is_some()
             && without_nullability(&input_type) == without_nullability(&output.data_type);
-        let gather = kind == PercentileKind::Discrete && (copy_typed || direct_rank_type(&output.data_type));
+        let direct_gather = kind == PercentileKind::Discrete && direct_rank_type(&output.data_type);
+        let borrow_winners = kind == PercentileKind::Discrete && !copy_typed && !direct_gather
+            && admits_discrete_winners(&output.data_type, &self.batches);
+        let gather = copy_typed || borrow_winners || direct_gather;
         let mut values = Vec::with_capacity(if kind == PercentileKind::Discrete && !gather { groups } else { 0 });
         let mut picks = Vec::with_capacity(if gather { groups } else { 0 });
         let mut interpolated = Vec::with_capacity(if kind == PercentileKind::Continuous { groups } else { 0 });
@@ -1255,6 +1349,9 @@ impl CollectionVectors {
         let read_number = |position: (usize, usize)| -> Result<f64> {
             if let Some((PercentileKey::Decimal, _)) = &typed {
                 return PercentileKey::decimal(source(position));
+            }
+            if matches!(&compatible, Some(PercentileKey::Number | PercentileKey::Native(NativeKeyKind::Number))) {
+                return Ok(PercentileKey::number(source(position))?.as_f64());
             }
             let (column, row) = source(position);
             match ScalarKey::read(column, row) {
@@ -1292,7 +1389,7 @@ impl CollectionVectors {
                 let key = |(batch, row): (usize, usize)| ScalarKey::read(&batches[batch].columns[0], row);
                 let indices = crate::sort::sort_ordinals(rows.len(), context, |left, right| {
                     let (left, right) = if descending { (rows[right], rows[left]) } else { (rows[left], rows[right]) };
-                    if let Some((key, _)) = &typed {
+                    if let Some(key) = comparison_key {
                         return key.compare(source(left), source(right));
                     }
                     if let (Some(left), Some(right)) = (key(left), key(right))
@@ -1302,9 +1399,9 @@ impl CollectionVectors {
                 (rows[indices.values[low as usize]], rows[indices.values[high as usize]])
             };
             if gather {
-                if copy_typed {
+                if copy_typed || borrow_winners {
                     context.check_cancelled()?;
-                    if matches!(&typed, Some((PercentileKey::Decimal, _))) {
+                    if borrow_winners || matches!(&typed, Some((PercentileKey::Decimal, _))) {
                         ranked_arrow_cell(source(lower)).validate_decimal_precision()?;
                     }
                 }
@@ -1557,6 +1654,14 @@ enum NumericCell {
 }
 
 impl NumericCell {
+    fn read_arrow(cell: ArrowCell<'_>) -> Result<Self> {
+        Ok(match cell.field.data_type() {
+            DataType::Float32 => Self::Float32(cell.array.as_primitive::<Float32Type>().value(cell.row)),
+            DataType::Float64 => Self::Float64(cell.array.as_primitive::<Float64Type>().value(cell.row)),
+            _ => Self::Integer(cell.signed_integer().ok_or_else(sum_state)?),
+        })
+    }
+
     fn as_f32(self) -> f32 {
         match self {
             Self::Integer(value) => value as f32,
@@ -1584,37 +1689,33 @@ impl NumericCell {
 struct NumericColumn<'a>(&'a Column);
 
 impl<'a> NumericColumn<'a> {
+    fn admits_leaf(field: &ArrowField, logical: Option<&LogicalType>, expected: Option<&LogicalType>) -> bool {
+        if !field.metadata().is_empty() { return false; }
+        let physical = match field.data_type() {
+            DataType::Null => return field.is_nullable() && logical.is_none_or(|ty| *ty == LogicalType::Null),
+            DataType::Int8 => ScalarType::I8,
+            DataType::Int16 => ScalarType::I16,
+            DataType::Int32 => ScalarType::I32,
+            DataType::Int64 => ScalarType::I64,
+            DataType::UInt8 => ScalarType::U8,
+            DataType::UInt16 => ScalarType::U16,
+            DataType::UInt32 => ScalarType::U32,
+            DataType::UInt64 => ScalarType::U64,
+            DataType::Float32 => ScalarType::F32,
+            DataType::Float64 => ScalarType::F64,
+            _ => return false,
+        };
+        let physical = LogicalType::Scalar(physical);
+        logical.is_none_or(|ty| without_nullability(ty) == &physical)
+            && expected.is_none_or(|ty| without_nullability(ty) == &physical)
+    }
+
     fn bind(column: &'a Column, expected: Option<&LogicalType>) -> Option<Self> {
-        let admitted = admits_reduction_column(column, |field, logical| {
-            if !field.metadata().is_empty() { return false; }
-            let physical = match field.data_type() {
-                DataType::Null => return field.is_nullable() && logical.is_none_or(|ty| *ty == LogicalType::Null),
-                DataType::Int8 => ScalarType::I8,
-                DataType::Int16 => ScalarType::I16,
-                DataType::Int32 => ScalarType::I32,
-                DataType::Int64 => ScalarType::I64,
-                DataType::UInt8 => ScalarType::U8,
-                DataType::UInt16 => ScalarType::U16,
-                DataType::UInt32 => ScalarType::U32,
-                DataType::UInt64 => ScalarType::U64,
-                DataType::Float32 => ScalarType::F32,
-                DataType::Float64 => ScalarType::F64,
-                _ => return false,
-            };
-            let physical = LogicalType::Scalar(physical);
-            logical.is_none_or(|ty| without_nullability(ty) == &physical)
-                && expected.is_none_or(|ty| without_nullability(ty) == &physical)
-        });
-        admitted.then_some(Self(column))
+        admits_reduction_column(column, |field, logical| Self::admits_leaf(field, logical, expected)).then_some(Self(column))
     }
 
     fn get(&self, row: usize) -> Result<Option<NumericCell>> {
-        let Some(cell) = present_column_position(self.0, row)? else { return Ok(None); };
-        Ok(Some(match cell.field.data_type() {
-            DataType::Float32 => NumericCell::Float32(cell.array.as_primitive::<Float32Type>().value(cell.row)),
-            DataType::Float64 => NumericCell::Float64(cell.array.as_primitive::<Float64Type>().value(cell.row)),
-            _ => NumericCell::Integer(cell.signed_integer().ok_or_else(sum_state)?),
-        }))
+        present_column_position(self.0, row)?.map(NumericCell::read_arrow).transpose()
     }
 }
 
@@ -1748,14 +1849,7 @@ impl ScalarGroups {
             .then(|| NumericColumn::bind(page.arrow_column(argument)?, None)).flatten();
         let decimal = page.arrow_column(argument).filter(|column| {
             matches!(without_nullability(summer.input), LogicalType::Scalar(ScalarType::Decimal { .. }))
-                && admits_reduction_column(column, |field, logical| {
-                    if field.data_type() == &DataType::Null {
-                        return field.metadata().is_empty() && field.is_nullable() && logical.is_none_or(|ty| *ty == LogicalType::Null);
-                    }
-                    matches!(field.data_type(), DataType::Decimal32(..) | DataType::Decimal64(..) | DataType::Decimal128(..) | DataType::Decimal256(..))
-                        && rtdb_columnar::decimal_field_parameters(field).is_ok_and(|parameters| parameters.is_some())
-                        && logical.is_none_or(|ty| crate::columnar::stable_read_layout(ty, field))
-                })
+                && admits_reduction_column(column, decimal_leaf)
         });
         let duration = match (without_nullability(summer.input), summer.output) {
             (LogicalType::Scalar(ScalarType::Duration(_)), LogicalType::Scalar(ScalarType::Duration(output))) =>

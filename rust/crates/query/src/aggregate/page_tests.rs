@@ -668,6 +668,60 @@ async fn typed_percentile_ranks_validate_only_the_discrete_decimal_winner() {
 }
 
 #[tokio::test]
+async fn mixed_numeric_percentiles_rank_in_double_order_and_return_the_exact_winner() {
+    let execution = execution(8);
+    let baseline = execution.context.memory.used_bytes();
+    let winner = Value::Decimal(decimal128_value(9_007_199_254_740_993, 20, 0).unwrap());
+    let peer = Value::I64(9_007_199_254_740_992);
+    let ty = winner.logical_type().join(&peer.logical_type());
+    let function = AggregateFunction::Percentile {
+        kind: PercentileKind::Discrete, fraction: PercentileFraction::Literal(0.0), descending: false,
+    };
+    let mut cursor = primitive_cursor(&execution, function, ty.clone(), ty, vec![vec![winner.clone()], vec![peer]], None);
+    let page = cursor.next_batch().await.unwrap().unwrap();
+    drop(cursor);
+    assert!(matches!(&page.columns[0], Column::Selected(_)));
+    assert_eq!(page.columns[0].value(0).unwrap(), winner);
+    drop(page);
+    assert_eq!(execution.context.memory.used_bytes(), baseline);
+}
+
+#[tokio::test]
+async fn mixed_discrete_percentiles_validate_only_the_selected_decimal_winner() {
+    let execution = execution(8);
+    let decimal = Value::Decimal(decimal128_value(100, 2, 0).unwrap());
+    let integer = Value::I64(1);
+    let ty = decimal.logical_type().join(&integer.logical_type());
+    let make_cursor = |fraction| primitive_cursor(
+        &execution,
+        AggregateFunction::Percentile { kind: PercentileKind::Discrete, fraction: PercentileFraction::Literal(fraction), descending: false },
+        ty.clone(), ty.clone(), vec![vec![decimal.clone()], vec![integer.clone()]], None,
+    );
+    assert_eq!(primitive_result(make_cursor(0.0)).await, integer);
+    let mut cursor = make_cursor(1.0);
+    assert_eq!(cursor.next_batch().await.err().unwrap().code, "rtdb/decimal-precision");
+}
+
+#[tokio::test]
+async fn discrete_keyword_percentile_reuses_the_winners_arrow_backing() {
+    let execution = execution(8);
+    let baseline = execution.context.memory.used_bytes();
+    let keyword = |value| Value::Keyword(rtdb_types::Keyword::from_name(value));
+    let winner = keyword("a");
+    let ty = winner.logical_type();
+    let function = AggregateFunction::Percentile {
+        kind: PercentileKind::Discrete, fraction: PercentileFraction::Literal(0.0), descending: false,
+    };
+    let mut cursor = primitive_cursor(&execution, function, ty.clone(), ty, vec![vec![keyword("z"), winner.clone()]], None);
+    let page = cursor.next_batch().await.unwrap().unwrap();
+    drop(cursor);
+    assert!(matches!(&page.columns[0], Column::Selected(_)));
+    assert_eq!(page.columns[0].value(0).unwrap(), winner);
+    drop(page);
+    assert_eq!(execution.context.memory.used_bytes(), baseline);
+}
+
+#[tokio::test]
 async fn typed_percentile_ranks_keep_date_peers_and_reach_mixed_timestamp_overflow() {
     let execution = execution(8);
     let baseline = execution.context.memory.used_bytes();

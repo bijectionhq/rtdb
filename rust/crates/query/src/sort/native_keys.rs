@@ -89,7 +89,7 @@ impl Kind {
         }
     }
 
-    fn accepts(self, column: &Column) -> bool {
+    pub(crate) fn accepts(self, column: &Column) -> bool {
         match column {
             Column::Values(values) => values.iter().all(|value| self.value(value).is_some()),
             Column::Arrow {
