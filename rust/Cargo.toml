@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
-exclude = ["vendor/bijection-geometry", "vendor/bijection-store-derive", "vendor/bijection-store-filter", "vendor/bijection-store-judge", "vendor/apache-avro", "vendor/fancy-regex", "vendor/validation-json", "vendor/validation-referencing", "vendor/validation-jsonschema", "vendor/rdkafka", "vendor/rdkafka-sys", "vendor/rustls", "vendor/openssl-src", "vendor/sqlparser"]
+exclude = ["vendor/bijection-geometry", "vendor/bijection-store-derive", "vendor/bijection-store-filter", "vendor/bijection-store-judge", "vendor/apache-avro", "vendor/fancy-regex", "vendor/validation-json", "vendor/validation-referencing", "vendor/validation-jsonschema", "vendor/rdkafka", "vendor/rdkafka-sys", "vendor/rustls", "vendor/openssl-src", "vendor/sqlparser", "vendor/bijection/store_read", "vendor/bijection/kernel_text", "vendor/bijection/geometry"]
 
 [patch.crates-io]
 rustls = { path = "vendor/rustls" }
@@ -52,9 +52,9 @@ rtdb-tls = { path = "crates/tls" }
 rtdb-affinity = { path = "crates/affinity" }
 rtdb-directory = { path = "crates/directory" }
 rtdb-logkeeper = { path = "crates/logkeeper" }
-journal-contract = { git = "https://github.com/bijectionhq/logkeeper.git", rev = "74bfb98615291b581329053318d6b200c39b9e11" }
-stream-logkeeper = { package = "logkeeper", git = "https://github.com/bijectionhq/logkeeper.git", rev = "74bfb98615291b581329053318d6b200c39b9e11", features = ["stream"] }
-ordered-logkeeper = { package = "logkeeper", git = "https://github.com/bijectionhq/logkeeper.git", rev = "74bfb98615291b581329053318d6b200c39b9e11", features = ["ordered-daemon"] }
+journal-contract = { git = "https://github.com/bijectionhq/logkeeper.git", rev = "32b2d87e4313fe6c7f2702bd238f2ad1935862a4" }
+stream-logkeeper = { package = "logkeeper", git = "https://github.com/bijectionhq/logkeeper.git", rev = "32b2d87e4313fe6c7f2702bd238f2ad1935862a4", features = ["stream"] }
+ordered-logkeeper = { package = "logkeeper", git = "https://github.com/bijectionhq/logkeeper.git", rev = "32b2d87e4313fe6c7f2702bd238f2ad1935862a4", features = ["ordered-daemon"] }
 rtdb-multi = { path = "crates/multi" }
 rtdb-simulation = { path = "crates/simulation" }
 rtdb-text = { path = "crates/text" }
@@ -87,8 +87,8 @@ num-rational = "0.4.2"
 num-traits = "0.2.19"
 regex = "1"
 regex-syntax = "=0.8.11"
-unicode-normalization = { version = "=0.1.24", default-features = false }
-unicode-segmentation = "=1.13.3"
+unicode-normalization = { version = "=0.1.26", default-features = false }
+unicode-segmentation = "=1.12.0"
 rust-stemmers = "=1.2.0"
 fancy-regex = { version = "=0.16.2", path = "vendor/fancy-regex" }
 futures = "0.3"

@@ -1,7 +1,7 @@
 use std::{sync::{Arc, RwLock}, time::Duration};
 
 use bytes::Bytes;
-use journal_contract::{BoxFuture, Epoch, Journal, JournalError, Lsn, Page, StreamId, WriterFence, WriterSessionId};
+use journal_contract::{BoxFuture, Epoch, Journal, JournalError, Lsn, Page, RecoveryFence, StreamId, WriterFence, WriterSessionId};
 use rtdb_crypt::{Context, Generation, Kms};
 use rtdb_format::journal::Record;
 use rtdb_tx::transact::TransactionRecord;
@@ -316,6 +316,19 @@ impl Stream {
         self.journal.acknowledge_recovery(self.id()).await
     }
 
+    /// The pending operator recovery's fence, `None` once it is acknowledged.
+    /// A journal without atomic recovery markers returns `Unsupported`.
+    pub(crate) async fn recovery_fence(&self) -> journal_contract::Result<Option<RecoveryFence>> {
+        self.journal.recovery_fence(self.id()).await
+    }
+
+    /// Appends `marker` right after the recovered head under the recovery's
+    /// epoch and lifts exactly that fence, in one journal decision.
+    pub(crate) async fn acknowledge_recovery_with_marker(&self, fence: RecoveryFence, marker: Bytes) -> journal_contract::Result<Lsn> {
+        self.authorize_mutation().await?;
+        self.journal.acknowledge_recovery_with_marker(self.id(), fence, marker).await
+    }
+
     pub(crate) async fn read(&self, from: Lsn) -> journal_contract::Result<Page> {
         self.read_through(from, Lsn(0)).await
     }
@@ -560,10 +573,29 @@ pub(crate) fn next(lsn: Lsn) -> Result<Lsn> {
         .ok_or_else(|| Anomaly::fault("rtdb/journal-exhausted", "The journal has no next position"))
 }
 
+/// The recovery faults this process reported, in the order of
+/// `RECOVERY_FAULT_CODES`.
+static RECOVERY_FAULTS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+const RECOVERY_FAULT_CODES: [&str; 3] = ["rtdb/journal-recovered", "rtdb/journal-shortened", "rtdb/journal-rewritten"];
+
+fn recovery_fault(kind: usize) {
+    RECOVERY_FAULTS[kind].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many journal recovery faults this process reported, by anomaly code:
+/// `rtdb/journal-recovered` when a journal call met an operator recovery that
+/// no writer had acknowledged yet, and `rtdb/journal-shortened` or
+/// `rtdb/journal-rewritten` when a replica or reader found that a recovery
+/// replaced the history it had replayed and rebuilt from the journal.
+pub fn journal_recovery_faults() -> [(&'static str, u64); 3] {
+    std::array::from_fn(|kind| (RECOVERY_FAULT_CODES[kind], RECOVERY_FAULTS[kind].load(std::sync::atomic::Ordering::Relaxed)))
+}
+
 /// The journal head is behind what this process already replayed: the stream
 /// was recovered after losing two of its three voters, and the records after
 /// `head` through `replayed` are lost.
 pub(crate) fn journal_shortened(head: Lsn, replayed: Lsn) -> Anomaly {
+    recovery_fault(1);
     Anomaly::fault(
         "rtdb/journal-shortened",
         format!(
@@ -580,6 +612,7 @@ pub(crate) fn journal_shortened(head: Lsn, replayed: Lsn) -> Anomaly {
 /// the journal announces a recovery after records this process replayed: an
 /// operator recovery replaced the history this process built its state from.
 pub(crate) fn journal_rewritten(at: Lsn) -> Anomaly {
+    recovery_fault(2);
     Anomaly::fault(
         "rtdb/journal-rewritten",
         format!(
@@ -591,6 +624,7 @@ pub(crate) fn journal_rewritten(at: Lsn) -> Anomaly {
 
 pub(crate) fn journal_error(error: JournalError) -> Anomaly {
     if let JournalError::Recovered { head } = error {
+        recovery_fault(0);
         return Anomaly::fault(
             "rtdb/journal-recovered",
             format!(
@@ -634,6 +668,9 @@ mod tests {
         let rewritten = journal_rewritten(Lsn(50));
         assert_eq!(rewritten.code, "rtdb/journal-rewritten");
         assert!(rewritten.message.unwrap().contains("through 50"));
+        let counted = journal_recovery_faults();
+        assert_eq!(counted.map(|(code, _)| code), ["rtdb/journal-recovered", "rtdb/journal-shortened", "rtdb/journal-rewritten"]);
+        assert!(counted.iter().all(|(_, count)| *count > 0));
     }
 
     #[test]

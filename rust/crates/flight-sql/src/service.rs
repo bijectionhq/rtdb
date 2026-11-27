@@ -219,6 +219,7 @@ impl Call {
 }
 impl Service {
     pub fn new(node: Node, auth: Arc<Authenticator>, config: FlightConfig, clock: Arc<dyn Clock>, cancellation: CancellationToken, status: watch::Sender<ServerStatus>, binding: Binding) -> rtdb_types::Result<Self> {
+        crate::v1::store::check_rank_digest()?;
         let memory = Arc::clone(node.memory());
         let exact_reads = Registry::new(clock.clone(), memory.clone());
         Ok(Self(Arc::new(Inner { sessions: Registry::new(clock.clone(), memory.clone()), transactions: Registry::new(clock.clone(), memory.clone()), prepared: Registry::new(clock.clone(), memory.clone()), owned_reads: Registry::new(clock.clone(), memory.clone()), owned_world_reads: Registry::new(clock, memory), owned_read_slots: Arc::new(Semaphore::new(64)), exact_reads, v1: Default::default(), auth: Authentication::new(auth), permits: Arc::new(Semaphore::new(config.maximum_concurrent_calls)), node, config, binding, cancellation, status })))

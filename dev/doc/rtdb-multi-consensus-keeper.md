@@ -72,6 +72,11 @@ Every seal returns `JournalError::Recovered { head }` until a writer or an admin
   Each check re-reads the last applied record with the next page, so it holds after the new writer has written past the lost positions.
   Either way the node logs the loss and rebuilds its state from the journal floor.
 - **Holding writes.** With `multiJournal: {holdWritesAfterRecovery: true}` the node instead refuses the writer role with `rtdb/journal-recovered` until someone else acknowledges the recovery, and records nothing.
+- **Metrics.** The Multi server's registry exports both process-wide counts on `/metrics`: `rtdb_multi_journal_recoveries_acknowledged_total`, and `rtdb_multi_journal_recovery_faults_total` by `code` (`rtdb/journal-recovered`, `rtdb/journal-shortened`, `rtdb/journal-rewritten`).
+  A rising `rtdb/journal-recovered` count without acknowledgements means a held writer or a recovery nobody acknowledged; the other two codes count followers and readers that rebuilt.
+- **Tested on real keepers.** `multi_resumes_after_a_real_keeper_recovery_and_followers_rebuild` runs on Logkeeper's `LocalCluster::start_spared`: five keepers in three domains and the catalog keeper.
+  Voter 1 stops after the first commit, the other two voters acknowledge two more and are retired, and `recover-stream` runs on voter 1.
+  The next writer acknowledges and records the recovery, and the old writer, both followers and a new reader all hold the first commit and the new ones, never the lost ones.
 
 ## Independent database activation
 
@@ -236,6 +241,8 @@ record the runs. To repeat them:
 cd rust
 # The Multi driver tests on real keepers in one process.
 RTDB_MULTI_JOURNAL=consensus RUST_MIN_STACK=16777216 cargo test -p rtdb-db --lib multi::tests
+# Operator recovery end to end on real keepers (always on consensus keepers).
+RUST_MIN_STACK=16777216 cargo test -p rtdb-db --lib multi_resumes_after_a_real_keeper_recovery
 # The contract suite through the RTDB adapter.
 cargo test -p rtdb-journal-logkeeper
 # The development runtime across a full keeper restart, a drained keeper,

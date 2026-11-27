@@ -394,12 +394,21 @@ mod tests {
             DatabaseOpen::Required,
         )
         .await?;
-        assert!(matches!(
-            database
-                .tick(&BTreeSet::from([runtime.backends.node]))
-                .await?,
-            Role::Writer(_)
-        ));
+        // Installing the candidate held a writer lease on another handle of
+        // this database; this handle becomes writer once that lease lapses.
+        let lapsed = std::time::Duration::from_micros(
+            (crate::multi::WRITER_LEASE_MICROS + crate::multi::CLOCK_DRIFT_MICROS) as u64,
+        );
+        let deadline = tokio::time::Instant::now() + lapsed + std::time::Duration::from_secs(5);
+        loop {
+            match database.tick(&BTreeSet::from([runtime.backends.node])).await? {
+                Role::Writer(_) => break,
+                role => {
+                    assert!(tokio::time::Instant::now() < deadline, "{role:?} after the candidate lease lapsed");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
         let ready = &witness.held_ready.ready;
         let placement = workload::ImportedPlacement::new(
             workload::Point::new("public.workload_installation", "authority".into(), Timestamp(0))?,
