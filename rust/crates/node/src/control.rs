@@ -41,6 +41,7 @@ pub fn control_schema(statement: &ControlStatement) -> Result<Option<Schema>> {
     let text = LogicalType::Scalar(ScalarType::Utf8);
     let fields = match statement {
         ControlStatement::ShowTransactionIsolationLevel => vec![("transaction_isolation", text)],
+        ControlStatement::ShowSessionParameter { name } => vec![(name.as_str(), text.maybe())],
         ControlStatement::Show { name } => {
             let integer = LogicalType::Scalar(ScalarType::I64).maybe();
             let instant = LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) });
@@ -262,6 +263,9 @@ impl NativeSession {
             ControlStatement::ShowTransactionIsolationLevel => {
                 self.show_transaction_isolation_level(cancellation).await.map(ControlResult::Rows)
             }
+            ControlStatement::ShowSessionParameter { name } => {
+                self.show(name, false, None, cancellation).await.map(ControlResult::Rows)
+            }
             ControlStatement::Show { name } => {
                 let source = if name == "rtdb_hosted_source_owner" {
                     let history = self.service.confirm_hosted_source_owner(self.state.database(), cancellation).await?;
@@ -363,7 +367,7 @@ impl NativeSession {
         let mut bound = 8192usize;
         if let Some(value) = self.state.parameter(name) { bound = size(bound, value.len().checked_mul(4).ok_or_else(|| invalid("SHOW allocation size overflow"))?)?; }
         if let Some(token) = if name == "latest_submitted_tx" { self.state.last_submitted_await_token() } else { self.state.effective_await_token() } { bound = size(bound, token.len().checked_mul(4).ok_or_else(|| invalid("SHOW token size overflow"))?)?; }
-        let snapshot_token = if name == "snapshot_token" { Some(context.issue_snapshot_token()?.ok_or_else(crate::sql_snapshots::unretained)?) } else { None };
+        let snapshot_token = if checked && name == "snapshot_token" { Some(context.issue_snapshot_token()?.ok_or_else(crate::sql_snapshots::unretained)?) } else { None };
         if let Some(token) = &snapshot_token { bound = size(bound, token.len().checked_mul(4).ok_or_else(|| invalid("SHOW token size overflow"))?)?; }
         let error = match (name, self.state.last_submitted()) { ("latest_submitted_tx", Some(LastSubmittedTx::Executed(tx))) => tx.encoded_error()?, _ => None };
         if let Some(error) = &error { bound = size(bound, error.as_ref().len().checked_mul(4).ok_or_else(|| invalid("SHOW error size overflow"))?)?; }
@@ -377,13 +381,13 @@ impl NativeSession {
         let integer = LogicalType::Scalar(ScalarType::I64);
         let instant = LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) });
         let (fields, rows) = match name {
-            "snapshot_token" => (vec![(name, text.clone())], vec![vec![Value::Utf8(snapshot_token.unwrap_or_default())]]),
-            "clock_time" => {
+            "snapshot_token" if checked => (vec![(name, text.clone())], vec![vec![Value::Utf8(snapshot_token.unwrap_or_default())]]),
+            "clock_time" if checked => {
                 let zone = Some(self.state.effective_timezone().to_owned());
                 (vec![(name, LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: zone.clone() }))],
                  vec![vec![Value::Timestamp { value: basis.current_time.as_micros()?.0, unit: TimeUnit::Microsecond, timezone: zone }]])
             }
-            "timezone" => (vec![(name, text.clone())], vec![vec![Value::Utf8(self.state.effective_timezone().into())]]),
+            "timezone" => (vec![(name, if checked { text.clone() } else { text.clone().maybe() })], vec![vec![Value::Utf8(self.state.effective_timezone().into())]]),
             "application_name" => (vec![(name, text.clone().maybe())], vec![vec![Value::Utf8(self.state.application_name().into())]]),
             "rtdb_bounded_retry" | "rtdb_source_barrier" => (vec![(name, text.clone())], vec![vec![Value::Utf8("1".into())]]),
             "rtdb_hosted_source_owner" => {

@@ -101,8 +101,9 @@ impl<'input> ParsedControl<'input> {
 
     /// Determines whether Simple Query starts an implicit transaction around this command.
     pub fn starts_implicit_transaction(&self) -> bool {
-        !matches!(self.syntax, ControlStatement::Begin(_) | ControlStatement::Discard(_)
-            | ControlStatement::SetTransaction(_) | ControlStatement::Show { .. } | ControlStatement::ShowTransactionIsolationLevel | ControlStatement::CopyIn { .. })
+        !self.syntax.is_show()
+            && !matches!(self.syntax, ControlStatement::Begin(_) | ControlStatement::Discard(_)
+                | ControlStatement::SetTransaction(_) | ControlStatement::CopyIn { .. })
             && !matches!(&self.syntax, ControlStatement::SetParameter { name, .. } if name == "bijection.at")
     }
 
@@ -293,9 +294,14 @@ impl ControlParser<'_> {
     fn option_value(&mut self, literal_only: bool) -> Result<ControlValue<ast::Expr>> {
         self.token(Token::Eq);
         if self.eat("DEFAULT") { return Ok(ControlValue::Default); }
-        let value = self.expression()?;
-        if literal_only && !is_literal(&value) { return Err(self.error("ASYNC requires a literal or DEFAULT")); }
+        let value = if literal_only { self.literal("ASYNC requires a literal or DEFAULT")? } else { self.expression()? };
         Ok(ControlValue::Expression(value))
+    }
+    fn literal(&mut self, expected: &str) -> Result<ast::Expr> {
+        let start = self.index;
+        let value = self.expression()?;
+        if is_literal(&value) || binary_literal_tokens(&self.tokens[start..self.index]) { Ok(value) }
+        else { Err(self.error(expected)) }
     }
     fn isolation(&mut self) -> Result<()> {
         self.expect("LEVEL")?;
@@ -435,8 +441,7 @@ impl ControlParser<'_> {
                 name = "bijection.at".into();
             }
             self.set_separator()?;
-            let value = self.expression()?;
-            if !is_literal(&value) { return Err(self.error("Session parameter requires a literal")); }
+            let value = self.literal("Session parameter requires a literal")?;
             return Ok(ControlStatement::SetParameter { name, value });
         }
         if self.eat("DISCARD") {
@@ -457,7 +462,11 @@ impl ControlParser<'_> {
                 self.expect("ZONE")?;
                 return Ok(ControlStatement::Show { name: "timezone".into() });
             }
-            let name = self.grammar_identifier()?.text.to_lowercase();
+            let identifier = self.grammar_identifier()?;
+            let name = identifier.text.to_lowercase();
+            if identifier.quoted && matches!(name.as_str(), "clock_time" | "snapshot_token" | "timezone") {
+                return Ok(ControlStatement::ShowSessionParameter { name });
+            }
             return Ok(ControlStatement::Show { name });
         }
         if self.eat("EXECUTE") {
@@ -546,6 +555,13 @@ fn word(token: Option<&TokenWithSpan>, expected: &str) -> bool {
 
 fn character_string(value: &ast::Value) -> bool {
     matches!(value, ast::Value::SingleQuotedString(_) | ast::Value::DollarQuotedString(_) | ast::Value::EscapedStringLiteral(_))
+}
+
+fn binary_literal_tokens(tokens: &[TokenWithSpan]) -> bool {
+    let [name, open, body, close] = tokens else { return false; };
+    word(Some(name), "X") && open.token == Token::LParen && close.token == Token::RParen
+        && matches!(&body.token, Token::SingleQuotedString(body) if body.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        && tokens.windows(2).all(|pair| pair[0].span.end == pair[1].span.start)
 }
 
 fn typed_literal(value: &ast::TypedString) -> bool {

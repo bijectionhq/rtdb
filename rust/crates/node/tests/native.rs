@@ -1619,11 +1619,25 @@ async fn shared_show_controls_pin_snapshot_reads_and_keep_generic_show_unresolve
     let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
     let token = session.state().cancellation().child_token();
     let parse = |sql| rtdb_sql::parse_control(sql, &Default::default()).unwrap().unwrap();
+    session.execute_control(&parse("SET \"Clock_Time\" = 'session value'"), &[], &token).await.unwrap();
     session.execute_control(&parse("BEGIN"), &[], &token).await.unwrap();
     session.prepare_context(&token).await.unwrap();
     assert_eq!(session.state().status(), TransactionStatus::Pending);
     let ControlResult::Rows(show) = session.execute_control(&parse("SHOW latest_submitted_tx"), &[], &token).await.unwrap() else { panic!() };
     assert!(rows(show).await.is_empty()); assert_eq!(session.state().status(), TransactionStatus::Pending);
+    for (sql, expected) in [
+        ("SHOW \"Clock_Time\"", Value::Utf8("session value".into())),
+        ("SHOW \"Snapshot_Token\"", Value::Null),
+        ("SHOW \"TimeZone\"", Value::Utf8(session.state().effective_timezone().into())),
+    ] {
+        let statement = parse(sql);
+        let schema = rtdb_node::control_schema(&statement).unwrap().unwrap();
+        assert_eq!(schema.fields()[0].data_type, LogicalType::Scalar(ScalarType::Utf8).maybe());
+        let ControlResult::Rows(show) = session.execute_control(&statement, &[], &token).await.unwrap() else { panic!("{sql}"); };
+        assert_eq!(show.schema(), &schema);
+        assert_eq!(rows(show).await, [vec![expected]]);
+        assert_eq!(session.state().status(), TransactionStatus::Pending);
+    }
     let ControlResult::Rows(show) = session.execute_control(&parse("SHOW snapshot_token"), &[], &token).await.unwrap() else { panic!() };
     assert_eq!(rows(show).await.len(), 1); assert_eq!(session.state().status(), TransactionStatus::Reading);
     session.execute_control(&parse("ROLLBACK"), &[], &token).await.unwrap();

@@ -77,7 +77,7 @@ impl StatementHandle {
             if matches!(statement, ControlStatement::Begin(_) | ControlStatement::Commit(_) | ControlStatement::Rollback) {
                 return Err(Anomaly::incorrect("xtdb.adbc/tx-control-as-sql", "BEGIN, START TRANSACTION, COMMIT and ROLLBACK aren't available as SQL here: use the transaction API (ADBC's autocommit, commit and rollback; Flight SQL's BeginTransaction and EndTransaction; Xtdb.Connection's begin, commitSync, commitAsync and rollbackTx), and SET TRANSACTION for a transaction's characteristics"));
             }
-            if !matches!(statement, ControlStatement::Show { .. } | ControlStatement::ShowTransactionIsolationLevel | ControlStatement::SetTransaction(_) | ControlStatement::SetSessionCharacteristics(_) | ControlStatement::SetTimeZone(_) | ControlStatement::SetAwaitToken(_) | ControlStatement::SetParameter { .. } | ControlStatement::SetRole) {
+            if !statement.is_show() && !matches!(statement, ControlStatement::SetTransaction(_) | ControlStatement::SetSessionCharacteristics(_) | ControlStatement::SetTimeZone(_) | ControlStatement::SetAwaitToken(_) | ControlStatement::SetParameter { .. } | ControlStatement::SetRole) {
                 return Err(Anomaly::incorrect("xtdb/not-a-query", "This statement is not supported through ADBC"));
             }
             if statement.is_show() {

@@ -46,6 +46,9 @@ fn control_grammar_is_shared_by_bare_commands_and_prepared_children() {
         "SET TIMEZONE TO 'UTC'",
         "SHOW TRANSACTION ISOLATION LEVEL",
         "SHOW \"MiXeD-Parameter\"",
+        "SHOW \"Clock_Time\"",
+        "SHOW \"Snapshot_Token\"",
+        "SHOW \"TimeZone\"",
         "COMMIT SYNC",
         "ROLLBACK",
     ] {
@@ -102,6 +105,19 @@ fn session_parameter_names_fold_case_and_preserve_punctuation() {
     assert_eq!(parse("SHOW \"MIXED-Parameter\""), ControlStatement::Show { name: "mixed-parameter".into() });
     assert!(matches!(parse("SET ROLE = 'x'"), ControlStatement::SetParameter { name, .. } if name == "role"));
     assert!(matches!(parse("SET TIMEZONE = 'UTC'"), ControlStatement::SetParameter { name, .. } if name == "timezone"));
+}
+
+#[test]
+fn show_quoted_identifiers_use_the_session_parameter_production() {
+    for (source, name) in [("SHOW \"Clock_Time\"", "clock_time"), ("SHOW \"Snapshot_Token\"", "snapshot_token"), ("SHOW \"TimeZone\"", "timezone")] {
+        let command = parse(source);
+        assert_eq!(command, ControlStatement::ShowSessionParameter { name: name.into() });
+        assert!(command.is_show());
+        assert!(!command.requires_read_transaction());
+    }
+    for source in ["SHOW CLOCK_TIME", "SHOW SNAPSHOT_TOKEN", "SHOW TIMEZONE"] {
+        assert!(parse(source).requires_read_transaction(), "{source}");
+    }
 }
 
 #[test]
@@ -178,6 +194,16 @@ fn sql_parser_session_literals_and_typed_control_parameters() {
     let options = PrepareOptions { parameter_types: [(0, LogicalType::Scalar(ScalarType::Utf8))].into(), ..Default::default() };
     let Some(ControlStatement::SetTimeZone(Expr::Parameter { index: 0, data_type })) = parse_control("SET TIME ZONE ?", &options).unwrap() else { panic!() };
     assert_eq!(data_type, LogicalType::Scalar(ScalarType::Utf8));
+}
+
+#[test]
+fn session_literals_admit_the_contiguous_binary_string_form() {
+    assert_eq!(parse("SET binary_value = X('00FF')"), ControlStatement::SetParameter {
+        name: "binary_value".into(), value: Expr::Literal(Value::Binary(vec![0, 255])),
+    });
+    for source in ["SET binary_value = X'00FF'", "SET binary_value = X ('00FF')", "SET binary_value = X('00FF' )", "SET binary_value = (X('00FF'))"] {
+        assert_eq!(parse_control(source, &Default::default()).unwrap_err().code, "xtdb/sql-error", "{source}");
+    }
 }
 
 #[test]

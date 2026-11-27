@@ -80,6 +80,7 @@ pub enum ControlStatement<E = Expr> {
     CopyOut { query: String, format: CopyOutFormat },
     AttachDatabase { name: String, configuration_yaml: Option<String>, source: String },
     DetachDatabase { name: String },
+    ShowSessionParameter { name: String },
 }
 
 impl<E> ControlStatement<E> {
@@ -106,7 +107,12 @@ impl<E> ControlStatement<E> {
             Self::CopyOut { query, format } => ControlStatement::CopyOut { query, format },
             Self::AttachDatabase { name, configuration_yaml, source } => ControlStatement::AttachDatabase { name, configuration_yaml, source },
             Self::DetachDatabase { name } => ControlStatement::DetachDatabase { name },
+            Self::ShowSessionParameter { name } => ControlStatement::ShowSessionParameter { name },
         })
+    }
+
+    pub fn is_show(&self) -> bool {
+        matches!(self, Self::Show { .. } | Self::ShowTransactionIsolationLevel | Self::ShowSessionParameter { .. })
     }
 }
 
@@ -155,9 +161,6 @@ impl ControlStatement {
             Self::Execute { arguments, .. } => arguments.iter().collect(),
             _ => Vec::new(),
         }
-    }
-    pub fn is_show(&self) -> bool {
-        matches!(self, Self::Show { .. } | Self::ShowTransactionIsolationLevel)
     }
     pub fn requires_read_transaction(&self) -> bool {
         matches!(self, Self::ShowTransactionIsolationLevel)

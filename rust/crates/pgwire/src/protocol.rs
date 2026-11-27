@@ -704,7 +704,7 @@ impl ProtocolSession {
                     }
                 })).await.ok_or_else(cancelled)?.map_err(|error| if token.is_cancelled() { cancelled() } else { error })?)
             },
-            (_, Some(statement @ (ControlStatement::Show { .. } | ControlStatement::ShowTransactionIsolationLevel))) => {
+            (_, Some(statement)) if statement.is_show() => {
                 let args = bind_control_arguments(portal.arguments.as_ref(), self.node.memory())?;
                 match Box::pin(self.session.execute_control_arrow_with(statement, args.as_ref(), &token, control_options)).await? {
                     ControlResult::Rows(cursor) => Some(cursor),
@@ -753,7 +753,8 @@ impl ProtocolSession {
         match (kind, control) {
             (PreparedKind::Empty, _) => writer.empty(b'I').await,
             (PreparedKind::Keywords, _) => { let env = self.environment()?; let value = rtdb_pg_codec::encode(PgType::VarChar, Format::Text, &Value::Utf8("xtdb".into()), &env, self.node.memory())?; writer.row(&[value]).await?; writer.string(b'C', "SELECT 1").await },
-            (PreparedKind::Query(_), _) | (PreparedKind::Control(_), Some(ControlStatement::Show { .. } | ControlStatement::ShowTransactionIsolationLevel)) => {
+            (PreparedKind::Query(_), _) | (PreparedKind::Control(_), Some(ControlStatement::Show { .. }
+                | ControlStatement::ShowTransactionIsolationLevel | ControlStatement::ShowSessionParameter { .. })) => {
                 if matches!(kind, PreparedKind::Query(_)) {
                     if self.session.state().is_read_write() && !is_type_probe(source) { return Err(Anomaly::incorrect("xtdb/queries-in-read-write-tx", "Queries are unsupported in a DML transaction").with_context("query", source.into())); }
                     self.begin_implicit(Some(true))?;
@@ -1040,7 +1041,7 @@ fn control_shape(control: PreparedControl, declared_parameters: usize) -> Result
     let statement = control.statement();
     let parameter_count = match statement {
         ControlStatement::Execute { .. } => statement.parameter_count(),
-        ControlStatement::Show { .. } | ControlStatement::ShowTransactionIsolationLevel => 0,
+        statement if statement.is_show() => 0,
         _ => declared_parameters,
     };
     let columns = control_schema(statement)?.map(|schema| schema.fields().iter().map(|field| {
