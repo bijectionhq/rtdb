@@ -37,6 +37,7 @@ SOURCE = {"reference": "revision", "files": [], "candidates": [
 CORPUS = [{"var": "xtdb.a-test/passes", "ns": "xtdb.a-test", "result": "pass"},
           {"var": "xtdb.a-test/fails", "ns": "xtdb.a-test", "result": "fail", "detail": "expected 1"},
           {"var": "xtdb.a-test/reaches-the-jvm", "ns": "xtdb.a-test", "result": "error",
+           "fail": 0, "error": 1, "failures": ["cannot be cast to class xtdb.api.Xtdb"],
            "detail": "cannot be cast to class xtdb.api.Xtdb"},
           {"var": "xtdb.kafka-test/streams", "ns": "xtdb.kafka-test", "result": "pass"}]
 

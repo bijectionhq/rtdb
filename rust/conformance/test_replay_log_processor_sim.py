@@ -57,7 +57,7 @@ class ProjectedSimulationTest(unittest.TestCase):
             ("stale index", "native joined live index differs"),
             ("fenced expectation", "expectation differs from the admitted replica"),
             ("short replica", "does not cover its complete prefix"),
-            ("different cohort", "differs from the original JVM assertion"),
+            ("different cohort", "native joined live-index operands differ from the original JVM assertion"),
         ):
             with self.subTest(defect=defect):
                 bad = joined_execution()
@@ -261,6 +261,7 @@ class ProjectedSimulationTest(unittest.TestCase):
                 file.parent.mkdir(parents=True, exist_ok=True)
                 file.write_bytes(f"owned fixture {index}".encode())
             (run / "artifacts").mkdir()
+            java_home.mkdir()
             bin_directory = java_home / "bin"
             bin_directory.mkdir()
             (bin_directory / "java").symlink_to(java)
