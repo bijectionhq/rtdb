@@ -669,6 +669,11 @@ mod tests {
         assert!(matches!(serving.tick(&live).await.unwrap(), Role::Writer(_)));
         serving.checkpoint(Vec::new()).await.unwrap();
         serving.shutdown_writer().await.unwrap();
+        let previous_checkpoint = rtdb_storage::ObjectKey::new(report["checkpoint"].as_str().unwrap()).unwrap();
+        let previous_version = store.observe_head(&previous_checkpoint).await.unwrap().version.unwrap();
+        aws("put-object-legal-hold", &["--key", &previous_version.key,
+            "--version-id", &previous_version.version, "--legal-hold", "Status=OFF"]);
+        aws("delete-object", &["--key", &previous_version.key, "--version-id", &previous_version.version]);
         let released = release_pending().await.unwrap();
         assert_eq!(released["incarnation"], candidate.to_string());
         assert_eq!(release_pending().await.unwrap(), released);

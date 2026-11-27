@@ -49,7 +49,7 @@ impl ObjectVersionHold for VersionedInventory {
         let path = self.observed_path(key, version)
             .map_err(|_| unavailable("The hold does not name an immutable version in this allocation"))?;
         self.inspect((path.to_string(), version.version.clone()), |owner, (path, version)| async move {
-            if owner.legal_hold_status(&path, &version).await? != ObjectLockLegalHoldStatus::On {
+            if owner.legal_hold_status(&path, &version).await? != Some(ObjectLockLegalHoldStatus::On) {
                 return Err(unavailable("The exact S3 object version has no legal hold"));
             }
             Ok(())
@@ -113,28 +113,34 @@ impl VersionedInventory {
         let path = self.observed_path(key, version)?;
         self.inspect((path.to_string(), version.version.clone()), |owner, (path, version)| async move {
             match owner.legal_hold_status(&path, &version).await? {
-                ObjectLockLegalHoldStatus::Off => return Ok(()),
-                ObjectLockLegalHoldStatus::On => (),
+                None | Some(ObjectLockLegalHoldStatus::Off) => return Ok(()),
+                Some(ObjectLockLegalHoldStatus::On) => (),
                 _ => return Err(unavailable("S3 reported an unknown legal hold state")),
             }
             let hold = ObjectLockLegalHold::builder().status(ObjectLockLegalHoldStatus::Off).build();
-            owner.client.put_object_legal_hold().bucket(&owner.namespace.bucket)
+            match owner.client.put_object_legal_hold().bucket(&owner.namespace.bucket)
                 .key(&path).version_id(&version).legal_hold(hold)
                 .set_request_payer(owner.request_payer.clone()).send().await
-                .map_err(|error| unavailable(format!("Releasing the S3 legal hold failed: {error}")))?;
-            if owner.legal_hold_status(&path, &version).await? != ObjectLockLegalHoldStatus::Off {
-                return Err(unavailable("S3 did not confirm release of the exact version's legal hold"));
+            {
+                Ok(_) => match owner.legal_hold_status(&path, &version).await? {
+                    None | Some(ObjectLockLegalHoldStatus::Off) => Ok(()),
+                    _ => Err(unavailable("S3 did not confirm release of the exact version's legal hold")),
+                },
+                Err(error) if error.as_service_error().and_then(|error| error.code()) == Some("NoSuchVersion") => Ok(()),
+                Err(error) => Err(unavailable(format!("Releasing the S3 legal hold failed: {error}"))),
             }
-            Ok(())
         }).await
     }
 
-    async fn legal_hold_status(&self, path: &str, version: &str) -> Result<ObjectLockLegalHoldStatus> {
-        let reply = self.client.get_object_legal_hold().bucket(&self.namespace.bucket)
+    async fn legal_hold_status(&self, path: &str, version: &str) -> Result<Option<ObjectLockLegalHoldStatus>> {
+        match self.client.get_object_legal_hold().bucket(&self.namespace.bucket)
             .key(path).version_id(version).set_request_payer(self.request_payer.clone()).send().await
-            .map_err(|error| unavailable(format!("Reading the S3 legal hold failed: {error}")))?;
-        reply.legal_hold().and_then(|hold| hold.status()).cloned()
-            .ok_or_else(|| unavailable("S3 did not report the exact object's legal hold state"))
+        {
+            Ok(reply) => reply.legal_hold().and_then(|hold| hold.status()).cloned()
+                .map(Some).ok_or_else(|| unavailable("S3 did not report the exact object's legal hold state")),
+            Err(error) if error.as_service_error().and_then(|error| error.code()) == Some("NoSuchVersion") => Ok(None),
+            Err(error) => Err(unavailable(format!("Reading the S3 legal hold failed: {error}"))),
+        }
     }
 
     pub(crate) fn new(client: Client, namespace: S3ObjectNamespace, root: ObjectKey, requester_pays: bool, scope_multipart_listing: bool) -> Self {

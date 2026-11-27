@@ -330,6 +330,7 @@ For operation-exclusive holds, use `rtdb multi-backup release-object-holds` with
 A published candidate can release its staged object holds after the original journal quorum confirms that its staged hold was released and a later serving checkpoint covers the staged announcement.
 Release the journal hold first and let the successor commit that checkpoint through its ordinary checkpoint path.
 The broker checks the published installation digests and the replacement checkpoint through the registered journal reader before authorizing removal of the temporary object holds.
+An authorized object release retry accepts the provider’s exact version-absence result after the version has been removed.
 For a published hosted recovery, give `release-recovery-key` the same original journal through `--journal-url` and `--journal-reader-tls-dir`.
 The vault releases the staged key hold only after confirming the same replacement checkpoint.
 The broker matches the cell signature and the activation connection and requires the retained decision to prove supersession or publication of a different recovery from the same binding.
