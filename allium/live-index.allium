@@ -15,6 +15,7 @@
 --   A table's immutable row lineage advances when rows are appended.
 --   Each live table holds a single growing relation of appended batches with no fixed slot limit; appending extends the relation and publishes the new row count and trie root without mutating any previous value.
 --   Each snapshot value shares and reads only its own stable prefix of the relation, so concurrent readers never see later appends or partially written rows, and row addresses within a prefix never change.
+--   Applied live index values share their ordered table inventory structurally across transactions.
 --   A discarded append or forked branch leaves no orphaned slots in any earlier value's relation and releases its unretained batch funding immediately.
 --   An incremental transaction snapshot appends the pending Arrow runs written since its last read as one batch.
 --   A holder of an earlier snapshot retains its prefix batches and their funding.

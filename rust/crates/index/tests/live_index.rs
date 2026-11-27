@@ -137,6 +137,21 @@ fn an_applied_write_installs_once_and_a_rejected_one_leaves_the_partition_unchan
 }
 
 #[test]
+fn an_empty_apply_shares_the_table_inventory_while_advancing_the_basis() {
+    let state = PartitionState::empty(TrieConfig::default()).unwrap();
+    let budget = MemoryBudget::new(1 << 24);
+    state.apply(&stage(&state, &budget, 0)).unwrap();
+    let previous = state.value();
+    let empty = StagedWrite::new(key(1), Some(key(0)), previous.live().block_index(), BTreeMap::new()).unwrap();
+    state.apply(&empty).unwrap();
+    let next = state.value();
+    assert!(previous.live().tables().ptr_eq(next.live().tables()));
+    assert_eq!(previous.live().latest_completed_tx(), Some(key(0)));
+    assert_eq!(next.live().latest_completed_tx(), Some(key(1)));
+    assert_eq!(next.live().block_row_count(), 1);
+}
+
+#[test]
 fn writes_to_registered_tables_share_the_table_catalog_and_a_new_table_registers_once() {
     let state = PartitionState::empty(TrieConfig::default()).unwrap();
     let budget = MemoryBudget::new(1 << 24);

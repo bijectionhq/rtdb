@@ -1079,7 +1079,7 @@ pub struct LiveIndex {
     block_index: BlockIndex,
     latest_completed_tx: Option<TransactionKey>,
     block_row_count: u64,
-    tables: BTreeMap<TableRef, Arc<LiveTable>>,
+    tables: imbl::OrdMap<TableRef, Arc<LiveTable>>,
     pub(crate) search: Option<ServingSearch>,
     config: TrieConfig,
 }
@@ -1111,7 +1111,7 @@ impl std::fmt::Debug for ServingSearch {
 
 impl LiveIndex {
     pub fn new(block_index: BlockIndex, latest_completed_tx: Option<TransactionKey>, config: TrieConfig) -> Self {
-        Self { block_index, latest_completed_tx, block_row_count: 0, tables: BTreeMap::new(), search: None, config }
+        Self { block_index, latest_completed_tx, block_row_count: 0, tables: imbl::OrdMap::new(), search: None, config }
     }
     pub fn block_index(&self) -> BlockIndex { self.block_index }
     pub fn latest_completed_tx(&self) -> Option<TransactionKey> { self.latest_completed_tx }
@@ -1121,13 +1121,17 @@ impl LiveIndex {
             bytes.saturating_add(batch.owned.reservation().bytes() as u64).saturating_add(batch.headers.1.bytes() as u64)
         })
     }
-    pub fn tables(&self) -> &BTreeMap<TableRef, Arc<LiveTable>> { &self.tables }
+    pub fn tables(&self) -> &imbl::OrdMap<TableRef, Arc<LiveTable>> { &self.tables }
     pub fn apply(&self, staged: &StagedWrite) -> Result<Self> {
         if staged.block_index != self.block_index || staged.predecessor != self.latest_completed_tx { return Err(invalid("Staged transaction no longer follows this live index")); }
         let mut next = self.clone();
+        let system_time = staged.tx_key.system_time;
         for (table, write) in &staged.tables {
-            let previous = self.tables.get(table).cloned().unwrap_or_else(|| Arc::new(LiveTable::new(table.clone(), self.block_index, self.config)));
-            next.tables.insert(table.clone(), Arc::new(previous.append(write, staged.tx_key.system_time)?));
+            let updated = match self.tables.get(table) {
+                Some(table) => table.append(write, system_time)?,
+                None => LiveTable::new(table.clone(), self.block_index, self.config).append(write, system_time)?,
+            };
+            next.tables.insert(table.clone(), Arc::new(updated));
         }
         next.block_row_count = next.block_row_count.checked_add(staged.row_count()?).ok_or_else(|| invalid("Block row count overflow"))?;
         next.latest_completed_tx = Some(staged.tx_key);
