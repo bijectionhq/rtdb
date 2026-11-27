@@ -16,6 +16,12 @@ fn reads(selection: Selection<'_>, row: usize) -> bool { selection.is_none_or(|r
 
 pub use crate::temporal_functions::{AgeOperand, FixedDateBin, timestamp_truncation_zone, truncate_date32, truncate_date64, truncate_timestamp};
 
+/// Truncates signed interval components in months, days and nanoseconds.
+pub fn truncate_interval(field: rtdb_plan::TemporalField, months: i32, days: i32, nanos: i64) -> Result<(i32, i32, i64)> {
+    let parts = crate::temporal_functions::truncate_interval_parts(field, crate::temporal::IntervalParts { months, days, nanos })?;
+    Ok((parts.months, parts.days, parts.nanos))
+}
+
 /// Casts a physical timestamp cell using scalar cast rules for units and local time.
 pub fn cast_timestamp_ticks(ticks: i64, source: rtdb_types::TimeUnit, source_zoned: bool, unit: rtdb_types::TimeUnit, zoned: bool, timezone: &str) -> Result<i64> {
     crate::cast::timestamp_raw(ticks, source, source_zoned, unit, zoned, timezone)

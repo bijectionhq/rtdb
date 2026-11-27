@@ -233,23 +233,44 @@ pub fn truncate_timestamp(field: F, value: i64, unit: U, zone: Option<&ZoneId>) 
         .and_then(|value| value.checked_mul(hz)).ok_or_else(overflow)
 }
 
+pub(crate) fn truncate_interval_parts(field: F, mut interval: IntervalParts) -> Result<IntervalParts> {
+    match field {
+        F::Millennium | F::Century | F::Decade | F::Year => {
+            let multiple = match field { F::Millennium => 12000, F::Century => 1200, F::Decade => 120, _ => 12 };
+            interval.months = interval.months / multiple * multiple;
+            interval.days = 0;
+            interval.nanos = 0;
+        }
+        F::Quarter => {
+            interval.months = interval.months / 3 * 3;
+            interval.days = 0;
+            interval.nanos = 0;
+        }
+        F::Month => { interval.days = 0; interval.nanos = 0; }
+        F::Week => { interval.days = interval.days / 7 * 7; interval.nanos = 0; }
+        F::Day => interval.nanos = 0,
+        _ => {
+            let quantum = match field {
+                F::Hour => 3_600_000_000_000,
+                F::Minute => 60_000_000_000,
+                F::Second => 1_000_000_000,
+                F::Millisecond => 1_000_000,
+                F::Microsecond => 1000,
+                _ => return Err(inapplicable("date_trunc", &[])),
+            };
+            interval.nanos = interval.nanos / quantum * quantum;
+        }
+    }
+    Ok(interval)
+}
+
 fn truncate(field: F,value: &Value,override_zone: Option<ZoneId>) -> Result<Value> {
     if let Some(day) = value.date_days() {
         let unit = if value.logical_type() == L::Scalar(S::DateDay) { DateUnit::Day } else { DateUnit::Millisecond };
         return Ok(Value::calendar_date(truncated_date(field,CivilDate::from_epoch_day(day)?)?,unit));
     }
-    if let Some(mut interval) = IntervalParts::of(value) {
-        match field {
-            F::Millennium | F::Century | F::Decade | F::Year => {
-                let multiple = match field { F::Millennium => 12000,F::Century => 1200,F::Decade => 120,_ => 12 };
-                interval.months = interval.months / multiple * multiple;interval.days = 0;interval.nanos = 0;
-            }
-            F::Quarter => { interval.months = interval.months / 3 * 3;interval.days = 0;interval.nanos = 0; }
-            F::Month => { interval.days = 0;interval.nanos = 0; }
-            F::Week => { interval.days = interval.days / 7 * 7;interval.nanos = 0; }
-            F::Day => interval.nanos = 0,
-            _ => { let quantum = match field { F::Hour => 3_600_000_000_000,F::Minute => 60_000_000_000,F::Second => 1_000_000_000,F::Millisecond => 1_000_000,F::Microsecond => 1000,_ => return Err(inapplicable("date_trunc",&[])) };interval.nanos = interval.nanos / quantum * quantum; }
-        }
+    if let Some(interval) = IntervalParts::of(value) {
+        let interval = truncate_interval_parts(field, interval)?;
         let L::Scalar(ty) = value.logical_type() else { return Err(inapplicable("date_trunc",&[])); };
         return interval.into_value(&ty);
     }
