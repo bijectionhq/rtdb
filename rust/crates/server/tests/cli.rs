@@ -373,9 +373,13 @@ fn compiled_build_info_ignores_runtime_version_overrides() {
 fn installed_standalone_requires_the_canonical_uuid_and_rejects_legacy_action_flags() {
     let id = "01234567-89ab-4def-8000-000000000001";
     let init = ["initialize-standalone", "--state", "stage", "--name", "team.dev", "--id", id];
-    let Command::InitializeStandalone(target) = parse(&init) else { panic!("expected standalone initialization") };
+    let Command::InitializeStandalone { target, classic_journals } = parse(&init) else { panic!("expected standalone initialization") };
     assert_eq!(target.name, "team.dev");
     assert_eq!(target.id.to_string(), id);
+    assert!(!classic_journals);
+    let mut classic = init.to_vec();
+    classic.push("--classic-journals");
+    assert!(matches!(parse(&classic), Command::InitializeStandalone { classic_journals: true, .. }));
     for invalid_id in ["00000000-0000-0000-0000-000000000000", "01234567-89AB-4DEF-8000-000000000001"] {
         let mut arguments = init;
         arguments[6] = invalid_id;
