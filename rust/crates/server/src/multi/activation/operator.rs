@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use self::attestation::{Attestation, Attestors, Intent};
-use super::{Access, ActivationAuthority, ActivationStatus, Binding, VerifiedSuccessor};
+use super::{Access, ActivationAuthority, ActivationStatus, Binding, VerifiedSuccessor, recovery};
 use crate::{
     config::NodeConfiguration,
     multi::{CONSENSUS_SCHEME, DEVELOPMENT_DATABASE, MultiRuntime},
@@ -22,6 +22,14 @@ pub const HELP: &str = "Usage: rtdb multi-activation status DATABASE AUTHORITY
        rtdb multi-activation freeze DATABASE AUTHORITY --expected-incarnation UUID --expected-revision N
        rtdb multi-activation candidate DATABASE AUTHORITY --expected-incarnation UUID --expected-revision N --operation-id UUID [--cell-id UUID]
        rtdb multi-activation publish DATABASE AUTHORITY --expected-incarnation UUID --expected-revision N --operation-id UUID
+                 [--cell-id UUID --installation-proof FILE --manifest-sha256 HEX]
+       rtdb multi-activation begin-recovery DATABASE AUTHORITY --expected-incarnation UUID --expected-revision N --operation-id UUID
+                 --loss-policy lossless|accept-unknown-tail [--cell-id UUID] [--supersede-operation-id UUID]
+       rtdb multi-activation recovery-status|freeze-recovery|publish-recovery DATABASE AUTHORITY
+                 --expected-incarnation UUID --expected-revision N --operation-id UUID
+       rtdb multi-activation seal-source DATABASE --authority-socket PATH
+                 --expected-incarnation UUID --expected-revision N --operation-id UUID
+       rtdb multi-activation record-install DATABASE AUTHORITY --expected-incarnation UUID --expected-revision N --operation-id UUID
                  [--cell-id UUID --installation-proof FILE --manifest-sha256 HEX]
        rtdb multi-activation attest xtdb --authority-id UUID --expected-incarnation UUID --expected-revision N --operation-id UUID
                  --data DIR --journal-url URL --tls-dir DIR --immutable-streams
@@ -75,6 +83,34 @@ enum Action {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         installation: Option<RemoteInstallation>,
     },
+    Recovery {
+        operation: recovery::Operation,
+        action: RecoveryAction,
+    },
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+enum RecoveryAction {
+    Begin { cell: Option<Uuid>, loss_policy: recovery::LossPolicy, supersedes: Option<Uuid> },
+    Status,
+    Freeze,
+    SealSource,
+    RecordInstall {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        installation: Option<RemoteInstallation>,
+    },
+    Publish,
+}
+
+impl Action {
+    fn installation(&mut self) -> Option<&mut Option<RemoteInstallation>> {
+        match self {
+            Self::Publish { installation, .. }
+            | Self::Recovery { action: RecoveryAction::RecordInstall { installation }, .. } => Some(installation),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -98,6 +134,14 @@ struct Destination {
     data: PathBuf,
     journal_url: String,
     journal_tls_dir: PathBuf,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Source {
+    incarnation: Uuid,
+    cell: Option<Uuid>,
+    location: Destination,
 }
 
 enum DestinationReader<'a> {
@@ -221,13 +265,37 @@ impl Options {
                 operation_id: id(take(&mut fields, "--operation-id")?)?,
                 installation: None,
             },
+            "begin-recovery" | "recovery-status" | "freeze-recovery" | "seal-source"
+            | "record-install" | "publish-recovery" => {
+                let selection = recovery::Operation {
+                    predecessor: binding(&mut fields)?,
+                    operation_id: id(take(&mut fields, "--operation-id")?)?,
+                };
+                let action = match operation.as_str() {
+                    "begin-recovery" => RecoveryAction::Begin {
+                        cell: fields.remove("--cell-id").map(id).transpose()?,
+                        supersedes: fields.remove("--supersede-operation-id").map(id).transpose()?,
+                        loss_policy: match take(&mut fields, "--loss-policy")?.as_str() {
+                            "lossless" => recovery::LossPolicy::Lossless,
+                            "accept-unknown-tail" => recovery::LossPolicy::AcceptUnknownTail,
+                            _ => return Err(arguments_error()),
+                        },
+                    },
+                    "recovery-status" => RecoveryAction::Status,
+                    "freeze-recovery" => RecoveryAction::Freeze,
+                    "seal-source" => RecoveryAction::SealSource,
+                    "record-install" => RecoveryAction::RecordInstall { installation: None },
+                    _ => RecoveryAction::Publish,
+                };
+                Action::Recovery { operation: selection, action }
+            }
             _ => return Err(arguments_error()),
         };
-        let request = Request { database, action };
+        let mut request = Request { database, action };
         #[cfg(unix)]
         if let Some(socket) = fields.remove("--authority-socket") {
             let proof = if let Some(path) = fields.remove("--installation-proof") {
-                if !matches!(request.action, Action::Publish { .. }) {
+                if request.action.installation().is_none() {
                     return Err(arguments_error());
                 }
                 Some(ProofFile {
@@ -248,6 +316,9 @@ impl Options {
             }));
         }
 
+        if matches!(request.action, Action::Recovery { action: RecoveryAction::SealSource, .. }) {
+            return Err(arguments_error());
+        }
         let identity = id(take(&mut fields, "--authority-id")?)?;
         let authority = match (
             fields.remove("--authority-file"),
@@ -265,9 +336,10 @@ impl Options {
             },
             _ => return Err(arguments_error()),
         };
-        let destination = if matches!(request.action, Action::Publish { .. }) && immutable_streams {
+        let reads_installation = request.action.installation().is_some();
+        let destination = if reads_installation && immutable_streams {
             Some(destination(&mut fields)?)
-        } else if matches!(request.action, Action::Publish { .. }) || immutable_streams {
+        } else if reads_installation || immutable_streams {
             return Err(arguments_error());
         } else {
             None
@@ -300,6 +372,7 @@ impl Options {
                         let access = if matches!(
                             request.action,
                             Action::Status | Action::Candidate { .. }
+                            | Action::Recovery { action: RecoveryAction::Status, .. }
                         ) {
                             Access::ConsensusReader
                         } else {
@@ -318,6 +391,7 @@ impl Options {
                     .execute(
                         &authority,
                         destination.as_ref().map(DestinationReader::Direct),
+                        None,
                         &Attestors::new(),
                         apple_sync,
                     )
@@ -329,9 +403,7 @@ impl Options {
                 mut request,
                 proof,
             } => {
-                if let (Some(proof), Action::Publish { installation, .. }) =
-                    (proof, &mut request.action)
-                {
+                if let (Some(proof), Some(installation)) = (proof, request.action.installation()) {
                     *installation = Some(RemoteInstallation {
                         cell: proof.cell,
                         manifest_sha256: proof.manifest_sha256,
@@ -367,6 +439,7 @@ impl Request {
         self,
         authority: &ActivationAuthority,
         destination: Option<DestinationReader<'_>>,
+        source: Option<&Source>,
         attestors: &Attestors,
         apple_sync: rtdb_storage::AppleSync,
     ) -> Result<Value> {
@@ -439,9 +512,105 @@ impl Request {
                     .await?;
                 return Ok(report(&database, published));
             }
+            Action::Recovery { operation, action } => {
+                let status = match action {
+                    RecoveryAction::Begin { cell, loss_policy, supersedes } => authority
+                        .begin_recovery(&database, recovery::Intent { operation, destination_cell: cell, loss_policy }, supersedes).await?,
+                    RecoveryAction::Status => authority.recovery_status(&database, operation).await?,
+                    RecoveryAction::Freeze => authority.freeze_recovery(&database, operation).await?,
+                    RecoveryAction::SealSource => seal_source(authority, &database, operation, source).await?,
+                    RecoveryAction::RecordInstall { installation } => {
+                        let verified = verify_recovery_installation(
+                            authority, &database, operation, installation, destination, attestors, apple_sync,
+                        ).await?;
+                        authority.record_recovery_installation(&database, operation, verified).await?
+                    }
+                    RecoveryAction::Publish => authority.publish_recovery(&database, operation).await?,
+                };
+                return Ok(json!(status));
+            }
         }
         Ok(report(&database, authority.status(&database).await?))
     }
+}
+
+async fn verify_recovery_installation(
+    authority: &ActivationAuthority,
+    database: &str,
+    operation: recovery::Operation,
+    proof: Option<RemoteInstallation>,
+    destination: Option<DestinationReader<'_>>,
+    attestors: &Attestors,
+    apple_sync: rtdb_storage::AppleSync,
+) -> Result<VerifiedSuccessor> {
+    let recovery_intent = match authority.recovery_status(database, operation).await? {
+        recovery::Status::Pending { intent, .. } | recovery::Status::Published { intent, .. } => intent,
+    };
+    let intent = Intent {
+        authority_id: authority.identity(),
+        database: database.to_owned(),
+        expected: operation.predecessor,
+        operation_id: operation.operation_id,
+        cell: recovery_intent.destination_cell,
+    };
+    if let Some(proof) = proof {
+        if Some(proof.cell) != intent.cell {
+            return Err(super::conflict());
+        }
+        return proof.attestation.verify(&intent, proof.manifest_sha256, attestors);
+    }
+    let destination = destination
+        .filter(|_| database == DEVELOPMENT_DATABASE && intent.cell.is_none())
+        .ok_or_else(missing_installation)?;
+    Ok(VerifiedSuccessor::from_installation(&destination.read(&intent, apple_sync).await?))
+}
+
+#[cfg(unix)]
+async fn seal_source(
+    authority: &ActivationAuthority, database: &str, operation: recovery::Operation,
+    source: Option<&Source>,
+) -> Result<recovery::Status> {
+    use journal_contract::{Journal, Lsn, StreamId};
+
+    let status = authority.recovery_status(database, operation).await?;
+    match status {
+        recovery::Status::Published { .. } | recovery::Status::Pending { final_source_lsn: Some(_), .. } => {
+            return Ok(status);
+        }
+        recovery::Status::Pending { grants_closed: true, intent, .. }
+            if intent.loss_policy == recovery::LossPolicy::Lossless => (),
+        _ => return Err(super::conflict()),
+    }
+    let source = source.filter(|source| source.incarnation == operation.predecessor.incarnation)
+        .ok_or_else(|| Anomaly::incorrect(
+            "rtdb/activation-source",
+            "The broker requires a commissioned predecessor with source journal credentials",
+        ))?;
+    let binding = authority.status(database).await?;
+    if binding.binding != operation.predecessor || binding.destination_cell != source.cell {
+        return Err(super::conflict());
+    }
+    broker::validate_destination(&source.location)?;
+    let scope = rtdb_db::ActivationScope::for_cell(authority.identity(), database, source.cell)?;
+    let stopped = StoppedDatabase::open(&source.location, source.incarnation, scope)?;
+    let result = async {
+        let head = stopped.journal
+            .head(StreamId(source.incarnation.as_u128())).await.map_err(super::journal_error)?;
+        if head == Lsn(0) {
+            return Err(super::conflict());
+        }
+        stopped.database.check_activation_scope(head).await?;
+        authority.seal_recovery_source(database, operation, &*stopped.journal, source.cell).await
+    }.await;
+    stopped.io.close_and_wait().await;
+    result
+}
+
+#[cfg(not(unix))]
+async fn seal_source(
+    _: &ActivationAuthority, _: &str, _: recovery::Operation, _: Option<&Source>,
+) -> Result<recovery::Status> {
+    Err(Anomaly::unsupported("rtdb/activation-source", "Source sealing requires the activation broker"))
 }
 
 fn report(database: &str, status: ActivationStatus) -> Value {
@@ -585,71 +754,91 @@ async fn attest_installation(
     manifest_sha256: [u8; 32],
     key: &ring::signature::Ed25519KeyPair,
 ) -> Result<Attestation> {
-    use std::{net::Ipv4Addr, sync::Arc};
-
-    use rtdb_crypt::FileKms;
-    use rtdb_db::{MultiDatabase, MultiOptions};
-    use rtdb_node::{Clock, SystemClock};
-    use rtdb_storage::{IoRegion, LocalStore};
-    use sha2::{Digest, Sha256};
-
-    use crate::multi::{CLOCK_DRIFT_MICROS, WRITER_LEASE_MICROS, io_error};
-
-    let data = &destination.data;
-    let candidate = intent.candidate()?;
-    // Serialize with local restore and serving without opening a development runtime.
-    let lock = existing_marker(&data.join("journal"))?;
-    match fs2::FileExt::try_lock_exclusive(&lock) {
-        Ok(()) => (),
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-            return Err(Anomaly::new(
-                rtdb_types::AnomalyCategory::Busy,
-                "rtdb.multi/development-journal",
-                "Multi development data already has a local writer",
-            ));
-        }
-        Err(error) => return Err(io_error(error)),
-    }
-    let journal_marker: [u8; 32] = Sha256::digest(destination.journal_url.as_bytes()).into();
-    check_marker(&lock, &journal_marker)?;
-    check_marker(
-        &existing_marker(&data.join("database-id"))?,
-        candidate.as_bytes(),
-    )?;
-
-    let connection = crate::cli::development_stream_journal(
-        &destination.journal_url,
-        &destination.journal_tls_dir,
-    )?;
-    let journal = rtdb_stream_journal::connect_consensus(&connection.url, &connection.credentials)
-        .ok_or_else(missing_installation)?
-        .map_err(io_error)?;
-    let keys = Arc::new(FileKms::open(&data.join("keys"), || SystemClock.now().0)?);
-    let objects = data.join("objects");
-    if !objects.is_dir() {
-        return Err(missing_installation());
-    }
-
-    let io = IoRegion::new();
-    let store = Arc::new(LocalStore::open_in(objects, io.clone())?);
-    let mut database = MultiDatabase::new(
-        MultiOptions {
-            database: candidate,
-            node: Ipv4Addr::LOCALHOST.into(),
-            lease_micros: WRITER_LEASE_MICROS,
-            drift_micros: CLOCK_DRIFT_MICROS,
-        },
-        Arc::new(journal),
-        store,
-        keys,
-        Arc::new(|| SystemClock.now()),
-    )?
-    .with_immutable_journal()
-    .with_activation_scope(intent.scope()?)?;
-    let result = database.installed_backup().await;
-    io.close_and_wait().await;
+    let mut stopped = StoppedDatabase::open(destination, intent.candidate()?, intent.scope()?)?;
+    let result = stopped.database.installed_backup().await;
+    stopped.io.close_and_wait().await;
     let installed = result?.ok_or_else(missing_installation)?;
     Attestation::sign(intent, manifest_sha256, &installed, key)
+}
+
+#[cfg(unix)]
+struct StoppedDatabase {
+    _lock: std::fs::File,
+    journal: std::sync::Arc<dyn journal_contract::Journal>,
+    database: rtdb_db::MultiDatabase,
+    io: std::sync::Arc<rtdb_storage::IoRegion>,
+}
+
+#[cfg(unix)]
+impl StoppedDatabase {
+    fn open(
+        destination: &Destination,
+        incarnation: Uuid,
+        scope: rtdb_db::ActivationScope,
+    ) -> Result<Self> {
+        use std::{net::Ipv4Addr, sync::Arc};
+
+        use rtdb_crypt::FileKms;
+        use rtdb_db::{MultiDatabase, MultiOptions};
+        use rtdb_node::{Clock, SystemClock};
+        use rtdb_storage::{IoRegion, LocalStore};
+        use sha2::{Digest, Sha256};
+
+        use crate::multi::{CLOCK_DRIFT_MICROS, WRITER_LEASE_MICROS, io_error};
+
+        let data = &destination.data;
+        // Serialize with local restore and serving without opening a development runtime.
+        let lock = existing_marker(&data.join("journal"))?;
+        match fs2::FileExt::try_lock_exclusive(&lock) {
+            Ok(()) => (),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err(Anomaly::new(
+                    rtdb_types::AnomalyCategory::Busy,
+                    "rtdb.multi/development-journal",
+                    "Multi development data already has a local writer",
+                ));
+            }
+            Err(error) => return Err(io_error(error)),
+        }
+        let journal_marker: [u8; 32] = Sha256::digest(destination.journal_url.as_bytes()).into();
+        check_marker(&lock, &journal_marker)?;
+        check_marker(
+            &existing_marker(&data.join("database-id"))?,
+            incarnation.as_bytes(),
+        )?;
+
+        let connection = crate::cli::development_stream_journal(
+            &destination.journal_url,
+            &destination.journal_tls_dir,
+        )?;
+        let journal = rtdb_stream_journal::connect_consensus(&connection.url, &connection.credentials)
+            .ok_or_else(missing_installation)?
+            .map_err(io_error)?;
+        let journal: Arc<dyn journal_contract::Journal> = Arc::new(journal);
+        let keys = Arc::new(FileKms::open(&data.join("keys"), || SystemClock.now().0)?);
+        let objects = data.join("objects");
+        if !objects.is_dir() {
+            return Err(missing_installation());
+        }
+
+        let io = IoRegion::new();
+        let store = Arc::new(LocalStore::open_in(objects, io.clone())?);
+        let database = MultiDatabase::new(
+            MultiOptions {
+                database: incarnation,
+                node: Ipv4Addr::LOCALHOST.into(),
+                lease_micros: WRITER_LEASE_MICROS,
+                drift_micros: CLOCK_DRIFT_MICROS,
+            },
+            journal.clone(),
+            store,
+            keys,
+            Arc::new(|| SystemClock.now()),
+        )?
+        .with_immutable_journal()
+        .with_activation_scope(scope)?;
+        Ok(Self { _lock: lock, journal, database, io })
+    }
 }
 
 #[cfg(unix)]
@@ -766,6 +955,7 @@ mod tests {
                     successor,
                     manifest_digest: [2; 32],
                     destination_cell: None,
+                    source_cut: recovery::SourceCut::default(),
                     activation_scope: Some(
                         rtdb_db::ActivationScope::new(authority.identity(), &database).unwrap(),
                     ),
@@ -787,6 +977,7 @@ mod tests {
         let reply = request(expected)
             .execute(
                 &authority,
+                None,
                 None,
                 &Attestors::new(),
                 rtdb_storage::AppleSync::default(),
@@ -814,6 +1005,7 @@ mod tests {
             request(wrong)
                 .execute(
                     &authority,
+                    None,
                     None,
                     &Attestors::new(),
                     rtdb_storage::AppleSync::default()
@@ -859,34 +1051,31 @@ pub(in crate::multi) mod testing {
             Self {
                 request: Request {
                     database: database.to_owned(),
-                    action: Action::Publish {
-                        expected,
-                        operation_id,
-                        installation: Some(RemoteInstallation {
-                            cell,
-                            manifest_sha256,
-                            attestation,
-                        }),
+                    action: Action::Recovery {
+                        operation: recovery::Operation { predecessor: expected, operation_id },
+                        action: RecoveryAction::RecordInstall {
+                            installation: Some(RemoteInstallation { cell, manifest_sha256, attestation }),
+                        },
                     },
                 },
                 attestors: Attestors::from([(cell, key.public_key().as_ref().try_into().unwrap())]),
             }
         }
 
-        pub(in crate::multi) async fn publish(
+        pub(in crate::multi) async fn record(
             &self,
             authority: &ActivationAuthority,
         ) -> Result<Value> {
             broker::call_test_peer(authority, &self.attestors, &self.request).await
         }
 
-        pub(in crate::multi) async fn retry_without_proof(
+        pub(in crate::multi) async fn publish_without_proof(
             &self,
             authority: &ActivationAuthority,
         ) -> Result<Value> {
             let mut request = self.request.clone();
-            if let Action::Publish { installation, .. } = &mut request.action {
-                *installation = None;
+            if let Action::Recovery { action, .. } = &mut request.action {
+                *action = RecoveryAction::Publish;
             }
             broker::call_test_peer(authority, &Attestors::new(), &request).await
         }

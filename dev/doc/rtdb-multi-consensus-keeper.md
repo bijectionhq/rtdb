@@ -194,6 +194,56 @@ Starting a serving listener for the staged incarnation requires a grant for both
 Set `RTDB_ACTIVATION_CELL_ID` on the selected cell when serving or reopening the incarnation.
 Cross-cell publication upgrades the binding to cell-aware grant protocol version 3. Earlier readers reject that binding.
 
+### Durable recovery
+
+Use the durable workflow for a new recovery. Its first write upgrades the name to
+protocol version 4. Upgrade serving readers and operator brokers before that
+write. Existing names on versions 1 through 3 retain their legacy commands.
+
+Pass the same `--expected-incarnation`, `--expected-revision`, and
+`--operation-id` to each command.
+
+1. Run `begin-recovery --loss-policy lossless|accept-unknown-tail`. Pass
+   `--cell-id` for a remote destination. The authority records the predecessor,
+   operation, destination, and loss policy and returns the candidate incarnation.
+2. Run `freeze-recovery` to close predecessor grant issuance for that exact
+   intent. For a lossless move, run `seal-source` against the broker once the
+   commissioned source has stopped. The broker waits out old grants and seals
+   the immutable source journal with a quorum writer fence. It records the
+   resulting committed head as the final source LSN. Export through that head.
+3. Restore into the candidate. For a remote destination, issue the signed
+   installation receipt with `attest` and present it to `record-install` with
+   `--cell-id`, `--installation-proof`, and `--manifest-sha256`. For a stopped
+   local destination, `record-install` can use the direct or broker-configured
+   verifier. The authority retains the verified archive digest, source LSN,
+   application position, and system time. A lossless installation must match
+   the retained final source LSN. An accepted unknown tail records the chosen
+   cut and leaves the final source LSN absent.
+4. Run `publish-recovery`. The broker reopens the recorded installation and
+   freeze from quorum, waits out predecessor authority, and compares the same
+   intent when committing the successor. The destination and proof file may be
+   offline by this point.
+
+An accepted-unknown-tail recovery can record the installation before freezing.
+`recovery-status` returns the pending intent or the latest completed operation
+from the authority after restart. A retry of publication returns the same
+retained result. The expected binding revision fences retries after another
+successor has been published. To replace an unfinished attempt, supply
+`--supersede-operation-id` with a new operation ID to `begin-recovery`. This
+preserves an existing freeze and any sealed lossless source cut.
+
+Lossless source sealing uses a broker-configured stopped deployment with its
+incarnation, optional cell, and protected data directory and source journal
+TLS credentials in `source.location`. The broker checks the local database ID,
+journal marker, and encrypted commissioning scope before using the source
+writer credential. The provider configuration is installed with the broker.
+The socket request supplies the operation identity only.
+
+The portable installer and these verification paths use the existing local
+object and key custody. The local custodian retains the staged closure through
+publication. Hosted object and key custody needs a provider hold for the same
+closure before a hosted verifier can certify it.
+
 ## Batches, placement, funded appends and journal size
 
 - **Batches.** The consensus `JournalBatchAppender` sends a Multi group as

@@ -20,7 +20,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use super::{Access, ActivationAuthority, Attestors, Destination, DestinationReader, Request};
+use super::{Access, ActivationAuthority, Attestors, Destination, DestinationReader, Request, Source};
 
 const MAX_FRAME_BYTES: usize = 16 * 1024;
 const MAX_CONNECTIONS: usize = 16;
@@ -34,6 +34,7 @@ struct Config {
     authority_tls_dir: PathBuf,
     operator_uids: BTreeSet<u32>,
     destination: Option<Destination>,
+    source: Option<Source>,
     #[serde(default)]
     destination_attestors: Attestors,
 }
@@ -68,16 +69,22 @@ impl Config {
                 != config.destination_attestors.len()
             || !config.authority_url.starts_with(super::CONSENSUS_SCHEME)
             || !config.authority_tls_dir.is_absolute()
-            || config.destination.as_ref().is_some_and(|destination| {
-                !destination.data.is_absolute()
-                    || !destination.journal_url.starts_with(super::CONSENSUS_SCHEME)
-                    || !destination.journal_tls_dir.is_absolute()
+            || config.destination.as_ref().is_some_and(|destination| !absolute_location(destination))
+            || config.source.as_ref().is_some_and(|source| {
+                source.incarnation.is_nil() || source.cell.is_some_and(|cell| cell.is_nil())
+                    || !absolute_location(&source.location)
             })
         {
             return Err(configuration());
         }
         Ok(config)
     }
+}
+
+fn absolute_location(location: &Destination) -> bool {
+    location.data.is_absolute()
+        && location.journal_url.starts_with(super::CONSENSUS_SCHEME)
+        && location.journal_tls_dir.is_absolute()
 }
 
 pub(super) async fn serve(
@@ -91,6 +98,12 @@ pub(super) async fn serve(
         super::super::require_independent_journals(
             &config.authority_url,
             &destination.journal_url,
+        )?;
+    }
+    if let Some(source) = &config.source {
+        super::super::require_independent_journals(
+            &config.authority_url,
+            &source.location.journal_url,
         )?;
     }
     let authority = ActivationAuthority::connect(
@@ -116,7 +129,7 @@ pub(super) async fn serve(
                 requests.spawn(async move {
                     handle_peer(
                         stream, &authority, &config.operator_uids, config.destination.as_ref(),
-                        &config.destination_attestors, apple_sync,
+                        config.source.as_ref(), &config.destination_attestors, apple_sync,
                     )
                     .await;
                 });
@@ -132,6 +145,7 @@ async fn handle_peer(
     authority: &ActivationAuthority,
     operator_uids: &BTreeSet<u32>,
     destination: Option<&Destination>,
+    source: Option<&Source>,
     attestors: &Attestors,
     apple_sync: rtdb_storage::AppleSync,
 ) {
@@ -145,6 +159,7 @@ async fn handle_peer(
                     .execute(
                         authority,
                         destination.map(DestinationReader::Broker),
+                        source,
                         attestors,
                         apple_sync,
                     )
@@ -329,6 +344,7 @@ mod tests {
                     &authority,
                     &allowed,
                     None,
+                    None,
                     &Attestors::new(),
                     rtdb_storage::AppleSync::default(),
                 )
@@ -400,6 +416,7 @@ pub(super) async fn call_test_peer(
             server,
             authority,
             &allowed,
+            None,
             None,
             attestors,
             rtdb_storage::AppleSync::default(),

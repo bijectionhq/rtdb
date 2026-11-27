@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 mod clock;
 pub(crate) mod operator;
+pub(super) mod recovery;
 pub use operator::{HELP as ACTIVATION_HELP, Options as ActivationOptions};
 
 use clock::{ElapsedClock, HOLDER_WINDOW};
@@ -27,6 +28,7 @@ use clock::{ElapsedClock, HOLDER_WINDOW};
 const ABSOLUTE_GRANT_PROTOCOL: u8 = 1;
 const ELAPSED_GRANT_PROTOCOL: u8 = 2;
 const CELL_GRANT_PROTOCOL: u8 = 3;
+const RECOVERY_INTENT_PROTOCOL: u8 = 4;
 const RENEW_AHEAD: Duration = Duration::from_secs(1);
 const ATTEMPTS: usize = 8;
 
@@ -97,6 +99,8 @@ struct Publication {
     manifest_digest: [u8; 32],
     #[serde(default, skip_serializing_if = "Option::is_none")]
     destination_cell: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovery: Option<recovery::Completed>,
 }
 
 /// Produced by the destination installer after its reconstruction is committed.
@@ -107,6 +111,7 @@ pub struct VerifiedSuccessor {
     manifest_digest: [u8; 32],
     activation_scope: Option<rtdb_db::ActivationScope>,
     destination_cell: Option<Uuid>,
+    source_cut: recovery::SourceCut,
 }
 
 impl VerifiedSuccessor {
@@ -117,6 +122,11 @@ impl VerifiedSuccessor {
             manifest_digest: installed.manifest_sha256(),
             activation_scope: installed.activation_scope(),
             destination_cell: None,
+            source_cut: recovery::SourceCut {
+                lsn: installed.source_lsn().0,
+                position: installed.source_basis().position(),
+                system_time: installed.source_system_time().0,
+            },
         }
     }
 }
@@ -129,6 +139,10 @@ struct State {
     grants_end: Option<i64>,
     retired: BTreeSet<Uuid>,
     publication: Option<Publication>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovery: Option<recovery::Pending>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    superseded_recoveries: BTreeSet<Uuid>,
 }
 
 impl State {
@@ -143,6 +157,8 @@ impl State {
             grants_end: None,
             retired: BTreeSet::new(),
             publication: None,
+            recovery: None,
+            superseded_recoveries: BTreeSet::new(),
         }
     }
 
@@ -169,6 +185,9 @@ impl State {
             return Err(conflict());
         }
         self.require(publication.predecessor)?;
+        if self.version >= RECOVERY_INTENT_PROTOCOL && publication.recovery.is_none() {
+            return Err(conflict());
+        }
         if !self.grants_closed || self.retired.contains(&successor) {
             return Err(conflict());
         }
@@ -319,6 +338,9 @@ impl ActivationAuthority {
         self.change(self.stream_id(name)?, |state| {
             let state = state.ok_or_else(unavailable)?;
             state.require(expected)?;
+            if state.version >= RECOVERY_INTENT_PROTOCOL {
+                return Err(conflict());
+            }
             if state.grants_closed {
                 return Ok(None);
             }
@@ -390,6 +412,7 @@ impl ActivationAuthority {
             predecessor: expected,
             manifest_digest: successor.manifest_digest,
             destination_cell: successor.destination_cell,
+            recovery: None,
         };
         let stream = self.stream_id(name)?;
         let (_, frozen) = self.read(stream).await?;
@@ -405,32 +428,40 @@ impl ActivationAuthority {
                 if state.already_published(publication, successor.successor)? {
                     return Ok(None);
                 }
-                let mut next = state.clone();
-                let version = if successor.destination_cell.is_some() {
-                    CELL_GRANT_PROTOCOL
-                } else {
-                    ELAPSED_GRANT_PROTOCOL
-                };
-                next.version = state.version.max(version);
-                // A higher revision already excludes successors issued by this
-                // protocol. Retain arbitrary identities from older bindings.
-                let derived_predecessor = state.publication.and_then(|prior| {
-                    successor_incarnation(self.identity, name, prior.predecessor, prior.operation, prior.destination_cell).ok()
-                });
-                if derived_predecessor != Some(expected.incarnation) {
-                    next.retired.insert(expected.incarnation);
-                }
-                next.binding = Binding {
-                    incarnation: successor.successor,
-                    revision: expected.revision.checked_add(1).ok_or_else(conflict)?,
-                };
-                next.grants_closed = false;
-                next.grants_end = None;
-                next.publication = Some(publication);
-                Ok(Some(next))
+                Ok(Some(self.install_binding(name, state, publication, successor.successor)?))
             })
             .await?;
         Ok(ActivationStatus::published(&state))
+    }
+
+    fn install_binding(
+        &self, name: &str, state: &State, publication: Publication, incarnation: Uuid,
+    ) -> Result<State> {
+        let mut next = state.clone();
+        let version = if publication.destination_cell.is_some() {
+            CELL_GRANT_PROTOCOL
+        } else {
+            ELAPSED_GRANT_PROTOCOL
+        };
+        next.version = state.version.max(version);
+        let predecessor = publication.predecessor;
+        // Retain identities that were assigned outside the successor protocol.
+        let derived_predecessor = state.publication.and_then(|prior| {
+            successor_incarnation(self.identity, name, prior.predecessor, prior.operation, prior.destination_cell).ok()
+        });
+        if derived_predecessor != Some(predecessor.incarnation) {
+            next.retired.insert(predecessor.incarnation);
+        }
+        next.binding = Binding {
+            incarnation,
+            revision: predecessor.revision.checked_add(1).ok_or_else(conflict)?,
+        };
+        next.grants_closed = false;
+        next.grants_end = None;
+        next.publication = Some(publication);
+        next.recovery = None;
+        next.superseded_recoveries.clear();
+        Ok(next)
     }
 
     pub(super) fn serving_authority(
@@ -508,11 +539,12 @@ impl ActivationAuthority {
                 return Err(corrupt());
             }
             let state: State = serde_json::from_slice(bytes).map_err(|_| corrupt())?;
-            if !matches!(state.version, ABSOLUTE_GRANT_PROTOCOL | ELAPSED_GRANT_PROTOCOL | CELL_GRANT_PROTOCOL)
+            if !matches!(state.version, ABSOLUTE_GRANT_PROTOCOL | ELAPSED_GRANT_PROTOCOL | CELL_GRANT_PROTOCOL | RECOVERY_INTENT_PROTOCOL)
                 || state.destination_cell().is_some_and(|cell| cell.is_nil() || state.version < CELL_GRANT_PROTOCOL)
                 || state.binding.incarnation.is_nil()
                 || state.binding.revision == 0
                 || state.retired.contains(&state.binding.incarnation)
+                || !state.valid_recovery()
             {
                 return Err(corrupt());
             }
@@ -888,6 +920,7 @@ mod tests {
             successor,
             manifest_digest: [3; 32],
             destination_cell: None,
+            source_cut: recovery::SourceCut::default(),
             activation_scope: Some(rtdb_db::ActivationScope::new(authority.identity(), "xtdb").unwrap()),
         };
         let published = tokio::time::timeout(
@@ -940,6 +973,7 @@ mod tests {
             successor,
             manifest_digest: [4; 32],
             destination_cell: None,
+            source_cut: recovery::SourceCut::default(),
             activation_scope: Some(rtdb_db::ActivationScope::new(identity, "xtdb").unwrap()),
         };
         let serving = authority.serving_authority("xtdb", predecessor).unwrap();

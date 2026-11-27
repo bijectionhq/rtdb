@@ -1,6 +1,6 @@
-use super::activation::ActivationAuthority;
 #[cfg(not(unix))]
 use super::activation::VerifiedSuccessor;
+use super::activation::{ActivationAuthority, recovery::{Intent, LossPolicy, Operation, Status}};
 use journal_contract::Journal;
 use rtdb_crypt::FileKms;
 use rtdb_db::{ActivationScope, MultiDatabase, MultiOptions, PortableBackup, Role};
@@ -98,11 +98,13 @@ fn transaction(key: u8) -> Transact {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn portable_cut_replaces_a_lost_cell_and_fences_its_return() {
     let (mut authority_keepers, control_journal) = journal().await;
-    let authority = ActivationAuthority::new(control_journal.clone(), Uuid::new_v4()).unwrap();
-    let activation_scope = ActivationScope::new(authority.identity(), NAME).unwrap();
+    let authority_id = Uuid::new_v4();
+    let authority = ActivationAuthority::new(control_journal.clone(), authority_id).unwrap();
+    let activation_scope = ActivationScope::new(authority_id, NAME).unwrap();
     let predecessor_id = Uuid::new_v4();
     let predecessor_binding = authority.bootstrap(NAME, predecessor_id).await.unwrap();
     let operation = Uuid::new_v4();
+    let recovery = Operation { predecessor: predecessor_binding, operation_id: operation };
     let destination_cell = cfg!(unix).then(Uuid::new_v4);
     let successor_id = authority
         .successor_incarnation_in_cell(NAME, predecessor_binding, operation, destination_cell)
@@ -132,10 +134,15 @@ async fn portable_cut_replaces_a_lost_cell_and_fences_its_return() {
 
     drop(source);
     source_keepers.shutdown().await.unwrap();
-    authority
-        .close_grants(NAME, predecessor_binding)
-        .await
-        .unwrap();
+    assert!(matches!(
+        authority.begin_recovery(NAME, Intent {
+            operation: recovery,
+            destination_cell,
+            loss_policy: LossPolicy::AcceptUnknownTail,
+        }, None).await.unwrap(),
+        Status::Pending { candidate, grants_closed: false, .. } if candidate == successor_id
+    ));
+    authority.freeze_recovery(NAME, recovery).await.unwrap();
 
     let (mut destination_keepers, destination_journal) = journal().await;
     let destination_store = Arc::new(MemoryStore::default());
@@ -216,15 +223,25 @@ async fn portable_cut_replaces_a_lost_cell_and_fences_its_return() {
         destination_cell.unwrap(),
         &installed,
     );
+    #[cfg(unix)]
+    assert_eq!(publication.record(&authority).await.unwrap()["stage"], "pending");
+    #[cfg(not(unix))]
+    authority.record_recovery_installation(NAME, recovery, successor).await.unwrap();
     let destination_keeper_ids = destination_keepers.keepers().keys().copied().collect::<Vec<_>>();
     destination_keepers.shutdown().await.unwrap();
 
+    drop(authority);
+    let authority = ActivationAuthority::new(control_journal.clone(), authority_id).unwrap();
+    assert!(matches!(
+        authority.recovery_status(NAME, recovery).await.unwrap(),
+        Status::Pending { grants_closed: true, installation: Some(_), .. }
+    ));
     let _active = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             #[cfg(unix)]
-            let result = publication.publish(&authority).await;
+            let result = publication.publish_without_proof(&authority).await;
             #[cfg(not(unix))]
-            let result = authority.publish_successor(NAME, predecessor_binding, operation, successor).await;
+            let result = authority.publish_recovery(NAME, recovery).await;
             match result {
                 Ok(active) => break active,
                 Err(error) if error.code == "rtdb/activation-draining" => {
@@ -238,11 +255,13 @@ async fn portable_cut_replaces_a_lost_cell_and_fences_its_return() {
     .unwrap();
     #[cfg(unix)]
     {
-        assert_eq!(_active["incarnation"], successor_id.to_string());
-        assert_eq!(_active["revision"], predecessor_binding.revision + 1);
-        assert_eq!(_active["destination_cell"], destination_cell.unwrap().to_string());
-        assert_eq!(_active["grant_protocol_version"], 3);
-        assert_eq!(publication.retry_without_proof(&authority).await.unwrap(), _active);
+        assert_eq!(_active["stage"], "published");
+        assert_eq!(_active["binding"]["incarnation"], successor_id.to_string());
+        assert_eq!(_active["binding"]["revision"], predecessor_binding.revision + 1);
+        assert_eq!(_active["intent"]["destination_cell"], destination_cell.unwrap().to_string());
+        assert_eq!(_active["intent"]["loss_policy"], "accept-unknown-tail");
+        assert!(_active["final_source_lsn"].is_null());
+        assert_eq!(publication.publish_without_proof(&authority).await.unwrap(), _active);
         let wrong_cell = Uuid::new_v4();
         assert_ne!(
             authority.successor_incarnation_in_cell(NAME, predecessor_binding, operation, Some(wrong_cell)).unwrap(),
@@ -277,13 +296,10 @@ async fn portable_cut_replaces_a_lost_cell_and_fences_its_return() {
     .await
     .expect("publication keeps just its verified authority checkpoint");
     #[cfg(not(unix))]
-    assert_eq!(
-        authority
-            .publish_successor(NAME, predecessor_binding, operation, successor)
-            .await
-            .unwrap(),
-        binding
-    );
+    assert!(matches!(
+        authority.publish_recovery(NAME, recovery).await.unwrap(),
+        Status::Published { binding: published, .. } if published == binding
+    ));
 
     for keeper in destination_keeper_ids {
         destination_keepers.restart(keeper).await.unwrap();
@@ -331,12 +347,17 @@ async fn portable_cut_replaces_a_lost_cell_and_fences_its_return() {
             .code,
         "rtdb/activation-fenced"
     );
-    authority.close_grants(NAME, binding).await.unwrap();
+    let next = Operation { predecessor: binding, operation_id: Uuid::new_v4() };
+    authority.begin_recovery(NAME, Intent {
+        operation: next,
+        destination_cell: None,
+        loss_policy: LossPolicy::Lossless,
+    }, None).await.unwrap();
+    authority.freeze_recovery(NAME, next).await.unwrap();
     let frozen = authority.status(NAME).await.unwrap();
     assert!(frozen.grants_closed);
     assert_eq!(frozen.destination_cell, destination_cell);
-    #[cfg(unix)]
-    assert_eq!(frozen.grant_protocol_version, 3);
+    assert_eq!(frozen.grant_protocol_version, 4);
     source_keepers.shutdown().await.unwrap();
     destination_keepers.shutdown().await.unwrap();
     authority_keepers.shutdown().await.unwrap();

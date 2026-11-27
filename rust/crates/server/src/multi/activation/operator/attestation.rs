@@ -16,7 +16,7 @@ use rtdb_types::{Anomaly, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::super::{Binding, VerifiedSuccessor, successor_incarnation};
+use super::super::{Binding, VerifiedSuccessor, recovery::SourceCut, successor_incarnation};
 
 const VERSION: u8 = 1;
 
@@ -160,6 +160,11 @@ impl Attestation {
             manifest_digest: evidence.manifest_sha256,
             activation_scope: Some(intent.scope()?),
             destination_cell: Some(cell),
+            source_cut: SourceCut {
+                lsn: evidence.source_lsn,
+                position: evidence.source_position,
+                system_time: evidence.source_system_time,
+            },
         })
     }
 }

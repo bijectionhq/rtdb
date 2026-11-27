@@ -420,6 +420,12 @@ contract CellMap {
         -- A fresh linearizable read of the binding authorizes a grant under reader credentials.
         -- Its holder expires the grant from before that read using a suspend-aware clock and a conservative rate bound.
         -- Closing grant issuance applies to one expected incarnation and activation revision.
+        -- A durable recovery records one operation, expected binding, destination cell and loss policy before publication.
+        -- Recovery freezes the exact operation. Supersession compares its identity and preserves any committed freeze and final lossless source cut.
+        -- Lossless recovery waits out source serving grants and obtains the final committed position from a source quorum seal.
+        -- A recorded installation must cover that final source position or carry explicit acceptance of an unknown tail at its verified cut.
+        -- The authority retains the verified installation and commits publication against that exact frozen operation.
+        -- Publication retries read the retained result and the predecessor revision fences older operations after a later publication.
         -- Publication compares that same binding, verifies the installed successor, and measures a full conservative grant window after observing the committed closure.
         -- The successor's identity is derived from the name, next activation revision and recovery operation.
         -- The local activation broker authenticates operator peers and owns its journal writer credential.
