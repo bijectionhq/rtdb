@@ -322,13 +322,15 @@ Offline repair and active standalone compaction work out of the box without a li
 **What differs.**
 Alongside InMemory, Local, ReadOnlyLocal, and Kafka, RTDB adds Logkeeper quorum logs, `logkeeper-consensus://`, Multi hosted journals, and FileJournal.
 For Kafka, RTDB uses `librdkafka`, translates supported Java client properties, and refuses `transactional.id`.
-For Kafka Connect sources, RTDB replaces dynamic JVM classloading with a closed native registry of converters (String, primitives, ByteArray, JSON, Confluent Avro, JSON Schema), SMTs (Cast, Flatten, Timestamp, etc.), and three predicates, returning `xtdb.kafka-connect-source/plugin-class-not-found` for unknown classes, and adds schema-registry data-contract rules with a DLQ producer.
+The native adapter supports Kerberos login, unsecured OAuthBearer login for development, and client-credentials OIDC with token refresh.
+For OIDC, list the exact token endpoint in `RTDB_KAFKA_OAUTHBEARER_ALLOWED_URLS` before opening a broker client.
+For Kafka Connect sources, RTDB replaces dynamic JVM classloading with a closed native registry of converters (String, primitives, ByteArray, JSON, Confluent Avro, JSON Schema, and Confluent Protobuf), SMTs (Cast, Flatten, Timestamp, etc.), and three predicates, returning `xtdb.kafka-connect-source/plugin-class-not-found` for unknown classes, and adds schema-registry data-contract rules with a DLQ producer.
 
 **Why.**
 A native Rust binary cannot load arbitrary Java JARs from a classpath and needs native quorum-log backends for hosted Multi clusters.
 
 **What a user sees.**
-RTDB rejects custom Java Kafka Connect converters and transforms at configuration time.
+RTDB rejects custom Java Kafka Connect converters, transforms and OAuth callbacks at configuration time.
 Built-in Connect pipelines gain schema-registry data-contract rules and DLQ support without a JVM.
 
 **Where in the code.**
@@ -645,7 +647,8 @@ A `COPY FROM STDIN` exceeding 1 GiB is rejected, and plaintext connections to an
 
 **What differs.**
 RTDB's plain Flight SQL `run` and `empty` tickets use upstream XTDB's unsigned JSON `QueryTicket` format.
-RTDB can include the extension keys `"searchPath"` and `"awaitFloor"` for non-default query state.
+A non-default search path uses the RTDB extension key `"searchPath"`.
+The reader still accepts the `"awaitFloor"` key on earlier RTDB tickets.
 Three deliberate RTDB extensions remain:
 - control inspections (`SHOW`) issue HMAC-signed, session-bound `"inspect"` tickets that expire with the session;
 - `ListActions` advertises `rtdb.v1.*` (and, when enabled, `rtdb.store.v1`, `rtdb.owned.*`, `rtdb.custody.v1`, `rtdb.admin.v1`, and hosted DoExchange uploads) alongside the standard Flight SQL actions;
@@ -690,14 +693,17 @@ TLS cipher negotiation uses `rustls`/`aws-lc-rs` instead of JSSE.
 
 **What differs.**
 Upstream XTDB embeds via `Xtdb.openNode`, `Xtdb.Connection`, Clojure `xtdb.api`, classpath config discovery, EDN with `#env`, and JVM extension hooks (`!Edgar`, `!Gleif`, `!Recording`, `allocator`, `spanProcessor`, `instantSource`).
-RTDB exposes a C ABI (`rtdb-ffi`, `include/rtdb.h`) and a JDK 25 FFM binding (`bindings/jvm`) providing ADBC and Clojure `Connectable` only, rejecting JVM config objects and extension tags; config loading performs no classpath search and treats EDN as data-only.
+RTDB exposes a C ABI and a JDK 25 FFM binding through `NativeDatabase`, ADBC, and Clojure `Connectable`.
+The binding supports native config files, listener and catalog discovery, a JDBC connection builder, typed transaction settings, and portable document and SQL operations.
+Config loading uses native YAML or data-only EDN.
 RTDB adds CLI subcommands (`dev`, `standalone`, `initialize-standalone`, `admin`, `classic-opening`, `native-dependent-custody`, `repair-checkpoint`, `retain-repair-base`, `inspect`, `--memory-limit`, `--build-info`), JSON output for file inspectors, the offline `rtdb-config` qualification binary, RTDB-only YAML keys and environment variables, and the separate `rtdb-multi` shared-cell runtime (`multiCheckpoints: {deferred, binary}`, binary branch records, gateways, logkeeper quorums, and deployment admin RPCs).
 
 **Why.**
 A native Rust engine cannot host arbitrary JVM extension plugins and needs native C/FFM embedding, offline config checks, and a multi-tenant cell runtime.
 
 **What a user sees.**
-JVM callers must connect via ADBC, pgwire, Flight SQL, or the FFM `Connectable` binding rather than `Xtdb.openNode` with custom JVM modules.
+Embedded callers use `NativeDatabase` and the native connection types.
+The binding accepts native configuration for log, storage, and authentication providers.
 YAML files using RTDB-only keys (such as `search.*`, `grants`, `query.spillLimitBytes`, `defaultV1Serving`, or `multiCheckpoints`) are rejected by upstream XTDB, and configs using JVM-only tags are rejected by RTDB.
 
 **Where in the code.**
