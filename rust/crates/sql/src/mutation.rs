@@ -42,6 +42,13 @@ impl StaticMutation {
     }
 }
 
+impl crate::ParsedStatement<'_> {
+    /// Whether submission can attempt a static document bind for this syntax.
+    pub fn has_static_document_source(&self) -> bool {
+        crate::bind::has_static_document_shape(self)
+    }
+}
+
 /// Returns an expression-only source for literal/parameter INSERT and PATCH statements.
 /// A syntax error remains an error; a data-dependent statement returns `None`.
 pub fn prepare_static(sql: &str, catalog: &dyn Catalog, options: &crate::PrepareOptions) -> Result<Option<StaticMutation>> {

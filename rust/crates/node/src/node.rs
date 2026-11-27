@@ -31,7 +31,7 @@ use rtdb_maintenance::CollectionObserver;
 use rtdb_plan::{CatalogMetrics, CatalogUsers};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryCursor};
 use rtdb_storage::cache::{BufferPool, CacheBudget};
-use rtdb_tx::{IDEMPOTENCY_GUARD_RESULT, RetainedAnomaly, SubmitOptions, SubmittedTx, TransactionAuthorization, TransactionResult, TxOp, prepare_submission_with_sql_options};
+use rtdb_tx::{IDEMPOTENCY_GUARD_RESULT, RetainedAnomaly, ScheduledOperation, SubmitOptions, SubmittedTx, TransactionAuthorization, TransactionResult, TxOp, prepare_scheduled_submission};
 use rtdb_types::{Anomaly, AnomalyCategory, AnomalyKind, CatalogCut, EntityId, Interval, LogicalType, PlacedAttempt, PlacedDecision, ReplicaPosition, Result, ScalarType, SourcePosition, TimeBasis, TimeUnit, Timestamp, TransactionKey, TxBasis, TxId, Value};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
@@ -805,13 +805,13 @@ impl Node {
         rtdb_storage::IoRegion::leased(lease, rtdb_query::evaluate_fragment_with_arguments(context, fragment, arguments)).await
     }
 
-    async fn submit(&self, database: &str, operations: Vec<TxOp>, mut options: SubmitOptions, permit: Option<crate::ReplaySubmissionPermit>, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<SubmittedTx> {
+    async fn submit(&self, database: &str, operations: Vec<ScheduledOperation>, mut options: SubmitOptions, permit: Option<crate::ReplaySubmissionPermit>, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<SubmittedTx> {
         self.admit(database, DatabaseAccess::Write, identity, cancellation).await?;
         if self.factory.resources.journal_native_sql() {
             return Err(Anomaly::unsupported("rtdb.multi/sql-write", "Multi writes use rtdb.v1.Transact"));
         }
         if !self.factory.options.owned_relations
-            && operations.iter().any(TxOp::is_owned)
+            && operations.iter().any(|operation| operation.operation().is_owned())
         {
             return Err(owned_relations_disabled());
         }
@@ -844,7 +844,7 @@ impl Node {
             _ => None,
         };
         let seed = authority.map(|authority| authority.scope().issue());
-        let source = prepare_submission_with_sql_options(operations, options, database.name(), &self.factory.memory, &sql_options)?
+        let source = prepare_scheduled_submission(operations, options, database.name(), &self.factory.memory, &sql_options)?
             .with_placed_seed(seed);
         let (source, submitted_at) = match replay {
             Some((replay, submitted_at)) => (source.with_replay_submission(replay), Some(submitted_at)),
@@ -4557,10 +4557,14 @@ impl SessionService for NativeSessionService {
         Ok(())
     }
     async fn submit(&self, database: &str, operations: Vec<TxOp>, options: SubmitOptions, cancellation: &CancellationToken) -> Result<SubmittedTx> {
-        self.node.submit(database, operations, options, None, self.identity.as_ref(), self.placement.as_ref(), cancellation).await
+        self.submit_scheduled(database, operations.into_iter().map(ScheduledOperation::from).collect(), options, None, cancellation).await
     }
     async fn submit_replay(&self, database: &str, operations: Vec<TxOp>, options: SubmitOptions, permit: crate::ReplaySubmissionPermit, cancellation: &CancellationToken) -> Result<SubmittedTx> {
-        self.node.submit(database, operations, options, Some(permit), self.identity.as_ref(), self.placement.as_ref(), cancellation).await
+        self.submit_scheduled(database, operations.into_iter().map(ScheduledOperation::from).collect(), options, Some(permit), cancellation).await
+    }
+
+    async fn submit_scheduled(&self, database: &str, operations: Vec<ScheduledOperation>, options: SubmitOptions, permit: Option<crate::ReplaySubmissionPermit>, cancellation: &CancellationToken) -> Result<SubmittedTx> {
+        self.node.submit(database, operations, options, permit, self.identity.as_ref(), self.placement.as_ref(), cancellation).await
     }
     async fn await_transaction(&self, database: &str, tx_id: TxId, cancellation: &CancellationToken) -> Result<TransactionResult> { self.node.await_transaction_result(database, tx_id, None, self.identity.as_ref(), self.placement.as_ref(), cancellation).await }
     async fn await_submission(&self, database: &str, submitted: &SubmittedTx, cancellation: &CancellationToken) -> Result<(TransactionResult, Option<String>)> {

@@ -87,6 +87,11 @@ An earlier database-operation timestamp can therefore fail index predecessor val
 `allium/live-index.allium` records the unresolved specification question about zero-row declarations.
 
 `prepare_submission_with_sql_options` uses the submitting node's captured SQL preparation settings during static SQL expansion.
+An eligible prepared INSERT or PATCH can retain one static plan from a successful submission expansion.
+Reuse requires the same statement source, target database, submission search path, endpoint policy, effective transaction time zone, and positional execution types after argument coalescing.
+Static planning uses the transaction-scoped submission catalog, whose table lookups are empty.
+Each submission evaluates its own arguments and bounds, then encodes the result through the ordinary source and retry digest paths.
+Source SQL still goes to transaction resolution when static expansion declines, including expressions that need transaction time or live catalog data.
 The node also supplies its endpoint policy to transaction-time SQL resolution.
 The endpoint setting remains process configuration and adds no field to the source log.
 Computed GENERATE_SERIES calls remain SQL source operations and use the resolving node's endpoint policy.

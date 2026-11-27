@@ -113,6 +113,19 @@ impl Service {
         let mut native = connection.borrow().await?;
         self.execute_update_in(&mut native, source, arguments).await
     }
+
+    pub(crate) async fn execute_prepared_upload(
+        &self, connection: &Arc<ConnectionResource>, source: &str, plan: Option<&PreparedSql>, arguments: Option<SqlArguments>,
+    ) -> Result<(), Status> {
+        let Some(plan) = plan.filter(|plan| plan.is_dml()) else {
+            return Box::pin(self.execute_update(connection, source, arguments)).await;
+        };
+        let mut native = connection.borrow().await?;
+        let token = native.state().cancellation().child_token();
+        let _cancel = token.clone().drop_guard();
+        native.prepare_context(&token).await.map_err(status)?.check_cancelled().map_err(status)?;
+        execute_prepared_update(&mut native, plan, arguments, true).await
+    }
     async fn execute_update_in(&self, native: &mut NativeSession, source: &str, arguments: Option<SqlArguments>) -> Result<(), Status> {
         let token = native.state().cancellation().child_token(); let _cancel = token.clone().drop_guard();
         let options = options(native);
@@ -123,7 +136,7 @@ impl Service {
         let context = native.prepare_context(&token).await.map_err(status)?;
         let prepared = PreparedSql::prepare(source, &context, options, ResultSignaturePolicy::Dynamic)
             .map_err(status)?;
-        execute_prepared_update(native, &prepared, arguments).await
+        execute_prepared_update(native, &prepared, arguments, false).await
     }
 
     fn empty_update_info(&self) -> Result<(wire::OwnedSchema, Bytes), Status> {
@@ -158,7 +171,7 @@ impl Service {
             if prepared.is_dml() {
                 let arguments = params.as_ref().map(|params| params.arguments(self.memory())).transpose()?;
                 native.prepare_context(&token).await.map_err(status)?;
-                execute_prepared_update(&mut native, &prepared, arguments).await?;
+                execute_prepared_update(&mut native, &prepared, arguments, previous.is_some()).await?;
                 return self.empty_update_info();
             }
             let (basis, context) = Box::pin(native.read_context(&token)).await.map_err(status)?;
@@ -334,10 +347,14 @@ async fn execute_control_update(native: &mut NativeSession, control: &ControlSta
     }
 }
 
-async fn execute_prepared_update(native: &mut NativeSession, prepared: &PreparedSql, arguments: Option<SqlArguments>) -> Result<(), Status> {
+async fn execute_prepared_update(native: &mut NativeSession, prepared: &PreparedSql, arguments: Option<SqlArguments>, reuse_plan: bool) -> Result<(), Status> {
     if !prepared.is_dml() { return Err(not_an_update()); }
-    let operation = prepared.dml_operation(arguments).map_err(status)?;
-    if let Some(result) = Box::pin(native.state_mut().execute_operation(operation)).await.map_err(status)? {
+    let operation = if reuse_plan {
+        prepared.schedule_dml(arguments)
+    } else {
+        prepared.dml_operation(arguments).map(Into::into)
+    }.map_err(status)?;
+    if let Some(result) = Box::pin(native.state_mut().execute_scheduled_operation(operation)).await.map_err(status)? {
         if let Some(error) = result.error() { return Err(status(error.clone())); }
     }
     Ok(())

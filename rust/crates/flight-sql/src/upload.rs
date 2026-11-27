@@ -100,7 +100,8 @@ impl Service {
                     drop(charge);
                     let arguments = upload.all_arguments().await?;
                     let connection = self.scoped(&call, &prepared.scope).await?;
-                    Box::pin(self.execute_update(&connection, &prepared.sql, arguments)).await?; Ok(update_ack())
+                    Box::pin(self.execute_prepared_upload(&connection, &prepared.sql, prepared.plan.as_ref(), arguments)).await?;
+                    Ok(update_ack())
                 }
                 Command::CommandStatementIngest(mut command) => {
                     validate_ingest(&command, &call.database)?;

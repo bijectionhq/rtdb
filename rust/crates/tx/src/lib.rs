@@ -17,7 +17,7 @@ mod replica;
 mod submission;
 mod inspection;
 pub use inspection::{OperationRows, OperationValue, decode_operation_rows, visit_operation_rows};
-pub use submission::{prepare_submission, prepare_submission_with_sql_options};
+pub use submission::{PreparedDml, ScheduledOperation, prepare_scheduled_submission, prepare_submission, prepare_submission_with_sql_options};
 
 pub use values::*;
 pub use guard_attribution::attributed_historical_guard_original;

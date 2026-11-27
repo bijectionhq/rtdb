@@ -1190,6 +1190,10 @@ rule TransitionToFollower {
 rule ClientSubmitsTransaction {
     -- A client submits a transaction: it is appended to the SOURCE log, which every node shares, so this succeeds whether or not this node happens to be the leader.
     -- Static expansion requires a declared column list for a VALUES insert.
+    -- A prepared INSERT or PATCH may reuse its static expansion plan for the same SQL source, target database, submission options, effective time zone, and positional execution types.
+    -- The static plan uses the transaction-scoped submission catalog with empty table lookups.
+    -- Each reuse evaluates the submitted argument rows and temporal bounds, and preserves the source encoding and retry digest of ordinary expansion.
+    -- Volatile expressions and expressions requiring transaction time or a live catalog proceed to transaction resolution as SQL.
     -- A VALUES insert whose source width cannot match its declared projection proceeds to transaction resolution as SQL.
     -- A static SQL mutation with an invalid temporal literal proceeds to transaction resolution as SQL.
     -- The resolved abort records the literal planning diagnostic and consumes a transaction position.

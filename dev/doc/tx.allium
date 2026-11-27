@@ -832,6 +832,8 @@ entity DmlBuffer {
     -- Accumulates buffered ops for a Writing transaction. Consecutive same-SQL ops
     -- coalesce: their args are appended column-major into the last op, so a prepared
     -- INSERT executed in a loop becomes one multi-row op. Drained at COMMIT.
+    -- Prepared static writes carry their plan owner through buffering.
+    -- Submission checks reuse against the transaction's effective time zone and the coalesced argument types.
     -- See: Xtdb.Connection.DmlBuffer
     transaction: Transaction
     ops: List<TxOp>

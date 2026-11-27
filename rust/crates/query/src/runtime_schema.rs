@@ -146,7 +146,8 @@ fn field_bound(field: &Field) -> Result<usize> {
 pub(crate) fn schema_bound(schema: &Schema) -> Result<usize> {
     schema.fields().iter().try_fold(4096, |bytes, field| add(bytes, field_bound(field)?))
 }
-pub(crate) fn expression_bound(expr: &Expr) -> Result<usize> {
+/// Bounds allocation for an expression and the values and types it owns.
+pub fn expression_bound(expr: &Expr) -> Result<usize> {
     stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || expression_bound_at(expr))
 }
 fn expression_bound_at(expr: &Expr) -> Result<usize> {
@@ -238,7 +239,8 @@ pub(crate) fn local_allocation_bound(relation: &Relation) -> Result<usize> {
     }
     Ok(bytes)
 }
-pub(crate) fn allocation_bound(relation: &Relation) -> Result<usize> {
+/// Bounds allocation across a relation tree, including expression and schema storage.
+pub fn allocation_bound(relation: &Relation) -> Result<usize> {
     let mut bytes = local_allocation_bound(relation)?;
     for child in relation.children() { bytes = add(bytes, allocation_bound(child)?)?; }
     if let RelationNode::Reference { binding } = relation.node() { bytes = add(bytes, allocation_bound(&binding.relation)?)?; }

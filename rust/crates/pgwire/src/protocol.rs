@@ -155,6 +155,7 @@ struct Portal {
     cancellation: CancellationToken,
     _charges: Vec<Arc<MemoryReservation>>,
     binding: Option<PortalBinding>,
+    reuse_dml_plan: bool,
 }
 
 impl Portal {
@@ -435,6 +436,7 @@ impl ProtocolSession {
                 let statement = Arc::downgrade(&prepared);
                 let mut portal = Box::pin(self.bind(prepared, arguments, Vec::new(), &result_formats)).await?;
                 portal.binding = Some(PortalBinding { statement, _storage: storage });
+                portal.reuse_dml_plan = true;
                 self.portals.insert(name.to_owned(), portal); writer.empty(b'2').await?;
             }
             b'D' => {
@@ -673,7 +675,7 @@ impl ProtocolSession {
             }
             None => None,
         };
-        let mut portal = Portal { prepared: Arc::clone(&prepared), arguments, columns, state: PortalState::Ready, cancellation: token.clone(), _charges: charges, binding: None };
+        let mut portal = Portal { prepared: Arc::clone(&prepared), arguments, columns, state: PortalState::Ready, cancellation: token.clone(), _charges: charges, binding: None, reuse_dml_plan: false };
         let control_options = self.control_options();
         let cursor = match (prepared.ordinary_kind(), prepared.control()) {
             (Some(PreparedKind::CopyOut(query, _)), _) => {
@@ -722,7 +724,9 @@ impl ProtocolSession {
                 let arguments = if arguments.batch().num_columns() == 0 { None } else {
                     Some(SqlArguments::from_canonical_arrow_row(arguments, self.node.memory())?)
                 };
-                return Box::pin(self.bind(inner, arguments, Vec::new(), formats)).await;
+                let mut inner = Box::pin(self.bind(inner, arguments, Vec::new(), formats)).await?;
+                inner.reuse_dml_plan = true;
+                return Ok(inner);
             }
             _ => None,
         };
@@ -781,7 +785,13 @@ impl ProtocolSession {
                 if self.config.read_only { return Err(Anomaly::incorrect("xtdb/dml-in-read-only-server", "DML is not allowed on the READ ONLY server")); }
                 if self.session.state().is_read_only() { return Err(Anomaly::incorrect("xtdb/dml-in-read-only-tx", "DML is not allowed in a READ ONLY transaction").with_context("query", source.into())); }
                 self.begin_implicit(Some(false))?;
-                self.session.state_mut().execute_operation(statement.dml_operation(portal.arguments.clone())?).await?;
+                let arguments = portal.arguments.clone();
+                let operation = if portal.reuse_dml_plan {
+                    statement.schedule_dml(arguments)?
+                } else {
+                    statement.dml_operation(arguments)?.into()
+                };
+                self.session.state_mut().execute_scheduled_operation(operation).await?;
                 if commit_dml_before_reply { Box::pin(self.commit(permit)).await?; }
                 match statement.ordered_index_command_tag() {
                     Some(tag) => writer.string(b'C', tag).await,

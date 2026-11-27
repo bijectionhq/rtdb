@@ -1,22 +1,24 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_schema::DataType;
-use rtdb_columnar::{ArrowCell, MemoryBudget};
+use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation};
 use rtdb_expr::{EvalContext, evaluate};
 use rtdb_plan::{Catalog, Expr, QualifiedTable, Relation, RelationNode, Schema, TableBinding, TemporalFilter};
 use rtdb_types::{Anomaly, LogicalType, Result, ScalarType, TimeUnit, Timestamp, Value};
 #[cfg(test)]
 use rtdb_types::StructFields;
-use rtdb_sql::StaticMutationKind;
+use rtdb_sql::{PrepareOptions, StaticMutation, StaticMutationKind};
 
 use crate::{ArrowDocuments, Documents, SourceTransaction, SqlArguments, SubmitOptions, TxOp};
 use crate::source::{DocumentCell, Operation, owned_projected_documents};
 use crate::values::{BoundArgumentRow, canonical_argument_column, plain_scalar_field};
 use crate::values::arguments::{canonical_float_field, compatible_float_cell};
 
+// Static planning sees the database name and a fixed empty catalog, even for PATCH.
+// The resolver uses the ordered transaction snapshot when it applies the patch.
 struct SubmissionCatalog<'a>(&'a str);
 impl Catalog for SubmissionCatalog<'_> {
     fn default_database(&self) -> &str { self.0 }
@@ -24,6 +26,106 @@ impl Catalog for SubmissionCatalog<'_> {
     fn table(&self, _: &QualifiedTable) -> Result<Option<TableBinding>> { Ok(None) }
     fn tables(&self, _: &str) -> Result<Vec<TableBinding>> { Ok(Vec::new()) }
     fn transaction_scoped(&self) -> bool { true }
+}
+
+/// One prepared statement's source and most recently used static submission plan.
+#[derive(Clone)]
+pub struct PreparedDml(Arc<PreparedDmlData>);
+
+struct PreparedDmlData {
+    source: String,
+    plan: Mutex<Option<Arc<CachedStaticMutation>>>,
+    reservation: Arc<MemoryReservation>,
+}
+
+struct CachedStaticMutation {
+    options: PrepareOptions,
+    mutation: StaticMutation,
+    _reservation: Arc<MemoryReservation>,
+}
+
+impl PreparedDml {
+    pub fn new(source: &str, memory: &Arc<MemoryBudget>) -> Option<Self> {
+        let reservation = memory.try_reserve(source.len().checked_add(512)?)?;
+        Some(Self(Arc::new(PreparedDmlData {
+            source: source.to_owned(),
+            plan: Mutex::new(None),
+            reservation,
+        })))
+    }
+
+    pub fn schedule(&self, args: Option<SqlArguments>) -> ScheduledOperation {
+        ScheduledOperation {
+            operation: TxOp::Sql { sql: self.0.source.clone(), args },
+            prepared: Some(self.clone()),
+        }
+    }
+
+    fn cached(
+        &self, sql_options: &PrepareOptions, timezone: &str, args: Option<&SqlArguments>, database: &str,
+    ) -> Option<Arc<CachedStaticMutation>> {
+        let cached = self.0.plan.lock().expect("prepared DML plan lock poisoned").clone()?;
+        let PrepareOptions { search_path, parameter_types, default_timezone, generate_series_end_exclusive } = &cached.options;
+        let matches = cached.mutation.table.database == database
+            && search_path == &sql_options.search_path
+            && default_timezone == timezone
+            && *generate_series_end_exclusive == sql_options.generate_series_end_exclusive
+            && parameter_types.len() == args.map_or(0, |args| args.types().len())
+            && parameter_types.iter().zip(args.into_iter().flat_map(|args| args.execution_types()).enumerate())
+                .all(|((&index, ty), (position, actual))| index == position && *ty == actual);
+        matches.then_some(cached)
+    }
+
+    fn remember(&self, options: PrepareOptions, mutation: StaticMutation) {
+        let Ok(bytes) = static_plan_bytes(&options, &mutation) else { return; };
+        let Some(reservation) = self.0.reservation.budget().try_reserve(bytes) else { return; };
+        let entry = Arc::new(CachedStaticMutation { options, mutation, _reservation: reservation });
+        *self.0.plan.lock().expect("prepared DML plan lock poisoned") = Some(entry);
+    }
+}
+
+fn static_plan_bytes(options: &PrepareOptions, mutation: &StaticMutation) -> Result<usize> {
+    let mut bytes = rtdb_query::relation_allocation_bound(&mutation.input)?
+        .checked_add(options.default_timezone.capacity()).and_then(|bytes| bytes.checked_add(1024))
+        .ok_or_else(overflow)?;
+    let table = &mutation.table;
+    for name in options.search_path.iter().chain([&table.database, &table.table.schema, &table.table.table]) {
+        bytes = bytes.checked_add(name.capacity()).and_then(|bytes| bytes.checked_add(64)).ok_or_else(overflow)?;
+    }
+    for ty in options.parameter_types.values() {
+        bytes = bytes.checked_add(ty.retained_bytes()?).and_then(|bytes| bytes.checked_add(256)).ok_or_else(overflow)?;
+    }
+    for expr in mutation.valid_time().expressions() {
+        bytes = bytes.checked_add(rtdb_query::expression_allocation_bound(expr)?).ok_or_else(overflow)?;
+    }
+    Ok(bytes)
+}
+
+/// A pending operation and its optional in-process submission plan owner.
+pub struct ScheduledOperation {
+    operation: TxOp,
+    prepared: Option<PreparedDml>,
+}
+
+impl From<TxOp> for ScheduledOperation {
+    fn from(operation: TxOp) -> Self { Self { operation, prepared: None } }
+}
+
+impl ScheduledOperation {
+    pub fn operation(&self) -> &TxOp { &self.operation }
+    pub fn into_operation(self) -> TxOp { self.operation }
+
+    /// Coalesces consecutive equal SQL texts while preserving positional argument order.
+    pub fn append_sql(&mut self, next: Self) -> Result<Option<Self>> {
+        match (&mut self.operation, next.operation) {
+            (TxOp::Sql { sql, args: Some(target) }, TxOp::Sql { sql: next_sql, args: Some(args) }) if *sql == next_sql => {
+                target.append(args)?;
+                if self.prepared.is_none() { self.prepared = next.prepared; }
+                Ok(None)
+            }
+            (_, operation) => Ok(Some(Self { operation, prepared: next.prepared })),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -41,6 +143,141 @@ fn hosted_capacity_sql_remains_an_ordered_operation() -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod prepared_tests {
+    use super::{MemoryBudget, Operation, PrepareOptions, PreparedDml, SqlArguments, SubmitOptions, TxOp,
+        prepare_scheduled_submission, prepare_submission, prepare_submission_with_sql_options};
+    use rtdb_types::{Anomaly, AnomalyKind, Result, Timestamp, Value};
+    use std::sync::Arc;
+
+    #[test]
+    fn repeated_insert_keeps_source_bytes_and_the_retry_digest_for_each_argument_batch() -> Result<()> {
+        let memory = MemoryBudget::new(1 << 24);
+        let sql = "INSERT INTO docs (_id, label) VALUES ($2, $1)";
+        let statement = PreparedDml::new(sql, &memory).unwrap();
+        let options = PrepareOptions::default();
+        let submit = |args: SqlArguments| {
+            let expected = prepare_submission(vec![TxOp::Sql { sql: sql.into(), args: Some(args.clone()) }], SubmitOptions::default(), "xtdb", &memory)?;
+            let actual = prepare_scheduled_submission([statement.schedule(Some(args))], SubmitOptions::default(), "xtdb", &memory, &options)?;
+            assert_eq!(actual.encode()?.as_slice(), expected.encode()?.as_slice());
+            assert_eq!(actual.body_digest()?, expected.body_digest()?);
+            Ok::<_, Anomaly>(actual)
+        };
+        let args = |values: &[(&str, i64)]| SqlArguments::from_rows(values.iter().map(|(label, id)| {
+            vec![Value::Utf8((*label).into()), Value::I64(*id)]
+        }).collect(), &memory);
+        let first_args = args(&[("first", 1)])?;
+        let first = submit(first_args.clone())?;
+        let kept = statement.cached(&options, "UTC", Some(&first_args), "xtdb").unwrap();
+
+        let second_args = args(&[("second", 2), ("third", 3)])?;
+        let second = submit(second_args.clone())?;
+        assert_ne!(first.body_digest()?, second.body_digest()?);
+        assert!(Arc::ptr_eq(&kept, &statement.cached(&options, "UTC", Some(&second_args), "xtdb").unwrap()));
+
+        let empty = SqlArguments::new(second_args.types().to_vec(), vec![], &memory)?;
+        let empty = submit(empty)?;
+        assert!(matches!(empty.operations.as_slice(), [Operation::Public(TxOp::Sql { sql: retained, args: Some(args) })]
+            if retained == sql && args.row_count() == 0));
+        Ok(())
+    }
+
+    #[test]
+    fn warm_static_insert_does_not_require_a_syntax_reservation() -> Result<()> {
+        let owner = MemoryBudget::new(1 << 24);
+        let constrained = MemoryBudget::new(1 << 20);
+        let sql = format!("INSERT /*{}*/ INTO docs (_id) VALUES (1)", " ".repeat(8192));
+        let statement = PreparedDml::new(&sql, &owner).unwrap();
+        let submit = |memory| prepare_scheduled_submission([statement.schedule(None)], SubmitOptions::default(), "xtdb", memory, &PrepareOptions::default());
+
+        assert!(submit(&constrained).err().unwrap().is(AnomalyKind::ResourceExhausted));
+        let expected = submit(&owner)?;
+        let actual = submit(&constrained)?;
+        assert_eq!(actual.encode()?.as_slice(), expected.encode()?.as_slice());
+        drop(statement);
+        drop(expected);
+        assert_eq!(owner.used_bytes(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_patch_binds_current_options_and_coalesced_positional_types() -> Result<()> {
+        let memory = MemoryBudget::new(1 << 24);
+        let sql = "PATCH INTO docs FOR VALID_TIME FROM $1 RECORDS {_id: $2, label: $3}";
+        let statement = PreparedDml::new(sql, &memory).unwrap();
+        let use_args = |id, label| SqlArguments::from_rows(vec![vec![Value::Utf8("1970-01-01T00:00:00".into()), Value::I64(id), label]], &memory);
+        let first = use_args(1, Value::I64(10))?;
+        let second = use_args(2, Value::Utf8("two".into()))?;
+        let mut joined = first.clone();
+        joined.append(second.clone())?;
+        let after_coalescing = || {
+            let mut operation = statement.schedule(Some(first.clone()));
+            assert!(operation.append_sql(statement.schedule(Some(second.clone())))?.is_none());
+            Ok::<_, Anomaly>(operation)
+        };
+        let submit = |operation, args, database: &str, timezone: &str, sql_options: &PrepareOptions| {
+            let submit = SubmitOptions { default_tz: timezone.into(), ..Default::default() };
+            let expected = prepare_submission_with_sql_options(vec![TxOp::Sql { sql: sql.into(), args: Some(args) }], submit.clone(), database, &memory, sql_options)?;
+            let actual = prepare_scheduled_submission([operation], submit, database, &memory, sql_options)?;
+            assert_eq!(actual.encode()?.as_slice(), expected.encode()?.as_slice());
+            assert_eq!(actual.body_digest()?, expected.body_digest()?);
+            Ok::<_, Anomaly>(actual)
+        };
+        let options = PrepareOptions::default();
+        submit(statement.schedule(Some(first.clone())), first.clone(), "xtdb", "UTC", &options)?;
+        let initial = statement.cached(&options, "UTC", Some(&first), "xtdb").unwrap();
+        assert!(statement.cached(&options, "UTC", Some(&joined), "xtdb").is_none());
+        let result = submit(after_coalescing()?, joined.clone(), "xtdb", "UTC", &options)?;
+        let rebound = statement.cached(&options, "UTC", Some(&joined), "xtdb").unwrap();
+        assert!(!Arc::ptr_eq(&initial, &rebound));
+        assert!(matches!(result.operations.as_slice(),
+            [Operation::PatchArrowIids { valid_from: Some(Timestamp(0)), .. }]));
+
+        assert!(statement.cached(&options, "+02:00", Some(&joined), "xtdb").is_none());
+        assert!(statement.cached(&options, "UTC", Some(&joined), "other").is_none());
+        let other = PrepareOptions { search_path: vec!["app".into()], generate_series_end_exclusive: true, ..options };
+        assert!(statement.cached(&other, "UTC", Some(&joined), "xtdb").is_none());
+        let result = submit(after_coalescing()?, joined.clone(), "other", "+02:00", &other)?;
+        assert!(matches!(result.operations.as_slice(),
+            [Operation::PatchArrowIids { table, valid_from: Some(Timestamp(-7_200_000_000)), .. }] if table.schema == "app"));
+        assert!(statement.cached(&other, "+02:00", Some(&joined), "other").is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_submission_preserves_dynamic_source_and_reached_errors() -> Result<()> {
+        let memory = MemoryBudget::new(1 << 24);
+        let options = PrepareOptions::default();
+        for sql in [
+            "INSERT INTO docs (_id, v) VALUES (1, CURRENT_TIMESTAMP)",
+            "INSERT INTO docs (_id, v) VALUES (1, RANDOM())",
+            "INSERT INTO docs (_id, v) VALUES (1)",
+            "PATCH INTO docs FOR VALID_TIME FROM CURRENT_TIMESTAMP RECORDS {_id: 1}",
+        ] {
+            let statement = PreparedDml::new(sql, &memory).unwrap();
+            for _ in 0..2 {
+                let actual = prepare_scheduled_submission([statement.schedule(None)], SubmitOptions::default(), "xtdb", &memory, &options)?;
+                assert!(matches!(actual.operations.as_slice(), [Operation::Public(TxOp::Sql { sql: retained, args: None })] if retained == sql));
+            }
+            assert!(statement.cached(&options, "UTC", None, "xtdb").is_none());
+        }
+
+        let sql = "PATCH INTO docs FOR VALID_TIME FROM $1 RECORDS {_id: $2}";
+        let statement = PreparedDml::new(sql, &memory).unwrap();
+        let args = |bound: &str| SqlArguments::from_rows(vec![
+            vec![Value::Utf8("1970-01-02".into()), Value::I64(1)],
+            vec![Value::Utf8(bound.into()), Value::I64(2)],
+        ], &memory);
+        prepare_scheduled_submission([statement.schedule(Some(args("1970-01-01")?))], SubmitOptions::default(), "xtdb", &memory, &options)?;
+        let invalid = args("not a date")?;
+        assert!(statement.cached(&options, "UTC", Some(&invalid), "xtdb").is_some());
+        let actual = prepare_scheduled_submission([statement.schedule(Some(invalid.clone()))], SubmitOptions::default(), "xtdb", &memory, &options).err().unwrap();
+        let expected = prepare_submission(vec![TxOp::Sql { sql: sql.into(), args: Some(invalid) }], SubmitOptions::default(), "xtdb", &memory).err().unwrap();
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+}
+
 pub fn prepare_submission(operations: Vec<TxOp>, options: SubmitOptions, database: &str, memory: &Arc<MemoryBudget>) -> Result<SourceTransaction> {
     prepare_submission_with_sql_options(operations,options,database,memory,&rtdb_sql::PrepareOptions::default())
 }
@@ -48,13 +285,21 @@ pub fn prepare_submission(operations: Vec<TxOp>, options: SubmitOptions, databas
 /// Expands static SQL using the submitting node's captured preparation settings.
 /// Argument types and timezone are taken from each operation and its transaction options; no SQL setting is added to the durable envelope.
 pub fn prepare_submission_with_sql_options(operations: Vec<TxOp>, options: SubmitOptions, database: &str, memory: &Arc<MemoryBudget>, sql_options: &rtdb_sql::PrepareOptions) -> Result<SourceTransaction> {
+    prepare_scheduled_submission(operations.into_iter().map(ScheduledOperation::from), options, database, memory, sql_options)
+}
+
+/// Prepares the original source operations, reusing matching plans from the submitting statements.
+pub fn prepare_scheduled_submission(
+    operations: impl IntoIterator<Item = ScheduledOperation>, options: SubmitOptions,
+    database: &str, memory: &Arc<MemoryBudget>, sql_options: &PrepareOptions,
+) -> Result<SourceTransaction> {
     let mut output = Vec::new();
-    for operation in operations {
+    for ScheduledOperation { operation, prepared } in operations {
         let expanded = match &operation {
-            TxOp::Sql { sql, args } => expand(sql, args.as_ref(), &options, database, memory, sql_options)?,
+            TxOp::Sql { sql, args } => expand(sql, args.as_ref(), &options, database, memory, sql_options, prepared.as_ref())?,
             TxOp::SqlBytes { sql, arg_bytes } => {
                 let args = if arg_bytes.as_slice().is_empty() { None } else { Some(crate::source::decode_arguments(arg_bytes.clone().into_bytes(), memory)?) };
-                expand(sql, args.as_ref(), &options, database, memory, sql_options)?
+                expand(sql, args.as_ref(), &options, database, memory, sql_options, None)?
             }
             _ => None,
         };
@@ -63,10 +308,20 @@ pub fn prepare_submission_with_sql_options(operations: Vec<TxOp>, options: Submi
     SourceTransaction::from_operations(output, options, memory)?.with_bounded_retry()
 }
 
-fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, database: &str, memory: &Arc<MemoryBudget>, sql_options: &rtdb_sql::PrepareOptions) -> Result<Option<Vec<Operation>>> {
+fn expand(
+    sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, database: &str,
+    memory: &Arc<MemoryBudget>, sql_options: &PrepareOptions, prepared: Option<&PreparedDml>,
+) -> Result<Option<Vec<Operation>>> {
     let scope = rtdb_expr::EvaluationScope::new(memory)?;
-    let _syntax = memory.reserve(rtdb_sql::statement_syntax_estimate(sql.len()).ok_or_else(overflow)?)?;
-    let prepare = rtdb_sql::PrepareOptions { parameter_types: args.map(|args| args.execution_types().enumerate().collect()).unwrap_or_default(), default_timezone: options.default_tz.clone(), ..sql_options.clone() };
+    if let Some(cached) = prepared.and_then(|prepared| prepared.cached(sql_options, &options.default_tz, args, database)) {
+        return expand_plan(&cached.mutation, args, options, memory, &scope);
+    }
+    let syntax = memory.reserve(rtdb_sql::statement_syntax_estimate(sql.len()).ok_or_else(overflow)?)?;
+    let prepare = PrepareOptions {
+        parameter_types: args.map(|args| args.execution_types().enumerate().collect()).unwrap_or_default(),
+        default_timezone: options.default_tz.clone(),
+        ..sql_options.clone()
+    };
     let Some(plan) = rtdb_sql::prepare_static_in(sql, &SubmissionCatalog(database), &prepare, scope.memory_budget())? else { return Ok(None); };
     if plan.table.table.schema == "xt" && plan.table.table.table == crate::hosted_control::HOSTED_CAPACITY_DECLARATIONS {
         return Ok(None);
@@ -75,8 +330,17 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
         expr.requires_current_time() || expr.is_volatile() || rtdb_expr::requires_pg_catalog(expr)
     }
     fn needs_resolver(input: &Relation) -> bool { input.expressions().iter().any(|expr| resolve_only(expr)) || input.children().iter().any(|input| needs_resolver(input)) }
+    if needs_resolver(&plan.input) || plan.valid_time().expressions().iter().any(|expr| resolve_only(expr)) { return Ok(None); }
+    let expanded = expand_plan(&plan, args, options, memory, &scope)?;
+    if expanded.is_some() && let Some(prepared) = prepared {
+        drop(syntax);
+        prepared.remember(prepare, plan);
+    }
+    Ok(expanded)
+}
+
+fn expand_plan(plan: &StaticMutation, args: Option<&SqlArguments>, options: &SubmitOptions, memory: &Arc<MemoryBudget>, scope: &rtdb_expr::EvaluationScope) -> Result<Option<Vec<Operation>>> {
     let valid_time = plan.valid_time();
-    if needs_resolver(&plan.input) || valid_time.expressions().iter().any(|expr| resolve_only(expr)) { return Ok(None); }
     if args.is_some_and(|args| args.row_count() == 0) { return Ok(None); }
     let parameter_count = plan.input.parameter_count().max(valid_time.expressions().iter().map(|expr| {
         let mut count = 0; expr.visit(&mut |expr| { if let rtdb_plan::Expr::Parameter { index, .. } = expr { count = count.max(index + 1); } }); count
@@ -85,7 +349,7 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
     if matches!(plan.kind, StaticMutationKind::Put) && let Some(args) = args && !args.built_from_rows() && let Some(pages) = args.uniform_arrow_pages() {
         let canonical_row = args.has_single_canonical_arrow_row();
         let projected = if plan.input.schema().fields().iter().any(|field| valid_time_column(&field.name)) {
-            projected_timed_puts(&plan.input, &pages, canonical_row, &plan.table.table, &options.default_tz, &scope, memory)
+            projected_timed_puts(&plan.input, &pages, canonical_row, &plan.table.table, &options.default_tz, scope, memory)
         } else {
             projected_arrow_documents(&plan.input, &pages, canonical_row, memory).map(|documents| documents.map(|documents| {
                 let table = plan.table.table.clone();

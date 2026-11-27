@@ -1,10 +1,10 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use rtdb_columnar::{MemoryReservation, OwnedBatch};
 use rtdb_plan::{Catalog, CatalogLookups, ColumnId, Field, PreparedStatement, RecordingCatalog, Schema, SqlNotice, Statement};
 use rtdb_query::{PreparedQuery, QueryContext, QueryCursor, RuntimeSchema, SharedPlan, SharedPlanKey};
 use rtdb_sql::{DeferredStatementSyntax, ParsedStatement, PrepareOptions, StatementKind, StatementSyntaxBatch};
-use rtdb_tx::{SqlArguments, TxOp};
+use rtdb_tx::{PreparedDml, ScheduledOperation, SqlArguments, TxOp};
 use rtdb_types::{Anomaly, AnomalyCategory, AnomalyKind, LogicalType, MemoryBudget, PgType, Result, Value};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,7 +23,10 @@ struct PreparedData {
     _reservation: Arc<MemoryReservation>,
     plan: parking_lot::Mutex<Option<CachedPlan>>,
 }
-enum PreparedResult { Query { schema: Schema, pg_types: Vec<PgType>, parameter_projection: bool }, Dml }
+enum PreparedResult {
+    Query { schema: Schema, pg_types: Vec<PgType>, parameter_projection: bool },
+    Dml { static_source: Option<OnceLock<PreparedDml>> },
+}
 
 /// An immutable SQL preparation; each query execution binds against its supplied snapshot.
 /// Session access checks and read-basis capture precede this API and remain the caller's obligation.
@@ -134,8 +137,9 @@ impl PreparedSql {
         let mut cached = None;
         let result = match parsed.kind() {
             StatementKind::Dml => {
+                let static_source = parsed.has_static_document_source().then(OnceLock::new);
                 if dml_notices { notices = parsed.bind(&context.catalog, &options).map(|prepared| prepared.notices).unwrap_or_default(); }
-                PreparedResult::Dml
+                PreparedResult::Dml { static_source }
             }
             StatementKind::Query => {
                 let shared = if sharable {
@@ -189,9 +193,9 @@ impl PreparedSql {
     pub fn notices(&self) -> &[SqlNotice] { &self.0.notices }
     pub fn ordered_index_command_tag(&self) -> Option<&'static str> { self.0.ordered_index_command_tag }
     pub fn selects_read_settings(&self) -> bool { self.0.snapshot_selector != Default::default() }
-    pub fn is_dml(&self) -> bool { matches!(&self.0.result, PreparedResult::Dml) }
-    pub fn prepared_schema(&self) -> Option<&Schema> { match &self.0.result { PreparedResult::Query { schema, .. } => Some(schema), PreparedResult::Dml => None } }
-    pub fn postgres_types(&self) -> Option<&[PgType]> { match &self.0.result { PreparedResult::Query { pg_types, .. } => Some(pg_types), PreparedResult::Dml => None } }
+    pub fn is_dml(&self) -> bool { matches!(&self.0.result, PreparedResult::Dml { .. }) }
+    pub fn prepared_schema(&self) -> Option<&Schema> { match &self.0.result { PreparedResult::Query { schema, .. } => Some(schema), PreparedResult::Dml { .. } => None } }
+    pub fn postgres_types(&self) -> Option<&[PgType]> { match &self.0.result { PreparedResult::Query { pg_types, .. } => Some(pg_types), PreparedResult::Dml { .. } => None } }
 
     /// ADBC parameters are positional, have empty field names, and publish unknown nullable types.
     pub fn parameter_schema(&self) -> Result<Schema> {
@@ -397,6 +401,19 @@ impl PreparedSql {
     pub fn dml_operation(&self, arguments: Option<SqlArguments>) -> Result<TxOp> {
         if !self.is_dml() { return Err(kind_error()); }
         Ok(TxOp::Sql { sql: self.0.source.clone(), args: arguments })
+    }
+
+    /// Schedules a write with access to the statement-local static plan.
+    pub fn schedule_dml(&self, arguments: Option<SqlArguments>) -> Result<ScheduledOperation> {
+        let PreparedResult::Dml { static_source } = &self.0.result else { return Err(kind_error()); };
+        if let Some(slot) = static_source {
+            let prepared = slot.get().or_else(|| {
+                let prepared = PreparedDml::new(self.source(), self.0._reservation.budget())?;
+                Some(slot.get_or_init(|| prepared))
+            });
+            if let Some(prepared) = prepared { return Ok(prepared.schedule(arguments)); }
+        }
+        Ok(self.dml_operation(arguments)?.into())
     }
 
     pub(crate) fn bind(&self, context: &Arc<QueryContext>, argument_types: &[LogicalType], execution: bool) -> Result<PreparedQuery> {

@@ -75,6 +75,7 @@ pub use rtdb_storage::sealing::{DeliveryIo, current_delivery_deadline};
 pub use query_cpu::QueryCpu;
 pub use settings::{head_covers, unindexed_tx};
 pub use runtime_schema::RuntimeSchema;
+pub use runtime_schema::{allocation_bound as relation_allocation_bound, expression_bound as expression_allocation_bound};
 
 fn invalid(code: &str, message: impl std::fmt::Display) -> rtdb_types::Anomaly {
     rtdb_types::Anomaly::incorrect(format!("rtdb.query/{code}"), message.to_string())

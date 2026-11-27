@@ -213,8 +213,8 @@ impl StatementHandle {
                         let context = session.prepare_context_for(&statement.creation_database, &token).await?;
                         *prepared = Some(PreparedSql::prepare(text, &context, Default::default(), ResultSignaturePolicy::Dynamic)?);
                     }
-                    let operation = prepared.as_ref().ok_or_else(not_prepared)?.dml_operation(state.bound.as_ref().map(|bound| bound.arguments.clone()))?;
-                    token.run_until_cancelled(session.state_mut().execute_operation(operation)).await.ok_or_else(super::cancelled)??;
+                    let operation = prepared.as_ref().ok_or_else(not_prepared)?.schedule_dml(state.bound.as_ref().map(|bound| bound.arguments.clone()))?;
+                    token.run_until_cancelled(session.state_mut().execute_scheduled_operation(operation)).await.ok_or_else(super::cancelled)??;
                     Ok(-1)
                 }
                 Source::Set(control) => {
