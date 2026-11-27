@@ -23,7 +23,7 @@ pub use durability::{AppleSync, sync_directory, sync_file};
 #[cfg(feature = "remote")]
 pub mod remote;
 
-pub use error::{Error, Result};
+pub use error::{Error, LeaseCutoff, Result};
 pub use remote_version_step::valid_object_version;
 pub use io_region::{HeldView, IoRegion};
 pub use read_lease::ReadLease;

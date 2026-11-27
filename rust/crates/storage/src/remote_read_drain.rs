@@ -110,7 +110,7 @@ mod tests {
         worker.put(&other, Bytes::from_static(b"other")).await.unwrap();
 
         let clock = Arc::new(AtomicI64::new(9));
-        let lease = Arc::new(ReadLease::new(Some(10), Arc::new({
+        let lease = Arc::new(ReadLease::new(10, Arc::new({
             let clock = clock.clone();
             move || clock.load(Ordering::SeqCst)
         })));

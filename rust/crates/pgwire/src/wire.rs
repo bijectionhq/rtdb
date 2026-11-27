@@ -7,7 +7,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::error::{network, protocol};
 
 pub(crate) fn delivery_error(error: Anomaly) -> Anomaly {
-    if matches!(error.code.as_str(), "rtdb.storage/plaintext-delivery-expired" | "rtdb.storage/read-lease-expired") {
+    if error.is(rtdb_types::AnomalyKind::ReadExpired) {
         network(error.message.as_deref().unwrap_or("The plaintext delivery grant expired"))
     } else {
         error

@@ -368,7 +368,7 @@ mod tests {
         };
         let view = PlaintextView::new(MemoryBudget::new(64 << 10));
         let grant = view.grant().await.unwrap().holding(
-            HeldView::recovery(Arc::new(())), Some(Arc::new(ReadLease::new(Some(2_000_000), clock))),
+            HeldView::recovery(Arc::new(())), Some(Arc::new(ReadLease::new(2_000_000, clock))),
         );
         let egress = Arc::new(FlightEgress::default());
         egress.admit(grant, None).unwrap();

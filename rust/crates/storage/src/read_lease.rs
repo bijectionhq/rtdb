@@ -3,47 +3,38 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{Error, Result};
+use crate::{Error, LeaseCutoff, Result};
 
 pub use crate::lease_decision::lease_admits;
 
-/// A reader's entitlement to begin provider requests for files its catalog references.
+/// A reader's entitlement to begin provider requests for files its catalog references, until a cutoff.
 /// Checked when each request is admitted; a request already admitted runs to completion.
+/// Collection never waits for a lease: it bounds work that holds plaintext or a provider's grant, not file retention.
 pub struct ReadLease {
-    catalog: Option<CatalogLease>,
+    clocked: Option<ClockedCutoff>,
     provider: Option<Instant>,
 }
 
+/// A cutoff on a monotonic clock the caller supplies, such as the node's, so simulated time can drive it.
 #[derive(Clone)]
-struct CatalogLease {
-    deadline: Option<i64>,
+struct ClockedCutoff {
+    deadline: i64,
     clock: Arc<dyn Fn() -> i64 + Send + Sync>,
 }
 
 impl ReadLease {
-    /// A lease without a deadline admits nothing: its catalog was never confirmed current.
-    pub fn new(deadline: Option<i64>, clock: Arc<dyn Fn() -> i64 + Send + Sync>) -> Self {
-        Self {
-            catalog: Some(CatalogLease { deadline, clock }),
-            provider: None,
-        }
+    /// A lease that admits requests strictly before `deadline` on `clock`'s monotonic microseconds.
+    pub fn new(deadline: i64, clock: Arc<dyn Fn() -> i64 + Send + Sync>) -> Self {
+        Self { clocked: Some(ClockedCutoff { deadline, clock }), provider: None }
     }
 
     /// A provider's monotonic cutoff can shorten a serving view across clock origins.
     pub fn until(deadline: Instant) -> Self {
-        Self {
-            catalog: None,
-            provider: Some(deadline),
-        }
+        Self { clocked: None, provider: Some(deadline) }
     }
 
     /// The provider's original monotonic cutoff, if this lease carries one.
     pub fn provider_cutoff(&self) -> Option<Instant> { self.provider }
-
-    /// The catalog's cutoff in the node's clock coordinates.
-    pub fn deadline(&self) -> Option<i64> {
-        self.catalog.as_ref().and_then(|catalog| catalog.deadline)
-    }
 
     /// Converts both cutoffs to a local wakeup for work holding plaintext.
     pub fn local_cutoff(&self) -> Result<Instant> {
@@ -53,51 +44,30 @@ impl ReadLease {
     }
 
     pub(crate) fn remaining(&self) -> Duration {
-        let catalog = self.catalog.as_ref().map_or(Duration::MAX, |lease| {
-            let remaining = lease
-                .deadline
-                .map_or(0, |deadline| deadline.saturating_sub((lease.clock)()));
-            Duration::from_micros(u64::try_from(remaining).unwrap_or_default())
+        let clocked = self.clocked.as_ref().map_or(Duration::MAX, |cutoff| {
+            Duration::from_micros(u64::try_from(cutoff.deadline.saturating_sub((cutoff.clock)())).unwrap_or_default())
         });
-        self.provider.map_or(catalog, |deadline| {
-            catalog.min(deadline.saturating_duration_since(Instant::now()))
-        })
+        self.provider.map_or(clocked, |deadline| clocked.min(deadline.saturating_duration_since(Instant::now())))
     }
+
     /// The earlier of two leases; a query over several databases holds every one of them.
     pub fn earlier(self: Arc<Self>, other: Arc<Self>) -> Arc<Self> {
         if Arc::ptr_eq(&self, &other) {
             return self;
         }
-        if self.provider.is_none() && other.provider.is_none() {
-            return if self.deadline() <= other.deadline() {
-                self
-            } else {
-                other
-            };
-        }
-        let catalog = match (&self.catalog, &other.catalog) {
+        let clocked = match (&self.clocked, &other.clocked) {
             (Some(mine), Some(theirs)) if mine.deadline <= theirs.deadline => Some(mine.clone()),
             (_, Some(theirs)) => Some(theirs.clone()),
-            (mine, None) => mine.as_ref().cloned(),
+            (mine, None) => mine.clone(),
         };
         let provider = match (self.provider, other.provider) {
             (Some(mine), Some(theirs)) => Some(mine.min(theirs)),
             (mine, theirs) => mine.or(theirs),
         };
-        Arc::new(Self { catalog, provider })
+        Arc::new(Self { clocked, provider })
     }
 
-    fn check_catalog(&self) -> Result<()> {
-        let Some(lease) = &self.catalog else {
-            return Ok(());
-        };
-        let now = (lease.clock)();
-        match lease.deadline {
-            Some(deadline) if lease_admits(now, deadline) => Ok(()),
-            deadline => Err(Error::ReadLeaseExpired { deadline, now }),
-        }
-    }
-    /// A request admitted in time may still find its object gone if it ran past the deadline.
+    /// A request admitted in time may still find its object gone if it ran past the cutoff.
     /// Objects are immutable, so an overrun can only fail; it then reports the expired lease.
     pub fn classify<T>(&self, result: Result<T>) -> Result<T> {
         match result {
@@ -108,15 +78,14 @@ impl ReadLease {
             result => result,
         }
     }
+
+    /// - Errors: [`Error::ReadLeaseExpired`] at or after either cutoff, naming the one that passed.
     pub fn check(&self) -> Result<()> {
-        self.check_catalog()?;
-        if self
-            .provider
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
-            return Err(Error::Closed(
-                "The bounded provider read lease expired".into(),
-            ));
+        if !self.clocked.as_ref().is_none_or(|cutoff| lease_admits((cutoff.clock)(), cutoff.deadline)) {
+            return Err(Error::ReadLeaseExpired { cutoff: LeaseCutoff::Clocked });
+        }
+        if !self.provider.is_none_or(|deadline| Instant::now() < deadline) {
+            return Err(Error::ReadLeaseExpired { cutoff: LeaseCutoff::Provider });
         }
         Ok(())
     }
@@ -128,7 +97,7 @@ mod tests {
     use std::sync::atomic::{AtomicI64, Ordering};
     use crate::IoRegion;
 
-    fn lease(deadline: Option<i64>, now: &Arc<AtomicI64>) -> Arc<ReadLease> {
+    fn lease(deadline: i64, now: &Arc<AtomicI64>) -> Arc<ReadLease> {
         let now = Arc::clone(now);
         Arc::new(ReadLease::new(deadline, Arc::new(move || now.load(Ordering::SeqCst))))
     }
@@ -137,13 +106,11 @@ mod tests {
     async fn a_request_begins_only_strictly_before_the_deadline() {
         let now = Arc::new(AtomicI64::new(9));
         let region = IoRegion::new();
-        let admitted = IoRegion::leased(Some(lease(Some(10), &now)), region.run_blocking(|| Ok(1))).await;
+        let admitted = IoRegion::leased(Some(lease(10, &now)), region.run_blocking(|| Ok(1))).await;
         assert_eq!(admitted.unwrap(), 1);
         now.store(10, Ordering::SeqCst);
-        let refused = IoRegion::leased(Some(lease(Some(10), &now)), region.run_blocking(|| Ok(1))).await;
-        assert!(matches!(refused, Err(Error::ReadLeaseExpired { deadline: Some(10), now: 10 })));
-        let unconfirmed = IoRegion::leased(Some(lease(None, &now)), region.run_blocking(|| Ok(1))).await;
-        assert!(matches!(unconfirmed, Err(Error::ReadLeaseExpired { deadline: None, .. })));
+        let refused = IoRegion::leased(Some(lease(10, &now)), region.run_blocking(|| Ok(1))).await;
+        assert!(matches!(refused, Err(Error::ReadLeaseExpired { cutoff: LeaseCutoff::Clocked })));
     }
 
     #[tokio::test]
@@ -151,10 +118,10 @@ mod tests {
         let now = Arc::new(AtomicI64::new(0));
         let region = IoRegion::new();
         let overrun = { let now = Arc::clone(&now); move || { now.store(20, Ordering::SeqCst); Err::<(), _>(Error::MissingObject("trie".into())) } };
-        let result = IoRegion::leased(Some(lease(Some(10), &now)), region.run_blocking(overrun)).await;
-        assert!(matches!(result, Err(Error::ReadLeaseExpired { deadline: Some(10), now: 20 })));
+        let result = IoRegion::leased(Some(lease(10, &now)), region.run_blocking(overrun)).await;
+        assert!(matches!(result, Err(Error::ReadLeaseExpired { cutoff: LeaseCutoff::Clocked })));
         now.store(0, Ordering::SeqCst);
-        let within = IoRegion::leased(Some(lease(Some(10), &now)), region.run_blocking(|| Err::<(), _>(Error::MissingObject("trie".into())))).await;
+        let within = IoRegion::leased(Some(lease(10, &now)), region.run_blocking(|| Err::<(), _>(Error::MissingObject("trie".into())))).await;
         assert!(matches!(within, Err(Error::MissingObject(_))), "a missing object within the lease is a violation, not an expiry");
     }
 
@@ -162,28 +129,35 @@ mod tests {
     async fn a_nested_lease_narrows_the_enclosing_one() {
         let now = Arc::new(AtomicI64::new(15));
         let region = IoRegion::new();
-        let inner = lease(Some(100), &now);
-        let result = IoRegion::leased(Some(lease(Some(10), &now)), async { IoRegion::leased(Some(inner), region.run_blocking(|| Ok(()))).await }).await;
-        assert!(matches!(result, Err(Error::ReadLeaseExpired { deadline: Some(10), .. })));
+        let inner = lease(100, &now);
+        let result = IoRegion::leased(Some(lease(10, &now)), async { IoRegion::leased(Some(inner), region.run_blocking(|| Ok(()))).await }).await;
+        assert!(matches!(result, Err(Error::ReadLeaseExpired { cutoff: LeaseCutoff::Clocked })));
     }
 
     #[test]
-    fn catalog_and_provider_cutoffs_both_survive_nested_admission() {
+    fn clocked_and_provider_cutoffs_both_survive_nested_admission() {
         let now = Arc::new(AtomicI64::new(8_000_000_000));
-        let catalog = lease(Some(8_000_000_010), &now);
+        let clocked = lease(8_000_000_010, &now);
         let provider = Arc::new(ReadLease::until(Instant::now() + Duration::from_secs(60)));
-        let combined = provider.earlier(catalog.clone());
-        assert_eq!(combined.deadline(), Some(8_000_000_010));
+        let combined = provider.earlier(clocked.clone());
+        assert!(combined.provider_cutoff().is_some());
         assert!(combined.remaining() <= Duration::from_micros(10));
         now.store(8_000_000_011, Ordering::SeqCst);
-        assert!(matches!(
-            combined.check(),
-            Err(Error::ReadLeaseExpired { .. })
-        ));
+        assert!(matches!(combined.check(), Err(Error::ReadLeaseExpired { cutoff: LeaseCutoff::Clocked })));
         now.store(8_000_000_000, Ordering::SeqCst);
         let expired_provider = Arc::new(ReadLease::until(Instant::now()));
-        let combined = catalog.earlier(expired_provider);
+        let combined = clocked.earlier(expired_provider);
         assert!(combined.remaining().is_zero());
-        assert!(combined.check().is_err());
+        assert!(matches!(combined.check(), Err(Error::ReadLeaseExpired { cutoff: LeaseCutoff::Provider })), "an expired provider lease raises the typed expiry");
+    }
+
+    #[test]
+    fn an_expired_clocked_lease_reports_the_read_expiry_kind() {
+        let anomaly = rtdb_types::Anomaly::from(Error::ReadLeaseExpired { cutoff: LeaseCutoff::Clocked });
+        assert_eq!(anomaly.kind, Some(rtdb_types::AnomalyKind::ReadExpired));
+        assert_eq!(anomaly.code, "rtdb.storage/read-lease-expired");
+        // A provider withdrawing its serving view closes the read, which a placed session replays elsewhere.
+        let anomaly = rtdb_types::Anomaly::from(Error::ReadLeaseExpired { cutoff: LeaseCutoff::Provider });
+        assert_eq!(anomaly.code, "rtdb.storage/closed");
     }
 }

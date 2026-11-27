@@ -1099,10 +1099,9 @@ fn charge_bytes(spent: &mut u64, size: u64, limit: u64) -> Result<()> {
 }
 
 fn posting_read_error(error: rtdb_storage::Error) -> Anomaly {
+    let expired = matches!(error, rtdb_storage::Error::ReadLeaseExpired { .. });
     let error = Anomaly::from(error);
-    if matches!(error.category, AnomalyCategory::Forbidden | AnomalyCategory::Busy | AnomalyCategory::Interrupted)
-        || error.code == "rtdb.storage/read-lease-expired"
-    {
+    if expired || matches!(error.category, AnomalyCategory::Forbidden | AnomalyCategory::Busy | AnomalyCategory::Interrupted) {
         error
     } else {
         postings::corrupt(error)

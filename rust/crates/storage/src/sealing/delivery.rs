@@ -521,7 +521,7 @@ fn expired() -> rtdb_types::Anomaly {
         rtdb_types::AnomalyCategory::Unavailable,
         "rtdb.storage/plaintext-delivery-expired",
         "The live unit-key grant expired during answer delivery",
-    )
+    ).with_kind(rtdb_types::AnomalyKind::ReadExpired)
 }
 
 pub struct PlaintextDelivery {
@@ -721,7 +721,7 @@ mod tests {
             let now = now.clone();
             Arc::new(move || now.load(Ordering::Relaxed))
         };
-        let lease = Arc::new(ReadLease::new(Some(10_000_000), clock));
+        let lease = Arc::new(ReadLease::new(10_000_000, clock));
         let grant = view.grant().await.unwrap().holding(HeldView::recovery(Arc::new(())), Some(lease));
         let mut bytes = Vec::new();
         let error = grant.deliver(async {
@@ -745,7 +745,7 @@ mod tests {
             let now = Arc::clone(&now);
             Arc::new(move || now.load(Ordering::Relaxed))
         };
-        let lease = Arc::new(ReadLease::new(Some(5_000_000), clock));
+        let lease = Arc::new(ReadLease::new(5_000_000, clock));
         IoRegion::leased(
             Some(lease),
             view.reading(async {

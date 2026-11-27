@@ -2,6 +2,21 @@ use std::path::PathBuf;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// The cutoff a [`crate::ReadLease`] passed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeaseCutoff {
+    /// A deadline on the caller's monotonic clock, such as an owned read's validation deadline.
+    Clocked,
+    /// A provider's serving cutoff.
+    Provider,
+}
+
+impl std::fmt::Display for LeaseCutoff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self { Self::Clocked => "clocked", Self::Provider => "provider" })
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("invalid object key: {0}")]
@@ -53,8 +68,8 @@ pub enum Error {
     Deposed { epoch: u64, promised: u64 },
     #[error("the held view requires an erased storage key")]
     ErasedUnderView,
-    #[error("read lease expired at {deadline:?}; now {now}")]
-    ReadLeaseExpired { deadline: Option<i64>, now: i64 },
+    #[error("the read lease expired at its {cutoff} cutoff")]
+    ReadLeaseExpired { cutoff: LeaseCutoff },
     #[error("{upload}; multipart abort also failed: {abort}")]
     MultipartAbort { #[source] upload: Box<Error>, abort: Box<Error> },
 }
@@ -69,11 +84,12 @@ impl From<Error> for rtdb_types::Anomaly {
     fn from(error: Error) -> Self {
         use rtdb_types::{Anomaly, AnomalyCategory as Category, AnomalyKind};
         let message = error.to_string();
-        let kind = match error {
+        let kind = match &error {
             Error::MemoryLimit { .. } => Some(AnomalyKind::ResourceExhausted),
             Error::MessageTooLarge { .. } => Some(AnomalyKind::ConfigurationLimitExceeded),
             Error::MissingObject(_) => Some(AnomalyKind::MissingObject),
             Error::InvalidRange { .. } => Some(AnomalyKind::CorruptObject),
+            Error::ReadLeaseExpired { cutoff: LeaseCutoff::Clocked } => Some(AnomalyKind::ReadExpired),
             _ => None,
         };
         let (category, code, context) = match error {
@@ -101,7 +117,9 @@ impl From<Error> for rtdb_types::Anomaly {
             Error::Deposed { epoch, promised } => (Category::Conflict, "rtdb.storage/deposed", serde_json::json!({"epoch": epoch, "promised": promised})),
             Error::PermissionDenied { key, .. } => (Category::Forbidden, "rtdb.storage/permission-denied", serde_json::json!({"key": key})),
             Error::ErasedUnderView => (Category::Forbidden, "rtdb/erased-under-view", serde_json::json!({})),
-            Error::ReadLeaseExpired { deadline, now } => (Category::Unavailable, "rtdb.storage/read-lease-expired", serde_json::json!({"deadline": deadline, "now": now})),
+            Error::ReadLeaseExpired { cutoff: LeaseCutoff::Clocked } => (Category::Unavailable, "rtdb.storage/read-lease-expired", serde_json::json!({})),
+            // The provider withdrew the serving view, as when a placement moves; the read is closed rather than late.
+            Error::ReadLeaseExpired { cutoff: LeaseCutoff::Provider } => (Category::Unavailable, "rtdb.storage/closed", serde_json::json!({})),
             Error::MultipartAbort { upload, abort } => {
                 let mut anomaly = Anomaly::from(*upload);
                 anomaly.message = Some(message);

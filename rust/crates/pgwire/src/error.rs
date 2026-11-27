@@ -38,7 +38,7 @@ fn kind_state(kind: AnomalyKind) -> Option<&'static str> {
         AnomalyKind::NumericValueOutOfRange => Some("22003"),
         AnomalyKind::TableNotFound | AnomalyKind::OptimisticConflict | AnomalyKind::MissingObject | AnomalyKind::CorruptObject
         | AnomalyKind::InputOutOfOrder | AnomalyKind::GrammarRejected | AnomalyKind::BasisAhead | AnomalyKind::UnknownBasis
-        | AnomalyKind::NoWriter => None,
+        | AnomalyKind::NoWriter | AnomalyKind::ReadExpired => None,
     }
 }
 

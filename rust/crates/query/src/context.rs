@@ -601,9 +601,8 @@ impl QueryContext {
             let work = self.owner_cancellation.run_until_cancelled(self.cancellation.run_until_cancelled(work));
             let answer = if let Some(lease) = lease {
                 let deadline = lease.local_cutoff()?;
-                tokio::time::timeout_at(deadline.into(), work).await.map_err(|_| {
-                    Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.storage/read-lease-expired", "The read lease expired while computing the answer")
-                })?
+                tokio::time::timeout_at(deadline.into(), work).await.map_err(|_| Anomaly::from(lease.check().err()
+                    .unwrap_or(rtdb_storage::Error::ReadLeaseExpired { cutoff: rtdb_storage::LeaseCutoff::Clocked })))?
             } else {
                 work.await
             }.flatten().ok_or_else(cancelled)??;

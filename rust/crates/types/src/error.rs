@@ -48,6 +48,8 @@ pub enum AnomalyKind {
     UnknownBasis,
     /// This node holds no writer lease for the database, so a write must go to the node that does.
     NoWriter,
+    /// A read's lease or plaintext delivery grant expired before its answer was delivered.
+    ReadExpired,
 }
 
 impl AnomalyKind {
@@ -81,6 +83,7 @@ impl AnomalyKind {
             "rtdb/basis-ahead" => Some(Self::BasisAhead),
             "rtdb/unknown-basis" => Some(Self::UnknownBasis),
             "rtdb/no-writer" => Some(Self::NoWriter),
+            "rtdb.storage/read-lease-expired" | "rtdb.storage/plaintext-delivery-expired" => Some(Self::ReadExpired),
             _ => None,
         }
     }
@@ -228,6 +231,7 @@ mod tests {
         assert_eq!(AnomalyKind::from_wire_code("rtdb/basis-ahead"), Some(AnomalyKind::BasisAhead));
         assert_eq!(AnomalyKind::from_wire_code("rtdb/unknown-basis"), Some(AnomalyKind::UnknownBasis));
         assert_eq!(AnomalyKind::from_wire_code("rtdb/no-writer"), Some(AnomalyKind::NoWriter));
+        assert_eq!(AnomalyKind::from_wire_code("rtdb.storage/read-lease-expired"), Some(AnomalyKind::ReadExpired));
         assert_eq!(AnomalyKind::from_wire_code("xtdb/sql-error"), None);
         assert_eq!(AnomalyKind::from_wire_code("xtdb.expression/overflow-error"), None);
     }
@@ -239,7 +243,8 @@ mod tests {
             (AnomalyKind::TableNotFound, "table-not-found"), (AnomalyKind::OptimisticConflict, "optimistic-conflict"),
             (AnomalyKind::MissingObject, "missing-object"), (AnomalyKind::CorruptObject, "corrupt-object"),
             (AnomalyKind::InputOutOfOrder, "input-out-of-order"), (AnomalyKind::GrammarRejected, "grammar-rejected"),
-            (AnomalyKind::BasisAhead, "basis-ahead"), (AnomalyKind::UnknownBasis, "unknown-basis"), (AnomalyKind::NoWriter, "no-writer")] {
+            (AnomalyKind::BasisAhead, "basis-ahead"), (AnomalyKind::UnknownBasis, "unknown-basis"), (AnomalyKind::NoWriter, "no-writer"),
+            (AnomalyKind::ReadExpired, "read-expired")] {
             assert_eq!(serde_json::to_value(kind).unwrap(), name);
             assert_eq!(serde_json::from_value::<AnomalyKind>(name.into()).unwrap(), kind);
         }
