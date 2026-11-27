@@ -814,3 +814,12 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, not(feature = "multi")))]
+#[test]
+fn default_binary_keeps_admin_help_and_requires_multi_for_operations() {
+    let arguments = |name: &str| ["admin".to_owned(), name.to_owned()];
+    assert!(matches!(parse(arguments("--help"), &|_| None).unwrap(), Command::AdminHelp));
+    let error = parse(arguments("create"), &|_| None).unwrap_err();
+    assert_eq!(error.code, "rtdb.admin/cli");
+}
