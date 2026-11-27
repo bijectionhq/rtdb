@@ -156,10 +156,11 @@ fn selected_local_record_survives_lost_readiness_and_cancelled_delivery() {
     let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).max_blocking_threads(1).enable_all().build().unwrap();
     runtime.block_on(async {
         let directory = tempfile::tempdir().unwrap();
-        let (inner, driver) = LocalLog::open(directory.path().join("LOG"), LocalLogOptions { maximum_message_bytes: 1024, queue_capacity: 4 }).unwrap();
+        let (inner, driver) = LocalLog::open(directory.path().join("LOG"), LocalLogOptions { maximum_message_bytes: 128 * 1024, queue_capacity: 4 }).unwrap();
         let cancellation = CancellationToken::new();
         let writer = tokio::spawn(driver.run(cancellation.clone()));
-        let payload = Bytes::from_static(b"selected");
+        // Exceed LocalLog's 64 KiB inline page-cache read threshold so read_head exercises the blocking pool.
+        let payload = Bytes::from(vec![b's'; 64 * 1024 + 1]);
         let metadata = inner.enqueue(payload.clone(), Timestamp(9)).await.unwrap().durable().await.unwrap();
         let mut lost_readiness = rule(Operation::ReplayPrepare, Phase::After, Action::Fail("readiness response lost".into()));
         lost_readiness.occurrence = 2;
