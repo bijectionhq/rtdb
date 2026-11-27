@@ -138,6 +138,25 @@ All replicas of the authority protect its state against rewind and survive failu
   `XTDB_LOGGING_LEVEL_DB_CHECKPOINT=debug`. The benches take
   `--checkpoints classic|binary|deferred`, default `deferred`.
 
+## Portable application backups
+
+`rtdb multi-backup export` captures a settled cut from a stopped, initialized development deployment, using its journal and object store to verify the current checkpoint dependencies.
+For an ordinary inline cut, the archive carries the complete checkpoint and retained receipt index under the source key generation.
+Its authenticated header binds the source incarnation, basis, system time, and journal position.
+The archive contains no key material.
+
+`rtdb multi-backup restore` reads the archive with an explicitly supplied source key vault and installs the cut into a fresh development incarnation and journal stream.
+The source journal, object store, and process can be absent.
+Keep source key custody available independently until a restore is admitted; retired key generations follow their existing deadlines.
+The destination checkpoint records the source coordinates and archive digest so the committed installation can be read back after restart.
+Recovered ordinary receipts use the new incarnation's basis, and the archive retains the original receipts.
+The commands work with the local development journal and the optional loopback Logkeeper connections configured with `--journal-url` and `--tls-dir`.
+
+This archive version supports inline checkpoints with ordinary retained receipts.
+Active pins, external object dependencies, ranked catalogues, protected custody, and scoped or funded receipts require a separate portable transfer.
+The export refuses incomplete erasure and key rotation.
+The command stages a destination cut for local rehearsal; a shared database name requires its own activation decision and predecessor fence.
+
 ## Qualification
 
 The [2026-11-26 consensus keeper results](../../verification/results/2026-11-26-consensus-keeper.adoc)

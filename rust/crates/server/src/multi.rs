@@ -51,6 +51,8 @@ mod native_checkpoint;
 pub use native_checkpoint::NativeDependentCustodyAuthority;
 pub use dependent_custody::{InheritedAdmission, InheritedAdmissionRegistration, InheritedCarrierBinding, InheritedDisposition, InheritedReadProof, InheritedRegistration, InheritedRelease};
 mod peer;
+mod portable_backup;
+pub use portable_backup::{MULTI_BACKUP_HELP, MultiBackupOptions};
 use activation::ActivationAuthority;
 use catalog::{Status, TransferExport};
 
@@ -76,7 +78,9 @@ impl DevelopmentStreamJournal {
             let config = if path.is_absolute() { JournalConfig::read(path).map_err(|_| invalid_config())? } else {
                 return Err(invalid_config());
             };
-            if config.keepers.values().any(|endpoint| !endpoint.ip().is_loopback() || endpoint.port() == 0) {
+            if config.keepers.values().any(|endpoint| {
+                !endpoint.socket_addr().is_some_and(|address| address.ip().is_loopback())
+            }) {
                 return Err(invalid_config());
             }
             return Ok(Self { url: url.to_owned(), credentials });
