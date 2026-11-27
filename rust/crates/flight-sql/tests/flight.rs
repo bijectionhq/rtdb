@@ -512,7 +512,10 @@ async fn ticket_carries_its_arrow_parameters_across_rebind() {
     let info = client.client.get_flight_info(request).await.unwrap().into_inner();
     let ticket = Any::decode(info.endpoint[0].ticket.as_ref().unwrap().ticket.as_ref()).unwrap();
     let handle = TicketStatementQuery::decode(ticket.value).unwrap().statement_handle;
-    assert!(handle.starts_with(b"RTDBFT\x05"));
+    // The reference's QueryTicket JSON, with the parameters as a base64 Arrow stream.
+    let json: serde_json::Value = serde_json::from_slice(&handle).unwrap();
+    assert_eq!((json["type"].as_str(), json["dbName"].as_str(), json["sql"].as_str()), (Some("run"), Some("xtdb"), Some("SELECT ? AS n")));
+    assert!(json["params"].is_string() && json["basis"]["snapshotToken"].is_string() && json["basis"]["currentTime"].is_string());
 
     let text = RecordBatch::try_from_iter([("label", Arc::new(StringArray::from(vec!["new"])) as arrow_array::ArrayRef)]).unwrap();
     client.upload(command, vec![text]).await;

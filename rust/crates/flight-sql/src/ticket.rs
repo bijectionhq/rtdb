@@ -1,24 +1,24 @@
 use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 
-use bytes::{Buf, Bytes};
+use base64::{Engine, engine::general_purpose::STANDARD};
+use bytes::Bytes;
 use hmac::{Hmac, Mac};
 use rtdb_columnar::MemoryBudget;
 use rtdb_node::QueryBasis;
 use rtdb_types::{Instant, TimeBasis, Timestamp};
+use serde_json::{Map, Value};
 use sha2::Sha256;
 use tonic::Status;
 
 use crate::{error::{invalid, status}, state::Owner, wire};
 
-const VERSION: &[u8] = b"RTDBFT\x05";
 const MAC_BYTES: usize = 32;
 const NONCE_BYTES: usize = 16;
-const RUN: u8 = 1;
-const INSPECT: u8 = 2;
 
-/// A self-contained query ticket; nothing about an issued ticket is retained by the server.
+/// A self-contained query ticket in the reference's `QueryTicket` JSON; nothing about an issued ticket is retained by the server.
 /// A run ticket is unsigned and redeemable by any session, and after a restart, as the reference's `QueryTicket.Run` is: it names its databases
-/// by name and basis alone. An inspection is signed for its session, and so dies with it.
+/// by name and basis alone, the basis as the reference's `QueryBasis` with its XTDB snapshot token. An inspection, which the reference
+/// does not have, is signed for its session, and so dies with it.
 pub(crate) enum Ticket {
     Run(QueryRun),
     Inspect(Inspection),
@@ -114,198 +114,175 @@ impl Binding<'_> {
 impl Ticket {
     pub fn empty(memory: &Arc<MemoryBudget>) -> Result<Bytes, Status> {
         let charge = memory.reserve(64).map_err(status)?;
-        Ok(wire::retain(VERSION.to_vec(), charge))
+        Ok(wire::retain(EMPTY.as_bytes().to_vec(), charge))
     }
 
+    /// An upper bound on the encoded ticket: JSON escapes a byte to at most six, and base64 grows by a third.
     pub fn encoded_bound(&self) -> Result<usize, Status> {
-        let strings = |values: &[String]| values.iter().try_fold(4usize, |bytes, value| wire::add(bytes, wire::add(4, value.len())?));
+        let text = |length: usize| wire::add(wire::mul(length, 6)?, 8);
+        let base64 = |length: usize| wire::add(wire::mul(length.div_ceil(3), 4)?, 8);
+        let strings = |values: &[String]| values.iter().try_fold(8usize, |bytes, value| wire::add(bytes, text(value.len())?));
         let body = match self {
             Self::Empty => 0,
-            Self::Inspect(inspection) => wire::add(wire::add(inspection.database.len(), inspection.sql.len())?,
-                wire::add(strings(&inspection.search_path)?, inspection.transaction.as_ref().map_or(0, Bytes::len))?)?,
+            Self::Inspect(inspection) => [text(inspection.database.len())?, text(inspection.sql.len())?, strings(&inspection.search_path)?,
+                base64(inspection.transaction.as_ref().map_or(0, Bytes::len))?, base64(NONCE_BYTES)?, base64(MAC_BYTES)?]
+                .into_iter().try_fold(0usize, wire::add)?,
             Self::Run(run) => {
                 let cut = match &run.basis.cut {
-                    Cut::Snapshot(token) => token.len(),
-                    Cut::Visible(databases) => databases.keys().try_fold(0usize, |bytes, name| wire::add(bytes, wire::add(name.len(), 16)?))?,
+                    Cut::Snapshot(token) => text(token.len())?,
+                    Cut::Visible(databases) => base64(databases.keys().try_fold(0usize, |bytes, name| wire::add(bytes, wire::add(name.len(), 32)?))?)?,
                 };
-                [run.database.len(), run.sql.len(), strings(&run.search_path)?, run.basis.timezone.len(), cut, run.params.as_ref().map_or(0, Bytes::len)]
+                [text(run.database.len())?, text(run.sql.len())?, strings(&run.search_path)?, text(run.basis.timezone.len())?, cut,
+                    base64(run.params.as_ref().map_or(0, Bytes::len))?]
                     .into_iter().try_fold(0usize, wire::add)?
             }
         };
-        wire::add(body, 128)
+        wire::add(body, 256)
     }
 
     pub fn encode(&self, binding: &Binding<'_>, memory: &Arc<MemoryBudget>) -> Result<Bytes, Status> {
         let bound = self.encoded_bound()?;
-        let charge = memory.reserve(wire::add(bound, 128)?).map_err(status)?;
-        let mut bytes = Vec::with_capacity(bound);
-        bytes.extend_from_slice(VERSION);
+        let charge = memory.reserve(wire::add(wire::mul(bound, 2)?, 128)?).map_err(status)?;
+        let mut object = Map::new();
         match self {
             Self::Empty => return Self::empty(memory),
             Self::Inspect(inspection) => {
-                bytes.push(INSPECT);
-                put_string(&mut bytes, &inspection.database)?;
                 let nonce = *uuid::Uuid::new_v4().as_bytes();
-                bytes.extend_from_slice(&nonce);
-                put_bytes(&mut bytes, inspection.transaction.as_deref().map(|handle| binding.mask(&nonce, handle)).as_deref())?;
-                put_string(&mut bytes, &inspection.sql)?;
-                put_strings(&mut bytes, &inspection.search_path)?;
+                let transaction = inspection.transaction.as_deref().map(|handle| binding.mask(&nonce, handle));
+                let tag = binding.sign(&inspection_payload(&inspection.database, &nonce, transaction.as_deref(), &inspection.sql, &inspection.search_path)?).finalize().into_bytes();
+                object.insert("type".into(), "inspect".into());
+                object.insert("dbName".into(), inspection.database.clone().into());
+                object.insert("sql".into(), inspection.sql.clone().into());
+                object.insert("searchPath".into(), inspection.search_path.clone().into());
+                object.insert("nonce".into(), STANDARD.encode(nonce).into());
+                object.insert("transaction".into(), transaction.map_or(Value::Null, |handle| STANDARD.encode(handle).into()));
+                object.insert("mac".into(), STANDARD.encode(tag).into());
             }
             Self::Run(run) => {
                 let basis = &run.basis;
-                bytes.push(RUN);
-                put_string(&mut bytes, &run.database)?;
-                put_string(&mut bytes, &run.sql)?;
-                put_strings(&mut bytes, &run.search_path)?;
-                put_string(&mut bytes, &basis.timezone)?;
-                bytes.extend_from_slice(&basis.current_time.seconds().to_be_bytes());
-                bytes.extend_from_slice(&basis.current_time.nanos().to_be_bytes());
-                put_time(&mut bytes, basis.snapshot_time);
-                bytes.push(u8::from(basis.has_await_floor));
-                match &basis.cut {
-                    Cut::Snapshot(token) => { bytes.push(0); put_string(&mut bytes, token)?; }
-                    Cut::Visible(databases) => {
-                        bytes.push(1);
-                        put_len(&mut bytes, databases.len())?;
-                        for (name, through) in databases {
-                            put_string(&mut bytes, name)?;
-                            put_time(&mut bytes, *through);
-                        }
-                    }
-                }
-                put_bytes(&mut bytes, run.params.as_deref())?;
+                let snapshot_token = match &basis.cut {
+                    Cut::Snapshot(token) => token.clone(),
+                    Cut::Visible(databases) => rtdb_format::basis::encode_time_basis(&TimeBasis {
+                        databases: databases.iter().map(|(name, through)| (name.clone(), vec![through.map(Instant::from)])).collect(),
+                    }),
+                };
+                let mut query_basis = Map::new();
+                query_basis.insert("currentTime".into(), basis.current_time.to_iso_string().map_err(status)?.into());
+                query_basis.insert("defaultTz".into(), basis.timezone.clone().into());
+                query_basis.insert("snapshotToken".into(), snapshot_token.into());
+                query_basis.insert("snapshotTime".into(), basis.snapshot_time.map(timestamp).transpose()?.map_or(Value::Null, Value::from));
+                object.insert("type".into(), "run".into());
+                object.insert("dbName".into(), run.database.clone().into());
+                object.insert("sql".into(), run.sql.clone().into());
+                object.insert("params".into(), run.params.as_ref().map_or(Value::Null, |params| STANDARD.encode(params).into()));
+                object.insert("basis".into(), query_basis.into());
+                // RTDB-only, and written only when they differ from what a ticket without them means, so that the reference's
+                // decoder, which refuses unknown keys, reads every ticket that does not depend on them.
+                if run.search_path != default_search_path() { object.insert("searchPath".into(), run.search_path.clone().into()); }
+                if basis.has_await_floor { object.insert("awaitFloor".into(), true.into()); }
             }
         }
-        if let Self::Inspect(_) = self {
-            let tag = binding.sign(&bytes).finalize().into_bytes();
-            bytes.extend_from_slice(&tag);
-        }
-        if bytes.capacity() > bound { return Err(Status::internal("Query ticket exceeds its encoding reservation")); }
+        let mut bytes = Vec::with_capacity(bound);
+        serde_json::to_writer(&mut bytes, &Value::Object(object)).map_err(|error| Status::internal(error.to_string()))?;
+        if bytes.len() > bound { return Err(Status::internal("Query ticket exceeds its encoding reservation")); }
         Ok(wire::retain(bytes, charge))
     }
 
     /// An inspection signed for another session or by another service reads as unknown; a run ticket decodes for any session.
+    /// Anything else, including a ticket an earlier RTDB issued in its binary format, is an invalid ticket, as the reference reports one.
     pub fn decode(bytes: &Bytes, binding: &Binding<'_>) -> Result<Self, Status> {
-        if !bytes.starts_with(VERSION) { return Err(invalid("invalid ticket version")); }
-        if bytes.len() == VERSION.len() { return Ok(Self::Empty); }
-        let end = match bytes[VERSION.len()] {
-            INSPECT => {
-                let split = bytes.len().checked_sub(MAC_BYTES).filter(|split| *split > VERSION.len())
-                    .ok_or_else(|| invalid("truncated ticket"))?;
-                binding.sign(&bytes[..split]).verify_slice(&bytes[split..]).map_err(|_| Status::not_found("unknown query ticket"))?;
-                split
-            }
-            _ => bytes.len(),
-        };
-        let mut body = bytes.slice(VERSION.len()..end);
-        let ticket = match body.get_u8() {
-            INSPECT => {
-                let database = take_string(&mut body)?;
-                need(&body, NONCE_BYTES)?;
-                let mut nonce = [0; NONCE_BYTES];
-                body.copy_to_slice(&mut nonce);
-                let transaction = take_bytes(&mut body)?.map(|handle| Bytes::from(binding.mask(&nonce, &handle)));
-                Self::Inspect(Inspection { database, transaction, sql: take_string(&mut body)?, search_path: take_strings(&mut body)? })
-            }
-            RUN => {
-                let database = take_string(&mut body)?;
-                let sql = take_string(&mut body)?;
-                let search_path = take_strings(&mut body)?;
-                let timezone = take_string(&mut body)?;
-                need(&body, 12)?;
-                let current_time = Instant::new(body.get_i64(), body.get_u32()).map_err(status)?;
-                let snapshot_time = take_time(&mut body)?;
-                let has_await_floor = take_flag(&mut body)?;
-                let cut = if take_flag(&mut body)? {
-                    let count = take_len(&mut body)?;
-                    let mut databases = BTreeMap::new();
-                    for _ in 0..count {
-                        let name = take_string(&mut body)?;
-                        databases.insert(name, take_time(&mut body)?);
-                    }
-                    Cut::Visible(databases)
-                } else {
-                    Cut::Snapshot(take_string(&mut body)?)
+        let Ok(Value::Object(mut object)) = serde_json::from_slice::<Value>(bytes) else { return Err(invalid_ticket()); };
+        let ticket = match take_string(&mut object, "type")?.as_str() {
+            "empty" => Self::Empty,
+            "run" => {
+                let database = take_string(&mut object, "dbName")?;
+                let sql = take_string(&mut object, "sql")?;
+                let params = take_base64(&mut object, "params")?.map(Bytes::from);
+                let Some(Value::Object(mut basis)) = object.remove("basis") else { return Err(invalid_ticket()); };
+                let current_time = Instant::parse_iso(&take_string(&mut basis, "currentTime")?).map_err(|_| invalid_ticket())?;
+                let timezone = take_string(&mut basis, "defaultTz")?;
+                let snapshot_token = take_string(&mut basis, "snapshotToken")?;
+                let snapshot_time = match basis.remove("snapshotTime") {
+                    Some(Value::Null) => None,
+                    Some(Value::String(time)) => Some(micros(&time)?),
+                    _ => return Err(invalid_ticket()),
                 };
-                let params = take_bytes(&mut body)?;
+                if !basis.is_empty() { return Err(invalid_ticket()); }
+                let search_path = match object.remove("searchPath") { None => default_search_path(), Some(value) => strings(value)? };
+                let has_await_floor = match object.remove("awaitFloor") { None => false, Some(Value::Bool(flag)) => flag, Some(_) => return Err(invalid_ticket()) };
+                let cut = match rtdb_format::basis::decode_time_basis(&snapshot_token) {
+                    Ok(time_basis) => Cut::Visible(time_basis.databases.into_iter().map(|(name, times)| match times.as_slice() {
+                        [through] => Ok((name, through.map(Instant::as_micros).transpose().map_err(|_| invalid_ticket())?)),
+                        _ => Err(invalid_ticket()),
+                    }).collect::<Result<_, Status>>()?),
+                    Err(_) => Cut::Snapshot(snapshot_token),
+                };
                 Self::Run(QueryRun { database, sql, search_path, basis: TicketBasis { current_time, timezone, snapshot_time, has_await_floor, cut }, params })
             }
-            _ => return Err(invalid("invalid ticket kind")),
+            "inspect" => {
+                let database = take_string(&mut object, "dbName")?;
+                let sql = take_string(&mut object, "sql")?;
+                let search_path = strings(object.remove("searchPath").ok_or_else(invalid_ticket)?)?;
+                let nonce: [u8; NONCE_BYTES] = take_base64(&mut object, "nonce")?.and_then(|nonce| nonce.try_into().ok()).ok_or_else(invalid_ticket)?;
+                let transaction = take_base64(&mut object, "transaction")?;
+                let tag = take_base64(&mut object, "mac")?.ok_or_else(invalid_ticket)?;
+                binding.sign(&inspection_payload(&database, &nonce, transaction.as_deref(), &sql, &search_path)?).verify_slice(&tag)
+                    .map_err(|_| Status::not_found("unknown query ticket"))?;
+                let transaction = transaction.map(|handle| Bytes::from(binding.mask(&nonce, &handle)));
+                Self::Inspect(Inspection { database, transaction, sql, search_path })
+            }
+            _ => return Err(invalid_ticket()),
         };
-        if !body.is_empty() { return Err(invalid("trailing ticket bytes")); }
+        if !object.is_empty() { return Err(invalid_ticket()); }
         Ok(ticket)
     }
 }
 
-fn put_len(out: &mut Vec<u8>, length: usize) -> Result<(), Status> {
-    out.extend_from_slice(&u32::try_from(length).map_err(|_| invalid("ticket field is too large"))?.to_be_bytes());
-    Ok(())
+/// The reference's `QueryTicket.Empty`.
+const EMPTY: &str = r#"{"type":"empty"}"#;
+
+fn invalid_ticket() -> Status { invalid("invalid ticket") }
+
+fn default_search_path() -> Vec<String> { rtdb_sql::PrepareOptions::default().search_path }
+
+/// What an inspection's tag signs: every field, each length-prefixed, so that no two tickets share a payload.
+fn inspection_payload(database: &str, nonce: &[u8; NONCE_BYTES], transaction: Option<&[u8]>, sql: &str, search_path: &[String]) -> Result<Vec<u8>, Status> {
+    let mut payload = Vec::new();
+    let mut put = |value: &[u8]| -> Result<(), Status> {
+        payload.extend_from_slice(&u32::try_from(value.len()).map_err(|_| invalid("ticket field is too large"))?.to_be_bytes());
+        payload.extend_from_slice(value);
+        Ok(())
+    };
+    put(b"inspect")?;
+    put(database.as_bytes())?;
+    put(nonce)?;
+    match transaction { Some(handle) => { put(b"\x01")?; put(handle)?; } None => put(b"\x00")? }
+    put(sql.as_bytes())?;
+    put(&u32::try_from(search_path.len()).map_err(|_| invalid("ticket field is too large"))?.to_be_bytes())?;
+    for schema in search_path { put(schema.as_bytes())?; }
+    Ok(payload)
 }
 
-fn put_string(out: &mut Vec<u8>, value: &str) -> Result<(), Status> {
-    put_len(out, value.len())?;
-    out.extend_from_slice(value.as_bytes());
-    Ok(())
+fn take_string(object: &mut Map<String, Value>, key: &str) -> Result<String, Status> {
+    match object.remove(key) { Some(Value::String(value)) => Ok(value), _ => Err(invalid_ticket()) }
 }
 
-fn put_strings(out: &mut Vec<u8>, values: &[String]) -> Result<(), Status> {
-    put_len(out, values.len())?;
-    values.iter().try_for_each(|value| put_string(out, value))
-}
-
-fn put_bytes(out: &mut Vec<u8>, value: Option<&[u8]>) -> Result<(), Status> {
-    match value {
-        Some(value) => { out.push(1); put_len(out, value.len())?; out.extend_from_slice(value); }
-        None => out.push(0),
+/// A key that must be present, holding base64 or null.
+fn take_base64(object: &mut Map<String, Value>, key: &str) -> Result<Option<Vec<u8>>, Status> {
+    match object.remove(key) {
+        Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => STANDARD.decode(text).map(Some).map_err(|_| invalid_ticket()),
+        _ => Err(invalid_ticket()),
     }
-    Ok(())
 }
 
-fn take_bytes(bytes: &mut Bytes) -> Result<Option<Bytes>, Status> {
-    if !take_flag(bytes)? { return Ok(None); }
-    let length = take_len(bytes)?;
-    need(bytes, length)?;
-    Ok(Some(bytes.split_to(length)))
+fn strings(value: Value) -> Result<Vec<String>, Status> {
+    let Value::Array(values) = value else { return Err(invalid_ticket()); };
+    values.into_iter().map(|value| match value { Value::String(value) => Ok(value), _ => Err(invalid_ticket()) }).collect()
 }
 
-fn put_time(out: &mut Vec<u8>, time: Option<Timestamp>) {
-    match time {
-        Some(time) => { out.push(1); out.extend_from_slice(&time.0.to_be_bytes()); }
-        None => out.push(0),
-    }
-}
-
-fn need(bytes: &Bytes, length: usize) -> Result<(), Status> {
-    if bytes.len() < length { Err(invalid("truncated ticket")) } else { Ok(()) }
-}
-
-fn take_flag(bytes: &mut Bytes) -> Result<bool, Status> {
-    need(bytes, 1)?;
-    match bytes.get_u8() { 0 => Ok(false), 1 => Ok(true), _ => Err(invalid("invalid ticket flag")) }
-}
-
-fn take_len(bytes: &mut Bytes) -> Result<usize, Status> {
-    need(bytes, 4)?;
-    Ok(bytes.get_u32() as usize)
-}
-
-fn take_string(bytes: &mut Bytes) -> Result<String, Status> {
-    let length = take_len(bytes)?;
-    need(bytes, length)?;
-    String::from_utf8(bytes.split_to(length).to_vec()).map_err(|_| invalid("invalid ticket text"))
-}
-
-fn take_strings(bytes: &mut Bytes) -> Result<Vec<String>, Status> {
-    let count = take_len(bytes)?;
-    // Each string carries at least its four-byte length.
-    need(bytes, count.saturating_mul(4))?;
-    (0..count).map(|_| take_string(bytes)).collect()
-}
-
-fn take_time(bytes: &mut Bytes) -> Result<Option<Timestamp>, Status> {
-    if !take_flag(bytes)? { return Ok(None); }
-    need(bytes, 8)?;
-    Ok(Some(Timestamp(bytes.get_i64())))
+fn micros(text: &str) -> Result<Timestamp, Status> {
+    Instant::parse_iso(text).and_then(Instant::as_micros).map_err(|_| invalid_ticket())
 }
 
 pub(crate) fn timestamp(time: Timestamp) -> Result<String, Status> {
@@ -370,10 +347,38 @@ mod tests {
             assert_eq!((decoded.database.as_str(), decoded.sql.as_str()), ("xtdb", "SELECT ?"));
         }
         assert!(Ticket::decode(&encoded.slice(..encoded.len() - 1), &signer).is_err());
-        let mut trailing = encoded.to_vec();
-        trailing.push(0);
-        assert!(Ticket::decode(&Bytes::from(trailing), &signer).is_err());
-        assert!(Ticket::decode(&Bytes::from_static(b"RTDBFT\x04\x01"), &signer).is_err(), "a ticket naming process-local attachments is refused");
+        for refused in [&b"RTDBFT\x05\x01"[..], br#"{"type":"run"}"#, br#"{"type":"empty","extra":1}"#, br#"{"type":"other"}"#] {
+            let error = Ticket::decode(&Bytes::from_static(refused), &signer).err().unwrap();
+            assert_eq!((error.code(), error.message()), (tonic::Code::InvalidArgument, "invalid ticket"), "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn run_ticket_is_the_references_query_ticket_json() {
+        let memory = MemoryBudget::new(1 << 20);
+        let signer = binding("session", Owner::Anonymous, b"key");
+        let ticket = Ticket::Run(QueryRun {
+            database: "xtdb".into(), sql: "SELECT 1".into(), search_path: vec!["public".into()],
+            basis: TicketBasis { current_time: Instant::new(1_577_836_800, 0).unwrap(), timezone: "Europe/London".into(), snapshot_time: None, has_await_floor: false,
+                cut: Cut::Visible(BTreeMap::from([("xtdb".to_owned(), Some(Timestamp(1_577_836_800_000_000)))])) },
+            params: Some(Bytes::from_static(b"\x01\x02\x03")),
+        });
+        let encoded = ticket.encode(&signer, &memory).unwrap();
+        // `xtdb.api/q` documents ChAKBHh0ZGISCAoGCIDCr/AF as database "xtdb" at 2020-01-01T00:00:00Z.
+        assert_eq!(std::str::from_utf8(&encoded).unwrap(), concat!(
+            r#"{"type":"run","dbName":"xtdb","sql":"SELECT 1","params":"AQID","#,
+            r#""basis":{"currentTime":"2020-01-01T00:00:00Z","defaultTz":"Europe/London","snapshotToken":"ChAKBHh0ZGISCAoGCIDCr/AF","snapshotTime":null}}"#));
+        assert!(matches!(Ticket::decode(&Ticket::empty(&memory).unwrap(), &signer), Ok(Ticket::Empty)));
+        assert_eq!(&Ticket::empty(&memory).unwrap()[..], br#"{"type":"empty"}"#);
+        // A ticket the reference issued redeems here.
+        let upstream = Bytes::from_static(br#"{"type":"run","dbName":"xtdb","sql":"SELECT 1","params":null,"basis":{"currentTime":"2020-01-01T00:00:00.123Z","defaultTz":"Z","snapshotToken":"ChAKBHh0ZGISCAoGCIDCr/AF","snapshotTime":"2020-01-01T00:00:00Z"}}"#);
+        let Ok(Ticket::Run(decoded)) = Ticket::decode(&upstream, &signer) else { panic!("reference ticket") };
+        assert_eq!(decoded.search_path, ["public"]);
+        assert_eq!(decoded.basis.snapshot_time, Some(Timestamp(1_577_836_800_000_000)));
+        assert_eq!(decoded.basis.current_time, Instant::new(1_577_836_800, 123_000_000).unwrap());
+        assert!(!decoded.basis.has_await_floor && decoded.params.is_none());
+        let Cut::Visible(cut) = decoded.basis.cut else { panic!("visible cut") };
+        assert_eq!(cut["xtdb"], Some(Timestamp(1_577_836_800_000_000)));
     }
 
     #[test]
@@ -386,10 +391,9 @@ mod tests {
         for other in [binding("other", owner, b"key"), binding("session", Owner::Anonymous, b"key"), binding("session", owner, b"restarted")] {
             assert_eq!(Ticket::decode(&encoded, &other).err().unwrap().code(), tonic::Code::NotFound);
         }
-        let mut tampered = encoded.to_vec();
-        tampered[VERSION.len() + 8] ^= 1;
+        let tampered = std::str::from_utf8(&encoded).unwrap().replace("SHOW search_path", "SHOW timezone");
         assert_eq!(Ticket::decode(&Bytes::from(tampered), &signer).err().unwrap().code(), tonic::Code::NotFound);
-        assert!(Ticket::decode(&encoded.slice(..VERSION.len() + 1), &signer).is_err());
+        assert!(Ticket::decode(&encoded.slice(..8), &signer).is_err());
     }
 
     #[test]

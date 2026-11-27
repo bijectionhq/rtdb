@@ -79,14 +79,16 @@ The node's PostgreSQL TLS configuration does not apply to this endpoint.
 
 == Queries, writes, and metadata
 
-GetFlightInfo encodes the SQL, search path, Arrow parameters, query clock, timezone and read cut in a self-contained `TicketStatementQuery` handle, as the reference's `QueryTicket.Run` does.
+GetFlightInfo encodes the SQL, Arrow parameters (a base64 Arrow stream), query clock, timezone and read cut in a self-contained `TicketStatementQuery` handle in the reference's `QueryTicket.Run` JSON, with the read cut as an XTDB snapshot token.
+Two RTDB-only keys are written only when they matter: `searchPath`, when it is not the default `public`, and `awaitFloor`; the reference refuses a ticket carrying either, and RTDB redeems the reference's tickets.
+A ticket issued by an earlier RTDB in its binary format is invalid.
 The server retains nothing per issued ticket, so the rate at which tickets are issued and redeemed is not bounded by `maximum_concurrent_calls`, and an unredeemed ticket holds no snapshot or catalog.
 The read cut names each database by name with its last visible system time; a database without a visible transaction, or one attached after the ticket was issued, keeps an empty cut, which later transactions do not enter.
 As upstream's ticket, it names no process-local state, so it redeems after a restart; a database detached and attached again under the same name is read at the same basis.
 A read under a restored SQL snapshot carries that snapshot's token instead.
 A query ticket is unsigned and redeemable by any session, as the reference's `QueryTicket.Run` is: DoGet re-prepares its SQL on the redeeming session's connection, under that session's identity, so a ticket grants nothing its redeemer could not query directly.
 A malformed or truncated ticket is invalid.
-An inspection ticket is signed with HMAC-SHA256 under a key generated when the service starts, over the issuing session's id and owner, since it may name that session's transaction; presented by another session, another owner, or after a restart, or altered, it fails as not found.
+An inspection ticket, which the reference does not have, is JSON of type `inspect`, signed with HMAC-SHA256 under a key generated when the service starts, over the issuing session's id and owner, since it may name that session's transaction; presented by another session, another owner, or after a restart, or altered, it fails as not found.
 A ticket that would not fit the largest request the server decodes is refused when issued, since its parameter batch is carried whole; with an audience that limit is 512 KiB.
 It keeps the connection borrowed through statement classification, basis capture, and schema preparation against that basis.
 GetFlightInfo, GetSchema, CreatePreparedStatement and DoPut statement updates use the same selected Direct parser diagnostics for initial preparation.
