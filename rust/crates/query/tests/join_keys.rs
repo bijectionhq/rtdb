@@ -456,6 +456,33 @@ async fn an_inner_join_residual_keeps_pairs_it_holds_for_and_meets_later_conjunc
 }
 
 #[tokio::test]
+async fn residual_conjuncts_keep_sparse_fanout_in_pair_order_and_exclude_unknown_matches() {
+    let left = measured(0, &[(1, Some(1.0)), (1, None), (1, Some(3.0)), (1, Some(4.0)), (1, Some(2.0))]);
+    let right = measured(2, &[(1, Some(1.0)), (2, Some(9.0)), (1, Some(2.0))]);
+    let (lk, lv) = (left.schema().fields()[0].expression(), left.schema().fields()[1].expression());
+    let (rk, rv) = (right.schema().fields()[0].expression(), right.schema().fields()[1].expression());
+    let key = Expr::binary(BinaryOp::Eq, lk, rk);
+    let differs = Expr::binary(BinaryOp::NotEq, lv.clone(), rv.clone());
+    let missing = Expr::Unary { op: rtdb_plan::UnaryOp::IsNull, expr: Box::new(lv.clone()) };
+    let delta = Expr::binary(BinaryOp::Subtract, lv, rv);
+    let reciprocal = Expr::binary(BinaryOp::Divide, Expr::Literal(Value::F64(1.0)), delta.clone());
+    let positive = Expr::binary(BinaryOp::Gt, reciprocal, Expr::Literal(Value::F64(0.0)));
+    let bounded = Expr::binary(BinaryOp::Lt, delta, Expr::Literal(Value::F64(3.0)));
+    let passes = Expr::binary(BinaryOp::Or, missing, Expr::binary(BinaryOp::And, positive, bounded));
+    let condition = Expr::binary(BinaryOp::And, key, Expr::binary(BinaryOp::And, differs, passes));
+    let context = context(&CancellationToken::new());
+    let rows = collect(&join(left, right, JoinKind::Inner, condition), &context).await.unwrap();
+    assert_eq!(rows.into_iter().map(|row| (row[1].clone(), row[3].clone())).collect::<Vec<_>>(), [
+        (Value::F64(3.0), Value::F64(1.0)),
+        (Value::F64(2.0), Value::F64(1.0)),
+        (Value::F64(3.0), Value::F64(2.0)),
+        (Value::F64(4.0), Value::F64(2.0)),
+    ]);
+    assert_eq!(context.spill_bytes(), 0);
+    assert_eq!(context.memory.used_bytes(), 0);
+}
+
+#[tokio::test]
 async fn an_inner_join_residual_is_evaluated_whole_for_every_key_matched_pair() {
     for (left_rows, matched) in [(vec![(1, Some(1.0)), (3, None)], true), (vec![(1, Some(1.0))], true)] {
         let left = measured(0, &left_rows);

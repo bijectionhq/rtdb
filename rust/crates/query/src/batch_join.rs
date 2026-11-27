@@ -18,7 +18,10 @@ use arrow_array::{
 use arrow_schema::{DataType, TimeUnit as ArrowTimeUnit};
 use rtdb_types::{IntervalUnit, LogicalType, Result, ScalarType, TimeUnit, Value};
 
-use crate::columnar::{BatchCursor, BoxBatchCursor, Column, ColumnBatch, gather_column_rows, gather_join_probe, gather_nullable_column, poll_nested_batch};
+use crate::columnar::{
+    BatchCursor, BoxBatchCursor, Column, ColumnBatch, gather_column_rows, gather_column_rows_iter,
+    gather_join_probe, gather_nullable_column, poll_nested_batch,
+};
 use crate::context::Execution;
 use crate::invalid;
 use crate::join_key::JoinLayout;
@@ -359,6 +362,12 @@ struct PreparedResidual<'a> {
     comparisons: Vec<rtdb_expr::ExpressionInvocation<'a>>,
     sides: &'a [(bool, usize)],
     _metadata: rtdb_expr::EvaluationScope,
+}
+
+struct ResidualCandidate {
+    build: (usize, usize),
+    probe: usize,
+    known: bool,
 }
 
 struct JoinRow<'a> {
@@ -859,9 +868,7 @@ impl Spec {
         let context = &self.execution.context;
         let memory = &context.memory;
         let equality = self.execution.scope()?;
-        let mut pairs = JoinPositions::new();
-        let mut probes = JoinPositions::new();
-        let mut known = Vec::new();
+        let mut candidates = JoinPositions::new();
         let mut first_row = 0;
         for row in 0..probe.len {
             context.check_cancelled_at(row)?;
@@ -873,57 +880,48 @@ impl Spec {
                 context.check_cancelled_at(candidate)?;
                 let (batch, offset) = table.position(ordinal);
                 let Some(keys) = self.residual_keys(&table.batches[batch], offset, probe, row, &equality)? else { continue; };
-                pairs.push((batch, offset), memory)?;
-                probes.push((0, row), memory)?;
-                known.push(keys);
+                candidates.push(ResidualCandidate { build: (batch, offset), probe: row, known: keys }, memory)?;
             }
-            if pairs.rows.len() >= PAIRS_PER_PASS || row + 1 == probe.len {
-                self.residual_pass(table, probe, residual, &pairs.rows, &probes.rows, &mut known, first_row..row + 1, matches).await?;
-                pairs = JoinPositions::new();
-                probes = JoinPositions::new();
-                known.clear();
+            if candidates.rows.len() >= PAIRS_PER_PASS || row + 1 == probe.len {
+                self.residual_pass(table, probe, residual, &mut candidates.rows, first_row..row + 1, matches).await?;
+                candidates = JoinPositions::new();
                 first_row = row + 1;
             }
         }
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn residual_pass(&self, table: &Table, probe: &ColumnBatch, residual: &Residual, pairs: &[(usize, usize)], probes: &[(usize, usize)],
-        known: &mut [bool], rows: std::ops::Range<usize>, matches: &mut InnerMatches) -> Result<()> {
+    async fn residual_pass(&self, table: &Table, probe: &ColumnBatch, residual: &Residual,
+        candidates: &mut Vec<ResidualCandidate>, rows: Range<usize>, matches: &mut InnerMatches) -> Result<()> {
         let memory = &self.execution.context.memory;
-        let index_bytes = pairs.len().checked_mul(3 * size_of::<(usize, usize)>()).ok_or_else(size_error)?;
-        let _indexes = memory.reserve(index_bytes)?;
-        let mut kept: Vec<usize> = (0..pairs.len()).collect();
         for predicate in &residual.expressions {
-            if kept.is_empty() { break; }
-            let build_rows: Vec<(usize, usize)> = kept.iter().map(|&pair| pairs[pair]).collect();
-            let probe_rows: Vec<(usize, usize)> = kept.iter().map(|&pair| probes[pair]).collect();
+            if candidates.is_empty() { break; }
             let mut columns = Vec::with_capacity(residual.sides.len());
             let mut charges = Vec::with_capacity(residual.sides.len());
             for &(on_build, position) in &residual.sides {
                 let (column, charge) = if on_build {
-                    gather_column_rows(|batch| &table.batches[batch], &build_rows, position, memory)?
+                    let rows = candidates.iter().map(|candidate| candidate.build);
+                    gather_column_rows_iter(|batch| &table.batches[batch], rows, position, memory)?
                 } else {
-                    gather_column_rows(|_| probe, &probe_rows, position, memory)?
+                    let rows = candidates.iter().map(|candidate| (0, candidate.probe));
+                    gather_column_rows_iter(|_| probe, rows, position, memory)?
                 };
                 columns.push(column);
                 charges.push(charge);
             }
-            let pairs_batch = ColumnBatch::settled(columns, kept.len(), memory.reserve(256)?)?;
+            let pairs_batch = ColumnBatch::settled(columns, candidates.len(), memory.reserve(256)?)?;
             let (truths, _truths) = crate::columnar::predicate_truth(&pairs_batch, predicate, &residual.schema, &self.execution).await?;
-            kept = kept.into_iter().zip(truths).filter_map(|(pair, truth)| match truth {
-                Some(false) => None,
-                Some(true) => Some(pair),
-                None => { known[pair] = false; Some(pair) }
-            }).collect();
+            let mut truths = truths.into_iter();
+            candidates.retain_mut(|candidate| match truths.next().expect("Each candidate has a truth value") {
+                Some(false) => false,
+                Some(true) => true,
+                None => { candidate.known = false; true }
+            });
         }
-        let mut kept = kept.into_iter().filter(|&pair| known[pair]).peekable();
+        let mut kept = candidates.iter().filter(|candidate| candidate.known).peekable();
         for row in rows {
-            while let Some(&pair) = kept.peek() {
-                if probes[pair].1 != row { break; }
-                matches.push(pairs[pair], memory)?;
-                kept.next();
+            while let Some(candidate) = kept.next_if(|candidate| candidate.probe == row) {
+                matches.push(candidate.build, memory)?;
             }
             matches.end_row(row, memory)?;
         }

@@ -2059,7 +2059,15 @@ pub(crate) fn ordinal_column_by(len: usize, name: &str, context: &crate::QueryCo
 pub(crate) fn gather_column_rows<'a>(
     source: impl Fn(usize) -> &'a ColumnBatch, rows: &[(usize, usize)], position: usize, memory: &Arc<MemoryBudget>,
 ) -> Result<(Column, Arc<MemoryReservation>)> {
-    gather_column_cells(source, rows.iter().copied().map(Some), rows.len(), position, false, memory)
+    gather_column_rows_iter(source, rows.iter().copied(), position, memory)
+}
+
+pub(crate) fn gather_column_rows_iter<'a>(
+    source: impl Fn(usize) -> &'a ColumnBatch, rows: impl ExactSizeIterator<Item = (usize, usize)> + Clone,
+    position: usize, memory: &Arc<MemoryBudget>,
+) -> Result<(Column, Arc<MemoryReservation>)> {
+    let count = rows.len();
+    gather_column_cells(source, rows.map(Some), count, position, false, memory)
 }
 
 pub(crate) async fn retain_list_spans(
