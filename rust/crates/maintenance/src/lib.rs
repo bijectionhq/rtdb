@@ -16,7 +16,7 @@ pub use table_history::{HistoryCoverage, HistoryRead, HistoryRow, HistoryVisitor
 pub use driver::{CompactionDriver, CompactionHandle, CompactionExecutor, CycleDriver, CycleHandle, CycleWorker};
 pub use entity_history::EntityHistoryArtefacts;
 pub use failure::{CompactionFailure, CompactionObserver, LoggingCompactionObserver};
-pub use gc::{BlockCollector, CollectionObserver, CollectorClock, GarbageConfig, TrieCollector, block_is_garbage};
+pub use gc::{BlockCollector, CollectionObserver, GarbageConfig, TrieCollector, block_is_garbage};
 pub use job::{CompactionJob, RecencyMode, available_jobs};
 pub use merge::{MergeConfig, RecencyPartition, SegmentCompactor, recency_partition};
 pub use publication::{CompactionPublisher, SnapshotSource, TableRetirements, TrieDeletionPublisher};

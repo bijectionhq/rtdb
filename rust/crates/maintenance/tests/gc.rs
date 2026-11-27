@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, atomic::{AtomicBool, AtomicI64, Ordering}};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use async_trait::async_trait;
 use bytes::Bytes;
 use rtdb_format::{block::proto as pb, catalog::BlockCatalog, cow_tree::RootRef, keys::{TRIE_RETIREMENT_DIRECTORY, TrieKey, block_key, oversized_key},
@@ -15,10 +14,6 @@ use tokio_util::sync::CancellationToken;
 #[derive(Default)]
 struct Observer(Mutex<Vec<Anomaly>>);
 impl CollectionObserver for Observer { fn table_failed(&self, _: Option<&TableRef>, error: &Anomaly) { self.0.lock().unwrap().push(error.clone()); } }
-
-/// No reader on another node holds a lease, so collection need not wait.
-fn unleased() -> GarbageConfig { GarbageConfig { page_grace: Duration::ZERO, ..GarbageConfig::default() } }
-fn fixed_clock() -> rtdb_maintenance::CollectorClock { Arc::new(|| 0) }
 
 fn block(index: i64) -> BlockCatalog {
     BlockCatalog::from_proto(pb::Block { block_index: Some(index), latest_completed_tx: Some(pb::TxKey { tx_id: Some(index), system_time: Some(index * 1_000_000), ..Default::default() }), ..Default::default() }).unwrap()
@@ -138,7 +133,7 @@ async fn trie_gc_deletes_artefacts_and_both_files_before_publishing_and_preserve
     })]);
     let publisher = Arc::new(DeletedPublisher { store: store.clone(), table: entry.clone(), commits: Mutex::new(Vec::new()) });
     let state = Arc::new(PartitionState::new(PartitionValue::loaded(catalog, tables, TrieConfig::default()).unwrap()));
-    let collector = TrieCollector::new(store.clone(), state, publisher.clone(), Arc::new(Observer::default()), unleased(), fixed_clock()).unwrap();
+    let collector = TrieCollector::new(store.clone(), state, publisher.clone(), Arc::new(Observer::default()), GarbageConfig::default()).unwrap();
     collector.collect_as_of(Timestamp(100), &CancellationToken::new()).await.unwrap();
     assert_eq!(*publisher.commits.lock().unwrap(), vec![vec!["l01-rc-b00".parse::<TrieKey>().unwrap()]]);
     assert!(store.head(&ObjectKey::new(entry.slug.data_key(&"l00-rc-b00".parse().unwrap())).unwrap()).await.is_ok());
@@ -180,7 +175,7 @@ async fn a_retired_table_loses_its_compacted_tries_through_the_ordinary_deletion
     let publisher = Arc::new(DeletedPublisher { store: store.clone(), table: entry.clone(), commits: Mutex::new(Vec::new()) });
     let retirements = Arc::new(DueRetirement { state: state.clone(), table: table.clone(), retired: Mutex::new(Vec::new()) });
     let observer = Arc::new(Observer::default());
-    let collector = TrieCollector::new(store.clone(), state.clone(), publisher.clone(), observer.clone(), unleased(), fixed_clock()).unwrap()
+    let collector = TrieCollector::new(store.clone(), state.clone(), publisher.clone(), observer.clone(), GarbageConfig::default()).unwrap()
         .with_retirements(retirements.clone());
 
     collector.collect_as_of(Timestamp(100), &CancellationToken::new()).await.unwrap();
@@ -287,7 +282,7 @@ async fn durable_retirement_intents_survive_writer_stop_on_both_sides_of_install
             phase, state: state.clone(), scope, store, pending: pending.clone(), requests: Mutex::new(Vec::new()),
         });
         let collector = |store: Arc<dyn ObjectStore>, publisher: Arc<InstallingPublisher>, observer: Arc<Observer>| {
-            TrieCollector::new(store, state.clone(), publisher, observer, unleased(), fixed_clock()).unwrap()
+            TrieCollector::new(store, state.clone(), publisher, observer, GarbageConfig::default()).unwrap()
         };
         let slug = &tables_for_footprint.entry(&table).unwrap().slug;
         let data = ObjectKey::new(slug.data_key(&old)).unwrap();
@@ -415,7 +410,7 @@ async fn local_trie_collection_keeps_the_window_and_never_waits_for_a_reader() {
     });
     let observer = Arc::new(Observer::default());
     let collect = |store: Arc<LocalStore>| TrieCollector::new(store, state.clone(), publisher.clone(),
-        observer.clone(), unleased(), fixed_clock()).unwrap();
+        observer.clone(), GarbageConfig::default()).unwrap();
     let cancellation = CancellationToken::new();
     collect(writer.clone()).collect_as_of(Timestamp(99), &cancellation).await.unwrap();
     assert!(state.value().retains_trie(&table, &obsolete), "a trie superseded inside the garbage window is kept");
@@ -478,7 +473,7 @@ async fn collection_preserves_live_and_pending_tries_of_the_installed_checkpoint
     }
     let observer = Arc::new(Observer::default());
     let publisher = Arc::new(DeletedPublisher { store: store.clone(), table: entry.clone(), commits: Mutex::new(Vec::new()) });
-    let collector = TrieCollector::new(store.clone(), state.clone(), publisher.clone(), observer.clone(), unleased(), fixed_clock()).unwrap();
+    let collector = TrieCollector::new(store.clone(), state.clone(), publisher.clone(), observer.clone(), GarbageConfig::default()).unwrap();
     let cancellation = CancellationToken::new();
     collector.collect_as_of(Timestamp(200), &cancellation).await.unwrap();
     assert!(publisher.commits.lock().unwrap().is_empty(), "an installed checkpoint still needs both tries");
@@ -526,7 +521,7 @@ async fn collection_keeps_the_garbage_window_and_ignores_open_readers() {
         }
     }
     let publisher = Arc::new(DeletedPublisher { store: store.clone(), table: entry, commits: Mutex::new(Vec::new()) });
-    let collector = TrieCollector::new(store.clone(), state.clone(), publisher.clone(), Arc::new(Observer::default()), unleased(), fixed_clock()).unwrap();
+    let collector = TrieCollector::new(store.clone(), state.clone(), publisher.clone(), Arc::new(Observer::default()), GarbageConfig::default()).unwrap();
     let cancellation = CancellationToken::new();
     collector.collect_as_of(Timestamp(99), &cancellation).await.unwrap();
     assert!(publisher.commits.lock().unwrap().is_empty(), "a trie superseded after the garbage-as-of horizon is kept");
@@ -607,7 +602,7 @@ async fn retirement_binds_only_the_same_version_the_catalog_published() {
         (data.clone(), published_data), (metadata.clone(), provider_version(&metadata, "replacement-version")),
     ]) });
     let publisher = Arc::new(DeletedPublisher { store: store.clone(), table: entry, commits: Mutex::new(Vec::new()) });
-    let collector = TrieCollector::new(observing, state, publisher, Arc::new(Observer::default()), unleased(), fixed_clock()).unwrap();
+    let collector = TrieCollector::new(observing, state, publisher, Arc::new(Observer::default()), GarbageConfig::default()).unwrap();
     collector.collect_as_of(Timestamp(100), &CancellationToken::new()).await.unwrap();
     let installed = ObjectKey::new(format!("{TRIE_RETIREMENT_DIRECTORY}/6-0-0/installed")).unwrap();
     let receipts = store.list(Some(&installed)).await.unwrap();
@@ -676,9 +671,9 @@ async fn shared_artefacts_go_only_with_the_last_member_the_catalog_holds() {
             let state = Arc::new(PartitionState::new(PartitionValue::loaded(catalog, tables, TrieConfig::default()).unwrap()));
             let cut = CatalogCut { storage_version: StorageVersion(6), storage_epoch: StorageEpoch(0), replica_epoch: StorageEpoch(0), through: ReplicaPosition(0) };
             state.publish_catalog_cut(cut).unwrap();
-            let config = GarbageConfig { chunk_size: 1, ..unleased() };
+            let config = GarbageConfig { chunk_size: 1, ..GarbageConfig::default() };
             let observer = Arc::new(Observer::default());
-            let collector = TrieCollector::new(observing, state, publisher.clone(), observer.clone(), config, fixed_clock()).unwrap();
+            let collector = TrieCollector::new(observing, state, publisher.clone(), observer.clone(), config).unwrap();
             collector.collect_as_of(Timestamp(200), &CancellationToken::new()).await.unwrap();
             assert!(observer.0.lock().unwrap().is_empty());
             publisher.commits.lock().unwrap().concat()
@@ -742,7 +737,7 @@ async fn an_uncoordinated_store_loses_a_trie_superseded_before_the_horizon_at_th
     let publisher = Arc::new(DeletedPublisher { store: store.clone(), table: entry.clone(), commits: Mutex::new(Vec::new()) });
     let state = Arc::new(PartitionState::new(PartitionValue::loaded(catalog, tables, TrieConfig::default()).unwrap()));
     let cancellation = CancellationToken::new();
-    let collector = TrieCollector::new(store.clone(), state, publisher.clone(), Arc::new(Observer::default()), GarbageConfig::default(), fixed_clock()).unwrap();
+    let collector = TrieCollector::new(store.clone(), state, publisher.clone(), Arc::new(Observer::default()), GarbageConfig::default()).unwrap();
     collector.collect_as_of(Timestamp(99), &cancellation).await.unwrap();
     assert!(publisher.commits.lock().unwrap().is_empty(), "a trie superseded after the horizon stays");
     assert!(store.head(&data).await.is_ok());
@@ -807,7 +802,7 @@ async fn retired_search_bodies_and_catalog_receipts_wait_for_store_holds() {
     let trie_deletion = Arc::new(DeletedPublisher { table: entry, store: store.inner.clone(), commits: Mutex::default() });
     let observer = Arc::new(Observer::default());
     let removal = Arc::new(SearchRemoval { table: table.clone(), state: state.clone() });
-    let collector = TrieCollector::new(store.clone(), state.clone(), trie_deletion, observer.clone(), unleased(), fixed_clock()).unwrap()
+    let collector = TrieCollector::new(store.clone(), state.clone(), trie_deletion, observer.clone(), GarbageConfig::default()).unwrap()
         .with_search(removal, StorageVersion(0), StorageEpoch(0));
     let stop = CancellationToken::new();
     collector.collect_as_of(Timestamp(3), &stop).await.unwrap();
@@ -888,7 +883,7 @@ async fn a_search_upload_without_catalog_adoption_is_fenced_before_release() {
     let retirement = Arc::new(SearchPublisher { table: table.clone(), state: Arc::clone(&state), store: Arc::clone(&store), abandoned: AtomicBool::new(false) });
     let trie_deletion = Arc::new(DeletedPublisher { table: entry, store: Arc::new(MemoryStore::default()), commits: Mutex::default() });
     let observer = Arc::new(Observer::default());
-    let collector = TrieCollector::new(store.clone(), state.clone(), trie_deletion, observer.clone(), unleased(), fixed_clock()).unwrap()
+    let collector = TrieCollector::new(store.clone(), state.clone(), trie_deletion, observer.clone(), GarbageConfig::default()).unwrap()
         .with_search(retirement.clone(), StorageVersion(0), StorageEpoch(0));
     let stop = CancellationToken::new();
     collector.collect_as_of(Timestamp(100), &stop).await.unwrap();
@@ -1000,13 +995,13 @@ async fn directory_collection_keeps_only_pages_the_next_root_reuses_whatever_a_r
     adopt_directory(&state, &table, 1, &next, Some(&old), count);
     let primary = Arc::new(DeletedPublisher { store: store.clone(), table: entry, commits: Mutex::new(Vec::new()) });
     let observer = Arc::new(Observer::default());
-    let collector = TrieCollector::new(store.clone(), state.clone(), primary, observer.clone(), unleased(), fixed_clock()).unwrap()
+    let collector = TrieCollector::new(store.clone(), state.clone(), primary, observer.clone(), GarbageConfig::default()).unwrap()
         .with_entity_directories(Arc::new(DirectoryPublisher(state.clone())), StorageVersion(6), StorageEpoch(0));
     let cancellation = CancellationToken::new();
     collector.collect_as_of(Timestamp(1), &cancellation).await.unwrap();
     assert!(observer.0.lock().unwrap().is_empty());
     assert!(store.head(&ObjectKey::new(cow_tree::page_key(&input.prefix, old.digest)).unwrap()).await.is_err(),
-        "a reader of the old root does not hold its pages once the lease has elapsed");
+        "a reader of the old root does not hold its pages once its supersession leaves the garbage window");
     drop(reader);
     for page in old_pages {
         assert_eq!(store.head(&ObjectKey::new(cow_tree::page_key(&input.prefix, page)).unwrap()).await.is_ok(), new_pages.contains(&page));
@@ -1015,7 +1010,7 @@ async fn directory_collection_keeps_only_pages_the_next_root_reuses_whatever_a_r
 }
 
 #[tokio::test]
-async fn directory_collection_preserves_shared_pages_until_the_newer_retired_root_lease_elapses() {
+async fn directory_collection_preserves_shared_pages_until_the_newer_retired_root_leaves_the_window() {
     use rtdb_format::{cow_tree::{self, Edit, NoSummary, Row}, entity_directory};
     use rtdb_storage::{cache::BufferPool, cow_pages::ObjectPageStore};
     use rtdb_types::MemoryBudget;
@@ -1045,24 +1040,26 @@ async fn directory_collection_preserves_shared_pages_until_the_newer_retired_roo
     let state = Arc::new(PartitionState::new(PartitionValue::loaded(TrieCatalog::default(), tables, TrieConfig::default()).unwrap()));
     adopt_directory(&state, &table, 0, &old, None, count);
     adopt_directory(&state, &table, 1, &newer, Some(&old), count);
-    let time = Arc::new(AtomicI64::new(0));
-    let clock = { let time = time.clone(); Arc::new(move || time.load(Ordering::Relaxed)) };
+    adopt_directory(&state, &table, 2, &current, Some(&newer), count);
+    let superseded: Vec<_> = state.value().trie_catalog().retired_entity_directories(&table).map(|root| root.superseded_at).collect();
+    assert_eq!(superseded, [Some(1), Some(2)], "each retired root records the system time of the block that replaced it");
     let primary = Arc::new(DeletedPublisher { store: store.clone(), table: entry, commits: Mutex::default() });
     let observer = Arc::new(Observer::default());
-    let config = GarbageConfig { page_grace: Duration::from_micros(10), ..unleased() };
-    let collector = TrieCollector::new(store.clone(), state.clone(), primary, observer.clone(), config, clock).unwrap()
+    let collector = TrieCollector::new(store.clone(), state.clone(), primary, observer.clone(), GarbageConfig::default()).unwrap()
         .with_entity_directories(Arc::new(DirectoryPublisher(state.clone())), StorageVersion(6), StorageEpoch(0));
     let cancellation = CancellationToken::new();
+    collector.collect_as_of(Timestamp(0), &cancellation).await.unwrap();
+    assert!(store.head(&old_root).await.is_ok(), "no retired root is collected inside the garbage window");
+
     collector.collect_as_of(Timestamp(1), &cancellation).await.unwrap();
-
-    adopt_directory(&state, &table, 2, &current, Some(&newer), count);
-    time.store(10, Ordering::Relaxed);
-    collector.collect_as_of(Timestamp(2), &cancellation).await.unwrap();
     assert!(matches!(store.head(&old_root).await, Err(rtdb_storage::Error::MissingObject(_))));
-    assert!(store.head(&shared).await.is_ok());
+    assert!(store.head(&shared).await.is_ok(), "a page the newer retired root still names waits for that root's window");
 
-    time.store(20, Ordering::Relaxed);
-    collector.collect_as_of(Timestamp(2), &cancellation).await.unwrap();
+    // A restarted collector has nothing to remember: the catalog carries each supersession time.
+    let restarted = TrieCollector::new(store.clone(), state.clone(), Arc::new(DeletedPublisher { store: store.clone(),
+        table: state.value().table_catalog().entry(&table).unwrap().clone(), commits: Mutex::default() }), observer.clone(), GarbageConfig::default()).unwrap()
+        .with_entity_directories(Arc::new(DirectoryPublisher(state.clone())), StorageVersion(6), StorageEpoch(0));
+    restarted.collect_as_of(Timestamp(2), &cancellation).await.unwrap();
     assert!(matches!(store.head(&shared).await, Err(rtdb_storage::Error::MissingObject(_))));
     assert!(state.value().trie_catalog().retired_entity_directories(&table).next().is_none());
     assert!(observer.0.lock().unwrap().is_empty());
@@ -1107,47 +1104,59 @@ async fn directory_sealing_requires_page_releases_and_preserves_per_trie_history
 }
 
 #[tokio::test]
-async fn unreachable_term_directory_pages_are_swept_when_tombstone_pruning_fails() {
-    use rtdb_format::{cow_tree::{PageDigest, page_key}, log::proto::{SearchRun, SearchRunChange}, term_directory};
-    use rtdb_maintenance::ArtefactPublisher;
-    use rtdb_types::SourcePosition;
-
-    struct Unused;
-    #[async_trait]
-    impl ArtefactPublisher for Unused {
-        async fn publish(&self, _: ArtefactsAdded) -> Result<SourcePosition> { panic!("No search transition is due") }
-        async fn remove(&self, _: ArtefactsRemoved) -> Result<SourcePosition> { panic!("No search transition is due") }
-    }
+async fn term_directory_pages_are_released_on_the_window_of_their_retired_root_and_unnamed_pages_stay() {
+    use rtdb_format::{cow_tree::{self, Edit, NoSummary, PageDigest, Row, page_key}, log::proto::{SearchRun, SearchRunChange, TermDirectoryRoot}, term_directory};
+    use rtdb_storage::{cache::BufferPool, cow_pages::ObjectPageStore};
+    use rtdb_types::MemoryBudget;
 
     let table = TableRef::new("public", "docs");
-    let tables = TableCatalog::load(Some(block(0)), &BTreeMap::new()).unwrap().with_seeded_table(table.clone(), Vec::new()).unwrap();
+    let tables = TableCatalog::default().with_seeded_table(table.clone(), Vec::new()).unwrap();
     let entry = tables.entry(&table).unwrap().clone();
     let anchor = TrieKey::l0(BlockIndex(0)).unwrap();
     let catalog = TrieCatalog::default().with_tries(table.clone(), [CatalogTrie::notification(anchor.clone(), 1, None).unwrap()], Timestamp(10)).unwrap();
     let state = Arc::new(PartitionState::new(PartitionValue::loaded(catalog, tables, TrieConfig::default()).unwrap()));
-    let run = SearchRun { definition_id: Some("docs_bodyf16".into()), definition_version: Some(1), blocks: vec![0],
-        digest: Some(vec![7; 32]), locator: Some(vec![1]), file_size: Some(4), source_rows: Some(1), allocation: Some(vec![16; 16]),
-        ..Default::default() };
-    let release = SearchRunChange { run: Some(run), retire_only: Some(true), ..Default::default() };
-    let abandon = SearchRunChange { abandon: Some(true), ..release.clone() }.to_artefact().unwrap();
-    state.add_artefacts_at(&table, vec![(anchor.clone(), abandon)], Timestamp(10));
-    state.remove_artefacts_at(&table, vec![(anchor, release.to_artefact().unwrap())], Some(ReplicaPosition(1)));
-    state.publish_catalog_cut(CatalogCut { storage_version: StorageVersion(0), storage_epoch: StorageEpoch(0),
-        replica_epoch: StorageEpoch(0), through: ReplicaPosition(2) }).unwrap();
 
     let store = Arc::new(MemoryStore::default());
-    let checkpoint = ObjectKey::new(block_key(BlockIndex(0)).unwrap()).unwrap();
-    store.put(&checkpoint, Bytes::from_static(b"\xff")).await.unwrap();
-    let prefix = term_directory::page_prefix(&entry.slug);
-    let orphans: Vec<_> = [1u8, 2].into_iter().map(|byte| ObjectKey::new(page_key(&prefix, PageDigest([byte; 32]))).unwrap()).collect();
-    for key in &orphans { store.put(key, Bytes::from_static(b"page")).await.unwrap(); }
+    let pages = ObjectPageStore { store: store.clone(), storage: Arc::new(BufferPool::new(store.clone(), 16 << 20)),
+        prefix: term_directory::page_prefix(&entry.slug) };
+    let memory = MemoryBudget::new(16 << 20);
+    let count = cow_tree::MAX_LEAF_ROWS + 1;
+    let edit = |index: usize, value| Edit::Put(Row { key: (index as u32).to_be_bytes().to_vec(), value: vec![value] });
+    let (old, _) = cow_tree::apply(&pages, None, (0..count).map(|index| edit(index, 0)).collect(), &NoSummary, &memory).await.unwrap();
+    let old = old.unwrap();
+    let (next, _) = cow_tree::apply(&pages, Some(&old), vec![edit(0, 1)], &NoSummary, &memory).await.unwrap();
+    let next = next.unwrap();
+    let old_pages = cow_tree::reachable(&pages, &old).await.unwrap();
+    let next_pages = cow_tree::reachable(&pages, &next).await.unwrap();
+    let directory = |root: &RootRef| TermDirectoryRoot { definition_id: Some("docs_bodyf16".into()), definition_version: Some(1),
+        root: Some(RootRef { summary: 1.0f64.to_be_bytes().to_vec(), ..root.clone() }.encode()), runs: Some(1), run_set: None };
+    let run = SearchRun { definition_id: Some("docs_bodyf16".into()), definition_version: Some(1), blocks: vec![0],
+        digest: Some(vec![7; 32]), locator: Some(vec![1]), file_size: Some(4), source_rows: Some(1), ..Default::default() };
+    let publish = |root: &RootRef, previous: Option<&RootRef>, at| {
+        let basis = term_directory::publication_basis(previous.map(directory).as_ref(), previous.map(|_| [7; 32]));
+        let change = SearchRunChange { run: Some(run.clone()), term_directory: Some(directory(root)), replaces_directory: Some(basis.to_vec()), ..Default::default() };
+        state.add_artefacts_at(&table, vec![(anchor.clone(), change.to_artefact().unwrap())], Timestamp(at));
+    };
+    publish(&old, None, 10);
+    publish(&next, Some(&old), 20);
+    let retired: Vec<_> = state.value().trie_catalog().retired_term_directories(&table).cloned().collect();
+    assert_eq!(retired.iter().map(|retired| retired.superseded_at).collect::<Vec<_>>(), [Some(20)]);
+    let unnamed = ObjectKey::new(page_key(&pages.prefix, PageDigest([1; 32]))).unwrap();
+    store.put(&unnamed, Bytes::from_static(b"page")).await.unwrap();
+
     let deletions = Arc::new(DeletedPublisher { table: entry.clone(), store: store.clone(), commits: Mutex::default() });
     let observer = Arc::new(Observer::default());
-    let collector = TrieCollector::new(store.clone(), state.clone(), deletions, observer.clone(), unleased(), fixed_clock()).unwrap()
-        .with_search(Arc::new(Unused), StorageVersion(0), StorageEpoch(0));
-    collector.collect_as_of(Timestamp(100), &CancellationToken::new()).await.unwrap();
-    for key in &orphans { assert!(matches!(store.head(key).await, Err(rtdb_storage::Error::MissingObject(_))), "{key:?}"); }
-    assert_eq!(state.snapshot().trie_catalog().retired_search_runs(&table).next().unwrap().settled_at_replica_msg_id, Some(1));
-    let errors = observer.0.lock().unwrap();
-    assert_eq!(errors.iter().map(|error| error.code.as_str()).collect::<Vec<_>>(), ["rtdb.format/invalid-catalog"]);
+    let collector = TrieCollector::new(store.clone(), state.clone(), deletions, observer.clone(), GarbageConfig::default()).unwrap()
+        .with_search(Arc::new(DirectoryPublisher(state.clone())), StorageVersion(0), StorageEpoch(0));
+    let present = |page: PageDigest| { let store = store.clone(); let key = ObjectKey::new(page_key(&pages.prefix, page)).unwrap();
+        async move { store.head(&key).await.is_ok() } };
+    collector.collect_as_of(Timestamp(19), &CancellationToken::new()).await.unwrap();
+    for page in &old_pages { assert!(present(*page).await, "the retired root's pages stay inside the garbage window"); }
+
+    collector.collect_as_of(Timestamp(20), &CancellationToken::new()).await.unwrap();
+    for page in &old_pages { assert_eq!(present(*page).await, next_pages.contains(page)); }
+    for page in &next_pages { assert!(present(*page).await); }
+    assert!(store.head(&unnamed).await.is_ok(), "a page no recorded root names is never collected");
+    assert!(state.value().trie_catalog().retired_term_directories(&table).next().is_none());
+    assert!(observer.0.lock().unwrap().is_empty());
 }

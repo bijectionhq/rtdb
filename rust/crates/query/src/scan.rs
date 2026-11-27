@@ -4306,7 +4306,7 @@ mod tests {
             root: Some(EntityDirectoryRoot {
                 root: Some(root.unwrap().encode()), through_block: Some(newest), source_rows: Some(source_rows),
                 has_erases: Some(false), allocation: Some(vec![0; 16]), writer_fence: Some(0),
-                erase_frontier_digest: Some(Sha256::digest([]).to_vec()),
+                erase_frontier_digest: Some(Sha256::digest([]).to_vec()), superseded_at: None,
             }),
             replaces_root: None,
         };

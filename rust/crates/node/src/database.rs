@@ -613,7 +613,7 @@ impl DatabaseFactory {
             let mut maintenance_options = self.options.clone();
             if sealed_local_erasure { maintenance_options.automatic_gc = false; }
             let supervisor = MaintenanceSupervisor { database: name.clone(), storage: Arc::clone(&storage), memory: Arc::clone(&self.memory), logs: Arc::clone(&logs), store: resources.store, partition: Arc::clone(&partition), replication: replication.clone(), compaction: compaction.clone(), artefacts: artefacts.clone(),
-                observer: Arc::clone(&self.observer), options: maintenance_options, source, ordered_worker, ordered_cycle: ordered_cycle.clone(), clock: Arc::clone(&self.clock) };
+                observer: Arc::clone(&self.observer), options: maintenance_options, source, ordered_worker, ordered_cycle: ordered_cycle.clone() };
             let fragment_residence = resources.fragment_storage.map(|storage| rtdb_query::FragmentResidence {
                 storage, replica_epoch: logs.replica_epoch.0,
             });
@@ -906,7 +906,6 @@ struct MaintenanceSupervisor {
     source: Option<Box<dyn ExternalSource>>,
     ordered_worker: Option<Arc<OrderedIndexMaintenance>>,
     ordered_cycle: Option<OrderedIndexCycle>,
-    clock: Arc<dyn Clock>,
     logs: Arc<PartitionLogs>,
 }
 
@@ -915,10 +914,7 @@ impl MaintenanceSupervisor {
         let cancellation = parent.child_token();
         let publisher = Arc::new(PublishDeletions(handle.clone()));
         let artefacts = Arc::new(PublishArtefacts { replication: self.replication.clone(), cancellation: cancellation.clone() });
-        let trie_collector = Arc::new(TrieCollector::new(Arc::clone(&self.store), Arc::clone(&self.partition), publisher, Arc::clone(&self.observer), self.options.garbage.clone(), {
-            let clock = Arc::clone(&self.clock);
-            Arc::new(move || clock.monotonic_micros())
-        })?
+        let trie_collector = Arc::new(TrieCollector::new(Arc::clone(&self.store), Arc::clone(&self.partition), publisher, Arc::clone(&self.observer), self.options.garbage.clone())?
             .with_entity_directories(artefacts.clone(), self.logs.storage_version, self.logs.storage_epoch)
             .with_search(artefacts, self.logs.storage_version, self.logs.storage_epoch).with_retirements(Arc::new(crate::table_retirement::RetiredRelations {
             database: self.database.clone(), partition: Arc::clone(&self.partition), storage: Arc::clone(&self.storage),
@@ -954,10 +950,6 @@ impl MaintenanceSupervisor {
         let mut status = self.replication.watch_status();
         let mut region: Option<TermRegion> = None;
         let mut adopted = None;
-        let mut trie_retry = tokio::time::interval(self.options.garbage.page_grace.clamp(
-            Duration::from_millis(100), Duration::from_secs(60),
-        ));
-        trie_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let result = loop {
             if cancellation.is_cancelled() { break Ok(()); }
             let current = status.borrow_and_update().clone();
@@ -971,7 +963,7 @@ impl MaintenanceSupervisor {
                         _ = cancellation.cancelled() => break Ok(()),
                         changed = status.changed() => { if changed.is_err() { break Err(closed()); } continue; }
                         started = self.start_term(handle, &cancellation) => match started {
-                            Ok(next) => { region = Some(next); trie_retry.reset_immediately(); }
+                            Ok(next) => { next.trie.signal(); region = Some(next); }
                             Err(error) => break Err(error),
                         },
                     }
@@ -991,9 +983,6 @@ impl MaintenanceSupervisor {
             tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => break Ok(()),
-                _ = trie_retry.tick(), if self.options.automatic_gc && region.is_some() => {
-                    if let Some(region) = &region { region.trie.signal(); }
-                }
                 changed = status.changed() => if changed.is_err() { break Err(closed()); },
                 result = async { region.as_mut().expect("guarded term region").tasks.join_next().await }, if region.is_some() => break Err(component_exit(result)),
             }

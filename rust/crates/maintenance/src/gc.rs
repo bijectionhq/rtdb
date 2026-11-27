@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use async_trait::async_trait;
 use futures::{StreamExt, stream};
@@ -21,20 +21,17 @@ pub struct GarbageConfig {
     /// The garbage window, as in XTDB: a superseded trie is collected only once it was superseded at or before the
     /// latest completed transaction of the oldest of the newest `blocks_to_keep` blocks, less `garbage_lifetime`.
     /// Readers register nothing, so a read of a catalog older than the window may find its files gone.
+    /// Search runs and entity and term directory pages follow the same window, from the supersession time the catalog
+    /// records for each.
     pub blocks_to_keep: usize,
     pub garbage_lifetime: Duration,
     pub table_parallelism: usize,
     pub delete_parallelism: usize,
     pub chunk_size: usize,
-    /// RTDB-only entity and term directory pages carry no supersession time in the catalog, so the collector releases
-    /// one this long after it first sees it unreferenced; an uploaded page also needs this long to become reachable
-    /// through its published root. Tries and search runs follow the window alone.
-    pub page_grace: Duration,
 }
 
 impl Default for GarbageConfig {
-    fn default() -> Self { Self { blocks_to_keep: 10, garbage_lifetime: Duration::from_secs(24 * 60 * 60), table_parallelism: 8, delete_parallelism: 64, chunk_size: 1024,
-        page_grace: Duration::from_secs(60 * 60) } }
+    fn default() -> Self { Self { blocks_to_keep: 10, garbage_lifetime: Duration::from_secs(24 * 60 * 60), table_parallelism: 8, delete_parallelism: 64, chunk_size: 1024 } }
 }
 
 impl GarbageConfig {
@@ -42,16 +39,8 @@ impl GarbageConfig {
         if self.blocks_to_keep == 0 || self.table_parallelism == 0 || self.delete_parallelism == 0 || self.chunk_size == 0 || self.chunk_size > 1024 {
             return Err(crate::invalid("Garbage collection requires positive retention and concurrency, with at most 1024 trie keys per chunk"));
         }
-        self.page_grace_micros()?;
         Ok(())
     }
-    fn page_grace_micros(&self) -> Result<i64> {
-        i64::try_from(self.page_grace.as_micros()).map_err(|_| crate::invalid("Page grace exceeds the timestamp range"))
-    }
-}
-
-fn grace_elapsed(first_observed: i64, grace: i64, now: i64) -> bool {
-    first_observed.checked_add(grace).is_some_and(|end| end <= now)
 }
 
 pub trait CollectionObserver: Send + Sync {
@@ -64,14 +53,7 @@ pub fn block_is_garbage(block: BlockIndex, latest: BlockIndex, keep: usize) -> b
     crate::retention::block_is_eligible(block.0, latest.0, keep)
 }
 
-/// Monotonic microseconds; the collector measures only the time elapsed since it first observed an unreferenced page.
-pub type CollectorClock = Arc<dyn Fn() -> i64 + Send + Sync>;
-
 pub struct TrieCollector {
-    clock: CollectorClock,
-    /// When this collector first saw each page unreferenced; a new collector starts empty and waits afresh.
-    first_directory_observed: Mutex<BTreeMap<(TableRef, rtdb_format::cow_tree::PageDigest), i64>>,
-    first_term_page_observed: Mutex<BTreeMap<(TableRef, rtdb_format::cow_tree::PageDigest), i64>>,
     directory: Option<(Arc<dyn ArtefactPublisher>, rtdb_types::StorageVersion, rtdb_types::StorageEpoch)>,
     search: Option<(Arc<dyn ArtefactPublisher>, rtdb_types::StorageVersion, rtdb_types::StorageEpoch)>,
     retirements: Option<Arc<dyn TableRetirements>>,
@@ -84,10 +66,9 @@ pub struct TrieCollector {
 
 impl TrieCollector {
     pub fn new(store: Arc<dyn ObjectStore>, partition: Arc<PartitionState>, publisher: Arc<dyn TrieDeletionPublisher>,
-        observer: Arc<dyn CollectionObserver>, config: GarbageConfig, clock: CollectorClock) -> Result<Self> {
+        observer: Arc<dyn CollectionObserver>, config: GarbageConfig) -> Result<Self> {
         config.validate()?;
-        Ok(Self { clock, search: None,
-            first_directory_observed: Mutex::default(), first_term_page_observed: Mutex::default(), directory: None, retirements: None, store, partition, publisher, observer, config })
+        Ok(Self { search: None, directory: None, retirements: None, store, partition, publisher, observer, config })
     }
 
     pub fn with_search(mut self, publisher: Arc<dyn ArtefactPublisher>, version: rtdb_types::StorageVersion, epoch: rtdb_types::StorageEpoch) -> Self {
@@ -182,8 +163,8 @@ impl TrieCollector {
                     self.collect_search_seals(&entry, &seals, cut, collection.current().trie_catalog(), cancellation).await?;
                     self.collect_pending_search(&entry, collection.current().trie_catalog(), collection.current().table_catalog().block_index(), cancellation).await?;
                     self.collect_search_runs(&entry, &collection, as_of, cut, cancellation).await?;
-                    self.collect_entity_directory_pages(&entry, &collection, cut, cancellation).await?;
-                    self.collect_term_directory_pages(&entry, &collection, cut, cancellation).await?;
+                    self.collect_entity_directory_pages(&entry, &collection, as_of, cut, cancellation).await?;
+                    self.collect_term_directory_pages(&entry, &collection, as_of, cut, cancellation).await?;
                     self.prune_search_tombstones(&entry, &collection, cut, oldest_checkpoint, cancellation).await
                 }).await;
                 if let Err(error) = &result { if !cancellation.is_cancelled() { self.observer.table_failed(Some(&entry.table), error); } }
@@ -193,7 +174,8 @@ impl TrieCollector {
         if cancellation.is_cancelled() { Err(crate::closed()) } else { Ok(()) }
     }
 
-    async fn collect_entity_directory_pages(&self, entry: &TableEntry, collection: &rtdb_index::TrieCollection,
+    /// Releases the pages of retired entity directories superseded at or before `as_of`, then publishes their removal.
+    async fn collect_entity_directory_pages(&self, entry: &TableEntry, collection: &rtdb_index::TrieCollection, as_of: Timestamp,
         cut: Option<CatalogCut>, cancellation: &CancellationToken) -> Result<()> {
         use rtdb_format::{cow_tree, entity_directory, log::proto::EntityDirectoryChange};
         let Some((publisher, version, epoch)) = &self.directory else { return Ok(()); };
@@ -223,17 +205,9 @@ impl TrieCollector {
             }
         }
         let roots: BTreeSet<_> = held.iter().map(|root| root.digest).collect();
-        let now = (self.clock)();
-        let grace = self.config.page_grace_micros()?;
-        let eligible = {
-            let candidates: BTreeSet<_> = retired.iter().filter(|(_, root)| !roots.contains(&root.digest)).map(|(_, root)| root.digest).collect();
-            let mut first = self.first_directory_observed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            first.retain(|(recorded, digest), _| recorded != table || candidates.contains(digest));
-            candidates.into_iter().filter(|&digest| {
-                let observed = *first.entry((table.clone(), digest)).or_insert(now);
-                grace_elapsed(observed, grace, now)
-            }).collect::<BTreeSet<_>>()
-        };
+        let eligible: BTreeSet<_> = retired.iter()
+            .filter(|(receipt, root)| !roots.contains(&root.digest) && receipt.superseded_at() <= as_of.0)
+            .map(|(_, root)| root.digest).collect();
         if eligible.is_empty() { return Ok(()); }
         let prefix = entity_directory::prefix(&entry.slug);
         let pages = rtdb_storage::cow_pages::FreshPages { store: self.store.as_ref(), prefix: &prefix };
@@ -254,7 +228,8 @@ impl TrieCollector {
                 .map(|digest| ObjectKey::new(cow_tree::page_key(&prefix, digest))).collect::<std::result::Result<Vec<_>, _>>()?;
             if self.store.release_entity_directory_pages(&keys, cut).await? < keys.len() { continue; }
             let key = TrieKey::l0(BlockIndex(receipt.through_block()))?;
-            let record = EntityDirectoryChange { root: Some(receipt.clone()), replaces_root: None }.to_artefact()?;
+            let root = rtdb_format::log::proto::EntityDirectoryRoot { superseded_at: None, ..receipt.clone() };
+            let record = EntityDirectoryChange { root: Some(root), replaces_root: None }.to_artefact()?;
             entries.push(ArtefactEntry { trie_key: Some(key.to_string()), record: Some(record) });
             if entries.len() >= self.config.chunk_size { break; }
         }
@@ -265,18 +240,21 @@ impl TrieCollector {
         Ok(())
     }
 
-    // Each build writes fresh digests, so a sweep candidate cannot acquire a new reference through a rebuild of the same rows.
-    // The page grace gives newly uploaded pages time to become reachable through the published root.
-    async fn collect_term_directory_pages(&self, entry: &TableEntry, collection: &rtdb_index::TrieCollection,
+    /// Releases the pages of retired term directories superseded at or before `as_of`, then publishes their removal.
+    /// Only pages reachable from a recorded root are ever released: a page no root names, as from a build that never
+    /// published, is left in place, as XTDB leaves files its catalog never recorded.
+    async fn collect_term_directory_pages(&self, entry: &TableEntry, collection: &rtdb_index::TrieCollection, as_of: Timestamp,
         cut: Option<CatalogCut>, cancellation: &CancellationToken) -> Result<()> {
         use rtdb_format::{cow_tree, term_directory};
-        if self.search.is_none() { return Ok(()); }
+        let Some((publisher, version, epoch)) = &self.search else { return Ok(()); };
         let table = &entry.table;
-        let prefix = term_directory::page_prefix(&entry.slug);
-        let listed = self.store.list(Some(&ObjectKey::new(format!("{prefix}/pages"))?)).await?;
-        let stored: BTreeSet<_> = listed.iter().filter_map(|object| term_directory::page_digest(object.key.as_str())).collect();
-        if stored.is_empty() { return Ok(()); }
-        let Ok(mut held) = collection.held_term_directories(table).filter_map(|root| root.page_root().transpose()).collect::<Result<Vec<_>>>() else { return Ok(()); };
+        let catalog = collection.current().trie_catalog();
+        let retired = catalog.retired_term_directories(table)
+            .map(|retired| Ok((retired, retired.root.as_ref().and_then(|root| root.page_root().transpose())
+                .ok_or_else(|| crate::invalid("Retired term directory has no pages"))??)))
+            .collect::<Result<Vec<_>>>()?;
+        if retired.is_empty() { return Ok(()); }
+        let mut held = collection.held_term_directories(table).filter_map(|root| root.page_root().transpose()).collect::<Result<Vec<_>>>()?;
         if let Some(latest) = collection.current().table_catalog().block_index() {
             let directory = ObjectKey::new(format!("{}/blocks", entry.slug.table_prefix()))?;
             for checkpoint in self.store.list(Some(&directory)).await? {
@@ -291,34 +269,41 @@ impl TrieCollector {
                 };
                 let checkpoint = rtdb_format::catalog::TableBlock::decode(&bytes)?;
                 for root in &checkpoint.as_proto().term_directories {
-                    match root.page_root() {
-                        Ok(Some(root)) => held.push(root),
-                        Ok(None) => {}
-                        Err(_) => return Ok(()),
-                    }
+                    if let Some(root) = root.page_root()? { held.push(root); }
                 }
             }
         }
+        let roots: BTreeSet<_> = held.iter().map(|root| root.digest).collect();
+        let eligible: BTreeSet<_> = retired.iter()
+            .filter(|(receipt, root)| !roots.contains(&root.digest) && receipt.superseded_at() <= as_of.0)
+            .map(|(_, root)| root.digest).collect();
+        if eligible.is_empty() { return Ok(()); }
+        let prefix = term_directory::page_prefix(&entry.slug);
         let pages = rtdb_storage::cow_pages::FreshPages { store: self.store.as_ref(), prefix: &prefix };
         let mut reachable = BTreeSet::new();
-        for root in &held {
+        let waiting = retired.iter().map(|(_, root)| root).filter(|root| !eligible.contains(&root.digest));
+        for (root, retired) in held.iter().map(|root| (root, false)).chain(waiting.map(|root| (root, true))) {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
-            if !reachable.contains(&root.digest) { reachable.extend(cow_tree::reachable(&pages, root).await?); }
+            if !reachable.contains(&root.digest) {
+                let pages = if retired { cow_tree::reachable_present(&pages, root).await? } else { cow_tree::reachable(&pages, root).await? };
+                reachable.extend(pages);
+            }
         }
-        let now = (self.clock)();
-        let grace = self.config.page_grace_micros()?;
-        let unreachable = {
-            let mut first = self.first_term_page_observed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            first.retain(|(recorded, digest), _| recorded != table || (stored.contains(digest) && !reachable.contains(digest)));
-            stored.into_iter().filter(|digest| !reachable.contains(digest)).filter(|&digest| {
-                let observed = *first.entry((table.clone(), digest)).or_insert(now);
-                grace_elapsed(observed, grace, now)
-            }).collect::<Vec<_>>()
-        };
-        if cancellation.is_cancelled() { return Err(crate::closed()); }
-        let keys = unreachable.into_iter().take(self.config.chunk_size)
-            .map(|digest| ObjectKey::new(cow_tree::page_key(&prefix, digest))).collect::<std::result::Result<Vec<_>, _>>()?;
-        self.store.release_entity_directory_pages(&keys, cut).await?;
+        let mut entries = Vec::new();
+        for (receipt, root) in retired.into_iter().filter(|(_, root)| eligible.contains(&root.digest)) {
+            if cancellation.is_cancelled() { return Err(crate::closed()); }
+            let keys = cow_tree::retirement_order(&pages, &root, &reachable).await?.into_iter()
+                .map(|digest| ObjectKey::new(cow_tree::page_key(&prefix, digest))).collect::<std::result::Result<Vec<_>, _>>()?;
+            if self.store.release_entity_directory_pages(&keys, cut).await? < keys.len() { continue; }
+            // The release names no trie; any valid key carries it.
+            let key = TrieKey::l0(BlockIndex(0))?;
+            entries.push(ArtefactEntry { trie_key: Some(key.to_string()), record: Some(receipt.to_release()?) });
+            if entries.len() >= self.config.chunk_size { break; }
+        }
+        if !entries.is_empty() {
+            publisher.remove(ArtefactsRemoved { storage_version: Some(version.0), storage_epoch: Some(epoch.0),
+                table_name: Some(table.schema_and_table()), entries, source_msg_id: None }).await?;
+        }
         Ok(())
     }
 

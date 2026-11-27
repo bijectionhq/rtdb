@@ -231,6 +231,7 @@ impl EntityDirectoryBuilder {
                     _ => 0,
                 }),
                 erase_frontier_digest: Some(erase_frontier_digest),
+                superseded_at: None,
             }),
             replaces_root: previous.and_then(|root| root.root.clone()),
         }

@@ -176,6 +176,9 @@ message EntityDirectoryRoot {
     bytes allocation = 5;
     uint64 writer_fence = 6;
     bytes erase_frontier_digest = 7;
+    // Set only on a retired root: the system time of the transaction that replaced it. The collector releases its
+    // pages once the garbage-as-of horizon reaches it, as it does superseded tries.
+    int64 superseded_at = 8;
 }
 
 message EntityDirectoryChange {
@@ -232,6 +235,12 @@ message TermDirectoryRoot {
     // active runs differ, as after an erase replaced a run, treats the
     // directory as building and ranks without its bounds.
     bytes run_set = 5;
+}
+
+// A replaced term directory whose pages the collector has not yet released.
+message RetiredTermDirectory {
+    TermDirectoryRoot root = 1;
+    int64 superseded_at = 2;
 }
 
 message RetiredSearchRun {

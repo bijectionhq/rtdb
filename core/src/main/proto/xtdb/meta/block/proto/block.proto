@@ -39,6 +39,7 @@ message TableBlock {
   xtdb.log.proto.EntityDirectoryRoot entity_directory = 13;
   repeated xtdb.log.proto.EntityDirectoryRoot retired_entity_directories = 14;
     repeated xtdb.log.proto.TermDirectoryRoot term_directories = 12;
+  repeated xtdb.log.proto.RetiredTermDirectory retired_term_directories = 15;
   reserved 11;
 }
 

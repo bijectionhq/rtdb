@@ -11,10 +11,8 @@
 -- Per-database, leader-only, signal-driven.
 -- The node that leads this database's replica log owns its trie GC.
 -- The leader signals at block adoption and transaction processing continues without waiting for the cycle.
--- In native Rust, the term supervisor also signals on term entry and periodically while automatic trie GC is enabled.
--- The period is the page grace clamped to 100 milliseconds through 60 seconds.
--- A retry gives an eligible trie or pending receipt a fresh collection opportunity even if no new block arrives.
--- The timer only schedules cycles. The collector still checks eligibility against the garbage window and the page grace.
+-- In native Rust, the term supervisor also signals on term entry. There is no timer: as in XTDB, a cycle that leaves
+-- garbage behind is retried at the next block.
 -- In installed-journal mode, a storage delete request queues the owned serving object for reclamation under journal custody.
 --
 -- Tries transition to `garbage` during addTries (see trie-cat.allium); this
@@ -43,10 +41,11 @@
 -- until a file it needs is gone, and then fails with `rtdb.storage/missing-object`. The collector waits for no reader on
 -- any store, and keeps no first sightings for tries or search runs: the garbage-as-of horizon, computed from stored
 -- blocks, alone decides, so a restart neither postpones nor hastens collection.
--- Entity and term directory pages are RTDB-only and their retirement carries no supersession time in the catalog, so the
--- collector releases one `page_grace` (default one hour, not configurable from YAML) after it first sees it unreferenced.
--- That grace also gives an uploaded term page time to become reachable through its published root. A restarted
--- collector observes pages afresh, which only postpones their release.
+-- Entity and term directory pages are RTDB-only. The table block records each retired directory root with the system
+-- time of the transaction that replaced it, and the collector releases its pages on the same horizon. A retired root
+-- recorded before roots carried that time counts as superseded when its catalog was loaded, and the next table block
+-- records that time. Only pages a recorded root names are released: a page no root names, as from a build that never
+-- published, stays, as XTDB leaves files its catalog never recorded.
 -- In Multi, an installed trie release can settle as soon as its floor, recovery coverage and provider publication authorize retirement.
 -- Path releases and checkpoint pack collection still use a separate grace.
 -- Local Multi can also erase an original L0 pack under independent replay archive custody.
@@ -95,7 +94,6 @@
 -- A new collector checks pending intents in the same storage root and journal.
 -- Where the installed catalog and checkpoint already exclude the requested keys, it can re-confirm their removal through replication.
 -- Source-residence retirement metadata stays outside fork publication and cell materialization.
--- A new collector, after restart or failover, observes directory pages afresh.
 -- Each cycle times the deletion of each collected trie's files under XTDB's `xtdb.gc.tries.delete.timer`.
 --
 -- Each cycle first retires the tables of owned relations whose retention has passed (rule RetireDueTables).
@@ -277,7 +275,7 @@ rule LeaderClosesTrieGc {
 --                         drains its triggers after each cycle and runs again
 --                         if any are pending.
 --
--- The enabled flag gates signals from block adoption and the native term timer.
+-- The enabled flag gates signals from block adoption and term entry.
 -- Direct `awaitNoGarbage()` always runs a cycle, regardless of `enabled`.
 
 rule LeaderFinishBlockSignalsTrieGc {
@@ -351,11 +349,11 @@ rule GarbageCollectTries {
     -- The same cycle releases logical search runs superseded at or before the garbage-as-of horizon once the current checkpoint has moved past their receipts.
     -- Every store releases them at once; the horizon alone protects readers, as for tries.
     -- Hosted release binds the provider publication to a catalog floor before acknowledgement.
-    -- Entity-directory collection marks all pages reachable from the current root, retained checkpoints, and retired roots still within the page grace; a captured reader marks nothing.
-    -- After the page grace, a retired root can release its unmarked pages.
+    -- Entity- and term-directory collection marks all pages reachable from the current roots, retained checkpoints, and retired roots superseded after the garbage-as-of horizon; a captured reader marks nothing.
+    -- A retired root superseded at or before the horizon releases its unmarked pages, and the collector then publishes its removal from the catalog.
     -- Hosted fork and archive holds continue to protect the pages in their checkpoint closures.
     -- A replay checkpoint holds every page reached by each active entity directory.
-    -- Term-directory pages have no retirement ledger: collection releases a stored page that no current or checkpointed root reaches, once the page grace has passed since it was first seen unreachable.
+    -- A replaced term directory with pages is retired in the table block with its supersession time; a recorded root that no longer matches its generation at load is retired at the load time.
     -- Each term-directory build gives newly written pages distinct digests so a rebuild cannot revive a page selected by a concurrent sweep.
     -- Hosted release of a retired search run, an exact sealed artefact, or a directory page waits for an open lineage, drained fork preparations, and the withdrawal of declared fork references to the publication.
     -- A hosted directory page release requires an observed immutable provider publication.

@@ -2,7 +2,7 @@ use rtdb_format::{
     keys::TrieKey,
     log::proto::{EntityDirectoryChange, EntityDirectoryRoot},
 };
-use rtdb_types::{Anomaly, Result};
+use rtdb_types::{Anomaly, Result, Timestamp};
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DirectoryManifest {
@@ -11,12 +11,18 @@ pub(crate) struct DirectoryManifest {
 }
 
 impl DirectoryManifest {
+    /// A retired root recorded before roots carried their supersession time counts as superseded at `loaded_at`;
+    /// the next table block records that time, so the wait is not restarted by later loads.
     pub fn load(
         active: Option<EntityDirectoryRoot>,
-        retired: Vec<EntityDirectoryRoot>,
+        mut retired: Vec<EntityDirectoryRoot>,
+        loaded_at: Timestamp,
     ) -> Result<Self> {
         if let Some(root) = &active {
             root.reference()?;
+        }
+        for root in &mut retired {
+            root.superseded_at.get_or_insert(loaded_at.0);
         }
         for root in &retired {
             root.reference()?;
@@ -54,10 +60,12 @@ impl DirectoryManifest {
             && self.active.as_ref().is_none_or(|old| root.through_block() > old.through_block())
     }
 
-    pub fn install(&mut self, key: &TrieKey, change: EntityDirectoryChange) {
+    /// Retires the replaced root as superseded at `as_of`, the system time of the transaction that replaced it.
+    pub fn install(&mut self, key: &TrieKey, change: EntityDirectoryChange, as_of: Timestamp) {
         if self.accepts(key, &change)
-            && let Some(old) = std::mem::replace(&mut self.active, change.root)
+            && let Some(mut old) = std::mem::replace(&mut self.active, change.root)
         {
+            old.superseded_at = Some(as_of.0);
             self.retired.push(old);
         }
     }
@@ -89,7 +97,7 @@ mod tests {
         let receipt = |block: i64, epoch| EntityDirectoryRoot {
             root: Some(RootRef { digest: PageDigest([block as u8 + 1; 32]), length: 512, height: 0, summary: Vec::new() }.encode()),
             through_block: Some(block), source_rows: Some(10), has_erases: Some(false), allocation: Some(vec![block as u8; 16]),
-            writer_fence: Some(epoch), erase_frontier_digest: Some(vec![0; 32]),
+            writer_fence: Some(epoch), erase_frontier_digest: Some(vec![0; 32]), superseded_at: None,
         };
         let (first, second) = (receipt(0, 3), receipt(1, 1));
         let catalog = TrieCatalog::new(4).unwrap()
@@ -124,7 +132,7 @@ mod tests {
         let root = EntityDirectoryRoot {
             root: Some(RootRef { digest: PageDigest([1; 32]), length: 512, height: 0, summary: Vec::new() }.encode()),
             through_block: Some(0), source_rows: Some(10), has_erases: Some(false), allocation: Some(vec![0; 16]),
-            writer_fence: Some(3), erase_frontier_digest: Some(vec![0; 32]),
+            writer_fence: Some(3), erase_frontier_digest: Some(vec![0; 32]), superseded_at: None,
         };
         let valid = EntityDirectoryChange { root: Some(root.clone()), replaces_root: None }.to_artefact().unwrap();
         let carrying = |record| {
@@ -173,6 +181,7 @@ mod tests {
             allocation: Some(vec![block as u8; 16]),
             writer_fence: Some(3),
             erase_frontier_digest: Some(vec![0; 32]),
+            superseded_at: None,
         };
         let publish = |next: EntityDirectoryRoot, previous: Option<&EntityDirectoryRoot>| {
             EntityDirectoryChange {
@@ -199,11 +208,12 @@ mod tests {
         let current = current.with_artefacts(&table, [(trie(2), rejected)]);
         assert_eq!(pinned.entity_directory(&table), Some(&first));
         assert_eq!(current.entity_directory(&table), Some(&second));
+        let retired = EntityDirectoryRoot { superseded_at: Some(0), ..first.clone() };
         assert_eq!(
             current
                 .retired_entity_directories(&table)
                 .collect::<Vec<_>>(),
-            [&first]
+            [&retired]
         );
         let block = TableBlock::from_parts(
             Default::default(),
@@ -225,7 +235,24 @@ mod tests {
             recovered
                 .retired_entity_directories(&table)
                 .collect::<Vec<_>>(),
-            [&first]
+            [&retired]
         );
+    }
+
+    #[test]
+    fn a_replaced_root_records_when_it_was_superseded_and_a_legacy_one_takes_its_load_time() {
+        let key = |block| TrieKey::l0(BlockIndex(block)).unwrap();
+        let receipt = |block: i64| EntityDirectoryRoot {
+            root: Some(RootRef { digest: PageDigest([block as u8 + 1; 32]), length: 512, height: 0, summary: Vec::new() }.encode()),
+            through_block: Some(block), source_rows: Some(10), has_erases: Some(false), allocation: Some(vec![block as u8; 16]),
+            writer_fence: Some(1), erase_frontier_digest: Some(vec![0; 32]), superseded_at: None,
+        };
+        let mut manifest = DirectoryManifest::default();
+        manifest.install(&key(0), EntityDirectoryChange { root: Some(receipt(0)), replaces_root: None }, Timestamp(5));
+        manifest.install(&key(1), EntityDirectoryChange { root: Some(receipt(1)), replaces_root: receipt(0).root }, Timestamp(9));
+        assert_eq!(manifest.retired().map(|root| root.superseded_at).collect::<Vec<_>>(), [Some(9)]);
+
+        let legacy = DirectoryManifest::load(Some(receipt(2)), vec![receipt(1), manifest.retired().next().unwrap().clone()], Timestamp(40)).unwrap();
+        assert_eq!(legacy.retired().map(|root| root.superseded_at).collect::<Vec<_>>(), [Some(40), Some(9)]);
     }
 }

@@ -336,6 +336,11 @@ impl TableBlock {
         self
     }
 
+    pub fn with_retired_term_directories(mut self, retired: Vec<crate::log::proto::RetiredTermDirectory>) -> Self {
+        if self.wire.retired_term_directories != retired { Arc::make_mut(&mut self.wire).retired_term_directories = retired; }
+        self
+    }
+
     pub fn trie_details(&self) -> impl Iterator<Item = &TrieDetails> {
         self.wire.partitions.iter().flat_map(|partition| &partition.tries)
             .chain(self.wire.tries.iter().filter(|_| self.wire.partitions.is_empty()))
@@ -355,6 +360,7 @@ impl TableBlock {
         wire.entity_directory = None;
         wire.retired_entity_directories.clear();
         wire.term_directories.clear();
+        wire.retired_term_directories.clear();
         Self { wire: Arc::new(wire), charge: self.charge.clone() }
     }
 

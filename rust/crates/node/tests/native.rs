@@ -2286,7 +2286,6 @@ async fn compactor_reset_preserves_checkpoint_history_and_resumes_retirement_aft
         settings.compaction_threads = 1;
         settings.automatic_gc = true;
         settings.garbage.blocks_to_keep = usize::MAX;
-        settings.garbage.page_grace = Duration::from_secs(1);
         let (node, driver) = running(settings, fresh_local_services(&runtime_services)).await;
         let database = node.catalog().database("xtdb").unwrap();
         let mut status = database.watch_status();
@@ -2900,7 +2899,6 @@ async fn a_successor_retires_an_old_leaders_trie_once_it_leaves_the_garbage_wind
         config.compaction_threads = 1;
         config.garbage.blocks_to_keep = 1;
         config.garbage.garbage_lifetime = lifetime;
-        config.garbage.page_grace = Duration::from_secs(1);
 
         let mut predecessor_config = config.clone();
         predecessor_config.replication.idle_heartbeat = false;

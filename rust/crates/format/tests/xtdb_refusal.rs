@@ -79,6 +79,7 @@ const FORK_FIELDS: &[(&str, u32, Fork)] = &[
     ("TableBlock", 12, Fork::Framed),
     ("TableBlock", 13, Fork::Framed),
     ("TableBlock", 14, Fork::Framed),
+    ("TableBlock", 15, Fork::Framed),
     ("Block", 11, Fork::Framed),
     ("Block", 12, Fork::Annotation("the digests of the table block files, which XTDB reads by their keys")),
     ("Block", 13, Fork::Framed),
@@ -228,6 +229,7 @@ fn extension_block_files() -> Vec<(Option<(&'static str, u32)>, Vec<u8>)> {
         (Some(("TableBlock", 12)), table_block(|table| table.with_term_directories(vec![pb::TermDirectoryRoot::default()]))),
         (Some(("TableBlock", 13)), table_block(|table| table.with_entity_directory(Some(pb::EntityDirectoryRoot::default()), vec![]))),
         (Some(("TableBlock", 14)), table_block(|table| table.with_entity_directory(None, vec![pb::EntityDirectoryRoot::default()]))),
+        (Some(("TableBlock", 15)), table_block(|table| table.with_retired_term_directories(vec![pb::RetiredTermDirectory::default()]))),
         (None, TableBlock::decode(&block_pb::TableBlock { tries: vec![trie("l01-rc-b00-e01")], ..Default::default() }.encode_to_vec()).unwrap().encode()),
         (None, TableBlock::decode(&block_pb::TableBlock {
             partitions: vec![block_pb::Partition { tries: vec![with_artefact(trie("l01-rc-b00"))], ..Default::default() }], ..Default::default()

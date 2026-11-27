@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use rtdb_format::{log::proto::{RetiredSearchRun, SearchRun, SearchRunChange, TermDirectoryRoot}, term_directory};
+use rtdb_format::{log::proto::{RetiredSearchRun, RetiredTermDirectory, SearchRun, SearchRunChange, TermDirectoryRoot}, term_directory};
 use rtdb_types::{Anomaly, ReplicaPosition, Result, Timestamp};
 
 #[derive(Clone, Debug, Default)]
@@ -8,6 +8,9 @@ pub(crate) struct SearchManifest {
     active: BTreeMap<[u8; 32], SearchRun>,
     retired: BTreeMap<[u8; 32], RetiredSearchRun>,
     term_directories: BTreeMap<(String, i64), TermDirectoryRoot>,
+    /// Replaced term directories with pages, each with the system time it was replaced at, until the collector
+    /// releases their pages on the garbage window.
+    retired_term_directories: Vec<RetiredTermDirectory>,
 }
 
 impl SearchManifest {
@@ -46,16 +49,41 @@ impl SearchManifest {
 
     pub fn term_directories(&self) -> impl Iterator<Item = &TermDirectoryRoot> { self.term_directories.values() }
 
-    pub fn load_term_directories(&mut self, roots: &[TermDirectoryRoot]) {
+    pub fn retired_term_directories(&self) -> impl Iterator<Item = &RetiredTermDirectory> { self.retired_term_directories.iter() }
+
+    /// A recorded root that no longer matches its generation is retired at `loaded_at`, so the collector still
+    /// releases its pages; the next table block records that time.
+    pub fn load_term_directories(&mut self, roots: &[TermDirectoryRoot], retired: &[RetiredTermDirectory], loaded_at: Timestamp) {
+        self.retired_term_directories = retired.iter()
+            .filter(|retired| retired.root.as_ref().is_some_and(|root| root.page_root().is_ok_and(|pages| pages.is_some())))
+            .cloned().collect();
         let mut seen = BTreeSet::new();
         for root in roots {
             let key = (root.definition_id().to_owned(), root.definition_version());
             if !seen.insert(key.clone()) {
-                self.term_directories.remove(&key);
+                if let Some(first) = self.term_directories.remove(&key) { self.retire_term_directory(first, loaded_at); }
+                self.retire_term_directory(root.clone(), loaded_at);
             } else if root.page_root().is_ok() && self.generation(&key).count() as i64 == root.runs() {
                 self.term_directories.insert(key, root.clone());
+            } else {
+                self.retire_term_directory(root.clone(), loaded_at);
             }
         }
+    }
+
+    /// Records a replaced root whose pages the collector must release; a root without pages needs no record.
+    fn retire_term_directory(&mut self, root: TermDirectoryRoot, as_of: Timestamp) {
+        if !root.page_root().is_ok_and(|pages| pages.is_some())
+            || self.term_directories.values().any(|active| active.root == root.root)
+            || self.retired_term_directories.iter().any(|retired| retired.root.as_ref() == Some(&root)) {
+            return;
+        }
+        self.retired_term_directories.push(RetiredTermDirectory { root: Some(root), superseded_at: Some(as_of.0) });
+    }
+
+    /// Forgets a retired directory once the collector has released its pages.
+    pub fn forget_term_directory(&mut self, released: &RetiredTermDirectory) {
+        self.retired_term_directories.retain(|retired| retired.root != released.root);
     }
 
     fn generation<'a>(&'a self, key: &'a (String, i64)) -> impl Iterator<Item = [u8; 32]> + 'a {
@@ -121,13 +149,18 @@ impl SearchManifest {
         let published = self.publish_receipt(change, as_of);
         if !published { return false; }
         let after: BTreeSet<_> = self.generation(&generation).collect();
-        if before != after {
+        let replaced = if before != after {
             match &root {
-                Some(root) if after.contains(&id) => { self.term_directories.insert(generation, root.clone()); }
-                _ => { self.term_directories.remove(&generation); }
+                Some(root) if after.contains(&id) => self.term_directories.insert(generation, root.clone()),
+                _ => self.term_directories.remove(&generation),
             }
         } else if already_active && let Some(root) = &root {
-            self.term_directories.insert(generation, root.clone());
+            self.term_directories.insert(generation, root.clone())
+        } else {
+            None
+        };
+        if let Some(replaced) = replaced.filter(|replaced| Some(replaced) != root.as_ref()) {
+            self.retire_term_directory(replaced, as_of);
         }
         true
     }
@@ -260,10 +293,40 @@ mod tests {
         assert_eq!(before_merge.term_directory("searchf16", 20), Some(&empty_root(2)));
         let retired: Vec<_> = search.retired().cloned().collect();
         let mut reopened = SearchManifest::load(&[merged], &retired).unwrap();
-        reopened.load_term_directories(&[empty_root(1)]);
+        reopened.load_term_directories(&[empty_root(1)], &[], Timestamp(5));
         assert_eq!(reopened.term_directory("searchf16", 20), Some(&empty_root(1)));
         assert!(reopened.publish(SearchRunChange { run: Some(run(4, &[2])), ..Default::default() }, Timestamp(5)));
         assert!(reopened.term_directory("searchf16", 20).is_none());
+    }
+
+    #[test]
+    fn a_replaced_term_directory_with_pages_is_retired_at_the_replacing_time_until_released() {
+        let paged = |digest: u8, runs| TermDirectoryRoot { definition_id: Some("searchf16".into()), definition_version: Some(20),
+            root: Some(rtdb_format::cow_tree::RootRef { digest: rtdb_format::cow_tree::PageDigest([digest; 32]), length: 4096, height: 0,
+                summary: 1.0f64.to_be_bytes().to_vec() }.encode()), runs: Some(runs), run_set: None };
+        let update = |run: SearchRun, root, basis: [u8; 32]| SearchRunChange {
+            run: Some(run), term_directory: Some(root), replaces_directory: Some(basis.to_vec()), ..Default::default()
+        };
+        let mut search = SearchManifest::default();
+        let a = run(1, &[0]);
+        assert!(search.publish(update(a.clone(), paged(7, 1), term_directory::publication_basis(None, [])), Timestamp(10)));
+        assert_eq!(search.retired_term_directories().count(), 0);
+        let basis = term_directory::publication_basis(Some(&paged(7, 1)), [[1; 32]]);
+        assert!(search.publish(update(run(2, &[1]), paged(8, 2), basis), Timestamp(20)));
+        let retired: Vec<_> = search.retired_term_directories().cloned().collect();
+        assert_eq!(retired, [RetiredTermDirectory { root: Some(paged(7, 1)), superseded_at: Some(20) }]);
+
+        let mut reopened = SearchManifest::load(&search.active().cloned().collect::<Vec<_>>(), &[]).unwrap();
+        reopened.load_term_directories(&[paged(8, 2)], &retired, Timestamp(30));
+        assert_eq!(reopened.retired_term_directories().cloned().collect::<Vec<_>>(), retired);
+        reopened.forget_term_directory(&retired[0]);
+        assert_eq!(reopened.retired_term_directories().count(), 0);
+
+        let mut stale = SearchManifest::load(&[a], &[]).unwrap();
+        stale.load_term_directories(&[paged(8, 2)], &[], Timestamp(30));
+        assert!(stale.term_directory("searchf16", 20).is_none());
+        assert_eq!(stale.retired_term_directories().cloned().collect::<Vec<_>>(),
+            [RetiredTermDirectory { root: Some(paged(8, 2)), superseded_at: Some(30) }]);
     }
 
     #[test]

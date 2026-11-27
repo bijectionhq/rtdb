@@ -1,7 +1,7 @@
 use prost::Message;
 use sha2::{Digest, Sha256};
 
-use crate::{cow_tree::RootRef, keys::TableSlug, log::proto::{ArtefactRecord, SearchRun, SearchRunChange, TermDirectoryRoot}, search_manifest::RECORD_KIND};
+use crate::{cow_tree::RootRef, keys::TableSlug, log::proto::{ArtefactRecord, RetiredTermDirectory, SearchRun, SearchRunChange, TermDirectoryRoot}, search_manifest::RECORD_KIND};
 use rtdb_types::{Anomaly, Result};
 
 const PAGE_OWNER: &str = "term-directory";
@@ -60,6 +60,34 @@ pub fn valid_change(run: &SearchRun, root: &TermDirectoryRoot, replaces: Option<
     replaces.is_some_and(|token| token.len() == 32)
         && root.definition_id == run.definition_id && root.definition_version == run.definition_version
         && root.page_root().is_ok()
+}
+
+/// The artefact kind of a record that tells the catalog the collector released a retired term directory's pages.
+pub const RELEASE_KIND: &str = "term-directory-release";
+
+impl RetiredTermDirectory {
+    /// The record an `ArtefactsRemoved` carries to forget this retired directory once its pages are released.
+    pub fn to_release(&self) -> Result<ArtefactRecord> {
+        let root = self.root.as_ref().ok_or_else(|| invalid("Retired term directory has no root"))?;
+        Ok(ArtefactRecord {
+            kind: Some(RELEASE_KIND.into()),
+            definition_id: root.definition_id.clone(),
+            definition_version: root.definition_version,
+            stats: Some(self.encode_to_vec()),
+            ..Default::default()
+        })
+    }
+
+    pub fn from_release(record: &ArtefactRecord) -> Result<Self> {
+        let decoded = Self::decode(record.stats()).map_err(|_| invalid("Term directory release is not decodable"))?;
+        let root = decoded.root.as_ref().ok_or_else(|| invalid("Retired term directory has no root"))?;
+        if record.kind() != RELEASE_KIND || root.definition_id != record.definition_id
+            || root.definition_version != record.definition_version {
+            return Err(invalid("Term directory release has inconsistent receipts"));
+        }
+        root.page_root()?;
+        Ok(decoded)
+    }
 }
 
 pub fn sealed_change(record: &ArtefactRecord) -> Option<SearchRunChange> {

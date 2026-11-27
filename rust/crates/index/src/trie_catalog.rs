@@ -321,13 +321,18 @@ impl TrieCatalog {
         self.tables.get(table).into_iter().flat_map(|state| state.search.term_directories())
     }
 
-    pub fn with_term_directories(&self, table: &TableRef, block: TableBlock) -> TableBlock {
-        block.with_term_directories(self.tables.get(table).into_iter()
-            .flat_map(|state| state.search.term_directories()).cloned().collect())
+    pub fn retired_term_directories(&self, table: &TableRef) -> impl Iterator<Item = &log_pb::RetiredTermDirectory> {
+        self.tables.get(table).into_iter().flat_map(|state| state.search.retired_term_directories())
     }
 
-    fn load_term_directories(state: &mut TableTries, block: &TableBlock) {
-        std::sync::Arc::make_mut(&mut state.search).load_term_directories(&block.as_proto().term_directories);
+    pub fn with_term_directories(&self, table: &TableRef, block: TableBlock) -> TableBlock {
+        block.with_term_directories(self.term_directories(table).cloned().collect())
+            .with_retired_term_directories(self.retired_term_directories(table).cloned().collect())
+    }
+
+    fn load_term_directories(state: &mut TableTries, block: &TableBlock, as_of: Timestamp) {
+        let wire = block.as_proto();
+        std::sync::Arc::make_mut(&mut state.search).load_term_directories(&wire.term_directories, &wire.retired_term_directories, as_of);
     }
 
     pub fn accepts_search_run(&self, table: &TableRef, record: &log_pb::ArtefactRecord) -> bool {
@@ -371,7 +376,7 @@ impl TrieCatalog {
             }
             trie.artefacts = held;
             for change in directory {
-                std::sync::Arc::make_mut(&mut state.directory).install(&trie.key, change);
+                std::sync::Arc::make_mut(&mut state.directory).install(&trie.key, change, as_of);
             }
             for change in search {
                 if trie.key.level() == 0 && !change.retire_only() && change.replaces.is_empty()
@@ -411,7 +416,7 @@ impl TrieCatalog {
                     let anchored = state.shards.get(&Shard::of(&key)).and_then(|shard| shard.tries.get(&key.block_index()))
                         .is_some_and(|trie| trie.key == key);
                     if anchored && let Ok(change) = log_pb::EntityDirectoryChange::from_artefact(&record) {
-                        std::sync::Arc::make_mut(&mut state.directory).install(&key, change);
+                        std::sync::Arc::make_mut(&mut state.directory).install(&key, change, as_of);
                     }
                     continue;
                 }
@@ -462,6 +467,12 @@ impl TrieCatalog {
                     if key.level() == 0 && let Ok(change) = log_pb::EntityDirectoryChange::from_artefact(&record)
                         && let Some(root) = change.root.filter(|root| root.through_block() == key.block_index().0) {
                         std::sync::Arc::make_mut(&mut state.directory).forget(&root);
+                    }
+                    continue;
+                }
+                if record.kind() == rtdb_format::term_directory::RELEASE_KIND {
+                    if let Ok(released) = log_pb::RetiredTermDirectory::from_release(&record) {
+                        std::sync::Arc::make_mut(&mut state.search).forget_term_directory(&released);
                     }
                     continue;
                 }
@@ -551,10 +562,10 @@ impl TrieCatalog {
                 return Err(invalid("Search history receipt belongs to another table"));
             }
             state.directory = std::sync::Arc::new(crate::entity_directory::DirectoryManifest::load(
-                wire.entity_directory.clone(), wire.retired_entity_directories.clone())?);
+                wire.entity_directory.clone(), wire.retired_entity_directories.clone(), as_of)?);
             state.search = std::sync::Arc::new(crate::search_manifest::SearchManifest::load(&wire.search_runs, &wire.retired_search_runs)?);
             state.retired = wire.retired_as_of_micros.map(Timestamp);
-            Self::load_term_directories(&mut state, &blocks[&table]);
+            Self::load_term_directories(&mut state, &blocks[&table], as_of);
             for partition in partitions {
                 let shard = decode_shard(&partition)?;
                 let mut value = ShardValue::default();

@@ -68,7 +68,7 @@ pub fn block_uses_extension(block: &block_pb::Block) -> bool {
 /// a relation retirement, or an RTDB-only trie.
 pub fn table_block_uses_extension(table: &block_pb::TableBlock) -> bool {
     !table.search_runs.is_empty() || !table.retired_search_runs.is_empty() || table.retired_as_of_micros.is_some()
-        || !table.term_directories.is_empty() || table.entity_directory.is_some() || !table.retired_entity_directories.is_empty()
+        || !table.term_directories.is_empty() || !table.retired_term_directories.is_empty() || table.entity_directory.is_some() || !table.retired_entity_directories.is_empty()
         || table.tries.iter().chain(table.partitions.iter().flat_map(|partition| &partition.tries)).any(trie_uses_extension)
 }
 
