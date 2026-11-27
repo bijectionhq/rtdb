@@ -23,6 +23,16 @@ fn numeric_catalogue_dispatches_logarithm_hyperbolic_double_and_modulo_calls() {
 }
 
 #[test]
+fn log_requires_base_and_operand_as_in_xtdb() {
+    assert_eq!(function_type("log", &[L::Scalar(S::F64)]).unwrap_err().code, "xtdb/invalid-function-arity");
+    assert_eq!(function_type("log", &[L::Null]).unwrap_err().code, "xtdb/invalid-function-arity");
+    assert_eq!(call("log", &[V::F64(100.0)]).unwrap_err().code, "xtdb/invalid-function-arity");
+    assert_eq!(call("log", &[V::Null]).unwrap_err().code, "xtdb/invalid-function-arity");
+    assert_eq!(function_type("log", &[L::Scalar(S::F64), L::Scalar(S::F64)]).unwrap(), L::Scalar(S::F64));
+    assert_eq!(call("log", &[V::F64(2.0), V::F64(8.0)]).unwrap(), V::F64(3.0));
+}
+
+#[test]
 fn hyperbolic_calls_preserve_signed_zero_nan_and_infinite_limits() {
     for name in ["sinh", "tanh", "double"] {
         let V::F64(value) = call(name, &[V::F64(-0.0)]).unwrap() else { panic!() };

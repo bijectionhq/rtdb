@@ -311,7 +311,7 @@ impl FloatMath {
     pub(crate) fn apply(self, x: f64, y: Option<f64>) -> Result<f64> {
         if let Some(function) = self.unary() { return Ok(function(x)); }
         Ok(match self {
-            Self::Log => y.map_or_else(|| x.log10(), |y| y.log(x)),
+            Self::Log => y.ok_or_else(|| inapplicable("log", &[]))?.log(x),
             _ => x.powf(y.ok_or_else(|| inapplicable("power", &[]))?),
         })
     }

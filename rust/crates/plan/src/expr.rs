@@ -165,9 +165,8 @@ pub fn function_type(name: &str, arguments: &[LogicalType]) -> Result<LogicalTyp
             (ty, 1..=2, true)
         }
         "greatest" | "least" => (if arguments.is_empty() { LogicalType::Null } else { LogicalType::join_all(arguments) }, 0..=usize::MAX, true),
-        "power" => (LogicalType::Scalar(S::F64), 2..=2, true),
+        "power" | "log" => (LogicalType::Scalar(S::F64), 2..=2, true),
         "sqrt" | "exp" | "ln" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" => (LogicalType::Scalar(S::F64), 1..=1, true),
-        "log" => (LogicalType::Scalar(S::F64), 2..=2, true),
         "random" => (LogicalType::Scalar(S::F64), 0..=0, false),
         "sleep" => (LogicalType::Null, 1..=1, true),
         "snapshot_token" => (LogicalType::Scalar(S::Utf8).maybe(), 0..=0, false),

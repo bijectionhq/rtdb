@@ -25,6 +25,7 @@ async fn xtql_shared_scalar_aliases_preserve_type_selection_and_nested_unknowns(
         ("(is-true (/ 1 0))",V::Bool(false)),("(distinct-from (/ 1 0) nil)",V::Bool(true)),
         ("(distinct_from [nil] [nil])",V::Null),
         ("(_meta_double 12)",V::F64(12.0)),("(_meta-double (cast (/ 1 0) #xt/type :utf8))",V::Null),
+        ("(log 2 8)",V::F64(3.0)),
     ] { assert_eq!(project(source).await.unwrap(),expected,"{source}"); }
-    for source in ["(is-true)","(is-false nil nil)","(distinct-from 1)","(_meta_double 1 2)"] { assert!(project(source).await.is_err(),"{source}"); }
+    for source in ["(is-true)","(is-false nil nil)","(distinct-from 1)","(_meta_double 1 2)","(log 100)","(log nil)"] { assert!(project(source).await.is_err(),"{source}"); }
 }
