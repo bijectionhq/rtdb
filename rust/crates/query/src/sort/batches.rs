@@ -14,7 +14,7 @@ use crate::{
 };
 
 use super::{
-    BLOCK_ROWS, KeyTypes, MERGE_FAN_IN, SortPlan, legacy, native_keys::NativeOrder, orders_consistently, select,
+    BLOCK_ROWS, KeyTypes, MERGE_FAN_IN, SortPlan, legacy, native_keys::{ByteKey, BytePrefix, NativeOrder}, orders_consistently, select,
     size_error, timsort,
 };
 
@@ -264,6 +264,13 @@ impl BatchSort {
     ) -> Result<Arc<SpillFile>> {
         let context = &plan.execution.context;
         let mut writer = context.spill.create()?;
+        let _scratch = context.memory.reserve(
+            context
+                .options
+                .batch_rows
+                .saturating_mul(64)
+                .saturating_add(8192),
+        )?;
         let mut runs = files
             .iter()
             .map(|file| {
@@ -272,18 +279,13 @@ impl BatchSort {
                     batch: None,
                     row: 0,
                     key: None,
+                    prefix: None,
                     native: false,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
         let mut remaining = plan.limit;
-        let _scratch = context.memory.reserve(
-            context
-                .options
-                .batch_rows
-                .saturating_mul(64)
-                .saturating_add(8192),
-        )?;
+        let prefixed = native.filter(|order| order.is_total() && order.has_leading_bytes());
         while remaining != 0 {
             for run in &mut runs {
                 run.fill(plan, key_columns, native)?;
@@ -293,6 +295,8 @@ impl BatchSort {
                 .batch_rows
                 .min(usize::try_from(remaining).unwrap_or(usize::MAX));
             let mut positions = Vec::with_capacity(size);
+            // Row offsets identify heads only until the next spill page is loaded.
+            let mut comparisons = [[None; MERGE_FAN_IN]; MERGE_FAN_IN];
             while positions.len() < size {
                 context.check_cancelled()?;
                 let mut winner: Option<usize> = None;
@@ -300,10 +304,25 @@ impl BatchSort {
                     let (preceding, candidates) = runs.split_at_mut(lane);
                     let run = &mut candidates[0];
                     if run.batch.is_none() { continue; }
-                    if let Some(first) = winner
-                        && !run.compare(&mut preceding[first], plan, key_columns, native)?.is_lt()
-                    {
-                        continue;
+                    if let Some(first) = winner {
+                        let other = &mut preceding[first];
+                        let comparison = if let Some(order) = prefixed.filter(|_| run.native && other.native) {
+                            let rows = (run.row, other.row);
+                            let cached = &mut comparisons[lane][first];
+                            match *cached {
+                                Some((previous, comparison)) if previous == rows => comparison,
+                                _ => {
+                                    let comparison = order.compare_prefixed(run.head(order), other.head(order), &plan.order, None)?;
+                                    *cached = Some((rows, comparison));
+                                    comparison
+                                }
+                            }
+                        } else {
+                            run.compare(other, plan, key_columns, native)?
+                        };
+                        if !comparison.is_lt() {
+                            continue;
+                        }
                     }
                     winner = Some(lane);
                 }
@@ -313,6 +332,7 @@ impl BatchSort {
                 let run = &mut runs[lane];
                 positions.push((lane, run.row));
                 run.row += 1;
+                run.prefix = None;
                 // Keep every source batch until this selection has been gathered.
                 if run.batch.as_ref().is_some_and(|batch| run.row == batch.len) {
                     break;
@@ -328,6 +348,11 @@ impl BatchSort {
                     .as_ref()
                     .expect("a selected lane owns its batch")
             })?;
+            for run in &mut runs {
+                if run.batch.as_ref().is_some_and(|batch| run.row == batch.len) {
+                    run.release_page();
+                }
+            }
             remaining -= batch.len as u64;
             write_batch(&mut writer, batch, plan)?;
             tokio::task::consume_budget().await;
@@ -396,11 +421,16 @@ fn ordering_bytes(rows: usize) -> usize {
 }
 
 struct Block {
-    batches: Vec<ColumnBatch>,
+    batches: Vec<Option<Source>>,
     positions: Vec<(usize, usize)>,
     native: bool,
     payload_bytes: usize,
     scratch: Arc<MemoryReservation>,
+}
+
+struct Source {
+    batch: ColumnBatch,
+    remaining: usize,
 }
 
 impl Block {
@@ -437,7 +467,7 @@ impl Block {
         scratch.grow_to(scratch.bytes().checked_add(base).ok_or_else(size_error)?)?;
         if self.native && !native.is_some_and(|native| native.accepts(&batch)) {
             for earlier in &self.batches {
-                observe_scalar_keys(earlier, columns, projected, types, plan)?;
+                observe_scalar_keys(&earlier.as_ref().expect("block holds every input page").batch, columns, projected, types, plan)?;
             }
             self.native = false;
         }
@@ -447,7 +477,7 @@ impl Block {
         self.positions
             .extend((0..batch.len).map(|row| (source, row)));
         self.payload_bytes = self.payload_bytes.saturating_add(payload_bytes);
-        self.batches.push(batch);
+        self.batches.push(Some(Source { remaining: batch.len, batch }));
         Ok(())
     }
 
@@ -461,56 +491,92 @@ impl Block {
         let context = &plan.execution.context;
         let algorithm = context.options.object_sort;
         let len = self.positions.len();
-        let bytes = match algorithm {
-            ObjectSort::TimSort => timsort::scratch_bytes(len)?,
-            ObjectSort::LegacyMergeSort => legacy::scratch_bytes(len)?,
-        };
-        let _temporary = context.memory.reserve(bytes)?;
-        let mut keys = if self.native { None } else { Some(BlockKeys::new(len, &context.memory)?) };
-        let mut comparisons = 0usize;
-        let compare = |left_index, right_index| {
-            context.check_cancelled_at(comparisons)?;
-            comparisons += 1;
-            let (left, left_row) = self.positions[left_index];
-            let (right, right_row) = self.positions[right_index];
-            let (left, right) = (&self.batches[left], &self.batches[right]);
-            if !self.native {
-                return compare_scalar_keys(&mut keys, left_index, right_index, plan, |index| {
-                    let (batch, row) = self.positions[index];
-                    scalar_key(&self.batches[batch], row, plan, key_columns, projected).map(Key::for_comparison)
-                });
-            }
-            native.expect("only an admitted sort can borrow its keys")
-                .compare(left, left_row, right, right_row, &plan.order)
+        let row_at = |index: usize| {
+            let (source, row) = self.positions[index];
+            (&self.batches[source].as_ref().expect("block holds every input page").batch, row)
         };
         let limit = usize::try_from(plan.limit).unwrap_or(usize::MAX);
         // Under a total order, selecting the first rows yields exactly the stable sort's prefix.
         // The legacy merge sort is kept for its comparison schedule, so it always sorts in full.
         let selects = self.native && algorithm == ObjectSort::TimSort
             && native.is_some_and(NativeOrder::is_total) && limit < len / 8;
-        let order = if selects {
-            select::first(len, limit, compare)?
+        let prefixed = native.filter(|order| selects && order.has_leading_bytes());
+        let mut comparisons = 0usize;
+        let order = if let Some(order) = prefixed {
+            let _temporary = context.memory.reserve(select::scratch_bytes::<ByteKey<'_>>(limit)?)?;
+            select::first(len, limit, |index| {
+                let (batch, row) = row_at(index);
+                order.leading_bytes(batch, row)
+            }, |left, a, right, b| {
+                context.check_cancelled_at(comparisons)?;
+                comparisons += 1;
+                let (left, left_row) = row_at(left);
+                let (right, right_row) = row_at(right);
+                order.compare_prefixed(
+                    (left, left_row, a.prefix), (right, right_row, b.prefix), &plan.order,
+                    Some((a.tail, b.tail)),
+                )
+            })?
         } else {
-            let mut order: Vec<_> = (0..len).collect();
-            match algorithm {
-                ObjectSort::TimSort => timsort::sort(&mut order, compare)?,
-                ObjectSort::LegacyMergeSort => legacy::sort(&mut order, compare)?,
+            let bytes = match algorithm {
+                ObjectSort::TimSort if selects => select::scratch_bytes::<()>(limit)?,
+                ObjectSort::TimSort => timsort::scratch_bytes(len)?,
+                ObjectSort::LegacyMergeSort => legacy::scratch_bytes(len)?,
+            };
+            let _temporary = context.memory.reserve(bytes)?;
+            let mut keys = if self.native { None } else { Some(BlockKeys::new(len, &context.memory)?) };
+            let compare = |left_index, right_index| {
+                context.check_cancelled_at(comparisons)?;
+                comparisons += 1;
+                let (left, left_row) = row_at(left_index);
+                let (right, right_row) = row_at(right_index);
+                if !self.native {
+                    return compare_scalar_keys(&mut keys, left_index, right_index, plan, |index| {
+                        let (batch, row) = row_at(index);
+                        scalar_key(batch, row, plan, key_columns, projected).map(Key::for_comparison)
+                    });
+                }
+                native.expect("only an admitted sort can borrow its keys")
+                    .compare(left, left_row, right, right_row, &plan.order)
+            };
+            if selects {
+                let mut compare = compare;
+                select::first(len, limit, |_| (), |left, _, right, _| compare(left, right))?
+            } else {
+                let mut order: Vec<_> = (0..len).collect();
+                match algorithm {
+                    ObjectSort::TimSort => timsort::sort(&mut order, compare)?,
+                    ObjectSort::LegacyMergeSort => legacy::sort(&mut order, compare)?,
+                }
+                order.truncate(limit);
+                order
             }
-            order.truncate(limit);
-            order
         };
-        drop(keys);
         let Self {
-            batches,
+            mut batches,
             positions,
             mut scratch,
             ..
         } = self;
+        if order.len() < len {
+            for source in batches.iter_mut().flatten() {
+                source.remaining = 0;
+            }
+            for &index in &order {
+                let (source, _) = positions[index];
+                batches[source].as_mut().expect("selected page still exists").remaining += 1;
+            }
+            for source in &mut batches {
+                if source.as_ref().is_some_and(|source| source.remaining == 0) {
+                    *source = None;
+                }
+            }
+        }
         let bytes = positions
             .capacity()
             .saturating_mul(size_of::<(usize, usize)>())
             .saturating_add(order.capacity().saturating_mul(size_of::<usize>()))
-            .saturating_add(batches.capacity().saturating_mul(size_of::<ColumnBatch>()))
+            .saturating_add(batches.capacity().saturating_mul(size_of::<Option<Source>>()))
             .saturating_add(256);
         let scratch_size = Arc::get_mut(&mut scratch).expect("sort block owns its reservation");
         if bytes > scratch_size.bytes() {
@@ -539,7 +605,7 @@ fn observe_scalar_keys(
 }
 
 struct MemoryRun {
-    batches: Vec<ColumnBatch>,
+    batches: Vec<Option<Source>>,
     positions: Vec<(usize, usize)>,
     order: std::vec::IntoIter<usize>,
     _scratch: Arc<MemoryReservation>,
@@ -554,13 +620,17 @@ impl MemoryRun {
         let count = self.order.len().min(maximum);
         let _scratch = context.memory.reserve(256 + count.saturating_mul(128))?;
         let positions = self.order.as_slice()[..count].iter().map(|&index| self.positions[index]);
-        let batch = gather(positions, columns, &context.memory, |batch| {
-            &self.batches[batch]
-        });
-        self.order.by_ref().take(count).for_each(drop);
-        let batch = batch?;
-        if self.order.len() == 0 {
-            self.batches.clear();
+        let batch = gather(positions, columns, &context.memory, |source| {
+            &self.batches[source].as_ref().expect("selected page still exists").batch
+        })?;
+        for index in self.order.by_ref().take(count) {
+            let (source, _) = self.positions[index];
+            let slot = &mut self.batches[source];
+            let page = slot.as_mut().expect("selected page still exists");
+            page.remaining -= 1;
+            if page.remaining == 0 {
+                *slot = None;
+            }
         }
         Ok(Some(batch))
     }
@@ -704,6 +774,7 @@ struct Run {
     batch: Option<ColumnBatch>,
     row: usize,
     key: Option<Key>,
+    prefix: Option<BytePrefix>,
     native: bool,
 }
 
@@ -721,15 +792,27 @@ impl Run {
         {
             return Ok(());
         }
-        self.batch = None;
-        self.key = None;
-        self.row = 0;
+        self.release_page();
         self.batch = self.reader.read_columns(plan.schema.len())?;
         self.native = self
             .batch
             .as_ref()
             .is_some_and(|batch| native.is_some_and(|native| native.accepts(batch)));
         self.read_key(plan, columns)
+    }
+
+    fn release_page(&mut self) {
+        self.key = None;
+        self.prefix = None;
+        self.batch = None;
+        self.row = 0;
+    }
+
+    fn head(&mut self, order: &NativeOrder) -> (&ColumnBatch, usize, BytePrefix) {
+        let batch = self.batch.as_ref().expect("a selected run owns a batch");
+        let row = self.row;
+        let prefix = *self.prefix.get_or_insert_with(|| order.leading_bytes(batch, row).prefix);
+        (batch, row, prefix)
     }
 
     fn read_key(&mut self, plan: &SortPlan, columns: &[usize]) -> Result<()> {
@@ -871,6 +954,49 @@ fn sparse_sorted_span_releases_large_variable_width_backing() {
     assert_eq!(page.columns[0].value(0).unwrap(), Value::Utf8("kept".into()));
     drop(page);
     assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn limited_block_drops_unselected_payload_and_releases_each_consumed_source() {
+    use crate::{columnar::Column, context::OuterRows, parameters::BoundParameters};
+    use rtdb_plan::{ColumnId, Field};
+    use rtdb_types::{LogicalType, ScalarType};
+
+    let context = super::object_sort_tests::context(ObjectSort::TimSort);
+    let memory = &context.memory;
+    let execution = Execution {
+        parameters: Arc::new(BoundParameters::infer(vec![], memory).unwrap()),
+        outer: OuterRows::empty(memory).unwrap(),
+        context: Arc::clone(&context), bindings: None, analysis: None,
+    };
+    let key = Field { id: ColumnId(0), name: "key".into(), qualifier: None, qualified_only: false,
+        unnamed: false, data_type: LogicalType::Scalar(ScalarType::I64) };
+    let payload = Field { id: ColumnId(1), name: "payload".into(),
+        data_type: LogicalType::Scalar(ScalarType::Utf8), ..key.clone() };
+    let plan = SortPlan { schema: Schema::new(vec![key.clone(), payload]).unwrap(), limit: 2,
+        order: vec![SortExpr { expr: key.expression(), descending: false, nulls_first: false }], execution };
+    let native = NativeOrder::bind(&plan.schema, &[0]).unwrap();
+    let mut key_types = KeyTypes::declared(&plan).unwrap();
+    let mut block = Block::new(memory, true).unwrap();
+    for key in [0, 2, 1] {
+        let reservation = memory.reserve(1 << 19).unwrap();
+        let batch = ColumnBatch::settled(vec![
+            Column::Values(vec![Value::I64(key)]),
+            Column::Values(vec![Value::Utf8("p".repeat(1 << 18))]),
+        ], 1, reservation).unwrap();
+        let bytes = batch.working_set_bytes(memory).unwrap();
+        block.append(batch, bytes, &[0], Some(&native), false, &mut key_types, &plan).unwrap();
+    }
+    let before_prune = memory.used_bytes();
+    let mut run = block.order(&plan, &[0], Some(&native), false).unwrap();
+    assert!(before_prune - memory.used_bytes() >= 1 << 18);
+    let before_gather = memory.used_bytes();
+    let first = run.next(&plan, &[0, 1], 1).unwrap().unwrap();
+    assert_eq!(first.columns[0].value(0).unwrap(), Value::I64(0));
+    drop(first);
+    assert!(before_gather - memory.used_bytes() >= 1 << 18);
+    let last = run.next(&plan, &[0, 1], 1).unwrap().unwrap();
+    assert_eq!(last.columns[0].value(0).unwrap(), Value::I64(1));
 }
 
 #[test]

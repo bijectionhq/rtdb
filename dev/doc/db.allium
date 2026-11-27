@@ -2415,6 +2415,9 @@ surface QueryAccess {
         -- Run-end encoding of list values groups adjacent equal representations and preserves raw floating-point bits.
         -- Supported physical sort keys are read from their vectors in memory and during Arrow spill replay.
         -- A sort can retain comparison keys within its memory grant and reuse them across comparisons in the same block or at the head of a spill run.
+        -- Heap selection for a total order can retain fixed-size prefixes and borrow the remaining bytes of leading byte keys from the input pages.
+        -- Merge can reuse comparisons between unchanged heads of admitted runs and compare the full key when the prefix leaves its order unresolved.
+        -- Once a block has chosen its output positions, a source page remains in the sort only while those positions or an emitted view still need it.
         -- A sort preserves key order, null placement and ties across spill replay.
         -- A projection over a direct scan retains its compatible input columns when other expressions use scalar evaluation.
         -- Adjacent compatible projections can pass computed scalar results as Arrow columns, including into a mutation's document projection.

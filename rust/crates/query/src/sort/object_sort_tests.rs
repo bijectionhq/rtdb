@@ -6,7 +6,7 @@ use rtdb_types::{Anomaly,ObjectSort,Timestamp};
 use tokio_util::sync::CancellationToken;
 use crate::{CatalogSnapshot,DatabaseSnapshot,QueryContext,QueryOptions};
 
-fn context(object_sort: ObjectSort) -> Arc<QueryContext> {
+pub(super) fn context(object_sort: ObjectSort) -> Arc<QueryContext> {
     let database = DatabaseSnapshot { partitions: vec![],storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()),1 << 20)) };
     let catalog = CatalogSnapshot::new("xtdb",BTreeMap::from([("xtdb".into(),database)]),false).unwrap();
     QueryContext::new(catalog,MemoryBudget::new(1 << 24),Timestamp(0),"UTC",QueryOptions { object_sort,..Default::default() },&CancellationToken::new()).unwrap()
@@ -270,6 +270,75 @@ mod limited {
                     assert_eq!(limited, full[..limit as usize], "desc {descending}, nulls first {nulls_first}, limit {limit}");
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn byte_key_top_k_and_multi_pass_merge_preserve_exact_secondary_order_and_stable_ties() {
+        let key = field(0, "key", LogicalType::Scalar(ScalarType::Binary).maybe());
+        let secondary = field(1, "secondary", LogicalType::Scalar(ScalarType::I64));
+        let ordinal = field(2, "ordinal", secondary.data_type.clone());
+        let schema = Schema::new(vec![key.clone(), secondary.clone(), ordinal]).unwrap();
+        let common = b"wide-key".repeat(512);
+        let bytes = [
+            None,
+            Some(vec![]),
+            Some(vec![0]),
+            Some(b"wide-key".to_vec()),
+            Some([b"wide-key".as_slice(), &[0]].concat()),
+            Some([common.as_slice(), &[0]].concat()),
+            Some([common.as_slice(), &[1]].concat()),
+            Some(vec![255]),
+        ];
+        let rows: Vec<_> = (0..384).map(|row| {
+            let primary = bytes[(row * 13 + row / 11) % bytes.len()].clone().map_or(Value::Null, Value::Binary);
+            let exact = Value::I64(9_007_199_254_740_992 + (row % 3) as i64);
+            [primary, exact, Value::I64(row as i64)]
+        }).collect();
+
+        for sort_memory_bytes in [usize::MAX, 1] {
+            let execution = budgeted(1 << 24, sort_memory_bytes, 64);
+            let context = &execution.context;
+            let baseline = context.memory.used_bytes();
+            for (descending, nulls_first) in [(false, false), (true, true)] {
+                let order = vec![
+                    SortExpr { expr: key.expression(), descending, nulls_first },
+                    SortExpr { expr: secondary.expression(), descending: false, nulls_first: false },
+                ];
+                let plan = SortPlan { schema: schema.clone(), order: order.clone(), limit: u64::MAX, execution: execution.clone() };
+                let mut expected: Vec<_> = (0..rows.len()).collect();
+                expected.sort_by(|&a, &b| plan.compare(&rows[a], &rows[b]).unwrap());
+                for limit in [5, u64::MAX] {
+                    let pages = rows.chunks(64).map(|page| {
+                        let columns = schema.fields().iter().enumerate().map(|(index, field)| {
+                            let values = page.iter().map(|row| row[index].clone()).collect::<Vec<_>>();
+                            Column::Arrow {
+                                array: rtdb_columnar::copy_array(&field.data_type, &values).unwrap(),
+                                field: Arc::new(rtdb_columnar::to_field(&field.name, &field.data_type).unwrap()),
+                                logical: Some(field.data_type.clone()),
+                            }
+                        }).collect();
+                        ColumnBatch::settled(columns, page.len(), context.memory.reserve(0).unwrap()).unwrap()
+                    }).collect();
+                    let mut sort = batches::BatchSort::new(
+                        Box::new(Batches(pages)), schema.clone(), order.clone(), execution.clone(), false, 2, limit,
+                    ).unwrap();
+                    let mut actual = Vec::new();
+                    while let Some(batch) = sort.next_batch().await.unwrap() {
+                        for row in 0..batch.len {
+                            let Value::I64(ordinal) = batch.columns[2].value(row).unwrap() else { panic!("expected an ordinal") };
+                            assert_eq!(batch.columns[0].value(row).unwrap(), rows[ordinal as usize][0]);
+                            assert_eq!(batch.columns[1].value(row).unwrap(), rows[ordinal as usize][1]);
+                            actual.push(ordinal as usize);
+                        }
+                    }
+                    assert_eq!(actual, expected[2..limit.min(rows.len() as u64) as usize]);
+                    drop(sort);
+                    assert_eq!(context.memory.used_bytes(), baseline);
+                    assert_eq!(context.spill_bytes(), 0);
+                }
+            }
+            assert_eq!(context.spill_peak_bytes() > 0, sort_memory_bytes == 1);
         }
     }
 

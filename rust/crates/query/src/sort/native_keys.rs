@@ -1,5 +1,5 @@
 //! Borrowed sort keys for ordered probes and other simple Arrow sorts.
-use std::cmp::Ordering;
+use std::{cmp::Ordering, mem::size_of};
 
 use arrow_array::{Array, cast::AsArray, types::*};
 use arrow_schema::{DataType, Field, TimeUnit as ArrowTime, UnionMode};
@@ -290,6 +290,37 @@ enum Key<'a> {
     MonthDay { has_positive_months: bool, nanos: i64 },
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum BytePrefix {
+    Null,
+    Bytes { word: u64, len: usize },
+}
+
+const PREFIX_BYTES: usize = size_of::<u64>();
+
+pub(super) struct ByteKey<'a> {
+    pub prefix: BytePrefix,
+    pub tail: &'a [u8],
+}
+
+impl BytePrefix {
+    fn compare(self, right: Self, order: &SortExpr) -> Option<Ordering> {
+        let comparison = match (self, right) {
+            (Self::Null, Self::Null) => return Some(Ordering::Equal),
+            (Self::Null, _) => return Some(if order.nulls_first { Ordering::Less } else { Ordering::Greater }),
+            (_, Self::Null) => return Some(if order.nulls_first { Ordering::Greater } else { Ordering::Less }),
+            (Self::Bytes { word: left, len }, Self::Bytes { word: right, len: other_len }) => {
+                match left.cmp(&right) {
+                    Ordering::Equal if len.min(other_len) <= PREFIX_BYTES => len.cmp(&other_len),
+                    Ordering::Equal => return None,
+                    comparison => comparison,
+                }
+            }
+        };
+        Some(if order.descending { comparison.reverse() } else { comparison })
+    }
+}
+
 impl Key<'_> {
     fn month_day(months: i32, days: i32, nanos: i64) -> Self {
         Self::MonthDay {
@@ -367,6 +398,53 @@ impl NativeOrder {
             .all(|&(column, kind)| kind.accepts(&batch.columns[column]))
     }
 
+    pub fn has_leading_bytes(&self) -> bool {
+        matches!(self.keys.first(), Some((_, Kind::Text | Kind::Keyword | Kind::Binary)))
+    }
+
+    fn leading_key<'a>(&self, batch: &'a ColumnBatch, row: usize) -> Key<'a> {
+        let (column, kind) = self.keys[0];
+        kind.read(&batch.columns[column], row)
+    }
+
+    pub fn leading_bytes<'a>(&self, batch: &'a ColumnBatch, row: usize) -> ByteKey<'a> {
+        match self.leading_key(batch, row) {
+            Key::Null => ByteKey { prefix: BytePrefix::Null, tail: &[] },
+            Key::Text(bytes) => {
+                let (first, tail) = bytes.split_at(bytes.len().min(PREFIX_BYTES));
+                let mut word = [0; PREFIX_BYTES];
+                word[..first.len()].copy_from_slice(first);
+                ByteKey { prefix: BytePrefix::Bytes { word: u64::from_be_bytes(word), len: bytes.len() }, tail }
+            }
+            _ => unreachable!("expected a byte sort key"),
+        }
+    }
+
+    pub fn compare_prefixed<'a>(
+        &self,
+        left: (&'a ColumnBatch, usize, BytePrefix),
+        right: (&'a ColumnBatch, usize, BytePrefix),
+        order: &[SortExpr],
+        tails: Option<(&'a [u8], &'a [u8])>,
+    ) -> rtdb_types::Result<Ordering> {
+        let (left, left_row, left_prefix) = left;
+        let (right, right_row, right_prefix) = right;
+        let comparison = left_prefix.compare(right_prefix, &order[0]).unwrap_or_else(|| {
+            let (a, b) = tails.unwrap_or_else(|| {
+                let Key::Text(a) = self.leading_key(left, left_row) else { unreachable!() };
+                let Key::Text(b) = self.leading_key(right, right_row) else { unreachable!() };
+                (&a[PREFIX_BYTES..], &b[PREFIX_BYTES..])
+            });
+            let comparison = a.cmp(b);
+            if order[0].descending { comparison.reverse() } else { comparison }
+        });
+        if comparison.is_eq() {
+            self.compare_from(1, left, left_row, right, right_row, order)
+        } else {
+            Ok(comparison)
+        }
+    }
+
     pub fn compare(
         &self,
         left: &ColumnBatch,
@@ -375,7 +453,19 @@ impl NativeOrder {
         right_row: usize,
         order: &[SortExpr],
     ) -> rtdb_types::Result<Ordering> {
-        for (&(column, kind), order) in self.keys.iter().zip(order) {
+        self.compare_from(0, left, left_row, right, right_row, order)
+    }
+
+    fn compare_from(
+        &self,
+        start: usize,
+        left: &ColumnBatch,
+        left_row: usize,
+        right: &ColumnBatch,
+        right_row: usize,
+        order: &[SortExpr],
+    ) -> rtdb_types::Result<Ordering> {
+        for (&(column, kind), order) in self.keys[start..].iter().zip(&order[start..]) {
             let left = kind.read(&left.columns[column], left_row);
             let right = kind.read(&right.columns[column], right_row);
             let comparison = left.compare(right, order)?;
