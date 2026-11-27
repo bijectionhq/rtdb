@@ -12,11 +12,11 @@ use crate::context::Execution;
 use crate::invalid;
 use crate::join_key::JoinLayout;
 use crate::join_spill::{BlockWriter, Partitions};
-use crate::join_storage::HashIndex;
+use crate::join_storage::{HashIndex, combine_cell_hash};
 use crate::operators::{BatchOutput, build_batch_input};
 use crate::pushdown::{PushdownBuilder, Pushdowns};
 use crate::runtime_schema::EmittedRelation;
-use crate::scalar_key::ScalarKey;
+use crate::scalar_key::{ScalarColumn, ScalarKey};
 use crate::set_keys::{Key, KeyColumns, TypedKeys, direct_key_equal};
 
 /// For each equality, whether its first operand is the build side's key.
@@ -212,6 +212,7 @@ struct Table {
     batches: Vec<ColumnBatch>,
     starts: Vec<usize>,
     index: HashIndex,
+    anti_key_layout: Option<usize>,
     rows: usize,
     unmatched: Option<(Vec<u8>, Arc<MemoryReservation>)>,
     _starts: Arc<MemoryReservation>,
@@ -222,6 +223,44 @@ struct HashedProbe<'a> {
     keys: TypedKeys<'a>,
     hashes: Vec<u32>,
     _reservation: Arc<MemoryReservation>,
+}
+
+#[derive(Clone, Copy)]
+enum ProbeCandidates<'a> {
+    BuildOrder,
+    HashBuckets(Option<&'a HashedProbe<'a>>),
+    AntiHashBuckets,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AntiKeyKind {
+    Null,
+    Bool,
+    Signed,
+    Bytes,
+}
+
+impl AntiKeyKind {
+    fn of(column: &Column) -> Option<Self> {
+        let reader = match column {
+            Column::Arrow { array, field, logical } => ScalarColumn::bind(array.as_ref(), field, logical.as_ref())?,
+            Column::Selected(selected) => {
+                let mut sources = selected.source_layouts();
+                let Some((array, field, logical)) = sources.next() else { return Some(Self::Null); };
+                if sources.next().is_some() { return None; }
+                ScalarColumn::bind(array, field, logical)?
+            }
+            Column::Values(_) => return None,
+        };
+        Some(match reader {
+            ScalarColumn::Null => Self::Null,
+            ScalarColumn::Bool(_) => Self::Bool,
+            ScalarColumn::I8(_) | ScalarColumn::I16(_) | ScalarColumn::I32(_) | ScalarColumn::I64(_) => Self::Signed,
+            ScalarColumn::Text(_) | ScalarColumn::Bytes(_) => Self::Bytes,
+            // Float equality merges signed zeros, whose vector hashes can differ.
+            ScalarColumn::F32(_) | ScalarColumn::F64(_) => return None,
+        })
+    }
 }
 
 impl Table {
@@ -413,7 +452,46 @@ impl Spec {
             }
         }
         let index = HashIndex::new(&hashes, &context.memory)?;
-        Ok(Table { batches, starts, index, rows, unmatched: None, _starts: reservation, _inventory: inventory })
+        let anti_key_layout = self.anti_build_layout(&batches);
+        Ok(Table { batches, starts, index, anti_key_layout, rows, unmatched: None, _starts: reservation, _inventory: inventory })
+    }
+
+    fn anti_build_layout(&self, batches: &[ColumnBatch]) -> Option<usize> {
+        if self.kind != JoinKind::Anti || self.build_keys.is_empty() || !self.theta.is_empty() || self.residual.is_some()
+            || self.build_keys.iter().any(|&position| position >= self.widths[0])
+            || self.probe_keys.iter().any(|&position| position >= self.widths[1])
+        {
+            return None;
+        }
+        let mut batches = batches.iter().enumerate().filter(|(_, batch)| batch.len != 0);
+        let (first, layout) = batches.next()?;
+        for &position in &self.build_keys {
+            let kind = AntiKeyKind::of(layout.columns.get(position)?)?;
+            if batches.clone().any(|(_, batch)| batch.columns.get(position).and_then(AntiKeyKind::of) != Some(kind)) {
+                return None;
+            }
+        }
+        Some(first)
+    }
+
+    fn anti_probe_compatible(&self, table: &Table, probe: &ColumnBatch) -> bool {
+        let Some(layout) = table.anti_key_layout else { return false; };
+        let build = &table.batches[layout];
+        self.build_keys.iter().zip(&self.probe_keys).all(|(&left, &right)| {
+            match (AntiKeyKind::of(&build.columns[left]), probe.columns.get(right).and_then(AntiKeyKind::of)) {
+                (Some(left), Some(right)) => left == right || left == AntiKeyKind::Null || right == AntiKeyKind::Null,
+                _ => false,
+            }
+        })
+    }
+
+    fn anti_probe_hash(&self, probe: &ColumnBatch, row: usize) -> Option<u32> {
+        self.probe_keys.iter().try_fold(0, |hash, &position| {
+            match ScalarKey::read(&probe.columns[position], row).expect("An admitted anti key has a scalar reader") {
+                ScalarKey::Null => None,
+                key => Some(combine_cell_hash(hash, key.hash() as i32)),
+            }
+        })
     }
 
     async fn spill_arrow(
@@ -493,7 +571,7 @@ impl Spec {
             let equality = self.execution.scope()?;
             for row in 0..probe.len {
                 context.check_cancelled_at(row)?;
-                self.matching_build_rows(table, &probe, hashed.as_ref(), row, &equality, residual.as_ref(), |_, position| {
+                self.matching_build_rows(table, &probe, ProbeCandidates::HashBuckets(hashed.as_ref()), row, &equality, residual.as_ref(), |_, position| {
                     matches.push(position, &context.memory)?;
                     Ok(ControlFlow::Continue(()))
                 }).await?;
@@ -600,9 +678,14 @@ impl Spec {
         let mut selected = JoinPositions::new();
         let equality = self.execution.scope()?;
         let hashed = self.hash_probe(&probe)?;
+        let candidates = match self.kind {
+            JoinKind::Anti if self.anti_probe_compatible(table, &probe) => ProbeCandidates::AntiHashBuckets,
+            JoinKind::Anti => ProbeCandidates::BuildOrder,
+            _ => ProbeCandidates::HashBuckets(hashed.as_ref()),
+        };
         for row in 0..probe.len {
             context.check_cancelled_at(row)?;
-            let matched = self.matching_build_rows(table, &probe, hashed.as_ref(), row, &equality, residual, |_, _| Ok(ControlFlow::Break(()))).await?;
+            let matched = self.matching_build_rows(table, &probe, candidates, row, &equality, residual, |_, _| Ok(ControlFlow::Break(()))).await?;
             if matched != (self.kind == JoinKind::Semi) { continue; }
             if span.is_empty() {
                 span = row..row + 1;
@@ -640,24 +723,31 @@ impl Spec {
 
     #[allow(clippy::too_many_arguments)]
     async fn matching_build_rows(
-        &self, table: &Table, probe: &ColumnBatch, hashed_probe: Option<&HashedProbe<'_>>, row: usize, equality: &rtdb_expr::EvaluationScope,
+        &self, table: &Table, probe: &ColumnBatch, candidates: ProbeCandidates<'_>, row: usize, equality: &rtdb_expr::EvaluationScope,
         residual: Option<&PreparedResidual<'_>>,
         mut accept: impl FnMut(usize, (usize, usize)) -> Result<ControlFlow<()>>,
     ) -> Result<bool> {
+        let context = &self.execution.context;
+        let checked_before_probe = usize::from(matches!(candidates, ProbeCandidates::AntiHashBuckets));
         let mut key = None;
-        let mut hashed = if self.kind != JoinKind::Anti {
-            let (hash, probe_key) = self.hashed_probe_key(probe, row, hashed_probe)?;
-            key = Some(probe_key);
-            Some(table.index.candidates(hash))
-        } else {
-            None
+        let mut hashed = match candidates {
+            ProbeCandidates::BuildOrder => None,
+            ProbeCandidates::HashBuckets(hashed) => {
+                let (hash, probe_key) = self.hashed_probe_key(probe, row, hashed)?;
+                key = Some(probe_key);
+                Some(table.index.candidates(hash))
+            }
+            ProbeCandidates::AntiHashBuckets => {
+                context.check_cancelled()?;
+                let Some(hash) = self.anti_probe_hash(probe, row) else { return Ok(false); };
+                Some(table.index.candidates(hash))
+            }
         };
-        // Anti joins test the build side in source order, including candidates with different hashes.
         let mut all = 0..table.rows;
         let candidates = std::iter::from_fn(|| match &mut hashed { Some(rows) => rows.next(), None => all.next() });
         let mut matched = false;
         for (candidate, ordinal) in candidates.enumerate() {
-            self.execution.context.check_cancelled_at(candidate)?;
+            context.check_cancelled_at(candidate + checked_before_probe)?;
             let (batch, offset) = table.position(ordinal);
             let build = &table.batches[batch];
             if let Some(residual) = residual {
@@ -767,7 +857,7 @@ impl Spec {
         for row in 0..probe.len {
             context.check_cancelled_at(row)?;
             let mut matched_once = false;
-            let matched = self.matching_build_rows(table, probe, hashed.as_ref(), row, &equality, residual, |ordinal, position| {
+            let matched = self.matching_build_rows(table, probe, ProbeCandidates::HashBuckets(hashed.as_ref()), row, &equality, residual, |ordinal, position| {
                 if matched_once && self.kind == JoinKind::Single { return Err(crate::cardinality_violation()); }
                 matched_once = true;
                 if let Some((unmatched, _)) = &mut unmatched { unmatched[ordinal] = 0; }

@@ -2356,6 +2356,9 @@ surface QueryAccess {
         -- An Arrow join can evaluate a residual predicate from borrowed cells on either side while gathering the result payloads from the input batches.
         -- An inner hash join feeding only unfiltered row counts can emit batch cardinalities without gathering payload columns.
         -- A hash join shares probe positions across the retained Arrow probe columns and represents an initial one-to-one span by its length.
+        -- A batch anti join on compatible validated scalar column equalities can search hash candidates when every equal key pair shares a hash and comparison is infallible.
+        -- This search keeps a probe row when any of its key cells is NULL or every candidate fails to match.
+        -- Other batch anti joins visit the build rows available to the probe in build order, including rows with different hashes, and stop at the first true result or reached error.
         -- Join partitions retain flat and nested layouts in Arrow IPC, including selected cells whose physical fields differ.
         -- An Arrow equijoin uses the raw vector hash of compatible floating-point list keys and compares their selected components.
         -- Join, sort, membership, and materialized-relation spills replay Arrow batches under the query's spill budget, which is unlimited by default and refuses bytes past any configured limit (including zero).

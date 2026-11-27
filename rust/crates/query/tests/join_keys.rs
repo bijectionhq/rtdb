@@ -7,9 +7,13 @@ use rtdb_types::{LogicalType, Result, ScalarType, TimeUnit, Timestamp, Value};
 use tokio_util::sync::CancellationToken;
 
 fn context(cancel: &CancellationToken) -> Arc<QueryContext> {
+    join_context(cancel, i64::MAX)
+}
+
+fn join_context(cancel: &CancellationToken, join_build_rows: i64) -> Arc<QueryContext> {
     let database = DatabaseSnapshot { partitions: vec![], storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)) };
     let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
-    QueryContext::new(catalog, MemoryBudget::new(1 << 26), Timestamp(0), "UTC", QueryOptions { join_build_rows: i64::MAX, batch_rows: 1, ..Default::default() }, cancel).unwrap()
+    QueryContext::new(catalog, MemoryBudget::new(1 << 26), Timestamp(0), "UTC", QueryOptions { join_build_rows, batch_rows: 1, ..Default::default() }, cancel).unwrap()
 }
 fn numbers(id: u32, name: &str, values: &[i64]) -> Arc<Relation> {
     let field = Field { id: ColumnId(id), name: name.into(), qualifier: None, qualified_only: false, unnamed: false, data_type: LogicalType::Scalar(ScalarType::I64) };
@@ -116,6 +120,101 @@ async fn hash_candidates_skip_unknown_key_pairs_but_anti_join_scans_them() {
             if kind == JoinKind::Anti || right_key.is_none() { assert!(result.is_err(), "{kind:?} {right_key:?}"); }
             else { assert_eq!(result.unwrap().len(), expected_rows, "{kind:?}"); }
             assert_eq!(context.spill_bytes(), 0); assert_eq!(context.memory.used_bytes(), 0);
+        }
+    }
+}
+
+fn typed_rows(first: u32, types: &[ScalarType], rows: Vec<Vec<Value>>) -> Arc<Relation> {
+    let fields = types.iter().enumerate().map(|(offset, ty)| {
+        let id = first + offset as u32;
+        Field { id: ColumnId(id), name: format!("k{id}"), qualifier: None, qualified_only: false, unnamed: false, data_type: LogicalType::Scalar(ty.clone()).maybe() }
+    }).collect();
+    let rows = rows.into_iter().map(|row| row.into_iter().map(Expr::Literal).collect()).collect();
+    Arc::new(Relation::new(Schema::new(fields).unwrap(), RelationNode::Values { rows }).unwrap())
+}
+
+#[tokio::test]
+async fn anti_equijoin_preserves_nulls_and_rechecks_colliding_keys_in_probe_order() {
+    use Value::{I64, Null};
+
+    let large = 1_i64 << 53;
+    let probe = typed_rows(0, &[ScalarType::I64], vec![vec![I64(7)], vec![I64(large + 1)], vec![Null],
+        vec![I64(31)], vec![I64(large)], vec![I64(large + 1)], vec![I64(11)]]);
+    let build = typed_rows(1, &[ScalarType::I64], vec![vec![I64(7)], vec![I64(7)], vec![I64(large)], vec![Null], vec![I64(11)]]);
+    let key = Expr::binary(BinaryOp::Eq, probe.schema().fields()[0].expression(), build.schema().fields()[0].expression());
+    let context = context(&CancellationToken::new());
+    let rows = collect(&join(probe, build, JoinKind::Anti, key), &context).await.unwrap();
+    assert_eq!(rows, [vec![I64(large + 1)], vec![Null], vec![I64(31)], vec![I64(large + 1)]]);
+    assert_eq!(context.memory.used_bytes(), 0);
+}
+
+#[tokio::test]
+async fn anti_equijoin_matches_composite_keys_across_widths_and_byte_layouts_in_memory_and_on_disk() {
+    use Value::{Binary, Bool, I16, I32, Null, Utf8};
+
+    let probe = typed_rows(0, &[ScalarType::Bool, ScalarType::I16, ScalarType::Utf8, ScalarType::I32], vec![
+        vec![Bool(true), I16(-12), Utf8("café".into()), I32(1)],
+        vec![Bool(false), I16(-12), Utf8("café".into()), I32(2)],
+        vec![Bool(true), I16(25), Utf8("other".into()), I32(3)],
+        vec![Bool(false), I16(-12), Utf8("café".into()), I32(4)],
+    ]);
+    let build = typed_rows(4, &[ScalarType::Bool, ScalarType::I32, ScalarType::Binary], vec![
+        vec![Bool(true), I32(-12), Binary("café".as_bytes().to_vec())],
+        vec![Bool(true), I32(25), Binary(b"other".to_vec())],
+        vec![Null, I32(-12), Binary("café".as_bytes().to_vec())],
+    ]);
+    let comparisons = [2, 0, 1].map(|index| {
+        let mut operands = [probe.schema().fields()[index].expression(), build.schema().fields()[index].expression()];
+        if index == 0 { operands.swap(0, 1); }
+        let [left, right] = operands;
+        Expr::binary(BinaryOp::Eq, left, right)
+    });
+    let condition = comparisons.into_iter().reduce(|left, right| Expr::binary(BinaryOp::And, left, right)).unwrap();
+    let query = join(probe, build, JoinKind::Anti, condition);
+    for threshold in [i64::MAX, 1] {
+        let context = join_context(&CancellationToken::new(), threshold);
+        assert_eq!(collect(&query, &context).await.unwrap(), [
+            vec![Bool(false), I16(-12), Utf8("café".into()), I32(2)],
+            vec![Bool(false), I16(-12), Utf8("café".into()), I32(4)],
+        ]);
+        assert_eq!(context.spill_peak_bytes() > 0, threshold == 1);
+        assert_eq!(context.spill_bytes(), 0);
+        assert_eq!(context.memory.used_bytes(), 0);
+    }
+}
+
+#[tokio::test]
+async fn anti_equijoin_preserves_signed_zero_nan_and_mixed_float_equality() {
+    use Value::{F32, F64, I64, Null};
+
+    let large = 1_i64 << 53;
+    for (probe_type, probe_keys, build_keys, expected_ids) in [
+        (ScalarType::F32, vec![F32(-0.0), F32(0.0), F32(1.5), F32(f32::NAN), Null],
+            vec![F64(0.0), F64(1.5), F64(f64::NAN), Null], [3, 4]),
+        (ScalarType::I64, vec![I64(0), I64(large), I64(large + 1), I64(large + 2), Null],
+            vec![F64(-0.0), F64(large as f64), Null], [3, 4]),
+    ] {
+        let probe_rows = probe_keys.into_iter().enumerate().map(|(id, key)| vec![key, I64(id as i64)]).collect();
+        let probe = typed_rows(0, &[probe_type, ScalarType::I64], probe_rows);
+        let build = typed_rows(2, &[ScalarType::F64], build_keys.into_iter().map(|key| vec![key]).collect());
+        let key = Expr::binary(BinaryOp::Eq, probe.schema().fields()[0].expression(), build.schema().fields()[0].expression());
+        let rows = collect(&join(probe, build, JoinKind::Anti, key), &context(&CancellationToken::new())).await.unwrap();
+        assert_eq!(rows.into_iter().map(|row| row[1].clone()).collect::<Vec<_>>(), expected_ids.map(I64));
+    }
+}
+
+#[tokio::test]
+async fn fallible_anti_equality_observes_build_order_before_a_matching_key() {
+    let duration = |value, unit| Value::Duration { value, unit };
+    for (build_values, errors) in [([i64::MAX, 1], true), ([1, i64::MAX], false)] {
+        let probe = typed_rows(0, &[ScalarType::Duration(TimeUnit::Nanosecond)], vec![vec![duration(1_000_000_000, TimeUnit::Nanosecond)]]);
+        let build = typed_rows(1, &[ScalarType::Duration(TimeUnit::Second)], build_values.into_iter().map(|value| vec![duration(value, TimeUnit::Second)]).collect());
+        let key = Expr::binary(BinaryOp::Eq, probe.schema().fields()[0].expression(), build.schema().fields()[0].expression());
+        let result = collect(&join(probe, build, JoinKind::Anti, key), &context(&CancellationToken::new())).await;
+        if errors {
+            assert_eq!(result.unwrap_err().code, "xtdb.expression/overflow-error");
+        } else {
+            assert!(result.unwrap().is_empty());
         }
     }
 }
