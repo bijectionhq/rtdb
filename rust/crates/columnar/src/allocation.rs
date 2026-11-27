@@ -239,7 +239,7 @@ fn clone_cost(value: &Value) -> Result<usize> {
 fn map_node_cost() -> Result<usize> { add(multiply(add(std::mem::size_of::<Value>(), std::mem::size_of::<String>())?, 2)?, 64) }
 fn add(left: usize, right: usize) -> Result<usize> { left.checked_add(right).ok_or_else(overflow) }
 fn multiply(left: usize, right: usize) -> Result<usize> { left.checked_mul(right).ok_or_else(overflow) }
-fn overflow() -> Anomaly { Anomaly::incorrect("rtdb/allocation-bound", "Array builder allocation bound cannot be represented") }
+fn overflow() -> Anomaly { Anomaly::incorrect("rtdb/allocation-bound", "Array builder allocation bound cannot be represented").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded) }
 
 #[cfg(test)]
 mod tests {

@@ -76,7 +76,7 @@ impl QuerySettings {
     /// Bounds owned setting values, including unadmitted literal text, for the lifetime of the prepared query.
     /// Size overflow returns an allocation anomaly.
     pub fn retained_bytes(&self) -> rtdb_types::Result<usize> {
-        let overflow = || rtdb_types::Anomaly::incorrect("rtdb.plan/settings-size", "Query setting allocation overflow");
+        let overflow = || rtdb_types::Anomaly::incorrect("rtdb.plan/settings-size", "Query setting allocation overflow").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded);
         [&self.clock_time,&self.snapshot_token,&self.snapshot_time].into_iter().flatten().try_fold(std::mem::size_of::<Self>(),|bytes,value| {
             let retained = match value { SettingValue::Literal(value) => value.retained_bytes()?,SettingValue::TimestampLiteral(text) => text.capacity(),_ => 0 };
             bytes.checked_add(retained).ok_or_else(overflow)

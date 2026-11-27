@@ -162,7 +162,7 @@ impl Iterator for Order<'_> {
     fn next(&mut self) -> Option<usize> { match self { Self::Array(range) => range.next(),Self::Hash(order) => order.next() } }
 }
 
-fn size_error() -> Anomaly { Anomaly::incorrect("rtdb.types/clojure-index-size","Clojure collection index exceeds addressable storage") }
+fn size_error() -> Anomaly { Anomaly::incorrect("rtdb.types/clojure-index-size","Clojure collection index exceeds addressable storage").with_kind(crate::AnomalyKind::ProgramLimitExceeded) }
 
 fn grow<T>(values: &mut Vec<T>,required: usize,allocation: Option<&AllocationScope>) -> Result<()> {
     if required <= values.capacity() { return Ok(()); }

@@ -43,10 +43,10 @@ impl AllocationScope {
     /// Reserves bytes plus bookkeeping before allocation; charges last until the scope is dropped.
     /// Calls may share the scope across threads; budget exhaustion returns without granting a reservation.
     pub fn reserve(&self, bytes: usize) -> Result<()> {
-        let bytes = bytes.checked_add(256).ok_or_else(|| Anomaly::incorrect("rtdb.expr/allocation-size", "Expression allocation exceeds addressable memory"))?;
+        let bytes = bytes.checked_add(256).ok_or_else(|| Anomaly::incorrect("rtdb.expr/allocation-size", "Expression allocation exceeds addressable memory").with_kind(crate::AnomalyKind::ProgramLimitExceeded))?;
         let mut lease = self.lease.lock().map_err(|_| Anomaly::fault("rtdb.expr/allocation-scope", "Expression allocation scope was poisoned"))?;
         match lease.as_mut().and_then(Arc::get_mut) {
-            Some(held) => held.grow_to(held.bytes().checked_add(bytes).ok_or_else(|| Anomaly::incorrect("rtdb.expr/allocation-size", "Expression allocation exceeds addressable memory"))?),
+            Some(held) => held.grow_to(held.bytes().checked_add(bytes).ok_or_else(|| Anomaly::incorrect("rtdb.expr/allocation-size", "Expression allocation exceeds addressable memory").with_kind(crate::AnomalyKind::ProgramLimitExceeded))?),
             None => { *lease = Some(self.memory.reserve(bytes)?); Ok(()) }
         }
     }

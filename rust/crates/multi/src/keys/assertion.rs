@@ -258,7 +258,7 @@ fn require_body_limit(plaintext: &[u8]) -> Result<()> {
     if plaintext.len() > MAX_BODY_BYTES {
         return Err(Anomaly::incorrect(
             "rtdb.multi/assertion-size", "The assertion exceeds the source message limit",
-        ));
+        ).with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded));
     }
     Ok(())
 }

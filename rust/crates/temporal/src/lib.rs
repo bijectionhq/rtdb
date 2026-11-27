@@ -239,7 +239,7 @@ impl AdmittedCeiling {
 }
 
 fn ceiling_size() -> Anomaly {
-    Anomaly::incorrect("rtdb.temporal/ceiling-size", "Temporal ceiling capacity exceeds addressable memory")
+    Anomaly::incorrect("rtdb.temporal/ceiling-size", "Temporal ceiling capacity exceeds addressable memory").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded)
 }
 
 /// Resolves events in order and retains the current ceiling's storage on the supplied budget.
@@ -338,7 +338,7 @@ impl<R> ResolvedRows<R> {
 
     fn push(&mut self, memory: &Arc<MemoryBudget>, row: impl FnOnce() -> ResolvedRow<R>) -> Result<()> {
         if self.rows.len() == self.capacity {
-            let overflow = || Anomaly::incorrect("rtdb.temporal/history-row-size", "Resolved history capacity exceeds addressable memory");
+            let overflow = || Anomaly::incorrect("rtdb.temporal/history-row-size", "Resolved history capacity exceeds addressable memory").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded);
             let capacity = self.capacity.checked_mul(2).ok_or_else(overflow)?.max(1);
             let bytes = capacity.checked_mul(std::mem::size_of::<ResolvedRow<R>>())
                 .and_then(|bytes| bytes.checked_add(256)).ok_or_else(overflow)?;

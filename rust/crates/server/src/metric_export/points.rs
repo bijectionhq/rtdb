@@ -73,7 +73,7 @@ fn truncate_utf16(value: &str, units: usize) -> String {
     let mut left = units;
     value.chars().take_while(|character| { let size = character.len_utf16(); if size > left { false } else { left -= size; true } }).collect()
 }
-fn size_error() -> Anomaly { Anomaly::incorrect("rtdb.metrics/export-size", "Metric export allocation size overflow") }
+fn size_error() -> Anomaly { Anomaly::incorrect("rtdb.metrics/export-size", "Metric export allocation size overflow").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded) }
 
 #[cfg(test)]
 mod tests {

@@ -135,7 +135,7 @@ fn allocation_bound(units: usize, backing: Layout) -> Result<usize> {
     backing.size().checked_add(owner.size()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)
 }
 
-fn size_error() -> Anomaly { Anomaly::incorrect("rtdb.types/java-text-size", "Java text exceeds addressable storage") }
+fn size_error() -> Anomaly { Anomaly::incorrect("rtdb.types/java-text-size", "Java text exceeds addressable storage").with_kind(crate::AnomalyKind::ProgramLimitExceeded) }
 
 impl<'a> JavaText<'a> {
     /// Counts UTF16 units in linear time, borrowing the original UTF8 bytes without allocation.

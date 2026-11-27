@@ -192,7 +192,7 @@ fn cast<T: 'static>(array: &dyn Array) -> Result<&T> { array.as_any().downcast_r
 fn map_node() -> Result<usize> { add(mul(add(std::mem::size_of::<Value>(), std::mem::size_of::<String>())?, 16)?, 512) }
 fn add(left: usize, right: usize) -> Result<usize> { left.checked_add(right).ok_or_else(overflow) }
 fn mul(left: usize, right: usize) -> Result<usize> { left.checked_mul(right).ok_or_else(overflow) }
-fn overflow() -> Anomaly { Anomaly::incorrect("rtdb/allocation-bound", "Arrow cell allocation bound exceeds address space") }
+fn overflow() -> Anomaly { Anomaly::incorrect("rtdb/allocation-bound", "Arrow cell allocation bound exceeds address space").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded) }
 fn layout() -> Anomaly { Anomaly::incorrect("rtdb/array-layout", "Arrow array and logical field layout disagree") }
 
 #[test]

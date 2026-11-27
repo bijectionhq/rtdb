@@ -23,7 +23,7 @@ impl OwnedSchema {
     }
     pub fn parameters(count: usize, memory: &Arc<MemoryBudget>) -> Result<Self> {
         u32::try_from(count.saturating_sub(1))
-            .map_err(|_| Anomaly::incorrect("rtdb.node/preparation-size", "Prepared statement retained size exceeds usize"))?;
+            .map_err(|_| Anomaly::incorrect("rtdb.node/preparation-size", "Prepared statement retained size exceeds usize").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded))?;
         let unknown = LogicalType::Null;
         let field_bytes = super::mul(unknown.retained_bytes()?, 16)?;
         let reservation = memory.reserve(super::add(4096, super::mul(count, field_bytes)?)?)?;

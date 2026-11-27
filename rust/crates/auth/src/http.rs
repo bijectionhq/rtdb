@@ -100,7 +100,7 @@ impl HttpTransport for NativeHttp {
     }
 }
 
-fn body_limit() -> Anomaly { Anomaly::incorrect("rtdb.auth/response-too-large", "OIDC response exceeds configured byte limit") }
+fn body_limit() -> Anomaly { Anomaly::incorrect("rtdb.auth/response-too-large", "OIDC response exceeds configured byte limit").with_kind(rtdb_types::AnomalyKind::ConfigurationLimitExceeded) }
 fn http_error(_: reqwest::Error) -> Anomaly { Anomaly::new(AnomalyCategory::Unavailable, "rtdb.auth/http", "OIDC HTTP request failed") }
 fn json_bytes(value: &Value) -> Result<usize> {
     let extra = match value {

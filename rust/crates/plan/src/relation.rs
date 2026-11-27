@@ -288,7 +288,7 @@ impl AggregateFunction {
     /// Includes the descriptor and any retained original-name capacity.
     pub fn retained_bytes(&self) -> Result<usize> {
         std::mem::size_of::<Self>().checked_add(match self { Self::Named(name) => name.spelling.capacity(), _ => 0 })
-            .ok_or_else(|| Anomaly::incorrect("rtdb.plan/aggregate-size", "Aggregate descriptor exceeds addressable memory"))
+            .ok_or_else(|| Anomaly::incorrect("rtdb.plan/aggregate-size", "Aggregate descriptor exceeds addressable memory").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded))
     }
     /// Returns the factory symbol used by plan descriptions.
     pub fn name(&self) -> &str {

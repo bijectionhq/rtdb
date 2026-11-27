@@ -130,4 +130,4 @@ fn labels(tags: &std::collections::BTreeMap<String, String>, extra: Option<(&str
     output
 }
 fn number(value: f64) -> String { if value.is_nan() { "NaN".into() } else if value == f64::INFINITY { "+Inf".into() } else if value == f64::NEG_INFINITY { "-Inf".into() } else { value.to_string() } }
-fn overflow() -> Anomaly { Anomaly::incorrect("rtdb.metrics/render-limit", "Metrics output exceeds its allocation bound") }
+fn overflow() -> Anomaly { Anomaly::incorrect("rtdb.metrics/render-limit", "Metrics output exceeds its allocation bound").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded) }

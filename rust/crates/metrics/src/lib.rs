@@ -227,7 +227,7 @@ impl CatalogMetrics for Registry {
 fn metric_bytes(metric: &CatalogMetric) -> Result<usize> {
     metric.tags().iter().try_fold(metric.name().len().checked_add(512).ok_or_else(overflow)?, |bytes, (key, value)| bytes.checked_add(key.len()).and_then(|bytes| bytes.checked_add(value.len())).and_then(|bytes| bytes.checked_add(256)).ok_or_else(overflow))
 }
-fn overflow() -> Anomaly { Anomaly::incorrect("rtdb.metrics/allocation-overflow", "Metric allocation exceeds addressable memory") }
+fn overflow() -> Anomaly { Anomaly::incorrect("rtdb.metrics/allocation-overflow", "Metric allocation exceeds addressable memory").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded) }
 fn wall_time_millis() -> i64 { match SystemTime::now().duration_since(UNIX_EPOCH) { Ok(elapsed) => elapsed.as_millis().min(i64::MAX as u128) as i64, Err(error) => -(error.duration().as_millis().min(i64::MAX as u128) as i64) } }
 
 #[cfg(test)]

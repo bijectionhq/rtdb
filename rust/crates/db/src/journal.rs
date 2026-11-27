@@ -347,7 +347,8 @@ pub(crate) fn journal_error(error: JournalError) -> Anomaly {
         JournalError::Unavailable => (AnomalyCategory::Unavailable, "rtdb/journal-unavailable"),
         JournalError::Recovered { .. } => unreachable!("handled above"),
     };
-    Anomaly::new(category, code, error.to_string())
+    let anomaly = Anomaly::new(category, code, error.to_string());
+    if matches!(error, JournalError::TooLarge { .. }) { anomaly.with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded) } else { anomaly }
 }
 
 #[cfg(test)]

@@ -90,7 +90,7 @@ impl LogicalType {
     /// Includes inline storage and owned capacities, with conservative tree-node overhead.
     pub fn retained_bytes(&self) -> Result<usize> {
         let mut bytes = std::mem::size_of::<Self>();
-        let overflow = || Anomaly::incorrect("rtdb/type-size", "Logical type size exceeds usize");
+        let overflow = || Anomaly::incorrect("rtdb/type-size", "Logical type size exceeds usize").with_kind(crate::AnomalyKind::ProgramLimitExceeded);
         match self {
             Self::Scalar(ScalarType::Timestamp { timezone: Some(timezone), .. }) => bytes = bytes.checked_add(timezone.capacity()).ok_or_else(overflow)?,
             Self::List { element, .. } | Self::Maybe(element) | Self::RunEndEncoded { value: element, .. } => bytes = bytes.checked_add(element.retained_bytes()?).ok_or_else(overflow)?,

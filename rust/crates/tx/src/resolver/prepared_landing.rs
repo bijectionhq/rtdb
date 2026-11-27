@@ -28,7 +28,7 @@ fn invalid() -> Anomaly {
 }
 
 fn too_large() -> Anomaly {
-    Anomaly::incorrect("rtdb.owned/prepared-generation-bound", "Prepared Proposal generation exceeds its retained byte bound")
+    Anomaly::incorrect("rtdb.owned/prepared-generation-bound", "Prepared Proposal generation exceeds its retained byte bound").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded)
 }
 
 fn stale() -> Anomaly {

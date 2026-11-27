@@ -981,7 +981,7 @@ fn conflict() -> Anomaly {
 }
 
 fn too_large() -> Anomaly {
-    Anomaly::incorrect("rtdb.multi/assertion-family-size", "The assertion family exceeds its custody inventory limit")
+    Anomaly::incorrect("rtdb.multi/assertion-family-size", "The assertion family exceeds its custody inventory limit").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded)
 }
 
 fn contention() -> Anomaly {

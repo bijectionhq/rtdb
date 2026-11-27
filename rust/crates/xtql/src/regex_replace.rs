@@ -29,7 +29,7 @@ impl<'source> Walk<'_, 'source> {
         Ok(())
     }
 }
-fn size() -> Anomaly { Anomaly::incorrect("rtdb.plan/regex-metadata-size", "Regex metadata exceeds addressable memory") }
+fn size() -> Anomaly { Anomaly::incorrect("rtdb.plan/regex-metadata-size", "Regex metadata exceeds addressable memory").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded) }
 
 fn form(value: &Edn, allocation: FormAllocation<'_>) -> Result<RegexForm> {
     if matches!(value.kind, EdnKind::Nil) { return Ok(RegexForm::default()); }

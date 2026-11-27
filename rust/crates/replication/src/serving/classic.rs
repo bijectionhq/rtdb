@@ -49,7 +49,7 @@ pub(super) fn apply_live(index: &mut BranchIndex, position: u64, write: &StagedW
 
 fn read_event(batch: &EventBatch, row: usize, memory: &Arc<MemoryBudget>) -> Result<(StoredEvent, Arc<MemoryReservation>)> {
     let bytes = batch.borrow_event(row)?.document_allocation_bound()?.checked_add(512)
-        .ok_or_else(|| Anomaly::incorrect("rtdb/classic-projection-size", "Classic effect exceeds addressable memory"))?;
+        .ok_or_else(|| Anomaly::incorrect("rtdb/classic-projection-size", "Classic effect exceeds addressable memory").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded))?;
     let charge = memory.reserve(bytes)?;
     Ok((batch.read_event(row)?, charge))
 }

@@ -114,4 +114,4 @@ pub fn build_iids(iids: &[Iid], encoding: Option<RunEndWidth>) -> Result<ArrayRe
     Ok(make_array(data))
 }
 
-fn run_overflow() -> Anomaly { Anomaly::incorrect("rtdb/run-end-overflow", "IID array exceeds its run-end width") }
+fn run_overflow() -> Anomaly { Anomaly::incorrect("rtdb/run-end-overflow", "IID array exceeds its run-end width").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded) }

@@ -26,7 +26,7 @@ pub fn copy_evaluated_cells(
     mut bound: impl FnMut(usize) -> Result<usize>, mut read: impl FnMut(usize) -> Result<Value>,
 ) -> Result<(ArrayRef, Arc<crate::MemoryReservation>)> {
     const CELLS: usize = 128;
-    let overflow = || Anomaly::incorrect("rtdb/column-size", "Evaluated column exceeds addressable memory");
+    let overflow = || Anomaly::incorrect("rtdb/column-size", "Evaluated column exceeds addressable memory").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded);
     let _inventory = memory.reserve(rows.div_ceil(CELLS).checked_mul(128)
         .and_then(|size| size.checked_add(256)).ok_or_else(overflow)?)?;
     let mut arrays = Vec::with_capacity(rows.div_ceil(CELLS));
@@ -322,7 +322,7 @@ fn build_scalar(scalar: &ScalarType, values: &[impl Borrow<Value>], check_precis
         Time { unit, bit_width } => {
             if *bit_width == 32 {
                 let converted = values.iter().map(Borrow::borrow).map(|value| match value {
-                    Value::Time { value, .. } => i32::try_from(*value).map(Some).map_err(|_| Anomaly::incorrect("rtdb/time-overflow", "Time exceeds i32 representation")),
+                    Value::Time { value, .. } => i32::try_from(*value).map(Some).map_err(|_| Anomaly::incorrect("rtdb/time-overflow", "Time exceeds i32 representation").with_kind(rtdb_types::AnomalyKind::NumericValueOutOfRange)),
                     _ => Ok(None),
                 }).collect::<Result<Vec<_>>>()?;
                 match unit {
@@ -1203,7 +1203,7 @@ fn copy_numeric_components(values: &dyn Array) -> Result<ArrayRef> {
 fn downcast<T: 'static>(array: &dyn Array) -> Result<&T> { array.as_any().downcast_ref().ok_or_else(layout_error) }
 fn layout_error() -> Anomaly { Anomaly::incorrect("rtdb/array-layout", "Arrow array and logical field layout disagree") }
 fn decimal_width() -> Anomaly { Anomaly::incorrect("rtdb/decimal-width", "Decimal coefficient must fill its declared signed width").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded) }
-fn run_overflow() -> Anomaly { Anomaly::incorrect("rtdb/run-end-overflow", "Array length exceeds its run-end index width") }
+fn run_overflow() -> Anomaly { Anomaly::incorrect("rtdb/run-end-overflow", "Array length exceeds its run-end index width").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded) }
 
 #[cfg(test)]
 mod tests {

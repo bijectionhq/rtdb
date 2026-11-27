@@ -161,4 +161,4 @@ impl RegexReplacement {
 }
 
 fn metadata_error(message: &str) -> Anomaly { Anomaly::fault("xtdb.error/unknown",message) }
-fn size_error() -> Anomaly { Anomaly::incorrect("rtdb.plan/regex-metadata-size","Regex metadata exceeds addressable memory") }
+fn size_error() -> Anomaly { Anomaly::incorrect("rtdb.plan/regex-metadata-size","Regex metadata exceeds addressable memory").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded) }

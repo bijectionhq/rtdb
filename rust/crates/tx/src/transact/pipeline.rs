@@ -225,7 +225,7 @@ impl TransactPipeline {
                 bytes.len()
             };
             if charge > limit {
-                return Err(Anomaly::incorrect("rtdb/decision-clock-record-size", "The funded transaction exceeds the journal record limit"));
+                return Err(Anomaly::incorrect("rtdb/decision-clock-record-size", "The funded transaction exceeds the journal record limit").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded));
             }
         }
         let timed = tx.before.is_some();

@@ -118,7 +118,7 @@ impl ColumnQualifier {
             Self::Alias(alias) => &[alias],
             Self::ScopedAlias { alias, symbol } => &[alias, symbol],
         };
-        for part in parts { bytes = bytes.checked_add(part.capacity()).ok_or_else(|| Anomaly::incorrect("rtdb.plan/qualifier-size", "Column qualifier exceeds addressable memory"))?; }
+        for part in parts { bytes = bytes.checked_add(part.capacity()).ok_or_else(|| Anomaly::incorrect("rtdb.plan/qualifier-size", "Column qualifier exceeds addressable memory").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded))?; }
         Ok(bytes)
     }
 
@@ -247,7 +247,7 @@ enum Lookup {
 pub struct CatalogLookups(Vec<Lookup>);
 impl CatalogLookups {
     pub fn retained_bytes(&self) -> Result<usize> {
-        let overflow = || Anomaly::incorrect("rtdb.plan/catalog-size", "Catalog lookup storage exceeds addressable memory");
+        let overflow = || Anomaly::incorrect("rtdb.plan/catalog-size", "Catalog lookup storage exceeds addressable memory").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded);
         let name_bytes = |name: &QualifiedTable| name.database.capacity().saturating_add(name.table.schema.capacity()).saturating_add(name.table.table.capacity());
         let table_bytes = |table: &TableBinding| -> Result<usize> {
             let mut size = name_bytes(&table.name);

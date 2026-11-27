@@ -267,7 +267,7 @@ fn copy_nested_cells(arrays: &[&dyn Array], cells: Selection<'_>, padding: Paddi
 
 fn copy_runs<R: RunEndIndexType>(arrays: &[&dyn Array], cells: Selection<'_>, padding: Padding) -> Result<ArrayRef> {
     let end = |value| R::Native::from_usize(value).ok_or_else(|| {
-        Anomaly::incorrect("rtdb/run-end-selection-width", "Selected rows exceed the run-end width")
+        Anomaly::incorrect("rtdb/run-end-selection-width", "Selected rows exceed the run-end width").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded)
     });
     end(cells.len())?;
     let runs = arrays.iter().map(|array| {

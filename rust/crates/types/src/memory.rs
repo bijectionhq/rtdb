@@ -94,7 +94,7 @@ impl MemoryBudget {
     ) -> Result<Arc<MemoryReservation>> {
         let bytes = backing.len().checked_mul(std::mem::size_of::<Arc<MemoryReservation>>())
             .and_then(|slots| bytes.checked_add(slots))
-            .ok_or_else(|| Anomaly::incorrect("rtdb/reservation-size", "Combined reservation exceeds addressable memory"))?;
+            .ok_or_else(|| Anomaly::incorrect("rtdb/reservation-size", "Combined reservation exceeds addressable memory").with_kind(crate::AnomalyKind::ProgramLimitExceeded))?;
         self.admit(bytes).map_err(Refusal::into_anomaly)?;
         Ok(Arc::new(MemoryReservation { budget: Arc::clone(self), bytes, backing: backing.collect() }))
     }
@@ -213,7 +213,7 @@ impl MemoryReservation {
             return Err(Anomaly::incorrect("rtdb/reservation-backing", "Reservation depends on other allocations"));
         }
         let bytes = self.bytes.checked_add(other.bytes)
-            .ok_or_else(|| Anomaly::incorrect("rtdb/reservation-size", "Combined reservation exceeds addressable memory"))?;
+            .ok_or_else(|| Anomaly::incorrect("rtdb/reservation-size", "Combined reservation exceeds addressable memory").with_kind(crate::AnomalyKind::ProgramLimitExceeded))?;
         self.bytes = bytes;
         other.bytes = 0;
         Ok(())

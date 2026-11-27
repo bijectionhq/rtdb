@@ -205,7 +205,7 @@ fn complete_handle(id: &EntityId) -> Result<Vec<u8>> {
         return Err(Anomaly::incorrect(
             "rtdb.owned/purge-handle-bound",
             "The complete purge handle exceeds its bound",
-        ));
+        ).with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded));
     }
     Ok(id.handle_bytes())
 }

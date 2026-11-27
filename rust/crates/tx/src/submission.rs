@@ -524,7 +524,7 @@ fn patch_bound_value(expression: &rtdb_plan::Expr, fallback: Timestamp, context:
     if matches!(value, Value::Null | Value::Undefined) { Ok(None) }
     else { rtdb_expr::query_clock_instant(&value, context.timezone)?.as_micros().map(Some) }
 }
-fn overflow() -> Anomaly { Anomaly::incorrect("rtdb.tx/allocation-overflow", "Static transaction allocation exceeds address space") }
+fn overflow() -> Anomaly { Anomaly::incorrect("rtdb.tx/allocation-overflow", "Static transaction allocation exceeds address space").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded) }
 
 #[cfg(test)]
 mod tests {

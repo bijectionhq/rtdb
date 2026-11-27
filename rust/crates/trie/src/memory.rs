@@ -150,7 +150,7 @@ impl MemoryHashTrie {
     /// Reader errors propagate.
     /// Validation stops with `rtdb/trie-root-path` at the first IID outside this root's path.
     pub fn add_range<R: IidReader + ?Sized>(&self, reader: &R, start: u32, count: u32) -> Result<Self> {
-        let end = start.checked_add(count).ok_or_else(|| Anomaly::incorrect("rtdb/trie-row-overflow", "Trie row range exceeds u32"))?;
+        let end = start.checked_add(count).ok_or_else(|| Anomaly::incorrect("rtdb/trie-row-overflow", "Trie row range exceeds u32").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded))?;
         self.add_rows(reader, start..end)
     }
 
@@ -211,7 +211,7 @@ fn insert_rows<R: IidReader + ?Sized>(
             Ok(Arc::new(TrieNode::Branch { path: path.clone(), children: next }))
         }
         TrieNode::Leaf(leaf) => {
-            let count = leaf.log.len().checked_add(rows.len()).ok_or_else(|| Anomaly::incorrect("rtdb/trie-size", "Trie pending row count overflow"))?;
+            let count = leaf.log.len().checked_add(rows.len()).ok_or_else(|| Anomaly::incorrect("rtdb/trie-size", "Trie pending row count overflow").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded))?;
             if count <= config.log_limit {
                 let mut log = leaf.log.to_vec();
                 log.extend(rows);

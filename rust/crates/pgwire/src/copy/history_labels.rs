@@ -123,7 +123,7 @@ fn dictionary_bound() -> Anomaly {
     Anomaly::incorrect(
         "rtdb.pgwire/history-label-bound",
         "History label dictionary exceeds its bound",
-    )
+    ).with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded)
 }
 
 fn label_id(spelling: &str) -> [u8; 16] {

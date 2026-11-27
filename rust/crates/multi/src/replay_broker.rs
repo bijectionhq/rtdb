@@ -1513,7 +1513,7 @@ fn fork_events_key(authority: Uuid, child: Uuid, digest: [u8; 32]) -> Result<Obj
 
 fn check_length(length: usize) -> Result<()> {
     if length == 0 || length > MAX_BODY {
-        return Err(Anomaly::incorrect("rtdb.multi/replay-broker-size", "The detached replay body exceeds the broker's allocation bound"));
+        return Err(Anomaly::incorrect("rtdb.multi/replay-broker-size", "The detached replay body exceeds the broker's allocation bound").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded));
     }
     Ok(())
 }

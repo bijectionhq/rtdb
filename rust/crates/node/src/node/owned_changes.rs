@@ -752,7 +752,7 @@ impl OwnedReadSession {
                         return Err(Anomaly::incorrect(
                             "rtdb.owned/merged-change-commit-size",
                             "A visible commit exceeds the merged change page budget",
-                        ));
+                        ).with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded));
                     }
                     page.stop_before(publication)?;
                     guarded.check_cancelled()?;

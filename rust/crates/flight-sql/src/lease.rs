@@ -15,7 +15,7 @@ pub(crate) struct Registry<K, V> { entries: Mutex<BTreeMap<K, Entry<V>>>, live: 
 impl<K: Ord + Clone, V: Leased> Registry<K, V> {
     pub fn new(clock: Arc<dyn Clock>, memory: Arc<MemoryBudget>) -> Self { Self { entries: Mutex::new(BTreeMap::new()), live: Default::default(), clock, memory } }
     pub fn insert(&self, key: K, value: Arc<V>, idle: Duration, first: Duration, acquired: bool, key_bytes: usize) -> Result<()> {
-        let reservation = self.memory.reserve(key_bytes.checked_add(256).ok_or_else(|| Anomaly::incorrect("rtdb.flight-sql/lease-size", "Lease identity exceeds addressable memory"))?)?;
+        let reservation = self.memory.reserve(key_bytes.checked_add(256).ok_or_else(|| Anomaly::incorrect("rtdb.flight-sql/lease-size", "Lease identity exceeds addressable memory").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded))?)?;
         let mut entries = self.entries.lock().expect("lease lock");
         if entries.contains_key(&key) { return Err(Anomaly::fault("rtdb.flight-sql/duplicate-handle", "Generated Flight handle already exists")); }
         entries.insert(key, Entry::Live(Live { value, since: self.clock.now(), limit: first, idle, users: usize::from(acquired), _reservation: reservation }));

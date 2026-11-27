@@ -351,7 +351,7 @@ impl ListValue {
     }
 
     pub fn retained_payload_bytes(&self) -> Result<usize> {
-        let overflow = || Anomaly::incorrect("rtdb/value-size-overflow", "Retained value memory exceeds usize");
+        let overflow = || Anomaly::incorrect("rtdb/value-size-overflow", "Retained value memory exceeds usize").with_kind(crate::AnomalyKind::ProgramLimitExceeded);
         match &self.0 {
             Storage::Values(values) => {
                 let inline = values.capacity().checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?;

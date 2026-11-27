@@ -263,4 +263,4 @@ impl Value {
     pub fn is_null(&self) -> bool { matches!(self, Self::Null) }
 }
 
-fn size_overflow() -> Anomaly { Anomaly::incorrect("rtdb/value-size-overflow", "Retained value memory exceeds usize") }
+fn size_overflow() -> Anomaly { Anomaly::incorrect("rtdb/value-size-overflow", "Retained value memory exceeds usize").with_kind(crate::AnomalyKind::ProgramLimitExceeded) }

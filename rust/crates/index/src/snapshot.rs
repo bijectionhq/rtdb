@@ -125,7 +125,7 @@ impl Snapshot {
     pub fn system_time_cap(&self) -> Option<Timestamp> { self.system_time_cap }
     /// Bounds a clone's owned overlay map, table names and segment references; immutable index buffers stay shared.
     pub fn clone_allocation_bound(&self) -> Result<usize> {
-        let overflow = || Anomaly::incorrect("rtdb.index/snapshot-size", "Snapshot clone metadata exceeds addressable memory");
+        let overflow = || Anomaly::incorrect("rtdb.index/snapshot-size", "Snapshot clone metadata exceeds addressable memory").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded);
         self.layered.iter().try_fold(std::mem::size_of::<Self>(), |bytes, (table, segments)| {
             bytes.checked_add(table.schema.len()).and_then(|bytes| bytes.checked_add(table.table.len()))
                 .and_then(|bytes| segments.len().checked_mul(std::mem::size_of::<Arc<LiveTable>>()).and_then(|segments| bytes.checked_add(segments)))
@@ -309,7 +309,7 @@ fn schema_sources_bound<'a>(
     database: &str,
     sources: impl Iterator<Item = (&'a TableRef, &'a StructFields<LogicalType>)>,
 ) -> Result<usize> {
-    let overflow = || Anomaly::incorrect("rtdb.index/schema-size", "Schema allocation bound exceeds addressable memory");
+    let overflow = || Anomaly::incorrect("rtdb.index/schema-size", "Schema allocation bound exceeds addressable memory").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded);
     let mut bytes = 4096usize;
     for (table, types) in sources {
         bytes = bytes.checked_add(database.len()).and_then(|n| n.checked_add(table.schema.len()))
