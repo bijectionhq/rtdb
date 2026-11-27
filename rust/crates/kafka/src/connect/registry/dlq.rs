@@ -184,20 +184,33 @@ impl DlqProducer {
                 Err((cause, _)) => return Err(error("dlq", cause)),
             }
         }
-        if self.settings.auto_flush { self.drain().await; }
+        if self.settings.auto_flush { self.drain().await?; }
         Ok(())
     }
     fn poll(&self) {
         self.producer.poll(Duration::ZERO);
         self.producer.context().release_completed();
     }
-    pub async fn drain(&mut self) {
+    pub async fn drain(&mut self) -> Result<()> {
+        let deadline = Instant::now().checked_add(self.settings.delivery_timeout);
         while self.producer.in_flight_count() != 0 {
             let _ = self.producer.flush(Duration::ZERO);
             self.poll();
-            if self.producer.in_flight_count() != 0 { tokio::time::sleep(Duration::from_millis(10)).await; }
+            if self.producer.in_flight_count() == 0 {
+                break;
+            }
+            let Some(remaining) = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now())) else {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            };
+            if remaining.is_zero() {
+                self.producer.context().release_completed();
+                return Err(error("dlq", "Dead-letter producer delivery timed out while draining"));
+            }
+            tokio::time::sleep(Duration::from_millis(10).min(remaining)).await;
         }
         self.producer.context().release_completed();
+        Ok(())
     }
 }
 fn varint_length(value: usize) -> Result<usize> {
@@ -354,9 +367,34 @@ mod cancellation_tests {
         assert!(producer.producer.in_flight_count() > 0);
         drop(context); assert!(memory.used_bytes() > 0);
         cluster.broker_up(1).unwrap();
-        tokio::time::timeout(Duration::from_secs(10), producer.drain()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), producer.drain()).await.unwrap().unwrap();
         assert_eq!(producer.producer.in_flight_count(), 0);
         drop(producer); assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn auto_flush_drain_terminates_at_delivery_timeout_when_broker_is_down() {
+        let cluster = MockCluster::new(1).unwrap(); cluster.create_topic("failures", 1, 1).unwrap();
+        let options = BTreeMap::from([
+            ("bootstrap.servers".into(), cluster.bootstrap_servers()),
+            ("buffer.memory".into(), (1 << 20).to_string()),
+            ("dlq.auto.flush".into(), "true".into()),
+            ("linger.ms".into(), "0".into()),
+            ("request.timeout.ms".into(), "50".into()),
+            ("delivery.timeout.ms".into(), "100".into()),
+        ]);
+        let rule = DlqRule { name: Some("guard".into()), executor: "missing".into(), mode: Mode::Read, subject: "events-value".into(), topic: Some("failures".into()), action: Arc::new(DlqAction { name: "_default_".into(), options: options.clone() }) };
+        let memory = MemoryBudget::new(1 << 26);
+        let mut context = ConversionContext::new(Arc::clone(&memory));
+        let mut producer = DlqProducer::open(&options, &mut context).unwrap();
+        cluster.broker_down(1).unwrap();
+        let record = Record::new(&rule, "failures", "events", false, Original::Framed, &[0, 0, 0, 0, 7, 14], &mut context).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), producer.send(record, &mut context)).await
+            .expect("drain must stop at delivery.timeout.ms rather than spin forever");
+        assert!(result.is_err());
+        drop(context);
+        drop(producer);
+        assert_eq!(memory.used_bytes(), 0);
     }
 }
 

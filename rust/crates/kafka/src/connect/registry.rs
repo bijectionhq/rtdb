@@ -467,9 +467,14 @@ impl Converter for RegistryConverter {
         result
     }
     async fn close(&mut self) -> Result<()> {
-        for producer in self.dlq.values_mut() { producer.drain().await; }
+        let mut first_error = None;
+        for producer in self.dlq.values_mut() {
+            if let Err(error) = producer.drain().await && first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
         self.dlq.clear();
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 }
 impl RegistryConverter {

@@ -6,6 +6,7 @@ use super::{error, overflow};
 pub(super) struct Settings {
     pub properties: BTreeMap<String, String>,
     pub maximum_block: Duration,
+    pub delivery_timeout: Duration,
     pub maximum_record_bytes: usize,
     pub auto_flush: bool,
     buffer_bytes: usize,
@@ -101,7 +102,16 @@ impl Settings {
             properties.insert(native.into(), value.clone());
         }
         let properties = crate::native_properties(&properties)?;
-        Ok(Self { properties, maximum_block, maximum_record_bytes: buffer_bytes.min(maximum_request), auto_flush: options.get("dlq.auto.flush").is_some_and(|value| value.eq_ignore_ascii_case("true")), buffer_bytes, key_serializer, value_serializer })
+        Ok(Self {
+            properties,
+            maximum_block,
+            delivery_timeout: Duration::from_millis(delivery_timeout),
+            maximum_record_bytes: buffer_bytes.min(maximum_request),
+            auto_flush: options.get("dlq.auto.flush").is_some_and(|value| value.eq_ignore_ascii_case("true")),
+            buffer_bytes,
+            key_serializer,
+            value_serializer,
+        })
     }
     pub fn validate_bytes(&self, key: Option<&[u8]>, value: Option<&[u8]>) -> Result<()> {
         if !self.key_serializer.accepts(key) || !self.value_serializer.accepts(value) { return Err(error("dlq", "Configured producer serializer cannot accept the original byte array")); }
