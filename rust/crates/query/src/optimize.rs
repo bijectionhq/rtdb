@@ -722,7 +722,7 @@ fn select_at(input: Arc<Relation>, predicate: Expr) -> Result<Arc<Relation>> {
 }
 
 fn reorderable_join(relation: &Relation) -> bool {
-    matches!(relation.node(), RelationNode::Join { kind: JoinKind::Inner | JoinKind::Cross, condition }
+    matches!(relation.node(), RelationNode::Join { kind: JoinKind::Inner | JoinKind::Cross, condition, .. }
         if !condition.as_ref().is_some_and(Expr::is_volatile))
 }
 
