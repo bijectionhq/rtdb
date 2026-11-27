@@ -1599,6 +1599,77 @@ async fn extended_control_errors_preserve_coordinates_and_the_registered_stateme
 }
 
 #[tokio::test]
+async fn simple_query_and_extended_parse_reject_non_xtdb_control_forms() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    assert_eq!(tags(&client.query("SET TIME ZONE 'Europe/Paris'").await), b"SCZ");
+
+    client.parse("control", "SHOW TIME ZONE", &[]).await;
+    client.send(b'S', &[]).await;
+    assert_eq!(tags(&client.through(b'Z').await), b"1Z");
+
+    for sql in [
+        "BEGIN WORK",
+        "COMMIT WORK",
+        "ROLLBACK AND NO CHAIN",
+        "BEGIN READ ONLY,",
+        "SET TIME ZONE = 'UTC'",
+        "SET LOCAL foo = 'bar'",
+        "SHOW a b c",
+    ] {
+        let simple = client.query(sql).await;
+        assert_eq!(tags(&simple), b"EZ", "{sql}");
+        assert_eq!(error_fields(&simple[0].1).0, "08P01", "{sql}");
+        assert_eq!(simple[1].1, b"I", "{sql}");
+
+        client.parse("control", sql, &[]).await;
+        client.bind("control", "control").await;
+        client.send(b'S', &[]).await;
+        let extended = client.through(b'Z').await;
+        assert_eq!(tags(&extended), b"EZ", "{sql}");
+        assert_eq!(error_fields(&extended[0].1).0, "08P01", "{sql}");
+        assert_eq!(extended[1].1, b"I", "{sql}");
+    }
+
+    client.bind("control", "control").await;
+    client.execute("control", 0).await;
+    client.send(b'S', &[]).await;
+    let frames = client.through(b'Z').await;
+    assert_eq!(tags(&frames), b"2DCZ");
+    assert_eq!(rows(&frames), [vec![Some(b"Europe/Paris".to_vec())]]);
+    drop(client);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn invalid_set_time_zone_reports_the_reference_state_in_both_protocol_modes() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    assert_eq!(tags(&client.query("SET TIME ZONE 'Europe/Paris'").await), b"SCZ");
+
+    let sql = "SET TIME ZONE 'Mars/Olympus'";
+    let simple = client.query(sql).await;
+    assert_eq!(tags(&simple), b"EZ");
+    let (state, message, detail) = error_fields(&simple[0].1);
+    assert_eq!(state, "XX000");
+    assert_eq!(message, "Unknown time-zone ID: Mars/Olympus");
+    assert_eq!(detail["code"], "xtdb/invalid-timezone");
+    assert_eq!(simple[1].1, b"I");
+
+    client.parse("bad_zone", sql, &[]).await;
+    client.bind("bad_zone", "bad_zone").await;
+    client.execute("bad_zone", 0).await;
+    client.send(b'S', &[]).await;
+    let extended = client.through(b'Z').await;
+    assert_eq!(tags(&extended), b"12EZ");
+    assert_eq!(error_fields(&extended[2].1), (state, message, detail));
+    assert_eq!(extended[3].1, b"I");
+    assert_eq!(rows(&client.query("SHOW TIME ZONE").await), [vec![Some(b"Europe/Paris".to_vec())]]);
+    drop(client);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn extended_prepare_rejects_nested_grammar_before_acknowledgment_and_keeps_the_registration() {
     let running = Running::start(ServerConfig::default(), None).await;
     let mut client = Client::connect(&running.server, None).await;
