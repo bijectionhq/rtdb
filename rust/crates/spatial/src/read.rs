@@ -289,8 +289,8 @@ pub async fn require_path_ready(
 ) -> Result<()> {
     let refused = || Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/spatial-not-ready",
         "The spatial path changed or lacks coverage at the ordered cut");
-    let definition = definition::held_definition(Arc::clone(&context), owner, relation, path).await
-        .map_err(|error| if error.code == "rtdb.owned/spatial-path" { refused() } else { error })?;
+    let definition = definition::find_held_definition(Arc::clone(&context), owner, relation, path).await?
+        .ok_or_else(refused)?;
     if columns.split_first().is_none_or(|(geometry, partition)| {
         geometry != &definition.geometry || partition != definition.partition.as_slice()
     }) || definition.encoding != encoding || !definition_ready(context, &definition).await? {
@@ -1348,5 +1348,15 @@ mod tests {
         assert_eq!(payloads.value(0), b"a");
         assert_eq!(payloads.value(1), b"b");
         Ok(())
+    }
+
+    #[test]
+    fn posting_read_error_preserves_read_lease_expiry_and_access_denials_without_marking_corrupt() {
+        let expired = posting_read_error(rtdb_storage::Error::ReadLeaseExpired { deadline: Some(10), now: 20 });
+        assert_eq!(expired.code, "rtdb.storage/read-lease-expired");
+        let erased = posting_read_error(rtdb_storage::Error::ErasedUnderView);
+        assert_eq!(erased.code, "rtdb/erased-under-view");
+        let missing = posting_read_error(rtdb_storage::Error::MissingObject("p".into()));
+        assert_eq!(missing.code, postings::CORRUPT);
     }
 }

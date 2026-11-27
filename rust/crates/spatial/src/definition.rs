@@ -108,31 +108,39 @@ pub(crate) async fn committed_native_definition(
         && definition.name.strip_suffix("~native") == Some(name)))
 }
 
+pub(crate) async fn find_held_definition(
+    context: Arc<QueryContext>,
+    owner: &str,
+    relation: &OwnedRelation,
+    path: &OwnedRelation,
+) -> Result<Option<Definition>> {
+    let catalog = OwnedRelation::spatial_catalog(owner);
+    let Some(cursor) = rtdb_query::open_owned_path_catalog(Arc::clone(&context), &catalog, Some(path.name())).await? else {
+        return Ok(None);
+    };
+    let (definition, duplicate) = select(cursor, Some(&catalog), &context.memory).await?;
+    let Some(definition) = definition else { return Ok(None); };
+    if duplicate
+        || definition.name != path.name()
+        || definition.table != relation.table(owner)
+    {
+        return Ok(None);
+    }
+    Ok(Some(definition))
+}
+
 pub(crate) async fn held_definition(
     context: Arc<QueryContext>,
     owner: &str,
     relation: &OwnedRelation,
     path: &OwnedRelation,
 ) -> Result<Definition> {
-    let catalog = OwnedRelation::spatial_catalog(owner);
-    let absent = || {
+    find_held_definition(context, owner, relation, path).await?.ok_or_else(|| {
         Anomaly::incorrect(
             "rtdb.owned/spatial-path",
             "Owned relation has no such spatial path at the held cut",
         )
-    };
-    let cursor = rtdb_query::open_owned_path_catalog(Arc::clone(&context), &catalog, Some(path.name()))
-        .await?
-        .ok_or_else(absent)?;
-    let (definition, duplicate) = select(cursor, Some(&catalog), &context.memory).await?;
-    let definition = definition.ok_or_else(absent)?;
-    if duplicate
-        || definition.name != path.name()
-        || definition.table != relation.table(owner)
-    {
-        return Err(absent());
-    }
-    Ok(definition)
+    })
 }
 
 pub fn path_geometry_encoding(cell: Option<ArrowCell<'_>>) -> Result<SpatialGeometryEncoding> {
