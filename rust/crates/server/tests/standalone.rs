@@ -3,14 +3,22 @@ use std::{
     io::Write,
     path::Path,
     process::{Child, Command, ExitStatus, Stdio},
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
 
 use serde_json::Value;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_postgres::{Client, NoTls, SimpleQueryMessage, config::SslMode};
+use tokio_rustls::{
+    TlsConnector,
+    rustls::{self, pki_types::ServerName},
+};
 
 const UUID: &str = "01234567-89ab-4def-8000-000000000001";
 const NAME: &str = "team.dev";
+const PASSWORD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const TIMEOUT: Duration = Duration::from_secs(20);
 
 fn command(operation: &str, state: &Path, id: &str) -> Command {
@@ -127,7 +135,7 @@ fn standalone_reopens_the_exact_private_authority_and_drains_on_parent_eof() {
             &session.path().join("key.pem"),
             &fs::read(fixture.join("xtdb.example.com.key")).unwrap(),
         );
-        private_file(&session.path().join("password"), "a".repeat(64).as_bytes());
+        private_file(&session.path().join("password"), PASSWORD.as_bytes());
 
         let mut child = Process(launch(state.path(), session.path(), UUID).spawn().unwrap());
         let ready_file = session.path().join("ready.json");
@@ -186,4 +194,167 @@ fn standalone_refuses_classic_state_during_initialization_and_open() {
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("explicit migration and cutover"));
     assert_eq!(fs::read(&authority).unwrap(), br#"{"format":2}"#);
     assert_eq!(fs::read_dir(state.path()).unwrap().count(), 1);
+}
+
+fn sql_identity(session: &Path) -> rustls::ClientConfig {
+    let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    private_file(
+        &session.join("certificate.pem"),
+        identity.cert.pem().as_bytes(),
+    );
+    private_file(
+        &session.join("key.pem"),
+        identity.signing_key.serialize_pem().as_bytes(),
+    );
+    private_file(&session.join("password"), PASSWORD.as_bytes());
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(identity.cert.der().clone()).unwrap();
+    rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth()
+}
+
+async fn sql_client(port: u16, tls: rustls::ClientConfig) -> Client {
+    let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    tcp.write_all(&[0, 0, 0, 8, 4, 210, 22, 47]).await.unwrap();
+    assert_eq!(tcp.read_u8().await.unwrap(), b'S');
+    let socket = TlsConnector::from(Arc::new(tls))
+        .connect(ServerName::try_from("localhost").unwrap(), tcp)
+        .await
+        .unwrap();
+    let (client, connection) = tokio_postgres::Config::new()
+        .user("xtdb")
+        .password(PASSWORD)
+        .dbname(NAME)
+        .ssl_mode(SslMode::Disable)
+        .connect_raw(socket, NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+    client
+}
+
+async fn rows(client: &Client, sql: &str) -> Vec<Vec<String>> {
+    client
+        .simple_query(sql)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => Some(
+                (0..row.len())
+                    .map(|column| row.get(column).unwrap().to_owned())
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standalone_single_journal_recovers_a_multi_table_commit_after_kill() {
+    let state = private_dir();
+    assert!(
+        command("initialize-standalone", state.path(), UUID)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let authority: Value =
+        serde_json::from_slice(&fs::read(state.path().join("native-authority.json")).unwrap())
+            .unwrap();
+    assert_eq!(authority["format"], 2);
+    assert!(authority.get("source_lineage").is_none());
+    assert!(state.path().join("journal/REPLICA_LOG").is_file());
+    assert!(!state.path().join("journal/LOG").exists());
+
+    let current = "SELECT o.total, i.quantity FROM orders o JOIN inventory i ON o._id = i._id";
+    for reopening in [false, true] {
+        let session = private_dir();
+        let tls = sql_identity(session.path());
+        let mut child = Process(launch(state.path(), session.path(), UUID).spawn().unwrap());
+        let ready = child.ready(&session.path().join("ready.json"));
+        let port = ready["port"].as_u64().unwrap().try_into().unwrap();
+        tokio::time::timeout(TIMEOUT, async {
+            let client = sql_client(port, tls).await;
+            if reopening {
+                assert_eq!(rows(&client, current).await, vec![vec!["42", "7"]]);
+                client.batch_execute("UPDATE orders SET total = total + 1 WHERE _id = 1").await.unwrap();
+                assert_eq!(rows(&client, current).await, vec![vec!["43", "7"]]);
+            } else {
+                client.batch_execute(
+                    "BEGIN READ WRITE;                      INSERT INTO orders (_id, total) VALUES (1, 42);                      INSERT INTO inventory (_id, quantity) VALUES (1, 7); COMMIT",
+                ).await.unwrap();
+                assert_eq!(rows(&client, current).await, vec![vec!["42", "7"]]);
+                let error = client.batch_execute(
+                    "BEGIN READ WRITE; UPDATE orders SET total = 99 WHERE _id = 1; COMMIT ASYNC",
+                ).await.unwrap_err();
+                assert_eq!(error.code(), Some(&tokio_postgres::error::SqlState::FEATURE_NOT_SUPPORTED));
+            }
+        }).await.unwrap();
+        assert!(!state.path().join("journal/LOG").exists());
+        if reopening {
+            drop(child.0.stdin.take().unwrap());
+            assert!(child.exit().success());
+        } else {
+            child.0.kill().unwrap();
+            assert!(!child.0.wait().unwrap().success());
+            OpenOptions::new()
+                .append(true)
+                .open(state.path().join("journal/REPLICA_LOG"))
+                .unwrap()
+                .write_all(&[0x1e, 0, 0])
+                .unwrap();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standalone_classic_journals_keep_durable_async_submission() {
+    let state = private_dir();
+    assert!(
+        command("initialize-standalone", state.path(), UUID)
+            .arg("--classic-journals")
+            .status()
+            .unwrap()
+            .success()
+    );
+    let authority: Value =
+        serde_json::from_slice(&fs::read(state.path().join("native-authority.json")).unwrap())
+            .unwrap();
+    assert_eq!(authority["format"], 1);
+    assert!(authority["source_lineage"].is_string());
+    assert!(state.path().join("journal/LOG").is_file());
+
+    let session = private_dir();
+    let tls = sql_identity(session.path());
+    let mut child = Process(launch(state.path(), session.path(), UUID).spawn().unwrap());
+    let port = child.ready(&session.path().join("ready.json"))["port"]
+        .as_u64()
+        .unwrap()
+        .try_into()
+        .unwrap();
+    tokio::time::timeout(TIMEOUT, async {
+        let client = sql_client(port, tls).await;
+        client
+            .batch_execute(
+                "BEGIN READ WRITE; INSERT INTO orders (_id, total) VALUES (1, 42); COMMIT ASYNC",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows(&client, "SELECT total FROM orders").await,
+            vec![vec!["42"]]
+        );
+    })
+    .await
+    .unwrap();
+    drop(child.0.stdin.take().unwrap());
+    assert!(child.exit().success());
 }

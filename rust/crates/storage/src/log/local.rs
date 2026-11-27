@@ -339,6 +339,54 @@ impl LocalLog {
         Self::open_journal(path.as_ref(), options, timestamps, reads, keys, true, apple_sync)
     }
 
+    /// Removes a structurally incomplete final append from the original single-journal file.
+    pub fn recover_incomplete_replica_tail(path: &Path, lineage: Uuid, maximum: usize, apple_sync: AppleSync) -> Result<()> {
+        let maximum = physical_maximum(maximum, false)?;
+        let mut file = JournalFile::lock(path, false, apple_sync)?;
+        if file.lineage() != Some(lineage) {
+            return Err(corrupt(path, 0, "replica journal lineage changed before tail recovery"));
+        }
+        file.cached_lineage(path)?;
+        let length = file.records_len().map_err(|error| Error::io(path, error))?;
+        if length >= 1 << 48 { return Err(corrupt(path, length, "local log exceeds the 48-bit offset space")); }
+        let mut offset = 0;
+        while offset < length {
+            file.seek(SeekFrom::Start(offset)).map_err(|error| Error::io(path, error))?;
+            let mut bytes = [0; HEADER_BYTES as usize];
+            let available = (length - offset).min(HEADER_BYTES) as usize;
+            file.read_exact(&mut bytes[..available]).map_err(|error| Error::io(path, error))?;
+            if !matches!(bytes[0], RECORD_SEPARATOR | RETIRED_SEPARATOR) {
+                return Err(corrupt(path, offset, "invalid single-journal record separator"));
+            }
+            if available < bytes.len() {
+                if bytes[0] != RECORD_SEPARATOR {
+                    return Err(corrupt(path, offset, "incomplete retired journal frame"));
+                }
+                break;
+            }
+            let header = decode_record_header(&bytes, path, maximum, offset)?;
+            if header.end() > length {
+                if header.retired { return Err(corrupt(path, offset, "incomplete retired journal frame")); }
+                if length - offset >= HEADER_BYTES + TRAILER_BYTES {
+                    let mut trailer = [0; TRAILER_BYTES as usize];
+                    file.seek(SeekFrom::Start(length - TRAILER_BYTES)).map_err(|error| Error::io(path, error))?;
+                    file.read_exact(&mut trailer).map_err(|error| Error::io(path, error))?;
+                    if i64::from_be_bytes(trailer) == header.metadata.offset.0 {
+                        return Err(corrupt(path, offset, "final frame has a complete trailer with an inconsistent length"));
+                    }
+                }
+                break;
+            }
+            inspect_record_body(&mut file, path, header)?;
+            offset = header.end();
+        }
+        if offset < length {
+            file.truncate_records(offset).map_err(|error| Error::io(path, error))?;
+            file.sync().map_err(|error| Error::io(path, error))?;
+        }
+        Ok(())
+    }
+
     /// The durability policy used for local filesystem syncs on Apple platforms.
     pub fn apple_sync(&self) -> AppleSync { self.apple_sync }
 
@@ -1229,6 +1277,42 @@ mod tests {
         let records = reopened.read_range(committed.offset, metadata[1].offset).await?;
         assert_eq!(records.iter().map(|record| record.payload.as_ref()).collect::<Vec<_>>(),
             [b"acknowledged".as_slice(), b"complete".as_slice()]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn single_journal_tail_recovery_truncates_only_an_incomplete_final_frame() -> Result<()> {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("REPLICA_LOG");
+        let options = || LocalLogOptions { maximum_message_bytes: 1024, queue_capacity: 3 };
+        let (log, mut driver) = LocalLog::open_replica(&path, options(), Arc::new(SuppliedTimestamp), IoRegion::new(), None)?;
+        let lineage = log.journal_lineage().unwrap();
+        let record = |payload: &'static [u8], time| Queued {
+            payload: Bytes::from_static(payload), timestamp: Timestamp(time), durable: oneshot::channel().0,
+        };
+        let frames = driver.writer.append(&[record(b"committed", 1), record(b"partial", 2)])?;
+        let final_offset = frames[1].metadata.offset.0 as u64;
+        driver.writer.file.truncate_records(final_offset + HEADER_BYTES + 2)
+            .map_err(|error| Error::io(&path, error))?;
+        drop(driver);
+        drop(log);
+        let incomplete = fs::read(&path).unwrap();
+        let wrong = Uuid::new_v4();
+        assert!(LocalLog::recover_incomplete_replica_tail(&path, wrong, 1024, AppleSync::Full).is_err());
+        assert_eq!(fs::read(&path).unwrap(), incomplete);
+        LocalLog::recover_incomplete_replica_tail(&path, lineage, 1024, AppleSync::Full)?;
+        let (reopened, mut driver) = LocalLog::open(&path, options())?;
+        let records = reopened.read_range(LogOffset(0), LogOffset(final_offset as i64)).await?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].payload.as_ref(), b"committed");
+        let next = driver.writer.append(&[record(b"complete", 3)])?[0];
+        driver.writer.file.seek(SeekFrom::Start(next.end() - 1)).unwrap();
+        driver.writer.file.write_all(&[0xff]).unwrap();
+        drop(driver);
+        drop(reopened);
+        let corrupt = fs::read(&path).unwrap();
+        assert!(LocalLog::recover_incomplete_replica_tail(&path, lineage, 1024, AppleSync::Full).is_err());
+        assert_eq!(fs::read(&path).unwrap(), corrupt);
         Ok(())
     }
 

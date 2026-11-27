@@ -40,7 +40,8 @@ use crate::{
 };
 
 pub const PROTOCOL: u32 = 3;
-const FORMAT: u32 = 1;
+const CLASSIC_FORMAT: u32 = 1;
+const SINGLE_JOURNAL_FORMAT: u32 = 2;
 const AUTHORITY: &str = "native-authority.json";
 const LOGS: &str = "journal";
 const SOURCE: &str = "LOG";
@@ -74,10 +75,36 @@ struct Authority {
     format: u32,
     database: String,
     installation: Uuid,
-    source_lineage: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_lineage: Option<Uuid>,
     replica_lineage: Uuid,
     token_witness: Claim,
     checkpoint_witness: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+enum JournalMode {
+    Classic,
+    Single,
+}
+
+impl JournalMode {
+    fn format(self) -> u32 {
+        match self {
+            Self::Classic => CLASSIC_FORMAT,
+            Self::Single => SINGLE_JOURNAL_FORMAT,
+        }
+    }
+}
+
+impl Authority {
+    fn journal_mode(&self) -> Result<JournalMode> {
+        match (self.format, self.source_lineage) {
+            (CLASSIC_FORMAT, Some(_)) => Ok(JournalMode::Classic),
+            (SINGLE_JOURNAL_FORMAT, None) => Ok(JournalMode::Single),
+            _ => Err(invalid("Invalid native standalone journal authority")),
+        }
+    }
 }
 
 impl Target {
@@ -127,8 +154,10 @@ impl Target {
         Ok(config)
     }
 
-    fn resources(&self, tokens: FileKms, checkpoints: Arc<FileKms>, apple_sync: AppleSync) -> NativeResources {
-        NativeResources::default()
+    fn resources(
+        &self, tokens: FileKms, checkpoints: Arc<FileKms>, apple_sync: AppleSync, journal_mode: JournalMode,
+    ) -> NativeResources {
+        let resources = NativeResources::default()
             .with_apple_sync(apple_sync)
             .with_token_kms(Arc::new(tokens))
             .with_native_serving_authority(
@@ -140,7 +169,11 @@ impl Target {
                         generation: CHECKPOINT_GENERATION,
                     }),
                 },
-            )
+            );
+        match journal_mode {
+            JournalMode::Classic => resources,
+            JournalMode::Single => resources.with_single_journal(),
+        }
     }
 
     fn generation(&self, number: u64) -> Generation {
@@ -174,6 +207,14 @@ pub async fn initialize(target: Target) -> Result<()> {
 }
 
 pub async fn initialize_with_sync(target: Target, apple_sync: AppleSync) -> Result<()> {
+    initialize_journal_mode(target, apple_sync, JournalMode::Single).await
+}
+
+pub async fn initialize_classic_with_sync(target: Target, apple_sync: AppleSync) -> Result<()> {
+    initialize_journal_mode(target, apple_sync, JournalMode::Classic).await
+}
+
+async fn initialize_journal_mode(target: Target, apple_sync: AppleSync, journal_mode: JournalMode) -> Result<()> {
     target.validate()?;
     private_directory(&target.state)?;
     if fs::read_dir(&target.state)
@@ -198,10 +239,13 @@ pub async fn initialize_with_sync(target: Target, apple_sync: AppleSync) -> Resu
             .map_err(io_error)?;
     }
 
-    let source_lineage = initialize_journal(&target.state.join(LOGS).join(SOURCE), apple_sync).await?;
+    let source_lineage = match journal_mode {
+        JournalMode::Classic => Some(initialize_journal(&target.state.join(LOGS).join(SOURCE), apple_sync).await?),
+        JournalMode::Single => None,
+    };
     let replica_lineage = initialize_journal(&target.state.join(LOGS).join(REPLICA), apple_sync).await?;
     let (tokens, checkpoints) = open_keys(&target.state)?;
-    let resources = target.resources(tokens, Arc::clone(&checkpoints), apple_sync);
+    let resources = target.resources(tokens, Arc::clone(&checkpoints), apple_sync, journal_mode);
     let (handle, driver) =
         ServerDriver::open_installed(config, ALLOCATION_LIMIT, resources, None).await?;
     let witness = async {
@@ -218,13 +262,13 @@ pub async fn initialize_with_sync(target: Target, apple_sync: AppleSync) -> Resu
         .wrap(
             target.generation(CHECKPOINT_GENERATION),
             &target.checkpoint_challenge(),
-            checkpoint_context(&target).as_bytes(),
+            checkpoint_context(&target, journal_mode).as_bytes(),
         )
         .await?;
     publish_json(
         &target.state.join(AUTHORITY),
         &Authority {
-            format: FORMAT,
+            format: journal_mode.format(),
             database: target.name,
             installation: target.id,
             source_lineage,
@@ -259,33 +303,16 @@ pub async fn serve_with_sync(launch: Launch, apple_sync: AppleSync, stop: Cancel
     let authority: Authority =
         serde_json::from_slice(&read_bounded(file.try_clone().map_err(io_error)?, 4096)?)
             .map_err(|_| invalid("Invalid native standalone authority record"))?;
-    if authority.format != FORMAT
-        || authority.database != target.name
-        || authority.installation != target.id
-    {
+    if authority.database != target.name || authority.installation != target.id {
         return Err(invalid(
             "Native standalone authority belongs to another installation",
         ));
     }
 
+    let journal_mode = authority.journal_mode()?;
     for name in [LOGS, OBJECTS, TOKEN_KEYS, CHECKPOINT_KEYS] {
         private_directory(&target.state.join(name))?;
     }
-    for (name, lineage) in [
-        (SOURCE, authority.source_lineage),
-        (REPLICA, authority.replica_lineage),
-    ] {
-        let path = target.state.join(LOGS).join(name);
-        if !fs::symlink_metadata(&path).map_err(io_error)?.is_file()
-            || ReadOnlyLocalLog::open(&path, ReadOnlyLocalLogOptions::default())?.journal_lineage()
-                != Some(lineage)
-        {
-            return Err(invalid(
-                "The original standalone journal lineage is missing",
-            ));
-        }
-    }
-
     private_directory(parent(&launch.ready_file))?;
     match launch.ready_file.symlink_metadata() {
         Err(error) if error.kind() == io::ErrorKind::NotFound => (),
@@ -298,13 +325,22 @@ pub async fn serve_with_sync(launch: Launch, apple_sync: AppleSync, stop: Cancel
         .unwrap(
             target.generation(CHECKPOINT_GENERATION),
             &authority.checkpoint_witness,
-            checkpoint_context(target).as_bytes(),
+            checkpoint_context(target, journal_mode).as_bytes(),
         )
         .await?;
     if *checkpoint != *target.checkpoint_challenge() {
         return Err(invalid(
             "The original standalone checkpoint authority is missing",
         ));
+    }
+
+    let replica = target.state.join(LOGS).join(REPLICA);
+    match journal_mode {
+        JournalMode::Classic => verify_journal(&replica, authority.replica_lineage)?,
+        JournalMode::Single => verify_single_journal(&replica, authority.replica_lineage, apple_sync)?,
+    }
+    if let Some(lineage) = authority.source_lineage {
+        verify_journal(&target.state.join(LOGS).join(SOURCE), lineage)?;
     }
 
     let password = Zeroizing::new(read_bounded(private_input(&launch.password_file)?, 64)?);
@@ -344,7 +380,7 @@ pub async fn serve_with_sync(launch: Launch, apple_sync: AppleSync, stop: Cancel
     let (handle, driver) = ServerDriver::open_installed(
         config,
         ALLOCATION_LIMIT,
-        target.resources(tokens, checkpoints, apple_sync),
+        target.resources(tokens, checkpoints, apple_sync, journal_mode),
         Some(tls),
     )
     .await?;
@@ -504,14 +540,42 @@ async fn initialize_journal(path: &Path, apple_sync: AppleSync) -> Result<Uuid> 
         .ok_or_else(|| invalid("Native standalone journal did not persist its lineage"))
 }
 
+fn verify_journal(path: &Path, lineage: Uuid) -> Result<()> {
+    if !fs::symlink_metadata(path).map_err(io_error)?.is_file()
+        || ReadOnlyLocalLog::open(path, ReadOnlyLocalLogOptions::default())?.journal_lineage() != Some(lineage)
+    {
+        return Err(invalid("The original standalone journal lineage is missing"));
+    }
+    Ok(())
+}
+
+fn verify_single_journal(path: &Path, lineage: Uuid, apple_sync: AppleSync) -> Result<()> {
+    if !fs::symlink_metadata(path).map_err(io_error)?.is_file() {
+        return Err(invalid("The original standalone journal lineage is missing"));
+    }
+    let options = ReadOnlyLocalLogOptions::default();
+    match ReadOnlyLocalLog::open(path, options.clone()) {
+        Ok(log) if log.journal_lineage() == Some(lineage) => Ok(()),
+        Ok(_) => Err(invalid("The original standalone journal lineage is missing")),
+        Err(rtdb_storage::Error::CorruptLog { .. }) => {
+            rtdb_storage::log::LocalLog::recover_incomplete_replica_tail(path, lineage, options.maximum_message_bytes, apple_sync)?;
+            verify_journal(path, lineage)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn open_keys(root: &Path) -> Result<(FileKms, Arc<FileKms>)> {
     let tokens = FileKms::open(&root.join(TOKEN_KEYS), || SystemClock.now().0)?;
     let checkpoints = FileKms::open(&root.join(CHECKPOINT_KEYS), || SystemClock.now().0)?;
     Ok((tokens, Arc::new(checkpoints)))
 }
 
-fn checkpoint_context(target: &Target) -> String {
-    format!("rtdb/installed-local/{}:{}", target.id, target.name)
+fn checkpoint_context(target: &Target, journal_mode: JournalMode) -> String {
+    match journal_mode {
+        JournalMode::Classic => format!("rtdb/installed-local/{}:{}", target.id, target.name),
+        JournalMode::Single => format!("rtdb/installed-local/single-journal/{}:{}", target.id, target.name),
+    }
 }
 
 fn tls(certificate: &Path, key: &Path) -> Result<Arc<rustls::ServerConfig>> {

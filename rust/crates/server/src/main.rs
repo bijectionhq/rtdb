@@ -103,7 +103,13 @@ async fn run() -> Result<()> {
             println!("{result}");
             Ok(())
         }
-        Command::InitializeStandalone(target) => rtdb_server::standalone::initialize_with_sync(target, apple_sync).await,
+        Command::InitializeStandalone { target, classic_journals } => {
+            if classic_journals {
+                rtdb_server::standalone::initialize_classic_with_sync(target, apple_sync).await
+            } else {
+                rtdb_server::standalone::initialize_with_sync(target, apple_sync).await
+            }
+        },
         Command::Standalone(launch) => run_standalone(launch, apple_sync).await,
         Command::HashPassword { bcrypt, password } => { println!("{}", cli::hash_password(bcrypt, password, &mut std::io::stdin().lock())?); Ok(()) }
         Command::Inspect { kind, path, allocation_limit_bytes } => rtdb_server::inspect::file(kind, &path, &rtdb_columnar::MemoryBudget::new(allocation_limit_bytes), &mut std::io::stdout().lock()),

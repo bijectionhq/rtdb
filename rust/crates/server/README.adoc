@@ -58,7 +58,11 @@ The loader selects a usable signing algorithm from the available identities; cer
 `rtdb initialize-standalone --state STAGE --name NAME --id UUID` installs one Default Local database in an empty private staging directory.
 Supply the original database name and a canonical nonzero UUID chosen by the caller.
 Publish the staging directory as the installation authority only after the command succeeds.
-Keep the whole authority together, including `native-authority.json`, `journal/LOG`, `journal/REPLICA_LOG`, `objects/`, `token-keys/` and `checkpoint-keys/`.
+Fresh installations write synchronous transaction outcomes to `journal/REPLICA_LOG` and hold pending requests in memory.
+Use `--classic-journals` at initialization when clients need the durable handoff contract of `COMMIT ASYNC`.
+The selected journal mode is part of the installation authority.
+Keep the whole authority together, including `native-authority.json`, `journal/REPLICA_LOG`, `objects/`, `token-keys/` and `checkpoint-keys/`.
+Classic-mode installations also retain `journal/LOG`.
 
 `rtdb standalone --state AUTHORITY --name NAME --id UUID --certificate PEM --private-key PEM --password-file FILE --ready-file FILE --parent-stdin` reopens that authority and serves PostgreSQL and native Flight on distinct ephemeral IPv4 loopback ports.
 Supply a certificate valid for `127.0.0.1`, its matching PEM key, and a private file containing a 64-digit hexadecimal password for `xtdb`.
