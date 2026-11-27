@@ -2064,3 +2064,37 @@ async fn keyed_writes_resolve_the_same_whether_their_plans_are_reused_or_planned
     }
     assert!(committed > 300 && rows > 250, "the statements must mostly commit and write: {committed} committed, {rows} rows");
 }
+
+#[tokio::test]
+async fn empty_delete_docs_skips_valid_time_validation_while_still_forbidding_system_tables() {
+    let context = context();
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+
+    let empty = TxOp::DeleteDocs {
+        table: table(),
+        ids: EntityIds::new(vec![], &context.memory).unwrap(),
+        valid_from: Some(Timestamp(200)),
+        valid_to: Some(Timestamp(100)),
+    };
+    let resolved = resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), request(vec![empty], &context), &context).await.unwrap();
+    assert!(resolved.result().committed(), "empty DeleteDocs should be a no-op before valid-time validation: {:?}", resolved.result().error());
+
+    let forbidden = TxOp::DeleteDocs {
+        table: TableRef::new("xt", "txs"),
+        ids: EntityIds::new(vec![], &context.memory).unwrap(),
+        valid_from: None,
+        valid_to: None,
+    };
+    let resolved = resolver.resolve_source(state.value().snapshot(), SourcePosition(1), Timestamp(101), request(vec![forbidden], &context), &context).await.unwrap();
+    assert!(!resolved.result().committed(), "forbidden tables must still be rejected even when ids are empty");
+
+    let non_empty_inverted = TxOp::DeleteDocs {
+        table: table(),
+        ids: EntityIds::new(vec![rtdb_types::EntityId::Integer(1)], &context.memory).unwrap(),
+        valid_from: Some(Timestamp(200)),
+        valid_to: Some(Timestamp(100)),
+    };
+    let resolved = resolver.resolve_source(state.value().snapshot(), SourcePosition(2), Timestamp(102), request(vec![non_empty_inverted], &context), &context).await.unwrap();
+    assert!(!resolved.result().committed(), "non-empty DeleteDocs with inverted valid time must abort");
+}

@@ -215,9 +215,17 @@ impl OpenTransaction<'_> {
 }
 
 /// Whether `error` is one an argument row's own values raise, rather than an unsupported feature, cancellation,
-/// exhaustion or a fault.
+/// exhaustion, limit or a fault.
 fn raised_by_a_row(error: &Anomaly) -> bool {
-    error.category == AnomalyCategory::Incorrect && error.kind != Some(AnomalyKind::ResourceExhausted)
+    error.category == AnomalyCategory::Incorrect
+        && !matches!(
+            error.kind,
+            Some(
+                AnomalyKind::ResourceExhausted
+                    | AnomalyKind::ConfigurationLimitExceeded
+                    | AnomalyKind::ProgramLimitExceeded
+            )
+        )
 }
 
 fn argument_put_document(batch: &RecordBatch) -> Option<&StructArray> {
@@ -309,6 +317,11 @@ mod tests {
         let mut exhausted = Anomaly::incorrect("rtdb/memory-budget-exceeded", "no room");
         exhausted.kind = Some(AnomalyKind::ResourceExhausted);
         assert!(!raised_by_a_row(&exhausted));
+        for kind in [AnomalyKind::ConfigurationLimitExceeded, AnomalyKind::ProgramLimitExceeded] {
+            let mut limited = Anomaly::incorrect("rtdb.test/limit", "limit exceeded");
+            limited.kind = Some(kind);
+            assert!(!raised_by_a_row(&limited));
+        }
         assert!(!raised_by_a_row(&Anomaly::new(AnomalyCategory::Interrupted, "rtdb/cancelled", "cancelled")));
         assert!(!raised_by_a_row(&Anomaly::fault("rtdb.tx/mutation-schema", "bad schema")));
     }

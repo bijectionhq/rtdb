@@ -1110,8 +1110,10 @@ impl<'a> OpenTransaction<'a> {
             Mutation::Erase { table, input } => (Some(table), input, MutationKind::Erase),
             Mutation::Assert { input, message } => {
                 let mut cursor = execute(input, context, arguments, syntax).await?;
-                if cursor.next_batch().await?.is_none() { return Err(footprint_grant_state::assert_failed(message.unwrap_or_else(|| "Assert failed".into()))); }
-                return Ok(());
+                while let Some(batch) = cursor.next_batch().await? {
+                    if batch.batch().num_rows() > 0 { return Ok(()); }
+                }
+                return Err(footprint_grant_state::assert_failed(message.unwrap_or_else(|| "Assert failed".into())));
             }
             Mutation::CreateTable { table, columns } => {
                 let table = table.table;
@@ -1442,6 +1444,7 @@ impl<'a> OpenTransaction<'a> {
             Operation::PutIids { table, documents, iids, valid_from, valid_to } => self.put_documents(table, documents, Some(iids), *valid_from, *valid_to, DocumentWrite::Put).await,
             Operation::Public(TxOp::DeleteDocs { table, ids, valid_from, valid_to }) => {
                 check_table(table)?;
+                if ids.ids().is_empty() { return Ok(()); }
                 let interval = interval(valid_from.unwrap_or(self.tx_key().system_time), valid_to.unwrap_or(Timestamp::MAX))?;
                 for id in ids.ids() { self.buffer.delete(table.clone(), id, interval)?; }
                 Ok(())
