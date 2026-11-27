@@ -223,7 +223,21 @@ pub async fn read_manifest(
     id: ObjectId,
 ) -> Result<VerifiedManifest> {
     require_kind(id, ObjectKind::Manifest)?;
-    let plaintext = read(store, kms, id).await?;
+    decode_manifest(id, read(store, kms, id).await?)
+}
+
+/// Reopens the immutable manifest directly from its backing store.
+pub async fn read_fresh_manifest(
+    store: &dyn ObjectStore,
+    kms: &dyn Kms,
+    id: ObjectId,
+) -> Result<VerifiedManifest> {
+    require_kind(id, ObjectKind::Manifest)?;
+    let bytes = store.get_fresh(&key(id)?).await?;
+    decode_manifest(id, open(kms, id, &bytes).await?)
+}
+
+fn decode_manifest(id: ObjectId, plaintext: Plaintext) -> Result<VerifiedManifest> {
     Ok(VerifiedManifest {
         id,
         generation: plaintext.generation,

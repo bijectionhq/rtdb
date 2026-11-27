@@ -366,7 +366,7 @@ Keep source key custody available independently until a restore is admitted; ret
 The destination checkpoint records the source coordinates and archive digest so the committed installation can be read back after restart.
 Each captured file is sealed under a fresh destination object identity.
 The committed destination checkpoint retains the source-to-destination file index and the new file identities through subsequent checkpoints.
-Opening the installation proof verifies the index and each relocated file using the destination's custody.
+Opening the installation proof rereads the selected replay checkpoint from its backing store and verifies the index and each relocated file using the destination's custody.
 Recovered ordinary receipts use the new incarnation's basis, and the archive retains the original receipts.
 The commands work with the local development journal and the optional loopback Logkeeper connections configured with `--journal-url` and `--tls-dir`.
 For a version 4 immutable stream, pass `--immutable-streams` to export, restore, and activation publication.

@@ -1192,6 +1192,7 @@ async fn append_custody_fixture(database: &mut MultiDatabase, request: &Transact
 #[tokio::test]
 async fn portable_backup_restores_a_fresh_stream_without_source_data() {
     use rtdb_crypt::FileKms;
+    use rtdb_store::LocalStore;
 
     let source_vault = tempfile::tempdir().unwrap();
     let destination_vault = tempfile::tempdir().unwrap();
@@ -1238,7 +1239,7 @@ async fn portable_backup_restores_a_fresh_stream_without_source_data() {
     let destination = Uuid::from_u128(999);
     let destination_time = Arc::new(AtomicI64::new(10));
     let journal = journals().await;
-    let store = Arc::new(MemoryStore::default());
+    let store = Arc::new(LocalStore::open(destination_vault.path().join("objects")).unwrap());
     let open = |node, handle| {
         let clock = Arc::clone(&destination_time);
         MultiDatabase::new(options(destination, node), Arc::new(journal.handle(handle)),
@@ -1260,7 +1261,7 @@ async fn portable_backup_restores_a_fresh_stream_without_source_data() {
     let new = successor.transact(&put(4, 2, "new history")).await.unwrap();
     assert!(new.basis > install.destination_basis());
     destination_time.store(new.system_time.0, Ordering::SeqCst);
-    successor.checkpoint(Vec::new()).await.unwrap();
+    let checkpoint = successor.checkpoint(Vec::new()).await.unwrap();
     drop(successor);
     drop(source_keys);
     drop(source_vault);
@@ -1268,6 +1269,16 @@ async fn portable_backup_restores_a_fresh_stream_without_source_data() {
     assert_eq!(reopened.installed_backup().await.unwrap(), Some(install));
     assert_eq!(reopened.tx_status(&request.key).await.unwrap(), restored);
     assert_eq!(text_at(&mut reopened, MAIN_BRANCH, 2).await, Some(Value::Utf8("new history".into())));
+
+    let key = ObjectKey::new(checkpoint.to_string()).unwrap();
+    let ciphertext = store.get_fresh(&key).await.unwrap();
+    store.delete(&key).await.unwrap();
+    assert!(reopened.installed_backup().await.is_err());
+    store.put(&key, Bytes::from(vec![0; ciphertext.len()])).await.unwrap();
+    assert_eq!(reopened.installed_backup().await.unwrap_err().code, "rtdb.store/object-digest");
+    store.delete(&key).await.unwrap();
+    store.put(&key, ciphertext).await.unwrap();
+    assert_eq!(reopened.installed_backup().await.unwrap(), Some(install));
 }
 
 #[tokio::test]

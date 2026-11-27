@@ -4,7 +4,7 @@ use journal_contract::Lsn;
 use rtdb_crypt::{Context, Generation, Kms};
 use rtdb_format::journal::{Checkpoint, Manifest, ObjectId, Record};
 use rtdb_index::branches::BranchCut;
-use rtdb_store::{ObjectStore, read_file_bounded};
+use rtdb_store::{ObjectStore, read_file_bounded, read_fresh_manifest};
 use rtdb_tx::transact::{Receipt, TransactState};
 use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::Basis};
 use sha2::{Digest, Sha256};
@@ -297,13 +297,25 @@ impl MultiDatabase {
 
     async fn verify_installed_files(&self) -> Result<Vec<BackupFileRelocation>> {
         let state = self.state();
+        if self.applied_backup().is_none() {
+            return Ok(Vec::new());
+        }
+        let checkpoint = state.base.as_ref().map(|base| &base.checkpoint)
+            .or_else(|| state.records.iter().find_map(|record| match record {
+                Record::Checkpoint(checkpoint) if checkpoint.restore => Some(checkpoint),
+                _ => None,
+            }))
+            .ok_or_else(invalid_backup)?;
+        let manifest = read_fresh_manifest(self.store.as_ref(), self.stream.kms.as_ref(), checkpoint.manifest).await?;
+        if manifest.generation.number != checkpoint.key_generation {
+            return Err(invalid_backup());
+        }
         let Some((index_id, relocations)) = read_relocation_index(
             &self.stream, self.store.as_ref(), state.coordinates.origin,
         ).await? else {
             return Ok(Vec::new());
         };
-        let closure = state.reachability(&self.stream, self.store.as_ref(), state.epoch).await?;
-        if relocation_ids(index_id, &relocations).any(|id| !closure.contains(id)) {
+        if relocation_ids(index_id, &relocations).any(|id| !manifest.contents().files.contains(&id)) {
             return Err(invalid_backup());
         }
         for relocation in &relocations {
