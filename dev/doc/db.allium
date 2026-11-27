@@ -2622,7 +2622,8 @@ surface QueryAccess {
         -- A RANGE_BINS projection over compatible period, date or timestamp bounds can write one Arrow list column of bin endpoints and weights per input page, with stride and origin read from admitted columns or bindings.
         -- A null period or a period with an unbounded upper endpoint produces a null list.
         -- Range binning validates the stride and casts the bounds and origin in scalar order for each reached non-null set of arguments.
-        -- A period projection can cast compatible date and timestamp endpoints to zoned microseconds and write them directly to Arrow.
+        -- A period projection can read compatible date and timestamp endpoints and timestamp casts and write their zoned microseconds directly to Arrow.
+        -- The period projection evaluates explicit endpoint expressions in scalar order before converting their results to the period's endpoint unit.
         -- A null endpoint denotes the corresponding infinity in that projection.
         -- An inverted or empty period fails with the period constructor's validation error.
         -- A DATE_TRUNC projection with a literal field and compatible date or timestamp input can write Arrow cells in the input unit and retain the timestamp's zone label.

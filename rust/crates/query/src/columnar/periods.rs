@@ -8,7 +8,7 @@ use rtdb_expr::kernels::{RangeBins, validate_period_bounds};
 use rtdb_plan::{Expr, Schema};
 use rtdb_types::{ListKind, LogicalType, Result, ScalarType, TimeUnit, Value};
 
-use super::{Column, ColumnBatch, calendar::{BinStride, CalendarInput, CalendarType}, float_vector::nonnull, owned_projection_bytes, size_error};
+use super::{Column, ColumnBatch, calendar::{BinStride, CalendarCell, CalendarInput, CalendarOperand, CalendarType}, float_vector::nonnull, owned_projection_bytes, size_error};
 use crate::{QueryContext, parameters::BoundParameters};
 
 pub(crate) fn is_zoned_micros(ty: &LogicalType) -> bool {
@@ -45,12 +45,12 @@ pub(crate) fn timestamp_ticks(column: &Column, row: usize) -> Option<Option<i64>
 
 enum PeriodEndpoint<'a> {
     Open,
-    Calendar(CalendarInput<'a>),
+    Calendar(CalendarOperand<'a>),
     MicrosColumn(&'a Column),
 }
 
 impl<'a> PeriodEndpoint<'a> {
-    fn bind(expr: &'a Expr, schema: &'a Schema, batch: &'a ColumnBatch, params: &'a BoundParameters) -> Option<Self> {
+    fn bind(expr: &'a Expr, schema: &'a Schema, batch: &'a ColumnBatch, params: &'a BoundParameters, timezone: &'a str) -> Option<Self> {
         if let Expr::Column { id, .. } = expr {
             let position = schema.position(*id)?;
             let ty = &schema.fields()[position].data_type;
@@ -69,15 +69,15 @@ impl<'a> PeriodEndpoint<'a> {
                 };
                 null.then_some(Self::Open)
             }
-            _ => CalendarInput::bind(expr, schema, batch, params).map(Self::Calendar),
+            _ => CalendarOperand::bind(expr, schema, batch, params, timezone).map(Self::Calendar),
         }
     }
 
-    fn ticks(&self, row: usize) -> Option<Option<i64>> {
+    fn prepare(&self, row: usize, timezone: &str) -> Result<Option<Option<CalendarCell<'a>>>> {
         match self {
-            Self::Open => Some(None),
-            Self::Calendar(input) => input.ticks(row),
-            Self::MicrosColumn(column) => timestamp_ticks(column, row),
+            Self::Open => Ok(Some(None)),
+            Self::Calendar(input) => input.prepare(row, timezone),
+            Self::MicrosColumn(column) => Ok(timestamp_ticks(column, row).map(|ticks| ticks.map(CalendarCell::Ticks))),
         }
     }
 
@@ -90,24 +90,45 @@ impl<'a> PeriodEndpoint<'a> {
     }
 }
 
+struct PeriodBounds<'a> {
+    lower: PeriodEndpoint<'a>,
+    upper: PeriodEndpoint<'a>,
+}
+
+impl<'a> PeriodBounds<'a> {
+    fn bind(expr: &'a Expr, schema: &'a Schema, batch: &'a ColumnBatch, params: &'a BoundParameters, timezone: &'a str) -> Option<Self> {
+        let Expr::Call { name, args, return_type } = expr else { return None; };
+        if name != "period" || !is_period(return_type) { return None; }
+        let [lower, upper] = args.as_slice() else { return None; };
+        Some(Self {
+            lower: PeriodEndpoint::bind(lower, schema, batch, params, timezone)?,
+            upper: PeriodEndpoint::bind(upper, schema, batch, params, timezone)?,
+        })
+    }
+
+    fn read(&self, row: usize, timezone: &str) -> Result<Option<(i64, i64)>> {
+        let Some(lower) = self.lower.prepare(row, timezone)? else { return Ok(None); };
+        let Some(upper) = self.upper.prepare(row, timezone)? else { return Ok(None); };
+        let lower = lower.map(|cell| cell.demand(timezone)).transpose()?;
+        let upper = upper.map(|cell| cell.demand(timezone)).transpose()?;
+        let from = self.lower.micros(lower, i64::MIN, timezone)?;
+        let to = self.upper.micros(upper, i64::MAX, timezone)?;
+        validate_period_bounds(from, to)?;
+        Ok(Some((from, to)))
+    }
+}
+
 pub(super) fn construct(expr: &Expr, schema: &Schema, batch: &ColumnBatch, params: &BoundParameters, context: &QueryContext)
     -> Result<Option<(Column, Arc<MemoryReservation>)>>
 {
-    let Expr::Call { name, args, return_type } = expr else { return Ok(None); };
-    if name != "period" || !is_period(return_type) { return Ok(None); }
-    let [lower, upper] = args.as_slice() else { return Ok(None); };
-    let (Some(lower), Some(upper)) = (PeriodEndpoint::bind(lower, schema, batch, params), PeriodEndpoint::bind(upper, schema, batch, params))
-        else { return Ok(None); };
+    let Some(bounds) = PeriodBounds::bind(expr, schema, batch, params, &context.timezone) else { return Ok(None); };
     let length = batch.len.checked_mul(2).ok_or_else(size_error)?;
     let bytes = length.checked_mul(size_of::<i64>()).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size_error)?;
     let mut owner = context.memory.reserve(bytes)?;
     let mut endpoints = Vec::with_capacity(length);
     for row in 0..batch.len {
         context.check_cancelled_at(row)?;
-        let (Some(from), Some(to)) = (lower.ticks(row), upper.ticks(row)) else { return Ok(None); };
-        let from = lower.micros(from, i64::MIN, &context.timezone)?;
-        let to = upper.micros(to, i64::MAX, &context.timezone)?;
-        validate_period_bounds(from, to)?;
+        let Some((from, to)) = bounds.read(row, &context.timezone)? else { return Ok(None); };
         endpoints.extend([from, to]);
     }
     let logical = Value::TimestampTzRange { lower: i64::MIN, upper: i64::MAX }.logical_type();
@@ -363,12 +384,12 @@ mod tests {
     use std::sync::Arc;
 
     use rtdb_columnar::MemoryBudget;
-    use rtdb_plan::{ColumnId, Expr, Field, Schema, function_type_with_args};
+    use rtdb_plan::{CastTarget, CastTimezone, ColumnId, Expr, Field, Schema, TemporalCast, TemporalKind, function_type_with_args};
     use rtdb_storage::{MemoryStore, cache::BufferPool};
     use rtdb_types::{CivilDate, LogicalType, Result, TimeUnit, Timestamp, Value};
     use tokio_util::sync::CancellationToken;
 
-    use super::{Column, ColumnBatch, bounds, construct, range_bins};
+    use super::{Column, ColumnBatch, bounds, construct, owned_projection_bytes, range_bins};
     use crate::{QueryContext, parameters::BoundParameters};
 
     fn context(timezone: &str) -> Arc<QueryContext> {
@@ -386,6 +407,12 @@ mod tests {
 
     fn timestamp(value: i64, unit: TimeUnit, zone: Option<&str>) -> Value {
         Value::Timestamp { value, unit, timezone: zone.map(str::to_owned) }
+    }
+
+    fn zoned_cast(expr: Expr, unit: TimeUnit, zone: &str) -> Expr {
+        Expr::Cast { expr: Box::new(expr), target: CastTarget::Temporal(TemporalCast {
+            kind: TemporalKind::TimestampZone(CastTimezone::Explicit(zone.into())), unit, precision: Some(6),
+        }) }
     }
 
     fn interval(months: i32, days: i32, nanoseconds: i64) -> Value {
@@ -456,6 +483,54 @@ mod tests {
             assert_eq!(error.code, expected.code);
             assert_eq!(error.context, expected.context);
         }
+    }
+
+    #[test]
+    fn period_composes_timestamp_casts_across_a_gap_and_preserves_open_bounds() {
+        let ctx = context("America/New_York");
+        let ty = timestamp(0, TimeUnit::Microsecond, None).logical_type().maybe();
+        let from = field(0, ty.clone());
+        let to = field(1, ty);
+        let schema = Schema::new(vec![from.clone(), to.clone()]).unwrap();
+        let lower = timestamp(1_615_685_400_000_017, TimeUnit::Microsecond, None);
+        let upper = timestamp(1_615_689_000_000_123, TimeUnit::Microsecond, None);
+        let input = [vec![lower.clone(), Value::Null, lower], vec![upper.clone(), upper, Value::Null]];
+        let period = call("period", vec![
+            zoned_cast(from.expression(), TimeUnit::Microsecond, "Europe/Paris"),
+            zoned_cast(to.expression(), TimeUnit::Microsecond, "Asia/Tokyo"),
+        ]);
+        let params = BoundParameters::infer(vec![], &ctx.memory).unwrap();
+        let page = batch(&schema, &input, &ctx);
+        let baseline = ctx.memory.used_bytes();
+        let (output, owner) = construct(&period, &schema, &page, &params, &ctx).unwrap().unwrap();
+        let expected = [(1_615_703_400_000_017, 1_615_707_000_000_123), (i64::MIN, 1_615_707_000_000_123),
+            (1_615_703_400_000_017, i64::MAX)];
+        for (row, expected) in expected.into_iter().enumerate() {
+            assert_eq!(bounds(&output, row), Some(Some(expected)));
+            assert_eq!(output.value(row).unwrap(), scalar(&period, &schema, &input, row, &params, &ctx).unwrap());
+        }
+        assert!(owner.bytes() >= owned_projection_bytes(&output).unwrap());
+        drop(output);
+        drop(owner);
+        assert_eq!(ctx.memory.used_bytes(), baseline);
+    }
+
+    #[test]
+    fn period_demands_the_upper_explicit_cast_before_the_lower_implicit_cast() {
+        let ctx = context("America/New_York");
+        let lower = timestamp(i64::MAX, TimeUnit::Second, Some("UTC"));
+        let upper = timestamp(i64::MAX, TimeUnit::Second, None);
+        let from = field(0, lower.logical_type());
+        let to = field(1, upper.logical_type());
+        let schema = Schema::new(vec![from.clone(), to.clone()]).unwrap();
+        let period = call("period", vec![from.expression(), zoned_cast(to.expression(), TimeUnit::Second, "UTC")]);
+        let params = BoundParameters::infer(vec![], &ctx.memory).unwrap();
+        let input = [vec![lower], vec![upper]];
+        let page = batch(&schema, &input, &ctx);
+        let error = construct(&period, &schema, &page, &params, &ctx).err().unwrap();
+        let oracle = scalar(&period, &schema, &input, 0, &params, &ctx).unwrap_err();
+        assert_eq!(error.code, "xtdb/time-overflow");
+        assert_eq!((error.code, error.message, error.context), (oracle.code, oracle.message, oracle.context));
     }
 
     #[test]
