@@ -362,10 +362,8 @@ fn expand_plan(plan: &StaticMutation, args: Option<&SqlArguments>, options: &Sub
         };
         if let Some(operations) = projected? { return Ok(Some(operations)); }
     }
-    let parameter_rows: Box<dyn Iterator<Item = Result<BoundArgumentRow<'_>>> + '_> = match args {
-        Some(args) => Box::new(args.indexed_bound_rows().map(|row| row.map(|(_, row)| row))),
-        None => Box::new(std::iter::once(Ok(BoundArgumentRow::Values { values: &[], types: None }))),
-    };
+    let parameter_rows = args.into_iter().flat_map(SqlArguments::indexed_bound_rows_with_source_types)
+        .chain(args.is_none().then_some(Ok((0, BoundArgumentRow::Values { values: &[], types: None }, None))));
     let mut groups: Vec<((Option<Timestamp>, Option<Timestamp>), Vec<ArrowDocuments>)> = Vec::new();
     let mut group_of: BTreeMap<(Option<Timestamp>, Option<Timestamp>), usize> = Default::default();
     let mut inventory = memory.reserve(4096)?;
@@ -416,9 +414,11 @@ fn expand_plan(plan: &StaticMutation, args: Option<&SqlArguments>, options: &Sub
         let row_scope = scope.scratch();
         let arrow;
         let values;
-        let binding = parameters?;
-        let input = match &binding {
-            BoundArgumentRow::Arrow { batch, row, .. } => Some((batch.batch(), *row)),
+        let (_, binding, source_types) = parameters?;
+        let input = match binding {
+            BoundArgumentRow::Arrow { batch, row, .. } => Some(StaticArrowRow {
+                batch: batch.batch(), row, types: source_types.expect("An Arrow row has source types"),
+            }),
             BoundArgumentRow::Values { .. } => None,
         };
         let parameters = match binding {
@@ -681,8 +681,40 @@ fn infer_document_decimals(value: &mut Value) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct StaticArrowRow<'a> { batch: &'a RecordBatch, row: usize, types: &'a [LogicalType] }
+
+impl<'a> StaticArrowRow<'a> {
+    fn argument(self, index: usize) -> Option<(ArrowCell<'a>, &'a LogicalType)> {
+        let field = self.batch.schema_ref().fields().get(index)?;
+        let array = self.batch.columns().get(index)?.as_ref();
+        Some((ArrowCell { field, array, row: self.row }, self.types.get(index)?))
+    }
+
+    fn position(self, expr: &Expr) -> Option<(ArrowCell<'a>, &'a LogicalType)> {
+        match expr {
+            Expr::Parameter { index, .. } => self.argument(*index),
+            Expr::Field { expr, name, .. } => {
+                let (record, declared) = self.position(expr)?;
+                if !record_field(record.field) { return None; }
+                let declared = match declared { LogicalType::Maybe(inner) => inner.as_ref(), ty => ty };
+                let LogicalType::Struct(fields) = declared else { return None; };
+                let cell = record.structure()?.filter(|child| child.field.name() == name).last()?;
+                Some((cell, fields.get(name)?))
+            }
+            _ => None,
+        }
+    }
+}
+
+fn record_field(field: &arrow_schema::Field) -> bool {
+    plain_scalar_field(field) || canonical_float_field(field)
+        || rtdb_columnar::decimal_field_parameters(field).is_ok_and(|decimal| decimal.is_some())
+        || matches!(field.data_type(), DataType::Struct(fields) if field.metadata().is_empty() && fields.iter().all(|field| record_field(field)))
+}
+
 fn materialize<'a>(
-    input: &Relation, binding: Option<(&'a RecordBatch, usize)>, context: &EvalContext<'_>,
+    input: &Relation, binding: Option<StaticArrowRow<'a>>, context: &EvalContext<'_>,
     emit: &mut dyn FnMut(Vec<DocumentCell<'a>>) -> Result<()>,
 ) -> Result<()> {
     match input.node() {
@@ -731,20 +763,15 @@ fn materialize<'a>(
 }
 
 fn project_static_cell<'a>(
-    expr: &Expr, binding: Option<(&'a RecordBatch, usize)>, schema: &Schema, context: &EvalContext<'_>,
+    expr: &Expr, binding: Option<StaticArrowRow<'a>>, schema: &Schema, context: &EvalContext<'_>,
 ) -> Result<DocumentCell<'a>> {
-    let Some((batch, row)) = binding else {
+    let Some(binding) = binding else {
         return evaluate(expr, schema, &[], context).map(|value| DocumentCell::Value(Cow::Owned(value)));
     };
-    let arrow = |index: usize| Some(ArrowCell {
-        field: batch.schema_ref().fields().get(index)?,
-        array: batch.columns().get(index)?.as_ref(),
-        row,
-    });
     let expr = if let Expr::Field { expr: record, name, .. } = expr
         && let Expr::Struct(fields) = record.as_ref()
         && fields.iter().all(|(_, expr)| match expr {
-            Expr::Parameter { index, .. } => arrow(*index).is_some_and(|cell| {
+            Expr::Parameter { index, .. } => binding.argument(*index).is_some_and(|(cell, _)| {
                 plain_scalar_field(cell.field) || canonical_float_field(cell.field)
                     || rtdb_columnar::decimal_field_parameters(cell.field).is_ok_and(|decimal| decimal.is_some())
             }),
@@ -756,25 +783,14 @@ fn project_static_cell<'a>(
         };
         expr
     } else { expr };
-    fn record_field(field: &arrow_schema::Field) -> bool {
-        plain_scalar_field(field) || canonical_float_field(field)
-            || rtdb_columnar::decimal_field_parameters(field).is_ok_and(|decimal| decimal.is_some())
-            || matches!(field.data_type(), DataType::Struct(fields) if field.metadata().is_empty() && fields.iter().all(|field| record_field(field)))
-    }
-    fn position<'a>(expr: &Expr, arrow: impl Fn(usize) -> Option<ArrowCell<'a>> + Copy) -> Option<ArrowCell<'a>> {
-        match expr {
-            Expr::Parameter { index, .. } => arrow(*index),
-            Expr::Field { expr, name, .. } => {
-                let record = position(expr, arrow)?;
-                if !record_field(record.field) { return None; }
-                record.structure()?.filter(|field| field.field.name() == name).last()
-            }
-            _ => None,
+    if let Some((cell, declared)) = binding.position(expr) {
+        if plain_scalar_field(cell.field) && !cell.field.data_type().is_unsigned_integer() {
+            return Ok(DocumentCell::Arrow { cell, declared: Some(declared) });
         }
-    }
-    if let Some(cell) = position(expr, arrow).filter(|cell| compatible_float_cell(*cell, None))
-        && matches!(cell.physical()?.field.data_type(), DataType::List(_) | DataType::FixedSizeList(..) | DataType::Null) {
-        return Ok(DocumentCell::Arrow { cell, declared: None });
+        if compatible_float_cell(cell, None)
+            && matches!(cell.physical()?.field.data_type(), DataType::List(_) | DataType::FixedSizeList(..) | DataType::Null) {
+            return Ok(DocumentCell::Arrow { cell, declared: None });
+        }
     }
     evaluate(expr, schema, &[], context).map(|value| DocumentCell::Value(Cow::Owned(value)))
 }
@@ -1209,10 +1225,11 @@ fn static_patch_and_timed_put_encode_mixed_float_bindings_as_rows_would() {
         let plan = rtdb_sql::prepare_static(sql, &SubmissionCatalog("xtdb"),
             &rtdb_sql::PrepareOptions { parameter_types: mixed.execution_types().enumerate().collect(), ..Default::default() }).unwrap().unwrap();
         let (index, _) = plan.input.schema().fields().iter().enumerate().find(|(_, field)| field.name == "embedding").unwrap();
-        let BoundArgumentRow::Arrow { batch, row, types } = mixed.indexed_bound_rows().next().unwrap().unwrap().1 else { panic!("Arrow arguments"); };
+        let (_, binding, source_types) = mixed.indexed_bound_rows_with_source_types().next().unwrap().unwrap();
+        let BoundArgumentRow::Arrow { batch, row, types } = binding else { panic!("Arrow arguments"); };
         let args = rtdb_query::BoundParameters::from_arrow(batch.clone(), row, types.to_vec(), &memory).unwrap();
         let context = EvalContext { parameters: args.evaluator(), ..EvalContext::default() };
-        materialize(&plan.input, Some((batch.batch(), row)), &context, &mut |projected| {
+        materialize(&plan.input, Some(StaticArrowRow { batch: batch.batch(), row, types: source_types.unwrap() }), &context, &mut |projected| {
             let DocumentCell::Arrow { cell, .. } = &projected[index] else { panic!("Expected a borrowed vector"); };
             assert!(std::ptr::eq(cell.array, batch.batch().column(1).as_ref()));
             Ok(())
@@ -1235,20 +1252,55 @@ fn static_patch_records_selects_the_vector_child_of_a_bound_arrow_record() {
     let sql = "PATCH INTO docs RECORDS $1";
     let plan = rtdb_sql::prepare_static(sql, &SubmissionCatalog("xtdb"),
         &rtdb_sql::PrepareOptions { parameter_types: arguments.execution_types().enumerate().collect(), ..Default::default() }).unwrap().unwrap();
-    let BoundArgumentRow::Arrow { batch, row, types } = arguments.indexed_bound_rows().next().unwrap().unwrap().1 else { panic!("Expected Arrow"); };
+    let (_, binding, source_types) = arguments.indexed_bound_rows_with_source_types().next().unwrap().unwrap();
+    let BoundArgumentRow::Arrow { batch, row, types } = binding else { panic!("Expected Arrow"); };
     let args = rtdb_query::BoundParameters::from_arrow(batch.clone(), row, types.to_vec(), &memory).unwrap();
     let context = EvalContext { parameters: args.evaluator(), ..EvalContext::default() };
     let record = batch.batch().column(0).as_any().downcast_ref::<arrow_array::StructArray>().unwrap();
-    let index = plan.input.schema().fields().iter().position(|field| field.name == "embedding").unwrap();
-    materialize(&plan.input, Some((batch.batch(), row)), &context, &mut |cells| {
-        let DocumentCell::Arrow { cell, .. } = &cells[index] else { panic!("Expected an Arrow child"); };
-        assert!(std::ptr::eq(cell.array, record.column_by_name("embedding").unwrap().as_ref()));
+    materialize(&plan.input, Some(StaticArrowRow { batch: batch.batch(), row, types: source_types.unwrap() }), &context, &mut |cells| {
+        for (field, selected) in plan.input.schema().fields().iter().zip(&cells) {
+            let DocumentCell::Arrow { cell, .. } = selected else { panic!("Expected an Arrow child"); };
+            assert!(std::ptr::eq(cell.array, record.column_by_name(&field.name).unwrap().as_ref()));
+        }
         Ok(())
     }).unwrap();
     let submit = |args| prepare_submission(vec![TxOp::Sql { sql: sql.into(), args: Some(args) }],
         SubmitOptions::default(), "xtdb", &memory).unwrap();
     let row = submit(SqlArguments::from_rows(vec![vec![value]], &memory).unwrap());
     let arrow = submit(arguments);
+    assert_eq!(arrow.encode().unwrap().as_slice(), row.encode().unwrap().as_slice());
+    assert_eq!(arrow.body_digest().unwrap(), row.body_digest().unwrap());
+}
+
+#[test]
+fn static_patch_mixed_primitive_bindings_keep_bounds_presence_and_receipt_bytes() {
+    let memory = MemoryBudget::new(1 << 24);
+    let bound = |value| Value::Timestamp { value, unit: TimeUnit::Nanosecond, timezone: Some("America/New_York".into()) };
+    let rows = vec![
+        vec![Value::I64(1), Value::Utf8("selected".into()), bound(-1999), bound(9001)],
+        vec![Value::I32(2), Value::Null, bound(-1999), bound(9001)],
+        vec![Value::I64(3), Value::I32(17), bound(9001), Value::Null],
+    ];
+    let page = |row: &Vec<Value>| {
+        let fields = row.iter().enumerate().map(|(index, value)| rtdb_columnar::to_field(&index.to_string(), &value.logical_type()).unwrap()).collect::<Vec<_>>();
+        let columns = row.iter().map(|value| rtdb_columnar::copy_array(&value.logical_type(), std::slice::from_ref(value)).unwrap()).collect();
+        let batch = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns).unwrap();
+        SqlArguments::from_arrow(rtdb_columnar::OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap()
+    };
+    let mut arguments = page(&rows[0]);
+    for row in &rows[1..] { arguments.append(page(row)).unwrap(); }
+    let sql = "PATCH INTO docs FOR VALID_TIME FROM $3 TO $4 RECORDS {_id: $1, payload: $2}";
+    let submit = |args| prepare_submission(vec![TxOp::Sql { sql: sql.into(), args: Some(args) }],
+        SubmitOptions::default(), "xtdb", &memory).unwrap();
+    let arrow = submit(arguments);
+    let row = submit(SqlArguments::from_rows(rows, &memory).unwrap());
+    let [
+        Operation::PatchArrowIids { documents, iids, valid_from: Some(from), valid_to: Some(to), .. },
+        Operation::PatchArrowIids { valid_from: Some(next), valid_to: None, .. },
+    ] = arrow.operations.as_slice() else { panic!("Expected two ordered PATCH groups"); };
+    assert_eq!((*from, *to, *next), (Timestamp(-2), Timestamp(9), Timestamp(9)));
+    assert_eq!(iids.as_slice(), &[rtdb_types::EntityId::Integer(1).iid(), rtdb_types::EntityId::Integer(2).iid()]);
+    assert!(documents.column_type("payload").unwrap().nullable());
     assert_eq!(arrow.encode().unwrap().as_slice(), row.encode().unwrap().as_slice());
     assert_eq!(arrow.body_digest().unwrap(), row.body_digest().unwrap());
 }

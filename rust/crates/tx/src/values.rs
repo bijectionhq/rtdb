@@ -1583,19 +1583,24 @@ impl SqlArguments {
     }
 
     pub(crate) fn indexed_bound_rows(&self) -> impl Iterator<Item = Result<(usize, BoundArgumentRow<'_>)>> {
+        self.indexed_bound_rows_with_source_types().map(|row| row.map(|(index, binding, _)| (index, binding)))
+    }
+
+    pub(crate) fn indexed_bound_rows_with_source_types(&self)
+        -> impl Iterator<Item = Result<(usize, BoundArgumentRow<'_>, Option<&[LogicalType]>)>> {
         let types = self.types();
         self.chunks.iter().flat_map(move |(start, chunk)| (0..chunk.len()).map(move |row| {
-            let bound = match chunk.as_ref() {
-                ArgumentChunk::Rows { rows, .. } => BoundArgumentRow::Values { values: &rows[row], types: Some(types) },
+            let (bound, source) = match chunk.as_ref() {
+                ArgumentChunk::Rows { rows, .. } => (BoundArgumentRow::Values { values: &rows[row], types: Some(types) }, None),
                 ArgumentChunk::Arrow { batch, types: physical_types, .. } => {
                     let page = batch.batch();
                     for ((field, column), ty) in page.schema_ref().fields().iter().zip(page.columns()).zip(physical_types.iter()) {
                         rtdb_columnar::validate_readable_cell(field, column.as_ref(), ty, row, &self.memory)?;
                     }
-                    BoundArgumentRow::Arrow { batch, row, types }
+                    (BoundArgumentRow::Arrow { batch, row, types }, Some(physical_types.as_slice()))
                 }
             };
-            Ok((start + row, bound))
+            Ok((start + row, bound, source))
         }))
     }
 

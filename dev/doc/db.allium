@@ -584,6 +584,7 @@ variant TxMessage : SourceMessage {
     -- Compatible row-local mutations bind Arrow argument rows as one column table and stage their results in argument order.
     -- Assertions and mutations whose argument rows can observe earlier writes resolve each binding in order against the transaction snapshot.
     -- Compatible nested SQL arguments align directly from their Arrow buffers and retain the canonical source bytes.
+    -- Compatible temporal SQL arguments keep their stored unit, value and zone label when aligned into the canonical source stream.
     -- SQL source replay binds Arrow argument rows by position and reads a scalar parameter when evaluation reaches it.
     -- Source encoding writes IID lists from their fixed-size bytes.
     -- Source replay reads IIDs directly from the selected position of a compatible Arrow list.
@@ -596,9 +597,10 @@ variant TxMessage : SourceMessage {
     -- A supported ID borrows its selected payload under the source buffer's reservation.
     -- A missing ID reports the original document in its error context.
     -- A static INSERT from compatible positional Arrow batches projects Arrow arguments into source document vectors in upload order, including supported lists and structs.
-    -- Static INSERT and PATCH retain projected floating-point Arrow arguments while evaluating scalar operands and valid-time bounds.
+    -- Static INSERT and PATCH retain compatible primitive and floating-point Arrow argument cells while evaluating scalar operands and valid-time bounds.
     -- The projected INSERT document batch carries each row's evaluated validity bounds and keeps the original row order.
-    -- Static RECORDS can select a floating-point vector from the selected fields of a bound Arrow struct.
+    -- Static RECORDS can select a compatible primitive cell or floating-point vector from a bound Arrow struct.
+    -- The selected cells use the types of their own argument page when successive pages have different layouts.
     -- Receipt encoding gathers compatible floating-point document cells by Arrow position under the canonical field layout.
     -- Receipt encoding gives masked fixed-size list components the row writer's union tags and offsets.
     -- A document layout retains its schema and column metadata while releasing translation scratch after construction.

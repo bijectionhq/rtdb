@@ -196,7 +196,8 @@ fn canonical_argument_field(field: &Field) -> bool {
         DataType::List(item) | DataType::FixedSizeList(item, _) => canonical_float_field(item),
         DataType::Struct(fields) => fields.iter().all(|field| canonical_argument_field(field)),
         DataType::Union(fields, UnionMode::Dense) => fields.iter().all(|(_, field)| canonical_argument_field(field)) && unambiguous_union(field, fields),
-        DataType::Utf8 => true,
+        DataType::Utf8 | DataType::Float16 | DataType::Date32 | DataType::Date64
+        | DataType::Time32(_) | DataType::Time64(_) | DataType::Timestamp(..) | DataType::Duration(_) => true,
         _ => plain_scalar_field(field),
     }
 }
@@ -321,6 +322,34 @@ fn decoding_one_argument_chunk_preserves_compatible_arrow_inputs() {
     let replay = SqlArguments::from_arrow(aligned, &memory).unwrap();
     let values = replay.rows().map(|row| row.unwrap()[0].clone()).collect::<Vec<_>>();
     assert_eq!(values, [first, second]);
+}
+
+#[test]
+fn canonical_temporal_arguments_keep_storage_and_clear_masked_payloads_in_source_ipc() {
+    use arrow_array::{Date64Array, TimestampNanosecondArray};
+    use arrow_buffer::NullBuffer;
+    use rtdb_types::{TimeUnit, Value};
+
+    let memory = MemoryBudget::new(1 << 24);
+    let zone = "America/New_York";
+    let validity = Some(NullBuffer::from(vec![true, false, true]));
+    let date = Arc::new(Date64Array::new(vec![-86_400_001, 77, 0].into(), validity.clone())) as ArrayRef;
+    let time = Arc::new(TimestampNanosecondArray::new(vec![-1999, 88, 123].into(), validity).with_timezone(zone)) as ArrayRef;
+    let values = |raw| Value::Timestamp { value: raw, unit: TimeUnit::Nanosecond, timezone: Some(zone.into()) };
+    let rows = vec![vec![Value::DateMilli(-86_400_001), values(-1999)], vec![Value::Null, Value::Null],
+        vec![Value::DateMilli(0), values(123)]];
+    let row = SqlArguments::from_rows(rows, &memory).unwrap();
+    let batch = RecordBatch::try_from_iter([("date", date), ("time", time)]).unwrap();
+    let arrow = SqlArguments::from_arrow_with_canonical_source(OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap();
+    let ArgumentChunk::Arrow { batch, .. } = arrow.chunks[0].1.as_ref() else { panic!("Expected Arrow arguments"); };
+    for (index, ty) in arrow.types().iter().enumerate() {
+        let target = to_field(&format!("?_{index}"), ty).unwrap();
+        let (kept, scratch) = argument_vector(&arrow.chunks[0].1, index, &target, ty, &memory).unwrap();
+        assert!(scratch.is_none());
+        assert!(Arc::ptr_eq(&kept, batch.batch().column(index)));
+    }
+    assert_eq!(crate::source::encode_arguments(&arrow, &memory).unwrap().as_slice(),
+        crate::source::encode_arguments(&row, &memory).unwrap().as_slice());
 }
 
 #[test]
