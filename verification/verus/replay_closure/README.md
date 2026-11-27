@@ -30,7 +30,7 @@ Storage version and epoch preserve equality across the projection.
 
 ## Contracts and boundaries
 
-The [Prost contract](../foreign_contracts/prost.md) supplies the typed replica body for the exact fetched bytes after the protobuf header.
+The [Prost contract](../foreign_contracts/prost.md) supplies the typed replica body for the exact fetched bytes after the protobuf or extension refusal framing.
 The store contracts supply the exact payload for its key and the catalog and table blocks returned by the first load of an adopted index.
 The proof checks dependency membership on successful enumeration.
 Digest validation, term admission, I/O progress, and error completeness remain runtime responsibilities.

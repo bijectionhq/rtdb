@@ -3,7 +3,7 @@
 use vstd::prelude::*;
 
 use crate::inputs::*;
-use crate::prost_replay::{PayloadSource, ReplicaEnvelope, payloadKey, replica_from_bytes};
+use crate::prost_replay::{PayloadSource, ReplicaEnvelope, payloadKey, replica_from_bytes, replica_wire_body};
 
 verus! {
 
@@ -165,7 +165,7 @@ pub open spec fn payloadKeys(envelope: &ReplicaEnvelope) -> ISet<u64> {
 
 pub open spec fn decodedBody(envelope: &ReplicaEnvelope, source: &PayloadSource) -> ReplicaBody {
     match payloadKey(envelope) {
-        Some(key) => replica_from_bytes(source.objects@[key].skip(1)).unwrap().2,
+        Some(key) => replica_from_bytes(replica_wire_body(source.objects@[key]).unwrap()).unwrap().2,
         None => envelope.message,
     }
 }

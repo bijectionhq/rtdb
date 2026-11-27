@@ -21,7 +21,7 @@
     "prost-log-message",
     "sha256-detached-replica"
   ],
-  "min_verified_functions": 26,
+  "min_verified_functions": 38,
   "controls": {
     "accept_another_decision_position": {
       "defect": "Accept a result from a different decision position.",
@@ -44,7 +44,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 25
+      "min_verified_functions": 37
     },
     "ignore_the_pending_lsn": {
       "defect": "Accept a result at the current writer head even if the original request names another LSN.",
@@ -67,7 +67,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 25
+      "min_verified_functions": 37
     },
     "use_writer_epoch_as_key_generation": {
       "defect": "Open the ciphertext under the recorded writer epoch instead of its recorded key generation.",
@@ -90,7 +90,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 25
+      "min_verified_functions": 37
     },
     "ignore_detached_digest": {
       "defect": "Decode fetched bytes with the right term and sequence even when their digest differs.",
@@ -118,7 +118,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 25
+      "min_verified_functions": 37
     },
     "accept_alien_detached_sequence": {
       "defect": "Accept a detached frame with a different term sequence.",
@@ -146,7 +146,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 25
+      "min_verified_functions": 37
     },
     "allow_an_alien_ciphertext_cut": {
       "defect": "Deliver a sealed record whose cut differs from the prepared successor.",
@@ -174,7 +174,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 25
+      "min_verified_functions": 36
     }
   }
 }

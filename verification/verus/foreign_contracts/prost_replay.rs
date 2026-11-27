@@ -1,7 +1,7 @@
 #![allow(non_snake_case)]
 
 use crate::inputs::{ReplicaBody, Result};
-use crate::log_headers::PROTOBUF_LOG_HEADER;
+use crate::log_headers::{PROTOBUF_LOG_HEADER, RTDB_EXTENSION_LOG_HEADER, XTDB_REFUSAL_PREFIX};
 use vstd::prelude::*;
 
 verus! {
@@ -13,6 +13,18 @@ pub struct ReplicaEnvelope {
 }
 
 pub uninterp spec fn replica_from_bytes(bytes: Seq<u8>) -> Option<(i64, Option<i64>, ReplicaBody)>;
+
+pub open spec fn replica_wire_body(bytes: Seq<u8>) -> Option<Seq<u8>> {
+    if bytes.len() > 0 && bytes[0] == PROTOBUF_LOG_HEADER {
+        Some(bytes.skip(1))
+    } else if bytes.len() >= 1 + XTDB_REFUSAL_PREFIX@.len() && bytes[0] == RTDB_EXTENSION_LOG_HEADER
+        && bytes.subrange(1, 1 + XTDB_REFUSAL_PREFIX@.len()) == XTDB_REFUSAL_PREFIX@
+    {
+        Some(bytes.skip(1 + XTDB_REFUSAL_PREFIX@.len()))
+    } else {
+        None
+    }
+}
 
 pub open spec fn payloadKey(envelope: &ReplicaEnvelope) -> Option<u64> {
     match envelope.message { ReplicaBody::OversizedMessage(key) => Some(key), _ => None }
@@ -29,8 +41,8 @@ impl ReplicaEnvelope {
         ensures out matches Ok(decoded) ==> decoded.term == self.term
             && decoded.sequence == self.sequence
             && !(decoded.message is OversizedMessage)
-            && bytes@.len() > 0 && bytes@[0] == PROTOBUF_LOG_HEADER
-            && replica_from_bytes(bytes@.skip(1)) == Some((decoded.term, decoded.sequence, decoded.message)),
+            && replica_wire_body(bytes@) matches Some(wire)
+            && replica_from_bytes(wire) == Some((decoded.term, decoded.sequence, decoded.message)),
     { unimplemented!() }
 }
 

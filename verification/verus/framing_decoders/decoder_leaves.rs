@@ -45,6 +45,7 @@ pub proof fn framed_replica_body(term: i64, sequence: Option<i64>, body: Replica
     let bytes = replica_framed(term, sequence, body);
     let inner = replica_bytes(term, sequence, body);
     if replica_extension(body) {
+        crate::log_headers::the_extension_header_is_not_a_protocol_header();
         assert(bytes.subrange(1, 1 + XTDB_REFUSAL_PREFIX@.len()) =~= XTDB_REFUSAL_PREFIX@);
         assert(bytes.skip(1 + XTDB_REFUSAL_PREFIX@.len()) =~= inner);
     } else {

@@ -12,7 +12,7 @@
   "foreign_contracts": [
     "prost-log-message"
   ],
-  "min_verified_functions": 23,
+  "min_verified_functions": 24,
   "controls": {
     "discard_frame_sequence": {
       "defect": "A decoded frame discards its assigned sequence.",
@@ -40,7 +40,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 21
+      "min_verified_functions": 22
     },
     "drop_recognized_body": {
       "defect": "Forming an envelope erases the decoded event even when the replica body is present.",
@@ -68,7 +68,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 21
+      "min_verified_functions": 22
     }
   }
 }
