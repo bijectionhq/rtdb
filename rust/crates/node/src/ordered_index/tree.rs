@@ -13,7 +13,7 @@ use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_storage::{IoRegion, ObjectKey, cache::BufferPool, object_store::IndexPageScope};
 use rtdb_types::{EventHeader, Iid, Interval, Result, Timestamp};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use sha2::{Digest, Sha256};
+use ring::digest::{SHA256, digest};
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -28,6 +28,10 @@ const FANOUT: usize = 64;
 const PAGE_CACHE_LIMIT: usize = 8 << 20;
 const ARC_HEADER_BYTES: usize = 2 * size_of::<usize>();
 type Work<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+
+fn page_digest(bytes: &[u8]) -> String {
+    hex::encode(digest(&SHA256, bytes).as_ref())
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct Address {
@@ -969,7 +973,7 @@ impl Tree {
         )
         .await?;
         if bytes.len() != pointer.size
-            || format!("{:x}", Sha256::digest(bytes.as_ref())) != pointer.digest
+            || page_digest(&bytes) != pointer.digest
         {
             return Err(format_error("Ordered index page checksum mismatch"));
         }
@@ -1373,7 +1377,7 @@ impl Tree {
                     .saturating_add(first.pointer_backing_bytes())
                     .saturating_add(last.pointer_backing_bytes()),
             )?;
-            let digest = format!("{:x}", Sha256::digest(&encoded));
+            let digest = page_digest(&encoded);
             let size = encoded.len();
             let object = self.page_key(generation, &digest)?;
             IoRegion::retaining(
@@ -1795,6 +1799,35 @@ impl Cursor {
 mod count_tests {
     use super::*;
     use rtdb_storage::MemoryStore;
+
+    #[tokio::test]
+    async fn ordered_replay_page_digest_matches_existing_addresses_and_rejects_replacement_bytes() -> Result<()> {
+        use sha2::{Digest, Sha256};
+
+        let store = Arc::new(MemoryStore::default());
+        let storage = Arc::new(BufferPool::new(store, 1 << 20));
+        let directory = ObjectKey::new("ordered-page-digest")?;
+        let memory = MemoryBudget::new(1 << 20);
+        let tree = Tree::new(&storage, &directory, &memory, 0).await?;
+        let revision = Key::Revision(IndexRevision::through_time(Timestamp(1)));
+        let root = tree.edit(None, vec![(revision, Some(Item::Revision(None)))])
+            .await?.unwrap();
+        let pointer = tree.persist(&root, 0, &mut BTreeMap::new(), &CancellationToken::new()).await?;
+        let path = tree.page_key(pointer.generation, &pointer.digest)?;
+        let store = storage.object_store();
+        let bytes = store.get(&path).await?;
+        assert_eq!(pointer.digest, format!("{:x}", Sha256::digest(&bytes)));
+
+        let mut changed = bytes.to_vec();
+        changed[0] ^= 1;
+        store.delete(&path).await?;
+        store.put(&path, Bytes::from(changed)).await?;
+
+        let reopened = Tree::new(&storage, &directory, &memory, 0).await?;
+        let error = reopened.open(&Link::Stored(pointer)).await.unwrap_err();
+        assert_eq!(error.message.as_deref(), Some("Ordered index page checksum mismatch"));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn rank_reads_persisted_cardinalities_across_leaf_boundaries() -> Result<()> {

@@ -28,6 +28,7 @@ entity Checkpoint {
 -- Aligned bucket decomposition places an eligible row in exactly one of the prefixes containing a valid-time point.
 -- A revision edits both sides of a changed projection. Unchanged spans retain their postings.
 -- Revision replay funds its span and edit storage and carries each retained span allocation with its correction group.
+-- Replay resolves the affected addresses against the same pre-revision root before applying the revision's edits.
 -- Plain scalar keys project from selected positions in the source Arrow columns.
 -- Retained projected tuples own compact key batches and their memory reservations.
 -- A contiguous, all-valid selection may share compact, layout-compatible Arrow buffers whose backing capacity is known.

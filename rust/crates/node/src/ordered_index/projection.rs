@@ -5,10 +5,11 @@ use std::{
 };
 
 use bytes::Bytes;
+use futures::{FutureExt, TryStreamExt, stream::FuturesOrdered};
 use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation};
 use rtdb_format::data::{EncodedEvent, EventBatch, PageEvent};
 use rtdb_temporal::HistoryResolver;
-use rtdb_types::{Anomaly, EventHeader, EventOp, Iid, Interval, LogicalType, Result, TableRef, TemporalBounds, Timestamp, Value, WorldShadow};
+use rtdb_types::{Anomaly, AnomalyKind, EventHeader, EventOp, Iid, Interval, LogicalType, Result, TableRef, TemporalBounds, Timestamp, Value, WorldShadow};
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -275,6 +276,7 @@ impl EditBatch {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(super) enum EventOrder {
     OldestFirst,
     NewestFirst,
@@ -318,22 +320,51 @@ impl Changes {
     pub async fn read(
         &self,
         tree: &Tree,
-        mut root: Root,
+        root: Root,
         through: IndexRevision,
         order: EventOrder,
         cancellation: &CancellationToken,
     ) -> Result<Root> {
+        const READ_AHEAD: usize = 8;
+        if tree.memory.snapshot_budget().is_some()
+            && self.revisions.values().any(|rows| rows.len() >= READ_AHEAD)
+            && let Ok(_read_ahead) = tree.memory.reserve(READ_AHEAD * 4096)
+        {
+            match self.read_with_window(tree, root.clone(), through, order, cancellation, READ_AHEAD).await {
+                Err(error) if error.is(AnomalyKind::ResourceExhausted) => (),
+                result => return result,
+            }
+        }
+        self.read_with_window(tree, root, through, order, cancellation, 1).await
+    }
+
+    async fn read_with_window(
+        &self,
+        tree: &Tree,
+        mut root: Root,
+        through: IndexRevision,
+        order: EventOrder,
+        cancellation: &CancellationToken,
+        window: usize,
+    ) -> Result<Root> {
         for (&revision, rows) in &self.revisions {
             let mut edits = EditBatch::new(&tree.memory)?;
-            for (address, events) in rows {
-                if cancellation.is_cancelled() {
-                    return Err(cancelled());
+            let base = &root;
+            let mut rows = rows.iter();
+            let mut reads = FuturesOrdered::new();
+            loop {
+                while reads.len() < window {
+                    let Some((address, events)) = rows.next() else { break; };
+                    if cancellation.is_cancelled() { return Err(cancelled()); }
+                    if revision > through && !events.iter().any(|event| event.header.op == EventOp::Erase) {
+                        continue;
+                    }
+                    reads.push_back(async move {
+                        let before = tree.spans(base, address).await?;
+                        Ok::<_, Anomaly>((address, events, before))
+                    }.boxed());
                 }
-                if revision > through && !events.iter().any(|event| event.header.op == EventOp::Erase)
-                {
-                    continue;
-                }
-                let before = tree.spans(&root, address).await?;
+                let Some((address, events, before)) = reads.try_next().await? else { break; };
                 let after = if revision > through {
                     Spans::default()
                 } else if events.iter().any(|event| event.header.position.is_some() || event.header.commit_position != 0) {
@@ -353,6 +384,7 @@ impl Changes {
                     edits.project(address, &before, after)?;
                 }
             }
+            drop(reads);
             root = edits.apply(tree, root).await?;
         }
         Ok(root)
@@ -608,6 +640,32 @@ mod tests {
         }
         keys.sort_unstable();
         keys
+    }
+
+    #[tokio::test]
+    async fn ordered_replay_read_ahead_keeps_the_cut_and_applies_later_erases() -> Result<()> {
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 8 << 20));
+        let directory = ObjectKey::new("ordered-read-ahead")?;
+        let memory = MemoryBudget::new(32 << 20);
+        let tree = Tree::new(&storage, &directory, &memory, 0).await?;
+        let token = CancellationToken::new();
+        let original: Vec<_> = (0..100).map(|id| put(id, 0, Interval::ALL, id)).collect();
+        let through = IndexRevision::through_time(Timestamp(1));
+        let root = changes(&original, &memory, &token)
+            .read(&tree, None, through, EventOrder::OldestFirst, &token).await?.unwrap();
+        let pointer = tree.persist(&root, 0, &mut BTreeMap::new(), &token).await?;
+        let mut live: Vec<_> = (0..100).map(|id| put(id, 1, Interval::ALL, 100 + id)).collect();
+        let mut erased = put(10, 2, Interval::ALL, 0);
+        erased.operation = StoredOperation::Erase;
+        live.push(erased);
+        live.push(put(20, 2, Interval::ALL, 1000));
+        let replay = changes(&live, &memory, &token);
+        let tree = Tree::new(&storage, &directory, &memory, 0).await?;
+        let replayed = replay.read(&tree, Some(Link::Stored(pointer)), through, EventOrder::OldestFirst, &token).await?;
+        let expected: Vec<_> = original.iter().enumerate().filter(|(id, _)| *id != 10)
+            .map(|(id, event)| (100 + id as i128, event.iid)).collect();
+        assert_eq!(keys(&tree, replayed, Timestamp(0)).await, expected);
+        Ok(())
     }
 
     #[test]
