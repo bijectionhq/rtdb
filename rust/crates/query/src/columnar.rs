@@ -3701,9 +3701,7 @@ impl ColumnBatch {
     }
 
     pub(crate) fn select_predicate(self, selection: &PredicateSelection, memory: &Arc<MemoryBudget>) -> Result<Self> {
-        if selection.mask.len() != self.len {
-            return Err(invalid("column-filter", "Filter predicate length differs from its batch"));
-        }
+        selection.validate_len(self.len)?;
         let selected = selection.count;
         if selected == self.len { return Ok(self); }
         let span = selection.contiguous_span();
@@ -3767,6 +3765,13 @@ impl PredicateSelection {
     }
 
     pub(crate) fn is_empty(&self) -> bool { self.count == 0 }
+
+    pub(crate) fn validate_len(&self, len: usize) -> Result<()> {
+        if self.mask.len() != len {
+            return Err(invalid("column-filter", "Filter predicate length differs from its batch"));
+        }
+        Ok(())
+    }
 
     fn from_arrow(mask: BooleanArray, mut reservation: Arc<MemoryReservation>) -> Result<Self> {
         let count = mask.true_count();

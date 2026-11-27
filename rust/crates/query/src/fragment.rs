@@ -250,21 +250,10 @@ async fn evaluate_retained_fragment(
     };
     arguments.use_execution_budget(&memory);
     let execution = Execution { parameters: Arc::new(arguments), outer: OuterRows::empty(&memory)?, context, bindings: None, analysis: None };
-    let scan = crate::scan::PartitionScan::fragment(snapshot.clone(), Arc::clone(&database.storage), fragment, execution.clone());
-    let mut batches: crate::columnar::BoxBatchCursor = Box::new(FragmentRows(scan));
-    if let Some(predicate) = fragment.scan.predicates.iter().cloned().reduce(|left, right| rtdb_plan::Expr::binary(rtdb_plan::BinaryOp::And, left, right)) {
-        batches = Box::new(crate::columnar::BatchFilter::new(batches, rtdb_plan::Schema::new(fragment.scan.columns.clone())?, predicate, execution));
-    }
+    let mut batches = crate::scan::PartitionScan::fragment(snapshot.clone(), Arc::clone(&database.storage), fragment, execution)?;
     let mut encoded = FragmentBytes::new(&memory)?;
     while let Some(batch) = batches.next_batch().await? { encode_batch(&batch, &memory, &mut encoded)?; }
     Ok(encoded)
-}
-
-struct FragmentRows(crate::scan::PartitionScan);
-
-#[async_trait::async_trait]
-impl crate::columnar::BatchCursor for FragmentRows {
-    async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> { self.0.next_batch().await }
 }
 
 const COLUMN_KEY: &str = "rtdb.fragment.column";
@@ -519,10 +508,15 @@ fn try_write_spanned_frame(record: &RecordBatch, options: &IpcWriteOptions, memo
 
 /// The batches `encode_batch` wrote into `bytes`, each charged to `memory` for what it retains.
 pub(crate) fn decode_batches(bytes: Buffer, memory: &Arc<MemoryBudget>) -> Result<Vec<ColumnBatch>> {
-    decode_fragment_frames(bytes, memory, true)
+    decode_batches_observed(bytes, memory, |_| {})
 }
 
-fn decode_fragment_frames(mut rest: Buffer, memory: &Arc<MemoryBudget>, retain: bool) -> Result<Vec<ColumnBatch>> {
+pub(crate) fn decode_batches_observed(bytes: Buffer, memory: &Arc<MemoryBudget>, observe: impl FnMut(&RecordBatch)) -> Result<Vec<ColumnBatch>> {
+    decode_fragment_frames(bytes, memory, true, observe)
+}
+
+fn decode_fragment_frames(mut rest: Buffer, memory: &Arc<MemoryBudget>, retain: bool,
+    mut observe: impl FnMut(&RecordBatch)) -> Result<Vec<ColumnBatch>> {
     let malformed = |message: &str| invalid("fragment-decode", message);
     let mut batches = Vec::new();
     while !rest.is_empty() {
@@ -533,7 +527,7 @@ fn decode_fragment_frames(mut rest: Buffer, memory: &Arc<MemoryBudget>, retain: 
         let frame = rest.slice_with_length(8, length);
         rest.advance(8 + length);
         if retain {
-            decode_retained_fragment(frame, memory, &mut batches)?;
+            decode_retained_fragment(frame, memory, &mut batches, &mut observe)?;
         } else {
             decode_copied_fragment(&frame, memory, &mut batches)?;
         }
@@ -541,9 +535,11 @@ fn decode_fragment_frames(mut rest: Buffer, memory: &Arc<MemoryBudget>, retain: 
     Ok(batches)
 }
 
-fn decode_retained_fragment(frame: Buffer, memory: &Arc<MemoryBudget>, batches: &mut Vec<ColumnBatch>) -> Result<()> {
+fn decode_retained_fragment(frame: Buffer, memory: &Arc<MemoryBudget>, batches: &mut Vec<ColumnBatch>,
+    observe: &mut impl FnMut(&RecordBatch)) -> Result<()> {
     let stream = OwnedStream::read_buffer(frame, memory).map_err(fragment_decode_error)?;
     for page in stream.into_pages() {
+        observe(page.batch());
         batches.push(decode_fragment_batch(page, memory)?);
     }
     Ok(())
@@ -1042,9 +1038,9 @@ mod tests {
         assert_eq!(error.code, "rtdb/memory-budget-exceeded");
 
         let detached_memory = MemoryBudget::new(512 << 10);
-        let detached = decode_fragment_frames(bytes.clone(), &detached_memory, false).unwrap();
+        let detached = decode_fragment_frames(bytes.clone(), &detached_memory, false, |_| {}).unwrap();
         let refused = MemoryBudget::new(large.len() - 1);
-        let error = decode_fragment_frames(bytes.clone(), &refused, false).err().unwrap();
+        let error = decode_fragment_frames(bytes.clone(), &refused, false, |_| {}).err().unwrap();
         assert_eq!(error.code, "rtdb/memory-budget-exceeded");
         assert_eq!(refused.used_bytes(), 0);
 

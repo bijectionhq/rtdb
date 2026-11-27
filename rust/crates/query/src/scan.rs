@@ -14,6 +14,7 @@ use bytes::Bytes;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use rtdb_columnar::{IidView, MemoryBudget, MemoryReservation, OwnedBatch, estimate_builder_bytes, from_field};
+use rtdb_columnar::arrow_flow;
 use rtdb_format::{data::{EventBatch, PutText}, ipc::{PageDecoder, PageProjection, inspect_file_reserved}, keys::{TableSlug, TrieKey}, metadata::{MetadataFile, MetadataNode}};
 use rtdb_index::{CatalogTrie, IndexBatch, LiveTable, LocatedRows, RowSource, Snapshot, TrieState};
 use rtdb_plan::{BinaryOp, Expr, Scan, Schema, TemporalFilter, UnaryOp};
@@ -665,7 +666,7 @@ struct ResolvedScanTask {
 
 struct ScanFilter {
     schema: Schema,
-    stages: Arc<[Expr]>,
+    predicate: Expr,
     admission: Admission,
     compiled: crate::columnar::functions::Predicate,
     _reservation: Arc<MemoryReservation>,
@@ -695,8 +696,10 @@ impl FilteredScan {
                 let filter = &self.filter;
                 let memory = &scan.execution.context.memory;
                 let input = crate::columnar::gather(&rows, &task.batches, filter.schema.fields(), memory, |_| Ok(None))?;
-                let selection = admitted_predicate_selection(&input, &filter.stages[0], &filter.schema, &scan.execution,
+                let selection = admitted_predicate_selection(&input, &filter.predicate, &filter.schema, &scan.execution,
                     Some(&filter.compiled), Some(&filter.admission)).await?;
+                selection.validate_len(rows.len())?;
+                scan.execution.context.check_cancelled()?;
                 if selection.is_empty() { continue; }
                 drop(input);
                 let mut row = 0;
@@ -706,7 +709,7 @@ impl FilteredScan {
                     keep
                 });
                 drop(selection);
-                let output = scan.gather_group(page, &rows, &task.batches).await?;
+                let output = scan.gather_group(page, &rows, &task.batches, true).await?;
                 self.pending = Some((task, group));
                 return Ok(Some(output));
             }
@@ -715,27 +718,84 @@ impl FilteredScan {
 }
 
 impl ScanFilter {
-    fn new(predicates: &Predicates, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
-        let [predicate] = predicates.stages.as_ref() else { return Ok(None); };
-        let mut range = matches!(predicate, Expr::Binary { .. } | Expr::Between { .. });
+    fn new(input: &Schema, predicate: &Expr, legacy_range: bool, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
+        let mut range = legacy_range && matches!(predicate, Expr::Binary { .. } | Expr::Between { .. });
+        let mut total = true;
         predicate.visit(&mut |expr| {
-            range &= matches!(expr, Expr::Column { .. } | Expr::Literal(_) | Expr::Parameter { .. }
-                | Expr::Between { symmetric: false, .. }
+            let range_operator = matches!(expr, Expr::Between { symmetric: false, .. }
                 | Expr::Binary { op: BinaryOp::And | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq, .. });
+            range &= range_operator || match expr {
+                Expr::Column { .. } | Expr::Literal(_) => true,
+                Expr::Parameter { data_type, .. } => *data_type != rtdb_types::LogicalType::Nothing,
+                _ => false,
+            };
+            total &= range_operator || match expr {
+                Expr::Column { data_type, .. } | Expr::Parameter { data_type, .. } => Self::total_scalar(data_type),
+                Expr::Literal(Value::Null | Value::Bool(_) | Value::Utf8(_) | Value::I8(_) | Value::I16(_)
+                    | Value::I32(_) | Value::I64(_) | Value::F32(_) | Value::F64(_)) => true,
+                Expr::Binary { op: BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Or, .. }
+                | Expr::Unary { op: UnaryOp::Not | UnaryOp::IsNull | UnaryOp::IsNotNull, .. } => true,
+                _ => false,
+            };
         });
-        if !range || predicates.compiled[0].is_none() { return Ok(None); }
+        if !range && !total { return Ok(None); }
         let referenced = predicate.referenced_columns();
-        if referenced.is_empty() || referenced.len() >= predicates.schema.len() { return Ok(None); }
-        let schema = Schema::new(predicates.schema.fields().iter()
+        if referenced.is_empty() || referenced.len() >= input.len() { return Ok(None); }
+        let schema = Schema::new(input.fields().iter()
             .filter(|field| referenced.contains(&field.id)).cloned().collect())?;
         if schema.len() != referenced.len() { return Ok(None); }
+        if !range && schema.fields().iter().any(|field| !Self::total_scalar(&field.data_type)) { return Ok(None); }
         let Some(compiled) = crate::columnar::functions::Predicate::bind(predicate, &schema) else { return Ok(None); };
+        let expression = crate::runtime_schema::expression_bound(predicate)?;
         let bytes = crate::runtime_schema::schema_bound(&schema)?.checked_add(compiled.retained_bytes()?)
+            .and_then(|bytes| bytes.checked_add(expression))
             .and_then(|bytes| bytes.checked_add(size_of::<Self>()))
             .ok_or_else(|| invalid("scan-filter-size", "Scan predicate exceeds addressable memory"))?;
-        let reservation = memory.reserve(bytes)?;
-        Ok(Some(Self { schema, stages: Arc::clone(&predicates.stages), admission: Admission::of(predicate), compiled, _reservation: reservation }))
+        let reservation = match memory.reserve(bytes) {
+            Err(error) if !range && error.is(AnomalyKind::ResourceExhausted) => return Ok(None),
+            result => result?,
+        };
+        Ok(Some(Self { schema, predicate: predicate.clone(), admission: Admission::of(predicate), compiled, _reservation: reservation }))
     }
+
+    fn total_scalar(data_type: &rtdb_types::LogicalType) -> bool {
+        use rtdb_types::{LogicalType, ScalarType};
+        match data_type {
+            LogicalType::Null => true,
+            LogicalType::Maybe(inner) => Self::total_scalar(inner),
+            LogicalType::Scalar(scalar) => matches!(scalar, ScalarType::Bool | ScalarType::Utf8
+                | ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64 | ScalarType::F32 | ScalarType::F64),
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct ProjectionEvidence {
+    decoded_bytes: u64,
+    gathered_bytes: u64,
+    selected_rows: u64,
+}
+
+impl ProjectionEvidence {
+    fn add(&mut self, other: Self) {
+        self.decoded_bytes = self.decoded_bytes.saturating_add(other.decoded_bytes);
+        self.gathered_bytes = self.gathered_bytes.saturating_add(other.gathered_bytes);
+        self.selected_rows = self.selected_rows.saturating_add(other.selected_rows);
+    }
+
+    fn decoded(&mut self, batch: &arrow_array::RecordBatch) {
+        for column in batch.columns() {
+            self.decoded_bytes = self.decoded_bytes.saturating_add(arrow_bytes(&column.to_data()));
+        }
+    }
+}
+
+fn arrow_bytes(data: &arrow_data::ArrayData) -> u64 {
+    // A projected IPC buffer can report the capacity of the entire input file.
+    let own = data.buffers().iter().chain(data.nulls().map(arrow_buffer::NullBuffer::buffer))
+        .fold(0u64, |bytes, buffer| bytes.saturating_add(buffer.len() as u64));
+    data.child_data().iter().fold(own, |bytes, child| bytes.saturating_add(arrow_bytes(child)))
 }
 
 pub(crate) struct PartitionScan {
@@ -752,6 +812,7 @@ pub(crate) struct PartitionScan {
     output: VecDeque<crate::columnar::ColumnBatch>,
     output_reservation: Option<Arc<MemoryReservation>>,
     filter: Option<FilteredScan>,
+    evidence: Option<ProjectionEvidence>,
     counts: ScanCounts,
     pushdowns: Option<Arc<crate::pushdown::Pushdowns>>,
     canonical_entity_iids: bool,
@@ -993,7 +1054,13 @@ enum Part { Local(PartitionScan), Fragment(Fragment), Resolved(Option<crate::col
 
 /// A fragment dispatched to the node it belongs to, read here instead when that node is this one or does not answer.
 struct Fragment { request: Arc<ScanFragment>, fallback: PartitionScan, state: FragmentState }
-enum FragmentState { Pending, Dispatched(Dispatch), Remote(VecDeque<crate::columnar::ColumnBatch>), Local, Failed }
+enum FragmentState {
+    Pending,
+    Dispatched(Dispatch),
+    Remote { batches: VecDeque<crate::columnar::ColumnBatch>, evidence: Option<ProjectionEvidence> },
+    Local,
+    Failed,
+}
 
 /// A dispatch in flight, abandoned with the scan.
 struct Dispatch(tokio::task::JoinHandle<Result<Option<crate::FragmentReply>>>);
@@ -1010,17 +1077,17 @@ impl Fragment {
     async fn next_batch(&mut self, memory: &Arc<MemoryBudget>) -> Result<Option<crate::columnar::ColumnBatch>> {
         if matches!(self.state, FragmentState::Dispatched(_)) {
             let FragmentState::Dispatched(mut dispatch) = std::mem::replace(&mut self.state, FragmentState::Failed) else { unreachable!() };
-            self.state = Self::answered(&mut dispatch, memory).await?;
+            self.state = Self::answered(&mut dispatch, memory, self.fallback.evidence.is_some()).await?;
         }
         match &mut self.state {
-            FragmentState::Remote(batches) => Ok(batches.pop_front()),
+            FragmentState::Remote { batches, .. } => Ok(batches.pop_front()),
             FragmentState::Pending | FragmentState::Local => self.fallback.next_batch().await,
             FragmentState::Dispatched(_) => Err(invalid("fragment-state", "A dispatched fragment was not awaited")),
             FragmentState::Failed => Err(invalid("fragment-state", "A failed fragment has no further rows")),
         }
     }
     /// Only a declined fragment or an unavailable reader leaves the fragment to this node; every other failure fails the scan.
-    async fn answered(dispatch: &mut Dispatch, memory: &Arc<MemoryBudget>) -> Result<FragmentState> {
+    async fn answered(dispatch: &mut Dispatch, memory: &Arc<MemoryBudget>, observe: bool) -> Result<FragmentState> {
         let answer = (&mut dispatch.0).await
             .map_err(|error| Anomaly::fault("rtdb.query/fragment-dispatch", format!("A fragment dispatch did not complete: {error}")))?;
         let bytes = match answer {
@@ -1029,7 +1096,15 @@ impl Fragment {
             Err(error) => Err(error),
         };
         match bytes {
-            Ok(bytes) => Ok(FragmentState::Remote(crate::fragment::decode_batches(bytes.into_ipc_buffer(), memory)?.into())),
+            Ok(bytes) => {
+                let bytes = bytes.into_ipc_buffer();
+                let mut evidence = observe.then(ProjectionEvidence::default);
+                let batches = match &mut evidence {
+                    Some(evidence) => crate::fragment::decode_batches_observed(bytes, memory, |batch| evidence.decoded(batch))?,
+                    None => crate::fragment::decode_batches(bytes, memory)?,
+                };
+                Ok(FragmentState::Remote { batches: batches.into(), evidence })
+            }
             Err(error) if error.category == rtdb_types::AnomalyCategory::Unavailable => Ok(FragmentState::Local),
             Err(error) => Err(error),
         }
@@ -1044,9 +1119,17 @@ fn persisted_bytes(snapshot: &Snapshot) -> u64 {
 }
 
 /// `fragmenter` is held until the first pull dispatches the fragments.
-pub(crate) struct ScanCursor { parts: VecDeque<Part>, fragmenter: Option<Arc<dyn ScanFragmenter>>, completed: ScanCounts,
-    database: String, source: String, memory: Arc<MemoryBudget>, join_iid_evidence: Option<crate::pushdown::JoinIidEvidence>,
-    _reservation: Arc<MemoryReservation> }
+pub(crate) struct ScanCursor {
+    parts: VecDeque<Part>,
+    fragmenter: Option<Arc<dyn ScanFragmenter>>,
+    completed: ScanCounts,
+    completed_evidence: Option<ProjectionEvidence>,
+    database: String,
+    source: String,
+    memory: Arc<MemoryBudget>,
+    join_iid_evidence: Option<crate::pushdown::JoinIidEvidence>,
+    _reservation: Arc<MemoryReservation>,
+}
 impl ScanCursor {
     pub async fn new(scan: Scan, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>) -> Result<Self> {
         let context = Arc::clone(&execution.context);
@@ -1099,7 +1182,8 @@ impl ScanCursor {
         let canonical_entity_iids = scan.iids.is_none() && restricted_iids.is_none()
             && pushdowns.as_ref().is_some_and(|filters| filters.needs_entity_iid_proof(&scan.columns))
             && database_partitions.iter().all(|snapshot| snapshot.has_canonical_entity_iids(&scan.table.name.table));
-        let join_iid_evidence = if crate::trace::operator_evidence_enabled(&execution.context) {
+        let observe = crate::trace::operator_evidence_enabled(&execution.context);
+        let join_iid_evidence = if observe {
             pushdowns.as_ref().and_then(|filters| filters.iid_evidence(&scan.columns, canonical_entity_iids,
                 scan.iids.is_some() || restricted_iids.is_some()))
         } else { None };
@@ -1298,7 +1382,7 @@ impl ScanCursor {
                     slots: slots.clone(), scan: local_scan.clone(), execution: execution.clone(), bounds,
                     initialized: false, files: FileDescriptors::default(), pages: PageDescriptors::default(),
                     tasks: None, loaded: BTreeMap::new(), output: VecDeque::new(),
-                    output_reservation: None, filter: None, counts: ScanCounts::default(), pushdowns: pushdowns.clone(),
+                    output_reservation: None, filter: None, evidence: observe.then(ProjectionEvidence::default), counts: ScanCounts::default(), pushdowns: pushdowns.clone(),
                     canonical_entity_iids, observe_join_iids, confined, order, page_test: None,
                 };
                 // A scan narrowed to named IIDs reads a few pages wherever they are; only a whole scan of a single-partition database is split.
@@ -1323,7 +1407,7 @@ impl ScanCursor {
             parts.extend(partition);
             verified_counts.add(counts);
         }
-        Ok(Self { parts, fragmenter, completed: verified_counts, database: name, source, memory: Arc::clone(&execution.context.memory),
+        Ok(Self { parts, fragmenter, completed: verified_counts, completed_evidence: None, database: name, source, memory: Arc::clone(&execution.context.memory),
             join_iid_evidence, _reservation: reservation })
     }
 }
@@ -1339,20 +1423,37 @@ impl PartitionScan {
         });
         let observe_join_iids = pushdowns.is_some() && crate::trace::operator_evidence_enabled(&execution.context);
         Self { snapshot, storage, scan, execution, bounds, matches: Vec::new(), ranking: None, candidate_iids: None, slots, metadata_time: None, initialized: false, files: FileDescriptors::default(), pages: PageDescriptors::default(), tasks: None, loaded: BTreeMap::new(),
-            output: VecDeque::new(), output_reservation: None, filter: None, counts: ScanCounts::default(), pushdowns, canonical_entity_iids,
+            output: VecDeque::new(), output_reservation: None, filter: None, evidence: None, counts: ScanCounts::default(), pushdowns, canonical_entity_iids,
             observe_join_iids, confined, order: None, page_test: None }
     }
     /// The scan another node asked this one for: its fragment's rows within the bounds that node evaluated.
-    pub(crate) fn fragment(snapshot: Snapshot, storage: Arc<BufferPool>, fragment: &ScanFragment, execution: Execution) -> Self {
-        Self::new(snapshot, storage, fragment.scan.clone(), execution, fragment.bounds, None, false, Some(fragment.prefix.range()))
+    pub(crate) fn fragment(snapshot: Snapshot, storage: Arc<BufferPool>, fragment: &ScanFragment, execution: Execution) -> Result<BoxBatchCursor> {
+        let mut scan = Self::new(snapshot, storage, fragment.scan.clone(), execution.clone(), fragment.bounds, None, false, Some(fragment.prefix.range()));
+        let Some(predicate) = fragment.scan.predicates.iter().cloned().reduce(|left, right| Expr::binary(BinaryOp::And, left, right)) else {
+            return Ok(Box::new(scan));
+        };
+        let schema = Schema::new(fragment.scan.columns.clone())?;
+        if scan.can_filter_before_gather()
+            && let Some(filter) = ScanFilter::new(&schema, &predicate, false, &execution.context.memory)?
+        {
+            scan.filter = Some(FilteredScan { filter: Arc::new(filter), pending: None });
+            return Ok(Box::new(scan));
+        }
+        Ok(Box::new(BatchFilter::new(Box::new(scan), schema, predicate, execution)))
     }
+}
+
+#[async_trait]
+impl BatchCursor for PartitionScan {
+    async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> { PartitionScan::next_batch(self).await }
 }
 
 impl ScanCursor {
     pub(crate) fn filtered(mut self, predicates: &Predicates, execution: Execution) -> Result<BoxBatchCursor> {
         if !self.parts.is_empty()
             && self.parts.iter().all(|part| matches!(part, Part::Local(partition) if partition.can_filter_before_gather()))
-            && let Some(filter) = ScanFilter::new(predicates, &self.memory)?
+            && let ([predicate], [compiled]) = (predicates.stages.as_ref(), predicates.compiled.as_ref())
+            && let Some(filter) = ScanFilter::new(&predicates.schema, predicate, compiled.is_some(), &self.memory)?
         {
             let filter = Arc::new(filter);
             for part in &mut self.parts {
@@ -1375,6 +1476,9 @@ impl ScanCursor {
                 Part::Resolved(batch) => batch.take() };
             if let Some(batch) = batch { return Ok(Some(batch)); }
             self.completed.add(part.counts());
+            if let Some(evidence) = part.evidence() {
+                self.completed_evidence.get_or_insert_default().add(evidence);
+            }
             self.parts.pop_front();
         }
         Ok(None)
@@ -1393,6 +1497,14 @@ impl ScanCursor {
 
 impl Part {
     fn counts(&self) -> ScanCounts { match self { Self::Local(partition) => partition.counts, Self::Fragment(fragment) => fragment.fallback.counts, Self::Resolved(_) => ScanCounts::default() } }
+    fn evidence(&self) -> Option<ProjectionEvidence> {
+        match self {
+            Self::Local(partition) => partition.evidence,
+            Self::Fragment(Fragment { state: FragmentState::Remote { evidence, .. }, .. }) => *evidence,
+            Self::Fragment(fragment) => fragment.fallback.evidence,
+            Self::Resolved(_) => None,
+        }
+    }
 }
 
 fn legacy_candidate_scan(scan: &Scan, candidates: Option<&crate::CandidateIids>, accelerator: &dyn crate::ScanAccelerator) -> Option<Scan> {
@@ -2194,12 +2306,22 @@ impl BatchCursor for ScanCursor {
     async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> { ScanCursor::next_batch(self).await }
 
     fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) {
-        let mut counts = self.completed; for part in &self.parts { counts.add(part.counts()); }
+        use crate::trace::OperatorCounter;
+        let mut counts = self.completed;
+        let mut evidence = self.completed_evidence;
+        for part in &self.parts {
+            counts.add(part.counts());
+            if let Some(part) = part.evidence() { evidence.get_or_insert_default().add(part); }
+        }
         span.attribute("scan_db", rtdb_plan::TraceValue::Text(&self.database));
         span.attribute("scan_source", rtdb_plan::TraceValue::Text(&self.source));
+        if let Some(evidence) = evidence {
+            OperatorCounter::ScanDecodedBytes.record(span, evidence.decoded_bytes);
+            OperatorCounter::ScanGatheredBytes.record(span, evidence.gathered_bytes);
+            OperatorCounter::ScanSelectedRows.record(span, evidence.selected_rows);
+        }
         for (name, value) in [("scan_files_pruned", counts.files_pruned), ("scan_files_used", counts.files_used), ("scan_pages_pruned", counts.pages_pruned), ("scan_pages_used", counts.pages_used), ("scan_rows_read", counts.rows_read)] { span.attribute(name, rtdb_plan::TraceValue::Unsigned(value)); }
         if let Some(evidence) = &self.join_iid_evidence {
-            use crate::trace::OperatorCounter;
             OperatorCounter::JoinFilterBuildDistinctKeys.record(span, evidence.build_distinct);
             OperatorCounter::JoinFilterBuildDistinctKeysComplete.record(span, u64::from(evidence.complete));
             OperatorCounter::JoinFilterAdmittedIids.record(span, evidence.admitted);
@@ -2505,6 +2627,7 @@ impl PartitionScan {
                     charge = charged;
                     batch
                 };
+                if let Some(evidence) = &mut self.evidence { evidence.decoded(batch.arrow()); }
                 ActiveRows::File(batch)
             }
         };
@@ -2771,21 +2894,21 @@ impl PartitionScan {
     async fn buffer_task(&mut self, task: ResolvedScanTask) -> Result<()> {
         let ResolvedScanTask { selected, groups, batches, reservation, _group_reservations } = task;
         for (group, rows) in groups.iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
-            let output = self.gather_group(selected[group], rows, &batches).await?;
+            let output = self.gather_group(selected[group], rows, &batches, false).await?;
             self.output.push_back(output);
         }
         self.output_reservation = Some(reservation);
         Ok(())
     }
 
-    async fn gather_group(&mut self, page: usize, rows: &[ResolvedRow<(u32, u32)>], batches: &[Arc<IndexBatch>]) -> Result<crate::columnar::ColumnBatch> {
+    async fn gather_group(&mut self, page: usize, rows: &[ResolvedRow<(u32, u32)>], batches: &[Arc<IndexBatch>], filtered: bool) -> Result<crate::columnar::ColumnBatch> {
         let archive_history = projects_archive_history(&self.scan);
         let keyed = self.scan.table.name.table.is_owned_event_data();
         let owned = self.execution.context.catalog.admits_owned_event_positions(&self.scan.table.name);
         let mut metadata = Box::pin(self.retained_transaction_metadata(rows, batches)).await?;
         let page = &self.pages.entries[page].source;
         let memory = &self.execution.context.memory;
-        crate::columnar::gather_with_funded_columns(rows, batches, &self.scan.columns, memory, |position| {
+        let output = crate::columnar::gather_with_funded_columns(rows, batches, &self.scan.columns, memory, |position| {
             let field = &self.scan.columns[position];
             if let Some(ranking) = &self.ranking && field.id == ranking.output {
                 return self.rank_column(ranking, rows, batches).map(|column| Some((column, None)));
@@ -2797,7 +2920,33 @@ impl PartitionScan {
                 return Ok(Some((column, Some(charge))));
             }
             self.slots[position].map(|slot| self.match_column(slot, page, rows, batches).map(|column| (column, None))).transpose()
-        })
+        })?;
+        let flow = arrow_flow::sample();
+        if self.evidence.is_some() || flow.is_some() {
+            let mut bytes = 0u64;
+            let mut retains_positions = false;
+            for column in &output.columns {
+                match column {
+                    Column::Arrow { array, .. } => bytes = bytes.saturating_add(arrow_bytes(&array.to_data())),
+                    Column::Selected(_) => retains_positions = true,
+                    Column::Values(_) => {}
+                }
+            }
+            if let Some(evidence) = &mut self.evidence {
+                evidence.gathered_bytes = evidence.gathered_bytes.saturating_add(bytes);
+                if filtered && retains_positions {
+                    evidence.selected_rows = evidence.selected_rows.saturating_add(output.len as u64);
+                }
+            }
+            if let Some(flow) = flow {
+                flow.record("rtdb.scan/gather", arrow_flow::Measures {
+                    rows: Some(output.len), new_backing_bytes: usize::try_from(bytes).ok(),
+                    layout: Some(if filtered { "late" } else { "ordinary" }),
+                    ..arrow_flow::Measures::default()
+                });
+            }
+        }
+        Ok(output)
     }
 
     fn match_column(&self, evaluated: usize, source: &PageSource, rows: &[ResolvedRow<(u32, u32)>], batches: &[Arc<IndexBatch>]) -> Result<crate::columnar::Column> {

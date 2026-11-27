@@ -171,6 +171,139 @@ async fn a_cold_fragment_sends_selected_fixed_lists_as_arrow() {
 }
 
 #[tokio::test]
+async fn a_fragment_filters_visible_versions_before_copying_wide_payloads() {
+    use rtdb_query::{ScanFragment, TriePrefix, evaluate_fragment};
+
+    let state = PartitionState::empty(TrieConfig::new(32, 32).unwrap()).unwrap();
+    let writes = MemoryBudget::new(1 << 27);
+    let row = |id, value, payload: String| {
+        let mut row = document(id, value);
+        row.insert("payload".into(), Value::Utf8(payload));
+        row
+    };
+    let mut first = tx(&state, &writes, 0, 100);
+    first.put(table(), row(1, Value::Utf8("keep".into()), "original".into()), Interval::ALL).unwrap();
+    first.put(table(), row(2, Value::Utf8("reject".into()), "x".repeat(2 << 20)), Interval::ALL).unwrap();
+    first.put(table(), row(3, Value::Null, "x".repeat(2 << 20)), Interval::ALL).unwrap();
+    state.apply(&first.stage().unwrap()).unwrap();
+    let mut second = tx(&state, &writes, 1, 200);
+    second.put(table(), row(1, Value::Utf8("reject".into()), "x".repeat(2 << 20)), Interval::ALL).unwrap();
+    second.put(table(), row(2, Value::Utf8("keep".into()), "replacement".into()), Interval::ALL).unwrap();
+    state.apply(&second.stage().unwrap()).unwrap();
+
+    let snapshot = state.snapshot();
+    let basis = snapshot.tx_basis().unwrap();
+    let database = DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)) };
+    let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
+    let context = QueryContext::new(catalog, MemoryBudget::new(1 << 19), Timestamp(50), "UTC", QueryOptions::default(), &CancellationToken::new()).unwrap();
+    let relation = scan(&context, &["v", "_id", "payload", "_system_from"], at(50), at(200), None);
+    let rtdb_plan::RelationNode::Scan(source) = relation.node() else { unreachable!() };
+    let mut source = source.clone();
+    source.predicates = vec![Expr::binary(BinaryOp::Eq, source.columns[0].expression(), Expr::Literal(Value::Utf8("keep".into())))];
+
+    for (system, id, payload) in [(100, 1, "original"), (200, 2, "replacement")] {
+        let fragment = ScanFragment {
+            scan: source.clone(), prefix: TriePrefix::new(Vec::new()).unwrap(), basis, residence: None,
+            bounds: rtdb_types::TemporalBounds {
+                valid_time: Interval::from_micros(50, 51).unwrap(), system_time: Interval::from_micros(system, system + 1).unwrap(),
+            },
+            timezone: "UTC".into(),
+        };
+        let wire = evaluate_fragment(Arc::clone(&context), &fragment).await.unwrap();
+        let (length, bytes) = wire.split_first_chunk::<8>().unwrap();
+        assert_eq!(u64::from_be_bytes(*length) as usize, bytes.len());
+        let mut reader = arrow_ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None).unwrap();
+        let batch = reader.next().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert!(reader.next().is_none());
+        let values = batch.schema_ref().fields().iter().zip(batch.columns())
+            .map(|(field, column)| read_value(field, column.as_ref(), 0)).collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(values, [Value::Utf8("keep".into()), Value::I64(id), Value::Utf8(payload.into()), timestamp(system)]);
+    }
+}
+
+#[tokio::test]
+async fn a_delegated_predicate_preserves_short_circuit_and_reached_errors() {
+    use rtdb_query::{ScanFragment, TriePrefix, evaluate_fragment};
+
+    let state = PartitionState::empty(TrieConfig::new(32, 32).unwrap()).unwrap();
+    let writes = MemoryBudget::new(1 << 24);
+    let mut write = tx(&state, &writes, 0, 10);
+    write.put(table(), document(1, Value::I64(0)), Interval::ALL).unwrap();
+    write.put(table(), document(2, Value::I64(5)), Interval::ALL).unwrap();
+    state.apply(&write.stage().unwrap()).unwrap();
+    let snapshot = state.snapshot();
+    let basis = snapshot.tx_basis().unwrap();
+    let context = query_context(snapshot, Arc::new(MemoryStore::default()), false);
+    let relation = scan(&context, &["v", "_id"], at(50), at(10), None);
+    let rtdb_plan::RelationNode::Scan(source) = relation.node() else { unreachable!() };
+    let value = source.columns[0].expression();
+    let zero = Expr::Literal(Value::I64(0));
+    let quotient = Expr::binary(BinaryOp::Divide, Expr::Literal(Value::I64(10)), value.clone());
+    let check = Expr::binary(BinaryOp::Gt, quotient, zero.clone());
+    let predicate = |op| Expr::binary(BinaryOp::And, Expr::binary(op, value.clone(), zero.clone()), check.clone());
+    let mut fragment = ScanFragment {
+        scan: source.clone(), prefix: TriePrefix::new(Vec::new()).unwrap(), basis, residence: None,
+        bounds: rtdb_types::TemporalBounds { valid_time: Interval::ALL, system_time: Interval::from_micros(10, 11).unwrap() },
+        timezone: "UTC".into(),
+    };
+    fragment.scan.predicates = vec![predicate(BinaryOp::NotEq)];
+    let wire = evaluate_fragment(Arc::clone(&context), &fragment).await.unwrap();
+    let (length, bytes) = wire.split_first_chunk::<8>().unwrap();
+    assert_eq!(u64::from_be_bytes(*length) as usize, bytes.len());
+    let mut reader = arrow_ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None).unwrap();
+    let batch = reader.next().unwrap().unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(read_value(batch.schema_ref().field(0), batch.column(0).as_ref(), 0).unwrap(), Value::I64(5));
+    assert!(reader.next().is_none());
+
+    fragment.scan.predicates = vec![predicate(BinaryOp::GtEq)];
+    assert_eq!(evaluate_fragment(context, &fragment).await.unwrap_err().code, "xtdb.expression/division-by-zero");
+}
+
+#[tokio::test]
+async fn scan_trace_distinguishes_decoded_pages_from_surviving_payload() {
+    let state = PartitionState::empty(TrieConfig::new(32, 32).unwrap()).unwrap();
+    let writes = MemoryBudget::new(1 << 27);
+    let store = Arc::new(MemoryStore::default());
+    let width = 1 << 16;
+    let mut write = tx(&state, &writes, 0, 10);
+    for (id, value, payload) in [(1, 5, "kept".into()), (2, 0, "x".repeat(width))] {
+        let mut row = document(id, Value::I64(value));
+        row.insert("payload".into(), Value::Utf8(payload));
+        write.put(table(), row, Interval::ALL).unwrap();
+    }
+    state.apply(&write.stage().unwrap()).unwrap();
+    persist(&state, &store).await;
+
+    let context = query_context(state.snapshot(), store, false);
+    let (tracer, mut receiver) = rtdb_metrics::TraceRecorder::new(Arc::clone(&context.memory), 32, true, true).unwrap();
+    let context = context.with_tracer(Some(tracer.clone()), None);
+    let relation = scan(&context, &["v", "payload"], TemporalFilter::All, TemporalFilter::All, None);
+    let rtdb_plan::RelationNode::Scan(source) = relation.node() else { unreachable!() };
+    let mut source = source.clone();
+    source.predicates = vec![Expr::binary(BinaryOp::Eq, source.columns[0].expression(), Expr::Literal(Value::I64(5)))];
+    let relation = Arc::new(Relation::scan(source).unwrap());
+    for _ in 0..2 {
+        assert_eq!(collect(Arc::clone(&relation), Arc::clone(&context)).await.unwrap(), [vec![Value::I64(5), Value::Utf8("kept".into())]]);
+    }
+    tracer.close();
+    let mut counts = Vec::new();
+    while let Some(span) = receiver.next().await {
+        if span.name == "query.cursor.scan.public.docs" {
+            let attributes: BTreeMap<_, _> = span.attributes().collect();
+            counts.push((attributes["cursor.scan.decoded_bytes"].parse::<usize>().unwrap(),
+                attributes["cursor.scan.gathered_bytes"].parse::<usize>().unwrap()));
+        }
+    }
+    let [(cold, gathered), (warm, gathered_again)] = counts.as_slice() else { panic!("Expected cold and warm scan spans: {counts:?}") };
+    assert!(*cold >= width);
+    assert_eq!(*warm, 0);
+    assert!((1..width).contains(gathered));
+    assert_eq!(gathered, gathered_again);
+}
+
+#[tokio::test]
 async fn delegated_scan_keeps_its_snapshot_until_cancelled_provider_reads_drain() {
     use rtdb_query::{ScanFragment, TriePrefix, evaluate_fragment};
     use rtdb_storage::{IoRegion, StoredObject};
@@ -219,10 +352,12 @@ async fn delegated_scan_keeps_its_snapshot_until_cancelled_provider_reads_drain(
     let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
     let cancellation = CancellationToken::new();
     let context = QueryContext::new(catalog, memory, Timestamp(50), "UTC", QueryOptions::default(), &cancellation).unwrap();
-    let relation = scan(&context, &["v"], TemporalFilter::All, at(10), None);
+    let relation = scan(&context, &["v", "_id"], TemporalFilter::All, at(10), None);
     let rtdb_plan::RelationNode::Scan(scan) = relation.node() else { unreachable!() };
+    let mut scan = scan.clone();
+    scan.predicates = vec![Expr::binary(BinaryOp::Eq, scan.columns[0].expression(), Expr::Literal(Value::Utf8("captured".into())))];
     let fragment = ScanFragment {
-        scan: scan.clone(),
+        scan,
         prefix: TriePrefix::new(Vec::new()).unwrap(),
         basis,
         residence: None,
