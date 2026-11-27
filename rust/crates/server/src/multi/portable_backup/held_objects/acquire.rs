@@ -85,6 +85,14 @@ impl Acquirer {
             return Err(invalid_plan());
         }
         let key_hold = receipt.key_hold;
+        if let Some(order) = staged::read_staging_order(store.as_ref(), key_hold.authority, key_hold.generation.database).await? {
+            if order.key_hold != key_hold || order.intent != receipt.intent {
+                return Err(invalid_plan());
+            }
+            if order.tracked_uploads {
+                inventory.staging_uploads(key_hold.authority, key_hold.generation.database)?.require_closed().await?;
+            }
+        }
         let plan_key = acquisition_key(key_hold.authority, key_hold.generation.database)?;
         let saved = match read_acquisition(store.as_ref(), &plan_key).await? {
             Some(Acquisition::Planned(plan)) => Some(plan),

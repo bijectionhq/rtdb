@@ -340,6 +340,10 @@ The activation journal selects the destination incarnation and cell.
 Lossless staging requires the archive to end at the predecessor's sealed final journal position.
 Before opening the destination stream or allocating its generation, staging records the exact intent, destination journal connection and original vault identity in the S3 allocation.
 The destination vault retains the exact generation before the staging writer puts the relocated files or publishes their checkpoint.
+Use staging writers that support tracked uploads before starting a new order.
+For new staging orders, the S3 ledger records an exact multipart upload before the staging writer sends bytes.
+A replacement staging writer claims the ledger and drains any upload left by the previous writer.
+Staging closes and drains the ledger before returning a receipt for acquisition.
 Save the stage result with the archive.
 It reports the destination and the key hold bound to the same consensus trust and installation coordinates used by the activation proof.
 A retry before the authority records the installation reopens the original checkpoint and checks its active key hold.
@@ -364,13 +368,16 @@ Settlement of a saved acquisition also verifies the selected checkpoint.
 The command settles the keeper's exact checkpoint hold, deletes the exact planned S3 versions, verifies their absence, and releases the held key generation.
 If staging stopped before saving an acquisition plan, use the same authority and incarnation selector to find its staging record.
 The original allocation records a terminal decision in the acquisition slot, which fences any later acquisition.
-The custodian then retires the abandoned journal and permanently closes the generation in the original vault, even when staging never created it.
-Any unheld ciphertext left by interrupted staging stays in the abandoned candidate's allocation for ordinary storage cleanup.
+The custodian closes the staging upload ledger and drains the recorded upload before retiring the abandoned journal and generation.
+For new staging orders, it purges the abandoned candidate's object and wrapped-key prefixes and reports `objects_purged` when the provider confirms both are empty.
+Staging orders created before upload tracking leave unheld ciphertext for ordinary storage cleanup.
 The S3 custodian needs version listing, legal-hold read and write access, `s3:DeleteObjectVersion`, and conditional writes for tombstones that keep older versions hidden.
 Use the same acquisition identity and provider settings to retry a partial settlement.
 Before advancing the binding again, the activation authority archives the previous recovery publication in its own immutable journal.
 The broker can use that publication to settle older acquisitions after activation compaction.
 The staging writer can create its `staging` record under `multi/recovery-custody/`, and the custodian can create the acquisition and settlement records there.
+Both identities need conditional access to the staging upload ledger and permission to abort and read the parts of its exact recorded upload.
+The custodian also needs permission to list and purge versions, delete markers and multipart uploads under the abandoned candidate's two data prefixes.
 Both identities need to read their records and distinguish absence from denied access.
 Protect acquisition records against deletion and replacement through settlement.
 Scope the custodian's S3 version reads and legal-hold writes to the operation-exclusive candidate paths.

@@ -14,6 +14,8 @@ mod never_versioned;
 pub use never_versioned::{NeverVersionedObject, NeverVersionedRetirement, ObservedTerminalObject};
 mod pinned_reads;
 mod retirement_decision;
+mod staging_uploads;
+pub use staging_uploads::StagingUploads;
 use retirement_decision::{VersionStatus, exact_version_status, matches_terminal_target};
 
 fn collect_child(parent: &str, key: Option<&str>, children: &mut BTreeSet<String>) {

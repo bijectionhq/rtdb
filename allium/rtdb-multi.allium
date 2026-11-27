@@ -1256,6 +1256,8 @@ contract PortableApplicationBackup {
     @invariant HostedAbandonment
         -- The activation broker proves abandonment at the original binding before authorizing settlement.
         -- The staging writer records the exact intent, destination journal and vault before creating a stream or allocating its generation.
+        -- Each tracked staging upload is ordered at the original allocation before it receives payload bytes.
+        -- Closing staging upload admission drains every recorded upload before the custodian verifies that the abandoned candidate's object and wrapped-key prefixes are empty.
         -- The original object allocation orders a saved acquisition plan and closure before acquisition on the same immutable record.
         -- Pre-acquisition closure retires the destination journal and permanently fences the original generation before a late staging writer can recreate it.
         -- Before replacing a recovery publication, the activation authority preserves the previous publication in an immutable record addressed by its predecessor binding.

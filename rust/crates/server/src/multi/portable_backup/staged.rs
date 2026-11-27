@@ -49,7 +49,11 @@ pub(super) struct StagingOrder {
     pub(super) key_hold: RecoveryKeyHold,
     pub(super) destination_journal_sha256: [u8; 32],
     pub(super) vault_identity: Uuid,
+    #[serde(default, skip_serializing_if = "untracked_uploads")]
+    pub(super) tracked_uploads: bool,
 }
+
+fn untracked_uploads(tracked: &bool) -> bool { !*tracked }
 
 fn staging_key(authority: Uuid, candidate: Uuid) -> Result<rtdb_storage::ObjectKey> {
     Ok(rtdb_storage::ObjectKey::new(format!("recovery-custody/{authority}/{candidate}/staging"))?)
@@ -116,18 +120,35 @@ impl Stage {
         let JournalBackend { journal, batch, .. } =
             connect_stream_journal(&self.destination.journal_url, &credentials).await?;
         let keys = Arc::new(FileKms::open(&self.destination.key_vault, || SystemClock.now().0)?);
-        let order = StagingOrder {
+        let mut order = StagingOrder {
             intent: candidate.intent.clone(), key_hold: hold,
             destination_journal_sha256: KeeperJournal::connect(&self.destination.journal_url, &credentials)?.connection_sha256,
             vault_identity: keys.enroll_recovery_vault().await?,
+            tracked_uploads: true,
         };
         let io = IoRegion::new();
+        let mut writer_io = IoRegion::new();
         let installed = async {
             let store = self.destination.objects.open(&root, &remotes, Arc::clone(&io)).await?;
+            if let Some(prior) = read_staging_order(store.as_ref(), hold.authority, candidate.incarnation).await? {
+                order.tracked_uploads = prior.tracked_uploads;
+            }
             let encoded = serde_json::to_vec(&order).map_err(|_| stage_source())?;
             store.put(&staging_key(hold.authority, candidate.incarnation)?, Bytes::from(encoded)).await?;
             Candidate::pending(authority, &self.destination.name, self.operation, source_lsn).await?;
             super::held_objects::require_staging_open(store.as_ref(), hold).await?;
+            let uploads = order.tracked_uploads.then(|| inventory.staging_uploads(hold.authority, candidate.incarnation)).transpose()?;
+            let (store, can_write): (Arc<dyn ObjectStore>, bool) = if let Some(uploads) = &uploads {
+                match uploads.begin().await? {
+                    Some(writer) => {
+                        Arc::get_mut(&mut writer_io).expect("the staging region is private").track_publications(writer);
+                        (self.destination.objects.open_cell(&root, &remotes, Arc::clone(&writer_io)).await?, true)
+                    }
+                    None => (store, false),
+                }
+            } else {
+                (store, true)
+            };
             let mut database = MultiDatabase::new(
                 MultiOptions {
                     database: candidate.incarnation,
@@ -139,12 +160,14 @@ impl Stage {
             )?.with_immutable_journal().with_batch_appender(batch).with_activation_scope(candidate.scope)?
                 .with_manifest_budget(MemoryBudget::new(PortableBackup::MAX_BYTES));
             match journal.head(database.journal_stream()).await {
-                Ok(Lsn(0)) | Err(JournalError::NotFound) => database.create().await?,
+                Ok(Lsn(0)) | Err(JournalError::NotFound) if can_write => database.create().await?,
+                Ok(Lsn(0)) | Err(JournalError::NotFound) => return Err(stage_closed()),
                 Ok(_) => (),
                 Err(error) => return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb/journal-unavailable", error.to_string())),
             }
             let installed = async {
                 if database.installed_backup().await?.is_none() {
+                    if !can_write { return Err(stage_closed()); }
                     acquire_writer(&mut database).await?;
                 }
                 database.install_portable_backup_holding_key(backup, hold).await
@@ -156,9 +179,13 @@ impl Stage {
                 return Err(stage_source());
             }
             keys.require_recovery_key(hold).await?;
+            if let Some(uploads) = uploads {
+                uploads.close().await?;
+            }
             Candidate::pending(authority, &self.destination.name, self.operation, source_lsn).await?;
             Ok::<_, Anomaly>(installed)
         }.await;
+        writer_io.close_and_wait().await;
         io.close_and_wait().await;
         let installed = installed?;
         serde_json::to_value(StageReceipt {
@@ -218,4 +245,8 @@ async fn acquire_writer(database: &mut MultiDatabase) -> Result<()> {
 
 fn stage_source() -> Anomaly {
     Anomaly::incorrect("rtdb/backup-stage-source", "The archive does not match the recovery's predecessor or sealed final cut")
+}
+
+fn stage_closed() -> Anomaly {
+    Anomaly::new(AnomalyCategory::Conflict, "rtdb/backup-stage-closed", "The original provider has closed staging uploads for this candidate")
 }

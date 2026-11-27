@@ -413,11 +413,14 @@ mod tests {
         assert_eq!(url.host_str(), Some("127.0.0.1"));
         let bucket = std::env::var("RTDB_BACKUP_HOLD_TEST_BUCKET").unwrap();
         assert!(bucket.starts_with("rtdb-backup-hold-test-"));
-        let aws_bucket = |bucket: &str, operation: &str, fields: &[&str]| {
-            let result = std::process::Command::new("aws")
+        let aws_call = |bucket: &str, operation: &str, fields: &[&str]| {
+            std::process::Command::new("aws")
                 .args(["--no-cli-pager", "--endpoint-url", &endpoint, "--region", "us-east-1",
                     "s3api", operation, "--bucket", bucket])
-                .args(fields).output().unwrap();
+                .args(fields).output().unwrap()
+        };
+        let aws_bucket = |bucket: &str, operation: &str, fields: &[&str]| {
+            let result = aws_call(bucket, operation, fields);
             assert!(result.status.success(), "{operation}: {}", String::from_utf8_lossy(&result.stderr));
             if result.stdout.is_empty() { Value::Null } else { serde_json::from_slice(&result.stdout).unwrap() }
         };
@@ -888,13 +891,24 @@ mod tests {
             let stream = StreamId(candidate.as_u128());
             let receipt = stage_with_credentials(operation.operation_id, journal_tls).await;
             let order = staged::read_staging_order(store.as_ref(), authority, candidate).await.unwrap().unwrap();
-            if journal_tls == &reader_tls {
+            let partial = if journal_tls == &reader_tls {
                 assert!(receipt.is_err());
                 assert!(matches!(journal.head(stream).await, Err(JournalError::NotFound)));
+                let uploads = inventory.staging_uploads(authority, candidate).unwrap();
+                let writer = uploads.begin().await.unwrap().unwrap();
+                let key = ObjectKey::new(format!("db/{candidate}/stalled")).unwrap();
+                let physical = format!("multi/{key}");
+                let reservation = aws("create-multipart-upload", &["--key", &physical]);
+                let upload = reservation["UploadId"].as_str().unwrap().to_owned();
+                writer.admit(&key, Uuid::new_v4(), &upload).await.unwrap();
+                aws("upload-part", &["--key", &physical, "--upload-id", &upload,
+                    "--part-number", "1", "--body", retry_bytes.to_str().unwrap()]);
+                Some((uploads, writer, key, physical, upload))
             } else {
                 assert!(receipt.is_ok());
                 original_keys.require_recovery_key(order.key_hold).await.unwrap();
-            }
+                None
+            };
             assert!(discover(candidate, &vault).await.is_err());
             serving_intent.operation.operation_id = Uuid::new_v4();
             activation.begin_recovery(DATABASE, serving_intent, Some(operation.operation_id)).await.unwrap();
@@ -903,10 +917,20 @@ mod tests {
             let retired = discover(candidate, &vault).await.unwrap();
             assert_eq!(retired["journal_retired"], true);
             assert_eq!(retired["generation_destroyed"], true);
+            assert_eq!(retired["objects_purged"], true);
             assert_eq!(discover(candidate, &vault).await.unwrap(), retired);
             assert!(matches!(journal.head(stream).await, Err(JournalError::Deleted)));
             assert!(journal.create_immutable(stream).await.is_err());
             assert!(original_keys.create(order.key_hold.generation).await.is_err());
+            assert!(inventory.is_empty(&ObjectKey::new(format!("db/{candidate}")).unwrap()).await.unwrap());
+            assert!(inventory.is_empty(&ObjectKey::new(format!("~rtdb-v1/{}/keys", candidate.simple())).unwrap()).await.unwrap());
+            if let Some((uploads, writer, key, physical, upload)) = partial {
+                let parts = aws_call(&bucket, "list-parts", &["--key", &physical, "--upload-id", &upload]);
+                assert!(!parts.status.success());
+                assert!(String::from_utf8_lossy(&parts.stderr).contains("NoSuchUpload"));
+                assert!(writer.admit(&key, Uuid::new_v4(), &upload).await.is_err());
+                assert!(uploads.begin().await.unwrap().is_none());
+            }
         }
 
         let operation = serving_intent.operation;

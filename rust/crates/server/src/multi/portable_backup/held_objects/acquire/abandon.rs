@@ -21,6 +21,11 @@ enum Selection {
     ProviderRecord { authority: Uuid, candidate: Uuid },
 }
 
+enum StagingSettlement {
+    Acquired(HoldPlan),
+    Retired { objects_purged: bool },
+}
+
 impl Abandon {
     pub(in crate::multi::portable_backup) fn parse(mut fields: BTreeMap<String, String>) -> Result<Self> {
         let selection = match fields.remove("--stage-receipt") {
@@ -75,10 +80,10 @@ impl Abandon {
                     let operation = order.key_hold.operation;
                     let closed = self.close_staging(store.as_ref(), &key, &inventory, &custodian, &keys, order).await?;
                     match closed {
-                        Some(plan) => plan,
-                        None => return Ok(json!({
+                        StagingSettlement::Acquired(plan) => plan,
+                        StagingSettlement::Retired { objects_purged } => return Ok(json!({
                             "incarnation": candidate, "operation_id": operation, "retired_versions": 0,
-                            "journal_retired": true, "generation_destroyed": true,
+                            "journal_retired": true, "generation_destroyed": true, "objects_purged": objects_purged,
                         })),
                     }
                 }
@@ -125,7 +130,7 @@ impl Abandon {
     async fn close_staging(
         &self, store: &dyn ObjectStore, key: &ObjectKey, inventory: &VersionedInventory,
         custodian: &KeeperJournal, keys: &FileKms, order: staged::StagingOrder,
-    ) -> Result<Option<HoldPlan>> {
+    ) -> Result<StagingSettlement> {
         let hold = order.key_hold;
         let journal = authorize_abandoned_staging(
             &self.authority_socket, order.intent, hold, inventory.namespace().clone(),
@@ -138,15 +143,22 @@ impl Abandon {
         let bytes = serde_json::to_vec(&closed).map_err(|_| invalid_plan())?;
         let written = store.put(key, Bytes::from(bytes)).await;
         match read_acquisition(store, key).await? {
-            Some(Acquisition::Planned(plan)) => return Ok(Some(plan)),
+            Some(Acquisition::Planned(plan)) => return Ok(StagingSettlement::Acquired(plan)),
             Some(Acquisition::Closed(observed)) if observed.abandoned_before_acquisition == hold => (),
             _ => {
                 written?;
                 return Err(invalid_plan());
             }
         }
+        let uploads = order.tracked_uploads.then(|| inventory.staging_uploads(hold.authority, hold.generation.database)).transpose()?;
+        if let Some(uploads) = &uploads {
+            uploads.close().await?;
+        }
         custodian.retire_unacquired(hold.generation.database).await?;
         keys.abandon_recovery_key(order.vault_identity, hold).await?;
-        Ok(None)
+        if let Some(uploads) = &uploads {
+            uploads.purge_abandoned().await?;
+        }
+        Ok(StagingSettlement::Retired { objects_purged: uploads.is_some() })
     }
 }
