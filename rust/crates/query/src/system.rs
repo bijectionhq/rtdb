@@ -857,6 +857,7 @@ mod tests {
         use arrow_array::{RecordBatch, Float64Array};
         use rtdb_columnar::{OwnedBatch, to_field};
         use rtdb_plan::{Binder, Expr, LiteralArrowPages, Relation, RelationNode, Schema};
+        use rtdb_types::Value;
 
         let memory = MemoryBudget::new(1 << 20);
         let double = LogicalType::Scalar(ScalarType::F64).maybe();
