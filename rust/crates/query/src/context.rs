@@ -1,6 +1,6 @@
 use rtdb_types::StructFields;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_index::Snapshot;
@@ -55,8 +55,6 @@ pub struct CatalogSnapshot {
     databases: Arc<BTreeMap<String, DatabaseSnapshot>>,
     transaction_scoped: bool,
     archive_history: bool,
-    /// Derived from `databases` and `owned_relation`; reset by every change to either.
-    relation_names: Arc<Mutex<Option<Arc<RelationNames>>>>,
     owned_relation: Option<(QualifiedTable, OwnedSelection)>,
     /// The masked commit, named by its position (T7), and its first masked commit position.
     pub(crate) owned_position_mask: Option<(TransactionKey, u32)>,
@@ -95,7 +93,7 @@ impl CatalogSnapshot {
         if transaction_scoped && databases.get(&default_database).is_none_or(|database| database.partitions.len() != 1) {
             return Err(invalid("transaction-partition-scope", "An index-time query must contain exactly its resolving partition"));
         }
-        Ok(Self { default_database, databases: Arc::new(databases), transaction_scoped, archive_history: false, relation_names: Default::default(), owned_relation: None, owned_position_mask: None, owned_transaction_cut: None, owned_read_guard: None, runtime: None, ordered_indexes: None, fragmenter: None, fragment_residence: None, read_lease: None, read_view: Arc::default(), snapshot_suffix: None, delivery_owner: None, resumed_storage_owner: None })
+        Ok(Self { default_database, databases: Arc::new(databases), transaction_scoped, archive_history: false, owned_relation: None, owned_position_mask: None, owned_transaction_cut: None, owned_read_guard: None, runtime: None, ordered_indexes: None, fragmenter: None, fragment_residence: None, read_lease: None, read_view: Arc::default(), snapshot_suffix: None, delivery_owner: None, resumed_storage_owner: None })
     }
     /// Enable explicit positional control history on a dedicated archive reader.
     pub fn with_archive_history(mut self) -> Self {
@@ -138,9 +136,7 @@ impl CatalogSnapshot {
         }
     }
     pub(crate) fn database_snapshots(&self) -> &Arc<BTreeMap<String, DatabaseSnapshot>> { &self.databases }
-    /// Clones keep sharing the relation-name memo of the snapshots they were cloned with; this one leaves it.
     pub(crate) fn databases_mut(&mut self) -> &mut BTreeMap<String, DatabaseSnapshot> {
-        self.relation_names = Default::default();
         Arc::make_mut(&mut self.databases)
     }
     pub(crate) fn reset_sql_snapshot_view(
@@ -350,58 +346,26 @@ fn include_table_oid(oid: &mut Option<i32>, snapshot: &Snapshot, table: &TableRe
     Ok(())
 }
 
-struct RelationNames {
-    by_oid: BTreeMap<i32, TableRef>,
-    by_name: BTreeMap<String, BTreeMap<String, i32>>,
-    _reservation: Arc<MemoryReservation>,
-}
-
 impl CatalogSnapshot {
-    fn relation_names(&self, memory: &Arc<MemoryBudget>) -> Result<Arc<RelationNames>> {
-        let mut cached = self.relation_names.lock().map_err(|_| invalid("catalog-state", "Relation name lookup was poisoned"))?;
-        if let Some(names) = &*cached { return Ok(Arc::clone(names)); }
+    /// Whether `database` lists `table` among the relations `table_name_sources` enumerates.
+    fn lists_relation(&self, database: &str, snapshot: &DatabaseSnapshot, table: &TableRef) -> bool {
+        let stored = || snapshot.partitions.iter().any(|partition| partition.contains_table(table));
+        let system = crate::system_schema::definition(table).is_some();
+        match &self.owned_relation {
+            Some((admitted, _)) => admitted.database == database && admitted.table == *table && (system || stored()),
+            None => system || !TableRef::owned_schema(&table.schema) && stored(),
+        }
+    }
 
-        let overflow = || invalid("catalog-size", "Relation lookup exceeds addressable memory");
-        let bound = |bytes: usize, schema: &str, table: &str| {
-            schema.len().checked_add(table.len()).and_then(|len| len.checked_mul(4))
-                .and_then(|len| len.checked_add(512)).and_then(|len| bytes.checked_add(len)).ok_or_else(overflow)
-        };
-        let bytes = if let Some((admitted, _)) = &self.owned_relation {
-            bound(4096, &admitted.table.schema, &admitted.table.table)?
-        } else {
-            self.databases.values().try_fold(4096usize, |bytes, database| {
-                let bytes = crate::system_schema::DEFINITIONS.iter()
-                    .try_fold(bytes, |bytes, definition| bound(bytes, definition.schema, definition.name))?;
-                database.partitions.iter().flat_map(Snapshot::table_names)
-                    .filter(|name| !TableRef::owned_schema(&name.schema))
-                    .try_fold(bytes, |bytes, name| bound(bytes, &name.schema, &name.table))
-            })?
-        };
-        let reservation = memory.reserve(bytes)?;
-        let mut names = RelationNames { by_oid: BTreeMap::new(), by_name: BTreeMap::new(), _reservation: reservation };
-        for (database, snapshot) in self.databases.iter() {
-            let tables = if let Some((admitted, _)) = &self.owned_relation {
-                if &admitted.database != database || !snapshot.partitions.iter().any(|part| part.contains_table(&admitted.table)) { continue; }
-                BTreeSet::from([admitted.table.clone()])
-            } else {
-                snapshot.partitions.iter().flat_map(Snapshot::table_names).filter(|name| !TableRef::owned_schema(&name.schema)).cloned()
-                    .chain(crate::system_schema::DEFINITIONS.iter().map(|def| TableRef::new(def.schema, def.name))).collect()
-            };
-            for table in tables {
-                let mut oid = None;
-                if crate::system_schema::definition(&table).is_none() {
-                    for partition in &snapshot.partitions {
-                        if partition.contains_table(&table) { include_table_oid(&mut oid, partition, &table)?; }
-                    }
-                }
-                let oid = rtdb_types::pg_table_oid(oid, &table);
-                names.by_name.entry(table.schema.clone()).or_default().insert(table.table.clone(), oid);
-                names.by_oid.insert(oid, table);
+    /// The pg_catalog OID of a relation `database` lists.
+    fn relation_oid_in(snapshot: &DatabaseSnapshot, table: &TableRef) -> Result<i32> {
+        let mut oid = None;
+        if crate::system_schema::definition(table).is_none() {
+            for partition in &snapshot.partitions {
+                if partition.contains_table(table) { include_table_oid(&mut oid, partition, table)?; }
             }
         }
-        let names = Arc::new(names);
-        *cached = Some(Arc::clone(&names));
-        Ok(names)
+        Ok(rtdb_types::pg_table_oid(oid, table))
     }
 }
 
@@ -416,15 +380,33 @@ impl rtdb_expr::PgCatalogLookup for CatalogSnapshot {
         Ok(())
     }
 
+    // Both lookups read the catalog's current snapshots on each call, as the enumeration does; a later database's
+    // relation of the same identity answers over an earlier one's.
     fn relation_name(&self, oid: i32, allocation: &rtdb_expr::EvaluationScope) -> Result<Option<String>> {
-        self.relation_names(allocation.memory_budget())?.by_oid.get(&oid)
-            .map(|table| rtdb_expr::format_relation_name(table, allocation)).transpose()
+        let mut found = None;
+        for (database, snapshot) in self.databases.iter() {
+            for (schema, table) in self.table_name_sources(database)? {
+                let table = TableRef::new(schema, table);
+                if Self::relation_oid_in(snapshot, &table)? == oid { found = Some(table); }
+            }
+        }
+        found.map(|table| rtdb_expr::format_relation_name(&table, allocation)).transpose()
     }
 
     fn relation_oid(&self, schema: Option<&str>, table: &str, allocation: &rtdb_expr::EvaluationScope) -> Result<Option<i32>> {
-        let names = self.relation_names(allocation.memory_budget())?;
-        let find = |schema| names.by_name.get(schema).and_then(|tables| tables.get(table)).copied();
-        Ok(match schema { Some(schema) => find(schema), None => find("pg_catalog").or_else(|| find("public")) })
+        let find = |schema: &str| -> Result<Option<i32>> {
+            allocation.reserve(schema.len().saturating_add(table.len()).saturating_add(256))?;
+            let table = TableRef::new(schema, table);
+            let mut found = None;
+            for (database, snapshot) in self.databases.iter() {
+                if self.lists_relation(database, snapshot, &table) { found = Some(Self::relation_oid_in(snapshot, &table)?); }
+            }
+            Ok(found)
+        };
+        match schema {
+            Some(schema) => find(schema),
+            None => Ok(match find("pg_catalog")? { Some(oid) => Some(oid), None => find("public")? }),
+        }
     }
 }
 
@@ -583,7 +565,6 @@ impl QueryContext {
     pub(crate) fn for_owned_selection(mut self: Arc<Self>, table: QualifiedTable, selection: OwnedSelection) -> Arc<Self> {
         let context = Arc::make_mut(&mut self);
         context.catalog.owned_relation = Some((table, selection));
-        context.catalog.relation_names = Default::default();
         context.catalog.runtime = None;
         context.catalog.fragmenter = None;
         context.accelerators = Default::default();
@@ -1107,22 +1088,31 @@ mod apply_argument_tests {
 }
 
 #[test]
-fn catalog_relation_identities_are_built_once_and_charged_to_the_catalog() {
+fn catalog_relation_identities_are_read_from_the_current_snapshots_without_a_memo() {
     use rtdb_expr::PgCatalogLookup;
 
+    let storage = Arc::new(BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20));
     let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), DatabaseSnapshot {
-        partitions: vec![],
-        storage: Arc::new(BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
+        partitions: vec![], storage: Arc::clone(&storage),
     })]), false).unwrap();
     let memory = MemoryBudget::new(1 << 20);
     let scope = rtdb_expr::EvaluationScope::new(&memory).unwrap();
     let oid = catalog.relation_oid(None, "pg_class", &scope).unwrap().unwrap();
-    let used = memory.used_bytes();
-    for _ in 0..100 {
-        assert_eq!(catalog.relation_oid(Some("pg_catalog"), "pg_class", &scope).unwrap(), Some(oid));
-    }
-    assert_eq!(memory.used_bytes(), used);
+    assert_eq!(catalog.relation_oid(Some("pg_catalog"), "pg_class", &scope).unwrap(), Some(oid));
+    assert_eq!(catalog.relation_oid(Some("public"), "pg_class", &scope).unwrap(), None);
     assert_eq!(catalog.relation_name(oid, &scope).unwrap().as_deref(), Some("pg_class"));
+    assert_eq!(catalog.relation_oid(None, "no_such_table", &scope).unwrap(), None);
+    drop(scope);
+    assert_eq!(memory.used_bytes(), 0, "a lookup holds nothing past its scope");
+
+    // A catalog narrowed to one relation lists only it, read again rather than from a memo of the wider catalog.
+    let pg_class = QualifiedTable { database: "xtdb".into(), table: TableRef::new("pg_catalog", "pg_class") };
+    let context = QueryContext::new(catalog, Arc::clone(&memory), Timestamp(0), "UTC", QueryOptions::default(), &CancellationToken::new()).unwrap();
+    let scope = rtdb_expr::EvaluationScope::new(&memory).unwrap();
+    assert!(context.catalog.relation_oid(None, "pg_type", &scope).unwrap().is_some());
+    let narrowed = Arc::clone(&context).for_owned_selection(pg_class, OwnedSelection::Relation);
+    assert_eq!(narrowed.catalog.relation_oid(None, "pg_class", &scope).unwrap(), Some(oid));
+    assert_eq!(narrowed.catalog.relation_oid(None, "pg_type", &scope).unwrap(), None);
 }
 
 #[test]
