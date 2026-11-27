@@ -2465,6 +2465,8 @@ surface QueryAccess {
         -- Grouped output keeps the configured transport row limit.
         -- Primitive numeric sums retain their state at the declared accumulation width within each group.
         -- Scalar aggregates reduce compatible numeric Arrow operands in input order and write compatible results as Arrow columns.
+        -- Direct writers for fixed-width aggregate results preserve the declared Arrow layout even when every group yields null.
+        -- The output page owns the charge for those buffers.
         -- A same-scale Decimal128 sum at non-negative scale accumulates its exact coefficient and checks physical overflow.
         -- Duration sums and averages keep the declared unit and use wrapping signed arithmetic for unit conversion and addition.
         -- Text extrema compare compatible Arrow text by bytes and copy the text only when it becomes a new extremum.

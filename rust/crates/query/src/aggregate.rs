@@ -374,6 +374,10 @@ impl AggregateCursor {
                 }
             };
             states.ensure(batch.len)?;
+            if let Some((column, charge)) = fixed_scalar_results(&states, &aggregate.function, field, context)? {
+                batch.append_column(column, charge, &context.memory)?;
+                continue;
+            }
             let bytes = batch.len.checked_mul(std::mem::size_of::<Value>().max(40)).and_then(|bytes| bytes.checked_add(field.name.len()))
                 .and_then(|bytes| bytes.checked_add(512)).ok_or_else(|| invalid("aggregate-size", "Aggregate output exceeds addressable memory"))?;
             let reservation = context.memory.reserve(bytes)?;
@@ -432,6 +436,127 @@ impl AggregateCursor {
         }
         Ok(Some(batch))
     }
+}
+
+fn fixed_scalar_results(
+    states: &ScalarGroups, function: &AggregateFunction, field: &rtdb_plan::Field, context: &crate::QueryContext,
+) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
+    use AggregateFunction as A;
+    use ScalarType as S;
+    use rtdb_types::TimeUnit;
+    use arrow_array::builder::BooleanBuilder;
+
+    let LogicalType::Scalar(scalar) = without_nullability(&field.data_type) else { return Ok(None); };
+    let state_error = || invalid("aggregate-state", "Aggregate result state does not match its output vector");
+    macro_rules! primitive {
+        ($ty:ty, $read:expr) => {
+            primitive_results::<$ty>(states, field, context, $read).map(Some)
+        };
+    }
+    macro_rules! retained {
+        ($state:expr, $pat:pat => $value:expr) => {
+            match &$state.accumulator {
+                ScalarState::Empty => Ok(None),
+                state => match state.retained() {
+                    Some($pat) => Ok(Some($value)),
+                    _ => Err(state_error()),
+                },
+            }
+        };
+    }
+    macro_rules! numeric {
+        ($ty:ty, $variant:ident) => {
+            primitive!($ty, |state| match &state.accumulator {
+                ScalarState::$variant(value) => Ok(Some(*value)),
+                _ => retained!(state, Value::$variant(value) => *value),
+            })
+        };
+    }
+    // A winning timestamp has already been cast to the output type by the reducer.
+    let timestamp = |state: &ScalarAccumulator| retained!(state, Value::Timestamp { value, .. } => *value);
+    let duration = |state: &ScalarAccumulator| match (&state.accumulator, function) {
+        (_, A::Average) if state.count == 0 => Ok(None),
+        (ScalarState::Duration(value, _), A::Average) => Ok(Some(value.wrapping_div(state.count))),
+        (ScalarState::Duration(value, _), _) => Ok(Some(*value)),
+        _ => retained!(state, Value::Duration { value, .. } => *value),
+    };
+    match (function, scalar) {
+        (A::Sum | A::Min | A::Max, S::I32) => numeric!(Int32Type, I32),
+        (A::Sum | A::Min | A::Max, S::I64) => numeric!(Int64Type, I64),
+        (A::Sum | A::Min | A::Max, S::F32) => numeric!(Float32Type, F32),
+        (A::Min | A::Max, S::F64) => numeric!(Float64Type, F64),
+        (A::Min | A::Max, S::I8) => primitive!(Int8Type, |state| retained!(state, Value::I8(value) => *value)),
+        (A::Min | A::Max, S::I16) => primitive!(Int16Type, |state| retained!(state, Value::I16(value) => *value)),
+        (A::Min | A::Max, S::Timestamp { unit, .. }) => match unit {
+            TimeUnit::Second => primitive!(TimestampSecondType, timestamp),
+            TimeUnit::Millisecond => primitive!(TimestampMillisecondType, timestamp),
+            TimeUnit::Microsecond => primitive!(TimestampMicrosecondType, timestamp),
+            TimeUnit::Nanosecond => primitive!(TimestampNanosecondType, timestamp),
+        },
+        (A::Sum | A::Average | A::Min | A::Max, S::Duration(unit)) => match unit {
+            TimeUnit::Second => primitive!(DurationSecondType, duration),
+            TimeUnit::Millisecond => primitive!(DurationMillisecondType, duration),
+            TimeUnit::Microsecond => primitive!(DurationMicrosecondType, duration),
+            TimeUnit::Nanosecond => primitive!(DurationNanosecondType, duration),
+        },
+        (A::Sum, S::Decimal { bit_width: 128, .. }) => primitive!(Decimal128Type, |state| {
+            Ok(match &state.accumulator {
+                ScalarState::Empty => None,
+                ScalarState::Decimal128(bytes) => Some(i128::from_ne_bytes(*bytes)),
+                state => {
+                    let Some(Value::Decimal(value)) = state.retained() else { return Err(sum_state()); };
+                    Some(i128::from_be_bytes(value.unscaled.as_slice().try_into().map_err(|_| sum_state())?))
+                }
+            })
+        }),
+        (A::Every | A::Any, S::Bool) => {
+            let len = states.values.len();
+            let (column, charge) = build_fixed_results(field, context, len, len.div_ceil(8), |_| {
+                let mut builder = BooleanBuilder::with_capacity(len);
+                for (row, state) in states.values.iter().enumerate() {
+                    context.check_cancelled_at(row)?;
+                    builder.append_option(retained!(state, Value::Bool(value) => *value)?);
+                }
+                Ok(Arc::new(builder.finish()))
+            })?;
+            Ok(Some((column, charge)))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn primitive_results<T: ArrowPrimitiveType>(
+    states: &ScalarGroups, field: &rtdb_plan::Field, context: &crate::QueryContext,
+    read: impl Fn(&ScalarAccumulator) -> Result<Option<T::Native>>,
+) -> Result<(Column, Arc<MemoryReservation>)> {
+    let len = states.values.len();
+    let values = len.checked_mul(size_of::<T::Native>())
+        .ok_or_else(|| invalid("aggregate-size", "Aggregate output exceeds addressable memory"))?;
+    build_fixed_results(field, context, len, values, |data_type| {
+        let mut builder = arrow_array::builder::PrimitiveBuilder::<T>::with_capacity(len).with_data_type(data_type.clone());
+        for (row, state) in states.values.iter().enumerate() {
+            context.check_cancelled_at(row)?;
+            builder.append_option(read(state)?);
+        }
+        Ok(Arc::new(builder.finish()))
+    })
+}
+
+fn build_fixed_results(
+    field: &rtdb_plan::Field, context: &crate::QueryContext, len: usize, values: usize,
+    build: impl FnOnce(&DataType) -> Result<arrow_array::ArrayRef>,
+) -> Result<(Column, Arc<MemoryReservation>)> {
+    let logical_bytes = field.data_type.retained_bytes()?;
+    let bytes = values.checked_add(len.div_ceil(8))
+        .and_then(|bytes| bytes.checked_add(logical_bytes.checked_mul(2)?))
+        .and_then(|bytes| bytes.checked_add(field.name.len()))
+        .and_then(|bytes| bytes.checked_add(512))
+        .ok_or_else(|| invalid("aggregate-size", "Aggregate output exceeds addressable memory"))?;
+    let charge = context.memory.reserve(bytes)?;
+    let logical = field.data_type.clone();
+    let field = Arc::new(rtdb_columnar::to_field(&field.name, &logical)?);
+    let array = build(field.data_type())?;
+    Ok((Column::Arrow { array, field, logical: Some(logical) }, charge))
 }
 
 fn double_results(values: Vec<Option<f64>>, reservation: Arc<MemoryReservation>) -> Result<(Column, Arc<MemoryReservation>)> {

@@ -794,6 +794,78 @@ async fn aggregate_output_is_complete_and_retains_distinct_state_across_pages() 
 }
 
 #[tokio::test]
+async fn fixed_aggregate_results_keep_declared_layout_nulls_and_page_custody() {
+    let execution = execution(8);
+    let memory = &execution.context.memory;
+    let baseline = memory.used_bytes();
+    let integer = LogicalType::Scalar(ScalarType::I64);
+    let duration = |value| Value::Duration { value, unit: TimeUnit::Millisecond };
+    let decimal = |coefficient, precision, scale| Value::Decimal(decimal128_value(coefficient, precision, scale).unwrap());
+    let timestamp = |value, unit, timezone: &str| Value::Timestamp {
+        value, unit, timezone: Some(timezone.into()),
+    };
+    for (function, left, right, expected) in [
+        (AggregateFunction::Sum, Value::I32(i32::MAX), Value::I32(1), Value::I32(i32::MIN)),
+        (AggregateFunction::Sum, Value::I64(i64::MAX), Value::I64(1), Value::I64(i64::MIN)),
+        (AggregateFunction::Sum, Value::F32(-0.0), Value::F32(-0.0), Value::F32(-0.0)),
+        (AggregateFunction::Average, duration(-10), duration(-15), duration(-12)),
+        (AggregateFunction::Sum, decimal(9, 1, 0), decimal(9, 1, 0), decimal(18, 1, 0)),
+        (AggregateFunction::Sum, decimal(1, 20, 0), decimal(2, 20, 2), decimal(102, 22, 2)),
+        (AggregateFunction::Every, Value::Bool(true), Value::Bool(false), Value::Bool(false)),
+        (AggregateFunction::Any, Value::Bool(false), Value::Bool(true), Value::Bool(true)),
+        (AggregateFunction::Max, Value::I16(-257), Value::I16(1300), Value::I16(1300)),
+        (AggregateFunction::Min,
+            timestamp(1_700_000_000_000_000, TimeUnit::Microsecond, "America/New_York"),
+            timestamp(1_700_000_000_000_000_001, TimeUnit::Nanosecond, "UTC"),
+            timestamp(1_700_000_000_000_000_000, TimeUnit::Nanosecond, "Z")),
+    ] {
+        let ty = left.logical_type().join(&right.logical_type());
+        let result_type = expected.logical_type().maybe();
+        let schema = Schema::new(vec![field(0, integer.clone()), field(1, ty.clone())]).unwrap();
+        let group = NamedExpr { field: field(2, integer.clone()), expr: schema.fields()[0].expression() };
+        let aggregate = AggregateExpr {
+            field: field(3, result_type.clone()), function: function.clone(),
+            argument: Some(schema.fields()[1].expression()), distinct: false,
+            filter: Some(Expr::binary(BinaryOp::NotEq, schema.fields()[0].expression(), Expr::Literal(Value::I64(1)))),
+            order_by: vec![],
+        };
+        let pages = vec![
+            vec![vec![Value::I64(2), left.clone()], vec![Value::I64(1), left]],
+            vec![vec![Value::I64(2), right]],
+        ];
+        let (mut cursor, _) = cursor(&execution, schema, pages, vec![group], vec![aggregate], None);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert!(cursor.next_batch().await.unwrap().is_none());
+        drop(cursor);
+        let Column::Arrow { array, field, logical } = &page.columns[1] else { panic!("Expected an Arrow result"); };
+        assert_eq!(field.as_ref(), &rtdb_columnar::to_field("c3", &result_type).unwrap());
+        assert_eq!(logical.as_ref(), Some(&result_type));
+        assert_eq!(array.data_type(), field.data_type());
+        assert_eq!(page.columns[0].value(0).unwrap(), Value::I64(2));
+        assert_eq!(page.columns[0].value(1).unwrap(), Value::I64(1));
+        let actual = page.columns[1].value(0).unwrap();
+        assert_eq!(actual, expected);
+        if let (Value::F32(actual), Value::F32(expected)) = (actual, expected) {
+            assert_eq!(actual.to_bits(), expected.to_bits());
+        }
+        assert!(array.is_null(1));
+        assert!(page.column_reservation(1).bytes() >= array.get_array_memory_size());
+        drop(page);
+        assert_eq!(memory.used_bytes(), baseline);
+
+        let mut empty = primitive_cursor(&execution, function, ty.clone(), ty, vec![], None);
+        let page = empty.next_batch().await.unwrap().unwrap();
+        let Column::Arrow { array, field, .. } = &page.columns[0] else { panic!("Expected an Arrow result"); };
+        assert_eq!(field.as_ref(), &rtdb_columnar::to_field("c1", &result_type).unwrap());
+        assert_eq!(array.data_type(), field.data_type());
+        assert_eq!(array.len(), 1);
+        assert!(array.is_null(0));
+        drop((page, empty));
+        assert_eq!(memory.used_bytes(), baseline);
+    }
+}
+
+#[tokio::test]
 async fn ordered_array_agg_lends_small_backing_and_detaches_wide_sort_keys() {
     for key_width in [0, 16 * 1024] {
         let execution = execution(1024);
