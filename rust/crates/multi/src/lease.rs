@@ -91,8 +91,12 @@ impl MemberLease {
                     if let Cas::Applied(record) = directory.replace_member(candidate.clone(), previous.version).await? {
                         return Ok(record);
                     }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                } else {
+                    // Sleep directly until the previous lease expires instead of polling every 100 ms.
+                    let remaining_ms = previous.lease_expires_at_ms.saturating_sub(now).max(1) as u64;
+                    tokio::time::sleep(Duration::from_millis(remaining_ms)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }).await.map_err(|_| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/logkeeper-lease",
             "The logkeeper's previous membership has not expired"))??;

@@ -863,7 +863,11 @@ impl IntakeLog {
 
     fn trim(&self) {
         let boundary = self.consumed.load(Ordering::Acquire).saturating_add(1);
-        if boundary > self.log.first_retained().0 { let _ = self.log.truncate_before(LogOffset(boundary)); }
+        if boundary > self.log.first_retained().0
+            && let Err(error) = self.log.truncate_before(LogOffset(boundary))
+        {
+            tracing::warn!(boundary, error = %error, "Failed to trim intake log");
+        }
     }
 }
 
