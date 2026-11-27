@@ -14,6 +14,13 @@ pub type Selection<'a> = Option<&'a [bool]>;
 
 fn reads(selection: Selection<'_>, row: usize) -> bool { selection.is_none_or(|rows| rows[row]) }
 
+pub use crate::temporal_functions::{AgeOperand, FixedDateBin};
+
+pub fn calendar_age(end: AgeOperand<'_>, start: AgeOperand<'_>) -> Result<(i32, i32, i64)> {
+    let parts = crate::temporal_functions::calendar_age(end, start)?;
+    Ok((parts.months, parts.days, parts.nanos))
+}
+
 /// Each row's cell, `None` for a null or unselected row; the first failing cell, in row order, raises.
 fn cells<T>(values: &dyn Array, selection: Selection<'_>, mut cell: impl FnMut(usize) -> Result<T>) -> Result<Vec<Option<T>>> {
     let mut cells = Vec::with_capacity(values.len());

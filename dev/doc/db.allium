@@ -2543,6 +2543,8 @@ surface QueryAccess {
         -- A period projection can write compatible zoned microsecond endpoints directly to Arrow.
         -- A null endpoint supplied by a column or literal denotes the corresponding infinity in that projection.
         -- An inverted or empty period fails with the period constructor's validation error.
+        -- A DATE_BIN projection with a fixed-time interval literal and a compatible timestamp origin can write Arrow timestamp ticks with the origin's zone label.
+        -- An AGE projection over compatible date or timestamp inputs can write Arrow intervals using the session-zone calendar and the scalar result precision.
         -- A column table over a compatible Arrow list parameter reads the bound row's child slice as one semantic page.
         -- Its columnar result is split to the transport row limit after the operators have processed the complete page.
         -- Scalar evaluation in columnar projections, filters, aggregate filters, and evaluated UNNEST can borrow the cells demanded by the expression.

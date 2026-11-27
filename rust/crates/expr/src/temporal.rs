@@ -54,10 +54,13 @@ pub(crate) fn absolute(value: &Value) -> Option<Result<Value>> {
         })
 }
 
-fn rescale(value: i64, source: TimeUnit, target: TimeUnit) -> Result<i64> {
+pub(crate) fn rescale(value: i64, source: TimeUnit, target: TimeUnit) -> Result<i64> {
     i64::try_from(i128::from(value) * i128::from(target.units_per_second()) / i128::from(source.units_per_second())).map_err(|_| overflow())
 }
 pub(crate) fn date_days(value: &Value) -> Option<i64> { value.date_days() }
+pub(crate) fn date_timestamp(days: i64, unit: TimeUnit) -> Result<i64> {
+    days.checked_mul(86_400).and_then(|seconds| seconds.checked_mul(unit.units_per_second())).ok_or_else(overflow)
+}
 /// The wall-clock microseconds a date or timestamp reads as in `timezone`: date-times that compare equal share it.
 pub fn local_micros(value: &Value, timezone: &str) -> Option<i64> { timestamp_units(value, TimeUnit::Microsecond, true, timezone).ok() }
 
@@ -66,23 +69,24 @@ pub fn local_timestamp_micros(value: i64, source: TimeUnit, zoned: bool, timezon
 }
 
 fn rescale_timestamp(value: i64, source: TimeUnit, target: TimeUnit, localize: bool, timezone: &str) -> Result<i64> {
-    let value = if localize {
-        let offset = offset_at(value, source, &zone(timezone)?)?;
-        value.checked_add(i64::from(offset).checked_mul(source.units_per_second()).ok_or_else(overflow)?).ok_or_else(overflow)?
-    } else {
-        value
-    };
-    rescale(value, source, target)
+    let zone = localize.then(|| zone(timezone)).transpose()?;
+    rescale(local_timestamp(value, source, zone.as_ref())?, source, target)
 }
 
 pub(crate) fn timestamp_units(value: &Value, unit: TimeUnit, localize: bool, timezone: &str) -> Result<i64> {
-    if let Some(days) = date_days(value) { return days.checked_mul(86_400).and_then(|seconds| seconds.checked_mul(unit.units_per_second())).ok_or_else(overflow); }
+    if let Some(days) = date_days(value) { return date_timestamp(days, unit); }
     match value {
         Value::Timestamp { value, unit: source, timezone: source_zone } =>
             rescale_timestamp(*value, *source, unit, localize && source_zone.is_some(), timezone),
         Value::Duration { value, unit: source } | Value::Time { value, unit: source, .. } => rescale(*value, *source, unit),
         _ => Err(inapplicable("temporal arithmetic", &[value])),
     }
+}
+
+pub(crate) fn local_timestamp(value: i64, unit: TimeUnit, zone: Option<&Zone>) -> Result<i64> {
+    let Some(zone) = zone else { return Ok(value); };
+    let offset = i64::from(offset_at(value, unit, zone)?);
+    value.checked_add(offset.checked_mul(unit.units_per_second()).ok_or_else(overflow)?).ok_or_else(overflow)
 }
 
 fn offset_at(value: i64, unit: TimeUnit, zone: &Zone) -> Result<i32> {
@@ -119,12 +123,16 @@ fn add_interval(value: &Value, parts: IntervalParts, result: &ScalarType, sign: 
             local_near(moved, &zone, offset)?.checked_mul(unit.units_per_second()).and_then(|seconds| seconds.checked_add(value.rem_euclid(unit.units_per_second()))).ok_or_else(overflow)?
         }
     } else { calendar_units(value, *unit, parts, sign)? };
-    let seconds = parts.nanos.div_euclid(1_000_000_000).checked_mul(unit.units_per_second()).ok_or_else(overflow)?;
-    let remainder = parts.nanos.rem_euclid(1_000_000_000);
-    let per_unit = 1_000_000_000 / unit.units_per_second();
-    let duration = if sign > 0 { seconds.checked_add(remainder / per_unit) }
-        else { seconds.checked_neg().and_then(|seconds| seconds.checked_sub((remainder + per_unit - 1) / per_unit)) }.ok_or_else(overflow)?;
+    let duration = interval_ticks(parts.nanos, *unit, sign)?;
     Ok(Value::Timestamp { value: moved.checked_add(duration).ok_or_else(overflow)?, unit: *unit, timezone: timezone.clone() })
+}
+
+pub(crate) fn interval_ticks(nanos: i64, unit: TimeUnit, sign: i64) -> Result<i64> {
+    let seconds = nanos.div_euclid(1_000_000_000).checked_mul(unit.units_per_second()).ok_or_else(overflow)?;
+    let remainder = nanos.rem_euclid(1_000_000_000);
+    let per_unit = 1_000_000_000 / unit.units_per_second();
+    if sign > 0 { seconds.checked_add(remainder / per_unit) }
+        else { seconds.checked_neg().and_then(|seconds| seconds.checked_sub((remainder + per_unit - 1) / per_unit)) }.ok_or_else(overflow)
 }
 
 pub(crate) fn arithmetic(op: BinaryOp, left: &Value, right: &Value, timezone: &str) -> Option<Result<Value>> {

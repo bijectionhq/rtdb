@@ -1,6 +1,7 @@
 //! Column-at-a-time pages: a scan gathers the cells its visible rows resolve to into one column per output field,
 //! so filters and aggregates can read whole columns, and rows are materialised only for operators that need them.
 pub(crate) mod apply;
+mod calendar;
 mod concat;
 pub(crate) mod float_vector;
 mod float_vectors;
@@ -5768,6 +5769,11 @@ impl BatchCursor for BatchExpressions {
                 continue;
             }
             if let Some((column, owner)) = periods::range_bins(kernel, &self.schema, &batch, &self.execution.context)? {
+                columns.push(column);
+                owners[index] = Some(owner);
+                continue;
+            }
+            if let Some((column, owner)) = calendar::project(kernel, &self.schema, &batch, &self.execution.context)? {
                 columns.push(column);
                 owners[index] = Some(owner);
                 continue;

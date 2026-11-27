@@ -235,11 +235,37 @@ fn truncate(field: F,value: &Value,override_zone: Option<ZoneId>) -> Result<Valu
 fn age(end: &Value,start: &Value,timezone: &str) -> Result<Value> {
     let local = |value: &Value| -> Result<(CivilDate,i64)> {
         let unit = match value { Value::Timestamp { unit,.. } => *unit,_ => U::Microsecond };
-        let value = timestamp_units(value,unit,true,timezone)?;
-        let hz = unit.units_per_second();
-        Ok((CivilDate::from_epoch_day(value.div_euclid(hz * 86_400))?,value.rem_euclid(hz * 86_400) * (1_000_000_000 / hz)))
+        age_local(timestamp_units(value,unit,true,timezone)?, unit)
     };
-    let (end_date,end_nano) = local(end)?;let (start_date,start_nano) = local(start)?;
+    let end_local = local(end)?;
+    let start_local = local(start)?;
+    let nano = [start,end].iter().any(|value|matches!(value,Value::Timestamp { unit: U::Nanosecond,.. }));
+    age_parts(end_local, start_local, nano)?.into_value(&if nano { S::Interval(rtdb_types::IntervalUnit::MonthDayNano) } else { S::IntervalMonthDayMicro })
+}
+
+fn age_local(value: i64, unit: U) -> Result<(CivilDate, i64)> {
+    let hz = unit.units_per_second();
+    Ok((CivilDate::from_epoch_day(value.div_euclid(hz * 86_400))?, value.rem_euclid(hz * 86_400) * (1_000_000_000 / hz)))
+}
+
+/// An epoch day or timestamp tick with its session zone for AGE.
+pub enum AgeOperand<'a> {
+    Date(i64),
+    Timestamp(i64, U, Option<&'a ZoneId>),
+}
+
+pub(crate) fn calendar_age(end: AgeOperand<'_>, start: AgeOperand<'_>) -> Result<IntervalParts> {
+    use crate::temporal::{date_timestamp, local_timestamp};
+
+    let local = |operand| match operand {
+        AgeOperand::Date(days) => age_local(date_timestamp(days, U::Microsecond)?, U::Microsecond),
+        AgeOperand::Timestamp(value, unit, zone) => age_local(local_timestamp(value, unit, zone)?, unit),
+    };
+    let nano = [&end, &start].iter().any(|operand| matches!(operand, AgeOperand::Timestamp(_, U::Nanosecond, _)));
+    age_parts(local(end)?, local(start)?, nano)
+}
+
+fn age_parts((end_date, end_nano): (CivilDate, i64), (start_date, start_nano): (CivilDate, i64), nano: bool) -> Result<IntervalParts> {
     let (ey,em,ed) = end_date.ymd();let (sy,sm,sd) = start_date.ymd();
     let mut months = (i64::from(ey) - i64::from(sy)) * 12 + i64::from(em) - i64::from(sm);
     let mut days = i64::from(ed) - i64::from(sd);
@@ -251,9 +277,45 @@ fn age(end: &Value,start: &Value,timezone: &str) -> Result<Value> {
     let total_nanos = i128::from(end_date.epoch_day() - start_date.epoch_day()) * 86_400_000_000_000 + i128::from(end_nano) - i128::from(start_nano);
     let duration_days = total_nanos.div_euclid(1_000_000_000) / 86_400;
     let mut nanos = (total_nanos - duration_days * 86_400_000_000_000) as i64;
-    let nano = [start,end].iter().any(|value|matches!(value,Value::Timestamp { unit: U::Nanosecond,.. }));
     if !nano { nanos = nanos.div_euclid(1000) * 1000; }
-    IntervalParts { months: i32::try_from(months).map_err(|_|overflow())?,days: i32::try_from(days).map_err(|_|overflow())?,nanos }.into_value(&if nano { S::Interval(rtdb_types::IntervalUnit::MonthDayNano) } else { S::IntervalMonthDayMicro })
+    Ok(IntervalParts { months: i32::try_from(months).map_err(|_|overflow())?,days: i32::try_from(days).map_err(|_|overflow())?,nanos })
+}
+
+/// Fixed-time binning for a source and origin that are both local or both zoned.
+pub struct FixedDateBin {
+    source_unit: U,
+    origin: i64,
+    origin_unit: U,
+    stride_nanos: i64,
+    output_unit: U,
+}
+
+impl FixedDateBin {
+    pub fn new(stride: &Value, source_unit: U, origin: i64, origin_unit: U) -> Option<Self> {
+        let output_unit = match stride {
+            Value::IntervalMonthDayMicro { months: 0, days: 0, .. } => origin_unit.max(U::Microsecond),
+            Value::IntervalMonthDayNano { months: 0, days: 0, .. } => U::Nanosecond,
+            _ => return None,
+        };
+        let stride_nanos = IntervalParts::of(stride)?.nanos;
+        Some(Self { source_unit, origin, origin_unit, stride_nanos, output_unit })
+    }
+
+    pub fn output_unit(&self) -> U { self.output_unit }
+
+    pub fn cell(&self, source: i64) -> Result<i64> {
+        use crate::{numeric::signed_quotient, temporal::{interval_ticks, rescale}};
+
+        let difference_unit = self.source_unit.max(self.origin_unit);
+        let source = rescale(source, self.source_unit, difference_unit)?;
+        let origin = rescale(self.origin, self.origin_unit, difference_unit)?;
+        let difference = source.checked_sub(origin).ok_or_else(overflow)?;
+        let stride = rescale(self.stride_nanos, U::Nanosecond, difference_unit)?;
+        let quotient = signed_quotient(difference, stride)?;
+        let offset = self.stride_nanos.checked_mul(quotient).ok_or_else(overflow)?;
+        let origin = rescale(self.origin, self.origin_unit, self.output_unit)?;
+        origin.checked_add(interval_ticks(offset, self.output_unit, 1)?).ok_or_else(overflow)
+    }
 }
 
 #[derive(Clone,Copy)]
