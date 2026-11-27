@@ -3070,7 +3070,7 @@ dependencies = [
 [[package]]
 name = "journal-contract"
 version = "0.1.0"
-source = "git+https://github.com/bijectionhq/logkeeper.git?rev=74bfb98615291b581329053318d6b200c39b9e11#74bfb98615291b581329053318d6b200c39b9e11"
+source = "git+https://github.com/bijectionhq/logkeeper.git?rev=32b2d87e4313fe6c7f2702bd238f2ad1935862a4#32b2d87e4313fe6c7f2702bd238f2ad1935862a4"
 dependencies = [
  "bytes",
  "serde",
@@ -3254,7 +3254,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 [[package]]
 name = "logkeeper"
 version = "0.2.0"
-source = "git+https://github.com/bijectionhq/logkeeper.git?rev=74bfb98615291b581329053318d6b200c39b9e11#74bfb98615291b581329053318d6b200c39b9e11"
+source = "git+https://github.com/bijectionhq/logkeeper.git?rev=32b2d87e4313fe6c7f2702bd238f2ad1935862a4#32b2d87e4313fe6c7f2702bd238f2ad1935862a4"
 dependencies = [
  "bincode",
  "bytes",
@@ -3263,6 +3263,7 @@ dependencies = [
  "futures",
  "journal-contract",
  "libc",
+ "object_store",
  "openraft",
  "parking_lot",
  "prost",
@@ -3739,6 +3740,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "walkdir",
  "wasm-bindgen-futures",
  "web-time",
 ]
