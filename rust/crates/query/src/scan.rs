@@ -1027,8 +1027,9 @@ impl ScanCursor {
             drop(workers);
             Ok::<_, Anomaly>(ranking.winners())
         }).await;
+        // Storage's memory limit reaches here with the ResourceExhausted kind its conversion gives it.
         let mut winners = match query_winners {
-            Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) || error.code == "rtdb.storage/memory-limit" => None,
+            Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => None,
             result => result?,
         };
         let mut parts = VecDeque::new();
