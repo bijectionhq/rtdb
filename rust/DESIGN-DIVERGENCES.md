@@ -299,7 +299,6 @@ RTDB's replication driver keeps upstream's leader/follower election and log-proc
 - Read-back identity matches staged writes by SHA-256 frame fingerprint and pointer identity (`readback_identity`) rather than `txId` alone.
 - Progress watchers continue serving already-applied prefixes after a driver fault, fail only unmet waits, and clear the terminal fault on explicit driver restart (`clear_terminal`), whereas upstream `Watchers.notifyError` fails every subsequent await.
 - On term-fencing journals (Logkeeper, placed deployments), leadership promotes only with an external writer grant and an empty read.
-- `BlockCutter`'s row count tracks applied rows rather than advancing at resolve time.
 - RTDB adds `wire_await_time` (awaiting by system time), catalog/serving checkpoints, offline journal repair (`repair-checkpoint`, `retain-repair-base`), and an active standalone `compactor` command that opens followers and publishes for a separate writer.
 
 **Why.**
@@ -530,13 +529,14 @@ Correlated shapes on the remaining per-row apply list execute once per outer row
 **What differs.**
 Upstream XTDB maintains a 4,096-entry SQL parse cache, a 4,096-entry plan cache, per-plan emit caches, and a DML skeleton cache.
 RTDB caches plans per prepared statement (`CachedPlan`, LRU of 4 parameter-type signatures), shares read plans across sessions in `SharedPlans` (128 plans within 1/64 of execution memory, capped at 16 MiB, excluding DML and `EXPLAIN`), and reuses prepared mutations across argument rows in `MutationPlans`.
-RTDB has no global SQL-text parse cache and no bytecode emit cache.
+Plan reuse checks catalog dependencies and the recorded join estimates.
+Parsing is scoped to statement preparation.
 
 **Why.**
-Rust SQL parsing is lightweight enough to run per preparation while bounded plan caches prevent unbounded memory growth under dynamic workloads.
+Bounded caches charge retained plans to execution memory.
 
 **What a user sees.**
-Short ad-hoc queries parsed afresh on every request still pay parse time, whereas repeated prepared queries and shared read plans skip binding and optimization.
+Repeated preparations can reuse read plans when their dependencies and estimates still agree with the current snapshot.
 
 **Where in the code.**
 - `RC/node/src/statement.rs`
@@ -596,7 +596,9 @@ RTDB implements several core engine internals differently from XTDB while preser
 - **Scan merge and temporal resolution.** `PartitionScan` runs a heap-based merge across event sources.
   Eligible Classic point scans track the valid-time gap around the point and seek to the next IID once the result is settled.
   Eligible range predicates run before payload gathering, and historical cuts that require full bounds use the polygon resolver.
-- **Metadata pruning:** leaf statistics are decoded lazily into `Value` trees (`LeafColumns`) per visited leaf and roaring bloom filters are deserialized per check rather than queried zero-copy.
+- **Metadata pruning.** Leaf statistics are decoded as the scan visits each leaf.
+  Byte equality probes use a validated borrowed view of standard serialized Roaring blooms.
+  Other encodings go through the checked bitmap decoder.
 - **Value boundaries:** while system columns (`_iid`, `_valid_*`, `_system_*`) are Arrow arrays, spill uses Arrow IPC, and pgwire encodes directly from Arrow where supported, several operators (non-columnar joins, aggregates, window, set ops), DML writes (`TransactionBuffer`), Flight bulk ingest, and compaction merges (`SegmentCompactor`, running parallel jobs on `spawn_blocking`) still convert through owned `Value` / `StoredEvent` trees.
 - **Cancellation:** RTDB uses per-query `CancellationToken` trees and cooperative checks rather than JVM thread interrupts.
 
