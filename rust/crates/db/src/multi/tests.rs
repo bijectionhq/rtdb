@@ -4119,19 +4119,23 @@ async fn applied_watch_waiters_share_one_journal_long_poll() {
     follower.fresh_index().await.unwrap();
 
     let until = tokio::time::Instant::now() + Duration::from_secs(60);
-    let waiters: Vec<_> = (0..4).map(|_| {
+    let mut waiters: [_; 4] = std::array::from_fn(|_| {
         let mut watch = follower.watch_applied();
         watch.mark_seen();
-        tokio::spawn(async move { watch.changed(until).await })
-    }).collect();
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(waiters.iter().all(|waiter| !waiter.is_finished()), "nothing is left to apply");
+        Box::pin(async move { watch.changed(until).await })
+    });
+    std::future::poll_fn(|context| {
+        for waiter in &mut waiters {
+            assert!(std::future::Future::poll(waiter.as_mut(), context).is_pending());
+        }
+        std::task::Poll::Ready(())
+    }).await;
+    assert_eq!(polls.count.load(Ordering::SeqCst), 1);
     writer.transact(&put(2, 2, "second")).await.unwrap();
-    for waiter in waiters {
-        tokio::time::timeout(Duration::from_secs(10), waiter).await.expect("the entry wakes every waiter").unwrap().unwrap();
-    }
-    // A woken waiter that re-checks before its refresh lands may poll once more, but never one poll per waiter.
-    assert!(polls.count.load(Ordering::SeqCst) < 4, "the waiters shared their long polls");
+    let [first, second, third, fourth] = waiters;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::try_join!(first, second, third, fourth)
+    }).await.expect("the entry wakes every waiter").unwrap();
 }
 
 #[tokio::test]
