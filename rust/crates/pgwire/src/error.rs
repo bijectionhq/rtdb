@@ -36,7 +36,9 @@ fn kind_state(kind: AnomalyKind) -> Option<&'static str> {
         AnomalyKind::ConfigurationLimitExceeded => Some("53400"),
         AnomalyKind::ProgramLimitExceeded => Some("54000"),
         AnomalyKind::NumericValueOutOfRange => Some("22003"),
-        AnomalyKind::TableNotFound => None,
+        AnomalyKind::TableNotFound | AnomalyKind::OptimisticConflict | AnomalyKind::MissingObject | AnomalyKind::CorruptObject
+        | AnomalyKind::InputOutOfOrder | AnomalyKind::GrammarRejected | AnomalyKind::BasisAhead | AnomalyKind::UnknownBasis
+        | AnomalyKind::NoWriter => None,
     }
 }
 
@@ -98,23 +100,27 @@ mod tests {
         assert_eq!(state(&error), "22003");
     }
 
-    /// RTDB `incorrect` codes named like a limit that still report upstream's `08P01` default.
-    /// Each is either a validation error that rightly keeps it or a limit still owed a kind; a code given a kind leaves the list.
-    const LIMIT_SHAPED_PROTOCOL_VIOLATIONS: &[&str] = &[
-        "rtdb.auth/http-limit", "rtdb.auth/response-too-large", "rtdb.expr/allocation-size", "rtdb.flight-sql/lease-size", "rtdb.index/schema-size",
-        "rtdb.index/snapshot-size", "rtdb.metrics/allocation-overflow", "rtdb.metrics/export-size", "rtdb.metrics/render-limit",
-        "rtdb.multi/assertion-family-size", "rtdb.multi/assertion-size", "rtdb.multi/replay-broker-size", "rtdb.node/invalid-memory-budget",
-        "rtdb.node/preparation-size", "rtdb.owned/change-group-too-large", "rtdb.owned/count-bound", "rtdb.owned/merged-change-commit-size",
-        "rtdb.owned/nearest-limit", "rtdb.owned/prepared-generation-bound", "rtdb.owned/purge-handle-bound", "rtdb.owned/range-bound",
-        "rtdb.owned/range-limit", "rtdb.owned/read-size", "rtdb.owned/replica-inline-bound", "rtdb.owned/search-limit",
-        "rtdb.pgwire/history-label-bound", "rtdb.plan/aggregate-size", "rtdb.plan/catalog-size", "rtdb.plan/qualifier-size",
-        "rtdb.plan/regex-metadata-size", "rtdb.plan/settings-size", "rtdb.query/expression-size", "rtdb.query/parameter-size",
-        "rtdb.server/invalid-memory-budget", "rtdb.storage/message-too-large", "rtdb.store/invalid-bound", "rtdb.temporal/ceiling-size",
-        "rtdb.temporal/history-row-size", "rtdb.tx/allocation-overflow", "rtdb.types/clojure-index-size", "rtdb.types/java-text-size",
-        "rtdb/allocation-bound", "rtdb/binary-width", "rtdb/change-limit", "rtdb/classic-projection-size", "rtdb/column-size",
-        "rtdb/decision-clock-record-size", "rtdb/iid-run-width", "rtdb/journal-record-too-large", "rtdb/list-size", "rtdb/rank-bound",
-        "rtdb/reservation-budget", "rtdb/reservation-size", "rtdb/run-end-overflow", "rtdb/run-end-selection-width", "rtdb/run-end-width",
-        "rtdb/time-overflow", "rtdb/time-width", "rtdb/trie-row-overflow", "rtdb/trie-size", "rtdb/type-size", "rtdb/value-size-overflow",
+    /// RTDB `incorrect` codes named like a limit that rightly keep upstream's `08P01`: each refuses a malformed argument,
+    /// configuration or schema, as XTDB reports an `IllegalArgumentException`, rather than work that outgrew a limit.
+    /// A limit raised as `incorrect` must carry its kind instead of joining this list.
+    const LIMIT_SHAPED_PROTOCOL_VIOLATIONS: &[(&str, &str)] = &[
+        ("rtdb.auth/http-limit", "a configured OIDC response limit of zero"),
+        ("rtdb.node/invalid-memory-budget", "node options disagree with the supplied execution budget"),
+        ("rtdb.server/invalid-memory-budget", "the supplied execution budget disagrees with the configured split"),
+        ("rtdb.store/invalid-bound", "a store bound whose min exceeds its max"),
+        ("rtdb.owned/count-bound", "a count bound on a relation that cannot carry one"),
+        ("rtdb.owned/range-bound", "a range bound that does not match its path key"),
+        ("rtdb.owned/range-limit", "a requested range limit outside 1..=128"),
+        ("rtdb.owned/nearest-limit", "a nearest request with a malformed or out-of-range probe, filter or k"),
+        ("rtdb.owned/search-limit", "a search request with an out-of-range offset, limit, partition count or text"),
+        ("rtdb/binary-width", "a negative fixed-size binary width in a schema"),
+        ("rtdb/list-size", "a negative fixed-size list length in a schema"),
+        ("rtdb/iid-run-width", "IID run ends of a type other than i16, i32 or i64"),
+        ("rtdb/run-end-width", "run ends of a type other than i16, i32 or i64"),
+        ("rtdb/time-width", "a time width that disagrees with its unit"),
+        ("rtdb/change-limit", "a changes request with a zero group limit"),
+        ("rtdb/rank-bound", "a rank admission with negative counts (its limit variant carries a kind)"),
+        ("rtdb/reservation-budget", "absorbing a reservation from another budget, a misuse of the reservation API"),
     ];
 
     const LIMIT_SUFFIXES: [&str; 9] = ["-size", "-overflow", "-limit", "-budget", "-bound", "-width", "-exceeded", "-too-large", "-capacity"];
@@ -158,12 +164,17 @@ mod tests {
             let error = match AnomalyKind::from_wire_code(code) { Some(kind) => error.with_kind(kind), None => error };
             state(&error).to_owned()
         };
-        let unlisted = limit_codes.iter().filter(|code| reported(code) == "08P01" && !LIMIT_SHAPED_PROTOCOL_VIOLATIONS.contains(&code.as_str())).collect::<Vec<_>>();
+        let listed = |code: &str| LIMIT_SHAPED_PROTOCOL_VIOLATIONS.iter().any(|(listed, _)| *listed == code);
+        let unlisted = limit_codes.iter().filter(|code| reported(code) == "08P01" && !listed(code)).collect::<Vec<_>>();
         assert!(unlisted.is_empty(), "limit codes reporting 08P01 without a kind: {unlisted:?}");
-        let stale = LIMIT_SHAPED_PROTOCOL_VIOLATIONS.iter().filter(|code| !limit_codes.contains(**code) || reported(code) != "08P01").collect::<Vec<_>>();
+        let stale = LIMIT_SHAPED_PROTOCOL_VIOLATIONS.iter().filter(|(code, _)| !limit_codes.contains(*code) || reported(code) != "08P01").collect::<Vec<_>>();
         assert!(stale.is_empty(), "listed codes no longer raised, or now given a kind: {stale:?}");
-        for code in ["rtdb/list-offset-overflow", "rtdb.sql/batch-size", "rtdb.query/shared-plan-size", "rtdb/decimal-width"] {
+        for code in ["rtdb/list-offset-overflow", "rtdb.sql/batch-size", "rtdb.query/shared-plan-size", "rtdb/decimal-width", "rtdb.query/expression-size",
+            "rtdb/value-size-overflow", "rtdb.plan/catalog-size", "rtdb/journal-record-too-large"] {
             assert_eq!(reported(code), "54000", "{code}");
+        }
+        for (code, expected) in [("rtdb.storage/message-too-large", "53400"), ("rtdb.auth/response-too-large", "53400"), ("rtdb/time-overflow", "22003")] {
+            assert_eq!(reported(code), expected, "{code}");
         }
     }
 }

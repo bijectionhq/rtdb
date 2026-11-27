@@ -6,7 +6,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     #[error("invalid object key: {0}")]
     InvalidKey(String),
-    #[error("object does not exist: {0}")]
+    /// XTDB's local and in-memory object stores report a missing object in these words.
+    #[error("Object {0} doesn't exist.")]
     MissingObject(String),
     #[error("range [{start}, {end}) exceeds object {key} of length {length}")]
     InvalidRange { key: String, start: u64, end: u64, length: u64 },
@@ -68,7 +69,13 @@ impl From<Error> for rtdb_types::Anomaly {
     fn from(error: Error) -> Self {
         use rtdb_types::{Anomaly, AnomalyCategory as Category, AnomalyKind};
         let message = error.to_string();
-        let kind = matches!(error, Error::MemoryLimit { .. }).then_some(AnomalyKind::ResourceExhausted);
+        let kind = match error {
+            Error::MemoryLimit { .. } => Some(AnomalyKind::ResourceExhausted),
+            Error::MessageTooLarge { .. } => Some(AnomalyKind::ConfigurationLimitExceeded),
+            Error::MissingObject(_) => Some(AnomalyKind::MissingObject),
+            Error::InvalidRange { .. } => Some(AnomalyKind::CorruptObject),
+            _ => None,
+        };
         let (category, code, context) = match error {
             Error::InvalidKey(key) => (Category::Incorrect, "rtdb.storage/invalid-key", serde_json::json!({"key": key})),
             Error::MissingObject(key) => (Category::NotFound, "rtdb.storage/missing-object", serde_json::json!({"key": key})),
@@ -137,6 +144,16 @@ mod tests {
         assert_eq!(anomaly.context["multipart-abort"]["code"], "rtdb.storage/remote");
         assert!(anomaly.message.as_deref().is_some_and(|message| message.contains("upload denied")));
         assert!(anomaly.message.as_deref().is_some_and(|message| message.contains("abort unavailable")));
+    }
+
+    #[test]
+    fn a_missing_object_reports_xtdbs_text_and_its_kind() {
+        let missing = rtdb_types::Anomaly::from(Error::MissingObject("tables/public$foo/data/l00-rc-b00.arrow".into()));
+        assert_eq!(missing.message.as_deref(), Some("Object tables/public$foo/data/l00-rc-b00.arrow doesn't exist."));
+        assert!(missing.is(rtdb_types::AnomalyKind::MissingObject));
+        assert_eq!(rtdb_types::AnomalyKind::from_wire_code(&missing.code), Some(rtdb_types::AnomalyKind::MissingObject));
+        let short = rtdb_types::Anomaly::from(Error::InvalidRange { key: "k".into(), start: 0, end: 9, length: 4 });
+        assert!(short.is(rtdb_types::AnomalyKind::CorruptObject));
     }
 
     #[test]

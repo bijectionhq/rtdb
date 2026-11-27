@@ -32,6 +32,22 @@ pub enum AnomalyKind {
     NumericValueOutOfRange,
     /// A table name resolved to no table.
     TableNotFound,
+    /// A transaction conflicted with data that changed under it: a failed `ASSERT`, or a write fenced by another work's grant.
+    OptimisticConflict,
+    /// The object store holds no object under the key, as when a read reaches a file collected after its block left the retention window.
+    MissingObject,
+    /// A stored object could not be decoded as the artefact it should hold.
+    CorruptObject,
+    /// An index build was handed rows outside the order it requires.
+    InputOutOfOrder,
+    /// A construct the vendor SQL parser admits but XTDB's grammar has no production for.
+    GrammarRejected,
+    /// A read asked for a basis this node has not applied yet.
+    BasisAhead,
+    /// A read asked for a basis this database never had, or one from another incarnation.
+    UnknownBasis,
+    /// This node holds no writer lease for the database, so a write must go to the node that does.
+    NoWriter,
 }
 
 impl AnomalyKind {
@@ -41,12 +57,30 @@ impl AnomalyKind {
         match code {
             "rtdb/memory-budget-exceeded" | "rtdb.storage/memory-limit"
             | "rtdb/allocation-failed" | "rtdb.expr/allocation-failed" => Some(Self::ResourceExhausted),
-            "rtdb.query/spill-limit" => Some(Self::ConfigurationLimitExceeded),
+            "rtdb.query/spill-limit" | "rtdb.storage/message-too-large" | "rtdb.auth/response-too-large" => Some(Self::ConfigurationLimitExceeded),
             "rtdb.expr/regex-limit" | "rtdb.expr/regex-host-limit" | "rtdb.query/sort-size" | "rtdb.query/shared-plan-size"
             | "rtdb.sql/allocation-size" | "rtdb.sql/token-array-size" | "rtdb.sql/split-size" | "rtdb.sql/control-size" | "rtdb.sql/batch-size"
-            | "rtdb/list-offset-overflow" | "rtdb/union-offset-overflow" | "rtdb/allocation-overflow" | "rtdb/decimal-width" => Some(Self::ProgramLimitExceeded),
-            "rtdb/decimal-precision" | "rtdb.pgwire/integer-out-of-range" => Some(Self::NumericValueOutOfRange),
+            | "rtdb/list-offset-overflow" | "rtdb/union-offset-overflow" | "rtdb/allocation-overflow" | "rtdb/decimal-width"
+            | "rtdb.query/expression-size" | "rtdb.query/parameter-size" | "rtdb.expr/allocation-size" | "rtdb.flight-sql/lease-size"
+            | "rtdb.index/schema-size" | "rtdb.index/snapshot-size" | "rtdb.metrics/allocation-overflow" | "rtdb.metrics/export-size"
+            | "rtdb.metrics/render-limit" | "rtdb.multi/assertion-family-size" | "rtdb.multi/assertion-size" | "rtdb.multi/replay-broker-size"
+            | "rtdb.node/preparation-size" | "rtdb.owned/change-group-too-large" | "rtdb.owned/merged-change-commit-size"
+            | "rtdb.owned/prepared-generation-bound" | "rtdb.owned/purge-handle-bound" | "rtdb.owned/read-size" | "rtdb.owned/replica-inline-bound"
+            | "rtdb.pgwire/history-label-bound" | "rtdb.plan/aggregate-size" | "rtdb.plan/catalog-size" | "rtdb.plan/qualifier-size"
+            | "rtdb.plan/regex-metadata-size" | "rtdb.plan/settings-size" | "rtdb.temporal/ceiling-size" | "rtdb.temporal/history-row-size"
+            | "rtdb.tx/allocation-overflow" | "rtdb.types/clojure-index-size" | "rtdb.types/java-text-size" | "rtdb/allocation-bound"
+            | "rtdb/classic-projection-size" | "rtdb/column-size" | "rtdb/decision-clock-record-size" | "rtdb/journal-record-too-large"
+            | "rtdb/reservation-size" | "rtdb/run-end-overflow" | "rtdb/run-end-selection-width" | "rtdb/trie-row-overflow" | "rtdb/trie-size"
+            | "rtdb/type-size" | "rtdb/value-size-overflow" => Some(Self::ProgramLimitExceeded),
+            "rtdb/decimal-precision" | "rtdb.pgwire/integer-out-of-range" | "rtdb/time-overflow" => Some(Self::NumericValueOutOfRange),
             "xtdb/table-not-found" => Some(Self::TableNotFound),
+            "xtdb/assert-failed" | "rtdb.owned/footprint-grant-fenced" => Some(Self::OptimisticConflict),
+            "rtdb.storage/missing-object" => Some(Self::MissingObject),
+            "rtdb.vector/corrupt-generation" => Some(Self::CorruptObject),
+            "rtdb.search/input-order" => Some(Self::InputOutOfOrder),
+            "rtdb/basis-ahead" => Some(Self::BasisAhead),
+            "rtdb/unknown-basis" => Some(Self::UnknownBasis),
+            "rtdb/no-writer" => Some(Self::NoWriter),
             _ => None,
         }
     }
@@ -180,9 +214,20 @@ mod tests {
             "rtdb.sql/batch-size", "rtdb/list-offset-overflow", "rtdb/union-offset-overflow", "rtdb/allocation-overflow", "rtdb/decimal-width"] {
             assert_eq!(AnomalyKind::from_wire_code(code), Some(AnomalyKind::ProgramLimitExceeded), "{code}");
         }
+        assert_eq!(AnomalyKind::from_wire_code("rtdb.query/expression-size"), Some(AnomalyKind::ProgramLimitExceeded));
+        assert_eq!(AnomalyKind::from_wire_code("rtdb.storage/message-too-large"), Some(AnomalyKind::ConfigurationLimitExceeded));
+        assert_eq!(AnomalyKind::from_wire_code("rtdb/time-overflow"), Some(AnomalyKind::NumericValueOutOfRange));
         assert_eq!(AnomalyKind::from_wire_code("rtdb/decimal-precision"), Some(AnomalyKind::NumericValueOutOfRange));
         assert_eq!(AnomalyKind::from_wire_code("rtdb.pgwire/integer-out-of-range"), Some(AnomalyKind::NumericValueOutOfRange));
         assert_eq!(AnomalyKind::from_wire_code("xtdb/table-not-found"), Some(AnomalyKind::TableNotFound));
+        assert_eq!(AnomalyKind::from_wire_code("xtdb/assert-failed"), Some(AnomalyKind::OptimisticConflict));
+        assert_eq!(AnomalyKind::from_wire_code("rtdb.owned/footprint-grant-fenced"), Some(AnomalyKind::OptimisticConflict));
+        assert_eq!(AnomalyKind::from_wire_code("rtdb.storage/missing-object"), Some(AnomalyKind::MissingObject));
+        assert_eq!(AnomalyKind::from_wire_code("rtdb.vector/corrupt-generation"), Some(AnomalyKind::CorruptObject));
+        assert_eq!(AnomalyKind::from_wire_code("rtdb.search/input-order"), Some(AnomalyKind::InputOutOfOrder));
+        assert_eq!(AnomalyKind::from_wire_code("rtdb/basis-ahead"), Some(AnomalyKind::BasisAhead));
+        assert_eq!(AnomalyKind::from_wire_code("rtdb/unknown-basis"), Some(AnomalyKind::UnknownBasis));
+        assert_eq!(AnomalyKind::from_wire_code("rtdb/no-writer"), Some(AnomalyKind::NoWriter));
         assert_eq!(AnomalyKind::from_wire_code("xtdb/sql-error"), None);
         assert_eq!(AnomalyKind::from_wire_code("xtdb.expression/overflow-error"), None);
     }
@@ -191,7 +236,10 @@ mod tests {
     fn every_kind_serialises_under_its_kebab_case_name() {
         for (kind, name) in [(AnomalyKind::ResourceExhausted, "resource-exhausted"), (AnomalyKind::ConfigurationLimitExceeded, "configuration-limit-exceeded"),
             (AnomalyKind::ProgramLimitExceeded, "program-limit-exceeded"), (AnomalyKind::NumericValueOutOfRange, "numeric-value-out-of-range"),
-            (AnomalyKind::TableNotFound, "table-not-found")] {
+            (AnomalyKind::TableNotFound, "table-not-found"), (AnomalyKind::OptimisticConflict, "optimistic-conflict"),
+            (AnomalyKind::MissingObject, "missing-object"), (AnomalyKind::CorruptObject, "corrupt-object"),
+            (AnomalyKind::InputOutOfOrder, "input-out-of-order"), (AnomalyKind::GrammarRejected, "grammar-rejected"),
+            (AnomalyKind::BasisAhead, "basis-ahead"), (AnomalyKind::UnknownBasis, "unknown-basis"), (AnomalyKind::NoWriter, "no-writer")] {
             assert_eq!(serde_json::to_value(kind).unwrap(), name);
             assert_eq!(serde_json::from_value::<AnomalyKind>(name.into()).unwrap(), kind);
         }
