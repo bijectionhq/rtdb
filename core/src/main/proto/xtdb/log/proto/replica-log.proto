@@ -15,10 +15,13 @@ message ReplicaLogMessage {
         NoOp no_op = 5;
         TriesDeleted tries_deleted = 6;
         OversizedMessage oversized_message = 8;
-        ArtefactsAdded artefacts_added = 10;
-        ArtefactsRemoved artefacts_removed = 11;
-        TablesRetired tables_retired = 12;
+        // RTDB's fields are numbered from 1000; see log.proto.
+        ArtefactsAdded artefacts_added = 1000;
+        ArtefactsRemoved artefacts_removed = 1001;
+        TablesRetired tables_retired = 1002;
     }
+
+    reserved 10 to 12;
 
     // The leader term that produced this message, for read-side fencing: followers
     // discard any message below the max term they've seen. Default 0 on messages
@@ -60,15 +63,17 @@ message ResolvedTx {
     // Set when this tx came from the source log; absent for ext-source txs whose tx_id is an
     // independent counter rather than a source-log msgId.
     int64 src_msg_id = 9 [features.field_presence = EXPLICIT];
-    bytes placed_attempt = 10;
+    bytes placed_attempt = 1000;
 
     // The two coordinates checked by a strict writer before staging this
     // committed attempt. Both travel with its effect through journal recovery.
-    AcceptanceStage acceptance_stage = 11;
-    bytes search_delta = 12;
+    AcceptanceStage acceptance_stage = 1001;
+    bytes search_delta = 1002;
 
     // Exact reserved input commitment, prefixed with the terminal kind.
-    bytes placed_slot_terminal = 13;
+    bytes placed_slot_terminal = 1003;
+
+    reserved 10 to 13;
 }
 
 message AcceptanceStage {
@@ -91,10 +96,11 @@ message NoOp {
     int64 src_msg_id = 1;
 
     // A placed receiver's reservation does not advance applied source progress.
-    bytes placed_slot_reservation = 2;
+    bytes placed_slot_reservation = 1000;
     // An applied-branch decision or reply. A timed original stores its source position here.
     // Only its terminal record sets src_msg_id.
-    bytes serving_record = 3;
+    bytes serving_record = 1001;
+    reserved 2, 3;
 
     // A leader clock lease end, in UTC microseconds, and nothing else (T7). A leader decides
     // only while its clock plus the drift bound is before the latest lease it issued, and
@@ -113,8 +119,9 @@ message OversizedMessage {
     int32 storage_epoch = 2;
     int64 block_index = 3;
     string payload_id = 4;
-    bytes payload_sha256 = 5;
-    ReplicaPayloadPublication publication = 6;
+    bytes payload_sha256 = 1000;
+    ReplicaPayloadPublication publication = 1001;
+    reserved 5, 6;
 }
 
 message ReplicaPayloadPublication {

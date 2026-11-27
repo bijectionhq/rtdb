@@ -2126,6 +2126,7 @@ contract XtdbRefusesRtdbExtensionRecords {
     -- A log record or block file that uses a feature XTDB does not implement is framed so that an XTDB node reading it fails on it, instead of skipping it or applying it without that feature.
     -- A record or file that uses no such feature keeps XTDB's framing byte for byte.
     -- Every field the fork adds to a message XTDB shares is either framed or an annotation XTDB loses nothing by ignoring; a format test fails on a field that is neither.
+    -- Every such field is numbered from 1000, so a field upstream adds next cannot take its number; the numbers the fork used before are reserved.
 
     @invariant ExtensionSourceRecords
         -- The source framing header is 4 (RTDB_EXTENSION_LOG_HEADER) for a ServingTransactMessage, an ArtefactsAddedMessage, an ArtefactsRemovedMessage,

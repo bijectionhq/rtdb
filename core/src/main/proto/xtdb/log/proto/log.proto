@@ -8,6 +8,9 @@ option java_multiple_files = true;
 
 // Behavioural spec: dev/doc/db.allium
 
+// Every field RTDB adds to a message XTDB declares is numbered from 1000, far above upstream's fields,
+// so that a field upstream adds next cannot collide with it. The numbers RTDB used before this rule are reserved.
+
 message SourceLogMessage {
     // 5 was block_uploaded, only ever written by unreleased builds between 2.1 and 2.2.
     reserved 5;
@@ -18,10 +21,12 @@ message SourceLogMessage {
         AttachDatabase attach_database = 3;
         DetachDatabase detach_database = 4;
         Tx tx = 6;
-        ArtefactsAdded artefacts_added = 7;
-        ArtefactsRemoved artefacts_removed = 8;
-        bytes serving_transact = 9;
+        ArtefactsAdded artefacts_added = 1000;
+        ArtefactsRemoved artefacts_removed = 1001;
+        bytes serving_transact = 1002;
     }
+
+    reserved 7 to 9;
 }
 
 message Tx {
@@ -31,12 +36,12 @@ message Tx {
     string user = 4;
     bytes user_metadata = 5;
     bytes external_source_token = 6;
-    IdempotencyGuard idempotency_guard = 7;
-    ReplaySubmission replay_submission = 8;
+    IdempotencyGuard idempotency_guard = 1000;
+    ReplaySubmission replay_submission = 1001;
     // The intake position comes from the log record's metadata.
-    bytes placed_attempt_seed = 9;
-    BoundedRetry bounded_retry = 10;
-    reserved 11;
+    bytes placed_attempt_seed = 1002;
+    BoundedRetry bounded_retry = 1003;
+    reserved 7 to 11;
     reserved prepared_landing;
 }
 
@@ -64,13 +69,12 @@ message BlockUploaded {
     int64 latest_processed_msg_id = 4;
     repeated TrieDetails tries = 5;
     bytes external_source_token = 6;
-    // SHA-256 of the exact encoded block catalog selected by this upload.
-    bytes catalog_sha256 = 7;
     // The block catalog's naming epoch, when above 0: its compaction outputs carry trie keys XTDB cannot parse,
     // so the record is framed for XTDB to refuse. See dev/doc/db.allium (XtdbRefusesRtdbExtensionRecords).
-    // Numbered far above upstream's fields so that a field upstream adds next cannot collide with it.
     int64 naming_epoch = 1000;
-    reserved 8;
+    // SHA-256 of the exact encoded block catalog selected by this upload.
+    bytes catalog_sha256 = 1001;
+    reserved 7, 8;
 }
 
 message FlushBlock {
@@ -114,8 +118,9 @@ message TrieDetails {
     TrieMetadata trie_metadata = 4;
     TrieState trie_state = 5;
     int64 garbage_as_of = 6;
-    repeated ArtefactRecord artefacts = 7;
-    TrieFileVersions published_files = 8;
+    repeated ArtefactRecord artefacts = 1000;
+    TrieFileVersions published_files = 1001;
+    reserved 7, 8;
 }
 
 // Physical identities returned when the immutable files were published.

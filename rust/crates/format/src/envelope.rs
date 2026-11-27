@@ -34,9 +34,9 @@ impl SourceMessage {
         let mut cursor = 0;
         while cursor < payload.len() {
             let (field, wire, body) = wire_key(payload, cursor).map_err(invalid)?;
-            if matches!(field, 1..=4 | 6..=9) {
+            if matches!(field, 1..=4 | SOURCE_TX | SOURCE_ARTEFACTS_ADDED | SOURCE_ARTEFACTS_REMOVED | SOURCE_SERVING_TRANSACT) {
                 if wire != 2 { return Err(invalid("Source message body must be length-delimited")); }
-                transaction = matches!(field, 6 | 9);
+                transaction = matches!(field, SOURCE_TX | SOURCE_SERVING_TRANSACT);
             }
             cursor = skip_wire(payload, field, wire, body, 0).map_err(invalid)?;
         }
@@ -92,6 +92,12 @@ impl SourceMessage {
         Ok(encoded)
     }
 }
+
+// `SourceLogMessage`'s oneof members in log.proto, beyond upstream's 1 to 4.
+const SOURCE_TX: u32 = 6;
+const SOURCE_ARTEFACTS_ADDED: u32 = 1000;
+const SOURCE_ARTEFACTS_REMOVED: u32 = 1001;
+const SOURCE_SERVING_TRANSACT: u32 = 1002;
 
 fn wire_varint(bytes: &mut &[u8]) -> Result<u64> {
     let mut value = 0;
@@ -155,7 +161,7 @@ impl<'a> ReplicaPeek<'a> {
                 (4 | 8, 2) => { wire_bytes(&mut wire)?; }
                 (5, 2) => Self::table_entry(wire_bytes(&mut wire)?)?,
                 (9, 0) => source = Some(wire_varint(&mut wire).ok()? as i64),
-                (12, 2) => search_delta = Some(wire_bytes(&mut wire)?),
+                (RESOLVED_SEARCH_DELTA, 2) => search_delta = Some(wire_bytes(&mut wire)?),
                 _ => return None,
             }
         }
@@ -182,6 +188,9 @@ impl<'a> ReplicaPeek<'a> {
         Some(source)
     }
 }
+
+/// `ResolvedTx.search_delta` in replica-log.proto.
+const RESOLVED_SEARCH_DELTA: u32 = 1002;
 
 fn wire_bytes<'a>(wire: &mut &'a [u8]) -> Option<&'a [u8]> {
     let length = usize::try_from(wire_varint(wire).ok()?).ok()?;

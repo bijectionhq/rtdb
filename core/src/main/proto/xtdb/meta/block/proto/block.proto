@@ -32,15 +32,17 @@ message TableBlock {
     repeated Partition partitions = 5;
     // keyed by the Arrow field name a column's data is written under, as `arrow_schema` is.
     map<string, xtdb.cols.proto.ColumnMeta> columns = 6;
-    repeated xtdb.log.proto.SearchRun search_runs = 7;
-    repeated xtdb.log.proto.RetiredSearchRun retired_search_runs = 8;
+
+    // RTDB's fields are numbered from 1000; see log.proto.
+    repeated xtdb.log.proto.SearchRun search_runs = 1000;
+    repeated xtdb.log.proto.RetiredSearchRun retired_search_runs = 1001;
     // When the table's relation was retired: every trie it holds or later receives is garbage.
-    int64 retired_as_of_micros = 9;
-  xtdb.log.proto.EntityDirectoryRoot entity_directory = 13;
-  repeated xtdb.log.proto.EntityDirectoryRoot retired_entity_directories = 14;
-    repeated xtdb.log.proto.TermDirectoryRoot term_directories = 12;
-  repeated xtdb.log.proto.RetiredTermDirectory retired_term_directories = 15;
-  reserved 11;
+    int64 retired_as_of_micros = 1002;
+    repeated xtdb.log.proto.TermDirectoryRoot term_directories = 1003;
+    xtdb.log.proto.EntityDirectoryRoot entity_directory = 1004;
+    repeated xtdb.log.proto.EntityDirectoryRoot retired_entity_directories = 1005;
+    repeated xtdb.log.proto.RetiredTermDirectory retired_term_directories = 1006;
+    reserved 7 to 9, 11 to 14;
 }
 
 message TxKey {
@@ -90,14 +92,18 @@ message Block {
     // this field, or whose boundary carried none. See #6105.
     int64 boundary_term_seq = 10;
 
+    // RTDB's fields are numbered from 1000; see log.proto.
+
     // The naming epoch of compaction outputs planned from this block's catalog.
     // A compactor reset increments it, so no trie name is published twice.
-    int64 naming_epoch = 11;
+    int64 naming_epoch = 1000;
 
     // Written by the Rust producer after its table block writes complete.
-    TableBlockManifest table_block_manifest = 12;
+    TableBlockManifest table_block_manifest = 1001;
 
     // The applied-branch image at this replica boundary, inline or named by a canonical object key.
-    bytes serving_checkpoint = 13;
-    string serving_checkpoint_object = 14;
+    bytes serving_checkpoint = 1002;
+    string serving_checkpoint_object = 1003;
+
+    reserved 11 to 14;
 }

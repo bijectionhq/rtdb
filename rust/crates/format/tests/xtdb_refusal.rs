@@ -50,40 +50,40 @@ enum Fork {
 
 /// Every field the fork adds to a message it shares with XTDB.
 const FORK_FIELDS: &[(&str, u32, Fork)] = &[
-    ("SourceLogMessage", 7, Fork::Framed),
-    ("SourceLogMessage", 8, Fork::Framed),
-    ("SourceLogMessage", 9, Fork::Framed),
-    ("Tx", 7, Fork::Framed),
-    ("Tx", 8, Fork::Framed),
-    ("Tx", 9, Fork::Framed),
-    ("Tx", 10, Fork::Framed),
-    ("BlockUploaded", 7, Fork::Annotation("the digest of the block file, which XTDB reads by its key")),
+    ("SourceLogMessage", 1000, Fork::Framed),
+    ("SourceLogMessage", 1001, Fork::Framed),
+    ("SourceLogMessage", 1002, Fork::Framed),
+    ("Tx", 1000, Fork::Framed),
+    ("Tx", 1001, Fork::Framed),
+    ("Tx", 1002, Fork::Framed),
+    ("Tx", 1003, Fork::Framed),
+    ("BlockUploaded", 1001, Fork::Annotation("the digest of the block file, which XTDB reads by its key")),
     ("BlockUploaded", 1000, Fork::Framed),
-    ("TrieDetails", 7, Fork::Framed),
-    ("TrieDetails", 8, Fork::Annotation("the object versions of immutable files, which XTDB reads by their keys")),
-    ("ReplicaLogMessage", 10, Fork::Framed),
-    ("ReplicaLogMessage", 11, Fork::Framed),
-    ("ReplicaLogMessage", 12, Fork::Framed),
-    ("ResolvedTx", 10, Fork::Framed),
-    ("ResolvedTx", 11, Fork::Framed),
-    ("ResolvedTx", 12, Fork::Framed),
-    ("ResolvedTx", 13, Fork::Framed),
-    ("NoOp", 2, Fork::Framed),
-    ("NoOp", 3, Fork::Framed),
+    ("TrieDetails", 1000, Fork::Framed),
+    ("TrieDetails", 1001, Fork::Annotation("the object versions of immutable files, which XTDB reads by their keys")),
+    ("ReplicaLogMessage", 1000, Fork::Framed),
+    ("ReplicaLogMessage", 1001, Fork::Framed),
+    ("ReplicaLogMessage", 1002, Fork::Framed),
+    ("ResolvedTx", 1000, Fork::Framed),
+    ("ResolvedTx", 1001, Fork::Framed),
+    ("ResolvedTx", 1002, Fork::Framed),
+    ("ResolvedTx", 1003, Fork::Framed),
+    ("NoOp", 1000, Fork::Framed),
+    ("NoOp", 1001, Fork::Framed),
     ("NoOp", 4, Fork::Framed),
-    ("OversizedMessage", 5, Fork::Annotation("the digest of the payload, which XTDB fetches by its key")),
-    ("OversizedMessage", 6, Fork::Framed),
-    ("TableBlock", 7, Fork::Framed),
-    ("TableBlock", 8, Fork::Framed),
-    ("TableBlock", 9, Fork::Framed),
-    ("TableBlock", 12, Fork::Framed),
-    ("TableBlock", 13, Fork::Framed),
-    ("TableBlock", 14, Fork::Framed),
-    ("TableBlock", 15, Fork::Framed),
-    ("Block", 11, Fork::Framed),
-    ("Block", 12, Fork::Annotation("the digests of the table block files, which XTDB reads by their keys")),
-    ("Block", 13, Fork::Framed),
-    ("Block", 14, Fork::Framed),
+    ("OversizedMessage", 1000, Fork::Annotation("the digest of the payload, which XTDB fetches by its key")),
+    ("OversizedMessage", 1001, Fork::Framed),
+    ("TableBlock", 1000, Fork::Framed),
+    ("TableBlock", 1001, Fork::Framed),
+    ("TableBlock", 1002, Fork::Framed),
+    ("TableBlock", 1003, Fork::Framed),
+    ("TableBlock", 1004, Fork::Framed),
+    ("TableBlock", 1005, Fork::Framed),
+    ("TableBlock", 1006, Fork::Framed),
+    ("Block", 1000, Fork::Framed),
+    ("Block", 1001, Fork::Annotation("the digests of the table block files, which XTDB reads by their keys")),
+    ("Block", 1002, Fork::Framed),
+    ("Block", 1003, Fork::Framed),
 ];
 
 /// The field numbers a `.proto` file declares for `message`, oneof members included.
@@ -113,6 +113,17 @@ fn every_field_the_fork_adds_to_a_shared_message_is_framed_or_a_named_annotation
         assert_eq!(added, classified.remove(message).unwrap_or_default(), "{message}: classify each added field in FORK_FIELDS");
     }
     assert!(classified.is_empty(), "classified fields of unshared messages: {classified:?}");
+}
+
+/// The first field number RTDB may give a field it adds to a message XTDB declares.
+const FORK_FIELD_FLOOR: u32 = 1000;
+
+#[test]
+fn every_field_the_fork_adds_to_a_shared_message_is_numbered_above_upstreams_range() {
+    // The leader clock lease (NoOp 4) is outside the rule only until its deletion lands.
+    let low = FORK_FIELDS.iter().filter(|(message, field, _)| *field < FORK_FIELD_FLOOR && (*message, *field) != ("NoOp", 4))
+        .map(|(message, field, _)| (*message, *field)).collect::<Vec<_>>();
+    assert!(low.is_empty(), "number these from {FORK_FIELD_FLOOR}, so a field upstream adds next cannot collide: {low:?}");
 }
 
 fn framed_fields() -> BTreeSet<(&'static str, u32)> {
@@ -169,25 +180,25 @@ fn envelope(message: ReplicaBody) -> ReplicaEnvelope {
 /// Replica records that use an RTDB-only feature, each with the fork field it exercises, if any.
 fn extension_replica_bodies() -> Vec<(Option<(&'static str, u32)>, ReplicaBody)> {
     vec![
-        (Some(("ReplicaLogMessage", 10)), ReplicaBody::ArtefactsAdded(artefacts_added())),
-        (Some(("ReplicaLogMessage", 11)), ReplicaBody::ArtefactsRemoved(pb::ArtefactsRemoved::default())),
-        (Some(("ReplicaLogMessage", 12)), ReplicaBody::TablesRetired(pb::TablesRetired { table_names: vec!["rtdb_owned_v1/docs".into()], as_of_micros: Some(7) })),
-        (Some(("ResolvedTx", 10)), resolved(|tx| tx.placed_attempt = Some(vec![1; 96].into()))),
-        (Some(("ResolvedTx", 12)), resolved(|tx| tx.search_delta = Some(vec![1].into()))),
-        (Some(("ResolvedTx", 13)), resolved(|tx| tx.placed_slot_terminal = Some(vec![1].into()))),
+        (Some(("ReplicaLogMessage", 1000)), ReplicaBody::ArtefactsAdded(artefacts_added())),
+        (Some(("ReplicaLogMessage", 1001)), ReplicaBody::ArtefactsRemoved(pb::ArtefactsRemoved::default())),
+        (Some(("ReplicaLogMessage", 1002)), ReplicaBody::TablesRetired(pb::TablesRetired { table_names: vec!["rtdb_owned_v1/docs".into()], as_of_micros: Some(7) })),
+        (Some(("ResolvedTx", 1000)), resolved(|tx| tx.placed_attempt = Some(vec![1; 96].into()))),
+        (Some(("ResolvedTx", 1002)), resolved(|tx| tx.search_delta = Some(vec![1].into()))),
+        (Some(("ResolvedTx", 1003)), resolved(|tx| tx.placed_slot_terminal = Some(vec![1].into()))),
         (None, resolved(|tx| tx.table_data = [("xt/idempotency_receipts".to_owned(), vec![1].into())].into_iter().collect())),
-        (Some(("NoOp", 2)), ReplicaBody::NoOp(pb::NoOp { placed_slot_reservation: Some(vec![1].into()), ..Default::default() })),
-        (Some(("NoOp", 3)), ReplicaBody::NoOp(pb::NoOp { src_msg_id: Some(4), serving_record: Some(vec![1].into()), ..Default::default() })),
+        (Some(("NoOp", 1000)), ReplicaBody::NoOp(pb::NoOp { placed_slot_reservation: Some(vec![1].into()), ..Default::default() })),
+        (Some(("NoOp", 1001)), ReplicaBody::NoOp(pb::NoOp { src_msg_id: Some(4), serving_record: Some(vec![1].into()), ..Default::default() })),
         (Some(("NoOp", 4)), ReplicaBody::NoOp(pb::NoOp { clock_lease_micros: Some(9), ..Default::default() })),
         (None, ReplicaBody::TriesAdded(tries_added(vec![trie("l01-rc-b00-e01")]))),
-        (Some(("TrieDetails", 7)), ReplicaBody::TriesAdded(tries_added(vec![with_artefact(trie("l01-rc-b00"))]))),
+        (Some(("TrieDetails", 1000)), ReplicaBody::TriesAdded(tries_added(vec![with_artefact(trie("l01-rc-b00"))]))),
         (None, ReplicaBody::TriesAdded(tries_added(vec![pb::TrieDetails { table_name: Some("xt/bounded_retry_receipts".into()), ..trie("l00-rc-b02") }]))),
         (None, ReplicaBody::TriesDeleted(pb::TriesDeleted { table_name: Some("public/docs".into()), trie_keys: vec!["l01-rc-b00-e01".into()] })),
         (None, ReplicaBody::TriesDeleted(pb::TriesDeleted { table_name: Some("public/docs".into()), trie_keys: vec!["l00-rc-b02".into()] })),
         (None, ReplicaBody::TriesDeleted(pb::TriesDeleted { table_name: Some("rtdb_owned_v1/docs".into()), trie_keys: vec!["l01-rc-b00".into()] })),
         (Some(("BlockUploaded", 1000)), uploaded(|upload| upload.naming_epoch = Some(1))),
         (None, uploaded(|upload| upload.tries = vec![with_artefact(trie("l00-rc-b02"))])),
-        (Some(("OversizedMessage", 6)), oversized(|message| {
+        (Some(("OversizedMessage", 1001)), oversized(|message| {
             message.storage_version = Some(-1);
             message.publication = Some(pb::ReplicaPayloadPublication { storage_version: Some(6), ..Default::default() });
         })),
@@ -198,13 +209,13 @@ fn extension_replica_bodies() -> Vec<(Option<(&'static str, u32)>, ReplicaBody)>
 fn extension_source_bodies() -> Vec<(Option<(&'static str, u32)>, SourceBody)> {
     let tx = || pb::Tx { tx_ops: Some(vec![1].into()), default_tz: Some("UTC".into()), ..Default::default() };
     vec![
-        (Some(("SourceLogMessage", 7)), SourceBody::ArtefactsAdded(artefacts_added())),
-        (Some(("SourceLogMessage", 8)), SourceBody::ArtefactsRemoved(pb::ArtefactsRemoved::default())),
-        (Some(("SourceLogMessage", 9)), SourceBody::ServingTransact(vec![9; 16].into())),
-        (Some(("Tx", 7)), SourceBody::Tx(pb::Tx { idempotency_guard: Some(pb::IdempotencyGuard { submitted_at_micros: Some(1), after_bootstrap: Some(false) }), ..tx() })),
-        (Some(("Tx", 8)), SourceBody::Tx(pb::Tx { replay_submission: Some(pb::ReplaySubmission::default()), ..tx() })),
-        (Some(("Tx", 9)), SourceBody::Tx(pb::Tx { placed_attempt_seed: Some(vec![0; 8].into()), ..tx() })),
-        (Some(("Tx", 10)), SourceBody::Tx(pb::Tx { bounded_retry: Some(pb::BoundedRetry { nonce: Some(vec![b'0'; 32]), not_after_micros: Some(2) }), ..tx() })),
+        (Some(("SourceLogMessage", 1000)), SourceBody::ArtefactsAdded(artefacts_added())),
+        (Some(("SourceLogMessage", 1001)), SourceBody::ArtefactsRemoved(pb::ArtefactsRemoved::default())),
+        (Some(("SourceLogMessage", 1002)), SourceBody::ServingTransact(vec![9; 16].into())),
+        (Some(("Tx", 1000)), SourceBody::Tx(pb::Tx { idempotency_guard: Some(pb::IdempotencyGuard { submitted_at_micros: Some(1), after_bootstrap: Some(false) }), ..tx() })),
+        (Some(("Tx", 1001)), SourceBody::Tx(pb::Tx { replay_submission: Some(pb::ReplaySubmission::default()), ..tx() })),
+        (Some(("Tx", 1002)), SourceBody::Tx(pb::Tx { placed_attempt_seed: Some(vec![0; 8].into()), ..tx() })),
+        (Some(("Tx", 1003)), SourceBody::Tx(pb::Tx { bounded_retry: Some(pb::BoundedRetry { nonce: Some(vec![b'0'; 32]), not_after_micros: Some(2) }), ..tx() })),
         (None, SourceBody::TriesAdded(tries_added(vec![trie("l01-rc-b00-e01")]))),
         (None, SourceBody::TriesAdded(tries_added(vec![with_artefact(trie("l01-rc-b00"))]))),
     ]
@@ -223,20 +234,20 @@ fn block(edit: impl FnOnce(&mut block_pb::Block)) -> Vec<u8> {
 /// Encoded block files that record an RTDB-only feature, each with the fork field it exercises, if any.
 fn extension_block_files() -> Vec<(Option<(&'static str, u32)>, Vec<u8>)> {
     vec![
-        (Some(("TableBlock", 7)), table_block(|table| table.with_search_runs(vec![pb::SearchRun::default()], vec![]))),
-        (Some(("TableBlock", 8)), table_block(|table| table.with_search_runs(vec![], vec![pb::RetiredSearchRun::default()]))),
-        (Some(("TableBlock", 9)), table_block(|table| table.with_retired_as_of(Some(7)))),
-        (Some(("TableBlock", 12)), table_block(|table| table.with_term_directories(vec![pb::TermDirectoryRoot::default()]))),
-        (Some(("TableBlock", 13)), table_block(|table| table.with_entity_directory(Some(pb::EntityDirectoryRoot::default()), vec![]))),
-        (Some(("TableBlock", 14)), table_block(|table| table.with_entity_directory(None, vec![pb::EntityDirectoryRoot::default()]))),
-        (Some(("TableBlock", 15)), table_block(|table| table.with_retired_term_directories(vec![pb::RetiredTermDirectory::default()]))),
+        (Some(("TableBlock", 1000)), table_block(|table| table.with_search_runs(vec![pb::SearchRun::default()], vec![]))),
+        (Some(("TableBlock", 1001)), table_block(|table| table.with_search_runs(vec![], vec![pb::RetiredSearchRun::default()]))),
+        (Some(("TableBlock", 1002)), table_block(|table| table.with_retired_as_of(Some(7)))),
+        (Some(("TableBlock", 1003)), table_block(|table| table.with_term_directories(vec![pb::TermDirectoryRoot::default()]))),
+        (Some(("TableBlock", 1004)), table_block(|table| table.with_entity_directory(Some(pb::EntityDirectoryRoot::default()), vec![]))),
+        (Some(("TableBlock", 1005)), table_block(|table| table.with_entity_directory(None, vec![pb::EntityDirectoryRoot::default()]))),
+        (Some(("TableBlock", 1006)), table_block(|table| table.with_retired_term_directories(vec![pb::RetiredTermDirectory::default()]))),
         (None, TableBlock::decode(&block_pb::TableBlock { tries: vec![trie("l01-rc-b00-e01")], ..Default::default() }.encode_to_vec()).unwrap().encode()),
         (None, TableBlock::decode(&block_pb::TableBlock {
             partitions: vec![block_pb::Partition { tries: vec![with_artefact(trie("l01-rc-b00"))], ..Default::default() }], ..Default::default()
         }.encode_to_vec()).unwrap().encode()),
-        (Some(("Block", 11)), block(|wire| wire.naming_epoch = Some(1))),
-        (Some(("Block", 13)), block(|wire| wire.serving_checkpoint = Some(vec![1].into()))),
-        (Some(("Block", 14)), block(|wire| wire.serving_checkpoint_object = Some("checkpoint".into()))),
+        (Some(("Block", 1000)), block(|wire| wire.naming_epoch = Some(1))),
+        (Some(("Block", 1002)), block(|wire| wire.serving_checkpoint = Some(vec![1].into()))),
+        (Some(("Block", 1003)), block(|wire| wire.serving_checkpoint_object = Some("checkpoint".into()))),
         (None, block(|wire| wire.tables = vec![block_pb::TableEntry {
             oid: Some(16_384), schema_name: Some("xt".into()), table_name: Some("idempotency_receipts".into()), slug: Some("xt$idempotency_receipts".into()),
         }])),
@@ -248,7 +259,7 @@ fn every_framed_fork_field_has_an_extension_sample() {
     let covered = extension_replica_bodies().into_iter().map(|(field, _)| field)
         .chain(extension_source_bodies().into_iter().map(|(field, _)| field))
         .chain(extension_block_files().into_iter().map(|(field, _)| field))
-        .chain([Some(("ResolvedTx", 11))])
+        .chain([Some(("ResolvedTx", 1001))])
         .flatten().collect::<BTreeSet<_>>();
     assert_eq!(covered, framed_fields());
 }
@@ -269,10 +280,10 @@ fn records_and_files_with_only_annotations_keep_xtdb_framing_byte_for_byte() {
         (None, resolved(|_| ())),
         (None, ReplicaBody::TriesAdded(tries_added(vec![trie("l01-rc-b00")]))),
         (None, ReplicaBody::TriesDeleted(pb::TriesDeleted { table_name: Some("public/docs".into()), trie_keys: vec!["l01-rc-b00".into()] })),
-        (Some(("BlockUploaded", 7)), uploaded(|upload| { upload.tries = vec![trie("l00-rc-b02")]; upload.catalog_sha256 = Some(vec![7; 32].into()); })),
-        (Some(("TrieDetails", 8)), uploaded(|upload| upload.tries = vec![pb::TrieDetails { published_files: Some(published.clone()), ..trie("l00-rc-b02") }])),
+        (Some(("BlockUploaded", 1001)), uploaded(|upload| { upload.tries = vec![trie("l00-rc-b02")]; upload.catalog_sha256 = Some(vec![7; 32].into()); })),
+        (Some(("TrieDetails", 1001)), uploaded(|upload| upload.tries = vec![pb::TrieDetails { published_files: Some(published.clone()), ..trie("l00-rc-b02") }])),
         (None, uploaded(|upload| upload.naming_epoch = Some(0))),
-        (Some(("OversizedMessage", 5)), oversized(|message| message.payload_sha256 = Some(vec![5; 32].into()))),
+        (Some(("OversizedMessage", 1000)), oversized(|message| message.payload_sha256 = Some(vec![5; 32].into()))),
         (None, ReplicaBody::NoOp(pb::NoOp { src_msg_id: Some(4), ..Default::default() })),
     ];
     let mut covered = BTreeSet::new();
@@ -297,7 +308,7 @@ fn records_and_files_with_only_annotations_keep_xtdb_framing_byte_for_byte() {
 
     let manifest = block_pb::Block { block_index: Some(1), table_block_manifest: Some(block_pb::TableBlockManifest::default()), ..Default::default() };
     assert_eq!(BlockCatalog::from_proto(manifest.clone()).unwrap().encode(), manifest.encode_to_vec());
-    covered.insert(("Block", 12));
+    covered.insert(("Block", 1001));
     let plain = block_pb::TableBlock { row_count: Some(1), tries: vec![trie("l01-rc-b00")], ..Default::default() }.encode_to_vec();
     let table = TableBlock::decode(&plain).unwrap();
     assert_eq!(table.encode(), plain);
@@ -406,8 +417,9 @@ fn an_extension_block_file_fails_xtdbs_parser_and_reads_as_itself_to_rtdb() {
 #[test]
 fn xtdb_reads_these_exact_bytes() {
     let retired = envelope(ReplicaBody::TablesRetired(pb::TablesRetired { table_names: vec!["a/b".into()], as_of_micros: Some(7) }));
-    assert_eq!(retired.encode(), [0x04, 0x00, 0x62, 0x07, 0x0a, 0x03, b'a', b'/', b'b', 0x10, 0x07, 0x38, 0x03, 0x48, 0x05]);
-    assert_eq!(SourceMessage::Protobuf(SourceBody::ServingTransact(vec![9, 9].into())).encode().unwrap(), [0x04, 0x4a, 0x02, 0x09, 0x09]);
-    assert_eq!(block(|wire| wire.naming_epoch = Some(1)), [0x00, 0x08, 0x01, 0x58, 0x01]);
-    assert_eq!(TableBlock::decode(&[0x10, 0x01]).unwrap().with_retired_as_of(Some(7)).encode(), [0x00, 0x10, 0x01, 0x48, 0x07]);
+    // Field 1002 length-delimited is the key 0xd2 0x3e; field 1000 and 1002 varints are 0xc0 0x3e and 0xd0 0x3e.
+    assert_eq!(retired.encode(), [0x04, 0x00, 0xd2, 0x3e, 0x07, 0x0a, 0x03, b'a', b'/', b'b', 0x10, 0x07, 0x38, 0x03, 0x48, 0x05]);
+    assert_eq!(SourceMessage::Protobuf(SourceBody::ServingTransact(vec![9, 9].into())).encode().unwrap(), [0x04, 0xd2, 0x3e, 0x02, 0x09, 0x09]);
+    assert_eq!(block(|wire| wire.naming_epoch = Some(1)), [0x00, 0x08, 0x01, 0xc0, 0x3e, 0x01]);
+    assert_eq!(TableBlock::decode(&[0x10, 0x01]).unwrap().with_retired_as_of(Some(7)).encode(), [0x00, 0x10, 0x01, 0xd0, 0x3e, 0x07]);
 }
