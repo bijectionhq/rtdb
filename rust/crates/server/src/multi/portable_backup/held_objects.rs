@@ -275,89 +275,161 @@ mod tests {
         recovery::{Intent, LossPolicy, Operation, Status},
     };
     use ring::{rand::SystemRandom, signature::{Ed25519KeyPair, KeyPair}};
-    use stream_logkeeper::stream::consensus::{CLUSTER_VERSION_CURRENT, Config, testing::LocalCluster};
+    use stream_logkeeper::stream::consensus::{CLUSTER_VERSION_CURRENT, Config, JournalConfig, testing::LocalCluster};
 
-    fn write_tls(path: &Path, credentials: Credentials) {
-        fs::create_dir(path).unwrap();
+    const DATABASE: &str = "hosted-documents";
+
+    struct RestartedKeepers {
+        stop: CancellationToken,
+        tasks: Vec<tokio::task::JoinHandle<std::io::Result<()>>>,
+    }
+
+    impl RestartedKeepers {
+        async fn with_roles(keepers: &mut LocalCluster, reader: &str, custodian: Option<&str>) -> Self {
+            let configs = keepers.keepers().keys().map(|id| {
+                let mut config = Config::read(&keepers.write_config(*id).unwrap()).unwrap();
+                config.readers.push(reader.into());
+                config.administrators.extend(custodian.map(str::to_owned));
+                config
+            }).collect::<Vec<_>>();
+            keepers.shutdown().await.unwrap();
+            let stop = CancellationToken::new();
+            let mut tasks = Vec::new();
+            for config in configs {
+                let listener = tokio::net::TcpListener::bind(config.listen).await.unwrap();
+                tasks.push(tokio::spawn(config.serve(listener, stop.child_token())));
+            }
+            Self { stop, tasks }
+        }
+
+        async fn shutdown(self) {
+            self.stop.cancel();
+            for task in self.tasks {
+                task.await.unwrap().unwrap();
+            }
+        }
+    }
+
+    fn keeper_access(
+        home: &Path, name: &str, keepers: &LocalCluster, placement: &JournalConfig, principal: &str,
+    ) -> (String, PathBuf) {
+        let journal = home.join(format!("{name}.json"));
+        fs::write(&journal, serde_json::to_vec(&json!({
+            "keepers": placement.keepers, "catalog": placement.catalog, "voters": placement.voters,
+            "catalog_voters": placement.catalog_voters, "quota_bytes": placement.quota_bytes,
+            "max_record_bytes": placement.max_record_bytes,
+        })).unwrap()).unwrap();
+        let tls = home.join(format!("{name}-tls"));
+        fs::create_dir(&tls).unwrap();
+        let credentials = keepers.credentials(principal).unwrap();
         for (source, name) in [(credentials.certificate, "journal-certificate.pem"),
             (credentials.private_key, "journal-key.pem"), (credentials.ca, "journal-ca.pem")]
         {
-            let file = path.join(name);
+            let file = tls.join(name);
             fs::copy(source, &file).unwrap();
             fs::set_permissions(file, fs::Permissions::from_mode(0o600)).unwrap();
         }
+        (format!("{CONSENSUS_SCHEME}{}", journal.display()), tls)
+    }
+
+    async fn export_commissioned_source(
+        home: &Path, authority: &Arc<ActivationAuthority>, source: Uuid, config: &rtdb_s3::S3Config,
+        vault: &Path, archive: &Path,
+    ) {
+        const WRITER: &str = "urn:logkeeper:client:backup-source-writer";
+        const READER: &str = "urn:logkeeper:client:backup-source-reader";
+        let mut keepers = LocalCluster::start_independent_catalog(&[WRITER]).await.unwrap();
+        let placement = keepers.journal_config(64 << 20, 4 << 20);
+        let journal = Arc::new(keepers.journal(WRITER, &placement).unwrap());
+        journal.finalize_version(CLUSTER_VERSION_CURRENT).await.unwrap();
+        let (journal_url, tls) = keeper_access(home, "source-reader", &keepers, &placement, READER);
+
+        FileKms::create_directory(vault).unwrap();
+        let keys = Arc::new(FileKms::open(vault, || SystemClock.now().0).unwrap());
+        let io = IoRegion::new();
+        let root = ObjectKey::new("multi").unwrap();
+        let store = config.open(&root, &BTreeMap::new(), io.clone()).await.unwrap();
+        let node = Ipv4Addr::LOCALHOST.into();
+        let mut database = MultiDatabase::new(MultiOptions {
+            database: source, node, lease_micros: WRITER_LEASE_MICROS, drift_micros: CLOCK_DRIFT_MICROS,
+        }, journal.clone(), store, keys.clone(), Arc::new(|| SystemClock.now())).unwrap()
+            .with_immutable_journal()
+            .with_activation_scope(authority.scope(DATABASE).unwrap()).unwrap()
+            .with_serving_authority(authority.serving_authority(DATABASE, source).unwrap());
+        database.create().await.unwrap();
+        assert!(matches!(database.tick(&BTreeSet::from([node])).await.unwrap(), Role::Writer(_)));
+        let attachment = database.write_file(b"portable object").await.unwrap();
+        database.checkpoint(vec![attachment]).await.unwrap();
+        database.shutdown_writer().await.unwrap();
+        let stream = database.journal_stream();
+        let head = journal.head(stream).await.unwrap();
+        drop(database);
+        io.close_and_wait().await;
+        let serving = RestartedKeepers::with_roles(&mut keepers, READER, None).await;
+        let options = MultiBackupOptions::parse([
+            "export-hosted".into(), "--archive".into(), archive.display().to_string(),
+            "--database".into(), DATABASE.into(),
+            "--incarnation".into(), source.to_string(), "--authority-id".into(), authority.identity().to_string(),
+            "--journal-url".into(), journal_url,
+            "--tls-dir".into(), tls.display().to_string(), "--key-vault".into(), vault.display().to_string(),
+            "--bucket".into(), config.bucket.clone(), "--region".into(), config.region.clone().unwrap(),
+            "--s3-endpoint".into(), config.endpoint.clone().unwrap(),
+        ].into_iter()).unwrap();
+        let exported = options.run(rtdb_storage::AppleSync::Full).await.unwrap();
+        let verified = PortableBackup::verify(&fs::read(archive).unwrap(), keys).await.unwrap();
+        assert_eq!(exported["manifest_sha256"], digest_hex(&verified.manifest_sha256()));
+        assert_eq!(verified.source_basis().incarnation(), *source.as_bytes());
+        assert_eq!(verified.source_lsn(), head);
+        assert_eq!(journal.head(stream).await.unwrap(), head);
+        serving.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "requires a disposable loopback S3 bucket with Object Lock and the AWS CLI"]
     async fn staged_backup_checks_exact_provider_holds_on_its_complete_object_closure() {
-        const DATABASE: &str = "hosted-documents";
         let endpoint = std::env::var("RTDB_BACKUP_HOLD_TEST_ENDPOINT").unwrap();
         let url = url::Url::parse(&endpoint).unwrap();
         assert_eq!(url.host_str(), Some("127.0.0.1"));
         let bucket = std::env::var("RTDB_BACKUP_HOLD_TEST_BUCKET").unwrap();
         assert!(bucket.starts_with("rtdb-backup-hold-test-"));
-        let aws = |operation: &str, fields: &[&str]| {
+        let aws_bucket = |bucket: &str, operation: &str, fields: &[&str]| {
             let result = std::process::Command::new("aws")
                 .args(["--no-cli-pager", "--endpoint-url", &endpoint, "--region", "us-east-1",
-                    "s3api", operation, "--bucket", &bucket])
+                    "s3api", operation, "--bucket", bucket])
                 .args(fields).output().unwrap();
             assert!(result.status.success(), "{operation}: {}", String::from_utf8_lossy(&result.stderr));
             if result.stdout.is_empty() { Value::Null } else { serde_json::from_slice(&result.stdout).unwrap() }
         };
+        let aws = |operation: &str, fields: &[&str]| aws_bucket(&bucket, operation, fields);
+        let source_bucket = format!("{bucket}-source");
+        aws_bucket(&source_bucket, "create-bucket", &["--object-lock-enabled-for-bucket"]);
 
         const PRINCIPAL: &str = "urn:logkeeper:client:backup-object-holds";
-        const READER: &str = "urn:logkeeper:client:backup-journal-reader";
+        const READER: &str = "urn:logkeeper:client:backup-destination-reader";
+        const CUSTODIAN: &str = "urn:logkeeper:client:backup-checkpoint-custodian";
         let mut keepers = LocalCluster::start_replicated_catalog(&[PRINCIPAL]).await.unwrap();
         let placement = keepers.journal_config(64 << 20, 4 << 20);
         let journal = Arc::new(keepers.journal(PRINCIPAL, &placement).unwrap());
         journal.finalize_version(CLUSTER_VERSION_CURRENT).await.unwrap();
-        let configurations: Vec<_> = keepers.keepers().keys().map(|id| {
-            let mut config = Config::read(&keepers.write_config(*id).unwrap()).unwrap();
-            config.readers.push(READER.into());
-            config
-        }).collect();
-        keepers.shutdown().await.unwrap();
-        let keeper_stop = CancellationToken::new();
-        let mut keeper_tasks = Vec::new();
-        for config in configurations {
-            let listener = tokio::net::TcpListener::bind(config.listen).await.unwrap();
-            keeper_tasks.push(tokio::spawn(config.serve(listener, keeper_stop.child_token())));
-        }
         let home = tempfile::Builder::new()
             .permissions(fs::Permissions::from_mode(0o700))
             .tempdir().unwrap();
-        let journal_config = home.path().join("journal.json");
-        fs::write(&journal_config, serde_json::to_vec(&json!({
-            "keepers": placement.keepers, "catalog": placement.catalog, "voters": placement.voters,
-            "catalog_voters": placement.catalog_voters, "quota_bytes": placement.quota_bytes,
-            "max_record_bytes": placement.max_record_bytes,
-        })).unwrap()).unwrap();
-        let journal_url = format!("{CONSENSUS_SCHEME}{}", journal_config.display());
-        let tls = home.path().join("tls");
-        write_tls(&tls, keepers.credentials(PRINCIPAL).unwrap());
-        let reader_tls = home.path().join("reader-tls");
-        write_tls(&reader_tls, keepers.credentials(READER).unwrap());
+        let (journal_url, tls) = keeper_access(home.path(), "destination-writer", &keepers, &placement, PRINCIPAL);
+        let (_, reader_tls) = keeper_access(home.path(), "destination-reader", &keepers, &placement, READER);
+        let (_, custodian_tls) = keeper_access(home.path(), "destination-custodian", &keepers, &placement, CUSTODIAN);
+        let destination_keepers = RestartedKeepers::with_roles(&mut keepers, READER, Some(CUSTODIAN)).await;
         let reader = KeeperJournal::connect(&journal_url, &crate::cli::journal_credentials(&reader_tls).unwrap()).unwrap();
         let options = |database| MultiOptions {
             database, node: Ipv4Addr::LOCALHOST.into(), lease_micros: WRITER_LEASE_MICROS,
             drift_micros: CLOCK_DRIFT_MICROS,
         };
         let live = BTreeSet::from([Ipv4Addr::LOCALHOST.into()]);
-        let source_vault = home.path().join("source");
-        FileKms::create_directory(&source_vault).unwrap();
-        let source_keys = Arc::new(FileKms::open(&source_vault, || SystemClock.now().0).unwrap());
-        let source_id = Uuid::new_v4();
-        let mut source = MultiDatabase::new(options(source_id), journal.clone(),
-            Arc::new(rtdb_storage::MemoryStore::default()), source_keys, Arc::new(|| SystemClock.now()))
-            .unwrap().with_immutable_journal();
-        source.create().await.unwrap();
-        assert!(matches!(source.tick(&live).await.unwrap(), Role::Writer(_)));
-        let attachment = source.write_file(b"portable object").await.unwrap();
-        source.checkpoint(vec![attachment]).await.unwrap();
-        let archive = source.portable_backup().await.unwrap().into_bytes();
+        let authority = Uuid::new_v4();
         let archive_path = home.path().join("archive");
-        fs::write(&archive_path, &archive).unwrap();
+        let source_vault = home.path().join("source");
+        let mut source = rtdb_s3::S3Config::new(source_bucket);
+        source.endpoint = Some(endpoint.clone());
+        source.region = Some("us-east-1".into());
         let mut s3 = rtdb_s3::S3Config::new(&bucket);
         s3.endpoint = Some(endpoint.clone());
         s3.region = Some("us-east-1".into());
@@ -367,27 +439,24 @@ mod tests {
         let vault = home.path().join("destination");
         FileKms::create_directory(&vault).unwrap();
         let keys = Arc::new(FileKms::open(&vault, || SystemClock.now().0).unwrap());
-        let authority = Uuid::new_v4();
         let cell = Uuid::new_v4();
         const AUTHORITY_PRINCIPAL: &str = "urn:logkeeper:client:backup-activation";
+        const AUTHORITY_READER: &str = "urn:logkeeper:client:backup-activation-reader";
         let mut authority_keepers = LocalCluster::start_independent_catalog(&[AUTHORITY_PRINCIPAL]).await.unwrap();
         let authority_placement = authority_keepers.journal_config(64 << 20, 4 << 20);
         let authority_journal = Arc::new(authority_keepers.journal(AUTHORITY_PRINCIPAL, &authority_placement).unwrap());
         authority_journal.finalize_version(CLUSTER_VERSION_CURRENT).await.unwrap();
-        let authority_config = home.path().join("authority.json");
-        fs::write(&authority_config, serde_json::to_vec(&json!({
-            "keepers": authority_placement.keepers, "catalog": authority_placement.catalog,
-            "voters": authority_placement.voters, "catalog_voters": authority_placement.catalog_voters,
-            "quota_bytes": authority_placement.quota_bytes, "max_record_bytes": authority_placement.max_record_bytes,
-        })).unwrap()).unwrap();
-        let authority_url = format!("{CONSENSUS_SCHEME}{}", authority_config.display());
-        let authority_tls = home.path().join("authority-tls");
-        write_tls(&authority_tls, authority_keepers.credentials(AUTHORITY_PRINCIPAL).unwrap());
+        let (authority_url, authority_tls) = keeper_access(home.path(), "authority", &authority_keepers, &authority_placement, AUTHORITY_PRINCIPAL);
+        let (_, authority_reader_tls) = keeper_access(home.path(), "authority-reader", &authority_keepers, &authority_placement, AUTHORITY_READER);
+        let activated_keepers = RestartedKeepers::with_roles(&mut authority_keepers, AUTHORITY_READER, None).await;
         let authority_reader = ActivationAuthority::connect_reader(
-            &authority_url, crate::cli::journal_credentials(&authority_tls).unwrap(), authority,
+            &authority_url, crate::cli::journal_credentials(&authority_reader_tls).unwrap(), authority,
         ).await.unwrap();
         let activation = ActivationAuthority::new(authority_journal.clone(), authority).unwrap();
+        let source_id = Uuid::new_v4();
         let predecessor = activation.bootstrap(DATABASE, source_id).await.unwrap();
+        export_commissioned_source(home.path(), &authority_reader, source_id, &source, &source_vault, &archive_path).await;
+        let archive = fs::read(&archive_path).unwrap();
         let operation_id = Uuid::new_v4();
         let intent = Intent {
             operation: Operation { predecessor, operation_id },
@@ -477,10 +546,10 @@ mod tests {
         let mut wrong_namespace = receipt.clone();
         wrong_namespace["object_namespace"]["bucket"] = json!("other-staging-allocation");
         fs::write(&wrong_namespace_path, serde_json::to_vec(&wrong_namespace).unwrap()).unwrap();
-        let hosted_options = |operation: &str, readback: Option<&Path>, receipt: &Path, key: Option<&Path>| MultiBackupOptions::parse([
+        let hosted_options = |operation: &str, destination: Uuid, readback: Option<&Path>, receipt: &Path, key: Option<&Path>| MultiBackupOptions::parse([
             operation.to_owned(), "--archive".into(), archive_path.display().to_string(),
             "--database".into(), DATABASE.into(),
-            "--incarnation".into(), incarnation.to_string(), "--authority-id".into(), authority.to_string(),
+            "--incarnation".into(), destination.to_string(), "--authority-id".into(), authority.to_string(),
             "--stage-receipt".into(), receipt.display().to_string(),
             "--cell-id".into(), cell.to_string(), "--key-vault".into(), vault.display().to_string(),
             "--journal-url".into(), journal_url.clone(), "--tls-dir".into(), reader_tls.display().to_string(),
@@ -490,17 +559,17 @@ mod tests {
             "--readback".into(), path.display().to_string(),
         ])).chain(key.into_iter().flat_map(|path| [
             "--attestation-signing-key".into(), path.display().to_string(),
-            "--journal-custodian-tls-dir".into(), tls.display().to_string(),
+            "--journal-custodian-tls-dir".into(), custodian_tls.display().to_string(),
         ]))).unwrap();
         let verify = |readback: Option<&Path>, receipt: &Path|
-            hosted_options("verify-object-holds", readback, receipt, None).run(rtdb_storage::AppleSync::Full);
-        let acquire = |receipt: &Path| {
-            let BackupCommand::AcquireObjects(acquirer) = hosted_options("acquire-object-holds", None, receipt, None).0
+            hosted_options("verify-object-holds", incarnation, readback, receipt, None).run(rtdb_storage::AppleSync::Full);
+        let acquire = |destination: Uuid, receipt: &Path| {
+            let BackupCommand::AcquireObjects(acquirer) = hosted_options("acquire-object-holds", destination, None, receipt, None).0
             else { panic!("expected hosted acquisition"); };
             acquirer.run_with_authority(&authority_reader)
         };
         let attest = |readback: &Path| {
-            let options = hosted_options("attest", Some(readback), &receipt_path, Some(&signing_key));
+            let options = hosted_options("attest", incarnation, Some(readback), &receipt_path, Some(&signing_key));
             let BackupCommand::AttestObjects(attester) = options.0 else { panic!("expected hosted attestation"); };
             attester.run_with_authority(&authority_reader)
         };
@@ -522,10 +591,10 @@ mod tests {
         let physical = store.observe_head(&file).await.unwrap().version.unwrap();
         hold(&physical);
         assert!(verify(None, &receipt_path).await.is_err());
-        assert!(acquire(&wrong_receipt_path).await.is_err());
-        assert!(acquire(&wrong_namespace_path).await.is_err());
+        assert!(acquire(incarnation, &wrong_receipt_path).await.is_err());
+        assert!(acquire(incarnation, &wrong_namespace_path).await.is_err());
         assert!(verify(None, &receipt_path).await.is_err());
-        let result = acquire(&receipt_path).await.unwrap();
+        let result = acquire(incarnation, &receipt_path).await.unwrap();
         assert_eq!(verify(None, &receipt_path).await.unwrap(), result);
         assert_eq!(result["object_holds_verified"], true);
         assert_eq!(result["key_hold"], receipt["key_hold"]);
@@ -545,7 +614,7 @@ mod tests {
             aws("put-object-legal-hold", &["--key", &version.key,
                 "--version-id", &version.version, "--legal-hold", "Status=OFF"]);
         }
-        assert_eq!(acquire(&receipt_path).await.unwrap(), result);
+        assert_eq!(acquire(incarnation, &receipt_path).await.unwrap(), result);
         assert_eq!(store.get_fresh(&plan).await.unwrap(), plan_before);
         assert_eq!(observe_hold(&physical)["LegalHold"]["Status"], "ON");
         assert_eq!(observe_hold(&newer)["LegalHold"]["Status"], "OFF");
@@ -553,7 +622,7 @@ mod tests {
 
         let readback = home.path().join("readback.json");
         fs::write(&readback, serde_json::to_vec(&result).unwrap()).unwrap();
-        let BackupCommand::AttestObjects(mut unauthorized) = hosted_options("attest", Some(&readback), &receipt_path, Some(&signing_key)).0
+        let BackupCommand::AttestObjects(mut unauthorized) = hosted_options("attest", incarnation, Some(&readback), &receipt_path, Some(&signing_key)).0
         else { panic!("expected a hosted attestor"); };
         unauthorized.journal_custodian_tls = reader_tls.clone();
         assert!(unauthorized.run_with_authority(&authority_reader).await.is_err());
@@ -678,7 +747,7 @@ mod tests {
         };
         activation.begin_recovery(DATABASE, replacement_intent, Some(operation_id)).await.unwrap();
         assert!(stage(operation_id).await.is_err());
-        assert!(acquire(&receipt_path).await.is_err());
+        assert!(acquire(incarnation, &receipt_path).await.is_err());
         assert!(attest(&new_readback).await.is_err());
         assert!(release_objects(&new_readback, &proof_path).await.is_err());
         let altered_signature = home.path().join("altered-signature.json");
@@ -705,22 +774,11 @@ mod tests {
         let next_receipt = stage(operation.operation_id).await.unwrap();
         let receipt = home.path().join("serving-stage.json");
         fs::write(&receipt, serde_json::to_vec(&next_receipt).unwrap()).unwrap();
-        let prefix = format!("db/{candidate}/");
-        let token_prefix = format!("~rtdb-v1/{}/keys/", candidate.simple());
-        for entry in store.list(None).await.unwrap().iter().filter(|entry| {
-            entry.key.as_str().starts_with(&prefix) || entry.key.as_str().starts_with(&token_prefix)
-        }) {
-            hold(&store.observe_head(&entry.key).await.unwrap().version.unwrap());
-        }
-        let BackupCommand::VerifyObjects(mut verifier) = hosted_options("verify-object-holds", None, &receipt, None).0
-        else { panic!("expected a hosted verifier"); };
-        verifier.incarnation = candidate;
-        let report = verifier.run().await.unwrap();
+        let report = acquire(candidate, &receipt).await.unwrap();
         let serving_readback = home.path().join("serving-readback.json");
         fs::write(&serving_readback, serde_json::to_vec(&report).unwrap()).unwrap();
-        let BackupCommand::AttestObjects(mut attester) = hosted_options("attest", Some(&serving_readback), &receipt, Some(&signing_key)).0
+        let BackupCommand::AttestObjects(attester) = hosted_options("attest", candidate, Some(&serving_readback), &receipt, Some(&signing_key)).0
         else { panic!("expected a hosted attestor"); };
-        attester.verifier.incarnation = candidate;
         let document = attester.run_with_authority(&authority_reader).await.unwrap();
         let serving_proof = home.path().join("serving-proof.json");
         fs::write(&serving_proof, serde_json::to_vec(&document).unwrap()).unwrap();
@@ -774,7 +832,7 @@ mod tests {
             "--authority-tls-dir".into(), authority_tls.display().to_string(),
             "--installation-proof".into(), serving_proof.display().to_string(),
             "--journal-url".into(), journal_url.clone(),
-            "--journal-custodian-tls-dir".into(), tls.display().to_string(),
+            "--journal-custodian-tls-dir".into(), custodian_tls.display().to_string(),
         ].into_iter()).unwrap().run(rtdb_storage::AppleSync::Full).await.unwrap();
         assert_eq!(release_pending().await.unwrap_err().code, "rtdb/activation-custody-replacement");
         assert_eq!(release_key(&serving_proof).await.unwrap_err().code, "rtdb/activation-custody-replacement");
@@ -805,10 +863,7 @@ mod tests {
         aws("delete-object", &["--key", &physical.key, "--version-id", &physical.version]);
         assert_eq!(release_objects(&readback, &proof_path).await.unwrap(), settled);
         io.close_and_wait().await;
-        keeper_stop.cancel();
-        for task in keeper_tasks {
-            task.await.unwrap().unwrap();
-        }
-        authority_keepers.shutdown().await.unwrap();
+        destination_keepers.shutdown().await;
+        activated_keepers.shutdown().await;
     }
 }
