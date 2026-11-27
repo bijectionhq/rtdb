@@ -224,7 +224,7 @@ fn array(rng: &mut Rng, field: &Field, rows: usize) -> ArrayData {
             builder.add_buffer(bytes(rng, rows * byte_width))
         }
     };
-    builder.nulls(nulls).build().unwrap()
+    builder.nulls(nulls).align_buffers(true).build().unwrap()
 }
 
 fn batch(rng: &mut Rng, schema: &Arc<Schema>, rows: usize) -> RecordBatch {

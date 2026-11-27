@@ -173,9 +173,9 @@ mod tests {
         use crate::log::proto::ResolvedTx;
         use prost::Message;
 
-        let old_wire = [0x62, 3, 0x00, 0x7f, 0xff];
-        let decoded = ResolvedTx::decode(old_wire.as_slice()).unwrap();
-        assert_eq!(decoded.search_delta.as_deref(), Some(&old_wire[2..]));
-        assert_eq!(decoded.encode_to_vec(), old_wire);
+        let wire = [0xd2, 0x3e, 3, 0x00, 0x7f, 0xff];
+        let decoded = ResolvedTx::decode(wire.as_slice()).unwrap();
+        assert_eq!(decoded.search_delta.as_deref(), Some(&wire[3..]));
+        assert_eq!(decoded.encode_to_vec(), wire);
     }
 }
