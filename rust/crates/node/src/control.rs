@@ -180,7 +180,7 @@ impl NativeSession {
     async fn control(&mut self, statement: &ControlStatement, arguments: Parameters<'_>, arrow_execute: bool, cancellation: &CancellationToken, options: ControlExecutionOptions) -> Result<ControlResult> {
         self.state.revalidate().await?;
         if matches!(options.frontend, ControlFrontend::Adbc | ControlFrontend::FlightSql) && matches!(statement, ControlStatement::Begin(_) | ControlStatement::Commit(_) | ControlStatement::Rollback) {
-            return Err(Anomaly::incorrect("xtdb.adbc/tx-control-as-sql", "Use the transaction API to begin, commit, or roll back transactions"));
+            return Err(Anomaly::incorrect("xtdb.adbc/tx-control-as-sql", "BEGIN, START TRANSACTION, COMMIT and ROLLBACK aren't available as SQL here: use the transaction API (ADBC's autocommit, commit and rollback; Flight SQL's BeginTransaction and EndTransaction; Xtdb.Connection's begin, commitSync, commitAsync and rollbackTx), and SET TRANSACTION for a transaction's characteristics"));
         }
         let failed_inspection = matches!(options.frontend, ControlFrontend::Adbc | ControlFrontend::FlightSql)
             && statement.is_show() && !statement.requires_read_transaction();

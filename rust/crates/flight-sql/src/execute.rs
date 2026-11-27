@@ -7,7 +7,7 @@ use rtdb_node::{ControlExecutionOptions, ControlFrontend, ControlResult, NativeS
 use rtdb_plan::ControlStatement;
 use rtdb_query::{BoundParameters, QueryContext, QueryCursor};
 use rtdb_tx::SqlArguments;
-use rtdb_types::{LogicalType, Timestamp};
+use rtdb_types::{Anomaly, LogicalType, Timestamp};
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tonic::{Response, Status};
 use crate::{error::{cancelled, invalid, status}, service::{Call, Output, Service, query_ticket}, state::ConnectionResource, ticket::{Cut, Inspection, QueryRun, Ticket, TicketBasis, invalid_ticket}, wire};
@@ -74,7 +74,13 @@ impl Service {
         let token = native.state().cancellation().child_token(); let _cancel = token.clone().drop_guard();
         let options = options(&native);
         if let Some(control) = rtdb_sql::parse_admitted_control_in(source, &options, self.memory()).map_err(status)? {
-            native.prepare_context(&token).await.map_err(status)?;
+            if matches!(control.statement(), ControlStatement::Begin(_) | ControlStatement::Commit(_) | ControlStatement::Rollback) {
+                return Err(status(Anomaly::incorrect(
+                    "xtdb.adbc/tx-control-as-sql",
+                    "BEGIN, START TRANSACTION, COMMIT and ROLLBACK aren't available as SQL here: use the transaction API (ADBC's autocommit, commit and rollback; Flight SQL's BeginTransaction and EndTransaction; Xtdb.Connection's begin, commitSync, commitAsync and rollbackTx), and SET TRANSACTION for a transaction's characteristics",
+                )));
+            }
+            native.state().revalidate().await.map_err(status)?;
             return Ok(Shape { schema: control_schema(control.statement()).map_err(status)?.as_ref().map(|schema| wire::plan_schema(schema, self.memory())).transpose()?, parameters: 0, plan: None });
         }
         let context = native.prepare_context(&token).await.map_err(status)?;
@@ -95,6 +101,13 @@ impl Service {
     pub async fn describe(&self, connection: Arc<ConnectionResource>, source: &str) -> Result<(wire::OwnedSchema, usize), Status> {
         let shape = self.prepare_shape(connection, source).await?;
         Ok((shape.schema.ok_or_else(|| invalid("executeSchema only supports queries (DML and SET return no result set)"))?, shape.parameters))
+    }
+    pub async fn describe_prepared(&self, connection: Arc<ConnectionResource>, source: &str) -> Result<wire::OwnedSchema, Status> {
+        let shape = self.prepare_shape(connection, source).await?;
+        match shape.schema {
+            Some(schema) => Ok(schema),
+            None => wire::OwnedSchema::empty(self.memory()),
+        }
     }
     pub async fn execute_update(&self, connection: &Arc<ConnectionResource>, source: &str, arguments: Option<SqlArguments>) -> Result<(), Status> {
         let mut native = connection.borrow().await?;

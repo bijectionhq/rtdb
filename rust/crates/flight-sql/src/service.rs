@@ -863,7 +863,7 @@ impl FlightService for Service {
         let work = async {
             let schema = match command {
                 Command::CommandStatementQuery(command) => { let connection = self.connection(&call, &call.database).await?; self.describe(connection, &command.query).await?.0 }
-                Command::CommandPreparedStatementQuery(command) => { let prepared = self.prepared(&call, &command.prepared_statement_handle)?; let connection = self.scoped(&call, &prepared.scope).await?; self.describe(connection, &prepared.sql).await?.0 }
+                Command::CommandPreparedStatementQuery(command) => { let prepared = self.prepared(&call, &command.prepared_statement_handle)?; let connection = self.scoped(&call, &prepared.scope).await?; self.describe_prepared(connection, &prepared.sql).await? }
                 command => self.metadata_schema(&command)?,
             };
             Ok::<_, Status>(flight::SchemaResult { schema: wire::schema_message(&schema, self.memory())? })

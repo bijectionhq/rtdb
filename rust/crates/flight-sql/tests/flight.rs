@@ -3354,5 +3354,45 @@ async fn run_tickets_redeem_on_a_restarted_server_at_their_basis_while_inspectio
     running.stop().await;
 }
 
+#[tokio::test]
+async fn prepared_get_schema_returns_empty_for_updates_and_rejects_tx_control_sql() {
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+
+    for sql in ["INSERT INTO docs (_id) VALUES (1)", "SET TIME ZONE 'UTC'"] {
+        let prepared = client.prepare(sql, None).await;
+        let request = client.request(FlightDescriptor::new_cmd(
+            CommandPreparedStatementQuery { prepared_statement_handle: prepared.prepared_statement_handle }.as_any().encode_to_vec(),
+        ));
+        let schema = Schema::try_from(client.client.get_schema(request).await.unwrap().into_inner()).unwrap();
+        assert!(schema.fields().is_empty(), "{sql}: {schema:?}");
+
+        let adhoc = client.request(FlightDescriptor::new_cmd(
+            CommandStatementQuery { query: sql.into(), transaction_id: None }.as_any().encode_to_vec(),
+        ));
+        let error = client.client.get_schema(adhoc).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument, "{sql}");
+        assert!(error.message().contains("only supports queries"), "{sql}: {}", error.message());
+    }
+
+    for sql in ["BEGIN", "START TRANSACTION", "COMMIT", "ROLLBACK"] {
+        let prepare = ActionCreatePreparedStatementRequest { query: sql.into(), transaction_id: None };
+        let error = client.action("CreatePreparedStatement", prepare.as_any().encode_to_vec().into()).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument, "prepare {sql}");
+        assert!(error.message().contains("BeginTransaction"), "prepare {sql}: {}", error.message());
+        let wire = error.metadata().get_bin("xtdb-anomaly-bin").unwrap().to_bytes().unwrap();
+        let detail: serde_json::Value = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(detail["code"], "xtdb.adbc/tx-control-as-sql", "prepare {sql}");
+
+        let adhoc = client.request(FlightDescriptor::new_cmd(
+            CommandStatementQuery { query: sql.into(), transaction_id: None }.as_any().encode_to_vec(),
+        ));
+        let error = client.client.get_schema(adhoc).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument, "schema {sql}");
+        assert!(error.message().contains("BeginTransaction"), "schema {sql}: {}", error.message());
+    }
+    running.stop().await;
+}
+
 #[path = "flight/v1_contract.rs"]
 mod v1_contract;
