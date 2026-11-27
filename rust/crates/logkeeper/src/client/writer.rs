@@ -1176,8 +1176,15 @@ impl Writer {
                 (sources, pipeline.buffer_first)
             };
             let mut chunk = None;
+            let mut fetch_errors = Vec::new();
             for source in sources {
-                let Ok(fetched) = ensemble.fetch(source, from, buffer_first, MAXIMUM_BATCH_ENTRIES).await else { continue };
+                let fetched = match ensemble.fetch(source, from, buffer_first, MAXIMUM_BATCH_ENTRIES).await {
+                    Ok(fetched) => fetched,
+                    Err(error) => {
+                        fetch_errors.push(format!("server {source}: {error}"));
+                        continue;
+                    }
+                };
                 if from <= fetched.trim_lsn {
                     deposed_by(epoch, ensemble.trim(server, fetched.trim_lsn).await?)?;
                     from = fetched.trim_lsn + 1;
@@ -1190,7 +1197,14 @@ impl Writer {
                 Some(entries) if entries.is_empty() => continue,
                 Some(entries) => from = deposed_by(epoch, ensemble.overwrite(server, epoch, from, entries, false).await?)?.last_lsn + 1,
                 None if empty_fetches < 50 => { empty_fetches += 1; tokio::time::sleep(Duration::from_millis(20)).await; }
-                None => return Err(Error::Remote { key: ensemble.config.stream.clone(), message: format!("no live server holds lsn {from} to repair from") }),
+                None => {
+                    let detail = if fetch_errors.is_empty() {
+                        format!("no live server holds lsn {from} to repair from")
+                    } else {
+                        format!("no live server holds lsn {from} to repair from ({})", fetch_errors.join("; "))
+                    };
+                    return Err(Error::Remote { key: ensemble.config.stream.clone(), message: detail });
+                }
             }
         }
     }
