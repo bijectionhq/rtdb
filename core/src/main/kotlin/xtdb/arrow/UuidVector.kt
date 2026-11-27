@@ -15,6 +15,8 @@ class UuidVector(override val inner: FixedSizeBinaryVector) : ExtensionVector(),
     override val arrowType = UuidType
     override val monoType = Scalar(arrowType)
 
+    internal val hasCanonicalWidth get() = inner.byteWidth == 2 * Long.SIZE_BYTES
+
     override fun getObject0(idx: Int, keyFn: IKeyFn<*>) =
         ByteBuffer.wrap(inner.getObject0(idx, keyFn)).let { buf ->
             UUID(buf.getLong(), buf.getLong())

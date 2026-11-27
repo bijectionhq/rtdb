@@ -591,6 +591,8 @@ variant TxMessage : SourceMessage {
     -- Compatible temporal SQL arguments keep their stored unit, value and zone label when aligned into the canonical source stream.
     -- SQL source replay binds Arrow argument rows by position and reads a scalar parameter when evaluation reaches it.
     -- Source encoding writes IID lists from their fixed-size bytes.
+    -- JVM DeleteDocs and EraseDocs derive IIDs from compatible scalar cells and canonical dense unions in the submitted ID order.
+    -- During IID derivation, an invalid ID reports the first reached logical value before source append.
     -- Source replay reads IIDs directly from the selected position of a compatible Arrow list.
     -- Source replay validates fixed-range binary and text bounds from the selected child positions.
     -- Replica replay can validate hosted control and world inventories from selected UTF-8 child positions.

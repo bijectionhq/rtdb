@@ -147,6 +147,27 @@ private class PatchDocsWriter(ops: VectorWriter) : TxOpWriter<TxOp.PatchDocs> {
     }
 }
 
+private fun Vector.supportsSourceIidWrite(): Boolean = when (this) {
+    is ByteVector, is ShortVector, is IntVector, is LongVector, is Utf8Vector, is KeywordVector -> true
+    is UuidVector -> hasCanonicalWidth
+    else -> false
+}
+
+private fun VectorReader.writeSourceIids(dest: VectorWriter) {
+    val positioned = when (this) {
+        is DenseUnionVector -> vectors.all {
+            (it is NullVector || it.supportsSourceIidWrite()) && it.name == it.arrowType.toLeg()
+        }
+        is Vector -> supportsSourceIidWrite()
+        else -> false
+    }
+
+    for (idx in 0 until valueCount) {
+        if (positioned) writeIid(idx, dest)
+        else dest.writeBytes(getObject(idx).asIid)
+    }
+}
+
 private class DeleteDocsWriter(ops: VectorWriter) : TxOpWriter<TxOp.DeleteDocs> {
     private val deleteVec = ops.vectorFor("delete-docs", STRUCT_TYPE, false)
     private val tableVec = deleteVec.vectorFor("table", UTF8_TYPE, false)
@@ -162,10 +183,7 @@ private class DeleteDocsWriter(ops: VectorWriter) : TxOpWriter<TxOp.DeleteDocs> 
 
         tableVec.writeObject("${op.schema}/${op.table}")
 
-        for (idx in 0 until op.ids.valueCount) {
-            val docId = op.ids.getObject(idx)
-            iidWriter.writeBytes(docId.asIid)
-        }
+        op.ids.writeSourceIids(iidWriter)
         iidsVec.endList()
 
         op.validFrom?.let { validFromVec.writeObject(it) } ?: validFromVec.writeNull()
@@ -188,10 +206,7 @@ private class EraseDocsWriter(ops: VectorWriter) : TxOpWriter<TxOp.EraseDocs> {
 
         tableVec.writeObject("${op.schema}/${op.table}")
 
-        for (idx in 0 until op.ids.valueCount) {
-            val docId = op.ids.getObject(idx)
-            iidWriter.writeBytes(docId.asIid)
-        }
+        op.ids.writeSourceIids(iidWriter)
         iidsVec.endList()
 
         eraseVec.endStruct()
