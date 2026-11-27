@@ -1158,7 +1158,7 @@ async fn submitted_attempt(client: &tokio_postgres::Client) -> (i64, String) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_reused_intake_position_cannot_redeem_the_sealed_writers_receipt() {
+async fn a_sealed_writer_cannot_issue_an_async_receipt() {
     use rtdb_format::basis::encode_tx_basis;
     use rtdb_types::{TxBasis, TxId};
 
@@ -1184,28 +1184,27 @@ async fn a_reused_intake_position_cannot_redeem_the_sealed_writers_receipt() {
         stream: old.stream("replica"), write_quorum: 2, maximum_message_bytes: 4 << 20,
     };
     rtdb_logkeeper::seal(&config, old.epoch + 1).await.unwrap();
-    writer.simple_query("COMMIT ASYNC").await.unwrap();
-    let (lost_id, lost) = submitted_attempt(&writer).await;
+    let refused = writer.simple_query("COMMIT ASYNC").await.unwrap_err();
+    let detail = refused.as_db_error().unwrap().detail().unwrap();
+    let anomaly: serde_json::Value = serde_json::from_str(detail).unwrap();
+    assert_eq!(anomaly["code"], "rtdb.storage/deposed");
+    let latest = writer.simple_query("SHOW LATEST_SUBMITTED_TX").await.unwrap();
+    assert!(!latest.iter().any(|message| matches!(message, tokio_postgres::SimpleQueryMessage::Row(row) if row.get("await_token").is_some())));
 
     drop((writer, via_gateway));
     cell.nodes[holder].take().unwrap().kill().await.unwrap();
     let successor = connect_eventually(&cell, "shop").await;
     let new = cell.directory.deployment(&shop.id).await.unwrap().unwrap();
     assert!(new.epoch > old.epoch);
+    assert_eq!(values(&successor, "SELECT total FROM orders").await, ["10"]);
     successor.simple_query("BEGIN READ WRITE; UPDATE orders SET total = 30 WHERE _id = 1; COMMIT ASYNC").await.unwrap();
     let (new_id, pending) = submitted_attempt(&successor).await;
-    assert_eq!(lost_id, new_id);
-    assert_ne!(lost, pending);
     assert_eq!(values(&successor, "SELECT total FROM orders").await, ["30"]);
     let applied = values(&successor, "SHOW AWAIT_TOKEN").await.pop().unwrap();
     assert_ne!(applied, pending);
     assert_eq!(submitted_attempt(&successor).await, (new_id, pending));
 
     let reader = cell.connect("shop").await;
-    reader.simple_query(&format!("SET AWAIT_TOKEN TO '{lost}'")).await.unwrap();
-    let error = reader.simple_query("SELECT total FROM orders").await
-        .expect_err("The sealed writer's receipt cannot return the successor's row");
-    assert!(error.as_db_error().unwrap().message().contains("closed writer epoch has no outcome"));
     let numeric = encode_tx_basis(&TxBasis { databases: BTreeMap::from([("shop".into(), vec![TxId(new_id)])]) });
     reader.simple_query(&format!("SET AWAIT_TOKEN TO '{numeric}'")).await.unwrap();
     let error = reader.simple_query("SELECT total FROM orders").await.unwrap_err();
