@@ -148,9 +148,11 @@ Nodes configured with a key vault or default erasure write encrypted logs and ob
 **What differs.**
 For a remote store with an XTDB-compatible URI and no Classic sealing keys, RTDB uses the upstream `c1/<first 32 hex digits of SHA-256(uri)>/` cache namespace.
 Other cacheable stores use the RTDB namespace `~rtdb-store-<sha256>/0/`, keyed by provider, storage identity, and epoch.
-RTDB guards the cache with an exclusive `.tmp/.owner-lock` and fills misses using range GETs of up to 1 MiB where the backing store supports them.
-Upstream fills misses with a streamed GET and memory-maps individual record-batch byte slices in `MemoryCache`.
-RTDB's `BufferPool` reads raw objects into heap buffers and stores decoded views (metadata, layouts, decoded pages) under one shared `CacheBudget` mutex rather than memory-mapping slices.
+RTDB guards the cache with an exclusive `.tmp/.owner-lock`.
+Like upstream XTDB, supported Classic S3, Azure, and GCS stores fill a cold entry with one streamed GET.
+RTDB reserves a 3 MiB transport window before issuing the request.
+Upstream memory-maps individual record-batch byte slices in `MemoryCache`.
+RTDB's `BufferPool` retains raw objects in heap buffers and stores decoded views (metadata, layouts, decoded pages) under the same `CacheBudget` mutex.
 
 **Why.**
 An explicit owner lock prevents two nodes from corrupting a shared cache directory.
@@ -158,11 +160,13 @@ Sharing one `CacheBudget` across raw bytes and decoded views enforces RTDB's har
 
 **What a user sees.**
 Give each running node its own disk-cache directory.
-Cold reads from range-capable stores can perform multiple GETs, and RTDB's memory cache retains heap buffers.
+When streaming is unavailable or the memory budget cannot admit the transport window, RTDB uses reserved reads, including range GETs of up to 1 MiB where supported.
+RTDB publishes a streamed fill after validating the response length and a clean end of stream.
 
 **Where in the code.**
 - `RC/storage/src/cache.rs` (`BufferPool`, `CacheBudget`)
 - `RC/storage/src/disk_cache.rs`
+- `RC/storage/src/remote.rs`
 - `RC/node/src/resources.rs`
 
 ### 1.8 RTDB-only bucket prefixes, catalog-ledger retirement, and receipt-table L0 deletion
