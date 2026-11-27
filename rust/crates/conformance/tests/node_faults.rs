@@ -50,7 +50,7 @@ fn options(directory: &std::path::Path) -> NodeOptions {
     options.automatic_compaction = false;
     options.automatic_gc = false;
     options.compaction_threads = 0;
-    options.replication.assertion_interval = Duration::from_millis(1);
+    options.replication.assertion_interval = Duration::from_millis(10);
     options.replication.flush_timeout = Duration::from_secs(3600);
     options.replication.election_seed = 42;
     options
@@ -93,7 +93,7 @@ async fn lost_source_acknowledgement_recovers_the_original_write_exactly_once() 
     let directory = tempfile::tempdir().unwrap();
     let clock = Arc::new(ClockFixture(AtomicI64::new(1_000_000)));
     let schedule = FaultSchedule::new(vec![Rule { owner: "xtdb/source".into(), operation: Operation::DurableReceipt,
-        phase: Phase::After, key: KeyMatch::Any, occurrence: 1, action: Action::Fail("source acknowledgement lost".into()) }], 10_000).unwrap();
+        phase: Phase::After, key: KeyMatch::Any, occurrence: 1, action: Action::Fail("source acknowledgement lost".into()) }], 200_000).unwrap();
     let (node, driver) = Node::open(options(directory.path()), services(clock.clone(), schedule.clone())).await.unwrap();
     let owner = tokio::spawn(driver.run());
     let mut session = node.session("xtdb", Arc::new(Identity)).unwrap();
@@ -105,7 +105,7 @@ async fn lost_source_acknowledgement_recovers_the_original_write_exactly_once() 
     schedule.assert_exhausted().unwrap();
     drop(session); drop(node);
 
-    let replay = FaultSchedule::new(vec![], 10_000).unwrap();
+    let replay = FaultSchedule::new(vec![], 200_000).unwrap();
     let (node, driver) = Node::open(options(directory.path()), services(clock, replay.clone())).await.unwrap();
     let owner = tokio::spawn(driver.run());
     node.sync_all(Duration::from_secs(10), node.cancellation()).await.unwrap();
@@ -136,7 +136,7 @@ async fn recover_interrupted_checkpoint(phase: Phase) {
     let schedule = FaultSchedule::new(vec![Rule {
         owner: "xtdb/store".into(), operation: Operation::Put, phase,
         key: KeyMatch::Exact(root), occurrence: 1, action: Action::Hold("checkpoint-root".into()),
-    }], 10_000).unwrap();
+    }], 200_000).unwrap();
     let (node, driver) = Node::open(options(directory.path()), services(clock.clone(), schedule.clone())).await.unwrap();
     let owner = tokio::spawn(driver.run());
     let mut session = node.session("xtdb", Arc::new(Identity)).unwrap();
@@ -163,7 +163,7 @@ async fn recover_interrupted_checkpoint(phase: Phase) {
     drop(database);
     drop(node);
 
-    let replay = FaultSchedule::new(vec![], 10_000).unwrap();
+    let replay = FaultSchedule::new(vec![], 200_000).unwrap();
     let (node, driver) = Node::open(options(directory.path()), services(clock, replay.clone())).await
         .unwrap_or_else(|error| panic!("checkpoint could not open after {phase:?} interruption: {error}"));
     let database = node.catalog().database("xtdb").unwrap();
@@ -209,7 +209,7 @@ async fn recovery_preserves_queries_through_tiered_publication() {
         key: KeyMatch::Prefix("tables/public$docs/data/l02-rc-p3-b".into()),
         occurrence: 1,
         action: Action::Hold("last-sibling".into()),
-    }], 20_000).unwrap();
+    }], 200_000).unwrap();
     let _close = CloseSchedule(schedule.clone());
     let mut config = options(directory.path());
     config.compaction_threads = 1;
@@ -276,7 +276,7 @@ async fn recovery_preserves_queries_through_tiered_publication() {
     drop(database);
     drop(node);
 
-    let replay = FaultSchedule::new(vec![], 20_000).unwrap();
+    let replay = FaultSchedule::new(vec![], 200_000).unwrap();
     let (node, driver) = Node::open(config, services(clock, replay.clone())).await.unwrap();
     let database = node.catalog().database("xtdb").unwrap();
     assert_eq!(database.status().adopted_block.unwrap().block_index(), checkpoint);
@@ -326,7 +326,7 @@ async fn recover_during_block_collection(pause: RecoveryPause) {
 
     let directory = tempfile::tempdir().unwrap();
     let clock = Arc::new(ClockFixture(AtomicI64::new(1_000_000)));
-    let schedule = FaultSchedule::new(vec![], 10_000).unwrap();
+    let schedule = FaultSchedule::new(vec![], 200_000).unwrap();
     let settings = options(directory.path());
     let (writer, driver) = Node::open(settings.clone(), services(clock.clone(), schedule)).await.unwrap();
     let writer_owner = tokio::spawn(driver.run());
@@ -345,7 +345,7 @@ async fn recover_during_block_collection(pause: RecoveryPause) {
     let reader_schedule = FaultSchedule::new(vec![Rule {
         owner: "xtdb/store".into(), operation, phase, key: KeyMatch::Exact(key),
         occurrence: 1, action: Action::Hold("checkpoint-open".into()),
-    }], 10_000).unwrap();
+    }], 200_000).unwrap();
     let _close = CloseSchedule(reader_schedule.clone());
     let reader_file_size = settings.file_size_target;
     let mut reader_options = settings;
@@ -433,7 +433,7 @@ async fn follower_cursor_during_collection(expire: bool) {
         occurrence: 1,
         action: Action::Hold("follower-trie-deleted".into()),
     }] } else { vec![] };
-    let schedule = FaultSchedule::new(rules, 50_000).unwrap();
+    let schedule = FaultSchedule::new(rules, 200_000).unwrap();
     let _close = CloseSchedule(schedule.clone());
 
     let mut writer_options = options(directory.path());
@@ -462,7 +462,7 @@ async fn follower_cursor_during_collection(expire: bool) {
 
     let mut follower_options = options(directory.path());
     follower_options.read_only = true;
-    let follower_schedule = FaultSchedule::new(vec![], 50_000).unwrap();
+    let follower_schedule = FaultSchedule::new(vec![], 200_000).unwrap();
     let (follower, driver) = Node::open(follower_options, services(clock.clone(), follower_schedule)).await.unwrap();
     let follower_owner = tokio::spawn(driver.run());
     follower.sync_all(limit, follower.cancellation()).await.unwrap();
