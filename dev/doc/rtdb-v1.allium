@@ -492,6 +492,7 @@ surface StatelessDatabase {
 
     @guarantee ChangesImages
         -- Changes image columns carry individual Arrow IPC streams by default.
+        -- Applied branch Changes keeps each present image as an individual IPC stream in its singleton response row.
         -- A route advertising changes.images.stream-v1 accepts an explicit request for shared image streams and acknowledges the selected representation in the response.
         -- In the shared representation each present image column carries one Arrow IPC stream in its first cell, with one image per result row in that batch's order.
         -- Image selection, change ordering and covered intervals apply equally to both representations.

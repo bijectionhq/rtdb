@@ -1136,9 +1136,9 @@ impl Service {
                         Arc::new(StringArray::from(vec![format!("{}.{}", row.table.schema, row.table.table)])),
                         Arc::new(TimestampMicrosecondArray::from(vec![group.cut.system_time.0]).with_timezone("UTC")),
                         Arc::new(BooleanArray::from(vec![row.kind == ChangeKind::Opened])),
-                        Arc::new(BinaryArray::from(vec![key.as_deref()])),
-                        Arc::new(BinaryArray::from(vec![before.as_deref()])),
-                        Arc::new(BinaryArray::from(vec![after.as_deref()])),
+                        Arc::new(applied_image_array(key).map_err(batch_error)?),
+                        Arc::new(applied_image_array(before).map_err(batch_error)?),
+                        Arc::new(applied_image_array(after).map_err(batch_error)?),
                         Arc::new(BooleanArray::from(vec![erased])),
                     ];
                     if observe_positions {
@@ -1164,6 +1164,13 @@ impl Service {
         let mut response = Response::new(stream);
         *response.metadata_mut() = headers;
         Ok(response)
+    }
+}
+
+fn applied_image_array(image: Option<bytes::Bytes>) -> Result<BinaryArray, ArrowError> {
+    match image {
+        Some(bytes) => singleton_binary_array(Buffer::from(bytes)),
+        None => Ok(BinaryArray::from(vec![None::<&[u8]>])),
     }
 }
 
@@ -1635,21 +1642,19 @@ fn pack_batch(schema: SchemaRef, rows: &[ReservedRow]) -> Result<RecordBatch, Ar
 
 fn singleton_image_array(image: Option<Image>) -> Result<BinaryArray, ArrowError> {
     match image {
-        Some(Image::Binary(bytes)) => {
-            let len = bytes.len();
-            let end = i32::try_from(len).map_err(|_| ArrowError::OffsetOverflowError(len))?;
-            BinaryArray::try_new(
-                OffsetBuffer::new(vec![0, end].into()),
-                Buffer::from_vec(bytes),
-                None,
-            )
-        }
+        Some(Image::Binary(bytes)) => singleton_binary_array(Buffer::from_vec(bytes)),
         Some(Image::Shared { stream, row }) => {
             shared_image_array(&stream, std::iter::once(&row), 1)
         }
         None => Ok(BinaryArray::new_null(1)),
         Some(Image::Deferred(_)) => unreachable!("singleton images have been encoded"),
     }
+}
+
+fn singleton_binary_array(values: Buffer) -> Result<BinaryArray, ArrowError> {
+    let len = values.len();
+    let end = i32::try_from(len).map_err(|_| ArrowError::OffsetOverflowError(len))?;
+    BinaryArray::try_new(OffsetBuffer::new(vec![0, end].into()), values, None)
 }
 
 fn image_array(rows: &[ReservedRow], column: usize) -> Result<BinaryArray, ArrowError> {
@@ -2515,6 +2520,39 @@ mod tests {
         assert_eq!(array.values().as_ptr(), pointer);
         assert_eq!(array.values().capacity(), capacity);
         assert_eq!(array.value(0), b"image payload");
+    }
+
+    #[test]
+    fn applied_image_singletons_keep_the_wire_bytes_and_the_image_reservation() {
+        let image_memory = rtdb_columnar::MemoryBudget::new(1 << 20);
+        let frame_memory = rtdb_columnar::MemoryBudget::new(1 << 20);
+        let id = Value::I64(7);
+        let cells = StructFields::from([("payload".into(), Value::Utf8("data".repeat(300)))]);
+        let valid = rtdb_types::Interval::new(Timestamp(10), Timestamp(20)).unwrap();
+        let image = write_change_image(&cells, &id, Some(valid), &image_memory).unwrap();
+        let charge = image_memory.used_bytes();
+        assert!(charge > 0);
+        let pointer = image.as_ptr();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("present", DataType::Binary, true),
+            Field::new("absent", DataType::Binary, true),
+        ]));
+        let legacy = RecordBatch::try_new(Arc::clone(&schema), vec![
+            Arc::new(BinaryArray::from(vec![Some(image.as_ref())])),
+            Arc::new(BinaryArray::from(vec![None::<&[u8]>])),
+        ]).unwrap();
+        let present = applied_image_array(Some(image)).unwrap();
+        assert_eq!(present.value(0).as_ptr(), pointer);
+        let shared = RecordBatch::try_new(Arc::clone(&schema), vec![
+            Arc::new(present),
+            Arc::new(applied_image_array(None).unwrap()),
+        ]).unwrap();
+        let frame = |batch: &RecordBatch| wire::Encoder::new(&schema, &frame_memory)
+            .unwrap().batch(batch, &frame_memory).unwrap();
+        assert_eq!(frame(&shared), frame(&legacy));
+        assert_eq!(image_memory.used_bytes(), charge);
+        drop(shared);
+        assert_eq!(image_memory.used_bytes(), 0);
     }
 
     #[test]
