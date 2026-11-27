@@ -2395,6 +2395,8 @@ surface QueryAccess {
         -- A located point read decodes the event headers and the put fields needed by its projection and predicates.
         -- Equality selection on a keyword ID includes the native and reference persisted digests.
         -- For columnar query output, stacked filters apply in plan order to the surviving vectors and row positions.
+        -- A projection concatenating two compatible UTF-8 columns reads their selected cells from Arrow and reserves the output buffers per page before writing them.
+        -- It preserves each nonnull pair's bytes in operand order and yields SQL null when either operand is null.
         -- A columnar limit applies its offset and row count to batches and slices compatible Arrow arrays.
         -- DISTINCT and set operations with columnar inputs select their output positions from those Arrow batches.
         -- DISTINCT holds its seen keys in memory and fails when the memory budget cannot hold them.

@@ -1,6 +1,7 @@
 //! Column-at-a-time pages: a scan gathers the cells its visible rows resolve to into one column per output field,
 //! so filters and aggregates can read whole columns, and rows are materialised only for operators that need them.
 pub(crate) mod apply;
+mod concat;
 pub(crate) mod float_vector;
 mod float_vectors;
 pub(crate) mod functions;
@@ -5331,6 +5332,11 @@ impl BatchCursor for BatchExpressions {
             }
             if let Some((column, owner)) = projection::shared_column(kernel, &self.schema, &batch, memory)? {
                 validate_kernel_projection(expression, &column)?;
+                columns.push(column);
+                owners[index] = Some(owner);
+                continue;
+            }
+            if let Some((column, owner)) = concat::utf8_column(kernel, &self.schema, &batch, &self.execution.context)? {
                 columns.push(column);
                 owners[index] = Some(owner);
                 continue;

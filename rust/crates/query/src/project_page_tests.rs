@@ -50,6 +50,116 @@ fn invalid_pattern() -> Expr {
 }
 
 #[tokio::test]
+async fn utf8_concat_writes_join_selections_within_the_output_page_budget() {
+    use arrow_array::{Array, RecordBatch, StringArray};
+    use crate::columnar::{Column, single_batch};
+
+    let execution = execution();
+    let memory = &execution.context.memory;
+    let baseline = memory.used_bytes();
+    let text = LogicalType::Scalar(ScalarType::Utf8).maybe();
+    let left = field(0, text.clone());
+    let right = field(1, text.clone());
+    let schema = Schema::new(vec![left.clone(), right.clone()]).unwrap();
+    let names = [None, Some(""), Some("é"), Some("e\u{301}")].repeat(16);
+    let labels = [Some("🦀"), None, Some(""), Some("β")].repeat(16);
+    let page = |values: &[Option<&str>]| {
+        let field = rtdb_columnar::to_field("input", &text).unwrap();
+        let array = StringArray::from_iter([Some("outside the slice")].into_iter().chain(values.iter().copied()));
+        let record = RecordBatch::try_new(
+            Arc::new(arrow_schema::Schema::new(vec![field])),
+            vec![Arc::new(array.slice(1, values.len()))],
+        ).unwrap();
+        ColumnBatch::from_owned(rtdb_columnar::OwnedBatch::new(record, memory).unwrap()).unwrap()
+    };
+    let batch = ColumnBatch::cross(&page(&names), &page(&labels), names.len() * labels.len(), &execution.context).unwrap();
+    let pressure = memory.reserve(memory.available_bytes() - (64 << 10)).unwrap();
+    let expression = Expr::binary(BinaryOp::Concat, left.expression(), right.expression());
+    let input = single_batch(Some(batch), Arc::clone(&execution.context));
+    let mut cursor = BatchExpressions::new(input, schema, vec![expression], execution.clone());
+    let output = cursor.next_batch().await.unwrap().unwrap();
+    drop((cursor, pressure));
+
+    let [Column::Arrow { array, logical: Some(logical), .. }] = output.columns.as_slice() else {
+        panic!("Expected one Arrow column");
+    };
+    assert_eq!(logical, &text);
+    let array = array.as_any().downcast_ref::<StringArray>().unwrap();
+    let expected = names.iter().flat_map(|left| labels.iter().map(move |right| {
+        left.zip(*right).map(|(left, right)| format!("{left}{right}"))
+    }));
+    assert!(array.iter().eq(expected.collect::<Vec<_>>().iter().map(Option::as_deref)));
+    assert!(memory.used_bytes() >= baseline + array.get_array_memory_size());
+    drop(output);
+    assert_eq!(memory.used_bytes(), baseline);
+}
+
+#[tokio::test]
+async fn utf8_concat_keeps_binary_and_unreached_expressions_on_the_scalar_path() {
+    let execution = execution();
+    let binary = Expr::binary(BinaryOp::Concat,
+        Expr::Literal(Value::Binary(vec![0, 255])), Expr::Literal(Value::Binary(vec![128, 0])));
+    let nullable = Expr::binary(BinaryOp::Concat,
+        Expr::Literal(Value::Null),
+        Expr::Cast {
+            expr: Box::new(Expr::binary(BinaryOp::Divide, int(1), int(0))),
+            target: rtdb_plan::CastTarget::fixed(LogicalType::Scalar(ScalarType::Utf8)),
+        });
+    let mut cursor = cursor(Some(vec![1]), vec![binary, nullable], &execution);
+    let output = cursor.next_batch().await.unwrap().unwrap();
+    assert_eq!(output.columns[0].value(0).unwrap(), Value::Binary(vec![0, 255, 128, 0]));
+    assert_eq!(output.columns[1].value(0).unwrap(), Value::Null);
+}
+
+#[tokio::test]
+async fn utf8_concat_supplies_grouping_top_k_and_spilling_sort_keys() {
+    use arrow_schema::DataType;
+    use rtdb_sql::PrepareOptions;
+    use crate::PreparedQuery;
+
+    let mut execution = execution();
+    Arc::get_mut(&mut execution.context).unwrap().options.sort_memory_bytes = 1;
+    let fixture = "WITH acc AS (SELECT 1 AS _id, 'z' AS name UNION ALL SELECT 2, 'é' \
+        UNION ALL SELECT 3, '🦀' UNION ALL SELECT 4, NULL), \
+        small AS (SELECT '' AS label UNION ALL SELECT 'β' UNION ALL SELECT 'β' UNION ALL SELECT NULL) ";
+    let query = |sql| {
+        let sql = format!("{fixture}{sql}");
+        let prepared = rtdb_sql::prepare(&sql, &execution.context.catalog, &PrepareOptions::default()).unwrap();
+        PreparedQuery::from_prepared(prepared, &execution.context.memory).unwrap()
+    };
+    let text = |value: &str| Value::Utf8(value.into());
+    let cases = [
+        ("SELECT a._id, a.name || b.label AS nn FROM acc a JOIN small b ON true ORDER BY nn DESC NULLS LAST LIMIT 5",
+            vec![DataType::Int64, DataType::Utf8],
+            vec![vec![Value::I64(3), text("🦀β")], vec![Value::I64(3), text("🦀β")], vec![Value::I64(3), text("🦀")],
+                vec![Value::I64(2), text("éβ")], vec![Value::I64(2), text("éβ")]]),
+        ("SELECT a.name || b.label AS k, COUNT(*) FROM acc a JOIN small b ON true GROUP BY a.name || b.label \
+            ORDER BY 2 DESC, 1 NULLS LAST LIMIT 5",
+            vec![DataType::Utf8, DataType::Int64],
+            vec![vec![Value::Null, Value::I64(7)], vec![text("zβ"), Value::I64(2)], vec![text("éβ"), Value::I64(2)],
+                vec![text("🦀β"), Value::I64(2)], vec![text("z"), Value::I64(1)]]),
+        ("SELECT COUNT(*) FROM (SELECT a.name || b.label AS nn FROM acc a JOIN small b ON true ORDER BY nn DESC OFFSET 10) x",
+            vec![DataType::Int64], vec![vec![Value::I64(6)]]),
+    ];
+    for (sql, types, expected) in cases {
+        let mut cursor = query(sql).execute_columns(Arc::clone(&execution.context), vec![]).await.unwrap();
+        let mut actual = Vec::new();
+        while let Some(output) = cursor.next_batch().await.unwrap() {
+            let batch = output.batch();
+            let schema = batch.schema();
+            assert!(schema.fields().iter().map(|field| field.data_type()).eq(&types));
+            for row in 0..batch.num_rows() {
+                actual.push(schema.fields().iter().zip(batch.columns()).map(|(field, array)| {
+                    rtdb_columnar::read_value(field, array.as_ref(), row).unwrap()
+                }).collect::<Vec<_>>());
+            }
+        }
+        assert_eq!(actual, expected, "{sql}");
+    }
+    assert!(execution.context.spill_peak_bytes() > 0);
+}
+
+#[tokio::test]
 async fn projection_evaluates_every_row_of_the_first_column_before_the_second_column() {
     let execution = execution();
     let first = Expr::binary(BinaryOp::Divide,int(10),Expr::column(ColumnId(0),LogicalType::Scalar(ScalarType::I64)));

@@ -493,7 +493,7 @@ impl NativeOrder {
 #[test]
 #[cfg(target_pointer_width = "64")]
 fn byte_prefix_resolves_concatenated_name_and_label_keys_inline() {
-    use rtdb_plan::ColumnId;
+    use rtdb_plan::{ColumnId, Expr};
 
     let order = SortExpr {
         expr: Expr::Column {
@@ -514,7 +514,7 @@ fn byte_prefix_resolves_concatenated_name_and_label_keys_inline() {
 
 #[test]
 fn byte_prefix_orders_zero_padding_and_leaves_equal_truncated_prefixes_to_the_tail() {
-    use rtdb_plan::ColumnId;
+    use rtdb_plan::{ColumnId, Expr};
 
     assert!(size_of::<BytePrefix>() <= 3 * size_of::<usize>());
     let exact = [0; PREFIX_BYTES];
