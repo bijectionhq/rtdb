@@ -4,16 +4,16 @@ use std::{
 };
 
 use arrow_array::RecordBatch;
-use arrow_buffer::Buffer;
+use arrow_buffer::{Buffer, bit_util::round_upto_multiple_of_64};
 use arrow_ipc::{FieldNode, MetadataVersion};
 use arrow_schema::{DataType, FieldRef, Schema, SchemaRef, UnionFields, UnionMode};
 use flatbuffers::FlatBufferBuilder;
 use rtdb_types::{Anomaly, Result};
 
 use super::{
-    PageProjection, allocation_add, allocation_mul, arrow_descriptors, codec_workspace, compressed_buffer_length,
-    decoded_buffer_bound, decoded_buffer_span, field_metadata_bound, invalid, nulls, schema_metadata_bound,
-    validate_lz4_frame,
+    PageProjection, align_ipc_body, allocation_add, allocation_mul, arrow_descriptors, codec_workspace,
+    compressed_buffer_length, decoded_buffer_bound, decoded_buffer_span, field_metadata_bound, invalid,
+    ipc_body_aligned, nulls, schema_metadata_bound, validate_lz4_frame,
 };
 
 #[derive(Clone, Copy)]
@@ -176,7 +176,12 @@ pub(super) fn prepare<'a, 'selection, G>(
         return Ok(None);
     }
     let inventory = layout.retained;
-    let Ok(bound) = allocation_add(base, inventory.bound) else {
+    let alignment_copy = if measure && inventory.dense_union && !ipc_body_aligned(body) {
+        round_upto_multiple_of_64(body.len())
+    } else {
+        0
+    };
+    let Ok(bound) = allocation_add(base, inventory.bound).and_then(|bound| allocation_add(bound, alignment_copy)) else {
         return Ok(None);
     };
     let workspace = if layout.decompresses { workspace } else { 0 };
@@ -255,6 +260,7 @@ struct Inventory<'a> {
     nested: bool,
     unknown_null_counts: bool,
     native_incompatible: bool,
+    dense_union: bool,
     /// A selected dictionary, or a selected union that may hold the reference's undefined cells.
     requires_full_decoder: bool,
     bound: usize,
@@ -280,6 +286,8 @@ impl<G> Plan<'_, G> {
         for frame in self.inventory.frames.iter() {
             validate_lz4_frame(frame.bytes, frame.expected)?;
         }
+        let aligned = self.inventory.dense_union.then(|| align_ipc_body(self.body.clone()));
+        let body = aligned.as_ref().unwrap_or(self.body);
         let batch = self.batch;
         let columns = indices.map_or(source.fields().len(), <[usize]>::len);
         if native_version
@@ -293,7 +301,7 @@ impl<G> Plan<'_, G> {
             && usize::try_from(batch.length()).is_ok()
         {
             return arrow_ipc::reader::read_record_batch(
-                self.body,
+                body,
                 batch,
                 Arc::clone(source),
                 &HashMap::new(),
@@ -307,13 +315,13 @@ impl<G> Plan<'_, G> {
         if let Some(mut scratch) = scratch.and_then(|scratch| scratch.try_lock().ok())
             && scratch.fits(self.inventory.selected)
         {
-            return self.decode_rewritten(schema, &mut scratch);
+            return self.decode_rewritten(body, schema, &mut scratch);
         }
         let mut descriptors = Descriptors::with_capacity(self.inventory.selected);
-        self.decode_rewritten(schema, &mut descriptors)
+        self.decode_rewritten(body, schema, &mut descriptors)
     }
 
-    fn decode_rewritten(&self, schema: SchemaRef, descriptors: &mut Descriptors) -> Result<RecordBatch> {
+    fn decode_rewritten(&self, body: &Buffer, schema: SchemaRef, descriptors: &mut Descriptors) -> Result<RecordBatch> {
         let batch = self.batch;
         descriptors.nodes.clear();
         descriptors.buffers.clear();
@@ -353,20 +361,20 @@ impl<G> Plan<'_, G> {
                 version: self.version,
                 header_type: arrow_ipc::MessageHeader::RecordBatch,
                 header: Some(batch.as_union_value()),
-                bodyLength: i64::try_from(self.body.len()).map_err(invalid)?,
+                bodyLength: i64::try_from(body.len()).map_err(invalid)?,
                 ..Default::default()
             });
             builder.finish(message, None);
             let (metadata, start) = builder.mut_finished_buffer();
             let metadata = &mut metadata[start..];
-            nulls::normalize(metadata, self.body, &schema)?;
+            nulls::normalize(metadata, body, &schema)?;
             arrow_ipc::root_as_message(metadata).map_err(invalid)?.header_as_record_batch()
                 .ok_or_else(|| invalid("Projected Arrow message has no record batch"))?
         } else {
             builder.finish(batch, None);
             flatbuffers::root::<arrow_ipc::RecordBatch<'_>>(builder.finished_data()).map_err(invalid)?
         };
-        arrow_ipc::reader::read_record_batch(self.body, batch, schema, &HashMap::new(), None, &self.version)
+        arrow_ipc::reader::read_record_batch(body, batch, schema, &HashMap::new(), None, &self.version)
             .map_err(invalid)
     }
 }
@@ -560,6 +568,7 @@ impl<'a, 'b> Layout<'a, 'b> {
             return Ok(());
         }
         if keep {
+            self.retained.dense_union |= matches!(physical, DataType::Union(_, UnionMode::Dense));
             self.retained.requires_full_decoder |= matches!(field.data_type(), DataType::Dictionary(..))
                 || (matches!(physical, DataType::Union(..))
                     && self.may_hold_undefined_cells(start.buffer + usize::from(self.version < MetadataVersion::V5), node.length())?);

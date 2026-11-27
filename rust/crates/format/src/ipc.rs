@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::collections::HashMap;
 
 use arrow_array::{ArrayRef, RecordBatch};
-use arrow_buffer::Buffer;
+use arrow_buffer::{Buffer, MutableBuffer};
 use arrow_ipc::reader::FileDecoder;
 use arrow_ipc::writer::{
     CompressionContext, DictionaryTracker, EncodedData, IpcDataGenerator, IpcWriteOptions,
@@ -610,7 +610,7 @@ impl PageDecoder {
                     return Err(invalid("Could not read IPC message as metadata versions mismatch"));
                 }
                 let record_batch = message.header_as_record_batch().ok_or_else(|| invalid("Arrow file ended before its declared page"))?;
-                let body = bytes.slice(body_start);
+                let body = align_ipc_body(bytes.slice(body_start));
                 let batch = arrow_ipc::reader::read_record_batch(
                     &body, record_batch, Arc::clone(&self.decoded_schema), &HashMap::new(),
                     self.projection.as_deref(), &message.version(),
@@ -628,6 +628,7 @@ impl PageDecoder {
     }
 
     fn decode_prepared(&self, block: &arrow_ipc::Block, bytes: Buffer) -> Result<RecordBatch> {
+        let bytes = align_ipc_block(bytes, usize::try_from(block.metaDataLength()).map_err(invalid)?);
         let batch = self.decoder.read_record_batch(block, &bytes).map_err(invalid)?.ok_or_else(|| invalid("Arrow file ended before its declared page"))?;
         undefined::reinstate(batch)
     }
@@ -1335,11 +1336,24 @@ fn contains_dense_union(ty: &DataType) -> bool {
 
 /// Ensures dense union offsets can be read before Arrow aligns the decoded arrays.
 pub fn align_ipc_body(body: Buffer) -> Buffer {
-    if body.as_ptr().align_offset(std::mem::align_of::<i32>()) == 0 {
-        body
-    } else {
-        Buffer::from_slice_ref(body.as_slice())
+    align_ipc_block(body, 0)
+}
+
+fn ipc_body_aligned(body: &[u8]) -> bool {
+    body.as_ptr().align_offset(std::mem::align_of::<i32>()) == 0
+}
+
+/// `align_ipc_body` for the body starting `body_start` bytes into a whole IPC block.
+fn align_ipc_block(block: Buffer, body_start: usize) -> Buffer {
+    if ipc_body_aligned(&block[body_start..]) {
+        return block;
     }
+    let alignment = std::mem::align_of::<i32>();
+    let padding = (alignment - body_start % alignment) % alignment;
+    let mut aligned = MutableBuffer::new(padding + block.len());
+    aligned.extend_zeros(padding);
+    aligned.extend_from_slice(block.as_slice());
+    Buffer::from(aligned).slice(padding)
 }
 
 fn decode_stream_batch(
@@ -2432,6 +2446,55 @@ fn seekable_event_projection_funds_only_selected_decode_and_wire_with_unknown_nu
     assert!(!fields.contains_key("ignored"));
     drop((page, charge));
     assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn ipc_file_pages_decode_dense_unions_from_unaligned_ranges() {
+    use arrow_array::{Int64Array, StringArray, UnionArray};
+    use arrow_schema::{Field, UnionFields};
+
+    let fields = UnionFields::try_new([0, 1], [
+        Field::new("i64", DataType::Int64, false),
+        Field::new("utf8", DataType::Utf8, false),
+    ]).unwrap();
+    let union = UnionArray::try_new(fields, vec![0, 1, 0].into(), Some(vec![0, 0, 1].into()), vec![
+        Arc::new(Int64Array::from(vec![7, -4])), Arc::new(StringArray::from(vec!["hello"])),
+    ]).unwrap();
+    let expected = RecordBatch::try_from_iter([("value", Arc::new(union) as ArrayRef)]).unwrap();
+    let mut writer = arrow_ipc::writer::FileWriter::try_new(Vec::new(), expected.schema_ref()).unwrap();
+    writer.write(&expected).unwrap();
+    let standard = writer.into_inner().unwrap();
+    let classic = write_file(expected.schema_ref(), std::slice::from_ref(&expected)).unwrap();
+    for file in [standard, classic] {
+        let file = Buffer::from_slice_ref(&file);
+        let reader = ArrowFile::from_buffer(file.clone(), None).unwrap();
+        let range = reader.pages.page_range(0).unwrap();
+        let block = file.slice_with_length(range.start as usize, (range.end - range.start) as usize);
+        let aligned = reader.pages.decode_page(0, block.clone()).unwrap();
+        assert_eq!(aligned, expected);
+        let union = aligned.column(0).as_any().downcast_ref::<UnionArray>().unwrap();
+        assert!(block.as_slice().as_ptr_range().contains(&union.offsets().unwrap().as_ptr().cast()));
+
+        let alignment = std::mem::align_of::<i32>();
+        let mut response = Vec::<u8>::with_capacity(block.len() + alignment);
+        let start = response.as_ptr().align_offset(alignment) + 1;
+        response.resize(start, 0);
+        response.extend_from_slice(&block);
+        let response = Bytes::from(response).slice(start..);
+        let range = Buffer::from(response.clone());
+        let (_, body_start) = block_message(reader.pages.block(0).unwrap(), &range).unwrap();
+        assert_ne!(range[body_start..].as_ptr().align_offset(alignment), 0);
+        assert_eq!(reader.pages.decode_page(0, range).unwrap(), expected);
+
+        let memory = MemoryBudget::new(1 << 20);
+        let (projected, charge) = reader.pages.decode_projected_page_reserved(
+            0, response, PageProjection::PutColumns(&[]), |bound| memory.reserve(bound),
+        ).unwrap().expect("a plain dense union is projected rather than declined");
+        assert_eq!(projected, expected);
+        drop(projected);
+        drop(charge);
+        assert_eq!(memory.used_bytes(), 0);
+    }
 }
 
 #[test]
