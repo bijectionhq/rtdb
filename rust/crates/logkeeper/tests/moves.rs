@@ -19,7 +19,8 @@ async fn committed(log: &dyn Log) -> Vec<String> {
 }
 
 fn quorum_of(ensemble: &Ensemble, servers: &[usize], stream: &str) -> StreamConfig {
-    StreamConfig { write_quorum: 2, ..ensemble.config_of(servers, stream) }
+    let routes = servers.iter().map(|&server| (server, ensemble.addresses[server])).collect::<Vec<_>>();
+    ensemble.members(&routes, stream)
 }
 
 /// Commits a0..a4 on {A,B,C} at epoch 1, then leaves an unacknowledged "stranded" entry on A alone and stops A.
