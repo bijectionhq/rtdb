@@ -7,7 +7,7 @@ use arrow_schema::{DataType, Field as ArrowField, IntervalUnit as ArrowIntervalU
 use rtdb_columnar::MemoryReservation;
 use rtdb_expr::kernels::{AgeOperand, DateBin, calendar_age, cast_date_timestamp_ticks, cast_timestamp_ticks,
     timestamp_truncation_zone, truncate_date32, truncate_date64, truncate_interval, truncate_timestamp};
-use rtdb_plan::{CastTarget, CastTimezone, Expr, Schema, TemporalField, TemporalKind, truncation_zone};
+use rtdb_plan::{CastTarget, CastTimezone, Expr, Schema, TemporalCast, TemporalField, TemporalKind, truncation_zone};
 use rtdb_types::{AnomalyKind, IntervalUnit, LogicalType, Result, ScalarType, TimeUnit, Value, ZoneId, java_date::MILLIS_PER_DAY};
 
 use super::{Column, ColumnBatch, owned_projection_bytes, plain_scalar, size_error};
@@ -257,44 +257,79 @@ impl<'a> BinStride<'a> {
     }
 }
 
-struct AgeInput<'a> {
+pub(super) struct CalendarOperand<'a> {
     input: CalendarInput<'a>,
-    timestamp_cast: Option<(TimeUnit, Option<&'a str>)>,
+    casts: Option<(&'a Expr, bool)>,
+    pub(super) ty: CalendarType<'a>,
 }
 
-impl<'a> AgeInput<'a> {
-    fn bind(expr: &'a Expr, schema: &'a Schema, batch: &'a ColumnBatch, params: &'a BoundParameters, timezone: &'a str) -> Option<Self> {
-        let (expr, timestamp_cast) = match expr {
-            Expr::Cast { expr, target: CastTarget::Temporal(target) } if target.precision.is_none() => {
-                match expr.as_ref() {
-                    Expr::Column { id, .. } if !schema.get(*id)?.data_type.nullable() => {}
-                    Expr::Parameter { index, .. } if !params.types().get(*index)?.nullable() => {}
-                    Expr::Literal(_) => {}
-                    _ => return None,
-                }
-                let label = match &target.kind {
-                    TemporalKind::TimestampLocal => None,
-                    TemporalKind::TimestampZone(CastTimezone::Explicit(label)) => Some(label.as_str()),
-                    TemporalKind::TimestampZone(CastTimezone::Session) => Some(timezone),
-                    _ => return None,
-                };
-                (expr.as_ref(), Some((target.unit, label)))
-            }
-            _ => (expr, None),
+impl<'a> CalendarOperand<'a> {
+    pub(super) fn bind(expr: &'a Expr, schema: &'a Schema, batch: &'a ColumnBatch, params: &'a BoundParameters, timezone: &'a str) -> Option<Self> {
+        let mut leaf = expr;
+        let mut ty = None;
+        while let Expr::Cast { expr, target: CastTarget::Temporal(target) } = leaf {
+            let cast_type = timestamp_cast_type(target, timezone)?;
+            ty.get_or_insert(cast_type);
+            leaf = expr;
+        }
+        let input = CalendarInput::bind(leaf, schema, batch, params)?;
+        let Some(ty) = ty else { return Some(Self::direct(input)); };
+        let eager = match leaf {
+            Expr::Column { id, .. } => schema.get(*id)?.data_type.nullable(),
+            Expr::Parameter { index, .. } => params.types().get(*index)?.nullable(),
+            _ => false,
         };
-        Some(Self { input: CalendarInput::bind(expr, schema, batch, params)?, timestamp_cast })
+        Some(Self { input, casts: Some((expr, eager)), ty })
     }
 
-    fn ty(&self) -> CalendarType<'a> {
-        self.timestamp_cast.map_or(self.input.ty, |(unit, label)| CalendarType::Timestamp(unit, label))
+    fn direct(input: CalendarInput<'a>) -> Self {
+        Self { ty: input.ty, input, casts: None }
     }
 
-    fn cast(&self, ticks: i64, timezone: &str) -> Result<i64> {
-        match self.timestamp_cast {
-            Some((unit, label)) => self.input.ty.cast_timestamp(ticks, unit, label.is_some(), timezone),
-            None => Ok(ticks),
+    pub(super) fn prepare(&self, row: usize, timezone: &str) -> Result<Option<Option<CalendarCell<'a>>>> {
+        let Some(ticks) = self.input.ticks(row) else { return Ok(None); };
+        let Some(ticks) = ticks else { return Ok(Some(None)); };
+        let cell = match self.casts {
+            None => CalendarCell::Ticks(ticks),
+            // A cast with a nullable declared type boxes its payload while the scalar call prepares its arguments.
+            Some((casts, true)) => CalendarCell::Ticks(cast_ticks(casts, self.input.ty, ticks, timezone)?.0),
+            Some((casts, false)) => CalendarCell::Cast { ticks, input: self.input.ty, casts },
+        };
+        Ok(Some(Some(cell)))
+    }
+}
+
+pub(super) enum CalendarCell<'a> {
+    Ticks(i64),
+    Cast { ticks: i64, input: CalendarType<'a>, casts: &'a Expr },
+}
+
+impl CalendarCell<'_> {
+    pub(super) fn demand(&self, timezone: &str) -> Result<i64> {
+        match self {
+            Self::Ticks(ticks) => Ok(*ticks),
+            Self::Cast { ticks, input, casts } => cast_ticks(casts, *input, *ticks, timezone).map(|(ticks, _)| ticks),
         }
     }
+}
+
+fn timestamp_cast_type<'a>(target: &'a TemporalCast, timezone: &'a str) -> Option<CalendarType<'a>> {
+    let label = match &target.kind {
+        TemporalKind::TimestampLocal => None,
+        TemporalKind::TimestampZone(CastTimezone::Explicit(label)) => Some(label.as_str()),
+        TemporalKind::TimestampZone(CastTimezone::Session) => Some(timezone),
+        _ => return None,
+    };
+    Some(CalendarType::Timestamp(target.unit, label))
+}
+
+fn cast_ticks<'a>(expr: &'a Expr, source: CalendarType<'a>, ticks: i64, timezone: &'a str) -> Result<(i64, CalendarType<'a>)> {
+    let Expr::Cast { expr, target: CastTarget::Temporal(target) } = expr else { return Ok((ticks, source)); };
+    let (ticks, source) = stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || cast_ticks(expr, source, ticks, timezone))?;
+    let ty = timestamp_cast_type(target, timezone).expect("bound timestamp cast");
+    let CalendarType::Timestamp(unit, label) = ty else { unreachable!("bound timestamp cast") };
+    // Scalar casts over typed dates and timestamps use the target unit without text precision quantization.
+    Ok((source.cast_timestamp(ticks, unit, label.is_some(), timezone)?, ty))
 }
 
 pub(super) fn project(expr: &Expr, schema: &Schema, batch: &ColumnBatch, params: &BoundParameters, context: &QueryContext)
@@ -355,26 +390,32 @@ pub(super) fn project(expr: &Expr, schema: &Schema, batch: &ColumnBatch, params:
             }
         }
         ("date_bin" | "date-bin", [stride, source] | [stride, source, _]) => {
+            let timezone = &context.timezone;
             let Some(stride) = BinStride::bind(stride, schema, batch, params) else { return Ok(None); };
-            let Some(source) = CalendarInput::bind(source, schema, batch, params) else { return Ok(None); };
+            let Some(source) = CalendarOperand::bind(source, schema, batch, params, timezone) else { return Ok(None); };
             let CalendarType::Timestamp(source_unit, source_zone) = source.ty else { return Ok(None); };
             let origin = match args.get(2) {
-                None => CalendarInput { source: CalendarSource::Constant(Some(0)), ty: CalendarType::Timestamp(TimeUnit::Microsecond, Some("UTC")) },
+                None => CalendarOperand::direct(CalendarInput {
+                    source: CalendarSource::Constant(Some(0)),
+                    ty: CalendarType::Timestamp(TimeUnit::Microsecond, Some("UTC")),
+                }),
                 Some(origin) => {
-                    let Some(origin) = CalendarInput::bind(origin, schema, batch, params) else { return Ok(None); };
+                    let Some(origin) = CalendarOperand::bind(origin, schema, batch, params, timezone) else { return Ok(None); };
                     origin
                 }
             };
             let CalendarType::Timestamp(origin_unit, origin_zone) = origin.ty else { return Ok(None); };
-            let ScalarType::Timestamp { unit, timezone } = result else { return Ok(None); };
+            let ScalarType::Timestamp { unit, timezone: result_zone } = result else { return Ok(None); };
             let bin = DateBin::new(stride.unit, source_unit, source_zone.is_some(), origin_unit, origin_zone);
-            if *unit != bin.output_unit() || timezone.as_deref() != origin_zone { return Ok(None); }
+            if *unit != bin.output_unit() || result_zone.as_deref() != origin_zone { return Ok(None); }
             let cell = |row| {
-                let (Some(stride_parts), Some(origin)) = (stride.parts(row), origin.ticks(row)) else { return Ok(None); };
+                let Some(stride_parts) = stride.parts(row) else { return Ok(None); };
+                let Some(origin) = origin.prepare(row, timezone)? else { return Ok(None); };
+                let origin = origin.map(|origin| origin.demand(timezone)).transpose()?;
                 let (Some(parts), Some(origin)) = (stride_parts, origin) else { return Ok(Some(None)); };
-                let Some(source) = source.ticks(row) else { return Ok(None); };
+                let Some(source) = source.prepare(row, timezone)? else { return Ok(None); };
                 let Some(source) = source else { return Ok(Some(None)); };
-                bin.cell((parts.months, parts.days, parts.nanoseconds), source, origin, &context.timezone)
+                bin.cell((parts.months, parts.days, parts.nanoseconds), source.demand(timezone)?, origin, timezone)
                     .map(|value| Some(Some(value)))
             };
             match unit {
@@ -385,9 +426,9 @@ pub(super) fn project(expr: &Expr, schema: &Schema, batch: &ColumnBatch, params:
         }
         ("age", [end, start]) => {
             let timezone = &context.timezone;
-            let (Some(end), Some(start)) = (AgeInput::bind(end, schema, batch, params, timezone), AgeInput::bind(start, schema, batch, params, timezone))
+            let (Some(end), Some(start)) = (CalendarOperand::bind(end, schema, batch, params, timezone), CalendarOperand::bind(start, schema, batch, params, timezone))
                 else { return Ok(None); };
-            let inputs = [end.ty(), start.ty()];
+            let inputs = [end.ty, start.ty];
             let expected = if inputs.iter().any(|ty| matches!(ty, CalendarType::Timestamp(TimeUnit::Nanosecond, _))) {
                 ScalarType::Interval(IntervalUnit::MonthDayNano)
             } else { ScalarType::IntervalMonthDayMicro };
@@ -395,13 +436,13 @@ pub(super) fn project(expr: &Expr, schema: &Schema, batch: &ColumnBatch, params:
             let needs_zone = inputs.iter().any(|ty| matches!(ty, CalendarType::Timestamp(_, Some(_))));
             let Ok(zone) = needs_zone.then(|| ZoneId::parse(timezone)).transpose() else { return Ok(None); };
             build::<IntervalMonthDayNanoType>(batch, context, result, |row| {
-                let Some(end_ticks) = end.input.ticks(row) else { return Ok(None); };
-                let Some(end_ticks) = end_ticks else { return Ok(Some(None)); };
-                let Some(start_ticks) = start.input.ticks(row) else { return Ok(None); };
-                let Some(start_ticks) = start_ticks else { return Ok(Some(None)); };
-                let end_ticks = end.cast(end_ticks, timezone)?;
-                let start_ticks = start.cast(start_ticks, timezone)?;
-                let (months, days, nanos) = calendar_age(end.ty().age_operand(end_ticks, zone.as_ref()), start.ty().age_operand(start_ticks, zone.as_ref()))?;
+                let Some(end_cell) = end.prepare(row, timezone)? else { return Ok(None); };
+                let Some(end_cell) = end_cell else { return Ok(Some(None)); };
+                let Some(start_cell) = start.prepare(row, timezone)? else { return Ok(None); };
+                let Some(start_cell) = start_cell else { return Ok(Some(None)); };
+                let end_ticks = end_cell.demand(timezone)?;
+                let start_ticks = start_cell.demand(timezone)?;
+                let (months, days, nanos) = calendar_age(end.ty.age_operand(end_ticks, zone.as_ref()), start.ty.age_operand(start_ticks, zone.as_ref()))?;
                 Ok(Some(Some(IntervalMonthDayNano::new(months, days, nanos))))
             })
         }
@@ -854,7 +895,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn age_does_not_demand_a_timestamp_cast_when_the_other_argument_is_null() {
+    async fn age_prepares_nullable_casts_and_skips_deferred_casts_after_a_null() {
         let end = Field { data_type: timestamp(0, TimeUnit::Second, None).logical_type(), ..field(0, TimeUnit::Second, None) };
         let start = field(1, TimeUnit::Second, None);
         let schema = Schema::new(vec![end.clone(), start.clone()]).unwrap();
@@ -885,9 +926,59 @@ mod tests {
         let age = age(&nullable);
         let values = [timestamp(i64::MAX, TimeUnit::Second, None), Value::Null];
         let expected = rtdb_expr::evaluate_projection(&age, &schema, &values, &Default::default()).unwrap_err();
-        let mut fallback = cursor(execution("UTC"), schema, batch(&nullable, None), vec![age]);
-        assert_eq!(fallback.next_batch().await.err().unwrap().code, expected.code);
-        assert_eq!(fallback.scalar_fallbacks, Some(1));
+        let mut eager = cursor(execution("UTC"), schema, batch(&nullable, None), vec![age]);
+        assert_eq!(eager.next_batch().await.err().unwrap().code, expected.code);
+        assert_eq!(eager.scalar_fallbacks, Some(0));
+    }
+
+    #[tokio::test]
+    async fn calendar_projections_compose_nested_timestamp_casts_and_typed_precision() {
+        use TimeUnit::{Microsecond, Millisecond, Nanosecond};
+        let source = field(0, Microsecond, None);
+        let schema = Schema::new(vec![source.clone()]).unwrap();
+        let batch = dataset(vec![arrow(TimestampMicrosecondArray::from(vec![
+            Some(1_615_689_000_123_456), Some(-1_001), None,
+        ]), &source)], 3);
+        let cast = |expr, kind, unit, precision| Expr::Cast {
+            expr: Box::new(expr), target: CastTarget::Temporal(TemporalCast { kind, unit, precision }),
+        };
+        let zone = TemporalKind::TimestampZone(CastTimezone::Explicit("Europe/Paris".into()));
+        let cast_source = cast(cast(source.expression(), zone.clone(), Millisecond, Some(1)),
+            TemporalKind::TimestampLocal, Nanosecond, Some(4));
+        let origin = cast(Expr::Literal(timestamp(0, Microsecond, None)), zone, Microsecond, Some(2));
+        let stride = Expr::Literal(Value::IntervalMonthDayMicro { months: 0, days: 0, nanoseconds: 500_000_000 });
+        let calls = vec![call("age", vec![cast_source.clone(), origin.clone()]),
+            call("date_bin", vec![stride, cast_source, origin])];
+        assert_parity(execution("America/New_York"), schema, batch, calls, vec![
+            ScalarType::Interval(IntervalUnit::MonthDayNano),
+            ScalarType::Timestamp { unit: Microsecond, timezone: Some("Europe/Paris".into()) },
+        ]).await;
+    }
+
+    #[tokio::test]
+    async fn date_bin_demands_its_origin_cast_with_a_null_stride_and_skips_its_source_cast() {
+        let source = Field { data_type: timestamp(0, TimeUnit::Second, None).logical_type(),
+            ..field(0, TimeUnit::Second, None) };
+        let stride = Field { data_type: LogicalType::Scalar(ScalarType::IntervalMonthDayMicro).maybe(),
+            ..field(1, TimeUnit::Microsecond, None) };
+        let schema = Schema::new(vec![source.clone(), stride.clone()]).unwrap();
+        let cast = Expr::Cast { expr: Box::new(source.expression()), target: CastTarget::Temporal(TemporalCast {
+            kind: TemporalKind::TimestampLocal, unit: TimeUnit::Nanosecond, precision: Some(9),
+        }) };
+        let other = Expr::Literal(timestamp(0, TimeUnit::Nanosecond, None));
+        let batch = || dataset(vec![
+            arrow(TimestampSecondArray::from(vec![i64::MAX]), &source),
+            arrow(IntervalMonthDayNanoArray::from(vec![None::<IntervalMonthDayNano>]), &stride),
+        ], 1);
+        let demanded = call("date_bin", vec![stride.expression(), other.clone(), cast.clone()]);
+        let skipped = call("date_bin", vec![stride.expression(), cast, other]);
+        let values = [timestamp(i64::MAX, TimeUnit::Second, None), Value::Null];
+        let oracle = rtdb_expr::evaluate_projection(&demanded, &schema, &values, &Default::default()).unwrap_err();
+        let mut reached = cursor(execution("UTC"), schema.clone(), batch(), vec![demanded]);
+        assert_eq!(reached.next_batch().await.err().unwrap().code, oracle.code);
+        assert_eq!(reached.scalar_fallbacks, Some(0));
+        assert_parity(execution("UTC"), schema, batch(), vec![skipped],
+            vec![ScalarType::Timestamp { unit: TimeUnit::Nanosecond, timezone: None }]).await;
     }
 
     #[tokio::test]
