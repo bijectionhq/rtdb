@@ -11,6 +11,8 @@ import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.assertThrows
+import xtdb.api.error.Incorrect
 import xtdb.arrow.I32_TYPE
 import xtdb.arrow.Relation.Companion.loader
 import xtdb.arrow.UTF8_TYPE
@@ -80,6 +82,26 @@ class StructVectorTest {
                     override fun readStruct(): Map<String, ValueReader> = error("unexpected reader map")
                 })
                 assertEquals(listOf(sparse, full, full), dst.asList)
+            }
+        }
+    }
+
+    @Test
+    fun `positioned struct writes retain the duplicate field error for an open nested row`() {
+        val type = structOf("nested" to structOf("text" to UTF8))
+        Vector.open(allocator, "src", type).use { src ->
+            src.writeObject(mapOf("nested" to mapOf("text" to "source")))
+
+            Vector.open(allocator, "dst", type).use { dst ->
+                val text = dst.vectorFor("nested").vectorFor("text")
+                text.writeObject("pending")
+                val row = src.valueReader().next()
+
+                assertFalse(row.copyIdentityTo(dst))
+                val error = assertThrows<Incorrect> { dst.writeValue(row) }
+                assertEquals("Incorrect: xtdb/key-already-set", error.message)
+                assertEquals(0, dst.valueCount)
+                assertEquals(listOf("pending"), text.asList)
             }
         }
     }

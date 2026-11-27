@@ -161,7 +161,13 @@ class StructVector private constructor(
     }
 
     internal fun canCopyObjectValueTo(dest: StructVector, idx: Int): Boolean =
-        nullable == dest.nullable && childFields == dest.childFields && hasObjectIdentityChildren(idx)
+        nullable == dest.nullable && childFields == dest.childFields &&
+            dest.isAtRowBoundary() && hasObjectIdentityChildren(idx)
+
+    private fun isAtRowBoundary(): Boolean =
+        childWriters.values.all { child ->
+            child.valueCount == valueCount && (child !is StructVector || child.isAtRowBoundary())
+        }
 
     private fun hasObjectIdentityChildren(idx: Int): Boolean =
         childWriters.values.all { child ->

@@ -2431,6 +2431,7 @@ surface QueryAccess {
         -- A nested field read follows the reached child through each valid ancestor and yields null for a null ancestor.
         -- A nullable nested field reuses the reached child position for its null check and read.
         -- Matching complete positioned structs used by projections and PATCH can copy their reached children in layout order.
+        -- Writing a reached struct field that is already written in the open destination row reports a duplicate-field error.
         -- A compatible PATCH result selects each right-hand field when it supplies a non-null value and otherwise keeps the corresponding left-hand field when present.
         -- Arrow map value writes retain the declared key-order flag and keep the last value of a repeated key at its first position.
         -- A positioned map identity write preserves the order of distinct boolean, signed integer or well-formed UTF-8 keys in a matching layout.
