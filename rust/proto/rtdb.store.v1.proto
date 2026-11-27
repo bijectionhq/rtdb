@@ -13,6 +13,7 @@ syntax = "proto3";
 //   rtdb.store.v1.Watch  WatchRequest  -> WatchReply
 //   rtdb.store.v1.Rank   RankRequest   -> RankReply
 //   rtdb.store.v1.StorageSizes StorageSizesRequest -> StorageSizesReply
+//   rtdb.store.v1.PurgeFloor PurgeFloorRequest -> PurgeFloorReply (Multi writer)
 //
 // A version is a commit position within one store incarnation. A restore or a
 // reset starts a new incarnation; a request naming another incarnation fails
@@ -260,7 +261,7 @@ message SizeBucket {
   uint64 presences = 5;
 }
 
-// rtdb.store.v1.PurgeFloor uses this schema when the writer serves the durable floor.
+// The local Multi writer orders rtdb.store.v1.PurgeFloor for its attached incarnation.
 // The effect covers the entire store incarnation and requires a verified credential with unscoped database write access.
 message PurgeFloorRequest {
   // Exactly 16 bytes, identifying the store incarnation observed by the planner.
@@ -278,6 +279,7 @@ message PurgeFloorRequest {
 message PurgeFloorReply {
   bytes incarnation = 1;
   // Present on success and equal to the request's keep_from. The durable floor is at least this Version.
+  // Physical collection follows the writer's checkpoint and retention policy.
   // Every retry must pass current writer, basis and guard admission, even when the floor already covers the request.
   optional uint64 keep_from = 2;
 }

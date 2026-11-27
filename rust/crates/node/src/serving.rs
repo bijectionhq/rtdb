@@ -4,12 +4,12 @@ use async_trait::async_trait;
 use rtdb_crypt::tokens::TokenAuthority;
 use rtdb_index::{
     Snapshot,
-    branches::{BranchCut, BranchIndex, BranchView, BranchWrite, RowImage, store::{StorePage, StoreRead, sizes::StorageSizes}},
+    branches::{BranchCut, BranchIndex, BranchView, BranchWrite, RowImage, store::{KeyRange, StorePage, StoreRead, sizes::StorageSizes}},
 };
 use rtdb_tx::transact::{CustodyGroupId, CustodyWriterFence, Receipt, Transact, TrustedCustodyCommand, workload};
 pub use rtdb_replication::{NativeCheckpointAuthority, NativeServingAuthority};
 use rtdb_types::{
-    EntityId, Interval, Result, TableRef, Timestamp,
+    EntityId, Interval, MemoryReservation, Result, TableRef, Timestamp,
     rtdb_v1::{At, Basis, Branch, Claim, Layer},
 };
 use tokio_util::sync::CancellationToken;
@@ -380,6 +380,16 @@ pub trait ServingDriver: Send + Sync {
 
     async fn store_sizes(&self, _epoch: Option<u64>, _now: Timestamp, _cancellation: &CancellationToken) -> Result<StorageSizes> {
         Err(rtdb_types::Anomaly::unsupported("rtdb.store/unsupported", "This route does not serve the ordered-bytes store"))
+    }
+
+    async fn supports_store_purge_floor(&self) -> bool { false }
+
+    /// Success confirms the durable floor in `since`'s incarnation after checking the exact retained basis and guards.
+    async fn publish_store_purge_floor(
+        &self, _since: Basis, _keep_from: u64, _reads: Vec<KeyRange>, _memory: Arc<MemoryReservation>,
+        _cancellation: &CancellationToken,
+    ) -> Result<()> {
+        Err(rtdb_types::Anomaly::unsupported("rtdb.store/purge-unsupported", "This route cannot order a store purge floor"))
     }
 
     /// A cursor below the retained effect floor reports `rtdb/cursor-expired`.

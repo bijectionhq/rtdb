@@ -5,12 +5,12 @@ use async_trait::async_trait;
 use rtdb_crypt::tokens::TokenAuthority;
 use rtdb_db::{ChangeHistory, MultiDatabase, NativeCheckpointInstallation, NativeDependentCarrier, NativeDependentOriginal, PinnedExport, Role, ServingAuthority, WritePipeline};
 use rtdb_index::branches::{BranchCut, BranchEffect, BranchIndex, BranchWrite};
-use rtdb_index::branches::store::{StorePage, StoreRead, sizes::StorageSizes};
+use rtdb_index::branches::store::{KeyRange, StorePage, StoreRead, sizes::StorageSizes};
 use rtdb_tx::transact::{
     CustodyGroupId, CustodyWriterFence, PHYSICAL_ERASURE, ROW_CUSTODY, Receipt, Transact, TrustedCustodyCommand, workload,
 };
 use rtdb_types::{
-    Anomaly, AnomalyCategory, AnomalyKind, EntityId, MemoryBudget, Result, TableRef, Timestamp,
+    Anomaly, AnomalyCategory, AnomalyKind, EntityId, MemoryBudget, MemoryReservation, Result, TableRef, Timestamp,
     rtdb_v1::{
         At, Basis, ClaimEvidence, ClaimScope, Layer, ManagedCheckpointReservation, ManagedCheckpointTarget,
         NativeCheckpointCustody, NativeCheckpointMember, NativeCustodyFence, NativeDependentCustodyDisposition,
@@ -1012,6 +1012,23 @@ impl ServingDriver for MultiServing {
         }).await
     }
 
+    async fn supports_store_purge_floor(&self) -> bool {
+        self.classic_workload_fence.is_none()
+            && self.serve(async { Ok(self.is_writer().await) }).await.unwrap_or(false)
+    }
+
+    async fn publish_store_purge_floor(
+        &self, since: Basis, keep_from: u64, reads: Vec<KeyRange>, memory: Arc<MemoryReservation>,
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
+        if self.classic_workload_fence.is_some() {
+            return Err(workload::denied());
+        }
+        cancellation.run_until_cancelled(self.serve(
+            self.writes.publish_store_purge_floor(since, keep_from, reads, memory),
+        )).await.ok_or_else(interrupted)?
+    }
+
     async fn query_workload_root(
         &self, source: QuerySource, cut: WorkloadReadCut, now: Timestamp, cancellation: &CancellationToken,
     ) -> Result<QueryView> {
@@ -1461,6 +1478,77 @@ mod tests {
             }],
             otherwise: vec![],
         }
+    }
+
+    #[tokio::test]
+    async fn only_the_local_multi_writer_publishes_a_guarded_store_floor() {
+        use rtdb_index::branches::store::Projection;
+        use rtdb_tx::transact::{StoreAppend, StoreWrite};
+
+        let journal = MemoryJournal::default();
+        let id = Uuid::from_u128(1);
+        let store = Arc::new(MemoryStore::default());
+        let kms = Arc::new(LocalKms::new(|| 10));
+        let memory = MemoryBudget::new(64 << 20);
+        let open = |node, identity| MultiDatabase::new(
+            MultiOptions { database: id, node, lease_micros: 100, drift_micros: 1 },
+            Arc::new(journal.handle(identity)), store.clone(), kms.clone(), Arc::new(|| Timestamp(10)),
+        ).unwrap();
+        let writer_node = IpAddr::from([127, 0, 0, 1]);
+        let mut database = open(writer_node, Identity::from_static("urn:rtdb:test:1"));
+        database.create().await.unwrap();
+        database.tick(&BTreeSet::from([writer_node])).await.unwrap();
+        let writer = MultiServing::new(database, Arc::clone(&memory));
+        let follower = Arc::new(MultiServing::new(open(
+            IpAddr::from([127, 0, 0, 2]), Identity::from_static("urn:rtdb:test:2"),
+        ), Arc::clone(&memory)));
+        let _assignment = follower.assign_follower().await.unwrap();
+        let cancellation = CancellationToken::new();
+        let store_write = |request_key, key: &[u8], value: &[u8]| Transact {
+            custody_request_digest: None,
+            request_memory: None,
+            key: vec![request_key; 16],
+            require: Vec::new(),
+            window: Window::default(),
+            guards: Vec::new(),
+            requires: Vec::new(),
+            ops: vec![Op::Store(StoreAppend {
+                writes: vec![StoreWrite { key: key.to_vec(), value: Some(value.to_vec()), key_stamp: None, value_stamp: None }],
+                bounds: Vec::new(),
+                derives: Vec::new(),
+                window: Window::default(),
+            })],
+            otherwise: Vec::new(),
+        };
+        let first = writer.transact(store_write(1, b"a", b"original"), &cancellation).await.unwrap().basis;
+        let floor = writer.transact(store_write(2, b"a", b"replacement"), &cancellation).await.unwrap().basis;
+        let guards = || vec![KeyRange { start: b"b".to_vec(), end: Some(b"c".to_vec()) }];
+        let reserve = || memory.try_reserve(4096).unwrap();
+        let read = || StoreRead {
+            range: KeyRange { start: b"a".to_vec(), end: Some(b"b".to_vec()) },
+            after: None, limit: 1, projection: Projection::Values, filter: None, reverse: false,
+        };
+        let original = writer.read_store(read(), At::Exactly(first), Timestamp(100), &cancellation).await.unwrap();
+        assert_eq!(original.entries[0].value.as_deref(), Some(b"original".as_slice()));
+
+        assert!(!follower.supports_store_purge_floor().await);
+        let refusal = follower.publish_store_purge_floor(floor, floor.position(), guards(), reserve(), &cancellation)
+            .await.unwrap_err();
+        assert_eq!(refusal.code, "rtdb/no-writer");
+        assert!(writer.supports_store_purge_floor().await);
+        for _ in 0..2 {
+            writer.publish_store_purge_floor(floor, floor.position(), guards(), reserve(), &cancellation).await.unwrap();
+        }
+
+        let expired = writer.read_store(read(), At::Exactly(first), Timestamp(100), &cancellation).await.unwrap_err();
+        assert_eq!(expired.code, "rtdb/cursor-expired");
+        let retained = writer.read_store(read(), At::Exactly(floor), Timestamp(100), &cancellation).await.unwrap();
+        assert_eq!(retained.entries[0].value.as_deref(), Some(b"replacement".as_slice()));
+
+        writer.transact(store_write(3, b"b", b"new"), &cancellation).await.unwrap();
+        let refusal = writer.publish_store_purge_floor(floor, floor.position(), guards(), reserve(), &cancellation)
+            .await.unwrap_err();
+        assert_eq!(refusal.code, "rtdb.store/purge-guard");
     }
 
     #[tokio::test]

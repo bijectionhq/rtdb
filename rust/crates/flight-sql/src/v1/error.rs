@@ -90,6 +90,16 @@ pub fn anomaly(native: Anomaly) -> Status {
     as_status(detail(native))
 }
 
+pub(super) fn purge_floor(native: Anomaly) -> Status {
+    let stable = (native.code.starts_with("rtdb.store/purge-")
+        || matches!(native.code.as_str(), "rtdb.store/outside-grant" | "rtdb/no-writer"
+            | "rtdb/basis-ahead" | "rtdb/unknown-basis" | "rtdb/foreign-basis"))
+        .then(|| native.code.clone());
+    let mut error = detail(native);
+    if let Some(code) = stable { error.code = code; }
+    as_status(error)
+}
+
 #[cfg(feature = "multi")]
 pub(crate) fn follower(native: Anomaly) -> Status {
     let stable = matches!(native.code.as_str(), "rtdb/basis-ahead" | "rtdb/foreign-basis" | "rtdb/unknown-basis"

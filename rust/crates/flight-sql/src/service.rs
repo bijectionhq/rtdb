@@ -631,9 +631,11 @@ impl FlightService for Service {
             .collect::<Vec<_>>();
         let store_enabled = !call.session.fresh_replica
             && call.session.caller.principal.label_scope().is_none();
+        let purge_enabled = store_enabled && self.supports_store_purge_floor(&call).await;
         result_stream(call, actions.into_iter().chain(crate::v1::ACTIONS.into_iter()
             .filter(|name| !matches!(*name, crate::v1::MANAGED_WORKLOAD | crate::v1::exact_read::OPEN | crate::v1::exact_read::CLOSE)))
-            .chain(crate::v1::STORE_ACTIONS.into_iter().filter(|_| store_enabled))
+            .chain(crate::v1::STORE_ACTIONS.into_iter().filter(|name| store_enabled
+                && (*name != crate::v1::store::PURGE_FLOOR || purge_enabled)))
             .chain(hosted_world_actions.into_iter().filter(|_| hosted_worlds))
             .chain(hosted_carrier_actions.into_iter().filter(|_| hosted_upload.is_some()))
             .chain(crate::owned_actions::ROOT_RANK_ACTIONS.into_iter().filter(|_| root_rank))

@@ -204,6 +204,14 @@ surface StatelessDatabase {
         -- Each included key contributes its visible encoded size at that version, including after replacement, deletion, or restore.
         -- Reconciliation replaces the rollup with a census of one retained version before publishing the result.
 
+    @guarantee StorePurgeFloor
+        -- PurgeFloor requires a verified credential with unscoped database write access to the attached Multi incarnation.
+        -- The request names one retained basis, a minimum retained version at or below that basis, and the original ordered list of half-open guards.
+        -- The local Multi writer checks the basis and every guard against its settled prefix, including when the durable floor already covers the request.
+        -- An admitted publication retains its request reservation through the ordered decision even if the Flight call ends.
+        -- A successful reply names the same incarnation and the requested minimum once the durable floor covers it.
+        -- The writer reclaims superseded history within that floor under its retention and checkpoint rules.
+
     @guarantee OrderedIndexCatalog
         -- An ordered index declaration preserves its columns in the order sent by the caller.
         -- Query of xt.ordered_indexes reads the definitions present at its selected applied cut.

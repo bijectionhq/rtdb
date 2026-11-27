@@ -41,14 +41,16 @@ use tonic::Status;
 use super::{MAX_CHANGE_GROUPS, MAX_WAIT, check_key, error};
 use crate::{rtdb::store::v1 as proto, service::{Call, Service}};
 
+mod purge;
 mod sizes;
 
 pub(crate) const READ: &str = "rtdb.store.v1.Read";
 pub(crate) const APPEND: &str = "rtdb.store.v1.Append";
 pub(crate) const WATCH: &str = "rtdb.store.v1.Watch";
 pub(crate) const RANK: &str = "rtdb.store.v1.Rank";
+pub(crate) use purge::PURGE_FLOOR;
 pub(super) use sizes::STORAGE_SIZES;
-pub(crate) const ACTIONS: [&str; 5] = [READ, APPEND, WATCH, RANK, STORAGE_SIZES];
+pub(crate) const ACTIONS: [&str; 6] = [READ, APPEND, WATCH, RANK, STORAGE_SIZES, PURGE_FLOOR];
 
 /// The `RANK_DIGEST` recorded with the vendored copy (vendor/bijection).
 const VENDORED_RANK_DIGEST: &str = include_str!("../../../../vendor/bijection/RANK_DIGEST");
@@ -153,6 +155,7 @@ impl Service {
             WATCH => self.store_watch(call, decode(body)?).await,
             RANK => self.store_rank(call, decode(body)?).await,
             STORAGE_SIZES => self.store_storage_sizes(call, decode(body)?).await,
+            PURGE_FLOOR => self.store_purge_floor(call, decode(body)?).await,
             _ => Err(error::unsupported("rtdb.store.v1")),
         }
     }
