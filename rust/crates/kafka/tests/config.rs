@@ -198,3 +198,62 @@ fn scram_native_token_configuration_must_agree_with_jaas() {
         if let Err(error) = result { assert_eq!(error.code, "xtdb.kafka/conflicting-config"); assert!(!format!("{error:?}").contains("secret-value")); }
     }
 }
+
+#[test]
+fn krb5_jaas_translates_keytab_and_ticket_cache_options_to_native_kerberos() {
+    let keytab = BTreeMap::from([
+        ("security.protocol".into(), "SASL_SSL".into()),
+        ("sasl.mechanism".into(), "GSSAPI".into()),
+        ("sasl.jaas.config".into(), r#"com.sun.security.auth.module.Krb5LoginModule required useKeyTab=true storeKey=true keyTab="/etc/kafka/client.keytab" principal="xtdb/host@EXAMPLE.COM" serviceName="kafka";"#.into()),
+    ]);
+    let native = native_properties(&keytab).unwrap();
+    assert!(!native.contains_key("sasl.jaas.config"));
+    assert_eq!(native["sasl.kerberos.principal"], "xtdb/host@EXAMPLE.COM");
+    assert_eq!(native["sasl.kerberos.service.name"], "kafka");
+    assert_eq!(native["sasl.kerberos.keytab"], "/etc/kafka/client.keytab");
+    assert!(!native.contains_key("sasl.kerberos.min.time.before.relogin"));
+    let mut cfg = rdkafka::ClientConfig::new();
+    for (k, v) in &native { cfg.set(k, v); }
+    assert!(cfg.create_native_config().is_ok());
+
+    let ticket_cache = BTreeMap::from([
+        ("security.protocol".into(), "SASL_PLAINTEXT".into()),
+        ("sasl.mechanism".into(), "GSSAPI".into()),
+        ("sasl.jaas.config".into(), r#"com.sun.security.auth.module.Krb5LoginModule required useTicketCache=true useKeyTab=false keyTab="/ignored" principal="xtdb@EXAMPLE.COM";"#.into()),
+    ]);
+    let native = native_properties(&ticket_cache).unwrap();
+    assert_eq!(native["sasl.kerberos.principal"], "xtdb@EXAMPLE.COM");
+    assert!(!native.contains_key("sasl.kerberos.keytab"));
+    assert_eq!(native["sasl.kerberos.min.time.before.relogin"], "0");
+
+    let conflict = BTreeMap::from([
+        ("sasl.kerberos.principal".into(), "other@EXAMPLE.COM".into()),
+        ("sasl.jaas.config".into(), r#"com.sun.security.auth.module.Krb5LoginModule required principal="xtdb@EXAMPLE.COM";"#.into()),
+    ]);
+    assert_eq!(native_properties(&conflict).unwrap_err().code, "xtdb.kafka/conflicting-config");
+}
+
+#[test]
+fn oauthbearer_unsecured_jaas_translates_and_oidc_remains_unsupported() {
+    let unsecured = BTreeMap::from([
+        ("security.protocol".into(), "SASL_PLAINTEXT".into()),
+        ("sasl.mechanism".into(), "OAUTHBEARER".into()),
+        ("sasl.login.callback.handler.class".into(), "org.apache.kafka.common.security.oauthbearer.internals.unsecured.OAuthBearerUnsecuredLoginCallbackHandler".into()),
+        ("sasl.jaas.config".into(), r#"org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required unsecuredLoginStringClaim_sub="admin" unsecuredLoginListClaim_scope="|read|write" unsecuredLoginLifetimeSeconds="600" unsecuredLoginExtension_logicalCluster="lkc-1";"#.into()),
+    ]);
+    let native = native_properties(&unsecured).unwrap();
+    assert!(!native.contains_key("sasl.jaas.config"));
+    assert!(!native.contains_key("sasl.login.callback.handler.class"));
+    assert_eq!(native["sasl.oauthbearer.config"], "principal=admin scope=read,write lifeSeconds=600 extension_logicalCluster=lkc-1");
+    let mut cfg = rdkafka::ClientConfig::new();
+    for (k, v) in &native { cfg.set(k, v); }
+    assert!(cfg.create_native_config().is_ok());
+
+    let oidc = BTreeMap::from([
+        ("sasl.mechanism".into(), "OAUTHBEARER".into()),
+        ("sasl.jaas.config".into(), r#"org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required clientId="cid" clientSecret="top-secret";"#.into()),
+    ]);
+    let error = native_properties(&oidc).unwrap_err();
+    assert_eq!(error.code, "xtdb.kafka/jaas-login-module");
+    assert!(!format!("{error:?}").contains("top-secret"));
+}

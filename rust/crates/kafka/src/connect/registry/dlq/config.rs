@@ -41,7 +41,11 @@ impl Settings {
             Ok(value)
         };
         for name in ["interceptor.classes", "partitioner.class", "sasl.login.class", "sasl.login.callback.handler.class", "sasl.client.callback.handler.class"] {
-            if options.get(name).is_some_and(|value| !value.trim().is_empty()) { return Err(error("dlq", format!("Producer {name} requires a native adapter"))); }
+            if options.get(name).is_some_and(|value| {
+                let trimmed = value.trim();
+                !trimmed.is_empty() && !(name == "sasl.login.callback.handler.class"
+                    && trimmed == "org.apache.kafka.common.security.oauthbearer.internals.unsecured.OAuthBearerUnsecuredLoginCallbackHandler")
+            }) { return Err(error("dlq", format!("Producer {name} requires a native adapter"))); }
         }
         if options.get("ssl.engine.factory.class").is_some_and(|value| trim_java(value) != "org.apache.kafka.common.security.ssl.DefaultSslEngineFactory") {
             return Err(error("dlq", "Producer ssl.engine.factory.class requires a native adapter"));
@@ -77,6 +81,7 @@ impl Settings {
                 "reconnect.backoff.ms" | "reconnect.backoff.max.ms" | "retry.backoff.ms" | "retry.backoff.max.ms" |
                 "connections.max.idle.ms" | "security.protocol" | "sasl.mechanism" | "sasl.jaas.config" |
                 "sasl.username" | "sasl.password" | "sasl.scram.tokenauth" | "sasl.kerberos.service.name" | "sasl.kerberos.principal" |
+                "sasl.kerberos.keytab" | "sasl.kerberos.kinit.cmd" | "sasl.kerberos.min.time.before.relogin" | "sasl.oauthbearer.config" |
                 "transactional.id" | "transaction.timeout.ms" | "ssl.cipher.suites" | "ssl.key.password" |
                 "ssl.ca.location" | "ssl.ca.pem" | "ssl.key.location" | "ssl.key.pem" |
                 "ssl.certificate.location" | "ssl.certificate.pem" => name.as_str(),

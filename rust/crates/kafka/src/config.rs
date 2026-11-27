@@ -171,15 +171,110 @@ pub(crate) fn native_client_properties(properties: &BTreeMap<String, String>) ->
                     properties.insert("sasl.scram.tokenauth".into(), enabled.to_string());
                 }
             }
+            "com.sun.security.auth.module.Krb5LoginModule" => {
+                for (jaas, native) in [("principal", "sasl.kerberos.principal"), ("serviceName", "sasl.kerberos.service.name")] {
+                    if let Some(value) = options.remove(jaas) {
+                        if properties.get(native).is_some_and(|configured| configured != &value) {
+                            return Err(Anomaly::incorrect("xtdb.kafka/conflicting-config", format!("JAAS and native {native} disagree")));
+                        }
+                        properties.insert(native.into(), value);
+                    }
+                }
+                let use_keytab = options.get("useKeyTab").is_none_or(|value| value.eq_ignore_ascii_case("true"));
+                if use_keytab && let Some(keytab) = options.remove("keyTab") {
+                    if properties.get("sasl.kerberos.keytab").is_some_and(|configured| configured != &keytab) {
+                        return Err(Anomaly::incorrect("xtdb.kafka/conflicting-config", "JAAS and native sasl.kerberos.keytab disagree"));
+                    }
+                    properties.insert("sasl.kerberos.keytab".into(), keytab);
+                }
+                if !properties.contains_key("sasl.kerberos.keytab")
+                    && !properties.contains_key("sasl.kerberos.kinit.cmd")
+                    && !properties.contains_key("sasl.kerberos.min.time.before.relogin")
+                {
+                    properties.insert("sasl.kerberos.min.time.before.relogin".into(), "0".into());
+                }
+            }
+            "org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule" => {
+                translate_oauthbearer_jaas(&options, &mut properties)?;
+            }
             _ => return Err(Anomaly::unsupported("xtdb.kafka/jaas-login-module", "Kafka login module requires a native credential adapter")),
         }
     }
     Ok((properties, ignored))
 }
 
+fn translate_oauthbearer_jaas(options: &BTreeMap<String, String>, properties: &mut BTreeMap<String, String>) -> Result<()> {
+    if options.contains_key("clientId") || options.contains_key("clientSecret") || properties.contains_key("sasl.oauthbearer.token.endpoint.url") {
+        return Err(Anomaly::unsupported("xtdb.kafka/jaas-login-module", "Kafka OAUTHBEARER OIDC login requires a native credential adapter"));
+    }
+    let principal_claim = options.get("unsecuredLoginPrincipalClaimName").map_or("sub", String::as_str);
+    let scope_claim = options.get("unsecuredLoginScopeClaimName").map_or("scope", String::as_str);
+    let principal_key = format!("unsecuredLoginStringClaim_{principal_claim}");
+    let scope_list_key = format!("unsecuredLoginListClaim_{scope_claim}");
+    let scope_string_key = format!("unsecuredLoginStringClaim_{scope_claim}");
+    let valid_token = |value: &str| !value.is_empty() && !value.chars().any(char::is_whitespace);
+    let mut parts = Vec::new();
+    if let Some(claim) = options.get("unsecuredLoginPrincipalClaimName") {
+        if !valid_token(claim) { return Err(invalid_config("unsecuredLoginPrincipalClaimName must be a non-empty token without whitespace")); }
+        parts.push(format!("principalClaimName={claim}"));
+    }
+    if let Some(principal) = options.get(&principal_key) {
+        if !valid_token(principal) { return Err(invalid_config("OAuthBearer unsecured principal must be a non-empty token without whitespace")); }
+        parts.push(format!("principal={principal}"));
+    }
+    if let Some(claim) = options.get("unsecuredLoginScopeClaimName") {
+        if !valid_token(claim) { return Err(invalid_config("unsecuredLoginScopeClaimName must be a non-empty token without whitespace")); }
+        parts.push(format!("scopeClaimName={claim}"));
+    }
+    if let Some(list_value) = options.get(&scope_list_key) {
+        let mut chars = list_value.chars();
+        let Some(delimiter) = chars.next() else { return Err(invalid_config("OAuthBearer unsecured scope list must start with a delimiter")); };
+        let items: Vec<&str> = chars.as_str().split(delimiter).filter(|item| !item.is_empty()).collect();
+        if items.is_empty() || items.iter().any(|item| item.contains(',') || item.chars().any(char::is_whitespace)) {
+            return Err(invalid_config("OAuthBearer unsecured scope list entries cannot contain commas or whitespace"));
+        }
+        parts.push(format!("scope={}", items.join(",")));
+    } else if let Some(scope) = options.get(&scope_string_key) {
+        if !valid_token(scope) { return Err(invalid_config("OAuthBearer unsecured scope must be a non-empty token without whitespace")); }
+        parts.push(format!("scope={scope}"));
+    }
+    if let Some(lifetime) = options.get("unsecuredLoginLifetimeSeconds") {
+        let seconds = signed_integer(lifetime).and_then(|value| i32::try_from(value).ok()).filter(|value| *value > 0)
+            .ok_or_else(|| invalid_config("unsecuredLoginLifetimeSeconds must be a positive 32-bit integer"))?;
+        parts.push(format!("lifeSeconds={seconds}"));
+    }
+    for (key, value) in options {
+        if let Some(ext_key) = key.strip_prefix("unsecuredLoginExtension_") {
+            if ext_key.is_empty() || !ext_key.bytes().all(|byte| byte.is_ascii_alphabetic()) || value.contains(' ') {
+                return Err(invalid_config("OAuthBearer unsecured extension key must be alphabetic and value cannot contain spaces"));
+            }
+            parts.push(format!("extension_{ext_key}={value}"));
+        } else if key.starts_with("unsecuredLoginNumberClaim_")
+            || (key.starts_with("unsecuredLoginStringClaim_") && key != &principal_key && key != &scope_string_key)
+            || (key.starts_with("unsecuredLoginListClaim_") && key != &scope_list_key)
+        {
+            return Err(Anomaly::unsupported("xtdb.kafka/jaas-login-module", "Custom OAuthBearer unsecured claims require a native credential adapter"));
+        }
+    }
+    if !parts.is_empty() {
+        let config = parts.join(" ");
+        if properties.get("sasl.oauthbearer.config").is_some_and(|configured| configured != &config) {
+            return Err(Anomaly::incorrect("xtdb.kafka/conflicting-config", "JAAS and native sasl.oauthbearer.config disagree"));
+        }
+        properties.insert("sasl.oauthbearer.config".into(), config);
+    } else if !properties.contains_key("sasl.oauthbearer.config") {
+        return Err(Anomaly::incorrect("xtdb.kafka/invalid-jaas-config", "Kafka OAuthBearerLoginModule requires unsecured login options or native sasl.oauthbearer.config"));
+    }
+    Ok(())
+}
+
 fn java_client_properties(properties: &mut BTreeMap<String, String>) -> Result<Vec<String>> {
     for name in UNSUPPORTED_JAVA_PROPERTIES {
-        if properties.remove(*name).is_some_and(|value| !trim_java(&value).is_empty()) {
+        if properties.remove(*name).is_some_and(|value| {
+            let trimmed = trim_java(&value);
+            !trimmed.is_empty() && !(*name == "sasl.login.callback.handler.class"
+                && trimmed == "org.apache.kafka.common.security.oauthbearer.internals.unsecured.OAuthBearerUnsecuredLoginCallbackHandler")
+        }) {
             return Err(Anomaly::unsupported("xtdb.kafka/unsupported-config", format!("Kafka property {name} requires a native adapter")));
         }
     }
