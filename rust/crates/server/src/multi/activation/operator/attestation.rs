@@ -465,12 +465,12 @@ mod tests {
         let (_, old_hold) = old_proof.held_key().unwrap();
         kms.create(old_hold.generation).await.unwrap();
         kms.retain_recovery_key(old_hold).await.unwrap();
-        assert!(super::super::release_recovery_key(&authority, "xtdb", &old_proof, &kms).await.is_err());
+        assert!(super::super::release_recovery_key(&authority, "xtdb", &old_proof, &kms, None).await.is_err());
         kms.require_recovery_key(old_hold).await.unwrap();
 
         let selected = recovery(Uuid::new_v4());
         authority.begin_recovery("xtdb", selected, Some(first.operation.operation_id)).await.unwrap();
-        assert_eq!(super::super::release_recovery_key(&authority, "xtdb", &old_proof, &kms).await.unwrap(), old_hold);
+        assert_eq!(super::super::release_recovery_key(&authority, "xtdb", &old_proof, &kms, None).await.unwrap(), old_hold);
         let proof = make(selected.operation.operation_id);
         let (intent, hold) = proof.held_key().unwrap();
         kms.create(hold.generation).await.unwrap();
@@ -478,7 +478,7 @@ mod tests {
         let installation = proof.verify(intent, [5; 32], &trusted).unwrap();
         authority.record_recovery_installation("xtdb", selected.operation, installation).await.unwrap();
         authority.freeze_recovery("xtdb", selected.operation).await.unwrap();
-        assert!(super::super::release_recovery_key(&authority, "xtdb", &proof, &kms).await.is_err());
+        assert!(super::super::release_recovery_key(&authority, "xtdb", &proof, &kms, None).await.is_err());
         assert!(kms.retire(hold.generation, 1).await.is_err());
         authority.publish_recovery("xtdb", selected.operation).await.unwrap();
         drop(authority);
@@ -490,10 +490,10 @@ mod tests {
         assert!(matches!(published, Status::Published { installation, .. } if installation.key_hold == Some(hold)));
         let mut substituted = proof.clone();
         substituted.evidence.key.as_mut().unwrap().authority_sha256 = [22; 32];
-        assert!(super::super::release_recovery_key(&authority, "xtdb", &substituted, &kms).await.is_err());
+        assert!(super::super::release_recovery_key(&authority, "xtdb", &substituted, &kms, None).await.is_err());
         kms.require_recovery_key(hold).await.unwrap();
-        assert_eq!(super::super::release_recovery_key(&authority, "xtdb", &proof, &kms).await.unwrap(), hold);
-        assert_eq!(super::super::release_recovery_key(&authority, "xtdb", &proof, &kms).await.unwrap(), hold);
+        assert_eq!(super::super::release_recovery_key(&authority, "xtdb", &proof, &kms, None).await.unwrap(), hold);
+        assert_eq!(super::super::release_recovery_key(&authority, "xtdb", &proof, &kms, None).await.unwrap(), hold);
         kms.retire(hold.generation, 1).await.unwrap();
     }
 

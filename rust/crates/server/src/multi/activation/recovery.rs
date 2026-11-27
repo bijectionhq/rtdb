@@ -99,6 +99,13 @@ pub(crate) enum Status {
     },
 }
 
+#[cfg(unix)]
+pub(super) enum CustodySettlement {
+    Abandoned,
+    Published(Installation),
+    Unrecorded { hosted_custody: bool },
+}
+
 fn custody_protocol(
     key_hold: Option<rtdb_crypt::RecoveryKeyHold>,
     journal_hold: Option<RetainedJournal>,
@@ -275,9 +282,10 @@ impl ActivationAuthority {
         self.recovery_status_at(name, &state.ok_or_else(unavailable)?, operation)
     }
 
+    #[cfg(unix)]
     pub(super) async fn require_custody_release(
         &self, name: &str, operation: Operation, cell: Option<Uuid>, candidate: Uuid,
-    ) -> Result<()> {
+    ) -> Result<CustodySettlement> {
         let derived = self.successor_incarnation_in_cell(
             name, operation.predecessor, operation.operation_id, cell,
         )?;
@@ -291,20 +299,26 @@ impl ActivationAuthority {
         if state.binding == operation.predecessor
             && state.superseded_recoveries.contains(&operation.operation_id)
         {
-            return Ok(());
+            return Ok(CustodySettlement::Abandoned);
         }
+        let unrecorded = CustodySettlement::Unrecorded {
+            hosted_custody: state.version >= RECOVERY_HOSTED_CUSTODY_PROTOCOL,
+        };
         if state.binding.revision > selected_revision {
-            return Ok(());
+            return Ok(unrecorded);
         }
         if state.binding.revision == selected_revision
             && let Some(publication) = state.publication
             && publication.predecessor == operation.predecessor
-            && (publication.operation != operation.operation_id
-                || (publication.recovery.is_some()
-                    && publication.destination_cell == cell
-                    && state.binding.incarnation == candidate))
         {
-            return Ok(());
+            if publication.operation != operation.operation_id {
+                return Ok(if publication.recovery.is_some() { CustodySettlement::Abandoned } else { unrecorded });
+            }
+            if publication.recovery.is_some() && publication.destination_cell == cell && state.binding.incarnation == candidate
+                && let Some(Status::Published { installation, .. }) = state.publication_status(operation)?
+            {
+                return Ok(CustodySettlement::Published(installation));
+            }
         }
         Err(Anomaly::new(
             rtdb_types::AnomalyCategory::Conflict,

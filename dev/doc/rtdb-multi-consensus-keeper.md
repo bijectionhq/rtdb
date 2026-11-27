@@ -359,9 +359,11 @@ Release the journal hold first and let the successor commit that checkpoint thro
 The broker checks the published installation digests and the replacement checkpoint through the registered journal reader before authorizing removal of the temporary object holds.
 An authorized object release retry accepts the provider’s exact version-absence result after the version has been removed.
 For a published hosted recovery, give `release-recovery-key` the same original journal through `--journal-url` and `--journal-reader-tls-dir`.
-The vault releases the staged key hold only after confirming the same replacement checkpoint.
-The broker matches the cell signature and the activation connection and requires the retained decision to prove supersession or publication of a different recovery from the same binding.
-Run the first authorization while that decision remains available to the broker.
+The key custodian checks the matched installation in the retained activation decision and confirms the same replacement checkpoint before releasing the staged key hold.
+On a name that has recorded hosted custody, settle the hold while the authority still retains the exact publication or abandonment decision.
+For object release, the broker matches the registered cell signature and the original activation connection.
+For an abandoned candidate, the retained decision must show supersession or publication of a different recovery from the same binding.
+Run the first object authorization while that decision remains available to the broker.
 The custodian records this authorization under `multi/recovery-custody/` before changing any legal hold.
 Protect that prefix with create-only writes, custodian-only reads and writes, and retention through settlement.
 On AWS, give the custodian `s3:GetBucketVersioning`, `s3:GetObjectLegalHold` and `s3:PutObjectLegalHold` for the allocation and staged candidate paths.

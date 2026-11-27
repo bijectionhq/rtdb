@@ -460,6 +460,8 @@ contract RecoveryGenerationCustody {
         -- A stopped-destination attestation with key custody follows a durable hold for the exact pending recovery.
         -- The activation record retains the held generation and the issuing authority connection identity with the verified installation.
         -- The provider releases the hold only after reading publication or supersession from that same activation authority.
+        -- For a published hosted installation, the retained activation decision identifies the required custody evidence.
+        -- The key custodian requires that decision and the original journal's replacement checkpoint before releasing the published hosted generation hold.
 }
 
 contract RecoveryJournalCustody {

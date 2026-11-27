@@ -546,27 +546,11 @@ impl Options {
                 let authority = ActivationAuthority::connect(
                     &url, crate::cli::journal_credentials(&tls)?, identity, Access::ConsensusReader,
                 ).await?;
-                if let Some(objects_sha256) = proof.objects_sha256() {
-                    let (intent, key) = proof.held_key()?;
-                    require_hold_release(&authority, &database, intent, key).await?;
-                    let operation = recovery::Operation { predecessor: intent.expected, operation_id: intent.operation_id };
-                    if let Some(installed) = authority.object_release_installation(&database, operation, key.generation.database).await? {
-                        let (_, _, retained) = proof.held_journal()?;
-                        if installed.objects_sha256 != Some(objects_sha256)
-                            || installed.key_hold != Some(key) || installed.journal_hold != Some(retained)
-                        {
-                            return Err(super::conflict());
-                        }
-                        let (url, tls) = journal_reader.as_ref().ok_or_else(arguments_error)?;
-                        KeeperJournal::connect(url, &crate::cli::journal_credentials(tls)?)?
-                            .require_replacement(key.generation.database, retained).await?;
-                    }
-                }
                 let kms = rtdb_crypt::FileKms::open(&vault, || {
                     use rtdb_node::Clock;
                     rtdb_node::SystemClock.now().0
                 })?;
-                let hold = release_recovery_key(&authority, &database, &proof, &kms).await?;
+                let hold = release_recovery_key(&authority, &database, &proof, &kms, journal_reader.as_ref()).await?;
                 Ok(json!({ "released": hold }))
             }
             #[cfg(unix)]
@@ -1028,9 +1012,34 @@ async fn release_recovery_key(
     database: &str,
     proof: &Attestation,
     kms: &dyn rtdb_crypt::Kms,
+    journal_reader: Option<&(String, PathBuf)>,
 ) -> Result<rtdb_crypt::RecoveryKeyHold> {
+    use recovery::CustodySettlement;
+
     let (intent, hold) = proof.held_key()?;
-    require_hold_release(authority, database, intent, hold).await?;
+    match require_hold_release(authority, database, intent, hold).await? {
+        CustodySettlement::Published(installed) => {
+            if installed.objects_sha256 != proof.objects_sha256() {
+                return Err(super::conflict());
+            }
+            if installed.objects_sha256.is_some() {
+                let (_, _, retained) = proof.held_journal()?;
+                if installed.key_hold != Some(hold) || installed.journal_hold != Some(retained) {
+                    return Err(super::conflict());
+                }
+                let (url, tls) = journal_reader.ok_or_else(arguments_error)?;
+                KeeperJournal::connect(url, &crate::cli::journal_credentials(tls)?)?
+                    .require_replacement(hold.generation.database, retained).await?;
+            }
+        }
+        CustodySettlement::Unrecorded { hosted_custody }
+            if hosted_custody || proof.objects_sha256().is_some() =>
+        {
+            return Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb/activation-key-custody",
+                "The activation authority must retain the matched generation's custody disposition"));
+        }
+        CustodySettlement::Abandoned | CustodySettlement::Unrecorded { .. } => (),
+    }
     kms.release_recovery_key(hold).await?;
     Ok(hold)
 }
@@ -1038,7 +1047,7 @@ async fn release_recovery_key(
 #[cfg(unix)]
 async fn require_hold_release(
     authority: &ActivationAuthority, database: &str, intent: &Intent, hold: rtdb_crypt::RecoveryKeyHold,
-) -> Result<()> {
+) -> Result<recovery::CustodySettlement> {
     if intent.database != database || authority.identity() != hold.authority
         || authority.connection_sha256 != Some(hold.authority_sha256)
     {

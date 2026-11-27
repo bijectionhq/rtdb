@@ -673,17 +673,34 @@ mod tests {
             ].into_iter()).unwrap().run(rtdb_storage::AppleSync::Full).await.unwrap();
         }
         serving_authority.acquire().await.unwrap().check().unwrap();
+        let serving_keys = Arc::new(FileKms::open(&vault, || SystemClock.now().0).unwrap());
+        let mut serving = MultiDatabase::new(
+            options(candidate), journal.clone(), store.clone(), serving_keys.clone(), Arc::new(|| SystemClock.now()),
+        ).unwrap().with_immutable_journal().with_activation_scope(scope).unwrap()
+            .with_serving_authority(serving_authority);
+        let installed = serving.installed_backup().await.unwrap().unwrap();
+        let proof: Attestation = serde_json::from_value(document).unwrap();
+        let (installed_intent, held) = proof.held_key().unwrap();
+        let key_evidence = KeyEvidence { generation: held.generation.number, authority_sha256: held.authority_sha256 };
+        let signer = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let key_only = Attestation::sign_installation(
+            installed_intent.clone(), installed.manifest_sha256(), &installed, Some(key_evidence), &signer,
+        ).unwrap();
+        let key_only_proof = home.path().join("key-only-proof.json");
+        fs::write(&key_only_proof, serde_json::to_vec(&key_only).unwrap()).unwrap();
         let release_pending = || release_objects(&serving_readback, &serving_proof);
-        let release_key = || ActivationOptions::parse([
+        let release_key = |proof: &Path| ActivationOptions::parse([
             "release-recovery-key".into(), DEVELOPMENT_DATABASE.into(),
             "--authority-id".into(), authority.to_string(), "--authority-url".into(), authority_url.clone(),
             "--authority-tls-dir".into(), authority_tls.display().to_string(),
-            "--installation-proof".into(), serving_proof.display().to_string(),
+            "--installation-proof".into(), proof.display().to_string(),
             "--key-vault".into(), vault.display().to_string(),
             "--journal-url".into(), journal_url.clone(), "--journal-reader-tls-dir".into(), reader_tls.display().to_string(),
         ].into_iter()).unwrap().run(rtdb_storage::AppleSync::Full);
         assert_eq!(release_pending().await.unwrap_err().code, "rtdb/activation-custody-replacement");
-        assert_eq!(release_key().await.unwrap_err().code, "rtdb/activation-custody-replacement");
+        assert_eq!(release_key(&serving_proof).await.unwrap_err().code, "rtdb/activation-custody-replacement");
+        assert_eq!(release_key(&key_only_proof).await.unwrap_err().code, "rtdb/activation-conflict");
+        serving_keys.require_recovery_key(held).await.unwrap();
         ActivationOptions::parse([
             "release-recovery-journal".into(), DEVELOPMENT_DATABASE.into(),
             "--authority-id".into(), authority.to_string(), "--authority-url".into(), authority_url.clone(),
@@ -693,13 +710,7 @@ mod tests {
             "--journal-custodian-tls-dir".into(), tls.display().to_string(),
         ].into_iter()).unwrap().run(rtdb_storage::AppleSync::Full).await.unwrap();
         assert_eq!(release_pending().await.unwrap_err().code, "rtdb/activation-custody-replacement");
-        assert_eq!(release_key().await.unwrap_err().code, "rtdb/activation-custody-replacement");
-
-        let serving_keys = Arc::new(FileKms::open(&vault, || SystemClock.now().0).unwrap());
-        let mut serving = MultiDatabase::new(
-            options(candidate), journal.clone(), store.clone(), serving_keys, Arc::new(|| SystemClock.now()),
-        ).unwrap().with_immutable_journal().with_activation_scope(scope).unwrap()
-            .with_serving_authority(serving_authority);
+        assert_eq!(release_key(&serving_proof).await.unwrap_err().code, "rtdb/activation-custody-replacement");
         assert!(matches!(serving.tick(&live).await.unwrap(), Role::Writer(_)));
         serving.checkpoint(Vec::new()).await.unwrap();
         serving.shutdown_writer().await.unwrap();
@@ -711,9 +722,9 @@ mod tests {
         let released = release_pending().await.unwrap();
         assert_eq!(released["incarnation"], candidate.to_string());
         assert_eq!(release_pending().await.unwrap(), released);
-        let released_key = release_key().await.unwrap();
+        let released_key = release_key(&serving_proof).await.unwrap();
         assert_eq!(released_key["released"]["operation"], operation.operation_id.to_string());
-        assert_eq!(release_key().await.unwrap(), released_key);
+        assert_eq!(release_key(&serving_proof).await.unwrap(), released_key);
         for version in serving_report.held_versions.iter().filter(|version| **version != previous_version) {
             assert_eq!(observe_hold(version)["LegalHold"]["Status"], "OFF");
         }
