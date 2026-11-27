@@ -73,6 +73,7 @@ pub enum ControlStatement<E = Expr> {
     SetRole,
     Discard(DiscardTarget),
     Show { name: String },
+    ShowTransactionIsolationLevel,
     Prepare { name: String, source: String },
     Execute { name: String, arguments: Vec<E> },
     CopyIn { table: Vec<Identifier>, format: Option<CopyFormat> },
@@ -98,6 +99,7 @@ impl<E> ControlStatement<E> {
             Self::SetRole => ControlStatement::SetRole,
             Self::Discard(target) => ControlStatement::Discard(target),
             Self::Show { name } => ControlStatement::Show { name },
+            Self::ShowTransactionIsolationLevel => ControlStatement::ShowTransactionIsolationLevel,
             Self::Prepare { name, source } => ControlStatement::Prepare { name, source },
             Self::Execute { name, arguments } => ControlStatement::Execute { name, arguments: arguments.into_iter().map(map).collect::<Result<_>>()? },
             Self::CopyIn { table, format } => ControlStatement::CopyIn { table, format },
@@ -152,10 +154,14 @@ impl ControlStatement {
         };
         expressions.into_iter().map(Expr::parameter_count).max().unwrap_or(0)
     }
+    pub fn is_show(&self) -> bool {
+        matches!(self, Self::Show { .. } | Self::ShowTransactionIsolationLevel)
+    }
     pub fn requires_read_transaction(&self) -> bool {
-        matches!(self, Self::Show { name } if [
-            "snapshot_token", "clock_time", "timezone", "transaction_isolation", "rtdb_hosted_source_owner",
-        ].contains(&name.as_str()))
+        matches!(self, Self::ShowTransactionIsolationLevel)
+            || matches!(self, Self::Show { name } if [
+                "snapshot_token", "clock_time", "timezone", "rtdb_hosted_source_owner",
+            ].contains(&name.as_str()))
     }
 }
 

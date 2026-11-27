@@ -75,6 +75,18 @@ fn xtdb_show_prepared_schema_does_not_require_a_live_connection() {
     assert_eq!(schema.fields()[3].data_type, LogicalType::Scalar(ScalarType::Transit).maybe());
     assert!(schema.fields().iter().all(|field| field.data_type.nullable()));
     assert!(control_schema(&parse("COMMIT")).unwrap().is_none());
+
+    let isolation_level = control_schema(&parse("SHOW TRANSACTION ISOLATION LEVEL")).unwrap().unwrap();
+    assert_eq!(isolation_level.fields().len(), 1);
+    assert_eq!(isolation_level.fields()[0].name, "transaction_isolation");
+    assert_eq!(isolation_level.fields()[0].data_type, LogicalType::Scalar(ScalarType::Utf8));
+
+    for variable in ["transaction_isolation", "application_name"] {
+        let variable_schema = control_schema(&parse(&format!("SHOW {variable}"))).unwrap().unwrap();
+        assert_eq!(variable_schema.fields().len(), 1);
+        assert_eq!(variable_schema.fields()[0].name, variable);
+        assert_eq!(variable_schema.fields()[0].data_type, LogicalType::Scalar(ScalarType::Utf8).maybe());
+    }
 }
 
 #[tokio::test]

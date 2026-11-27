@@ -38,20 +38,25 @@ pub enum ControlResult {
 }
 
 pub fn control_schema(statement: &ControlStatement) -> Result<Option<Schema>> {
-    let ControlStatement::Show { name } = statement else { return Ok(None); };
     let text = LogicalType::Scalar(ScalarType::Utf8);
-    let integer = LogicalType::Scalar(ScalarType::I64).maybe();
-    let instant = LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) });
-    let fields = match name.as_str() {
-        "clock_time" => vec![(name.as_str(), instant)],
-        "snapshot_token" | "timezone" | "transaction_isolation" | "application_name"
-        | "rtdb_bounded_retry" | "rtdb_source_barrier" | "rtdb_hosted_source_owner" => vec![(name.as_str(), text)],
-        "rtdb_hosted_source_barrier" => vec![(name.as_str(), text), ("tx_id", integer), ("system_time", instant.maybe())],
-        "standard_conforming_strings" => vec![(name.as_str(), LogicalType::Scalar(ScalarType::Bool).maybe())],
-        "latest_submitted_tx" => vec![("tx_id", integer), ("system_time", instant.maybe()), ("committed", LogicalType::Scalar(ScalarType::Bool).maybe()), ("error", LogicalType::Scalar(ScalarType::Transit).maybe()), ("await_token", text.maybe())],
-        "latest_completed_txs" => vec![("db_name", text), ("part", LogicalType::Scalar(ScalarType::I32)), ("tx_id", integer), ("system_time", instant.maybe())],
-        "latest_submitted_msg_ids" | "latest_processed_msg_ids" => vec![("db_name", text), ("part", LogicalType::Scalar(ScalarType::I32)), ("msg_id", integer)],
-        _ => vec![(name.as_str(), text.maybe())],
+    let fields = match statement {
+        ControlStatement::ShowTransactionIsolationLevel => vec![("transaction_isolation", text)],
+        ControlStatement::Show { name } => {
+            let integer = LogicalType::Scalar(ScalarType::I64).maybe();
+            let instant = LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) });
+            match name.as_str() {
+                "clock_time" => vec![(name.as_str(), instant)],
+                "snapshot_token" | "timezone"
+                | "rtdb_bounded_retry" | "rtdb_source_barrier" | "rtdb_hosted_source_owner" => vec![(name.as_str(), text)],
+                "rtdb_hosted_source_barrier" => vec![(name.as_str(), text), ("tx_id", integer), ("system_time", instant.maybe())],
+                "standard_conforming_strings" => vec![(name.as_str(), LogicalType::Scalar(ScalarType::Bool).maybe())],
+                "latest_submitted_tx" => vec![("tx_id", integer), ("system_time", instant.maybe()), ("committed", LogicalType::Scalar(ScalarType::Bool).maybe()), ("error", LogicalType::Scalar(ScalarType::Transit).maybe()), ("await_token", text.maybe())],
+                "latest_completed_txs" => vec![("db_name", text), ("part", LogicalType::Scalar(ScalarType::I32)), ("tx_id", integer), ("system_time", instant.maybe())],
+                "latest_submitted_msg_ids" | "latest_processed_msg_ids" => vec![("db_name", text), ("part", LogicalType::Scalar(ScalarType::I32)), ("msg_id", integer)],
+                _ => vec![(name.as_str(), text.maybe())],
+            }
+        }
+        _ => return Ok(None),
     };
     let mut binder = Binder::default();
     Schema::new(fields.into_iter().map(|(name, ty)| binder.field(name, None, ty)).collect::<Result<Vec<_>>>()?).map(Some)
@@ -178,7 +183,7 @@ impl NativeSession {
             return Err(Anomaly::incorrect("xtdb.adbc/tx-control-as-sql", "Use the transaction API to begin, commit, or roll back transactions"));
         }
         let failed_inspection = matches!(options.frontend, ControlFrontend::Adbc | ControlFrontend::FlightSql)
-            && matches!(statement, ControlStatement::Show { .. }) && !statement.requires_read_transaction();
+            && statement.is_show() && !statement.requires_read_transaction();
         self.check_control_transaction(matches!(statement, ControlStatement::Rollback) || failed_inspection)?;
         if arguments.width() < statement.parameter_count() { return Err(Anomaly::incorrect("xtdb/missing-parameter", "Control statement has fewer parameters than its expressions")); }
         let allocation = self.admit_control_arguments(arguments)?;
@@ -251,6 +256,9 @@ impl NativeSession {
                     self.state.reset()?;
                 }
                 Ok(command(match target { DiscardTarget::All => "DISCARD ALL", DiscardTarget::Plans => "DISCARD PLANS", DiscardTarget::Temporary => "DISCARD TEMP", DiscardTarget::Sequences => "DISCARD SEQUENCES" }, allocation))
+            }
+            ControlStatement::ShowTransactionIsolationLevel => {
+                self.show_transaction_isolation_level(cancellation).await.map(ControlResult::Rows)
             }
             ControlStatement::Show { name } => {
                 let source = if name == "rtdb_hosted_source_owner" {
@@ -326,6 +334,15 @@ impl NativeSession {
         Ok(())
     }
 
+    async fn show_transaction_isolation_level(&mut self, cancellation: &CancellationToken) -> Result<QueryCursor> {
+        let basis = self.state.read_basis().await?;
+        let context = self.instrument_query_context(self.service.query_context(self.state.database(), &basis, cancellation).await?);
+        let reservation = context.memory.reserve(8192)?;
+        let mut binder = Binder::default();
+        let schema = Schema::new(vec![binder.field("transaction_isolation", None, LogicalType::Scalar(ScalarType::Utf8))?])?;
+        QueryCursor::from_rows(schema, vec![vec![Value::Utf8("read committed".into())]], context, reservation)
+    }
+
     async fn show(&mut self, name: &str, checked: bool, source: Option<SourceInspection>, cancellation: &CancellationToken) -> Result<QueryCursor> {
         let basis = if checked { self.state.read_basis().await? } else { self.state.inspection_basis()? };
         let context = self.instrument_query_context(self.service.query_context(self.state.database(), &basis, cancellation).await?);
@@ -353,7 +370,7 @@ impl NativeSession {
                  vec![vec![Value::Timestamp { value: basis.current_time.as_micros()?.0, unit: TimeUnit::Microsecond, timezone: zone }]])
             }
             "timezone" => (vec![(name, text.clone())], vec![vec![Value::Utf8(self.state.effective_timezone().into())]]),
-            "application_name" => (vec![(name, text.clone())], vec![vec![Value::Utf8(self.state.application_name().into())]]),
+            "application_name" => (vec![(name, text.clone().maybe())], vec![vec![Value::Utf8(self.state.application_name().into())]]),
             "rtdb_bounded_retry" | "rtdb_source_barrier" => (vec![(name, text.clone())], vec![vec![Value::Utf8("1".into())]]),
             "rtdb_hosted_source_owner" => {
                 let Some(SourceInspection::Owner(history)) = source else {
@@ -371,7 +388,6 @@ impl NativeSession {
                 });
                 (fields, vec![vec![Value::Utf8(receipt.history), offset, time]])
             },
-            "transaction_isolation" => (vec![(name, text.clone())], vec![vec![Value::Utf8("read committed".into())]]),
             "await_token" => (vec![(name, text.clone().maybe())], vec![vec![self.state.effective_await_token().map_or(Value::Null, |token| Value::Utf8(token.into()))]]),
             "standard_conforming_strings" => (vec![(name, LogicalType::Scalar(ScalarType::Bool).maybe())], vec![vec![Value::Bool(self.state.parameter(name).is_some_and(|value| ["on", "true", "yes", "1"].contains(&value.to_ascii_lowercase().as_str())))]]),
             "latest_submitted_tx" => {

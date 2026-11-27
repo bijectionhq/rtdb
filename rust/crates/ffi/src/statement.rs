@@ -77,10 +77,10 @@ impl StatementHandle {
             if matches!(statement, ControlStatement::Begin(_) | ControlStatement::Commit(_) | ControlStatement::Rollback) {
                 return Err(Anomaly::incorrect("xtdb.adbc/tx-control-as-sql", "Use the transaction API to begin, commit, or roll back transactions"));
             }
-            if !matches!(statement, ControlStatement::Show { .. } | ControlStatement::SetTransaction(_) | ControlStatement::SetSessionCharacteristics(_) | ControlStatement::SetTimeZone(_) | ControlStatement::SetAwaitToken(_) | ControlStatement::SetParameter { .. } | ControlStatement::SetRole) {
+            if !matches!(statement, ControlStatement::Show { .. } | ControlStatement::ShowTransactionIsolationLevel | ControlStatement::SetTransaction(_) | ControlStatement::SetSessionCharacteristics(_) | ControlStatement::SetTimeZone(_) | ControlStatement::SetAwaitToken(_) | ControlStatement::SetParameter { .. } | ControlStatement::SetRole) {
                 return Err(Anomaly::incorrect("xtdb/not-a-query", "This statement is not supported through ADBC"));
             }
-            if matches!(statement, ControlStatement::Show { .. }) {
+            if statement.is_show() {
                 Source::Show { statement: control, prepared: false }
             } else { Source::Set(control) }
         } else {

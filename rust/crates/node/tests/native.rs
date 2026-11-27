@@ -6518,3 +6518,34 @@ async fn guarded_cosine_leaves_disabled_zero_norm_vectors_unread() {
     assert_eq!(error.code, "rtdb.vector/zero-norm");
     stop(&node, driver).await;
 }
+
+#[tokio::test]
+async fn show_transaction_isolation_reads_session_parameter_distinct_from_isolation_level() {
+    let (node, driver) = running(options(), services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let token = session.state().cancellation().child_token();
+    let parse = |sql: &str| rtdb_sql::parse_control(sql, &Default::default()).unwrap().unwrap();
+
+    session.state_mut().begin().unwrap();
+    let ControlResult::Rows(cursor) = session.execute_control(&parse("SHOW transaction_isolation"), &[], &token).await.unwrap() else {
+        panic!("expected rows from SHOW transaction_isolation");
+    };
+    assert_eq!(rows(cursor).await, [vec![Value::Null]]);
+    assert!(!session.state().is_read_only());
+
+    drop(session.execute_control(&parse("SET transaction_isolation = 'serializable'"), &[], &token).await.unwrap());
+    let ControlResult::Rows(cursor) = session.execute_control(&parse("SHOW transaction_isolation"), &[], &token).await.unwrap() else {
+        panic!("expected rows from SHOW transaction_isolation after SET");
+    };
+    assert_eq!(rows(cursor).await, [vec![Value::Utf8("serializable".into())]]);
+    assert!(!session.state().is_read_only());
+
+    let ControlResult::Rows(cursor) = session.execute_control(&parse("SHOW TRANSACTION ISOLATION LEVEL"), &[], &token).await.unwrap() else {
+        panic!("expected rows from SHOW TRANSACTION ISOLATION LEVEL");
+    };
+    assert_eq!(rows(cursor).await, [vec![Value::Utf8("read committed".into())]]);
+    assert!(session.state().is_read_only());
+
+    drop(session);
+    stop(&node, driver).await;
+}

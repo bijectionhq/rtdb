@@ -101,7 +101,7 @@ impl<'input> ParsedControl<'input> {
     /// Determines whether Simple Query starts an implicit transaction around this command.
     pub fn starts_implicit_transaction(&self) -> bool {
         !matches!(self.syntax, ControlStatement::Begin(_) | ControlStatement::Discard(_)
-            | ControlStatement::SetTransaction(_) | ControlStatement::Show { .. } | ControlStatement::CopyIn { .. })
+            | ControlStatement::SetTransaction(_) | ControlStatement::Show { .. } | ControlStatement::ShowTransactionIsolationLevel | ControlStatement::CopyIn { .. })
             && !matches!(&self.syntax, ControlStatement::SetParameter { name, .. } if name == "bijection.at")
     }
 
@@ -372,13 +372,16 @@ impl ControlParser<'_> {
         if self.eat("SHOW") {
             if self.eat("TRANSACTION") {
                 self.expect("ISOLATION")?; self.expect("LEVEL")?;
-                return Ok(ControlStatement::Show { name: "transaction_isolation".into() });
+                return Ok(ControlStatement::ShowTransactionIsolationLevel);
             }
             if let Some(keyword) = ["AWAIT_TOKEN", "SNAPSHOT_TOKEN", "CLOCK_TIME"].into_iter().find(|keyword| self.eat(keyword)) {
                 return Ok(ControlStatement::Show { name: keyword.to_ascii_lowercase() });
             }
-            let mut name = self.grammar_identifier()?.normalized();
-            if name == "time" { self.expect("ZONE")?; name = "timezone".into(); }
+            if self.eat("TIME") {
+                self.expect("ZONE")?;
+                return Ok(ControlStatement::Show { name: "timezone".into() });
+            }
+            let name = self.grammar_identifier()?.normalized();
             return Ok(ControlStatement::Show { name });
         }
         if self.eat("EXECUTE") {
