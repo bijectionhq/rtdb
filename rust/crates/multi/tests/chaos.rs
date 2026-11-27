@@ -27,10 +27,12 @@ async fn acknowledged_writes_survive_a_cell_under_faults() {
     admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
 
     let stop = Arc::new(AtomicBool::new(false));
+    let (first_acknowledgement, started) = tokio::sync::oneshot::channel();
     let writer = {
         let (stop, port) = (Arc::clone(&stop), cell.gateway.port());
         tokio::spawn(async move {
             let (mut acknowledged, mut unknown) = (BTreeSet::new(), BTreeSet::new());
+            let mut first_acknowledgement = Some(first_acknowledgement);
             let mut client = None;
             let mut id = 0i64;
             while !stop.load(Ordering::Relaxed) {
@@ -42,7 +44,10 @@ async fn acknowledged_writes_survive_a_cell_under_faults() {
                 }
                 let insert = format!("INSERT INTO orders (_id, total) VALUES ({id}, {id})");
                 match client.as_ref().expect("connected").simple_query(&insert).await {
-                    Ok(_) => { acknowledged.insert(id); }
+                    Ok(_) => {
+                        acknowledged.insert(id);
+                        if let Some(started) = first_acknowledgement.take() { let _ = started.send(()); }
+                    }
                     Err(_) => { unknown.insert(id); client = None; }
                 }
                 id += 1;
@@ -50,6 +55,8 @@ async fn acknowledged_writes_survive_a_cell_under_faults() {
             (acknowledged, unknown, id)
         })
     };
+    tokio::time::timeout(Duration::from_secs(10), started).await
+        .expect("the writer acknowledged a transaction before the faults").unwrap();
 
     let mut faults = Faults(seed);
     let mut logkeeper_killed = false;
@@ -88,7 +95,6 @@ async fn acknowledged_writes_survive_a_cell_under_faults() {
     stop.store(true, Ordering::Relaxed);
     let (acknowledged, unknown, attempted) = writer.await.unwrap();
     println!("{} acknowledged, {} unknown of {attempted}", acknowledged.len(), unknown.len());
-    assert!(acknowledged.len() > 50, "the cell kept accepting writes through the faults");
 
     let record = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
     println!("after the faults: lifecycle {:?}, epoch {}, holder {:?}, crashes {}", record.lifecycle, record.epoch, record.holder, record.activation_crashes);
@@ -98,6 +104,8 @@ async fn acknowledged_writes_survive_a_cell_under_faults() {
     assert!(lost.is_empty(), "acknowledged writes were lost: {lost:?}");
     let invented: Vec<_> = stored.iter().filter(|id| !acknowledged.contains(id) && !unknown.contains(id)).collect();
     assert!(invented.is_empty(), "rows appeared that were never attempted: {invented:?}");
+    client.simple_query(&format!("INSERT INTO orders (_id, total) VALUES ({attempted}, {attempted})")).await.unwrap();
+    assert_eq!(values(&client, &format!("SELECT _id FROM orders WHERE _id = {attempted}")).await, [attempted.to_string()]);
     drop(client);
     let report = admin::audit(cell.directory.as_ref(), &cell.keys(), "shop", 4 << 20).await.unwrap();
     println!("audit: {} records, {} transactions, highest term {}", report.records, report.transactions, report.highest_term);
