@@ -86,6 +86,18 @@ fn interval_components_remain_independent_and_mixed_division_is_rejected() {
 }
 
 #[test]
+fn minimum_long_temporal_quotients_wrap_and_mixed_intervals_fail_before_zero_division() {
+    let minimum = duration(i64::MIN);
+    arithmetic(B::Divide, minimum.clone(), V::I64(-1), minimum.clone());
+    arithmetic(B::Divide, minimum, duration(-1), V::I64(i64::MIN));
+    arithmetic(B::Divide, mdm(0, 0, i64::MIN), V::I64(-1), mdm(0, 0, i64::MIN));
+    assert_eq!(arithmetic_in_timezone(B::Divide, &mdm(0, 0, 1), &V::I64(0), "UTC").unwrap_err().code,
+        "xtdb.expression/division-by-zero");
+    assert_eq!(arithmetic_in_timezone(B::Divide, &mdm(0, 1, 1), &V::I64(0), "UTC").unwrap_err().code,
+        "xtdb.expression/cannot-divide-mixed-intervals");
+}
+
+#[test]
 fn duration_text_casts_preserve_java_iso_and_millisecond_fallback_semantics() {
     let target = T::Scalar(S::Duration(U::Nanosecond));
     for (text, nanos) in [("PT2S", 2_000_000_000), ("1 SECOND", 1_000_000_000), ("1.5 SECOND", 1_500_000_000), ("0.99 second", 990_000_000), ("1 microsecond", 0), ("PT-0.000000001S", -1), ("-PT-1S", 1_000_000_000), ("PT1M-2S", 58_000_000_000), ("PT1,5S", 1_500_000_000)] {

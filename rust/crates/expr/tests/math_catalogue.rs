@@ -66,7 +66,9 @@ fn hyperbolic_calls_preserve_signed_zero_nan_and_infinite_limits() {
 fn floating_mod_matches_primitive_reference_results_and_errors() {
     let modulus = |a, b| call("mod", &[V::F64(a), V::F64(b)]);
     for divisor in [0.0, -0.0] {
-        assert_eq!(modulus(7.0, divisor).unwrap_err().code, "xtdb.expression/unknown-arithmetic-error");
+        let error = modulus(7.0, divisor).unwrap_err();
+        assert_eq!(error.code, "xtdb.expression/unknown-arithmetic-error");
+        assert_eq!(error.message.as_deref(), Some("data exception - arithmetic exception"));
     }
     for dividend in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
         assert_eq!(modulus(dividend, 2.0).unwrap_err().code, "xtdb.expression/number-format-error");

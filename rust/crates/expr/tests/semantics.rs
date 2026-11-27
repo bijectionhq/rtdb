@@ -119,6 +119,14 @@ fn numeric_errors_preserve_division_and_overflow_diagnostics() {
 }
 
 #[test]
+fn minimum_bigint_divided_by_minus_one_wraps_only_the_quotient() {
+    let left = V::I64(i64::MIN);
+    let right = V::I64(-1);
+    assert_eq!(run(&expr(B::Divide, left.clone(), right.clone())), left);
+    assert_eq!(rtdb_expr::arithmetic(B::Multiply, &left, &right).unwrap_err().code, "xtdb.expression/overflow-error");
+}
+
+#[test]
 fn modulo_uses_the_divisors_sign() {
     for (left, right, expected) in [(-5, 3, 1), (5, -3, -1), (-5, -3, -2), (5, 3, 2)] {
         assert_eq!(arithmetic(B::Modulo, &V::I64(left), &V::I64(right)).unwrap(), V::I64(expected));

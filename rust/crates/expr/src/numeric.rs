@@ -47,6 +47,11 @@ pub(crate) fn floating_value(value: f64, ty: &ScalarType) -> Value {
 pub(crate) fn overflow() -> Anomaly { Anomaly::incorrect("xtdb.expression/overflow-error", "data exception - overflow error") }
 pub(crate) fn division_by_zero() -> Anomaly { Anomaly::incorrect("xtdb.expression/division-by-zero", "data exception - division by zero") }
 
+pub(crate) fn signed_quotient(left: i64, right: i64) -> Result<i64> {
+    if right == 0 { return Err(division_by_zero()); }
+    Ok(left.wrapping_div(right))
+}
+
 pub fn signed_modulo(left: i64, right: i64) -> Result<i64> {
     if right == 0 { return Err(division_by_zero()); }
     let remainder = left.wrapping_rem(right);
@@ -55,7 +60,7 @@ pub fn signed_modulo(left: i64, right: i64) -> Result<i64> {
 
 pub fn float_modulo(left: f64, right: f64) -> Result<f64> {
     if right == 0.0 {
-        return Err(Anomaly::incorrect("xtdb.expression/unknown-arithmetic-error", "Divide by zero"));
+        return Err(Anomaly::incorrect("xtdb.expression/unknown-arithmetic-error", "data exception - arithmetic exception"));
     }
     let quotient = left / right;
     if !quotient.is_finite() { return Err(number_format("Infinite or NaN".into())); }
@@ -122,8 +127,8 @@ pub fn arithmetic_in_timezone(op: BinaryOp, left: &Value, right: &Value, timezon
 
 pub(crate) fn integer_arithmetic(op: BinaryOp, a: i128, b: i128) -> Result<i128> {
     use BinaryOp as B;
-    if op == B::Modulo && let (Ok(a), Ok(b)) = (i64::try_from(a), i64::try_from(b)) {
-        return signed_modulo(a, b).map(i128::from);
+    if matches!(op, B::Divide | B::Modulo) && let (Ok(a), Ok(b)) = (i64::try_from(a), i64::try_from(b)) {
+        return if op == B::Divide { signed_quotient(a, b) } else { signed_modulo(a, b) }.map(i128::from);
     }
     if matches!(op, B::Divide | B::Modulo) && b == 0 { return Err(division_by_zero()); }
     match op {

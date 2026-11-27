@@ -1,6 +1,6 @@
 use rtdb_plan::BinaryOp;
 use rtdb_types::{Anomaly, IntervalUnit, LogicalType, Result, ScalarType, TimeUnit, Value};
-use crate::{cast::cast, numeric::{division_by_zero, inapplicable, integer, number, overflow}, timezone::{Zone, zone}};
+use crate::{cast::cast, numeric::{division_by_zero, inapplicable, integer, number, overflow, signed_quotient}, timezone::{Zone, zone}};
 
 pub(crate) fn interval_overflow() -> Anomaly {
     Anomaly::incorrect("xtdb.expression/overflow-error", "data exception - overflow error")
@@ -141,7 +141,7 @@ fn arithmetic_value(op: BinaryOp, left: &Value, right: &Value, target: &ScalarTy
             else {
                 if parts.mixed() { return Err(Anomaly::unsupported("xtdb.expression/cannot-divide-mixed-intervals", "Cannot divide mixed (month, day, time) intervals")); }
                 if factor == 0 { return Err(division_by_zero()); }
-                IntervalParts { months: i32::try_from(i64::from(parts.months).checked_div(factor).ok_or_else(interval_overflow)?).map_err(|_| interval_overflow())?, days: i32::try_from(i64::from(parts.days).checked_div(factor).ok_or_else(interval_overflow)?).map_err(|_| interval_overflow())?, nanos: parts.nanos.checked_div(factor).ok_or_else(interval_overflow)? }
+                IntervalParts { months: i32::try_from(i64::from(parts.months) / factor).map_err(|_| interval_overflow())?, days: i32::try_from(i64::from(parts.days) / factor).map_err(|_| interval_overflow())?, nanos: signed_quotient(parts.nanos, factor)? }
             };
             return parts.into_value(target);
         }
@@ -150,8 +150,7 @@ fn arithmetic_value(op: BinaryOp, left: &Value, right: &Value, target: &ScalarTy
         if let Value::Duration { value: other, unit: other_unit } = factor {
             let common = (*unit).max(*other_unit);
             let (a, b) = (rescale(*value, *unit, common)?, rescale(*other, *other_unit, common)?);
-            if b == 0 { return Err(division_by_zero()); }
-            return Ok(Value::I64(a.checked_div(b).ok_or_else(overflow)?));
+            return signed_quotient(a, b).map(Value::I64);
         }
         if IntervalParts::of(factor).is_some() {
             let factor = cast(factor, &LogicalType::Scalar(ScalarType::Duration(*unit)), timezone)?;
@@ -159,8 +158,7 @@ fn arithmetic_value(op: BinaryOp, left: &Value, right: &Value, target: &ScalarTy
         }
         let value = if let Some(factor) = integer(factor) {
             let factor = i64::try_from(factor).map_err(|_| overflow())?;
-            if op == B::Divide && factor == 0 { return Err(division_by_zero()); }
-            if op == B::Multiply { value.checked_mul(factor) } else { value.checked_div(factor) }.ok_or_else(overflow)?
+            if op == B::Multiply { value.checked_mul(factor).ok_or_else(overflow)? } else { signed_quotient(*value, factor)? }
         } else {
             let factor = number(factor).ok_or_else(|| inapplicable("duration arithmetic", &[left, right]))?;
             if op == B::Divide && factor == 0.0 { return Err(division_by_zero()); }
