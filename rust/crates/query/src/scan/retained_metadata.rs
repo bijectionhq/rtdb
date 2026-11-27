@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use arrow_array::StructArray;
+use arrow_array::{ArrayRef, StructArray, make_array};
+use arrow_schema::{DataType, Field as ArrowField};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, estimate_read_cell_bytes, read_execution_value, read_execution_value_as, validate_readable_cell};
 use rtdb_index::{IndexBatch, Snapshot};
 use rtdb_plan::{Catalog, ColumnId, Expr, Field, QualifiedTable, Scan, TemporalFilter};
@@ -200,10 +201,17 @@ fn borrow_metadata(cells: &[MetadataCell<'_>], memory: &Arc<MemoryBudget>)
         } else {
             let schema = field.size().checked_mul(8).ok_or_else(projection_size)?;
             let _layout = memory.reserve(schema)?;
-            if *logical == LogicalType::Nothing || !stable_read_layout(logical, field) { return Ok(None); }
+            if *logical == LogicalType::Nothing { return Ok(None); }
+            let (array, field, logical, owner) = if stable_read_layout(logical, field) {
+                (Arc::clone(array), Arc::clone(field), logical.clone(), Arc::clone(owner))
+            } else if let Some(signed) = signed_metadata_source(array, field, logical, owner, memory)? {
+                signed
+            } else {
+                return Ok(None);
+            };
             reserve_more(&mut charge, logical.retained_bytes()?.checked_add(256).ok_or_else(projection_size)?)?;
             let source = sources.len();
-            sources.push(Some((Arc::clone(array), Arc::clone(field), Some(logical.clone()), Some(Arc::clone(owner)))));
+            sources.push(Some((array, field, Some(logical), Some(owner))));
             inputs.insert(key, source);
             source
         };
@@ -214,6 +222,26 @@ fn borrow_metadata(cells: &[MetadataCell<'_>], memory: &Arc<MemoryBudget>)
     }
     let column = Column::Selected(SelectedColumn::new(sources, Arc::new(positions)));
     settle_metadata(column, charge).map(Some)
+}
+
+fn signed_metadata_source(array: &ArrayRef, field: &ArrowField, logical: &LogicalType,
+    owner: &Arc<MemoryReservation>, memory: &Arc<MemoryBudget>,
+) -> Result<Option<(ArrayRef, Arc<ArrowField>, LogicalType, Arc<MemoryReservation>)>> {
+    if !matches!(field.data_type(), DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64)
+        || field.data_type() != array.data_type()
+        || !field.metadata().is_empty()
+        || rtdb_columnar::from_field(field).ok().as_ref() != Some(logical)
+    {
+        return Ok(None);
+    }
+    let bytes = field.size().checked_add(256).ok_or_else(projection_size)?;
+    let owner = memory.reserve_with_backing(bytes, std::iter::once(Arc::clone(owner)))?;
+    let signed = rtdb_columnar::execution_type(logical);
+    let field = rtdb_columnar::to_field(field.name(), &signed)?;
+    let Ok(data) = array.to_data().into_builder().data_type(field.data_type().clone()).build() else {
+        return Ok(None);
+    };
+    Ok(Some((make_array(data), Arc::new(field), signed, owner)))
 }
 
 fn settle_metadata(column: Column, mut charge: Arc<MemoryReservation>) -> Result<(Column, Arc<MemoryReservation>)> {
@@ -254,8 +282,56 @@ fn reserve_more(charge: &mut Arc<MemoryReservation>, bytes: usize) -> Result<()>
 }
 
 #[test]
-fn metadata_value_fallback_coerces_legacy_unsigned_cells_and_owns_its_charge() {
-    use arrow_array::{ArrayRef, UInt64Array};
+fn retained_metadata_views_sliced_unsigned_sources_as_signed_arrow() {
+    use arrow_array::{Array, UInt8Array, UInt16Array, UInt32Array, UInt64Array};
+    use rtdb_types::ScalarType;
+
+    let cases: [(ScalarType, ArrayRef, Value); 4] = [
+        (ScalarType::U8, Arc::new(UInt8Array::from(vec![Some(0), Some(u8::MAX), None])), Value::I8(-1)),
+        (ScalarType::U16, Arc::new(UInt16Array::from(vec![Some(0), Some(u16::MAX), None])), Value::I16(-1)),
+        (ScalarType::U32, Arc::new(UInt32Array::from(vec![Some(0), Some(u32::MAX), None])), Value::I32(-1)),
+        (ScalarType::U64, Arc::new(UInt64Array::from(vec![Some(0), Some(u64::MAX), None])), Value::I64(-1)),
+    ];
+    for (scalar, array, expected) in cases {
+        let memory = MemoryBudget::new(1 << 20);
+        let logical = LogicalType::Scalar(scalar).maybe();
+        let field = Arc::new(rtdb_columnar::to_field("user_metadata", &logical).unwrap());
+        let owner = memory.reserve(array.get_array_memory_size()).unwrap();
+        let array = array.slice(1, 2);
+        let receipt = Column::Arrow { array: Arc::clone(&array), field: Arc::clone(&field), logical: Some(logical.clone()) };
+        let input = FundedArrowCell { array: &array, field: &field, logical: Some(&logical), owner: &owner, row: 0 };
+        let expected = [expected, Value::Null, Value::Null];
+
+        let (column, charge) = project_metadata(&[
+            MetadataCell::Original(Some(input)), MetadataCell::Receipt { column: &receipt, owner: &owner, row: 1 },
+            MetadataCell::Original(None),
+        ], &memory).unwrap();
+        let Column::Selected(selected) = &column else { panic!("Expected funded Arrow positions"); };
+        let data = array.to_data();
+        let signed = rtdb_columnar::execution_type(&logical);
+        let target = rtdb_columnar::to_field("user_metadata", &signed).unwrap();
+        for (array, field, logical) in selected.source_layouts() {
+            let view = array.to_data();
+            assert!(view.buffers()[0].ptr_eq(&data.buffers()[0]));
+            assert!(view.nulls().unwrap().buffer().ptr_eq(data.nulls().unwrap().buffer()));
+            assert_eq!(field, &target);
+            assert_eq!(logical, Some(&signed));
+        }
+        let backing = Arc::downgrade(&owner);
+        drop((receipt, array, owner));
+        assert!(backing.upgrade().is_some());
+        let (output, output_charge) = crate::columnar::relayout_output(&column, &signed, &target, &memory).unwrap().unwrap();
+        let values = (0..output.len()).map(|row| read_execution_value(&target, output.as_ref(), row).unwrap()).collect::<Vec<_>>();
+        assert_eq!(values, expected);
+        drop((output, output_charge, column, charge));
+        assert!(backing.upgrade().is_none());
+        assert_eq!(memory.used_bytes(), 0);
+    }
+}
+
+#[test]
+fn retained_metadata_value_fallback_releases_aliases_and_owns_its_charge() {
+    use arrow_array::UInt64Array;
     use rtdb_types::ScalarType;
 
     let memory = MemoryBudget::new(1 << 20);
@@ -264,10 +340,14 @@ fn metadata_value_fallback_coerces_legacy_unsigned_cells_and_owns_its_charge() {
     let array: ArrayRef = Arc::new(UInt64Array::from(vec![u64::MAX]));
     let owner = memory.reserve(array.get_array_memory_size()).unwrap();
     let input = FundedArrowCell { array: &array, field: &field, logical: Some(&logical), owner: &owner, row: 0 };
+    let receipt = Column::Values(vec![Value::Binary(vec![7; 64])]);
+    let receipt_owner = memory.reserve(receipt.retained_bytes().unwrap()).unwrap();
 
-    let (column, charge) = project_metadata(&[MetadataCell::Original(Some(input)), MetadataCell::Original(None)], &memory).unwrap();
-    drop((array, owner));
-    assert!(matches!(&column, Column::Values(values) if values.as_slice() == [Value::I64(-1), Value::Null]));
+    let (column, charge) = project_metadata(&[
+        MetadataCell::Original(Some(input)), MetadataCell::Receipt { column: &receipt, owner: &receipt_owner, row: 0 },
+    ], &memory).unwrap();
+    drop((array, owner, receipt, receipt_owner));
+    assert!(matches!(&column, Column::Values(values) if values.as_slice() == [Value::I64(-1), Value::Binary(vec![7; 64])]));
     assert_eq!(memory.used_bytes(), charge.bytes());
     assert_eq!(charge.bytes(), column.retained_bytes().unwrap());
 }
