@@ -99,7 +99,7 @@ pub(super) fn all_identical(left: &[CellKind], right: &[CellKind]) -> bool {
 }
 
 /// A comparable cell.
-#[derive(Clone, Copy, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
 pub(super) enum Cell<'a> {
     Int(i64), Float(f64), Text(&'a str), Bool(bool), Micros(i64, Option<&'a str>),
     /// A UUID as the big-endian integer of its bytes, which orders as the bytes do.
@@ -224,7 +224,7 @@ impl<'a> Cells<'a> {
     }
 
     /// `Err` where a cell has a type no comparison here reads.
-    fn get(&self, row: usize) -> Result<Option<Cell<'a>>, ()> {
+    pub(super) fn get(&self, row: usize) -> Result<Option<Cell<'a>>, ()> {
         fn valid<A: Array>(array: &A, row: usize) -> bool { array.is_valid(row) }
         Ok(match self {
             Self::Null => None,

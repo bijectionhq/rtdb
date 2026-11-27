@@ -21,6 +21,7 @@ use rtdb_types::{LogicalType, Result, ScalarType, TimeUnit, Value};
 use super::{Column, ColumnBatch, PredicateSelection, SelectedColumn, plain_scalar};
 
 mod predicate;
+mod range;
 use predicate::{Cell, Cells, Operand};
 
 /// A batch-length column of one plain scalar type, or of nulls only.
@@ -214,7 +215,13 @@ pub(crate) struct Projection(Node);
 
 /// A predicate expression, its calls and schema layout checks resolved once at plan/preparation time.
 #[derive(Clone, Debug)]
-pub(crate) struct Predicate(Node);
+pub(crate) struct Predicate(PredicatePlan);
+
+#[derive(Clone, Debug)]
+enum PredicatePlan {
+    Range(range::RangePredicate),
+    Vector(Node),
+}
 
 /// The static vector type of a bound node, decided from the schema and expression types at bind time.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -368,16 +375,32 @@ impl Projection {
 impl Predicate {
     /// `None` where the predicate's shape or schema types cannot be evaluated here.
     pub(crate) fn bind(expr: &Expr, schema: &Schema) -> Option<Self> {
+        if let Some(range) = range::RangePredicate::bind(expr, schema) {
+            return Some(Self(PredicatePlan::Range(range)));
+        }
         let (node, ty) = Node::bind_vector(expr, schema, None)?;
-        matches!(ty, VectorType::Bool | VectorType::Null).then_some(Self(node))
+        matches!(ty, VectorType::Bool | VectorType::Null).then_some(Self(PredicatePlan::Vector(node)))
     }
 
-    pub(crate) fn retained_bytes(&self) -> Result<usize> { self.0.retained_bytes() }
+    pub(crate) fn retained_bytes(&self) -> Result<usize> {
+        match &self.0 {
+            PredicatePlan::Range(_) => Ok(size_of::<range::RangePredicate>()),
+            PredicatePlan::Vector(node) => node.retained_bytes(),
+        }
+    }
 
     pub(crate) fn selection(&self, batch: &ColumnBatch, parameters: rtdb_expr::Parameters<'_>, memory: &Arc<MemoryBudget>,
         prepare: impl FnOnce() -> Result<()>) -> Result<Option<PredicateSelection>> {
+        let node = match &self.0 {
+            PredicatePlan::Range(range) => {
+                let selection = range.selection(batch, parameters, memory)?;
+                if selection.is_some() { prepare()?; }
+                return Ok(selection);
+            }
+            PredicatePlan::Vector(node) => node,
+        };
         let evaluation = Evaluation { columns: &batch.columns, len: batch.len, parameters: Parameters::Values(parameters), memory: batch.reservation.budget() };
-        let Some(Charged { vector, _charge: charge }) = evaluation.vector(&self.0, None)? else { return Ok(None); };
+        let Some(Charged { vector, _charge: charge }) = evaluation.vector(node, None)? else { return Ok(None); };
         if !holds_truths(&vector) { return Ok(None); }
         prepare()?;
         Ok(Some(match (vector, charge) {
@@ -392,8 +415,12 @@ impl Predicate {
 
     /// Each row's three-valued truth over `batch`, keeping unknown (null) apart from false.
     pub(crate) fn truth(&self, batch: &ColumnBatch, parameters: rtdb_expr::Parameters<'_>) -> Result<Option<Vec<Option<bool>>>> {
+        let node = match &self.0 {
+            PredicatePlan::Range(range) => return range.truth(batch, parameters),
+            PredicatePlan::Vector(node) => node,
+        };
         let evaluation = Evaluation { columns: &batch.columns, len: batch.len, parameters: Parameters::Values(parameters), memory: batch.reservation.budget() };
-        let Some(charged) = evaluation.vector(&self.0, None)? else { return Ok(None) };
+        let Some(charged) = evaluation.vector(node, None)? else { return Ok(None) };
         Ok(match &charged.vector {
             Vector::Null => Some(vec![None; batch.len]),
             Vector::Bool(values) => Some(values.iter().collect()),
