@@ -11,7 +11,7 @@ use uuid::Uuid;
 use super::{ActivationAuthority, Binding, VerifiedSuccessor};
 use crate::{
     config::NodeConfiguration,
-    multi::{CONSENSUS_SCHEME, DEVELOPMENT_DATABASE, MultiRuntime, io_error},
+    multi::{CONSENSUS_SCHEME, DEVELOPMENT_DATABASE, MultiRuntime},
 };
 
 pub const HELP: &str = "Usage: rtdb multi-activation status DATABASE AUTHORITY
