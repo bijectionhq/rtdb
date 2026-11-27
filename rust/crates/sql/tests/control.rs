@@ -116,6 +116,9 @@ fn control_names_follow_the_reference_identifier_rule() {
         let error = parse_control(source, &PrepareOptions::default()).unwrap_err();
         assert_eq!(error.code, "xtdb/sql-error", "{source}");
     }
+    assert_eq!(parse("SHOW TRANSACTION ISOLATION LEVEL"), ControlStatement::ShowTransactionIsolationLevel);
+    assert!(parse("SHOW TRANSACTION ISOLATION LEVEL").requires_read_transaction());
+    assert!(!parse("SHOW transaction_isolation").requires_read_transaction());
     for (source, name) in [("SHOW \"all\"", "all"), ("SHOW \"time\"", "time"), ("SHOW transaction_isolation", "transaction_isolation"), ("SHOW AWAIT_TOKEN", "await_token"),
         ("SHOW snapshot_token", "snapshot_token"), ("SHOW CLOCK_TIME", "clock_time"), ("SHOW TIME ZONE", "timezone"), ("SHOW database", "database")] {
         assert_eq!(parse(source), ControlStatement::Show { name: name.into() }, "{source}");

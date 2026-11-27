@@ -276,6 +276,9 @@ impl NativeSession {
                 };
                 self.show(name, statement.requires_read_transaction(), source, cancellation).await.map(ControlResult::Rows)
             },
+            ControlStatement::ShowTransactionIsolationLevel => {
+                self.show_transaction_isolation(cancellation).await.map(ControlResult::Rows)
+            }
             ControlStatement::Prepare { name, source } => {
                 allocation.reserve(size(name.len(), source.len())?)?;
                 Ok(ControlResult::Prepare { name: name.clone(), source: source.clone(), allocation })
@@ -419,6 +422,15 @@ impl NativeSession {
         let mut binder = Binder::default();
         let schema = Schema::new(fields.into_iter().map(|(name, ty)| binder.field(name, None, ty)).collect::<Result<Vec<_>>>()?)?;
         QueryCursor::from_rows(schema, rows, context, reservation)
+    }
+
+    async fn show_transaction_isolation(&mut self, cancellation: &CancellationToken) -> Result<QueryCursor> {
+        let basis = self.state.read_basis().await?;
+        let context = self.instrument_query_context(self.service.query_context(self.state.database(), &basis, cancellation).await?);
+        let reservation = context.memory.reserve(8192)?;
+        let mut binder = Binder::default();
+        let schema = Schema::new(vec![binder.field("transaction_isolation", None, LogicalType::Scalar(ScalarType::Utf8))?])?;
+        QueryCursor::from_rows(schema, vec![vec![Value::Utf8("read committed".into())]], context, reservation)
     }
 }
 

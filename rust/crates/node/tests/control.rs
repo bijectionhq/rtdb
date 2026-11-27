@@ -74,6 +74,14 @@ fn xtdb_show_prepared_schema_does_not_require_a_live_connection() {
     assert_eq!(schema.fields().iter().map(|field| field.name.as_str()).collect::<Vec<_>>(), ["tx_id", "system_time", "committed", "error", "await_token"]);
     assert_eq!(schema.fields()[3].data_type, LogicalType::Scalar(ScalarType::Transit).maybe());
     assert!(schema.fields().iter().all(|field| field.data_type.nullable()));
+    let isolation_level = control_schema(&parse("SHOW TRANSACTION ISOLATION LEVEL")).unwrap().unwrap();
+    assert_eq!(isolation_level.fields().len(), 1);
+    assert_eq!(isolation_level.fields()[0].name, "transaction_isolation");
+    assert_eq!(isolation_level.fields()[0].data_type, LogicalType::Scalar(ScalarType::Utf8));
+    let isolation_var = control_schema(&parse("SHOW transaction_isolation")).unwrap().unwrap();
+    assert_eq!(isolation_var.fields().len(), 1);
+    assert_eq!(isolation_var.fields()[0].name, "transaction_isolation");
+    assert_eq!(isolation_var.fields()[0].data_type, LogicalType::Scalar(ScalarType::Utf8).maybe());
     assert!(control_schema(&parse("COMMIT")).unwrap().is_none());
 
     let isolation_level = control_schema(&parse("SHOW TRANSACTION ISOLATION LEVEL")).unwrap().unwrap();

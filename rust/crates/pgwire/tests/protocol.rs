@@ -1987,3 +1987,31 @@ async fn a_server_default_timezone_starts_each_session_in_that_zone() {
     drop(client);
     running.stop().await;
 }
+
+#[tokio::test]
+async fn show_transaction_isolation_reads_session_parameter_unlike_isolation_level() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+
+    let level = client.query("SHOW TRANSACTION ISOLATION LEVEL").await;
+    assert_eq!(tags(&level), b"TDCZ");
+    assert_eq!(rows(&level), [vec![Some(b"read committed".to_vec())]]);
+
+    let variable = client.query("SHOW transaction_isolation").await;
+    assert_eq!(tags(&variable), b"TDCZ");
+    assert_eq!(rows(&variable), [vec![None]]);
+
+    assert_eq!(tags(&client.query("SET transaction_isolation = 'serializable'").await), b"SCZ");
+    assert_eq!(rows(&client.query("SHOW transaction_isolation").await), [vec![Some(b"serializable".to_vec())]]);
+    assert_eq!(rows(&client.query("SHOW TRANSACTION ISOLATION LEVEL").await), [vec![Some(b"read committed".to_vec())]]);
+
+    assert_eq!(tags(&client.query("BEGIN READ WRITE").await), b"CZ");
+    let in_rw = client.query("SHOW transaction_isolation").await;
+    assert_eq!(tags(&in_rw), b"TDCZ");
+    assert_eq!(rows(&in_rw), [vec![Some(b"serializable".to_vec())]]);
+    assert_eq!(in_rw.last().unwrap().1, b"T");
+    assert_eq!(tags(&client.query("ROLLBACK").await), b"CZ");
+
+    drop(client);
+    running.stop().await;
+}
