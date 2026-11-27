@@ -592,9 +592,15 @@ impl ProtocolSession {
     async fn bind(&mut self, prepared: Arc<Prepared>, arguments: Option<SqlArguments>, mut charges: Vec<Arc<MemoryReservation>>, formats: &[Format]) -> Result<Portal> {
         Box::pin(async move {
         let token = self.token();
-        let bound = prepared.columns.as_deref().unwrap_or_default().iter().try_fold(8192usize, |bytes, column| bytes.checked_add(column.name.len()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(|| protocol("Portal descriptors are too large")))?;
-        charges.push(self.node.memory().reserve(bound)?);
-        let columns = prepared.columns.as_ref().map(|columns| bound_columns(columns, formats)).transpose()?;
+        charges.push(self.node.memory().reserve(std::mem::size_of::<Portal>())?);
+        let columns = match &prepared.columns {
+            Some(columns) => {
+                let (columns, charge) = bind_portal_columns(columns, formats, self.node.memory())?;
+                if let Some(charge) = charge { charges.push(charge); }
+                Some(columns)
+            }
+            None => None,
+        };
         let mut portal = Portal { prepared: Arc::clone(&prepared), arguments, columns, state: PortalState::Ready, cancellation: token.clone(), _charges: charges, _bind_storage: None };
         let control_options = self.control_options();
         let cursor = match (prepared.ordinary_kind(), prepared.control()) {
@@ -1116,7 +1122,26 @@ fn retained_prepared_bytes(source: &str, command: &str, oid_capacity: usize, col
 }
 fn head(source: &str) -> String { source.split_whitespace().next().unwrap_or_default().to_ascii_uppercase() }
 fn dml_tag(command: &str) -> &str { match command { "INSERT" => "INSERT 0 0", "UPDATE" => "UPDATE 0", "DELETE" => "DELETE 0", "PATCH" => "PATCH 0", "ERASE" => "ERASE 0", "CREATE" => "CREATE TABLE", command => command } }
+fn portal_descriptor_bytes(columns: &[Column]) -> Result<usize> {
+    columns.iter().try_fold(0usize, |bytes, column| {
+        bytes.checked_add(std::mem::size_of::<Column>())
+            .and_then(|bytes| bytes.checked_add(column.name.len()))
+            .ok_or_else(|| protocol("Portal descriptors are too large"))
+    })
+}
 /// A portal's descriptors in its result formats, shared with the statement's when the formats leave them unchanged.
+/// Only allocates and charges descriptor memory when the portal must build its own copy.
+fn bind_portal_columns(columns: &Arc<[Column]>, formats: &[Format], memory: &Arc<MemoryBudget>) -> Result<(Arc<[Column]>, Option<Arc<MemoryReservation>>)> {
+    let mut unchanged = true;
+    for (index, column) in columns.iter().enumerate() { unchanged &= item_format(formats, columns.len(), index)? == column.format; }
+    if unchanged { return Ok((Arc::clone(columns), None)); }
+    let reservation = memory.reserve(portal_descriptor_bytes(columns)?)?;
+    let bound: Arc<[Column]> = columns.iter().enumerate()
+        .map(|(index, column)| Ok(Column { name: column.name.clone(), ty: column.ty, format: item_format(formats, columns.len(), index)? }))
+        .collect::<Result<_>>()?;
+    Ok((bound, Some(reservation)))
+}
+#[cfg(test)]
 fn bound_columns(columns: &Arc<[Column]>, formats: &[Format]) -> Result<Arc<[Column]>> {
     let mut unchanged = true;
     for (index, column) in columns.iter().enumerate() { unchanged &= item_format(formats, columns.len(), index)? == column.format; }
@@ -2409,6 +2434,16 @@ mod tests {
         let error = bound_columns(&columns, &[Format::Text; 3]).unwrap_err();
         assert_eq!(error.message, item_format(&[Format::Text; 3], 2, 0).unwrap_err().message);
         assert!(bound_columns(&Arc::<[Column]>::from(Vec::new()), &[Format::Text; 3]).unwrap().is_empty());
+
+        let memory = MemoryBudget::new(1 << 16);
+        let (shared, charge) = bind_portal_columns(&columns, &[Format::Text], &memory).unwrap();
+        assert!(Arc::ptr_eq(&shared, &columns));
+        assert!(charge.is_none());
+        assert_eq!(memory.used_bytes(), 0);
+        let (owned, charge) = bind_portal_columns(&columns, &[Format::Binary], &memory).unwrap();
+        assert!(!Arc::ptr_eq(&owned, &columns));
+        assert!(charge.is_some());
+        assert_eq!(memory.used_bytes(), portal_descriptor_bytes(&columns).unwrap());
     }
 
     #[test]
