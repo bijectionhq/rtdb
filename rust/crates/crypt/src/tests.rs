@@ -12,6 +12,78 @@ fn generation(number: u64) -> Generation {
     }
 }
 
+fn recovery_hold(generation: Generation) -> RecoveryKeyHold {
+    RecoveryKeyHold {
+        authority: Uuid::from_u128(23),
+        operation: Uuid::from_u128(24),
+        generation,
+        installation_sha256: [25; 32],
+    }
+}
+
+#[tokio::test]
+async fn recovery_key_hold_survives_reopen_and_remembers_exact_release() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("vault");
+    FileKms::create_directory(&path).unwrap();
+    let generation = generation(1);
+    let hold = recovery_hold(generation);
+    let foreign = RecoveryKeyHold { installation_sha256: [26; 32], ..hold };
+    let kms = FileKms::open(&path, || 0).unwrap();
+    kms.create(generation).await.unwrap();
+    let context = Context::Journal { lsn: 7 };
+    let sealed = seal(&kms, generation, context, b"successor").await.unwrap();
+    assert!(kms.require_recovery_key(hold).await.is_err());
+    kms.retain_recovery_key(hold).await.unwrap();
+    kms.retain_recovery_key(hold).await.unwrap();
+    assert!(kms.retain_recovery_key(foreign).await.is_err());
+    assert!(kms.require_recovery_key(foreign).await.is_err());
+    assert!(kms.release_recovery_key(foreign).await.is_err());
+    assert!(kms.retire(generation, 1).await.is_err());
+    drop(kms);
+
+    let kms = FileKms::open(&path, || 2).unwrap();
+    kms.require_recovery_key(hold).await.unwrap();
+    assert!(kms.destroy(generation).await.is_err());
+    assert_eq!(&*open(&kms, generation.database, context, &sealed).await.unwrap().bytes, b"successor");
+    kms.release_recovery_key(hold).await.unwrap();
+    assert!(kms.require_recovery_key(hold).await.is_err());
+    kms.retire(generation, 2).await.unwrap();
+    kms.destroy(generation).await.unwrap();
+    drop(kms);
+
+    let kms = FileKms::open(&path, || 3).unwrap();
+    kms.release_recovery_key(hold).await.unwrap();
+    assert!(kms.release_recovery_key(foreign).await.is_err());
+    assert!(kms.retain_recovery_key(hold).await.is_err());
+    assert!(kms.generation_destroyed(generation).await.unwrap());
+}
+
+#[tokio::test]
+async fn recovery_key_hold_and_retirement_cannot_both_win_admission() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("vault");
+    FileKms::create_directory(&path).unwrap();
+    let generation = generation(1);
+    let hold = recovery_hold(generation);
+    let kms = FileKms::open(&path, || 0).unwrap();
+    kms.create(generation).await.unwrap();
+    let peer = FileKms::open(&path, || 0).unwrap();
+    let (held, retired) = tokio::join!(
+        kms.retain_recovery_key(hold),
+        peer.retire(generation, 10),
+    );
+    assert_ne!(held.is_ok(), retired.is_ok());
+    if retired.is_ok() {
+        assert!(kms.retain_recovery_key(hold).await.is_err());
+        let reopened = FileKms::open(&path, || 10).unwrap();
+        assert_eq!(reopened.check_readable(generation).await.unwrap_err(), erased_under_view());
+    } else {
+        peer.require_recovery_key(hold).await.unwrap();
+        assert!(peer.retire(generation, 10).await.is_err());
+    }
+}
+
 #[tokio::test]
 async fn custody_values_bind_the_member_and_remain_revoked_after_vault_reopen() {
     let root = tempfile::tempdir().unwrap();

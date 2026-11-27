@@ -84,6 +84,14 @@ Every seal returns `JournalError::Recovered { head }` until a writer or an admin
   Voter 1 stops after the first commit, the other two voters acknowledge two more and are retired, and `recover-stream` runs on voter 1.
   The next writer acknowledges and records the recovery, and the old writer, both followers and a new reader all hold the first commit and the new ones, never the lost ones.
 
+## Recovery key custody
+
+The file key provider can hold an existing destination generation for an exact activation authority, recovery operation, and installation digest.
+Holding, releasing, and retiring a generation serialize in its original vault.
+Custody survives reopening the vault, and exact release retries recover the original result even after the key is destroyed.
+The provider accepts holds before retirement is admitted, preserving every existing erasure deadline.
+Activation and hosted provider integration must establish when to retain the generation and when publication or supersession permits release.
+
 ## Independent database activation
 
 A Multi runtime can bind a stable name and its exact database incarnation to a separately commissioned immutable activation journal.

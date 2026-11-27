@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use zeroize::Zeroizing;
 
-use super::{DataKey, Generation, Kms, aead, erased_under_view};
+use super::{DataKey, Generation, Kms, RecoveryKeyHold, aead, erased_under_view};
 
 #[derive(Clone)]
 pub struct FileKms {
@@ -37,7 +37,9 @@ impl FileKms {
         })
     }
 
-    pub fn vault_path(&self) -> &Path { &self.root }
+    pub fn vault_path(&self) -> &Path {
+        &self.root
+    }
 
     pub fn create_directory(path: &Path) -> Result<()> {
         let mut directory = fs::DirBuilder::new();
@@ -87,18 +89,56 @@ impl FileKms {
     }
 }
 
-enum State {
-    Active(DataKey),
-    Retiring { key: DataKey, unreadable_by: i64 },
-    Destroyed,
+struct State {
+    key: Option<DataKey>,
+    custody: Custody,
 }
 
 impl State {
+    fn writable(&self) -> Result<&DataKey> {
+        if self.custody.deadline().is_some() {
+            return Err(erased_under_view());
+        }
+        self.key.as_ref().ok_or_else(erased_under_view)
+    }
+
     fn readable(&self, now: i64) -> Result<&DataKey> {
+        if self
+            .custody
+            .deadline()
+            .is_some_and(|deadline| now >= deadline)
+        {
+            return Err(erased_under_view());
+        }
+        self.key.as_ref().ok_or_else(erased_under_view)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Custody {
+    Unrestricted,
+    Retiring(i64),
+    Recovery(RecoveryCustody),
+}
+
+#[derive(Clone, Copy, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+enum RecoveryCustody {
+    Held {
+        hold: RecoveryKeyHold,
+    },
+    Released {
+        hold: RecoveryKeyHold,
+        unreadable_by: Option<i64>,
+    },
+}
+
+impl Custody {
+    fn deadline(self) -> Option<i64> {
         match self {
-            Self::Active(key) => Ok(key),
-            Self::Retiring { key, unreadable_by } if now < *unreadable_by => Ok(key),
-            Self::Retiring { .. } | Self::Destroyed => Err(erased_under_view()),
+            Self::Retiring(unreadable_by) => Some(unreadable_by),
+            Self::Recovery(RecoveryCustody::Released { unreadable_by, .. }) => unreadable_by,
+            _ => None,
         }
     }
 }
@@ -117,24 +157,51 @@ impl Slot {
         };
         let mut bytes = Zeroizing::new(Vec::with_capacity(34));
         file.take(34).read_to_end(&mut bytes).map_err(io_error)?;
-        let state = match bytes.as_slice() {
+        let key = match bytes.as_slice() {
             [0, key @ ..] if key.len() == 32 => {
-                let key = DataKey::new(key.try_into().map_err(|_| invalid_slot())?);
-                match fs::read(self.path.with_extension("retirement")) {
-                    Ok(deadline) => State::Retiring {
-                        key,
-                        unreadable_by: i64::from_be_bytes(
-                            deadline.try_into().map_err(|_| invalid_slot())?,
-                        ),
-                    },
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => State::Active(key),
-                    Err(error) => return Err(io_error(error)),
-                }
+                Some(DataKey::new(key.try_into().map_err(|_| invalid_slot())?))
             }
-            [2] => State::Destroyed,
+            [2] => None,
             _ => return Err(invalid_slot()),
         };
-        Ok(Some(state))
+        Ok(Some(State {
+            key,
+            custody: self.read_custody()?,
+        }))
+    }
+
+    fn read_custody(&self) -> Result<Custody> {
+        let path = self.path.with_extension("retirement");
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(Custody::Unrestricted);
+            }
+            Err(error) => return Err(io_error(error)),
+        };
+        let mut bytes = Vec::new();
+        file.take(1025).read_to_end(&mut bytes).map_err(io_error)?;
+        if let Ok(deadline) = bytes.as_slice().try_into() {
+            return Ok(Custody::Retiring(i64::from_be_bytes(deadline)));
+        }
+        if bytes.len() > 1024 {
+            return Err(invalid_slot());
+        }
+        serde_json::from_slice(&bytes)
+            .map(Custody::Recovery)
+            .map_err(|_| invalid_slot())
+    }
+
+    fn write_retirement(&self, deadline: i64) -> Result<()> {
+        self.write(
+            &self.path.with_extension("retirement"),
+            &deadline.to_be_bytes(),
+        )
+    }
+
+    fn write_recovery_custody(&self, custody: RecoveryCustody) -> Result<()> {
+        let bytes = serde_json::to_vec(&custody).map_err(|_| invalid_slot())?;
+        self.write(&self.path.with_extension("retirement"), &bytes)
     }
 
     fn write_key(&self, key: &DataKey) -> Result<()> {
@@ -148,6 +215,10 @@ impl Slot {
         file.write_all(bytes).map_err(io_error)?;
         file.as_file().sync_all().map_err(io_error)?;
         file.persist(path).map_err(|error| io_error(error.error))?;
+        self.sync()
+    }
+
+    fn sync(&self) -> Result<()> {
         File::open(&self.root)
             .and_then(|root| root.sync_all())
             .map_err(io_error)
@@ -156,17 +227,21 @@ impl Slot {
 
 #[async_trait]
 impl Kms for FileKms {
-    fn supports_durable_generation_retirement(&self) -> bool { true }
+    fn supports_durable_generation_retirement(&self) -> bool {
+        true
+    }
 
     async fn generation_destroyed(&self, generation: Generation) -> Result<bool> {
-        self.access(generation, |_, state, _| Ok(matches!(state, Some(State::Destroyed)))).await
+        self.access(generation, |_, state, _| {
+            Ok(state.is_some_and(|state| state.key.is_none()))
+        })
+        .await
     }
 
     async fn create(&self, generation: Generation) -> Result<()> {
         self.access(generation, |slot, state, _| match state {
             None => slot.write_key(&aead::random_key()?),
-            Some(State::Active(_)) => Ok(()),
-            Some(_) => Err(erased_under_view()),
+            Some(state) => state.writable().map(|_| ()),
         })
         .await
     }
@@ -175,10 +250,8 @@ impl Kms for FileKms {
         let key = key.clone();
         let context = context.to_vec();
         self.access(generation, move |_, state, _| {
-            match state.ok_or_else(unknown_generation)? {
-                State::Active(wrapping) => aead::seal(&wrapping, &context, key.as_ref()),
-                _ => Err(erased_under_view()),
-            }
+            let state = state.ok_or_else(unknown_generation)?;
+            aead::seal(state.writable()?, &context, key.as_ref())
         })
         .await
     }
@@ -206,19 +279,33 @@ impl Kms for FileKms {
 
     async fn retire(&self, generation: Generation, unreadable_by: i64) -> Result<()> {
         self.access(generation, move |slot, state, _| {
-            match state.ok_or_else(unknown_generation)? {
-                // The retirement record carries no key material, including in an interrupted write.
-                State::Active(_) => slot.write(
-                    &slot.path.with_extension("retirement"),
-                    &unreadable_by.to_be_bytes(),
-                ),
-                State::Retiring {
-                    unreadable_by: existing,
-                    ..
-                } if existing != unreadable_by => {
-                    Err(conflict("Generation already has a retirement deadline"))
+            let state = state.ok_or_else(unknown_generation)?;
+            if state.key.is_none() {
+                return Ok(());
+            }
+            match state.custody {
+                Custody::Unrestricted => slot.write_retirement(unreadable_by),
+                Custody::Recovery(RecoveryCustody::Held { .. }) => {
+                    Err(conflict("The staged recovery still holds this generation"))
                 }
-                _ => Ok(()),
+                Custody::Recovery(RecoveryCustody::Released {
+                    hold,
+                    unreadable_by: None,
+                }) => slot.write_recovery_custody(RecoveryCustody::Released {
+                    hold,
+                    unreadable_by: Some(unreadable_by),
+                }),
+                Custody::Retiring(existing)
+                | Custody::Recovery(RecoveryCustody::Released {
+                    unreadable_by: Some(existing),
+                    ..
+                }) => {
+                    if existing == unreadable_by {
+                        slot.sync()
+                    } else {
+                        Err(conflict("Generation already has a retirement deadline"))
+                    }
+                }
             }
         })
         .await
@@ -236,18 +323,98 @@ impl Kms for FileKms {
 
     async fn destroy(&self, generation: Generation) -> Result<()> {
         self.access(generation, |slot, state, now| {
-            match state.ok_or_else(unknown_generation)? {
-                State::Retiring { unreadable_by, .. } if now >= unreadable_by => {
-                    slot.write(&slot.path, &[2])
+            let state = state.ok_or_else(unknown_generation)?;
+            if state.key.is_none() {
+                return Ok(());
+            }
+            if state
+                .custody
+                .deadline()
+                .is_some_and(|deadline| now >= deadline)
+            {
+                return slot.write(&slot.path, &[2]);
+            }
+            Err(conflict(
+                "Key custody must remain through the retirement deadline",
+            ))
+        })
+        .await
+    }
+
+    async fn retain_recovery_key(&self, hold: RecoveryKeyHold) -> Result<()> {
+        validate_hold(hold)?;
+        self.access(hold.generation, move |slot, state, _| {
+            let state = state.ok_or_else(unknown_generation)?;
+            state.writable()?;
+            match state.custody {
+                Custody::Unrestricted => {
+                    slot.write_recovery_custody(RecoveryCustody::Held { hold })
                 }
-                State::Destroyed => Ok(()),
+                Custody::Recovery(RecoveryCustody::Held { hold: existing }) if existing == hold => {
+                    slot.sync()
+                }
                 _ => Err(conflict(
-                    "Key custody must remain through the retirement deadline",
+                    "This generation already has a different recovery custody decision",
                 )),
             }
         })
         .await
     }
+
+    async fn require_recovery_key(&self, hold: RecoveryKeyHold) -> Result<()> {
+        validate_hold(hold)?;
+        self.access(hold.generation, move |slot, state, _| {
+            let state = state.ok_or_else(unknown_generation)?;
+            state.writable()?;
+            match state.custody {
+                Custody::Recovery(RecoveryCustody::Held { hold: existing }) if existing == hold => {
+                    slot.sync()
+                }
+                _ => Err(conflict(
+                    "This generation has no matching active recovery hold",
+                )),
+            }
+        })
+        .await
+    }
+
+    async fn release_recovery_key(&self, hold: RecoveryKeyHold) -> Result<()> {
+        validate_hold(hold)?;
+        self.access(hold.generation, move |slot, state, _| {
+            let state = state.ok_or_else(unknown_generation)?;
+            match state.custody {
+                Custody::Recovery(RecoveryCustody::Held { hold: existing }) if existing == hold => {
+                    slot.write_recovery_custody(RecoveryCustody::Released {
+                        hold,
+                        unreadable_by: None,
+                    })
+                }
+                Custody::Recovery(RecoveryCustody::Released { hold: existing, .. })
+                    if existing == hold =>
+                {
+                    slot.sync()
+                }
+                _ => Err(conflict(
+                    "This generation has no matching recovery hold to release",
+                )),
+            }
+        })
+        .await
+    }
+}
+
+fn validate_hold(hold: RecoveryKeyHold) -> Result<()> {
+    if hold.authority.is_nil()
+        || hold.operation.is_nil()
+        || hold.generation.database.is_nil()
+        || hold.installation_sha256 == [0; 32]
+    {
+        return Err(Anomaly::incorrect(
+            "rtdb.crypt/recovery-key-hold",
+            "Invalid recovery key hold identity",
+        ));
+    }
+    Ok(())
 }
 
 fn invalid_vault() -> Anomaly {

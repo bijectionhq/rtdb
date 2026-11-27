@@ -21,10 +21,21 @@ pub use custody::CustodyVault;
 
 pub type DataKey = Zeroizing<[u8; 32]>;
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Generation {
     pub database: Uuid,
     pub number: u64,
+}
+
+/// Custody of a staged successor's generation for one verified installation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryKeyHold {
+    pub authority: Uuid,
+    pub operation: Uuid,
+    pub generation: Generation,
+    pub installation_sha256: [u8; 32],
 }
 
 /// Custody for generation keys.
@@ -48,6 +59,23 @@ pub trait Kms: Send + Sync {
     async fn retire(&self, generation: Generation, unreadable_by: i64) -> Result<()>;
     async fn check_readable(&self, generation: Generation) -> Result<()>;
     async fn destroy(&self, generation: Generation) -> Result<()>;
+
+    /// Retains a generation that has never entered retirement.
+    async fn retain_recovery_key(&self, _hold: RecoveryKeyHold) -> Result<()> {
+        Err(recovery_key_hold_unsupported())
+    }
+    /// Reopens the original hold without provisioning or extending custody.
+    async fn require_recovery_key(&self, _hold: RecoveryKeyHold) -> Result<()> {
+        Err(recovery_key_hold_unsupported())
+    }
+    /// Settles exactly this hold after the owning recovery has reached its terminal decision.
+    async fn release_recovery_key(&self, _hold: RecoveryKeyHold) -> Result<()> {
+        Err(recovery_key_hold_unsupported())
+    }
+}
+
+fn recovery_key_hold_unsupported() -> Anomaly {
+    Anomaly::unsupported("rtdb.crypt/recovery-key-hold", "This key provider cannot retain a recovery generation")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

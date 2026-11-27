@@ -439,6 +439,20 @@ contract CellMap {
         -- A retained follower or writer handle acquires only grants for its own incarnation.
 }
 
+contract RecoveryGenerationCustody {
+    -- The generation's key provider orders recovery holds against retirement under the same generation authority.
+    -- A recovery hold binds the activation authority, recovery operation, destination generation and verified installation digest.
+
+    @invariant RecoveryHoldPrecedesRetirement
+        -- The provider admits a hold only on an existing generation with no retirement decision.
+        -- An admitted hold prevents retirement until the exact hold is released.
+        -- The provider reopens the same hold after restart and rejects substitutions.
+
+    @invariant RecoveryHoldReleaseIsTerminal
+        -- Release retains the exact hold identity, including after generation retirement and destruction.
+        -- A released hold cannot be reacquired.
+}
+
 contract Directory {
     -- A cell's linearizable, transactional, sharded key-value store.
     -- Holds deployment records and member records.
