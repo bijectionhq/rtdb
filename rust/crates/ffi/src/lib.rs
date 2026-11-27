@@ -97,8 +97,9 @@ pub unsafe extern "C" fn rtdb_v1_database_flush_all(handle: u64, timeout_nanos: 
         if timeout_nanos <= 0 { return Err(invalid("Flush timeout must be positive")); }
         let database = handles::database(handle)?;
         let _admitted = database.0.enter()?;
-        let node = database.0.server.node();
-        database.0.run(node.flush_all(std::time::Duration::from_nanos(timeout_nanos as u64)))
+        let node = database.0.server.node().clone();
+        let timeout = std::time::Duration::from_nanos(timeout_nanos as u64);
+        database.0.run(move || async move { node.flush_all(timeout).await })
     }) }
 }
 
@@ -108,8 +109,9 @@ pub unsafe extern "C" fn rtdb_v1_database_sync_all(handle: u64, timeout_nanos: i
         if timeout_nanos <= 0 { return Err(invalid("Sync timeout must be positive")); }
         let database = handles::database(handle)?;
         let _admitted = database.0.enter()?;
-        let node = database.0.server.node();
-        database.0.run(node.sync_all(std::time::Duration::from_nanos(timeout_nanos as u64), node.cancellation()))
+        let node = database.0.server.node().clone();
+        let timeout = std::time::Duration::from_nanos(timeout_nanos as u64);
+        database.0.run(move || async move { node.sync_all(timeout, node.cancellation()).await })
     }) }
 }
 
@@ -159,15 +161,20 @@ pub unsafe extern "C" fn rtdb_v1_session_open(database: u64, name: *const u8, na
         let out = output(out)?; *out = 0;
         let database = handles::database(database)?;
         let _admitted = database.0.enter()?;
-        let principal = database.0.run(async {
-            let auth = database.0.server.authenticator();
-            match authentication {
-                0 => auth.unauthenticated(), 1 => auth.authenticate_trusted(text(user, user_length)?),
-                2 => auth.verify_password(text(user, user_length)?, text(secret, secret_length)?).await,
-                3 => auth.verify_client_credentials(text(user, user_length)?, text(secret, secret_length)?).await,
-                _ => Err(invalid("Unknown embedded authentication mode")),
+        let principal = match authentication {
+            0 => { region::blocking_caller()?; database.0.server.authenticator().unauthenticated()? }
+            1 => { region::blocking_caller()?; database.0.server.authenticator().authenticate_trusted(text(user, user_length)?)? }
+            2 | 3 => {
+                let auth = Arc::clone(database.0.server.authenticator());
+                let user = text(user, user_length)?.to_owned();
+                let secret = text(secret, secret_length)?.to_owned();
+                database.0.run(move || async move {
+                    if authentication == 2 { auth.verify_password(&user, &secret).await }
+                    else { auth.verify_client_credentials(&user, &secret).await }
+                })?
             }
-        })?;
+            _ => { region::blocking_caller()?; return Err(invalid("Unknown embedded authentication mode")); }
+        };
         let session = database.0.server.node().session(text(name, name_length)?, principal)?;
         *out = handles::insert(Handle::Session(statement::SessionHandle::new(Arc::clone(&database.0), session)?))?; Ok(())
     }) }
@@ -195,8 +202,9 @@ pub unsafe extern "C" fn rtdb_v1_session_action(handle: u64, operation: u64, act
     unsafe { call(error, || {
         let session = handles::session(handle)?; let _admitted = session.region.enter()?;
         let token = handles::cancellation(operation, &session)?;
-        session.region.run(async {
-            let mut state = session.state.lock();
+        let session_handle = Arc::clone(&session);
+        session.region.run(move || async move {
+            let mut state = session_handle.state.lock().await;
             token.run_until_cancelled(async {
                 state.state().revalidate().await?;
                 match action {
@@ -212,7 +220,7 @@ pub unsafe extern "C" fn rtdb_v1_session_action(handle: u64, operation: u64, act
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rtdb_v1_session_set_catalog(handle: u64, name: *const u8, length: usize, error: *mut u64) -> i32 {
-    unsafe { call(error, || { let session = handles::session(handle)?; let _admitted = session.region.enter()?; session.state.lock().state_mut().set_database(text(name, length)?)?; Ok(()) }) }
+    unsafe { call(error, || { let session = handles::session(handle)?; let _admitted = session.region.enter()?; session.state.blocking_lock().state_mut().set_database(text(name, length)?)?; Ok(()) }) }
 }
 
 #[unsafe(no_mangle)]
@@ -220,7 +228,7 @@ pub unsafe extern "C" fn rtdb_v1_session_set_application_name(handle: u64, name:
     unsafe { call(error, || {
         let session = handles::session(handle)?;
         let _admitted = session.region.enter()?;
-        session.state.lock().state_mut().set_application_name(text(name, length)?)?;
+        session.state.blocking_lock().state_mut().set_application_name(text(name, length)?)?;
         Ok(())
     }) }
 }
@@ -229,7 +237,7 @@ pub unsafe extern "C" fn rtdb_v1_session_await_token(handle: u64, out: *mut u64,
     unsafe { call(error, || {
         let out = output(out)?; *out = 0;
         let session = handles::session(handle)?; let _admitted = session.region.enter()?; session.ensure_open()?;
-        let state = session.state.lock();
+        let state = session.state.blocking_lock();
         if let Some(token) = state.state().effective_await_token() {
             let memory = session.region.memory(); let reservation = memory.reserve(add(token.len(), 256)?)?;
             let value = rtdb_tx::RetainedBytes::with_reservation(token.as_bytes().to_vec(), reservation)?;
@@ -246,10 +254,12 @@ pub unsafe extern "C" fn rtdb_v1_session_set_await_token(handle: u64, operation:
         let cancellation = handles::cancellation(operation, &session)?;
         let token = optional_text(token, length)?;
         let _input = session.region.memory().reserve(add(4096, token.map_or(0, str::len))?)?;
-        session.region.run(async {
-            let mut state = session.state.lock();
+        let token = token.map(str::to_owned);
+        let session_handle = Arc::clone(&session);
+        session.region.run(move || async move {
+            let mut state = session_handle.state.lock().await;
             let _control = state.admit_frontend_prepare(&[], &cancellation).await?;
-            state.state_mut().set_await_token(token.map(str::to_owned))
+            state.state_mut().set_await_token(token)
         })
     }) }
 }
@@ -284,6 +294,23 @@ impl<'a> ReadTime<'a> {
     fn text_len(&self) -> usize {
         match self { Self::Text(value) | Self::TemporalText { text: value, .. } => value.len(), Self::Instant(_) => 0 }
     }
+
+    fn into_owned(self) -> OwnedReadTime {
+        match self {
+            Self::Text(value) => OwnedReadTime::Text(value.to_owned()),
+            Self::Instant(instant) => OwnedReadTime::Instant(instant),
+            Self::TemporalText { text, oid } => OwnedReadTime::TemporalText { text: text.to_owned(), oid },
+        }
+    }
+}
+
+enum OwnedReadTime {
+    Text(String),
+    Instant(rtdb_types::Instant),
+    TemporalText { text: String, oid: u32 },
+}
+
+impl OwnedReadTime {
     fn snapshot(&self, timezone: &str) -> Result<rtdb_types::Timestamp> {
         match self {
             Self::Text(value) => rtdb_expr::parse_timestamp(value, timezone),
@@ -322,15 +349,20 @@ pub unsafe extern "C" fn rtdb_v1_session_set_read_settings(handle: u64, operatio
             snapshot_time.as_ref().map_or(0, ReadTime::text_len), clock_time.as_ref().map_or(0, ReadTime::text_len)]
             .into_iter().try_fold(0, add)?;
         let _input = session.region.memory().reserve(add(4096, mul(bytes, 4)?)?)?;
-        session.region.run(async {
-            let mut state = session.state.lock();
+        let timezone = timezone.map(str::to_owned);
+        let snapshot = snapshot.map(str::to_owned);
+        let snapshot_time = snapshot_time.map(ReadTime::into_owned);
+        let clock_time = clock_time.map(ReadTime::into_owned);
+        let session_handle = Arc::clone(&session);
+        session.region.run(move || async move {
+            let mut state = session_handle.state.lock().await;
             let _control = state.admit_frontend_prepare(&[], &cancellation).await?;
-            let effective_timezone = match timezone {
+            let effective_timezone = match timezone.as_deref() {
                 Some(zone) => rtdb_expr::normalize_timezone(zone)?,
                 None => state.state().effective_timezone().to_owned(),
             };
             let settings = ReadOnlySettings {
-                snapshot_token: snapshot.map(str::to_owned).map_or(OptionUpdate::Unchanged, OptionUpdate::Set),
+                snapshot_token: snapshot.map_or(OptionUpdate::Unchanged, OptionUpdate::Set),
                 snapshot_time: snapshot_time.map(|time| time.snapshot(&effective_timezone)).transpose()?.map_or(OptionUpdate::Unchanged, OptionUpdate::Set),
                 clock_time: clock_time.map(|time| time.clock(&effective_timezone)).transpose()?.map_or(OptionUpdate::Unchanged, OptionUpdate::Set),
                 ..Default::default()
@@ -401,48 +433,59 @@ pub unsafe extern "C" fn rtdb_v1_statement_schema(handle: u64, operation: u64, p
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rtdb_v1_statement_query(handle: u64, operation: u64, out: *mut u64, error: *mut u64) -> i32 {
-    unsafe { call(error, || region::with_query_stack(|| {
+    unsafe { call(error, || {
         let out = output(out)?; *out = 0;
         let statement = handles::statement(handle)?; let _admitted = statement.session.region.enter()?;
         *out = handles::insert(Handle::Cursor(statement.query(&handles::cancellation(operation, &statement.session)?)?))?; Ok(())
-    })) }
+    }) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rtdb_v1_session_query_ra(session: u64, operation: u64, plan: *const u8, plan_length: usize, arguments: *const u8, arguments_length: usize, out: *mut u64, error: *mut u64) -> i32 {
-    unsafe { call(error, || region::with_query_stack(|| {
+    unsafe { call(error, || {
         let out = output(out)?; *out = 0;
         let session = handles::session(session)?;
         let _admitted = session.region.enter()?;
         let operation = handles::cancellation(operation, &session)?;
         let memory = session.region.memory();
-        let _token_storage = memory.reserve(4096)?;
-        let token = operation.child_token();
         let source = text(plan, plan_length)?;
+        let _token_storage = memory.reserve(add(4096, source.len())?)?;
+        let token = operation.child_token();
+        let source = source.to_owned();
         let (arguments, _arguments) = rtdb_pg_codec::decode_transit_msgpack(bytes(arguments, arguments_length)?, memory)?.into_parts();
         let rtdb_types::Value::Struct(arguments) = arguments else { return Err(invalid("Logical relation arguments require a Transit map")); };
-        let cursor = session.region.run(async { session.state.lock().query_ra(source, arguments, &token).await })?;
+        let session_handle = Arc::clone(&session);
+        let query_token = token.clone();
+        let cursor = session.region.run(move || async move {
+            session_handle.state.lock().await.query_ra(&source, arguments, &query_token).await
+        })?;
         *out = handles::insert(Handle::Cursor(statement::CursorHandle::new(Arc::clone(&session.region), cursor, token)?))?;
         Ok(())
-    })) }
+    }) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rtdb_v1_session_query_ra_arrow(session: u64, operation: u64, plan: *const u8, plan_length: usize,
     array: *mut FFI_ArrowArray, schema: *mut FFI_ArrowSchema, out: *mut u64, error: *mut u64,
 ) -> i32 {
-    unsafe { call(error, || region::with_query_stack(|| {
+    unsafe { call(error, || {
         let out = output(out)?; *out = 0;
         let session = handles::session(session)?;
         let _admitted = session.region.enter()?;
         let operation = handles::cancellation(operation, &session)?;
         let memory = session.region.memory();
-        let _token_storage = memory.reserve(4096)?;
-        let token = operation.child_token();
         let source = text(plan, plan_length)?;
+        let _token_storage = memory.reserve(add(4096, source.len())?)?;
+        let token = operation.child_token();
+        let source = source.to_owned();
         let bound = arrow::import_retained_arguments(output(array)?, output(schema)?, memory)?;
-        let cursor = session.region.run(async { session.state.lock().query_ra_arrow(source, &bound.names, &bound.arguments, &token).await })?;
+        let session_handle = Arc::clone(&session);
+        let query_token = token.clone();
+        let (cursor, _bound) = session.region.run(move || async move {
+            let cursor = session_handle.state.lock().await.query_ra_arrow(&source, &bound.names, &bound.arguments, &query_token).await?;
+            Ok((cursor, bound))
+        })?;
         *out = handles::insert(Handle::Cursor(statement::CursorHandle::new(Arc::clone(&session.region), cursor, token)?))?;
         Ok(())
-    })) }
+    }) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rtdb_v1_statement_update(handle: u64, operation: u64, affected: *mut i64, error: *mut u64) -> i32 {

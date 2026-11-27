@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use parking_lot::Mutex;
+use tokio::sync::Mutex;
 use arrow_schema::SchemaRef;
 use rtdb_columnar::{DeclaredBatch, DeclaredSchema, MemoryReservation, OwnedBatch};
 use rtdb_node::{ControlExecutionOptions, ControlFrontend, ControlResult, NativeSession, PreparedSql, ResultSignaturePolicy, control_schema};
@@ -24,10 +24,10 @@ impl SessionHandle {
         let cancellation = session.state().cancellation().clone();
         Ok(Arc::new(Self { region, state: Mutex::new(session), cancellation, _reservation: reservation }))
     }
-    pub fn close(&self) { self.cancellation.cancel(); self.state.lock().state_mut().close(); }
+    pub fn close(&self) { self.cancellation.cancel(); self.state.blocking_lock().state_mut().close(); }
     pub fn ensure_open(&self) -> Result<()> { if self.cancellation.is_cancelled() { Err(super::closed()) } else { Ok(()) } }
 }
-impl Drop for SessionHandle { fn drop(&mut self) { self.close(); } }
+impl Drop for SessionHandle { fn drop(&mut self) { self.cancellation.cancel(); self.state.get_mut().state_mut().close(); } }
 
 const SOURCE_ALLOCATION_OVERHEAD: usize = 256;
 
@@ -47,7 +47,7 @@ pub(crate) struct StatementHandle {
 impl StatementHandle {
     pub fn new(session: Arc<SessionHandle>, source: &str, bulk: bool) -> Result<Arc<Self>> {
         session.ensure_open()?;
-        let connection = session.state.lock();
+        let connection = session.state.blocking_lock();
         let reservation = session.region.memory().reserve(super::add(std::mem::size_of::<Self>() + 1024, connection.state().database().len())?)?;
         let creation_database = connection.state().database().to_owned();
         drop(connection);
@@ -57,7 +57,7 @@ impl StatementHandle {
     }
     pub fn replace_source(&self, text: &str, bulk: bool) -> Result<()> {
         self.session.ensure_open()?;
-        let mut state = self.state.lock();
+        let mut state = self.state.blocking_lock();
         if state.is_none() { return Err(super::closed()); }
         *state = Some(Self::source_state(&self.session, text, bulk)?);
         Ok(())
@@ -89,21 +89,23 @@ impl StatementHandle {
         };
         Ok(StatementState { source, bound: None })
     }
-    pub fn close(&self) { self.state.lock().take(); }
+    pub fn close(&self) { self.state.blocking_lock().take(); }
     pub fn bind(&self, values: BoundArguments) -> Result<()> {
         self.session.ensure_open()?;
-        self.state.lock().as_mut().ok_or_else(super::closed)?.bound = Some(values); Ok(())
+        self.state.blocking_lock().as_mut().ok_or_else(super::closed)?.bound = Some(values); Ok(())
     }
-    pub fn prepare(&self, token: &CancellationToken) -> Result<()> {
+    pub fn prepare(self: &Arc<Self>, token: &CancellationToken) -> Result<()> {
         if token.is_cancelled() { return Err(super::cancelled()); }
-        let mut locked = self.state.lock();
-        let state = locked.as_mut().ok_or_else(super::closed)?;
-        self.session.region.run(async {
-            let mut session = self.session.state.lock();
+        let statement = Arc::clone(self);
+        let token = token.clone();
+        self.session.region.run(move || async move {
+            let mut locked = statement.state.lock().await;
+            let state = locked.as_mut().ok_or_else(super::closed)?;
+            let mut session = statement.session.state.lock().await;
             match &mut state.source {
                 Source::Sql { text, prepared, .. } => {
                     if text.is_empty() { return Err(Anomaly::incorrect("xtdb.adbc/no-sql", "SQL query not set")); }
-                    let context = session.prepare_context_for(&self.creation_database, token).await?;
+                    let context = session.prepare_context_for(&statement.creation_database, &token).await?;
                     *prepared = Some(PreparedSql::prepare(text, &context, Default::default(), ResultSignaturePolicy::Dynamic)?);
                 }
                 Source::Show { prepared, .. } => { session.state().revalidate().await?; *prepared = true; }
@@ -113,18 +115,20 @@ impl StatementHandle {
             Ok(())
         })
     }
-    pub fn schema(&self, parameters: bool, token: &CancellationToken) -> Result<crate::arrow::OwnedSchema> {
+    pub fn schema(self: &Arc<Self>, parameters: bool, token: &CancellationToken) -> Result<crate::arrow::OwnedSchema> {
         self.session.ensure_open()?;
-        let locked = self.state.lock();
-        let state = locked.as_ref().ok_or_else(super::closed)?;
-        self.session.region.run(async {
-            let mut session = self.session.state.lock();
+        let statement = Arc::clone(self);
+        let token = token.clone();
+        self.session.region.run(move || async move {
+            let locked = statement.state.lock().await;
+            let state = locked.as_ref().ok_or_else(super::closed)?;
+            let mut session = statement.session.state.lock().await;
             match &state.source {
                 Source::Sql { prepared, .. } => {
                     let prepared = prepared.as_ref().ok_or_else(not_prepared)?;
-                    if parameters { return crate::arrow::OwnedSchema::parameters(prepared.parameter_count(), self.session.region.memory()); }
-                    if prepared.is_dml() { return crate::arrow::OwnedSchema::empty(self.session.region.memory()); }
-                    let context = session.prepare_context_for(&self.creation_database, token).await?;
+                    if parameters { return crate::arrow::OwnedSchema::parameters(prepared.parameter_count(), statement.session.region.memory()); }
+                    if prepared.is_dml() { return crate::arrow::OwnedSchema::empty(statement.session.region.memory()); }
+                    let context = session.prepare_context_for(&statement.creation_database, &token).await?;
                     let result = {
                         context.check_cancelled()?;
                         let count = prepared.parameter_count();
@@ -132,37 +136,38 @@ impl StatementHandle {
                         let types = vec![LogicalType::Null; count];
                         prepared.result_schema(&context, &types)?
                     };
-                    crate::arrow::OwnedSchema::logical(result.schema(), self.session.region.memory())
+                    crate::arrow::OwnedSchema::logical(result.schema(), statement.session.region.memory())
                 }
                 Source::Show { statement: control, prepared } => {
                     if !*prepared { return Err(not_prepared()); }
-                    if parameters { crate::arrow::OwnedSchema::empty(self.session.region.memory()) } else {
-                        crate::arrow::OwnedSchema::logical(&control_schema(control.statement())?.unwrap_or_default(), self.session.region.memory())
+                    if parameters { crate::arrow::OwnedSchema::empty(statement.session.region.memory()) } else {
+                        crate::arrow::OwnedSchema::logical(&control_schema(control.statement())?.unwrap_or_default(), statement.session.region.memory())
                     }
                 }
-                Source::Set(_) => crate::arrow::OwnedSchema::empty(self.session.region.memory()),
+                Source::Set(_) => crate::arrow::OwnedSchema::empty(statement.session.region.memory()),
                 Source::Bulk { .. } => Err(Anomaly::incorrect("xtdb.adbc/bulk-ingest-no-query", "Bulk ingest does not have a query schema")),
             }
         })
     }
-    pub fn query(&self, token: &CancellationToken) -> Result<Arc<CursorHandle>> {
+    pub fn query(self: &Arc<Self>, token: &CancellationToken) -> Result<Arc<CursorHandle>> {
         let _token_storage = self.session.region.memory().reserve(4096)?;
         let result_token = token.child_token();
-        let token = &result_token;
-        let mut locked = self.state.lock();
-        let state = locked.as_mut().ok_or_else(super::closed)?;
-        let cursor = self.session.region.run(async {
-            let mut session = self.session.state.lock();
+        let statement = Arc::clone(self);
+        let token = result_token.clone();
+        let cursor = self.session.region.run(move || async move {
+            let mut locked = statement.state.lock().await;
+            let state = locked.as_mut().ok_or_else(super::closed)?;
+            let mut session = statement.session.state.lock().await;
             let args = state.bound.as_ref().map(|bound| &bound.arguments);
             match &mut state.source {
                 Source::Sql { text, prepared, .. } => {
                     if text.is_empty() { return Err(Anomaly::incorrect("xtdb.adbc/no-sql", "SQL query not set")); }
                     if prepared.is_none() {
                         if args.is_some() { return Err(Anomaly::incorrect("xtdb.adbc/bind-without-prepare", "Call prepare before executing with bound arguments")); }
-                        let context = session.prepare_context_for(&self.creation_database, token).await?;
+                        let context = session.prepare_context_for(&statement.creation_database, &token).await?;
                         *prepared = Some(PreparedSql::prepare(text, &context, Default::default(), ResultSignaturePolicy::Dynamic)?);
                     }
-                    let context = session.query_context_for(&self.creation_database, token).await?;
+                    let context = session.query_context_for(&statement.creation_database, &token).await?;
                     let prepared = prepared.as_ref().ok_or_else(not_prepared)?;
                     check_argument_row_count(args)?;
                     if let Some(args) = args
@@ -170,13 +175,13 @@ impl StatementHandle {
                         && let Some(cursor) = prepared.try_open_query_arrow(Arc::clone(&context), page, args.types()).await? {
                         return Ok(cursor);
                     }
-                    let values = argument_row(args, self.session.region.memory())?;
+                    let values = argument_row(args, statement.session.region.memory())?;
                     prepared.open_query_columns_typed(context, values.0, args.map(SqlArguments::types).unwrap_or_default()).await
                 }
                 Source::Show { statement: control, prepared } => {
                     if !*prepared && args.is_some() { return Err(Anomaly::incorrect("xtdb.adbc/bind-without-prepare", "Call prepare before executing with bound arguments")); }
                     *prepared = true;
-                    match session.execute_control_arrow_with(control.statement(), None, token, ControlExecutionOptions { frontend: ControlFrontend::Adbc, implicit_transaction: false }).await? {
+                    match session.execute_control_arrow_with(control.statement(), None, &token, ControlExecutionOptions { frontend: ControlFrontend::Adbc, implicit_transaction: false }).await? {
                         ControlResult::Rows(cursor) => Ok(cursor),
                         _ => Err(Anomaly::incorrect("xtdb/not-a-query", "Statement does not produce rows")),
                     }
@@ -187,17 +192,19 @@ impl StatementHandle {
         })?;
         CursorHandle::new(Arc::clone(&self.session.region), cursor, result_token)
     }
-    pub fn update(&self, token: &CancellationToken) -> Result<i64> {
-        let mut locked = self.state.lock();
-        let state = locked.as_mut().ok_or_else(super::closed)?;
-        self.session.region.run(async {
-            let mut session = self.session.state.lock();
+    pub fn update(self: &Arc<Self>, token: &CancellationToken) -> Result<i64> {
+        let statement = Arc::clone(self);
+        let token = token.clone();
+        self.session.region.run(move || async move {
+            let mut locked = statement.state.lock().await;
+            let state = locked.as_mut().ok_or_else(super::closed)?;
+            let mut session = statement.session.state.lock().await;
             session.state().revalidate().await?;
             match &mut state.source {
                 Source::Sql { text, prepared, .. } => {
                     if text.is_empty() { return Err(Anomaly::incorrect("xtdb.adbc/no-sql", "SQL query not set")); }
                     if prepared.is_none() {
-                        let context = session.prepare_context_for(&self.creation_database, token).await?;
+                        let context = session.prepare_context_for(&statement.creation_database, &token).await?;
                         *prepared = Some(PreparedSql::prepare(text, &context, Default::default(), ResultSignaturePolicy::Dynamic)?);
                     }
                     let operation = prepared.as_ref().ok_or_else(not_prepared)?.dml_operation(state.bound.as_ref().map(|bound| bound.arguments.clone()))?;
@@ -207,14 +214,14 @@ impl StatementHandle {
                 Source::Set(control) => {
                     let args = state.bound.as_ref().map(|bound| &bound.arguments);
                     check_argument_row_count(args)?;
-                    let memory = self.session.region.memory();
+                    let memory = statement.session.region.memory();
                     let options = ControlExecutionOptions { frontend: ControlFrontend::Adbc, implicit_transaction: false };
                     let result = if let Some(args) = args && let Some(page) = args.first_arrow_page() {
                         let parameters = BoundParameters::from_arrow(page.clone(), 0, args.execution_types().collect(), memory)?;
-                        session.execute_control_arrow_with(control.statement(), Some(&parameters), token, options).await?
+                        session.execute_control_arrow_with(control.statement(), Some(&parameters), &token, options).await?
                     } else {
                         let (values, _reservation) = argument_row(args, memory)?;
-                        session.execute_control_with(control.statement(), &values, token, options).await?
+                        session.execute_control_with(control.statement(), &values, &token, options).await?
                     };
                     match result {
                         ControlResult::Command { .. } => Ok(-1), _ => Err(Anomaly::incorrect("xtdb.adbc/not-an-update", "Statement is not an update")),
@@ -224,7 +231,7 @@ impl StatementHandle {
                 Source::Bulk { table, .. } => {
                     let Some(bound) = state.bound.take() else { return Ok(0); };
                     let count = i64::try_from(bound.arguments.row_count()).map_err(|_| super::invalid("Bulk row count exceeds i64"))?;
-                    match bound.arguments.ingest_named_documents(&bound.names, self.session.region.memory()) {
+                    match bound.arguments.ingest_named_documents(&bound.names, statement.session.region.memory()) {
                         Ok(Some(documents)) => {
                             let operation = TxOp::PutArrowDocs { table: table.clone(), documents };
                             token.run_until_cancelled(session.state_mut().execute_operation(operation)).await.ok_or_else(super::cancelled)??;
@@ -239,14 +246,14 @@ impl StatementHandle {
                             super::add(bytes, super::add(super::add(value.retained_bytes()?, name.len())?, node)?)
                         })
                     })?;
-                    let _scratch = self.session.region.memory().reserve(super::mul(bytes, 2)?)?;
+                    let _scratch = statement.session.region.memory().reserve(super::mul(bytes, 2)?)?;
                     let rows = bound.arguments.rows().map(|row| {
                         bound.names.iter().cloned().zip(row?.iter().cloned()).map(|(name, mut value)| {
                             rtdb_columnar::admit_execution_value(&mut value)?;
                             Ok((name, value))
                         }).collect::<Result<StructFields<_>>>()
                     }).collect::<Result<_>>()?;
-                    let operation = TxOp::PutDocs { table: table.clone(), documents: Documents::new(rows, self.session.region.memory())?, valid_from: None, valid_to: None };
+                    let operation = TxOp::PutDocs { table: table.clone(), documents: Documents::new(rows, statement.session.region.memory())?, valid_from: None, valid_to: None };
                     token.run_until_cancelled(session.state_mut().execute_operation(operation)).await.ok_or_else(super::cancelled)??;
                     Ok(count)
                 }
@@ -292,18 +299,29 @@ impl CursorHandle {
         Ok(Arc::new(Self { region, token: token.child_token(), schema, state: Mutex::new(Some(CursorInput::Batch(batch))) }))
     }
     pub fn schema(&self) -> &SchemaRef { self.schema.schema() }
-    pub fn next(&self) -> Result<Option<DeclaredBatch>> {
-        let mut state = self.state.lock();
-        if self.token.is_cancelled() { state.take(); return Err(super::cancelled()); }
-        if matches!(state.as_ref(), Some(CursorInput::Batch(_))) {
-            let Some(CursorInput::Batch(batch)) = state.take() else { unreachable!() }; return self.schema.conform(batch, self.region.memory()).map(Some);
-        }
-        let Some(CursorInput::Query(cursor)) = state.as_mut() else { return Ok(None); };
-        let result = self.region.run(cursor.next_batch()).and_then(|batch| batch.map(|batch| self.schema.conform(batch, self.region.memory()).inspect_err(|_| cursor.record_consumer_error())).transpose());
-        if !matches!(&result, Ok(Some(_))) { state.take(); }
-        result
+    pub fn next(self: &Arc<Self>) -> Result<Option<DeclaredBatch>> {
+        let cursor_handle = Arc::clone(self);
+        self.region.run(move || async move {
+            let mut state = cursor_handle.state.lock().await;
+            if cursor_handle.token.is_cancelled() { state.take(); return Err(super::cancelled()); }
+            if matches!(state.as_ref(), Some(CursorInput::Batch(_))) {
+                let Some(CursorInput::Batch(batch)) = state.take() else { unreachable!() };
+                return cursor_handle.schema.conform(batch, cursor_handle.region.memory()).map(Some);
+            }
+            let Some(CursorInput::Query(cursor)) = state.as_mut() else { return Ok(None); };
+            let result = cursor.next_batch().await.and_then(|batch| {
+                batch.map(|batch| cursor_handle.schema.conform(batch, cursor_handle.region.memory()).inspect_err(|_| cursor.record_consumer_error())).transpose()
+            });
+            if !matches!(&result, Ok(Some(_))) { state.take(); }
+            result
+        })
     }
-    pub fn consumer_error(&self) { if let Some(CursorInput::Query(cursor)) = self.state.lock().as_ref() { cursor.record_consumer_error(); } }
-    pub fn close(&self) { self.token.cancel(); if let Some(CursorInput::Query(mut cursor)) = self.state.lock().take() { cursor.cancel(); } }
+    pub fn consumer_error(&self) { if let Some(CursorInput::Query(cursor)) = self.state.blocking_lock().as_ref() { cursor.record_consumer_error(); } }
+    pub fn close(&self) { self.token.cancel(); if let Some(CursorInput::Query(mut cursor)) = self.state.blocking_lock().take() { cursor.cancel(); } }
 }
-impl Drop for CursorHandle { fn drop(&mut self) { self.close(); } }
+impl Drop for CursorHandle {
+    fn drop(&mut self) {
+        self.token.cancel();
+        if let Some(CursorInput::Query(mut cursor)) = self.state.get_mut().take() { cursor.cancel(); }
+    }
+}

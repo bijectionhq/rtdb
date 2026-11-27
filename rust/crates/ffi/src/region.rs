@@ -27,17 +27,18 @@ impl EmbeddedRegion {
         let (configuration, memory, configuration_charge) = parsed.into_execution(memory_bytes)?;
         drop(bootstrap);
         let runtime = tokio::runtime::Builder::new_multi_thread().thread_stack_size(rtdb_node::WORKER_STACK_BYTES).enable_all().build().map_err(|error| Anomaly::fault("rtdb.ffi/runtime", error.to_string()))?;
-        let (server, driver) = runtime.block_on(async {
+        let configuration = Box::new(configuration);
+        let (server, driver) = Self::run_on(&runtime, move || async move {
             match transaction_clock {
-                Some(clock) => ServerDriver::open_with_log_clock(configuration, memory_bytes, memory, clock).await,
-                None => ServerDriver::open_with_memory(configuration, memory_bytes, memory).await,
+                Some(clock) => ServerDriver::open_with_log_clock(*configuration, memory_bytes, memory, clock).await,
+                None => ServerDriver::open_with_memory(*configuration, memory_bytes, memory).await,
             }
         })?;
         let reservation = match server.node().memory().reserve(std::mem::size_of::<Self>() + 8192) {
             Ok(reservation) => reservation,
-            Err(error) => { server.shutdown(); let _ = runtime.block_on(driver.run()); return Err(error); }
+            Err(error) => { server.shutdown(); let _ = Self::run_on(&runtime, move || driver.run()); return Err(error); }
         };
-        let driver = runtime.spawn(driver.run());
+        let driver = runtime.spawn(async move { Box::pin(driver.run()).await });
         Ok(Arc::new(Self { server, runtime, driver: Mutex::new(Some(driver)), admission: Admission { closing: AtomicBool::new(false), calls: RwLock::new(()) }, _reservation: reservation, _configuration: configuration_charge }))
     }
     pub fn memory(&self) -> &Arc<MemoryBudget> { self.server.node().memory() }
@@ -46,9 +47,29 @@ impl EmbeddedRegion {
         if self.admission.closing.load(Ordering::Acquire) { return Err(super::closed()); }
         Ok(guard)
     }
-    pub fn run<T>(&self, work: impl Future<Output = Result<T>>) -> Result<T> {
+    /// Runs an async operation on a Tokio worker thread (`rtdb_node::WORKER_STACK_BYTES`
+    /// stack) so large debug futures and deep planner/query recursion never overflow a
+    /// host thread's smaller stack or run JNI/FFM callbacks on a switched `stacker` stack.
+    pub fn run<F, Fut, T>(&self, work: F) -> Result<T>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T>> + Send + 'static,
+        T: Send + 'static,
+    {
+        Self::run_on(&self.runtime, work)
+    }
+    fn run_on<F, Fut, T>(runtime: &Runtime, work: F) -> Result<T>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T>> + Send + 'static,
+        T: Send + 'static,
+    {
         blocking_caller()?;
-        self.runtime.block_on(work)
+        let task = runtime.spawn(async move { Box::pin(work()).await });
+        runtime.block_on(task).map_err(|error| {
+            if error.is_panic() { Anomaly::fault("rtdb.ffi/panic", "A native call panicked") }
+            else { Anomaly::fault("rtdb.ffi/task", error.to_string()) }
+        })?
     }
     pub fn close(&self) -> Result<()> {
         blocking_caller()?;
@@ -57,21 +78,16 @@ impl EmbeddedRegion {
         self.server.node().shutdown();
         let _drained = self.admission.calls.write();
         if let Some(driver) = self.driver.lock().take() {
-            self.run(async { driver.await.map_err(|error| Anomaly::fault("rtdb.ffi/driver", error.to_string()))? })?;
+            self.run(move || async move { driver.await.map_err(|error| Anomaly::fault("rtdb.ffi/driver", error.to_string()))? })?;
         }
         Ok(())
     }
 }
 impl Drop for EmbeddedRegion { fn drop(&mut self) { let _ = self.close(); } }
 
-pub(crate) fn with_query_stack<T>(query: impl FnOnce() -> T) -> T {
-    // The host may have used most of its thread stack before the native planner starts.
-    stacker::maybe_grow(2 << 20, rtdb_node::WORKER_STACK_BYTES, query)
-}
-
 pub(crate) struct DatabaseHandle(pub Arc<EmbeddedRegion>);
 impl Drop for DatabaseHandle { fn drop(&mut self) { let _ = self.0.close(); } }
-fn blocking_caller() -> Result<()> {
+pub(crate) fn blocking_caller() -> Result<()> {
     if tokio::runtime::Handle::try_current().is_ok() { return Err(super::invalid("Blocking FFI calls must originate outside a Tokio runtime")); }
     Ok(())
 }

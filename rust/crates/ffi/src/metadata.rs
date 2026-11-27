@@ -21,9 +21,11 @@ pub(crate) struct Request {
 }
 pub(crate) fn open(session: &Arc<SessionHandle>, token: CancellationToken, request: Request) -> Result<Arc<CursorHandle>> {
     if token.is_cancelled() { return Err(crate::cancelled()); }
-    let region = &session.region;
-    let batch = region.run(async {
-        let mut session_state = session.state.lock();
+    let region = Arc::clone(&session.region);
+    let session_handle = Arc::clone(session);
+    let query_token = token.clone();
+    let batch = session.region.run(move || async move {
+        let mut session_state = session_handle.state.lock().await;
         session_state.state().revalidate().await?;
         let _fixed = region.memory().reserve(131_072)?;
         match request.kind {
@@ -39,7 +41,7 @@ pub(crate) fn open(session: &Arc<SessionHandle>, token: CancellationToken, reque
                 OwnedBatch::with_reservation(batch, reservation)
             }
             2 | 3 => {
-                let context = session_state.query_context_with(&token, false).await?;
+                let context = session_state.query_context_with(&query_token, false).await?;
                 if request.kind == 3 {
                     let database = request.catalog.as_deref().unwrap_or_else(|| session_state.state().database());
                     if context.catalog.database(database).is_err() { return empty(Schema::empty(), region.memory()); }
@@ -112,7 +114,7 @@ pub(crate) fn open(session: &Arc<SessionHandle>, token: CancellationToken, reque
             _ => Err(crate::invalid("Unknown metadata request kind")),
         }
     })?;
-    CursorHandle::from_batch(Arc::clone(region), batch, token)
+    CursorHandle::from_batch(Arc::clone(&session.region), batch, token)
 }
 
 fn matches_pattern(value: &str, pattern: Option<&str>, context: &rtdb_query::QueryContext) -> Result<bool> {

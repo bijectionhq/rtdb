@@ -66,8 +66,10 @@ pub(crate) fn transaction(session: &Arc<SessionHandle>, token: &CancellationToke
     let operations = list(request.remove("operations").ok_or_else(|| crate::invalid("operations is required"))?)?;
     let operations = operations.into_values().into_iter().filter_map(|operation| operation_value(operation, memory).transpose()).collect::<Result<Vec<_>>>()?;
     if !request.is_empty() { return Err(crate::invalid("Unknown transaction request field")); }
-    session.region.run(async {
-        let mut state = session.state.lock();
+    let session_handle = Arc::clone(session);
+    let token = token.clone();
+    session.region.run(move || async move {
+        let mut state = session_handle.state.lock().await;
         let options = AutonomousTxOptions { database, default_timezone: timezone, system_time, user_metadata };
         token.run_until_cancelled(async {
             let mut values = StructFields::new();

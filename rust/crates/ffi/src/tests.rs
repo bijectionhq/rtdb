@@ -222,10 +222,15 @@ fn statement_captures_creation_catalog_for_prepare_schema_and_reexecution() {
     let deferred = native.statement("SELECT label FROM docs");
     let deferred = handles::statement(deferred).unwrap();
     let dml = native.statement("INSERT INTO docs (_id, label) VALUES (3, 'third')");
-    session.region.run(async {
-        session.state.lock().execute_control(&rtdb_plan::ControlStatement::AttachDatabase { name: "other".into(), configuration_yaml: None, source: "ATTACH DATABASE other".into() }, &[], &token).await?;
-        session.state.lock().state_mut().set_database("other")
-    }).unwrap();
+    {
+        let session_handle = Arc::clone(&session);
+        let token = token.clone();
+        session.region.run(move || async move {
+            let mut state = session_handle.state.lock().await;
+            state.execute_control(&rtdb_plan::ControlStatement::AttachDatabase { name: "other".into(), configuration_yaml: None, source: "ATTACH DATABASE other".into() }, &[], &token).await?;
+            state.state_mut().set_database("other")
+        }).unwrap();
+    }
     let insert = native.statement("INSERT INTO docs (_id, label) VALUES (2, 'second')");
     handles::statement(insert).unwrap().update(&token).unwrap();
     handles::statement(dml).unwrap().update(&token).unwrap();
@@ -247,7 +252,7 @@ fn statement_captures_creation_catalog_for_prepare_schema_and_reexecution() {
     assert_eq!(rtdb_columnar::read_value(batch.batch().schema().field(0), batch.batch().column(0).as_ref(), 0).unwrap(), rtdb_types::Value::Utf8("first".into()));
     let current = native.statement("SELECT label FROM docs");
     assert_eq!(handles::statement(current).unwrap().query(&token).unwrap().next().unwrap().unwrap().batch().num_rows(), 2);
-    assert_eq!(session.state.lock().state().database(), "other");
+    assert_eq!(session.state.blocking_lock().state().database(), "other");
 }
 
 #[test]
@@ -257,7 +262,7 @@ fn adbc_session_show_survives_failed_transaction_while_queries_and_pgwire_show_r
     let session = handles::session(native.session).unwrap();
     let token = handles::cancellation(operation, &session).unwrap();
     {
-        let mut connection = session.state.lock();
+        let mut connection = session.state.blocking_lock();
         connection.state_mut().set_parameter("application_name", Some("inspectable".into())).unwrap();
         connection.state_mut().begin().unwrap();
         connection.state_mut().fail_transaction();
@@ -271,11 +276,15 @@ fn adbc_session_show_survives_failed_transaction_while_queries_and_pgwire_show_r
         let statement = native.statement(sql);
         assert_eq!(handles::statement(statement).unwrap().query(&token).err().unwrap().code, "xtdb/tx-failed");
     }
-    let error = session.region.run(async {
-        session.state.lock().execute_control_with(&rtdb_plan::ControlStatement::Show { name: "application_name".into() }, &[], &token, rtdb_node::ControlExecutionOptions { frontend: rtdb_node::ControlFrontend::PostgreSql, implicit_transaction: false }).await.map(|_| ())
-    }).unwrap_err();
+    let error = {
+        let session_handle = Arc::clone(&session);
+        let token = token.clone();
+        session.region.run(move || async move {
+            session_handle.state.lock().await.execute_control_with(&rtdb_plan::ControlStatement::Show { name: "application_name".into() }, &[], &token, rtdb_node::ControlExecutionOptions { frontend: rtdb_node::ControlFrontend::PostgreSql, implicit_transaction: false }).await.map(|_| ())
+        })
+    }.unwrap_err();
     assert_eq!(error.code, "xtdb/tx-failed");
-    assert_eq!(session.state.lock().state().status(), rtdb_node::TransactionStatus::Failed);
+    assert_eq!(session.state.blocking_lock().state().status(), rtdb_node::TransactionStatus::Failed);
 }
 
 #[test]
@@ -763,7 +772,7 @@ fn adbc_set_query_rejection_has_no_side_effect_and_show_schema_requires_prepare(
     let set = native.statement("SET application_name = 'changed'");
     let set = handles::statement(set).unwrap();
     assert!(matches!(set.query(&token), Err(error) if error.code == "xtdb/not-a-query"));
-    assert_eq!(session.state.lock().state().parameter("application_name"), None);
+    assert_eq!(session.state.blocking_lock().state().parameter("application_name"), None);
     assert!(set.schema(true, &token).unwrap().schema.fields().is_empty());
     let show = native.statement("SHOW application_name");
     let show = handles::statement(show).unwrap();
@@ -902,10 +911,14 @@ fn adbc_prepared_schemas_admit_positional_fields_and_unknown_binding_types() {
     assert_eq!(native.memory_used(), baseline);
 
     let token = handles::cancellation(operation, &session).unwrap();
-    let context = session.region.run(async {
-        let mut connection = session.state.lock();
-        connection.prepare_context_for("xtdb", &token).await
-    }).unwrap();
+    let context = {
+        let session_handle = Arc::clone(&session);
+        let token = token.clone();
+        session.region.run(move || async move {
+            let mut connection = session_handle.state.lock().await;
+            connection.prepare_context_for("xtdb", &token).await
+        })
+    }.unwrap();
     let context_bytes = native.memory_used() - baseline;
     assert!(context_bytes > 0);
     drop(context);
@@ -1027,12 +1040,15 @@ fn adbc_statement_replacement_keeps_the_previous_lease_during_admission() {
 fn show_latest_submitted_after_async_submit_does_not_await_a_future_token() {
     let mut native = Native::open();
     let session = handles::session(native.session).unwrap();
-    session.region.run(async {
-        let mut session = session.state.lock();
-        session.state_mut().submit_tx(vec![rtdb_tx::TxOp::Sql { sql: "INSERT INTO docs (_id) VALUES (1)".into(), args: None }], Default::default()).await?;
-        let future = rtdb_format::basis::encode_tx_basis(&rtdb_types::TxBasis { databases: std::collections::BTreeMap::from([("xtdb".into(), vec![rtdb_types::TxId(i64::MAX)])]) });
-        session.state_mut().set_await_token(Some(future))
-    }).unwrap();
+    {
+        let session_handle = Arc::clone(&session);
+        session.region.run(move || async move {
+            let mut session = session_handle.state.lock().await;
+            session.state_mut().submit_tx(vec![rtdb_tx::TxOp::Sql { sql: "INSERT INTO docs (_id) VALUES (1)".into(), args: None }], Default::default()).await?;
+            let future = rtdb_format::basis::encode_tx_basis(&rtdb_types::TxBasis { databases: std::collections::BTreeMap::from([("xtdb".into(), vec![rtdb_types::TxId(i64::MAX)])]) });
+            session.state_mut().set_await_token(Some(future))
+        }).unwrap();
+    }
     let statement = native.statement("SHOW latest_submitted_tx");
     let statement = handles::statement(statement).unwrap();
     let operation = native.operation();
@@ -1054,7 +1070,7 @@ fn concurrent_close_cancels_admitted_work_before_joining() {
         let _admitted = waiting.enter().unwrap();
         let token = waiting.server.node().cancellation().child_token();
         entered.wait();
-        waiting.run(async { token.cancelled().await; Ok(()) }).unwrap();
+        waiting.run(move || async move { token.cancelled().await; Ok(()) }).unwrap();
     });
     barrier.wait(); region.close().unwrap(); thread.join().unwrap(); assert!(region.enter().is_err());
 }
@@ -1253,7 +1269,7 @@ fn jvm_read_settings_set_the_transaction_basis_and_await_token_directly() {
     let mut error = 0;
     ok(unsafe { rtdb_v1_session_set_await_token(native.session, operation, token.as_ptr(), token.len(), &mut error) }, error);
     let session = handles::session(native.session).unwrap();
-    assert_eq!(session.state.lock().state().effective_await_token(), Some(token.as_str()));
+    assert_eq!(session.state.blocking_lock().state().effective_await_token(), Some(token.as_str()));
     ok(unsafe { rtdb_v1_session_action(native.session, operation, 2, &mut error) }, error);
     let zone = b"Europe/Paris";
     let snapshot = b"2025-01-01T12:03:04.123456789";
@@ -1261,13 +1277,16 @@ fn jvm_read_settings_set_the_transaction_basis_and_await_token_directly() {
     let clock = RtdbReadTime { text: RtdbSlice { data: std::ptr::null(), length: 0 }, seconds: -1, nanos: 999_999_999, kind: 2 };
     ok(unsafe { rtdb_v1_session_set_read_settings(native.session, operation, zone.as_ptr(), zone.len(), std::ptr::null(), 0,
         &snapshot, &clock, &mut error) }, error);
-    let basis = session.region.run(async { session.state.lock().state_mut().read_basis().await }).unwrap();
+    let basis = {
+        let session_handle = Arc::clone(&session);
+        session.region.run(move || async move { session_handle.state.lock().await.state_mut().read_basis().await })
+    }.unwrap();
     assert_eq!(basis.timezone, "Europe/Paris");
     assert_eq!(basis.current_time, rtdb_types::Instant::new(-1, 999_999_999).unwrap());
     assert_eq!(basis.snapshot_time, Some(Timestamp(1_735_729_384_123_456)));
     ok(unsafe { rtdb_v1_session_action(native.session, operation, 7, &mut error) }, error);
     ok(unsafe { rtdb_v1_session_set_await_token(native.session, operation, std::ptr::null(), 0, &mut error) }, error);
-    assert!(session.state.lock().state().effective_await_token().is_none());
+    assert!(session.state.blocking_lock().state().effective_await_token().is_none());
 }
 
 #[test]
@@ -1310,4 +1329,111 @@ fn jvm_adbc_metadata_distinguishes_null_and_empty_nested_lists() {
             assert!(columns.column(2).is_null(0));
         }
     }
+}
+
+#[test]
+fn embedded_ffi_calls_succeed_from_a_constrained_host_thread_stack() {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use rtdb_format::transit::{TransitValue as T, encode_msgpack};
+
+    unsafe extern "C" fn host_clock(context: usize, seconds: *mut i64, nanos: *mut u32) -> i32 {
+        let counter = unsafe { &*(context as *const AtomicI64) };
+        let step = counter.fetch_add(1, Ordering::Relaxed);
+        unsafe {
+            *seconds = 1_700_000_000 + step;
+            *nanos = 0;
+        }
+        0
+    }
+
+    std::thread::Builder::new()
+        .name("small-host-stack".into())
+        .stack_size(512 * 1024)
+        .spawn(|| {
+            let ticks = AtomicI64::new(0);
+            let yaml = b"server: null\nflightSql: null\nnodeId: ffi-small-stack\n";
+            let props = b"{}";
+            let (mut database, mut session, mut operation, mut error) = (0, 0, 0, 0);
+            ok(unsafe {
+                rtdb_v1_database_open_with_log_clock(
+                    yaml.as_ptr(), yaml.len(), 256 * 1024 * 1024,
+                    props.as_ptr(), props.len(),
+                    Some(host_clock), (&ticks as *const AtomicI64) as usize,
+                    &mut database, &mut error,
+                )
+            }, error);
+            ok(unsafe {
+                rtdb_v1_session_open(database, b"xtdb".as_ptr(), 4, 0, std::ptr::null(), 0, std::ptr::null(), 0, &mut session, &mut error)
+            }, error);
+            ok(unsafe { rtdb_v1_operation_new(session, &mut operation, &mut error) }, error);
+
+            let tx = T::Map(vec![(
+                T::String("operations".into()),
+                T::Array(vec![T::Map(vec![
+                    (T::String("op".into()), T::String("put-docs".into())),
+                    (T::String("table".into()), T::String("docs".into())),
+                    (T::String("documents".into()), T::Array(vec![T::Map(vec![
+                        (T::String("_id".into()), T::Integer(1)),
+                        (T::String("v".into()), T::String("ok".into())),
+                    ])])),
+                ])]),
+            )]);
+            let payload = encode_msgpack(&tx).unwrap();
+            let mut tx_bytes = 0;
+            ok(unsafe { rtdb_v1_session_transact(session, operation, payload.as_ptr(), payload.len(), &mut tx_bytes, &mut error) }, error);
+            ok(unsafe { rtdb_v1_release(tx_bytes, &mut error) }, error);
+            assert!(ticks.load(Ordering::Relaxed) > 0);
+
+            let sql = b"SELECT _id, v FROM docs";
+            let (mut statement, mut cursor, mut row_bytes) = (0, 0, 0);
+            let mut view = RtdbSlice { data: std::ptr::null(), length: 0 };
+            ok(unsafe { rtdb_v1_statement_new(session, sql.as_ptr(), sql.len(), 0, &mut statement, &mut error) }, error);
+            ok(unsafe { rtdb_v1_statement_prepare(statement, operation, &mut error) }, error);
+            ok(unsafe { rtdb_v1_statement_query(statement, operation, &mut cursor, &mut error) }, error);
+            ok(unsafe { rtdb_v1_cursor_next_row_bytes(cursor, &mut view, &mut row_bytes, &mut error) }, error);
+            assert_ne!(row_bytes, 0);
+            assert_eq!(unsafe { bytes(view.data, view.length) }.unwrap(), br#"[["~#rtdb/struct",["^ ","_id",1,"v","ok"]]]"#);
+            ok(unsafe { rtdb_v1_release(row_bytes, &mut error) }, error);
+            ok(unsafe { rtdb_v1_close(cursor, &mut error) }, error);
+            ok(unsafe { rtdb_v1_release(cursor, &mut error) }, error);
+            ok(unsafe { rtdb_v1_close(statement, &mut error) }, error);
+            ok(unsafe { rtdb_v1_release(statement, &mut error) }, error);
+
+            let memory = Arc::clone(handles::database(database).unwrap().0.memory());
+            let batch = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("parameter", DataType::Int64, false)])),
+                vec![Arc::new(Int64Array::from(vec![7]))],
+            ).unwrap();
+            let (mut input, mut schema) = arrow::export_batch(OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap();
+            let plan = b"[:project {:projections [{v ?parameter}]} [:literal-pages {:pages [[{:a 1}]]}]]";
+            let mut ra_cursor = 0;
+            ok(unsafe {
+                rtdb_v1_session_query_ra_arrow(session, operation, plan.as_ptr(), plan.len(), &mut input, &mut schema, &mut ra_cursor, &mut error)
+            }, error);
+            assert!(input.release.is_none() && schema.release.is_none());
+            let mut ra_schema = FFI_ArrowSchema::empty();
+            ok(unsafe { rtdb_v1_cursor_schema(ra_cursor, &mut ra_schema, &mut error) }, error);
+            let mut ra_array = FFI_ArrowArray::empty();
+            let mut present = 0;
+            ok(unsafe { rtdb_v1_cursor_next_array(ra_cursor, &mut ra_array, &mut present, &mut error) }, error);
+            assert_eq!(present, 1);
+            let rows = StructArray::from(unsafe { from_ffi(ra_array, &ra_schema) }.unwrap());
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows.column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0), 7);
+            drop(rows);
+            drop(ra_schema);
+            ok(unsafe { rtdb_v1_close(ra_cursor, &mut error) }, error);
+            ok(unsafe { rtdb_v1_release(ra_cursor, &mut error) }, error);
+
+            ok(unsafe { rtdb_v1_database_flush_all(database, 5_000_000_000, &mut error) }, error);
+            ok(unsafe { rtdb_v1_database_sync_all(database, 5_000_000_000, &mut error) }, error);
+            ok(unsafe { rtdb_v1_release(operation, &mut error) }, error);
+            ok(unsafe { rtdb_v1_close(session, &mut error) }, error);
+            ok(unsafe { rtdb_v1_release(session, &mut error) }, error);
+            ok(unsafe { rtdb_v1_close(database, &mut error) }, error);
+            ok(unsafe { rtdb_v1_release(database, &mut error) }, error);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }
