@@ -1676,6 +1676,24 @@ enum NumericCell {
 }
 
 impl NumericCell {
+    fn read_decimal_f32(cell: ArrowCell<'_>) -> Result<Self> {
+        use std::io::Write;
+
+        let (parameters, mut coefficient) = cell.decimal_coefficient()?.ok_or_else(sum_state)?;
+        let start = coefficient.len() - usize::from(parameters.bit_width / 8);
+        let sign = if coefficient[start] & 0x80 == 0 { 0 } else { 0xff };
+        coefficient[..start].fill(sign);
+        // The spelling fits 77 coefficient digits, punctuation, and a signed scale exponent.
+        const TEXT_CAPACITY: usize = 96;
+        let mut text = [0; TEXT_CAPACITY];
+        let mut tail = text.as_mut_slice();
+        write!(tail, "{}", rtdb_types::jvm_number::decimal_coefficient_display(coefficient, parameters.scale))
+            .map_err(|_| sum_state())?;
+        let len = TEXT_CAPACITY - tail.len();
+        let decimal = std::str::from_utf8(&text[..len]).map_err(|_| sum_state())?;
+        Ok(Self::Float32(decimal.parse().map_err(|_| sum_state())?))
+    }
+
     fn read_number_arrow(cell: ArrowCell<'_>) -> Result<Self> {
         if decimal_storage(cell.field.data_type()) {
             return Ok(Self::Float64(rtdb_columnar::decimal_cell_as_f64(cell.field, cell.array, cell.row)?));
@@ -1890,8 +1908,9 @@ impl ScalarGroups {
         let input = without_nullability(summer.input);
         let numeric = matches!(summer.output, LogicalType::Scalar(ScalarType::I32 | ScalarType::I64 | ScalarType::F32 | ScalarType::F64))
             .then(|| NumericColumn::bind(source?, None)).flatten();
-        let double = source.filter(|column| {
-            numeric.is_none() && summer.output == &LogicalType::Scalar(ScalarType::F64)
+        let float32 = summer.output == &LogicalType::Scalar(ScalarType::F32);
+        let floating = source.filter(|column| {
+            numeric.is_none() && (float32 || summer.output == &LogicalType::Scalar(ScalarType::F64))
                 && admits_reduction_column(column, |field, logical| {
                     NumericColumn::admits_leaf(field, logical, None) || decimal_leaf(field, logical)
                 })
@@ -1917,9 +1936,14 @@ impl ScalarGroups {
                 }
                 continue;
             }
-            if let Some(column) = double {
+            if let Some(column) = floating {
                 if let Some(cell) = present_column_position(column, index)? {
-                    state.add_numeric(NumericCell::read_number_arrow(cell)?, summer.output)?;
+                    let value = if float32 && decimal_storage(cell.field.data_type()) {
+                        NumericCell::read_decimal_f32(cell)?
+                    } else {
+                        NumericCell::read_number_arrow(cell)?
+                    };
+                    state.add_numeric(value, summer.output)?;
                 }
                 continue;
             }

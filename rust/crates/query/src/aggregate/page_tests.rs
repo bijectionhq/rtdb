@@ -1289,6 +1289,54 @@ fn decimal_average_reads_the_annotated_scale_before_rounding_to_double() {
     assert_eq!(states.values[0].average_double().unwrap().to_bits(), expected.to_bits());
 }
 
+#[test]
+fn decimal_sum_to_f32_rounds_once_at_the_logical_scale() {
+    use arrow_buffer::i256;
+    let execution = execution(8);
+    let memory = &execution.context.memory;
+    let baseline = memory.used_bytes();
+    let midpoint = (1i128 << 54) + (1i128 << 30);
+    let negative = i256::from_i128(-midpoint - 1).wrapping_mul(i256::from_i128(10).wrapping_pow(40));
+    let upper = ((1u64 << 54) + (1u64 << 31)) as f32;
+    for (decimal, expected) in [
+        (decimal128_value(midpoint + 1, 20, 0).unwrap(), upper),
+        (rtdb_types::DecimalValue::new(negative.to_be_bytes().to_vec(), 60, 40, 256).unwrap(), -upper),
+        (decimal128_value(-123, 20, 400).unwrap(), -0.0),
+    ] {
+        let scalar = vector_float(&Value::Decimal(decimal.clone())).unwrap();
+        assert_eq!(scalar.to_bits(), expected.to_bits());
+        let values = [Value::Decimal(decimal), Value::Null, Value::Null];
+        let input = values[0].logical_type().maybe();
+        let field = Arc::new(rtdb_columnar::to_field("c0", &input).unwrap());
+        let array = rtdb_columnar::copy_array(&input, &values).unwrap();
+        let batch = ColumnBatch::settled(vec![Column::Arrow { array, field, logical: Some(input.clone()) }],
+            values.len(), memory.reserve(4096).unwrap()).unwrap();
+        let rows = Rows::columns(&batch, &[0], false, &execution.context).unwrap();
+        let mut states = ScalarGroups::new(&execution).unwrap();
+        states.ensure(2).unwrap();
+        let output = LogicalType::Scalar(ScalarType::F32);
+        let factory = SumFactory::new(&input, &output).unwrap();
+        let pressure = memory.reserve(memory.available_bytes() - 4096).unwrap();
+        states.sum_page(rows, GroupMapping::Grouped(&[0, 0, 1]), |_| true, Some(0), &factory, &execution).unwrap();
+        drop(pressure);
+        assert!(matches!(states.values[0].accumulator, ScalarState::F32(value) if value.to_bits() == expected.to_bits()));
+        assert!(matches!(states.values[1].accumulator, ScalarState::Empty));
+    }
+    assert_eq!(memory.used_bytes(), baseline);
+}
+
+#[tokio::test]
+async fn mixed_decimal_float_sum_keeps_the_binary32_accumulation_order() {
+    let execution = execution(8);
+    let midpoint = (1i128 << 54) + (1i128 << 30);
+    let positive = Value::Decimal(decimal128_value(midpoint + 1, 20, 0).unwrap());
+    let negative = Value::F32(-(((1u64 << 54) + (1u64 << 31)) as f32));
+    let input = positive.logical_type().join(&negative.logical_type()).maybe();
+    let cursor = primitive_cursor(&execution, AggregateFunction::Sum, input.clone(), input,
+        vec![vec![negative, Value::Null, positive, Value::F32(1.0)]], None);
+    assert_eq!(primitive_result(cursor).await, Value::F32(1.0));
+}
+
 #[tokio::test]
 async fn mixed_numeric_average_preserves_input_order_and_counts_nonnull_values() {
     let execution = execution(8);
