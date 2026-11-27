@@ -80,9 +80,9 @@ impl AsRef<[u8]> for ChargedBytes {
 }
 
 /// The retained journal records that trigger a writer checkpoint. A
-/// consensus journal stream refuses appends at 65,536 retained records, so
+/// consensus journal stream refuses appends at 262,144 retained records, so
 /// the writer checkpoints and trims at half that bound.
-pub const JOURNAL_CHECKPOINT_RECORDS: u64 = 32_768;
+pub const JOURNAL_CHECKPOINT_RECORDS: u64 = 131_072;
 
 impl MultiServing {
     /// Checkpoints and trims once the writer's retained journal suffix

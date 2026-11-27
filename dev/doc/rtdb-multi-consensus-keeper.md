@@ -66,11 +66,12 @@ never a sealed writer epoch, and Multi always seals epoch one or later.
   in the stream keeper's mount format. Without trust,
   `maximum_timed_original_bytes` is `None` and funded appends stay
   unsupported, as before.
-- **Journal size.** A consensus stream refuses appends at 65,536 retained
-  records. The Multi writer checkpoints and trims once its retained journal
-  suffix reaches 32,768 records. Before this, the server only checkpointed
-  for erasure, so a long-running writer would have stalled on consensus
-  streams. The stream Writer is limited only by its byte quota.
+- **Journal size.** A consensus stream refuses appends at 262,144 retained records.
+  The Multi writer checkpoints and trims once its retained journal suffix reaches 131,072 records, half that bound, so a checkpoint held back by a pending erasure has 131,072 records of headroom.
+  The stream's byte quota must also hold that many records.
+  Each residence keeps its retained suffix decoded in memory and replays it on open, so both grow with the bound.
+  Before the writer checkpointed on its own, the server only checkpointed for erasure, so a long-running writer would have stalled on consensus streams.
+  The stream Writer is limited only by its byte quota.
 - **Checkpoints off the commit path.** By default that checkpoint runs under
   the database lock, so commits wait for it. With
   `multiCheckpoints: {deferred: true}` the writer captures the state under the
