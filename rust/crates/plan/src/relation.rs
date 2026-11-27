@@ -246,33 +246,55 @@ impl AggregateAlias {
 /// Factory lookup follows XTQL name normalization; the spelling is retained for plan descriptions.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
-pub struct AggregateName { spelling: String, evaluator: AggregateAlias }
+pub struct AggregateName { spelling: String, canonical: CanonicalAggregate, distinct: bool }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CanonicalAggregate {
+    Count, CountStar, Sum, Average, Min, Max, ArrayAgg, VecAgg, Every, Any,
+    VariancePopulation, VarianceSample, StddevPopulation, StddevSample,
+}
+
+impl CanonicalAggregate {
+    fn into_function(self) -> AggregateFunction {
+        match self {
+            Self::Count => AggregateFunction::Count, Self::CountStar => AggregateFunction::CountStar,
+            Self::Sum => AggregateFunction::Sum, Self::Average => AggregateFunction::Average,
+            Self::Min => AggregateFunction::Min, Self::Max => AggregateFunction::Max,
+            Self::ArrayAgg => AggregateFunction::ArrayAgg, Self::VecAgg => AggregateFunction::VecAgg,
+            Self::Every => AggregateFunction::Every, Self::Any => AggregateFunction::Any,
+            Self::VariancePopulation => AggregateFunction::VariancePopulation,
+            Self::VarianceSample => AggregateFunction::VarianceSample,
+            Self::StddevPopulation => AggregateFunction::StddevPopulation,
+            Self::StddevSample => AggregateFunction::StddevSample,
+        }
+    }
+}
 
 impl AggregateName {
     /// Rejects names without an ordinary aggregate factory, including unsupported ALL/DISTINCT combinations.
     pub fn new(spelling: impl Into<String>) -> Result<Self> {
-        use AggregateAlias as A;
+        use CanonicalAggregate as C;
         let spelling = spelling.into();
         let normalized = crate::Identifier::unquoted(&spelling).normalized();
-        let evaluator = match normalized.as_str() {
-            "row_count" => A::RowCountUnderscore,
-            "count" | "count_all" => A::CountAll, "count_distinct" => A::CountDistinctHyphen,
-            "sum" | "sum_all" => A::SumAll, "sum_distinct" => A::SumDistinctHyphen,
-            "avg" | "avg_all" => A::AverageAll, "avg_distinct" => A::AverageDistinctHyphen,
-            "min" | "min_all" => A::MinAll, "min_distinct" => A::MinDistinctHyphen,
-            "max" | "max_all" => A::MaxAll, "max_distinct" => A::MaxDistinctHyphen,
-            "array_agg" => A::ArrayAggUnderscore, "array_agg_distinct" => A::ArrayAggDistinctHyphen,
-            "vec_agg" => A::VecAggHyphen, "every" | "bool_and" => A::BoolAnd, "bool_or" => A::BoolOrHyphen,
-            "var_pop" => A::VariancePopulationHyphen, "var_samp" => A::VarianceSampleHyphen,
-            "stddev_pop" => A::StddevPopulationHyphen, "stddev_samp" => A::StddevSampleHyphen,
+        let (canonical, distinct) = match normalized.as_str() {
+            "row_count" => (C::CountStar, false),
+            "count" | "count_all" => (C::Count, false), "count_distinct" => (C::Count, true),
+            "sum" | "sum_all" => (C::Sum, false), "sum_distinct" => (C::Sum, true),
+            "avg" | "avg_all" => (C::Average, false), "avg_distinct" => (C::Average, true),
+            "min" | "min_all" => (C::Min, false), "min_distinct" => (C::Min, true),
+            "max" | "max_all" => (C::Max, false), "max_distinct" => (C::Max, true),
+            "array_agg" => (C::ArrayAgg, false), "array_agg_distinct" => (C::ArrayAgg, true),
+            "vec_agg" => (C::VecAgg, false), "every" | "bool_and" => (C::Every, false), "bool_or" => (C::Any, false),
+            "var_pop" => (C::VariancePopulation, false), "var_samp" => (C::VarianceSample, false),
+            "stddev_pop" => (C::StddevPopulation, false), "stddev_samp" => (C::StddevSample, false),
             _ => return Err(Anomaly::incorrect("rtdb.plan/aggregate-name", format!("Unknown aggregate factory: {spelling}"))),
         };
-        Ok(Self { spelling, evaluator })
+        Ok(Self { spelling, canonical, distinct })
     }
     /// Returns the original, unnormalized factory symbol.
     pub fn spelling(&self) -> &str { &self.spelling }
     /// Whether this factory symbol requests duplicate elimination.
-    pub fn distinct(&self) -> bool { self.evaluator.distinct().unwrap_or(false) }
+    pub fn distinct(&self) -> bool { self.distinct }
 }
 impl TryFrom<String> for AggregateName {
     type Error = Anomaly;
@@ -282,7 +304,7 @@ impl From<AggregateName> for String { fn from(name: AggregateName) -> Self { nam
 
 impl AggregateFunction {
     /// Resolves alias spellings to evaluator variants.
-    pub fn canonical(&self) -> Self { match self { Self::Alias(alias) => alias.canonical(), Self::Named(name) => name.evaluator.canonical(), function => function.clone() } }
+    pub fn canonical(&self) -> Self { match self { Self::Alias(alias) => alias.canonical(), Self::Named(name) => name.canonical.into_function(), function => function.clone() } }
     /// Returns the quantifier fixed by a factory spelling, when present.
     pub fn quantifier(&self) -> Option<bool> { match self { Self::Alias(alias) => alias.distinct(), Self::Named(name) => Some(name.distinct()), _ => None } }
     /// Includes the descriptor and any retained original-name capacity.
