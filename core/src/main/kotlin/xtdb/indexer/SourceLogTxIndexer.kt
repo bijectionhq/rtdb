@@ -289,9 +289,12 @@ internal class SourceLogTxIndexer(
             val queryStr = queryRdr.getObject(opIdx) as String
 
             wrapAnomaly(mapOf("sql" to queryStr, "tx-op-idx" to opIdx, "tx-key" to opts.txKey)) {
-                val argsLoader: Relation.ILoader? =
-                    if (argsRdr.isNull(opIdx)) null
-                    else Relation.streamLoader(allocator, argsRdr.getObject(opIdx) as ByteArray)
+                val argsLoader = when {
+                    argsRdr.isNull(opIdx) -> null
+                    argsRdr is DenseUnionVector.LegVector && argsRdr.inner is VarBinaryVector ->
+                        Relation.StreamLoader(allocator, argsRdr.getBytes(opIdx).asChannel)
+                    else -> Relation.streamLoader(allocator, argsRdr.getObject(opIdx) as ByteArray)
+                }
 
                 argsLoader.use {
                     tracer.withSpan("xtdb.transaction.sql") { span ->
