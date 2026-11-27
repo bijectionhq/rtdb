@@ -260,6 +260,13 @@
                                :p {:inner nil}}]}]]
             {}))))
 
+(t/deftest positioned-interval-projection-keeps-null-and-signed-components
+  (t/is (= [{:copied #xt/interval "P12M"} {} {:copied #xt/interval "P-4M"}]
+           (tu/query-ra
+            '[:project {:projections [{copied tick}]}
+              [:table {:rows [{:tick #xt/interval "P12M"} {:tick nil} {:tick #xt/interval "P-4M"}]}]]
+            {}))))
+
 (t/deftest test-table-stats
   (t/testing "row table stats - should return stats/row-count"
     (t/is (= {:row-count 4}

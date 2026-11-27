@@ -424,7 +424,8 @@
 
 (doseq [[k tag] {:interval Interval :decimal BigDecimal}]
   (defmethod read-value-code k [_ & args]
-    (-> `(.readObject ~@args) (with-tag tag)))
+    (cond-> (with-tag `(.readObject ~@args) tag)
+      (= k :interval) (vary-meta assoc ::interval-reader (first args))))
 
   (defmethod write-value-code k [_ & args] `(.writeObject ~@args)))
 
@@ -2539,7 +2540,7 @@
                           (update-vals children (fn [_] (with-tag (gensym 'out-child) VectorWriter))))]
       {:writer-bindings (into [] (mapcat (fn [[k writer]] [writer `(.vectorFor ~out-vec-sym ~k)])) child-writers)
        :write-value-out! (fn [value-type code]
-                           (let [{::keys [struct-fields struct-bindings struct-reader]} (meta code)]
+                           (let [{::keys [struct-fields struct-bindings struct-reader interval-reader]} (meta code)]
                              (if (and child-writers
                                       (= struct-type value-type)
                                       (= (set (keys child-writers)) (set (keys struct-fields)))
@@ -2551,8 +2552,8 @@
                                     ~@(for [[reader _ writer] readers]
                                         `(.writeValue ~writer ~reader))
                                     (.endStruct ~out-vec-sym)))
-                               (if struct-reader
-                                 `(.writeValue0 ~out-vec-sym ~(with-tag struct-reader ValueReader))
+                               (if-let [reader (or struct-reader interval-reader)]
+                                 `(.writeValue0 ~out-vec-sym ~(with-tag reader ValueReader))
                                  (write-value-code value-type out-vec-sym code)))))})))
 
 (defn wrap-zone-id-cache-buster [f]
