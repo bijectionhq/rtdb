@@ -33,6 +33,18 @@ pub(crate) fn selectable(field: &Field) -> bool {
     supported(field, false)
 }
 
+pub(super) fn selectable_present_struct(field: &Field) -> bool {
+    fn leaf(field: &Field) -> bool {
+        field.metadata().is_empty()
+            && matches!(field.data_type(), DataType::Null | DataType::Boolean | DataType::Int64 | DataType::Utf8)
+    }
+    let DataType::Struct(children) = field.data_type() else { return false; };
+    field.is_nullable() && field.metadata().is_empty() && children.iter().all(|child| {
+        leaf(child) || matches!(child.data_type(), DataType::Union(legs, UnionMode::Dense)
+            if child.metadata().is_empty() && legs.iter().all(|(_, leg)| leaf(leg)) && selectable(child))
+    })
+}
+
 pub(crate) fn align(
     array: &ArrayRef, source: &Field, target: &Field, memory: &Arc<MemoryBudget>,
 ) -> Result<Option<(ArrayRef, Option<Arc<MemoryReservation>>)>> {

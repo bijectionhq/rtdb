@@ -1989,7 +1989,8 @@ impl DocumentCell<'_> {
         }
         if let Self::Arrow { cell, declared: Some(declared) } = self
             && **declared != LogicalType::Nothing
-            && canonical::selectable(cell.field)
+            && (canonical::selectable(cell.field)
+                || !cell.array.is_null(cell.row) && canonical::selectable_present_struct(cell.field))
             && let Ok(scratch) = cell.observed_type_bytes().and_then(|bytes| memory.reserve(bytes))
             && rtdb_columnar::validate_readable_cell(cell.field, cell.array, declared, cell.row, memory).is_ok()
             && let Ok(observed) = cell.observed_type() {
@@ -2319,8 +2320,14 @@ fn gather_document_column(
 ) -> Result<Option<(ArrayRef, Arc<MemoryReservation>)>> {
     use rtdb_columnar::{copy_nullable_cells, estimate_copy_cell_bytes, estimate_null_copy_cell_bytes};
 
-    if ty.unencoded() != *ty || !canonical::selectable(field)
+    if ty.unencoded() != *ty
         || !cells.iter().flatten().any(|cell| matches!(cell, DocumentCell::Arrow { .. })) {
+        return Ok(None);
+    }
+    let exact_present_structs = !canonical::selectable(field);
+    if exact_present_structs && (!canonical::selectable_present_struct(field) || !cells.iter().all(|cell| {
+        matches!(cell, Some(DocumentCell::Arrow { cell, .. }) if cell.field == field && !cell.array.is_null(cell.row))
+    })) {
         return Ok(None);
     }
     let _inventory = memory.reserve(cells.len().checked_mul(128).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?)?;
@@ -2348,7 +2355,7 @@ fn gather_document_column(
             }
             Some(DocumentCell::Arrow { cell: selected, .. }) => {
                 let ArrowCell { field: source, array: column, row } = *selected;
-                if !canonical::selectable(source) || !canonical::selectable_cell(*selected, packed_null_bytes) {
+                if (!exact_present_structs && !canonical::selectable(source)) || !canonical::selectable_cell(*selected, packed_null_bytes) {
                     return Ok(None);
                 }
                 if previous.is_none_or(|prior| !std::ptr::eq(prior, column)) {
@@ -6047,6 +6054,57 @@ mod tests {
         assert_eq!(ipc(actual).as_slice(), ipc(expected).as_slice());
         assert!(!canonical::selectable(&array.fields()[0]));
         assert!(!canonical::selectable_cell(ArrowCell { field: &array.fields()[1], array: array.column(1).as_ref(), row: 0 }, true));
+    }
+
+    #[test]
+    fn exact_present_nullable_structs_keep_union_children_and_source_bytes() {
+        let memory = budget();
+        let child = LogicalType::Scalar(ScalarType::I64).join(&LogicalType::Scalar(ScalarType::Utf8));
+        let ty = LogicalType::Struct(StructFields::from([("choice".into(), child)])).maybe();
+        let field = to_field("details", &ty).unwrap();
+        let values = [Value::Null,
+            Value::Struct(StructFields::from([("choice".into(), Value::I64(-7))])),
+            Value::Struct(StructFields::from([("choice".into(), Value::Utf8("selected".into()))])),
+        ];
+        let array = copy_array(&ty, &values).unwrap();
+        let positions = |row| DocumentCell::Arrow {
+            cell: ArrowCell { field: &field, array: array.as_ref(), row }, declared: Some(&ty),
+        };
+        let first = positions(1);
+        let second = positions(2);
+        let masked = positions(0);
+        assert!(!canonical::selectable(&field));
+        assert_eq!(first.observed_type(&memory).unwrap(), values[1].logical_type());
+        assert!(gather_document_column(&field, &ty, &[Some(&first), None], &memory).unwrap().is_none());
+        assert!(gather_document_column(&field, &ty, &[Some(&first), Some(&masked)], &memory).unwrap().is_none());
+
+        let ids = Field::new("_id", DataType::Int64, false);
+        let array = StructArray::new(vec![ids, field.clone()].into(), vec![
+            Arc::new(arrow_array::Int64Array::from(vec![0, 1, 2])), Arc::clone(&array),
+        ], None).slice(1, 2);
+        let layout = DecodedDocumentLayout::new(array.fields(), &memory).unwrap();
+        let presence = BTreeSet::from(["_id".into(), "details".into()]);
+        let arrow = ArrowDocuments::from_source(&array, layout, array.get_array_memory_size(), &memory).unwrap().unwrap()
+            .with_legacy_owned_presence(Some(vec![presence; 2]), &memory).unwrap();
+        let rows = arrow.read_legacy_owned_rows(&memory).unwrap();
+        let (selected, _lease) = gather_document_column(&field, &ty, &[Some(&second), Some(&first)], &memory).unwrap().unwrap();
+        let reference = copy_array(&ty, &[values[2].clone(), values[1].clone()]).unwrap();
+        let ipc = |column| {
+            let schema = Arc::new(Schema::new(vec![field.clone()]));
+            let batch = RecordBatch::try_new(Arc::clone(&schema), vec![column]).unwrap();
+            crate::ipc::encode(&schema, [&batch], &memory).unwrap()
+        };
+        assert_eq!(ipc(selected).as_slice(), ipc(reference).as_slice());
+
+        let relation = rtdb_types::OwnedRelation::new("docs").unwrap();
+        let actual = SourceTransaction::new(vec![TxOp::OwnedArrowDocs {
+            relation: relation.clone(), documents: arrow, create_only: true, valid_from: None, valid_to: None,
+        }], SubmitOptions::default(), &memory).unwrap();
+        let expected = SourceTransaction::new(vec![TxOp::OwnedInsertDocs {
+            relation, documents: rows, valid_from: None, valid_to: None,
+        }], SubmitOptions::default(), &memory).unwrap();
+        assert_eq!(actual.encode().unwrap().as_slice(), expected.encode().unwrap().as_slice());
+        assert_eq!(actual.body_digest().unwrap(), expected.body_digest().unwrap());
     }
 
     #[test]

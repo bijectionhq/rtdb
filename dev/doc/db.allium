@@ -622,6 +622,7 @@ variant TxMessage : SourceMessage {
     -- The private Original World replay operand carries complete typed handles for copied shadows and keeps their original assertion positions.
     -- The legacy source writer derives compatible structured document types from selected Arrow cells and aligns dense union tags to the source schema.
     -- It preserves the canonical union padding beneath null parent cells.
+    -- An exact nullable document struct with a present parent at every selected position can retain dense unions of ordinary Boolean, signed 64-bit, text and null children.
     -- A legacy document page with a stable logical layout can share a source leg with authored Arrow documents.
     -- Submitted legacy scalar pages with matching concrete column types can share that leg when a column is nullable or a page omits it.
     -- The combined leg retains the legacy source field order, values and receipt bytes.
