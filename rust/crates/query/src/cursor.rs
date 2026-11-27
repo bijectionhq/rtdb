@@ -2011,6 +2011,53 @@ mod tests {
     }
 
     #[test]
+    fn result_expands_a_run_end_record_child_and_keeps_sibling_backing_charged() {
+        use arrow_array::{Int64Array, StructArray};
+        use rtdb_types::{RunEndWidth, StructFields};
+
+        let memory = MemoryBudget::new(1 << 20);
+        let int = LogicalType::Scalar(ScalarType::I64);
+        let text = LogicalType::Scalar(ScalarType::Utf8);
+        let source = LogicalType::Struct(StructFields::from([
+            ("label".into(), text.clone()),
+            ("counter".into(), int.clone().run_end_encoded(RunEndWidth::I16).unwrap()),
+        ]));
+        let target = LogicalType::Struct(StructFields::from([
+            ("counter".into(), int),
+            ("label".into(), text),
+        ]));
+        let rows = [("earlier", 0), ("first", 7), ("second", 7)].map(|(label, counter)| {
+            Value::Struct(StructFields::from([
+                ("label".into(), Value::Utf8(label.into())), ("counter".into(), Value::I64(counter)),
+            ]))
+        });
+        let array = copy_array(&source, &rows).unwrap().slice(1, 2);
+        let owner = memory.reserve(array.get_array_memory_size() + 4096).unwrap();
+        let backing = Arc::downgrade(&owner);
+        let labels = array.as_any().downcast_ref::<StructArray>().unwrap().column(0).to_data();
+        let label_buffer = labels.buffers()[1].data_ptr();
+        drop(labels);
+        let input = crate::columnar::ColumnBatch::settled(vec![crate::columnar::Column::Arrow {
+            field: Arc::new(to_field("v", &source).unwrap()), logical: Some(source), array,
+        }], 2, owner).unwrap();
+        let schema = Schema::new(vec![rtdb_plan::Field {
+            id: rtdb_plan::ColumnId(0), name: "v".into(), qualifier: None,
+            qualified_only: false, unnamed: false, data_type: target.clone(),
+        }]).unwrap();
+
+        let result = column_batch(&schema, &memory, input).unwrap();
+        let record = result.batch().column(0).as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(record.column_names(), ["counter", "label"]);
+        assert_eq!(record.column(1).to_data().buffers()[1].data_ptr(), label_buffer);
+        assert_eq!(record.column(0).as_any().downcast_ref::<Int64Array>().unwrap().values().as_ref(), &[7, 7]);
+        assert_eq!(record.to_data(), copy_array(&target, &rows[1..]).unwrap().to_data());
+        assert!(backing.upgrade().is_some());
+        drop(result);
+        assert!(backing.upgrade().is_none());
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
     fn typed_result_writes_a_packed_component_null_under_its_numeric_tag() {
         use arrow_array::{Array, Float32Array, Float64Array, NullArray, UnionArray, make_array, new_empty_array};
         use arrow_array::cast::AsArray;

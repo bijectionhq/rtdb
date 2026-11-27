@@ -3425,6 +3425,38 @@ fn selected_arrow_output_preserves_the_bottom_cell_read_error() {
 }
 
 #[test]
+fn mixed_result_gathers_an_exact_nested_leg_beside_a_fallible_cell() {
+    use arrow_array::StringArray;
+    use rtdb_types::{ScalarType, StructFields};
+
+    let memory = MemoryBudget::new(1 << 20);
+    let record = Value::Struct(StructFields::from([("items".into(), Value::list(vec![Value::I64(8)]))]));
+    let list = Value::list(vec![Value::I64(7), Value::I64(9)]);
+    let record_type = record.logical_type();
+    let list_type = list.logical_type();
+    let uri_type = LogicalType::Scalar(ScalarType::Uri);
+    let target = LogicalType::from_legs([record_type.clone(), list_type.clone(), uri_type.clone()]);
+    let field = rtdb_columnar::to_field("v", &target).unwrap();
+    let selected = SelectedColumn::new(vec![
+        Some((rtdb_columnar::copy_array(&record_type, std::slice::from_ref(&record)).unwrap(),
+            Arc::new(rtdb_columnar::to_field("v", &record_type).unwrap()), Some(record_type), None)),
+        Some((Arc::new(StringArray::from(vec!["https://xtdb.com", "not a URI"])),
+            Arc::new(rtdb_columnar::to_field("v", &uri_type).unwrap()), Some(uri_type), None)),
+        Some((rtdb_columnar::copy_array(&list_type, std::slice::from_ref(&list)).unwrap(),
+            Arc::new(rtdb_columnar::to_field("v", &list_type).unwrap()), Some(list_type), None)),
+    ], Arc::new(vec![(1, 0), (0, 0), (2, 0), (0, 0)]));
+    let column = Column::Selected(selected.clone());
+    let (result, _scratch) = selected.copy_mixed_result(&column, &target, &field, &memory).unwrap().unwrap();
+    let expected = [Value::Uri("https://xtdb.com".into()), record.clone(), list, record];
+    assert_eq!(result.to_data(), rtdb_columnar::copy_array(&target, &expected).unwrap().to_data());
+
+    let invalid = SelectedColumn { cells: SelectedRows::Picks(Arc::new(vec![(0, 0), (1, 1)])), ..selected };
+    let column = Column::Selected(invalid.clone());
+    let expected = column.value(1).unwrap_err();
+    assert_eq!(invalid.copy_mixed_result(&column, &target, &field, &memory).err(), Some(expected));
+}
+
+#[test]
 fn selecting_a_list_with_an_unreadable_child_preserves_its_read_error() {
     let logical = LogicalType::list(LogicalType::Nothing);
     let field = Arc::new(rtdb_columnar::to_field("v", &logical).unwrap());
@@ -3538,8 +3570,17 @@ pub(crate) fn relayout_output(column: &Column, target: &LogicalType, field: &Arr
         return column.relayout_result(target, field, memory, false);
     }
     let Column::Arrow { array, field: source, logical: Some(logical) } = column else { return Ok(None) };
-    if !stable_read_layout(logical, source) || logical.join(target) != *target { return Ok(None); }
-    let bound = rtdb_columnar::arrow_relayout_bound(array.as_ref(), source, field)?;
+    let stable = stable_read_layout(logical, source);
+    if (!stable && (array.data_type() != source.data_type() || !stable_encoded_result_layout(logical, source)))
+        || logical.unencoded().join(target) != *target
+    {
+        return Ok(None);
+    }
+    let bound = match rtdb_columnar::arrow_relayout_bound(array.as_ref(), source, field) {
+        Ok(bound) => bound,
+        Err(error) if stable => return Err(error),
+        Err(_) => return Ok(None),
+    };
     let Ok(scratch) = memory.reserve(bound) else { return Ok(None) };
     let Ok((physical, array)) = rtdb_columnar::relayout_arrow_column(Arc::clone(array), source, field) else { return Ok(None) };
     if physical.data_type() != field.data_type() || (!target.nullable() && array.logical_null_count() != 0) {
@@ -3582,9 +3623,12 @@ impl SelectedColumn {
                 let size = rtdb_columnar::estimate_copy_cell_bytes(field, cell.array, cell.row)?;
                 bytes = size.checked_mul(4).and_then(|size| bytes.checked_add(size)).ok_or_else(size_error)?;
                 picks.push((source, cell.row));
-            } else if matches!(target, LogicalType::Union(_)) && vector.is_some_and(|(_, field, logical, _)| {
-                logical.as_ref().is_some_and(|logical| plain_scalar(logical).is_some_and(copyable)
-                    && stable_read_layout(logical, field) && logical.join(target) == *target)
+            } else if matches!(target, LogicalType::Union(_)) && vector.is_some_and(|(_, source, logical, _)| {
+                logical.as_ref().is_some_and(|logical| {
+                    (plain_scalar(logical).is_some_and(copyable) && stable_read_layout(logical, source)
+                        && logical.join(target) == *target)
+                    || exact_nested_result_leg(logical, source, target, field)
+                })
             }) {
                 picks.push((1, widen.len()));
                 widen.push((source, offset));
@@ -3781,6 +3825,37 @@ fn exact_result_cell<'a>(cell: rtdb_columnar::ArrowCell<'a>, logical: Option<&Lo
     }
     if !scalar { admit_cell_read(selected.field, selected.array, Some(&actual), selected.row, memory).ok()?; }
     Some(selected)
+}
+
+fn exact_nested_result_leg(logical: &LogicalType, source: &ArrowField, target: &LogicalType, field: &ArrowField) -> bool {
+    let (LogicalType::Union(legs), DataType::Union(layouts, arrow_schema::UnionMode::Dense)) = (target, field.data_type())
+        else { return false; };
+    if !matches!(logical, LogicalType::Struct(_) | LogicalType::List { kind: ListKind::List | ListKind::FixedSizeList(_), .. })
+        || !legs.contains(logical) || !plain_result_children(logical) || source.is_nullable()
+    {
+        return false;
+    }
+    rtdb_columnar::leg_name(logical).is_ok_and(|name| layouts.iter().any(|(_, leg)| {
+        *leg.name() == name && leg.data_type() == source.data_type() && leg.metadata() == source.metadata()
+    }))
+}
+
+fn plain_result_children(logical: &LogicalType) -> bool {
+    match logical {
+        LogicalType::Scalar(scalar) => copyable(scalar) && !matches!(scalar,
+            rtdb_types::ScalarType::U8 | rtdb_types::ScalarType::U16 | rtdb_types::ScalarType::U32 | rtdb_types::ScalarType::U64),
+        LogicalType::Null => true,
+        LogicalType::Maybe(inner) => plain_result_children(inner),
+        LogicalType::Struct(fields) => fields.values().all(plain_result_children),
+        LogicalType::List { kind: ListKind::List | ListKind::FixedSizeList(_), element } => plain_result_children(element),
+        _ => false,
+    }
+}
+
+fn stable_encoded_result_layout(logical: &LogicalType, field: &ArrowField) -> bool {
+    let plain = logical.unencoded();
+    plain != *logical && plain_result_children(&plain)
+        && rtdb_columnar::to_field(field.name(), logical).is_ok_and(|canonical| canonical == *field)
 }
 
 pub(crate) fn stable_read_layout(logical: &LogicalType, field: &ArrowField) -> bool {

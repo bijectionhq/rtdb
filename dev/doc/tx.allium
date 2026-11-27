@@ -57,6 +57,8 @@
 -- Native SQL, XTQL, and logical relation execution opens Arrow batches for the root operator.
 -- Semantic pages remain Arrow batches through downstream operators and transport batching.
 -- Flight SQL result batches retain the Arrow buffers of columns that already match the declared field, even when other columns require conformance.
+-- Result relayout can expand canonical run-end children while retaining compatible sibling buffers under their source admission.
+-- A mixed result union can gather compatible selected record and list legs in Arrow alongside cells that require evaluation.
 -- Native cursor pages with a fixed result layout share one admitted Arrow schema.
 -- Result buffers that share operator backing carry its admission for as long as their Arrow views retain it.
 -- Arrow result layout adaptation reserves its scratch space against the client operation's budget.
