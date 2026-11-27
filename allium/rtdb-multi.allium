@@ -1193,6 +1193,11 @@ contract PortableApplicationBackup {
         -- The staged installation receipt requires both the original active key hold and the pending recovery to remain observable after checkpoint publication.
         -- A retry of the installed archive verifies the original hold and reopens the checkpoint without advancing the destination journal.
         -- A combined object and key readback requires the original active key hold on the generation of the authenticated checkpoint.
+        -- A hosted attestor requires the staged serving names to resolve to the recorded physical versions.
+        -- The attestor rechecks each provider hold and the original key hold before signing.
+        -- The attestor checks the exact pending recovery through the activation connection enrolled in that key hold.
+        -- The resulting installation proof signs the digest of the verified object readback and identifies the original key hold for settlement.
+        -- Destination object custody preserves serving-name visibility of the held versions through handoff.
 }
 
 ------------------------------------------------------------

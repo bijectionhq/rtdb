@@ -20,11 +20,15 @@ Usage: rtdb multi-backup export --data DIR --archive FILE [--journal-url URL --t
        rtdb multi-backup verify-object-holds --archive FILE --incarnation UUID --authority-id UUID [--cell-id UUID]
                     --journal-url URL --tls-dir DIR --key-vault DIR --bucket BUCKET [--region REGION] [--s3-endpoint URL]
                     [--readback FILE] [--stage-receipt FILE]
+       rtdb multi-backup attest --archive FILE --incarnation UUID --authority-id UUID --cell-id UUID
+                    --journal-url URL --tls-dir DIR --key-vault DIR --bucket BUCKET [--region REGION] [--s3-endpoint URL]
+                    --readback FILE --stage-receipt FILE --attestation-signing-key PKCS8
 Export and restore operate on stopped, local RTDB Multi development data.
 Stage installs a pending activation's backup in S3 and holds its destination key.
 Verify-object-holds reads a staged immutable journal and an S3 allocation.
 Pass a saved readback to reopen and verify its exact S3 versions.
-Stage and verify-object-holds require the backup-object-holds build feature.
+Hosted backup commands require the backup-object-holds build feature.
+Attest emits the signed installation proof for the activation broker and requires Unix.
 These commands run without a serving listener.
 ";
 
@@ -54,6 +58,8 @@ enum BackupCommand {
     Stage(staged::Stage),
     #[cfg(feature = "backup-object-holds")]
     VerifyObjects(held_objects::Verifier),
+    #[cfg(all(unix, feature = "backup-object-holds"))]
+    AttestObjects(held_objects::Attester),
 }
 
 impl MultiBackupOptions {
@@ -71,16 +77,19 @@ impl MultiBackupOptions {
                 return Err(arguments_error());
             }
         }
-        if matches!(operation.as_str(), "stage" | "verify-object-holds") {
+        if matches!(operation.as_str(), "stage" | "verify-object-holds" | "attest") {
             if immutable_streams { return Err(arguments_error()); }
             #[cfg(feature = "backup-object-holds")]
-            return Ok(Self(if operation == "stage" {
-                BackupCommand::Stage(staged::Stage::parse(fields)?)
-            } else {
-                BackupCommand::VerifyObjects(held_objects::Verifier::parse(fields)?)
+            return Ok(Self(match operation.as_str() {
+                "stage" => BackupCommand::Stage(staged::Stage::parse(fields)?),
+                "verify-object-holds" => BackupCommand::VerifyObjects(held_objects::Verifier::parse(fields)?),
+                #[cfg(unix)]
+                _ => BackupCommand::AttestObjects(held_objects::Attester::parse(fields)?),
+                #[cfg(not(unix))]
+                _ => return Err(Anomaly::unsupported("rtdb/backup-attestation", "Hosted attestation requires the Unix signing key reader")),
             }));
             #[cfg(not(feature = "backup-object-holds"))]
-            return Err(Anomaly::unsupported("rtdb/backup-object-holds", "Hosted staging and object hold verification require the backup-object-holds build feature"));
+            return Err(Anomaly::unsupported("rtdb/backup-object-holds", "Hosted backup commands require the backup-object-holds build feature"));
         }
         let data = fields.remove("--data").ok_or_else(arguments_error)?.into();
         let archive = fields.remove("--archive").ok_or_else(arguments_error)?.into();
@@ -128,6 +137,8 @@ impl MultiBackupOptions {
             BackupCommand::Stage(stage) => stage.run().await,
             #[cfg(feature = "backup-object-holds")]
             BackupCommand::VerifyObjects(verifier) => verifier.run().await,
+            #[cfg(all(unix, feature = "backup-object-holds"))]
+            BackupCommand::AttestObjects(attester) => attester.run().await,
         }
     }
 }

@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use crate::multi::activation::operator::attestation::Intent;
 use crate::multi::activation::operator::attestation::KeyEvidence;
 
 use super::*;
@@ -15,6 +17,32 @@ struct Readback {
     object_holds_verified: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     key_hold: Option<RecoveryKeyHold>,
+}
+
+impl Readback {
+    #[cfg(unix)]
+    fn digest(&self) -> Result<[u8; 32]> {
+        let bytes = serde_json::to_vec(self).map_err(|error| Anomaly::fault("rtdb/backup-object-readback", error.to_string()))?;
+        let mut digest = Sha256::new();
+        digest.update(b"rtdb.hosted-recovery-readback/v1\0");
+        digest.update(bytes);
+        Ok(digest.finalize().into())
+    }
+}
+
+struct VerifiedReadback {
+    report: Readback,
+    #[cfg(unix)]
+    installation: rtdb_db::InstalledBackup,
+    #[cfg(unix)]
+    intent: Option<Intent>,
+}
+
+#[derive(Clone, Copy)]
+enum ReadSource {
+    SavedVersions,
+    #[cfg(unix)]
+    ServingNames,
 }
 
 fn read_receipt<T: serde::de::DeserializeOwned>(path: &Path, max_bytes: u64) -> Result<T> {
@@ -58,6 +86,11 @@ impl Verifier {
     }
 
     pub(super) async fn run(self) -> Result<Value> {
+        serde_json::to_value(self.verify(ReadSource::SavedVersions).await?.report)
+            .map_err(|error| Anomaly::fault("rtdb/backup-object-readback", error.to_string()))
+    }
+
+    async fn verify(self, source: ReadSource) -> Result<VerifiedReadback> {
         let digest = Sha256::digest(read_archive(&self.archive)?).into();
         let receipt = self.stage_receipt.as_deref()
             .map(|path| read_receipt::<staged::StageReceipt>(path, 4096)).transpose()?;
@@ -84,9 +117,9 @@ impl Verifier {
         let inventory = self.destination.objects.versioned_inventory(&root, &remotes).await?;
         inventory.require_versioned().await?;
         let io = IoRegion::new();
-        let store = match &requested {
-            Some(readback) => inventory.pinned_read_store(&readback.held_versions)?,
-            None => self.destination.objects.open(&root, &remotes, Arc::clone(&io)).await?,
+        let store = match (&requested, source) {
+            (Some(readback), ReadSource::SavedVersions) => inventory.pinned_read_store(&readback.held_versions)?,
+            _ => self.destination.objects.open(&root, &remotes, Arc::clone(&io)).await?,
         };
         let mut database = MultiDatabase::new(
             MultiOptions {
@@ -100,7 +133,7 @@ impl Verifier {
         let checked = database.check_installed_backup_object_holds(digest, &inventory).await;
         io.close_and_wait().await;
         let checked = checked?;
-        let key_hold = if let Some(receipt) = receipt {
+        let key_hold = if let Some(receipt) = &receipt {
             let key = KeyEvidence { generation: checked.generation.number, authority_sha256: receipt.key_hold.authority_sha256 };
             let hold = receipt.intent.installed_key_hold(&checked.installation, key)?;
             if hold != receipt.key_hold || hold.generation != checked.generation {
@@ -121,8 +154,51 @@ impl Verifier {
         if requested.is_some_and(|previous| previous != current) {
             return Err(invalid_readback());
         }
-        serde_json::to_value(current)
-            .map_err(|error| Anomaly::fault("rtdb/backup-object-readback", error.to_string()))
+        Ok(VerifiedReadback {
+            report: current,
+            #[cfg(unix)]
+            installation: checked.installation,
+            #[cfg(unix)]
+            intent: receipt.map(|receipt| receipt.intent),
+        })
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+pub(super) struct Attester {
+    verifier: Verifier,
+    signing_key: PathBuf,
+}
+
+#[cfg(unix)]
+impl Attester {
+    pub(super) fn parse(mut fields: BTreeMap<String, String>) -> Result<Self> {
+        let signing_key = backup_field(&mut fields, "--attestation-signing-key")?.into();
+        let verifier = Verifier::parse(fields)?;
+        if verifier.readback.is_none() || verifier.stage_receipt.is_none() {
+            return Err(arguments_error());
+        }
+        Ok(Self { verifier, signing_key })
+    }
+
+    pub(super) async fn run(self) -> Result<Value> {
+        let authority = activation::installed(&self.verifier.destination.journal_url, true).await?
+            .ok_or_else(|| Anomaly::incorrect("rtdb/backup-attestation-authority", "Configure the independent activation journal reader"))?;
+        self.run_with_authority(&authority).await
+    }
+
+    pub(super) async fn run_with_authority(self, authority: &activation::ActivationAuthority) -> Result<Value> {
+        use crate::multi::activation::operator::attestation::{Attestation, signing_key};
+
+        let checked = self.verifier.verify(ReadSource::ServingNames).await?;
+        let (intent, hold) = checked.intent.zip(checked.report.key_hold).ok_or_else(invalid_readback)?;
+        let key = signing_key(&self.signing_key)?;
+        let proof = Attestation::sign_hosted_installation(
+            authority, intent, &checked.installation, hold, checked.report.digest()?, &key,
+        ).await?;
+        serde_json::to_value(proof)
+            .map_err(|error| Anomaly::fault("rtdb/backup-attestation", error.to_string()))
     }
 }
 
@@ -132,13 +208,14 @@ fn invalid_readback() -> Anomaly {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     use super::*;
     use crate::multi::activation::{
         ActivationAuthority, ActivationOptions, operator::attestation::Attestation,
         recovery::{Intent, LossPolicy, Operation, Status},
     };
+    use ring::{rand::SystemRandom, signature::{Ed25519KeyPair, KeyPair}};
     use stream_logkeeper::stream::consensus::{CLUSTER_VERSION_CURRENT, testing::LocalCluster};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -155,6 +232,7 @@ mod tests {
                     "s3api", operation, "--bucket", &bucket])
                 .args(fields).output().unwrap();
             assert!(result.status.success(), "{operation}: {}", String::from_utf8_lossy(&result.stderr));
+            if result.stdout.is_empty() { Value::Null } else { serde_json::from_slice(&result.stdout).unwrap() }
         };
 
         const PRINCIPAL: &str = "urn:logkeeper:client:backup-object-holds";
@@ -162,7 +240,9 @@ mod tests {
         let placement = keepers.journal_config(64 << 20, 4 << 20);
         let journal = Arc::new(keepers.journal(PRINCIPAL, &placement).unwrap());
         journal.finalize_version(CLUSTER_VERSION_CURRENT).await.unwrap();
-        let home = tempfile::tempdir().unwrap();
+        let home = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir().unwrap();
         let journal_config = home.path().join("journal.json");
         fs::write(&journal_config, serde_json::to_vec(&json!({
             "keepers": placement.keepers, "catalog": placement.catalog, "voters": placement.voters,
@@ -296,17 +376,13 @@ mod tests {
         let mut staged = MultiDatabase::new(options(incarnation), journal.clone(),
             store.clone(), keys, Arc::new(|| SystemClock.now())).unwrap()
             .with_immutable_journal().with_activation_scope(scope).unwrap();
-        let installed = staged.installed_backup().await.unwrap().unwrap();
-        let stage_receipt: staged::StageReceipt = serde_json::from_value(receipt.clone()).unwrap();
-        let signing_key = ring::signature::Ed25519KeyPair::from_seed_unchecked(&[47; 32]).unwrap();
-        let proof = Attestation::sign_installation(
-            stage_receipt.intent, installed.manifest_sha256(), &installed,
-            Some(KeyEvidence { generation: key_hold.generation.number, authority_sha256: key_hold.authority_sha256 }),
-            &signing_key,
-        ).unwrap();
-        assert_eq!(proof.held_key().unwrap().1, key_hold);
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let signing_key = home.path().join("attestor.pkcs8");
+        fs::write(&signing_key, pkcs8.as_ref()).unwrap();
+        fs::set_permissions(&signing_key, fs::Permissions::from_mode(0o600)).unwrap();
+        let attestor_public_key =
+            Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap().public_key().as_ref().to_vec();
         let proof_path = home.path().join("installation-proof.json");
-        fs::write(&proof_path, serde_json::to_vec(&proof).unwrap()).unwrap();
         let release = || ActivationOptions::parse([
             "release-recovery-key".into(), DEVELOPMENT_DATABASE.into(),
             "--authority-id".into(), authority.to_string(), "--authority-url".into(), authority_url.clone(),
@@ -314,7 +390,6 @@ mod tests {
             "--installation-proof".into(), proof_path.display().to_string(),
             "--key-vault".into(), vault.display().to_string(),
         ].into_iter()).unwrap().run(rtdb_storage::AppleSync::Full);
-        assert!(release().await.is_err());
         let relocated = staged.installed_backup_file_relocations().await.unwrap();
         let [relocated] = relocated.as_slice() else { panic!("expected one relocated file"); };
         let file = rtdb_storage::ObjectKey::new(relocated.destination_file.to_string()).unwrap();
@@ -326,8 +401,8 @@ mod tests {
         let mut substituted = receipt.clone();
         substituted["key_hold"]["operation"] = json!(Uuid::new_v4());
         fs::write(&wrong_receipt_path, serde_json::to_vec(&substituted).unwrap()).unwrap();
-        let verify = |readback: Option<&Path>, receipt: &Path| MultiBackupOptions::parse([
-            "verify-object-holds".to_owned(), "--archive".into(), archive_path.display().to_string(),
+        let hosted_options = |operation: &str, readback: Option<&Path>, receipt: &Path, key: Option<&Path>| MultiBackupOptions::parse([
+            operation.to_owned(), "--archive".into(), archive_path.display().to_string(),
             "--incarnation".into(), incarnation.to_string(), "--authority-id".into(), authority.to_string(),
             "--stage-receipt".into(), receipt.display().to_string(),
             "--cell-id".into(), cell.to_string(), "--key-vault".into(), vault.display().to_string(),
@@ -336,7 +411,16 @@ mod tests {
             "--s3-endpoint".into(), endpoint.clone(),
         ].into_iter().chain(readback.into_iter().flat_map(|path| [
             "--readback".into(), path.display().to_string(),
-        ]))).unwrap().run(rtdb_storage::AppleSync::Full);
+        ])).chain(key.into_iter().flat_map(|path| [
+            "--attestation-signing-key".into(), path.display().to_string(),
+        ]))).unwrap();
+        let verify = |readback: Option<&Path>, receipt: &Path|
+            hosted_options("verify-object-holds", readback, receipt, None).run(rtdb_storage::AppleSync::Full);
+        let attest = |readback: &Path| {
+            let options = hosted_options("attest", Some(readback), &receipt_path, Some(&signing_key));
+            let BackupCommand::AttestObjects(attester) = options.0 else { panic!("expected hosted attestation"); };
+            attester.run_with_authority(&authority_reader)
+        };
         let objects = store.list(None).await.unwrap();
         assert_eq!(objects.len(), 4);
         let token = &objects.iter().find(|entry| entry.key.as_str().starts_with("~rtdb-v1/")).unwrap().key;
@@ -363,6 +447,69 @@ mod tests {
         assert_eq!(result["held_versions"].as_array().unwrap().len(), 4);
         assert!(result["held_versions"].as_array().unwrap().contains(&json!(physical)));
 
+        let readback = home.path().join("readback.json");
+        fs::write(&readback, serde_json::to_vec(&result).unwrap()).unwrap();
+        let proof_json = attest(&readback).await.unwrap();
+        let proof: Attestation = serde_json::from_value(proof_json.clone()).unwrap();
+        assert_eq!(proof.held_key().unwrap().1, key_hold);
+        let verified_readback: Readback = serde_json::from_value(result.clone()).unwrap();
+        assert_eq!(proof_json["evidence"]["objects_sha256"], json!(verified_readback.digest().unwrap()));
+        fs::write(&proof_path, serde_json::to_vec(&proof_json).unwrap()).unwrap();
+        assert!(release().await.is_err());
+
+        let broker_config = home.path().join("broker.json");
+        let socket = home.path().join("authority.sock");
+        fs::write(&broker_config, serde_json::to_vec(&json!({
+            "authority_id": authority, "authority_url": authority_url, "authority_tls_dir": authority_tls,
+            "operator_uids": [fs::metadata(home.path()).unwrap().uid()],
+            "destination_attestors": {(cell.to_string()): attestor_public_key},
+        })).unwrap()).unwrap();
+        fs::set_permissions(&broker_config, fs::Permissions::from_mode(0o600)).unwrap();
+        let broker = ActivationOptions::parse([
+            "serve".into(), "--authority-socket".into(), socket.display().to_string(),
+            "--broker-config".into(), broker_config.display().to_string(),
+        ].into_iter()).unwrap();
+        let broker = tokio::spawn(broker.run(rtdb_storage::AppleSync::Full));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !socket.exists() && !broker.is_finished() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        if broker.is_finished() {
+            panic!("broker startup failed: {:?}", broker.await);
+        }
+        let record = |path: &Path| ActivationOptions::parse([
+            "record-install".into(), DEVELOPMENT_DATABASE.into(),
+            "--authority-socket".into(), socket.display().to_string(),
+            "--operation-id".into(), operation_id.to_string(),
+            "--expected-incarnation".into(), predecessor.incarnation.to_string(),
+            "--expected-revision".into(), predecessor.revision.to_string(),
+            "--cell-id".into(), cell.to_string(),
+            "--manifest-sha256".into(), result["archive_sha256"].as_str().unwrap().into(),
+            "--installation-proof".into(), path.display().to_string(),
+        ].into_iter()).unwrap().run(rtdb_storage::AppleSync::Full);
+        let altered_proof = home.path().join("altered-proof.json");
+        let mut altered = proof_json.clone();
+        altered["evidence"]["objects_sha256"][0] = json!(1 ^ verified_readback.digest().unwrap()[0]);
+        fs::write(&altered_proof, serde_json::to_vec(&altered).unwrap()).unwrap();
+        assert!(record(&altered_proof).await.is_err());
+        let recorded = record(&proof_path).await.unwrap();
+        assert_eq!(record(&proof_path).await.unwrap(), recorded);
+        assert_eq!(attest(&readback).await.unwrap(), proof_json);
+
+        let wrong_readback = home.path().join("wrong-readback.json");
+        let mut wrong = result.clone();
+        wrong["journal_head"] = json!(head.0 + 1);
+        fs::write(&wrong_readback, serde_json::to_vec(&wrong).unwrap()).unwrap();
+        assert!(verify(Some(&wrong_readback), &receipt_path).await.is_err());
+        assert!(attest(&wrong_readback).await.is_err());
+
+        aws("put-object-legal-hold", &["--key", &physical.key,
+            "--version-id", &physical.version, "--legal-hold", "Status=OFF"]);
+        assert!(verify(Some(&readback), &receipt_path).await.is_err());
+        assert!(attest(&readback).await.is_err());
+        hold(&physical);
+
         let same_bytes = home.path().join("same-bytes");
         fs::write(&same_bytes, store.get_fresh(&file).await.unwrap()).unwrap();
         aws("put-object", &["--key", &physical.key, "--body", same_bytes.to_str().unwrap()]);
@@ -376,34 +523,33 @@ mod tests {
         let verified = new["held_versions"].as_array().unwrap();
         assert!(!verified.contains(&json!(physical)));
         assert!(verified.contains(&json!(replacement)));
+        assert_eq!(verify(Some(&readback), &receipt_path).await.unwrap(), result);
+        assert!(attest(&readback).await.is_err());
 
-        let readback = home.path().join("readback.json");
-        fs::write(&readback, serde_json::to_vec(&result).unwrap()).unwrap();
+        let new_readback = home.path().join("replacement-readback.json");
+        fs::write(&new_readback, serde_json::to_vec(&new).unwrap()).unwrap();
         let checkpoint = rtdb_storage::ObjectKey::new(result["checkpoint"].as_str().unwrap()).unwrap();
         let checkpoint_version = store.observe_head(&checkpoint).await.unwrap().version.unwrap();
-        aws("delete-object", &["--key", &checkpoint_version.key]);
+        let deleted = aws("delete-object", &["--key", &checkpoint_version.key]);
+        let marker = deleted["VersionId"].as_str().unwrap();
         assert!(verify(None, &receipt_path).await.is_err());
-        assert_eq!(verify(Some(&readback), &receipt_path).await.unwrap(), result);
+        assert_eq!(verify(Some(&new_readback), &receipt_path).await.unwrap(), new);
+        assert!(attest(&new_readback).await.is_err());
+        aws("delete-object", &["--key", &checkpoint_version.key, "--version-id", marker]);
+        assert_eq!(verify(None, &receipt_path).await.unwrap(), new);
 
-        let wrong_readback = home.path().join("wrong-readback.json");
-        let mut wrong = result.clone();
-        wrong["journal_head"] = json!(head.0 + 1);
-        fs::write(&wrong_readback, serde_json::to_vec(&wrong).unwrap()).unwrap();
-        assert!(verify(Some(&wrong_readback), &receipt_path).await.is_err());
-
-        aws("put-object-legal-hold", &["--key", &physical.key,
-            "--version-id", &physical.version, "--legal-hold", "Status=OFF"]);
-        assert!(verify(Some(&readback), &receipt_path).await.is_err());
-        hold(&physical);
         let replacement_intent = Intent {
             operation: Operation { predecessor, operation_id: Uuid::new_v4() },
             ..intent
         };
         activation.begin_recovery(DEVELOPMENT_DATABASE, replacement_intent, Some(operation_id)).await.unwrap();
         assert!(stage(operation_id).await.is_err());
+        assert!(attest(&new_readback).await.is_err());
         release().await.unwrap();
         assert!(verify(Some(&readback), &receipt_path).await.is_err());
         assert_eq!(journal.head(stream).await.unwrap(), head);
+        broker.abort();
+        assert!(broker.await.unwrap_err().is_cancelled());
         io.close_and_wait().await;
         keepers.shutdown().await.unwrap();
         authority_keepers.shutdown().await.unwrap();

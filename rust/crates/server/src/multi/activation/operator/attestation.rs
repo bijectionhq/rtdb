@@ -22,6 +22,7 @@ use super::super::journal_custody::{JournalAttestation, JournalEvidence, Retaine
 
 const VERSION: u8 = 1;
 const HELD_KEY_VERSION: u8 = 2;
+const HOSTED_CUSTODY_VERSION: u8 = 3;
 
 pub(super) type Attestors = BTreeMap<Uuid, [u8; 32]>;
 
@@ -60,6 +61,7 @@ impl Intent {
             source_lsn: cut.lsn,
             manifest_sha256,
             key,
+            objects_sha256: None,
         })
     }
 
@@ -117,6 +119,8 @@ struct Evidence {
     manifest_sha256: [u8; 32],
     #[serde(default, skip_serializing_if = "Option::is_none")]
     key: Option<KeyEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    objects_sha256: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -143,11 +147,16 @@ impl Evidence {
         bytes.extend_from_slice(&self.source_system_time.to_be_bytes());
         bytes.extend_from_slice(&self.source_lsn.to_be_bytes());
         bytes.extend_from_slice(&self.manifest_sha256);
-        match (self.version, self.key) {
-            (VERSION, None) => (),
-            (HELD_KEY_VERSION, Some(key)) if key.authority_sha256 != [0; 32] => {
+        match (self.version, self.key, self.objects_sha256) {
+            (VERSION, None, None) => (),
+            (HELD_KEY_VERSION, Some(key), None) if key.authority_sha256 != [0; 32] => {
                 bytes.extend_from_slice(&key.generation.to_be_bytes());
                 bytes.extend_from_slice(&key.authority_sha256);
+            }
+            (HOSTED_CUSTODY_VERSION, Some(key), Some(objects)) if key.authority_sha256 != [0; 32] && objects != [0; 32] => {
+                bytes.extend_from_slice(&key.generation.to_be_bytes());
+                bytes.extend_from_slice(&key.authority_sha256);
+                bytes.extend_from_slice(&objects);
             }
             _ => return Err(invalid()),
         }
@@ -156,7 +165,11 @@ impl Evidence {
 
     fn key_hold(&self) -> Result<Option<RecoveryKeyHold>> {
         let Some(key) = self.key else { return Ok(None); };
-        let digest = ring::digest::digest(&ring::digest::SHA256, &self.message()?);
+        let message = self.message()?;
+        let key_message = if self.version == HOSTED_CUSTODY_VERSION {
+            Self { version: HELD_KEY_VERSION, objects_sha256: None, ..self.clone() }.message()?
+        } else { message };
+        let digest = ring::digest::digest(&ring::digest::SHA256, &key_message);
         Ok(Some(RecoveryKeyHold {
             authority: self.intent.authority_id,
             authority_sha256: key.authority_sha256,
@@ -196,6 +209,46 @@ impl Attestation {
         signing_key: &Ed25519KeyPair,
     ) -> Result<Self> {
         Self::signed(intent.installed_evidence(manifest_sha256, installed, key_custody)?, signing_key)
+    }
+
+    #[cfg(all(unix, feature = "backup-object-holds"))]
+    pub(in crate::multi) async fn sign_hosted_installation(
+        authority: &super::super::ActivationAuthority,
+        intent: Intent,
+        installed: &rtdb_db::InstalledBackup,
+        hold: RecoveryKeyHold,
+        objects_sha256: [u8; 32],
+        signing_key: &Ed25519KeyPair,
+    ) -> Result<Self> {
+        use journal_contract::Lsn;
+        use super::super::recovery::{LossPolicy, Operation, Status};
+
+        let key = KeyEvidence {
+            generation: hold.generation.number,
+            authority_sha256: authority.connection_digest()?,
+        };
+        let mut evidence = intent.installed_evidence(installed.manifest_sha256(), installed, Some(key))?;
+        if evidence.key_hold()? != Some(hold) || intent.authority_id != authority.identity() {
+            return Err(invalid());
+        }
+        let operation = Operation { predecessor: intent.expected, operation_id: intent.operation_id };
+        match authority.recovery_status(&intent.database, operation).await? {
+            Status::Pending { intent: selected, candidate, installation, final_source_lsn, .. }
+                if selected.destination_cell == intent.cell && candidate == evidence.candidate
+                    && (selected.loss_policy != LossPolicy::Lossless || final_source_lsn == Some(Lsn(evidence.source_lsn)))
+                    && installation.is_none_or(|prior| {
+                        prior.manifest_digest == evidence.manifest_sha256 && prior.key_hold == Some(hold)
+                            && prior.source_cut == SourceCut {
+                                lsn: evidence.source_lsn,
+                                position: evidence.source_position,
+                                system_time: evidence.source_system_time,
+                            }
+                    }) => (),
+            _ => return Err(invalid()),
+        }
+        evidence.version = HOSTED_CUSTODY_VERSION;
+        evidence.objects_sha256 = Some(objects_sha256);
+        Self::signed(evidence, signing_key)
     }
 
     #[cfg(unix)]
@@ -279,7 +332,7 @@ impl Attestation {
 }
 
 #[cfg(unix)]
-pub(super) fn signing_key(path: &Path) -> Result<Ed25519KeyPair> {
+pub(in crate::multi) fn signing_key(path: &Path) -> Result<Ed25519KeyPair> {
     let bytes = zeroize::Zeroizing::new(read_file(path, 256, true)?);
     Ed25519KeyPair::from_pkcs8_maybe_unchecked(&bytes).map_err(|_| invalid())
 }
@@ -383,6 +436,7 @@ mod tests {
                 source_position: 11, source_system_time: 13, source_lsn: 17,
                 manifest_sha256: [5; 32],
                 key: Some(KeyEvidence { generation: 1, authority_sha256: fingerprint }),
+                objects_sha256: None,
             }, &signer).unwrap()
         };
         let recovery = |operation_id| RecoveryIntent {
@@ -444,6 +498,7 @@ mod tests {
                 source_lsn: 605,
                 manifest_sha256,
                 key: None,
+                objects_sha256: None,
             },
             &key,
         )
