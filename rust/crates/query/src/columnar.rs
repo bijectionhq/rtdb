@@ -4308,7 +4308,7 @@ impl rtdb_expr::RowInput for BatchRow<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{BooleanArray, Float32Array, Float64Array, Int64Array, StringArray};
+    use arrow_array::{BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, StringArray};
     use rtdb_plan::{BinaryOp, ColumnId, Expr, Schema, UnaryOp};
     use rtdb_types::ScalarType;
 
@@ -4905,6 +4905,71 @@ mod tests {
             outer: crate::context::OuterRows::empty(memory).unwrap(), bindings: None, analysis: None,
         };
         BatchExpressions::new(Box::new(RecordProjectionInput(Some(batch))), schema, expressions, execution)
+    }
+
+    #[tokio::test]
+    async fn bounded_text_cases_write_observed_arrow_results_in_branch_order() {
+        let memory = MemoryBudget::new(1 << 22);
+        let len = 256;
+        let schema = Schema::new(vec![field(0, ScalarType::I64)]).unwrap();
+        let selector = schema.fields()[0].expression();
+        let literal = |text: &str| Expr::Literal(Value::Utf8(text.into()));
+        let divide = |divisor| Expr::binary(BinaryOp::Divide, Expr::Literal(Value::I64(1)), Expr::Literal(Value::I64(divisor)));
+        let failing_candidate = Expr::binary(BinaryOp::Eq, divide(0), Expr::Literal(Value::I64(1)));
+        let expression = Expr::Case {
+            branches: vec![
+                (Expr::binary(BinaryOp::Eq, selector, Expr::Literal(Value::I64(1))), literal("é😀")),
+                (Expr::binary(BinaryOp::Eq, divide(1), Expr::Literal(Value::I64(1))), Expr::Literal(Value::Null)),
+                (failing_candidate.clone(), literal("unreached")),
+            ],
+            otherwise: Box::new(literal("other")),
+        };
+        assert!(matches!(ProjectionValues::new(&expression, &expression.data_type(), len), ProjectionValues::Text(_)));
+        let array = Int64Array::from_iter_values((0..len).map(|row| i64::from(row % 2 == 0)));
+        let batch = ColumnBatch::settled(vec![arrow(Arc::new(array), ScalarType::I64)], len, memory.reserve(0).unwrap()).unwrap();
+        let mut cursor = record_projection_cursor(batch, schema, vec![expression], &memory);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        let [Column::Arrow { array, field, .. }] = page.columns.as_slice() else { panic!("Expected an Arrow text column"); };
+        let actual = array.as_any().downcast_ref::<StringArray>().unwrap();
+        assert!(field.is_nullable());
+        assert!(actual.iter().enumerate().all(|(row, value)| value == (row % 2 == 0).then_some("é😀")));
+
+        let always_null = Expr::Case {
+            branches: vec![(Expr::Literal(Value::Bool(false)), literal("unused"))],
+            otherwise: Box::new(Expr::Literal(Value::Null)),
+        };
+        let reached_error = Expr::Case {
+            branches: vec![(failing_candidate, literal("unreached"))],
+            otherwise: Box::new(literal("other")),
+        };
+        let batch = || ColumnBatch::settled(vec![], len, memory.reserve(0).unwrap()).unwrap();
+        let mut cursor = record_projection_cursor(batch(), Schema::default(), vec![always_null], &memory);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert!(matches!(&page.columns[0], Column::Arrow { logical: Some(LogicalType::Null), .. }));
+        assert!(matches!(
+            ProjectionValues::new(&literal(&"x".repeat(size_of::<Value>())), &LogicalType::Scalar(ScalarType::Utf8), len),
+            ProjectionValues::Dynamic(_)
+        ));
+        let mut cursor = record_projection_cursor(batch(), Schema::default(), vec![reached_error], &memory);
+        assert_eq!(cursor.next_batch().await.err().unwrap().code, "xtdb.expression/division-by-zero");
+    }
+
+    #[tokio::test]
+    async fn scalar_length_over_a_computed_argument_writes_an_i32_column() {
+        let memory = MemoryBudget::new(1 << 22);
+        let len = 256;
+        let length = Expr::Call {
+            name: "octet_length".into(),
+            args: vec![Expr::Coalesce(vec![Expr::Literal(Value::Null), Expr::Literal(Value::Utf8("é😀".into()))])],
+            return_type: LogicalType::Scalar(ScalarType::I32),
+        };
+        assert!(matches!(ProjectionValues::new(&length, &length.data_type(), len), ProjectionValues::I32(_)));
+        let batch = ColumnBatch::settled(vec![], len, memory.reserve(0).unwrap()).unwrap();
+        let mut cursor = record_projection_cursor(batch, Schema::default(), vec![length], &memory);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        let [Column::Arrow { array, .. }] = page.columns.as_slice() else { panic!("Expected an Arrow integer column"); };
+        let values = array.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert!(values.iter().all(|value| value == Some(6)));
     }
 
     #[tokio::test]
@@ -5963,10 +6028,22 @@ enum ProjectionValues {
     I64(Int64Builder),
     F32(Float32Builder),
     F64(Float64Builder),
+    Text(StringBuilder),
 }
 
 impl ProjectionValues {
     fn new(expression: &Expr, output: &LogicalType, len: usize) -> Self {
+        if plain_scalar(output) == Some(&ScalarType::Utf8)
+            && let Some(width) = literal_text_result_width(expression)
+            && let Some(payload) = len.checked_mul(width).filter(|bytes| *bytes <= i32::MAX as usize)
+            && let Some(value_slots) = len.checked_mul(size_of::<Value>())
+            && len.checked_add(1).and_then(|offsets| offsets.checked_mul(size_of::<i32>()))
+                .and_then(|offsets| offsets.checked_add(payload))
+                .and_then(|bytes| bytes.checked_add(len.div_ceil(8) + 512))
+                .is_some_and(|bound| bound <= value_slots)
+        {
+            return Self::Text(StringBuilder::with_capacity(len, payload));
+        }
         let fixed = plain_scalar(output).filter(|scalar| {
             matches!(
                 scalar,
@@ -6004,6 +6081,8 @@ impl ProjectionValues {
             (Self::F32(values), Value::Null) => values.append_null(),
             (Self::F64(values), Value::F64(value)) => values.append_value(value),
             (Self::F64(values), Value::Null) => values.append_null(),
+            (Self::Text(values), Value::Utf8(value)) => values.append_value(value),
+            (Self::Text(values), Value::Null) => values.append_null(),
             _ => return Err(rtdb_types::Anomaly::fault("rtdb.query/scalar-result", "Projection returned a value outside its fixed result type")),
         }
         Ok(())
@@ -6012,14 +6091,29 @@ impl ProjectionValues {
     fn finish(self) -> Result<Column> {
         match self {
             Self::Dynamic(values) => Ok(Column::Values(values)),
-            Self::Bool(mut values) => fixed_width_column(values.finish()),
-            Self::I8(mut values) => fixed_width_column(values.finish()),
-            Self::I16(mut values) => fixed_width_column(values.finish()),
-            Self::I32(mut values) => fixed_width_column(values.finish()),
-            Self::I64(mut values) => fixed_width_column(values.finish()),
-            Self::F32(mut values) => fixed_width_column(values.finish()),
-            Self::F64(mut values) => fixed_width_column(values.finish()),
+            Self::Bool(mut values) => observed_scalar_column(values.finish()),
+            Self::I8(mut values) => observed_scalar_column(values.finish()),
+            Self::I16(mut values) => observed_scalar_column(values.finish()),
+            Self::I32(mut values) => observed_scalar_column(values.finish()),
+            Self::I64(mut values) => observed_scalar_column(values.finish()),
+            Self::F32(mut values) => observed_scalar_column(values.finish()),
+            Self::F64(mut values) => observed_scalar_column(values.finish()),
+            Self::Text(mut values) => observed_scalar_column(values.finish()),
         }
+    }
+}
+
+fn literal_text_result_width(expression: &Expr) -> Option<usize> {
+    match expression {
+        Expr::Literal(Value::Null) => Some(0),
+        Expr::Literal(Value::Utf8(text)) => Some(text.len()),
+        Expr::Case { branches, otherwise } | Expr::SimpleCase { branches, otherwise, .. } => {
+            branches.iter().map(|(_, value)| value).chain([otherwise.as_ref()]).try_fold(0, |width, value| {
+                stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || literal_text_result_width(value))
+                    .map(|next| width.max(next))
+            })
+        }
+        _ => None,
     }
 }
 
@@ -6030,10 +6124,14 @@ fn fixed_projection_result(expression: &Expr, scalar: &ScalarType) -> bool {
                 stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || fixed_projection_result(value, scalar))
             })
         }
-        Expr::Call { name, args, .. } if args.len() == 1 && *scalar == ScalarType::F64 => matches!(
-            rtdb_expr::kernels::Function::resolve(name),
-            Some(rtdb_expr::kernels::Function::Floor | rtdb_expr::kernels::Function::Ceil),
-        ),
+        Expr::Call { name, args, .. } if args.len() == 1 => {
+            use rtdb_expr::kernels::Function;
+            match Function::resolve(name) {
+                Some(Function::Floor | Function::Ceil) => *scalar == ScalarType::F64,
+                Some(Function::Length | Function::OctetLength) => *scalar == ScalarType::I32,
+                _ => false,
+            }
+        }
         Expr::Unary { op: UnaryOp::IsNull | UnaryOp::IsNotNull | UnaryOp::IsUnknown | UnaryOp::IsTrue | UnaryOp::IsFalse, .. } => {
             *scalar == ScalarType::Bool
         }
@@ -6075,12 +6173,12 @@ async fn evaluate_score_column(
         scope.reset()?;
     }
 
-    let column = fixed_width_column(scores.finish())?;
+    let column = observed_scalar_column(scores.finish())?;
     settle_primitive_column(&column, lease, retained)?;
     Ok(Some(column))
 }
 
-fn fixed_width_column(values: impl Array + 'static) -> Result<Column> {
+fn observed_scalar_column(values: impl Array + 'static) -> Result<Column> {
     let len = values.len();
     let nulls = values.null_count();
     let (array, nullable): (ArrayRef, bool) = if nulls == len {

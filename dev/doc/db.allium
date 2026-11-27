@@ -2556,6 +2556,7 @@ surface QueryAccess {
         -- Its columnar result is split to the transport row limit after the operators have processed the complete page.
         -- Scalar evaluation in columnar projections, filters, aggregate filters, and evaluated UNNEST can borrow the cells demanded by the expression.
         -- Scalar COALESCE can pass the selected Arrow string through to concatenation or regular expression replacement as borrowed text.
+        -- Scalar character and octet length calls can also measure the selected text without copying it into an owned argument.
         -- Character and octet lengths and supported unary floating-point calls can read the active cells of selected and run-end encoded inputs and write fixed-width Arrow results.
         -- ROUND with a literal or omitted scale can read Float32 and Float64 column cells in place through compatible selections, unions and run ends, writing admitted Float64 results and reporting overflow only for reached non-null cells.
         -- A projection casting a numeric column to double precision can read supported signed integer and floating-point cells through compatible selections, unions and run ends and write admitted Float64 results.
@@ -2564,6 +2565,7 @@ surface QueryAccess {
         -- A CASE projection with cosine scores, double literals or null as its only results can write Arrow values and validity as each row's selected branch is evaluated.
         -- Scalar-evaluated projections with provably fixed Boolean, signed integer, Float32 or Float64 results can write them directly to Arrow in row order.
         -- These include truth tests, FLOOR and CEILING, and CASE expressions with compatible results, which evaluate only the branch each row reaches.
+        -- A CASE with UTF-8 or null literals as results can write the selected text directly to Arrow when its maximum output fits the page reservation.
         -- The result uses observed nullability and a NULL vector when every selected result is null.
         -- Scalar-evaluated results that lack a compatible fixed writer use the generic packing path.
         -- Columnar text search reads compatible Arrow text and bound corpus statistics from their selected cells.

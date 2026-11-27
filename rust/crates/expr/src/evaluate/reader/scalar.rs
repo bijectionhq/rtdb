@@ -517,6 +517,24 @@ fn call<'a>(function: ResolvedFunction<'a>, args: &'a [Expr], ty: LogicalType, f
             if argument.is_null() && shortcut_null { return nil(frame); }
             arguments.push(argument);
         }
+        if arguments.len() == 1 && matches!(function, ResolvedFunction::Known(
+            ScalarFunction::Length | ScalarFunction::String(StringFunction::CharacterLength | StringFunction::OctetLength)
+        )) {
+            let argument = arguments.pop().expect("validated length argument");
+            return deferred(ty, async move {
+                frame.context.reserve(std::mem::size_of::<EvalValue<'_>>())?;
+                let input = argument.demand_output().await?;
+                if let Output::Text(text, _) = input {
+                    let size = if function == ResolvedFunction::Known(ScalarFunction::String(StringFunction::OctetLength)) {
+                        text.len()
+                    } else {
+                        text.chars().count()
+                    };
+                    return Ok(scalar(Value::I32(i32::try_from(size).map_err(|_| overflow())?)));
+                }
+                calls::apply(function, vec![input.into_value()?], frame)?.await
+            }, frame);
+        }
         if function == ResolvedFunction::Known(ScalarFunction::String(StringFunction::Concat))
             && plain_type(&ty) == &LogicalType::Scalar(ScalarType::Utf8)
         {
@@ -852,6 +870,30 @@ mod tests {
         ] {
             let result = evaluate(&expression, &frame).unwrap().await.unwrap();
             assert!(is_null(&result));
+        }
+    }
+
+    #[tokio::test]
+    async fn length_calls_measure_the_selected_text_without_owning_it() {
+        let field = Field { id: ColumnId(0), name: "source".into(), qualifier: None,
+            qualified_only: false, unnamed: false, data_type: LogicalType::Scalar(ScalarType::Utf8).maybe() };
+        let column = field.expression();
+        let schema = Schema::new(vec![field]).unwrap();
+        let field = arrow_schema::Field::new("source", DataType::Utf8, true);
+        let text = "é😀".repeat(1 << 18);
+        let array = StringArray::from(vec![Some(text.as_str()), None]);
+        let memory = rtdb_columnar::MemoryBudget::new(1 << 18);
+        for (name, size) in [("length", 2 << 18), ("character_length", 2 << 18), ("octet_length", 6 << 18)] {
+            let args = vec![Expr::Coalesce(vec![column.clone(), Expr::Literal(Value::Null)])];
+            let expr = Expr::Call { name: name.into(), return_type: function_type_with_args(name, &args).unwrap(), args };
+            for (row, expected) in [(0, Value::I32(size)), (1, Value::Null)] {
+                let allocation = crate::EvaluationScope::new(&memory).unwrap();
+                let context = EvalContext::default().with_allocation(&allocation);
+                let input = TextRow(ArrowCell { field: &field, array: &array, row });
+                let invocation = crate::ExpressionInvocation::prepare(&expr, &schema, &context).unwrap();
+                let value = invocation.evaluate_projection_row_async(ExpressionRow::Borrowed(&input), &context).await.unwrap();
+                assert_eq!(value, expected);
+            }
         }
     }
 }
