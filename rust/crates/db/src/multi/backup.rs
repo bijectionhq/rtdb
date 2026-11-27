@@ -252,7 +252,7 @@ impl MultiDatabase {
 }
 
 fn backup_context(header: &[u8]) -> Context {
-    Context::CustodyValue { binding: Sha256::digest(header).into() }
+    Context::PortableBackup { header_digest: Sha256::digest(header).into() }
 }
 
 fn require_durable_custody(kms: &dyn Kms) -> Result<()> {

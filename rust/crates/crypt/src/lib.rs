@@ -56,6 +56,7 @@ pub enum Context {
     Manifest { epoch: u64, seq: u64 },
     Journal { lsn: u64 },
     CustodyValue { binding: [u8; 32] },
+    PortableBackup { header_digest: [u8; 32] },
 }
 
 const HEADER: &[u8; 6] = b"RTDBE\x01";
@@ -83,6 +84,10 @@ impl Context {
             Self::CustodyValue { binding } => {
                 bytes.push(4);
                 bytes.extend_from_slice(&binding);
+            }
+            Self::PortableBackup { header_digest } => {
+                bytes.push(5);
+                bytes.extend_from_slice(&header_digest);
             }
         }
         bytes
