@@ -2575,7 +2575,7 @@ surface QueryAccess {
         -- Outer joins track unmatched build positions through partition replay.
         -- Correlated Apply retains dependent Arrow pages as ordered spans with an outer position for each span.
         -- A left, single or scalar Apply with no match retains one outer position with a missing dependent row.
-        -- A left lateral UNNEST with a supported total predicate processes the real candidates of each reached input page and retains each candidate for which the predicate is true.
+        -- A left lateral UNNEST under consecutive filters with supported total predicates processes the real candidates of each reached input page and retains each candidate for which every predicate is true.
         -- Candidate predicate evaluation uses bounded batches and delivers each reached input page's complete ordered expansion together.
         -- A batched left lateral UNNEST cursor trace counts real candidates and their true survivors from completed input pages.
         -- An admitted fixed-size Arrow list has the declared width and contributes the selected parent's child span within the reached slice.

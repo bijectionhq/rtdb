@@ -1049,7 +1049,7 @@ async fn left_unnest_batches_dense_unions_and_keeps_fallible_mixed_ordering_on_a
 
     let ordinal = typed(42, "n", int());
     let context = context();
-    let left_unnest = |element: &Field, parents: &[Value], predicate| {
+    let left_unnest = |element: &Field, parents: &[Value], predicates: Vec<Expr>| {
         let list_type = LogicalType::from_legs([LogicalType::list(element.data_type.clone()), bool_type()]);
         let list = typed(40, "items", list_type);
         let schema = Arc::new(ArrowSchema::new(vec![to_field("items", &list.data_type).unwrap()]));
@@ -1064,7 +1064,8 @@ async fn left_unnest_batches_dense_unions_and_keeps_fallible_mixed_ordering_on_a
         let table = Arc::new(Relation::new(Schema::new(vec![element.clone()]).unwrap(),
             RelationNode::ColumnTable { expr: parameter(0, &list), element: element.clone() }).unwrap());
         let table = Arc::new(table.with_ordinality(ordinal.clone(), rtdb_plan::OrdinalityScope::Page).unwrap());
-        let relation = apply(&input, select(table, predicate), vec![(0, list.expression())], ApplyKind::Left, None);
+        let dependent = predicates.into_iter().fold(table, select);
+        let relation = apply(&input, dependent, vec![(0, list.expression())], ApplyKind::Left, None);
         let output = [element.id, ordinal.id].map(|id| relation.schema().get(id).unwrap().clone());
         keep(relation, &output)
     };
@@ -1073,13 +1074,17 @@ async fn left_unnest_batches_dense_unions_and_keeps_fallible_mixed_ordering_on_a
     let integers = typed(41, "item", LogicalType::from_legs([
         LogicalType::Scalar(ScalarType::I32), int(), LogicalType::Null,
     ]));
-    let numeric_parents = [Value::list(vec![Value::I32(1), Value::I64(boundary), Value::I64(boundary + 1)]), Value::Bool(true)];
+    let numeric_parents = [
+        Value::list(vec![Value::I64(boundary + 2), Value::I32(1), Value::I64(boundary), Value::I64(boundary + 1)]),
+        Value::Bool(true),
+    ];
     let exact = Expr::binary(BinaryOp::Gt, integers.expression(), literal(boundary));
-    let (correlated, rewritten) = both_ways(&left_unnest(&integers, &numeric_parents, exact));
+    let later_ordinal = Expr::binary(BinaryOp::Gt, ordinal.expression(), literal(1));
+    let (correlated, rewritten) = both_ways(&left_unnest(&integers, &numeric_parents, vec![exact, later_ordinal.clone()]));
     assert_eq!(count_nodes(rewritten.relation(), &|node| matches!(node, RelationNode::Apply { kind: ApplyKind::LeftUnnest, .. })), 1);
-    let expected = ["[I64(9007199254740993), I64(3)]", "[Null, Null]"];
+    let expected = ["[I64(9007199254740993), I64(4)]", "[Null, Null]"];
     assert_eq!(run_in_order(&correlated).await.unwrap(), expected);
-    assert_eq!(run_with_unnest_trace(&rewritten, Arc::clone(&context), (3, 1)).await, expected);
+    assert_eq!(run_with_unnest_trace(&rewritten, Arc::clone(&context), (4, 1)).await, expected);
 
     let element = typed(41, "item", LogicalType::from_legs([
         LogicalType::Scalar(ScalarType::I32), int(), bool_type(), LogicalType::Null,
@@ -1089,13 +1094,15 @@ async fn left_unnest_batches_dense_unions_and_keeps_fallible_mixed_ordering_on_a
         Value::list(vec![Value::Bool(false)]),
     ];
     let total = Expr::binary(BinaryOp::Or, Expr::unary(UnaryOp::IsNull, element.expression()), equals(ordinal.expression(), literal(1)));
-    let (correlated, rewritten) = both_ways(&left_unnest(&element, &mixed_parents, total));
+    let (correlated, rewritten) = both_ways(&left_unnest(&element, &mixed_parents, vec![total]));
     assert_eq!(count_nodes(rewritten.relation(), &|node| matches!(node, RelationNode::Apply { kind: ApplyKind::LeftUnnest, .. })), 1);
     let expected = ["[I32(-1), I64(1)]", "[Null, I64(3)]", "[Bool(false), I64(1)]"];
     assert_eq!(run_in_order(&correlated).await.unwrap(), expected);
     assert_eq!(run_with_unnest_trace(&rewritten, Arc::clone(&context), (4, 3)).await, expected);
 
-    let fallible = left_unnest(&element, &mixed_parents, Expr::binary(BinaryOp::Gt, element.expression(), literal(0)));
+    let fallible = Expr::binary(BinaryOp::Gt, element.expression(), literal(0));
+    let positive_ordinal = Expr::binary(BinaryOp::Gt, ordinal.expression(), literal(0));
+    let fallible = left_unnest(&element, &mixed_parents, vec![fallible, positive_ordinal]);
     let limited = Arc::new(Arc::clone(&fallible).limit(None, Some(literal(1))).unwrap());
     let (correlated, rewritten) = both_ways(&limited);
     assert_eq!(applies(rewritten.relation()), 1);

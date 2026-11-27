@@ -922,9 +922,10 @@ fn column_table(input: &Arc<Relation>, dependent: &Arc<Relation>, correlation: &
 fn filtered_left_unnest(input: &Arc<Relation>, dependent: &Arc<Relation>, correlation: &Correlation<'_>, ids: &mut Ids) -> Result<Option<Arc<Relation>>> {
     let Some((list, element, ordinality, _)) = filtered_left_unnest_source(input, dependent, correlation.arguments)
         else { return Ok(None); };
-    let RelationNode::Filter { predicate, .. } = dependent.node() else { unreachable!(); };
+    let RelationNode::Filter { input: filtered, predicate } = dependent.node() else { unreachable!(); };
     match unnest_input(input) {
-        Some(UnnestInput::PlainLiterals) if plain_unnest_list(&list.data_type) && total_outer_predicate(predicate, correlation) => {
+        Some(UnnestInput::PlainLiterals) if !matches!(filtered.node(), RelationNode::Filter { .. })
+            && plain_unnest_list(&list.data_type) && total_outer_predicate(predicate, correlation) => {
             let list = Expr::Case {
                 branches: vec![(correlation.substitute(predicate.clone()), list.expression())],
                 otherwise: Box::new(Expr::Literal(Value::Null)),
@@ -945,10 +946,16 @@ fn filtered_left_unnest(input: &Arc<Relation>, dependent: &Arc<Relation>, correl
 pub(crate) fn filtered_left_unnest_source<'a>(
     input: &'a Relation, dependent: &'a Relation, arguments: &[(usize, Expr)],
 ) -> Option<(&'a Field, &'a Field, Option<&'a Field>, Expr)> {
-    let RelationNode::Filter { input: table, predicate } = dependent.node() else { return None; };
+    let mut table = dependent;
+    let mut predicates = Vec::new();
+    while let RelationNode::Filter { input, predicate } = table.node() {
+        predicates.push(predicate);
+        table = input;
+    }
+    if predicates.is_empty() { return None; }
     let (column_table, ordinality) = match table.node() {
         RelationNode::Ordinality { input, field, scope: OrdinalityScope::Page } => (input.as_ref(), Some(field)),
-        _ => (table.as_ref(), None),
+        _ => (table, None),
     };
     let RelationNode::ColumnTable { expr: Expr::Parameter { index, data_type }, element } = column_table.node()
         else { return None; };
@@ -969,15 +976,18 @@ pub(crate) fn filtered_left_unnest_source<'a>(
             return None;
         }
     }
-    let mut captures_valid = true;
-    predicate.visit(&mut |expr| if let Expr::Parameter { index, data_type } = expr {
-        captures_valid &= arguments.iter().any(|(slot, argument)| slot == index && argument.data_type() == *data_type);
-    });
-    if !captures_valid { return None; }
     let correlation = Correlation { arguments };
     let schema = input.schema().concat(table.schema()).ok()?;
-    let predicate = correlation.substitute(predicate.clone());
-    total_unnest_predicate(&predicate, &schema).then_some((list, element, ordinality, predicate))
+    let predicates = predicates.into_iter().rev().map(|predicate| {
+        let mut captures_valid = true;
+        predicate.visit(&mut |expr| if let Expr::Parameter { index, data_type } = expr {
+            captures_valid &= arguments.iter().any(|(slot, argument)| slot == index && argument.data_type() == *data_type);
+        });
+        if !captures_valid { return None; }
+        let predicate = correlation.substitute(predicate.clone());
+        total_unnest_predicate(&predicate, &schema).then_some(predicate)
+    }).collect::<Option<Vec<_>>>()?;
+    Some((list, element, ordinality, conjunction(predicates)?))
 }
 
 fn plain_unnest_scalar(ty: &LogicalType) -> bool {
