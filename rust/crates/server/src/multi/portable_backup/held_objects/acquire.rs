@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use rtdb_s3::VersionedInventory;
-use rtdb_storage::{Error, ObjectKey, remote::decode_provider_key};
+use rtdb_storage::{ObjectKey, remote::decode_provider_key};
 
 use super::*;
 use crate::multi::activation::{ActivationAuthority, operator::attestation};
@@ -26,6 +26,19 @@ struct HoldPlan {
     journal_anchor: Option<journal_contract::CheckpointAnchor>,
     checkpoint: String,
     versions: Vec<PhysicalObjectVersion>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum Acquisition {
+    Planned(HoldPlan),
+    Closed(ClosedAcquisition),
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ClosedAcquisition {
+    abandoned_before_acquisition: RecoveryKeyHold,
 }
 
 impl Acquirer {
@@ -73,7 +86,11 @@ impl Acquirer {
         }
         let key_hold = receipt.key_hold;
         let plan_key = acquisition_key(key_hold.authority, key_hold.generation.database)?;
-        let saved = read_plan(store.as_ref(), &plan_key).await?;
+        let saved = match read_acquisition(store.as_ref(), &plan_key).await? {
+            Some(Acquisition::Planned(plan)) => Some(plan),
+            Some(Acquisition::Closed(_)) => return Err(invalid_plan()),
+            None => None,
+        };
         if saved.as_ref().is_some_and(|plan| plan.key_hold != key_hold) {
             return Err(invalid_plan());
         }
@@ -107,7 +124,9 @@ impl Acquirer {
                 return Err(invalid_plan());
             }
             store.put(&plan_key, Bytes::from(bytes)).await?;
-            if read_plan(store.as_ref(), &plan_key).await?.as_ref() != Some(&plan) {
+            if !matches!(read_acquisition(store.as_ref(), &plan_key).await?,
+                Some(Acquisition::Planned(observed)) if observed == plan)
+            {
                 return Err(invalid_plan());
             }
             receipt.require_pending(authority, observed.installation.source_lsn()).await?;
@@ -166,15 +185,37 @@ fn acquisition_key(authority: Uuid, candidate: Uuid) -> Result<ObjectKey> {
     Ok(ObjectKey::new(format!("recovery-custody/{authority}/{candidate}/acquisition"))?)
 }
 
-async fn read_plan(store: &dyn ObjectStore, key: &ObjectKey) -> Result<Option<HoldPlan>> {
-    let size = match store.head_fresh(key).await {
-        Ok(metadata) => metadata.size,
-        Err(Error::MissingObject(_)) => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let size = usize::try_from(size).ok().filter(|size| *size <= MAX_PLAN_BYTES).ok_or_else(invalid_plan)?;
-    let bytes = store.get_fresh_exact(key, size).await?;
-    serde_json::from_slice(&bytes).map(Some).map_err(|_| invalid_plan())
+async fn read_acquisition(store: &dyn ObjectStore, key: &ObjectKey) -> Result<Option<Acquisition>> {
+    read_provider_record(store, key, MAX_PLAN_BYTES).await
+}
+
+pub(in crate::multi::portable_backup) async fn require_staging_open(
+    store: &dyn ObjectStore, hold: RecoveryKeyHold,
+) -> Result<()> {
+    let key = acquisition_key(hold.authority, hold.generation.database)?;
+    if matches!(read_acquisition(store, &key).await?, Some(Acquisition::Closed(_))) {
+        return Err(invalid_plan());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(super) async fn require_attestation_plan(
+    store: &dyn ObjectStore, receipt: &staged::StageReceipt, readback: &Readback,
+) -> Result<()> {
+    let hold = receipt.key_hold;
+    if staged::read_staging_order(store, hold.authority, hold.generation.database).await?.is_none() {
+        return Ok(());
+    }
+    let key = acquisition_key(hold.authority, hold.generation.database)?;
+    match read_acquisition(store, &key).await? {
+        Some(Acquisition::Planned(plan)) if plan.key_hold == hold
+            && plan.intent.as_ref().is_none_or(|intent| *intent == receipt.intent)
+            && plan.checkpoint == readback.checkpoint
+            && plan.versions == readback.held_versions
+            && plan.journal_head == readback.journal_head => Ok(()),
+        _ => Err(invalid_plan()),
+    }
 }
 
 fn invalid_plan() -> Anomaly {

@@ -235,6 +235,21 @@ impl KeeperJournal {
         Ok(())
     }
 
+    #[cfg(all(unix, feature = "backup-object-holds"))]
+    pub(in crate::multi) async fn retire_unacquired(&self, candidate: Uuid) -> Result<()> {
+        let stream = StreamId(candidate.as_u128());
+        match self.journal.create_immutable(stream).await {
+            Ok(()) => self.journal.delete(stream).await.map_err(journal_error)?,
+            Err(JournalError::Deleted) => (),
+            Err(error) => return Err(journal_error(error)),
+        }
+        match self.journal.head(stream).await {
+            Err(JournalError::Deleted) => Ok(()),
+            Ok(_) => Err(conflict()),
+            Err(error) => Err(journal_error(error)),
+        }
+    }
+
     pub(super) async fn require_retained(
         &self,
         candidate: Uuid,

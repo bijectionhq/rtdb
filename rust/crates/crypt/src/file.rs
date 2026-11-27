@@ -7,6 +7,7 @@ use std::{
 
 use async_trait::async_trait;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
+use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use super::{DataKey, Generation, Kms, RecoveryKeyHold, aead, erased_under_view};
@@ -57,6 +58,50 @@ impl FileKms {
         }
     }
 
+    pub async fn enroll_recovery_vault(&self) -> Result<Uuid> {
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || {
+            let path = root.join("recovery-vault-id");
+            if let Some(identity) = read_vault_identity(&path)? {
+                File::open(root.as_ref()).and_then(|root| root.sync_all()).map_err(io_error)?;
+                return Ok(identity);
+            }
+            let identity = Uuid::new_v4();
+            let mut file = tempfile::NamedTempFile::new_in(&root).map_err(io_error)?;
+            file.write_all(identity.as_bytes()).map_err(io_error)?;
+            file.as_file().sync_all().map_err(io_error)?;
+            match file.persist_noclobber(&path) {
+                Ok(_) => (),
+                Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => (),
+                Err(error) => return Err(io_error(error.error)),
+            }
+            File::open(root.as_ref()).and_then(|root| root.sync_all()).map_err(io_error)?;
+            read_vault_identity(&path)?.ok_or_else(invalid_vault)
+        }).await.map_err(vault_task_error)?
+    }
+
+    pub async fn require_recovery_vault(&self, identity: Uuid) -> Result<()> {
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || check_vault_identity(&root, identity))
+            .await.map_err(vault_task_error)?
+    }
+
+    pub async fn abandon_recovery_key(&self, identity: Uuid, hold: RecoveryKeyHold) -> Result<()> {
+        validate_hold(hold)?;
+        self.access(hold.generation, move |slot, state, _| {
+            check_vault_identity(&slot.root, identity)?;
+            match state.map(|state| state.custody) {
+                None | Some(Custody::Unrestricted) => (),
+                Some(Custody::Recovery(RecoveryCustody::Held { hold: existing }
+                    | RecoveryCustody::Released { hold: existing, .. })) if existing == hold => (),
+                Some(Custody::Recovery(RecoveryCustody::Abandoned { hold: existing })) if existing == hold =>
+                    return slot.sync(),
+                _ => return Err(conflict("This generation already has a different custody decision")),
+            }
+            slot.write_abandoned(hold)
+        }).await
+    }
+
     async fn access<T: Send + 'static>(
         &self,
         generation: Generation,
@@ -85,8 +130,32 @@ impl FileKms {
             action(&slot, state, (vault.now)())
         })
         .await
-        .map_err(|error| Anomaly::fault("rtdb.crypt/key-vault", error.to_string()))?
+        .map_err(vault_task_error)?
     }
+}
+
+fn read_vault_identity(path: &Path) -> Result<Option<Uuid>> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error(error)),
+    };
+    let mut bytes = Vec::with_capacity(17);
+    file.take(17).read_to_end(&mut bytes).map_err(io_error)?;
+    let identity = Uuid::from_slice(&bytes).map_err(|_| invalid_vault())?;
+    if identity.is_nil() { return Err(invalid_vault()); }
+    Ok(Some(identity))
+}
+
+fn check_vault_identity(root: &Path, identity: Uuid) -> Result<()> {
+    if read_vault_identity(&root.join("recovery-vault-id"))? == Some(identity) {
+        return Ok(());
+    }
+    Err(conflict("The recovery must use its original generation vault"))
+}
+
+fn vault_task_error(error: tokio::task::JoinError) -> Anomaly {
+    Anomaly::fault("rtdb.crypt/key-vault", error.to_string())
 }
 
 struct State {
@@ -131,6 +200,9 @@ enum RecoveryCustody {
         hold: RecoveryKeyHold,
         unreadable_by: Option<i64>,
     },
+    Abandoned {
+        hold: RecoveryKeyHold,
+    },
 }
 
 impl Custody {
@@ -156,12 +228,17 @@ impl Slot {
             Err(error) => return Err(io_error(error)),
         };
         let mut bytes = Zeroizing::new(Vec::with_capacity(34));
-        file.take(34).read_to_end(&mut bytes).map_err(io_error)?;
+        file.take(1025).read_to_end(&mut bytes).map_err(io_error)?;
         let key = match bytes.as_slice() {
             [0, key @ ..] if key.len() == 32 => {
                 Some(DataKey::new(key.try_into().map_err(|_| invalid_slot())?))
             }
             [2] => None,
+            [3, encoded @ ..] if encoded.len() < 1024 => {
+                let hold = serde_json::from_slice(encoded).map_err(|_| invalid_slot())?;
+                validate_hold(hold).map_err(|_| invalid_slot())?;
+                return Ok(Some(State { key: None, custody: Custody::Recovery(RecoveryCustody::Abandoned { hold }) }));
+            }
             _ => return Err(invalid_slot()),
         };
         Ok(Some(State {
@@ -187,9 +264,10 @@ impl Slot {
         if bytes.len() > 1024 {
             return Err(invalid_slot());
         }
-        serde_json::from_slice(&bytes)
-            .map(Custody::Recovery)
-            .map_err(|_| invalid_slot())
+        match serde_json::from_slice(&bytes).map_err(|_| invalid_slot())? {
+            RecoveryCustody::Abandoned { .. } => Err(invalid_slot()),
+            custody => Ok(Custody::Recovery(custody)),
+        }
     }
 
     fn write_retirement(&self, deadline: i64) -> Result<()> {
@@ -208,6 +286,12 @@ impl Slot {
         let mut bytes = Zeroizing::new([0; 33]);
         bytes[1..].copy_from_slice(key.as_ref());
         self.write(&self.path, bytes.as_ref())
+    }
+
+    fn write_abandoned(&self, hold: RecoveryKeyHold) -> Result<()> {
+        let mut bytes = vec![3];
+        serde_json::to_writer(&mut bytes, &hold).map_err(|_| invalid_slot())?;
+        self.write(&self.path, &bytes)
     }
 
     fn write(&self, path: &Path, bytes: &[u8]) -> Result<()> {
@@ -288,6 +372,7 @@ impl Kms for FileKms {
                 Custody::Recovery(RecoveryCustody::Held { .. }) => {
                     Err(conflict("The staged recovery still holds this generation"))
                 }
+                Custody::Recovery(RecoveryCustody::Abandoned { .. }) => Err(erased_under_view()),
                 Custody::Recovery(RecoveryCustody::Released {
                     hold,
                     unreadable_by: None,
@@ -390,6 +475,7 @@ impl Kms for FileKms {
                     })
                 }
                 Custody::Recovery(RecoveryCustody::Released { hold: existing, .. })
+                | Custody::Recovery(RecoveryCustody::Abandoned { hold: existing })
                     if existing == hold =>
                 {
                     slot.sync()

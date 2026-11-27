@@ -1255,6 +1255,9 @@ contract PortableApplicationBackup {
 
     @invariant HostedAbandonment
         -- The activation broker proves abandonment at the original binding before authorizing settlement.
+        -- The staging writer records the exact intent, destination journal and vault before creating a stream or allocating its generation.
+        -- The original object allocation orders a saved acquisition plan and closure before acquisition on the same immutable record.
+        -- Pre-acquisition closure retires the destination journal and permanently fences the original generation before a late staging writer can recreate it.
         -- Before replacing a recovery publication, the activation authority preserves the previous publication in an immutable record addressed by its predecessor binding.
         -- A retained publication identifies the original chosen recovery and settles the disposition of other candidates derived from the same predecessor.
         -- For an interrupted acquisition, the broker confirms the selected checkpoint with the custodian enrolled for the destination cell.

@@ -10,6 +10,7 @@ use rtdb_types::PhysicalObjectVersion;
 
 mod acquire;
 pub(super) use acquire::Acquirer;
+pub(super) use acquire::require_staging_open;
 #[cfg(unix)]
 pub(super) use acquire::Abandon;
 
@@ -84,6 +85,18 @@ pub(super) fn read_receipt<T: serde::de::DeserializeOwned>(path: &Path, max_byte
     serde_json::from_slice(&bytes).map_err(|_| invalid_readback())
 }
 
+pub(super) async fn read_provider_record<T: serde::de::DeserializeOwned>(
+    store: &dyn ObjectStore, key: &rtdb_storage::ObjectKey, limit: usize,
+) -> Result<Option<T>> {
+    let size = match store.head_fresh(key).await {
+        Ok(metadata) => usize::try_from(metadata.size).ok().filter(|size| *size <= limit).ok_or_else(invalid_readback)?,
+        Err(rtdb_storage::Error::MissingObject(_)) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let bytes = store.get_fresh_exact(key, size).await?;
+    serde_json::from_slice(&bytes).map(Some).map_err(|_| invalid_readback())
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct Verifier {
     archive: PathBuf,
@@ -150,6 +163,12 @@ impl Verifier {
                 (Some(readback), ReadSource::SavedVersions) => inventory.pinned_read_store(&readback.held_versions)?,
                 _ => self.destination.objects.open(&root, &remotes, Arc::clone(&io)).await?,
             };
+            #[cfg(unix)]
+            if matches!(source, ReadSource::ServingNames)
+                && let (Some(receipt), Some(readback)) = (&staged.receipt, &requested)
+            {
+                acquire::require_attestation_plan(store.as_ref(), receipt, readback).await?;
+            }
             self.inspect(&staged, store, Some(&inventory)).await
         }.await;
         io.close_and_wait().await;
@@ -465,7 +484,7 @@ mod tests {
             destination_cell: Some(cell),
             loss_policy: LossPolicy::AcceptUnknownTail,
         };
-        let stage = |operation_id: Uuid| {
+        let stage_with_credentials = |operation_id: Uuid, journal_tls: &Path| {
             let opts = MultiBackupOptions::parse([
                 "stage".into(), "--archive".into(), archive_path.display().to_string(),
                 "--database".into(), DATABASE.into(),
@@ -474,13 +493,14 @@ mod tests {
                 "--expected-revision".into(), predecessor.revision.to_string(),
                 "--source-key-vault".into(), source_vault.display().to_string(),
                 "--key-vault".into(), vault.display().to_string(),
-                "--journal-url".into(), journal_url.clone(), "--tls-dir".into(), tls.display().to_string(),
+                "--journal-url".into(), journal_url.clone(), "--tls-dir".into(), journal_tls.display().to_string(),
                 "--bucket".into(), bucket.clone(), "--region".into(), "us-east-1".into(),
                 "--s3-endpoint".into(), endpoint.clone(),
             ].into_iter()).unwrap();
             let BackupCommand::Stage(stage) = opts.0 else { panic!("expected a stage command"); };
             stage.run_with_authority(&authority_reader)
         };
+        let stage = |operation_id| stage_with_credentials(operation_id, &tls);
         let lossless_id = Uuid::new_v4();
         let unsealed = Intent {
             operation: Operation { predecessor, operation_id: lossless_id },
@@ -575,7 +595,8 @@ mod tests {
             let BackupCommand::AttestObjects(attester) = options.0 else { panic!("expected hosted attestation"); };
             attester.run_with_authority(&authority_reader)
         };
-        let objects = store.list(None).await.unwrap();
+        let objects: Vec<_> = store.list(None).await.unwrap().into_iter()
+            .filter(|entry| !entry.key.as_str().starts_with("recovery-custody/")).collect();
         assert_eq!(objects.len(), 4);
         let token = &objects.iter().find(|entry| entry.key.as_str().starts_with("~rtdb-v1/")).unwrap().key;
         assert!(verify(None, &receipt_path).await.is_err());
@@ -596,6 +617,11 @@ mod tests {
         assert!(acquire(incarnation, &wrong_receipt_path).await.is_err());
         assert!(acquire(incarnation, &wrong_namespace_path).await.is_err());
         assert!(verify(None, &receipt_path).await.is_err());
+        hold(&store.observe_head(token).await.unwrap().version.unwrap());
+        let manual = home.path().join("manual-readback.json");
+        let report = verify(None, &receipt_path).await.unwrap();
+        fs::write(&manual, serde_json::to_vec(&report).unwrap()).unwrap();
+        assert_eq!(attest(&manual).await.unwrap_err().code, "rtdb/backup-object-acquisition");
         let result = acquire(incarnation, &receipt_path).await.unwrap();
         assert_eq!(verify(None, &receipt_path).await.unwrap(), result);
         assert_eq!(result["object_holds_verified"], true);
@@ -814,7 +840,7 @@ mod tests {
         hold(&unrelated);
         aws("put-object-legal-hold", &["--key", &version.key, "--version-id", &version.version, "--legal-hold", "Status=OFF"]);
 
-        let serving_intent = Intent {
+        let mut serving_intent = Intent {
             operation: Operation { predecessor, operation_id: Uuid::new_v4() },
             ..replacement_intent
         };
@@ -854,6 +880,34 @@ mod tests {
         };
         assert!(custodian.retain(abandoned, retained).await.is_err());
         assert!(original_keys.require_recovery_key(plan.key_hold.unwrap()).await.is_err());
+
+        for journal_tls in [&reader_tls, &tls] {
+            let operation = serving_intent.operation;
+            let Status::Pending { candidate, .. } = activation.recovery_status(DATABASE, operation).await.unwrap()
+            else { panic!("expected a staging intent"); };
+            let stream = StreamId(candidate.as_u128());
+            let receipt = stage_with_credentials(operation.operation_id, journal_tls).await;
+            let order = staged::read_staging_order(store.as_ref(), authority, candidate).await.unwrap().unwrap();
+            if journal_tls == &reader_tls {
+                assert!(receipt.is_err());
+                assert!(matches!(journal.head(stream).await, Err(JournalError::NotFound)));
+            } else {
+                assert!(receipt.is_ok());
+                original_keys.require_recovery_key(order.key_hold).await.unwrap();
+            }
+            assert!(discover(candidate, &vault).await.is_err());
+            serving_intent.operation.operation_id = Uuid::new_v4();
+            activation.begin_recovery(DATABASE, serving_intent, Some(operation.operation_id)).await.unwrap();
+            assert!(discover(candidate, &empty_vault).await.is_err());
+            assert!(!original_keys.generation_destroyed(order.key_hold.generation).await.unwrap());
+            let retired = discover(candidate, &vault).await.unwrap();
+            assert_eq!(retired["journal_retired"], true);
+            assert_eq!(retired["generation_destroyed"], true);
+            assert_eq!(discover(candidate, &vault).await.unwrap(), retired);
+            assert!(matches!(journal.head(stream).await, Err(JournalError::Deleted)));
+            assert!(journal.create_immutable(stream).await.is_err());
+            assert!(original_keys.create(order.key_hold.generation).await.is_err());
+        }
 
         let operation = serving_intent.operation;
         let Status::Pending { candidate, .. } = activation.recovery_status(DATABASE, operation).await.unwrap()

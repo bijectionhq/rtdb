@@ -48,7 +48,7 @@ Stage installs a pending activation's backup in S3 and holds its destination key
 Verify-object-holds reads a staged immutable journal and an S3 allocation.
 Pass a saved readback to reopen and verify its exact S3 versions.
 Acquire-object-holds selects and retains the staged backup's exact S3 versions, then emits their verified readback.
-Abandon-object-acquisition settles the exact journal, S3 and generation holds of a superseded acquisition.
+Abandon-object-acquisition settles superseded staging and acquisitions at the original providers.
 Hosted backup commands require the backup-object-holds build feature.
 Attest emits the signed installation proof for the activation broker and requires Unix.
 Release-object-holds settles an abandoned candidate or a published candidate with a replacement checkpoint. It requires Unix.

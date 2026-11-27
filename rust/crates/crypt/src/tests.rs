@@ -61,6 +61,36 @@ async fn recovery_key_hold_survives_reopen_and_remembers_exact_release() {
 }
 
 #[tokio::test]
+async fn abandoned_recovery_generation_blocks_late_creation_and_rejects_another_vault() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("vault");
+    FileKms::create_directory(&path).unwrap();
+    let vault = FileKms::open(&path, || 0).unwrap();
+    let identity = vault.enroll_recovery_vault().await.unwrap();
+    let missing = recovery_hold(generation(1));
+    let existing = recovery_hold(generation(2));
+    vault.create(existing.generation).await.unwrap();
+    vault.retain_recovery_key(existing).await.unwrap();
+    let context = Context::Journal { lsn: 1 };
+    let ciphertext = seal(&vault, existing.generation, context, b"abandoned stage").await.unwrap();
+    assert!(vault.abandon_recovery_key(Uuid::new_v4(), existing).await.is_err());
+    assert!(vault.abandon_recovery_key(identity, RecoveryKeyHold { operation: Uuid::new_v4(), ..existing }).await.is_err());
+    vault.abandon_recovery_key(identity, missing).await.unwrap();
+    vault.abandon_recovery_key(identity, existing).await.unwrap();
+    drop(vault);
+
+    let vault = FileKms::open(&path, || 0).unwrap();
+    assert_eq!(vault.enroll_recovery_vault().await.unwrap(), identity);
+    assert!(vault.create(missing.generation).await.is_err());
+    assert!(vault.retain_recovery_key(existing).await.is_err());
+    assert!(open(&vault, existing.generation.database, context, &ciphertext).await.is_err());
+    for hold in [missing, existing] {
+        assert!(vault.generation_destroyed(hold.generation).await.unwrap());
+        vault.abandon_recovery_key(identity, hold).await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn recovery_key_hold_and_retirement_cannot_both_win_admission() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("vault");

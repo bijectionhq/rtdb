@@ -1,9 +1,10 @@
+use bytes::Bytes;
 use journal_contract::Lsn;
 use rtdb_crypt::RecoveryKeyHold;
 use rtdb_types::S3ObjectNamespace;
 
 use crate::multi::activation::{
-    ActivationAuthority, Binding,
+    ActivationAuthority, Binding, journal_custody::KeeperJournal,
     operator::attestation::{Intent, KeyEvidence},
     recovery::{LossPolicy, Operation, Status},
 };
@@ -39,6 +40,25 @@ pub(super) struct StageReceipt {
     pub(super) key_hold: RecoveryKeyHold,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) object_namespace: Option<S3ObjectNamespace>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct StagingOrder {
+    pub(super) intent: Intent,
+    pub(super) key_hold: RecoveryKeyHold,
+    pub(super) destination_journal_sha256: [u8; 32],
+    pub(super) vault_identity: Uuid,
+}
+
+fn staging_key(authority: Uuid, candidate: Uuid) -> Result<rtdb_storage::ObjectKey> {
+    Ok(rtdb_storage::ObjectKey::new(format!("recovery-custody/{authority}/{candidate}/staging"))?)
+}
+
+pub(super) async fn read_staging_order(
+    store: &dyn ObjectStore, authority: Uuid, candidate: Uuid,
+) -> Result<Option<StagingOrder>> {
+    super::held_objects::read_provider_record(store, &staging_key(authority, candidate)?, 4096).await
 }
 
 impl StageReceipt {
@@ -96,9 +116,18 @@ impl Stage {
         let JournalBackend { journal, batch, .. } =
             connect_stream_journal(&self.destination.journal_url, &credentials).await?;
         let keys = Arc::new(FileKms::open(&self.destination.key_vault, || SystemClock.now().0)?);
+        let order = StagingOrder {
+            intent: candidate.intent.clone(), key_hold: hold,
+            destination_journal_sha256: KeeperJournal::connect(&self.destination.journal_url, &credentials)?.connection_sha256,
+            vault_identity: keys.enroll_recovery_vault().await?,
+        };
         let io = IoRegion::new();
         let installed = async {
             let store = self.destination.objects.open(&root, &remotes, Arc::clone(&io)).await?;
+            let encoded = serde_json::to_vec(&order).map_err(|_| stage_source())?;
+            store.put(&staging_key(hold.authority, candidate.incarnation)?, Bytes::from(encoded)).await?;
+            Candidate::pending(authority, &self.destination.name, self.operation, source_lsn).await?;
+            super::held_objects::require_staging_open(store.as_ref(), hold).await?;
             let mut database = MultiDatabase::new(
                 MultiOptions {
                     database: candidate.incarnation,

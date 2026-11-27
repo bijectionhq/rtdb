@@ -88,6 +88,12 @@ enum Action {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         object_namespace: Option<rtdb_types::S3ObjectNamespace>,
     },
+    #[cfg(all(unix, feature = "backup-object-holds"))]
+    AuthorizeAbandonedStaging {
+        intent: Intent,
+        hold: rtdb_crypt::RecoveryKeyHold,
+        object_namespace: rtdb_types::S3ObjectNamespace,
+    },
     Bootstrap {
         incarnation: Uuid,
     },
@@ -187,6 +193,15 @@ struct JournalReader {
 impl JournalReader {
     fn connect(&self) -> Result<KeeperJournal> {
         KeeperJournal::connect(&self.journal_url, &crate::cli::journal_credentials(&self.journal_tls_dir)?)
+    }
+
+    #[cfg(all(unix, feature = "backup-object-holds"))]
+    fn require_object_namespace(&self, namespace: &rtdb_types::S3ObjectNamespace) -> Result<()> {
+        if !self.require_object_custody || self.object_namespace.as_ref() != Some(namespace) {
+            return Err(Anomaly::incorrect("rtdb/activation-custody-allocation",
+                "The acquisition plan must come from the object allocation enrolled for its destination cell"));
+        }
+        Ok(())
     }
 }
 
@@ -634,26 +649,20 @@ impl Request {
             }
             #[cfg(all(unix, feature = "backup-object-holds"))]
             Action::AuthorizeAbandonedAcquisition { intent, hold, head, anchor, object_namespace } => {
-                use recovery::CustodySettlement;
-                let cell = intent.cell.ok_or_else(super::conflict)?;
-                let candidate = intent.candidate()?;
-                if candidate != hold.generation.database
-                    || intent.operation_id != hold.operation
-                    || intent.authority_id != hold.authority
-                    || !matches!(require_hold_release(authority, &database, &intent, hold).await?, CustodySettlement::Abandoned)
-                {
-                    return Err(super::conflict());
-                }
+                let cell = require_abandoned_destination(authority, &database, &intent, hold).await?;
                 let reader = journals.get(&cell).ok_or_else(super::configuration)?;
-                if let Some(namespace) = object_namespace.as_ref()
-                    && (!reader.require_object_custody || reader.object_namespace.as_ref() != Some(namespace))
-                {
-                    return Err(Anomaly::incorrect("rtdb/activation-custody-allocation",
-                        "The acquisition plan must come from the object allocation enrolled for its destination cell"));
+                if let Some(namespace) = object_namespace.as_ref() {
+                    reader.require_object_namespace(namespace)?;
                 }
-                let reader = reader.connect()?;
-                let selected = reader.selected_for_abandonment(candidate, head, anchor).await?;
+                let selected = reader.connect()?.selected_for_abandonment(hold.generation.database, head, anchor).await?;
                 return serde_json::to_value(selected.retained(hold)).map_err(|_| super::conflict());
+            }
+            #[cfg(all(unix, feature = "backup-object-holds"))]
+            Action::AuthorizeAbandonedStaging { intent, hold, object_namespace } => {
+                let cell = require_abandoned_destination(authority, &database, &intent, hold).await?;
+                let reader = journals.get(&cell).ok_or_else(super::configuration)?;
+                reader.require_object_namespace(&object_namespace)?;
+                return Ok(json!(reader.connect()?.connection_sha256));
             }
             #[cfg(all(unix, feature = "backup-object-holds"))]
             Action::AuthorizeObjectRelease { proof, objects_sha256 } => {
@@ -803,6 +812,33 @@ pub(in crate::multi) async fn authorize_abandoned_acquisition(
         action: Action::AuthorizeAbandonedAcquisition { intent, hold, head, anchor, object_namespace },
     }).await?;
     serde_json::from_value(response).map_err(|_| super::conflict())
+}
+
+#[cfg(all(unix, feature = "backup-object-holds"))]
+pub(in crate::multi) async fn authorize_abandoned_staging(
+    socket: &std::path::Path, intent: Intent, hold: rtdb_crypt::RecoveryKeyHold,
+    object_namespace: rtdb_types::S3ObjectNamespace,
+) -> Result<[u8; 32]> {
+    let response = broker::call(socket, Request {
+        database: intent.database.clone(),
+        action: Action::AuthorizeAbandonedStaging { intent, hold, object_namespace },
+    }).await?;
+    serde_json::from_value(response).map_err(|_| super::conflict())
+}
+
+#[cfg(all(unix, feature = "backup-object-holds"))]
+async fn require_abandoned_destination(
+    authority: &ActivationAuthority, database: &str, intent: &Intent, hold: rtdb_crypt::RecoveryKeyHold,
+) -> Result<Uuid> {
+    let cell = intent.cell.ok_or_else(super::conflict)?;
+    if intent.candidate()? != hold.generation.database
+        || intent.operation_id != hold.operation
+        || intent.authority_id != hold.authority
+        || !matches!(require_hold_release(authority, database, intent, hold).await?, recovery::CustodySettlement::Abandoned)
+    {
+        return Err(super::conflict());
+    }
+    Ok(cell)
 }
 
 async fn verify_recovery_installation(
