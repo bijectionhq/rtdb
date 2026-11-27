@@ -4,6 +4,7 @@ use std::{fmt::Display, future::Future};
 
 use rtdb_storage::release::{Backoff, Settled, settle};
 use rtdb_types::Anomaly;
+use tokio_util::sync::CancellationToken;
 
 /// A directory change that failed, told apart by whether it may still have applied.
 #[derive(Clone, Debug)]
@@ -30,16 +31,24 @@ impl From<ChangeFailure> for Anomaly {
 
 /// Repeats an idempotent release until it applies or fails permanently,
 /// logging each retry and a permanent failure against `hold`.
+///
+/// The release is unbounded, as no reconciliation retires every kind of hold
+/// that a bound would abandon. Multi does not yet hand these tasks the
+/// process's shutdown token, so the release is not cancelled at shutdown; the
+/// process waits a bounded time for the task tracker instead.
 pub(crate) async fn release_hold<F, Fut>(hold: impl Display, release: F) -> Settled
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<(), Anomaly>>,
 {
-    let settled = settle(Backoff::RELEASE, release, |attempt, error, delay| {
+    let settled = settle(Backoff::RELEASE, &CancellationToken::new(), release, |attempt, error, delay| {
         tracing::warn!(%hold, attempt, code = %error.code, retry_in = ?delay, "Hold release failed; retrying");
     }).await;
-    if let Settled::Refused(error) = &settled {
-        tracing::error!(%hold, code = %error.code, message = error.message.as_deref().unwrap_or(""), "Hold release was refused; the hold stays registered");
+    match &settled {
+        Settled::Released => {}
+        Settled::Refused(error) | Settled::GaveUp(error) =>
+            tracing::error!(%hold, code = %error.code, message = error.message.as_deref().unwrap_or(""), "Hold release did not apply; the hold stays registered"),
+        Settled::Stopped => tracing::warn!(%hold, "Hold release stopped with its owner; the hold stays registered"),
     }
     settled
 }
