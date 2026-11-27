@@ -16,7 +16,7 @@ Isolated UTF-16 surrogate inputs remain outside the current UTF-8 string carrier
 
 Runtime version metadata is one immutable process value initialized on the first version or revision lookup.
 The version is the nonblank `XTDB_VERSION` override the server installs at startup (`install_runtime_version`) or `DEFAULT_RUNTIME_VERSION`, plus `GIT_SHA` or the build-time `RTDB_REVISION` when available; the library reads no environment.
-`DEFAULT_RUNTIME_VERSION` is `XTDB_COMPATIBLE_VERSION`, the version the reference's build of the tracked `main` reports (`2.x-SNAPSHOT`), with the Cargo package version as semantic-version build metadata: `2.x-SNAPSHOT+rtdb.0.1.0`.
+`DEFAULT_RUNTIME_VERSION` is `XTDB_COMPATIBLE_VERSION`, the version the reference's build of the tracked `main` reports (`2.x-SNAPSHOT`).
 The command-line version, SQL session-information functions, Flight SqlInfo and the native ADBC vendor and driver versions share that value.
 The pgwire `server_version` parameter stays the PostgreSQL major version `16`, as in the reference.
 Release builds embed their recorded source revision in the native executable.

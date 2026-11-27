@@ -16,13 +16,11 @@ pub fn compiled_build_info() -> BuildInfo {
     BuildInfo { schema_version: 1, engine: "rust", version: env!("CARGO_PKG_VERSION"), revision: option_env!("RTDB_REVISION"), tzdb_version: crate::TZDB_VERSION, tzdb_sha256: crate::TZDB_SHA256 }
 }
 
-macro_rules! xtdb_compatible_version { () => { "2.x-SNAPSHOT" } }
-
 /// The reference version this engine is compatible with: what the reference's own build of the tracked `main` reports.
-pub const XTDB_COMPATIBLE_VERSION: &str = xtdb_compatible_version!();
+pub const XTDB_COMPATIBLE_VERSION: &str = "2.x-SNAPSHOT";
 
-/// The version reported without an `XTDB_VERSION` override: the compatible reference version, with this engine's package version as build metadata so that version comparisons ignore it.
-pub const DEFAULT_RUNTIME_VERSION: &str = concat!(xtdb_compatible_version!(), "+rtdb.", env!("CARGO_PKG_VERSION"));
+/// The version reported without an `XTDB_VERSION` override: matches upstream XTDB's default version string.
+pub const DEFAULT_RUNTIME_VERSION: &str = XTDB_COMPATIBLE_VERSION;
 
 struct Version { number: String, revision: Option<String> }
 
@@ -61,8 +59,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_version_is_the_compatible_reference_version_with_the_engine_as_build_metadata() {
-        assert_eq!(DEFAULT_RUNTIME_VERSION, format!("{XTDB_COMPATIBLE_VERSION}+rtdb.{}", env!("CARGO_PKG_VERSION")));
+    fn default_version_matches_the_compatible_reference_version() {
+        assert_eq!(DEFAULT_RUNTIME_VERSION, XTDB_COMPATIBLE_VERSION);
+        assert_eq!(DEFAULT_RUNTIME_VERSION, "2.x-SNAPSHOT");
+        assert_eq!(compiled_build_info().version, env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
