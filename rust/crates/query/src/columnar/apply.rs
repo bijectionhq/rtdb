@@ -418,15 +418,23 @@ impl ColumnBatch {
             let compatible = match logical.as_ref() {
                 Some(ty) => *ty != LogicalType::Nothing && stable_read_layout(ty, &field),
                 None => *all_declared_layouts.get_or_insert_with(|| positions.iter().zip(schema.fields()).all(|(&position, output)| {
-                    matches!(&self.columns[position], Column::Arrow { array, field, logical }
-                        if field.metadata().is_empty() && array.data_type() == field.data_type() && array.len() == self.len
-                            && (field.is_nullable() || array.null_count() == 0)
-                            && logical.as_ref().is_none_or(|ty| *ty == output.data_type)
-                            && (plain_scalar(&output.data_type).is_some_and(copyable)
-                                || matches!(field.data_type(), DataType::List(child) | DataType::FixedSizeList(child, _)
-                                    if super::lists::captured_list_child(child)))
-                            && stable_read_layout(&output.data_type, field)
-                            && rtdb_columnar::to_field(field.name(), &output.data_type).is_ok_and(|declared| declared == **field))
+                    let (array, field, logical, mut rows) = match &self.columns[position] {
+                        Column::Arrow { array, field, logical } if array.len() == self.len => (array, field, logical, 0..self.len),
+                        Column::Selected(selected) => {
+                            let Some(((array, field, logical, _), rows)) = selected.contiguous_source(0..self.len)
+                                else { return false; };
+                            (array, field, logical, rows)
+                        }
+                        _ => return false,
+                    };
+                    field.metadata().is_empty() && array.data_type() == field.data_type()
+                        && (field.is_nullable() || array.null_count() == 0 || rows.all(|row| array.is_valid(row)))
+                        && logical.as_ref().is_none_or(|ty| *ty == output.data_type)
+                        && (plain_scalar(&output.data_type).is_some_and(copyable)
+                            || matches!(field.data_type(), DataType::List(child) | DataType::FixedSizeList(child, _)
+                                if super::lists::captured_list_child(child)))
+                        && stable_read_layout(&output.data_type, field)
+                        && rtdb_columnar::to_field(field.name(), &output.data_type).is_ok_and(|declared| declared == **field)
                 })),
             };
             if !compatible {
@@ -556,6 +564,50 @@ mod tests {
         assert!(source_memory.used_bytes() > 0);
         drop((child, document));
         assert_eq!(source_memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn apply_document_lends_a_contiguous_selected_list_without_cached_type() {
+        let memory = MemoryBudget::new(1 << 20);
+        let source_memory = MemoryBudget::new(1 << 20);
+        let logical = LogicalType::list(LogicalType::Scalar(ScalarType::Utf8).maybe()).maybe();
+        let field = Arc::new(rtdb_columnar::to_field("values", &logical).unwrap());
+        let lists = rtdb_columnar::build_array(&logical, &[
+            Value::list(vec![Value::Utf8("earlier".into())]),
+            Value::Null,
+            Value::list(vec![Value::Utf8("selected".into()), Value::Null]),
+        ]).unwrap();
+        let address = lists.as_list::<i32>().values().as_string::<i32>().value(1).as_ptr();
+        let owner = source_memory.reserve(lists.get_array_memory_size()).unwrap();
+        let selected = SelectedColumn::new(vec![Some((lists, field, None, Some(owner)))], Arc::new(vec![(0, 1), (0, 2)]));
+        let int = LogicalType::Scalar(ScalarType::I64);
+        let id_field = Arc::new(rtdb_columnar::to_field("id", &int).unwrap());
+        let source = ColumnBatch::settled(vec![
+            Column::Selected(selected),
+            Column::Arrow { array: Arc::new(Int64Array::from(vec![11, 12])), field: id_field, logical: Some(int.clone()) },
+        ], 2, memory.reserve(4096).unwrap()).unwrap();
+        let schema = Schema::new([("id", int), ("values", logical)].into_iter().enumerate()
+            .map(|(id, (name, data_type))| Field {
+                id: rtdb_plan::ColumnId(id as u32), name: name.into(), data_type,
+                qualifier: None, qualified_only: false, unnamed: false,
+            }).collect()).unwrap();
+
+        let document = source.apply_document(&[1, 0], &schema, &memory).unwrap();
+        drop(source);
+        let [Column::Arrow { array, .. }] = document.columns.as_slice() else { panic!("Expected a document array"); };
+        let record = array.as_struct();
+        assert_eq!(record.column_names(), ["id", "values"]);
+        assert_eq!(record.column(0).as_any().downcast_ref::<Int64Array>().unwrap().values().as_ref(), &[11, 12]);
+        let lists = record.column(1).as_list::<i32>();
+        assert!(lists.is_null(0));
+        let child = lists.value(1);
+        let strings = child.as_string::<i32>();
+        assert_eq!(strings.iter().collect::<Vec<_>>(), [Some("selected"), None]);
+        assert_eq!(strings.value(0).as_ptr(), address);
+        assert!(source_memory.used_bytes() > 0);
+        drop((child, document));
+        assert_eq!(source_memory.used_bytes(), 0);
+        assert_eq!(memory.used_bytes(), 0);
     }
 
     #[test]
