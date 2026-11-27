@@ -247,6 +247,7 @@ impl MultiDatabase {
     }
 
     pub async fn tick(&mut self, live_nodes: &BTreeSet<IpAddr>) -> Result<Role> {
+        Box::pin(async move {
         if self.assigned_follower.strong_count() != 0 {
             self.refresh().await?;
             return Ok(Role::Follower);
@@ -285,9 +286,11 @@ impl MultiDatabase {
             self.candidate = None;
         }
         Ok(self.role())
+        }).await
     }
 
     async fn promote(&mut self) -> Result<()> {
+        Box::pin(async move {
         if !self.observed_lapse() {
             return Ok(());
         }
@@ -357,6 +360,7 @@ impl MultiDatabase {
             }
         }
         Ok(())
+        }).await
     }
 
     /// Seals the attempt's epoch. After an operator recovery the writer
@@ -460,9 +464,9 @@ impl MultiDatabase {
         request: &Transact,
         scope: Option<ScopedTransact<'_>>,
     ) -> Result<Receipt> {
-        let result = self.transact_serial(request, scope).await;
+        let result = Box::pin(self.transact_serial(request, scope)).await;
         if result.is_err() {
-            self.recover_after_failure().await;
+            Box::pin(self.recover_after_failure()).await;
         }
         self.project_receipt(result?, scope)
     }
@@ -720,6 +724,7 @@ impl MultiDatabase {
     }
 
     pub async fn checkpoint(&mut self, files: Vec<ObjectId>) -> Result<ObjectId> {
+        Box::pin(async move {
         let mut timing = timing::Phases::start();
         self.refresh().await?;
         timing.mark("refresh");
@@ -768,6 +773,7 @@ impl MultiDatabase {
         timing.mark("trim");
         timing.report(self.options.database, manifest.payload.len(), through);
         Ok(image.id())
+        }).await
     }
 
     pub async fn pin_checkpoint(
@@ -808,6 +814,7 @@ impl MultiDatabase {
     }
 
     async fn open_pinned_manifest(&mut self, id: Uuid, require_writer: bool) -> Result<(Pin, VerifiedManifest)> {
+        Box::pin(async move {
         self.refresh().await?;
         self.require_active()?;
         let state = self.state();
@@ -845,6 +852,7 @@ impl MultiDatabase {
             ));
         }
         Ok((pin.clone(), image))
+        }).await
     }
 
     pub async fn release_pin(&mut self, id: Uuid) -> Result<()> {
@@ -893,9 +901,7 @@ impl MultiDatabase {
     }
 
     async fn reachability(&self, lease: Lease) -> Result<Reachability> {
-        self.state()
-            .reachability(&self.stream, self.store.as_ref(), lease.epoch)
-            .await
+        Box::pin(self.state().reachability(&self.stream, self.store.as_ref(), lease.epoch)).await
     }
 
     /// Trims through the cut of a checkpoint this writer announced, then keeps
@@ -991,6 +997,7 @@ impl MultiDatabase {
         generation: u64,
         record: Record,
     ) -> Result<()> {
+        Box::pin(async move {
         self.authority()?;
         let coordinates = self.state().coordinates;
         let at = coordinates.lsn(self
@@ -1010,6 +1017,7 @@ impl MultiDatabase {
         };
         self.commit_one(lease, write).await?;
         Ok(())
+        }).await
     }
 
     fn mutation_failed(&mut self, error: JournalError) -> Anomaly {
@@ -1027,6 +1035,7 @@ impl MultiDatabase {
     }
 
     async fn refresh(&mut self) -> Result<()> {
+        Box::pin(async move {
         if self
             .writer
             .as_ref()
@@ -1043,9 +1052,11 @@ impl MultiDatabase {
             self.withdraw_writer();
         }
         Ok(())
+        }).await
     }
 
     async fn catch_up(&mut self, end: Lsn) -> Result<()> {
+        Box::pin(async move {
         let previous = self.committed.take().filter(|_| !std::mem::take(&mut self.replay_afresh));
         let replayed = match Committed::read_through(&self.stream, self.store.as_ref(), end, previous).await {
             Ok(replayed) => replayed,
@@ -1064,6 +1075,7 @@ impl MultiDatabase {
         };
         self.install_committed(replayed);
         Ok(())
+        }).await
     }
 
     fn keep_replayed(&mut self, error: ReplayError) -> Anomaly {

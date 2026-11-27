@@ -127,6 +127,7 @@ impl MultiDatabase {
     }
 
     async fn pin_exact_checkpoint(&mut self, id: Uuid, basis: Basis, until: Option<Timestamp>, target: Option<ManagedCheckpointTarget>) -> Result<Pin> {
+        Box::pin(async move {
         self.refresh().await?;
         let lease = self.authority()?;
         self.require_destroyed_generation()?;
@@ -183,6 +184,7 @@ impl MultiDatabase {
         let pin = Pin { id, manifest: image.id(), until: until.map(|time| time.0) };
         self.append_control(lease, Record::Pin(pin.clone())).await?;
         Ok(pin)
+        }).await
     }
 
     pub async fn open_export(&mut self, id: Uuid) -> Result<PinnedExport> {
@@ -240,6 +242,7 @@ impl MultiDatabase {
 
     /// The installed host supplies the exact reservation after its independent two-sided copy drain.
     pub async fn release_managed_checkpoint(&mut self, reservation: ManagedCheckpointReservation) -> Result<()> {
+        Box::pin(async move {
         if self.incarnation() != reservation.source.basis.incarnation() { return Err(managed_export_required()); }
         self.refresh().await?;
         let lease = self.authority()?;
@@ -259,9 +262,11 @@ impl MultiDatabase {
         }
         self.require_authority(lease)?;
         self.append_control(lease, Record::Unpin { id }).await
+        }).await
     }
 
     pub async fn claim_native_checkpoint_copy(&mut self, reservation: ManagedCheckpointReservation) -> Result<NativeCheckpointCustody> {
+        Box::pin(async move {
         self.require_managed_checkpoint_writer().await?;
         if self.durable_transactions().index().native_checkpoint_forward(reservation)?.is_some() {
             return Err(Anomaly::new(AnomalyCategory::Busy, "rtdb/native-checkpoint-copy-claimed", "The exact transfer already has a copy owner"));
@@ -288,9 +293,11 @@ impl MultiDatabase {
             Outcome::Refused { error } => Err(error),
             _ => Err(native_terminal_required()),
         }
+        }).await
     }
 
     pub async fn record_native_checkpoint_drain(&mut self, installed: NativeCheckpointInstallation) -> Result<()> {
+        Box::pin(async move {
         let NativeCheckpointInstallation { basis, custody } = installed;
         self.require_managed_checkpoint_writer().await?;
         match self.durable_transactions().index().native_checkpoint_forward(custody.reservation)? {
@@ -304,6 +311,7 @@ impl MultiDatabase {
             Outcome::Refused { error } => Err(error),
             _ => Err(native_terminal_required()),
         }
+        }).await
     }
 
     pub async fn require_native_dependent_fence(&mut self, scope: NativeDependentCustodyScope, fence: &NativeCustodyFence) -> Result<()> {
@@ -327,6 +335,7 @@ impl MultiDatabase {
         order: NativeDependentCustodyOrder,
         expected: Option<NativeDependentSourceGeneration>,
     ) -> Result<Receipt> {
+        Box::pin(async move {
         self.require_managed_checkpoint_writer().await?;
         if let Some(expected) = expected {
             let current = self.native_dependent_source_generation(order.scope()).await?;
@@ -350,6 +359,7 @@ impl MultiDatabase {
             Outcome::Refused { error } => Err(error.clone()),
             _ => Err(native_terminal_required()),
         }
+        }).await
     }
 
     /// Install an independent backing for an exact export. The destination's
@@ -395,6 +405,7 @@ impl MultiDatabase {
     }
 
     async fn restore_exact_export(&mut self, export: &PinnedExport, restore: Restore<'_>) -> Result<BranchCut> {
+        Box::pin(async move {
         let source = export.image.id();
         if source.database == self.options.database {
             return Err(Anomaly::incorrect("rtdb/restore-same-deployment", "Restore needs a distinct deployment"));
@@ -461,6 +472,7 @@ impl MultiDatabase {
         })).await?;
         self.trim(lease, through).await?;
         Ok(cut)
+        }).await
     }
 
     pub async fn checkpoint_source(&mut self) -> Result<Option<CheckpointSource>> {

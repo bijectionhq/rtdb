@@ -35,6 +35,7 @@ impl MultiDatabase {
     }
 
     pub(super) async fn finish_pending_erasure(&mut self) -> Result<()> {
+        Box::pin(async move {
         if self.state().rotation.is_none() && self.state().transactions.pending_erasure().is_some() {
             self.check_erase_storage(self.authority()?).await?;
             self.rotate_clean_checkpoint(&[]).await?;
@@ -42,6 +43,7 @@ impl MultiDatabase {
             self.finish_key_rotation().await?;
         }
         Ok(())
+        }).await
     }
 
     pub(super) async fn complete_erase_receipt(&mut self, mut receipt: Receipt, scope: Option<ScopedTransact<'_>>) -> Result<Receipt> {
@@ -65,6 +67,7 @@ impl MultiDatabase {
         &mut self,
         clean_files: &[Bytes],
     ) -> Result<RotationReceipt> {
+        Box::pin(async move {
         self.refresh().await?;
         let lease = self.authority()?;
         if self.state().rotation.is_some() {
@@ -117,9 +120,11 @@ impl MultiDatabase {
         self.finish_key_rotation()
             .await?
             .ok_or_else(missing_rotation)
+        }).await
     }
 
     pub(super) async fn finish_key_rotation(&mut self) -> Result<Option<RotationReceipt>> {
+        Box::pin(async move {
         let Some(rotation) = self.state().rotation else {
             return Ok(None);
         };
@@ -205,6 +210,7 @@ impl MultiDatabase {
             checkpoint: rotation.cut,
             unreadable_by: Timestamp(armed.retirement.unreadable_by()),
         }))
+        }).await
     }
 
     pub(super) fn require_armed_rotation(&self) -> Result<()> {

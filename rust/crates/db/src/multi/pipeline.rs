@@ -367,49 +367,54 @@ async fn run(
         };
         match command {
             Command::Transact(work) if work.batchable() => {
-                burst(&database, &mut input, &mut barrier, work).await;
+                Box::pin(burst(&database, &mut input, &mut barrier, work)).await;
             }
             Command::Transact(work) => {
-                let result = database
-                    .lock()
-                    .await
-                    .transact_in(&work.request, work.scope.as_ref().map(Scope::authority))
-                    .await;
+                let result = Box::pin(async {
+                    database
+                        .lock()
+                        .await
+                        .transact_in(&work.request, work.scope.as_ref().map(Scope::authority))
+                        .await
+                })
+                .await;
                 let _ = work.reply.send(result);
             }
             Command::Workload(request, reply) => {
-                let result = database.lock().await.managed_workload(request).await;
+                let result = Box::pin(async { database.lock().await.managed_workload(request).await }).await;
                 let _ = reply.send(result);
             }
             Command::Funded { transaction, scope, owner, command, clock, managed, reply } => {
-                let result = database.lock().await.transact_funded_serial(
-                    &transaction, scope.as_ref().map(Scope::authority), owner, command, clock.as_ref(), managed.as_deref(),
-                ).await;
+                let result = Box::pin(async {
+                    database.lock().await.transact_funded_serial(
+                        &transaction, scope.as_ref().map(Scope::authority), owner, command, clock.as_ref(), managed.as_deref(),
+                    ).await
+                }).await;
                 let _ = reply.send(result);
             }
             Command::Tick(live, reply) => {
-                let result = database.lock().await.tick(&live).await;
+                let result = Box::pin(async { database.lock().await.tick(&live).await }).await;
                 let _ = reply.send(result);
             }
             Command::Shutdown(reply) => {
                 input.close();
-                let result = database.lock().await.shutdown_writer().await;
+                let result = Box::pin(async { database.lock().await.shutdown_writer().await }).await;
                 let _ = reply.send(result);
                 return;
             }
             Command::PublishRanked { build, inventory, files, memory, reply } => {
-                let result = database.lock().await.publish_ranked_catalog(build, inventory, files, &memory).await;
+                let result = Box::pin(async { database.lock().await.publish_ranked_catalog(build, inventory, files, &memory).await }).await;
                 let _ = reply.send(result);
             }
             Command::BoundJournal { limit, reply } => {
                 let mut guard = database.lock().await;
                 if !guard.deferred_checkpoints() {
-                    let result = guard.checkpoint_retained_suffix(limit).await;
+                    let result = Box::pin(guard.checkpoint_retained_suffix(limit)).await;
                     answer_checkpoint(reply, result);
                 } else if building {
                     answer_checkpoint(reply, Ok(None));
                 } else {
-                    match guard.capture_checkpoint(limit).await {
+                    match Box::pin(guard.capture_checkpoint(limit)).await {
                         Ok(Some(capture)) => {
                             let builder = guard.checkpoint_builder();
                             drop(guard);
@@ -437,30 +442,32 @@ async fn run(
             Command::AnnounceCheckpoint { prepared, reply } => {
                 building = false;
                 let result = match prepared {
-                    Ok(prepared) => database.lock().await.announce_checkpoint(prepared).await
-                        .map(super::deferred::Announcement::manifest),
+                    Ok(prepared) => Box::pin(async {
+                        database.lock().await.announce_checkpoint(prepared).await
+                            .map(super::deferred::Announcement::manifest)
+                    }).await,
                     Err(error) => Err(error),
                 };
                 answer_checkpoint(reply, result);
             }
             Command::Export { pin, basis, until, reply } => {
-                let result = database.lock().await.export_ticket(pin, basis, until).await;
+                let result = Box::pin(async { database.lock().await.export_ticket(pin, basis, until).await }).await;
                 let _ = reply.send(result);
             }
             Command::OpenExport { ticket, reply } => {
-                let result = database.lock().await.open_export_ticket(&ticket).await;
+                let result = Box::pin(async { database.lock().await.open_export_ticket(&ticket).await }).await;
                 let _ = reply.send(result);
             }
             Command::ReleaseExport { ticket, reply } => {
-                let result = database.lock().await.release_export_ticket(&ticket).await;
+                let result = Box::pin(async { database.lock().await.release_export_ticket(&ticket).await }).await;
                 let _ = reply.send(result);
             }
             Command::Restore { export, reply } => {
-                let result = database.lock().await.restore_export(&export).await;
+                let result = Box::pin(async { database.lock().await.restore_export(&export).await }).await;
                 let _ = reply.send(result);
             }
             Command::Retire(reply) => {
-                let result = database.lock().await.retire_deployment().await;
+                let result = Box::pin(async { database.lock().await.retire_deployment().await }).await;
                 let _ = reply.send(result);
             }
         }
@@ -1139,6 +1146,7 @@ impl MultiDatabase {
     }
 
     pub(super) async fn recover_writer(&mut self) -> Result<()> {
+        Box::pin(async move {
         let Some(writer) = self.writer.as_ref().filter(|writer| writer.recovering) else {
             return Ok(());
         };
@@ -1225,6 +1233,7 @@ impl MultiDatabase {
             self.commit_one(lease, terminal).await?;
         }
         Ok(())
+        }).await
     }
 
     pub(super) async fn commit_one(
@@ -1232,6 +1241,7 @@ impl MultiDatabase {
         lease: Lease,
         write: Append,
     ) -> Result<(Timestamp, Vec<Receipt>)> {
+        Box::pin(async move {
         let authority = self.append_authority(lease.epoch)?;
         let writes = vec![write];
         let (upper, tail) = authority
@@ -1243,6 +1253,7 @@ impl MultiDatabase {
             .await
             .map_err(|error| self.begin_write_recovery(AttemptError::Local(error)))?;
         Ok((upper, receipts))
+        }).await
     }
 
     pub(super) fn withdraw_writer(&mut self) {
