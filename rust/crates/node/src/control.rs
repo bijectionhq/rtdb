@@ -683,10 +683,14 @@ fn execute_scalar_cell(
     use arrow_schema::{DataType, Field};
 
     let data_type = cell.field.data_type();
-    if !cell.field.metadata().is_empty() || !matches!(data_type,
+    let plain = cell.field.metadata().is_empty() && matches!(data_type,
         DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
         | DataType::Float16 | DataType::Float32 | DataType::Float64 | DataType::Utf8 | DataType::Binary
-    ) {
+        | DataType::Date32 | DataType::Date64 | DataType::Time32(_) | DataType::Time64(_)
+        | DataType::Timestamp(..) | DataType::Duration(_) | DataType::FixedSizeBinary(_)
+    );
+    let uuid = data_type == &DataType::FixedSizeBinary(16) && cell.field.extension_type_name() == Some("uuid");
+    if !plain && !uuid {
         return Ok(None);
     }
     if cell.is_null()? {
@@ -694,8 +698,12 @@ fn execute_scalar_cell(
         let array = output.column(512, || Ok(Arc::new(NullArray::new(1))))?;
         return Ok(Some((field, array)));
     }
-    let field = Field::new(name, data_type.clone(), false);
     let bound = size(512, cell.payload_bytes()?)?;
+    let field = if uuid {
+        rtdb_columnar::to_field(name, &LogicalType::Scalar(rtdb_types::ScalarType::Uuid))?
+    } else {
+        Field::new(name, data_type.clone(), false)
+    };
     let array = output.column(bound, || {
         let index = UInt64Array::from(vec![cell.row as u64]);
         arrow_select::take::take(cell.array, &index, None).map_err(rtdb_columnar::arrow_error)
@@ -863,6 +871,38 @@ mod tests {
             }
             assert!(parameters.evaluator().known(0).is_none());
             assert!(parameters.evaluator().known(1).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_forwards_temporal_cells_without_decoding_and_keeps_nanoseconds() {
+        use arrow_array::{Date64Array, TimestampNanosecondArray};
+        use rtdb_types::{TimeUnit, Value};
+
+        let memory = MemoryBudget::new(1 << 20);
+        let arrays: Vec<arrow_array::ArrayRef> = vec![
+            Arc::new(TimestampNanosecondArray::from(vec![Some(-1999), None]).with_timezone("Europe/Paris")),
+            Arc::new(Date64Array::from(vec![-86_400_001, 0])),
+        ];
+        let batch = RecordBatch::try_from_iter(["ts", "date"].into_iter().zip(arrays)).unwrap();
+        let types = batch.schema_ref().fields().iter().map(|field| rtdb_columnar::from_field(field).unwrap()).collect::<Vec<_>>();
+        let batch = OwnedBatch::new(batch, &memory).unwrap();
+        let expressions = [0, 1].map(|index| Expr::Parameter { index, data_type: LogicalType::Nothing });
+        for (row, expected) in [
+            (0, [Value::Timestamp { value: -1999, unit: TimeUnit::Nanosecond, timezone: Some("Europe/Paris".into()) }, Value::DateMilli(-86_400_001)]),
+            (1, [Value::Null, Value::DateMilli(0)]),
+        ] {
+            let parameters = BoundParameters::from_arrow(batch.clone(), row, types.clone(), &memory).unwrap();
+            let allocation = EvaluationScope::new(&memory).unwrap();
+            let eval = EvalContext { parameters: parameters.evaluator(), allocation: Some(&allocation), ..Default::default() };
+            let output = execute_arguments(&expressions, &eval, &memory, &allocation).await.unwrap();
+            let output = output.batch();
+            for (index, expected) in expected.into_iter().enumerate() {
+                let field = output.schema_ref().field(index);
+                assert_eq!(rtdb_columnar::from_field(field).unwrap(), expected.logical_type());
+                assert_eq!(rtdb_columnar::read_value(field, output.column(index).as_ref(), 0).unwrap(), expected);
+                assert!(parameters.evaluator().known(index).is_none());
+            }
         }
     }
 

@@ -347,6 +347,8 @@ impl PreparedSql {
                 None => {
                     let (field, array) = if let Some(cast) = cast_arrow_integer(cell, source, &target, &allocation)? {
                         cast
+                    } else if let Some(cast) = cast_arrow_timestamp(cell, source, &target, &context.timezone, &allocation)? {
+                        cast
                     } else {
                         allocation.reserve(rtdb_columnar::estimate_read_cell_bytes(field, array.as_ref(), 0)?)?;
                         let value = rtdb_columnar::read_execution_value_as(source, field, array.as_ref(), 0)?;
@@ -728,6 +730,35 @@ fn cast_arrow_integer(
         LogicalType::Scalar(ScalarType::I64) => cast!(i64, Int64Array, Int64),
         _ => return Ok(None),
     }))
+}
+
+fn cast_arrow_timestamp(
+    cell: rtdb_columnar::ArrowCell<'_>, source: &LogicalType, target: &LogicalType,
+    timezone: &str, allocation: &rtdb_expr::EvaluationScope,
+) -> Result<Option<(arrow_schema::Field, arrow_array::ArrayRef)>> {
+    use arrow_array::{ArrayRef, TimestampSecondArray, TimestampMillisecondArray, TimestampMicrosecondArray, TimestampNanosecondArray};
+    use rtdb_types::{ScalarType, TimeUnit};
+
+    fn required(ty: &LogicalType) -> &LogicalType {
+        match ty { LogicalType::Maybe(inner) => inner, ty => ty }
+    }
+    let logical @ LogicalType::Scalar(ScalarType::Timestamp { unit, timezone: zone }) = required(target) else { return Ok(None); };
+    if !cell.field.metadata().is_empty() || !matches!(cell.field.data_type(), arrow_schema::DataType::Timestamp(..) | arrow_schema::DataType::Utf8) {
+        return Ok(None);
+    }
+    allocation.reserve(cell.field.name().len().checked_add(zone.as_ref().map_or(0, String::len))
+        .and_then(|bytes| bytes.checked_add(cell.field.size()))
+        .and_then(|bytes| bytes.checked_add(1024)).ok_or_else(size_error)?)?;
+    if required(source) != &cell.logical_type()? { return Ok(None); }
+    let Some(raw) = rtdb_expr::cast_bound_timestamp(cell, *unit, zone.is_some(), timezone)? else { return Ok(None); };
+    let zone = zone.as_deref();
+    let array: ArrayRef = match unit {
+        TimeUnit::Second => Arc::new(TimestampSecondArray::from(vec![raw]).with_timezone_opt(zone)),
+        TimeUnit::Millisecond => Arc::new(TimestampMillisecondArray::from(vec![raw]).with_timezone_opt(zone)),
+        TimeUnit::Microsecond => Arc::new(TimestampMicrosecondArray::from(vec![raw]).with_timezone_opt(zone)),
+        TimeUnit::Nanosecond => Arc::new(TimestampNanosecondArray::from(vec![raw]).with_timezone_opt(zone)),
+    };
+    Ok(Some((rtdb_columnar::to_field(cell.field.name(), logical)?, array)))
 }
 
 fn parameter_error(message: &str) -> Anomaly { Anomaly::incorrect("xtdb/parameter-count-mismatch", message) }
@@ -1301,6 +1332,46 @@ mod argument_cast_tests {
     use rtdb_storage::{MemoryStore, cache::BufferPool};
     use rtdb_types::{ListKind, ScalarType, Timestamp};
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn prepared_timestamp_cells_match_the_scalar_cast_for_zone_changes_and_negative_fractions() {
+        use arrow_array::{TimestampNanosecondArray, types::TimestampMicrosecondType};
+        use rtdb_columnar::ArrowCell;
+        use rtdb_types::TimeUnit;
+
+        let memory = MemoryBudget::new(1 << 20);
+        let allocation = rtdb_expr::EvaluationScope::new(&memory).unwrap();
+        let session_zone = "America/New_York";
+        let target = LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) });
+        let cases: Vec<(ArrowField, arrow_array::ArrayRef)> = vec![
+            (ArrowField::new("zoned", DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, Some("Europe/Paris".into())), false),
+                Arc::new(TimestampNanosecondArray::from(vec![-1999]).with_timezone("Europe/Paris"))),
+            (ArrowField::new("local", DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None), false),
+                Arc::new(TimestampNanosecondArray::from(vec![-1999]))),
+            (ArrowField::new("text", DataType::Utf8, false),
+                Arc::new(StringArray::from(vec!["2024-11-03T01:30:00.000000999-04:00"]))),
+        ];
+        for (field, array) in cases {
+            let source = rtdb_columnar::from_field(&field).unwrap();
+            let value = rtdb_columnar::read_execution_value_as(&source, &field, array.as_ref(), 0).unwrap();
+            let expected = rtdb_expr::cast(&value, &target, session_zone).unwrap();
+            let cell = ArrowCell { field: &field, array: array.as_ref(), row: 0 };
+            let (out_field, output) = cast_arrow_timestamp(cell, &source, &target, session_zone, &allocation).unwrap().unwrap();
+            assert_eq!(out_field, rtdb_columnar::to_field(field.name(), &target).unwrap());
+            assert_eq!(rtdb_columnar::read_value(&out_field, output.as_ref(), 0).unwrap(), expected);
+            if field.name() == "zoned" {
+                assert_eq!(output.as_primitive::<TimestampMicrosecondType>().value(0), -1);
+            }
+        }
+        let field = ArrowField::new("invalid", DataType::Utf8, false);
+        let source = LogicalType::Scalar(ScalarType::Utf8);
+        let text = "not a timestamp";
+        let array = StringArray::from(vec![text]);
+        let cell = ArrowCell { field: &field, array: &array, row: 0 };
+        let error = cast_arrow_timestamp(cell, &source, &target, session_zone, &allocation).unwrap_err();
+        let expected = rtdb_expr::cast(&Value::Utf8(text.into()), &target, session_zone).unwrap_err();
+        assert_eq!((error.code, error.kind, error.message), (expected.code, expected.kind, expected.message));
+    }
 
     #[test]
     fn prepared_cast_retains_unchanged_owners_and_funds_the_one_row_replacements() {

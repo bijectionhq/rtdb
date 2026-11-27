@@ -36,7 +36,7 @@ pub use string::render::arrow_text;
 pub use string::pattern::JavaFullMatcher;
 pub use string::host_defaults;
 
-pub use cast::{cast, cast_target, parse_timestamp, query_clock_instant, timestamp_micros};
+pub use cast::{cast, cast_bound_timestamp, cast_target, parse_timestamp, query_clock_instant, timestamp_micros};
 pub use temporal::{local_micros, local_timestamp_micros};
 pub use compare::{compare, compare_in_timezone, equality_allocation_bound, null_eq, null_eq_in_timezone, sql_eq, sql_eq_in_timezone, sql_not_eq_in_timezone, strict_eq};
 pub use ordered::{ordered_compare_in_timezone, validate_order_type};

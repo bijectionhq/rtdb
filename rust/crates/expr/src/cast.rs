@@ -145,6 +145,26 @@ pub(crate) fn timestamp_raw(value: i64, source: TimeUnit, source_zoned: bool, un
     i64::try_from(scaled).map_err(|_| overflow())
 }
 
+/// Casts a selected plain text or timestamp cell to the raw storage of a declared timestamp.
+/// The caller handles nulls and verifies that the argument type agrees with its Arrow field.
+pub fn cast_bound_timestamp(
+    cell: rtdb_columnar::ArrowCell<'_>, unit: TimeUnit, zoned: bool, timezone: &str,
+) -> Result<Option<i64>> {
+    use arrow_array::{cast::AsArray, types::{TimestampSecondType, TimestampMillisecondType, TimestampMicrosecondType, TimestampNanosecondType}};
+    use arrow_schema::{DataType, TimeUnit as ArrowUnit};
+
+    if !cell.field.metadata().is_empty() || cell.array.is_null(cell.row) { return Ok(None); }
+    if let Some(text) = cell.utf8() { return timestamp_text_raw(text, unit, zoned).map(Some); }
+    let DataType::Timestamp(source_unit, zone) = cell.field.data_type() else { return Ok(None); };
+    let (raw, source) = match source_unit {
+        ArrowUnit::Second => (cell.array.as_primitive::<TimestampSecondType>().value(cell.row), TimeUnit::Second),
+        ArrowUnit::Millisecond => (cell.array.as_primitive::<TimestampMillisecondType>().value(cell.row), TimeUnit::Millisecond),
+        ArrowUnit::Microsecond => (cell.array.as_primitive::<TimestampMicrosecondType>().value(cell.row), TimeUnit::Microsecond),
+        ArrowUnit::Nanosecond => (cell.array.as_primitive::<TimestampNanosecondType>().value(cell.row), TimeUnit::Nanosecond),
+    };
+    timestamp_raw(raw, source, zone.is_some(), unit, zoned, timezone).map(Some)
+}
+
 pub(crate) fn date_to_timestamp(days: i64, unit: TimeUnit, zoned: bool, timezone: &str) -> Result<i64> {
     let seconds = if zoned { zone(timezone)?.start_of_day(CivilDate::from_epoch_day(days)?)? }
         else { days.checked_mul(86_400).ok_or_else(overflow)? };
