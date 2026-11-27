@@ -329,37 +329,70 @@ fn age_parts((end_date, end_nano): (CivilDate, i64), (start_date, start_nano): (
     Ok(IntervalParts { months: i32::try_from(months).map_err(|_|overflow())?,days: i32::try_from(days).map_err(|_|overflow())?,nanos })
 }
 
-/// DATE_BIN for timestamp operands and a month-day-micro or month-day-nano stride.
+/// The declared unit and zone of DATE_BIN ticks, or an epoch day.
+#[derive(Clone, Copy)]
+pub enum DateBinInput<'a> {
+    Date,
+    Timestamp(U, Option<&'a str>),
+}
+
+impl DateBinInput<'_> {
+    pub fn zone(&self) -> Option<&str> {
+        match self {
+            Self::Date => None,
+            Self::Timestamp(_, zone) => *zone,
+        }
+    }
+
+    fn difference_unit(&self) -> U {
+        match self {
+            Self::Date => U::Microsecond,
+            Self::Timestamp(unit, _) => *unit,
+        }
+    }
+
+    fn rescale(&self, value: i64, target: U, mixed_zones: bool, timezone: &str) -> Result<i64> {
+        match self {
+            Self::Date => crate::temporal::date_timestamp(value, target),
+            Self::Timestamp(unit, zone) =>
+                crate::temporal::rescale_timestamp(value, *unit, target, mixed_zones && zone.is_some(), timezone),
+        }
+    }
+}
+
+/// DATE_BIN for date and timestamp operands with a month-day-micro or month-day-nano stride.
 pub struct DateBin<'a> {
-    source_unit: U,
-    source_zoned: bool,
-    origin_unit: U,
-    origin_zone: Option<&'a str>,
+    source: DateBinInput<'a>,
+    origin: DateBinInput<'a>,
     output_unit: U,
 }
 
 impl<'a> DateBin<'a> {
-    pub fn new(stride_unit: U, source_unit: U, source_zoned: bool, origin_unit: U, origin_zone: Option<&'a str>) -> Self {
-        Self { source_unit, source_zoned, origin_unit, origin_zone, output_unit: stride_unit.max(origin_unit) }
+    pub fn new(stride_unit: U, source: DateBinInput<'a>, origin: DateBinInput<'a>) -> Option<Self> {
+        if matches!((source, origin), (DateBinInput::Date, DateBinInput::Date)) { return None; }
+        let output_unit = match origin {
+            DateBinInput::Date => stride_unit,
+            DateBinInput::Timestamp(unit, _) => unit.max(stride_unit),
+        };
+        Some(Self { source, origin, output_unit })
     }
 
     pub fn output_unit(&self) -> U { self.output_unit }
 
     /// Bins a non-null source relative to a non-null origin using signed interval components.
     pub fn cell(&self, (months, days, nanos): (i32, i32, i64), source: i64, origin: i64, timezone: &str) -> Result<i64> {
-        use crate::{cast::month_day_duration, numeric::signed_quotient, temporal::{add_timestamp_interval, rescale, rescale_timestamp}};
+        use crate::{cast::month_day_duration, numeric::signed_quotient, temporal::add_timestamp_interval};
 
-        let difference_unit = self.source_unit.max(self.origin_unit);
-        let origin_zoned = self.origin_zone.is_some();
-        let mixed_zones = self.source_zoned != origin_zoned;
-        let local_source = rescale_timestamp(source, self.source_unit, difference_unit, mixed_zones && self.source_zoned, timezone)?;
-        let local_origin = rescale_timestamp(origin, self.origin_unit, difference_unit, mixed_zones && origin_zoned, timezone)?;
+        let difference_unit = self.source.difference_unit().max(self.origin.difference_unit());
+        let mixed_zones = self.source.zone().is_some() != self.origin.zone().is_some();
+        let local_source = self.source.rescale(source, difference_unit, mixed_zones, timezone)?;
+        let local_origin = self.origin.rescale(origin, difference_unit, mixed_zones, timezone)?;
         let difference = local_source.checked_sub(local_origin).ok_or_else(overflow)?;
         let stride = month_day_duration(months, days, nanos, difference_unit)?;
         let quotient = signed_quotient(difference, stride)?;
         let offset = IntervalParts { months, days, nanos }.scale(quotient)?;
-        let origin = rescale(origin, self.origin_unit, self.output_unit)?;
-        add_timestamp_interval(origin, self.output_unit, self.origin_zone, offset, 1)
+        let origin = self.origin.rescale(origin, self.output_unit, false, timezone)?;
+        add_timestamp_interval(origin, self.output_unit, self.origin.zone(), offset, 1)
     }
 }
 

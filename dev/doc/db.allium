@@ -2651,7 +2651,8 @@ surface QueryAccess {
         -- DATE_BIN and RANGE_BINS can consume the components of a compatible truncated interval without materializing an intermediate column.
         -- Whole-second and coarser truncation of zoned timestamps uses the timestamp's zone rules or the explicit override, preserving the scalar result at gaps and overlaps.
         -- Truncation raises errors in reached row order.
-        -- A DATE_BIN projection with a compatible month-day interval stride and timestamp bounds can write Arrow timestamp ticks with the origin's zone label.
+        -- A DATE_BIN projection with a compatible month-day interval stride and two timestamp operands or one timestamp and one date can write Arrow timestamp ticks.
+        -- A date enters the difference at local midnight, and a date origin produces local timestamp bins.
         -- DATE_BIN demands the stride and origin before the source, which it skips when either is null.
         -- DATE_BIN uses the session zone for a mixed local and zoned difference and the origin's calendar for a reached calendar offset.
         -- An AGE projection over compatible date or timestamp inputs can write Arrow intervals using the session-zone calendar and the scalar result precision.
