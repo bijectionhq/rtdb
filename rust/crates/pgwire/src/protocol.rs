@@ -186,7 +186,7 @@ pub(crate) struct ProtocolSession {
     copy: Option<crate::copy::CopyInput>,
     replay_permit: Option<GatewayReplayPermit>,
     /// The encoding environment last built, with the session's parameters revision it copied.
-    environment_cache: Option<(u64, Arc<SessionEnvironment>)>,
+    environment_cache: Option<(rtdb_node::SessionParametersHandle, Arc<SessionEnvironment>)>,
 }
 impl ProtocolSession {
     pub fn new(session: NativeSession, node: Node, config: Arc<ServerConfig>, startup: Startup, cancellations: Arc<CancellationSlot>) -> Self {
@@ -204,15 +204,15 @@ impl ProtocolSession {
     pub fn close(&mut self) { self.copy = None; self.portals.clear(); self.retired.clear(); self.statements.clear(); self.environment_cache = None; self.session.state_mut().close(); }
     fn environment(&mut self) -> Result<Arc<SessionEnvironment>> {
         let state = self.session.state();
-        let revision = state.parameters_revision();
         let timezone = state.effective_timezone();
         if let Some((cached, environment)) = &self.environment_cache
-            && *cached == revision && environment.parameter("timezone") == Some(timezone) {
+            && cached.matches(state) && environment.parameter("timezone") == Some(timezone) {
             return Ok(Arc::clone(environment));
         }
+        let handle = state.parameters_handle();
         self.environment_cache = None;
         let environment = Arc::new(SessionEnvironment::new(state.parameter_entries(), timezone, self.node.memory())?);
-        self.environment_cache = Some((revision, Arc::clone(&environment)));
+        self.environment_cache = Some((handle, Arc::clone(&environment)));
         Ok(environment)
     }
     fn fallback(&self) -> PgType { SessionEnvironment::fallback_for(self.session.state().parameter("fallback_output_format")) }
