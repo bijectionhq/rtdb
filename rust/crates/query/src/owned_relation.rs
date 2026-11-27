@@ -1147,18 +1147,51 @@ pub fn owned_row_revision_for(
     batch: &arrow_array::RecordBatch, row: usize, expected_id: EntityIdRef<'_>,
     memory: &Arc<rtdb_columnar::MemoryBudget>,
 ) -> Result<Timestamp> {
+    owned_row_revision_with_identity(batch, row, expected_id, memory, None)
+}
+
+#[doc(hidden)]
+pub struct BorrowedOwnedRowIdentity<'a> {
+    batch: &'a arrow_array::RecordBatch,
+    cell: rtdb_columnar::ArrowCell<'a>,
+    id: EntityIdRef<'a>,
+}
+
+impl<'a> BorrowedOwnedRowIdentity<'a> {
+    pub fn read(batch: &'a arrow_array::RecordBatch, row: usize) -> Option<Self> {
+        let cell = rtdb_columnar::ArrowCell::named(batch, "_id", row)?;
+        let id = rtdb_columnar::read_owned_entity_id(cell.field, cell.array, cell.row).ok()?;
+        Some(Self { batch, cell, id })
+    }
+
+    pub fn id(&self) -> EntityIdRef<'a> { self.id }
+
+    pub fn revision_for(self, expected_id: EntityIdRef<'_>, memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<Timestamp> {
+        owned_row_revision_with_identity(self.batch, self.cell.row, expected_id, memory, Some((self.cell, self.id)))
+    }
+}
+
+fn owned_row_revision_with_identity(
+    batch: &arrow_array::RecordBatch, row: usize, expected_id: EntityIdRef<'_>,
+    memory: &Arc<rtdb_columnar::MemoryBudget>, borrowed: Option<(rtdb_columnar::ArrowCell<'_>, EntityIdRef<'_>)>,
+) -> Result<Timestamp> {
     let schema = batch.schema_ref();
-    let (id_column, id_field) = schema.column_with_name("_id")
-        .ok_or_else(|| Anomaly::fault("rtdb.owned/row-identity", "Owned read omitted its identity column"))?;
-    let id = batch.column(id_column).as_ref();
-    let bound = rtdb_columnar::estimate_read_value_bytes(id_field, id, row)?;
+    let (cell, borrowed_id) = match borrowed {
+        Some((cell, id)) => (cell, Some(id)),
+        None => {
+            let cell = rtdb_columnar::ArrowCell::named(batch, "_id", row)
+                .ok_or_else(|| Anomaly::fault("rtdb.owned/row-identity", "Owned read omitted its identity column"))?;
+            (cell, None)
+        }
+    };
+    let bound = rtdb_columnar::estimate_read_value_bytes(cell.field, cell.array, cell.row)?;
     let _scratch = memory.reserve(bound.checked_add(4096)
         .ok_or_else(|| Anomaly::fault("rtdb.owned/row-identity", "Owned identity allocation overflow"))?)?;
-    let typed = typed_owned_cell(rtdb_columnar::ArrowCell { field: id_field, array: id, row })
-        .and_then(|cell| rtdb_columnar::read_owned_entity_id(cell.field, cell.array, cell.row).ok());
+    let typed = typed_owned_cell(cell)
+        .and_then(|cell| borrowed_id.or_else(|| rtdb_columnar::read_owned_entity_id(cell.field, cell.array, cell.row).ok()));
     let matches = match typed {
         Some(id) => id == expected_id,
-        None => EntityIdRef::from(&rtdb_columnar::read_value(id_field, id, row)?.owned_entity_id()?) == expected_id,
+        None => EntityIdRef::from(&rtdb_columnar::read_value(cell.field, cell.array, cell.row)?.owned_entity_id()?) == expected_id,
     };
     if !matches {
         return Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.owned/iid-collision", "Owned row locator resolves to a different complete identity"));

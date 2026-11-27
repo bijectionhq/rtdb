@@ -38,6 +38,7 @@
 -- Owned ranked candidates share a projected primary cursor in bounded batches.
 -- Each cursor retains the candidate's complete keys as slices of their posting file's Arrow buffers.
 -- The scan checks each candidate's complete Arrow identity, microsecond revision, and declared text leg at the held cut.
+-- A compatible borrowed identity used to select the candidate also serves its revision check under the same admission.
 -- A covered rank window borrows the verified identities from the admitted run pages through Arrow output construction.
 -- The ranker uses posting frequencies and stored lengths when the winning revision identifies an unambiguous event in its run.
 -- Overlapping events at the same revision use the resolved text to verify the match and score.
@@ -420,7 +421,7 @@ rule RepairUnreadableSearchFile {
 --      A claimed bound covers the work through publication of its children and verified outcomes.
 --      Verification resolves the candidate's full history and gathers the visible row's text, SQL rank keys and predicate columns.
 --      The verifier checks the SQL predicates and scores that payload.
---      Verification reads an integer tie key from its selected Arrow cell with the scan's signed execution semantics.
+--      Verification reads the integer or UUID tie key from one selected Arrow cell, using the scan's signed execution semantics for integers.
 --      A stale posting supplies no verified score for its revision.
 --   3. The query stops when all work is exhausted, or when its verified cutoff strictly precedes every queued and claimed bound.
 --      Pending verification has a bound until the verifier reports.

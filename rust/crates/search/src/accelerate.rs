@@ -952,10 +952,11 @@ async fn rank_owned_artefacts<'a>(
                     for row in 0..batch.num_rows() {
                         context.check_cancelled_at(row)?;
                         let ids = batch.column(id_column).as_ref();
+                        let borrowed_id = rtdb_query::BorrowedOwnedRowIdentity::read(batch, row);
                         let fallback;
-                        let id = match rtdb_columnar::read_owned_entity_id(id_field, ids, row) {
-                            Ok(id) => id,
-                            Err(_) => {
+                        let id = match &borrowed_id {
+                            Some(id) => id.id(),
+                            None => {
                                 fallback = rtdb_columnar::read_value(id_field, ids, row)?.entity_id()?;
                                 EntityIdRef::from(&fallback)
                             }
@@ -966,7 +967,10 @@ async fn rank_owned_artefacts<'a>(
                         };
                         let candidate = &mut pending[index];
                         if candidate.verified.is_some() { return Err(OwnedArtefactError::Uncovered); }
-                        let revision = rtdb_query::owned_row_revision_for(batch, row, candidate.id, &context.memory)?;
+                        let revision = match borrowed_id {
+                            Some(id) => id.revision_for(candidate.id, &context.memory)?,
+                            None => rtdb_query::owned_row_revision_for(batch, row, candidate.id, &context.memory)?,
+                        };
                         // The winning row's event is named by its position: a
                         // tied transaction's event shares its time (T7).
                         let position = rtdb_query::owned_row_event_position(batch, row)?;

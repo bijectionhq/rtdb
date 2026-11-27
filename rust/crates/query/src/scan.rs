@@ -1881,21 +1881,27 @@ impl RankedGather<'_> {
     }
 }
 
-fn ranked_integer_id(column: &crate::columnar::Column, row: usize) -> Result<Option<i64>> {
+fn ranked_key(column: &crate::columnar::Column, row: usize, score: f64) -> Result<Option<crate::rank_cutoff::RankKey>> {
+    use crate::rank_cutoff::RankKey;
+    use rtdb_columnar::EntityIdRef;
+
+    fn key(id: EntityIdRef<'_>, score: f64) -> Option<RankKey> {
+        match id {
+            EntityIdRef::Integer(id) => Some(RankKey::integer(score, Some(id))),
+            EntityIdRef::Uuid(id) => Some(RankKey::uuid(score, id)),
+            _ => None,
+        }
+    }
     match column.arrow_cell(row) {
         Some(Some((array, field, logical, offset))) => {
             match rtdb_columnar::read_execution_entity_id_as(logical, field, array, offset) {
-                Ok(Some(rtdb_columnar::EntityIdRef::Integer(id))) => Ok(Some(id)),
-                Ok(_) => Ok(None),
+                Ok(id) => Ok(id.and_then(|id| key(id, score))),
                 Err(error) if error.is(AnomalyKind::InvalidEntityId) => Ok(None),
                 Err(error) => Err(error),
             }
         }
         Some(None) => Ok(None),
-        None => Ok(match column.value(row)?.entity_id() {
-            Ok(EntityId::Integer(id)) => Some(id),
-            _ => None,
-        }),
+        None => Ok(column.value(row)?.entity_id().ok().as_ref().and_then(|id| key(id.into(), score))),
     }
 }
 
@@ -2122,12 +2128,8 @@ impl ScanVerifier<'_> {
             drop(scratch);
             let key = match id {
                 Some(id) => {
-                    let column = &batch.columns[id];
-                    if let Some(id) = ranked_integer_id(column, position_in_batch)? {
-                        RankKey::integer(score, Some(id))
-                    } else if let Ok(EntityId::Uuid(id)) = column.value(position_in_batch)?.entity_id() {
-                        RankKey::uuid(score, id)
-                    } else { return Ok(None); }
+                    let Some(key) = ranked_key(&batch.columns[id], position_in_batch, score)? else { return Ok(None); };
+                    key
                 }
                 None => RankKey::integer(score, None),
             };
@@ -2199,7 +2201,7 @@ impl ScanVerifier<'_> {
                 selected.append_value(iid.0).map_err(|error| invalid("verifier-iid", error))?;
                 scores.append_value(score);
                 if let Some((position, ids)) = id_position.zip(ranked_ids.as_mut()) {
-                    ids.append_option(ranked_integer_id(&batch.columns[position], row)?);
+                    ids.append_option(ranked_key(&batch.columns[position], row, score)?.and_then(crate::rank_cutoff::RankKey::integer_id));
                 }
             }
         }
@@ -3462,19 +3464,28 @@ mod tests {
     }
 
     #[test]
-    fn ranked_integer_ids_follow_execution_types_and_selected_offsets() {
+    fn ranked_keys_follow_execution_types_and_selected_offsets() {
         use crate::columnar::{Column, SelectedColumn};
+        use crate::rank_cutoff::RankKey;
 
-        let values = [Value::U8(u8::MAX), Value::Null, Value::I16(-20), Value::Utf8("other".into()), Value::Binary(vec![0; 16])];
+        let uuid = [42; 16];
+        let values = [Value::U8(u8::MAX), Value::Null, Value::I16(-20), Value::Utf8("other".into()), Value::Binary(vec![0; 16]), Value::Uuid(uuid)];
         let logical = LogicalType::join_all(&values.iter().map(Value::logical_type).collect::<Vec<_>>());
         let field = Arc::new(rtdb_columnar::to_field("_id", &logical).unwrap());
         let array = rtdb_columnar::copy_array(&logical, &values).unwrap();
         let columns = Column::Selected(SelectedColumn::new(
             vec![Some((array, field, Some(logical), None)), None],
-            Arc::new(vec![(0, 2), (0, 0), (0, 1), (0, 3), (0, 4), (1, 0)]),
+            Arc::new(vec![(0, 2), (0, 0), (0, 1), (0, 3), (0, 4), (1, 0), (0, 5)]),
         ));
-        let actual = (0..6).map(|row| ranked_integer_id(&columns, row).unwrap()).collect::<Vec<_>>();
+        let actual = (0..6).map(|row| ranked_key(&columns, row, 1.0).unwrap().and_then(RankKey::integer_id)).collect::<Vec<_>>();
         assert_eq!(actual, [Some(-20), Some(-1), None, None, None, None]);
+        let key = ranked_key(&columns, 6, 1.0).unwrap().unwrap();
+        assert_eq!(key.integer_id(), None);
+        assert_eq!(key.compare(RankKey::uuid(1.0, uuid)), std::cmp::Ordering::Equal);
+        assert!(key.beats(RankKey::uuid(1.0, [43; 16])));
+        for row in 2..6 {
+            assert!(ranked_key(&columns, row, 1.0).unwrap().is_none());
+        }
 
         let uri = LogicalType::Scalar(ScalarType::Uri);
         let unreadable = Column::Arrow {
@@ -3482,7 +3493,7 @@ mod tests {
             field: Arc::new(rtdb_columnar::to_field("_id", &uri).unwrap()),
             logical: Some(uri),
         };
-        assert_eq!(ranked_integer_id(&unreadable, 0).unwrap_err(), unreadable.value(0).unwrap_err());
+        assert_eq!(ranked_key(&unreadable, 0, 1.0).unwrap_err(), unreadable.value(0).unwrap_err());
     }
 
     #[test]
@@ -4038,10 +4049,18 @@ mod tests {
         let mut found = BTreeSet::new();
         while let Some(batch) = cursor.next_batch().await.unwrap() {
             let batch = batch.batch();
-            let (position, field) = batch.schema_ref().column_with_name("_id").unwrap();
             for row in 0..batch.num_rows() {
-                let id = rtdb_columnar::read_entity_id(field, batch.column(position).as_ref(), row).unwrap();
+                let identity = crate::BorrowedOwnedRowIdentity::read(batch, row).unwrap();
+                let id = identity.id();
+                let collision = crate::BorrowedOwnedRowIdentity::read(batch, row).unwrap();
+                assert_eq!(collision.revision_for(rtdb_columnar::EntityIdRef::from(&colliding), &memory).unwrap_err().code,
+                    "rtdb.owned/iid-collision");
+                let exhausted = MemoryBudget::new(1);
+                let unfunded = crate::BorrowedOwnedRowIdentity::read(batch, row).unwrap();
+                assert_eq!(unfunded.revision_for(id, &exhausted).unwrap_err(),
+                    crate::owned_row_revision_for(batch, row, id, &exhausted).unwrap_err());
                 assert_eq!(crate::owned_row_revision_for(batch, row, id, &memory).unwrap(), time);
+                assert_eq!(identity.revision_for(id, &memory).unwrap(), time);
                 found.insert(id.into_owned());
             }
         }
