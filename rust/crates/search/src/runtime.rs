@@ -504,6 +504,13 @@ pub enum FileError { Missing, Corrupt(rtdb_types::Anomaly), Unavailable(rtdb_typ
 impl FileError {
     pub fn needs_repair(&self) -> bool { !matches!(self, Self::Unavailable(_)) }
 
+    pub(crate) fn into_anomaly(self) -> rtdb_types::Anomaly {
+        match self {
+            Self::Missing => rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::NotFound, "rtdb.storage/missing-object", "Search artefact object is missing"),
+            Self::Corrupt(error) | Self::Unavailable(error) => error,
+        }
+    }
+
     pub(crate) fn from_anomaly(error: rtdb_types::Anomaly) -> Self {
         match error.kind {
             Some(rtdb_types::AnomalyKind::MissingObject) => Self::Missing,
@@ -920,6 +927,25 @@ impl SearchRuntime {
     /// Retained pages use the built-file residency budget when admitted to the cache and `memory` otherwise.
     pub async fn built(&self, database: &str, storage: &Arc<BufferPool>, trie: &rtdb_format::keys::TrieKey, data: &rtdb_storage::ObjectKey, columns: &[String],
         analyzer: rtdb_text::Analyzer, memory: &Arc<MemoryBudget>, cancellation: &CancellationToken) -> Result<TrieFile> {
+        self.built_inner(database, storage, trie, data, columns, analyzer, memory, cancellation)
+            .await
+            .map_err(crate::file::BuildError::into_anomaly)
+    }
+
+    /// Attempts to build a search file for optional scan acceleration, declining (`Ok(None)`)
+    /// when the input rows are not in buildable order or the memory budget refuses the build.
+    pub(crate) async fn try_built(&self, database: &str, storage: &Arc<BufferPool>, trie: &rtdb_format::keys::TrieKey, data: &rtdb_storage::ObjectKey, columns: &[String],
+        analyzer: rtdb_text::Analyzer, memory: &Arc<MemoryBudget>, cancellation: &CancellationToken) -> Result<Option<TrieFile>> {
+        match self.built_inner(database, storage, trie, data, columns, analyzer, memory, cancellation).await {
+            Ok(file) => Ok(Some(file)),
+            Err(crate::file::BuildError::InputOrder(_)) => Ok(None),
+            Err(crate::file::BuildError::Anomaly(error)) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => Ok(None),
+            Err(crate::file::BuildError::Anomaly(error)) => Err(error),
+        }
+    }
+
+    async fn built_inner(&self, database: &str, storage: &Arc<BufferPool>, trie: &rtdb_format::keys::TrieKey, data: &rtdb_storage::ObjectKey, columns: &[String],
+        analyzer: rtdb_text::Analyzer, memory: &Arc<MemoryBudget>, cancellation: &CancellationToken) -> std::result::Result<TrieFile, crate::file::BuildError> {
         let identity = format!("{data}#{columns:?}#{analyzer}");
         let share = storage.prepaid_metadata_budget().is_none();
         let cache_key = (database.to_string(), identity.clone());
@@ -935,7 +961,7 @@ impl SearchRuntime {
             Arc::new(tokio::sync::OnceCell::new())
         };
         let outcome = cell.get_or_try_init(|| async {
-            let lease = storage.get(data).await?;
+            let lease = storage.get(data).await.map_err(rtdb_types::Anomaly::from)?;
             let ceiling = crate::file::ceiling_of(trie.recency());
             let indexing = memory.reserve(crate::lane::indexing_allowance(i64::try_from(lease.as_slice().len()).unwrap_or(i64::MAX)))?;
             let (indexed, token) = (columns.to_vec(), cancellation.clone());
@@ -951,8 +977,8 @@ impl SearchRuntime {
             if let Some(weight) = weight {
                 self.built.lock().cache.insert(cache_key.clone(), (Arc::downgrade(storage), Arc::clone(&file)), weight);
             }
-            Ok::<_, rtdb_types::Anomaly>(file)
-        }).await.cloned();
+            Ok::<_, crate::file::BuildError>(file)
+        }).await.map(Arc::clone);
         if share {
             let mut building = self.building.lock();
             // A failed initializer leaves the cell empty for its existing waiters to retry.

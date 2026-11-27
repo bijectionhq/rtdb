@@ -501,6 +501,23 @@ where P: IntoIterator<Item = Result<I>>, I: SearchPage,
     write_group_as(columns, members, identity, version, ceiling, output, reservation, format, BuildMode::Combined).map(|(sections, _, _)| sections)
 }
 
+pub(crate) enum BuildError {
+    InputOrder(Anomaly),
+    Anomaly(Anomaly),
+}
+
+impl BuildError {
+    pub(crate) fn into_anomaly(self) -> Anomaly {
+        match self {
+            Self::InputOrder(error) | Self::Anomaly(error) => error,
+        }
+    }
+}
+
+impl From<Anomaly> for BuildError {
+    fn from(error: Anomaly) -> Self { Self::Anomaly(error) }
+}
+
 pub(crate) fn write_group_as<P, I>(
     columns: &[String], members: impl IntoIterator<Item = P>, identity: &str, version: Option<i64>,
     ceiling: Option<i64>, output: impl Write, reservation: Option<Arc<MemoryReservation>>, format: i32, mode: BuildMode,
@@ -514,7 +531,7 @@ where P: IntoIterator<Item = Result<I>>, I: SearchPage,
         let sections = super::legacy11::write_versioned_group(columns, members, identity, version, ceiling, store, output)?;
         return Ok((sections.into_iter().map(super::legacy11::Section::into_arrow).collect(), TermSummaries::default(), None));
     }
-    let builder = build_group(columns, members, ceiling, reservation, format, mode)?;
+    let builder = build_group(columns, members, ceiling, reservation, format, mode).map_err(BuildError::into_anomaly)?;
     let mut output = Output::File(Writer::new(output, format)?);
     let (sections, summaries, root) = builder.finish(columns, version, identity, &mut output)?;
     let Output::File(writer) = output else { unreachable!() };
@@ -523,7 +540,7 @@ where P: IntoIterator<Item = Result<I>>, I: SearchPage,
 }
 
 pub(super) fn query_batches<I: SearchPage>(columns: &[String], pages: impl IntoIterator<Item = Result<I>>,
-    ceiling: Option<i64>, reservation: Arc<MemoryReservation>) -> Result<QueryBatches> {
+    ceiling: Option<i64>, reservation: Arc<MemoryReservation>) -> std::result::Result<QueryBatches, BuildError> {
     let mut builder = build_group(columns, [pages], ceiling, Some(reservation), FORMAT_VERSION, BuildMode::Combined)?;
     let reservation = builder.reservation.take().expect("Query build owns its reservation");
     let mut output = Output::<std::io::Sink>::Batches(QueryBatches { pages: Vec::new(), reservation });
@@ -535,7 +552,7 @@ pub(super) fn query_batches<I: SearchPage>(columns: &[String], pages: impl IntoI
 fn build_group<P, I>(
     columns: &[String], members: impl IntoIterator<Item = P>, ceiling: Option<i64>,
     reservation: Option<Arc<MemoryReservation>>, format: i32, mode: BuildMode,
-) -> Result<Builder>
+) -> std::result::Result<Builder, BuildError>
 where P: IntoIterator<Item = Result<I>>, I: SearchPage,
 {
     let mut builder = Builder::new(columns.len(), ceiling, reservation, format, mode);
@@ -552,11 +569,11 @@ where P: IntoIterator<Item = Result<I>>, I: SearchPage,
                 let row = page.row(index, columns)?;
                 let iid = row.header.iid;
                 if member_iid.is_none() && previous_member_iid.is_some_and(|previous| previous >= iid) {
-                    return Err(Anomaly::unsupported("rtdb.search/input-order", "Search file members do not hold disjoint IID ranges in order").with_kind(rtdb_types::AnomalyKind::InputOutOfOrder));
+                    return Err(BuildError::InputOrder(Anomaly::unsupported("rtdb.search/input-order", "Search file members do not hold disjoint IID ranges in order").with_kind(rtdb_types::AnomalyKind::InputOutOfOrder)));
                 }
                 if let Some(previous) = member_iid {
                     if previous > iid {
-                        return Err(Anomaly::unsupported("rtdb.search/input-order", "Search rows are not in IID order").with_kind(rtdb_types::AnomalyKind::InputOutOfOrder));
+                        return Err(BuildError::InputOrder(Anomaly::unsupported("rtdb.search/input-order", "Search rows are not in IID order").with_kind(rtdb_types::AnomalyKind::InputOutOfOrder)));
                     }
                     if previous != iid {
                         for (key, entity) in std::mem::take(&mut entities) {
@@ -566,7 +583,7 @@ where P: IntoIterator<Item = Result<I>>, I: SearchPage,
                     }
                 }
                 if previous_time.is_some_and(|previous| previous < row.header.precedence()) {
-                    return Err(Anomaly::unsupported("rtdb.search/input-order", "Search rows are not in system-time-descending order").with_kind(rtdb_types::AnomalyKind::InputOutOfOrder));
+                    return Err(BuildError::InputOrder(Anomaly::unsupported("rtdb.search/input-order", "Search rows are not in system-time-descending order").with_kind(rtdb_types::AnomalyKind::InputOutOfOrder)));
                 }
                 previous_time = Some(row.header.precedence());
                 member_iid = Some(iid);
@@ -581,7 +598,7 @@ where P: IntoIterator<Item = Result<I>>, I: SearchPage,
             previous_member_iid = Some(iid);
         }
     }
-    if builder.members.is_empty() { return Err(fault("A search file holds at least one member")); }
+    if builder.members.is_empty() { return Err(BuildError::Anomaly(fault("A search file holds at least one member"))); }
     Ok(builder)
 }
 
@@ -617,7 +634,7 @@ mod tests {
             old_tokens.append(true);
         }
 
-        let mut previous = build_group(&columns, [[Ok(documents())]], None, None, format, BuildMode::Postings)?;
+        let mut previous = build_group(&columns, [[Ok(documents())]], None, None, format, BuildMode::Postings).map_err(BuildError::into_anomaly)?;
         previous.doc_tokens = old_tokens;
         let mut expected = Vec::new();
         let mut output = Output::File(Writer::new(&mut expected, format)?);

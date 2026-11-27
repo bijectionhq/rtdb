@@ -301,10 +301,12 @@ pub fn write_search_file(columns: &[String], pages: impl IntoIterator<Item = Res
     write_group_search_file(columns, [pages], identity, ceiling, output)
 }
 
+pub(crate) use write::BuildError;
+
 pub(crate) fn build_query_pages<I: SearchPage>(
     columns: &[String], pages: impl IntoIterator<Item = Result<I>>, ceiling: Option<i64>,
     reservation: Arc<MemoryReservation>, admit_shared: impl FnOnce(usize) -> Option<Arc<MemoryReservation>>,
-) -> Result<(SearchFile, Option<usize>)> {
+) -> std::result::Result<(SearchFile, Option<usize>), BuildError> {
     let mut batches = write::query_batches(columns, pages, ceiling, reservation)?;
     let size = shared_batches_allocation_size(&batches.pages)?;
     let build = Arc::get_mut(&mut batches.reservation).expect("Query build owns its reservation");
@@ -1004,7 +1006,7 @@ mod tests {
     async fn arrow_build_query_and_legacy_files_open_from_the_same_typed_pages_as_disk() -> Result<()> {
         let columns = columns();
         let memory = rtdb_columnar::MemoryBudget::new(8 << 20);
-        let (built, weight) = build_query_pages(&columns, [Ok(rows())], None, memory.reserve(1 << 20)?, |_| None)?;
+        let (built, weight) = build_query_pages(&columns, [Ok(rows())], None, memory.reserve(1 << 20)?, |_| None).map_err(BuildError::into_anomaly)?;
         let on_disk = SearchFile::open(build_search_file(&columns, &rows(), "built")?, &columns)?;
         let compare = |typed: &SearchFile, on_disk: &SearchFile| -> Result<()> {
             assert_eq!(typed.reader.len(), on_disk.reader.len());
@@ -1080,7 +1082,7 @@ mod tests {
         let columns = columns();
         let rows = rows();
         let memory = rtdb_columnar::MemoryBudget::new(8 << 20);
-        let (built, _) = build_query_pages(&columns, [Ok(rows.clone())], None, memory.reserve(4 << 20)?, |_| None)?;
+        let (built, _) = build_query_pages(&columns, [Ok(rows.clone())], None, memory.reserve(4 << 20)?, |_| None).map_err(BuildError::into_anomaly)?;
         let durable = SearchFile::open(build_search_file(&columns, &rows, "durable")?, &columns)?;
         let matching = Query::parse("\"invoice is overdue\"");
         let scoring = Query::parse("invoice overdue");

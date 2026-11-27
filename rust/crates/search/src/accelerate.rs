@@ -68,7 +68,25 @@ fn may_be_visible(valid_from: i64, valid_to: i64, system_from: i64, recency: i64
 }
 
 fn optional_build_refused(error: &Anomaly) -> bool {
-    error.is(AnomalyKind::ResourceExhausted) || error.is(AnomalyKind::InputOutOfOrder)
+    error.is(AnomalyKind::ResourceExhausted)
+}
+
+enum RankedFileAction {
+    ReleaseCacheAndDecline,
+    RepairAndDecline,
+    Propagate(Anomaly),
+}
+
+fn classify_ranked_file_error(error: Anomaly) -> RankedFileAction {
+    if error.is(AnomalyKind::ResourceExhausted) {
+        return RankedFileAction::ReleaseCacheAndDecline;
+    }
+    let file_error = crate::runtime::FileError::from_anomaly(error);
+    if file_error.needs_repair() {
+        RankedFileAction::RepairAndDecline
+    } else {
+        RankedFileAction::Propagate(file_error.into_anomaly())
+    }
 }
 
 #[async_trait]
@@ -482,7 +500,7 @@ impl SearchAccelerator {
                 skipped.push(trie.key.clone());
                 continue;
             }
-            let data = ObjectKey::new(entry.slug.data_key(&trie.key))?;
+            let data = ObjectKey::new(entry.slug.data_key(&trie.key)).map_err(Anomaly::from)?;
             let published = recorded.map(|recorded| {
                 let published = (recorded.key.clone(), recorded.member);
                 loads.entry(recorded.key.clone()).or_insert(recorded);
@@ -507,12 +525,9 @@ impl SearchAccelerator {
         }
         if unindexed > self.max_unindexed_bytes { return Ok(TrieFiles::Partial(Found { files, skipped })); }
         for (trie, data) in unbuilt {
-            match self.runtime.built(request.database, request.storage, &trie, &data, &definition.columns, definition.analyzer, request.memory, request.cancellation).await {
-                Ok(file) => files.push(file),
-                Err(error) if optional_build_refused(&error) => {
-                    return Ok(TrieFiles::Partial(Found { files, skipped }));
-                }
-                Err(error) => return Err(error),
+            match self.runtime.try_built(request.database, request.storage, &trie, &data, &definition.columns, definition.analyzer, request.memory, request.cancellation).await? {
+                Some(file) => files.push(file),
+                None => return Ok(TrieFiles::Partial(Found { files, skipped })),
             }
         }
         Ok(TrieFiles::Complete(Found { files, skipped }))
@@ -582,6 +597,26 @@ fn uncovered_owned_search() -> Anomaly {
     Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/search-uncovered", "Published search artefacts do not cover the held cut")
 }
 
+enum OwnedArtefactError {
+    Uncovered,
+    Anomaly(Anomaly),
+}
+
+impl OwnedArtefactError {
+    fn into_anomaly(self) -> Anomaly {
+        match self {
+            Self::Uncovered => uncovered_owned_search(),
+            Self::Anomaly(error) => error,
+        }
+    }
+}
+
+impl From<Anomaly> for OwnedArtefactError {
+    fn from(error: Anomaly) -> Self { Self::Anomaly(error) }
+}
+
+type OwnedArtefactResult<T> = std::result::Result<T, OwnedArtefactError>;
+
 /// Computes exact statistics for the admitted owned relation at the held point.
 /// Opens only artefacts recorded on that cut and never builds a replacement.
 pub async fn owned_corpus(
@@ -593,7 +628,9 @@ pub async fn owned_corpus(
     let partition = [(relation.clone(), path.clone())];
     let analyzer = crate::owned_search_analyzer(Arc::clone(&context), owner, &partition).await?;
     let query = Query::analyzed(analyzer, text);
-    let covered = covered_owned_corpus(context, owner, relation, path, &query, None, false, |_| false).await?;
+    let covered = covered_owned_corpus(context, owner, relation, path, &query, None, false, |_| false)
+        .await
+        .map_err(OwnedArtefactError::into_anomaly)?;
     Ok(rtdb_text::Corpus {
         documents: covered.documents, tokens: covered.tokens,
         frequencies: query.terms().iter().cloned().zip(covered.frequencies.values().iter().copied()).collect(),
@@ -620,17 +657,17 @@ async fn covered_owned_corpus(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, path: &OwnedRelation, query: &Query,
     valid_at: Option<Timestamp>, retain_runs: bool,
     is_shadowed: impl Fn(EntityIdRef<'_>) -> bool,
-) -> Result<CoveredCorpus> {
+) -> OwnedArtefactResult<CoveredCorpus> {
     let definition = crate::definitions::owned_definition(Arc::clone(&context), owner, relation, path).await?
         .ok_or_else(|| Anomaly::incorrect("rtdb.owned/search-path", "Owned relation has no declared clear-text search path with this name"))?;
     let database = context.catalog.default_database();
     let captured = context.catalog.database(database)?;
-    let [snapshot] = captured.partitions.as_slice() else { return Err(uncovered_owned_search()); };
+    let [snapshot] = captured.partitions.as_slice() else { return Err(OwnedArtefactError::Uncovered); };
     let present = context.current_time.as_micros()?;
     if !crate::held_at_or_before(snapshot, present) {
-        return Err(uncovered_owned_search());
+        return Err(OwnedArtefactError::Uncovered);
     }
-    let [column] = definition.columns.as_slice() else { return Err(uncovered_owned_search()); };
+    let [column] = definition.columns.as_slice() else { return Err(OwnedArtefactError::Uncovered); };
     let bounds = TemporalBounds {
         valid_time: Interval::at(valid_at.unwrap_or(present))?,
         system_time: Interval::at(present)?,
@@ -643,16 +680,16 @@ async fn covered_owned_corpus(
         });
     }
     if snapshot.iter_segments(&definition.table).any(|segment| segment.row_count() != 0) {
-        return Err(uncovered_owned_search());
+        return Err(OwnedArtefactError::Uncovered);
     }
     let runtime = crate::SearchRuntime::for_query(Arc::clone(&context.memory));
     let mut files = Vec::new();
     let mut opened = BTreeMap::<ObjectKey, Arc<SearchFile>>::new();
-    let entry = snapshot.table_entry(&definition.table).ok_or_else(uncovered_owned_search)?;
+    let entry = snapshot.table_entry(&definition.table).ok_or(OwnedArtefactError::Uncovered)?;
     for trie in snapshot.trie_catalog().current_tries(&definition.table) {
         context.check_cancelled()?;
         let recorded = SearchAccelerator::recorded_key(snapshot, &definition.table, trie, &definition, false)?
-            .ok_or_else(uncovered_owned_search)?;
+            .ok_or(OwnedArtefactError::Uncovered)?;
         let file = if let Some(file) = opened.get(&recorded.key) {
             Arc::clone(file)
         } else {
@@ -660,16 +697,16 @@ async fn covered_owned_corpus(
             let queries = [query];
             let file = context.cancellation.run_until_cancelled(Box::pin(SearchAccelerator::open_recorded(
                 &runtime, database, &captured.storage, &recorded, &definition, &identity, column, &queries, LoadSearch::Owned,
-            ))).await.ok_or_else(search_cancelled)?.map_err(|_| uncovered_owned_search())?;
-            file.prepare_terms(column, &[query]).await.map_err(|_| uncovered_owned_search())?;
+            ))).await.ok_or_else(search_cancelled)?.map_err(|_| OwnedArtefactError::Uncovered)?;
+            file.prepare_terms(column, &[query]).await.map_err(|_| OwnedArtefactError::Uncovered)?;
             if !file.matches_artefact(&identity, definition.version) {
-                return Err(uncovered_owned_search());
+                return Err(OwnedArtefactError::Uncovered);
             }
             opened.insert(recorded.key.clone(), Arc::clone(&file));
             file
         };
-        if !file.has_full_event_keys() { return Err(uncovered_owned_search()); }
-        let data = ObjectKey::new(entry.slug.data_key(&trie.key))?;
+        if !file.has_full_event_keys() { return Err(OwnedArtefactError::Uncovered); }
+        let data = ObjectKey::new(entry.slug.data_key(&trie.key)).map_err(Anomaly::from)?;
         files.push(TrieFile { trie: trie.key.clone(), data, identity: recorded.key.as_str().to_owned(), file, member: recorded.member });
     }
 
@@ -695,13 +732,13 @@ async fn covered_owned_corpus(
                 let id = selected.file.run_identity_key(doc)?;
                 match cutter.judge_key(own, doc, Some(key))? {
                     Judged::Hidden => (),
-                    Judged::Visible { exact: false } => return Err(uncovered_owned_search()),
+                    Judged::Visible { exact: false } => return Err(OwnedArtefactError::Uncovered),
                     Judged::Visible { exact: true } => {
                         if is_shadowed(id) { continue; }
                         Arc::get_mut(&mut identities).expect("corpus owns its identity reservation")
                             .grow_to(seen.len().saturating_add(1).saturating_mul(256))?;
                         if !seen.insert(key) || visible.last().is_some_and(|&last| last >= doc.doc) {
-                            return Err(uncovered_owned_search());
+                            return Err(OwnedArtefactError::Uncovered);
                         }
                         push_accounted(&mut visible, doc.doc, 128, &mut selection)?;
                         documents += 1;
@@ -711,7 +748,7 @@ async fn covered_owned_corpus(
             }
         }
         for (term, frequency) in query.terms().iter().zip(&mut frequencies) {
-            let Some(postings) = selected.file.postings(column, term).map_err(|_| uncovered_owned_search())? else { continue; };
+            let Some(postings) = selected.file.postings(column, term).map_err(|_| OwnedArtefactError::Uncovered)? else { continue; };
             *frequency += postings.documents().iter().filter(|doc| visible.binary_search(doc).is_ok()).count() as u64;
         }
         if retain_runs && !visible.is_empty() {
@@ -804,19 +841,18 @@ pub async fn owned_ranked_overlay_batch(
             return rank_owned_exact(&context, owner, partitions, analyzer, text, offset, limit, valid_at, overlay).await;
         }
     }
-    let uncovered = match prepare_owned_artefacts(&context, owner, partitions, &query, valid_at, overlay.as_ref()).await {
+    match prepare_owned_artefacts(&context, owner, partitions, &query, valid_at, overlay.as_ref()).await {
         Ok(corpus) => match rank_owned_artefacts(&context, owner, &corpus, offset, limit).await {
             Ok(mut rank) => {
                 if let Some(overlay) = overlay { overlay.rank(&corpus.scorer, &mut rank)?; }
                 context.check_cancelled()?;
                 return rank.finish_batch();
             }
-            Err(error) => error,
+            Err(OwnedArtefactError::Uncovered) => {}
+            Err(OwnedArtefactError::Anomaly(error)) => return Err(error),
         },
-        Err(error) => error,
-    };
-    if uncovered.code != "rtdb.owned/search-uncovered" {
-        return Err(uncovered);
+        Err(OwnedArtefactError::Uncovered) => {}
+        Err(OwnedArtefactError::Anomaly(error)) => return Err(error),
     }
     rank_owned_exact(&context, owner, partitions, analyzer, text, offset, limit, valid_at, overlay).await
 }
@@ -846,7 +882,7 @@ struct OwnedArtefactCorpus<'a> {
 async fn prepare_owned_artefacts<'a>(
     context: &Arc<QueryContext>, owner: &str, partitions: &'a [(OwnedRelation, OwnedRelation)], query: &Query,
     valid_at: Option<Timestamp>, overlay: Option<&crate::HeldTextCorpus>,
-) -> Result<OwnedArtefactCorpus<'a>> {
+) -> OwnedArtefactResult<OwnedArtefactCorpus<'a>> {
     let mut documents = 0;
     let mut tokens = 0;
     let mut frequencies = vec![0; query.terms().len()];
@@ -873,7 +909,7 @@ async fn prepare_owned_artefacts<'a>(
 
 async fn rank_owned_artefacts<'a>(
     context: &Arc<QueryContext>, owner: &str, corpus: &'a OwnedArtefactCorpus<'_>, offset: usize, limit: usize,
-) -> Result<OwnedRankWindow<'a>> {
+) -> OwnedArtefactResult<OwnedRankWindow<'a>> {
     let scorer = &corpus.scorer;
     let query = scorer.query();
     let mut rank = OwnedRankWindow::new(&context.memory, offset, limit)?;
@@ -881,7 +917,7 @@ async fn rank_owned_artefacts<'a>(
         for VisibleRuns { file, documents: visible, .. } in &covered.visible_runs {
             context.check_cancelled()?;
             let mut matches = file.matched_scores(&covered.column, scorer, covered.bounds, Some(visible.values()))
-                .map_err(|_| uncovered_owned_search())?;
+                .map_err(|_| OwnedArtefactError::Uncovered)?;
             loop {
                 let available = OWNED_RANK_CANDIDATES - rank.total;
                 if available == 0 {
@@ -900,7 +936,7 @@ async fn rank_owned_artefacts<'a>(
                 let keys = pending.iter().map(|candidate| (Iid(candidate.run.iid), candidate.key.clone())).collect::<Vec<_>>();
                 let Some(mut rows) = rtdb_query::open_owned_artefact_candidates(
                     Arc::clone(context), owner, relation, covered.bounds.valid_time, &covered.column, keys,
-                ).await? else { return Err(uncovered_owned_search()); };
+                ).await? else { return Err(OwnedArtefactError::Uncovered); };
                 let mut locators = BTreeMap::<Iid, Vec<usize>>::new();
                 for (index, candidate) in pending.iter().enumerate() {
                     locators.entry(Iid(candidate.run.iid)).or_default().push(index);
@@ -908,9 +944,9 @@ async fn rank_owned_artefacts<'a>(
                 while let Some(batch) = rows.next_batch().await? {
                     let batch = batch.batch();
                     let schema = batch.schema_ref();
-                    let (column, field) = schema.column_with_name(&covered.column).ok_or_else(uncovered_owned_search)?;
-                    let (id_column, id_field) = schema.column_with_name("_id").ok_or_else(uncovered_owned_search)?;
-                    let iids = batch.column_by_name("_iid").ok_or_else(uncovered_owned_search)?;
+                    let (column, field) = schema.column_with_name(&covered.column).ok_or(OwnedArtefactError::Uncovered)?;
+                    let (id_column, id_field) = schema.column_with_name("_id").ok_or(OwnedArtefactError::Uncovered)?;
+                    let iids = batch.column_by_name("_iid").ok_or(OwnedArtefactError::Uncovered)?;
                     let iids = rtdb_columnar::IidView::new(iids.as_ref())?;
                     let logical = rtdb_columnar::from_field(field)?;
                     for row in 0..batch.num_rows() {
@@ -926,10 +962,10 @@ async fn rank_owned_artefacts<'a>(
                         };
                         let iid = iids.get(row)?;
                         let Some(&index) = locators.get(&iid).and_then(|indices| indices.iter().find(|&&index| pending[index].id == id)) else {
-                            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/iid-collision", "Owned row locator resolves to a different complete identity"));
+                            return Err(OwnedArtefactError::Anomaly(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/iid-collision", "Owned row locator resolves to a different complete identity")));
                         };
                         let candidate = &mut pending[index];
-                        if candidate.verified.is_some() { return Err(uncovered_owned_search()); }
+                        if candidate.verified.is_some() { return Err(OwnedArtefactError::Uncovered); }
                         let revision = rtdb_query::owned_row_revision_for(batch, row, candidate.id, &context.memory)?;
                         // The winning row's event is named by its position: a
                         // tied transaction's event shares its time (T7).
@@ -947,25 +983,25 @@ async fn rank_owned_artefacts<'a>(
                                     && file.run_of(&covered.column, entry) == Some(Some(candidate.run.doc));
                             }
                         }
-                        if !same_run { return Err(uncovered_owned_search()); }
+                        if !same_run { return Err(OwnedArtefactError::Uncovered); }
                         let PutText::Utf8(text) = rtdb_columnar::owned_text_cell(&logical, field, batch.column(column).as_ref(), row)?
-                            else { return Err(uncovered_owned_search()); };
+                            else { return Err(OwnedArtefactError::Uncovered); };
                         let score = if overlapping == 1 {
                             candidate.score
                         } else {
                             let _scratch = context.memory.reserve(text.len().saturating_mul(64).saturating_add(4096))?;
                             let (count, frequencies, matched) = query.text_terms(text, true);
                             if !matched || count.len() != file.token_length(candidate.run.doc)? as usize {
-                                return Err(uncovered_owned_search());
+                                return Err(OwnedArtefactError::Uncovered);
                             }
                             scorer.score(&frequencies, rtdb_text::stored_length(count.len()))
                         };
-                        if !score.is_finite() { return Err(uncovered_owned_search()); }
+                        if !score.is_finite() { return Err(OwnedArtefactError::Uncovered); }
                         candidate.verified = Some(score);
                     }
                 }
                 for candidate in pending {
-                    let score = candidate.verified.ok_or_else(uncovered_owned_search)?;
+                    let score = candidate.verified.ok_or(OwnedArtefactError::Uncovered)?;
                     if let Some(at) = rank.position(partition, candidate.id, score) {
                         rank.insert_at(at, partition, RankedIdentity::Covered(candidate.id), score);
                     }
@@ -1291,25 +1327,29 @@ impl SearchAccelerator {
                 let next = request.cancellation.run_until_cancelled(candidates.next(options.scope, ascending_id.is_some(), work))
                     .await.ok_or_else(search_cancelled)?;
                 let pending = match next {
-                    Err((index, error)) if optional_build_refused(&error) || error.code.starts_with("rtdb.search/")
-                        || error.code.starts_with("rtdb.storage/") => {
-                        if error.is(AnomalyKind::ResourceExhausted) { self.runtime.release_file_cache(); }
-                        if crate::runtime::FileError::from_anomaly(error).needs_repair()
-                            && let Some(file) = index.and_then(|index| files.get(index)) {
-                            let table = &request.scan.table.name.table;
-                            if let Some(recorded) = request.snapshot.trie_catalog().trie(table, &file.trie)
-                                .and_then(|trie| Self::recorded_key(request.snapshot, table, trie, definition, false).ok().flatten())
-                                .filter(|recorded| recorded.key.as_str() == file.identity) {
-                                self.runtime.report(Suspect {
-                                    database: request.database.to_owned(), table: table.clone(), owner: recorded.owner,
-                                    artefact_id: recorded.artefact_id, version: definition.version,
-                                });
-                            }
+                    Err((index, error)) => match classify_ranked_file_error(error) {
+                        RankedFileAction::ReleaseCacheAndDecline => {
+                            self.runtime.release_file_cache();
+                            work.decline = Some("ranked-file");
+                            return Ok(None);
                         }
-                        work.decline = Some("ranked-file");
-                        return Ok(None);
-                    }
-                    Err((_, error)) => return Err(error),
+                        RankedFileAction::RepairAndDecline => {
+                            if let Some(file) = index.and_then(|index| files.get(index)) {
+                                let table = &request.scan.table.name.table;
+                                if let Some(recorded) = request.snapshot.trie_catalog().trie(table, &file.trie)
+                                    .and_then(|trie| Self::recorded_key(request.snapshot, table, trie, definition, false).ok().flatten())
+                                    .filter(|recorded| recorded.key.as_str() == file.identity) {
+                                    self.runtime.report(Suspect {
+                                        database: request.database.to_owned(), table: table.clone(), owner: recorded.owner,
+                                        artefact_id: recorded.artefact_id, version: definition.version,
+                                    });
+                                }
+                            }
+                            work.decline = Some("ranked-file");
+                            return Ok(None);
+                        }
+                        RankedFileAction::Propagate(error) => return Err(error),
+                    },
                     Ok(pending) => pending,
                 };
                 let Some(Pending { iid, .. }) = pending else { break };
@@ -1533,5 +1573,30 @@ mod tests {
         assert!(covers(&[], &iid));
         assert!(covers(&[1, 2, 3, 0, 1], &iid));
         assert!(!covers(&[1, 3], &iid));
+    }
+
+    #[test]
+    fn ranked_file_errors_decline_only_for_budget_missing_or_corrupt_files() {
+        let budget = Anomaly::from(rtdb_storage::Error::MemoryLimit { requested: 16, limit: 8, retained: 8 });
+        assert!(matches!(classify_ranked_file_error(budget), RankedFileAction::ReleaseCacheAndDecline));
+
+        let missing = Anomaly::from(rtdb_storage::Error::MissingObject("search/missing".into()));
+        assert!(matches!(classify_ranked_file_error(missing), RankedFileAction::RepairAndDecline));
+
+        let corrupt = Anomaly::fault("rtdb.search/corrupt-file", "bad footer");
+        assert!(matches!(classify_ranked_file_error(corrupt), RankedFileAction::RepairAndDecline));
+
+        for propagated in [
+            Anomaly::from(rtdb_storage::Error::PermissionDenied { key: "k".into(), message: "denied".into() }),
+            Anomaly::from(rtdb_storage::Error::ErasedUnderView),
+            search_cancelled(),
+            Anomaly::new(AnomalyCategory::Unavailable, "rtdb.storage/io", "transient io"),
+        ] {
+            let code = propagated.code.clone();
+            match classify_ranked_file_error(propagated) {
+                RankedFileAction::Propagate(error) => assert_eq!(error.code, code),
+                _ => panic!("expected {code} to propagate"),
+            }
+        }
     }
 }
