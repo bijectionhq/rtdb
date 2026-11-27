@@ -389,7 +389,9 @@ A filtered left lateral unnest can expand directly captured lists of signed inte
 Compatible fixed-size Arrow lists use the declared width and retain child spans relative to the reached array slice.
 A total predicate may use the element, its original one-based I64 ordinal, and directly captured Boolean or signed integer columns.
 Predicate admission covers Boolean combinations, null and truth tests, signed integer comparisons, and Boolean equality and distinctness.
-Only real candidates enter the page predicate, and only true candidates survive.
+The predicate sees real candidates in bounded batches, and only true candidates survive.
+The operator returns the complete ordered expansion of each reached input page.
+Its cursor trace reports the real candidates and their survivors from completed batched expansions as `cursor.left_unnest.candidates` and `cursor.left_unnest.survivors`.
 Compatible dense unions can select a list leg per parent and retain mixed signed integer, Boolean or null element legs.
 Signed integer comparisons span widths exactly, and Boolean and signed integer element legs can share null tests.
 Each parent with zero surviving candidates gets one row with null dependent fields.

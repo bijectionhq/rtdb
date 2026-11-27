@@ -10,6 +10,8 @@ use crate::{QueryContext, pages::{BoxPageCursor, OwnedPage, PageCursor}};
 pub(crate) enum OperatorCounter {
     PeakMemoryBytes,
     InnerExecutions,
+    LeftUnnestCandidates,
+    LeftUnnestSurvivors,
     PredicateScalarFallbacks,
     ProjectionScalarFallbacks,
     ScanDecodedBytes,
@@ -29,6 +31,8 @@ impl OperatorCounter {
         let name = match self {
             Self::PeakMemoryBytes => "cursor.peak_memory_bytes",
             Self::InnerExecutions => "cursor.apply.inner_executions",
+            Self::LeftUnnestCandidates => "cursor.left_unnest.candidates",
+            Self::LeftUnnestSurvivors => "cursor.left_unnest.survivors",
             Self::PredicateScalarFallbacks => "cursor.predicate.scalar_fallbacks",
             Self::ProjectionScalarFallbacks => "cursor.projection.scalar_fallbacks",
             Self::ScanDecodedBytes => "cursor.scan.decoded_bytes",

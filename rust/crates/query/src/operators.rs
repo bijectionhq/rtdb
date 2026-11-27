@@ -6,7 +6,7 @@ use rtdb_expr::{integer, is_true, null_eq_in_timezone};
 use rtdb_plan::{ApplyKind, Expr, NamedExpr, Relation, RelationNode, Schema, SetOperator};
 use rtdb_types::{LogicalType, Result, Value};
 
-use crate::columnar::PredicateSelection;
+use crate::columnar::{FilteredUnnestCounts, PredicateSelection};
 use crate::compiled::{OperatorTemplate, Predicates, Projections, StackedFilters};
 use crate::context::Execution;
 use crate::limit_bounds::{checked_row_count, sort_prefix_len};
@@ -352,7 +352,12 @@ async fn build_batches_at(
                 document_field: None, comparison: None,
                 inner_executions: apply_open_counter(&execution.context), execution };
             let cursor: BoxBatchCursor = match expansion {
-                Some(expansion) => Box::new(BatchFilteredUnnest { input, expansion, fallback: plan }),
+                Some(expansion) => Box::new(BatchFilteredUnnest {
+                    input,
+                    expansion,
+                    counts: plan.inner_executions.as_ref().map(|_| FilteredUnnestCounts::default()),
+                    fallback: plan,
+                }),
                 None => Box::new(BatchApply { input, plan, document_reuse: None }),
             };
             Ok(Some((cursor, projected)))
@@ -1213,12 +1218,17 @@ struct BatchFilteredUnnest {
     input: crate::columnar::BoxBatchCursor,
     expansion: BatchFilteredUnnestPlan,
     fallback: BatchApplyPlan,
+    counts: Option<FilteredUnnestCounts>,
 }
 
 #[async_trait]
 impl crate::columnar::BatchCursor for BatchFilteredUnnest {
     fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) {
         self.fallback.trace_opens(span);
+        if let Some(counts) = &self.counts {
+            crate::trace::OperatorCounter::LeftUnnestCandidates.record(span, counts.candidates);
+            crate::trace::OperatorCounter::LeftUnnestSurvivors.record(span, counts.survivors);
+        }
     }
 
     async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> {
@@ -1231,8 +1241,12 @@ impl crate::columnar::BatchCursor for BatchFilteredUnnest {
             batch.validate_readable(context)?;
             if batch.len == 0 { continue; }
             if plan.scalar_arguments.iter().all(|&pos| batch.compatible_unnest_argument(pos, &plan.schema.fields()[pos].data_type))
-                && let Some(output) = batch.expand_filtered_list(plan.list, &plan.schema, &plan.predicate, plan.ordinality.as_deref(), execution).await?
+                && let Some((output, counts)) = batch.expand_filtered_list(plan.list, &plan.schema, &plan.predicate, plan.ordinality.as_deref(), execution).await?
             {
+                if let Some(total) = &mut self.counts {
+                    total.candidates = total.candidates.saturating_add(counts.candidates);
+                    total.survivors = total.survivors.saturating_add(counts.survivors);
+                }
                 return Ok(Some(output));
             }
             if let Some(output) = self.fallback.joined(&Arc::new(batch)).await? {

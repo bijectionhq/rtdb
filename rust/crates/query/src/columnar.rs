@@ -219,6 +219,74 @@ impl UnnestRows {
     fn group_start(&self, group: usize) -> usize {
         group.checked_sub(1).map_or(0, |prev| self.groups[prev].end)
     }
+
+    fn candidate_window(&self, rows: Range<usize>, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
+        let first_group = self.group_at(rows.start);
+        let mut window = Self::new(memory)?;
+        let mut group_start = self.group_start(first_group);
+        for group in &self.groups[first_group..] {
+            let start = rows.start.max(group_start) - group_start;
+            let end = rows.end.min(group.end) - group_start;
+            let (source, child_start) = group.child.expect("Candidate runs contain real list elements");
+            window.push_run(group.parent, Some((source, child_start + start..child_start + end)),
+                group.ordinal_start + start, memory)?;
+            if group.end >= rows.end { break; }
+            group_start = group.end;
+        }
+        Ok(Arc::new(window))
+    }
+
+    fn fill_unmatched_until(&mut self, end: usize, context: &crate::QueryContext) -> Result<()> {
+        let start = self.groups.last().map_or(0, |last| last.parent + 1);
+        for parent in start..end {
+            context.check_cancelled_at(parent)?;
+            self.push_run(parent, None, 0, &context.memory)?;
+        }
+        Ok(())
+    }
+
+    fn append_survivors(&mut self, candidates: &Self, selection: &PredicateSelection,
+        context: &crate::QueryContext) -> Result<()> {
+        let mut selected = selection.mask.values().set_slices().peekable();
+        for (index, group) in candidates.groups.iter().enumerate() {
+            let group_start = candidates.group_start(index);
+            loop {
+                let Some(&(start, end)) = selected.peek() else { return Ok(()); };
+                if start >= group.end { break; }
+                let start = start.max(group_start) - group_start;
+                let stop = end.min(group.end) - group_start;
+                let (source, child_start) = group.child.expect("Candidate runs contain real list elements");
+                self.fill_unmatched_until(group.parent, context)?;
+                self.push_surviving_run(group.parent, source, child_start + start..child_start + stop,
+                    group.ordinal_start + start, &context.memory)?;
+                if end > group.end { break; }
+                let _ = selected.next();
+            }
+        }
+        Ok(())
+    }
+
+    fn push_surviving_run(&mut self, parent: usize, source: usize, child: Range<usize>, ordinal_start: usize,
+        memory: &Arc<MemoryBudget>) -> Result<()> {
+        let previous_len = self.len() - self.group_start(self.groups.len().saturating_sub(1));
+        if let Some(previous) = self.groups.last_mut()
+            && previous.parent == parent
+            && previous.child.is_some_and(|(previous_source, start)| previous_source == source && start + previous_len == child.start)
+            && previous.ordinal_start + previous_len == ordinal_start
+        {
+            previous.end = previous.end.checked_add(child.len()).ok_or_else(size_error)?;
+            return Ok(());
+        }
+        self.push_run(parent, Some((source, child)), ordinal_start, memory)
+    }
+}
+
+const FILTERED_UNNEST_CANDIDATE_ROWS: usize = 1024;
+
+#[derive(Default)]
+pub(crate) struct FilteredUnnestCounts {
+    pub candidates: u64,
+    pub survivors: u64,
 }
 
 struct UnnestExpansion {
@@ -233,41 +301,6 @@ impl UnnestExpansion {
             expansion: RowExpansion::UnnestChildren(Arc::clone(runs)), rows: 0..runs.len(), input: None,
         };
         Column::Selected(SelectedColumn { sources: Arc::clone(&self.sources), cells })
-    }
-
-    fn survivors(&self, selection: Option<&PredicateSelection>, parents: usize,
-        context: &crate::QueryContext) -> Result<Arc<UnnestRows>> {
-        let memory = &context.memory;
-        let mut output = UnnestRows::new(memory)?;
-        let mut candidates = self.runs.groups.iter().enumerate().peekable();
-        for parent in 0..parents {
-            context.check_cancelled_at(parent)?;
-            let before = output.len();
-            if let Some((index, group)) = candidates.next_if(|(_, group)| group.parent == parent)
-                && let Some(selection) = selection
-                && !selection.is_empty()
-            {
-                let (source, start) = group.child.expect("Candidate runs contain real list elements");
-                let first = self.runs.group_start(index);
-                let mut kept = None;
-                for candidate in first..group.end {
-                    context.check_cancelled_at(candidate)?;
-                    let ordinal = candidate - first;
-                    if selection.contains(candidate) {
-                        kept.get_or_insert(ordinal);
-                    } else if let Some(from) = kept.take() {
-                        output.push_run(parent, Some((source, start + from..start + ordinal)), from, memory)?;
-                    }
-                }
-                if let Some(from) = kept {
-                    output.push_run(parent, Some((source, start + from..start + (group.end - first))), from, memory)?;
-                }
-            }
-            if output.len() == before {
-                output.push_run(parent, None, 0, memory)?;
-            }
-        }
-        Ok(Arc::new(output))
     }
 }
 
@@ -884,25 +917,38 @@ impl ColumnBatch {
     }
 
     pub(crate) async fn expand_filtered_list(&self, position: usize, schema: &rtdb_plan::Schema, predicate: &rtdb_plan::Expr,
-        ordinality: Option<&str>, execution: &crate::context::Execution) -> Result<Option<Self>> {
+        ordinality: Option<&str>, execution: &crate::context::Execution) -> Result<Option<(Self, FilteredUnnestCounts)>> {
         let context = &execution.context;
         let expected = &schema.fields()[position].data_type;
         let Some(expansion) = self.list_expansion(position, Some(expected), false, false, context)? else {
             return Ok(None);
         };
         let candidates = &expansion.runs;
-        let selection = if candidates.len() == 0 {
-            None
-        } else {
-            let batch = self.finish_filtered_unnest(&expansion, candidates, ordinality, context)?;
-            let selection = predicate_selection(&batch, predicate, schema, execution).await?;
-            if selection.count == candidates.len() && candidates.groups.len() == self.len {
-                return Ok(Some(batch));
+        let candidate_count = candidates.len();
+        let mut counts = FilteredUnnestCounts { candidates: candidate_count as u64, survivors: 0 };
+        let mut survivors = UnnestRows::new(&context.memory)?;
+        if candidate_count != 0 {
+            let compiled = functions::Predicate::bind(predicate, schema);
+            for start in (0..candidate_count).step_by(FILTERED_UNNEST_CANDIDATE_ROWS) {
+                context.check_cancelled()?;
+                let window = if candidate_count <= FILTERED_UNNEST_CANDIDATE_ROWS {
+                    Arc::clone(candidates)
+                } else {
+                    let end = start + (candidate_count - start).min(FILTERED_UNNEST_CANDIDATE_ROWS);
+                    candidates.candidate_window(start..end, &context.memory)?
+                };
+                let batch = self.finish_filtered_unnest(&expansion, &window, ordinality, context)?;
+                let selection = admitted_predicate_selection(&batch, predicate, schema, execution, compiled.as_ref(), None).await?;
+                counts.survivors += selection.count as u64;
+                if selection.count == candidate_count && candidates.groups.len() == self.len {
+                    return Ok(Some((batch, counts)));
+                }
+                survivors.append_survivors(&window, &selection, context)?;
             }
-            Some(selection)
-        };
-        let survivors = expansion.survivors(selection.as_ref(), self.len, context)?;
-        self.finish_filtered_unnest(&expansion, &survivors, ordinality, context).map(Some)
+        }
+        survivors.fill_unmatched_until(self.len, context)?;
+        let output = self.finish_filtered_unnest(&expansion, &Arc::new(survivors), ordinality, context)?;
+        Ok(Some((output, counts)))
     }
 
     fn finish_filtered_unnest(&self, expansion: &UnnestExpansion, runs: &Arc<UnnestRows>, ordinality: Option<&str>,

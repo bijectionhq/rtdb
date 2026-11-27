@@ -1009,7 +1009,7 @@ async fn left_unnest_batches_dense_unions_and_keeps_fallible_mixed_ordering_on_a
     assert_eq!(count_nodes(rewritten.relation(), &|node| matches!(node, RelationNode::Apply { kind: ApplyKind::LeftUnnest, .. })), 1);
     let expected = ["[I64(9007199254740993), I64(3)]", "[Null, Null]"];
     assert_eq!(run_in_order(&correlated).await.unwrap(), expected);
-    assert_eq!(run_with_no_dependent_opens(&rewritten, Arc::clone(&context)).await, expected);
+    assert_eq!(run_with_unnest_trace(&rewritten, Arc::clone(&context), (3, 1)).await, expected);
 
     let element = typed(41, "item", LogicalType::from_legs([
         LogicalType::Scalar(ScalarType::I32), int(), bool_type(), LogicalType::Null,
@@ -1023,7 +1023,7 @@ async fn left_unnest_batches_dense_unions_and_keeps_fallible_mixed_ordering_on_a
     assert_eq!(count_nodes(rewritten.relation(), &|node| matches!(node, RelationNode::Apply { kind: ApplyKind::LeftUnnest, .. })), 1);
     let expected = ["[I32(-1), I64(1)]", "[Null, I64(3)]", "[Bool(false), I64(1)]"];
     assert_eq!(run_in_order(&correlated).await.unwrap(), expected);
-    assert_eq!(run_with_no_dependent_opens(&rewritten, Arc::clone(&context)).await, expected);
+    assert_eq!(run_with_unnest_trace(&rewritten, Arc::clone(&context), (4, 3)).await, expected);
 
     let fallible = left_unnest(&element, &mixed_parents, Expr::binary(BinaryOp::Gt, element.expression(), literal(0)));
     let limited = Arc::new(Arc::clone(&fallible).limit(None, Some(literal(1))).unwrap());
@@ -1276,17 +1276,26 @@ fn filtered_fixed_size_tags(
     keep(relation, &output)
 }
 
-async fn run_with_no_dependent_opens(query: &PreparedQuery, context: Arc<QueryContext>) -> Vec<String> {
+async fn run_with_unnest_trace(query: &PreparedQuery, context: Arc<QueryContext>, (expected_candidates, expected_survivors): (u64, u64)) -> Vec<String> {
     let (tracer, mut spans) = rtdb_metrics::TraceRecorder::new(Arc::clone(&context.memory), 64, true, true).unwrap();
     let rows = run_with_context(query, context.with_tracer(Some(tracer.clone()), None)).await.unwrap();
     tracer.close();
     let mut opens = Vec::new();
+    let mut candidates = Vec::new();
+    let mut survivors = Vec::new();
     while let Some(span) = spans.next().await {
         for (name, value) in span.attributes() {
-            if name == "cursor.apply.inner_executions" { opens.push(value.parse::<u64>().unwrap()); }
+            match name {
+                "cursor.apply.inner_executions" => opens.push(value.parse::<u64>().unwrap()),
+                "cursor.left_unnest.candidates" => candidates.push(value.parse::<u64>().unwrap()),
+                "cursor.left_unnest.survivors" => survivors.push(value.parse::<u64>().unwrap()),
+                _ => {}
+            }
         }
     }
     assert_eq!(opens, [0]);
+    assert_eq!(candidates, [expected_candidates]);
+    assert_eq!(survivors, [expected_survivors]);
     rows
 }
 
@@ -1330,7 +1339,7 @@ async fn left_unnest_batches_sliced_fixed_size_lists_and_keeps_real_nulls_and_sp
         "[I64(1), Null, I64(2)]", "[I64(1), I64(51), I64(4)]",
     ];
     assert_eq!(run_in_order(&correlated).await.unwrap(), expected);
-    assert_eq!(run_with_no_dependent_opens(&rewritten, context).await, expected);
+    assert_eq!(run_with_unnest_trace(&rewritten, context, (12, 4)).await, expected);
 }
 
 #[tokio::test]
@@ -1367,7 +1376,7 @@ async fn left_unnest_zero_width_fixed_size_lists_extend_each_parent_and_validate
         RelationNode::Apply { kind: ApplyKind::LeftUnnest, .. })), 1);
     let expected = ["[I64(1), Null, Null]", "[I64(2), Null, Null]"];
     assert_eq!(run_in_order(&correlated).await.unwrap(), expected);
-    assert_eq!(run_with_no_dependent_opens(&rewritten, context).await, expected);
+    assert_eq!(run_with_unnest_trace(&rewritten, context, (0, 0)).await, expected);
 
     let (correlated, rewritten) = both_ways(&relation);
     assert_eq!(run_in_order(&correlated).await, Err(error.clone()));

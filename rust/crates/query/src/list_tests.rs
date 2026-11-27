@@ -108,7 +108,7 @@ async fn filtered_unnest_borrows_selected_arrow_spans_and_keeps_original_ordinal
     let schema = Schema::new(vec![list, element, ordinal]).unwrap();
     let charge = memory.reserve(lists.get_array_memory_size() + 1024).unwrap();
     let input = ColumnBatch::settled(vec![Column::Arrow { array: Arc::new(lists), field: list_field, logical: None }], 4, charge).unwrap();
-    let output = input.expand_filtered_list(0, &schema, &predicate, Some("n"), &execution).await.unwrap().unwrap();
+    let (output, _) = input.expand_filtered_list(0, &schema, &predicate, Some("n"), &execution).await.unwrap().unwrap();
     drop(input);
 
     let Column::Selected(elements) = &output.columns[1] else { panic!("Expected borrowed child spans"); };
@@ -123,6 +123,69 @@ async fn filtered_unnest_borrows_selected_arrow_spans_and_keeps_original_ordinal
         [Value::Null, Value::Null], [Value::Null, Value::Null], [Value::Null, Value::Null],
     ]);
     drop(output);
+    assert_eq!(memory.used_bytes(), baseline);
+}
+
+#[tokio::test]
+async fn wide_filtered_unnest_bounds_predicate_scratch_and_keeps_matches_across_chunks() {
+    use arrow_array::{Array, ArrayRef, Int64Array, ListArray};
+    use arrow_buffer::{NullBuffer, OffsetBuffer};
+    use arrow_schema::{DataType, Field as ArrowField};
+    use crate::columnar::Column;
+    use rtdb_plan::UnaryOp;
+
+    let execution = execution(1);
+    let memory = &execution.context.memory;
+    let baseline = memory.used_bytes();
+    let width = 32_768;
+    let first_width = width - 1;
+    let mut items = vec![Some(0); 2 * width + 1];
+    items[first_width + 1024] = Some(7);
+    items[first_width + 1025] = None;
+    items[first_width + width - 1] = Some(9);
+    items[2 * width - 1] = Some(10);
+    items[2 * width] = Some(8);
+    let values: ArrayRef = Arc::new(Int64Array::from(items));
+    let item = Arc::new(ArrowField::new("item", DataType::Int64, true));
+    let offsets = [0, 0, first_width, first_width + width, first_width + width, 2 * width + 1]
+        .map(|offset| i32::try_from(offset).unwrap());
+    let lists = ListArray::new(item, OffsetBuffer::new(offsets.to_vec().into()), Arc::clone(&values),
+        Some(NullBuffer::from(vec![true, true, true, false, true])));
+    let list_field = Arc::new(ArrowField::new("xs", lists.data_type().clone(), true));
+    let field = |id, name: &str, data_type| Field {
+        id: ColumnId(id), name: name.into(), qualifier: None, qualified_only: false, unnamed: false, data_type,
+    };
+    let int = LogicalType::Scalar(ScalarType::I64);
+    let element = field(2, "v", int.clone().maybe());
+    let predicate = Expr::binary(BinaryOp::Or, Expr::unary(UnaryOp::IsNull, element.expression()),
+        Expr::binary(BinaryOp::GtEq, element.expression(), Expr::Literal(Value::I64(7))));
+    let schema = Schema::new(vec![field(0, "xs", rtdb_columnar::from_field(&list_field).unwrap()),
+        field(1, "id", int.clone()), element, field(3, "n", int.clone())]).unwrap();
+    let ids = Int64Array::from(vec![1, 2, 3, 4, 5]);
+    let charge = memory.reserve(lists.get_array_memory_size() + ids.get_array_memory_size() + 1024).unwrap();
+    let input = ColumnBatch::settled(vec![
+        Column::Arrow { array: Arc::new(lists), field: list_field, logical: None },
+        Column::Arrow { array: Arc::new(ids), field: Arc::new(ArrowField::new("id", DataType::Int64, false)), logical: Some(int) },
+    ], 5, charge).unwrap();
+    let pressure = memory.reserve(memory.available_bytes() - (64 << 10)).unwrap();
+    let (output, counts) = input.expand_filtered_list(0, &schema, &predicate, Some("n"), &execution).await.unwrap().unwrap();
+    drop(input);
+
+    assert_eq!((counts.candidates, counts.survivors), (65_537, 5));
+    let Column::Selected(elements) = &output.columns[2] else { panic!("Expected borrowed child spans"); };
+    let ((array, _, _), span) = elements.fragment_source(2..4).unwrap();
+    assert!(Arc::ptr_eq(&array, &values));
+    assert_eq!(span, first_width + 1024..first_width + 1026);
+    let actual = (0..output.len).map(|row| [1, 2, 3].map(|column| output.columns[column].value(row).unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(actual, [
+        [Value::I64(1), Value::Null, Value::Null], [Value::I64(2), Value::Null, Value::Null],
+        [Value::I64(3), Value::I64(7), Value::I64(1025)], [Value::I64(3), Value::Null, Value::I64(1026)],
+        [Value::I64(3), Value::I64(9), Value::I64(32_768)], [Value::I64(4), Value::Null, Value::Null],
+        [Value::I64(5), Value::I64(10), Value::I64(1)], [Value::I64(5), Value::I64(8), Value::I64(2)],
+    ]);
+    assert!(memory.used_bytes() - pressure.bytes() >= values.get_array_memory_size());
+    drop((output, pressure));
     assert_eq!(memory.used_bytes(), baseline);
 }
 
@@ -181,7 +244,7 @@ async fn filtered_unnest_borrows_sliced_dense_union_list_and_element_spans() {
     }], 7, charge).unwrap();
     let owner = Arc::downgrade(input.column_reservation(0));
     input.validate_readable(&execution.context).unwrap();
-    let output = input.expand_filtered_list(0, &schema, &predicate, Some("n"), &execution).await.unwrap().unwrap();
+    let (output, _) = input.expand_filtered_list(0, &schema, &predicate, Some("n"), &execution).await.unwrap().unwrap();
     drop(input);
 
     let Column::Selected(elements) = &output.columns[1] else { panic!("Expected borrowed child spans"); };
