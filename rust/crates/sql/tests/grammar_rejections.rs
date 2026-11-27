@@ -302,3 +302,21 @@ fn non_grammar_cast_data_types_are_rejected() {
         prepare(sql, &Fixture, &PrepareOptions::default()).unwrap_or_else(|error| panic!("{sql}: {error}"));
     }
 }
+
+#[test]
+fn non_grammar_function_and_aggregate_forms_are_rejected() {
+    for sql in [
+        "SELECT ABS('abc' USING OCTETS)",
+        "SELECT LENGTH('abc' USING CHARACTERS)",
+        "SELECT COALESCE()",
+        "SELECT COUNT(ALL *) FROM docs",
+        "SELECT SUBSTRING('abc')",
+        "SELECT SUBSTRING('abc' FOR 2)",
+    ] {
+        let error = rejection(sql);
+        assert_eq!((error.category, error.code.as_str()), (AnomalyCategory::Incorrect, "xtdb/sql-error"), "{sql}");
+        assert!(error.message.as_deref().unwrap().starts_with("Errors parsing SQL statement:\n  - "), "{sql}");
+    }
+    prepare("SELECT CHAR_LENGTH('abc' USING OCTETS)", &Fixture, &PrepareOptions::default()).unwrap();
+    prepare("SELECT COUNT(ALL a) FROM docs", &Fixture, &PrepareOptions::default()).unwrap();
+}

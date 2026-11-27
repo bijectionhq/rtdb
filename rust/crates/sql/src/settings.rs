@@ -168,6 +168,9 @@ impl Context<'_> {
                 _ => return Err(grammar_rejected("A scalar function argument modifier")),
             };
             let name = crate::expression::scalar_name(function)?;
+            if units.is_some() && name != "character_length" {
+                return Err(grammar_rejected("USING CHARACTERS/OCTETS outside CHARACTER_LENGTH"));
+            }
             setting_function_arity(&name, arguments.len())?;
             if name == "regexp_replace" { regexp_arguments(arguments)?; }
             if matches!(name.as_str(),"date_bin" | "range_bins") && !matches!(arguments.first(),Some(ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(ast::Expr::Interval(_))))) { return Err(error("Temporal bin functions require an interval literal stride")); }

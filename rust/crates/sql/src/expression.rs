@@ -212,6 +212,9 @@ impl Context<'_> {
                     _ => None,
                 };
                 let name = scalar_name(function)?;
+                if units.is_some() && name != "character_length" {
+                    return Err(grammar_rejected("USING CHARACTERS/OCTETS outside CHARACTER_LENGTH"));
+                }
                 if name == "regexp_replace" {
                     let arguments = function_arguments(function)?;
                     crate::settings::regexp_arguments(&arguments)?;
@@ -276,7 +279,10 @@ impl Context<'_> {
                     if parts.len() == 1 { parts.pop().unwrap() } else { call(name, parts)? }
                 }
                 else if name == "str" && args.is_empty() { return Err(error("Function str arity mismatch: expected at least 1 argument")); }
-                else if name == "coalesce" { Expr::Coalesce(args) }
+                else if name == "coalesce" {
+                    if args.is_empty() { return Err(grammar_rejected("COALESCE with no arguments")); }
+                    Expr::Coalesce(args)
+                }
                 else if matches!(name.as_str(), "generate_series" | "range") { self.series(&name, args)? }
                 else if name == "overlaps" { crate::period::overlaps(args)? }
                 else if name == "range_bins" {
@@ -308,7 +314,8 @@ impl Context<'_> {
             }
             ast::Expr::Position { expr, r#in } => call("position".into(), vec![self.expr_bound(expr, input, replacements)?, self.expr_bound(r#in, input, replacements)?])?,
             ast::Expr::Substring { expr, substring_from, substring_for, .. } => {
-                let mut args = vec![self.expr_bound(expr, input, replacements)?, substring_from.as_ref().map(|expr| self.expr_bound(expr, input, replacements)).transpose()?.unwrap_or(Expr::Literal(Value::I64(1)))];
+                let Some(start) = substring_from else { return Err(grammar_rejected("SUBSTRING without a start position")); };
+                let mut args = vec![self.expr_bound(expr, input, replacements)?, self.expr_bound(start, input, replacements)?];
                 if let Some(length) = substring_for { args.push(self.expr_bound(length, input, replacements)?); }
                 call("substring".into(), args)?
             }
@@ -357,7 +364,7 @@ impl Context<'_> {
             for clause in &arguments.clauses {
                 match clause { ast::FunctionArgumentClause::OrderBy(order) if kind == AggregateFunction::ArrayAgg => for expression in order { order_by.push(self.relational_sort_expr(expression, input, &BTreeMap::new())?); }, _ => return Err(grammar_rejected("An aggregate argument modifier")) }
             }
-            if kind == AggregateFunction::ArrayAgg && arguments.duplicate_treatment.is_some() { return Err(grammar_rejected("An ARRAY_AGG set quantifier")); }
+            if matches!(kind, AggregateFunction::ArrayAgg | AggregateFunction::CountStar) && arguments.duplicate_treatment.is_some() { return Err(grammar_rejected("An aggregate set quantifier")); }
             arguments.duplicate_treatment == Some(ast::DuplicateTreatment::Distinct)
         } else { false };
         if distinct && !matches!(kind.canonical(), AggregateFunction::Count | AggregateFunction::Sum | AggregateFunction::Average | AggregateFunction::Min | AggregateFunction::Max | AggregateFunction::ArrayAgg) {
