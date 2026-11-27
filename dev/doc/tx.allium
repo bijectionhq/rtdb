@@ -181,6 +181,7 @@
 -- Same-width list casts preserve the bits of present floating-point components.
 -- A packed numeric list derives its observed element type from the first selected occurrence of each present leg and of null.
 -- Native list pages can cast numeric, text, and supported temporal components directly into their result child buffers.
+-- Compatible Boolean list casts write validity and Boolean values in component order using the scalar cast rules.
 -- A time-to-timestamp list cast uses the query clock and session zone for each reached component.
 -- A page applies the conversion and projection checks in component order.
 -- A list parameter enters evaluation as its Arrow cell.

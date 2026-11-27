@@ -158,6 +158,14 @@ pub(crate) fn timestamp_to_time(value: i64, source: TimeUnit, unit: TimeUnit, ti
     Ok(nanos / (1_000_000_000 / unit.units_per_second()))
 }
 
+pub(crate) fn boolean_text(text: &str) -> Result<bool> {
+    match text.to_lowercase().as_str() {
+        "true" | "t" | "yes" | "y" | "on" | "1" => Ok(true),
+        "false" | "f" | "no" | "n" | "off" | "0" => Ok(false),
+        _ => Err(rtdb_types::function_type_mismatch("boolean", &[LogicalType::Scalar(ScalarType::Utf8)])),
+    }
+}
+
 pub fn cast(value: &Value, data_type: &LogicalType, timezone: &str) -> Result<Value> {
     if matches!(value, Value::Null | Value::Undefined) { return Ok(Value::Null); }
     cast_from(value, &value.logical_type(), data_type, timezone)
@@ -227,7 +235,7 @@ fn cast_from(value: &Value, source: &LogicalType, data_type: &LogicalType, timez
             decimal_value(decimal, *precision, *scale, *bit_width)
         }
         S::Bool => match value {
-            Value::Utf8(text) => match text.to_lowercase().as_str() { "true" | "t" | "yes" | "y" | "on" | "1" => Ok(Value::Bool(true)), "false" | "f" | "no" | "n" | "off" | "0" => Ok(Value::Bool(false)), _ => Err(inapplicable("boolean", &[value])) },
+            Value::Utf8(text) => boolean_text(text).map(Value::Bool),
             value if number(value).is_some() => Ok(Value::Bool(number(value) != Some(0.0))),
             _ => Err(inapplicable("boolean", &[value])),
         },

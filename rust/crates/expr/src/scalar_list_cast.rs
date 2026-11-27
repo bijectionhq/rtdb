@@ -2,7 +2,8 @@ use std::{ops::Range, sync::Arc};
 
 use arrow_array::{
     Array, ArrayRef, ArrowPrimitiveType, StringArray,
-    builder::{PrimitiveBuilder, StringBuilder},
+    builder::{BooleanBuilder, PrimitiveBuilder, StringBuilder},
+    cast::AsArray,
     types::{
         Date32Type, Date64Type, DurationMicrosecondType, DurationMillisecondType, DurationNanosecondType,
         DurationSecondType, Time32MillisecondType, Time32SecondType, Time64MicrosecondType, Time64NanosecondType,
@@ -46,6 +47,9 @@ pub(crate) fn cast_list(
     }
     if ty == ScalarType::Utf8 {
         return render(&cells, target, reserve);
+    }
+    if ty == ScalarType::Bool {
+        return boolean(&cells, target, reserve);
     }
     if let Some(ty) = list_cast::scalar_target(target)
         && cells.all(|cell| matches!(cell, Cell::Null | Cell::Number(_) | Cell::Text(_)))
@@ -110,6 +114,40 @@ pub(crate) fn cast_list(
     };
     let field = field.with_nullable(array.null_count() != 0);
     Ok(ListValue::from_scalar_arrow(Arc::new(field), array))
+}
+
+fn boolean(
+    cells: &Cells<'_>, target: &CastTarget, mut reserve: impl FnMut(usize) -> Result<()>,
+) -> Result<Option<ListValue>> {
+    if !cells.all(|cell| match cell {
+        Cell::Null | Cell::Bool(_) | Cell::Text(_) => true,
+        Cell::Number(number) => !matches!(number, NumericCell::Decimal(..)),
+        _ => false,
+    }) || cells.all(|cell| matches!(cell, Cell::Null)) {
+        return Ok(None);
+    }
+    let bytes = cells.len().div_ceil(8).checked_mul(2).and_then(|bytes| bytes.checked_add(1024)).ok_or_else(overflow)?;
+    reserve(bytes)?;
+    let mut builder = BooleanBuilder::with_capacity(cells.len());
+    for row in 0..cells.len() {
+        let (source, value) = match cells.get(row) {
+            Cell::Null => { builder.append_null(); continue; }
+            Cell::Bool(value) => (ScalarType::Bool, value),
+            Cell::Text(text) => {
+                target.validate_source(&LogicalType::Scalar(ScalarType::Utf8))?;
+                reserve(text.len().checked_mul(4).ok_or_else(overflow)?)?;
+                builder.append_value(cast::boolean_text(text)?);
+                continue;
+            }
+            Cell::Number(number) => (number.scalar_type().expect("Present number"), number.as_f64() != Some(0.0)),
+            _ => unreachable!("Boolean cast inputs were admitted"),
+        };
+        target.validate_source(&LogicalType::Scalar(source))?;
+        builder.append_value(value);
+    }
+    let array = builder.finish();
+    let field = arrow_schema::Field::new("value", arrow_schema::DataType::Boolean, array.null_count() != 0);
+    Ok(ListValue::from_scalar_arrow(Arc::new(field), Arc::new(array)))
 }
 
 fn render(
@@ -184,6 +222,7 @@ enum Cells<'a> {
 
 enum Cell<'a> {
     Null,
+    Bool(bool),
     Text(&'a str),
     Number(NumericCell),
     Temporal(i64, ScalarType),
@@ -258,6 +297,7 @@ impl<'a> Cells<'a> {
                 use ScalarType as S;
                 match &values[row] {
                     Value::Null | Value::Undefined => Cell::Null,
+                    Value::Bool(value) => Cell::Bool(*value),
                     Value::Utf8(text) => Cell::Text(text),
                     Value::DateDay(value) => Cell::Temporal(i64::from(*value), S::DateDay),
                     Value::DateMilli(value) => Cell::Temporal(*value, S::DateMilli),
@@ -280,6 +320,7 @@ impl<'a> Cells<'a> {
                     return Cell::Number(span.get(0).expect("selected cell").signed());
                 }
                 match cell.logical_type() {
+                    Ok(LogicalType::Scalar(ScalarType::Bool)) => Cell::Bool(cell.array.as_boolean().value(cell.row)),
                     Ok(LogicalType::Scalar(ScalarType::Utf8)) => Cell::Text(
                         cell.array.as_any().downcast_ref::<StringArray>().expect("string array").value(cell.row),
                     ),
@@ -501,6 +542,39 @@ mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, TimeUnit as ArrowUnit};
     use rtdb_types::Anomaly;
+
+    #[test]
+    fn boolean_list_cast_keeps_nulls_and_matches_the_first_scalar_error() {
+        let target = CastTarget::fixed(LogicalType::Scalar(ScalarType::Bool));
+        let inputs = [Value::I64(0), Value::Null, Value::I64(-7), Value::Utf8("YeS".into()), Value::Bool(false)];
+        let source = Source::Stored(ListView::Values(&inputs));
+        let list = cast_list(source, &target, "UTC", None, true, |_| Ok(())).unwrap().unwrap();
+        let (field, values) = list.packed_column().unwrap();
+        assert_eq!(field.data_type(), &DataType::Boolean);
+        assert_eq!(values.as_boolean().iter().collect::<Vec<_>>(), [Some(false), None, Some(true), Some(true), Some(false)]);
+
+        let child = Arc::new(arrow_array::StringArray::from(vec![Some("unused"), Some("YeS"), None, Some("bogus")])) as ArrayRef;
+        let item = Arc::new(Field::new("item", DataType::Utf8, true));
+        let lists = rtdb_columnar::build_list_array(item, vec![0, 1, 4].into(), &child, None).unwrap();
+        let field = Field::new("items", lists.data_type().clone(), false);
+        let cell = ArrowCell { field: &field, array: lists.as_ref(), row: 1 };
+        let list = cast_list(Source::Arrow(cell, 0..2), &target, "UTC", None, true, |_| Ok(())).unwrap().unwrap();
+        assert_eq!(list.packed_column().unwrap().1.as_boolean().iter().collect::<Vec<_>>(), [Some(true), None]);
+        let expected = cast::cast_target(&Value::Utf8("bogus".into()), &target, "UTC").unwrap_err();
+        let error = cast_list(Source::Arrow(cell, 0..3), &target, "UTC", None, true, |_| Ok(())).unwrap_err();
+        assert_eq!((error.code, error.message, error.context), (expected.code, expected.message, expected.context));
+
+        let checked = CastTarget::Checked { requested: LogicalType::Scalar(ScalarType::Bool), target: Box::new(target) };
+        let bad = [Value::I64(1), Value::F64(0.25), Value::Utf8("bogus".into())];
+        let source = Source::Stored(ListView::Values(&bad));
+        let expected = cast::cast_target(&bad[1], &checked, "UTC").unwrap_err();
+        let error = cast_list(source, &checked, "UTC", None, true, |_| Ok(())).unwrap_err();
+        assert_eq!((error.code, error.message, error.context), (expected.code, expected.message, expected.context));
+
+        let nulls = [Value::Null, Value::Null];
+        let source = Source::Stored(ListView::Values(&nulls));
+        assert!(cast_list(source, &checked, "UTC", None, true, |_| Ok(())).unwrap().is_none());
+    }
 
     #[test]
     fn temporal_narrowing_preserves_the_time32_and_date32_error_order() {
