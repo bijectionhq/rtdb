@@ -414,7 +414,7 @@ impl FundedReceipt {
         }
         let activation_valid = |activation: Activation| {
             ordered(prepared.basis, activation.order.cut.basis)
-                && prepared.system_time < activation.order.cut.system_time
+                && prepared.system_time <= activation.order.cut.system_time
                 && activation.sample.valid(self, clock.reading, clock.reading)
         };
         match state.stage {
@@ -422,7 +422,7 @@ impl FundedReceipt {
             AppointmentStage::Activated(activation) => cut == activation.order.cut && activation_valid(activation),
             AppointmentStage::Consumed { activation, sample } => activation_valid(activation)
                 && ordered(activation.order.cut.basis, cut.basis)
-                && activation.order.cut.system_time < cut.system_time
+                && activation.order.cut.system_time <= cut.system_time
                 && sample.observation.covers(activation.sample.observation)
                 && sample.observation.instant >= clock.reading
                 && sample.valid(self, clock.before, clock.journal_before),
