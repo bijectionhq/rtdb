@@ -10,7 +10,8 @@ pub fn parse_timestamp(text: &str, timezone: &str) -> Result<Timestamp> {
     rtdb_types::parse_sql_timestamp_instant(text, timezone)?.as_micros()
 }
 
-pub(crate) fn rescale_units(value: i64, source: TimeUnit, target: TimeUnit) -> Result<i64> {
+/// Converts temporal ticks with truncation toward zero and reports overflow if they exceed the signed 64-bit range.
+pub fn rescale_units(value: i64, source: TimeUnit, target: TimeUnit) -> Result<i64> {
     let scaled = i128::from(value) * i128::from(target.units_per_second()) / i128::from(source.units_per_second());
     i64::try_from(scaled).map_err(|_| overflow())
 }
@@ -154,14 +155,16 @@ pub fn cast_bound_timestamp(
     use arrow_schema::{DataType, TimeUnit as ArrowUnit};
 
     if !cell.field.metadata().is_empty() || cell.array.is_null(cell.row) { return Ok(None); }
-    if let Some(text) = cell.utf8() { return timestamp_text_raw(text, unit, zoned).map(Some); }
-    let DataType::Timestamp(source_unit, zone) = cell.field.data_type() else { return Ok(None); };
+    let DataType::Timestamp(source_unit, zone) = cell.field.data_type() else {
+        return cell.utf8().map(|text| timestamp_text_raw(text, unit, zoned)).transpose();
+    };
     let (raw, source) = match source_unit {
         ArrowUnit::Second => (cell.array.as_primitive::<TimestampSecondType>().value(cell.row), TimeUnit::Second),
         ArrowUnit::Millisecond => (cell.array.as_primitive::<TimestampMillisecondType>().value(cell.row), TimeUnit::Millisecond),
         ArrowUnit::Microsecond => (cell.array.as_primitive::<TimestampMicrosecondType>().value(cell.row), TimeUnit::Microsecond),
         ArrowUnit::Nanosecond => (cell.array.as_primitive::<TimestampNanosecondType>().value(cell.row), TimeUnit::Nanosecond),
     };
+    if source == unit && zone.is_some() == zoned { return Ok(Some(raw)); }
     timestamp_raw(raw, source, zone.is_some(), unit, zoned, timezone).map(Some)
 }
 

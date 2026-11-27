@@ -892,6 +892,8 @@ async fn fixed_aggregate_results_keep_declared_layout_nulls_and_page_custody() {
         (AggregateFunction::Average, duration(-10), duration(-15), duration(-12)),
         (AggregateFunction::Sum, decimal(9, 1, 0), decimal(9, 1, 0), decimal(18, 1, 0)),
         (AggregateFunction::Sum, decimal(1, 20, 0), decimal(2, 20, 2), decimal(102, 22, 2)),
+        (AggregateFunction::Max, decimal(9_007_199_254_740_992, 2, 0), decimal(9_007_199_254_740_993, 2, 0),
+            decimal(9_007_199_254_740_993, 2, 0)),
         (AggregateFunction::Every, Value::Bool(true), Value::Bool(false), Value::Bool(false)),
         (AggregateFunction::Any, Value::Bool(false), Value::Bool(true), Value::Bool(true)),
         (AggregateFunction::VariancePopulation, Value::F64(2.0), Value::F64(4.0), Value::F64(1.0)),
@@ -1083,6 +1085,8 @@ fn aggregate_input_inline_extrema_and_boolean_fit_in_reserved_group_state() {
         (Value::F64(-1.5), Value::F64(19.25)),
         (Value::DateDay(i32::MIN), Value::DateDay(i32::MAX)),
         (Value::DateMilli(-1), Value::DateMilli(4)),
+        (Value::Decimal(decimal128_value(9_007_199_254_740_992, 20, 2).unwrap()),
+            Value::Decimal(decimal128_value(9_007_199_254_740_993, 20, 2).unwrap())),
     ]);
     for (lesser, greater) in inputs {
         let input = lesser.logical_type().maybe();
@@ -1150,6 +1154,18 @@ fn date64_extremum_keeps_the_first_tick_on_a_calendar_day() {
     let (column, _charge) = fixed_scalar_results(&states, &AggregateFunction::Min, &output, &execution.context).unwrap().unwrap();
     assert_eq!(column.value(0).unwrap(), Value::DateMilli(-1));
     assert_eq!(column.value(1).unwrap(), Value::Null);
+}
+
+#[test]
+fn time32_extremum_checks_winning_ticks_at_publication() {
+    let execution = execution(8);
+    let output = field(0, LogicalType::Scalar(ScalarType::Time { unit: TimeUnit::Millisecond, bit_width: 32 }).maybe());
+    let mut states = ScalarGroups::new(&execution).unwrap();
+    states.ensure(1).unwrap();
+    states.values[0].temporal_extremum(i64::from(i32::MAX) + 1, false).unwrap();
+    let error = fixed_scalar_results(&states, &AggregateFunction::Max, &output, &execution.context).err().unwrap();
+    assert_eq!(error.code, "rtdb/time-overflow");
+    assert!(error.is(rtdb_types::AnomalyKind::NumericValueOutOfRange));
 }
 
 #[test]
@@ -1283,14 +1299,23 @@ async fn aggregate_input_timestamp_extremum_keeps_units_and_casts_each_reached_v
     let coarse = timestamp(-2, TimeUnit::Second, "America/New_York");
     let overflow = timestamp(i64::MAX, TimeUnit::Second, "America/New_York");
     let declared = initial.logical_type().join(&coarse.logical_type()).maybe();
-    for later in [coarse.clone(), overflow.clone()] {
+    for (later, arrow) in [(coarse.clone(), false), (overflow.clone(), false), (coarse, true), (overflow.clone(), true)] {
         let ty = initial.logical_type();
         let first = ColumnBatch::settled(vec![Column::Arrow {
             array: rtdb_columnar::copy_array(&ty, std::slice::from_ref(&initial)).unwrap(),
             field: Arc::new(rtdb_columnar::to_field("c0", &ty).unwrap()), logical: Some(ty),
         }], 1, memory.reserve(4096).unwrap()).unwrap();
         let is_overflow = later == overflow;
-        let second = ColumnBatch::settled(vec![Column::Values(vec![later])], 1, memory.reserve(4096).unwrap()).unwrap();
+        let column = if arrow {
+            let ty = later.logical_type();
+            Column::Arrow {
+                array: rtdb_columnar::copy_array(&ty, std::slice::from_ref(&later)).unwrap(),
+                field: Arc::new(rtdb_columnar::to_field("c0", &ty).unwrap()), logical: Some(ty),
+            }
+        } else {
+            Column::Values(vec![later])
+        };
+        let second = ColumnBatch::settled(vec![column], 1, memory.reserve(4096).unwrap()).unwrap();
         let mut cursor = primitive_cursor(&execution, AggregateFunction::Min, declared.clone(), declared.clone(), vec![], None);
         cursor.input = Some(AggregateInput { batches: Box::new(Pages([first, second].into())), projected: true });
         if is_overflow {

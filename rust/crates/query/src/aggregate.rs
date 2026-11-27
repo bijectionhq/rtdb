@@ -495,7 +495,9 @@ fn fixed_scalar_results(
             TimeUnit::Microsecond => primitive!(DurationMicrosecondType, duration),
             TimeUnit::Nanosecond => primitive!(DurationNanosecondType, duration),
         },
-        (A::Sum, S::Decimal { bit_width: 128, .. }) => primitive!(Decimal128Type, |state| {
+        (A::Min | A::Max, S::Decimal { bit_width: 128, .. })
+            if states.values.iter().any(|state| matches!(state.accumulator, ScalarState::Retained(_))) => Ok(None),
+        (A::Sum | A::Min | A::Max, S::Decimal { bit_width: 128, .. }) => primitive!(Decimal128Type, |state| {
             Ok(match &state.accumulator {
                 ScalarState::Empty => None,
                 ScalarState::Decimal128(bytes) => Some(i128::from_ne_bytes(*bytes)),
@@ -911,21 +913,40 @@ fn present_arrow_position<'a>(cell: Option<(&'a dyn Array, &'a ArrowField, Optio
     Ok((cell.array.data_type() != &DataType::Null && !cell.array.is_null(cell.row)).then_some(cell))
 }
 
-fn same_temporal_layout(ty: &LogicalType, physical: &DataType) -> bool {
-    let matches_unit = |unit, physical: &ArrowTimeUnit| matches!((unit, physical),
-        (TimeUnit::Second, ArrowTimeUnit::Second)
-        | (TimeUnit::Millisecond, ArrowTimeUnit::Millisecond)
-        | (TimeUnit::Microsecond, ArrowTimeUnit::Microsecond)
-        | (TimeUnit::Nanosecond, ArrowTimeUnit::Nanosecond));
-    match (without_nullability(ty), physical) {
-        (LogicalType::Scalar(ScalarType::Timestamp { unit, timezone }), DataType::Timestamp(actual, zone)) =>
-            matches_unit(*unit, actual) && timezone.as_deref() == zone.as_deref(),
-        (LogicalType::Scalar(ScalarType::Time { unit, bit_width: 32 }), DataType::Time32(actual))
-        | (LogicalType::Scalar(ScalarType::Time { unit, bit_width: 64 }), DataType::Time64(actual))
-        | (LogicalType::Scalar(ScalarType::Duration(unit)), DataType::Duration(actual)) => matches_unit(*unit, actual),
-        (LogicalType::Scalar(ScalarType::DateDay), DataType::Date32)
-        | (LogicalType::Scalar(ScalarType::DateMilli), DataType::Date64) => true,
-        _ => false,
+fn admits_temporal_extremum(ty: &LogicalType, physical: &DataType) -> bool {
+    matches!((without_nullability(ty), physical),
+        (LogicalType::Scalar(ScalarType::Timestamp { .. }), DataType::Timestamp(..))
+        | (LogicalType::Scalar(ScalarType::Time { .. }), DataType::Time32(ArrowTimeUnit::Second | ArrowTimeUnit::Millisecond)
+            | DataType::Time64(ArrowTimeUnit::Microsecond | ArrowTimeUnit::Nanosecond))
+        | (LogicalType::Scalar(ScalarType::Duration(_)), DataType::Duration(_))
+        | (LogicalType::Scalar(ScalarType::DateDay), DataType::Date32)
+        | (LogicalType::Scalar(ScalarType::DateMilli), DataType::Date64))
+}
+
+fn time_unit(unit: &ArrowTimeUnit) -> TimeUnit {
+    match unit {
+        ArrowTimeUnit::Second => TimeUnit::Second,
+        ArrowTimeUnit::Millisecond => TimeUnit::Millisecond,
+        ArrowTimeUnit::Microsecond => TimeUnit::Microsecond,
+        ArrowTimeUnit::Nanosecond => TimeUnit::Nanosecond,
+    }
+}
+
+fn cast_extremum_ticks(cell: ArrowCell<'_>, output: &LogicalType, timezone: &str) -> Result<i64> {
+    match without_nullability(output) {
+        LogicalType::Scalar(ScalarType::Timestamp { unit, timezone: zone }) => {
+            rtdb_expr::cast_bound_timestamp(cell, *unit, zone.is_some(), timezone)?
+                .ok_or_else(|| invalid("aggregate-state", "Expected a timestamp extremum input"))
+        }
+        LogicalType::Scalar(ScalarType::Time { unit, .. } | ScalarType::Duration(unit)) => {
+            let source = match cell.field.data_type() {
+                DataType::Time32(source) | DataType::Time64(source) | DataType::Duration(source) => time_unit(source),
+                _ => return Err(invalid("aggregate-state", "Expected a time or duration input")),
+            };
+            let ticks = temporal_ticks(cell.array, cell.row)?;
+            if source == *unit { Ok(ticks) } else { rtdb_expr::rescale_units(ticks, source, *unit) }
+        }
+        _ => Err(invalid("aggregate-state", "Expected a temporal extremum output")),
     }
 }
 
@@ -937,10 +958,6 @@ fn temporal_ticks(array: &dyn Array, row: usize) -> Result<i64> {
     let value = match array.data_type() {
         DataType::Date32 => ticks!(Date32Type),
         DataType::Date64 => ticks!(Date64Type),
-        DataType::Timestamp(T::Second, _) => ticks!(TimestampSecondType),
-        DataType::Timestamp(T::Millisecond, _) => ticks!(TimestampMillisecondType),
-        DataType::Timestamp(T::Microsecond, _) => ticks!(TimestampMicrosecondType),
-        DataType::Timestamp(T::Nanosecond, _) => ticks!(TimestampNanosecondType),
         DataType::Time32(T::Second) => ticks!(Time32SecondType),
         DataType::Time32(T::Millisecond) => ticks!(Time32MillisecondType),
         DataType::Time64(T::Microsecond) => ticks!(Time64MicrosecondType),
@@ -1777,7 +1794,15 @@ impl ScalarGroups {
                 let date_millis = without_nullability(output) == &LogicalType::Scalar(ScalarType::DateMilli);
                 let column = page.arrow_column(argument);
                 let numeric = column.and_then(|column| NumericColumn::bind(column, Some(output)));
-                let temporal = column.filter(|column| accepts_typed_column(column, |ty| same_temporal_layout(output, ty)));
+                let temporal = column.filter(|column| accepts_typed_column(column, |ty| admits_temporal_extremum(output, ty)));
+                let decimal = column.filter(|column| {
+                    let Some((precision, scale, 128)) = decimal_type(output) else { return false; };
+                    let expected = rtdb_columnar::DecimalParameters { precision, scale, bit_width: 128 };
+                    admits_reduction_column(column, |field, logical| decimal_leaf(field, logical) && (
+                        field.data_type() == &DataType::Null
+                            || rtdb_columnar::decimal_field_parameters(field).is_ok_and(|params| params == Some(expected))
+                    ))
+                });
                 let bytes = column.filter(|column| {
                     accepts_typed_column(column, |ty| matches!((without_nullability(output), ty),
                         (LogicalType::Scalar(ScalarType::Utf8), DataType::Utf8)
@@ -1792,13 +1817,17 @@ impl ScalarGroups {
                                 state.numeric_extremum(value, output, minimum)?;
                             }
                         } else if let Some(column) = temporal {
-                            if let Some((array, offset)) = present_column_cell(column, row)? {
-                                let ticks = temporal_ticks(array, offset)?;
-                                if matches!(array.data_type(), DataType::Date32 | DataType::Date64) {
-                                    state.date_extremum(ticks, date_millis, minimum);
+                            if let Some(cell) = present_column_position(column, row)? {
+                                if matches!(cell.field.data_type(), DataType::Date32 | DataType::Date64) {
+                                    state.date_extremum(temporal_ticks(cell.array, cell.row)?, date_millis, minimum);
                                 } else {
+                                    let ticks = cast_extremum_ticks(cell, output, &execution.context.timezone)?;
                                     state.temporal_extremum(ticks, minimum)?;
                                 }
+                            }
+                        } else if let Some(column) = decimal && !matches!(state.accumulator, ScalarState::Retained(_)) {
+                            if let Some((array, offset)) = present_column_cell(column, row)? {
+                                state.decimal_extremum(array.as_primitive::<Decimal128Type>().value(offset), minimum)?;
                             }
                         } else if let Some(column) = bytes {
                             if let Some((array, offset)) = present_column_cell(column, row)? {
@@ -1872,13 +1901,7 @@ impl ScalarGroups {
                     return Err(duration_null(index));
                 };
                 let DataType::Duration(unit) = array.data_type() else { return Err(sum_state()); };
-                let unit = match unit {
-                    ArrowTimeUnit::Second => TimeUnit::Second,
-                    ArrowTimeUnit::Millisecond => TimeUnit::Millisecond,
-                    ArrowTimeUnit::Microsecond => TimeUnit::Microsecond,
-                    ArrowTimeUnit::Nanosecond => TimeUnit::Nanosecond,
-                };
-                state.add_duration(temporal_ticks(array, offset)?, unit, output)?;
+                state.add_duration(temporal_ticks(array, offset)?, time_unit(unit), output)?;
                 continue;
             }
             if let Some(column) = decimal {
@@ -1965,6 +1988,20 @@ impl ScalarAccumulator {
             _ => return Err(sum_state()),
         };
         self.accumulator = ScalarState::Decimal128(sum.to_ne_bytes());
+        Ok(())
+    }
+
+    fn decimal_extremum(&mut self, coefficient: i128, minimum: bool) -> Result<()> {
+        match self.accumulator {
+            ScalarState::Empty => (),
+            ScalarState::Decimal128(previous) => {
+                if coefficient.cmp(&i128::from_ne_bytes(previous)) != if minimum { Ordering::Less } else { Ordering::Greater } {
+                    return Ok(());
+                }
+            }
+            _ => return Err(invalid("aggregate-state", "Expected a Decimal128 extremum")),
+        }
+        self.accumulator = ScalarState::Decimal128(coefficient.to_ne_bytes());
         Ok(())
     }
 
@@ -2128,7 +2165,27 @@ impl ScalarAccumulator {
         if let Value::Timestamp { value, .. } | Value::Time { value, .. } | Value::Duration { value, .. } = value {
             return self.temporal_extremum(value, minimum);
         }
-        if let Some(previous) = self.accumulator.retained() {
+        let compact;
+        let _compact_charge;
+        let previous = if let Value::Decimal(value) = &value
+            && let Some((precision, scale, 128)) = decimal_type(output)
+        {
+            if !matches!(self.accumulator, ScalarState::Retained(_))
+                && let Ok(bytes) = value.unscaled.as_slice().try_into()
+            {
+                return self.decimal_extremum(i128::from_be_bytes(bytes), minimum);
+            }
+            if let ScalarState::Decimal128(bytes) = self.accumulator {
+                _compact_charge = execution.context.memory.reserve(16)?;
+                compact = Value::Decimal(decimal128_value(i128::from_ne_bytes(bytes), precision, scale)?);
+                Some(&compact)
+            } else {
+                self.accumulator.retained()
+            }
+        } else {
+            self.accumulator.retained()
+        };
+        if let Some(previous) = previous {
             let order = match (&value, previous) {
                 (Value::Uri(left), Value::Uri(right)) => left.as_bytes().cmp(right.as_bytes()),
                 _ => compare_in_timezone(&value, previous, false, &execution.context.timezone)?,
