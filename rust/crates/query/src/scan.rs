@@ -2797,9 +2797,9 @@ async fn bounds(scan: &Scan, snapshot: &Snapshot, execution: &Execution) -> Resu
     let system = if basis.is_none() && matches!(scan.system_time, TemporalFilter::Default) { Interval::ALL }
         else { dimension(&scan.system_time, basis.map(Into::into).unwrap_or(execution.context.current_time), execution).await? };
     let cap = basis.map(|basis| basis.0.saturating_add(1)).map(Timestamp).unwrap_or(Timestamp::MAX);
-    // A point after the basis reads as the basis: what is known at the basis is all that can be known then.
-    let system = match (&scan.system_time, basis) {
-        (TemporalFilter::At(_), Some(basis)) if system.lower() > basis => Interval::new(basis, cap)?,
+    // Any non-empty system-time range starting after the basis sees the state current at the basis.
+    let system = match basis {
+        Some(basis) if !system.is_empty() && system.lower() > basis => Interval::new(basis, cap)?,
         _ => system,
     };
     let upper = cap.min(system.upper());

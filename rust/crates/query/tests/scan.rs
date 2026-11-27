@@ -962,3 +962,45 @@ async fn a_nonmatching_page_overlapping_no_emitted_version_in_valid_time_is_prun
     assert_eq!(rows, [vec![Value::I64(1), timestamp(100), timestamp(200)], vec![Value::I64(1), timestamp(500), timestamp(600)]]);
     assert_eq!(pruned, 1);
 }
+
+#[tokio::test]
+async fn future_system_time_ranges_see_versions_live_at_the_basis() {
+    let state = PartitionState::empty(TrieConfig::new(32, 32).unwrap()).unwrap();
+    let budget = MemoryBudget::new(1 << 27);
+    let store = Arc::new(MemoryStore::default());
+
+    let mut first = tx(&state, &budget, 0, 100);
+    first.put(table(), document(1, Value::I64(1)), Interval::ALL).unwrap();
+    first.put(table(), document(2, Value::I64(10)), Interval::ALL).unwrap();
+    state.apply(&first.stage().unwrap()).unwrap();
+    persist(&state, &store).await;
+
+    let mut second = tx(&state, &budget, 1, 200);
+    second.put(table(), document(1, Value::I64(2)), Interval::ALL).unwrap();
+    second.delete(table(), &EntityId::Integer(2), Interval::ALL).unwrap();
+    state.apply(&second.stage().unwrap()).unwrap();
+
+    let snapshot = state.value().snapshot();
+    for bypass in [false, true] {
+        let context = query_context(snapshot.clone(), Arc::clone(&store), bypass);
+        for system_time in [
+            at(300),
+            TemporalFilter::FromTo { from: Expr::Literal(timestamp(300)), to: Expr::Literal(timestamp(400)) },
+            TemporalFilter::FromTo { from: Expr::Literal(timestamp(300)), to: Expr::Literal(Value::Null) },
+            TemporalFilter::Between { from: Expr::Literal(timestamp(300)), to: Expr::Literal(timestamp(400)) },
+            TemporalFilter::Between { from: Expr::Literal(timestamp(300)), to: Expr::Literal(timestamp(300)) },
+        ] {
+            let rows = collect(scan(&context, &["_id", "v", "_system_from", "_system_to"], TemporalFilter::All, system_time, None), Arc::clone(&context)).await.unwrap();
+            assert_eq!(rows, vec![vec![Value::I64(1), Value::I64(2), timestamp(200), Value::Null]]);
+        }
+        for empty in [
+            at(Timestamp::MAX.0),
+            TemporalFilter::FromTo { from: Expr::Literal(timestamp(300)), to: Expr::Literal(timestamp(300)) },
+            TemporalFilter::FromTo { from: Expr::Literal(timestamp(400)), to: Expr::Literal(timestamp(300)) },
+            TemporalFilter::Between { from: Expr::Literal(timestamp(400)), to: Expr::Literal(timestamp(300)) },
+        ] {
+            let rows = collect(scan(&context, &["v"], TemporalFilter::All, empty, None), Arc::clone(&context)).await.unwrap();
+            assert!(rows.is_empty());
+        }
+    }
+}
