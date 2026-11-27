@@ -40,6 +40,7 @@ Both diagnostics identify the slot and include the upstream message and SQLSTATE
 The slot connection stays open without another command while a second connection imports that snapshot in a repeatable-read transaction.
 Publication tables and table rows use bounded server cursors with pages of 1,000 rows.
 The source submits snapshot pages in order with an incomplete token and awaits the final complete-token transaction after all pages.
+The final transaction only marks the snapshot complete and bypasses the source indexer.
 The snapshot transaction is rolled back when the import finishes; cancelling the run closes both connections.
 
 Streaming uses protocol version 1 and the applied token's committed end LSN.
@@ -100,12 +101,13 @@ Replication command literals follow https://github.com/postgres/postgres/blob/RE
 
 == Source regression coverage
 
-`tests/semantics.rs` records the durable/apply distinction, caught-up WAL gap, first-block exception, resume-before-durable case, token compatibility, retry backoff, scalar/array decoding, end-LSN commits, old-tuple TOAST recovery, ignored tables, and reservation lifetime.
+`tests/semantics.rs` records durable and applied progress, caught-up WAL gaps, first-block replay, resume-before-durable, token and persisted configuration compatibility, retry backoff, scalar and array decoding, end-LSN commits, old-tuple TOAST recovery, ignored tables, and reservation lifetime.
 The cases map to `PostgresSourceIntegrationTest`, `PostgresSourceToastTest`, `PostgresSourceTypesPropertyTest`, and `ReconnectPolicyTest`.
 The frame-reader tests cover cancellation after a partial header and partial body, and rejection before allocating an oversized frame.
-`src/integration.rs` contains explicit PostgreSQL 17+ tests for exported snapshot consistency, concurrent changes, full TOAST, native CopyBoth resume/delete, and the complete source→replica apply→block adoption→WAL confirmation path.
-Those tests require an operator-provided logical-replication PostgreSQL server and `RTDB_PG_HOST`, `RTDB_PG_PORT`, `RTDB_PG_DATABASE`, `RTDB_PG_USER`, and `RTDB_PG_PASSWORD`.
-They are marked ignored until that external test environment is deliberately selected; none has been run during Phase 1.
+The slot tests cover duplicate slots, server rejection diagnostics, and malformed replies.
+`src/integration.rs` checks the snapshot completion token against the native resolver and a custom indexer.
+Its PostgreSQL 17+ tests exercise exported snapshots, concurrent changes, full TOAST, native CopyBoth resume and delete, and WAL confirmation after block adoption and connection loss.
+The PostgreSQL cases are ignored by default and require an operator-provided logical-replication server and `RTDB_PG_HOST`, `RTDB_PG_PORT`, `RTDB_PG_DATABASE`, `RTDB_PG_USER`, and `RTDB_PG_PASSWORD`.
 
 == Compatibility qualifications
 

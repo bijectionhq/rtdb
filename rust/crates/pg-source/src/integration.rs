@@ -75,7 +75,7 @@ async fn wait_for(mut predicate: impl FnMut() -> bool) {
 
 #[tokio::test]
 #[ignore = "requires an explicitly configured PostgreSQL 17+ server with wal_level=logical and replication credentials"]
-async fn native_source_applies_snapshot_streams_and_confirms_only_the_adopted_extent() {
+async fn native_source_reconnects_without_reapplying_or_confirming_beyond_the_adopted_extent() {
     use rtdb_storage::{MemoryStore, cache::BufferPool, log::MemoryLog};
     use rtdb_replication::{BlockStore, PartitionLogs, ProgressMonitor, ReplicationConfig, ReplicationDriver, Role};
     use rtdb_types::{SourcePosition, StorageEpoch, Timestamp};
@@ -95,6 +95,7 @@ async fn native_source_applies_snapshot_streams_and_confirms_only_the_adopted_ex
     control.query(&format!("CREATE TABLE {table} (_id integer PRIMARY KEY, value text)")).await.unwrap(); control.query(&format!("INSERT INTO {table} VALUES (1, 'snapshot')")).await.unwrap(); control.query(&format!("CREATE PUBLICATION {publication} FOR TABLE {table}")).await.unwrap();
     let config = SourceConfig { remote: "test".into(), slot_name: slot.clone(), publication_name: publication.clone(), indexer: None, ignore_tables: BTreeSet::new() };
     let source = crate::SourceDriver::new(remote, config, Arc::clone(&memory), None).unwrap(); let cancellation = CancellationToken::new();
+    let status = source.watch_status();
     let source_job = tokio::spawn(source.run(handle.term().unwrap(), None, handle.watch_status(), cancellation.clone()));
     let applied_token = || handle.progress().current().external_token.as_deref().and_then(|token| crate::ResumeToken::decode(token).ok());
     wait_for(|| applied_token().is_some_and(|token| token.snapshot_completed)).await;
@@ -103,6 +104,25 @@ async fn native_source_applies_snapshot_streams_and_confirms_only_the_adopted_ex
     let durable = crate::ResumeToken::decode(handle.status().adopted_block.as_ref().unwrap().external_source_token().unwrap()).unwrap().lsn;
     control.query(&format!("INSERT INTO {table} VALUES (2, 'unflushed')")).await.unwrap(); wait_for(|| applied_token().is_some_and(|token| token.lsn > durable)).await;
     let applied = applied_token().unwrap().lsn;
+
+    let active_pid = format!("SELECT active_pid FROM pg_replication_slots WHERE slot_name = '{slot}'");
+    let pid = control.query(&active_pid).await.unwrap().rows[0].cell(0).unwrap().unwrap().parse::<i32>().unwrap();
+    let terminated = control.query(&format!("SELECT pg_terminate_backend({pid})")).await.unwrap();
+    assert_eq!(terminated.rows[0].cell(0).unwrap(), Some("t"));
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let slot = control.query(&active_pid).await.unwrap();
+            let active = slot.rows[0].cell(0).unwrap().map(|pid| pid.parse::<i32>().unwrap());
+            if active.is_some_and(|active| active != pid) { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+
+    control.query(&format!("INSERT INTO {table} VALUES (3, 'after reconnect')")).await.unwrap();
+    wait_for(|| status.borrow().commits >= 2).await;
+    assert_eq!(status.borrow().commits, 2);
+    assert_eq!(status.borrow().events, 2);
+    assert!(applied_token().unwrap().lsn > applied);
     for _ in 0..20 {
         let result = control.query(&format!("SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = '{slot}'")).await.unwrap();
         let confirmed: crate::Lsn = result.rows[0].cell(0).unwrap().unwrap().parse().unwrap(); assert!(confirmed < applied);
@@ -214,23 +234,70 @@ async fn native_source_recovers_confirmed_local_journal_transactions_before_the_
     control.query(&format!("DROP TABLE {table}")).await.unwrap();
 }
 
-#[tokio::test]
-async fn pg_source_arrow_wal_keeps_replica_table_bytes_and_event_ordinals() {
-    use rtdb_format::envelope::ReplicaBody;
-    use rtdb_index::PartitionState;
+fn source_resolve_context(memory: &Arc<MemoryBudget>) -> rtdb_tx::ResolveContext {
     use rtdb_storage::{MemoryStore, cache::BufferPool};
-    use rtdb_types::{SourcePosition, Timestamp};
     use tokio_util::sync::CancellationToken;
 
-    let memory = MemoryBudget::new(1 << 26);
     let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
-    let context = rtdb_tx::ResolveContext {
-        database: "cdc".into(), storage, memory: Arc::clone(&memory), cancellation: CancellationToken::new(),
+    rtdb_tx::ResolveContext {
+        database: "cdc".into(), storage, memory: Arc::clone(memory), cancellation: CancellationToken::new(),
         default_tz: "UTC".into(), authorization: Arc::new(Authority), query_options: Default::default(),
         scan_accelerators: Default::default(), footprint_grants: Default::default(), decision_clock: None, world_constraints: None,
         execution_observer: None, tracer: None, write_event_origins: false, placed_receipt_retirement: false,
         owned_witness_scope: None,
-    };
+    }
+}
+
+#[derive(Default)]
+struct NonemptyMirror {
+    indexed: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl crate::PgIndexer for NonemptyMirror {
+    async fn index_transaction(&self, source: &crate::PgTransaction, target: &mut rtdb_tx::OpenTransaction<'_>) -> rtdb_types::Result<()> {
+        assert!(!source.operations.is_empty());
+        assert_eq!(source.commit_time, Some(target.tx_key().system_time));
+        self.indexed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::PgIndexer::index_transaction(&crate::DirectMirror, source, target).await
+    }
+}
+
+#[tokio::test]
+async fn completing_a_snapshot_does_not_offer_an_empty_transaction_to_the_custom_indexer() {
+    use rtdb_format::envelope::ReplicaBody;
+    use rtdb_types::{SourcePosition, TableRef, Timestamp};
+
+    let memory = MemoryBudget::new(1 << 26);
+    let context = source_resolve_context(&memory);
+    let partition = rtdb_index::PartitionState::empty(Default::default()).unwrap();
+    let mut resolver = rtdb_tx::TxResolver::new(None, SourcePosition(-1), None, &memory).unwrap();
+    let indexer = Arc::new(NonemptyMirror::default());
+    let (mut rows, _) = crate::decoder::tests::transactions(&memory);
+    let lsn = crate::Lsn(123);
+    let page = crate::decoder::DecodedTransaction::new(lsn, None, vec![rows.batches.remove(0)]);
+    let marker = crate::decoder::DecodedTransaction::new(lsn, None, Vec::new());
+    let table = TableRef::new("public", "a").schema_and_table();
+    for (transaction, completed) in [(page, false), (marker, true)] {
+        let token = crate::ResumeToken::new(lsn, completed).encode();
+        let mut writer = crate::indexer::ImportWriter { transaction, indexer: Some(indexer.clone()), memory: Arc::clone(&memory) };
+        let resolved = resolver.resolve_external(partition.snapshot(), Timestamp(1_600_000_000_000_000), None, Some(token.clone()), &mut writer, &context).await.unwrap();
+        let record = resolved.to_replica_body(&memory).unwrap();
+        let ReplicaBody::ResolvedTx(record) = record.body() else { unreachable!() };
+        assert_eq!(record.external_source_token.as_deref(), Some(token.as_slice()));
+        assert_eq!(record.table_data.contains_key(&table), !completed);
+    }
+    assert_eq!(indexer.indexed.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn pg_source_arrow_wal_keeps_replica_table_bytes_and_event_ordinals() {
+    use rtdb_format::envelope::ReplicaBody;
+    use rtdb_index::PartitionState;
+    use rtdb_types::{SourcePosition, Timestamp};
+
+    let memory = MemoryBudget::new(1 << 26);
+    let context = source_resolve_context(&memory);
     let partition = PartitionState::empty(Default::default()).unwrap();
     let (actual, legacy) = crate::decoder::tests::transactions(&memory);
     let mut replicas = Vec::new();

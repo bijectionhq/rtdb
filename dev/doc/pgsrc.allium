@@ -342,6 +342,11 @@ surface TargetIngestion {
     contracts:
         demands TargetDurability
 
+    @guarantee SnapshotCompletionBarrier
+        -- The target applies all snapshot batches before the completed import token becomes applied progress.
+        -- The indexer receives the batches containing snapshot rows.
+        -- A metadata transaction records snapshot completion.
+
     @guarantee NativeMirrorPayloads
         -- The native mirror builds Arrow batches for snapshot and WAL fields in their received order.
         -- Bytea, UUID, date, timestamp, interval, and decimal text feeds typed Arrow columns.

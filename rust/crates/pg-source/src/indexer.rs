@@ -170,12 +170,14 @@ pub(crate) struct ImportWriter {
 #[async_trait]
 impl TransactionWriter for ImportWriter {
     async fn write(&mut self, target: &mut OpenTransaction<'_>) -> Result<WriterResult> {
-        if self.transaction.commit_time.is_none() { self.transaction.commit_time = Some(target.tx_key().system_time); }
-        if let Some(indexer) = &self.indexer {
-            let (transaction, _charge) = self.transaction.compatibility_batches(&self.memory)?;
-            indexer.index_arrow_transaction(&transaction, target, &self.memory).await?;
-        } else {
-            index_arrow_runs(self.transaction.ordered_runs(), target, &self.memory).await?;
+        if !self.transaction.batches.is_empty() {
+            if self.transaction.commit_time.is_none() { self.transaction.commit_time = Some(target.tx_key().system_time); }
+            if let Some(indexer) = &self.indexer {
+                let (transaction, _charge) = self.transaction.compatibility_batches(&self.memory)?;
+                indexer.index_arrow_transaction(&transaction, target, &self.memory).await?;
+            } else {
+                index_arrow_runs(self.transaction.ordered_runs(), target, &self.memory).await?;
+            }
         }
         Ok(WriterResult::Committed { user_metadata: None })
     }
