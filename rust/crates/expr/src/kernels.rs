@@ -39,7 +39,7 @@ impl Function {
     /// The function a call of `name`, in any case and with hyphens or underscores, runs here.
     pub fn resolve(name: &str) -> Option<Self> {
         let name = crate::functions::canonical_name(name);
-        Some(match name.as_str() {
+        Some(match &*name {
             "extract" => Self::Extract,
             "round" => Self::Round,
             "abs" => Self::Abs,
@@ -160,11 +160,11 @@ pub fn text_lengths(values: &StringArray) -> Int32Array {
 pub struct LikeMatcher { pattern: crate::string::pattern::LikePattern, negated: bool }
 
 impl LikeMatcher {
-    /// `None` where the scalar LIKE rejects the pattern.
-    pub fn compile(pattern: &str, escape: Option<char>, case_insensitive: bool, negated: bool) -> Option<Self> {
+    /// The scalar LIKE's error where it rejects the pattern.
+    pub fn compile(pattern: &str, escape: Option<char>, case_insensitive: bool, negated: bool) -> Result<Self> {
         let pattern = rtdb_types::Value::Utf8(pattern.to_owned());
-        let pattern = crate::string::pattern::compile_like(&pattern, escape, case_insensitive, &crate::EvalContext::default()).ok()?;
-        Some(Self { pattern, negated })
+        let pattern = crate::string::pattern::compile_like(&pattern, escape, case_insensitive, &crate::EvalContext::default())?;
+        Ok(Self { pattern, negated })
     }
 
     /// The truth of `text LIKE pattern` (or NOT LIKE) for each text in turn; the states are reused across calls.
@@ -433,7 +433,7 @@ mod tests {
             for (escape, case_insensitive, negated) in [(None, false, false), (Some('\\'), false, true), (Some('\\'), true, false), (None, true, true)] {
                 let expr = Expr::Like { expr: Box::new(column.clone()), pattern: Box::new(Expr::Literal(Value::Utf8(pattern.into()))), escape, case_insensitive, negated };
                 let expected = scalar(&expr, &schema, cells.iter().map(|cell| cell.map_or(Value::Null, |text| Value::Utf8(text.into())))).ok();
-                let matcher = LikeMatcher::compile(pattern, escape, case_insensitive, negated);
+                let matcher = LikeMatcher::compile(pattern, escape, case_insensitive, negated).ok();
                 assert_eq!(expected.is_some(), matcher.is_some(), "{pattern:?} escaped by {escape:?}");
                 if let (Some(expected), Some(matcher)) = (expected, matcher) {
                     same(&expected, matcher.column(&values).iter().map(|cell| cell.map_or(Value::Null, Value::Bool)));

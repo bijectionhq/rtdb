@@ -600,7 +600,7 @@ impl AggregateColumn {
         scope.reserve(input.len())?;
         let mut mask = vec![true;input.len()];
         if let Some(filter) = &aggregate.filter
-            && let Some(selected) = crate::columnar::typed_predicate_mask(input.batch, filter, schema, execution.parameters.evaluator())
+            && let Some(selected) = crate::columnar::typed_predicate_mask(input.batch, filter, schema, execution.parameters.evaluator())?
         {
             execution.prepare_expression(filter, schema, &scope)?;
             mask = selected;

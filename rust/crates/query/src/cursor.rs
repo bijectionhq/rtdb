@@ -4,7 +4,7 @@ use arrow_array::{Array, ArrayRef, NullArray, RecordBatch, RecordBatchOptions};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef};
 use async_trait::async_trait;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, ResultArrayFunding, copy_array_refs, copy_nullable_cells, estimate_builder_bytes_refs, estimate_copy_cell_bytes, retain_result_array, to_field};
-use rtdb_plan::{BinaryOp, Catalog, ExecutionError, ExecutionSample, ExecutionTimer, Expr, Relation, RelationNode, Schema};
+use rtdb_plan::{Catalog, ExecutionError, ExecutionSample, ExecutionTimer, Expr, Relation, RelationNode, Schema};
 use rtdb_types::{ListKind, LogicalType, Result, ScalarType, Value};
 
 use crate::{QueryContext, context::{Execution, cancelled}, invalid};
@@ -560,11 +560,6 @@ fn parameter_projection_backing(array: &ArrayRef, direct: bool, arguments: &Owne
 fn parameter_projection_expression(expression: &Expr) -> bool {
     stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || match expression {
         Expr::Parameter { .. } | Expr::Column { .. } => true,
-        Expr::Binary { op: BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply, left, right } => {
-            let operand = |expr: &Expr| matches!(expr, Expr::Literal(Value::Null | Value::I8(_) | Value::I16(_) | Value::I32(_) | Value::I64(_) | Value::F64(_)))
-                || parameter_projection_expression(expr);
-            operand(left) && operand(right)
-        }
         _ => crate::columnar::functions::bound_lowerable(expression),
     })
 }
@@ -596,20 +591,10 @@ fn project_bound_columns(
     use crate::columnar::{Column, ColumnBatch};
 
     let parameters = ColumnBatch::from_owned(arguments.slice(0, 1)?)?;
-    let bound_column = |expr: &Expr, schema: &Schema, input: &[Column]| {
-        if let Some(column) = crate::columnar::projection::bound_column(expr, schema, input, &parameters.columns)? {
-            return match column {
-                Column::Arrow { array, field, logical } if !matches!(expr, Expr::Column { .. } | Expr::Parameter { .. }) => {
-                    let bytes = array.get_array_memory_size().checked_add(512).ok_or_else(parameter_projection_size)?;
-                    let charge = memory.reserve(bytes)?;
-                    let array = rtdb_columnar::retain_array(array, &charge)?;
-                    Ok(Some(Column::Arrow { array, field, logical }))
-                }
-                column => Ok(Some(column)),
-            };
-        }
-        // A cell that fails declines the projection, so the ordinary path raises its error where it reaches it.
-        Result::Ok(crate::columnar::functions::bound_column(expr, schema, input, &parameters.columns, memory).unwrap_or(None))
+    // A shape the native evaluator doesn't take declines the projection; any error it raises is the query's.
+    let bound_column = |expr: &Expr, schema: &Schema, input: &[Column]| -> Result<Option<Column>> {
+        if let Some(column) = crate::columnar::projection::bound_column(expr, schema, input, &parameters.columns) { return Ok(Some(column)); }
+        crate::columnar::functions::bound_column(expr, schema, input, &parameters.columns, memory)
     };
     let mut layers = Vec::new();
     let mut relation = relation;

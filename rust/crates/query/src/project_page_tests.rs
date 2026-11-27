@@ -295,7 +295,7 @@ async fn arrow_wave4_selected_boolean_projection_and_filter_match_scalar_evaluat
         expected.push(execution.evaluate(&scope, &predicate, &schema, &[batch.columns[0].value(row).unwrap()]).await.unwrap());
         scope.reset().unwrap();
     }
-    let mask = crate::columnar::typed_predicate_mask(&batch, &predicate, &schema, execution.parameters.evaluator()).unwrap();
+    let mask = crate::columnar::typed_predicate_mask(&batch, &predicate, &schema, execution.parameters.evaluator()).unwrap().unwrap();
     assert_eq!(mask, expected.iter().map(|value| *value == Value::Bool(true)).collect::<Vec<_>>());
     let input = crate::columnar::single_batch(Some(batch), context.clone());
     let mut projections = BatchExpressions::new(input, schema, vec![predicate], execution.clone());
@@ -324,7 +324,7 @@ async fn arrow_wave4_selected_checked_arithmetic_falls_back_at_the_first_failing
         ColumnBatch::settled(vec![column], len, context.memory.reserve(4096).unwrap()).unwrap()
     };
     let selected = batch(vec![(1, 0), (0, 0), (0, 1)]);
-    let result = crate::columnar::projection::column(&expression, &schema, &selected, execution.parameters.evaluator()).unwrap().unwrap();
+    let result = crate::columnar::functions::column(&expression, &schema, &selected, execution.parameters.evaluator(), &context.memory).unwrap().unwrap();
     let expected = [Value::Null, Value::I64(42), Value::Null];
     assert_eq!((0..selected.len).map(|row| result.value(row).unwrap()).collect::<Vec<_>>(), expected);
     let selected = batch(vec![(0, 1), (0, 2), (0, 0)]);

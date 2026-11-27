@@ -3554,11 +3554,12 @@ impl BatchCursor for BatchFilter {
     fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { self.input.scan_counts() }
 }
 
+/// The rows `predicate` holds at, `Ok(None)` where the row evaluator computes it.
 pub(crate) fn typed_predicate_mask(
     batch: &ColumnBatch, predicate: &rtdb_plan::Expr, schema: &rtdb_plan::Schema, parameters: rtdb_expr::Parameters<'_>,
-) -> Option<Vec<bool>> {
-    let truth = kernel::truth(predicate, schema, batch, parameters)?;
-    Some(truth.into_iter().map(|value| value == Some(true)).collect())
+) -> Result<Option<Vec<bool>>> {
+    let Some(truth) = functions::truth(predicate, schema, batch, parameters)? else { return Ok(None) };
+    Ok(Some(truth.into_iter().map(|value| value == Some(true)).collect()))
 }
 
 pub(crate) async fn predicate_selection(
@@ -3591,7 +3592,7 @@ async fn admitted_predicate_selection(
         }
         Ok(())
     };
-    if let Some(truth) = kernel::truth(predicate, schema, batch, params) {
+    if let Some(truth) = functions::truth(predicate, schema, batch, params)? {
         prepare_typed()?;
         return PredicateSelection::from_bits(truth.into_iter().map(|value| value == Some(true)), memory);
     }
@@ -3637,7 +3638,7 @@ pub(crate) async fn predicate_truth(
         }
         Ok(())
     };
-    if let Some(truth) = kernel::truth(predicate, schema, batch, params) {
+    if let Some(truth) = functions::truth(predicate, schema, batch, params)? {
         prepare_typed()?;
         return Ok((truth.into_iter().collect(), reservation));
     }
@@ -3682,460 +3683,6 @@ impl rtdb_expr::RowInput for BatchRow<'_> {
 
     fn value(&self, index: usize, allocation: Option<&rtdb_expr::EvaluationScope>) -> Result<Option<Value>> {
         self.batch.columns.get(index).map(|column| column.expression_value(self.row, self.admit_dates, allocation)).transpose()
-    }
-}
-
-/// Three-valued predicate evaluation over a batch's columns, for the predicate shapes and cell types whose
-/// semantics are exactly those of the scalar evaluator; `None` sends the batch to it instead.
-mod kernel {
-    use std::sync::Arc;
-    use arrow_array::{Array, BooleanArray, FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, PrimitiveArray, StringArray, TimestampMicrosecondArray, types::ArrowPrimitiveType};
-    use arrow_schema::{DataType, TimeUnit as ArrowUnit};
-    use rtdb_plan::{BinaryOp, Expr, Schema, UnaryOp};
-    use rtdb_types::{ScalarType, TimeUnit, Value};
-    use super::{Column, ColumnBatch, MemoryReservation, projection};
-
-    type Truth = Vec<Option<bool>>;
-
-    /// A comparable cell; integers and floats compare only where the conversion between them is exact.
-    #[derive(Clone, Copy, PartialEq, PartialOrd)]
-    enum Cell<'a> { Int(i64), Float(f64), Text(&'a str), Bool(bool), Micros(i64, Option<&'a str>),
-        /// A UUID as the big-endian integer of its bytes, which orders as the bytes do.
-        Uuid(u128) }
-
-    enum Cells<'a> { Null, Uuid(&'a FixedSizeBinaryArray), Int(&'a Int64Array), Int32(&'a Int32Array), Int16(&'a Int16Array), Int8(&'a Int8Array), Float(&'a Float64Array), Float32(&'a Float32Array), Text(&'a StringArray), Bool(&'a BooleanArray), Micros(&'a TimestampMicrosecondArray, Option<&'a str>), Values(&'a [Value]), Owned(Vec<Option<Cell<'static>>>),
-        /// A dense union whose legs are each a plain cell type, read through the leg each cell's type id names.
-        Union { array: &'a arrow_array::UnionArray, legs: Vec<Option<Cells<'a>>> },
-        Selected { rows: &'a super::SelectedRows, sources: Vec<Option<Cells<'a>>> },
-    }
-
-    impl<'a> Cells<'a> {
-        fn of(column: &'a Column) -> Option<Self> {
-            match column {
-                Column::Values(values) => Some(Self::Values(values)),
-                Column::Arrow { array, field, logical } => Self::arrow(array.as_ref(), field, logical.as_ref()),
-                Column::Selected(selected) => {
-                    let sources = selected.sources.iter().map(|source| match source {
-                        Some((array, field, logical, _)) => Self::arrow(array.as_ref(), field, logical.as_ref()).map(Some),
-                        None => Some(None),
-                    }).collect::<Option<Vec<_>>>()?;
-                    Some(Self::Selected { rows: &selected.cells, sources })
-                }
-            }
-        }
-
-        fn arrow(array: &'a dyn Array, field: &'a arrow_schema::Field, logical: Option<&'a rtdb_types::LogicalType>) -> Option<Self> {
-            let scalar = logical.and_then(super::plain_scalar);
-            let plain = |expected: ScalarType| match logical { Some(_) => scalar == Some(&expected), None => field.metadata().is_empty() };
-            let any = array.as_any();
-            match array.data_type() {
-                DataType::Null if field.is_nullable() && logical.is_none_or(|ty| *ty == rtdb_types::LogicalType::Null) => Some(Self::Null),
-                DataType::Int64 if plain(ScalarType::I64) => any.downcast_ref().map(Self::Int),
-                DataType::Int32 if plain(ScalarType::I32) => any.downcast_ref().map(Self::Int32),
-                DataType::Int16 if plain(ScalarType::I16) => any.downcast_ref().map(Self::Int16),
-                DataType::Int8 if plain(ScalarType::I8) => any.downcast_ref().map(Self::Int8),
-                DataType::Float32 if plain(ScalarType::F32) => any.downcast_ref().map(Self::Float32),
-                DataType::Float64 if plain(ScalarType::F64) => any.downcast_ref().map(Self::Float),
-                DataType::Utf8 if plain(ScalarType::Utf8) => any.downcast_ref().map(Self::Text),
-                DataType::Boolean if plain(ScalarType::Bool) => any.downcast_ref().map(Self::Bool),
-                // Sixteen bytes are a UUID only where the column's logical type says so.
-                DataType::FixedSizeBinary(16) if scalar == Some(&ScalarType::Uuid) => any.downcast_ref().map(Self::Uuid),
-                // A cell reads its zone from the column's logical type, or from the layout where it has none.
-                DataType::Timestamp(ArrowUnit::Microsecond, zone) => {
-                    let zone = match (logical, scalar) {
-                        (Some(_), Some(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone })) => timezone.as_deref(),
-                        (None, _) if field.metadata().is_empty() => zone.as_deref(),
-                        _ => return None,
-                    };
-                    any.downcast_ref().map(|array| Self::Micros(array, zone))
-                }
-                DataType::Union(fields, arrow_schema::UnionMode::Dense) => {
-                    if logical.is_some_and(|logical| rtdb_columnar::from_field(field).ok().as_ref() != Some(logical)) {
-                        return None;
-                    }
-                    let array: &arrow_array::UnionArray = any.downcast_ref()?;
-                    let mut legs: Vec<Option<Self>> = Vec::new();
-                    for (id, field) in fields.iter() {
-                        if id < 0 || !field.metadata().is_empty() { return None; }
-                        let child = array.child(id);
-                        let leg_any = child.as_any();
-                        let cells = match child.data_type() {
-                            DataType::Int64 => Self::Int(leg_any.downcast_ref()?),
-                            DataType::Int32 => Self::Int32(leg_any.downcast_ref()?),
-                            DataType::Int16 => Self::Int16(leg_any.downcast_ref()?),
-                            DataType::Int8 => Self::Int8(leg_any.downcast_ref()?),
-                            DataType::Float32 => Self::Float32(leg_any.downcast_ref()?),
-                            DataType::Float64 => Self::Float(leg_any.downcast_ref()?),
-                            DataType::Utf8 => Self::Text(leg_any.downcast_ref()?),
-                            DataType::Boolean => Self::Bool(leg_any.downcast_ref()?),
-                            _ => return None,
-                        };
-                        let id = id as usize;
-                        if legs.len() <= id { legs.resize_with(id + 1, || None); }
-                        legs[id] = Some(cells);
-                    }
-                    Some(Self::Union { array, legs })
-                }
-                _ => None,
-            }
-        }
-
-        /// `Err` where a cell has a type the kernel doesn't evaluate.
-        fn get(&self, row: usize) -> Result<Option<Cell<'a>>, ()> {
-            fn valid<A: Array>(array: &A, row: usize) -> bool { array.is_valid(row) }
-            Ok(match self {
-                Self::Null => None,
-                Self::Selected { rows, sources } => {
-                    let (source, position) = rows.get(row).ok_or(())?;
-                    match &sources[source] {
-                        Some(cells) => cells.get(position)?,
-                        None => None,
-                    }
-                }
-                Self::Int(array) => integral(*array, row),
-                Self::Int32(array) => integral(*array, row),
-                Self::Int16(array) => integral(*array, row),
-                Self::Int8(array) => integral(*array, row),
-                Self::Owned(cells) => cells[row],
-                Self::Float(array) => valid(*array, row).then(|| Cell::Float(array.value(row))),
-                Self::Float32(array) => valid(*array, row).then(|| Cell::Float(f64::from(array.value(row)))),
-                Self::Text(array) => valid(*array, row).then(|| Cell::Text(array.value(row))),
-                Self::Bool(array) => valid(*array, row).then(|| Cell::Bool(array.value(row))),
-                Self::Micros(array, zone) => valid(*array, row).then(|| Cell::Micros(array.value(row), *zone)),
-                Self::Uuid(array) => match valid(*array, row).then(|| array.value(row).try_into()) {
-                    Some(bytes) => Some(Cell::Uuid(u128::from_be_bytes(bytes.map_err(|_| ())?))),
-                    None => None,
-                },
-                Self::Values(values) => scalar(&values[row])?,
-                Self::Union { array, legs } => {
-                    let leg = usize::try_from(array.type_id(row)).ok().and_then(|id| legs.get(id)).and_then(Option::as_ref).ok_or(())?;
-                    leg.get(array.value_offset(row))?
-                }
-            })
-        }
-    }
-
-    fn integral<T: ArrowPrimitiveType>(array: &PrimitiveArray<T>, row: usize) -> Option<Cell<'static>>
-    where i64: From<T::Native> {
-        array.is_valid(row).then(|| Cell::Int(i64::from(array.value(row))))
-    }
-
-    fn owned(cell: Cell<'_>) -> Option<Cell<'static>> {
-        match cell {
-            Cell::Int(value) => Some(Cell::Int(value)), Cell::Float(value) => Some(Cell::Float(value)), Cell::Bool(value) => Some(Cell::Bool(value)), Cell::Uuid(value) => Some(Cell::Uuid(value)),
-            Cell::Micros(value, None) => Some(Cell::Micros(value, None)), Cell::Micros(value, Some("UTC")) => Some(Cell::Micros(value, Some("UTC"))),
-            Cell::Micros(_, Some(_)) | Cell::Text(_) => None,
-        }
-    }
-    fn scalar(value: &Value) -> Result<Option<Cell<'_>>, ()> {
-        Ok(match value {
-            Value::Null => None,
-            Value::I8(value) => Some(Cell::Int(i64::from(*value))),
-            Value::I16(value) => Some(Cell::Int(i64::from(*value))),
-            Value::I32(value) => Some(Cell::Int(i64::from(*value))),
-            Value::I64(value) => Some(Cell::Int(*value)),
-            Value::F32(value) => Some(Cell::Float(f64::from(*value))),
-            Value::F64(value) => Some(Cell::Float(*value)),
-            Value::Utf8(value) => Some(Cell::Text(value)),
-            Value::Bool(value) => Some(Cell::Bool(*value)),
-            Value::Timestamp { value, unit: TimeUnit::Microsecond, timezone } => Some(Cell::Micros(*value, timezone.as_deref())),
-            Value::Uuid(bytes) => Some(Cell::Uuid(u128::from_be_bytes(*bytes))),
-            _ => return Err(()),
-        })
-    }
-
-    const EXACT: i64 = 1 << 53;
-    /// Orders two cells as the scalar comparison does, or `Err` where the pair is outside the kernel.
-    fn order(left: Cell<'_>, right: Cell<'_>, equality_only: bool) -> Result<std::cmp::Ordering, ()> {
-        use std::cmp::Ordering;
-        let float = |value: f64| if value.is_nan() { Err(()) } else { Ok(value) };
-        // Equality is IEEE (`-0.0 = 0.0`), ordering is total (`-0.0 < 0.0`), as in the scalar evaluator.
-        let floats = |a: f64, b: f64| if equality_only { a.partial_cmp(&b).ok_or(()) } else { Ok(a.total_cmp(&b)) };
-        match (left, right) {
-            (Cell::Int(a), Cell::Int(b)) => Ok(a.cmp(&b)),
-            (Cell::Micros(a, zoned), Cell::Micros(b, other)) if zoned.is_some() == other.is_some() => Ok(a.cmp(&b)),
-            (Cell::Float(a), Cell::Float(b)) => floats(float(a)?, float(b)?),
-            (Cell::Int(a), Cell::Float(b)) if a.unsigned_abs() < EXACT as u64 => floats(a as f64, float(b)?),
-            (Cell::Float(a), Cell::Int(b)) if b.unsigned_abs() < EXACT as u64 => floats(float(a)?, b as f64),
-            (Cell::Text(a), Cell::Text(b)) if equality_only || (a.is_ascii() && b.is_ascii()) => Ok(a.cmp(b)),
-            (Cell::Bool(a), Cell::Bool(b)) if equality_only => Ok(if a == b { Ordering::Equal } else { Ordering::Less }),
-            (Cell::Uuid(a), Cell::Uuid(b)) => Ok(a.cmp(&b)),
-            _ => Err(()),
-        }
-    }
-
-    enum ComputedCells {
-        Null,
-        Int8(Int8Array),
-        Int16(Int16Array),
-        Int32(Int32Array),
-        Int64(Int64Array),
-        Float64(Float64Array),
-        Text(StringArray),
-        Bool(BooleanArray),
-    }
-
-    struct ComputedOperand {
-        cells: ComputedCells,
-        _reservation: Arc<MemoryReservation>,
-    }
-
-    impl ComputedOperand {
-        /// `None` where the column kernels don't compute the operand or one of its cells fails: the predicate kernel
-        /// evaluates every row, so only the row evaluator, which skips what AND, OR and CASE don't reach, raises.
-        fn of(expr: &Expr, schema: &Schema, batch: &ColumnBatch, parameters: rtdb_expr::Parameters<'_>) -> Option<Self> {
-            let memory = batch.reservation.budget();
-            let mut reservation = memory.reserve(projection::arithmetic_bound(expr, batch.len)?).ok()?;
-            let column = match projection::column(expr, schema, batch, parameters).ok()? {
-                Some(column) => column,
-                None => super::functions::column(expr, schema, batch, parameters, memory).ok()??,
-            };
-            let Column::Arrow { array, .. } = column else { return None; };
-            let any = array.as_any();
-            let cells = match array.data_type() {
-                DataType::Null => ComputedCells::Null,
-                DataType::Int8 => ComputedCells::Int8(any.downcast_ref::<Int8Array>()?.clone()),
-                DataType::Int16 => ComputedCells::Int16(any.downcast_ref::<Int16Array>()?.clone()),
-                DataType::Int32 => ComputedCells::Int32(any.downcast_ref::<Int32Array>()?.clone()),
-                DataType::Int64 => ComputedCells::Int64(any.downcast_ref::<Int64Array>()?.clone()),
-                DataType::Float64 => ComputedCells::Float64(any.downcast_ref::<Float64Array>()?.clone()),
-                DataType::Utf8 => ComputedCells::Text(any.downcast_ref::<StringArray>()?.clone()),
-                DataType::Boolean => ComputedCells::Bool(any.downcast_ref::<BooleanArray>()?.clone()),
-                _ => return None,
-            };
-            let retained = array.get_array_memory_size();
-            drop(array);
-            let lease = Arc::get_mut(&mut reservation)?;
-            if retained <= lease.bytes() { lease.shrink_to(retained).ok()?; } else { lease.grow_to(retained).ok()?; }
-            Some(Self { cells, _reservation: reservation })
-        }
-
-        fn get(&self, row: usize) -> Option<Cell<'_>> {
-            match &self.cells {
-                ComputedCells::Null => None,
-                ComputedCells::Int8(array) => integral(array, row),
-                ComputedCells::Int16(array) => integral(array, row),
-                ComputedCells::Int32(array) => integral(array, row),
-                ComputedCells::Int64(array) => integral(array, row),
-                ComputedCells::Float64(array) => array.is_valid(row).then(|| Cell::Float(array.value(row))),
-                ComputedCells::Text(array) => array.is_valid(row).then(|| Cell::Text(array.value(row))),
-                ComputedCells::Bool(array) => array.is_valid(row).then(|| Cell::Bool(array.value(row))),
-            }
-        }
-    }
-
-    enum Operand<'a> { Cells(Cells<'a>), Computed(ComputedOperand), Constant(Option<Cell<'a>>) }
-    fn can_read_owned_cell(data_type: &DataType) -> bool {
-        match data_type {
-            DataType::Union(fields, arrow_schema::UnionMode::Dense) => fields.iter().all(|(_, field)| can_read_owned_cell(field.data_type())),
-            DataType::RunEndEncoded(_, field) => can_read_owned_cell(field.data_type()),
-            DataType::Null | DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
-            | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 | DataType::Float32 | DataType::Float64
-            | DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, _) => true,
-            _ => false,
-        }
-    }
-
-    impl<'a> Operand<'a> {
-        fn of(expr: &'a Expr, schema: &Schema, batch: &'a ColumnBatch, parameters: rtdb_expr::Parameters<'a>) -> Option<Self> {
-            match expr {
-                Expr::Column { id, .. } => {
-                    let column = &batch.columns[schema.position(*id)?];
-                    match Cells::of(column) {
-                        Some(cells) => Some(Self::Cells(cells)),
-                        None if matches!(column, Column::Selected(_)) => None,
-                        None if matches!(column, Column::Arrow { array, .. } if !can_read_owned_cell(array.data_type())) => None,
-                        // A column without a direct cell reader, a union of integer legs say, is read once into owned cells.
-                        None => (0..batch.len).map(|row| {
-                            let value = column.value(row).ok()?;
-                            match scalar(&value).ok()? { None => Some(None), Some(cell) => owned(cell).map(Some) }
-                        }).collect::<Option<Vec<_>>>().map(|cells| Self::Cells(Cells::Owned(cells))),
-                    }
-                }
-                Expr::Literal(value) => scalar(value).ok().map(Self::Constant),
-                // An Arrow-bound parameter is decoded on first read, so `known` alone would decline it.
-                Expr::Parameter { index, .. } => scalar(parameters.get(*index).ok()??).ok().map(Self::Constant),
-                Expr::Binary { .. } | Expr::Unary { .. } | Expr::Cast { .. } | Expr::Call { .. } | Expr::Case { .. } =>
-                    ComputedOperand::of(expr, schema, batch, parameters).map(Self::Computed),
-                _ => None,
-            }
-        }
-        fn get(&self, row: usize) -> Result<Option<Cell<'_>>, ()> {
-            match self {
-                Self::Cells(cells) => cells.get(row),
-                Self::Computed(computed) => Ok(computed.get(row)),
-                Self::Constant(cell) => Ok(*cell),
-            }
-        }
-    }
-
-    pub(super) fn truth(expr: &Expr, schema: &Schema, batch: &ColumnBatch, parameters: rtdb_expr::Parameters<'_>) -> Option<Truth> {
-        use std::cmp::Ordering::*;
-        let rows = batch.len;
-        match expr {
-            Expr::Binary { op: BinaryOp::And, left, right } => {
-                let (left, right) = (truth(left, schema, batch, parameters)?, truth(right, schema, batch, parameters)?);
-                Some(left.into_iter().zip(right).map(|pair| match pair { (Some(false), _) | (_, Some(false)) => Some(false), (Some(true), Some(true)) => Some(true), _ => None }).collect())
-            }
-            Expr::Binary { op: BinaryOp::Or, left, right } => {
-                let (left, right) = (truth(left, schema, batch, parameters)?, truth(right, schema, batch, parameters)?);
-                Some(left.into_iter().zip(right).map(|pair| match pair { (Some(true), _) | (_, Some(true)) => Some(true), (Some(false), Some(false)) => Some(false), _ => None }).collect())
-            }
-            Expr::Unary { op: UnaryOp::Not, expr } => Some(truth(expr, schema, batch, parameters)?.into_iter().map(|value| value.map(|value| !value)).collect()),
-            Expr::Unary { op: op @ (UnaryOp::IsNull | UnaryOp::IsUnknown | UnaryOp::IsNotNull), expr } => {
-                if let Expr::Column { id, .. } = expr.as_ref()
-                    && let Column::Selected(column) = &batch.columns[schema.position(*id)?] {
-                    return column.null_test(*op != UnaryOp::IsNotNull);
-                }
-                let operand = Operand::of(expr, schema, batch, parameters)?;
-                (0..rows).map(|row| operand.get(row).ok().map(|cell| Some(cell.is_none() == (*op != UnaryOp::IsNotNull)))).collect()
-            }
-            Expr::Column { .. } => {
-                let operand = Operand::of(expr, schema, batch, parameters)?;
-                (0..rows).map(|row| match operand.get(row).ok()? { None => Some(None), Some(Cell::Bool(value)) => Some(Some(value)), Some(_) => None }).collect()
-            }
-            Expr::Binary { op, left, right } => {
-                let (equality_only, accept): (bool, fn(std::cmp::Ordering) -> bool) = match op {
-                    BinaryOp::Eq => (true, |ordering| ordering == Equal), BinaryOp::NotEq => (true, |ordering| ordering != Equal),
-                    BinaryOp::Lt => (false, |ordering| ordering == Less), BinaryOp::LtEq => (false, |ordering| ordering != Greater),
-                    BinaryOp::Gt => (false, |ordering| ordering == Greater), BinaryOp::GtEq => (false, |ordering| ordering != Less),
-                    _ => return None,
-                };
-                let (left, right) = (Operand::of(left, schema, batch, parameters)?, Operand::of(right, schema, batch, parameters)?);
-                // An integer column against an integer constant compares the values in place.
-                match (&left, &right) {
-                    (Operand::Cells(Cells::Int(array)), Operand::Constant(Some(Cell::Int(constant)))) =>
-                        return Some((0..rows).map(|row| (!array.is_null(row)).then(|| accept(array.value(row).cmp(constant)))).collect()),
-                    (Operand::Constant(Some(Cell::Int(constant))), Operand::Cells(Cells::Int(array))) =>
-                        return Some((0..rows).map(|row| (!array.is_null(row)).then(|| accept(constant.cmp(&array.value(row))))).collect()),
-                    _ => {}
-                }
-                (0..rows).map(|row| match (left.get(row).ok()?, right.get(row).ok()?) {
-                    (Some(a), Some(b)) => order(a, b, equality_only).ok().map(|ordering| Some(accept(ordering))),
-                    _ => Some(None),
-                }).collect()
-            }
-            Expr::Call { name, args, .. } if name == "===" && args.len() == 2 => {
-                let (left, right) = (Operand::of(&args[0], schema, batch, parameters)?, Operand::of(&args[1], schema, batch, parameters)?);
-                (0..rows).map(|row| Some(Some(match (left.get(row).ok()?, right.get(row).ok()?) {
-                    (None, None) => true,
-                    (None, Some(_)) | (Some(_), None) => false,
-                    (Some(Cell::Int(a)), Some(Cell::Int(b))) => a == b,
-                    // Floats keep their category but compare by SQL equality, so NaN differs from itself.
-                    (Some(Cell::Float(a)), Some(Cell::Float(b))) => a == b,
-                    (Some(Cell::Int(_)), Some(Cell::Float(_))) | (Some(Cell::Float(_)), Some(Cell::Int(_))) => false,
-                    (Some(Cell::Text(a)), Some(Cell::Text(b))) => a == b,
-                    (Some(Cell::Bool(a)), Some(Cell::Bool(b))) => a == b,
-                    (Some(Cell::Uuid(a)), Some(Cell::Uuid(b))) => a == b,
-                    // Timestamps are equal only under the same zone label.
-                    (Some(Cell::Micros(a, zone)), Some(Cell::Micros(b, other))) => zone == other && a == b,
-                    _ => return None,
-                }))).collect()
-            }
-            Expr::Like { expr, pattern, escape, case_insensitive, negated } => {
-                let pattern = match pattern.as_ref() {
-                    Expr::Literal(Value::Utf8(pattern)) => pattern.as_str(),
-                    Expr::Parameter { index, .. } => match parameters.get(*index).ok()?? { Value::Utf8(pattern) => pattern.as_str(), _ => return None },
-                    _ => return None,
-                };
-                let like = rtdb_expr::kernels::LikeMatcher::compile(pattern, *escape, *case_insensitive, *negated)?;
-                let mut matches = like.matcher();
-                let operand = Operand::of(expr, schema, batch, parameters)?;
-                (0..rows).map(|row| match operand.get(row).ok()? {
-                    None => Some(None),
-                    Some(Cell::Text(text)) => Some(Some(matches(text))),
-                    Some(_) => None,
-                }).collect()
-            }
-            Expr::Literal(Value::Null) => Some(vec![None; rows]),
-            Expr::Literal(Value::Bool(value)) => Some(vec![Some(*value); rows]),
-            Expr::Between { operand, low, high, symmetric: false } => {
-                let (operand, low, high) = (Operand::of(operand, schema, batch, parameters)?, Operand::of(low, schema, batch, parameters)?, Operand::of(high, schema, batch, parameters)?);
-                (0..rows).map(|row| {
-                    let (value, low, high) = (operand.get(row).ok()?, low.get(row).ok()?, high.get(row).ok()?);
-                    let above = match (value, low) { (Some(value), Some(low)) => Some(order(value, low, false).ok()? != Less), _ => None };
-                    let below = match (value, high) { (Some(value), Some(high)) => Some(order(value, high, false).ok()? != Greater), _ => None };
-                    Some(match (above, below) { (Some(false), _) | (_, Some(false)) => Some(false), (Some(true), Some(true)) => Some(true), _ => None })
-                }).collect()
-            }
-            Expr::Case { .. } | Expr::Call { .. } if super::plain_scalar(&expr.data_type()) == Some(&ScalarType::Bool) => {
-                let operand = ComputedOperand::of(expr, schema, batch, parameters)?;
-                (0..rows).map(|row| match operand.get(row) { None => Some(None), Some(Cell::Bool(value)) => Some(Some(value)), Some(_) => None }).collect()
-            }
-            _ => None,
-        }
-    }
-
-    #[cfg(test)]
-    #[test]
-    fn a_parameter_not_yet_decoded_still_compares_in_the_kernel() {
-        use arrow_array::ArrayRef;
-        use rtdb_plan::{ColumnId, Field};
-        use rtdb_types::LogicalType;
-        use crate::columnar::{ArrowField, MemoryBudget};
-
-        struct Undecoded(Value);
-        impl rtdb_expr::ParameterLookup for Undecoded {
-            fn width(&self) -> usize { 1 }
-            fn value(&self, index: usize) -> rtdb_types::Result<Option<&Value>> { Ok((index == 0).then_some(&self.0)) }
-            fn known_value(&self, _: usize) -> Option<&Value> { None }
-            fn arrow_cell(&self, _: usize) -> Option<rtdb_expr::ArrowParameterCell<'_>> { None }
-        }
-        let memory = MemoryBudget::new(1 << 20);
-        let lookup = Undecoded(Value::I64(2));
-        let parameters = rtdb_expr::Parameters::Lookup(&lookup);
-        let logical = LogicalType::Scalar(ScalarType::I64);
-        let field = Field { id: ColumnId(0), name: "_id".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: logical.clone() };
-        let schema = Schema::new(vec![field.clone()]).unwrap();
-        let array: ArrayRef = Arc::new(Int64Array::from(vec![1, 2]));
-        let column = Column::Arrow { field: Arc::new(ArrowField::new("_id", array.data_type().clone(), false)), array, logical: Some(logical) };
-        let batch = ColumnBatch::settled(vec![column], 2, memory.reserve(0).unwrap()).unwrap();
-        let parameter = Expr::Parameter { index: 0, data_type: LogicalType::Scalar(ScalarType::I64).maybe() };
-        let predicate = Expr::binary(BinaryOp::Eq, field.expression(), parameter);
-        assert_eq!(truth(&predicate, &schema, &batch, parameters), Some(vec![Some(false), Some(true)]));
-    }
-
-    #[cfg(test)]
-    #[test]
-    fn computed_operands_hold_admission_for_their_arrays() {
-        use arrow_array::ArrayRef;
-        use rtdb_plan::{ColumnId, Field};
-        use rtdb_types::LogicalType;
-        use crate::columnar::{ArrowField, MemoryBudget};
-
-        let memory = MemoryBudget::new(1 << 20);
-        let parameters = rtdb_expr::Parameters::Values(&[]);
-        let cases: [(ScalarType, ArrayRef, Value); 2] = [
-            (ScalarType::I64, Arc::new(Int64Array::from(vec![Some(2), None])), Value::I64(3)),
-            (ScalarType::I32, Arc::new(Int32Array::from(vec![Some(2), None])), Value::I32(3)),
-        ];
-        for (scalar, array, offset) in cases {
-            let logical = LogicalType::Scalar(scalar.clone()).maybe();
-            let field = Field { id: ColumnId(0), name: "value".into(), qualifier: None, qualified_only: false,
-                unnamed: false, data_type: logical.clone() };
-            let schema = Schema::new(vec![field.clone()]).unwrap();
-            let column = Column::Arrow { field: Arc::new(ArrowField::new("value", array.data_type().clone(), true)),
-                array, logical: Some(logical) };
-            let batch = ColumnBatch::settled(vec![column], 2, memory.reserve(0).unwrap()).unwrap();
-            let expr = Expr::binary(BinaryOp::Add, field.expression(), Expr::Literal(offset));
-            let baseline = memory.used_bytes();
-            let computed = ComputedOperand::of(&expr, &schema, &batch, parameters).unwrap();
-            assert!(matches!((&computed.cells, scalar),
-                (ComputedCells::Int64(_), ScalarType::I64) | (ComputedCells::Int32(_), ScalarType::I32)));
-            assert!(memory.used_bytes() > baseline);
-            assert!(computed.get(0) == Some(Cell::Int(5)));
-            assert!(computed.get(1).is_none());
-            drop(computed);
-            assert_eq!(memory.used_bytes(), baseline);
-
-            let predicate = Expr::binary(BinaryOp::Gt, expr.clone(), Expr::Literal(Value::I64(4)));
-            assert_eq!(truth(&predicate, &schema, &batch, parameters), Some(vec![Some(true), None]));
-            assert_eq!(memory.used_bytes(), baseline);
-            let full = memory.reserve(memory.limit_bytes() - baseline).unwrap();
-            assert!(ComputedOperand::of(&expr, &schema, &batch, parameters).is_none());
-            drop(full);
-            assert_eq!(memory.used_bytes(), baseline);
-        }
     }
 }
 
@@ -4758,28 +4305,36 @@ mod tests {
     }
 
     #[test]
-    fn the_projection_kernel_agrees_with_the_evaluator_on_every_batch_it_computes() {
+    fn the_arithmetic_kernels_agree_with_the_evaluator_on_every_batch_they_compute() {
         let memory = MemoryBudget::new(1 << 28);
         let schema = Schema::new(vec![field(0, ScalarType::I64), field(1, ScalarType::F64), field(2, ScalarType::Utf8), field(3, ScalarType::Bool), field(4, ScalarType::I64)]).unwrap();
         let mut random = Random(0x2545f4914f6cdd1d);
-        let mut computed = 0;
-        for _ in 0..400 {
+        let (mut computed, mut raised) = (0, 0);
+        for _ in 0..600 {
             let batch = batch(&mut random, 64, &memory);
-            let expression = if random.below(3) == 0 {
-                Expr::Struct(vec![("a".into(), arithmetic(&mut random, &schema, 2)), ("t".into(), schema.fields()[2].expression()), ("b".into(), arithmetic(&mut random, &schema, 2))])
-            } else { arithmetic(&mut random, &schema, 3) };
-            let Some(column) = projection::column(&expression, &schema, &batch, rtdb_expr::Parameters::Values(&[])).unwrap() else { continue };
-            computed += 1;
+            let expression = arithmetic(&mut random, &schema, 3);
             let scope = rtdb_expr::EvaluationScope::new(&memory).unwrap();
             let context = rtdb_expr::EvalContext { parameters: rtdb_expr::Parameters::Values(&[]), parameter_types: None, current_time: rtdb_types::Instant::from(Timestamp(0)), timezone: "UTC",
                 outer_rows: &[], snapshot_token: None, allocation: Some(&scope), catalog: None };
-            for row in 0..batch.len {
-                let values: Vec<Value> = batch.columns.iter().map(|column| column.value(row).unwrap()).collect();
-                let expected = rtdb_expr::evaluate_projection(&expression, &schema, &values, &context).unwrap();
+            let rows: Vec<Vec<Value>> = (0..batch.len).map(|row| batch.columns.iter().map(|column| column.value(row).unwrap()).collect()).collect();
+            let column = match functions::column(&expression, &schema, &batch, rtdb_expr::Parameters::Values(&[]), &memory) {
+                Ok(Some(column)) => column,
+                Ok(None) => continue,
+                Err(error) => {
+                    // An overflowing cell raises the evaluator's error for it rather than leaving the batch to it.
+                    let failed = rows.iter().any(|values| rtdb_expr::evaluate_projection(&expression, &schema, values, &context).is_err_and(|failure| failure.code == error.code));
+                    assert!(failed, "{expression:?}: the kernel raised {error:?} where the evaluator doesn't");
+                    raised += 1;
+                    continue;
+                }
+            };
+            computed += 1;
+            for (row, values) in rows.iter().enumerate() {
+                let expected = rtdb_expr::evaluate_projection(&expression, &schema, values, &context).unwrap();
                 assert_eq!(column.value(row).unwrap(), expected, "{expression:?} on {values:?}");
             }
         }
-        assert!(computed > 150, "the kernel should compute most generated projections, computed {computed}");
+        assert!(computed > 60 && raised > 0, "the kernels should compute many generated sums: computed {computed}, raised {raised}");
     }
 
     fn float_cell(random: &mut Random) -> f64 {
@@ -4796,7 +4351,7 @@ mod tests {
         let column = Expr::Column { id: rtdb_plan::ColumnId(1), data_type: LogicalType::Scalar(ScalarType::F64) };
         for (op, literal, expected) in [(Lt, Value::F64(0.0), [true, false]), (Lt, Value::I64(0), [true, false]), (GtEq, Value::F64(0.0), [false, true]), (Eq, Value::F64(0.0), [true, true])] {
             let predicate = Expr::binary(op, column.clone(), Expr::Literal(literal));
-            assert_eq!(kernel::truth(&predicate, &schema, &batch, rtdb_expr::Parameters::Values(&[])), Some(expected.map(Some).to_vec()), "{predicate:?}");
+            assert_eq!(functions::truth(&predicate, &schema, &batch, rtdb_expr::Parameters::Values(&[])).unwrap(), Some(expected.map(Some).to_vec()), "{predicate:?}");
         }
     }
 
@@ -4828,7 +4383,7 @@ mod tests {
                 3 => Expr::binary(BinaryOp::And, Expr::binary(BinaryOp::GtEq, column(&mut random), constant(&mut random)), Expr::binary(BinaryOp::Lt, column(&mut random), constant(&mut random))),
                 _ => Expr::Call { name: "===".into(), args: vec![column(&mut random), constant(&mut random)], return_type: LogicalType::Scalar(ScalarType::Bool) },
             };
-            let truth = kernel::truth(&predicate, &schema, &batch, rtdb_expr::Parameters::Values(&parameters)).unwrap_or_else(|| panic!("the kernel evaluates {predicate:?}"));
+            let truth = functions::truth(&predicate, &schema, &batch, rtdb_expr::Parameters::Values(&parameters)).unwrap().unwrap_or_else(|| panic!("the kernel evaluates {predicate:?}"));
             let scope = rtdb_expr::EvaluationScope::new(&memory).unwrap();
             let context = rtdb_expr::EvalContext { parameters: rtdb_expr::Parameters::Values(&parameters), parameter_types: None, current_time: rtdb_types::Instant::from(Timestamp(0)), timezone: "UTC",
                 outer_rows: &[], snapshot_token: None, allocation: Some(&scope), catalog: None };
@@ -4849,7 +4404,7 @@ mod tests {
         for _ in 0..400 {
             let batch = batch(&mut random, 64, &memory);
             let predicate = predicate(&mut random, &schema, 3);
-            let Some(truth) = kernel::truth(&predicate, &schema, &batch, rtdb_expr::Parameters::Values(&[])) else { continue };
+            let Some(truth) = functions::truth(&predicate, &schema, &batch, rtdb_expr::Parameters::Values(&[])).unwrap() else { continue };
             evaluated += 1;
             let scope = rtdb_expr::EvaluationScope::new(&memory).unwrap();
             let context = rtdb_expr::EvalContext { parameters: rtdb_expr::Parameters::Values(&[]), parameter_types: None, current_time: rtdb_types::Instant::from(Timestamp(0)), timezone: "UTC",
@@ -4983,7 +4538,7 @@ mod tests {
                 let rows: Vec<Vec<Value>> = (0..batch.len).map(|row| batch.columns.iter().map(|column| column.value(row).unwrap()).collect()).collect();
                 if round % 2 == 0 {
                     let predicate = predicate(&mut random, &schema);
-                    let Some(truth) = kernel::truth(&predicate, &schema, &batch, rtdb_expr::Parameters::Values(&[])) else { continue };
+                    let Some(truth) = functions::truth(&predicate, &schema, &batch, rtdb_expr::Parameters::Values(&[])).unwrap() else { continue };
                     predicates += 1;
                     for (values, expected) in rows.iter().zip(truth) {
                         let actual = match rtdb_expr::evaluate(&predicate, &schema, values, &context) {
@@ -4995,8 +4550,12 @@ mod tests {
                 } else {
                     let expression = projection(&mut random, &schema);
                     assert!(projection::shaped(&expression), "{expression:?}");
-                    if projection::bound(&expression, &schema, &batch).unwrap().is_none() { continue; }
-                    let Some(column) = projection::column(&expression, &schema, &batch, rtdb_expr::Parameters::Values(&[])).unwrap() else { continue };
+                    // As `BatchExpressions` tries them: the copying projections, then the native evaluator.
+                    let column = match projection::bound(&expression, &schema, &batch).unwrap() {
+                        Some(_) => projection::column(&expression, &schema, &batch, rtdb_expr::Parameters::Values(&[])).unwrap(),
+                        None => functions::column(&expression, &schema, &batch, rtdb_expr::Parameters::Values(&[]), &memory).unwrap(),
+                    };
+                    let Some(column) = column else { continue };
                     projections += 1;
                     let cells: Vec<Value> = (0..batch.len).map(|row| column.value(row).unwrap()).collect();
                     for (values, actual) in rows.iter().zip(&cells) {
@@ -5263,7 +4822,7 @@ impl BatchCursor for BatchExpressions {
             }
             if batch.len != 0
                 && matches!(plain_scalar(&expression.data_type()), Some(rtdb_types::ScalarType::Bool))
-                && let Some(truth) = kernel::truth(kernel, &self.schema, &batch, parameters)
+                && let Some(truth) = functions::truth(kernel, &self.schema, &batch, parameters)?
             {
                 let admission = self.admissions.as_ref().map(|admissions| &admissions[index]);
                 if !admission.is_some_and(crate::compiled::Admission::admitted) {
@@ -5292,7 +4851,7 @@ impl BatchCursor for BatchExpressions {
             let metadata = self.execution.scope()?;
             let invocation = self.execution.prepare_expression(expression, &self.schema, &metadata)?;
             if let Some(projection) = self.functions.as_ref().and_then(|items| items[index].as_ref())
-                && let Some(column) = projection.column(&self.schema, &batch, parameters, memory)? {
+                && let Some(column) = projection.column(&batch, parameters, memory)? {
                 let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("column-size", "A column page's charge is shared"))?;
                 lease.grow_to(lease.bytes().checked_add(column.retained_bytes()?).ok_or_else(size_error)?)?;
                 columns.push(column);
@@ -5693,151 +5252,19 @@ fn scalar_result_type<'a>(values: impl Iterator<Item = &'a Value>) -> Option<Log
 /// including any integer overflow, so its error is raised.
 pub(crate) mod projection {
     use std::sync::Arc;
-    use arrow_array::{Array, ArrayRef, Float64Array, Int64Array, ListArray, StructArray, cast::AsArray, make_array, types::{Float64Type, Int64Type}};
+    use arrow_array::{Array, ArrayRef, ListArray, StructArray, make_array};
     use arrow_buffer::{NullBuffer, OffsetBuffer};
     use arrow_schema::{DataType, Field as ArrowField};
-    use rtdb_plan::{BinaryOp, CastTarget, Expr, Schema};
-    use rtdb_types::{LogicalType, Result, ScalarType, StructFields, Value};
+    use rtdb_plan::{CastTarget, Expr, Schema};
+    use rtdb_types::{LogicalType, Result, StructFields, Value};
     use super::{Column, ColumnBatch, MemoryBudget, MemoryReservation};
 
-    #[derive(Clone, Copy)]
-    enum Number { Int(i64), Float(f64) }
-    enum Numbers<'a> {
-        Int(&'a Int64Array),
-        Float(&'a Float64Array),
-        Selected(&'a Column, bool),
-        Constant(Option<Number>),
-    }
-    impl Numbers<'_> {
-        fn get(&self, row: usize) -> Option<Number> {
-            match self {
-                Self::Int(array) => array.is_valid(row).then(|| Number::Int(array.value(row))),
-                Self::Float(array) => array.is_valid(row).then(|| Number::Float(array.value(row))),
-                Self::Selected(column, floating) => {
-                    let (array, _, _, offset) = column.arrow_cell(row)??;
-                    if array.data_type() == &DataType::Null || array.is_null(offset) { return None; }
-                    Some(if *floating {
-                        Number::Float(array.as_primitive::<Float64Type>().value(offset))
-                    } else {
-                        Number::Int(array.as_primitive::<Int64Type>().value(offset))
-                    })
-                }
-                Self::Constant(number) => *number,
-            }
-        }
-        fn floating(&self) -> Option<bool> { match self { Self::Int(_) => Some(false), Self::Float(_) => Some(true), Self::Selected(_, floating) => Some(*floating), Self::Constant(Some(Number::Float(_))) => Some(true), Self::Constant(Some(Number::Int(_))) => Some(false), Self::Constant(None) => None } }
-    }
-    fn constant(value: &Value) -> Option<Option<Number>> {
-        match value {
-            Value::Null => Some(None),
-            Value::I8(value) => Some(Some(Number::Int(i64::from(*value)))), Value::I16(value) => Some(Some(Number::Int(i64::from(*value)))),
-            Value::I32(value) => Some(Some(Number::Int(i64::from(*value)))), Value::I64(value) => Some(Some(Number::Int(*value))),
-            Value::F64(value) => Some(Some(Number::Float(*value))),
-            _ => None,
-        }
-    }
-    #[derive(Clone, Copy)]
-    enum Parameters<'a> { Values(rtdb_expr::Parameters<'a>), Columns(&'a [Column]) }
-
-    fn numbers<'a>(expr: &Expr, schema: &Schema, columns: &'a [Column], len: usize, computed: &'a mut Option<Column>, parameters: Parameters<'a>) -> Result<Option<Numbers<'a>>> {
-        let plain = |logical: Option<&LogicalType>, field: &ArrowField, expected: ScalarType| match logical { Some(logical) => super::plain_scalar(logical) == Some(&expected), None => field.metadata().is_empty() };
-        let array_numbers = |column: &'a Column| -> Option<Numbers<'a>> {
-            match column {
-                Column::Arrow { array, field, logical } => match array.data_type() {
-                    DataType::Int64 if plain(logical.as_ref(), field, ScalarType::I64) => array.as_any().downcast_ref().map(Numbers::Int),
-                    DataType::Float64 if plain(logical.as_ref(), field, ScalarType::F64) => array.as_any().downcast_ref().map(Numbers::Float),
-                    _ => None,
-                },
-                Column::Selected(selected) => {
-                    let mut floating = None;
-                    for (array, field, logical) in selected.source_layouts() {
-                        let is_float = match array.data_type() {
-                            DataType::Null if field.is_nullable() && logical.is_none_or(|ty| *ty == LogicalType::Null) => continue,
-                            DataType::Int64 if plain(logical, field, ScalarType::I64) => false,
-                            DataType::Float64 if plain(logical, field, ScalarType::F64) => true,
-                            _ => return None,
-                        };
-                        if floating.is_some_and(|known| known != is_float) { return None; }
-                        floating = Some(is_float);
-                    }
-                    floating.map(|floating| Numbers::Selected(column, floating))
-                }
-                Column::Values(_) => None,
-            }
-        };
-        Ok(match expr {
-            Expr::Column { id, .. } => schema.position(*id).and_then(|position| array_numbers(&columns[position])),
-            Expr::Literal(value) => constant(value).map(Numbers::Constant),
-            Expr::Parameter { index, .. } => match parameters {
-                Parameters::Values(values) => values.known(*index).and_then(constant).map(Numbers::Constant),
-                Parameters::Columns(columns) => columns.get(*index).and_then(array_numbers),
-            },
-            Expr::Binary { .. } => {
-                *computed = arithmetic(expr, schema, columns, len, parameters)?;
-                computed.as_ref().and_then(array_numbers)
-            }
-            _ => None,
-        })
-    }
-    fn arithmetic(expr: &Expr, schema: &Schema, columns: &[Column], len: usize, parameters: Parameters<'_>) -> Result<Option<Column>> {
-        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || arithmetic_at(expr, schema, columns, len, parameters))
-    }
-
-    pub(super) fn arithmetic_bound(expr: &Expr, len: usize) -> Option<usize> {
-        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
-            let Expr::Binary { op: BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply, left, right } = expr else { return Some(0); };
-            let bytes = len.checked_mul(32)?.checked_add(512)?;
-            bytes.checked_add(arithmetic_bound(left, len)?)?.checked_add(arithmetic_bound(right, len)?)
-        })
-    }
-
-    fn arithmetic_at(expr: &Expr, schema: &Schema, columns: &[Column], len: usize, parameters: Parameters<'_>) -> Result<Option<Column>> {
-        let Expr::Binary { op: op @ (BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply), left, right } = expr else { return Ok(None) };
-        let (mut left_computed, mut right_computed) = (None, None);
-        let Some(left) = numbers(left, schema, columns, len, &mut left_computed, parameters)? else { return Ok(None) };
-        let Some(right) = numbers(right, schema, columns, len, &mut right_computed, parameters)? else { return Ok(None) };
-        if matches!(left, Numbers::Constant(_)) && matches!(right, Numbers::Constant(_)) { return Ok(None); }
-        let floating = match (left.floating(), right.floating()) { (Some(a), Some(b)) => a || b, (Some(a), None) | (None, Some(a)) => a, (None, None) => return Ok(None) };
-        let float = |number: Number| match number { Number::Int(value) => value as f64, Number::Float(value) => value };
-        let (array, scalar): (ArrayRef, ScalarType) = if floating {
-            let values: Float64Array = (0..len).map(|row| match (left.get(row), right.get(row)) {
-                (Some(a), Some(b)) => Some(match op { BinaryOp::Add => float(a) + float(b), BinaryOp::Subtract => float(a) - float(b), _ => float(a) * float(b) }),
-                _ => None,
-            }).collect();
-            (Arc::new(values), ScalarType::F64)
-        } else {
-            let mut values = Vec::with_capacity(len);
-            for row in 0..len {
-                values.push(match (left.get(row), right.get(row)) {
-                    (Some(Number::Int(a)), Some(Number::Int(b))) => match match op { BinaryOp::Add => a.checked_add(b), BinaryOp::Subtract => a.checked_sub(b), _ => a.checked_mul(b) } {
-                        Some(value) => Some(value),
-                        None => return Ok(None),
-                    },
-                    _ => None,
-                });
-            }
-            (Arc::new(Int64Array::from(values)), ScalarType::I64)
-        };
-        if matches!(left, Numbers::Selected(..)) || matches!(right, Numbers::Selected(..)) {
-            let (array, logical) = if array.null_count() == len {
-                (Arc::new(arrow_array::NullArray::new(len)) as ArrayRef, LogicalType::Null)
-            } else {
-                let logical = LogicalType::Scalar(scalar);
-                let logical = if array.null_count() == 0 { logical } else { logical.maybe() };
-                (array, logical)
-            };
-            let field = Arc::new(rtdb_columnar::to_field("value", &logical)?);
-            return Ok(Some(Column::Arrow { array, field, logical: Some(logical) }));
-        }
-        let field = Arc::new(ArrowField::new("value", array.data_type().clone(), true));
-        Ok(Some(Column::Arrow { array, field, logical: Some(LogicalType::Scalar(scalar)) }))
-    }
-
-    pub(crate) fn bound_column(expr: &Expr, schema: &Schema, columns: &[Column], parameters: &[Column]) -> Result<Option<Column>> {
+    /// A bare column or parameter of a projection over one bound row, shared rather than computed.
+    pub(crate) fn bound_column(expr: &Expr, schema: &Schema, columns: &[Column], parameters: &[Column]) -> Option<Column> {
         match expr {
-            Expr::Column { id, .. } => Ok(schema.position(*id).map(|position| columns[position].duplicate())),
-            Expr::Parameter { index, .. } => Ok(parameters.get(*index).map(Column::duplicate)),
-            _ => arithmetic(expr, schema, columns, 1, Parameters::Columns(parameters)),
+            Expr::Column { id, .. } => schema.position(*id).map(|position| columns[position].duplicate()),
+            Expr::Parameter { index, .. } => parameters.get(*index).map(Column::duplicate),
+            _ => None,
         }
     }
 
@@ -5846,7 +5273,8 @@ pub(crate) mod projection {
         match expr {
             Expr::Column { .. } | Expr::Parameter { .. } | Expr::RowCopy(_) => true,
             Expr::Literal(value) => literal(value),
-            Expr::Binary { op: BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply, left, right } => shaped(left) && shaped(right),
+            // Sums and products the native evaluator computes where their operands' layouts allow.
+            Expr::Binary { op: rtdb_plan::BinaryOp::Add | rtdb_plan::BinaryOp::Subtract | rtdb_plan::BinaryOp::Multiply, left, right } => shaped(left) && shaped(right),
             Expr::Struct(fields) => fields.iter().all(|(_, field)| shaped(field)),
             Expr::Field { expr, .. } => matches!(expr.as_ref(), Expr::Column { .. }),
             Expr::Coalesce(args) => args.iter().all(shaped),
@@ -5858,7 +5286,9 @@ pub(crate) mod projection {
             expr => super::functions::lowerable(expr),
         }
     }
-    fn literal(value: &Value) -> bool { constant(value).is_some() || matches!(value, Value::Utf8(_) | Value::Bool(_) | Value::Timestamp { .. }) }
+    fn literal(value: &Value) -> bool {
+        matches!(value, Value::Null | Value::I8(_) | Value::I16(_) | Value::I32(_) | Value::I64(_) | Value::F64(_) | Value::Utf8(_) | Value::Bool(_) | Value::Timestamp { .. })
+    }
     /// The query clock, which `BatchExpressions` reads once and hands the kernels as a literal.
     pub(crate) fn clock(name: &str, args: &[Expr]) -> bool { args.is_empty() && matches!(name, "current_timestamp" | "current-timestamp" | "now") }
 
@@ -5934,11 +5364,6 @@ pub(crate) mod projection {
             Expr::Column { id, .. } => match schema.position(*id) { Some(position) => batch.columns[position].retained_bytes()?, None => return Ok(None) },
             Expr::Literal(value) if literal(value) => super::repeated_cell_bound(value, rows)?,
             Expr::Parameter { .. } => 0,
-            // The checked path builds `Option<i64>` cells before the array, and each operand may be computed too.
-            Expr::Binary { op: BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply, left, right } => {
-                let (Some(left), Some(right)) = (bound(left, schema, batch)?, bound(right, schema, batch)?) else { return Ok(None) };
-                per_row(32)?.checked_add(left).and_then(|bytes| bytes.checked_add(right)).ok_or_else(super::size_error)?
-            }
             Expr::List(items) => {
                 let Some((arrays, logical)) = list_columns(items, schema, batch) else { return Ok(None); };
                 let bytes = arrays.iter().try_fold(4096usize, |bytes, array| {
@@ -6029,7 +5454,6 @@ pub(crate) mod projection {
                 }))
             }
             Expr::Literal(value) if literal(value) => super::repeat_cell(value, batch.len).map(Some),
-            Expr::Binary { .. } => arithmetic(expr, schema, &batch.columns, batch.len, Parameters::Values(parameters)),
             Expr::List(items) => {
                 let Some((arrays, logical)) = list_columns(items, schema, batch) else { return Ok(None); };
                 let child = Arc::new(rtdb_columnar::to_field("item", &logical)?);

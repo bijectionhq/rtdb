@@ -1,9 +1,11 @@
 //! Column-at-a-time evaluation of scalar expressions over plain scalar cells: calls, arithmetic, negation, numeric
-//! casts and searched CASE through `rtdb_expr::kernels`, which share the scalar functions' per-value code, and
-//! predicates through the predicate kernel.
-//! A failing cell raises the row evaluator's error for that cell. Each CASE branch is computed only over the rows that
-//! take it, so a cell fails only where the row evaluator would evaluate it.
-//! `Ok(None)` leaves a batch to the row evaluator where a layout, a cell type or a result is outside these vectors.
+//! casts, searched CASE and predicates (comparisons, `===`, LIKE, BETWEEN, IS NULL, NOT, AND and OR), the scalar
+//! functions through `rtdb_expr::kernels`, which share their per-value code.
+//! A failing cell raises the row evaluator's error for that cell. Each CASE branch and each condition after the first
+//! is computed only over the rows that reach it, and the right side of AND and OR only over the rows the left side
+//! leaves open, so a cell fails only where the row evaluator would evaluate it.
+//! `Ok(None)` leaves a batch to the row evaluator where a layout, a cell type or a result is outside these vectors;
+//! every error is raised.
 //! Every vector built along the way is charged to the query's memory budget while it lives.
 
 use std::sync::Arc;
@@ -11,11 +13,14 @@ use std::sync::Arc;
 use arrow_array::{Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, NullArray, StringArray, TimestampMicrosecondArray, new_null_array};
 use arrow_schema::{DataType, Field as ArrowField, TimeUnit as ArrowUnit};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_expr::kernels::{self, Function, Selection};
+use rtdb_expr::kernels::{self, Function, LikeMatcher, Selection};
 use rtdb_plan::{BinaryOp, CastTarget, Expr, Schema, UnaryOp};
 use rtdb_types::{LogicalType, Result, ScalarType, TimeUnit, Value};
 
 use super::{Column, ColumnBatch, SelectedColumn, plain_scalar};
+
+mod predicate;
+use predicate::{Cell, Cells, Operand};
 
 /// A batch-length column of one plain scalar type, or of nulls only.
 #[derive(Clone)]
@@ -95,8 +100,7 @@ impl Charged {
     }
 }
 
-/// The scalar a stored layout's cells read as, `None` within `Some` for a layout of nulls only, as the predicate
-/// kernel's cell reader takes it.
+/// The scalar a stored layout's cells read as, `None` within `Some` for a layout of nulls only.
 fn layout(array: &dyn Array, field: &ArrowField, logical: Option<&LogicalType>) -> Option<Option<ScalarType>> {
     let plain = |data_type: &DataType| -> Option<ScalarType> {
         let scalar = match data_type {
@@ -161,7 +165,7 @@ fn read_selected(selected: &SelectedColumn, expected: &ScalarType, memory: &Arc<
         .chain(std::iter::once(nulls.as_ref())).collect();
     let _cells = memory.reserve(cell_bytes(selected.cells.len())?)?;
     let cells: Vec<(usize, usize)> = selected.cells.iter().map(|(source, row)| if readable[source] { (source, row) } else { (null, 0) }).collect();
-    let Ok(gathered) = super::interleave(&arrays, &cells) else { return Ok(None) };
+    let gathered = super::interleave(&arrays, &cells)?;
     Vector::of(gathered.as_ref(), expected).map(|vector| Charged::built(vector, memory)).transpose()
 }
 
@@ -227,23 +231,40 @@ enum Kind {
     Negate(Box<Node>),
     /// A CAST to the node's declared scalar.
     Cast(Box<Node>),
-    /// A predicate, whose truths the predicate kernel computes.
-    Truth(Expr),
-    /// The values of the branches, then the otherwise value.
-    Case { conditions: Vec<Expr>, values: Vec<Node> },
+    Not(Box<Node>),
+    /// `=`, `<>`, `<`, `<=`, `>` or `>=`.
+    Compare { op: BinaryOp, left: Box<Node>, right: Box<Node> },
+    /// `===`, which reads both sides at every row and holds of two nulls.
+    Identical { left: Box<Node>, right: Box<Node> },
+    /// IS NULL or IS UNKNOWN, or IS NOT NULL where `negated`.
+    IsNull { operand: Box<Node>, negated: bool },
+    /// LIKE over a literal or bound pattern.
+    Like { input: Box<Node>, pattern: Box<Node>, escape: Option<char>, case_insensitive: bool, negated: bool },
+    /// BETWEEN, not symmetric.
+    Between { operand: Box<Node>, low: Box<Node>, high: Box<Node> },
+    /// AND, or OR where not `and`.
+    Logical { and: bool, left: Box<Node>, right: Box<Node> },
+    /// The conditions of the branches; the values of the branches, then the otherwise value.
+    Case { conditions: Vec<Node>, values: Vec<Node> },
 }
 
 impl Kind {
     /// The arguments of a strict node, which is null wherever one of them is, in the order the row evaluator prepares
-    /// them; `None` for a leaf, a predicate or a CASE.
+    /// them; `None` for a leaf, a CASE or a predicate answered as truths.
     fn arguments(&self) -> Option<Vec<&Node>> {
         Some(match self {
-            Self::Column(_) | Self::Literal(_) | Self::Parameter(_) | Self::Truth(_) | Self::Case { .. } => return None,
+            Self::Column(_) | Self::Literal(_) | Self::Parameter(_) | Self::Case { .. } | Self::Compare { .. } | Self::Identical { .. }
+                | Self::IsNull { .. } | Self::Like { .. } | Self::Between { .. } | Self::Logical { .. } => return None,
             Self::Extract { source: argument, .. } | Self::Round { value: argument, .. } | Self::Abs(argument) | Self::TextCase { text: argument, .. }
-                | Self::Length(argument) | Self::Double(_, argument) | Self::Negate(argument) | Self::Cast(argument) => vec![argument.as_ref()],
+                | Self::Length(argument) | Self::Double(_, argument) | Self::Negate(argument) | Self::Cast(argument) | Self::Not(argument) => vec![argument.as_ref()],
             Self::Substring { text, position, length } => [Some(text), Some(position), length.as_ref()].into_iter().flatten().map(|argument| argument.as_ref()).collect(),
             Self::Arithmetic { left, right, .. } => vec![left.as_ref(), right.as_ref()],
         })
+    }
+
+    /// Whether this is a predicate answered as truths rather than through its strict arguments.
+    fn answers_truths(&self) -> bool {
+        matches!(self, Self::Compare { .. } | Self::Identical { .. } | Self::IsNull { .. } | Self::Like { .. } | Self::Between { .. } | Self::Logical { .. })
     }
 }
 
@@ -256,8 +277,8 @@ impl Projection {
 
     /// The column over `batch`, typed as the evaluator's packed results are, or `Ok(None)` where the evaluator must
     /// compute it.
-    pub(crate) fn column(&self, schema: &Schema, batch: &ColumnBatch, parameters: rtdb_expr::Parameters<'_>, memory: &Arc<MemoryBudget>) -> Result<Option<Column>> {
-        self.evaluated(&Evaluation { schema, columns: &batch.columns, len: batch.len, batch: Some(batch), parameters: Parameters::Values(parameters), memory })
+    pub(crate) fn column(&self, batch: &ColumnBatch, parameters: rtdb_expr::Parameters<'_>, memory: &Arc<MemoryBudget>) -> Result<Option<Column>> {
+        self.evaluated(&Evaluation { columns: &batch.columns, len: batch.len, parameters: Parameters::Values(parameters), memory })
     }
 
     fn evaluated(&self, evaluation: &Evaluation<'_>) -> Result<Option<Column>> {
@@ -280,9 +301,22 @@ impl Projection {
 /// The column of `expr` over `batch`, `Ok(None)` where the row evaluator computes it.
 pub(crate) fn column(expr: &Expr, schema: &Schema, batch: &ColumnBatch, parameters: rtdb_expr::Parameters<'_>, memory: &Arc<MemoryBudget>) -> Result<Option<Column>> {
     match Projection::bind(expr, schema) {
-        Some(projection) => projection.column(schema, batch, parameters, memory),
+        Some(projection) => projection.column(batch, parameters, memory),
         None => Ok(None),
     }
+}
+
+/// Each row's three-valued truth under `predicate` over `batch`, keeping unknown (null) apart from false, or
+/// `Ok(None)` where the row evaluator computes it. The vectors built along the way are charged to the batch's budget.
+pub(crate) fn truth(predicate: &Expr, schema: &Schema, batch: &ColumnBatch, parameters: rtdb_expr::Parameters<'_>) -> Result<Option<Vec<Option<bool>>>> {
+    let Some(node) = Node::bind(predicate, schema).filter(Node::truth) else { return Ok(None) };
+    let evaluation = Evaluation { columns: &batch.columns, len: batch.len, parameters: Parameters::Values(parameters), memory: batch.reservation.budget() };
+    let Some(charged) = evaluation.vector(&node, None)? else { return Ok(None) };
+    Ok(match &charged.vector {
+        Vector::Null => Some(vec![None; batch.len]),
+        Vector::Bool(values) => Some(values.iter().collect()),
+        _ => None,
+    })
 }
 
 /// The one-row column of `expr` over `columns`, reading its parameters from the one-row `arguments`, charged to
@@ -290,7 +324,7 @@ pub(crate) fn column(expr: &Expr, schema: &Schema, batch: &ColumnBatch, paramete
 pub(crate) fn bound_column(expr: &Expr, schema: &Schema, columns: &[Column], arguments: &[Column], memory: &Arc<MemoryBudget>) -> Result<Option<Column>> {
     if !bound_lowerable(expr) { return Ok(None); }
     let Some(projection) = Projection::bind(expr, schema) else { return Ok(None) };
-    let evaluation = Evaluation { schema, columns, len: 1, batch: None, parameters: Parameters::Columns(arguments), memory };
+    let evaluation = Evaluation { columns, len: 1, parameters: Parameters::Columns(arguments), memory };
     let Some(Column::Arrow { array, field, logical }) = projection.evaluated(&evaluation)? else { return Ok(None) };
     // A null result keeps the expression's declared type, as the query's result schema gives it.
     let (array, field, logical) = match (&logical, plain_scalar(&expr.data_type())) {
@@ -309,6 +343,7 @@ pub(crate) fn bound_column(expr: &Expr, schema: &Schema, columns: &[Column], arg
 /// Whether a leaf of this declared type can be read as a vector.
 fn plain_leaf(logical: &LogicalType) -> bool {
     match logical {
+        LogicalType::Null => true,
         LogicalType::Maybe(inner) => plain_leaf(inner),
         LogicalType::Scalar(scalar) => matches!(scalar, ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64
             | ScalarType::F32 | ScalarType::F64 | ScalarType::Utf8 | ScalarType::Bool),
@@ -317,32 +352,33 @@ fn plain_leaf(logical: &LogicalType) -> bool {
 }
 
 /// Whether the shape of `expr` could be computed here; its inputs' layouts decide per batch.
-pub(crate) fn lowerable(expr: &Expr) -> bool { lowerable_at(expr, None) }
+pub(crate) fn lowerable(expr: &Expr) -> bool { lowerable_at(expr, false) }
 
-/// As `lowerable`, for an expression over parameters bound one row at a time, to a bounded depth.
-pub(crate) fn bound_lowerable(expr: &Expr) -> bool { lowerable_at(expr, Some(32)) }
+/// As `lowerable`, for an expression over parameters bound one row at a time.
+pub(crate) fn bound_lowerable(expr: &Expr) -> bool { lowerable_at(expr, true) }
 
-fn lowerable_at(expr: &Expr, remaining: Option<usize>) -> bool {
-    if remaining == Some(0) { return false; }
-    let lower = |expr: &Expr| lowerable_at(expr, remaining.map(|depth| depth - 1));
-    match expr {
-        Expr::Parameter { .. } if remaining.is_some() => true,
-        Expr::Column { .. } | Expr::Parameter { .. } | Expr::Literal(_) => plain_leaf(&expr.data_type()),
-        Expr::Binary { op: BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide | BinaryOp::Modulo | BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq
-            | BinaryOp::Gt | BinaryOp::GtEq | BinaryOp::And | BinaryOp::Or, left, right } => lower(left) && lower(right),
-        Expr::Unary { op: UnaryOp::Not | UnaryOp::IsNull | UnaryOp::IsNotNull | UnaryOp::Negate, expr } => lower(expr),
-        Expr::Cast { expr, target: CastTarget::Fixed(_) } => lower(expr),
-        Expr::Case { branches, otherwise } => branches.iter().all(|(condition, value)| lower(condition) && lower(value)) && lower(otherwise),
-        Expr::Call { name, args, .. } => match (Function::resolve(name), args.as_slice()) {
-            (Some(Function::Upper | Function::Lower), [arg]) if remaining.is_some() => {
-                matches!(arg, Expr::Column { .. } | Expr::Parameter { .. } | Expr::Literal(_)) && lower(arg)
-            }
-            (Some(Function::Upper | Function::Lower | Function::Length | Function::Abs), [arg]) => lower(arg),
-            (Some(Function::Mod), [left, right]) => lower(left) && lower(right),
+fn lowerable_at(expr: &Expr, bound: bool) -> bool {
+    stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
+        let lower = |expr: &Expr| lowerable_at(expr, bound);
+        match expr {
+            Expr::Parameter { .. } if bound => true,
+            Expr::Column { .. } | Expr::Parameter { .. } | Expr::Literal(_) => plain_leaf(&expr.data_type()),
+            Expr::Binary { op: BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide | BinaryOp::Modulo | BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq
+                | BinaryOp::Gt | BinaryOp::GtEq | BinaryOp::And | BinaryOp::Or, left, right } => lower(left) && lower(right),
+            Expr::Unary { op: UnaryOp::Not | UnaryOp::IsNull | UnaryOp::IsNotNull | UnaryOp::Negate, expr } => lower(expr),
+            Expr::Cast { expr, target: CastTarget::Fixed(_) } => lower(expr),
+            Expr::Case { branches, otherwise } => branches.iter().all(|(condition, value)| lower(condition) && lower(value)) && lower(otherwise),
+            Expr::Call { name, args, .. } => match (Function::resolve(name), args.as_slice()) {
+                (Some(Function::Upper | Function::Lower), [arg]) if bound => {
+                    matches!(arg, Expr::Column { .. } | Expr::Parameter { .. } | Expr::Literal(_)) && lower(arg)
+                }
+                (Some(Function::Upper | Function::Lower | Function::Length | Function::Abs), [arg]) => lower(arg),
+                (Some(Function::Mod), [left, right]) => lower(left) && lower(right),
+                _ => false,
+            },
             _ => false,
-        },
-        _ => false,
-    }
+        }
+    })
 }
 
 impl Node {
@@ -356,7 +392,10 @@ impl Node {
             Expr::Column { id, .. } => Kind::Column(schema.position(*id)?),
             Expr::Literal(value) => Kind::Literal(value.clone()),
             Expr::Parameter { index, .. } => Kind::Parameter(*index),
-            Expr::Call { name, args, .. } if name == "===" && args.len() == 2 => Kind::Truth(expr.clone()),
+            Expr::Call { name, args, .. } if name == "===" => match args.as_slice() {
+                [left, right] => Kind::Identical { left: child(left)?, right: child(right)? },
+                _ => return None,
+            },
             Expr::Call { name, args, .. } => match (Function::resolve(name)?, args.as_slice()) {
                 (Function::Extract, [Expr::Literal(Value::Utf8(field)), source]) => Kind::Extract { field: field.clone(), source: child(source)? },
                 (Function::Round, [value]) => Kind::Round { value: child(value)?, scale: None },
@@ -374,17 +413,74 @@ impl Node {
             },
             Expr::Binary { op: op @ (BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide | BinaryOp::Modulo), left, right } =>
                 Kind::Arithmetic { op: *op, left: child(left)?, right: child(right)? },
+            Expr::Binary { op: op @ (BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq), left, right } =>
+                Kind::Compare { op: *op, left: child(left)?, right: child(right)? },
+            Expr::Binary { op: op @ (BinaryOp::And | BinaryOp::Or), left, right } =>
+                Kind::Logical { and: *op == BinaryOp::And, left: child(left)?.filter_truth()?, right: child(right)?.filter_truth()? },
             Expr::Unary { op: UnaryOp::Negate, expr: operand } => Kind::Negate(child(operand)?),
+            Expr::Unary { op: UnaryOp::Not, expr: operand } => Kind::Not(child(operand)?),
+            Expr::Unary { op: op @ (UnaryOp::IsNull | UnaryOp::IsUnknown | UnaryOp::IsNotNull), expr: operand } =>
+                Kind::IsNull { operand: child(operand)?, negated: *op == UnaryOp::IsNotNull },
+            Expr::Like { expr: input, pattern, escape, case_insensitive, negated }
+                if matches!(pattern.as_ref(), Expr::Literal(Value::Utf8(_) | Value::Null) | Expr::Parameter { .. }) =>
+                Kind::Like { input: child(input)?, pattern: child(pattern)?, escape: *escape, case_insensitive: *case_insensitive, negated: *negated },
+            Expr::Between { operand, low, high, symmetric: false } => Kind::Between { operand: child(operand)?, low: child(low)?, high: child(high)? },
             Expr::Cast { expr: operand, target: CastTarget::Fixed(_) } => Kind::Cast(child(operand)?),
             Expr::Case { branches, otherwise } => Kind::Case {
-                conditions: branches.iter().map(|(condition, _)| condition.clone()).collect(),
+                conditions: branches.iter().map(|(condition, _)| Self::bind(condition, schema).filter(Self::truth)).collect::<Option<_>>()?,
                 values: branches.iter().map(|(_, value)| value).chain(std::iter::once(otherwise.as_ref()))
                     .map(|value| Self::bind(value, schema)).collect::<Option<_>>()?,
             },
-            expr if plain_scalar(&expr.data_type()) == Some(&ScalarType::Bool) => Kind::Truth(expr.clone()),
             _ => return None,
         };
         Some(Self { kind, declared: expr.data_type() })
+    }
+
+    /// Whether this node yields truths: it is typed boolean or null.
+    fn truth(&self) -> bool { self.declared == LogicalType::Null || plain_scalar(&self.declared) == Some(&ScalarType::Bool) }
+
+    fn filter_truth(self: Box<Self>) -> Option<Box<Self>> { self.truth().then_some(self) }
+
+    fn leaf(&self) -> bool { matches!(self.kind, Kind::Column(_) | Kind::Literal(_) | Kind::Parameter(_)) }
+
+    /// Whether preparing this node, of a single type other than null, as the row evaluator does before demanding its
+    /// payload raises nothing: whatever preparing it demands (the conditions of a CASE, the operand of BETWEEN, a
+    /// predicate that may be null, an argument of several legs) can't fail.
+    fn settles(&self) -> bool {
+        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || match &self.kind {
+            Kind::Column(_) | Kind::Literal(_) | Kind::Parameter(_) => true,
+            Kind::Compare { left, right, .. } | Kind::Identical { left, right } => left.prepares() && right.prepares(),
+            Kind::Like { input, pattern, .. } => input.prepares() && pattern.prepares(),
+            Kind::IsNull { operand, .. } => operand.prepares(),
+            // AND and OR answer as they are prepared where they may be null, and are deferred where they can't be.
+            Kind::Logical { .. } => !self.declared.nullable() || self.infallible(),
+            Kind::Between { operand, .. } => operand.infallible() && (!self.declared.nullable() || self.infallible()),
+            Kind::Case { conditions, values } => conditions.iter().all(Self::infallible) && values.iter().all(Self::settles),
+            kind => kind.arguments().is_some_and(|arguments| arguments.into_iter().all(Self::prepares)),
+        })
+    }
+
+    /// Whether preparing this node as an argument raises nothing: one of several legs, or typed null, is demanded as it
+    /// is prepared; one of a single other type is only prepared.
+    fn prepares(&self) -> bool {
+        if self.declared != LogicalType::Null && self.declared.legs().len() < 2 { self.settles() } else { self.infallible() }
+    }
+
+    /// Whether computing this node over any rows raises nothing.
+    fn infallible(&self) -> bool {
+        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || match &self.kind {
+            Kind::Column(_) | Kind::Literal(_) | Kind::Parameter(_) => true,
+            Kind::Not(operand) | Kind::IsNull { operand, .. } => operand.infallible(),
+            Kind::Compare { left, right, .. } | Kind::Identical { left, right } | Kind::Logical { left, right, .. } => left.infallible() && right.infallible(),
+            Kind::Between { operand, low, high } => operand.infallible() && low.infallible() && high.infallible(),
+            Kind::Like { input, pattern, escape, case_insensitive, negated } => input.infallible() && match &pattern.kind {
+                Kind::Literal(Value::Utf8(pattern)) => LikeMatcher::compile(pattern, *escape, *case_insensitive, *negated).is_ok(),
+                Kind::Literal(Value::Null) => true,
+                _ => false,
+            },
+            Kind::Case { conditions, values } => conditions.iter().chain(values).all(Self::infallible),
+            _ => false,
+        })
     }
 }
 
@@ -393,18 +489,62 @@ impl Node {
 enum Parameters<'a> { Values(rtdb_expr::Parameters<'a>), Columns(&'a [Column]) }
 
 struct Evaluation<'a> {
-    schema: &'a Schema,
     columns: &'a [Column],
     len: usize,
-    /// The batch the predicate kernel reads, `None` for parameters bound one row at a time.
-    batch: Option<&'a ColumnBatch>,
     parameters: Parameters<'a>,
     memory: &'a Arc<MemoryBudget>,
 }
 
 /// A strict node's arguments once prepared: null at every row, or computed with the rows none is null at, `None` for
 /// every row.
-enum Prepared { Null, Live { rows: Option<Vec<bool>>, arguments: Vec<Charged> } }
+enum Prepared<T> { Null, Live { rows: Option<Vec<bool>>, arguments: Vec<T> } }
+
+/// Where a prepared argument is null.
+enum Validity { Valid, Null, Rows(Vec<bool>) }
+
+/// A computed argument whose nulls its preparation reads.
+trait Argument {
+    /// Where the argument is valid among `rows`, `None` where a cell there is outside these vectors.
+    fn validity(&self, rows: Selection<'_>, len: usize) -> Option<Validity>;
+}
+
+impl Argument for Charged {
+    fn validity(&self, _: Selection<'_>, len: usize) -> Option<Validity> {
+        Some(match self.vector.array() {
+            None => Validity::Null,
+            Some(array) if array.null_count() == 0 => Validity::Valid,
+            Some(array) => Validity::Rows((0..len).map(|row| array.is_valid(row)).collect()),
+        })
+    }
+}
+
+impl Argument for Operand<'_> {
+    fn validity(&self, rows: Selection<'_>, len: usize) -> Option<Validity> {
+        match self {
+            Self::Computed(charged) => charged.validity(rows, len),
+            Self::Constant(None) | Self::Cells(Cells::Null) => Some(Validity::Null),
+            Self::Constant(Some(_)) => Some(Validity::Valid),
+            Self::Cells(_) | Self::Values { .. } => {
+                let mut valid = Vec::with_capacity(len);
+                for row in 0..len { valid.push(reads(rows, row) && self.get(row).ok()?.is_some()); }
+                Some(Validity::Rows(valid))
+            }
+        }
+    }
+}
+
+/// A predicate's answers: null at every row, as where a strict argument is, or a truth for each row.
+enum Truths { Null, Rows(Vec<Option<bool>>) }
+
+fn reads(rows: Selection<'_>, row: usize) -> bool { rows.is_none_or(|rows| rows[row]) }
+
+/// Whether a vector holds truths.
+fn holds_truths(vector: &Vector) -> bool { matches!(vector, Vector::Null | Vector::Bool(_)) }
+
+/// The truth a vector of truths holds at `row`.
+fn truth_at(vector: &Vector, row: usize) -> Option<bool> {
+    match vector { Vector::Bool(values) => values.is_valid(row).then(|| values.value(row)), _ => None }
+}
 
 /// Integers of the type `result`, held as 64-bit integers, as a vector of that type.
 fn narrowed(values: Int64Array, result: &ScalarType) -> Vector {
@@ -426,14 +566,20 @@ impl Evaluation<'_> {
         vector.map(|vector| Charged::built(vector, self.memory)).transpose()
     }
 
+    /// The charge for one truth per row while a predicate's answers are gathered.
+    fn truth_scratch(&self) -> Result<Arc<MemoryReservation>> {
+        self.memory.reserve(self.len.checked_mul(size_of::<Option<bool>>()).ok_or_else(super::size_error)?)
+    }
+
     fn vector_at(&self, node: &Node, selection: Selection<'_>) -> Result<Option<Charged>> {
+        if node.kind.answers_truths() { return self.predicate(node, selection); }
         let len = self.len;
         let null = || -> Result<Option<Charged>> { Ok(Some(Charged::shared(Vector::Null))) };
         // A strict node's arguments are prepared, in order, before any payload is read.
         let live;
         let (selection, arguments) = match node.kind.arguments() {
             None => (selection, Vec::new()),
-            Some(arguments) => match self.prepared(&arguments, selection)? {
+            Some(arguments) => match self.prepared(&arguments, selection, |argument, rows| self.vector(argument, rows))? {
                 None => return Ok(None),
                 Some(Prepared::Null) => return null(),
                 Some(Prepared::Live { rows, arguments }) => {
@@ -448,7 +594,8 @@ impl Evaluation<'_> {
             Kind::Column(position) => read(&self.columns[*position], &node.declared, len, self.memory)?,
             Kind::Literal(value) => self.built(constant(value, len))?,
             Kind::Parameter(index) => match self.parameters {
-                Parameters::Values(parameters) => match parameters.known(*index) {
+                // An Arrow-bound parameter is decoded on its first read, which `known` alone would leave undone.
+                Parameters::Values(parameters) => match parameters.get(*index)? {
                     Some(value) => self.built(constant(value, len))?,
                     None => None,
                 },
@@ -567,17 +714,17 @@ impl Evaluation<'_> {
                     }
                 }
             }
-            Kind::Truth(predicate) => {
-                // The predicate kernel raises nothing, so its truths can be computed for every row.
-                let truth = match (self.batch, self.parameters) {
-                    (Some(batch), Parameters::Values(parameters)) => super::kernel::truth(predicate, self.schema, batch, parameters),
-                    (None, Parameters::Columns(arguments)) => self.bound_truth(predicate, arguments)?,
+            Kind::Not(_) => {
+                let operand = argument();
+                match &operand.vector {
+                    Vector::Null => return null(),
+                    Vector::Bool(values) => self.built(Some(Vector::Bool(values.iter().map(|value| value.map(|value| !value)).collect())))?,
                     _ => None,
-                };
-                let Some(truth) = truth else { return Ok(None) };
-                self.built(Some(Vector::Bool(BooleanArray::from(truth))))?
+                }
             }
             Kind::Case { conditions, values } => self.case(conditions, values, selection)?,
+            Kind::Compare { .. } | Kind::Identical { .. } | Kind::IsNull { .. } | Kind::Like { .. } | Kind::Between { .. } | Kind::Logical { .. } =>
+                unreachable!("predicates are answered as truths"),
         };
         let Some(charged) = charged else { return Ok(None) };
         // Each node yields its declared type, as the evaluator's cells do.
@@ -593,28 +740,33 @@ impl Evaluation<'_> {
     /// its own arguments are prepared; one of a type with several legs, a nullable one among them, is demanded as it
     /// is prepared, and is null where its value is; one of a single other type is typed so at every row, and its
     /// payload is computed once all are prepared, over only the rows none is null at, where it would be demanded.
-    /// Where an argument is null at every row, the single-typed ones before it are left unread but for what preparing
-    /// them demands.
-    fn prepared(&self, arguments: &[&Node], selection: Selection<'_>) -> Result<Option<Prepared>> {
+    /// Where an argument is null at every row, the single-typed ones before it are left unread, which is only taken
+    /// here where preparing them raises nothing.
+    fn prepared<'n, T: Argument>(&self, arguments: &[&'n Node], selection: Selection<'_>,
+        compute: impl Fn(&'n Node, Selection<'_>) -> Result<Option<T>>) -> Result<Option<Prepared<T>>> {
         let len = self.len;
         let mut rows: Option<Vec<bool>> = selection.map(<[bool]>::to_vec);
-        let mut computed: Vec<Option<Charged>> = Vec::with_capacity(arguments.len());
-        let null = |computed: &[Option<Charged>]| -> Option<Prepared> {
+        let mut computed: Vec<Option<T>> = Vec::with_capacity(arguments.len());
+        let null = |computed: &[Option<T>]| -> Option<Prepared<T>> {
             let deferred = arguments.iter().zip(computed).filter(|(_, value)| value.is_none());
-            deferred.into_iter().all(|(argument, _)| self.settles(argument)).then_some(Prepared::Null)
+            deferred.into_iter().all(|(argument, _)| argument.settles()).then_some(Prepared::Null)
         };
         for argument in arguments {
             if argument.declared == LogicalType::Null {
-                if null(&computed).is_none() || self.vector(argument, rows.as_deref())?.is_none() { return Ok(None); }
+                if null(&computed).is_none() || compute(*argument, rows.as_deref())?.is_none() { return Ok(None); }
                 return Ok(Some(Prepared::Null));
             }
             if argument.declared.legs().len() < 2 { computed.push(None); continue; }
-            let Some(value) = self.vector(argument, rows.as_deref())? else { return Ok(None) };
-            let Some(array) = value.vector.array() else { return Ok(null(&computed)) };
-            if array.null_count() != 0 {
-                let live: Vec<bool> = (0..len).map(|row| array.is_valid(row) && rows.as_ref().is_none_or(|rows| rows[row])).collect();
-                if !live.contains(&true) { return Ok(null(&computed)); }
-                rows = Some(live);
+            let Some(value) = compute(*argument, rows.as_deref())? else { return Ok(None) };
+            match value.validity(rows.as_deref(), len) {
+                None => return Ok(None),
+                Some(Validity::Null) => return Ok(null(&computed)),
+                Some(Validity::Valid) => {}
+                Some(Validity::Rows(valid)) => {
+                    let live: Vec<bool> = (0..len).map(|row| valid[row] && reads(rows.as_deref(), row)).collect();
+                    if !live.contains(&true) { return Ok(null(&computed)); }
+                    rows = Some(live);
+                }
             }
             computed.push(Some(value));
         }
@@ -622,61 +774,235 @@ impl Evaluation<'_> {
         for (argument, value) in arguments.iter().zip(computed) {
             let value = match value {
                 Some(value) => value,
-                None => match self.vector(argument, rows.as_deref())? { Some(value) => value, None => return Ok(None) },
+                None => match compute(*argument, rows.as_deref())? { Some(value) => value, None => return Ok(None) },
             };
             prepared.push(value);
         }
         Ok(Some(Prepared::Live { rows, arguments: prepared }))
     }
 
-    /// Whether preparing `node`, of a single type other than null, demands only what the predicate kernel computes
-    /// without raising: the conditions of each CASE and the operands of each predicate in it.
-    fn settles(&self, node: &Node) -> bool {
-        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || match &node.kind {
-            Kind::Column(_) | Kind::Literal(_) | Kind::Parameter(_) => true,
-            Kind::Truth(predicate) => match (self.batch, self.parameters) {
-                (Some(batch), Parameters::Values(parameters)) => super::kernel::truth(predicate, self.schema, batch, parameters).is_some(),
-                _ => false,
+    /// The cells of a predicate's operand over `rows`: read in place from a column, a bound parameter or a literal, or
+    /// computed.
+    fn operand<'s>(&'s self, node: &'s Node, rows: Selection<'_>) -> Result<Option<Operand<'s>>> {
+        Ok(match &node.kind {
+            Kind::Column(position) => self.cells(&self.columns[*position], rows)?,
+            Kind::Literal(value) => predicate::scalar(value).ok().map(Operand::Constant),
+            Kind::Parameter(index) => match self.parameters {
+                // An Arrow-bound parameter is decoded on its first read, which `known` alone would leave undone.
+                Parameters::Values(parameters) => match parameters.get(*index)? {
+                    Some(value) => predicate::scalar(value).ok().map(Operand::Constant),
+                    None => None,
+                },
+                Parameters::Columns(arguments) => match arguments.get(*index) {
+                    Some(argument) => self.cells(argument, rows)?,
+                    None => None,
+                },
             },
-            Kind::Case { conditions, values } => matches!(self.branches(conditions), Ok(Some(_))) && values.iter().all(|value| self.settles(value)),
-            kind => kind.arguments().is_some_and(|arguments| arguments.into_iter().all(|argument| self.settles(argument))),
+            _ => self.vector(node, rows)?.map(Operand::Computed),
         })
     }
 
-    /// For each row, the branch it takes and the row: the first branch whose condition holds, else the otherwise
-    /// value at `conditions.len()`; `Ok(None)` where the predicate kernel leaves a condition to the row evaluator.
-    fn branches(&self, conditions: &[Expr]) -> Result<Option<Vec<(usize, usize)>>> {
-        let (Some(batch), Parameters::Values(parameters)) = (self.batch, self.parameters) else { return Ok(None) };
-        let len = self.len;
-        let truth_bytes = conditions.len().checked_mul(len).and_then(|cells| cells.checked_mul(size_of::<Option<bool>>())).ok_or_else(super::size_error)?;
-        let _truths = self.memory.reserve(truth_bytes)?;
-        let mut truths = Vec::with_capacity(conditions.len());
-        for condition in conditions {
-            let Some(truth) = super::kernel::truth(condition, self.schema, batch, parameters) else { return Ok(None) };
-            truths.push(truth);
+    /// A column's cells, read in place where a reader takes its layout, else read once into values over `rows`.
+    fn cells<'s>(&'s self, column: &'s Column, rows: Selection<'_>) -> Result<Option<Operand<'s>>> {
+        if let Some(cells) = Cells::of(column) { return Ok(Some(Operand::Cells(cells))); }
+        match column {
+            Column::Selected(_) => return Ok(None),
+            Column::Arrow { array, .. } if !predicate::readable_values(array.data_type()) => return Ok(None),
+            _ => {}
         }
-        Ok(Some((0..len).map(|row| (truths.iter().position(|truth| truth[row] == Some(true)).unwrap_or(conditions.len()), row)).collect()))
-    }
-
-    /// The predicate kernel's truths of `predicate` over one row bound with the query: the parameters it reads are
-    /// that row's values, charged while they are read.
-    fn bound_truth(&self, predicate: &Expr, arguments: &[Column]) -> Result<Option<Vec<Option<bool>>>> {
-        let mut read = vec![false; arguments.len()];
-        let mut missing = false;
-        predicate.visit(&mut |expr| if let Expr::Parameter { index, .. } = expr {
-            match read.get_mut(*index) { Some(read) => *read = true, None => missing = true }
-        });
-        if missing { return Ok(None); }
-        let mut values = Vec::with_capacity(arguments.len());
-        let mut bytes = arguments.len().checked_mul(size_of::<Value>()).ok_or_else(super::size_error)?;
-        for (argument, read) in arguments.iter().zip(read) {
-            let value = if read { argument.value(0)? } else { Value::Null };
-            bytes = bytes.checked_add(value.retained_bytes()?).ok_or_else(super::size_error)?;
+        let mut charge = self.memory.reserve(self.len.checked_mul(size_of::<Value>()).ok_or_else(super::size_error)?)?;
+        let lease = Arc::get_mut(&mut charge).expect("a new reservation is unshared");
+        let mut values = Vec::with_capacity(self.len);
+        for row in 0..self.len {
+            let value = if reads(rows, row) { column.value(row)? } else { Value::Null };
+            lease.grow_to(lease.bytes().checked_add(value.retained_bytes()?).ok_or_else(super::size_error)?)?;
             values.push(value);
         }
-        let _values = self.memory.reserve(bytes)?;
-        let batch = ColumnBatch::settled(self.columns.iter().map(Column::duplicate).collect(), self.len, self.memory.reserve(0)?)?;
-        Ok(super::kernel::truth(predicate, self.schema, &batch, rtdb_expr::Parameters::Values(&values)))
+        Ok(Some(Operand::Values { values, _charge: charge }))
+    }
+
+    /// A predicate's truths over the rows `selection` picks, as a vector of truths of its declared type.
+    fn predicate(&self, node: &Node, selection: Selection<'_>) -> Result<Option<Charged>> {
+        let truths = match &node.kind {
+            Kind::Compare { op, left, right } => self.compare(*op, left, right, selection)?,
+            Kind::Identical { left, right } => self.identical(left, right, selection)?,
+            Kind::IsNull { operand, negated } => self.is_null(operand, *negated, selection)?,
+            Kind::Like { input, pattern, escape, case_insensitive, negated } => self.like(input, pattern, (*escape, *case_insensitive, *negated), selection)?,
+            Kind::Between { operand, low, high } => self.between(operand, low, high, selection)?,
+            Kind::Logical { and, left, right } => self.logical(*and, left, right, selection)?,
+            _ => unreachable!("only predicates are answered as truths"),
+        };
+        match truths {
+            None => Ok(None),
+            Some(Truths::Null) => Ok(Some(Charged::shared(Vector::Null))),
+            Some(Truths::Rows(truths)) if plain_scalar(&node.declared) == Some(&ScalarType::Bool) =>
+                Charged::built(Vector::Bool(BooleanArray::from(truths)), self.memory).map(Some),
+            // A predicate typed null answers null at every row.
+            Some(Truths::Rows(truths)) => Ok((node.declared.nullable() && truths.iter().all(Option::is_none)).then(|| Charged::shared(Vector::Null))),
+        }
+    }
+
+    /// A comparison, strict in both operands.
+    fn compare(&self, op: BinaryOp, left: &Node, right: &Node, selection: Selection<'_>) -> Result<Option<Truths>> {
+        use std::cmp::Ordering::{self, Equal, Greater, Less};
+        let (equality_only, accept): (bool, fn(Ordering) -> bool) = match op {
+            BinaryOp::Eq => (true, |ordering| ordering == Equal), BinaryOp::NotEq => (true, |ordering| ordering != Equal),
+            BinaryOp::Lt => (false, |ordering| ordering == Less), BinaryOp::LtEq => (false, |ordering| ordering != Greater),
+            BinaryOp::Gt => (false, |ordering| ordering == Greater), BinaryOp::GtEq => (false, |ordering| ordering != Less),
+            _ => return Ok(None),
+        };
+        let Some(prepared) = self.prepared(&[left, right], selection, |operand, rows| self.operand(operand, rows))? else { return Ok(None) };
+        let Prepared::Live { rows, arguments } = prepared else { return Ok(Some(Truths::Null)) };
+        let [left, right] = arguments.as_slice() else { unreachable!("a comparison has two operands") };
+        let live = |row: usize| reads(rows.as_deref(), row);
+        let len = self.len;
+        let _scratch = self.truth_scratch()?;
+        // An integer column against an integer constant compares the values in place.
+        match (left, right) {
+            (Operand::Cells(Cells::Int(array)), Operand::Constant(Some(Cell::Int(constant)))) =>
+                return Ok(Some(Truths::Rows((0..len).map(|row| (live(row) && array.is_valid(row)).then(|| accept(array.value(row).cmp(constant)))).collect()))),
+            (Operand::Constant(Some(Cell::Int(constant))), Operand::Cells(Cells::Int(array))) =>
+                return Ok(Some(Truths::Rows((0..len).map(|row| (live(row) && array.is_valid(row)).then(|| accept(constant.cmp(&array.value(row))))).collect()))),
+            _ => {}
+        }
+        let mut truths = Vec::with_capacity(len);
+        for row in 0..len {
+            if !live(row) { truths.push(None); continue; }
+            let (Ok(a), Ok(b)) = (left.get(row), right.get(row)) else { return Ok(None) };
+            truths.push(match (a, b) {
+                // An ordering with NaN on either side is false, as the scalar comparison answers.
+                (Some(a), Some(b)) if !equality_only && (a.is_nan() || b.is_nan()) => Some(false),
+                (Some(a), Some(b)) => match predicate::order(a, b, equality_only) { Ok(ordering) => Some(accept(ordering)), Err(()) => return Ok(None) },
+                _ => None,
+            });
+        }
+        Ok(Some(Truths::Rows(truths)))
+    }
+
+    /// `left === right`, both read at every row.
+    fn identical(&self, left: &Node, right: &Node, selection: Selection<'_>) -> Result<Option<Truths>> {
+        let Some(left) = self.operand(left, selection)? else { return Ok(None) };
+        let Some(right) = self.operand(right, selection)? else { return Ok(None) };
+        let _scratch = self.truth_scratch()?;
+        let mut truths = Vec::with_capacity(self.len);
+        for row in 0..self.len {
+            if !reads(selection, row) { truths.push(None); continue; }
+            let (Ok(a), Ok(b)) = (left.get(row), right.get(row)) else { return Ok(None) };
+            let Ok(same) = predicate::identical(a, b) else { return Ok(None) };
+            truths.push(Some(same));
+        }
+        Ok(Some(Truths::Rows(truths)))
+    }
+
+    /// IS NULL, or IS NOT NULL where `negated`.
+    fn is_null(&self, operand: &Node, negated: bool, selection: Selection<'_>) -> Result<Option<Truths>> {
+        let len = self.len;
+        let answer = |null: bool| Some(null != negated);
+        // A computed operand of a single type other than null is never null, and the row evaluator only prepares it.
+        let computed = !operand.leaf() && !matches!(operand.kind, Kind::Case { .. });
+        if computed && operand.declared != LogicalType::Null && operand.declared.legs().len() < 2 {
+            return Ok(operand.settles().then(|| Truths::Rows((0..len).map(|row| if reads(selection, row) { answer(false) } else { None }).collect())));
+        }
+        if let Kind::Column(position) = &operand.kind && let Column::Selected(column) = &self.columns[*position] {
+            return Ok(column.null_test(!negated).map(Truths::Rows));
+        }
+        let Some(value) = self.operand(operand, selection)? else { return Ok(None) };
+        let _scratch = self.truth_scratch()?;
+        let mut truths = Vec::with_capacity(len);
+        for row in 0..len {
+            if !reads(selection, row) { truths.push(None); continue; }
+            let Ok(cell) = value.get(row) else { return Ok(None) };
+            truths.push(answer(cell.is_none()));
+        }
+        Ok(Some(Truths::Rows(truths)))
+    }
+
+    /// LIKE, strict in its input and pattern; an invalid pattern raises the scalar LIKE's error where both are present.
+    fn like(&self, input: &Node, pattern: &Node, (escape, case_insensitive, negated): (Option<char>, bool, bool), selection: Selection<'_>) -> Result<Option<Truths>> {
+        let Some(prepared) = self.prepared(&[input, pattern], selection, |operand, rows| self.operand(operand, rows))? else { return Ok(None) };
+        let Prepared::Live { rows, arguments } = prepared else { return Ok(Some(Truths::Null)) };
+        let [input, pattern] = arguments.as_slice() else { unreachable!("LIKE has an input and a pattern") };
+        let pattern = match pattern {
+            Operand::Constant(Some(Cell::Text(pattern))) => *pattern,
+            // A pattern bound one row at a time is that row's.
+            pattern if self.len == 1 => match pattern.get(0) { Ok(Some(Cell::Text(pattern))) => pattern, _ => return Ok(None) },
+            _ => return Ok(None),
+        };
+        let like = LikeMatcher::compile(pattern, escape, case_insensitive, negated)?;
+        let mut matches = like.matcher();
+        let _scratch = self.truth_scratch()?;
+        let mut truths = Vec::with_capacity(self.len);
+        for row in 0..self.len {
+            if !reads(rows.as_deref(), row) { truths.push(None); continue; }
+            truths.push(match input.get(row) {
+                Ok(None) => None,
+                Ok(Some(Cell::Text(text))) => Some(matches(text)),
+                _ => return Ok(None),
+            });
+        }
+        Ok(Some(Truths::Rows(truths)))
+    }
+
+    /// `operand BETWEEN low AND high`: the operand is demanded first, the low bound only where it is present, and the
+    /// high bound only where the low one doesn't already answer false.
+    fn between(&self, operand: &Node, low: &Node, high: &Node, selection: Selection<'_>) -> Result<Option<Truths>> {
+        use std::cmp::Ordering::{Greater, Less};
+        let len = self.len;
+        let Some(value) = self.operand(operand, selection)? else { return Ok(None) };
+        let mut present = vec![false; len];
+        for (row, present) in present.iter_mut().enumerate() {
+            if !reads(selection, row) { continue; }
+            let Ok(cell) = value.get(row) else { return Ok(None) };
+            *present = cell.is_some();
+        }
+        let _scratch = self.truth_scratch()?;
+        let Some(lower) = self.bound(&value, low, &present, |ordering| ordering != Less)? else { return Ok(None) };
+        let open: Vec<bool> = (0..len).map(|row| present[row] && lower[row] != Some(false)).collect();
+        let Some(upper) = self.bound(&value, high, &open, |ordering| ordering != Greater)? else { return Ok(None) };
+        Ok(Some(Truths::Rows((0..len).map(|row| {
+            if !present[row] { return None; }
+            match (lower[row], upper[row]) { (Some(false), _) | (_, Some(false)) => Some(false), (Some(true), Some(true)) => Some(true), _ => None }
+        }).collect())))
+    }
+
+    /// One bound of BETWEEN against `value` over `rows`: whether each row's value lies on its side, null where the
+    /// bound is.
+    fn bound(&self, value: &Operand<'_>, bound: &Node, rows: &[bool], accept: fn(std::cmp::Ordering) -> bool) -> Result<Option<Vec<Option<bool>>>> {
+        let mut truths = vec![None; self.len];
+        if !rows.contains(&true) { return Ok(Some(truths)); }
+        let Some(bound) = self.operand(bound, Some(rows))? else { return Ok(None) };
+        for (row, truth) in truths.iter_mut().enumerate() {
+            if !rows[row] { continue; }
+            let (Ok(Some(a)), Ok(b)) = (value.get(row), bound.get(row)) else { return Ok(None) };
+            *truth = match b {
+                None => None,
+                Some(b) if a.is_nan() || b.is_nan() => Some(false),
+                Some(b) => match predicate::order(a, b, false) { Ok(ordering) => Some(accept(ordering)), Err(()) => return Ok(None) },
+            };
+        }
+        Ok(Some(truths))
+    }
+
+    /// AND, or OR where not `and`: the right side is computed only over the rows the left side leaves open.
+    fn logical(&self, and: bool, left: &Node, right: &Node, selection: Selection<'_>) -> Result<Option<Truths>> {
+        let len = self.len;
+        // The answer either side alone decides: false for AND, true for OR.
+        let decided = !and;
+        let Some(left) = self.vector(left, selection)? else { return Ok(None) };
+        if !holds_truths(&left.vector) { return Ok(None); }
+        let open: Vec<bool> = (0..len).map(|row| reads(selection, row) && truth_at(&left.vector, row) != Some(decided)).collect();
+        let right = match self.vector(right, Some(open.as_slice()))? {
+            Some(right) if holds_truths(&right.vector) => right,
+            _ => return Ok(None),
+        };
+        let _scratch = self.truth_scratch()?;
+        Ok(Some(Truths::Rows((0..len).map(|row| {
+            if !reads(selection, row) { return None; }
+            let left = truth_at(&left.vector, row);
+            if left == Some(decided) { return Some(decided); }
+            let right = truth_at(&right.vector, row);
+            if right == Some(decided) { Some(decided) } else if left.is_none() || right.is_none() { None } else { Some(!decided) }
+        }).collect())))
     }
 
     /// Integers widened as the scalar functions widen their integer arguments, with the charge for any copy.
@@ -704,15 +1030,28 @@ impl Evaluation<'_> {
         Ok(Some((array, Some(charge))))
     }
 
-    /// Each row takes the value of the first branch whose condition holds, as the evaluator's searched CASE does,
-    /// and each branch is computed over only the rows that take it.
-    fn case(&self, conditions: &[Expr], values: &[Node], selection: Selection<'_>) -> Result<Option<Charged>> {
+    /// Each row takes the value of the first branch whose condition holds, as the evaluator's searched CASE does: each
+    /// condition is computed over only the rows no earlier one holds at, and each branch over only the rows that take it.
+    fn case(&self, conditions: &[Node], values: &[Node], selection: Selection<'_>) -> Result<Option<Charged>> {
         let len = self.len;
         let _cells = self.memory.reserve(cell_bytes(len)?.checked_add(len).ok_or_else(super::size_error)?)?;
-        let Some(cells) = self.branches(conditions)? else { return Ok(None) };
+        let mut open: Vec<bool> = (0..len).map(|row| reads(selection, row)).collect();
+        let mut chosen = vec![conditions.len(); len];
+        for (branch, condition) in conditions.iter().enumerate() {
+            if !open.contains(&true) { break; }
+            let Some(truths) = self.vector(condition, Some(open.as_slice()))? else { return Ok(None) };
+            if !holds_truths(&truths.vector) { return Ok(None); }
+            for (row, open) in open.iter_mut().enumerate() {
+                if *open && truth_at(&truths.vector, row) == Some(true) {
+                    chosen[row] = branch;
+                    *open = false;
+                }
+            }
+        }
+        let cells: Vec<(usize, usize)> = chosen.iter().copied().zip(0..len).collect();
         let mut computed = Vec::with_capacity(values.len());
         for (branch, value) in values.iter().enumerate() {
-            let taken: Vec<bool> = cells.iter().map(|(chosen, row)| *chosen == branch && selection.is_none_or(|rows| rows[*row])).collect();
+            let taken: Vec<bool> = (0..len).map(|row| chosen[row] == branch && reads(selection, row)).collect();
             let Some(value) = self.vector(value, Some(taken.as_slice()))? else { return Ok(None) };
             computed.push(value);
         }
@@ -725,7 +1064,7 @@ impl Evaluation<'_> {
         let _nulls = self.memory.reserve(nulls.get_array_memory_size())?;
         let arrays = computed.iter().map(|value| value.vector.array()).collect::<Vec<_>>();
         let sources: Vec<&dyn Array> = arrays.iter().map(|array| array.as_deref().unwrap_or(nulls.as_ref())).collect();
-        let Ok(chosen) = super::interleave(&sources, &cells) else { return Ok(None) };
+        let chosen = super::interleave(&sources, &cells)?;
         self.built(Vector::of(chosen.as_ref(), &scalar))
     }
 }
@@ -856,10 +1195,17 @@ mod tests {
     }
 
     fn predicate(random: &mut Random) -> Expr {
-        match random.below(3) {
+        match random.below(8) {
             0 => column(4),
             1 => Expr::binary(BinaryOp::Eq, column(3), Expr::Literal(Value::Utf8(random.pick(&["closed", "ß", ""]).into()))),
-            _ => Expr::binary(BinaryOp::Gt, column(random.below(3) as u32), Expr::Literal(Value::I64(random.below(9) as i64 - 4))),
+            2 => Expr::binary(BinaryOp::Gt, column(random.below(3) as u32), Expr::Literal(Value::I64(random.below(9) as i64 - 4))),
+            3 => Expr::binary(random.pick(&[BinaryOp::And, BinaryOp::Or]), predicate(random), predicate(random)),
+            4 => Expr::Unary { op: random.pick(&[UnaryOp::Not, UnaryOp::IsNull, UnaryOp::IsNotNull]), expr: Box::new(predicate(random)) },
+            5 => Expr::Between { operand: Box::new(column(random.below(3) as u32)), low: Box::new(Expr::Literal(Value::I64(random.below(9) as i64 - 6))),
+                high: Box::new(Expr::Literal(Value::I64(random.below(9) as i64 - 2))), symmetric: false },
+            // Fails where c0 is zero or at the edge of its range, so only the rows AND, OR and CASE reach may compute it.
+            6 => Expr::binary(BinaryOp::Gt, Expr::binary(BinaryOp::Divide, Expr::Literal(Value::I64(8)), column(0)), Expr::Literal(Value::I64(1))),
+            _ => Expr::binary(BinaryOp::Lt, Expr::binary(BinaryOp::Add, column(0), Expr::Literal(Value::I64(1))), Expr::Literal(Value::I64(3))),
         }
     }
 
@@ -923,10 +1269,13 @@ mod tests {
                 let values: Vec<Value> = batch.columns.iter().map(|column| column.value(row).unwrap()).collect();
                 match rtdb_expr::evaluate(&expr, &schema, &values, &context).ok()? { Value::Null => Some(None), Value::Bool(value) => Some(Some(value)), _ => None }
             }).collect();
-            let actual = super::super::kernel::truth(&expr, &schema, &batch, rtdb_expr::Parameters::Values(&[]));
-            if let Some(actual) = actual {
-                computed += 1;
-                assert_eq!(expected, Some(actual), "{expr:?}");
+            match super::truth(&expr, &schema, &batch, rtdb_expr::Parameters::Values(&[])) {
+                Ok(Some(actual)) => {
+                    computed += 1;
+                    assert_eq!(expected, Some(actual), "{expr:?}");
+                }
+                Ok(None) => {}
+                Err(error) => assert!(expected.is_none(), "{expr:?}: the evaluator answers where the vectors raise {error:?}"),
             }
         }
         assert!(computed > 200, "computed {computed}");
@@ -962,14 +1311,14 @@ mod tests {
 
         let roomy = MemoryBudget::new(1 << 28);
         let ample = batch(&mut Random(7), rows, &roomy);
-        let computed = projection.column(&schema, &ample, rtdb_expr::Parameters::Values(&[]), &roomy).unwrap();
+        let computed = projection.column(&ample, rtdb_expr::Parameters::Values(&[]), &roomy).unwrap();
         assert!(computed.is_some(), "the kernel computes {expr:?}");
         assert!(roomy.peak_bytes() >= rows * text.len(), "peak {} bytes", roomy.peak_bytes());
 
         // The batch's own columns are charged to another budget, so only the kernel's vectors meet the limit.
         let tight = MemoryBudget::new(rows * text.len() / 2);
         let limited = batch(&mut Random(7), rows, &roomy);
-        let error = projection.column(&schema, &limited, rtdb_expr::Parameters::Values(&[]), &tight).err().expect("the literal's copies exceed the budget");
+        let error = projection.column(&limited, rtdb_expr::Parameters::Values(&[]), &tight).err().expect("the literal's copies exceed the budget");
         assert_eq!(error.code, "rtdb/memory-budget-exceeded");
     }
 
@@ -1023,5 +1372,108 @@ mod tests {
         let guarded = Expr::Case { branches: vec![(Expr::binary(BinaryOp::NotEq, column(0), Expr::Literal(Value::I64(0))), divided)], otherwise: Box::new(Expr::Literal(Value::I64(7))) };
         let Some(Column::Arrow { array, .. }) = project(&guarded, &schema, &batch, &memory).unwrap() else { panic!("the guarded division is a kernel") };
         assert_eq!(array.as_any().downcast_ref::<Int64Array>().unwrap().iter().collect::<Vec<_>>(), [Some(0), Some(2), Some(7)]);
+    }
+
+    /// The predicate's truths over `batch`, as the row evaluator gives them.
+    fn evaluated_truths(expr: &Expr, schema: &Schema, batch: &ColumnBatch) -> rtdb_types::Result<Vec<Option<bool>>> {
+        let context = rtdb_expr::EvalContext::default();
+        (0..batch.len).map(|row| {
+            let values: Vec<Value> = batch.columns.iter().map(|column| column.value(row).unwrap()).collect();
+            Ok(match rtdb_expr::evaluate(expr, schema, &values, &context)? { Value::Bool(value) => Some(value), _ => None })
+        }).collect()
+    }
+
+    fn integers(values: Vec<Option<i64>>, memory: &Arc<MemoryBudget>) -> (Schema, ColumnBatch) {
+        let logical = LogicalType::Scalar(ScalarType::I64).maybe();
+        let field = Field { id: ColumnId(0), name: "c0".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: logical.clone() };
+        let len = values.len();
+        let array: ArrayRef = Arc::new(Int64Array::from(values));
+        let column = Column::Arrow { field: Arc::new(rtdb_columnar::to_field("c0", &logical).unwrap()), array, logical: Some(logical) };
+        (Schema::new(vec![field]).unwrap(), ColumnBatch::settled(vec![column], len, memory.reserve(0).unwrap()).unwrap())
+    }
+
+    #[test]
+    fn and_or_and_case_conditions_compute_their_later_operands_only_where_the_earlier_leave_the_answer_open() {
+        let memory = MemoryBudget::new(1 << 20);
+        let (schema, batch) = integers(vec![Some(0), Some(4), None, Some(16)], &memory);
+        let x = column(0);
+        let nonzero = Expr::binary(BinaryOp::NotEq, x.clone(), Expr::Literal(Value::I64(0)));
+        let zero = Expr::binary(BinaryOp::Eq, x.clone(), Expr::Literal(Value::I64(0)));
+        let divided = Expr::binary(BinaryOp::Gt, Expr::binary(BinaryOp::Divide, Expr::Literal(Value::I64(8)), x.clone()), Expr::Literal(Value::I64(1)));
+        let guarded = [
+            Expr::binary(BinaryOp::And, nonzero.clone(), divided.clone()),
+            Expr::binary(BinaryOp::Or, zero.clone(), divided.clone()),
+            Expr::Unary { op: UnaryOp::Not, expr: Box::new(Expr::binary(BinaryOp::Or, zero.clone(), divided.clone())) },
+            Expr::Case { branches: vec![(zero.clone(), Expr::Literal(Value::Bool(false))), (divided.clone(), Expr::Literal(Value::Bool(true)))],
+                otherwise: Box::new(Expr::Literal(Value::Bool(false))) },
+        ];
+        for predicate in guarded {
+            let expected = evaluated_truths(&predicate, &schema, &batch).expect("the guard keeps the division from zero");
+            let actual = truth(&predicate, &schema, &batch, rtdb_expr::Parameters::Values(&[])).unwrap();
+            assert_eq!(actual, Some(expected), "{predicate:?}");
+        }
+
+        // Unguarded, the division fails as the row evaluator's does, rather than leaving the batch to it.
+        for predicate in [divided.clone(), Expr::binary(BinaryOp::And, divided.clone(), nonzero.clone())] {
+            let expected = evaluated_truths(&predicate, &schema, &batch).expect_err("the division by zero is reached");
+            let error = truth(&predicate, &schema, &batch, rtdb_expr::Parameters::Values(&[])).expect_err("the vectors raise it too");
+            assert_eq!(error.code, expected.code, "{predicate:?}");
+        }
+    }
+
+    #[test]
+    fn a_refused_reservation_raises_rather_than_leaving_the_predicate_to_the_row_evaluator() {
+        let memory = MemoryBudget::new(1 << 20);
+        let (schema, batch) = integers(vec![Some(2), None], &memory);
+        let predicate = Expr::binary(BinaryOp::Gt, Expr::binary(BinaryOp::Add, column(0), Expr::Literal(Value::I64(3))), Expr::Literal(Value::I64(4)));
+        let baseline = memory.used_bytes();
+        assert_eq!(truth(&predicate, &schema, &batch, rtdb_expr::Parameters::Values(&[])).unwrap(), Some(vec![Some(true), None]));
+        assert_eq!(memory.used_bytes(), baseline, "the computed operand's charge ends with it");
+        let full = memory.reserve(memory.limit_bytes() - baseline).unwrap();
+        let error = truth(&predicate, &schema, &batch, rtdb_expr::Parameters::Values(&[])).expect_err("the budget has no room for the sum");
+        assert!(error.is(rtdb_types::AnomalyKind::ResourceExhausted), "{error:?}");
+        drop(full);
+        assert_eq!(memory.used_bytes(), baseline);
+    }
+
+    /// Commit 56d3e368fa: reading a parameter with `known` declined every Arrow-bound point read to the row evaluator.
+    #[test]
+    fn an_arrow_bound_parameter_is_decoded_rather_than_declined() {
+        struct Undecoded(Value);
+        impl rtdb_expr::ParameterLookup for Undecoded {
+            fn width(&self) -> usize { 1 }
+            fn value(&self, index: usize) -> rtdb_types::Result<Option<&Value>> { Ok((index == 0).then_some(&self.0)) }
+            fn known_value(&self, _: usize) -> Option<&Value> { None }
+            fn arrow_cell(&self, _: usize) -> Option<rtdb_expr::ArrowParameterCell<'_>> { None }
+        }
+        let memory = MemoryBudget::new(1 << 20);
+        let lookup = Undecoded(Value::I64(2));
+        let parameters = rtdb_expr::Parameters::Lookup(&lookup);
+        let (schema, batch) = integers(vec![Some(1), Some(2)], &memory);
+        let parameter = Expr::Parameter { index: 0, data_type: LogicalType::Scalar(ScalarType::I64).maybe() };
+        let predicate = Expr::binary(BinaryOp::Eq, column(0), parameter.clone());
+        assert_eq!(truth(&predicate, &schema, &batch, parameters).unwrap(), Some(vec![Some(false), Some(true)]));
+        let sum = Expr::binary(BinaryOp::Add, column(0), parameter);
+        let Some(Column::Arrow { array, .. }) = super::column(&sum, &schema, &batch, parameters, &memory).unwrap() else { panic!("the sum over a bound parameter is a kernel") };
+        assert_eq!(array.as_any().downcast_ref::<Int64Array>().unwrap().iter().collect::<Vec<_>>(), [Some(3), Some(4)]);
+    }
+
+    #[test]
+    fn an_invalid_like_pattern_raises_where_an_input_is_present() {
+        let memory = MemoryBudget::new(1 << 20);
+        let schema = Schema::new((0..6).map(field).collect()).unwrap();
+        let rows = 2;
+        let columns: Vec<Column> = (0..6).map(|id| {
+            let logical = LogicalType::Scalar(types()[id].clone()).maybe();
+            let field = Arc::new(rtdb_columnar::to_field("c", &logical).unwrap());
+            let array = if id == 3 { Arc::new(StringArray::from(vec![Some("x"), None])) as ArrayRef } else { new_null_array(field.data_type(), rows) };
+            Column::Arrow { array, field, logical: Some(logical) }
+        }).collect();
+        let batch = ColumnBatch::settled(columns, rows, memory.reserve(0).unwrap()).unwrap();
+        let like = Expr::Like { expr: Box::new(column(3)), pattern: Box::new(Expr::Literal(Value::Utf8("x\\".into()))), escape: Some('\\'),
+            case_insensitive: false, negated: false };
+        let expected = evaluated_truths(&like, &schema, &batch).expect_err("a pattern ending in its escape is invalid");
+        let error = truth(&like, &schema, &batch, rtdb_expr::Parameters::Values(&[])).expect_err("the vectors raise it too");
+        assert_eq!(error.code, expected.code);
     }
 }
