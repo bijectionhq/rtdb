@@ -1,5 +1,5 @@
 use std::{borrow::Cow, collections::BTreeMap};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use arrow_schema::SchemaRef;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_node::{CommitResult, ControlExecutionOptions, ControlFrontend, ControlResult, NativeSession, Node, PreparedSql, ReplaySubmissionPermit, TransactionStatus, control_schema};
@@ -56,6 +56,17 @@ impl Prepared {
         match self.ordinary_kind() {
             Some(PreparedKind::Control(control)) => Some(control.statement()),
             _ => None,
+        }
+    }
+
+    fn describes_parameters(&self) -> bool {
+        match self.ordinary_kind() {
+            Some(PreparedKind::Query(_) | PreparedKind::Dml(_) | PreparedKind::CopyOut(..)) => true,
+            Some(PreparedKind::Control(control)) => matches!(
+                control.statement(),
+                ControlStatement::Begin(_) | ControlStatement::SetTransaction(_) | ControlStatement::Execute { .. }
+            ) || control.statement().is_show(),
+            _ => false,
         }
     }
 }
@@ -131,6 +142,11 @@ impl ResultLayout {
 }
 
 enum PortalState { Query(QueryPortal), Ready }
+struct PortalBinding {
+    statement: Weak<Prepared>,
+    _storage: Arc<MemoryReservation>,
+}
+
 struct Portal {
     prepared: Arc<Prepared>,
     arguments: Option<SqlArguments>,
@@ -138,7 +154,7 @@ struct Portal {
     state: PortalState,
     cancellation: CancellationToken,
     _charges: Vec<Arc<MemoryReservation>>,
-    _bind_storage: Option<Arc<MemoryReservation>>,
+    binding: Option<PortalBinding>,
 }
 
 impl Portal {
@@ -167,6 +183,18 @@ fn parse_frontend_definition(bytes: &[u8]) -> Result<(&str, &str, Vec<i32>)> {
     Ok((name, sql, oids))
 }
 
+enum CopyMode {
+    Idle,
+    Streaming(crate::copy::CopyInput),
+    Discarding,
+}
+
+impl CopyMode {
+    fn is_streaming(&self) -> bool {
+        matches!(self, Self::Streaming(_))
+    }
+}
+
 pub(crate) struct ProtocolSession {
     session: NativeSession,
     node: Node,
@@ -183,7 +211,7 @@ pub(crate) struct ProtocolSession {
     portals: BTreeMap<String, Portal>,
     /// Portals a finished transaction closed, dropped once the message that closed them has been answered.
     retired: BTreeMap<String, Portal>,
-    copy: Option<crate::copy::CopyInput>,
+    copy: CopyMode,
     replay_permit: Option<GatewayReplayPermit>,
     /// The encoding environment last built, with the session's parameters revision it copied.
     environment_cache: Option<(rtdb_node::SessionParametersHandle, Arc<SessionEnvironment>)>,
@@ -192,7 +220,7 @@ impl ProtocolSession {
     pub fn new(session: NativeSession, node: Node, config: Arc<ServerConfig>, startup: Startup, cancellations: Arc<CancellationSlot>) -> Self {
         let reported_settings = session.state().settings_revision();
         Self { session, node, config, startup, cancellations, extended: false, skip_until_sync: false, implicit: false, transaction_generation: 0,
-            reported_await_token: 0, reported_settings, statements: BTreeMap::new(), portals: BTreeMap::new(), retired: BTreeMap::new(), copy: None, replay_permit: None, environment_cache: None }
+            reported_await_token: 0, reported_settings, statements: BTreeMap::new(), portals: BTreeMap::new(), retired: BTreeMap::new(), copy: CopyMode::Idle, replay_permit: None, environment_cache: None }
     }
     pub fn extended(&self) -> bool { self.extended }
     pub fn portal_deadline(&self) -> Option<std::time::Instant> {
@@ -201,7 +229,7 @@ impl ProtocolSession {
     pub fn expire_portals(&mut self, now: std::time::Instant) {
         self.portals.retain(|_, portal| portal.retention_deadline().is_none_or(|deadline| deadline > now));
     }
-    pub fn close(&mut self) { self.copy = None; self.portals.clear(); self.retired.clear(); self.statements.clear(); self.environment_cache = None; self.session.state_mut().close(); }
+    pub fn close(&mut self) { self.copy = CopyMode::Idle; self.portals.clear(); self.retired.clear(); self.statements.clear(); self.environment_cache = None; self.session.state_mut().close(); }
     fn environment(&mut self) -> Result<Arc<SessionEnvironment>> {
         let state = self.session.state();
         let timezone = state.effective_timezone();
@@ -268,7 +296,7 @@ impl ProtocolSession {
             return Err(protocol("A gateway replay permit must be followed by a simple query"));
         }
         if frame.tag == GATEWAY_SESSION_STATE_TAG && frame.body.first() == Some(&GATEWAY_REPLAY_PERMIT_KIND) {
-            if !self.startup.gateway_session_state || self.extended || self.copy.is_some() || self.ready() != b'I' {
+            if !self.startup.gateway_session_state || self.extended || self.copy.is_streaming() || self.ready() != b'I' {
                 return Err(protocol("A gateway replay permit requires an idle gateway session"));
             }
             let permit = GatewayReplayPermit::decode(&frame.body).ok_or_else(|| protocol("Invalid gateway replay permit"))?;
@@ -279,7 +307,7 @@ impl ProtocolSession {
         }
         if frame.tag == GATEWAY_SESSION_STATE_TAG && let Some((&kind @ (GATEWAY_KEY_KIND | GATEWAY_KEY_CONFIRM_KIND), key)) = frame.body.split_first() {
             // Failure here ends the connection before it can execute the following command.
-            if !self.startup.gateway_session_state || self.extended || self.copy.is_some() || self.ready() != b'I' {
+            if !self.startup.gateway_session_state || self.extended || self.copy.is_streaming() || self.ready() != b'I' {
                 return Err(protocol("A gateway key requires an idle gateway session"));
             }
             let key = std::str::from_utf8(key).ok().filter(|key| key.len() == 32 && key.bytes().all(|byte| byte.is_ascii_hexdigit()))
@@ -289,10 +317,22 @@ impl ProtocolSession {
             return Ok(());
         }
         if self.skip_until_sync && frame.tag != b'S' { return Ok(()); }
-        if self.copy.is_some() && matches!(frame.tag, b'S' | b'H') { return Ok(()); }
+        if matches!(self.copy, CopyMode::Discarding) {
+            match frame.tag {
+                b'd' | b'c' | b'f' => return Ok(()),
+                b'S' | b'H' => (),
+                _ => self.copy = CopyMode::Idle,
+            }
+        }
+        let copying = self.copy.is_streaming();
+        if copying && matches!(frame.tag, b'S' | b'H') { return Ok(()); }
         let result = if frame.tag == b'd' {
-            self.copy.as_mut().ok_or_else(|| protocol("COPY IN not in progress, cannot write data"))
-                .and_then(|copy| copy.append(frame))
+            match &mut self.copy {
+                CopyMode::Streaming(copy) => copy.append(frame),
+                _ => Err(protocol("COPY IN not in progress, cannot write data")),
+            }
+        } else if copying && !matches!(frame.tag, b'c' | b'f') {
+            Err(protocol("Unexpected message during COPY IN"))
         } else {
             Box::pin(self.message(&frame, writer)).await
         };
@@ -300,7 +340,14 @@ impl ProtocolSession {
             if error.code == "xtdb.pgwire/connection-error" { return Err(error); }
             if self.extended { self.skip_until_sync = true; }
             self.session.state_mut().fail_transaction();
+            if copying {
+                self.copy = CopyMode::Discarding;
+            }
             writer.error(&error, self.fallback(), false).await?;
+            if copying {
+                if self.extended { writer.flush().await?; }
+                else { self.report_ready(writer).await?; }
+            }
         }
         Ok(())
     }
@@ -376,8 +423,9 @@ impl ProtocolSession {
                 };
                 drop(charges);
                 let arguments = arguments.map(|batch| SqlArguments::from_canonical_arrow_row(batch, self.node.memory())).transpose()?;
+                let statement = Arc::downgrade(&prepared);
                 let mut portal = Box::pin(self.bind(prepared, arguments, Vec::new(), &result_formats)).await?;
-                portal._bind_storage = Some(storage);
+                portal.binding = Some(PortalBinding { statement, _storage: storage });
                 self.portals.insert(name.to_owned(), portal); writer.empty(b'2').await?;
             }
             b'D' => {
@@ -386,7 +434,7 @@ impl ProtocolSession {
                     b'S' => {
                         if let Some(statement) = self.statements.get(name) {
                             let statement = &statement.prepared;
-                            if !matches!(statement.ordinary_kind(), Some(PreparedKind::Empty | PreparedKind::Keywords)) {
+                            if statement.describes_parameters() {
                                 writer.parameters(&statement.oids).await?;
                             }
                             let columns = match statement.control() {
@@ -410,29 +458,43 @@ impl ProtocolSession {
                 if generation == self.transaction_generation { self.portals.insert(name, portal); }
                 result?;
             }
-            b'C' => { let kind = input.byte()?; let name = input.string()?; input.end()?; match kind { b'P' => { self.portals.remove(name); }, b'S' => { if let Some(statement) = self.statements.remove(name) { self.portals.retain(|_, portal| !Arc::ptr_eq(&portal.prepared, &statement.prepared)); } }, _ => return Err(protocol("Invalid close target")) } writer.empty(b'3').await?; }
+            b'C' => {
+                let kind = input.byte()?;
+                let name = input.string()?;
+                input.end()?;
+                match kind {
+                    b'P' => { self.portals.remove(name); }
+                    b'S' => if let Some(statement) = self.statements.remove(name) {
+                        let statement = Arc::downgrade(&statement.prepared);
+                        self.portals.retain(|_, portal| {
+                            portal.binding.as_ref().is_none_or(|binding| !binding.statement.ptr_eq(&statement))
+                        });
+                    },
+                    _ => return Err(protocol("Invalid close target")),
+                }
+                writer.empty(b'3').await?;
+            }
             b'S' => { input.end()?; if self.implicit { let result = if self.session.state().status() == TransactionStatus::Failed { self.rollback() } else { Box::pin(self.commit(None)).await }; if let Err(error) = result { writer.error(&error, self.fallback(), false).await?; } } self.skip_until_sync = false; self.extended = false; self.report_ready(writer).await?; }
             b'H' => { input.end()?; writer.flush().await?; }
             b'c' => {
                 input.end()?;
-                let copy = self.copy.take().ok_or_else(|| protocol("COPY IN not in progress"))?;
+                let CopyMode::Streaming(copy) = std::mem::replace(&mut self.copy, CopyMode::Idle) else {
+                    return Err(protocol("COPY IN not in progress"));
+                };
                 let token = self.token();
                 let result = Box::pin(copy.finish(&mut self.session, &self.node, &token)).await;
                 if self.session.state().status() == TransactionStatus::Idle { self.end_transaction(); }
-                match result {
-                    Ok(rows) => writer.string(b'C', &format!("COPY {rows}")).await?,
-                    Err(error) if self.extended => return Err(error),
-                    Err(error) => writer.error(&error, self.fallback(), false).await?,
-                }
-                if !self.extended { self.report_ready(writer).await?; }
+                writer.string(b'C', &format!("COPY {}", result?)).await?;
+                if self.extended { writer.flush().await?; }
+                else { self.report_ready(writer).await?; }
             }
             b'f' => {
-                self.copy = None;
+                self.copy = CopyMode::Idle;
                 if self.extended { return Err(protocol("COPY input was cancelled")); }
                 self.report_ready(writer).await?;
             }
             GATEWAY_SESSION_STATE_TAG if self.startup.gateway_session_state => {
-                if self.copy.is_some() || self.ready() != b'I' {
+                if self.copy.is_streaming() || self.ready() != b'I' {
                     return Err(protocol("A gateway can restore state only on an idle session"));
                 }
                 match input.byte()? {
@@ -594,6 +656,7 @@ impl ProtocolSession {
         let token = self.token();
         charges.push(self.node.memory().reserve(std::mem::size_of::<Portal>())?);
         let columns = match &prepared.columns {
+            Some(columns) if matches!(prepared.ordinary_kind(), Some(PreparedKind::Keywords)) => Some(Arc::clone(columns)),
             Some(columns) => {
                 let (columns, charge) = bind_portal_columns(columns, formats, self.node.memory())?;
                 if let Some(charge) = charge { charges.push(charge); }
@@ -601,7 +664,7 @@ impl ProtocolSession {
             }
             None => None,
         };
-        let mut portal = Portal { prepared: Arc::clone(&prepared), arguments, columns, state: PortalState::Ready, cancellation: token.clone(), _charges: charges, _bind_storage: None };
+        let mut portal = Portal { prepared: Arc::clone(&prepared), arguments, columns, state: PortalState::Ready, cancellation: token.clone(), _charges: charges, binding: None };
         let control_options = self.control_options();
         let cursor = match (prepared.ordinary_kind(), prepared.control()) {
             (Some(PreparedKind::CopyOut(query, _)), _) => {
@@ -737,7 +800,7 @@ impl ProtocolSession {
                             table, format, self.node.memory(), self.config.maximum_copy_bytes, autocommit,
                         )?;
                         let format = copy.wire_format().code() as u8;
-                        self.copy = Some(copy);
+                        self.copy = CopyMode::Streaming(copy);
                         writer.send(b'G', &[format, 0, 1, 0, format]).await?;
                         writer.flush().await
                     }
@@ -827,7 +890,7 @@ impl ProtocolSession {
             if error.anomaly().code == "xtdb.pgwire/connection-error" { return Err(error.anomaly().clone()); }
             writer.error(error.anomaly(), self.fallback(), false).await?;
         }
-        if self.copy.is_none() { self.report_ready(writer).await?; }
+        if !self.copy.is_streaming() { self.report_ready(writer).await?; }
         Ok(())
     }
     async fn simple_statements<W: AsyncWrite + Unpin>(
@@ -1132,6 +1195,15 @@ fn portal_descriptor_bytes(columns: &[Column]) -> Result<usize> {
 /// A portal's descriptors in its result formats, shared with the statement's when the formats leave them unchanged.
 /// Only allocates and charges descriptor memory when the portal must build its own copy.
 fn bind_portal_columns(columns: &Arc<[Column]>, formats: &[Format], memory: &Arc<MemoryBudget>) -> Result<(Arc<[Column]>, Option<Arc<MemoryReservation>>)> {
+    if formats.len() > 1 && formats.len() != columns.len() {
+        let names = formats.iter().map(|format| match format {
+            Format::Text => serde_json::Value::from("text"),
+            Format::Binary => serde_json::Value::from("binary"),
+        }).collect();
+        return Err(Anomaly::incorrect("xtdb.pgwire/invalid-result-format", "invalid result-format for query")
+            .with_context("result-format", serde_json::Value::Array(names))
+            .with_context("type-count", columns.len().into()));
+    }
     let mut unchanged = true;
     for (index, column) in columns.iter().enumerate() { unchanged &= item_format(formats, columns.len(), index)? == column.format; }
     if unchanged { return Ok((Arc::clone(columns), None)); }
@@ -1140,13 +1212,6 @@ fn bind_portal_columns(columns: &Arc<[Column]>, formats: &[Format], memory: &Arc
         .map(|(index, column)| Ok(Column { name: column.name.clone(), ty: column.ty, format: item_format(formats, columns.len(), index)? }))
         .collect::<Result<_>>()?;
     Ok((bound, Some(reservation)))
-}
-#[cfg(test)]
-fn bound_columns(columns: &Arc<[Column]>, formats: &[Format]) -> Result<Arc<[Column]>> {
-    let mut unchanged = true;
-    for (index, column) in columns.iter().enumerate() { unchanged &= item_format(formats, columns.len(), index)? == column.format; }
-    if unchanged { return Ok(Arc::clone(columns)); }
-    columns.iter().enumerate().map(|(index, column)| Ok(Column { name: column.name.clone(), ty: column.ty, format: item_format(formats, columns.len(), index)? })).collect()
 }
 fn is_type_probe(source: &str) -> bool { let mut prior_space = false; source.chars().filter(|character| { let repeated = *character == ' ' && prior_space; prior_space = *character == ' '; !repeated }).collect::<String>() == "SELECT pg_type.oid, typname FROM pg_catalog.pg_type LEFT JOIN (select ns.oid as nspoid, ns.nspname, r.r from pg_namespace as ns join ( select s.r, (current_schemas(false))[s.r] as nspname from generate_series(1, array_upper(current_schemas(false), 1)) as s(r) ) as r using ( nspname ) ) as sp ON sp.nspoid = typnamespace WHERE typname = $1 ORDER BY sp.r, pg_type.oid DESC LIMIT 1" }
 const DBEAVER_NAMESPACE_QUERY: &str = "SELECT n.oid,n.*,d.description FROM pg_catalog.pg_namespace n LEFT OUTER JOIN pg_catalog.pg_description d ON d.objoid=n.oid AND d.objsubid=0 AND d.classoid='pg_namespace'::regclass ORDER BY nspname";
@@ -2422,28 +2487,21 @@ mod tests {
             Column { name: "a".into(), ty: PgType::Int8, format: Format::Text },
             Column { name: "b".into(), ty: PgType::Text, format: Format::Text },
         ]);
+        let memory = MemoryBudget::new(1 << 16);
         for formats in [&[][..], &[Format::Text], &[Format::Text, Format::Text]] {
-            assert!(Arc::ptr_eq(&bound_columns(&columns, formats).unwrap(), &columns), "{formats:?}");
+            let (bound, charge) = bind_portal_columns(&columns, formats, &memory).unwrap();
+            assert!(Arc::ptr_eq(&bound, &columns), "{formats:?}");
+            assert!(charge.is_none());
+            assert_eq!(memory.used_bytes(), 0);
         }
         for (formats, expected) in [(&[Format::Binary][..], [Format::Binary, Format::Binary]), (&[Format::Text, Format::Binary][..], [Format::Text, Format::Binary])] {
-            let bound = bound_columns(&columns, formats).unwrap();
+            let (bound, charge) = bind_portal_columns(&columns, formats, &memory).unwrap();
             assert!(!Arc::ptr_eq(&bound, &columns));
             assert_eq!(bound.iter().map(|column| column.format).collect::<Vec<_>>(), expected);
             assert!(bound.iter().zip(columns.iter()).all(|(bound, column)| bound.name == column.name && bound.ty == column.ty));
+            assert!(charge.is_some());
+            assert_eq!(memory.used_bytes(), portal_descriptor_bytes(&columns).unwrap());
         }
-        let error = bound_columns(&columns, &[Format::Text; 3]).unwrap_err();
-        assert_eq!(error.message, item_format(&[Format::Text; 3], 2, 0).unwrap_err().message);
-        assert!(bound_columns(&Arc::<[Column]>::from(Vec::new()), &[Format::Text; 3]).unwrap().is_empty());
-
-        let memory = MemoryBudget::new(1 << 16);
-        let (shared, charge) = bind_portal_columns(&columns, &[Format::Text], &memory).unwrap();
-        assert!(Arc::ptr_eq(&shared, &columns));
-        assert!(charge.is_none());
-        assert_eq!(memory.used_bytes(), 0);
-        let (owned, charge) = bind_portal_columns(&columns, &[Format::Binary], &memory).unwrap();
-        assert!(!Arc::ptr_eq(&owned, &columns));
-        assert!(charge.is_some());
-        assert_eq!(memory.used_bytes(), portal_descriptor_bytes(&columns).unwrap());
     }
 
     #[test]
@@ -2498,7 +2556,7 @@ mod tests {
             if round == 0 { frontend.handle(frame(b'P', parse.clone()), &mut writer).await.unwrap(); }
             let bind = frame(b'B', bind.clone());
             frontend.handle(bind, &mut writer).await.unwrap();
-            log.lock().unwrap().watched = Some(Arc::downgrade(frontend.portals[""]._bind_storage.as_ref().unwrap()));
+            log.lock().unwrap().watched = Some(Arc::downgrade(&frontend.portals[""].binding.as_ref().unwrap()._storage));
             frontend.handle(frame(b'E', execute.clone()), &mut writer).await.unwrap();
             assert!(frontend.portals.contains_key(""));
             frontend.handle(frame(b'S', Vec::new()), &mut writer).await.unwrap();

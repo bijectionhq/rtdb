@@ -67,20 +67,26 @@ Planning warnings use severity `WARNING` and SQLSTATE `01000` and are sent in oc
 A nested SQL `PREPARE` emits its terminal child's planning warnings when execution reaches that child.
 Planning warnings are sent once per preparation.
 Interactive DML warning planning is best-effort and is skipped when the client supplied parameter OIDs.
-DML and unprepared control parameter descriptions retain the supplied OID list.
-Query and EXECUTE descriptions use their planned placeholder count, padding missing OIDs with the fallback type and truncating excess OIDs.
+DML, BEGIN, and SET TRANSACTION parameter descriptions retain the supplied OID list.
+Query and EXECUTE descriptions use their planned placeholder count, describing unspecified parameters as text and truncating excess OIDs.
+SHOW describes zero parameters, and other classic controls describe only NoData.
+The keyword probe always describes and sends text.
+A query Bind with multiple result format codes reports the format list and result column count if their lengths differ.
 Direct DML Bind requires matching argument and OID counts and a declared type for each non-null value.
 SQL EXECUTE derives its DML argument types from expressions; SQL argument-width validation occurs during submission and transaction resolution.
 Bind captures the query context and opens the cursor.
 An extended-protocol error skips messages until Sync.
 Sync completes an implicit transaction and leaves an explicit transaction open.
 Execute limits suspend the portal even when the limit exactly matches the remaining rows; a subsequent Execute observes exhaustion and reports the cumulative count.
-Statement close releases its associated portals, and transaction completion releases transaction-scoped portals.
+Statement close releases portals bound from that registration, including portals that execute a different statement through SQL EXECUTE.
+Transaction completion releases transaction-scoped portals.
 
 The frontend preserves the reference's JDBC type-lookup exception inside a write transaction and its DBeaver projection rewrite from issue 4528.
 It also preserves the canned keyword response.
 SQL `PREPARE` bodies use ordinary SQL preparation for both queries.
-The server read-only flag applies to DML; COPY independently enforces the connection's read-only transaction state.
+Startup `options` extracts `-c name=value` assignments with the reference's ASCII word grammar and echoes the original parameter.
+The server read-only flag applies to DML and COPY IN.
+COPY IN also enforces the connection's read-only transaction state.
 `SET ROLE` follows the pinned no-response visitor.
 CancelRequest uses the connection identifier and ignores the supplied secret; BackendKeyData sends zero as the secret.
 These protocol choices are compatibility behavior, and the read-only/COPY and cancellation policies are recorded as open questions in `dev/doc/tx.allium`.
@@ -98,6 +104,10 @@ Capacity validation and the catalog writes share one ordered outcome.
 
 == COPY and memory
 
+RTDB extends pgwire with Arrow-stream COPY OUT and its configured COPY IN byte limit, which defaults to 1 GiB.
+The same listener can require TLS and admit capabilities or gateway-session frames when those are configured.
+These extensions serve native deployments and preserve the classic authentication and COPY wire formats for ordinary connections.
+
 A history reader can offer `/* rtdb-history-label-dictionary-v1 */` immediately inside the opening query parenthesis of `COPY (query) TO STDOUT WITH (FORMAT 'arrow-stream')`.
 An owner that accepts the offer writes the Utf8 `label` projection as `Dictionary<Int32, Struct<id: FixedSizeBinary(16), canonical: Utf8>>`.
 Older owners ignore the comment and return the ordinary Arrow schema.
@@ -106,11 +116,13 @@ The preimage concatenates `bijection.native-root-catalog.v1`, the big-endian 64-
 The owner bounds each dictionary to 4,096 entries, 4,096 bytes per spelling and 1 MiB of distinct spelling bytes.
 Dictionary rows use the same query basis and delivery grants as ordinary COPY.
 
-The protocol state opens a temporary file at COPY admission and checks the configured disk-byte limit on every input frame.
-Arrow streams up to 8 KiB can remain in the existing COPY scratch reservation with an empty temporary file.
-If retention is unavailable or the stream grows past 8 KiB, COPY writes the retained prefix to the temporary file and spools the rest there.
-Arrow files and Transit inputs use the temporary file throughout, and Arrow files seek to the footer during preflight.
+The protocol checks the configured byte limit on every COPY input frame.
+An admitted first Arrow frame can stay in memory, with a retention limit of 256 KiB for autocommit Arrow streams and 8 KiB for explicit Arrow streams and autocommit Arrow files.
+When more storage is needed, COPY writes the retained prefix to a temporary file and spools subsequent bytes there.
+Transit inputs spool to a temporary file and Arrow files seek to the footer during preflight.
 CopyFail, disconnect, shutdown, and completion release the COPY input and its temporary file.
+A server-side COPY input failure releases the partial input and discards queued COPY frames.
+Simple COPY reports ReadyForQuery after the failure and extended COPY waits for Sync.
 Transit JSON and MessagePack accept multiple top-level documents, resetting the Transit cache for each value.
 Transit COPY commits one batch when no transaction is open.
 Arrow file and stream COPY preserve record-batch boundaries and commit one transaction per batch outside an explicit transaction.

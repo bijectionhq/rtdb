@@ -248,5 +248,12 @@ pub(crate) async fn apply_startup<W: AsyncWrite + Unpin>(session: &mut NativeSes
     Ok(())
 }
 pub(crate) fn display_parameter(key: &str) -> &str { match key { "timezone" => "TimeZone", "datestyle" => "DateStyle", "intervalstyle" => "IntervalStyle", key => key } }
-fn options(value: &str) -> Vec<(String, String)> { value.split("-c ").skip(1).filter_map(|part| { let (key, value) = part.split_once('=')?; let valid = |ch: char| ch.is_alphanumeric() || ch == '_'; if !key.chars().all(valid) { return None; } Some((key.into(), value.chars().take_while(|ch| valid(*ch)).collect())) }).collect() }
+fn options(value: &str) -> impl Iterator<Item = (&str, String)> {
+    value.split("-c ").skip(1).filter_map(|part| {
+        let (key, value) = part.split_once('=')?;
+        let valid = |ch: char| ch.is_ascii_alphanumeric() || ch == '_';
+        if !key.chars().all(valid) { return None; }
+        Some((key, value.chars().take_while(|ch| valid(*ch)).collect()))
+    })
+}
 fn client_credentials(value: &str) -> Result<(&str, &str)> { if value.trim().is_empty() { return Err(Anomaly::incorrect("xtdb.authn/malformed-client-credentials", "Client credentials were empty")); } let (id, secret) = value.split_once(':').filter(|(_, secret)| !secret.is_empty() && !secret.contains(':')).ok_or_else(|| Anomaly::incorrect("xtdb.authn/malformed-client-credentials", "Client credentials must be provided in the format 'client-id:client-secret'"))?; Ok((id, secret)) }

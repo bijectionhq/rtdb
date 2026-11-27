@@ -446,6 +446,9 @@
 --      The ordinary Utf8 projection remains valid when the owner ignores the offer.
 --      Dictionary frames and their rows share each batch's original delivery grant.
 --      COPY FROM STDIN with an Arrow format submits Arrow document batches.
+--      A COPY input failure discards its partial input and queued COPY frames.
+--      Simple COPY reports ReadyForQuery after the error.
+--      Extended COPY reports ReadyForQuery at the next Sync.
 --      The connection completes Arrow framing and allocation preflight before submitting the first batch.
 --      COPY can retain the first admitted Arrow input frame and create a spool only when it needs disk storage.
 --      Autocommit can decode compatible record buffers from retained input or bounded immutable ranges of the completed spool.
@@ -542,6 +545,7 @@ external entity SqlParser {
     -- Native Extended Parse lexes the full input before classifying the statement.
     -- If classification cannot reserve memory, existing prepared statements remain registered.
     -- Bind reserves argument slots before publishing a portal.
+    -- The portal is bound to its originating statement registration for Close, including when an EXECUTE portal runs another statement.
     -- Extended Parse validates the grammar of every nested PREPARE body before installing the prepared statement.
     -- Executing a PREPARE prepares its immediate child in the current session context.
     -- Native pgwire reports locations in structured errors from a reached SQL PREPARE child as byte positions in the normalized Simple Query message that supplied it.

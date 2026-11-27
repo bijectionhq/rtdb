@@ -571,6 +571,54 @@ async fn transit_copy_fragments_normalize_keyword_ids_and_copy_fail_discards_the
 }
 
 #[tokio::test]
+async fn copy_limit_aborts_both_protocol_modes_and_drains_the_queued_copy_tail() {
+    let running = Running::start(ServerConfig { maximum_copy_bytes: 32, ..Default::default() }, None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let sql = "COPY docs FROM STDIN WITH (FORMAT 'transit-json')";
+    assert_eq!(tags(&client.query("INSERT INTO docs (_id) VALUES (10)").await), b"CZ");
+
+    for extended in [false, true] {
+        if extended {
+            assert_eq!(client.query("BEGIN READ WRITE").await.last().unwrap().1, b"T");
+            client.parse("copy_stmt", sql, &[]).await;
+            client.bind("copy_portal", "copy_stmt").await;
+            client.execute("copy_portal", 0).await;
+            client.send(b'S', &[]).await;
+            assert_eq!(tags(&client.through(b'G').await), b"12G");
+        } else {
+            client.send(b'Q', &cstring(sql)).await;
+            assert_eq!(client.receive().await.0, b'G');
+        }
+
+        client.send(b'd', br#"["^ ","_id",11]"#).await;
+        client.send(b'd', &[b' '; 32]).await;
+        let (tag, body) = client.receive().await;
+        assert_eq!(tag, b'E');
+        let (state, _, detail) = error_fields(&body);
+        assert_eq!(state, "XX000");
+        assert_eq!(detail["code"], "xtdb.pgwire/copy-limit");
+        if !extended {
+            assert_eq!(client.receive().await, (b'Z', b"I".to_vec()));
+        }
+        client.send(b'd', b"ignored").await;
+        client.send(b'c', &[]).await;
+        client.send(b'f', &cstring("already failed")).await;
+        if extended {
+            client.send(b'S', &[]).await;
+            assert_eq!(client.receive().await, (b'Z', b"E".to_vec()));
+            assert_eq!(tags(&client.query("ROLLBACK").await), b"CZ");
+        }
+
+        let result = client.query("SELECT _id FROM docs ORDER BY _id").await;
+        assert_eq!(tags(&result), b"TDCZ");
+        assert_eq!(rows(&result), [vec![Some(b"10".to_vec())]]);
+    }
+
+    drop(client);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn transit_copy_msgpack_decodes_across_pages_and_rejects_a_truncated_tail_atomically() {
     use rtdb_format::transit::{TransitValue as T, encode_msgpack};
 
@@ -673,6 +721,34 @@ async fn binary_bind_parameters_and_result_formats_use_declared_oids() {
 }
 
 #[tokio::test]
+async fn bind_reports_a_result_format_count_mismatch_and_leaves_the_statement_available() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    client.parse("one", "SELECT 1 AS value", &[]).await;
+    client.bind_formats("result", "one", &[0, 1]).await;
+    client.execute("result", 0).await;
+    client.send(b'S', &[]).await;
+
+    let frames = client.through(b'Z').await;
+    assert_eq!(tags(&frames), b"1EZ");
+    let (state, message, detail) = error_fields(&frames[1].1);
+    assert_eq!(state, "08P01");
+    assert_eq!(message, "invalid result-format for query");
+    assert_eq!(detail["code"], "xtdb.pgwire/invalid-result-format");
+    assert_eq!(detail["data"], serde_json::json!({"result-format": ["text", "binary"], "type-count": 1}));
+    assert_eq!(frames[2].1, b"I");
+
+    client.bind("result", "one").await;
+    client.execute("result", 0).await;
+    client.send(b'S', &[]).await;
+    let frames = client.through(b'Z').await;
+    assert_eq!(tags(&frames), b"2DCZ");
+    assert_eq!(rows(&frames), [vec![Some(b"1".to_vec())]]);
+    drop(client);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn numeric_parameters_keep_numeric_result_types_through_integer_arithmetic() {
     let running = Running::start(ServerConfig::default(), None).await;
     let mut client = Client::connect(&running.server, None).await;
@@ -692,25 +768,32 @@ async fn numeric_parameters_keep_numeric_result_types_through_integer_arithmetic
 }
 
 #[tokio::test]
-async fn parameter_descriptions_keep_dml_and_control_oids_and_resize_query_oids() {
+async fn describe_sends_parameter_oids_only_for_the_reference_statement_kinds() {
     let running = Running::start(ServerConfig::default(), None).await;
     let mut client = Client::connect(&running.server, None).await;
     for (name, sql, supplied, expected, result) in [
-        ("dml_missing", "UPDATE docs SET v=$2", vec![], vec![], b'n'),
-        ("dml_extra", "DELETE FROM docs", vec![23, 0], vec![23, 25], b'n'),
-        ("control_missing", "SET TIME ZONE $1", vec![], vec![], b'n'),
-        ("control_extra", "SET TIME ZONE 'UTC'", vec![25], vec![25], b'n'),
-        ("query_extra", "SELECT $1 AS value", vec![23, 999_999], vec![23], b'T'),
-        ("query_missing", "SELECT $2 AS value", vec![23], vec![23, 25], b'T'),
+        ("dml_missing", "UPDATE docs SET v=$2", vec![], Some(vec![]), b'n'),
+        ("dml_extra", "DELETE FROM docs", vec![23, 0], Some(vec![23, 25]), b'n'),
+        ("control_missing", "SET TIME ZONE $1", vec![], None, b'n'),
+        ("control_extra", "SET TIME ZONE 'UTC'", vec![25], None, b'n'),
+        ("begin", "BEGIN", vec![23], Some(vec![23]), b'n'),
+        ("set_tx", "SET TRANSACTION READ ONLY", vec![23], Some(vec![23]), b'n'),
+        ("show", "SHOW TIME ZONE", vec![23], Some(vec![]), b'T'),
+        ("query_extra", "SELECT $1 AS value", vec![23, 999_999], Some(vec![23]), b'T'),
+        ("query_missing", "SELECT $2 AS value", vec![23], Some(vec![23, 25]), b'T'),
     ] {
         client.parse(name, sql, &supplied).await;
         let mut description = vec![b'S']; description.extend_from_slice(&cstring(name));
         client.send(b'D', &description).await; client.send(b'S', &[]).await;
         let frames = client.through(b'Z').await;
-        assert_eq!(tags(&frames), vec![b'1', b't', result, b'Z'], "{name}");
-        let mut bytes = (expected.len() as u16).to_be_bytes().to_vec();
-        for oid in expected { bytes.extend_from_slice(&i32::to_be_bytes(oid)); }
-        assert_eq!(frames[1].1, bytes, "{name}");
+        if let Some(expected) = expected {
+            assert_eq!(tags(&frames), vec![b'1', b't', result, b'Z'], "{name}");
+            let mut bytes = (expected.len() as u16).to_be_bytes().to_vec();
+            for oid in expected { bytes.extend_from_slice(&i32::to_be_bytes(oid)); }
+            assert_eq!(frames[1].1, bytes, "{name}");
+        } else {
+            assert_eq!(tags(&frames), vec![b'1', result, b'Z'], "{name}");
+        }
     }
     drop(client); running.stop().await;
 }
@@ -1180,17 +1263,20 @@ async fn locale_dependent_simple_and_extended_keyword_responses_keep_their_descr
     let mut describe = vec![b'S'];
     describe.extend_from_slice(&cstring("keywords"));
     client.send(b'D', &describe).await;
-    client.bind("", "keywords").await;
+    client.bind_formats("", "keywords", &[1]).await;
+    client.send(b'D', b"P\0").await;
     client.execute("", 0).await;
     client.send(b'S', &[]).await;
     let extended = client.through(b'Z').await;
-    assert_eq!(tags(&extended), b"1T2DCZ");
+    assert_eq!(tags(&extended), b"1T2TDCZ");
     let columns = &extended[1].1;
     assert_eq!(&columns[..7], b"\0\x01col1\0");
     assert_eq!(i32::from_be_bytes(columns[13..17].try_into().unwrap()), 1043);
+    assert_eq!(&extended[3].1, columns);
+    assert!(columns.ends_with(&0u16.to_be_bytes()));
     assert_eq!(rows(&extended), vec![vec![Some(b"xtdb".to_vec())]]);
-    assert_eq!(extended[4].1, b"SELECT 1\0");
-    assert_eq!(extended[5].1, b"I");
+    assert_eq!(extended[5].1, b"SELECT 1\0");
+    assert_eq!(extended[6].1, b"I");
     drop(client); running.stop().await;
 }
 
@@ -1508,9 +1594,8 @@ async fn extended_prepare_reports_a_reached_leaf_error_at_its_original_input_spa
     client.send(b'D', &describe).await;
     client.send(b'S', &[]).await;
     let parsed = client.through(b'Z').await;
-    assert_eq!(tags(&parsed), b"1tnZ");
-    assert_eq!(parsed[1].1, b"\0\x01\0\0\0\x17");
-    assert_eq!(parsed[3].1, b"I");
+    assert_eq!(tags(&parsed), b"1nZ");
+    assert_eq!(parsed[2].1, b"I");
 
     client.bind("", "wire").await;
     client.execute("", 0).await;
@@ -2054,7 +2139,12 @@ async fn startup_sends_default_application_name_before_server_parameters() {
     assert_eq!(custom_apps, [("application_name", "custom-client")]);
     assert!(!custom_params.iter().any(|(_, v)| v == "XTDB PGWire"));
 
-    drop((default_client, custom_client));
+    let options = "-c datestyle=iso8601é";
+    let (mut option_client, option_params) = connect_params(&running.server, &[("options", options)]).await;
+    assert!(option_params.iter().any(|(key, value)| key == "options" && value == options));
+    assert_eq!(rows(&option_client.query("SHOW DateStyle").await), [vec![Some(b"iso8601".to_vec())]]);
+
+    drop((default_client, custom_client, option_client));
     running.stop().await;
 }
 
@@ -2101,6 +2191,29 @@ async fn describe_on_extended_execute_reads_the_current_prepared_statement() {
         }
     }
 
+    drop(client);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn closing_a_statement_closes_only_portals_bound_from_that_registration() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    assert_eq!(tags(&client.query("PREPARE target AS SELECT $1::bigint AS value").await), b"CZ");
+
+    client.parse("first", "EXECUTE target (1)", &[]).await;
+    client.parse("second", "EXECUTE target (2)", &[]).await;
+    client.bind("first_portal", "first").await;
+    client.bind("second_portal", "second").await;
+    client.send(b'C', b"Starget\0").await;
+    client.send(b'C', b"Sfirst\0").await;
+    client.send(b'D', b"Pfirst_portal\0").await;
+    client.execute("second_portal", 0).await;
+    client.send(b'S', &[]).await;
+
+    let frames = client.through(b'Z').await;
+    assert_eq!(tags(&frames), b"112233nDCZ");
+    assert_eq!(rows(&frames), [vec![Some(b"2".to_vec())]]);
     drop(client);
     running.stop().await;
 }
