@@ -235,6 +235,31 @@
                                         {:text ?rest}]}]
                         {:args {:label "é😀", :rest "🎈"}, :with-types? true}))))
 
+(t/deftest positioned-record-projections-and-patch-preserve-null-ancestors
+  (t/is (= [{:patched {:nested {:leaf "left"}, :kept 1}
+             :direct {:nested {:leaf "left"}, :kept 1}
+             :selected "é",
+             :row {:chosen {:leaf "é"}}}
+            {:patched {:nested {:leaf "right"}, :kept 2}
+             :direct {:nested {:leaf "stale"}, :kept 2}, :row {}}
+            {:patched {:nested {:leaf "keep"}, :kept 3}
+             :direct {:nested {:leaf "keep"}, :kept 3}, :row {}}]
+           (tu/query-ra
+            '[:project {:projections [{patched (_patch l r)}
+                                      {direct l}
+                                      {selected (.. p inner leaf)}
+                                      {row {:chosen (. p inner)}}]}
+              [:table {:rows [{:l {:nested {:leaf "left"}, :kept 1}
+                               :r {:nested nil}
+                               :p {:inner {:leaf "é"}}}
+                              {:l {:nested {:leaf "stale"}, :kept 2}
+                               :r {:nested {:leaf "right"}}
+                               :p nil}
+                              {:l {:nested {:leaf "keep"}, :kept 3}
+                               :r {:nested nil}
+                               :p {:inner nil}}]}]]
+            {}))))
+
 (t/deftest test-table-stats
   (t/testing "row table stats - should return stats/row-count"
     (t/is (= {:row-count 4}

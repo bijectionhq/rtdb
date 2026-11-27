@@ -156,7 +156,9 @@ class StructVector private constructor(
             endStruct()
         }
 
-    override fun writeValue0(v: ValueReader) = writeObject(v.readStruct())
+    override fun writeValue0(v: ValueReader) {
+        if (!v.copyIdentityTo(this)) writeObject(v.readStruct())
+    }
 
     internal fun canCopyObjectValueTo(dest: StructVector, idx: Int): Boolean =
         nullable == dest.nullable && childFields == dest.childFields && hasObjectIdentityChildren(idx)
@@ -196,6 +198,12 @@ class StructVector private constructor(
             return readers
         }
         override fun readObject(keyFn: IKeyFn<*>) = getObject(pos, keyFn)
+
+        override fun copyIdentityTo(dest: VectorWriter): Boolean {
+            if (dest !is StructVector || !canCopyObjectValueTo(dest, pos)) return false
+            this@StructVector.rowCopier(dest).copyRow(pos)
+            return true
+        }
     }
 
     override fun hashCode0(idx: Int, hasher: Hasher) =

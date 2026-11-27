@@ -6,7 +6,9 @@ import org.apache.arrow.vector.types.pojo.Field
 import org.apache.arrow.vector.types.pojo.FieldType
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import xtdb.arrow.I32_TYPE
@@ -56,6 +58,29 @@ class StructVectorTest {
             structVec.writeObject(m3)
 
             assertEquals(listOf(m1, m2, m3), structVec.asList)
+        }
+    }
+
+    @Test
+    fun `positioned struct writes skip the reader map only for matching complete layouts`() {
+        val type = structOf("nested" to structOf("text" to maybe(UTF8)))
+        val full = mapOf("nested" to mapOf("text" to "é😀"))
+        val sparse = mapOf("nested" to emptyMap<String, String>())
+        Vector.open(allocator, "src", type).use { src ->
+            src.writeObject(full)
+            src.writeObject(sparse)
+
+            Vector.open(allocator, "dst", type).use { dst ->
+                val rows = src.select(intArrayOf(1, 0)).valueReader()
+                assertFalse(rows.next().copyIdentityTo(dst))
+                dst.writeValue(rows)
+                val row = rows.next()
+                assertTrue(row.copyIdentityTo(dst))
+                dst.writeValue(object : ValueReader by row {
+                    override fun readStruct(): Map<String, ValueReader> = error("unexpected reader map")
+                })
+                assertEquals(listOf(sparse, full, full), dst.asList)
+            }
         }
     }
 

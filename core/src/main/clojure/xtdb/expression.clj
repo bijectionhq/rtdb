@@ -1991,16 +1991,21 @@
                     ~(f return-type (vary-meta map-sym assoc ::struct-fields fields))))}))
 
 (defmethod codegen-call [:get_field :struct] [{[^VectorType$Struct struct-type] :arg-types, :keys [field]}]
-  (if-let [val-type (.get (.getChildren struct-type) (str field))]
+  (if-let [^VectorType val-type (.get (.getChildren struct-type) (str field))]
     {:return-type val-type
      :continue-call (fn [f [struct-code]]
                       (let [{::keys [struct-reader struct-fields struct-bindings]} (meta struct-code)
                             field (str field)
+                            legs (seq (.getLegs val-type))
                             child-code (cond
                                          struct-reader `(.readField ~(with-tag struct-reader ValueReader) ~field)
                                          (and struct-fields (empty? struct-bindings)) (get struct-fields field)
                                          :else `(.get ~(with-tag struct-code Map) ~field))]
-                        (continue-read f val-type (with-tag child-code ValueReader))))}
+                        (if (and (next legs) (some #{#xt/type :null} legs))
+                          (let [child-sym (with-tag (gensym 'child) ValueReader)]
+                            `(let [~child-sym ~child-code]
+                               ~(continue-read f val-type child-sym)))
+                          (continue-read f val-type (with-tag child-code ValueReader)))))}
 
     {:return-type #xt/type :null, :->call-code (constantly nil)}))
 
@@ -2534,7 +2539,7 @@
                           (update-vals children (fn [_] (with-tag (gensym 'out-child) VectorWriter))))]
       {:writer-bindings (into [] (mapcat (fn [[k writer]] [writer `(.vectorFor ~out-vec-sym ~k)])) child-writers)
        :write-value-out! (fn [value-type code]
-                           (let [{::keys [struct-fields struct-bindings]} (meta code)]
+                           (let [{::keys [struct-fields struct-bindings struct-reader]} (meta code)]
                              (if (and child-writers
                                       (= struct-type value-type)
                                       (= (set (keys child-writers)) (set (keys struct-fields)))
@@ -2546,7 +2551,9 @@
                                     ~@(for [[reader _ writer] readers]
                                         `(.writeValue ~writer ~reader))
                                     (.endStruct ~out-vec-sym)))
-                               (write-value-code value-type out-vec-sym code))))})))
+                               (if struct-reader
+                                 `(.writeValue0 ~out-vec-sym ~(with-tag struct-reader ValueReader))
+                                 (write-value-code value-type out-vec-sym code)))))})))
 
 (defn wrap-zone-id-cache-buster [f]
   (fn [expr opts]
