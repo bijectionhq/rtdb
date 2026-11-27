@@ -666,8 +666,10 @@ impl DatabaseFactory {
                     // Default erasure keeps the prior generation readable for the garbage window after it observes the
                     // retirement: a reader that captured the prior catalog is protected for that window and no longer,
                     // as XTDB keeps an erased row in superseded files until the window lets them go.
-                    let grant = i64::try_from(self.options.garbage.garbage_lifetime.as_micros())
-                        .map_err(|_| Anomaly::incorrect("rtdb.node/garbage-lifetime", "The garbage lifetime exceeds the timestamp range"))?;
+                    // A negative lifetime, which XTDB accepts, keeps nothing past the observation.
+                    let grant = self.options.garbage.garbage_lifetime.num_microseconds()
+                        .ok_or_else(|| Anomaly::incorrect("rtdb.node/garbage-lifetime", "The garbage lifetime exceeds the timestamp range"))?
+                        .max(0);
                     let grant = if sealed_local_erasure {
                         grant.max(rtdb_storage::sealing::PLAINTEXT_DELIVERY_WINDOW.as_micros() as i64)
                     } else {

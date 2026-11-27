@@ -2921,7 +2921,7 @@ async fn a_successor_retires_an_old_leaders_trie_once_it_leaves_the_garbage_wind
         let mut config = options();
         config.compaction_threads = 1;
         config.garbage.blocks_to_keep = 1;
-        config.garbage.garbage_lifetime = lifetime;
+        config.garbage.garbage_lifetime = chrono::TimeDelta::from_std(lifetime).unwrap();
 
         let mut predecessor_config = config.clone();
         predecessor_config.replication.idle_heartbeat = false;

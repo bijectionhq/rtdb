@@ -441,7 +441,7 @@ async fn follower_cursor_during_collection(expire: bool) {
     writer_options.automatic_gc = true;
     if expire {
         writer_options.garbage.blocks_to_keep = 1;
-        writer_options.garbage.garbage_lifetime = Duration::ZERO;
+        writer_options.garbage.garbage_lifetime = chrono::TimeDelta::zero();
     }
     let writer_resources = Arc::new(NativeResources::default().with_local_log_clock(clock.clone(), true));
     let writer_services = NodeServices {

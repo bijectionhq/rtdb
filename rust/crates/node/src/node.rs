@@ -4339,7 +4339,8 @@ impl NativeSession {
         // lease issues no witness.
         let clock = Arc::clone(&node.factory.clock);
         let now = clock.monotonic_micros();
-        let lifetime = OWNED_READ_LIFETIME.min(node.factory.options.garbage.garbage_lifetime);
+        // A negative garbage lifetime, which XTDB accepts, retains superseded files for no time at all.
+        let lifetime = OWNED_READ_LIFETIME.min(node.factory.options.garbage.garbage_lifetime.to_std().unwrap_or(Duration::ZERO));
         let deadline = now.saturating_add(i64::try_from(lifetime.as_micros()).unwrap_or(i64::MAX));
         let lease_remaining = lease.as_ref().map(|lease| lease.local_cutoff().map_or(0, |cutoff| {
             i64::try_from(cutoff.saturating_duration_since(std::time::Instant::now()).as_micros()).unwrap_or(i64::MAX)

@@ -63,7 +63,8 @@ pub struct CompactorSettings {
 #[derive(Clone, Debug)]
 pub struct SearchSettings { pub enabled: bool, pub threads: usize, pub write_format: rtdb_node::SearchFileFormat }
 #[derive(Clone, Debug)]
-pub struct GarbageSettings { pub enabled: bool, pub blocks_to_keep: usize, pub garbage_lifetime: Duration }
+/// `garbage_lifetime` is signed, as XTDB's `java.time.Duration`: a negative lifetime is accepted as upstream does.
+pub struct GarbageSettings { pub enabled: bool, pub blocks_to_keep: usize, pub garbage_lifetime: chrono::TimeDelta }
 #[derive(Clone, Debug)]
 pub struct TracingSettings { pub enabled: bool, pub endpoint: String, pub service_name: String, pub query_tracing: bool, pub transaction_tracing: bool }
 /// Physical erasure enrolment for fresh Default primaries; both are off unless configured.
@@ -410,7 +411,7 @@ fn garbage(value: Option<Yaml>) -> Result<GarbageSettings> {
     let mut fields = YamlFields::new(value.unwrap_or_else(empty), "garbageCollector")?;
     let blocks_to_keep = fields.string("blocksToKeep")?.map(|text| yaml_int(&text).ok_or_else(|| invalid("'blocksToKeep' must be a 32-bit integer"))).transpose()?;
     let result = GarbageSettings { enabled: fields.boolean("enabled")?.unwrap_or(true), blocks_to_keep: positive(i64::from(blocks_to_keep.unwrap_or(10)), "blocksToKeep")?,
-        garbage_lifetime: duration(&mut fields, "garbageLifetime", 24 * 3600)? };
+        garbage_lifetime: fields.string("garbageLifetime")?.map(|value| parse_signed_duration(&value)).transpose()?.unwrap_or_else(|| chrono::TimeDelta::hours(24)) };
     fields.finish()?;
     Ok(result)
 }
@@ -480,7 +481,22 @@ fn ratio(fields: &mut YamlFields, key: &str, default: f64) -> Result<f64> {
 fn boolean(value: &Yaml, key: &str) -> Result<bool> { match scalar_string(value, key)?.as_str() { "true" => Ok(true), "false" => Ok(false), _ => Err(invalid(format!("{key} must be a boolean"))) } }
 fn duration(fields: &mut YamlFields, key: &str, seconds: u64) -> Result<Duration> { fields.string(key)?.map(|value| parse_duration(&value)).transpose().map(|value| value.unwrap_or(Duration::from_secs(seconds))) }
 
+/// Parses a non-negative ISO-8601 duration of days, hours, minutes and seconds.
 pub fn parse_duration(value: &str) -> Result<Duration> {
+    let nanos = duration_nanos(value)?;
+    let seconds = u64::try_from(nanos / 1_000_000_000).map_err(|_| invalid("Duration must be nonnegative"))?;
+    let fraction = u32::try_from(nanos % 1_000_000_000).map_err(|_| invalid("Duration must be nonnegative"))?;
+    Ok(Duration::new(seconds, fraction))
+}
+
+/// Parses an ISO-8601 duration of days, hours, minutes and seconds that may be negative, as `java.time.Duration.parse`.
+pub fn parse_signed_duration(value: &str) -> Result<chrono::TimeDelta> {
+    let nanos = duration_nanos(value)?;
+    let seconds = i64::try_from(nanos.div_euclid(1_000_000_000)).map_err(|_| invalid("Duration exceeds range"))?;
+    chrono::TimeDelta::new(seconds, nanos.rem_euclid(1_000_000_000) as u32).ok_or_else(|| invalid("Duration exceeds range"))
+}
+
+fn duration_nanos(value: &str) -> Result<i128> {
     let regex = regex::Regex::new(r"(?i)^([+-]?)P(?:([+-]?\d+)D)?(?:T(?:([+-]?\d+)H)?(?:([+-]?\d+)M)?(?:([+-]?\d+)(?:[.,](\d{0,9}))?S)?)?$").map_err(|error| invalid(error.to_string()))?;
     let captures = regex.captures(value).ok_or_else(|| invalid("Duration must use ISO-8601 days, hours, minutes and seconds"))?;
     if (2..=5).all(|index| captures.get(index).is_none()) || (value.to_ascii_uppercase().contains('T') && (3..=5).all(|index| captures.get(index).is_none())) { return Err(invalid("Duration has no components")); }
@@ -496,8 +512,6 @@ pub fn parse_duration(value: &str) -> Result<Duration> {
         }
     }
     if captures.get(1).is_some_and(|sign| sign.as_str() == "-") { nanos = nanos.checked_neg().ok_or_else(|| invalid("Duration exceeds range"))?; }
-    let seconds = u64::try_from(nanos / 1_000_000_000).map_err(|_| invalid("Duration must be nonnegative"))?;
-    let fraction = u32::try_from(nanos % 1_000_000_000).map_err(|_| invalid("Duration must be nonnegative"))?;
-    Ok(Duration::new(seconds, fraction))
+    Ok(nanos)
 }
 fn invalid(message: impl Into<String>) -> Anomaly { Anomaly::incorrect("xtdb/invalid-node-config", message) }

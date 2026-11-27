@@ -1,6 +1,7 @@
 use std::time::Duration;
 use rtdb_auth::{AuthConfig, Method};
-use rtdb_server::config::{KeyVaultSettings, NodeConfiguration, RemoteConfig, host_timezone_from, parse_duration};
+use chrono::TimeDelta;
+use rtdb_server::config::{KeyVaultSettings, NodeConfiguration, RemoteConfig, host_timezone_from, parse_duration, parse_signed_duration};
 
 fn decode(yaml: &str) -> rtdb_types::Result<NodeConfiguration> { NodeConfiguration::from_yaml_with_environment(yaml, &|_| None, false) }
 
@@ -135,7 +136,7 @@ fn startup_defaults_match_the_pinned_factories() {
     assert_eq!(config.indexer.rows_per_block, 102400);
     assert_eq!(config.indexer.flush_duration, Duration::from_secs(900));
     assert_eq!(config.garbage.blocks_to_keep, 10);
-    assert_eq!(config.garbage.garbage_lifetime, Duration::from_secs(86400));
+    assert_eq!(config.garbage.garbage_lifetime, TimeDelta::seconds(86400));
     assert_eq!(config.memory_cache.maximum_ratio, 0.5);
     assert!(config.disk_cache.is_none());
     assert!(matches!(config.auth, AuthConfig::SingleRootUser { password: None }));
@@ -332,6 +333,10 @@ fn durations_keep_fractional_and_component_sign_semantics() {
     assert_eq!(parse_duration("PT1M-2S").unwrap(), Duration::from_secs(58));
     assert_eq!(parse_duration("-PT-1S").unwrap(), Duration::from_secs(1));
     assert!(parse_duration("PT-0.1S").is_err());
+    assert_eq!(parse_signed_duration("PT-0.1S").unwrap(), TimeDelta::milliseconds(-100));
+    assert_eq!(parse_signed_duration("-PT1.000000001S").unwrap(), TimeDelta::nanoseconds(-1_000_000_001));
+    assert_eq!(parse_signed_duration("PT1M-2S").unwrap(), TimeDelta::seconds(58));
+    assert!(parse_signed_duration("PT").is_err());
     assert!(parse_duration("P1MT").is_err());
     assert!(parse_duration("PT").is_err());
 }
@@ -384,7 +389,7 @@ fn node_options_apply_indexer_compactor_gc_and_shared_memory_settings() {
     assert!(options.compaction.within_file_recency_branching);
     assert!(!options.automatic_gc);
     assert_eq!(options.garbage.blocks_to_keep, 4);
-    assert_eq!(options.garbage.garbage_lifetime, Duration::from_secs(43200));
+    assert_eq!(options.garbage.garbage_lifetime, TimeDelta::seconds(43200));
     assert!(options.read_only);
     assert!(config.node_options(1024).is_err());
 }
@@ -398,12 +403,18 @@ fn garbage_collector_settings_accept_the_forms_xtdb_yaml_accepts() {
             blocks => assert_eq!(decoded.unwrap().garbage.blocks_to_keep, blocks, "{text}"),
         }
     }
-    for (text, seconds) in [("PT12H", 43_200.0), ("P1D", 86_400.0), ("p1dt1h", 90_000.0), ("PT1H-30M", 1_800.0), ("-PT-1H", 3_600.0), ("PT0.5S", 0.5), ("PT1,25S", 1.25), ("PT", -1.0), ("P", -1.0), ("1h", -1.0)] {
+    // As XTDB, whose `garbageLifetime` is a `java.time.Duration`, a negative lifetime is accepted.
+    for (text, millis) in [("PT12H", Some(43_200_000)), ("P1D", Some(86_400_000)), ("p1dt1h", Some(90_000_000)), ("PT1H-30M", Some(1_800_000)), ("-PT-1H", Some(3_600_000)),
+        ("PT0.5S", Some(500)), ("PT1,25S", Some(1_250)), ("-PT1H", Some(-3_600_000)), ("PT-1H", Some(-3_600_000)), ("PT-0.5S", Some(-500)), ("-P1D", Some(-86_400_000)),
+        ("PT", None), ("P", None), ("1h", None)] {
         let decoded = decode(&format!("garbageCollector:\n  garbageLifetime: {text}\n"));
-        if seconds < 0.0 {
-            assert!(decoded.is_err(), "{text}");
-        } else {
-            assert_eq!(decoded.unwrap().garbage.garbage_lifetime, Duration::from_secs_f64(seconds), "{text}");
+        match millis {
+            None => assert!(decoded.is_err(), "{text}"),
+            Some(millis) => {
+                let config = decoded.unwrap();
+                assert_eq!(config.garbage.garbage_lifetime, TimeDelta::milliseconds(millis), "{text}");
+                assert_eq!(config.node_options(1 << 30).unwrap().garbage.garbage_lifetime, TimeDelta::milliseconds(millis), "{text}");
+            }
         }
     }
     for key in ["readerLease", "readerLeaseMargin"] {

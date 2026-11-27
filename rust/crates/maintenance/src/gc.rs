@@ -24,14 +24,22 @@ pub struct GarbageConfig {
     /// Search runs and entity and term directory pages follow the same window, from the supersession time the catalog
     /// records for each.
     pub blocks_to_keep: usize,
-    pub garbage_lifetime: Duration,
+    /// Signed, as XTDB's `java.time.Duration`: a negative lifetime moves the threshold past that transaction.
+    pub garbage_lifetime: chrono::TimeDelta,
     pub table_parallelism: usize,
     pub delete_parallelism: usize,
     pub chunk_size: usize,
 }
 
 impl Default for GarbageConfig {
-    fn default() -> Self { Self { blocks_to_keep: 10, garbage_lifetime: Duration::from_secs(24 * 60 * 60), table_parallelism: 8, delete_parallelism: 64, chunk_size: 1024 } }
+    fn default() -> Self { Self { blocks_to_keep: 10, garbage_lifetime: chrono::TimeDelta::hours(24), table_parallelism: 8, delete_parallelism: 64, chunk_size: 1024 } }
+}
+
+/// The garbage lifetime in whole microseconds, rounded towards positive infinity so a sub-microsecond lifetime never
+/// shortens the window; `None` where it exceeds the timestamp range.
+fn lifetime_micros(lifetime: chrono::TimeDelta) -> Option<i64> {
+    let nanos = i128::from(lifetime.num_seconds()) * 1_000_000_000 + i128::from(lifetime.subsec_nanos());
+    i64::try_from(nanos.div_euclid(1000) + i128::from(nanos.rem_euclid(1000) != 0)).ok()
 }
 
 impl GarbageConfig {
@@ -104,7 +112,7 @@ impl TrieCollector {
             let Some(index) = blocks.len().checked_sub(self.config.blocks_to_keep) else { return Ok(None); };
             let block = BlockCatalog::decode(&self.store.get(&blocks[index].key).await.map_err(crate::invalid)?)?;
             let Some(tx) = block.latest_completed_tx() else { return Ok(None); };
-            let duration = i64::try_from(self.config.garbage_lifetime.as_nanos().div_ceil(1000)).map_err(crate::invalid)?;
+            let duration = lifetime_micros(self.config.garbage_lifetime).ok_or_else(|| crate::invalid("Garbage lifetime exceeds timestamp range"))?;
             Ok(Some(Timestamp(tx.system_time.0.checked_sub(duration).ok_or_else(|| crate::invalid("Garbage lifetime exceeds timestamp range"))?)))
         }).await
     }
@@ -667,5 +675,23 @@ impl CycleWorker for BlockCollector {
             }
         }).buffer_unordered(self.config.table_parallelism).for_each(|_| async {}).await;
         if cancellation.is_cancelled() { Err(crate::closed()) } else { Ok(()) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::TimeDelta;
+    use super::lifetime_micros;
+
+    /// As XTDB subtracts a signed `java.time.Duration`, a negative lifetime moves the threshold later, never errors.
+    #[test]
+    fn lifetime_micros_accepts_negative_lifetimes_and_rounds_up() {
+        assert_eq!(lifetime_micros(TimeDelta::hours(24)), Some(86_400_000_000));
+        assert_eq!(lifetime_micros(TimeDelta::zero()), Some(0));
+        assert_eq!(lifetime_micros(TimeDelta::nanoseconds(1)), Some(1));
+        assert_eq!(lifetime_micros(TimeDelta::hours(-1)), Some(-3_600_000_000));
+        assert_eq!(lifetime_micros(TimeDelta::nanoseconds(-1)), Some(0));
+        assert_eq!(lifetime_micros(TimeDelta::nanoseconds(-1_001)), Some(-1));
+        assert_eq!(lifetime_micros(TimeDelta::MAX), None);
     }
 }
