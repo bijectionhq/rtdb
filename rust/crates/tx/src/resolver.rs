@@ -1103,8 +1103,7 @@ impl<'a> OpenTransaction<'a> {
             Mutation::Erase { table, input } => (Some(table), input, MutationKind::Erase),
             Mutation::Assert { input, message } => {
                 let mut cursor = execute(input, context, arguments, syntax).await?;
-                // TODO(w4/errors): assert_failed helper
-                if cursor.next_batch().await?.is_none() { return Err(Anomaly::new(AnomalyCategory::Conflict, footprint_grant_state::ASSERT_FAILED, message.unwrap_or_else(|| "Assert failed".into()))); }
+                if cursor.next_batch().await?.is_none() { return Err(footprint_grant_state::assert_failed(message.unwrap_or_else(|| "Assert failed".into()))); }
                 return Ok(());
             }
             Mutation::CreateTable { table, columns } => {
