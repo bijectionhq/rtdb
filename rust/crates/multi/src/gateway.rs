@@ -211,10 +211,12 @@ async fn connection(client: TcpStream, directory: Arc<dyn Directory>, options: G
     };
     let ordered = options.installed_cell.is_some()
         || options.installed_journals.as_ref().and_then(|routes| routes.by_name(&name)).is_some();
-    let Ok(remote_gateway) = tokio::time::timeout_at(startup_deadline, async {
-        if ordered { None } else { elsewhere(&directory, &name, &options).await }
-    }).await else {
-        return refuse(&mut client, "57P03", "Timed out looking up the deployment's cell").await;
+    let remote_gateway = match tokio::time::timeout_at(startup_deadline, async {
+        if ordered { Ok(None) } else { elsewhere(&directory, &name, &options).await }
+    }).await {
+        Ok(Ok(gateway)) => gateway,
+        Ok(Err(error)) => return refuse(&mut client, "57P03", error.message.as_deref().unwrap_or(error.code.as_ref())).await,
+        Err(_) => return refuse(&mut client, "57P03", "Timed out looking up the deployment's cell").await,
     };
     if let Some(gateway) = remote_gateway {
         startup.parameters.insert(RELAY_ANSWER_DEADLINE_PARAMETER.into(), "on".into());
@@ -271,13 +273,13 @@ async fn connection(client: TcpStream, directory: Arc<dyn Directory>, options: G
 }
 
 /// The gateway of the cell a deployment lives in, when that is not this gateway's cell.
-async fn elsewhere(directory: &Arc<dyn Directory>, name: &str, options: &GatewayOptions) -> Option<String> {
-    let (map, cell) = options.cells.as_ref()?;
-    let here = directory.deployment_by_name(name).await.ok().flatten();
-    if here.as_ref().is_some_and(|record| matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)) { return None; }
-    let living = map.cell_of(name).await.ok().flatten()?;
-    if &living == cell { return None; }
-    map.gateway(&living).await.ok().flatten()
+async fn elsewhere(directory: &Arc<dyn Directory>, name: &str, options: &GatewayOptions) -> Result<Option<String>> {
+    let Some((map, cell)) = options.cells.as_ref() else { return Ok(None); };
+    let here = directory.deployment_by_name(name).await?;
+    if here.as_ref().is_some_and(|record| matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)) { return Ok(None); }
+    let Some(living) = map.cell_of(name).await? else { return Ok(None); };
+    if &living == cell { return Ok(None); }
+    map.gateway(&living).await
 }
 
 struct GatewayRouter {
@@ -318,11 +320,13 @@ impl Heartbeats {
         let interval = options.touch_interval;
         let timeout = options.control_timeout;
         let key = control::ControlKey(options.capabilities.clone());
-        let request = Request::Touch { name };
+        let request = Request::Touch { name: name.clone() };
         let task = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
-                let _ = control::call(&address, &request, timeout, &key).await;
+                if let Err(error) = control::call(&address, &request, timeout, &key).await {
+                    tracing::warn!(deployment = %name, address = %address, code = %error.code, "Gateway backend heartbeat failed");
+                }
             }
         });
         let heartbeat = Arc::new(Heartbeat { registry: Arc::downgrade(self), target: target.clone(), _task: AbortOnDropHandle::new(task) });
@@ -885,5 +889,31 @@ mod tests {
         drop(active);
         drop((moved, other));
         assert!(heartbeats.0.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn elsewhere_propagates_cell_map_errors_instead_of_ignoring_them() {
+        struct FailingCellMap;
+
+        #[async_trait::async_trait]
+        impl crate::cells::CellMap for FailingCellMap {
+            async fn register_cell(&self, _: &str, _: &str) -> Result<()> { Ok(()) }
+            async fn gateway(&self, _: &str) -> Result<Option<String>> {
+                Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/cell-map-down", "cell map unavailable"))
+            }
+            async fn cells(&self) -> Result<BTreeMap<String, String>> { Ok(BTreeMap::new()) }
+            async fn cell_of(&self, _: &str) -> Result<Option<String>> {
+                Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/cell-map-down", "cell map unavailable"))
+            }
+            async fn assign(&self, _: &str, _: &str, _: Option<&str>) -> Result<bool> { Ok(false) }
+        }
+
+        let directory: Arc<dyn Directory> = rtdb_directory::MemoryDirectory::new();
+        let options = GatewayOptions {
+            cells: Some((Arc::new(FailingCellMap), "cell-a".into())),
+            ..GatewayOptions::default()
+        };
+        let error = elsewhere(&directory, "shop", &options).await.unwrap_err();
+        assert_eq!(error.code, "rtdb.multi/cell-map-down");
     }
 }
