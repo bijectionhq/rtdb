@@ -551,6 +551,8 @@ external entity SqlParser {
     -- Native Extended Parse lexes the full input before classifying the statement.
     -- If classification cannot reserve memory, existing prepared statements remain registered.
     -- Bind reserves argument slots before publishing a portal.
+    -- Memory exhaustion while decoding a Bind argument reports SQLSTATE `XX000`.
+    -- An invalid argument representation reports `22P02` for text and `22P03` for binary.
     -- The portal is bound to its originating statement registration for Close, including when an EXECUTE portal runs another statement.
     -- Extended Parse validates the grammar of every nested PREPARE body before installing the prepared statement.
     -- Executing a PREPARE prepares its immediate child in the current session context.

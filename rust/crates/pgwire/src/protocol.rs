@@ -1167,6 +1167,7 @@ fn java_regex_whitespace(character: char) -> bool {
 }
 
 fn invalid_argument(error: Anomaly, index: usize, format: Format) -> Anomaly {
+    if error.is(rtdb_types::AnomalyKind::ResourceExhausted) { return error; }
     Anomaly::new_nullable(rtdb_types::AnomalyCategory::Incorrect, "xtdb.pgwire/invalid-arg-representation", error.message)
         .with_context("arg-idx", index.into()).with_context("arg-format", if format == Format::Binary { "binary" } else { "text" }.into())
 }
@@ -2116,6 +2117,53 @@ mod tests {
         frontend.portals.clear();
         assert_eq!(memory.used_bytes(), before);
         drop((frame, writer, frontend));
+        driver.close_without_run().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bind_distinguishes_argument_memory_exhaustion_from_malformed_input() {
+        let (mut frontend, driver) = test_frontend(false).await;
+        let memory = Arc::clone(frontend.node.memory());
+        let prepared = frontend.prepare_client("SELECT $1 AS v", vec![23], None).await.unwrap();
+        frontend.register_statement(Cow::Borrowed("p"), prepared).unwrap();
+        let mut writer = Writer::new(tokio::io::sink(), Arc::clone(&memory));
+
+        let bind_frame = |format: Format, argument: &[u8]| {
+            let mut body = b"candidate\0p\0".to_vec();
+            body.extend_from_slice(&1u16.to_be_bytes());
+            body.extend_from_slice(&format.code().to_be_bytes());
+            body.extend_from_slice(&1u16.to_be_bytes());
+            body.extend_from_slice(&i32::try_from(argument.len()).unwrap().to_be_bytes());
+            body.extend_from_slice(argument);
+            body.extend_from_slice(&0u16.to_be_bytes());
+            let charge = memory.reserve(body.len()).unwrap();
+            Frame { tag: b'B', body, charge }
+        };
+        let binary = 42i32.to_be_bytes();
+        for (format, valid, malformed, sqlstate) in [
+            (Format::Text, b"42".as_slice(), b"x".as_slice(), "22P02"),
+            (Format::Binary, binary.as_slice(), b"\x2a".as_slice(), "22P03"),
+        ] {
+            let valid = bind_frame(format, valid);
+            let blocked = memory.reserve(memory.limit_bytes() - memory.used_bytes() - 4096).unwrap();
+            let error = frontend.message(&valid, &mut writer).await.unwrap_err();
+            assert!(error.is(rtdb_types::AnomalyKind::ResourceExhausted));
+            assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+            assert_eq!(crate::error::state(&error), "XX000");
+            assert!(!frontend.portals.contains_key("candidate"));
+            drop(blocked);
+
+            let malformed = bind_frame(format, malformed);
+            let error = frontend.message(&malformed, &mut writer).await.unwrap_err();
+            assert_eq!(error.code, "xtdb.pgwire/invalid-arg-representation");
+            assert_eq!(error.context["arg-idx"], 0);
+            assert_eq!(crate::error::state(&error), sqlstate);
+            assert!(!frontend.portals.contains_key("candidate"));
+
+            frontend.message(&valid, &mut writer).await.unwrap();
+            assert!(frontend.portals.remove("candidate").is_some());
+        }
+        drop(frontend);
         driver.close_without_run().await.unwrap();
     }
 

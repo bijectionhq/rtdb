@@ -49,6 +49,8 @@ The original input classification and any supplemental syntax charge stay reserv
 Prepared statements admit their projected parameter OID capacity before expanding it.
 A Bind admits its typed argument slots, reservation handles and retained portal name before creating the argument vectors.
 The portal carries the charge through argument and cursor release.
+A Bind that exhausts memory while decoding an argument reports `XX000`.
+Malformed text and binary arguments report `22P02` and `22P03` respectively.
 During extended Parse, the node's memory budget covers the temporary tokens used to identify a control statement.
 A directly prepared control retains its estimated parsing and binding allowance while a statement registration or bound portal holds it.
 A bound portal retains the body selected at Bind when a later Parse replaces the statement name.
