@@ -3,13 +3,14 @@ use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use bytes::{Bytes, BytesMut};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope, ReplicaFrame, ReplicaPeek, ReplicaPeekBody, SourceMessage}, keys::oversized_key, log::proto};
-use rtdb_storage::{Error as StorageError, IoRegion, ObjectKey, ObjectStore, cache::BufferPool, log::{AppendBuffer, AppendCapacity, AppendMode, AppendReceipt, GuardedAppend, Log, LogMetadata, LogOffset, LogRecord, LogReplayTail, LogTail}};
+use rtdb_storage::{Error as StorageError, IoRegion, ObjectKey, ObjectStore, cache::BufferPool, log::{AppendBuffer, AppendCapacity, AppendMode, AppendReceipt, GuardedAppend, LocalLogAttachment, Log, LogMetadata, LogOffset, LogRecord, LogReplayTail, LogTail}};
 use rtdb_storage::object_store::ReadReservation;
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, ReplicaPosition, Result, SourcePosition, StorageEpoch, StorageVersion, Term, TermSequence, Timestamp};
 
 use crate::maintenance_class::is_maintenance;
 use crate::readback_identity::{ReplicaFingerprint, fingerprint};
 
+pub(crate) const LOCAL_INTERACTIVE_MARKER: &[u8] = b"\xffrtdb-local-interactive";
 pub(crate) const APPEND_CAPACITY: &str = "rtdb.storage/append-capacity";
 pub(crate) const STRICT_DISPATCH_CUTOFF: &str = "rtdb.replication/strict-dispatch-cutoff";
 pub(crate) const STRICT_DISPATCH_UNAVAILABLE: &str = "rtdb.replication/strict-dispatch-unavailable";
@@ -315,6 +316,14 @@ impl PartitionLogs {
         let metadata = receipt.durable().await?;
         self.source_position(metadata)
     }
+    pub(crate) async fn append_source_interactive(&self, request: rtdb_tx::SourceTransaction, now: Timestamp) -> Result<SourcePosition> {
+        let bytes = request.local_interactive_retained_bytes()
+            .ok_or_else(|| Anomaly::fault("rtdb.replication/interactive-intake", "Local intake requires staged interactive effects"))?;
+        let attachment = LocalLogAttachment::new(request, bytes);
+        let receipt = self.source.enqueue_local_attachment(Bytes::from_static(LOCAL_INTERACTIVE_MARKER), attachment, now).await?;
+        self.source_position(receipt.durable().await?)
+    }
+
     pub async fn enqueue_replica(&self, envelope: &ReplicaEnvelope, block: BlockIndex, now: Timestamp) -> Result<ReplicaReceipt> {
         if matches!(&envelope.message, ReplicaBody::ResolvedTx(tx) if tx.acceptance_stage.is_some()) {
             return Err(Anomaly::fault("rtdb.replication/strict-dispatch-clock", "Strict replica writes require the live writer clock"));
@@ -340,11 +349,11 @@ impl PartitionLogs {
         self.replica.maximum_timed_original_append_bytes()
     }
 
-    fn encode_replica(&self, term: Term, sequence: Option<TermSequence>, body: &ReplicaBody) -> Result<AppendBuffer> {
+    fn encode_replica(&self, term: Term, sequence: Option<TermSequence>, body: &ReplicaBody, memory: &Arc<MemoryBudget>) -> Result<AppendBuffer> {
         let length = ReplicaEnvelope::encoded_body_len(term, sequence, body);
         let (prefix, suffix) = self.replica.append_headroom();
         let capacity = length.checked_add(prefix).and_then(|bytes| bytes.checked_add(suffix)).ok_or_else(size_overflow)?;
-        let mut charge = self.memory.reserve(encoded_allocation(length)?)?;
+        let mut charge = memory.reserve(encoded_allocation(length)?)?;
         let mut output = BytesMut::with_capacity(capacity);
         output.resize(prefix, 0);
         ReplicaEnvelope::encode_body(term, sequence, body, &mut output);
@@ -353,8 +362,30 @@ impl PartitionLogs {
         Ok(AppendBuffer::new(output, prefix, charge))
     }
 
+    pub(crate) fn prepay_interactive_replica(&self, body: &ReplicaBody, memory: &Arc<MemoryBudget>) -> Result<Arc<MemoryBudget>> {
+        let size = ReplicaEnvelope::maximum_encoded_len(body);
+        let maximum = self.replica.maximum_append_bytes().ok_or_else(|| Anomaly::unsupported(
+            "rtdb/interactive-inline", "The standalone journal must declare its inline capacity",
+        ))?;
+        if size > maximum {
+            return Err(Anomaly::incorrect("rtdb/interactive-inline", "The prepared transaction exceeds the local journal's inline capacity")
+                .with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded));
+        }
+        let read = size.checked_add(1024).and_then(|bytes| bytes.checked_mul(2)).ok_or_else(size_overflow)?;
+        let decode = replica_decode_bound(read)?;
+        let encode = encoded_allocation(size)?;
+        let reserved = encode.checked_add(read).and_then(|bytes| bytes.checked_add(decode))
+            .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size_overflow)?;
+        memory.prepay(reserved)
+    }
+
     pub(crate) async fn enqueue_replica_with(&self, term: Term, sequence: Option<TermSequence>, body: &ReplicaBody, block: BlockIndex, clock: impl Fn() -> Timestamp + Send + Sync,
         allow_offload: bool, before_enqueue: impl FnOnce(&[u8]) -> Result<()>) -> Result<ReplicaReceipt> {
+        self.enqueue_replica_in(term, sequence, body, block, clock, allow_offload, before_enqueue, &self.memory).await
+    }
+
+    pub(crate) async fn enqueue_replica_in(&self, term: Term, sequence: Option<TermSequence>, body: &ReplicaBody, block: BlockIndex, clock: impl Fn() -> Timestamp + Send + Sync,
+        allow_offload: bool, before_enqueue: impl FnOnce(&[u8]) -> Result<()>, memory: &Arc<MemoryBudget>) -> Result<ReplicaReceipt> {
         let stage = match body {
             ReplicaBody::ResolvedTx(tx) => tx.checked_acceptance_stage()?
                 .map(|stage| (stage.clock_upper, stage.cutoff, stage.journal)),
@@ -362,7 +393,7 @@ impl PartitionLogs {
                 .map(|(upper, cutoff, journal)| (upper, cutoff, Some(journal))),
             _ => None,
         };
-        let mut payload = self.encode_replica(term, sequence, body)?;
+        let mut payload = self.encode_replica(term, sequence, body, memory)?;
         before_enqueue(payload.payload())?;
         if let Some((upper, cutoff, journal)) = stage {
             let guard = GuardedAppend::new(&clock, upper, cutoff, journal);
@@ -393,7 +424,7 @@ impl PartitionLogs {
                 if let Some(version) = self.replica.publish_replica_payload(self.store.as_ref(), &key, payload.into_bytes()).await? {
                     proxy.bind_offload_publication(version)?;
                 }
-                let mut payload = self.encode_replica(proxy.term, proxy.term_sequence, &proxy.message)?;
+                let mut payload = self.encode_replica(proxy.term, proxy.term_sequence, &proxy.message, memory)?;
                 self.append_replica_buffer(&mut payload, now, maintenance).await?
             }
             Err(error) => return Err(error.into()),

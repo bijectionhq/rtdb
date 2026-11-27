@@ -80,6 +80,7 @@ pub struct SourceTransaction {
     pub(crate) guard: Option<SourceGuard>,
     placed_seed: Option<PlacedAttemptSeed>,
     pub(crate) prepared_landing: Option<crate::resolver::PreparedLanding>,
+    pub(crate) interactive: Option<crate::resolver::PreparedInteractive>,
     pub(crate) memory: Arc<MemoryBudget>,
     _reservation: Arc<MemoryReservation>,
 }
@@ -145,10 +146,32 @@ impl SourceTransaction {
     }
 
     pub fn requires_durable_predecessor(&self) -> bool {
-        crate::resolver::is_prepared_landing(&self.operations) || self.uses_staging_deadline()
+        self.interactive.is_some() || crate::resolver::is_prepared_landing(&self.operations) || self.uses_staging_deadline()
             || self.operations.iter().any(|operation| matches!(operation,
                 Operation::Public(TxOp::HostedControl(control)) if control.is_assertion_family_marker())
                 || matches!(operation, Operation::Public(TxOp::OwnedAdoptRelation { .. })))
+    }
+
+    pub fn local_interactive_retained_bytes(&self) -> Option<usize> {
+        if !self.operations.is_empty() || self.guard.is_some() || self.placed_seed.is_some() || self.prepared_landing.is_some()
+            || self.options.system_time.is_none() || self.options.user_metadata.is_some()
+        {
+            return None;
+        }
+        Some(self.interactive.as_ref()?.retained_bytes().saturating_add(self._reservation.bytes()))
+    }
+
+    pub fn local_interactive_rejection_budget(&self) -> Option<Arc<MemoryBudget>> {
+        Some(self.interactive.as_ref()?.rejection_budget())
+    }
+
+    pub fn clone_local_interactive(&self) -> Option<Self> {
+        self.local_interactive_retained_bytes()?;
+        let interactive = self.interactive.as_ref()?.clone();
+        Some(Self {
+            operations: Vec::new(), options: self.options.clone(), guard: None, placed_seed: None, prepared_landing: None,
+            interactive: Some(interactive), memory: Arc::clone(&self.memory), _reservation: Arc::clone(&self._reservation),
+        })
     }
 
     pub fn uses_staging_deadline(&self) -> bool {
@@ -216,7 +239,7 @@ impl SourceTransaction {
             bytes = bytes.checked_add(text).and_then(|size| size.checked_add(ids)).and_then(|size| size.checked_add(table.map_or(0, |table| table.schema.capacity() + table.table.capacity()))).and_then(|size| size.checked_add(256)).ok_or_else(overflow)?;
         }
         let reservation = memory.reserve(bytes)?;
-        Ok(Self { operations, options, guard: None, placed_seed: None, prepared_landing: None, memory: Arc::clone(memory), _reservation: reservation })
+        Ok(Self { operations, options, guard: None, placed_seed: None, prepared_landing: None, interactive: None, memory: Arc::clone(memory), _reservation: reservation })
     }
 
     pub fn with_idempotency_guard(mut self, submitted_at: Timestamp, after_bootstrap: bool) -> Self {
@@ -496,6 +519,7 @@ impl SourceTransaction {
     }
 
     fn encode_for(&self, purpose: SourcePurpose) -> Result<RetainedBytes> {
+        if self.interactive.is_some() { return Err(invalid("An interactive transaction requires a process-local attachment")); }
         self.validate_bounded_retry_guard()?;
         let prefix = matches!(self.guard, Some(SourceGuard::Replay(_) | SourceGuard::Bounded(_))).then(|| {
             Operation::Public(TxOp::Sql { sql: LEGACY_REPLAY_ABORT.into(), args: None })

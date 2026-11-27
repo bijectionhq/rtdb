@@ -358,3 +358,148 @@ async fn standalone_classic_journals_keep_durable_async_submission() {
     drop(child.0.stdin.take().unwrap());
     assert!(child.exit().success());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standalone_interactive_sql_opens_portals_at_execute_and_checks_the_commit_basis() {
+    let state = private_dir();
+    assert!(
+        command("initialize-standalone", state.path(), UUID)
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let session = private_dir();
+    let tls = sql_identity(session.path());
+    let mut child = Process(launch(state.path(), session.path(), UUID).spawn().unwrap());
+    let port = child.ready(&session.path().join("ready.json"))["port"]
+        .as_u64()
+        .unwrap()
+        .try_into()
+        .unwrap();
+    tokio::time::timeout(TIMEOUT, async {
+        let mut client = sql_client(port, tls.clone()).await;
+        let observer = sql_client(port, tls).await;
+        client.batch_execute("SET TIME ZONE 'UTC'").await.unwrap();
+        observer.batch_execute("SET TIME ZONE 'UTC'").await.unwrap();
+        client
+            .batch_execute("INSERT INTO orders (_id, total) VALUES (1, 10), (2, 20)")
+            .await
+            .unwrap();
+
+        let tx = client
+            .build_transaction()
+            .read_only(false)
+            .start()
+            .await
+            .unwrap();
+        let begin_clock: String = tx.query_one("SELECT CAST(CURRENT_TIMESTAMP AS VARCHAR)", &[]).await.unwrap().get(0);
+        let prepared = tx
+            .prepare("SELECT CAST(total AS BIGINT) FROM orders ORDER BY _id")
+            .await
+            .unwrap();
+        let portal = tx.bind(&prepared, &[]).await.unwrap();
+        tx.batch_execute("UPDATE orders SET total = total + 1")
+            .await
+            .unwrap();
+        let first = tx.query_portal(&portal, 1).await.unwrap();
+        assert_eq!(first[0].get::<_, i64>(0), 11);
+        tx.batch_execute("UPDATE orders SET total = 44 WHERE _id = 2")
+            .await
+            .unwrap();
+        let remaining = tx.query_portal(&portal, 0).await.unwrap();
+        assert_eq!(remaining[0].get::<_, i64>(0), 21);
+        let staged_clock: String = tx
+            .query_one("SELECT CAST(_system_from AS VARCHAR) FROM orders WHERE _id = 2", &[])
+            .await.unwrap().get(0);
+        assert_eq!(staged_clock, begin_clock);
+        assert_eq!(
+            rows(&observer, "SELECT total FROM orders ORDER BY _id").await,
+            vec![vec!["10"], vec!["20"]]
+        );
+        tx.commit().await.unwrap();
+        assert_eq!(
+            rows(&observer, "SELECT total FROM orders ORDER BY _id").await,
+            vec![vec!["11"], vec!["44"]]
+        );
+        let durable_clock: String = observer
+            .query_one("SELECT CAST(_system_from AS VARCHAR) FROM orders WHERE _id = 2", &[])
+            .await.unwrap().get(0);
+        assert_eq!(durable_clock, begin_clock);
+
+        let tx = client
+            .build_transaction()
+            .read_only(false)
+            .start()
+            .await
+            .unwrap();
+        tx.batch_execute("UPDATE orders SET total = 12 WHERE _id = 1")
+            .await
+            .unwrap();
+        let read = tx
+            .simple_query("SELECT total FROM orders WHERE _id = 1")
+            .await
+            .unwrap();
+        let observed = read.iter().find_map(|message| match message {
+            SimpleQueryMessage::Row(row) => row.get(0),
+            _ => None,
+        });
+        assert_eq!(observed, Some("12"));
+        observer
+            .batch_execute("UPDATE orders SET total = 99 WHERE _id = 1")
+            .await
+            .unwrap();
+        let conflict = tx.commit().await.unwrap_err();
+        assert_eq!(
+            conflict.code(),
+            Some(&tokio_postgres::error::SqlState::T_R_SERIALIZATION_FAILURE)
+        );
+        assert_eq!(
+            rows(&observer, "SELECT total FROM orders ORDER BY _id").await,
+            vec![vec!["99"], vec!["44"]]
+        );
+
+        let tx = client.build_transaction().read_only(false).start().await.unwrap();
+        let count: i64 = tx.query_one("SELECT COUNT(*) FROM orders WHERE total < 50", &[])
+            .await.unwrap().get(0);
+        assert_eq!(count, 1);
+        tx.batch_execute("UPDATE orders SET total = 45 WHERE _id = 2").await.unwrap();
+        observer.batch_execute("INSERT INTO orders (_id, total) VALUES (3, 10)").await.unwrap();
+        assert_eq!(tx.commit().await.unwrap_err().code(), Some(&tokio_postgres::error::SqlState::T_R_SERIALIZATION_FAILURE));
+
+        let tx = client.build_transaction().read_only(false).start().await.unwrap();
+        tx.batch_execute("DELETE FROM orders WHERE _id = 3").await.unwrap();
+        assert!(tx.query_opt("SELECT total FROM orders WHERE _id = 3", &[]).await.unwrap().is_none());
+        tx.rollback().await.unwrap();
+
+        let tx = client.build_transaction().read_only(false).start().await.unwrap();
+        assert_eq!(
+            tx.batch_execute("SET rtdb_idempotency_key = 'late-key'").await.unwrap_err().code(),
+            Some(&tokio_postgres::error::SqlState::FEATURE_NOT_SUPPORTED)
+        );
+        tx.rollback().await.unwrap();
+        assert_eq!(
+            rows(&observer, "SELECT total FROM orders ORDER BY _id").await,
+            vec![vec!["99"], vec!["44"], vec!["10"]]
+        );
+    })
+    .await
+    .unwrap();
+    child.0.kill().unwrap();
+    assert!(!child.exit().success());
+
+    let reopened = private_dir();
+    let tls = sql_identity(reopened.path());
+    let mut child = Process(launch(state.path(), reopened.path(), UUID).spawn().unwrap());
+    let port = child.ready(&reopened.path().join("ready.json"))["port"]
+        .as_u64().unwrap().try_into().unwrap();
+    tokio::time::timeout(TIMEOUT, async {
+        let observer = sql_client(port, tls).await;
+        assert_eq!(
+            rows(&observer, "SELECT total FROM orders ORDER BY _id").await,
+            vec![vec!["99"], vec!["44"], vec!["10"]]
+        );
+    }).await.unwrap();
+    drop(child.0.stdin.take().unwrap());
+    assert!(child.exit().success());
+}

@@ -78,6 +78,7 @@ impl NativeSession {
     /// Prepares on the current catalogue with the timezone captured by a gateway before a move.
     pub async fn prepare_context_with_timezone(&mut self, timezone: Option<&str>, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
         cancellation.run_until_cancelled(async {
+            if let Some(context) = self.interactive_query_context(self.state.database(), timezone, cancellation).await? { return Ok(context); }
             let mut basis = self.state.prepare_basis().await?;
             if let Some(timezone) = timezone { basis.timezone = rtdb_expr::normalize_timezone(timezone)?; }
             Ok(self.instrument_query_context(self.service.query_context(self.state.database(), &basis, cancellation).await?))
@@ -88,6 +89,7 @@ impl NativeSession {
     /// `cancellation` must descend from `state().cancellation()`.
     pub async fn prepare_context_for(&mut self, database: &str, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
         cancellation.run_until_cancelled(async {
+            if let Some(context) = self.interactive_query_context(database, None, cancellation).await? { return Ok(context); }
             let basis = self.state.prepare_basis().await?;
             Ok(self.instrument_query_context(self.service.query_context(database, &basis, cancellation).await?))
         }).await.ok_or_else(cancelled)?
@@ -97,6 +99,7 @@ impl NativeSession {
     /// `cancellation` must descend from `state().cancellation()`.
     pub async fn query_context_for(&mut self, database: &str, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
         cancellation.run_until_cancelled(async {
+            if let Some(context) = self.interactive_query_context(database, None, cancellation).await? { return Ok(context); }
             let basis = self.state.read_basis().await?;
             Ok(self.instrument_query_context(self.service.query_context(database, &basis, cancellation).await?))
         }).await.ok_or_else(cancelled)?
@@ -125,6 +128,7 @@ impl NativeSession {
     /// Unchecked reads are for EXECUTE arguments and the frontend's exact pgjdbc type probe.
     pub async fn query_context_with(&mut self, cancellation: &CancellationToken, checked: bool) -> Result<Arc<QueryContext>> {
         cancellation.run_until_cancelled(async {
+            if let Some(context) = self.interactive_query_context(self.state.database(), None, cancellation).await? { return Ok(context); }
             let basis = if checked { self.state.read_basis().await? } else { self.state.unchecked_read_basis().await? };
             Ok(self.instrument_query_context(self.service.query_context(self.state.database(), &basis, cancellation).await?))
         }).await.ok_or_else(cancelled)?
@@ -210,7 +214,7 @@ impl NativeSession {
             ControlStatement::Begin(options) => {
                 self.state.check_begin()?;
                 let settings = evaluate_transaction_settings(options, arguments, self.state.effective_timezone(), self.state.session_timezone(), self.service.node.query_instant(), self.service.node.memory(), &allocation, catalog).await?;
-                self.state.begin_with(settings)?;
+                self.state.begin_sql(settings, cancellation).await?;
                 Ok(command("BEGIN", allocation))
             }
             ControlStatement::SetTransaction(options) => {
@@ -342,7 +346,9 @@ impl NativeSession {
     }
 
     fn control_context<'a>(&'a self, parameters: Parameters<'a>, allocation: &'a EvaluationScope, catalog: Option<&'a dyn rtdb_expr::PgCatalogLookup>) -> EvalContext<'a> {
-        EvalContext { parameters, parameter_types: None, current_time: self.service.node.query_instant(), timezone: self.state.effective_timezone(), outer_rows: &[], snapshot_token: None, allocation: Some(allocation), catalog }
+        let current_time = self.state.interactive().ok().flatten().and_then(|transaction| transaction.system_time().ok())
+            .map_or_else(|| self.service.node.query_instant(), Into::into);
+        EvalContext { parameters, parameter_types: None, current_time, timezone: self.state.effective_timezone(), outer_rows: &[], snapshot_token: None, allocation: Some(allocation), catalog }
     }
 
     fn check_database_control(&self, action: &str, name: &str, options: ControlExecutionOptions) -> Result<()> {
@@ -353,17 +359,19 @@ impl NativeSession {
     }
 
     async fn show_transaction_isolation_level(&mut self, cancellation: &CancellationToken) -> Result<QueryCursor> {
-        let basis = self.state.read_basis().await?;
-        let context = self.instrument_query_context(self.service.query_context(self.state.database(), &basis, cancellation).await?);
+        let isolation = if self.is_interactive_write() { "serializable" } else { "read committed" };
+        let context = self.query_context_with(cancellation, true).await?;
         let reservation = context.memory.reserve(8192)?;
         let mut binder = Binder::default();
         let schema = Schema::new(vec![binder.field("transaction_isolation", None, LogicalType::Scalar(ScalarType::Utf8))?])?;
-        QueryCursor::from_rows(schema, vec![vec![Value::Utf8("read committed".into())]], context, reservation)
+        QueryCursor::from_rows(schema, vec![vec![Value::Utf8(isolation.into())]], context, reservation)
     }
 
     async fn show(&mut self, name: &str, checked: bool, source: Option<SourceInspection>, cancellation: &CancellationToken) -> Result<QueryCursor> {
-        let basis = if checked { self.state.read_basis().await? } else { self.state.inspection_basis()? };
-        let context = self.instrument_query_context(self.service.query_context(self.state.database(), &basis, cancellation).await?);
+        let context = if checked { self.query_context_with(cancellation, true).await? } else {
+            let basis = self.state.inspection_basis()?;
+            self.instrument_query_context(self.service.query_context(self.state.database(), &basis, cancellation).await?)
+        };
         let mut bound = 8192usize;
         if let Some(value) = self.state.parameter(name) { bound = size(bound, value.len().checked_mul(4).ok_or_else(|| invalid("SHOW allocation size overflow"))?)?; }
         if let Some(token) = if name == "latest_submitted_tx" { self.state.last_submitted_await_token() } else { self.state.effective_await_token() } { bound = size(bound, token.len().checked_mul(4).ok_or_else(|| invalid("SHOW token size overflow"))?)?; }
@@ -385,7 +393,7 @@ impl NativeSession {
             "clock_time" if checked => {
                 let zone = Some(self.state.effective_timezone().to_owned());
                 (vec![(name, LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: zone.clone() }))],
-                 vec![vec![Value::Timestamp { value: basis.current_time.as_micros()?.0, unit: TimeUnit::Microsecond, timezone: zone }]])
+                 vec![vec![Value::Timestamp { value: context.current_time.as_micros()?.0, unit: TimeUnit::Microsecond, timezone: zone }]])
             }
             "timezone" => (vec![(name, if checked { text.clone() } else { text.clone().maybe() })], vec![vec![Value::Utf8(self.state.effective_timezone().into())]]),
             "application_name" => (vec![(name, text.clone().maybe())], vec![vec![Value::Utf8(self.state.application_name().into())]]),

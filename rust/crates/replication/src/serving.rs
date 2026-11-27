@@ -397,6 +397,11 @@ impl SourceReplies {
     }
 }
 
+pub(crate) struct PreparedClassicObservation {
+    touches_data: bool,
+    effects: Option<classic::PreparedEffects>,
+}
+
 pub(crate) struct NativeServing {
     authority: NativeServingAuthority,
     fold: Option<TransactState>,
@@ -1020,6 +1025,26 @@ impl NativeServing {
         index.advance_classic(BranchCut { basis: Basis::new(self.authority.incarnation, anchor), system_time })?;
         index.seal_classic_checkpoint();
         self.install_classic_index(index, Vec::new())
+    }
+
+    pub(crate) fn prepare_classic_observation(shares_main: bool, write: &StagedWrite, memory: &Arc<MemoryBudget>) -> PreparedClassicObservation {
+        let touches_data = classic::touches_data(write);
+        let effects = (touches_data && shares_main).then(|| classic::PreparedEffects::prepare(write, memory)).and_then(Result::ok);
+        PreparedClassicObservation { touches_data, effects }
+    }
+
+    pub(crate) fn observe_prepared_classic(&mut self, prepared: PreparedClassicObservation, write: &StagedWrite, replica: ReplicaPosition) -> Result<()> {
+        if !prepared.touches_data { return Ok(()); }
+        if let Some(effects) = prepared.effects {
+            if !self.shares_main || self.main_write_pending() || self.holds_checkpoint() { return Err(invalid()); }
+            let mut index = self.durable().index().clone();
+            let position = self.next_position()?.max(replica_basis_position(replica)?);
+            if let Ok(charges) = effects.apply(&mut index, position, write) {
+                return self.install_classic_index(index, charges);
+            }
+        }
+        self.observe_unprojected_classic(Some(replica));
+        Ok(())
     }
 
     pub(crate) fn observe_classic(&mut self, write: &StagedWrite, replica: ReplicaPosition, memory: &Arc<MemoryBudget>) -> Result<()> {

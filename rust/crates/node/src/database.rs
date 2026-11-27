@@ -48,6 +48,7 @@ pub struct Database {
     installed_journal: bool,
     pub(crate) logs: Arc<PartitionLogs>,
     pub(crate) replication: ReplicationHandle,
+    pub(crate) prepares_local_interactive: bool,
     serving: Option<Arc<dyn crate::serving::ServingDriver>>,
     pub(crate) native_serving_authority: Option<crate::serving::NativeServingAuthority>,
     pub(crate) default_native_handle: Option<rtdb_replication::NativeServingHandle>,
@@ -537,7 +538,8 @@ impl DatabaseFactory {
                 Some(builder)
             } else { None };
             let search = builders.iter().find(|(_, builder)| builder.prepares_serving_search()).map(|(_, builder)| Arc::clone(builder));
-            let mut replica_driver = if history.is_some() || search.is_some() {
+            let prepares_local_interactive = history.is_none() && search.is_none();
+            let mut replica_driver = if !prepares_local_interactive {
                 replica_driver.with_serving_search(Arc::new(PrepareSearch { search, history }))
             } else { replica_driver };
             let publisher: Option<Arc<dyn CompactionPublisher>> = match (&self.compaction_relay, read_only) {
@@ -657,7 +659,7 @@ impl DatabaseFactory {
             }
             static ATTACHMENTS: AtomicU64 = AtomicU64::new(0);
             let database = Arc::new(Database { attachment: ATTACHMENTS.fetch_add(1, Ordering::Relaxed), writes_event_history: event_history, protected_equality_epoch: uuid::Uuid::new_v4(), tokens, name, configuration, read_only, partition, storage, resolve,
-                installed_journal: resources.installed_journal, logs, replication, serving, native_serving_authority: native_authority, default_native_handle,
+                installed_journal: resources.installed_journal, logs, replication, prepares_local_interactive, serving, native_serving_authority: native_authority, default_native_handle,
                 custody_provider: Default::default(), replica_read_index: opened_logs.replica_read_index,
                 await_authority: opened_logs.await_authority,
                 transaction_admission: RwLock::default(), submitted_bytes: AtomicU64::new(0), replica_read_sessions: AtomicUsize::new(0), latest_stored_block: AtomicI64::new(-1),

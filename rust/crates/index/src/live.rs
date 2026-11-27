@@ -1092,6 +1092,36 @@ impl StagedWrite {
         Ok(Self { tx_key, predecessor, block_index, tables, segments: OnceLock::new() })
     }
     pub fn tx_key(&self) -> TransactionKey { self.tx_key }
+
+    pub fn assign_interactive_position(mut self, key: TransactionKey, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        if self.tx_key.system_time != key.system_time || self.predecessor.is_some_and(|predecessor| key.tx_id <= predecessor.tx_id)
+            || self.tables.values().any(TableWrite::is_adopted_history)
+        {
+            return Err(invalid("Interactive effects must keep their staged system time and extend their captured predecessor"));
+        }
+        self.segments.take();
+        for write in self.tables.values_mut() {
+            let Some(batch) = &write.batch else { continue; };
+            if batch.is_empty() { continue; }
+            if batch.view().has_origin_column() {
+                return Err(invalid("An interactive event cannot yet carry a durable origin"));
+            }
+            let _positions = memory.reserve(batch.len().checked_mul(32).ok_or_else(|| invalid("Event positions exceed memory"))?)?;
+            let positions = batch.headers.0.iter().map(|header| {
+                let position = header.position.filter(|position| position.transaction == self.tx_key.tx_id
+                    && matches!(header.op, EventOp::Put | EventOp::Delete))
+                    .ok_or_else(|| invalid("An interactive event must be a put or delete at its provisional position"))?;
+                Ok(EventPosition { transaction: key.tx_id, ordinal: position.ordinal })
+            }).collect::<Result<Vec<_>>>()?;
+            if self.tx_key != key {
+                let owned = rtdb_format::data::append_event_positions(&batch.owned, positions, memory)?;
+                write.batch = Some(IndexBatch::from_owned(owned)?);
+            }
+        }
+        self.tx_key = key;
+        Ok(self)
+    }
+
     pub fn predecessor(&self) -> Option<TransactionKey> { self.predecessor }
     pub fn block_index(&self) -> BlockIndex { self.block_index }
     pub fn tables(&self) -> &BTreeMap<TableRef, TableWrite> { &self.tables }

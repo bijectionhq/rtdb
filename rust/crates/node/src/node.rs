@@ -1058,7 +1058,8 @@ impl Node {
             return Ok(if db.external_source() { result.as_ref().clone() } else { answer_duplicate(result.as_ref().clone()) });
         }
         let basis = QueryBasis { snapshot: self.snapshot_basis()?, replica_capture: None, resume_token: None, has_await_floor: false, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
-        let context = self.query_context_in_placement(database, &basis, identity, placement, CatalogReadCut::Current, cancellation).await?;
+        let cut = if placement.is_some() && !self.catalog.is_placed() { CatalogReadCut::Single } else { CatalogReadCut::Current };
+        let context = self.query_context_in_placement(database, &basis, identity, placement, cut, cancellation).await?;
         let arguments = vec![Value::I64(tx_id.0)];
         let mut cursor = self.outcome_query(OutcomeQuery::Await, &context, &arguments)?.execute(context, arguments).await?;
         let batch = cursor.next_batch().await?.ok_or_else(|| Anomaly::fault("xtdb/tx-await-missing", format!("tx {tx_id} not found after await")))?;
@@ -3632,6 +3633,32 @@ impl NativeSession {
     pub fn track_replica_read_session(&self) -> Result<impl Send + use<>> {
         Ok(self.service.database()?.track_replica_read_session())
     }
+    pub fn is_interactive_write(&self) -> bool { self.state.is_interactive_write() }
+
+    pub(crate) async fn interactive_query_context(
+        &self, database: &str, timezone: Option<&str>, cancellation: &CancellationToken,
+    ) -> Result<Option<Arc<QueryContext>>> {
+        let Some(transaction) = self.state.interactive()? else { return Ok(None); };
+        if database != self.state.database() { return Err(crate::session::interactive_unavailable()); }
+        self.state.revalidate().await?;
+        let timezone = rtdb_expr::normalize_timezone(timezone.unwrap_or_else(|| self.state.effective_timezone()))?;
+        let attachment = self.service.interactive_database(database)?;
+        if !transaction.belongs_to(&attachment.resolve) { return Err(lost_placement(database)); }
+        let placement = Arc::downgrade(&attachment);
+        let current_time = transaction.system_time()?.into();
+        let basis = QueryBasis {
+            snapshot: TimeBasis { databases: BTreeMap::from([(database.to_owned(), vec![Some(current_time)])]) },
+            replica_capture: Some(crate::session::ReplicaQueryCapture {
+                attachment: placement.clone(), snapshot: Arc::new(transaction.snapshot()?),
+            }),
+            resume_token: None, has_await_floor: false, snapshot_time: None,
+            current_time, timezone,
+        };
+        let context = self.service.node.query_context_in_placement(
+            database, &basis, self.service.identity.as_ref(), Some(&placement), CatalogReadCut::Single, cancellation,
+        ).await?;
+        Ok(Some(self.instrument_query_context(context)))
+    }
     pub fn state(&self) -> &Session { &self.state }
     pub fn state_mut(&mut self) -> &mut Session { &mut self.state }
     /// Identifies the placed replica history of this authenticated attachment.
@@ -4271,6 +4298,7 @@ impl NativeSession {
     }
 
     pub async fn query_context(&mut self) -> Result<Arc<QueryContext>> {
+        if let Some(context) = self.interactive_query_context(self.state.database(), None, self.state.cancellation()).await? { return Ok(context); }
         let basis = self.state.read_basis().await?;
         Ok(self.instrument_query_context(self.service.query_context(self.state.database(), &basis, self.state.cancellation()).await?))
     }
@@ -4396,6 +4424,19 @@ async fn ordered_commit_observation(
 impl NativeSessionService {
     fn database(&self) -> Result<Arc<Database>> {
         self.node.attached_database(&self.database, self.placement.as_ref())
+    }
+
+    fn interactive_database(&self, name: &str) -> Result<Arc<Database>> {
+        let database = self.node.attached_database(name, self.placement.as_ref())?;
+        if self.node.catalog.is_placed() || self.node.factory.resources.journal_native_sql()
+            || !database.logs.uses_volatile_intake()
+            || !database.prepares_local_interactive
+            || !matches!(database.await_authority, AwaitAuthority::SourcePosition)
+            || database.external_source()
+        {
+            return Err(crate::session::interactive_unavailable());
+        }
+        Ok(database)
     }
 
     async fn confirm_placed_token(&self, db: &Database, token: PlacedToken, timeout: Duration, cancellation: &CancellationToken) -> Result<Option<(TransactionResult, String)>> {
@@ -4572,6 +4613,44 @@ impl SessionService for NativeSessionService {
     }
     async fn submit_replay(&self, database: &str, operations: Vec<TxOp>, options: SubmitOptions, permit: crate::ReplaySubmissionPermit, cancellation: &CancellationToken) -> Result<SubmittedTx> {
         self.submit_scheduled(database, operations.into_iter().map(ScheduledOperation::from).collect(), options, Some(permit), cancellation).await
+    }
+
+    fn supports_interactive(&self, database: &str) -> bool {
+        self.interactive_database(database).is_ok()
+    }
+    async fn open_interactive(
+        &self, database: &str, options: SubmitOptions, cancellation: &CancellationToken,
+    ) -> Result<rtdb_tx::InteractiveTransaction> {
+        self.node.admit(database, DatabaseAccess::Read, self.identity.as_ref(), cancellation).await?;
+        self.node.admit(database, DatabaseAccess::Write, self.identity.as_ref(), cancellation).await?;
+        let attachment = self.interactive_database(database)?;
+        attachment.require_writable()?;
+        self.node.ensure_indexing()?;
+        rtdb_tx::InteractiveTransaction::open(
+            attachment.snapshot(), self.node.now(), options, Arc::clone(&attachment.resolve),
+        )
+    }
+    async fn commit_interactive(
+        &self, database: &str, transaction: rtdb_tx::InteractiveTransaction, cancellation: &CancellationToken,
+    ) -> Result<(SubmittedTx, TransactionResult)> {
+        self.node.admit(database, DatabaseAccess::Write, self.identity.as_ref(), cancellation).await?;
+        let attachment = self.interactive_database(database)?;
+        if !transaction.belongs_to(&attachment.resolve) { return Err(lost_placement(database)); }
+        attachment.require_writable()?;
+        let request = transaction.into_source()?;
+        let observer = self.node.execution_observer();
+        let position = {
+            let _sample = rtdb_plan::ExecutionSample::new(observer.clone(), rtdb_plan::ExecutionTimer::SourceAppend);
+            cancellation.run_until_cancelled(attachment.replication.submit_source_interactive(request, self.node.now()))
+                .await.ok_or_else(cancelled)??
+        };
+        let submitted = SubmittedTx { tx_id: TxId(position.0), placed_receipt: None };
+        let placement = Arc::downgrade(&attachment);
+        let _await = rtdb_plan::ExecutionSample::new(observer, rtdb_plan::ExecutionTimer::TxAwait);
+        let result = self.node.await_transaction_result(
+            database, submitted.tx_id, None, self.identity.as_ref(), Some(&placement), cancellation,
+        ).await?;
+        Ok((submitted, result))
     }
 
     async fn submit_scheduled(&self, database: &str, operations: Vec<ScheduledOperation>, options: SubmitOptions, permit: Option<crate::ReplaySubmissionPermit>, cancellation: &CancellationToken) -> Result<SubmittedTx> {

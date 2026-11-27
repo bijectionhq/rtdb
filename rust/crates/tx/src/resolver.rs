@@ -42,6 +42,10 @@ mod schedule_order;
 mod retry;
 mod retention;
 mod sql_argument_table;
+
+mod interactive;
+pub use interactive::InteractiveTransaction;
+pub(crate) use interactive::PreparedInteractive;
 pub use retention::installed_receipt_time;
 mod fixed_range;
 pub(crate) mod ordered_micros;
@@ -67,6 +71,7 @@ pub trait TransactionAuthorization: Send + Sync {
     fn is_hosted_control_owner(&self, _principal: &str) -> bool { false }
 }
 
+#[derive(Clone)]
 pub struct ResolveContext {
     pub footprint_grants: FootprintGrantOptions,
     pub decision_clock: Option<Arc<dyn crate::DecisionClock>>,
@@ -253,7 +258,7 @@ pub struct WriterPublication<'a> {
 
 struct ResolvedHead {
     key: TransactionKey,
-    receipt_time: Option<Timestamp>,
+    receipt_time: Option<Option<Timestamp>>,
 }
 
 pub struct TxResolver {
@@ -269,11 +274,35 @@ pub struct TxResolver {
 impl TxResolver {
     pub fn new(seed: Option<TransactionKey>, source_position: SourcePosition, external_token: Option<Vec<u8>>, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let token_reservation = memory.reserve(external_token.as_ref().map_or(0, Vec::capacity).checked_add(512).ok_or_else(overflow)?)?;
-        let queue_reservation = memory.reserve(128)?;
-        Ok(Self { resolved_head: seed.map(|key| ResolvedHead { key, receipt_time: None }), source_position, external_token, queue: VecDeque::new(), memory: Arc::clone(memory), token_reservation, queue_reservation, plans: mutation_plans::MutationPlans::new(memory) })
+        let queue_reservation = memory.reserve(128 + 8 * std::mem::size_of::<Arc<ResolvedTx>>())?;
+        Ok(Self { resolved_head: seed.map(|key| ResolvedHead { key, receipt_time: None }), source_position, external_token, queue: VecDeque::with_capacity(8), memory: Arc::clone(memory), token_reservation, queue_reservation, plans: mutation_plans::MutationPlans::new(memory) })
     }
     pub fn resolved_head(&self) -> Option<TransactionKey> { self.resolved_head.as_ref().map(|head| head.key) }
-    fn latest_receipt_time(&self) -> Option<Timestamp> { self.resolved_head.as_ref().and_then(|head| head.receipt_time) }
+    fn latest_receipt_time(&self) -> Option<Timestamp> { self.observed_receipt_time().flatten() }
+    fn observed_receipt_time(&self) -> Option<Option<Timestamp>> {
+        self.resolved_head.as_ref().map_or(Some(None), |head| head.receipt_time)
+    }
+
+    pub fn receipt_clock_ready(&self) -> bool { self.observed_receipt_time().is_some() }
+
+    pub fn preserve_receipt_clock(&mut self, previous: &Self) {
+        if let (Some(head), Some(prior)) = (&mut self.resolved_head, &previous.resolved_head)
+            && head.key == prior.key
+        {
+            head.receipt_time = prior.receipt_time;
+        }
+    }
+
+    pub async fn initialize_receipt_clock(&mut self, applied: Snapshot, context: &ResolveContext) -> Result<()> {
+        if let Some(head) = &mut self.resolved_head && head.receipt_time.is_none() {
+            if applied.tx_basis() != Some(head.key) {
+                return Err(Anomaly::fault("rtdb.tx/receipt-predecessor", "The receipt clock requires the exact applied predecessor"));
+            }
+            let query = context.query_context(applied, head.key.system_time, &context.default_tz, None)?;
+            head.receipt_time = Some(installed_receipt_time(query, head.key).await?);
+        }
+        Ok(())
+    }
     pub fn source_position(&self) -> SourcePosition { self.source_position }
     pub fn external_token(&self) -> Option<&[u8]> { self.external_token.as_deref() }
     pub fn staged_rows(&self) -> Result<u64> { self.queue.iter().try_fold(0u64, |rows, tx| rows.checked_add(tx.writes.row_count()?).ok_or_else(overflow)) }
@@ -288,7 +317,7 @@ impl TxResolver {
         }) {
             return Err(Anomaly::fault("rtdb.tx/serving-predecessor", "The serving transaction does not extend the physical prefix"));
         }
-        self.resolved_head = Some(ResolvedHead { key, receipt_time: self.latest_receipt_time() });
+        self.resolved_head = Some(ResolvedHead { key, receipt_time: self.observed_receipt_time() });
         self.advance_source(self.source_position.max(SourcePosition(key.tx_id.0)))
     }
 
@@ -356,9 +385,17 @@ impl TxResolver {
     }
 
     pub async fn resolve_source_with_authority(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp,
-        mut request: SourceTransaction, context: &ResolveContext, writer: Option<WriterPublication<'_>>,
+        request: SourceTransaction, context: &ResolveContext, writer: Option<WriterPublication<'_>>,
         classic_authority: Option<&rtdb_index::branches::BranchIndex>,
     ) -> std::result::Result<Arc<ResolvedTx>, SourceFailure> {
+        let (resolved, receipt_time) = self.build_source(durable, position, log_time, request, context, writer, classic_authority).await?;
+        self.stage_resolved(resolved, receipt_time).map_err(SourceFailure::from)
+    }
+
+    async fn build_source(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp,
+        mut request: SourceTransaction, context: &ResolveContext, writer: Option<WriterPublication<'_>>,
+        classic_authority: Option<&rtdb_index::branches::BranchIndex>,
+    ) -> std::result::Result<(ResolvedTx, Timestamp), SourceFailure> {
         let _sample = rtdb_plan::ExecutionSample::new(context.execution_observer.clone(), rtdb_plan::ExecutionTimer::TxOp);
         let span = context.transaction_span(None, "xtdb.transaction", &[("operations.count", rtdb_plan::TraceValue::Unsigned(request.operations.len() as u64))]);
         context.check_cancelled()?;
@@ -368,7 +405,12 @@ impl TxResolver {
         let base = self.resolving_snapshot(durable)?;
         let has_owned_operations = request.operations.iter().any(Operation::is_owned);
         let default_time = self.smooth(log_time)?;
-        let supplied_time = self.supplied_time(request.options.system_time, TxId(position.0))?;
+        let interactive_basis = request.interactive.as_ref().map_or(Ok(()), |prepared| prepared.validate_basis(&base));
+        let supplied_time = if interactive_basis.is_ok() {
+            self.supplied_time(request.options.system_time, TxId(position.0))?
+        } else {
+            Ok(None)
+        };
         let attempt = request.placed_attempt(position)?;
         let decision = match &context.decision_clock {
             Some(clock) => Some(clock.observe().await?),
@@ -464,7 +506,7 @@ impl TxResolver {
         let mut prepared_writes = None;
         let mut settled = false;
         let mut failed_op = None;
-        let outcome = if let Some(error) = supplied_time.err().or(slot_time.err()).or(placement.err()).or(plan_error).or(retry_error) {
+        let outcome = if let Some(error) = interactive_basis.err().or(supplied_time.err()).or(slot_time.err()).or(placement.err()).or(plan_error).or(retry_error) {
             Err(error)
         } else if has_owned_operations && matches!(request.guard, Some(SourceGuard::Bounded(_))) {
             Err(Anomaly::incorrect("rtdb/idempotency-owned-scope", "Bounded application retry metadata is supported on ordinary transactions"))
@@ -475,6 +517,12 @@ impl TxResolver {
         } else if staging_deadline.is_some() && (attempt.is_none() || attempt.map(PlacedAttempt::scope) != context.owned_witness_scope
             || request.guard.is_some() || request.idempotency_key().is_some()) {
             Err(Anomaly::incorrect("rtdb.owned/staging-deadline", "A staging deadline requires a fresh placed source attempt"))
+        } else if let Some(prepared) = request.interactive.take() {
+            match prepared.resolve(key, &context.memory) {
+                Ok(writes) => { prepared_writes = Some(writes); Ok(()) }
+                Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => Err(error),
+                Err(error) => return Err(error.into()),
+            }
         } else if let Some(generation) = request.prepared_landing.take() {
             if request.guard.is_some() || request.options.user_metadata.is_some() || request.options.system_time.is_some() {
                 return Err(Anomaly::fault("rtdb.owned/prepared-generation", "A prepared generation carried unsupported transaction options").into());
@@ -677,7 +725,50 @@ impl TxResolver {
             resolved = tx.finish_source(result, input, log_time, clock, &[], None).await?;
         }
         context.check_cancelled()?;
-        self.stage_resolved(resolved, receipt_time).map_err(SourceFailure::from)
+        Ok((resolved, receipt_time))
+    }
+
+    pub async fn resolve_local_interactive<T>(
+        &mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp, request: SourceTransaction,
+        context: &ResolveContext, authority: Option<&rtdb_index::branches::BranchIndex>, skipped: bool,
+        preflight: impl Fn(&ResolvedTx, &Arc<MemoryBudget>) -> Result<T>,
+    ) -> Result<(Arc<ResolvedTx>, T, Option<Arc<MemoryBudget>>)> {
+        let funding = request.local_interactive_rejection_budget()
+            .ok_or_else(|| Anomaly::fault("rtdb.tx/interactive-funding", "Interactive commit has no funded rejection"))?;
+        let previous_receipt = self.observed_receipt_time()
+            .ok_or_else(|| Anomaly::fault("rtdb.tx/interactive-receipt", "Interactive commit has no established receipt clock"))?;
+        if !self.queue.is_empty() {
+            return Err(Anomaly::fault("rtdb.tx/interactive-order", "Interactive preflight needs the applied predecessor"));
+        }
+        let candidate = if skipped {
+            Err(Anomaly::fault("xtdb/skipped-tx", "Transaction was skipped"))
+        } else {
+            self.build_source(durable.clone(), position, log_time, request, context, None, authority).await
+                .map_err(Anomaly::from).and_then(|(resolved, time)| {
+                    let dispatch = preflight(&resolved, &context.memory)?;
+                    Ok((resolved, time, dispatch))
+                })
+        };
+        match candidate {
+            Ok((resolved, time, dispatch)) => Ok((self.stage_resolved(resolved, time)?, dispatch, None)),
+            Err(error) if skipped || error.is(rtdb_types::AnomalyKind::ResourceExhausted) || error.is(rtdb_types::AnomalyKind::ProgramLimitExceeded) => {
+                let mut context = context.clone();
+                context.memory = Arc::clone(&funding);
+                let key = TransactionKey { tx_id: TxId(position.0), system_time: self.smooth(log_time)? };
+                let options = SubmitOptions { default_tz: context.default_tz.clone(), ..SubmitOptions::default() };
+                let mut tx = OpenTransaction::new(durable, key, &options, &context)?;
+                let clock = retention::RetentionClock::observe(previous_receipt, log_time);
+                let result = TransactionResult::Aborted {
+                    tx_key: key,
+                    error: Some(crate::RetainedAnomaly::new(error, &context.memory)?),
+                };
+                let resolved = tx.finish_source(result, ResolvedInput::Position(position), log_time, clock, &[], None).await?;
+                let dispatch = preflight(&resolved, &context.memory)?;
+                context.check_cancelled()?;
+                Ok((self.stage_resolved(resolved, clock.time)?, dispatch, Some(funding)))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub async fn resolve_external(&mut self, durable: Snapshot, now: Timestamp, system_time: Option<Timestamp>, token: Option<Vec<u8>>, writer: &mut dyn TransactionWriter, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
@@ -780,7 +871,7 @@ impl TxResolver {
         }
         let resolved = Arc::new(resolved);
         self.queue.push_back(Arc::clone(&resolved));
-        self.resolved_head = Some(ResolvedHead { key, receipt_time: Some(receipt_time) });
+        self.resolved_head = Some(ResolvedHead { key, receipt_time: Some(Some(receipt_time)) });
         self.source_position = position;
         if let Some(token) = &resolved.external_token {
             self.external_token = Some(token.clone());
@@ -857,12 +948,19 @@ pub struct OpenTransaction<'a> {
     decision: Option<crate::DecisionObservation>,
     clock_slot: Option<crate::OwnedClockSlot>,
     terms_time: Timestamp,
+    interactive: bool,
     /// The resolver's kept plans, where this transaction may reuse and keep them.
     plans: Option<Arc<mutation_plans::MutationPlans>>,
 }
 impl<'a> OpenTransaction<'a> {
     fn new(base: Snapshot, key: TransactionKey, options: &'a SubmitOptions, context: &'a ResolveContext) -> Result<Self> {
-        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), capacity_changes: OwnedCapacityChanges::default(), owned_worlds: BTreeMap::new(), timed_world_overlays: BTreeMap::new(), owned_changes: BTreeMap::new(), bounded_period_writes: BTreeMap::new(), hosted_replay: None, search_erasure_admitted: false, replay_rank_erases: None, placed_attempt: None, decision: None, clock_slot: None, terms_time: key.system_time, plans: None })
+        let buffer = TransactionBuffer::new(base, key, Arc::clone(&context.memory))?;
+        Ok(Self::with_buffer(buffer, options, context))
+    }
+
+    fn with_buffer(buffer: TransactionBuffer, options: &'a SubmitOptions, context: &'a ResolveContext) -> Self {
+        let terms_time = buffer.tx_key().system_time;
+        Self { buffer, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), capacity_changes: OwnedCapacityChanges::default(), owned_worlds: BTreeMap::new(), timed_world_overlays: BTreeMap::new(), owned_changes: BTreeMap::new(), bounded_period_writes: BTreeMap::new(), hosted_replay: None, search_erasure_admitted: false, replay_rank_erases: None, placed_attempt: None, decision: None, clock_slot: None, terms_time, interactive: false, plans: None }
     }
     pub fn tx_key(&self) -> TransactionKey { self.buffer.tx_key() }
 
@@ -992,6 +1090,11 @@ impl<'a> OpenTransaction<'a> {
     /// transaction's catalog answers the planning's lookups the same.
     async fn execute_sql_typed(&mut self, sql: &str, arguments: Option<BoundArgumentRow<'_>>, planned: &mut Option<PlannedMutation>) -> Result<()> {
         let (mutation, query, context, syntax) = self.plan_sql_mutation(sql, arguments, planned)?;
+        if self.interactive && !matches!(mutation, rtdb_sql::Mutation::Put { .. } | rtdb_sql::Mutation::Delete { .. }
+            | rtdb_sql::Mutation::Assert { .. } | rtdb_sql::Mutation::CreateTable { .. })
+        {
+            return Err(interactive::unsupported());
+        }
         self.execute_mutation(mutation, query, context, arguments, Some(syntax)).await.map_err(|error| error.with_context("sql", sql.into()))
     }
 

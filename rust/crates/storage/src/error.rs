@@ -54,6 +54,8 @@ pub enum Error {
     GuardedAppendUnavailable,
     #[error("the journal provider does not implement guarded append")]
     GuardedAppendUnsupported,
+    #[error("the journal provider cannot retain a process-local attachment")]
+    LocalAttachmentUnsupported,
     #[error("cache requires {requested} bytes; limit is {limit} with {retained} retained")]
     MemoryLimit { requested: usize, limit: usize, retained: usize },
     #[error("storage task failed: {0}")]
@@ -108,6 +110,7 @@ impl From<Error> for rtdb_types::Anomaly {
             Error::GuardedAppendCutoff => (Category::Unavailable, "rtdb.storage/guarded-append-cutoff", serde_json::json!({})),
             Error::GuardedAppendUnavailable => (Category::Unavailable, "rtdb.storage/guarded-append-unavailable", serde_json::json!({})),
             Error::GuardedAppendUnsupported => (Category::Unsupported, "rtdb.storage/guarded-append-unsupported", serde_json::json!({})),
+            Error::LocalAttachmentUnsupported => (Category::Unsupported, "rtdb.storage/local-attachment-unsupported", serde_json::json!({})),
             Error::MemoryLimit { requested, limit, retained } => (Category::Busy, "rtdb.storage/memory-limit", serde_json::json!({"requested": requested, "limit": limit, "retained": retained})),
             Error::Task(_) | Error::ImmutableLength { .. } => (Category::Fault, "rtdb.storage/task", serde_json::json!({})),
             Error::Remote { key, .. } => (Category::Unavailable, "rtdb.storage/remote", serde_json::json!({"key": key})),

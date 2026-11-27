@@ -1,4 +1,4 @@
-use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}};
 
 use crate::{Anomaly, AnomalyKind, Result};
 
@@ -10,7 +10,19 @@ pub struct MemoryBudget {
     used_bytes: AtomicUsize,
     peak_bytes: AtomicUsize,
     parent: Option<Arc<MemoryBudget>>,
-    funding: Option<Arc<MemoryReservation>>,
+    funding: Option<PrepaidFunding>,
+}
+
+#[derive(Debug)]
+enum PrepaidFunding {
+    Fixed { _lease: Arc<MemoryReservation> },
+    Reclaimable(Mutex<ReclaimableFunding>),
+}
+
+#[derive(Debug)]
+struct ReclaimableFunding {
+    lease: MemoryReservation,
+    settled: bool,
 }
 
 /// The limit that had no room for a reservation, as it stood when it refused.
@@ -26,7 +38,7 @@ impl Refusal {
 }
 
 impl MemoryBudget {
-    fn with_parts(limit_bytes: usize, parent: Option<Arc<Self>>, funding: Option<Arc<MemoryReservation>>) -> Arc<Self> {
+    fn with_parts(limit_bytes: usize, parent: Option<Arc<Self>>, funding: Option<PrepaidFunding>) -> Arc<Self> {
         Arc::new(Self { limit_bytes, used_bytes: AtomicUsize::new(0), peak_bytes: AtomicUsize::new(0), parent, funding })
     }
 
@@ -51,7 +63,24 @@ impl MemoryBudget {
     /// Retained reservations keep the funding alive, even after the owner closes.
     pub fn prepay(self: &Arc<Self>, bytes: usize) -> Result<Arc<Self>> {
         let funding = self.reserve(bytes)?;
+        Ok(Self::with_parts(bytes, None, Some(PrepaidFunding::Fixed { _lease: funding })))
+    }
+
+    /// Prepays a region until its work finishes. The region can then return unused credit
+    /// while live allocations continue to charge the original budget for their actual lifetime.
+    pub fn prepay_reclaimable(self: &Arc<Self>, bytes: usize) -> Result<Arc<Self>> {
+        self.admit(bytes).map_err(Refusal::into_anomaly)?;
+        let lease = MemoryReservation { budget: Arc::clone(self), bytes, backing: Box::default() };
+        let funding = PrepaidFunding::Reclaimable(Mutex::new(ReclaimableFunding { lease, settled: false }));
         Ok(Self::with_parts(bytes, None, Some(funding)))
+    }
+
+    pub fn settle_prepaid(&self) {
+        if let Some(PrepaidFunding::Reclaimable(funding)) = &self.funding {
+            let mut funding = funding.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            funding.lease.release_to(self.used_bytes());
+            funding.settled = true;
+        }
     }
 
     pub fn is_prepaid(&self) -> bool { self.funding.is_some() }
@@ -97,6 +126,17 @@ impl MemoryBudget {
 
     /// Admits bytes at the root first and at this budget last, releasing the ancestors' admission if this one refuses.
     fn admit(&self, bytes: usize) -> std::result::Result<(), Refusal> {
+        if let Some(PrepaidFunding::Reclaimable(funding)) = &self.funding {
+            let mut funding = funding.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if funding.settled {
+                let retained = self.used_bytes();
+                let next = retained.checked_add(bytes).filter(|next| *next <= self.limit_bytes)
+                    .ok_or(Refusal { bytes, limit: self.limit_bytes, retained })?;
+                funding.lease.budget.admit(bytes)?;
+                funding.lease.bytes = next;
+            }
+            return self.acquire(bytes);
+        }
         if let Some(parent) = &self.parent { parent.admit(bytes)?; }
         if let Err(refusal) = self.acquire(bytes) {
             if let Some(parent) = &self.parent { parent.release(bytes); }
@@ -106,8 +146,14 @@ impl MemoryBudget {
     }
 
     fn release(&self, bytes: usize) {
-        self.used_bytes.fetch_sub(bytes, Ordering::AcqRel);
-        if let Some(parent) = &self.parent { parent.release(bytes); }
+        if let Some(PrepaidFunding::Reclaimable(funding)) = &self.funding {
+            let mut funding = funding.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = self.used_bytes.fetch_sub(bytes, Ordering::AcqRel);
+            if funding.settled { funding.lease.release_to(previous - bytes); }
+        } else {
+            self.used_bytes.fetch_sub(bytes, Ordering::AcqRel);
+            if let Some(parent) = &self.parent { parent.release(bytes); }
+        }
     }
 
     /// Counts the reservation controls created by a successful `reserve`, including this budget and every ancestor.
@@ -151,6 +197,10 @@ impl MemoryBudget {
         let mut budget = Some(self);
         while let Some(current) = budget {
             available = available.min(current.limit_bytes.saturating_sub(current.used_bytes()));
+            if let Some(PrepaidFunding::Reclaimable(funding)) = &current.funding {
+                let funding = funding.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if funding.settled { available = available.min(funding.lease.budget.available_bytes()); }
+            }
             budget = current.parent.as_deref();
         }
         available
@@ -234,4 +284,32 @@ fn ordered_index_snapshot_budget_shares_only_ordinary_equal_limit_scopes() {
     assert!(Arc::ptr_eq(&root, request.snapshot_budget().unwrap()));
     assert!(root.scope_with_limit(4096).scope().snapshot_budget().is_none());
     assert!(root.prepay(4096).unwrap().scope().snapshot_budget().is_none());
+}
+
+
+#[test]
+fn reclaimable_prepay_keeps_only_live_allocations_after_settlement() {
+    let root = MemoryBudget::new(8192);
+    let prepaid = root.prepay_reclaimable(4096).unwrap();
+    let child = prepaid.scope();
+    let stage = child.reserve(512).unwrap();
+    let other = root.reserve(4096).unwrap();
+    assert_eq!(root.used_bytes(), 8192);
+
+    prepaid.settle_prepaid();
+    assert_eq!(root.used_bytes(), 4608);
+    assert_eq!(child.available_bytes(), 3584);
+    let outside = root.reserve(3072).unwrap();
+    assert_eq!(child.available_bytes(), 512);
+    assert!(child.reserve(513).is_err());
+    let after = child.reserve(512).unwrap();
+    assert_eq!(root.used_bytes(), 8192);
+
+    drop(prepaid);
+    drop(stage);
+    assert_eq!(root.used_bytes(), 7680);
+    drop(after);
+    drop(outside);
+    drop(other);
+    assert_eq!(root.used_bytes(), 0);
 }

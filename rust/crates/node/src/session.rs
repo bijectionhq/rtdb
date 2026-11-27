@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::basis::{decode_tx_basis, encode_tx_basis};
 use rtdb_plan::AccessMode;
-use rtdb_tx::{ScheduledOperation, SubmitOptions, SubmittedTx, TransactionResult, TxOp, UserMetadata};
+use rtdb_tx::{InteractiveTransaction, ScheduledOperation, SubmitOptions, SubmittedTx, TransactionResult, TxOp, UserMetadata};
 use rtdb_types::{Anomaly, Instant, Result, TimeBasis, Timestamp, TransactionKey, TxBasis, TxId, Value};
 use tokio_util::sync::CancellationToken;
 
@@ -46,6 +46,13 @@ pub trait SessionService: Send + Sync {
     }
     async fn submit_scheduled_async(&self, database: &str, operations: Vec<ScheduledOperation>, options: SubmitOptions, cancellation: &CancellationToken) -> Result<SubmittedTx> {
         self.submit_scheduled(database, operations, options, None, cancellation).await
+    }
+    fn supports_interactive(&self, _database: &str) -> bool { false }
+    async fn open_interactive(&self, _database: &str, _options: SubmitOptions, _cancellation: &CancellationToken) -> Result<InteractiveTransaction> {
+        Err(interactive_unavailable())
+    }
+    async fn commit_interactive(&self, _database: &str, _transaction: InteractiveTransaction, _cancellation: &CancellationToken) -> Result<(SubmittedTx, TransactionResult)> {
+        Err(interactive_unavailable())
     }
     async fn await_transaction(&self, database: &str, tx_id: TxId, cancellation: &CancellationToken) -> Result<TransactionResult>;
     async fn await_submission(&self, database: &str, submitted: &SubmittedTx, cancellation: &CancellationToken) -> Result<(TransactionResult, Option<String>)> {
@@ -245,6 +252,7 @@ enum Phase {
     Pending(Option<ReadOptions>),
     Reading { basis: RetainedBasis, await_token: Option<RetainedText> },
     Writing { buffer: DmlBuffer, options: WriteOptions },
+    Interactive(Option<InteractiveTransaction>),
 }
 
 struct Transaction {
@@ -350,7 +358,12 @@ impl Session {
         Ok(())
     }
     pub fn database(&self) -> &str { &self.database }
-    pub fn set_database(&mut self, database: impl Into<String>) -> Result<()> { self.ensure_open()?; self.database = RetainedText::new(database.into(), self.service.memory())?; Ok(()) }
+    pub fn set_database(&mut self, database: impl Into<String>) -> Result<()> {
+        self.ensure_open()?;
+        if self.is_interactive_write() { return Err(interactive_unavailable()); }
+        self.database = RetainedText::new(database.into(), self.service.memory())?;
+        Ok(())
+    }
     pub fn application_name(&self) -> &str { self.parameter("application_name").unwrap_or("XTDB") }
     pub fn set_application_name(&mut self, name: impl Into<String>) -> Result<()> { self.set_parameter("application_name", Some(name.into())) }
     pub fn user(&self) -> Option<&str> { self.service.user() }
@@ -374,11 +387,19 @@ impl Session {
             Lifecycle::Closed => TransactionStatus::Closed,
             Lifecycle::Open(None) => TransactionStatus::Idle,
             Lifecycle::Open(Some(tx)) if tx.failed => TransactionStatus::Failed,
-            Lifecycle::Open(Some(tx)) => match &tx.phase { Phase::Pending(_) => TransactionStatus::Pending, Phase::Reading { .. } => TransactionStatus::Reading, Phase::Writing { .. } => TransactionStatus::Writing },
+            Lifecycle::Open(Some(tx)) => match &tx.phase { Phase::Pending(_) => TransactionStatus::Pending, Phase::Reading { .. } => TransactionStatus::Reading, Phase::Writing { .. } | Phase::Interactive(_) => TransactionStatus::Writing },
         }
     }
     pub fn is_read_only(&self) -> bool { matches!(self.transaction().map(|tx| &tx.phase), Some(Phase::Reading { .. } | Phase::Pending(Some(_)))) }
-    pub fn is_read_write(&self) -> bool { matches!(self.transaction().map(|tx| &tx.phase), Some(Phase::Writing { .. })) }
+    pub fn is_read_write(&self) -> bool { matches!(self.transaction().map(|tx| &tx.phase), Some(Phase::Writing { .. } | Phase::Interactive(_))) }
+    pub(crate) fn is_interactive_write(&self) -> bool { matches!(self.transaction().map(|tx| &tx.phase), Some(Phase::Interactive(_))) }
+    pub(crate) fn interactive(&self) -> Result<Option<&InteractiveTransaction>> {
+        self.require_usable_transaction()?;
+        match self.transaction().map(|tx| &tx.phase) {
+            Some(Phase::Interactive(transaction)) => transaction.as_ref().map(Some).ok_or_else(interactive_unavailable),
+            _ => Ok(None),
+        }
+    }
     pub fn set_await_token(&mut self, token: Option<String>) -> Result<()> {
         self.ensure_open()?;
         let token = token.map(|token| RetainedText::new(token, self.service.memory())).transpose()?;
@@ -402,6 +423,11 @@ impl Session {
     pub fn set_parameter(&mut self, name: impl Into<String>, value: Option<String>) -> Result<()> {
         self.ensure_open()?;
         let name = name.into();
+        if name == crate::node::IDEMPOTENCY_KEY_PARAMETER && self.is_interactive_write()
+            && value.as_ref().is_some_and(|key| !key.is_empty())
+        {
+            return Err(interactive_unavailable());
+        }
         if name == "bijection.at" {
             if self.transaction().is_some() {
                 return Err(Anomaly::incorrect("rtdb/world-setting-in-transaction", "SET bijection.at requires an idle session"));
@@ -418,6 +444,7 @@ impl Session {
     }
     pub fn set_gateway_key(&mut self, key: String) -> Result<()> {
         self.ensure_open()?;
+        if self.is_interactive_write() { return Err(interactive_unavailable()); }
         self.gateway_key = Some((RetainedText::new(key, self.service.memory())?, 0));
         Ok(())
     }
@@ -498,6 +525,34 @@ impl Session {
         if let Err(error) = self.set_transaction(settings) { self.lifecycle = Lifecycle::Open(None); return Err(error); }
         Ok(())
     }
+    pub(crate) async fn begin_sql(&mut self, settings: TransactionSettings, cancellation: &CancellationToken) -> Result<()> {
+        let Some(AccessSettings::ReadWrite(write)) = &settings.access else { return self.begin_with(settings); };
+        if !self.service.supports_interactive(&self.database) || matches!(write.asynchronous, OptionUpdate::Set(true)) {
+            return self.begin_with(settings);
+        }
+        self.check_begin()?;
+        self.require_open_world()?;
+        if !matches!(write.user_metadata, OptionUpdate::Unchanged | OptionUpdate::Clear)
+            || self.gateway_key.is_some()
+            || self.parameter(crate::node::IDEMPOTENCY_KEY_PARAMETER).is_some_and(|key| !key.is_empty())
+        {
+            return self.begin_with(settings);
+        }
+        let timezone = rtdb_expr::normalize_timezone(&settings.timezone.apply(&Some(self.timezone.to_string())).unwrap_or_else(|| self.timezone.to_string()))?;
+        let retained_timezone = RetainedText::new(timezone.clone(), self.service.memory())?;
+        self.service.check_submission_basis(&self.database, self.await_token.as_deref(), cancellation).await?;
+        self.service.await_client_token(self.await_token.as_deref(), Duration::from_secs(60), cancellation).await?;
+        let options = SubmitOptions {
+            user: self.service.user().map(str::to_owned), default_tz: timezone, system_time: write.system_time.apply(&None),
+            user_metadata: None,
+        };
+        let interactive = self.service.open_interactive(&self.database, options, cancellation).await?;
+        let mut transaction = Transaction::new(Phase::Interactive(Some(interactive)), &self.timezone);
+        transaction.timezone = retained_timezone;
+        self.lifecycle = Lifecycle::Open(Some(transaction));
+        Ok(())
+    }
+
     pub fn set_transaction(&mut self, settings: TransactionSettings) -> Result<()> {
         self.ensure_open()?;
         if matches!(&settings.access, Some(AccessSettings::ReadWrite(_))) { self.require_open_world()?; }
@@ -536,7 +591,7 @@ impl Session {
         let timezone = rtdb_expr::normalize_timezone(&timezone.into())?;
         let timezone = RetainedText::new(timezone, self.service.memory())?;
         if let Some(tx) = self.transaction_mut() {
-            if matches!(&tx.phase, Phase::Writing { buffer, .. } if !buffer.is_empty()) {
+            if matches!(&tx.phase, Phase::Interactive(_)) || matches!(&tx.phase, Phase::Writing { buffer, .. } if !buffer.is_empty()) {
                 return Err(Anomaly::incorrect("xtdb/set-tz-in-write-tx", "Cannot SET TIME ZONE in a read-write transaction with buffered writes"));
             }
             tx.timezone = timezone.clone(); tx.session_timezone = timezone;
@@ -549,7 +604,12 @@ impl Session {
             self.settings_revision = self.settings_revision.wrapping_add(1);
         }
     }
-    pub fn fail_transaction(&mut self) { if let Some(tx) = self.transaction_mut() { tx.failed = true; } }
+    pub fn fail_transaction(&mut self) {
+        if let Some(tx) = self.transaction_mut() {
+            tx.failed = true;
+            if let Phase::Interactive(transaction) = &mut tx.phase { transaction.take(); }
+        }
+    }
     pub fn rollback_tx(&mut self) -> Result<()> { self.ensure_open()?; self.lifecycle = Lifecycle::Open(None); Ok(()) }
     pub fn rollback(&mut self) -> Result<()> {
         if self.auto_commit { return Err(Anomaly::incorrect("xtdb.adbc/rollback-in-autocommit", "Cannot rollback when autoCommit is enabled")); }
@@ -600,7 +660,7 @@ impl Session {
         self.require_usable_transaction()?;
         if let Some(tx) = self.transaction() {
             match &tx.phase {
-                Phase::Writing { .. } => return Err(Anomaly::incorrect("xtdb/queries-in-read-write-tx", "Queries are unsupported in a DML transaction")),
+                Phase::Writing { .. } | Phase::Interactive(_) => return Err(Anomaly::incorrect("xtdb/queries-in-read-write-tx", "This read cannot be captured in a write transaction")),
                 Phase::Reading { basis, .. } => { let mut basis = basis.basis.clone(); basis.timezone = tx.timezone.to_string(); return Ok(basis); }
                 Phase::Pending(_) => (),
             }
@@ -680,6 +740,13 @@ impl Session {
         if matches!(&tx.phase, Phase::Pending(None)) { tx.phase = Phase::Writing { buffer: DmlBuffer::default(), options: WriteOptions::default() }; }
         match &mut tx.phase {
             Phase::Writing { buffer, .. } => buffer.append(operation, &memory)?,
+            Phase::Interactive(transaction) => {
+                if let Err(error) = transaction.as_mut().ok_or_else(interactive_unavailable)?.apply(operation).await {
+                    transaction.take();
+                    tx.failed = true;
+                    return Err(error);
+                }
+            }
             _ => return Err(Anomaly::incorrect("xtdb/read-only-tx", "Cannot write in a read-only transaction")),
         }
         Ok(None)
@@ -717,6 +784,12 @@ impl Session {
         }.inspect_err(|_| {
             if let Some(observer) = &observer { observer.record_error(rtdb_plan::ExecutionError::Transaction); }
         })?;
+        self.finish_submission(database, submitted, mode, reserve_present, observer, None).await
+    }
+    async fn finish_submission(
+        &mut self, database: String, submitted: SubmittedTx, mode: CommitMode, reserve_present: bool,
+        observer: Option<Arc<dyn rtdb_plan::ExecutionObserver>>, confirmed: Option<TransactionResult>,
+    ) -> Result<CommitResult> {
         let token = if let Some(receipt) = &submitted.placed_receipt {
             receipt.clone()
         } else {
@@ -731,9 +804,12 @@ impl Session {
                 Ok(CommitResult::Submitted(submitted))
             }
             CommitMode::Sync => {
-                let (result, applied) = {
-                    let _await = rtdb_plan::ExecutionSample::new(observer.clone(), rtdb_plan::ExecutionTimer::TxAwait);
-                    self.service.await_submission(&database, &submitted, &self.cancellation).await?
+                let (result, applied) = match confirmed {
+                    Some(result) => (result, None),
+                    None => {
+                        let _await = rtdb_plan::ExecutionSample::new(observer.clone(), rtdb_plan::ExecutionTimer::TxAwait);
+                        self.service.await_submission(&database, &submitted, &self.cancellation).await?
+                    }
                 };
                 if reserve_present && result.tx_key().tx_id != submitted.tx_id {
                     return Err(Anomaly::fault("rtdb.node/present-reservation", "The ordered present resolved at a different source position"));
@@ -808,6 +884,17 @@ impl Session {
             return if replay.is_some() { Err(replay_operation_count()) } else { Ok(CommitResult::NoTransaction) };
         };
         self.replace_timezone(tx.session_timezone);
+        if let Phase::Interactive(transaction) = tx.phase {
+            if replay.is_some() || mode == Some(CommitMode::Async) {
+                return Err(interactive_unavailable());
+            }
+            let transaction = transaction.ok_or_else(interactive_unavailable)?;
+            let database = self.database.to_string();
+            let observer = self.service.execution_observer();
+            let _sample = rtdb_plan::ExecutionSample::new(observer.clone(), rtdb_plan::ExecutionTimer::TxExecute);
+            let (submitted, result) = self.service.commit_interactive(&database, transaction, &self.cancellation).await?;
+            return self.finish_submission(database, submitted, CommitMode::Sync, false, observer, Some(result)).await;
+        }
         let Phase::Writing { buffer, options } = tx.phase else {
             return if replay.is_some() { Err(replay_operation_count()) } else { Ok(CommitResult::NoTransaction) };
         };
@@ -839,6 +926,10 @@ fn update_text(update: &OptionUpdate<String>, old: &Option<RetainedText>, memory
     }
 }
 fn allocation_overflow() -> Anomaly { Anomaly::incorrect("rtdb.node/session-allocation", "Session allocation size exceeds usize") }
+
+pub(crate) fn interactive_unavailable() -> Anomaly {
+    Anomaly::unsupported("rtdb/interactive-transaction", "This operation is unavailable in an interactive write transaction")
+}
 
 fn replay_operation_count() -> Anomaly {
     Anomaly::incorrect("rtdb.node/private-replay-operation-count", "Private replay requires exactly one buffered write operation")

@@ -1,4 +1,4 @@
-use super::{AppendBuffer, AppendMode, AppendReceipt, AppendTimestampSource, GuardedAppend, LOG_RECORD_OVERHEAD_BYTES, Log, LogMetadata, LogOffset, LogRecord, LogReplayTail, LogTail, Progress, ReplayHead, SuppliedTimestamp, await_tip};
+use super::{AppendBuffer, AppendMode, AppendReceipt, AppendTimestampSource, GuardedAppend, LOG_RECORD_OVERHEAD_BYTES, LocalLogAttachment, Log, LogMetadata, LogOffset, LogRecord, LogReplayTail, LogTail, Progress, ReplayHead, SuppliedTimestamp, await_tip};
 use crate::{Error, Result, object_store::ReadReservation};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -80,21 +80,33 @@ impl MemoryLog {
         Ok(())
     }
 
+    pub(super) fn release_local_attachments(&self, from: LogOffset, through: LogOffset) {
+        let mut records = self.shared.records.lock();
+        let first = records.first;
+        let from = from.0.max(first).min(records.next);
+        let to = through.0.saturating_add(1).max(from).min(records.next);
+        for (index, record) in records.values.range_mut((from - first) as usize..(to - first) as usize).enumerate() {
+            debug_assert_eq!(record.metadata.offset.0, from + index as i64);
+            record.local_attachment = None;
+        }
+    }
+
     pub fn close(&self) {
         let _records = self.shared.records.lock();
         self.shared.progress.close();
     }
 
-    fn enqueue_at(&self, length: usize, take: impl FnOnce() -> Bytes, sample: impl FnOnce(&[u8]) -> Result<Timestamp>) -> Result<AppendReceipt> {
-        if length > self.shared.maximum_message_bytes {
-            return Err(Error::MessageTooLarge { size: length, maximum: self.shared.maximum_message_bytes });
+    fn enqueue_at(&self, length: usize, attachment: Option<LocalLogAttachment>, take: impl FnOnce() -> Bytes, sample: impl FnOnce(&[u8]) -> Result<Timestamp>) -> Result<AppendReceipt> {
+        let charged = length.saturating_add(attachment.as_ref().map_or(0, |attachment| attachment.retained_bytes));
+        if charged > self.shared.maximum_message_bytes {
+            return Err(Error::MessageTooLarge { size: charged, maximum: self.shared.maximum_message_bytes });
         }
         let mut records = self.shared.records.lock();
         self.shared.progress.latest()?;
         let next = records.next.checked_add(1).ok_or_else(|| Error::Closed("log positions exhausted".into()))?;
         // Release the producer's allocation charge once this log owns the payload.
         let payload = if let Some(retained) = &self.shared.retained {
-            let required = length.saturating_add(LOG_RECORD_OVERHEAD_BYTES);
+            let required = charged.saturating_add(LOG_RECORD_OVERHEAD_BYTES);
             let unavailable = || Error::AppendCapacity { required_bytes: required as u64 };
             let charge = u32::try_from(required).map_err(|_| unavailable())?;
             let credit = Arc::clone(retained).try_acquire_many_owned(charge).map_err(|_| unavailable())?;
@@ -105,7 +117,7 @@ impl MemoryLog {
         let timestamp = sample(&payload)?;
         let metadata = LogMetadata { offset: LogOffset(records.next), timestamp };
         records.next = next;
-        records.values.push_back(LogRecord::new(metadata, payload));
+        records.values.push_back(LogRecord { local_attachment: attachment, ..LogRecord::new(metadata, payload) });
         self.shared.progress.advance(metadata.offset);
         let (sender, durable) = oneshot::channel();
         let _ = sender.send(Ok(metadata));
@@ -130,12 +142,12 @@ fn read(shared: &Shared, from: i64, to: i64) -> Result<Vec<LogRecord>> {
 }
 
 impl MemoryLog {
-    pub(super) fn append_owned(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt> {
-        self.enqueue_at(payload.len(), || payload, |payload| self.shared.timestamps.timestamp(payload, timestamp))
+    pub(super) fn append_owned(&self, payload: Bytes, attachment: Option<LocalLogAttachment>, timestamp: Timestamp) -> Result<AppendReceipt> {
+        self.enqueue_at(payload.len(), attachment, || payload, |payload| self.shared.timestamps.timestamp(payload, timestamp))
     }
 
     fn append_record(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt> {
-        self.enqueue_at(payload.len(), || Bytes::copy_from_slice(&payload), |payload| self.shared.timestamps.timestamp(payload, timestamp))
+        self.enqueue_at(payload.len(), None, || Bytes::copy_from_slice(&payload), |payload| self.shared.timestamps.timestamp(payload, timestamp))
     }
 
     fn open_tail(&self, after: LogOffset) -> Result<MemoryTail> {
@@ -172,7 +184,7 @@ impl Log for MemoryLog {
         if guard.journal_before().is_some() {
             return Err(Error::GuardedAppendUnsupported);
         }
-        self.enqueue_at(payload.len(), || Bytes::copy_from_slice(&payload), |_| guard.sample())
+        self.enqueue_at(payload.len(), None, || Bytes::copy_from_slice(&payload), |_| guard.sample())
     }
 
     async fn enqueue_buffer(&self, buffer: &mut AppendBuffer, mode: AppendMode<'_>) -> Result<AppendReceipt> {
@@ -181,7 +193,7 @@ impl Log for MemoryLog {
         {
             return Err(Error::GuardedAppendUnsupported);
         }
-        self.enqueue_at(buffer.payload().len(), || buffer.take_bytes(), |payload| match mode {
+        self.enqueue_at(buffer.payload().len(), None, || buffer.take_bytes(), |payload| match mode {
             AppendMode::Ordinary(timestamp) | AppendMode::Maintenance(timestamp) => self.shared.timestamps.timestamp(payload, timestamp),
             AppendMode::Guarded(guard) => guard.sample(),
         })
@@ -305,6 +317,18 @@ impl LogReplayTail for MemoryTail {
         let record = record.clone().with_read_reservation(reservation);
         self.after = record.metadata.offset;
         Ok(record)
+    }
+
+    fn read_local_attachment(&mut self, head: ReplayHead) -> Result<Option<LogRecord>> {
+        let records = self.shared.records.lock();
+        self.shared.progress.latest()?;
+        let record = records.replay_record(self.after.0 + 1)?;
+        if replay_head(record) != head {
+            return Err(Error::Task("log replay head does not match the next record".into()));
+        }
+        if record.local_attachment.is_none() { return Ok(None); }
+        self.after = record.metadata.offset;
+        Ok(Some(record.clone()))
     }
 }
 

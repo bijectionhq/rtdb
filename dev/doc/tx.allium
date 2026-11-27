@@ -541,6 +541,25 @@
 --        async/sync choice is the commit's own COMMIT SYNC / COMMIT ASYNC if it states one,
 --        else the transaction's begin-time async flag.
 -- A single-journal standalone attachment accepts synchronous SQL submissions.
+-- An explicit synchronous SQL BEGIN READ WRITE on a single-journal standalone attachment opens an interactive transaction when no retry metadata is supplied.
+-- Interactive begin waits for the connection's await floor and captures the attached database's exact applied generation and predecessor.
+-- Begin fixes the system time of the transaction and its statement clock.
+-- Every ordinary SQL mutation executes against the captured snapshot with the transaction's earlier staged effects.
+-- An interactive query observes the same private view; an executing pgwire portal retains the private view it opened until it completes.
+-- Interactive rollback or statement failure releases the private effects.
+-- Interactive commit carries the charged staged effects as a process-local attachment in source order.
+-- The writer validates the captured predecessor and generation before those effects can be journaled.
+-- Interactive admission funds an independent rejection before accepting a workspace.
+-- An interactive writer initializes its receipt clock before admission and preserves it across checkpoint adoption.
+-- A funded rejection derives its receipt time from that cached clock.
+-- The writer prepares the next live revision and complete inline replica body before append.
+-- The appender and its exact readback use reserved scratch through publication.
+-- The native serving fold prepares the projected events before append and advances them at the installed replica coordinate.
+-- An unavailable Classic projection selects the native fold's ordinary unprojected recovery path.
+-- A checkpoint closes before interactive preparation begins, and a later cut waits for the interactive publication.
+-- Interactive commits above the inline size limit publish a rejection.
+-- An intervening transaction or generation change makes the ordered outcome SQLSTATE 40001, with no application effects.
+-- Success journals the staged effects, their original system time, and the assigned ordered identity together, then acknowledges after publication.
 -- Asynchronous SQL submission requires a durable handoff and is rejected before queuing on that attachment.
 -- Above: the Frontend (pgwire / ADBC / Flight SQL client) that decodes the wire protocol and feeds SQL strings and transaction API calls into the Connection.
 -- A trusted frontend may supply a private replay permit for the synchronous commit of exactly one buffered write operation.

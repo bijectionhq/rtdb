@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -18,7 +18,7 @@ use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 use crate::promotion::{initial_term_sequence, replica_read_is_empty, should_start_claim};
 use crate::{BlockCycle, BlockStore, FlushTimer, PartitionLogs, PendingBlock, ProgressMonitor, PublishedCheckpoint, PublishedPrimaryReset, RecoveredPartition, ReplicaMetadata, ReplicaRecord, TermFence, TermPosition, Verdict};
 use crate::admission::AdmittedReplica;
-use crate::appender::{Applied, AppenderHandle, CommitLagBasis, PendingWrite, ReplicaAppender, WriteBody, complete_record, join_error, now};
+use crate::appender::{Applied, AppenderHandle, CommitLagBasis, PendingWrite, PreparedInteractivePublication, ReplicaAppender, WriteBody, complete_record, join_error, now};
 use crate::blocks::{RecoveredBlockConfirmation, checkpoint_digest, matches_catalog_boundary, matches_confirmation, validate_uploaded_root};
 use crate::logs::{APPEND_CAPACITY, DecodedReplica, PartitionReplay, STRICT_DISPATCH_CUTOFF, STRICT_DISPATCH_UNAVAILABLE, replica_decode_bound};
 use crate::progress::{AppliedTransaction, DriverRestart, stopped, term_ended};
@@ -143,6 +143,7 @@ pub struct DriverStatus {
     pub promotion_failure: Option<Anomaly>,
     pub last_block_upload_epoch_seconds: i64,
     pub memory_block_cuts: u64,
+    pub interactive_ready: bool,
 }
 
 #[derive(Clone)]
@@ -170,6 +171,14 @@ impl ReplicationHandle {
         if self.cancellation.is_cancelled() { return Err(stopped()); }
         self.logs.require_data_intake()?;
         self.logs.append_source_encoded(payload, timestamp).await
+    }
+    pub async fn submit_source_interactive(&self, request: SourceTransaction, timestamp: Timestamp) -> Result<SourcePosition> {
+        if self.cancellation.is_cancelled() { return Err(stopped()); }
+        if !self.status.borrow().interactive_ready {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb/interactive-receipt", "The writer is preparing its interactive receipt clock"));
+        }
+        self.logs.require_data_intake()?;
+        self.logs.append_source_interactive(request, timestamp).await
     }
     pub async fn await_tx(&self, id: TxId, cancellation: &CancellationToken) -> Result<Option<Arc<TransactionResult>>> { self.progress.await_tx(id, cancellation).await }
     pub async fn await_source(&self, position: SourcePosition, cancellation: &CancellationToken) -> Result<()> { self.progress.await_source(position, cancellation).await }
@@ -450,6 +459,7 @@ async fn pending_claim(claim: &mut Option<Claim>) -> Result<crate::ReplicaMetada
 struct Resolution {
     future: BoxFuture<'static, (TxResolver, Result<Arc<ResolvedTx>>)>,
     completion: Completion,
+    interactive: Option<Arc<OnceLock<PreparedInteractivePublication>>>,
 }
 enum Production {
     Writing(std::time::Instant, BoxFuture<'static, Result<CheckpointOutput>>),
@@ -500,11 +510,12 @@ struct SourceInput {
     log_time: Timestamp,
     work: SourceWork,
     reservation: Option<PlacedReservation>,
-    _decode_charge: Arc<MemoryReservation>,
+    _decode_charge: Option<Arc<MemoryReservation>>,
 }
 
 enum StrictSource {
     Transaction(SourceInput),
+    Interactive(SourceInput),
     Serving { position: SourcePosition, request: SourceRequest },
     Physical { record: LogRecord, decode: Arc<MemoryReservation> },
     DeferredFlush(SourcePosition),
@@ -537,7 +548,7 @@ impl LeaderState {
             && self.awaiting_placed.is_none() && !self.settling_placed
     }
     fn pending_strict_write(&self) -> bool {
-        self.pending.front().is_some_and(|pending| match &pending.body {
+        self.pending.front().is_some_and(|pending| pending.interactive.is_some() || match &pending.body {
             WriteBody::Resolved(tx, _) => tx.staging_clock_upper().is_some(),
             WriteBody::Message(ReplicaBody::NoOp(message)) => serving::is_funded_original(message),
             _ => false,
@@ -634,7 +645,7 @@ impl ReplicationDriver {
         let track_catalog_cut = config.enabled && recovered.allows_catalog_cut_tracking();
         let initial = DriverStatus { role: Role::Following, highest_term: recovered.fence.highest_term(), replica_position: read_position,
             installed: None, first_erasure: None,
-            open_block: recovered.partition.value().live().block_index(), adopted_block: recovered.block.clone().map(Arc::new), promotion_failure: None, last_block_upload_epoch_seconds: 0, memory_block_cuts: 0 };
+            open_block: recovered.partition.value().live().block_index(), adopted_block: recovered.block.clone().map(Arc::new), promotion_failure: None, last_block_upload_epoch_seconds: 0, memory_block_cuts: 0, interactive_ready: false };
         let (status, receiver) = watch::channel(initial);
         let (sender, commands) = mpsc::channel(128);
         let handle = ReplicationHandle { logs: Arc::clone(&logs), progress: Arc::clone(&progress), status: receiver, commands: sender, cancellation: cancellation.clone(), clock: Arc::clone(&clock), partition: Arc::clone(&recovered.partition) };
@@ -892,7 +903,9 @@ impl ReplicationDriver {
         let serving_source_ready = self.default_erasure.is_none() && self.serving.as_ref().is_none_or(NativeServing::source_ready);
         !self.waiting_for_checkpoint() && self.placed_slot.is_none() && serving_source_ready
             && self.leader.as_ref().is_some_and(|leader| leader.ready_source()
-                && (self.pending_block.is_none() || !matches!(leader.waiting_strict_source, Some(StrictSource::DeferredFlush(_)))))
+                && (self.pending_block.is_none() || !matches!(leader.waiting_strict_source, Some(StrictSource::DeferredFlush(_) | StrictSource::Interactive(_))))
+                && (!matches!(leader.waiting_strict_source, Some(StrictSource::Interactive(_)))
+                    || !self.serving.as_ref().is_some_and(NativeServing::main_write_pending)))
     }
     async fn source_polled(&mut self, tail: PartitionReplay, records: Result<TailPoll>) -> Result<()> {
         let Some(leader) = &mut self.leader else { return Ok(()); };
@@ -914,7 +927,9 @@ impl ReplicationDriver {
         let end = self.logs.latest_replica_position()?;
         while let Some(head) = self.replica_head {
             let tail = self.replica_tail.as_mut().ok_or_else(|| invalid("Prepared replica head has no tail"))?;
-            let Some(record) = read_replay_head(tail, head, self.logs.memory(), replica_decode_bound, &self.cancellation).await? else { return Ok(false); };
+            let memory = self.leader.as_ref().and_then(|leader| leader.pending.front())
+                .and_then(|write| write.interactive.as_ref()).map_or(self.logs.memory(), |prepared| &prepared.io);
+            let Some(record) = read_replay_head(tail, head, memory, replica_decode_bound, &self.cancellation).await? else { return Ok(false); };
             self.replica_head = None;
             self.consume_record(record.raw, Some(record.decode_reservation)).await?;
             if self.cancellation.is_cancelled() { return Ok(false); }
@@ -987,6 +1002,7 @@ impl ReplicationDriver {
         if self.placed_slot.is_some() || !self.leader.as_ref().is_some_and(|leader| {
             leader.confirmed && leader.cycle.accepting() && leader.resolution.is_none()
                 && leader.awaiting_placed.is_none() && !leader.settling_placed
+                && !leader.pending.front().is_some_and(|pending| pending.interactive.is_some())
         }) { return Ok(()); }
         let Some(serving) = &mut self.serving else { return Ok(()); };
         let now = (self.clock)();
@@ -1229,8 +1245,14 @@ impl ReplicationDriver {
         let recovery_write = self.next_recovery_write().await?;
         let produce_inherited = recovery_write.is_none() && self.pending_block.is_some();
         let confirmed = recovery_write.is_none() && !produce_inherited;
+        let mut resolver = TxResolver::new(progress.tx_key, progress.source_position, progress.external_token.as_deref().map(<[u8]>::to_vec), &self.resolve.memory)?;
+        if self.prepares_local_interactive()
+            && let Err(error) = resolver.initialize_receipt_clock(self.partition.snapshot(), &self.resolve).await
+        {
+            tracing::warn!(database = %self.resolve.database, %error, "Interactive receipt clock is unavailable");
+        }
         let job = pump.with_heartbeat(self.config.idle_heartbeat).run(recovery_write.clone());
-        self.leader = Some(LeaderState { term, resolver: Some(TxResolver::new(progress.tx_key, progress.source_position, progress.external_token.as_deref().map(<[u8]>::to_vec), &self.resolve.memory)?), resolution: None,
+        self.leader = Some(LeaderState { term, resolver: Some(resolver), resolution: None,
             production: None, confirmed, activation: writer_activation(self.logs.fences_writer_terms()),
             recovery_write, held: VecDeque::new(), held_bytes: 0, cycle,
             pending: VecDeque::new(), source_tail, source_poll: None, source_batch: VecDeque::new(), source_head: None, waiting_strict_source: None, awaiting_placed: None, settling_placed: false, appender, job: Some(tokio::spawn(job)), cancellation, deferred_commands: VecDeque::new(), compactor_reset: None, trie_removals: Vec::new(), source_batch_end: None });
@@ -1282,14 +1304,23 @@ impl ReplicationDriver {
         self.leader.as_ref().filter(|leader| leader.confirmed && leader.activation.is_active())
             .map_or(Role::Following, |leader| Role::Leading(leader.term))
     }
+    fn prepares_local_interactive(&self) -> bool {
+        self.logs.uses_volatile_intake() && self.resolve.owned_witness_scope.is_none()
+            && !self.config.external_source && self.serving_search.is_none()
+    }
+
     fn publish_status(&self, role: Role) {
         let value = self.partition.value();
-        let (promotion_failure, last_block_upload_epoch_seconds, memory_block_cuts) = {
+        let (promotion_failure, last_block_upload_epoch_seconds, memory_block_cuts, previous_interactive_ready) = {
             let status = self.status.borrow();
-            (status.promotion_failure.clone(), status.last_block_upload_epoch_seconds, status.memory_block_cuts)
+            (status.promotion_failure.clone(), status.last_block_upload_epoch_seconds, status.memory_block_cuts,
+                status.role == role && status.interactive_ready)
         };
+        let interactive_ready = matches!(role, Role::Leading(_)) && self.prepares_local_interactive()
+            && self.leader.as_ref().and_then(|leader| leader.resolver.as_ref())
+                .map_or(previous_interactive_ready, TxResolver::receipt_clock_ready);
         self.status.send_replace(DriverStatus { role, highest_term: self.fence.highest_term(), replica_position: self.read_position,
-            installed: self.installed, first_erasure: self.first_erasure,
+            interactive_ready, installed: self.installed, first_erasure: self.first_erasure,
             open_block: value.live().block_index(), adopted_block: value.table_catalog().block().cloned().map(Arc::new), promotion_failure, last_block_upload_epoch_seconds, memory_block_cuts });
     }
     fn observe_erasure(&mut self, position: ReplicaPosition, write: &StagedWrite) -> Result<()> {
@@ -1736,8 +1767,22 @@ impl ReplicationDriver {
                         let expected = Arc::clone(expected);
                         let applied: Result<_> = async {
                             let head = head.filter(|head| Arc::ptr_eq(head, &expected)).ok_or_else(|| readback_mismatch(message.tx_id))?;
-                            let delta = confirmed_search_delta(pending.body.search_delta(), message.search_delta.as_ref());
-                            self.apply_transaction(head.writes(), delta, record.metadata.position).await?;
+                            if let Some(prepared) = &pending.interactive {
+                                let _apply = rtdb_plan::ExecutionSample::new(self.resolve.execution_observer.clone(), rtdb_plan::ExecutionTimer::ReadBackApply);
+                                let revision = prepared.revision.lock().take().ok_or_else(|| invalid("Interactive publication lost its prepared revision"))?;
+                                let classic = prepared.classic.lock().take();
+                                if let Some(serving) = &self.serving { serving.require_classic_effects(head.writes())?; }
+                                self.partition.install_write(revision, None)?;
+                                match (&mut self.serving, classic) {
+                                    (Some(serving), Some(classic)) => serving.observe_prepared_classic(classic, head.writes(), record.metadata.position)?,
+                                    (None, None) => (),
+                                    _ => return Err(invalid("The prepared native observation lost its serving owner")),
+                                }
+                                if let Some(rejection) = &prepared.rejected { rejection.settle_prepaid(); }
+                            } else {
+                                let delta = confirmed_search_delta(pending.body.search_delta(), message.search_delta.as_ref());
+                                self.apply_transaction(head.writes(), delta, record.metadata.position).await?;
+                            }
                             if head.result().committed() {
                                 self.observe_erasure(record.metadata.position, head.writes())?;
                                 if let Some(operation) = head.db_op() { self.effects.apply_db_op(operation).await?; }
@@ -2038,7 +2083,9 @@ impl ReplicationDriver {
             let waiting_for_checkpoint = self.waiting_for_checkpoint();
             if let Some(leader) = &mut self.leader {
                 if leader.resolver()?.staged_rows()? != 0 { return Err(invalid("A block adoption retained unresolved transaction writes")); }
-                leader.resolver = Some(TxResolver::new(progress.tx_key, progress.source_position, progress.external_token.as_deref().map(<[u8]>::to_vec), &self.resolve.memory)?);
+                let mut next = TxResolver::new(progress.tx_key, progress.source_position, progress.external_token.as_deref().map(<[u8]>::to_vec), &self.resolve.memory)?;
+                next.preserve_receipt_clock(leader.resolver()?);
+                leader.resolver = Some(next);
                 if !waiting_for_checkpoint && self.default_erasure.is_none() && self.pending_block.is_none() && leader.source_tail.is_none() && leader.source_poll.is_none() {
                     leader.source_tail = Some(self.logs.source_replay(progress.source_position).await?);
                 }
@@ -2169,7 +2216,13 @@ impl ReplicationDriver {
         let external = resolution.completion.0.is_some();
         leader.resolver = Some(resolver);
         match result {
-            Ok(resolved) => self.enqueue_resolved(resolved, resolution.completion.0.take()).await?,
+            Ok(resolved) => {
+                let interactive = resolution.interactive.take().map(|slot| {
+                    Arc::try_unwrap(slot).ok().and_then(OnceLock::into_inner)
+                        .ok_or_else(|| invalid("Interactive resolution lost its publication owner"))
+                }).transpose()?;
+                self.enqueue_resolved_with_preparation(resolved, resolution.completion.0.take(), interactive).await?
+            }
             Err(error) => {
                 if let Some(sender) = resolution.completion.0.take() { let _ = sender.send(Err(error.clone())); }
                 if !external || !error.is_caller_error() { return Err(error); }
@@ -2189,6 +2242,9 @@ impl ReplicationDriver {
     }
     async fn resolve_next_source(&mut self) -> Result<()> {
         let deferred_checkpoint = self.has_deferred_checkpoint();
+        let checkpoint_pending = self.pending_block.is_some();
+        let serving_pending = self.serving.as_ref().is_some_and(NativeServing::main_write_pending);
+        let permits_interactive = self.prepares_local_interactive();
         let Some(leader) = &mut self.leader else { return Ok(()); };
         let deferred = if leader.waiting_strict_source.is_some() {
             if !leader.ready_source() { return Ok(()); }
@@ -2199,7 +2255,7 @@ impl ReplicationDriver {
                     leader.resolver_mut()?.advance_source(position)?;
                     return self.cut().await;
                 }
-                StrictSource::Transaction(source) => return self.admit_source(source),
+                StrictSource::Transaction(source) | StrictSource::Interactive(source) => return self.admit_source(source),
                 StrictSource::Serving { position, request } => return self.admit_serving_source(position, Ok(request)).await,
                 StrictSource::Compaction { position, log_time, message, _decode_charge } =>
                     return self.admit_fact_compaction(position, log_time, message).await,
@@ -2208,15 +2264,43 @@ impl ReplicationDriver {
         let (record, decode_reservation) = if let Some(deferred) = deferred { deferred }
         else if let Some(head) = leader.source_head {
             let tail = leader.source_tail.as_mut().ok_or_else(|| invalid("Prepared source head has no tail"))?;
-            let Some(record) = read_replay_head(tail, head, &self.resolve.memory, source_decode_bound, &self.cancellation).await? else { return Ok(()); };
+            let local = if self.logs.uses_volatile_intake() {
+                tail.replay().ok_or_else(|| invalid("Volatile intake lost its prepared reader"))?.read_local_attachment(head)?
+            } else { None };
+            let record = if let Some(local) = local {
+                (local, None)
+            } else {
+                let Some(record) = read_replay_head(tail, head, &self.resolve.memory, source_decode_bound, &self.cancellation).await? else { return Ok(()); };
+                (record.raw, Some(record.decode_reservation))
+            };
             leader.source_head = None;
-            (record.raw, Some(record.decode_reservation))
+            record
         } else {
             let Some(record) = leader.source_batch.pop_front() else { return Ok(()); };
             (record, None)
         };
         let metadata = record.metadata;
         let position = self.logs.source_position(metadata)?;
+        if let Some(attachment) = record.local_attachment.as_ref() {
+            if record.payload.as_ref() != crate::logs::LOCAL_INTERACTIVE_MARKER
+                || !permits_interactive
+            {
+                return Err(invalid("An interactive attachment requires the standalone single journal"));
+            }
+            let request = attachment.get::<SourceTransaction>().and_then(SourceTransaction::clone_local_interactive)
+                .ok_or_else(|| invalid("An interactive attachment has no staged transaction"))?;
+            if position <= leader.resolver()?.source_position() { return Err(invalid("Source reader did not advance")); }
+            let work = SourceWork::Resolve(request, None);
+            let source = SourceInput { position, log_time: metadata.timestamp, work, reservation: None, _decode_charge: None };
+            if checkpoint_pending || serving_pending || !leader.drained_for_strict_source() {
+                leader.waiting_strict_source = Some(StrictSource::Interactive(source));
+                return Ok(());
+            }
+            return self.admit_source(source);
+        }
+        if record.payload.as_ref() == crate::logs::LOCAL_INTERACTIVE_MARKER {
+            return Err(invalid("An interactive intake marker lost its local attachment"));
+        }
         let decode_charge = match decode_reservation {
             Some(reservation) => reservation,
             None => self.resolve.memory.reserve(source_decode_bound(record.payload.len())?)?,
@@ -2254,7 +2338,7 @@ impl ReplicationDriver {
                     SourceWork::Fence => unreachable!("only recovery constructs a placed fence"),
                 };
                 let reservation = original.map(|attempt| PlacedReservation::new(attempt, metadata.timestamp, &payload));
-                let source = SourceInput { position, log_time: metadata.timestamp, work, reservation, _decode_charge: decode_charge };
+                let source = SourceInput { position, log_time: metadata.timestamp, work, reservation, _decode_charge: Some(decode_charge) };
                 // Keep this position as the source head until every previously queued replica
                 // write has been read back. In particular, none can still be offloading a body.
                 if (reservation.is_some() || matches!(&source.work, SourceWork::Resolve(request, _) if request.requires_durable_predecessor()))
@@ -2457,7 +2541,7 @@ impl ReplicationDriver {
                 log_time: slot.reservation.submitted_at,
                 work: SourceWork::Fence,
                 reservation: Some(slot.reservation),
-                _decode_charge: self.resolve.memory.reserve(1024)?,
+                _decode_charge: Some(self.resolve.memory.reserve(1024)?),
             }
         };
         leader.settling_placed = true;
@@ -2483,6 +2567,7 @@ impl ReplicationDriver {
     fn begin_source_resolution(&mut self, source: SourceInput) -> Result<()> {
         let durable = self.partition.snapshot();
         let classic_authority = self.serving.as_ref().map(|serving| serving.classic_write_authority().clone());
+        let classic_shares_main = self.serving.as_ref().map(NativeServing::shares_main);
         let leader = self.leader.as_mut().ok_or_else(term_ended)?;
         let mut resolver = leader.resolver.take().ok_or_else(|| invalid("Source resolution has no idle resolver"))?;
         let context = Arc::clone(&self.resolve);
@@ -2491,10 +2576,32 @@ impl ReplicationDriver {
         let maximum_timed_original_bytes = self.logs.replica_timed_original_append_limit();
         let node_id = self.config.node_id.clone();
         let partition = Arc::clone(&self.partition);
-        leader.resolution = Some(Resolution { completion: Completion(None), future: Box::pin(async move {
+        let logs = Arc::clone(&self.logs);
+        let skipped = self.config.skipped_transactions.contains(&source.position);
+        let interactive = matches!(&source.work, SourceWork::Resolve(request, _) if request.local_interactive_rejection_budget().is_some())
+            .then(|| Arc::new(OnceLock::new()));
+        let publication = interactive.clone();
+        leader.resolution = Some(Resolution { completion: Completion(None), interactive, future: Box::pin(async move {
             let SourceInput { position, log_time, work, reservation, _decode_charge } = source;
             let _resolution = rtdb_plan::ExecutionSample::new(context.execution_observer.clone(), rtdb_plan::ExecutionTimer::ResolveSource);
             let result = match work {
+                SourceWork::Resolve(request, _) if publication.is_some() => {
+                    let result = resolver.resolve_local_interactive(durable, position, log_time, request, &context, classic_authority.as_ref(), skipped,
+                        |tx, memory| {
+                            let revision = partition.prepare_write(tx.writes())?;
+                            let body = tx.to_replica_body(memory)?;
+                            let io = logs.prepay_interactive_replica(body.body(), memory)?;
+                            let classic = classic_shares_main.map(|shared| NativeServing::prepare_classic_observation(shared, tx.writes(), memory));
+                            Ok(PreparedInteractivePublication { revision: parking_lot::Mutex::new(Some(revision)),
+                                classic: parking_lot::Mutex::new(classic), body, io, rejected: None })
+                        }).await;
+                    result.and_then(|(resolved, mut prepared, rejected)| {
+                        prepared.rejected = rejected;
+                        publication.expect("matched interactive resolution").set(prepared)
+                            .map_err(|_| invalid("Interactive publication was prepared twice"))?;
+                        Ok(resolved)
+                    })
+                }
                 SourceWork::Resolve(mut request, operations) => {
                     let prepared = async {
                         if request.proposal_generation_reading()?.is_some() {
@@ -2553,10 +2660,14 @@ impl ReplicationDriver {
         Ok(())
     }
     async fn enqueue_resolved(&mut self, resolved: Arc<ResolvedTx>, completion: Option<oneshot::Sender<Result<Applied>>>) -> Result<()> {
+        self.enqueue_resolved_with_preparation(resolved, completion, None).await
+    }
+
+    async fn enqueue_resolved_with_preparation(&mut self, resolved: Arc<ResolvedTx>, completion: Option<oneshot::Sender<Result<Applied>>>, interactive: Option<PreparedInteractivePublication>) -> Result<()> {
         let mut completion = Completion(completion);
         let result = async {
             let strict = resolved.staging_clock_upper().is_some();
-            let search_delta = if !strict && resolved.result().committed()
+            let search_delta = if !strict && interactive.is_none() && resolved.result().committed()
                 && let Some(builder) = self.serving_search.as_ref().filter(|builder| builder.journals_deltas()) {
                 let leader = self.leader.as_ref().ok_or_else(term_ended)?;
                 let snapshot = leader.resolver()?.resolving_snapshot(self.partition.value().snapshot())?;
@@ -2565,7 +2676,11 @@ impl ReplicationDriver {
             let leader = self.leader.as_mut().ok_or_else(term_ended)?;
             leader.cycle.resolved(resolved.writes().row_count()?)?;
             let block = self.partition.value().live().block_index();
-            if let Some(attempt) = resolved.placed_attempt() {
+            if let Some(publication) = interactive {
+                let write = PendingWrite::prepared_interactive(resolved, block, publication)?;
+                leader.appender.enqueue(Arc::clone(&write))?;
+                leader.pending.push_back(write);
+            } else if let Some(attempt) = resolved.placed_attempt() {
                 let slot = self.placed_slot.filter(|slot| slot.reservation.attempt == attempt)
                     .ok_or_else(|| invalid("Placed resolution lost its original receiver reservation"))?;
                 if !leader.settling_placed || completion.0.is_some() {
@@ -2789,7 +2904,7 @@ impl ReplicationDriver {
                 let mut resolver = leader.resolver.take().ok_or_else(|| invalid("External resolution has no idle resolver"))?;
                 let context = Arc::clone(&self.resolve);
                 let clock = Arc::clone(&self.clock);
-                leader.resolution = Some(Resolution { completion: Completion(Some(completion)), future: Box::pin(async move {
+                leader.resolution = Some(Resolution { completion: Completion(Some(completion)), interactive: None, future: Box::pin(async move {
                     let result = resolver.resolve_external(durable, clock(), system_time, token, writer.as_mut(), &context).await;
                     (resolver, result)
                 }) });

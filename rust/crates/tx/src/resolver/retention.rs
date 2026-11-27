@@ -13,7 +13,7 @@ pub(super) struct RetentionClock {
 }
 
 impl RetentionClock {
-    fn observe(previous: Option<Timestamp>, appended: Timestamp) -> Self {
+    pub(super) fn observe(previous: Option<Timestamp>, appended: Timestamp) -> Self {
         Self { time: Timestamp(advance_retry_clock(previous.unwrap_or(appended).0, appended.0)), previous }
     }
 

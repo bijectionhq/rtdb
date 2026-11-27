@@ -70,11 +70,39 @@ pub struct LogMetadata {
 mod replica_objects;
 pub use replica_objects::{ReplicaObjectCustody, ReplicaObjectScope, ReplicaPayload, ReplicaPayloadBroker, ReplicaPayloadReference};
 
+#[derive(Clone)]
+pub struct LocalLogAttachment {
+    value: Arc<dyn std::any::Any + Send + Sync>,
+    retained_bytes: usize,
+}
+
+impl LocalLogAttachment {
+    pub fn new<T: Send + Sync + 'static>(value: T, retained_bytes: usize) -> Self {
+        Self { value: Arc::new(value), retained_bytes }
+    }
+
+    pub fn get<T: Send + Sync + 'static>(&self) -> Option<&T> { self.value.downcast_ref() }
+}
+
+impl std::fmt::Debug for LocalLogAttachment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalLogAttachment").field("retained_bytes", &self.retained_bytes).finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for LocalLogAttachment {
+    fn eq(&self, other: &Self) -> bool {
+        self.retained_bytes == other.retained_bytes && Arc::ptr_eq(&self.value, &other.value)
+    }
+}
+impl Eq for LocalLogAttachment {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogRecord {
     pub metadata: LogMetadata,
     pub payload: Bytes,
     pub replica_objects: Option<ReplicaObjectCustody>,
+    pub local_attachment: Option<LocalLogAttachment>,
     /// The committed provider frame's timed authority, separate from the payload's claim.
     pub timed_original: Option<rtdb_types::TimedJournalCutoff>,
 }
@@ -83,7 +111,7 @@ const LOG_RECORD_OVERHEAD_BYTES: usize = 256;
 
 impl LogRecord {
     pub fn new(metadata: LogMetadata, payload: Bytes) -> Self {
-        Self { metadata, payload, replica_objects: None, timed_original: None }
+        Self { metadata, payload, replica_objects: None, local_attachment: None, timed_original: None }
     }
 
     /// Keeps the caller's pre-read charge alive for every clone of the payload.
@@ -99,6 +127,7 @@ impl LogRecord {
             metadata: self.metadata,
             payload: Bytes::from_owner(Retained { bytes: self.payload, _reservation: reservation }),
             replica_objects: self.replica_objects,
+            local_attachment: self.local_attachment,
             timed_original: self.timed_original,
         }
     }
@@ -184,6 +213,10 @@ pub trait LogReplayTail: Send {
     /// An insufficient reservation returns an error. Failure or cancellation leaves the cursor at its current position.
     /// Offloaded work keeps the reservation through the read and disposal of an undelivered result.
     async fn read_head(&mut self, head: ReplayHead, reservation: ReadReservation) -> Result<LogRecord>;
+
+    /// Delivers a precharged attachment from a process-local queue.
+    /// A head without an attachment remains at its original position for ordinary replay.
+    fn read_local_attachment(&mut self, _head: ReplayHead) -> Result<Option<LogRecord>> { Ok(None) }
 }
 
 /// An installed journal's current ordinary budget and selected checkpoint.
@@ -388,6 +421,9 @@ pub trait Log: Send + Sync {
     }
     /// Fixes append order before returning; the receipt reports whether those bytes became durable.
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt>;
+    async fn enqueue_local_attachment(&self, _marker: Bytes, _attachment: LocalLogAttachment, _timestamp: Timestamp) -> Result<AppendReceipt> {
+        Err(Error::LocalAttachmentUnsupported)
+    }
     /// Appends a recovery record through reserved maintenance capacity when the provider has it.
     async fn enqueue_maintenance(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt> {
         self.enqueue(payload, timestamp).await

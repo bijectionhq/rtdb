@@ -47,6 +47,51 @@ pub(super) fn apply_live(index: &mut BranchIndex, position: u64, write: &StagedW
     Ok(())
 }
 
+pub(super) struct PreparedEffects {
+    tables: Vec<Vec<StoredEvent>>,
+    charges: Vec<Arc<MemoryReservation>>,
+    _inventory: Arc<MemoryReservation>,
+}
+
+impl PreparedEffects {
+    pub(super) fn prepare(write: &StagedWrite, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let overflow = || Anomaly::incorrect("rtdb/classic-projection-size", "Classic effect exceeds addressable memory")
+            .with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded);
+        let rows = usize::try_from(write.row_count()?).map_err(|_| overflow())?;
+        let bytes = rows.checked_mul(std::mem::size_of::<StoredEvent>() + std::mem::size_of::<Arc<MemoryReservation>>())
+            .and_then(|bytes| bytes.checked_add(write.tables().len().checked_mul(128)?))
+            .ok_or_else(overflow)?;
+        let _inventory = memory.reserve(bytes)?;
+        let mut tables = Vec::with_capacity(write.tables().len());
+        let mut charges = Vec::with_capacity(rows);
+        for (table, write) in write.tables() {
+            if !data_table(table) { continue; }
+            let mut events = Vec::with_capacity(write.row_count());
+            if let Some(batch) = write.batch() {
+                for row in 0..batch.len() {
+                    let (event, charge) = read_event(batch.view(), row, memory)?;
+                    events.push(event);
+                    charges.push(charge);
+                }
+            }
+            tables.push(events);
+        }
+        Ok(Self { tables, charges, _inventory })
+    }
+
+    pub(super) fn apply(self, index: &mut BranchIndex, position: u64, write: &StagedWrite) -> Result<Vec<Arc<MemoryReservation>>> {
+        index.advance_classic(BranchCut {
+            basis: Basis::new(index.head().basis.incarnation(), position), system_time: write.tx_key().system_time,
+        })?;
+        let transaction = Some(write.tx_key().tx_id);
+        for ((table, write), events) in write.tables().iter().filter(|(table, _)| data_table(table)).zip(self.tables) {
+            if !write.declared_columns().is_empty() { declare(index, table, write.declared_columns())?; }
+            for event in events { index.apply_classic_event(table, event, transaction)?; }
+        }
+        Ok(self.charges)
+    }
+}
+
 fn read_event(batch: &EventBatch, row: usize, memory: &Arc<MemoryBudget>) -> Result<(StoredEvent, Arc<MemoryReservation>)> {
     let bytes = batch.borrow_event(row)?.document_allocation_bound()?.checked_add(512)
         .ok_or_else(|| Anomaly::incorrect("rtdb/classic-projection-size", "Classic effect exceeds addressable memory").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded))?;

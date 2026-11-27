@@ -230,6 +230,7 @@ pub struct PartitionState {
 
 pub struct PreparedWrite {
     predecessor: Arc<LiveIndex>,
+    predecessor_catalog: Arc<TableCatalog>,
     next: PartitionValue,
     written: Vec<TableRef>,
 }
@@ -378,7 +379,7 @@ impl PartitionState {
         let mut next = captured.as_ref().clone();
         next.live = Arc::new(captured.live.apply(write)?);
         next.table_catalog = with_entries_for(&captured.table_catalog, written.iter())?;
-        Ok(PreparedWrite { predecessor: Arc::clone(&captured.live), next, written })
+        Ok(PreparedWrite { predecessor: Arc::clone(&captured.live), predecessor_catalog: Arc::clone(&captured.table_catalog), next, written })
     }
 
     pub fn install_write(&self, mut prepared: PreparedWrite, search: Option<ServingSearch>) -> Result<()> {
@@ -388,7 +389,11 @@ impl PartitionState {
         }
         Arc::make_mut(&mut prepared.next.live).search = search;
         let mut next = value.as_ref().clone();
-        next.table_catalog = with_entries_for(&value.table_catalog, prepared.written.iter())?;
+        next.table_catalog = if Arc::ptr_eq(&prepared.predecessor_catalog, &value.table_catalog) {
+            prepared.next.table_catalog
+        } else {
+            with_entries_for(&value.table_catalog, prepared.written.iter())?
+        };
         next.live = prepared.next.live;
         *value = Arc::new(next);
         Ok(())

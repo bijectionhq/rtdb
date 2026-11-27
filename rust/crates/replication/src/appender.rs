@@ -5,8 +5,8 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope}, log::proto};
-use rtdb_index::PreparedSearchDelta;
-use rtdb_tx::{ResolvedTx, TransactionResult};
+use rtdb_index::{PreparedSearchDelta, PreparedWrite};
+use rtdb_tx::{OwnedReplicaBody, ResolvedTx, TransactionResult};
 use rtdb_types::{Anomaly, BlockIndex, PlacedTerminal, ReplicaPosition, Result, Term, TermSequence, Timestamp};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -32,10 +32,19 @@ pub(crate) struct AppendStamp {
     pub fingerprint: Option<ReplicaFingerprint>,
 }
 
+pub(crate) struct PreparedInteractivePublication {
+    pub body: OwnedReplicaBody,
+    pub revision: Mutex<Option<PreparedWrite>>,
+    pub classic: Mutex<Option<crate::serving::PreparedClassicObservation>>,
+    pub io: Arc<MemoryBudget>,
+    pub rejected: Option<Arc<MemoryBudget>>,
+}
+
 pub(crate) struct PendingWrite {
     pub body: WriteBody,
     pub block: BlockIndex,
     placed_terminal: Option<PlacedTerminal>,
+    pub interactive: Option<PreparedInteractivePublication>,
     append: OnceLock<AppendStamp>,
     completion: Mutex<Option<oneshot::Sender<Result<Applied>>>>,
     _reservation: Arc<MemoryReservation>,
@@ -47,7 +56,7 @@ impl PendingWrite {
             WriteBody::Message(body) => Self::message_bound(body),
         };
         match bytes.and_then(|bytes| memory.reserve(bytes)) {
-            Ok(reservation) => Ok(Self::reserved(body, block, completion, None, reservation)),
+            Ok(reservation) => Ok(Self::reserved(body, block, completion, None, None, reservation)),
             Err(error) => {
                 if let Some(sender) = completion { let _ = sender.send(Err(error.clone())); }
                 Err(error)
@@ -55,18 +64,23 @@ impl PendingWrite {
         }
     }
     pub fn placed(body: WriteBody, block: BlockIndex, terminal: PlacedTerminal, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
-        Ok(Self::reserved(body, block, None, Some(terminal), memory.reserve(1024)?))
+        Ok(Self::reserved(body, block, None, Some(terminal), None, memory.reserve(1024)?))
     }
     pub fn clone_message(body: &ReplicaBody, block: BlockIndex, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
         let reservation = memory.reserve(Self::message_bound(body)?)?;
-        Ok(Self::reserved(WriteBody::Message(body.clone()), block, None, None, reservation))
+        Ok(Self::reserved(WriteBody::Message(body.clone()), block, None, None, None, reservation))
     }
+    pub fn prepared_interactive(tx: Arc<ResolvedTx>, block: BlockIndex, publication: PreparedInteractivePublication) -> Result<Arc<Self>> {
+        let reservation = publication.io.reserve(1024)?;
+        Ok(Self::reserved(WriteBody::Resolved(tx, None), block, None, None, Some(publication), reservation))
+    }
+
     fn message_bound(body: &ReplicaBody) -> Result<usize> {
         body.encoded_len().checked_mul(4).and_then(|bytes| bytes.checked_add(8192))
             .ok_or_else(|| Anomaly::fault("rtdb.replication/payload-size", "Pending message allocation size overflow"))
     }
-    fn reserved(body: WriteBody, block: BlockIndex, completion: Option<oneshot::Sender<Result<Applied>>>, placed_terminal: Option<PlacedTerminal>, reservation: Arc<MemoryReservation>) -> Arc<Self> {
-        Arc::new(Self { body, block, placed_terminal, append: OnceLock::new(), completion: Mutex::new(completion), _reservation: reservation })
+    fn reserved(body: WriteBody, block: BlockIndex, completion: Option<oneshot::Sender<Result<Applied>>>, placed_terminal: Option<PlacedTerminal>, interactive: Option<PreparedInteractivePublication>, reservation: Arc<MemoryReservation>) -> Arc<Self> {
+        Arc::new(Self { body, block, placed_terminal, interactive, append: OnceLock::new(), completion: Mutex::new(completion), _reservation: reservation })
     }
     pub fn append_stamp(&self) -> Option<&AppendStamp> { self.append.get() }
     pub fn sequence(&self) -> Option<TermSequence> { self.append_stamp().map(|stamp| stamp.sequence) }
@@ -199,20 +213,27 @@ impl ReplicaAppender {
                     let append_sample = matches!(&request.write.body, WriteBody::Resolved(..))
                         .then(|| rtdb_plan::ExecutionSample::new(self.execution_observer.clone(), rtdb_plan::ExecutionTimer::ReplicaAppend));
                     let resolved;
-                    let (body, allow_offload) = match &request.write.body {
-                        WriteBody::Resolved(tx, _) => match tx.inline_replica_body() {
-                            Some(body) => (body, false),
-                            None => match tx.to_replica_body(&self.memory) {
-                                Ok(body) => { resolved = body; (resolved.body(), true) }
-                                Err(error) => { request.fail(error.clone()); break Err(error); }
+                    let interactive = request.write.interactive.as_ref();
+                    let (body, allow_offload) = if let Some(interactive) = interactive {
+                        (interactive.body.body(), false)
+                    } else {
+                        match &request.write.body {
+                            WriteBody::Resolved(tx, _) => match tx.inline_replica_body() {
+                                Some(body) => (body, false),
+                                None => match tx.to_replica_body(&self.memory) {
+                                    Ok(body) => { resolved = body; (resolved.body(), true) }
+                                    Err(error) => { request.fail(error.clone()); break Err(error); }
+                                },
                             },
-                        },
-                        WriteBody::Message(body) => (body, true),
+                            WriteBody::Message(body) => (body, true),
+                        }
                     };
                     let copy_bound = body.encoded_len().checked_mul(4).and_then(|bytes| bytes.checked_add(8192)).ok_or_else(|| Anomaly::fault("rtdb.replication/payload-size", "Append message copy size overflow"));
-                    let _copy_reservation = match copy_bound.and_then(|bytes| self.memory.reserve(bytes)) {
-                        Ok(reservation) => reservation,
-                        Err(error) => { request.fail(error.clone()); break Err(error); }
+                    let _copy_reservation = if interactive.is_some() { None } else {
+                        match copy_bound.and_then(|bytes| self.memory.reserve(bytes)) {
+                            Ok(reservation) => Some(reservation),
+                            Err(error) => { request.fail(error.clone()); break Err(error); }
+                        }
                     };
                     let updated;
                     let search = request.write.body.search_delta().filter(|_| {
@@ -239,8 +260,9 @@ impl ReplicaAppender {
                         _ => false,
                     };
                     let observation = self.durable_commit_observation(&request.write.body);
-                    let enqueue = self.logs.enqueue_replica_with(self.term, Some(sequence), body, request.write.block, || (self.clock)(), allow_offload,
-                        |frame| request.write.stamp_append(sequence, frame));
+                    let memory = interactive.map_or(&self.memory, |publication| &publication.io);
+                    let enqueue = self.logs.enqueue_replica_in(self.term, Some(sequence), body, request.write.block, || (self.clock)(), allow_offload,
+                        |frame| request.write.stamp_append(sequence, frame), memory);
                     let enqueued = observe_enqueue(enqueue, &self.cancellation, &mut receipts).await;
                     drop(_copy_reservation);
                     match enqueued {

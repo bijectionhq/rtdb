@@ -118,6 +118,122 @@ async fn appended_log_records_release_their_encoding_charges() {
 }
 
 #[tokio::test]
+async fn local_interactive_rejection_prepares_journal_and_live_revision_under_root_pressure() {
+    let f = fixture(ReplicationConfig { idle_heartbeat: false, ..Default::default() }, 8 << 20).await;
+    let partition = &f.driver.partition;
+    let mut resolver = rtdb_tx::TxResolver::new(None, SourcePosition(-1), None, &f.memory).unwrap();
+    let mut workspace = rtdb_tx::InteractiveTransaction::open(
+        partition.snapshot(), Timestamp(100), SubmitOptions::default(), Arc::clone(&f.driver.resolve),
+    ).unwrap();
+    workspace.apply(TxOp::Sql { sql: "INSERT INTO docs RECORDS {_id: 1}".into(), args: None }.into()).await.unwrap();
+    let request = workspace.into_source().unwrap();
+    let blocker = f.memory.reserve(f.memory.available_bytes()).unwrap();
+
+    let (resolved, (revision, body, io), rejected) = resolver.resolve_local_interactive(
+        partition.snapshot(), SourcePosition(0), Timestamp(200), request, &f.driver.resolve, None, false,
+        |tx, memory| {
+            let revision = partition.prepare_write(tx.writes())?;
+            let body = tx.to_replica_body(memory)?;
+            let io = f.logs.prepay_interactive_replica(body.body(), memory)?;
+            Ok((revision, body, io))
+        },
+    ).await.unwrap();
+    assert_eq!(resolved.result().error().unwrap().code, "rtdb/memory-budget-exceeded");
+    assert!(!resolved.result().committed());
+    assert!(!resolved.writes().tables().contains_key(&TableRef::new("public", "docs")));
+
+    let through = f.logs.enqueue_replica_in(Term(1), Some(TermSequence(0)), body.body(), BlockIndex(0),
+        || Timestamp(200), false, |_| Ok(()), &io).await.unwrap().durable().await.unwrap();
+    let mut tail = f.logs.replica_replay(f.logs.replica_floor().unwrap()).await.unwrap();
+    let head = tail.replay().unwrap().poll_head(Duration::ZERO).await.unwrap().unwrap();
+    let record = read_replay_head(&mut tail, head, &io, replica_decode_bound, &CancellationToken::new())
+        .await.unwrap().unwrap();
+    assert_eq!(f.logs.decode_reserved_replica(record.raw, record.decode_reservation).unwrap().unwrap().metadata, through);
+    partition.install_write(revision, None).unwrap();
+    assert_eq!(partition.snapshot().tx_basis(), Some(resolved.result().tx_key()));
+    let before = f.memory.used_bytes();
+    rejected.unwrap().settle_prepaid();
+    assert!(f.memory.used_bytes() < before);
+    assert!(!partition.snapshot().tables().contains(&TableRef::new("public", "docs")));
+    drop(blocker);
+}
+
+#[tokio::test]
+async fn local_interactive_flush_recovers_the_applied_prefix() {
+    let config = ReplicationConfig { idle_heartbeat: false, ..Default::default() };
+    let mut f = fixture(config.clone(), 8 << 20).await;
+    let source = Arc::new(rtdb_storage::log::IntakeLog::for_local_replica(8 << 20, LogOffset(0)));
+    let logs = PartitionLogs::new(source, f.replica.clone(), StorageEpoch(0), StorageEpoch(0),
+        CURRENT_STORAGE_VERSION, StorageEpoch(0), f.store.clone(),
+        Arc::clone(&f.driver.resolve.storage), Arc::clone(&f.memory)).unwrap();
+    f.driver.logs = Arc::clone(&logs);
+    f.handle.logs = Arc::clone(&logs);
+    let mut workspace = rtdb_tx::InteractiveTransaction::open(
+        f.driver.partition.snapshot(), Timestamp(100), SubmitOptions::default(), Arc::clone(&f.driver.resolve),
+    ).unwrap();
+    workspace.apply(TxOp::Sql { sql: "INSERT INTO docs RECORDS {_id: 1}".into(), args: None }.into()).await.unwrap();
+    let request = workspace.into_source().unwrap();
+    let resolve = Arc::clone(&f.driver.resolve);
+
+    let mut status = f.handle.watch_status();
+    let task = tokio::spawn(f.driver.run());
+    let cancellation = CancellationToken::new();
+    let (committed, flush) = tokio::time::timeout(Duration::from_secs(5), async {
+        status.wait_for(|status| status.interactive_ready).await.unwrap();
+        let submitted = f.handle.submit_source_interactive(request, Timestamp(200)).await.unwrap();
+        let flush = f.handle.flush().await.unwrap();
+        let committed = f.handle.await_tx(TxId(submitted.0), &cancellation).await.unwrap().unwrap();
+        assert!(committed.committed());
+        f.handle.await_source(flush, &cancellation).await.unwrap();
+        status.wait_for(|status| status.adopted_block.is_some()).await.unwrap();
+        (committed.tx_key(), flush)
+    }).await.unwrap();
+    f.handle.shutdown();
+    task.await.unwrap().unwrap();
+
+    let recovered = f.blocks.recover(TrieConfig::new(2, 2).unwrap(), logs.source_floor().unwrap(),
+        Timestamp(200), crate::BlockDiscovery::List).await.unwrap();
+    assert_eq!(recovered.progress.tx_key, Some(committed));
+    assert!(recovered.progress.source_position >= flush);
+    assert!(recovered.partition.snapshot().tables().contains(&TableRef::new("public", "docs")));
+
+    let partition = Arc::clone(&recovered.partition);
+    let progress = ProgressMonitor::new(recovered.progress.clone());
+    let (handle, driver) = ReplicationDriver::new(config, logs, f.blocks, recovered, progress,
+        Arc::clone(&resolve), Arc::new(NoEffects), CancellationToken::new()).unwrap();
+    let mut status = handle.watch_status();
+    let task = tokio::spawn(driver.run());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        status.wait_for(|status| status.interactive_ready).await.unwrap();
+        let mut workspace = rtdb_tx::InteractiveTransaction::open(
+            partition.snapshot(), Timestamp(300), SubmitOptions::default(), resolve.clone(),
+        ).unwrap();
+        workspace.apply(TxOp::Sql { sql: "INSERT INTO refused RECORDS {_id: 2}".into(), args: None }.into()).await.unwrap();
+        let request = workspace.into_source().unwrap();
+        let pressure = f.memory.reserve(f.memory.available_bytes()).unwrap();
+        let source = handle.submit_source_interactive(request, Timestamp(150)).await.unwrap();
+        let result = handle.await_tx(TxId(source.0), &cancellation).await.unwrap().unwrap();
+        assert_eq!(result.error().unwrap().code, "rtdb/memory-budget-exceeded");
+        assert!(f.memory.used_bytes() < f.memory.limit_bytes());
+        drop(pressure);
+        assert!(!partition.snapshot().tables().contains(&TableRef::new("public", "refused")));
+
+        let catalog = rtdb_query::CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(),
+            rtdb_query::DatabaseSnapshot { partitions: vec![partition.snapshot()], storage: Arc::clone(&resolve.storage) }
+        )]), true).unwrap();
+        let context = rtdb_query::QueryContext::new(catalog, Arc::clone(&f.memory), Timestamp(400), "UTC",
+            Default::default(), &cancellation).unwrap();
+        assert_eq!(rtdb_tx::installed_receipt_time(context, result.tx_key()).await.unwrap(), Some(Timestamp(200)));
+        let followup = SourceTransaction::new(vec![TxOp::Sql { sql: "INSERT INTO docs RECORDS {_id: 3}".into(), args: None }],
+            SubmitOptions::default(), &f.memory).unwrap();
+        let source = handle.submit_source_encoded(followup.encode().unwrap().into_bytes(), Timestamp(400)).await.unwrap();
+        assert!(handle.await_tx(TxId(source.0), &cancellation).await.unwrap().unwrap().committed());
+    }).await.unwrap();
+    handle.shutdown();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn two_ready_local_tails_leave_room_to_read_and_decode_the_selected_head() {
     let directory = tempfile::tempdir().unwrap();
     let options = || LocalLogOptions { maximum_message_bytes: 1 << 20, queue_capacity: 2 };

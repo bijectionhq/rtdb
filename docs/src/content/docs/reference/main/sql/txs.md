@@ -201,14 +201,24 @@ return rr.Diagram(rr.Choice(0, begin, commit, 'ROLLBACK'))
 * A transaction may be either `READ ONLY` or `READ WRITE`.
   If not specified, it will be inferred from the first statement in the transaction.
 
-  Transactions must not mix query statements and [DML](https://en.wikipedia.org/wiki/Data_manipulation_language) statements.
+  On a native single-journal standalone database, synchronous `BEGIN READ WRITE` opens an interactive transaction that can mix queries and [DML](https://en.wikipedia.org/wiki/Data_manipulation_language) in the current database.
+  A query in that transaction reads the committed state captured at `BEGIN` and all earlier statements' writes.
+  The transaction fixes `CURRENT_TIMESTAMP` and the system time its writes will carry at `BEGIN`.
+  A PostgreSQL portal captures its view on first execution and keeps that view until it finishes.
+  If another transaction advances the database before `COMMIT`, the commit fails with SQLSTATE `40001`.
+  Retry the entire transaction from `BEGIN`.
+  Rollback discards all staged changes.
+  Interactive transactions support ordinary SQL data mutations, `ASSERT`, and `CREATE TABLE`.
+  The journal refuses interactive commits whose prepared effects exceed its inline record limit.
+  Attachments that synchronously build serving search or event-history indexes use the buffered write path.
+  Set retry metadata before opening the transaction to use the buffered write path.
+  An asynchronous commit option at `BEGIN` also selects that path.
+  Transactions on the buffered write path accept DML and reject queries.
 * `BEGIN`'s transaction modes are those of [`SET TRANSACTION`](#set-transaction-v22): `BEGIN READ WRITE, SYSTEM_TIME = ...` opens a transaction and applies `SET TRANSACTION READ WRITE, SYSTEM_TIME = ...` to it.
 * `BEGIN READ WRITE WITH (...)` takes the same options inside `WITH (...)`, `TIMEZONE` included.
 * `COMMIT` (v2.2+) optionally takes `SYNC` or `ASYNC`, choosing whether the connection waits for the transaction to be indexed before returning.
   `COMMIT SYNC` waits for indexing; `COMMIT ASYNC` returns as soon as the transaction is submitted to the log.
   When given, this takes precedence over the transaction's `ASYNC` option; otherwise that option applies, defaulting to `SYNC`.
-* N.B. `READ WRITE` is a misnomer in XTDB here - this is to align with standard SQL syntax.
-  XTDB doesn't have interactive read-write transactions, so any attempt to (e.g.) `SELECT` in this transaction will error.
 * For read-only transactions, see the [query reference](/reference/main/sql/queries#begin--commit--rollback).
 * `BEGIN`, `COMMIT` and `ROLLBACK` are SQL statements over the Postgres wire protocol only - see the [query reference](/reference/main/sql/queries#begin--commit--rollback).
 

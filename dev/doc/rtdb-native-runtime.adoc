@@ -27,8 +27,8 @@ The link:../../rust/crates/sql/README.adoc[SQL] and link:../../rust/crates/xtql/
 The rows apply in input order.
 A null start uses the transaction's assigned time, and a null end leaves validity open.
 
-Use `ASSERT CURRENT_TIMESTAMP < TIMESTAMP '2027-01-15T00:00:00Z'` as the first statement of a read-write transaction to require an exclusive deadline.
-The assertion uses the assigned system time, including any increase required to advance the previous transaction's time.
+An interactive standalone `BEGIN READ WRITE` fixes its assigned system time at begin and uses that time for each statement, including assertions.
+A buffered transaction evaluates `ASSERT CURRENT_TIMESTAMP < TIMESTAMP '2027-01-15T00:00:00Z'` against its assigned system time when it resolves in journal order.
 The transaction aborts when the assertion fails.
 In the same transaction, an expression such as `CURRENT_TIMESTAMP + INTERVAL '1' SECOND` can supply a value, part of an encoded key, or a validity endpoint.
 

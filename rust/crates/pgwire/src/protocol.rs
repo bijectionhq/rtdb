@@ -142,7 +142,7 @@ impl ResultLayout {
     }
 }
 
-enum PortalState { Query(QueryPortal), Ready }
+enum PortalState { Query(QueryPortal), DeferredQuery, Ready }
 struct PortalBinding {
     statement: Weak<Prepared>,
     _storage: Arc<MemoryReservation>,
@@ -163,7 +163,7 @@ impl Portal {
     fn retention_deadline(&self) -> Option<std::time::Instant> {
         match &self.state {
             PortalState::Query(query) => query.cursor.context().retention_deadline(),
-            PortalState::Ready => None,
+            PortalState::DeferredQuery | PortalState::Ready => None,
         }
     }
 }
@@ -699,19 +699,12 @@ impl ProtocolSession {
                     }
                 })).await.ok_or_else(cancelled)??)
             },
+            (Some(PreparedKind::Query(_)), _) if self.session.is_interactive_write() => {
+                portal.state = PortalState::DeferredQuery;
+                None
+            }
             (Some(PreparedKind::Query(query)), _) => {
-                let _active = self.cancellations.enter(&token);
-                let checked = !self.session.state().is_read_write();
-                let context = self.session.query_context_with(&token, checked).await?;
-                let arguments = portal.arguments.take();
-                Some(token.run_until_cancelled(Box::pin(async {
-                    if let Some(args) = arguments {
-                        let page = args.single_arrow_page().expect("portal owns one Arrow argument page");
-                        query.open_query_arrow_rows(context, page, args.types()).await
-                    } else {
-                        query.open_query(context, Vec::new()).await
-                    }
-                })).await.ok_or_else(cancelled)?.map_err(|error| if token.is_cancelled() { cancelled() } else { error })?)
+                Some(self.open_query_cursor(&mut portal, query).await?)
             },
             (_, Some(statement)) if statement.is_show() => {
                 let args = bind_control_arguments(portal.arguments.as_ref(), self.node.memory())?;
@@ -747,6 +740,23 @@ impl ProtocolSession {
         Ok(portal)
         }).await
     }
+    async fn open_query_cursor(&mut self, portal: &mut Portal, query: &PreparedSql) -> Result<QueryCursor> {
+        let token = portal.cancellation.clone();
+        let _active = self.cancellations.enter(&token);
+        let checked = !self.session.state().is_read_write();
+        let context = self.session.query_context_with(&token, checked).await?;
+        let arguments = portal.arguments.take();
+        token.run_until_cancelled(Box::pin(async {
+            if let Some(args) = arguments {
+                let page = args.single_arrow_page().expect("portal owns one Arrow argument page");
+                query.open_query_arrow_rows(context, page, args.types()).await
+            } else {
+                query.open_query(context, Vec::new()).await
+            }
+        })).await.ok_or_else(cancelled)?
+            .map_err(|error| if token.is_cancelled() { cancelled() } else { error })
+    }
+
     fn control_options(&self) -> ControlExecutionOptions { ControlExecutionOptions { frontend: ControlFrontend::PostgreSql, implicit_transaction: self.implicit } }
     fn record_transaction_error(&self) { if let Some(observer) = self.node.execution_observer() { observer.record_error(rtdb_plan::ExecutionError::Transaction); } }
     async fn description<W: AsyncWrite + Unpin>(columns: Option<&[Column]>, fallback: PgType, writer: &mut Writer<W>) -> Result<()> { match columns { Some(columns) => writer.columns(columns, fallback).await, None => writer.empty(b'n').await } }
@@ -766,9 +776,15 @@ impl ProtocolSession {
             (PreparedKind::Keywords, _) => { let env = self.environment()?; let value = rtdb_pg_codec::encode(PgType::VarChar, Format::Text, &Value::Utf8("xtdb".into()), &env, self.node.memory())?; writer.row(&[value]).await?; writer.string(b'C', "SELECT 1").await },
             (PreparedKind::Query(_), _) | (PreparedKind::Control(_), Some(ControlStatement::Show { .. }
                 | ControlStatement::ShowTransactionIsolationLevel | ControlStatement::ShowSessionParameter { .. })) => {
-                if matches!(kind, PreparedKind::Query(_)) {
-                    if self.session.state().is_read_write() && !is_type_probe(source) { return Err(Anomaly::incorrect("xtdb/queries-in-read-write-tx", "Queries are unsupported in a DML transaction").with_context("query", source.into())); }
+                if let PreparedKind::Query(query) = kind {
+                    if self.session.state().is_read_write() && !self.session.is_interactive_write() && !is_type_probe(source) {
+                        return Err(Anomaly::incorrect("xtdb/queries-in-read-write-tx", "Queries are unsupported in a DML transaction").with_context("query", source.into()));
+                    }
                     self.begin_implicit(Some(true))?;
+                    if matches!(portal.state, PortalState::DeferredQuery) {
+                        let cursor = self.open_query_cursor(portal, query).await?;
+                        portal.state = PortalState::Query(QueryPortal { cursor, batch: None, layout: None, row: 0, sent: 0 });
+                    }
                 } else if control.is_some_and(ControlStatement::requires_read_transaction) {
                     self.begin_implicit(Some(true))?;
                 }
