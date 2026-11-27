@@ -76,7 +76,7 @@ impl TableStatistics for RecordStatistics<'_> {
 
 /// Each partition's flushed rows, from its table catalog, and its live rows; a partition that holds none of the table's
 /// rows counts as none, and only a table no partition knows is unknown.
-fn table_rows(catalog: &CatalogSnapshot, table: &QualifiedTable) -> Option<u64> {
+pub(crate) fn table_rows(catalog: &CatalogSnapshot, table: &QualifiedTable) -> Option<u64> {
     let partitions = catalog.database(&table.database).ok()?.partitions.iter().map(|partition| {
         let flushed = partition.table_catalog().metadata(&table.table).map(|meta| meta.row_count);
         let live = partition.iter_segments(&table.table).map(|segment| i64::from(segment.row_count())).sum::<i64>();
