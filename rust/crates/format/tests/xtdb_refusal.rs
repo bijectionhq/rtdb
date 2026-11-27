@@ -196,6 +196,9 @@ fn extension_replica_bodies() -> Vec<(Option<(&'static str, u32)>, ReplicaBody)>
         (None, ReplicaBody::TriesDeleted(pb::TriesDeleted { table_name: Some("public/docs".into()), trie_keys: vec!["l01-rc-b00-e01".into()] })),
         (None, ReplicaBody::TriesDeleted(pb::TriesDeleted { table_name: Some("public/docs".into()), trie_keys: vec!["l00-rc-b02".into()] })),
         (None, ReplicaBody::TriesDeleted(pb::TriesDeleted { table_name: Some("rtdb_owned_v1/docs".into()), trie_keys: vec!["l01-rc-b00".into()] })),
+        // A key XTDB cannot parse is refused rather than passed through.
+        (None, ReplicaBody::TriesAdded(tries_added(vec![trie("l01-rc-b00-x")]))),
+        (None, ReplicaBody::TriesDeleted(pb::TriesDeleted { table_name: Some("public/docs".into()), trie_keys: vec!["l01-rc-b00-x".into()] })),
         (Some(("BlockUploaded", 1000)), uploaded(|upload| upload.naming_epoch = Some(1))),
         (None, uploaded(|upload| upload.tries = vec![with_artefact(trie("l00-rc-b02"))])),
         (Some(("OversizedMessage", 1001)), oversized(|message| {
@@ -218,6 +221,7 @@ fn extension_source_bodies() -> Vec<(Option<(&'static str, u32)>, SourceBody)> {
         (Some(("Tx", 1003)), SourceBody::Tx(pb::Tx { bounded_retry: Some(pb::BoundedRetry { nonce: Some(vec![b'0'; 32]), not_after_micros: Some(2) }), ..tx() })),
         (None, SourceBody::TriesAdded(tries_added(vec![trie("l01-rc-b00-e01")]))),
         (None, SourceBody::TriesAdded(tries_added(vec![with_artefact(trie("l01-rc-b00"))]))),
+        (None, SourceBody::TriesAdded(tries_added(vec![trie("l01-rc-b00-x")]))),
     ]
 }
 

@@ -2149,6 +2149,9 @@ contract XtdbRefusesRtdbExtensionRecords {
         -- is stored with XTDB_REFUSAL_PREFIX before its protobuf, so XTDB's Block.parseFrom and TableBlock.parseFrom fail with the same invalid-tag error when a node opens the store or follows a block upload.
         -- An RTDB reader strips a leading zero byte, which no encoded protobuf message starts with; digests cover the stored bytes, prefix included.
 
+    @invariant UnparseableTrieKeys
+        -- A trie key that does not parse counts as RTDB-only wherever a trie's naming epoch is checked, so a record naming one is framed rather than let through.
+
     @invariant RtdbOnlyTables
         -- The engine's transaction-metadata tables (xt/idempotency_receipts, xt/bounded_retry_receipts, xt/rtdb_replay_keys, the placed attempt outcomes) and the owned rtdb_owned_* schemas are RTDB-only tables.
 

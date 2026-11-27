@@ -40,7 +40,7 @@ pub fn replica_uses_extension(body: &ReplicaBody) -> bool {
             || noop.clock_lease_micros.is_some(),
         ReplicaBody::TriesAdded(added) => added.tries.iter().any(trie_uses_extension),
         ReplicaBody::TriesDeleted(deleted) => deleted.table_name.as_deref().is_some_and(rtdb_only_table)
-            || deleted.trie_keys.iter().any(|key| key.parse::<TrieKey>().is_ok_and(|key| key.epoch() != 0 || key.level() == 0)),
+            || deleted.trie_keys.iter().any(|key| rtdb_only_trie_key(key, |key| key.level() == 0)),
         ReplicaBody::BlockUploaded(upload) => upload.naming_epoch.is_some_and(|epoch| epoch > 0)
             || upload.tries.iter().any(trie_uses_extension),
         ReplicaBody::OversizedMessage(oversized) => oversized.publication.is_some()
@@ -72,11 +72,17 @@ pub fn table_block_uses_extension(table: &block_pb::TableBlock) -> bool {
         || table.tries.iter().chain(table.partitions.iter().flat_map(|partition| &partition.tries)).any(trie_uses_extension)
 }
 
-/// A trie of a later naming epoch, of an RTDB-only table, or carrying derived artefacts.
+/// A trie of a later naming epoch or an unparseable key, of an RTDB-only table, or carrying derived artefacts.
 fn trie_uses_extension(trie: &TrieDetails) -> bool {
     !trie.artefacts.is_empty()
         || trie.table_name.as_deref().is_some_and(rtdb_only_table)
-        || trie.trie_key.as_deref().and_then(|key| key.parse::<TrieKey>().ok()).is_some_and(|key| key.epoch() != 0)
+        || trie.trie_key.as_deref().is_some_and(|key| rtdb_only_trie_key(key, |_| false))
+}
+
+/// A trie key of a later naming epoch, one `also` picks out, or one that does not parse: XTDB parses every trie key it reads,
+/// so it must refuse a record naming a key it cannot parse rather than be let through by default.
+fn rtdb_only_trie_key(key: &str, also: impl FnOnce(&TrieKey) -> bool) -> bool {
+    key.parse::<TrieKey>().map_or(true, |key| key.epoch() != 0 || also(&key))
 }
 
 /// A `schema/table` name, as log records spell it, of a table only RTDB writes.
