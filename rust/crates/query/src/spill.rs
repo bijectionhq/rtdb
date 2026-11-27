@@ -13,7 +13,9 @@ use arrow_schema::{ArrowError, SchemaRef};
 use ctr::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_format::ipc::RecordSpans;
-use rtdb_types::{Anomaly, AnomalyKind, Result};
+use rtdb_types::Result;
+#[cfg(test)]
+use rtdb_types::AnomalyKind;
 use tempfile::{NamedTempFile, TempDir, TempPath};
 
 use crate::{
@@ -125,7 +127,6 @@ impl SpillRegion {
         Ok(())
     }
     pub fn create(self: &Arc<Self>) -> Result<SpillWriter> {
-        if self.limit == 0 { return Err(spill_limit("Query spilling is disabled")); }
         let key = match self.sealing { SpillSealing::Plain => None, SpillSealing::Sealed => Some(SpillKey::generate()?) };
         let (file, path) = NamedTempFile::new_in(self.directory()?).map_err(io_error)?.into_parts();
         let cipher = key.map(|key| key.cipher_at(0).map(|cipher| (key, cipher))).transpose().map_err(io_error)?;
@@ -187,7 +188,7 @@ impl SpillWriter {
 
     pub fn write_single_join_record(&mut self, batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<()> {
         self.write_frame(&[3])?;
-        if let Some(spans) = exact_spill_spans(batch, memory)? {
+        if let Some(spans) = RecordSpans::exact(batch, IPC_ALIGNMENT, memory)? {
             return self.write_spanned_record(&spans);
         }
         self.write_record(batch, memory)
@@ -232,7 +233,7 @@ impl SpillWriter {
         };
         let options = IpcWriteOptions::try_new(IPC_ALIGNMENT, false, MetadataVersion::V5).map_err(ipc_error)?;
         let generator = IpcDataGenerator::default();
-        let spans = exact_spill_spans(batch, memory)?;
+        let spans = RecordSpans::exact(batch, IPC_ALIGNMENT, memory)?;
         let _scratch = if spans.is_none() {
             let bound = batch.get_array_memory_size().checked_mul(6)
                 .and_then(|bytes| bytes.checked_add(schema_bytes.checked_mul(8)?))
@@ -268,20 +269,13 @@ impl SpillWriter {
         })
     }
 
+    /// Writes a whole page, as XTDB's spill writes whole Arrow batches: as one Arrow record where its columns have one,
+    /// otherwise as its fragments. A budget or quota that cannot hold the page fails the query.
     pub fn write_columns(&mut self, batch: &ColumnBatch, schema: &rtdb_plan::Schema, memory: &Arc<MemoryBudget>) -> Result<()> {
         if batch.len == 0 { return self.write_frame(&[0]); }
-        match batch.spill_record(schema, memory) {
-            Ok(Some(record)) => {
-                let schema_bytes = crate::runtime_schema::schema_bound(schema)?;
-                match self.write_arrow(Some(1), &record, schema_bytes, memory, "spill-columns") {
-                    Ok(()) => return Ok(()),
-                    Err(error) if error.is(AnomalyKind::ResourceExhausted) || error.is(AnomalyKind::ConfigurationLimitExceeded) => (),
-                    Err(error) => return Err(error),
-                }
-            }
-            Ok(None) => (),
-            Err(error) if error.is(AnomalyKind::ResourceExhausted) => (),
-            Err(error) => return Err(error),
+        if let Some(record) = batch.spill_record(schema, memory)? {
+            let schema_bytes = crate::runtime_schema::schema_bound(schema)?;
+            return self.write_arrow(Some(1), &record, schema_bytes, memory, "spill-columns");
         }
         let mut fragments = FragmentBytes::new(memory)?;
         encode_batch(batch, memory, &mut fragments)?;
@@ -292,14 +286,6 @@ impl SpillWriter {
     pub fn finish(mut self) -> Result<Arc<SpillFile>> {
         self.file.flush().map_err(io_error)?;
         Ok(self.retained)
-    }
-}
-
-fn exact_spill_spans(batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<Option<RecordSpans>> {
-    match RecordSpans::exact(batch, IPC_ALIGNMENT, memory) {
-        // A small record can fit its generic encoding reservation even when span planning runs out of scratch.
-        Err(error) if error.is(AnomalyKind::ResourceExhausted) || error.code == "rtdb.format/invalid-arrow" => Ok(None),
-        result => result,
     }
 }
 
@@ -412,44 +398,6 @@ impl SpillReader {
     }
 }
 
-/// Writes a page in spans each of whose encoding the memory budget can admit, so that no written frame is rolled back.
-/// A span's encoding is bounded by `ENCODING_FACTOR` times its share of the page's charges; a span of one row is written
-/// whatever the budget holds, and fails as any other allocation does.
-pub(crate) fn write_page(writer: &mut SpillWriter, batch: &ColumnBatch, schema: &rtdb_plan::Schema, memory: &Arc<MemoryBudget>) -> Result<()> {
-    let rows = page_span_rows(batch.len, batch.working_set_bytes(memory)?, crate::runtime_schema::schema_bound(schema)?, memory)?;
-    if rows >= batch.len { return writer.write_columns(batch, schema, memory); }
-    let positions = (0..schema.len()).collect::<Vec<_>>();
-    for start in (0..batch.len).step_by(rows) {
-        let span = start..batch.len.min(start + rows);
-        let bytes = span.len().checked_mul(std::mem::size_of::<(usize, usize)>())
-            .ok_or_else(|| invalid("row-size", "Spill page selection exceeds addressable memory"))?;
-        let _picks = memory.reserve(bytes)?;
-        let picks = span.map(|row| (0, row)).collect::<Vec<_>>();
-        let slice = ColumnBatch::take_rows_with_custody(&[batch], &picks, &positions, true, memory)?;
-        writer.write_columns(&slice, schema, memory)?;
-    }
-    Ok(())
-}
-
-/// The encoding scratch of a spilled page, its copy for a span included, per byte of the page's charges.
-const ENCODING_FACTOR: usize = 8;
-
-/// The most rows of a page of `len` rows holding `page_bytes` whose encoding `memory` admits now, halving from the whole
-/// page; at least one.
-fn page_span_rows(len: usize, page_bytes: usize, schema_bytes: usize, memory: &Arc<MemoryBudget>) -> Result<usize> {
-    let overflow = || invalid("row-size", "Spill page encoding bound exceeds addressable memory");
-    let fixed = schema_bytes.checked_mul(8).and_then(|bytes| bytes.checked_add(8192)).ok_or_else(overflow)?;
-    let mut rows = len.max(1);
-    while rows > 1 {
-        let share = u128::from(page_bytes as u64) * rows as u128 / len.max(1) as u128;
-        let bound = usize::try_from(share).ok().and_then(|share| share.checked_mul(ENCODING_FACTOR))
-            .and_then(|bytes| bytes.checked_add(fixed)).ok_or_else(overflow)?;
-        if memory.try_reserve(bound).is_some() { break; }
-        rows = rows.div_ceil(2);
-    }
-    Ok(rows)
-}
-
 /// The buffer of each spill writer.
 const WRITER_BUFFER_BYTES: usize = 8 << 10;
 
@@ -466,18 +414,6 @@ fn every_node_spills_without_limit_by_default_and_a_configured_limit_refuses_pas
     let limited = SpillRegion::new(1 << 10).unwrap();
     limited.reserve(1 << 10).unwrap();
     assert!(limited.reserve(1).unwrap_err().is(AnomalyKind::ConfigurationLimitExceeded));
-}
-
-#[test]
-fn a_spill_page_spans_what_the_budget_admits_and_never_less_than_a_row() {
-    let memory = MemoryBudget::new(1 << 20);
-    assert_eq!(page_span_rows(1024, 1 << 10, 64, &memory).unwrap(), 1024, "a page that fits is written whole");
-    let rows = page_span_rows(1024, 1 << 20, 64, &memory).unwrap();
-    assert!(rows < 1024 && rows > 1, "{rows}");
-    assert!(memory.try_reserve((1 << 20) / 1024 * rows * ENCODING_FACTOR).is_some());
-    assert_eq!(page_span_rows(1024, usize::MAX / 16, 64, &MemoryBudget::new(0)).unwrap(), 1);
-    assert_eq!(page_span_rows(0, 0, 64, &memory).unwrap(), 1);
-    assert_eq!(memory.used_bytes(), 0, "sizing holds nothing");
 }
 
 #[test]
@@ -523,12 +459,12 @@ fn malformed_column_spill_markers_fail_before_body_admission() {
 }
 
 #[test]
-fn join_spill_replays_small_records_across_offsets_with_generic_scratch() {
+fn join_spill_replays_small_records_across_offsets() {
     use arrow_array::{Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
 
     let memory = MemoryBudget::new(1 << 20);
-    let scratch = MemoryBudget::new(32 << 10);
+    let scratch = MemoryBudget::new(1 << 20);
     let spill = Arc::new(SpillRegion::new(1536).unwrap());
     let schema = Arc::new(Schema::new(vec![
         Field::new("key", DataType::Int64, false),
@@ -640,11 +576,18 @@ fn homogeneous_spill_writes_exact_ipc_framing_and_checks_quota_before_writing() 
     assert_eq!(memory.used_bytes(), 0);
 }
 
+/// Zero is a quota like any other, not a switch: it refuses the first byte written, plain or sealed.
 #[test]
-fn a_disabled_spill_refuses_its_first_file_as_a_configured_limit() {
-    let error = Arc::new(SpillRegion::new(0).unwrap()).create().err().unwrap();
-    assert_eq!(error.code, "rtdb.query/spill-limit");
-    assert!(error.is(AnomalyKind::ConfigurationLimitExceeded));
+fn a_zero_spill_quota_refuses_the_first_byte_as_an_exceeded_temporary_file_limit() {
+    for spill in [SpillRegion::new(0).unwrap(), SpillRegion::sealed(0).unwrap()] {
+        let spill = Arc::new(spill);
+        let mut writer = spill.create().unwrap();
+        let error = writer.write_frame(&[0]).unwrap_err();
+        assert_eq!(error.code, "rtdb.query/spill-limit");
+        assert!(error.is(AnomalyKind::ConfigurationLimitExceeded));
+        drop(writer);
+        assert_eq!(spill.retained_bytes(), 0);
+    }
 }
 
 #[test]
@@ -859,14 +802,4 @@ fn sealed_spill_files_hold_no_readable_rows_and_replay_from_any_offset() {
     }
     assert_ne!(ciphertexts[0], ciphertexts[1], "each sealed file has its own key");
     assert_eq!(memory.used_bytes(), 0);
-}
-
-#[test]
-fn a_refused_spill_reports_an_exhausted_temporary_file_limit() {
-    for spill in [SpillRegion::new(0).unwrap(), SpillRegion::sealed(0).unwrap()] {
-        let error = Arc::new(spill).create().err().unwrap();
-        assert_eq!(error.code, "rtdb.query/spill-limit");
-        assert!(error.is(rtdb_types::AnomalyKind::ResourceExhausted));
-        assert_eq!(error.context.get("sql-state").and_then(serde_json::Value::as_str), Some("53400"));
-    }
 }

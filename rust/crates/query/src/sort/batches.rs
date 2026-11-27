@@ -786,7 +786,7 @@ fn scalar_key(batch: &ColumnBatch, row: usize, plan: &SortPlan, columns: &[usize
 }
 
 fn write_batch(writer: &mut SpillWriter, batch: ColumnBatch, plan: &SortPlan) -> Result<()> {
-    crate::spill::write_page(writer, &batch, &plan.schema, &plan.execution.context.memory)
+    writer.write_columns(&batch, &plan.schema, &plan.execution.context.memory)
 }
 
 fn read_semantic_page(
