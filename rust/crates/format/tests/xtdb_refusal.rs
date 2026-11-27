@@ -70,7 +70,6 @@ const FORK_FIELDS: &[(&str, u32, Fork)] = &[
     ("ResolvedTx", 1003, Fork::Framed),
     ("NoOp", 1000, Fork::Framed),
     ("NoOp", 1001, Fork::Framed),
-    ("NoOp", 4, Fork::Framed),
     ("OversizedMessage", 1000, Fork::Annotation("the digest of the payload, which XTDB fetches by its key")),
     ("OversizedMessage", 1001, Fork::Framed),
     ("TableBlock", 1000, Fork::Framed),
@@ -121,7 +120,7 @@ const FORK_FIELD_FLOOR: u32 = 1000;
 #[test]
 fn every_field_the_fork_adds_to_a_shared_message_is_numbered_above_upstreams_range() {
     // The leader clock lease (NoOp 4) is outside the rule only until its deletion lands.
-    let low = FORK_FIELDS.iter().filter(|(message, field, _)| *field < FORK_FIELD_FLOOR && (*message, *field) != ("NoOp", 4))
+    let low = FORK_FIELDS.iter().filter(|(message, field, _)| *field < FORK_FIELD_FLOOR)
         .map(|(message, field, _)| (*message, *field)).collect::<Vec<_>>();
     assert!(low.is_empty(), "number these from {FORK_FIELD_FLOOR}, so a field upstream adds next cannot collide: {low:?}");
 }
