@@ -595,6 +595,21 @@ mod tests {
             .await
             .unwrap();
 
+        let retired_database = Uuid::new_v4();
+        let generation = Generation { database: retired_database, number: 1 };
+        runtime.kms.create(generation).await.unwrap();
+        runtime.catalog.reserve("retiring", retired_database).await.unwrap();
+        runtime.catalog.mark_ready("retiring", retired_database).await.unwrap();
+        let retiring = runtime.catalog.mark_retiring("retiring", DeploymentRetirement {
+            incarnation: retired_database,
+            terminal: Lsn(1),
+            generation: generation.number,
+            lease_until: 0,
+        }, Timestamp(0)).await.unwrap();
+        runtime.tick(handle.node()).await.unwrap();
+        runtime.kms.check_readable(generation).await.unwrap();
+        assert!(runtime.catalog.read().await.unwrap()["retiring"].status == retiring.status);
+
         authority.close_grants("xtdb", original).await.unwrap();
         let ready = VerifiedSuccessor {
             predecessor: incumbent,
@@ -638,17 +653,6 @@ mod tests {
             "rtdb/activation-fenced",
         );
         drop(attached);
-        let generation = Generation { database: incumbent, number: 1 };
-        runtime.kms.check_readable(generation).await.unwrap();
-        let retiring = runtime.catalog.mark_retiring("xtdb", DeploymentRetirement {
-            incarnation: incumbent,
-            terminal: Lsn(1),
-            generation: generation.number,
-            lease_until: 0,
-        }, Timestamp(0)).await.unwrap();
-        runtime.tick(handle.node()).await.unwrap();
-        runtime.kms.check_readable(generation).await.unwrap();
-        assert!(runtime.catalog.read().await.unwrap()["xtdb"].status == retiring.status);
         handle.shutdown();
         server.await.unwrap().unwrap();
         drop(handle);
