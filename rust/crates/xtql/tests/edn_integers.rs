@@ -23,3 +23,22 @@ fn invalid_integer_spellings_cannot_be_preserved_as_unchecked_bigint_text() {
     }
     assert!(read("#{1 1.0 1M}").is_ok());
 }
+
+#[test]
+fn integral_ratio_tokens_preserve_clojure_integer_widths() {
+    for (source, expected) in [("06/03", 2), ("-10/2", -5), ("+4/2", 2), ("0/3", 0)] {
+        assert_eq!(read(source).unwrap().kind, EdnKind::Integer(expected), "{source}");
+    }
+    assert_eq!(read("9223372036854775808/2").unwrap().kind, EdnKind::BigInteger("4611686018427387904".into()));
+    assert_eq!(read("-9223372036854775808/1").unwrap().kind, EdnKind::BigInteger(i64::MIN.to_string()));
+    assert!(read("#{6/3 2}").is_err());
+    for (source, message) in [
+        ("1/0", "Ratio denominator is zero"),
+        ("2/3", "Non-integral ratio literals are not supported; use a decimal or floating-point value"),
+        ("2/-1", "Invalid ratio literal"),
+    ] {
+        let error = read(source).unwrap_err();
+        assert_eq!(error.code, "xtql/edn-reader");
+        assert_eq!(error.message.as_deref(), Some(message));
+    }
+}

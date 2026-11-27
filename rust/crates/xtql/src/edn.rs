@@ -1,3 +1,5 @@
+use num_bigint::BigInt;
+use num_traits::{ToPrimitive, Zero};
 use rtdb_plan::SourceSpan;
 use rtdb_types::{Anomaly, Result};
 use serde::{Deserialize, Serialize};
@@ -47,7 +49,7 @@ impl<'a> Reader<'a> {
         loop {
             while self.peek().is_some_and(|ch| ch.is_whitespace() || ch == ',') { self.next(); }
             if self.peek() == Some(';') {
-                while self.next().is_some_and(|ch| ch != '\n') {}
+                while self.next().is_some_and(|ch| ch != '\n' && ch != '\r') {}
             } else if self.source[self.offset..].starts_with("#_") {
                 self.offset += 2;
                 self.form()?;
@@ -71,20 +73,7 @@ impl<'a> Reader<'a> {
                 if token.is_empty() || token.starts_with(':') { return Err(self.failure("Keyword requires an explicit name")); }
                 EdnKind::Keyword(token.into())
             }
-            '\\' => {
-                let token = self.token();
-                let ch = match token {
-                    "newline" => '\n', "space" => ' ', "tab" => '\t', "return" => '\r', "backspace" => '\u{8}', "formfeed" => '\u{c}',
-                    value if value.starts_with('u') && value.len() == 5 => u32::from_str_radix(&value[1..], 16).ok().and_then(char::from_u32).ok_or_else(|| self.failure("Invalid Unicode character"))?,
-                    value => {
-                        let mut chars = value.chars();
-                        let ch = chars.next().ok_or_else(|| self.failure("Empty character literal"))?;
-                        if chars.next().is_some() { return Err(self.failure("Invalid character literal")); }
-                        ch
-                    }
-                };
-                EdnKind::Character(ch)
-            }
+            '\\' => EdnKind::Character(self.character()?),
             '#' => match self.peek() {
                 Some(':') => {
                     self.next();
@@ -113,6 +102,10 @@ impl<'a> Reader<'a> {
                     EdnKind::Float(value)
                 }
                 Some('=') => return Err(self.failure("Reader evaluation is not an EDN operation")),
+                Some('?') => return Err(self.failure("Reader conditionals are not supported")),
+                Some('"') => return Err(self.failure("Regex objects are not EDN literals; use a string pattern")),
+                Some('<') => return Err(self.failure("Unreadable object form")),
+                Some('^') => { self.next(); self.metadata()? }
                 _ => {
                     let tag = self.token().to_owned();
                     if tag.is_empty() { return Err(self.failure("Tagged value requires a tag name")); }
@@ -123,7 +116,7 @@ impl<'a> Reader<'a> {
                 let symbol = Edn { span: SourceSpan { start, end: start + 1 }, kind: EdnKind::Symbol("quote".into()) };
                 EdnKind::List(vec![symbol, self.form()?])
             }
-            '^' => { self.form()?; let value = self.form()?; value.kind }
+            '^' => self.metadata()?,
             ')' | ']' | '}' => return Err(self.failure("Unexpected closing delimiter")),
             _ => {
                 let rest = self.token();
@@ -172,8 +165,40 @@ impl<'a> Reader<'a> {
 
     fn token(&mut self) -> &'a str {
         let start = self.offset;
-        while self.peek().is_some_and(|ch| !ch.is_whitespace() && !matches!(ch, ',' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | ';')) { self.next(); }
+        while self.peek().is_some_and(|ch| !ch.is_whitespace() && ch != ',' && !(reader_macro(ch) && ch != '#')) { self.next(); }
         &self.source[start..self.offset]
+    }
+
+    fn metadata(&mut self) -> Result<EdnKind> {
+        self.form()?;
+        Ok(self.form()?.kind)
+    }
+
+    fn character(&mut self) -> Result<char> {
+        let start = self.offset;
+        let first = self.next().ok_or_else(|| self.failure("Empty character literal"))?;
+        self.token();
+        let token = &self.source[start..self.offset];
+        if token.len() == first.len_utf8() {
+            return Ok(first);
+        }
+        let numeric = |digits: &str, radix, maximum| {
+            let value = digits.chars().try_fold(0, |value, ch| {
+                edn_digit(ch, radix).map(|digit| value * radix + digit)
+            }).ok_or_else(|| self.failure("Invalid numeric character literal"))?;
+            char::from_u32(value).filter(|_| value <= maximum).ok_or_else(|| self.failure("Character literal is out of range"))
+        };
+        match token {
+            "newline" => Ok('\n'),
+            "space" => Ok(' '),
+            "tab" => Ok('\t'),
+            "return" => Ok('\r'),
+            "backspace" => Ok('\u{8}'),
+            "formfeed" => Ok('\u{c}'),
+            token if first == 'u' && token.chars().count() == 5 => numeric(&token[1..], 16, 0xffff),
+            token if first == 'o' && token.chars().count() <= 4 => numeric(&token[1..], 8, 0o377),
+            _ => Err(self.failure("Invalid character literal")),
+        }
     }
 
     fn string(&mut self) -> Result<String> {
@@ -194,6 +219,16 @@ impl<'a> Reader<'a> {
                         }
                         result.push(char::from_u32(code).ok_or_else(|| self.failure("Unicode escape is not a scalar value"))?);
                     }
+                    ch if rtdb_types::decimal_digit(ch).is_some() => {
+                        let mut value = edn_digit(ch, 8).ok_or_else(|| self.failure("Invalid octal escape"))?;
+                        for _ in 1..3 {
+                            let Some(next) = self.peek().filter(|ch| !ch.is_whitespace() && *ch != ',' && !reader_macro(*ch)) else { break };
+                            value = value * 8 + edn_digit(next, 8).ok_or_else(|| self.failure("Invalid octal escape"))?;
+                            self.next();
+                        }
+                        let byte = u8::try_from(value).map_err(|_| self.failure("Octal escape must be in the range 0 through 377"))?;
+                        result.push(char::from(byte));
+                    }
                     _ => return Err(self.failure("Unknown string escape")),
                 },
                 ch => result.push(ch),
@@ -203,9 +238,22 @@ impl<'a> Reader<'a> {
 
     fn unicode_escape(&mut self) -> Result<u32> {
         let mut code = 0;
-        for _ in 0..4 { code = code * 16 + self.next().and_then(|ch| ch.to_digit(16)).ok_or_else(|| self.failure("Invalid Unicode escape"))?; }
+        for _ in 0..4 { code = code * 16 + self.next().and_then(|ch| edn_digit(ch, 16)).ok_or_else(|| self.failure("Invalid Unicode escape"))?; }
         Ok(code)
     }
+}
+
+fn reader_macro(ch: char) -> bool {
+    matches!(ch, '(' | ')' | '[' | ']' | '{' | '}' | '"' | ';' | '^' | '\\' | '#')
+}
+
+fn edn_digit(ch: char, radix: u32) -> Option<u32> {
+    let digit = match ch {
+        'Ａ'..='Ｆ' => u32::from(ch) - u32::from('Ａ') + 10,
+        'ａ'..='ｆ' => u32::from(ch) - u32::from('ａ') + 10,
+        _ => ch.to_digit(16).or_else(|| rtdb_types::decimal_digit(ch).map(u32::from))?,
+    };
+    (digit < radix).then_some(digit)
 }
 
 fn numeric_token(value: &str) -> bool {
@@ -220,15 +268,33 @@ fn parse_number(value: &str) -> std::result::Result<EdnKind, &'static str> {
         return Ok(EdnKind::Decimal(value.into()));
     }
     if let Some(value) = value.strip_suffix('N') { return Ok(EdnKind::BigInteger(integer_token(value)?.to_string())); }
-    use num_traits::ToPrimitive;
     if let Ok(parsed) = integer_token(value) {
         return Ok(match parsed.to_i64() { Some(value) => EdnKind::Integer(value), None => EdnKind::BigInteger(parsed.to_string()) });
+    }
+    if let Some((numerator, denominator)) = value.split_once('/') {
+        let unsigned = numerator.strip_prefix(['+', '-']).unwrap_or(numerator);
+        if unsigned.is_empty() || denominator.is_empty() || !unsigned.bytes().chain(denominator.bytes()).all(|byte| byte.is_ascii_digit()) {
+            return Err("Invalid ratio literal");
+        }
+        let numerator = numerator.parse::<BigInt>().map_err(|_| "Invalid ratio numerator")?;
+        let denominator = denominator.parse::<BigInt>().map_err(|_| "Invalid ratio denominator")?;
+        if denominator.is_zero() { return Err("Ratio denominator is zero"); }
+        if !(&numerator % &denominator).is_zero() {
+            return Err("Non-integral ratio literals are not supported; use a decimal or floating-point value");
+        }
+        let fixed_width = numerator.to_i64().is_some_and(|value| value != i64::MIN) && denominator.to_i64().is_some();
+        let quotient = numerator / denominator;
+        return Ok(if fixed_width {
+            EdnKind::Integer(quotient.to_i64().ok_or("Ratio result exceeds signed 64 bits")?)
+        } else {
+            EdnKind::BigInteger(quotient.to_string())
+        });
     }
     if value.contains(['.', 'e', 'E']) { return value.parse().map(EdnKind::Float).map_err(|_| "Invalid floating-point literal"); }
     Err("Invalid integer literal")
 }
 
-fn integer_token(value: &str) -> std::result::Result<num_bigint::BigInt, &'static str> {
+fn integer_token(value: &str) -> std::result::Result<BigInt, &'static str> {
     let (negative, unsigned) = if let Some(value) = value.strip_prefix('-') { (true, value) } else { (false, value.strip_prefix('+').unwrap_or(value)) };
     let (digits, radix) = if let Some(hex) = unsigned.strip_prefix("0x").or_else(|| unsigned.strip_prefix("0X")) { (hex, 16) }
         else if let Some((radix, digits)) = unsigned.split_once(['r', 'R']) {
@@ -240,7 +306,7 @@ fn integer_token(value: &str) -> std::result::Result<num_bigint::BigInt, &'stati
         else if unsigned.len() > 1 && unsigned.starts_with('0') { (&unsigned[1..], 8) }
         else { (unsigned, 10) };
     if digits.is_empty() || !digits.chars().all(|ch| ch.is_ascii_alphanumeric() && ch.to_digit(radix).is_some()) { return Err("Invalid integer literal"); }
-    let parsed = num_bigint::BigInt::parse_bytes(digits.as_bytes(), radix).ok_or("Invalid integer literal")?;
+    let parsed = BigInt::parse_bytes(digits.as_bytes(), radix).ok_or("Invalid integer literal")?;
     Ok(if negative { -parsed } else { parsed })
 }
 

@@ -37,7 +37,10 @@ No successful XTQL percentile call syntax is added.
 The following surfaces remain outside this checkpoint's implementation.
 
 * The shared scalar function registry does not yet cover every JVM expression function, cast option, temporal operation, or collection operation reachable from XTQL.
-* The EDN reader does not implement reader conditionals, automatic namespace aliases, arbitrary tagged Java objects, regex objects, ratios, or variadic anonymous functions.
+* Submit one EDN query form.
+Reader evaluation, reader conditionals, automatic namespace aliases, unreadable Java objects, and regex objects are outside the native text surface.
+Use explicit namespace names or `#:namespace` maps, choose conditional forms before submission, and pass regex patterns as strings.
+Use a fixed-arity `fn` with a list parameter in place of a variadic anonymous function.
 * Temporal scan filters containing relational subqueries are rejected.
 * SQL and XTQL share the catalog scan types for bitemporal columns, including nullable upper bounds for open intervals.
 * Untyped prepared relation parameters require concrete argument types before they can produce their correct output schema.
@@ -80,6 +83,11 @@ Object-valued tagged struct field keys and hash-map/set iteration spelling remai
 Integer reader tokens normalize octal, hexadecimal, and explicit radix syntax before field-name printing or literal conversion.
 An `N` suffix preserves the BigInteger distinction, while integers outside signed 64 bits become BigInteger reader values automatically, as in Clojure 1.12 `EdnReader.matchNumber`.
 Their later vector-value conversion retains the existing signed 64-bit value limit.
+Ratio tokens that divide exactly, such as `6/3`, read as integers and follow Clojure's Long and BigInt rules.
+For fractional column values use a decimal or floating-point expression.
+For exact fractions inside a computed regex pattern, use a supported division form such as `(/ 1 3)` within that pattern.
+Strings and character literals support octal escapes and character literals can include punctuation delimiters such as `\]`.
+Both `^` and `#^` metadata forms leave the underlying data form available to XTQL.
 Duplicate reader keys and set elements compare integers across Long/BigInteger representation, decimals independently of scale, and lists/vectors by their sequence contents.
 
 Temporal cast options retain `:precision`, including recursive list and encoded targets.
@@ -201,6 +209,10 @@ The owned carrier preserves nonliteral host pattern syntax through the native ho
 `tests/regex_replace_metadata.rs` records missing/extra fields, raw flags, dead COALESCE tails and host-form preservation as unexecuted source regressions.
 Native REGEXP_REPLACE host patterns retain their own lexical compilation and invocation phases.
 Simple lexical bindings and pure string/control forms compile independently of XTQL row variables, while raw replacement and flag fields retain their metadata contracts.
+Use a string for a fixed pattern or `java.util.regex.Pattern/quote` to turn supported host text into a literal match.
+Use the fully qualified `clojure.string` spellings listed in the link:../../../dev/doc/rust-regex.adoc[regex reference] when constructing a pattern from static text.
+For row-dependent matching, use `like-regex` with a pattern expression and literal flags.
+For a replacement that needs row values, ambient state, arbitrary interop or unsupported host functions, transform the text in the caller and pass the finished value as a query argument.
 Host `if-let` and `when-let` support one simple-symbol binding.
 Each evaluates its initializer once and exposes its value in the selected truthy branch.
 Unqualified macro calls respect same-name local bindings.

@@ -50,6 +50,26 @@ async fn host_patterns_use_lexical_controls_and_strict_string_functions() {
 }
 
 #[tokio::test]
+async fn regex_patterns_use_portable_reader_literals_and_allow_list_calls() {
+    for expression in [
+        r#"(regexp-replace "a" "\141" "x")"#,
+        r#"(regexp-replace "a" (str \o141) "x")"#,
+        r#"(regexp-replace "a" (str (subs "a!" 0 2/2)) "x")"#,
+        r#"(regexp-replace "1/3" (str (/ 1 3)) "x")"#,
+        r#"(regexp-replace "[" (java.util.regex.Pattern/quote "[") "x")"#,
+    ] {
+        assert_eq!(project(expression).await.unwrap(), Value::Utf8("x".into()), "{expression}");
+    }
+    for expression in [
+        r#"(regexp-replace "a" (java.lang.System/getProperty "user.name") "x")"#,
+        r#"(regexp-replace "a" (str/join ["a"]) "x")"#,
+        r#"(regexp-replace "a" (Pattern/quote "a") "x")"#,
+    ] {
+        assert_eq!(project(expression).await.unwrap_err().code, "rtdb.expr/regex-host-form", "{expression}");
+    }
+}
+
+#[tokio::test]
 async fn conditional_host_bindings_scope_only_the_selected_body() {
     for (source, pattern) in [
         ("a", r#"(let [p "a"] (if-let [p (str p "b")] (subs p 0 1) "b"))"#),
