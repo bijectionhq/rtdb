@@ -2544,7 +2544,7 @@ impl OwnedReadSession {
             return Err(historical_owned_read::unavailable());
         }
         self.certify_historical_cut(relation, system.min(commit)).await?;
-        let purge = self.point_purge_guard(relation, id, system.min(commit), true).await?;
+        let purge = self.point_purge_guard(relation, id.into(), system.min(commit), true).await?;
         Ok(context.with_owned_read_guard(purge))
     }
 
@@ -2552,24 +2552,24 @@ impl OwnedReadSession {
     pub async fn check_point_purge_floor(
         &self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId, system: Timestamp,
     ) -> Result<()> {
-        self.point_purge_guard(relation, id, system, false).await.map(|_| ())
+        self.point_purge_guard(relation, id.into(), system, false).await.map(|_| ())
     }
 
     /// A retained point applies the live relation fence before reopening its older data.
     pub async fn parent_point_release_guard(
         &self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId, system: Timestamp,
     ) -> Result<Arc<dyn Fn() -> Result<()> + Send + Sync>> {
-        self.point_purge_guard(relation, id, system, true).await
+        self.point_purge_guard(relation, id.into(), system, true).await
     }
 
     async fn point_purge_guard(
-        &self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId, system: Timestamp,
+        &self, relation: &rtdb_types::OwnedRelation, id: EntityIdRef<'_>, system: Timestamp,
         present_point: bool,
     ) -> Result<Arc<dyn Fn() -> Result<()> + Send + Sync>> {
         self.admit_access().await?;
         let guard = self.relation_release_guard_for([relation], present_point)?;
         let context = Arc::clone(self.retained_root_context()).with_owned_read_guard(Arc::clone(&guard));
-        if rtdb_query::owned_purge_floor(Arc::clone(&context), &self.owner, relation, id)
+        if rtdb_query::owned_purge_floor_for(Arc::clone(&context), &self.owner, relation, id)
             .await?.is_some_and(|floor| system < floor)
         {
             return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/read-purged", "The requested cut precedes its ordered erase"));

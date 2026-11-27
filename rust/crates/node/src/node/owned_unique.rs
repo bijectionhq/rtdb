@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use rtdb_columnar::EntityIdRef;
 use rtdb_query::OwnedUniqueHit;
 use rtdb_types::{Anomaly, AnomalyCategory, Interval, OwnedRelation, Result, Timestamp, TransactionKey};
 
@@ -116,9 +117,16 @@ impl OwnedReadSession {
                 for row in 0..batch.num_rows() {
                     let size = rtdb_columnar::estimate_read_value_bytes(field, values, row)?;
                     let _charge = context.memory.reserve(size.saturating_add(4096))?;
-                    let id = rtdb_columnar::read_execution_value(field, values, row)?.owned_entity_id()?;
-                    rtdb_query::owned_row_revision(batch, row, &id, &context.memory)?;
-                    self.check_point_purge_floor(relation, &id, retained).await?;
+                    let owned;
+                    let id = match rtdb_columnar::read_execution_owned_entity_id(field, values, row) {
+                        Ok(Some(id)) => id,
+                        _ => {
+                            owned = rtdb_columnar::read_execution_value(field, values, row)?.owned_entity_id()?;
+                            EntityIdRef::from(&owned)
+                        }
+                    };
+                    rtdb_query::owned_row_revision_for(batch, row, id, &context.memory)?;
+                    self.point_purge_guard(relation, id, retained, false).await?;
                 }
                 pages.push(page);
             }

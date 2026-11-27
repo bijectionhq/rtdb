@@ -88,7 +88,7 @@ fn cardinality_violation() -> rtdb_types::Anomaly {
 mod hosted_control;
 pub use hosted_control::{HostedControlPoint, read_hosted_control_point};
 mod owned_purge;
-pub use owned_purge::{OwnedPurgeBucket, owned_purge_floor, read_owned_purge_bucket, purge_coverage_document};
+pub use owned_purge::{OwnedPurgeBucket, owned_purge_floor, owned_purge_floor_for, read_owned_purge_bucket, purge_coverage_document};
 mod owned_relation;
 mod owned_unique;
 mod owned_range;

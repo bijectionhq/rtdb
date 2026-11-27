@@ -54,7 +54,7 @@ impl Service {
         let row_count = pages.iter().map(|page| page.batch().num_rows()).sum();
         let id_scratch = wire::mul(row_count, std::mem::size_of::<EntityIdRef<'_>>())?;
         let _copy = call.reserve(wire::add(bytes, id_scratch)?)?;
-        let rows = unique_window_rows(&pages, &column, key, valid, row_count)?;
+        let rows = unique_window_rows(&pages, &column, key, valid, row_count, call.memory())?;
         let mut metadata = [
             (OWNED_PRESENT.into(), system.0.to_string()),
             (OWNED_VALID_FROM.into(), from.0.to_string()),
@@ -149,6 +149,7 @@ fn encode_unique_point(
 
 fn unique_window_rows(
     pages: &[OwnedBatch], column: &str, key: Option<&[u8]>, valid: Interval, row_count: usize,
+    memory: &Arc<MemoryBudget>,
 ) -> Result<RecordBatch, Status> {
     use arrow_array::builder::{BinaryBuilder, Int64Builder};
 
@@ -180,12 +181,65 @@ fn unique_window_rows(
             ends.append_value(end.0);
         }
     }
+    let ids = match compact_unique_window_ids(pages, memory) {
+        Some(compact) => compact,
+        None => rtdb_columnar::entity_id_array(ids).map_err(status)?,
+    };
     RecordBatch::try_from_iter([
-        ("_id", rtdb_columnar::entity_id_array(ids).map_err(status)?),
+        ("_id", ids),
         ("key", Arc::new(keys.finish())),
         ("valid_from_micros", Arc::new(starts.finish())),
         ("valid_to_micros", Arc::new(ends.finish())),
     ]).map_err(arrow)
+}
+
+fn compact_unique_window_ids(pages: &[OwnedBatch], memory: &Arc<MemoryBudget>) -> Option<ArrayRef> {
+    let target = rtdb_columnar::to_field("_id", &entity_id_type()).ok()?;
+    let DataType::Union(legs, arrow_schema::UnionMode::Dense) = target.data_type() else { return None; };
+    let (_, source) = pages.first()?.batch().schema_ref().column_with_name("_id")?;
+    let already_union = source.data_type() == target.data_type() && source.metadata() == target.metadata();
+    if !already_union && !legs.iter().any(|(_, leg)| {
+        source.data_type() == leg.data_type() && source.metadata() == leg.metadata()
+    }) {
+        return None;
+    }
+
+    let descriptors = pages.len().checked_mul(256)?.checked_add(4096)?;
+    let mut scratch = memory.try_reserve(descriptors)?;
+    let mut arrays = Vec::with_capacity(pages.len());
+    let mut copy_bytes = descriptors;
+    for page in pages {
+        let batch = page.batch();
+        let (index, field) = batch.schema_ref().column_with_name("_id")?;
+        if field.data_type() != source.data_type() || field.metadata() != source.metadata() {
+            return None;
+        }
+        let array = batch.column(index).as_ref();
+        for row in 0..array.len() {
+            let cell_bytes = rtdb_columnar::estimate_copy_cell_bytes(field, array, row).ok()?;
+            copy_bytes = copy_bytes.checked_add(cell_bytes)?.checked_add(64)?;
+        }
+        arrays.push(array);
+    }
+    let scratch = Arc::get_mut(&mut scratch)?;
+    scratch.grow_to(copy_bytes).ok()?;
+    let cells = arrays.iter().enumerate()
+        .flat_map(|(page, array)| (0..array.len()).map(move |row| (page, row)))
+        .collect::<Vec<_>>();
+    let copied = rtdb_columnar::copy_selected_cells(&arrays, &cells).ok()?;
+    let canonical = if already_union {
+        copied
+    } else {
+        let relayout = rtdb_columnar::arrow_relayout_bound(copied.as_ref(), source, &target).ok()?;
+        scratch.grow_to(copy_bytes.checked_add(relayout)?).ok()?;
+        let (field, canonical) = rtdb_columnar::relayout_arrow_column(copied, source, &target).ok()?;
+        if field != target { return None; }
+        canonical
+    };
+    let reply_allowance = arrays.iter().try_fold(4096usize, |bytes, array| {
+        bytes.checked_add(array.get_array_memory_size())
+    })?;
+    (canonical.get_array_memory_size() <= reply_allowance).then_some(canonical)
 }
 
 fn unique_window_keys<'a>(
@@ -301,7 +355,7 @@ mod tests {
         ]).unwrap();
         let pages = [OwnedBatch::new(page, &memory).unwrap()];
         let valid = Interval::from_micros(10, 30).unwrap();
-        let reply = unique_window_rows(&pages, "unique_key", Some(key), valid, ids.len()).unwrap();
+        let reply = unique_window_rows(&pages, "unique_key", Some(key), valid, ids.len(), &memory).unwrap();
         let schema = reply.schema_ref();
         let field = rtdb_columnar::to_field("_id", &entity_id_type()).unwrap();
         assert_eq!(schema.field(0), &field);
@@ -312,10 +366,70 @@ mod tests {
             let times = reply.column_by_name(column).unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
             assert_eq!(times.values().as_ref(), &expected);
         }
-        let empty = unique_window_rows(&[], "unique_key", Some(key), valid, 0).unwrap();
+        let empty = unique_window_rows(&[], "unique_key", Some(key), valid, 0, &memory).unwrap();
         assert_eq!(empty.schema_ref(), schema);
         assert_eq!(empty.num_rows(), 0);
-        let error = unique_window_rows(&pages, "unique_key", Some(&[4]), valid, ids.len()).unwrap_err();
+        let error = unique_window_rows(&pages, "unique_key", Some(&[4]), valid, ids.len(), &memory).unwrap_err();
         assert_eq!(error.message(), history_invalid().message());
+    }
+
+    #[test]
+    fn unique_window_compacts_sliced_identity_columns_with_identical_ipc() {
+        let memory = MemoryBudget::new(1 << 20);
+        let key = b"cell".as_slice();
+        let valid = Interval::from_micros(10, 30).unwrap();
+        let dense = rtdb_columnar::entity_id_array([
+            EntityIdRef::Binary(b"hidden"),
+            EntityIdRef::String("first"),
+            EntityIdRef::Binary(b"same"),
+            EntityIdRef::Binary(b"same"),
+        ]).unwrap();
+        let scalar: ArrayRef = Arc::new(StringArray::from(vec!["hidden", "first", "same", "same"]));
+        for ids in [dense, scalar] {
+            let page = RecordBatch::try_from_iter([
+                ("_id", ids),
+                ("unique_key", Arc::new(BinaryArray::from_iter_values([key; 4])) as ArrayRef),
+                ("_valid_from", Arc::new(TimestampMicrosecondArray::from(vec![10, 10, 15, 20]))),
+                ("_valid_to", Arc::new(TimestampMicrosecondArray::from(vec![15, 15, 20, 25]))),
+            ]).unwrap();
+            let pages = [
+                OwnedBatch::new(page.slice(1, 1), &memory).unwrap(),
+                OwnedBatch::new(page.slice(2, 2), &memory).unwrap(),
+            ];
+            for (sources, rows) in [(&pages[..1], 1), (&pages[..], 3)] {
+                let compact = compact_unique_window_ids(sources, &memory).unwrap();
+                let no_scratch = MemoryBudget::new(0);
+                assert!(compact_unique_window_ids(sources, &no_scratch).is_none());
+                let actual = unique_window_rows(sources, "unique_key", Some(key), valid, rows, &memory).unwrap();
+                let fallback = unique_window_rows(sources, "unique_key", Some(key), valid, rows, &no_scratch).unwrap();
+                assert_eq!(actual.column(0).to_data(), compact.to_data());
+                let ipc = |batch: &RecordBatch| {
+                    rtdb_format::ipc::write_arrow_stream(
+                        batch.schema_ref(), std::slice::from_ref(batch), arrow_ipc::writer::IpcWriteOptions::default(),
+                    ).unwrap()
+                };
+                assert_eq!(ipc(&actual), ipc(&fallback));
+            }
+        }
+    }
+
+    #[test]
+    fn unique_window_declines_identity_compaction_above_the_reply_allowance() {
+        use arrow_array::UnionArray;
+
+        let memory = MemoryBudget::new(1 << 20);
+        let payload = vec![0x7f; 8192];
+        let dense = rtdb_columnar::entity_id_array([EntityIdRef::Binary(&payload)]).unwrap();
+        let dense = dense.as_any().downcast_ref::<UnionArray>().unwrap();
+        let DataType::Union(fields, _) = dense.data_type() else { unreachable!() };
+        let repeated = UnionArray::try_new(
+            fields.clone(),
+            vec![dense.type_id(0); 8].into(),
+            Some(vec![0; 8].into()),
+            fields.iter().map(|(tag, _)| Arc::clone(dense.child(tag))).collect(),
+        ).unwrap();
+        let page = RecordBatch::try_from_iter([("_id", Arc::new(repeated) as ArrayRef)]).unwrap();
+        let pages = [OwnedBatch::new(page, &memory).unwrap()];
+        assert!(compact_unique_window_ids(&pages, &memory).is_none());
     }
 }

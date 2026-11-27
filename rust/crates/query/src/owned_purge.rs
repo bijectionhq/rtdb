@@ -4,6 +4,7 @@
 //! time.
 use std::{collections::BTreeMap, sync::Arc};
 
+use rtdb_columnar::EntityIdRef;
 use rtdb_plan::Catalog;
 use rtdb_types::{
     Anomaly, AnomalyCategory, EntityId, OwnedRelation, Result, StructFields, Timestamp,
@@ -30,7 +31,7 @@ impl OwnedPurgeBucket {
                 "The exact purge bucket exceeds its bound",
             ));
         }
-        if bucket_id(identity) != self.id
+        if bucket_id(identity.into()) != self.id
             || self
                 .entries
                 .get(&handle)
@@ -58,6 +59,18 @@ impl OwnedPurgeBucket {
             ),
         ]))
     }
+
+    fn floor(&self, id: EntityIdRef<'_>) -> Option<Timestamp> {
+        if self.entries.is_empty() || exceeds_handle_bound(id) {
+            return None;
+        }
+        let mut integer = [0; 8];
+        let (tag, payload) = id.handle_parts(&mut integer);
+        let mut handle = Vec::with_capacity(1 + payload.len());
+        handle.push(tag);
+        handle.extend_from_slice(payload);
+        self.entries.get(&handle).map(|floor| floor.system_time)
+    }
 }
 
 pub fn purge_coverage_document(through_events: i64) -> StructFields<Value> {
@@ -73,11 +86,17 @@ pub async fn owned_purge_floor(
     relation: &OwnedRelation,
     id: &EntityId,
 ) -> Result<Option<Timestamp>> {
-    let bucket = read_owned_purge_bucket(context, owner, relation, id).await?;
-    if bucket.entries.is_empty() || exceeds_handle_bound(id) {
-        return Ok(None);
-    }
-    Ok(bucket.entries.get(&id.handle_bytes()).map(|floor| floor.system_time))
+    owned_purge_floor_for(context, owner, relation, id.into()).await
+}
+
+#[doc(hidden)]
+pub async fn owned_purge_floor_for(
+    context: Arc<QueryContext>,
+    owner: &str,
+    relation: &OwnedRelation,
+    id: EntityIdRef<'_>,
+) -> Result<Option<Timestamp>> {
+    Ok(read_owned_purge_bucket_for(context, owner, relation, id).await?.floor(id))
 }
 
 pub async fn read_owned_purge_bucket(
@@ -85,6 +104,15 @@ pub async fn read_owned_purge_bucket(
     owner: &str,
     relation: &OwnedRelation,
     identity: &EntityId,
+) -> Result<OwnedPurgeBucket> {
+    read_owned_purge_bucket_for(context, owner, relation, identity.into()).await
+}
+
+async fn read_owned_purge_bucket_for(
+    context: Arc<QueryContext>,
+    owner: &str,
+    relation: &OwnedRelation,
+    identity: EntityIdRef<'_>,
 ) -> Result<OwnedPurgeBucket> {
     if owner.is_empty() || relation.world().is_some() || relation.is_world_catalog() {
         return Err(uncovered());
@@ -148,7 +176,7 @@ pub async fn read_owned_purge_bucket(
                 return Err(uncovered());
             }
             let exact = EntityId::from_handle_bytes(handle).map_err(|_| uncovered())?;
-            if bucket_id(&exact) != id {
+            if bucket_id((&exact).into()) != id {
                 return Err(uncovered());
             }
             entries.insert(handle.clone(), TransactionKey { tx_id: TxId(*tx), system_time: Timestamp(*time) });
@@ -200,7 +228,7 @@ async fn cell(
 }
 
 fn complete_handle(id: &EntityId) -> Result<Vec<u8>> {
-    if exceeds_handle_bound(id) {
+    if exceeds_handle_bound(id.into()) {
         return Err(Anomaly::incorrect(
             "rtdb.owned/purge-handle-bound",
             "The complete purge handle exceeds its bound",
@@ -209,13 +237,11 @@ fn complete_handle(id: &EntityId) -> Result<Vec<u8>> {
     Ok(id.handle_bytes())
 }
 
-fn exceeds_handle_bound(id: &EntityId) -> bool {
-    matches!(id, EntityId::String(text) if text.len() >= OWNED_CHANGE_GROUP_BYTES)
-        || matches!(id, EntityId::Keyword(text) if text.as_str().len() >= OWNED_CHANGE_GROUP_BYTES)
-        || matches!(id, EntityId::Binary(bytes) if bytes.len() >= OWNED_CHANGE_GROUP_BYTES)
+fn exceeds_handle_bound(id: EntityIdRef<'_>) -> bool {
+    id.owned_payload_bytes() >= OWNED_CHANGE_GROUP_BYTES
 }
 
-fn bucket_id(id: &EntityId) -> EntityId {
+fn bucket_id(id: EntityIdRef<'_>) -> EntityId {
     let mut locator = id.iid().0;
     // Keep the control entry outside the bucket address space.
     locator[0] |= 0x80;
@@ -228,4 +254,26 @@ fn uncovered() -> Anomaly {
         "rtdb.owned/purge-history-reset",
         "The relation cannot prove its complete purge floors",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn borrowed_purge_floor_distinguishes_complete_ids_at_the_same_bucket() {
+        let identity = EntityId::String("same-digest".into());
+        let collision = EntityId::Uuid(identity.iid().0);
+        let id = bucket_id((&identity).into());
+        assert_eq!(id, bucket_id((&collision).into()));
+
+        let mut bucket = OwnedPurgeBucket { id, entries: BTreeMap::new() };
+        bucket.advance(&collision, TransactionKey { tx_id: TxId(1), system_time: Timestamp(10) }).unwrap();
+        assert_eq!(bucket.floor((&identity).into()), None);
+        assert_eq!(bucket.floor((&collision).into()), Some(Timestamp(10)));
+
+        bucket.advance(&identity, TransactionKey { tx_id: TxId(2), system_time: Timestamp(20) }).unwrap();
+        assert_eq!(bucket.floor((&identity).into()), Some(Timestamp(20)));
+        assert_eq!(bucket.floor((&collision).into()), Some(Timestamp(10)));
+    }
 }

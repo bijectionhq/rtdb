@@ -704,6 +704,62 @@ async fn owned_erase_revokes_old_holds_without_erasing_a_colliding_identity() {
 }
 
 #[tokio::test]
+async fn held_unique_window_projects_plain_binary_keys_and_complete_typed_holders() {
+    use rtdb_types::{Interval, OwnedRelation, OwnedSchema};
+
+    let mut settings = options();
+    settings.owned_relations = true;
+    let (node, driver) = running(settings, services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let relation = OwnedRelation::new("held-unique-orders").unwrap();
+    let path = OwnedRelation::new("order-key").unwrap();
+    let schema = OwnedSchema::from_json(
+        br#"{"fields":[{"name":"canonical","type":{"kind":"binary"},"optional":false,"nullable":false}],"validity":"acceptance"}"#,
+    ).unwrap();
+    let declared = session.state_mut().execute_tx(
+        vec![TxOp::OwnedDeclareRelation { relation: relation.clone(), schema }],
+        AutonomousTxOptions::default(),
+    ).await.unwrap();
+    assert!(declared.committed(), "{:?}", declared.error());
+    let unique = session.state_mut().execute_tx(
+        vec![TxOp::OwnedDeclareUniquePath { relation: relation.clone(), name: path.clone(), column: "canonical".into() }],
+        AutonomousTxOptions::default(),
+    ).await.unwrap();
+    assert!(unique.committed(), "{:?}", unique.error());
+
+    let id = EntityId::String("holder-α".into());
+    let key = b"unique";
+    let documents = Documents::new(vec![StructFields::from([
+        ("_id".into(), id.as_value()),
+        ("canonical".into(), Value::Binary(key.to_vec())),
+    ])], node.memory()).unwrap();
+    let written = session.state_mut().execute_tx(vec![TxOp::OwnedInsertDocs {
+        relation: relation.clone(), documents, valid_from: None, valid_to: None,
+    }], AutonomousTxOptions::default()).await.unwrap();
+    assert!(written.committed(), "{:?}", written.error());
+
+    let held = session.open_owned_read().await.unwrap();
+    let valid = Interval::at(written.tx_key().system_time).unwrap();
+    let (pages, column, witness) = held.unique_window(&relation, &path, Some(key), valid, held.system_time(), None, 1).await.unwrap();
+    assert_eq!(column, "canonical");
+    assert!(witness.is_none());
+    let [page] = pages.as_slice() else { panic!("Expected one held window page"); };
+    let batch = page.batch();
+    assert_eq!(batch.num_rows(), 1);
+    let (key_col, key_field) = batch.schema_ref().column_with_name(&column).unwrap();
+    assert_eq!(key_field.data_type(), &arrow_schema::DataType::Binary);
+    assert!(key_field.metadata().is_empty());
+    assert_eq!(read_value(key_field, batch.column(key_col).as_ref(), 0).unwrap(), Value::Binary(key.to_vec()));
+    let (id_col, id_field) = batch.schema_ref().column_with_name("_id").unwrap();
+    assert_eq!(rtdb_columnar::read_execution_owned_entity_id(id_field, batch.column(id_col).as_ref(), 0).unwrap(),
+        Some(rtdb_columnar::EntityIdRef::from(&id)));
+    assert_eq!(rtdb_query::owned_row_revision(batch, 0, &id, node.memory()).unwrap(), written.tx_key().system_time);
+    drop(held);
+    drop(session);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn ordered_owned_unique_groups_swaps_and_refuses_conflicts() {
     use rtdb_types::{EntityId, OwnedRelation};
 
