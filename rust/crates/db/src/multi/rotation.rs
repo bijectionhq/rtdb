@@ -73,6 +73,9 @@ impl MultiDatabase {
         &mut self,
         clean_files: &[Bytes],
     ) -> Result<RotationReceipt> {
+        if self.stream.serving_authority.is_some() {
+            return Err(activation_effects_unavailable());
+        }
         Box::pin(async move {
         self.refresh().await?;
         let lease = self.authority()?;
@@ -134,6 +137,9 @@ impl MultiDatabase {
         let Some(rotation) = self.state().rotation else {
             return Ok(None);
         };
+        if self.stream.serving_authority.is_some() {
+            return Err(activation_effects_unavailable());
+        }
         let lease = self.authority()?;
         let plan = self.rotation_plan(
             rotation
@@ -274,5 +280,12 @@ fn missing_rotation() -> Anomaly {
     Anomaly::fault(
         "rtdb/key-rotation",
         "The expected key rotation is absent from the applied prefix",
+    )
+}
+
+fn activation_effects_unavailable() -> Anomaly {
+    Anomaly::unsupported(
+        "rtdb/activation-effects",
+        "Key rotation requires an effect provider commissioned for database activation",
     )
 }

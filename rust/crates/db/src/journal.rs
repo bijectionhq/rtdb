@@ -1,7 +1,7 @@
-use std::{sync::Arc, time::Duration};
+use std::{sync::{Arc, RwLock}, time::Duration};
 
 use bytes::Bytes;
-use journal_contract::{BoxFuture, Epoch, Journal, JournalError, Lsn, Page, StreamId};
+use journal_contract::{BoxFuture, Epoch, Journal, JournalError, Lsn, Page, StreamId, WriterFence, WriterSessionId};
 use rtdb_crypt::{Context, Generation, Kms};
 use rtdb_format::journal::Record;
 use rtdb_tx::transact::TransactionRecord;
@@ -11,6 +11,8 @@ use uuid::Uuid;
 
 const ENVELOPE_VERSION: u8 = 1;
 const PAGE_SIZE: usize = 128;
+const KEEPER_BATCH_RECORDS: usize = 256;
+const KEEPER_BATCH_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TimedOriginal {
@@ -60,6 +62,15 @@ pub trait JournalBatchAppender: Send + Sync {
         Box::pin(async { Err(JournalError::Unavailable) })
     }
 
+    fn append_session_timed_original(
+        &self,
+        _fence: WriterFence,
+        _original: TimedOriginal,
+        _payload: Bytes,
+    ) -> BoxFuture<'_, journal_contract::Result<TimedOriginalProof>> {
+        Box::pin(async { Err(JournalError::Unsupported) })
+    }
+
     /// Reopens retained proofs under the original keeper identities after writer replacement.
     fn prove_timed_original(
         &self,
@@ -73,10 +84,18 @@ pub trait JournalBatchAppender: Send + Sync {
 pub(crate) struct Stream {
     pub(crate) database: Uuid,
     journal: Arc<dyn Journal>,
+    pub(crate) serving_authority: Option<Arc<dyn crate::ServingAuthority>>,
     pub(crate) batch: Option<Arc<dyn JournalBatchAppender>>,
     pub(crate) kms: Arc<dyn Kms>,
     pub(crate) manifests: Arc<crate::replay::ManifestCache>,
     tail: Arc<TailPoll>,
+    session: Option<Arc<WriterSession>>,
+}
+
+struct WriterSession {
+    id: WriterSessionId,
+    fence: RwLock<Option<WriterFence>>,
+    verified_history: tokio::sync::OnceCell<()>,
 }
 
 /// One journal long poll shared by every waiter of a stream: the first waiter
@@ -115,11 +134,26 @@ impl Stream {
         Self {
             database,
             journal,
+            serving_authority: None,
             batch: None,
             kms,
             manifests: Arc::default(),
             tail: Arc::default(),
+            session: None,
         }
+    }
+
+    pub(crate) fn with_immutable_history(mut self) -> Self {
+        self.session = Some(Arc::new(WriterSession {
+            id: WriterSessionId(Uuid::new_v4().as_u128()),
+            fence: RwLock::new(None),
+            verified_history: tokio::sync::OnceCell::new(),
+        }));
+        self
+    }
+
+    pub(crate) fn immutable_history(&self) -> bool {
+        self.session.is_some()
     }
 
     fn id(&self) -> StreamId {
@@ -137,26 +171,93 @@ impl Stream {
                 number: 1,
             })
             .await?;
-        self.journal.create(self.id()).await.map_err(journal_error)
+        if let Some(session) = &self.session {
+            self.journal.create_immutable(self.id()).await.map_err(journal_error)?;
+            let _ = session.verified_history.set(());
+            Ok(())
+        } else {
+            self.journal.create(self.id()).await.map_err(journal_error)
+        }
+    }
+
+    async fn verify_history(&self) -> journal_contract::Result<()> {
+        if let Some(session) = &self.session {
+            session.verified_history.get_or_try_init(|| self.journal.require_immutable(self.id())).await?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn head(&self) -> Result<Lsn> {
+        self.verify_history().await.map_err(journal_error)?;
         self.journal.head(self.id()).await.map_err(journal_error)
     }
 
+    pub(crate) async fn require_serving(&self) -> Result<()> {
+        if let Some(authority) = &self.serving_authority {
+            authority.acquire().await?.check()?;
+        }
+        Ok(())
+    }
+
+    async fn authorize_mutation(&self) -> journal_contract::Result<()> {
+        self.require_serving().await.map_err(|_| JournalError::Unavailable)
+    }
+
     pub(crate) async fn seal(&self, epoch: Epoch) -> journal_contract::Result<Lsn> {
-        self.journal.seal(self.id(), epoch).await
+        let Some(session) = &self.session else {
+            self.authorize_mutation().await?;
+            return self.journal.seal(self.id(), epoch).await;
+        };
+        self.verify_history().await?;
+        let expected_epoch = epoch.0.checked_sub(1).map(Epoch).ok_or(JournalError::Unavailable)?;
+        self.authorize_mutation().await?;
+        let receipt = self.journal.seal_session(self.id(), expected_epoch, session.id).await?;
+        let fence = WriterFence { stream: self.id(), writer_epoch: epoch, writer_session_id: session.id };
+        if receipt.fence != fence {
+            return Err(JournalError::Unavailable);
+        }
+        let mut current = session.fence.write().expect("writer session");
+        if let Some(previous) = *current
+            && previous.writer_epoch > epoch
+        {
+            return Err(JournalError::Fenced { current: previous.writer_epoch });
+        }
+        *current = Some(fence);
+        Ok(receipt.sealed_head_lsn)
+    }
+
+    fn session_fence(&self, epoch: Epoch) -> journal_contract::Result<Option<WriterFence>> {
+        let Some(session) = &self.session else {
+            return Ok(None);
+        };
+        let fence = session.fence.read().expect("writer session").ok_or(JournalError::Unavailable)?;
+        if fence.writer_epoch != epoch {
+            return Err(JournalError::Fenced { current: fence.writer_epoch });
+        }
+        Ok(Some(fence))
     }
 
     /// Lifts an operator recovery's fence and returns the journal head.
     pub(crate) async fn acknowledge_recovery(&self) -> journal_contract::Result<Lsn> {
+        self.authorize_mutation().await?;
         self.journal.acknowledge_recovery(self.id()).await
     }
 
     pub(crate) async fn read(&self, from: Lsn) -> journal_contract::Result<Page> {
-        self.journal
-            .read(self.id(), from, PAGE_SIZE, Duration::ZERO)
-            .await
+        self.read_through(from, Lsn(0)).await
+    }
+
+    pub(crate) async fn read_through(&self, from: Lsn, head: Lsn) -> journal_contract::Result<Page> {
+        self.page(from, head, PAGE_SIZE, Duration::ZERO).await
+    }
+
+    async fn page(&self, from: Lsn, head: Lsn, limit: usize, wait: Duration) -> journal_contract::Result<Page> {
+        if self.immutable_history() {
+            self.verify_history().await?;
+            self.journal.read_page(self.id(), from, head, limit, wait).await
+        } else {
+            self.journal.read(self.id(), from, limit, wait).await
+        }
     }
 
     /// Waits until `until` for a committed record after `applied`, sharing one
@@ -194,7 +295,7 @@ impl Stream {
     /// Waits up to `wait` for a committed record after `applied`.
     /// A reader below the retained floor, or behind an operator recovery, also has a record to apply.
     async fn holds_after(&self, applied: Lsn, wait: Duration) -> Result<bool> {
-        match self.journal.read(self.id(), Lsn(applied.0 + 1), 1, wait).await {
+        match self.page(next(applied)?, applied, 1, wait).await {
             Ok(page) => Ok(!page.records.is_empty()),
             Err(JournalError::Trimmed { .. } | JournalError::Recovered { .. }) => Ok(true),
             Err(error) => Err(journal_error(error)),
@@ -202,7 +303,11 @@ impl Stream {
     }
 
     pub(crate) async fn trim(&self, epoch: Epoch, through: Lsn) -> journal_contract::Result<()> {
-        self.journal.trim(self.id(), epoch, through).await
+        self.authorize_mutation().await?;
+        match self.session_fence(epoch)? {
+            Some(fence) => self.journal.trim_session(fence, through).await,
+            None => self.journal.trim(self.id(), epoch, through).await,
+        }
     }
 
     pub(crate) async fn encode(&self, lsn: Lsn, entry: &Entry) -> Result<Bytes> {
@@ -261,7 +366,11 @@ impl Stream {
         at: Lsn,
         payload: Bytes,
     ) -> journal_contract::Result<Lsn> {
-        self.journal.append(self.id(), epoch, at, payload).await
+        self.authorize_mutation().await?;
+        match self.session_fence(epoch)? {
+            Some(fence) => self.journal.append_session_batch(fence, at, vec![payload]).await,
+            None => self.journal.append(self.id(), epoch, at, payload).await,
+        }
     }
 
     pub(crate) async fn append_group(
@@ -269,7 +378,11 @@ impl Stream {
         epoch: Epoch,
         mut records: Vec<(Lsn, Bytes)>,
     ) -> journal_contract::Result<Lsn> {
+        if let Some(fence) = self.session_fence(epoch)? {
+            return self.append_session_group(fence, records).await;
+        }
         if let Some(batch) = &self.batch {
+            self.authorize_mutation().await?;
             return batch.append_batch(self.id(), epoch, records).await;
         }
         if records.len() != 1 {
@@ -278,6 +391,54 @@ impl Stream {
         let (at, payload) = records.pop().expect("one record");
         self.append(epoch, at, payload).await
     }
+    async fn append_session_group(
+        &self,
+        fence: WriterFence,
+        records: Vec<(Lsn, Bytes)>,
+    ) -> journal_contract::Result<Lsn> {
+        let first_lsn = records.first().ok_or(JournalError::Unavailable)?.0;
+        for (index, (lsn, payload)) in records.iter().enumerate() {
+            if first_lsn.0.checked_add(index as u64) != Some(lsn.0) {
+                return Err(JournalError::Unavailable);
+            }
+            if payload.len() > KEEPER_BATCH_BYTES {
+                return Err(JournalError::TooLarge { max: KEEPER_BATCH_BYTES });
+            }
+        }
+        let mut records = records.into_iter().peekable();
+        let mut head = Lsn(0);
+        while let Some((first, _)) = records.peek() {
+            let first = *first;
+            let mut bytes = 0;
+            let mut batch = Vec::new();
+            while let Some((_, payload)) = records.peek() {
+                if batch.len() == KEEPER_BATCH_RECORDS || bytes + payload.len() > KEEPER_BATCH_BYTES {
+                    break;
+                }
+                bytes += payload.len();
+                batch.push(records.next().expect("peeked record").1);
+            }
+            let expected_head = Lsn(first.0 + (batch.len() as u64 - 1));
+            self.authorize_mutation().await?;
+            head = self.journal.append_session_batch(fence, first, batch).await?;
+            if head != expected_head {
+                return Err(JournalError::Unavailable);
+            }
+        }
+        Ok(head)
+    }
+
+    pub(crate) async fn append_timed_original(
+        &self, original: TimedOriginal, payload: Bytes,
+    ) -> journal_contract::Result<TimedOriginalProof> {
+        self.authorize_mutation().await?;
+        let batch = self.batch.as_ref().ok_or(JournalError::Unsupported)?;
+        match self.session_fence(original.epoch)? {
+            Some(fence) => batch.append_session_timed_original(fence, original, payload).await,
+            None => batch.append_timed_original(original, payload).await,
+        }
+    }
+
 }
 
 pub(crate) fn next(lsn: Lsn) -> Result<Lsn> {
@@ -345,6 +506,8 @@ pub(crate) fn journal_error(error: JournalError) -> Anomaly {
             (AnomalyCategory::NotFound, "rtdb/unknown-database")
         }
         JournalError::Unavailable => (AnomalyCategory::Unavailable, "rtdb/journal-unavailable"),
+        JournalError::Unsupported => (AnomalyCategory::Unsupported, "rtdb/journal-unsupported"),
+        JournalError::Corrupted => (AnomalyCategory::Fault, "rtdb/journal-corrupted"),
         JournalError::Recovered { .. } => unreachable!("handled above"),
     };
     let anomaly = Anomaly::new(category, code, error.to_string());

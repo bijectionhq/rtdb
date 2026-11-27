@@ -266,6 +266,18 @@ impl Peer {
         frame: Request,
         reservation: Arc<MemoryReservation>,
     ) -> std::result::Result<Answer, PeerError> {
+        if matches!(
+            &frame.admission,
+            Admission::Export { .. }
+                | Admission::Restore { .. }
+                | Admission::ManagedPin { .. }
+                | Admission::ManagedInstall { .. }
+                | Admission::ManagedRelease { .. }
+                | Admission::NativeCopy { .. }
+                | Admission::Retire
+        ) {
+            runtime.require_local_lifecycle().map_err(PeerError::Other)?;
+        }
         let target = self.selected(Uuid::from_bytes(frame.incarnation));
         if target != Some(self.address) && !matches!(&frame.admission, Admission::Workload { .. }) {
             return Err(PeerError::unavailable());

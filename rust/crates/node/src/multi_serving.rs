@@ -1,11 +1,12 @@
+use std::future::Future;
 use std::{collections::BTreeSet, net::IpAddr, sync::{Arc, Weak}, time::Duration};
 
 use async_trait::async_trait;
 use rtdb_crypt::tokens::TokenAuthority;
-use rtdb_db::{ChangeHistory, MultiDatabase, NativeCheckpointInstallation, NativeDependentCarrier, NativeDependentOriginal, PinnedExport, Role, WritePipeline};
+use rtdb_db::{ChangeHistory, MultiDatabase, NativeCheckpointInstallation, NativeDependentCarrier, NativeDependentOriginal, PinnedExport, Role, ServingAuthority, WritePipeline};
 use rtdb_index::branches::{BranchCut, BranchEffect, BranchIndex, BranchWrite};
 use rtdb_tx::transact::{
-    CustodyGroupId, CustodyWriterFence, ROW_CUSTODY, Receipt, Transact, TrustedCustodyCommand, workload,
+    CustodyGroupId, CustodyWriterFence, PHYSICAL_ERASURE, ROW_CUSTODY, Receipt, Transact, TrustedCustodyCommand, workload,
 };
 use rtdb_types::{
     Anomaly, AnomalyCategory, AnomalyKind, EntityId, MemoryBudget, Result, TableRef, Timestamp,
@@ -56,6 +57,7 @@ pub struct MultiServing {
     database: Arc<Mutex<MultiDatabase>>,
     writes: WritePipeline,
     incarnation: [u8; 16],
+    serving_authority: Option<Arc<dyn ServingAuthority>>,
     tokens: TokenAuthority,
     features: Vec<&'static str>,
     memory: Arc<MemoryBudget>,
@@ -104,18 +106,20 @@ impl MultiFollower {
 
     async fn progress(&self, cut: BranchCut, observe: bool, cancellation: &CancellationToken)
         -> Result<Option<MultiFollowerProgress>> {
-        if !observe { return Ok(None); }
-        cancellation.run_until_cancelled(async {
-            let mut database = self.serving.database.lock().await;
-            let (index, _) = database.follower_view(&self.owner)?;
-            let applied_position = index.applied_position(cut)?;
-            let retained_from = index.oldest_retained_cut().basis;
-            let (writer_head, writer_head_position) = database.follower_writer_head(&self.owner).await?;
-            if writer_head.incarnation() != cut.basis.incarnation() || writer_head_position < applied_position {
-                return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb/follower-progress-unavailable", "The writer head does not cover the selected follower cut"));
-            }
-            Ok(Some(MultiFollowerProgress { applied_position, retained_from, writer_head, writer_head_position }))
-        }).await.ok_or_else(interrupted)?
+        self.serving.serve(async {
+            if !observe { return Ok(None); }
+            cancellation.run_until_cancelled(async {
+                let mut database = self.serving.database.lock().await;
+                let (index, _) = database.follower_view(&self.owner)?;
+                let applied_position = index.applied_position(cut)?;
+                let retained_from = index.oldest_retained_cut().basis;
+                let (writer_head, writer_head_position) = database.follower_writer_head(&self.owner).await?;
+                if writer_head.incarnation() != cut.basis.incarnation() || writer_head_position < applied_position {
+                    return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb/follower-progress-unavailable", "The writer head does not cover the selected follower cut"));
+                }
+                Ok(Some(MultiFollowerProgress { applied_position, retained_from, writer_head, writer_head_position }))
+            }).await.ok_or_else(interrupted)?
+        }).await
     }
 
     pub async fn query(
@@ -136,45 +140,51 @@ impl MultiFollower {
     async fn query_view(
         &self, at: At, now: Timestamp, cancellation: &CancellationToken,
     ) -> Result<QueryView> {
-        cancellation.run_until_cancelled(async {
-            let (index, generation) = self.serving.database.lock().await.follower_view(&self.owner)?;
-            require_plain_follower(&index)?;
-            match at {
-                At::Exactly(basis) => { index.cut(At::AtLeast(basis))?; }
-                At::Latest | At::AtLeast(_) => (),
-                _ => return Err(Anomaly::unsupported("rtdb/follower-source", "The follower selects Latest, AtLeast or Exactly")),
-            }
-            let view = index.view(rtdb_types::rtdb_v1::MAIN_BRANCH, at, Layer::Merged, now).map_err(|error| {
-                if error.is(AnomalyKind::UnknownBasis) {
-                    Anomaly::new(AnomalyCategory::NotFound, "rtdb/cursor-expired", "The replica has no retained exact cut at this basis")
-                } else { error }
-            })?;
-            let cut = view.cut();
-            let snapshot = rtdb_query::branch_snapshot(&view, &self.serving.memory)?;
-            Ok(QueryView {
-                snapshot, cut, claim: None, custody_groups: BTreeSet::new(),
-                custody_contributors: Some(BTreeSet::new()), scoped_source_basis: None, key_generation: Some(generation),
-            })
-        }).await.ok_or_else(interrupted)?
+        self.serving.serve(async {
+            cancellation.run_until_cancelled(async {
+                let (index, generation) = self.serving.database.lock().await.follower_view(&self.owner)?;
+                require_plain_follower(&index)?;
+                match at {
+                    At::Exactly(basis) => { index.cut(At::AtLeast(basis))?; }
+                    At::Latest | At::AtLeast(_) => (),
+                    _ => return Err(Anomaly::unsupported("rtdb/follower-source", "The follower selects Latest, AtLeast or Exactly")),
+                }
+                let view = index.view(rtdb_types::rtdb_v1::MAIN_BRANCH, at, Layer::Merged, now).map_err(|error| {
+                    if error.is(AnomalyKind::UnknownBasis) {
+                        Anomaly::new(AnomalyCategory::NotFound, "rtdb/cursor-expired", "The replica has no retained exact cut at this basis")
+                    } else { error }
+                })?;
+                let cut = view.cut();
+                let snapshot = rtdb_query::branch_snapshot(&view, &self.serving.memory)?;
+                Ok(QueryView {
+                    snapshot, cut, claim: None, custody_groups: BTreeSet::new(),
+                    custody_contributors: Some(BTreeSet::new()), scoped_source_basis: None, key_generation: Some(generation),
+                })
+            }).await.ok_or_else(interrupted)?
+        }).await
     }
 
     pub async fn check_delivery(&self, basis: Basis, generation: u64, now: Timestamp, cancellation: &CancellationToken) -> Result<()> {
-        cancellation.run_until_cancelled(async {
-            let database = self.serving.database.lock().await;
-            let (index, _) = database.follower_view(&self.owner)?;
-            require_plain_follower(&index)?;
-            index.view(rtdb_types::rtdb_v1::MAIN_BRANCH, At::Exactly(basis), Layer::Merged, now)?;
-            database.check_generation(generation).await
-        }).await.ok_or_else(interrupted)?
+        self.serving.serve(async {
+            cancellation.run_until_cancelled(async {
+                let database = self.serving.database.lock().await;
+                let (index, _) = database.follower_view(&self.owner)?;
+                require_plain_follower(&index)?;
+                index.view(rtdb_types::rtdb_v1::MAIN_BRANCH, At::Exactly(basis), Layer::Merged, now)?;
+                database.check_generation(generation).await
+            }).await.ok_or_else(interrupted)?
+        }).await
     }
 
     pub async fn check_retained_delivery(&self, generation: u64, cancellation: &CancellationToken) -> Result<()> {
-        cancellation.run_until_cancelled(async {
-            let database = self.serving.database.lock().await;
-            let (index, _) = database.follower_view(&self.owner)?;
-            require_plain_follower(&index)?;
-            database.check_generation(generation).await
-        }).await.ok_or_else(interrupted)?
+        self.serving.serve(async {
+            cancellation.run_until_cancelled(async {
+                let database = self.serving.database.lock().await;
+                let (index, _) = database.follower_view(&self.owner)?;
+                require_plain_follower(&index)?;
+                database.check_generation(generation).await
+            }).await.ok_or_else(interrupted)?
+        }).await
     }
 }
 
@@ -231,6 +241,28 @@ pub enum MultiWriteAdmission<'a> {
 }
 
 impl MultiServing {
+    async fn serve<T>(&self, operation: impl Future<Output = Result<T>>) -> Result<T> {
+        let permit = match &self.serving_authority {
+            Some(authority) => Some(authority.acquire().await?),
+            None => None,
+        };
+        let result = operation.await?;
+        if let Some(permit) = permit {
+            permit.check()?;
+        }
+        Ok(result)
+    }
+
+    fn require_unmanaged_effects(&self) -> Result<()> {
+        if self.serving_authority.is_some() {
+            return Err(Anomaly::unsupported(
+                "rtdb/activation-effects",
+                "This operation requires an effect provider commissioned for database activation",
+            ));
+        }
+        Ok(())
+    }
+
     fn check_appointment_origin(&self, appointment: &workload::ManagedAppointment) -> Result<()> {
         if self.classic_workload_fence.as_ref().is_some_and(|imported| !appointment.fence().at_or_after_import(imported)) {
             return Err(workload::denied());
@@ -249,6 +281,18 @@ impl MultiServing {
 
     pub async fn restored_checkpoint_basis(&self, manifest_digest: [u8; 32]) -> Result<Option<Basis>> {
         self.database.lock().await.restored_checkpoint_basis(manifest_digest).await
+    }
+
+    pub async fn portable_backup(&self) -> Result<rtdb_db::PortableBackup> {
+        self.database.lock().await.portable_backup().await
+    }
+
+    pub async fn install_portable_backup(&self, backup: rtdb_db::VerifiedBackup) -> Result<rtdb_db::InstalledBackup> {
+        self.database.lock().await.install_portable_backup(backup).await
+    }
+
+    pub async fn installed_backup(&self) -> Result<Option<rtdb_db::InstalledBackup>> {
+        self.database.lock().await.installed_backup().await
     }
 
     pub async fn pin_managed_checkpoint(
@@ -390,8 +434,12 @@ impl MultiServing {
     pub fn new(database: MultiDatabase, memory: Arc<MemoryBudget>) -> Self {
         let database = database.with_manifest_budget(Arc::clone(&memory));
         let incarnation = database.incarnation();
+        let serving_authority = database.serving_authority();
         let tokens = database.token_authority();
         let mut features = database.write_features().to_vec();
+        if serving_authority.is_some() {
+            features.retain(|&feature| feature != PHYSICAL_ERASURE && feature != ROW_CUSTODY);
+        }
         features.extend([
             "query", "query.track", "query.page", rtdb_types::rtdb_v1::QUERY_WRITTEN_BASIS,
             "query.linearizable", "branch.local-layer", "changes", "changes.progress-only", "transact", "tx-status",
@@ -402,6 +450,7 @@ impl MultiServing {
         let writes = WritePipeline::start(Arc::clone(&database));
         Self {
             incarnation,
+            serving_authority,
             tokens,
             features,
             database,
@@ -428,74 +477,90 @@ impl MultiServing {
     pub async fn transact_local(
         &self, mut request: Transact, scope: Option<ServingScope>,
     ) -> Result<Receipt> {
-        if self.classic_workload_fence.is_some() { return Err(workload::denied()); }
-        require_ordinary_request(&request)?;
-        if let Some(scope) = scope {
-            return self.writes.transact_scoped(request, scope.labels, scope.receipt_namespace).await;
-        }
-        if request.uses_custody() && self.features().contains(&ROW_CUSTODY) {
-            crate::serving::custody::prepare(&mut request, &self.tokens.custody_vault()).await?;
-        }
-        self.writes.transact(request).await
+        self.serve(async {
+            if self.classic_workload_fence.is_some() { return Err(workload::denied()); }
+            require_ordinary_request(&request)?;
+            if request.uses_custody() || request.uses_erasure() {
+                self.require_unmanaged_effects()?;
+            }
+            if let Some(scope) = scope {
+                return self.writes.transact_scoped(request, scope.labels, scope.receipt_namespace).await;
+            }
+            if request.uses_custody() && self.features().contains(&ROW_CUSTODY) {
+                crate::serving::custody::prepare(&mut request, &self.tokens.custody_vault()).await?;
+            }
+            self.writes.transact(request).await
+        }).await
     }
 
     async fn transact_routed(
         &self, request: Transact, scope: Option<ServingScope>, cancellation: &CancellationToken,
     ) -> Result<Receipt> {
-        require_ordinary_request(&request)?;
-        cancellation.run_until_cancelled(async {
-            if let Some(route) = &self.route
-                && let Some(receipt) = route.forward(
-                    self.incarnation, &request, MultiWriteAdmission::Ordinary(scope.as_ref()),
-                ).await?
-            {
-                return Ok(receipt);
+        self.serve(async {
+            require_ordinary_request(&request)?;
+            if request.uses_custody() || request.uses_erasure() {
+                self.require_unmanaged_effects()?;
             }
-            self.transact_local(request, scope).await
-        }).await.ok_or_else(interrupted)?
+            cancellation.run_until_cancelled(async {
+                if let Some(route) = &self.route
+                    && let Some(receipt) = route.forward(
+                        self.incarnation, &request, MultiWriteAdmission::Ordinary(scope.as_ref()),
+                    ).await?
+                {
+                    return Ok(receipt);
+                }
+                self.transact_local(request, scope).await
+            }).await.ok_or_else(interrupted)?
+        }).await
     }
 
     /// Accepts only the narrow ordered response-release command from an admitted peer.
     pub async fn managed_workload_local(&self, mut request: workload::Request) -> Result<workload::Reply> {
-        if matches!(&request.operation, workload::Operation::Submit {
-            authority: workload::Authority::OriginalFamilyWrite { .. } | workload::Authority::ProvisionBranch { .. }, ..
-        } | workload::Operation::Status { family: workload::Family::OriginalFamilyWrite, .. }
-            | workload::Operation::ImportedStatus { family: workload::Family::OriginalFamilyWrite, .. }
-            | workload::Operation::Settle { family: workload::Family::OriginalFamilyWrite, .. }
-            | workload::Operation::ImportedSettle { family: workload::Family::OriginalFamilyWrite, .. }) {
-            return Err(workload::denied());
-        }
-        if let Some(expected) = &self.classic_workload_fence {
-            if let workload::Operation::Status { key, family } = &request.operation {
-                request.operation = workload::Operation::ImportedStatus {
-                    key: key.clone(), family: *family, after: Basis::from_bytes(&expected.applied.basis)?,
-                };
-                return self.writes.workload(request).await;
+        self.require_unmanaged_effects()?;
+        self.serve(async {
+            if matches!(&request.operation, workload::Operation::Submit {
+                authority: workload::Authority::OriginalFamilyWrite { .. } | workload::Authority::ProvisionBranch { .. }, ..
+            } | workload::Operation::Status { family: workload::Family::OriginalFamilyWrite, .. }
+                | workload::Operation::ImportedStatus { family: workload::Family::OriginalFamilyWrite, .. }
+                | workload::Operation::Settle { family: workload::Family::OriginalFamilyWrite, .. }
+                | workload::Operation::ImportedSettle { family: workload::Family::OriginalFamilyWrite, .. }) {
+                return Err(workload::denied());
             }
-            if let workload::Operation::Settle { key, family, digest } = &request.operation {
-                request.operation = workload::Operation::ImportedSettle {
-                    key: key.clone(), family: *family, digest: *digest,
-                    after: Basis::from_bytes(&expected.applied.basis)?,
+            if let Some(expected) = &self.classic_workload_fence {
+                if let workload::Operation::Status { key, family } = &request.operation {
+                    request.operation = workload::Operation::ImportedStatus {
+                        key: key.clone(), family: *family, after: Basis::from_bytes(&expected.applied.basis)?,
+                    };
+                    return self.writes.workload(request).await;
+                }
+                if let workload::Operation::Settle { key, family, digest } = &request.operation {
+                    request.operation = workload::Operation::ImportedSettle {
+                        key: key.clone(), family: *family, digest: *digest,
+                        after: Basis::from_bytes(&expected.applied.basis)?,
+                    };
+                    return self.writes.workload(request).await;
+                }
+                let covered = match &request.operation {
+                    workload::Operation::Submit { authority, .. } => authority.permits_imported_workload(expected),
+                    workload::Operation::Observe(fence) | workload::Operation::ReadRoot { fence, .. }
+                    | workload::Operation::ReadCustody { fence, .. } => fence.at_or_after_import(expected),
+                    workload::Operation::Predecessor(predecessor) => predecessor.fence.at_or_after_import(expected),
+                    _ => false,
                 };
-                return self.writes.workload(request).await;
+                if !covered { return Err(workload::denied()); }
             }
-            let covered = match &request.operation {
-                workload::Operation::Submit { authority, .. } => authority.permits_imported_workload(expected),
-                workload::Operation::Observe(fence) | workload::Operation::ReadRoot { fence, .. }
-                | workload::Operation::ReadCustody { fence, .. } => fence.at_or_after_import(expected),
-                workload::Operation::Predecessor(predecessor) => predecessor.fence.at_or_after_import(expected),
-                _ => false,
-            };
-            if !covered { return Err(workload::denied()); }
-        }
-        self.writes.workload(request).await
+            self.writes.workload(request).await
+        }).await
     }
 
     pub async fn submit_response_local(&self, request: Transact) -> Result<Receipt> {
-        if self.classic_workload_fence.is_some() || !request.is_response_release() {
-            return Err(crate::serving::custody_release::release_unavailable());
-        }
-        self.writes.transact(request).await
+        self.require_unmanaged_effects()?;
+        self.serve(async {
+            if self.classic_workload_fence.is_some() || !request.is_response_release() {
+                return Err(crate::serving::custody_release::release_unavailable());
+            }
+            self.writes.transact(request).await
+        }).await
     }
 
     pub async fn replay_follower(&self) -> Result<()> {
@@ -531,6 +596,7 @@ impl MultiServing {
     }
 
     pub async fn retire_deployment(&self) -> Result<rtdb_db::DeploymentRetirement> {
+        self.require_unmanaged_effects()?;
         self.writes.retire_deployment().await
     }
 
@@ -549,27 +615,45 @@ impl ServingDriver for MultiServing {
     fn token_authority(&self) -> Option<TokenAuthority> { Some(self.tokens.clone()) }
 
     async fn apply_token_key_rotation(&self, generation: u64, unreadable_by: i64) -> Result<()> {
-        self.database.lock().await.finish_token_rotation(generation, unreadable_by).await
+        self.require_unmanaged_effects()?;
+        self.serve(async {
+            self.database.lock().await.finish_token_rotation(generation, unreadable_by).await
+        }).await
     }
 
     async fn destroy_retired_token_key(&self, generation: u64) -> Result<()> {
-        self.database.lock().await.destroy_retired_token_key(generation).await
+        self.require_unmanaged_effects()?;
+        self.serve(async {
+            self.database.lock().await.destroy_retired_token_key(generation).await
+        }).await
     }
 
     async fn export_checkpoint(&self, pin: uuid::Uuid, basis: Basis, until: Option<Timestamp>, cancellation: &CancellationToken) -> Result<Vec<u8>> {
-        cancellation.run_until_cancelled(self.writes.export(pin, basis, until)).await.ok_or_else(interrupted)?
+        self.require_unmanaged_effects()?;
+        self.serve(async {
+            cancellation.run_until_cancelled(self.writes.export(pin, basis, until)).await.ok_or_else(interrupted)?
+        }).await
     }
 
     async fn open_checkpoint_export(&self, ticket: Vec<u8>, cancellation: &CancellationToken) -> Result<rtdb_db::PinnedExport> {
-        cancellation.run_until_cancelled(self.writes.open_export(ticket)).await.ok_or_else(interrupted)?
+        self.require_unmanaged_effects()?;
+        self.serve(async {
+            cancellation.run_until_cancelled(self.writes.open_export(ticket)).await.ok_or_else(interrupted)?
+        }).await
     }
 
     async fn release_checkpoint_export(&self, ticket: Vec<u8>, cancellation: &CancellationToken) -> Result<()> {
-        cancellation.run_until_cancelled(self.writes.release_export(ticket)).await.ok_or_else(interrupted)?
+        self.require_unmanaged_effects()?;
+        self.serve(async {
+            cancellation.run_until_cancelled(self.writes.release_export(ticket)).await.ok_or_else(interrupted)?
+        }).await
     }
 
     async fn restore_checkpoint(&self, export: rtdb_db::PinnedExport, cancellation: &CancellationToken) -> Result<BranchCut> {
-        cancellation.run_until_cancelled(self.writes.restore(export)).await.ok_or_else(interrupted)?
+        self.require_unmanaged_effects()?;
+        self.serve(async {
+            cancellation.run_until_cancelled(self.writes.restore(export)).await.ok_or_else(interrupted)?
+        }).await
     }
 
     fn features(&self) -> &[&str] {
@@ -582,112 +666,126 @@ impl ServingDriver for MultiServing {
 
     async fn query_ranked_ivf(&self, source: QuerySource, target: &crate::serving::ranked_ivf::Target,
         now: Timestamp, cancellation: &CancellationToken) -> Result<(QueryView, crate::serving::ranked_ivf::Catalog)> {
-        if !self.supports_ranked_ivf() { return Err(crate::serving::ranked_ivf::unsupported()); }
-        self.ranked_query(source, target, now, None, cancellation).await
+        self.serve(async {
+            if !self.supports_ranked_ivf() { return Err(crate::serving::ranked_ivf::unsupported()); }
+            self.ranked_query(source, target, now, None, cancellation).await
+        }).await
     }
 
     async fn query_ranked_artefacts(&self, database: &str, source: QuerySource, now: Timestamp,
         cancellation: &CancellationToken) -> Result<QueryView> {
-        self.ranked_artefacts(database, source, now, None, cancellation).await
+        self.serve(async {
+            self.ranked_artefacts(database, source, now, None, cancellation).await
+        }).await
     }
 
     async fn query_scoped(&self, source: QuerySource, track: bool, now: Timestamp,
                           scope: &ServingScope, cancellation: &CancellationToken) -> Result<QueryView> {
-        cancellation.run_until_cancelled(async {
-            let deadline = Instant::now() + Duration::from_secs(30);
-            let mut applied = self.database.lock().await.watch_applied();
-            loop {
-                applied.mark_seen();
-                let (index, generation) = self.database.lock().await.fresh_view().await?;
-                index.require_local_custody()?;
-                let vault = index.has_custody_groups().then(|| self.tokens.custody_vault());
-                match scope.query(&index, source.clone(), now, &self.memory, vault.as_ref()).await {
-                    Ok((mut view, raw)) => {
-                        if track {
-                            view.claim = Some(self.tokens.issuer().await?.seal_scoped_claim(raw, &scope.labels).await?);
+        self.serve(async {
+            cancellation.run_until_cancelled(async {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                let mut applied = self.database.lock().await.watch_applied();
+                loop {
+                    applied.mark_seen();
+                    let (index, generation) = self.database.lock().await.fresh_view().await?;
+                    index.require_local_custody()?;
+                    let vault = index.has_custody_groups().then(|| self.tokens.custody_vault());
+                    match scope.query(&index, source.clone(), now, &self.memory, vault.as_ref()).await {
+                        Ok((mut view, raw)) => {
+                            if track {
+                                view.claim = Some(self.tokens.issuer().await?.seal_scoped_claim(raw, &scope.labels).await?);
+                            }
+                            self.database.lock().await.check_generation(generation).await?;
+                            view.key_generation = Some(generation);
+                            return Ok(view);
                         }
-                        self.database.lock().await.check_generation(generation).await?;
-                        view.key_generation = Some(generation);
-                        return Ok(view);
+                        Err(error) if error.is(AnomalyKind::BasisAhead) && Instant::now() < deadline => {
+                            applied.changed(deadline).await?;
+                        }
+                        Err(error) => return Err(error),
                     }
-                    Err(error) if error.is(AnomalyKind::BasisAhead) && Instant::now() < deadline => {
-                        applied.changed(deadline).await?;
-                    }
-                    Err(error) => return Err(error),
                 }
-            }
-        }).await.ok_or_else(interrupted)?
+            }).await.ok_or_else(interrupted)?
+        }).await
     }
 
     async fn managed_workload(&self, request: workload::Request,
                               cancellation: &CancellationToken) -> Result<workload::Reply> {
-        cancellation.run_until_cancelled(async {
-            let local = self.managed_workload_local(request.clone()).await;
-            if local.as_ref().err().is_some_and(|error| error.is(AnomalyKind::NoWriter))
-                && let Some(route) = &self.route
-            {
-                return route.forward_workload(self.incarnation, request).await;
-            }
-            local
-        }).await.ok_or_else(interrupted)?
+        self.require_unmanaged_effects()?;
+        self.serve(async {
+            cancellation.run_until_cancelled(async {
+                let local = self.managed_workload_local(request.clone()).await;
+                if local.as_ref().err().is_some_and(|error| error.is(AnomalyKind::NoWriter))
+                    && let Some(route) = &self.route
+                {
+                    return route.forward_workload(self.incarnation, request).await;
+                }
+                local
+            }).await.ok_or_else(interrupted)?
+        }).await
     }
 
     async fn managed_original_family(&self, mut request: workload::Request,
                                      cancellation: &CancellationToken) -> Result<workload::Reply> {
-        let imported = self.classic_workload_fence.as_ref();
-        let after = imported.map(|fence| Basis::from_bytes(&fence.applied.basis)).transpose()?;
-        match &request.operation {
-            workload::Operation::ReadRoot { fence, .. }
-                if imported.is_none_or(|origin| fence.at_or_after_import(origin)) => {}
-            workload::Operation::Submit { authority: workload::Authority::OriginalFamilyWrite { fence, writer, created, .. }, .. }
-                if imported.is_none_or(|origin| fence.covers_imported_family_line(origin, writer, *created)) => {}
-            workload::Operation::Submit { authority: workload::Authority::ProvisionBranch { fence, .. }, .. }
-                if imported.is_none_or(|origin| fence.at_or_after_import(origin)) => {}
-            workload::Operation::Status { key, family: family @ workload::Family::OriginalFamilyWrite } => {
-                if let Some(after) = after {
-                    request.operation = workload::Operation::ImportedStatus { key: key.clone(), family: *family, after };
+        self.require_unmanaged_effects()?;
+        self.serve(async {
+            let imported = self.classic_workload_fence.as_ref();
+            let after = imported.map(|fence| Basis::from_bytes(&fence.applied.basis)).transpose()?;
+            match &request.operation {
+                workload::Operation::ReadRoot { fence, .. }
+                    if imported.is_none_or(|origin| fence.at_or_after_import(origin)) => {}
+                workload::Operation::Submit { authority: workload::Authority::OriginalFamilyWrite { fence, writer, created, .. }, .. }
+                    if imported.is_none_or(|origin| fence.covers_imported_family_line(origin, writer, *created)) => {}
+                workload::Operation::Submit { authority: workload::Authority::ProvisionBranch { fence, .. }, .. }
+                    if imported.is_none_or(|origin| fence.at_or_after_import(origin)) => {}
+                workload::Operation::Status { key, family: family @ workload::Family::OriginalFamilyWrite } => {
+                    if let Some(after) = after {
+                        request.operation = workload::Operation::ImportedStatus { key: key.clone(), family: *family, after };
+                    }
                 }
+                _ => return Err(workload::denied()),
             }
-            _ => return Err(workload::denied()),
-        }
-        let reply = cancellation.run_until_cancelled(self.writes.workload(request)).await.ok_or_else(interrupted)??;
-        if let (Some(after), workload::Reply::Receipt(receipt)) = (after, &reply)
-            && (receipt.basis.incarnation() != after.incarnation() || receipt.basis <= after)
-        {
-            return Err(workload::denied());
-        }
-        Ok(reply)
+            let reply = cancellation.run_until_cancelled(self.writes.workload(request)).await.ok_or_else(interrupted)??;
+            if let (Some(after), workload::Reply::Receipt(receipt)) = (after, &reply)
+                && (receipt.basis.incarnation() != after.incarnation() || receipt.basis <= after)
+            {
+                return Err(workload::denied());
+            }
+            Ok(reply)
+        }).await
     }
 
     async fn query_original_family_review(&self, source: QuerySource, review: FamilyReviewSelection,
         now: Timestamp, cancellation: &CancellationToken) -> Result<QueryView> {
-        let At::Exactly(basis) = source.at else { return Err(workload::denied()); };
-        let imported = self.classic_workload_fence.as_ref().map(|fence| Basis::from_bytes(&fence.applied.basis)).transpose()?;
-        if source.layer != Layer::Merged || basis < review.created
-            || imported.is_some_and(|after| review.created.incarnation() != after.incarnation() || review.created <= after)
-        {
-            return Err(workload::denied());
-        }
-        cancellation.run_until_cancelled(async {
-            let (index, generation) = self.database.lock().await.fresh_view().await?;
-            index.require_local_custody()?;
-            if index.has_visibility_history() { return Err(workload::denied()); }
-            workload::require_family_branch(&index, &source.branch, review.created, now)?;
-            let view = index.view(&source.branch, At::Exactly(basis), Layer::Merged, now)?;
-            let (_, _, selected) = index.custody_review_at(&source.branch, basis, review.valid_at, review.group, review.selected)?;
-            let target = &selected.target;
-            let event = view.row(&target.table, &target.id, review.valid_at).ok_or_else(workload::denied)?;
-            if view.custody_event_contributor(&target.table, event) != Some((review.group, review.selected)) {
+        self.serve(async {
+            let At::Exactly(basis) = source.at else { return Err(workload::denied()); };
+            let imported = self.classic_workload_fence.as_ref().map(|fence| Basis::from_bytes(&fence.applied.basis)).transpose()?;
+            if source.layer != Layer::Merged || basis < review.created
+                || imported.is_some_and(|after| review.created.incarnation() != after.incarnation() || review.created <= after)
+            {
                 return Err(workload::denied());
             }
-            let snapshot = rtdb_query::branch_family_review_snapshot(&view, &self.memory, &target.table, event)?;
-            self.database.lock().await.check_generation(generation).await?;
-            Ok(QueryView {
-                snapshot, cut: view.cut(), claim: None, scoped_source_basis: None,
-                custody_groups: BTreeSet::from([review.group]), key_generation: Some(generation),
-                custody_contributors: Some(BTreeSet::from([(review.group, review.selected)])),
-            })
-        }).await.ok_or_else(interrupted)?
+            cancellation.run_until_cancelled(async {
+                let (index, generation) = self.database.lock().await.fresh_view().await?;
+                index.require_local_custody()?;
+                if index.has_visibility_history() { return Err(workload::denied()); }
+                workload::require_family_branch(&index, &source.branch, review.created, now)?;
+                let view = index.view(&source.branch, At::Exactly(basis), Layer::Merged, now)?;
+                let (_, _, selected) = index.custody_review_at(&source.branch, basis, review.valid_at, review.group, review.selected)?;
+                let target = &selected.target;
+                let event = view.row(&target.table, &target.id, review.valid_at).ok_or_else(workload::denied)?;
+                if view.custody_event_contributor(&target.table, event) != Some((review.group, review.selected)) {
+                    return Err(workload::denied());
+                }
+                let snapshot = rtdb_query::branch_family_review_snapshot(&view, &self.memory, &target.table, event)?;
+                self.database.lock().await.check_generation(generation).await?;
+                Ok(QueryView {
+                    snapshot, cut: view.cut(), claim: None, scoped_source_basis: None,
+                    custody_groups: BTreeSet::from([review.group]), key_generation: Some(generation),
+                    custody_contributors: Some(BTreeSet::from([(review.group, review.selected)])),
+                })
+            }).await.ok_or_else(interrupted)?
+        }).await
     }
 
     async fn transact_scoped(&self, request: Transact, scope: ServingScope,
@@ -696,14 +794,17 @@ impl ServingDriver for MultiServing {
     }
 
     async fn supports_funded_transact(&self) -> bool {
-        self.database.lock().await.supports_funded_transact()
+        self.serving_authority.is_none() && self.database.lock().await.supports_funded_transact()
     }
 
     async fn supports_funded_appointment(&self) -> bool {
-        self.classic_workload_fence.is_none() && self.database.lock().await.supports_funded_appointment()
+        self.serving_authority.is_none()
+            && self.classic_workload_fence.is_none()
+            && self.database.lock().await.supports_funded_appointment()
     }
 
     async fn managed_appointment_ready(&self, appointment: &workload::ManagedAppointment) -> Result<bool> {
+        self.require_unmanaged_effects()?;
         self.check_appointment_origin(appointment)?;
         self.database.lock().await.managed_appointment_ready(appointment).await
     }
@@ -713,60 +814,72 @@ impl ServingDriver for MultiServing {
         command: rtdb_tx::transact::AppointmentCommand, clock: Arc<dyn rtdb_tx::DecisionClock>,
         cancellation: &CancellationToken,
     ) -> Result<Receipt> {
-        self.check_appointment_origin(&appointment)?;
-        cancellation.run_until_cancelled(self.writes.transact_managed_appointment(request, appointment, command, clock))
-            .await.ok_or_else(interrupted)?
+        self.require_unmanaged_effects()?;
+        self.serve(async {
+            self.check_appointment_origin(&appointment)?;
+            cancellation.run_until_cancelled(self.writes.transact_managed_appointment(request, appointment, command, clock))
+                .await.ok_or_else(interrupted)?
+        }).await
     }
 
     async fn managed_appointment_status(
         &self, appointment: &workload::ManagedAppointment, key: &[u8], cancellation: &CancellationToken,
     ) -> Result<Receipt> {
-        self.check_appointment_origin(appointment)?;
-        cancellation.run_until_cancelled(async {
-            self.database.lock().await.managed_appointment_status(appointment, key).await
-        }).await.ok_or_else(interrupted)?
+        self.serve(async {
+            self.check_appointment_origin(appointment)?;
+            cancellation.run_until_cancelled(async {
+                self.database.lock().await.managed_appointment_status(appointment, key).await
+            }).await.ok_or_else(interrupted)?
+        }).await
     }
 
     async fn transact_funded(
         &self, request: Transact, scope: Option<ServingScope>, funding: FundingSubmission,
         cancellation: &CancellationToken,
     ) -> Result<Receipt> {
-        if self.classic_workload_fence.is_some() { return Err(workload::denied()); }
-        let scope = scope.map(|scope| (scope.labels, scope.receipt_namespace));
-        cancellation.run_until_cancelled(self.writes.transact_funded(
-            request, scope, funding.owner, funding.command, funding.clock,
-        )).await.ok_or_else(interrupted)?
+        self.require_unmanaged_effects()?;
+        self.serve(async {
+            if self.classic_workload_fence.is_some() { return Err(workload::denied()); }
+            let scope = scope.map(|scope| (scope.labels, scope.receipt_namespace));
+            cancellation.run_until_cancelled(self.writes.transact_funded(
+                request, scope, funding.owner, funding.command, funding.clock,
+            )).await.ok_or_else(interrupted)?
+        }).await
     }
 
     async fn tx_status_scoped(&self, key: &[u8], scope: &ServingScope,
                               cancellation: &CancellationToken) -> Result<Receipt> {
-        cancellation.run_until_cancelled(async {
-            self.database.lock().await.tx_status_scoped(key, scope.transaction_scope()).await
-        }).await.ok_or_else(interrupted)?
+        self.serve(async {
+            cancellation.run_until_cancelled(async {
+                self.database.lock().await.tx_status_scoped(key, scope.transaction_scope()).await
+            }).await.ok_or_else(interrupted)?
+        }).await
     }
 
     async fn changes_scoped(&self, request: Changes, scope: &ServingScope,
                             cancellation: &CancellationToken) -> Result<ChangePage> {
-        cancellation.run_until_cancelled(async {
-            let start = Instant::now();
-            let mut applied = self.database.lock().await.watch_applied();
-            loop {
-                applied.mark_seen();
-                let (index, generation) = self.database.lock().await.fresh_view().await?;
-                index.require_local_custody()?;
-                let mut page = scope.changes(&index, &request)?;
-                let remaining = request.wait.saturating_sub(start.elapsed());
-                if !page.groups.is_empty() || request.until.is_some() && page.complete || remaining.is_zero() {
-                    self.database.lock().await.check_generation(generation).await?;
-                    page.key_generation = Some(generation);
-                    if index.has_custody_groups() {
-                        return crate::serving::custody::open_changes(&index, &self.tokens.custody_vault(), page).await;
+        self.serve(async {
+            cancellation.run_until_cancelled(async {
+                let start = Instant::now();
+                let mut applied = self.database.lock().await.watch_applied();
+                loop {
+                    applied.mark_seen();
+                    let (index, generation) = self.database.lock().await.fresh_view().await?;
+                    index.require_local_custody()?;
+                    let mut page = scope.changes(&index, &request)?;
+                    let remaining = request.wait.saturating_sub(start.elapsed());
+                    if !page.groups.is_empty() || request.until.is_some() && page.complete || remaining.is_zero() {
+                        self.database.lock().await.check_generation(generation).await?;
+                        page.key_generation = Some(generation);
+                        if index.has_custody_groups() {
+                            return crate::serving::custody::open_changes(&index, &self.tokens.custody_vault(), page).await;
+                        }
+                        return Ok(page);
                     }
-                    return Ok(page);
+                    applied.changed(Instant::now() + remaining).await?;
                 }
-                applied.changed(Instant::now() + remaining).await?;
-            }
-        }).await.ok_or_else(interrupted)?
+            }).await.ok_or_else(interrupted)?
+        }).await
     }
 
     async fn query(
@@ -776,103 +889,109 @@ impl ServingDriver for MultiServing {
         now: Timestamp,
         cancellation: &CancellationToken,
     ) -> Result<QueryView> {
-        cancellation
-            .run_until_cancelled(async {
-                let (index, generation) = self.database.lock().await.fresh_view().await?;
-                index.require_local_custody()?;
-                let at = if source.at == At::Linearizable {
-                    At::Latest
-                } else {
-                    source.at
-                };
-                let view = index.view(&source.branch, at, source.layer, now)?;
-                let cut = view.cut();
-                let (snapshot, custody_groups, custody_contributors) = if index.has_custody_groups() {
-                    crate::serving::custody::snapshot(&view, &self.memory, &self.tokens.custody_vault()).await?
-                } else { (rtdb_query::branch_snapshot(&view, &self.memory)?, BTreeSet::new(), Some(BTreeSet::new())) };
-                let claim = if track {
-                    Some(self.tokens.seal_claim(&ClaimEvidence {
-                        scope: ClaimScope { branch: source.branch, basis: cut.basis, layer: source.layer },
-                        footprint: Default::default(),
-                    }).await?)
-                } else {
-                    None
-                };
-                self.database
-                    .lock()
-                    .await
-                    .check_generation(generation)
-                    .await?;
-                Ok(QueryView {
-                    snapshot,
-                    cut,
-                    claim,
-                    custody_groups,
-                    custody_contributors,
-                    scoped_source_basis: None,
-                    key_generation: Some(generation),
+        self.serve(async {
+            cancellation
+                .run_until_cancelled(async {
+                    let (index, generation) = self.database.lock().await.fresh_view().await?;
+                    index.require_local_custody()?;
+                    let at = if source.at == At::Linearizable {
+                        At::Latest
+                    } else {
+                        source.at
+                    };
+                    let view = index.view(&source.branch, at, source.layer, now)?;
+                    let cut = view.cut();
+                    let (snapshot, custody_groups, custody_contributors) = if index.has_custody_groups() {
+                        crate::serving::custody::snapshot(&view, &self.memory, &self.tokens.custody_vault()).await?
+                    } else { (rtdb_query::branch_snapshot(&view, &self.memory)?, BTreeSet::new(), Some(BTreeSet::new())) };
+                    let claim = if track {
+                        Some(self.tokens.seal_claim(&ClaimEvidence {
+                            scope: ClaimScope { branch: source.branch, basis: cut.basis, layer: source.layer },
+                            footprint: Default::default(),
+                        }).await?)
+                    } else {
+                        None
+                    };
+                    self.database
+                        .lock()
+                        .await
+                        .check_generation(generation)
+                        .await?;
+                    Ok(QueryView {
+                        snapshot,
+                        cut,
+                        claim,
+                        custody_groups,
+                        custody_contributors,
+                        scoped_source_basis: None,
+                        key_generation: Some(generation),
+                    })
                 })
-            })
-            .await
-            .ok_or_else(interrupted)?
+                .await
+                .ok_or_else(interrupted)?
+        }).await
     }
 
     async fn read_store(
         &self, read: rtdb_index::branches::store::StoreRead, at: At, now: Timestamp, cancellation: &CancellationToken,
     ) -> Result<rtdb_index::branches::store::StorePage> {
-        cancellation.run_until_cancelled(async {
-            let (index, generation) = self.database.lock().await.fresh_view().await?;
-            if index.has_custody_groups() || index.has_visibility_history() {
-                return Err(Anomaly::unsupported("rtdb.store/unsupported", "The ordered-bytes store serves only an unlabelled database"));
-            }
-            let at = if at == At::Linearizable { At::Latest } else { at };
-            let page = index.view(rtdb_types::rtdb_v1::MAIN_BRANCH, at, Layer::Merged, now)?.store_page(&read)?;
-            self.database.lock().await.check_generation(generation).await?;
-            Ok(page)
-        }).await.ok_or_else(interrupted)?
+        self.serve(async {
+            cancellation.run_until_cancelled(async {
+                let (index, generation) = self.database.lock().await.fresh_view().await?;
+                if index.has_custody_groups() || index.has_visibility_history() {
+                    return Err(Anomaly::unsupported("rtdb.store/unsupported", "The ordered-bytes store serves only an unlabelled database"));
+                }
+                let at = if at == At::Linearizable { At::Latest } else { at };
+                let page = index.view(rtdb_types::rtdb_v1::MAIN_BRANCH, at, Layer::Merged, now)?.store_page(&read)?;
+                self.database.lock().await.check_generation(generation).await?;
+                Ok(page)
+            }).await.ok_or_else(interrupted)?
+        }).await
     }
 
     async fn query_workload_root(
         &self, source: QuerySource, cut: WorkloadReadCut, now: Timestamp, cancellation: &CancellationToken,
     ) -> Result<QueryView> {
-        cancellation.run_until_cancelled(async {
-            let (index, generation) = self.database.lock().await.fresh_view().await?;
-            index.require_local_custody()?;
-            if source.branch != rtdb_types::rtdb_v1::MAIN_BRANCH || source.layer != Layer::Merged
-                || index.has_visibility_history() || cut.basis.incarnation() != self.incarnation
-            {
-                return Err(workload::denied());
-            }
-            let basis = match source.at {
-                At::Exactly(basis) if basis.incarnation() == self.incarnation && basis <= cut.basis => basis,
-                At::AtLeast(basis) if basis.incarnation() == self.incarnation && basis <= cut.basis => cut.basis,
-                At::Linearizable => cut.basis,
-                _ => return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb/basis-ahead",
-                    "The requested basis is outside the admitted writer cut").with_kind(AnomalyKind::BasisAhead)),
-            };
-            let view = index.view(&source.branch, At::Exactly(basis), source.layer, now)?;
-            let snapshot = if let Some(groups) = &cut.custody_groups {
-                if !matches!(source.at, At::Exactly(_)) { return Err(workload::denied()); }
-                for group in groups {
-                    if !index.custody_group_live(*group)? { return Err(workload::denied()); }
+        self.serve(async {
+            cancellation.run_until_cancelled(async {
+                let (index, generation) = self.database.lock().await.fresh_view().await?;
+                index.require_local_custody()?;
+                if source.branch != rtdb_types::rtdb_v1::MAIN_BRANCH || source.layer != Layer::Merged
+                    || index.has_visibility_history() || cut.basis.incarnation() != self.incarnation
+                {
+                    return Err(workload::denied());
                 }
-                rtdb_query::branch_workload_custody_snapshot(&view, &self.memory, groups)?
-            } else {
-                let tables = view.tables().filter(|(table, _)| !index.has_custody_relation(table))
-                    .map(|(table, _)| table.clone()).collect();
-                rtdb_query::branch_workload_clear_snapshot(&view, &self.memory, &tables)?
-            };
-            self.database.lock().await.check_generation(generation).await?;
-            Ok(QueryView {
-                snapshot,
-                cut: view.cut(),
-                claim: None,
-                custody_groups: BTreeSet::new(),
-                custody_contributors: Some(BTreeSet::new()),
-                scoped_source_basis: None,
-                key_generation: Some(generation),
-            })
-        }).await.ok_or_else(interrupted)?
+                let basis = match source.at {
+                    At::Exactly(basis) if basis.incarnation() == self.incarnation && basis <= cut.basis => basis,
+                    At::AtLeast(basis) if basis.incarnation() == self.incarnation && basis <= cut.basis => cut.basis,
+                    At::Linearizable => cut.basis,
+                    _ => return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb/basis-ahead",
+                        "The requested basis is outside the admitted writer cut").with_kind(AnomalyKind::BasisAhead)),
+                };
+                let view = index.view(&source.branch, At::Exactly(basis), source.layer, now)?;
+                let snapshot = if let Some(groups) = &cut.custody_groups {
+                    if !matches!(source.at, At::Exactly(_)) { return Err(workload::denied()); }
+                    for group in groups {
+                        if !index.custody_group_live(*group)? { return Err(workload::denied()); }
+                    }
+                    rtdb_query::branch_workload_custody_snapshot(&view, &self.memory, groups)?
+                } else {
+                    let tables = view.tables().filter(|(table, _)| !index.has_custody_relation(table))
+                        .map(|(table, _)| table.clone()).collect();
+                    rtdb_query::branch_workload_clear_snapshot(&view, &self.memory, &tables)?
+                };
+                self.database.lock().await.check_generation(generation).await?;
+                Ok(QueryView {
+                    snapshot,
+                    cut: view.cut(),
+                    claim: None,
+                    custody_groups: BTreeSet::new(),
+                    custody_contributors: Some(BTreeSet::new()),
+                    scoped_source_basis: None,
+                    key_generation: Some(generation),
+                })
+            }).await.ok_or_else(interrupted)?
+        }).await
     }
 
     async fn watch_applied(&self) -> Option<rtdb_db::AppliedWatch> {
@@ -882,28 +1001,30 @@ impl ServingDriver for MultiServing {
     async fn changes_workload_root(
         &self, mut request: Changes, cut: Basis, cancellation: &CancellationToken,
     ) -> Result<ChangePage> {
-        cancellation.run_until_cancelled(async {
-            let mut database = self.database.lock().await;
-            let history = database.fresh_history().await?;
-            history.index.require_local_custody()?;
-            if request.branch != rtdb_types::rtdb_v1::MAIN_BRANCH || history.index.has_visibility_history()
-                || cut.incarnation() != self.incarnation
-                || history.index.has_custody_groups() && (request.tables.is_empty()
-                    || request.tables.iter().any(|table| history.index.has_custody_relation(table)))
-            {
-                return Err(workload::denied());
-            }
-            if request.after.is_some_and(|after| after.position() > cut.position()) {
-                return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb/change-basis-ahead",
-                    "The changes cursor is beyond the admitted writer cut"));
-            }
-            let until = request.until;
-            request.until = Some(until.map_or(cut, |until| until.min(cut)));
-            let mut page = changes_page(&history, &request, self.incarnation)?;
-            if until.is_some_and(|until| until > cut) { page.complete = false; }
-            page.key_generation = Some(history.generation);
-            Ok(page)
-        }).await.ok_or_else(interrupted)?
+        self.serve(async {
+            cancellation.run_until_cancelled(async {
+                let mut database = self.database.lock().await;
+                let history = database.fresh_history().await?;
+                history.index.require_local_custody()?;
+                if request.branch != rtdb_types::rtdb_v1::MAIN_BRANCH || history.index.has_visibility_history()
+                    || cut.incarnation() != self.incarnation
+                    || history.index.has_custody_groups() && (request.tables.is_empty()
+                        || request.tables.iter().any(|table| history.index.has_custody_relation(table)))
+                {
+                    return Err(workload::denied());
+                }
+                if request.after.is_some_and(|after| after.position() > cut.position()) {
+                    return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb/change-basis-ahead",
+                        "The changes cursor is beyond the admitted writer cut"));
+                }
+                let until = request.until;
+                request.until = Some(until.map_or(cut, |until| until.min(cut)));
+                let mut page = changes_page(&history, &request, self.incarnation)?;
+                if until.is_some_and(|until| until > cut) { page.complete = false; }
+                page.key_generation = Some(history.generation);
+                Ok(page)
+            }).await.ok_or_else(interrupted)?
+        }).await
     }
 
     async fn transact(
@@ -919,60 +1040,75 @@ impl ServingDriver for MultiServing {
     }
 
     async fn check_read_delivery(&self, generation: Option<u64>, groups: &BTreeSet<CustodyGroupId>, cancellation: &CancellationToken) -> Result<()> {
-        if generation.is_none() && groups.is_empty() { return Ok(()); }
-        cancellation.run_until_cancelled(async {
-            let mut database = self.database.lock().await;
-            if !groups.is_empty() {
-                let index = database.fresh_index().await?;
-                index.require_local_custody()?;
-                crate::serving::custody::check_delivery(index, &self.tokens.custody_vault(), groups).await?;
-            }
-            if let Some(generation) = generation { database.check_generation(generation).await?; }
-            Ok(())
-        }).await.ok_or_else(interrupted)?
+        if !groups.is_empty() {
+            self.require_unmanaged_effects()?;
+        }
+        self.serve(async {
+            if generation.is_none() && groups.is_empty() { return Ok(()); }
+            cancellation.run_until_cancelled(async {
+                let mut database = self.database.lock().await;
+                if !groups.is_empty() {
+                    let index = database.fresh_index().await?;
+                    index.require_local_custody()?;
+                    crate::serving::custody::check_delivery(index, &self.tokens.custody_vault(), groups).await?;
+                }
+                if let Some(generation) = generation { database.check_generation(generation).await?; }
+                Ok(())
+            }).await.ok_or_else(interrupted)?
+        }).await
     }
 
     async fn current_custody(&self, cancellation: &CancellationToken) -> Result<BranchIndex> {
-        cancellation.run_until_cancelled(async {
-            let (index, generation) = self.database.lock().await.fresh_view().await?;
-            index.require_local_custody()?;
-            self.database.lock().await.check_generation(generation).await?;
-            Ok(index)
-        }).await.ok_or_else(interrupted)?
+        self.require_unmanaged_effects()?;
+        self.serve(async {
+            cancellation.run_until_cancelled(async {
+                let (index, generation) = self.database.lock().await.fresh_view().await?;
+                index.require_local_custody()?;
+                self.database.lock().await.check_generation(generation).await?;
+                Ok(index)
+            }).await.ok_or_else(interrupted)?
+        }).await
     }
 
     async fn submit_custody_release(&self, command: TrustedCustodyCommand, cancellation: &CancellationToken) -> Result<Receipt> {
-        let request = command.into_request()?;
-        cancellation.run_until_cancelled(async {
-            if let Some(route) = &self.route
-                && let Some(receipt) = route.forward(
-                    self.incarnation, &request, MultiWriteAdmission::CustodyResponse,
-                ).await?
-            {
-                return Ok(receipt);
-            }
-            self.submit_response_local(request).await
-        }).await.ok_or_else(interrupted)?
+        self.require_unmanaged_effects()?;
+        self.serve(async {
+            let request = command.into_request()?;
+            cancellation.run_until_cancelled(async {
+                if let Some(route) = &self.route
+                    && let Some(receipt) = route.forward(
+                        self.incarnation, &request, MultiWriteAdmission::CustodyResponse,
+                    ).await?
+                {
+                    return Ok(receipt);
+                }
+                self.submit_response_local(request).await
+            }).await.ok_or_else(interrupted)?
+        }).await
     }
 
     async fn check_custody_release_delivery(&self, groups: &BTreeSet<CustodyGroupId>, writer: &CustodyWriterFence,
                                             generation: Option<u64>, cancellation: &CancellationToken) -> Result<()> {
-        cancellation.run_until_cancelled(async {
-            let vault = self.tokens.custody_vault();
-            for &group in groups { vault.check_readable(group).await?; }
-            let mut database = self.database.lock().await;
-            let (index, current_generation) = database.fresh_view().await?;
-            index.require_local_custody()?;
-            crate::serving::custody_release::check_release_cut(&index, writer, groups, crate::Clock::now(&crate::SystemClock))?;
-            database.check_generation(current_generation).await?;
-            if let Some(selected) = generation.filter(|selected| *selected != current_generation) {
-                database.check_generation(selected).await?;
-            }
-            Ok(())
-        }).await.ok_or_else(interrupted)?
+        self.require_unmanaged_effects()?;
+        self.serve(async {
+            cancellation.run_until_cancelled(async {
+                let vault = self.tokens.custody_vault();
+                for &group in groups { vault.check_readable(group).await?; }
+                let mut database = self.database.lock().await;
+                let (index, current_generation) = database.fresh_view().await?;
+                index.require_local_custody()?;
+                crate::serving::custody_release::check_release_cut(&index, writer, groups, crate::Clock::now(&crate::SystemClock))?;
+                database.check_generation(current_generation).await?;
+                if let Some(selected) = generation.filter(|selected| *selected != current_generation) {
+                    database.check_generation(selected).await?;
+                }
+                Ok(())
+            }).await.ok_or_else(interrupted)?
+        }).await
     }
 
     async fn reconcile_custody(&self, cancellation: &CancellationToken) -> Result<()> {
+        self.require_unmanaged_effects()?;
         cancellation.run_until_cancelled(async {
             let (index, _) = self.database.lock().await.fresh_view().await?;
             index.require_local_custody()?;
@@ -981,32 +1117,40 @@ impl ServingDriver for MultiServing {
     }
 
     async fn tx_status(&self, key: &[u8], cancellation: &CancellationToken) -> Result<Receipt> {
-        cancellation
-            .run_until_cancelled(async { self.database.lock().await.tx_status(key).await })
-            .await
-            .ok_or_else(interrupted)?
+        self.serve(async {
+            cancellation
+                .run_until_cancelled(async { self.database.lock().await.tx_status(key).await })
+                .await
+                .ok_or_else(interrupted)?
+        }).await
     }
 
     async fn original_custody_receipt(&self, key: &[u8], basis: Basis, cancellation: &CancellationToken) -> Result<Receipt> {
-        cancellation.run_until_cancelled(async {
-            self.database.lock().await.original_custody_receipt(key, basis).await
-        }).await.ok_or_else(interrupted)?
+        self.serve(async {
+            cancellation.run_until_cancelled(async {
+                self.database.lock().await.original_custody_receipt(key, basis).await
+            }).await.ok_or_else(interrupted)?
+        }).await
     }
 
     async fn original_writer_receipt(&self, key: &[u8], basis: Basis, cancellation: &CancellationToken) -> Result<Receipt> {
-        cancellation.run_until_cancelled(async {
-            self.database.lock().await.original_writer_receipt(key, basis).await
-        }).await.ok_or_else(interrupted)?
+        self.serve(async {
+            cancellation.run_until_cancelled(async {
+                self.database.lock().await.original_writer_receipt(key, basis).await
+            }).await.ok_or_else(interrupted)?
+        }).await
     }
 
     async fn original_line_creation_receipt(&self, key: &[u8], basis: Basis, cancellation: &CancellationToken) -> Result<Receipt> {
-        if let Some(imported) = &self.classic_workload_fence {
-            let after = Basis::from_bytes(&imported.applied.basis)?;
-            if basis.incarnation() != after.incarnation() || basis <= after { return Err(workload::denied()); }
-        }
-        cancellation.run_until_cancelled(async {
-            self.database.lock().await.original_line_creation_receipt(key, basis).await
-        }).await.ok_or_else(interrupted)?
+        self.serve(async {
+            if let Some(imported) = &self.classic_workload_fence {
+                let after = Basis::from_bytes(&imported.applied.basis)?;
+                if basis.incarnation() != after.incarnation() || basis <= after { return Err(workload::denied()); }
+            }
+            cancellation.run_until_cancelled(async {
+                self.database.lock().await.original_line_creation_receipt(key, basis).await
+            }).await.ok_or_else(interrupted)?
+        }).await
     }
 
     async fn changes(
@@ -1014,37 +1158,39 @@ impl ServingDriver for MultiServing {
         request: Changes,
         cancellation: &CancellationToken,
     ) -> Result<ChangePage> {
-        if request.limit == 0 {
-            return Err(Anomaly::incorrect(
-                "rtdb/change-limit",
-                "Changes requires a positive group limit",
-            ));
-        }
-        cancellation
-            .run_until_cancelled(async {
-                let start = Instant::now();
-                let mut applied = self.database.lock().await.watch_applied();
-                loop {
-                    applied.mark_seen();
-                    let mut database = self.database.lock().await;
-                    let history = database.fresh_history().await?;
-                    history.index.require_local_custody()?;
-                    let page = changes_page(&history, &request, self.incarnation)?;
-                    let remaining = request.wait.saturating_sub(start.elapsed());
-                    if !page.groups.is_empty() || request.until.is_some() && page.complete || remaining.is_zero() {
-                        let index = history.index.has_custody_groups().then(|| history.index.clone());
+        self.serve(async {
+            if request.limit == 0 {
+                return Err(Anomaly::incorrect(
+                    "rtdb/change-limit",
+                    "Changes requires a positive group limit",
+                ));
+            }
+            cancellation
+                .run_until_cancelled(async {
+                    let start = Instant::now();
+                    let mut applied = self.database.lock().await.watch_applied();
+                    loop {
+                        applied.mark_seen();
+                        let mut database = self.database.lock().await;
+                        let history = database.fresh_history().await?;
+                        history.index.require_local_custody()?;
+                        let page = changes_page(&history, &request, self.incarnation)?;
+                        let remaining = request.wait.saturating_sub(start.elapsed());
+                        if !page.groups.is_empty() || request.until.is_some() && page.complete || remaining.is_zero() {
+                            let index = history.index.has_custody_groups().then(|| history.index.clone());
+                            drop(database);
+                            return match index {
+                                Some(index) => crate::serving::custody::open_changes(&index, &self.tokens.custody_vault(), page).await,
+                                None => Ok(page),
+                            };
+                        }
                         drop(database);
-                        return match index {
-                            Some(index) => crate::serving::custody::open_changes(&index, &self.tokens.custody_vault(), page).await,
-                            None => Ok(page),
-                        };
+                        applied.changed(Instant::now() + remaining).await?;
                     }
-                    drop(database);
-                    applied.changed(Instant::now() + remaining).await?;
-                }
-            })
-            .await
-            .ok_or_else(interrupted)?
+                })
+                .await
+                .ok_or_else(interrupted)?
+        }).await
     }
 }
 

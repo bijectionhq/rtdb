@@ -3070,7 +3070,7 @@ dependencies = [
 [[package]]
 name = "journal-contract"
 version = "0.1.0"
-source = "git+https://github.com/bijectionhq/logkeeper.git?rev=514bc5edec39f87cba774883fa6a6aaeb121bac1#514bc5edec39f87cba774883fa6a6aaeb121bac1"
+source = "git+https://github.com/bijectionhq/logkeeper.git?rev=74bfb98615291b581329053318d6b200c39b9e11#74bfb98615291b581329053318d6b200c39b9e11"
 dependencies = [
  "bytes",
  "serde",
@@ -3254,7 +3254,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 [[package]]
 name = "logkeeper"
 version = "0.2.0"
-source = "git+https://github.com/bijectionhq/logkeeper.git?rev=514bc5edec39f87cba774883fa6a6aaeb121bac1#514bc5edec39f87cba774883fa6a6aaeb121bac1"
+source = "git+https://github.com/bijectionhq/logkeeper.git?rev=74bfb98615291b581329053318d6b200c39b9e11#74bfb98615291b581329053318d6b200c39b9e11"
 dependencies = [
  "bincode",
  "bytes",
@@ -3276,6 +3276,7 @@ dependencies = [
  "tokio",
  "tokio-rustls 0.26.6",
  "tokio-util",
+ "tracing",
  "uuid",
  "x509-parser",
 ]

@@ -96,6 +96,19 @@ async fn envelopes_authenticate_database_purpose_position_and_bytes() {
 }
 
 #[tokio::test]
+async fn backup_envelopes_have_their_own_purpose() {
+    let kms = LocalKms::new(|| 0);
+    let generation = generation(1);
+    kms.create(generation).await.unwrap();
+
+    let binding = [7; 32];
+    let context = Context::PortableBackup { header_digest: binding };
+    let envelope = seal(&kms, generation, context, b"checkpoint").await.unwrap();
+    assert!(open(&kms, generation.database, context, &envelope).await.is_ok());
+    assert!(open(&kms, generation.database, Context::CustodyValue { binding }, &envelope).await.is_err());
+}
+
+#[tokio::test]
 async fn deadline_is_exclusive_and_destroyed_generation_cannot_reopen() {
     let now = Arc::new(AtomicI64::new(0));
     let kms = LocalKms::new({

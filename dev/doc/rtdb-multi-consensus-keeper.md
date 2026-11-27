@@ -41,9 +41,21 @@ Replication admission, the restart read rule and the read index sit inside
 the keepers, so the Multi driver needs no change to use them. Epoch zero is
 never a sealed writer epoch, and Multi always seals epoch one or later.
 
+## Immutable stream history
+
+Set `multiJournal: {immutableStreams: true}` for a Multi cell using a Logkeeper consensus cluster with cluster version 4 finalized.
+The loopback development equivalent is `rtdb dev --multi --multi-immutable-streams` with a complete Multi TLS profile and the consensus journal URL.
+This setting applies to newly created stream IDs.
+A residence verifies the durable stream mode before opening the history and presents a fresh session identity when seeking the writer epoch.
+Seal binds that session to the exact committed head, and subsequent appends and trims carry its fence.
+Followers request pages that cover their observed head and resume at the next LSN.
+A history change under the same ID faults the residence.
+The keeper manages replica replacement for immutable streams.
+To adopt this mode for existing databases, restore a verified application cut into a fresh database incarnation and stream before changing the database route.
+
 ## Operator recovery
 
-When a stream loses two of its three voters, an operator can run `logkeeper keeper recover-stream --acknowledge-data-loss` on the survivor.
+For a legacy mutable stream that loses two of its three voters, an operator can run `logkeeper keeper recover-stream --acknowledge-data-loss` on the survivor.
 The stream then ends at the survivor's head, and records acknowledged after it may be lost.
 Every seal returns `JournalError::Recovered { head }` until a writer or an administrator acknowledges the recovery.
 
@@ -58,6 +70,35 @@ Every seal returns `JournalError::Recovered { head }` until a writer or an admin
   Each check re-reads the last applied record with the next page, so it holds after the new writer has written past the lost positions.
   Either way the node logs the loss and rebuilds its state from the journal floor.
 - **Holding writes.** With `multiJournal: {holdWritesAfterRecovery: true}` the node instead refuses the writer role with `rtdb/journal-recovered` until someone else acknowledges the recovery, and records nothing.
+
+## Independent database activation
+
+A Multi runtime can bind a stable name and its exact database incarnation to a separately commissioned immutable activation journal.
+The authority records the maximum lease expiry before it issues a serving grant.
+A successor publication compares the original activation revision, requires closed grant issuance, and waits for the previous grant window to close.
+It rejects a retired incarnation as a successor.
+A cached grant expires at the earlier of its original monotonic deadline and the conservative real-time upper bound.
+The authority assumes a bound of 250 milliseconds on real-time clock offset across all its participants.
+
+Every member serving an activated database name must enforce the same authority.
+Commission every serving endpoint with the activation configuration before accepting client traffic.
+Keep the authority in a failure domain separate from both the predecessor and the successor.
+The current implementation gives grant renewals and operator actions the same underlying journal write capability and assumes trusted participants.
+The runtime gates client operations, peer writes, journal mutations, and retained result delivery on the incarnation's grant.
+Transactions with an external custody or erasure effect, funded dispatch, and the existing local catalog's create, erase and checkpoint-transfer operations return an explicit refusal in activation mode.
+Those capabilities require separately commissioned effect fences before they can serve an activated database name.
+
+On installed Multi nodes, `RTDB_ACTIVATION_JOURNAL_URL` selects the independent immutable consensus authority and `RTDB_ACTIVATION_AUTHORITY_ID` identifies it.
+Installed activation requires `multiJournal: {immutableStreams: true}` for the application journal.
+The authority's TLS files come from `RTDB_ACTIVATION_CERTIFICATE_PATH`, `RTDB_ACTIVATION_PRIVATE_KEY_PATH`, and `RTDB_ACTIVATION_CA_PATH`.
+All replicas of the authority protect its state against rewind and survive failure of the databases they activate.
+
+`rtdb multi-activation` supplies `bootstrap`, `status`, `freeze`, and `publish` operator actions.
+`freeze` and `publish` compare the expected incarnation and activation revision.
+`publish` independently opens the stopped destination, reads its committed portable restore, and binds the successor to that proof.
+If the predecessor still holds a serving grant, retry with the same operation ID after the grant window closes.
+A local rehearsal can use an exclusively opened authority file in the same process as its participating runtimes.
+Separate development processes can use a loopback immutable consensus authority through the installed activation environment variables.
 
 ## Batches, placement, funded appends and journal size
 
@@ -109,6 +150,26 @@ Every seal returns `JournalError::Recovered { head }` until a writer or an admin
   `XTDB_LOGGING_LEVEL_DB_CHECKPOINT=debug`. The benches take
   `--checkpoints classic|binary|deferred`, default `deferred`.
 
+## Portable application backups
+
+`rtdb multi-backup export` captures a settled cut from a stopped, initialized development deployment, using its journal and object store to verify the current checkpoint dependencies.
+For an ordinary inline cut, the archive carries the complete checkpoint and retained receipt index under the source key generation.
+Its authenticated header binds the source incarnation, basis, system time, and journal position.
+The archive contains a wrapped data key. The source generation key remains in its vault.
+
+`rtdb multi-backup restore` reads the archive with an explicitly supplied source key vault and installs the cut into a fresh development incarnation and journal stream.
+The source journal, object store, and process can be absent.
+Keep source key custody available independently until a restore is admitted; retired key generations follow their existing deadlines.
+The destination checkpoint records the source coordinates and archive digest so the committed installation can be read back after restart.
+Recovered ordinary receipts use the new incarnation's basis, and the archive retains the original receipts.
+The commands work with the local development journal and the optional loopback Logkeeper connections configured with `--journal-url` and `--tls-dir`.
+For a version 4 immutable stream, pass `--immutable-streams` to export, restore, and activation publication.
+
+This archive version supports inline checkpoints with ordinary retained receipts.
+Active pins, external object dependencies, ranked catalogues, protected custody, and scoped or funded receipts require a separate portable transfer.
+The export refuses incomplete erasure and key rotation.
+The command stages a destination cut for local rehearsal; a shared database name requires its own activation decision and predecessor fence.
+
 ## Qualification
 
 The [2026-11-26 consensus keeper results](../../verification/results/2026-11-26-consensus-keeper.adoc)
@@ -125,6 +186,8 @@ cargo test -p rtdb-journal-logkeeper
 cargo test -p rtdb-server --features multi --lib multi_dev_serves_and_reopens_on_consensus_keepers
 cargo test -p rtdb-server --features multi --lib multi_dev_moves_its_stream_off_a_draining_keeper
 cargo test -p rtdb-server --features multi --lib consensus_batch_proves_funded_timed_originals
+# Restore an immutable cut with three independent keeper clusters.
+cargo test -p rtdb-server --features multi --lib portable_cut_replaces_a_lost_cell_and_fences_its_return
 # Separate keeper processes, rtdb dev --multi and rtdb.v1 commits over Flight.
 python3 bench/v1_consensus_keepers.py --rtdb target/release/rtdb \
   --logkeeper /path/to/logkeeper output-directory
@@ -135,3 +198,13 @@ python3 bench/v1_journal_comparison.py --rtdb target/release/rtdb \
 
 The process run needs OpenSSL, PyArrow and a release `logkeeper` built with
 the `stream` feature at the pinned revision.
+
+To qualify a local Logkeeper change before the Git dependency is published, pass a Cargo override containing both workspace crates:
+
+```toml
+[patch."https://github.com/bijectionhq/logkeeper.git"]
+logkeeper = { path = "/path/to/logkeeper" }
+journal-contract = { path = "/path/to/logkeeper/contract" }
+```
+
+Use `cargo --config /path/to/local-logkeeper.toml test ...` and keep the lockfile changes local to the qualification.
