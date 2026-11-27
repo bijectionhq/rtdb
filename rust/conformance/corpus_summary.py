@@ -18,8 +18,11 @@ HERE = pathlib.Path(__file__).resolve().parent
 EXCLUSIONS_PATH = HERE / "corpus-exclusions.json"
 EXCLUDED_OUTCOMES = {"jvm-api-boundary", "jvm-internal", "environment-unavailable", "jvm-layout"}
 FAILED_RESULTS = {"error", "fail"}
-PASSED_RESULTS = {"pass", "pass-wire", "pass-jvm-only", "no-assertions"}
-UNSUCCESSFUL = {"error", "fail", "timeout", "process-crash", "load-error"}
+NATIVE_PASSES = {"pass", "pass-wire"}
+PASSED_RESULTS = NATIVE_PASSES | {"pass-jvm-only"}
+EXCLUDED_VAR_RESULTS = EXCLUDED_OUTCOMES | {"pass-jvm-only", "skipped-integration"}
+VAR_RESULTS = PASSED_RESULTS | FAILED_RESULTS | {"timeout", "skipped-integration", "no-assertions"}
+UNSUCCESSFUL = {"error", "fail", "timeout", "process-crash", "load-error", "no-assertions", "unobserved"}
 NOISE = re.compile(r"\d+|0x[0-9a-f]+")
 
 # Gauges of the JVM runtime and of Arrow Java's child-allocator tree.
@@ -48,8 +51,10 @@ def only_data_file_sizes_differ(detail):
 
 def only_jvm_runtime_metrics_missing(detail):
     """Whether a metrics assertion failed only because JVM-runtime or child-allocator gauges are absent."""
-    missing = [set(re.findall(r'"([^"]+)"', names)) for names in MISSING_METRICS.findall(detail)]
-    return bool(missing) and all(names <= JVM_ONLY_METRICS for names in missing)
+    missing = MISSING_METRICS.findall(detail)
+    return bool(missing) and all(re.fullmatch(r'(?:\s*"[^"]+")+\s*', names)
+                                 and set(re.findall(r'"([^"]+)"', names)) <= JVM_ONLY_METRICS
+                                 for names in missing)
 
 
 CHECKS = {
@@ -117,18 +122,30 @@ def uncovered_failures(row, exclusions=None):
     return [failure for failure in failures(row) if not exclusions.covers(row["var"], failure)]
 
 
+def failure_evidence_complete(row):
+    texts = row.get("failures")
+    if not texts or row.get("failures-truncated"):
+        return False
+    if "fail" in row or "error" in row:
+        return len(texts) == row.get("fail", 0) + row.get("error", 0)
+    return True
+
+
 def outcome(row, exclusions=None):
     exclusions = exclusions or EXCLUSIONS
     result = row["result"]
     if result == "jvm-internal":
         return "pass-jvm-only"  # a native-free pass, as the runner named it before pass-jvm-only
-    if (result in FAILED_RESULTS and row["var"] in exclusions.vars and failures(row) and not row.get("failures-truncated")
+    if (result in FAILED_RESULTS and row["var"] in exclusions.vars and failure_evidence_complete(row)
             and not uncovered_failures(row, exclusions)):
         return exclusions.outcome_of(row["var"])
     return result
 
 
 def load(directory: pathlib.Path):
+    if (directory / "selection.json").is_file():
+        yield from read_run(directory)["rows"]
+        return
     for path in sorted(directory.glob("*.jsonl")):
         for line in path.read_text(encoding="utf-8").splitlines():
             if line.strip():
@@ -139,6 +156,96 @@ def upstream_commit_of(directory: pathlib.Path):
     """The upstream commit whose test sources the run loaded, as upstream_tests.sh recorded it, or None."""
     marker = directory / ".upstream-tests" / ".commit"
     return marker.read_text(encoding="utf-8").strip() if marker.is_file() else None
+
+
+def namespace_results(directory, namespace):
+    rows, problems = [], []
+    vars_ = None
+    finished = False
+    path = directory / f"{namespace}.jsonl"
+    if path.is_file():
+        with path.open(encoding="utf-8") as stream:
+            try:
+                for line in stream:
+                    if not line.endswith("\n"):
+                        raise ValueError("incomplete corpus result line")
+                    row = json.loads(line)
+                    if not isinstance(row, dict) or row.get("ns") != namespace or finished:
+                        raise ValueError("unexpected namespace result")
+                    event = row.get("event")
+                    if event == "load-error" and vars_ is None:
+                        raise ValueError(f'namespace load failed: {row.get("detail")}')
+                    if event == "namespace-start" and vars_ is None:
+                        found = row.get("vars")
+                        if (not isinstance(found, list) or not all(
+                                isinstance(var, str) and var.startswith(namespace + "/") for var in found)
+                                or len(found) != len(set(found))):
+                            raise ValueError("invalid discovered Var list")
+                        vars_ = found
+                    elif event == "namespace-complete" and vars_ is not None and len(rows) == len(vars_):
+                        finished = True
+                    elif (event is None and vars_ is not None and len(rows) < len(vars_)
+                          and row.get("var") == vars_[len(rows)] and row.get("result") in VAR_RESULTS):
+                        rows.append(row)
+                    else:
+                        raise ValueError("unexpected or reordered corpus result")
+            except ValueError as error:
+                problems.append(str(error))
+    exit_path = directory / f"{namespace}.exit"
+    exit_code = exit_path.read_text(encoding="ascii").strip() if exit_path.is_file() else None
+    if exit_code != "0":
+        problems.append(f"JVM exit status {exit_code if exit_code is not None else 'unknown'}")
+    if not finished:
+        problems.append("namespace did not complete")
+    if vars_ is not None:
+        rows.extend({"ns": namespace, "var": var, "result": "unobserved"}
+                    for var in vars_[len(rows):])
+    return rows, vars_ is not None, problems
+
+
+def read_run(directory):
+    selection = json.loads((directory / "selection.json").read_text(encoding="utf-8"))
+    namespaces = selection["namespaces"]
+    if (selection.get("schema_version") != 1 or not isinstance(namespaces, list) or not namespaces
+            or any(not isinstance(ns, str) or not re.fullmatch(r"[\w.-]+", ns, re.ASCII) for ns in namespaces)
+            or len(namespaces) != len(set(namespaces))):
+        raise ValueError("invalid corpus selection")
+    if selection["upstream_commit"] != upstream_commit_of(directory):
+        raise ValueError("corpus selection and extracted upstream SHA differ")
+    rows, discovered, problems = [], set(), {}
+    for namespace in namespaces:
+        batch, known, errors = namespace_results(directory, namespace)
+        rows.extend(batch)
+        if known:
+            discovered.add(namespace)
+        if errors:
+            problems[namespace] = errors
+    return {"selection": selection, "rows": rows, "discovered": discovered, "problems": problems,
+            "complete": not problems and len(discovered) == len(namespaces)}
+
+
+def var_counts(totals):
+    passed = sum(totals[name] for name in NATIVE_PASSES)
+    excluded = sum(totals[name] for name in EXCLUDED_VAR_RESULTS)
+    discovered = sum(totals.values())
+    return {"discovered_vars": discovered, "passed": passed, "failed": discovered - passed - excluded,
+            "excluded": excluded, "unobserved": totals["unobserved"]}
+
+
+def run_summary(run, exclusions=None):
+    grouped = collections.defaultdict(collections.Counter)
+    for row in run["rows"]:
+        grouped[row["ns"]][outcome(row, exclusions)] += 1
+    namespaces = {}
+    for ns in run["selection"]["namespaces"]:
+        counts = var_counts(grouped[ns])
+        namespaces[ns] = {**counts, "var_denominator": counts["discovered_vars"] if ns in run["discovered"] else None,
+                          "outcomes": dict(grouped[ns]), "evidence_errors": run["problems"].get(ns, [])}
+    totals = var_counts(sum(grouped.values(), collections.Counter()))
+    unknown = sorted(set(namespaces) - run["discovered"])
+    return {"schema_version": 1, **run["selection"], "execution_complete": run["complete"],
+            "totals": {**totals, "var_denominator": totals["discovered_vars"] if not unknown else None},
+            "unknown_namespaces": unknown, "namespaces": namespaces}
 
 
 def summarise(rows, exclusions=None):
@@ -166,7 +273,7 @@ def summarise(rows, exclusions=None):
                 uncovered.append((var, len(missed), (missed or ["(no failure text recorded)"])[0][:300]))
         if kind in UNSUCCESSFUL:
             texts = failures(row) or [row.get("detail") or ""]
-            failure_count += len(texts)
+            failure_count += len(failures(row))
             for text in texts:
                 signature = NOISE.sub("#", text[:160])
                 clusters[(kind, signature)] += 1
@@ -183,7 +290,15 @@ def main(argv=None):
     parser.add_argument("--clusters", type=int, default=40)
     parser.add_argument("--exclusions", type=pathlib.Path, default=EXCLUSIONS_PATH)
     args = parser.parse_args(argv)
-    summary = summarise(load(args.results), load_exclusions(args.exclusions))
+    exclusions = load_exclusions(args.exclusions)
+    run = read_run(args.results) if (args.results / "selection.json").is_file() else None
+    summary = summarise(run["rows"] if run else load(args.results), exclusions)
+    receipt = run_summary(run, exclusions) if run else None
+    if receipt:
+        (args.results / "summary.json").write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps(receipt["totals"], indent=2))
+    else:
+        print("historical results without discovery and process receipts")
     commit = upstream_commit_of(args.results)
     print(f"test sources: upstream XTDB {commit}" if commit else
           "test sources: UNKNOWN - this run did not load upstream_tests.sh's extraction, so it does not measure upstream conformance")
@@ -194,14 +309,15 @@ def main(argv=None):
     print("excluded by decision (corpus-exclusions.json):")
     print(json.dumps(dict(summary["excluded"].most_common()), indent=1))
     for var, count, first in summary["uncovered"]:
-        print(f"uncovered exclusion: {var} has {count} failure(s) outside its decision\n     {first}")
+        print(f"uncovered exclusion: {var} has {count} failure(s) outside its decision or incomplete diagnostics\n     {first}")
     for var in summary["stale"]:
         print(f"stale exclusion: {var} no longer fails")
     for var in summary["absent"]:
         print(f"absent exclusion: {var} is not in its namespace's results")
     for (kind, signature), count in summary["clusters"].most_common(args.clusters):
         print(f"{count:4d} {kind:13s} {summary['examples'][(kind, signature)]}\n     {signature}")
+    return 0 if receipt and receipt["execution_complete"] and receipt["totals"]["failed"] == 0 else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

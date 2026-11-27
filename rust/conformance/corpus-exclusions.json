@@ -5,9 +5,10 @@
    "outcome": "jvm-api-boundary",
    "decision": "RTDB's JVM binding exposes a node as xtdb.rust.NativeDatabase, reached through ADBC, pgwire and Flight SQL (bindings/jvm/README.adoc). It is not an xtdb.api.Xtdb, an xtdb.NodeBase or an xtdb.api.Xtdb$Connection, does not carry the JVM node's database catalog, does not implement the xtdb.db / xtdb.node protocols and is not a Clojure map.",
    "match": [
-    "cannot be cast to class xtdb\\.api\\.Xtdb\\b",
-    "xtdb\\.NodeBase",
-    "xtdb\\.database\\.Database\\$Catalog",
+    "cannot be cast to class xtdb\\.api\\.Xtdb(?:Internal)?\\b",
+    "cannot be cast to class xtdb\\.XtdbInternal\\b",
+    "cannot be cast to class xtdb\\.NodeBase\\b",
+    "cannot be cast to class xtdb\\.database\\.Database\\$Catalog\\b",
     "Cannot invoke \"xtdb\\.database\\.DatabaseCatalog\\.",
     "cannot be cast to class xtdb\\.api\\.Xtdb\\$Connection",
     "No implementation of method: :\\S+ of protocol: #'xtdb\\.(db|node)",
@@ -92,86 +93,6 @@
  "vars": [
   {
    "var": "xtdb.api-adbc-test/concurrent-writers-awaits-share-one-plan-6216",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.api-flight-sql-test/a-committed-write-is-visible-to-another-connection",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.api-flight-sql-test/a-flight-status-without-an-anomaly-maps-from-its-status",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.api-flight-sql-test/anomaly-code-crosses-the-wire",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.api-flight-sql-test/client-op-conversions",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.api-flight-sql-test/connection-rejects-database-opt",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.api-flight-sql-test/execute-tx-and-query",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.api-flight-sql-test/mixed-type-argument-reaches-the-server",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.api-flight-sql-test/mixed-type-column-round-trips",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.api-flight-sql-test/multi-op-tx-is-atomic",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.api-flight-sql-test/multi-row-batches",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.api-flight-sql-test/pages-shaped-differently-from-the-declared-result-type",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.api-flight-sql-test/put-docs-valid-time",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.api-flight-sql-test/query-args-and-plan-q",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.api-flight-sql-test/query-basis-opts",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.api-flight-sql-test/sql-anomaly-propagates",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.api-flight-sql-test/status-over-flight-sql",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.api-flight-sql-test/struct-field-order-differs-between-nodes",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.api-flight-sql-test/submit-tx-then-query-sees-write",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.api-flight-sql-test/tx-opts",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.api-flight-sql-test/unknown-db-is-rejected-at-open",
    "decision": "native-database-is-not-a-jvm-node"
   },
   {
@@ -387,59 +308,11 @@
    "decision": "native-database-is-not-a-jvm-node"
   },
   {
-   "var": "xtdb.flight-sql-test/set-time-zone-sets-the-session-zone",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.flight-sql-test/test-adbc",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
    "var": "xtdb.flight-sql-test/test-adbc-multi-db",
    "decision": "native-database-is-not-a-jvm-node"
   },
   {
-   "var": "xtdb.flight-sql-test/test-anomaly-propagates-through-prepare-5812",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.flight-sql-test/test-anomaly-propagates-through-query-5812",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.flight-sql-test/test-client",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.flight-sql-test/test-dml-anomaly-propagates-through-update-5812",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.flight-sql-test/test-dml-via-query-path-writes-its-row-5082",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
    "var": "xtdb.flight-sql-test/test-flightsql-multi-db",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.flight-sql-test/test-prepared-stmt-explicit-close-mid-session",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.flight-sql-test/test-prepared-stmt-no-params",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.flight-sql-test/test-prepared-stmts",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.flight-sql-test/test-prepared-stmts-in-tx",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.flight-sql-test/test-transaction",
    "decision": "native-database-is-not-a-jvm-node"
   },
   {

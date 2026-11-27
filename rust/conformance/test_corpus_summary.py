@@ -1,8 +1,9 @@
+import json
 import pathlib
 import tempfile
 import unittest
 
-from corpus_summary import EXCLUSIONS, Exclusions, load_exclusions, outcome, summarise, upstream_commit_of
+from corpus_summary import EXCLUSIONS, Exclusions, load_exclusions, outcome, read_run, run_summary, summarise, upstream_commit_of
 
 
 def detail(expected_size, actual_size, actual_rows=6):
@@ -31,10 +32,10 @@ CAST = "error java.lang.ClassCastException: class xtdb.rust.NativeDatabase canno
 
 class DataFileLayoutTest(unittest.TestCase):
     def test_a_block_catalog_differing_only_in_data_file_size_is_a_layout_difference(self):
-        self.assertEqual(outcome({"var": "xtdb.indexer-test/test-multi-block-metadata", "result": "error", "detail": detail(5638, 5598)}, EXCLUDED), "jvm-layout")
+        self.assertEqual(outcome({"var": "xtdb.indexer-test/test-multi-block-metadata", "result": "error", "failures": [detail(5638, 5598)]}, EXCLUDED), "jvm-layout")
 
     def test_any_other_block_catalog_difference_still_fails(self):
-        self.assertEqual(outcome({"var": "xtdb.indexer-test/test-multi-block-metadata", "result": "fail", "detail": detail(5638, 5598, actual_rows=7)}, EXCLUDED), "fail")
+        self.assertEqual(outcome({"var": "xtdb.indexer-test/test-multi-block-metadata", "result": "fail", "failures": [detail(5638, 5598, actual_rows=7)]}, EXCLUDED), "fail")
 
 
 class ExplicitExclusionTest(unittest.TestCase):
@@ -85,6 +86,56 @@ class ExplicitExclusionTest(unittest.TestCase):
         for var, entry in shipped.vars.items():
             self.assertTrue(shipped.decisions[entry["decision"]][0]["decision"].strip(), var)
         self.assertEqual(set(shipped.vars), set(EXCLUSIONS.vars))
+
+
+    def test_a_legacy_failure_or_an_incomplete_list_cannot_excuse_a_var(self):
+        row = {"var": "xtdb.a-test/casts", "result": "error", "detail": CAST}
+        self.assertEqual(outcome(row, EXCLUDED), "error")
+        self.assertEqual(outcome({**row, "failures": [CAST], "error": 2}, EXCLUDED), "error")
+
+
+class RunSummaryTest(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = pathlib.Path(directory.name)
+        marker = self.root / ".upstream-tests" / ".commit"
+        marker.parent.mkdir()
+        marker.write_text("reference\n")
+        (self.root / "selection.json").write_text(json.dumps(
+            {"schema_version": 1, "upstream_commit": "reference", "namespaces": ["xtdb.a-test", "xtdb.b-test"]}))
+
+    def write_namespace(self, name, exit_code, *records):
+        namespace = "xtdb." + name + "-test"
+        (self.root / f"{namespace}.jsonl").write_text(
+            "".join(json.dumps({"ns": namespace, **row}) + "\n" for row in records))
+        (self.root / f"{namespace}.exit").write_text(f"{exit_code}\n")
+
+    def test_missing_results_keep_the_discovered_denominator_and_fail_unobserved_vars(self):
+        self.write_namespace("a", 134,
+                             {"event": "namespace-start", "vars": ["xtdb.a-test/native", "xtdb.a-test/unobserved"]},
+                             {"var": "xtdb.a-test/native", "result": "pass"})
+        self.write_namespace("b", 0, {"event": "namespace-start", "vars": []}, {"event": "namespace-complete"})
+        result = run_summary(read_run(self.root), EXCLUDED)
+        self.assertEqual(result["totals"], {"discovered_vars": 2, "var_denominator": 2,
+                                            "passed": 1, "excluded": 0, "failed": 1, "unobserved": 1})
+        self.assertFalse(result["execution_complete"])
+        self.assertEqual(result["namespaces"]["xtdb.b-test"]["var_denominator"], 0)
+
+    def test_load_error_leaves_that_namespaces_denominator_unknown(self):
+        self.write_namespace("a", 0,
+                             {"event": "namespace-start", "vars": ["xtdb.a-test/integration", "xtdb.a-test/jvm",
+                                                                   "xtdb.a-test/empty"]},
+                             {"var": "xtdb.a-test/integration", "result": "skipped-integration"},
+                             {"var": "xtdb.a-test/jvm", "result": "pass-jvm-only"},
+                             {"var": "xtdb.a-test/empty", "result": "no-assertions"},
+                             {"event": "namespace-complete"})
+        self.write_namespace("b", 1, {"event": "load-error", "detail": "missing fixture"})
+        result = run_summary(read_run(self.root), EXCLUDED)
+        self.assertEqual(result["totals"], {"discovered_vars": 3, "var_denominator": None,
+                                            "passed": 0, "excluded": 2, "failed": 1, "unobserved": 0})
+        self.assertEqual(result["unknown_namespaces"], ["xtdb.b-test"])
+        self.assertIn("missing fixture", result["namespaces"]["xtdb.b-test"]["evidence_errors"][0])
 
 
 class UpstreamCommitTest(unittest.TestCase):

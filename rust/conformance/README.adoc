@@ -457,9 +457,10 @@ It uses the original C84 helpers for the continuation, internal queries, pgwire,
 == Native corpus
 
 The native corpus runs upstream XTDB's own Clojure test Vars against the native engine through the JVM binding.
-`upstream_tests.sh` extracts `src/test/clojure`, `src/test/resources`, `src/testFixtures/clojure` and `src/testFixtures/resources` at the pinned upstream commit (`0b9fa440f23d2165250d215209f7fa9bd7c26a6f`, the upstream `main` this fork last merged) into `<out-dir>/.upstream-tests`, read-only, with a `MANIFEST` of blob ids and a `.commit` marker.
+`upstream_tests.sh` extracts `src/test/clojure`, `src/test/resources`, `src/testFixtures/clojure` and `src/testFixtures/resources` at the pinned upstream commit (`0b9fa440f23d2165250d215209f7fa9bd7c26a6f` in `upstream-commit.txt`) into `<out-dir>/.upstream-tests`, read-only, with a `MANIFEST` of blob ids and a `.commit` marker.
 The runners put that tree ahead of this repository's test classpath, so neither the RTDB-edited test files nor the edited `xtdb.test-util` load; the runner refuses a namespace whose source resolves elsewhere and stops if `xtdb.test-util` does.
-Its only seams are `with-redefs` in `bindings/jvm/src/test/clojure/xtdb/rust/corpus.clj` that route node construction, `tu/query-ra`, `tu/flush-block!` and the connectables to the native engine.
+The harness routes node construction, `tu/query-ra`, `tu/flush-block!` and the connectables to the native engine.
+The two upstream Flight SQL test files also resolve their listener port through the native binding, with their original options, fixtures and assertions.
 Set `XTDB_UPSTREAM_COMMIT` to run another upstream commit and `XTDB_UPSTREAM_REPO` to read it from another clone; when the commit is missing, `git fetch --filter=blob:none https://github.com/xtdb/xtdb.git <commit>` first.
 
 [source,shell]
@@ -469,12 +470,18 @@ rust/conformance/run_corpus_parallel.sh "$PWD/rust/target/release/librtdb_ffi.dy
 python3 rust/conformance/corpus_summary.py build/conformance/corpus-upstream-001
 ----
 
-`run_corpus.sh <native-library> <out-dir> [ns...]` runs the same corpus through the Gradle `corpus` task, one Gradle invocation per namespace; the task refuses to start without `-PcorpusSources`.
+`run_corpus.sh <native-library> <out-dir> [ns...]` uses the same runner with one JVM at a time.
+Both commands require a fresh output directory and record the selected namespaces, upstream pin, implementation checkout and native-library digest before opening the first JVM.
+Each JVM records its discovered Var list before executing tests and flushes each Var outcome as it completes.
 Each result row records the Var's outcome, its assertion counts, `failures` (every failed or erroring assertion, up to 200, with `failures-truncated` beyond that) and `detail`, the first of them.
 
 `corpus_summary.py` counts a failing Var as `fail` or `error` unless `corpus-exclusions.json` lists it and every recorded failure satisfies the match of the entry's decision.
 Each decision names the RTDB feature or decision that justifies it and the outcome it reports (`jvm-api-boundary`, `jvm-internal`, `environment-unavailable` or `jvm-layout`); no pattern excuses a Var the list does not name, and a truncated failure list is never excused.
-A Var that passes without reaching a native entry point is `pass-jvm-only`, reported apart from both passes and exclusions.
+A Var that passes without reaching a native entry point is `pass-jvm-only` and contributes to the excluded count, as does a Var tagged integration.
+`summary.json` reports the pass, fail and exclusion counts for each selected namespace and for the run.
+Unobserved Vars after a crash or timeout count as failures once their identities are known.
+A namespace that fails before discovery leaves its denominator unknown and makes the overall denominator unknown.
+Historical JSONL without a recorded selection and process receipts remains diagnostic evidence.
 The summary prints the upstream commit the run loaded, or says the run does not measure upstream conformance, and lists uncovered exclusions (a recorded failure outside the decision), stale ones (the Var no longer fails) and absent ones (the Var is gone from its namespace).
 Review and edit the list from those lines after every run; the shipped entries were seeded from a run over the fork's edited tests that kept only first failures, so expect uncovered and stale entries on the first upstream run.
 
@@ -488,18 +495,19 @@ A test the corpus cannot run natively, or one that exercises JVM implementation 
 Corpus outcomes of the last three kinds become those classifications; JUnit tests and Clojure tests outside the corpus root are `engine-internal`.
 A ledger case with neither counterparts nor a classification is an error, and a classified case never names counterparts.
 Classified cases are reconciled without a bound invocation and reported apart, as `classified_case_count` and `classified_by_kind`; they are excluded from `assertion_denominator` and never count as passed native assertions.
-A counterpart whose corpus outcome is not `pass`, `pass-wire` or `no-assertions` is a reconciliation error, so a failing or unexecuted native Var keeps the inventory incomplete.
+A counterpart whose corpus outcome is neither `pass` nor `pass-wire` is a reconciliation error, so a failing or unexecuted native Var keeps the inventory incomplete.
 Runtime cases bind to candidates through aliases for namespaces declared with metadata, whose candidates the source inventory names `^:meta/...`, and for JUnit methods a subclass inherits, resolved through the superclass declarations in the reference checkout's test sources.
 A Var defined twice in one file is one ledger case and one candidate.
 Language-client candidates, Vars the corpus no longer contains, and macro-generated Vars without a source candidate stay unmapped.
+Build the source and runtime inventories from the same upstream commit recorded by the corpus.
 
 [source,shell]
 ----
-python3 rust/conformance/corpus_ledger.py --source rust/conformance/source-inventory.json \
-  --runtime build/conformance/reference-001 --corpus CORPUS_RESULTS --reference-checkout C84_CHECKOUT \
+python3 rust/conformance/corpus_ledger.py --source MATCHING_SOURCE_INVENTORY \
+  --runtime MATCHING_RUNTIME_INVENTORY --corpus CORPUS_RESULTS --reference-checkout REFERENCE_CHECKOUT \
   --native-configuration NATIVE_CONFIGURATION --corpus-source-revision REVISION --output build/conformance/ledger-001
-python3 rust/conformance/runtime_inventory.py --source rust/conformance/source-inventory.json \
-  --ledger build/conformance/ledger-001/ledger.json --runtime build/conformance/reference-001 \
+python3 rust/conformance/runtime_inventory.py --source MATCHING_SOURCE_INVENTORY \
+  --ledger build/conformance/ledger-001/ledger.json --runtime MATCHING_RUNTIME_INVENTORY \
   --native build/conformance/ledger-001/native.json --aliases build/conformance/ledger-001/aliases.json \
   --invocations build/conformance/ledger-001/invocations.json --output build/conformance/ledger-001/reconciliation.json
 ----

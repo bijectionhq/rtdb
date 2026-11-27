@@ -86,7 +86,7 @@ def source_name(descriptor):
 
 
 CLASSIFICATION_KINDS = ("engine-internal", "jvm-api-boundary", "jvm-internal", "environment-unavailable")
-PASSING_NATIVE_OUTCOMES = ("pass", "pass-wire", "no-assertions", "SUCCESSFUL")
+PASSING_NATIVE_OUTCOMES = ("pass", "pass-wire", "SUCCESSFUL")
 
 
 def case_key(identity):

@@ -38,3 +38,40 @@
       (t/is (not (corpus/loads-from? root 'xtdb.corpus-probe-absent-test)))
       (finally
         (.setContextClassLoader thread original)))))
+
+(t/deftest flight-port-adapter-preserves-server-options-and-assertions
+  (let [adapt #'corpus/adapt-flight-ports
+        source "(t/is (anomalous? [:incorrect :xtdb/unknown-db]
+                  (fsql/open-conn {:port (.getFlightSqlPort ^Xtdb *node*), :dbname \"no-such-db\"})))
+                (fsql/open-conn {:port (.getFlightSqlPort ^Xtdb *node*)})
+                (fsql/open-conn {:port (.getFlightSqlPort node)})
+                (fsql/open-conn {:port (.getFlightSqlPort node)})"]
+    (t/is (= "(t/is (anomalous? [:incorrect :xtdb/unknown-db]
+                  (fsql/open-conn {:port (xtdb.rust.corpus/native-flight-sql-port *node*), :dbname \"no-such-db\"})))
+                (fsql/open-conn {:port (xtdb.rust.corpus/native-flight-sql-port *node*)})
+                (fsql/open-conn {:port (xtdb.rust.corpus/native-flight-sql-port node)})
+                (fsql/open-conn {:port (xtdb.rust.corpus/native-flight-sql-port node)})"
+             (adapt 'xtdb.api-flight-sql-test source)))
+    (t/is (thrown-with-msg? clojure.lang.ExceptionInfo #"Unexpected upstream Flight SQL port call sites"
+                            (adapt 'xtdb.api-flight-sql-test "")))))
+
+(t/deftest a-corpus-namespace-publishes-its-vars-before-outcomes
+  (let [root (temp-dir)
+        source (io/file root "xtdb/corpus_order_test.clj")
+        thread (Thread/currentThread)
+        original (.getContextClassLoader thread)
+        seen (atom [])]
+    (io/make-parents source)
+    (spit source "(ns xtdb.corpus-order-test (:require [clojure.test :as t]))
+                  (t/deftest first-case (t/is false))
+                  (t/deftest ^:integration second-case (t/is false))")
+    (with-open [loader (URLClassLoader. (into-array URL [(.toURL (.toURI root))]) original)]
+      (.setContextClassLoader thread loader)
+      (try
+        (t/is (true? (corpus/run-namespace root 'xtdb.corpus-order-test 10000 #(swap! seen conj %))))
+        (t/is (= {:event "namespace-start" :vars ["xtdb.corpus-order-test/first-case" "xtdb.corpus-order-test/second-case"]}
+                 (first @seen)))
+        (t/is (= ["fail" "skipped-integration"] (mapv :result (subvec @seen 1 3))))
+        (t/is (= {:event "namespace-complete"} (peek @seen)))
+        (finally
+          (.setContextClassLoader thread original))))))

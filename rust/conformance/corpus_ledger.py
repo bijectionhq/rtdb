@@ -18,7 +18,8 @@ import corpus_summary  # noqa: E402
 import runtime_inventory  # noqa: E402
 
 CLASSIFIED_OUTCOMES = {"jvm-api-boundary": "jvm-api-boundary", "jvm-internal": "jvm-internal",
-                       "environment-unavailable": "environment-unavailable", "pass-jvm-only": "jvm-internal"}
+                       "environment-unavailable": "environment-unavailable", "pass-jvm-only": "jvm-internal",
+                       "jvm-layout": "jvm-internal", "skipped-integration": "environment-unavailable"}
 PASS_JVM_ONLY_REASON = "the Var passes without reaching a native entry point, so it is no evidence about the native engine"
 PARAMETER_FIXTURE = "none"
 REFERENCE_CONFIGURATION = "reference-pinned"
@@ -102,6 +103,8 @@ def corpus_reason(row, outcome, exclusions):
     """Why a classified corpus Var is not a counterpart: its exclusion's decision, or that it passed without native code."""
     if outcome == "pass-jvm-only":
         return PASS_JVM_ONLY_REASON
+    if outcome == "skipped-integration":
+        return "the native corpus does not run Vars tagged integration"
     return exclusions.decisions[exclusions.vars[row["var"]]["decision"]][0]["decision"]
 
 
@@ -197,9 +200,16 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     source = json.loads(args.source.read_bytes())
+    if not (args.corpus / "selection.json").is_file():
+        parser.error("corpus results lack current discovery and process receipts")
+    run = corpus_summary.read_run(args.corpus)
+    revision = run["selection"]["upstream_commit"]
+    if revision != source["reference"] or revision != args.corpus_source_revision:
+        parser.error("source inventory and corpus must use the same pinned reference")
     runtime_cases = [case for path in sorted(args.runtime.rglob("*.jsonl")) for case in runtime_inventory.read_plan(path)["cases"]]
-    ledger, invocations, aliases, native, counts = build(source, runtime_cases, list(corpus_summary.load(args.corpus)),
+    ledger, invocations, aliases, native, counts = build(source, runtime_cases, run["rows"],
                                                          args.native_configuration, args.reference_checkout, args.corpus_source_revision)
+    native["complete"] = run["complete"] and run["selection"]["all_namespaces"]
     args.output.mkdir(parents=True, exist_ok=False)
     for name, value in [("ledger.json", ledger), ("invocations.json", invocations), ("aliases.json", aliases),
                         ("native.json", native), ("generation.json", counts)]:

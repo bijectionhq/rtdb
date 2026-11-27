@@ -16,9 +16,8 @@ if ! git -C "$source_repo" cat-file -e "$commit^{commit}" 2>/dev/null; then
   exit 1
 fi
 commit=$(git -C "$source_repo" rev-parse "$commit^{commit}")
-if [ -f "$dest/.commit" ] && [ "$(cat "$dest/.commit")" = "$commit" ]; then echo "$dest"; exit 0; fi
-if [ -e "$dest" ]; then chmod -R u+w "$dest"; rm -rf "$dest"; fi
-mkdir -p "$dest"
+mkdir -p "$(dirname "$dest")"
+mkdir "$dest"
 git -C "$source_repo" archive --format=tar "$commit" -- "${TEST_PATHS[@]}" | tar -x -C "$dest"
 # git archive stamps every file with the commit time, and Clojure loads a compiled __init.class instead of a .clj
 # that is not strictly newer, so restamp the sources to now.
