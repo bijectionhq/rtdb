@@ -8,7 +8,11 @@ use std::{
     sync::Arc,
 };
 
-use arrow_array::{Array, BooleanArray, Int64Array, StringArray, StructArray};
+use arrow_array::{
+    Array, BinaryArray, BooleanArray, Date32Array, Date64Array, FixedSizeBinaryArray, Float16Array,
+    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray,
+    StructArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+};
 use arrow_buffer::Buffer;
 use bytes::Bytes;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
@@ -368,7 +372,7 @@ impl Events<'_> {
             while ordered.peek().is_some_and(|(following, _)| following.transaction == position.transaction) {
                 rows.push(ordered.next().expect("peeked row").1);
             }
-            let batch = match copy_positions(&rows, self.memory)? {
+            let batch = match copy_positions(rows.iter(), self.memory)? {
                 Some(batch) => batch,
                 None => {
                     let mut events = Vec::with_capacity(rows.len());
@@ -391,10 +395,22 @@ impl Events<'_> {
 }
 
 fn flat_type(array: &dyn Array) -> Option<ScalarType> {
-    if array.as_any().is::<Int64Array>() { Some(ScalarType::I64) }
-    else if array.as_any().is::<StringArray>() { Some(ScalarType::Utf8) }
-    else if array.as_any().is::<BooleanArray>() { Some(ScalarType::Bool) }
-    else { None }
+    let physical = array.as_any();
+    macro_rules! scalar_types {
+        ($($array:ty => $scalar:ident),+ $(,)?) => {
+            $(if physical.is::<$array>() { return Some(ScalarType::$scalar); })+
+        };
+    }
+    scalar_types!(
+        BooleanArray => Bool, StringArray => Utf8, BinaryArray => Binary,
+        Int8Array => I8, Int16Array => I16, Int32Array => I32, Int64Array => I64,
+        UInt8Array => U8, UInt16Array => U16, UInt32Array => U32, UInt64Array => U64,
+        Float16Array => F16, Float32Array => F32, Float64Array => F64,
+        Date32Array => DateDay, Date64Array => DateMilli,
+    );
+    physical.downcast_ref::<FixedSizeBinaryArray>()
+        .filter(|array| array.value_length() > 0)
+        .map(|array| ScalarType::FixedSizeBinary(array.value_length()))
 }
 
 fn flat_put(batch: &EventBatch, row: usize) -> Result<Option<&StructArray>> {
@@ -406,9 +422,12 @@ fn flat_put(batch: &EventBatch, row: usize) -> Result<Option<&StructArray>> {
     }).then_some(put))
 }
 
-fn copy_positions(rows: &[SurvivorRow], memory: &Arc<MemoryBudget>) -> Result<Option<Arc<IndexBatch>>> {
+fn copy_positions<'a>(
+    rows: impl Iterator<Item = &'a SurvivorRow> + Clone,
+    memory: &Arc<MemoryBudget>,
+) -> Result<Option<Arc<IndexBatch>>> {
     let mut put = None;
-    for row in rows {
+    for row in rows.clone() {
         let SurvivorPayload::Position(page, index) = &row.payload else { return Ok(None); };
         if row.header.op == EventOp::Put {
             let document = flat_put(&page.batch, *index)?.expect("admitted flat put");
@@ -428,7 +447,7 @@ fn copy_positions(rows: &[SurvivorRow], memory: &Arc<MemoryBudget>) -> Result<Op
     let fields = put.map(|put| put.fields().iter().zip(put.columns()).map(|(field, array)| {
         (field.name().clone(), LogicalType::Scalar(flat_type(array.as_ref()).expect("admitted flat column")))
     }).collect());
-    let events = rows.iter().map(|row| {
+    let events = rows.map(|row| {
         let SurvivorPayload::Position(page, index) = &row.payload else { unreachable!("admitted position"); };
         Ok(page.batch.borrow_event(*index)?.without_recency())
     }).collect::<Result<Vec<_>>>()?;
@@ -821,24 +840,35 @@ mod tests {
             operation,
             recency: Some(Timestamp(recency)),
         };
-        let document = || StoredOperation::Put(StructFields::from([
+        let document = |zero| StoredOperation::Put(StructFields::from([
             ("name".into(), Value::Utf8("survivor".into())),
             ("count".into(), Value::I64(42)),
             ("enabled".into(), Value::Bool(true)),
+            ("i8".into(), Value::I8(i8::MIN)),
+            ("i16".into(), Value::I16(i16::MIN)),
+            ("i32".into(), Value::I32(i32::MIN)),
+            ("u8".into(), Value::U8(u8::MAX)),
+            ("u16".into(), Value::U16(u16::MAX)),
+            ("u32".into(), Value::U32(u32::MAX)),
+            ("u64".into(), Value::U64(u64::MAX)),
+            ("half".into(), Value::F16(0x8000)),
+            ("zero".into(), Value::F32(zero)),
+            ("double".into(), Value::F64(-0.0)),
+            ("raw".into(), Value::Binary(vec![0xff, 0, 0x42])),
+            ("fixed".into(), Value::FixedSizeBinary(vec![0x42, 0])),
+            ("day".into(), Value::DateDay(-1)),
+            ("millis".into(), Value::DateMilli(-86_400_000)),
         ]));
-        let fields = Some(StructFields::from([
-            ("name".into(), LogicalType::Scalar(ScalarType::Utf8)),
-            ("count".into(), LogicalType::Scalar(ScalarType::I64)),
-            ("enabled".into(), LogicalType::Scalar(ScalarType::Bool)),
-        ]));
+        let StoredOperation::Put(example) = document(-0.0) else { unreachable!() };
+        let fields = Some(example.into_iter().map(|(name, value)| (name, value.logical_type())).collect());
         let disk = build_event_batch(&[
-            event(3, document(), 110),
-            event(1, document(), 110),
+            event(3, document(-0.0), 110),
+            event(1, document(-0.0), 110),
             event(2, StoredOperation::Erase, 110),
         ], fields.clone(), Some(rtdb_types::RunEndWidth::I32))?;
         let live = EventBatch::new(build_event_batch(&[
-            event(3, document(), 220),
-            event(4, document(), 220),
+            event(3, document(0.0), 220),
+            event(4, document(0.0), 220),
         ], fields, None)?)?;
         let source = MemoryStore::default();
         let key = ObjectKey::new(entry.slug.data_key(&trie))?;
@@ -858,6 +888,7 @@ mod tests {
             rows.add(&live, None)?;
             assert_eq!(rows.rows.keys().copied().collect::<Vec<_>>(), [position(2), position(3), position(4)]);
             assert!(rows.rows.values().all(|row| matches!(&row.payload, SurvivorPayload::Position(..)) == positions));
+            assert_eq!(copy_positions(rows.rows.values(), &memory)?.is_some(), positions);
             let rebuilt = rows.into_live(&entry, block, &declarations, &cancellation)?;
             assert_eq!(used_positions, positions);
             let mut output = Candidate { store: &store, memory: &memory, remaining: 16 << 20 };
@@ -870,6 +901,12 @@ mod tests {
                 let event = page.read_event(row)?;
                 assert_eq!(event.iid, iid);
                 assert_eq!(event.recency, None);
+                let ordinal = event.position.unwrap().ordinal;
+                assert_eq!(event.origin, Some(EventOrigin([ordinal as u8; EventOrigin::WIDTH as usize])));
+                if let StoredOperation::Put(document) = event.operation {
+                    let Value::F32(zero) = document["zero"] else { panic!("Expected a typed float") };
+                    assert_eq!(zero.to_bits(), if ordinal == 3 { (-0.0_f32).to_bits() } else { 0 });
+                }
             }
             let metadata = store.get(&ObjectKey::new(entry.slug.metadata_key(&trie))?).await?;
             outputs.push((image, metadata, rebuilt.block_metadata()?.0));
