@@ -206,11 +206,11 @@ public final class NativeDatabase extends NativeResource implements AdbcDatabase
     /** Publishes next only when the stored token is the same object as previous, including null. */
     public boolean compareAndSetAwaitToken(String previous, String next) { return awaitToken.compareAndSet(previous, next); }
     public NativeConnection connect(String database) throws AdbcException { return connect(database, 0, "", ""); }
-    public NativeConnection.SubmittedTx submitTx(String database, List<NativeConnection.SqlOperation> operations,
+    public NativeConnection.SubmittedTx submitTx(String database, List<? extends NativeConnection.TxOperation> operations,
                                                  NativeConnection.TxOptions options) throws AdbcException {
         try (var connection = connect(database)) { return connection.submitTx(operations, options); }
     }
-    public NativeConnection.ExecutedTx executeTx(String database, List<NativeConnection.SqlOperation> operations,
+    public NativeConnection.ExecutedTx executeTx(String database, List<? extends NativeConnection.TxOperation> operations,
                                                  NativeConnection.TxOptions options) throws AdbcException {
         try (var connection = connect(database)) { return connection.executeTx(operations, options); }
     }

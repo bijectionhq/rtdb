@@ -52,7 +52,9 @@ SQL transaction-control statements are rejected; use autocommit, commit and roll
 `beginReadOnly()` and `beginWriteOnly()` have overloads for a read basis or write settings.
 `commitSyncResult()` returns the indexed key and abort information, and `commitAsyncResult()` returns the submitted transaction ID.
 Both return null when there is no write transaction to submit.
-`executeTx` and `submitTx` on a connection accept a list of `NativeConnection.SqlOperation` records and optional `TxOptions`.
+`executeTx` and `submitTx` on a connection accept a list of typed transaction operations and optional `TxOptions`.
+Use `SqlOperation` for parameterized SQL or `PutDocuments`, `PatchDocuments`, `DeleteDocuments` and `EraseDocuments` for documents.
+Document maps can use string field names such as `_id` and values supported by the Transit request codec.
 Use `NativeDatabase.executeTx` or `submitTx` to select a database for those operations.
 For transaction operations expressed as Clojure documents or SQL, use `xtdb.api/execute-tx` and `xtdb.api/submit-tx`.
 

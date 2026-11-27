@@ -23,6 +23,7 @@ import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import xtdb.api.TableRef;
 import xtdb.api.error.Incorrect;
 
 final class NativeAdbcTest {
@@ -131,6 +132,32 @@ final class NativeAdbcTest {
                 assertEquals(1L, ((Number) ids.getObject(0)).longValue());
                 assertEquals(3L, ((Number) ids.getObject(1)).longValue());
                 assertFalse(result.getReader().loadNextBatch());
+            }
+        }
+    }
+
+    @Test void runsTypedDocumentOperationsThroughTheNativeTransactionResolver() throws Exception {
+        try (var allocator = new RootAllocator(); var database = open(allocator); var connection = database.connect()) {
+            assertSame(allocator, connection.getAllocator());
+            var table = TableRef.parse("public.documents");
+            var submitted = connection.submitTx(List.of(new NativeConnection.PutDocuments(table, List.of(
+                Map.of("_id", 1L, "payload", "original"), Map.of("_id", 2L, "payload", "to erase")), null, null)), null);
+            var patched = connection.executeTx(List.of(new NativeConnection.PatchDocuments(table,
+                List.of(Map.of("_id", 1L, "payload", "patched")), null, null)), null);
+            assertTrue(patched.committed());
+            assertTrue(patched.txId() > submitted.txId());
+            try (var query = connection.createStatement("SELECT payload FROM documents WHERE _id = 1");
+                 var result = query.executeQuery()) {
+                assertTrue(result.getReader().loadNextBatch());
+                assertEquals("patched", result.getReader().getVectorSchemaRoot().getVector(0).getObject(0).toString());
+            }
+            var removed = connection.executeTx(List.of(
+                new NativeConnection.DeleteDocuments(table, List.of(1L), null, null),
+                new NativeConnection.EraseDocuments(table, List.of(2L))), null);
+            assertTrue(removed.committed());
+            try (var query = connection.createStatement("SELECT COUNT(*) FROM documents"); var result = query.executeQuery()) {
+                assertTrue(result.getReader().loadNextBatch());
+                assertEquals(0L, ((Number) result.getReader().getVectorSchemaRoot().getVector(0).getObject(0)).longValue());
             }
         }
     }

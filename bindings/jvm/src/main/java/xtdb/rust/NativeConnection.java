@@ -28,15 +28,21 @@ import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.Schema;
+import xtdb.api.TableRef;
 
 /** Calls share the native session's transaction state; serialize ordinary connection use. Cancellation is concurrent. */
 public final class NativeConnection extends NativeResource implements AdbcConnection {
     public record SubmittedTx(long txId) implements CommitOutcome {}
     public record ExecutedTx(long txId, Instant systemTime, boolean committed, NativeException error) implements CommitOutcome {}
+    public sealed interface TxOperation permits SqlOperation, PutDocuments, PatchDocuments, DeleteDocuments, EraseDocuments {}
     /** A SQL transaction operation. Null arguments mean unbound SQL and an empty batch executes no rows. */
-    public record SqlOperation(String sql, List<? extends List<?>> argumentRows) {
+    public record SqlOperation(String sql, List<? extends List<?>> argumentRows) implements TxOperation {
         public SqlOperation(String sql) { this(sql, null); }
     }
+    public record PutDocuments(TableRef table, List<? extends Map<?, ?>> documents, Instant validFrom, Instant validTo) implements TxOperation {}
+    public record PatchDocuments(TableRef table, List<? extends Map<?, ?>> documents, Instant validFrom, Instant validTo) implements TxOperation {}
+    public record DeleteDocuments(TableRef table, List<?> ids, Instant validFrom, Instant validTo) implements TxOperation {}
+    public record EraseDocuments(TableRef table, List<?> ids) implements TxOperation {}
     public record TxOptions(ZoneId defaultTimezone, Instant systemTime, Map<?, ?> metadata) {}
     private sealed interface CommitOutcome permits SubmittedTx, ExecutedTx {}
 
@@ -55,6 +61,7 @@ public final class NativeConnection extends NativeResource implements AdbcConnec
     NativeConnection(NativeAbi abi, long handle, BufferAllocator allocator, String catalog) {
         super(abi, handle); this.allocator = allocator; this.catalog = catalog;
     }
+    public BufferAllocator getAllocator() { return allocator; }
     final class Operation implements AutoCloseable {
         private final AtomicLong id;
         Operation(long id) { this.id = new AtomicLong(id); operations.add(this); }
@@ -209,24 +216,18 @@ public final class NativeConnection extends NativeResource implements AdbcConnec
         }
     }
 
-    /** Submits SQL transaction operations to this connection's database without waiting for indexing. */
-    public SubmittedTx submitTx(List<SqlOperation> operations, TxOptions options) throws AdbcException {
+    /** Submits transaction operations to this connection's database without waiting for indexing. */
+    public SubmittedTx submitTx(List<? extends TxOperation> operations, TxOptions options) throws AdbcException {
         return (SubmittedTx) transactResult(operations, options, true);
     }
 
-    /** Executes SQL transaction operations atomically and returns the indexed outcome, including an abort. */
-    public ExecutedTx executeTx(List<SqlOperation> operations, TxOptions options) throws AdbcException {
+    /** Executes transaction operations atomically and returns the indexed outcome, including an abort. */
+    public ExecutedTx executeTx(List<? extends TxOperation> operations, TxOptions options) throws AdbcException {
         return (ExecutedTx) transactResult(operations, options, false);
     }
 
-    private CommitOutcome transactResult(List<SqlOperation> operations, TxOptions options, boolean asynchronous) throws AdbcException {
-        var encodedOperations = operations.stream().map(operation -> {
-            var result = new LinkedHashMap<String, Object>();
-            result.put("op", "sql");
-            result.put("sql", operation.sql());
-            if (operation.argumentRows() != null) result.put("arguments", operation.argumentRows());
-            return result;
-        }).toList();
+    private CommitOutcome transactResult(List<? extends TxOperation> operations, TxOptions options, boolean asynchronous) throws AdbcException {
+        var encodedOperations = operations.stream().map(NativeConnection::encodeOperation).toList();
         var encodedOptions = new LinkedHashMap<String, Object>();
         if (options != null) {
             if (options.defaultTimezone() != null) encodedOptions.put("default_timezone", options.defaultTimezone().getId());
@@ -241,6 +242,30 @@ public final class NativeConnection extends NativeResource implements AdbcConnec
             abi.call("session_transact_result", handle(), operation.id(), input, input.byteSize(), out);
             return decodeCommitResult(out);
         }
+    }
+
+    private static Map<String, Object> encodeOperation(TxOperation operation) {
+        return switch (operation) {
+            case SqlOperation sql -> sql.argumentRows() == null
+                ? Map.of("op", "sql", "sql", sql.sql())
+                : Map.of("op", "sql", "sql", sql.sql(), "arguments", sql.argumentRows());
+            case PutDocuments put -> documentOperation("put-docs", put.table(), "documents", put.documents(), put.validFrom(), put.validTo());
+            case PatchDocuments patch -> documentOperation("patch-docs", patch.table(), "documents", patch.documents(), patch.validFrom(), patch.validTo());
+            case DeleteDocuments delete -> documentOperation("delete-docs", delete.table(), "ids", delete.ids(), delete.validFrom(), delete.validTo());
+            case EraseDocuments erase -> documentOperation("erase-docs", erase.table(), "ids", erase.ids(), null, null);
+        };
+    }
+
+    private static Map<String, Object> documentOperation(String kind, TableRef table, String field, List<?> values,
+                                                         Instant validFrom, Instant validTo) {
+        var operation = new LinkedHashMap<String, Object>();
+        operation.put("op", kind);
+        operation.put("schema", table.getSchemaName());
+        operation.put("table", table.getTableName());
+        operation.put(field, values);
+        if (validFrom != null) operation.put("valid_from", validFrom);
+        if (validTo != null) operation.put("valid_to", validTo);
+        return operation;
     }
     public NativeRows queryLogicalRelation(String plan, byte[] arguments) throws AdbcException {
         Operation operation = operation();
