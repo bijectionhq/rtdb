@@ -567,7 +567,7 @@ impl Context<'_> {
     }
 
     pub(crate) fn query(&mut self, query: &ast::Query) -> Result<Arc<Relation>> {
-        if !query.locks.is_empty() || query.for_clause.is_some() || !query.pipe_operators.is_empty() || query.settings.is_some() { return Err(grammar_rejected("Query locking, an output clause, a pipe or SETTINGS")); }
+        if !query.locks.is_empty() || query.for_clause.is_some() || !query.pipe_operators.is_empty() || query.settings.is_some() || query.format_clause.is_some() { return Err(grammar_rejected("Query locking, an output clause, a pipe, FORMAT or SETTINGS")); }
         let old_ctes = self.ctes.clone();
         let mut bindings = Vec::new();
         if let Some(with) = &query.with {
@@ -575,6 +575,7 @@ impl Context<'_> {
             for cte in &with.cte_tables {
                 if !cte.alias.columns.is_empty() { return Err(unsupported("Column aliases are not supported yet")); }
                 if cte.materialized == Some(ast::CteAsMaterialized::NotMaterialized) { return Err(grammar_rejected("AS NOT MATERIALIZED")); }
+                if cte.from.is_some() { return Err(grammar_rejected("CTE FROM clause")); }
                 let input = self.query(&cte.query)?;
                 let name = identifier(&cte.alias.name).normalized();
                 let symbol = self.symbol(&name)?;

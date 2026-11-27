@@ -154,3 +154,19 @@ fn joins_without_specification_and_global_joins_are_grammar_rejections() {
     prepare("SELECT * FROM docs CROSS JOIN docs AS d2", &Fixture, &PrepareOptions::default()).unwrap();
     prepare("SELECT * FROM docs NATURAL JOIN docs AS d2", &Fixture, &PrepareOptions::default()).unwrap();
 }
+
+#[test]
+fn clickhouse_query_modifiers_cte_without_as_and_bare_from_values_are_rejected() {
+    for sql in [
+        "SELECT 1 FORMAT JSON",
+        "SELECT a FROM docs ORDER BY a WITH FILL STEP 1",
+        "SELECT a FROM docs ORDER BY a INTERPOLATE (a AS 1)",
+        "SELECT ROW_NUMBER() OVER (ORDER BY a WITH FILL) FROM docs",
+        "WITH c (SELECT 1 AS a) SELECT * FROM c",
+        "SELECT * FROM VALUES (1, 2) AS t(x, y)",
+    ] {
+        let error = rejection(sql);
+        assert_eq!((error.category, error.code.as_str()), (AnomalyCategory::Incorrect, "xtdb/sql-error"), "{sql}");
+    }
+    prepare("SELECT * FROM (VALUES (1, 2)) AS t(x, y)", &Fixture, &PrepareOptions::default()).unwrap();
+}
