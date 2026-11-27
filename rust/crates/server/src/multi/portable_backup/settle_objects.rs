@@ -35,12 +35,13 @@ impl Release {
         let proof = Attestation::read(&self.proof)?;
         let objects_sha256 = readback.digest()?;
         let (intent, hold, manifest_sha256) = proof.hosted_hold(objects_sha256)?;
-        if intent.database != DEVELOPMENT_DATABASE || readback.incarnation != intent.candidate()?
+        if readback.incarnation != intent.candidate()?
             || readback.key_hold != Some(hold) || readback.archive_sha256 != digest_hex(&manifest_sha256)
             || !readback.object_holds_verified
         {
             return Err(invalid_release());
         }
+        let database = intent.database.clone();
         let prefix = format!("recovery-custody/{}/{}", hold.authority, readback.incarnation);
         let authorization = ObjectKey::new(format!("{prefix}/authorized"))?;
         let completion = ObjectKey::new(format!("{prefix}/released"))?;
@@ -57,7 +58,7 @@ impl Release {
         let settled = async {
             let store = self.objects.open(&root, &remotes, Arc::clone(&io)).await?;
             if !receipt_exists(store.as_ref(), &authorization, &record).await? {
-                authorize_object_release(&self.authority_socket, DEVELOPMENT_DATABASE, proof, objects_sha256).await?;
+                authorize_object_release(&self.authority_socket, &database, proof, objects_sha256).await?;
                 store.put(&authorization, record.clone()).await?;
                 if !receipt_exists(store.as_ref(), &authorization, &record).await? {
                     return Err(invalid_release());

@@ -5,7 +5,7 @@ pub(super) struct Export {
     archive: PathBuf,
     incarnation: Uuid,
     scope: ActivationScope,
-    source: HostedDestination,
+    source: HostedDatabase,
 }
 
 impl Export {
@@ -14,8 +14,8 @@ impl Export {
         let incarnation = backup_uuid(&backup_field(&mut fields, "--incarnation")?)?;
         let authority = backup_uuid(&backup_field(&mut fields, "--authority-id")?)?;
         let cell = fields.remove("--cell-id").as_deref().map(backup_uuid).transpose()?;
-        let scope = ActivationScope::for_cell(authority, DEVELOPMENT_DATABASE, cell)?;
-        let source = HostedDestination::parse(&mut fields)?;
+        let source = HostedDatabase::parse(&mut fields)?;
+        let scope = ActivationScope::for_cell(authority, &source.name, cell)?;
         if !fields.is_empty() {
             return Err(arguments_error());
         }
@@ -85,7 +85,8 @@ mod tests {
         FileKms::create_directory(&vault).unwrap();
         let keys = Arc::new(FileKms::open(&vault, || SystemClock.now().0).unwrap());
         let (authority, cell, incarnation) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-        let scope = ActivationScope::for_cell(authority, DEVELOPMENT_DATABASE, Some(cell)).unwrap();
+        let name = "hosted-records";
+        let scope = ActivationScope::for_cell(authority, name, Some(cell)).unwrap();
         let node = Ipv4Addr::LOCALHOST.into();
         let mut database = MultiDatabase::new(MultiOptions {
             database: incarnation, node, lease_micros: WRITER_LEASE_MICROS, drift_micros: CLOCK_DRIFT_MICROS,
@@ -133,10 +134,11 @@ mod tests {
         })).unwrap()).unwrap();
         let url = format!("{CONSENSUS_SCHEME}{}", journal_config.display());
         let archive = home.path().join("archive");
-        let command = |authority: Uuid| MultiBackupOptions::parse([
+        let command = |authority: Uuid, name: &str| MultiBackupOptions::parse([
             "export-hosted".to_owned(),
             "--archive".into(), archive.display().to_string(),
             "--incarnation".into(), incarnation.to_string(),
+            "--database".into(), name.to_owned(),
             "--authority-id".into(), authority.to_string(),
             "--cell-id".into(), cell.to_string(),
             "--journal-url".into(), url.clone(),
@@ -147,15 +149,16 @@ mod tests {
             "--s3-endpoint".into(), endpoint.clone(),
         ].into_iter()).unwrap();
         let sync = rtdb_storage::AppleSync::Full;
-        assert_eq!(command(Uuid::new_v4()).run(sync).await.unwrap_err().code, "rtdb/activation-scope");
+        assert_eq!(command(Uuid::new_v4(), name).run(sync).await.unwrap_err().code, "rtdb/activation-scope");
+        assert_eq!(command(authority, "another-database").run(sync).await.unwrap_err().code, "rtdb/activation-scope");
         assert!(!archive.exists());
-        let report = command(authority).run(sync).await.unwrap();
+        let report = command(authority, name).run(sync).await.unwrap();
         let original = PortableBackup::verify(&fs::read(&archive).unwrap(), keys).await.unwrap();
         assert_eq!(report["manifest_sha256"], digest_hex(&original.manifest_sha256()));
         assert_eq!(original.source_basis().incarnation(), *incarnation.as_bytes());
         assert_eq!(original.source_lsn(), head);
         assert_eq!(journal.head(stream).await.unwrap(), head);
-        assert_eq!(command(authority).run(sync).await.unwrap_err().code, "rtdb/backup-exists");
+        assert_eq!(command(authority, name).run(sync).await.unwrap_err().code, "rtdb/backup-exists");
         stop.cancel();
         for task in tasks {
             task.await.unwrap().unwrap();

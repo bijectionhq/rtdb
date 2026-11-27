@@ -15,7 +15,7 @@ pub(super) struct Stage {
     archive: PathBuf,
     source_key_vault: PathBuf,
     operation: Operation,
-    destination: HostedDestination,
+    destination: HostedDatabase,
 }
 
 struct Candidate {
@@ -44,7 +44,7 @@ pub(super) struct StageReceipt {
 impl StageReceipt {
     pub(super) async fn require_pending(&self, authority: &ActivationAuthority, source_lsn: Lsn) -> Result<()> {
         let operation = Operation { predecessor: self.intent.expected, operation_id: self.intent.operation_id };
-        let candidate = Candidate::pending(authority, operation, source_lsn).await?;
+        let candidate = Candidate::pending(authority, &self.intent.database, operation, source_lsn).await?;
         if candidate.intent != self.intent || authority.connection_digest()? != self.key_hold.authority_sha256 {
             return Err(stage_source());
         }
@@ -60,7 +60,7 @@ impl Stage {
         let incarnation = backup_uuid(&backup_field(&mut fields, "--expected-incarnation")?)?;
         let revision = backup_field(&mut fields, "--expected-revision")?.parse::<u64>()
             .ok().filter(|revision| *revision != 0).ok_or_else(arguments_error)?;
-        let destination = HostedDestination::parse(&mut fields)?;
+        let destination = HostedDatabase::parse(&mut fields)?;
         if !fields.is_empty() {
             return Err(arguments_error());
         }
@@ -82,7 +82,7 @@ impl Stage {
         if backup.source_basis().incarnation() != *self.operation.predecessor.incarnation.as_bytes() {
             return Err(stage_source());
         }
-        let candidate = Candidate::pending(authority, self.operation, source_lsn).await?;
+        let candidate = Candidate::pending(authority, &self.destination.name, self.operation, source_lsn).await?;
         let evidence = KeyEvidence {
             generation: 1,
             authority_sha256: authority.connection_digest()?,
@@ -127,7 +127,7 @@ impl Stage {
                 return Err(stage_source());
             }
             keys.require_recovery_key(hold).await?;
-            Candidate::pending(authority, self.operation, source_lsn).await?;
+            Candidate::pending(authority, &self.destination.name, self.operation, source_lsn).await?;
             Ok::<_, Anomaly>(installed)
         }.await;
         io.close_and_wait().await;
@@ -149,9 +149,9 @@ impl Stage {
 }
 
 impl Candidate {
-    async fn pending(authority: &ActivationAuthority, operation: Operation, source_lsn: Lsn) -> Result<Self> {
+    async fn pending(authority: &ActivationAuthority, name: &str, operation: Operation, source_lsn: Lsn) -> Result<Self> {
         let Status::Pending { intent, candidate: incarnation, final_source_lsn, installation: None, .. } =
-            authority.recovery_status(DEVELOPMENT_DATABASE, operation).await?
+            authority.recovery_status(name, operation).await?
         else {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb/backup-stage-intent", "Staging requires a pending recovery before installation is recorded"));
         };
@@ -163,7 +163,7 @@ impl Candidate {
         ))?;
         let intent = Intent {
             authority_id: authority.identity(),
-            database: DEVELOPMENT_DATABASE.to_owned(),
+            database: name.to_owned(),
             expected: operation.predecessor,
             operation_id: operation.operation_id,
             cell: Some(cell),

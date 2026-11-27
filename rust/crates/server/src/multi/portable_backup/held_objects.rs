@@ -90,7 +90,7 @@ pub(super) struct Verifier {
     incarnation: Uuid,
     authority: Uuid,
     scope: ActivationScope,
-    destination: HostedDestination,
+    destination: HostedDatabase,
 }
 
 impl Verifier {
@@ -98,11 +98,11 @@ impl Verifier {
         let archive = backup_field(&mut fields, "--archive")?.into();
         let incarnation = backup_uuid(&backup_field(&mut fields, "--incarnation")?)?;
         let authority = backup_uuid(&backup_field(&mut fields, "--authority-id")?)?;
-        let destination = HostedDestination::parse(&mut fields)?;
+        let destination = HostedDatabase::parse(&mut fields)?;
         let readback = fields.remove("--readback").map(PathBuf::from);
         let stage_receipt = fields.remove("--stage-receipt").map(PathBuf::from);
         let cell = fields.remove("--cell-id").as_deref().map(backup_uuid).transpose()?;
-        let scope = ActivationScope::for_cell(authority, DEVELOPMENT_DATABASE, cell)?;
+        let scope = ActivationScope::for_cell(authority, &destination.name, cell)?;
         if !fields.is_empty() {
             return Err(arguments_error());
         }
@@ -291,6 +291,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "requires a disposable loopback S3 bucket with Object Lock and the AWS CLI"]
     async fn staged_backup_checks_exact_provider_holds_on_its_complete_object_closure() {
+        const DATABASE: &str = "hosted-documents";
         let endpoint = std::env::var("RTDB_BACKUP_HOLD_TEST_ENDPOINT").unwrap();
         let url = url::Url::parse(&endpoint).unwrap();
         assert_eq!(url.host_str(), Some("127.0.0.1"));
@@ -386,7 +387,7 @@ mod tests {
             &authority_url, crate::cli::journal_credentials(&authority_tls).unwrap(), authority,
         ).await.unwrap();
         let activation = ActivationAuthority::new(authority_journal.clone(), authority).unwrap();
-        let predecessor = activation.bootstrap(DEVELOPMENT_DATABASE, source_id).await.unwrap();
+        let predecessor = activation.bootstrap(DATABASE, source_id).await.unwrap();
         let operation_id = Uuid::new_v4();
         let intent = Intent {
             operation: Operation { predecessor, operation_id },
@@ -396,6 +397,7 @@ mod tests {
         let stage = |operation_id: Uuid| {
             let opts = MultiBackupOptions::parse([
                 "stage".into(), "--archive".into(), archive_path.display().to_string(),
+                "--database".into(), DATABASE.into(),
                 "--operation-id".into(), operation_id.to_string(),
                 "--expected-incarnation".into(), source_id.to_string(),
                 "--expected-revision".into(), predecessor.revision.to_string(),
@@ -415,15 +417,15 @@ mod tests {
             ..intent
         };
         let Status::Pending { candidate: unsealed_candidate, .. } =
-            activation.begin_recovery(DEVELOPMENT_DATABASE, unsealed, None).await.unwrap()
+            activation.begin_recovery(DATABASE, unsealed, None).await.unwrap()
         else { panic!("expected a pending lossless recovery"); };
         assert!(stage(lossless_id).await.is_err());
         assert!(matches!(journal.head(StreamId(unsealed_candidate.as_u128())).await, Err(JournalError::NotFound)));
         let Status::Pending { candidate: incarnation, .. } =
-            activation.begin_recovery(DEVELOPMENT_DATABASE, intent, Some(lossless_id)).await.unwrap()
+            activation.begin_recovery(DATABASE, intent, Some(lossless_id)).await.unwrap()
         else { panic!("expected a pending recovery"); };
         let stream = StreamId(incarnation.as_u128());
-        let activation_stream = activation.commissioning_stream_id(DEVELOPMENT_DATABASE).unwrap();
+        let activation_stream = activation.commissioning_stream_id(DATABASE).unwrap();
         let activation_head = authority_journal.head(activation_stream).await.unwrap();
         assert!(stage(Uuid::new_v4()).await.is_err());
         assert!(matches!(journal.head(stream).await, Err(JournalError::NotFound)));
@@ -442,7 +444,7 @@ mod tests {
         assert_eq!(journal.head(stream).await.unwrap(), head);
         assert_eq!(authority_journal.head(activation_stream).await.unwrap(), activation_head);
 
-        let scope = ActivationScope::for_cell(authority, DEVELOPMENT_DATABASE, Some(cell)).unwrap();
+        let scope = ActivationScope::for_cell(authority, DATABASE, Some(cell)).unwrap();
         let mut staged = MultiDatabase::new(options(incarnation), journal.clone(),
             store.clone(), keys, Arc::new(|| SystemClock.now())).unwrap()
             .with_immutable_journal().with_activation_scope(scope).unwrap();
@@ -454,7 +456,7 @@ mod tests {
             Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap().public_key().as_ref().to_vec();
         let proof_path = home.path().join("installation-proof.json");
         let release = || ActivationOptions::parse([
-            "release-recovery-key".into(), DEVELOPMENT_DATABASE.into(),
+            "release-recovery-key".into(), DATABASE.into(),
             "--authority-id".into(), authority.to_string(), "--authority-url".into(), authority_url.clone(),
             "--authority-tls-dir".into(), authority_tls.display().to_string(),
             "--installation-proof".into(), proof_path.display().to_string(),
@@ -477,6 +479,7 @@ mod tests {
         fs::write(&wrong_namespace_path, serde_json::to_vec(&wrong_namespace).unwrap()).unwrap();
         let hosted_options = |operation: &str, readback: Option<&Path>, receipt: &Path, key: Option<&Path>| MultiBackupOptions::parse([
             operation.to_owned(), "--archive".into(), archive_path.display().to_string(),
+            "--database".into(), DATABASE.into(),
             "--incarnation".into(), incarnation.to_string(), "--authority-id".into(), authority.to_string(),
             "--stage-receipt".into(), receipt.display().to_string(),
             "--cell-id".into(), cell.to_string(), "--key-vault".into(), vault.display().to_string(),
@@ -598,7 +601,7 @@ mod tests {
             panic!("broker startup failed: {:?}", broker.await);
         }
         let record = |operation: Uuid, path: &Path| ActivationOptions::parse([
-            "record-install".into(), DEVELOPMENT_DATABASE.into(),
+            "record-install".into(), DATABASE.into(),
             "--authority-socket".into(), socket.display().to_string(),
             "--operation-id".into(), operation.to_string(),
             "--expected-incarnation".into(), predecessor.incarnation.to_string(),
@@ -673,7 +676,7 @@ mod tests {
             operation: Operation { predecessor, operation_id: Uuid::new_v4() },
             ..intent
         };
-        activation.begin_recovery(DEVELOPMENT_DATABASE, replacement_intent, Some(operation_id)).await.unwrap();
+        activation.begin_recovery(DATABASE, replacement_intent, Some(operation_id)).await.unwrap();
         assert!(stage(operation_id).await.is_err());
         assert!(acquire(&receipt_path).await.is_err());
         assert!(attest(&new_readback).await.is_err());
@@ -697,7 +700,7 @@ mod tests {
         assert!(verify(Some(&readback), &receipt_path).await.is_err());
         assert_eq!(journal.head(stream).await.unwrap(), head);
         let operation = replacement_intent.operation;
-        let Status::Pending { candidate, .. } = activation.recovery_status(DEVELOPMENT_DATABASE, operation).await.unwrap()
+        let Status::Pending { candidate, .. } = activation.recovery_status(DATABASE, operation).await.unwrap()
         else { panic!("expected the replacement recovery"); };
         let next_receipt = stage(operation.operation_id).await.unwrap();
         let receipt = home.path().join("serving-stage.json");
@@ -724,12 +727,12 @@ mod tests {
         let recorded = record(operation.operation_id, &serving_proof).await.unwrap();
         let serving_report: Readback = serde_json::from_value(report).unwrap();
         assert_eq!(recorded["installation"]["objects_sha256"], json!(serving_report.digest().unwrap()));
-        let serving_authority = authority_reader.serving_authority_for_cell(DEVELOPMENT_DATABASE, candidate, Some(cell)).unwrap();
+        let serving_authority = authority_reader.serving_authority_for_cell(DATABASE, candidate, Some(cell)).unwrap();
         assert_eq!(serving_authority.acquire().await.unwrap_err().code, "rtdb/activation-fenced");
 
         for action in ["freeze-recovery", "publish-recovery"] {
             ActivationOptions::parse([
-                action.into(), DEVELOPMENT_DATABASE.into(),
+                action.into(), DATABASE.into(),
                 "--authority-socket".into(), socket.display().to_string(),
                 "--expected-incarnation".into(), predecessor.incarnation.to_string(),
                 "--expected-revision".into(), predecessor.revision.to_string(),
@@ -754,7 +757,7 @@ mod tests {
         fs::write(&key_only_proof, serde_json::to_vec(&key_only).unwrap()).unwrap();
         let release_pending = || release_objects(&serving_readback, &serving_proof);
         let release_key = |proof: &Path| ActivationOptions::parse([
-            "release-recovery-key".into(), DEVELOPMENT_DATABASE.into(),
+            "release-recovery-key".into(), DATABASE.into(),
             "--authority-id".into(), authority.to_string(), "--authority-url".into(), authority_url.clone(),
             "--authority-tls-dir".into(), authority_tls.display().to_string(),
             "--installation-proof".into(), proof.display().to_string(),
@@ -766,7 +769,7 @@ mod tests {
         assert_eq!(release_key(&key_only_proof).await.unwrap_err().code, "rtdb/activation-conflict");
         serving_keys.require_recovery_key(held).await.unwrap();
         ActivationOptions::parse([
-            "release-recovery-journal".into(), DEVELOPMENT_DATABASE.into(),
+            "release-recovery-journal".into(), DATABASE.into(),
             "--authority-id".into(), authority.to_string(), "--authority-url".into(), authority_url.clone(),
             "--authority-tls-dir".into(), authority_tls.display().to_string(),
             "--installation-proof".into(), serving_proof.display().to_string(),

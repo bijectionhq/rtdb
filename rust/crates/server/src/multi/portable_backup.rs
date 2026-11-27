@@ -19,17 +19,21 @@ Usage: rtdb multi-backup export --data DIR --archive FILE [--journal-url URL --t
        rtdb multi-backup restore --data DIR --archive FILE --incarnation UUID --source-key-vault DIR
                                  [--journal-url URL --tls-dir DIR] [--immutable-streams] [--authority-id UUID [--cell-id UUID]]
        rtdb multi-backup export-hosted --archive FILE --incarnation UUID --authority-id UUID [--cell-id UUID]
+                    [--database NAME]
                     --journal-url URL --tls-dir DIR --key-vault DIR --bucket BUCKET [--region REGION] [--s3-endpoint URL]
        rtdb multi-backup stage --archive FILE --source-key-vault DIR --operation-id UUID
-                    --expected-incarnation UUID --expected-revision REVISION
+                    --expected-incarnation UUID --expected-revision REVISION [--database NAME]
                     --journal-url URL --tls-dir DIR --key-vault DIR --bucket BUCKET [--region REGION] [--s3-endpoint URL]
        rtdb multi-backup verify-object-holds --archive FILE --incarnation UUID --authority-id UUID [--cell-id UUID]
+                    [--database NAME]
                     --journal-url URL --tls-dir DIR --key-vault DIR --bucket BUCKET [--region REGION] [--s3-endpoint URL]
                     [--readback FILE] [--stage-receipt FILE]
        rtdb multi-backup acquire-object-holds --archive FILE --incarnation UUID --authority-id UUID --cell-id UUID
+                    [--database NAME]
                     --journal-url URL --tls-dir DIR --key-vault DIR --bucket BUCKET [--region REGION] [--s3-endpoint URL]
                     --stage-receipt FILE
        rtdb multi-backup attest --archive FILE --incarnation UUID --authority-id UUID --cell-id UUID
+                    [--database NAME]
                     --journal-url URL --tls-dir DIR --key-vault DIR --bucket BUCKET [--region REGION] [--s3-endpoint URL]
                     --readback FILE --stage-receipt FILE --attestation-signing-key PKCS8 --journal-custodian-tls-dir DIR
        rtdb multi-backup release-object-holds --readback FILE --installation-proof FILE --authority-socket PATH
@@ -177,7 +181,8 @@ impl MultiBackupOptions {
 
 #[cfg(feature = "backup-object-holds")]
 #[derive(Clone, Debug)]
-struct HostedDestination {
+struct HostedDatabase {
+    name: String,
     journal_url: String,
     journal_tls: PathBuf,
     key_vault: PathBuf,
@@ -185,16 +190,17 @@ struct HostedDestination {
 }
 
 #[cfg(feature = "backup-object-holds")]
-impl HostedDestination {
+impl HostedDatabase {
     fn parse(fields: &mut BTreeMap<String, String>) -> Result<Self> {
+        let name = fields.remove("--database").unwrap_or_else(|| DEVELOPMENT_DATABASE.to_owned());
         let journal_url = backup_field(fields, "--journal-url")?;
-        if !journal_url.starts_with(CONSENSUS_SCHEME) {
+        if name.is_empty() || !journal_url.starts_with(CONSENSUS_SCHEME) {
             return Err(arguments_error());
         }
         let journal_tls = backup_field(fields, "--tls-dir")?.into();
         let key_vault = backup_field(fields, "--key-vault")?.into();
         let objects = hosted_s3(fields)?;
-        Ok(Self { journal_url, journal_tls, key_vault, objects })
+        Ok(Self { name, journal_url, journal_tls, key_vault, objects })
     }
 }
 

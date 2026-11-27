@@ -480,6 +480,8 @@ rtdb multi-backup export-hosted --archive "$ARCHIVE" --incarnation "$PREDECESSOR
 ```
 
 For a source commissioned in a cell, also pass its original `--cell-id`.
+Use `--database NAME` on hosted export, staging, object hold and attestation commands to select a commissioned name other than `xtdb`.
+The object release command reads that name from the signed installation proof.
 
 `rtdb multi-backup export` captures a settled cut from a stopped, initialized development deployment, using its journal and object store to verify the current checkpoint dependencies.
 An immutable export takes the existing local journal lock and replays a quorum-confirmed head directly from the application stream using reader credentials.
