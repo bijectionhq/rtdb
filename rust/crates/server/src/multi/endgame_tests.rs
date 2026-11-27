@@ -98,7 +98,7 @@ fn transaction(key: u8) -> Transact {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn portable_cut_replaces_a_lost_cell_and_fences_its_return() {
     let (mut authority_keepers, control_journal) = journal().await;
-    let authority = ActivationAuthority::new(control_journal, Uuid::new_v4()).unwrap();
+    let authority = ActivationAuthority::new(control_journal.clone(), Uuid::new_v4()).unwrap();
     let activation_scope = ActivationScope::new(authority.identity(), NAME).unwrap();
     let predecessor_id = Uuid::new_v4();
     let predecessor_binding = authority.bootstrap(NAME, predecessor_id).await.unwrap();
@@ -259,6 +259,23 @@ async fn portable_cut_replaces_a_lost_cell_and_fences_its_return() {
     let binding = authority.binding(NAME).await.unwrap();
     assert_eq!(binding.incarnation, successor_id);
     assert_eq!(binding.revision, predecessor_binding.revision + 1);
+    let control_stream = authority.commissioning_stream_id(NAME).unwrap();
+    let control_head = control_journal.head(control_stream).await.unwrap();
+    assert!(control_head.0 > 1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let page = control_journal
+                .read_page(control_stream, control_head, control_head, 1, Duration::ZERO)
+                .await
+                .unwrap();
+            if page.floor == control_head {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("publication keeps just its verified authority checkpoint");
     #[cfg(not(unix))]
     assert_eq!(
         authority

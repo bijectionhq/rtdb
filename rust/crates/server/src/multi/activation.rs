@@ -7,7 +7,8 @@ use std::{
 
 use bytes::Bytes;
 use journal_contract::{
-    BoxFuture, Epoch, Identity, Journal, JournalError, Lsn, StreamId, WriterFence, WriterSessionId,
+    BoxFuture, CheckpointAnchor, Epoch, Identity, Journal, JournalError, Lsn, StreamId, WriterFence,
+    WriterSessionId,
     reference::{FileJournal, Limits},
 };
 use rtdb_db::{ServingAuthority, ServingPermit};
@@ -563,6 +564,11 @@ impl ActivationAuthority {
                 .map(Bytes::from)
                 .map_err(|_| corrupt())?;
             let at = Lsn(head.0.checked_add(1).ok_or_else(unavailable)?);
+            let anchor = CheckpointAnchor {
+                announced_at: at,
+                covered_through: head,
+                record_sha256: Sha256::digest(&bytes).into(),
+            };
             let append = match fence {
                 Fence::Local(epoch) => self.journal.append(stream, epoch, at, bytes).await,
                 Fence::Immutable(fence) => {
@@ -576,7 +582,9 @@ impl ActivationAuthority {
                     if head != Lsn(0) {
                         let _ = match fence {
                             Fence::Local(epoch) => self.journal.trim(stream, epoch, head).await,
-                            Fence::Immutable(fence) => self.journal.trim_session(fence, head).await,
+                            Fence::Immutable(fence) => {
+                                self.journal.trim_checkpoint(fence, anchor).await
+                            }
                         };
                     }
                     return Ok(state);
