@@ -4,13 +4,14 @@ use crate::string::StringFunction;
 use crate::temporal_functions::TemporalFunction;
 use super::*;
 use super::computed::Output;
-use rtdb_types::NumericCell;
+use rtdb_types::{NumericCell, ScalarType, decimal_arrow::DecimalParameters};
+use crate::decimal::ScalarDecimal;
 
 pub(super) struct Continuation<'a> { ty: LogicalType, payload: Pending<'a,Output<'a>> }
 impl<'a> Continuation<'a> {
     pub(super) fn is_null(&self) -> bool { self.ty == LogicalType::Null }
     pub(super) fn is_list(&self) -> bool { matches!(self.ty, LogicalType::List { kind: ListKind::List | ListKind::Set | ListKind::FixedSizeList(_), .. }) }
-    pub(super) async fn demand(self) -> Result<EvalValue<'a>> { self.demand_output().await.map(Output::into_value) }
+    pub(super) async fn demand(self) -> Result<EvalValue<'a>> { self.demand_output().await?.into_value() }
     pub(super) async fn demand_output(self) -> Result<Output<'a>> { self.payload.await }
 }
 fn deferred<'a>(ty: LogicalType,payload: impl Future<Output=Result<EvalValue<'a>>> + Send + 'a,frame: &EvaluationFrame<'_>) -> Result<Continuation<'a>> {
@@ -26,6 +27,10 @@ fn ready_output<'a>(value: Output<'a>, frame: &EvaluationFrame<'_>) -> Result<Co
             frame.context.reserve(4096 + number_value_bytes(number) * 8)?;
             let ty = number.scalar_type().map_or(LogicalType::Null, LogicalType::Scalar);
             deferred_output(ty, async move { Ok(Output::Number(number)) }, frame)
+        }
+        Output::Decimal(decimal) => {
+            let ty = LogicalType::Scalar(decimal.scalar_type());
+            deferred_output(ty, async move { Ok(Output::Decimal(decimal)) }, frame)
         }
     }
 }
@@ -179,8 +184,8 @@ fn prepare_inner<'a>(expr: &'a Expr,ty: LogicalType,frame: &'a EvaluationFrame<'
                 prepare(otherwise,frame)?.await
             }
             Expr::Between { operand,low,high,symmetric } => {
-                let operand = prepare(operand,frame)?.await?.demand().await?;
-                if is_null(&operand) { return nil(frame); }
+                let operand = prepare(operand,frame)?.await?.demand_output().await?;
+                if operand.is_null() { return nil(frame); }
                 let nullable = emitted_type(low,frame)?.nullable() || emitted_type(high,frame)?.nullable();
                 let payload = async move {
                     let forward = between_bounds(&operand,low,high,frame).await?;
@@ -191,17 +196,15 @@ fn prepare_inner<'a>(expr: &'a Expr,ty: LogicalType,frame: &'a EvaluationFrame<'
                 if nullable { ready(payload.await?,frame) } else { deferred(ty,payload,frame) }
             }
             Expr::SimpleCase { operand,branches,otherwise } => {
-                let operand = prepare(operand,frame)?.await?.demand().await?;
-                if is_null(&operand) { return prepare(otherwise,frame)?.await; }
+                let operand = prepare(operand,frame)?.await?.demand_output().await?;
+                if operand.is_null() { return prepare(otherwise,frame)?.await; }
                 for (candidate,result) in branches {
                     let selected = prepare(candidate,frame)?.await?;
                     if selected.is_null() { continue; }
-                    let mut right = selected.demand().await?;
-                    let mut left = clone_value(&operand,frame)?;
-                    if let (EvalValue::Scalar(left),EvalValue::Scalar(right)) = (&mut left,&mut right) {
-                        super::super::coerce_comparison_literals(false,matches!(candidate,Expr::Literal(Value::Utf8(_))),left,right,frame.context.timezone)?;
+                    let right = selected.demand_output().await?;
+                    if computed::equal(&operand, right, false, matches!(candidate, Expr::Literal(Value::Utf8(_))), frame).await? == Some(true) {
+                        return prepare(result,frame)?.await;
                     }
-                    if compare::equal(left,right,false,frame)?.await? == Some(true) { return prepare(result,frame)?.await; }
                 }
                 prepare(otherwise,frame)?.await
             }
@@ -212,15 +215,7 @@ fn prepare_inner<'a>(expr: &'a Expr,ty: LogicalType,frame: &'a EvaluationFrame<'
                 if input.is_null() { return nil(frame); }
                 deferred_output(ty,async move {
                     let input = input.demand_output().await?;
-                    if let (Some(target_type), Some(number)) = (crate::list_cast::scalar_target(target), input.number())
-                        && let Some(source) = number.scalar_type()
-                    {
-                        frame.context.reserve(4096 + number_value_bytes(number) * 8)?;
-                        target.validate_source(&LogicalType::Scalar(source.clone()))?;
-                        frame.context.reserve(4096 + number_value_bytes(number) * 64)?;
-                        return crate::list_cast::cast_number(number, &source, target_type).map(Output::Number);
-                    }
-                    cast_value(input.into_value(),Target::Cast(target),frame)?.await.map(Output::Value)
+                    cast_output(input, target, frame).await
                 },frame)
             }
             Expr::Unary { op,expr: input } => {
@@ -232,17 +227,18 @@ fn prepare_inner<'a>(expr: &'a Expr,ty: LogicalType,frame: &'a EvaluationFrame<'
                 if input.is_null() { return nil(frame); }
                 deferred_output(ty,async move {
                     let input = input.demand_output().await?;
+                    if *op == UnaryOp::Negate && input.is_decimal() {
+                        return Ok(Output::Decimal(input.into_decimal(frame)?.negate()));
+                    }
                     if *op == UnaryOp::Negate && let Some(number) = input.number() {
                         if number == NumericCell::Null { return Ok(Output::Number(number)); }
                         let ty = number.scalar_type().expect("present number");
                         if let Some(integer) = number.integer() {
                             return crate::numeric::integer_cell(integer.checked_neg().ok_or_else(overflow)?, &ty).map(Output::Number);
                         }
-                        if !matches!(number, NumericCell::Decimal(..)) {
-                            return Ok(Output::Number(computed::floating(-number.as_f64().unwrap(), &ty)));
-                        }
+                        return Ok(Output::Number(computed::floating(-number.as_f64().unwrap(), &ty)));
                     }
-                    let input = materialize(input.into_value(),frame)?.await?;
+                    let input = materialize(input.into_value()?,frame)?.await?;
                     from_value(super::super::unary_value(*op,input)?,frame).map(Output::Value)
                 },frame)
             }
@@ -283,10 +279,12 @@ fn prepare_inner<'a>(expr: &'a Expr,ty: LogicalType,frame: &'a EvaluationFrame<'
                     }, frame);
                 }
                 deferred(ty,async move {
-                    let mut left = if left.is_null() { scalar(Value::Null) } else { left.demand().await? };
-                    let mut right = if right.is_null() { scalar(Value::Null) } else { right.demand().await? };
-                    if matches!(op,BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq) { calls::literal_coercion(left_expr,right_expr,&mut left,&mut right,frame)?; }
-                    calls::binary_values(*op,left,right,frame)?.await
+                    let left = left.demand_output().await?;
+                    let right = right.demand_output().await?;
+                    if matches!(op, BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq | BinaryOp::IsDistinctFrom | BinaryOp::IsNotDistinctFrom) {
+                        return computed::predicate(*op, left, right, Some(left_expr), right_expr, frame).await;
+                    }
+                    calls::binary_values(*op, left.into_value()?, right.into_value()?, frame)?.await
                 },frame)
             }
             Expr::Call { name, args, .. } => {
@@ -359,18 +357,68 @@ fn prepare_inner<'a>(expr: &'a Expr,ty: LogicalType,frame: &'a EvaluationFrame<'
     },frame)
 }
 
-async fn between_bound<'a>(operand: &EvalValue<'a>,bound: &'a Expr,op: BinaryOp,frame: &'a EvaluationFrame<'a>) -> Result<Option<bool>> {
+async fn cast_output<'a>(input: Output<'a>, target: &'a CastTarget, frame: &'a EvaluationFrame<'a>) -> Result<Output<'a>> {
+    use crate::list_cast::{Target as NumberTarget, scalar_target};
+    if let Output::Decimal(decimal) = input {
+        let source = LogicalType::Scalar(decimal.scalar_type());
+        target.validate_source(&source)?;
+        let output = target.result_type(&source);
+        return match plain_type(&output) {
+            LogicalType::Scalar(ScalarType::Utf8) => decimal.text(frame.context).map(|text| Output::Value(scalar(text))),
+            LogicalType::Scalar(ScalarType::Decimal { precision, scale, bit_width }) => {
+                let params = DecimalParameters { precision: *precision, scale: *scale, bit_width: *bit_width };
+                if matches!(scalar_target(target), Some(NumberTarget::DefaultDecimal)) { return Ok(Output::Decimal(decimal)); }
+                decimal.rescale(params, bigdecimal::RoundingMode::HalfEven, frame.context).map(Output::Decimal)
+            }
+            LogicalType::Scalar(ty @ (ScalarType::F16 | ScalarType::F32 | ScalarType::F64)) => {
+                Ok(Output::Number(computed::floating(decimal.as_f64(frame.context)?, ty)))
+            }
+            LogicalType::Scalar(ty @ (ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64
+                | ScalarType::U8 | ScalarType::U16 | ScalarType::U32 | ScalarType::U64)) => {
+                let integer = crate::cast::decimal_integer(decimal.as_f64(frame.context)?)?;
+                crate::numeric::integer_cell(integer, ty).map(Output::Number)
+            }
+            _ => cast_value(Output::Decimal(decimal).into_value()?, Target::Cast(target), frame)?.await.map(Output::Value),
+        };
+    }
+    if let Some(target_type) = scalar_target(target) {
+        let decimal = match target_type {
+            NumberTarget::Scalar(ScalarType::Decimal { precision, scale, bit_width }) => {
+                Some(DecimalParameters { precision: *precision, scale: *scale, bit_width: *bit_width })
+            }
+            NumberTarget::DefaultDecimal if !input.is_decimal() => Some(DecimalParameters { precision: 64, scale: 9, bit_width: 256 }),
+            _ => None,
+        };
+        if let Some(number) = input.number() && let Some(source) = number.scalar_type() {
+            frame.context.reserve(4096 + number_value_bytes(number) * 8)?;
+            target.validate_source(&LogicalType::Scalar(source.clone()))?;
+            if let Some(params) = decimal
+                && !matches!(target_type, NumberTarget::Scalar(ty) if *ty == source)
+            {
+                return ScalarDecimal::from_number(number, params, frame.context).map(Output::Decimal);
+            }
+            frame.context.reserve(4096 + number_value_bytes(number) * 64)?;
+            return crate::list_cast::cast_number(number, &source, target_type).map(Output::Number);
+        }
+        if let (Some(params), Output::Value(EvalValue::Scalar(Value::Utf8(text)))) = (decimal, &input) {
+            target.validate_source(&LogicalType::Scalar(ScalarType::Utf8))?;
+            return ScalarDecimal::from_text(text, params, frame.context).map(Output::Decimal);
+        }
+    }
+    cast_value(input.into_value()?, Target::Cast(target), frame)?.await.map(Output::Value)
+}
+
+async fn between_bound<'a>(operand: &Output<'a>,bound: &'a Expr,op: BinaryOp,frame: &'a EvaluationFrame<'a>) -> Result<Option<bool>> {
     let bound_expr = bound;
     let bound = prepare(bound,frame)?.await?;
     if bound.is_null() { return Ok(None); }
-    let mut right = bound.demand().await?;
-    let mut left = clone_value(operand,frame)?;
-    if let (EvalValue::Scalar(left),EvalValue::Scalar(right)) = (&mut left,&mut right) {
-        super::super::coerce_comparison_literals(false,matches!(bound_expr,Expr::Literal(Value::Utf8(_))),left,right,frame.context.timezone)?;
-    }
+    let right = bound.demand_output().await?;
+    if let Some(result) = computed::decimal_predicate(op, operand, &right, frame)? { return Ok(result); }
+    let (mut left, mut right) = (operand.clone_narrow(frame)?, right.into_value()?);
+    calls::literal_coercion(None, bound_expr, &mut left, &mut right, frame)?;
     Ok(payload_truth(&calls::binary_values(op,left,right,frame)?.await?))
 }
-async fn between_bounds<'a>(operand: &EvalValue<'a>,low: &'a Expr,high: &'a Expr,frame: &'a EvaluationFrame<'a>) -> Result<Option<bool>> {
+async fn between_bounds<'a>(operand: &Output<'a>,low: &'a Expr,high: &'a Expr,frame: &'a EvaluationFrame<'a>) -> Result<Option<bool>> {
     let lower = between_bound(operand,low,BinaryOp::GtEq,frame).await?;
     if lower == Some(false) { return Ok(Some(false)); }
     let upper = between_bound(operand,high,BinaryOp::LtEq,frame).await?;
@@ -389,17 +437,13 @@ fn coalesce<'a>(args: &'a [Expr],frame: &'a EvaluationFrame<'a>) -> Result<Pendi
 }
 fn nullif<'a>(args: &'a [Expr],frame: &'a EvaluationFrame<'a>) -> Result<Pending<'a,Continuation<'a>>> {
     boxed(async move {
-        let left = prepare(&args[0],frame)?.await?.demand().await?;
-        if is_null(&left) { return ready(left,frame); }
+        let left = prepare(&args[0],frame)?.await?.demand_output().await?;
+        if left.is_null() { return ready_output(left,frame); }
         let right = prepare(&args[1],frame)?.await?;
-        if right.is_null() { return ready(left,frame); }
-        let mut right = right.demand().await?;
-        let mut left = left;
-        if let (EvalValue::Scalar(left),EvalValue::Scalar(right)) = (&mut left,&mut right) {
-            super::super::coerce_comparison_literals(false,matches!(&args[1],Expr::Literal(Value::Utf8(_))),left,right,frame.context.timezone)?;
-        }
-        let equal = compare::equal(clone_value(&left,frame)?,right,false,frame)?.await?;
-        ready(if equal == Some(true) { scalar(Value::Null) } else { left },frame)
+        if right.is_null() { return ready_output(left,frame); }
+        let right = right.demand_output().await?;
+        let equal = computed::equal(&left, right, false, matches!(&args[1], Expr::Literal(Value::Utf8(_))), frame).await?;
+        if equal == Some(true) { nil(frame) } else { ready_output(left, frame) }
     },frame)
 }
 fn greatest<'a>(greatest: bool,args: &'a [Expr],frame: &'a EvaluationFrame<'a>) -> Result<Pending<'a,Continuation<'a>>> {
@@ -408,16 +452,16 @@ fn greatest<'a>(greatest: bool,args: &'a [Expr],frame: &'a EvaluationFrame<'a>) 
         if args.len() == 1 { return prepare(first,frame)?.await; }
         let first = prepare(first,frame)?.await?;
         if first.is_null() { return nil(frame); }
-        let mut best = first.demand().await?;
+        let mut best = first.demand_output().await?;
         for expr in &args[1..] {
             let next = prepare(expr,frame)?.await?;
             if next.is_null() { return nil(frame); }
-            let next = next.demand().await?;
-            let unordered = [&best,&next].iter().any(|value| matches!(value,EvalValue::Scalar(value) if crate::numeric::number(value).is_some_and(f64::is_nan)));
-            let ordering = if unordered { std::cmp::Ordering::Equal } else { compare::order(clone_value(&best,frame)?,clone_value(&next,frame)?,frame)?.await? };
+            let next = next.demand_output().await?;
+            let unordered = [best.number(), next.number()].into_iter().flatten().any(|number| number.as_f64().is_some_and(f64::is_nan));
+            let ordering = if unordered { std::cmp::Ordering::Equal } else { computed::order(&best, &next, frame).await? };
             if ordering != if greatest { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less } { best = next; }
         }
-        ready(best,frame)
+        ready_output(best,frame)
     },frame)
 }
 fn payload_truth(value: &EvalValue<'_>) -> Option<bool> {
@@ -536,6 +580,79 @@ fn call<'a>(function: ResolvedFunction<'a>, args: &'a [Expr], ty: LogicalType, f
         if function == ResolvedFunction::Known(ScalarFunction::StrictEq) && arguments.iter().all(Continuation::is_null) {
             return ready(scalar(Value::Bool(true)), frame);
         }
+        if let ResolvedFunction::Known(func @ (ScalarFunction::NullEq | ScalarFunction::StrictEq | ScalarFunction::DistinctFrom
+            | ScalarFunction::Compare | ScalarFunction::CompareNullsFirst | ScalarFunction::CompareNullsLast | ScalarFunction::Mod)) = function
+            && arguments.len() == 2
+        {
+            let right = arguments.pop().unwrap();
+            let left = arguments.pop().unwrap();
+            return deferred_output(ty, async move {
+                let left = left.demand_output().await?;
+                let right = right.demand_output().await?;
+                if func == ScalarFunction::Mod {
+                    return computed::arithmetic(BinaryOp::Modulo, left, right, frame).await;
+                }
+                if left.has_wide_decimal() || right.has_wide_decimal() {
+                    let value = match func {
+                        ScalarFunction::NullEq | ScalarFunction::StrictEq | ScalarFunction::DistinctFrom => {
+                            let equal = computed::equal(&left, right, func == ScalarFunction::StrictEq, false, frame).await? == Some(true);
+                            Value::Bool(if func == ScalarFunction::DistinctFrom { !equal } else { equal })
+                        }
+                        _ => {
+                            let comparator_input = |input: Output<'a>| match input {
+                                Output::Decimal(decimal) => decimal.as_f64(frame.context).map(Value::F64),
+                                input => input.into_value().and_then(|value| match value {
+                                    EvalValue::Scalar(value) => Ok(value),
+                                    _ => Err(invalid("compare")),
+                                }),
+                            };
+                            let left = comparator_input(left)?;
+                            let right = comparator_input(right)?;
+                            Value::I32(crate::ordered::scalar_compare(
+                                &left, &right, func == ScalarFunction::CompareNullsFirst, frame.context.timezone,
+                            )?)
+                        }
+                    };
+                    return Ok(Output::Value(scalar(value)));
+                }
+                frame.context.reserve(2 * std::mem::size_of::<EvalValue<'_>>())?;
+                calls::apply(function, vec![left.into_value()?, right.into_value()?], frame)?.await.map(Output::Value)
+            }, frame);
+        }
+        let round_with_scale = function == ResolvedFunction::Known(ScalarFunction::Round) && arguments.len() == 2;
+        let precision = arguments.first().and_then(|arg| match &arg.ty {
+            LogicalType::Scalar(ScalarType::Decimal { precision, .. }) => Some(*precision),
+            LogicalType::Scalar(ScalarType::I32) if round_with_scale => Some(10),
+            LogicalType::Scalar(ScalarType::I64) if round_with_scale => Some(19),
+            _ => None,
+        });
+        if let ResolvedFunction::Known(func @ (ScalarFunction::Abs | ScalarFunction::Round | ScalarFunction::Floor | ScalarFunction::Ceil | ScalarFunction::Ceiling)) = function
+            && let Some(precision) = precision
+        {
+            let explicit_scale = if arguments.len() == 2 { arguments.pop() } else { None };
+            let input = arguments.pop().expect("validated decimal argument");
+            return deferred_output(ty, async move {
+                let decimal = input.demand_output().await?.into_decimal(frame)?;
+                return match func {
+                    ScalarFunction::Abs => Ok(Output::Decimal(decimal.abs())),
+                    ScalarFunction::Round => {
+                        let scale = match explicit_scale {
+                            Some(scale) => {
+                                let scale = scale.demand().await?;
+                                integer(scalar_ref(&scale)?).and_then(|value| i32::try_from(value).ok()).ok_or_else(overflow)?
+                            }
+                            None => 0,
+                        };
+                        let params = DecimalParameters { scale, precision, ..decimal.params };
+                        decimal.rescale(params, bigdecimal::RoundingMode::HalfUp, frame.context).map(Output::Decimal)
+                    }
+                    _ => {
+                        let number = decimal.as_f64(frame.context)?;
+                        Ok(Output::Number(NumericCell::F64(if func == ScalarFunction::Floor { number.floor() } else { number.ceil() })))
+                    }
+                };
+            }, frame);
+        }
         if matches!(function, ResolvedFunction::Known(ScalarFunction::ColDescription | ScalarFunction::PgIndexamHasProperty))
             || matches!(function, ResolvedFunction::Known(ScalarFunction::FormatType | ScalarFunction::String(StringFunction::StringToArray))) && arguments.first().is_some_and(Continuation::is_null)
         {
@@ -567,20 +684,20 @@ fn call<'a>(function: ResolvedFunction<'a>, args: &'a [Expr], ty: LogicalType, f
                 let count = 1 + usize::from(right.is_some());
                 frame.context.reserve(count * std::mem::size_of::<EvalValue<'_>>())?;
                 let numbers = [left.number(), right.as_ref().and_then(Output::number)];
-                let types = numbers.map(|number| number.and_then(NumericCell::scalar_type).map(LogicalType::Scalar));
+                let types = [left.scalar_type(), right.as_ref().and_then(Output::scalar_type)].map(|ty| ty.map(LogicalType::Scalar));
                 if types[..count].iter().all(Option::is_some) {
                     frame.context.reserve(count * std::mem::size_of::<Value>())?;
                     let bytes = numbers[..count].iter().flatten().copied().map(number_value_bytes).sum::<usize>();
                     frame.context.reserve((bytes + 256) * 16)?;
                     let types = types.map(|ty| ty.unwrap_or(LogicalType::Null));
                     rtdb_plan::function_type(math.canonical_name(), &types[..count])?;
-                    let x = numbers[0].and_then(NumericCell::as_f64).unwrap();
-                    let y = numbers[1].and_then(NumericCell::as_f64);
+                    let x = left.as_f64(frame)?.expect("numeric argument");
+                    let y = match &right { Some(right) => right.as_f64(frame)?, None => None };
                     return math.apply(x, y).map(|value| Output::Number(NumericCell::F64(value)));
                 }
                 let mut values = Vec::with_capacity(count);
-                values.push(left.into_value());
-                if let Some(right) = right { values.push(right.into_value()); }
+                values.push(left.into_value()?);
+                if let Some(right) = right { values.push(right.into_value()?); }
                 calls::apply(function, values, frame)?.await.map(Output::Value)
             }, frame);
         }
@@ -591,7 +708,19 @@ fn call<'a>(function: ResolvedFunction<'a>, args: &'a [Expr], ty: LogicalType, f
         let payload = async move {
             frame.context.reserve(arguments.len().checked_mul(std::mem::size_of::<EvalValue<'_>>()).ok_or_else(overflow)?)?;
             let mut values = Vec::with_capacity(arguments.len());
-            for argument in arguments { values.push(if argument.is_null() && !demand_null { scalar(Value::Null) } else { argument.demand().await? }); }
+            for (index, argument) in arguments.into_iter().enumerate() {
+                if argument.is_null() && !demand_null {
+                    values.push(scalar(Value::Null));
+                    continue;
+                }
+                let output = argument.demand_output().await?;
+                let renders_text = function == ResolvedFunction::Known(ScalarFunction::String(StringFunction::Str))
+                    || (index > 0 && function == ResolvedFunction::Known(ScalarFunction::String(StringFunction::Format)));
+                values.push(match output {
+                    Output::Decimal(decimal) if renders_text => scalar(decimal.text(frame.context)?),
+                    other => other.into_value()?,
+                });
+            }
             calls::apply(function, values, frame)?.await
         };
         if selects_element { ready(payload.await?, frame) } else { deferred(ty, payload, frame) }

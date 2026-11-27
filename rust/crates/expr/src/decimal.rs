@@ -2,10 +2,155 @@ use bigdecimal::{BigDecimal, RoundingMode};
 use num_bigint::{BigInt, Sign};
 use num_traits::{Signed, Zero};
 use rtdb_plan::BinaryOp;
-use rtdb_types::{Anomaly, DecimalValue, NumericCell, Result, decimal_arrow::DecimalParameters};
+use rtdb_types::{Anomaly, DecimalValue, NumericCell, Result, ScalarType, Value, decimal_arrow::DecimalParameters};
 use std::cmp::Ordering;
 use std::str::FromStr;
 use crate::numeric::{division_by_zero, inapplicable, overflow};
+
+const MAX_SCALAR_DIGITS: usize = 4096;
+
+pub(crate) struct ScalarDecimal {
+    coefficient: BigInt,
+    scale: i32,
+    pub(crate) params: DecimalParameters,
+}
+
+impl ScalarDecimal {
+    pub(crate) fn from_cell(bytes: [u8; 32], params: DecimalParameters) -> Self {
+        Self { coefficient: BigInt::from_signed_bytes_be(&bytes), scale: params.scale, params }
+    }
+
+    pub(crate) fn from_integer(integer: i128) -> Self {
+        Self {
+            coefficient: BigInt::from(integer),
+            scale: 0,
+            params: DecimalParameters { precision: 32, scale: 0, bit_width: 128 },
+        }
+    }
+
+    pub(crate) fn from_number(number: NumericCell, params: DecimalParameters, context: &crate::EvalContext<'_>) -> Result<Self> {
+        context.reserve(4096)?;
+        let value = match number {
+            NumericCell::Decimal(bytes, source) => Self::from_cell(bytes, source),
+            number => {
+                let (coefficient, scale) = if let Some(integer) = number.integer() {
+                    (BigInt::from(integer), 0)
+                } else {
+                    let (coefficient, scale) = BigDecimal::from_str(&number.as_f64().ok_or_else(overflow)?.to_string())
+                        .map_err(|_| overflow())?.into_bigint_and_scale();
+                    (coefficient, i32::try_from(scale).map_err(|_| overflow())?)
+                };
+                Self { coefficient, scale, params }
+            }
+        };
+        value.rescale(params, RoundingMode::HalfEven, context)
+    }
+
+    pub(crate) fn from_text(text: &str, params: DecimalParameters, context: &crate::EvalContext<'_>) -> Result<Self> {
+        context.reserve(text.len().checked_mul(4).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?)?;
+        let spelling = rtdb_types::decimal_spelling(text).map_err(|_| {
+            rtdb_types::function_type_mismatch("decimal", &[rtdb_types::LogicalType::Scalar(ScalarType::Utf8)])
+        })?;
+        let mantissa = spelling.ascii().split(['e', 'E']).next().unwrap();
+        let significant = mantissa.bytes().filter(u8::is_ascii_digit).skip_while(|&byte| byte == b'0');
+        let count = significant.clone().count();
+        if count > MAX_SCALAR_DIGITS { return Err(overflow()); }
+        reserve_work(context, count)?;
+        let coefficient = if count == 0 { BigInt::zero() } else {
+            let digits = significant.collect::<Vec<_>>();
+            let coefficient = BigInt::parse_bytes(&digits, 10).expect("validated decimal digits");
+            if mantissa.starts_with('-') { -coefficient } else { coefficient }
+        };
+        Self { coefficient, scale: spelling.scale(), params }.rescale(params, RoundingMode::HalfEven, context)
+    }
+
+    pub(crate) fn scalar_type(&self) -> ScalarType {
+        let DecimalParameters { precision, scale, bit_width } = self.params;
+        ScalarType::Decimal { precision, scale, bit_width }
+    }
+
+    pub(crate) fn negate(mut self) -> Self {
+        self.coefficient = -self.coefficient;
+        self
+    }
+
+    pub(crate) fn abs(mut self) -> Self {
+        if self.coefficient.is_negative() { self.coefficient = -self.coefficient; }
+        self
+    }
+
+    pub(crate) fn rescale(self, params: DecimalParameters, mode: RoundingMode, context: &crate::EvalContext<'_>) -> Result<Self> {
+        let shift = if self.coefficient.is_zero() { 0 } else { (i64::from(params.scale) - i64::from(self.scale)).max(0) };
+        let work = (self.digit_bound() as i64 + shift).min(MAX_SCALAR_DIGITS as i64) as usize;
+        reserve_work(context, work)?;
+        let coefficient = rescale_coefficient(self.coefficient, i64::from(self.scale), params.scale, MAX_SCALAR_DIGITS, mode)?;
+        Ok(Self { coefficient, scale: params.scale, params })
+    }
+
+    pub(crate) fn into_cell(self) -> Result<NumericCell> {
+        if self.scale != self.params.scale { return Err(overflow()); }
+        let bytes = cast_coefficient(BigDecimal::new(self.coefficient, i64::from(self.scale)), self.params)?;
+        Ok(NumericCell::Decimal(bytes, self.params))
+    }
+
+    pub(crate) fn text(&self, context: &crate::EvalContext<'_>) -> Result<Value> {
+        reserve_work(context, self.digit_bound())?;
+        Ok(Value::Utf8(decimal_parts_text(&self.coefficient, self.scale)))
+    }
+
+    pub(crate) fn as_f64(&self, context: &crate::EvalContext<'_>) -> Result<f64> {
+        reserve_work(context, self.digit_bound())?;
+        Ok(rtdb_types::jvm_number::decimal_bytes_to_f64(&self.coefficient.to_signed_bytes_be(), self.scale))
+    }
+
+    pub(crate) fn compare(&self, other: &Self, context: &crate::EvalContext<'_>) -> Result<Ordering> {
+        if self.scale == other.scale { return Ok(self.coefficient.cmp(&other.coefficient)); }
+        reserve_work(context, self.digit_bound() + other.digit_bound())?;
+        Ok(compare_parts(&self.coefficient, i64::from(self.scale), &other.coefficient, i64::from(other.scale)))
+    }
+
+    pub(crate) fn number(&self, context: &crate::EvalContext<'_>) -> Result<crate::jvm_number::Number> {
+        reserve_work(context, self.digit_bound())?;
+        Ok(crate::jvm_number::Number::Decimal { coefficient: self.coefficient.clone(), scale: self.scale })
+    }
+
+    pub(crate) fn arithmetic(self, op: BinaryOp, other: Self, params: DecimalParameters, context: &crate::EvalContext<'_>) -> Result<Self> {
+        let (ls, rs) = (i64::from(self.scale), i64::from(other.scale));
+        let (a, b) = (self.digit_bound(), other.digit_bound());
+        let work = match op {
+            BinaryOp::Add | BinaryOp::Subtract => {
+                let aligned = |decimal: &Self, digits: usize, scale: i64| {
+                    if decimal.coefficient.is_zero() { return digits; }
+                    (digits as i64 + ls.max(rs) - scale).min(MAX_SCALAR_DIGITS as i64) as usize
+                };
+                aligned(&self, a, ls).max(aligned(&other, b, rs)) + 1
+            }
+            BinaryOp::Multiply => a + b,
+            BinaryOp::Divide => {
+                if other.coefficient.is_zero() { return Err(division_by_zero()); }
+                let shift = if self.coefficient.is_zero() { 0 } else {
+                    (i64::from(params.scale) + rs - ls).unsigned_abs().min((2 * MAX_SCALAR_DIGITS) as u64) as usize
+                };
+                a + b + shift
+            }
+            BinaryOp::Modulo => 8 * (a + b) + MAX_SCALAR_DIGITS.min((ls - rs).unsigned_abs() as usize),
+            _ => return Err(inapplicable("decimal arithmetic", &[])),
+        };
+        reserve_work(context, work)?;
+        let scale = if op == BinaryOp::Divide { params.scale } else { rtdb_plan::decimal_arithmetic_scale(op, self.scale, other.scale)? };
+        let (coefficient, scale) = arithmetic_parts(op, (self.coefficient, self.scale), (other.coefficient, other.scale), scale, MAX_SCALAR_DIGITS)?;
+        if digits(&coefficient) > MAX_SCALAR_DIGITS { return Err(overflow()); }
+        Ok(Self { coefficient, scale, params })
+    }
+
+    fn digit_bound(&self) -> usize {
+        (self.coefficient.bits() as usize * 302) / 1000 + 1
+    }
+}
+
+fn reserve_work(context: &crate::EvalContext<'_>, digits: usize) -> Result<()> {
+    context.reserve(256 + digits * 48)
+}
 
 fn coefficient(value: &DecimalValue) -> BigInt { BigInt::from_signed_bytes_be(&value.unscaled) }
 fn digits(value: &BigInt) -> usize { value.to_str_radix(10).trim_start_matches('-').len() }
@@ -215,7 +360,7 @@ fn factors(mut value: BigInt, factor: u8) -> i64 {
     count
 }
 
-fn modulo(a: BigInt, ls: i64, b: BigInt, rs: i64, target: i64, output_digits: usize) -> Result<BigInt> {
+fn modulo(a: BigInt, ls: i64, b: BigInt, rs: i64, output_digits: usize) -> Result<(BigInt, i64)> {
     if b.is_zero() { return Err(division_by_zero()); }
     let (left, right) = (a.abs(), b.abs());
     let (mut remainder, mut result_scale) = if compare_parts(&left, ls, &right, rs) == Ordering::Less {
@@ -245,36 +390,28 @@ fn modulo(a: BigInt, ls: i64, b: BigInt, rs: i64, target: i64, output_digits: us
         remainder = align(remainder, scale - result_scale, maximum)? + align(b, scale - rs, maximum)?;
         result_scale = scale;
     }
-    if result_scale != target { return Err(overflow()); }
-    Ok(remainder)
+    Ok((remainder, result_scale))
 }
 
 pub(crate) fn arithmetic(op: BinaryOp, left: &DecimalValue, right: &DecimalValue, precision: i32, scale: i32, bit_width: u16) -> Result<DecimalValue> {
-    let result = arithmetic_parts(op, (coefficient(left), left.scale), (coefficient(right), right.scale), DecimalParameters {
-        precision, scale, bit_width,
-    })?;
+    let maximum = physical_digits(bit_width)?;
+    let (result, result_scale) = arithmetic_parts(op, (coefficient(left), left.scale), (coefficient(right), right.scale), scale, maximum)?;
+    if result_scale != scale { return Err(overflow()); }
     from_coefficient(result, precision, scale, bit_width)
 }
 
-pub(crate) fn arithmetic_cells(
-    op: BinaryOp, left: ([u8; 32], i32), right: ([u8; 32], i32), params: DecimalParameters,
-) -> Result<NumericCell> {
-    let (left, right) = ((BigInt::from_signed_bytes_be(&left.0), left.1), (BigInt::from_signed_bytes_be(&right.0), right.1));
-    let result = arithmetic_parts(op, left, right, params)?;
-    cast_coefficient(BigDecimal::new(result, i64::from(params.scale)), params).map(|bytes| NumericCell::Decimal(bytes, params))
-}
-
-fn arithmetic_parts(op: BinaryOp, (a, ls): (BigInt, i32), (b, rs): (BigInt, i32), params: DecimalParameters) -> Result<BigInt> {
-    let DecimalParameters { precision, scale, bit_width } = params;
-    let output_digits = physical_digits(bit_width)?;
+fn arithmetic_parts(op: BinaryOp, (a, ls): (BigInt, i32), (b, rs): (BigInt, i32), scale: i32, output_digits: usize) -> Result<(BigInt, i32)> {
     let (ls, rs, target) = (i64::from(ls), i64::from(rs), i64::from(scale));
-    Ok(match op {
+    let coefficient = match op {
         BinaryOp::Add | BinaryOp::Subtract => {
             let maximum = digits(&a).max(digits(&b)).max(output_digits) + 1;
             let (a, b) = (align(a, target - ls, maximum)?, align(b, target - rs, maximum)?);
             if op == BinaryOp::Add { a + b } else { a - b }
         }
-        BinaryOp::Multiply => a * b,
+        BinaryOp::Multiply => {
+            if !a.is_zero() && !b.is_zero() && digits(&a) + digits(&b) - 1 > output_digits { return Err(overflow()); }
+            a * b
+        }
         BinaryOp::Divide => {
             if b.is_zero() { return Err(division_by_zero()); }
             if a.is_zero() { BigInt::zero() } else {
@@ -283,7 +420,7 @@ fn arithmetic_parts(op: BinaryOp, (a, ls): (BigInt, i32), (b, rs): (BigInt, i32)
                 let shift = target + rs - ls;
                 if shift.unsigned_abs() > i32::MAX as u64 { return Err(overflow()); }
                 let magnitude = digits(&a) as i64 - digits(&b) as i64 + shift;
-                if magnitude > i64::from(precision).min(output_digits as i64) { return Err(overflow()); }
+                if magnitude > output_digits as i64 { return Err(overflow()); }
                 if magnitude < -1 { BigInt::zero() } else {
                     let (a, b) = if shift >= 0 { (a * power(shift)?, b) } else { (a, b * power(-shift)?) };
                     let sign = if a.sign() == b.sign() { Sign::Plus } else { Sign::Minus };
@@ -292,8 +429,10 @@ fn arithmetic_parts(op: BinaryOp, (a, ls): (BigInt, i32), (b, rs): (BigInt, i32)
             }
         }
         BinaryOp::Modulo => {
-            modulo(a, ls, b, rs, target, output_digits)?
+            let (remainder, scale) = modulo(a, ls, b, rs, output_digits)?;
+            return Ok((remainder, i32::try_from(scale).map_err(|_| overflow())?));
         }
         _ => return Err(inapplicable("decimal arithmetic", &[])),
-    })
+    };
+    Ok((coefficient, scale))
 }

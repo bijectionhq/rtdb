@@ -27,9 +27,9 @@ pub(super) fn subscript<'a>(value: EvalValue<'a>,index: EvalValue<'a>,frame: &'a
     },frame)
 }
 
-pub(super) fn literal_coercion(left_expr: &Expr,right_expr: &Expr,left: &mut EvalValue<'_>,right: &mut EvalValue<'_>,frame: &EvaluationFrame<'_>) -> Result<()> {
+pub(super) fn literal_coercion(left_expr: Option<&Expr>,right_expr: &Expr,left: &mut EvalValue<'_>,right: &mut EvalValue<'_>,frame: &EvaluationFrame<'_>) -> Result<()> {
     if let (EvalValue::Scalar(left),EvalValue::Scalar(right)) = (left,right) {
-        super::super::coerce_comparison_literals(matches!(left_expr,Expr::Literal(Value::Utf8(_))),matches!(right_expr,Expr::Literal(Value::Utf8(_))),left,right,frame.context.timezone)?;
+        super::super::coerce_comparison_literals(matches!(left_expr,Some(Expr::Literal(Value::Utf8(_)))),matches!(right_expr,Expr::Literal(Value::Utf8(_))),left,right,frame.context.timezone)?;
     }
     Ok(())
 }

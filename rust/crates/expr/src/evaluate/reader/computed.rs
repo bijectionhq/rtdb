@@ -1,18 +1,23 @@
-use rtdb_types::{NumericCell, ScalarType};
+use std::cmp::Ordering;
 
+use rtdb_types::{NumericCell, ScalarType, decimal_arrow::DecimalParameters};
+
+use crate::decimal::ScalarDecimal;
 use super::*;
 
 pub(super) enum Output<'a> {
     Number(NumericCell),
+    Decimal(ScalarDecimal),
     Value(EvalValue<'a>),
 }
 
 impl<'a> Output<'a> {
-    pub(super) fn into_value(self) -> EvalValue<'a> {
-        match self {
+    pub(super) fn into_value(self) -> Result<EvalValue<'a>> {
+        Ok(match self {
             Self::Number(number) => EvalValue::Scalar(number.into_value()),
+            Self::Decimal(decimal) => EvalValue::Scalar(decimal.into_cell()?.into_value()),
             Self::Value(value) => value,
-        }
+        })
     }
 
     pub(super) fn number(&self) -> Option<NumericCell> {
@@ -23,6 +28,181 @@ impl<'a> Output<'a> {
             _ => None,
         }
     }
+
+    pub(super) fn is_null(&self) -> bool {
+        match self {
+            Self::Value(value) => is_null(value),
+            Self::Number(number) => *number == NumericCell::Null,
+            Self::Decimal(_) => false,
+        }
+    }
+
+    pub(super) fn is_decimal(&self) -> bool {
+        matches!(self, Self::Decimal(_)) || matches!(self.number(), Some(NumericCell::Decimal(..)))
+    }
+
+    pub(super) fn has_wide_decimal(&self) -> bool {
+        matches!(self, Self::Decimal(_))
+    }
+
+    pub(super) fn scalar_type(&self) -> Option<ScalarType> {
+        match self {
+            Self::Decimal(decimal) => Some(decimal.scalar_type()),
+            _ => self.number().and_then(NumericCell::scalar_type),
+        }
+    }
+
+    pub(super) fn as_f64(&self, frame: &EvaluationFrame<'_>) -> Result<Option<f64>> {
+        match self {
+            Self::Decimal(decimal) => decimal.as_f64(frame.context).map(Some),
+            _ => Ok(self.number().and_then(NumericCell::as_f64)),
+        }
+    }
+
+    pub(super) fn into_decimal(self, frame: &EvaluationFrame<'_>) -> Result<ScalarDecimal> {
+        match self {
+            Self::Decimal(decimal) => Ok(decimal),
+            _ => exact(self.number().expect("decimal or integer"), frame),
+        }
+    }
+
+    pub(super) fn clone_narrow(&self, frame: &EvaluationFrame<'_>) -> Result<EvalValue<'a>> {
+        match self {
+            Self::Number(number) => {
+                if let NumericCell::Decimal(_, params) = number {
+                    frame.context.reserve(usize::from(params.bit_width / 8))?;
+                }
+                Ok(scalar(number.into_value()))
+            }
+            Self::Value(value) => clone_value(value, frame),
+            Self::Decimal(_) => Err(overflow()),
+        }
+    }
+}
+
+fn exact(number: NumericCell, frame: &EvaluationFrame<'_>) -> Result<ScalarDecimal> {
+    frame.context.reserve(256)?;
+    match number {
+        NumericCell::Decimal(bytes, params) => Ok(ScalarDecimal::from_cell(bytes, params)),
+        number => number.integer().map(ScalarDecimal::from_integer).ok_or_else(overflow),
+    }
+}
+
+fn decimal_order(
+    left: &Output<'_>, right: &Output<'_>, frame: &EvaluationFrame<'_>, total: bool,
+) -> Result<Option<Ordering>> {
+    let (decimal, other, reversed) = match (left, right) {
+        (Output::Decimal(left), Output::Decimal(right)) => return left.compare(right, frame.context).map(Some),
+        (Output::Decimal(decimal), other) => (decimal, other, false),
+        (other, Output::Decimal(decimal)) => (decimal, other, true),
+        _ => return Ok(None),
+    };
+    let number = match (other, total) {
+        (Output::Value(EvalValue::Scalar(Value::Oid(value) | Value::RegClass(value) | Value::RegProc(value))), true) => Some(NumericCell::I32(*value)),
+        _ => other.number(),
+    };
+    let Some(number) = number.filter(|number| *number != NumericCell::Null) else { return Ok(None); };
+    let order = if matches!(number, NumericCell::Decimal(..)) || number.integer().is_some() {
+        decimal.compare(&exact(number, frame)?, frame.context).map(Some)?
+    } else {
+        let (left, right) = (decimal.as_f64(frame.context)?, number.as_f64().expect("floating-point number"));
+        if total { Some(crate::compare::float_order(left, right)) } else { left.partial_cmp(&right) }
+    };
+    Ok(order.map(|order| if reversed { order.reverse() } else { order }))
+}
+
+fn decimal_equal(left: &Output<'_>, right: &Output<'_>, strict: bool, frame: &EvaluationFrame<'_>) -> Result<bool> {
+    match (left, right) {
+        (Output::Decimal(decimal), Output::Value(EvalValue::Scalar(Value::Transit(bytes))))
+        | (Output::Value(EvalValue::Scalar(Value::Transit(bytes))), Output::Decimal(decimal)) => {
+            let scope = crate::transit_object::scope(frame.context.allocation)?;
+            let stored = crate::transit_object::Decoded::read(bytes, scope)?;
+            Ok(stored.equivalent_number(&decimal.number(frame.context)?))
+        }
+        _ if strict && !(left.is_decimal() && right.is_decimal()) => Ok(false),
+        _ => Ok(decimal_order(left, right, frame, false)? == Some(Ordering::Equal)),
+    }
+}
+
+pub(super) async fn equal<'a>(
+    left: &Output<'a>, right: Output<'a>, strict: bool, right_text_literal: bool, frame: &'a EvaluationFrame<'a>,
+) -> Result<Option<bool>> {
+    if left.has_wide_decimal() || right.has_wide_decimal() {
+        if left.is_null() || right.is_null() { return Ok(if strict { Some(false) } else { None }); }
+        return decimal_equal(left, &right, strict, frame).map(Some);
+    }
+    let (mut left, mut right) = (left.clone_narrow(frame)?, right.into_value()?);
+    if let (EvalValue::Scalar(left), EvalValue::Scalar(right)) = (&mut left, &mut right) {
+        super::super::coerce_comparison_literals(false, right_text_literal, left, right, frame.context.timezone)?;
+    }
+    compare::equal(left, right, strict, frame)?.await
+}
+
+pub(super) async fn order<'a>(left: &Output<'a>, right: &Output<'a>, frame: &'a EvaluationFrame<'a>) -> Result<Ordering> {
+    if left.has_wide_decimal() || right.has_wide_decimal() {
+        return wide_order(left, right, frame);
+    }
+    compare::order(left.clone_narrow(frame)?, right.clone_narrow(frame)?, frame)?.await
+}
+
+fn wide_order(left: &Output<'_>, right: &Output<'_>, frame: &EvaluationFrame<'_>) -> Result<Ordering> {
+    if let Some(order) = decimal_order(left, right, frame, true)? { return Ok(order); }
+    let ty = |output: &Output<'_>| match output {
+        Output::Value(value) => value_type(value, frame),
+        _ => Ok(output.scalar_type().map_or(LogicalType::Null, LogicalType::Scalar)),
+    };
+    Err(rtdb_types::function_type_mismatch("compare", &[ty(left)?, ty(right)?]))
+}
+
+pub(super) async fn predicate<'a>(
+    op: BinaryOp, left: Output<'a>, right: Output<'a>, left_expr: Option<&Expr>, right_expr: &Expr,
+    frame: &'a EvaluationFrame<'a>,
+) -> Result<EvalValue<'a>> {
+    if let Some(result) = decimal_predicate(op, &left, &right, frame)? {
+        return Ok(scalar(boolean(result)));
+    }
+    let (mut left, mut right) = (left.into_value()?, right.into_value()?);
+    if !matches!(op, BinaryOp::IsDistinctFrom | BinaryOp::IsNotDistinctFrom) {
+        calls::literal_coercion(left_expr, right_expr, &mut left, &mut right, frame)?;
+    }
+    calls::binary_values(op, left, right, frame)?.await
+}
+
+pub(super) fn decimal_predicate(
+    op: BinaryOp, left: &Output<'_>, right: &Output<'_>, frame: &EvaluationFrame<'_>,
+) -> Result<Option<Option<bool>>> {
+    use BinaryOp as B;
+    if left.has_wide_decimal() || right.has_wide_decimal() {
+        let result = if left.is_null() || right.is_null() {
+            match op {
+                B::IsDistinctFrom => Some(left.is_null() != right.is_null()),
+                B::IsNotDistinctFrom => Some(left.is_null() == right.is_null()),
+                _ => None,
+            }
+        } else {
+            let equal = || decimal_equal(left, right, false, frame);
+            Some(match op {
+                B::Eq | B::IsNotDistinctFrom => equal()?,
+                B::NotEq | B::IsDistinctFrom => !equal()?,
+                B::Lt | B::LtEq | B::Gt | B::GtEq => {
+                    let unordered = [left.number(), right.number()].into_iter().flatten().any(|cell| matches!(
+                        cell, NumericCell::F16(_) | NumericCell::F32(_) | NumericCell::F64(_)
+                    ) && cell.as_f64().is_some_and(f64::is_nan));
+                    if unordered { return Ok(Some(Some(false))); }
+                    let order = wide_order(left, right, frame)?;
+                    match op {
+                        B::Lt => order == Ordering::Less,
+                        B::LtEq => order != Ordering::Greater,
+                        B::Gt => order == Ordering::Greater,
+                        _ => order != Ordering::Less,
+                    }
+                }
+                _ => return Err(invalid("compare")),
+            })
+        };
+        return Ok(Some(result));
+    }
+    Ok(None)
 }
 
 pub(super) async fn element<'a>(expr: &'a Expr, frame: &'a EvaluationFrame<'a>) -> Result<Option<Output<'a>>> {
@@ -75,13 +255,42 @@ pub(super) fn floating(value: f64, target: &ScalarType) -> NumericCell {
 pub(super) async fn arithmetic<'a>(
     op: BinaryOp, lhs: Output<'a>, rhs: Output<'a>, frame: &'a EvaluationFrame<'a>,
 ) -> Result<Output<'a>> {
+    if lhs.is_null() || rhs.is_null() {
+        return Ok(Output::Number(NumericCell::Null));
+    }
+    if (lhs.is_decimal() || rhs.is_decimal())
+        && let (Some(left), Some(right)) = (lhs.scalar_type(), rhs.scalar_type())
+    {
+        let types = [LogicalType::Scalar(left), LogicalType::Scalar(right)];
+        let exact = |output: &Output<'_>| output.is_decimal() || output.number().and_then(NumericCell::integer).is_some();
+        if exact(&lhs) && exact(&rhs) {
+            let a = lhs.into_decimal(frame)?;
+            let b = rhs.into_decimal(frame)?;
+            let params = if op == BinaryOp::Modulo {
+                let Some(LogicalType::Scalar(ScalarType::Decimal { precision, scale, bit_width })) =
+                    LogicalType::least_upper_bound(&types) else { return Err(overflow()); };
+                DecimalParameters { precision, scale, bit_width }
+            } else {
+                let (precision, bit_width) = if a.params.precision <= 32 && b.params.precision <= 32 {
+                    (32, 128)
+                } else {
+                    (64, 256)
+                };
+                let scale = rtdb_plan::decimal_arithmetic_scale(op, a.params.scale, b.params.scale)?;
+                DecimalParameters { precision, scale, bit_width }
+            };
+            return a.arithmetic(op, b, params, frame.context).map(Output::Decimal);
+        }
+        if let Some(LogicalType::Scalar(ty @ (ScalarType::F16 | ScalarType::F32 | ScalarType::F64))) =
+            LogicalType::least_upper_bound(&types)
+        {
+            let a = lhs.as_f64(frame)?.expect("numeric left operand");
+            let b = rhs.as_f64(frame)?.expect("numeric right operand");
+            let value = crate::numeric::float_arithmetic(op, a, b).expect("arithmetic operation")?;
+            return Ok(Output::Number(floating(value, &ty)));
+        }
+    }
     if let (Some(a), Some(b)) = (lhs.number(), rhs.number()) {
-        if a == NumericCell::Null || b == NumericCell::Null {
-            return Ok(Output::Number(NumericCell::Null));
-        }
-        if let Some(decimal) = decimal_arithmetic(op, a, b) {
-            return decimal.map(Output::Number);
-        }
         if !matches!(a, NumericCell::Decimal(..))
             && !matches!(b, NumericCell::Decimal(..))
             && let Some(LogicalType::Scalar(ty)) = LogicalType::least_upper_bound(&[
@@ -97,38 +306,7 @@ pub(super) async fn arithmetic<'a>(
             return Ok(Output::Number(floating(value, &ty)));
         }
     }
-    calls::binary_values(op, lhs.into_value(), rhs.into_value(), frame)?.await.map(Output::Value)
-}
-
-fn decimal_arithmetic(op: BinaryOp, left: NumericCell, right: NumericCell) -> Option<Result<NumericCell>> {
-    use rtdb_types::decimal_arrow::DecimalParameters;
-    if !matches!(left, NumericCell::Decimal(..)) && !matches!(right, NumericCell::Decimal(..)) {
-        return None;
-    }
-    let parts = |value: NumericCell| match value {
-        NumericCell::Decimal(bytes, params) => Some((bytes, params.precision, params.scale)),
-        value => {
-            let integer = value.integer()?;
-            let mut bytes = [if integer < 0 { u8::MAX } else { 0 }; 32];
-            bytes[16..].copy_from_slice(&integer.to_be_bytes());
-            Some((bytes, 32, 0))
-        }
-    };
-    let (a, ap, ls) = parts(left)?;
-    let (b, bp, rs) = parts(right)?;
-    Some((|| {
-        let params = if op == BinaryOp::Modulo {
-            let types = [left, right].map(|cell| LogicalType::Scalar(cell.scalar_type().unwrap()));
-            let Some(LogicalType::Scalar(ScalarType::Decimal { precision, scale, bit_width })) =
-                LogicalType::least_upper_bound(&types) else { return Err(overflow()); };
-            DecimalParameters { precision, scale, bit_width }
-        } else {
-            let (precision, bit_width) = if ap <= 32 && bp <= 32 { (32, 128) } else { (64, 256) };
-            let scale = rtdb_plan::decimal_arithmetic_scale(op, ls, rs)?;
-            DecimalParameters { precision, scale, bit_width }
-        };
-        crate::decimal::arithmetic_cells(op, (a, ls), (b, rs), params)
-    })())
+    calls::binary_values(op, lhs.into_value()?, rhs.into_value()?, frame)?.await.map(Output::Value)
 }
 
 #[cfg(test)]
@@ -146,10 +324,10 @@ mod tests {
         for op in [BinaryOp::Add, BinaryOp::Subtract, BinaryOp::Multiply, BinaryOp::Divide, BinaryOp::Modulo] {
             let expected = crate::arithmetic(op, &decimal, &divisor).unwrap();
             let expression = Expr::Binary { op, left: Box::new(Expr::Literal(decimal.clone())), right: Box::new(Expr::Literal(divisor.clone())) };
-            let Some(Output::Number(actual)) = element(&expression, &frame).await.unwrap() else {
+            let Some(Output::Decimal(actual)) = element(&expression, &frame).await.unwrap() else {
                 panic!("expected a typed decimal result");
             };
-            assert_eq!(actual.into_value(), expected);
+            assert_eq!(actual.into_cell().unwrap().into_value(), expected);
         }
     }
 

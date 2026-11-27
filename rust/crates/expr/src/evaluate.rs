@@ -514,6 +514,7 @@ macro_rules! expression_body {
             context.reserve(field.name.len().checked_add(4096).ok_or_else(overflow)?)?;
             Ok((field.name.clone(), row.value(schema, field.id, context)?))
         }).collect::<Result<_>>()?)),
+        Expr::In { .. } if reader::required_with(expr, replacements) => $reader!(expr),
         Expr::In { expr, values, negated } => {
             let value = $eval!(expr)?;
             let mut unknown = false;

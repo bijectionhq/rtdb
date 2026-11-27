@@ -63,8 +63,7 @@ Type Widening
     - Floating operand types results in the decimal part being converted to a floating point before the operation.
 
 Casting
-: Explicit casts to `DECIMAL` types are honoured in storage and
-    computation:
+: Explicit decimal casts set the result precision and round to the requested scale.
 
     - `::DECIMAL(p, s)` → Precision = `p`, Scale = `s`
     - `::DECIMAL(p)` → Precision = `p`, Scale = `0`
@@ -82,13 +81,10 @@ Examples
     - `CAST(123 AS DECIMAL(5))` → `DECIMAL(5,0)`
     - `CAST(123.456 AS DECIMAL)` → `DECIMAL(64,9)` (unless already `DECIMAL`)
 
-Edge Case Limitation
-: Addition of large `DECIMAL` values near the 32-precision boundary
-    may require a precision-64 result.
-
-    - If an operation would overflow a precision-32 result, an exception is raised, even though precision-64 types are generally supported.
-      The reasoning here is that we try to preserve the original precision.
-      If a larger precision is needed use an explicit cast.
+Result limits
+: A returned decimal must fit the declared precision and signed storage width of its result type.
+    A scalar comparison or text cast can consume a wider intermediate result.
+    Cast the expression to a larger precision or a scale that rounds the result to fit when returning it as a decimal.
 
 ## Date/time types
 

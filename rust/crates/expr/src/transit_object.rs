@@ -104,6 +104,9 @@ impl<'a> Decoded<'a> {
     }
     pub(crate) fn equivalent(&self,other: &Self) -> Result<bool> { self.value.equivalent(&other.value) }
     pub(crate) fn equivalent_emitted(&self,other: &rtdb_types::Value) -> Result<bool> { self.value.equivalent_emitted(other,self.allocation) }
+    pub(crate) fn equivalent_number(&self, other: &Number) -> bool {
+        matches!(&self.value, Object::Number(number) if number.equivalent(other))
+    }
 }
 
 struct ObjectReadBuilder<'a> { admission: Admission<'a> }

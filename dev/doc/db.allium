@@ -2397,7 +2397,9 @@ surface QueryAccess {
         -- Checked numeric arithmetic can produce a result vector from selected Arrow positions with a compatible physical type.
         -- A nested field read can select its child from an input struct vector.
         -- Computed outputs publish Arrow columns or positions in arrays with differing physical fields.
+        -- Within the scalar evaluation budget, decimal arithmetic, comparisons, and casts can consume a coefficient wider than the expression's declared decimal result field.
         -- Computed Arrow projections validate decimal precision on the selected result cells, including nested decimals.
+        -- A computed decimal result whose coefficient exceeds the signed width of its selected field fails when materialized.
         -- Run-end encoding of list values groups adjacent equal representations and preserves raw floating-point bits.
         -- Supported physical sort keys are read from their vectors in memory and during Arrow spill replay.
         -- A sort can retain comparison keys within its memory grant and reuse them across comparisons in the same block or at the head of a spill run.

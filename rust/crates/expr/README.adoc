@@ -88,8 +88,9 @@ Declared precision is independent of physical coefficient width, including nonpo
 Ordinary writes reject a nonnull coefficient whose digit count exceeds precision, and separately reject signed byte-width overflow.
 Computed projections apply these checks to their selected output, including decimal cells inside lists and structs.
 Bare column projections retain raw vector cells; a decimal cast with unspecified precision retains the source type but still passes through the computed projection writer.
-Intermediate same-type casts consumed by boolean or text expressions remain scalar values and are not separately vector-written.
-Differing-type casts and arithmetic still use fixed-width native decimal intermediates, so JVM computations whose intermediate BigDecimal exceeds its declared precision or storage width remain a qualification gap even if a later expression produces a nondecimal result.
+Scalar decimal arithmetic, casts, and comparisons can consume coefficients with up to 4096 digits, subject to the caller's evaluation budget.
+A scalar expression can compare, render, or rescale a coefficient that exceeds the intermediate expression's declared precision or storage width.
+Returning a fixed-width decimal result checks precision and signed storage width at materialization.
 Value inference retains the reference's 32/64 precision choices, and expression cast options retain the upper limit of 64.
 `infer_decimal` applies that object-writer inference to a raw coefficient and retains its scale, with bounded coefficient scratch and a checked source width.
 Decimal least-upper-bound promotion uses the pinned Kotlin `Int` wrapping arithmetic and width thresholds, including results above 76 and negative results.
@@ -97,7 +98,8 @@ Rescaling, exact arithmetic, comparison, canonical text, and integer conversion 
 `decimal_text`, `decimal_long_value`, `decimal_rescale`, `decimal_to_f64`, and `parse_decimal` are passive transforms shared with protocol adapters.
 Canonical text, scale-difference overflow, and truncating low-64-bit integer conversion follow https://github.com/openjdk/jdk/blob/jdk-21%2B35/src/java.base/share/classes/java/math/BigDecimal.java[OpenJDK 21 BigDecimal].
 Decimal ROUND retains the requested constant scale, while FLOOR and CEIL return doubles.
-Decimal modulo retains the least-upper-bound result type and the reference vector-write failures when a remainder carries a different scale.
+Decimal modulo retains its least-upper-bound result type and the actual remainder scale during scalar evaluation.
+Materializing a decimal modulo result requires the remainder scale to match its result field.
 `tests/decimal_scales.rs` covers coefficient bounds, rounding ties, extreme-scale metadata, canonical text, integer conversion, and source-compatible overflow; all assertions remain unexecuted.
 `tests/decimal_precisions.rs` covers signed precision, physical allocation bounds and `DecimalVector.increment` accumulation separately from ordinary writes.
 Text parsing accepts OpenJDK 21's Unicode 15.0 BMP decimal digits in coefficients and exponents, including mixed alphabets, while retaining ASCII signs, points, and exponent markers.

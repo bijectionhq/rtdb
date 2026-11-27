@@ -611,6 +611,10 @@ async fn append_list_element<'a>(
             builder.push_numeric(number);
             return Ok(());
         }
+        Some(computed::Output::Decimal(decimal)) => {
+            builder.push_numeric(decimal.into_cell()?);
+            return Ok(());
+        }
         Some(computed::Output::Value(cell)) => materialize(box_cell(cell)?, frame)?.await?,
         None => materialize(nth(clone_value(value, frame)?, index, frame)?.await?, frame)?.await?,
     };
@@ -807,10 +811,11 @@ fn evaluate<'a>(expr: &'a Expr,frame: &'a EvaluationFrame<'a>) -> Result<Pending
             }
             Expr::Unary { .. } | Expr::Binary { .. } => scalar::prepare(expr,frame)?.await?.demand().await,
             Expr::In { expr,values,negated } => {
-                let value = evaluate(expr,frame)?.await?;
+                let value = scalar::prepare(expr, frame)?.await?.demand_output().await?;
                 let mut unknown = false;
                 for candidate in values {
-                    match compare::equal(clone_value(&value,frame)?,evaluate(candidate,frame)?.await?,false,frame)?.await? {
+                    let candidate = scalar::prepare(candidate, frame)?.await?.demand_output().await?;
+                    match computed::equal(&value, candidate, false, false, frame).await? {
                         Some(true) => return Ok(scalar(Value::Bool(!*negated))),None => unknown = true,_ => (),
                     }
                 }
