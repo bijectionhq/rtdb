@@ -63,7 +63,7 @@ Point operations at 1M rows are where the per-file, per-page and per-statement c
 
 - `LiveTable` (`R/index/src/live.rs`) holds `chunks: Vec<(u32, Arc<IndexBatch>)>`, one immutable Arrow `RecordBatch` per transaction, plus a persistent `MemoryHashTrie` over global row numbers.
 - `LiveTable::append` clones the table: the chunk `Vec`, `column_types` and the trie root. It pushes the new chunk, path-copies the trie (`add_range`), then calls `merge_small_chunks`.
-- `merge_small_chunks` (`live.rs:256`) concatenates the newest chunk into the previous one while the newest is at least as large, the two fit in `MERGED_CHUNK_ROWS = 8192`, and the schemas are **exactly equal**. It uses `arrow_select::concat::concat_batches`, which re-copies the earlier chunk every time.
+- `merge_small_chunks` (`live.rs:256`) concatenates the newest chunk into the previous one while the newest is at least as large, the two fit in a trie page (`page_limit`, 1024 rows by default; appends wait in a tail of up to `log_limit` chunks first), and the schemas are **exactly equal**. It uses `arrow_select::concat::concat_batches`, which re-copies the earlier chunk every time.
 - Every row lookup (`locate`, `header`, `row`) runs a `partition_point` binary search over the chunks.
 - Each `IndexBatch` decodes every row's header eagerly (`IndexBatch::from_owned_with_headers`).
 - `LocatedLeaves` caches `(chunk, offset)` and headers per trie leaf per snapshot (`LiveTable::located_rows`). It sits behind a `std::sync::Mutex<HashMap>` keyed by leaf address. A clone starts empty, so every append invalidates the whole table's cache.

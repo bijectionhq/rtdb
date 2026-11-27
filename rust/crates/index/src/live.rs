@@ -307,18 +307,24 @@ pub struct LiveTable {
     located: LocatedLeaves,
 }
 
-/// The most chunks a live table appends before it merges them into its merged chunks.
-const TAIL_CHUNKS: usize = 32;
-/// The most rows merging puts into one chunk.
-const MERGED_CHUNK_ROWS: usize = 8192;
+/// How a live table groups its chunks, derived from its trie's limits. XTDB appends every transaction to one shared
+/// relation; RTDB keeps each append as its own immutable chunk so versions can share them, and merges them as the trie
+/// does its leaf logs: up to `log_limit` appends wait in the tail, and merging packs them into chunks of up to a trie
+/// page, `page_limit` rows.
+#[derive(Clone, Copy, Debug)]
+struct ChunkLimits { tail: usize, merged_rows: usize }
+
+impl From<TrieConfig> for ChunkLimits {
+    fn from(config: TrieConfig) -> Self { Self { tail: config.log_limit(), merged_rows: config.page_limit() } }
+}
 
 /// Chunks appended since the table last merged its tail, one per append, in slots each set at most once.
 /// Every version holding a prefix of the slots shares them; an append from a version whose next slot is already taken copies its prefix into slots of its own.
 #[derive(Debug)]
-struct TailChunks([OnceLock<(u32, Arc<IndexBatch>)>; TAIL_CHUNKS]);
+struct TailChunks(Box<[OnceLock<(u32, Arc<IndexBatch>)>]>);
 
 impl TailChunks {
-    fn new() -> Self { Self(std::array::from_fn(|_| OnceLock::new())) }
+    fn new(slots: usize) -> Self { Self((0..slots).map(|_| OnceLock::new()).collect()) }
 }
 
 fn published(slot: &OnceLock<(u32, Arc<IndexBatch>)>) -> &(u32, Arc<IndexBatch>) {
@@ -368,11 +374,11 @@ impl Chunks {
         }
     }
 
-    fn push(&mut self, start: u32, batch: Arc<IndexBatch>) -> Result<()> {
-        if self.tail_len == TAIL_CHUNKS { self.merge_tail()?; }
-        let tail = self.tail.get_or_insert_with(|| Arc::new(TailChunks::new()));
+    fn push(&mut self, start: u32, batch: Arc<IndexBatch>, limits: ChunkLimits) -> Result<()> {
+        if self.tail_len >= limits.tail { self.merge_tail(limits.merged_rows)?; }
+        let tail = self.tail.get_or_insert_with(|| Arc::new(TailChunks::new(limits.tail)));
         if let Err(chunk) = tail.0[self.tail_len].set((start, batch)) {
-            let own = TailChunks::new();
+            let own = TailChunks::new(limits.tail);
             for (slot, taken) in own.0.iter().zip(&tail.0[..self.tail_len]) {
                 let _ = slot.set(published(taken).clone());
             }
@@ -383,9 +389,9 @@ impl Chunks {
         Ok(())
     }
 
-    /// Moves the tail into the merged chunks: consecutive tail chunks of one layout are concatenated up to `MERGED_CHUNK_ROWS`,
+    /// Moves the tail into the merged chunks: consecutive tail chunks of one layout are concatenated up to `merged_rows`,
     /// and each result merges into the chunk before it while that is no larger, so the chunks keep their row addresses.
-    fn merge_tail(&mut self) -> Result<()> {
+    fn merge_tail(&mut self, merged_rows: usize) -> Result<()> {
         let tail: Vec<(u32, Arc<IndexBatch>)> = self.tail().iter().map(|slot| published(slot).clone()).collect();
         self.tail = None;
         self.tail_len = 0;
@@ -397,7 +403,7 @@ impl Chunks {
             let mut rows = head.len();
             while let Some((_, next)) = tail.get(end)
                 && next.arrow().schema_ref() == schema
-                && rows.checked_add(next.len()).is_some_and(|total| total <= MERGED_CHUNK_ROWS)
+                && rows.checked_add(next.len()).is_some_and(|total| total <= merged_rows)
             {
                 rows += next.len();
                 end += 1;
@@ -410,7 +416,7 @@ impl Chunks {
             let count = u32::try_from(batch.len()).map_err(invalid)?;
             crate::row_address::append_chunk(merged, *start, count, batch)
                 .ok_or_else(|| invalid("Live table exceeds u32 row address space"))?;
-            merge_small_chunks(merged)?;
+            merge_small_chunks(merged, merged_rows)?;
             first = end;
         }
         Ok(())
@@ -418,11 +424,11 @@ impl Chunks {
 }
 
 /// Merges the newest chunk into the one before it while it is at least as large, they share a layout and together
-/// stay within `MERGED_CHUNK_ROWS`, so a table written a row per transaction is read from chunks of up to that many rows.
+/// stay within `merged_rows`, so a table written a row per transaction is read from chunks of up to that many rows.
 /// A merged chunk starts where the earlier one did.
-fn merge_small_chunks(chunks: &mut Vec<(u32, Arc<IndexBatch>)>) -> Result<()> {
+fn merge_small_chunks(chunks: &mut Vec<(u32, Arc<IndexBatch>)>, merged_rows: usize) -> Result<()> {
     while let [.., (_, previous), (_, last)] = chunks.as_slice() {
-        if !LiveTable::can_merge_chunk(previous, last.len(), last.arrow().schema_ref()) { break; }
+        if !LiveTable::can_merge_chunk(previous, last.len(), last.arrow().schema_ref(), merged_rows) { break; }
         let merged = LiveTable::concat_live_chunks(previous.arrow().schema_ref(), [previous.as_ref(), last.as_ref()].into_iter(),
             previous.arrow_reservation().budget())?;
         crate::row_address::replace_last_two(chunks, merged);
@@ -692,15 +698,15 @@ impl LiveTable {
         let count = u32::try_from(batch.len()).map_err(invalid)?;
         let first_new_row = self.row_count;
         let row_count = first_new_row.checked_add(count).ok_or_else(|| invalid("Live table exceeds u32 row address space"))?;
-        self.chunks.push(first_new_row, batch)?;
+        self.chunks.push(first_new_row, batch, self.trie.config().into())?;
         self.row_count = row_count;
         self.trie = self.trie.add_range(self, first_new_row, count)?;
         if count > 0 { self.lineage.append(self.row_count); }
         Ok(())
     }
 
-    fn can_merge_chunk(previous: &IndexBatch, rows: usize, schema: &SchemaRef) -> bool {
-        previous.len() <= rows && rows <= MERGED_CHUNK_ROWS.saturating_sub(previous.len())
+    fn can_merge_chunk(previous: &IndexBatch, rows: usize, schema: &SchemaRef, merged_rows: usize) -> bool {
+        previous.len() <= rows && rows <= merged_rows.saturating_sub(previous.len())
             && previous.arrow().schema_ref() == schema
     }
 
@@ -2698,8 +2704,11 @@ mod chunk_tests {
                 operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(id)), ("v".into(), Value::F64(id as f64))])), recency: None };
             live = live.append(&TableWrite::new(StructFields::new(), Some(IndexBatch::copy_events(&[event], &StructFields::new(), &memory).unwrap())), Timestamp(id)).unwrap();
         }
-        assert!(live.chunks.len() <= 8 + TAIL_CHUNKS, "{} chunks", live.chunks.len());
-        assert!(live.chunks.merged.len() <= 8, "{} merged chunks", live.chunks.merged.len());
+        let config = TrieConfig::default();
+        assert!(live.chunks.tail_len <= config.log_limit(), "{} tail chunks", live.chunks.tail_len);
+        let bound = 2 * 10_000usize.div_ceil(config.page_limit());
+        assert!(live.chunks.merged.len() <= bound, "{} merged chunks", live.chunks.merged.len());
+        assert!(live.chunks.merged.iter().all(|(_, chunk)| chunk.len() <= config.page_limit()));
         for id in [0u32, 1, 1023, 1024, 8191, 8192, 9999] {
             assert_eq!(live.row(id).unwrap().header().unwrap().system_from, Timestamp(i64::from(id)));
         }
@@ -2723,8 +2732,10 @@ mod chunk_tests {
             }).collect::<Vec<_>>();
             live = live.append(&TableWrite::new(StructFields::new(), Some(IndexBatch::copy_events(&events, &StructFields::new(), &memory).unwrap())), Timestamp(tx)).unwrap();
         }
-        assert!(live.chunks.merged.len() <= 4, "{} merged chunks", live.chunks.merged.len());
-        assert!(live.chunks.len() <= 4 + TAIL_CHUNKS, "{} chunks", live.chunks.len());
+        let config = TrieConfig::default();
+        let bound = 2 * 8192usize.div_ceil(config.page_limit());
+        assert!(live.chunks.merged.len() <= bound, "{} merged chunks", live.chunks.merged.len());
+        assert!(live.chunks.tail_len <= config.log_limit(), "{} tail chunks", live.chunks.tail_len);
         assert_eq!(live.row_count, 8192);
     }
 
@@ -2769,7 +2780,11 @@ mod chunk_tests {
             live = live.apply(&staged).unwrap_or_else(|error| panic!("row {id}: {error:?}"));
         }
         let chunks = &live.tables()[&table].chunks;
-        assert!(chunks.len() <= 16, "{} chunks", chunks.len());
+        let config = TrieConfig::default();
+        assert!(chunks.tail_len <= config.log_limit(), "{} tail chunks", chunks.tail_len);
+        // Fewer than a page of rows: the merged chunks count full tails in binary.
+        let bound = 1 + (config.page_limit() / config.log_limit()).ilog2() as usize;
+        assert!(chunks.merged.len() <= bound, "{} merged chunks", chunks.merged.len());
         assert_eq!(live.live_batch_bytes(), memory.used_bytes() as u64);
         assert_eq!(live.next_block().unwrap().live_batch_bytes(), 0);
     }

@@ -182,7 +182,8 @@ fn appending_from_a_version_whose_next_slot_is_taken_keeps_both_branches() {
 fn a_table_merges_its_tail_into_the_merged_chunks_once_the_tail_is_full() {
     let memory = MemoryBudget::new(1 << 26);
     let mut live = LiveTable::new(TableRef::new("public", "docs"), BlockIndex(0), TrieConfig::default());
-    for id in 0..=TAIL_CHUNKS as i64 {
+    let tail_chunks = TrieConfig::default().log_limit();
+    for id in 0..=tail_chunks as i64 {
         let event = StoredEvent {
             position: None, origin: None, commit_position: 0, entity_key: None, iid: EntityId::Integer(id).iid(),
             system_from: Timestamp(id), valid_time: Interval::ALL, recency: None,
@@ -191,9 +192,9 @@ fn a_table_merges_its_tail_into_the_merged_chunks_once_the_tail_is_full() {
         let batch = IndexBatch::copy_events(&[event], &StructFields::new(), &memory).unwrap();
         let previous = live.clone();
         live = live.append(&TableWrite::new(StructFields::new(), Some(batch)), Timestamp(id)).unwrap();
-        assert!(Arc::ptr_eq(&previous.chunks.merged, &live.chunks.merged) || id == TAIL_CHUNKS as i64);
+        assert!(Arc::ptr_eq(&previous.chunks.merged, &live.chunks.merged) || id == tail_chunks as i64);
     }
-    assert_eq!(live.chunks.merged.iter().map(|(start, batch)| (*start, batch.len())).collect::<Vec<_>>(), [(0, TAIL_CHUNKS)]);
+    assert_eq!(live.chunks.merged.iter().map(|(start, batch)| (*start, batch.len())).collect::<Vec<_>>(), [(0, tail_chunks)]);
     assert_eq!(live.chunks.tail_len, 1);
-    assert_eq!(live.locate(TAIL_CHUNKS as u32).unwrap(), (1, 0));
+    assert_eq!(live.locate(tail_chunks as u32).unwrap(), (1, 0));
 }
