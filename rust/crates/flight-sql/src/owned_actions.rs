@@ -6484,27 +6484,71 @@ fn world_point_cell(cell: ArrowCell<'_>) -> rtdb_types::Result<(Field, ArrayRef)
     let selected = cell.physical()?;
     let logical = selected.logical_type()?;
     let field = rtdb_columnar::to_field(cell.field.name(), &logical)?;
-    match &logical {
-        LogicalType::Null => Ok((field, Arc::new(arrow_array::NullArray::new(1)))),
-        LogicalType::Scalar(_) if selected.field.data_type() == field.data_type()
-            && selected.field.metadata() == field.metadata() => {
-            let array = selected.array.slice(selected.row, 1);
-            rtdb_columnar::validate_projected_decimals(&field, array.as_ref())?;
-            let array = if array.nulls().is_some() {
-                let data = array.to_data().into_builder().nulls(None).build()
-                    .map_err(|error| rtdb_types::Anomaly::incorrect("rtdb/invalid-arrow", error.to_string()))?;
-                arrow_array::make_array(data)
-            } else { array };
-            Ok((field, array))
-        }
-        _ => {
-            let value = rtdb_columnar::read_value(cell.field, cell.array, cell.row)?;
-            let logical = value.logical_type();
-            let field = rtdb_columnar::to_field(cell.field.name(), &logical)?;
-            let array = rtdb_columnar::build_array(&logical, &[value])?;
-            Ok((field, array))
-        }
+    if logical == LogicalType::Null {
+        return Ok((field, Arc::new(arrow_array::NullArray::new(1))));
     }
+    if matches!(&logical, LogicalType::Scalar(_)) && selected.field.data_type() == field.data_type()
+        && selected.field.metadata() == field.metadata()
+    {
+        let array = selected.array.slice(selected.row, 1);
+        rtdb_columnar::validate_projected_decimals(&field, array.as_ref())?;
+        let array = if array.nulls().is_some() {
+            let data = array.to_data().into_builder().nulls(None).build()
+                .map_err(|error| rtdb_types::Anomaly::incorrect("rtdb/invalid-arrow", error.to_string()))?;
+            arrow_array::make_array(data)
+        } else { array };
+        return Ok((field, array));
+    }
+    if matches!(logical, LogicalType::List { .. } | LogicalType::Struct(_))
+        && crate::owned_world::concrete_point_bytes(cell, selected, &logical, &field).is_some()
+    {
+        // IPC admission counts buffer capacities, including backing buffers held by slices.
+        let array = build_concrete_point_cell(selected, &logical, &field)?;
+        return Ok((field, array));
+    }
+    let value = rtdb_columnar::read_value(cell.field, cell.array, cell.row)?;
+    let logical = value.logical_type();
+    let field = rtdb_columnar::to_field(cell.field.name(), &logical)?;
+    let array = rtdb_columnar::build_array(&logical, &[value])?;
+    Ok((field, array))
+}
+
+fn build_concrete_point_cell(cell: ArrowCell<'_>, logical: &rtdb_types::LogicalType, field: &Field) -> rtdb_types::Result<ArrayRef> {
+    use arrow_array::cast::AsArray;
+    use rtdb_types::{ListKind, ListValue, LogicalType, ScalarType};
+
+    let array = match (logical, field.data_type()) {
+        (LogicalType::Struct(types), DataType::Struct(fields)) => {
+            let children = cell.structure().expect("admitted point struct");
+            let arrays = children.zip(fields.iter()).map(|(child, field)| {
+                build_concrete_point_cell(child, &types[field.name()], field)
+            }).collect::<rtdb_types::Result<Vec<_>>>()?;
+            rtdb_columnar::build_struct_array(fields.clone(), &arrays, 1, None)?
+        }
+        (LogicalType::List { kind, .. }, _) => {
+            let (item, values, range) = cell.sequence_range().expect("admitted point float list");
+            let list = match item.data_type() {
+                DataType::Float32 => ListValue::from_f32(values.as_primitive::<arrow_array::types::Float32Type>().slice(range.start, range.len())),
+                DataType::Float64 => ListValue::from_f64(values.as_primitive::<arrow_array::types::Float64Type>().slice(range.start, range.len())),
+                _ => unreachable!("admitted point list components"),
+            };
+            let value = match kind {
+                ListKind::List => Value::List(list),
+                _ => Value::FixedSizeList(list),
+            };
+            rtdb_columnar::build_array(logical, &[value])?
+        }
+        (LogicalType::Null | LogicalType::Nothing, _) => Arc::new(arrow_array::NullArray::new(1)),
+        (LogicalType::Scalar(ScalarType::Utf8 | ScalarType::Keyword), _) =>
+            Arc::new(StringArray::from(vec![Some(cell.array.as_string::<i32>().value(cell.row))])),
+        (LogicalType::Scalar(ScalarType::Binary | ScalarType::Transit), _) =>
+            Arc::new(BinaryArray::from(vec![Some(cell.array.as_binary::<i32>().value(cell.row))])),
+        _ => {
+            let value = rtdb_columnar::read_value_as(logical, cell.field, cell.array, cell.row)?;
+            rtdb_columnar::build_array(logical, &[value])?
+        }
+    };
+    Ok(array)
 }
 
 fn optional_micros(value: Option<Value>) -> Result<Option<Timestamp>, Status> {
@@ -6654,7 +6698,7 @@ mod world_point_tests {
     use arrow_array::cast::AsArray;
     use arrow_ipc::writer::IpcWriteOptions;
     use rtdb_format::ipc::write_arrow_stream;
-    use rtdb_types::{LogicalType, ScalarType};
+    use rtdb_types::{ListKind, LogicalType, ScalarType};
 
     #[test]
     fn world_point_narrows_to_the_selected_leg_and_retains_its_payload() {
@@ -6695,5 +6739,74 @@ mod world_point_tests {
         assert!(!field.is_nullable());
         assert!(narrowed.nulls().is_none());
         assert_eq!(narrowed.as_string::<i32>().value(0).as_ptr(), array.value(1).as_ptr());
+    }
+
+    #[test]
+    fn world_point_sizes_and_writes_concrete_nested_fields() {
+        let f32_list = LogicalType::List {
+            kind: ListKind::List, element: Box::new(LogicalType::Scalar(ScalarType::F32)),
+        };
+        let f64_list = LogicalType::List {
+            kind: ListKind::FixedSizeList(2), element: Box::new(LogicalType::Scalar(ScalarType::F64)),
+        };
+        let logical = LogicalType::Struct(StructFields::from([
+            ("z_label".into(), LogicalType::Scalar(ScalarType::Utf8)),
+            ("absent".into(), LogicalType::Nothing),
+            ("null".into(), LogicalType::Null),
+            ("variable".into(), f32_list),
+            ("fixed".into(), f64_list),
+        ]));
+        let wider = LogicalType::from_legs([logical.clone(), LogicalType::Scalar(ScalarType::I64)]);
+        let field = rtdb_columnar::to_field("payload", &wider).unwrap();
+        let value = |label: &str, f32s: Vec<Value>, f64s: Vec<Value>| Value::Struct(StructFields::from([
+            ("z_label".into(), Value::Utf8(label.into())),
+            ("absent".into(), Value::Undefined),
+            ("null".into(), Value::Null),
+            ("variable".into(), Value::list(f32s)),
+            ("fixed".into(), Value::FixedSizeList(f64s.into())),
+        ]));
+        let values = [value("earlier", vec![Value::F32(2.0)], vec![Value::F64(4.0), Value::F64(8.0)]),
+            Value::I64(9), value("selected",
+                vec![Value::F32(f32::from_bits(0x7fc0_0042)), Value::F32(-0.0)],
+                vec![Value::F64(f64::from_bits(0x7ff8_0000_0000_0042)), Value::F64(-0.0)])];
+        let input = RecordBatch::try_new(Arc::new(Schema::new(vec![field.clone()])),
+            vec![rtdb_columnar::build_array(&wider, &values).unwrap()]).unwrap().slice(2, 1);
+        let cell = ArrowCell::named(&input, "payload", 0).unwrap();
+        let baseline = rtdb_columnar::read_value(cell.field, cell.array, cell.row).unwrap();
+        let document = StructFields::from([("payload".into(), baseline.clone())]);
+        assert_eq!(crate::WorldPointRow::document_bytes(&input).unwrap(), Value::document_retained_bytes(&document).unwrap());
+
+        let (field, narrowed) = world_point_cell(cell).unwrap();
+        assert_eq!(field, rtdb_columnar::to_field("payload", &baseline.logical_type()).unwrap());
+        let source = cell.physical().unwrap();
+        assert!(crate::owned_world::concrete_point_bytes(cell, source, &logical, &field).is_some());
+        let schema = Arc::new(Schema::new(vec![field]));
+        let baseline = rtdb_columnar::build_array(&baseline.logical_type(), &[baseline]).unwrap();
+        assert_eq!(narrowed.get_array_memory_size(), baseline.get_array_memory_size());
+        let ipc = |array| {
+            let batch = RecordBatch::try_new(Arc::clone(&schema), vec![array]).unwrap();
+            write_arrow_stream(&schema, &[batch], IpcWriteOptions::default()).unwrap()
+        };
+        assert_eq!(ipc(narrowed), ipc(baseline));
+    }
+
+    #[test]
+    fn world_point_retains_narrowing_and_validation_for_other_nested_layouts() {
+        let logical = LogicalType::Struct(StructFields::from([
+            ("nullable".into(), LogicalType::Scalar(ScalarType::Utf8).maybe()),
+        ]));
+        let field = rtdb_columnar::to_field("payload", &logical).unwrap();
+        let value = Value::Struct(StructFields::from([("nullable".into(), Value::Utf8("present".into()))]));
+        let array = rtdb_columnar::build_array(&logical, &[value.clone()]).unwrap();
+        let (field, _) = world_point_cell(ArrowCell { field: &field, array: array.as_ref(), row: 0 }).unwrap();
+        assert_eq!(field, rtdb_columnar::to_field("payload", &value.logical_type()).unwrap());
+
+        let uri = Arc::new(rtdb_columnar::to_field("uri", &LogicalType::Scalar(ScalarType::Uri)).unwrap());
+        let array = arrow_array::StructArray::new(vec![uri].into(), vec![Arc::new(StringArray::from(vec!["not a URI"]))], None);
+        let field = Field::new("payload", array.data_type().clone(), false);
+        let baseline = rtdb_columnar::read_value(&field, &array, 0).unwrap_err();
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![Arc::new(array)]).unwrap();
+        assert_eq!(crate::WorldPointRow::document_bytes(&batch).unwrap_err(), baseline);
+        assert_eq!(world_point_cell(ArrowCell::named(&batch, "payload", 0).unwrap()).unwrap_err(), baseline);
     }
 }
