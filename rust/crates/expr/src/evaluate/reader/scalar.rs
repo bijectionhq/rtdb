@@ -888,7 +888,8 @@ mod tests {
             let expr = Expr::Call { name: name.into(), return_type: function_type_with_args(name, &args).unwrap(), args };
             for (row, expected) in [(0, Value::I32(size)), (1, Value::Null)] {
                 let allocation = crate::EvaluationScope::new(&memory).unwrap();
-                let context = EvalContext::default().with_allocation(&allocation);
+                let context = EvalContext::default();
+                let context = context.with_allocation(&allocation);
                 let input = TextRow(ArrowCell { field: &field, array: &array, row });
                 let invocation = crate::ExpressionInvocation::prepare(&expr, &schema, &context).unwrap();
                 let value = invocation.evaluate_projection_row_async(ExpressionRow::Borrowed(&input), &context).await.unwrap();

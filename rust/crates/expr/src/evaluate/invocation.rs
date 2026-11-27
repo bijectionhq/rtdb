@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use super::{EvalContext,ExpressionRow,Schema,Expr,Value,Result,Anomaly,expression_type,reader,overflow,validate_projection_value};
 use rtdb_types::{ListBuilder,ListValue,LogicalType,ScalarType};
 use crate::string::pattern::{CompiledReplacement,compile_replacement_pattern};
