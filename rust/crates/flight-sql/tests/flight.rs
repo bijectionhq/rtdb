@@ -471,7 +471,7 @@ async fn inspection_ticket_issued_in_a_transaction_reads_that_transaction_connec
 }
 
 #[tokio::test]
-async fn query_ticket_is_unknown_once_a_database_it_reads_is_attached_again() {
+async fn query_ticket_reads_a_database_attached_again_under_its_name_at_the_same_basis() {
     let running = Running::start(None, FlightConfig::default()).await;
     running.node.database_or_attach("other".into(), Default::default()).await.unwrap().unwrap();
     let mut client = Client::connect(&running.server, None).await;
@@ -484,8 +484,17 @@ async fn query_ticket_is_unknown_once_a_database_it_reads_is_attached_again() {
         while running.node.catalog().database("other").is_ok() || running.node.catalog().is_draining("other") { tokio::task::yield_now().await; }
     }).await.unwrap();
     running.node.database_or_attach("other".into(), Default::default()).await.unwrap().unwrap();
+    // As the reference's QueryTicket.Run, the ticket names `other` by name and basis alone: the new attachment's
+    // history has no transaction at that basis yet, so the read refuses as xtdb/unindexed-tx rather than as unknown.
     let request = client.request(info.endpoint[0].ticket.clone().unwrap());
-    assert_eq!(client.client.do_get(request).await.unwrap_err().code(), tonic::Code::NotFound);
+    let refused = client.client.do_get(request).await.unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument, "{refused:?}");
+    assert!(refused.message().contains("after the latest completed tx"), "{refused:?}");
+    // Once the new history passes the basis, the ticket redeems at that basis: the later write is not visible.
+    let mut other = Client::connect_with_database(&running.server, None, Some("other")).await;
+    other.update("INSERT INTO docs (_id) VALUES (2)", None).await;
+    assert_eq!(integer(&client.redeem(&info).await[0], 0, 0), 0);
+    assert_eq!(integer(&client.query("SELECT count(*) AS n FROM other.public.docs").await[0], 0, 0), 1);
     running.stop().await;
 }
 
@@ -503,7 +512,7 @@ async fn ticket_carries_its_arrow_parameters_across_rebind() {
     let info = client.client.get_flight_info(request).await.unwrap().into_inner();
     let ticket = Any::decode(info.endpoint[0].ticket.as_ref().unwrap().ticket.as_ref()).unwrap();
     let handle = TicketStatementQuery::decode(ticket.value).unwrap().statement_handle;
-    assert!(handle.starts_with(b"RTDBFT\x04"));
+    assert!(handle.starts_with(b"RTDBFT\x05"));
 
     let text = RecordBatch::try_from_iter([("label", Arc::new(StringArray::from(vec!["new"])) as arrow_array::ArrayRef)]).unwrap();
     client.upload(command, vec![text]).await;
