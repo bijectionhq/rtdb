@@ -1920,19 +1920,16 @@ fn canonical_cells(
     if legacy_arrow && let Some(column) = canonical_arrow_document_column(&target, cells, arrays)? {
         return Ok((Arc::new(target), column));
     }
-    let (array, _writer) = match copy_document_floats(&target, &ty, cells, memory) {
-        Ok(Some(output)) => output,
-        Ok(None) | Err(_) => {
-            if let Some(output) = gather_document_column(&target, &ty, cells, memory) {
-                output
-            } else {
-                let missing = if ty == LogicalType::Nothing { &Value::Undefined } else { &Value::Null };
-                rtdb_columnar::copy_evaluated_cells(&ty, cells.len(), memory,
-                    |row| cells[row].map_or(Ok(0), DocumentCell::bound),
-                    |row| cells[row].map_or_else(|| Ok(missing.clone()), |cell| cell.value().map(Cow::into_owned)),
-                )?
-            }
-        }
+    let (array, _writer) = if let Some(output) = copy_document_floats(&target, &ty, cells, memory)? {
+        output
+    } else if let Some(output) = gather_document_column(&target, &ty, cells, memory)? {
+        output
+    } else {
+        let missing = if ty == LogicalType::Nothing { &Value::Undefined } else { &Value::Null };
+        rtdb_columnar::copy_evaluated_cells(&ty, cells.len(), memory,
+            |row| cells[row].map_or(Ok(0), DocumentCell::bound),
+            |row| cells[row].map_or_else(|| Ok(missing.clone()), |cell| cell.value().map(Cow::into_owned)),
+        )?
     };
     let column = arrays.column(array.get_array_memory_size(), || Ok(array))?;
     Ok((Arc::new(target), column))
@@ -2184,14 +2181,14 @@ fn canonical_document_struct(
 
 fn gather_document_column(
     field: &Field, ty: &LogicalType, cells: &[Option<&DocumentCell<'_>>], memory: &Arc<MemoryBudget>,
-) -> Option<(ArrayRef, Arc<MemoryReservation>)> {
+) -> Result<Option<(ArrayRef, Arc<MemoryReservation>)>> {
     use rtdb_columnar::{copy_nullable_cells, estimate_copy_cell_bytes, estimate_null_copy_cell_bytes};
 
     if ty.unencoded() != *ty || !canonical::selectable(field)
         || !cells.iter().flatten().any(|cell| matches!(cell, DocumentCell::Arrow { .. })) {
-        return None;
+        return Ok(None);
     }
-    let _inventory = memory.reserve(cells.len().checked_mul(128)?.checked_add(4096)?).ok()?;
+    let _inventory = memory.reserve(cells.len().checked_mul(128).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?)?;
     let mut sources = Vec::new();
     let mut picks = Vec::with_capacity(cells.len());
     let mut previous = None;
@@ -2199,10 +2196,10 @@ fn gather_document_column(
     let packed_null_bytes = cells.len() <= 128;
     let row_values = || cells.iter().flatten().filter_map(|cell| match cell { DocumentCell::Value(value) => Some(value.as_ref()), _ => None });
     if row_values().next().is_some() {
-        let reserve = memory.reserve(estimate_builder_bytes_refs(ty, row_values()).ok()?).ok()?;
-        let array = rtdb_columnar::copy_array_refs(ty, &row_values().collect::<Vec<_>>()).ok()?;
+        let reserve = memory.reserve(estimate_builder_bytes_refs(ty, row_values())?)?;
+        let array = rtdb_columnar::copy_array_refs(ty, &row_values().collect::<Vec<_>>())?;
         if !(0..array.len()).all(|row| canonical::selectable_cell(ArrowCell { field, array: array.as_ref(), row }, packed_null_bytes)) {
-            return None;
+            return Ok(None);
         }
         sources.push((array, Some(reserve)));
     }
@@ -2217,10 +2214,13 @@ fn gather_document_column(
             Some(DocumentCell::Arrow { cell: selected, .. }) => {
                 let ArrowCell { field: source, array: column, row } = *selected;
                 if !canonical::selectable(source) || !canonical::selectable_cell(*selected, packed_null_bytes) {
-                    return None;
+                    return Ok(None);
                 }
                 if previous.is_none_or(|prior| !std::ptr::eq(prior, column)) {
-                    sources.push(canonical::align(&arrow_array::make_array(column.to_data()), source, field, memory)?);
+                    let Some(aligned) = canonical::align(&arrow_array::make_array(column.to_data()), source, field, memory)? else {
+                        return Ok(None);
+                    };
+                    sources.push(aligned);
                     previous = Some(column);
                 }
                 picks.push(Some((sources.len() - 1, row)));
@@ -2228,19 +2228,19 @@ fn gather_document_column(
         }
     }
     let inputs = sources.iter().map(|(array, _)| array.as_ref()).collect::<Vec<_>>();
-    let null = estimate_null_copy_cell_bytes(field).ok()?;
+    let null = estimate_null_copy_cell_bytes(field)?;
     let bound = picks.iter().try_fold(4096usize, |size, pick| {
         let cell = match pick {
-            Some((page, row)) => estimate_copy_cell_bytes(field, inputs[*page], *row).ok()?,
+            Some((page, row)) => estimate_copy_cell_bytes(field, inputs[*page], *row)?,
             None => null,
         };
-        size.checked_add(cell.checked_mul(4)?)
+        size.checked_add(cell.checked_mul(4).ok_or_else(overflow)?).ok_or_else(overflow)
     })?;
-    let mut scratch = memory.reserve(bound).ok()?;
-    let array = copy_nullable_cells(&inputs, &picks).ok()?;
+    let mut scratch = memory.reserve(bound)?;
+    let array = copy_nullable_cells(&inputs, &picks)?;
     Arc::get_mut(&mut scratch).expect("The document gather owns its output")
-        .shrink_to(array.get_array_memory_size()).ok()?;
-    Some((array, scratch))
+        .shrink_to(array.get_array_memory_size())?;
+    Ok(Some((array, scratch)))
 }
 
 fn masks_dense_union(field: &Field, parent_can_mask: bool) -> bool {
@@ -5591,7 +5591,9 @@ mod tests {
                     declared: Some(logical),
                 }));
                 let selected = cells.iter().map(Some).collect::<Vec<_>>();
-                assert!(gather_document_column(&target, &ty, &selected, &memory).is_some(), "{}", field.name());
+                assert!(gather_document_column(&target, &ty, &selected, &memory).unwrap().is_some(), "{}", field.name());
+                assert!(gather_document_column(&target, &ty, &selected, &MemoryBudget::new(0))
+                    .unwrap_err().is(rtdb_types::AnomalyKind::ResourceExhausted));
             }
             let iids = (1..=length).map(|id| EntityId::Integer(id as i64).iid()).collect::<Vec<_>>();
             let table = TableRef::new("public", "docs");

@@ -69,18 +69,18 @@ fn argument_vector(chunk: &ArgumentChunk, position: usize, target: &Field, ty: &
                 && canonical::selectable(field) && canonical::selectable(target)
                 && validate_readable_column(field, array.as_ref(), source, memory).is_ok()
                 && (0..array.len()).all(|row| canonical::selectable_cell(ArrowCell { field, array: array.as_ref(), row }, false))
-                && let Some(aligned) = canonical::align(array, field, target, memory) {
+                && let Some(aligned) = canonical::align(array, field, target, memory)? {
                 return Ok(aligned);
             }
             if (*source_layout == SourceArgumentLayout::Uploaded || canonical_argument_field(field))
                 && can_copy_argument(source) && source.join(ty) == *ty {
                 validate_argument_uris(field, array.as_ref())?;
                 if has_valid_union_nulls(field, array.as_ref()) {
-                    if let Some(output) = aligned_argument(array, field, target, memory) { return Ok(output); }
+                    if let Some(output) = aligned_argument(array, field, target, memory)? { return Ok(output); }
                 } else if canonical_float_field(field)
-                    && let Ok(Some(normalized)) = normalize_float_argument(array, memory) {
+                    && let Some(normalized) = normalize_float_argument(array, memory)? {
                     let physical = normalized_field(field, &normalized);
-                    if let Some((output, scratch)) = aligned_argument(&normalized, &physical, target, memory) {
+                    if let Some((output, scratch)) = aligned_argument(&normalized, &physical, target, memory)? {
                         return Ok((output, scratch));
                     }
                 }
@@ -89,9 +89,8 @@ fn argument_vector(chunk: &ArgumentChunk, position: usize, target: &Field, ty: &
                 && has_valid_union_nulls(field, array.as_ref())
                 && (0..array.len()).all(|row| compatible_float_cell(ArrowCell { field, array: array.as_ref(), row }, Some(source))) {
                 let cells = (0..array.len()).map(|row| Some(ArrowCell { field, array: array.as_ref(), row }));
-                if let Ok(output) = crate::source::copy_float_cells(target, cells, memory) {
-                    return Ok((output.0, Some(output.1)));
-                }
+                let output = crate::source::copy_float_cells(target, cells, memory)?;
+                return Ok((output.0, Some(output.1)));
             }
             let (output, scratch) = copy_evaluated_cells(ty, batch.num_rows(), memory,
                 |row| estimate_read_cell_bytes(field, array.as_ref(), row),
@@ -123,13 +122,13 @@ fn normalize_float_argument(array: &ArrayRef, memory: &Arc<MemoryBudget>) -> Res
     Ok(data.ok().map(arrow_array::make_array))
 }
 
-fn aligned_argument(array: &ArrayRef, source: &Field, target: &Field, memory: &Arc<MemoryBudget>) -> Option<ArgumentVector> {
+fn aligned_argument(array: &ArrayRef, source: &Field, target: &Field, memory: &Arc<MemoryBudget>) -> Result<Option<ArgumentVector>> {
     if source.data_type() == target.data_type() && source.metadata() == target.metadata() {
-        return Some((Arc::clone(array), None));
+        return Ok(Some((Arc::clone(array), None)));
     }
-    let scratch = memory.reserve(arrow_relayout_bound(array.as_ref(), source, target).ok()?).ok()?;
-    let (field, converted) = relayout_arrow_column(Arc::clone(array), source, target).ok()?;
-    (field.data_type() == target.data_type()).then_some((converted, Some(scratch)))
+    let scratch = memory.reserve(arrow_relayout_bound(array.as_ref(), source, target)?)?;
+    let Ok((field, converted)) = relayout_arrow_column(Arc::clone(array), source, target) else { return Ok(None); };
+    Ok((field.data_type() == target.data_type()).then_some((converted, Some(scratch))))
 }
 
 pub(crate) fn canonical_float_field(field: &Field) -> bool {

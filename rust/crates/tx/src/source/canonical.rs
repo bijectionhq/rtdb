@@ -3,7 +3,7 @@ use std::sync::Arc;
 use arrow_array::ArrayRef;
 use arrow_schema::{DataType, Field, UnionMode};
 use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation, arrow_relayout_bound, from_field, leg_name, relayout_arrow_column};
-use rtdb_types::{LogicalType, OrderedSet};
+use rtdb_types::{LogicalType, OrderedSet, Result};
 
 pub(crate) fn selectable(field: &Field) -> bool {
     fn supported(field: &Field, masked: bool) -> bool {
@@ -35,12 +35,12 @@ pub(crate) fn selectable(field: &Field) -> bool {
 
 pub(crate) fn align(
     array: &ArrayRef, source: &Field, target: &Field, memory: &Arc<MemoryBudget>,
-) -> Option<(ArrayRef, Option<Arc<MemoryReservation>>)> {
-    if source.data_type() == target.data_type() { return Some((Arc::clone(array), None)); }
-    if retags_undefined(source, target) { return None; }
-    let scratch = memory.reserve(arrow_relayout_bound(array.as_ref(), source, target).ok()?).ok()?;
-    let (field, array) = relayout_arrow_column(Arc::clone(array), source, target).ok()?;
-    (field.data_type() == target.data_type()).then_some((array, Some(scratch)))
+) -> Result<Option<(ArrayRef, Option<Arc<MemoryReservation>>)>> {
+    if source.data_type() == target.data_type() { return Ok(Some((Arc::clone(array), None))); }
+    if retags_undefined(source, target) { return Ok(None); }
+    let scratch = memory.reserve(arrow_relayout_bound(array.as_ref(), source, target)?)?;
+    let Ok((field, array)) = relayout_arrow_column(Arc::clone(array), source, target) else { return Ok(None); };
+    Ok((field.data_type() == target.data_type()).then_some((array, Some(scratch))))
 }
 
 fn retags_undefined(source: &Field, target: &Field) -> bool {
