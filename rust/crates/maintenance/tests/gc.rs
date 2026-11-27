@@ -1131,7 +1131,8 @@ async fn term_directory_pages_are_released_on_the_window_of_their_retired_root_a
     let directory = |root: &RootRef| TermDirectoryRoot { definition_id: Some("docs_bodyf16".into()), definition_version: Some(1),
         root: Some(RootRef { summary: 1.0f64.to_be_bytes().to_vec(), ..root.clone() }.encode()), runs: Some(1), run_set: None };
     let run = SearchRun { definition_id: Some("docs_bodyf16".into()), definition_version: Some(1), blocks: vec![0],
-        digest: Some(vec![7; 32]), locator: Some(vec![1]), file_size: Some(4), source_rows: Some(1), ..Default::default() };
+        digest: Some(vec![7; 32]), locator: Some(vec![1]), file_size: Some(4), source_rows: Some(1), allocation: Some(vec![16; 16]),
+        ..Default::default() };
     let publish = |root: &RootRef, previous: Option<&RootRef>, at| {
         let basis = term_directory::publication_basis(previous.map(directory).as_ref(), previous.map(|_| [7; 32]));
         let change = SearchRunChange { run: Some(run.clone()), term_directory: Some(directory(root)), replaces_directory: Some(basis.to_vec()), ..Default::default() };
