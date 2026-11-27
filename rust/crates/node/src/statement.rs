@@ -716,7 +716,13 @@ fn arrow_surface_preparation_reuses_the_first_plan_across_query_budgets() {
     let statement_budget = MemoryBudget::new(1 << 20);
     let context = QueryContext::new(catalog, Arc::clone(&statement_budget), rtdb_types::Timestamp(0), "UTC", QueryOptions::default(), &cancellation).unwrap();
     let prepared = PreparedSql::prepare("SELECT 1", &context, Default::default(), ResultSignaturePolicy::Dynamic).unwrap();
-    let original = prepared.0.plan.lock().as_ref().unwrap().plan.lookups_and_query().unwrap().1.relation().clone();
+    let original = {
+        let cached = prepared.0.plan.lock();
+        let KeptPlan::Own { query, .. } = &cached.as_ref().unwrap().plan else {
+            panic!("a context without a shared cache keeps its own plan");
+        };
+        Arc::clone(query.relation())
+    };
     let query_budget = MemoryBudget::new(1 << 20);
     let mut query_context = context;
     Arc::make_mut(&mut query_context).memory = Arc::clone(&query_budget);
