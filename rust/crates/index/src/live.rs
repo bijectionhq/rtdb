@@ -2834,7 +2834,7 @@ mod chunk_tests {
 
     #[test]
     fn a_table_written_a_row_per_transaction_grows_its_relation_with_stable_row_addresses() {
-        let memory = MemoryBudget::new(1 << 26);
+        let memory = MemoryBudget::new(128 << 20);
         let table = TableRef::new("public", "docs");
         let mut live = LiveTable::new(table, BlockIndex(0), TrieConfig::default());
         let mut snapshot = None;

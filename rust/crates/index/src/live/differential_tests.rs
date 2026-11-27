@@ -143,7 +143,7 @@ fn appended_live_versions_hold_exactly_their_writes_rows_and_keep_them_after_lat
         verify_index(&base, &base_expected, &memory);
         versions.push((next, expected));
     }
-    assert!(versions.iter().any(|(live, _)| live.tables().values().any(|table| table.relation.len() > TrieConfig::default().log_limit())));
+    assert!(versions.iter().any(|(live, _)| live.tables().values().any(|table| table.row_count() as usize > TrieConfig::default().log_limit())));
     for (live, expected) in &versions { verify_index(live, expected, &memory); }
     drop(versions);
     assert_eq!(memory.used_bytes(), 0);
