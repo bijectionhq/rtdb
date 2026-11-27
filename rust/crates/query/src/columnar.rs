@@ -23,6 +23,7 @@ use rtdb_temporal::ResolvedRow;
 use rtdb_types::{ListKind, LogicalType, Result, ScalarType, Timestamp, Value};
 
 use crate::{invalid, pages::OwnedPage};
+use crate::trace::{OperatorCounter, operator_evidence_enabled};
 #[cfg(test)]
 use crate::{cursor::OwnedRow, pages::PageBuilder};
 
@@ -3676,17 +3677,20 @@ pub(crate) struct BatchFilter {
     compiled: Arc<[Option<functions::Predicate>]>,
     admissions: Option<Arc<[crate::compiled::Admission]>>, execution: crate::context::Execution,
     stage_analysis: Vec<Option<Arc<crate::analysis::AnalysisNode>>>,
+    scalar_fallbacks: Option<u64>,
 }
 impl BatchFilter {
     pub fn new(input: BoxBatchCursor, schema: rtdb_plan::Schema, predicate: rtdb_plan::Expr, execution: crate::context::Execution) -> Self {
         let compiled: Arc<[Option<functions::Predicate>]> = Arc::from([functions::Predicate::bind(&predicate, &schema)]);
-        Self { input, schema: Arc::new(schema), stages: vec![predicate].into(), compiled, admissions: None, execution, stage_analysis: Vec::new() }
+        let scalar_fallbacks = operator_evidence_enabled(&execution.context).then_some(0);
+        Self { input, schema: Arc::new(schema), stages: vec![predicate].into(), compiled, admissions: None, execution, stage_analysis: Vec::new(), scalar_fallbacks }
     }
     /// Applies a compiled plan's predicates, sharing their plan-time bindings and admissions with every execution of that plan.
     pub(crate) fn admitted(input: BoxBatchCursor, predicates: &crate::compiled::Predicates, execution: crate::context::Execution) -> Self {
+        let scalar_fallbacks = operator_evidence_enabled(&execution.context).then_some(0);
         Self { input, schema: Arc::clone(&predicates.schema), stages: Arc::clone(&predicates.stages),
             compiled: Arc::clone(&predicates.compiled),
-            admissions: Some(Arc::clone(&predicates.admissions)), execution, stage_analysis: Vec::new() }
+            admissions: Some(Arc::clone(&predicates.admissions)), execution, stage_analysis: Vec::new(), scalar_fallbacks }
     }
     /// Measures each stage, innermost first, as the filter it was fused from; `None` leaves a stage to its operator's wrapper.
     pub fn observing_stages(mut self, stage_analysis: Vec<Option<Arc<crate::analysis::AnalysisNode>>>) -> Self {
@@ -3713,7 +3717,10 @@ impl BatchCursor for BatchFilter {
             };
             for (index, predicate) in self.stages.iter().enumerate() {
                 let admission = self.admissions.as_ref().map(|admissions| &admissions[index]);
-                let selection = admitted_predicate_selection(&batch, predicate, &self.schema, &self.execution, self.compiled[index].as_ref(), admission).await?;
+                let selection = admitted_predicate_selection_counted(
+                    &batch, predicate, &self.schema, &self.execution, self.compiled[index].as_ref(), admission,
+                    self.scalar_fallbacks.as_mut(),
+                ).await?;
                 if selection.count == 0 {
                     self.observe_stages(index, stages, started, None)?;
                     continue 'batches;
@@ -3724,7 +3731,12 @@ impl BatchCursor for BatchFilter {
             return Ok(Some(batch));
         }
     }
-    fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) { self.input.trace_attributes(span) }
+    fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) {
+        self.input.trace_attributes(span);
+        if let Some(count) = self.scalar_fallbacks {
+            OperatorCounter::PredicateScalarFallbacks.record(span, count);
+        }
+    }
     fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { self.input.scan_counts() }
 }
 
@@ -3748,6 +3760,13 @@ pub(crate) async fn predicate_selection(
 pub(crate) async fn admitted_predicate_selection(
     batch: &ColumnBatch, predicate: &rtdb_plan::Expr, schema: &rtdb_plan::Schema, execution: &crate::context::Execution,
     compiled: Option<&functions::Predicate>, admission: Option<&crate::compiled::Admission>,
+) -> Result<PredicateSelection> {
+    admitted_predicate_selection_counted(batch, predicate, schema, execution, compiled, admission, None).await
+}
+
+async fn admitted_predicate_selection_counted(
+    batch: &ColumnBatch, predicate: &rtdb_plan::Expr, schema: &rtdb_plan::Schema, execution: &crate::context::Execution,
+    compiled: Option<&functions::Predicate>, admission: Option<&crate::compiled::Admission>, scalar_fallbacks: Option<&mut u64>,
 ) -> Result<PredicateSelection> {
     execution.context.check_cancelled()?;
     let params = execution.parameters.evaluator();
@@ -3777,6 +3796,9 @@ pub(crate) async fn admitted_predicate_selection(
     let reservation = memory.reserve(PredicateSelection::bitmap_bound(batch.len))?;
     let mut mask = BooleanBufferBuilder::new(batch.len);
     let mut count = 0;
+    if let Some(fallbacks) = scalar_fallbacks && batch.len != 0 {
+        *fallbacks = fallbacks.saturating_add(1);
+    }
     for row in 0..batch.len {
         let input = BatchRow { batch, row, admit_dates: false };
         let value = execution.evaluate_invocation_row(
@@ -4861,6 +4883,7 @@ pub(crate) struct BatchExpressions {
     cosine: Option<Vec<Option<crate::cosine::Projection>>>,
     functions: Arc<[Option<functions::Projection>]>, functions_clocked: bool,
     admissions: Arc<[crate::compiled::Admission]>, execution: crate::context::Execution, validate_input: bool,
+    scalar_fallbacks: Option<u64>,
 }
 impl BatchExpressions {
     pub fn new(input: BoxBatchCursor, schema: rtdb_plan::Schema, expressions: Vec<rtdb_plan::Expr>, execution: crate::context::Execution) -> Self {
@@ -4871,14 +4894,16 @@ impl BatchExpressions {
         }).collect();
         let admissions = expressions.iter().map(crate::compiled::Admission::of).collect();
         let clocked = (!has_clock).then(|| Arc::clone(&expressions));
-        Self { input, schema: Arc::new(schema), expressions, clocked, cosine: None, functions, functions_clocked: !has_clock, admissions, execution, validate_input: false }
+        let scalar_fallbacks = operator_evidence_enabled(&execution.context).then_some(0);
+        Self { input, schema: Arc::new(schema), expressions, clocked, cosine: None, functions, functions_clocked: !has_clock, admissions, execution, validate_input: false, scalar_fallbacks }
     }
     /// Computes a compiled plan's projections, sharing their plan-time bindings and admissions with every execution of that plan.
     pub(crate) fn admitted(input: BoxBatchCursor, projections: &crate::compiled::Projections, execution: crate::context::Execution) -> Self {
         let clocked = (!projections.has_clock).then(|| Arc::clone(&projections.expressions));
+        let scalar_fallbacks = operator_evidence_enabled(&execution.context).then_some(0);
         Self { input, schema: Arc::clone(&projections.schema), expressions: Arc::clone(&projections.expressions), clocked, cosine: None,
             functions: Arc::clone(&projections.functions), functions_clocked: !projections.has_clock,
-            admissions: Arc::clone(&projections.admissions), execution, validate_input: false }
+            admissions: Arc::clone(&projections.admissions), execution, validate_input: false, scalar_fallbacks }
     }
     pub fn validating_input(mut self, validate: bool) -> Self {
         self.validate_input = validate;
@@ -5034,6 +5059,9 @@ impl BatchCursor for BatchExpressions {
             let retained = lease.bytes();
             let value_slots = batch.len.checked_mul(std::mem::size_of::<Value>()).ok_or_else(size_error)?;
             let primitive_bound = batch.len.checked_mul(9).and_then(|bytes| bytes.checked_add(512)).ok_or_else(size_error)?;
+            if let Some(fallbacks) = &mut self.scalar_fallbacks && batch.len != 0 {
+                *fallbacks = fallbacks.saturating_add(1);
+            }
             // Extra CASE shapes must leave at least as much room for row evaluation as the value buffer would.
             if crate::cosine::has_score_output(expression, primitive_bound <= value_slots)
                 && let Some(column) = evaluate_score_column(&batch, &self.execution, &invocation, &scope, lease, primitive_bound).await?
@@ -5086,7 +5114,12 @@ impl BatchCursor for BatchExpressions {
         drop(batch);
         finish_expression_page(columns, owners, len, base, reservation, memory).map(Some)
     }
-    fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) { self.input.trace_attributes(span) }
+    fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) {
+        self.input.trace_attributes(span);
+        if let Some(count) = self.scalar_fallbacks {
+            OperatorCounter::ProjectionScalarFallbacks.record(span, count);
+        }
+    }
     fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { self.input.scan_counts() }
 }
 

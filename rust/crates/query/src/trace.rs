@@ -170,7 +170,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use rtdb_columnar::MemoryBudget;
-    use rtdb_plan::{ColumnId, Expr, Field, Relation, RelationNode, Schema, SpanContext, Tracer};
+    use rtdb_plan::{BinaryOp, ColumnId, Expr, Field, NamedExpr, RegexFormBuilder, RegexReplacement, Relation, RelationNode, Schema, SpanContext, Tracer};
     use rtdb_storage::{MemoryStore, cache::BufferPool};
     use rtdb_types::{LogicalType, ScalarType, Timestamp, Value};
     use tokio_util::sync::CancellationToken;
@@ -252,6 +252,60 @@ mod tests {
             }
         }
         assert_eq!(pulled_pages, Some(1));
+    }
+
+    #[tokio::test]
+    async fn scalar_fallbacks_count_reached_batches_on_the_producing_cursor() {
+        let literal = |text: &str| Expr::Literal(Value::Utf8(text.into()));
+        let raw = |text: &str| {
+            let mut builder = RegexFormBuilder::new_untracked();
+            builder.literal(&Value::Utf8(text.into())).unwrap();
+            builder.finish().unwrap()
+        };
+        let input = field(0, "word", ScalarType::Utf8);
+        let pages = [["xx", "xy"], ["aa", "bb"]].into_iter()
+            .map(|page| page.into_iter().map(|word| vec![literal(word)]).collect()).collect();
+        let source = Arc::new(Relation::new(Schema::new(vec![input.clone()]).unwrap(), RelationNode::LiteralPages { pages }).unwrap());
+        let replace = Expr::regex_replace(input.expression(), RegexReplacement {
+            pattern: raw("^x"), replacement: raw("y"), ..Default::default()
+        });
+        let filter = Arc::new(source.filter(Expr::binary(BinaryOp::NotEq, replace.clone(), input.expression())).unwrap());
+        let project = Arc::new(filter.project(vec![
+            NamedExpr { field: input.clone(), expr: input.expression() },
+            NamedExpr { field: field(1, "out", ScalarType::Utf8), expr: replace },
+        ]).unwrap());
+
+        for enabled in [false, true] {
+            let (tracer, mut receiver) = rtdb_metrics::TraceRecorder::new(MemoryBudget::new(1 << 20), 8, enabled, false).unwrap();
+            let context = query_context().with_tracer(Some(tracer.clone()), None);
+            let query = QueryTrace::start(&context, None);
+            let context = context.with_tracer(Some(tracer.clone()), query.as_ref().map(QueryTrace::context));
+            let mut cursor = open(Arc::clone(&project), context).await;
+            let batch = cursor.next_batch().await.unwrap().unwrap();
+            assert_eq!(batch.len, 2);
+            assert_eq!(batch.columns[1].value(0).unwrap(), Value::Utf8("yx".into()));
+            assert_eq!(batch.columns[1].value(1).unwrap(), Value::Utf8("yy".into()));
+            assert!(cursor.next_batch().await.unwrap().is_none());
+            drop((cursor, query));
+            tracer.close();
+
+            let mut fallbacks = Vec::new();
+            while let Some(span) = receiver.next().await {
+                for (name, value) in span.attributes().filter(|(name, _)| name.ends_with(".scalar_fallbacks")) {
+                    fallbacks.push((span.name.clone(), name.to_owned(), value.parse::<u64>().unwrap()));
+                }
+            }
+            fallbacks.sort();
+            let expected: Vec<(String, String, u64)> = if enabled {
+                vec![
+                    ("query.cursor.project".into(), "cursor.projection.scalar_fallbacks".into(), 1),
+                    ("query.cursor.select".into(), "cursor.predicate.scalar_fallbacks".into(), 2),
+                ]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(fallbacks, expected);
+        }
     }
 
     #[tokio::test]

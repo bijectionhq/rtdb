@@ -86,6 +86,20 @@ The operator states are passive, single-writer transients.
 No operator starts a detached task or owns a transaction, ingestion, replication, or node lifecycle loop.
 Spill files are scoped temporary resources with a retained-byte quota.
 
+== Query tracing
+
+Operator evidence is attached to the producing cursor's span as numeric attributes with fixed keys.
+A traced operator boundary collects its own attributes, including those of its internal cursor adapters.
+`cursor.predicate.scalar_fallbacks` and `cursor.projection.scalar_fallbacks` count nonempty batch evaluations that enter the scalar evaluator.
+An expression evaluated across several rows contributes one fallback for that batch.
+The count includes a reached fallback that discards the entire input batch or encounters a scalar error.
+Operators sample their existing batch boundaries when query tracing is enabled.
+
+`cursor.peak_memory_bytes` reports the peak reservation in the operator's memory scope.
+`query.spill_region_peak_bytes` reports the existing high-water mark for bytes reserved by all spill files in the query context.
+Multiple executions opened from one context can share that spill region.
+The public `EXPLAIN ANALYZE` report uses its existing schema.
+
 == Implemented source paths
 
 * Visibility resolution merges each common trie task in IID order and descending system time, with newer segments first at equal system times.
