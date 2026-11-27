@@ -189,17 +189,62 @@ async fn anti_equijoin_preserves_signed_zero_nan_and_mixed_float_equality() {
 
     let large = 1_i64 << 53;
     for (probe_type, probe_keys, build_keys, expected_ids) in [
-        (ScalarType::F32, vec![F32(-0.0), F32(0.0), F32(1.5), F32(f32::NAN), Null],
-            vec![F64(0.0), F64(1.5), F64(f64::NAN), Null], [3, 4]),
+        (ScalarType::F32, vec![F32(-0.0), F32(0.0), F32(1.5), F32(f32::from_bits(0x7fc0_0000)), Null],
+            vec![F64(0.0), F64(1.5), F64(f64::from_bits(0x7ff8_0000_0000_0000)), Null], [3, 4]),
         (ScalarType::I64, vec![I64(0), I64(large), I64(large + 1), I64(large + 2), Null],
             vec![F64(-0.0), F64(large as f64), Null], [3, 4]),
     ] {
+        let float_probe = probe_type == ScalarType::F32;
         let probe_rows = probe_keys.into_iter().enumerate().map(|(id, key)| vec![key, I64(id as i64)]).collect();
         let probe = typed_rows(0, &[probe_type, ScalarType::I64], probe_rows);
         let build = typed_rows(2, &[ScalarType::F64], build_keys.into_iter().map(|key| vec![key]).collect());
         let key = Expr::binary(BinaryOp::Eq, probe.schema().fields()[0].expression(), build.schema().fields()[0].expression());
-        let rows = collect(&join(probe, build, JoinKind::Anti, key), &context(&CancellationToken::new())).await.unwrap();
-        assert_eq!(rows.into_iter().map(|row| row[1].clone()).collect::<Vec<_>>(), expected_ids.map(I64));
+        let query = join(probe, build, JoinKind::Anti, key);
+        for threshold in [i64::MAX, 1] {
+            let context = join_context(&CancellationToken::new(), threshold);
+            let rows = collect(&query, &context).await.unwrap();
+            let mut expected = expected_ids;
+            if float_probe && threshold == 1 { expected.reverse(); }
+            assert_eq!(rows.into_iter().map(|row| row[1].clone()).collect::<Vec<_>>(), expected.map(I64));
+            assert_eq!(context.spill_peak_bytes() > 0, threshold == 1);
+            assert_eq!(context.spill_bytes(), 0);
+            assert_eq!(context.memory.used_bytes(), 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn mixed_numeric_join_spill_keeps_signed_zero_fanout_in_candidate_order() {
+    use Value::{F32, F64, I16, I64, Null};
+
+    let build = typed_rows(0, &[ScalarType::F64, ScalarType::I64, ScalarType::I64], vec![
+        vec![F64(-0.0), I64(-12), I64(10)],
+        vec![F64(f64::from_bits(0x7ff8_0000_0000_0123)), I64(-12), I64(11)],
+        vec![Null, I64(-12), I64(12)],
+        vec![F64(0.0), I64(-12), I64(13)],
+    ]);
+    let RelationNode::Values { rows } = build.node() else { unreachable!() };
+    let pages = rows.chunks(2).map(<[_]>::to_vec).collect();
+    let build = Arc::new(Relation::new(build.schema().clone(), RelationNode::LiteralPages { pages }).unwrap());
+    let probe = typed_rows(3, &[ScalarType::F32, ScalarType::I16, ScalarType::I64], vec![
+        vec![F32(0.0), I16(-12), I64(20)],
+        vec![F32(f32::NAN), I16(-12), I64(21)],
+        vec![Null, I16(-12), I64(22)],
+        vec![F32(-0.0), I16(-12), I64(23)],
+        vec![F32(0.0), I16(-13), I64(24)],
+    ]);
+    let second_column = Expr::binary(BinaryOp::Eq, probe.schema().fields()[1].expression(), build.schema().fields()[1].expression());
+    let first_column = Expr::binary(BinaryOp::Eq, build.schema().fields()[0].expression(), probe.schema().fields()[0].expression());
+    let query = join(build, probe, JoinKind::Inner, Expr::binary(BinaryOp::And, second_column, first_column));
+
+    for threshold in [i64::MAX, 1] {
+        let context = join_context(&CancellationToken::new(), threshold);
+        let rows = collect(&query, &context).await.unwrap();
+        let ids = rows.into_iter().map(|row| (row[2].clone(), row[5].clone())).collect::<Vec<_>>();
+        assert_eq!(ids, [(I64(10), I64(20)), (I64(13), I64(20)), (I64(10), I64(23)), (I64(13), I64(23))]);
+        assert_eq!(context.spill_peak_bytes() > 0, threshold == 1);
+        assert_eq!(context.spill_bytes(), 0);
+        assert_eq!(context.memory.used_bytes(), 0);
     }
 }
 

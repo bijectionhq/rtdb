@@ -2372,6 +2372,9 @@ surface QueryAccess {
         -- This search keeps a probe row when any of its key cells is NULL or every candidate fails to match.
         -- Other batch anti joins visit the build rows available to the probe in build order, including rows with different hashes, and stop at the first true result or reached error.
         -- Join partitions retain flat and nested layouts in Arrow IPC, including selected cells whose physical fields differ.
+        -- Equijoin shuffle and partition replay hash admitted scalar key columns in equality-pair order, using ordered row hashing for other layouts.
+        -- Equijoins over compatible primitive scalar key types hash either floating zero sign as positive zero in the join index and both shuffles.
+        -- Anti joins with fallible predicates or keys keep their raw partition routing and ordered comparison of the reached build rows.
         -- An Arrow equijoin uses the raw vector hash of compatible floating-point list keys and compares their selected components.
         -- Join, sort, membership, and materialized-relation spills replay Arrow batches under the query's spill budget, which is unlimited by default and refuses bytes past any configured limit (including zero).
         -- Each spilled page is written whole under its encoding reservation, and a budget or quota refusal fails the query.

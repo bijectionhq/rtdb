@@ -109,18 +109,23 @@ pub(crate) struct TypedKeys<'a> {
 
 impl TypedKeys<'_> {
     pub(crate) fn hash_vector_into(&self, hashes: &mut [u32], context: &QueryContext) -> Result<()> {
-        self.hash_into(hashes, context, |hash, cell| combine_cell_hash(hash, cell as i32))
+        self.hash_join_into(hashes, context, JoinHash::Vector)
+    }
+
+    pub(crate) fn hash_join_into(&self, hashes: &mut [u32], context: &QueryContext, hashing: JoinHash) -> Result<()> {
+        self.hash_into(hashes, context, |key| hashing.scalar(key), |hash, cell| combine_cell_hash(hash, cell as i32))
     }
 
     fn hash_for_index(&self, hashes: &mut [u32], context: &QueryContext, hashing: KeyHash) -> Result<()> {
         match hashing {
-            KeyHash::Set => self.hash_into(hashes, context, combine_equality_hash),
+            KeyHash::Set => self.hash_into(hashes, context, |key| key.hash(), combine_equality_hash),
             KeyHash::Vector => self.hash_vector_into(hashes, context),
         }
     }
 
     fn hash_into(
-        &self, hashes: &mut [u32], context: &QueryContext, combine: impl Fn(u32, u32) -> u32,
+        &self, hashes: &mut [u32], context: &QueryContext, hash_cell: impl Fn(ScalarKey<'_>) -> u32,
+        combine: impl Fn(u32, u32) -> u32,
     ) -> Result<()> {
         let len = self.source.batch.len;
         assert_eq!(len, hashes.len());
@@ -130,7 +135,7 @@ impl TypedKeys<'_> {
             column.visit(len, |key| {
                 let (row, hash) = output.next().expect("The column emits one key per row");
                 context.check_cancelled_at(row)?;
-                *hash = combine(*hash, key.hash());
+                *hash = combine(*hash, hash_cell(key));
                 Ok(())
             })?;
         }
@@ -166,6 +171,21 @@ pub(crate) struct Key<'a> {
 enum KeyHash {
     Set,
     Vector,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JoinHash {
+    Vector,
+    CanonicalZero,
+}
+
+impl JoinHash {
+    pub(crate) fn scalar(self, key: ScalarKey<'_>) -> u32 {
+        match key {
+            ScalarKey::Float(value) if self == Self::CanonicalZero && value == 0.0 => ScalarKey::Float(0.0).hash(),
+            _ => key.hash(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -351,10 +371,25 @@ impl<'a> Key<'a> {
     }
 
     pub(crate) fn vector_hash(&self) -> Result<u32> {
+        self.join_hash(JoinHash::Vector)
+    }
+
+    pub(crate) fn join_hash(&self, hashing: JoinHash) -> Result<u32> {
         (0..self.len()).try_fold(0, |hash, index| {
             let cell = match self.cached(index) {
-                Some(value) => rtdb_columnar::hash_value(value, 0)?,
-                None => self.direct(index).expect("An unread key has a direct reader").hash(),
+                Some(value) => {
+                    if hashing == JoinHash::CanonicalZero
+                        && let Some(key @ ScalarKey::Float(_)) = ScalarKey::from_value(value)
+                    {
+                        hashing.scalar(key) as i32
+                    } else {
+                        rtdb_columnar::hash_value(value, 0)?
+                    }
+                }
+                None => match self.direct(index).expect("An unread key has a direct reader") {
+                    DirectKey::Scalar(key) => hashing.scalar(key) as i32,
+                    key => key.hash(),
+                },
             };
             Ok(combine_cell_hash(hash, cell))
         })
@@ -1026,6 +1061,54 @@ mod tests {
         assert_eq!(nulls.equal_at(&nulls, 1, false, &context, None).unwrap(), None);
         assert_eq!(nan.equal_at(&nan, 1, true, &context, None).unwrap(), Some(false));
         assert!(typed.equal_rows(0, 5));
+    }
+
+    #[test]
+    fn join_hashes_agree_with_numeric_equality_across_typed_and_row_readers() {
+        let context = context();
+        let large = 1_i64 << 53;
+        let pages = [
+            batch(Arc::new(Int64Array::from(vec![Some(0), Some(large), Some(large + 1), None])),
+                vec![Some("key"); 4], &context),
+            batch(Arc::new(Float32Array::from(vec![Some(-0.0), Some(1.5), Some(f32::NAN), None])),
+                vec![Some("key"); 4], &context),
+            batch(Arc::new(Float64Array::from(vec![Some(0.0), Some(1.5), Some(large as f64),
+                Some(f64::from_bits(0x7ff8_0000_0000_0123)), None])), vec![Some("key"); 5], &context),
+        ];
+        let projection = [1, 0];
+        let scope = rtdb_expr::EvaluationScope::new(&context.memory).unwrap();
+        for left in &pages {
+            let typed_left = KeyColumns::projection(left, &projection).bind_typed(&context).unwrap().unwrap();
+            let mut left_hashes = vec![0; left.len];
+            typed_left.hash_join_into(&mut left_hashes, &context, JoinHash::CanonicalZero).unwrap();
+            for right in &pages {
+                let typed_right = KeyColumns::projection(right, &projection).bind_typed(&context).unwrap().unwrap();
+                let mut right_hashes = vec![0; right.len];
+                typed_right.hash_join_into(&mut right_hashes, &context, JoinHash::CanonicalZero).unwrap();
+                for (l, &hash) in left_hashes.iter().enumerate() {
+                    let row = Key::for_columns(left, l, false, &projection, &context).unwrap();
+                    assert_eq!(row.join_hash(JoinHash::CanonicalZero).unwrap(), hash);
+                    for (r, &right_hash) in right_hashes.iter().enumerate() {
+                        let lvalue = left.columns[0].value(l).unwrap();
+                        let rvalue = right.columns[0].value(r).unwrap();
+                        let expected = rtdb_expr::sql_eq(&lvalue, &rvalue, &scope).unwrap();
+                        let left = typed_left.key(l, false);
+                        let right = typed_right.key(r, false);
+                        assert_eq!(left.equal_at(&right, 1, false, &context, None).unwrap(), expected);
+                        let both_null = matches!((&lvalue, &rvalue), (Value::Null, Value::Null));
+                        if both_null || expected == Some(true) {
+                            assert_eq!(left.equal_at(&right, 1, true, &context, None).unwrap(), Some(true));
+                            assert_eq!(hash, right_hash);
+                        }
+                    }
+                }
+            }
+        }
+
+        let positive = Key::for_columns(&pages[2], 0, false, &[0], &context).unwrap();
+        let negative = Key::for_columns(&pages[1], 0, false, &[0], &context).unwrap();
+        assert_ne!(positive.vector_hash().unwrap() & 3, negative.vector_hash().unwrap() & 3);
+        assert_eq!(positive.join_hash(JoinHash::CanonicalZero).unwrap(), negative.join_hash(JoinHash::CanonicalZero).unwrap());
     }
 
     #[test]

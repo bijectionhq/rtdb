@@ -183,6 +183,7 @@
 -- A compatible inner equijoin hashes and compares its Arrow key cells at their build and probe positions.
 -- Hash joins hash admitted scalar key columns over each page and use the same row hash for other layouts.
 -- Its Bloom and bounded entity ID filters use those same build-side vectors.
+-- A query-generated join Bloom covers both persisted floating zero encodings for a numeric zero build key.
 -- An equijoin can partition and replay its consumed input as Arrow record batches and Arrow selections.
 -- Supported computed keys and plain numeric residual comparisons retain the payload positions through match selection.
 -- Floating-point residuals preserve unknown for null operands and unordered comparison for NaN.

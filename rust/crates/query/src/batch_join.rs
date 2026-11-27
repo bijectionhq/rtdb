@@ -17,7 +17,7 @@ use crate::operators::{BatchOutput, build_batch_input};
 use crate::pushdown::{PushdownBuilder, Pushdowns};
 use crate::runtime_schema::EmittedRelation;
 use crate::scalar_key::{ScalarColumn, ScalarKey};
-use crate::set_keys::{Key, KeyColumns, TypedKeys, direct_key_equal};
+use crate::set_keys::{JoinHash, Key, KeyColumns, TypedKeys, direct_key_equal};
 
 /// For each equality, whether its first operand is the build side's key.
 pub(crate) fn key_order(layout: &JoinLayout) -> Option<Vec<bool>> {
@@ -237,6 +237,7 @@ enum AntiKeyKind {
     Null,
     Bool,
     Signed,
+    Float,
     Bytes,
 }
 
@@ -256,9 +257,8 @@ impl AntiKeyKind {
             ScalarColumn::Null => Self::Null,
             ScalarColumn::Bool(_) => Self::Bool,
             ScalarColumn::I8(_) | ScalarColumn::I16(_) | ScalarColumn::I32(_) | ScalarColumn::I64(_) => Self::Signed,
+            ScalarColumn::F32(_) | ScalarColumn::F64(_) => Self::Float,
             ScalarColumn::Text(_) | ScalarColumn::Bytes(_) => Self::Bytes,
-            // Float equality merges signed zeros, whose vector hashes can differ.
-            ScalarColumn::F32(_) | ScalarColumn::F64(_) => return None,
         })
     }
 }
@@ -344,6 +344,7 @@ pub(crate) struct BatchJoin { state: State, spec: Spec }
 struct Spec {
     order: Vec<bool>, build_keys: Vec<usize>, probe_keys: Vec<usize>, widths: [usize; 2], kind: JoinKind, count_only: bool,
     projected: [bool; 2], swapped: bool, _original_layout_charge: Option<Arc<MemoryReservation>>, theta: Vec<ThetaTest>, residual: Option<Residual>, execution: Execution,
+    hash: JoinHash,
 }
 
 impl BatchJoin {
@@ -352,7 +353,7 @@ impl BatchJoin {
         let probe_keys = layout.right.key_positions().to_vec();
         let widths = [layout.left.original.len(), layout.right.original.len()];
         Self { state: State::Build { build, probe, layout }, spec: Spec { order, build_keys, probe_keys, widths, kind: JoinKind::Inner, count_only: false,
-            projected, swapped: false, _original_layout_charge: None, theta: Vec::new(), residual: None, execution } }
+            projected, swapped: false, _original_layout_charge: None, theta: Vec::new(), residual: None, execution, hash: JoinHash::Vector } }
     }
 }
 
@@ -386,6 +387,7 @@ impl Spec {
     }
 
     async fn build(&mut self, build: BoxBatchCursor, probe: ProbeInput, layout: JoinLayout) -> Result<State> {
+        self.hash = self.hash_policy(&layout);
         let mut build = layout.left.project_batches(build, &self.execution);
         let memory = Arc::clone(&self.execution.context.memory);
         let threshold = self.execution.context.options.join_build_rows;
@@ -443,7 +445,7 @@ impl Spec {
                 && let Some(keys) = KeyColumns::projection(batch, &self.build_keys).bind_typed(context)? {
                 let start = hashes.len();
                 hashes.resize(start.checked_add(batch.len).ok_or_else(size_error)?, 0);
-                keys.hash_vector_into(&mut hashes[start..], context)?;
+                keys.hash_join_into(&mut hashes[start..], context, self.hash)?;
             } else {
                 for row in 0..batch.len {
                     context.check_cancelled_at(row)?;
@@ -456,11 +458,36 @@ impl Spec {
         Ok(Table { batches, starts, index, anti_key_layout, rows, unmatched: None, _starts: reservation, _inventory: inventory })
     }
 
-    fn anti_build_layout(&self, batches: &[ColumnBatch]) -> Option<usize> {
-        if self.kind != JoinKind::Anti || self.build_keys.is_empty() || !self.theta.is_empty() || self.residual.is_some()
-            || self.build_keys.iter().any(|&position| position >= self.widths[0])
-            || self.probe_keys.iter().any(|&position| position >= self.widths[1])
+    fn direct_anti_equality(&self) -> bool {
+        self.kind == JoinKind::Anti && !self.build_keys.is_empty() && self.theta.is_empty() && self.residual.is_none()
+            && self.build_keys.iter().all(|&position| position < self.widths[0])
+            && self.probe_keys.iter().all(|&position| position < self.widths[1])
+    }
+
+    fn hash_policy(&self, layout: &JoinLayout) -> JoinHash {
+        fn scalar(ty: &LogicalType) -> bool {
+            match ty {
+                LogicalType::Null | LogicalType::Scalar(
+                    ScalarType::Bool | ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64
+                    | ScalarType::F32 | ScalarType::F64 | ScalarType::Utf8 | ScalarType::Binary
+                ) => true,
+                LogicalType::Maybe(value) | LogicalType::RunEndEncoded { value, .. } => scalar(value),
+                LogicalType::Union(legs) => legs.iter().all(scalar),
+                _ => false,
+            }
+        }
+        if (self.kind != JoinKind::Anti || self.direct_anti_equality())
+            && self.build_keys.iter().all(|&key| scalar(&layout.left.schema.fields()[key].data_type))
+            && self.probe_keys.iter().all(|&key| scalar(&layout.right.schema.fields()[key].data_type))
         {
+            JoinHash::CanonicalZero
+        } else {
+            JoinHash::Vector
+        }
+    }
+
+    fn anti_build_layout(&self, batches: &[ColumnBatch]) -> Option<usize> {
+        if !self.direct_anti_equality() {
             return None;
         }
         let mut batches = batches.iter().enumerate().filter(|(_, batch)| batch.len != 0);
@@ -477,9 +504,12 @@ impl Spec {
     fn anti_probe_compatible(&self, table: &Table, probe: &ColumnBatch) -> bool {
         let Some(layout) = table.anti_key_layout else { return false; };
         let build = &table.batches[layout];
+        use AntiKeyKind::{Float, Null, Signed};
         self.build_keys.iter().zip(&self.probe_keys).all(|(&left, &right)| {
             match (AntiKeyKind::of(&build.columns[left]), probe.columns.get(right).and_then(AntiKeyKind::of)) {
-                (Some(left), Some(right)) => left == right || left == AntiKeyKind::Null || right == AntiKeyKind::Null,
+                (Some(Float), Some(Float | Signed | Null)) | (Some(Signed | Null), Some(Float)) => self.hash == JoinHash::CanonicalZero,
+                (Some(Float), _) | (_, Some(Float)) => false,
+                (Some(left), Some(right)) => left == right || left == Null || right == Null,
                 _ => false,
             }
         })
@@ -489,7 +519,7 @@ impl Spec {
         self.probe_keys.iter().try_fold(0, |hash, &position| {
             match ScalarKey::read(&probe.columns[position], row).expect("An admitted anti key has a scalar reader") {
                 ScalarKey::Null => None,
-                key => Some(combine_cell_hash(hash, key.hash() as i32)),
+                key => Some(combine_cell_hash(hash, self.hash.scalar(key) as i32)),
             }
         })
     }
@@ -505,7 +535,7 @@ impl Spec {
             build.append(batch, context)?;
         }
         drop(rest);
-        let build = build.finish(context)?.shuffle(1, context, |batch, row| self.key_hash(batch, row, 0))?;
+        let build = build.finish(context)?.shuffle_keys(1, context, &self.build_keys, self.projected[0], self.hash)?;
         let Some((input, projected)) = build_batch_input(probe.runtime, probe.execution, probe.pushdowns, probe.output).await? else {
             return Err(crate::join_spill::layout_error());
         };
@@ -516,12 +546,12 @@ impl Spec {
             batch.validate_readable(context)?;
             probe.append(batch, context)?;
         }
-        let probe = probe.finish(context)?.shuffle(build.count(), context, |batch, row| self.key_hash(batch, row, 1))?;
+        let probe = probe.finish(context)?.shuffle_keys(build.count(), context, &self.probe_keys, self.projected[1], self.hash)?;
         Ok(DiskJoin { build, probe, table: None, build_partition: 0, probe_partition: 0, ready: None })
     }
 
     fn key_hash(&self, batch: &ColumnBatch, row: usize, side: usize) -> Result<u32> {
-        self.key(batch, row, side)?.vector_hash()
+        self.key(batch, row, side)?.join_hash(self.hash)
     }
 
     fn key<'a>(&'a self, batch: &'a ColumnBatch, row: usize, side: usize) -> Result<Key<'a>> {
@@ -535,7 +565,7 @@ impl Spec {
         let Some(keys) = KeyColumns::projection(probe, &self.probe_keys).bind_typed(context)? else { return Ok(None); };
         let reservation = context.memory.reserve(probe.len.checked_mul(size_of::<u32>()).ok_or_else(size_error)?)?;
         let mut hashes = vec![0; probe.len];
-        keys.hash_vector_into(&mut hashes, context)?;
+        keys.hash_join_into(&mut hashes, context, self.hash)?;
         Ok(Some(HashedProbe { keys, hashes, _reservation: reservation }))
     }
 
@@ -544,7 +574,7 @@ impl Spec {
             Ok((hashed.hashes[row], hashed.keys.key(row, self.projected[1])))
         } else {
             let key = self.key(probe, row, 1)?;
-            Ok((key.vector_hash()?, key))
+            Ok((key.join_hash(self.hash)?, key))
         }
     }
 

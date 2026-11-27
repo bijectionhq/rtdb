@@ -13,6 +13,7 @@ use crate::{
     invalid,
     join_storage::partition_count,
     runtime_schema::schema_bound,
+    set_keys::{JoinHash, Key, KeyColumns},
     spill::{SpillFile, SpillReader, SpillWriter},
 };
 
@@ -223,6 +224,33 @@ impl SpilledBlocks {
         self, minimum: usize, context: &QueryContext,
         hash: impl Fn(&ColumnBatch, usize) -> Result<u32>,
     ) -> Result<Partitions> {
+        self.shuffle_with(minimum, context, |batch, partitions| {
+            partition_rows(batch.len, partitions, context, |row| hash(batch, row))
+        })
+    }
+
+    pub fn shuffle_keys(
+        self, minimum: usize, context: &QueryContext, positions: &[usize], projected: bool, hashing: JoinHash,
+    ) -> Result<Partitions> {
+        self.shuffle_with(minimum, context, |batch, partitions| {
+            if !positions.is_empty()
+                && let Some(keys) = KeyColumns::projection(batch, positions).bind_typed(context)?
+            {
+                let _scratch = context.memory.reserve(batch.len.checked_mul(size_of::<u32>()).ok_or_else(size_error)?)?;
+                let mut hashes = vec![0; batch.len];
+                keys.hash_join_into(&mut hashes, context, hashing)?;
+                return partition_rows(batch.len, partitions, context, |row| Ok(hashes[row]));
+            }
+            partition_rows(batch.len, partitions, context, |row| {
+                Key::for_columns(batch, row, projected, positions, context)?.join_hash(hashing)
+            })
+        })
+    }
+
+    fn shuffle_with(
+        self, minimum: usize, context: &QueryContext,
+        partition: impl Fn(&ColumnBatch, &mut [Vec<(usize, usize)>]) -> Result<()>,
+    ) -> Result<Partitions> {
         let memory = &context.memory;
         let count = partition_count(self.blocks, minimum)?;
         let base = count.checked_mul(size_of::<Vec<u64>>()).and_then(|bytes| bytes.checked_add(512)).ok_or_else(size_error)?;
@@ -239,11 +267,7 @@ impl SpilledBlocks {
                 .ok_or_else(size_error)?;
             let _picks = memory.reserve(scratch)?;
             let mut partitions = vec![Vec::new(); count];
-            for row in 0..batch.len {
-                context.check_cancelled_at(row)?;
-                let partition = hash(&batch, row)? as usize & (count - 1);
-                partitions[partition].push((0, row));
-            }
+            partition(&batch, &mut partitions)?;
             for (picks, offsets) in partitions.into_iter().zip(&mut offsets) {
                 if picks.is_empty() { continue; }
                 context.check_cancelled()?;
@@ -262,6 +286,18 @@ impl SpilledBlocks {
         }
         Ok(Partitions { reader: writer.finish()?.reader(Arc::clone(memory))?, offsets, schema: self.schema, _reservation: reservation })
     }
+}
+
+fn partition_rows(
+    rows: usize, partitions: &mut [Vec<(usize, usize)>], context: &QueryContext,
+    hash: impl Fn(usize) -> Result<u32>,
+) -> Result<()> {
+    let mask = partitions.len() - 1;
+    for row in 0..rows {
+        context.check_cancelled_at(row)?;
+        partitions[hash(row)? as usize & mask].push((0, row));
+    }
+    Ok(())
 }
 
 pub(crate) struct Partitions {

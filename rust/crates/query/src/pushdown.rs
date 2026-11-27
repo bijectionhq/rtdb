@@ -284,6 +284,15 @@ impl PushdownBuilder {
             if let Some(((xxhash, murmur3), scalar)) = crate::set_keys::direct_bloom_hashes(column, row) {
                 if let Some(ScalarKey::Signed(value)) = scalar && !key.recorded.record((value, xxhash, murmur3), memory)? { continue; }
                 key.add(rtdb_format::bloom::hashes(xxhash, murmur3));
+                let other_zero = match scalar {
+                    Some(ScalarKey::Signed(0)) => Some(-0.0),
+                    Some(ScalarKey::Float(value)) if value == 0.0 => Some(-value),
+                    _ => None,
+                };
+                if let Some(zero) = other_zero {
+                    let zero = ScalarKey::Float(zero);
+                    key.add(rtdb_format::bloom::hashes(zero.hash() as i32, zero.murmur3() as i32));
+                }
                 if let Some(iids) = &mut key.filter.iids {
                     let supported = match scalar {
                         Some(ScalarKey::Null) => true,
@@ -362,6 +371,41 @@ mod tests {
     use super::*;
     use rtdb_format::metadata::LeafColumns;
     use rtdb_types::StructFields;
+
+    #[test]
+    fn numeric_zero_join_bloom_covers_both_persisted_zero_encodings() {
+        let memory = MemoryBudget::new(1 << 20);
+        let positive = BloomFilter::value_positions(&Value::F64(0.0)).unwrap();
+        let negative = BloomFilter::value_positions(&Value::F64(-0.0)).unwrap();
+        assert_ne!(positive, negative);
+
+        for value in [Value::I64(0), Value::F32(-0.0), Value::F64(0.0)] {
+            let field = Field { id: ColumnId(0), name: "k".into(), qualifier: None, qualified_only: false,
+                unnamed: false, data_type: value.logical_type() };
+            let schema = Schema::new(vec![field.clone()]).unwrap();
+            let mut builder = PushdownBuilder {
+                keys: vec![Key {
+                    expression: field.expression(), probe: field.id,
+                    filter: ColumnFilter { bloom: Some(BloomFilter::default()), iids: None,
+                        _reservation: memory.reserve(1024).unwrap() },
+                    pending: Pending::Sorted(Vec::new()),
+                    recorded: RecordedIntegers::default(),
+                }],
+                _reservation: memory.reserve(1024).unwrap(),
+            };
+            let mut persisted = BloomFilter::default();
+            persisted.insert_value(&value).unwrap();
+            assert_ne!(persisted.contains_positions(&positive), persisted.contains_positions(&negative));
+
+            let batch = ColumnBatch::settled(vec![crate::columnar::Column::Values(vec![value])], 1, memory.reserve(4096).unwrap()).unwrap();
+            builder.insert_arrow(&schema, &batch, 0, &memory).unwrap();
+            let filters = builder.finish(&memory).unwrap().unwrap();
+            let bloom = filters.columns[0].1.bloom.as_ref().unwrap();
+            assert!(bloom.contains_positions(&positive));
+            assert!(bloom.contains_positions(&negative));
+            assert!(bloom.intersects(&persisted));
+        }
+    }
 
     #[test]
     fn arrow_keyword_bloom_retains_the_iid_candidate_without_owning_the_spelling() {
