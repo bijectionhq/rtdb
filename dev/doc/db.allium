@@ -2540,6 +2540,7 @@ surface QueryAccess {
         -- Variance computes its square inputs in page order before applying the aggregate mask.
         -- Text and binary extrema compare compatible Arrow cells by bytes and copy only a replacement winner.
         -- A compatible text or binary result copies the retained winners directly into the output page's Arrow buffers.
+        -- A text or binary extremum with no winners emits nullable Arrow Null for all groups.
         -- EVERY and ANY read compatible Arrow Boolean cells in selection order and retain a nullable Boolean per group.
         -- Aggregate DISTINCT indexes its selected argument positions within each group and retains arguments whose SQL equality is unknown.
         -- Aggregate FILTER can consume a compatible predicate bitmap and selects only true positions before DISTINCT and accumulation.

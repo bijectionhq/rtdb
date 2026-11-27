@@ -1308,7 +1308,10 @@ fn byte_extremum_result_owns_the_winners_and_keeps_empty_groups_null() {
     let execution = execution(8);
     let context = &execution.context;
     let baseline = context.memory.used_bytes();
-    for winner in [Value::Utf8("winner".repeat(1024)), Value::Binary(vec![0xff; 8192])] {
+    for winner in [
+        Value::Utf8(String::new()), Value::Binary(Vec::new()),
+        Value::Utf8("winner".repeat(1024)), Value::Binary(vec![0xff; 8192]),
+    ] {
         let field = field(0, winner.logical_type().maybe());
         let (column, charge) = {
             let mut states = ScalarGroups::new(&execution).unwrap();
@@ -1323,6 +1326,34 @@ fn byte_extremum_result_owns_the_winners_and_keeps_empty_groups_null() {
         assert_eq!(batch.columns[0].value(1).unwrap(), winner);
         drop(batch);
         assert_eq!(context.memory.used_bytes(), baseline);
+    }
+}
+
+#[test]
+fn byte_extrema_without_winners_emit_nullable_arrow_null() {
+    let execution = execution(8);
+    let context = &execution.context;
+    let memory = &context.memory;
+    let baseline = memory.used_bytes();
+    for ty in [ScalarType::Utf8, ScalarType::Binary] {
+        let field = field(0, LogicalType::Scalar(ty).maybe());
+        let mut states = ScalarGroups::new(&execution).unwrap();
+        states.ensure(3).unwrap();
+        let (expected, reference_charge) = crate::columnar::pack_evaluated_column(&[Value::Null, Value::Null, Value::Null], memory).unwrap();
+        let Column::Arrow { field: expected_field, .. } = expected else { panic!("Expected nullable Arrow Null"); };
+        let pressure = memory.reserve(memory.available_bytes() - 512).unwrap();
+        let (result, charge) = byte_scalar_results(&states, &AggregateFunction::Min, &field, context).unwrap().unwrap();
+        drop((pressure, states));
+        let Column::Arrow { array, field, logical } = &result else { panic!("Expected nullable Arrow Null"); };
+        assert_eq!(field, &expected_field);
+        assert_eq!(array.data_type(), &DataType::Null);
+        assert_eq!(logical.as_ref(), Some(&LogicalType::Null));
+        assert_eq!(array.len(), 3);
+        for row in 0..3 {
+            assert_eq!(result.value(row).unwrap(), Value::Null);
+        }
+        drop((result, charge, expected_field, reference_charge));
+        assert_eq!(memory.used_bytes(), baseline);
     }
 }
 

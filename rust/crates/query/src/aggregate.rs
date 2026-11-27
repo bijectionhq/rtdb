@@ -571,7 +571,12 @@ fn byte_scalar_results(
         };
         payload = bytes;
     }
-    if !has_winner { return Ok(None); }
+    if !has_winner {
+        let charge = context.memory.reserve(512)?;
+        let field = Arc::new(rtdb_columnar::to_field("value", &LogicalType::Null)?);
+        let array = Arc::new(arrow_array::NullArray::new(len));
+        return Ok(Some((Column::Arrow { array, field, logical: Some(LogicalType::Null) }, charge)));
+    }
     let bytes = len.checked_add(1)
         .and_then(|offsets| offsets.checked_mul(size_of::<i32>()))
         .and_then(|bytes| bytes.checked_add(payload))
