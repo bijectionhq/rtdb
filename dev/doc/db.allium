@@ -2460,6 +2460,7 @@ surface QueryAccess {
         -- A spatial refinement scan can project the requested put children from persisted pages.
         -- A located point read decodes the event headers and the put fields needed by its projection and predicates.
         -- Equality selection on a keyword ID includes the native and reference persisted digests.
+        -- A literal false filter rejects its input before predicates above it can evaluate those rows.
         -- For columnar query output, stacked filters apply in plan order to the surviving vectors and row positions.
         -- A tree of binary UTF-8 concatenations can read its compatible leaf cells, including active run ends and union legs, and literal operands.
         -- It reserves the output buffers per page before writing them.

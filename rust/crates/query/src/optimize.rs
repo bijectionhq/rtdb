@@ -816,7 +816,9 @@ fn select_at(input: Arc<Relation>, predicate: Expr) -> Result<Arc<Relation>> {
             };
             Ok(Arc::new(Relation::new(input.schema().clone(), node)?))
         }
-        RelationNode::Filter { predicate: existing, .. } if existing.is_volatile() => Ok(Arc::new(input.filter(predicate)?)),
+        RelationNode::Filter { predicate: existing, .. }
+            if existing.is_volatile() || matches!(existing, Expr::Literal(Value::Bool(false))) =>
+            Ok(Arc::new(input.filter(predicate)?)),
         RelationNode::Filter { input: child, predicate: existing } => filter(select(Arc::clone(child), predicate)?, existing.clone()),
         RelationNode::Join { left, right, kind, condition } => {
             if condition.as_ref().is_some_and(Expr::is_volatile) {
