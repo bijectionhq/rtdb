@@ -7,7 +7,7 @@ mod replay;
 
 pub use journal::{JournalBatchAppender, TimedOriginal, TimedOriginalProof, journal_recovery_faults};
 pub use multi::{
-    AppliedWatch, BackupFileRelocation, ClassicInstallation, DeploymentRetirement, InstalledBackup, MultiDatabase, MultiOptions, NativeCheckpointInstallation, NativeDependentCarrier, NativeDependentOriginal, PinnedExport, PortableBackup, RankedBuild, RankedFiles, RankedPublication, Role, RotationReceipt, VerifiedBackup, WritePipeline, classic_import_basis, journal_recoveries_acknowledged,
+    AppliedWatch, BackupFileRelocation, ClassicInstallation, DeploymentRetirement, InstalledBackup, MultiDatabase, MultiOptions, NativeCheckpointInstallation, NativeDependentCarrier, NativeDependentOriginal, PinnedExport, PortableBackup, RankedBuild, RankedFiles, RankedPublication, Role, RotationReceipt, StoreVersionHold, StoreVersionHoldKey, StoreVersionHoldReply, StoreVersionHoldRequest, VerifiedBackup, WritePipeline, classic_import_basis, journal_recoveries_acknowledged,
 };
 pub use placement::{discover_nodes, preferred};
 pub use replay::{AppliedEffects, ChangeHistory, CheckpointSource, JournalRecovery};

@@ -23,7 +23,8 @@ use tokio::{
 use crate::replay::JournalCoordinates;
 
 use super::{
-    Entry, Lease, MultiDatabase, PinnedExport, Role, Stream, Uuid, missing_receipt, next, no_writer,
+    Entry, Lease, MultiDatabase, PinnedExport, Role, StoreVersionHoldReply, StoreVersionHoldRequest,
+    Stream, Uuid, missing_receipt, next, no_writer,
 };
 
 const CAPACITY: usize = 64;
@@ -65,6 +66,11 @@ enum Command {
         reads: Vec<KeyRange>,
         request_memory: Arc<MemoryReservation>,
         reply: Reply<()>,
+    },
+    StoreVersionHold {
+        reader: [u8; 32],
+        request: StoreVersionHoldRequest,
+        reply: Reply<StoreVersionHoldReply>,
     },
     BoundJournal { limit: u64, reply: Reply<Option<rtdb_format::journal::ObjectId>> },
     /// A deferred checkpoint built off the database lock, ready to announce.
@@ -125,6 +131,12 @@ pub struct WritePipeline {
 }
 
 impl WritePipeline {
+    pub async fn store_version_hold(
+        &self, reader: [u8; 32], request: StoreVersionHoldRequest,
+    ) -> Result<StoreVersionHoldReply> {
+        self.request(|reply| Command::StoreVersionHold { reader, request, reply }).await
+    }
+
     /// Keeps an admitted publication in the writer's queue after the caller drops its reply.
     pub async fn publish_store_purge_floor(
         &self, since: Basis, keep_from: u64, reads: Vec<KeyRange>, request_memory: Arc<MemoryReservation>,
@@ -424,6 +436,10 @@ async fn run(
                 let result = Box::pin(async {
                     database.lock().await.publish_store_purge_floor(since, keep_from, &reads).await
                 }).await;
+                let _ = reply.send(result);
+            }
+            Command::StoreVersionHold { reader, request, reply } => {
+                let result = Box::pin(async { database.lock().await.store_version_hold(reader, request).await }).await;
                 let _ = reply.send(result);
             }
             Command::BoundJournal { limit, reply } => {

@@ -52,19 +52,10 @@ impl MultiDatabase {
     async fn admit_store_purge_floor(&mut self, since: Basis, keep_from: u64, reads: &[KeyRange]) -> Result<Option<Lease>> {
         self.stream.require_serving().await?;
         self.refresh().await?;
-        let lease = self.authority()?;
-        self.require_armed_rotation()?;
+        let lease = self.settled_store_writer()?;
         let state = self.state();
         let head = state.head;
         let journal_floor = state.floor;
-        let writer = self.writer.as_ref().ok_or_else(no_writer)?;
-        if writer.acknowledged != head
-            || writer.pipeline.next_position() != state.coordinates.position(next(head)?)?
-            || state.lease.map(|(epoch, _)| epoch) != Some(lease.epoch)
-            || state.transactions.recover_pending().is_some()
-        {
-            return Err(prefix_unsettled());
-        }
 
         let index = state.transactions.index();
         index.check_store_purge_guards(since, keep_from, reads)?;
@@ -82,12 +73,30 @@ impl MultiDatabase {
         if self.authority()?.epoch != lease.epoch || self.state().head != head || self.state().floor != journal_floor {
             return Err(prefix_unsettled());
         }
+        let now = self.upper();
+        let generation = self.state().generation;
+        self.writer.as_mut().ok_or_else(no_writer)?.store_holds.check_floor(keep_from, now, generation)?;
         // The journal compares the next slot and writer fence when the caller appends.
         Ok(Some(lease))
     }
+
+    pub(super) fn settled_store_writer(&self) -> Result<Lease> {
+        let lease = self.authority()?;
+        self.require_armed_rotation()?;
+        let state = self.state();
+        let writer = self.writer.as_ref().ok_or_else(no_writer)?;
+        if writer.acknowledged != state.head
+            || writer.pipeline.next_position() != state.coordinates.position(next(state.head)?)?
+            || state.lease.map(|(epoch, _)| epoch) != Some(lease.epoch)
+            || state.transactions.recover_pending().is_some()
+        {
+            return Err(prefix_unsettled());
+        }
+        Ok(lease)
+    }
 }
 
-fn prefix_unsettled() -> Anomaly {
+pub(super) fn prefix_unsettled() -> Anomaly {
     Anomaly::new(AnomalyCategory::Busy, "rtdb.store/purge-prefix-unsettled",
         "The writer must check the purge floor against a settled journal prefix")
 }

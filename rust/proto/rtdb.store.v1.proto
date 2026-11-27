@@ -283,3 +283,40 @@ message PurgeFloorReply {
   // Every retry must pass current writer, basis and guard admission, even when the floor already covers the request.
   optional uint64 keep_from = 2;
 }
+
+// Authored contract for rtdb.store.v1.HoldVersion on the current Multi writer.
+message HoldVersionRequest {
+  // Exact 16-byte physical incarnation previously observed by the reader.
+  bytes incarnation = 1;
+  oneof operation {
+    RetainVersion retain = 2;
+    HeldVersionKey reopen = 3;
+    HeldVersionKey release = 4;
+  }
+}
+
+message RetainVersion {
+  // Required, including zero. This exact Version must still be retained.
+  optional uint64 at = 1;
+  // Required. Exclusive deadline on the writer clock, in microseconds.
+  optional int64 expires_at_micros = 2;
+}
+
+message HeldVersionKey {
+  // The opaque 16-byte identity assigned at admission.
+  bytes hold_id = 1;
+  optional uint64 at = 2;
+}
+
+message HeldVersion {
+  HeldVersionKey key = 1;
+  optional int64 expires_at_micros = 2;
+}
+
+message HoldVersionReply {
+  bytes incarnation = 1;
+  oneof outcome {
+    HeldVersion held = 2;
+    HeldVersionKey released = 3;
+  }
+}

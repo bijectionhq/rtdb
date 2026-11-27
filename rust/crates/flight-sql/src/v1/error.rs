@@ -131,6 +131,8 @@ pub(super) fn detail(native: Anomaly) -> Error {
     };
     let stable = match native.code.as_str() {
         "rtdb/erased-under-view" | "rtdb/cursor-expired" | "rtdb/unknown-branch"
+        | "rtdb.store/hold-deadline" | "rtdb.store/hold-quota" | "rtdb.store/hold-unavailable"
+        | "rtdb.store/hold-unsupported"
         | "rtdb/default-serving-classic-history" | "rtdb/idempotency-key"
         | "rtdb/window-expired" | "rtdb/timed-transaction-refused"
         | "rtdb/funded-appointment"

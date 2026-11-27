@@ -219,6 +219,15 @@ surface StatelessDatabase {
         -- A successful reply names the same incarnation and the requested minimum once the durable floor covers it.
         -- The writer reclaims superseded history within that floor under its retention and checkpoint rules.
 
+    @guarantee StoreVersionHold
+        -- The hosted Multi writer orders exact physical Version admission and release alongside Store floor publication.
+        -- Retain requires a settled writer prefix, a current fence, the exact physical incarnation and a known retained Version at or above the admitted Store floor.
+        -- The writer assigns a quota-accounted opaque identity and an exclusive deadline.
+        -- Reopen and Release require the original identity, exact Version and verified reader binding.
+        -- A live hold prevents the writer from advancing the Store floor past its Version.
+        -- Released and expired holds and holds from an earlier writer or key generation cannot reopen.
+        -- Flight dispatch requires matching guarded consumers on the admitted reader route.
+
     @guarantee OrderedIndexCatalog
         -- An ordered index declaration preserves its columns in the order sent by the caller.
         -- Query of xt.ordered_indexes reads the definitions present at its selected applied cut.

@@ -46,6 +46,7 @@ mod ranked;
 mod rotation;
 mod retirement;
 mod store_floor;
+mod store_hold;
 mod timing;
 pub use backup::{BackupFileRelocation, InstalledBackup, PortableBackup, VerifiedBackup};
 pub use classic_migration::{ClassicInstallation, classic_import_basis};
@@ -56,6 +57,7 @@ use pipeline::{Append, AttemptError, Planned, receipt_for};
 use rotation::ArmedRotation;
 pub use rotation::RotationReceipt;
 pub use retirement::DeploymentRetirement;
+pub use store_hold::{StoreVersionHold, StoreVersionHoldKey, StoreVersionHoldReply, StoreVersionHoldRequest};
 
 /// Wakes a waiter when its residence applies a new journal position, or when the journal holds an entry the residence has not applied, such as one another writer appended.
 /// It never holds the residence, so the waiter reads afresh after each wake.
@@ -131,6 +133,7 @@ struct Writer {
     uploaded: BTreeSet<ObjectId>,
     reclaimed_store_history_through: Option<Lsn>,
     retired_store_checkpoints: BTreeSet<ObjectId>,
+    store_holds: store_hold::StoreHolds,
 }
 
 /// One serialized database residence. The owner drives ticks and serving calls.
@@ -399,6 +402,7 @@ impl MultiDatabase {
                 uploaded: BTreeSet::new(),
                 reclaimed_store_history_through: None,
                 retired_store_checkpoints: BTreeSet::new(),
+                store_holds: store_hold::StoreHolds::default(),
             });
             if let Err(error) = self.finish_pending_erasure().await {
                 self.withdraw_writer();

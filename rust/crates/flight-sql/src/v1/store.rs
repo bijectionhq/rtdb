@@ -41,6 +41,8 @@ use tonic::Status;
 use super::{MAX_CHANGE_GROUPS, MAX_WAIT, check_key, error};
 use crate::{rtdb::store::v1 as proto, service::{Call, Service}};
 
+#[cfg(feature = "multi")]
+mod hold_version;
 mod purge;
 mod sizes;
 
@@ -166,6 +168,8 @@ impl Service {
             RANK => self.store_rank(call, decode(body)?).await,
             STORAGE_SIZES => self.store_storage_sizes(call, decode(body)?).await,
             PURGE_FLOOR => self.store_purge_floor(call, decode(body)?).await,
+            #[cfg(feature = "multi")]
+            hold_version::ACTION if hold_version::AVAILABLE => self.store_hold_version(call, decode(body)?).await,
             _ => Err(error::unsupported("rtdb.store.v1")),
         }
     }

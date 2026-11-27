@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::serving::{
     ChangeGroup, ChangeOrder, ChangePage, Changes, FamilyReviewSelection, FundingSubmission, QuerySource, QueryView, ROW_VISIBILITY,
-    ServingDriver, ServingScope, WorkloadReadCut, append_change_rows,
+    ServingDriver, ServingScope, StoreVersionHoldReply, StoreVersionHoldRequest, WorkloadReadCut, append_change_rows,
 };
 use crate::{Database, DatabaseCatalog};
 
@@ -1015,6 +1015,16 @@ impl ServingDriver for MultiServing {
     async fn supports_store_purge_floor(&self) -> bool {
         self.classic_workload_fence.is_none()
             && self.serve(async { Ok(self.is_writer().await) }).await.unwrap_or(false)
+    }
+
+    async fn store_version_hold(
+        &self, reader: [u8; 32], request: StoreVersionHoldRequest, cancellation: &CancellationToken,
+    ) -> Result<StoreVersionHoldReply> {
+        if self.classic_workload_fence.is_some() {
+            return Err(workload::denied());
+        }
+        cancellation.run_until_cancelled(self.serve(self.writes.store_version_hold(reader, request)))
+            .await.ok_or_else(interrupted)?
     }
 
     async fn publish_store_purge_floor(
