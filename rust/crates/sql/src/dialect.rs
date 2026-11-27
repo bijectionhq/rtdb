@@ -171,7 +171,6 @@ impl Dialect for SqlDialect {
         supports_connect_by,
         supports_match_recognize,
         supports_pipe_operator,
-        supports_start_transaction_modifier,
         supports_window_function_null_treatment_arg,
         supports_dictionary_syntax,
         supports_window_clause_named_window_reference,

@@ -414,7 +414,8 @@ pub(super) fn parse_statement_syntax<'input>(
     let (mut tokens, mut temporal) = extract_temporal(tokens, sql)?;
     let mut statement = if word(tokens.first(), "PATCH") || (word(tokens.first(), "INSERT") && tokens.iter().any(|token| word(Some(token), "RECORDS"))) {
         let patch = word(tokens.first(), "PATCH");
-        let start = if word(tokens.get(1), "INTO") { 2 } else { 1 };
+        if !word(tokens.get(1), "INTO") { return Err(sql_error("Expected INTO after INSERT or PATCH", sql, slice[0].span)); }
+        let start = 2;
         let mut parser = Parser::new(&dialect).with_recursion_limit(STATEMENT_RECURSION_LIMIT).with_tokens_with_locations(tokens[start..].to_vec());
         let table = parser.parse_object_name(false).map_err(|error| parser_error(error, sql, slice[0].span))?;
         if patch {
@@ -432,7 +433,7 @@ pub(super) fn parse_statement_syntax<'input>(
         let mut parser = Parser::new(&dialect).with_recursion_limit(STATEMENT_RECURSION_LIMIT).with_tokens_with_locations(tokens[start..].to_vec());
         let table = parser.parse_object_name(false).map_err(|error| parser_error(error, sql, slice[0].span))?;
         let mut columns = Vec::new();
-        if parser.consume_token(&Token::LParen) && !parser.consume_token(&Token::RParen) {
+        if parser.consume_token(&Token::LParen) {
             loop {
                 let name = identifier_token(&parser.next_token())?;
                 let ty = match parser.peek_token().token {

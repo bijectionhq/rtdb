@@ -193,3 +193,32 @@ fn non_grammar_query_bodies_and_table_factors_are_rejected() {
     prepare("RECORDS OBJECT(a: 1)", &Fixture, &PrepareOptions::default()).unwrap();
     prepare("INSERT INTO docs RECORDS {_id: 1}", &Fixture, &PrepareOptions::default()).unwrap();
 }
+
+#[test]
+fn non_grammar_dml_ddl_and_transaction_forms_are_rejected() {
+    for sql in [
+        "INSERT docs (_id) VALUES (1)",
+        "INSERT docs RECORDS {_id: 1}",
+        "INSERT INTO TABLE docs (_id) VALUES (1)",
+        "INSERT LOW_PRIORITY INTO docs (_id) VALUES (1)",
+        "INSERT INTO docs (_id) PARTITION (p = 1) VALUES (1)",
+        "INSERT INTO docs (_id) VALUES (1) AS new_row",
+        "PATCH docs RECORDS {_id: 1}",
+        "PATCH INTO docs FOR VALID_TIME AS OF TIMESTAMP '2020-01-01T00:00:00Z' RECORDS {_id: 1}",
+        "UPDATE OR IGNORE docs SET a = 1",
+        "DELETE docs",
+        "ERASE docs",
+        "UPDATE xtdb.public.docs SET a = 1",
+        "DELETE FROM xtdb.public.docs",
+        "ERASE FROM xtdb.public.docs",
+        "CREATE TABLE docs ()",
+        "END",
+        "BEGIN WORK",
+        "BEGIN TRAN",
+        "BEGIN DEFERRED",
+        "START TRANSACTION READ ONLY, READ WRITE",
+    ] {
+        let error = rejection(sql);
+        assert_eq!((error.category, error.code.as_str()), (AnomalyCategory::Incorrect, "xtdb/sql-error"), "{sql}");
+    }
+}

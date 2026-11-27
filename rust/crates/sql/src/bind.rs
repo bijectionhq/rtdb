@@ -392,6 +392,9 @@ impl Context<'_> {
         if system_time != TemporalFilter::Default || (!patch && valid_time != TemporalFilter::Default) {
             return Err(error("Invalid temporal clause for RECORDS"));
         }
+        if patch && matches!(valid_time, TemporalFilter::At(_) | TemporalFilter::Between { .. } | TemporalFilter::All) {
+            return Err(grammar_rejected("PATCH valid time other than FROM/TO"));
+        }
         let kind = if patch { crate::StaticMutationKind::Patch(valid_time) } else { crate::StaticMutationKind::Put };
         Ok(crate::StaticMutation { table: target, input, kind })
     }
@@ -442,7 +445,10 @@ impl Context<'_> {
 
     fn insert_rows(&mut self, insert: &ast::Insert) -> std::result::Result<InsertRows, InsertRowsError> {
         if insert.returning.is_some() { return Err(unsupported("INSERT RETURNING").into()); }
-        if insert.on.is_some() || insert.overwrite || insert.ignore || insert.replace_into || insert.or.is_some() || !insert.assignments.is_empty() || insert.output.is_some() {
+        if !insert.into || insert.has_table_keyword || insert.priority.is_some() || insert.partitioned.is_some()
+            || insert.insert_alias.is_some() || insert.table_alias.is_some() || insert.settings.is_some() || insert.format_clause.is_some()
+            || insert.on.is_some() || insert.overwrite || insert.ignore || insert.replace_into || insert.or.is_some() || !insert.assignments.is_empty() || insert.output.is_some()
+        {
             return Err(grammar_rejected("An INSERT modifier").into());
         }
         let ast::TableObject::TableName(name) = &insert.table else { return Err(grammar_rejected("A dynamic INSERT target").into()); };
@@ -515,7 +521,7 @@ impl Context<'_> {
             }
             ast::Statement::Update(update) => {
                 if update.returning.is_some() { return Err(unsupported("UPDATE RETURNING")); }
-                if update.from.is_some() || update.output.is_some() || !update.order_by.is_empty() || update.limit.is_some() || !update.table.joins.is_empty() { return Err(grammar_rejected("UPDATE FROM, a joined target or ordering")); }
+                if update.from.is_some() || update.output.is_some() || update.or.is_some() || !update.order_by.is_empty() || update.limit.is_some() || !update.table.joins.is_empty() { return Err(grammar_rejected("UPDATE FROM, a conflict clause, a joined target or ordering")); }
                 let mut input = self.mutation_table(&update.table.relation, false)?;
                 let (target, valid_time) = scan_target(&input)?;
                 let target_columns = input.schema().fields().iter().filter(|field| !matches!(field.name.as_str(), "_valid_time" | "_system_time")).map(|field| field.id).collect();
@@ -532,12 +538,19 @@ impl Context<'_> {
                 Statement::Dml(Dml::Update { table: target, input, target_columns, assignments, valid_time })
             }
             ast::Statement::Delete(delete) => return self.delete(delete, false),
-            ast::Statement::StartTransaction { modes, statements, .. } => {
-                if !statements.is_empty() { return Err(grammar_rejected("A procedural transaction block")); }
+            ast::Statement::StartTransaction { modes, transaction, modifier, statements, has_end_keyword, .. } => {
+                if !statements.is_empty() || *has_end_keyword || modifier.is_some()
+                    || matches!(transaction, Some(ast::BeginTransactionKind::Work | ast::BeginTransactionKind::Tran))
+                {
+                    return Err(grammar_rejected("A non-standard transaction modifier or block"));
+                }
                 let mut access_mode = None;
                 for mode in modes {
                     match mode {
-                        ast::TransactionMode::AccessMode(mode) => access_mode = Some(match mode { ast::TransactionAccessMode::ReadOnly => AccessMode::ReadOnly, ast::TransactionAccessMode::ReadWrite => AccessMode::ReadWrite }),
+                        ast::TransactionMode::AccessMode(mode) => {
+                            if access_mode.is_some() { return Err(grammar_rejected("Duplicate transaction access mode")); }
+                            access_mode = Some(match mode { ast::TransactionAccessMode::ReadOnly => AccessMode::ReadOnly, ast::TransactionAccessMode::ReadWrite => AccessMode::ReadWrite });
+                        }
                         ast::TransactionMode::IsolationLevel(ast::TransactionIsolationLevel::ReadUncommitted | ast::TransactionIsolationLevel::ReadCommitted
                             | ast::TransactionIsolationLevel::RepeatableRead | ast::TransactionIsolationLevel::Serializable) => (),
                         _ => return Err(grammar_rejected("A transaction isolation level other than the four standard levels")),
@@ -545,7 +558,7 @@ impl Context<'_> {
                 }
                 Statement::Begin { access_mode }
             }
-            ast::Statement::Commit { chain, .. } if !chain => Statement::Commit,
+            ast::Statement::Commit { chain, end, modifier } if !chain && !end && modifier.is_none() => Statement::Commit,
             ast::Statement::Rollback { chain, savepoint, .. } if !chain && savepoint.is_none() => Statement::Rollback,
             ast::Statement::Explain { statement, analyze, describe_alias, verbose, query_plan, estimate, format, options } => {
                 if *describe_alias != ast::DescribeAlias::Explain || *verbose || *query_plan || *estimate || format.is_some() || options.is_some() { return Err(grammar_rejected("An EXPLAIN option other than ANALYZE")); }
@@ -562,7 +575,7 @@ impl Context<'_> {
     fn delete(&mut self, delete: &ast::Delete, erase: bool) -> Result<Statement> {
         if delete.returning.is_some() { return Err(unsupported("DELETE RETURNING")); }
         if delete.using.is_some() || delete.output.is_some() || !delete.order_by.is_empty() || delete.limit.is_some() || !delete.tables.is_empty() { return Err(grammar_rejected("DELETE USING, ordering or a multi-table target")); }
-        let tables = match &delete.from { ast::FromTable::WithFromKeyword(tables) | ast::FromTable::WithoutKeyword(tables) => tables };
+        let ast::FromTable::WithFromKeyword(tables) = &delete.from else { return Err(grammar_rejected("DELETE or ERASE without FROM")); };
         if tables.len() != 1 || !tables[0].joins.is_empty() { return Err(error("DELETE and ERASE require one target table")); }
         let mut input = self.mutation_table(&tables[0].relation, erase)?;
         let RelationNode::Scan(scan) = input.node() else { return Err(error("Mutation target must be a base table")); };
@@ -1119,6 +1132,7 @@ impl Context<'_> {
                         return match alias { Some(alias) => self.alias(input, alias), None => self.rename(input, Some(cte_name), None) };
                     }
                 }
+                if purpose != TablePurpose::Query && names.len() > 2 { return Err(grammar_rejected("A three-part DML target name")); }
                 let (valid_time, system_time, clamp_valid_time) = self.temporal_filters(name)?;
                 let binding = resolve_table(self.catalog, &names, &self.options.search_path)?;
                 let qualifier = alias.as_ref().map(|alias| identifier(&alias.name).normalized()).unwrap_or_else(|| binding.name.table.table.clone());
