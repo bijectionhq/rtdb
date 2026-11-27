@@ -279,10 +279,14 @@ The byte-store Version hold lives with the current writer and fences the Store p
 For S3 Object Lock, commission a dedicated versioned allocation and bind both verification and recovery reads to the held versions.
 Give the verifier version-read access and either `s3:GetObjectLegalHold` or `s3:GetObjectRetention` for the selected hold mechanism.
 Object Lock allows delete markers and newer versions above a held version. [S3 Object Lock](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html)
+A legal hold carries a single status per object version. [S3 legal-hold request](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObjectLegalHold.html)
+Operations that share a version need an ordered record of which recovery operations still own its hold and release the provider hold only after the last owner settles.
 
 The installed server opens its generation keys through `FileKms` at `RTDB_KEY_DIRECTORY`.
 A hosted key custodian must retain decryption of the exact copies' generations across worker and verifier loss and order hold placement and release against key retirement.
 Key readability at the time of verification proves one read.
+Bijection's native key-capture authority holds the key scopes admitted by a management-signed capture grant until the threshold ledger orders a disposition. [Native key custody](https://github.com/bijectionhq/bijection/blob/73ce87926a3504a8ffcf83aa4be5b34e43749df8/crates/quorum/src/custody_lifecycle.rs#L1-L25)
+Using that provider here requires enrolling the RTDB incarnation and generation in the captured scope and giving the staged runtime a matching wrap and unwrap route for its journal and objects.
 For an AWS KMS design, establish which authority can disable or schedule deletion of a held key, since a key in pending deletion cannot decrypt. [AWS KMS key deletion](https://docs.aws.amazon.com/kms/latest/developerguide/deleting-keys.html)
 The object and key custodian receipts must bind the same recovery operation, destination incarnation and verified dependency closure.
 Any finite hold must still cover the activation decision when it commits.
