@@ -18,7 +18,7 @@ use rtdb_expr::kernels::{self, Function, LikeMatcher, Selection};
 use rtdb_plan::{BinaryOp, CastTarget, Expr, Schema, UnaryOp};
 use rtdb_types::{LogicalType, Result, ScalarType, TimeUnit, Value};
 
-use super::{Column, ColumnBatch, SelectedColumn, plain_scalar};
+use super::{Column, ColumnBatch, PredicateSelection, SelectedColumn, plain_scalar};
 
 mod predicate;
 use predicate::{Cell, Cells, Operand};
@@ -373,6 +373,22 @@ impl Predicate {
     }
 
     pub(crate) fn retained_bytes(&self) -> Result<usize> { self.0.retained_bytes() }
+
+    pub(crate) fn selection(&self, batch: &ColumnBatch, parameters: rtdb_expr::Parameters<'_>, memory: &Arc<MemoryBudget>,
+        prepare: impl FnOnce() -> Result<()>) -> Result<Option<PredicateSelection>> {
+        let evaluation = Evaluation { columns: &batch.columns, len: batch.len, parameters: Parameters::Values(parameters), memory: batch.reservation.budget() };
+        let Some(Charged { vector, _charge: charge }) = evaluation.vector(&self.0, None)? else { return Ok(None); };
+        if !holds_truths(&vector) { return Ok(None); }
+        prepare()?;
+        Ok(Some(match (vector, charge) {
+            (Vector::Null, _) => PredicateSelection::from_bits(std::iter::repeat_n(false, batch.len), memory)?,
+            (Vector::Bool(values), Some(charge)) => PredicateSelection::from_arrow(values, charge)?,
+            (Vector::Bool(values), None) => PredicateSelection::from_bits((0..batch.len).map(|row| {
+                values.is_valid(row) && values.value(row)
+            }), memory)?,
+            _ => return Ok(None),
+        }))
+    }
 
     /// Each row's three-valued truth over `batch`, keeping unknown (null) apart from false.
     pub(crate) fn truth(&self, batch: &ColumnBatch, parameters: rtdb_expr::Parameters<'_>) -> Result<Option<Vec<Option<bool>>>> {

@@ -240,6 +240,11 @@ impl<'a> CellReadCheck<'a> {
         self.check(array, row)
     }
 
+    /// Whether the layout requires inspecting individual values after validating the array shape.
+    pub fn requires_cell_validation(&self) -> bool {
+        !matches!(self.mode, CellReadMode::Plain)
+    }
+
     fn for_layout(field: &'a Field, logical: &LogicalType, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let mode = if ambiguous_union(field, logical)? {
             let reservation = reserve_plan(field, memory)?;

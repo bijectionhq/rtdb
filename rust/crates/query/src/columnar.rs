@@ -16,7 +16,7 @@ use arrow_array::{
 };
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
 use arrow_schema::{DataType, Field as ArrowField};
-use rtdb_columnar::{MemoryBudget, MemoryReservation, copy_selected_cells, read_execution_value, read_execution_value_as};
+use rtdb_columnar::{CellReadCheck, MemoryBudget, MemoryReservation, copy_selected_cells, read_execution_value, read_execution_value_as};
 use rtdb_index::IndexBatch;
 use rtdb_plan::{CastTarget, Expr, Field};
 use rtdb_temporal::ResolvedRow;
@@ -513,20 +513,7 @@ impl Column {
 
     pub(crate) fn validate_readable_cell(&self, row: usize, memory: &Arc<MemoryBudget>) -> Result<()> {
         if let Some(Some((array, field, logical, offset))) = self.arrow_cell(row) {
-            let derived;
-            let _schema;
-            let logical = match logical {
-                Some(logical) => logical,
-                None => {
-                    _schema = memory.reserve(field.size().checked_mul(8).ok_or_else(size_error)?)?;
-                    derived = rtdb_columnar::from_field(field)?;
-                    &derived
-                }
-            };
-            if logical == &LogicalType::Nothing {
-                return Err(rtdb_types::Anomaly::fault("xtdb/zero-leg-read", "The bottom type has no values to read"));
-            }
-            rtdb_columnar::validate_readable_cell(field, array, logical, offset, memory)?;
+            admit_cell_read(field, array, logical, offset, memory)?;
         }
         Ok(())
     }
@@ -943,9 +930,39 @@ impl ColumnBatch {
     }
 
     pub(crate) fn validate_readable(&self, context: &crate::QueryContext) -> Result<()> {
-        for row in 0..self.len {
+        if self.len == 0 { return Ok(()); }
+        context.check_cancelled_at(0)?;
+        let mut checks = Vec::<BatchReadCheck<'_>>::new();
+        let mut scratch = None;
+        for column in &self.columns {
+            let check = match column {
+                Column::Arrow { array, field, logical } => {
+                    let check = admit_cell_read(field, array.as_ref(), logical.as_ref(), 0, &context.memory)?;
+                    if array.len() >= self.len && !check.requires_cell_validation() { continue; }
+                    BatchReadCheck::Arrow { array: array.as_ref(), check }
+                }
+                Column::Selected(column) => {
+                    let bytes = column.sources.len().checked_mul(size_of::<Option<CellReadCheck<'_>>>()).ok_or_else(size_error)?;
+                    let reservation = context.memory.reserve(bytes)?;
+                    let mut check = BatchReadCheck::Selected {
+                        column, checks: std::iter::repeat_with(|| None).take(column.sources.len()).collect(), _reservation: reservation,
+                    };
+                    check.validate(0, &context.memory)?;
+                    check
+                }
+                Column::Values(_) => continue,
+            };
+            if scratch.is_none() {
+                let bytes = self.columns.len().checked_mul(size_of::<BatchReadCheck<'_>>()).ok_or_else(size_error)?;
+                scratch = Some(context.memory.reserve(bytes)?);
+                checks.reserve_exact(self.columns.len());
+            }
+            checks.push(check);
+        }
+        if checks.is_empty() { return Ok(()); }
+        for row in 1..self.len {
             context.check_cancelled_at(row)?;
-            for column in &self.columns { column.validate_readable_cell(row, &context.memory)?; }
+            for check in &mut checks { check.validate(row, &context.memory)?; }
         }
         Ok(())
     }
@@ -1657,6 +1674,77 @@ impl ColumnBatch {
         }
         Ok(page.finish())
     }
+}
+
+enum BatchReadCheck<'a> {
+    Arrow { array: &'a dyn Array, check: CellReadCheck<'a> },
+    Selected { column: &'a SelectedColumn, checks: Vec<Option<CellReadCheck<'a>>>, _reservation: Arc<MemoryReservation> },
+}
+
+impl BatchReadCheck<'_> {
+    fn validate(&mut self, row: usize, memory: &Arc<MemoryBudget>) -> Result<()> {
+        match self {
+            Self::Arrow { array, check } => check.validate(*array, row),
+            Self::Selected { column, checks, .. } => {
+                let column = *column;
+                let Some((source, offset)) = column.cells.get(row) else { return Ok(()); };
+                let Some((array, field, logical, _)) = &column.sources[source] else { return Ok(()); };
+                if let Some(check) = &checks[source] {
+                    check.validate(array.as_ref(), offset)
+                } else {
+                    checks[source] = Some(admit_cell_read(field, array.as_ref(), logical.as_ref(), offset, memory)?);
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn batch_validation_checks_later_cells_and_only_the_selected_source_positions() {
+    let memory = MemoryBudget::new(1 << 20);
+    let database = crate::DatabaseSnapshot {
+        partitions: Vec::new(),
+        storage: Arc::new(rtdb_storage::cache::BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
+    };
+    let catalog = crate::CatalogSnapshot::new("xtdb", [("xtdb".into(), database)].into(), false).unwrap();
+    let context = crate::QueryContext::new(catalog, Arc::clone(&memory), Timestamp(0), "UTC", Default::default(),
+        &tokio_util::sync::CancellationToken::new()).unwrap();
+
+    let logical = LogicalType::Scalar(ScalarType::Uri);
+    let field = Arc::new(rtdb_columnar::to_field("uri", &logical).unwrap());
+    let array: ArrayRef = Arc::new(arrow_array::StringArray::from(vec!["https://xtdb.com", "not a URI"]));
+    let arrow = ColumnBatch::settled(vec![Column::Arrow {
+        array: Arc::clone(&array), field: Arc::clone(&field), logical: Some(logical.clone()),
+    }], 2, memory.reserve(0).unwrap()).unwrap();
+    let expected = arrow.columns[0].validate_readable_cell(1, &memory).unwrap_err();
+    assert_eq!(arrow.validate_readable(&context).unwrap_err(), expected);
+
+    let selected = |cells: Vec<(usize, usize)>| {
+        let len = cells.len();
+        let column = SelectedColumn::new(vec![Some((Arc::clone(&array), Arc::clone(&field), Some(logical.clone()), None)), None], Arc::new(cells));
+        ColumnBatch::settled(vec![Column::Selected(column)], len, memory.reserve(0).unwrap()).unwrap()
+    };
+    selected(vec![(1, 0), (0, 0), (0, 0)]).validate_readable(&context).unwrap();
+    assert_eq!(selected(vec![(0, 0), (0, 1)]).validate_readable(&context).unwrap_err(), expected);
+}
+
+fn admit_cell_read<'a>(field: &'a ArrowField, array: &dyn Array, logical: Option<&LogicalType>, row: usize,
+    memory: &Arc<MemoryBudget>) -> Result<CellReadCheck<'a>> {
+    let derived;
+    let _schema;
+    let logical = match logical {
+        Some(logical) => logical,
+        None => {
+            _schema = memory.reserve(field.size().checked_mul(8).ok_or_else(size_error)?)?;
+            derived = rtdb_columnar::from_field(field)?;
+            &derived
+        }
+    };
+    if logical == &LogicalType::Nothing {
+        return Err(rtdb_types::Anomaly::fault("xtdb/zero-leg-read", "The bottom type has no values to read"));
+    }
+    CellReadCheck::admit(field, array, logical, row, memory)
 }
 
 fn distinct_charges<'a>(leases: impl IntoIterator<Item = &'a Arc<MemoryReservation>>, memory: &Arc<MemoryBudget>) -> Result<usize> {
@@ -3498,6 +3586,31 @@ impl PredicateSelection {
     }
 }
 
+#[test]
+fn a_boolean_predicate_selection_keeps_only_valid_true_bits() {
+    let memory = MemoryBudget::new(1 << 20);
+    let logical = LogicalType::Scalar(ScalarType::Bool).maybe();
+    let field = Field { id: rtdb_plan::ColumnId(0), name: "predicate".into(), qualifier: None,
+        qualified_only: false, unnamed: false, data_type: logical.clone() };
+    let column = field.expression();
+    let schema = rtdb_plan::Schema::new(vec![field]).unwrap();
+    let bits = [true, true, false, true].into_iter().collect::<BooleanBuffer>();
+    let valid = [true, false, true, true].into_iter().collect::<BooleanBuffer>();
+    let batch = ColumnBatch::settled(vec![Column::Arrow {
+        array: Arc::new(BooleanArray::new(bits, Some(arrow_buffer::NullBuffer::new(valid)))),
+        field: Arc::new(ArrowField::new("predicate", DataType::Boolean, true)), logical: Some(logical),
+    }], 4, memory.reserve(0).unwrap()).unwrap();
+    for (predicate, expected) in [
+        (column.clone(), [true, false, false, true]),
+        (Expr::unary(rtdb_plan::UnaryOp::Not, column), [false, false, true, false]),
+    ] {
+        let selection = functions::Predicate::bind(&predicate, &schema).unwrap()
+            .selection(&batch, rtdb_expr::Parameters::Values(&[]), &memory, || Ok(())).unwrap().unwrap();
+        let actual: [bool; 4] = std::array::from_fn(|row| selection.contains(row));
+        assert_eq!(actual, expected);
+    }
+}
+
 /// Filters batches, evaluating the predicate over whole columns where its plan-time binding against the schema allows,
 /// and row by row, exactly as the row filter does, otherwise.
 pub(crate) struct BatchFilter {
@@ -3574,7 +3687,7 @@ pub(crate) async fn predicate_selection(
 
 /// As `predicate_selection`, using `compiled`'s plan-time binding and skipping the type admission of a kernel-evaluated
 /// predicate that `admission` already passed.
-async fn admitted_predicate_selection(
+pub(crate) async fn admitted_predicate_selection(
     batch: &ColumnBatch, predicate: &rtdb_plan::Expr, schema: &rtdb_plan::Schema, execution: &crate::context::Execution,
     compiled: Option<&functions::Predicate>, admission: Option<&crate::compiled::Admission>,
 ) -> Result<PredicateSelection> {
@@ -3597,9 +3710,8 @@ async fn admitted_predicate_selection(
         }
         Ok(())
     };
-    if let Some(compiled) = compiled && let Some(truth) = compiled.truth(batch, params)? {
-        prepare_typed()?;
-        return PredicateSelection::from_bits(truth.into_iter().map(|value| value == Some(true)), memory);
+    if let Some(compiled) = compiled && let Some(selection) = compiled.selection(batch, params, memory, prepare_typed)? {
+        return Ok(selection);
     }
     let metadata = execution.scope()?;
     let invocation = execution.prepare_expression(predicate, schema, &metadata)?;
