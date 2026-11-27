@@ -285,6 +285,7 @@
 -- A Flight owned create or commit with compatible legacy Root document fields retains its vectors, structs, decimals, intervals and keywords through source encoding.
 -- The legacy Root payload contributes the same transaction source bytes and receipt digest as its row encoding.
 -- Declared scalar Root replay with exact field presence checks the declaration and reached decimal coefficients in document order before staging the selected Arrow cells.
+-- Legacy Root replay can select a flat Boolean, signed 64-bit, text or null union leg while keeping the document field name and its recorded presence.
 -- Hosted replay preserves each copied effect's explicit original valid interval.
 -- Ordered shadow replay validates the exact field marker and the inherited schema from the selected Arrow cells.
 -- Proposal publication and inherited constraints read shadow markers, identities, and binary keys from selected document fields.
