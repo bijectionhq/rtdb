@@ -1692,6 +1692,29 @@ async fn sql_snapshot_tokens_are_xtdb_time_bases_read_at_the_redeeming_clock() {
     stop(&node, driver).await;
 }
 
+#[tokio::test]
+async fn transactions_in_one_microsecond_get_distinct_system_times_that_tokens_name_unambiguously() {
+    let services = NodeServices {
+        resources: Arc::new(NativeResources::default().with_log_clock(Arc::new(|| Ok(Timestamp(1_000_000))))),
+        ..services()
+    };
+    let (node, driver) = running(options(), services).await;
+    let mut writer = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let first = writer.state_mut().execute_operation(put(&node, 1, 10)).await.unwrap().unwrap().tx_key();
+    let mut reader = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let original = rows(reader.query_sql("SELECT value, SNAPSHOT_TOKEN FROM docs", vec![]).await.unwrap()).await;
+    let Value::Utf8(token) = original[0][1].clone() else { panic!("expected a snapshot token"); };
+    // As XTDB's TxResolver: the frozen log's second transaction steps one microsecond past the first.
+    let next = writer.state_mut().execute_operation(put(&node, 1, 20)).await.unwrap().unwrap().tx_key();
+    assert_eq!(next.system_time, Timestamp(first.system_time.0 + 1));
+    let reopened = rows(reader.query_sql(
+        "SETTING SNAPSHOT_TOKEN=? SELECT value FROM docs", vec![Value::Utf8(token)],
+    ).await.unwrap()).await;
+    assert_eq!(reopened, [vec![Value::I64(10)]], "the first transaction's token never reads its successor");
+    assert_eq!(rows(reader.query_sql("SELECT value FROM docs", vec![]).await.unwrap()).await, [vec![Value::I64(20)]]);
+    stop(&node, driver).await;
+}
+
 async fn rows_result(mut cursor: QueryCursor) -> Result<()> {
     while cursor.next_batch().await?.is_some() {}
     Ok(())
