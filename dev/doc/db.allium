@@ -126,7 +126,8 @@
 --   Resolution and apply never interleave, so a transaction is never half-applied.
 --   Both reads deliver a batch, as upstream's poll does: the records durable when the read begins.
 --   A source batch resolves back to back, holding the records read back meanwhile until it is resolved or the leader stops resolving it.
---   A replica batch is applied in log order before the next read, so the writers whose records one flush made durable are answered together.
+--   A replica batch is applied in log order, including records delivered together by a provider without prepared single-record replay.
+--   The driver drains the delivered batch before selecting new work, so the writers whose records one flush made durable are answered together.
 --   That keeps the transactions one flush carried together into the next, so each flush carries every commit queued behind it.
 --   Staging, ownership and the durability handles: live-index.allium. The role lifecycle, the claim and the term: log-processor-lifecycle.allium.
 --

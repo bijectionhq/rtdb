@@ -1121,6 +1121,26 @@ async fn source_transaction_reads_back_applies_flushes_and_recovers() {
 }
 
 #[tokio::test]
+async fn a_follower_applies_every_record_from_a_legacy_replica_poll_in_order() {
+    let mut fixture = fixture(ReplicationConfig { may_lead: false, ..Default::default() }, 1 << 27).await;
+    for record in [raw(0, 1, 0, resolved(0, 0)), raw(1, 2, 0, resolved(1, 1)),
+        raw(2, 1, 1, upload(7, 2)), raw(3, 2, 1, resolved(3, 3))] {
+        fixture.replica.enqueue(record.payload, record.metadata.timestamp).await.unwrap().durable().await.unwrap();
+    }
+    let mut tail = fixture.logs.replica_tail(fixture.driver.read_position).await.unwrap();
+    let records = tail.poll(Duration::ZERO).await.unwrap();
+    assert_eq!(records.len(), 4);
+    fixture.driver.replica_batch.extend(records);
+
+    assert!(fixture.driver.consume_replica_batch().await.unwrap());
+
+    assert!(fixture.driver.replica_batch.is_empty());
+    assert_eq!(fixture.handle.progress().current().tx_id(), TxId(3));
+    assert_eq!(fixture.handle.status().highest_term, Term(2));
+    assert_eq!(fixture.handle.status().installed.map(|prefix| prefix.replica), Some(ReplicaPosition(3)));
+}
+
+#[tokio::test]
 async fn a_source_batch_resolves_back_to_back_before_its_read_back_applies() {
     // As upstream's SourceLogProcessor: each record of the batch starts resolving as the previous one finishes, and
     // what is read back meanwhile is held until the whole batch has been resolved.

@@ -808,11 +808,9 @@ impl ReplicationDriver {
                     };
                     self.lead_after_empty_read(record_count).await?;
                 }
-                Event::Replica => if self.replica_head.is_some() {
+                Event::Replica => {
                     if !self.consume_replica_batch().await? { return Ok(()); }
-                } else if let Some(record) = self.replica_batch.pop_front() {
-                    self.consume(record).await?;
-                },
+                }
                 Event::SourceBatch(tail, records) => self.source_polled(tail, records).await?,
                 Event::Source => {
                     if let Some(leader) = &mut self.leader && leader.source_batch_end.is_none() {
@@ -881,11 +879,14 @@ impl ReplicationDriver {
         }
         self.flush_if_due().await
     }
-    /// Applies the replica records durable when the first of them was read, in log order, as upstream's replica tail
-    /// applies each poll's records before it polls again: one flush's records are applied, and their writers answered,
-    /// together rather than a turn of the event loop apart.
     /// Returns false when cancelled.
     async fn consume_replica_batch(&mut self) -> Result<bool> {
+        while let Some(record) = self.replica_batch.pop_front() {
+            self.consume(record).await?;
+            if self.cancellation.is_cancelled() { return Ok(false); }
+            if !self.replica_batch.is_empty() { self.prepare_turn().await?; }
+        }
+        if self.replica_head.is_none() { return Ok(true); }
         let end = self.logs.latest_replica_position()?;
         while let Some(head) = self.replica_head {
             let tail = self.replica_tail.as_mut().ok_or_else(|| invalid("Prepared replica head has no tail"))?;
