@@ -36,6 +36,7 @@ enum EventBuild { Write, CopyInferred, CopyCaptured }
 
 const MAX_PACKED_LIVE_ROWS: usize = 128;
 const MAX_PACKED_LIVE_INPUT_BYTES: usize = 256 << 10;
+const PACK_FAN_IN: usize = 8;
 
 impl IndexBatch {
     pub fn new(batch: RecordBatch, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
@@ -198,30 +199,37 @@ impl IndexBatch {
         (self.owned.reservation().bytes() as u64).saturating_add(self.headers.1.bytes() as u64)
     }
 
-    fn try_join_live_tail(&self, following: &Self) -> Option<Arc<Self>> {
-        if self.len() != following.len() || !self.len().is_power_of_two() || self.len() >= MAX_PACKED_LIVE_ROWS
-            || self.arrow().schema_ref() != following.arrow().schema_ref()
-            || self.events.has_entity_keys() || self.events.has_commit_positions() || self.events.has_origin_column()
+    /// Joins a run of equal-length live batches into one, or `None` when the run is not packable.
+    fn try_join_live_run(run: &[&Self]) -> Option<Arc<Self>> {
+        let (first, rest) = run.split_first()?;
+        let rows = first.len().checked_mul(run.len())?;
+        if rest.is_empty() || !first.len().is_power_of_two() || rows > MAX_PACKED_LIVE_ROWS
+            || first.events.has_entity_keys() || first.events.has_commit_positions() || first.events.has_origin_column()
         {
             return None;
         }
-        let budget = self.arrow_reservation().budget().snapshot_budget()?;
-        if !Arc::ptr_eq(budget, following.arrow_reservation().budget().snapshot_budget()?) {
-            return None;
+        let budget = first.arrow_reservation().budget().snapshot_budget()?;
+        for batch in rest {
+            if batch.len() != first.len() || batch.arrow().schema_ref() != first.arrow().schema_ref()
+                || batch.events.has_entity_keys() || batch.events.has_commit_positions() || batch.events.has_origin_column()
+                || !Arc::ptr_eq(budget, batch.arrow_reservation().budget().snapshot_budget()?)
+            {
+                return None;
+            }
         }
-        let reserved_input = self.arrow().get_array_memory_size().checked_add(following.arrow().get_array_memory_size())?;
+        let reserved_input = run.iter().try_fold(0usize, |bytes, batch| bytes.checked_add(batch.arrow().get_array_memory_size()))?;
         if reserved_input > MAX_PACKED_LIVE_INPUT_BYTES { return None; }
-        let schema = self.arrow().schema_ref();
+        let schema = first.arrow().schema_ref();
         let schema_bytes = schema.fields().iter().try_fold(4096usize, |bytes, field| bytes.checked_add(field.size()))?;
         let schema_bytes = schema.metadata().iter().try_fold(schema_bytes, |bytes, (key, value)| {
             bytes.checked_add(128)?.checked_add(key.capacity())?.checked_add(value.capacity())
         })?;
         let peak = reserved_input.checked_mul(4)?.checked_add(schema_bytes)?.checked_add(4096)?;
         let mut reservation = budget.try_reserve(peak)?;
-        let batch = arrow_select::concat::concat_batches(schema, [self.arrow(), following.arrow()]).ok()?;
+        let batch = arrow_select::concat::concat_batches(schema, run.iter().map(|batch| batch.arrow())).ok()?;
         Arc::get_mut(&mut reservation)?.shrink_to(batch.get_array_memory_size().checked_add(schema_bytes)?).ok()?;
         let owned = OwnedBatch::with_reservation(batch, reservation).ok()?;
-        Self::from_owned_rows_of(owned, [self, following].into_iter()).ok()
+        Self::from_owned_rows_of(owned, run.iter().copied()).ok()
     }
 
     pub fn arrow(&self) -> &RecordBatch { self.owned.batch() }
@@ -382,20 +390,32 @@ impl LiveRelation {
         let index = self.starts.partition_point(|start| *start <= row).checked_sub(1)?;
         Some((index, row - self.starts[index]))
     }
-    fn push(&mut self, mut start: u32, mut batch: Arc<IndexBatch>, pack: bool) {
-        if pack {
-            while let Some((previous_start, previous)) = self.batches.back() {
-                let Some(joined) = previous.try_join_live_tail(&batch) else { break; };
-                start = *previous_start;
-                self.retained_bytes -= previous.retained_bytes();
-                self.batches.pop_back();
-                Arc::make_mut(&mut self.starts).pop();
-                batch = joined;
-            }
-        }
+    fn push(&mut self, start: u32, batch: Arc<IndexBatch>, pack: bool) {
+        self.push_back(start, batch);
+        while pack && self.pack_tail() {}
+    }
+    fn push_back(&mut self, start: u32, batch: Arc<IndexBatch>) {
         self.retained_bytes += batch.retained_bytes();
         self.batches.push_back((start, batch));
         Arc::make_mut(&mut self.starts).push(start);
+    }
+    /// Joins the trailing run of equal-length batches once it is `PACK_FAN_IN` long, or once it fills a packed batch.
+    /// A row is copied once per level (1, 8, 64, then 128 rows) rather than once per doubling.
+    fn pack_tail(&mut self) -> bool {
+        let Some((_, last)) = self.batches.back() else { return false; };
+        let size = last.len();
+        if size == 0 || !size.is_power_of_two() || size >= MAX_PACKED_LIVE_ROWS { return false; }
+        let fan_in = PACK_FAN_IN.min(MAX_PACKED_LIVE_ROWS / size);
+        let Some(first) = self.batches.len().checked_sub(fan_in) else { return false; };
+        let run = self.batches.focus().narrow(first..).into_iter().map(|(_, batch)| batch.as_ref()).collect::<Vec<_>>();
+        let Some(joined) = IndexBatch::try_join_live_run(&run) else { return false; };
+        let start = self.batches[first].0;
+        for _ in 0..fan_in {
+            if let Some((_, batch)) = self.batches.pop_back() { self.retained_bytes -= batch.retained_bytes(); }
+            Arc::make_mut(&mut self.starts).pop();
+        }
+        self.push_back(start, joined);
+        true
     }
 }
 
@@ -2274,7 +2294,7 @@ fn pending_runs_preserve_nested_intervals_with_arrow_alignment() {
     let [first, second] = runs.each_ref().map(|run| run.batch.as_ref());
     let expected = [first.events.read_event(0).unwrap(), second.events.read_event(0).unwrap()];
     let merged = PendingTable::concat_runs(&runs, &memory).unwrap();
-    let packed = first.try_join_live_tail(second).unwrap();
+    let packed = IndexBatch::try_join_live_run(&[first, second]).unwrap();
     for batch in [merged, packed] {
         assert_eq!(batch.len(), expected.len());
         for (row, event) in expected.iter().enumerate() {
@@ -2861,6 +2881,8 @@ mod chunk_tests {
         let rows = &live.tables()[&table];
         assert_eq!(rows.row_count(), 1000);
         assert!(rows.relation.len() <= 14);
+        let sizes = rows.relation.iter().map(|(_, batch)| batch.len()).collect::<Vec<_>>();
+        assert_eq!(sizes, [[128; 7].as_slice(), &[64], &[8; 5]].concat());
         assert_eq!(*rows.relation.starts, rows.relation.iter().map(|(start, _)| *start).collect::<Vec<_>>());
         assert!(live.live_batch_bytes() < 4_096 * 1000);
         for id in 0..1000u32 {
