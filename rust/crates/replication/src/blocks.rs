@@ -484,20 +484,30 @@ impl BlockStore {
 
     pub(crate) async fn latest_listed_block(&self) -> Result<Option<BlockIndex>> { latest_stored_block(self.store.as_ref(), None).await }
 
-    pub(crate) async fn collect_serving_checkpoints(&self, database: uuid::Uuid, epoch: u64, cancellation: &CancellationToken) -> Result<()> {
+    pub(crate) async fn collect_serving_checkpoints(&self, database: uuid::Uuid, epoch: u64,
+        checkpoint: PublishedCheckpoint, cancellation: &CancellationToken) -> Result<()> {
         let Some(local) = self.store.local_maintenance_store().filter(|store| store.defers_trie_releases()) else { return Ok(()); };
         let Some(custody) = local.try_lock_recovery_deletion().await? else { return Ok(()); };
         IoRegion::retaining(custody, async {
+            check_cancelled(cancellation)?;
+            let selected = self.load_fresh_catalog(checkpoint.block).await?;
+            if checkpoint.root_sha256.is_none() || selected.publication_sha256() != checkpoint.root_sha256
+                || selected.boundary_replica_position() != Some(checkpoint.boundary)
+            {
+                return Err(invalid("Serving checkpoint collection requires the adopted upload"));
+            }
+            let Some(key) = &selected.as_proto().serving_checkpoint_object else { return Ok(()); };
+            let image = serving_checkpoint_id(key)?;
+            self.store.head_fresh(&ObjectKey::new(key)?).await?;
             let files = self.store.list(Some(&ObjectKey::new(format!("db/{database}/file"))?)).await?;
-            let mut roots = Vec::new();
+            let mut roots = vec![image];
             for stored in self.store.list(Some(&ObjectKey::new("blocks")?)).await? {
                 check_cancelled(cancellation)?;
                 let Some(index) = canonical_block_index(&stored.key) else { continue; };
+                if index == checkpoint.block { continue; }
                 let catalog = self.load_fresh_catalog(index).await?;
                 if let Some(key) = &catalog.as_proto().serving_checkpoint_object {
-                    let id = key.parse::<ObjectId>()?;
-                    if id.kind != ObjectKind::File { return Err(invalid("Invalid serving checkpoint object kind")); }
-                    roots.push(id);
+                    roots.push(serving_checkpoint_id(key)?);
                 }
             }
             let reachable = Reachability::from_roots(database, epoch, roots)?;
@@ -771,7 +781,7 @@ impl BlockStore {
         let tx_key = prepared.value().live().latest_completed_tx();
         check_cancelled(cancellation)?;
         let (serving_checkpoint, serving_checkpoint_object) = match serving_checkpoint {
-            Some(checkpoint) => checkpoint.store(self, cancellation).await?,
+            Some(checkpoint) => checkpoint.store(self.store.as_ref()).await?,
             None => (None, None),
         };
         check_cancelled(cancellation)?;
@@ -921,6 +931,11 @@ pub(crate) fn relation_oid_order_at_boundary(prepared: &BlockPreparation, bounda
     RelationOidOrder::from_wire(boundary.relation_oid_order.or(prior.wire_value()))
 }
 fn invalid(message: impl Into<String>) -> Anomaly { Anomaly::fault("rtdb.replication/invalid-block", message) }
+fn serving_checkpoint_id(key: &str) -> Result<ObjectId> {
+    let id: ObjectId = key.parse()?;
+    if id.kind != ObjectKind::File { return Err(invalid("Invalid serving checkpoint object kind")); }
+    Ok(id)
+}
 fn io_error(error: impl std::fmt::Display) -> Anomaly { Anomaly::fault("rtdb.replication/block-io", error.to_string()) }
 fn check_cancelled(cancellation: &CancellationToken) -> Result<()> { if cancellation.is_cancelled() { Err(crate::progress::cancelled()) } else { Ok(()) } }
 

@@ -231,7 +231,8 @@ impl AppliedErasure {
             };
         evidence.inventory_sha256 = Some(inventory.store(blocks).await?);
         checkpoint.bind_rewrite(evidence)?;
-        let object = checkpoint.store_rewrite(blocks, cancellation).await?;
+        check_cancelled(cancellation)?;
+        let object = checkpoint.store_rewrite(store).await?;
         for key in members {
             check_cancelled(cancellation)?;
             store

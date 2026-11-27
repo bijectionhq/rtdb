@@ -738,7 +738,7 @@ async fn replay(
                         source.copy_to(&key, destination, &key).await?;
                         kms.check_readable(opened.generation).await?;
                         Some(checkpoint)
-                    } else { Some(serving.checkpoint(record.envelope.term, false)?) }
+                    } else { Some(serving.checkpoint(record.envelope.term)?) }
                 } else { None };
                 let output = blocks.produce_with_search(&prepared, &record, Default::default(), cancellation, None, serving_checkpoint).await?;
                 if position == through {

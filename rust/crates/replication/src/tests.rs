@@ -1566,6 +1566,56 @@ async fn default_v1_uses_positioned_classic_rows_from_a_preexisting_checkpoint()
 }
 
 #[tokio::test]
+async fn default_local_reclaims_an_older_orphan_at_checkpoint_readback() {
+    use rtdb_crypt::{Generation, Kms, LocalKms, tokens::VerifiedClaims};
+    use rtdb_store::WriterObjects;
+    use rtdb_types::rtdb_v1::At;
+
+    let directory = tempfile::tempdir().unwrap();
+    let options = || LocalLogOptions { maximum_message_bytes: 1 << 20, queue_capacity: 8 };
+    let (source, source_driver) = LocalLog::open(directory.path().join("LOG"), options()).unwrap();
+    let (replica, replica_driver) = LocalLog::open(directory.path().join("REPLICA_LOG"), options()).unwrap();
+    let writers = CancellationToken::new();
+    let source_writer = tokio::spawn(source_driver.run(writers.clone()));
+    let replica_writer = tokio::spawn(replica_driver.run(writers.clone()));
+    let store = Arc::new(LocalStore::open(directory.path().join("objects")).unwrap().with_catalog_ledger(StorageEpoch(0)));
+    let database = uuid::Uuid::from_bytes([7; 16]);
+    let kms = Arc::new(LocalKms::new(|| 0));
+    let generation = Generation { database, number: 1 };
+    kms.create(generation).await.unwrap();
+    let orphan = WriterObjects::new(database, 0).file(kms.as_ref(), 1, b"orphan").await.unwrap();
+    let orphan_key = ObjectKey::new(orphan.id().to_string()).unwrap();
+    orphan.put(store.as_ref()).await.unwrap();
+
+    let interval = Duration::from_millis(5);
+    let (handle, mut driver) = local_recovery_driver(source, replica, store.clone(), true, interval).await;
+    let authority = NativeServingAuthority { incarnation: *database.as_bytes(),
+        checkpoints: Some(NativeCheckpointAuthority { kms, generation: 1 }) };
+    let serving = driver.attach_native_serving(handle.clone(), authority.clone(), true).await.unwrap();
+    let running = tokio::spawn(driver.run());
+    let cancellation = CancellationToken::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        serving.view(At::Linearizable, &cancellation).await.unwrap();
+        assert!(store.head_fresh(&orphan_key).await.is_ok());
+        let written = serving.transact(serving_source_put(1), VerifiedClaims::default(), None, &cancellation).await.unwrap();
+        let flush = handle.flush().await.unwrap();
+        let mut status = handle.watch_status();
+        let checkpoint = status.wait_for(|status| status.installed.is_some_and(|prefix| prefix.source >= flush))
+            .await.unwrap().adopted_block.clone().unwrap();
+        assert!(matches!(store.head_fresh(&orphan_key).await, Err(rtdb_storage::Error::MissingObject(_))));
+        let wire = checkpoint.as_proto();
+        assert!(authority.read_checkpoint(store.as_ref(), wire.serving_checkpoint.as_deref(), wire.serving_checkpoint_object.as_deref())
+            .await.unwrap().is_some());
+        assert_eq!(serving.view(At::Exactly(written.basis), &cancellation).await.unwrap().index.head().basis, written.basis);
+    }).await.unwrap();
+    handle.shutdown();
+    running.await.unwrap().unwrap();
+    writers.cancel();
+    source_writer.await.unwrap().unwrap();
+    replica_writer.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn default_orders_an_exact_pin_and_reopens_independent_backing() {
     use rtdb_crypt::tokens::VerifiedClaims;
 
@@ -1764,7 +1814,7 @@ async fn the_leader_records_artefacts_of_live_tries_and_deletes_the_files_of_ent
 }
 
 async fn local_recovery_driver(
-    source: Arc<dyn Log>, replica: Arc<dyn Log>, store: Arc<MemoryStore>, may_lead: bool, assertion_interval: Duration,
+    source: Arc<dyn Log>, replica: Arc<dyn Log>, store: Arc<impl ObjectStore + 'static>, may_lead: bool, assertion_interval: Duration,
 ) -> (ReplicationHandle, ReplicationDriver) {
     let memory = MemoryBudget::new(1 << 28);
     let cache = Arc::new(BufferPool::new(store.clone(), 1 << 25));

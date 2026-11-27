@@ -16,7 +16,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::promotion::{initial_term_sequence, replica_read_is_empty, should_start_claim};
-use crate::{BlockCycle, BlockStore, FlushTimer, PartitionLogs, PendingBlock, ProgressMonitor, PublishedPrimaryReset, RecoveredPartition, ReplicaRecord, TermFence, TermPosition, Verdict};
+use crate::{BlockCycle, BlockStore, FlushTimer, PartitionLogs, PendingBlock, ProgressMonitor, PublishedCheckpoint, PublishedPrimaryReset, RecoveredPartition, ReplicaRecord, TermFence, TermPosition, Verdict};
 use crate::admission::AdmittedReplica;
 use crate::appender::{Applied, AppenderHandle, CommitLagBasis, PendingWrite, ReplicaAppender, WriteBody, complete_record, join_error, now};
 use crate::blocks::{RecoveredBlockConfirmation, checkpoint_digest, matches_catalog_boundary, matches_confirmation, validate_uploaded_root};
@@ -571,6 +571,7 @@ pub struct ReplicationDriver {
     resolve: Arc<ResolveContext>, effects: Arc<dyn DatabaseEffects>, cancellation: CancellationToken, clock: ReplicationClock,
     serving_search: Option<Arc<dyn ServingSearchBuilder>>,
     serving: Option<NativeServing>,
+    collect_serving_checkpoints: bool,
     default_erasure: Option<DefaultErasure>,
     default_erasure_read_fence: Option<Arc<dyn crate::DefaultErasureReadFence>>,
     local_erasure_read_fence: Option<Arc<crate::LocalDefaultErasureReadFence>>,
@@ -636,7 +637,7 @@ impl ReplicationDriver {
         let replica_tail = recovered.take_replay_tail(&logs, read_position)?;
         let restart = if config.enabled { progress.prepare_driver_restart() } else { None };
         Ok((handle, Self { config, logs, blocks, partition: recovered.partition, progress, restart, resolve, effects, cancellation, clock, recovered_confirmation, compaction_replay_cutoff: recovered.compaction_replay_cutoff, track_catalog_cut, recognized_prefix: true, applied_prefix, installed: None, first_erasure: None, historical_confirmations: VecDeque::new(), fence: recovered.fence,
-            read_position, pending_block: None, claim: None, claiming: None, replica_tail, replica_poll: None, replica_batch: VecDeque::new(), replica_head: None, leader: None, commands, status, flush_timer, serving_search: None, serving: None, default_erasure: None, default_erasure_read_fence: None, local_erasure_read_fence: None, default_erasure_grant_micros: None, required_append_bytes: None, deferred_cut: false, placed_slot: None }))
+            read_position, pending_block: None, claim: None, claiming: None, replica_tail, replica_poll: None, replica_batch: VecDeque::new(), replica_head: None, leader: None, commands, status, flush_timer, serving_search: None, serving: None, collect_serving_checkpoints: false, default_erasure: None, default_erasure_read_fence: None, local_erasure_read_fence: None, default_erasure_grant_micros: None, required_append_bytes: None, deferred_cut: false, placed_slot: None }))
     }
 
     pub fn with_serving_search(mut self, builder: Arc<dyn ServingSearchBuilder>) -> Self {
@@ -671,7 +672,7 @@ impl ReplicationDriver {
                 .await?;
         }
         let store = Arc::clone(self.resolve.storage.object_store());
-        let (mut serving, view) = NativeServing::open(authority.clone(), store, checkpoint.as_ref(), collect_checkpoints)?;
+        let (mut serving, view) = NativeServing::open(authority.clone(), store, checkpoint.as_ref())?;
         serving.physical_erasure = self.local_erasure_read_fence.is_some();
         if let Some(block) = &block { serving.verify_checkpoint_prefix(block)?; }
         serving.recover_classic(self.partition.snapshot(), block.as_ref().and_then(|block| block.boundary_replica_position()),
@@ -691,6 +692,7 @@ impl ReplicationDriver {
             serving.funded_record_limit = self.logs.replica_timed_original_append_limit().map(|limit| limit.saturating_sub(1024));
         }
         let funded_record_limit = serving.funded_record_limit;
+        self.collect_serving_checkpoints = collect_checkpoints && self.logs.retains_recovery_history();
         self.serving = Some(serving);
         Ok(NativeServingHandle { replication, view, authority, source_authority, source_replies, funded_record_limit,
             local_read_fence: self.local_erasure_read_fence.clone() })
@@ -1595,6 +1597,13 @@ impl ReplicationDriver {
                 let (catalog, table_blocks) = self.blocks.load(pending.block_index()).await?;
                 crate::blocks::validate_boundary(&catalog, &pending.prepared, &pending.boundary)?;
                 validate_uploaded_root(&catalog, message, self.logs.requires_checkpoint_digest())?;
+                let checkpoint = PublishedCheckpoint {
+                    block: catalog.block_index(), boundary: pending.boundary.metadata.position,
+                    root_sha256: message.catalog_sha256.as_deref().and_then(|digest| digest.try_into().ok()),
+                };
+                let collect = self.collect_serving_checkpoints && checkpoint.root_sha256.is_some()
+                    && catalog.as_proto().serving_checkpoint_object.is_some()
+                    && matches_confirmation(&catalog, message, self.logs.storage_version, self.logs.storage_epoch);
                 let tries = additions(&message.tries)?;
                 let selected = self.verify_default_erasure_upload(&catalog, &pending.boundary, &record).await?;
                 if let Some(selected) = selected {
@@ -1621,6 +1630,17 @@ impl ReplicationDriver {
                         storage_version: Some(self.logs.storage_version.0), storage_epoch: Some(self.logs.storage_epoch.0),
                         tries: message.tries.clone(), source_msg_id: None,
                     })), (self.clock)()).await?;
+                }
+                if collect && self.default_erasure.is_none()
+                    && let Role::Leading(term) = self.role() && term == record.envelope.term
+                    && let Ok(epoch) = u64::try_from(term.0)
+                    && let Some(incarnation) = self.serving.as_ref().map(NativeServing::incarnation)
+                    && let Err(error) = self.blocks.collect_serving_checkpoints(
+                        uuid::Uuid::from_bytes(incarnation), epoch, checkpoint, &self.cancellation,
+                    ).await
+                    && !self.cancellation.is_cancelled()
+                {
+                    tracing::warn!(%error, block = checkpoint.block.0, "Could not collect older serving checkpoint files");
                 }
                 self.publish_status(self.role());
                 continue;
@@ -1983,7 +2003,7 @@ impl ReplicationDriver {
             None => None,
         };
         let term = rewrite.as_ref().map_or(leader.term, |_| boundary.envelope.term);
-        let serving_checkpoint = self.serving.as_mut().map(|serving| serving.checkpoint(term, leader.confirmed && rewrite.is_none())).transpose()?;
+        let serving_checkpoint = self.serving.as_mut().map(|serving| serving.checkpoint(term)).transpose()?;
         let logs = Arc::clone(&self.logs);
         let cancellation = leader.cancellation.clone();
         leader.production = Some(Production::Writing(std::time::Instant::now(), Box::pin(async move {

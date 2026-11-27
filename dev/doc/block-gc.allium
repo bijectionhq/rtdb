@@ -16,6 +16,9 @@
 -- the leader checks the storage owner's startup hold and repair anchor before deleting old metadata.
 -- Coordinated native startup retains a shared recovery gate while choosing a checkpoint and admitting the replica cursor.
 -- Native metadata collection needs exclusive access to that gate through unlink.
+-- The Default Local writer collects older-term sealed serving images after adopting its own replica upload confirmation.
+-- The collector verifies the exact published root and replica boundary under the exclusive recovery gate.
+-- Every retained block catalog remains a root for its sealed image.
 --
 -- Multi records a logical release first. For a versioned or enrolled terminal S3 block pack,
 -- the release names the owned pack and the exact publication observed for the member.

@@ -68,7 +68,7 @@ pub(crate) async fn open_selected(
     authority: NativeServingAuthority, block: Option<&BlockCatalog>, snapshot: Snapshot,
     storage: &Arc<BufferPool>, memory: &Arc<MemoryBudget>, cancellation: &CancellationToken, checkpoint: Option<&NativeCheckpointImage>,
 ) -> Result<NativeServing> {
-    let (mut serving, _) = NativeServing::open(authority, Arc::clone(storage.object_store()), checkpoint, false)?;
+    let (mut serving, _) = NativeServing::open(authority, Arc::clone(storage.object_store()), checkpoint)?;
     if serving.pending_erasure().is_some() { return Err(erasure_recovery_required()); }
     if let Some(block) = block { serving.verify_checkpoint_prefix(block)?; }
     serving.recover_classic(snapshot, block.and_then(BlockCatalog::boundary_replica_position), storage, memory, cancellation,
@@ -84,7 +84,7 @@ pub(crate) fn genesis(
         incarnation,
         checkpoints: None,
     };
-    NativeServing::open(authority, Arc::clone(store), None, false).map(|(serving, _)| serving)
+    NativeServing::open(authority, Arc::clone(store), None).map(|(serving, _)| serving)
 }
 
 pub(crate) struct AppliedDecision {

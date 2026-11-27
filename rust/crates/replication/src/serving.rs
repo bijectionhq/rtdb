@@ -402,7 +402,6 @@ pub(crate) struct NativeServing {
     position: u64,
     pipeline: Option<TransactPipeline>,
     pub(crate) funded_record_limit: Option<usize>,
-    collect_checkpoints: bool,
     writer: Option<(Term, Arc<Mutex<WriterObjects>>)>,
     pending: BTreeMap<u64, proto::NoOp>,
     timed_source: Option<SourcePosition>,
@@ -432,7 +431,6 @@ struct CheckpointWriter {
     authority: NativeCheckpointAuthority,
     database: Uuid,
     epoch: u64,
-    collect: bool,
 }
 
 impl ServingCheckpoint {
@@ -455,17 +453,16 @@ impl ServingCheckpoint {
             return Err(default_erasure::invalid());
         }
         writer.authority.generation = writer.authority.generation.checked_add(1).ok_or_else(default_erasure::invalid)?;
-        writer.collect = false;
         self.image = evidence.frame(prefix, state)?;
         Ok(())
     }
 
-    pub(crate) async fn store_rewrite(self, blocks: &crate::BlockStore, cancellation: &CancellationToken) -> Result<String> {
+    pub(crate) async fn store_rewrite(self, store: &dyn ObjectStore) -> Result<String> {
         let CheckpointPublication::Writer(writer) = &self.publication else {
             return Err(default_erasure::unsupported());
         };
         writer.authority.kms.create(Generation { database: writer.database, number: writer.authority.generation }).await?;
-        self.store(blocks, cancellation).await?.1.ok_or_else(default_erasure::invalid)
+        self.store(store).await?.1.ok_or_else(default_erasure::invalid)
     }
 
     pub(crate) async fn verify(&self, store: &dyn ObjectStore, inline: Option<&[u8]>, object: Option<&str>) -> Result<()> {
@@ -487,8 +484,7 @@ impl ServingCheckpoint {
         if same { Ok(()) } else { Err(invalid()) }
     }
 
-    pub(crate) async fn store(self, blocks: &crate::BlockStore, cancellation: &CancellationToken) -> Result<(Option<Vec<u8>>, Option<String>)> {
-        let store = blocks.object_store();
+    pub(crate) async fn store(self, store: &dyn ObjectStore) -> Result<(Option<Vec<u8>>, Option<String>)> {
         let writer = match &self.publication {
             CheckpointPublication::Inline => return Ok((Some(self.image.to_vec()), None)),
             CheckpointPublication::Retained { id, .. } => {
@@ -502,9 +498,6 @@ impl ServingCheckpoint {
         prepared.put(store).await?;
         let reachable = Reachability::from_roots(writer.database, writer.epoch, [])?;
         reachable.validate_publication([prepared.id()])?;
-        if writer.collect {
-            blocks.collect_serving_checkpoints(writer.database, writer.epoch, cancellation).await?;
-        }
         Ok((None, Some(prepared.id().to_string())))
     }
 }
@@ -532,7 +525,7 @@ impl NativeServing {
         }
     }
 
-    pub(crate) fn open(mut authority: NativeServingAuthority, store: Arc<dyn ObjectStore>, checkpoint: Option<&NativeCheckpointImage>, collect_checkpoints: bool) -> Result<(Self, watch::Receiver<NativeServingView>)> {
+    pub(crate) fn open(mut authority: NativeServingAuthority, store: Arc<dyn ObjectStore>, checkpoint: Option<&NativeCheckpointImage>) -> Result<(Self, watch::Receiver<NativeServingView>)> {
         let (fold, position, shared_checkpoint) = match checkpoint {
             Some(checkpoint) => decode_checkpoint_image(checkpoint.bytes(), authority.incarnation)?,
             None => (TransactState::new(authority.incarnation), 0, false),
@@ -555,14 +548,14 @@ impl NativeServing {
         Ok((Self {
             funded_record_limit: None,
             authority, fold: Some(fold), position, pipeline: None,
-            collect_checkpoints, writer: None, pending: BTreeMap::new(),
+            writer: None, pending: BTreeMap::new(),
             timed_source: None, erasure_in_flight: false, physical_erasure: false, pending_replies: 0,
             shares_main: shared_checkpoint || position == 0, classic_charges: Vec::new(),
             view, source_authority, source_replies: Arc::default(),
         }, receiver))
     }
 
-    pub(crate) fn checkpoint(&mut self, term: Term, confirmed: bool) -> Result<ServingCheckpoint> {
+    pub(crate) fn checkpoint(&mut self, term: Term) -> Result<ServingCheckpoint> {
         let fold = self.durable();
         let cut = fold.index().head();
         let checkpoint = fold.encode_checkpoint()?;
@@ -579,7 +572,7 @@ impl NativeServing {
                 self.writer = Some((term, Arc::new(Mutex::new(WriterObjects::new(database, epoch)))));
             }
             let (_, writer) = self.writer.as_ref().expect("writer installed for this term");
-            Some(CheckpointWriter { allocator: Arc::clone(writer), authority: authority.clone(), database, epoch, collect: confirmed && self.collect_checkpoints })
+            Some(CheckpointWriter { allocator: Arc::clone(writer), authority: authority.clone(), database, epoch })
         } else { None };
         let publication = writer.map_or(CheckpointPublication::Inline, CheckpointPublication::Writer);
         Ok(ServingCheckpoint { image: frame.freeze(), publication })
@@ -1199,7 +1192,7 @@ mod tests {
 
     fn open(checkpoint: Option<&[u8]>) -> (NativeServing, watch::Receiver<NativeServingView>) {
         let checkpoint = checkpoint.map(|bytes| NativeCheckpointImage::Inline(Bytes::copy_from_slice(bytes)));
-        NativeServing::open(authority(), Arc::new(MemoryStore::default()), checkpoint.as_ref(), false).unwrap()
+        NativeServing::open(authority(), Arc::new(MemoryStore::default()), checkpoint.as_ref()).unwrap()
     }
 
     #[test]
@@ -1228,7 +1221,7 @@ mod tests {
         let retry = writer.decide_source(SourcePosition(4), Timestamp(43), Ok(unscoped(transaction))).unwrap();
         assert!(writer.apply_ordered(&retry, true, Some((ReplicaPosition(12), Term(2))), |_, _, _, _| unreachable!()).unwrap().unwrap().1.unwrap().replayed);
         for serving in [&mut writer, &mut retained] {
-            let image = serving.checkpoint(Term(2), true).unwrap().image;
+            let image = serving.checkpoint(Term(2)).unwrap().image;
             let (reopened, _) = open(Some(&image));
             assert_eq!(reopened.durable().installed_receipt(None, &receipt.key, receipt.basis), Some(witness));
             assert_eq!(reopened.durable().installed_receipt(Some([0; 32]), &receipt.key, receipt.basis), None);
@@ -1251,7 +1244,7 @@ mod tests {
         let (mut legacy, _) = open(None);
         let (_, receipt) = legacy.apply_ordered(&old_record, false, Some((ReplicaPosition(4), Term(2))), |_, _, _, _| unreachable!()).unwrap().unwrap();
         let receipt = receipt.unwrap();
-        let image = legacy.checkpoint(Term(2), true).unwrap().image;
+        let image = legacy.checkpoint(Term(2)).unwrap().image;
         let (reopened, _) = open(Some(&image));
         let index = reopened.durable().index();
         let view = index.view(MAIN_BRANCH, At::Exactly(receipt.basis), Layer::Merged, receipt.system_time).unwrap();
@@ -1339,7 +1332,7 @@ mod tests {
         let message = writer.decide_source(offset, Timestamp(40), Ok(unscoped(put(1)))).unwrap();
         let (_, receipt) = writer.apply_ordered(&message, true, Some((replica, Term(2))), |_, _, _, _| Ok(())).unwrap().unwrap();
         let receipt = receipt.unwrap();
-        let image = writer.checkpoint(Term(2), true).unwrap().image;
+        let image = writer.checkpoint(Term(2)).unwrap().image;
         let sealed = WriterObjects::new(database, 2).file(kms.as_ref(), generation.number, &image).await.unwrap();
         sealed.put(source.as_ref()).await.unwrap();
         kms.retire(generation, 100).await.unwrap();
@@ -1355,14 +1348,12 @@ mod tests {
         let key = ObjectKey::new(object.clone()).unwrap();
         source.copy_to(&key, destination.as_ref(), &key).await.unwrap();
         let store: Arc<dyn ObjectStore> = destination.clone();
-        let blocks = crate::BlockStore::new(Arc::clone(&store), Arc::new(BufferPool::new(Arc::clone(&store), 1 << 20)),
-            MemoryBudget::new(1 << 24), 100_000_000).unwrap();
-        let (inline, restored_object) = checkpoint.store(&blocks, &CancellationToken::new()).await.unwrap();
+        let (inline, restored_object) = checkpoint.store(store.as_ref()).await.unwrap();
         assert!(inline.is_none());
         assert_eq!(restored_object, Some(object.clone()));
         assert_eq!(source.get(&key).await.unwrap(), destination.get(&key).await.unwrap());
         let copied = authority.read_checkpoint(store.as_ref(), None, Some(&object)).await.unwrap();
-        let (reopened, view) = NativeServing::open(authority, store, copied.as_ref(), false).unwrap();
+        let (reopened, view) = NativeServing::open(authority, store, copied.as_ref()).unwrap();
         assert_eq!(view.borrow().key_generation, Some(generation.number));
         assert_eq!(reopened.durable().installed_receipt(None, &receipt.key, receipt.basis), Some(InstalledReceipt { source: offset, replica, term: Term(2) }));
     }
@@ -1456,7 +1447,7 @@ mod tests {
         assert!(serving.apply(&excluded, true, |_, _, _, _| Ok(())).is_err());
         assert_eq!(serving.apply(&reread, true, |_, _, _, _| Ok(())).unwrap().unwrap().1.unwrap().basis.position(), 2);
 
-        let image = serving.checkpoint(Term(2), true).unwrap().image;
+        let image = serving.checkpoint(Term(2)).unwrap().image;
         let (recovered, _) = open(Some(&image));
         assert_eq!(recovered.status(&[2; 16], None).unwrap().basis.position(), 2);
     }
@@ -1477,7 +1468,7 @@ mod tests {
                     assert_eq!(reply.unwrap().basis.position(), u64::from(key));
                 }
             }
-            assert_eq!(leader.checkpoint(Term(1), true).unwrap().image, follower.checkpoint(Term(1), true).unwrap().image);
+            assert_eq!(leader.checkpoint(Term(1)).unwrap().image, follower.checkpoint(Term(1)).unwrap().image);
         }
     }
 
@@ -1510,7 +1501,7 @@ mod tests {
         assert_eq!(receipt.outcome, Outcome::Then);
         assert_eq!(receipt.basis.incarnation(), scope.labels.main_read_incarnation(INCARNATION));
 
-        let checkpoint = serving.checkpoint(Term(1), true).unwrap();
+        let checkpoint = serving.checkpoint(Term(1)).unwrap();
         let (reopened, _) = open(Some(&checkpoint.image));
         assert_eq!(reopened.status(&[2; 16], Some(&scope)).unwrap().basis, receipt.basis);
         assert_eq!(reopened.status(&[2; 16], None).unwrap_err().code, "rtdb/unknown-transaction");
@@ -1520,7 +1511,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serving_object_collection_preserves_retained_and_current_epoch_images() {
+    async fn serving_object_collection_requires_exact_upload_and_preserves_retained_images() {
+        use crate::PublishedCheckpoint;
+
         let directory = tempfile::tempdir().unwrap();
         let local = Arc::new(LocalStore::open(directory.path()).unwrap().with_catalog_ledger(StorageEpoch(0)));
         let store: Arc<dyn ObjectStore> = local.clone();
@@ -1534,26 +1527,44 @@ mod tests {
         let retained = old.file(&kms, 1, b"retained").await.unwrap();
         let orphan = old.file(&kms, 1, b"orphan").await.unwrap();
         let inflight = current.file(&kms, 1, b"in flight").await.unwrap();
-        for object in [&retained, &orphan, &inflight] { object.put(store.as_ref()).await.unwrap(); }
+        let adopted = current.file(&kms, 1, b"adopted").await.unwrap();
+        for object in [&retained, &orphan, &inflight, &adopted] { object.put(store.as_ref()).await.unwrap(); }
         let mut root = BlockCatalog::from_proto(block_pb::Block { block_index: Some(1),
             serving_checkpoint_object: Some(retained.id().to_string()), ..Default::default() }).unwrap();
         let root_key = ObjectKey::new(block_key(BlockIndex(1)).unwrap()).unwrap();
         store.put(&root_key, Bytes::from(root.encode_for_publication())).await.unwrap();
-        let staged_key = ObjectKey::new("blocks/staged/b02.binpb").unwrap();
-        let mut staged = BlockCatalog::from_proto(block_pb::Block { block_index: Some(2),
+        let mut latest = BlockCatalog::from_proto(block_pb::Block { block_index: Some(2), boundary_replica_msg_id: Some(5),
+            serving_checkpoint_object: Some(adopted.id().to_string()), ..Default::default() }).unwrap();
+        let latest_key = ObjectKey::new(block_key(BlockIndex(2)).unwrap()).unwrap();
+        store.put(&latest_key, Bytes::from(latest.encode_for_publication())).await.unwrap();
+        let publication = PublishedCheckpoint { block: BlockIndex(2), boundary: ReplicaPosition(5), root_sha256: latest.publication_sha256() };
+
+        let staged_key = ObjectKey::new("blocks/staged/b03.binpb").unwrap();
+        let mut staged = BlockCatalog::from_proto(block_pb::Block { block_index: Some(3),
             serving_checkpoint_object: Some(orphan.id().to_string()), ..Default::default() }).unwrap();
         store.put(&staged_key, Bytes::from(staged.encode_for_publication())).await.unwrap();
 
         let cancellation = CancellationToken::new();
-        let recovery = local.hold_recovery_open().await.unwrap();
-        blocks.collect_serving_checkpoints(database, 2, &cancellation).await.unwrap();
         let orphan_key = ObjectKey::new(orphan.id().to_string()).unwrap();
+        for wrong in [
+            PublishedCheckpoint { root_sha256: None, ..publication },
+            PublishedCheckpoint { root_sha256: root.publication_sha256(), ..publication },
+            PublishedCheckpoint { boundary: ReplicaPosition(4), ..publication },
+        ] {
+            assert!(blocks.collect_serving_checkpoints(database, 2, wrong, &cancellation).await.is_err());
+            assert!(store.head(&orphan_key).await.is_ok());
+        }
+        assert!(blocks.collect_serving_checkpoints(Uuid::from_bytes([99; 16]), 2, publication, &cancellation).await.is_err());
+        assert!(store.head(&orphan_key).await.is_ok());
+        let recovery = local.hold_recovery_open().await.unwrap();
+        blocks.collect_serving_checkpoints(database, 2, publication, &cancellation).await.unwrap();
         assert!(store.head(&orphan_key).await.is_ok());
         drop(recovery);
-        blocks.collect_serving_checkpoints(database, 2, &cancellation).await.unwrap();
+        blocks.collect_serving_checkpoints(database, 2, publication, &cancellation).await.unwrap();
         assert!(matches!(store.head(&orphan_key).await, Err(rtdb_storage::Error::MissingObject(_))));
         assert!(store.head(&staged_key).await.is_ok());
         assert_eq!(rtdb_store::read_file(store.as_ref(), &kms, retained.id()).await.unwrap().bytes.as_slice(), b"retained");
         assert_eq!(rtdb_store::read_file(store.as_ref(), &kms, inflight.id()).await.unwrap().bytes.as_slice(), b"in flight");
+        assert_eq!(rtdb_store::read_file(store.as_ref(), &kms, adopted.id()).await.unwrap().bytes.as_slice(), b"adopted");
     }
 }

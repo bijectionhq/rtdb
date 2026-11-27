@@ -33,8 +33,8 @@ async fn a_reopened_view_checks_the_actual_checkpoint_generation_at_delivery() -
         }),
     };
     let store: Arc<dyn ObjectStore> = Arc::new(MemoryStore::default());
-    let (mut serving, _) = NativeServing::open(authority.clone(), Arc::clone(&store), None, false)?;
-    let image = serving.checkpoint(Term(1), false)?.image;
+    let (mut serving, _) = NativeServing::open(authority.clone(), Arc::clone(&store), None)?;
+    let image = serving.checkpoint(Term(1))?.image;
     let stored = WriterObjects::new(database, 1)
         .file(kms.as_ref(), selected.number, &image)
         .await?;
@@ -44,7 +44,7 @@ async fn a_reopened_view_checks_the_actual_checkpoint_generation_at_delivery() -
         .read_checkpoint(store.as_ref(), None, Some(&key))
         .await?;
     let (reopened, view) =
-        NativeServing::open(authority.clone(), store, checkpoint.as_ref(), false)?;
+        NativeServing::open(authority.clone(), store, checkpoint.as_ref())?;
     let original = view.borrow().clone();
     reopened.adopt_erasure_generation(current.number);
     let generation = original.key_generation.unwrap();
@@ -115,8 +115,8 @@ async fn ordinary_checkpoints_continue_at_the_installed_generation_after_restart
     };
     keys.create(selected).await?;
     let store: Arc<dyn ObjectStore> = Arc::new(MemoryStore::default());
-    let (mut fresh, _) = NativeServing::open(initial.clone(), Arc::clone(&store), None, false)?;
-    let image = fresh.checkpoint(Term(1), false)?.image;
+    let (mut fresh, _) = NativeServing::open(initial.clone(), Arc::clone(&store), None)?;
+    let image = fresh.checkpoint(Term(1))?.image;
     let file = WriterObjects::new(database, 1)
         .file(keys.as_ref(), selected.number, &image)
         .await?;
@@ -124,9 +124,9 @@ async fn ordinary_checkpoints_continue_at_the_installed_generation_after_restart
     let checkpoint = initial
         .read_checkpoint(store.as_ref(), None, Some(&file.id().to_string()))
         .await?;
-    let (mut reopened, _) = NativeServing::open(initial, store, checkpoint.as_ref(), false)?;
+    let (mut reopened, _) = NativeServing::open(initial, store, checkpoint.as_ref())?;
     assert_eq!(
-        reopened.checkpoint(Term(2), true)?.write_generation()?,
+        reopened.checkpoint(Term(2))?.write_generation()?,
         selected.number
     );
     Ok(())
