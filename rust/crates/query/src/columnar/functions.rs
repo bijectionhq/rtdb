@@ -12,7 +12,8 @@
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, NullArray, PrimitiveArray, StringArray, StructArray,
-    TimestampMicrosecondArray, builder::{BooleanBuilder, PrimitiveBuilder}, new_null_array, types::{ArrowPrimitiveType, Float64Type, Int32Type}};
+    TimestampMicrosecondArray, make_array, builder::{BooleanBuilder, PrimitiveBuilder}, new_null_array, types::{ArrowPrimitiveType, Float64Type, Int32Type}};
+use arrow_buffer::NullBuffer;
 use arrow_schema::{DataType, Field as ArrowField, TimeUnit as ArrowUnit};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_expr::kernels::{self, Function, LikeMatcher, Selection};
@@ -136,13 +137,15 @@ fn read(column: &Column, declared: &LogicalType, len: usize, memory: &Arc<Memory
             Some(Some(scalar)) if scalar == *expected => Vector::of(array.as_ref(), expected).map(Charged::shared),
             _ => None,
         },
-        Column::Selected(selected) => read_selected(selected, expected, memory)?,
+        Column::Selected(selected) => read_selected(selected, expected, &[], memory)?,
         Column::Values(values) => read_values(values, expected, len).map(|vector| Charged::built(vector, memory)).transpose()?,
     })
 }
 
 /// Gathers a selection whose sources all read as `expected` or as nulls into one vector.
-fn read_selected(selected: &SelectedColumn, expected: &ScalarType, memory: &Arc<MemoryBudget>) -> Result<Option<Charged>> {
+fn read_selected(
+    selected: &SelectedColumn, expected: &ScalarType, parent_nulls: &[Option<&NullBuffer>], memory: &Arc<MemoryBudget>,
+) -> Result<Option<Charged>> {
     let mut data_type = None;
     let mut readable = Vec::with_capacity(selected.sources.len());
     for source in selected.sources.iter() {
@@ -167,21 +170,25 @@ fn read_selected(selected: &SelectedColumn, expected: &ScalarType, memory: &Arc<
         .map(|(source, typed)| match source { Some((array, ..)) if *typed => array.as_ref(), _ => nulls.as_ref() })
         .chain(std::iter::once(nulls.as_ref())).collect();
     let _cells = memory.reserve(cell_bytes(selected.cells.len())?)?;
-    let cells: Vec<(usize, usize)> = selected.cells.iter().map(|(source, row)| if readable[source] { (source, row) } else { (null, 0) }).collect();
+    let cells: Vec<(usize, usize)> = selected.cells.iter().map(|(source, row)| {
+        if readable[source] && parent_nulls.get(source).and_then(|nulls| *nulls).is_none_or(|nulls| nulls.is_valid(row)) {
+            (source, row)
+        } else { (null, 0) }
+    }).collect();
     let gathered = super::interleave(&arrays, &cells)?;
     Vector::of(gathered.as_ref(), expected).map(|vector| Charged::built(vector, memory)).transpose()
 }
 
 fn struct_child<'a>(array: &'a dyn Array, field: &ArrowField, logical: Option<&LogicalType>, name: &str)
-    -> Option<(&'a ArrayRef, &'a Arc<ArrowField>)>
+    -> Option<(&'a StructArray, &'a ArrayRef, &'a Arc<ArrowField>)>
 {
-    if !field.metadata().is_empty() || field.data_type() != array.data_type() || array.null_count() != 0 { return None; }
+    if !field.metadata().is_empty() || field.data_type() != array.data_type() { return None; }
     let LogicalType::Struct(types) = nonnull(logical?) else { return None; };
     let parent = array.as_any().downcast_ref::<StructArray>()?;
     let position = parent.fields().iter().position(|child| child.name() == name)?;
     let child = &parent.fields()[position];
     let physical = rtdb_columnar::from_field(child).ok()?;
-    (&physical == types.get(name)?).then(|| (parent.column(position), child))
+    (&physical == types.get(name)?).then(|| (parent, parent.column(position), child))
 }
 
 fn read_struct_field(column: &Column, name: &str, declared: &LogicalType, memory: &Arc<MemoryBudget>) -> Result<Option<Charged>> {
@@ -191,29 +198,44 @@ fn read_struct_field(column: &Column, name: &str, declared: &LogicalType, memory
             if array.data_type() == &DataType::Null && field.is_nullable() && logical.as_ref() == Some(&LogicalType::Null) {
                 return Ok(Some(Charged::shared(Vector::Null)));
             }
-            let Some((child, field)) = struct_child(array.as_ref(), field, logical.as_ref(), name) else { return Ok(None); };
-            Ok(match layout(child.as_ref(), field, None) {
-                Some(None) => Some(Charged::shared(Vector::Null)),
-                Some(Some(ty)) if ty == *expected => Vector::of(child.as_ref(), expected).map(Charged::shared),
-                _ => None,
-            })
+            let Some((parent, child, field)) = struct_child(array.as_ref(), field, logical.as_ref(), name) else { return Ok(None); };
+            match layout(child.as_ref(), field, None) {
+                Some(None) => Ok(Some(Charged::shared(Vector::Null))),
+                Some(Some(ty)) if ty == *expected => {
+                    if parent.null_count() == 0 {
+                        return Ok(Vector::of(child.as_ref(), expected).map(Charged::shared));
+                    }
+                    let bytes = child.len().div_ceil(8).checked_add(512).ok_or_else(super::size_error)?;
+                    let owner = memory.reserve(bytes)?;
+                    let nulls = NullBuffer::union(parent.nulls(), child.nulls());
+                    let Ok(data) = child.to_data().into_builder().nulls(nulls).build() else { return Ok(None); };
+                    Ok(Vector::of(make_array(data).as_ref(), expected).map(|vector| Charged { vector, _charge: Some(owner) }))
+                }
+                _ => Ok(None),
+            }
         }
         Column::Selected(parent) => {
-            let bytes = parent.sources.len().checked_mul(size_of::<Option<StoredVector>>())
+            let bytes = parent.sources.len().checked_mul(size_of::<Option<StoredVector>>() + size_of::<Option<&NullBuffer>>())
                 .and_then(|bytes| bytes.checked_add(512)).ok_or_else(super::size_error)?;
             let _sources = memory.reserve(bytes)?;
             let mut sources = Vec::with_capacity(parent.sources.len());
+            let mut parent_nulls = Vec::with_capacity(parent.sources.len());
             for source in parent.sources.iter() {
-                let Some((array, field, logical, _)) = source else { sources.push(None); continue; };
-                if array.data_type() == &DataType::Null && field.is_nullable() && logical.as_ref() == Some(&LogicalType::Null) {
-                    sources.push(None);
-                    continue;
+                match source {
+                    Some((array, field, logical, _)) if !(array.data_type() == &DataType::Null && field.is_nullable()
+                        && logical.as_ref() == Some(&LogicalType::Null)) => {
+                        let Some((parent, child, field)) = struct_child(array.as_ref(), field, logical.as_ref(), name) else { return Ok(None); };
+                        sources.push(Some((Arc::clone(child), Arc::clone(field), None, None)));
+                        parent_nulls.push(parent.nulls());
+                    }
+                    _ => {
+                        sources.push(None);
+                        parent_nulls.push(None);
+                    }
                 }
-                let Some((child, field)) = struct_child(array.as_ref(), field, logical.as_ref(), name) else { return Ok(None); };
-                sources.push(Some((Arc::clone(child), Arc::clone(field), None, None)));
             }
             let selected = SelectedColumn { sources: Arc::new(sources), cells: parent.cells.clone() };
-            read_selected(&selected, expected, memory)
+            read_selected(&selected, expected, &parent_nulls, memory)
         }
         Column::Values(_) => Ok(None),
     }

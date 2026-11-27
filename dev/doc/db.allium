@@ -1333,6 +1333,7 @@ rule LeaderProcessesTx {
         -- A batch can combine different put layouts while retaining the declarations of their original layouts.
         -- PATCH gap filling preserves the ordered valid-time pages and selects compatible document vectors.
         -- PATCH projects independently over distinct pairs of old and patch struct layouts.
+        -- A uniform Arrow patch can reuse compatible operand spans under their original buffer charges.
         -- PATCH can pack row-backed records while selecting the preferred children from its Arrow operand.
         -- The patch projection keeps existing cells when a patch cell is null and keeps the patch's field set for an uncovered interval.
         -- A SQL mutation that targets a reserved table aborts with the table reference in the error data.
@@ -2538,8 +2539,8 @@ surface QueryAccess {
         -- The range comparison preserves SQL unknown and demands each bound in expression order only where it is reached.
         -- Direct predicate comparisons keep their computed arithmetic operands in admitted Arrow buffers from construction through comparison.
         -- Checked numeric arithmetic can produce a result vector from selected Arrow positions with a compatible physical type.
-        -- A nested field read can select its child from an input struct vector.
-        -- Scalar arithmetic over a compatible field of a selected struct can read the child values at the selected positions.
+        -- A nested field projection follows admitted Arrow struct children and applies each ancestor's validity.
+        -- Scalar arithmetic over a compatible field of a selected struct reads the child values at the selected positions and observes the parent's validity.
         -- Computed outputs publish Arrow columns or positions in arrays with differing physical fields.
         -- Within the scalar evaluation budget, decimal arithmetic, comparisons, and casts can consume a coefficient wider than the expression's declared decimal result field.
         -- Computed Arrow projections validate decimal precision on the selected result cells, including nested decimals.
@@ -2568,7 +2569,9 @@ surface QueryAccess {
         -- Nullable element targets preserve union remapping.
         -- Numeric list predicates read the active child buffers and apply scalar equality and ordering in list order.
         -- Integer and decimal pairs compare exactly, pairs that include a float use scalar binary64 comparison, and strict equality preserves numeric categories.
-        -- A struct expression over compatible Arrow fields retains the child arrays.
+        -- A struct expression over compatible Arrow fields retains the child arrays, including admitted computed fields.
+        -- A row copy can assemble compatible Arrow child selections into a record.
+        -- In an assembled record, the first occurrence of a repeated field name fixes its position and the last supplies its value.
         -- Selecting a compatible struct child combines its validity with the parent validity in Arrow.
         -- A projected field missing from some pages uses Arrow nulls when the available columns share a layout or form a scalar dense union.
         -- A projected dense union with compatible children retains its Arrow array when it already matches the result layout.

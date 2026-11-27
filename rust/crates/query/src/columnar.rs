@@ -4655,6 +4655,211 @@ mod tests {
         assert!(selection.contains(0));
     }
 
+    struct RecordProjectionInput(Option<ColumnBatch>);
+
+    #[async_trait::async_trait]
+    impl BatchCursor for RecordProjectionInput {
+        async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> { Ok(self.0.take()) }
+    }
+
+    fn record_projection_cursor(
+        batch: ColumnBatch, schema: Schema, expressions: Vec<Expr>, memory: &Arc<MemoryBudget>,
+    ) -> BatchExpressions {
+        let database = crate::DatabaseSnapshot {
+            partitions: vec![],
+            storage: Arc::new(rtdb_storage::cache::BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
+        };
+        let catalog = crate::CatalogSnapshot::new("xtdb", [("xtdb".into(), database)].into(), false).unwrap();
+        let context = crate::QueryContext::new(catalog, Arc::clone(memory), Timestamp(0), "UTC", Default::default(),
+            &tokio_util::sync::CancellationToken::new()).unwrap();
+        let execution = crate::context::Execution {
+            context, parameters: Arc::new(crate::parameters::BoundParameters::infer(Vec::new(), memory).unwrap()),
+            outer: crate::context::OuterRows::empty(memory).unwrap(), bindings: None, analysis: None,
+        };
+        BatchExpressions::new(Box::new(RecordProjectionInput(Some(batch))), schema, expressions, execution)
+    }
+
+    #[tokio::test]
+    async fn record_projection_computed_struct_keeps_child_backing_and_duplicate_order() {
+        let source = MemoryBudget::new(1 << 23);
+        let memory = MemoryBudget::new(1 << 17);
+        let schema = Schema::new(vec![field(0, ScalarType::Utf8), field(1, ScalarType::I64)]).unwrap();
+        let payload = "x".repeat(1 << 21);
+        let text: ArrayRef = Arc::new(StringArray::from(vec![payload.as_str(), "small"]));
+        let inputs = [Arc::clone(&text), Arc::new(Int64Array::from(vec![10, 20])) as ArrayRef];
+        let columns = schema.fields().iter().zip(inputs).map(|(field, array)| Column::Arrow {
+            array, field: Arc::new(rtdb_columnar::to_field(&field.name, &field.data_type).unwrap()),
+            logical: Some(field.data_type.clone()),
+        }).collect();
+        let batch = ColumnBatch::settled(columns, 2, source.reserve(0).unwrap()).unwrap();
+        let owner = Arc::downgrade(batch.column_reservation(0));
+        let plus = Expr::binary(BinaryOp::Add, schema.fields()[1].expression(), Expr::Literal(Value::I64(1)));
+        let expression = Expr::Struct(vec![
+            ("score".into(), Expr::Literal(Value::Null)),
+            ("payload".into(), schema.fields()[0].expression()),
+            ("score".into(), Expr::Struct(vec![("value".into(), plus)])),
+            ("explicit_null".into(), Expr::Literal(Value::Null)),
+        ]);
+        let score = Expr::Field {
+            data_type: rtdb_plan::field_type(&expression.data_type(), "score"),
+            expr: Box::new(expression.clone()), name: "score".into(),
+        };
+        let score = Expr::Field {
+            data_type: rtdb_plan::field_type(&score.data_type(), "value"),
+            expr: Box::new(score), name: "value".into(),
+        };
+        let mut cursor = record_projection_cursor(batch, schema, vec![expression, score], &memory);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert!(owner.upgrade().is_some());
+        let [Column::Arrow { array, .. }, Column::Arrow { array: score, .. }] = page.columns.as_slice() else { panic!("Expected an Arrow struct and its projected field"); };
+        assert_eq!(score.as_any().downcast_ref::<Int64Array>().unwrap().values().as_ref(), &[11, 21]);
+        let record = array.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(record.fields().iter().map(|field| field.name().as_str()).collect::<Vec<_>>(), ["score", "payload", "explicit_null"]);
+        assert!(Arc::ptr_eq(record.column(1), &text));
+        let scores = record.column(0).as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(scores.column(0).as_any().downcast_ref::<Int64Array>().unwrap().values().as_ref(), &[11, 21]);
+        assert_eq!(record.column(2).logical_null_count(), 2);
+        drop(page);
+        assert!(owner.upgrade().is_none());
+        assert_eq!(source.used_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn record_projection_reaches_errors_in_row_then_field_order() {
+        let memory = MemoryBudget::new(1 << 21);
+        let schema = Schema::new(vec![field(0, ScalarType::I64)]).unwrap();
+        let batch = || {
+            let input = arrow(Arc::new(Int64Array::from(vec![1, i64::MAX])), ScalarType::I64);
+            ColumnBatch::settled(vec![input], 2, memory.reserve(0).unwrap()).unwrap()
+        };
+        let plus = Expr::binary(BinaryOp::Add, schema.fields()[0].expression(), Expr::Literal(Value::I64(1)));
+        let first_row_error = Expr::Cast {
+            expr: Box::new(Expr::Literal(Value::Utf8("first row error".into()))),
+            target: rtdb_plan::CastTarget::Fixed(LogicalType::Scalar(ScalarType::I64)),
+        };
+        let expression = Expr::Struct(vec![("duplicate".into(), plus.clone()), ("duplicate".into(), first_row_error)]);
+        let mut cursor = record_projection_cursor(batch(), schema.clone(), vec![expression], &memory);
+        let error = cursor.next_batch().await.err().expect("The first row fails");
+        assert!(error.message.unwrap().contains("first row error"));
+        drop(cursor);
+
+        let expression = Expr::Struct(vec![("duplicate".into(), plus), ("duplicate".into(), Expr::Literal(Value::Null))]);
+        let mut cursor = record_projection_cursor(batch(), schema, vec![expression], &memory);
+        let error = cursor.next_batch().await.err().expect("The overwritten field still runs");
+        assert_eq!(error.code, "xtdb.expression/overflow-error");
+    }
+
+    #[tokio::test]
+    async fn record_projection_reads_nested_nullable_selected_parents() {
+        use rtdb_types::StructFields;
+
+        let source = MemoryBudget::new(1 << 20);
+        let memory = MemoryBudget::new(1 << 17);
+        let integer = LogicalType::Scalar(ScalarType::I64);
+        let inner = LogicalType::Struct(StructFields::from([("leaf".into(), integer.clone())])).maybe();
+        let outer = LogicalType::Struct(StructFields::from([("inner".into(), inner.clone()), ("score".into(), integer.clone())])).maybe();
+        let mut input = field(0, ScalarType::I64);
+        input.data_type = outer.clone();
+        let schema = Schema::new(vec![input.clone()]).unwrap();
+        let doc = |value| Value::Struct(StructFields::from([("inner".into(), value), ("score".into(), Value::I64(10))]));
+        let array = rtdb_columnar::copy_array(&outer, &[
+            doc(Value::Struct(StructFields::from([("leaf".into(), Value::I64(42))]))),
+            Value::Null,
+            doc(Value::Null),
+        ]).unwrap();
+        let field = Arc::new(rtdb_columnar::to_field(&input.name, &outer).unwrap());
+        let owner = source.reserve(array.get_array_memory_size()).unwrap();
+        let weak = Arc::downgrade(&owner);
+        let picks = Arc::new(vec![(0, 1), (0, 0), (0, 2), (1, 0), (0, 0)]);
+        let selected = SelectedColumn::new(vec![Some((array, field, Some(outer), Some(owner))), None], picks);
+        let batch = ColumnBatch::settled(vec![Column::Selected(selected)], 5, memory.reserve(0).unwrap()).unwrap();
+        let leaf = Expr::Field {
+            expr: Box::new(Expr::Field { expr: Box::new(input.expression()), name: "inner".into(), data_type: inner }),
+            name: "leaf".into(), data_type: integer.clone().maybe(),
+        };
+        let score = Expr::Field { expr: Box::new(input.expression()), name: "score".into(), data_type: integer.maybe() };
+        let plus = Expr::binary(BinaryOp::Add, score, Expr::Literal(Value::I64(1)));
+        let kernel = functions::column(&plus, &schema, &batch, rtdb_expr::Parameters::Values(&[]), &memory).unwrap().unwrap();
+        assert_eq!(kernel.value(0).unwrap(), Value::Null);
+        assert_eq!(kernel.value(1).unwrap(), Value::I64(11));
+        assert_eq!(kernel.value(3).unwrap(), Value::Null);
+
+        let mut cursor = record_projection_cursor(batch, schema, vec![leaf, plus], &memory);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert!(matches!(page.columns[0], Column::Selected(_)));
+        assert!(weak.upgrade().is_some());
+        for (row, expected) in [Value::Null, Value::I64(42), Value::Null, Value::Null, Value::I64(42)].into_iter().enumerate() {
+            assert_eq!(page.columns[0].value(row).unwrap(), expected);
+        }
+        drop(page);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(source.used_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn record_projection_row_copy_keeps_selected_nested_layout_and_last_field() {
+        use rtdb_types::StructFields;
+
+        let memory = MemoryBudget::new(1 << 20);
+        let mut documents = field(0, ScalarType::I64);
+        let mut discarded = field(1, ScalarType::I64);
+        discarded.name = documents.name.clone();
+        let record = |z| Value::Struct(StructFields::from([("z".into(), Value::I64(z)), ("a".into(), Value::Null)]));
+        let first = record(1);
+        let second = record(2);
+        documents.data_type = first.logical_type();
+        let physical = Arc::new(rtdb_columnar::to_field("documents", &documents.data_type).unwrap());
+        let array = rtdb_columnar::copy_array(&documents.data_type, &[first.clone(), second.clone()]).unwrap();
+        let charge = memory.reserve(array.get_array_memory_size()).unwrap();
+        let selection = SelectedColumn::new(
+            vec![Some((array, physical, Some(documents.data_type.clone()), Some(charge))), None],
+            Arc::new(vec![(0, 1), (1, 0), (0, 0), (0, 1)]),
+        );
+        let raw = Int64Array::from(vec![3, 4, 5, 6]);
+        let raw_type = discarded.data_type.clone();
+        let batch = ColumnBatch::settled(vec![
+            Column::Selected(selection),
+            Column::Arrow { array: Arc::new(raw), field: Arc::new(rtdb_columnar::to_field("discarded", &raw_type).unwrap()), logical: Some(raw_type) },
+        ], 4, memory.reserve(0).unwrap()).unwrap();
+        let schema = Schema::new(vec![documents.clone(), field(1, ScalarType::I64)]).unwrap();
+        let expression = Expr::RowCopy(vec![discarded, documents.clone()]);
+        let mut cursor = record_projection_cursor(batch, schema, vec![expression], &memory);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        let [Column::Arrow { array, .. }] = page.columns.as_slice() else { panic!("Expected an Arrow row copy"); };
+        let array = array.as_any().downcast_ref::<StructArray>().unwrap();
+        let nested = array.column(0).as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(nested.fields().iter().map(|field| field.name().as_str()).collect::<Vec<_>>(), ["z", "a"]);
+        for (row, expected) in [second.clone(), Value::Null, first, second].into_iter().enumerate() {
+            assert_eq!(page.columns[0].value(row).unwrap(), Value::Struct(StructFields::from([(documents.name.clone(), expected)])));
+        }
+    }
+
+    #[tokio::test]
+    async fn record_projection_row_copy_distinguishes_absent_and_null_nested_keys() {
+        use rtdb_types::StructFields;
+
+        let memory = MemoryBudget::new(1 << 20);
+        let absent = Value::Struct(StructFields::from([("id".into(), Value::I64(1))]));
+        let explicit = Value::Struct(StructFields::from([("id".into(), Value::I64(2)), ("optional".into(), Value::Null)]));
+        let mut documents = field(0, ScalarType::I64);
+        documents.data_type = absent.logical_type().join(&explicit.logical_type());
+        let sources = [&absent, &explicit].into_iter().map(|value| {
+            let logical = value.logical_type();
+            let field = Arc::new(rtdb_columnar::to_field("documents", &logical).unwrap());
+            let array = rtdb_columnar::copy_array(&logical, std::slice::from_ref(value)).unwrap();
+            let owner = memory.reserve(array.get_array_memory_size()).unwrap();
+            Some((array, field, Some(logical), Some(owner)))
+        }).collect();
+        let selection = SelectedColumn::new(sources, Arc::new(vec![(1, 0), (0, 0)]));
+        let batch = ColumnBatch::settled(vec![Column::Selected(selection)], 2, memory.reserve(0).unwrap()).unwrap();
+        let schema = Schema::new(vec![documents.clone()]).unwrap();
+        let mut cursor = record_projection_cursor(batch, schema, vec![Expr::RowCopy(vec![documents.clone()])], &memory);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        for (row, expected) in [explicit, absent].into_iter().enumerate() {
+            assert_eq!(page.columns[0].value(row).unwrap(), Value::Struct(StructFields::from([(documents.name.clone(), expected)])));
+        }
+    }
+
     #[test]
     fn row_copy_builds_an_arrow_record_from_compatible_nested_vectors() {
         let memory = MemoryBudget::new(1 << 20);
@@ -5337,6 +5542,11 @@ impl BatchCursor for BatchExpressions {
                 owners[index] = Some(owner);
                 continue;
             }
+            if let Some((column, owner)) = projection::computed_record(kernel, &self.schema, &batch, parameters, memory)? {
+                columns.push(column);
+                owners[index] = Some(owner);
+                continue;
+            }
             if let Some((column, owner)) = concat::utf8_column(kernel, &self.schema, &batch, &self.execution.context)? {
                 columns.push(column);
                 owners[index] = Some(owner);
@@ -5819,7 +6029,7 @@ pub(crate) mod projection {
     use arrow_schema::{DataType, Field as ArrowField};
     use rtdb_plan::{CastTarget, Expr, Schema};
     use rtdb_types::{LogicalType, Result, StructFields, Value};
-    use super::{Column, ColumnBatch, MemoryBudget, MemoryReservation};
+    use super::{Column, ColumnBatch, MemoryBudget, MemoryReservation, SelectedColumn, StoredVector};
 
     /// A bare column or parameter of a projection over one bound row, shared rather than computed.
     pub(crate) fn bound_column(expr: &Expr, schema: &Schema, columns: &[Column], parameters: &[Column]) -> Option<Column> {
@@ -5871,26 +6081,10 @@ pub(crate) mod projection {
                 }
                 Ok(Some((column, owner)))
             }
-            Expr::Field { expr, name, .. } => {
-                let Some((position, parent, child, field, logical)) = struct_field(expr, name, schema, batch) else { return Ok(None); };
-                let wrap = parent.null_count() != 0 && child.data_type() != &DataType::Null;
-                if wrap && matches!(child.data_type(), DataType::Union(..) | DataType::RunEndEncoded(..)) { return Ok(None); }
-                let logical_bytes = logical.retained_bytes()?;
-                let source = batch.column_reservation(position);
-                let owner = if wrap {
-                    let bitmap = if child.nulls().is_some() { child.len().div_ceil(8) } else { 0 };
-                    let descriptor = child.get_array_memory_size().checked_sub(child.get_buffer_memory_size()).ok_or_else(super::size_error)?;
-                    let bytes = logical_bytes.checked_add(field.size()).and_then(|bytes| bytes.checked_add(descriptor))
-                        .and_then(|bytes| bytes.checked_mul(4)).and_then(|bytes| bytes.checked_add(bitmap))
-                        .and_then(|bytes| bytes.checked_add(512)).ok_or_else(super::size_error)?;
-                    memory.reserve_with_backing(bytes, std::iter::once(Arc::clone(source)))?
-                } else {
-                    let copied = logical_bytes.checked_sub(size_of::<LogicalType>()).ok_or_else(super::size_error)?;
-                    if copied == 0 { Arc::clone(source) }
-                    else { memory.reserve_with_backing(copied, std::iter::once(Arc::clone(source)))? }
-                };
-                Ok(project_struct_child(parent, child, field, logical).map(|column| (column, owner)))
-            }
+            Expr::Field { .. } => match shared_field_path(expr, schema, batch, memory) {
+                Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => Ok(None),
+                result => result,
+            },
             Expr::Struct(fields) if direct_struct(fields, schema, batch) => {
                 let inputs = fields.iter().map(|(name, expr)| {
                     let Expr::Column { id, .. } = expr else { unreachable!("The struct's inputs are columns"); };
@@ -5912,16 +6106,242 @@ pub(crate) mod projection {
 
     fn shared_record<'a>(inputs: impl ExactSizeIterator<Item = (&'a str, usize)> + Clone, batch: &ColumnBatch, memory: &Arc<MemoryBudget>)
         -> Result<Option<(Column, Arc<MemoryReservation>)>> {
-        let bytes = inputs.clone().try_fold(512usize, |bytes, (name, position)| {
-            let Column::Arrow { field, logical: Some(logical), .. } = &batch.columns[position] else { unreachable!("The struct's inputs were checked"); };
+        assemble_record(inputs.len(), inputs.map(|(name, position)| {
+            (name, &batch.columns[position], batch.column_reservation(position))
+        }), memory)
+    }
+
+    fn assemble_record<'a>(
+        width: usize,
+        inputs: impl ExactSizeIterator<Item = (&'a str, &'a Column, &'a Arc<MemoryReservation>)> + Clone,
+        memory: &Arc<MemoryBudget>,
+    ) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
+        let bytes = inputs.clone().try_fold(512usize, |bytes, (name, column, _)| {
+            let Column::Arrow { field, logical: Some(logical), .. } = column else { unreachable!("The struct's inputs were checked"); };
             let logical = logical.retained_bytes()?;
             field.size().checked_add(logical).and_then(|child| child.checked_add(name.len()))
                 .and_then(|child| child.checked_mul(2)).and_then(|child| child.checked_add(512))
                 .and_then(|child| bytes.checked_add(child)).ok_or_else(super::size_error)
         })?;
-        let owner = memory.reserve_with_backing(bytes, inputs.clone().map(|(_, position)| Arc::clone(batch.column_reservation(position))))?;
-        let width = inputs.len();
-        Ok(record_from_columns(width, inputs.map(|(name, position)| (name, &batch.columns[position]))).map(|column| (column, owner)))
+        let owner = memory.reserve_with_backing(bytes, inputs.clone().map(|(_, _, owner)| Arc::clone(owner)))?;
+        Ok(record_from_columns(width, inputs.map(|(name, column, _)| (name, column))).map(|column| (column, owner)))
+    }
+
+    pub(super) fn computed_record(
+        expr: &Expr, schema: &Schema, batch: &ColumnBatch, parameters: rtdb_expr::Parameters<'_>, memory: &Arc<MemoryBudget>,
+    ) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
+        match try_record(expr, schema, batch, parameters, memory) {
+            Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => Ok(None),
+            result => result,
+        }
+    }
+
+    fn try_record(
+        expr: &Expr, schema: &Schema, batch: &ColumnBatch, parameters: rtdb_expr::Parameters<'_>, memory: &Arc<MemoryBudget>,
+    ) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
+        if batch.len == 0 { return Ok(None); }
+        let (fields, row_copy) = match expr {
+            Expr::Struct(fields) if !fields.is_empty() => (fields.len(), false),
+            Expr::RowCopy(fields) if !fields.is_empty() => (fields.len(), true),
+            Expr::Field { expr: parent, name, .. } if matches!(parent.as_ref(), Expr::Struct(_) | Expr::Field { .. }) => {
+                let Some((parent, owner)) = try_record(parent, schema, batch, parameters, memory)? else { return Ok(None); };
+                let result = shared_field(&parent, name, &owner, memory)?;
+                return Ok(result.filter(|(column, _)| super::validate_kernel_projection(expr, column).is_ok()));
+            }
+            _ => return Ok(None),
+        };
+        let bytes = fields.checked_mul(size_of::<(&str, Column, Arc<MemoryReservation>)>()).ok_or_else(super::size_error)?;
+        let _inputs = memory.reserve(bytes)?;
+        let mut inputs: Vec<(&str, Column, Arc<MemoryReservation>)> = Vec::with_capacity(fields);
+        let mut add = |name, column: Column, owner| {
+            let Column::Arrow { field, logical: Some(logical), .. } = &column else { return false; };
+            if !record_field(field, true) || !super::stable_read_layout(logical, field) { return false; }
+            if let Some(input) = inputs.iter_mut().find(|input| input.0 == name) {
+                *input = (name, column, owner);
+            } else {
+                inputs.push((name, column, owner));
+            }
+            true
+        };
+        match expr {
+            Expr::Struct(fields) => for (name, expr) in fields {
+                let Some((column, owner)) = record_input(expr, schema, batch, parameters, memory)? else { return Ok(None); };
+                if !add(name.as_str(), column, owner) { return Ok(None); }
+            },
+            Expr::RowCopy(fields) => for field in fields {
+                let Some(position) = schema.position(field.id) else { return Ok(None); };
+                let Some((column, owner)) = record_vector(&batch.columns[position], batch.column_reservation(position), batch.len, memory)? else { return Ok(None); };
+                if !add(field.name.as_str(), column, owner) { return Ok(None); }
+            },
+            _ => unreachable!("The projection is a record"),
+        }
+        let result = assemble_record(inputs.len(), inputs.iter().map(|(name, column, owner)| (*name, column, owner)), memory)?;
+        if !row_copy && let Some((column, _)) = &result && super::validate_kernel_projection(expr, column).is_err() {
+            return Ok(None);
+        }
+        Ok(result)
+    }
+
+    fn record_input(
+        expr: &Expr, schema: &Schema, batch: &ColumnBatch, parameters: rtdb_expr::Parameters<'_>, memory: &Arc<MemoryBudget>,
+    ) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
+        match expr {
+            Expr::Column { id, .. } => {
+                let Some(position) = schema.position(*id) else { return Ok(None); };
+                record_vector(&batch.columns[position], batch.column_reservation(position), batch.len, memory)
+            }
+            Expr::Field { .. } => {
+                let Some((column, owner)) = shared_column(expr, schema, batch, memory)? else {
+                    return try_record(expr, schema, batch, parameters, memory);
+                };
+                match column {
+                    Column::Arrow { .. } => Ok(Some((column, owner))),
+                    _ => record_vector(&column, &owner, batch.len, memory),
+                }
+            }
+            Expr::Struct(_) => try_record(expr, schema, batch, parameters, memory),
+            Expr::Cast { expr, target: CastTarget::Fixed(target) } => {
+                let Some((column, owner)) = record_input(expr, schema, batch, parameters, memory)? else { return Ok(None); };
+                Ok(identity_cast(&column, target).then_some((column, owner)))
+            }
+            Expr::List(_) | Expr::Literal(_) => {
+                let Some(bytes) = bound(expr, schema, batch)? else { return Ok(None); };
+                let owner = memory.reserve(bytes)?;
+                let Some(column) = column(expr, schema, batch, parameters).ok().flatten() else { return Ok(None); };
+                match column {
+                    Column::Arrow { .. } => Ok(Some((column, owner))),
+                    _ => record_vector(&column, &owner, batch.len, memory),
+                }
+            }
+            Expr::Binary { op: rtdb_plan::BinaryOp::Add | rtdb_plan::BinaryOp::Subtract | rtdb_plan::BinaryOp::Multiply, .. } => {
+                // A failed speculative kernel leaves the row evaluator to raise the first reached error across fields.
+                let Some(column) = super::functions::column(expr, schema, batch, parameters, memory).ok().flatten() else { return Ok(None); };
+                let owner = memory.reserve(super::owned_projection_bytes(&column)?)?;
+                Ok(Some((column, owner)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn record_vector(
+        column: &Column, owner: &Arc<MemoryReservation>, len: usize, memory: &Arc<MemoryBudget>,
+    ) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
+        match column {
+            Column::Arrow { field, logical: Some(logical), .. } if record_field(field, true) && super::stable_read_layout(logical, field) =>
+                column.duplicate_for_projection(owner, memory).map(Some),
+            Column::Selected(selected) => {
+                if let Some(((array, field, Some(logical), custody), rows)) = selected.contiguous_source(0..len)
+                    && rows.len() == array.len() && record_field(field, true) && super::stable_read_layout(logical, field)
+                {
+                    let owner = memory.reserve_with_backing(logical.retained_bytes()?, std::iter::once(Arc::clone(custody.as_ref().unwrap_or(owner))))?;
+                    return Ok(Some((Column::Arrow { array: Arc::clone(array), field: Arc::clone(field), logical: Some(logical.clone()) }, owner)));
+                }
+                if selected.source_layouts().any(|(_, field, logical)| {
+                    !logical.is_some_and(|logical| record_field(field, true) && super::stable_read_layout(logical, field))
+                }) { return Ok(None); }
+                if let Some(((array, field, logical), owner)) = selected.uniform_fragment_vector(0..len, memory).ok().flatten() {
+                    return Ok(Some((Column::Arrow { array, field, logical }, owner)));
+                }
+                let mut layouts = selected.source_layouts().filter_map(|(_, field, logical)| {
+                    (field.data_type() != &DataType::Null).then_some((field, logical?))
+                });
+                let Some((field, logical)) = layouts.next() else { return Ok(None); };
+                let nullable = logical.clone().maybe();
+                if !layouts.all(|(other, ty)| other.data_type() == field.data_type() && other.metadata() == field.metadata()
+                    && ty.clone().maybe() == nullable)
+                {
+                    return Ok(None);
+                }
+                let field = Arc::new(field.clone().with_nullable(true));
+                Ok(selected.relayout(&nullable, &field, memory, false)?.map(|(array, owner)| {
+                    (Column::Arrow { array, field, logical: Some(nullable) }, owner)
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn record_field(field: &ArrowField, decimals: bool) -> bool {
+        match field.data_type() {
+            DataType::Null => field.is_nullable(),
+            DataType::Struct(fields) => fields.iter().all(|field| record_field(field, decimals)),
+            DataType::List(child) | DataType::FixedSizeList(child, _) | DataType::Map(child, _) => record_field(child, decimals),
+            DataType::Union(fields, _) => fields.iter().all(|(_, field)| record_field(field, decimals)),
+            DataType::RunEndEncoded(..) => false,
+            ty => decimals || rtdb_columnar::decimal_parameters(ty).is_none(),
+        }
+    }
+
+    fn shared_field_path(
+        expression: &Expr, schema: &Schema, batch: &ColumnBatch, memory: &Arc<MemoryBudget>,
+    ) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
+        let Expr::Field { expr, name, .. } = expression else { return Ok(None); };
+        if let Expr::Column { id, .. } = expr.as_ref() {
+            let Some(position) = schema.position(*id) else { return Ok(None); };
+            return shared_field(&batch.columns[position], name, batch.column_reservation(position), memory);
+        }
+        let Some((parent, owner)) = shared_field_path(expr, schema, batch, memory)? else { return Ok(None); };
+        shared_field(&parent, name, &owner, memory)
+    }
+
+    fn shared_field(
+        column: &Column, name: &str, owner: &Arc<MemoryReservation>, memory: &Arc<MemoryBudget>,
+    ) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
+        match column {
+            Column::Arrow { array, field, logical: Some(logical) } => {
+                let Some((parent, child, field, logical)) = struct_child(array, field, logical, name) else { return Ok(None); };
+                funded_child(parent, child, field, logical, owner, memory)
+            }
+            Column::Selected(selected) => {
+                let bytes = selected.sources.len().checked_mul(size_of::<Option<StoredVector>>() + 1)
+                    .and_then(|bytes| bytes.checked_add(512)).ok_or_else(super::size_error)?;
+                let selection_owner = memory.reserve_with_backing(bytes, std::iter::once(Arc::clone(owner)))?;
+                let mut used = vec![false; selected.sources.len()];
+                for (source, _) in selected.cells.iter() { used[source] = true; }
+                let mut sources = Vec::with_capacity(selected.sources.len());
+                for (source, used) in selected.sources.iter().zip(used) {
+                    let Some((array, field, logical, custody)) = source.as_ref().filter(|_| used) else {
+                        sources.push(None);
+                        continue;
+                    };
+                    let Some(logical) = logical else { return Ok(None); };
+                    if *logical == LogicalType::Null && field.data_type() == &DataType::Null && field.is_nullable() {
+                        sources.push(None);
+                        continue;
+                    }
+                    let Some((parent, child, field, logical)) = struct_child(array, field, logical, name) else { return Ok(None); };
+                    if !record_field(field, false) { return Ok(None); }
+                    let Some((Column::Arrow { array, field, logical }, charge)) =
+                        funded_child(parent, child, field, logical, custody.as_ref().unwrap_or(owner), memory)? else { return Ok(None); };
+                    sources.push(Some((array, field, logical, Some(charge))));
+                }
+                let column = Column::Selected(SelectedColumn { sources: Arc::new(sources), cells: selected.cells.clone() });
+                Ok(Some((column, selection_owner)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn funded_child(
+        parent: &StructArray, child: &ArrayRef, field: &Arc<ArrowField>, logical: &LogicalType,
+        source: &Arc<MemoryReservation>, memory: &Arc<MemoryBudget>,
+    ) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
+        let wrap = parent.null_count() != 0 && child.data_type() != &DataType::Null;
+        if wrap && matches!(child.data_type(), DataType::Union(..) | DataType::RunEndEncoded(..)) { return Ok(None); }
+        let logical_bytes = logical.retained_bytes()?;
+        let owner = if wrap {
+            let bitmap = if child.nulls().is_some() { child.len().div_ceil(8) } else { 0 };
+            let descriptor = child.get_array_memory_size().checked_sub(child.get_buffer_memory_size()).ok_or_else(super::size_error)?;
+            let bytes = logical_bytes.checked_add(field.size()).and_then(|bytes| bytes.checked_add(descriptor))
+                .and_then(|bytes| bytes.checked_mul(4)).and_then(|bytes| bytes.checked_add(bitmap))
+                .and_then(|bytes| bytes.checked_add(512)).ok_or_else(super::size_error)?;
+            memory.reserve_with_backing(bytes, std::iter::once(Arc::clone(source)))?
+        } else {
+            let copied = logical_bytes.checked_sub(size_of::<LogicalType>()).ok_or_else(super::size_error)?;
+            if copied == 0 { Arc::clone(source) }
+            else { memory.reserve_with_backing(copied, std::iter::once(Arc::clone(source)))? }
+        };
+        Ok(project_struct_child(parent, child, field, logical).map(|column| (column, owner)))
     }
 
     /// Bounds what `column` allocates for `expr`, or `None` where it would not compute it.
@@ -6088,6 +6508,12 @@ pub(crate) mod projection {
         let Expr::Column { id, .. } = expr else { return None; };
         let input = schema.position(*id)?;
         let Column::Arrow { array, field, logical: Some(logical) } = &batch.columns[input] else { return None; };
+        let (parent, child, field, logical) = struct_child(array, field, logical, name)?;
+        Some((input, parent, child, field, logical))
+    }
+
+    fn struct_child<'a>(array: &'a ArrayRef, field: &ArrowField, logical: &'a LogicalType, name: &str)
+        -> Option<(&'a StructArray, &'a ArrayRef, &'a Arc<ArrowField>, &'a LogicalType)> {
         if !super::stable_read_layout(logical, field) { return None; }
         let logical = match logical { LogicalType::Maybe(inner) => inner.as_ref(), logical => logical };
         let LogicalType::Struct(types) = logical else { return None; };
@@ -6095,7 +6521,7 @@ pub(crate) mod projection {
         if *logical == LogicalType::Nothing { return None; }
         let parent = array.as_any().downcast_ref::<StructArray>()?;
         let position = parent.fields().iter().position(|field| field.name() == name)?;
-        Some((input, parent, parent.column(position), &parent.fields()[position], logical))
+        Some((parent, parent.column(position), &parent.fields()[position], logical))
     }
 
     fn project_struct_child(parent: &StructArray, child: &ArrayRef, field: &Arc<ArrowField>, logical: &LogicalType) -> Option<Column> {

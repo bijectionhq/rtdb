@@ -72,11 +72,38 @@ fn record<'a>(column: &'a Column, owner: &'a Arc<MemoryReservation>, row: usize)
     Some(Some(Record { array: cell.array.as_any().downcast_ref()?, position: cell.row, owner }))
 }
 
+fn uniform_record<'a>(column: &'a Column, owner: &'a Arc<MemoryReservation>) -> Option<Option<Record<'a>>> {
+    let Column::Arrow { array, field, logical } = column else { return None; };
+    match field.data_type() {
+        DataType::Null if field.is_nullable() && logical.as_ref() == Some(&LogicalType::Null) => Some(None),
+        DataType::Struct(_) if array.null_count() == 0 => record(column, owner, 0),
+        _ => None,
+    }
+}
+
 pub(super) fn merge(
     args: &[Expr], schema: &Schema, batch: &ColumnBatch, memory: &Arc<MemoryBudget>,
 ) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
     let [Expr::Column { id: old, .. }, Expr::Column { id: patch, .. }] = args else { return Ok(None); };
     let (Some(old), Some(patch)) = (schema.position(*old), schema.position(*patch)) else { return Ok(None); };
+    if batch.len != 0 {
+        let old_column = &batch.columns[old];
+        let patch_column = &batch.columns[patch];
+        if let Some(old) = uniform_record(old_column, batch.column_reservation(old))
+            && let Some(Some(patch)) = uniform_record(patch_column, batch.column_reservation(patch))
+            && let Some(group) = merged_group(
+                |row| (old.map(|record| Record { position: row, ..record }), Record { position: row, ..patch }),
+                0..batch.len, old.map(|record| record.array.fields()), patch.array.fields(), memory,
+            )?
+        {
+            let MergedGroup { vector: (array, field, logical), charge, shared_children } = group;
+            if !shared_children { return Ok(Some((Column::Arrow { array, field, logical }, charge))); }
+            let reservation = memory.reserve(512)?;
+            let sources = Arc::new(vec![Some((array, field, logical, Some(charge)))]);
+            let column = Column::Selected(SelectedColumn { sources, cells: SelectedRows::Span(0..batch.len) });
+            return Ok(Some((column, reservation)));
+        }
+    }
     let bytes = batch.len.checked_mul(256).and_then(|bytes| bytes.checked_add(8192)).ok_or_else(size_error)?;
     let mut reservation = memory.reserve(bytes)?;
     fn pack_operand(column: &Column, memory: &Arc<MemoryBudget>) -> Option<(Column, Arc<MemoryReservation>)> {
@@ -118,7 +145,7 @@ pub(super) fn merge(
     let mut sources = Vec::with_capacity(groups.len());
     for ((old, patch), indices) in groups {
         let Some(MergedGroup { vector: (array, field, logical), charge, shared_children }) =
-            merged_group(&rows, &indices, old, patch, memory)? else {
+            merged_group(|row| rows[row], indices.iter().copied(), old, patch, memory)? else {
             return Ok(None);
         };
         if heterogeneous || union_records || packed.iter().any(Option::is_some) {
@@ -151,7 +178,8 @@ struct MergedGroup {
 }
 
 fn merged_group<'a>(
-    rows: &[(Option<Record<'a>>, Record<'a>)], indices: &[usize], old: Option<&Fields>, patch: &Fields, memory: &Arc<MemoryBudget>,
+    record_at: impl Fn(usize) -> (Option<Record<'a>>, Record<'a>),
+    indices: impl ExactSizeIterator<Item = usize> + Clone, old: Option<&Fields>, patch: &Fields, memory: &Arc<MemoryBudget>,
 ) -> Result<Option<MergedGroup>> {
     let previous = old.into_iter().flatten().enumerate().map(|(index, field)| {
         (field, Some(index), patch.iter().position(|candidate| candidate.name() == field.name()))
@@ -181,7 +209,7 @@ fn merged_group<'a>(
         };
         let target = to_field(field.name(), &ty)?;
         let preferred = |row: usize| {
-            let (old, patch) = rows[row];
+            let (old, patch) = record_at(row);
             if let Some(index) = patch_index {
                 let child = patch.child(index);
                 if old_index.is_none() || !arrow_cell_is_null(child.field, child.array.as_ref(), child.position)? {
@@ -190,11 +218,11 @@ fn merged_group<'a>(
             }
             Some(old?.child(old_index?))
         };
-        let array = if let Some(array) = retain_child_range(indices, preferred, &target, lease)? {
+        let array = if let Some(array) = retain_child_range(indices.clone(), preferred, &target, lease)? {
             shared_children = true;
             array
         } else {
-            let Some((array, mut scratch)) = gather_child(indices, preferred, &target, memory)? else { return Ok(None); };
+            let Some((array, mut scratch)) = gather_child(indices.clone(), preferred, &target, memory)? else { return Ok(None); };
             let retained = array.get_array_memory_size();
             let scratch = Arc::get_mut(&mut scratch).expect("The patch child owns its construction reservation");
             if retained <= scratch.bytes() { scratch.shrink_to(retained)?; } else { scratch.grow_to(retained)?; }
@@ -211,13 +239,14 @@ fn merged_group<'a>(
 }
 
 fn retain_child_range<'a>(
-    rows: &[usize], cell: impl Fn(usize) -> Option<ChildCell<'a>>, target: &ArrowField,
+    mut rows: impl ExactSizeIterator<Item = usize>, cell: impl Fn(usize) -> Option<ChildCell<'a>>, target: &ArrowField,
     lease: &mut MemoryReservation,
 ) -> Result<Option<ArrayRef>> {
-    let Some(first) = rows.first().and_then(|&row| cell(row)) else { return Ok(None); };
-    let Some(end) = first.position.checked_add(rows.len()) else { return Ok(None); };
+    let len = rows.len();
+    let Some(first) = rows.next().and_then(&cell) else { return Ok(None); };
+    let Some(end) = first.position.checked_add(len) else { return Ok(None); };
     if end > first.array.len() || !first.matches_layout(target) || first.array.data_type() != target.data_type()
-        || !rows[1..].iter().enumerate().all(|(offset, &row)| {
+        || !rows.enumerate().all(|(offset, row)| {
             cell(row).is_some_and(|next| Arc::ptr_eq(first.array, next.array)
                 && next.position == first.position + offset + 1
                 && (std::ptr::eq(first.field, next.field) || next.matches_layout(target)))
@@ -230,7 +259,7 @@ fn retain_child_range<'a>(
     let bound = descriptors.checked_mul(4).and_then(|bytes| bytes.checked_add(512))
         .and_then(|bytes| retained.checked_add(bytes)).ok_or_else(size_error)?;
     lease.grow_to(bound)?;
-    let view = if rows.len() == first.array.len() { Arc::clone(first.array) } else { first.array.slice(first.position, rows.len()) };
+    let view = if len == first.array.len() { Arc::clone(first.array) } else { first.array.slice(first.position, len) };
     // A query page can own the source reservation outside its Arrow buffers.
     if let Ok(view) = rtdb_columnar::retain_array(view, first.owner) {
         return Ok(Some(view));
@@ -240,7 +269,7 @@ fn retain_child_range<'a>(
 }
 
 fn gather_child<'a>(
-    rows: &[usize], cell: impl Fn(usize) -> Option<ChildCell<'a>>,
+    rows: impl ExactSizeIterator<Item = usize>, cell: impl Fn(usize) -> Option<ChildCell<'a>>,
     target: &ArrowField, memory: &Arc<MemoryBudget>,
 ) -> Result<Option<(ArrayRef, Arc<MemoryReservation>)>> {
     let bound = rows.len().checked_mul(128).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size_error)?;
@@ -249,7 +278,7 @@ fn gather_child<'a>(
     let mut slots = HashMap::new();
     let mut arrays = Vec::new();
     let mut selected = Vec::with_capacity(rows.len());
-    for &row in rows {
+    for row in rows {
         let Some(child) = cell(row) else { return Ok(None); };
         let ChildCell { field, array: source, position: offset, .. } = child;
         let key = Arc::as_ptr(source).cast::<()>();
@@ -285,6 +314,37 @@ mod tests {
     use arrow_array::RecordBatch;
     use rtdb_plan::{ColumnId, Field};
     use rtdb_types::StructFields;
+
+    #[test]
+    fn record_projection_uniform_patch_reuses_children_under_a_small_merge_budget() {
+        let origin = MemoryBudget::new(1 << 20);
+        let memory = MemoryBudget::new(1 << 16);
+        let len = 4096;
+        let old = Value::Struct(StructFields::from([("kept".into(), Value::I64(7))]));
+        let patch = Value::Struct(StructFields::from([("kept".into(), Value::Null), ("new".into(), Value::I64(8))]));
+        for (old, expected_kept) in [(old, Value::I64(7)), (Value::Null, Value::Null)] {
+            let schema = Schema::new([old.logical_type(), patch.logical_type()].into_iter().enumerate().map(|(id, data_type)| {
+                Field { id: ColumnId(id as u32), name: format!("c{id}"), qualifier: None,
+                    qualified_only: false, unnamed: false, data_type }
+            }).collect()).unwrap();
+            let fields = schema.fields().iter().map(|field| to_field(&field.name, &field.data_type).unwrap()).collect::<Vec<_>>();
+            let arrays = [old, patch.clone()].into_iter().map(|value| rtdb_columnar::copy_array(&value.logical_type(), &vec![value; len]).unwrap()).collect();
+            let input = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), arrays).unwrap();
+            let input = ColumnBatch::from_owned(rtdb_columnar::OwnedBatch::new(input, &origin).unwrap()).unwrap();
+            let source = Arc::downgrade(input.column_reservation(0));
+            let args = schema.fields().iter().map(Field::expression).collect::<Vec<_>>();
+            let (column, charge) = merge(&args, &schema, &input, &memory).unwrap().unwrap();
+            drop(input);
+            assert!(source.upgrade().is_some());
+            let Value::Struct(record) = column.value(len - 1).unwrap() else { panic!("Expected a patched record"); };
+            assert_eq!(record.keys().map(String::as_str).collect::<Vec<_>>(), ["kept", "new"]);
+            assert_eq!(record["kept"], expected_kept);
+            assert_eq!(record["new"], Value::I64(8));
+            drop((column, charge));
+            assert!(source.upgrade().is_none());
+            assert_eq!(memory.used_bytes(), 0);
+        }
+    }
 
     #[test]
     fn null_patch_cells_keep_existing_fields_and_missing_left_records_keep_the_patch_shape() {
