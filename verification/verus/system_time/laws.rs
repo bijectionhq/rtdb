@@ -1,95 +1,98 @@
-use crate::production::{acceptance_relative_time, accepts_clock_lineage, clock_slot_admits, next_grid_reading, owned_deadline_is_live, owned_point_matches, original_funded_seat, follows, automatic_time, external_time};
+use crate::production::{acceptance_relative_time, accepts_clock_lineage, clock_slot_admits, next_grid_reading, owned_deadline_is_live, owned_point_matches, original_funded_seat, advances, automatic_time, external_time};
 use vstd::prelude::*;
 
 verus! {
 
-// LAW TIME-SYSTEM-TIE. Ties are admitted and positions order them (T7): a transaction is named by its
-// position, so a tie follows its predecessor.
-pub fn a_tied_time_follows(previous: i64) {
-    let tied = follows(Some(previous), previous);
-    assert(tied);
+// LAW TIME-SYSTEM-STRICT. A read basis names a transaction by its system time, so a tie never advances.
+pub fn a_tied_time_does_not_advance(previous: i64) {
+    let tied = advances(Some(previous), previous);
+    assert(!tied);
 }
 
 // LAW TIME-SYSTEM-FIRST.
 pub fn first_uses_the_clock(candidate: i64) {
     let assigned = automatic_time(None, candidate);
-    assert(assigned == candidate);
+    assert(assigned == Some(candidate));
 }
 
 // LAW TIME-SYSTEM-CLOCK.
 pub fn an_advancing_clock_is_used_unchanged(previous: i64, candidate: i64)
-    requires previous <= candidate,
+    requires previous < candidate,
 {
     let assigned = automatic_time(Some(previous), candidate);
-    assert(assigned == candidate);
+    assert(assigned == Some(candidate));
 }
 
 // LAW TIME-SYSTEM-MONOTONIC.
-pub fn every_automatic_assignment_follows(previous: i64, candidate: i64) {
+pub fn every_automatic_assignment_advances(previous: i64, candidate: i64) {
     let assigned = automatic_time(Some(previous), candidate);
-    assert(previous <= assigned);
+    if let Some(time) = assigned {
+        assert(previous < time);
+    }
 }
 
-// LAW TIME-SYSTEM-NO-MINT. A stalled or regressed clock ties its predecessor: no time is minted past it, so a
-// shared-main store append is never judged against a time no clock issued.
-pub fn a_stalled_clock_ties_its_predecessor(previous: i64, candidate: i64)
+// LAW TIME-SYSTEM-MINIMAL.
+pub fn a_stalled_clock_advances_one_tick(previous: i64, candidate: i64)
+    requires candidate <= previous, previous < i64::MAX,
+{
+    let assigned = automatic_time(Some(previous), candidate);
+    assert(assigned.is_some() && assigned.unwrap() as int == previous as int + 1);
+}
+
+// LAW TIME-SYSTEM-EXHAUSTION.
+pub fn the_maximum_cannot_be_advanced(candidate: i64) {
+    let assigned = automatic_time(Some(i64::MAX), candidate);
+    assert(assigned.is_none());
+}
+
+// LAW TIME-SUPPLIED-STRICT. A supplied time that does not follow its predecessor's is refused.
+pub fn a_supplied_time_must_follow_its_predecessor(previous: i64, candidate: i64)
     requires candidate <= previous,
 {
-    let assigned = automatic_time(Some(previous), candidate);
-    assert(assigned == previous);
-}
-
-// LAW TIME-SYSTEM-TOTAL. The maximum is kept, never exhausted.
-pub fn the_maximum_is_kept(candidate: i64) {
-    let assigned = automatic_time(Some(i64::MAX), candidate);
-    assert(assigned == i64::MAX);
-}
-
-// LAW TIME-SUPPLIED-ORDER. A supplied time before its predecessor's is refused.
-pub fn a_supplied_time_must_not_precede_its_predecessor(previous: i64, candidate: i64)
-    requires candidate < previous,
-{
-    let admitted = follows(Some(previous), candidate);
+    let admitted = advances(Some(previous), candidate);
     assert(!admitted);
 }
 
-// LAW TIME-SUPPLIED-FUTURE. As in XTDB, a supplied time at or after its predecessor is admitted however far it
-// leads now, and the automatic time after it ties it until now passes it.
+// LAW TIME-SUPPLIED-FUTURE. As in XTDB, a supplied time that follows its predecessor is admitted however far it
+// leads now, and the automatic time after it steps one tick past it.
 pub fn a_supplied_time_may_lead_now(previous: i64, candidate: i64, now: i64)
-    requires previous <= candidate, now < candidate,
+    requires previous < candidate, now < candidate, candidate < i64::MAX,
 {
-    let admitted = follows(Some(previous), candidate);
+    let admitted = advances(Some(previous), candidate);
     let following = automatic_time(Some(candidate), now);
-    assert(admitted && following == candidate);
+    assert(admitted && following == Some((candidate + 1) as i64));
 }
 
-// LAW TIME-SUPPLIED-BACKFILL. An external time at or after its predecessor is used unchanged, behind or ahead
-// of now.
+// LAW TIME-SUPPLIED-BACKFILL. An external time that advances is used unchanged, behind or ahead of now.
 pub fn an_advancing_external_time_is_used_unchanged(previous: i64, candidate: i64, now: i64)
-    requires previous <= candidate,
+    requires previous < candidate,
 {
     let assigned = external_time(Some(previous), Some(candidate), now);
-    assert(assigned == candidate);
+    assert(assigned == Some(candidate));
 }
 
-// LAW TIME-EXTERNAL-MONOTONIC. An external source's time is held rather than refused, and never goes back.
-pub fn every_external_time_follows(previous: i64, supplied: Option<i64>, now: i64) {
+// LAW TIME-EXTERNAL-MONOTONIC. An external source's time is stepped rather than refused, and always advances.
+pub fn every_external_time_advances(previous: i64, supplied: Option<i64>, now: i64) {
     let assigned = external_time(Some(previous), supplied, now);
-    assert(previous <= assigned);
+    if let Some(time) = assigned {
+        assert(previous < time);
+    }
 }
 
-// LAW TIME-EXTERNAL-TIE. A tied external time is kept: its position orders it.
-pub fn a_tied_external_time_is_kept(previous: i64, now: i64) {
+// LAW TIME-EXTERNAL-TIE. A tied external time advances one tick.
+pub fn a_tied_external_time_steps_one_tick(previous: i64, now: i64)
+    requires previous < now,
+{
     let assigned = external_time(Some(previous), Some(previous), now);
-    assert(assigned == previous);
+    assert(assigned == Some((previous + 1) as i64));
 }
 
-// LAW TIME-EXTERNAL-NOW. An external writer that supplies no time takes now, held at its predecessor's.
+// LAW TIME-EXTERNAL-NOW. An external writer that supplies no time takes now, stepped past its predecessor.
 pub fn an_unsupplied_external_time_takes_now(previous: i64, now: i64)
-    requires previous <= now,
+    requires previous < now,
 {
     let assigned = external_time(Some(previous), None, now);
-    assert(assigned == now);
+    assert(assigned == Some(now));
 }
 
 pub fn a_proposal_slot_checks_the_observation_independently_of_append() {

@@ -4953,7 +4953,7 @@ async fn a_private_replay_marker_covers_out_of_order_samples_and_survives_restar
 }
 
 #[tokio::test]
-async fn a_supplied_system_time_commits_even_ahead_of_the_log_ties_its_predecessor_and_refuses_an_earlier_one() {
+async fn a_supplied_system_time_commits_even_ahead_of_the_log_and_refuses_one_not_strictly_later() {
     let (node, driver) = running(options(), services()).await;
     let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
     let at = |time| AutonomousTxOptions { system_time: Some(Timestamp(time)), ..Default::default() };
@@ -4969,28 +4969,28 @@ async fn a_supplied_system_time_commits_even_ahead_of_the_log_ties_its_predecess
     assert!(second.committed(), "{:?}", second.error());
     assert_eq!(second.tx_key().system_time, Timestamp(200));
 
-    let refused = session.state_mut().execute_tx(vec![put(&node, 1, 150)], at(150)).await.unwrap();
-    assert_eq!(refused.error().map(|error| error.code.as_str()), Some("invalid-system-time"));
-    assert!(refused.tx_key().system_time.0 > 200);
+    for requested in [200, 150] {
+        let refused = session.state_mut().execute_tx(vec![put(&node, 1, requested)], at(requested)).await.unwrap();
+        assert_eq!(refused.error().map(|error| error.code.as_str()), Some("invalid-system-time"), "{requested}");
+        assert!(refused.tx_key().system_time.0 > 200);
+    }
     assert_eq!(rows(session.query_sql("SELECT value FROM docs", vec![]).await.unwrap()).await, [vec![Value::I64(20)]]);
     let between = "SELECT value FROM docs FOR SYSTEM_TIME AS OF TIMESTAMP '1970-01-01T00:00:00.00015Z'";
     assert_eq!(rows(session.query_sql(between, vec![]).await.unwrap()).await, [vec![Value::I64(10)]]);
 
-    // As in XTDB, a time ahead of the log commits. A supplied time equal to it, and the default time while the
-    // log is behind it, tie it at later positions, which order them (T7: no tick is minted).
+    // As in XTDB, a time ahead of the log commits, and the next default time follows it by one tick.
     let future = 4_102_444_800_000_000; // 2100-01-01T00:00:00Z
     let ahead = session.state_mut().execute_tx(vec![put(&node, 1, 30)], at(future)).await.unwrap();
     assert!(ahead.committed(), "{:?}", ahead.error());
     assert_eq!(ahead.tx_key().system_time, Timestamp(future));
     let tied = session.state_mut().execute_tx(vec![put(&node, 1, 35)], at(future)).await.unwrap();
-    assert!(tied.committed(), "{:?}", tied.error());
-    assert_eq!(tied.tx_key().system_time, Timestamp(future));
+    assert_eq!(tied.error().map(|error| error.code.as_str()), Some("invalid-system-time"));
+    assert_eq!(tied.tx_key().system_time, Timestamp(future + 1));
     let next = session.state_mut().execute_tx(vec![put(&node, 1, 40)], AutonomousTxOptions::default()).await.unwrap();
     assert!(next.committed(), "{:?}", next.error());
-    assert_eq!(next.tx_key().system_time, Timestamp(future));
-    assert!(ahead.tx_key().tx_id < tied.tx_key().tx_id && tied.tx_key().tx_id < next.tx_key().tx_id);
-    let latest = "SELECT value FROM docs FOR VALID_TIME AS OF TIMESTAMP '2100-01-01T00:00:00Z' \
-        FOR SYSTEM_TIME AS OF TIMESTAMP '2100-01-01T00:00:00Z'";
+    assert_eq!(next.tx_key().system_time, Timestamp(future + 2));
+    let latest = "SELECT value FROM docs FOR VALID_TIME AS OF TIMESTAMP '2100-01-01T00:00:00.000002Z' \
+        FOR SYSTEM_TIME AS OF TIMESTAMP '2100-01-01T00:00:00.000002Z'";
     assert_eq!(rows(session.query_sql(latest, vec![]).await.unwrap()).await, [vec![Value::I64(40)]]);
     drop(session);
     stop(&node, driver).await;
@@ -5008,9 +5008,8 @@ async fn a_keyed_transaction_rejected_before_its_duplicate_guard_keeps_its_error
         ..AutonomousTxOptions::default()
     }).await.unwrap();
     assert!(original.committed());
-    // An earlier time is refused before the duplicate guard; an equal one would tie and reach it (T7).
     let retry = session.state_mut().submit_tx(vec![put(&node, 2, 20)], AutonomousTxOptions {
-        system_time: Some(Timestamp(original.tx_key().system_time.0 - 1)),
+        system_time: Some(original.tx_key().system_time),
         user_metadata: Some(metadata),
         ..AutonomousTxOptions::default()
     }).await.unwrap();
