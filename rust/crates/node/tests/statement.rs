@@ -242,6 +242,27 @@ async fn prepared_vector_projection_reads_arrow_operands_for_division_comparison
 }
 
 #[tokio::test]
+async fn prepared_vector_projection_propagates_memory_exhaustion_instead_of_declining() {
+    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use rtdb_columnar::OwnedBatch;
+
+    let prepare_memory = MemoryBudget::new(1 << 20);
+    let prepare_context = context(None, &prepare_memory);
+    let query = PreparedSql::prepare("SELECT $1 + 1 AS next", &prepare_context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![41]))]).unwrap();
+    let arguments = OwnedBatch::new(batch, &prepare_memory).unwrap();
+    let types = [LogicalType::Scalar(ScalarType::I64)];
+
+    let exhausted = MemoryBudget::new(1);
+    let tight_context = context(None, &exhausted);
+    let error = query.try_open_parameter_projection(tight_context, &arguments, &types).await
+        .err().expect("a memory budget refusal must fail the query instead of falling through to a second bind");
+    assert!(error.is(rtdb_types::AnomalyKind::ResourceExhausted));
+}
+
+#[tokio::test]
 async fn prepared_vector_projection_never_reads_a_masked_utf8_span() {
     use arrow_array::{RecordBatch, StringArray};
     use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};

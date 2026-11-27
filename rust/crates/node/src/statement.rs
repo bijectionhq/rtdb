@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use rtdb_columnar::{MemoryReservation, OwnedBatch, Selection};
+use rtdb_columnar::{MemoryReservation, OwnedBatch};
 use rtdb_plan::{CatalogLookups, ColumnId, Field, RecordingCatalog, Schema, SqlNotice, Statement};
 use rtdb_query::{PreparedQuery, QueryContext, QueryCursor, RuntimeSchema, SharedPlan, SharedPlanKey};
 use rtdb_sql::{DeferredStatementSyntax, ParsedStatement, PrepareOptions, StatementKind, StatementSyntaxBatch};
@@ -245,11 +245,7 @@ impl PreparedSql {
         let arguments = if arguments.batch().num_rows() == 1 {
             arguments.clone()
         } else {
-            match arguments.select(&Selection::Indices(vec![0])) {
-                Ok(row) => row,
-                Err(error) if error.is(AnomalyKind::ResourceExhausted) => arguments.slice(0, 1)?,
-                Err(error) => return Err(error),
-            }
+            arguments.slice(0, 1)?
         };
         let selector = &self.0.snapshot_selector;
         let context = if let Some(rtdb_plan::SettingValue::Parameter { index }) = &selector.snapshot_token {
@@ -369,14 +365,8 @@ impl PreparedSql {
             || arguments.batch().num_rows() == 0 || types.len() != self.parameter_count() {
             return Ok(None);
         }
-        let projection = async {
-            let query = deep(self.source(), || self.bind(&context, types, true))?;
-            query.execute_parameter_projection(context, arguments, types, Some(self.source())).await
-        }.await;
-        match projection {
-            Err(error) if error.is(AnomalyKind::ResourceExhausted) => Ok(None),
-            result => result,
-        }
+        let query = deep(self.source(), || self.bind(&context, types, true))?;
+        query.execute_parameter_projection(context, arguments, types, Some(self.source())).await
     }
 
     async fn open_query_batches(&self, context: Arc<QueryContext>, mut arguments: Vec<Value>, types: &[LogicalType], columnar: bool, track: bool)
