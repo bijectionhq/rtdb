@@ -14,8 +14,17 @@ fn partition_roots_preserve_the_single_partition_namespace() {
     assert_eq!(storage_root(StorageVersion(6), StorageEpoch(0), 0, 1).unwrap(), "v06");
     assert_eq!(storage_root(StorageVersion(6), StorageEpoch(16), 0, 1).unwrap(), "v06_e110");
     assert_eq!(storage_root(StorageVersion(6), StorageEpoch(0), 2, 4).unwrap(), "parts/2/v06");
-    assert!(storage_root(StorageVersion(6), StorageEpoch(0), 2, 2).is_err());
-    assert!(storage_root(StorageVersion(6), StorageEpoch(0), 0, 0).is_err());
+    let invalid_partition = storage_root(StorageVersion(6), StorageEpoch(0), 2, 2).unwrap_err();
+    assert_eq!(invalid_partition.code, "xtdb/invalid-partition");
+    assert_eq!(invalid_partition.message.as_deref(), Some("partition must be in 0..<2, got 2"));
+    assert_eq!(invalid_partition.context, BTreeMap::from([
+        ("partition".into(), 2.into()),
+        ("total-partitions".into(), 2.into()),
+    ]));
+    let invalid_count = storage_root(StorageVersion(6), StorageEpoch(0), 0, 0).unwrap_err();
+    assert_eq!(invalid_count.code, "xtdb/invalid-total-partitions");
+    assert_eq!(invalid_count.message.as_deref(), Some("totalPartitions must be >= 1, got 0"));
+    assert_eq!(invalid_count.context, BTreeMap::from([("total-partitions".into(), 0.into())]));
     assert_eq!(rtdb_format::keys::StorageRoot::new(StorageVersion(6), StorageEpoch(16)).unwrap().key(), "v06_e110");
     assert_eq!(rtdb_format::keys::StorageRoot::under_prefix(Some("tenants/acme"), "v06"), "tenants/acme/v06");
     assert_eq!(rtdb_format::keys::StorageRoot::under_prefix(Some(""), "v06"), "v06", "an empty prefix is no prefix");

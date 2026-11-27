@@ -69,8 +69,17 @@ impl StorageRoot {
     pub fn new(version: StorageVersion, epoch: StorageEpoch) -> Result<Self> { Self::partitioned(version, epoch, 0, 1) }
 
     pub fn partitioned(version: StorageVersion, epoch: StorageEpoch, partition: u32, partitions: u32) -> Result<Self> {
-        if partitions == 0 || partition >= partitions {
-            return Err(Anomaly::incorrect("xtdb/invalid-partition", format!("Partition {partition} is outside 0..{partitions}")));
+        if partitions == 0 {
+            return Err(Anomaly::incorrect("xtdb/invalid-total-partitions", "totalPartitions must be >= 1, got 0")
+                .with_context("total-partitions", partitions.into()));
+        }
+        if partition >= partitions {
+            return Err(Anomaly::incorrect(
+                "xtdb/invalid-partition",
+                format!("partition must be in 0..<{partitions}, got {partition}"),
+            )
+            .with_context("partition", partition.into())
+            .with_context("total-partitions", partitions.into()));
         }
         Ok(Self { version: nonnegative(i64::from(version.0), "storage version")?, epoch: nonnegative(i64::from(epoch.0), "storage epoch")?, partition, partitions })
     }
