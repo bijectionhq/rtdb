@@ -1,0 +1,61 @@
+[
+  {
+    "id": "null_probe_key",
+    "probe": [null, 0, 101],
+    "build": [[null, 0], [null, 1]],
+    "reference": {"rows": [101]},
+    "native": {"error": "xtdb.expression/division-by-zero"}
+  },
+  {
+    "id": "unequal_hashes_in_the_same_partition",
+    "probe": [15, 0, 102],
+    "build": [[null, 0], [15, 1]],
+    "reference": {"rows": []},
+    "native": {"error": "xtdb.expression/division-by-zero"}
+  },
+  {
+    "id": "unequal_hashes_in_different_partitions",
+    "probe": [1, 0, 103],
+    "build": [[null, 0], [1, 1]],
+    "reference": {"rows": []},
+    "native": {"error": "xtdb.expression/division-by-zero"},
+    "native_spill": {"rows": []}
+  },
+  {
+    "id": "true_match_before_the_unknown_key",
+    "probe": [15, 0, 104],
+    "build": [[15, 1], [null, 0]],
+    "reference": {"rows": []},
+    "native": {"rows": []}
+  },
+  {
+    "id": "unequal_nonnull_keys",
+    "probe": [1, 0, 105],
+    "build": [[15, 0], [15, 1]],
+    "reference": {"rows": [105]},
+    "native": {"rows": [105]}
+  },
+  {
+    "id": "colliding_hashes_with_no_equal_key",
+    "probe": [9007199254740992, 0, 106],
+    "build": [[9007199254740993, 0], [9007199254740993, 1]],
+    "first_build_key_collides": true,
+    "reference": {"rows": [106]},
+    "native": {"rows": [106]}
+  },
+  {
+    "id": "colliding_hashes_before_a_reached_error",
+    "probe": [9007199254740992, 0, 107],
+    "build": [[9007199254740993, 0], [9007199254740992, 0], [9007199254740992, 1]],
+    "first_build_key_collides": true,
+    "reference": {"error": "xtdb.expression/division-by-zero"},
+    "native": {"error": "xtdb.expression/division-by-zero"}
+  },
+  {
+    "id": "true_match_before_a_same_hash_error",
+    "probe": [9007199254740992, 0, 108],
+    "build": [[9007199254740992, 1], [9007199254740992, 0]],
+    "reference": {"rows": []},
+    "native": {"rows": []}
+  }
+]

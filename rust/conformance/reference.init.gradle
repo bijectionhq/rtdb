@@ -80,6 +80,17 @@ gradle.projectsEvaluated {
         argumentProviders.add({ ["-m", "rtdb.conformance.table-column-test", fixture.get()] } as CommandLineArgumentProvider)
         outputs.upToDateWhen { false }
     }
+    root.tasks.register("rtdbConformanceAntiJoinContract", JavaExec) { task ->
+        configureRuntime(task)
+        def test = referenceTest.get()
+        dependsOn root.tasks.named("testClasses")
+        classpath = test.classpath + root.files(root.providers.gradleProperty("rtdb.adapterRoot").get())
+        jvmArgumentProviders.addAll(test.jvmArgumentProviders)
+        environment(test.environment)
+        mainClass = "clojure.main"
+        argumentProviders.add({ ["-m", "rtdb.conformance.anti-join-contract-test", fixture.get()] } as CommandLineArgumentProvider)
+        outputs.upToDateWhen { false }
+    }
     root.tasks.register("rtdbConformanceHistoryAdapterTest", JavaExec) { task ->
         configureRuntime(task)
         dependsOn root.tasks.named("testClasses")

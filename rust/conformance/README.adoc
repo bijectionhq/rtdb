@@ -513,6 +513,37 @@ Historical JSONL without a recorded selection and process receipts remains diagn
 The summary prints the upstream commit the run loaded, or says the run does not measure upstream conformance, and lists uncovered exclusions (a recorded failure outside the decision), stale ones (the Var no longer fails) and absent ones (the Var is gone from its namespace).
 Review and edit the list from those lines after every run; the shipped entries were seeded from a run over the fork's edited tests that kept only first failures, so expect uncovered and stale entries on the first upstream run.
 
+=== Fallible anti-join residuals
+
+link:fixtures/anti-join-contract.json[The anti-join contract fixture] supplies both engines with the same ordered build rows and a fallible division predicate.
+The scenario selects the anti-join operator directly in each engine and asserts retained probe IDs or the exact division-by-zero error.
+It runs with an in-memory build and again with a one-row spill threshold.
+
+* Pinned XTDB retains a NULL-key probe without visiting candidates and compares only build rows with the same full hash for other probes.
+* Native RTDB can reach the residual on an unknown equality while scanning the current build partition in order.
+  The NULL build key shares a spill partition with `15` and lands in a different spill partition from `1` in this fixture.
+* An unequal key stops evaluation of that pair, including when the two integers share a full hash.
+  Within a hash or build partition, the scenario places a true match both before and after a row that would raise.
+
+Run both suites during authorized qualification.
+Set `RTDB_CHECKOUT` to the absolute implementation path and `XTDB_REFERENCE` to a clean checkout of the revision in `upstream-commit.txt`.
+
+[source,shell]
+----
+test "$(git -C "$XTDB_REFERENCE" rev-parse HEAD)" = "$(cat "$RTDB_CHECKOUT/rust/conformance/upstream-commit.txt")" &&
+  test -z "$(git -C "$XTDB_REFERENCE" status --porcelain)" &&
+  "$XTDB_REFERENCE/gradlew" -p "$XTDB_REFERENCE" \
+    -I "$RTDB_CHECKOUT/rust/conformance/reference.init.gradle" \
+    -Prtdb.adapterRoot="$RTDB_CHECKOUT/rust/conformance/jvm" \
+    -Prtdb.fixture="$RTDB_CHECKOUT/rust/conformance/fixtures/anti-join-contract.json" \
+    rtdbConformanceAntiJoinContract
+
+cargo test --locked --manifest-path "$RTDB_CHECKOUT/rust/Cargo.toml" \
+  -p rtdb-query --test join_keys fallible_anti_residuals_observe_native_build_order_within_reached_partitions
+----
+
+These authored cases record the two operator contracts separately from the pinned upstream test Var counts.
+
 == Native CI coverage
 
 The native push jobs run Rust unit and integration targets for the transaction, query, node, pgwire, Flight SQL, FFI, format, conformance and simulation crates.

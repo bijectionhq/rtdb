@@ -220,6 +220,131 @@ async fn fallible_anti_equality_observes_build_order_before_a_matching_key() {
 }
 
 #[tokio::test]
+async fn fallible_anti_residuals_observe_native_build_order_within_reached_partitions() {
+    use rtdb_types::AnomalyCategory;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    #[serde(untagged)]
+    enum Outcome {
+        Rows { rows: Vec<i64> },
+        Error { error: String },
+    }
+
+    #[derive(Deserialize)]
+    struct Case {
+        id: String,
+        probe: (Option<i64>, i64, i64),
+        build: Vec<(Option<i64>, i64)>,
+        #[serde(default)]
+        first_build_key_collides: bool,
+        native: Outcome,
+        native_spill: Option<Outcome>,
+    }
+
+    let fixture = include_str!("../../../conformance/fixtures/anti-join-contract.json");
+    let cases: Vec<Case> = serde_json::from_str(fixture).unwrap();
+    for case in cases {
+        let (probe_key, probe_input, probe_id) = case.probe;
+        let key_value = |key: Option<i64>| key.map_or(Value::Null, Value::I64);
+        if case.first_build_key_collides {
+            let build_key = case.build[0].0;
+            assert_ne!(probe_key, build_key, "{}", case.id);
+            assert_eq!(
+                rtdb_columnar::hash_value(&key_value(probe_key), 0).unwrap(),
+                rtdb_columnar::hash_value(&key_value(build_key), 0).unwrap(),
+                "{}",
+                case.id,
+            );
+        }
+
+        let probe = typed_rows(
+            0,
+            &[ScalarType::I64, ScalarType::I64, ScalarType::I64],
+            vec![vec![
+                key_value(probe_key),
+                Value::I64(probe_input),
+                Value::I64(probe_id),
+            ]],
+        );
+        let build = typed_rows(
+            3,
+            &[ScalarType::I64, ScalarType::I64],
+            case.build
+                .into_iter()
+                .map(|(key, input)| vec![key_value(key), Value::I64(input)])
+                .collect(),
+        );
+        let key = Expr::binary(
+            BinaryOp::Eq,
+            probe.schema().fields()[0].expression(),
+            build.schema().fields()[0].expression(),
+        );
+        let denominator = Expr::binary(
+            BinaryOp::Add,
+            probe.schema().fields()[1].expression(),
+            build.schema().fields()[1].expression(),
+        );
+        let quotient = Expr::binary(
+            BinaryOp::Divide,
+            Expr::Literal(Value::F64(1.0)),
+            denominator,
+        );
+        let residual = Expr::binary(BinaryOp::Gt, quotient, Expr::Literal(Value::F64(0.0)));
+        let query = join(
+            probe,
+            build,
+            JoinKind::Anti,
+            Expr::binary(BinaryOp::And, key, residual),
+        );
+        assert!(
+            matches!(
+                query.relation().node(),
+                RelationNode::Join {
+                    kind: JoinKind::Anti,
+                    ..
+                }
+            ),
+            "{}",
+            case.id
+        );
+
+        for (spill, threshold) in [(false, i64::MAX), (true, 1)] {
+            let label = format!("{} (spill={spill})", case.id);
+            let context = join_context(&CancellationToken::new(), threshold);
+            let outcome = match collect(&query, &context).await {
+                Ok(rows) => Outcome::Rows {
+                    rows: rows
+                        .into_iter()
+                        .map(|row| match row[2] {
+                            Value::I64(id) => id,
+                            ref other => panic!("{label}: unexpected probe id {other:?}"),
+                        })
+                        .collect(),
+                },
+                Err(error) => {
+                    assert_eq!(
+                        error.category,
+                        AnomalyCategory::Incorrect,
+                        "{label}: {error:?}"
+                    );
+                    Outcome::Error { error: error.code }
+                }
+            };
+            let expected = if spill {
+                case.native_spill.as_ref().unwrap_or(&case.native)
+            } else {
+                &case.native
+            };
+            assert_eq!(&outcome, expected, "{label}");
+            assert_eq!(context.spill_peak_bytes() > 0, spill, "{label}");
+            assert_eq!(context.spill_bytes(), 0, "{label}");
+            assert_eq!(context.memory.used_bytes(), 0, "{label}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn composite_hashes_follow_equality_pair_order_in_both_input_schemas() {
     let left = keyed(0, Some(true)); let right = keyed(2, Some(true));
     let first = Expr::binary(BinaryOp::Eq, right.schema().fields()[1].expression(), left.schema().fields()[1].expression());
