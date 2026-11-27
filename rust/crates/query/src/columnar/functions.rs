@@ -966,9 +966,9 @@ mod tests {
         assert!(computed.is_some(), "the kernel computes {expr:?}");
         assert!(roomy.peak_bytes() >= rows * text.len(), "peak {} bytes", roomy.peak_bytes());
 
-        // The batch's own columns are not charged here, so only the kernel's vectors meet the limit.
+        // The batch's own columns are charged to another budget, so only the kernel's vectors meet the limit.
         let tight = MemoryBudget::new(rows * text.len() / 2);
-        let limited = batch(&mut Random(7), rows, &tight);
+        let limited = batch(&mut Random(7), rows, &roomy);
         let error = projection.column(&schema, &limited, rtdb_expr::Parameters::Values(&[]), &tight).err().expect("the literal's copies exceed the budget");
         assert_eq!(error.code, "rtdb/memory-budget-exceeded");
     }
