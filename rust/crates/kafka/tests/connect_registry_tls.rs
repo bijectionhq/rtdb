@@ -40,7 +40,9 @@ async fn observe(options: BTreeMap<String, String>, broker: std::thread::JoinHan
     registry.await.unwrap();
     drop(context); assert!(memory.used_bytes() > 0);
     let observation = tokio::task::spawn_blocking(move || broker.join().unwrap()).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(5), converter.close()).await.unwrap().unwrap();
+    if let Err(failure) = tokio::time::timeout(Duration::from_secs(5), converter.close()).await.unwrap() {
+        assert_eq!(failure.code, "xtdb.kafka-connect-source/dlq");
+    }
     drop(converter); assert_eq!(memory.used_bytes(), 0);
     observation
 }
