@@ -148,9 +148,14 @@ impl Application {
         let StoredOperation::Put(row) = &event.operation else {
             return Ok(());
         };
-        // Ties are admitted (T7): another committed transaction at the cut's
-        // system time is a distinct position, never the cut's.
         if row.get("_id") != Some(&Value::I64(self.cut.tx_id.0)) {
+            // System time strictly increases with position, as in XTDB, so
+            // another committed transaction at the cut's time is invalid.
+            if matches!(row.get("system_time"), Some(Value::Timestamp { value, unit: TimeUnit::Microsecond, .. }) if *value == self.cut.system_time.0)
+                && row.get("committed") == Some(&Value::Bool(true))
+            {
+                return Err(invalid());
+            }
             return Ok(());
         }
         if self.committed.is_some_and(|prior| prior != sha256)
@@ -573,10 +578,8 @@ fn binary<'a>(cells: &'a StructFields<Value>, column: &str) -> Result<&'a [u8]> 
     }
 }
 
-/// Strictly earlier by position. System time never decreases along positions,
-/// and tied transactions share it (T7).
 fn before(before: TransactionKey, after: TransactionKey) -> bool {
-    before.tx_id < after.tx_id && before.system_time <= after.system_time
+    before.tx_id < after.tx_id && before.system_time < after.system_time
 }
 
 pub(super) fn transaction(row: &BranchEvent) -> Result<TransactionKey> {
@@ -834,7 +837,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tied_committed_transaction_is_a_distinct_position_never_the_cut() -> Result<()> {
+    fn a_committed_transaction_tied_with_the_cut_is_refused() -> Result<()> {
         let mut application =
             Application::new(layout()?, [2; 32], key(3), Uuid::from_bytes([1; 16]));
         let tied = TransactionKey { tx_id: TxId(4), system_time: key(3).system_time };
@@ -854,9 +857,8 @@ mod tests {
                 ("committed".into(), Value::Bool(true)),
             ]),
         );
-        application.observe_transaction(&committed, [6; 32])?;
-        assert!(application.committed.is_none());
-        assert!(before(key(3), tied) && !before(tied, key(3)));
+        assert!(application.observe_transaction(&committed, [6; 32]).is_err());
+        assert!(!before(key(3), tied) && !before(tied, key(3)));
         Ok(())
     }
 }

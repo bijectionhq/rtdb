@@ -1,8 +1,7 @@
 //! Ordered purge floors use complete typed identities. A digest is a bounded
 //! bucket locator, never an identity or permission to purge another handle.
 //! A floor names the purging transaction by its position, with its system
-//! time: tied transactions share the time, and only the position attributes
-//! a floor to its own transaction (T7).
+//! time.
 use std::{collections::BTreeMap, sync::Arc};
 
 use rtdb_plan::Catalog;
@@ -35,7 +34,7 @@ impl OwnedPurgeBucket {
             || self
                 .entries
                 .get(&handle)
-                .is_some_and(|previous| previous.tx_id >= at.tx_id || previous.system_time > at.system_time)
+                .is_some_and(|previous| previous.tx_id >= at.tx_id || previous.system_time >= at.system_time)
         {
             return Err(uncovered());
         }

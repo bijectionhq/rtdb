@@ -429,11 +429,10 @@ impl OwnedReadSession {
         let head = current
             .tx_basis()
             .filter(|head| {
-                // One position has one time; a later position may tie it (T7).
                 head.tx_id >= self.present.tx_id
                     && head.system_time >= self.present.system_time
-                    && (head.tx_id != self.present.tx_id
-                        || head.system_time == self.present.system_time)
+                    && ((head.tx_id == self.present.tx_id)
+                        == (head.system_time == self.present.system_time))
             })
             .ok_or_else(unavailable)?;
         for witness in witnesses {
