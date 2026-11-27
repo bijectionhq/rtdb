@@ -46,12 +46,13 @@ pub open spec fn highest_after_admission(highest: int, arriving: int) -> int {
 pub open spec fn fenced_promotion(
     record_count: nat,
     recognized_prefix: bool,
+    prefix_applied: bool,
     may_lead: bool,
     already_leading: bool,
     holds_grant: bool,
     highest: int,
 ) -> Option<(int, int)> {
-    if record_count == 0 && recognized_prefix && may_lead && !already_leading && holds_grant && highest < i64::MAX {
+    if record_count == 0 && recognized_prefix && prefix_applied && may_lead && !already_leading && holds_grant && highest < i64::MAX {
         Some((highest + 1, 0))
     } else {
         None
@@ -95,18 +96,19 @@ fn admission_preserves_the_high_water_mark(
         (match out {
             Some((term, sequence)) => Some((term.0 as int, sequence as int)),
             None => None,
-        }) == fenced_promotion(record_count as nat, recognized_prefix, may_lead, already_leading, holds_grant,
+        }) == fenced_promotion(record_count as nat, recognized_prefix, prefix_applied, may_lead, already_leading, holds_grant,
                                fence.observed_highest() as int),
 )]
 fn fenced_promotion_after_empty_read(
     record_count: usize,
     recognized_prefix: bool,
+    prefix_applied: bool,
     may_lead: bool,
     already_leading: bool,
     holds_grant: bool,
     fence: &TermFence,
 ) -> Option<(Term, i64)> {
-    if !replica_read_is_empty(record_count) || !may_promote(recognized_prefix, may_lead, already_leading, holds_grant) {
+    if !replica_read_is_empty(record_count) || !may_promote(recognized_prefix, prefix_applied, may_lead, already_leading, holds_grant) {
         return None;
     }
     match fence.claim_term() {

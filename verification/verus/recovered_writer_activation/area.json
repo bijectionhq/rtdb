@@ -1,17 +1,17 @@
 {
-  "summary": "The shared replica driver requires a recognized prefix to promote and activates a fenced writer only after confirmation and installation of the exact recovered position.",
+  "summary": "The shared replica driver requires a recognized and applied prefix to promote and activates a fenced writer only after confirmation, full prefix application, and installation of the exact recovered position.",
   "flags": [
     "--no-external-by-default"
   ],
-  "min_verified_functions": 6,
+  "min_verified_functions": 10,
   "controls": {
     "promote_after_unknown_frame": {
       "defect": "A grant holder promotes after encountering an unrecognized replica frame.",
       "mutate": [
         {
           "file": "rust/crates/replication/src/recovery_promotion.rs",
-          "find": "    recognized_prefix && may_lead && !already_leading && holds_grant",
-          "replace": "    may_lead && !already_leading && holds_grant"
+          "find": "    recognized_prefix && prefix_applied && may_lead && !already_leading && holds_grant",
+          "replace": "    prefix_applied && may_lead && !already_leading && holds_grant"
         }
       ],
       "expect": [
@@ -21,15 +21,33 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 5
+      "min_verified_functions": 9
+    },
+    "promote_with_unapplied_prefix": {
+      "defect": "A grant holder promotes while a record it has read is still unapplied.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/recovery_promotion.rs",
+          "find": "    recognized_prefix && prefix_applied && may_lead && !already_leading && holds_grant",
+          "replace": "    recognized_prefix && may_lead && !already_leading && holds_grant"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/replication/src/recovery_promotion.rs",
+          "function": "may_promote",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 9
     },
     "activate_after_append_before_apply": {
       "defect": "A confirmed append can activate a replacement writer while its installed state is behind.",
       "mutate": [
         {
           "file": "rust/crates/replication/src/recovery_promotion.rs",
-          "find": "        if self.is_active() || (confirmed && recognized && installed == Some(received)) {",
-          "replace": "        if self.is_active() || (confirmed && recognized) {"
+          "find": "        if self.is_active() || (confirmed && recognized && prefix_applied && installed == Some(received)) {",
+          "replace": "        if self.is_active() || (confirmed && recognized && prefix_applied) {"
         }
       ],
       "expect": [
@@ -39,7 +57,25 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 5
+      "min_verified_functions": 9
+    },
+    "activate_with_unapplied_prefix": {
+      "defect": "A replacement writer activates at the received position while a record it has read is still unapplied.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/recovery_promotion.rs",
+          "find": "        if self.is_active() || (confirmed && recognized && prefix_applied && installed == Some(received)) {",
+          "replace": "        if self.is_active() || (confirmed && recognized && installed == Some(received)) {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/replication/src/recovery_promotion.rs",
+          "function": "installed",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 9
     }
   }
 }

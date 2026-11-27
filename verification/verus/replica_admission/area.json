@@ -13,7 +13,7 @@
     "--verify-module",
     "recovery_promotion"
   ],
-  "min_verified_functions": 25,
+  "min_verified_functions": 29,
   "controls": {
     "ignore_sequence_gap": {
       "defect": "A record past a missing predecessor is discarded without voiding the term.",
@@ -31,7 +31,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 24
+      "min_verified_functions": 28
     },
     "forget_term_fence_with_weakened_contract": {
       "defect": "Both the function and its contract permit records from a displaced leader.",
@@ -69,7 +69,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 23
+      "min_verified_functions": 27
     },
     "apply_from_superseded_term": {
       "defect": "The admission fold applies a lower-term record.",
@@ -92,7 +92,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 24
+      "min_verified_functions": 28
     },
     "promote_before_empty_read": {
       "defect": "A nonempty poll authorizes promotion.",
@@ -115,20 +115,20 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 24
+      "min_verified_functions": 28
     },
     "promote_without_grant": {
       "defect": "A worker can promote without a positive grant observation.",
       "mutate": [
         {
           "file": "rust/crates/replication/src/recovery_promotion.rs",
-          "find": "    recognized_prefix && may_lead && !already_leading && holds_grant\n",
-          "replace": "    recognized_prefix && may_lead && !already_leading\n"
+          "find": "    recognized_prefix && prefix_applied && may_lead && !already_leading && holds_grant\n",
+          "replace": "    recognized_prefix && prefix_applied && may_lead && !already_leading\n"
         },
         {
           "file": "rust/crates/replication/src/recovery_promotion.rs",
-          "find": "can_promote == (recognized_prefix && may_lead && !already_leading && holds_grant),",
-          "replace": "can_promote == (recognized_prefix && may_lead && !already_leading),"
+          "find": "can_promote == (recognized_prefix && prefix_applied && may_lead && !already_leading && holds_grant),",
+          "replace": "can_promote == (recognized_prefix && prefix_applied && may_lead && !already_leading),"
         }
       ],
       "expect": [
@@ -138,20 +138,20 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 24
+      "min_verified_functions": 28
     },
     "promote_after_unrecognized_prefix": {
       "defect": "A worker can promote after an unrecognized replica frame.",
       "mutate": [
         {
           "file": "rust/crates/replication/src/recovery_promotion.rs",
-          "find": "    recognized_prefix && may_lead && !already_leading && holds_grant\n",
-          "replace": "    may_lead && !already_leading && holds_grant\n"
+          "find": "    recognized_prefix && prefix_applied && may_lead && !already_leading && holds_grant\n",
+          "replace": "    prefix_applied && may_lead && !already_leading && holds_grant\n"
         },
         {
           "file": "rust/crates/replication/src/recovery_promotion.rs",
-          "find": "can_promote == (recognized_prefix && may_lead && !already_leading && holds_grant),",
-          "replace": "can_promote == (may_lead && !already_leading && holds_grant),"
+          "find": "can_promote == (recognized_prefix && prefix_applied && may_lead && !already_leading && holds_grant),",
+          "replace": "can_promote == (prefix_applied && may_lead && !already_leading && holds_grant),"
         }
       ],
       "expect": [
@@ -161,7 +161,30 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 24
+      "min_verified_functions": 28
+    },
+    "promote_with_unapplied_prefix": {
+      "defect": "A worker can promote while a record it has read is still unapplied.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/recovery_promotion.rs",
+          "find": "    recognized_prefix && prefix_applied && may_lead && !already_leading && holds_grant\n",
+          "replace": "    recognized_prefix && may_lead && !already_leading && holds_grant\n"
+        },
+        {
+          "file": "rust/crates/replication/src/recovery_promotion.rs",
+          "find": "can_promote == (recognized_prefix && prefix_applied && may_lead && !already_leading && holds_grant),",
+          "replace": "can_promote == (recognized_prefix && may_lead && !already_leading && holds_grant),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/replica_admission/laws.rs",
+          "function": "fenced_promotion_after_empty_read",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 28
     },
     "start_fenced_term_at_one": {
       "defect": "The first fenced append skips sequence zero.",
@@ -184,7 +207,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 24
+      "min_verified_functions": 28
     },
     "reuse_highest_term": {
       "defect": "Promotion reuses the current term.",
@@ -207,7 +230,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 24
+      "min_verified_functions": 28
     },
     "permit_claim_on_fenced_log": {
       "defect": "The legacy claim path admits a fenced journal.",
@@ -230,7 +253,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 24
+      "min_verified_functions": 28
     }
   }
 }

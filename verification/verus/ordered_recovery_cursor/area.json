@@ -1,73 +1,73 @@
 {
-  "summary": "The shipped ordered writer open checks the certified checkpoint and head coordinates. The installed cursor binds the exact requested interval, delivers the selected successor, and advances only after successful delivery. A fenced writer activates only at its recognized and installed prefix after checkpoint confirmation.",
+  "summary": "The shipped ordered writer open checks the certified checkpoint and head coordinates. The installed cursor binds the exact requested interval, delivers the selected successor, and advances only after successful delivery. A fenced writer activates only at its recognized, applied, and installed prefix after checkpoint confirmation.",
   "flags": ["--no-external-by-default"],
-  "min_verified_functions": 17,
+  "min_verified_functions": 29,
   "controls": {
     "accept_another_hold_extent": {
       "defect": "A reply for another terminal position can replace the interval requested by the cursor.",
       "mutate": [{ "file": "rust/crates/multi/src/journal/replay_cursor.rs", "find": " || terminal_position != requested_terminal", "replace": "" }],
       "expect": [{ "file": "rust/crates/multi/src/journal/replay_cursor.rs", "function": "bind", "category": "postcondition not satisfied" }],
-      "min_verified_functions": 16
+      "min_verified_functions": 28
     },
     "advance_before_delivery": {
       "defect": "A failed delivery spends its cut, so retry can lose the certified record.",
       "mutate": [{ "file": "rust/crates/multi/src/journal/replay_cursor.rs", "find": "        let record = result?;", "replace": "        let record = match result { Ok(record) => record, Err(error) => { self.next = cut.next; return Err(error); } };" }],
       "expect": [{ "file": "rust/crates/multi/src/journal/replay_cursor.rs", "function": "finish", "category": "postcondition not satisfied" }],
-      "min_verified_functions": 16
+      "min_verified_functions": 28
     },
     "finish_from_another_predecessor": {
       "defect": "An otherwise valid record prepared on an alien history spends this cursor's position.",
       "mutate": [{ "file": "rust/crates/multi/src/journal/replay_cursor.rs", "find": "        if !same_predecessor || self.from.is_none()", "replace": "        if self.from.is_none()" }],
       "expect": [{ "file": "rust/crates/multi/src/journal/replay_cursor.rs", "function": "finish", "category": "postcondition not satisfied" }],
-      "min_verified_functions": 16
+      "min_verified_functions": 28
     },
     "substitute_checkpoint_root": {
       "defect": "The opened catalog may come from another checkpoint at the same offset.",
       "mutate": [{ "file": "rust/crates/multi/src/journal/replay_cursor.rs", "find": "Some(boundary) => !genesis && exact_root && boundary as i128", "replace": "Some(boundary) => !genesis && boundary as i128" }],
       "expect": [{ "file": "rust/crates/multi/src/journal/replay_cursor.rs", "function": "recovery_coordinates_match", "category": "postcondition not satisfied" }],
-      "min_verified_functions": 8
+      "min_verified_functions": 28
     },
     "skip_next_lsn": {
       "defect": "Replay accepts a later record and skips an original transaction.",
       "mutate": [{ "file": "rust/crates/multi/src/journal/replay_cursor.rs", "find": "from.checked_add(1) == Some(offered)", "replace": "from < offered" }],
       "expect": [{ "file": "rust/crates/multi/src/journal/replay_cursor.rs", "function": "next_in_hold", "category": "postcondition not satisfied" }],
-      "min_verified_functions": 8
+      "min_verified_functions": 28
     },
     "substitute_renewed_history": {
       "defect": "Renewal accepts a cut in another history at the same offset.",
       "mutate": [{ "file": "rust/crates/multi/src/journal/replay_cursor.rs", "find": "    start == next && (!resuming || exact_previous_cut)", "replace": "    start == next" }],
       "expect": [{ "file": "rust/crates/multi/src/journal/replay_cursor.rs", "function": "starts_at", "category": "postcondition not satisfied" }],
-      "min_verified_functions": 8
+      "min_verified_functions": 28
     },
     "substitute_page_checkpoint": {
       "defect": "A prepared record can come from a page with a different checkpoint.",
       "mutate": [{ "file": "rust/crates/multi/src/journal/replay_cursor.rs", "find": "    if exact_checkpoint && exact_through && exact_record_cut", "replace": "    if exact_through && exact_record_cut" }],
       "expect": [{ "file": "rust/crates/multi/src/journal/replay_cursor.rs", "function": "select_record", "category": "postcondition not satisfied" }],
-      "min_verified_functions": 8
+      "min_verified_functions": 28
     },
     "promote_after_unknown_frame": {
       "defect": "A grant holder promotes after encountering an unrecognized replica frame.",
       "mutate": [{ "file": "rust/crates/replication/src/recovery_promotion.rs", "find": "    recognized_prefix && prefix_applied && may_lead && !already_leading && holds_grant", "replace": "    prefix_applied && may_lead && !already_leading && holds_grant" }],
       "expect": [{ "file": "rust/crates/replication/src/recovery_promotion.rs", "function": "may_promote", "category": "postcondition not satisfied" }],
-      "min_verified_functions": 8
+      "min_verified_functions": 28
     },
     "promote_with_unapplied_prefix": {
       "defect": "A grant holder promotes while a record it has read is still unapplied.",
       "mutate": [{ "file": "rust/crates/replication/src/recovery_promotion.rs", "find": "    recognized_prefix && prefix_applied && may_lead && !already_leading && holds_grant", "replace": "    recognized_prefix && may_lead && !already_leading && holds_grant" }],
       "expect": [{ "file": "rust/crates/replication/src/recovery_promotion.rs", "function": "may_promote", "category": "postcondition not satisfied" }],
-      "min_verified_functions": 8
+      "min_verified_functions": 28
     },
     "activate_after_append_before_apply": {
       "defect": "A confirmed append can activate a replacement writer while its installed state is behind.",
       "mutate": [{ "file": "rust/crates/replication/src/recovery_promotion.rs", "find": "        if self.is_active() || (confirmed && recognized && prefix_applied && installed == Some(received)) {", "replace": "        if self.is_active() || (confirmed && recognized && prefix_applied) {" }],
       "expect": [{ "file": "rust/crates/replication/src/recovery_promotion.rs", "function": "installed", "category": "postcondition not satisfied" }],
-      "min_verified_functions": 8
+      "min_verified_functions": 28
     },
     "activate_with_unapplied_prefix": {
       "defect": "A replacement writer activates at the received position while a record it has read is still unapplied.",
       "mutate": [{ "file": "rust/crates/replication/src/recovery_promotion.rs", "find": "        if self.is_active() || (confirmed && recognized && prefix_applied && installed == Some(received)) {", "replace": "        if self.is_active() || (confirmed && recognized && installed == Some(received)) {" }],
       "expect": [{ "file": "rust/crates/replication/src/recovery_promotion.rs", "function": "installed", "category": "postcondition not satisfied" }],
-      "min_verified_functions": 8
+      "min_verified_functions": 28
     }
   }
 }
