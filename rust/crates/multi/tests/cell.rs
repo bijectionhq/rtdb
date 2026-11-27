@@ -3761,6 +3761,14 @@ async fn a_recovering_subscriber_keeps_its_suffix_through_a_concurrent_trim() {
     cell.stop().await;
 }
 
+fn checkpoint_trim_limit(record: &DeploymentRecord) -> Option<i64> {
+    let through = record.checkpoint?.boundary - 1;
+    Some(record.checkpoint_decision.as_ref().map_or(through, |witness| {
+        let proof = <rtdb_logkeeper::StableDecision as prost::Message>::decode(witness.stable.as_slice()).unwrap();
+        through.min(proof.certificate.statement.prefix.predecessor)
+    }))
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hosted_search_rebuilds_after_trim_and_loss_of_postings_and_all_source_tries() {
     use rtdb_format::keys::{CURRENT_STORAGE_VERSION, StorageRoot};
@@ -3894,13 +3902,18 @@ async fn a_stream_is_trimmed_below_its_last_published_block_and_still_recovers()
             let members: std::collections::BTreeMap<_, _> = cell.directory.members().await.unwrap().into_iter().map(|member| (member.id.clone(), member)).collect();
             let servers = record.ensemble.iter().map(|id| members[id].address.clone().into()).collect();
             let reader = rtdb_logkeeper::open_reader(rtdb_logkeeper::StreamConfig { write_quorum: 2, servers, stream: record.stream("replica"), maximum_message_bytes: 4 << 20 }, Default::default()).await.unwrap();
-            if matches!(reader.read_range(rtdb_storage::log::LogOffset(0), rtdb_storage::log::LogOffset(1)).await, Err(rtdb_storage::Error::UnavailableLogRange { .. })) { break record; }
+            if record.checkpoint.is_some_and(|checkpoint| checkpoint.block == 2)
+                && let Some(through) = checkpoint_trim_limit(&record)
+                && record.replica_anchor.as_ref().is_some_and(|anchor| anchor.interval == [0, through])
+                && reader.retained_floor().await.unwrap().is_some_and(|floor| floor.0 == through + 1)
+            {
+                break record;
+            }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }).await.expect("the stream is trimmed below the published blocks");
     assert_eq!(record.checkpoint.map(|checkpoint| checkpoint.block), Some(2), "the directory names the last published block, which a cold start starts from");
     let anchor = *record.replica_anchor.unwrap();
-    assert_eq!(anchor.interval, [0, record.checkpoint.unwrap().boundary - 1]);
     assert_eq!(anchor.root_incarnation, record.incarnation);
     drop(client);
 
@@ -4794,7 +4807,17 @@ async fn a_fork_publishes_and_trims_only_after_adopting_a_block_from_its_own_log
     agent.reconcile().await;
     let checkpoint = cell.directory.deployment(&child.id).await.unwrap().unwrap().checkpoint.unwrap();
     assert!(checkpoint.boundary > 0 && checkpoint.source >= 0);
-    assert!(matches!(reader.read_range(LogOffset(0), LogOffset(1)).await, Err(rtdb_storage::Error::UnavailableLogRange { .. })));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match reader.read_range(LogOffset(0), LogOffset(1)).await {
+                Err(rtdb_storage::Error::UnavailableLogRange { .. }) => break,
+                Ok(_) => (),
+                Err(error) => panic!("could not read the child replica prefix: {error}"),
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            agent.reconcile().await;
+        }
+    }).await.expect("the child replica prefix was trimmed after its own block was adopted");
     assert_eq!(reader.read_range(LogOffset(checkpoint.boundary), LogOffset(checkpoint.boundary + 1)).await.unwrap().len(), 1);
     assert_eq!(values(&preview, "SELECT _id FROM orders").await, ["0", "1", "2", "3", "4", "5", "6", "7", "8"]);
     drop((parent, preview));
