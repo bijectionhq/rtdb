@@ -50,13 +50,12 @@ async fn fixture_with_replica(config: ReplicationConfig, replica_message_limit: 
 /// The driver reads `store` through `objects`.
 async fn fixture_over(config: ReplicationConfig, replica_message_limit: usize, clock: Option<ReplicationClock>,
     wrap_replica: impl FnOnce(Arc<MemoryLog>) -> Arc<dyn Log>, store: Arc<MemoryStore>, objects: Arc<dyn ObjectStore>) -> Fixture {
-    fixture_observed_over(config, replica_message_limit, clock, wrap_replica, store, objects, None).await
+    fixture_observed_over(config, replica_message_limit, clock, wrap_replica, store, objects, None, MemoryBudget::new(1 << 30)).await
 }
 
 async fn fixture_observed_over(config: ReplicationConfig, replica_message_limit: usize, clock: Option<ReplicationClock>,
     wrap_replica: impl FnOnce(Arc<MemoryLog>) -> Arc<dyn Log>, store: Arc<MemoryStore>, objects: Arc<dyn ObjectStore>,
-    execution_observer: Option<Arc<dyn rtdb_plan::ExecutionObserver>>) -> Fixture {
-    let memory = MemoryBudget::new(1 << 30);
+    execution_observer: Option<Arc<dyn rtdb_plan::ExecutionObserver>>, memory: Arc<MemoryBudget>) -> Fixture {
     let source = Arc::new(MemoryLog::new(1 << 28));
     let replica = Arc::new(MemoryLog::new(replica_message_limit));
     let cache = Arc::new(BufferPool::new(Arc::clone(&objects), 1 << 27));
@@ -1184,6 +1183,48 @@ async fn a_source_batch_resolves_back_to_back_before_its_read_back_applies() {
 }
 
 #[tokio::test]
+async fn a_byte_pressure_cut_adopts_and_recovers_a_block_below_the_row_limit() {
+    let config = ReplicationConfig { rows_per_block: u64::MAX, assertion_interval: Duration::from_millis(10), ..Default::default() };
+    let store = Arc::new(MemoryStore::default());
+    let fixture = fixture_observed_over(config, 1 << 27, None, |replica| replica,
+        Arc::clone(&store), store, None, MemoryBudget::new(32 << 20)).await;
+    let handle = fixture.handle.clone();
+    let blocks = Arc::clone(&fixture.blocks);
+    let partition = Arc::clone(&fixture.driver.partition);
+    let writer = tokio::spawn(fixture.driver.run());
+    let table = TableRef::new("public", "wide");
+    for id in 0..128_i64 {
+        if handle.status().memory_block_cuts > 0 { break; }
+        let documents = Documents::new(
+            vec![StructFields::from([("_id".into(), Value::I64(id)), ("payload".into(), Value::Utf8("a".repeat(128 << 10)))])],
+            &fixture.memory,
+        ).unwrap();
+        let transaction = SourceTransaction::new(vec![TxOp::PutDocs {
+            table: table.clone(), documents, valid_from: Some(Timestamp(0)), valid_to: None,
+        }], SubmitOptions::default(), &fixture.memory).unwrap();
+        let position = handle.submit_source_encoded(transaction.encode().unwrap().into_bytes(), Timestamp(100 + id)).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), handle.await_tx(TxId(position.0), &CancellationToken::new()))
+            .await.unwrap().unwrap().unwrap();
+        assert!(result.committed(), "{id}: {result:?}");
+    }
+    assert!(handle.status().memory_block_cuts > 0,
+        "no byte cut after {} retained bytes and {} live rows; fault {:?}",
+        partition.value().live().live_batch_bytes(), partition.value().live().block_row_count(), handle.progress().fault());
+    let mut status = handle.watch_status();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if status.borrow_and_update().adopted_block.is_some() { break; }
+            status.changed().await.unwrap();
+        }
+    }).await.unwrap_or_else(|error| panic!("{error}: {:?}; fault {:?}", handle.status(), handle.progress().fault()));
+    assert!(status.borrow().memory_block_cuts > 0);
+    handle.shutdown();
+    writer.await.unwrap().unwrap();
+    let recovered = blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(1000), crate::BlockDiscovery::List).await.unwrap();
+    assert!(recovered.partition.value().table_catalog().metadata(&table).unwrap().row_count > 0);
+}
+
+#[tokio::test]
 async fn block_production_records_the_upload_timer_once_the_block_is_appended() {
     #[derive(Default)]
     struct Timers(Mutex<Vec<rtdb_plan::ExecutionTimer>>);
@@ -1194,7 +1235,7 @@ async fn block_production_records_the_upload_timer_once_the_block_is_appended() 
     let timers = Arc::new(Timers::default());
     let store = Arc::new(MemoryStore::default());
     let config = ReplicationConfig { rows_per_block: 2, assertion_interval: Duration::from_millis(10), ..Default::default() };
-    let fixture = fixture_observed_over(config, 1 << 27, None, |replica| replica, Arc::clone(&store), store, Some(timers.clone() as Arc<dyn rtdb_plan::ExecutionObserver>)).await;
+    let fixture = fixture_observed_over(config, 1 << 27, None, |replica| replica, Arc::clone(&store), store, Some(timers.clone() as Arc<dyn rtdb_plan::ExecutionObserver>), MemoryBudget::new(1 << 30)).await;
     let handle = fixture.handle.clone();
     let writer = tokio::spawn(fixture.driver.run());
     let transaction = SourceTransaction::new(vec![TxOp::PutDocs { table: TableRef::new("public", "docs"), documents: Documents::new(vec![StructFields::from([("_id".into(), Value::I64(1))])], &fixture.memory).unwrap(), valid_from: Some(Timestamp(0)), valid_to: None }], SubmitOptions::default(), &fixture.memory).unwrap();

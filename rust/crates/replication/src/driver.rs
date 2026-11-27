@@ -141,6 +141,7 @@ pub struct DriverStatus {
     pub first_erasure: Option<CommittedErasure>,
     pub promotion_failure: Option<Anomaly>,
     pub last_block_upload_epoch_seconds: i64,
+    pub memory_block_cuts: u64,
 }
 
 #[derive(Clone)]
@@ -622,7 +623,7 @@ impl ReplicationDriver {
         let track_catalog_cut = config.enabled && recovered.allows_catalog_cut_tracking();
         let initial = DriverStatus { role: Role::Following, highest_term: recovered.fence.highest_term(), replica_position: read_position,
             installed: None, first_erasure: None,
-            open_block: recovered.partition.value().live().block_index(), adopted_block: recovered.block.clone().map(Arc::new), promotion_failure: None, last_block_upload_epoch_seconds: 0 };
+            open_block: recovered.partition.value().live().block_index(), adopted_block: recovered.block.clone().map(Arc::new), promotion_failure: None, last_block_upload_epoch_seconds: 0, memory_block_cuts: 0 };
         let (status, receiver) = watch::channel(initial);
         let (sender, commands) = mpsc::channel(128);
         let handle = ReplicationHandle { logs: Arc::clone(&logs), progress: Arc::clone(&progress), status: receiver, commands: sender, cancellation: cancellation.clone(), clock: Arc::clone(&clock), partition: Arc::clone(&recovered.partition) };
@@ -1248,10 +1249,13 @@ impl ReplicationDriver {
     }
     fn publish_status(&self, role: Role) {
         let value = self.partition.value();
-        let (promotion_failure, last_block_upload_epoch_seconds) = { let status = self.status.borrow(); (status.promotion_failure.clone(), status.last_block_upload_epoch_seconds) };
+        let (promotion_failure, last_block_upload_epoch_seconds, memory_block_cuts) = {
+            let status = self.status.borrow();
+            (status.promotion_failure.clone(), status.last_block_upload_epoch_seconds, status.memory_block_cuts)
+        };
         self.status.send_replace(DriverStatus { role, highest_term: self.fence.highest_term(), replica_position: self.read_position,
             installed: self.installed, first_erasure: self.first_erasure,
-            open_block: value.live().block_index(), adopted_block: value.table_catalog().block().cloned().map(Arc::new), promotion_failure, last_block_upload_epoch_seconds });
+            open_block: value.live().block_index(), adopted_block: value.table_catalog().block().cloned().map(Arc::new), promotion_failure, last_block_upload_epoch_seconds, memory_block_cuts });
     }
     fn observe_erasure(&mut self, position: ReplicaPosition, write: &StagedWrite) -> Result<()> {
         if self.track_catalog_cut && self.first_erasure.is_none() {
@@ -2505,13 +2509,20 @@ impl ReplicationDriver {
         } else {
             None
         };
+        let memory_triggered = self.leader.as_ref().is_some_and(|leader| {
+            !leader.cycle.is_full(self.config.rows_per_block) && self.block_needs_memory_cut(leader)
+        });
         let leader = self.leader.as_mut().ok_or_else(term_ended)?;
         leader.cycle.cut()?;
         let boundary = proto::BlockBoundary {
             block_index: Some(block.0), latest_processed_msg_id: Some(leader.resolver()?.source_position().0),
             external_source_token: leader.resolver()?.external_token().map(<[u8]>::to_vec), relation_oid_order,
         };
-        leader.enqueue(WriteBody::Message(ReplicaBody::BlockBoundary(boundary)), block, None, &self.resolve.memory)
+        leader.enqueue(WriteBody::Message(ReplicaBody::BlockBoundary(boundary)), block, None, &self.resolve.memory)?;
+        if memory_triggered {
+            self.status.send_modify(|status| status.memory_block_cuts = status.memory_block_cuts.saturating_add(1));
+        }
+        Ok(())
     }
     async fn flush_if_due(&mut self) -> Result<()> {
         let persisted = self.partition.value().table_catalog().block().and_then(BlockCatalog::latest_completed_tx).map(|key| key.tx_id);

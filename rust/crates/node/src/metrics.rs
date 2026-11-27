@@ -50,6 +50,11 @@ impl CatalogMetrics for NodeMetrics {
                 };
                 rows.push(CatalogMetric::Gauge { name: name.into(), tags: BTreeMap::from([("db".into(), database.name().into())]), unit, value });
             }
+            rows.push(CatalogMetric::Counter {
+                name: "rtdb.block.memory.cuts".into(),
+                tags: BTreeMap::from([("db".into(), database.name().into())]),
+                count: status.memory_block_cuts as f64,
+            });
             let available = rtdb_maintenance::available_jobs(&database.trie_catalog()).map_or(f64::NAN, |jobs| jobs.len() as f64);
             rows.push(CatalogMetric::Gauge { name: "compactor.jobs.available".into(), tags: BTreeMap::from([("db".into(), database.name().into())]), unit: None, value: available });
             push_allocator(&mut rows, "buffer-pool", database.name(), database.storage.pool_retained_bytes(), database.storage.scan_byte_limit());
