@@ -7279,7 +7279,7 @@ pub(crate) mod projection {
                     return Ok(None);
                 }
                 let field = Arc::new(field.clone().with_nullable(true));
-                Ok(selected.relayout(&nullable, &field, memory, false)?.map(|(array, owner)| {
+                Ok(selected.relayout(&nullable, &field, memory, false, false)?.map(|(array, owner)| {
                     (Column::Arrow { array, field, logical: Some(nullable) }, owner)
                 }))
             }
