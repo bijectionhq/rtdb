@@ -156,7 +156,7 @@ fn rollback_root_matches_optional_semicolon_and_attaches_actual_eof_in_both_prof
 #[test]
 fn insert_values_uses_the_original_returning_rule_and_select_list_call() {
     let source = "INSERT INTO \"select\".\"table\" (\"_id\") VALUES (1), (2) RETURNING 3 AS \"order\";";
-    let (result, memory) = environment_fixture(|environment, work, _| {
+    let (result, memory) = environment_fixture(|environment, work, _| -> RuntimeResult<'_, ()> {
         for profile in [ParserProfile::SllBail, ParserProfile::LlDefault] {
             with_parser_session(environment, source, work, |session| {
                 session.profile = profile;

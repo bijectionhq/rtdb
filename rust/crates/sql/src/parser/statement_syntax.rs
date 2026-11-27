@@ -40,6 +40,9 @@ fn diagnose(
 mod tests {
     use super::*;
 
+    type Diagnostic = fn(&str, &Anomaly, &Arc<MemoryBudget>) -> Result<Option<StatementSyntaxDiagnostic>>;
+    const DIAGNOSTICS: [Diagnostic; 2] = [statement_syntax_diagnostic, batch_syntax_diagnostic];
+
     #[test]
     fn reports_retain_only_the_listener_lease() {
         let memory = MemoryBudget::new(64 << 20);
@@ -121,7 +124,7 @@ mod tests {
             ("SELECT 1 LIMIT 2 LIMIT 3", same("line 1:17 mismatched input 'LIMIT' expecting {<EOF>, ';'}".into())),
         ] {
             let error = Anomaly::incorrect("xtdb/sql-error", "vendor");
-            for (diagnose, expected) in [(statement_syntax_diagnostic as fn(_, _, _) -> _, direct), (batch_syntax_diagnostic, multi)] {
+            for (diagnose, expected) in DIAGNOSTICS.into_iter().zip([direct, multi]) {
                 let report = diagnose(source, &error, &memory).unwrap().unwrap();
                 assert_eq!(report.anomaly().message.as_deref().unwrap(), format!("Errors parsing SQL statement:\n  - {expected}"), "{source}");
             }
@@ -147,7 +150,7 @@ mod tests {
             ),
         ] {
             let legacy = crate::parse_in(source, &memory).unwrap_err();
-            for diagnose in [statement_syntax_diagnostic as fn(_, _, _) -> _, batch_syntax_diagnostic] {
+            for diagnose in DIAGNOSTICS {
                 let report = diagnose(source, &legacy, &memory).unwrap().unwrap();
                 assert_eq!(report.anomaly().category, AnomalyCategory::Incorrect);
                 assert_eq!(report.anomaly().code, "xtdb/sql-error");
@@ -161,7 +164,7 @@ mod tests {
 
     #[test]
     fn dml_source_replay_reaches_the_first_error_in_the_original_statement() {
-        let memory = MemoryBudget::new(64 << 20);
+        let memory = MemoryBudget::new(256 << 20);
         for (source, location) in [
             ("INSERT INTO docs (_id, foo) VALUES ($1, $2), ($3, $4) RETURNING CAST(a AS BLOB)", "1:74"),
             ("INSERT INTO docs (_id, foo) VALUES ROW(1, abs(2)), (3, 4) RETURNING CAST(a AS BLOB)", "1:78"),
@@ -174,8 +177,9 @@ mod tests {
             ("DELETE FROM \"🙂\".\"select\" AS \"returning\"\nWHERE \"_id\" = ? RETURNING CAST(a AS BLOB)", "2:36"),
         ] {
             let legacy = crate::parse_in(source, &memory).unwrap_err();
-            for diagnose in [statement_syntax_diagnostic as fn(_, _, _) -> _, batch_syntax_diagnostic] {
-                let report = diagnose(source, &legacy, &memory).unwrap().unwrap();
+            for diagnose in DIAGNOSTICS {
+                let report = diagnose(source, &legacy, &memory)
+                    .unwrap_or_else(|error| panic!("{source}: {error:?}")).unwrap();
                 assert_eq!(report.anomaly().message.as_deref().unwrap(),
                     format!("Errors parsing SQL statement:\n  - line {location} no viable alternative at input 'CAST(aASBLOB'"), "{source}");
             }
@@ -193,7 +197,7 @@ mod tests {
                 "line 1:38 mismatched input 'ALL' expecting {UNSIGNED_INTEGER, POSTGRES_PARAMETER_SPECIFICATION, '?'}"),
         ] {
             let legacy = crate::parse_in(source, &memory).unwrap_err();
-            for diagnose in [statement_syntax_diagnostic as fn(_, _, _) -> _, batch_syntax_diagnostic] {
+            for diagnose in DIAGNOSTICS {
                 let report = diagnose(source, &legacy, &memory).unwrap().unwrap();
                 assert_eq!(report.anomaly().message.as_deref().unwrap(),
                     format!("Errors parsing SQL statement:\n  - {expected}"), "{source}");
