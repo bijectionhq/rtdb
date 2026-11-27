@@ -1,7 +1,7 @@
 use std::{collections::HashMap, ops::Range, sync::Arc};
 
-use arrow_array::{Array, ArrayRef, Int32Array, MapArray, NullArray, TimestampMicrosecondArray, UnionArray, cast::AsArray, make_array,
-    types::{Float32Type, Float64Type, Int16Type, Int32Type, Int64Type}};
+use arrow_array::{Array, ArrayRef, Int32Array, MapArray, NullArray, TimestampMicrosecondArray, UnionArray,
+    builder::PrimitiveBuilder, cast::AsArray, make_array, types::{ArrowPrimitiveType, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type}};
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer, ScalarBuffer};
 use arrow_data::{ArrayData, transform::MutableArrayData};
 use arrow_schema::{DataType, Field, UnionMode};
@@ -48,7 +48,7 @@ fn read_size_ceiling(field: &Field) -> Option<usize> {
 }
 
 pub(super) fn column<E: EncodedEvent>(
-    events: &[&E], target: &Field, logical: &LogicalType, builder: Option<&mut BatchBuilder>,
+    events: &[&E], target: &Field, logical: &LogicalType, mut builder: Option<&mut BatchBuilder>,
     preflight_scalar_read: impl FnOnce() -> Result<()>,
 ) -> Result<Option<ArrayRef>> {
     if events.is_empty() { return Ok(None); }
@@ -66,6 +66,11 @@ pub(super) fn column<E: EncodedEvent>(
         }
     }
     if reserved && !defer_read_size { preflight_scalar_read()?; }
+    if let Some(builder) = builder.as_deref_mut()
+        && let Some(array) = plain_primitive_column(events, target, builder)?
+    {
+        return Ok(Some(array));
+    }
     let mismatch = |row| {
         let message = if reserved {
             "Allocation estimate requires values belonging to the declared logical type".into()
@@ -166,6 +171,50 @@ pub(super) fn column<E: EncodedEvent>(
     } else {
         build()
     }
+}
+
+fn plain_primitive_column<E: EncodedEvent>(
+    events: &[&E], target: &Field, builder: &mut BatchBuilder,
+) -> Result<Option<ArrayRef>> {
+    let ty = target.data_type();
+    if !target.metadata().is_empty() || !(ty.is_integer() || ty.is_floating() || ty.is_temporal()) {
+        return Ok(None);
+    }
+    if !events.iter().all(|event| match event.put_column(target.name()) {
+        Some(PutColumn::Stored(field, array, row)) => field.metadata().is_empty()
+            && field.data_type() == ty && array.data_type() == ty
+            && row < array.len() && (target.is_nullable() || array.is_valid(row)),
+        Some(PutColumn::Absent) => target.is_nullable(),
+        None => false,
+    }) {
+        return Ok(None);
+    }
+    let width = ty.primitive_width().expect("Plain primitive width");
+    let bound = events.len().checked_mul(width + 1)
+        .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(event_size)?;
+    macro_rules! primitive {
+        ($array_type:ty) => { build_primitive::<$array_type, E>(events, target) };
+    }
+    match builder.try_funded_column(bound, || {
+        let array = arrow_array::downcast_primitive!(ty => (primitive), _ => unreachable!("Plain primitive"));
+        Ok(Some(array))
+    })? {
+        FundedColumn::Built(array) => Ok(array),
+        FundedColumn::Unfunded => Ok(None),
+    }
+}
+
+fn build_primitive<T: ArrowPrimitiveType, E: EncodedEvent>(events: &[&E], target: &Field) -> ArrayRef {
+    let mut output = PrimitiveBuilder::<T>::with_capacity(events.len()).with_data_type(target.data_type().clone());
+    for event in events {
+        match event.put_column(target.name()) {
+            Some(PutColumn::Stored(_, array, row)) if array.is_valid(row) => {
+                output.append_value(array.as_primitive::<T>().value(row));
+            }
+            _ => output.append_null(),
+        }
+    }
+    Arc::new(output.finish())
 }
 
 fn has_packed_null_payload(item: &Field, values: &dyn Array, start: usize, end: usize) -> bool {
@@ -993,6 +1042,62 @@ mod tests {
     }
 
     #[test]
+    fn plain_timestamp_output_keeps_scalar_ipc_when_neither_selection_plan_fits() {
+        use arrow_array::TimestampNanosecondArray;
+        use arrow_buffer::NullBuffer;
+
+        let zone = "Europe/Paris";
+        let ty = LogicalType::Scalar(ScalarType::Timestamp {
+            unit: TimeUnit::Nanosecond, timezone: Some(zone.to_owned()),
+        }).maybe();
+        let fields = StructFields::from([("v".into(), ty.clone())]);
+        let target = to_field("v", &ty).unwrap();
+        let values = TimestampNanosecondArray::new(
+            vec![-1001, i64::MAX, 17].into(),
+            Some(NullBuffer::from(vec![true, false, true])),
+        ).with_timezone(zone);
+        let positions = (0..512).map(|row| [Some(2), None, Some(0), Some(1)][row % 4]).collect::<Vec<_>>();
+        let events = positions.iter().map(|&row| ArrowOnly(match row {
+            Some(row) => PutColumn::Stored(&target, &values, row),
+            None => PutColumn::Absent,
+        })).collect::<Vec<_>>();
+        let expected = stored(positions.into_iter().map(|row| match row {
+            Some(row) => rtdb_columnar::read_value(&target, &values, row).unwrap(),
+            None => Value::Null,
+        }).collect());
+        let reference_memory = MemoryBudget::new(8 << 20);
+        let (base, _) = super::super::event_builder(events.len(), Some(&fields), &reference_memory).unwrap();
+        let memory = MemoryBudget::new(reference_memory.used_bytes() + (32 << 10));
+        drop(base);
+        let (mut builder, _) = super::super::event_builder(events.len(), Some(&fields), &memory).unwrap();
+        let refs = events.iter().collect::<Vec<_>>();
+        assert!(super::super::columns::gather_column(&refs, &target, &ty, Some(&mut builder)).unwrap().is_none());
+        assert!(builder.try_reserve_scratch(events.len() * 128).is_none());
+        drop(builder);
+
+        for compact in [false, true] {
+            let (expected, actual) = if compact {
+                (
+                    copy_event_batch_with_recency(&expected, Some(fields.clone()), None, false).unwrap(),
+                    copy_compaction_batch(&events, Some(fields.clone()), None, false, false, &memory).unwrap(),
+                )
+            } else {
+                (
+                    super::super::owned_event_batch(&expected, Some(fields.clone()), true, &reference_memory).unwrap().batch().clone(),
+                    super::super::owned_event_batch(&events, Some(fields.clone()), true, &memory).unwrap(),
+                )
+            };
+            assert_eq!(write_stream(expected.schema_ref(), std::slice::from_ref(&expected)).unwrap(),
+                write_stream(actual.batch().schema_ref(), std::slice::from_ref(actual.batch())).unwrap());
+            let held = actual.batch().clone();
+            drop(actual);
+            assert!(memory.used_bytes() > 0);
+            drop(held);
+            assert_eq!(memory.used_bytes(), 0);
+        }
+    }
+
+    #[test]
     fn native_selection_defers_scalar_sizing_for_a_bounded_layout() {
         let ty = LogicalType::list(LogicalType::Scalar(ScalarType::I64));
         let field = to_field("v", &ty).unwrap();
@@ -1049,8 +1154,7 @@ mod tests {
 
     #[test]
     fn scalar_sizing_errors_precede_native_read_errors() {
-        let target = LogicalType::RunEndEncoded { width: RunEndWidth::I32, value: Box::new(LogicalType::Scalar(ScalarType::I64)) };
-        let fields = StructFields::from([("v".into(), target)]);
+        let integer = LogicalType::Scalar(ScalarType::I64);
         let uri = to_field("v", &LogicalType::Scalar(ScalarType::Uri)).unwrap();
         let invalid_uri = arrow_array::StringArray::from(vec!["bad uri"]);
         let bottom = to_field("v", &LogicalType::Nothing).unwrap();
@@ -1060,8 +1164,11 @@ mod tests {
             ArrowOnly(PutColumn::Stored(&bottom, &nulls, 0)),
         ];
         let memory = MemoryBudget::new(1 << 20);
-        let error = copy_compaction_batch(&events, Some(fields), None, false, false, &memory).unwrap_err();
-        assert_eq!(error.code, "xtdb/zero-leg-read");
-        assert_eq!(error.message.as_deref(), Some("The bottom type has no values to read"));
+        for target in [integer.clone(), LogicalType::RunEndEncoded { width: RunEndWidth::I32, value: Box::new(integer) }] {
+            let fields = StructFields::from([("v".into(), target)]);
+            let error = copy_compaction_batch(&events, Some(fields), None, false, false, &memory).unwrap_err();
+            assert_eq!(error.code, "xtdb/zero-leg-read");
+            assert_eq!(error.message.as_deref(), Some("The bottom type has no values to read"));
+        }
     }
 }
