@@ -169,17 +169,19 @@ impl Verifier {
 pub(super) struct Attester {
     verifier: Verifier,
     signing_key: PathBuf,
+    journal_custodian_tls: PathBuf,
 }
 
 #[cfg(unix)]
 impl Attester {
     pub(super) fn parse(mut fields: BTreeMap<String, String>) -> Result<Self> {
         let signing_key = backup_field(&mut fields, "--attestation-signing-key")?.into();
+        let journal_custodian_tls = PathBuf::from(backup_field(&mut fields, "--journal-custodian-tls-dir")?);
         let verifier = Verifier::parse(fields)?;
-        if verifier.readback.is_none() || verifier.stage_receipt.is_none() {
+        if !journal_custodian_tls.is_absolute() || verifier.readback.is_none() || verifier.stage_receipt.is_none() {
             return Err(arguments_error());
         }
-        Ok(Self { verifier, signing_key })
+        Ok(Self { verifier, signing_key, journal_custodian_tls })
     }
 
     pub(super) async fn run(self) -> Result<Value> {
@@ -189,14 +191,28 @@ impl Attester {
     }
 
     pub(super) async fn run_with_authority(self, authority: &activation::ActivationAuthority) -> Result<Value> {
-        use crate::multi::activation::operator::attestation::{Attestation, signing_key};
+        use crate::multi::activation::{
+            journal_custody::KeeperJournal,
+            operator::attestation::{Attestation, signing_key},
+        };
 
+        let candidate = self.verifier.incarnation;
+        let destination = &self.verifier.destination;
+        let reader = KeeperJournal::connect(
+            &destination.journal_url, &crate::cli::journal_credentials(&destination.journal_tls)?,
+        )?;
+        let selected = reader.selected(candidate).await?;
+        let custodian = KeeperJournal::connect(
+            &destination.journal_url, &crate::cli::journal_credentials(&self.journal_custodian_tls)?,
+        )?;
         let checked = self.verifier.verify(ReadSource::ServingNames).await?;
         let (intent, hold) = checked.intent.zip(checked.report.key_hold).ok_or_else(invalid_readback)?;
         let key = signing_key(&self.signing_key)?;
-        let proof = Attestation::sign_hosted_installation(
+        let mut proof = Attestation::sign_hosted_installation(
             authority, intent, &checked.installation, hold, checked.report.digest()?, &key,
         ).await?;
+        let retained = proof.bind_journal(selected, &key)?;
+        custodian.retain(candidate, retained).await?;
         serde_json::to_value(proof)
             .map_err(|error| Anomaly::fault("rtdb/backup-attestation", error.to_string()))
     }
@@ -291,7 +307,7 @@ mod tests {
         let authority = Uuid::new_v4();
         let cell = Uuid::new_v4();
         const AUTHORITY_PRINCIPAL: &str = "urn:logkeeper:client:backup-activation";
-        let mut authority_keepers = LocalCluster::start_replicated_catalog(&[AUTHORITY_PRINCIPAL]).await.unwrap();
+        let mut authority_keepers = LocalCluster::start_independent_catalog(&[AUTHORITY_PRINCIPAL]).await.unwrap();
         let authority_placement = authority_keepers.journal_config(64 << 20, 4 << 20);
         let authority_journal = Arc::new(authority_keepers.journal(AUTHORITY_PRINCIPAL, &authority_placement).unwrap());
         authority_journal.finalize_version(CLUSTER_VERSION_CURRENT).await.unwrap();
@@ -413,6 +429,7 @@ mod tests {
             "--readback".into(), path.display().to_string(),
         ])).chain(key.into_iter().flat_map(|path| [
             "--attestation-signing-key".into(), path.display().to_string(),
+            "--journal-custodian-tls-dir".into(), tls.display().to_string(),
         ]))).unwrap();
         let verify = |readback: Option<&Path>, receipt: &Path|
             hosted_options("verify-object-holds", readback, receipt, None).run(rtdb_storage::AppleSync::Full);
@@ -452,6 +469,11 @@ mod tests {
         let proof_json = attest(&readback).await.unwrap();
         let proof: Attestation = serde_json::from_value(proof_json.clone()).unwrap();
         assert_eq!(proof.held_key().unwrap().1, key_hold);
+        let (.., retained) = proof.held_journal().unwrap();
+        assert_eq!(
+            journal.checkpoint_custody(stream).await.unwrap().unwrap(),
+            journal_contract::CheckpointCustody { hold: retained.hold, released: false },
+        );
         let verified_readback: Readback = serde_json::from_value(result.clone()).unwrap();
         assert_eq!(proof_json["evidence"]["objects_sha256"], json!(verified_readback.digest().unwrap()));
         fs::write(&proof_path, serde_json::to_vec(&proof_json).unwrap()).unwrap();
@@ -463,6 +485,9 @@ mod tests {
             "authority_id": authority, "authority_url": authority_url, "authority_tls_dir": authority_tls,
             "operator_uids": [fs::metadata(home.path()).unwrap().uid()],
             "destination_attestors": {(cell.to_string()): attestor_public_key},
+            "destination_journal_readers": {(cell.to_string()): {
+                "journal_url": journal_url, "journal_tls_dir": tls, "require_object_custody": true,
+            }},
         })).unwrap()).unwrap();
         fs::set_permissions(&broker_config, fs::Permissions::from_mode(0o600)).unwrap();
         let broker = ActivationOptions::parse([
@@ -494,6 +519,7 @@ mod tests {
         fs::write(&altered_proof, serde_json::to_vec(&altered).unwrap()).unwrap();
         assert!(record(&altered_proof).await.is_err());
         let recorded = record(&proof_path).await.unwrap();
+        assert_eq!(recorded["installation"]["objects_sha256"], json!(verified_readback.digest().unwrap()));
         assert_eq!(record(&proof_path).await.unwrap(), recorded);
         assert_eq!(attest(&readback).await.unwrap(), proof_json);
         let release_objects = |readback: &Path, proof: &Path| MultiBackupOptions::parse([

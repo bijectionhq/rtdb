@@ -285,7 +285,7 @@ impl Attestation {
     }
 
     #[cfg(unix)]
-    pub(super) fn bind_journal(&mut self, evidence: JournalEvidence, signer: &Ed25519KeyPair) -> Result<RetainedJournal> {
+    pub(in crate::multi) fn bind_journal(&mut self, evidence: JournalEvidence, signer: &Ed25519KeyPair) -> Result<RetainedJournal> {
         let (_, hold) = self.held_key()?;
         let journal = JournalAttestation::sign(evidence, hold, signer);
         let retained = journal.retained(hold);
@@ -294,7 +294,7 @@ impl Attestation {
     }
 
     #[cfg(unix)]
-    pub(super) fn held_journal(&self) -> Result<(&Intent, RecoveryKeyHold, RetainedJournal)> {
+    pub(in crate::multi) fn held_journal(&self) -> Result<(&Intent, RecoveryKeyHold, RetainedJournal)> {
         let (intent, key) = self.held_key()?;
         let journal = self.journal.as_ref().ok_or_else(invalid)?;
         Ok((intent, key, journal.retained(key)))
@@ -331,6 +331,7 @@ impl Attestation {
             destination_cell: Some(cell),
             key_hold,
             journal_hold,
+            objects_sha256: evidence.objects_sha256,
             source_cut: SourceCut {
                 lsn: evidence.source_lsn,
                 position: evidence.source_position,

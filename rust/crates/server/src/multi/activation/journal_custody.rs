@@ -13,14 +13,14 @@ use uuid::Uuid;
 use super::{configuration, conflict, journal_error};
 use crate::multi::{CONSENSUS_SCHEME, Credentials, JournalConfig, io_error};
 
-pub(super) struct KeeperJournal {
+pub(in crate::multi) struct KeeperJournal {
     pub journal: Arc<dyn Journal>,
     pub connection_sha256: [u8; 32],
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct JournalEvidence {
+pub(in crate::multi) struct JournalEvidence {
     pub connection_sha256: [u8; 32],
     pub anchor: CheckpointAnchor,
 }
@@ -125,7 +125,7 @@ impl JournalEvidence {
 }
 
 impl KeeperJournal {
-    pub(super) fn connect(url: &str, credentials: &Credentials) -> Result<Self> {
+    pub(in crate::multi) fn connect(url: &str, credentials: &Credentials) -> Result<Self> {
         let path = Path::new(
             url.strip_prefix(CONSENSUS_SCHEME)
                 .ok_or_else(configuration)?,
@@ -149,7 +149,7 @@ impl KeeperJournal {
         })
     }
 
-    pub(super) async fn selected(&self, candidate: Uuid) -> Result<JournalEvidence> {
+    pub(in crate::multi) async fn selected(&self, candidate: Uuid) -> Result<JournalEvidence> {
         let stream = StreamId(candidate.as_u128());
         let receipt = self
             .journal
@@ -179,7 +179,7 @@ impl KeeperJournal {
         })
     }
 
-    pub(super) async fn retain(&self, candidate: Uuid, retained: RetainedJournal) -> Result<()> {
+    pub(in crate::multi) async fn retain(&self, candidate: Uuid, retained: RetainedJournal) -> Result<()> {
         let hold = self.require_connection(retained)?;
         let observed = self
             .journal

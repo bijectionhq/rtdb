@@ -1,5 +1,5 @@
 use super::{
-    ActivationAuthority, Binding, Publication, RECOVERY_INTENT_PROTOCOL, RECOVERY_JOURNAL_CUSTODY_PROTOCOL,
+    ActivationAuthority, Binding, Publication, RECOVERY_HOSTED_CUSTODY_PROTOCOL, RECOVERY_INTENT_PROTOCOL, RECOVERY_JOURNAL_CUSTODY_PROTOCOL,
     RECOVERY_KEY_CUSTODY_PROTOCOL, State, VerifiedSuccessor,
     clock, conflict, journal_custody::RetainedJournal, journal_error, unavailable,
 };
@@ -49,6 +49,8 @@ pub(crate) struct Installation {
     pub(super) key_hold: Option<rtdb_crypt::RecoveryKeyHold>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) journal_hold: Option<RetainedJournal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) objects_sha256: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -69,6 +71,8 @@ pub(super) struct Completed {
     key_hold: Option<rtdb_crypt::RecoveryKeyHold>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     journal_hold: Option<RetainedJournal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    objects_sha256: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -87,6 +91,20 @@ pub(crate) enum Status {
         installation: Installation,
         final_source_lsn: Option<Lsn>,
     },
+}
+
+fn custody_protocol(
+    key_hold: Option<rtdb_crypt::RecoveryKeyHold>,
+    journal_hold: Option<RetainedJournal>,
+    objects_sha256: Option<[u8; 32]>,
+) -> Option<u8> {
+    match (key_hold, journal_hold, objects_sha256) {
+        (None, None, None) => Some(RECOVERY_INTENT_PROTOCOL),
+        (Some(_), None, None) => Some(RECOVERY_KEY_CUSTODY_PROTOCOL),
+        (Some(_), Some(_), None) => Some(RECOVERY_JOURNAL_CUSTODY_PROTOCOL),
+        (Some(_), Some(_), Some(digest)) if digest != [0; 32] => Some(RECOVERY_HOSTED_CUSTODY_PROTOCOL),
+        _ => None,
+    }
 }
 
 impl State {
@@ -111,10 +129,8 @@ impl State {
                 && (pending.final_source_lsn.is_none() || self.grants_closed)
                 && pending.installation.is_none_or(|installation| {
                     installation.source_cut.lsn != 0
-                        && (installation.key_hold.is_none() || self.version >= RECOVERY_KEY_CUSTODY_PROTOCOL)
-                        && (installation.journal_hold.is_none() || (
-                            self.version >= RECOVERY_JOURNAL_CUSTODY_PROTOCOL && installation.key_hold.is_some()
-                        ))
+                        && custody_protocol(installation.key_hold, installation.journal_hold, installation.objects_sha256)
+                            .is_some_and(|protocol| self.version >= protocol)
                         && match pending.intent.loss_policy {
                             LossPolicy::Lossless => {
                                 pending.final_source_lsn == Some(Lsn(installation.source_cut.lsn))
@@ -126,10 +142,8 @@ impl State {
         let publication_valid = self.publication.is_some_and(|publication| {
             if let Some(completed) = publication.recovery {
                 completed.source_cut.lsn != 0
-                    && (completed.key_hold.is_none() || self.version >= RECOVERY_KEY_CUSTODY_PROTOCOL)
-                    && (completed.journal_hold.is_none() || (
-                        self.version >= RECOVERY_JOURNAL_CUSTODY_PROTOCOL && completed.key_hold.is_some()
-                    ))
+                    && custody_protocol(completed.key_hold, completed.journal_hold, completed.objects_sha256)
+                        .is_some_and(|protocol| self.version >= protocol)
                     && publication.predecessor.revision.checked_add(1)
                         == Some(self.binding.revision)
                     && match completed.loss_policy {
@@ -178,6 +192,7 @@ impl State {
                 source_cut: completed.source_cut,
                 key_hold: completed.key_hold,
                 journal_hold: completed.journal_hold,
+                objects_sha256: completed.objects_sha256,
             },
             final_source_lsn: completed.final_source_lsn,
         }))
@@ -361,10 +376,13 @@ impl ActivationAuthority {
             source_cut: installed.source_cut,
             key_hold: installed.key_hold,
             journal_hold: installed.journal_hold,
+            objects_sha256: installed.objects_sha256,
         };
         if installation.source_cut.lsn == 0 {
             return Err(conflict());
         }
+        let protocol = custody_protocol(installation.key_hold, installation.journal_hold, installation.objects_sha256)
+            .ok_or_else(conflict)?;
         let state = self.change(self.stream_id(name)?, |state| {
             let state = state.ok_or_else(unavailable)?;
             let published = state.publication_status(operation)?;
@@ -383,7 +401,7 @@ impl ActivationAuthority {
                         || hold.generation.database != installed.successor
                 })
                 || installed.journal_hold.is_some_and(|held| {
-                    installed.key_hold.is_none() || held.hold.operation_id != operation.operation_id.as_u128()
+                    held.hold.operation_id != operation.operation_id.as_u128()
                         || held.connection_sha256 == [0; 32]
                 })
                 || installed.activation_scope != Some(rtdb_db::ActivationScope::for_cell(
@@ -395,7 +413,7 @@ impl ActivationAuthority {
             if let Some(Status::Published { installation: prior, .. }) = published {
                 return same_installation(prior, installation);
             }
-            if state.version >= RECOVERY_JOURNAL_CUSTODY_PROTOCOL && installation.journal_hold.is_none() {
+            if state.version >= RECOVERY_JOURNAL_CUSTODY_PROTOCOL && protocol < state.version {
                 return Err(conflict());
             }
             let mut pending = state.pending(operation)?;
@@ -412,11 +430,7 @@ impl ActivationAuthority {
             }
             pending.installation = Some(installation);
             let mut next = state.clone();
-            if installation.journal_hold.is_some() {
-                next.version = state.version.max(RECOVERY_JOURNAL_CUSTODY_PROTOCOL);
-            } else if installation.key_hold.is_some() {
-                next.version = state.version.max(RECOVERY_KEY_CUSTODY_PROTOCOL);
-            }
+            next.version = state.version.max(protocol);
             next.recovery = Some(pending);
             Ok(Some(next))
         }).await?;
@@ -526,6 +540,7 @@ impl ActivationAuthority {
                 final_source_lsn: pending.final_source_lsn,
                 key_hold: installation.key_hold,
                 journal_hold: installation.journal_hold,
+                objects_sha256: installation.objects_sha256,
             }),
         };
         clock::wait_out(
@@ -675,6 +690,7 @@ mod tests {
             destination_cell: None,
             key_hold: None,
             journal_hold: None,
+            objects_sha256: None,
             activation_scope: Some(rtdb_db::ActivationScope::new(identity, "xtdb").unwrap()),
             source_cut: SourceCut {
                 lsn,

@@ -190,7 +190,8 @@ For same-host verification, the broker account owns the stopped destination's da
 
 Register each destination's cell UUID and raw 32-byte Ed25519 public key in the broker configuration under `destination_attestors`, a JSON object keyed by cell UUID.
 Omit `destination` on an authority host that publishes solely from registered attestations.
-The authority broker and operator account have no destination journal credentials, object storage access or private signing key.
+For journal custody, give the authority broker the registered destination reader credential.
+Keep the destination writer credential, object custodian credential and private signing key on the destination side.
 Keep the Ed25519 private key in a mode-0600 PKCS#8 DER file owned by the destination verifier account. Use a separate key for each cell.
 The verifier account runs inside the destination cell and uses its read-only journal TLS principal and the stopped installation's existing data and key vault.
 
@@ -301,7 +302,14 @@ Supply `--stage-receipt FILE` to reconstruct the hold from the installed checkpo
 Save the JSON result with the archive and the custodian's recovery records.
 Pass it back with `--readback FILE` and the same archive and destination settings to reopen the recorded versions, including when a delete marker or a newer version masks a held object.
 The command checks the complete inventory and journal cut against the saved readback and obtains fresh legal-hold status from S3.
-On Unix, run `rtdb multi-backup attest` with the same archive and destination arguments, the saved readback and stage receipt, and the destination cell's protected Ed25519 PKCS8 signing key.
+On Unix, run `rtdb multi-backup attest` with the same archive and destination arguments, the saved readback and stage receipt, and the destination cell's protected Ed25519 PKCS8 signing key and its `--journal-custodian-tls-dir`.
+The hosted attestor reads the selected keeper checkpoint before reopening the serving object names.
+The original journal quorum must retain that checkpoint before the attestor issues the combined proof.
+Register the destination's journal reader with the broker and set `require_object_custody` for the cell.
+The broker confirms the exact keeper hold and records the signed object inventory digest.
+Recording hosted custody advances the name to activation protocol 7.
+Upgrade the broker and serving readers before recording hosted custody.
+Later recoveries of that name need the same three custody types.
 Use the independent activation reader configured for staging.
 The attestor requires every current object name to resolve to its recorded held version.
 It rechecks the original key hold and the pending recovery on that activation connection.

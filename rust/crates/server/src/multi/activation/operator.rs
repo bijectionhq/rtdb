@@ -156,6 +156,8 @@ type JournalReaders = BTreeMap<Uuid, JournalReader>;
 struct JournalReader {
     journal_url: String,
     journal_tls_dir: PathBuf,
+    #[serde(default)]
+    require_object_custody: bool,
 }
 
 impl JournalReader {
@@ -703,7 +705,15 @@ async fn verify_recovery_installation(
         let verified = proof.attestation.verify(&intent, proof.manifest_sha256, attestors)?;
         if !published {
             match (journals.get(&proof.cell), verified.journal_hold) {
-                (Some(reader), Some(hold)) => reader.connect()?.require_retained(verified.successor, hold).await?,
+                (Some(reader), Some(hold)) => {
+                    if reader.require_object_custody && verified.objects_sha256.is_none() {
+                        return Err(Anomaly::incorrect(
+                            "rtdb/activation-object-custody",
+                            "The registered destination requires exact provider object custody",
+                        ));
+                    }
+                    reader.connect()?.require_retained(verified.successor, hold).await?;
+                }
                 (None, None) => (),
                 _ => return Err(Anomaly::incorrect(
                     "rtdb/activation-journal-custody",
@@ -1173,6 +1183,7 @@ mod tests {
                     destination_cell: None,
                     key_hold: None,
                     journal_hold: None,
+                    objects_sha256: None,
                     source_cut: recovery::SourceCut::default(),
                     activation_scope: Some(
                         rtdb_db::ActivationScope::new(authority.identity(), &database).unwrap(),

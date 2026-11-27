@@ -19,7 +19,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 mod clock;
-mod journal_custody;
+pub(super) mod journal_custody;
 pub(crate) mod operator;
 pub(super) mod recovery;
 pub use operator::{HELP as ACTIVATION_HELP, Options as ActivationOptions};
@@ -32,6 +32,7 @@ const CELL_GRANT_PROTOCOL: u8 = 3;
 const RECOVERY_INTENT_PROTOCOL: u8 = 4;
 const RECOVERY_KEY_CUSTODY_PROTOCOL: u8 = 5;
 const RECOVERY_JOURNAL_CUSTODY_PROTOCOL: u8 = 6;
+const RECOVERY_HOSTED_CUSTODY_PROTOCOL: u8 = 7;
 const RENEW_AHEAD: Duration = Duration::from_secs(1);
 const ATTEMPTS: usize = 8;
 
@@ -117,6 +118,7 @@ pub struct VerifiedSuccessor {
     destination_cell: Option<Uuid>,
     key_hold: Option<rtdb_crypt::RecoveryKeyHold>,
     journal_hold: Option<journal_custody::RetainedJournal>,
+    objects_sha256: Option<[u8; 32]>,
     source_cut: recovery::SourceCut,
 }
 
@@ -130,6 +132,7 @@ impl VerifiedSuccessor {
             destination_cell: None,
             key_hold: None,
             journal_hold: None,
+            objects_sha256: None,
             source_cut: recovery::SourceCut {
                 lsn: installed.source_lsn().0,
                 position: installed.source_basis().position(),
@@ -557,7 +560,7 @@ impl ActivationAuthority {
                 return Err(corrupt());
             }
             let state: State = serde_json::from_slice(bytes).map_err(|_| corrupt())?;
-            if !matches!(state.version, ABSOLUTE_GRANT_PROTOCOL | ELAPSED_GRANT_PROTOCOL | CELL_GRANT_PROTOCOL | RECOVERY_INTENT_PROTOCOL | RECOVERY_KEY_CUSTODY_PROTOCOL | RECOVERY_JOURNAL_CUSTODY_PROTOCOL)
+            if !matches!(state.version, ABSOLUTE_GRANT_PROTOCOL | ELAPSED_GRANT_PROTOCOL | CELL_GRANT_PROTOCOL | RECOVERY_INTENT_PROTOCOL | RECOVERY_KEY_CUSTODY_PROTOCOL | RECOVERY_JOURNAL_CUSTODY_PROTOCOL | RECOVERY_HOSTED_CUSTODY_PROTOCOL)
                 || state.destination_cell().is_some_and(|cell| cell.is_nil() || state.version < CELL_GRANT_PROTOCOL)
                 || state.binding.incarnation.is_nil()
                 || state.binding.revision == 0
@@ -953,6 +956,7 @@ mod tests {
             destination_cell: None,
             key_hold: None,
             journal_hold: None,
+            objects_sha256: None,
             source_cut: recovery::SourceCut::default(),
             activation_scope: Some(rtdb_db::ActivationScope::new(authority.identity(), "xtdb").unwrap()),
         };
@@ -1008,6 +1012,7 @@ mod tests {
             destination_cell: None,
             key_hold: None,
             journal_hold: None,
+            objects_sha256: None,
             source_cut: recovery::SourceCut::default(),
             activation_scope: Some(rtdb_db::ActivationScope::new(identity, "xtdb").unwrap()),
         };
