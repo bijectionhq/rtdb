@@ -48,22 +48,26 @@ pub(super) fn construct(expr: &Expr, schema: &Schema, batch: &ColumnBatch, conte
 {
     let Expr::Call { name, args, return_type } = expr else { return Ok(None); };
     if name != "period" || !is_period(return_type) { return Ok(None); }
-    let [Expr::Column { id: lower, .. }, Expr::Column { id: upper, .. }] = args.as_slice() else { return Ok(None); };
-    let (Some(lower), Some(upper)) = (schema.position(*lower), schema.position(*upper)) else { return Ok(None); };
-    if [lower, upper].into_iter().any(|position| {
-        let ty = &schema.fields()[position].data_type;
-        *ty != LogicalType::Null && !is_zoned_micros(ty)
-    }) {
-        return Ok(None);
-    }
+    let [lower, upper] = args.as_slice() else { return Ok(None); };
+    let bind_endpoint = |expr: &Expr| match expr {
+        Expr::Column { id, .. } => {
+            let position = schema.position(*id)?;
+            let ty = &schema.fields()[position].data_type;
+            let column = batch.columns.get(position)?;
+            (*ty == LogicalType::Null || is_zoned_micros(ty)).then_some(Some(column))
+        }
+        Expr::Literal(Value::Null | Value::Undefined) => Some(None),
+        _ => None,
+    };
+    let (Some(lower), Some(upper)) = (bind_endpoint(lower), bind_endpoint(upper)) else { return Ok(None); };
     let length = batch.len.checked_mul(2).ok_or_else(size_error)?;
     let bytes = length.checked_mul(size_of::<i64>()).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size_error)?;
     let mut owner = context.memory.reserve(bytes)?;
     let mut endpoints = Vec::with_capacity(length);
     for row in 0..batch.len {
         context.check_cancelled_at(row)?;
-        let (Some(lower), Some(upper)) = (timestamp_ticks(&batch.columns[lower], row), timestamp_ticks(&batch.columns[upper], row))
-            else { return Ok(None); };
+        let read = |column: Option<&Column>| column.map_or(Some(None), |column| timestamp_ticks(column, row));
+        let (Some(lower), Some(upper)) = (read(lower), read(upper)) else { return Ok(None); };
         let lower = lower.unwrap_or(i64::MIN);
         let upper = upper.unwrap_or(i64::MAX);
         if lower >= upper { return Ok(None); }
@@ -180,4 +184,40 @@ fn settle(column: Column, owner: &mut Arc<MemoryReservation>) -> Result<Column> 
     let retained = owned_projection_bytes(&column)?;
     if retained <= lease.bytes() { lease.shrink_to(retained)?; } else { lease.grow_to(retained)?; }
     Ok(column)
+}
+
+#[test]
+fn period_projection_writes_arrow_with_a_literal_unbounded_endpoint() {
+    use rtdb_columnar::MemoryBudget;
+    use rtdb_plan::{ColumnId, Field};
+    use rtdb_storage::{MemoryStore, cache::BufferPool};
+    use rtdb_types::Timestamp;
+    use tokio_util::sync::CancellationToken;
+
+    let memory = MemoryBudget::new(1 << 20);
+    let catalog = crate::CatalogSnapshot::new("xtdb", [("xtdb".into(), crate::DatabaseSnapshot {
+        partitions: vec![],
+        storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)),
+    })].into(), false).unwrap();
+    let context = QueryContext::new(catalog, Arc::clone(&memory), Timestamp(0), "UTC", Default::default(),
+        &CancellationToken::new()).unwrap();
+    let ty = LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) }).maybe();
+    let input = Field { id: ColumnId(0), name: "endpoint".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: ty.clone() };
+    let schema = Schema::new(vec![input.clone()]).unwrap();
+    let array = TimestampMicrosecondArray::from(vec![Some(7), None]).with_timezone("UTC");
+    let field = Arc::new(rtdb_columnar::to_field("endpoint", &ty).unwrap());
+    let batch = ColumnBatch::settled(vec![Column::Arrow { array: Arc::new(array), field, logical: Some(ty) }],
+        2, memory.reserve(4096).unwrap()).unwrap();
+
+    for (args, expected) in [
+        (vec![input.expression(), Expr::Literal(Value::Null)], (7, i64::MAX)),
+        (vec![Expr::Literal(Value::Null), input.expression()], (i64::MIN, 7)),
+    ] {
+        let period = Expr::Call { name: "period".into(), args,
+            return_type: Value::TimestampTzRange { lower: i64::MIN, upper: i64::MAX }.logical_type() };
+        let (column, _owner) = construct(&period, &schema, &batch, &context).unwrap().unwrap();
+        assert!(matches!(column, Column::Arrow { .. }));
+        assert_eq!(bounds(&column, 0), Some(Some(expected)));
+        assert_eq!(bounds(&column, 1), Some(Some((i64::MIN, i64::MAX))));
+    }
 }
