@@ -437,15 +437,48 @@ impl SourceTransaction {
     }
     // arrow-flow-end
 
-    pub fn encode(&self) -> Result<RetainedBytes> {
+    /// Checks a Classic submission before append for ordinal dense-union encoding eligibility.
+    /// For keyed and bounded retries, both encodings must yield the same digest after ordered source decoding.
+    pub fn check_classic_sql_argument_normalization(&self) -> Result<()> {
+        let refused = |message| Anomaly::unsupported("rtdb.tx/sql-argument-normalization", message);
+        if self.placed_seed.is_some() || self.prepared_landing.is_some()
+            || matches!(self.guard, Some(SourceGuard::Application(_) | SourceGuard::Replay(_)))
+            || self.operations.iter().any(Operation::is_owned)
+        {
+            return Err(refused("This transaction requires its original source encoding"));
+        }
+        if self.operations.iter().any(|operation| matches!(operation,
+            Operation::Public(TxOp::SqlBytes { arg_bytes, .. }) if !arg_bytes.as_slice().is_empty()))
+        {
+            return Err(refused("SQL argument bytes require their original encoding"));
+        }
+        if self.guard.is_none() && self.idempotency_key().is_none() {
+            return self.validate_bounded_retry_guard();
+        }
+
+        let replay_digest = |purpose| {
+            let encoded = self.encode_for(purpose)?;
+            let _envelope = self.memory.reserve(self.source_envelope_bound()?)?;
+            let message = SourceMessage::decode_bytes(encoded.into_bytes())?
+                .ok_or_else(|| invalid("Encoded source transaction has no message"))?;
+            Self::decode(&message, &self.memory)?.body_digest()
+        };
+        if replay_digest(SourcePurpose::Log)? != replay_digest(SourcePurpose::ClassicLog)? {
+            return Err(refused("Ordinal SQL arguments change the receipt digest after source replay"));
+        }
+        Ok(())
+    }
+
+    fn validate_bounded_retry_guard(&self) -> Result<()> {
         let bounded = BoundedRetry::from_metadata(self.options.user_metadata.as_ref())?;
         let attached = match &self.guard { Some(SourceGuard::Bounded(retry)) => Some(*retry), _ => None };
         if bounded != attached {
             return Err(invalid("Bounded retry cannot share another retry guard"));
         }
-        let prefix = matches!(self.guard, Some(SourceGuard::Replay(_) | SourceGuard::Bounded(_))).then(|| {
-            Operation::Public(TxOp::Sql { sql: LEGACY_REPLAY_ABORT.into(), args: None })
-        });
+        Ok(())
+    }
+
+    pub fn encode(&self) -> Result<RetainedBytes> {
         // Retry resolution hashes the decoded argument stream, and placed reservations commit to the source bytes.
         let purpose = if self.guard.is_none() && self.placed_seed.is_none() && self.idempotency_key().is_none()
             && !self.operations.iter().any(Operation::is_owned)
@@ -454,13 +487,25 @@ impl SourceTransaction {
         } else {
             SourcePurpose::Log
         };
+        self.encode_for(purpose)
+    }
+
+    fn source_envelope_bound(&self) -> Result<usize> {
+        self.options.default_tz.capacity().checked_add(self.options.user.as_ref().map_or(0, String::capacity))
+            .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)
+    }
+
+    fn encode_for(&self, purpose: SourcePurpose) -> Result<RetainedBytes> {
+        self.validate_bounded_retry_guard()?;
+        let prefix = matches!(self.guard, Some(SourceGuard::Replay(_) | SourceGuard::Bounded(_))).then(|| {
+            Operation::Public(TxOp::Sql { sql: LEGACY_REPLAY_ABORT.into(), args: None })
+        });
         let batch = self.operation_batch(prefix.as_ref(), purpose)?;
         let mut output = crate::ipc::Output::new(&self.memory, SOURCE_PREFIX_SPACE)?;
         output.write_stream(batch.batch().schema_ref(), [batch.batch()])?;
         let ops_len = output.len() - SOURCE_PREFIX_SPACE;
         let metadata = self.options.user_metadata.as_ref().map(|metadata| encode_metadata(metadata, &self.memory)).transpose()?;
-        let body_size = self.options.default_tz.capacity().checked_add(self.options.user.as_ref().map_or(0, String::capacity)).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?;
-        let _body_reservation = self.memory.reserve(body_size)?;
+        let _body_reservation = self.memory.reserve(self.source_envelope_bound()?)?;
         use rtdb_format::generated::xtdb::log::proto;
         let (idempotency_guard, replay_submission, bounded_retry) = match &self.guard {
             Some(SourceGuard::Application(guard)) => (Some(proto::IdempotencyGuard {
@@ -3818,7 +3863,7 @@ mod tests {
     #[test]
     fn classic_sql_replay_uses_ordinal_tags_without_changing_retry_source_bytes() {
         use arrow_array::{Int64Array, NullArray, StringArray};
-        use rtdb_types::PlacedAttemptScope;
+        use rtdb_types::{PlacedAttemptScope, PlacedReservation};
 
         let memory = budget();
         let legs = UnionFields::try_new([42, 3, 17], [
@@ -3851,6 +3896,9 @@ mod tests {
 
         let classic = request(typed.clone(), None);
         let legacy = request(old.clone(), None);
+        assert!(classic.check_classic_sql_argument_normalization().is_ok());
+        assert_eq!(legacy.check_classic_sql_argument_normalization().unwrap_err().code,
+            "rtdb.tx/sql-argument-normalization");
         assert_eq!(classic.encode().unwrap().as_slice()[0], PROTOBUF_LOG_HEADER);
         assert_eq!(classic.body_digest().unwrap(), legacy.body_digest().unwrap());
 
@@ -3902,12 +3950,36 @@ mod tests {
             ]
         };
         for (source, legacy) in cases(typed).into_iter().zip(cases(old)) {
-            assert_eq!(source.encode().unwrap().as_slice(), legacy.encode().unwrap().as_slice());
+            let existing = source.encode().unwrap();
+            assert_eq!(existing.as_slice(), legacy.encode().unwrap().as_slice());
             let digest = legacy.body_digest().unwrap();
             assert_eq!(source.body_digest().unwrap(), digest);
             let replayed = roundtrip(&source);
             assert_eq!(replayed.body_digest().unwrap(), digest);
             assert_eq!(rows(replayed, [42, 3, 17], &[42, 3, 17, 42][..]), expected);
+
+            let refusal = source.check_classic_sql_argument_normalization().unwrap_err();
+            assert_eq!(refusal.code, "rtdb.tx/sql-argument-normalization");
+            let ordinal = source.encode_for(SourcePurpose::ClassicLog).unwrap();
+            assert_ne!(ordinal.as_slice(), existing.as_slice());
+            let message = SourceMessage::decode(ordinal.as_slice()).unwrap().unwrap();
+            let ordinal_readback = SourceTransaction::decode(&message, &memory).unwrap();
+            assert_ne!(ordinal_readback.body_digest().unwrap(), digest);
+            match &source.guard {
+                None | Some(SourceGuard::Bounded(_)) if source.placed_seed.is_none() => {
+                    assert_eq!(refusal.message.as_deref(), Some("Ordinal SQL arguments change the receipt digest after source replay"));
+                    assert!(ordinal_readback.check_classic_sql_argument_normalization().is_ok());
+                }
+                _ => assert_eq!(refusal.message.as_deref(), Some("This transaction requires its original source encoding")),
+            }
+            if let Some(attempt) = source.placed_attempt(SourcePosition(7)).unwrap() {
+                assert_eq!(ordinal_readback.placed_attempt(SourcePosition(7)).unwrap(), Some(attempt));
+                let before = PlacedReservation::new(attempt, Timestamp(1), existing.as_slice());
+                let after = PlacedReservation::new(attempt, Timestamp(1), ordinal.as_slice());
+                assert_eq!(PlacedReservation::decode(&before.encode()).unwrap(), before);
+                assert_ne!(before.commitment, after.commitment);
+            }
+            assert_eq!(rows(ordinal_readback, [0, 1, 2], &[0, 1, 2, 0][..]), expected);
         }
     }
 

@@ -531,6 +531,8 @@ variant TxMessage : SourceMessage {
     -- An unguarded Classic append without a retry key or placed attempt writes dense union tags from a uniform Arrow argument upload as child ordinals, including nested unions.
     -- Receipt encoding and the source encoding of keyed, guarded and placed transactions preserve the explicit type IDs in uniform Arrow argument uploads.
     -- Source replay accepts existing argument streams with explicitly declared non-ordinal type IDs.
+    -- The read-only ordinal-argument eligibility check for keyed and bounded retries requires the existing and candidate source records to yield the same receipt digest after source decoding.
+    -- The check refuses placed attempts, owned operations, application and private replay guards, and nonempty opaque SQL argument bytes.
     -- A uniformly typed upload can reuse its sole populated page of null-free numeric vectors with unannotated fields for a single source IPC batch.
     -- When a source operation leg has one populated cell from typed SQL arguments, the binary column can adopt the encoded stream as its values buffer.
     -- The encoder writes the operation IPC into the retained source record with the same protobuf field order and framing.
@@ -1251,6 +1253,7 @@ rule LeaderProcessesTx {
         -- An elapsed identity cannot become admissible after a clock regression or after removal of its aged-out receipt.
         -- The first admitted terminal outcome installs its receipt in the same replica frame as its transaction result, including an abort.
         -- Receipt hashing gathers compatible document columns in Arrow and preserves the historical transaction body bytes.
+        -- A uniform typed SQL argument upload can carry the same values under different dense union tags and yield distinct receipt digests.
         -- A same-body retry links to that exact outcome; a different body fails with a conflict.
         -- A reader using the first receipt returns the original committed or aborted result.
         -- An invalid valid-time interval reports its two bounds as instants in the transaction failure and the durable error.

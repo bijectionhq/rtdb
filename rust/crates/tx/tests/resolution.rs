@@ -1080,6 +1080,105 @@ async fn a_bounded_identity_survives_a_writer_epoch_change_but_is_local_to_its_p
 }
 
 #[tokio::test]
+async fn historical_union_tags_distinguish_retry_bodies_after_replica_replay() {
+    use arrow_array::{Array, ArrayRef, Int64Array, ListArray, RecordBatch, StringArray, UnionArray};
+    use arrow_buffer::OffsetBuffer;
+    use arrow_schema::{DataType, Field, UnionFields};
+    use rtdb_columnar::OwnedBatch;
+    use rtdb_format::envelope::{ReplicaBody, ReplicaEnvelope, SourceMessage};
+    use rtdb_types::{Term, TermSequence};
+
+    let context = context();
+    for bounded in [false, true] {
+        let metadata = if bounded {
+            (BOUNDED_RETRY_METADATA_KEY, Value::Struct(StructFields::from([
+                ("nonce".into(), Value::Utf8("a0000000000000000000000000000001".into())),
+                ("not_after_micros".into(), Value::I64(200)),
+            ])))
+        } else {
+            ("idempotency_key", Value::Utf8("historical-union".into()))
+        };
+        let metadata = UserMetadata::new(Value::Struct(StructFields::from([
+            (metadata.0.into(), metadata.1),
+        ])), &context.memory).unwrap();
+        let source = |ids: [i8; 2]| {
+            let legs = UnionFields::try_new(ids, [
+                Field::new("i64", DataType::Int64, false),
+                Field::new("utf8", DataType::Utf8, false),
+            ]).unwrap();
+            let items = UnionArray::try_new(legs, ids.to_vec().into(), Some(vec![0, 0].into()), vec![
+                Arc::new(Int64Array::from(vec![7])),
+                Arc::new(StringArray::from(vec!["tag"])),
+            ]).unwrap();
+            let item = Arc::new(Field::new("item", items.data_type().clone(), true));
+            let list = ListArray::new(item, OffsetBuffer::new(vec![0, 2].into()), Arc::new(items), None);
+            let page = RecordBatch::try_from_iter([
+                ("id", Arc::new(Int64Array::from(vec![1])) as ArrayRef),
+                ("payload", Arc::new(list)),
+            ]).unwrap();
+            let page = OwnedBatch::new(page, &context.memory).unwrap();
+            let arguments = SqlArguments::from_arrow(page, &context.memory).unwrap();
+            SourceTransaction::new(vec![TxOp::Sql {
+                sql: "INSERT INTO docs (_id, v) SELECT $1, CARDINALITY($2)".into(), args: Some(arguments),
+            }], SubmitOptions { user_metadata: Some(metadata.clone()), ..Default::default() }, &context.memory).unwrap()
+        };
+        let custom = [42, 3];
+        let ordinal = [0, 1];
+        assert_eq!(source(custom).check_classic_sql_argument_normalization().unwrap_err().code,
+            "rtdb.tx/sql-argument-normalization");
+        assert!(source(ordinal).check_classic_sql_argument_normalization().is_ok());
+        let readback = |ids| {
+            let bytes = source(ids).encode().unwrap().into_bytes();
+            let message = SourceMessage::decode_bytes(bytes).unwrap().unwrap();
+            SourceTransaction::decode(&message, &context.memory).unwrap()
+        };
+
+        for (original, alternative) in [(custom, ordinal), (ordinal, custom)] {
+            let state = PartitionState::empty(Default::default()).unwrap();
+            let mut leader = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+            let first = leader.resolve_source(state.snapshot(), SourcePosition(0), Timestamp(100), readback(original), &context).await.unwrap();
+            assert!(first.result().committed(), "{:?}", first.result().error());
+            let write = first.writes().tables()[&table()].batch().unwrap();
+            let StoredOperation::Put(row) = write.view().read_event(0).unwrap().operation else { panic!("expected a put"); };
+            assert_eq!(row["v"], Value::I32(2));
+
+            let replica = first.to_replica_body(&context.memory).unwrap();
+            let wire = ReplicaEnvelope { term: Term(1), term_sequence: Some(TermSequence(1)), message: replica.body().clone() }.encode();
+            let ReplicaBody::ResolvedTx(frame) = ReplicaEnvelope::decode(&wire).unwrap().unwrap().message else {
+                panic!("expected a resolved transaction");
+            };
+            let replayed = decode_replica(&frame, None, state.snapshot().block_index(), &context.memory).unwrap();
+            let key = replayed.result.tx_key();
+            assert_eq!(key, first.result().tx_key());
+            state.apply(&replayed.writes).unwrap();
+            let mut successor = TxResolver::new(Some(key), SourcePosition(0), None, &context.memory).unwrap();
+            let mut retry = async |position, time, ids| {
+                let resolved = successor.resolve_source(state.snapshot(), SourcePosition(position), Timestamp(time), readback(ids), &context).await.unwrap();
+                state.apply(successor.take_head().unwrap().writes()).unwrap();
+                assert!(!resolved.writes().tables().contains_key(&table()));
+                resolved
+            };
+
+            let different = retry(1, 101, alternative).await;
+            assert_eq!(different.result().error().unwrap().code, "rtdb/idempotency-conflict");
+            let duplicate = retry(2, 102, original).await;
+            let error = duplicate.result().error().unwrap();
+            if bounded {
+                assert_eq!(bounded_retry_original(error).unwrap(), Some(key));
+                for (position, time) in [(3, 200), (4, 103)] {
+                    let expired = retry(position, time, original).await;
+                    assert_eq!(expired.result().error().unwrap().code, "rtdb/idempotency-expired");
+                }
+            } else {
+                assert_eq!(error.code, "rtdb/idempotency-duplicate");
+                assert_eq!(error.context["original-tx-id"], key.tx_id.0);
+                assert_eq!(error.context["original-system-time-micros"], key.system_time.0);
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn a_retry_identity_answers_its_own_body_and_refuses_another_within_its_window() {
     let state = PartitionState::empty(Default::default()).unwrap();
     let context = context();
