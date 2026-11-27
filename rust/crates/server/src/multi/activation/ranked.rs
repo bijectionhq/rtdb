@@ -79,6 +79,28 @@ impl State {
 }
 
 impl ActivationAuthority {
+    #[cfg(any(feature = "s3", all(test, feature = "backup-object-holds")))]
+    pub(in crate::multi) async fn open_ranked_writer(
+        &self,
+        name: &str,
+        incarnation: Uuid,
+        config: &rtdb_s3::S3Config,
+        io: std::sync::Arc<rtdb_storage::IoRegion>,
+    ) -> Result<Option<std::sync::Arc<dyn rtdb_storage::ranked_admission::RankedAdmissionWriter>>> {
+        let (_, state) = self.read(self.stream_id(name)?).await?;
+        let Some(state) = state.filter(|state| state.binding.incarnation == incarnation && !state.grants_closed) else {
+            return Ok(None);
+        };
+        let Some(provider) = state.ranked.and_then(|ranked| ranked.provider) else {
+            return Ok(None);
+        };
+        if state.destination_cell() != self.serving_cell || provider_id(config)? != provider {
+            return Err(provider_unavailable());
+        }
+        let admission = open_provider(config, self.ranked_scope(name, &state)?, io).await?;
+        Ok(Some(std::sync::Arc::new(admission)))
+    }
+
     pub(super) async fn ranked_commissioning_scope(
         &self,
         name: &str,
@@ -409,12 +431,109 @@ mod tests {
         recovery::{Intent, LossPolicy, SourceCut},
     };
 
-    #[cfg(any(feature = "s3", feature = "backup-object-holds"))]
-    #[tokio::test]
+    #[cfg(feature = "backup-object-holds")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "requires a disposable S3-compatible loopback bucket"]
-    async fn ranked_broker_reads_the_original_catalogues_after_source_loss() {
-        use rtdb_format::journal::{ObjectId, ObjectKind, RankedCatalog};
+    async fn ranked_writer_exports_and_the_broker_reconciles_after_keepers_stop() {
+        use std::{collections::BTreeSet, net::Ipv4Addr};
 
+        use bytes::Bytes;
+        use rtdb_crypt::FileKms;
+        use rtdb_db::{MultiDatabase, MultiOptions, PortableBackup, Role, WritePipeline};
+        use rtdb_node::{Clock, SystemClock};
+        use rtdb_tx::transact::{Cell, Op, Outcome, Row, Transact};
+        use rtdb_types::{EntityId, MemoryBudget, TableRef, rtdb_v1::MAIN_BRANCH};
+        use stream_logkeeper::stream::consensus::{CLUSTER_VERSION_CURRENT, testing::LocalCluster};
+
+        let config = test_provider();
+        let directory = tempfile::tempdir().unwrap();
+        let authority = ActivationAuthority::open_local(&directory.path().join("authority"), Uuid::new_v4()).unwrap();
+        let binding = authority.bootstrap("xtdb", Uuid::new_v4()).await.unwrap();
+        let providers = Providers(BTreeMap::from([("archive".to_owned(), config.clone())]));
+        providers.commission(&authority, "xtdb", binding, "archive").await.unwrap();
+        let io = rtdb_storage::IoRegion::new();
+        let root = rtdb_storage::ObjectKey::new("multi").unwrap();
+        let store = config.open(&root, &BTreeMap::new(), io.clone()).await.unwrap();
+        let ranked = authority.open_ranked_writer("xtdb", binding.incarnation, &config, io.clone())
+            .await.unwrap().unwrap();
+        let vault = directory.path().join("keys");
+        FileKms::create_directory(&vault).unwrap();
+        let keys: Arc<dyn rtdb_crypt::Kms> = Arc::new(FileKms::open(&vault, || SystemClock.now().0).unwrap());
+        const PRINCIPAL: &str = "urn:logkeeper:client:ranked-writer";
+        let mut keepers = LocalCluster::start_replicated_catalog(&[PRINCIPAL]).await.unwrap();
+        let placement = keepers.journal_config(64 << 20, 4 << 20);
+        let journal = Arc::new(keepers.journal(PRINCIPAL, &placement).unwrap());
+        journal.finalize_version(CLUSTER_VERSION_CURRENT).await.unwrap();
+        let node = Ipv4Addr::LOCALHOST.into();
+        let mut database = MultiDatabase::new(MultiOptions {
+            database: binding.incarnation,
+            node,
+            lease_micros: 10_000_000,
+            drift_micros: 1_000,
+        }, journal, store, keys.clone(), Arc::new(|| SystemClock.now())).unwrap()
+            .with_immutable_journal()
+            .with_activation_scope(authority.scope("xtdb").unwrap()).unwrap()
+            .with_serving_authority(authority.serving_authority("xtdb", binding.incarnation).unwrap())
+            .with_ranked_admission(ranked).unwrap();
+        database.create().await.unwrap();
+        assert!(matches!(database.tick(&BTreeSet::from([node])).await.unwrap(), Role::Writer(_)));
+        let receipt = database.transact(&Transact {
+            custody_request_digest: None,
+            request_memory: None,
+            key: vec![17; 16],
+            require: vec![],
+            window: Default::default(),
+            guards: vec![],
+            requires: vec![],
+            otherwise: vec![],
+            ops: vec![Op::Put {
+                branch: MAIN_BRANCH.into(),
+                table: TableRef::new("public", "docs"),
+                if_absent: false,
+                rows: vec![Row {
+                    id: EntityId::Integer(1),
+                    valid: None,
+                    custody_group: None,
+                    protected_columns: vec![],
+                    custody_payload: None,
+                    cells: rtdb_types::StructFields::from([("value".into(), Cell::Value(rtdb_types::Value::I64(1)))]),
+                }],
+            }],
+        }).await.unwrap();
+        assert_eq!(receipt.outcome, Outcome::Then);
+        let build = database.ranked_build().unwrap().unwrap();
+        let database = Arc::new(tokio::sync::Mutex::new(database));
+        let pipeline = WritePipeline::start(database.clone());
+        let memory = MemoryBudget::new(32 << 20);
+        pipeline.publish_ranked_catalog(build, vec![1], vec![Bytes::from_static(b"index")], memory.clone()).await.unwrap();
+        let cut = database.lock().await.fresh_index().await.unwrap().head();
+        let publication = database.lock().await.ranked_publication(cut).unwrap();
+        assert_eq!(publication.open(&memory).await.unwrap().files[0].0.as_ref(), b"index");
+        let archive = database.lock().await.portable_backup().await.unwrap();
+        let verified = PortableBackup::verify(&archive.into_bytes(), keys).await.unwrap();
+        assert_eq!(verified.source_basis(), receipt.basis);
+        assert_eq!(verified.source_receipt(&[17; 16]).await.unwrap().basis, receipt.basis);
+        pipeline.shutdown().await.unwrap();
+        drop(pipeline);
+        drop(database);
+        io.close_and_wait().await;
+        keepers.shutdown().await.unwrap();
+
+        let operation = Operation { predecessor: binding, operation_id: Uuid::new_v4() };
+        authority.begin_recovery("xtdb", Intent {
+            operation,
+            destination_cell: None,
+            loss_policy: LossPolicy::AcceptUnknownTail,
+        }, None).await.unwrap();
+        providers.freeze(&authority, "xtdb", operation).await.unwrap();
+        let outcome = providers.outcomes(&authority, "xtdb", operation, 0).await.unwrap();
+        assert_eq!(outcome["scope"]["admitted"], 1);
+        assert_eq!(outcome["catalogues"][0]["position"], receipt.basis.position());
+        assert_eq!(outcome["catalogues"][0]["system_time"], receipt.system_time.0);
+    }
+
+    #[cfg(any(feature = "s3", feature = "backup-object-holds"))]
+    fn test_provider() -> rtdb_s3::S3Config {
         let endpoint = std::env::var("RTDB_BACKUP_HOLD_TEST_ENDPOINT").unwrap();
         assert_eq!(url::Url::parse(&endpoint).unwrap().host_str(), Some("127.0.0.1"));
         let bucket = std::env::var("RTDB_BACKUP_HOLD_TEST_BUCKET").unwrap();
@@ -422,6 +541,16 @@ mod tests {
         let mut config = rtdb_s3::S3Config::new(bucket);
         config.endpoint = Some(endpoint);
         config.region = Some("us-east-1".into());
+        config
+    }
+
+    #[cfg(any(feature = "s3", feature = "backup-object-holds"))]
+    #[tokio::test]
+    #[ignore = "requires a disposable S3-compatible loopback bucket"]
+    async fn ranked_broker_reads_the_original_catalogues_after_source_loss() {
+        use rtdb_format::journal::{ObjectId, ObjectKind, RankedCatalog};
+
+        let config = test_provider();
         let data = tempfile::tempdir().unwrap();
         let identity = Uuid::new_v4();
         let path = data.path().join("authority");

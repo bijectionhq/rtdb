@@ -2,6 +2,25 @@ use rtdb_format::journal::RankedCatalog;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RankedAttempt {
+    pub epoch: u64,
+    pub position: u64,
+    pub system_time: i64,
+    pub key_generation: u64,
+}
+
+impl From<RankedCatalog> for RankedAttempt {
+    fn from(catalogue: RankedCatalog) -> Self {
+        Self {
+            epoch: catalogue.manifest.epoch,
+            position: catalogue.position,
+            system_time: catalogue.system_time,
+            key_generation: catalogue.key_generation,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RankedAdmissionScope {
@@ -21,4 +40,13 @@ pub struct ClosedRankedAdmission {
 pub struct RankedAdmissionPage {
     pub catalogues: Vec<RankedCatalog>,
     pub next_after: Option<u64>,
+}
+
+#[async_trait::async_trait]
+pub trait RankedAdmissionWriter: Send + Sync {
+    fn scope(&self) -> RankedAdmissionScope;
+
+    async fn prepared(&self, attempt: RankedAttempt) -> rtdb_types::Result<Option<RankedCatalog>>;
+
+    async fn admit(&self, catalogue: RankedCatalog) -> rtdb_types::Result<()>;
 }

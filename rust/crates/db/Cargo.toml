@@ -12,6 +12,7 @@ journal-contract.workspace = true
 rtdb-crypt = { path = "../crypt" }
 rtdb-format.workspace = true
 rtdb-index.workspace = true
+rtdb-storage.workspace = true
 rtdb-store = { path = "../store" }
 rtdb-tx.workspace = true
 rtdb-types.workspace = true
@@ -25,7 +26,6 @@ uuid.workspace = true
 [dev-dependencies]
 async-trait.workspace = true
 rtdb-logkeeper = { workspace = true, features = ["simulation"] }
-rtdb-storage.workspace = true
 stream-logkeeper = { workspace = true, features = ["consensus-testing"] }
 tempfile.workspace = true
 

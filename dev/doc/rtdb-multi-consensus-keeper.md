@@ -197,6 +197,12 @@ rtdb multi-activation commission-ranked xtdb --authority-socket "$SOCKET" --prov
   --expected-incarnation "$PREDECESSOR" --expected-revision "$REVISION"
 ```
 
+Reopen the native S3-backed writer after commissioning so it loads the binding.
+Its serving object allocation must match the commissioned provider.
+The writer records the exact catalogue at that provider before publishing the catalogue to its journal.
+If a retry uses the same cut and writer epoch, it continues with the manifest already prepared at the provider.
+A replacement writer can rebuild the cut under its own epoch, and the provider retains each admitted outcome.
+
 For a commissioned ranked scope, `freeze-recovery` first closes activation grants and then closes admission at the original provider. Publication requires the resulting closure receipt. If the provider is unavailable, restore access and retry freeze with the same binding and operation ID. Replacing a pending recovery operation for the same predecessor preserves its closure. Commission the successor separately if it needs ranked publication.
 
 Use `ranked-outcomes` on the pending or published recovery to page through the original provider's admitted catalogues, including entries whose source operation IDs were lost. Pass the returned `next_after` value as `--after` until the response ends the scan.
@@ -462,7 +468,9 @@ Withdraw access to the uncommissioned predecessor's endpoints before publishing 
 
 Existing inline archives remain readable.
 Archives with files cover ordinary checkpoint attachments within the archive size limit and the current source key generation.
-Active pins, files retained only through pin history, transaction object inventories, ranked catalogues, protected custody, and scoped or funded receipts require a separate portable transfer.
+Active pins, files retained only through pin history, transaction object inventories, protected custody, and scoped or funded receipts require a separate portable transfer.
+Ranked catalogues are rebuilt in the successor from the transferred database state.
+Recovery reconciles their admissions at the original ranked provider.
 The export refuses incomplete erasure and key rotation.
 The command stages a destination cut for local rehearsal; a shared database name requires its own activation decision and predecessor fence.
 

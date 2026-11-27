@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{RemoteStore, provider_error};
+use crate::ranked_admission::{RankedAdmissionWriter, RankedAttempt};
 use crate::{IoRegion, ObjectKey};
 
 const PAGE_SIZE: usize = 100;
@@ -138,18 +139,22 @@ impl RankedAdmission {
 
     async fn publish_catalogue(&self, catalogue: RankedCatalog) -> Result<u64> {
         self.check_catalogue(catalogue)?;
+        let attempt = RankedAttempt::from(catalogue);
         let encoded = Bytes::from(Record::RankedCatalog(catalogue).encode()?);
         let (initial, _) = self.root().await?;
         let mut checked = 0;
         if !initial.closed {
-            let claim = self.path.clone().join("claims").join({
-                let (position, system_time, generation) = coordinates(catalogue);
-                format!("{position:016x}-{system_time:016x}-{generation:016x}")
-            });
-            if self.create(&claim, encoded.clone()).await? {
-                checked = initial.count;
-            } else if self.read_catalogue(&claim).await? != catalogue {
-                return Err(conflicting());
+            if let Some(prior) = self.legacy_claim(attempt).await? {
+                if prior != catalogue {
+                    return Err(conflicting());
+                }
+            } else {
+                let claim = self.claim_path(attempt);
+                if self.create(&claim, encoded.clone()).await? {
+                    checked = initial.count;
+                } else if self.read_catalogue(&claim).await? != catalogue {
+                    return Err(conflicting());
+                }
             }
         }
 
@@ -157,7 +162,7 @@ impl RankedAdmission {
             let (ledger, version) = self.root().await?;
             for sequence in checked..ledger.count {
                 let admitted = self.entry(sequence + 1).await?;
-                if coordinates(admitted) == coordinates(catalogue) {
+                if RankedAttempt::from(admitted) == attempt {
                     return if admitted == catalogue {
                         Ok(sequence + 1)
                     } else {
@@ -187,6 +192,36 @@ impl RankedAdmission {
             }
         }
         Err(contention())
+    }
+
+    async fn prepared_catalogue(&self, attempt: RankedAttempt) -> Result<Option<RankedCatalog>> {
+        let (ledger, _) = self.root().await?;
+        if ledger.closed {
+            return Err(closed());
+        }
+        match self.optional_catalogue(&self.claim_path(attempt)).await? {
+            Some(catalogue) if RankedAttempt::from(catalogue) == attempt => Ok(Some(catalogue)),
+            Some(_) => Err(invalid()),
+            None => self.legacy_claim(attempt).await,
+        }
+    }
+
+    fn claim_path(&self, attempt: RankedAttempt) -> Path {
+        self.path.clone().join("claims").join(format!("{:016x}", attempt.epoch))
+            .join(cut_key(attempt))
+    }
+
+    async fn legacy_claim(&self, attempt: RankedAttempt) -> Result<Option<RankedCatalog>> {
+        let path = self.path.clone().join("claims").join(cut_key(attempt));
+        Ok(self.optional_catalogue(&path).await?.filter(|catalogue| RankedAttempt::from(*catalogue) == attempt))
+    }
+
+    async fn optional_catalogue(&self, path: &Path) -> Result<Option<RankedCatalog>> {
+        match self.read_catalogue(path).await {
+            Ok(catalogue) => Ok(Some(catalogue)),
+            Err(error) if error.category == AnomalyCategory::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     async fn close_admission(&self) -> Result<ClosedRankedAdmission> {
@@ -305,12 +340,27 @@ fn encode_root(ledger: Ledger) -> Result<Bytes> {
         .map_err(|_| invalid())
 }
 
-fn coordinates(catalogue: RankedCatalog) -> (u64, i64, u64) {
-    (
-        catalogue.position,
-        catalogue.system_time,
-        catalogue.key_generation,
-    )
+#[async_trait::async_trait]
+impl RankedAdmissionWriter for RankedAdmission {
+    fn scope(&self) -> RankedAdmissionScope {
+        self.scope
+    }
+
+    async fn prepared(&self, attempt: RankedAttempt) -> Result<Option<RankedCatalog>> {
+        let owner = self.clone();
+        self.region
+            .run_async(async move { Ok(owner.prepared_catalogue(attempt).await) })
+            .await?
+    }
+
+    async fn admit(&self, catalogue: RankedCatalog) -> Result<()> {
+        self.publish(catalogue).await.map(drop)
+    }
+}
+
+fn cut_key(attempt: RankedAttempt) -> String {
+    let RankedAttempt { position, system_time, key_generation, .. } = attempt;
+    format!("{position:016x}-{system_time:016x}-{key_generation:016x}")
 }
 
 fn invalid() -> Anomaly {
@@ -426,6 +476,33 @@ mod tests {
         wrong.commission().await.unwrap();
         wrong.close().await.unwrap();
         assert!(wrong.outcomes(closed, 0).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn ranked_admission_retries_an_exact_claim_and_admits_a_replacement_epoch() {
+        let provider = Arc::new(InMemory::new());
+        let scope = scope();
+        let writer = open(provider.clone(), scope);
+        writer.commission().await.unwrap();
+        let first = catalogue(scope, 1);
+        let attempt = RankedAttempt::from(first);
+        let legacy = writer.path.clone().join("claims").join(cut_key(attempt));
+        let encoded = Bytes::from(Record::RankedCatalog(first).encode().unwrap());
+        assert!(writer.create(&legacy, encoded).await.unwrap());
+        assert_eq!(writer.prepared(attempt).await.unwrap(), Some(first));
+        assert_eq!(writer.publish(first).await.unwrap(), 1);
+        let mut replacement = first;
+        replacement.manifest.epoch += 1;
+        replacement.manifest.digest = [9; 32];
+        let next = RankedAttempt::from(replacement);
+        assert!(writer.prepared(next).await.unwrap().is_none());
+        assert_eq!(writer.publish(replacement).await.unwrap(), 2);
+
+        let replacement_writer = open(provider, scope);
+        assert_eq!(replacement_writer.prepared(next).await.unwrap(), Some(replacement));
+        assert_eq!(replacement_writer.publish(replacement).await.unwrap(), 2);
+        let closed = replacement_writer.close().await.unwrap();
+        assert_eq!(replacement_writer.outcomes(closed, 0).await.unwrap().catalogues, [first, replacement]);
     }
 
     #[tokio::test]

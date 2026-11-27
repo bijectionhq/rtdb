@@ -4,6 +4,7 @@ use journal_contract::{Epoch, Journal, JournalError, Lsn};
 use rtdb_crypt::{Generation, Kms, tokens::TokenAuthority};
 use rtdb_format::journal::{Checkpoint, Manifest, ObjectId, ObjectKind, Pin, Record};
 use rtdb_index::branches::{BranchEffect, BranchIndex};
+use rtdb_storage::ranked_admission::RankedAdmissionWriter;
 use rtdb_store::{
     ObjectKey, ObjectStore, Reachability, StoredTokenKeys, VerifiedManifest, WriterObjects, read_manifest,
 };
@@ -145,6 +146,7 @@ pub struct MultiDatabase {
     token_keys: Arc<StoredTokenKeys>,
     tokens: TokenAuthority,
     row_custody: bool,
+    ranked_admission: Option<Arc<dyn RankedAdmissionWriter>>,
     committed: Option<Committed>,
     applied: tokio::sync::watch::Sender<u64>,
     writer: Option<Writer>,
@@ -187,6 +189,7 @@ impl MultiDatabase {
             token_keys,
             tokens,
             row_custody: false,
+            ranked_admission: None,
             committed: None,
             applied: tokio::sync::watch::channel(0).0,
             writer: None,

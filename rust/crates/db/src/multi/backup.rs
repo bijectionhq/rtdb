@@ -168,15 +168,12 @@ impl MultiDatabase {
                     return Err(Anomaly::new(AnomalyCategory::Busy, "rtdb/backup-pending-writes", "The writer is settling an admitted transaction"));
                 }
             }
-            if state.records.iter().any(|record| match record {
-                Record::Tx { objects, .. } => !objects.is_empty(),
-                Record::RankedCatalog(_) => true,
-                _ => false,
-            }) {
+            if state.records.iter().any(|record| matches!(record, Record::Tx { objects, .. } if !objects.is_empty())) {
                 return Err(backup_dependencies());
             }
             let read_epoch = writer_lease.map_or(state.epoch, |lease| lease.epoch);
-            let closure = state.reachability(&self.stream, self.store.as_ref(), read_epoch).await?;
+            let closure = state.closure_inputs().without_ranked_catalogues()
+                .resolve(&self.stream, self.store.as_ref(), read_epoch).await?;
             if closure.pins().next().is_some() || closure.contains_pinned_files() {
                 return Err(backup_dependencies());
             }

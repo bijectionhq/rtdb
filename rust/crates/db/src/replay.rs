@@ -208,6 +208,11 @@ pub(crate) struct ClosureInputs {
 }
 
 impl ClosureInputs {
+    pub(crate) fn without_ranked_catalogues(mut self) -> Self {
+        self.records.retain(|record| !matches!(record, Record::RankedCatalog(_)));
+        self
+    }
+
     pub(crate) async fn resolve(&self, stream: &Stream, store: &dyn ObjectStore, epoch: Epoch) -> Result<Reachability> {
         closure(stream, store, epoch, self.base.as_ref(), &self.records).await
     }

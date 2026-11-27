@@ -254,6 +254,8 @@ impl MultiRuntime {
             checkpoints: config.multi_checkpoints.with_deferred_default(local_journal),
             journal_settings: config.multi_journal,
             activation,
+            #[cfg(feature = "s3")]
+            ranked_provider: None,
             offline_scope,
             _journal_lock: writer_lock,
         };
@@ -384,6 +386,7 @@ impl MultiRuntime {
             checkpoints: config.multi_checkpoints,
             journal_settings: config.multi_journal,
             activation,
+            ranked_provider: Some(s3),
             offline_scope: None,
             _journal_lock: Some(Arc::new(lock)),
         };
@@ -1474,16 +1477,28 @@ struct Backends {
     checkpoints: crate::config::MultiCheckpointSettings,
     journal_settings: crate::config::MultiJournalSettings,
     activation: Option<Arc<ActivationAuthority>>,
+    #[cfg(feature = "s3")]
+    ranked_provider: Option<rtdb_s3::S3Config>,
     offline_scope: Option<ActivationScope>,
     _journal_lock: Option<Arc<File>>,
 }
 
 impl Backends {
-    fn bound_database(&self, database: MultiDatabase, name: &str, id: Uuid) -> Result<MultiDatabase> {
+    async fn bound_database(&self, database: MultiDatabase, name: &str, id: Uuid) -> Result<MultiDatabase> {
         match &self.activation {
-            Some(activation) => Ok(database
-                .with_activation_scope(activation.scope(name)?)?
-                .with_serving_authority(activation.serving_authority(name, id)?)),
+            Some(activation) => {
+                let database = database.with_activation_scope(activation.scope(name)?)?
+                    .with_serving_authority(activation.serving_authority(name, id)?);
+                #[cfg(feature = "s3")]
+                if let Some(config) = &self.ranked_provider {
+                    match activation.open_ranked_writer(name, id, config, Arc::clone(&self.io)).await {
+                        Ok(Some(admission)) => return database.with_ranked_admission(admission),
+                        Ok(None) => (),
+                        Err(error) => ::tracing::warn!(database = name, "Ranked admission unavailable: {error}"),
+                    }
+                }
+                Ok(database)
+            }
             None => match self.offline_scope {
                 Some(scope) => database.with_activation_scope(scope),
                 None => Ok(database),
@@ -1568,7 +1583,7 @@ async fn open_database_for_name(
         database = database.with_immutable_journal();
     }
     if let Some(name) = application_name {
-        database = backends.bound_database(database, name, id)?;
+        database = backends.bound_database(database, name, id).await?;
     }
     match backends.journal.head(StreamId(id.as_u128())).await {
         Ok(head) if head.0 > 0 => {
@@ -2337,6 +2352,8 @@ mod tests {
             checkpoints: crate::config::MultiCheckpointSettings::default(),
             journal_settings: crate::config::MultiJournalSettings::default(),
             activation: None,
+            #[cfg(feature = "s3")]
+            ranked_provider: None,
             offline_scope: None,
             _journal_lock: None,
         };

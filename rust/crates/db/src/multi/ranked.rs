@@ -4,6 +4,7 @@ use bytes::Bytes;
 use rtdb_crypt::{Generation, Kms, Plaintext};
 use rtdb_format::journal::{Manifest, ObjectKind, RankedCatalog, Record};
 use rtdb_index::branches::{BranchCut, BranchIndex};
+use rtdb_storage::ranked_admission::{RankedAdmissionScope, RankedAdmissionWriter, RankedAttempt};
 use rtdb_store::{ObjectStore, read_manifest, read_observed_file};
 use rtdb_types::{
     Anomaly, AnomalyCategory, MemoryBudget, MemoryReservation, PhysicalObjectVersion, Result,
@@ -11,7 +12,7 @@ use rtdb_types::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::MultiDatabase;
+use super::{Lease, MultiDatabase};
 
 const MAX_CATALOG_BYTES: usize = 1 << 20;
 const MAX_FILES_BYTES: usize = 256 << 20;
@@ -66,8 +67,24 @@ impl AsRef<[u8]> for HeldFile {
 }
 
 impl MultiDatabase {
+    pub fn with_ranked_admission(mut self, admission: Arc<dyn RankedAdmissionWriter>) -> Result<Self> {
+        let scope = self.stream.activation_scope.ok_or_else(crate::commissioning::scope_mismatch)?;
+        if admission.scope() != (RankedAdmissionScope {
+            incarnation: self.options.database,
+            activation_sha256: scope.digest(),
+        }) || self.stream.serving_authority.is_none() {
+            return Err(crate::commissioning::scope_mismatch());
+        }
+        self.ranked_admission = Some(admission);
+        Ok(self)
+    }
+
+    fn ranked_admission_enabled(&self) -> bool {
+        !self.activation_required() || self.ranked_admission.is_some()
+    }
+
     pub fn has_ranked_work(&self) -> bool {
-        !self.activation_required()
+        self.ranked_admission_enabled()
             && self.authority().is_ok()
             && self
                 .committed
@@ -76,7 +93,7 @@ impl MultiDatabase {
     }
 
     pub fn ranked_build(&self) -> Result<Option<RankedBuild>> {
-        if self.activation_required() {
+        if !self.ranked_admission_enabled() {
             return Ok(None);
         }
         let lease = self.authority()?;
@@ -101,7 +118,7 @@ impl MultiDatabase {
         files: Vec<Bytes>,
         memory: &Arc<MemoryBudget>,
     ) -> Result<()> {
-        if self.activation_required() {
+        if !self.ranked_admission_enabled() {
             return Err(Anomaly::unsupported(
                 "rtdb/activation-effects",
                 "Ranked catalogue publication requires an effect provider commissioned for database activation",
@@ -115,6 +132,40 @@ impl MultiDatabase {
         {
             return Ok(());
         }
+        let admission = self.ranked_admission.clone();
+        let prepared = if let Some(admission) = &admission {
+            self.stream.require_serving().await?;
+            self.require_authority(lease)?;
+            admission.prepared(RankedAttempt {
+                epoch: build.epoch,
+                position: build.cut.basis.position(),
+                system_time: build.cut.system_time.0,
+                key_generation: build.generation,
+            }).await?
+        } else {
+            None
+        };
+        let catalogue = match prepared {
+            Some(catalogue) => catalogue,
+            None => self.stage_ranked_catalogue(lease, build, primary, files, memory).await?,
+        };
+        if let Some(admission) = admission {
+            self.stream.require_serving().await?;
+            self.require_authority(lease)?;
+            admission.admit(catalogue).await?;
+        }
+        self.append_control(lease, Record::RankedCatalog(catalogue)).await?;
+        Ok(())
+    }
+
+    async fn stage_ranked_catalogue(
+        &mut self,
+        lease: Lease,
+        build: RankedBuild,
+        primary: Vec<u8>,
+        files: Vec<Bytes>,
+        memory: &Arc<MemoryBudget>,
+    ) -> Result<RankedCatalog> {
         let total = files
             .iter()
             .fold(0usize, |total, file| total.saturating_add(file.len()));
@@ -171,17 +222,12 @@ impl MultiDatabase {
             )
             .await?;
         manifest.put(self.store.as_ref()).await?;
-        self.append_control(
-            lease,
-            Record::RankedCatalog(RankedCatalog {
-                manifest: manifest.id(),
-                position: build.cut.basis.position(),
-                system_time: build.cut.system_time.0,
-                key_generation: build.generation,
-            }),
-        )
-        .await?;
-        Ok(())
+        Ok(RankedCatalog {
+            manifest: manifest.id(),
+            position: build.cut.basis.position(),
+            system_time: build.cut.system_time.0,
+            key_generation: build.generation,
+        })
     }
 
     pub fn ranked_publication(&self, cut: BranchCut) -> Option<RankedPublication> {

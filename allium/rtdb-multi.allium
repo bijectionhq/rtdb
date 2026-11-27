@@ -1136,6 +1136,8 @@ contract EpochScopedStorage {
     @invariant RankedAdmissionClosure
         -- The original object provider orders each ranked publication and admission closure on the same conditional scope root.
         -- The scope binds the commissioned activation identity and source incarnation.
+        -- The writer projects a ranked catalogue into the source journal only after the original provider admits its exact manifest.
+        -- A prepared manifest binds a cut and writer epoch; retries under that epoch reuse it, and a replacement epoch may rebuild the cut.
         -- A published sequence slot retains the exact catalogue and remains discoverable without its operation ID.
         -- Closure is irreversible and exposes the final immutable inventory through sequence pages.
         -- A staged slot outside the committed prefix grants no admission.
@@ -1144,6 +1146,7 @@ contract EpochScopedStorage {
         -- Recovery freezes the predecessor's grants before obtaining closure from that allocation.
         -- Publication requires the durable closure of each commissioned predecessor ranked scope.
         -- Replacing the pending operation preserves the predecessor's closure; publication retains it for outcome discovery.
+        -- The portable checkpoint moves database state and ordinary file roots; the successor rebuilds ranked catalogues.
 
     @invariant PermanentUnreachability
         -- In Multi mode the writer captures all retained records through a committed head after sealing.
