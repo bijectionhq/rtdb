@@ -1150,6 +1150,7 @@ contract EpochScopedStorage {
     @invariant RankedAdmissionClosure
         -- The original object provider orders each ranked publication and admission closure on the same conditional scope root.
         -- The scope binds the commissioned activation identity and source incarnation.
+        -- A newer writer epoch drains the recorded previous upload before reserving its own.
         -- The writer projects a ranked catalogue into the source journal only after the original provider admits its exact manifest.
         -- A prepared manifest binds a cut and writer epoch; retries under that epoch reuse it, and a replacement epoch may rebuild the cut.
         -- A published sequence slot retains the exact catalogue and remains discoverable without its operation ID.

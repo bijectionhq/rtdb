@@ -22,9 +22,8 @@ use uuid::Uuid;
 
 use super::{Access, ActivationAuthority, Attestors, Destination, DestinationReader, JournalReaders, Request, Source};
 
-use super::super::ranked::Providers;
+use super::super::{BROKER_FRAME_BYTES, ranked::Providers};
 
-const MAX_FRAME_BYTES: usize = 16 * 1024;
 const MAX_CONNECTIONS: usize = 16;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -54,10 +53,10 @@ impl Config {
             .map_err(io_error)?;
         require_private_file(&file)?;
         let mut bytes = Vec::new();
-        file.take((MAX_FRAME_BYTES + 1) as u64)
+        file.take((BROKER_FRAME_BYTES + 1) as u64)
             .read_to_end(&mut bytes)
             .map_err(io_error)?;
-        if bytes.len() > MAX_FRAME_BYTES {
+        if bytes.len() > BROKER_FRAME_BYTES {
             return Err(configuration());
         }
         let config: Self = serde_json::from_slice(&bytes).map_err(|_| configuration())?;
@@ -214,7 +213,7 @@ pub(super) async fn call(path: &Path, request: Request) -> Result<Value> {
 
 async fn read_frame<T: DeserializeOwned>(stream: &mut UnixStream) -> Result<T> {
     let length = stream.read_u32().await.map_err(io_error)? as usize;
-    if !(1..=MAX_FRAME_BYTES).contains(&length) {
+    if !(1..=BROKER_FRAME_BYTES).contains(&length) {
         return Err(protocol());
     }
     let mut body = vec![0; length];
@@ -224,7 +223,7 @@ async fn read_frame<T: DeserializeOwned>(stream: &mut UnixStream) -> Result<T> {
 
 async fn write_frame<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
     let body = serde_json::to_vec(value).map_err(|_| protocol())?;
-    if body.len() > MAX_FRAME_BYTES {
+    if body.len() > BROKER_FRAME_BYTES {
         return Err(protocol());
     }
     stream

@@ -336,6 +336,44 @@ async fn ranked_admission_closure_drains_only_the_recorded_multipart_upload() {
 #[cfg(feature = "versioning")]
 #[tokio::test]
 #[ignore = "requires a disposable versioned S3-compatible loopback bucket"]
+async fn a_new_writer_epoch_drains_the_previous_ranked_upload_without_closing_the_scope() {
+    use rtdb_storage::ranked_admission::RankedAttempt;
+    use ring::digest::{SHA256, digest};
+
+    let config = loopback_config();
+    let client = loopback_client(&config).await;
+    let root = ObjectKey::new("multi").unwrap();
+    let scope = RankedAdmissionScope { incarnation: Uuid::new_v4(), activation_sha256: [9; 32] };
+    let io = IoRegion::new();
+    let writer = config.ranked_admission(&root, &BTreeMap::new(), Arc::clone(&io), scope).await.unwrap();
+    writer.commission().await.unwrap();
+    let bytes = bytes::Bytes::from_static(b"ranked epoch transition");
+    let object = ObjectId {
+        database: scope.incarnation,
+        kind: ObjectKind::File,
+        epoch: 1,
+        seq: 1,
+        digest: digest(&SHA256, &bytes).as_ref().try_into().unwrap(),
+    };
+    let attempt = RankedAttempt { epoch: 1, position: 2, system_time: 3, key_generation: 4 };
+    let stalled = writer.reserve_staging(attempt, object).await.unwrap();
+    let next = ObjectId { epoch: 2, ..object };
+    let replacement = writer.reserve_staging(RankedAttempt { epoch: 2, ..attempt }, next).await.unwrap();
+    assert!(writer.complete_staging(stalled, bytes.clone()).await.is_err());
+    let uploads = client.list_multipart_uploads().bucket(&config.bucket)
+        .prefix(format!("{root}/{object}")).send().await.unwrap();
+    assert!(uploads.uploads().is_empty());
+    let version = writer.complete_staging(replacement, bytes).await.unwrap();
+    let closed = writer.close().await.unwrap();
+    let staged = writer.staging_page(closed, 0, 1).await.unwrap();
+    assert_eq!(staged.objects[0].object, next);
+    assert_eq!(staged.objects[0].physical, version);
+    io.close_and_wait().await;
+}
+
+#[cfg(feature = "versioning")]
+#[tokio::test]
+#[ignore = "requires a disposable versioned S3-compatible loopback bucket"]
 async fn ranked_admission_closure_recovers_the_exact_version_after_a_lost_completion_reply() {
     use aws_sdk_s3::{
         primitives::ByteStream,

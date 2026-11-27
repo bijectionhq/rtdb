@@ -189,6 +189,7 @@ For same-host verification, the broker account owns the stopped destination's da
 ### Ranked catalogue admission
 
 Configure `ranked_providers` in the broker configuration as a map from operator-selected names to S3 settings. Each allocation requires an explicit region. Keep the original bucket, endpoint and prefix registered while its recovery outcomes are needed. Credentials may rotate without changing the allocation identity.
+Ranked commissioning requires a build with `backup-object-holds` and a versioned S3 allocation.
 
 Commission a provider against the active binding before enabling the ranked writer for that incarnation.
 
@@ -213,7 +214,7 @@ Preserve committed entries against replacement through outcome discovery.
 The commissioned ranked writer stages files and manifests at the original versioned allocation.
 The writer records the exact multipart upload in the provider ledger before sending bytes.
 The ledger permits one recorded upload per ranked scope.
-An interrupted upload that stays recorded keeps subsequent ranked staging busy until the scope closes and the original provider drains it.
+A newer writer epoch drains an interrupted upload through the original provider before reserving its own upload.
 Closure cancels any recorded upload and waits for the original provider to confirm that its parts can no longer be addressed.
 Give the writer permission to verify bucket versioning.
 Give both the writer and original ranked custodian permission to abort scoped multipart uploads and inspect their parts at the commissioned allocation.

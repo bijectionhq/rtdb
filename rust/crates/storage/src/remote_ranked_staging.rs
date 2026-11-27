@@ -143,7 +143,13 @@ impl RankedAdmission {
     ) -> Result<RankedStagingUpload> {
         let path = self.staging_path(object)?;
         check_cut(cut, object)?;
-        require_open_slot(&self.root().await?.0)?;
+        let (ledger, _) = self.root().await?;
+        if !ledger.closed && let Some(upload) = ledger.staging.as_ref().filter(|upload| upload.cut.epoch < cut.epoch) {
+            self.drain_staging(upload).await?;
+            require_open_slot(&self.root().await?.0)?;
+        } else {
+            require_open_slot(&ledger)?;
+        }
         let provider = self.staging_provider()?.uploads.as_ref();
         provider.require_versioned().await?;
         let attempt = Uuid::new_v4();

@@ -254,7 +254,7 @@ impl MultiRuntime {
             checkpoints: config.multi_checkpoints.with_deferred_default(local_journal),
             journal_settings: config.multi_journal,
             activation,
-            #[cfg(feature = "s3")]
+            #[cfg(all(feature = "s3", feature = "backup-object-holds"))]
             ranked_provider: None,
             offline_scope,
             _journal_lock: writer_lock,
@@ -386,6 +386,7 @@ impl MultiRuntime {
             checkpoints: config.multi_checkpoints,
             journal_settings: config.multi_journal,
             activation,
+            #[cfg(feature = "backup-object-holds")]
             ranked_provider: Some(s3),
             offline_scope: None,
             _journal_lock: Some(Arc::new(lock)),
@@ -1477,7 +1478,7 @@ struct Backends {
     checkpoints: crate::config::MultiCheckpointSettings,
     journal_settings: crate::config::MultiJournalSettings,
     activation: Option<Arc<ActivationAuthority>>,
-    #[cfg(feature = "s3")]
+    #[cfg(all(feature = "s3", feature = "backup-object-holds"))]
     ranked_provider: Option<rtdb_s3::S3Config>,
     offline_scope: Option<ActivationScope>,
     _journal_lock: Option<Arc<File>>,
@@ -1489,7 +1490,7 @@ impl Backends {
             Some(activation) => {
                 let database = database.with_activation_scope(activation.scope(name)?)?
                     .with_serving_authority(activation.serving_authority(name, id)?);
-                #[cfg(feature = "s3")]
+                #[cfg(all(feature = "s3", feature = "backup-object-holds"))]
                 if let Some(config) = &self.ranked_provider {
                     match activation.open_ranked_writer(name, id, config, Arc::clone(&self.io)).await {
                         Ok(Some(admission)) => return database.with_ranked_admission(admission),
@@ -2352,7 +2353,7 @@ mod tests {
             checkpoints: crate::config::MultiCheckpointSettings::default(),
             journal_settings: crate::config::MultiJournalSettings::default(),
             activation: None,
-            #[cfg(feature = "s3")]
+            #[cfg(all(feature = "s3", feature = "backup-object-holds"))]
             ranked_provider: None,
             offline_scope: None,
             _journal_lock: None,

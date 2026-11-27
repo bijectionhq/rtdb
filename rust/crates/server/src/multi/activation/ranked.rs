@@ -80,7 +80,7 @@ impl State {
 }
 
 impl ActivationAuthority {
-    #[cfg(any(feature = "s3", all(test, feature = "backup-object-holds")))]
+    #[cfg(all(feature = "backup-object-holds", any(feature = "s3", test)))]
     pub(in crate::multi) async fn open_ranked_writer(
         &self,
         name: &str,
@@ -232,9 +232,9 @@ fn missing_closure() -> Anomaly {
     )
 }
 
-#[cfg(any(feature = "s3", feature = "backup-object-holds"))]
+#[cfg(feature = "backup-object-holds")]
 type ProviderConfig = rtdb_s3::S3Config;
-#[cfg(not(any(feature = "s3", feature = "backup-object-holds")))]
+#[cfg(not(feature = "backup-object-holds"))]
 type ProviderConfig = Value;
 
 #[derive(Default, Deserialize)]
@@ -312,7 +312,7 @@ impl Providers {
     }
 }
 
-#[cfg(any(feature = "s3", feature = "backup-object-holds"))]
+#[cfg(feature = "backup-object-holds")]
 pub(super) fn provider_id(config: &ProviderConfig) -> Result<[u8; 32]> {
     use sha2::{Digest, Sha256};
 
@@ -325,7 +325,7 @@ pub(super) fn provider_id(config: &ProviderConfig) -> Result<[u8; 32]> {
     Ok(hash.finalize().into())
 }
 
-#[cfg(any(feature = "s3", feature = "backup-object-holds"))]
+#[cfg(feature = "backup-object-holds")]
 pub(super) async fn open_provider(
     config: &ProviderConfig,
     scope: RankedAdmissionScope,
@@ -337,10 +337,12 @@ pub(super) async fn open_provider(
         .await
 }
 
-#[cfg(any(feature = "s3", feature = "backup-object-holds"))]
+#[cfg(feature = "backup-object-holds")]
 async fn commission_scope(config: &ProviderConfig, scope: RankedAdmissionScope) -> Result<()> {
     let io = rtdb_storage::IoRegion::new();
     let result = async {
+        let root = rtdb_storage::ObjectKey::new("multi")?;
+        config.versioned_inventory(&root, &BTreeMap::new()).await?.require_versioned().await?;
         open_provider(config, scope, io.clone())
             .await?
             .commission()
@@ -351,7 +353,7 @@ async fn commission_scope(config: &ProviderConfig, scope: RankedAdmissionScope) 
     result
 }
 
-#[cfg(any(feature = "s3", feature = "backup-object-holds"))]
+#[cfg(feature = "backup-object-holds")]
 async fn close_scope(
     config: &ProviderConfig,
     scope: RankedAdmissionScope,
@@ -368,7 +370,7 @@ async fn close_scope(
     result
 }
 
-#[cfg(any(feature = "s3", feature = "backup-object-holds"))]
+#[cfg(feature = "backup-object-holds")]
 async fn read_outcomes(
     config: &ProviderConfig,
     receipt: ClosedRankedAdmission,
@@ -389,29 +391,50 @@ async fn read_outcomes(
         let staged = staging.objects.into_iter().map(|entry| serde_json::json!({
             "object": entry.object.to_string(), "attempt": entry.attempt, "physical": entry.physical,
         })).collect::<Vec<_>>();
-        Ok(serde_json::json!({ "scope": receipt, "catalogues": catalogues, "staged": staged,
-            "next_after": page.next_after.max(staging.next_after) }))
+        ranked_outcome_frame(receipt, after, catalogues, staged)
     }.await;
     io.close_and_wait().await;
     result
 }
 
-#[cfg(not(any(feature = "s3", feature = "backup-object-holds")))]
+#[cfg(feature = "backup-object-holds")]
+fn ranked_outcome_frame(
+    receipt: ClosedRankedAdmission, after: u64, mut catalogues: Vec<Value>, mut staged: Vec<Value>,
+) -> Result<Value> {
+    let mut count = catalogues.len().max(staged.len());
+    loop {
+        let position = after.saturating_add(count as u64);
+        let next_after = (position < receipt.admitted.max(receipt.staging.completed)).then_some(position);
+        let frame = serde_json::json!({ "scope": receipt, "catalogues": &catalogues, "staged": &staged, "next_after": next_after });
+        let reply: Result<&Value> = Ok(&frame);
+        if serde_json::to_vec(&reply).map_err(|_| provider_unavailable())?.len() <= super::BROKER_FRAME_BYTES {
+            return Ok(frame);
+        }
+        if count <= 1 {
+            return Err(Anomaly::fault("rtdb/activation-ranked-provider", "The original ranked outcome exceeds the activation broker's frame limit"));
+        }
+        count /= 2;
+        catalogues.truncate(count);
+        staged.truncate(count);
+    }
+}
+
+#[cfg(not(feature = "backup-object-holds"))]
 fn provider_id(_: &ProviderConfig) -> Result<[u8; 32]> {
     Err(provider_unavailable())
 }
 
-#[cfg(not(any(feature = "s3", feature = "backup-object-holds")))]
+#[cfg(not(feature = "backup-object-holds"))]
 async fn commission_scope(_: &ProviderConfig, _: RankedAdmissionScope) -> Result<()> {
     Err(provider_unavailable())
 }
 
-#[cfg(not(any(feature = "s3", feature = "backup-object-holds")))]
+#[cfg(not(feature = "backup-object-holds"))]
 async fn close_scope(_: &ProviderConfig, _: RankedAdmissionScope) -> Result<ClosedRankedAdmission> {
     Err(provider_unavailable())
 }
 
-#[cfg(not(any(feature = "s3", feature = "backup-object-holds")))]
+#[cfg(not(feature = "backup-object-holds"))]
 async fn read_outcomes(_: &ProviderConfig, _: ClosedRankedAdmission, _: u64) -> Result<Value> {
     Err(provider_unavailable())
 }
@@ -439,6 +462,29 @@ mod tests {
         VerifiedSuccessor,
         recovery::{Intent, LossPolicy, SourceCut},
     };
+
+    #[cfg(feature = "backup-object-holds")]
+    #[test]
+    fn ranked_outcomes_share_a_cursor_and_fit_the_broker_frame() {
+        let receipt = ClosedRankedAdmission {
+            scope: RankedAdmissionScope { incarnation: Uuid::new_v4(), activation_sha256: [1; 32] },
+            admitted: 8,
+            inventory_sha256: [2; 32],
+            staging: rtdb_storage::ranked_admission::RankedStagingInventory { completed: 32, inventory_sha256: [3; 32] },
+        };
+        let catalogues = (1..=8).map(|position| serde_json::json!({ "position": position })).collect();
+        let staged = (1..=32).map(|sequence| serde_json::json!({
+            "sequence": sequence,
+            "physical": { "version": "v".repeat(1024) },
+        })).collect();
+        let frame = ranked_outcome_frame(receipt, 0, catalogues, staged).unwrap();
+        let reply: Result<&Value> = Ok(&frame);
+        assert!(serde_json::to_vec(&reply).unwrap().len() <= super::super::BROKER_FRAME_BYTES);
+        let next = frame["next_after"].as_u64().unwrap();
+        assert_eq!(frame["staged"].as_array().unwrap().len(), next as usize);
+        assert_eq!(frame["catalogues"].as_array().unwrap().len(), next.min(receipt.admitted) as usize);
+        assert_eq!(frame["staged"][next as usize - 1]["sequence"], next);
+    }
 
     #[cfg(feature = "backup-object-holds")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -556,7 +602,7 @@ mod tests {
         assert_eq!(manifest["physical"]["namespace"]["bucket"], config.bucket);
     }
 
-    #[cfg(any(feature = "s3", feature = "backup-object-holds"))]
+    #[cfg(feature = "backup-object-holds")]
     fn test_provider() -> rtdb_s3::S3Config {
         let endpoint = std::env::var("RTDB_BACKUP_HOLD_TEST_ENDPOINT").unwrap();
         assert_eq!(url::Url::parse(&endpoint).unwrap().host_str(), Some("127.0.0.1"));
@@ -568,7 +614,7 @@ mod tests {
         config
     }
 
-    #[cfg(any(feature = "s3", feature = "backup-object-holds"))]
+    #[cfg(feature = "backup-object-holds")]
     #[tokio::test]
     #[ignore = "requires a disposable S3-compatible loopback bucket"]
     async fn ranked_broker_reads_the_original_catalogues_after_source_loss() {
