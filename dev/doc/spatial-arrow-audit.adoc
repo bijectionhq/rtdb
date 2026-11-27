@@ -143,7 +143,7 @@ Owned action headers carry authorization, framing, and held-read controls.
 
 == Remaining control-plane conversions
 
-The reserved audience bootstrap and legacy catalog ownership transitions still read declarations over PostgreSQL.
+Legacy catalog ownership transitions still read declarations over PostgreSQL.
 Ordinary Root fact and catalog reads use the scoped Flight action for their exact source floor.
 Ordered clock holds and hosted Flight commits confirm the durable source and their exact transaction floors through Flight.
 RTDB checks the original writer's quorum before acknowledging the sampled position in Arrow.

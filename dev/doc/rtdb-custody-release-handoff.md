@@ -419,7 +419,7 @@ Keep W10b delivery and the RTDB custody capability gated until this producer con
 
 Configure one `flightSql.custodyProviders` entry per original database on the ordinary listener and use the existing `flightSql.hostedControls.owner` principal.
 That principal must use validated password or client credentials, with write access to the selected original database.
-An anonymous, trust-only, scoped, fresh-replica or audience session cannot mount or use the provider.
+An anonymous, trust-only, scoped or fresh-replica session cannot mount or use the provider.
 Ordinary `Transact` and Query requests never mount a provider.
 The owner-only action or explicitly requested custody read proof lazily mounts the configured HTTPS provider after checking its independently confirmed writer receipt and current writer point.
 The route retains the mount for the live attachment and verifies a replacement attachment as a new mount.

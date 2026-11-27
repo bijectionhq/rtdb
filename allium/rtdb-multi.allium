@@ -412,8 +412,8 @@ contract CellMap {
 
 contract Directory {
     -- A cell's linearizable, transactional, sharded key-value store.
-    -- Holds deployment records, member records and revisioned audience seat claims.
-    -- Serves activation, placement, flush publication, lifecycle and audience standing checks.
+    -- Holds deployment records and member records.
+    -- Serves activation, placement, flush publication and lifecycle checks.
     read: (deployment: DeploymentId) -> DeploymentRecord
     cas: (deployment: DeploymentId, expected_epoch: Epoch, change: DeploymentChange) -> DeploymentRecord
     watch: (member: MemberId) -> Stream<MemberRecord>
@@ -428,13 +428,6 @@ contract Directory {
 
     @invariant EpochsOnlyRise
         -- A record's epoch never decreases, and every change of holder increments it.
-
-    @invariant AudienceSeatClaimIsExclusive
-        -- A seat is keyed by deployment, prepaid turn and alternate.
-        -- Claiming a seat checks the exact current writer assignment and the exact seat predecessor in one transaction.
-        -- A live task's claim remains exclusive until the session and its retained I/O drain.
-        -- An exact task-stop observation permits replacing that task's claim.
-        -- Release advances the seat revision even when it fences a claim whose write is still outstanding.
 
     @invariant WatchesMayLagButNeverRewind
         -- A watcher receives each record's changes in epoch order, possibly late, and discards any change older than the one it holds.
@@ -2460,7 +2453,6 @@ rule BecomeIdle {
     -- The directory retains the published checkpoint and the time of the last activity.
     -- A move reservation takes precedence over the idle transition.
     -- A Flight SQL call keeps the placement active until its stream closes or the caller cancels.
-    -- An admitted audience object read retains the original call permit, session seat permit, any placement pin and the request memory reservation through provider drain.
     -- Caller cancellation ends the wait while the admitted operation keeps those resources.
     when: ResidentIdleDeadlineReached(holding)
 
@@ -2977,7 +2969,6 @@ rule ConfirmHostedAppliedRead {
     requires: original.session = session
     requires: controls.all(CheckFromInstalledAllowlist)
     requires: point = null or OrdinaryRootPointAt(point, original.basis)
-              or (original.audience_preparation != null and RootPartitionMarkerAt(point, original.basis))
 
     ensures:
         let current = CaptureAppliedCatalog(holding)
@@ -4050,31 +4041,6 @@ actor Gateway {
     -- A gateway configured with a PostgreSQL TLS key store completes the client's TLS handshake before it routes startup.
     -- A configured gateway refuses plaintext startup before any holder receives credentials.
     -- A Flight SQL gateway forwards the authenticated transport peer using a proof for the deployment and writer epoch.
-    -- A directory-backed audience handshake locates the holder and its advertised host over the audience directory transport.
-    -- An installed audience handshake locates the exact current ordered grant and uses its enrolled worker's host.
-    -- The audience route dials the configured audience port on that host.
-    -- Audience route discovery cannot activate a deployment.
-    -- An audience handshake names one of two session seats per prepaid turn and an exact mint attempt.
-    -- An audience handshake supplies one reader seat header using a canonical decimal turn, a single alternate digit, and a lowercase hyphenated non-nil attempt UUID.
-    -- The holder obtains the deployment-wide seat claim before minting a session within its local reservation.
-    -- Only a retry of the live attempt under the same authenticated credential can recover that occupied seat.
-    -- A session has a 180-second ceiling fixed before its claim, and the holder sweeps expired registrations.
-    -- Close and expiry end session admission, while the seat stays charged until the session and its retained I/O drain.
-    -- A successful audience data reply transfers to the local Flight egress under the same session lock that orders local close.
-    -- An original cleanup reply can acknowledge close after the session has closed.
-    -- Provider requests and socket buffers admitted earlier keep their original custody.
-    -- A displaced session authorizes cleanup on its original holder.
-    -- Every new data action checks current placement standing.
-    -- An audience placement must recover its commissioning checkpoint before it serves.
-    -- Each prepared capture checks its catalog pin and projected transaction floor while standing is fenced by the current holder and writer epoch.
-    -- An installed capture holds the exact catalog checkpoint and suffix through its final user and admitted I/O.
-    -- An installed audience admits a capture only while the recovered leading attachment matches the current ordered grant and its serving lease is live.
-    -- Audience actions exclude the whole-Root publication head and the provider-issuer control.
-    -- An audience historical Root page scans at most five forward nominations under the prepared read, at equal valid and system coordinates less than 60 seconds before the hold.
-    -- A detached audience operation polls with the same action and turn allowances as its admitting call.
-    -- Each provider attempt spends its work charge from the action allowance and from the shared turn allowance when present.
-    -- An authenticated original audience bearer can close its own session or read after the writer attachment is gone.
-    -- A handshake authenticated against the current local attachment can retire a displaced or expired session for that deployment.
     -- The writer authenticates the session with the peer in that proof.
     -- Each Flight SQL call using a session token resolves its original writer placement.
     -- A displaced Flight SQL session must establish a new authenticated session.

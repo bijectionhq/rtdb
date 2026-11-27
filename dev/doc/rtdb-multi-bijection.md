@@ -113,53 +113,6 @@ The client supplies the certified entry's roster, quorum and cutoff to the bound
 The server computes the retained digest from the selected entry in the requested original stream.
 The proof takes journal identity and sample provenance, the retained chain's binding to exact bytes, the validity of the recorded origin, and the installed physical clock bounds as premises.
 
-The installed audience Flight gateway discovers its existing holder with its own DynamoDB client.
-It makes strongly consistent point reads of the installed deployment and its assigned member, then dials the configured audience port on the member's advertised host.
-A missing, stale, or parked placement makes the audience handshake unavailable.
-The writer lifecycle remains with the placement owners. At the holder, acquisition verifies the recovered source and writer quorum.
-
-Each installed holder prepays two Flight session seats per turn, and a shared directory claim makes each position exclusive across the cell's holders.
-The off-turn mint reserves its local permit and then conditionally claims the deployment and seat index in DynamoDB.
-The transaction checks the exact holder and writer epoch with the seat predecessor, so even a placement change after the gateway's read can fence a stale mint.
-The running holder relinquishes the claim after the session and its retained I/O drain.
-A successor can replace a charged claim with an exact ECS task-stop observation.
-An interrupted or ambiguous claim is retired by advancing its revision from either the observed predecessor or the attempted claim revision.
-A delayed duplicate write can only apply to its original predecessor.
-The gateway and holder parse the same seat selector, and the gateway requires the holder to acknowledge the exact selector and mint attempt before wrapping a new session token.
-A live seat can recover its original session under the same credential and exact mint attempt.
-For the same deployment, the holder compares the candidate with the current local attachment before retiring a displaced or expired occupant.
-Close, expiry and displacement can end a registry entry while its session still owns the permit.
-A lost close request leaves the existing session in place until retirement, and a lost reply leaves the permit charged while original I/O drains.
-The holder orders a successful audience data reply's local egress handoff under the same lock that orders session close.
-An already admitted cleanup call can still acknowledge close.
-
-On 2026-11-24, Verus 0.2026.11.20.9da409b checked eight obligations and rejected all 16 controls in the audience session seat area.
-See [the area manifest](../../verification/verus/audience_session_seats/area.json) for the mutations and expected diagnostics.
-The area checks the shipped alternate parser, registry size and indexing, attachment and admission decisions, and a lost-close model that invokes the shipped admission decision.
-The handoff predicate refuses a closed session's data reply and allows its cleanup acknowledgement.
-Source inspection ties the predicate and synchronous egress handoff to the session lock, which serializes them with close.
-Source inspection ties vacancy to an acquired semaphore permit, retry to lookup of the original live registry entry, and retained provider I/O to a strong reference to the session through its I/O admission.
-The local bound assumes those runtime ownership and serialization rules, the sampled catalog, and authenticated identity comparisons.
-
-**Cross-holder proof checked on 2026-11-23.**
-TLC 2026.11.19.180144 exhausted 9,522 distinct states for one assignment move and 25,252 for two moves, with two holders, two alternates for one prepaid turn, a three-tick ceiling and a two-tick sweep.
-[The model](../../verification/tla/CrossHolderAudienceSeats.tla) checks seven invariants and one progress property, including capacity across holders, current routing and mint authority, local drain before reuse, retained I/O custody, cleanup-only standing, and registry retirement by ceiling plus sweep.
-Nine controls failed their declared laws, and a witness served a replacement while an earlier holder still retained already-admitted I/O in the other seat.
-On 2026-11-24, Verus 0.2026.11.20.9da409b verified five items for the shared claim, and all seven controls failed their declared checks.
-[The claim proof area](../../verification/verus/audience_cross_holder_claim/area.json) checks admission against the exact free or stopped predecessor, release before or after a pending claim commits, and refusal by a delayed release against a distinct replacement revision.
-
-**Cross-holder source inspection.**
-The claim uses the ordinary holder directory client off-turn.
-Each data action uses the independent audience read path to check current standing, and an authenticated close can act on the original session without opening a native connection.
-The holder recovers the directory checkpoint at attachment time.
-Audience captures confirm their own pinned catalog and projected floor under the current writer epoch, so a later directory maintenance checkpoint does not govern a held audience read.
-The audience Flight contract refuses the whole-Root publication head and the provider-issuer control in reads and confirmation.
-The holder fixes the 180-second deadline before its claim attempt, and the installed listener requests a sweep every 10 seconds.
-The 190-second registry-retirement bound assumes a progressing monotonic clock and that the installed listener completes an expiry sweep within 10 seconds of the deadline.
-Physical release also requires retained I/O to drain and the directory to accept or observe the fenced release, or exact task-stop evidence to arrive.
-The correspondence assumes DynamoDB conditional-write atomicity and consistent reads within the cell, unique claim revisions, authenticated bearer routes, exact ECS stop records, and the session ownership and clock wiring inspected in Rust.
-Cross-cell transfers and provider I/O drain time require separate evidence.
-
 #### Prepared audience writer handoff
 
 The active and prepared fleets must join the same placement authority, source incarnation, storage namespaces and original replica quorum.
@@ -168,9 +121,9 @@ It retains the preparation in the deployment record and issues its witness only 
 A signed control request binds the handoff, target, action and nonce.
 The signed response binds the exact request and ordered witness.
 At the switch the directory assigns the immediate successor epoch directly to the target.
-The target confirms leadership on the original quorum before ordering its opening.
+The target confirms leadership on the original quorum with the holder's ordinary journal leadership confirmation before ordering its opening.
 An ordinary park, restart claim, later holding or changed target supplies no settlement.
-The authenticated settlement read rechecks the exact local attachment and quorum.
+The authenticated settlement read rechecks the exact local attachment and confirms leadership the same way.
 
 The scheduled move uses the commissioned clock error bound for the nodes and original journals.
 The supplied switch deadline bounds the funded slot in which quorum recovery and route publication must finish.
@@ -186,27 +139,6 @@ Its `prepare`, `switch` and `read` operations return canonical binary witnesses.
 They require the exact handoff file, both member IDs, incarnation, installed cell secret, shared directory, clock error, switch deadline, and incumbent drain bound.
 An abandoned unexecuted handoff retains its identity.
 After a fence, retries open the same successor epoch even if its original slot has expired, and a late opening supplies no timely settlement.
-
-#### Resource-enforced seat generations
-
-The proposed durable seat fence gives the accepting resource one current generation for each deployment and turn.
-The resource orders replacement and the generation check for each read, write and stream continuation together.
-The replacement owns the logical seat at fence commit, and can recover that decision by exact readback if the reply is lost.
-This transition needs no task-stop observation.
-Physical capacity still includes requests and buffers held by the original generation unless their owner can retire them or bound them independently.
-The installed cold object and pack transports have separate accepting orders from the directory claim.
-A generation compare in Flight cannot change the ordering of requests that those providers have already received.
-A reclaim deadline requires a service bound through durable fence commit and exact readback.
-The current reservations and expiry sweep continue to cover the unfenced provider path.
-
-**Resource model proof checked on 2026-11-24.**
-TLC 2026.11.19.180144 exhausted 1,088 distinct states for one replacement and 13,120 for two in [the proposed resource model](../../verification/tla/AudienceSeatResourceFence.tla).
-It checked exclusion of superseded I/O, unique logical seat ownership, acquisition at fence commit, and reclaim without stop evidence under weak fairness of the fence and exact readback.
-All six mutations failed their intended laws.
-Two witnesses reached a retained old charge after the fence and a successful successor operation with such a charge still present.
-The model assumes that fence persistence and application share an accepting order and that fence and readback service eventually succeed.
-The current Flight handoff change orders application only at local response admission.
-Provider acceptance, already admitted reads and socket buffers keep their original custody boundaries.
 
 #### Journal provenance evidence
 
@@ -232,7 +164,7 @@ It abstracts the first frame sync and the second observation sync as separate tr
 **Proof checked on 2026-11-24.** Verus 0.2026.11.20.9da409b with Rust 1.100.0 and Z3 4.16.0 checked 56 items in the [framing decoder area](../../verification/verus/framing_decoders/area.json).
 All 27 mutations failed at their declared laws, including clearing the certification bit on write, on each of the two reads, and at the end of the composed round trip.
 
-The checks cover the shipped source and replica header dispatch, replica frame and envelope mapping, eligible source, replica and journal round trips, fixed retirement bytes, and canonical Flight seat text.
+The checks cover the shipped source and replica header dispatch, replica frame and envelope mapping, eligible source, replica and journal round trips, and fixed retirement bytes.
 The protobuf wire traversal checks field keys and lengths, progresses across the complete outer envelope, and bounds group nesting at 100.
 Recovery hold detection validates all outer fields before using the presence of a length-delimited field 8.
 The journal reader checks the declared length against the remaining extent before requesting the body, checks the checksum of the exact body, and decodes that body.
@@ -240,16 +172,15 @@ A proper prefix of an encoded frame cannot match a complete record, even when it
 A read at a retained location also requires its whole extent to match the declared frame.
 The frame writer and located decoder round-trip the whole record, including the certification bit, under the Prost contract.
 The sequential reader returns the exact Prost-decoded record on every successful read, including the certification bit.
-The Flight holder admits a seat header only for an audience handshake with exactly one value, and the parser requires the prepaid turn, one alternate digit, and the canonical non-nil attempt UUID.
 
-**Source inspection.** Replay and retained payload lookup call the checked journal functions, and the Flight holder and gateway use the shared header names and seat parser.
+**Source inspection.** Replay and retained payload lookup call the checked journal functions.
 The activation writer stores the publication mode in protobuf field 17 of the journal record, and replay restores it from that activation or from the compacted snapshot's own mode field.
 The mode determines whether publication requires a decision certificate.
 `JournalProvenance` abstracts retained entry origins and sync samples, and `ActiveLogletReadIndex` abstracts decisions and their quorum installation.
 The [Prost contract](../../verification/verus/foreign_contracts/prost.md) is a premise for generated-message behavior, including full consumption, unknown fields and round trips within the supported nesting depth.
 Protobuf permits non-minimal varints, valid extra fields and equivalent serializations.
 The legacy source flush marker keeps its historical interpretation.
-The remaining premises are exact reads, byte-buffer and endian operations, CRC calculation, available encoding capacity and journal bodies that fit the u32 length field, the existing placed-attempt codec and stage validator, canonical UUID formatting and parsing, and the HTTP metadata libraries' delivery of the header values.
+The remaining premises are exact reads, byte-buffer and endian operations, CRC calculation, available encoding capacity and journal bodies that fit the u32 length field, and the existing placed-attempt codec and stage validator.
 Filesystem durability, application of replayed records to stream state, and the recovery decision to truncate the final segment are outside the decoder proof.
 **Authored.** The Prost conformance cases include a wire-tag and reader fixture for both activation modes.
 Native execution of those cases remains unverified.
@@ -278,32 +209,6 @@ The upload is limited to 16,384 frames and the existing 64 MiB message limit les
 The owner allows 30 seconds to receive the complete upload.
 The ordered decision uses the same installed writer proof, custody checks, effect ordinals, refusal alternative and commit receipt as the packed unary action.
 An interrupted upload releases its request buffers, and a lost reply to a complete upload uses the original attempt recovery.
-
-#### Audience action work
-
-Each audience Flight action allows 256 object-store requests, 32 MiB of requested bodies, 4 MiB of provider metadata envelopes, 65,536 scan items and 64 MiB of decoding.
-An exact object read spends its request, requested body and 16 KiB metadata envelope before dispatch, including a zero-body HEAD.
-Exhaustion closes that ledger and refuses the operation.
-Actions against one applied hold also spend that hold's shared allowance.
-Nested work and detached provider attempts carry the same action ledger.
-An independently admitted Flight action starts its own action ledger and continues to spend the original hold's aggregate when it uses that hold.
-Cleanup closes use independent call capacity.
-
-On 2026-11-23, Verus 0.2026.11.20.9da409b checked 14 items and rejected all 11 controls in the [audience action ceilings area](../../verification/verus/audience_action_ceilings/area.json).
-That area checked the shipped action limits, requested-work charges, closed-ledger and retry decisions, and the decision to relinquish custody on readiness.
-
-On 2026-11-23, the same Verus version checked 39 items and rejected all seven controls in the [audience drain wiring area](../../verification/verus/audience_drain_wiring/area.json).
-The harness loads the production expressions for Flight owner capture, I/O admission scope, worker spawn, budget entry and debit, and the `poll_fn` body, and instantiates them with [RTDB-local runtime contracts](../../verification/verus/foreign_contracts/leaves.json).
-It proves that any prefix of pending polls keeps the owner, that the ready poll relinquishes the worker's reference, and that dropping the caller's join handle preserves the original call permit, session seat permit, placement pin when present, and request memory reservation in the worker.
-The reference model checks one release at the last strong drop, and the debit proof checks the exact action and turn charges against their acquired values, including refusal and ledger exhaustion.
-The worker's poll observes the captured budget even when Tokio starts the spawned task with no task-local bindings.
-The controls release on a pending poll, clear retained owners before spawn, discard an enclosing Flight owner, return the same permit twice, skip the turn debit, omit scope installation for the worker, and reset a nested budget.
-
-Source inspection ties the shared expressions to the native Tokio and standard-library calls, the action wrapper, the I/O region's ancestor admission and task tracking, the Flight resource destructors, and result delivery or disposal before readiness.
-The local contracts assume task-local poll and restore semantics, detach, last-reference and semaphore drop semantics, pin and poll behavior, and exclusive locked updates.
-Their named conformance tests were authored and remain unrun.
-The checked laws apply to provider work whose runtime stays live through drain and whose completion covers its provider effects.
-Charge coverage before dispatch, retry-free audience transport, and provider completion time remain premises.
 
 ### Subscriptions, watches and exports
 
@@ -572,7 +477,7 @@ Retained Worlds, holds, and key disposition require their own evidence before ro
 
 ##### Ordinary fresh Owned Flight
 
-The first Flight population is ordinary, non-audience `rtdb.owned.OpenFreshRead.v2` and the handles, calls, work and delivery descended from those opens on one Classic source.
+The first Flight population is ordinary `rtdb.owned.OpenFreshRead.v2` and the handles, calls, work and delivery descended from those opens on one Classic source.
 The ordinary gateway validates the exact deployment and writer epoch and, for a subscriber, its replica epoch, stream and residence.
 The gateway can select a subscriber or the current holder.
 The receiver also admits the authenticated placed session and checks the attachment against the source UUID before capturing its replica snapshot.
@@ -682,7 +587,7 @@ The positive owner contract requires all of the following.
    Restart and lost-reply recovery reopen those same records and require positive, generation-specific stop and delivery evidence for any owner lost before its join was recorded.
    CUT joins the terminal to the independently held Begin and Original catalog commitment, the mounted application placement and custody, and the exact sealed scratch and Classic and SQL cuts.
 
-Ordinary fresh Flight remains pending along with the other ordinary Flight opens and SQL query deliveries, reserved audience Flight, PgWire, World readers, export and replay outputs, external response deliveries, retained Worlds and holds, and key dispositions beyond the selected `RFR1` release.
+Ordinary fresh Flight remains pending along with the other ordinary Flight opens and SQL query deliveries, PgWire, World readers, export and replay outputs, external response deliveries, retained Worlds and holds, and key dispositions beyond the selected `RFR1` release.
 Keep aggregate route readiness closed while any required population or retained continuation lacks its own evidence.
 
 ### Private native candidate

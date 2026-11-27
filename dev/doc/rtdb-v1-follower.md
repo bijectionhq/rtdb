@@ -93,7 +93,7 @@ Send exactly one `x-xtdb-database` header on each call with the value `NAME@INCA
 The listener admits authenticated Flight handshake, `rtdb.v1.Capabilities`, the exact scope actions and Query DoGet.
 Capabilities advertises `query`, `query.track`, `query.page`, `query.applied-position`, `query.follower-progress` and `query.exact-scope`.
 Transact, including effect-free validation, TxStatus, Changes, ordinary Flight SQL, administration, custody operations and other Flight actions are refused at dispatch.
-Forwarded peer and audience headers cannot admit a call on this listener, and the legacy fresh-replica proxy keeps its existing Query refusal.
+Forwarded peer headers cannot admit a call on this listener, and the legacy fresh-replica proxy keeps its existing Query refusal.
 Query uses one database snapshot and read-only SQL, so SQL mutations, DDL and session commands are also refused.
 
 The cell stops renewing the assignment, drains the Bijection attachment, calls `ServerHandle::shutdown()` and joins the Flight driver.

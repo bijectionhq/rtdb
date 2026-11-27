@@ -89,7 +89,7 @@ A read under a restored SQL snapshot carries that snapshot's token instead.
 A query ticket is unsigned and redeemable by any session, as the reference's `QueryTicket.Run` is: DoGet re-prepares its SQL on the redeeming session's connection, under that session's identity, so a ticket grants nothing its redeemer could not query directly.
 A malformed or truncated ticket is invalid.
 An inspection ticket, which the reference does not have, is JSON of type `inspect`, signed with HMAC-SHA256 under a key generated when the service starts, over the issuing session's id and owner, since it may name that session's transaction; presented by another session, another owner, or after a restart, or altered, it fails as not found.
-A ticket that would not fit the largest request the server decodes is refused when issued, since its parameter batch is carried whole; with an audience that limit is 512 KiB.
+A ticket that would not fit the largest request the server decodes is refused when issued, since its parameter batch is carried whole.
 It keeps the connection borrowed through statement classification, basis capture, and schema preparation against that basis.
 GetFlightInfo, GetSchema, CreatePreparedStatement and DoPut statement updates use the same selected Direct parser diagnostics for initial preparation.
 When the vendor parser rejects a first unquoted ASCII identifier outside both vocabularies, the frontend compares the byte range and accepts a matching extraneous-input or statement-head mismatch report.
@@ -292,7 +292,7 @@ The result has 16 opaque handle bytes followed by three signed big-endian i64 fi
 `rtdb.owned.OpenAppliedRead.v5` requests an already-applied hosted catalog from the current recovered holder.
 Its input is the 16-byte source installation UUID, a one-byte count from one to four, and that many exact transaction keys.
 Each key is a signed big-endian i64 transaction ID followed by a signed big-endian i64 ordered microsecond time.
-The final field is a big-endian u64 generation. Use zero outside a reserved audience session.
+The final field is a big-endian u64 generation and must be zero.
 Its result uses the same held handle and cut format.
 The selected transaction must equal or advance both coordinates of each supplied transaction in the same history.
 The node pins the exact installed storage catalog in the serving residence, confirms the recovered holder's source identity and checks the supplied transactions in that catalog.
@@ -300,63 +300,8 @@ An inexact floor, foreign history, or a cut that cannot be retained is refused w
 The handle admits held point, historical point and hosted control reads and applied confirmation.
 This operation establishes a data cut. Its ordered time does not give the current physical clock or establish live write authority.
 
-On a placed cell, install the same `--flight-audience UUID/TURNS` on every Flight gateway and holder and bind a separate `--flight-audience-listen ADDR` on each.
-The authenticated hosted owner sends the installed value as `x-rtdb-audience-flight-v19` on the audience gateway during its handshake.
-The handshake also sends `x-rtdb-audience-reader-seat` as `TURN/ALTERNATE/ATTEMPT`, with a zero-based turn, 0 or 1 and a canonical UUID.
-The gateway and holder acknowledge the exact reservation and mint attempt. Ordinary and audience routes are accepted on their own listeners.
-The dedicated path has its own TCP acceptance, connection limits, calls, backend HTTP/2 connection pool and holder session seats.
-Each turn has two seats. An exact retry under the same credential can recover the live session in that seat.
-Another mint cannot take the seat until the original session and its retained I/O release it, including when a close reply is lost.
-The original audience bearer can close its own session or held read after the writer attachment is displaced.
-A handshake authenticated against the current local attachment can start retirement of a prior attachment's session in its own seat. It waits for the same original resource ownership to drain before it can mint.
-The connection and call limits set aside two permits per turn plus two for preparation and cleanup.
-Before serving, the holder reserves 16 MiB of execution memory and 16 MiB of cache memory per permit. Both reservations are deducted before the ordinary allocation splits between cache and execution. It refuses startup if the node cannot fund both pools.
-Each session uses its own buffer pool on the audience cache budget from initial preparation through applied confirmation.
-Audience queries use local scans. The holder requires an uncached view of the live writer's exact S3 storage attachment for the installed source.
-That view shares the attachment's object mapping, custody and serving key and bypasses the ordinary SSD cache and its fill queue.
-Provider object reads use a distinct S3 HTTP client and credential cache, including when retained I/O outlives its caller.
-The configured source and its attached archive open that client with their own credential provider. A remote store without the client refuses the scoped read.
-Whole objects read into the buffer pool must match the reserved length. The pool funds the retained bytes and the temporary ciphertext and archive buffers before fetching the body.
-The reservations remain held while admitted provider work drains after cancellation. The read view requires a whole-object or scan-range reservation for every body.
 Native trie data uses 64 KiB plaintext frames. A point scan can read its footer and pages without decrypting the rest of the file. The object header authenticates the length and content identity, and every selected frame authenticates its key, identity and position.
 Retained archives bind the encrypted frame header in their manifest and authenticate only the requested frames before resealing them for the serving key. Native trie data and retained archives must be written in this format.
-Each audience action has cumulative ceilings of 256 object-store requests, 32 MiB of requested object bodies, 4 MiB of provider metadata envelopes, 65,536 scan items and 64 MiB in decoding bounds.
-An applied hold additionally limits the whole turn to 64 Flight actions, 4096 object-store requests, 512 MiB of requested bodies, 64 MiB of provider metadata envelopes, 1,048,576 scan items and 1 GiB in decoding bounds.
-Each action spends both allowances, including detached provider work.
-Closing the original hold uses cleanup capacity even after the hold exhausts its work allowance.
-The object reader reserves a 16 KiB metadata envelope separately from each requested body, including HEAD, and checks complete range responses under the reserved body length.
-The holder charges these before the counted work. Admitted provider tasks retain the allowance and the call and session permits until their work drains. Listings, unbounded body reads and the ordinary object transport are unavailable during the action.
-Live trie scans locate rows under the audience execution budget without consulting the ordinary leaf caches.
-The holder refuses the handshake if the opened residence needs per-read registration for a legacy object reference or serves a retained archive from a local volume. An admitted S3 archive uses the custody hold acquired when the attachment opened.
-The installed source holder loads pack locations before accepting a session. Its own block publications register their locations before the catalog can be captured. A scheduled object lookup never searches for more packs or adopts a relocated pack.
-Each audience session owns one retained-read slot. A new applied open must advance that session's generation and retires the previous handle before starting the new read.
-A delayed open with an earlier or repeated generation cannot displace the replacement. CloseSession and session expiry both retire its current hold. Their budget charges cover native session state, decoded action bodies, pinned query contexts, output encoding and retained replies.
-The audience handshake and subsequent actions use the reserved admission.
-The holder sets aside 12 MiB per reserved connection outside body accounting, with four HTTP/2 streams, an 8 KiB header-list limit, a 512 KiB request message limit and a 2 MiB reply limit.
-The gateway sets aside 2 MiB per reserved peer connection and 2 MiB per forwarded call.
-Its audience upstream has bounded HTTP/2 windows and keeps no idle routes.
-An audience session can read a forward live Root range of up to five nominations through ReadHeldRange.v2 on its prepared hold.
-It can also read that range at a retained system cut less than 60 seconds before the hold through ReadHeldRange.v4, with the valid instant equal to the system cut.
-The historical scan verifies relation coverage and spends the original hold's aggregate work allowance.
-Its range request permits an exclusive continuation and has a 16 KiB carrier ceiling.
-Applied confirmation on the same prepared session can check the exact partition publication marker against both catalogs.
-The gateway resolves the placement at handshake, then forwards authenticated session actions to the sealed holder address.
-For each audience data action the holder reads the live member and current deployment over a DynamoDB client with its own credential provider.
-It checks the writer epoch, recovered checkpoint and exact attached database. A holder whose directory cannot install an audience read transport refuses audience startup.
-Applied acquisition and confirmation also check journal leadership on the holder's configured `--audience-journal-port`.
-Each logkeeper serves this port with `--audience-authority UUID/TURNS` and `--audience-authority-listen ADDR`.
-The connection and frame sizes are bounded. Each success confirms the exact journal, replica stream, active ensemble and durable writer epoch.
-A pending fence change refuses immediately until it is durable. Ordinary append and history-read queues do not carry these authority checks.
-Closing a local hold or session only releases resources. The directory, journal quorum, network, object storage, and scheduler still have service obligations.
-
-Before its first open, a reserved session must call `rtdb.owned.PrepareAppliedRead.v2`. The body is the same source and exact transaction floor as an applied open, without the generation. After registering the captured catalog in the directory, the action returns one unsigned eight-byte big-endian remaining lifetime in microseconds, bounded by both the catalog pin and the session. Anchor this duration to the start of the preparation request on the caller's monotonic clock to reserve a conservative full observation window. Audience sessions have a nonrenewable 180-second ceiling from the handshake. Retained work keeps its original permits through cancellation and drain.
-The registration is session-bound and expires after 180 monotonic seconds. A read or confirmation shares it only for a catalog at or after the registered cut in the same attachment, storage version, storage epoch and replica epoch.
-An older registration keeps the retirement floor from passing this cut. In-flight snapshots keep their own references until reads and provider I/O drain.
-A changed or expired preparation requires a new session. Opening and confirming a hold never falls back to a new registration on a reserved session.
-Holder confirmation, exact transaction checks, and session generations still apply to each acquired cut.
-
-The reservation admits preparation, applied open and confirmation, held point and historical point reads, hosted control reads, and closure of the hold or session.
-The gateway routes only action RPCs on a reserved session.
 
 `rtdb.owned.ConfirmAppliedHosted.v6` takes the 16-byte original held handle, the same source and transaction floor input, an exclusive signed big-endian i64 Unix microsecond cutoff, a point option, and the normal hosted control groups.
 The point option starts with one byte: zero for a control-only read, one for a raw Utf8 key, and two for a complete typed handle.
@@ -410,7 +355,7 @@ Spatial opens, continuations and winner gathers use the same negotiated framing.
 The contiguous writer and message slicing remain available for negotiated replies that use the original writer.
 Without negotiation an Arrow-only reply remains one contiguous IPC stream.
 Held text, nearest and hybrid actions require negotiation and send their link:../../../dev/doc/rtdb-assertion-families.md#ranked-response-contributor-inventory[binary contributor inventory] before the Arrow IPC messages.
-The audience endpoint and actions with control envelopes use their existing framing.
+Actions with control envelopes use their existing framing.
 
 `rtdb.owned.ReadPoints.v1` accepts two to 256 held point entries.
 Selectors 0 through 7 map to held Root v2, fixed Root, historical Root, positioned Root, held world v2, earlier accepted world, archived Root parent, and held Root publication cut points in that order.
@@ -424,7 +369,6 @@ Initial response metadata acknowledges the batch with `x-rtdb-owned-points: v1` 
 The owner executes the entries in request order and streams the unchanged Arrow IPC reply for each successful entry.
 The first refusal terminates the stream with its scalar status, and dropping the stream cancels further work.
 Fresh replica sessions admit the same Root selectors as their scalar actions.
-Prepared audience sessions retain their scalar allowances.
 
 `rtdb.owned.ReadSelection.v1` uses the same count and length framing for up to 256 entries and a 2 MiB request.
 Point selectors 0 through 6 retain their action's binary cut prefix and relation name, followed by a signed big-endian valid instant and the UTF-8 identity to the end of the entry.
@@ -438,11 +382,6 @@ A changed schema adds a length-prefixed Arrow IPC schema frame without schema me
 The rest is one Arrow IPC record batch frame for a present point or empty for an absent point.
 Unchanged schemas reuse the last compatible schema in the action.
 Other point replies retain their scalar Arrow IPC envelope.
-
-`rtdb.owned.ReadAudiencePoints.v1` is available on reserved audience sessions and acknowledges with `x-rtdb-audience-points: v1`.
-It accepts two to four selector-zero entries carrying their complete `ReadHeldPoint.v2` request bodies within the reserved transport request bound.
-Each entry independently spends its original action and decode allowances, confirms its reserved route, and runs the scalar projection and delivery checks.
-Each result stays within the original reserved reply limit and uses the same compatible point framing.
 
 
 Send `rtdb.owned.CloseRead.v1` with only the 16 handle bytes to release it.

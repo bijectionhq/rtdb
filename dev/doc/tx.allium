@@ -262,7 +262,6 @@
 -- The owner streams one scalar IPC reply per successful entry and terminates at the first refusal with that entry's scalar status.
 -- Held selections carry UTF-8 and Binary points and valid windows in request order on their original handles with each entry's original cut.
 -- Compatible point selections reuse the Arrow field schema and retain reply metadata per entry.
--- Reserved audience point selections spend one original action and work allowance per entry and preserve the original route and reply limits.
 -- Fresh Flight readers can batch the Root selectors admitted by their route.
 -- An ordinary Flight caller can opt into Arrow IPC message framing for a raw owned reply.
 -- A historical point uses the held catalog and the same identity registry within the admitted cut and its requested system-time cap.
