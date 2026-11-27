@@ -21,6 +21,64 @@ pub(crate) fn is_period(ty: &LogicalType) -> bool {
     matches!(nonnull(ty), LogicalType::List { kind: ListKind::TimestampTzRange, element } if is_zoned_micros(element))
 }
 
+fn timestamp_ticks(column: &Column, row: usize) -> Option<Option<i64>> {
+    if let Column::Values(values) = column {
+        return match values.get(row)? {
+            Value::Timestamp { unit: TimeUnit::Microsecond, timezone: Some(_), value } => Some(Some(*value)),
+            Value::Null | Value::Undefined => Some(None),
+            _ => None,
+        };
+    }
+    let Some((array, field, logical, row)) = column.arrow_cell(row)? else { return Some(None); };
+    if array.data_type() != field.data_type() || !field.metadata().is_empty() { return None; }
+    if field.data_type() == &DataType::Null && field.is_nullable() && logical.is_none_or(|ty| *ty == LogicalType::Null) {
+        return Some(None);
+    }
+    if !matches!(field.data_type(), DataType::Timestamp(ArrowUnit::Microsecond, Some(_)))
+        || logical.is_some_and(|ty| !is_zoned_micros(ty))
+    {
+        return None;
+    }
+    let values = array.as_any().downcast_ref::<TimestampMicrosecondArray>()?;
+    Some(values.is_valid(row).then(|| values.value(row)))
+}
+
+pub(super) fn construct(expr: &Expr, schema: &Schema, batch: &ColumnBatch, context: &QueryContext)
+    -> Result<Option<(Column, Arc<MemoryReservation>)>>
+{
+    let Expr::Call { name, args, return_type } = expr else { return Ok(None); };
+    if name != "period" || !is_period(return_type) { return Ok(None); }
+    let [Expr::Column { id: lower, .. }, Expr::Column { id: upper, .. }] = args.as_slice() else { return Ok(None); };
+    let (Some(lower), Some(upper)) = (schema.position(*lower), schema.position(*upper)) else { return Ok(None); };
+    if [lower, upper].into_iter().any(|position| {
+        let ty = &schema.fields()[position].data_type;
+        *ty != LogicalType::Null && !is_zoned_micros(ty)
+    }) {
+        return Ok(None);
+    }
+    let length = batch.len.checked_mul(2).ok_or_else(size_error)?;
+    let bytes = length.checked_mul(size_of::<i64>()).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size_error)?;
+    let mut owner = context.memory.reserve(bytes)?;
+    let mut endpoints = Vec::with_capacity(length);
+    for row in 0..batch.len {
+        context.check_cancelled_at(row)?;
+        let (Some(lower), Some(upper)) = (timestamp_ticks(&batch.columns[lower], row), timestamp_ticks(&batch.columns[upper], row))
+            else { return Ok(None); };
+        let lower = lower.unwrap_or(i64::MIN);
+        let upper = upper.unwrap_or(i64::MAX);
+        if lower >= upper { return Ok(None); }
+        endpoints.extend([lower, upper]);
+    }
+    let logical = Value::TimestampTzRange { lower: i64::MIN, upper: i64::MAX }.logical_type();
+    let field = Arc::new(rtdb_columnar::to_field("value", &logical)?);
+    let DataType::FixedSizeList(child, 2) = field.data_type() else { unreachable!("Periods have two endpoints"); };
+    let endpoints = Arc::new(TimestampMicrosecondArray::from(endpoints).with_timezone("UTC"));
+    let array = FixedSizeListArray::try_new(Arc::clone(child), 2, endpoints, None)
+        .map_err(|error| crate::invalid("period-column", error))?;
+    let column = Column::Arrow { array: Arc::new(array), field, logical: Some(logical) };
+    settle(column, &mut owner).map(|column| Some((column, owner)))
+}
+
 pub(crate) fn bounds(column: &Column, row: usize) -> Option<Option<(i64, i64)>> {
     if let Column::Values(values) = column {
         return match values.get(row)? {
@@ -114,8 +172,12 @@ pub(super) fn range_bins(expr: &Expr, schema: &Schema, batch: &ColumnBatch, cont
     let array = ListArray::try_new(Arc::clone(child), OffsetBuffer::new(offsets.into()), Arc::new(values), nulls)
         .map_err(arrow_error)?;
     let column = Column::Arrow { array: Arc::new(array), field, logical: Some(logical) };
-    let lease = Arc::get_mut(&mut owner).expect("The bin projection owns its reservation");
+    settle(column, &mut owner).map(|column| Some((column, owner)))
+}
+
+fn settle(column: Column, owner: &mut Arc<MemoryReservation>) -> Result<Column> {
+    let lease = Arc::get_mut(owner).expect("The period projection owns its reservation");
     let retained = owned_projection_bytes(&column)?;
     if retained <= lease.bytes() { lease.shrink_to(retained)?; } else { lease.grow_to(retained)?; }
-    Ok(Some((column, owner)))
+    Ok(column)
 }

@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, NullArray, PrimitiveArray, StringArray,
+use arrow_array::{Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, NullArray, PrimitiveArray, StringArray, StructArray,
     TimestampMicrosecondArray, builder::{BooleanBuilder, PrimitiveBuilder}, new_null_array, types::{ArrowPrimitiveType, Float64Type, Int32Type}};
 use arrow_schema::{DataType, Field as ArrowField, TimeUnit as ArrowUnit};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
@@ -19,7 +19,7 @@ use rtdb_expr::kernels::{self, Function, LikeMatcher, Selection};
 use rtdb_plan::{BinaryOp, CastTarget, Expr, Schema, UnaryOp};
 use rtdb_types::{LogicalType, Result, ScalarType, TimeUnit, Value};
 
-use super::{Column, ColumnBatch, PredicateSelection, SelectedColumn, plain_scalar};
+use super::{Column, ColumnBatch, PredicateSelection, SelectedColumn, StoredVector, float_vector::nonnull, plain_scalar};
 
 mod predicate;
 mod range;
@@ -172,6 +172,53 @@ fn read_selected(selected: &SelectedColumn, expected: &ScalarType, memory: &Arc<
     Vector::of(gathered.as_ref(), expected).map(|vector| Charged::built(vector, memory)).transpose()
 }
 
+fn struct_child<'a>(array: &'a dyn Array, field: &ArrowField, logical: Option<&LogicalType>, name: &str)
+    -> Option<(&'a ArrayRef, &'a Arc<ArrowField>)>
+{
+    if !field.metadata().is_empty() || field.data_type() != array.data_type() || array.null_count() != 0 { return None; }
+    let LogicalType::Struct(types) = nonnull(logical?) else { return None; };
+    let parent = array.as_any().downcast_ref::<StructArray>()?;
+    let position = parent.fields().iter().position(|child| child.name() == name)?;
+    let child = &parent.fields()[position];
+    let physical = rtdb_columnar::from_field(child).ok()?;
+    (&physical == types.get(name)?).then(|| (parent.column(position), child))
+}
+
+fn read_struct_field(column: &Column, name: &str, declared: &LogicalType, memory: &Arc<MemoryBudget>) -> Result<Option<Charged>> {
+    let Some(expected) = plain_scalar(declared) else { return Ok(None); };
+    match column {
+        Column::Arrow { array, field, logical } => {
+            if array.data_type() == &DataType::Null && field.is_nullable() && logical.as_ref() == Some(&LogicalType::Null) {
+                return Ok(Some(Charged::shared(Vector::Null)));
+            }
+            let Some((child, field)) = struct_child(array.as_ref(), field, logical.as_ref(), name) else { return Ok(None); };
+            Ok(match layout(child.as_ref(), field, None) {
+                Some(None) => Some(Charged::shared(Vector::Null)),
+                Some(Some(ty)) if ty == *expected => Vector::of(child.as_ref(), expected).map(Charged::shared),
+                _ => None,
+            })
+        }
+        Column::Selected(parent) => {
+            let bytes = parent.sources.len().checked_mul(size_of::<Option<StoredVector>>())
+                .and_then(|bytes| bytes.checked_add(512)).ok_or_else(super::size_error)?;
+            let _sources = memory.reserve(bytes)?;
+            let mut sources = Vec::with_capacity(parent.sources.len());
+            for source in parent.sources.iter() {
+                let Some((array, field, logical, _)) = source else { sources.push(None); continue; };
+                if array.data_type() == &DataType::Null && field.is_nullable() && logical.as_ref() == Some(&LogicalType::Null) {
+                    sources.push(None);
+                    continue;
+                }
+                let Some((child, field)) = struct_child(array.as_ref(), field, logical.as_ref(), name) else { return Ok(None); };
+                sources.push(Some((Arc::clone(child), Arc::clone(field), None, None)));
+            }
+            let selected = SelectedColumn { sources: Arc::new(sources), cells: parent.cells.clone() };
+            read_selected(&selected, expected, memory)
+        }
+        Column::Values(_) => Ok(None),
+    }
+}
+
 /// The bytes of the row-to-source map an interleave reads.
 fn cell_bytes(len: usize) -> Result<usize> {
     len.checked_mul(size_of::<(usize, usize)>()).ok_or_else(super::size_error)
@@ -282,6 +329,7 @@ struct Node { kind: Kind, declared: LogicalType }
 enum Kind {
     /// The batch column at this position.
     Column(usize),
+    StructField { position: usize, name: String },
     Literal(Value),
     Parameter(usize),
     Extract { field: String, source: Box<Node> },
@@ -323,7 +371,7 @@ impl Kind {
     /// Strict arguments prepared as vectors, in the order the row evaluator prepares them.
     fn arguments(&self) -> Option<Vec<&Node>> {
         Some(match self {
-            Self::Column(_) | Self::Literal(_) | Self::Parameter(_) | Self::Case { .. } | Self::Length { .. } | Self::Double(..)
+            Self::Column(_) | Self::StructField { .. } | Self::Literal(_) | Self::Parameter(_) | Self::Case { .. } | Self::Length { .. } | Self::Double(..)
                 | Self::RoundFloatColumn { .. }
                 | Self::Compare { .. } | Self::Identical { .. }
                 | Self::IsNull { .. } | Self::Like { .. } | Self::Between { .. } | Self::Logical { .. } => return None,
@@ -610,6 +658,14 @@ impl Node {
         }
         let result_ty = VectorType::of(&declared)?;
         let (kind, ty) = match expr {
+            Expr::Field { expr, name, .. } => {
+                let Expr::Column { id, .. } = expr.as_ref() else { return None; };
+                let position = schema.position(*id)?;
+                let LogicalType::Struct(types) = nonnull(&schema.fields()[position].data_type) else { return None; };
+                let ty = VectorType::of(types.get(name)?)?;
+                if ty == VectorType::Null || ty != result_ty { return None; }
+                (Kind::StructField { position, name: name.clone() }, ty)
+            }
             Expr::Call { name, args, .. } if name == "===" => match args.as_slice() {
                 [left, right] => {
                     if result_ty != VectorType::Bool { return None; }
@@ -950,6 +1006,7 @@ impl Node {
             let mut bytes = add(size_of::<Self>(), self.declared.retained_bytes()?)?;
             match &self.kind {
                 Kind::Column(_) | Kind::Parameter(_) | Kind::RoundFloatColumn { .. } => {}
+                Kind::StructField { name, .. } => bytes = add(bytes, name.capacity())?,
                 Kind::Literal(value) => bytes = add(bytes, value.retained_bytes()?)?,
                 Kind::Extract { field, source } => {
                     bytes = add(bytes, field.capacity())?;
@@ -998,7 +1055,7 @@ impl Node {
     /// predicate that may be null, an argument of several legs) can't fail.
     fn settles(&self) -> bool {
         stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || match &self.kind {
-            Kind::Column(_) | Kind::Literal(_) | Kind::Parameter(_) | Kind::RoundFloatColumn { .. } => true,
+            Kind::Column(_) | Kind::StructField { .. } | Kind::Literal(_) | Kind::Parameter(_) | Kind::RoundFloatColumn { .. } => true,
             Kind::Compare { left, right, .. } | Kind::Identical { left, right } => left.prepares() && right.prepares(),
             Kind::Like { input, pattern, .. } => input.prepares() && pattern.prepares(),
             Kind::Length { operand, .. } | Kind::Double(_, operand) => operand.prepares(),
@@ -1020,7 +1077,7 @@ impl Node {
     /// Whether computing this node over any rows raises nothing.
     fn infallible(&self) -> bool {
         stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || match &self.kind {
-            Kind::Column(_) | Kind::Literal(_) | Kind::Parameter(_) => true,
+            Kind::Column(_) | Kind::StructField { .. } | Kind::Literal(_) | Kind::Parameter(_) => true,
             Kind::Not(operand) | Kind::IsNull { operand, .. } => operand.infallible(),
             Kind::Compare { left, right, .. } | Kind::Identical { left, right } | Kind::Logical { left, right, .. } => left.infallible() && right.infallible(),
             Kind::Between { operand, low, high } => operand.infallible() && low.infallible() && high.infallible(),
@@ -1141,6 +1198,7 @@ impl Evaluation<'_> {
         let mut argument = move || arguments.next().expect("a strict node's arguments are prepared");
         let charged = match &node.kind {
             Kind::Column(position) => read(&self.columns[*position], &node.declared, len, self.memory)?,
+            Kind::StructField { position, name } => read_struct_field(&self.columns[*position], name, &node.declared, self.memory)?,
             Kind::Literal(value) => self.built(constant(value, len))?,
             Kind::Parameter(index) => match self.parameters {
                 // An Arrow-bound parameter is decoded on its first read, which `known` alone would leave undone.

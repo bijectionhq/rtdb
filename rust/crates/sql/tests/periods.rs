@@ -50,6 +50,41 @@ fn timestamp(value: i64) -> V { V::Timestamp { value, unit: TimeUnit::Microsecon
 fn period(lower: i64, upper: i64) -> V { V::TimestampTzRange { lower, upper } }
 
 #[tokio::test]
+async fn tsbs_period_constructor_preserves_zoned_ticks_infinite_bounds_and_errors() {
+    let zoned = "SELECT PERIOD(lo, hi) FROM (VALUES
+                    (TIMESTAMP '1970-01-01T01:00:00.000010+01:00', TIMESTAMP '1970-01-01T00:00:00.000030Z'),
+                    (TIMESTAMP '1970-01-01T01:00:00.000040+01:00', TIMESTAMP '1970-01-01T00:00:00.000050Z')
+                  ) t(lo, hi)";
+    assert_eq!(query(zoned).await.unwrap().1, [vec![period(10, 30)], vec![period(40, 50)]]);
+    let sql = "SELECT PERIOD(lo, hi) AS p FROM (VALUES
+                 (1, TIMESTAMP '1970-01-01T01:00:00.000010+01:00', TIMESTAMP '1970-01-01T00:00:00.000030Z'),
+                 (2, NULL::timestamptz, TIMESTAMP '1970-01-01T00:00:00.000030Z'),
+                 (3, TIMESTAMP '1970-01-01T00:00:00.000010Z', NULL::timestamptz)
+               ) t(n, lo, hi) ORDER BY n";
+    assert_eq!(query(sql).await.unwrap().1,
+               [vec![period(10, 30)], vec![period(i64::MIN, 30)], vec![period(10, i64::MAX)]]);
+    let inverted = "SELECT PERIOD(lo, hi) FROM (VALUES
+                       (TIMESTAMP '1970-01-01T00:00:00.000030Z', TIMESTAMP '1970-01-01T00:00:00.000010Z')
+                     ) t(lo, hi)";
+    assert_eq!(query(inverted).await.unwrap_err().code, "xtdb/invalid-period");
+}
+
+#[tokio::test]
+async fn tsbs_period_selected_bin_fields_feed_arithmetic_with_nulls() {
+    let sql = "WITH readings AS (
+                 SELECT _valid_time AS p, 8::DOUBLE PRECISION AS velocity FROM foo FOR ALL VALID_TIME
+                 UNION ALL SELECT _valid_time, NULL::DOUBLE PRECISION FROM foo FOR ALL VALID_TIME
+               )
+               SELECT (bin)._from AS lo, (bin)._weight AS weight, velocity * (bin)._weight AS weighted
+               FROM readings, UNNEST(RANGE_BINS(INTERVAL 'PT0.000025S', p)) AS bins(bin)
+               ORDER BY lo, weighted NULLS LAST";
+    assert_eq!(query(sql).await.unwrap().1, [
+        vec![timestamp(0), V::F64(0.75), V::F64(6.0)], vec![timestamp(0), V::F64(0.75), V::Null],
+        vec![timestamp(25), V::F64(0.25), V::F64(2.0)], vec![timestamp(25), V::F64(0.25), V::Null],
+    ]);
+}
+
+#[tokio::test]
 async fn tsbs_period_bins_preserve_typed_bounds_weights_and_open_end() {
     let sql = "WITH readings AS (
                  SELECT _valid_time AS p FROM foo FOR ALL VALID_TIME

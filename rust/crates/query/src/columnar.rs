@@ -5342,6 +5342,11 @@ impl BatchCursor for BatchExpressions {
                 owners[index] = Some(owner);
                 continue;
             }
+            if let Some((column, owner)) = periods::construct(kernel, &self.schema, &batch, &self.execution.context)? {
+                columns.push(column);
+                owners[index] = Some(owner);
+                continue;
+            }
             if let Some((column, owner)) = periods::range_bins(kernel, &self.schema, &batch, &self.execution.context)? {
                 columns.push(column);
                 owners[index] = Some(owner);
