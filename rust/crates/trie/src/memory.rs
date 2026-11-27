@@ -44,13 +44,13 @@ impl Default for TrieConfig { fn default() -> Self { Self { log_limit: 64, page_
 pub struct Leaf {
     path: Path,
     data: Arc<[u32]>,
-    log: Arc<[u32]>,
+    log: Box<[u32]>,
     sorted: OnceLock<Arc<[u32]>>,
 }
 
 impl Leaf {
-    fn empty(path: Path) -> Self { Self::new(path, Arc::from([]), Arc::from([])) }
-    fn new(path: Path, data: Arc<[u32]>, log: Arc<[u32]>) -> Self { Self { path, data, log, sorted: OnceLock::new() } }
+    fn empty(path: Path) -> Self { Self::new(path, Arc::from([]), Box::default()) }
+    fn new(path: Path, data: Arc<[u32]>, log: Box<[u32]>) -> Self { Self { path, data, log, sorted: OnceLock::new() } }
     pub fn path(&self) -> &Path { &self.path }
     pub fn len(&self) -> usize { self.data.len() + self.log.len() }
     pub fn is_empty(&self) -> bool { self.len() == 0 }
@@ -154,14 +154,26 @@ impl MemoryHashTrie {
         self.add_rows(reader, start..end)
     }
 
-    fn add_rows<R: IidReader + ?Sized>(&self, reader: &R, rows: impl ExactSizeIterator<Item = u32> + Clone) -> Result<Self> {
-        for row in rows.clone() {
-            if !Bucketer::DEFAULT.contains(self.root.path(), reader.iid(row)?)? {
-                return Err(Anomaly::incorrect("rtdb/trie-root-path", "Added IID lies outside the trie's root path"));
-            }
-        }
+    fn add_rows<R: IidReader + ?Sized>(&self, reader: &R, mut rows: impl ExactSizeIterator<Item = u32> + Clone) -> Result<Self> {
         if rows.len() == 0 { return Ok(self.clone()); }
+        if rows.len() == 1 {
+            let row = rows.next().unwrap();
+            let iid = reader.iid(row)?;
+            self.validate_root(iid)?;
+            let root = insert_row(&self.root, reader, row, iid, self.config)?;
+            return Ok(Self { root, config: self.config });
+        }
+        for row in rows.clone() {
+            self.validate_root(reader.iid(row)?)?;
+        }
         Ok(Self { root: insert_rows(&self.root, reader, rows, self.config)?, config: self.config })
+    }
+
+    fn validate_root(&self, iid: Iid) -> Result<()> {
+        if !Bucketer::DEFAULT.contains(self.root.path(), iid)? {
+            return Err(Anomaly::incorrect("rtdb/trie-root-path", "Added IID lies outside the trie's root path"));
+        }
+        Ok(())
     }
 
     pub fn compact_logs<R: IidReader + ?Sized>(&self, reader: &R) -> Result<Self> {
@@ -191,6 +203,24 @@ impl MemoryHashTrie {
 
 impl Default for MemoryHashTrie { fn default() -> Self { Self::new(TrieConfig::default()) } }
 
+fn insert_row<R: IidReader + ?Sized>(
+    node: &TrieNode, reader: &R, row: u32, iid: Iid, config: TrieConfig,
+) -> Result<Arc<TrieNode>> {
+    match node {
+        TrieNode::Leaf(leaf) => insert_leaf(leaf, reader, std::iter::once(row), config),
+        TrieNode::Branch { path, children } => {
+            let bucket = Bucketer::DEFAULT.bucket(iid, path.len())?;
+            let index = usize::from(bucket);
+            let mut next = children.clone();
+            next[index] = Some(match children[index].as_deref() {
+                Some(child) => insert_row(child, reader, row, iid, config)?,
+                None => insert_leaf(&Leaf::empty(path.child(bucket, Bucketer::DEFAULT)?), reader, std::iter::once(row), config)?,
+            });
+            Ok(Arc::new(TrieNode::Branch { path: path.clone(), children: next }))
+        }
+    }
+}
+
 fn insert_rows<R: IidReader + ?Sized>(
     node: &Arc<TrieNode>, reader: &R, rows: impl ExactSizeIterator<Item = u32>, config: TrieConfig,
 ) -> Result<Arc<TrieNode>> {
@@ -210,21 +240,27 @@ fn insert_rows<R: IidReader + ?Sized>(
             }
             Ok(Arc::new(TrieNode::Branch { path: path.clone(), children: next }))
         }
-        TrieNode::Leaf(leaf) => {
-            let count = leaf.log.len().checked_add(rows.len()).ok_or_else(|| Anomaly::incorrect("rtdb/trie-size", "Trie pending row count overflow").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded))?;
-            if count <= config.log_limit {
-                let mut log = leaf.log.to_vec();
-                log.extend(rows);
-                let next = Arc::new(TrieNode::Leaf(Leaf::new(leaf.path.clone(), Arc::clone(&leaf.data), log.into())));
-                if count == config.log_limit { compact(&next, reader, config) } else { Ok(next) }
-            } else {
-                let merged = merge_overflow_rows(&leaf.data, leaf.log.iter().copied(), rows, |row| {
-                    reader.iid(row).map(|iid| iid.0)
-                })?;
-                build_subtree(leaf.path.clone(), merged, reader, config, true)
-            }
-        }
+        TrieNode::Leaf(leaf) => insert_leaf(leaf, reader, rows, config),
     }
+}
+
+fn insert_leaf<R: IidReader + ?Sized>(
+    leaf: &Leaf, reader: &R, rows: impl ExactSizeIterator<Item = u32>, config: TrieConfig,
+) -> Result<Arc<TrieNode>> {
+    let count = leaf.log.len().checked_add(rows.len()).ok_or_else(|| Anomaly::incorrect("rtdb/trie-size", "Trie pending row count overflow").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded))?;
+    let iid = |row| reader.iid(row).map(|iid| iid.0);
+    if count > config.log_limit {
+        let merged = merge_overflow_rows(&leaf.data, leaf.log.iter().copied(), rows, iid)?;
+        return build_subtree(leaf.path.clone(), merged, reader, config, true);
+    }
+    let mut log = Vec::with_capacity(count);
+    log.extend_from_slice(&leaf.log);
+    log.extend(rows);
+    if count == config.log_limit {
+        let merged = merge_pending_rows(&leaf.data, log.into_iter(), iid)?;
+        return build_subtree(leaf.path.clone(), merged, reader, config, false);
+    }
+    Ok(Arc::new(TrieNode::Leaf(Leaf::new(leaf.path.clone(), Arc::clone(&leaf.data), log.into_boxed_slice()))))
 }
 
 fn compact<R: IidReader + ?Sized>(node: &Arc<TrieNode>, reader: &R, config: TrieConfig) -> Result<Arc<TrieNode>> {
@@ -250,7 +286,7 @@ fn build_subtree<R: IidReader + ?Sized>(path: Path, rows: Vec<u32>, reader: &R, 
         |buckets, contents| {
             let path = Path::from_split_buckets(buckets);
             Arc::new(match contents {
-                SplitContents::Leaf(rows) => TrieNode::Leaf(Leaf::new(path, rows.into(), Arc::from([]))),
+                SplitContents::Leaf(rows) => TrieNode::Leaf(Leaf::new(path, rows.into(), Box::default())),
                 SplitContents::Branch(children) => TrieNode::Branch { path, children },
             })
         },
@@ -288,7 +324,7 @@ fn import<R: IidReader + ?Sized>(node: PersistedNode, path: Path, reader: &R) ->
             validate_persisted_order(&rows, |row| reader.iid(row).map(|iid| iid.0), || {
                 Anomaly::incorrect("rtdb/trie-row-order", "Persisted trie rows are out of IID/newest-first order")
             })?;
-            Ok(Arc::new(TrieNode::Leaf(Leaf::new(path, rows.into(), Arc::from([])))))
+            Ok(Arc::new(TrieNode::Leaf(Leaf::new(path, rows.into(), Box::default()))))
         }
         PersistedNode::Branch(children) => {
             if children.len() != 4 || path.len() == Bucketer::DEFAULT.max_depth() {

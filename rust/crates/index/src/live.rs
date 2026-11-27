@@ -576,7 +576,7 @@ impl LiveTable {
             return Err(invalid("The table write has the wrong physical entity-key layout"));
         }
         if adopted_history {
-            if self.row_count != 0 || !self.relation.is_empty() {
+            if self.last_system_time.is_some() {
                 return Err(invalid("An adopted history must start a virgin live table"));
             }
         } else if batches.clone().any(|batch| !batch.has_system_time(system_time)) {
@@ -610,12 +610,14 @@ impl LiveTable {
 
     fn append_relation_batch(&mut self, batch: Arc<IndexBatch>) -> Result<()> {
         let count = u32::try_from(batch.len()).map_err(invalid)?;
+        if count == 0 { return Ok(()); }
         let first_new_row = self.row_count;
         let row_count = first_new_row.checked_add(count).ok_or_else(|| invalid("Live table exceeds u32 row address space"))?;
+        let trie = self.trie.add_range(&AppendIids { table: self, batch: &batch }, first_new_row, count)?;
         self.relation.push(first_new_row, batch);
         self.row_count = row_count;
-        self.trie = self.trie.add_range(self, first_new_row, count)?;
-        if count > 0 { self.lineage.append(self.row_count); }
+        self.trie = trie;
+        self.lineage.append(self.row_count);
         Ok(())
     }
     pub fn ordered_events(&self) -> Result<Vec<EventRow<RowSource>>> {
@@ -673,6 +675,20 @@ impl LiveTable {
 
 impl IidReader for LiveTable {
     fn iid(&self, row: u32) -> Result<Iid> { self.header(row).map(|header| header.iid) }
+}
+
+struct AppendIids<'a> {
+    table: &'a LiveTable,
+    batch: &'a IndexBatch,
+}
+
+impl IidReader for AppendIids<'_> {
+    fn iid(&self, row: u32) -> Result<Iid> {
+        if let Some(offset) = row.checked_sub(self.table.row_count) {
+            return self.batch.header(offset as usize).map(|header| header.iid);
+        }
+        self.table.iid(row)
+    }
 }
 
 pub struct BlockPages<'a> {

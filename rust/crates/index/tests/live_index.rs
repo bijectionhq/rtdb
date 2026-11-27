@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use rtdb_columnar::MemoryBudget;
 use rtdb_format::{block::proto as pb, catalog::BlockCatalog, keys::TrieKey};
-use rtdb_index::{BlockPreparation, CatalogTrie, PartitionState, Snapshot, StagedWrite, StoredOperation, TransactionBuffer};
+use rtdb_index::{BlockPreparation, CatalogTrie, PartitionState, PartitionValue, Snapshot, StagedWrite, StoredOperation, TableCatalog, TransactionBuffer, TrieCatalog};
 use rtdb_temporal::HistoryResolver;
 use rtdb_trie::{EventMerge, TrieConfig};
 use rtdb_types::{BlockIndex, EntityId, Interval, LogicalType, ScalarType, TableRef, TemporalBounds, Timestamp, TransactionKey, TxId, Value};
@@ -316,6 +316,58 @@ fn empty_declared_table_is_visible_to_later_staged_transactions() {
     state.apply(&staged).unwrap();
     assert!(state.open_snapshot(Some(key(0).tx_id)).tables().contains(&table()));
     assert!(state.open_snapshot(Some(key(0).tx_id)).contains_table(&table()));
+}
+
+#[test]
+fn schema_only_apply_and_checkpoint_keep_the_declaration_without_retaining_row_batches() {
+    let config = TrieConfig::new(2, 4).unwrap();
+    let state = PartitionState::empty(config).unwrap();
+    let memory = MemoryBudget::new(1 << 24);
+    let table = table();
+    let field = (String::from("v"), LogicalType::Scalar(ScalarType::I64));
+    let declarations = StructFields::from([field.clone()]);
+    let mut creator = TransactionBuffer::new(state.snapshot(), key(0), Arc::clone(&memory)).unwrap();
+    creator.declare_table(table.clone(), [field.0.clone()]).unwrap();
+    creator.record_sql_declaration(&table, &[field]).unwrap();
+    let staged = creator.stage().unwrap();
+    assert!(staged.tables()[&table].batch().unwrap().is_empty());
+    state.apply(&staged).unwrap();
+    drop(staged);
+
+    let declared = state.snapshot();
+    let segment = &declared.segments(&table)[0];
+    assert_eq!(segment.declared_columns(), &declarations);
+    assert!(segment.batches().next().is_none());
+    assert_eq!(state.value().live().live_batch_bytes(), 0);
+    assert_eq!(memory.used_bytes(), 0);
+
+    let prepared = state.prepare_block().unwrap();
+    let durable = block(&prepared);
+    let tries = BTreeMap::new();
+    let as_of = key(0).system_time;
+    let blocks = prepared.table_blocks(&tries, as_of).unwrap();
+    let restored = PartitionState::new(PartitionValue::loaded(
+        TrieCatalog::load(&blocks, TrieCatalog::default().file_size_target(), as_of).unwrap(),
+        TableCatalog::load(Some(durable.clone()), &blocks).unwrap(),
+        config,
+    ).unwrap());
+    state.adopt_block(prepared, durable, &blocks, &tries, as_of).unwrap();
+
+    let mut writer = TransactionBuffer::new(state.snapshot(), key(1), Arc::clone(&memory)).unwrap();
+    writer.put(table.clone(), document(1, 1), Interval::ALL).unwrap();
+    writer.erase(table.clone(), &EntityId::Integer(1)).unwrap();
+    let replayed = writer.stage().unwrap();
+    for partition in [&state, &restored] {
+        assert_eq!(partition.value().table_catalog().metadata(&table).unwrap().declared_columns, declarations);
+        partition.apply(&replayed).unwrap();
+        let snapshot = partition.snapshot();
+        let segment = &snapshot.segments(&table)[0];
+        assert_eq!(segment.locate(0).unwrap(), (0, 0));
+        let events = segment.ordered_events().unwrap();
+        assert_eq!(events[0].source.event().unwrap().operation, StoredOperation::Erase);
+        assert_eq!(events[1].source.event().unwrap().operation, StoredOperation::Put(document(1, 1)));
+    }
+    assert!(segment.batches().next().is_none());
 }
 
 #[test]

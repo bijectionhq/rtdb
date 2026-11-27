@@ -144,6 +144,7 @@ rule AddIndex {
 
     -- Creates new trie with index added (immutable operation)
     -- Navigates to correct leaf based on IID at new_idx
+    -- One stored IID lookup supplies every branch decision for a single insertion.
 
     ensures: result = MemoryHashTrie.created(
         root_node: trie.root_node.add(new_idx),

@@ -152,6 +152,36 @@ fn adding_a_range_stops_at_the_first_outside_iid_and_checks_overflow_before_look
 }
 
 #[test]
+fn a_single_append_routes_with_one_iid_read_and_shares_other_branches() {
+    struct Reader<'a> {
+        iids: &'a [Iid],
+        visited: RefCell<Vec<u32>>,
+    }
+
+    impl IidReader for Reader<'_> {
+        fn iid(&self, row: u32) -> Result<Iid> {
+            self.visited.borrow_mut().push(row);
+            self.iids.iid(row)
+        }
+    }
+
+    let iids = [0, 0x0100_0000, 0x4000_0000, 0x8000_0000, 0xc000_0000, 0x0100_0000].map(iid);
+    let prefix = MemoryHashTrie::new(TrieConfig::new(4, 1).unwrap()).add_range(&iids[..], 0, 5).unwrap();
+    let reader = Reader { iids: &iids, visited: RefCell::new(Vec::new()) };
+    let next = prefix.add_range(&reader, 5, 1).unwrap();
+    assert_eq!(reader.visited.into_inner(), [5]);
+
+    let (TrieNode::Branch { children: before, .. }, TrieNode::Branch { children: after, .. }) =
+        (prefix.root().as_ref(), next.root().as_ref()) else { panic!("Expected IIDs in distinct branches"); };
+    for bucket in 1..4 {
+        assert!(Arc::ptr_eq(before[bucket].as_ref().unwrap(), after[bucket].as_ref().unwrap()));
+    }
+    assert_eq!(prefix.sorted_rows(&iids[..]).unwrap(), [0, 1, 2, 3, 4]);
+    let restored = MemoryHashTrie::from_persisted(next.persisted(&iids[..]).unwrap(), &iids[..]).unwrap();
+    assert_eq!(restored.sorted_rows(&iids[..]).unwrap(), [0, 5, 1, 2, 3, 4]);
+}
+
+#[test]
 fn add_range_preserves_the_same_multiset_as_folded_add_across_thresholds() {
     let iids: Vec<_> = (0..200).map(|i| iid((i * 67) % 139)).collect();
     for count in [0, 6, 8, 20, 200] {

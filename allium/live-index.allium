@@ -24,6 +24,8 @@
 --   One coroutine writes a transient, and it is never published mid-flight.
 --   Columnar puts retain their Arrow values alongside resolved IIDs and valid-time intervals until the events are encoded.
 --   A committed SQL declaration retains its original column types through replica replay and checkpoints separately from the types inferred from row events.
+--   Applying a zero-row table delta retains its schema in the table and leaves the row relation and trie at their existing prefix.
+--   Indexing an append reads its new IIDs from the incoming batch and resolves earlier IIDs against the existing relation.
 --   A positioned owned append returns the ordinal it stored in the event header for use by the resolver's change journal.
 --   Rebuilding an unpositioned archive event leaves the original ordinal inventory available to positioned effects.
 --   A copied world effect consumes its explicit original ordinal independently of the Root effect sequence.
