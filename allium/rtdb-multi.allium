@@ -56,6 +56,10 @@
 -- dev/doc/rtdb-multi-plan.md stages the implementation and names the code each part grows from.
 -- The target serving protocol uses scoped attempt receipts and a loglet read index.
 -- The implementation still exposes numeric intake positions, fences on member lease loss and lacks the subscriber read index.
+-- An installed deployment may enable direct synchronous SQL commits after its replay consumers support direct outcomes.
+-- The native writer journals the ordinary attempt's admission witness and resolved outcome in the same replica record.
+-- Applied read-back supplies the synchronous receipt.
+-- Explicit asynchronous and timed SQL keep the placed receiver reservation protocol.
 -- verification/redesign/authority-boundaries.md describes the migration and proof premises.
 -- Where this spec and an existing spec describe the same mechanism, the existing spec describes the code as it stands and this one describes where it is going:
 --   - election and the term fence: log-processor-lifecycle.allium
@@ -808,6 +812,11 @@ contract LogService {
         -- A custodian synchronizes a reused local object and its directory entries before treating it as durable.
         -- The journal orders publication under the custodian before accepting trim through that cut.
         -- An ordinary native checkpoint cut is the inclusive replica boundary plus one.
+        -- With deferred checkpoints enabled, a confirmed installed writer may resolve and apply later untimed transactions while the sealed checkpoint uploads.
+        -- The custodian selects the sealed boundary and its certified root, and trim preserves every committed record after that boundary.
+        -- The current installed writer may protect its applied catalog for transaction resolution, live SQL reads and receipt lookups through the selected keeper checkpoint and the exact suffix covering its newer adopted block.
+        -- An exact reader names its captured checkpoint root and independently protects its captured suffix.
+        -- Protected replay that crosses the boundary holds both live generations until adopting the sealed checkpoint from the matching upload's admitted files.
         -- The custodian names the selected checkpoint and its exact cut when advancing the retained floor.
         -- An immutable Multi journal can append and select its checkpoint announcement and advance the logical floor in one keeper decision.
         -- Replay uses the selected announcement when several retained checkpoints cover the same cut.
@@ -848,7 +857,10 @@ contract LogService {
         -- An empty journal's read cut selects an empty catalog with no transaction basis.
         -- A published empty catalog names the exact replica floor and the current storage version and epoch.
         -- The receiving database applies the protected cut before the fresh read can proceed.
+        -- Current SQL on the active installed writer can protect a later published cut in the same history once it covers the barrier.
+        -- An exact certified read retains its selected cut.
         -- Every read is a fresh admission under a new invocation, and the journal never replays an earlier read's result.
+        -- The reader can retry a conflicting installed barrier using a new route and invocation.
         -- A reader that loses a read's outcome releases it by invocation identity, and that release settles once the invocation can no longer be admitted.
         -- Mutations keep exact retry through their original receipts.
 

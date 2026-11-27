@@ -2,12 +2,13 @@ use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 
 use rtdb_format::{catalog::legacy_table_ref, envelope::{ReplicaBody, decode_replica_outcome_attempt}};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_index::{Snapshot, StagedWrite};
+use rtdb_index::{BlockPreparation, Snapshot, StagedWrite};
 use rtdb_storage::{ObjectStore, cache::BufferPool, object_store::ReadReservation};
 use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, EventOp, EventOrigin, EventPosition, Iid, PlacedReservation, PlacedTerminal, ReplicaPosition, Result, SourcePosition, TableRef, Term, Timestamp};
 use tokio_util::sync::CancellationToken;
 
-use crate::{NativeServingAuthority, PartitionLogs, RecoveredPartition, blocks::{matches_confirmation, validate_uploaded_root}, driver::{additions, artefact_entries}, serving::retained};
+use crate::{BlockStore, NativeServingAuthority, PartitionLogs, RecoveredPartition, ReplicaRecord,
+    blocks::{matches_confirmation, validate_boundary, validate_uploaded_root}, driver::{additions, artefact_entries}, serving::retained};
 
 /// Owns the original checkpoint boundary and protected replica interval.
 pub struct SnapshotReplay {
@@ -99,7 +100,7 @@ impl RecoveredPartition {
     /// Collect every committed erase on this exact certified head, including
     /// markers that applied while the broker was closing admission.
     pub async fn replay_sql_erasure(
-        &mut self, logs: &PartitionLogs, replay: SnapshotReplay, store: Arc<dyn ObjectStore>,
+        &mut self, logs: &PartitionLogs, replay: SnapshotReplay, blocks: &BlockStore,
         cancellation: &CancellationToken,
     ) -> Result<SqlErasureSource> {
         let authenticated_head = replay.protected.suffix.as_ref().and_then(|range| range.authenticated_head)
@@ -109,7 +110,7 @@ impl RecoveredPartition {
         let mut first_marker = None;
         let mut targets = Vec::new();
         let memory = logs.memory();
-        let custody = self.replay_snapshot_suffix_with(logs, replay, cancellation, |position, write, committed| {
+        let custody = self.replay_snapshot_suffix_with(logs, replay, blocks, cancellation, |position, write, committed| {
             if committed {
                 let marker = erasure_targets(write, memory)?;
                 if !marker.is_empty() {
@@ -122,13 +123,13 @@ impl RecoveredPartition {
         Ok(SqlErasureSource {
             authenticated_head, cut, checkpoint, source_position: self.progress.source_position, first_marker,
             targets, inherited_erasure: None, custody, snapshot: self.partition.snapshot(),
-            store, memory: Arc::clone(memory),
+            store: Arc::clone(blocks.storage().object_store()), memory: Arc::clone(memory),
             fence: self.fence.clone(), external_token: self.progress.external_token.clone(),
         })
     }
 
     async fn replay_snapshot_suffix_with(
-        &mut self, logs: &PartitionLogs, replay: SnapshotReplay, cancellation: &CancellationToken,
+        &mut self, logs: &PartitionLogs, replay: SnapshotReplay, blocks: &BlockStore, cancellation: &CancellationToken,
         mut observe: impl FnMut(ReplicaPosition, &StagedWrite, bool) -> Result<()> + Send,
         require_complete_transactions: bool,
     ) -> Result<Option<Arc<dyn Send + Sync>>> {
@@ -165,6 +166,7 @@ impl RecoveredPartition {
         };
         let mut reached = after;
         let mut slot: Option<(PlacedReservation, Term)> = None;
+        let mut sealed: Option<(ReplicaRecord, BlockPreparation)> = None;
         while let Some(raw) = cancellation.run_until_cancelled(range.next(ReadReservation::new(bound, memory.reserve(bound)?)))
             .await.ok_or_else(crate::progress::cancelled)??
         {
@@ -197,8 +199,10 @@ impl RecoveredPartition {
                     let attempt = message.placed_attempt.as_deref().map(decode_replica_outcome_attempt)
                         .transpose()?.map(|(attempt, _)| attempt);
                     let terminal = message.placed_slot_terminal.as_deref().map(PlacedTerminal::decode).transpose()?;
+                    let direct = message.checked_direct_placed_admission()?;
                     match (slot, attempt, terminal) {
                         (None, None, None) => {}
+                        (None, Some(_), None) if direct.is_some() => {}
                         (Some((original, owner)), Some(attempt), Some(terminal))
                             if original.attempt == attempt && original.commitment == terminal.commitment
                                 && message.tx_id == Some(attempt.position().0) && message.src_msg_id == message.tx_id
@@ -272,6 +276,33 @@ impl RecoveredPartition {
                         self.partition.remove_artefacts_at(&table, artefact_entries(&message.entries), Some(position));
                     }
                     self.advance_snapshot_source(message.source_msg_id, slot.is_some())?;
+                }
+                ReplicaBody::BlockBoundary(message) if message.deferred_checkpoint == Some(true) => {
+                    if sealed.is_some() || slot.is_some() || serving.as_ref().is_some_and(|serving| serving.holds_checkpoint())
+                        || message.block_index != Some(self.partition.value().live().block_index().0)
+                    {
+                        return Err(unretained());
+                    }
+                    let prepared = self.partition.seal_block()?;
+                    self.advance_snapshot_source(message.latest_processed_msg_id, false)?;
+                    if let Some(token) = &message.external_source_token { self.progress.external_token = Some(token.clone().into()); }
+                    sealed = Some((ReplicaRecord::clone(&record), prepared));
+                }
+                ReplicaBody::BlockUploaded(message) if sealed.is_some() => {
+                    let (boundary, prepared) = sealed.take().ok_or_else(unretained)?;
+                    if slot.is_some() || !same_storage(message.storage_version, message.storage_epoch, cut)
+                        || message.block_index != Some(prepared.block_index().0)
+                    {
+                        return Err(unretained());
+                    }
+                    range.admit_snapshot_files(offset)?;
+                    let (block, tables) = cancellation.run_until_cancelled(blocks.load(prepared.block_index()))
+                        .await.ok_or_else(crate::progress::cancelled)??;
+                    validate_boundary(&block, &prepared, &boundary)?;
+                    if !matches_confirmation(&block, message, cut.storage_version, cut.storage_epoch) { return Err(unretained()); }
+                    validate_uploaded_root(&block, message, true)?;
+                    self.partition.adopt_sealed_block(prepared, block.clone(), &tables, &additions(&message.tries)?, at)?;
+                    self.block = Some(block);
                 }
                 ReplicaBody::BlockBoundary(_) | ReplicaBody::BlockUploaded(_) | ReplicaBody::OversizedMessage(_) =>
                     return Err(unretained()),
@@ -361,6 +392,78 @@ mod tests {
     use rtdb_format::log::proto;
     use rtdb_storage::{cache::BufferPool, MemoryStore};
     use rtdb_types::TxId;
+
+    #[tokio::test]
+    async fn protected_replay_admits_the_exact_assets_of_a_crossed_deferred_checkpoint() -> Result<()> {
+        use rtdb_format::{envelope::ReplicaEnvelope, keys::CURRENT_STORAGE_VERSION};
+        use rtdb_storage::log::{LogMetadata, LogOffset, LogRange, LogRecord, MemoryLog,
+            ProtectedLogRange, ProtectedLogSnapshot};
+        use rtdb_types::{BlockIndex, StorageEpoch, TermSequence};
+
+        struct HeldRange {
+            records: std::collections::VecDeque<LogRecord>,
+            admitted: Arc<parking_lot::Mutex<Vec<LogOffset>>>,
+            delivered: Option<LogOffset>,
+        }
+        #[async_trait::async_trait]
+        impl LogRange for HeldRange {
+            fn allocation_bound(&self) -> usize { 4096 }
+            async fn next(&mut self, reservation: ReadReservation) -> rtdb_storage::Result<Option<LogRecord>> {
+                let record = self.records.pop_front();
+                self.delivered = record.as_ref().map(|record| record.metadata.offset);
+                record.map(|record| record.retain(reservation)).transpose()
+            }
+            fn admit_snapshot_files(&mut self, position: LogOffset) -> rtdb_storage::Result<()> {
+                assert_eq!(self.delivered.take(), Some(position));
+                self.admitted.lock().push(position);
+                Ok(())
+            }
+        }
+
+        let memory = MemoryBudget::new(1 << 26);
+        let store = Arc::new(MemoryStore::default());
+        let cache = Arc::new(BufferPool::new(store.clone(), 1 << 20));
+        let blocks = BlockStore::new(store.clone(), Arc::clone(&cache), Arc::clone(&memory), 1 << 20)?;
+        let logs = PartitionLogs::new(Arc::new(MemoryLog::new(4096)), Arc::new(MemoryLog::new(4096)),
+            StorageEpoch(0), StorageEpoch(0), CURRENT_STORAGE_VERSION, StorageEpoch(0), store, cache, Arc::clone(&memory))?;
+        let record = |at: i64, message| LogRecord::new(LogMetadata { offset: LogOffset(at), timestamp: Timestamp(at + 100) },
+            ReplicaEnvelope { term: Term(1), term_sequence: Some(TermSequence(at)), message }.encode().into());
+        let transaction = |position| proto::ResolvedTx { tx_id: Some(position), src_msg_id: Some(position),
+            system_time_micros: Some(100 + position), committed: Some(true), ..Default::default() };
+        let boundary = record(1, ReplicaBody::BlockBoundary(proto::BlockBoundary {
+            block_index: Some(0), latest_processed_msg_id: Some(0), deferred_checkpoint: Some(true), ..Default::default()
+        }));
+        let mut writer = blocks.empty_snapshot_base(Default::default(), SourcePosition(-1), Timestamp(100))?;
+        writer.apply_snapshot_transaction(&transaction(0), &memory, |_, _| Ok(()))?;
+        let captured = writer.partition.prepare_block()?;
+        let boundary_record = logs.decode_replica(boundary.clone())?.unwrap();
+        let produced = blocks.produce(&captured, &boundary_record, BTreeMap::new()).await?;
+        let upload = record(3, ReplicaBody::BlockUploaded(proto::BlockUploaded {
+            storage_version: Some(CURRENT_STORAGE_VERSION.0), storage_epoch: Some(0), block_index: Some(0), latest_processed_msg_id: Some(0),
+            catalog_sha256: Some(produced.catalog.publication_sha256().unwrap().to_vec()), ..Default::default()
+        }));
+        let cut = CatalogCut { storage_version: CURRENT_STORAGE_VERSION, storage_epoch: StorageEpoch(0),
+            replica_epoch: StorageEpoch(0), through: ReplicaPosition(4) };
+        let admitted = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let replay = SnapshotReplay { cut, after: ReplicaPosition(-1), checkpoint: None, serving: None,
+            protected: ProtectedLogSnapshot { provider: None, suffix: Some(ProtectedLogRange {
+                authenticated_head: Some([1; 32]), hold: Arc::new(()), range: Box::new(HeldRange {
+                    records: [record(0, ReplicaBody::ResolvedTx(transaction(0))), boundary,
+                        record(2, ReplicaBody::ResolvedTx(transaction(1))), upload,
+                        record(4, ReplicaBody::ResolvedTx(transaction(2)))].into(),
+                    admitted: Arc::clone(&admitted), delivered: None,
+                }),
+            }) },
+        };
+        let mut recovered = blocks.empty_snapshot_base(Default::default(), SourcePosition(-1), Timestamp(100))?;
+        let source = recovered.replay_sql_erasure(&logs, replay, &blocks, &CancellationToken::new()).await?;
+        assert_eq!(*admitted.lock(), vec![LogOffset(3)]);
+        assert_eq!(source.snapshot().block_index(), BlockIndex(1));
+        assert_eq!(source.snapshot().table_catalog().block_index(), Some(BlockIndex(0)));
+        assert_eq!(source.snapshot().tx_basis().unwrap().tx_id, TxId(2));
+        assert_eq!(source.source_position(), SourcePosition(2));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn survivor_checkpoint_matches_the_exact_head_event_and_member_sets() -> Result<()> {

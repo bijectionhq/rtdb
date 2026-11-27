@@ -39,6 +39,8 @@ pub struct InstalledCell {
     pub archive_root: String,
     pub keys: String,
     pub custody_manifest: Option<PathBuf>,
+    #[serde(default)]
+    pub(crate) direct_sql_commits: bool,
     maximum_prefix_bytes: usize,
     maximum_application_frame: usize,
     #[serde(default = "exchange_ms")]

@@ -8,7 +8,7 @@ use rtdb_columnar::{EntityIdRef, MemoryBudget, OwnedBatch};
 use rtdb_format::catalog::{DECLARED_COLUMNS, schema_declarations};
 use rtdb_format::{data::{EncodedEvent, StoredOperation}, envelope::decode_replica_outcome_attempt, generated::xtdb::log::proto::ResolvedTx};
 use rtdb_index::{IndexBatch, StagedWrite, TableWrite};
-use rtdb_types::{Anomaly, BlockIndex, EventOp, Interval, PLACED_ATTEMPT_OUTCOME_TABLE, PlacedAttempt, Result, StructFields, TableRef, Timestamp, TransactionKey, TxId, Value};
+use rtdb_types::{Anomaly, BlockIndex, EventOp, Interval, LogicalType, PLACED_ATTEMPT_OUTCOME_TABLE, PlacedAttempt, Result, ScalarType, StructFields, TableRef, TimeUnit, Timestamp, TransactionKey, TxId, Value};
 
 use crate::{RetainedAnomaly, TransactionResult};
 
@@ -37,6 +37,7 @@ pub fn project_held_replica(message: &mut ResolvedTx, predecessor: TransactionKe
     message.table_data.retain(|name, _| !receipt_table(name));
     message.placed_attempt = None;
     message.placed_slot_terminal = None;
+    message.placed_direct_admission = None;
     // The strict acceptance witness is bound to that same placed attempt.
     // Original journal admission checked it before this projection.
     message.acceptance_stage = None;
@@ -47,7 +48,9 @@ pub fn project_held_replica(message: &mut ResolvedTx, predecessor: TransactionKe
 /// passed the full replica decoder. Placement-dependent checks ran before the
 /// receipt witness was removed. This decoder is private to archived replay.
 pub fn decode_held_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>, block: BlockIndex, memory: &Arc<MemoryBudget>) -> Result<ReplayedTransaction> {
-    if message.placed_attempt.is_some() || message.placed_slot_terminal.is_some() || message.table_data.keys().any(|name| receipt_table(name)) {
+    if message.placed_attempt.is_some() || message.placed_slot_terminal.is_some() || message.placed_direct_admission.is_some()
+        || message.table_data.keys().any(|name| receipt_table(name))
+    {
         return Err(invalid("Held business replay contains expiring transaction metadata"));
     }
     decode(message, predecessor, block, memory, true)
@@ -58,6 +61,7 @@ fn receipt_table(name: &str) -> bool {
 }
 
 fn decode(message: &ResolvedTx, predecessor: Option<TransactionKey>, block: BlockIndex, memory: &Arc<MemoryBudget>, held: bool) -> Result<ReplayedTransaction> {
+    let direct = message.checked_direct_placed_admission()?;
     if let Some(wire) = message.placed_slot_terminal.as_deref() {
         let terminal = rtdb_types::PlacedTerminal::decode(wire)?;
         if message.placed_attempt.is_none() || (terminal.fenced && (
@@ -153,7 +157,10 @@ fn decode(message: &ResolvedTx, predecessor: Option<TransactionKey>, block: Bloc
     if held {
         return Ok(ReplayedTransaction { writes: StagedWrite::new(key, predecessor, block, tables)?, result, placed_attempt: None });
     }
-    let outcome = placed.map(|(attempt, retirement)| read_placed_outcome(&tables, attempt, retirement, &result, memory)).transpose()?;
+    let direct_receipt_time = direct.map(|admission| checked_direct_receipt_time(&tables, key, admission.submitted_at)).transpose()?;
+    let outcome = placed.map(|(attempt, retirement)| {
+        read_placed_outcome(&tables, attempt, retirement, direct_receipt_time, &result, memory)
+    }).transpose()?;
     let proof = outcome.as_ref().map(|(proof, _)| proof);
     let world_effects = proof.and_then(|proof| proof.get(worlds::WORLD_EFFECTS));
     let archive_replay = match proof.and_then(|proof| proof.get(crate::hosted_control::RESOLVED_ARCHIVE_REPLAY)) {
@@ -421,9 +428,32 @@ fn verify_archive_replay(
     Ok(())
 }
 
+fn checked_direct_receipt_time(
+    tables: &BTreeMap<TableRef, TableWrite>, key: TransactionKey, submitted_at: Timestamp,
+) -> Result<Timestamp> {
+    let mismatch = || invalid("A direct placed admission differs from its transaction clocks");
+    let batch = tables.get(&TableRef::new("xt", "txs")).and_then(TableWrite::batch)
+        .filter(|batch| batch.len() == 1).ok_or_else(mismatch)?;
+    let row = batch.view().borrow_event(0)?;
+    let header = row.header();
+    let identity = EntityIdRef::Integer(key.tx_id.0);
+    if header.op != EventOp::Put || !header.written_in(key) || header.commit_position != 0
+        || header.iid != identity.iid() || row.put_identity()? != Some(identity)
+    {
+        return Err(mismatch());
+    }
+    let ty = LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) });
+    let clock = |column| match row.put_cell(column, &ty)?.as_ref() {
+        Value::Timestamp { value, unit: TimeUnit::Microsecond, .. } => Ok(Timestamp(*value)),
+        _ => Err(mismatch()),
+    };
+    if clock("source_log_time")? != submitted_at { return Err(mismatch()); }
+    clock("receipt_time")
+}
+
 fn read_placed_outcome(
-    tables: &BTreeMap<TableRef, TableWrite>, attempt: PlacedAttempt, retirement: bool, result: &TransactionResult,
-    memory: &Arc<MemoryBudget>,
+    tables: &BTreeMap<TableRef, TableWrite>, attempt: PlacedAttempt, retirement: bool,
+    direct_receipt_time: Option<Timestamp>, result: &TransactionResult, memory: &Arc<MemoryBudget>,
 ) -> Result<(StructFields<Value>, Arc<rtdb_columnar::MemoryReservation>)> {
     let key = result.tx_key();
     let mismatch = || invalid("Resolved transaction differs from its ordered placed attempt");
@@ -451,7 +481,14 @@ fn read_placed_outcome(
         {
             continue;
         }
-        if header.op != EventOp::Put || header.iid != expected || proof.is_some() { return Err(mismatch()); }
+        if header.op != EventOp::Put || header.iid != expected || proof.is_some()
+            || direct_receipt_time.is_some_and(|receipt_time| {
+                header.valid_time.lower() != receipt_time
+                    || header.valid_time.upper() != Timestamp(receipt_time.0.saturating_add(crate::RECEIPT_WINDOW_MICROS))
+            })
+        {
+            return Err(mismatch());
+        }
         let event = outcome.view().read_event(row)?;
         let StoredOperation::Put(row) = event.operation else { return Err(mismatch()); };
         proof = Some(row);

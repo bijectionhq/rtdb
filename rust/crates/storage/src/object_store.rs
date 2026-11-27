@@ -220,6 +220,12 @@ pub trait ObjectStore: Send + Sync {
     ) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
         Ok(None)
     }
+    /// Admits a catalog captured by the active transaction resolver.
+    async fn admit_writer_catalog(
+        &self, cut: Option<rtdb_types::CatalogCut>, checkpoint: Option<rtdb_types::CatalogCheckpoint>,
+    ) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
+        self.admit_catalog(cut, checkpoint).await
+    }
     /// Whether physical trie retirement belongs to a coordinated storage authority.
     fn defers_trie_releases(&self) -> bool { false }
     /// The custodian can settle covered receipt L0 after releasing its recovery dependencies.

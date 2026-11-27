@@ -23,7 +23,7 @@ pub struct DatabaseSnapshot { pub partitions: Vec<Snapshot>, pub storage: Arc<Bu
 
 /// The custody the storage owner grants for reading this snapshot's captured catalog, reusing custody already attached
 /// to the snapshot. Only a hosted journal grants any; every other store keeps no reader state and returns `None`.
-async fn admit_snapshot(snapshot: &Snapshot, storage: &BufferPool) -> Result<Option<Arc<dyn Send + Sync>>> {
+async fn admit_snapshot(snapshot: &Snapshot, storage: &BufferPool, transaction_scoped: bool) -> Result<Option<Arc<dyn Send + Sync>>> {
     let cut = snapshot.catalog_cut();
     if let Some(admission) = snapshot.catalog_read_permit::<CatalogAdmission>()
         && storage.admitted(&admission, cut)
@@ -31,7 +31,9 @@ async fn admit_snapshot(snapshot: &Snapshot, storage: &BufferPool) -> Result<Opt
         return Ok(Some(admission as Arc<dyn Send + Sync>));
     }
     let checkpoint = match cut { Some(_) => snapshot.catalog_checkpoint()?, None => None };
-    Ok(storage.admit_catalog(cut, checkpoint).await?.map(|admission| admission as Arc<dyn Send + Sync>))
+    let admission = if transaction_scoped { storage.admit_writer_catalog(cut, checkpoint).await? }
+        else { storage.admit_catalog(cut, checkpoint).await? };
+    Ok(admission.map(|admission| admission as Arc<dyn Send + Sync>))
 }
 
 #[derive(Clone, Debug)]
@@ -162,7 +164,7 @@ impl CatalogSnapshot {
             for database in self.databases.values() {
                 for snapshot in &database.partitions {
                     if snapshot.catalog_cut().is_some() || snapshot.read_custody_deadline().is_none() {
-                        admissions.extend(admit_snapshot(snapshot, &database.storage).await?);
+                        admissions.extend(admit_snapshot(snapshot, &database.storage, self.transaction_scoped).await?);
                     }
                 }
             }

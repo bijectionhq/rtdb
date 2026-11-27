@@ -72,6 +72,7 @@ message ResolvedTx {
 
     // Exact reserved input commitment, prefixed with the terminal kind.
     bytes placed_slot_terminal = 1003;
+    bytes placed_direct_admission = 1004;
 
     reserved 10 to 13;
 }

@@ -232,6 +232,22 @@ pub struct AcceptanceStageWitness {
 }
 
 impl crate::log::proto::ResolvedTx {
+    pub fn checked_direct_placed_admission(&self) -> Result<Option<rtdb_types::PlacedReservation>> {
+        let Some(wire) = &self.placed_direct_admission else { return Ok(None); };
+        let admission = rtdb_types::PlacedReservation::decode(wire)?;
+        let attempt = self.placed_attempt.as_deref().map(decode_replica_outcome_attempt).transpose()?;
+        let position = Some(admission.attempt.position().0);
+        if attempt.is_none_or(|(attempt, _)| attempt != admission.attempt)
+            || self.tx_id != position || self.src_msg_id != position || self.system_time_micros.is_none()
+            || self.committed.is_none() || self.placed_slot_terminal.is_some() || self.acceptance_stage.is_some()
+            || self.db_op.is_some() || self.external_source_token.is_some()
+            || !self.table_data.contains_key("xt/placed_attempt_outcomes")
+        {
+            return Err(invalid("The direct placed admission does not match the transaction outcome"));
+        }
+        Ok(Some(admission))
+    }
+
     /// Coordinates retained with a strict committed transaction. The sample
     /// is the writer's admission clock, before quorum durability.
     pub fn checked_acceptance_stage(&self) -> Result<Option<AcceptanceStageWitness>> {

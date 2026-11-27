@@ -79,6 +79,7 @@ pub struct SourceTransaction {
     pub options: SubmitOptions,
     pub(crate) guard: Option<SourceGuard>,
     placed_seed: Option<PlacedAttemptSeed>,
+    direct_placed_commit: bool,
     pub(crate) prepared_landing: Option<crate::resolver::PreparedLanding>,
     pub(crate) interactive: Option<crate::resolver::PreparedInteractive>,
     pub(crate) memory: Arc<MemoryBudget>,
@@ -153,7 +154,7 @@ impl SourceTransaction {
     }
 
     pub fn local_interactive_retained_bytes(&self) -> Option<usize> {
-        if !self.operations.is_empty() || self.guard.is_some() || self.placed_seed.is_some() || self.prepared_landing.is_some()
+        if !self.operations.is_empty() || self.guard.is_some() || self.placed_seed.is_some() || self.direct_placed_commit || self.prepared_landing.is_some()
             || self.options.system_time.is_none() || self.options.user_metadata.is_some()
         {
             return None;
@@ -169,7 +170,7 @@ impl SourceTransaction {
         self.local_interactive_retained_bytes()?;
         let interactive = self.interactive.as_ref()?.clone();
         Some(Self {
-            operations: Vec::new(), options: self.options.clone(), guard: None, placed_seed: None, prepared_landing: None,
+            operations: Vec::new(), options: self.options.clone(), guard: None, placed_seed: None, direct_placed_commit: false, prepared_landing: None,
             interactive: Some(interactive), memory: Arc::clone(&self.memory), _reservation: Arc::clone(&self._reservation),
         })
     }
@@ -239,7 +240,7 @@ impl SourceTransaction {
             bytes = bytes.checked_add(text).and_then(|size| size.checked_add(ids)).and_then(|size| size.checked_add(table.map_or(0, |table| table.schema.capacity() + table.table.capacity()))).and_then(|size| size.checked_add(256)).ok_or_else(overflow)?;
         }
         let reservation = memory.reserve(bytes)?;
-        Ok(Self { operations, options, guard: None, placed_seed: None, prepared_landing: None, interactive: None, memory: Arc::clone(memory), _reservation: reservation })
+        Ok(Self { operations, options, guard: None, placed_seed: None, direct_placed_commit: false, prepared_landing: None, interactive: None, memory: Arc::clone(memory), _reservation: reservation })
     }
 
     pub fn with_idempotency_guard(mut self, submitted_at: Timestamp, after_bootstrap: bool) -> Self {
@@ -262,6 +263,28 @@ impl SourceTransaction {
         self
     }
 
+    pub fn with_direct_placed_commit(mut self) -> Self {
+        self.direct_placed_commit = self.can_commit_directly();
+        self
+    }
+
+    fn can_commit_directly(&self) -> bool {
+        self.placed_seed.is_some() && self.interactive.is_none() && !self.operations.is_empty()
+            && !self.operations.iter().any(Operation::is_owned)
+            && !self.requires_durable_predecessor()
+    }
+
+    pub fn direct_placed_commit(&self) -> bool { self.direct_placed_commit }
+
+    pub fn direct_placed_message(message: &SourceMessage) -> Result<bool> {
+        let SourceMessage::Protobuf(SourceBody::Tx(tx)) = message else { return Ok(false); };
+        match tx.direct_placed_commit {
+            Some(true) if tx.placed_attempt_seed.is_some() => Ok(true),
+            None => Ok(false),
+            _ => Err(invalid("A direct placed commit requires an attempt seed")),
+        }
+    }
+
     pub fn placed_attempt(&self, position: SourcePosition) -> Result<Option<PlacedAttempt>> {
         self.placed_seed.map(|seed| seed.identify(position, self.options.user.as_deref())).transpose()
     }
@@ -279,6 +302,7 @@ impl SourceTransaction {
             _ => 0,
         };
         let _option_scratch = memory.reserve(option_bytes)?;
+        let direct_placed_commit = Self::direct_placed_message(message)?;
         let placed_seed = match message {
             SourceMessage::Protobuf(SourceBody::Tx(tx)) => decode_placed_seed(tx)?,
             _ => None,
@@ -324,7 +348,7 @@ impl SourceTransaction {
             _ => return Err(invalid("Source message is not a transaction")),
         };
         if pages.is_empty() && !legacy {
-            if guard.is_some() { return Err(invalid("A guarded transaction requires an operations batch")); }
+            if guard.is_some() || direct_placed_commit { return Err(invalid("This transaction requires an operations batch")); }
             let mut transaction = Self::from_operations(Vec::new(), options, memory)?;
             transaction.placed_seed = placed_seed;
             return Ok(transaction);
@@ -363,6 +387,10 @@ impl SourceTransaction {
         let mut transaction = Self::from_operations(operations, options, memory)?;
         transaction.guard = guard;
         transaction.placed_seed = placed_seed;
+        if direct_placed_commit && !transaction.can_commit_directly() {
+            return Err(invalid("Only ordinary placed transactions can commit directly"));
+        }
+        transaction.direct_placed_commit = direct_placed_commit;
         Ok(transaction)
     }
 
@@ -557,6 +585,7 @@ impl SourceTransaction {
             replay_submission,
             bounded_retry,
             placed_attempt_seed: self.placed_seed.map(|seed| seed.encode().to_vec().into()),
+            direct_placed_commit: self.direct_placed_commit.then_some(true),
         };
         let extension = rtdb_format::envelope::tx_uses_extension(&tx);
         let tail_len = tx.encoded_len();

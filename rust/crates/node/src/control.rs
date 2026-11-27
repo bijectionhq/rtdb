@@ -207,7 +207,7 @@ impl NativeSession {
         };
         let catalog_context = if needs_catalog {
             let basis = self.state.inspection_basis()?;
-            Some(self.service.query_context(self.state.database(), &basis, cancellation).await?)
+            Some(self.service.inspection_context(self.state.database(), &basis, cancellation).await?)
         } else { None };
         let catalog = catalog_context.as_ref().map(|context| &context.catalog as &dyn rtdb_expr::PgCatalogLookup);
         match statement {
@@ -370,7 +370,7 @@ impl NativeSession {
     async fn show(&mut self, name: &str, checked: bool, source: Option<SourceInspection>, cancellation: &CancellationToken) -> Result<QueryCursor> {
         let context = if checked { self.query_context_with(cancellation, true).await? } else {
             let basis = self.state.inspection_basis()?;
-            self.instrument_query_context(self.service.query_context(self.state.database(), &basis, cancellation).await?)
+            self.instrument_query_context(self.service.inspection_context(self.state.database(), &basis, cancellation).await?)
         };
         let mut bound = 8192usize;
         if let Some(value) = self.state.parameter(name) { bound = size(bound, value.len().checked_mul(4).ok_or_else(|| invalid("SHOW allocation size overflow"))?)?; }

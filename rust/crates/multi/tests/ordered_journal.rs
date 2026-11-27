@@ -813,25 +813,27 @@ async fn start_disposal_node(
         .unwrap()
 }
 
-#[test]
-fn installed_owned_reads_hold_their_cut_and_retry_a_discarded_reply() {
-    const WORKFLOW_DEADLINE: Duration = Duration::from_secs(60);
-    std::thread::Builder::new().stack_size(rtdb_node::WORKER_STACK_BYTES).spawn(|| {
+fn run_with_worker_stack<F: std::future::Future<Output = ()>>(test: impl FnOnce() -> F + Send + 'static) {
+    std::thread::Builder::new().stack_size(rtdb_node::WORKER_STACK_BYTES).spawn(move || {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .thread_stack_size(rtdb_node::WORKER_STACK_BYTES)
             .enable_all()
             .build()
             .unwrap();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            runtime.block_on(async {
-                tokio::time::timeout(WORKFLOW_DEADLINE, exercise_installed_owned_reads()).await
-                    .expect("installed owned reads and node shutdown should finish within the workflow deadline");
-            });
-        }));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.block_on(test())));
         runtime.shutdown_timeout(DEADLINE);
         if let Err(error) = result { std::panic::resume_unwind(error); }
     }).unwrap().join().unwrap();
+}
+
+#[test]
+fn installed_owned_reads_hold_their_cut_and_retry_a_discarded_reply() {
+    const WORKFLOW_DEADLINE: Duration = Duration::from_secs(60);
+    run_with_worker_stack(|| async {
+        tokio::time::timeout(WORKFLOW_DEADLINE, exercise_installed_owned_reads()).await
+            .expect("installed owned reads and node shutdown should finish within the workflow deadline");
+    });
 }
 
 async fn exercise_installed_owned_reads() {
@@ -1489,18 +1491,36 @@ async fn flight_client(
     client
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn gateway_replaces_a_writer_and_resumes_its_prepared_provider_copy() {
-    recover_after_writer_loss(true).await;
+enum RecoveryCoverage {
+    CheckpointRetirement,
+    CombinedFeatures,
+    CombinedRetirement,
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn idle_custodian_discovers_the_chosen_upload_after_writer_loss() {
-    recover_after_writer_loss(false).await;
+#[test]
+fn gateway_replaces_a_writer_and_resumes_its_prepared_provider_copy() {
+    run_with_worker_stack(|| recover_after_writer_loss(true, RecoveryCoverage::CheckpointRetirement));
 }
 
-async fn recover_after_writer_loss(prepare_before_loss: bool) {
+#[test]
+fn idle_custodian_discovers_the_chosen_upload_after_writer_loss() {
+    run_with_worker_stack(|| recover_after_writer_loss(false, RecoveryCoverage::CheckpointRetirement));
+}
+
+#[test]
+fn hosted_combined_features_with_deferred_archive_preparation() {
+    run_with_worker_stack(|| recover_after_writer_loss(false, RecoveryCoverage::CombinedFeatures));
+}
+
+#[test]
+fn hosted_combined_features_survive_a_second_checkpoint_and_reopen() {
+    run_with_worker_stack(|| recover_after_writer_loss(true, RecoveryCoverage::CombinedRetirement));
+}
+
+async fn recover_after_writer_loss(prepare_before_loss: bool, coverage: RecoveryCoverage) {
     use futures::TryStreamExt;
+
+    let combined_features = !matches!(coverage, RecoveryCoverage::CheckpointRetirement);
 
     let record = DeploymentRecord::new("shop", "acceptance", Vec::new(), now_ms());
     let deployment: Uuid = record.id.parse().unwrap();
@@ -1566,24 +1586,28 @@ async fn recover_after_writer_loss(prepare_before_loss: bool) {
             .data
             .path()
             .join(format!("worker-route-{index}.json"));
-        write_json(
-            &path,
-            &json!([{
-                "deployment": record,
-                "worker": installed_client(&authority.workers[index], json!({"kind": "worker", "enrollment": authority.enrollments[index]})),
-                "custody": (prepare_before_loss || index == 1)
-                    .then(|| installed_client(&authority.custodian, json!({"kind": "custody"}))),
-                "endpoints": endpoints,
-                "archive": archive,
-                "archive_prefix": "checkpoints",
-                "checkpoint_reservations": reservations,
-            }]),
-        );
+        let mut manifest = json!({
+            "deployment": record,
+            "worker": installed_client(&authority.workers[index], json!({"kind": "worker", "enrollment": authority.enrollments[index]})),
+            "custody": (prepare_before_loss || index == 1)
+                .then(|| installed_client(&authority.custodian, json!({"kind": "custody"}))),
+            "endpoints": endpoints,
+            "archive": archive,
+            "archive_prefix": "checkpoints",
+            "checkpoint_reservations": reservations,
+        });
+        if combined_features {
+            manifest["direct_sql_commits"] = json!(true);
+        }
+        write_json(&path, &json!([manifest]));
         let control_address = control.local_addr().unwrap();
         let pgwire_port = pgwire.local_addr().unwrap().port();
-        let configuration = rtdb_server::config::NodeConfiguration::from_yaml(&format!(
+        let mut configuration = rtdb_server::config::NodeConfiguration::from_yaml(&format!(
             "authn: !SingleRootUser\n  password: cell-test\nserver:\n  port: {pgwire_port}\n  numThreads: 4\nflightSql: {{port: 0}}\n",
         )).unwrap();
+        if combined_features {
+            configuration.multi_checkpoints.deferred = Some(!prepare_before_loss);
+        }
         let mut agent = AgentOptions::new(storage.clone());
         agent.installed_journal_manifest = Some(path);
         agent.watch_interval = Duration::from_millis(50);
@@ -1654,12 +1678,22 @@ async fn recover_after_writer_loss(prepare_before_loss: bool) {
     ));
 
     let initial = common::connect(&sql_address.to_string(), "shop").await;
+    let empty_head = if combined_features {
+        assert_eq!(common::values(&initial, "SELECT 1").await, ["1"]);
+        Some(route(&routing).await.head)
+    } else {
+        None
+    };
     initial
         .simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)")
         .await
         .unwrap();
     drop(initial);
     let before = route(&routing).await;
+    if let Some(empty_head) = empty_head {
+        assert_eq!(before.head.next_lsn, empty_head.next_lsn + 1);
+        assert_eq!(before.last_data, Some(before.head));
+    }
     let incumbent = before.writer.grant.unwrap();
     let incumbent_index = authority
         .enrollments
@@ -1716,6 +1750,24 @@ async fn recover_after_writer_loss(prepare_before_loss: bool) {
         .unwrap();
     assert!(route(&routing).await.head.next_lsn > before.head.next_lsn);
 
+    let earlier_receipt = if combined_features {
+        let earlier = common::connect(&sql_address.to_string(), "shop").await;
+        earlier
+            .simple_query("BEGIN READ WRITE; INSERT INTO receipt_probe (_id, value) VALUES (1, 17); COMMIT ASYNC")
+            .await
+            .unwrap();
+        let messages = earlier.simple_query("SHOW LATEST_SUBMITTED_TX").await.unwrap();
+        let receipt = messages.into_iter().find_map(|message| {
+            let tokio_postgres::SimpleQueryMessage::Row(row) = message else { return None; };
+            assert!(row.get("committed").is_none());
+            row.get("await_token").map(str::to_owned)
+        }).unwrap();
+        assert_eq!(common::values(&earlier, "SELECT value FROM receipt_probe").await, ["17"]);
+        Some(receipt)
+    } else {
+        None
+    };
+
     let mut old_flight = flight_client(flight_address, deployment).await;
     let ticket = old_flight
         .execute("SELECT CAST(total AS BIGINT) FROM orders".into(), None)
@@ -1746,11 +1798,14 @@ async fn recover_after_writer_loss(prepare_before_loss: bool) {
         .unwrap();
     blocker.try_lock().unwrap();
     let original_node = nodes[incumbent_index].as_ref().unwrap();
-    assert!(original_node.agent.flush("shop").await.is_err());
+    let original_database = original_node.server.node().catalog().database("shop").unwrap();
+    let flush_error = original_node.agent.flush("shop").await.unwrap_err();
     let interrupted = route(&routing).await;
     let pending = interrupted.preparing;
     if prepare_before_loss {
-        let pending = pending.expect("the exact provider intent was ordered before the fault");
+        let pending = pending.unwrap_or_else(|| {
+            panic!("The exact provider intent was missing after the failed flush: {flush_error:?}")
+        });
         assert_eq!(pending.source, incumbent);
         assert_eq!(pending.custody.allocation, allocation);
     } else {
@@ -1769,12 +1824,34 @@ async fn recover_after_writer_loss(prepare_before_loss: bool) {
 
     let suffix = common::connect(&sql_address.to_string(), "shop").await;
     let large = "x".repeat(1_310_720);
-    suffix
+    if let Err(error) = suffix
         .simple_query(&format!(
             "INSERT INTO suffix_values (_id, body) VALUES (1, '{large}')"
         ))
         .await
-        .unwrap();
+    {
+        let status = original_database.status();
+        panic!("Large suffix insert failed: {error:?}; progress: {:?}; role: {:?}; applied: {:?}",
+            original_database.progress().fault(), status.role, status.installed);
+    }
+    if let Some(earlier_receipt) = earlier_receipt {
+        assert_eq!(
+            common::values(&suffix, "SELECT octet_length(body) FROM suffix_values WHERE _id = 1").await,
+            ["1310720"]
+        );
+        suffix.simple_query(&format!("SET AWAIT_TOKEN TO '{earlier_receipt}'")).await.unwrap();
+        assert_eq!(common::values(&suffix, "SELECT value FROM receipt_probe").await, ["17"]);
+        assert_ne!(common::values(&suffix, "SHOW AWAIT_TOKEN").await, [earlier_receipt]);
+        if let Err(error) = suffix.batch_execute(update).await {
+            let status = original_database.status();
+            panic!(
+                "The keyed retry failed during archive publication: {error:?}; progress: {:?}; role: {:?}; applied: {:?}",
+                original_database.progress().fault(), status.role, status.installed,
+            );
+        }
+        assert_eq!(common::values(&suffix, "SELECT total FROM orders WHERE _id = 1").await, ["11"]);
+    }
+    drop(original_database);
     drop(suffix);
     let storage_root = rtdb_format::keys::StorageRoot::new(
         rtdb_format::keys::CURRENT_STORAGE_VERSION,
@@ -1794,7 +1871,12 @@ async fn recover_after_writer_loss(prepare_before_loss: bool) {
             .unwrap()
             .any(|entry| entry.unwrap().path().is_file())
     );
-    assert!(route(&routing).await.head.next_lsn > interrupted.head.next_lsn);
+    let after_suffix = route(&routing).await;
+    assert!(after_suffix.head.next_lsn > interrupted.head.next_lsn);
+    if combined_features {
+        assert_eq!(after_suffix.checkpoint, interrupted.checkpoint);
+        assert_eq!(after_suffix.preparing, interrupted.preparing);
+    }
     let generation_root = serving_root
         .join(record.storage_prefix())
         .join("~ordered")
@@ -1966,99 +2048,105 @@ async fn recover_after_writer_loss(prepare_before_loss: bool) {
         rtdb_types::Value::I64(11)
     );
 
-    // Closing the journal root and disposing of its local bytes are distinct
-    // effects. An overlapping provider borrow delays the physical action.
-    let provider_reader = OpenOptions::new()
-        .read(true)
-        .open(lifecycle.join("lock"))
-        .unwrap();
-    provider_reader.try_lock_shared().unwrap();
-    replacement
-        .simple_query("INSERT INTO orders (_id, total) VALUES (2, 70)")
-        .await
-        .unwrap();
-    nodes[1 - incumbent_index]
-        .as_ref()
-        .unwrap()
-        .agent
-        .flush("shop")
-        .await
-        .unwrap();
-    // The restored writer itself holds the old root until its attachment
-    // closes. Keep the separate provider reader alive across that release.
-    drop(new_flight);
-    drop(replacement);
-    nodes[1 - incumbent_index]
-        .as_ref()
-        .unwrap()
-        .agent
-        .park("shop")
-        .await
-        .unwrap();
-    let custodian = authority.custodian.client(&cohort.route);
-    eventually(async || {
-        let view = route(&custodian).await;
-        view.retirement
-            .filter(|old| old.checkpoint == published.checkpoint && old.closed)
-    })
-    .await;
-    assert!(
-        allocation_parent
-            .join(&allocation_name)
-            .join("manifest")
-            .is_file()
-    );
-    drop(provider_reader);
-    eventually(async || {
-        let marked = fs::read(lifecycle.join("closed"))
-            .ok()
-            .is_some_and(|bytes| bytes.as_slice() == published.checkpoint.manifest);
-        let removed = !allocation_parent.join(&allocation_name).exists();
-        let settled = route(&custodian)
+    if matches!(coverage, RecoveryCoverage::CombinedFeatures) {
+        drop(new_flight);
+        drop(replacement);
+        drop(zombie);
+    } else {
+        // Closing the journal root and disposing of its local bytes are distinct
+        // effects. An overlapping provider borrow delays the physical action.
+        let provider_reader = OpenOptions::new()
+            .read(true)
+            .open(lifecycle.join("lock"))
+            .unwrap();
+        provider_reader.try_lock_shared().unwrap();
+        replacement
+            .simple_query("INSERT INTO orders (_id, total) VALUES (2, 70)")
             .await
-            .retirement
-            .is_none_or(|old| old.checkpoint != published.checkpoint);
-        (marked && removed && settled).then_some(())
-    })
-    .await;
+            .unwrap();
+        nodes[1 - incumbent_index]
+            .as_ref()
+            .unwrap()
+            .agent
+            .flush("shop")
+            .await
+            .unwrap();
+        // The restored writer itself holds the old root until its attachment
+        // closes. Keep the separate provider reader alive across that release.
+        drop(new_flight);
+        drop(replacement);
+        nodes[1 - incumbent_index]
+            .as_ref()
+            .unwrap()
+            .agent
+            .park("shop")
+            .await
+            .unwrap();
+        let custodian = authority.custodian.client(&cohort.route);
+        eventually(async || {
+            let view = route(&custodian).await;
+            view.retirement
+                .filter(|old| old.checkpoint == published.checkpoint && old.closed)
+        })
+        .await;
+        assert!(
+            allocation_parent
+                .join(&allocation_name)
+                .join("manifest")
+                .is_file()
+        );
+        drop(provider_reader);
+        eventually(async || {
+            let marked = fs::read(lifecycle.join("closed"))
+                .ok()
+                .is_some_and(|bytes| bytes.as_slice() == published.checkpoint.manifest);
+            let removed = !allocation_parent.join(&allocation_name).exists();
+            let settled = route(&custodian)
+                .await
+                .retirement
+                .is_none_or(|old| old.checkpoint != published.checkpoint);
+            (marked && removed && settled).then_some(())
+        })
+        .await;
 
-    let covered = eventually(async || {
-        let view = route(&custodian).await;
-        (view.floor == view.checkpoint.cut && view.checkpoint.cut.next_lsn >= published.head.next_lsn)
-            .then_some(view)
-    })
-    .await;
-    assert!(covered.writer.epoch > incumbent.epoch);
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(
-        retired_prefix.join(&storage_root).join("~grant").is_file(),
-        "a held prefix is retained after the journal no longer needs it"
-    );
-    drop(zombie);
-    let lifecycle = generation_root.join(format!("{}.lifecycle", incumbent.epoch));
-    let receipt = generation_root.join("~retired").join(format!("{}.settled", incumbent.epoch));
-    eventually(async || (!retired_prefix.exists() && lifecycle.join("closed").is_file() && receipt.is_file()).then_some(())).await;
-    let settled: Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
-    assert_eq!(settled["intent"]["grant"]["epoch"], json!(incumbent.epoch));
-    assert_eq!(settled["intent"]["grant"]["worker"], json!(incumbent.enrollment.worker));
-    assert_eq!(settled["intent"]["inventory"], json!("local_directory"));
-    let successor = generation_root.join(elected.epoch.to_string());
-    assert!(successor.join(&storage_root).join("~grant").is_file(), "the current grant's prefix survives");
-    let late = OpenOptions::new().read(true).open(lifecycle.join("lock")).unwrap();
-    late.try_lock_shared().unwrap();
-    assert!(lifecycle.join("closed").is_file(), "a late reader finds the permanent closure");
-    drop(late);
+        let covered = eventually(async || {
+            let view = route(&custodian).await;
+            (view.floor == view.checkpoint.cut && view.checkpoint.cut.next_lsn >= published.head.next_lsn)
+                .then_some(view)
+        })
+        .await;
+        assert!(covered.writer.epoch > incumbent.epoch);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            retired_prefix.join(&storage_root).join("~grant").is_file(),
+            "a held prefix is retained after the journal no longer needs it"
+        );
+        drop(zombie);
+        let lifecycle = generation_root.join(format!("{}.lifecycle", incumbent.epoch));
+        let receipt = generation_root.join("~retired").join(format!("{}.settled", incumbent.epoch));
+        eventually(async || (!retired_prefix.exists() && lifecycle.join("closed").is_file() && receipt.is_file()).then_some(())).await;
+        let settled: Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+        assert_eq!(settled["intent"]["grant"]["epoch"], json!(incumbent.epoch));
+        assert_eq!(settled["intent"]["grant"]["worker"], json!(incumbent.enrollment.worker));
+        assert_eq!(settled["intent"]["inventory"], json!("local_directory"));
+        let successor = generation_root.join(elected.epoch.to_string());
+        assert!(successor.join(&storage_root).join("~grant").is_file(), "the current grant's prefix survives");
+        let late = OpenOptions::new().read(true).open(lifecycle.join("lock")).unwrap();
+        late.try_lock_shared().unwrap();
+        assert!(lifecycle.join("closed").is_file(), "a late reader finds the permanent closure");
+        drop(late);
 
-    let reopened = common::connect(&sql_address.to_string(), "shop").await;
-    assert_eq!(
-        common::values(&reopened, "SELECT total FROM orders").await,
-        ["11", "70"]
-    );
-    assert_eq!(
-        common::values(&reopened, "SELECT octet_length(body) FROM suffix_values WHERE _id = 1").await,
-        ["1310720"]
-    );
-    drop(reopened);
+        let reopened = common::connect(&sql_address.to_string(), "shop").await;
+        assert_eq!(
+            common::values(&reopened, "SELECT total FROM orders").await,
+            ["11", "70"]
+        );
+        assert_eq!(
+            common::values(&reopened, "SELECT octet_length(body) FROM suffix_values WHERE _id = 1").await,
+            ["1310720"]
+        );
+        drop(reopened);
+    }
 
     serving.cancel();
     tokio::time::timeout(DEADLINE, sql)

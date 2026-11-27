@@ -41,6 +41,7 @@ message Tx {
     // The intake position comes from the log record's metadata.
     bytes placed_attempt_seed = 1002;
     BoundedRetry bounded_retry = 1003;
+    bool direct_placed_commit = 1004;
     reserved 7 to 11;
     reserved prepared_landing;
 }

@@ -89,7 +89,7 @@ async fn capture(scenario: Scenario) -> Vec<String> {
         operation.clone(), Ok(()), &resolve).await.unwrap();
     let key = staged.result().tx_key();
     let (completion, mut receipt) = oneshot::channel();
-    fixture.driver.enqueue_resolved(staged, Some(completion)).await.unwrap();
+    fixture.driver.enqueue_resolved(staged, Some(completion), None).await.unwrap();
     trace.push(format!("enqueue 0 {}", key.tx_id.0));
 
     gate.submitted.notified().await;

@@ -11,6 +11,7 @@ pub enum AwaitAuthority {
         codec: Box<dyn PlacedReceiptCodec>,
         recovery: ClosedEpochRecovery,
         placed_receipt_retirement: bool,
+        direct_sql_commits: bool,
     },
     Checkpoint {
         codec: Box<dyn PlacedReceiptCodec>,

@@ -334,6 +334,13 @@ impl BufferPool {
         }))
     }
 
+    pub async fn admit_writer_catalog(&self, cut: Option<rtdb_types::CatalogCut>, checkpoint: Option<rtdb_types::CatalogCheckpoint>)
+        -> rtdb_types::Result<Option<Arc<CatalogAdmission>>> {
+        Ok(self.store.admit_writer_catalog(cut, checkpoint).await?.map(|custody| {
+            Arc::new(CatalogAdmission { residence: Arc::clone(&self.residence), cut, _custody: custody })
+        }))
+    }
+
     /// Whether `admission` was granted through this pool for exactly `cut`.
     pub fn admitted(&self, admission: &CatalogAdmission, cut: Option<rtdb_types::CatalogCut>) -> bool {
         Arc::ptr_eq(&self.residence, &admission.residence) && admission.cut == cut

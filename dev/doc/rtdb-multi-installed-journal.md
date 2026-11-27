@@ -32,6 +32,7 @@ The cell file contains the following fields.
 | `keys` | Serving and journal key vault location |
 | `maximum_prefix_bytes`, `maximum_application_frame` | Voter media prefix and application frame sizes for each group |
 | `exchange_ms` | Management deadline in milliseconds, defaulting to 2000 |
+| `direct_sql_commits` | Enables one logical append for ordinary synchronous SQL after all workers in the cell can replay direct outcomes. Defaults to false. |
 | `administrator_pin`, `route_reader_pin`, optional `custodian_pin` | SHA-256 pins encoded as 32-byte arrays |
 | `workers` | Ordered array of configured worker slots with `worker` UUID, `certificate` pin, `control` and `pgwire` addresses |
 | `credentials` | Optional per-role objects `administrator`, `route_reader`, `worker` and `custodian`, each with a PEM `certificate` and `key` path |
@@ -117,6 +118,15 @@ The manifests contain arrays. A node entry includes:
 - `checkpoint_reservations` with preassigned allocation UUIDs, the exact provider fingerprint in `custody.provider`, consecutive revisions starting after the installed checkpoint, and `usable_bytes` for each exact allocation. Fund peak old retention, the new copy and its metadata. Renew the reservation inventory before it runs out. Nodes and replacements must agree on an already prepared allocation.
 - For SQL erasure, `custody_work` supplies the broker domain UUID and the path to the enrolled PKCS#8 `admission_key`. The installed custodian also supplies `erasure_signing_key` with the separate PKCS#8 credential that matches the root's broker-enrolled evidence key. Provide the custody broker route and its privileged token to the custodian.
 - Optionally, `journal_window_bytes` to cap each automatically replenished append window. The actual funded amount is bounded by paid, currently reusable voter space.
+- Optionally, set `direct_sql_commits` to true on the same deployment in every worker's manifest once the workers and offline replay tools understand direct placed outcomes.
+  Upgrade every replay consumer before enabling the flag.
+  The first direct record creates history that older workers cannot replay.
+
+**Direct synchronous SQL.** The writer records the original admission and applied outcome together in its resolved replica record.
+A lost reply can be retried with the existing scoped idempotency key.
+Gateway private replay permits use the same direct path and check replay markers in the ordered transaction prefix.
+Explicit asynchronous submissions and operations that require a prior receiver reservation keep the original reservation and settlement protocol.
+One logical append still uses the installed Logkeeper authority's prepare and accept phases and protected replica read-back.
 
 A gateway entry includes `name`, the exact `deployment` UUID, a `journal` scope with routing authority and credential paths, and the same enrolled worker endpoints.
 Native PGWire and ordinary Flight SQL follow the journal route, authenticate worker readiness, and compare it with the current grant.
@@ -191,6 +201,8 @@ The scan is tied to the exact selected base and the newest chosen maintenance cu
 A changed base invalidates the scan, and staging still requires the new ordered preparation.
 An accepted block upload carries the digest of its exact encoded catalog.
 Installed recovery requires that digest before adopting or confirming the catalog.
+When a protected SQL erasure cut crosses a deferred block boundary, replay retains both live generations until the matching upload adopts the sealed one.
+The upload must authorize the exact checkpoint files in the held journal suffix and certify the selected catalog digest.
 Before staging a new copy, the custodian reads and decodes the chosen native block boundary under the exact preparation.
 Publication and trim use the custodian identity independently of the writer grant.
 Trim names the exact currently selected reconstructable root and retains every suffix still held by an overlapping read or attachment.
@@ -198,6 +210,25 @@ Its receipt names the old floor and the resulting floor and totals the encoded b
 Ordinary windows replenish from the reusable voter space reported by the installed journal.
 On ordinary capacity pressure, the driver pauses ordinary intake, preserves the previously accepted source prefix, and uses the maintenance lane for block boundaries, uploads, and fenced terminals that settle inherited receiver slots.
 The custodian queries the exact candidate cut and orders preparation without borrowing an ordinary read hold.
+
+### Deferred checkpoints
+
+Installed journals use blocking checkpoint cuts by default.
+To keep ordinary commits moving during checkpoint uploads, set the following on each worker after every process that reads this deployment's journal supports deferred boundaries.
+
+```yaml
+multiCheckpoints:
+  deferred: true
+```
+
+The setting applies to a confirmed writer on an installed journal with ordered writer grants and certified checkpoint digests.
+The writer seals one live block, starts the next block, and uploads the sealed block in the background.
+The custodian publishes the original cut and retains every committed record after it, including transactions applied during the upload.
+The memory budget and ordinary journal windows bound how far writes can advance before the upload finishes.
+External intake, physical erasure and the single-generation serving search formats use blocking checkpoint cuts.
+When turning the setting off, keep readers that support deferred boundaries until journal trim has retired the last one.
+
+### Writer promotion
 
 An installed driver promotes after an empty replica read and a positive check of the current grant.
 It starts the successor of the highest observed replica term at sequence zero.

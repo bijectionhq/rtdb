@@ -11,8 +11,8 @@ use rtdb_format::{database::proto::DatabaseConfig, envelope::{ReplicaBody, Repli
 use rtdb_index::TransactionBuffer;
 use rtdb_storage::{LocalStore, MemoryStore, ObjectKey, ObjectStore, cache::BufferPool, log::{LocalLog, LocalLogOptions, Log, LogMetadata, LogOffset, LogRecord, MemoryLog, ReadOnlyLocalLog, ReadOnlyLocalLogOptions}};
 use rtdb_trie::TrieConfig;
-use rtdb_tx::{Documents, ResolveContext, SourceTransaction, SubmitOptions, TransactionAuthorization, TxOp};
-use rtdb_types::{Anomaly, BlockIndex, Interval, ReplicaPosition, Result, SourcePosition, StorageEpoch, TableRef, Term, TermSequence, Timestamp, TransactionKey, TxId, Value};
+use rtdb_tx::{Documents, ReplaySubmission, ResolveContext, SourceTransaction, SubmitOptions, TransactionAuthorization, TxOp};
+use rtdb_types::{Anomaly, BlockIndex, Interval, PlacedReservation, ReplicaPosition, Result, SourcePosition, StorageEpoch, TableRef, Term, TermSequence, Timestamp, TransactionKey, TxId, Value};
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError::Empty;
 use tokio_util::sync::CancellationToken;
@@ -1184,7 +1184,7 @@ async fn staged_leader_and_decoding_follower_publish_the_same_transaction_prefix
         let resolved = leader.driver.leader.as_mut().unwrap().resolver_mut().unwrap()
             .resolve_source(snapshot, position, clock, transaction, &context).await.unwrap();
         assert_eq!(resolved.result().committed(), committed, "{statements:?}: {:?}", resolved.result());
-        leader.driver.enqueue_resolved(resolved, None).await.unwrap();
+        leader.driver.enqueue_resolved(resolved, None, None).await.unwrap();
         let records = tail.poll(Duration::from_secs(5)).await.unwrap();
         assert_eq!(records.len(), 1);
         let record = records.into_iter().next().unwrap();
@@ -3042,7 +3042,7 @@ async fn queued_attach_readback(fixture: &mut Fixture, operation: &DbOp, positio
     let staged = resolver.resolve_db_op(snapshot, position, Timestamp(100), operation.clone(), verdict, &resolve).await.unwrap();
     let key = staged.result().tx_key();
     let (completion, receipt) = oneshot::channel();
-    fixture.driver.enqueue_resolved(staged, Some(completion)).await.unwrap();
+    fixture.driver.enqueue_resolved(staged, Some(completion), None).await.unwrap();
 
     let mut tail = fixture.logs.replica_tail(fixture.driver.read_position).await.unwrap();
     let mut records = tail.poll(Duration::from_secs(5)).await.unwrap();
@@ -3096,6 +3096,166 @@ async fn a_strict_source_samples_the_clock_after_the_older_replica_write_applies
     let (resolver, result) = super::pending_resolution(&mut fixture.driver.leader.as_mut().unwrap().resolution).await;
     assert_eq!(result.as_ref().unwrap().result().error().unwrap().code, "rtdb.owned/expired");
     fixture.driver.resolution_finished(resolver, result).await.unwrap();
+    fixture.driver.demote().await.unwrap();
+}
+
+#[tokio::test]
+async fn direct_placed_sql_publishes_its_attempt_with_the_only_replica_decision() {
+    let mut fixture = fixture(ReplicationConfig { idle_heartbeat: false, ..Default::default() }, 1 << 16).await;
+    let scope = rtdb_types::PlacedAttemptScope::new("test-replica", 1).unwrap();
+    Arc::get_mut(&mut fixture.driver.resolve).unwrap().owned_witness_scope = Some(scope);
+    let seed = scope.issue();
+    let request = SourceTransaction::new(vec![TxOp::Sql {
+        sql: "INSERT INTO docs (_id) VALUES (1)".into(), args: None,
+    }], SubmitOptions { user: Some("owner".into()), ..Default::default() }, &fixture.memory)
+        .unwrap().with_placed_seed(Some(seed)).with_direct_placed_commit();
+    assert!(request.direct_placed_commit());
+    let submitted = Timestamp(100);
+    let payload = request.encode().unwrap().into_bytes();
+    let source = fixture.logs.append_source_encoded(payload.clone(), submitted).await.unwrap();
+    let expected = PlacedReservation::new(seed.identify(source, Some("owner")).unwrap(), submitted, &payload);
+    let driver = tokio::spawn(fixture.driver.run());
+    tokio::time::timeout(Duration::from_secs(5), fixture.handle.await_source(source, &CancellationToken::new()))
+        .await.unwrap().unwrap();
+    let latest = fixture.replica.latest().unwrap().0;
+    let records = fixture.replica.read_range(LogOffset(0), LogOffset(latest + 1)).await.unwrap();
+    let mut decisions = Vec::new();
+    for record in records {
+        match ReplicaEnvelope::decode(&record.payload).unwrap().unwrap().message {
+            ReplicaBody::ResolvedTx(tx) => decisions.push(tx),
+            ReplicaBody::NoOp(noop) => assert!(noop.placed_slot_reservation.is_none()),
+            _ => {}
+        }
+    }
+    let [decision] = decisions.as_slice() else { panic!("expected one direct decision") };
+    assert_eq!(decision.committed, Some(true));
+    assert_eq!(decision.checked_direct_placed_admission().unwrap(), Some(expected));
+    let reopened = rtdb_tx::decode_replica(decision, None, BlockIndex(0), &fixture.memory).unwrap();
+    assert_eq!(reopened.placed_attempt, Some(expected.attempt));
+    let mut mismatched = decision.clone();
+    mismatched.placed_direct_admission = Some(PlacedReservation { submitted_at: Timestamp(99), ..expected }.encode());
+    assert!(rtdb_tx::decode_replica(&mismatched, None, BlockIndex(0), &fixture.memory).is_err());
+    assert!(fixture.handle.progress().current().placed_outcome(expected.attempt).unwrap().committed);
+    fixture.handle.shutdown();
+    tokio::time::timeout(Duration::from_secs(5), driver).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_direct_gateway_replay_applies_an_offloaded_decision_with_a_receiver_clock() {
+    struct ReceiverClock;
+    #[async_trait]
+    impl rtdb_tx::DecisionClock for ReceiverClock {
+        async fn observe(&self) -> Result<rtdb_tx::DecisionObservation> {
+            Ok(rtdb_tx::DecisionObservation { domain: [1; 16], epoch: 1, sequence: 1, instant: Timestamp(250) })
+        }
+    }
+
+    let config = ReplicationConfig { idle_heartbeat: false, ..Default::default() };
+    let mut fixture = fixture(config, 1 << 20).await;
+    let scope = rtdb_types::PlacedAttemptScope::new("test-replica", 1).unwrap();
+    let context = Arc::get_mut(&mut fixture.driver.resolve).unwrap();
+    context.owned_witness_scope = Some(scope);
+    context.decision_clock = Some(Arc::new(ReceiverClock));
+    let seed = scope.issue();
+    let body = "x".repeat(1_310_720);
+    let request = SourceTransaction::new(vec![TxOp::Sql {
+        sql: format!("INSERT INTO docs (_id, body) VALUES (1, '{body}')"), args: None,
+    }], SubmitOptions { user: Some("owner".into()), ..Default::default() }, &fixture.memory)
+        .unwrap().with_placed_seed(Some(seed))
+        .with_replay_submission(ReplaySubmission::admit("00112233445566778899aabbccddeeff/0", Timestamp(100), Timestamp(10_000)).unwrap())
+        .with_direct_placed_commit();
+    let payload = request.encode().unwrap().into_bytes();
+    let position = fixture.logs.append_source_encoded(payload.clone(), Timestamp(100)).await.unwrap();
+    let admission = PlacedReservation::new(seed.identify(position, Some("owner")).unwrap(), Timestamp(100), &payload);
+    let running = tokio::spawn(fixture.driver.run());
+    tokio::time::timeout(Duration::from_secs(5), fixture.handle.await_source(position, &CancellationToken::new()))
+        .await.unwrap().unwrap();
+    assert!(fixture.handle.progress().current().placed_outcome(admission.attempt).unwrap().committed);
+
+    let latest = fixture.replica.latest().unwrap().0;
+    let records = fixture.replica.read_range(LogOffset(0), LogOffset(latest + 1)).await.unwrap();
+    let [opening, decision] = records.as_slice() else { panic!("expected the term opening and one direct decision"); };
+    assert!(matches!(ReplicaEnvelope::decode(&opening.payload).unwrap().unwrap().message,
+        ReplicaBody::NoOp(ref message) if message.placed_slot_reservation.is_none()));
+    let decision = fixture.logs.decode_replica(decision.clone()).unwrap().unwrap();
+    assert!(matches!(decision.envelope.message, ReplicaBody::OversizedMessage(_)));
+    let decision = fixture.logs.resolve_oversized(decision).await.unwrap();
+    let ReplicaBody::ResolvedTx(decision) = &decision.envelope.message else { panic!("expected the offloaded transaction"); };
+    assert_eq!(decision.checked_direct_placed_admission().unwrap(), Some(admission));
+    let replayed = rtdb_tx::decode_replica(decision, None, BlockIndex(0), &fixture.memory).unwrap();
+    assert!(replayed.result.committed());
+    assert_eq!(replayed.placed_attempt, Some(admission.attempt));
+    let outcomes = replayed.writes.tables().get(&TableRef::new("xt", "placed_attempt_outcomes")).unwrap();
+    assert_eq!(outcomes.batch().unwrap().header(0).unwrap().valid_time.lower(), Timestamp(250));
+    let mut mismatched = decision.clone();
+    mismatched.placed_direct_admission = Some(PlacedReservation { submitted_at: Timestamp(250), ..admission }.encode());
+    assert!(rtdb_tx::decode_replica(&mismatched, None, BlockIndex(0), &fixture.memory).is_err());
+    fixture.handle.shutdown();
+    tokio::time::timeout(Duration::from_secs(5), running).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_direct_gateway_replay_detects_a_staged_original_without_a_reservation() {
+    let mut fixture = fixture(ReplicationConfig { idle_heartbeat: false, ..Default::default() }, 1 << 16).await;
+    let scope = rtdb_types::PlacedAttemptScope::new("test-replica", 1).unwrap();
+    Arc::get_mut(&mut fixture.driver.resolve).unwrap().owned_witness_scope = Some(scope);
+    let opening = raw(0, 1, 0, ReplicaBody::NoOp(proto::NoOp::default()));
+    fixture.replica.enqueue(opening.payload.clone(), opening.metadata.timestamp).await.unwrap().durable().await.unwrap();
+    fixture.driver.consume(opening).await.unwrap();
+    fixture.driver.promote().await.unwrap();
+
+    let replay_key = "00112233445566778899aabbccddeeff/0";
+    let mut attempts = Vec::new();
+    for (id, submitted) in [(1, Timestamp(100)), (2, Timestamp(101))] {
+        let seed = scope.issue();
+        let request = SourceTransaction::new(vec![TxOp::Sql {
+            sql: format!("INSERT INTO docs (_id) VALUES ({id})"), args: None,
+        }], SubmitOptions { user: Some("owner".into()), ..Default::default() }, &fixture.memory)
+            .unwrap().with_placed_seed(Some(seed))
+            .with_replay_submission(ReplaySubmission::admit(replay_key, submitted, Timestamp(10_000)).unwrap())
+            .with_direct_placed_commit();
+        assert!(request.direct_placed_commit());
+        let payload = request.encode().unwrap().into_bytes();
+        let position = fixture.logs.append_source_encoded(payload.clone(), submitted).await.unwrap();
+        attempts.push(PlacedReservation::new(seed.identify(position, Some("owner")).unwrap(), submitted, &payload));
+    }
+
+    let records = fixture.source.read_range(LogOffset(0), LogOffset(2)).await.unwrap();
+    let leader = fixture.driver.leader.as_mut().unwrap();
+    leader.source_batch.extend(records);
+    leader.source_batch_end = Some(fixture.logs.latest_source_position().unwrap());
+    fixture.driver.resolve_next_source().await.unwrap();
+    let (resolver, result) = super::pending_resolution(&mut fixture.driver.leader.as_mut().unwrap().resolution).await;
+    let first = result.as_ref().unwrap().result();
+    assert!(first.committed());
+    let original = first.tx_key();
+    fixture.driver.resolution_finished(resolver, result).await.unwrap();
+
+    assert_eq!(fixture.handle.progress().current().tx_id(), TxId(-1));
+    assert!(fixture.driver.leader.as_ref().unwrap().resolution.is_some());
+    let (resolver, result) = super::pending_resolution(&mut fixture.driver.leader.as_mut().unwrap().resolution).await;
+    let error = result.as_ref().unwrap().result().error().unwrap();
+    assert_eq!(rtdb_tx::private_replay_original(error).unwrap(), Some(original));
+    fixture.driver.resolution_finished(resolver, result).await.unwrap();
+
+    let mut replica = fixture.replica.tail(LogOffset(0)).await.unwrap();
+    let mut decisions = Vec::new();
+    while decisions.len() < attempts.len() {
+        let records = replica.poll(Duration::from_secs(5)).await.unwrap();
+        assert!(!records.is_empty());
+        decisions.extend(records);
+    }
+    assert_eq!(decisions.len(), attempts.len());
+    for ((admission, committed), record) in attempts.into_iter().zip([true, false]).zip(decisions) {
+        let ReplicaBody::ResolvedTx(decision) = ReplicaEnvelope::decode(&record.payload).unwrap().unwrap().message else {
+            panic!("each direct attempt should append only its decision");
+        };
+        assert_eq!(decision.checked_direct_placed_admission().unwrap(), Some(admission));
+        assert_eq!(decision.committed, Some(committed));
+        fixture.driver.consume(record).await.unwrap();
+        assert_eq!(fixture.handle.progress().current().placed_outcome(admission.attempt).unwrap().committed, committed);
+    }
+    assert!(replica.poll(Duration::ZERO).await.unwrap().is_empty());
     fixture.driver.demote().await.unwrap();
 }
 

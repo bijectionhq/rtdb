@@ -7,7 +7,7 @@ use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope}, log::proto};
 use rtdb_index::{PreparedSearchDelta, PreparedWrite};
 use rtdb_tx::{OwnedReplicaBody, ResolvedTx, TransactionResult};
-use rtdb_types::{Anomaly, BlockIndex, PlacedTerminal, ReplicaPosition, Result, Term, TermSequence, Timestamp};
+use rtdb_types::{Anomaly, BlockIndex, PlacedReservation, PlacedTerminal, ReplicaPosition, Result, Term, TermSequence, Timestamp};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -32,6 +32,11 @@ pub(crate) struct AppendStamp {
     pub fingerprint: Option<ReplicaFingerprint>,
 }
 
+enum PlacedPublication {
+    Reserved(PlacedTerminal),
+    Direct(PlacedReservation),
+}
+
 pub(crate) struct PreparedInteractivePublication {
     pub body: OwnedReplicaBody,
     pub revision: Mutex<Option<PreparedWrite>>,
@@ -43,7 +48,7 @@ pub(crate) struct PreparedInteractivePublication {
 pub(crate) struct PendingWrite {
     pub body: WriteBody,
     pub block: BlockIndex,
-    placed_terminal: Option<PlacedTerminal>,
+    placed: Option<PlacedPublication>,
     pub interactive: Option<PreparedInteractivePublication>,
     append: OnceLock<AppendStamp>,
     completion: Mutex<Option<oneshot::Sender<Result<Applied>>>>,
@@ -64,7 +69,10 @@ impl PendingWrite {
         }
     }
     pub fn placed(body: WriteBody, block: BlockIndex, terminal: PlacedTerminal, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
-        Ok(Self::reserved(body, block, None, Some(terminal), None, memory.reserve(1024)?))
+        Ok(Self::reserved(body, block, None, Some(PlacedPublication::Reserved(terminal)), None, memory.reserve(1024)?))
+    }
+    pub fn direct_placed(body: WriteBody, block: BlockIndex, admission: PlacedReservation, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
+        Ok(Self::reserved(body, block, None, Some(PlacedPublication::Direct(admission)), None, memory.reserve(1024)?))
     }
     pub fn clone_message(body: &ReplicaBody, block: BlockIndex, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
         let reservation = memory.reserve(Self::message_bound(body)?)?;
@@ -79,8 +87,8 @@ impl PendingWrite {
         body.encoded_len().checked_mul(4).and_then(|bytes| bytes.checked_add(8192))
             .ok_or_else(|| Anomaly::fault("rtdb.replication/payload-size", "Pending message allocation size overflow"))
     }
-    fn reserved(body: WriteBody, block: BlockIndex, completion: Option<oneshot::Sender<Result<Applied>>>, placed_terminal: Option<PlacedTerminal>, interactive: Option<PreparedInteractivePublication>, reservation: Arc<MemoryReservation>) -> Arc<Self> {
-        Arc::new(Self { body, block, placed_terminal, interactive, append: OnceLock::new(), completion: Mutex::new(completion), _reservation: reservation })
+    fn reserved(body: WriteBody, block: BlockIndex, completion: Option<oneshot::Sender<Result<Applied>>>, placed: Option<PlacedPublication>, interactive: Option<PreparedInteractivePublication>, reservation: Arc<MemoryReservation>) -> Arc<Self> {
+        Arc::new(Self { body, block, placed, interactive, append: OnceLock::new(), completion: Mutex::new(completion), _reservation: reservation })
     }
     pub fn append_stamp(&self) -> Option<&AppendStamp> { self.append.get() }
     pub fn sequence(&self) -> Option<TermSequence> { self.append_stamp().map(|stamp| stamp.sequence) }
@@ -241,10 +249,12 @@ impl ReplicaAppender {
                     });
                     let _search_charge = search.and_then(|delta| self.memory.reserve(delta.encoded.len().saturating_mul(8)).ok());
                     let body = match body {
-                        ReplicaBody::ResolvedTx(tx) if request.write.placed_terminal.is_some() || _search_charge.is_some() => {
+                        ReplicaBody::ResolvedTx(tx) if request.write.placed.is_some() || _search_charge.is_some() => {
                             let mut tx = tx.clone();
-                            if let Some(terminal) = request.write.placed_terminal {
-                                tx.placed_slot_terminal = Some(terminal.encode());
+                            match &request.write.placed {
+                                Some(PlacedPublication::Reserved(terminal)) => tx.placed_slot_terminal = Some(terminal.encode()),
+                                Some(PlacedPublication::Direct(admission)) => tx.placed_direct_admission = Some(admission.encode()),
+                                None => {}
                             }
                             if let Some(delta) = search.filter(|_| _search_charge.is_some()) {
                                 tx.search_delta = Some(delta.encoded.clone());

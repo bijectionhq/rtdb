@@ -137,6 +137,10 @@
 -- A native leader can order a block boundary when live and queued batch reservations reach the memory threshold for the open block.
 -- It counts published live batches and queued transactions beyond the applied head.
 -- Native synchronous transaction waits can use the exact outcome of a recent ordinary commit after a later transaction has applied.
+-- An installed journal with direct SQL commits enabled may queue an ordinary synchronous placed transaction without a receiver reservation.
+-- Its resolved replica record binds the exact attempt, original admission time and input commitment.
+-- Live, snapshot and archive replay admit the direct outcome at the exact source position only outside an open receiver slot.
+-- An asynchronous or timed placed attempt retains the receiver reservation and terminal protocol.
 -- The memory trigger uses the same resolution pause, ordered boundary and checkpoint adoption as the row and timer triggers.
 
 -- The compactor writes L1+ tries to the source log, and the leader forwards them to the replica log.
@@ -1085,6 +1089,9 @@ config {
 -- During adoption the writer removes the sealed generation and installs the verified checkpoint catalog in the same partition change.
 -- The active generation, its transaction basis and the later applied source watermark carry through adoption.
 -- A successor reads from the selected checkpoint boundary and applies every subsequent committed record, including writes between the cut and the matching upload.
+-- Protected SQL erasure replay seals the same generation when its exact suffix crosses a deferred boundary.
+-- It admits the matching upload's certified provider file references before reading the root and table blocks through the held store.
+-- The upload must name the captured cut and exact root digest before replay can adopt it.
 -- live_index.block_row_count and Leader.block_in_progress are the coarser view this spec's rules take of that cycle.
 --
 -- A cut is TWO operations — the block is PRODUCED on the boundary and ADOPTED on the confirmation coming back — which is also how a follower reads the same pair of messages.
@@ -1333,6 +1340,8 @@ rule LeaderProcessesTx {
     -- For concrete document writes, forbidden columns abort with the table reference and offending column names in source schema order.
     -- SQL insert plans report each forbidden projection as a planning error.
         -- The resolver looks up a private replay key against its ordered prefix before applying user operations.
+        -- A direct placed request with a private replay permit includes staged predecessor writes in that lookup.
+        -- Replay verifies the direct admission sample against the recorded source time and the outcome validity against the receiver receipt clock.
         -- A matching marker has a validity interval overlapping the submission sample or a later instant.
         -- A successful first execution records its marker atomically with its user effects.
         -- The marker expires at the later of the permit cutoff and one hour after the admission sample.

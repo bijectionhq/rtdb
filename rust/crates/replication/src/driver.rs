@@ -72,6 +72,7 @@ pub struct ReplicationConfig {
     pub skipped_transactions: BTreeSet<SourcePosition>,
     pub rows_per_block: u64,
     pub deferred_checkpoints: bool,
+    pub hosted_deferred_checkpoints: bool,
     pub activate_classic_utf16_relation_oids: bool,
     pub assertion_interval: Duration,
     pub flush_timeout: Duration,
@@ -98,7 +99,7 @@ impl ReplicationConfig {
 }
 impl Default for ReplicationConfig {
     fn default() -> Self {
-        Self { enabled: true, may_lead: true, external_source: false, skipped_transactions: BTreeSet::new(), rows_per_block: Self::DEFAULT_ROWS_PER_BLOCK, deferred_checkpoints: false, activate_classic_utf16_relation_oids: false, assertion_interval: Duration::from_millis(100), flush_timeout: Self::DEFAULT_FLUSH_TIMEOUT,
+        Self { enabled: true, may_lead: true, external_source: false, skipped_transactions: BTreeSet::new(), rows_per_block: Self::DEFAULT_ROWS_PER_BLOCK, deferred_checkpoints: false, hosted_deferred_checkpoints: false, activate_classic_utf16_relation_oids: false, assertion_interval: Duration::from_millis(100), flush_timeout: Self::DEFAULT_FLUSH_TIMEOUT,
             pending_block_records: 1024, pending_block_bytes: 64 * 1024 * 1024, election_seed: uuid::Uuid::new_v4().as_u128() as u64,
             idle_heartbeat: true, claim_wait: None, node_id: Self::default_node_id() }
     }
@@ -459,6 +460,7 @@ async fn pending_claim(claim: &mut Option<Claim>) -> Result<crate::ReplicaMetada
 struct Resolution {
     future: BoxFuture<'static, (TxResolver, Result<Arc<ResolvedTx>>)>,
     completion: Completion,
+    direct_admission: Option<PlacedReservation>,
     interactive: Option<Arc<OnceLock<PreparedInteractivePublication>>>,
 }
 enum Production {
@@ -505,11 +507,25 @@ struct LeaderState {
     source_batch_end: Option<SourcePosition>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SourcePlacement {
+    Reserved(PlacedReservation),
+    Direct(PlacedReservation),
+}
+
+impl SourcePlacement {
+    fn attempt(&self) -> rtdb_types::PlacedAttempt {
+        match *self {
+            Self::Reserved(admission) | Self::Direct(admission) => admission.attempt,
+        }
+    }
+}
+
 struct SourceInput {
     position: SourcePosition,
     log_time: Timestamp,
     work: SourceWork,
-    reservation: Option<PlacedReservation>,
+    placement: Option<SourcePlacement>,
     _decode_charge: Option<Arc<MemoryReservation>>,
 }
 
@@ -2024,7 +2040,7 @@ impl ReplicationDriver {
                         }
                         if let Some(leader) = &self.leader
                             && leader.term == record.envelope.term
-                            && leader.awaiting_placed.as_ref().and_then(|source| source.reservation) != Some(reservation)
+                            && leader.awaiting_placed.as_ref().and_then(|source| source.placement) != Some(SourcePlacement::Reserved(reservation))
                         {
                             return Err(invalid("Read-back changed the writer's original placed reservation"));
                         }
@@ -2221,7 +2237,7 @@ impl ReplicationDriver {
                     Arc::try_unwrap(slot).ok().and_then(OnceLock::into_inner)
                         .ok_or_else(|| invalid("Interactive resolution lost its publication owner"))
                 }).transpose()?;
-                self.enqueue_resolved_with_preparation(resolved, resolution.completion.0.take(), interactive).await?
+                self.enqueue_resolved_with_preparation(resolved, resolution.completion.0.take(), resolution.direct_admission, interactive).await?
             }
             Err(error) => {
                 if let Some(sender) = resolution.completion.0.take() { let _ = sender.send(Err(error.clone())); }
@@ -2291,7 +2307,7 @@ impl ReplicationDriver {
                 .ok_or_else(|| invalid("An interactive attachment has no staged transaction"))?;
             if position <= leader.resolver()?.source_position() { return Err(invalid("Source reader did not advance")); }
             let work = SourceWork::Resolve(request, None);
-            let source = SourceInput { position, log_time: metadata.timestamp, work, reservation: None, _decode_charge: None };
+            let source = SourceInput { position, log_time: metadata.timestamp, work, placement: None, _decode_charge: None };
             if checkpoint_pending || serving_pending || !leader.drained_for_strict_source() {
                 leader.waiting_strict_source = Some(StrictSource::Interactive(source));
                 return Ok(());
@@ -2322,6 +2338,7 @@ impl ReplicationDriver {
         let resolved = match message {
             Some(message @ (SourceMessage::LegacyTransaction(_) | SourceMessage::Protobuf(SourceBody::Tx(_)))) => {
                 if self.config.external_source { return Err(Anomaly::incorrect("xtdb/external-source-transaction", "Client transactions are disabled for an external-source database")); }
+                let direct = SourceTransaction::direct_placed_message(&message)?;
                 let work = if self.config.skipped_transactions.contains(&position) {
                     SourceWork::Skip(message)
                 } else {
@@ -2337,11 +2354,15 @@ impl ReplicationDriver {
                     SourceWork::Skip(message) => SourceTransaction::skipped_attempt(message, position)?,
                     SourceWork::Fence => unreachable!("only recovery constructs a placed fence"),
                 };
-                let reservation = original.map(|attempt| PlacedReservation::new(attempt, metadata.timestamp, &payload));
-                let source = SourceInput { position, log_time: metadata.timestamp, work, reservation, _decode_charge: Some(decode_charge) };
+                let placement = original.map(|attempt| {
+                    let admission = PlacedReservation::new(attempt, metadata.timestamp, &payload);
+                    if direct { SourcePlacement::Direct(admission) } else { SourcePlacement::Reserved(admission) }
+                });
+                let needs_reservation = matches!(&placement, Some(SourcePlacement::Reserved(_)));
+                let source = SourceInput { position, log_time: metadata.timestamp, work, placement, _decode_charge: Some(decode_charge) };
                 // Keep this position as the source head until every previously queued replica
                 // write has been read back. In particular, none can still be offloading a body.
-                if (reservation.is_some() || matches!(&source.work, SourceWork::Resolve(request, _) if request.requires_durable_predecessor()))
+                if (needs_reservation || matches!(&source.work, SourceWork::Resolve(request, _) if request.requires_durable_predecessor()))
                     && !leader.drained_for_strict_source()
                 {
                     leader.waiting_strict_source = Some(StrictSource::Transaction(source));
@@ -2423,7 +2444,7 @@ impl ReplicationDriver {
                 None
             }
         };
-        if let Some(resolved) = resolved { self.enqueue_resolved(resolved, None).await?; }
+        if let Some(resolved) = resolved { self.enqueue_resolved(resolved, None, None).await?; }
         Ok(())
     }
 
@@ -2503,7 +2524,14 @@ impl ReplicationDriver {
     }
 
     fn admit_source(&mut self, source: SourceInput) -> Result<()> {
-        let Some(reservation) = source.reservation else { return self.begin_source_resolution(source); };
+        let Some(SourcePlacement::Reserved(reservation)) = source.placement else {
+            if let Some(SourcePlacement::Direct(admission)) = source.placement
+                && self.resolve.owned_witness_scope != Some(admission.attempt.scope())
+            {
+                return Err(invalid("The direct placed attempt belongs to another receiver"));
+            }
+            return self.begin_source_resolution(source);
+        };
         let leader = self.leader.as_mut().ok_or_else(term_ended)?;
         if self.placed_slot.is_some() || leader.awaiting_placed.is_some()
             || self.resolve.owned_witness_scope != Some(reservation.attempt.scope())
@@ -2530,7 +2558,7 @@ impl ReplicationDriver {
         }
         let source = if slot.term == leader.term {
             leader.awaiting_placed.take()
-                .filter(|source| source.reservation == Some(slot.reservation))
+                .filter(|source| source.placement == Some(SourcePlacement::Reserved(slot.reservation)))
                 .ok_or_else(|| invalid("The installed reservation differs from the writer's original input"))?
         } else {
             if slot.term >= leader.term || leader.awaiting_placed.is_some() {
@@ -2540,7 +2568,7 @@ impl ReplicationDriver {
                 position: slot.reservation.attempt.position(),
                 log_time: slot.reservation.submitted_at,
                 work: SourceWork::Fence,
-                reservation: Some(slot.reservation),
+                placement: Some(SourcePlacement::Reserved(slot.reservation)),
                 _decode_charge: Some(self.resolve.memory.reserve(1024)?),
             }
         };
@@ -2549,6 +2577,11 @@ impl ReplicationDriver {
     }
 
     fn check_placed_terminal(&self, term: Term, message: &proto::ResolvedTx) -> Result<bool> {
+        if message.checked_direct_placed_admission()?.is_some() {
+            return if self.placed_slot.is_none() { Ok(false) } else {
+                Err(invalid("A direct placed commit cannot cross an open receiver slot"))
+            };
+        }
         let terminal = message.placed_slot_terminal.as_deref().map(PlacedTerminal::decode).transpose()?;
         let attempt = message.placed_attempt.as_deref().map(rtdb_format::envelope::decode_replica_outcome_attempt)
             .transpose()?.map(|(attempt, _)| attempt);
@@ -2576,13 +2609,14 @@ impl ReplicationDriver {
         let maximum_timed_original_bytes = self.logs.replica_timed_original_append_limit();
         let node_id = self.config.node_id.clone();
         let partition = Arc::clone(&self.partition);
+        let direct_admission = match source.placement { Some(SourcePlacement::Direct(admission)) => Some(admission), _ => None };
         let logs = Arc::clone(&self.logs);
         let skipped = self.config.skipped_transactions.contains(&source.position);
         let interactive = matches!(&source.work, SourceWork::Resolve(request, _) if request.local_interactive_rejection_budget().is_some())
             .then(|| Arc::new(OnceLock::new()));
         let publication = interactive.clone();
-        leader.resolution = Some(Resolution { completion: Completion(None), interactive, future: Box::pin(async move {
-            let SourceInput { position, log_time, work, reservation, _decode_charge } = source;
+        leader.resolution = Some(Resolution { completion: Completion(None), direct_admission, interactive, future: Box::pin(async move {
+            let SourceInput { position, log_time, work, placement, _decode_charge } = source;
             let _resolution = rtdb_plan::ExecutionSample::new(context.execution_observer.clone(), rtdb_plan::ExecutionTimer::ResolveSource);
             let result = match work {
                 SourceWork::Resolve(request, _) if publication.is_some() => {
@@ -2628,13 +2662,13 @@ impl ReplicationDriver {
                             result.map_err(Anomaly::from)
                         }
                         Err(error) if error.is_caller_error() => resolver.resolve_source_abort(
-                            durable, position, log_time, reservation.map(|slot| slot.attempt), &context, error, false,
+                            durable, position, log_time, placement.as_ref().map(SourcePlacement::attempt), &context, error, false,
                         ).await,
                         Err(error) => Err(error),
                     }
                 }
                 SourceWork::Fence => {
-                    let Some(reservation) = reservation else {
+                    let Some(SourcePlacement::Reserved(reservation)) = placement else {
                         return (resolver, Err(invalid("Placed fence lost its original slot")));
                     };
                     resolver.resolve_placed_fence(durable, reservation.attempt, log_time, &context).await
@@ -2647,6 +2681,7 @@ impl ReplicationDriver {
                         tx.bounded_retry = None;
                         tx.replay_submission = None;
                         tx.placed_attempt_seed = None;
+                        tx.direct_placed_commit = None;
                     }
                     let key = rtdb_storage::ObjectKey::new(rtdb_format::keys::skipped_tx_key(position))?;
                     let reservation = context.memory.reserve(message.encoded_len().checked_add(128).ok_or_else(|| invalid("Skipped payload exceeds allocation range"))?)?;
@@ -2659,11 +2694,13 @@ impl ReplicationDriver {
         }) });
         Ok(())
     }
-    async fn enqueue_resolved(&mut self, resolved: Arc<ResolvedTx>, completion: Option<oneshot::Sender<Result<Applied>>>) -> Result<()> {
-        self.enqueue_resolved_with_preparation(resolved, completion, None).await
+    async fn enqueue_resolved(&mut self, resolved: Arc<ResolvedTx>, completion: Option<oneshot::Sender<Result<Applied>>>,
+        direct_admission: Option<PlacedReservation>) -> Result<()> {
+        self.enqueue_resolved_with_preparation(resolved, completion, direct_admission, None).await
     }
 
-    async fn enqueue_resolved_with_preparation(&mut self, resolved: Arc<ResolvedTx>, completion: Option<oneshot::Sender<Result<Applied>>>, interactive: Option<PreparedInteractivePublication>) -> Result<()> {
+    async fn enqueue_resolved_with_preparation(&mut self, resolved: Arc<ResolvedTx>, completion: Option<oneshot::Sender<Result<Applied>>>,
+        direct_admission: Option<PlacedReservation>, interactive: Option<PreparedInteractivePublication>) -> Result<()> {
         let mut completion = Completion(completion);
         let result = async {
             let strict = resolved.staging_clock_upper().is_some();
@@ -2677,9 +2714,22 @@ impl ReplicationDriver {
             leader.cycle.resolved(resolved.writes().row_count()?)?;
             let block = self.partition.value().live().block_index();
             if let Some(publication) = interactive {
+                if direct_admission.is_some() || resolved.placed_attempt().is_some() || completion.0.is_some() {
+                    return Err(invalid("Interactive publication cannot carry a placed or external admission"));
+                }
                 let write = PendingWrite::prepared_interactive(resolved, block, publication)?;
                 leader.appender.enqueue(Arc::clone(&write))?;
                 leader.pending.push_back(write);
+            } else if let Some(admission) = direct_admission {
+                if resolved.placed_attempt() != Some(admission.attempt) || self.placed_slot.is_some()
+                    || strict || completion.0.is_some()
+                {
+                    return Err(invalid("The resolved direct commit differs from its admission"));
+                }
+                let write = PendingWrite::direct_placed(WriteBody::Resolved(resolved, search_delta), block, admission, &self.resolve.memory)?;
+                leader.appender.enqueue(Arc::clone(&write))?;
+                leader.pending.push_back(write);
+                if self.block_needs_cut() { self.cut().await?; }
             } else if let Some(attempt) = resolved.placed_attempt() {
                 let slot = self.placed_slot.filter(|slot| slot.reservation.attempt == attempt)
                     .ok_or_else(|| invalid("Placed resolution lost its original receiver reservation"))?;
@@ -2777,7 +2827,9 @@ impl ReplicationDriver {
         let memory_triggered = self.leader.as_ref().is_some_and(|leader| {
             !leader.cycle.is_full(self.config.rows_per_block) && self.block_needs_memory_cut(leader)
         });
-        let deferred_checkpoint = (self.config.deferred_checkpoints && !self.config.external_source
+        let deferred_enabled = self.config.deferred_checkpoints || (self.config.hosted_deferred_checkpoints
+            && self.logs.fences_writer_terms() && self.logs.requires_checkpoint_digest());
+        let deferred_checkpoint = (deferred_enabled && !self.config.external_source
             && relation_oid_order.is_none() && self.default_erasure.is_none()
             && self.local_erasure_read_fence.is_none() && self.default_erasure_read_fence.is_none()
             && self.serving_search.is_none()
@@ -2904,7 +2956,7 @@ impl ReplicationDriver {
                 let mut resolver = leader.resolver.take().ok_or_else(|| invalid("External resolution has no idle resolver"))?;
                 let context = Arc::clone(&self.resolve);
                 let clock = Arc::clone(&self.clock);
-                leader.resolution = Some(Resolution { completion: Completion(Some(completion)), interactive: None, future: Box::pin(async move {
+                leader.resolution = Some(Resolution { completion: Completion(Some(completion)), direct_admission: None, interactive: None, future: Box::pin(async move {
                     let result = resolver.resolve_external(durable, clock(), system_time, token, writer.as_mut(), &context).await;
                     (resolver, result)
                 }) });

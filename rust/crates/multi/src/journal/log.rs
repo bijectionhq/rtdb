@@ -506,6 +506,9 @@ impl ReplicaReadIndex for JournalLog {
                         certified_read: None,
                     });
                 }
+                Err(ReadFailure::Refused(error)) if !retried && error.code == "rtdb.multi/ordered-conflict" => {
+                    retried = true;
+                }
                 Err(ReadFailure::Refused(error)) => {
                     reads.retain(|read| *read != invocation.id);
                     return Err(error);

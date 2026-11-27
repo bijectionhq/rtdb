@@ -178,7 +178,7 @@ pub(crate) async fn visit_table(
             match envelope.message {
                 ReplicaBody::ResolvedTx(message) if message.db_op.is_none() && message.external_source_token.is_none() => {
                     let source = logical.transaction_source(message.src_msg_id)?;
-                    let block = BlockIndex(logical.installed.block.checked_add(1).ok_or_else(suffix_unavailable)?);
+                    let block = logical.active_block_index()?;
                     let transaction = rtdb_tx::decode_replica(&message, latest, block, memory)?;
                     let tx = transaction.writes.tx_key();
                     if latest.is_some_and(|prior| tx.tx_id <= prior.tx_id || tx.system_time < prior.system_time) {
@@ -195,7 +195,7 @@ pub(crate) async fn visit_table(
         }
     }
     if !terminal_admitted || next.checked_sub(1) != Some(through) || latest != target.latest_completed_tx()
-        || logical.pending.as_ref().map(|cut| cut.block) != Some(target.block_index().0)
+        || logical.pending.as_ref().map(|pending| pending.cut.block) != Some(target.block_index().0)
     {
         return Err(suffix_unavailable());
     }
@@ -955,8 +955,10 @@ struct PlacedReplay {
 
 impl PlacedReplay {
     fn finish_transaction(&mut self, row: &ResolvedTx, term: rtdb_types::Term) -> Result<()> {
+        let direct = row.checked_direct_placed_admission()?;
         match (self.debt.as_ref(), row.placed_slot_terminal.as_deref(), row.placed_attempt.as_deref()) {
             (None, None, None) => return Ok(()),
+            (None, None, Some(_)) if direct.is_some() => return Ok(()),
             (Some(debt), Some(terminal), Some(attempt)) => {
                 let owner = rtdb_types::Term(debt.term);
                 let reservation = rtdb_types::PlacedReservation::decode(&debt.reservation)?;
@@ -1008,17 +1010,24 @@ struct BlockCut {
 }
 
 enum ReplayControl {
-    Boundary(BlockCut),
+    Boundary(PendingBlockCut),
     Upload(BlockCut),
     Advance(Option<i64>),
+}
+
+#[derive(Clone, Copy)]
+struct PendingBlockCut {
+    cut: BlockCut,
+    deferred: bool,
 }
 
 impl ReplayControl {
     fn read(body: &ReplicaBody) -> Result<Self> {
         Ok(match body {
-            ReplicaBody::BlockBoundary(row) if row.external_source_token.is_none() => Self::Boundary(BlockCut {
-                block: row.block_index.ok_or_else(suffix_unavailable)?,
-                source: row.latest_processed_msg_id.ok_or_else(suffix_unavailable)?,
+            ReplicaBody::BlockBoundary(row) if row.external_source_token.is_none() => Self::Boundary(PendingBlockCut {
+                cut: BlockCut { block: row.block_index.ok_or_else(suffix_unavailable)?,
+                    source: row.latest_processed_msg_id.ok_or_else(suffix_unavailable)? },
+                deferred: row.deferred_checkpoint == Some(true),
             }),
             ReplicaBody::BlockUploaded(row) if row.external_source_token.is_none()
                 && row.storage_version == Some(CURRENT_STORAGE_VERSION.0)
@@ -1040,7 +1049,7 @@ struct LogicalReplay {
     epoch: StorageEpoch,
     source: i64,
     installed: BlockCut,
-    pending: Option<BlockCut>,
+    pending: Option<PendingBlockCut>,
 }
 
 impl LogicalReplay {
@@ -1065,21 +1074,28 @@ impl LogicalReplay {
 
     fn transaction_source(&self, position: Option<i64>) -> Result<i64> {
         let next = self.source_offset(position.ok_or_else(suffix_unavailable)?)?;
-        if self.pending.is_some() || next <= self.source {
+        if self.pending.is_some_and(|pending| !pending.deferred) || next <= self.source {
             return Err(suffix_unavailable());
         }
         Ok(next)
     }
 
+    fn active_block_index(&self) -> Result<BlockIndex> {
+        let opened_after = self.pending.filter(|pending| pending.deferred).map_or(self.installed.block, |pending| pending.cut.block);
+        Ok(BlockIndex(opened_after.checked_add(1).ok_or_else(suffix_unavailable)?))
+    }
+
     fn apply_control(&mut self, control: ReplayControl) -> Result<()> {
         match control {
-            ReplayControl::Boundary(cut) => {
-                if self.pending.is_some() || self.installed.block.checked_add(1) != Some(cut.block)
-                    || self.source_offset(cut.source)? < self.source
+            ReplayControl::Boundary(pending) => {
+                let source = self.source_offset(pending.cut.source)?;
+                if self.pending.is_some() || self.installed.block.checked_add(1) != Some(pending.cut.block)
+                    || source < self.source
                 {
                     return Err(suffix_unavailable());
                 }
-                self.pending = Some(cut);
+                if pending.deferred { self.source = source; }
+                self.pending = Some(pending);
             }
             ReplayControl::Upload(cut) => {
                 // A restarted writer can confirm earlier retained blocks.
@@ -1088,16 +1104,16 @@ impl LogicalReplay {
                 {
                     return Ok(());
                 }
-                if self.pending != Some(cut) {
+                if self.pending.is_none_or(|pending| pending.cut != cut) {
                     return Err(suffix_unavailable());
                 }
-                self.source = self.source_offset(cut.source)?;
+                self.source = self.source.max(self.source_offset(cut.source)?);
                 self.installed = cut;
                 self.pending = None;
             }
             ReplayControl::Advance(Some(position)) => {
                 let next = self.source_offset(position)?;
-                if self.pending.is_some() && next > self.source {
+                if self.pending.is_some_and(|pending| !pending.deferred) && next > self.source {
                     return Err(suffix_unavailable());
                 }
                 self.source = self.source.max(next);
@@ -1120,6 +1136,7 @@ pub(super) fn transfer_control(
         ReplayControl::Upload(cut) if cut.block == checkpoint.block => return Ok(None),
         ReplayControl::Upload(cut) => Some(cut.source),
         ReplayControl::Advance(position) => position,
+        ReplayControl::Boundary(pending) if pending.deferred => Some(pending.cut.source),
         ReplayControl::Boundary(_) => None,
     };
     Ok(Some(ReplicaEnvelope {
@@ -1163,6 +1180,38 @@ mod custody_tests {
     use tokio::sync::Notify;
 
     use super::*;
+
+    #[test]
+    fn archived_deferred_checkpoint_keeps_intervening_positions_and_block_index() -> Result<()> {
+        let mut replay = LogicalReplay {
+            epoch: StorageEpoch(0), source: 10, installed: BlockCut { block: 0, source: 10 }, pending: None,
+        };
+        let cut = BlockCut { block: 1, source: 11 };
+        let boundary = ReplicaBody::BlockBoundary(rtdb_format::log::proto::BlockBoundary {
+            block_index: Some(cut.block), latest_processed_msg_id: Some(cut.source),
+            deferred_checkpoint: Some(true), ..Default::default()
+        });
+        replay.apply_control(ReplayControl::read(&boundary)?)?;
+        assert_eq!(replay.source, 11);
+        assert_eq!(replay.active_block_index()?, BlockIndex(2));
+        assert!(replay.transaction_source(Some(11)).is_err());
+        replay.source = replay.transaction_source(Some(12))?;
+        replay.apply_control(ReplayControl::Advance(Some(13)))?;
+        assert!(replay.apply_control(ReplayControl::Boundary(PendingBlockCut {
+            cut: BlockCut { block: 2, source: 13 }, deferred: true,
+        })).is_err());
+        replay.apply_control(ReplayControl::Upload(cut))?;
+        assert_eq!(replay.source, 13);
+        assert_eq!(replay.active_block_index()?, BlockIndex(2));
+
+        let next_cut = BlockCut { block: 2, source: 14 };
+        replay.apply_control(ReplayControl::Boundary(PendingBlockCut { cut: next_cut, deferred: false }))?;
+        assert!(replay.transaction_source(Some(14)).is_err());
+        assert!(replay.apply_control(ReplayControl::Advance(Some(14))).is_err());
+        replay.apply_control(ReplayControl::Upload(next_cut))?;
+        assert_eq!(replay.transaction_source(Some(15))?, 15);
+        Ok(())
+    }
 
     #[test]
     fn arrow_byte_path_archived_records_retain_fenced_offsets_without_admitting_their_payloads() -> Result<()> {

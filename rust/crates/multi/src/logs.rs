@@ -249,6 +249,7 @@ pub(crate) async fn ordered_opened(
     admission: crate::journal::WriterAdmission,
     checkpoint: Option<rtdb_directory::Checkpoint>,
     maximum_message_bytes: usize,
+    direct_sql_commits: bool,
     cancellation: CancellationToken,
 ) -> Result<OpenedLogs> {
     let epoch = StorageEpoch(record.log_epoch);
@@ -297,6 +298,7 @@ pub(crate) async fn ordered_opened(
             codec: Box::new(DeploymentReceipts { scope, cipher: Cipher::new(key)? }),
             recovery: ClosedEpochRecovery::Opened(opened),
             placed_receipt_retirement: record.placed_receipt_retirement,
+            direct_sql_commits,
         },
         drivers: vec![trimming],
     })
@@ -314,6 +316,7 @@ pub(crate) fn ordered_reader_opened(
         AwaitAuthority::Live {
             codec: Box::new(DeploymentReceipts { scope, cipher: Cipher::new(key)? }),
             recovery: ClosedEpochRecovery::ReadIndex(index()), placed_receipt_retirement: record.placed_receipt_retirement,
+            direct_sql_commits: false,
         }
     };
     let next = checkpoint.map_or(0, |checkpoint| checkpoint.source.saturating_add(1));
@@ -409,7 +412,7 @@ impl LogFactory for LogkeeperLogFactory {
                 ClosedEpochRecovery::ReadIndex(read_index())
             };
             AwaitAuthority::Live { codec: Box::new(DeploymentReceipts { scope, cipher: Cipher::new(&key)? }), recovery,
-                placed_receipt_retirement: config.placed_receipt_retirement }
+                placed_receipt_retirement: config.placed_receipt_retirement, direct_sql_commits: false }
         } else { AwaitAuthority::Frozen };
         let replica: Arc<dyn Log> = Arc::new(SealedLog::for_serving(quorum, &config, Arc::clone(&self.holds)).await?);
         let intake_cut = include_placed_debt(config.transfer_intake_cut, config.placed_transfer.as_ref())?;
@@ -447,7 +450,8 @@ fn member_ids(servers: &[JournalEndpoint]) -> Result<Vec<rtdb_directory::MemberI
 }
 
 /// The first source offset no replica record can already have consumed.
-/// Every replica record consumes at most one source position, so the newest one named, plus one per later record, bounds every position assigned before; oversized records, whose position is out of line, are covered by that count.
+/// A source advancement plus one per later unclassified record bounds the assigned source positions.
+/// A checkpoint confirmation can name an older source position than transactions committed while its files were uploading.
 pub async fn next_source_offset(replica: &dyn Log, epoch: StorageEpoch) -> Result<i64> {
     next_source_offset_from_cut(replica, epoch, None).await
 }
@@ -485,6 +489,7 @@ async fn next_source_offset_from_cut(
     let mut after_newest = 0i64;
     let mut missing = 0i64;
     let mut observed_next = 0i64;
+    let mut checkpoint_floor = 0i64;
     let mut window = INTAKE_TIP_WINDOW;
     while end > floor {
         let start = end.saturating_sub(window).max(floor);
@@ -502,9 +507,12 @@ async fn next_source_offset_from_cut(
             match source_position(&record.payload, epoch)? {
                 Scanned::Position(position) => {
                     let next = position.checked_add(1).and_then(|next| next.checked_add(after_newest)).ok_or_else(invalid_floor)?;
-                    if cut.is_none() { return Ok(next); }
+                    if cut.is_none() { return Ok(next.max(checkpoint_floor)); }
                     observed_next = observed_next.max(next);
                     after_newest += 1;
+                }
+                Scanned::Checkpoint(position) => {
+                    checkpoint_floor = checkpoint_floor.max(position.checked_add(1).ok_or_else(invalid_floor)?);
                 }
                 Scanned::MayConsume => after_newest += 1,
                 Scanned::Consumes => {}
@@ -513,13 +521,14 @@ async fn next_source_offset_from_cut(
         end = start;
         window = SCAN_WINDOW;
     }
-    let anchored = source_floor.checked_add(after_newest)
+    let anchor = if cut.is_some() { source_floor } else { checkpoint_floor };
+    let anchored = anchor.checked_add(after_newest)
         .and_then(|next| next.checked_add(if cut.is_some() { missing } else { 0 }))
         .ok_or_else(invalid_floor)?;
-    Ok(observed_next.max(anchored))
+    Ok(observed_next.max(anchored).max(checkpoint_floor))
 }
 
-enum Scanned { Position(i64), MayConsume, Consumes }
+enum Scanned { Position(i64), Checkpoint(i64), MayConsume, Consumes }
 
 /// What one replica record says about source positions allocated up to it.
 /// A claim or heartbeat (a no-op naming no source position) and a leader's own deletion notice consume none; anything else whose position it does not name may have consumed one.
@@ -536,7 +545,9 @@ fn source_position(payload: &[u8], epoch: StorageEpoch) -> Result<Scanned> {
                     None => match noop.src_msg_id { None => return Ok(Scanned::Consumes), position => position },
                 },
                 ReplicaBody::BlockBoundary(boundary) => boundary.latest_processed_msg_id,
-                ReplicaBody::BlockUploaded(upload) => upload.latest_processed_msg_id,
+                ReplicaBody::BlockUploaded(upload) => return Ok(upload.latest_processed_msg_id.map(SourcePosition)
+                    .filter(|position| position.0 >= 0 && position.epoch() == epoch)
+                    .map_or(Scanned::Consumes, |position| Scanned::Checkpoint(position.offset()))),
                 ReplicaBody::TriesDeleted(_) | ReplicaBody::TablesRetired(_) => return Ok(Scanned::Consumes),
                 _ => None,
             }
@@ -602,6 +613,7 @@ pub fn renumber_into(tail: &mut [ReplicaEnvelope], epoch: StorageEpoch) -> Resul
         tx.src_msg_id = Some(position);
         tx.placed_attempt = None;
         tx.placed_slot_terminal = None;
+        tx.placed_direct_admission = None;
         tx.acceptance_stage = None;
         tx.table_data.remove(&attempt_table);
     }
@@ -1131,6 +1143,24 @@ mod tests {
         assert_eq!(next_source_offset(&replica, StorageEpoch(0)).await.unwrap(), 42, "a claim consumes no source position");
         append(&replica, ReplicaBody::TriesAdded(Default::default())).await;
         assert_eq!(next_source_offset(&replica, StorageEpoch(0)).await.unwrap(), 43, "a record that names no position may have consumed one");
+    }
+
+    #[tokio::test]
+    async fn a_deferred_upload_preserves_the_successor_intake_floor() {
+        let epoch = StorageEpoch(0);
+        let upload = || ReplicaBody::BlockUploaded(proto::BlockUploaded { latest_processed_msg_id: Some(41), ..Default::default() });
+        let replica = MemoryLog::new(1 << 20);
+        append(&replica, ReplicaBody::BlockBoundary(proto::BlockBoundary {
+            latest_processed_msg_id: Some(41), deferred_checkpoint: Some(true), ..Default::default()
+        })).await;
+        append(&replica, ReplicaBody::ResolvedTx(proto::ResolvedTx { src_msg_id: Some(45), ..Default::default() })).await;
+        append(&replica, upload()).await;
+        assert_eq!(next_source_offset(&replica, epoch).await.unwrap(), 46);
+
+        let retained = MemoryLog::starting_at(1 << 20, LogOffset(1));
+        append(&retained, ReplicaBody::OversizedMessage(proto::OversizedMessage::default())).await;
+        append(&retained, upload()).await;
+        assert_eq!(next_source_offset(&retained, epoch).await.unwrap(), 43);
     }
 
     #[tokio::test]

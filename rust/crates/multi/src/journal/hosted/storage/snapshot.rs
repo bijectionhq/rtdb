@@ -11,7 +11,7 @@ pub(super) struct Source {
 
 impl Source {
     pub(super) async fn retain(
-        &self, cut: rtdb_types::CatalogCut, base: rtdb_types::CatalogCheckpoint,
+        &self, cut: rtdb_types::CatalogCut, base: rtdb_types::CatalogCheckpoint, writer: Option<Grant>,
     ) -> Result<Arc<dyn Send + Sync>> {
         let custody = self.placement.hold_query_custody(&self.tasks, &self.release_stop).await?;
         let journal = &self.placement.worker;
@@ -25,14 +25,21 @@ impl Source {
         {
             return Err(invalid("The catalog belongs to another journal generation"));
         }
-        let from = (base.boundary.0 - genesis.0) as u64;
+        let local_base = (base.boundary.0 - genesis.0) as u64;
         let through = (cut.through.0 - genesis.0) as u64;
         let route = journal.route().await?;
+        // This catalog has already adopted its chosen BlockUploaded. Until custody publishes that
+        // root, the writer's checkpoint hold must cover the exact journal suffix that introduced its files.
+        let replay_base = writer.filter(|grant| route.writer.grant == Some(*grant)
+            && route.checkpoint.cut.next_lsn < local_base && through <= route.head.next_lsn)
+            .map(|_| route.checkpoint);
+        let (root, from) = replay_base.map_or((base.root, local_base), |checkpoint| (checkpoint.root, checkpoint.cut.next_lsn));
         if from < route.erasure_floor { return Err(Error::ErasedUnderView.into()); }
-        let request = journal.request(&route, crate::journal::owned_read::protect_snapshot(base.root, from, through))?;
+        let request = journal.request(&route, crate::journal::owned_read::protect_snapshot(root, from, through))?;
         let held = crate::journal::Held::acquire(journal, request, &self.tasks, &self.release_stop).await?;
         let scope = held.scope();
-        if scope.checkpoint.root != base.root || scope.checkpoint.cut != scope.start
+        if scope.checkpoint.root != root || scope.checkpoint.cut != scope.start
+            || replay_base.is_some_and(|checkpoint| scope.checkpoint != checkpoint)
             || scope.start.next_lsn != from || scope.through.next_lsn != through
         {
             return Err(invalid("The protected catalog has a different checkpoint or suffix"));

@@ -164,6 +164,18 @@ impl Database {
         self.replica_read_index.as_ref().is_some_and(|index| index.requires_anchored_catalog())
     }
 
+    pub(crate) async fn hold_current_writer_catalog(&self, snapshot: rtdb_index::Snapshot) -> Result<rtdb_index::Snapshot> {
+        if self.read_only || !self.requires_anchored_catalog() || !matches!(self.status().role, Role::Leading(_)) {
+            return Ok(snapshot);
+        }
+        let cut = snapshot.catalog_cut();
+        let checkpoint = snapshot.catalog_checkpoint()?;
+        match self.storage.admit_writer_catalog(cut, checkpoint).await? {
+            Some(permit) => Ok(snapshot.with_catalog_read(permit)),
+            None => Ok(snapshot),
+        }
+    }
+
     pub async fn confirm_replica_snapshot(&self, cancellation: &CancellationToken) -> Result<()> {
         if let Some(index) = &self.replica_read_index {
             self.confirm_replica_cut(index.as_ref(), cancellation).await?;
@@ -171,19 +183,40 @@ impl Database {
         Ok(())
     }
 
+    pub(crate) async fn capture_current_writer_snapshot(&self, cancellation: &CancellationToken) -> Result<rtdb_index::Snapshot> {
+        self.capture_replica_snapshot_at(cancellation, self.requires_anchored_catalog() && !self.read_only).await
+    }
+
     pub(crate) async fn capture_replica_snapshot(&self, cancellation: &CancellationToken) -> Result<rtdb_index::Snapshot> {
+        self.capture_replica_snapshot_at(cancellation, false).await
+    }
+
+    async fn capture_replica_snapshot_at(&self, cancellation: &CancellationToken, accepts_later_cut: bool) -> Result<rtdb_index::Snapshot> {
         let Some(index) = &self.replica_read_index else { return Ok(self.partition.snapshot()); };
         // The reader can sample again if apply already passed its selection.
         // Each retry is a fresh confirmation within the original invocation.
         for _ in 0..3 {
             let (barrier, position) = self.confirm_replica_cut(index.as_ref(), cancellation).await?;
             let snapshot = match position {
-                Some(through) => self.partition.published_snapshot(CatalogCut {
-                    storage_version: self.logs.storage_version,
-                    storage_epoch: self.logs.storage_epoch,
-                    replica_epoch: self.logs.replica_epoch,
-                    through,
-                }),
+                Some(through) => {
+                    let cut = CatalogCut {
+                        storage_version: self.logs.storage_version,
+                        storage_epoch: self.logs.storage_epoch,
+                        replica_epoch: self.logs.replica_epoch,
+                        through,
+                    };
+                    let current = if accepts_later_cut && barrier.certified_read.is_none()
+                        && matches!(self.status().role, Role::Leading(_))
+                    {
+                        self.partition.current_published_snapshot().filter(|snapshot| {
+                            snapshot.catalog_cut().is_some_and(|applied| {
+                                applied.storage_version == cut.storage_version && applied.storage_epoch == cut.storage_epoch
+                                    && applied.replica_epoch == cut.replica_epoch && applied.through >= cut.through
+                            })
+                        })
+                    } else { None };
+                    current.or_else(|| self.partition.published_snapshot(cut))
+                }
                 None => {
                     let floor = CatalogCut {
                         storage_version: self.logs.storage_version,

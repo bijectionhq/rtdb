@@ -19,6 +19,13 @@ pub(crate) const CLOSE_SESSION: &str = "CloseSession";
 const CLASSIC_RETAINED_PROOF: &str = "x-rtdb-classic-retained-proof";
 const MAX_CLASSIC_RETAINED_PROOF: usize = 4608;
 
+fn routed_answer_deadline(grant: Option<DeliveryDeadline>, streaming: bool) -> Option<DeliveryDeadline> {
+    if !streaming { return grant; }
+    // Later batches may load encrypted objects whose delivery grants last only one answer window.
+    let window = DeliveryDeadline::answer_window();
+    Some(grant.map_or(window, |grant| grant.earlier(window)))
+}
+
 pub(crate) type Output<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 #[derive(Clone)]
 pub(crate) struct Service(pub Arc<Inner>);
@@ -183,7 +190,7 @@ impl Call {
     ) -> Result<(tonic::metadata::MetadataMap, Option<DeliveryDeadline>), Status> {
         let mut headers = self.response(())?.metadata().clone();
         let cutoff = if self.routed_delivery {
-            self.classic_deadline(grant.transport_deadline().or_else(|| streaming.then(DeliveryDeadline::answer_window)))
+            self.classic_deadline(routed_answer_deadline(grant.transport_deadline(), streaming))
         } else { None };
         if let Some(cutoff) = cutoff {
             let wire = cutoff.wire_nanos().ok_or_else(|| Status::unavailable("Flight answer deadline cannot be routed"))?;
@@ -770,7 +777,8 @@ pub(crate) fn query_ticket(ticket: Bytes, memory: &Arc<MemoryBudget>) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{CallKind, session_error};
+    use super::{CallKind, DeliveryDeadline, MemoryBudget, routed_answer_deadline, session_error};
+    use std::sync::Arc;
     use tonic::{Code, Status};
 
     #[test]
@@ -891,5 +899,27 @@ mod tests {
         assert!(!readback.allows_original_custody_control());
         assert!(!readback.allows_label_scope());
         assert!(!readback.serves_assigned_follower());
+    }
+
+    #[tokio::test]
+    async fn routed_streaming_deadline_is_capped_before_loading_encrypted_batches() {
+        use std::time::{Duration, Instant};
+        use rtdb_storage::{HeldView, ReadLease, sealing::PlaintextView};
+
+        let plaintext = PlaintextView::new(MemoryBudget::new(1 << 20));
+        let long = plaintext.grant().await.unwrap().holding(HeldView::recovery(Arc::new(())),
+            Some(Arc::new(ReadLease::until(Instant::now() + Duration::from_secs(60)))));
+        let long = long.transport_deadline().unwrap();
+        let selected = routed_answer_deadline(Some(long), true).unwrap();
+        assert!(long.covers(selected));
+        assert!(!selected.covers(long));
+        assert!(DeliveryDeadline::answer_window().covers(selected));
+
+        let short = plaintext.grant().await.unwrap().holding(HeldView::recovery(Arc::new(())),
+            Some(Arc::new(ReadLease::until(Instant::now() + Duration::from_secs(5)))));
+        let short = short.transport_deadline().unwrap();
+        let selected = routed_answer_deadline(Some(short), true).unwrap();
+        assert!(short.covers(selected) && selected.covers(short));
+        assert!(routed_answer_deadline(Some(long), false).unwrap().covers(long));
     }
 }

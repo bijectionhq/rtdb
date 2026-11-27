@@ -25,7 +25,7 @@ pub fn source_uses_extension(body: &SourceBody) -> bool {
 /// A transaction with an idempotency, replay or bounded-retry guard, or a placed attempt seed.
 pub fn tx_uses_extension(tx: &Tx) -> bool {
     tx.idempotency_guard.is_some() || tx.replay_submission.is_some() || tx.bounded_retry.is_some()
-        || tx.placed_attempt_seed.is_some()
+        || tx.placed_attempt_seed.is_some() || tx.direct_placed_commit.is_some()
 }
 
 /// A replica record XTDB would otherwise skip or misapply: a table retirement, an artefact record,
@@ -50,7 +50,8 @@ pub fn replica_uses_extension(body: &ReplicaBody) -> bool {
 
 fn resolved_uses_extension(tx: &ResolvedTx) -> bool {
     tx.placed_attempt.is_some() || tx.acceptance_stage.is_some() || tx.search_delta.is_some()
-        || tx.placed_slot_terminal.is_some() || tx.table_data.keys().any(|table| rtdb_only_table(table))
+        || tx.placed_slot_terminal.is_some() || tx.placed_direct_admission.is_some()
+        || tx.table_data.keys().any(|table| rtdb_only_table(table))
 }
 
 /// A block catalog XTDB would open without the feature it records: a later naming epoch, a serving checkpoint,

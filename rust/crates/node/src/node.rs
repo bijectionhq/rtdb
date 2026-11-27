@@ -132,6 +132,7 @@ impl NodeServices {
 #[derive(Clone, Copy)]
 enum CatalogReadCut<'a> {
     Current,
+    CurrentWriter,
     Single,
     Reserved(TransactionKey),
     HostedApplied {
@@ -617,7 +618,7 @@ impl Node {
                 if !placed || placement.is_none() { return Err(hosted_source_unavailable()); }
                 Some((self.read_fence.as_ref().ok_or_else(hosted_source_unavailable)?, history))
             }
-            CatalogReadCut::Current | CatalogReadCut::Single | CatalogReadCut::Reserved(_) => {
+            CatalogReadCut::Current | CatalogReadCut::CurrentWriter | CatalogReadCut::Single | CatalogReadCut::Reserved(_) => {
                 if replica_capture.is_none() && let Some(fence) = &self.read_fence {
                     fence.confirm(database).await?;
                     confirmed = true;
@@ -645,13 +646,13 @@ impl Node {
             if !placed && identity.authorize_database(&name, DatabaseAccess::Read).is_err() { continue; }
             let database_lease = match cut {
                 CatalogReadCut::HostedApplied { .. } => database.object_store().catalog_delivery_lease().await?,
-                CatalogReadCut::Current | CatalogReadCut::Single | CatalogReadCut::Reserved(_) => self.catalog_read_lease(&database).await?,
+                CatalogReadCut::Current | CatalogReadCut::CurrentWriter | CatalogReadCut::Single | CatalogReadCut::Reserved(_) => self.catalog_read_lease(&database).await?,
             };
             if let Some(database_lease) = database_lease {
                 lease = Some(match lease { Some(lease) => lease.earlier(database_lease), None => database_lease });
             }
             let snapshot = match cut {
-                CatalogReadCut::Current | CatalogReadCut::Single => crate::read_selection::query_snapshot(
+                CatalogReadCut::Current | CatalogReadCut::CurrentWriter | CatalogReadCut::Single => crate::read_selection::query_snapshot(
                     replica_capture.map(|capture| (*capture.snapshot).clone()),
                     || database.partition.snapshot(),
                 ),
@@ -701,6 +702,10 @@ impl Node {
                     Some(permit) => snapshot.with_catalog_read(permit),
                     None => snapshot,
                 }
+            } else if matches!(cut, CatalogReadCut::CurrentWriter)
+                && !self.read_fence.as_ref().is_some_and(|fence| fence.archive_history(&name))
+            {
+                database.hold_current_writer_catalog(snapshot).await?
             } else {
                 snapshot
             };
@@ -760,7 +765,7 @@ impl Node {
                 None => blocks.empty_snapshot_base(self.factory.options.trie, database.logs.source_floor()?, self.now())?,
             };
             let replay = replay.with_serving(database.native_serving_authority.clone(), storage);
-            recovered.replay_sql_erasure(&database.logs, replay, store, cancellation).await
+            recovered.replay_sql_erasure(&database.logs, replay, &blocks, cancellation).await
         }).await
     }
 
@@ -858,6 +863,14 @@ impl Node {
             Some((replay, submitted_at)) => (source.with_replay_submission(replay), Some(submitted_at)),
             None => (source, None),
         };
+        let source = if mode == CommitMode::Sync && matches!(&database.await_authority,
+            AwaitAuthority::Live { direct_sql_commits: true, .. })
+        {
+            source.with_direct_placed_commit()
+        } else {
+            source
+        };
+        let direct_placed_commit = source.direct_placed_commit();
         let prepared_clock = source.proposal_generation_reading()?;
         let payload = source.encode()?.into_bytes();
         drop(source);
@@ -884,7 +897,8 @@ impl Node {
         let placed_receipt = match authority.zip(seed) {
             Some((authority, seed)) => {
                 let attempt = seed.identify(position, identity.user())?;
-                if !database.progress().await_placed_admission(attempt, append_time, cancellation).await?
+                if !direct_placed_commit
+                    && !database.progress().await_placed_admission(attempt, append_time, cancellation).await?
                     && self.placed_outcome(database.name(), attempt, identity, placement, cancellation).await?.is_none()
                 {
                     return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb/attempt-unresolved",
@@ -920,7 +934,7 @@ impl Node {
     /// The committed outcome visible to the retry when its duplicate guard ran.
     async fn historical_keyed_transaction(&self, database: &str, key: &str, retry_time: Timestamp, submitted_at: Timestamp, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<Option<TransactionKey>> {
         let basis = QueryBasis { snapshot: self.snapshot_basis()?, replica_capture: None, resume_token: None, has_await_floor: false, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
-        let context = self.query_context_in_placement(database, &basis, identity, placement, CatalogReadCut::Current, cancellation).await?;
+        let context = self.query_context_in_placement(database, &basis, identity, placement, CatalogReadCut::CurrentWriter, cancellation).await?;
         let timestamp = |time: Timestamp| Value::Timestamp { value: time.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) };
         let arguments = vec![timestamp(retry_time), timestamp(submitted_at), Value::Utf8(key.to_owned())];
         let prepared = match self.outcome_query(OutcomeQuery::Historical, &context, &arguments) {
@@ -941,7 +955,7 @@ impl Node {
     }
     async fn placed_outcome(&self, database: &str, attempt: PlacedAttempt, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<Option<PlacedDecision>> {
         let basis = QueryBasis { snapshot: TimeBasis::default(), replica_capture: None, resume_token: None, has_await_floor: false, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
-        let context = self.query_context_in_placement(database, &basis, identity, placement, CatalogReadCut::Current, cancellation).await?;
+        let context = self.query_context_in_placement(database, &basis, identity, placement, CatalogReadCut::CurrentWriter, cancellation).await?;
         let arguments = vec![Value::Utf8(attempt.outcome_key())];
         let prepared = match self.outcome_query(OutcomeQuery::Placed, &context, &arguments) {
             Ok(prepared) => prepared,
@@ -966,7 +980,8 @@ impl Node {
 
     async fn check_placed_receipt_window(&self, database: &str, submitted_at: Timestamp, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<()> {
         let basis = QueryBasis { snapshot: TimeBasis::default(), replica_capture: None, resume_token: None, has_await_floor: false, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
-        let context = self.query_context_in_placement(database, &basis, identity, placement, CatalogReadCut::Current, cancellation).await?;
+        let cut = if self.factory.decision_clock.is_some() { CatalogReadCut::Current } else { CatalogReadCut::CurrentWriter };
+        let context = self.query_context_in_placement(database, &basis, identity, placement, cut, cancellation).await?;
         let installed_time = match &self.factory.decision_clock {
             Some(clock) => {
                 context.check_cancelled()?;
@@ -1058,7 +1073,13 @@ impl Node {
             return Ok(if db.external_source() { result.as_ref().clone() } else { answer_duplicate(result.as_ref().clone()) });
         }
         let basis = QueryBasis { snapshot: self.snapshot_basis()?, replica_capture: None, resume_token: None, has_await_floor: false, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
-        let cut = if placement.is_some() && !self.catalog.is_placed() { CatalogReadCut::Single } else { CatalogReadCut::Current };
+        let cut = if expected.is_some() {
+            CatalogReadCut::CurrentWriter
+        } else if placement.is_some() && !self.catalog.is_placed() {
+            CatalogReadCut::Single
+        } else {
+            CatalogReadCut::Current
+        };
         let context = self.query_context_in_placement(database, &basis, identity, placement, cut, cancellation).await?;
         let arguments = vec![Value::I64(tx_id.0)];
         let mut cursor = self.outcome_query(OutcomeQuery::Await, &context, &arguments)?.execute(context, arguments).await?;
@@ -1123,7 +1144,7 @@ impl Node {
         let invalid = || Anomaly::fault("rtdb.node/bounded-retry-outcome", "The bounded retry has no matching original outcome");
         if original.tx_id >= retry { return Err(invalid()); }
         let basis = QueryBasis { snapshot: self.snapshot_basis()?, replica_capture: None, resume_token: None, has_await_floor: false, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
-        let context = self.query_context_in_placement(database, &basis, identity, placement, CatalogReadCut::Current, cancellation).await?;
+        let context = self.query_context_in_placement(database, &basis, identity, placement, CatalogReadCut::CurrentWriter, cancellation).await?;
         let arguments = vec![Value::I64(original.tx_id.0)];
         let mut cursor = self.outcome_query(OutcomeQuery::Bounded, &context, &arguments)?.execute(context, arguments).await?;
         while let Some(batch) = cursor.next_batch().await? {
@@ -4471,11 +4492,26 @@ impl NativeSessionService {
     }
 
     pub(crate) async fn query_context(&self, database: &str, basis: &QueryBasis, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
+        self.query_context_at_cut(database, basis, CatalogReadCut::Current, cancellation).await
+    }
+
+    pub(crate) async fn inspection_context(&self, database: &str, basis: &QueryBasis, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
+        let cut = if basis.replica_capture.is_none() && basis.resume_token.is_none() {
+            CatalogReadCut::CurrentWriter
+        } else {
+            CatalogReadCut::Current
+        };
+        self.query_context_at_cut(database, basis, cut, cancellation).await
+    }
+
+    async fn query_context_at_cut(&self, database: &str, basis: &QueryBasis, cut: CatalogReadCut<'_>,
+        cancellation: &CancellationToken,
+    ) -> Result<Arc<QueryContext>> {
         let admission = Arc::new(crate::sql_snapshots::SqlSnapshotAdmission {
             node: self.node.clone(), identity: Arc::clone(&self.identity),
         });
         let context = self.node.query_context_in_placement(
-            database, basis, self.identity.as_ref(), self.placement.as_ref(), CatalogReadCut::Current, cancellation,
+            database, basis, self.identity.as_ref(), self.placement.as_ref(), cut, cancellation,
         ).await?;
         #[cfg(feature = "multi")]
         if self.node.factory.resources.journal_native_sql() {
@@ -4560,7 +4596,12 @@ impl SessionService for NativeSessionService {
         self.node.ensure_open()?;
         let database = self.database()?;
         if !database.has_replica_read_index() { return Ok((self.snapshot_basis()?, None)); }
-        let snapshot = database.capture_replica_snapshot(cancellation).await?;
+        let snapshot = if self.node.read_fence.as_ref().is_some_and(|fence| fence.archive_history(&self.database)) {
+            database.capture_replica_snapshot(cancellation).await?
+        } else {
+            let snapshot = database.capture_current_writer_snapshot(cancellation).await?;
+            database.hold_current_writer_catalog(snapshot).await?
+        };
         if !Arc::ptr_eq(&database, &self.database()?) {
             return Err(hosted_source_unavailable());
         }
