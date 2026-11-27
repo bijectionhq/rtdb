@@ -2412,6 +2412,7 @@ surface QueryAccess {
         -- A left lateral UNNEST with a supported total predicate processes the real candidates of each reached input page and retains each candidate for which the predicate is true.
         -- An admitted fixed-size Arrow list has the declared width and contributes the selected parent's child span within the reached slice.
         -- Each surviving candidate retains its parent, its original one-based ordinality, and its element value, including a real null element.
+        -- Compatible dense unions at the list or element level can use the batched expansion when the predicate is total for every admitted element leg.
         -- A parent with a null list, an empty list, or zero surviving candidates yields one row with null dependent columns.
         -- Batched expansion preserves the reached input validation and retains selected child spans under their source owners.
         -- The dependent Apply evaluates fallible predicates and bindings and handles input layouts outside the batch admission.

@@ -924,7 +924,7 @@ fn filtered_left_unnest(input: &Arc<Relation>, dependent: &Arc<Relation>, correl
         else { return Ok(None); };
     let RelationNode::Filter { predicate, .. } = dependent.node() else { unreachable!(); };
     match unnest_input(input) {
-        Some(UnnestInput::PlainLiterals) if total_outer_predicate(predicate, correlation) => {
+        Some(UnnestInput::PlainLiterals) if plain_unnest_list(&list.data_type) && total_outer_predicate(predicate, correlation) => {
             let list = Expr::Case {
                 branches: vec![(correlation.substitute(predicate.clone()), list.expression())],
                 otherwise: Box::new(Expr::Literal(Value::Null)),
@@ -953,8 +953,8 @@ pub(crate) fn filtered_left_unnest_source<'a>(
     let RelationNode::ColumnTable { expr: Expr::Parameter { index, data_type }, element } = column_table.node()
         else { return None; };
     let (_, Expr::Column { id, .. }) = arguments.iter().find(|(slot, _)| slot == index)? else { return None; };
-    if !plain_unnest_list(data_type)
-        || !(element.data_type == LogicalType::Nothing || plain_unnest_scalar(&element.data_type))
+    if !(plain_unnest_list(data_type) || mixed_unnest_list(data_type))
+        || !(element.data_type == LogicalType::Nothing || unnest_scalar_legs(&element.data_type))
         || !input.schema().ids().is_disjoint(&table.schema().ids())
     {
         return None;
@@ -985,6 +985,25 @@ fn plain_unnest_scalar(ty: &LogicalType) -> bool {
     matches!(ty, LogicalType::Null | LogicalType::Scalar(ScalarType::Bool | ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64))
 }
 
+fn unnest_scalar_legs(ty: &LogicalType) -> bool {
+    match ty {
+        LogicalType::Union(legs) => legs.iter().all(plain_unnest_scalar),
+        ty => plain_unnest_scalar(ty),
+    }
+}
+
+fn mixed_unnest_list(ty: &LogicalType) -> bool {
+    fn variable_list(ty: &LogicalType) -> bool {
+        matches!(ty, LogicalType::List { kind: ListKind::List, element } if unnest_scalar_legs(element))
+    }
+    match ty {
+        LogicalType::Maybe(inner) => variable_list(inner),
+        LogicalType::Union(legs) => legs.iter().any(variable_list)
+            && legs.iter().all(|leg| variable_list(leg) || plain_unnest_scalar(leg)),
+        ty => variable_list(ty),
+    }
+}
+
 fn plain_unnest_list(ty: &LogicalType) -> bool {
     let ty = match ty { LogicalType::Maybe(inner) => inner.as_ref(), ty => ty };
     matches!(ty, LogicalType::List { kind: ListKind::List | ListKind::FixedSizeList(0..), element }
@@ -994,7 +1013,7 @@ fn plain_unnest_list(ty: &LogicalType) -> bool {
 fn unnest_scalar_operand(expr: &Expr, schema: &Schema) -> bool {
     match expr {
         Expr::Literal(value) => plain_unnest_scalar(&value.logical_type()),
-        Expr::Column { id, data_type } => plain_unnest_scalar(data_type)
+        Expr::Column { id, data_type } => unnest_scalar_legs(data_type)
             && schema.get(*id).is_some_and(|field| field.data_type == *data_type),
         _ => false,
     }
@@ -1017,7 +1036,10 @@ fn total_unnest_predicate(predicate: &Expr, schema: &Schema) -> bool {
             if is_boolean_or_null(&left) && is_boolean_or_null(&right) {
                 matches!(op, BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::IsDistinctFrom | BinaryOp::IsNotDistinctFrom)
             } else {
-                [&left, &right].into_iter().all(|ty| !is_boolean_or_null(ty) || *ty == LogicalType::Null)
+                [&left, &right].into_iter().all(|ty| {
+                    ty.legs().iter().all(|leg| matches!(leg, LogicalType::Null
+                        | LogicalType::Scalar(ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64)))
+                })
             }
         }
         _ => unnest_scalar_operand(predicate, schema) && is_boolean_or_null(&predicate.data_type()),
@@ -1058,9 +1080,11 @@ fn unnest_input(mut input: &Relation) -> Option<UnnestInput> {
 
 fn plain_unnest_cell(expr: &Expr) -> bool {
     match expr {
-        Expr::Literal(Value::List(items)) => i32::try_from(items.len()).is_ok() && plain_unnest_list(&expr.data_type()),
+        Expr::Literal(Value::List(items)) => i32::try_from(items.len()).is_ok()
+            && (plain_unnest_list(&expr.data_type()) || mixed_unnest_list(&expr.data_type())),
         Expr::Literal(value) => plain_unnest_scalar(&value.logical_type()),
-        Expr::List(items) => i32::try_from(items.len()).is_ok() && plain_unnest_list(&expr.data_type())
+        Expr::List(items) => i32::try_from(items.len()).is_ok()
+            && (plain_unnest_list(&expr.data_type()) || mixed_unnest_list(&expr.data_type()))
             && items.iter().all(|item| matches!(item, Expr::Literal(value) if plain_unnest_scalar(&value.logical_type()))),
         Expr::Cast { target: CastTarget::Fixed(ty), .. } => plain_unnest_scalar(ty),
         _ => false,

@@ -931,6 +931,73 @@ async fn left_unnest_reuses_apply_for_a_page_with_an_incompatible_list_layout() 
     assert_eq!(run_in_order(&rewritten).await.unwrap(), expected);
 }
 
+#[tokio::test]
+async fn left_unnest_batches_dense_unions_and_keeps_fallible_mixed_ordering_on_apply() {
+    use arrow_array::RecordBatch;
+    use arrow_schema::Schema as ArrowSchema;
+    use rtdb_columnar::{OwnedBatch, build_array, to_field};
+    use rtdb_plan::LiteralArrowPages;
+
+    let ordinal = typed(42, "n", int());
+    let context = context();
+    let left_unnest = |element: &Field, parents: &[Value], predicate| {
+        let list_type = LogicalType::from_legs([LogicalType::list(element.data_type.clone()), bool_type()]);
+        let list = typed(40, "items", list_type);
+        let schema = Arc::new(ArrowSchema::new(vec![to_field("items", &list.data_type).unwrap()]));
+        let pages = parents.iter().map(|value| {
+            let array = build_array(&list.data_type, std::slice::from_ref(value)).unwrap();
+            let record = RecordBatch::try_new(Arc::clone(&schema), vec![array]).unwrap();
+            OwnedBatch::new(record, &context.memory).unwrap()
+        }).collect();
+        let input = Arc::new(Relation::new(Schema::new(vec![list.clone()]).unwrap(), RelationNode::ArrowLiteralPages {
+            pages: LiteralArrowPages::new(pages),
+        }).unwrap());
+        let table = Arc::new(Relation::new(Schema::new(vec![element.clone()]).unwrap(),
+            RelationNode::ColumnTable { expr: parameter(0, &list), element: element.clone() }).unwrap());
+        let table = Arc::new(table.with_ordinality(ordinal.clone(), rtdb_plan::OrdinalityScope::Page).unwrap());
+        let relation = apply(&input, select(table, predicate), vec![(0, list.expression())], ApplyKind::Left, None);
+        let output = [element.id, ordinal.id].map(|id| relation.schema().get(id).unwrap().clone());
+        keep(relation, &output)
+    };
+
+    let boundary = 1_i64 << 53;
+    let integers = typed(41, "item", LogicalType::from_legs([
+        LogicalType::Scalar(ScalarType::I32), int(), LogicalType::Null,
+    ]));
+    let numeric_parents = [Value::list(vec![Value::I32(1), Value::I64(boundary), Value::I64(boundary + 1)]), Value::Bool(true)];
+    let exact = Expr::binary(BinaryOp::Gt, integers.expression(), literal(boundary));
+    let (correlated, rewritten) = both_ways(&left_unnest(&integers, &numeric_parents, exact));
+    assert_eq!(count_nodes(rewritten.relation(), &|node| matches!(node, RelationNode::Apply { kind: ApplyKind::LeftUnnest, .. })), 1);
+    let expected = ["[I64(9007199254740993), I64(3)]", "[Null, Null]"];
+    assert_eq!(run_in_order(&correlated).await.unwrap(), expected);
+    assert_eq!(run_with_no_dependent_opens(&rewritten, Arc::clone(&context)).await, expected);
+
+    let element = typed(41, "item", LogicalType::from_legs([
+        LogicalType::Scalar(ScalarType::I32), int(), bool_type(), LogicalType::Null,
+    ]));
+    let mixed_parents = [
+        Value::list(vec![Value::I32(-1), Value::I64(1), Value::Null]),
+        Value::list(vec![Value::Bool(false)]),
+    ];
+    let total = Expr::binary(BinaryOp::Or, Expr::unary(UnaryOp::IsNull, element.expression()), equals(ordinal.expression(), literal(1)));
+    let (correlated, rewritten) = both_ways(&left_unnest(&element, &mixed_parents, total));
+    assert_eq!(count_nodes(rewritten.relation(), &|node| matches!(node, RelationNode::Apply { kind: ApplyKind::LeftUnnest, .. })), 1);
+    let expected = ["[I32(-1), I64(1)]", "[Null, I64(3)]", "[Bool(false), I64(1)]"];
+    assert_eq!(run_in_order(&correlated).await.unwrap(), expected);
+    assert_eq!(run_with_no_dependent_opens(&rewritten, Arc::clone(&context)).await, expected);
+
+    let fallible = left_unnest(&element, &mixed_parents, Expr::binary(BinaryOp::Gt, element.expression(), literal(0)));
+    let limited = Arc::new(Arc::clone(&fallible).limit(None, Some(literal(1))).unwrap());
+    let (correlated, rewritten) = both_ways(&limited);
+    assert_eq!(applies(rewritten.relation()), 1);
+    assert_eq!(run_in_order(&correlated).await.unwrap(), ["[I64(1), I64(2)]"]);
+    assert_eq!(run_in_order(&rewritten).await.unwrap(), ["[I64(1), I64(2)]"]);
+    let (correlated, rewritten) = both_ways(&fallible);
+    let error = Err("xtdb.expression/function-type-mismatch".to_owned());
+    assert_eq!(run_in_order(&correlated).await, error);
+    assert_eq!(run_in_order(&rewritten).await, error);
+}
+
 #[test]
 fn a_selected_exists_becomes_a_semi_join_and_its_negation_an_anti_join() {
     let semi = prepare(exists(one(customer_orders()), by_customer(), false, None)).unwrap();

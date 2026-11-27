@@ -126,6 +126,116 @@ async fn filtered_unnest_borrows_selected_arrow_spans_and_keeps_original_ordinal
     assert_eq!(memory.used_bytes(), baseline);
 }
 
+#[tokio::test]
+async fn filtered_unnest_borrows_sliced_dense_union_list_and_element_spans() {
+    use arrow_array::{Array, ArrayRef, BooleanArray, Int32Array, Int64Array, ListArray, NullArray, UnionArray};
+    use arrow_buffer::{NullBuffer, OffsetBuffer};
+    use arrow_schema::{DataType, Field as ArrowField, UnionFields};
+    use crate::columnar::Column;
+    use rtdb_plan::UnaryOp;
+
+    let execution = execution(1);
+    let memory = &execution.context.memory;
+    let baseline = memory.used_bytes();
+    let boundary = 1_i64 << 53;
+    let item_legs = UnionFields::try_new([5, 9, 12], [
+        ArrowField::new("i32", DataType::Int32, false),
+        ArrowField::new("i64", DataType::Int64, false),
+        ArrowField::new("null", DataType::Null, true),
+    ]).unwrap();
+    let items: ArrayRef = Arc::new(UnionArray::try_new(item_legs, vec![5, 5, 9, 12, 9, 5, 5].into(),
+        Some(vec![0, 1, 0, 0, 1, 2, 3].into()), vec![
+            Arc::new(Int32Array::from(vec![90, -2, 7, 5])),
+            Arc::new(Int64Array::from(vec![boundary, boundary + 1])),
+            Arc::new(NullArray::new(1)),
+        ]).unwrap());
+    let item = Arc::new(ArrowField::new("item", items.data_type().clone(), true));
+    let ty = rtdb_columnar::from_field(&item).unwrap();
+    let lists = ListArray::new(item, OffsetBuffer::new(vec![0_i32, 1, 5, 5, 6, 7].into()),
+        Arc::clone(&items), Some(NullBuffer::from(vec![true, true, true, false, true]))).slice(1, 4);
+    let list_legs = UnionFields::try_new([3, 7, 15], [
+        ArrowField::new("list", lists.data_type().clone(), true),
+        ArrowField::new("bool", DataType::Boolean, false),
+        ArrowField::new("null", DataType::Null, true),
+    ]).unwrap();
+    let lists = UnionArray::try_new(list_legs, vec![7, 3, 3, 15, 3, 7, 3, 3].into(),
+        Some(vec![0, 0, 1, 0, 2, 0, 3, 0].into()), vec![
+            Arc::new(lists), Arc::new(BooleanArray::from(vec![true])), Arc::new(NullArray::new(1)),
+        ]).unwrap().slice(1, 7);
+    let list_field = Arc::new(ArrowField::new("xs", lists.data_type().clone(), false));
+    let field = |id, name: &str, data_type| Field {
+        id: ColumnId(id), name: name.into(), qualifier: None, qualified_only: false, unnamed: false, data_type,
+    };
+    let list = field(0, "xs", rtdb_columnar::from_field(&list_field).unwrap());
+    let element = field(1, "v", ty);
+    let ordinal = field(2, "n", LogicalType::Scalar(ScalarType::I64));
+    let predicate = Expr::binary(BinaryOp::Or,
+        Expr::unary(UnaryOp::IsNull, element.expression()),
+        Expr::binary(BinaryOp::Or,
+            Expr::binary(BinaryOp::Eq, element.expression(), Expr::Literal(Value::I64(-2))),
+            Expr::binary(BinaryOp::Gt, element.expression(), Expr::Literal(Value::I64(boundary)))));
+    let schema = Schema::new(vec![list, element, ordinal]).unwrap();
+    let charge = memory.reserve(lists.get_array_memory_size() + 1024).unwrap();
+    let input = ColumnBatch::settled(vec![Column::Arrow {
+        array: Arc::new(lists), field: list_field, logical: None,
+    }], 7, charge).unwrap();
+    let owner = Arc::downgrade(input.column_reservation(0));
+    input.validate_readable(&execution.context).unwrap();
+    let output = input.expand_filtered_list(0, &schema, &predicate, Some("n"), &execution).await.unwrap().unwrap();
+    drop(input);
+
+    let Column::Selected(elements) = &output.columns[1] else { panic!("Expected borrowed child spans"); };
+    for (result, input) in [(0..1, 1..2), (1..3, 3..5), (8..9, 1..2), (9..11, 3..5)] {
+        let ((array, _, _), span) = elements.fragment_source(result).unwrap();
+        assert!(Arc::ptr_eq(&array, &items));
+        assert_eq!(span, input);
+    }
+    let element = output.columns[1].funded_arrow_cell(0, output.column_reservation(1)).unwrap().unwrap();
+    assert!(Arc::ptr_eq(element.owner, &owner.upgrade().unwrap()));
+    let actual = rows(&output).into_iter().map(|row| [row[1].clone(), row[2].clone()]).collect::<Vec<_>>();
+    let matched = [[Value::I32(-2), Value::I64(1)], [Value::Null, Value::I64(3)], [Value::I64(boundary + 1), Value::I64(4)]];
+    let expected = matched.iter().cloned().chain(std::iter::repeat_n([Value::Null, Value::Null], 5))
+        .chain(matched.iter().cloned()).collect::<Vec<_>>();
+    assert_eq!(actual, expected);
+    drop(output);
+    assert!(owner.upgrade().is_none());
+    assert_eq!(memory.used_bytes(), baseline);
+}
+
+#[tokio::test]
+async fn filtered_unnest_declines_an_ambiguous_union_and_keeps_reached_validation() {
+    use arrow_array::{Array, BooleanArray, Int64Array, ListArray, UnionArray};
+    use arrow_buffer::OffsetBuffer;
+    use arrow_schema::{DataType, Field as ArrowField, UnionFields};
+    use crate::columnar::Column;
+
+    let execution = execution(1);
+    let memory = &execution.context.memory;
+    let legs = UnionFields::try_new([0, 1], [
+        ArrowField::new("int", DataType::Int64, false),
+        ArrowField::new("i64", DataType::Boolean, false),
+    ]).unwrap();
+    let items = UnionArray::try_new(legs, vec![0, 1].into(), Some(vec![0, 0].into()), vec![
+        Arc::new(Int64Array::from(vec![1])), Arc::new(BooleanArray::from(vec![true])),
+    ]).unwrap();
+    let item = Arc::new(ArrowField::new("item", items.data_type().clone(), false));
+    let ty = rtdb_columnar::from_field(&item).unwrap();
+    let lists = ListArray::new(item, OffsetBuffer::new(vec![0_i32, 1, 2].into()), Arc::new(items), None);
+    let field = Arc::new(ArrowField::new("xs", lists.data_type().clone(), false));
+    let schema = Schema::new(vec![
+        Field { id: ColumnId(0), name: "xs".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: LogicalType::list(ty.clone()) },
+        Field { id: ColumnId(1), name: "v".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: ty },
+    ]).unwrap();
+    let charge = memory.reserve(lists.get_array_memory_size() + 1024).unwrap();
+    let input = ColumnBatch::settled(vec![Column::Arrow { array: Arc::new(lists), field, logical: None }], 2, charge).unwrap();
+    let error = input.validate_readable(&execution.context).unwrap_err();
+    assert_eq!(error.code.to_string(), "rtdb/array-layout");
+    let reached = input.slice(0, 1, memory).unwrap();
+    reached.validate_readable(&execution.context).unwrap();
+    let predicate = Expr::Literal(Value::Bool(false));
+    assert!(reached.expand_filtered_list(0, &schema, &predicate, None, &execution).await.unwrap().is_none());
+}
+
 #[test]
 fn computed_unnest_keeps_compatible_child_spans_and_gathers_mixed_children_in_order() {
     use crate::columnar::{Column, UnnestRows, pack_evaluated_column};

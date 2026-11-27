@@ -390,6 +390,8 @@ Compatible fixed-size Arrow lists use the declared width and retain child spans 
 A total predicate may use the element, its original one-based I64 ordinal, and directly captured Boolean or signed integer columns.
 Predicate admission covers Boolean combinations, null and truth tests, signed integer comparisons, and Boolean equality and distinctness.
 Only real candidates enter the page predicate, and only true candidates survive.
+Compatible dense unions can select a list leg per parent and retain mixed signed integer, Boolean or null element legs.
+Signed integer comparisons span widths exactly, and Boolean and signed integer element legs can share null tests.
 Each parent with zero surviving candidates gets one row with null dependent fields.
 Selected child spans retain their Arrow owners, including the positions of surviving null elements.
 The batched path validates the reached page and keeps the original Apply when the reached layout is incompatible.

@@ -794,13 +794,22 @@ impl ColumnBatch {
                         lease.grow_to(lease.bytes().checked_add(bytes).ok_or_else(size_error)?)?;
                         let inferred = if logical.is_none() && expected.is_some() { rtdb_columnar::from_field(field).ok() } else { None };
                         let Some(logical) = logical.or(inferred.as_ref()) else { return Ok(None); };
+                        let readable = readable_list_type(logical, field)
+                            || (expected.is_some() && readable_mixed_unnest_layout(logical, field, true));
                         if expected.is_some_and(|expected| expected.join(logical) != *expected)
-                            || !stable_read_layout(logical, field) || !readable_list_type(logical, field)
+                            || !stable_read_layout(logical, field) || !readable
                         {
                             return Ok(None);
                         }
                         layouts.insert(layout);
                     }
+                    let (array, offset) = if matches!(array.data_type(), DataType::Union(_, arrow_schema::UnionMode::Dense)) {
+                        let cell = rtdb_columnar::ArrowCell { array: array.as_ref(), field, row: offset }.physical()?;
+                        if !matches!(cell.array.data_type(), DataType::List(_)) { continue; }
+                        (cell.array, cell.row)
+                    } else {
+                        (array.as_ref(), offset)
+                    };
                     if array.is_null(offset) || array.data_type() == &DataType::Null {
                         (0, 0, 0)
                     } else {
@@ -3489,6 +3498,34 @@ fn readable_list_type(logical: &LogicalType, field: &ArrowField) -> bool {
         (LogicalType::Null, DataType::Null) => true,
         (LogicalType::List { kind: ListKind::List | ListKind::FixedSizeList(_) | ListKind::Set, .. },
          DataType::List(child) | DataType::FixedSizeList(child, _)) => readable(child),
+        _ => false,
+    }
+}
+
+fn readable_mixed_unnest_layout(logical: &LogicalType, field: &ArrowField, lists: bool) -> bool {
+    if !field.metadata().is_empty() { return false; }
+    let logical = match logical { LogicalType::Maybe(inner) => inner.as_ref(), ty => ty };
+    match field.data_type() {
+        DataType::List(child) if lists => {
+            let LogicalType::List { kind: ListKind::List, element } = logical else { return false; };
+            readable_mixed_unnest_layout(element, child, false)
+        }
+        DataType::Union(fields, arrow_schema::UnionMode::Dense) => fields.iter().all(|(_, child)| {
+            !matches!(child.data_type(), DataType::Union(..))
+                && rtdb_columnar::from_field(child).is_ok_and(|actual| {
+                    // A named leg can override the physical type in a logical read of the same cell.
+                    let name_agrees = match logical {
+                        LogicalType::Union(legs) => legs.iter().all(|leg| {
+                            !rtdb_columnar::leg_name(leg).is_ok_and(|name| name == *child.name())
+                                || *leg == actual || leg.clone().maybe() == actual
+                        }),
+                        _ => true,
+                    };
+                    name_agrees && readable_mixed_unnest_layout(&actual, child, lists)
+                })
+        }),
+        DataType::Null => field.is_nullable(),
+        DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => true,
         _ => false,
     }
 }
