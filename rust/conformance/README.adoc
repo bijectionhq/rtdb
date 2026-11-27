@@ -200,6 +200,28 @@ Earlier valid captures with a version 1 tape still replay the boot and authored 
 The launcher requires byte-for-byte equality between native stdout and `execution.json` before publishing `result.json`.
 Comparison of internal time samples, intermediate apply and role edges, and block and snapshot layouts remains pending.
 
+The Classic staggered-compaction replay ports `xtdb.NodeSimulationTest/staggered system startup during active compaction` from XTDB `0b9fa440f23d2165250d215209f7fa9bd7c26a6f`.
+It selects one source-authored interleaving of the pinned method and its mock compactor, with zero recorded JVM invocations and no JVM dispatcher seed.
+Two independent Classic catalogs share a memory object store seeded with eight full L1 tries for `public/docs` and block roots 5 through 7.
+The native fixture loads the final root with empty checkpoint trie metadata and applies the L1 seed separately, matching the reference fixture's separately seeded catalog and empty block additions.
+The replay calls the native job planner and trie collector, writes the reference fixture's one-byte placeholder files, and applies the modeled broadcasts to each catalog in order.
+System 1 collects the first group while the last sibling of the second group is still queued for delivery.
+Both systems subsequently reach compaction idle and run the original final collection passes.
+
+[source,shell]
+----
+RTDB_CONFORMANCE_BINARY simulation-staggered-compaction NEW_OUTPUT_DIRECTORY
+----
+
+`execution.json` records the source and fixture digests, binary identity, every modeled event, and the instrumented object-store operations.
+Each event's `storage_position` gives the number of storage events already recorded, so consecutive positions locate operations performed during that step.
+The receipt retains the original assertion operands and outcomes for five source sites and six evaluations.
+These count system 0's first post-compaction subset check, the two later subset checks, the distinct final catalog count, the exact final catalog set, and the exact stored data-file set.
+Unobserved evaluations count as failures and zero evaluations are excluded.
+The in-crate regression compares complete traces from two independent executions of the schedule and checks the delayed publication and both-file removals.
+The receipt covers the modeled compaction and GC interleaving at the catalog and object-store boundary.
+The pinned fixture uses placeholder files and an in-process broadcast, so real Arrow merging, replica publication, and JVM scheduler replay require separate coverage.
+
 
 `list_native.py` reads Cargo JSON build messages and lists the already-built test executables, preserving target, feature configuration, binary digest, and exact test name.
 It requires a single terminal successful `build-finished` record and a `--selection` JSON manifest with `schema_version: 1`, the absolute `workspace`, `implementation_revision`, `configuration`, build `command` argv, and `targets`.

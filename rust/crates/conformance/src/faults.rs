@@ -248,6 +248,8 @@ impl FaultSchedule {
 
     pub fn events(&self) -> Vec<Event> { self.state.lock().events.clone() }
 
+    pub(crate) fn event_count(&self) -> usize { self.state.lock().events.len() }
+
     fn begin_call(self: &Arc<Self>) -> Result<Call> {
         let mut state = self.state.lock();
         if state.closed { return Err(Error::Closed("fault scenario closed".into())); }
