@@ -3,6 +3,9 @@ use sha2::{Digest, Sha256};
 use std::{fs, path::Path};
 
 fn plan(root: &Path, records: Vec<Value>, direct: bool, query_limit: Option<u64>) -> std::path::PathBuf {
+    plan_at(root, "c84f9334eb060ceb92d28ecdd4a06e6b625932fd", records, direct, query_limit)
+}
+fn plan_at(root: &Path, reference: &str, records: Vec<Value>, direct: bool, query_limit: Option<u64>) -> std::path::PathBuf {
     let options = json!({"direct_sql":direct,"decorrelate":true,"query_limit":query_limit,"max_rows":100,"max_result_bytes":1048576});
     let mut source = String::new();
     let mut assertion = 0;
@@ -11,14 +14,14 @@ fn plan(root: &Path, records: Vec<Value>, direct: bool, query_limit: Option<u64>
         let is_assertion = matches!(record["type"].as_str(), Some("statement" | "query"));
         if is_assertion { assertion += 1; }
         let assertion_ordinal = if is_assertion { json!(assertion) } else { Value::Null };
-        let identity = json!({"reference":"c84f9334eb060ceb92d28ecdd4a06e6b625932fd","source":"fixture.test","source_sha256":"a".repeat(64),
+        let identity = json!({"reference":reference,"source":"fixture.test","source_sha256":"a".repeat(64),
             "selection":"fixture","options":options,"ordinal":index + 1,"assertion_ordinal":assertion_ordinal,"line":index * 4 + 1});
         source.push_str(&serde_json::to_string(&json!({"identity":identity,"ordinal":index + 1,"assertion_ordinal":assertion_ordinal,
             "line":index * 4 + 1,"record":record,"parse_error":null})).unwrap());
         source.push('\n');
     }
     fs::write(root.join("records.jsonl"), &source).unwrap();
-    let plan = json!({"schema_version":1,"reference":"c84f9334eb060ceb92d28ecdd4a06e6b625932fd","selection":"fixture","scripts":[{
+    let plan = json!({"schema_version":1,"reference":reference,"selection":"fixture","scripts":[{
         "source":"fixture.test","source_sha256":"a".repeat(64),"records":count,"assertions":assertion,"parse_errors":0,
         "records_file":"records.jsonl","records_sha256":format!("{:x}",Sha256::digest(source.as_bytes())),"selection":"fixture","options":options}]});
     let path = root.join("plan.json"); fs::write(&path, serde_json::to_vec(&plan).unwrap()).unwrap(); path
@@ -98,4 +101,18 @@ async fn unavailable_script_still_verifies_original_assertion_denominator() {
     fs::write(&plan_path, serde_json::to_vec(&plan).unwrap()).unwrap();
     let execution = rtdb_conformance::sql_logic::execute(&plan_path, &directory.path().join("output")).await.unwrap();
     assert_eq!(execution["execution_complete"], false);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upstream_pinned_commit_is_accepted_and_unpinned_reference_is_rejected() {
+    let directory = tempfile::tempdir().unwrap();
+    let accepted_dir = directory.path().join("accepted-plan");
+    let rejected_dir = directory.path().join("rejected-plan");
+    fs::create_dir(&accepted_dir).unwrap();
+    fs::create_dir(&rejected_dir).unwrap();
+    let accepted = plan_at(&accepted_dir, "0b9fa440f23d2165250d215209f7fa9bd7c26a6f", vec![query("SELECT 1", "1\n")], true, None);
+    let execution = rtdb_conformance::sql_logic::execute(&accepted, &directory.path().join("accepted-out")).await.unwrap();
+    assert_eq!(execution["execution_complete"], true, "{execution:#}");
+    let rejected = plan_at(&rejected_dir, "0000000000000000000000000000000000000000", vec![query("SELECT 1", "1\n")], true, None);
+    assert!(rtdb_conformance::sql_logic::execute(&rejected, &directory.path().join("rejected-out")).await.is_err());
 }

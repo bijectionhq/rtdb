@@ -11,6 +11,10 @@ use std::{collections::BTreeMap, fs::{self, File, OpenOptions}, io::{BufRead, Bu
 
 type Error = Box<dyn std::error::Error>;
 const MAX_LINE: u64 = 64 * 1024 * 1024;
+const PINNED_REFERENCES: [&str; 2] = [
+    "c84f9334eb060ceb92d28ecdd4a06e6b625932fd",
+    "0b9fa440f23d2165250d215209f7fa9bd7c26a6f",
+];
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -208,7 +212,7 @@ pub async fn execute(plan_path: &Path, output: &Path) -> Result<Json, Error> {
     File::open(plan_path)?.take(16 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
     if bytes.len() > 16 * 1024 * 1024 { return Err("SLT plan exceeds bounded size".into()); }
     let plan: Plan = serde_json::from_slice(&bytes)?;
-    if plan.schema_version != 1 || plan.reference != "c84f9334eb060ceb92d28ecdd4a06e6b625932fd" || plan.scripts.is_empty() { return Err("invalid SLT selection plan".into()); }
+    if plan.schema_version != 1 || !PINNED_REFERENCES.contains(&plan.reference.as_str()) || plan.scripts.is_empty() { return Err("invalid SLT selection plan".into()); }
     let plan_sha = format!("{:x}", Sha256::digest(&bytes));
     fs::create_dir(output)?;
     let mut scripts = Vec::new();
