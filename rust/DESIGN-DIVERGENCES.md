@@ -384,8 +384,8 @@ Unsupported window forms use SQLSTATE `0A000`.
 **What differs.**
 Upstream XTDB delegates regexes to `java.util.regex` with no compile or backtracking cap, parses XTQL with the Clojure reader, and splices computed `regexp-replace` patterns directly into Clojure codegen.
 RTDB translates Java regex syntax onto a vendored `fancy-regex` engine plus a UTF-16 interpreter for `\b{g}` and `\R`, enforcing hard limits (64 KiB pattern, nesting 128, repetition 10,000, 128 groups, and backtracking budgets) that fail with `rtdb.expr/regex-limit` (`ProgramLimitExceeded`, `54000`).
-RTDB parses XTQL with a native EDN reader that supports portable escapes, tagged values and integral ratios.
-Computed `regexp-replace` patterns use a whitelist of string and number functions, including `java.util.regex.Pattern/quote` and supported `clojure.string/*` operations.
+RTDB parses XTQL with a native EDN reader that supports portable escapes, tagged values, and exact ratio literals in raw forms.
+Computed `regexp-replace` patterns admit exact ratio arithmetic and use a whitelist of string and number functions, including `java.util.regex.Pattern/quote` and supported `clojure.string/*` operations.
 
 **Why.**
 Hard regex limits prevent catastrophic backtracking DoS on native worker threads.
@@ -515,6 +515,7 @@ RTDB ports XTDB's decorrelation rules (rules 1–4, 8, 9, `apply-table-col->unne
 - RTDB lifts a correlated selection above an unnest whose list reads no bound parameter (preserving the same rows), which XTDB does not;
 - RTDB does not lift correlated selections from the null-supplying side of an outer join;
 - ungrouped collecting/ordered aggregates under scalar/single/inner/left applies, parameterized percentile fractions, volatile dependent plans, and `PULL`/`PULL_MANY` keep their per-row apply.
+
 For a filtered left lateral `UNNEST` over eligible `VALUES` inputs, RTDB can use a total outer-row predicate to decide whether to expand a captured list of booleans or signed integers.
 A rejected, null, or empty list yields one null-extended row.
 Each element of an accepted list keeps its original ordinality, including a real null element.
