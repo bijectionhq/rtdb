@@ -5,7 +5,7 @@ use arrow_array::{Array, Date32Array, Date64Array, IntervalDayTimeArray, Interva
         IntervalMonthDayNanoType, IntervalYearMonthType, TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType}};
 use arrow_schema::{DataType, Field as ArrowField, IntervalUnit as ArrowIntervalUnit};
 use rtdb_columnar::MemoryReservation;
-use rtdb_expr::kernels::{AgeOperand, FixedDateBin, calendar_age, cast_date_timestamp_ticks, cast_timestamp_ticks,
+use rtdb_expr::kernels::{AgeOperand, DateBin, calendar_age, cast_date_timestamp_ticks, cast_timestamp_ticks,
     timestamp_truncation_zone, truncate_date32, truncate_date64, truncate_interval, truncate_timestamp};
 use rtdb_plan::{CastTarget, CastTimezone, Expr, Schema, TemporalField, TemporalKind, truncation_zone};
 use rtdb_types::{AnomalyKind, IntervalUnit, LogicalType, Result, ScalarType, TimeUnit, Value, ZoneId, java_date::MILLIS_PER_DAY};
@@ -366,17 +366,16 @@ pub(super) fn project(expr: &Expr, schema: &Schema, batch: &ColumnBatch, params:
                 }
             };
             let CalendarType::Timestamp(origin_unit, origin_zone) = origin.ty else { return Ok(None); };
-            if source_zone.is_some() != origin_zone.is_some() { return Ok(None); }
             let ScalarType::Timestamp { unit, timezone } = result else { return Ok(None); };
-            if *unit != FixedDateBin::output_unit(stride.unit, origin_unit) || timezone.as_deref() != origin_zone { return Ok(None); }
+            let bin = DateBin::new(stride.unit, source_unit, source_zone.is_some(), origin_unit, origin_zone);
+            if *unit != bin.output_unit() || timezone.as_deref() != origin_zone { return Ok(None); }
             let cell = |row| {
                 let (Some(stride_parts), Some(origin)) = (stride.parts(row), origin.ticks(row)) else { return Ok(None); };
                 let (Some(parts), Some(origin)) = (stride_parts, origin) else { return Ok(Some(None)); };
                 let Some(source) = source.ticks(row) else { return Ok(None); };
                 let Some(source) = source else { return Ok(Some(None)); };
-                if parts.months != 0 || parts.days != 0 { return Ok(None); }
-                let bin = FixedDateBin::new(parts.nanoseconds, stride.unit, source_unit, origin, origin_unit);
-                bin.cell(source).map(|value| Some(Some(value)))
+                bin.cell((parts.months, parts.days, parts.nanoseconds), source, origin, &context.timezone)
+                    .map(|value| Some(Some(value)))
             };
             match unit {
                 TimeUnit::Microsecond => build::<TimestampMicrosecondType>(batch, context, result, cell),
@@ -748,21 +747,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn date_bin_uses_scalar_arithmetic_for_reached_calendar_strides() {
-        let ts = field(0, TimeUnit::Microsecond, Some("America/New_York"));
-        let stride = Field { data_type: LogicalType::Scalar(ScalarType::Interval(IntervalUnit::MonthDayNano)), ..field(1, TimeUnit::Microsecond, None) };
-        let schema = Schema::new(vec![ts.clone(), stride.clone()]).unwrap();
+    async fn date_bin_uses_origin_calendar_and_session_zone_across_dst() {
+        use TimeUnit::{Microsecond, Nanosecond};
+        let ny = "America/New_York";
+        let london = "Europe/London";
+        let session = "America/Chicago";
+        let zoned = field(0, Microsecond, Some(london));
+        let local = field(1, Microsecond, None);
+        let stride = Field { data_type: LogicalType::Scalar(ScalarType::Interval(IntervalUnit::MonthDayNano)).maybe(),
+            ..field(2, Microsecond, None) };
+        let schema = Schema::new(vec![zoned.clone(), local.clone(), stride.clone()]).unwrap();
+        let day = 86_400_000_000i64;
+        let instant = 1_615_620_600_000_000i64;
+        let wall = instant - 6 * 3_600_000_000;
         let batch = dataset(vec![
-            arrow(TimestampMicrosecondArray::from(vec![86_400_000_000i64]).with_timezone("America/New_York"), &ts),
-            arrow(IntervalMonthDayNanoArray::from(vec![IntervalMonthDayNano::new(0, 1, 0)]), &stride),
-        ], 1);
-        let bin = call("date_bin", vec![stride.expression(), ts.expression()]);
-        let values = batch.columns.iter().map(|column| column.value(0).unwrap()).collect::<Vec<_>>();
-        let expected = rtdb_expr::evaluate_projection(&bin, &schema, &values, &Default::default()).unwrap();
-        let mut cursor = cursor(execution("UTC"), schema, batch, vec![bin]);
-        let page = cursor.next_batch().await.unwrap().unwrap();
-        assert_eq!(page.columns[0].value(0).unwrap(), expected);
-        assert_eq!(cursor.scalar_fallbacks, Some(1));
+            arrow(TimestampMicrosecondArray::from(vec![Some(instant + day), Some(instant - 34 * day),
+                Some(instant), None]).with_timezone(london), &zoned),
+            arrow(TimestampMicrosecondArray::from(vec![Some(wall + day), Some(wall - 34 * day), Some(wall), None]), &local),
+            arrow(IntervalMonthDayNanoArray::from(vec![
+                Some(IntervalMonthDayNano::new(0, 1, 0)),
+                Some(IntervalMonthDayNano::new(-1, 29, 123)),
+                None,
+                Some(IntervalMonthDayNano::new(1, 0, 0)),
+            ]), &stride),
+        ], 4);
+        let since = |source: &Field, ticks, zone| call("date_bin", vec![
+            stride.expression(), source.expression(), Expr::Literal(timestamp(ticks, Microsecond, zone)),
+        ]);
+        let calls = vec![since(&zoned, instant, Some(ny)), since(&local, instant, Some(ny)), since(&zoned, wall, None)];
+        let zoned_result = ScalarType::Timestamp { unit: Nanosecond, timezone: Some(ny.into()) };
+        let local_result = ScalarType::Timestamp { unit: Nanosecond, timezone: None };
+        assert_parity(execution(session), schema, batch, calls, vec![zoned_result.clone(), zoned_result, local_result]).await;
+    }
+
+    #[tokio::test]
+    async fn date_bin_validates_a_reached_calendar_stride_after_subtraction() {
+        let ts = field(0, TimeUnit::Microsecond, None);
+        let schema = Schema::new(vec![ts.clone()]).unwrap();
+        let stride = Expr::Literal(Value::IntervalMonthDayMicro { months: 1, days: 0, nanoseconds: 0 });
+        let origin = Expr::Literal(timestamp(-1, TimeUnit::Microsecond, None));
+        let bin = call("date_bin", vec![stride, ts.expression(), origin]);
+        for (first, second, expected) in [
+            (i64::MAX, 0, "xtdb.expression/overflow-error"),
+            (0, i64::MAX, "xtdb.expression/cannot-cast-mdn-interval-with-months"),
+        ] {
+            let values = [None, Some(first), Some(second)];
+            let batch = dataset(vec![arrow(TimestampMicrosecondArray::from(values.to_vec()), &ts)], values.len());
+            let oracle = rtdb_expr::evaluate_projection(&bin, &schema, &[timestamp(first, TimeUnit::Microsecond, None)],
+                &Default::default()).unwrap_err();
+            let mut cursor = cursor(execution("UTC"), schema.clone(), batch, vec![bin.clone()]);
+            let actual = cursor.next_batch().await.err().unwrap();
+            assert_eq!(actual.code, oracle.code);
+            assert_eq!(actual.code, expected);
+            assert_eq!(cursor.scalar_fallbacks, Some(0));
+        }
     }
 
     #[tokio::test]

@@ -27,7 +27,7 @@ impl IntervalParts {
         })
     }
     fn mixed(self) -> bool { usize::from(self.months != 0) + usize::from(self.days != 0) + usize::from(self.nanos != 0) > 1 }
-    fn scale(self, factor: i64) -> Result<Self> {
+    pub(crate) fn scale(self, factor: i64) -> Result<Self> {
         Ok(Self {
             months: i32::try_from(i64::from(self.months).checked_mul(factor).ok_or_else(interval_overflow)?).map_err(|_| interval_overflow())?,
             days: i32::try_from(i64::from(self.days).checked_mul(factor).ok_or_else(interval_overflow)?).map_err(|_| interval_overflow())?,
@@ -68,7 +68,7 @@ pub fn local_timestamp_micros(value: i64, source: TimeUnit, zoned: bool, timezon
     rescale_timestamp(value, source, TimeUnit::Microsecond, zoned, timezone).ok()
 }
 
-fn rescale_timestamp(value: i64, source: TimeUnit, target: TimeUnit, localize: bool, timezone: &str) -> Result<i64> {
+pub(crate) fn rescale_timestamp(value: i64, source: TimeUnit, target: TimeUnit, localize: bool, timezone: &str) -> Result<i64> {
     let zone = localize.then(|| zone(timezone)).transpose()?;
     rescale(local_timestamp(value, source, zone.as_ref())?, source, target)
 }
@@ -112,6 +112,11 @@ fn add_interval(value: &Value, parts: IntervalParts, result: &ScalarType, sign: 
     }
     let ScalarType::Timestamp { unit, timezone } = result else { return Err(inapplicable("interval arithmetic", &[value])); };
     let value = timestamp_units(value, *unit, false, "UTC")?;
+    let value = add_timestamp_interval(value, *unit, timezone.as_deref(), parts, sign)?;
+    Ok(Value::Timestamp { value, unit: *unit, timezone: timezone.clone() })
+}
+
+pub(crate) fn add_timestamp_interval(value: i64, unit: TimeUnit, timezone: Option<&str>, parts: IntervalParts, sign: i64) -> Result<i64> {
     let moved = if let Some(timezone) = timezone {
         if parts.months == 0 && parts.days == 0 { value }
         else {
@@ -122,9 +127,9 @@ fn add_interval(value: &Value, parts: IntervalParts, result: &ScalarType, sign: 
             let moved = calendar_units(local, TimeUnit::Second, parts, sign)?;
             local_near(moved, &zone, offset)?.checked_mul(unit.units_per_second()).and_then(|seconds| seconds.checked_add(value.rem_euclid(unit.units_per_second()))).ok_or_else(overflow)?
         }
-    } else { calendar_units(value, *unit, parts, sign)? };
-    let duration = interval_ticks(parts.nanos, *unit, sign)?;
-    Ok(Value::Timestamp { value: moved.checked_add(duration).ok_or_else(overflow)?, unit: *unit, timezone: timezone.clone() })
+    } else { calendar_units(value, unit, parts, sign)? };
+    let duration = interval_ticks(parts.nanos, unit, sign)?;
+    moved.checked_add(duration).ok_or_else(overflow)
 }
 
 pub(crate) fn interval_ticks(nanos: i64, unit: TimeUnit, sign: i64) -> Result<i64> {

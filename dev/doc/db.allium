@@ -2618,8 +2618,9 @@ surface QueryAccess {
         -- DATE_TRUNC over an exact interval cell preserves its layout and truncates signed month, day and time components toward zero.
         -- Whole-second and coarser truncation of zoned timestamps uses the timestamp's zone rules or the explicit override, preserving the scalar result at gaps and overlaps.
         -- Truncation raises errors in reached row order.
-        -- A DATE_BIN projection with a compatible fixed-time stride and timestamp origin can write Arrow timestamp ticks with the origin's zone label.
-        -- A null DATE_BIN stride or origin skips the source, and a reached calendar stride uses scalar interval arithmetic.
+        -- A DATE_BIN projection with a compatible month-day interval stride and timestamp bounds can write Arrow timestamp ticks with the origin's zone label.
+        -- A null DATE_BIN stride or origin skips the source.
+        -- DATE_BIN uses the session zone for a mixed local and zoned difference and the origin's calendar for a reached calendar offset.
         -- An AGE projection over compatible date or timestamp inputs can write Arrow intervals using the session-zone calendar and the scalar result precision.
         -- A compatible non-nullable timestamp cast inside AGE applies the scalar cast after both operands reach a non-null cell.
         -- A column table over a compatible Arrow list parameter reads the bound row's child slice as one semantic page.

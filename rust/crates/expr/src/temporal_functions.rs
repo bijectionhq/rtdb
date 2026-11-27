@@ -329,37 +329,37 @@ fn age_parts((end_date, end_nano): (CivilDate, i64), (start_date, start_nano): (
     Ok(IntervalParts { months: i32::try_from(months).map_err(|_|overflow())?,days: i32::try_from(days).map_err(|_|overflow())?,nanos })
 }
 
-/// Fixed-time binning for a source and origin that are both local or both zoned.
-pub struct FixedDateBin {
+/// DATE_BIN for timestamp operands and a month-day-micro or month-day-nano stride.
+pub struct DateBin<'a> {
     source_unit: U,
-    origin: i64,
+    source_zoned: bool,
     origin_unit: U,
-    stride_nanos: i64,
+    origin_zone: Option<&'a str>,
     output_unit: U,
 }
 
-impl FixedDateBin {
-    /// Computes the output unit for fixed-time interval strides of the given precision.
-    pub fn output_unit(stride_unit: U, origin_unit: U) -> U { stride_unit.max(origin_unit) }
-
-    /// Binds the time component of an interval with zero months and days.
-    pub fn new(stride_nanos: i64, stride_unit: U, source_unit: U, origin: i64, origin_unit: U) -> Self {
-        let output_unit = Self::output_unit(stride_unit, origin_unit);
-        Self { source_unit, origin, origin_unit, stride_nanos, output_unit }
+impl<'a> DateBin<'a> {
+    pub fn new(stride_unit: U, source_unit: U, source_zoned: bool, origin_unit: U, origin_zone: Option<&'a str>) -> Self {
+        Self { source_unit, source_zoned, origin_unit, origin_zone, output_unit: stride_unit.max(origin_unit) }
     }
 
-    pub fn cell(&self, source: i64) -> Result<i64> {
-        use crate::{numeric::signed_quotient, temporal::{interval_ticks, rescale}};
+    pub fn output_unit(&self) -> U { self.output_unit }
+
+    /// Bins a non-null source relative to a non-null origin using signed interval components.
+    pub fn cell(&self, (months, days, nanos): (i32, i32, i64), source: i64, origin: i64, timezone: &str) -> Result<i64> {
+        use crate::{cast::month_day_duration, numeric::signed_quotient, temporal::{add_timestamp_interval, rescale, rescale_timestamp}};
 
         let difference_unit = self.source_unit.max(self.origin_unit);
-        let source = rescale(source, self.source_unit, difference_unit)?;
-        let origin = rescale(self.origin, self.origin_unit, difference_unit)?;
-        let difference = source.checked_sub(origin).ok_or_else(overflow)?;
-        let stride = rescale(self.stride_nanos, U::Nanosecond, difference_unit)?;
+        let origin_zoned = self.origin_zone.is_some();
+        let mixed_zones = self.source_zoned != origin_zoned;
+        let local_source = rescale_timestamp(source, self.source_unit, difference_unit, mixed_zones && self.source_zoned, timezone)?;
+        let local_origin = rescale_timestamp(origin, self.origin_unit, difference_unit, mixed_zones && origin_zoned, timezone)?;
+        let difference = local_source.checked_sub(local_origin).ok_or_else(overflow)?;
+        let stride = month_day_duration(months, days, nanos, difference_unit)?;
         let quotient = signed_quotient(difference, stride)?;
-        let offset = self.stride_nanos.checked_mul(quotient).ok_or_else(overflow)?;
-        let origin = rescale(self.origin, self.origin_unit, self.output_unit)?;
-        origin.checked_add(interval_ticks(offset, self.output_unit, 1)?).ok_or_else(overflow)
+        let offset = IntervalParts { months, days, nanos }.scale(quotient)?;
+        let origin = rescale(origin, self.origin_unit, self.output_unit)?;
+        add_timestamp_interval(origin, self.output_unit, self.origin_zone, offset, 1)
     }
 }
 
