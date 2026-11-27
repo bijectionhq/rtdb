@@ -80,7 +80,7 @@ pub(super) fn relayout_result(array: &ArrayRef, source: &Field, target: &Field, 
         scratch.borrow_mut().push(memory.reserve(bytes)?);
         Ok(())
     };
-    let (field, array) = relayout_in(Arc::clone(array), source, target, false, Some(&reserve)).map_err(rtdb_types::Anomaly::from)?;
+    let (field, array) = relayout_in(Arc::clone(array), source, target, false, Some(&reserve)).map_err(RelayoutError::into_anomaly)?;
     Ok((field, array, scratch.into_inner()))
 }
 
@@ -160,9 +160,9 @@ impl From<rtdb_types::Anomaly> for RelayoutError {
     fn from(error: rtdb_types::Anomaly) -> Self { Self::Anomaly(error) }
 }
 
-impl From<RelayoutError> for rtdb_types::Anomaly {
-    fn from(error: RelayoutError) -> Self {
-        match error {
+impl RelayoutError {
+    fn into_anomaly(self) -> rtdb_types::Anomaly {
+        match self {
             RelayoutError::Incompatible => incompatible(),
             RelayoutError::Anomaly(error) => error,
         }
@@ -172,7 +172,7 @@ impl From<RelayoutError> for rtdb_types::Anomaly {
 type RelayoutResult<T> = std::result::Result<T, RelayoutError>;
 
 pub(super) fn relayout(array: ArrayRef, source: &Field, target: &Field, event: bool) -> Result<(Field, ArrayRef)> {
-    relayout_in(array, source, target, event, None).map_err(Into::into)
+    relayout_in(array, source, target, event, None).map_err(RelayoutError::into_anomaly)
 }
 
 fn relayout_in(array: ArrayRef, source: &Field, target: &Field, event: bool, result: Option<&dyn Fn(usize) -> Result<()>>) -> RelayoutResult<(Field, ArrayRef)> {
@@ -365,7 +365,7 @@ impl<'a> ResultLeg<'a> {
         let mut children = Vec::with_capacity(self.sources.len());
         for (source, array) in self.sources {
             reserve(super::arrow_relayout_bound(array, source, &target)?)?;
-            let (field, child) = relayout_in(make_array(array.to_data()), source, &target, false, Some(reserve)).map_err(rtdb_types::Anomaly::from)?;
+            let (field, child) = relayout_in(make_array(array.to_data()), source, &target, false, Some(reserve)).map_err(RelayoutError::into_anomaly)?;
             target = field.clone();
             children.push((field, child));
         }
@@ -375,7 +375,7 @@ impl<'a> ResultLeg<'a> {
                 inputs.push(child);
             } else {
                 reserve(super::arrow_relayout_bound(child.as_ref(), &source, &target)?)?;
-                let (_, child) = relayout_in(child, &source, &target, false, Some(reserve)).map_err(rtdb_types::Anomaly::from)?;
+                let (_, child) = relayout_in(child, &source, &target, false, Some(reserve)).map_err(RelayoutError::into_anomaly)?;
                 inputs.push(child);
             }
         }
