@@ -12,6 +12,7 @@ import xtdb.api.error.Unsupported
 import xtdb.hash.addDoubles
 import xtdb.util.Hasher
 import java.math.BigDecimal
+import java.math.BigInteger
 import java.nio.ByteOrder
 
 private const val DECIMAL_ERROR_KEY = "xtdb.error/decimal-error"
@@ -40,6 +41,14 @@ class DecimalVector private constructor(
             : this(al, name, 0, if (nullable) BitBuffer(al) else null, ExtensibleBuffer(al), decimalType)
 
     override val byteWidth = (bitWidth / 8)
+
+    private val coefficientBounds by lazy(LazyThreadSafetyMode.NONE) {
+        if (precision < 1 || precision >= bitWidth) null
+        else {
+            val max = BigInteger.TEN.pow(precision) - BigInteger.ONE
+            if (max.bitLength() >= bitWidth) null else max.negate().toByteArray() to max.toByteArray()
+        }
+    }
 
     override val arrowType: ArrowType = Decimal(precision, scale, bitWidth)
 
@@ -84,24 +93,31 @@ class DecimalVector private constructor(
     internal fun tryCopyValue(src: DecimalVector, idx: Int): Boolean {
         if (arrowType != src.arrowType || precision < 1) return false
 
-        // A coefficient fitting in 3p magnitude bits is smaller than 10^p, including the negative boundary.
-        val signBit = minOf(bitWidth - 1L, 3L * precision).toInt()
-        val signByte = signBit / Byte.SIZE_BITS
+        if (!fitsPrecision(src, idx)) return false
+        copyNonNullValue(src, idx)
+        return true
+    }
+
+    private fun fitsPrecision(src: DecimalVector, idx: Int): Boolean {
+        val (min, max) = coefficientBounds ?: return true
         val offset = idx.toLong() * byteWidth
-        val srcBuffer = src.dataBuffer
+
         fun readByte(i: Int): Int {
             val physicalIndex = if (LITTLE_ENDIAN) i else byteWidth - 1 - i
-            return srcBuffer.getByte(offset + physicalIndex).toInt()
+            return src.dataBuffer.getByte(offset + physicalIndex).toInt() and 0xff
         }
 
-        val sign = readByte(signByte) shr (signBit % Byte.SIZE_BITS)
-        if (sign != 0 && sign != -1) return false
-        for (i in signByte + 1 until byteWidth) {
-            if (readByte(i) != sign) return false
+        val highByte = readByte(byteWidth - 1)
+        val negative = highByte >= 0x80
+        val bound = if (negative) min else max
+        val signExtension = if (negative) 0xff else 0
+        for (i in byteWidth - 1 downTo 0) {
+            val coefficientByte = if (i == byteWidth - 1) highByte else readByte(i)
+            val boundByte = if (i < bound.size) (bound[bound.lastIndex - i].toInt() and 0xff) else signExtension
+            if (coefficientByte != boundByte) {
+                return if (negative) coefficientByte > boundByte else coefficientByte < boundByte
+            }
         }
-
-        dataBuffer.writeBytes(srcBuffer, offset, byteWidth.toLong())
-        writeNotNull()
         return true
     }
 

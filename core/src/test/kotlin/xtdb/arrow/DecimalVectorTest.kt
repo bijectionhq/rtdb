@@ -9,6 +9,7 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
 import java.math.BigDecimal
+import java.math.BigInteger
 
 class DecimalVectorTest {
     private lateinit var allocator: BufferAllocator
@@ -87,6 +88,35 @@ class DecimalVectorTest {
             DecimalVector(allocator, "other-scale", false, ArrowType.Decimal(5, 3, 32)).use { dst ->
                 val reader = src.valueReader()
                 assertThrows<InvalidWriteObjectException> { dst.writeValue(reader.next()) }
+            }
+        }
+    }
+
+    @Test
+    fun `identity copies the exact signed precision bounds for every width`() {
+        for ((bits, precision) in listOf(32 to 9, 64 to 18, 128 to 38, 256 to 76)) {
+            val scale = -2
+            val type = ArrowType.Decimal(precision, scale, bits)
+            val limit = BigInteger.TEN.pow(precision)
+            val max = BigDecimal(limit - BigInteger.ONE, scale)
+            val outside = BigDecimal(limit, scale)
+            DecimalVector(allocator, "src", false, type).use { src ->
+                src.writeObject(max)
+                src.writeObject(max.negate())
+                src.setBigDecimal(2, outside)
+                src.setBigDecimal(3, outside.negate())
+
+                DecimalVector(allocator, "dst", false, type).use { dst ->
+                    val reader = src.valueReader()
+                    assertTrue(reader.next().copyIdentityTo(dst))
+                    assertTrue(reader.next().copyIdentityTo(dst))
+                    for (invalid in listOf(outside, outside.negate())) {
+                        reader.next()
+                        assertFalse(reader.copyIdentityTo(dst))
+                        assertEquals(invalid, assertThrows<InvalidWriteObjectException> { dst.writeValue(reader) }.obj)
+                    }
+                    assertEquals(listOf(max, max.negate()), dst.asList)
+                }
             }
         }
     }
