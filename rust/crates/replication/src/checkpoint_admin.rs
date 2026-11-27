@@ -338,7 +338,7 @@ impl NativeServingHandle {
         selection.alive(self.replication.serving_clock())?;
         let installed = status.installed.ok_or_else(unavailable)?;
         if selection.boundary.epoch() != logs.replica_epoch || selection.boundary > installed.replica
-            || selection.source > installed.source || !logs.confirms_recovery_checkpoint(&block).await
+            || selection.source > installed.source || !logs.confirms_recovery_checkpoint(&block).await?
         { return Err(unavailable()); }
         let cut = CatalogCut { storage_version: logs.storage_version, storage_epoch: logs.storage_epoch,
             replica_epoch: logs.replica_epoch, through: selection.boundary };

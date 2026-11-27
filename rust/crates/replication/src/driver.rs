@@ -285,19 +285,21 @@ impl TermHandle {
         }
     }
     /// Obtains the adopted source token only once the hosted recovery owner has installed its root.
-    pub async fn recoverable_external_checkpoint(&self) -> Option<RecoverableExternalToken> {
+    /// A journal that cannot say whether it confirms the root raises its error rather than reporting no token.
+    pub async fn recoverable_external_checkpoint(&self) -> Result<Option<RecoverableExternalToken>> {
         let catalog = {
             let status = self.handle.status.borrow();
-            if status.role != Role::Leading(self.term) { return None; }
-            status.adopted_block.clone()?
+            if status.role != Role::Leading(self.term) { return Ok(None); }
+            let Some(catalog) = status.adopted_block.clone() else { return Ok(None); };
+            catalog
         };
-        let bytes = catalog.external_source_token()?;
-        if !self.handle.logs.confirms_recovery_checkpoint(&catalog).await
+        let Some(bytes) = catalog.external_source_token() else { return Ok(None); };
+        if !self.handle.logs.confirms_recovery_checkpoint(&catalog).await?
             || self.handle.status.borrow().role != Role::Leading(self.term)
         {
-            return None;
+            return Ok(None);
         }
-        Some(RecoverableExternalToken(Arc::from(bytes)))
+        Ok(Some(RecoverableExternalToken(Arc::from(bytes))))
     }
 
     /// Replaces a quiescent catalog and returns after its new block has been adopted in this term.

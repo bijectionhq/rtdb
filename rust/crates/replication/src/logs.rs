@@ -189,11 +189,14 @@ impl PartitionLogs {
     }
 
     pub(crate) fn requires_checkpoint_digest(&self) -> bool { self.replica.requires_checkpoint_digest() }
-    pub(crate) async fn confirms_recovery_checkpoint(&self, catalog: &rtdb_format::catalog::BlockCatalog) -> bool {
-        if !self.replica.needs_published_recovery_checkpoint() { return true; }
-        let (Some(boundary), Some(root)) = (catalog.boundary_replica_position(), catalog.publication_sha256()) else { return false; };
+    /// Whether the replica journal's hosted owner attests `catalog` as its recovery root.
+    /// A journal that cannot answer raises its error: an unreachable owner is not an owner that declined.
+    pub(crate) async fn confirms_recovery_checkpoint(&self, catalog: &rtdb_format::catalog::BlockCatalog) -> Result<bool> {
+        if !self.replica.needs_published_recovery_checkpoint() { return Ok(true); }
+        let (Some(boundary), Some(root)) = (catalog.boundary_replica_position(), catalog.publication_sha256()) else { return Ok(false); };
         let through = LogOffset(boundary.after_offset(self.replica_epoch));
-        through.0 >= 0 && self.replica.confirms_recovery_checkpoint(catalog.block_index().0, through, root).await.unwrap_or(false)
+        if through.0 < 0 { return Ok(false); }
+        Ok(self.replica.confirms_recovery_checkpoint(catalog.block_index().0, through, root).await?)
     }
     pub(crate) fn fences_writer_terms(&self) -> bool { self.replica.fences_writer_terms() }
     pub(crate) async fn holds_writer_grant(&self) -> Result<bool> { Ok(self.replica.holds_writer_grant().await?) }

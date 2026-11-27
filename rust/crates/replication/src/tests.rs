@@ -3884,3 +3884,35 @@ async fn fenced_appends_charge_only_boundaries_and_uploads_to_maintenance() {
 
 #[path = "driver_trace_tests.rs"]
 mod driver_trace_tests;
+
+/// A hosted replica journal whose owner cannot be reached when asked to confirm a recovery root.
+struct UnreachableRecoveryOwner { log: Arc<MemoryLog> }
+
+#[async_trait::async_trait]
+impl Log for UnreachableRecoveryOwner {
+    fn needs_published_recovery_checkpoint(&self) -> bool { true }
+    async fn confirms_recovery_checkpoint(&self, _block: i64, _through: LogOffset, _root: [u8; 32]) -> rtdb_storage::Result<bool> {
+        Err(rtdb_storage::Error::Closed("recovery owner unreachable".into()))
+    }
+    async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> rtdb_storage::Result<rtdb_storage::log::AppendReceipt> {
+        self.log.enqueue(payload, timestamp).await
+    }
+    fn latest(&self) -> rtdb_storage::Result<LogOffset> { self.log.latest() }
+    async fn tail(&self, after: LogOffset) -> rtdb_storage::Result<Box<dyn rtdb_storage::log::LogTail>> { self.log.tail(after).await }
+    async fn range(&self, from: LogOffset, to: LogOffset) -> rtdb_storage::Result<Box<dyn rtdb_storage::log::LogRange>> { self.log.range(from, to).await }
+    async fn read_range(&self, from: LogOffset, to: LogOffset) -> rtdb_storage::Result<Vec<LogRecord>> { self.log.read_range(from, to).await }
+}
+
+#[tokio::test]
+async fn an_unreachable_recovery_owner_raises_instead_of_declining_the_checkpoint() {
+    let fixture = produced_memory_checkpoint(true).await;
+    let (catalog, _) = fixture.blocks.load(BlockIndex(0)).await.unwrap();
+    assert!(catalog.boundary_replica_position().is_some() && catalog.publication_sha256().is_some());
+    let objects: Arc<dyn ObjectStore> = fixture.store.clone();
+    let cache = Arc::new(BufferPool::new(Arc::clone(&objects), 1 << 20));
+    let replica: Arc<dyn Log> = Arc::new(UnreachableRecoveryOwner { log: Arc::new(MemoryLog::new(1 << 20)) });
+    let logs = PartitionLogs::new(Arc::new(MemoryLog::new(1 << 20)), replica, StorageEpoch(0), StorageEpoch(0),
+        CURRENT_STORAGE_VERSION, StorageEpoch(0), objects, cache, MemoryBudget::new(1 << 26)).unwrap();
+    let error = logs.confirms_recovery_checkpoint(&catalog).await.expect_err("an unreachable owner is not an owner that declined");
+    assert_eq!(error.code, "rtdb.storage/closed");
+}

@@ -206,7 +206,7 @@ fn applied(receipt: ExternalReceipt, events: usize, commit_time: Option<Timestam
 }
 async fn durable(term: &TermHandle, blocks: &mut watch::Receiver<DriverStatus>) -> Result<Option<Lsn>> {
     drop(blocks.borrow_and_update());
-    let Some(recoverable) = term.recoverable_external_checkpoint().await else { return Ok(None); };
+    let Some(recoverable) = term.recoverable_external_checkpoint().await? else { return Ok(None); };
     let token = ResumeToken::decode(recoverable.as_bytes())?;
     Ok(token.snapshot_completed.then_some(token.lsn))
 }
