@@ -25,6 +25,10 @@
 -- A writable sealed Kafka topic can settle keys for its prefix when the selected recovery store holds the same exact cut.
 -- Per-frame withdrawal preserves the log record coordinates and the suffix used to replay the retirement record.
 -- The Default erasure rewrite binds its fresh physical membership to the pending canonical receipt and its original source position, replica position and term.
+-- The native SQL rewrite keeps events for a targeted IID at or after its selected erase position and excludes events with selected inherited origins.
+-- Surviving occurrences of one original event position must agree after clearing recency and removing null and absent struct fields, including inside sequences and map values.
+-- The rebuild writes one event at each surviving original position in transaction and ordinal order, keeping the stored IID.
+-- An eligible flat document can supply its survivor by Arrow position under a retained page reservation.
 -- Recovery accepts the rewrite only when the authenticated checkpoint contains that same receipt installation.
 -- An authenticated inventory binds prior checkpoint and replay objects to the exact replacement.
 -- A Local retirement installs the erasure floor, refusing prior catalogs, and waits for the original deadline; no reader hold delays it.

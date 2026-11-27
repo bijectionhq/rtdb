@@ -261,6 +261,12 @@ impl<'a> PutTextColumn<'a> {
 }
 
 impl<'a> EventRef<'a> {
+    /// Clears any physical recency annotation before rebuilding the event.
+    pub fn without_recency(mut self) -> Self {
+        self.recency = None;
+        self
+    }
+
     pub fn validate_document(&self, memory: &Arc<MemoryBudget>) -> Result<()> {
         let Some(put) = self.put else { return Ok(()); };
         for (index, field) in put.array.fields().iter().enumerate() {

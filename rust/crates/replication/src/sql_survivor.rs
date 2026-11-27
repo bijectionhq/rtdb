@@ -8,13 +8,14 @@ use std::{
     sync::Arc,
 };
 
+use arrow_array::{Array, BooleanArray, Int64Array, StringArray, StructArray};
 use arrow_buffer::Buffer;
 use bytes::Bytes;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{
     block::proto as pb,
     catalog::{BlockCatalog, TableEntry, publication_digest},
-    data::{EventBatch, StoredEvent, StoredOperation},
+    data::{EventBatch, StoredEvent, StoredOperation, owned_event_batch},
     ipc::{ArrowFile, ArrowFileEncoder, inspect_file_reserved},
     keys::{TrieKey, block_key},
     metadata::MetadataBuilder,
@@ -23,7 +24,8 @@ use rtdb_index::{BlockPages, CatalogTrie, IndexBatch, LiveTable, Snapshot, Table
 use rtdb_storage::{IoRegion, MemoryStore, ObjectKey, ObjectStore, ReadReservation, RetainedBytes};
 use rtdb_trie::{TrieConfig, TrieNode};
 use rtdb_types::{
-    Anomaly, AnomalyCategory, CatalogCut, EventOrigin, EventPosition, Iid, LogicalType, Result, SourcePosition, StructFields, Value,
+    Anomaly, AnomalyCategory, AnomalyKind, BlockIndex, CatalogCut, EventHeader, EventOp, EventOrigin,
+    EventPosition, Iid, LogicalType, Result, ScalarType, SourcePosition, StructFields, Value,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -135,43 +137,16 @@ impl SurvivorInput<'_> {
                         map
                     },
                 );
-            let mut rows = Events {
-                memory: self.memory,
-                rows: BTreeMap::new(),
-                targets,
-                inherited_erasure: self.inherited_erasure,
-            };
             let retired = snapshot.trie_catalog().retired_as_of(&entry.table);
-            if retired.is_none() {
-                for primary in snapshot.trie_entries(&entry.table) {
-                    check_cancelled(cancellation)?;
-                    let key = ObjectKey::new(entry.slug.data_key(&primary.key))?;
-                    let length = usize::try_from(primary.data_file_size)
-                        .map_err(|_| invalid("A source trie exceeds addressable memory"))?;
-                    IoRegion::retaining(
-                        Arc::clone(self.custody),
-                        read_trie(self.store, &key, length, &mut rows, cancellation),
-                    )
-                    .await?;
-                }
-                for segment in snapshot.iter_segments(&entry.table) {
-                    for batch in segment.batches() {
-                        check_cancelled(cancellation)?;
-                        rows.add(batch.view())?;
-                    }
-                }
-            }
-            seen_targets += rows
-                .targets
-                .iter()
-                .filter(|(iid, position)| {
-                    rows.rows.get(*position).is_some_and(|(event, _)| {
-                        event.iid == **iid && matches!(event.operation, StoredOperation::Erase)
-                    })
-                })
-                .count();
             let declarations = snapshot.declared_columns(&entry.table);
-            let rebuilt = rows.into_live(entry, block, declarations, cancellation)?;
+            let mut used_positions = false;
+            let (rebuilt, marked) = match self.rebuild_table(entry, &targets, &declarations, true, &mut used_positions, cancellation).await {
+                Err(error) if used_positions && error.is(AnomalyKind::ResourceExhausted) => {
+                    self.rebuild_table(entry, &targets, &declarations, false, &mut used_positions, cancellation).await?
+                }
+                result => result?,
+            };
+            seen_targets += marked;
             let catalog = match destination
                 .write_trie(entry, &trie, &rebuilt, cancellation)
                 .await?
@@ -237,17 +212,83 @@ impl SurvivorInput<'_> {
             store: storage,
         })
     }
+
+    async fn rebuild_table(
+        &self,
+        entry: &TableEntry,
+        targets: &BTreeMap<Iid, EventPosition>,
+        declarations: &StructFields<LogicalType>,
+        positions: bool,
+        used_positions: &mut bool,
+        cancellation: &CancellationToken,
+    ) -> Result<(LiveTable, usize)> {
+        let mut rows = Events {
+            memory: self.memory,
+            rows: BTreeMap::new(),
+            targets,
+            inherited_erasure: self.inherited_erasure,
+            positions: positions && declarations.is_empty(),
+            used_positions,
+        };
+        if self.snapshot.trie_catalog().retired_as_of(&entry.table).is_none() {
+            for primary in self.snapshot.trie_entries(&entry.table) {
+                check_cancelled(cancellation)?;
+                let key = ObjectKey::new(entry.slug.data_key(&primary.key))?;
+                let length = usize::try_from(primary.data_file_size)
+                    .map_err(|_| invalid("A source trie exceeds addressable memory"))?;
+                IoRegion::retaining(
+                    Arc::clone(self.custody),
+                    read_trie(self.store, &key, length, &mut rows, cancellation),
+                ).await?;
+            }
+            for segment in self.snapshot.iter_segments(&entry.table) {
+                for batch in segment.batches() {
+                    check_cancelled(cancellation)?;
+                    rows.add(batch.view(), None)?;
+                }
+            }
+        }
+        let marked = targets.iter().filter(|(iid, position)| {
+            rows.rows.get(*position).is_some_and(|row| {
+                row.header.iid == **iid && row.header.op == EventOp::Erase
+            })
+        }).count();
+        let live = rows.into_live(entry, self.snapshot.block_index(), declarations, cancellation)?;
+        Ok((live, marked))
+    }
 }
 
 struct Events<'a> {
     memory: &'a Arc<MemoryBudget>,
-    rows: BTreeMap<EventPosition, (StoredEvent, Arc<MemoryReservation>)>,
-    targets: BTreeMap<Iid, EventPosition>,
+    rows: BTreeMap<EventPosition, SurvivorRow>,
+    targets: &'a BTreeMap<Iid, EventPosition>,
     inherited_erasure: Option<&'a BTreeSet<EventOrigin>>,
+    positions: bool,
+    used_positions: &'a mut bool,
+}
+
+struct SurvivorRow {
+    header: EventHeader,
+    payload: SurvivorPayload,
+    reservation: Arc<MemoryReservation>,
+}
+
+enum SurvivorPayload {
+    Position(Arc<SurvivorPage>, usize),
+    Scalar(StoredEvent),
+}
+
+struct SurvivorPage {
+    batch: EventBatch,
+    _disk: Option<(Arc<MemoryReservation>, Arc<MemoryReservation>)>,
+    _reservation: Arc<MemoryReservation>,
 }
 
 impl Events<'_> {
-    fn add(&mut self, batch: &EventBatch) -> Result<()> {
+    fn add(
+        &mut self, batch: &EventBatch, disk: Option<(&Arc<MemoryReservation>, &Arc<MemoryReservation>)>,
+    ) -> Result<()> {
+        let mut source = None;
         for row in 0..batch.len() {
             let header = batch.header(row)?;
             if let Some(origins) = self.inherited_erasure {
@@ -264,25 +305,45 @@ impl Events<'_> {
             if !keep_local_event(position.transaction.0, position.ordinal, before) {
                 continue;
             }
-            let borrowed = batch.borrow_event(row)?;
-            let bound = borrowed
-                .document_allocation_bound()?
-                .checked_add(borrowed.physical_entity_key().map_or(0, |key| key.len()))
-                .and_then(|size| size.checked_add(1024))
-                .ok_or_else(|| invalid("A surviving row exceeds addressable memory"))?;
-            let reservation = self.memory.reserve(bound)?;
-            let mut event = batch.read_event(row)?;
-            event.recency = None;
-            if let StoredOperation::Put(document) = &mut event.operation {
-                remove_padding(document);
-            }
             match self.rows.entry(position) {
-                Entry::Vacant(entry) => {
-                    entry.insert((event, reservation));
+                Entry::Occupied(entry) => {
+                    let (candidate, _reservation) = normalized_event(batch, row, self.memory)?;
+                    let equal = match &entry.get().payload {
+                        SurvivorPayload::Scalar(event) => *event == candidate,
+                        SurvivorPayload::Position(page, row) => {
+                            let (event, _reservation) = normalized_event(&page.batch, *row, self.memory)?;
+                            event == candidate
+                        }
+                    };
+                    if !equal {
+                        return Err(invalid("Two primary rows claim the same original event"));
+                    }
                 }
-                Entry::Occupied(entry) if entry.get().0 == event => {}
-                Entry::Occupied(_) => {
-                    return Err(invalid("Two primary rows claim the same original event"));
+                Entry::Vacant(entry) => {
+                    let positioned = self.positions && !batch.has_entity_keys()
+                        && (header.op != EventOp::Put || flat_put(batch, row)?.is_some());
+                    if positioned && source.is_none() {
+                        let bytes = batch.arrow().num_columns().checked_mul(32)
+                            .and_then(|bytes| bytes.checked_add(1024))
+                            .ok_or_else(|| invalid("A surviving page exceeds addressable memory"))?;
+                        source = self.memory.try_reserve(bytes).map(|reservation| Arc::new(SurvivorPage {
+                            batch: batch.clone(),
+                            _disk: disk.map(|(opening, decoded)| (Arc::clone(opening), Arc::clone(decoded))),
+                            _reservation: reservation,
+                        }));
+                    }
+                    let (payload, reservation) = match source.as_ref().filter(|_| positioned) {
+                        Some(page) => {
+                            *self.used_positions = true;
+                            let reservation = self.memory.reserve(1024)?;
+                            (SurvivorPayload::Position(Arc::clone(page), row), reservation)
+                        }
+                        None => {
+                            let (event, reservation) = normalized_event(batch, row, self.memory)?;
+                            (SurvivorPayload::Scalar(event), reservation)
+                        }
+                    };
+                    entry.insert(SurvivorRow { header, payload, reservation });
                 }
             }
         }
@@ -292,33 +353,102 @@ impl Events<'_> {
     fn into_live(
         self,
         entry: &TableEntry,
-        block: rtdb_types::BlockIndex,
-        declarations: StructFields<LogicalType>,
+        block: BlockIndex,
+        declarations: &StructFields<LogicalType>,
         cancellation: &CancellationToken,
     ) -> Result<LiveTable> {
         let mut live = LiveTable::new(entry.table.clone(), block, TrieConfig::default());
-        let empty =
-            TableWrite::new(declarations.clone(), None).with_declarations(declarations.clone());
+        let empty = TableWrite::new(declarations.clone(), None).with_declarations(declarations.clone());
         live = live.append(&empty, rtdb_types::Timestamp(i64::MIN))?;
         let mut ordered = self.rows.into_iter().peekable();
-        while let Some((position, (first, reservation))) = ordered.next() {
+        while let Some((position, first)) = ordered.next() {
             check_cancelled(cancellation)?;
-            let time = first.system_from;
-            let mut events = vec![first];
-            let mut reservations = vec![reservation];
-            while ordered
-                .peek()
-                .is_some_and(|(following, _)| following.transaction == position.transaction)
-            {
-                let (_, (event, reservation)) = ordered.next().expect("peeked row");
-                events.push(event);
-                reservations.push(reservation);
+            let time = first.header.system_from;
+            let mut rows = vec![first];
+            while ordered.peek().is_some_and(|(following, _)| following.transaction == position.transaction) {
+                rows.push(ordered.next().expect("peeked row").1);
             }
-            let batch = IndexBatch::copy_events(&events, &declarations, self.memory)?;
+            let batch = match copy_positions(&rows, self.memory)? {
+                Some(batch) => batch,
+                None => {
+                    let mut events = Vec::with_capacity(rows.len());
+                    let mut reservations = Vec::with_capacity(rows.len());
+                    for row in rows {
+                        let (event, reservation) = match row.payload {
+                            SurvivorPayload::Scalar(event) => (event, row.reservation),
+                            SurvivorPayload::Position(page, row) => normalized_event(&page.batch, row, self.memory)?,
+                        };
+                        events.push(event);
+                        reservations.push(reservation);
+                    }
+                    IndexBatch::copy_events(&events, declarations, self.memory)?
+                }
+            };
             live = live.append(&TableWrite::new(declarations.clone(), Some(batch)), time)?;
         }
         Ok(live)
     }
+}
+
+fn flat_type(array: &dyn Array) -> Option<ScalarType> {
+    if array.as_any().is::<Int64Array>() { Some(ScalarType::I64) }
+    else if array.as_any().is::<StringArray>() { Some(ScalarType::Utf8) }
+    else if array.as_any().is::<BooleanArray>() { Some(ScalarType::Bool) }
+    else { None }
+}
+
+fn flat_put(batch: &EventBatch, row: usize) -> Result<Option<&StructArray>> {
+    batch.borrow_event(row)?;
+    let put = batch.put_document()?.ok_or_else(|| invalid("A put operation must contain a document struct"))?;
+    let offset = batch.operations()?.value_offset(row);
+    Ok(put.fields().iter().zip(put.columns()).all(|(field, array)| {
+        field.metadata().is_empty() && array.is_valid(offset) && flat_type(array.as_ref()).is_some()
+    }).then_some(put))
+}
+
+fn copy_positions(rows: &[SurvivorRow], memory: &Arc<MemoryBudget>) -> Result<Option<Arc<IndexBatch>>> {
+    let mut put = None;
+    for row in rows {
+        let SurvivorPayload::Position(page, index) = &row.payload else { return Ok(None); };
+        if row.header.op == EventOp::Put {
+            let document = flat_put(&page.batch, *index)?.expect("admitted flat put");
+            if put.is_some_and(|first: &StructArray| first.fields() != document.fields()) {
+                return Ok(None);
+            }
+            put = Some(document);
+        }
+    }
+    let bound = put.map_or(Ok(4096usize), |put| {
+        put.fields().iter().try_fold(4096usize, |bytes, field| {
+            field.size().checked_mul(8).and_then(|size| bytes.checked_add(size))
+                .ok_or_else(|| invalid("Survivor schema exceeds addressable memory"))
+        })
+    })?;
+    let _schema = memory.reserve(bound)?;
+    let fields = put.map(|put| put.fields().iter().zip(put.columns()).map(|(field, array)| {
+        (field.name().clone(), LogicalType::Scalar(flat_type(array.as_ref()).expect("admitted flat column")))
+    }).collect());
+    let events = rows.iter().map(|row| {
+        let SurvivorPayload::Position(page, index) = &row.payload else { unreachable!("admitted position"); };
+        Ok(page.batch.borrow_event(*index)?.without_recency())
+    }).collect::<Result<Vec<_>>>()?;
+    let batch = owned_event_batch(&events, fields, true, memory)?;
+    IndexBatch::from_owned(batch).map(Some)
+}
+
+fn normalized_event(batch: &EventBatch, row: usize, memory: &Arc<MemoryBudget>) -> Result<(StoredEvent, Arc<MemoryReservation>)> {
+    let borrowed = batch.borrow_event(row)?;
+    let bound = borrowed.document_allocation_bound()?
+        .checked_add(borrowed.physical_entity_key().map_or(0, |key| key.len()))
+        .and_then(|bytes| bytes.checked_add(1024))
+        .ok_or_else(|| invalid("A surviving row exceeds addressable memory"))?;
+    let reservation = memory.reserve(bound)?;
+    let mut event = batch.read_event(row)?;
+    event.recency = None;
+    if let StoredOperation::Put(document) = &mut event.operation {
+        remove_padding(document);
+    }
+    Ok((event, reservation))
 }
 
 fn remove_padding(fields: &mut StructFields<Value>) {
@@ -385,11 +515,11 @@ async fn read_trie(
     let bytes = store
         .get_reserved_object(key, ReadReservation::funded(length, retained, scratch))
         .await?;
-    let (mut file, _opening) = open_survivor_input(Bytes::from_owner(TrieInput(bytes)), events.memory)?;
+    let (mut file, opening) = open_survivor_input(Bytes::from_owner(TrieInput(bytes)), events.memory)?;
     for page in 0..file.page_count() {
         check_cancelled(cancellation)?;
-        let _decoded = events.memory.reserve(file.page_allocation_bound(page)?)?;
-        events.add(&EventBatch::new(file.read_page(page)?)?)?;
+        let decoded = events.memory.reserve(file.page_allocation_bound(page)?)?;
+        events.add(&EventBatch::new(file.read_page(page)?)?, Some((&opening, &decoded)))?;
         tokio::task::yield_now().await;
     }
     Ok(())
@@ -667,6 +797,118 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn positioned_survivors_match_scalar_checkpoint_bytes() -> Result<()> {
+        use rtdb_format::data::build_event_batch;
+        use rtdb_format::ipc::write_file;
+
+        let memory = MemoryBudget::new(32 << 20);
+        let cancellation = CancellationToken::new();
+        let entry = TableEntry::new(1, TableRef::new("public", "orders"))?;
+        let block = BlockIndex(2);
+        let trie = TrieKey::l0(block)?;
+        let declarations = StructFields::new();
+        let iid = Iid([5; 16]);
+        let position = |ordinal| EventPosition { transaction: TxId(10), ordinal };
+        let event = |ordinal, operation, recency| StoredEvent {
+            position: Some(position(ordinal)),
+            origin: Some(EventOrigin([ordinal as u8; EventOrigin::WIDTH as usize])),
+            entity_key: None,
+            iid,
+            system_from: Timestamp(10),
+            commit_position: 0,
+            valid_time: Interval::ALL,
+            operation,
+            recency: Some(Timestamp(recency)),
+        };
+        let document = || StoredOperation::Put(StructFields::from([
+            ("name".into(), Value::Utf8("survivor".into())),
+            ("count".into(), Value::I64(42)),
+            ("enabled".into(), Value::Bool(true)),
+        ]));
+        let fields = Some(StructFields::from([
+            ("name".into(), LogicalType::Scalar(ScalarType::Utf8)),
+            ("count".into(), LogicalType::Scalar(ScalarType::I64)),
+            ("enabled".into(), LogicalType::Scalar(ScalarType::Bool)),
+        ]));
+        let disk = build_event_batch(&[
+            event(3, document(), 110),
+            event(1, document(), 110),
+            event(2, StoredOperation::Erase, 110),
+        ], fields.clone(), Some(rtdb_types::RunEndWidth::I32))?;
+        let live = EventBatch::new(build_event_batch(&[
+            event(3, document(), 220),
+            event(4, document(), 220),
+        ], fields, None)?)?;
+        let source = MemoryStore::default();
+        let key = ObjectKey::new(entry.slug.data_key(&trie))?;
+        let bytes = write_file(disk.schema_ref(), std::slice::from_ref(&disk))?;
+        let length = bytes.len();
+        source.put(&key, Bytes::from(bytes)).await?;
+        let targets = BTreeMap::from([(iid, position(2))]);
+        let mut outputs = Vec::new();
+        for positions in [true, false] {
+            let store = MemoryStore::default();
+            let mut used_positions = false;
+            let mut rows = Events {
+                memory: &memory, rows: BTreeMap::new(), targets: &targets,
+                inherited_erasure: None, positions, used_positions: &mut used_positions,
+            };
+            read_trie(&source, &key, length, &mut rows, &cancellation).await?;
+            rows.add(&live, None)?;
+            assert_eq!(rows.rows.keys().copied().collect::<Vec<_>>(), [position(2), position(3), position(4)]);
+            assert!(rows.rows.values().all(|row| matches!(&row.payload, SurvivorPayload::Position(..)) == positions));
+            let rebuilt = rows.into_live(&entry, block, &declarations, &cancellation)?;
+            assert_eq!(used_positions, positions);
+            let mut output = Candidate { store: &store, memory: &memory, remaining: 16 << 20 };
+            output.write_trie(&entry, &trie, &rebuilt, &cancellation).await?.unwrap();
+            let image = store.get(&key).await?;
+            let mut file = ArrowFile::from_reader(Cursor::new(image.clone()), None)?;
+            let page = EventBatch::new(file.read_page(0)?)?;
+            assert_eq!(page.len(), 3);
+            for row in 0..page.len() {
+                let event = page.read_event(row)?;
+                assert_eq!(event.iid, iid);
+                assert_eq!(event.recency, None);
+            }
+            let metadata = store.get(&ObjectKey::new(entry.slug.metadata_key(&trie))?).await?;
+            outputs.push((image, metadata, rebuilt.block_metadata()?.0));
+        }
+        assert_eq!(outputs[0], outputs[1]);
+        drop(outputs);
+        assert_eq!(memory.used_bytes(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn survivor_duplicate_equality_normalizes_nested_padding_and_rejects_conflicts() -> Result<()> {
+        let memory = MemoryBudget::new(4 << 20);
+        let position = EventPosition { transaction: TxId(10), ordinal: 0 };
+        let batch = |nested| -> Result<Arc<IndexBatch>> {
+            IndexBatch::copy_events(&[StoredEvent {
+                position: Some(position), origin: None, entity_key: None,
+                iid: Iid([5; 16]), system_from: Timestamp(10), commit_position: 0,
+                valid_time: Interval::ALL, recency: None,
+                operation: StoredOperation::Put(StructFields::from([
+                    ("nested".into(), Value::list(vec![Value::Struct(nested)])),
+                ])),
+            }], &StructFields::new(), &memory)
+        };
+        let padded = batch(StructFields::from([("padding".into(), Value::Null)]))?;
+        let empty = batch(StructFields::new())?;
+        let different = batch(StructFields::from([("padding".into(), Value::I64(9))]))?;
+        let mut used_positions = false;
+        let mut rows = Events { memory: &memory, rows: BTreeMap::new(), targets: &BTreeMap::new(),
+            inherited_erasure: None, positions: true, used_positions: &mut used_positions };
+        rows.add(padded.view(), None)?;
+        rows.add(empty.view(), None)?;
+        assert_eq!(rows.rows.len(), 1);
+        assert!(matches!(&rows.rows[&position].payload, SurvivorPayload::Scalar(_)));
+        let error = rows.add(different.view(), None).unwrap_err();
+        assert_eq!(error.message.as_deref(), Some("Two primary rows claim the same original event"));
+        Ok(())
+    }
+
     #[test]
     fn survivor_schema_excludes_erased_inference_and_retains_a_later_put() -> Result<()> {
         let memory = MemoryBudget::new(16 << 20);
@@ -700,20 +942,18 @@ mod tests {
             &StructFields::new(),
             &memory,
         )?;
-        let mut rows = Events {
-            memory: &memory,
-            rows: BTreeMap::new(),
-            targets: BTreeMap::from([(iid, position(3))]),
-            inherited_erasure: None,
-        };
-        rows.add(batch.view())?;
+        let targets = BTreeMap::from([(iid, position(3))]);
+        let mut used_positions = false;
+        let mut rows = Events { memory: &memory, rows: BTreeMap::new(), targets: &targets,
+            inherited_erasure: None, positions: false, used_positions: &mut used_positions };
+        rows.add(batch.view(), None)?;
         let entry = TableEntry::new(1, TableRef::new("public", "orders"))?;
         let declarations =
             StructFields::from([("ddl_only".into(), LogicalType::Scalar(ScalarType::Utf8))]);
         let live = rows.into_live(
             &entry,
             BlockIndex(2),
-            declarations.clone(),
+            &declarations,
             &CancellationToken::new(),
         )?;
         let (metadata, _hll_reservation) = live.block_metadata()?;
