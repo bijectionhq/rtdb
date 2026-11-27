@@ -350,6 +350,7 @@ impl ArrowFile {
 
 pub struct PageDecoder {
     decoder: FileDecoder,
+    projection: Option<Vec<usize>>,
     event_projection: Option<event_projection::EventProjection>,
     schema: SchemaRef,
     source_schema: SchemaRef,
@@ -395,7 +396,7 @@ impl PageDecoder {
         // before `undefined::reinstate` has rewritten those cells and run `validate_full` over every column, dictionary
         // values included; `corrupt_persisted_pages_fail_full_decode_validation` checks that.
         let mut decoder = unsafe { FileDecoder::new(Arc::clone(&decoded), footer.version()).with_skip_validation(true) };
-        if let Some(projection) = projection { decoder = decoder.with_projection(projection); }
+        if let Some(projection) = projection.clone() { decoder = decoder.with_projection(projection); }
         let blocks: Vec<_> = footer.recordBatches().ok_or_else(|| invalid("Arrow footer has no record-batch inventory"))?.iter().copied().collect();
         let dictionaries: Vec<_> = footer.dictionaries().into_iter().flat_map(|blocks| blocks.iter().copied()).collect();
         for block in blocks.iter().chain(&dictionaries) {
@@ -404,7 +405,7 @@ impl PageDecoder {
                 return Err(invalid("Arrow block exceeds data region"));
             }
         }
-        Ok(Self { decoder, event_projection: None, schema, source_schema, decoded_schema: decoded, version: footer.version(), blocks, dictionaries })
+        Ok(Self { decoder, projection, event_projection: None, schema, source_schema, decoded_schema: decoded, version: footer.version(), blocks, dictionaries })
     }
 
     pub fn schema(&self) -> SchemaRef { Arc::clone(&self.schema) }
@@ -508,14 +509,15 @@ impl PageDecoder {
     pub fn decode_file_page(&self, page: usize, bytes: Buffer) -> Result<RecordBatch> {
         let Some(projection) = &self.event_projection else { return self.decode_page(page, bytes); };
         let block = self.block(page)?;
-        let bytes = prepare_block(block, bytes, &self.source_schema, false)?;
         let (header, body_start) = block_message(block, &bytes)?;
-        let message = arrow_ipc::root_as_message(&bytes[header]).map_err(invalid)?;
+        let (normalized, has_undefined_union) = prepare_block_header(&bytes, header.clone(), body_start, &self.source_schema, false)?;
+        let message_bytes = normalized.as_deref().unwrap_or(&bytes[header.clone()]);
+        let message = arrow_ipc::root_as_message(message_bytes).map_err(invalid)?;
         if (message.version() == self.version || self.version == arrow_ipc::MetadataVersion::V1)
             && let Some(batch) = projection.decode(&self.decoded_schema, message, &bytes.slice(body_start), Arc::ptr_eq(&self.schema, &self.decoded_schema))? {
             return Ok(batch);
         }
-        projection.select_decoded(&self.decode_prepared(block, bytes)?)
+        projection.select_decoded(&self.decode_prepared_header(block, bytes, header, body_start, normalized, has_undefined_union)?)
     }
 
     /// Admits selected decode allocations while `wire` owns the already-funded IPC bytes.
@@ -590,7 +592,38 @@ impl PageDecoder {
 
     pub fn decode_page(&self, page: usize, bytes: Buffer) -> Result<RecordBatch> {
         let block = self.block(page)?;
-        let bytes = prepare_block(block, bytes, &self.source_schema, false)?;
+        let (header, body_start) = block_message(block, &bytes)?;
+        let (normalized, has_undefined_union) = prepare_block_header(&bytes, header.clone(), body_start, &self.source_schema, false)?;
+        self.decode_prepared_header(block, bytes, header, body_start, normalized, has_undefined_union)
+    }
+
+    fn decode_prepared_header(
+        &self, block: &arrow_ipc::Block, bytes: Buffer, header: Range<usize>, body_start: usize,
+        normalized: Option<Vec<u8>>, has_undefined_union: bool,
+    ) -> Result<RecordBatch> {
+        if let Some(normalized) = normalized {
+            // Normalize only the small metadata header so aligned body buffers stay zero-copy
+            // slices of `bytes` when no union carries the reference's `-1` undefined cells.
+            if !has_undefined_union && self.dictionaries.is_empty() {
+                let message = arrow_ipc::root_as_message(&normalized).map_err(invalid)?;
+                if self.version != arrow_ipc::MetadataVersion::V1 && message.version() != self.version {
+                    return Err(invalid("Could not read IPC message as metadata versions mismatch"));
+                }
+                let record_batch = message.header_as_record_batch().ok_or_else(|| invalid("Arrow file ended before its declared page"))?;
+                let body = bytes.slice(body_start);
+                let batch = arrow_ipc::reader::read_record_batch(
+                    &body, record_batch, Arc::clone(&self.decoded_schema), &HashMap::new(),
+                    self.projection.as_deref(), &message.version(),
+                ).map_err(invalid)?;
+                for column in batch.columns() {
+                    column.to_data().validate_full().map_err(invalid)?;
+                }
+                return Ok(batch);
+            }
+            let mut owned = bytes.into_vec::<u8>().unwrap_or_else(|bytes| bytes.to_vec());
+            owned[header].copy_from_slice(&normalized);
+            return self.decode_prepared(block, Buffer::from(owned));
+        }
         self.decode_prepared(block, bytes)
     }
 
@@ -662,18 +695,29 @@ fn check_block_message(message: &arrow_ipc::Message<'_>, body_length: usize, dic
     Ok(())
 }
 
-fn prepare_block(block: &arrow_ipc::Block, bytes: Buffer, schema: &Schema, dictionary: bool) -> Result<Buffer> {
-    let (header, metadata_end) = block_message(block, &bytes)?;
+fn prepare_block_header(
+    bytes: &[u8], header: Range<usize>, metadata_end: usize, schema: &Schema, dictionary: bool,
+) -> Result<(Option<Vec<u8>>, bool)> {
     let message = arrow_ipc::root_as_message(&bytes[header.clone()]).map_err(invalid)?;
     check_block_message(&message, bytes.len() - metadata_end, dictionary)?;
-    validate_lz4_lengths(&message, &bytes[metadata_end..])?;
+    let body = &bytes[metadata_end..];
+    validate_lz4_lengths(&message, body)?;
     let batch = message.header_as_record_batch().or_else(|| message.header_as_dictionary_batch().and_then(|dictionary| dictionary.data()));
     let needs_normalization = batch.and_then(|batch| batch.nodes()).is_some_and(|nodes| nodes.iter().any(|node| node.null_count() < 0));
-    if !needs_normalization { return Ok(bytes); }
+    if !needs_normalization { return Ok((None, false)); }
 
+    let mut normalized = bytes[header].to_vec();
+    let has_undefined_union = nulls::normalize_inspecting_unions(&mut normalized, body, schema)?;
+    Ok((Some(normalized), has_undefined_union))
+}
+
+fn prepare_block(block: &arrow_ipc::Block, bytes: Buffer, schema: &Schema, dictionary: bool) -> Result<Buffer> {
+    let (header, metadata_end) = block_message(block, &bytes)?;
+    let (Some(normalized), _) = prepare_block_header(&bytes, header.clone(), metadata_end, schema, dictionary)? else {
+        return Ok(bytes);
+    };
     let mut owned = bytes.into_vec::<u8>().unwrap_or_else(|bytes| bytes.to_vec());
-    let (metadata, body) = owned.split_at_mut(metadata_end);
-    nulls::normalize(&mut metadata[header], body, schema)?;
+    owned[header].copy_from_slice(&normalized);
     Ok(Buffer::from(owned))
 }
 

@@ -9,15 +9,22 @@ mod tests;
 
 #[allow(deprecated)]
 pub(super) fn normalize(metadata: &mut [u8], body: &[u8], schema: &Schema) -> Result<()> {
-    let patches = {
+    normalize_inspecting_unions(metadata, body, schema).map(drop)
+}
+
+/// Normalizes unknown (`-1`) field null counts in `metadata` without modifying `body`, and
+/// reports whether any union column in the batch may hold the reference's `-1` undefined cells.
+#[allow(deprecated)]
+pub(super) fn normalize_inspecting_unions(metadata: &mut [u8], body: &[u8], schema: &Schema) -> Result<bool> {
+    let (patches, may_hold_undefined_union) = {
         let message = arrow_ipc::root_as_message(metadata).map_err(invalid)?;
         let batch = message.header_as_record_batch().or_else(|| message.header_as_dictionary_batch().and_then(|dictionary| dictionary.data()));
-        let Some(batch) = batch else { return Ok(()); };
+        let Some(batch) = batch else { return Ok(false); };
         let nodes = batch.nodes().ok_or_else(|| invalid("Arrow batch has no field nodes"))?;
         if nodes.iter().any(|node| node.null_count() < -1) { return Err(invalid("Arrow null count is below the unknown-count sentinel")); }
-        if !nodes.iter().any(|node| node.null_count() == -1) { return Ok(()); }
+        if !nodes.iter().any(|node| node.null_count() == -1) { return Ok(false); }
         let mut counts = NullCounts { batch, body, version: message.version(), metadata_base: metadata.as_ptr() as usize,
-            node: 0, buffer: 0, variadic: 0, patches: Vec::with_capacity(nodes.len()) };
+            node: 0, buffer: 0, variadic: 0, patches: Vec::with_capacity(nodes.len()), may_hold_undefined_union: false };
         if let Some(dictionary) = message.header_as_dictionary_batch() {
             let fields = schema.fields_with_dict_id(dictionary.id());
             let field = fields.first().ok_or_else(|| invalid("Arrow dictionary has no schema field"))?;
@@ -30,13 +37,13 @@ pub(super) fn normalize(metadata: &mut [u8], body: &[u8], schema: &Schema) -> Re
             || counts.variadic != batch.variadicBufferCounts().map_or(0, |counts| counts.len()) {
             return Err(invalid("Arrow schema and field-node inventory disagree"));
         }
-        counts.patches
+        (counts.patches, counts.may_hold_undefined_union)
     };
     for (offset, count) in patches {
         let end = offset.checked_add(8).ok_or_else(|| invalid("Arrow null-count offset overflow"))?;
         metadata.get_mut(offset..end).ok_or_else(|| invalid("Arrow null-count slot exceeds metadata"))?.copy_from_slice(&count.to_le_bytes());
     }
-    Ok(())
+    Ok(may_hold_undefined_union)
 }
 
 struct NullCounts<'a> {
@@ -48,6 +55,7 @@ struct NullCounts<'a> {
     buffer: usize,
     variadic: usize,
     patches: Vec<(usize, i64)>,
+    may_hold_undefined_union: bool,
 }
 
 impl NullCounts<'_> {
@@ -59,6 +67,10 @@ impl NullCounts<'_> {
         self.node += 1;
         let length = usize::try_from(node.length()).map_err(invalid)?;
         let physical = match data_type { DataType::Dictionary(key, _) => key.as_ref(), value => value };
+        if matches!(physical, DataType::Union(..)) {
+            let type_ids = self.buffer + usize::from(self.version < MetadataVersion::V5);
+            self.may_hold_undefined_union |= self.union_may_hold_undefined(type_ids, length)?;
+        }
         if node.null_count() == -1 {
             let count = match physical {
                 DataType::Null => length,
@@ -133,5 +145,22 @@ impl NullCounts<'_> {
         let mut valid = bits[..whole].iter().map(|byte| byte.count_ones() as usize).sum::<usize>();
         if remainder != 0 { valid += (bits[whole] & ((1u8 << remainder) - 1)).count_ones() as usize; }
         Ok(length - valid)
+    }
+
+    fn union_may_hold_undefined(&self, buffer_index: usize, length: usize) -> Result<bool> {
+        let buffers = self.batch.buffers().ok_or_else(|| invalid("Arrow batch has no buffer inventory"))?;
+        if buffer_index >= buffers.len() { return Err(invalid("Arrow union exceeds its buffer inventory")); }
+        let buffer = buffers.get(buffer_index);
+        let start = usize::try_from(buffer.offset()).map_err(invalid)?;
+        let size = usize::try_from(buffer.length()).map_err(invalid)?;
+        let end = start.checked_add(size).ok_or_else(|| invalid("Arrow union buffer offset overflow"))?;
+        let encoded = self.body.get(start..end).ok_or_else(|| invalid("Arrow union exceeds the message body"))?;
+        if encoded.is_empty() { return Ok(false); }
+        if self.batch.compression().is_some() {
+            let prefix: [u8; 8] = encoded.get(..8).ok_or_else(|| invalid("Compressed Arrow union has no length"))?.try_into().map_err(invalid)?;
+            if i64::from_le_bytes(prefix) != -1 { return Ok(true); }
+            return Ok(encoded[8..].iter().take(length).any(|byte| (*byte as i8) < 0));
+        }
+        Ok(encoded.iter().take(length).any(|byte| (*byte as i8) < 0))
     }
 }
