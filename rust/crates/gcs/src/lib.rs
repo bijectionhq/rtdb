@@ -19,6 +19,13 @@ impl GcsConfig {
         ObjectKey::new(StorageRoot::under_prefix(self.prefix.as_deref(), storage_root.as_str())).map_err(Anomaly::from)
     }
 
+    /// Upstream XTDB's `ObjectStore.location` URI (`xtdb.gcp.CloudStorage`), used to key the shared `c1/` disk cache.
+    pub fn storage_location(&self, storage_root: &ObjectKey) -> Result<String> {
+        if self.bucket.is_empty() { return Err(Anomaly::incorrect("xtdb.gcp/invalid-config", "GCS requires a project ID and bucket")); }
+        let prefix = self.object_prefix(storage_root)?;
+        Ok(format!("gs://{}/{}", self.bucket, prefix.as_str()))
+    }
+
     /// `storage_root` is appended to the configured prefix and must already contain the storage version and epoch.
     /// Application Default Credentials refresh during requests and retain their quota-project headers.
     /// The owner closes and joins `io` after store consumers finish and before shutting down the runtime.
@@ -40,5 +47,19 @@ impl GcsConfig {
 
     pub fn from_proto(config: &GcsObjectStoreConfig) -> Self {
         Self { project_id: config.project_id.clone().unwrap_or_default(), bucket: config.bucket.clone().unwrap_or_default(), prefix: config.prefix.as_ref().filter(|prefix| !prefix.is_empty()).cloned() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn storage_location_matches_xtdb_cloud_storage_uri() {
+        let root = ObjectKey::new("v06").unwrap();
+        let mut config = GcsConfig::new("project", "bucket");
+        assert_eq!(config.storage_location(&root).unwrap(), "gs://bucket/v06");
+        config.prefix = Some("team/prod".into());
+        assert_eq!(config.storage_location(&ObjectKey::new("v06_e1").unwrap()).unwrap(), "gs://bucket/team/prod/v06_e1");
     }
 }

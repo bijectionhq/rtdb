@@ -144,6 +144,11 @@ pub trait RemoteStorageFactory: Send + Sync {
     fn cache_identity<'a>(&self, configuration: &'a Any) -> Result<Cow<'a, [u8]>> {
         Ok(Cow::Borrowed(&configuration.value))
     }
+    /// Upstream XTDB's `ObjectStore.location` URI for standard remote stores.
+    /// When `Some` and unsealed, the disk cache uses XTDB's `c1/<sha256(uri)[..32]>` namespace.
+    fn storage_location(&self, _configuration: &Any, _storage_root: &ObjectKey) -> Result<Option<String>> {
+        Ok(None)
+    }
     /// How recovery should find the store's latest block; a provider that tracks it spares recovery a listing.
     async fn block_discovery(&self, _configuration: &Any) -> Result<rtdb_replication::BlockDiscovery> { Ok(rtdb_replication::BlockDiscovery::List) }
 }
@@ -552,8 +557,14 @@ impl ResourceFactory for NativeResources {
                     fragment_storage = opened.fragment_storage;
                     let storage = if factory.use_disk_cache() && remote.permits_shared_read_cache() {
                         let cache = self.disk_cache.as_ref().ok_or_else(|| invalid("Remote storage requires a disk cache"))?;
-                        let identity = factory.cache_identity(configuration)?;
-                        let namespace = cache_namespace(&configuration.type_url, &identity, storage_epoch)?;
+                        let namespace = if classic_keys.is_none()
+                            && let Some(location) = factory.storage_location(configuration, &root)?
+                        {
+                            xtdb_cache_namespace(&location)?
+                        } else {
+                            let identity = factory.cache_identity(configuration)?;
+                            cache_namespace(&configuration.type_url, &identity, storage_epoch)?
+                        };
                         cache.scope_in(namespace, remote, Arc::clone(&io))?
                     } else {
                         remote
@@ -635,6 +646,18 @@ fn kafka_log_epoch(_: &Any) -> Result<i32> {
     Err(invalid("Default Kafka erasure requires the native Kafka provider"))
 }
 
+/// Upstream XTDB's disk-cache namespace (`xtdb.cache.CachePrefix`): `c1/<first 32 lowercase hex chars of sha256(location)>`.
+fn xtdb_cache_namespace(location: &str) -> Result<ObjectKey> {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(location.as_bytes());
+    let mut hex = String::with_capacity(32);
+    for byte in &digest[..16] {
+        use std::fmt::Write;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    ObjectKey::new(format!("c1/{hex}")).map_err(Into::into)
+}
+
 /// Cached objects belong to the store they came from, so the namespace is the store's identity, never the database's name.
 /// A name re-attached to a different bucket, prefix or storage epoch must not be served the previous store's objects.
 fn cache_namespace(provider_type: &str, store_identity: &[u8], epoch: StorageEpoch) -> Result<ObjectKey> {
@@ -660,6 +683,14 @@ mod cache_namespace_tests {
         assert_ne!(key(b"bucket-a", 0), key(b"bucket-a", 1), "another storage epoch");
     }
 
+    #[test]
+    fn plain_remote_stores_use_xtdbs_c1_cache_prefix() {
+        assert_eq!(xtdb_cache_namespace("s3://bucket/v06").unwrap().as_str(), "c1/e5a7a9f09a7a6beba24351e69e57218b");
+        assert_eq!(xtdb_cache_namespace("s3://bucket/prefix/v06_e1").unwrap().as_str(), "c1/48f80a67a8048366735ccecc0612fded");
+        assert_eq!(xtdb_cache_namespace("http://127.0.0.1:9000/bucket/v06").unwrap().as_str(), "c1/69f757c8e6bbcb37002f876757c3c7af");
+        assert_eq!(xtdb_cache_namespace("https://acct.blob.core.windows.net/cont/v06").unwrap().as_str(), "c1/de6b02248bda86c36767e296bc64883d");
+        assert_eq!(xtdb_cache_namespace("gs://bucket/v06").unwrap().as_str(), "c1/f3617e62f8079049750d30909b36a2fc");
+    }
 }
 
 #[cfg(test)]

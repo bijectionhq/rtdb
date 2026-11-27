@@ -68,6 +68,16 @@ impl AzureConfig {
         ObjectKey::new(StorageRoot::under_prefix(self.prefix.as_deref(), storage_root.as_str())).map_err(Anomaly::from)
     }
 
+    /// Upstream XTDB's `ObjectStore.location` URI (`xtdb.azure.BlobStorage`), used to key the shared `c1/` disk cache.
+    pub fn storage_location(&self, storage_root: &ObjectKey, remotes: &dyn AzureCredentialResolver) -> Result<String> {
+        if self.storage_account.is_empty() || self.container.is_empty() { return Err(invalid("Azure requires an account and container")); }
+        let prefix = self.object_prefix(storage_root)?;
+        let credentials = self.resolve_credentials(remotes)?;
+        let connection = connection::resolve(self, credentials)?;
+        let endpoint = &connection.endpoint;
+        Ok(format!("{}://{}{}/{}/{}", endpoint.scheme(), endpoint.authority(), endpoint.path().trim_end_matches('/'), self.container, prefix.as_str()))
+    }
+
     /// Creates the container if absent and appends `storage_root` to the configured prefix.
     /// `storage_root` must already contain the storage version and epoch.
     /// Default credential commands may occupy the caller's thread for up to 30 seconds per attempted provider.
@@ -130,3 +140,21 @@ async fn ensure_container(client: &MicrosoftAzure, account: &str, endpoint: &url
 }
 
 fn invalid(error: impl std::fmt::Display) -> Anomaly { Anomaly::incorrect("xtdb.azure/invalid-config", error.to_string()) }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn storage_location_matches_xtdb_blob_storage_uri() {
+        let remotes = std::collections::BTreeMap::new();
+        let root = ObjectKey::new("v06").unwrap();
+        let mut config = AzureConfig::new("acct", "cont");
+        assert_eq!(config.storage_location(&root, &remotes).unwrap(), "https://acct.blob.core.windows.net/cont/v06");
+        config.prefix = Some("team/prod".into());
+        assert_eq!(config.storage_location(&ObjectKey::new("v06_e1").unwrap(), &remotes).unwrap(), "https://acct.blob.core.windows.net/cont/team/prod/v06_e1");
+        config.prefix = None;
+        config.storage_account_endpoint = Some("https://private.example/".into());
+        assert_eq!(config.storage_location(&root, &remotes).unwrap(), "https://private.example/cont/v06");
+    }
+}

@@ -281,3 +281,44 @@ async fn source_writer_log_access_leaves_replica_writer_ownership_available() {
     drop(opened);
     native.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn plain_remote_stores_with_a_location_share_xtdbs_c1_disk_cache_layout() {
+    struct LocatedRemote(Arc<MemoryStore>);
+    #[async_trait]
+    impl RemoteStorageFactory for LocatedRemote {
+        fn storage_location(&self, _: &Any, root: &ObjectKey) -> Result<Option<String>> {
+            Ok(Some(format!("s3://bucket/{}", root.as_str())))
+        }
+        async fn open(&self, _: &Any, _: &ObjectKey, _: Arc<rtdb_storage::IoRegion>) -> Result<Arc<dyn ObjectStore>> {
+            Ok(Arc::clone(&self.0) as Arc<dyn ObjectStore>)
+        }
+    }
+
+    let cache_dir = tempfile::tempdir().unwrap();
+    let expected_prefix = cache_dir.path().join("c1/e5a7a9f09a7a6beba24351e69e57218b");
+    let prewarmed = expected_prefix.join("blocks/b00.binpb");
+    std::fs::create_dir_all(prewarmed.parent().unwrap()).unwrap();
+    std::fs::write(&prewarmed, b"from-xtdb-cache").unwrap();
+
+    let remote = Arc::new(MemoryStore::default());
+    remote.put(&ObjectKey::new("blocks/b01.binpb").unwrap(), b"from-remote".as_slice().into()).await.unwrap();
+    let cache = DiskCache::open(cache_dir.path(), 1024 * 1024, MemoryBudget::new(4 * 1024 * 1024)).unwrap();
+    let native = NativeResources::default()
+        .with_disk_cache(cache)
+        .register_storage("test.Located", Arc::new(LocatedRemote(remote)))
+        .unwrap();
+    let config = DatabaseConfig {
+        storage: Some(database_config::Storage::RemoteStorage(RemoteStorage {
+            object_store: Some(Any { type_url: "type.googleapis.com/test.Located".into(), value: Vec::new() }),
+            epoch: Some(0),
+        })),
+        ..Default::default()
+    };
+    let opened = native.open("xtdb", &config, rtdb_node::LogAccess::ReadOnly, CancellationToken::new()).await.unwrap();
+    assert_eq!(opened.store.get(&ObjectKey::new("blocks/b00.binpb").unwrap()).await.unwrap().as_ref(), b"from-xtdb-cache");
+    assert_eq!(opened.store.get(&ObjectKey::new("blocks/b01.binpb").unwrap()).await.unwrap().as_ref(), b"from-remote");
+    assert_eq!(std::fs::read(expected_prefix.join("blocks/b01.binpb")).unwrap(), b"from-remote");
+    drop(opened);
+    native.close().await.unwrap();
+}

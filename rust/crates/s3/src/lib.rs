@@ -103,6 +103,16 @@ impl S3Config {
         ObjectKey::new(StorageRoot::under_prefix(self.prefix.as_deref(), storage_root.as_str())).map_err(Anomaly::from)
     }
 
+    /// Upstream XTDB's `ObjectStore.location` URI (`xtdb.aws.S3`), used to key the shared `c1/` disk cache.
+    pub fn storage_location(&self, storage_root: &ObjectKey) -> Result<String> {
+        if self.bucket.is_empty() { return Err(Anomaly::incorrect("xtdb.aws/invalid-config", "S3 bucket is empty")); }
+        let prefix = self.object_prefix(storage_root)?;
+        match self.configured_endpoint()? {
+            Some(endpoint) => Ok(format!("{}://{}{}/{}/{}", endpoint.scheme(), endpoint.authority(), endpoint.path().trim_end_matches('/'), self.bucket, prefix.as_str())),
+            None => Ok(format!("s3://{}/{}", self.bucket, prefix.as_str())),
+        }
+    }
+
     pub fn cell_root(&self) -> Result<ObjectKey> {
         let Some(scope) = &self.terminal_scope else {
             if self.prefix.as_deref().is_some_and(is_terminal_root) { return Err(reserved_terminal_root()); }
@@ -405,6 +415,20 @@ mod tests {
         config.path_style_access_enabled = false;
         config.endpoint = Some("http://127.0.0.1:9000".into());
         assert!(!config.endpoint_addressing().unwrap().1);
+    }
+
+    #[test]
+    fn storage_location_matches_xtdb_s3_uri() {
+        let root = ObjectKey::new("v06").unwrap();
+        let mut config = S3Config::new("bucket");
+        assert_eq!(config.storage_location(&root).unwrap(), "s3://bucket/v06");
+        config.prefix = Some("prefix".into());
+        assert_eq!(config.storage_location(&ObjectKey::new("v06_e1").unwrap()).unwrap(), "s3://bucket/prefix/v06_e1");
+        config.prefix = None;
+        config.endpoint = Some("http://127.0.0.1:9000/".into());
+        assert_eq!(config.storage_location(&root).unwrap(), "http://127.0.0.1:9000/bucket/v06");
+        config.endpoint = Some("https://s3.example.test/custom/".into());
+        assert_eq!(config.storage_location(&root).unwrap(), "https://s3.example.test/custom/bucket/v06");
     }
     #[tokio::test]
     async fn ranged_observation_uses_the_version_from_the_payload_response() {
