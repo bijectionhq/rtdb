@@ -455,10 +455,29 @@ fn invalid_entry() -> Anomaly {
     )
 }
 
+/// The recovery faults this process reported, in the order of
+/// `RECOVERY_FAULT_CODES`.
+static RECOVERY_FAULTS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+const RECOVERY_FAULT_CODES: [&str; 3] = ["rtdb/journal-recovered", "rtdb/journal-shortened", "rtdb/journal-rewritten"];
+
+fn recovery_fault(kind: usize) {
+    RECOVERY_FAULTS[kind].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many journal recovery faults this process reported, by anomaly code:
+/// `rtdb/journal-recovered` when a journal call met an operator recovery that
+/// no writer had acknowledged yet, and `rtdb/journal-shortened` or
+/// `rtdb/journal-rewritten` when a replica or reader found that a recovery
+/// replaced the history it had replayed and rebuilt from the journal.
+pub fn journal_recovery_faults() -> [(&'static str, u64); 3] {
+    std::array::from_fn(|kind| (RECOVERY_FAULT_CODES[kind], RECOVERY_FAULTS[kind].load(std::sync::atomic::Ordering::Relaxed)))
+}
+
 /// The journal head is behind what this process already replayed: the stream
 /// was recovered after losing two of its three voters, and the records after
 /// `head` through `replayed` are lost.
 pub(crate) fn journal_shortened(head: Lsn, replayed: Lsn) -> Anomaly {
+    recovery_fault(1);
     Anomaly::fault(
         "rtdb/journal-shortened",
         format!(
@@ -475,6 +494,7 @@ pub(crate) fn journal_shortened(head: Lsn, replayed: Lsn) -> Anomaly {
 /// the journal announces a recovery after records this process replayed: an
 /// operator recovery replaced the history this process built its state from.
 pub(crate) fn journal_rewritten(at: Lsn) -> Anomaly {
+    recovery_fault(2);
     Anomaly::fault(
         "rtdb/journal-rewritten",
         format!(
@@ -486,6 +506,7 @@ pub(crate) fn journal_rewritten(at: Lsn) -> Anomaly {
 
 pub(crate) fn journal_error(error: JournalError) -> Anomaly {
     if let JournalError::Recovered { head } = error {
+        recovery_fault(0);
         return Anomaly::fault(
             "rtdb/journal-recovered",
             format!(
@@ -529,6 +550,9 @@ mod tests {
         let rewritten = journal_rewritten(Lsn(50));
         assert_eq!(rewritten.code, "rtdb/journal-rewritten");
         assert!(rewritten.message.unwrap().contains("through 50"));
+        let counted = journal_recovery_faults();
+        assert_eq!(counted.map(|(code, _)| code), ["rtdb/journal-recovered", "rtdb/journal-shortened", "rtdb/journal-rewritten"]);
+        assert!(counted.iter().all(|(_, count)| *count > 0));
     }
 
     #[test]

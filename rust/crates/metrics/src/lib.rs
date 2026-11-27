@@ -3,6 +3,8 @@ mod disk;
 mod trace;
 mod step;
 mod processor;
+mod observed;
+pub use observed::{ObservedSeries, ObservedTotals};
 pub mod logging;
 pub use trace::{
     OTLP_PROTOBUF_CONTENT_TYPE, OtlpAnyValue, OtlpExportTracePartialSuccess, OtlpExportTraceRequest,

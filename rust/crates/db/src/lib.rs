@@ -3,7 +3,7 @@ mod multi;
 mod placement;
 mod replay;
 
-pub use journal::{JournalBatchAppender, TimedOriginal, TimedOriginalProof};
+pub use journal::{JournalBatchAppender, TimedOriginal, TimedOriginalProof, journal_recovery_faults};
 pub use multi::{
     AppliedWatch, ClassicInstallation, DeploymentRetirement, InstalledBackup, MultiDatabase, MultiOptions, NativeCheckpointInstallation, NativeDependentCarrier, NativeDependentOriginal, PinnedExport, PortableBackup, RankedBuild, RankedFiles, RankedPublication, Role, RotationReceipt, VerifiedBackup, WritePipeline, classic_import_basis, journal_recoveries_acknowledged,
 };

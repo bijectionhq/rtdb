@@ -180,7 +180,17 @@ impl ServerDriver {
     ) -> Result<(ServerHandle, Self)> {
         multi.validate_assignment_peer_auth(&config.auth)?;
         let backend = Backend::Configured(Some(multi.resource_override()), tls.map(Arc::new));
-        Self::open_mode(config, limit, memory, false, None, None, backend, clock).await
+        let (handle, mut driver) = Self::open_mode(config, limit, memory, false, None, None, backend, clock).await?;
+        match crate::multi::register_journal_metrics(handle.metrics()) {
+            Ok(registration) => driver.registrations.push(registration),
+            Err(error) => {
+                return match driver.close_without_run().await {
+                    Ok(()) => Err(error),
+                    Err(close) => Err(error.with_context("resource-close-error", close.to_string().into())),
+                };
+            }
+        }
+        Ok((handle, driver))
     }
 
     #[cfg(all(feature = "multi", feature = "s3"))]

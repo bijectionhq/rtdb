@@ -1787,6 +1787,27 @@ struct PlacementSource {
 
 const PLACEMENT_INTERVAL: Duration = Duration::from_secs(5);
 
+/// The Multi journal's operator-recovery counters: the recoveries this
+/// process's writers acknowledged before resuming, and the recovery faults
+/// it reported by code. They are process-wide, like the journal backends.
+const RECOVERIES_ACKNOWLEDGED: &str = "rtdb.multi.journal.recoveries.acknowledged";
+const RECOVERY_FAULTS: &str = "rtdb.multi.journal.recovery.faults";
+
+pub(crate) fn register_journal_metrics(metrics: &rtdb_metrics::Registry) -> Result<rtdb_metrics::MetricRegistration> {
+    use rtdb_metrics::ObservedSeries;
+    let series = std::iter::once(ObservedSeries { name: RECOVERIES_ACKNOWLEDGED, tags: BTreeMap::new() })
+        .chain(rtdb_db::journal_recovery_faults().map(|(code, _)| ObservedSeries {
+            name: RECOVERY_FAULTS,
+            tags: BTreeMap::from([("code".to_owned(), code.to_owned())]),
+        }))
+        .collect();
+    metrics.register_observed_counters(series, Arc::new(|| {
+        std::iter::once(rtdb_db::journal_recoveries_acknowledged())
+            .chain(rtdb_db::journal_recovery_faults().map(|(_, count)| count))
+            .collect()
+    }))
+}
+
 /// Opens the Logkeeper journal named by `url`. A `logkeeper-consensus://`
 /// URL selects keeper-hosted consensus streams. Any other URL opens the
 /// stream Writer.
@@ -2202,6 +2223,22 @@ mod tests {
     };
     use rtdb_tx::transact::{Cell, Op, Outcome, Row, Transact};
     use rtdb_types::{EntityId, TableRef, Value};
+
+    #[tokio::test]
+    async fn the_multi_registry_exports_journal_recovery_counters() {
+        use rtdb_plan::CatalogMetrics as _;
+        let memory = MemoryBudget::new(1 << 22);
+        let registry = rtdb_metrics::Registry::new("node", Arc::clone(&memory)).unwrap();
+        let _registration = register_journal_metrics(&registry).unwrap();
+        let rows = registry.sample().await.unwrap();
+        let text = crate::prometheus::render(rows.rows(), &memory).unwrap();
+        let text = std::str::from_utf8(&text).unwrap();
+        assert!(text.contains("# TYPE rtdb_multi_journal_recoveries_acknowledged_total counter"), "{text}");
+        assert!(text.lines().any(|line| line.starts_with("rtdb_multi_journal_recoveries_acknowledged_total")), "{text}");
+        for code in ["rtdb/journal-recovered", "rtdb/journal-shortened", "rtdb/journal-rewritten"] {
+            assert!(text.contains(&format!("rtdb_multi_journal_recovery_faults_total{{code=\"{code}\"")), "{text}");
+        }
+    }
 
     #[test]
     fn managed_workload_oidc_reuses_the_assignment_peer_profile() {
