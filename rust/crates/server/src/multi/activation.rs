@@ -7,8 +7,8 @@ use std::{
 
 use bytes::Bytes;
 use journal_contract::{
-    BoxFuture, CheckpointAnchor, Epoch, Identity, Journal, JournalError, Lsn, StreamId, WriterFence,
-    WriterSessionId,
+    BoxFuture, CheckpointAnchor, CheckpointInstallation, Epoch, Identity, Journal, JournalError,
+    Lsn, StreamId, WriterFence, WriterSessionId,
     reference::{FileJournal, Limits},
 };
 use rtdb_db::{ServingAuthority, ServingPermit};
@@ -601,17 +601,30 @@ impl ActivationAuthority {
                 covered_through: head,
                 record_sha256: Sha256::digest(&bytes).into(),
             };
-            let append = match fence {
-                Fence::Local(epoch) => self.journal.append(stream, epoch, at, bytes).await,
+            let (append, installed) = match fence {
+                Fence::Local(epoch) => (self.journal.append(stream, epoch, at, bytes).await, false),
                 Fence::Immutable(fence) => {
-                    self.journal
-                        .append_session_batch(fence, at, vec![bytes])
-                        .await
+                    let checkpoint = CheckpointInstallation {
+                        operation_id: Uuid::new_v4().as_u128(),
+                        checkpoint_lsn: at,
+                        covered_through_lsn: head,
+                        record: bytes.clone(),
+                    };
+                    match self.journal.install_checkpoint(fence, checkpoint).await {
+                        Ok(receipt) if receipt.checkpoint_lsn == at
+                            && receipt.covered_through_lsn == head
+                            && receipt.logical_floor_lsn == at => (Ok(at), true),
+                        Ok(_) => return Err(corrupt()),
+                        Err(JournalError::Unsupported) => (
+                            self.journal.append_session_batch(fence, at, vec![bytes]).await, false,
+                        ),
+                        Err(error) => (Err(error), false),
+                    }
                 }
             };
             match append {
                 Ok(committed) if committed == at => {
-                    if head != Lsn(0) {
+                    if !installed && head != Lsn(0) {
                         let _ = match fence {
                             Fence::Local(epoch) => self.journal.trim(stream, epoch, head).await,
                             Fence::Immutable(fence) => {
