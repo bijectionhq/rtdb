@@ -1,549 +1,783 @@
-# RTDB and XTDB: design divergences
+# RTDB and upstream XTDB: deliberate design divergences
 
-This page lists where RTDB (the Rust port, `rust/crates/*`) is built differently from XTDB (the JVM reference, `rtdb-ref`), and estimates where each difference can make RTDB slower or faster.
-It is a deeper companion to [`XTDB-VS-RTDB.md`](XTDB-VS-RTDB.md), which gives the benchmark numbers.
-
-Everything here comes from reading source; nothing was built, run or profiled.
-Each claim names a file and function.
-A claim marked **(inference)** is reasoned from the code rather than read directly from it, and every performance estimate is an inference unless it cites a measurement.
+This document lists the remaining deliberate divergences between RTDB (`rust/crates/*`, audited on `w4/integration`) and upstream XTDB (`0b9fa440f2`).
+Divergences that have been closed to match upstream XTDB are omitted.
+That includes GC reader leases, directory-page grace timers, the replica SHA-256 digest chain, aggregate and `DISTINCT` spilling, binary Flight SQL run tickets, vendored DataFusion expression lowering, default query spill caps, RTDB-only plain snapshot tokens, startup refusal on unreadable host locales, refusal of custom `file:` JSON log templates, and Docker `/var/lib/rtdb` default paths.
 
 Path abbreviations:
 
-- `R/` is `rust/crates/`.
-- `XK/` is `rtdb-ref/core/src/main/kotlin/xtdb/`.
-- `XC/` is `rtdb-ref/core/src/main/clojure/xtdb/`.
-- `XM/` is `rtdb-ref/modules/`.
+- `RC/` is `rust/crates/`.
+- `UK/` is `core/src/main/kotlin/xtdb/`.
+- `UC/` is `core/src/main/clojure/xtdb/`.
+- `XM/` is `modules/`.
 
-This page describes RTDB as of the commit that made leaf column statistics lazy (`perf(format): a read trie metadata file decodes a leaf's column statistics only when a scan visits it`).
-
-One measurement corrects the reading: a profile of point lookups over a 1,000,000-row table in Docker spent 75% of its time in `MetadataFile::read_reader`.
-The level-1 metadata file's decode bound (121 MB) exceeded the metadata cache's per-file limit, so every lookup decoded the whole file again.
-That commit fixes it; the remaining costs of reading metadata are in [Reading metadata](#reading-metadata) and row 11 of the ranked table.
-
-## Summary
-
-RTDB copies XTDB's *architecture* closely:
-
-- the same leader resolve → replica append → apply pipeline;
-- the same L0/L1/L2 compaction job selection;
-- the same hash-trie bucketing and limits;
-- the same bitemporal polygon algorithm;
-- the same 100k-row join threshold, 102,400-row sort blocks, and bloom/IID join pushdown.
-
-The divergences are almost all in *representation and caching*:
-
-1. RTDB converts Arrow data into owned `Value` trees at many points (writes, DML results, scans of system columns, most operators, pgwire output, compaction, spill), where XTDB stays on Arrow vectors from end to end.
-2. RTDB caches no parsed, planned or compiled query, where XTDB caches all three.
-3. RTDB reads whole objects into heap memory and decodes pages into a second cache, where XTDB memory-maps the byte slice of one record batch.
-4. RTDB charges memory per row or per value through a shared atomic chain, where XTDB charges per Arrow buffer allocation.
-
-These explain the measured pattern (inference):
-
-- RTDB wins on startup, footprint, plain full scans and concurrency of short reads.
-- RTDB loses on joins, aggregates over union columns and anything that falls off its column path.
-- RTDB loses on point operations once the data outgrows the live index. At 1M rows, point lookups and updates are about 15× slower than XTDB, joins about 4.5× slower.
-
-Point operations at 1M rows are where the per-file, per-page and per-statement costs below all add up.
+Each entry records what differs, why RTDB diverges, what a user or operator sees, and where the behaviour lives in the code.
 
 ---
 
-## 1. Live index
+## 1. Storage, log, and wire-format compatibility
 
-### XTDB
+### 1.1 Loud refusal framing for RTDB-only log records and block files
 
-- One Arrow `Relation` per table per block holds every transaction's rows: `XK/indexer/LiveTable.kt`, with `LiveTable.State(relation, trie)`.
-- A transaction writes through `LiveTable.openTx`, a direct slice (`relation.openDirectSlice`) over the same memory. Rows are appended in place (`Tx.endOps`, `Tx.importRows` → `relation.append`).
-- `Tx.commit` yields the next value by swapping the `State`. It does not copy rows.
-- Schema growth is absorbed by the relation's vectors: dense-union legs and struct children are promoted in place.
-- `LiveIndex.State` (`XK/indexer/LiveIndex.kt`) is a Clojure `PersistentHashMap` behind a `StateFlow`. Readers never lock.
-- A snapshot (`XK/indexer/TableSnapshot.kt` `open`) is another `openDirectSlice` plus `trie.withIidReader`: a ref-counted view, O(1) per table.
-- DML writes its query output straight into the live vectors: `OpenTx.executeSql` → `table(...).writePuts(RelationReader)` (`XK/api/tx/OpenTx.kt:233-290`).
+**What differs.**
+Upstream XTDB decodes source records with header bytes `0xff`, `2`, and `3`, ignores the replica header byte, and parses `Block` and `TableBlock` protobuf files directly.
+RTDB writes identical records and files for plain XTDB workloads, but frames any source record, replica record, or block file that uses an RTDB-only feature so that an upstream XTDB node refuses it immediately.
+Source records using RTDB-only features take header byte `4`.
+Replica records and `Block`/`TableBlock` files using RTDB-only features start their protobuf payload with a leading zero byte.
+Every field RTDB adds to a shared XTDB protobuf message is numbered from `1000` upwards.
+Four integrity annotations (`BlockUploaded.catalog_sha256`, `TrieDetails.published_files`, `OversizedMessage.payload_sha256`, and `Block.table_block_manifest`) remain unframed because XTDB loses nothing by ignoring them.
 
-### RTDB
+**Why.**
+Silently skipping an RTDB-only record or reading a block without its RTDB-only semantics would let an XTDB follower diverge or apply duplicate writes.
+Numbering extension fields from `1000` prevents field-number collisions with future upstream XTDB releases.
 
-- `LiveTable` (`R/index/src/live.rs`) holds `chunks: Vec<(u32, Arc<IndexBatch>)>`, one immutable Arrow `RecordBatch` per transaction, plus a persistent `MemoryHashTrie` over global row numbers.
-- `LiveTable::append` clones the table: the chunk `Vec`, `column_types` and the trie root. It pushes the new chunk, path-copies the trie (`add_range`), then calls `merge_small_chunks`.
-- `merge_small_chunks` (`live.rs:256`) concatenates the newest chunk into the previous one while the newest is at least as large, the two fit in a trie page (`page_limit`, 1024 rows by default; appends wait in a tail of up to `log_limit` chunks first), and the schemas are **exactly equal**. It uses `arrow_select::concat::concat_batches`, which re-copies the earlier chunk every time.
-- Every row lookup (`locate`, `header`, `row`) runs a `partition_point` binary search over the chunks.
-- Each `IndexBatch` decodes every row's header eagerly (`IndexBatch::from_owned_with_headers`).
-- `LocatedLeaves` caches `(chunk, offset)` and headers per trie leaf per snapshot (`LiveTable::located_rows`). It sits behind a `std::sync::Mutex<HashMap>` keyed by leaf address. A clone starts empty, so every append invalidates the whole table's cache.
-- `LiveIndex::apply` clones the `BTreeMap` of tables. `PartitionState::apply` (`R/index/src/partition.rs:81`) runs all of that **while holding the `parking_lot::RwLock` write lock**, which also clones the `TableCatalog` (`with_entries_for`).
-- A transaction's pending writes are kept as rows: `TransactionBuffer` holds `Vec<StoredEvent>`, whose `StoredOperation::Put(StructFields<Value>)` is a `Value` tree per document (`live.rs:429-520`).
-  - Each in-transaction read calls `TransactionBuffer::snapshot`, which turns the events added since the last read into a new `IndexBatch` (`IndexBatch::copy_events`) and appends a cloned segment.
-  - `stage` re-encodes **all** of the transaction's events into Arrow (`materialize`).
-  - Each `append` takes a `MemoryBudget` reservation per event.
+**What a user sees.**
+An XTDB node can follow an RTDB log and open an RTDB store while only standard XTDB features are used.
+Once a log or store records an RTDB-only feature, an XTDB node stops loudly with `IllegalArgumentException: Unknown message type: 4` on the source log or `InvalidProtocolBufferException: Protocol message contained an invalid tag (zero)` on the replica log or a block file.
 
-### Divergence and impact
+**Where in the code.**
+- `RC/format/src/envelope/extension.rs` (`source_uses_extension`, `replica_uses_extension`, `block_uses_extension`, `table_block_uses_extension`)
+- `RC/format/src/envelope/log_headers.rs`
+- `RC/format/tests/xtdb_refusal.rs`
+- `core/src/main/proto/xtdb/log/proto/log.proto`
+- `core/src/main/proto/xtdb/meta/block/proto/block.proto`
+- `docs/src/content/docs/ops/config/log.md`
 
-- **Union legs block chunk merging.** A column written as `int2` by one transaction and `int4` by another (psycopg does this) gives chunks with different schemas, so `merge_small_chunks` stops. The table then stays at one chunk per transaction. Every downstream gather handles many small sources, and `joined_union` / `Column::Values` fallbacks apply (see §3).
-- **Per-transaction cost grows with chunk count.** Each append clones the chunk `Vec`, `BTreeMap` and catalog, and the merge re-copies up to 8k rows. With XTDB, an append writes only the new rows (inference: small, but it is on the single writer path and under the lock).
-- **The write lock blocks readers.** The `RwLock` write lock is held while computing the next value, so `open_snapshot` waits behind apply. XTDB readers never wait.
-- **The located-leaf cache dies on every commit.** Under a write-heavy mix (e.g. the 80/20 benchmark), every read after a commit re-locates and re-copies the headers of every leaf it touches (inference).
-- **The write path changes representation twice.** Client Arrow becomes `Value` documents, then Arrow again (`IndexBatch::copy_events`).
+### 1.2 Trie key naming epochs after compactor reset or primary recovery
 
-### Recommendation
+**What differs.**
+Upstream `Trie.parseKey` accepts only standard level/recency/part/block segments.
+RTDB appends `-e<lexhex>` to compacted trie keys whenever the catalog's naming epoch is greater than zero, and records `naming_epoch` on `Block` and `BlockUploaded`.
+All records and blocks naming an epoch greater than zero are framed for XTDB refusal (§1.1).
 
-- Short term:
-  - merge chunks whose schemas differ only in union legs by widening into the joined layout (the gather already knows how: `R/query/src/columnar.rs` `joined_union`);
-  - compute `LiveIndex::apply` outside the lock, then swap;
-  - keep the located-leaf cache keyed by leaf identity across appends that leave the leaf `Arc` unchanged.
-- Long term: one growable Arrow builder per table (an append-only relation with a published row count), so that a transaction writes columns in place and a snapshot is a length-bounded view, as in XTDB.
+**Why.**
+Online compactor reset and recovery from a primary need newly compacted tries to avoid colliding with pre-reset object keys in immutable object storage.
 
----
+**What a user sees.**
+Plain workloads stay at epoch zero and remain XTDB-compatible.
+After an online compactor reset or primary recovery, compacted object keys carry `-e<epoch>` and an upstream XTDB node refuses to follow the log or open the store from that block onwards.
 
-## 2. Tries, on-disk layout and metadata pruning
+**Where in the code.**
+- `RC/format/src/keys.rs` (`TrieKey`)
+- `RC/index/src/trie_catalog.rs` (`reset_from_primary`)
+- `RC/replication/src/blocks.rs`
 
-### Memory hash trie
+### 1.3 Extended local-log frame separators, lineage header, startup scan, and append rollback
 
-- XTDB, `XK/trie/MemoryHashTrie.kt`: `LOG_LIMIT = 64`, `PAGE_LIMIT = 1024`, 4-way branching (`Bucketer`). IIDs are compared in place in the Arrow `_iid` vector through an `ArrowBufPointer`.
-- RTDB, `R/trie/src/memory.rs`: the same limits (`TrieConfig::default`) and 4-way buckets (`Bucketer::DEFAULT`, 2 bits). The structure is the same, and so is the "rebuild a leaf every 64 inserts" behaviour.
-  - `IidReader for LiveTable` reads the IID through `LiveTable::header`, i.e. a chunk binary search plus a header copy per comparison (`live.rs:304`).
-  - `Leaf::sorted_rows` caches the merged order in a `OnceLock`.
-- Divergence: only the cost of an IID read, which is a binary search instead of a pointer. Low impact.
+**What differs.**
+Upstream `LocalLog` writes only `0x1E` frame separators, reads only the final trailer on startup (`readLatestSubmittedOffset`), and leaves partial bytes on append failure.
+RTDB adds `0x1D` (retired), `0x1C` (sealed/encrypted), and `0x1B` (retired and sealed) separators, and prefixes journals under sealed erasure or native event history with a 24-byte `\x1aRTDBJ01`+UUID lineage header and `.lineage` sidecar.
+On startup, `inspect` walks every frame to validate the custody profile and 2^48 offset bound and rejects a torn final frame.
+On an append write error, RTDB truncates the partial batch and re-syncs the file.
 
-### On-disk trie files
+**Why.**
+Crypto-shredding erasure and lineage-bound native journals need per-frame retirement/sealing markers and identity verification.
+Rolling back partial appends and validating frames on startup prevent torn tails from corrupting recovery.
 
-- Both write a data file of Arrow pages of at most 1024 rows, plus a metadata file with an IID/recency-branch node vector and per-leaf column statistics, including blooms.
-  - RTDB writes these with `MetadataBuilder` (`R/format/src/metadata.rs`).
-  - XTDB writes them with `MetadataFileWriter` / `PageTrieWriter` (`XK/trie/`).
-- The files are format-compatible: the corpus tests read each other's files.
+**What a user sees.**
+Plain local logs use `0x1E` frames and remain readable by XTDB, though startup time scales linearly with log size instead of O(1).
+Sealed, retired, or lineage-headed local logs cannot be opened by upstream XTDB.
 
-### Reading metadata
+**Where in the code.**
+- `RC/storage/src/log/local.rs` (`inspect`, `RECORD_SEPARATOR`, `RETIRED_SEPARATOR`, `SEALED_SEPARATOR`, `RETIRED_SEALED_SEPARATOR`)
+- `RC/storage/src/log/journal_file.rs`
+- `RC/node/src/database.rs`
 
-- XTDB: `PageMetadata.open` (`XK/metadata/PageMetadata.kt`) loads the metadata file's single page as an Arrow `Relation`. `ArrowHashTrie(rel["nodes"])` walks the nodes in place, and `readPageIdxs` builds one `(colName, pageIdx) → row` map. Statistics are read as typed vector reads on demand.
-  - The metadata predicate is compiled into a page-index test (`metadataPredicate?.build(pageMetadata)` in `XK/segment/BufferPoolSegment.kt`).
-  - Bloom filters are `ImmutableRoaringBitmap` views over the vector's buffer, with no deserialisation (`XK/bloom/BloomUtils.kt` `bloomToBitmap`).
-- RTDB: `MetadataFile::read_reader` decodes every node into `Vec<MetadataNode>`.
-  - Leaf statistics are now `LeafColumns` (`metadata.rs`). A leaf read from a file decodes them each time a scan visits it, **into a whole `Vec<Value>` tree for the leaf** via `rtdb_columnar::read_value`, and does not keep them.
-  - The cache sizes a file by the node arrays it retains (`MetadataFile::stored_bytes`), not by its decode bound.
-  - `PageTest::matches` (`R/query/src/page_metadata.rs`) finds a column by linear search over those `Value` structs, using string field lookups (`column.field("col-name")`, `"root-col?"`).
-  - Blooms are checked by `BloomFilter::from_bytes`, which **deserialises a `RoaringBitmap` per page per test**. The join pushdown does the same in `Pushdowns::page_matches` (`R/query/src/pushdown.rs:144-151`).
-  - Decoded files are held as views in the database's `BufferPool`, under the node's memory cache (§6).
-- Divergence and impact:
-  - A point lookup that visits one leaf in each of N files pays N full statistic decodes on a cold cache, and a bloom deserialisation per leaf even when warm.
-  - The lazy change removes the decoding of unvisited leaves, but not the `Value` materialisation or the bloom deserialisation of visited ones.
-  - High for point operations once data is on disk (inference).
-- Recommendation:
-  - keep leaf statistics as Arrow arrays and resolve `(column, page) → row` once per file, as in `readPageIdxs`;
-  - compile `PageTest` against column indexes once per file;
-  - test blooms through a zero-copy view of the serialized roaring format (`roaring` can test containers in place, or cache the decoded bitmap per leaf).
+### 1.4 Local-log write batching and Apple `F_FULLFSYNC` opt-out
 
-### Trie catalog
+**What differs.**
+Upstream `LocalLog` uses a 10-element channel and drains up to 10 queued messages per `force(true)` call.
+RTDB uses a 64-element channel (`log_queue_capacity`) and batches queued records up to `256 KiB` (`APPEND_BATCH_BYTES`) or `1 ms` (`APPEND_BATCH_TIME`), writing and syncing each batch via `tokio::task::spawn_blocking`.
+On Apple platforms, RTDB calls `F_FULLFSYNC` (falling back to `fsync` on `ENOTSUP`/`EINVAL`/`ENOTTY`) and exposes `RTDB_APPLE_SYNC=fsync` to weaken sync for local development.
 
-- XTDB: Clojure persistent maps updated with `update-in` (`XC/trie_catalog.clj`).
-- RTDB: `TrieCatalog::with_tries` (`R/index/src/trie_catalog.rs:196`) clones the whole catalog per table. `current_tries` allocates and sorts every trie of a table per call, and is called on every scan and every compaction planning pass. `PartitionState::add_tries` / `adopt_block` do this under the write lock.
-- Impact: medium, and it grows with the number of tries.
-- Recommendation: use `im`-style persistent maps, and cache each table's sorted live tries per catalog generation.
+**Why.**
+Byte- and time-bounded batches smooth local-disk group commits under Rust's async runtime without blocking executor threads.
+The Apple opt-out lets developers trade full-flush durability for speed on macOS without changing code.
 
----
+**What a user sees.**
+Write batching and latency characteristics under concurrent local-log writers can differ from XTDB's 10-message batches.
+Setting `RTDB_APPLE_SYNC=fsync` on macOS weakens crash durability compared to `F_FULLFSYNC`.
 
-## 3. Scan path
+**Where in the code.**
+- `RC/storage/src/log/local.rs` (`LocalLogDriver::run`, `ready_batch`)
+- `RC/node/src/resources.rs` (`log_queue_capacity`)
+- `RC/storage/src/durability.rs` (`sync_file`)
 
-### XTDB
+### 1.5 Create-only object publication, directory fsync, S3 conditional writes, and publication metadata
 
-`XK/operator/scan/ScanCursor.kt`, `XC/operator/scan.clj`.
+**What differs.**
+Upstream `LocalStorage` moves temp files into place with `ATOMIC_MOVE` without fsync or conflict checks, and upstream S3 uploads multipart objects in parallel directly to the final key.
+RTDB's local store writes a tempfile, fsyncs both the file and every parent directory, publishes with `persist_noclobber`, and raises `ConflictingObject` if differing bytes already exist.
+RTDB's remote store publishes via `PutMode::Create` with byte comparison on conflict, uploads files as sequential 5 MiB parts to `.tmp/upload-<uuid>` followed by `copy_if_not_exists` and delete, requires S3 `S3ConditionalPut::ETagMatch` and `S3CopyIfNotExists::Multipart`, and attaches `rtdb-publication`/`rtdb-retirement` metadata and zero-byte tombstones.
 
-1. Segments (live `MemorySegment`s and `BufferPoolSegment`s) are merged by `MergePlanner` into `MergeTask`s, one per IID path.
-2. Per task, pages are loaded concurrently (`runBlocking { task.pages.map { async { it.loadDataPage(al) } } }`), each as a zero-copy `Relation` over a buffer-pool slice.
-3. The `_iid` predicate is applied first as a selection on each page: `SingleIidSelector` binary-searches the iid vector, `MultiIidSelector` handles several.
-4. Only the selected rows enter `EntityMerge`.
-5. `AsOfResolver` is used when both temporal dimensions are points. It stops at the first covering event of an entity, so older versions are never visited. `PolygonResolver` handles everything else (`EntityResolver.kt`).
-6. `BitemporalConsumer` records selected row indexes per page and builds typed Arrow temporal vectors. The output relation is a `select` view over the page, plus the four temporal vectors.
-7. Column predicates (`colPreds`, compiled `SelectionSpec`s) are applied inside the scan to that output.
+**Why.**
+Create-only publication and parent-directory fsyncs enforce immutability and crash durability for every published trie and block object.
 
-### RTDB
+**What a user sees.**
+Block flushes and compaction outputs perform extra fsyncs locally and extra round trips on remote stores.
+S3-compatible object stores that do not support conditional `ETagMatch` puts or conditional multipart copy are rejected.
 
-`R/query/src/scan.rs` (`PartitionScan`), `R/query/src/scan_tasks.rs`, `R/temporal/src/lib.rs`, `R/query/src/columnar.rs` (`gather`).
+**Where in the code.**
+- `RC/storage/src/object_store.rs`
+- `RC/storage/src/remote.rs` (`put_opened_file`)
+- `RC/s3/src/lib.rs`
 
-1. `initialize` visits **every leaf of every live segment** (filtered by `path_matches`). For each one it calls `located_rows` and `summarize_headers`.
-   - Then, for each selected trie file, it fetches the metadata from the global cache or decodes it, and walks the node tree.
-   - For every surviving leaf it materialises the leaf statistics and runs `Pushdowns::page_matches`, `may_satisfy_not_null` and `PageTest::matches`.
-   - Every step takes a `MemoryBudget` reservation (candidate, summary, selector, stack and descriptor reservations).
-2. `ScanTaskPlan` partitions pages by IID range.
-3. `buffer_task` loads each page:
-   - a decoded page held as a view by the `BufferPool` (§6), else
-   - `BufferPool::get` of the **whole data file** on its first open, and a ranged read of the page once its layout is cached (§6), `read_page` (memcpy into a new `Vec`), `IndexBatch::from_owned` (decodes all row headers), then an order check of every row on first load.
-4. It runs a `BinaryHeap` k-way merge over **every row in the task's IID range**. Rows not in `scan.iids` are dropped one by one (`iids.contains`), after the heap has visited them.
-   - There is no binary search for the target IID inside a page: the only binary search finds the task's lower bound.
-   - A point lookup therefore walks up to a full 1024-row leaf through the heap, per file that holds that leaf.
-5. Every visited event goes through `HistoryResolver::resolve_fragments`, the general polygon calculator (`AdmittedPolygonCalculator::visit`).
-   - There is no as-of fast path, so all older versions of an entity are processed even for a point-in-time query.
-   - The ceiling's growth takes memory reservations.
-6. `gather` builds the output columns:
-   - `Column::Arrow` via `interleave` when all sources share a flat layout;
-   - a dense union via `joined_union` when integer widths differ;
-   - otherwise `Column::Values(Vec<Value>)`.
-   - `_valid_from`, `_valid_to`, `_system_from`, `_system_to` and `_iid` are **always `Column::Values`**. Each timestamp cell is `Value::Timestamp { timezone: Some("UTC".into()) }`, a heap `String` per cell (`fn time`). Each `_iid` cell is a `Vec<u8>`.
-7. Column predicates are applied above the scan by `BatchFilter`. Its kernels cover plain scalar columns only; anything else materialises every column of the batch into rows (§4).
-8. An `_id` range confines the scan to an IID interval (`id_interval`), which XTDB has no counterpart for.
-   - It applies where every `_id` of the table is a UUID, because a UUID is its own IID and orders as its bytes do. The conjuncts `_id <`, `<=`, `>`, `>=` and `BETWEEN` a UUID literal or parameter give one inclusive interval.
-   - `path_matches` drops trie files, metadata paths, live leaves and scan tasks outside the interval, and `buffer_task` starts and ends its merge inside it.
-   - The predicate still runs on the rows read. Like the `_id = v` narrowing, the interval trusts each row's IID to be the one its ID derives: a row replayed under another IID is not found by its ID.
-   - A table holding an ID of any other type is not narrowed, since its IDs are hashed into their IIDs.
-9. `ORDER BY _id ... LIMIT n` over such a table reads in IID order and stops (`iid_ordered_input`), which XTDB also has no counterpart for.
-   - The scan hands its tasks out in ascending or descending IID order, and keeps each task's merged rows in one batch in that order.
-   - The scan's predicates run on those batches, and the limit above stops pulling once it has its rows, so the remaining tasks load no page.
-   - `initialize` walks the interval's metadata paths but leaves each leaf's statistics undecoded; `read_statistics` tests them when the scan reaches the leaf's task, from the metadata the pool holds.
-   - It serves one `_id` sort key over a single partition, where no ordered index answers first. Any other sort is sorted as before.
+### 1.6 Optional storage encryption, physical ("default") erasure, and KMS writer store
 
-### Divergence and impact
+**What differs.**
+Upstream XTDB stores objects and spill files in plaintext and implements `ERASE` logically by writing erase events that wait for GC.
+RTDB adds opt-in AES-256-GCM object sealing (`RTDB_CLASSIC_KEY_VAULT`), opt-in crypto-shredding default erasure (`RTDB_DEFAULT_LOCAL_ERASURE`, `RTDB_DEFAULT_KAFKA_ERASURE`, sealed Kafka topics) that writes sealed successor roots and destroys key slots (while disabling compaction, artefacts, GC, and export), per-file AES-128-CTR encrypted query spill files under local erasure custody, and `rtdb-store`, a KMS-encrypted immutable writer store.
 
-- **Point operations scale with versions and files rather than with matches.** XTDB does about log₂(1024) comparisons per page and stops at the first visible version. RTDB pushes every row of the leaf through a heap and the full polygon calculator, per file.
-  - This grows with data size, since more L0/L1 files cover each IID path, and with update count, since an entity has more versions.
-  - It is the most plausible size-dependent cause of the 15× point-lookup and update gap at 1M rows **(inference)**.
-  - Compaction lag (§9) makes it worse, because uncompacted L0 files each cover the whole IID space.
-- **System columns are never columnar.** Any query projecting or filtering on `_valid_from`, `_system_from` and the like (valid-time history, `FOR VALID_TIME AS OF` outputs, all UPDATE/DELETE inputs, which read `_iid` and the valid-time columns) goes through `Value` per cell, a `String` allocation per timestamp, and the row fallback in every operator above.
-- **Decoded pages cost a page decode per cold read.** A page is decoded once into the pool, which then drops the raw file, so warm reads are cheap but every eviction costs a decode, where XTDB maps the raw page in place (inference).
+**Why.**
+Regulated deployments require cryptographic deletion of erased data across logs, storage, and temporary query spill files.
 
-### Recommendation
+**What a user sees.**
+Plain nodes are unaffected.
+Nodes configured with a key vault or default erasure write encrypted logs and objects that XTDB cannot read, encrypt query spill files in memory-keyed AES-128-CTR, and run without background compaction, artefacts, GC, or export under default erasure.
 
-- Apply `scan.iids` as a per-page binary search before the merge, as `SingleIidSelector` / `MultiIidSelector` do. Skip leaves with no candidate IID before loading them.
-- Add an as-of resolver that ends an entity at its first covering event (port `AsOfResolver`).
-- Emit temporal columns as `TimestampMicrosecondArray` with a shared `"UTC"` timezone `Arc<str>`, and `_iid` as `FixedSizeBinaryArray`.
-- Apply simple column predicates inside the scan on the gathered batch, so non-matching rows are never materialised.
-- Cache file layout and page offsets, and read single pages by range (see §6).
+**Where in the code.**
+- `RC/storage/src/sealing/`
+- `RC/replication/src/default_erasure.rs`
+- `RC/kafka/src/erasure.rs`
+- `RC/query/src/spill.rs`
+- `RC/query/src/context.rs`
+- `RC/store/src/`
 
----
+### 1.7 Disk cache layout, owner lock, and heap buffer pool
 
-## 4. Expression evaluation and value representation
+**What differs.**
+Upstream XTDB stores disk-cache files under `c1/<sha256>/`, fills misses with one streamed GET, and memory-maps individual record-batch byte slices in `MemoryCache`.
+RTDB stores disk-cache files under `~rtdb-store-<sha256>/0/` guarded by an exclusive `.tmp/.owner-lock` and fills misses with sequential 1 MiB range GETs.
+RTDB's `BufferPool` reads raw objects into heap buffers and stores decoded views (metadata, layouts, decoded pages) under one shared `CacheBudget` mutex rather than memory-mapping slices.
 
-### XTDB
+**Why.**
+An explicit owner lock prevents two nodes from corrupting a shared cache directory.
+Sharing one `CacheBudget` across raw bytes and decoded views enforces RTDB's hard process memory ceiling without relying on JVM direct-memory mapping.
 
-- `XC/expression.clj`: `codegen-expr` / `codegen-call` multimethods emit Clojure code per expression, specialised to input vector types.
-- `emit-projection` wraps it in a `(dotimes [idx row-count] …)` loop, `eval`s it into JVM bytecode, and memoises it (`util/lru-memoize`).
-- Unions are read leg by leg (`continue-read-union`).
-- Selections produce `VectorMask` → `int[]`, and outputs are `select` views.
-- Comparators for sort and join are generated `IntBinaryOperator`s (`XC/expression/comparator.clj`).
+**What a user sees.**
+An XTDB node and an RTDB node must not share the same disk-cache directory.
+Cold reads of large remote files perform multiple 1 MiB range GETs and heap copies instead of one streamed download and mmap.
 
-### RTDB
+**Where in the code.**
+- `RC/storage/src/cache.rs` (`BufferPool`, `CacheBudget`)
+- `RC/storage/src/disk_cache.rs`
+- `RC/node/src/resources.rs`
 
-- `R/types/src/value.rs` `Value` is a 40-variant owned enum (`Utf8(String)`, `Timestamp{.., timezone: Option<String>}`, `List(Vec<Value>)`, `Struct(StructFields)`, …).
-- Rows are `OwnedRow { values: Vec<Value>, reservation }` (`R/query/src/cursor.rs`) grouped into `OwnedPage`. Batches are `ColumnBatch { columns: Vec<Column> }`, where `Column` is `Arrow` or `Values` (`R/query/src/columnar.rs`).
-- `R/expr` is a recursive tree-walking interpreter over `&[Value]`. About 85k of its 103k lines are Unicode tables; the logic is about 11k lines, mostly in `evaluate.rs` and `evaluate/invocation.rs`.
-- Per call, `functions::scalar_call`:
-  - lowercases and replaces the function name (two `String`s);
-  - re-runs `function_type` on a freshly built `Vec<LogicalType>`;
-  - walks a chain of module dispatchers that each match on strings.
-- Per row, `Execution::evaluate_invocation` (`R/query/src/context.rs`) does a cancellation check, two scope reservations, a `Vec` for outer rows, and nested `run_until_cancelled` futures. Row operators also call `scope.reset()` per row.
-- Vectorised paths:
-  - `columnar::kernel::truth`: comparisons, AND/OR/NOT, IS NULL, BETWEEN over plain I8–I64/F64/Utf8/Bool/µs-timestamp and dense unions of those.
-  - `columnar::projection`: checked `+ - *`.
-  - `columnar::functions`: projected EXTRACT, ROUND, ABS, FLOOR/CEIL and the one-argument float math, UPPER/LOWER, LENGTH, SUBSTRING and searched CASE.
-    Each projection resolves its calls to `rtdb_expr::kernels::Function` once, and every vector it builds (literal copies, gathered selections, widened arguments, CASE inputs) is charged to the query's memory budget while it lives; a refusal fails the query rather than falling back.
-    A batch with any failing cell is still recomputed by the row evaluator.
-  - `vector.rs`: lowers a subset of expressions to DataFusion `PhysicalExpr`, **rebuilt per batch**, with an extra pass to scan divisors for zero.
-  - `rtdb_expr::evaluate_batch` exists but has no production caller.
-- Fallbacks: `BatchFilter` and `BatchExpressions` call `batch.rows()`, which materialises **every** column for every row, even when the expression reads one.
-  - Columns that always fall back: union columns with string legs, temporal system columns (`Column::Values`), nested types, extension types (keyword, uuid, uri, transit, decimal), and float or non-ASCII ordering cases.
-  - Tracing and EXPLAIN ANALYZE run the production column plan; stacked filters stay fused, EXPLAIN ANALYZE measures each fused stage as its own `select`, and a trace shows the fused stack as one span.
+### 1.8 RTDB-only bucket prefixes, catalog-ledger retirement, and receipt-table L0 deletion
 
-### Divergence and impact
+**What differs.**
+Upstream XTDB stores only blocks, table data/meta tries, and oversized payloads in the bucket, deletes eligible tries directly during GC, and never deletes L0 trie files.
+RTDB adds bucket prefixes for RTDB-only subsystems (`~trie-retirements/`, `ordered-index/v2/`, `tables/<slug>/artefacts/`, `search-runs/`, `search-pending/`, term/entity directories, `tables/<slug>/spatial/`, `~rtdb-v1/`, `.tmp/catalog-ledger`, `.tmp/upload-*`).
+On remote stores with catalog-ledger coordination, level >= 1 trie releases go through retirement intents and delete exact S3 object versions.
+For RTDB's expiring receipt tables (`xt.idempotency_receipts`, `xt.bounded_retry_receipts`, `xt.rtdb_replay_keys`, and placed-attempt tables), compaction folds every L0 into L1 and GC deletes their L0 files (framed for XTDB refusal).
 
-- For expressions on the fallback path, RTDB pays an enum match, an owned clone and several allocations per cell per node. XTDB pays a typed, unboxed read inside JIT-compiled code.
-- Inference: 10–100× per row, and the dominant cost of the aggregate and as-of benchmarks over pgwire, where `_id` is an integer union.
-- **Recommendation:**
-  - resolve function name, overload and result type once in `ExpressionInvocation::prepare`;
-  - borrow cells instead of `retained_clone`;
-  - materialise only the columns an expression reads;
-  - cache the DataFusion lowering per (expression, input types);
-  - extend the kernels and the lowering to dense unions with string legs and to temporal columns.
-  - Longer term: compile expressions to closures over typed column readers, the closest Rust analogue of XTDB's codegen.
+**Why.**
+RTDB's secondary indexes, native v1 incarnations, and expiring receipt tables need dedicated storage namespaces and safe versioned deletion.
+
+**What a user sees.**
+An XTDB node running GC against a bucket that also holds RTDB-only prefixes would leak those objects.
+Any `TriesDeleted` record that deletes an L0 receipt-table trie is framed so XTDB stops rather than misapplying it.
+
+**Where in the code.**
+- `RC/format/src/keys.rs`
+- `RC/storage/src/remote_catalog.rs`
+- `RC/maintenance/src/retirement_intent.rs`
+- `RC/maintenance/src/job.rs`
+- `RC/maintenance/src/gc.rs`
+
+### 1.9 Page IID-order validation on decode and GC missing-object error code
+
+**What differs.**
+Upstream XTDB trusts its persisted trie data pages on read and surfaces the object store's missing-file exception when a query reads a catalog older than the GC window.
+RTDB checks that row IIDs are ordered the first time a persisted data page is decoded.
+When a read requests an object already removed by GC, RTDB reports `rtdb.storage/missing-object` (`NotFound`, mapped to `XX000` and logged in pgwire).
+
+**Why.**
+Validating page order on first decode catches corrupt or malformed files early before temporal resolution relies on sorted IIDs.
+Typed storage errors give uniform diagnostics across local and remote stores.
+
+**What a user sees.**
+A corrupt out-of-order data page fails immediately on first load instead of producing wrong query results.
+Reading past the GC retention window fails with `XX000` as in XTDB, but carries RTDB's `rtdb.storage/missing-object` code and message.
+
+**Where in the code.**
+- `RC/query/src/scan.rs`
+- `RC/columnar/src/read_check.rs`
+- `RC/storage/src/error.rs`
 
 ---
 
-## 5. Operators
+## 2. Transactions, system time, and replication
 
-| Operator | XTDB | RTDB | Divergence / impact |
-| --- | --- | --- | --- |
-| Hash join | `XK/operator/join/` `BuildSide` (Arrow `Relation`, spills Arrow pages past 100k rows), `BuildSideMap` (open addressing over `IntVector`), `ProbeSide` (generated comparator), `JoinType` emits index lists and `select` views; `DiskHashJoin`/`Shuffle` Grace partitioning; bloom/IID pushdown to the probe scan | `R/query/src/join.rs`, `join_storage.rs` (`HashIndex` with the same skip array and 0.6 load, same partitioning), `pushdown.rs` (same pushdowns). But `JoinLayout::project_page` copies each input page; keys are hashed and compared as `Value` (`hash_values`, `sql_eq_in_timezone`); every output row is `OwnedRow::copy_parts_in`; spills are JSON. Columnar `BatchJoin` (`batch_join.rs`) only for inner equi-joins on bare columns, same projection shape, below 100k build rows, no tracing, and only when a parent asks for batches | Same algorithm, row representation. Main cause of the 0.43–0.44× join results and the 4.5× gap at 1M rows (inference). Make `BatchJoin` the default: hash Arrow key columns, emit `take` indices, keep build pages as Arrow |
-| Spill | Arrow IPC pages (`XK/operator/join/Spill.kt`, `XC/operator/order_by.clj` `write-rel`) | `R/query/src/spill.rs`: `serde_json` of `Vec<Value>` **per row** (`SpillWriter::write`, `SpillReader::next`), reserving `retained × 8` / `length × 64 + 4096` bytes per row | Very high whenever anything spills. Use Arrow IPC (the format crate already writes it) |
-| Aggregate | `XC/operator/group_by.clj`; `XK/arrow/agg/GroupMapper.kt` (`DistinctRelationMap` hash trie → I32 group-id vector per batch); per-aggregate output vectors indexed by group; compiled reducers | `R/query/src/aggregate.rs`: `GroupKeys` = `HashMap<u32, Vec<usize>>` with `OwnedRow` keys compared through `rows_equal` (a new `EvaluationScope` per cell compared); min/max clone, cast and reserve per row. Column path only for bare-column keys without FILTER/DISTINCT/ORDER BY/ARRAY_AGG/PERCENTILE, and its inputs are still `ColumnValues` (`Vec<Value>`) | High constant factor. Group ids per batch over Arrow keys; typed accumulators |
-| DISTINCT aggregate, ARRAY_AGG, PERCENTILE | One `DistinctRelationMap` per group; index lists plus `copyRows` | `AggregateColumn::aggregate` rescans the whole JSON spill per input row (O(N²)); `finish` rescans the spill per group (O(G·N)) | Asymptotic. Per-group hash set / index list |
-| Sort | `OrderByCursor`: 102,400-row blocks sorted by index with generated comparator, Arrow run files, 4-way merge | `R/query/src/sort.rs`, `sort/records.rs`: the same block size and fan-in, but switches to the JSON disk store after `sort_memory_bytes` = **8 MiB** (`context.rs:112`), i.e. about 12k rows of 10 columns; `write_run` re-reads records by seek + JSON decode; comparisons on `Value` | Medium-high on large sorts. Count by rows or raise the budget; spill Arrow |
-| Top-k | No special path (block trim) | `SortPlan::top` / `top_batches` for limit ≤ 10,000: sorted `Vec` with early reject | RTDB faster (measured 1.28–2.0×) |
-| Window | `XC/operator/window.clj` `WindowFnCursor`: in memory, `GroupMapper` partitions, one index sort | `R/query/src/window.rs`: finds each row's partition by **scanning the key spill file** (`PartitionPages::next_page`, O(N·P) with I/O); copies rows twice; per-cell `replace_value` | Asymptotic. Hash partition ids |
-| DISTINCT | `DistinctRelationMap` over Arrow | `operators.rs` `Distinct`/`SeenRows` with `OwnedRow` copies; `equality_hash` (`operators.rs`) hashes a date-time as its wall-clock instant in the session zone, at any depth inside lists and structs; a set or map holding one still hashes by its size alone, as its struct members compare regardless of field order | Fixed for scalars, lists and structs; sets and maps of date-times stay O(N²) per size |
-| INTERSECT/EXCEPT | `XC/operator/set.clj` hash `BuildSide` plus `ProbeSide` | `operators.rs` `SetCursor`: spools the right side to JSON, then `reader.rewind()` and a full scan **per left row** (`operators.rs:629`) | Asymptotic. Hash build side |
-| LIMIT | `TopCursor` `select` over an index range | `Limit` moves `OwnedRow`s into a new page | Low |
-| UNNEST | `UnnestCursor` `copyRange` plus selection | Per-row interpreter call, and a copy of the whole input row per element | Medium for wide rows |
-| Apply | `ApplyCursor.kt`: dependent cursor per row with args as single-row `select`s | `operators.rs` `Apply` rebuilds the dependent operator tree per row and clones both sides | Similar shape, higher constant |
-| Cross join | Selection vectors | Nested page × page loop with row copies | Medium |
+### 2.1 Non-decreasing system time (T7 ties) on the classic path
 
----
+**What differs.**
+Upstream `TxResolver` strictly advances automatic system time by +1 µs whenever the log timestamp does not advance past the head, and rejects any supplied `SYSTEM_TIME` less than or equal to the latest completed transaction with `"specified system-time must be later than current tx"` (logged at WARN).
+On `w4/integration`, RTDB uses `follows` (`<=`): a stalled, regressed, or same-microsecond log timestamp holds at the predecessor's time without minting +1 µs, and a supplied `SYSTEM_TIME` equal to the head commits (rejecting only strictly earlier times with `"specified system-time must not be earlier than current tx"`).
+Note: this divergence is under active review against XTDB's strict-increase rule.
 
-## 6. Buffer pool and caching
+**Why.**
+In shared-main deployments that interleave classic transactions with `rtdb.store.v1` appends, minting a synthetic +1 µs timestamp past the wall clock can make a subsequent store append look like a clock regression (T7).
 
-### XTDB
+**What a user sees.**
+Concurrent local-log writes in the same microsecond, bursts on millisecond-grained Kafka logs, and transactions supplying a `SYSTEM_TIME` equal to the head commit with tied system times instead of advancing or aborting.
+Because XTDB's `TimeBasis` snapshot tokens and `AS OF SYSTEM_TIME` reads name prefixes by system time alone, a read or token at a tied instant observes every transaction sharing that timestamp.
 
-`XK/storage/BufferPool.kt`, `LocalStorage.kt`, `RemoteBufferPool.kt`, `XK/cache/MemoryCache.kt`, `DiskCache.kt`, `PinningCache.kt`.
+**Where in the code.**
+- `RC/tx/src/system_time.rs` (`follows`, `automatic_time`, `external_time`)
+- `RC/tx/src/resolver.rs` (`supplied_time`, `smooth`)
 
-- Footers are cached in Caffeine (`arrowFooterCache`).
-- `getRecordBatch(path, idx)` asks `MemoryCache` for the **byte slice of that one batch**. `PathLoader` does `FileChannel.map(READ_ONLY, offset, len)` and wraps it as an `ArrowBuf` with no copy. `MemoryCache` de-duplicates concurrent fetches through a `ConcurrentHashMap` of ref-counted slices, limited to 0.5 × direct memory.
-- Remote stores add a disk tier: a Caffeine `AsyncCache` with pinning at 0.75 × disk, filled by a single streamed GET to a file (`XM/aws/.../S3.kt` `getObject(k, outPath)`).
-- The OS page cache does the rest.
+### 2.2 Native `rtdb.v1` protocol, Classic vs v1 partitions, and `rtdb.store.v1`
 
-### RTDB
+**What differs.**
+Upstream XTDB provides one linear SQL/XTQL write and read model per database.
+RTDB ships two additional native protocols over Flight actions in every build: `rtdb.v1` (conditional `Transact` with idempotency keys, capabilities, guards/requires, `ops`/`otherwise`, decision clocks, funded appointments, branches `Fork`/`Merge`/`Renew`/`DropBranch`, a `Changes` stream, and per-principal private owned relations/worlds/audiences) and `rtdb.store.v1` (ordered versioned key-value bytes with `Read`/`Append`/`Watch`, `Bound`, derived writes, and scoped grants).
+Ordinary SQL writes land on a database's Classic partition; once a Classic transaction applies, that database's `rtdb.v1` branch route is unavailable.
 
-- `R/storage/src/cache.rs` `BufferPool::get` does a `head` and then `get_reserved_range(key, 0..size)`: **the whole object goes into a heap `Vec`**.
-  - The defaults make this costly: `file_size_target` is 100 MB and `cache_bytes` is 256 MB (`R/node/src/config.rs:43-44`).
-  - Objects have a per-entry `tokio::Mutex` for single-flight loads.
-- The pool also holds decoded views of an object (`cache::View`: a whole decoded file, a file's layout, one page), under the same `CacheBudget` as the raw bytes.
-  - Every pool sharing a budget keeps its entries in one recency list behind one `parking_lot::Mutex`, with O(1) lookup, touch, insert and removal.
-  - Admitting bytes, raw or decoded, evicts the least recently used idle entries of any pool; an entry still leased or in use is skipped, since evicting it would free nothing.
-  - A view that would take more than an eighth of the budget, or that does not fit, is not cached.
-- Scans (`R/query/src/scan.rs`) cache decoded trie metadata, data-file layouts and decoded `IndexBatch` pages as views, and evict the raw object once its decoded form is admitted.
-  - A data file whose layout is cached is read a page at a time with `get_range`.
-  - A read the cache cannot admit is charged to the query's own budget instead (`get_or`, `get_range_or`).
-- `ArrowFile::read_page` → `read_block` (`R/format/src/ipc.rs:106-141`) copies each page into a new `Vec`, then decodes it.
-- `R/storage/src/disk_cache.rs`:
-  - a miss downloads the object as **sequential 1 MB range GETs**;
-  - `put_file` copies in 64 KB chunks;
-  - each range read does `File::open` + seek + `read_exact` into a new `Vec`;
-  - `trim` rescans every entry on every lease drop.
+**Why.**
+RTDB serves Bijection's transactional, branching, multi-tenant, and ordered-store workloads alongside XTDB-compatible SQL.
 
-### Divergence and impact
+**What a user sees.**
+Plain XTDB SQL workloads do not need `rtdb.v1` or `rtdb.store.v1`, though `rtdb dev` and `rtdb standalone` enable `defaultV1Serving` and disallow mixing Classic SQL writes and v1 writes in the same database.
+Any database that executes `rtdb.v1` writes produces framed records that upstream XTDB refuses (§1.1).
 
-- **Read amplification.** Up to file size ÷ page size: one 1024-row page from a 100 MB L2 file costs 100 MB of I/O and memcpy on a cold read.
-- **Cache thrash.** Two or three large files exhaust the 256 MB pool.
-- **Copies.** Each page is copied twice before decoding.
-- **Contention.** Every pool sharing a budget shares one mutex; its operations are O(1), but the 8-reader workloads still serialise on it (inference).
-- Overall: very high for cold point lookups over compacted data; medium under concurrency.
+**Where in the code.**
+- `rust/proto/rtdb.v1.proto`
+- `rust/proto/rtdb.store.v1.proto`
+- `RC/flight-sql/src/v1/`
+- `RC/tx/src/decision_clock.rs`
+- `RC/node/src/receiver_clock.rs`
+- `RC/query/src/owned_relation.rs`
+- `RC/index/src/branches.rs`
+- `rust/README.adoc`
 
-### Recommendation
+### 2.3 Serving-leader clock lease and offered clock-slot wait
 
-- Cache the footer and layout per file, then fetch and cache by `(key, page)` byte range: a `get_range` against the object store, or `pread`/mmap against the disk cache and the local store.
-- Drop the whole-file `BufferPool::get` from compaction, and from a scan's first open of a file, by inspecting the layout from ranged reads.
-- Shard the pool's recency list, and key its views by an interned `(file id, page)` rather than an `ObjectKey`.
-- Download disk-cache misses as one streamed GET.
+**What differs.**
+Upstream XTDB has no leader clock lease and no offered clock-slot submission wait.
+On `w4/integration`, when native serving mode is active (`self.serving.is_some()`), RTDB's replica appender periodically writes framed `NoOp.clock_lease_micros` records (a 2 s lease) and a newly promoted leader delays decisions until its clock passes the prior lease plus drift.
+Submitters consuming an offered clock slot wait up to 1.5 s (`clock_slot_wait`) for the local clock to reach the slot reading before appending.
 
----
+**Why.**
+Native serving and funded appointments need a bounded-drift guarantee across leader failover without reading the last hidden commit timestamp.
 
-## 7. Storage and log
+**What a user sees.**
+Plain XTDB server workloads never enable `self.serving`, emit no clock-lease records, and do not hit `clock_slot_wait`.
+Native serving leaders pause briefly on failover until the previous lease expires, and their replica log contains framed lease no-ops that XTDB refuses (§1.1).
 
-### Local log
+**Where in the code.**
+- `RC/replication/src/appender.rs` (`ClockLease`, `LEADER_CLOCK_LEASE_MICROS`, `clock_lease_record`)
+- `RC/replication/src/driver.rs` (`clock_lease_admits`)
+- `RC/tx/src/system_time.rs` (`clock_slot_wait`, `clock_slot_reading`)
 
-- **Same format, group commit and fsync policy.**
-  - XTDB `XK/api/log/LocalLog.kt`: `0x1E | i32 size | i64 ts | payload | i64 offset`; one writer coroutine drains up to 10 appends and calls `force(true)` once per batch.
-  - RTDB `R/storage/src/log/local.rs`: the same format (`HEADER_BYTES = 13`, `TRAILER_BYTES = 8`). `LocalLogDriver::run` drains up to 10 and calls `sync_file` once.
-- **Divergences:**
-  - Startup `inspect()` reads every record, where XTDB reads only the last trailer (`readLatestSubmittedOffset`). Startup is O(log size).
-  - The replication driver prefers the replay tail (`R/replication/src/driver.rs` `read_replay_head`). `LocalTail::poll_head`/`read_head` open the file twice and hop through `spawn_blocking` twice **per record**, for both the source and replica logs, about four opens and four thread-pool hops per transaction (inference). The batched `LocalTail::poll` (up to 1024 records) is bypassed.
-- Impact: medium for single-row transaction latency; startup cost grows with log size.
-- Recommendation: keep the tail's file handle open and read batches; read only the trailer at startup.
+### 2.4 Idempotent and bounded-retry SQL submissions
 
-### Object store and publication
+**What differs.**
+Upstream XTDB has no built-in idempotency key or bounded-retry guard on SQL `Tx` log messages.
+RTDB adds `Tx` extension fields (`idempotency_guard`, `replay_submission`, `bounded_retry`, `placed_attempt_seed`) backed by private receipt tables and a 1 h idempotency window, framed for XTDB refusal.
 
-- RTDB `R/storage/src/remote.rs` `put_opened_file` does HEAD, then sequential 5 MB parts to a temporary key, then `copy_if_not_exists` (a server-side copy), then DELETE.
-  - XTDB uploads parts in parallel straight to the final key (`XK/multipart/SupportsMultipart.kt`), and small objects with HEAD + PUT.
-- The local store (`R/storage/src/object_store.rs` `put`/`publish_file`) copies into a tempfile and fsyncs the file and every parent directory.
-  - Block production (`R/replication/src/blocks.rs:237-240`) writes and fsyncs a tempfile *before* `put_file` copies and fsyncs it again.
-  - XTDB `LocalStorage` writes a tmp file and does an `ATOMIC_MOVE`, with no copy and no fsync.
-- RTDB's `block_lag` (`R/node/src/database.rs`) lists nothing on the leader, the database's only block writer, and on a follower probes forward from the highest block it has adopted or seen with one fresh HEAD per block, listing `blocks/` only when it knows of no stored block. XTDB lists after the current block and caches the result for 10 s (`BufferPool.kt` `latestAvailableBlockIndex`), so its lag can be up to 10 s stale.
-- Impact: medium-high on block flush and compaction output latency, and extra round trips on S3/GCS/Azure.
-- Recommendation: rename into the local store root; upload parts in parallel to the final key, keeping the create-only check as a conditional PUT on the last step.
+**Why.**
+At-least-once clients and placed deployments need server-enforced deduplication across network retries and leader failovers.
 
----
+**What a user sees.**
+Clients that do not attach RTDB retry guards see standard XTDB transaction behaviour.
+Clients using guards get deduplicated replay receipts, and the resulting framed records cannot be replayed by XTDB.
 
-## 8. Transaction pipeline
+**Where in the code.**
+- `RC/tx/src/replay_submission.rs`
+- `RC/tx/src/bounded_retry.rs`
+- `RC/tx/src/idempotency_window.rs`
+- `RC/tx/src/source.rs`
 
-### Structure: equivalent
+### 2.5 Sealed snapshot tokens for placed databases and world-overlay refusal
 
-- RTDB:
-  - submission (`R/node/src/node.rs:253` → `R/tx/src/submission.rs`, static INSERT expanded once, like XTDB's `toStaticOps` with `dml-cache`);
-  - the source log;
-  - `ReplicationDriver::run_inner` (`R/replication/src/driver.rs`), a single `tokio::select!` loop with one resolution in flight (`resolve_next_source`);
-  - the replica log append (`appender.rs`);
-  - apply (`apply_admitted`);
-  - the block cut at `rows_per_block` (`enqueue_resolved` → `cut`).
-- This mirrors `XK/indexer/LeaderLogProcessor.kt`, `TxResolver.kt`, `SourceLogTxIndexer.kt`, `ReplicaLogAppender.kt`, `BlockCutter.kt`.
-- Thresholds:
-  - RTDB's `ReplicationConfig::default` uses `rows_per_block` 100,000 and `flush_timeout` 4 h. The server config default is 102,400 (`R/server/src/config/mod.rs:202`).
-  - XTDB uses 102,400 and a 15 min `flushDuration` (`XK/api/IndexerConfig.kt`).
+**What differs.**
+Plain RTDB snapshot tokens now match upstream XTDB's stateless base64 protobuf `TimeBasis` and are interoperable in both directions.
+However, when the default database has a placed-receipt codec, RTDB emits an `rtdb-sealed-snapshot-v4:` token encrypted and bound to the issuing principal, history fingerprint, and storage generation.
+Issuing or redeeming a snapshot token over a view with RTDB world overlays fails with `rtdb/snapshot-token-overlay` (`Unsupported`, SQLSTATE `0A000`).
 
-### SQL DML with argument rows
+**Why.**
+Placed multi-tenant deployments cannot expose raw database topology or let one principal redeem another principal's or another storage generation's token, and XTDB's `TimeBasis` cannot represent world overlays.
 
-- RTDB `R/tx/src/resolver.rs`:
-  - `apply_inner` (`:363-370`) loops `for (index, row) in arguments.indexed_rows() { self.execute_sql_typed(sql, Some(row), …) }`.
-  - `execute_sql_typed` (`:285-297`) does, **per row**: `self.snapshot()`, which runs `TransactionBuffer::snapshot` (re-encode the new events, append a cloned segment); a new `query_context`; `admit_sql_syntax`; `rtdb_sql::prepare_tx_in` (full parse, bind and plan); a new `PreparedQuery` in `execute`.
-  - `execute_mutation` (`:328-345`) then reads each result cell back into a `Value` (`read_value`) and pushes `StoredEvent`s.
-- XTDB also runs the statement once per argument row (`SourceLogTxIndexer.forEachArgRow`, `XK/indexer/SourceLogTxIndexer.kt:265-283`, slicing each row with `paramRel.select(selection)`).
-  - But `prepareTxSql` → `prepareRa` hits the parse cache (`XK/query/SqlParser.kt` `singleQueryCache`, 4096), the plan cache (`XC/query.clj` `:plan-cache`, 4096, `PlanCacheKey` = AST + dbs + arg fields + table info) and the emit cache (`:emit-cache` per plan, keyed by scan and param types).
-  - Results are written as Arrow (`writePuts`).
-- Impact: high for parameterised UPDATE/DELETE/ASSERT/INSERT…SELECT batches and for the 1,000-update bitemporal transaction. The per-row cost is a full SQL front end plus a snapshot rebuild.
-- Recommendation:
-  - prepare the mutation once per (SQL text, argument types) and re-execute it with new parameters;
-  - make `TransactionBuffer::snapshot` cheap when nothing new has been written since the last read (it already checks), and when only one row was added (append to a growable builder);
-  - write mutation output batches straight into the transaction's Arrow buffer.
+**What a user sees.**
+Standard SQL snapshot tokens work identically to XTDB and redeem across XTDB and RTDB.
+Placed-database tokens are opaque `rtdb-sealed-snapshot-v4:` strings rejected by XTDB as `xtdb.basis/invalid-basis`, and overlay views refuse snapshot tokens with `0A000`.
 
-### Apply and block flush
+**Where in the code.**
+- `RC/node/src/sql_snapshots.rs` (`SEALED_PREFIX`, `encode`, `decode`, `overlaid`)
 
-- `PartitionState::apply` computes under the write lock (§1).
-- `BlockStore::produce_cancellable` (`R/replication/src/blocks.rs:208-266`) runs as a future inside the driver's select loop, writes tables **sequentially**, and encodes leaves synchronously on the async worker (`write_node`, `BlockPages::copy` → `interleave_distinct_rows`, with a per-row `Value` fallback when chunk schemas differ, `live.rs:319-352`).
-  - XTDB fans tables out on the IO dispatcher (`LiveTable.finishBlock` on `Map<TableRef, LiveTable>`, `XK/indexer/LiveTable.kt`).
-- Impact: medium. Flush time grows with the number of tables, and the per-row fallback applies whenever union legs differ.
-- Recommendation: run block encoding with `spawn_blocking` per table, and fix chunk-schema divergence (§1) so the `interleave` path always applies.
+### 2.6 Replication driver gates, watcher fault recovery, and standalone compactor
 
-### Back-pressure and group commit
+**What differs.**
+RTDB's replication driver keeps upstream's leader/follower election and log-processor pipeline, with several deliberate operational differences:
+- `AppliedPrefix` requires every admitted replica position to apply once and in order before promotion, writer activation, or prefix publication (replacing the deleted SHA-256 digest chain).
+- The term fence uses an explicit `Voided` state and checked arithmetic instead of upstream's `Long.MAX_VALUE` sentinel.
+- Read-back identity matches staged writes by SHA-256 frame fingerprint and pointer identity (`readback_identity`) rather than `txId` alone.
+- Progress watchers continue serving already-applied prefixes after a driver fault, fail only unmet waits, and clear the terminal fault on explicit driver restart (`clear_terminal`), whereas upstream `Watchers.notifyError` fails every subsequent await.
+- On term-fencing journals (Logkeeper, placed deployments), leadership promotes only with an external writer grant and an empty read.
+- `BlockCutter`'s row count tracks applied rows rather than advancing at resolve time.
+- RTDB adds `wire_await_time` (awaiting by system time), catalog/serving checkpoints, offline journal repair (`repair-checkpoint`, `retain-repair-base`), and an active standalone `compactor` command that opens followers and publishes for a separate writer.
 
-- The two are comparable: `command_capacity` 64, deferred commands ≤ 128, held replica records capped by `pending_block_records`/bytes. Log fsync batches up to 10 in both.
-- The measured concurrent-writer throughput is level (1,507 vs 1,517 tx/s).
+**Why.**
+These changes harden leader handoff, avoid sentinel-overflow edge cases, prevent already-committed reads from failing after a recoverable fault, and support hosted and standalone compactor topologies.
 
----
+**What a user sees.**
+Awaits on already-applied transactions survive a driver fault and resume after restart.
+Offline repair and active standalone compaction work out of the box without a live leader in the same process.
 
-## 9. Compaction and GC
+**Where in the code.**
+- `RC/replication/src/applied_prefix.rs`
+- `RC/replication/src/driver.rs`
+- `RC/replication/src/progress.rs` (`clear_terminal`)
+- `RC/replication/src/readback_identity.rs`
+- `RC/replication/src/repair.rs`
+- `RC/node/src/node.rs` (`wire_await_time`)
 
-- **Job selection: equivalent.**
-  - RTDB `R/maintenance/src/job.rs` `available_jobs`: L0 + partial L1 → L1 (recency-partitioned), L1H → L2H, fan-out of 4 per level by part, 1024-row pages.
-  - This mirrors `XC/compactor/job_calculator.clj` and `dev/doc/compaction.allium`.
-- **Merge: divergent.**
-  - RTDB `SegmentCompactor::execute` (`R/maintenance/src/merge.rs:230-322`) decodes every input row into `StoredEvent` (`events.read_event(row)`), deep-clones each output event, re-encodes through `copy_event_batch_with_recency`, then decodes and re-encodes again in `merge/layout.rs` `normalize`.
-  - Inputs are first downloaded to temp files in 1 MB chunks, even from `LocalStore`.
-  - XTDB `XK/compactor/SegmentMerge.kt` copies with vector-level `rowCopier`s (`OutWriter.kt`) over pages loaded through the buffer pool.
-- **Threading: divergent.**
-  - RTDB `CompactionDriver::run` (`R/maintenance/src/driver.rs:71-133`) polls jobs as futures in one `FuturesUnordered` on one task. With no `spawn` or `spawn_blocking`, `compaction_threads = 2` gives concurrency but not parallelism. CPU work and blocking `std::fs` I/O run on a tokio worker, broken up only by a `yield_now`.
-  - XTDB runs on `ioDispatcher.limitedParallelism(threadCount)` with CPUs/2 threads (`XK/compactor/Compactor.kt:181`).
-- **Impact:** very high on compaction throughput (inference: about 10× the CPU per row). This produced the measured ingest gap ("compaction decodes and re-encodes every event").
-  - It also stalls whichever queries share that worker.
-  - Most importantly for reads, it lets L0 files accumulate, so every point lookup visits more files (§3).
-- **GC:** comparable. `R/maintenance/src/gc.rs` (`TrieCollector`, `BlockCollector`, `buffer_unordered`) versus `XK/garbage_collector/`.
-- **Recommendation:**
-  - merge columnar: per output page, gather `(source page, row)` indices in IID/system-time order, then `interleave` columns, the same as `BlockPages::copy`;
-  - run each job on `spawn_blocking` or a dedicated rayon/thread pool sized by `compaction_threads`;
-  - read inputs through the range-reading buffer pool rather than temp-file downloads.
+### 2.7 Additional log backends and native Kafka Connect plugin model
+
+**What differs.**
+Alongside InMemory, Local, ReadOnlyLocal, and Kafka, RTDB adds Logkeeper quorum logs, `logkeeper-consensus://`, Multi hosted journals, and FileJournal.
+For Kafka, RTDB uses `librdkafka` (translating Java client properties and refusing `transactional.id`; JVM JAAS mechanisms `GSSAPI` and `OAUTHBEARER` are not implemented).
+For Kafka Connect sources, RTDB replaces dynamic JVM classloading with a closed native registry of converters (String, primitives, ByteArray, JSON, Confluent Avro, JSON Schema), SMTs (Cast, Flatten, Timestamp, etc.), and three predicates, returning `xtdb.kafka-connect-source/plugin-class-not-found` for unknown classes, and adds schema-registry data-contract rules with a DLQ producer.
+
+**Why.**
+A native Rust binary cannot load arbitrary Java JARs from a classpath and needs native quorum-log backends for hosted Multi clusters.
+
+**What a user sees.**
+Custom Java Kafka Connect converters/SMTs and JVM JAAS (`GSSAPI`/`OAUTHBEARER`) are rejected at configuration time.
+Built-in Connect pipelines gain schema-registry data-contract rules and DLQ support without a JVM.
+
+**Where in the code.**
+- `RC/logkeeper/src/`
+- `RC/journal-logkeeper/src/`
+- `RC/kafka/src/config.rs`
+- `RC/kafka/src/connect/converter.rs`
+- `RC/kafka/src/connect/transforms.rs`
+- `RC/kafka/src/connect/registry/`
 
 ---
 
-## 10. Front ends
+## 3. SQL dialect, XTQL, types, and error reporting
 
-### Connection model
+### 3.1 SQL parser architecture and deliberate SQL extensions
 
-- XTDB `XC/pgwire.clj` (`serve`, `conn-loop`, `start-client-reader!`): one virtual-thread handler per connection plus a reader thread with a 64-message queue. Concurrent connections are capped by `num-threads`. Output goes through a 1 KiB `BufferedOutputStream` (`XC/pgwire/io.clj` `socket-buffer-size`).
-- RTDB `R/pgwire/src/server.rs`, `connection.rs`: a tokio task per connection with a reader task and `mpsc::channel(64)`, and a 64 KiB `BufWriter`.
-- RTDB's model is equivalent or better: fewer syscalls and no connection ceiling. Query execution runs on the connection task, i.e. on runtime workers.
+**What differs.**
+Upstream XTDB parses every statement with ANTLR (`Sql.g4`) and Clojure visitors.
+RTDB parses queries and DML with a vendored `sqlparser-rs` (`0.63`) plus a hand-written control parser (`parse_control`), re-parsing rejected constructs through a ported ANTLR `directSqlStatement` recognizer (`grammar_rejected`) to preserve upstream parse errors.
+RTDB deliberately accepts several SQL extensions that upstream rejects:
+- optional column types in `CREATE [OR ALTER] TABLE` (contributing nullable types to the catalog without constraining writes);
+- `CREATE`/`DROP` DDL for `SEARCH INDEX`, `VECTOR INDEX`, and ordered `INDEX`, plus `RTDB_SEARCH`, `RTDB_NEAREST`, `RTDB_HYBRID` table functions and full-text, vector, and spatial scalar functions;
+- `COPY (query) TO STDOUT WITH (FORMAT 'arrow-stream')` (plus a `/* rtdb-history-label-dictionary-v1 */` variant);
+- scalar subqueries in `UPDATE ... SET`;
+- internal helpers `epoch_nanos_be` and `_id_eq_any`.
+In addition, `RECORDS` emits columns in first-seen key order rather than hash-set iteration order, and constructs where upstream crashes with raw JVM exceptions (unsupported window forms, `MIN`/`MAX` on decimal or time, `SUM` on `i8`/`i16`, set equality) return structured `Unsupported` errors (`xtdb/sql-unsupported`).
 
-### Parse, plan and emit caching
+**Why.**
+The extensions expose RTDB's secondary indexes, Arrow streaming export, and typed table declarations while keeping standard XTDB SQL rejections intact.
+Deterministic `RECORDS` column ordering and structured `Unsupported` errors avoid accidental JVM-specific behaviour.
 
-- **XTDB:**
-  - parse cache by SQL string (`XK/query/SqlParser.kt:66-80`);
-  - plan cache (`XC/query.clj` `->query-source`, `PlanCacheKey`);
-  - emit cache per plan (`emit-query`);
-  - DML skeleton cache and `table-chains-cache` (`XC/sql.clj:3388`).
-- **RTDB:**
-  - `PreparedSql` (`R/node/src/statement.rs`) keeps its last optimized `PreparedQuery` and reuses it while its planning options and catalog lookups replay the same.
-  - The node's `SharedPlans` (`R/query/src/shared_plans.rs`) shares query plans between sessions: preparing or rebinding a statement reuses a plan with the same source and planning options whose recorded catalog lookups replay the same answers, so a new pgwire Parse or Flight request for a known query skips binding and optimization.
-  - It holds 128 plans in a budget of 1/64 of the execution budget, capped at 16 MiB; DML, `EXPLAIN` and transaction-resolver plans are not shared.
-  - Each statement is still parsed once per preparation; there is no parse cache keyed by SQL text, and no emit cache.
-- **Impact:** medium for short queries prepared afresh per request; parsing remains a per-preparation constant.
-- **Recommendation:**
-  - share DML plans prepared once per (SQL text, argument types) through the transaction resolver;
-  - cache parsed syntax by SQL text ahead of the plan cache.
+**What a user sees.**
+Queries using these extensions run on RTDB but fail with parse or planning errors on upstream XTDB.
+Unsupported constructs return clean `0A000` errors instead of JVM `UnsupportedOperationException` traces, and `RECORDS` output columns appear in deterministic first-seen order.
 
-### Result encoding
+**Where in the code.**
+- `RC/sql/src/dialect.rs`
+- `RC/sql/src/control.rs`
+- `RC/sql/src/bind.rs`
+- `RC/sql/src/parser/`
+- `RC/pgwire/src/copy.rs`
+- `RC/sql/README.adoc`
 
-- XTDB `cmd-exec-query` → `serialize-row` → `PgType.writeBinary/writeText(env, rdr, idx)` reads straight from the vector reader (`XK/pgwire/PgType.kt`).
-- RTDB `ProtocolSession::stream` (`R/pgwire/src/protocol.rs:369`), per cell:
-  - reads a `Value` (`read_value_as`);
-  - calls `rtdb_pg_codec::encode`, which takes another `MemoryBudget` reservation, allocates a `Vec<u8>`, and for `Default`/JSON columns runs `to_ascii_lowercase` per cell (`R/pg-codec/src/output.rs:28-49`);
-  - writes separately with `write_i32` + `write_all`.
-  - There is also a reservation per row.
-- Impact: medium-high for wide or long results.
-- Recommendation: encode from `ArrayRef` by column type into a reused row buffer, with one reservation per batch.
+### 3.2 Regex safety limits and XTQL reader / host-form whitelist
 
-### Ingest and parameter batches
+**What differs.**
+Upstream XTDB delegates regexes to `java.util.regex` with no compile or backtracking cap, parses XTQL with the Clojure reader, and splices computed `regexp-replace` patterns directly into Clojure codegen.
+RTDB translates Java regex syntax onto a vendored `fancy-regex` engine plus a UTF-16 interpreter for `\b{g}` and `\R`, enforcing hard limits (64 KiB pattern, nesting 128, repetition 10,000, 128 groups, and backtracking budgets) that fail with `rtdb.expr/regex-limit` (`ProgramLimitExceeded`, `54000`).
+RTDB parses XTQL with its own EDN reader (rejecting `#=`, reader conditionals, regex literals, ratios, and arbitrary Java tags), does not support XTQL percentile aggregates or subqueries in temporal filters, and evaluates computed `regexp-replace` patterns through a whitelisted host-form interpreter (core string/number functions, `java.util.regex.Pattern/quote`, `clojure.string/*`) rather than arbitrary Clojure code.
 
-- Flight SQL bulk ingest:
-  - XTDB: `XK/flight_sql/XtdbProducer.kt` `acceptPutStatementBulkIngest` → `Connection.bulkIngest` → `TxOp.PutDocs` with an Arrow `RelationReader`.
-  - RTDB: `R/flight-sql/src/upload.rs` `documents` turns each batch into `Vec<StructFields<Value>>`, cloning the column name per cell. The resolver then walks documents to compute IIDs (`R/tx/src/source.rs`), and the buffer re-encodes them (§1).
-  - This matches the measured 0.65× Flight SQL bulk ingest.
-- `executemany` over Flight SQL collapses into one argument batch on both sides, but RTDB's `SqlArguments` is rows of `Value`, and the resolver then re-plans per row (§8).
-- Pipelined pgwire Executes run one tx op each on both sides.
-- Recommendation: keep `PutDocs` documents as an Arrow `RecordBatch` from upload through the source log (already Arrow IPC, `R/tx/src/ipc.rs`) into `IndexBatch`, computing IIDs column-wise.
+**Why.**
+Hard regex limits prevent catastrophic backtracking DoS on native worker threads.
+A non-JVM engine cannot execute arbitrary Clojure reader macros or host expressions.
+
+**What a user sees.**
+Pathological or oversized regex patterns fail with SQLSTATE `54000` (`rtdb.expr/regex-limit`) instead of hanging.
+XTQL queries relying on arbitrary Clojure host forms or reader macros fail at parse or bind time.
+
+**Where in the code.**
+- `RC/expr/src/string/pattern.rs`
+- `RC/expr/src/evaluate/invocation/host.rs`
+- `RC/xtql/src/edn.rs`
+- `RC/xtql/src/ast.rs`
+
+### 3.3 Bundled OpenJDK time-zone database and `RTDB_TZDB_FILE`
+
+**What differs.**
+Upstream XTDB uses whichever `lib/tzdb.dat` the host JDK provides.
+RTDB compiles in OpenJDK `tzdb.dat` (`2026e`, overridable at build time via `RTDB_TZDB_PATH`) and decodes it lazily on first region lookup.
+At runtime, the server and Multi binaries install an optional `RTDB_TZDB_FILE` path at startup to replace the bundled database without rebuilding.
+Legacy `java.util.Date` text parsing is ported from OpenJDK 25 CLDR tables in `rtdb-java-date`.
+
+**Why.**
+A standalone native binary has no JDK installation to supply `tzdb.dat` and still needs an operator-replaceable zone database.
+
+**What a user sees.**
+Time-zone transitions can differ from an XTDB node running on a JDK with a different IANA tzdb version unless both use the same `tzdb.dat`.
+An unreadable `RTDB_TZDB_FILE` fails with `xtdb/tzdb-unavailable` on the first region lookup rather than aborting startup.
+
+**Where in the code.**
+- `RC/types/src/zone.rs` (`install_tzdb_file`, `tzdb_version`)
+- `RC/types/build.rs`
+- `RC/server/src/config/mod.rs`
+- `RC/java-date/src/`
+
+### 3.4 Host locale source for `UPPER` and `LOWER`
+
+**What differs.**
+Upstream XTDB uses `Locale.getDefault()` (which can be overridden with `-Duser.language`) for locale-sensitive `UPPER`/`LOWER` rules.
+RTDB reads the host process display locale once at startup (`LC_MESSAGES` on Linux, host locale on macOS) and falls back to the root locale if the host locale cannot be read, with no `-Duser.language`-style override flag.
+
+**Why.**
+Reading the OS locale once matches the JVM's default behaviour without adding JVM-specific system-property flags.
+
+**What a user sees.**
+Turkish, Azeri, and Lithuanian case mappings follow the OS process locale (set via `LC_ALL`/`LC_MESSAGES` on Linux) rather than a JVM property.
+A host with no readable locale starts normally and uses root Unicode case mapping.
+
+**Where in the code.**
+- `RC/expr/src/string.rs` (`case_language`, `language_or_root`)
+- `RC/java-date/src/date_platform.rs` (`process_language`)
+
+### 3.5 Extended scalar types and RTDB-specific error codes and SQLSTATEs
+
+**What differs.**
+Upstream XTDB rejects half-floats and maps unsigned Arrow integers onto signed vectors; its pgwire layer maps unknown `Incorrect` errors to `08P01` and Arrow OOMs to `XX000`.
+RTDB's `ScalarType` includes `U8`–`U64` (reinterpreted as signed integers during execution) and `F16` (raising `rtdb/jvm-half-float` where upstream fails).
+RTDB matches upstream's `XX000` (logged at ERROR) for memory exhaustion (`AnomalyKind::ResourceExhausted`), while mapping RTDB-only limit and range kinds to PostgreSQL-specific SQLSTATEs: `53400` (`ConfigurationLimitExceeded`), `54000` (`ProgramLimitExceeded`), and `22003` (`NumericValueOutOfRange`).
+RTDB also emits `rtdb*` error codes for RTDB-only checks, with a workspace source test pinning the small allow-list of limit-shaped codes that legitimately keep `08P01`.
+
+**Why.**
+PostgreSQL clients benefit from distinct SQLSTATEs (`53400`, `54000`, `22003`) for RTDB-only configuration, program, and integer-width limits while preserving exact XTDB SQLSTATEs for every upstream error and for OOM.
+
+**What a user sees.**
+Exceeding an opt-in spill cap reports `53400`, hitting regex/expression/plan/batch size limits reports `54000`, and overflowing a pgwire integer width reports `22003`.
+Out-of-memory failures report `XX000` and are logged at ERROR, matching XTDB.
+
+**Where in the code.**
+- `RC/types/src/logical.rs` (`ScalarType`)
+- `RC/types/src/error.rs` (`AnomalyKind`)
+- `RC/pgwire/src/error.rs` (`classify`, `kind_state`, `LIMIT_SHAPED_PROTOCOL_VIOLATIONS`)
+- `RC/pg-codec/src/output.rs` (`integer_in_range`)
 
 ---
 
-## 11. Concurrency model and memory management
+## 4. Query engine, accelerators, and memory model
 
-### Runtime
+### 4.1 Explicit memory budget, opt-in spill quota, and deterministic spill thresholds
 
-- RTDB runs one multi-threaded tokio runtime (`R/server/src/main.rs`). Per database there are a replication driver task, a compaction driver task, GC tasks and log writers (`R/node/src/database.rs:160-247`). Blocking file I/O goes through `IoRegion::run` → `spawn_blocking`.
-- These CPU-heavy paths run inline on async workers: compaction, block encode, query execution.
-- XTDB uses virtual threads for connections and coroutine dispatchers (`Dispatchers.IO`, `limitedParallelism`) for compaction and block writes.
-- Impact: a long compaction or block-encode step can delay unrelated queries on the same worker (inference).
+**What differs.**
+Upstream XTDB splits memory by JVM ergonomics (heap plus `0.9 ×` max direct memory with per-query Arrow child allocators) and has no spill cap.
+RTDB enforces one explicit byte ceiling (`--memory-limit` or `RTDB_MEMORY_LIMIT_BYTES`, defaulting to half of physical or cgroup memory, or 1 GiB when unknown; embedded `NodeOptions::default` uses 512 MiB execution + 256 MiB cache).
+Reservations account for Arrow buffers, rows, cells, log frames, and operator scratch up to the root budget.
+Spill is unlimited by default (`QueryOptions::UNLIMITED_SPILL`), matching XTDB, with an opt-in per-query limit via `query.spillLimitBytes` or `RTDB_QUERY_SPILL_LIMIT_BYTES`.
+Spill decisions use only fixed `QueryOptions` thresholds (`sort_memory_bytes = 64 MiB`, `join_build_rows = 100_000`, `materialized_spill_rows = 100_000`), never free budget bytes, and `GROUP BY`, aggregates, and `DISTINCT` stay in memory as in XTDB.
+A refused allocation fails the query rather than silently switching strategy (except cache admission and optional search accelerators).
 
-### Lock hot spots in RTDB
+**Why.**
+A native process has no GC heap or JVM direct-memory cap, so explicit admission control prevents OS OOM kills while keeping query plans deterministic for a given configuration.
 
-- `PartitionState.value: RwLock<Arc<PartitionValue>>`: written during apply, `add_tries` and `adopt_block` with the computation inside the lock (`R/index/src/partition.rs`).
-- `LiveTable.located: Mutex<HashMap>`, taken per leaf per scan (`live.rs:170`).
-- `TransactionBuffer.segments: Mutex`, taken per in-transaction read.
-- The three global scan cache mutexes, plus `BufferPool.entries` and `DiskCache.state`.
-- `node/src/catalog.rs` `RwLock<Arc<DatabaseSet>>`.
-- XTDB's equivalents are lock-free persistent values (`StateFlow` + `PersistentHashMap`), `ConcurrentHashMap` and Caffeine.
+**What a user sees.**
+Memory-heavy queries can fail with `rtdb/memory-budget-exceeded` (`XX000`) at a different threshold than on a JVM with default ergonomics.
+Operators who configure `query.spillLimitBytes` get a hard cap on temporary spill disk usage (failing with `rtdb.query/spill-limit`, SQLSTATE `53400`).
 
-### Memory accounting
+**Where in the code.**
+- `RC/server/src/cli/memory.rs` (`default_memory_limit_bytes`, `cgroup_memory_limit`)
+- `RC/types/src/memory.rs` (`MemoryBudget`)
+- `RC/node/src/config.rs` (`NodeOptions`)
+- `RC/query/src/context.rs` (`QueryOptions`)
+- `RC/server/src/config/mod.rs` (`query_spill_limit`)
 
-- XTDB:
-  - each query gets a child `BufferAllocator` (`XC/query.clj:439`), and each pgwire connection its own (`XC/pgwire.clj:1673`);
-  - accounting happens per Arrow buffer allocation, which grows geometrically;
-  - operators bound memory by row thresholds.
-- RTDB `R/types/src/memory.rs` `MemoryBudget::reserve`:
-  - allocates an `Arc<MemoryReservation>`, then runs a CAS loop and `fetch_max` on **every ancestor up to one node-wide 512 MiB root** (`R/node/src/config.rs` `execution_memory_bytes`);
-  - `scope()` adds a level without a tighter limit.
-- RTDB reserves at these places:
-  - per `OwnedRow`;
-  - per evaluated row (twice in `evaluate_invocation`);
-  - per cell compared (`rows_equal` → `EvaluationScope::new`, 4 KiB);
-  - per pgwire cell;
-  - per transaction event (`TransactionBuffer::append`);
-  - per compaction row;
-  - per spill row;
-  - many times per scan initialisation;
-  - and through `AllocationScope` (`R/types/src/allocation.rs`), which adds a `Mutex` per reservation.
-- Bounds are deliberately pessimistic: 4 KiB scratch, ×8 and ×64 spill factors, up-front cell-size passes in `ColumnBatch::rows_admitting` (inference: early `rtdb/memory-budget-exceeded` under concurrency).
-- Impact: high CPU in row paths, and cache-line contention on the root counter across all connections and background tasks (inference).
-- Recommendation:
-  - charge per page or per buffer growth through a per-operator lease;
-  - give each query a child budget that batches its charges to the root (e.g. reserve in 1 MiB quanta);
-  - remove the per-cell scope in `rows_equal`.
+### 4.2 Interpreted and column-kernel expression evaluation instead of bytecode codegen
+
+**What differs.**
+Upstream XTDB compiles each expression per input vector schema into Clojure/JVM bytecode and memoises the compiled projection (`emit-projection`).
+RTDB evaluates expressions with one native column evaluator (`RC/query/src/columnar`) backed by a tree-walking scalar interpreter (`RC/expr`) over `Value`.
+There is no JIT codegen and no DataFusion fallback.
+A failing cell raises the scalar's own error, strict calls short-circuit on null in argument order as in XTDB, and `CASE` evaluates each branch only on its selected rows.
+
+**Why.**
+Compiling and loading machine code at query time adds large complexity and attack surface in Rust; column kernels over Arrow buffers cover hot scalar paths while the interpreter guarantees exact XTDB edge-case semantics.
+
+**What a user sees.**
+Query results and error semantics match XTDB, including null short-circuiting and `CASE` laziness.
+CPU-heavy expressions that fall outside the column kernels run slower per row than XTDB's JIT-compiled bytecode, while cold query compilation is faster.
+
+**Where in the code.**
+- `RC/query/src/columnar.rs`
+- `RC/query/src/columnar/functions.rs`
+- `RC/expr/src/evaluate.rs`
+- `RC/expr/src/functions.rs`
+
+### 4.3 Query optimizer, decorrelation edge cases, and `EXPLAIN` output
+
+**What differs.**
+Upstream XTDB runs Clojure zipper rewrites (`logical_plan.clj`, `rewrite.clj`) and formats `EXPLAIN` from those plans.
+RTDB implements its own Rust optimizer (`optimize.rs`, `optimize/decorrelate.rs`), so `EXPLAIN` text and plan structure can differ from XTDB's.
+RTDB ports XTDB's decorrelation rules (rules 1–4, 8, 9, `apply-table-col->unnest`, `select-mark-join->semi-join`, and the push-down rules) with deliberate exceptions:
+- RTDB lifts a correlated selection above an unnest whose list reads no bound parameter (preserving the same rows), which XTDB does not;
+- RTDB does not lift correlated selections from the null-supplying side of an outer join;
+- ungrouped collecting/ordered aggregates under scalar/single/inner/left applies, parameterized percentile fractions, volatile dependent plans, and `PULL`/`PULL_MANY` keep their per-row apply.
+
+**Why.**
+The Rust optimizer targets semantic equivalence and safe decorrelation without replicating Clojure's internal zipper AST verbatim.
+
+**What a user sees.**
+Query results match XTDB, while `EXPLAIN` plans and the row order of unordered queries can differ.
+Correlated shapes on the remaining per-row apply list execute once per outer row.
+
+**Where in the code.**
+- `RC/query/src/optimize.rs`
+- `RC/query/src/optimize/decorrelate.rs`
+- `RC/query/README.adoc`
+
+### 4.4 Plan caching without a global SQL parse or emit cache
+
+**What differs.**
+Upstream XTDB maintains a 4,096-entry SQL parse cache, a 4,096-entry plan cache, per-plan emit caches, and a DML skeleton cache.
+RTDB caches plans per prepared statement (`CachedPlan`, LRU of 4 parameter-type signatures), shares read plans across sessions in `SharedPlans` (128 plans within 1/64 of execution memory, capped at 16 MiB, excluding DML and `EXPLAIN`), and reuses prepared mutations across argument rows in `MutationPlans`.
+RTDB has no global SQL-text parse cache and no bytecode emit cache.
+
+**Why.**
+Rust SQL parsing is lightweight enough to run per preparation while bounded plan caches prevent unbounded memory growth under dynamic workloads.
+
+**What a user sees.**
+Short ad-hoc queries parsed afresh on every request still pay parse time, whereas repeated prepared queries and shared read plans skip binding and optimization.
+
+**Where in the code.**
+- `RC/node/src/statement.rs`
+- `RC/query/src/shared_plans.rs`
+- `RC/query/src/compiled.rs`
+- `RC/tx/src/resolver.rs` (`MutationPlans`)
+
+### 4.5 Scan accelerators: UUID `_id` ranges, IID-ordered `LIMIT`, and top-k sort
+
+**What differs.**
+Upstream XTDB narrows scans on `_id = v` equality only and executes `ORDER BY _id LIMIT n` and general `ORDER BY ... LIMIT n` through its block-based sorter.
+RTDB additionally narrows `_id <`, `<=`, `>`, `>=`, and `BETWEEN` predicates to an IID interval when every `_id` in the table is a UUID (since a UUID is its own big-endian IID).
+Over such tables, `ORDER BY _id LIMIT n` streams scan tasks in ascending or descending IID order with lazy per-leaf statistics and stops once `n` rows are produced.
+For general sorts with `LIMIT <= 12_800` (`top_k_rows`), RTDB uses an in-memory top-k path with early rejection.
+
+**Why.**
+UUID keys already preserve order in the hash trie's IID space, allowing range scans and ordered limits to skip unrelated trie leaves without an extra index.
+
+**What a user sees.**
+UUID range queries, `ORDER BY _id LIMIT n` over UUID tables, and small top-k queries read fewer pages and run faster than on XTDB, while returning the same rows.
+
+**Where in the code.**
+- `RC/query/src/scan.rs` (`id_interval`, `iid_ordered_input`)
+- `RC/query/src/sort.rs` (`SortPlan::top`)
+- `RC/query/src/context.rs` (`top_k_rows`)
+
+### 4.6 Full-text, vector, spatial, and ordered secondary indexes and artefact lane
+
+**What differs.**
+Upstream XTDB has no built-in full-text search, vector search, spatial index, or secondary ordered index subsystem.
+RTDB includes bitemporal full-text search (`rtdb-search`, default feature of `rtdb-node`, `search.writeFormat` 11–16 defaulting to 13 so plain workloads write no entity-history artefacts), IVF vector search (`rtdb-vector`), spatial postings (`rtdb-spatial`), ordered secondary indexes (`ordered-index/v2/`), a background artefact build lane (`artefact_threads`), scan pushdowns (`MATCH`, `ORDER BY search_score DESC LIMIT n`, ordered-index narrowing), and system tables (`xt.search_indexes`, `xt.ordered_indexes`, `xt.vector_indexes`, `xt.ranked_indexes`, `xt.live_trie_artefacts`, `xt.live_ordered_index_storage`).
+
+**Why.**
+RTDB provides native bitemporal retrieval and ranking inside the database without an external search engine.
+
+**What a user sees.**
+Workloads that define no secondary indexes stay on XTDB-compatible storage (with `writeFormat` 13).
+Defining a search, vector, spatial, or ordered index adds artefacts and table-block metadata framed for XTDB refusal (§1.1), and exposes the corresponding SQL functions and `xt.*` catalog tables.
+
+**Where in the code.**
+- `RC/search/src/`
+- `RC/vector/src/`
+- `RC/spatial/src/`
+- `RC/node/src/ordered_index/`
+- `RC/maintenance/src/artefact.rs`
+- `RC/query/src/accelerate.rs`
+- `RC/query/src/rank_cutoff.rs`
+
+### 4.7 Internal execution representations (live chunks, scan merge, metadata, compaction, and cancellation)
+
+**What differs.**
+RTDB implements several core engine internals differently from XTDB while preserving observable query semantics:
+- **Live index:** `LiveTable` stores immutable per-transaction Arrow `IndexBatch` chunks (merging adjacent equal-schema chunks up to `page_limit`, with `PartitionState::apply` building outside the write lock) instead of one growable in-place `Relation`, and `TrieCatalog` clones its `BTreeMap` on change instead of using Clojure persistent maps.
+- **Scan merge and temporal resolution:** `PartitionScan` runs a `BinaryHeap` k-way merge and general `HistoryResolver` polygon calculation rather than per-page `SingleIidSelector` binary search and `AsOfResolver` early exit.
+- **Metadata pruning:** leaf statistics are decoded lazily into `Value` trees (`LeafColumns`) per visited leaf and roaring bloom filters are deserialized per check rather than queried zero-copy.
+- **Value boundaries:** while system columns (`_iid`, `_valid_*`, `_system_*`) are Arrow arrays, spill uses Arrow IPC, and pgwire encodes directly from Arrow where supported, several operators (non-columnar joins, aggregates, window, set ops), DML writes (`TransactionBuffer`), Flight bulk ingest, and compaction merges (`SegmentCompactor`, running parallel jobs on `spawn_blocking`) still convert through owned `Value` / `StoredEvent` trees.
+- **Cancellation:** RTDB uses per-query `CancellationToken` trees and cooperative checks rather than JVM thread interrupts.
+
+**Why.**
+Immutable Rust data structures, cooperative async cancellation, and incremental columnarization fit Rust's ownership model without requiring unsafe shared-memory mutation.
+
+**What a user sees.**
+Query semantics match XTDB.
+Performance profiles differ: RTDB starts faster and uses less memory, while heavy joins, multi-file point lookups, non-columnar expressions, and high-throughput compaction can spend more CPU than XTDB's end-to-end vector paths.
+
+**Where in the code.**
+- `RC/index/src/live.rs`
+- `RC/index/src/partition.rs`
+- `RC/index/src/trie_catalog.rs`
+- `RC/query/src/scan.rs`
+- `RC/temporal/src/lib.rs`
+- `RC/format/src/metadata.rs`
+- `RC/query/src/page_metadata.rs`
+- `RC/maintenance/src/merge.rs`
+- `RC/maintenance/src/driver.rs`
+- `RC/flight-sql/src/upload.rs`
 
 ---
 
-## 12. Other divergences found
+## 5. Protocols, APIs, security, and deployment
 
-- **Cancellation checks.** Most row operators check cancellation per row (`check_cancelled`, which takes the token's lock per its comment). Only the scan heap uses `check_cancelled_at` (every N rows). XTDB checks by thread interrupt. Low-medium.
-- **Fused filters under profiling.** Tracing and EXPLAIN ANALYZE run the production plan, including fused stacked filters (`R/query/src/operators.rs`); EXPLAIN ANALYZE reports each fused `select`, while a trace has one span for the stack where XTDB has one per `select`.
-- **Different block-size defaults.** `rows_per_block` is 100,000 in `ReplicationConfig::default` (`R/replication/src/driver.rs:51`) and 102,400 in server config. This is harmless, but embedded and server nodes cut blocks at different points.
-- **Data files are validated on first decode** (`scan.rs` `load`, IID-order check per row). XTDB trusts its own files. This is a one-off cost per page thanks to the page cache.
-- **Better than XTDB in RTDB:**
-  - startup (no JVM, no class loading);
-  - footprint;
-  - the 64 KiB pgwire buffer;
-  - top-k up to 10,000;
-  - a per-page `interleave` gather for flat columns that beats XTDB's full scans to the client;
-  - no connection ceiling.
+### 5.1 pgwire connection model, `COPY IN` limit, and RTDB protocol extensions
 
----
+**What differs.**
+Upstream pgwire uses virtual threads capped by `num-threads` with a 1 KiB socket buffer and spools `COPY FROM STDIN` to an unbounded temp file.
+RTDB runs one Tokio task plus a 64-message reader task per connection with a 64 KiB `BufWriter`, `TCP_NODELAY`, and no thread ceiling, and caps `COPY FROM STDIN` at `maximum_copy_bytes` (1 GiB by default).
+RTDB also accepts opt-in startup parameters (`rtdb.capability`, `rtdb.require_installation`, `rtdb.gateway_*`), emits `rtdb.delegable` ParameterStatus and custom `'Y'` backend messages when opted in, and enforces TLS on installed standalone/multi listeners (`require_tls`).
 
-## Ranked divergences by likely performance cost
+**Why.**
+Async tasks and 64 KiB buffering reduce syscall overhead and remove connection caps; capping `COPY IN` bounds untrusted disk usage; startup extensions support Multi gateways and capability-scoped sessions.
 
-Ranking is impact × breadth, judged from the code and the benchmark pattern (inference throughout).
+**What a user sees.**
+Standard PostgreSQL clients see XTDB-compatible pgwire behaviour with lower connection overhead.
+A `COPY FROM STDIN` exceeding 1 GiB is rejected, and plaintext connections to an installed TLS listener are refused.
 
-| # | Divergence | Where it costs | One-line recommendation | Files |
-| --: | --- | --- | --- | --- |
-| 1 | Point-lookup scan walks every row of each candidate leaf through a heap and the full polygon resolver, per file: no in-page IID binary search, no as-of early exit | Point lookups, UPDATE/DELETE by `_id`, read-your-write; grows with files and versions. Not the measured 1M-row gap: `buffer_task` binary-searches each page to its task's IID range and drops rows outside `scan.iids` before resolving, so the per-row cost is the heap | Port `SingleIidSelector`/`MultiIidSelector` and `AsOfResolver`; skip leaves with no candidate IID before loading | `R/query/src/scan.rs` (`buffer_task`, `initialize`), `R/temporal/src/lib.rs` (`HistoryResolver`); ref `XK/operator/scan/ScanCursor.kt`, `SingleIidSelector.kt`, `EntityResolver.kt` |
-| 2 | `BufferPool::get` reads the whole object into heap memory, then pages are copied again and cached a second time decoded | Cold reads over L1/L2 files (100 MB target against a 256 MB pool), cache thrash, memory | Footer/layout cache plus per-page range reads (pread/mmap/`get_range`); single decoded-page tier | `R/storage/src/cache.rs`, `R/format/src/ipc.rs` (`read_block`), `R/query/src/scan.rs` (`load`, `metadata_cache`), `R/storage/src/disk_cache.rs` |
-| 3 | No parse or emit cache, and query plans are shared between sessions only through `SharedPlans`; DML re-parses and re-plans per argument row and rebuilds the tx snapshot per row | Every short query, every pgwire Execute and Flight DoGet, batched DML | Parse cache; prepare mutations once per (SQL, arg types) | `R/node/src/statement.rs`, `R/pgwire/src/protocol.rs`, `R/flight-sql/src/execute.rs`, `R/tx/src/resolver.rs:285-370`, `R/index/src/live.rs` (`TransactionBuffer::snapshot`) |
-| 4 | Row-at-a-time `Value` operators: joins, aggregates, distinct, window, set ops, unnest all copy `OwnedRow`s; `BatchJoin` covers a narrow case | Joins (0.43×, 4.5× at 1M), group-by, anything above a scan | Make the batch path the default for joins and aggregates: Arrow keys, group-id vectors, `take` outputs | `R/query/src/join.rs`, `join_storage.rs`, `batch_join.rs`, `aggregate.rs`, `operators.rs`, `cursor.rs` |
-| 5 | Interpreted expressions with per-call name lowering, type checking and allocations; kernels exclude unions with string legs, temporal and extension types; fallback materialises every column | Filters and projections over union `_id` (pgwire), temporal columns and functions | Resolve calls at prepare; borrow cells; materialise only read columns; cache DataFusion lowering; extend kernels to unions and timestamps | `R/expr/src/evaluate*.rs`, `functions.rs`, `R/query/src/columnar.rs` (`kernel`, `BatchFilter`), `vector.rs`, `context.rs` |
-| 6 | Compaction decodes every event to `Value`, re-encodes twice, and runs as futures on one tokio task (no parallelism) | Ingest throughput, worker stalls, L0 backlog that worsens #1 | Columnar index gather plus `interleave`; run jobs on a blocking pool sized by `compaction_threads` | `R/maintenance/src/merge.rs`, `merge/layout.rs`, `driver.rs`; ref `XK/compactor/SegmentMerge.kt`, `OutWriter.kt` |
-| 7 | Spill is per-row `serde_json`; four operators rescan a spill file per row or group (INTERSECT/EXCEPT, DISTINCT aggs, ARRAY_AGG/PERCENTILE, window partitions); sort spills after 8 MiB | Any large query; asymptotic blow-ups | Arrow IPC spill; hash structures instead of rescans; count sort blocks by rows | `R/query/src/spill.rs`, `operators.rs` (`SetCursor`), `aggregate.rs`, `window.rs`, `sort.rs`, `context.rs:112` |
-| 8 | Fine-grained `MemoryBudget` reservations (Arc plus CAS chain to the node root) per row, cell, event and comparison | CPU everywhere in row paths; cross-connection contention | Per-operator leases charged per page; per-query child budget reserving in quanta | `R/types/src/memory.rs`, `allocation.rs`, callers throughout `R/query`, `R/pgwire`, `R/pg-codec`, `R/index/src/live.rs` |
-| 9 | System columns (`_valid_*`, `_system_*`, `_iid`) gathered as `Value` with a `String` timezone per cell; nested columns too | Temporal queries, all DML inputs, history queries | Emit `TimestampMicrosecondArray` and `FixedSizeBinaryArray` | `R/query/src/columnar.rs` (`gather`, `time`) |
-| 10 | Write path is Arrow → `Value` documents → Arrow (Flight ingest, PutDocs, DML results, `TransactionBuffer`); live chunks split by union-leg schema differences | Bulk ingest (0.65× Flight), per-transaction apply, block flush fallback | Keep documents as Arrow end to end; widen union legs so chunks merge | `R/flight-sql/src/upload.rs`, `R/tx/src/resolver.rs`, `R/tx/src/source.rs`, `R/index/src/live.rs` |
-| 11 | Leaf metadata materialised as `Value` trees; page tests by string search; bloom bitmaps deserialised per check | Point lookups and filtered scans over many files | Arrow-resident statistics with a per-file `(col, page)` index; zero-copy bloom test | `R/format/src/metadata.rs`, `R/query/src/page_metadata.rs`, `R/query/src/pushdown.rs`, `R/format/src/bloom.rs` |
-| 12 | pgwire encodes Arrow → `Value` → `Vec<u8>` per cell with reservations and lowercase per cell | Wide or long pgwire results | Encode from `ArrayRef` into a reused buffer | `R/pgwire/src/protocol.rs` (`stream`), `R/pg-codec/src/output.rs`, `R/pgwire/src/wire.rs` |
-| 13 | Global mutex caches with String keys and O(n) retain/evict per insert; `BufferPool` and disk cache sort or rescan under lock | Concurrent readers, large scans | Sharded or lock-free cache (`moka`), interned keys, O(1) LRU | `R/query/src/scan.rs` (`metadata_cache`), `R/storage/src/cache.rs`, `disk_cache.rs` |
-| 14 | `PartitionState::apply`, `add_tries` and `adopt_block` compute under the write lock; the trie catalog is deep-cloned per change; located-leaf cache reset per commit | Read latency under write load; grows with tries | Compute outside the lock and swap; persistent maps; keep leaf caches across appends | `R/index/src/partition.rs`, `trie_catalog.rs`, `live.rs` |
-| 15 | Log replay tail reads one record per two opens and two `spawn_blocking`s; startup scans the whole log | Single-row tx latency; startup time grows with log size | Persistent handle with batched reads; read the trailer at startup | `R/storage/src/log/local.rs`, `R/replication/src/driver.rs` |
-| 16 | Publication: tempfile + fsync + copy + fsync locally; temp-key multipart + server-side copy + delete remotely, with sequential parts; sequential 1 MB GETs on disk-cache miss | Block flush, compaction output, cold remote reads | Rename into place; parallel parts to the final key; one streamed GET | `R/storage/src/object_store.rs`, `remote.rs`, `disk_cache.rs`, `R/replication/src/blocks.rs` |
-| 17 | Block production encodes tables sequentially on the driver task | Flush pauses with many tables | `spawn_blocking` per table | `R/replication/src/blocks.rs` |
-| 18 | `equality_hash` gave every temporal-valued row the same hash (fixed, except for sets and maps holding a date-time) | DISTINCT/UNION on temporal columns became O(N²) | Hash a normalised instant | `R/query/src/operators.rs` `equality_cell_hash` |
+**Where in the code.**
+- `RC/pgwire/src/config.rs` (`maximum_copy_bytes`)
+- `RC/pgwire/src/connection.rs`
+- `RC/pgwire/src/copy.rs`
+- `RC/pgwire/src/protocol.rs`
+
+### 5.2 Flight SQL extensions, signed inspection tickets, and Flight TLS
+
+**What differs.**
+RTDB's Flight SQL `run` and `empty` tickets now use upstream XTDB's unsigned JSON `QueryTicket` format and redeem across sessions, restarts, and XTDB/RTDB peers (emitting RTDB-only `"searchPath"` and `"awaitFloor"` keys only when they differ from defaults).
+Three deliberate RTDB extensions remain:
+- control inspections (`SHOW`) issue HMAC-signed, session-bound `"inspect"` tickets that expire with the session;
+- `ListActions` advertises `rtdb.v1.*` (and, when enabled, `rtdb.store.v1`, `rtdb.owned.*`, `rtdb.custody.v1`, `rtdb.admin.v1`, and hosted DoExchange uploads) alongside the standard Flight SQL actions;
+- Flight handles bind to caller identity, and Flight SQL supports TLS on standalone, loopback-TLS, and private Multi listeners.
+
+**Why.**
+`SHOW` commands read session state that cannot safely be replayed by another caller, while native v1, admin, and hosted protocols share the Flight transport.
+
+**What a user sees.**
+Standard Flight SQL / ADBC queries produce and accept XTDB-compatible JSON tickets.
+`ListActions` includes additional `rtdb.*` actions, and inspection tickets cannot be shared across sessions or restarts.
+
+**Where in the code.**
+- `RC/flight-sql/src/ticket.rs`
+- `RC/flight-sql/src/service.rs`
+- `RC/flight-sql/src/admin.rs`
+- `RC/flight-sql/src/server.rs`
+
+### 5.3 Authentication extensions and bounded Argon2 admission queue
+
+**What differs.**
+Upstream XTDB verifies Argon2id passwords on the JVM heap with unbounded concurrency, uses JSSE for TLS keystores, and has no per-database ACL grants or workload OIDC tag.
+RTDB verifies passwords through `PasswordAdmission`, which runs at most one verification per CPU core on `spawn_blocking` against its own dedicated memory budget (sized to `cores × costliest configured hash`) so logins queue instead of competing with query memory.
+RTDB adds per-database `grants` (`DENY`/`READ`/`READ_WRITE`), OIDC `issuerCaCertificate`/`workloadGrants`/`!ManagedWorkloadOidc`, per-database signed-claim key vaults, and native JKS/PKCS12 decoding over `rustls`/`aws-lc-rs`.
+
+**Why.**
+Unbounded 64 MiB Argon2id verifications can OOM a memory-budgeted native process during login storms.
+Per-database grants and workload OIDC support multi-tenant hosted deployments.
+
+**What a user sees.**
+Standard `TRUST`, `PASSWORD`, `DEVICE_AUTH`, and `CLIENT_CREDENTIALS` flows behave as in XTDB, except login bursts queue smoothly at one verification per core rather than failing or exhausting query memory.
+TLS cipher negotiation uses `rustls`/`aws-lc-rs` instead of JSSE.
+
+**Where in the code.**
+- `RC/auth/src/password.rs` (`PasswordAdmission`)
+- `RC/auth/src/lib.rs` (`authorize_database`)
+- `RC/auth/src/managed_workload_oidc.rs`
+- `RC/tls/src/`
+
+### 5.4 Embedded APIs, CLI commands, configuration extensions, and Multi cell runtime
+
+**What differs.**
+Upstream XTDB embeds via `Xtdb.openNode`, `Xtdb.Connection`, Clojure `xtdb.api`, classpath config discovery, EDN with `#env`, and JVM extension hooks (`!Edgar`, `!Gleif`, `!Recording`, `allocator`, `spanProcessor`, `instantSource`).
+RTDB exposes a C ABI (`rtdb-ffi`, `include/rtdb.h`) and a JDK 25 FFM binding (`bindings/jvm`) providing ADBC and Clojure `Connectable` only, rejecting JVM config objects and extension tags; config loading performs no classpath search and treats EDN as data-only.
+RTDB adds CLI subcommands (`dev`, `standalone`, `initialize-standalone`, `admin`, `classic-opening`, `native-dependent-custody`, `repair-checkpoint`, `retain-repair-base`, `inspect`, `--memory-limit`, `--build-info`), JSON output for file inspectors, the offline `rtdb-config` qualification binary, RTDB-only YAML keys and environment variables, and the separate `rtdb-multi` shared-cell runtime (`multiCheckpoints: {deferred, binary}`, binary branch records, gateways, logkeeper quorums, and deployment admin RPCs).
+
+**Why.**
+A native Rust engine cannot host arbitrary JVM extension plugins and needs native C/FFM embedding, offline config checks, and a multi-tenant cell runtime.
+
+**What a user sees.**
+JVM callers must connect via ADBC, pgwire, Flight SQL, or the FFM `Connectable` binding rather than `Xtdb.openNode` with custom JVM modules.
+YAML files using RTDB-only keys (such as `search.*`, `grants`, `query.spillLimitBytes`, `defaultV1Serving`, or `multiCheckpoints`) are rejected by upstream XTDB, and configs using JVM-only tags are rejected by RTDB.
+
+**Where in the code.**
+- `RC/ffi/src/`
+- `RC/ffi/include/rtdb.h`
+- `bindings/jvm/`
+- `RC/server/src/cli.rs`
+- `RC/server/src/config/mod.rs`
+- `RC/server/src/standalone.rs`
+- `RC/config/src/`
+- `RC/multi/src/`
+
+### 5.5 Runtime version build metadata (`+rtdb.<pkg>`)
+
+**What differs.**
+Upstream XTDB reports `2.x-SNAPSHOT` (or `XTDB_VERSION`) in `version()`, `XT.VERSION`, and Flight `SqlInfo`.
+When `XTDB_VERSION` is unset, RTDB reports `2.x-SNAPSHOT+rtdb.<CARGO_PKG_VERSION>` (currently `2.x-SNAPSHOT+rtdb.0.1.0`), while `--build-info` reports the native crate version `0.1.0`.
+Setting `XTDB_VERSION` overrides runtime version output identically to XTDB.
+
+**Why.**
+Semver build metadata identifies the native RTDB release while keeping version-parsing clients compatible with XTDB `2.x`.
+
+**What a user sees.**
+`SELECT version()` returns `PostgreSQL 16 (XTDB 2.x-SNAPSHOT+rtdb.0.1.0)` unless `XTDB_VERSION` is set.
+
+**Where in the code.**
+- `RC/types/src/version.rs` (`DEFAULT_RUNTIME_VERSION`, `install_runtime_version`)
+
+### 5.6 Container runtime, backend Cargo features, and cluster configurations
+
+**What differs.**
+Upstream XTDB ships an Alpine image running as user `xtdb` (UID/GID 20000) on a custom JRE with runtime backend modules.
+RTDB's image matches upstream's `/usr/local/lib/xtdb` workdir, `-f config.yaml` command, `VOLUME /var/lib/xtdb`, default no-password / `XTDB_PASSWORD` auth, and `wget` `HEALTHCHECK`, while deliberately using Debian Bookworm, user `rtdb` (same UID/GID 20000), and `LD_PRELOAD=libjemalloc.so.2` (with legacy fallbacks in `rtdb-entrypoint` for `/etc/rtdb/config.yaml` and `/var/lib/rtdb`).
+Remote storage and Kafka backends (`s3`, `azure`, `gcs`, `kafka`, `pg-source`, `cloudwatch`) are compile-time Cargo features rather than runtime modules, so `--variant local` omits them and `all-backends` bundles them.
+Outside Docker, `rtdb` uses system `malloc` rather than a compiled-in `#[global_allocator]`.
+The bundled `/etc/rtdb/cluster-default.yaml` and `/etc/rtdb/cluster-multi.yaml` files are RTDB-only cluster configs that read `RTDB_ROOT_PASSWORD`.
+
+**Why.**
+Debian Bookworm supplies `glibc`, `libsasl2`, and `libjemalloc2` cleanly for native builds, and Cargo features keep local-only binaries small.
+
+**What a user sees.**
+Drop-in container mounts at `/var/lib/xtdb` and `/usr/local/lib/xtdb/config.yaml` work as in XTDB.
+Container tooling inside the image sees Debian (`apt`) and user `rtdb` instead of Alpine (`apk`) and `xtdb`, and enabling S3/Azure/GCS/Kafka requires a binary built with those features.
+
+**Where in the code.**
+- `rust/release/Dockerfile`
+- `rust/release/entrypoint.sh`
+- `rust/release/README.adoc`
+- `RC/server/Cargo.toml`
+- `RC/server/src/main.rs`
+
+### 5.7 Observability: logging targets, JSON templates, metrics, tracing export, and crash logs
+
+**What differs.**
+RTDB's `tracing` subscriber honours `XTDB_LOG_FORMAT`, `XTDB_LOGGING_LEVEL[_NS]`, and `XTDB_LOG_JSON_TEMPLATE` (compiling bundled `classpath:` templates or `file:` Log4j2 `JsonTemplateLayout` templates at startup, refusing startup on unsupported resolvers) and aliases 18 core `rtdb_*` targets to upstream `xtdb.*` logger names; unaliased Rust modules report as `xtdb.<crate>.<module>`.
+Metrics use 16 per-thread sample shards, omit JVM-only binders (`jvm.*`) and per-allocator child gauges, and add RTDB-only metrics (`rtdb.cache.{limit,retained}.bytes`, `rtdb.gc.error`, `rtdb.kafka.warning`, `rtdb.replica.commit.*`, `query.linearizable`, `query.page`, `query.track`).
+OTLP trace export sends HTTP/JSON (`application/json`) over a 1,024-span queue instead of OTLP protobuf, and CloudWatch/Azure metric exporters use native JSON envelopes instead of Micrometer registries.
+`CrashLogger` writes `crash.edn`, `tx-ops.arrow`, `live-trie.binpb`, and `live-table.arrow` under `crashes/<node-id>/<instant>/`; writing `open-tx-table.arrow`, `open-tx-trie.binpb`, and `query-rel.arrow` is implemented via `CrashSite` but not yet wired from the transaction resolver.
+
+**Why.**
+Native Rust binaries replace JVM-only libraries (Log4j2, Micrometer, OpenTelemetry Java SDK) with `tracing` and lightweight JSON exporters while preserving upstream environment variables, Prometheus exposition, and core metric names.
+
+**What a user sees.**
+`XTDB_LOG_FORMAT`, `XTDB_LOG_JSON_TEMPLATE` (for bundled and `file:` templates using supported resolvers), and `XTDB_LOGGING_LEVEL` work as in XTDB, though fine-grained sub-logger names outside the 18 aliases follow Rust module names.
+JVM-specific `jvm.*` metrics are absent, OTLP collectors must accept OTLP/HTTP JSON, and crash dumps currently omit open-transaction and query-relation files until the resolver passes `CrashSite`.
+
+**Where in the code.**
+- `RC/metrics/src/logging.rs` (`UPSTREAM_ALIASES`)
+- `RC/metrics/src/logging/template.rs`
+- `RC/metrics/src/lib.rs`
+- `RC/server/src/prometheus.rs`
+- `RC/server/src/tracing.rs`
+- `RC/server/src/metric_export/`
+- `RC/replication/src/crash_log.rs`
