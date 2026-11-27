@@ -298,7 +298,7 @@ fn prepare_inner<'a>(expr: &'a Expr,ty: LogicalType,frame: &'a EvaluationFrame<'
                 frame.context.reserve(name.len().checked_mul(8).and_then(|bytes|bytes.checked_add(256)).ok_or_else(overflow)?)?;
                 let name = crate::functions::canonical_name(name);
                 calls::validate(expr, &name, args, frame)?;
-                match name.as_str() {
+                match &*name {
                     "coalesce" => coalesce(args,frame)?.await,
                     "nullif" => nullif(args,frame)?.await,
                     "greatest" | "least" => greatest(name == "greatest",args,frame)?.await,
@@ -429,7 +429,7 @@ fn payload_truth(value: &EvalValue<'_>) -> Option<bool> {
 }
 fn literal_argument(name: &str,index: usize) -> bool {
     let name = crate::functions::canonical_name(name);
-    match name.as_str() {
+    match &*name {
         "round" => index == 1,"extract" | "date_trunc" => index == 0 || index == 2,
         "single_field_interval" | "multi_field_interval" => index != 0,
         "current_timestamp" | "now" | "current_time" | "local_timestamp" | "localtimestamp" | "local_time" | "localtime" => true,
@@ -437,7 +437,7 @@ fn literal_argument(name: &str,index: usize) -> bool {
     }
 }
 
-fn call<'a>(name: String,args: &'a [Expr],ty: LogicalType,frame: &'a EvaluationFrame<'a>) -> Result<Pending<'a,Continuation<'a>>> {
+fn call<'a>(name: std::borrow::Cow<'a, str>,args: &'a [Expr],ty: LogicalType,frame: &'a EvaluationFrame<'a>) -> Result<Pending<'a,Continuation<'a>>> {
     boxed(async move {
         if name == "date_bin" {
             frame.context.reserve(4096)?;
@@ -458,7 +458,7 @@ fn call<'a>(name: String,args: &'a [Expr],ty: LogicalType,frame: &'a EvaluationF
                 crate::volatile::random().map(|value| Output::Number(NumericCell::F64(value)))
             }, frame);
         }
-        let shortcut_null = !matches!(name.as_str(),"is_true" | "is_false" | "is_null" | "true?" | "false?" | "nil?" | "boolean" | "===" | "null_eq" | "compare_nulls_first" | "compare_nulls_last" | "distinct_from" | "period" | "str" | "_patch" | "string_to_array" | "format_type" | "format");
+        let shortcut_null = !matches!(&*name,"is_true" | "is_false" | "is_null" | "true?" | "false?" | "nil?" | "boolean" | "===" | "null_eq" | "compare_nulls_first" | "compare_nulls_last" | "distinct_from" | "period" | "str" | "_patch" | "string_to_array" | "format_type" | "format");
         frame.context.reserve(args.len().checked_mul(std::mem::size_of::<Continuation<'_>>()).ok_or_else(overflow)?)?;
         let mut arguments = Vec::with_capacity(args.len());
         for expr in args {
@@ -474,11 +474,11 @@ fn call<'a>(name: String,args: &'a [Expr],ty: LogicalType,frame: &'a EvaluationF
                 from_value(crate::interval_constructor::construct(scalar_ref(&value)?,&recipe)?,frame)
             },frame);
         }
-        if matches!(name.as_str(),"null_eq" | "distinct_from") && arguments.len() == 2 { rtdb_plan::validate_equality_types(&arguments[0].ty,&arguments[1].ty)?; }
+        if matches!(&*name,"null_eq" | "distinct_from") && arguments.len() == 2 { rtdb_plan::validate_equality_types(&arguments[0].ty,&arguments[1].ty)?; }
         if let [argument] = arguments.as_slice() {
-            if matches!(name.as_str(),"_meta_double" | "get_field") && rtdb_plan::function_type(&name,std::slice::from_ref(&argument.ty))? == LogicalType::Null { return nil(frame); }
+            if matches!(&*name,"_meta_double" | "get_field") && rtdb_plan::function_type(&name,std::slice::from_ref(&argument.ty))? == LogicalType::Null { return nil(frame); }
             let boolean = argument.ty == LogicalType::Scalar(rtdb_types::ScalarType::Bool);
-            let constant = match name.as_str() {
+            let constant = match &*name {
                 "nil?" | "is_null" => Some(argument.is_null()),
                 "true?" | "is_true" | "false?" | "is_false" if !boolean => Some(false),
                 "boolean" if !boolean => Some(!argument.is_null()),
@@ -501,7 +501,7 @@ fn call<'a>(name: String,args: &'a [Expr],ty: LogicalType,frame: &'a EvaluationF
                 pattern.search(input,frame.context).map(|value|scalar(Value::Bool(value)))
             },frame);
         }
-        if matches!(name.as_str(),"like" | "ilike") {
+        if matches!(&*name,"like" | "ilike") {
             let pattern = arguments.pop().ok_or_else(||invalid(&name))?;
             let input = arguments.pop().ok_or_else(||invalid(&name))?;
             return deferred(ty,async move {
@@ -513,7 +513,7 @@ fn call<'a>(name: String,args: &'a [Expr],ty: LogicalType,frame: &'a EvaluationF
                 pattern.search(scalar_ref(&input)?,false,&context).map(scalar)
             },frame);
         }
-        if matches!(name.as_str(),"array_lower" | "array_upper" | "array_length") {
+        if matches!(&*name,"array_lower" | "array_upper" | "array_length") {
             let dimension = arguments.pop().expect("validated array dimension");
             let input = arguments.pop().expect("validated array input");
             return deferred(ty,async move {
@@ -530,13 +530,13 @@ fn call<'a>(name: String,args: &'a [Expr],ty: LogicalType,frame: &'a EvaluationF
         if name == "distinct_from" && arguments.iter().any(Continuation::is_null) {
             return ready(scalar(Value::Bool(!arguments.iter().all(Continuation::is_null))),frame);
         }
-        if matches!(name.as_str(),"compare_nulls_first" | "compare_nulls_last") && arguments.iter().any(Continuation::is_null) {
+        if matches!(&*name,"compare_nulls_first" | "compare_nulls_last") && arguments.iter().any(Continuation::is_null) {
             let result = if arguments.iter().all(Continuation::is_null) { 0 }
                 else if arguments[0].is_null() == (name == "compare_nulls_first") { -1 } else { 1 };
             return ready(scalar(Value::I32(result)),frame);
         }
         if name == "===" && arguments.iter().all(Continuation::is_null) { return ready(scalar(Value::Bool(true)),frame); }
-        if matches!(name.as_str(),"col_description" | "pg_indexam_has_property") || matches!(name.as_str(),"format_type" | "string_to_array") && arguments.first().is_some_and(Continuation::is_null) { return nil(frame); }
+        if matches!(&*name,"col_description" | "pg_indexam_has_property") || matches!(&*name,"format_type" | "string_to_array") && arguments.first().is_some_and(Continuation::is_null) { return nil(frame); }
         if name == "round" && arguments.len() == 2 && matches!(arguments[0].ty,LogicalType::Scalar(rtdb_types::ScalarType::F32 | rtdb_types::ScalarType::F64)) {
             let scale = arguments.pop().expect("validated scale");
             let input = arguments.pop().expect("validated input");

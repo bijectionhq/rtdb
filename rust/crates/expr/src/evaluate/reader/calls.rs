@@ -155,7 +155,7 @@ pub(super) fn call<'a>(expr: &'a Expr,name: &'a str,args: &'a [Expr],frame: &'a 
         let mut values = Vec::with_capacity(args.len());
         for expr in args {
             let value = evaluate(expr,frame)?.await?;
-            if matches!(name.as_str(),"concat" | "array_upper" | "array_lower" | "array_length") && is_null(&value) { return Ok(scalar(Value::Null)); }
+            if matches!(&*name,"concat" | "array_upper" | "array_lower" | "array_length") && is_null(&value) { return Ok(scalar(Value::Null)); }
             values.push(value);
         }
         apply(name,values,frame)?.await
@@ -375,7 +375,7 @@ async fn cosine_components<'a>(input: &EvalValue<'a>, frame: &'a EvaluationFrame
     Ok(components)
 }
 
-pub(super) fn apply<'a>(name: String,mut values: Vec<EvalValue<'a>>,frame: &'a EvaluationFrame<'a>) -> Result<Pending<'a,EvalValue<'a>>> {
+pub(super) fn apply<'a>(name: std::borrow::Cow<'a, str>,mut values: Vec<EvalValue<'a>>,frame: &'a EvaluationFrame<'a>) -> Result<Pending<'a,EvalValue<'a>>> {
     boxed(async move {
         if name == "get_field" { return field(values.remove(0),None,frame); }
         if name == "range_bins" {
@@ -399,7 +399,7 @@ pub(super) fn apply<'a>(name: String,mut values: Vec<EvalValue<'a>>,frame: &'a E
         }
         if let [value] = values.as_slice() {
             if let Some(value) = type_predicate(&name,value) { return Ok(scalar(Value::Bool(value))); }
-            if matches!(name.as_str(),"length" | "cardinality") {
+            if matches!(&*name,"length" | "cardinality") {
                 if is_null(value) { return Ok(scalar(Value::Null)); }
                 if matches!(value,EvalValue::List(_,_)) { return Ok(scalar(Value::I32(size(value)?))); }
                 let count = match value {
@@ -442,7 +442,7 @@ pub(super) fn apply<'a>(name: String,mut values: Vec<EvalValue<'a>>,frame: &'a E
             }
         }
         if name == "nth" { return subscript(values.remove(0),values.remove(0),frame)?.await; }
-        if matches!(name.as_str(),"array_upper" | "array_lower" | "array_length") {
+        if matches!(&*name,"array_upper" | "array_lower" | "array_length") {
             if values.iter().any(is_null) { return Ok(scalar(Value::Null)); }
             let count = integer(scalar_ref(&values[1])?).and_then(|count| i64::try_from(count).ok()).ok_or_else(|| invalid(&name))?;
             let input = values.remove(0);

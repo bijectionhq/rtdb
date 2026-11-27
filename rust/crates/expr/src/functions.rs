@@ -40,7 +40,8 @@ pub async fn scalar_call_async(name: &str, args: &[Value], context: &EvalContext
 pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Result<Value> {
     let bytes = args.iter().try_fold(256usize, |bytes, value| bytes.checked_add(value.retained_bytes()?).ok_or_else(overflow))?;
     context.reserve(bytes.checked_mul(16).ok_or_else(overflow)?)?;
-    let name = canonical_name(name);
+    let canonical = canonical_name(name);
+    let name: &str = &canonical;
     if name == "cosine_distance" {
         let [left, right] = args else {
             return Err(Anomaly::incorrect("xtdb/invalid-function-arity", "cosine_distance requires two arguments"));
@@ -54,7 +55,7 @@ pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Res
         return Ok(Value::Bool(!nullish(column)));
     }
     function_type(&name, &args.iter().map(Value::logical_type).collect::<Vec<_>>())?;
-    match name.as_str() {
+    match name {
         "cosine_distance_f32" => return crate::vector::cosine_distance_f32(&args[0], &args[1]),
         "entity_sort_key" => return if nullish(&args[0]) { Ok(Value::Null) } else {
             Ok(Value::Binary(args[0].entity_id()?.handle_bytes().into()))
@@ -82,16 +83,16 @@ pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Res
     if let Some(result) = crate::interval_constructor::call(&name, args) { return result; }
     if name == "get_field" { return crate::field::get(&args[0],None,context); }
     if name == "generate_series" { return crate::series::prepare(args,context)?.materialize(context); }
-    if matches!(name.as_str(), "compare" | "compare_nulls_first" | "compare_nulls_last") {
+    if matches!(name, "compare" | "compare_nulls_first" | "compare_nulls_last") {
         if name == "compare" && args.iter().any(nullish) { return Ok(Value::Null); }
         return crate::ordered::scalar_compare(&args[0],&args[1],name == "compare_nulls_first",context.timezone).map(Value::I32);
     }
-    if matches!(name.as_str(), "uri_scheme" | "uri_user_info" | "uri_host" | "uri_port" | "uri_path" | "uri_query" | "uri_fragment") {
+    if matches!(name, "uri_scheme" | "uri_user_info" | "uri_host" | "uri_port" | "uri_path" | "uri_query" | "uri_fragment") {
         if nullish(&args[0]) { return Ok(Value::Null); }
         let Value::Uri(text) = &args[0] else { return Err(inapplicable(&name, &[&args[0]])); };
         let uri = rtdb_types::UriParts::parse(text)?;
         if name == "uri_port" { return Ok(uri.port().map(Value::I32).unwrap_or(Value::Null)); }
-        let component = match name.as_str() {
+        let component = match name {
             "uri_scheme" => uri.scheme().map(std::borrow::Cow::Borrowed),
             "uri_host" => uri.host().map(std::borrow::Cow::Borrowed),
             "uri_user_info" => uri.user_info(),
@@ -101,7 +102,7 @@ pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Res
         };
         return Ok(component.map(|text| Value::Utf8(text.into_owned())).unwrap_or(Value::Null));
     }
-    match name.as_str() {
+    match name {
         "col_description" | "pg_indexam_has_property" => return Ok(Value::Null),
         "random" => return crate::volatile::random().map(Value::F64),
         "sleep" => return if crate::volatile::sleep_millis(&args[0])? == 0 { Ok(Value::Null) }
@@ -179,7 +180,7 @@ pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Res
     if args.iter().any(nullish) { return Ok(Value::Null); }
     if name == "abs" { if let Some(result) = crate::temporal::absolute(&args[0]) { return result; } }
     if let Some(Value::TimestampTzRange { lower, upper }) = args.first() {
-        match name.as_str() {
+        match name {
             "lower" => return Ok(Value::Timestamp { value: *lower, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) }),
             "upper" => return Ok(if *upper == i64::MAX { Value::Null } else { Value::Timestamp { value: *upper, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) } }),
             "lower_inf" => return Ok(Value::Bool(*lower == i64::MIN)),
@@ -187,7 +188,7 @@ pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Res
             _ => (),
         }
     }
-    match name.as_str() {
+    match name {
         "lower" => Ok(Value::Utf8(crate::string::case_language()?.to_lower(text(&args[0])?))),
         "upper" => Ok(Value::Utf8(crate::string::case_language()?.to_upper(text(&args[0])?))),
         "length" => match &args[0] { Value::Utf8(text) => count(text.chars().count()), Value::Binary(bytes) | Value::FixedSizeBinary(bytes) => count(bytes.len()), Value::List(items) => count(items.len()), value => Err(inapplicable(&name, &[value])) },
@@ -232,7 +233,7 @@ pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Res
         "regexp_replace" => crate::string::pattern::replace(args, context),
         "abs" | "floor" | "ceil" | "ceiling" | "round" => {
             let scale = args.get(1).map(|value| integer(value).ok_or_else(|| inapplicable(&name, &[value]))).transpose()?.unwrap_or(0);
-            if matches!(name.as_str(), "floor" | "ceil" | "ceiling") {
+            if matches!(name, "floor" | "ceil" | "ceiling") {
                 let value = number(&args[0]).ok_or_else(|| inapplicable(&name, &[&args[0]]))?;
                 return Ok(Value::F64(if name == "floor" { value.floor() } else { value.ceil() }));
             }
@@ -268,8 +269,12 @@ pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Res
     }
 }
 
-/// The one spelling a function name is matched in: lower case, with underscores for hyphens.
-pub(crate) fn canonical_name(name: &str) -> String { name.to_lowercase().replace('-', "_") }
+/// The one spelling a function name is matched in: lower case, with underscores for hyphens. A name already so
+/// spelled, as a call's name is once canonicalized, is borrowed rather than copied on every call of every row.
+pub(crate) fn canonical_name(name: &str) -> std::borrow::Cow<'_, str> {
+    if name.bytes().all(|byte| byte.is_ascii() && !byte.is_ascii_uppercase() && byte != b'-') { return std::borrow::Cow::Borrowed(name); }
+    std::borrow::Cow::Owned(name.to_lowercase().replace('-', "_"))
+}
 
 /// The reference rounds a double as `floor(v + 0.5)` from zero up and `ceil(v - 0.5)` below zero, not to the nearest
 /// integer: the addition itself rounds, so 0.49999999999999994 becomes 1 and 2^52 + 1 becomes 2^52 + 2.
