@@ -2007,7 +2007,8 @@ rule ProcessingErrorHaltsNode {
     -- When a leader document write (put, delete or erase) fails for a reason other than a caller error, the leader writes a crash log under `crashes/<node-id>/<instant>/` in the database's object store before ingestion stops.
     -- The crash log writes `crash.edn` first with the failed table, transaction key, operation index, message and `#xt/error`.
     -- Alongside `crash.edn`, it writes `tx-ops.arrow` (the transaction's operations stream as an Arrow file, keeping only `tx-ops` for a legacy envelope), the failed table's `live-trie.binpb` with compacted logs, and `live-table.arrow` when the table has rows.
-    -- When the failed operation supplies its site, it also writes `open-tx-table.arrow`, `open-tx-trie.binpb` and `query-rel.arrow`.
+    -- A failed document operation supplies the open transaction's table segment, which is written as `open-tx-table.arrow` and `open-tx-trie.binpb` when the live index holds that table and the segment is readable.
+    -- When the live index holds the table, the crash logger writes `query-rel.arrow` if the crash site supplies a query relation.
     -- Each file is attempted independently, and any failure writing one is logged through tracing and swallowed so the original error is preserved unchanged.
     --
     -- A SUPERSESSION is not one of these, and neither is an interruption of the term: see LeaderSuperseded.
