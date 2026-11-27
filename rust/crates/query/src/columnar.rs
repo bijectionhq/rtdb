@@ -5194,6 +5194,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn text_position_distinguishes_character_and_byte_counts_for_reached_cells() {
+        let memory = MemoryBudget::new(1 << 22);
+        let schema = Schema::new(vec![field(0, ScalarType::Utf8), field(1, ScalarType::Utf8)]).unwrap();
+        let len = 256;
+        let batch = ColumnBatch::settled(
+            [
+                [Some("b"), Some(""), Some("missing"), None],
+                [Some("é😀b"), Some("é"), Some("x"), Some("b")],
+            ].into_iter().zip(schema.fields()).map(|(cells, field)| Column::Arrow {
+                array: Arc::new(StringArray::from_iter(cells.into_iter().cycle().take(len))),
+                field: Arc::new(rtdb_columnar::to_field(&field.name, &field.data_type).unwrap()),
+                logical: Some(field.data_type.clone()),
+            }).collect(),
+            len, memory.reserve(0).unwrap(),
+        ).unwrap();
+        let expressions = ["position", "octet_position"].map(|name| Expr::Call {
+            name: name.into(), args: schema.fields().iter().map(rtdb_plan::Field::expression).collect(),
+            return_type: LogicalType::Scalar(ScalarType::I32).maybe(),
+        });
+        assert!(expressions.iter().all(|expression| matches!(
+            ProjectionValues::new(expression, &expression.data_type(), len, None), ProjectionValues::I32(_)
+        )));
+        let mut cursor = record_projection_cursor(batch, schema, expressions.into(), &memory);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        for (column, expected) in page.columns.iter().zip([[Some(3), Some(1), Some(0), None], [Some(7), Some(1), Some(0), None]]) {
+            let Column::Arrow { array, .. } = column else { panic!("Expected an Arrow integer column"); };
+            let actual = array.as_any().downcast_ref::<Int32Array>().unwrap();
+            assert!(actual.iter().enumerate().all(|(row, value)| value == expected[row % 4]));
+        }
+    }
+
+    #[tokio::test]
     async fn record_projection_computed_struct_keeps_child_backing_and_duplicate_order() {
         let source = MemoryBudget::new(1 << 23);
         let memory = MemoryBudget::new(1 << 17);
@@ -6566,6 +6598,8 @@ fn fixed_projection_result(expression: &Expr, scalar: &ScalarType) -> bool {
                 stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || fixed_projection_result(value, scalar))
             })
         }
+        Expr::Call { name, args, .. } if args.len() == 2 && ["position", "octet_position", "octet-position"]
+            .iter().any(|function| name.eq_ignore_ascii_case(function)) => *scalar == ScalarType::I32,
         Expr::Call { name, args, .. } if args.len() == 1 => {
             use rtdb_expr::kernels::Function;
             match Function::resolve(name) {

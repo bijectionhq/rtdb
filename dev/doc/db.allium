@@ -2643,6 +2643,7 @@ surface QueryAccess {
         -- Scalar evaluation in columnar projections, filters, aggregate filters, and evaluated UNNEST can borrow the cells demanded by the expression.
         -- Scalar COALESCE can pass the selected Arrow string through to concatenation or regular expression replacement as borrowed text.
         -- Scalar character and octet length calls can also measure the selected text without copying it into an owned argument.
+        -- POSITION and OCTET_POSITION can read reached UTF-8 arguments in place and write their counts directly into an Arrow integer column.
         -- Character and octet lengths and supported unary floating-point calls can read the active cells of selected and run-end encoded inputs and write fixed-width Arrow results.
         -- ROUND with a literal or omitted scale can read Float32 and Float64 column cells in place through compatible selections, unions and run ends, writing admitted Float64 results and reporting overflow only for reached non-null cells.
         -- A projection casting a numeric column to double precision can read supported signed integer and floating-point cells through compatible selections, unions and run ends and write admitted Float64 results.

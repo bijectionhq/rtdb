@@ -535,6 +535,22 @@ fn call<'a>(function: ResolvedFunction<'a>, args: &'a [Expr], ty: LogicalType, f
                 calls::apply(function, vec![input.into_value()?], frame)?.await
             }, frame);
         }
+        if let ResolvedFunction::Known(ScalarFunction::String(func @ (StringFunction::Position | StringFunction::OctetPosition))) = function
+            && arguments.len() == 2
+            && arguments.iter().all(|arg| arg.ty == LogicalType::Scalar(ScalarType::Utf8))
+        {
+            let haystack = arguments.pop().expect("validated haystack");
+            let needle = arguments.pop().expect("validated needle");
+            return deferred(ty, async move {
+                let needle = needle.demand_output().await?.into_text_or_value()?;
+                let haystack = haystack.demand_output().await?.into_text_or_value()?;
+                if let (Some(needle), Some(haystack)) = (needle.text(), haystack.text()) {
+                    return func.position(needle.as_bytes(), haystack.as_bytes()).map(scalar);
+                }
+                frame.context.reserve(2 * std::mem::size_of::<EvalValue<'_>>())?;
+                calls::apply(function, vec![needle.into_value()?, haystack.into_value()?], frame)?.await
+            }, frame);
+        }
         if function == ResolvedFunction::Known(ScalarFunction::String(StringFunction::Concat))
             && plain_type(&ty) == &LogicalType::Scalar(ScalarType::Utf8)
         {
@@ -542,11 +558,7 @@ fn call<'a>(function: ResolvedFunction<'a>, args: &'a [Expr], ty: LogicalType, f
                 frame.context.reserve(arguments.len().checked_mul(std::mem::size_of::<Output<'_>>()).ok_or_else(overflow)?)?;
                 let mut inputs = Vec::with_capacity(arguments.len());
                 for argument in arguments {
-                    let output = argument.demand_output().await?;
-                    inputs.push(match output {
-                        Output::Text(..) => output,
-                        other => Output::Value(other.into_value()?),
-                    });
+                    inputs.push(argument.demand_output().await?.into_text_or_value()?);
                 }
                 if inputs.iter().all(|input| input.text().is_some()) {
                     return crate::string::concat_utf8(inputs.iter().filter_map(Output::text), frame.context).map(scalar);

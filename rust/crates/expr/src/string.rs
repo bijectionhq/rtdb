@@ -49,6 +49,11 @@ pub(crate) enum StringFunction {
 }
 
 impl StringFunction {
+    pub(crate) fn position(self, needle: &[u8], haystack: &[u8]) -> Result<Value> {
+        let found = if needle.is_empty() { Some(0) } else { haystack.windows(needle.len()).position(|candidate| candidate == needle) };
+        count(found.map_or(0, |index| if self == Self::Position { utf8_length(&haystack[..index]) + 1 } else { index + 1 }))
+    }
+
     pub(crate) fn from_canonical(name: &str) -> Option<Self> {
         Some(match name {
             "like" => Self::Like,
@@ -146,12 +151,7 @@ impl StringFunction {
                 output.extend_from_slice(prefix); output.extend_from_slice(placing); output.extend_from_slice(suffix);
                 from_bytes(output, binary)?
             }
-            Self::Position | Self::OctetPosition => {
-                let needle = bytes(&args[0])?;
-                let haystack = bytes(&args[1])?;
-                let position = if needle.is_empty() { Some(0) } else { haystack.windows(needle.len()).position(|candidate| candidate == needle) };
-                count(position.map_or(0, |index| if self == Self::Position { utf8_length(&haystack[..index]) + 1 } else { index + 1 }))?
-            }
+            Self::Position | Self::OctetPosition => self.position(bytes(&args[0])?, bytes(&args[1])?)?,
             Self::CharacterLength => count(utf8_length(bytes(&args[0])?))?,
             Self::DefaultOverlayLength => count(if binary { bytes(&args[0])?.len() } else { utf8_length(bytes(&args[0])?) })?,
             Self::OctetLength => count(bytes(&args[0])?.len())?,

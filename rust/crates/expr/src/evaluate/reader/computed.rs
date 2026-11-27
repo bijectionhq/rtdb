@@ -34,6 +34,13 @@ impl<'a> Output<'a> {
         }
     }
 
+    pub(super) fn into_text_or_value(self) -> Result<Self> {
+        match self {
+            Self::Text(..) => Ok(self),
+            output => output.into_value().map(Self::Value),
+        }
+    }
+
     pub(super) fn number(&self) -> Option<NumericCell> {
         match self {
             Self::Number(number) => Some(*number),
