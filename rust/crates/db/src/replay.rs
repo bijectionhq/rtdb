@@ -376,7 +376,8 @@ impl Committed {
             let mut state = previous
                 .take()
                 .unwrap_or_else(|| Self::empty(stream, page.floor));
-            if state.awaiting_base() {
+            // Retirement can make a later clean checkpoint the replay start before the journal trims to it.
+            if state.awaiting_base() && state.floor == page.floor {
                 match find_replay_base(stream, &page).await
                     .map_err(|error| ReplayError::failed(error, None))?
                 {
