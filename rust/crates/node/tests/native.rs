@@ -2830,9 +2830,12 @@ async fn follower_compactor_publishes_results_through_the_writer_without_claimin
     }).await.unwrap();
 }
 
+/// As XTDB, a superseded trie stays for the garbage window (`blocksToKeep` blocks, less `garbageLifetime`) and no longer:
+/// a running query on the old leader reads it while it is inside the window, but holds nothing, so once the window
+/// passes the successor retires it whether or not that query is still open.
 #[tokio::test]
-async fn a_successor_retires_an_old_leaders_trie_only_after_its_query_finishes() {
-    use rtdb_format::{keys::{CURRENT_STORAGE_VERSION, TrieKey}, trie_retirement::journal_directory};
+async fn a_successor_retires_an_old_leaders_trie_once_it_leaves_the_garbage_window_whatever_its_queries() {
+    use rtdb_format::keys::{CURRENT_STORAGE_VERSION, TrieKey};
     use rtdb_replication::Role;
     use rtdb_storage::{Error, IoRegion, LocalStore, ObjectKey, log::{AppendTimestampSource, MemoryLog}};
     use rtdb_types::StorageEpoch;
@@ -2891,11 +2894,12 @@ async fn a_successor_retires_an_old_leaders_trie_only_after_its_query_finishes()
         let journal = || Arc::new(MemoryLog::with_timestamp_source(1 << 26, Arc::new(JournalClock(wall.clone()))));
         let shared = Arc::new(SharedJournal { source: journal(), replica: journal(), storage: files.path().join("objects") });
         let old_clock = Arc::new(CollectorClock { wall: wall.clone(), monotonic: AtomicI64::new(0) });
-        let new_clock = Arc::new(CollectorClock { wall, monotonic: AtomicI64::new(9_000_000) });
+        let new_clock = Arc::new(CollectorClock { wall: wall.clone(), monotonic: AtomicI64::new(9_000_000) });
+        let lifetime = Duration::from_secs(60 * 60);
         let mut config = options();
         config.compaction_threads = 1;
         config.garbage.blocks_to_keep = 1;
-        config.garbage.garbage_lifetime = Duration::ZERO;
+        config.garbage.garbage_lifetime = lifetime;
         config.garbage.page_grace = Duration::from_secs(1);
 
         let mut predecessor_config = config.clone();
@@ -2916,7 +2920,6 @@ async fn a_successor_retires_an_old_leaders_trie_only_after_its_query_finishes()
         assert_eq!(snapshot.trie_entries(&table).iter().map(|trie| &trie.key).collect::<Vec<_>>(), [&old]);
         let slug = &snapshot.table_entry(&table).unwrap().slug;
         let files = [slug.data_key(&old), slug.metadata_key(&old)].map(|name| ObjectKey::new(name).unwrap());
-        let journal = journal_directory(snapshot.catalog_cut().unwrap());
         drop(snapshot);
         let Role::Leading(old_term) = previous_status.borrow().role else { panic!("the first node must lead") };
         let cursor = reader.query_sql("SELECT value FROM docs", vec![]).await.unwrap();
@@ -2937,44 +2940,30 @@ async fn a_successor_retires_an_old_leaders_trie_only_after_its_query_finishes()
         assert!(current.trie_catalog().garbage_tries(&table, Timestamp::MAX).iter().any(|trie| trie.key == old),
             "the successor compaction must supersede the old trie");
 
+        // Inside the window the superseded files stay, so the old leader's running query reads them.
         let store = current.object_store();
-        let pending = ObjectKey::new(format!("{journal}/pending")).unwrap();
-        let mut ids = 3..12;
-        let intent = loop {
-            let id = ids.next().expect("the successor must install a retirement for the held trie");
-            new_clock.monotonic.fetch_add(2_000_000, Ordering::Relaxed);
+        for id in 3..6 {
             writer.state_mut().execute_operation(put(&successor, id, id * 10)).await.unwrap();
             flush(&successor, &current).await;
-            let observed = tokio::time::timeout(Duration::from_millis(200), async {
-                loop {
-                    for object in store.list(Some(&pending)).await.unwrap() {
-                        let digest = object.key.as_str().rsplit('/').next().unwrap();
-                        let receipt = ObjectKey::new(format!("{journal}/installed/{digest}")).unwrap();
-                        let Ok(body) = store.get(&object.key).await else { continue; };
-                        let intent: rtdb_format::trie_retirement::RetirementIntent = serde_json::from_slice(&body).unwrap();
-                        if intent.tries.contains(&old.to_string()) && store.head_fresh(&receipt).await.is_ok() {
-                            return object.key;
-                        }
-                    }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            }).await;
-            if let Ok(intent) = observed { break intent; }
-        };
+        }
         for file in &files { store.head_fresh(file).await.unwrap(); }
         assert_eq!(rows(cursor).await, vec![vec![Value::I64(10)]]);
 
-        tokio::time::timeout(Duration::from_secs(5), async {
+        // An open query is no hold: once the window passes, the files go while it is still open.
+        let held = reader.query_sql("SELECT value FROM docs", vec![]).await.unwrap();
+        wall.0.fetch_add(i64::try_from(2 * lifetime.as_micros()).unwrap(), Ordering::Relaxed);
+        let mut ids = 6..;
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
+                let id = ids.next().unwrap();
+                writer.state_mut().execute_operation(put(&successor, id, id * 10)).await.unwrap();
+                flush(&successor, &current).await;
                 let retired = futures::future::join_all(files.iter().map(|file| store.head_fresh(file))).await;
-                if matches!(store.head_fresh(&intent).await, Err(Error::MissingObject(_)))
-                    && retired.into_iter().all(|result| matches!(result, Err(Error::MissingObject(_))))
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                if retired.into_iter().all(|result| matches!(result, Err(Error::MissingObject(_)))) { break; }
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-        }).await.expect("the successor must finish the installed retirement after the query releases its hold");
+        }).await.expect("the successor must retire the trie once it leaves the garbage window, though a query is open");
+        drop(held);
         drop((reader, writer, previous, current));
         stop(&predecessor, predecessor_driver).await;
         stop(&successor, successor_driver).await;
