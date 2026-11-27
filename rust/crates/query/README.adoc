@@ -325,7 +325,8 @@ Materialized replay retains every bound input page, including empty pages, in on
 Each reference reconstructs the original page boundaries before the client batch size is applied.
 
 `EXPLAIN` returns typed `depth`, `op`, and `explain` columns derived from the production relation tree.
-`EXPLAIN ANALYZE` returns the reference's ten-column schema, actual produced-page and row counts, operator durations, direct-child time subtraction, scan counters, and a common execution allocation peak.
+`EXPLAIN ANALYZE` returns the reference's eleven-column schema, actual produced-page and row counts, operator durations, direct-child time subtraction, scan counters, and both operator and query allocation peaks.
+`EXPLAIN` describes each join condition as a list of equi-key maps and residual predicates.
 An unadvanced branch has zero counts and a null first-page duration.
 The production page boundary applies to ordinary execution as well as analysis.
 Values, Scan, Project and Sort expose their own input-derived pages; standalone filters skip empty selections and coalesce small pages after the first 100 rows.

@@ -366,6 +366,45 @@ fn arguments<'work>(arguments: &[(usize, Expr)], columns: &Columns<'work>, work:
     joined(work, "{", &values, ", ", "}")
 }
 
+fn join_conditions<'work>(
+    condition: Option<&Expr>, left: &Schema, right: &Schema, columns: &Columns<'work>, work: &'work ExplainWork,
+) -> Result<WorkText<'work>> {
+    let belongs_to = |expr: &Expr, schema: &Schema| {
+        let ids = expr.referenced_columns();
+        !ids.is_empty() && ids.iter().all(|id| schema.get(*id).is_some())
+    };
+    let mut pending = ScratchVec::new(work);
+    if let Some(condition) = condition { pending.push(condition)?; }
+    let mut conditions = ScratchVec::new(work);
+    while let Some(condition) = pending.pop() {
+        if let Expr::Binary { op: BinaryOp::And, left, right } = condition {
+            pending.push(right.as_ref())?;
+            pending.push(left.as_ref())?;
+            continue;
+        }
+        if let Expr::Binary { op: BinaryOp::Eq, left: first, right: second } = condition {
+            let operands = if belongs_to(first, left) && belongs_to(second, right) {
+                Some((first, second))
+            } else if belongs_to(first, right) && belongs_to(second, left) {
+                Some((second, first))
+            } else {
+                None
+            };
+            if let Some((left, right)) = operands {
+                let left = form(left, columns, work)?;
+                let right = form(right, columns, work)?;
+                conditions.push(work.pieces(&[
+                    RenderPiece::Text("{"), RenderPiece::Text(left.as_str()), RenderPiece::Text(" "),
+                    RenderPiece::Text(right.as_str()), RenderPiece::Text("}"),
+                ])?)?;
+                continue;
+            }
+        }
+        conditions.push(form(condition, columns, work)?)?;
+    }
+    joined(work, "[", &conditions, " ", "]")
+}
+
 enum ColumnName { Symbol, String }
 
 impl KeySemantics<&str> for ColumnName {
@@ -448,11 +487,9 @@ fn describe<'work>(relation: &Relation, work: &'work ExplainWork) -> Result<Desc
             ("valid-from", text(work_patch_endpoint(from, expression(from)?)?)?),
             ("valid-to", text(work_patch_endpoint(to, expression(to)?)?)?),
         ])?,
-        RelationNode::Join { kind, condition, .. } => {
-            op = match kind { JoinKind::Inner => "inner-join", JoinKind::Cross => "cross-join", JoinKind::Left | JoinKind::Right => "left-join", JoinKind::Full => "full-join", JoinKind::Semi => "semi-join", JoinKind::Anti => "anti-join", JoinKind::Single => "single-join" };
-            let condition = match condition { Some(condition) => expression(condition)?, None => work.copy_text("")? };
-            map(work, [("condition", text(work.pieces(&[RenderPiece::Text("["), RenderPiece::Text(condition.as_str()), RenderPiece::Text("]")])?)?)])?
-        }
+        RelationNode::Join { kind: JoinKind::Cross, .. } => work.null(),
+        RelationNode::Join { left, right, condition, .. } =>
+            map(work, [("condition", text(join_conditions(condition.as_ref(), left.schema(), right.schema(), &input_columns, work)?)?)])?,
         RelationNode::Aggregate { groups, aggregates, .. } => {
             let mut group_values = ScratchVec::new(work);
             for group in groups { group_values.push(expression(&group.expr)?)?; }
@@ -514,15 +551,13 @@ fn describe<'work>(relation: &Relation, work: &'work ExplainWork) -> Result<Desc
             let mut fields = WorkMap::new(work);
             fields.insert("from", text(expression(expr)?)?)?;
             fields.insert("to", text(field_symbol(element, work)?)?)?;
-            if let Some(field) = ordinality { fields.insert("ordinality", text(field_symbol(field, work)?)?)?; }
+            let ordinality = match ordinality { Some(field) => text(field_symbol(field, work)?)?, None => work.null() };
+            fields.insert("ordinality", ordinality)?;
             fields.finish()?
         }
-        RelationNode::Mark { arguments, condition, comparison, .. } if arguments.is_empty() => {
+        RelationNode::Mark { input, dependent, arguments, condition, comparison, .. } if arguments.is_empty() => {
             let comparison = expression(comparison)?;
-            let condition = if let Some(condition) = condition {
-                let condition = expression(condition)?;
-                work.pieces(&[RenderPiece::Text("["), RenderPiece::Text(condition.as_str()), RenderPiece::Text("]")])?
-            } else { work.copy_text("[]")? };
+            let condition = join_conditions(condition.as_ref(), input.schema(), dependent.schema(), &input_columns, work)?;
             map(work, [
                 ("condition", text(condition)?),
                 ("mark", text(work.pieces(&[RenderPiece::Text("(and "), RenderPiece::Text(comparison.as_str()), RenderPiece::Text(")")])?)?),
@@ -934,6 +969,61 @@ mod rendering_tests {
         let work = work(&memory);
         let text = literal(RegexLiteralView::new(value), &work).unwrap();
         text.as_str().into()
+    }
+
+    #[test]
+    fn explain_renders_join_keys_as_maps_and_keeps_residual_predicates_separate() {
+        let memory = MemoryBudget::new(1 << 20);
+        let work = work(&memory);
+        let field = |id, name: &str| Field {
+            id: ColumnId(id), name: name.into(), qualifier: None, qualified_only: false, unnamed: false,
+            data_type: LogicalType::Scalar(ScalarType::I64),
+        };
+        let (a, b) = (field(0, "a"), field(1, "b"));
+        let values = |field: &Field| Arc::new(Relation::new(Schema::new(vec![field.clone()]).unwrap(),
+            RelationNode::Values { rows: vec![vec![Expr::Literal(Value::I64(1))]] }).unwrap());
+        let (left, right) = (values(&a), values(&b));
+        let condition = Expr::binary(BinaryOp::And,
+            Expr::binary(BinaryOp::Gt, b.expression(), a.expression()),
+            Expr::binary(BinaryOp::And,
+                Expr::binary(BinaryOp::Eq, b.expression(), a.expression()),
+                Expr::binary(BinaryOp::Eq, a.expression(), Expr::Literal(Value::I64(1)))));
+
+        let join = Relation::join(Arc::clone(&left), Arc::clone(&right), JoinKind::Inner, Some(condition.clone())).unwrap();
+        let mark = Field { data_type: LogicalType::Scalar(ScalarType::Bool).maybe(), ..field(2, "mark") };
+        let mark_schema = left.schema().concat(&Schema::new(vec![mark.clone()]).unwrap()).unwrap();
+        let marked = Relation::new(mark_schema, RelationNode::Mark {
+            input: Arc::clone(&left), dependent: Arc::clone(&right), arguments: Vec::new(),
+            condition: Some(condition), comparison: Expr::Literal(Value::Bool(true)), output: mark,
+        }).unwrap();
+        for relation in [join, marked] {
+            let descriptor = describe(&relation, &work).unwrap();
+            let Value::Struct(explanation) = descriptor.explanation.value else { panic!("Expected join metadata"); };
+            assert_eq!(explanation["condition"], Value::Utf8("[(> b a) {a b} (== a 1)]".into()));
+        }
+
+        let cross = Relation::join(left, right, JoinKind::Cross, None).unwrap();
+        let descriptor = describe(&cross, &work).unwrap();
+        assert_eq!(descriptor.op, "cross-join");
+        assert_eq!(descriptor.explanation.value, Value::Null);
+    }
+
+    #[test]
+    fn explain_unnest_includes_the_ordinality_field_when_absent() {
+        let memory = MemoryBudget::new(1 << 20);
+        let work = work(&memory);
+        let field = |id, name: &str, data_type| Field {
+            id: ColumnId(id), name: name.into(), qualifier: None, qualified_only: false, unnamed: false, data_type,
+        };
+        let int = LogicalType::Scalar(ScalarType::I64);
+        let list = field(0, "items", LogicalType::list(int.clone()));
+        let input = Arc::new(Relation::empty(Schema::new(vec![list.clone()]).unwrap()));
+        let element = field(1, "item", int);
+        let relation = Relation::new(Schema::new(vec![list.clone(), element.clone()]).unwrap(),
+            RelationNode::Unnest { input, expr: list.expression(), element, ordinality: None, outer: false }).unwrap();
+        let descriptor = describe(&relation, &work).unwrap();
+        let Value::Struct(explanation) = descriptor.explanation.value else { panic!("Expected UNNEST metadata"); };
+        assert_eq!(explanation["ordinality"], Value::Null);
     }
 
     #[test]
