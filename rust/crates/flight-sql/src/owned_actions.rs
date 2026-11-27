@@ -5873,7 +5873,6 @@ impl Service {
         writes: &mut Vec<rtdb_node::OwnedWorldWrite>, reservations: &mut Vec<Arc<MemoryReservation>>,
     ) -> Result<(), Status> {
         use rtdb_node::OwnedWorldWrite;
-        use rtdb_types::{Interval, WorldShadow};
 
         for (relation, arrow) in groups {
             let batch = request_batch(call, call.retain_request_bytes(envelope.slice_ref(arrow)))?;
@@ -5893,55 +5892,161 @@ impl Service {
                 .ok_or_else(|| invalid("Owned world commit exceeds its total row limit"))?;
             let charge = call.reserve(wire::mul(batch.num_rows(), std::mem::size_of::<OwnedWorldWrite>() + 512)?)?;
             writes.try_reserve_exact(batch.num_rows()).map_err(|_| Status::resource_exhausted("Owned world commit allocation failed"))?;
+            reservations.push(charge);
+            if let Some(decoded) = try_world_arrow_writes(batch, &relation, proposal, call.memory(), writes) {
+                reservations.push(decoded);
+                continue;
+            }
             let (rows, decoded) = upload::owned_documents(batch, call.memory())?;
-            reservations.extend([charge, decoded]);
+            reservations.push(decoded);
             for mut row in rows {
                 let id = row.remove("_id").ok_or_else(|| invalid("Owned world write has no _id"))?.owned_entity_id().map_err(status)?;
                 let (Some(Value::Utf8(operation)), Some(from), Some(to), Some(payload)) = (
                     row.remove("_op"), row.remove("_valid_from_micros"), row.remove("_valid_to_micros"), row.remove("fact"),
                 ) else { return Err(invalid("Owned world write requires a typed operation and explicit valid endpoints")); };
-                let valid = match (optional_micros(Some(from))?, optional_micros(Some(to))?) {
-                    (None, None) => None,
-                    (Some(from), Some(to)) => {
-                        let valid = Interval::new(from, to).map_err(status)?;
-                        if valid.is_empty() { return Err(invalid("Owned world write needs a nonempty valid interval")); }
-                        Some(valid)
-                    }
-                    _ => return Err(invalid("Owned world write has only one valid endpoint")),
-                };
-                let create_only = operation == "insert";
-                if create_only && valid.is_some()
-                    && !(relation.is_world_custody_control() && valid == Some(Interval::ALL))
-                {
-                    return Err(invalid("World creates require acceptance validity or a full custody control interval"));
-                }
-                let mut ordered_keys = None;
-                let shadow = match (operation.as_str(), payload) {
-                    ("delete", Value::Null) => WorldShadow::Deleted,
-                    ("replace" | "insert", Value::Struct(mut fields)) => {
-                        strip_owned_absence(&mut fields)?;
-                        if let Some(slots) = fields.remove("_ordered_micros") {
-                            ordered_keys = match slots {
-                                Value::Binary(slots) if proposal => Some(slots),
-                                Value::Undefined | Value::Null => None,
-                                _ => return Err(invalid("Only an admitted Proposal can place ordered keys")),
-                            };
-                        }
-                        if fields.keys().any(|name| name.starts_with('_')) {
-                            return Err(invalid("Owned world fact contains a reserved field"));
-                        }
-                        let mut fact = StructFields::from([("_id".into(), id.as_value())]);
-                        fact.extend(fields);
-                        WorldShadow::Present(fact)
-                    }
-                    _ => return Err(invalid("Owned world writes require a complete fact or a null deletion")),
-                };
-                writes.push(OwnedWorldWrite { relation: relation.clone(), id, shadow, valid, create_only, ordered_keys });
+                let from = optional_micros(Some(from))?;
+                let to = optional_micros(Some(to))?;
+                writes.push(world_write(&relation, id, &operation, from, to, payload, proposal)?);
             }
         }
         Ok(())
     }
 
+}
+
+fn try_world_arrow_writes(
+    batch: &RecordBatch, relation: &OwnedRelation, proposal: bool, memory: &Arc<MemoryBudget>,
+    writes: &mut Vec<rtdb_node::OwnedWorldWrite>,
+) -> Option<Arc<MemoryReservation>> {
+    use arrow_array::{cast::AsArray, types::Int64Type};
+
+    let id = ArrowCell::named(batch, "_id", 0)?;
+    let fact = ArrowCell::named(batch, "fact", 0)?;
+    let op = ArrowCell::named(batch, "_op", 0)?;
+    let endpoint = |name| {
+        let cell = ArrowCell::named(batch, name, 0)?;
+        if !cell.field.metadata().is_empty() { return None; }
+        cell.array.as_primitive_opt::<Int64Type>()
+    };
+    let from = endpoint("_valid_from_micros")?;
+    let to = endpoint("_valid_to_micros")?;
+    let bytes = (0..batch.num_rows()).try_fold(8192usize, |bytes, row| {
+        let id_bytes = rtdb_columnar::estimate_read_value_bytes(id.field, id.array, row).ok()?;
+        let fact_bytes = rtdb_columnar::estimate_read_value_bytes(fact.field, fact.array, row).ok()?;
+        bytes.checked_add(id_bytes)?.checked_add(fact_bytes)
+    })?;
+    let charge = memory.reserve(bytes).ok()?;
+    let ids = rtdb_columnar::ColumnReader::new(id.field).ok()?;
+    let facts = rtdb_columnar::ColumnReader::new(fact.field).ok()?;
+    let start = writes.len();
+    let appended = (0..batch.num_rows()).try_for_each(|row| {
+        let id = ids.read_owned_entity_id(id.array, row).ok()??.into_owned();
+        let operation = upload::owned_operation(ArrowCell { row, ..op })?;
+        let from = from.is_valid(row).then(|| Timestamp(from.value(row)));
+        let to = to.is_valid(row).then(|| Timestamp(to.value(row)));
+        let payload = facts.read(fact.array, row).ok()?;
+        writes.push(world_write(relation, id, operation, from, to, payload, proposal).ok()?);
+        Some(())
+    });
+    if appended.is_none() {
+        writes.truncate(start);
+        return None;
+    }
+    Some(charge)
+}
+
+fn world_write(
+    relation: &OwnedRelation, id: EntityId, operation: &str, from: Option<Timestamp>, to: Option<Timestamp>,
+    payload: Value, proposal: bool,
+) -> Result<rtdb_node::OwnedWorldWrite, Status> {
+    use rtdb_types::WorldShadow;
+
+    let valid = match (from, to) {
+        (None, None) => None,
+        (Some(from), Some(to)) => {
+            let valid = Interval::new(from, to).map_err(status)?;
+            if valid.is_empty() { return Err(invalid("Owned world write needs a nonempty valid interval")); }
+            Some(valid)
+        }
+        _ => return Err(invalid("Owned world write has only one valid endpoint")),
+    };
+    let create_only = operation == "insert";
+    if create_only && valid.is_some()
+        && !(relation.is_world_custody_control() && valid == Some(Interval::ALL))
+    {
+        return Err(invalid("World creates require acceptance validity or a full custody control interval"));
+    }
+    let mut ordered_keys = None;
+    let shadow = match (operation, payload) {
+        ("delete", Value::Null) => WorldShadow::Deleted,
+        ("replace" | "insert", Value::Struct(mut fields)) => {
+            strip_owned_absence(&mut fields)?;
+            if let Some(slots) = fields.remove("_ordered_micros") {
+                ordered_keys = match slots {
+                    Value::Binary(slots) if proposal => Some(slots),
+                    Value::Undefined | Value::Null => None,
+                    _ => return Err(invalid("Only an admitted Proposal can place ordered keys")),
+                };
+            }
+            if fields.keys().any(|name| name.starts_with('_')) {
+                return Err(invalid("Owned world fact contains a reserved field"));
+            }
+            let mut fact = StructFields::from([("_id".into(), id.as_value())]);
+            fact.extend(fields);
+            WorldShadow::Present(fact)
+        }
+        _ => return Err(invalid("Owned world writes require a complete fact or a null deletion")),
+    };
+    Ok(rtdb_node::OwnedWorldWrite { relation: relation.clone(), id, shadow, valid, create_only, ordered_keys })
+}
+
+#[test]
+fn world_arrow_envelopes_keep_typed_identity_validity_and_shadows_in_order() {
+    use arrow_array::{DictionaryArray, Int8Array, types::Int8Type};
+    use arrow_buffer::NullBuffer;
+    use rtdb_types::WorldShadow;
+
+    let relation = OwnedRelation::new("facts").unwrap();
+    let memory = MemoryBudget::new(1 << 20);
+    let keys = DictionaryArray::<Int8Type>::try_new(
+        Int8Array::from(vec![0, 0, 1, 2]), Arc::new(StringArray::from(vec!["replace", "delete", "unknown"])),
+    ).unwrap();
+    let ids = rtdb_columnar::entity_id_array([
+        EntityIdRef::Integer(0), EntityIdRef::String("same"), EntityIdRef::Binary(b"same"), EntityIdRef::Integer(3),
+    ]).unwrap();
+    let fact = StructArray::new(
+        vec![Field::new("name", DataType::Utf8, true)].into(),
+        vec![Arc::new(StringArray::from(vec![None, Some("value"), None, None]))],
+        Some(NullBuffer::from(vec![false, true, false, false])),
+    );
+    let fields = vec![
+        Field::new("_op", keys.data_type().clone(), false),
+        rtdb_columnar::to_field("_id", &entity_id_type()).unwrap(),
+        Field::new("_valid_to_micros", DataType::Int64, true),
+        Field::new("fact", fact.data_type().clone(), true),
+        Field::new("_valid_from_micros", DataType::Int64, true),
+    ];
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), vec![
+        Arc::new(keys), ids, Arc::new(Int64Array::from(vec![None, Some(20), None, None])),
+        Arc::new(fact), Arc::new(Int64Array::from(vec![None, Some(10), None, None])),
+    ]).unwrap();
+    let mut writes = Vec::new();
+    let charge = try_world_arrow_writes(&batch.slice(1, 2), &relation, false, &memory, &mut writes).unwrap();
+    assert_eq!(writes.len(), 2);
+    assert_eq!(writes[0].id, EntityId::String("same".into()));
+    assert_eq!(writes[0].valid, Some(Interval::new(Timestamp(10), Timestamp(20)).unwrap()));
+    assert_eq!(writes[0].shadow, WorldShadow::Present(StructFields::from([
+        ("_id".into(), writes[0].id.as_value()), ("name".into(), Value::Utf8("value".into())),
+    ])));
+    assert_eq!(writes[1].id, EntityId::Binary(b"same".to_vec()));
+    assert_eq!(writes[1].valid, None);
+    assert_eq!(writes[1].shadow, WorldShadow::Deleted);
+    assert!(try_world_arrow_writes(&batch.slice(1, 3), &relation, false, &memory, &mut writes).is_none());
+    assert_eq!(writes.len(), 2);
+    assert_eq!(memory.used_bytes(), charge.bytes());
+}
+
+impl Service {
     pub(crate) async fn read_owned_action(&self, call: &Call, body: &Bytes, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (relation, id, _, _identity) = point_request(call, body, body, PointTime::Default)?;

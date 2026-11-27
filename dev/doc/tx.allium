@@ -412,6 +412,8 @@
 -- For each ancestor or Root holder, the receiver checks whether the union of newer masks covers its overlap with a local claim.
 -- Two adjacent half-open claims may share the key, and any remaining intersection aborts the world write.
 -- Acceptance-valid writes in a Held world start at the logical clock that the world publishes with them and have an open end.
+-- A Flight world commit preserves the complete typed identity, submitted row order and nullable signed microsecond bounds of its Arrow writes.
+-- A null fact in a delete selects an absence shadow, and a replacement or insert supplies a complete fact.
 -- Held Original replay installs complete-key capacity rules at their source transaction and requires the exact resulting frontier and counter effects.
 -- When an Original replay receipt carries archived assertion positions, the governed events retain those exact positions in the destination transaction.
 -- A fresh held read can derive a scoped read-only hold at the actual last visible publication marker.
