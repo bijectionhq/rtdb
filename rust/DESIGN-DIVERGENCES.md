@@ -1,8 +1,9 @@
 # RTDB and upstream XTDB: deliberate design divergences
 
-This document lists the remaining deliberate divergences between RTDB (`rust/crates/*`, audited on `w4/integration`) and upstream XTDB (`0b9fa440f2`).
+This document lists the remaining deliberate divergences between RTDB (`rust/crates/*`) and upstream XTDB (`0b9fa440f2`).
 Divergences that have been closed to match upstream XTDB are omitted.
-That includes GC reader leases, directory-page grace timers, the replica SHA-256 digest chain, aggregate and `DISTINCT` spilling, binary Flight SQL run tickets, vendored DataFusion expression lowering, default query spill caps, RTDB-only plain snapshot tokens, startup refusal on unreadable host locales, refusal of custom `file:` JSON log templates, and Docker `/var/lib/rtdb` default paths.
+Classic assigns strictly increasing system times as XTDB does, advancing the previous time by one microsecond when the automatic time stalls and rejecting supplied times at or before the head.
+Plain SQL snapshot tokens name those times using XTDB's `TimeBasis` format.
 
 Path abbreviations:
 
@@ -146,8 +147,10 @@ Nodes configured with a key vault or default erasure write encrypted logs and ob
 ### 1.7 Disk cache layout, owner lock, and heap buffer pool
 
 **What differs.**
-Upstream XTDB stores disk-cache files under `c1/<sha256>/`, fills misses with one streamed GET, and memory-maps individual record-batch byte slices in `MemoryCache`.
-RTDB stores disk-cache files under `~rtdb-store-<sha256>/0/` guarded by an exclusive `.tmp/.owner-lock` and fills misses with sequential 1 MiB range GETs.
+For a remote store with an XTDB-compatible URI and no Classic sealing keys, RTDB uses the upstream `c1/<first 32 hex digits of SHA-256(uri)>/` cache namespace.
+Other cacheable stores use the RTDB namespace `~rtdb-store-<sha256>/0/`, keyed by provider, storage identity, and epoch.
+RTDB guards the cache with an exclusive `.tmp/.owner-lock` and fills misses using range GETs of up to 1 MiB where the backing store supports them.
+Upstream fills misses with a streamed GET and memory-maps individual record-batch byte slices in `MemoryCache`.
 RTDB's `BufferPool` reads raw objects into heap buffers and stores decoded views (metadata, layouts, decoded pages) under one shared `CacheBudget` mutex rather than memory-mapping slices.
 
 **Why.**
@@ -155,8 +158,8 @@ An explicit owner lock prevents two nodes from corrupting a shared cache directo
 Sharing one `CacheBudget` across raw bytes and decoded views enforces RTDB's hard process memory ceiling without relying on JVM direct-memory mapping.
 
 **What a user sees.**
-An XTDB node and an RTDB node must not share the same disk-cache directory.
-Cold reads of large remote files perform multiple 1 MiB range GETs and heap copies instead of one streamed download and mmap.
+Give each running node its own disk-cache directory.
+Cold reads from range-capable stores can perform multiple GETs, and RTDB's memory cache retains heap buffers.
 
 **Where in the code.**
 - `RC/storage/src/cache.rs` (`BufferPool`, `CacheBudget`)
@@ -209,25 +212,7 @@ Reading past the GC retention window fails with `XX000` as in XTDB, but carries 
 
 ## 2. Transactions, system time, and replication
 
-### 2.1 Non-decreasing system time (T7 ties) on the classic path
-
-**What differs.**
-Upstream `TxResolver` strictly advances automatic system time by +1 µs whenever the log timestamp does not advance past the head, and rejects any supplied `SYSTEM_TIME` less than or equal to the latest completed transaction with `"specified system-time must be later than current tx"` (logged at WARN).
-On `w4/integration`, RTDB uses `follows` (`<=`): a stalled, regressed, or same-microsecond log timestamp holds at the predecessor's time without minting +1 µs, and a supplied `SYSTEM_TIME` equal to the head commits (rejecting only strictly earlier times with `"specified system-time must not be earlier than current tx"`).
-Note: this divergence is under active review against XTDB's strict-increase rule.
-
-**Why.**
-In shared-main deployments that interleave classic transactions with `rtdb.store.v1` appends, minting a synthetic +1 µs timestamp past the wall clock can make a subsequent store append look like a clock regression (T7).
-
-**What a user sees.**
-Concurrent local-log writes in the same microsecond, bursts on millisecond-grained Kafka logs, and transactions supplying a `SYSTEM_TIME` equal to the head commit with tied system times instead of advancing or aborting.
-Because XTDB's `TimeBasis` snapshot tokens and `AS OF SYSTEM_TIME` reads name prefixes by system time alone, a read or token at a tied instant observes every transaction sharing that timestamp.
-
-**Where in the code.**
-- `RC/tx/src/system_time.rs` (`follows`, `automatic_time`, `external_time`)
-- `RC/tx/src/resolver.rs` (`supplied_time`, `smooth`)
-
-### 2.2 Native `rtdb.v1` protocol, Classic vs v1 partitions, and `rtdb.store.v1`
+### 2.1 Native `rtdb.v1` protocol, Classic vs v1 partitions, and `rtdb.store.v1`
 
 **What differs.**
 Upstream XTDB provides one linear SQL/XTQL write and read model per database.
@@ -251,26 +236,26 @@ Any database that executes `rtdb.v1` writes produces framed records that upstrea
 - `RC/index/src/branches.rs`
 - `rust/README.adoc`
 
-### 2.3 Serving-leader clock lease and offered clock-slot wait
+### 2.2 Offered clock slots for native writes
 
 **What differs.**
-Upstream XTDB has no leader clock lease and no offered clock-slot submission wait.
-On `w4/integration`, when native serving mode is active (`self.serving.is_some()`), RTDB's replica appender periodically writes framed `NoOp.clock_lease_micros` records (a 2 s lease) and a newly promoted leader delays decisions until its clock passes the prior lease plus drift.
-Submitters consuming an offered clock slot wait up to 1.5 s (`clock_slot_wait`) for the local clock to reach the slot reading before appending.
+A native write that consumes an offered clock slot waits for the local clock to reach the slot's reading, up to 1.5 seconds.
+The replica appender's serving-leader clock lease and its promotion gate have been removed.
+Multi's ordered journal has its own [writer clock lease](../dev/doc/ordered-bytes-store.adoc) for bounded-drift sampling across writer handoffs.
 
 **Why.**
-Native serving and funded appointments need a bounded-drift guarantee across leader failover without reading the last hidden commit timestamp.
+Funded native operations can name the offered clock reading before submitting the write that consumes it.
 
 **What a user sees.**
-Plain XTDB server workloads never enable `self.serving`, emit no clock-lease records, and do not hit `clock_slot_wait`.
-Native serving leaders pause briefly on failover until the previous lease expires, and their replica log contains framed lease no-ops that XTDB refuses (§1.1).
+A native submit using an offered clock slot can wait before its source-log append.
 
 **Where in the code.**
-- `RC/replication/src/appender.rs` (`ClockLease`, `LEADER_CLOCK_LEASE_MICROS`, `clock_lease_record`)
-- `RC/replication/src/driver.rs` (`clock_lease_admits`)
 - `RC/tx/src/system_time.rs` (`clock_slot_wait`, `clock_slot_reading`)
+- `RC/node/src/node.rs`
+- `RC/flight-sql/src/owned_actions.rs`
+- `RC/db/src/multi.rs`
 
-### 2.4 Idempotent and bounded-retry SQL submissions
+### 2.3 Idempotent and bounded-retry SQL submissions
 
 **What differs.**
 Upstream XTDB has no built-in idempotency key or bounded-retry guard on SQL `Tx` log messages.
@@ -289,7 +274,7 @@ Clients using guards get deduplicated replay receipts, and the resulting framed 
 - `RC/tx/src/idempotency_window.rs`
 - `RC/tx/src/source.rs`
 
-### 2.5 Sealed snapshot tokens for placed databases and world-overlay refusal
+### 2.4 Sealed snapshot tokens for placed databases and world-overlay refusal
 
 **What differs.**
 Plain RTDB snapshot tokens now match upstream XTDB's stateless base64 protobuf `TimeBasis` and are interoperable in both directions.
@@ -306,7 +291,7 @@ Placed-database tokens are opaque `rtdb-sealed-snapshot-v4:` strings rejected by
 **Where in the code.**
 - `RC/node/src/sql_snapshots.rs` (`SEALED_PREFIX`, `encode`, `decode`, `overlaid`)
 
-### 2.6 Replication driver gates, watcher fault recovery, and standalone compactor
+### 2.5 Replication driver gates, watcher fault recovery, and standalone compactor
 
 **What differs.**
 RTDB's replication driver keeps upstream's leader/follower election and log-processor pipeline, with several deliberate operational differences:
@@ -333,18 +318,18 @@ Offline repair and active standalone compaction work out of the box without a li
 - `RC/replication/src/repair.rs`
 - `RC/node/src/node.rs` (`wire_await_time`)
 
-### 2.7 Additional log backends and native Kafka Connect plugin model
+### 2.6 Additional log backends and native Kafka Connect plugin model
 
 **What differs.**
 Alongside InMemory, Local, ReadOnlyLocal, and Kafka, RTDB adds Logkeeper quorum logs, `logkeeper-consensus://`, Multi hosted journals, and FileJournal.
-For Kafka, RTDB uses `librdkafka` (translating Java client properties and refusing `transactional.id`; JVM JAAS mechanisms `GSSAPI` and `OAUTHBEARER` are not implemented).
+For Kafka, RTDB uses `librdkafka`, translates supported Java client properties, and refuses `transactional.id`.
 For Kafka Connect sources, RTDB replaces dynamic JVM classloading with a closed native registry of converters (String, primitives, ByteArray, JSON, Confluent Avro, JSON Schema), SMTs (Cast, Flatten, Timestamp, etc.), and three predicates, returning `xtdb.kafka-connect-source/plugin-class-not-found` for unknown classes, and adds schema-registry data-contract rules with a DLQ producer.
 
 **Why.**
 A native Rust binary cannot load arbitrary Java JARs from a classpath and needs native quorum-log backends for hosted Multi clusters.
 
 **What a user sees.**
-Custom Java Kafka Connect converters/SMTs and JVM JAAS (`GSSAPI`/`OAUTHBEARER`) are rejected at configuration time.
+RTDB rejects custom Java Kafka Connect converters and transforms at configuration time.
 Built-in Connect pipelines gain schema-registry data-contract rules and DLQ support without a JVM.
 
 **Where in the code.**
@@ -603,7 +588,10 @@ Defining a search, vector, spatial, or ordered index adds artefacts and table-bl
 
 **What differs.**
 RTDB implements several core engine internals differently from XTDB while preserving observable query semantics:
-- **Live index:** `LiveTable` stores immutable per-transaction Arrow `IndexBatch` chunks (merging adjacent equal-schema chunks up to `page_limit`, with `PartitionState::apply` building outside the write lock) instead of one growable in-place `Relation`, and `TrieCatalog` clones its `BTreeMap` on change instead of using Clojure persistent maps.
+- **Live index.** Each `LiveTable` version holds a persistent `LiveRelation` of immutable Arrow `IndexBatch` chunks with stable row addresses.
+  Later versions share the prefix, and readers keep their original version.
+  XTDB appends to a growable in-place `Relation`.
+  RTDB's `TrieCatalog` clones its `BTreeMap` on change.
 - **Scan merge and temporal resolution:** `PartitionScan` runs a `BinaryHeap` k-way merge and general `HistoryResolver` polygon calculation rather than per-page `SingleIidSelector` binary search and `AsOfResolver` early exit.
 - **Metadata pruning:** leaf statistics are decoded lazily into `Value` trees (`LeafColumns`) per visited leaf and roaring bloom filters are deserialized per check rather than queried zero-copy.
 - **Value boundaries:** while system columns (`_iid`, `_valid_*`, `_system_*`) are Arrow arrays, spill uses Arrow IPC, and pgwire encodes directly from Arrow where supported, several operators (non-columnar joins, aggregates, window, set ops), DML writes (`TransactionBuffer`), Flight bulk ingest, and compaction merges (`SegmentCompactor`, running parallel jobs on `spawn_blocking`) still convert through owned `Value` / `StoredEvent` trees.
@@ -655,7 +643,8 @@ A `COPY FROM STDIN` exceeding 1 GiB is rejected, and plaintext connections to an
 ### 5.2 Flight SQL extensions, signed inspection tickets, and Flight TLS
 
 **What differs.**
-RTDB's Flight SQL `run` and `empty` tickets now use upstream XTDB's unsigned JSON `QueryTicket` format and redeem across sessions, restarts, and XTDB/RTDB peers (emitting RTDB-only `"searchPath"` and `"awaitFloor"` keys only when they differ from defaults).
+RTDB's plain Flight SQL `run` and `empty` tickets use upstream XTDB's unsigned JSON `QueryTicket` format.
+RTDB can include the extension keys `"searchPath"` and `"awaitFloor"` for non-default query state.
 Three deliberate RTDB extensions remain:
 - control inspections (`SHOW`) issue HMAC-signed, session-bound `"inspect"` tickets that expire with the session;
 - `ListActions` advertises `rtdb.v1.*` (and, when enabled, `rtdb.store.v1`, `rtdb.owned.*`, `rtdb.custody.v1`, `rtdb.admin.v1`, and hosted DoExchange uploads) alongside the standard Flight SQL actions;
@@ -665,8 +654,9 @@ Three deliberate RTDB extensions remain:
 `SHOW` commands read session state that cannot safely be replayed by another caller, while native v1, admin, and hosted protocols share the Flight transport.
 
 **What a user sees.**
-Standard Flight SQL / ADBC queries produce and accept XTDB-compatible JSON tickets.
-`ListActions` includes additional `rtdb.*` actions, and inspection tickets cannot be shared across sessions or restarts.
+Standard Flight SQL / ADBC queries produce and accept plain XTDB JSON tickets.
+`ListActions` includes additional `rtdb.*` actions, and inspection tickets expire with their issuing session.
+Hosted audience reads use the Root's ordinary store connection with kernel version tokens.
 
 **Where in the code.**
 - `RC/flight-sql/src/ticket.rs`
@@ -719,23 +709,7 @@ YAML files using RTDB-only keys (such as `search.*`, `grants`, `query.spillLimit
 - `RC/config/src/`
 - `RC/multi/src/`
 
-### 5.5 Runtime version build metadata (`+rtdb.<pkg>`)
-
-**What differs.**
-Upstream XTDB reports `2.x-SNAPSHOT` (or `XTDB_VERSION`) in `version()`, `XT.VERSION`, and Flight `SqlInfo`.
-When `XTDB_VERSION` is unset, RTDB reports `2.x-SNAPSHOT+rtdb.<CARGO_PKG_VERSION>` (currently `2.x-SNAPSHOT+rtdb.0.1.0`), while `--build-info` reports the native crate version `0.1.0`.
-Setting `XTDB_VERSION` overrides runtime version output identically to XTDB.
-
-**Why.**
-Semver build metadata identifies the native RTDB release while keeping version-parsing clients compatible with XTDB `2.x`.
-
-**What a user sees.**
-`SELECT version()` returns `PostgreSQL 16 (XTDB 2.x-SNAPSHOT+rtdb.0.1.0)` unless `XTDB_VERSION` is set.
-
-**Where in the code.**
-- `RC/types/src/version.rs` (`DEFAULT_RUNTIME_VERSION`, `install_runtime_version`)
-
-### 5.6 Container runtime, backend Cargo features, and cluster configurations
+### 5.5 Container runtime, backend Cargo features, and cluster configurations
 
 **What differs.**
 Upstream XTDB ships an Alpine image running as user `xtdb` (UID/GID 20000) on a custom JRE with runtime backend modules.
@@ -758,20 +732,23 @@ Container tooling inside the image sees Debian (`apt`) and user `rtdb` instead o
 - `RC/server/Cargo.toml`
 - `RC/server/src/main.rs`
 
-### 5.7 Observability: logging targets, JSON templates, metrics, tracing export, and crash logs
+### 5.6 Observability: logging targets, JSON templates, metrics, tracing export, and crash logs
 
 **What differs.**
 RTDB's `tracing` subscriber honours `XTDB_LOG_FORMAT`, `XTDB_LOGGING_LEVEL[_NS]`, and `XTDB_LOG_JSON_TEMPLATE` (compiling bundled `classpath:` templates or `file:` Log4j2 `JsonTemplateLayout` templates at startup, refusing startup on unsupported resolvers) and aliases 18 core `rtdb_*` targets to upstream `xtdb.*` logger names; unaliased Rust modules report as `xtdb.<crate>.<module>`.
-Metrics use 16 per-thread sample shards, omit JVM-only binders (`jvm.*`) and per-allocator child gauges, and add RTDB-only metrics (`rtdb.cache.{limit,retained}.bytes`, `rtdb.gc.error`, `rtdb.kafka.warning`, `rtdb.replica.commit.*`, `query.linearizable`, `query.page`, `query.track`).
-OTLP trace export sends HTTP/JSON (`application/json`) over a 1,024-span queue instead of OTLP protobuf, and CloudWatch/Azure metric exporters use native JSON envelopes instead of Micrometer registries.
-`CrashLogger` writes `crash.edn`, `tx-ops.arrow`, `live-trie.binpb`, and `live-table.arrow` under `crashes/<node-id>/<instant>/`; writing `open-tx-table.arrow`, `open-tx-trie.binpb`, and `query-rel.arrow` is implemented via `CrashSite` but not yet wired from the transaction resolver.
+Metrics use 16 per-thread sample shards, publish native allocator gauges, omit JVM-only binders (`jvm.*`), and add RTDB-only metrics (`rtdb.cache.{limit,retained}.bytes`, `rtdb.gc.error`, `rtdb.kafka.warning`, `rtdb.replica.commit.*`, `query.linearizable`, `query.page`, `query.track`).
+OTLP traces use HTTP protobuf.
+CloudWatch and Azure metric exporters build native JSON payloads.
+Crash logs under `crashes/<node-id>/<instant>/` include `crash.edn`, available transaction operations and live-table data, and transaction-local files when the resolver reports a failed table operation with a captured open table.
+The driver currently supplies no query relation to the crash writer.
 
 **Why.**
 Native Rust binaries replace JVM-only libraries (Log4j2, Micrometer, OpenTelemetry Java SDK) with `tracing` and lightweight JSON exporters while preserving upstream environment variables, Prometheus exposition, and core metric names.
 
 **What a user sees.**
 `XTDB_LOG_FORMAT`, `XTDB_LOG_JSON_TEMPLATE` (for bundled and `file:` templates using supported resolvers), and `XTDB_LOGGING_LEVEL` work as in XTDB, though fine-grained sub-logger names outside the 18 aliases follow Rust module names.
-JVM-specific `jvm.*` metrics are absent, OTLP collectors must accept OTLP/HTTP JSON, and crash dumps currently omit open-transaction and query-relation files until the resolver passes `CrashSite`.
+Prometheus exposes native allocator and replica metrics alongside RTDB-specific counters.
+The transaction crash path currently omits `query-rel.arrow`.
 
 **Where in the code.**
 - `RC/metrics/src/logging.rs` (`UPSTREAM_ALIASES`)
