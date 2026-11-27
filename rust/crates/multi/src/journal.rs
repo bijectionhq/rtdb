@@ -180,13 +180,17 @@ impl InstalledJournal {
     }
 
     pub async fn grant(&self, nomination: &Request) -> Result<WriterAdmission> {
+        self.grant_typed(nomination).await.map_err(JournalError::into_anomaly)
+    }
+
+    pub(crate) async fn grant_typed(&self, nomination: &Request) -> std::result::Result<WriterAdmission, JournalError> {
         let Command::Grant { expected, candidate } = &nomination.command else {
-            return Err(mismatch("The request is not a writer nomination"));
+            return Err(JournalError::Other(mismatch("The request is not a writer nomination")));
         };
-        let decision = self.execute(nomination).await?;
-        let Outcome::Granted { grant, recovery } = decision.receipt.outcome.map_err(refused)?
+        let decision = self.execute_typed(nomination).await?;
+        let Outcome::Granted { grant, recovery } = decision.receipt.outcome.map_err(JournalError::Refused)?
         else {
-            return Err(mismatch("The journal did not return a writer grant"));
+            return Err(JournalError::Other(mismatch("The journal did not return a writer grant")));
         };
         if !adapter_command::ordered_writer_successor(
             expected.epoch,
@@ -198,9 +202,9 @@ impl InstalledJournal {
             || recovery.id != nomination.id
             || recovery.admitted_at != decision.receipt.position
         {
-            return Err(mismatch(
+            return Err(JournalError::Other(mismatch(
                 "The writer grant disagrees with its predecessor or protected recovery basis",
-            ));
+            )));
         }
         Ok(WriterAdmission {
             grant,
@@ -363,14 +367,18 @@ impl InstalledJournal {
     }
 
     pub async fn hold(&self, request: &Request) -> Result<Hold> {
-        let decision = self.execute(request).await?;
-        let Outcome::Protected(hold) = decision.receipt.outcome.map_err(refused)? else {
-            return Err(mismatch(
+        self.hold_typed(request).await.map_err(JournalError::into_anomaly)
+    }
+
+    pub(crate) async fn hold_typed(&self, request: &Request) -> std::result::Result<Hold, JournalError> {
+        let decision = self.execute_typed(request).await?;
+        let Outcome::Protected(hold) = decision.receipt.outcome.map_err(JournalError::Refused)? else {
+            return Err(JournalError::Other(mismatch(
                 "The peer did not protect the ordered replay interval",
-            ));
+            )));
         };
         if hold.id != request.id || hold.admitted_at != decision.receipt.position {
-            return Err(mismatch("The replay hold addresses a different invocation"));
+            return Err(JournalError::Other(mismatch("The replay hold addresses a different invocation")));
         }
         Ok(hold)
     }
@@ -400,14 +408,18 @@ impl InstalledJournal {
     }
 
     pub async fn append(&self, request: &Request) -> Result<AppendResult> {
-        let decision = self.execute(request).await?;
-        let Outcome::Appended(result) = decision.receipt.outcome.map_err(refused)? else {
-            return Err(mismatch(
+        self.append_typed(request).await.map_err(JournalError::into_anomaly)
+    }
+
+    pub(crate) async fn append_typed(&self, request: &Request) -> std::result::Result<AppendResult, JournalError> {
+        let decision = self.execute_typed(request).await?;
+        let Outcome::Appended(result) = decision.receipt.outcome.map_err(JournalError::Refused)? else {
+            return Err(JournalError::Other(mismatch(
                 "The peer did not return the ordered append receipt",
-            ));
+            )));
         };
         append_selection::chosen_result_at(result, result.position, decision.receipt.position)
-            .ok_or_else(|| mismatch("The append result names a different command position"))
+            .ok_or_else(|| JournalError::Other(mismatch("The append result names a different command position")))
     }
 
     pub async fn checkpoint_cut(&self, next: u64) -> Result<Cut> {
@@ -536,28 +548,51 @@ impl InstalledJournal {
     }
 
     pub async fn execute(&self, request: &Request) -> Result<wire::Decision> {
+        self.execute_typed(request).await.map_err(JournalError::into_anomaly)
+    }
+
+    pub(crate) async fn execute_typed(&self, request: &Request) -> std::result::Result<wire::Decision, JournalError> {
         if request.placement != self.placement || request.principal != self.authority.principal() {
-            return Err(mismatch(
+            return Err(JournalError::Other(mismatch(
                 "The request addresses a different installed journal credential",
-            ));
+            )));
         }
-        let reply = self.call(Operation::Execute(request.clone())).await?;
+        let reply = self.call_typed(Operation::Execute(request.clone())).await?;
         let Reply::Decision(decision) = reply else {
-            return Err(mismatch("The peer did not return the ordered decision"));
+            return Err(JournalError::Other(mismatch("The peer did not return the ordered decision")));
         };
         Ok(decision)
     }
 
     async fn call(&self, operation: Operation) -> Result<Reply> {
+        self.call_typed(operation).await.map_err(JournalError::into_anomaly)
+    }
+
+    async fn call_typed(&self, operation: Operation) -> std::result::Result<Reply, JournalError> {
         match self.client.call(operation).await.map_err(|error| {
-            Anomaly::new(
+            JournalError::Transport(Anomaly::new(
                 AnomalyCategory::Unavailable,
                 "rtdb.multi/ordered-journal",
                 error.to_string(),
-            )
+            ))
         })? {
-            Reply::Refused(reason) => Err(refused(reason)),
+            Reply::Refused(reason) => Err(JournalError::Refused(reason)),
             reply => Ok(reply),
+        }
+    }
+}
+
+pub(crate) enum JournalError {
+    Transport(Anomaly),
+    Refused(Refusal),
+    Other(Anomaly),
+}
+
+impl JournalError {
+    pub(crate) fn into_anomaly(self) -> Anomaly {
+        match self {
+            Self::Transport(error) | Self::Other(error) => error,
+            Self::Refused(reason) => refused(reason),
         }
     }
 }

@@ -1093,14 +1093,11 @@ impl Placement {
                 request
             }
         };
-        let result = self.worker.grant(&request).await;
-        if !result
-            .as_ref()
-            .is_err_and(|error| error.code == "rtdb.multi/ordered-journal")
-        {
+        let result = self.worker.grant_typed(&request).await;
+        if !matches!(result, Err(crate::journal::JournalError::Transport(_))) {
             *pending = None;
         }
-        result
+        result.map_err(crate::journal::JournalError::into_anomaly)
     }
 
     pub(crate) async fn checkpoint_custody(

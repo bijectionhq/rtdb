@@ -50,15 +50,20 @@ impl Retention {
         let Command::DisposeExpired { enrollment } = request.command else {
             return Err(invalid("The pending request is not an expiry disposal"));
         };
-        let result = custodian.execute(request).await;
-        if result
-            .as_ref()
-            .is_err_and(|error| error.code == "rtdb.multi/ordered-journal")
-        {
-            return result.map(|_| ());
-        }
-        *pending = None;
-        match result?.receipt.outcome {
+        let decision = match custodian.execute_typed(request).await {
+            Ok(decision) => {
+                *pending = None;
+                decision
+            }
+            Err(error @ crate::journal::JournalError::Transport(_)) => {
+                return Err(error.into_anomaly());
+            }
+            Err(error) => {
+                *pending = None;
+                return Err(error.into_anomaly());
+            }
+        };
+        match decision.receipt.outcome {
             Ok(Outcome::WorkerDisposed(disposed)) if disposed == enrollment => Ok(()),
             Err(Refusal::Unavailable | Refusal::Expired) => Ok(()),
             Err(reason) => Err(refused(reason)),

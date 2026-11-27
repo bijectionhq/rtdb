@@ -1,13 +1,13 @@
 //! RTDB storage-log projection of the installed journal's ordered grants
 //! and exact replay intervals.
 
-use super::{InstalledJournal, ReadFailure, WriterAdmission, adapter_command, append_selection, latest, replay_cursor};
+use super::{InstalledJournal, JournalError, ReadFailure, WriterAdmission, adapter_command, append_selection, latest, replay_cursor};
 use crate::{cipher::SEALED_OVERHEAD, keys::{JournalKey, KeyService}};
 use async_trait::async_trait;
 use bytes::Bytes;
 use ordered_logkeeper::ordered::{
     APPEND_RECORD_CHARGE_BYTES, AppendClass, Command, Cut, Grant, Hold, MAX_OBJECT_REFERENCES,
-    ObjectName, Request, RequestId,
+    ObjectName, Refusal, Request, RequestId,
     service::Route,
 };
 use rtdb_node::{ProtectedReadIndex, ReplicaReadIndex};
@@ -140,16 +140,22 @@ impl Held {
         request: Request,
         tasks: &TaskTracker,
     ) -> rtdb_types::Result<Arc<Self>> {
-        let (send, receive) = oneshot::channel();
+        let (mut send, receive) = oneshot::channel();
         let journal = Arc::clone(journal);
         let worker = tasks.clone();
         tasks.spawn(async move {
             let admitted = loop {
-                match journal.hold(&request).await {
-                    Err(error) if error.code == "rtdb.multi/ordered-journal" => {
-                        tokio::time::sleep(ORDERED_ADMISSION_RETRY).await
+                if send.is_closed() {
+                    return;
+                }
+                match journal.hold_typed(&request).await {
+                    Err(JournalError::Transport(_)) => {
+                        tokio::select! {
+                            _ = send.closed() => return,
+                            _ = tokio::time::sleep(ORDERED_ADMISSION_RETRY) => {}
+                        }
                     }
-                    result => break result,
+                    result => break result.map_err(JournalError::into_anomaly),
                 }
             };
             let result = admitted.map(|hold| Self::pin(journal, hold, &worker));
@@ -310,29 +316,27 @@ impl JournalLog {
         else {
             return Err(Error::Task("Pending ordered work is not an append".into()));
         };
-        let result = match self.reads.journal.append(request).await {
+        let result = match self.reads.journal.append_typed(request).await {
             Ok(result) => result,
-            Err(error) if error.code == "rtdb.multi/ordered-expired" => self
+            Err(JournalError::Refused(Refusal::Expired)) => self
                 .reads
                 .journal
                 .reconcile(writer.grant, request.clone())
                 .await
                 .map_err(storage)?,
-            Err(error) if error.code == "rtdb.multi/ordered-capacity" => {
+            Err(error @ JournalError::Refused(Refusal::Capacity)) => {
                 let capacity = (*class == AppendClass::Data).then(|| Error::AppendCapacity {
                     required_bytes: (payload.len() as u64)
                         .saturating_add(APPEND_RECORD_CHARGE_BYTES),
                 });
                 writer.pending = None;
-                return Err(capacity.unwrap_or_else(|| storage(error)));
+                return Err(capacity.unwrap_or_else(|| storage(error.into_anomaly())));
             }
-            Err(error) if matches!(error.code.as_str(),
-                "rtdb.multi/ordered-conflict" | "rtdb.multi/ordered-replay-unavailable")
-            => {
+            Err(error @ JournalError::Refused(Refusal::Conflict | Refusal::Unavailable)) => {
                 writer.pending = None;
-                return Err(storage(error));
+                return Err(storage(error.into_anomaly()));
             }
-            Err(error) => return Err(storage(error)),
+            Err(error) => return Err(storage(error.into_anomaly())),
         };
         if !append_selection::matches_pending_append(
             result.class, *class, result.lsn, *expected_next, writer.head.next_lsn,
