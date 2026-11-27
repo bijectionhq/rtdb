@@ -259,3 +259,25 @@ message SizeBucket {
   uint64 value_bytes = 4;
   uint64 presences = 5;
 }
+
+// rtdb.store.v1.PurgeFloor uses this schema when the writer serves the durable floor.
+// The effect covers the entire store incarnation and requires a verified credential with unscoped database write access.
+message PurgeFloorRequest {
+  // Exactly 16 bytes, identifying the store incarnation observed by the planner.
+  bytes incarnation = 1;
+  // Required, including when zero. The retained Version of every guard observation.
+  optional uint64 since = 2;
+  // Required, including when zero. Versions strictly below this bound may become eligible for reclamation.
+  // This Version must be at or below since.
+  optional uint64 keep_from = 3;
+  // Nonempty, in the planner's order, including retention and writer-fence guards.
+  // A write after since intersecting any guard refuses publication.
+  repeated KeyRange reads = 4;
+}
+
+message PurgeFloorReply {
+  bytes incarnation = 1;
+  // Present on success and equal to the request's keep_from. The durable floor is at least this Version.
+  // Every retry must pass current writer, basis and guard admission, even when the floor already covers the request.
+  optional uint64 keep_from = 2;
+}
