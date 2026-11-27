@@ -2592,9 +2592,9 @@ impl OwnedReadSession {
             return Err(historical_owned_read::unavailable());
         }
         let context = self.relation_context(relation)?;
-        let (schema, _charge) = rtdb_query::read_owned_relation_schema(Arc::clone(&context), &self.owner, relation)
-            .await?.ok_or_else(historical_owned_read::unavailable)?;
-        if schema.has_opaque_columns() || schema.lifetime_micros().is_some() {
+        if rtdb_query::read_owned_relation_schema(Arc::clone(&context), &self.owner, relation)
+            .await?.is_some_and(|(schema, _)| schema.has_opaque_columns() || schema.lifetime_micros().is_some())
+        {
             return Err(historical_owned_read::unavailable());
         }
         self.certify_historical_cut(relation, system.min(commit)).await?;
