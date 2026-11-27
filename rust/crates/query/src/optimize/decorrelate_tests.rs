@@ -133,14 +133,24 @@ fn tagged() -> Arc<Relation> {
     Arc::new(Relation::new(Schema::new(vec![customer_id(), tags()]).unwrap(), RelationNode::Values { rows }).unwrap())
 }
 
-/// `SELECT t.*, u.* FROM t JOIN LATERAL UNNEST(t.tags) [WITH ORDINALITY] AS u ON <selected>`, as an apply over the tag
-/// table, binding the tags to parameter 0 and the customer to parameter 1.
-fn unnested(numbered: bool, selected: Option<Expr>) -> Arc<Relation> {
+fn tag_column_table(numbered: bool) -> Arc<Relation> {
     let element = integer(41, "tag");
     let table = Arc::new(Relation::new(Schema::new(vec![element.clone()]).unwrap(), RelationNode::ColumnTable { expr: parameter(0, &tags()), element }).unwrap());
-    let table = if numbered { Arc::new(table.with_ordinality(typed(42, "n", int()), rtdb_plan::OrdinalityScope::Page).unwrap()) } else { table };
+    if numbered { Arc::new(table.with_ordinality(typed(42, "n", int()), rtdb_plan::OrdinalityScope::Page).unwrap()) } else { table }
+}
+
+/// `SELECT t.*, u.* FROM t JOIN LATERAL UNNEST(t.tags) [WITH ORDINALITY] AS u ON <selected>`, binding the tags to
+/// parameter 0 and the customer to parameter 1.
+fn unnested(numbered: bool, selected: Option<Expr>) -> Arc<Relation> {
+    let table = tag_column_table(numbered);
     let table = match selected { Some(predicate) => select(table, predicate), None => table };
     apply(&tagged(), table, vec![(0, tags().expression()), (1, customer_id().expression())], ApplyKind::Inner, None)
+}
+
+fn left_filtered_tags(input: &Arc<Relation>, predicate: Expr, extra_arguments: Vec<(usize, Expr)>) -> Arc<Relation> {
+    let mut arguments = vec![(0, tags().expression())];
+    arguments.extend(extra_arguments);
+    apply(input, select(tag_column_table(true), predicate), arguments, ApplyKind::Left, None)
 }
 
 fn owner() -> Field { integer(50, "owner") }
@@ -436,8 +446,7 @@ fn context() -> Arc<QueryContext> {
     QueryContext::new(catalog, MemoryBudget::new(1 << 26), Timestamp(0), "UTC", QueryOptions::default(), &CancellationToken::new()).unwrap()
 }
 
-/// The query's rows in a canonical order, or its error code.
-async fn run(query: &PreparedQuery) -> std::result::Result<Vec<String>, String> {
+async fn run_in_order(query: &PreparedQuery) -> std::result::Result<Vec<String>, String> {
     let context = context();
     let rows = async {
         let mut cursor = query.execute(Arc::clone(&context), vec![]).await?;
@@ -451,10 +460,14 @@ async fn run(query: &PreparedQuery) -> std::result::Result<Vec<String>, String> 
         }
         Ok::<_, rtdb_types::Anomaly>(rows)
     }.await;
-    match rows {
-        Ok(mut rows) => { rows.sort(); Ok(rows) }
-        Err(error) => Err(error.code.to_string()),
-    }
+    rows.map_err(|error| error.code.to_string())
+}
+
+/// The query's rows in a canonical order, or its error code.
+async fn run(query: &PreparedQuery) -> std::result::Result<Vec<String>, String> {
+    let mut rows = run_in_order(query).await?;
+    rows.sort();
+    Ok(rows)
 }
 
 /// The query prepared without decorrelation and with it.
@@ -541,6 +554,151 @@ async fn left_apply_unnests_through_a_column_projection_and_preserves_unmatched_
         assert_eq!(expected.len(), 8);
         assert_eq!(run(&rewritten).await.unwrap(), expected);
     }
+}
+
+#[tokio::test]
+async fn left_unnest_gate_preserves_parent_order_and_null_element_positions() {
+    let enabled = typed(45, "enabled", bool_type());
+    let uncertain = typed(46, "uncertain", bool_type());
+    let rows = [
+        (1, Value::list(vec![Value::I64(11), Value::Null, Value::I64(13)]), true, false),
+        (2, Value::list(vec![Value::I64(21), Value::Null]), false, false),
+        (3, Value::list(vec![Value::I64(31)]), false, true),
+        (4, Value::list(vec![]), true, false),
+        (5, Value::Null, true, false),
+        (6, Value::list(vec![Value::Null]), true, false),
+        (6, Value::list(vec![Value::Null]), true, false),
+    ].into_iter().map(|(id, list, enabled, uncertain)| {
+        vec![literal(id), Expr::Literal(list), Expr::Literal(Value::Bool(enabled)), Expr::Literal(Value::Bool(uncertain))]
+    }).collect();
+    let input = Arc::new(Relation::new(
+        Schema::new(vec![customer_id(), tags(), enabled.clone(), uncertain.clone()]).unwrap(), RelationNode::Values { rows },
+    ).unwrap());
+    let predicate = Expr::binary(BinaryOp::Or, Expr::unary(UnaryOp::IsTrue, parameter(1, &enabled)),
+        Expr::binary(BinaryOp::And, Expr::unary(UnaryOp::IsTrue, parameter(2, &uncertain)), Expr::Literal(Value::Null)));
+    let relation = left_filtered_tags(&input, predicate, vec![(1, enabled.expression()), (2, uncertain.expression())]);
+    let fields = [0, 41, 42].map(|id| relation.schema().get(ColumnId(id)).unwrap().clone());
+    let relation = keep(relation, &fields);
+    let (correlated, rewritten) = both_ways(&relation);
+    assert_eq!(applies(rewritten.relation()), 0);
+    assert_eq!(rewritten.relation().schema(), relation.schema());
+    let expected = [
+        (1, Some(11), Some(1)), (1, None, Some(2)), (1, Some(13), Some(3)),
+        (2, None, None), (3, None, None), (4, None, None), (5, None, None), (6, None, Some(1)), (6, None, Some(1)),
+    ].map(|(id, item, ordinal)| {
+        let row = [Value::I64(id), item.map_or(Value::Null, Value::I64), ordinal.map_or(Value::Null, Value::I64)];
+        format!("{row:?}")
+    });
+    assert_eq!(run_in_order(&correlated).await.unwrap(), expected);
+    assert_eq!(run_in_order(&rewritten).await.unwrap(), expected);
+}
+
+#[tokio::test]
+async fn a_limit_can_consume_a_left_unnest_fallback_without_reading_later_input_pages() {
+    let divide = Expr::binary(BinaryOp::Divide, literal(1), literal(0));
+    let divide = Expr::Cast { expr: Box::new(divide), target: rtdb_plan::CastTarget::Fixed(int()) };
+    let list = Expr::Literal(Value::list(vec![Value::I64(11)]));
+    let input = Arc::new(Relation::new(Schema::new(vec![customer_id(), tags()]).unwrap(), RelationNode::LiteralPages {
+        pages: vec![vec![vec![literal(1), list.clone()]], vec![vec![divide, list]]],
+    }).unwrap());
+    let relation = left_filtered_tags(&input, Expr::Literal(Value::Bool(false)), Vec::new());
+    let fields = [0, 41, 42].map(|id| relation.schema().get(ColumnId(id)).unwrap().clone());
+    let relation = keep(relation, &fields);
+    let limited = Arc::new(Arc::clone(&relation).limit(None, Some(literal(1))).unwrap());
+    let (correlated, rewritten) = both_ways(&limited);
+    assert_eq!(applies(rewritten.relation()), 0);
+    let expected = ["[I64(1), Null, Null]".to_owned()];
+    assert_eq!(run_in_order(&correlated).await.unwrap(), expected);
+    assert_eq!(run_in_order(&rewritten).await.unwrap(), expected);
+    let (correlated, rewritten) = both_ways(&relation);
+    let error = Err("xtdb.expression/division-by-zero".to_owned());
+    assert_eq!(run_in_order(&correlated).await, error);
+    assert_eq!(run_in_order(&rewritten).await, error);
+}
+
+#[tokio::test]
+async fn left_unnest_keeps_element_tests_and_effectful_expressions_on_apply() {
+    let input = tagged();
+    let element = integer(41, "tag");
+    let ordinal = typed(42, "n", int());
+    let divide = Expr::binary(BinaryOp::Divide, literal(1), literal(0));
+    let random = Expr::Call { name: "random".into(), args: Vec::new(), return_type: LogicalType::Scalar(ScalarType::F64) };
+    for predicate in [
+        Expr::unary(UnaryOp::IsNull, element.expression()),
+        equals(ordinal.expression(), literal(2)),
+        equals(divide.clone(), literal(1)),
+        Expr::binary(BinaryOp::Gt, random, Expr::Literal(Value::F64(0.5))),
+    ] {
+        let relation = left_filtered_tags(&input, predicate, Vec::new());
+        let (_, rewritten) = both_ways(&relation);
+        assert_eq!(applies(rewritten.relation()), 1);
+    }
+
+    let relation = left_filtered_tags(&input, Expr::Literal(Value::Bool(false)), vec![(1, divide)]);
+    let (correlated, rewritten) = both_ways(&relation);
+    assert_eq!(applies(rewritten.relation()), 1);
+    let error = Err("xtdb.expression/division-by-zero".to_owned());
+    assert_eq!(run_in_order(&correlated).await, error);
+    assert_eq!(run_in_order(&rewritten).await, error);
+}
+
+#[tokio::test]
+async fn a_left_unnest_opens_a_fallible_list_before_a_false_filter() {
+    let element = integer(41, "tag");
+    let list = Expr::List(vec![Expr::binary(BinaryOp::Divide, literal(1), parameter(0, &customer_id()))]);
+    let table = Arc::new(Relation::new(Schema::new(vec![element.clone()]).unwrap(), RelationNode::ColumnTable { expr: list, element }).unwrap());
+    let input = values(vec![customer_id()], &[&[Some(0)]]);
+    let relation = apply(&input, select(table, Expr::Literal(Value::Bool(false))), by_customer(), ApplyKind::Left, None);
+    let (correlated, rewritten) = both_ways(&relation);
+    assert_eq!(applies(rewritten.relation()), 1);
+    let error = Err("xtdb.expression/division-by-zero".to_owned());
+    assert_eq!(run_in_order(&correlated).await, error);
+    assert_eq!(run_in_order(&rewritten).await, error);
+}
+
+#[tokio::test]
+async fn left_unnest_keeps_errors_in_unused_outer_projections() {
+    let input = tagged();
+    let divide = Expr::binary(BinaryOp::Divide, literal(1), literal(0));
+    let expressions = input.schema().fields().iter().map(|field| NamedExpr { field: field.clone(), expr: field.expression() })
+        .chain([NamedExpr { field: typed(45, "computed", divide.data_type()), expr: divide }]).collect();
+    let input = Arc::new(input.project(expressions).unwrap());
+    let relation = left_filtered_tags(&input, Expr::Literal(Value::Bool(false)), Vec::new());
+    let dependent = relation.schema().get(ColumnId(41)).unwrap().clone();
+    let relation = keep(relation, &[dependent]);
+    let (correlated, rewritten) = both_ways(&relation);
+    assert_eq!(applies(rewritten.relation()), 1);
+    let error = Err("xtdb.expression/division-by-zero".to_owned());
+    assert_eq!(run_in_order(&correlated).await, error);
+    assert_eq!(run_in_order(&rewritten).await, error);
+}
+
+#[tokio::test]
+async fn left_unnest_keeps_validation_of_unused_arrow_cells() {
+    use arrow_array::{Array, Int64Array, ListArray, RecordBatch, StringArray, types::Int64Type};
+    use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+    use rtdb_columnar::{OwnedBatch, to_field};
+    use rtdb_plan::LiteralArrowPages;
+
+    let uri = typed(45, "uri", LogicalType::Scalar(ScalarType::Uri));
+    let uri_field = to_field("uri", &uri.data_type).unwrap();
+    let uris = StringArray::from(vec!["https://xtdb.com", "not a URI"]);
+    let error = read_value(&uri_field, &uris, 1).unwrap_err().code.to_string();
+    let lists = ListArray::from_iter_primitive::<Int64Type, _, _>([Some(vec![Some(5)]), Some(vec![None])]);
+    let schema = Arc::new(ArrowSchema::new(vec![
+        to_field("id", &customer_id().data_type).unwrap(), ArrowField::new("tags", lists.data_type().clone(), true), uri_field,
+    ]));
+    let record = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2])), Arc::new(lists), Arc::new(uris)]).unwrap();
+    let page = OwnedBatch::new(record, &context().memory).unwrap();
+    let input = Arc::new(Relation::new(Schema::new(vec![customer_id(), tags(), uri]).unwrap(), RelationNode::ArrowLiteralPages {
+        pages: LiteralArrowPages::new(vec![page]),
+    }).unwrap());
+    let relation = left_filtered_tags(&input, Expr::Literal(Value::Bool(false)), Vec::new());
+    let output = relation.schema().get(ColumnId(41)).unwrap().clone();
+    let (correlated, rewritten) = both_ways(&keep(relation, &[output]));
+    assert_eq!(applies(rewritten.relation()), 1);
+    assert_eq!(run_in_order(&correlated).await, Err(error.clone()));
+    assert_eq!(run_in_order(&rewritten).await, Err(error));
 }
 
 #[test]

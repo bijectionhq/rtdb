@@ -369,13 +369,18 @@ Selection lifting separates correlated conjuncts from independent predicates.
 Volatile predicates keep their original filter or join scope during pushdown and join ordering.
 RTDB can lift a correlated selection above an unnest when the list reads no bound parameter and the rewrite preserves the rows on which fallible expressions are evaluated.
 Left lateral unnests can pass through column projections while preserving unmatched input rows and their null ordinality.
+A filtered left lateral unnest over a VALUES source with plain scalar and list cells can expand a directly captured list of signed integers or Booleans conditionally on a total outer-row predicate.
+Admitted predicates combine Boolean or NULL constants and null or truth tests on direct captures.
+A false or unknown result suppresses the list, so outer unnest supplies one null-extended row.
+When the predicate is true, the original list order and ordinality survive, including the position of a real null element.
 Correlated selections on the null-supplying side of an outer join remain in place to preserve unmatched rows.
 These shapes still run once per input row, and keep their applies:
 
 * a dependent plan with a volatile call, or an outer reference to an enclosing apply;
 * an ungrouped collecting or ordered aggregate (such as `ARRAY_AGG` or `VEC_AGG`) under a scalar, single, inner or left apply;
 * outside a lateral inner join, which rule 8 handles, a correlated selection beneath a grouping that reads a column the grouping drops, or a grouping or aggregate that reads a bound parameter itself, including a percentile fraction;
-* a correlated unnest under a filtered left apply, or an unnest whose list reads a bound parameter inside a semi/anti/mark/exists apply or below another operator;
+* a filtered left apply over an unnest with an element-dependent or ordinal-dependent predicate, a fallible expression, or a shape outside the captured-list rewrite;
+* an unnest whose list reads a bound parameter inside a semi/anti/mark/exists apply or below another operator;
 * a correlated selection beneath the null-supplying side of an outer join, a full outer or single join, a set operation, a window, a row numbering or ordinality, or, outside an existence test, DISTINCT, a sort or a limit;
 * `PULL` and `PULL_MANY` applies (`NEST_ONE` / `NEST_MANY`).
 Append projections, windows and UNNEST retain the input columns required by their expressions and those requested by their parents.

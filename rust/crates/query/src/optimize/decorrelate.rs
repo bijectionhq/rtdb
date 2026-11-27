@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 use rtdb_plan::{AggregateExpr, AggregateFunction, ApplyKind, BinaryOp, CastTarget, ColumnId, Expr, Field, JoinKind, MaterializedBinding, NamedExpr, OrdinalityScope, PercentileFraction, Relation, RelationNode, Schema, UnaryOp};
-use rtdb_types::{LogicalType, Result, ScalarType, Value};
+use rtdb_types::{ListKind, LogicalType, Result, ScalarType, Value};
 use super::{Ids, with_children};
 
 pub(super) fn decorrelate(relation: Arc<Relation>, ids: &mut Ids) -> Result<Arc<Relation>> {
@@ -716,11 +716,11 @@ fn grouped_lateral(input: &Arc<Relation>, dependent: &Arc<Relation>, correlation
 }
 
 /// `apply-table-col->unnest`: `R A× T(l)`, the table of the elements of a list `l` read from R, as `μ l (R)`, with the
-/// table's row numbers as the unnest's ordinality; for a left apply without filtering over the table, `outer: true`
-/// preserves input rows with empty or null lists.
+/// table's row numbers as the unnest's ordinality. An outer unnest supplies the left apply's unmatched row.
 fn column_table(input: &Arc<Relation>, dependent: &Arc<Relation>, correlation: &Correlation<'_>, outer: bool, ids: &mut Ids) -> Result<Option<Arc<Relation>>> {
     match dependent.node() {
-        RelationNode::Filter { input: table, predicate } if !outer => {
+        RelationNode::Filter { input: table, predicate } => {
+            if outer { return filtered_left_unnest(input, table, predicate, correlation, ids); }
             let Some(unnested) = column_table(input, table, correlation, false, ids)? else { return Ok(None) };
             Ok(Some(Arc::new(unnested.filter(correlation.substitute(predicate.clone()))?)))
         }
@@ -749,12 +749,91 @@ fn column_table(input: &Arc<Relation>, dependent: &Arc<Relation>, correlation: &
     }
 }
 
+fn filtered_left_unnest(input: &Arc<Relation>, table: &Relation, predicate: &Expr, correlation: &Correlation<'_>, ids: &mut Ids) -> Result<Option<Arc<Relation>>> {
+    let (column_table, ordinality) = match table.node() {
+        RelationNode::Ordinality { input, field, scope: OrdinalityScope::Page } => (input.as_ref(), Some(field)),
+        _ => (table, None),
+    };
+    let RelationNode::ColumnTable { expr: expr @ Expr::Parameter { index, data_type }, element } = column_table.node() else { return Ok(None) };
+    if !correlation.binds(*index) || !input.schema().ids().is_disjoint(&table.schema().ids()) { return Ok(None); }
+    if !plain_unnest_list(data_type) { return Ok(None); }
+    if !correlation.arguments.iter().all(|(slot, argument)| {
+        slot.checked_add(1).is_some_and(|width| std::alloc::Layout::array::<LogicalType>(width).is_ok())
+            && matches!(argument, Expr::Column { id, data_type: ty } if input.schema().get(*id).is_some_and(|field| field.data_type == *ty)
+            && if slot == index { ty == data_type } else { plain_unnest_scalar(ty) })
+    }) || !total_outer_predicate(predicate, correlation) || !prunable_unnest_input(input) {
+        return Ok(None);
+    }
+
+    // Apply tests the predicate only on actual elements, so only a total predicate can become a list gate.
+    let list = Expr::Case {
+        branches: vec![(correlation.substitute(predicate.clone()), correlation.substitute(expr.clone()))],
+        otherwise: Box::new(Expr::Literal(Value::Null)),
+    };
+    unnest_rows(Arc::clone(input), list, element, ordinality, true, ids).map(Some)
+}
+
+fn plain_unnest_scalar(ty: &LogicalType) -> bool {
+    let ty = match ty { LogicalType::Maybe(inner) => inner.as_ref(), ty => ty };
+    matches!(ty, LogicalType::Null | LogicalType::Scalar(ScalarType::Bool | ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64))
+}
+
+fn plain_unnest_list(ty: &LogicalType) -> bool {
+    let ty = match ty { LogicalType::Maybe(inner) => inner.as_ref(), ty => ty };
+    matches!(ty, LogicalType::List { kind: ListKind::List, element }
+        if **element == LogicalType::Nothing || plain_unnest_scalar(element))
+}
+
+fn total_outer_predicate(predicate: &Expr, correlation: &Correlation<'_>) -> bool {
+    stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || match predicate {
+        Expr::Literal(Value::Bool(_) | Value::Null) => true,
+        Expr::Unary { op: op @ (UnaryOp::IsTrue | UnaryOp::IsFalse | UnaryOp::IsNull | UnaryOp::IsNotNull | UnaryOp::IsUnknown), expr } => {
+            let Expr::Parameter { index, data_type } = expr.as_ref() else { return false; };
+            if matches!(op, UnaryOp::IsTrue | UnaryOp::IsFalse | UnaryOp::IsUnknown) && !is_boolean_or_null(data_type) { return false; }
+            correlation.arguments.iter().any(|(slot, argument)| slot == index && argument.data_type() == *data_type)
+        }
+        Expr::Unary { op: UnaryOp::Not, expr } => total_outer_predicate(expr, correlation),
+        Expr::Binary { op: BinaryOp::And | BinaryOp::Or, left, right } =>
+            total_outer_predicate(left, correlation) && total_outer_predicate(right, correlation),
+        _ => false,
+    })
+}
+
+fn prunable_unnest_input(mut input: &Relation) -> bool {
+    // Apply validates every input cell before binding. Unnest can drop unused projections and skip rejected lists.
+    loop {
+        match input.node() {
+            RelationNode::Project { input: source, expressions } | RelationNode::Rename { input: source, expressions, .. }
+                if expressions.iter().all(|named| matches!(&named.expr, Expr::Column { id, data_type }
+                    if *data_type == named.field.data_type && source.schema().get(*id).is_some_and(|field| field.data_type == *data_type))) => input = source,
+            RelationNode::Values { rows } => return rows.iter().flatten().all(plain_unnest_cell),
+            RelationNode::LiteralPages { pages } => return pages.iter().flatten().flatten().all(plain_unnest_cell),
+            _ => return false,
+        }
+    }
+}
+
+fn plain_unnest_cell(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(Value::List(items)) => i32::try_from(items.len()).is_ok() && plain_unnest_list(&expr.data_type()),
+        Expr::Literal(value) => plain_unnest_scalar(&value.logical_type()),
+        Expr::List(items) => i32::try_from(items.len()).is_ok() && plain_unnest_list(&expr.data_type())
+            && items.iter().all(|item| matches!(item, Expr::Literal(value) if plain_unnest_scalar(&value.logical_type()))),
+        Expr::Cast { target: CastTarget::Fixed(ty), .. } => plain_unnest_scalar(ty),
+        _ => false,
+    }
+}
+
 /// The elements of the list `expr` reads from each input row, the input row's columns beside each, and the element's
 /// position where `ordinality` names a column for it.
 fn unnest(input: &Arc<Relation>, expr: &Expr, element: &Field, ordinality: Option<&Field>, outer: bool, correlation: &Correlation<'_>, ids: &mut Ids) -> Result<Option<Arc<Relation>>> {
     let list = correlation.substitute(expr.clone());
     let staged = hidden(ids.next()?, "_unnest", list.data_type());
     let extended = Arc::new(Arc::clone(input).extend(vec![NamedExpr { field: staged.clone(), expr: list }])?);
+    unnest_rows(extended, staged.expression(), element, ordinality, outer, ids).map(Some)
+}
+
+fn unnest_rows(input: Arc<Relation>, expr: Expr, element: &Field, ordinality: Option<&Field>, outer: bool, ids: &mut Ids) -> Result<Arc<Relation>> {
     let element = if outer { Field { data_type: element.data_type.clone().maybe(), ..element.clone() } } else { element.clone() };
     // An unnest numbers its elements as 32-bit integers, and a row-numbered table as 64-bit ones.
     let position = match ordinality {
@@ -764,15 +843,15 @@ fn unnest(input: &Arc<Relation>, expr: &Expr, element: &Field, ordinality: Optio
         }
         None => None,
     };
-    let fields = extended.schema().fields().iter().cloned().chain([element.clone()]).chain(position.clone()).collect();
+    let fields = input.schema().fields().iter().cloned().chain([element.clone()]).chain(position.clone()).collect();
     let unnested = Arc::new(Relation::new(Schema::new(fields)?, RelationNode::Unnest {
-        input: extended, expr: staged.expression(), element, ordinality: position.clone(), outer,
+        input, expr, element, ordinality: position.clone(), outer,
     })?);
-    let (Some(ordinality), Some(position)) = (ordinality, position) else { return Ok(Some(unnested)) };
+    let (Some(ordinality), Some(position)) = (ordinality, position) else { return Ok(unnested) };
     let target = if outer { ordinality.data_type.clone().maybe() } else { ordinality.data_type.clone() };
     let field = Field { data_type: target.clone(), ..ordinality.clone() };
     let cast = Expr::Cast { expr: Box::new(position.expression()), target: CastTarget::Fixed(target) };
-    Ok(Some(Arc::new(unnested.extend(vec![NamedExpr { field, expr: cast }])?)))
+    Ok(Arc::new(unnested.extend(vec![NamedExpr { field, expr: cast }])?))
 }
 
 /// Whether every value of `data_type` compares equal to itself under the grouping comparator (`null_eq`).

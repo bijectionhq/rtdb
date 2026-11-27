@@ -226,6 +226,27 @@ async fn unnest_ordinal_width_follows_the_bound_table_and_cross_apply_shapes() {
 }
 
 #[tokio::test]
+async fn a_left_unnest_on_an_outer_row_test_keeps_real_and_synthetic_nulls_distinct() {
+    let sql = "SELECT o.id, u.v, u.n FROM (VALUES (1, ARRAY[10, NULL], TRUE), (2, ARRAY[20, NULL], FALSE), \
+               (3, ARRAY[30, NULL], NULL)) AS o(id, items, enabled) \
+               LEFT JOIN UNNEST(o.items) WITH ORDINALITY AS u(v, n) ON o.enabled IS TRUE OR NULL ORDER BY o.id, u.n";
+    let context = context();
+    let prepared = prepare(sql, &context.catalog, &PrepareOptions::default()).unwrap();
+    let plan = PreparedQuery::from_prepared(prepared, &context.memory).unwrap();
+    fn contains_outer_unnest(relation: &Relation) -> bool {
+        matches!(relation.node(), RelationNode::Unnest { outer: true, .. })
+            || relation.children().iter().any(|child| contains_outer_unnest(child))
+    }
+    assert!(contains_outer_unnest(plan.relation()));
+    assert_eq!(query(sql, vec![]).await.unwrap(), [
+        vec![Value::I64(1), Value::I64(10), Value::I64(1)],
+        vec![Value::I64(1), Value::Null, Value::I64(2)],
+        vec![Value::I64(2), Value::Null, Value::Null],
+        vec![Value::I64(3), Value::Null, Value::Null],
+    ]);
+}
+
+#[tokio::test]
 async fn captured_unnest_reads_a_staged_column_and_preserves_external_parameter_ids() {
     let sql = "SELECT v, n FROM (VALUES (?)) AS t(k), UNNEST(ARRAY[k, k+?]) WITH ORDINALITY AS u(v,n)";
     let context = context();
