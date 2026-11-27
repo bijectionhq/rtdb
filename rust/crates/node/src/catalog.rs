@@ -104,16 +104,6 @@ impl DatabaseCatalog {
     }
 
     #[cfg(feature = "multi")]
-    pub async fn deployment_checkpoint_source(
-        &self, name: &str, cancellation: &tokio_util::sync::CancellationToken,
-    ) -> Result<Option<rtdb_db::CheckpointSource>> {
-        let attachment = self.database(name)?;
-        let driver = attachment.serving_driver().ok_or_else(export_unavailable)?;
-        let source = driver.checkpoint_source(cancellation).await?;
-        self.with_current_attachment(&attachment, || Ok(source))
-    }
-
-    #[cfg(feature = "multi")]
     async fn restore_checkpoint(
         &self, original: &Arc<Database>, restored: &Arc<Database>, ticket: Vec<u8>,
         cancellation: &tokio_util::sync::CancellationToken,

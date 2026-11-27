@@ -3023,14 +3023,6 @@ impl OwnedReadSession {
         self.range_page(relation, path, crate::ordered_index::RowBounds::Compound(request), None).await
     }
 
-    /// Issues evidence only after the covering query completed, including a covered empty page.
-    pub async fn range_page_by_key_observed(
-        &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
-        request: crate::OwnedRangeRequest<'_>,
-    ) -> Result<(crate::OwnedRangePage, Option<OwnedRangeWitness>)> {
-        self.range_page_by_key_at_observed(relation, path, request, None).await
-    }
-
     pub async fn range_page_by_key_at_observed(
         &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
         request: crate::OwnedRangeRequest<'_>, valid_at: Option<Timestamp>,

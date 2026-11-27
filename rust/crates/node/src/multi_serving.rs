@@ -559,11 +559,6 @@ impl ServingDriver for MultiServing {
         cancellation.run_until_cancelled(self.writes.restore(export)).await.ok_or_else(interrupted)?
     }
 
-    async fn checkpoint_source(&self, cancellation: &CancellationToken) -> Result<Option<rtdb_db::CheckpointSource>> {
-        cancellation.run_until_cancelled(async { self.database.lock().await.checkpoint_source().await })
-            .await.ok_or_else(interrupted)?
-    }
-
     fn features(&self) -> &[&str] {
         &self.features
     }

@@ -245,11 +245,6 @@ pub trait ServingDriver: Send + Sync {
         Err(rtdb_types::Anomaly::unsupported("rtdb/restore-checkpoint", "The serving attachment has no independent checkpoint restore"))
     }
 
-    #[cfg(feature = "multi")]
-    async fn checkpoint_source(&self, _cancellation: &CancellationToken) -> Result<Option<rtdb_db::CheckpointSource>> {
-        Err(rtdb_types::Anomaly::unsupported("rtdb/restore-checkpoint", "The serving attachment has no retained checkpoint source"))
-    }
-
     fn supports_query_tokens(&self) -> bool { true }
 
     fn supports_row_visibility(&self) -> bool { false }

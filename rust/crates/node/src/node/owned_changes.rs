@@ -430,12 +430,6 @@ impl OwnedReadSession {
         self.merged_changes_window(relations, after.into(), through.into(), limit, false).await
     }
 
-    pub async fn merged_changes_descending(
-        &self, relations: &[OwnedRelation], after: Timestamp, through: Timestamp, limit: usize,
-    ) -> Result<OwnedMergedChanges> {
-        self.merged_changes_window(relations, after.into(), through.into(), limit, true).await
-    }
-
     /// Merge whole Root publications within the authorized held interval.
     pub async fn merged_changes_window(
         &self, relations: &[OwnedRelation], after: OwnedChangeEdge, through: OwnedChangeEdge,
