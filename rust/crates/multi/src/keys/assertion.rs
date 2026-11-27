@@ -457,7 +457,7 @@ impl AssertionKeyService for LocalKeyService {
 }
 
 impl LocalKeyService {
-    fn require_assertion_broker(&self) -> Result<()> {
+    pub(super) fn require_assertion_broker(&self) -> Result<()> {
         if !self.provision_archive_keys {
             return Err(Anomaly::unsupported(
                 "rtdb.multi/assertion-vault", "Assertion custody requires the local operation broker",

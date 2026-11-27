@@ -233,6 +233,8 @@ It authenticates the wrapped key and sealed body for separate purposes and keeps
 A broker tombstone refuses both further opens and reuse of that stage.
 The hosted S3 key service has a distinct object prefix for assertion capabilities.
 It refuses versioned custody and uses conditional writes for staging and withdrawal.
+The original vault can reconcile its own retirement obligation after source loss. Its commissioned custodian reopens the exact family fence and order, verifies the signed release drains, tombstones the complete vault inventory, and retains its signed settlement for retries.
+The installed service still needs an authenticated source-order and release-drain route. A complete erasure report also requires settlements from the configured backup and derivative custodians.
 Native ingress, exact ordered placement, current disclosure and the multi-custodian destruction barrier still need to use this envelope before assertion erasure can be offered.
 See [the fixed assertion deadline](../../verification/redesign/R7-eraser.md#option-2-assertion-deadline) for the private custody ledger, passive backup frame and deployment obligations.
 

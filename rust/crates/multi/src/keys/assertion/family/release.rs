@@ -539,8 +539,7 @@ impl<'a> AssertionFamilies<'a> {
         if family.fenced != Some(expected.order) || family.fence_inventory(expected.order).vault_inventory() != expected.inventory {
             return Err(conflict());
         }
-        Ok(family.release_holds.is_empty() && family.native_landings_drained()
-            && self.checkpoint_transfers_drained(&family).await? && self.world_rank_transfers_drained(&family).await?)
+        self.custody_drained(&family).await
     }
 
     fn require_release_owner(&self, owner: CarrierJournalIdentity) -> Result<()> {

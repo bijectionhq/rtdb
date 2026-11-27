@@ -37,7 +37,7 @@ use super::{AssertionAuthoring, AssertionEnvelope, AssertionKeyService, Assertio
 use super::issuer::AssertionIssuerScope;
 use crate::keys::{assertion_deadline::AssertionDeadline, malformed};
 
-pub(super) const LOCAL_PREFIX: &str = "assertion-family-";
+pub(in crate::keys) const LOCAL_PREFIX: &str = "assertion-family-";
 pub(super) const LOCAL_ISSUER_PREFIX: &str = "assertion-issuer-";
 pub(in crate::keys) const MAX_RECORD_BYTES: usize = 1024 * 1024;
 const MAX_DERIVED_ROWS: usize = 2048;
@@ -851,6 +851,22 @@ impl<'a> AssertionFamilies<'a> {
         }).await
     }
 
+    /// Reads an already adopted fence from independent custody without consulting the source.
+    pub(in crate::keys) async fn retirement_fence(
+        &self, family: Uuid, order: Uuid, require_drained: bool,
+    ) -> Result<FamilyFence> {
+        let (record, _) = self.read(family).await?.ok_or_else(conflict)?;
+        if record.fenced != Some(order) || require_drained && !self.custody_drained(&record).await? {
+            return Err(conflict());
+        }
+        Ok(record.fence_inventory(order))
+    }
+
+    async fn custody_drained(&self, family: &Family) -> Result<bool> {
+        Ok(family.release_holds.is_empty() && family.native_landings_drained()
+            && self.checkpoint_transfers_drained(family).await? && self.world_rank_transfers_drained(family).await?)
+    }
+
     /// Remove private membership only after signed deadline settlement and
     /// after every original position has its own durable denial.
     pub async fn settle(
@@ -862,9 +878,7 @@ impl<'a> AssertionFamilies<'a> {
                 return Ok(());
             }
             let record = decode_family(&bytes)?;
-            if !record.release_holds.is_empty() || !record.native_landings_drained()
-                || !self.checkpoint_transfers_drained(&record).await? || !self.world_rank_transfers_drained(&record).await?
-            {
+            if !self.custody_drained(&record).await? {
                 return Err(conflict());
             }
             let fence = record.fence_inventory(record.fenced.ok_or_else(conflict)?);
@@ -991,7 +1005,7 @@ fn contention() -> Anomaly {
     )
 }
 
-fn local_record(vault: &LocalKeyService, path: &std::path::Path) -> Result<Option<(Bytes, String)>> {
+pub(in crate::keys) fn local_record(vault: &LocalKeyService, path: &std::path::Path) -> Result<Option<(Bytes, String)>> {
     match fs::read(path) {
         Ok(bytes) if bytes.len() <= MAX_RECORD_BYTES => {
             vault.sync_directory()?;

@@ -4,6 +4,11 @@
 //! destruction outside payload checkpoints. Only the installed custody
 //! authority may call it with authenticated source orders or hold decisions.
 
+mod local;
+mod vault;
+
+pub use vault::AssertionVaultCustodian;
+
 use std::{collections::BTreeMap, time::Duration};
 
 use ring::{
@@ -139,6 +144,8 @@ enum Phase {
 #[serde(deny_unknown_fields)]
 struct Record {
     order: ErasureOrder,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vault_binding: Option<vault::Binding>,
     holds: BTreeMap<Uuid, Hold>,
     suspended_at_ms: Option<u64>,
     suspended_ms: u64,
@@ -151,6 +158,7 @@ struct Record {
 impl Record {
     fn new(order: ErasureOrder) -> Self {
         Self {
+            vault_binding: None,
             last_hold_change_ms: order.committed_at_ms,
             holds: order.initial_holds.iter().map(|&id| (id, Hold {
                 placed_at_ms: order.committed_at_ms,
@@ -220,6 +228,11 @@ impl Record {
         };
         if self.order.obligations.binary_search(&settlement.obligation).is_err() {
             return Err(invalid("The disposition is outside the original custody roster"));
+        }
+        if let Some(binding) = self.vault_binding
+            && settlement.obligation.kind == CustodyKind::AssertionVault
+        {
+            binding.require_settlement(self.order.id, &settlement)?;
         }
         if settlement.obligation.kind != CustodyKind::ReleaseDrain {
             let drain = self.order.obligations.iter()

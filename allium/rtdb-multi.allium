@@ -628,6 +628,9 @@ contract LogService {
         -- A native-backed family hold rechecks both current authorities before release.
         -- The Original deadline waits for positive native release and checkpoint-copy drain as well as the Original drains.
         -- The private deadline journal requires the exact stage inventory and all enrolled release drains before retiring the family capabilities.
+        -- A commissioned single-vault holder binds the original vault namespace, exact family fence and closed stage inventory to the erasure order before effect.
+        -- The holder requires signed release drains and drained family custody in its own vault before confirming a permanent tombstone at every enrolled capability, including unused stages.
+        -- The original vault records the exact signed holder disposition by compare-and-set. Replacement recovers that disposition or resumes tombstoning from the bound order without source data.
         -- Signed terminal settlement preserves independent denials by original position and drops private family membership.
         -- A protected checkpoint transfer binds an exact source pin and cut to one prepared destination and the full original contributor inventory.
         -- A managed checkpoint reserves one copy owner while the selected destination is still private.
