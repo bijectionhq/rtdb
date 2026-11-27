@@ -401,13 +401,17 @@ Any finite hold must still cover the activation decision when it commits.
 Release after publication requires a handoff to the destination's serving custody.
 
 Ranked derivative publication needs an authority that admits staging for the current incarnation and fences or drains provider work before that incarnation loses authority.
-It must retain or retire the exact primary cut, derivative object versions and generation keys.
+The closed ranked prefix accounts for admitted catalogues.
+Qualification also needs original-provider evidence that staging reservations outside that prefix have drained or been retired.
+Derivative custody must retain or retire the exact primary cut, derivative object versions and generation keys.
 An assertion erasure report also needs signed settlements from each backup and derivative custodian in its ordered roster.
 
-Funded dispatch needs an effect authority for the receiver and keeper original quorum.
-Commission the receiver identity and certificate, the original keeper clock signers and their common clock bounds, and bind both admission and retry to the exact activation and booking.
-Keeper timed-original proof authenticates the append and its cutoff.
-The activation effect authority also has to close predecessor receiver admissions and reconcile issued bookings before a successor can admit funded work.
+The installed `fundedReceiverClock` transport supplies authenticated clock observations for the pinned receiver certificate and source incarnation.
+`RTDB_TIMED_ORIGINAL_TRUST_FILE` pins the keeper clock signers used to verify the original accepted append and its cutoff.
+Commission the receiver and keepers on the same guarded clock scale.
+Commissioned funded dispatch also requires an original admission authority that can durably close booking admission for the exact predecessor activation binding and receiver certificate.
+Its closed inventory must be independently readable after restart and identify every issued booking by its original receipt namespace, idempotency key and decision cutoff.
+The recovery operator needs the original terminal decision for each booking, with a matching keeper timed-original proof for accepting appends, before the successor can admit funded work.
 
 A hosted qualification requires a named non-production allocation with scoped object and key provider credentials, an independent activation quorum, and separate reader, operator and custodian identities.
 Drive the same recovery through lost replies and process restart, prove the selected versions and keys stay usable with the verifier offline, and verify that supersession or publication settles only the selected operation's hold.
