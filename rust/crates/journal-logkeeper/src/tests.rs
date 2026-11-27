@@ -128,6 +128,8 @@ async fn stream_journal_appends_a_batch_in_order() {
         Ok(Lsn(2))
     );
     assert_committed_batch(&writer).await;
+    // Stream keepers have no operator recovery to acknowledge.
+    assert_eq!(writer.acknowledge_recovery(STREAM).await, Err(JournalError::Unavailable));
 }
 
 #[tokio::test]
@@ -208,5 +210,17 @@ async fn consensus_journal_conforms_through_the_rtdb_adapter() {
         Arc::new(journals[index].clone()) as Arc<dyn Journal>
     })
     .await;
+
+    // Multi acknowledges an operator recovery as the writer principal it
+    // writes with. Without a recovery fence the acknowledgement only returns
+    // the head, and the writer keeps its seal.
+    let stream = StreamId(0x5eed);
+    let writer: &dyn Journal = &journals[0];
+    writer.create(stream).await.unwrap();
+    assert_eq!(writer.seal(stream, EPOCH).await, Ok(Lsn(0)));
+    assert_eq!(writer.append(stream, EPOCH, Lsn(1), Bytes::from_static(b"kept")).await, Ok(Lsn(1)));
+    assert_eq!(writer.acknowledge_recovery(stream).await, Ok(Lsn(1)));
+    assert_eq!(journals[1].acknowledge_recovery(stream).await, Ok(Lsn(1)));
+    assert_eq!(writer.append(stream, EPOCH, Lsn(2), Bytes::from_static(b"after")).await, Ok(Lsn(2)));
     cluster.shutdown().await.unwrap();
 }

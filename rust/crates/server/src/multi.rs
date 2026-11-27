@@ -211,6 +211,7 @@ impl MultiRuntime {
             node: Ipv4Addr::LOCALHOST.into(),
             peers: None,
             checkpoints: config.multi_checkpoints,
+            journal_settings: config.multi_journal,
             _journal_lock: writer_lock,
         };
         Self::open(
@@ -334,6 +335,7 @@ impl MultiRuntime {
             node,
             peers,
             checkpoints: config.multi_checkpoints,
+            journal_settings: config.multi_journal,
             _journal_lock: Some(Arc::new(lock)),
         };
         let mut runtime = Self::open(config, memory, databases, backends, follower).await?;
@@ -1217,6 +1219,7 @@ struct Backends {
     node: IpAddr,
     peers: Option<String>,
     checkpoints: crate::config::MultiCheckpointSettings,
+    journal_settings: crate::config::MultiJournalSettings,
     _journal_lock: Option<Arc<File>>,
 }
 
@@ -1280,7 +1283,8 @@ async fn open_database(
     }
     database = database
         .with_deferred_checkpoints(backends.checkpoints.deferred)
-        .with_binary_checkpoints(backends.checkpoints.binary);
+        .with_binary_checkpoints(backends.checkpoints.binary)
+        .with_hold_writes_after_recovery(backends.journal_settings.hold_writes_after_recovery);
     match backends.journal.head(StreamId(id.as_u128())).await {
         Ok(head) if head.0 > 0 => (),
         Ok(_) | Err(JournalError::NotFound) if matches!(mode, DatabaseOpen::Prepared) => {
@@ -1918,6 +1922,7 @@ mod tests {
             node: Ipv4Addr::LOCALHOST.into(),
             peers: None,
             checkpoints: crate::config::MultiCheckpointSettings::default(),
+            journal_settings: crate::config::MultiJournalSettings::default(),
             _journal_lock: None,
         };
         let incarnation = Uuid::from_u128(1);

@@ -112,6 +112,10 @@ impl Journal for TestJournal {
     fn delete(&self, stream: StreamId) -> BoxFuture<'_, journal_contract::Result<()>> {
         self.0.delete(stream)
     }
+
+    fn acknowledge_recovery(&self, stream: StreamId) -> BoxFuture<'_, journal_contract::Result<Lsn>> {
+        self.0.acknowledge_recovery(stream)
+    }
 }
 
 struct Cluster {
@@ -909,23 +913,274 @@ async fn exact_export_pins_the_selected_branch_ancestry_after_trim() {
     assert_eq!(text_at(&mut follower, "report", 1).await, Some(Value::Utf8("parent row".into())));
 }
 
-#[tokio::test]
-async fn multi_driver_refuses_the_writer_role_until_a_journal_recovery_is_acknowledged() {
-    let journal = journals().await;
-    let cluster = Cluster::new();
-    let gate = Arc::new(GateJournal::new(Arc::new(journal.handle(NODE_1_IDENTITY))));
-    let mut writer = cluster.node(1, gate.clone());
+/// A reference journal that an operator recovery can cut back, as
+/// `logkeeper keeper recover-stream` does to a consensus stream that lost two
+/// of its three voters: the stream keeps its first `head` records under a
+/// recovery fence, and every seal returns `Recovered` until someone
+/// acknowledges the recovery. Keeper-hosted recovery needs two replacement
+/// keepers in distinct failure domains, which the local consensus cluster
+/// does not have.
+#[derive(Default)]
+struct Recoverable {
+    current: std::sync::Mutex<MemoryJournal>,
+    /// The recovered head while the recovery awaits acknowledgement.
+    pending: std::sync::Mutex<Option<Lsn>>,
+    acknowledgements: AtomicUsize,
+    /// Holds each acknowledgement until this many nodes are acknowledging.
+    rendezvous: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
+}
+
+const RECOVERY_IDENTITY: Identity = Identity::from_static("urn:rtdb:test:recovery");
+const RECOVERY_FENCE: Epoch = Epoch(5);
+
+impl Recoverable {
+    fn handle(self: &Arc<Self>, identity: Identity) -> Arc<dyn Journal> {
+        Arc::new(RecoverableHandle { shared: Arc::clone(self), identity })
+    }
+
+    fn journal(&self, identity: &Identity) -> impl Journal + use<> {
+        self.current.lock().unwrap().handle(identity.clone())
+    }
+
+    /// Replaces the stream with its first `head` records under the recovery
+    /// fence, as the survivor's replica would hold them.
+    async fn recover(&self, stream: StreamId, head: Lsn) {
+        let old = self.journal(&RECOVERY_IDENTITY);
+        let survivor = MemoryJournal::default();
+        let copy = survivor.handle(RECOVERY_IDENTITY);
+        copy.create(stream).await.unwrap();
+        copy.seal(stream, Epoch(RECOVERY_FENCE.0 - 1)).await.unwrap();
+        let mut at = Lsn(1);
+        while at <= head {
+            let page = old.read(stream, at, 128, Duration::ZERO).await.unwrap();
+            for (lsn, payload) in page.records.into_iter().take_while(|(lsn, _)| *lsn <= head) {
+                copy.append(stream, Epoch(RECOVERY_FENCE.0 - 1), lsn, payload).await.unwrap();
+                at = Lsn(lsn.0 + 1);
+            }
+        }
+        survivor.handle(Identity::from_static("urn:rtdb:test:operator")).seal(stream, RECOVERY_FENCE).await.unwrap();
+        *self.current.lock().unwrap() = survivor;
+        *self.pending.lock().unwrap() = Some(head);
+    }
+
+    async fn acknowledge(&self, stream: StreamId) -> journal_contract::Result<Lsn> {
+        let rendezvous = self.rendezvous.lock().unwrap().clone();
+        if let Some(rendezvous) = rendezvous {
+            rendezvous.wait().await;
+        }
+        self.acknowledgements.fetch_add(1, Ordering::SeqCst);
+        self.pending.lock().unwrap().take();
+        self.journal(&RECOVERY_IDENTITY).head(stream).await
+    }
+}
+
+struct RecoverableHandle {
+    shared: Arc<Recoverable>,
+    identity: Identity,
+}
+
+impl Journal for RecoverableHandle {
+    fn create(&self, stream: StreamId) -> BoxFuture<'_, journal_contract::Result<()>> {
+        let journal = self.shared.journal(&self.identity);
+        Box::pin(async move { journal.create(stream).await })
+    }
+
+    fn seal(&self, stream: StreamId, epoch: Epoch) -> BoxFuture<'_, journal_contract::Result<Lsn>> {
+        let pending = *self.shared.pending.lock().unwrap();
+        let journal = self.shared.journal(&self.identity);
+        Box::pin(async move {
+            match pending {
+                Some(head) => Err(JournalError::Recovered { head }),
+                None => journal.seal(stream, epoch).await,
+            }
+        })
+    }
+
+    fn append(&self, stream: StreamId, epoch: Epoch, at: Lsn, payload: Bytes) -> BoxFuture<'_, journal_contract::Result<Lsn>> {
+        let journal = self.shared.journal(&self.identity);
+        Box::pin(async move { journal.append(stream, epoch, at, payload).await })
+    }
+
+    fn read(&self, stream: StreamId, from: Lsn, max: usize, wait: Duration) -> BoxFuture<'_, journal_contract::Result<Page>> {
+        let journal = self.shared.journal(&self.identity);
+        Box::pin(async move { journal.read(stream, from, max, wait).await })
+    }
+
+    fn head(&self, stream: StreamId) -> BoxFuture<'_, journal_contract::Result<Lsn>> {
+        let journal = self.shared.journal(&self.identity);
+        Box::pin(async move { journal.head(stream).await })
+    }
+
+    fn trim(&self, stream: StreamId, epoch: Epoch, through: Lsn) -> BoxFuture<'_, journal_contract::Result<()>> {
+        let journal = self.shared.journal(&self.identity);
+        Box::pin(async move { journal.trim(stream, epoch, through).await })
+    }
+
+    fn delete(&self, stream: StreamId) -> BoxFuture<'_, journal_contract::Result<()>> {
+        let journal = self.shared.journal(&self.identity);
+        Box::pin(async move { journal.delete(stream).await })
+    }
+
+    fn acknowledge_recovery(&self, stream: StreamId) -> BoxFuture<'_, journal_contract::Result<Lsn>> {
+        Box::pin(self.shared.acknowledge(stream))
+    }
+}
+
+/// The recovery records a node's retained journal holds.
+fn recovery_records(node: &MultiDatabase) -> Vec<Record> {
+    node.committed.as_ref().unwrap().records.iter().filter(|record| matches!(record, Record::Recovered { .. })).cloned().collect()
+}
+
+/// A writer that committed `kept` and then two lost commits, a follower that
+/// applied all three, and the journal head after `kept`.
+async fn recoverable_cluster(cluster: &Cluster, journal: &Arc<Recoverable>) -> (MultiDatabase, MultiDatabase, Lsn) {
+    let (writer, follower, _, kept) = recoverable_cluster_with_lagging(cluster, journal).await;
+    (writer, follower, kept)
+}
+
+/// As [`recoverable_cluster`], with a follower that applied only `kept`.
+async fn recoverable_cluster_with_lagging(cluster: &Cluster, journal: &Arc<Recoverable>) -> (MultiDatabase, MultiDatabase, MultiDatabase, Lsn) {
+    let mut writer = cluster.node(1, journal.handle(NODE_1_IDENTITY));
+    let mut follower = cluster.node(2, journal.handle(NODE_2_IDENTITY));
+    let mut lagging = cluster.node(4, journal.handle(Identity::from_static("urn:rtdb:test:4")));
     writer.create().await.unwrap();
-    // A recovered stream refuses every seal until an administrator
-    // acknowledges the recovery, so the node stays a follower and says why.
-    *gate.recovered.lock().unwrap() = Some(Lsn(0));
-    let refused = writer.tick(&live(1)).await.unwrap_err();
-    assert_eq!(refused.code, "rtdb/journal-recovered");
-    assert!(refused.message.as_deref().unwrap_or("").contains("acknowledge"));
-    assert_eq!(writer.role(), Role::Follower);
-    *gate.recovered.lock().unwrap() = None;
     assert_eq!(writer.tick(&live(1)).await.unwrap(), Role::Writer(Epoch(1)));
-    writer.transact(&put(1, 1, "after recovery")).await.unwrap();
+    writer.transact(&put(1, 1, "kept")).await.unwrap();
+    let kept = writer.stream.head().await.unwrap();
+    assert_eq!(text_at(&mut lagging, MAIN_BRANCH, 1).await, Some(Value::Utf8("kept".into())));
+    writer.transact(&put(2, 2, "lost")).await.unwrap();
+    writer.transact(&put(3, 3, "lost")).await.unwrap();
+    assert_eq!(text_at(&mut follower, MAIN_BRANCH, 3).await, Some(Value::Utf8("lost".into())));
+    (writer, follower, lagging, kept)
+}
+
+#[tokio::test]
+async fn multi_driver_acknowledges_a_journal_recovery_records_it_and_resumes_writing() {
+    let cluster = Cluster::new();
+    let journal = Arc::new(Recoverable::default());
+    let (writer, mut follower, kept) = recoverable_cluster(&cluster, &journal).await;
+    let stream = writer.journal_stream();
+    drop(writer);
+    journal.recover(stream, kept).await;
+    let recoveries = journal_recoveries_acknowledged();
+
+    // The follower outlives the lost writer's lease, notices the recovery when
+    // it seals, acknowledges it, seals above the recovery's fence and records
+    // the loss before it writes.
+    cluster.at(10 + LEASE + DRIFT + 1);
+    assert_eq!(follower.tick(&live(2)).await.unwrap(), Role::Writer(Epoch(RECOVERY_FENCE.0 + 1)));
+    assert_eq!(journal.acknowledgements.load(Ordering::SeqCst), 1);
+    assert!(journal_recoveries_acknowledged() > recoveries);
+    let recovery = follower.journal_recovery().unwrap();
+    assert_eq!((recovery.head, recovery.epoch, recovery.time), (kept, Epoch(RECOVERY_FENCE.0 + 1), Timestamp(10 + LEASE + DRIFT + 1)));
+    assert!(recovery.at > kept);
+    assert_eq!(text_at(&mut follower, MAIN_BRANCH, 1).await, Some(Value::Utf8("kept".into())));
+    assert_eq!(text_at(&mut follower, MAIN_BRANCH, 2).await, None);
+    follower.transact(&put(4, 2, "after recovery")).await.unwrap();
+    assert_eq!(text_at(&mut follower, MAIN_BRANCH, 2).await, Some(Value::Utf8("after recovery".into())));
+
+    // A reader opened after the recovery replays the same history.
+    let mut reader = cluster.node(3, journal.handle(NODE_3_IDENTITY));
+    assert_eq!(text_at(&mut reader, MAIN_BRANCH, 2).await, Some(Value::Utf8("after recovery".into())));
+    assert_eq!(text_at(&mut reader, MAIN_BRANCH, 3).await, None);
+    assert_eq!(reader.journal_recovery(), Some(recovery));
+}
+
+#[tokio::test]
+async fn multi_driver_holds_writes_after_a_journal_recovery_when_configured() {
+    let cluster = Cluster::new();
+    let journal = Arc::new(Recoverable::default());
+    let (writer, follower, kept) = recoverable_cluster(&cluster, &journal).await;
+    let stream = writer.journal_stream();
+    drop((writer, follower));
+    journal.recover(stream, kept).await;
+
+    let mut held = cluster.node(2, journal.handle(NODE_2_IDENTITY)).with_hold_writes_after_recovery(true);
+    cluster.at(10 + LEASE + DRIFT + 1);
+    let refused = held.tick(&live(2)).await.unwrap_err();
+    assert_eq!(refused.code, "rtdb/journal-recovered");
+    assert!(refused.message.as_deref().unwrap_or("").contains("acknowledges the recovery"));
+    assert_eq!(held.role(), Role::Follower);
+    assert_eq!(journal.acknowledgements.load(Ordering::SeqCst), 0);
+    // An administrator acknowledges it; the held writer then resumes without
+    // recording a recovery of its own.
+    journal.acknowledge(stream).await.unwrap();
+    assert_eq!(held.tick(&live(2)).await.unwrap(), Role::Follower);
+    cluster.at(10 + 2 * (LEASE + DRIFT + 1));
+    assert_eq!(held.tick(&live(2)).await.unwrap(), Role::Writer(Epoch(RECOVERY_FENCE.0 + 1)));
+    assert_eq!(held.journal_recovery(), None);
+    assert_eq!(text_at(&mut held, MAIN_BRANCH, 2).await, None);
+    held.transact(&put(4, 2, "after recovery")).await.unwrap();
+}
+
+#[tokio::test]
+async fn multi_followers_rebuild_their_state_across_a_journal_recovery() {
+    let cluster = Cluster::new();
+    let journal = Arc::new(Recoverable::default());
+    let (mut writer, mut ahead, mut behind, kept) = recoverable_cluster_with_lagging(&cluster, &journal).await;
+    let stream = writer.journal_stream();
+    let lost = writer.stream.head().await.unwrap();
+    journal.recover(stream, kept).await;
+
+    // A new writer resumes and commits past the positions the lost commits
+    // held, so the head alone no longer shows that the history changed.
+    let mut successor = cluster.node(3, journal.handle(NODE_3_IDENTITY));
+    cluster.at(10 + LEASE + DRIFT + 1);
+    assert_eq!(successor.tick(&live(3)).await.unwrap(), Role::Writer(Epoch(RECOVERY_FENCE.0 + 1)));
+    for id in 10..16 {
+        successor.transact(&put(id as u8, id, "new")).await.unwrap();
+    }
+    assert!(successor.stream.head().await.unwrap() > lost);
+    let recovery = successor.journal_recovery();
+
+    for node in [&mut ahead, &mut behind, &mut writer] {
+        assert_eq!(text_at(node, MAIN_BRANCH, 1).await, Some(Value::Utf8("kept".into())));
+        assert_eq!(text_at(node, MAIN_BRANCH, 2).await, None);
+        assert_eq!(text_at(node, MAIN_BRANCH, 3).await, None);
+        assert_eq!(text_at(node, MAIN_BRANCH, 15).await, Some(Value::Utf8("new".into())));
+        assert_eq!(node.journal_recovery(), recovery);
+        assert_eq!(node.role(), Role::Follower);
+    }
+    assert_eq!(journal.acknowledgements.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn multi_writers_racing_to_acknowledge_a_journal_recovery_record_it_once() {
+    let cluster = Cluster::new();
+    let journal = Arc::new(Recoverable::default());
+    let (writer, first, kept) = recoverable_cluster(&cluster, &journal).await;
+    let stream = writer.journal_stream();
+    drop(writer);
+    let mut first = first;
+    let mut second = cluster.node(3, journal.handle(NODE_3_IDENTITY));
+    text_at(&mut second, MAIN_BRANCH, 1).await;
+    journal.recover(stream, kept).await;
+
+    // Both nodes take themselves for the preferred writer and see the
+    // recovery before either acknowledges it.
+    *journal.rendezvous.lock().unwrap() = Some(Arc::new(tokio::sync::Barrier::new(2)));
+    cluster.at(10 + LEASE + DRIFT + 1);
+    let (two, three) = (live(2), live(3));
+    let (a, b) = tokio::join!(first.tick(&two), second.tick(&three));
+    *journal.rendezvous.lock().unwrap() = None;
+    assert_eq!(journal.acknowledgements.load(Ordering::SeqCst), 2);
+    let roles = [a.unwrap(), b.unwrap()];
+    assert_eq!(roles.iter().filter(|role| matches!(role, Role::Writer(_))).count(), 1, "{roles:?}");
+    let (mut winner, mut loser) = if matches!(roles[0], Role::Writer(_)) { (first, second) } else { (second, first) };
+    winner.transact(&put(4, 4, "winner")).await.unwrap();
+    assert_eq!(recovery_records(&winner).len(), 1);
+
+    // The loser takes over once the winner releases; the journal already
+    // records the recovery, so it does not record it again.
+    let successor = BTreeSet::from([loser.options.node]);
+    assert_eq!(winner.tick(&successor).await.unwrap(), Role::Follower);
+    cluster.at(10 + 2 * (LEASE + DRIFT + 1));
+    assert!(matches!(loser.tick(&successor).await.unwrap(), Role::Writer(_)));
+    loser.transact(&put(5, 5, "loser")).await.unwrap();
+    assert_eq!(recovery_records(&loser).len(), 1);
+    assert_eq!(loser.journal_recovery().unwrap().head, kept);
+    assert_eq!(text_at(&mut winner, MAIN_BRANCH, 5).await, Some(Value::Utf8("loser".into())));
+    assert_eq!(recovery_records(&winner).len(), 1);
 }
 
 #[tokio::test]
@@ -1304,7 +1559,6 @@ struct GateJournal {
     inner: Arc<dyn Journal>,
     arm: AtomicBool,
     block_seal: AtomicBool,
-    recovered: std::sync::Mutex<Option<Lsn>>,
     block_trim: AtomicBool,
     entered: Notify,
     release: Notify,
@@ -1316,7 +1570,6 @@ impl GateJournal {
             inner,
             arm: AtomicBool::new(false),
             block_seal: AtomicBool::new(false),
-            recovered: std::sync::Mutex::new(None),
             block_trim: AtomicBool::new(false),
             entered: Notify::new(),
             release: Notify::new(),
@@ -1330,9 +1583,7 @@ impl Journal for GateJournal {
     }
 
     fn seal(&self, stream: StreamId, epoch: Epoch) -> BoxFuture<'_, journal_contract::Result<Lsn>> {
-        if let Some(head) = *self.recovered.lock().unwrap() {
-            Box::pin(async move { Err(JournalError::Recovered { head }) })
-        } else if self.block_seal.load(Ordering::SeqCst) {
+        if self.block_seal.load(Ordering::SeqCst) {
             Box::pin(async { Err(JournalError::Unavailable) })
         } else {
             self.inner.seal(stream, epoch)
@@ -1384,6 +1635,10 @@ impl Journal for GateJournal {
 
     fn delete(&self, stream: StreamId) -> BoxFuture<'_, journal_contract::Result<()>> {
         self.inner.delete(stream)
+    }
+
+    fn acknowledge_recovery(&self, stream: StreamId) -> BoxFuture<'_, journal_contract::Result<Lsn>> {
+        self.inner.acknowledge_recovery(stream)
     }
 }
 
@@ -2609,6 +2864,10 @@ impl Journal for LongPolls {
 
     fn delete(&self, stream: StreamId) -> BoxFuture<'_, journal_contract::Result<()>> {
         self.inner.delete(stream)
+    }
+
+    fn acknowledge_recovery(&self, stream: StreamId) -> BoxFuture<'_, journal_contract::Result<Lsn>> {
+        self.inner.acknowledge_recovery(stream)
     }
 }
 

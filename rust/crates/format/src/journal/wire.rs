@@ -6,7 +6,7 @@ use super::{ObjectKind, invalid, require_kind};
 
 #[derive(Message)]
 pub(super) struct Record {
-    #[prost(oneof = "Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12")]
+    #[prost(oneof = "Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13")]
     kind: Option<Kind>,
 }
 
@@ -36,6 +36,8 @@ enum Kind {
     DeploymentRetirement(Lease),
     #[prost(message, tag = "12")]
     RankedCatalog(RankedCatalog),
+    #[prost(message, tag = "13")]
+    Recovered(Recovered),
 }
 
 #[derive(Message)]
@@ -115,6 +117,16 @@ struct KeyRetirement {
 }
 
 #[derive(Message)]
+struct Recovered {
+    #[prost(uint64, tag = "1")]
+    head: u64,
+    #[prost(uint64, tag = "2")]
+    epoch: u64,
+    #[prost(sint64, tag = "3")]
+    time: i64,
+}
+
+#[derive(Message)]
 struct TimedDecision {
     #[prost(uint64, tag = "1")]
     tx_lsn: u64,
@@ -174,6 +186,7 @@ impl TryFrom<&super::Record> for Record {
             }
             WriterRelease { lease_until } => Kind::WriterRelease(self::Lease { until: *lease_until }),
             DeploymentRetirement { lease_until } => Kind::DeploymentRetirement(self::Lease { until: *lease_until }),
+            Recovered { head, epoch, time } => Kind::Recovered(self::Recovered { head: *head, epoch: *epoch, time: *time }),
         };
         Ok(Self { kind: Some(kind) })
     }
@@ -232,6 +245,11 @@ impl TryFrom<Record> for super::Record {
                 },
                 Kind::WriterRelease(release) => Self::WriterRelease { lease_until: release.until },
                 Kind::DeploymentRetirement(retirement) => Self::DeploymentRetirement { lease_until: retirement.until },
+                Kind::Recovered(recovered) => Self::Recovered {
+                    head: recovered.head,
+                    epoch: recovered.epoch,
+                    time: recovered.time,
+                },
             },
         )
     }

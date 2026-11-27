@@ -35,10 +35,29 @@ The contract maps onto consensus streams as follows.
 | `head(stream)` | The leader's fresh quorum-confirmed head after local application |
 | `read(stream, from, max, wait)` | One keeper's applied page, which may lag `head` |
 | `trim`, `delete` | Committed `Trim` under the fence, and `Delete` |
+| `acknowledge_recovery(stream)` | Replaces the fence that `keeper recover-stream` left with an ownerless one, so the next seal succeeds |
 
 Replication admission, the restart read rule and the read index sit inside
 the keepers, so the Multi driver needs no change to use them. Epoch zero is
 never a sealed writer epoch, and Multi always seals epoch one or later.
+
+## Operator recovery
+
+When a stream loses two of its three voters, an operator can run `logkeeper keeper recover-stream --acknowledge-data-loss` on the survivor.
+The stream then ends at the survivor's head, and records acknowledged after it may be lost.
+Every seal returns `JournalError::Recovered { head }` until a writer or an administrator acknowledges the recovery.
+
+- **Resuming.** The Multi node that would take the writer role logs a `rtdb/journal-recovered` error event, counts it in `rtdb_db::journal_recoveries_acknowledged`, acknowledges the recovery and seals above the recovery's fence.
+  It replays the recovered journal from its floor, writes its lease and then a `Recovered { head, epoch, time }` journal record, before any transaction.
+  When several nodes acknowledge at once, the epoch fence leaves one writer, and a node that finds the journal already records the recovery's head does not record it again.
+- **Why the journal.** The record is ordered with the history it describes and reaches every replica and reader through replay.
+  It stays until a checkpoint trims past it; checkpoint images do not carry it, and the error event and counter remain the operator's record after that.
+  RTDB's own object-store metadata has no order relative to the journal, and a reader would have to consult it on every catch-up to learn that its state is stale.
+- **Readers and followers.** A node whose state is ahead of the recovered head reports `rtdb/journal-shortened`.
+  A node whose last applied record the journal no longer holds, or that meets a recovery record after records it applied, reports `rtdb/journal-rewritten`.
+  Each check re-reads the last applied record with the next page, so it holds after the new writer has written past the lost positions.
+  Either way the node logs the loss and rebuilds its state from the journal floor.
+- **Holding writes.** With `multiJournal: {holdWritesAfterRecovery: true}` the node instead refuses the writer role with `rtdb/journal-recovered` until someone else acknowledges the recovery, and records nothing.
 
 ## Batches, placement, funded appends and journal size
 

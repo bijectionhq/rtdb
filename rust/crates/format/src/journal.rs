@@ -161,6 +161,13 @@ pub enum Record {
     DeploymentRetirement {
         lease_until: i64,
     },
+    /// The writer of `epoch` resumed at `time` after an operator recovery cut
+    /// the journal back to `head`; records acknowledged after `head` may be lost.
+    Recovered {
+        head: u64,
+        epoch: u64,
+        time: i64,
+    },
 }
 
 impl Record {

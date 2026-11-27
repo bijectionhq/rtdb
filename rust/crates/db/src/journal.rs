@@ -148,6 +148,11 @@ impl Stream {
         self.journal.seal(self.id(), epoch).await
     }
 
+    /// Lifts an operator recovery's fence and returns the journal head.
+    pub(crate) async fn acknowledge_recovery(&self) -> journal_contract::Result<Lsn> {
+        self.journal.acknowledge_recovery(self.id()).await
+    }
+
     pub(crate) async fn read(&self, from: Lsn) -> journal_contract::Result<Page> {
         self.journal
             .read(self.id(), from, PAGE_SIZE, Duration::ZERO)
@@ -219,6 +224,20 @@ impl Stream {
     }
 
     pub(crate) async fn decode(&self, lsn: Lsn, bytes: &[u8]) -> Result<Entry> {
+        let entry = self.decode_unproven(lsn, bytes).await?;
+        if let Record::Tx { payload, .. } = &entry.record
+            && let Some(cutoff) = TransactionRecord::funded_journal_cutoff(payload)?
+        {
+            let batch = self.batch.as_ref().ok_or_else(rtdb_tx::transact::funding_unsupported)?;
+            let original = self.timed_original(lsn, entry.epoch, bytes, cutoff);
+            batch.prove_timed_original(original).await.map_err(journal_error)?.verify_exact(original)?;
+        }
+        Ok(entry)
+    }
+
+    /// Decodes an entry without proving a funded transaction's timed
+    /// original, for comparing it with an entry already applied.
+    pub(crate) async fn decode_unproven(&self, lsn: Lsn, bytes: &[u8]) -> Result<Entry> {
         let context = Context::Journal { lsn: lsn.0 };
         let plaintext = rtdb_crypt::open(self.kms.as_ref(), self.database, context, bytes).await?;
         let (header, record) = plaintext
@@ -233,13 +252,6 @@ impl Stream {
             return Err(invalid_entry());
         }
         let record = Record::decode(record)?;
-        if let Record::Tx { payload, .. } = &record
-            && let Some(cutoff) = TransactionRecord::funded_journal_cutoff(payload)?
-        {
-            let batch = self.batch.as_ref().ok_or_else(rtdb_tx::transact::funding_unsupported)?;
-            let original = self.timed_original(lsn, epoch, bytes, cutoff);
-            batch.prove_timed_original(original).await.map_err(journal_error)?.verify_exact(original)?;
-        }
         Ok(Entry { epoch, generation: plaintext.generation.number, record })
     }
 
@@ -298,12 +310,25 @@ pub(crate) fn journal_shortened(head: Lsn, replayed: Lsn) -> Anomaly {
     )
 }
 
+/// The journal record at `at` is not the one this process replayed there, or
+/// the journal announces a recovery after records this process replayed: an
+/// operator recovery replaced the history this process built its state from.
+pub(crate) fn journal_rewritten(at: Lsn) -> Anomaly {
+    Anomaly::fault(
+        "rtdb/journal-rewritten",
+        format!(
+            "The journal no longer holds the history this process replayed through {}; an operator recovery replaced it",
+            at.0
+        ),
+    )
+}
+
 pub(crate) fn journal_error(error: JournalError) -> Anomaly {
     if let JournalError::Recovered { head } = error {
         return Anomaly::fault(
             "rtdb/journal-recovered",
             format!(
-                "The journal was recovered after losing two of its three voters and ends at {}; commits acknowledged after it may be lost. An administrator must acknowledge the recovery before writes resume",
+                "The journal was recovered after losing two of its three voters and ends at {}; commits acknowledged after it may be lost. Writes resume once a writer or an administrator acknowledges the recovery",
                 head.0
             ),
         );
@@ -337,6 +362,9 @@ mod tests {
         let shortened = journal_shortened(Lsn(41), Lsn(50));
         assert_eq!(shortened.code, "rtdb/journal-shortened");
         assert!(shortened.message.unwrap().contains("42 through 50"));
+        let rewritten = journal_rewritten(Lsn(50));
+        assert_eq!(rewritten.code, "rtdb/journal-rewritten");
+        assert!(rewritten.message.unwrap().contains("through 50"));
     }
 
     #[test]

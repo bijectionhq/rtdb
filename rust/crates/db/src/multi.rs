@@ -11,13 +11,23 @@ use rtdb_tx::transact::{
     Erasure, Receipt, ScopedTransact, Transact, TransactPipeline, TransactState, TransactionRecord,
 };
 use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::Basis};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
     journal::{Entry, JournalBatchAppender, Stream, journal_error, next},
     placement::preferred,
-    replay::{ChangeHistory, Committed, JournalCoordinates, ReplayBase, ReplayError},
+    replay::{ChangeHistory, Committed, JournalCoordinates, JournalRecovery, ReplayBase, ReplayError},
 };
+
+/// Operator recoveries this process's Multi writers acknowledged on their own.
+static RECOVERIES_ACKNOWLEDGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The number of operator journal recoveries that Multi writers in this
+/// process acknowledged before resuming writes.
+pub fn journal_recoveries_acknowledged() -> u64 {
+    RECOVERIES_ACKNOWLEDGED.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 mod classic_migration;
 mod deferred;
@@ -109,6 +119,11 @@ pub struct MultiDatabase {
     assigned_follower: Weak<()>,
     deferred_checkpoints: bool,
     binary_checkpoints: bool,
+    hold_writes_after_recovery: bool,
+    /// The next catch-up replays from the journal floor instead of resuming.
+    replay_afresh: bool,
+    /// A recovery this node acknowledged and has not yet recorded.
+    unrecorded_recovery: Option<Lsn>,
 }
 
 impl MultiDatabase {
@@ -148,6 +163,9 @@ impl MultiDatabase {
             assigned_follower: Weak::new(),
             deferred_checkpoints: false,
             binary_checkpoints: false,
+            hold_writes_after_recovery: false,
+            replay_afresh: false,
+            unrecorded_recovery: None,
         })
     }
 
@@ -180,6 +198,20 @@ impl MultiDatabase {
     }
 
     pub fn deferred_checkpoints(&self) -> bool { self.deferred_checkpoints }
+
+    /// Refuses the writer role after an operator recovery of the journal
+    /// until someone else acknowledges it. By default the writer
+    /// acknowledges the recovery itself, records it in the journal and
+    /// resumes.
+    pub fn with_hold_writes_after_recovery(mut self, hold: bool) -> Self {
+        self.hold_writes_after_recovery = hold;
+        self
+    }
+
+    /// The latest operator recovery recorded in the retained journal.
+    pub fn journal_recovery(&self) -> Option<JournalRecovery> {
+        self.committed.as_ref().and_then(|state| state.recovery)
+    }
 
     /// Writes checkpoint transaction state in CBOR instead of JSON. Enable
     /// only once every reader of the stream installs binary checkpoints.
@@ -279,14 +311,9 @@ impl MultiDatabase {
                 attempt
             }
         };
-        let end = match self.stream.seal(attempt.epoch).await {
-            Ok(end) => end,
-            Err(JournalError::Fenced { current }) => {
-                self.candidate = None;
-                self.note_competing_seal(current);
-                return Ok(());
-            }
-            Err(error) => return Err(journal_error(error)),
+        let (attempt, end) = match self.seal_attempt(attempt).await? {
+            Some(sealed) => sealed,
+            None => return Ok(()),
         };
         self.catch_up(end).await?;
         if !self.observed_lapse() || !self.before(attempt.until) {
@@ -324,7 +351,64 @@ impl MultiDatabase {
                 self.withdraw_writer();
                 return Err(error);
             }
+            if let Err(error) = self.record_recovery(attempt).await {
+                self.withdraw_writer();
+                return Err(error);
+            }
         }
+        Ok(())
+    }
+
+    /// Seals the attempt's epoch. After an operator recovery the writer
+    /// acknowledges the recovery itself, unless it holds writes, and seals
+    /// above the recovery's fence. Returns `None` when a competing writer
+    /// holds the stream.
+    async fn seal_attempt(&mut self, mut attempt: Lease) -> Result<Option<(Lease, Lsn)>> {
+        let mut acknowledged = None;
+        loop {
+            match self.stream.seal(attempt.epoch).await {
+                Ok(end) => return Ok(Some((attempt, end))),
+                Err(JournalError::Recovered { head }) if !self.hold_writes_after_recovery && acknowledged.is_none() => {
+                    tracing::error!(
+                        database = %self.options.database, code = "rtdb/journal-recovered", head = head.0,
+                        epoch = attempt.epoch.0,
+                        "An operator recovered the Multi journal after it lost two of its three voters; commits acknowledged after its head may be lost. The writer acknowledges the recovery, records it in the journal and resumes",
+                    );
+                    RECOVERIES_ACKNOWLEDGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.stream.acknowledge_recovery().await.map_err(journal_error)?;
+                    acknowledged = Some(head);
+                    self.unrecorded_recovery = Some(head);
+                    self.replay_afresh = true;
+                }
+                Err(JournalError::Fenced { current }) => {
+                    // The recovery's fence stands above the epoch this node
+                    // chose before it saw the recovery. Seal once above it,
+                    // unless a writer already appended after the recovery.
+                    if let Some(head) = acknowledged.take()
+                        && self.stream.head().await? == head
+                    {
+                        attempt = Lease { epoch: Epoch(next(Lsn(current.0))?.0), until: attempt.until };
+                        self.candidate = Some(attempt);
+                        continue;
+                    }
+                    self.candidate = None;
+                    self.note_competing_seal(current);
+                    return Ok(None);
+                }
+                Err(error) => return Err(journal_error(error)),
+            }
+        }
+    }
+
+    /// Appends the recovery this node acknowledged, unless the journal
+    /// already records it.
+    async fn record_recovery(&mut self, lease: Lease) -> Result<()> {
+        let Some(head) = self.unrecorded_recovery else { return Ok(()) };
+        if self.state().recovery.is_none_or(|recovery| recovery.head != head) {
+            let time = (self.clock)().0;
+            self.append_control(lease, Record::Recovered { head: head.0, epoch: lease.epoch.0, time }).await?;
+        }
+        self.unrecorded_recovery = None;
         Ok(())
     }
 
@@ -846,6 +930,7 @@ impl MultiDatabase {
             record,
         };
         let bytes = self.stream.encode(at, &entry).await?;
+        let tail = Sha256::digest(&bytes).into();
         self.require_authority(lease)?;
         match self.stream.append(lease.epoch, at, bytes).await {
             Ok(lsn) if lsn == at => {}
@@ -870,6 +955,7 @@ impl MultiDatabase {
                 return Err(error);
             }
         };
+        state.read_back(tail);
         self.install_committed(state);
         self.require_authority(lease)?;
         Ok(receipt)
@@ -960,15 +1046,16 @@ impl MultiDatabase {
     }
 
     async fn catch_up(&mut self, end: Lsn) -> Result<()> {
-        let previous = self.committed.take();
+        let previous = self.committed.take().filter(|_| !std::mem::take(&mut self.replay_afresh));
         let replayed = match Committed::read_through(&self.stream, self.store.as_ref(), end, previous).await {
             Ok(replayed) => replayed,
-            // Only an acknowledged recovery lets a seal return a head below
-            // what this process replayed. Report the lost range once, then
-            // continue from the recovered journal.
-            Err(shortened @ ReplayError::Shortened { .. }) => {
-                let shortened = shortened.into_anomaly();
-                eprintln!("Multi database {}: {}", self.options.database, shortened.message.as_deref().unwrap_or(""));
+            // Only an operator recovery shortens the journal below what this
+            // process replayed or replaces records it applied. Report the
+            // loss once, then rebuild from the recovered journal.
+            Err(lost @ (ReplayError::Shortened { .. } | ReplayError::Rewritten { .. })) => {
+                let lost = lost.into_anomaly();
+                tracing::error!(database = %self.options.database, code = %lost.code,
+                    "{}; replaying the recovered journal from its floor", lost.message.as_deref().unwrap_or(""));
                 Committed::read_through(&self.stream, self.store.as_ref(), end, None)
                     .await
                     .map_err(|error| self.keep_replayed(error))?

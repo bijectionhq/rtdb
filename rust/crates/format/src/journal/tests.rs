@@ -53,6 +53,11 @@ fn record_kinds_round_trip_with_fixed_tags() {
             system_time: i64::MIN,
             key_generation: 2,
         }),
+        Record::Recovered {
+            head: u64::MAX,
+            epoch: 3,
+            time: i64::MIN,
+        },
     ];
     for (i, record) in records.into_iter().enumerate() {
         let encoded = record.encode().unwrap();
@@ -71,7 +76,7 @@ fn malformed_record_envelopes_are_refused() {
     assert!(Record::decode(&bytes).is_err());
 
     let mut unknown = RECORD_HEADER.to_vec();
-    unknown.extend_from_slice(&[0x6a, 0]);
+    unknown.extend_from_slice(&[0x72, 0]);
     assert!(Record::decode(&unknown).is_err());
     assert!(
         Record::Checkpoint(Checkpoint {

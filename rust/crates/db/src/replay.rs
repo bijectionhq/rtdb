@@ -9,9 +9,10 @@ use rtdb_index::branches::{BranchCut, BranchEffect, BranchIndex};
 use rtdb_store::{ObjectStore, Reachability, VerifiedManifest, read_manifest};
 use rtdb_tx::transact::{Receipt, TransactState, TransactionRecord};
 use rtdb_types::{Anomaly, Result, Timestamp, rtdb_v1::Basis};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::journal::{Entry, Stream, journal_error, journal_shortened, next};
+use crate::journal::{Entry, Stream, journal_error, journal_rewritten, journal_shortened, next};
 
 const ROTATING_CHECKPOINT: u8 = 1;
 const RESTORED_HISTORY: u8 = 2;
@@ -86,6 +87,9 @@ pub(crate) enum ReplayError {
     /// The journal ends at `head`, before the `replayed` position this process
     /// already applied: a recovery lost the records between them.
     Shortened { head: Lsn, replayed: Lsn },
+    /// The journal no longer holds the history this process replayed through
+    /// `at`: the record there changed, or a recovery record follows it.
+    Rewritten { at: Lsn },
     /// `resume` is the longest prefix replay had fully applied, which a later
     /// replay continues from instead of starting over.
     Failed { error: Anomaly, resume: Option<Box<Committed>> },
@@ -101,6 +105,7 @@ impl ReplayError {
     pub(crate) fn into_anomaly(self) -> Anomaly {
         match self {
             Self::Shortened { head, replayed } => journal_shortened(head, replayed),
+            Self::Rewritten { at } => journal_rewritten(at),
             Self::Failed { error, .. } => error,
         }
     }
@@ -185,6 +190,19 @@ pub(crate) struct ReplayBase {
     pub(crate) checkpoint: Checkpoint,
 }
 
+/// An operator recovery that a writer recorded in the retained journal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JournalRecovery {
+    /// The position of the record.
+    pub at: Lsn,
+    /// The head the recovery left; records acknowledged after it may be lost.
+    pub head: Lsn,
+    /// The writer epoch that resumed after the recovery.
+    pub epoch: Epoch,
+    /// The writer's clock when it resumed.
+    pub time: Timestamp,
+}
+
 pub(crate) struct Committed {
     pub(crate) transactions: TransactState,
     pub(crate) floor: Lsn,
@@ -199,6 +217,10 @@ pub(crate) struct Committed {
     pub(crate) effects: Vec<AppliedEffects>,
     pub(crate) rotation: Option<Rotation>,
     pub(crate) coordinates: JournalCoordinates,
+    /// The latest retained recovery record.
+    pub(crate) recovery: Option<JournalRecovery>,
+    /// The digest of the journal bytes at `head`, when this state read them.
+    tail: Option<[u8; 32]>,
 }
 
 impl Committed {
@@ -217,6 +239,8 @@ impl Committed {
             effects: Vec::new(),
             rotation: None,
             coordinates: JournalCoordinates::default(),
+            recovery: None,
+            tail: None,
         }
     }
 
@@ -248,13 +272,30 @@ impl Committed {
         if let Some(state) = previous.as_ref().filter(|state| state.head > end) {
             return Err(ReplayError::Shortened { head: end, replayed: state.head });
         }
-        let mut from = next(previous.as_ref().map_or(Lsn(0), |state| state.head))
-            .map_err(|error| ReplayError::failed(error, previous.take()))?;
+        // An operator recovery can replace records this state applied while
+        // the head moves past them again, so the first page re-reads the last
+        // applied record and checks that it is still there.
+        let mut verify = previous.as_ref().filter(|state| !state.records.is_empty()).map(|state| state.head);
+        // A recovery record after a resumed state means the history before it
+        // may differ from what the state applied.
+        let mut seeded = verify.is_some();
+        let mut from = match verify {
+            Some(head) => head,
+            None => next(previous.as_ref().map_or(Lsn(0), |state| state.head))
+                .map_err(|error| ReplayError::failed(error, previous.take()))?,
+        };
         loop {
             let page = match stream.read(from).await {
                 Ok(page) => page,
+                // A trim through the head leaves no record to re-read.
+                Err(JournalError::Trimmed { floor }) if verify.is_some_and(|at| next(at).ok() == Some(floor)) => {
+                    verify = None;
+                    from = floor;
+                    continue;
+                }
                 Err(JournalError::Trimmed { floor }) if from < floor && floor <= end => {
                     previous = None;
+                    (verify, seeded) = (None, false);
                     from = floor;
                     continue;
                 }
@@ -268,6 +309,7 @@ impl Committed {
                 .is_some_and(|state| state.floor < page.floor)
             {
                 previous = None;
+                (verify, seeded) = (None, false);
                 from = page.floor;
                 continue;
             }
@@ -297,17 +339,32 @@ impl Committed {
                     }
                 }
             }
-            for (lsn, bytes) in page.records.into_iter().take_while(|(lsn, _)| *lsn <= end) {
+            let mut records = page.records.into_iter().take_while(|(lsn, _)| *lsn <= end);
+            if let Some(at) = verify.take() {
+                let Some((lsn, bytes)) = records.next().filter(|(lsn, _)| *lsn == at) else {
+                    return Err(ReplayError::failed(journal_error(JournalError::Unavailable), Some(state)));
+                };
+                match state.replayed(stream, lsn, &bytes).await {
+                    Ok(true) => state.tail = Some(Sha256::digest(&bytes).into()),
+                    Ok(false) => return Err(ReplayError::Rewritten { at }),
+                    Err(error) => return Err(ReplayError::failed(error, Some(state))),
+                }
+            }
+            for (lsn, bytes) in records {
                 let entry = match stream.decode(lsn, &bytes).await {
                     Ok(entry) => entry,
                     Err(error) => return Err(ReplayError::failed(error, Some(state))),
                 };
+                if seeded && matches!(entry.record, Record::Recovered { .. }) {
+                    return Err(ReplayError::Rewritten { at: state.head });
+                }
                 // A failed entry may have applied part of itself, so the state
                 // is no longer a prefix of the journal.
                 state
                     .apply_entry(stream, store, lsn, entry)
                     .await
                     .map_err(|error| ReplayError::failed(error, None))?;
+                state.tail = Some(Sha256::digest(&bytes).into());
             }
             if state.head == end {
                 return Ok(state);
@@ -320,6 +377,25 @@ impl Committed {
             from = following;
             previous = Some(state);
         }
+    }
+
+    /// Records the digest of the journal bytes of the record just applied at
+    /// the head.
+    pub(crate) fn read_back(&mut self, digest: [u8; 32]) {
+        self.tail = Some(digest);
+    }
+
+    /// Whether `bytes` at `lsn`, the head, are the record this state applied
+    /// there.
+    async fn replayed(&self, stream: &Stream, lsn: Lsn, bytes: &[u8]) -> Result<bool> {
+        if let Some(tail) = self.tail {
+            return Ok(<[u8; 32]>::from(Sha256::digest(bytes)) == tail);
+        }
+        // A state that applied its head without the journal bytes compares
+        // the record decoded.
+        let entry = stream.decode_unproven(lsn, bytes).await?;
+        Ok(entry.epoch == self.epoch && entry.generation == self.generation
+            && self.records.last() == Some(&entry.record))
     }
 
     /// A suffix that starts after LSN 1 replays over a checkpoint of the
@@ -533,6 +609,13 @@ impl Committed {
                 }
                 self.generation
             }
+            Record::Recovered { head, epoch, time } => {
+                if *head >= lsn.0 || *epoch != entry.epoch.0 {
+                    return Err(invalid("The recovery record does not follow the recovered head under its writer"));
+                }
+                self.recovery = Some(JournalRecovery { at: lsn, head: Lsn(*head), epoch: entry.epoch, time: Timestamp(*time) });
+                self.generation
+            }
             Record::Pin(_) | Record::Unpin { .. } => self.generation,
         };
         if generation != entry.generation {
@@ -543,6 +626,7 @@ impl Committed {
         self.generation = generation;
         self.epoch = entry.epoch;
         self.head = lsn;
+        self.tail = None;
         self.records.push(entry.record);
         if let (Some(receipt), Some(effects)) = (&receipt, effects)
             && !effects.is_empty()
@@ -761,6 +845,9 @@ impl Committed {
         self.effects.retain(|group| group.cut.basis.position() >= position);
         self.floor = floor;
         self.base = Some(base);
+        if self.recovery.is_some_and(|recovery| recovery.at < floor) {
+            self.recovery = None;
+        }
         if !self.records.iter().any(|record| matches!(record, Record::Lease { .. })) {
             self.lease = Some((epoch, until));
         }

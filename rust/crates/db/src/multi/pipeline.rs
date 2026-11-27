@@ -5,6 +5,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use sha2::{Digest, Sha256};
 use journal_contract::{Epoch, JournalError, Lsn};
 use rtdb_crypt::tokens::{TokenAuthority, VerifiedClaims};
 use rtdb_format::journal::Record;
@@ -265,7 +266,7 @@ impl Authority {
     async fn append_funded(
         &self, write: &Append, decision_before: Timestamp, cutoff: rtdb_types::TimedJournalCutoff,
         managed: Option<(&workload::ManagedAppointment, &TransactState)>,
-    ) -> std::result::Result<(), AttemptError> {
+    ) -> std::result::Result<[u8; 32], AttemptError> {
         let batch = self.stream.batch.as_ref().filter(|batch| batch.maximum_timed_original_bytes().is_some())
             .ok_or_else(|| AttemptError::Local(rtdb_tx::transact::funding_unsupported()))?;
         if self.next != write.at { return Err(AttemptError::Local(order_error("The funded append must follow the acknowledged prefix"))); }
@@ -284,7 +285,8 @@ impl Authority {
         let original = self.stream.timed_original(write.at, self.lease.epoch, &bytes, cutoff);
         let proof = batch.append_timed_original(original, bytes)
             .await.map_err(AttemptError::Journal)?;
-        proof.verify_exact(original).map_err(AttemptError::Local)
+        proof.verify_exact(original).map_err(AttemptError::Local)?;
+        Ok(original.payload_sha256)
     }
 
     fn upper(&self) -> Timestamp {
@@ -299,10 +301,12 @@ impl Authority {
         }
     }
 
+    /// Returns the clock bound after the append and the digest of the last
+    /// record's bytes.
     pub(super) async fn append(
         &self,
         writes: &[Append],
-    ) -> std::result::Result<Timestamp, AttemptError> {
+    ) -> std::result::Result<(Timestamp, [u8; 32]), AttemptError> {
         let mut records = Vec::with_capacity(writes.len());
         for (offset, write) in writes.iter().enumerate() {
             if self.next.0.checked_add(offset as u64) != Some(write.at.0) {
@@ -325,6 +329,7 @@ impl Authority {
             return Err(AttemptError::Local(workload::denied()));
         }
         let expected = writes.last().expect("nonempty append group").at;
+        let tail = Sha256::digest(&records.last().expect("nonempty append group").1).into();
         let appended = self
             .stream
             .append_group(self.lease.epoch, records)
@@ -336,7 +341,7 @@ impl Authority {
                 "The journal acknowledged a different group head",
             )));
         }
-        Ok(upper)
+        Ok((upper, tail))
     }
 }
 
@@ -538,8 +543,8 @@ async fn burst(
                 }
             }
         };
-        let upper = match result {
-            Ok(upper) => upper,
+        let (upper, tail) = match result {
+            Ok(appended) => appended,
             Err(error) => {
                 fail(database, &mut staged, waiters, error).await;
                 return;
@@ -547,7 +552,7 @@ async fn burst(
         };
         let positions: Vec<_> = writes.iter().map(|write| write.at).collect();
         let mut database_guard = database.lock().await;
-        let mut receipts = match database_guard.publish_staged(authority.lease, writes).await {
+        let mut receipts = match database_guard.publish_staged(authority.lease, writes, tail).await {
             Ok(receipts) => receipts.into_iter(),
             Err(error) => {
                 drop(database_guard);
@@ -806,13 +811,15 @@ impl MultiDatabase {
         let receipts = if let Some((_, decision_before, cutoff)) = funded {
             let authority = self.append_authority(lease.epoch)?;
             let admission = managed.map(|appointment| (appointment, self.durable_transactions()));
-            let result = authority.append_funded(&write, decision_before, cutoff, admission).await;
-            if let Err(error) = result {
-                let error = self.begin_write_recovery(error);
-                self.recover_after_failure().await;
-                return Err(error);
-            }
-            self.publish_staged(lease, vec![write]).await
+            let tail = match authority.append_funded(&write, decision_before, cutoff, admission).await {
+                Ok(tail) => tail,
+                Err(error) => {
+                    let error = self.begin_write_recovery(error);
+                    self.recover_after_failure().await;
+                    return Err(error);
+                }
+            };
+            self.publish_staged(lease, vec![write], tail).await
                 .map_err(|error| self.begin_write_recovery(AttemptError::Local(error)))?
         } else {
             self.commit_one(lease, write).await?.1
@@ -1058,10 +1065,12 @@ impl MultiDatabase {
         })
     }
 
+    /// `tail` is the digest of the last write's journal bytes.
     pub(super) async fn publish_staged(
         &mut self,
         lease: Lease,
         writes: Vec<Append>,
+        tail: [u8; 32],
     ) -> Result<Vec<Receipt>> {
         let through = writes.last().expect("nonempty append group").at;
         let reload = writes.iter().any(|write| reload_writer_fold(&write.entry.record));
@@ -1072,6 +1081,9 @@ impl MultiDatabase {
         for Append { at, entry, .. } in writes {
             if at > state.head {
                 state.apply_entry(&self.stream, self.store.as_ref(), at, entry).await?;
+                if at == through {
+                    state.read_back(tail);
+                }
             }
         }
         self.install_committed(state);
@@ -1137,6 +1149,12 @@ impl MultiDatabase {
             Ok(head) => head,
             Err(error @ (JournalError::Fenced { .. } | JournalError::Deleted)) => {
                 return Err(self.mutation_failed(error));
+            }
+            // An operator recovery ended this writer's epoch. Promotion
+            // acknowledges it and seals a new one.
+            Err(error @ JournalError::Recovered { .. }) => {
+                self.withdraw_writer();
+                return Err(super::journal_error(error));
             }
             Err(error) => return Err(super::journal_error(error)),
         };
@@ -1216,12 +1234,12 @@ impl MultiDatabase {
     ) -> Result<(Timestamp, Vec<Receipt>)> {
         let authority = self.append_authority(lease.epoch)?;
         let writes = vec![write];
-        let upper = authority
+        let (upper, tail) = authority
             .append(&writes)
             .await
             .map_err(|error| self.begin_write_recovery(error))?;
         let receipts = self
-            .publish_staged(lease, writes)
+            .publish_staged(lease, writes, tail)
             .await
             .map_err(|error| self.begin_write_recovery(AttemptError::Local(error)))?;
         Ok((upper, receipts))

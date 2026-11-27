@@ -34,6 +34,8 @@
 -- With deferred checkpoints the writer captures that checkpoint under its database lock, builds and uploads it without the lock, and announces it later, so commits continue while it builds.
 -- The stream driver submits contiguous append groups in LSN order and acknowledges the group after every record in it commits.
 -- An unavailable append can leave a committed prefix, which the driver recovers from the journal before resuming writes.
+-- After an operator recovery cuts a consensus stream back to its survivor's head, the next writer acknowledges the recovery, records it in the journal before any transaction, and resumes, unless its node is configured to hold writes until someone else acknowledges it.
+-- A node whose replayed state the recovered journal no longer holds rebuilds it from the journal floor.
 -- A cluster of the opt-in stream driver runs one node role per process and takes one journal URL with a client identity and trust bundle.
 -- A development process opens FileJournal and a filesystem object store under its selected data directory.
 -- The node uses the persisted database identity and key generations to recover the same journal after reopening the directory.
