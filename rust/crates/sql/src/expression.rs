@@ -629,7 +629,7 @@ fn function_arguments(function: &ast::Function) -> Result<Vec<ast::FunctionArg>>
     match &function.args { ast::FunctionArguments::None => Ok(Vec::new()), ast::FunctionArguments::List(arguments) => Ok(arguments.args.clone()), _ => Err(grammar_rejected("An unparenthesised subquery function argument")) }
 }
 
-fn binary_operator(operator: &ast::BinaryOperator) -> Result<BinaryOp> {
+pub(crate) fn binary_operator(operator: &ast::BinaryOperator) -> Result<BinaryOp> {
     use ast::BinaryOperator as A;
     Ok(match operator {
         A::Plus => BinaryOp::Add, A::Minus => BinaryOp::Subtract, A::Multiply => BinaryOp::Multiply, A::Divide => BinaryOp::Divide, A::Modulo => BinaryOp::Modulo,

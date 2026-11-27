@@ -4,7 +4,7 @@ use std::ops::ControlFlow;
 use rtdb_plan::{Expr, QuerySettings, Schema, SettingValue, TemporalFilter};
 use rtdb_types::{Result, TimeUnit, Value};
 use sqlparser::{ast, tokenizer::{Token, TokenWithSpan}};
-use sqlparser::ast::VisitMut;
+use sqlparser::ast::{Spanned, VisitMut};
 
 use crate::bind::Context;
 use crate::parse::{TemporalExtent, expression, sql_error, word};
@@ -114,6 +114,7 @@ pub(crate) fn extract(tokens: Vec<TokenWithSpan>, source: &str) -> Result<(Vec<T
             if word(tokens.get(at), "TO") || tokens.get(at).is_some_and(|token| token.token == Token::Eq) { at += 1; }
             else { return Err(sql_error("Expected TO or = after query setting", source, token.span)); }
             let (value, used) = expression(&tokens[at..], source, 0)?;
+            validate_setting_expression(&value, source)?;
             settings.entries.push(constructor(value));
             at += used;
         }
@@ -122,6 +123,56 @@ pub(crate) fn extract(tokens: Vec<TokenWithSpan>, source: &str) -> Result<(Vec<T
     let mut output = tokens[..start].to_vec();
     output.extend_from_slice(&tokens[at..]);
     Ok((output, settings))
+}
+
+fn validate_setting_expression(value: &ast::Expr, source: &str) -> Result<()> {
+    struct SettingGrammar<'a>(&'a str);
+
+    impl ast::Visitor for SettingGrammar<'_> {
+        type Break = rtdb_types::Anomaly;
+
+        fn pre_visit_expr(&mut self, expression: &ast::Expr) -> ControlFlow<Self::Break> {
+            use ast::{BinaryOperator as B, Expr as E, UnaryOperator as U};
+            let invalid = match expression {
+                E::BinaryOp { op: B::Custom(name), .. }
+                    if name.starts_with("rtdb.sql/string/") || name.starts_with("rtdb.sql/period/")
+                        || matches!(name.as_str(), "rtdb.sql/between/symmetric" | "rtdb.sql/between/not-symmetric" | "rtdb.sql/between/bounds"
+                            | "rtdb.sql/regex/match" | "rtdb.sql/regex/not" | "rtdb.sql/regex/flags") => None,
+                E::BinaryOp { op, .. } if crate::json_access::JsonAccess::operator(op).is_none()
+                    && crate::expression::binary_operator(op).is_err() => Some(format!("Invalid binary operator {op} in query setting")),
+                E::AnyOp { compare_op, .. } | E::AllOp { compare_op, .. }
+                    if !matches!(compare_op, B::Eq | B::NotEq | B::Lt | B::LtEq | B::Gt | B::GtEq) =>
+                    Some(format!("Invalid comparison operator {compare_op} in query setting")),
+                E::UnaryOp { op, .. } if !matches!(op, U::Plus | U::Minus | U::Not | U::BitwiseNot) =>
+                    Some(format!("Invalid unary operator {op} in query setting")),
+                E::Like { any: true, .. } | E::ILike { any: true, .. } => Some("LIKE ANY is not a query setting expression".into()),
+                E::Trim { trim_characters: Some(_), .. } => Some("Unexpected TRIM character list in query setting".into()),
+                E::CompoundFieldAccess { access_chain, .. } if access_chain.iter().any(|access| !matches!(access,
+                    ast::AccessExpr::Dot(E::Identifier(_)) | ast::AccessExpr::Subscript(ast::Subscript::Index { .. }))) =>
+                    Some("Unexpected field access or array slice in query setting".into()),
+                _ => None,
+            };
+            match invalid {
+                Some(message) => ControlFlow::Break(sql_error(message, self.0, expression.span())),
+                None => ControlFlow::Continue(()),
+            }
+        }
+
+        fn post_visit_expr(&mut self, expression: &ast::Expr) -> ControlFlow<Self::Break> {
+            if let ast::Expr::BinaryOp { op: ast::BinaryOperator::Custom(name), .. } = expression
+                && let Some(operator) = name.strip_prefix("rtdb.sql/string/")
+                && let Err(error) = crate::expression::string_operator_function(operator)
+            {
+                return ControlFlow::Break(error);
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    match ast::Visit::visit(value, &mut SettingGrammar(source)) {
+        ControlFlow::Continue(()) => Ok(()),
+        ControlFlow::Break(error) => Err(error),
+    }
 }
 
 fn parse_extent(tokens: &[TokenWithSpan], source: &str, span: sqlparser::tokenizer::Span) -> Result<(TemporalExtent, usize)> {

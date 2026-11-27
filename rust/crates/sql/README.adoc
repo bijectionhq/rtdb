@@ -127,7 +127,7 @@ INSERT columns, UPDATE assignment targets, and JOIN USING columns are unqualifie
 Query-level `SETTING` prefixes bind default valid/system extents into table scans, with explicit table extents taking precedence.
 The passive `QuerySettings` value retains clock, snapshot-token and snapshot-time metadata alongside the prepared relation; repeated settings are all planned and the last occurrence determines the value.
 Its passive `SettingValue` distinguishes literals, unadmitted `CLOCK_TIME` timestamp literals, parameters and unevaluated forms, retaining the parameter count of forms whose scalar type is never needed.
-Ignored snapshot-time settings and overwritten settings still validate function names, arities and typed literal spelling without scalar type checking.
+Ignored snapshot-time settings and overwritten settings still validate expression operators, function names, arities and typed literal spelling without scalar type checking.
 Temporal defaults retain their syntax in the preparation transient and bind scalar types when a scan uses the default.
 `PreparedQuery::from_prepared` carries this metadata into the shared node, transaction, ADBC/Flight and PostgreSQL execution path.
 Clock and snapshot-token settings resolve literals and parameters at query opening; scalar forms are recorded as unevaluated metadata and fail when consumed.

@@ -309,6 +309,19 @@ fn setting_before_explain_and_setting_from_without_to_are_rejected() {
 }
 
 #[test]
+fn query_settings_validate_operator_syntax_without_evaluating_the_expression() {
+    for expression in ["1 <=> 2", "1 DIV 2", "'x' LIKE ANY ('x')", "TRIM('xy', 'y')", "ARRAY[1,2][1:2]"] {
+        let sql = format!("SETTING SNAPSHOT_TIME = ({expression}) SELECT 1");
+        assert_eq!(rejection(&sql).code, "xtdb/sql-error", "{sql}");
+    }
+    let position = rejection("SETTING SNAPSHOT_TIME = POSITION('x' IN 'xy' USING octets) SELECT 1");
+    assert_eq!(position.code, "xtdb.error/illegal-arg");
+    assert_eq!(position.message.as_deref(), Some("No matching clause: octets"));
+    let prepared = prepare("SETTING SNAPSHOT_TIME = ($2 + 1) SELECT 1", &Fixture, &PrepareOptions::default()).unwrap();
+    assert_eq!(prepared.settings.snapshot_time, Some(SettingValue::Unevaluated { parameter_count: 2 }));
+}
+
+#[test]
 fn non_grammar_string_numeric_and_typed_literals_are_rejected() {
     for sql in [
         "SELECT N'hello'",
