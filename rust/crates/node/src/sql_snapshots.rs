@@ -17,7 +17,6 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 const SEALED_PREFIX: &str = "rtdb-sealed-snapshot-v4:";
-const MAX_SEALED_BYTES: usize = 2048;
 
 /// The RTDB-only envelope a sealed token carries.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -50,11 +49,7 @@ fn encode(view: &rtdb_query::SqlSnapshotView, owner: Option<&str>, codec: Option
     let Some(codec) = codec else { return Ok(rtdb_format::basis::encode_time_basis(&times)); };
     let cut = view.catalog.database(view.database())?.partitions.first().and_then(|snapshot| snapshot.catalog_cut());
     let sealed = SealedBasis { owner: owner.map(str::to_owned), history: codec.scope().history_fingerprint(), cut, times };
-    let token = format!("{SEALED_PREFIX}{}", codec.seal_snapshot(&serde_json::to_vec(&sealed).map_err(|error| invalid_basis(error.to_string()))?)?);
-    if token.len() > MAX_SEALED_BYTES {
-        return Err(Anomaly::new(AnomalyCategory::Unsupported, "rtdb/sealed-snapshot-too-large", "The sealed SQL snapshot token exceeds its size bound"));
-    }
-    Ok(token)
+    Ok(format!("{SEALED_PREFIX}{}", codec.seal_snapshot(&serde_json::to_vec(&sealed).map_err(|error| invalid_basis(error.to_string()))?)?))
 }
 
 /// Decodes a token for `owner`: XTDB's `TimeBasis`, or a sealed token, which needs the codec that sealed it.
@@ -63,7 +58,6 @@ fn decode(token: &str, owner: Option<&str>, codec: Option<&dyn crate::placed_rec
     let Some(sealed) = token.strip_prefix(SEALED_PREFIX) else {
         return Ok((rtdb_format::basis::decode_time_basis(token)?, None));
     };
-    if token.len() > MAX_SEALED_BYTES { return Err(invalid_basis("the sealed token exceeds its size bound")); }
     let codec = codec.ok_or_else(|| invalid_basis("a sealed token needs its database's codec"))?;
     let opened = codec.open_snapshot(sealed).map_err(|_| invalid_basis("the sealed token does not open here"))?;
     let basis: SealedBasis = serde_json::from_slice(&opened).map_err(|error| invalid_basis(error.to_string()))?;
@@ -120,6 +114,8 @@ pub(crate) struct SqlSnapshotAdmission {
 
 impl SqlSnapshotAdmission {
     /// Redeems a token against the current context's catalog, clock and zone, with no server-side state.
+    /// As in XTDB, a database is read by its name at the token's times: one replaced since the token was issued is read
+    /// as it is now, and refuses with `xtdb/unindexed-tx` when it has not reached those times.
     pub(crate) async fn restore(
         &self, token: &str, current: &QueryContext, cancellation: &CancellationToken,
     ) -> Result<rtdb_query::SqlSnapshotView> {
@@ -127,14 +123,14 @@ impl SqlSnapshotAdmission {
 
         let name = current.catalog.default_database();
         self.node.admit_retained_catalog(&current.catalog, self.identity.as_ref(), cancellation).await?;
-        let database = self.node.catalog().database(name).map_err(|_| unretained())?;
+        let database = self.node.catalog().database(name)?;
         let current_database = current.catalog.database(name)?;
-        if !Arc::ptr_eq(&database.storage, &current_database.storage) { return Err(unretained()); }
         let (times, cut) = decode(token, self.identity.user(), database.await_authority.codec())?;
+        // A sealed token also names the storage generation it was read from, which XTDB's basis cannot express.
         if let (Some(issued), Some(redeemed)) = (cut, current_database.partitions.first().and_then(|snapshot| snapshot.catalog_cut()))
             && (issued.storage_version != redeemed.storage_version || issued.storage_epoch != redeemed.storage_epoch)
         {
-            return Err(unretained());
+            return Err(invalid_basis("the sealed token was read from another storage generation"));
         }
         let partitions = current.catalog.database_names().map(|name| {
             Ok((name.to_owned(), read_at(times.databases.get(name), &current.catalog.database(name)?.partitions)?))
