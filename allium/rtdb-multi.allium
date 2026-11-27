@@ -33,7 +33,7 @@
 -- Appends and trims require that session's current fence.
 -- Recovery past a lost quorum restores a new incarnation and journals under a fresh stream ID.
 -- Consensus streams place each stream on three keepers in distinct failure domains and move one voter at a time off draining keepers.
--- With installed keeper trust they prove timed originals from signed syncs on two voters, so funded appends work on them.
+-- Authenticated consensus streams prove the exact records committed by the original quorum, including the durability bound of a timed original.
 -- The Multi writer checkpoints and trims before its retained journal suffix reaches the consensus stream's record bound.
 -- With deferred checkpoints the writer captures that checkpoint under its database lock, builds and uploads it without the lock, and announces it later, so commits continue while it builds.
 -- The standalone FileJournal enables deferred checkpoints by default.
@@ -429,9 +429,10 @@ contract CellMap {
         -- Its holder expires the grant from before that read using a suspend-aware clock and a conservative rate bound.
         -- Closing grant issuance applies to one expected incarnation and activation revision.
         -- A durable recovery records one operation, expected binding, destination cell and loss policy before publication.
-        -- Recovery freezes the exact operation. Supersession compares its identity and preserves any committed freeze and final lossless source cut.
-        -- Lossless recovery waits out source serving grants and obtains the final committed position from a source quorum seal.
-        -- A recorded installation must cover that final source position or carry explicit acceptance of an unknown tail at its verified cut.
+        -- Recovery freezes the exact operation.
+        -- Supersession compares its identity and preserves any committed freeze and lossless segment end.
+        -- Lossless recovery waits out source serving grants and obtains the segment end from a source quorum seal.
+        -- A recorded installation must cover that segment end or carry explicit acceptance of an unknown tail at its verified cut.
         -- The authority retains the verified installation and commits publication against that exact frozen operation.
         -- Publication retries read the retained result and the predecessor revision fences older operations after a later publication.
         -- Read-only status discovery by the exact predecessor incarnation and revision returns the selected operation after supersession or publication.
@@ -481,7 +482,7 @@ contract KernelFundedAdmission {
         -- The booking binds the original Kernel scope, the exact active RTDB binding, the call identity, and the ordered clock slot.
         -- The original slot is discoverable by call identity after the offer commits, including before the caller receives a reply or records a delivery.
         -- Binding the slot to a delivery orders the matching obligation and once identity in the Kernel's inbox commit.
-        -- RTDB orders and seals the store append for the offered slot, and provides physical commitment evidence at the exact journal cut.
+        -- RTDB orders and seals the store append for the offered slot, and provides proofs against the published lineage.
 
     @invariant StandaloneAdmission
         -- Ordinary reads, writes, recovery and ordered clock slots remain available independently of the Kernel.
@@ -495,58 +496,51 @@ contract KernelFundedAdmission {
         -- Recovery retains the original Kernel scope and ordered store cut through custody and readmission.
         -- The Kernel reconciles inherited bookings through its task and obligation fates and reads completed work by original call identity.
         -- The selected store can admit the Kernel's recovery writes before funded calls resume.
-        -- Funded admission at the successor requires an active RTDB binding, its matching authenticated Kernel enrollment, and reconciled predecessor evidence.
-        -- A predecessor decision beyond the available cut remains unresolved until the original commit or exclusion is established.
+        -- Future funded admission at the successor requires an active RTDB binding, its matching authenticated Kernel enrollment, and the Kernel's predecessor decisions.
+        -- A predecessor authorization remains pending until the Kernel verifies its inclusion or exclusion in the published lineage.
 }
 
-contract SignedFundedReceiptImport {
-    -- The existing RTDB recovery protocol for previously enrolled signed receipt scopes.
-    @invariant RetainedIssuerBooking
-        -- A historical import enrollment identifies its original issuer, activation authority, database, serving binding and receiver certificate.
-        -- The operator may replay an existing enrollment and supply its missing journal trust before recovery.
-        -- A new issuer scope receives the missing-Kernel refusal and never joins the retained roster.
-        -- The activation authority retains the complete roster of issuer and certificate scopes enrolled for that binding through recovery, including scopes closed before certificate rotation.
-        -- For each imported booking, the original issuer ordered it before returning its receipt or authorizing its accepting appends.
-        -- The booking carries the original receipt namespace, idempotency key, authenticated owner, predecessor basis, canonical request or appointment intent digest, and exclusive decision and journal cutoffs.
-        -- The original issuer's accepting-append authorizations precede its exclusive decision cutoff.
-        -- Before dispatch, each accepting-append authorization durably binds the booking and stage to the exact stream, writer epoch, position, sealed payload digest, receiver certificate and exclusive journal cutoff.
-        -- Exact retries recover the same booking and ordered stages, and a changed request for the same stage conflicts.
-        -- The issuer authenticates booking authority, the receiver authenticates clock evidence, and the original journal quorum authenticates timed appends.
+contract OriginalFundedAdmission {
+    @invariant IssuerOwnsBooking
+        -- Commissioning enrolls an original booking issuer for an exact activation authority, database name, serving binding and receiver certificate.
+        -- The issuer durably orders each booking before returning its receipt or authorizing an accepting stage.
+        -- Before dispatch, the authorization binds the booking and stage to the commissioned stream, writer epoch, position, sealed payload digest, receiver certificate digest and exclusive journal cutoff.
+        -- The issuer records an authorization only before its exclusive decision cutoff.
+        -- Exact retries reuse the original booking and authorization, and a changed request for the same stage conflicts.
 
-    @invariant ClosureFixesTheInventory
-        -- The matching activation decision closing predecessor grants fixes the scope roster and authorizes each issuer closure.
-        -- Each original issuer durably closes its funded scopes under that binding against new bookings and new authorizations for accepting appends.
-        -- Each scope closure authenticates a complete immutable inventory of the bookings ordered before it, including bookings whose replies were lost.
-        -- Activation publication requires a matching signed admission closure and a verified outcome for every booking in every enrolled predecessor scope.
-        -- The authority retains the roster and its closures through publication and exposes them by predecessor binding.
-        -- Recovery can resume enumeration against the same closure after issuer restart or recovery operation replacement.
-        -- After grants close, the broker contacts the exact enrolled issuer over authenticated transport for the closure and first missing outcome.
-        -- A lost reply resumes at the durable inventory position, and the issuer returns the same signed evidence for each retry.
-        -- A closure can be recorded while earlier authorized work still awaits a terminal decision.
+    @invariant LineageIsTheLedger
+        -- A database's lineage is the chain of journal segments selected by the activation authority.
+        -- Each segment binds its database, predecessor binding, original stream, authenticated head, inclusive end and successor binding to the preceding publication.
+        -- Logkeeper authenticates the records committed in each stream and their quorum durability bounds.
+        -- The independent control catalog authenticates the activation publication that selects which records survive.
+        -- Writer takeovers close prior epochs in the stream, and the authority publishes the surviving prefix when the incarnation ends.
+        -- Each successor's installation anchors the inherited prefix, and any later cut includes that installation.
 
-    @invariant SettlementUsesOriginalEvidence
-        -- The original issuer returns one durable terminal disposition for each inventoried booking under its original identity.
-        -- The verifier reconciles every append authorization and checks each accepting append's original keeper proof against its exact authorized request.
-        -- An accepted appointment activation retains its original proof even when the final appointment disposition is a refusal.
-        -- A terminal refusal requires original evidence that no accepting append committed for that stage and a fence against future acceptance under every issued authorization for it.
-        -- The exclusive journal cutoff bounds the original durability samples.
-        -- An authorized append with timely samples can commit after that cutoff while its original writer and journal roster still have authority.
-        -- A lossless seal of the original immutable stream excludes an authorized position above the sealed committed head when the seal fences the authorization's writer epoch.
-        -- Timed proof lookup follows the original journal's logical floor when the committed record moves to the offload store.
-        -- Before a covering trim or retirement, the issuer retains a commitment receipt from the original immutable journal for each accepted stage.
-        -- The receipt binds the enrolled catalog and exact timed original to a keeper attestation of commitment and the original quorum's signed timing samples.
-        -- Settlement evidence remains verifiable through writer replacement and source retirement, including when a checkpoint trims the accepting record.
-        -- Recovery leaves an authorized stage unresolved when it cannot verify the original evidence needed for settlement.
-        -- RTDB verifies every predecessor scope closure against its enrolled issuer and reconciles the complete inventories before the successor advertises or admits commissioned funded work.
-        -- A retained RTDB recovery record binds the verified original issuer evidence to its booking and scope.
-        -- The authority retains verified outcomes in issuer inventory order and publishes only when the installed cut covers every committed stage.
-        -- The portable cut preserves reconciled bookings under their original namespaces and keys as terminal receipts.
-        -- Installation attests the funded receipt inventory, and activation matches it against the predecessor's retained reconciliation.
-        -- A successor uses its own commissioned scope and preserves the original booking identity for retry and outcome lookup.
-        -- A label-scoped status request authenticates against the current binding before looking up a retained funded receipt under the original incarnation.
-        -- A retained unscoped appointment receipt is visible through status only to the authenticated original owner.
-        -- A retired ordinary funded consume can read its terminal receipt by exact owner, scope, booking, key and canonical request without creating a new effect.
-        -- That lookup requires the original receipt's issuer, caller, database and label scope to match, and projects the result through the current label scope.
+    @invariant CaptureRequiresPublishedInclusion
+        -- The issuer captures an authorization exactly once after verifying inclusion of its exact timed leaf within the published segment for that stream.
+        -- The leaf binds a quorum durability bound strictly before the authorized journal cutoff.
+        -- Inclusion in an application head alone leaves the authorization pending.
+
+    @invariant ReleaseRequiresPublishedExclusion
+        -- The issuer releases an authorization exactly once when the published segment for its stream ends before its position or proves inclusion of a different leaf at that position within the segment.
+        -- A replacement writer's different leaf at the authorized position excludes the authorization once that position survives in a published segment.
+        -- A verified terminal segment excludes its discarded suffix and all later commits to the predecessor from every successor.
+
+    @invariant ProofsOutliveTrim
+        -- Checkpoints and payload trim preserve the authenticated application and control leaves and the ability to prove inclusion against retained heads.
+        -- A recoverable cut makes its signed head and the proof material for that head available independently of its source keepers.
+        -- Retirement archives the material needed to produce inclusion and consistency proofs.
+
+    @invariant VerificationPinsOnlyTheCatalogRoot
+        -- The issuer verifies application and control catalog signatures offline from each catalog's pinned root and signed catalog history.
+        -- Leaf inclusion binds the exact stream and position to the verified head and the publication binds the selected application head to the database lineage.
+        -- Leader movement, keeper replacement and key rotation preserve verification for issued heads.
+
+    @invariant RecoveryIsFundingAgnostic
+        -- The activation authority seals or selects a cut, verifies the successor and publishes the segment without consulting the issuer.
+        -- The successor inherits the effects and committed receipts at that cut under their original retry identities.
+        -- The issuer owns booking identity and capture or release, and RTDB owns application effects and receipts.
+        -- Commissioned funded dispatch remains fenced.
 }
 
 contract Directory {
@@ -1177,7 +1171,7 @@ contract FencedStreamWriter {
         -- Refuse returns the unsent suffix for redecision against the refused state.
 
     @invariant ActivationEffectAdmission
-        -- Commissioned funded dispatch follows KernelFundedAdmission.
+        -- A commissioned incarnation refuses funded dispatch before contacting the receiver clock.
         -- A commissioned incarnation requires derivative custody authority before staging or publishing a ranked catalogue.
 
     @invariant SpeculativeWriteSuffix
@@ -1285,7 +1279,8 @@ contract PortableApplicationBackup {
         -- The writer captures one settled applied cut and binds its source incarnation, basis, system time and journal position to the encrypted checkpoint.
         -- An immutable stream can capture its settled application state at a quorum-confirmed head with read authority and without provisioning any source streams.
         -- The checkpoint contains its inline application state and exact retained receipt index.
-        -- A portable cut carries ordinary receipts and reconciled funded receipts, requires ordinary row custody state, and closes its export-pin inventory.
+        -- A portable cut carries committed receipts, requires ordinary row custody state, and closes its export-pin inventory.
+        -- An authenticated portable cut binds its source catalog and signed head and preserves independent access to the proof material for that head.
         -- The archive authenticates each ordinary checkpoint file under its exact source object identity.
         -- The writer reads each file from the current generation's custody and verifies its stored identity before capture.
         -- Publication follows durable archive creation under the source generation's independently available key custody.
@@ -1313,7 +1308,8 @@ contract PortableApplicationBackup {
 
     @invariant HostedStaging
         -- The independent activation journal supplies the pending recovery and its destination cell and incarnation.
-        -- The archive identifies the recovery predecessor and, for a lossless recovery, the sealed final source journal position.
+        -- The archive identifies the recovery predecessor and its selected segment end.
+        -- A lossless archive covers the source quorum's sealed head.
         -- The destination key provider retains the exact generation for the authority connection, operation and installation proof before the staging writer publishes relocated files or the checkpoint.
         -- The staged installation receipt requires both the original active key hold and the pending recovery to remain observable after checkpoint publication.
         -- A retry of the installed archive verifies the original hold and reopens the checkpoint without advancing the destination journal.
@@ -4639,7 +4635,7 @@ surface TerminalStorageMaintenance {
 -- Open Questions
 ------------------------------------------------------------
 
-open question "Which original funded issuer will be installed, and how will RTDB enroll and authenticate its admission, closure and terminal evidence?"
+open question "Which original funded issuer will be installed, and how will RTDB enroll and authenticate its authorizations?"
 
 open question "What does an idle RTDB database cost in memory today, and what is the least it can be made to cost?"
     -- resident_idle_target_bytes is a target, not a measurement.

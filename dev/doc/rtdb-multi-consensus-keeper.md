@@ -289,16 +289,16 @@ Pass the same `--expected-incarnation`, `--expected-revision`, and
 2. Run `freeze-recovery` to close predecessor grant issuance for that exact
    intent. For a lossless move, run `seal-source` against the broker once the
    commissioned source has stopped. The broker waits out old grants and seals
-   the immutable source journal with a quorum writer fence. It records the
-   resulting committed head as the final source LSN. Export through that head.
+   the immutable source journal with a quorum writer fence.
+   It records the resulting committed head as the segment end.
+   Export through that head.
 3. Restore into the candidate. For a remote destination, issue the signed
    installation receipt with `attest` and present it to `record-install` with
    `--cell-id`, `--installation-proof`, and `--manifest-sha256`. For a stopped
-   local destination, `record-install` can use the direct or broker-configured
-   verifier. The authority retains the verified archive digest, source LSN,
-   application position, and system time. A lossless installation must match
-   the retained final source LSN. An accepted unknown tail records the chosen
-   cut and leaves the final source LSN absent.
+   local destination, `record-install` can use the direct or broker-configured verifier.
+   The authority retains the verified archive digest, journal position, application position and system time.
+   A lossless installation must match the segment end recorded by `seal-source`.
+   An accepted unknown tail uses the installed archive cut as the segment end.
 4. Run `publish-recovery`. The broker reopens the recorded installation and
    freeze from quorum, waits out predecessor authority, and compares the same
    intent when committing the successor. The destination and proof file may be
@@ -471,80 +471,61 @@ The Kernel's task and obligation fates supply the business outcome during recove
 The Kernel records a slot by commit label and scheduled reading and binds it to the obligation and once identity in the inbox commit.
 An exact call retry needs to recover the same slot by call identity as soon as the offer commits, including when the reply is lost before the inbox commit. [Slot offer](https://github.com/bijectionhq/bijection/blob/c85db1809eed26f9e741d519d55ce13701696065/crates/kernel/src/pipeline/mod.rs#L5689-L5730) [Inbox binding](https://github.com/bijectionhq/bijection/blob/c85db1809eed26f9e741d519d55ce13701696065/crates/kernel/src/pipeline/mod.rs#L5935-L6002)
 
-Carry the original Kernel scope, selected store cut, and committed journal evidence through hosted custody.
+Carry the original Kernel scope and selected store cut through hosted custody.
 Use Kernel readmission to reconcile the original obligations and expose their fates under the original call identities. [Kernel readmission](https://github.com/bijectionhq/bijection/blob/c85db1809eed26f9e741d519d55ce13701696065/crates/kernel/src/pipeline/mod.rs#L3142-L3229)
 Let the Kernel finish its readmission writes on the selected successor store while funded calls remain fenced.
-If the original decision may be in an unavailable tail, keep it unresolved until the original commitment or exclusion is established.
+The Kernel verifies inclusion or exclusion in the published lineage before settling a predecessor authorization.
 
 Live funding requires a reachable Bijection Kernel.
 Standalone and pre-Kernel deployments admit ordinary reads, writes, recovery and ordered clock slots.
 The stock RTDB listeners refuse fresh funded requests at admission with `Unavailable` (`rtdb/funding-kernel-unavailable`) before queuing any work.
-Exact retries of retired ordinary DecisionClock receipts and keyed status remain available on the authenticated historical receipt route.
+The Kernel resolves exact retries through its original call identities after settlement.
 
-The stock RTDB deployment check for a standalone listener is a legacy `OfferDecisionClock` Flight action. It returns the typed missing-Kernel refusal before using the request body. A listener serving RTDB v1 also omits the legacy funded feature names from `Capabilities`.
-The stock RTDB launchers have no live Kernel funding route. A deployment serving live funded calls must admit them through the Bijection Kernel and use RTDB's ordered store interface for the append.
+The stock RTDB deployment check for a standalone listener is a legacy `OfferDecisionClock` Flight action.
+It returns the typed missing-Kernel refusal before using the request body.
+A listener serving RTDB v1 also omits the legacy funded feature names from `Capabilities`.
+A deployment serving live funded calls admits them through the Bijection Kernel and uses RTDB's ordered store interface for the append.
+The lineage protocol refuses prior signed-import funded state at its upgrade boundary.
 
-### Signed funded receipt import
+### Lineage and funded settlement
 
-Activation protocol 11 retains and verifies historical receipt scopes registered through the signed import protocol.
-An import enrollment binds the exact activation authority, database, serving binding and receiver certificate. [Signed funded import contract](../../allium/rtdb-multi.allium)
-The installed `fundedReceiverClock` transport supplies clock observations for that certificate and source incarnation.
-`RTDB_TIMED_ORIGINAL_TRUST_FILE` pins the original keeper proof signers, and the receiver and keepers use the same guarded clock scale.
-Give recovery an independently authenticated route to the original issuer and retain the original issuer and keeper verification identities through settlement.
-The original issuer durably binds each accepting stage to its exact sealed append before the writer sends it to the original journal.
-Logkeeper can verify the timed-original proof of a committed record after it moves from local storage to its original offload store. The stream's logical floor controls proof lookup in both locations. Preserve verifiable settlement evidence before a covering checkpoint trim or retirement removes the original proof. [Timed proof read](https://github.com/bijectionhq/logkeeper/blob/119f527310e40ad77765527ae1ac6040a6ae2670/src/stream/consensus/journal.rs#L371-L383)
-A hold on the selected checkpoint preceding a funded append keeps its timed proof readable through writer replacement by blocking checkpoint replacement while the hold is active. [Checkpoint replacement](https://github.com/bijectionhq/logkeeper/blob/14d7b7ec7c3d74667d95bebbe9ee143ca6eb8d98/src/stream/consensus/state/checkpoint.rs#L199-L220)
-Logkeeper accepts one checkpoint hold identity per stream and retains its terminal release record through later checkpoint replacements. [Exact checkpoint hold](https://github.com/bijectionhq/logkeeper/blob/14d7b7ec7c3d74667d95bebbe9ee143ca6eb8d98/src/stream/consensus/state/checkpoint.rs#L99-L123) [Released custody regression](https://github.com/bijectionhq/logkeeper/blob/14d7b7ec7c3d74667d95bebbe9ee143ca6eb8d98/src/stream/consensus/keeper/tests/authority.rs#L748-L761)
-Logkeeper can export a portable commitment receipt with `attest_timed_original` on immutable streams after cluster feature level 13 is finalized. The original keeper signs the commitment after a quorum read barrier. The receipt includes the original signed timing samples. Retain the receipt at the original issuer before a covering trim or retirement. Verification uses the enrolled catalog and historical keeper keys and works after the source keepers shut down. [Commitment receipt](https://github.com/bijectionhq/logkeeper/blob/0f056c0570a2a68b74991e1a45f211a280dcfc6e/src/stream/timed.rs)
-Read the complete funded scope roster from the original activation decision that closed predecessor grants, including scopes closed before certificate rotation.
-Upgrade the activation broker and serving readers to activation protocol 11 before resuming a pending historical funded handoff.
-The activation broker's `commission-funded` operation accepts exact retries of an existing historical enrollment identified by the original issuer's Ed25519 public key and exact receiver certificate on the current binding. A new enrollment receives `rtdb/funding-kernel-unavailable`.
-For an existing enrollment with no journal trust, use `--journal-trust FILE` to pin the original catalog UUID and historical keeper public keys before the predecessor starts recovery. The file contains `catalog` and a `keepers` array of `identity` and `verification_key` entries.
-The authority retains enrollments in issuer identity and certificate digest order and freezes that roster with the predecessor's grants.
-After `freeze-recovery`, page through `funded-scopes` by predecessor incarnation and revision and follow `next_offset`.
-The same lookup returns the frozen roster and recorded closures after supersession, publication, or later recoveries.
+This section describes the target design.
+Unknown-tail publication permanently fences the discarded suffix from the surviving lineage.
+An isolated predecessor quorum can still commit previously staged bytes outside that lineage.
 
-Configure `funded_issuers` on the activation broker to fetch signed closures and outcomes directly from the enrolled issuers. Each array entry contains the full `enrollment` from `funded-scopes` and a `connection` with the HTTPS origin `endpoint`, `ca_file`, `client_certificate_file`, `client_private_key_file`, and `server_certificate_sha256`. The broker selects a connection using the issuer UUID, receiver certificate digest, and verification key together. The server certificate pin identifies the HTTPS endpoint. Give the broker a private mTLS recovery credential, and have the issuer authorize that credential for the exact authority and scope before it closes admission or returns outcomes.
+Commissioned funded dispatch remains fenced.
+For a future funded dispatch, an issuer enrolls for the exact activation authority, database, binding and receiver certificate.
+The issuer deduplicates bookings and records each append authorization before dispatch, binding the original stream, writer epoch, position, sealed payload digest, receiver certificate digest and exclusive journal cutoff.
+The receiver clock supplies the journal clock scale, and the source quorum authenticates the durable timing bound.
 
-Run `reconcile-funded` with the predecessor incarnation, revision, and scope `--offset`. Each call records one closure or the first missing outcome. Repeat at the same offset until `next_index` is null, then follow `next_offset`. The broker recovers the cursor from its journal after either side loses a reply. Completed scopes can be checked after publication without contacting the issuer. For lossless recovery, run `seal-source` after closing admission so the issuer can settle stages that the seal excludes.
+The activation authority publishes one segment when it selects the surviving history of a predecessor incarnation and installs the successor binding.
+The publication names the exact application catalog and stream, the signed application head, the inclusive segment end, the successor and the previous lineage publication.
+The same decision orders the segment and the successor binding in the independent control journal.
+A writer takeover can fence an earlier epoch within the application stream while that incarnation's lineage publication is still pending.
 
-The broker posts JSON to `/rtdb/funded-issuer/v1/recovery`. The request contains `version` set to `1`, `authority_id`, `database`, `predecessor`, `scope_sha256`, and an `action`. The action is `{"kind":"close"}` or contains `kind` set to `outcome`, `inventory_sha256`, `index`, and `source_fence`. The fence is null until the broker has a lossless seal, then contains `writer_epoch` and `sealed_head` from the original seal. The issuer replies with `version` set to `1`, `request_sha256` over the exact request bytes, and `result` containing the signed closure or resolution. Both sides use at most 16 KiB per JSON body. HTTP 429 or 503 leaves the step pending. Persist the exact signed response before replying so retries carry the same proof bytes even if a different keeper could attest the same append.
+For a lossless recovery, select the segment end returned by the source quorum seal.
+For `accept-unknown-tail`, use the verified cut installed from the selected archive.
+An authenticated archive binds the original catalog and its signed head to the cut and preserves access to the proof material independently of the source cell.
+A successor's binding anchors its committed installation so a later recovery cut includes the previously selected history.
+Recovery publishes the segment without calling the issuer and carries the committed receipts in the selected cut to the successor.
 
-Operators holding a signed copy can also import the closure with `record-funded-closure`.
-The closure is JSON with `scope_sha256`, `bookings`, `inventory_sha256`, and `signature`.
-Digests and signatures are arrays of unsigned bytes.
-The issuer signs the concatenation of the UTF-8 domain `rtdb.activation.funded-closure/v1` followed by one zero byte, the 32-byte scope digest returned by the broker, the eight-byte big-endian booking count, and the 32-byte inventory digest.
-An empty inventory uses count zero and an all-zero digest.
-The authority verifies the receipt against the enrolled issuer. Publication requires each enrolled closure and its complete verified booking inventory.
+The issuer verifies the publication's inclusion in the control catalog and the application's inclusion against the head identified by the segment.
+Pin the root of each catalog and verify its signed history to resolve the quorum keys for the head.
+For capture, verify a timed leaf at the authorized position that matches the authorization in full and binds a quorum durability bound strictly before the cutoff.
+For release, verify that the published segment of the authorized stream ends before the position, or that a different leaf occupies the position within that segment.
+For example, a replacement writer can fill an abandoned position, and an authorized leaf above the selected cut can exist in the old stream while remaining outside the published lineage.
+Until publication, even a verified timed leaf leaves the authorization pending.
+Checkpoint replacement and trim preserve proofs, and retirement preserves a proof archive that can be checked offline.
 
-For direct imports, send the issuer's terminal resolutions to `record-funded-outcome` in one-based inventory order. Use `funded-outcome` with the predecessor binding, scope digest and index to recover the exact verified booking and its evidence.
-The issuer orders its frozen inventory by receipt namespace and idempotency key. An absent namespace sorts first, and present namespaces and keys sort by their raw bytes.
-The 32-byte inventory prefix starts at zero. For each booking, hash the UTF-8 domain `rtdb.activation.funded-inventory/v1` followed by one zero byte, the previous prefix and the booking digest. The last prefix must equal the signed closure's inventory digest.
-The booking digest hashes the UTF-8 domain `rtdb.activation.funded-booking/v1` followed by one zero byte and these fields in order. Use the raw booking UUID, a one-byte namespace presence flag and any namespace bytes, the length-prefixed key, the owner digest, the predecessor basis, the intent digest, one kind byte, and the count and contents of the accepting authorizations.
-Encode the predecessor basis as incarnation UUID and position. Each authorization contains one stage byte, writer epoch, position, payload digest, decision cutoff and journal cutoff. All integer lengths, counts, positions, epochs and cutoffs use eight big-endian bytes. The kind is zero for a transaction and one for an appointment. The stage is zero for activation and one for consumption.
-The issuer signs a resolution over the UTF-8 domain `rtdb.activation.funded-resolution/v1` followed by one zero byte, the scope digest, the signed inventory digest, the index, the prefix for that index, the disposition byte, and the count and contents of the stage evidence.
-Disposition zero means accepted and one means refused. A committed stage contributes byte zero and the SHA-256 digest of its encoded keeper commitment. An excluded stage contributes byte one and requires the original lossless seal.
-RTDB re-verifies the pinned keeper receipt for each committed stage and checks the original source fence for each excluded stage. It retains earlier appointment activation evidence even when consumption ends in refusal.
-After reconciliation, run `export-hosted` with `--funded-authority-url`, `--funded-authority-tls-dir`, and `--predecessor-revision`. The activation reader supplies the verified booking inventory. A lossless export selects the sealed predecessor head.
-The archive retains terminal results under their original receipt namespace and idempotency key. It preserves the original booking identity and evidence digest and clears live offers. A booking recorded only by the issuer receives a terminal refusal at the selected cut.
-For label-scoped `TxStatus`, use a current credential with the same issuer, subject, database name, and read and write labels. RTDB derives the original namespace from the retained receipt's source incarnation and projects the result through the current label scope. A current-namespace result takes precedence. If multiple inherited bookings match, use the activation broker's `funded-outcome` to select by predecessor and issuer scope.
-For an unscoped recovered appointment, `TxStatus` requires the original authenticated booking owner and returns the terminal receipt with the offer removed.
-An ordinary DecisionClock consume can also retry against the successor using the original booking, key and canonical transaction. The successor checks the current credential and matches the archived owner or exact label scope. A matching retry returns the terminal receipt without a clock observation or journal write. A different transaction under the same booking conflicts.
-Stage and attest this archive through the normal custody flow. The destination derives the funded inventory digest from the installed checkpoint and signs it with the installation. Publication compares it with the original predecessor's reconciled inventory.
-
-Obtain a durable closure for each scope and enumerate its complete booking inventory, including bookings whose replies were lost.
-Resume from that same closure after a restart or replacement recovery operation.
-Reconcile each booking with its original terminal disposition and verify the original keeper proof of every accepting append, including an accepted appointment activation followed by a refusal.
-When a lookup misses or is trimmed, settle the stage only from preserved acceptance proof or an original exclusion and fence.
-Logkeeper can commit an authorized append after the journal cutoff using signed samples that place durability before it, while the original writer and roster still have authority. [Timed append](https://github.com/bijectionhq/logkeeper/blob/14d7b7ec7c3d74667d95bebbe9ee143ca6eb8d98/src/stream/consensus/keeper.rs#L2513-L2564)
-A lossless seal of the original immutable stream excludes an exact attempt when its authorized position is above the sealed committed head and its writer epoch is fenced by the seal.
-Verify the stream, writer fence and head from the original seal receipt together. [Seal receipt](https://github.com/bijectionhq/logkeeper/blob/14d7b7ec7c3d74667d95bebbe9ee143ca6eb8d98/contract/src/lib.rs#L246-L252) [Atomic seal](https://github.com/bijectionhq/logkeeper/blob/14d7b7ec7c3d74667d95bebbe9ee143ca6eb8d98/src/stream/consensus/state.rs#L1113-L1152)
-Keep successor funded admission closed until the original evidence settles every booking.
+RTDB retains committed receipts by their original retry identity as part of the portable cut.
+For label-scoped `TxStatus`, use a current credential with the same issuer, subject, database name, and read and write labels.
+For an unscoped recovered appointment, `TxStatus` requires the original authenticated booking owner.
+The issuer retains the booking and the decision to capture or release even if the authorized transaction has no committed RTDB receipt.
 
 A hosted qualification requires a named non-production allocation with scoped object and key provider credentials, an independent activation quorum, and separate reader, operator and custodian identities.
 Drive the same recovery through lost replies and process restart, prove the selected versions and keys stay usable with the verifier offline, and verify that supersession or publication settles only the selected operation's hold.
-The Object Lock qualification reconciles a signed funded refusal through the broker, exports it from the read-only predecessor, and checks the receipt after successor activation and checkpoint replacement.
-Exercise derivative staging and funded dispatch across that same handoff only after enrolling their effect authorities.
+For lineage qualification, confirm that an authorization stays pending before publication, that a replacement record or a discarded suffix supports release, and that the included leaf verifies after trim and keeper shutdown.
+Exercise derivative staging across that handoff with its commissioned provider.
 
 ## Batches, placement, funded appends and journal size
 
@@ -600,7 +581,7 @@ Exercise derivative staging and funded dispatch across that same handoff only af
 
 For a commissioned hosted source, use `multi-backup export-hosted` with the original journal's reader credential, S3 allocation, and generation key vault.
 The command checks the immutable source's commissioning identity and creates an encrypted archive without advancing the source journal.
-For lossless recovery, export after `seal-source` so the archive covers the final source LSN required by the activation broker.
+For lossless recovery, export after `seal-source` so the archive covers the sealed segment end required by the activation broker.
 
 ```sh
 rtdb multi-backup export-hosted --archive "$ARCHIVE" --incarnation "$PREDECESSOR" \
@@ -621,6 +602,7 @@ The archive contains a wrapped data key. The source generation key remains in it
 
 `rtdb multi-backup restore` reads the archive with an explicitly supplied source key vault and installs the cut into a fresh development incarnation and journal stream.
 The source journal, object store, and process can be absent.
+An authenticated archive preserves the selected head and independent access to the material needed to prove any leaf in its cut.
 Keep source key custody available independently until a restore is admitted; retired key generations follow their existing deadlines.
 The destination checkpoint records the source coordinates and archive digest so the committed installation can be read back after restart.
 Each captured file is sealed under a fresh destination object identity.
