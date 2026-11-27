@@ -1,0 +1,33 @@
+= Pinned retention and cache tests
+
+The VE-11 comparison selects two original JUnit methods in an independent XTDB checkout at `0b9fa440f23d2165250d215209f7fa9bd7c26a6f`.
+The wrapper verifies both source blobs and retains the exact JUnit invocations and XML outcomes.
+The upstream collector test asserts that only the block-9 payload survives collection at block 10 with three blocks retained, and that the block-6 payload is absent.
+The upstream cache test starves the common pool, acquires and releases three four-byte pins against a ten-byte capacity, and asserts that `b` and `c` remain and the eviction callback names `a`.
+
+The native fixture publishes real oversized replica records through a size-limited native log into Classic local storage.
+It checks that block collection leaves exactly the three newest catalog files, that both payloads remain published, and that a reader opening the object store again resolves both recorded pointers to their original envelopes.
+The native disk cache fixture records its pinned and idle bytes, the actual files surviving each relevant step, and cache hits and misses on reload.
+The native memory cache fixture checks hard admission, retention through a sliced lease, and eviction of the least recently used idle allocation.
+The native tests run through the production storage, log, collector and cache APIs.
+
+After Phase 2 begins, use clean checkouts and a fresh output directory outside both.
+
+[source,shell]
+----
+python3 rust/conformance/run_reference_test_contracts.py --phase-two \
+  --reference /absolute/path/to/xtdb-at-0b9fa440f \
+  --output /absolute/new/reference-test-contracts
+----
+
+`result.json` retains both original assertion outcomes, the native observations, and field-level comparisons.
+It records the payload mismatch and compares the disk cache's final keys with the original Caffeine expectations.
+It also reports whether the native memory cache accepted all three pins, which is a precondition of the original cache test.
+The disk comparison covers final file residency and eviction identity.
+The original JUnit method covers Caffeine's common-pool scheduling and eviction callback behavior.
+
+Exit status 0 means both original tests and the native fixture assertions passed under their respective contracts.
+A difference in the compared observations sets `strict_match` to false even if both contracts pass.
+Exit status 1 signals an observed test failure with complete evidence.
+Exit status 2 signals missing evidence or an execution or provenance error.
+An incomplete comparison has `strict_match` set to null when a result can be written.

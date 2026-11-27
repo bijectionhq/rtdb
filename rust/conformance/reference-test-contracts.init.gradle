@@ -1,0 +1,16 @@
+import org.gradle.api.tasks.testing.Test
+
+gradle.projectsEvaluated {
+    def properties = gradle.rootProject.providers
+    def selected = properties.gradleProperty("rtdb.referenceContractsTask").get()
+    def destination = new File(properties.gradleProperty("rtdb.referenceContractsReport").get())
+    gradle.rootProject.allprojects { project ->
+        project.tasks.withType(Test).configureEach { task ->
+            if (task.path == selected) {
+                task.reports.junitXml.required.set(true)
+                task.reports.junitXml.outputLocation.set(destination)
+                task.outputs.upToDateWhen { false }
+            }
+        }
+    }
+}
