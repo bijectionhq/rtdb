@@ -1539,6 +1539,10 @@ mod tests {
             serving_checkpoint_object: Some(retained.id().to_string()), ..Default::default() }).unwrap();
         let root_key = ObjectKey::new(block_key(BlockIndex(1)).unwrap()).unwrap();
         store.put(&root_key, Bytes::from(root.encode_for_publication())).await.unwrap();
+        let staged_key = ObjectKey::new("blocks/staged/b02.binpb").unwrap();
+        let mut staged = BlockCatalog::from_proto(block_pb::Block { block_index: Some(2),
+            serving_checkpoint_object: Some(orphan.id().to_string()), ..Default::default() }).unwrap();
+        store.put(&staged_key, Bytes::from(staged.encode_for_publication())).await.unwrap();
 
         let cancellation = CancellationToken::new();
         let recovery = local.hold_recovery_open().await.unwrap();
@@ -1548,6 +1552,7 @@ mod tests {
         drop(recovery);
         blocks.collect_serving_checkpoints(database, 2, &cancellation).await.unwrap();
         assert!(matches!(store.head(&orphan_key).await, Err(rtdb_storage::Error::MissingObject(_))));
+        assert!(store.head(&staged_key).await.is_ok());
         assert_eq!(rtdb_store::read_file(store.as_ref(), &kms, retained.id()).await.unwrap().bytes.as_slice(), b"retained");
         assert_eq!(rtdb_store::read_file(store.as_ref(), &kms, inflight.id()).await.unwrap().bytes.as_slice(), b"in flight");
     }

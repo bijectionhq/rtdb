@@ -262,7 +262,7 @@ pub async fn latest_stored_block(store: &dyn ObjectStore, known: Option<BlockInd
         Some(known) if known.0 >= 0 && block_stored(store, known).await? => known,
         _ => {
             let directory = ObjectKey::new("blocks")?;
-            return Ok(store.list(Some(&directory)).await?.into_iter().filter_map(|entry| block_index_from_key(entry.key.as_str()).ok()).max());
+            return Ok(store.list(Some(&directory)).await?.into_iter().filter_map(|entry| canonical_block_index(&entry.key)).max());
         }
     };
     while let Some(next) = latest.0.checked_add(1).map(BlockIndex) {
@@ -270,6 +270,11 @@ pub async fn latest_stored_block(store: &dyn ObjectStore, known: Option<BlockInd
         latest = next;
     }
     Ok(Some(latest))
+}
+
+pub(crate) fn canonical_block_index(key: &ObjectKey) -> Option<BlockIndex> {
+    let index = block_index_from_key(key.as_str()).ok()?;
+    (key.as_str() == block_key(index).ok()?.as_str()).then_some(index)
 }
 
 async fn block_stored(store: &dyn ObjectStore, index: BlockIndex) -> Result<bool> {
@@ -486,7 +491,7 @@ impl BlockStore {
             let mut roots = Vec::new();
             for stored in self.store.list(Some(&ObjectKey::new("blocks")?)).await? {
                 check_cancelled(cancellation)?;
-                let Ok(index) = block_index_from_key(stored.key.as_str()) else { continue; };
+                let Some(index) = canonical_block_index(&stored.key) else { continue; };
                 let catalog = self.load_fresh_catalog(index).await?;
                 if let Some(key) = &catalog.as_proto().serving_checkpoint_object {
                     let id = key.parse::<ObjectId>()?;
@@ -969,5 +974,16 @@ mod latest_stored_block_tests {
         assert_eq!(latest_stored_block(&store, Some(BlockIndex(1))).await.unwrap(), Some(BlockIndex(7)));
         assert_eq!(latest_stored_block(&store, Some(BlockIndex(-1))).await.unwrap(), Some(BlockIndex(7)));
         assert_eq!(store.lists.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn listing_ignores_block_basenames_outside_the_canonical_root_keys() {
+        let store = CountingStore::default();
+        for key in ["blocks/staged/b0b.binpb", "blocks/b0A.binpb"] {
+            store.put(&ObjectKey::new(key).unwrap(), Bytes::from_static(b"unpublished")).await.unwrap();
+        }
+        assert_eq!(latest_stored_block(&store, None).await.unwrap(), None);
+        upload(&store, 7).await;
+        assert_eq!(latest_stored_block(&store, Some(BlockIndex(1))).await.unwrap(), Some(BlockIndex(7)));
     }
 }

@@ -912,6 +912,7 @@ config {
 -- == Leader Startup ==
 --
 -- A writable restart restores the latest persisted block and reads the replica suffix from that block's boundary.
+-- Checkpoint discovery, retained checkpoint export and serving-image collection recognize root block catalogs at the canonical `blocks/b{index}.binpb` keys.
 -- Native search repair uses a durable replica journal identity that survives reopening or relocating the journal directory.
 -- An admitted upload after a recovered boundary in the configured replica epoch confirms its checkpoint when the block index, storage version and epoch, source watermark, and external token match its recorded identity.
 -- An omitted upload storage epoch means zero.

@@ -3,7 +3,7 @@ use std::{fs, io::Write, path::{Path, PathBuf}, sync::Arc};
 use bytes::Bytes;
 use fs2::FileExt;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_format::{catalog::BlockCatalog, keys::{block_index_from_key, block_key}, log::proto};
+use rtdb_format::{catalog::BlockCatalog, keys::block_key, log::proto};
 use rtdb_storage::{HeldView, IoRegion, LocalStore, ObjectKey, ObjectStore, cache::BufferPool, object_store::ReadReservation};
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, CatalogCheckpoint, CatalogCut, ReplicaPosition, Result, SourcePosition, StorageEpoch, StorageVersion, Term, Timestamp, rtdb_v1::Basis};
 use serde::{Deserialize, Serialize};
@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{BlockDiscovery, BlockStore, NativeServingAuthority, NativeServingHandle, PublishedCheckpoint, checkpoint_dependencies, serving::decode_checkpoint_image};
+use crate::blocks::canonical_block_index;
 
 pub(crate) const PIN_FRAME: u8 = 7;
 pub(crate) const RELEASE_FRAME: u8 = 8;
@@ -558,7 +559,7 @@ async fn find_retained_publication(
     }
     let directory = ObjectKey::new("blocks")?;
     let mut retained = store.list(Some(&directory)).await?.into_iter()
-        .filter_map(|object| block_index_from_key(object.key.as_str()).ok())
+        .filter_map(|object| canonical_block_index(&object.key))
         .filter(|index| *index < latest.block_index())
         .collect::<Vec<_>>();
     retained.sort_unstable_by(|left, right| right.cmp(left));
