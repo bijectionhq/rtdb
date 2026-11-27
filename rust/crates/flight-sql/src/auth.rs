@@ -259,6 +259,103 @@ mod tests {
         let err = auth.authenticate(&client, None).await.err().unwrap();
         assert_eq!((err.code(), err.message()), (tonic::Code::Unauthenticated, "Client credentials authentication failed for client: client"));
     }
+
+    #[test]
+    fn credential_parsing_trims_scheme_separator_and_matches_xtdb_errors() {
+        let mut request = Request::new(());
+        request.metadata_mut().insert("authorization", "  bAsIc   dXNlcjpwYXNz  ".parse().unwrap());
+        let Credentials::Basic { raw, user, secret } = Credentials::parse(&request).unwrap() else { panic!("basic credentials"); };
+        assert_eq!((raw, user.as_str(), secret.as_str()), ("  bAsIc   dXNlcjpwYXNz  ", "user", "pass"));
+
+        request.metadata_mut().insert("authorization", "  Bearer   sess-1  ".parse().unwrap());
+        assert_eq!(Credentials::parse(&request).unwrap().bearer(), Some("sess-1"));
+
+        for (header, expected) in [
+            ("Basic", "malformed Basic credentials"),
+            ("Basic   ", "malformed Basic credentials"),
+            ("Basic not-base64", "malformed Basic credentials"),
+            ("Basic /w==", "malformed Basic credentials"),
+            ("Basic bm9jb2xvbg==", "malformed Basic credentials"),
+            ("Basic Og==", "malformed Basic credentials"),
+            ("Client", "malformed Client credentials"),
+            ("Client Og==", "malformed Client credentials"),
+            ("Bearer", "unsupported authorization scheme"),
+            ("Bearer   ", "unsupported authorization scheme"),
+            ("Digest abc", "unsupported authorization scheme"),
+            ("", "unsupported authorization scheme"),
+        ] {
+            request.metadata_mut().insert("authorization", header.parse().unwrap());
+            let error = Credentials::parse(&request).err().unwrap();
+            assert_eq!((error.code(), error.message()), (tonic::Code::Unauthenticated, expected), "{header:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn authentication_rejections_match_xtdb_messages() {
+        use rtdb_auth::{AuthConfig, HttpRequest, HttpResponse, HttpTransport, MethodRule, OidcConfig, Secret};
+        use rtdb_columnar::MemoryBudget;
+        use serde_json::json;
+
+        struct Issuer(Arc<MemoryBudget>);
+
+        #[async_trait::async_trait]
+        impl HttpTransport for Issuer {
+            async fn request(&self, request: HttpRequest) -> rtdb_types::Result<HttpResponse> {
+                let body = match request {
+                    HttpRequest::Get { bearer: None, .. } => json!({
+                        "token_endpoint": "https://issuer.example/token",
+                        "userinfo_endpoint": "https://issuer.example/userinfo",
+                    }),
+                    HttpRequest::Form { .. } => json!({"access_token": "token", "expires_in": 60}),
+                    HttpRequest::Get { bearer: Some(_), .. } => json!({"sub": "alice"}),
+                };
+                HttpResponse::new(200, body, &self.0)
+            }
+        }
+
+        let memory = MemoryBudget::new(8 << 20);
+        let oidc = |rules: Vec<MethodRule>| {
+            let memory = Arc::clone(&memory);
+            async move {
+                let authenticator = Authenticator::open(AuthConfig::OpenIdConnect(OidcConfig {
+                    issuer_url: "https://issuer.example".parse().unwrap(),
+                    issuer_ca_pem: None,
+                    client_id: "rtdb".into(),
+                    client_secret: Secret::new("configured"),
+                    rules,
+                    workload_grants: None,
+                }), Arc::clone(&memory), Arc::new(rtdb_node::SystemClock), Arc::new(Issuer(memory))).await.unwrap();
+                Authentication::new(authenticator)
+            }
+        };
+
+        let mut basic_req = Request::new(());
+        basic_req.metadata_mut().insert("authorization", "Basic YWxpY2U6c2VjcmV0".parse().unwrap());
+        let basic = Credentials::parse(&basic_req).unwrap();
+
+        let mut client_req = Request::new(());
+        client_req.metadata_mut().insert("authorization", "Client Y2xpZW50OnNlY3JldA==".parse().unwrap());
+        let client = Credentials::parse(&client_req).unwrap();
+
+        let no_rules = oidc(Vec::new()).await;
+        let error = no_rules.authenticate(&Credentials::None, None).await.err().unwrap();
+        assert_eq!((error.code(), error.message()), (tonic::Code::Unauthenticated, "authentication required"));
+        let error = no_rules.authenticate(&basic, None).await.err().unwrap();
+        assert_eq!((error.code(), error.message()), (tonic::Code::Unauthenticated, "no authentication record found for user: alice"));
+
+        let client_only = oidc(vec![MethodRule::any(Method::ClientCredentials)]).await;
+        let error = client_only.authenticate(&basic, None).await.err().unwrap();
+        assert_eq!((error.code(), error.message()), (tonic::Code::Unauthenticated, "send client credentials as `authorization: Client <base64(client-id:client-secret)>`"));
+
+        let device_only = oidc(vec![MethodRule::any(Method::DeviceAuth)]).await;
+        let error = device_only.authenticate(&basic, None).await.err().unwrap();
+        assert_eq!((error.code(), error.message()), (tonic::Code::Unimplemented, "device authorisation isn't supported over Flight SQL"));
+
+        let password_only = oidc(vec![MethodRule { method: Method::Password, user: Some("alice".into()), remote_address: None }]).await;
+        let error = password_only.authenticate(&client, None).await.err().unwrap();
+        assert_eq!((error.code(), error.message()), (tonic::Code::Unauthenticated, "Client credentials authentication failed for client: client"));
+    }
+
     #[test]
     fn cookie_parser_selects_first_nonempty_session_cookie() {
         let mut request = Request::new(()); request.metadata_mut().append("cookie", "x=y; arrow_flight_session_id=".parse().unwrap()); request.metadata_mut().append("cookie", " arrow_flight_session_id=one; arrow_flight_session_id=two".parse().unwrap());
