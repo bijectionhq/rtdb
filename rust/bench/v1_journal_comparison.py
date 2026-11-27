@@ -10,7 +10,9 @@ dev --multi` per back end on the same host:
 - `consensus`: three consensus voters and a catalog keeper
   (`logkeeper-consensus://`).
 
-Results go to OUTPUT/comparison.json.
+`--sync-mode fsync|full` sets the keepers' `sync_mode` (on macOS, plain
+`fsync` or `F_FULLFSYNC`); without it they use their default. Results go to
+OUTPUT/comparison.json.
 """
 
 import argparse
@@ -29,9 +31,10 @@ STREAM_PRINCIPAL = "urn:logkeeper:client:rtdb-journal-comparison"
 class StreamKeepers:
     """Three stream keepers, the journal Multi used before consensus streams."""
 
-    def __init__(self, binary, work, logs):
+    def __init__(self, binary, work, logs, sync_mode=None):
         self.binary, self.logs, self.processes = binary, logs, {}
         self.pki = harness.Pki(work, "stream")
+        durability = dict(sync_mode=sync_mode) if sync_mode else {}
         self.configs = {}
         addresses = []
         for index in range(3):
@@ -45,7 +48,7 @@ class StreamKeepers:
                 tls=dict(certificate=str(cert), private_key=str(key), ca=str(self.pki.ca)),
                 clients=[STREAM_PRINCIPAL], writers=[STREAM_PRINCIPAL],
                 limits=dict(stream_quota_bytes=8 << 30, max_record_bytes=32 << 20,
-                            round_bytes_per_stream=4 << 20, round_requests=64))))
+                            round_bytes_per_stream=4 << 20, round_requests=64), **durability)))
             self.configs[keeper] = (config, listen)
         self.client = self.pki.issue("stream-writer", f"URI:{STREAM_PRINCIPAL}", "clientAuth")
         self.url = "logkeeper+tls://" + ",".join(addresses)
@@ -71,10 +74,10 @@ def run_backend(name, args, results):
     logs.mkdir(parents=True)
     keepers = None
     if name == "stream":
-        keepers = StreamKeepers(args.logkeeper.resolve(), work, logs)
+        keepers = StreamKeepers(args.logkeeper.resolve(), work, logs, args.sync_mode)
         keepers.start_all()
     elif name == "consensus":
-        keepers = harness.Keepers(args.logkeeper.resolve(), work, logs)
+        keepers = harness.Keepers(args.logkeeper.resolve(), work, logs, args.sync_mode)
         for keeper in keepers.all():
             keepers.start(keeper)
     rtdb = harness.Rtdb(args.rtdb.resolve(), work, keepers, logs, args.checkpoints)
@@ -83,7 +86,7 @@ def run_backend(name, args, results):
         rtdb.start()
         for clients in args.clients:
             row = harness.commit(rtdb, clients, args.seconds, name, [], acknowledged)
-            results.append(dict(backend=name, **row))
+            results.append(dict(backend=name, sync_mode=args.sync_mode if keepers else None, **row))
     finally:
         if rtdb.process and rtdb.process.poll() is None:
             rtdb.stop()
@@ -103,6 +106,7 @@ def main():
     parser.add_argument("--clients", type=int, nargs="+", default=[1, 4, 16, 64])
     parser.add_argument("--seconds", type=float, default=10)
     parser.add_argument("--checkpoints", choices=harness.CHECKPOINT_MODES, default="deferred")
+    parser.add_argument("--sync-mode", choices=["fsync", "full"])
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     results = []

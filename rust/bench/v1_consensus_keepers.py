@@ -86,9 +86,11 @@ class Pki:
 
 
 class Keepers:
-    def __init__(self, binary, work, logs):
+    def __init__(self, binary, work, logs, sync_mode=None):
         self.binary, self.logs, self.processes = binary, logs, {}
         self.pki = Pki(work, "journal")
+        # Older keepers reject the field, so it is written only when asked for.
+        durability = dict(sync_mode=sync_mode) if sync_mode else {}
         self.voters = [str(uuid.uuid4()) for _ in range(3)]
         self.catalog = str(uuid.uuid4())
         roster = self.voters + [self.catalog]
@@ -110,7 +112,7 @@ class Keepers:
                 keeper=keeper, listen=lanes["keepers"][keeper], data=str(data), enrollment=str(registry),
                 tls=dict(certificate=str(cert), private_key=str(key), ca=str(self.pki.ca)),
                 **lanes, domains=domains, catalog=self.catalog,
-                readers=[PRINCIPAL], writers=[PRINCIPAL], administrators=[PRINCIPAL])))
+                readers=[PRINCIPAL], writers=[PRINCIPAL], administrators=[PRINCIPAL], **durability)))
             run(binary, "keeper", "initialize", "--config", config)
             self.configs[keeper] = config
         self.client = self.pki.issue("rtdb-writer", f"URI:{PRINCIPAL}", "clientAuth")
