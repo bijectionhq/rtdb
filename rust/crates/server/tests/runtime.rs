@@ -37,6 +37,17 @@ async fn production_composition_binds_drives_and_joins_all_listeners() {
 }
 
 #[tokio::test]
+async fn flight_sql_accepts_the_upstream_wildcard_host() {
+    let yaml = "server: null\nflightSql: {host: '*', port: 0}\ncompactor: {threads: 0}";
+    let config = NodeConfiguration::from_yaml_with_environment(yaml, &|_| None, false).unwrap();
+    let (server, driver) = ServerDriver::open(config, 128 * 1024 * 1024).await.unwrap();
+    let address = server.addresses().flight_sql.unwrap();
+    assert_eq!(address.ip(), std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    assert_ne!(address.port(), 0);
+    driver.close_without_run().await.unwrap();
+}
+
+#[tokio::test]
 async fn bind_failure_drops_previously_opened_listeners_without_starting_node_tasks() {
     let directory = tempfile::tempdir().unwrap();
     let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

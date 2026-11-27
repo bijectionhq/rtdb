@@ -340,7 +340,7 @@ fn flight(value: Yaml) -> Result<FlightSettings> {
     if hosted_controls.is_none() && custody_providers.iter().any(|route| route.owner.is_none()) {
         return Err(Anomaly::incorrect("rtdb/custody-provider-configuration", "Each custody provider route requires a configured owner"));
     }
-    let config = FlightSettings { host: fields.string("host")?.unwrap_or_else(|| "127.0.0.1".into()), port: decode_port(&mut fields, "port", 0)?,
+    let config = FlightSettings { host: fields.string("host")?.map(normalize_bind_host).unwrap_or_else(|| "127.0.0.1".into()), port: decode_port(&mut fields, "port", 0)?,
         transaction_idle_timeout: duration(&mut fields, "transactionIdleTimeout", 1800)?, prepared_statement_idle_timeout: duration(&mut fields, "preparedStatementIdleTimeout", 1800)?,
         session_idle_timeout: duration(&mut fields, "sessionIdleTimeout", 1800)?, session_unclaimed_timeout: duration(&mut fields, "sessionUnclaimedTimeout", 60)?, owned_native_actions: fields.boolean("ownedNativeActions")?.unwrap_or(false), store_only: false, hosted_controls, custody_providers };
     fields.finish()?;
@@ -460,8 +460,11 @@ fn bind_host(fields: &mut YamlFields) -> Result<String> {
     match fields.take("host") {
         None => Ok("127.0.0.1".into()),
         Some(Yaml::Null) => Ok("0.0.0.0".into()),
-        Some(value) => scalar_string(&value, "host").map(|host| if host == "*" { "0.0.0.0".into() } else { host }),
+        Some(value) => scalar_string(&value, "host").map(normalize_bind_host),
     }
+}
+fn normalize_bind_host(host: String) -> String {
+    if host == "*" { "0.0.0.0".into() } else { host }
 }
 fn env_boolean(environment: &impl Fn(&str) -> Option<String>, key: &str) -> bool { environment(key).is_some_and(|value| value.eq_ignore_ascii_case("true")) }
 fn decode_port(fields: &mut YamlFields, key: &str, default: i32) -> Result<i32> {

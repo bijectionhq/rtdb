@@ -40,7 +40,8 @@ Meter observations can cross a wall-clock boundary during live gauge I/O, as in 
 The command-line source handles YAML or EDN node startup, YAML ingest startup, playground startup, password hashing, help and version output.
 `--build-info` prints JSON with compiled version, full source revision and time-zone data version/digest without opening a node.
 Its values are independent of the `XTDB_VERSION` and `GIT_SHA` runtime overrides used by ordinary version output.
-Playground listeners bind all IPv4 interfaces; ordinary Pgwire and Flight settings retain loopback defaults.
+Playground listeners bind all IPv4 interfaces.
+Ordinary Pgwire and Flight SQL listeners default to loopback and accept `host: '*'` to bind all IPv4 interfaces.
 The EDN adapter preserves configured backend tags, aliases, numeric millisecond timeouts, `#env`, authentication-rule defaults and ignored top-level keys.
 JVM object-valued configuration hooks require native replacements; the EDN reader accepts data and never evaluates code.
 The process listens for interrupt and termination signals and reports shutdowns that take longer than ten seconds.
