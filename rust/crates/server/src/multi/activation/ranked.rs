@@ -218,6 +218,35 @@ impl ActivationAuthority {
         self.recovery_status(name, operation).await
     }
 
+    async fn ranked_outcome_closure(
+        &self,
+        name: &str,
+        predecessor: Binding,
+        operation_id: Option<Uuid>,
+    ) -> Result<RankedClosure> {
+        let (_, state) = self.read(self.stream_id(name)?).await?;
+        let state = state.ok_or_else(unavailable)?;
+        let closure = if state.binding == predecessor {
+            if let Some(operation_id) = operation_id {
+                state.pending(Operation { predecessor, operation_id })?;
+            }
+            state.ranked.and_then(|ranked| ranked.closure)
+        } else {
+            if predecessor.revision >= state.binding.revision {
+                return Err(conflict());
+            }
+            let publication = match state.publication {
+                Some(publication) if publication.predecessor == predecessor => Some(publication),
+                _ => self.archived_publication(name, predecessor).await?,
+            }.ok_or_else(missing_closure)?;
+            if operation_id.is_some_and(|operation_id| operation_id != publication.operation) {
+                return Err(conflict());
+            }
+            publication.recovery.and_then(|recovery| recovery.ranked_closure)
+        };
+        closure.filter(|closure| closure.valid_for(predecessor.incarnation)).ok_or_else(missing_closure)
+    }
+
     fn ranked_scope(&self, name: &str, state: &State) -> Result<RankedAdmissionScope> {
         let scope =
             rtdb_db::ActivationScope::for_cell(self.identity, name, state.destination_cell())?;
@@ -293,15 +322,11 @@ impl Providers {
         &self,
         authority: &ActivationAuthority,
         name: &str,
-        operation: Operation,
+        predecessor: Binding,
+        operation_id: Option<Uuid>,
         after: u64,
     ) -> Result<Value> {
-        let closure = match authority.recovery_status(name, operation).await? {
-            Status::Pending { ranked_closure, .. } | Status::Published { ranked_closure, .. } => {
-                ranked_closure
-            }
-        }
-        .ok_or_else(missing_closure)?;
+        let closure = authority.ranked_outcome_closure(name, predecessor, operation_id).await?;
         let config = self.find(closure.provider)?;
         read_outcomes(config, closure.receipt, after).await
     }
@@ -686,7 +711,7 @@ mod tests {
             loss_policy: LossPolicy::AcceptUnknownTail,
         }, None).await.unwrap();
         providers.freeze(&authority, "xtdb", operation).await.unwrap();
-        let outcome = providers.outcomes(&authority, "xtdb", operation, 0).await.unwrap();
+        let outcome = providers.outcomes(&authority, "xtdb", binding, None, 0).await.unwrap();
         assert_eq!(outcome["scope"]["admitted"], 1);
         assert_eq!(outcome["catalogues"][0]["position"], receipt.basis.position());
         assert_eq!(outcome["catalogues"][0]["system_time"], receipt.system_time.0);
@@ -763,20 +788,63 @@ mod tests {
         assert!(authority.status("xtdb").await.unwrap().grants_closed);
         drop(authority);
 
-        let authority = ActivationAuthority::open_local(&path, identity).unwrap();
+        let mut authority = ActivationAuthority::open_local(&path, identity).unwrap();
+        let time = AtomicU64::new(0);
+        Arc::get_mut(&mut authority).unwrap().clock =
+            Arc::new(move || Some(Duration::from_secs(time.fetch_add(6, Ordering::SeqCst))));
         let Status::Pending { ranked_closure: Some(closure), .. } =
             providers.freeze(&authority, "xtdb", operation).await.unwrap()
         else { panic!("expected original-provider closure"); };
         assert_eq!(closure.receipt.admitted, 33);
-        let first = providers.outcomes(&authority, "xtdb", operation, 0).await.unwrap();
+        let first = providers.outcomes(&authority, "xtdb", predecessor, None, 0).await.unwrap();
         let entries = first["catalogues"].as_array().unwrap();
         assert_eq!(entries.len(), 32);
         assert_eq!(entries[0]["position"], 3);
         assert_eq!(entries[0]["manifest"], catalogue.manifest.to_string());
         let next = first["next_after"].as_u64().unwrap();
-        let last = providers.outcomes(&authority, "xtdb", operation, next).await.unwrap();
+        let last = providers.outcomes(&authority, "xtdb", predecessor, Some(operation.operation_id), next).await.unwrap();
         assert_eq!(last["catalogues"][0]["position"], 35);
         assert!(last["next_after"].is_null());
+
+        let publish = async |operation: Operation| {
+            let Status::Pending { candidate, .. } = authority.recovery_status("xtdb", operation).await.unwrap()
+            else { panic!("expected pending ranked recovery"); };
+            authority.record_recovery_installation("xtdb", operation, VerifiedSuccessor {
+                predecessor: operation.predecessor.incarnation,
+                successor: candidate,
+                manifest_digest: [8; 32],
+                destination_cell: None,
+                key_hold: None,
+                journal_hold: None,
+                objects_sha256: None,
+                activation_scope: Some(rtdb_db::ActivationScope::new(identity, "xtdb").unwrap()),
+                source_cut: SourceCut { lsn: 3, position: 3, system_time: 4 },
+            }).await.unwrap();
+            let Status::Published { binding, .. } = authority.publish_recovery("xtdb", operation).await.unwrap()
+            else { panic!("expected the installed recovery to publish"); };
+            binding
+        };
+        let successor = publish(operation).await;
+        let later = Operation { predecessor: successor, operation_id: Uuid::new_v4() };
+        authority.begin_recovery("xtdb", Intent {
+            operation: later,
+            destination_cell: None,
+            loss_policy: LossPolicy::AcceptUnknownTail,
+        }, None).await.unwrap();
+        providers.freeze(&authority, "xtdb", later).await.unwrap();
+        publish(later).await;
+        drop(authority);
+
+        let reopened = ActivationAuthority::open_local(&path, identity).unwrap();
+        assert!(reopened.recovery_status("xtdb", operation).await.is_err());
+        assert_eq!(providers.outcomes(&reopened, "xtdb", predecessor, None, 0).await.unwrap(), first);
+        assert_eq!(providers.outcomes(&reopened, "xtdb", predecessor, Some(operation.operation_id), next).await.unwrap(), last);
+        assert!(providers.outcomes(&reopened, "xtdb", predecessor, Some(later.operation_id), 0).await.is_err());
+        assert!(providers.outcomes(&reopened, "xtdb", Binding { incarnation: Uuid::new_v4(), ..predecessor }, None, 0).await.is_err());
+        assert_eq!(
+            replacement.outcomes(&reopened, "xtdb", predecessor, None, 0).await.unwrap_err().code,
+            "rtdb/activation-ranked-provider",
+        );
     }
 
     #[tokio::test]

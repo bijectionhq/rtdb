@@ -65,7 +65,7 @@ pub(super) struct Pending {
 #[serde(deny_unknown_fields)]
 pub(super) struct Completed {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    ranked_closure: Option<super::ranked::RankedClosure>,
+    pub(super) ranked_closure: Option<super::ranked::RankedClosure>,
     loss_policy: LossPolicy,
     source_cut: SourceCut,
     final_source_lsn: Option<Lsn>,

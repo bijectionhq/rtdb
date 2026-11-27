@@ -1167,6 +1167,7 @@ contract EpochScopedStorage {
         -- Recovery freezes the predecessor's grants before obtaining closure from that allocation.
         -- Publication requires the durable closure of each commissioned predecessor ranked scope.
         -- Replacing the pending operation preserves the predecessor's closure; publication retains it for outcome discovery.
+        -- The broker discovers closed outcomes by the exact predecessor binding, including dispositions preserved across later recoveries.
         -- The portable checkpoint moves database state and ordinary file roots; the successor rebuilds ranked catalogues.
 
     @invariant PermanentUnreachability

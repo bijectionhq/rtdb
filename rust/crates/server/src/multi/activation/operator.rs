@@ -31,7 +31,7 @@ pub const HELP: &str = "Usage: rtdb multi-activation status DATABASE AUTHORITY
        rtdb multi-activation commission-ranked DATABASE --authority-socket PATH --provider NAME
                  --expected-incarnation UUID --expected-revision N
        rtdb multi-activation ranked-outcomes DATABASE --authority-socket PATH [--after N]
-                 --expected-incarnation UUID --expected-revision N --operation-id UUID
+                 --expected-incarnation UUID --expected-revision N [--operation-id UUID]
        rtdb multi-activation seal-source DATABASE --authority-socket PATH
                  --expected-incarnation UUID --expected-revision N --operation-id UUID
        rtdb multi-activation record-install DATABASE AUTHORITY --expected-incarnation UUID --expected-revision N --operation-id UUID
@@ -92,6 +92,10 @@ enum Action {
     CommissionRanked {
         expected: Binding,
         provider: String,
+    },
+    RankedOutcomes {
+        predecessor: Binding,
+        after: u64,
     },
     Freeze {
         expected: Binding,
@@ -351,6 +355,18 @@ impl Options {
                 expected: binding(&mut fields)?,
                 provider: take(&mut fields, "--provider")?,
             },
+            "ranked-outcomes" => {
+                let predecessor = binding(&mut fields)?;
+                let after = fields.remove("--after").map(|value| value.parse())
+                    .transpose().map_err(|_| arguments_error())?.unwrap_or(0);
+                match fields.remove("--operation-id").map(id).transpose()? {
+                    Some(operation_id) => Action::Recovery {
+                        operation: recovery::Operation { predecessor, operation_id },
+                        action: RecoveryAction::RankedOutcomes { after },
+                    },
+                    None => Action::RankedOutcomes { predecessor, after },
+                }
+            },
             "freeze" => Action::Freeze {
                 expected: binding(&mut fields)?,
             },
@@ -368,7 +384,7 @@ impl Options {
                 installation: None,
             },
             "begin-recovery" | "recovery-status" | "freeze-recovery" | "seal-source"
-            | "record-install" | "publish-recovery" | "ranked-outcomes" => {
+            | "record-install" | "publish-recovery" => {
                 let selection = recovery::Operation {
                     predecessor: binding(&mut fields)?,
                     operation_id: id(take(&mut fields, "--operation-id")?)?,
@@ -386,10 +402,6 @@ impl Options {
                     "recovery-status" => RecoveryAction::Status,
                     "freeze-recovery" => RecoveryAction::Freeze,
                     "seal-source" => RecoveryAction::SealSource,
-                    "ranked-outcomes" => RecoveryAction::RankedOutcomes {
-                        after: fields.remove("--after").map(|value| value.parse())
-                            .transpose().map_err(|_| arguments_error())?.unwrap_or(0),
-                    },
                     "record-install" => RecoveryAction::RecordInstall { installation: None },
                     _ => RecoveryAction::Publish,
                 };
@@ -422,7 +434,7 @@ impl Options {
             }));
         }
 
-        if matches!(request.action, Action::CommissionRanked { .. }
+        if matches!(request.action, Action::CommissionRanked { .. } | Action::RankedOutcomes { .. }
             | Action::Recovery { action: RecoveryAction::SealSource | RecoveryAction::RankedOutcomes { .. }, .. })
         {
             return Err(arguments_error());
@@ -595,6 +607,9 @@ impl Request {
         let database = self.database;
         match self.action {
             Action::Status => (),
+            Action::RankedOutcomes { predecessor, after } => {
+                return ranked.outcomes(authority, &database, predecessor, None, after).await;
+            }
             #[cfg(all(unix, feature = "backup-object-holds"))]
             Action::AuthorizeAbandonedAcquisition { intent, hold, head, anchor } => {
                 use recovery::CustodySettlement;
@@ -719,7 +734,7 @@ impl Request {
                     RecoveryAction::Status => authority.recovery_status(&database, operation).await?,
                     RecoveryAction::Freeze => ranked.freeze(authority, &database, operation).await?,
                     RecoveryAction::RankedOutcomes { after } => {
-                        return ranked.outcomes(authority, &database, operation, after).await;
+                        return ranked.outcomes(authority, &database, operation.predecessor, Some(operation.operation_id), after).await;
                     }
                     RecoveryAction::SealSource => seal_source(authority, &database, operation, source).await?,
                     RecoveryAction::RecordInstall { installation } => {
@@ -1214,6 +1229,29 @@ fn missing_installation() -> Anomaly {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn ranked_outcomes_arguments_accept_the_predecessor_without_a_recovery_id() {
+        let incarnation = Uuid::new_v4();
+        let arguments = format!(
+            "ranked-outcomes xtdb --authority-socket /tmp/authority.sock --expected-incarnation {incarnation} --expected-revision 7 --after 32"
+        );
+        let options = Options::parse(arguments.split_whitespace().map(str::to_owned)).unwrap();
+        assert!(matches!(options.0, Command::CallBroker { request: Request {
+            action: Action::RankedOutcomes { predecessor: Binding { incarnation: expected, revision: 7 }, after: 32 }, ..
+        }, .. } if expected == incarnation));
+
+        let operation_id = Uuid::new_v4();
+        let arguments = format!("{arguments} --operation-id {operation_id}");
+        let options = Options::parse(arguments.split_whitespace().map(str::to_owned)).unwrap();
+        assert!(matches!(options.0, Command::CallBroker { request: Request {
+            action: Action::Recovery {
+                operation: recovery::Operation { predecessor: Binding { incarnation: expected, revision: 7 }, operation_id: selected },
+                action: RecoveryAction::RankedOutcomes { after: 32 },
+            }, ..
+        }, .. } if expected == incarnation && selected == operation_id));
+    }
 
     #[test]
     fn publication_requires_exact_predecessor_and_destination() {

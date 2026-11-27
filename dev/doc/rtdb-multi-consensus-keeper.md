@@ -222,7 +222,9 @@ Give both identities permission to read the staged object's metadata and list ve
 On AWS, grant `s3:GetObject` and `s3:ListBucket` so `HeadObject` can report a missing key, and grant `s3:ListBucketVersions` for the exact derivative key prefix. [HeadObject permissions](https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadObject.html) · [ListObjectVersions permissions](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectVersions.html)
 Preserve the staged object versions and provider ledger records through outcome discovery, and keep unresolved completions visible at their current object keys.
 
-Use `ranked-outcomes` on the pending or published recovery to page through the original provider's admitted catalogues and independently recorded staged versions.
+Use `ranked-outcomes` with the exact predecessor binding to page through the original provider's admitted catalogues and independently recorded staged versions.
+The activation authority finds the closure from the frozen binding or its retained recovery publication, including after later recoveries.
+Supply `--operation-id` to require a match with the selected recovery.
 The `staged` array identifies each completed object's exact provider version, build cut and key generation, including files and manifests that never reached a catalogue.
 The inventory covers writes through recorded staging, and older writes require separate provider inventory evidence.
 Use brokers that understand staged receipts before commissioning writers with recorded staging.
@@ -230,7 +232,7 @@ Pass the returned `next_after` value as `--after` until the response ends the sc
 
 ```sh
 rtdb multi-activation ranked-outcomes xtdb --authority-socket "$SOCKET" \
-  --expected-incarnation "$PREDECESSOR" --expected-revision "$REVISION" --operation-id "$OPERATION"
+  --expected-incarnation "$PREDECESSOR" --expected-revision "$REVISION"
 ```
 
 ### Cross-cell publication
