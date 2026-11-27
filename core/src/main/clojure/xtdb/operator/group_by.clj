@@ -14,6 +14,7 @@
   (:import (com.carrotsearch.hppc LongArrayList)
            com.google.protobuf.UnsafeByteOperations
            (java.io Closeable)
+           (java.time LocalDateTime ZoneOffset)
            (java.util ArrayList Arrays LinkedList List Spliterator Spliterators)
            (java.util.stream IntStream IntStream$Builder)
            (org.apache.arrow.memory BufferAllocator)
@@ -22,7 +23,7 @@
            (xtdb.api ICursor)
            (xtdb.arrow ArrowTypes IntVector MonoVector RelationReader RowMask RowMask$Builder RowValueReader Vector VectorReader VectorType VectorWriter)
            (xtdb.arrow.agg AggregateSpec AggregateSpec$Factory Average Count GroupMapper GroupMapper$Mapper GroupMapper$Null RowCount StdDevPop StdDevSamp Sum VarWidthMinMax VariancePop VarianceSamp)
-           xtdb.arrow.extensions.UuidType
+           (xtdb.arrow.extensions KeywordType UuidType)
            (xtdb.expression.map IndexHasher RelationMapBuilder)
            xtdb.operator.SelectionSpec
            xtdb.operator.SelectionSpec$Factory
@@ -430,6 +431,14 @@
     (.getAsDouble values (int idx))
     (double (.getObject values (int idx)))))
 
+(def ^:private min-local-epoch-second (.toEpochSecond LocalDateTime/MIN ZoneOffset/UTC))
+(def ^:private max-local-epoch-second (.toEpochSecond LocalDateTime/MAX ZoneOffset/UTC))
+
+(defn- copy-percentile-timestamp? [^ArrowType$Timestamp arrow-type, ^VectorReader values, ^long idx]
+  (or (not= TimeUnit/SECOND (.getUnit arrow-type))
+      (and (contains? #{nil "UTC" "Z"} (.getTimezone arrow-type))
+           (<= (long min-local-epoch-second) (.getLong values (int idx)) (long max-local-epoch-second)))))
+
 (defn- copy-percentile-value! [^VectorWriter out-vec, ^VectorReader values, ^long idx]
   (let [arrow-type (.getArrowType values)
         same-type? (= (.getArrowType out-vec) arrow-type)]
@@ -457,8 +466,8 @@
                (and (instance? ArrowType$Date arrow-type)
                     (= DateUnit/DAY (.getUnit ^ArrowType$Date arrow-type)))
                (and (instance? ArrowType$Timestamp arrow-type)
-                    (not= TimeUnit/SECOND (.getUnit ^ArrowType$Timestamp arrow-type)))
-               (and (= ArrowTypes/UTF8_TYPE arrow-type)
+                    (copy-percentile-timestamp? arrow-type values idx))
+               (and (or (= ArrowTypes/UTF8_TYPE arrow-type) (= KeywordType/INSTANCE arrow-type))
                     (.isValidUtf8 (UnsafeByteOperations/unsafeWrap (.getBytes values (int idx)))))))
       (.copyRow (.rowCopier values out-vec) (int idx))
 

@@ -6,11 +6,13 @@
             [xtdb.test-util :as tu]
             [xtdb.util :as util])
   (:import (java.math BigDecimal)
+           (java.nio ByteBuffer)
+           (java.nio.charset StandardCharsets)
            (java.nio.file Files)
            (java.nio.file.attribute FileAttribute)
-           (java.time LocalDate)
+           (java.time DateTimeException LocalDate LocalDateTime ZoneOffset)
            (java.util Random)
-           (xtdb.arrow DateMilliVector DecimalVector RelationReader RowMask)
+           (xtdb.arrow DateMilliVector DecimalVector RelationReader RowMask Vector)
            (xtdb.arrow.agg AggregateSpec)))
 
 (t/use-fixtures :each tu/with-allocator tu/with-node)
@@ -184,6 +186,34 @@
       (t/is (thrown-with-msg? Exception #"invalid writeObject"
                               (#'group-by/copy-percentile-value! out src 2)))
       (t/is (= 2 (.getValueCount out))))))
+
+(t/deftest test-discrete-percentile-second-timestamp-winner-validation
+  (doseq [[src-type dst-type] [[#xt/type [:timestamp-local :second] #xt/type [:? [:timestamp-local :second]]]
+                               [#xt/type [:timestamp-tz :second "UTC"] #xt/type [:? [:timestamp-tz :second "UTC"]]]]]
+    (with-open [^Vector src (tu/open-vec "v" src-type [])
+                ^Vector out (tu/open-vec "p" dst-type [])]
+      (let [max-local-second (.toEpochSecond LocalDateTime/MAX ZoneOffset/UTC)]
+        (.writeLong src -1)
+        (.writeLong src max-local-second)
+        (.writeLong src (inc max-local-second))
+        (.writeLong src Long/MAX_VALUE)
+        (#'group-by/copy-percentile-value! out src 0)
+        (#'group-by/copy-percentile-value! out src 1)
+        (t/is (= [-1 max-local-second] (mapv #(.getLong out %) [0 1])))
+        (t/is (thrown? DateTimeException (#'group-by/copy-percentile-value! out src 2)))
+        (t/is (thrown? DateTimeException (#'group-by/copy-percentile-value! out src 3)))
+        (t/is (= 2 (.getValueCount out)))))))
+
+(t/deftest test-discrete-percentile-keyword-winner-keeps-java-decoding
+  (with-open [^Vector src (tu/open-vec "v" #xt/type :keyword [:document/café])
+              ^Vector out (tu/open-vec "p" #xt/type [:? :keyword] [])]
+    (let [malformed (byte-array (map unchecked-byte [0xed 0xa0 0x80]))
+          decoded (String. malformed StandardCharsets/UTF_8)]
+      (.writeBytes src ^bytes malformed)
+      (#'group-by/copy-percentile-value! out src 0)
+      (#'group-by/copy-percentile-value! out src 1)
+      (t/is (= [:document/café (keyword decoded)] (.getAsList out)))
+      (t/is (= (ByteBuffer/wrap (.getBytes decoded StandardCharsets/UTF_8)) (.getBytes out 1))))))
 
 (defn- reference-percentile [mode fraction direction vs]
   (let [vs (vec (cond-> (sort (remove nil? vs))
