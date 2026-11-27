@@ -193,6 +193,9 @@ impl MultiRuntime {
                     (Arc::new(journal.handle(identity)), None, None, None)
                 }
             };
+        if config.multi_journal.immutable_streams && placement.is_none() {
+            return Err(invalid("Immutable streams require a Logkeeper consensus journal"));
+        }
         let io = IoRegion::new();
         let store = Arc::new(LocalStore::open_in(path.join("objects"), Arc::clone(&io))?.with_apple_sync(config.apple_sync));
         let path = path
@@ -321,6 +324,9 @@ impl MultiRuntime {
             )?,
         };
         let JournalBackend { journal, batch, placement } = connect_stream_journal(&journal_url, &credentials).await?;
+        if config.multi_journal.immutable_streams && placement.is_none() {
+            return Err(invalid("Immutable streams require a Logkeeper consensus journal"));
+        }
         let io = IoRegion::new();
         let store = s3
             .open(
@@ -1082,7 +1088,9 @@ impl MultiRuntime {
                     watch.mark_seen();
                 }
 
-                if let Some(placement) = &self.backends.placement {
+                if !self.backends.journal_settings.immutable_streams
+                    && let Some(placement) = &self.backends.placement
+                {
                     let now = tokio::time::Instant::now();
                     if placement_due.is_none_or(|due| now >= due) {
                         placement_due = Some(now + PLACEMENT_INTERVAL);
@@ -1470,6 +1478,9 @@ async fn open_database(
         .with_deferred_checkpoints(backends.checkpoints.deferred)
         .with_binary_checkpoints(backends.checkpoints.binary)
         .with_hold_writes_after_recovery(backends.journal_settings.hold_writes_after_recovery);
+    if backends.journal_settings.immutable_streams {
+        database = database.with_immutable_journal();
+    }
     match backends.journal.head(StreamId(id.as_u128())).await {
         Ok(head) if head.0 > 0 => (),
         Ok(_) | Err(JournalError::NotFound) if matches!(mode, DatabaseOpen::Prepared) => {
@@ -1768,6 +1779,15 @@ impl JournalBatchAppender for ConsensusJournalBatch {
     ) -> journal_contract::BoxFuture<'_, journal_contract::Result<rtdb_db::TimedOriginalProof>> {
         Box::pin(async move {
             let proof = self.0.append_timed_original(timed_stream::request(original), payload).await?;
+            timed_stream::proof(original, proof)
+        })
+    }
+
+    fn append_session_timed_original(
+        &self, fence: journal_contract::WriterFence, original: rtdb_db::TimedOriginal, payload: bytes::Bytes,
+    ) -> journal_contract::BoxFuture<'_, journal_contract::Result<rtdb_db::TimedOriginalProof>> {
+        Box::pin(async move {
+            let proof = self.0.append_session_timed_original(fence, timed_stream::request(original), payload).await?;
             timed_stream::proof(original, proof)
         })
     }

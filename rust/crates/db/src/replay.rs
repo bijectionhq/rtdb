@@ -297,7 +297,9 @@ impl Committed {
         // An operator recovery can replace records this state applied while
         // the head moves past them again, so the first page re-reads the last
         // applied record and checks that it is still there.
-        let mut verify = previous.as_ref().filter(|state| !state.records.is_empty()).map(|state| state.head);
+        let mut verify = previous.as_ref()
+            .filter(|state| !stream.immutable_history() && !state.records.is_empty())
+            .map(|state| state.head);
         // A recovery record after a resumed state means the history before it
         // may differ from what the state applied.
         let mut seeded = verify.is_some();
@@ -307,7 +309,7 @@ impl Committed {
                 .map_err(|error| ReplayError::failed(error, previous.take()))?,
         };
         loop {
-            let page = match stream.read(from).await {
+            let page = match stream.read_through(from, end).await {
                 Ok(page) => page,
                 // A trim through the head leaves no record to re-read.
                 Err(JournalError::Trimmed { floor }) if verify.is_some_and(|at| next(at).ok() == Some(floor)) => {
@@ -377,7 +379,7 @@ impl Committed {
                     Ok(entry) => entry,
                     Err(error) => return Err(ReplayError::failed(error, Some(state))),
                 };
-                if seeded && matches!(entry.record, Record::Recovered { .. }) {
+                if (seeded || stream.immutable_history()) && matches!(entry.record, Record::Recovered { .. }) {
                     return Err(ReplayError::Rewritten { at: state.head });
                 }
                 // A failed entry may have applied part of itself, so the state

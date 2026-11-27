@@ -28,13 +28,17 @@
 -- The directory-managed storage and reaper rules describe the deployment path still in service.
 -- The opt-in stream driver uses the Logkeeper `journal-contract` boundary specified in Logkeeper's verification/target-journal.md.
 -- A `logkeeper-consensus://` journal URL selects keeper-hosted consensus streams behind the same boundary, as described in dev/doc/rtdb-multi-consensus-keeper.md.
+-- With immutable stream history, a stream ID names one committed history and remains bound to that mode.
+-- A journal seal binds its writer epoch to the claimant's session and records the sealed head.
+-- Appends and trims require that session's current fence.
+-- Recovery past a lost quorum restores a new incarnation and journals under a fresh stream ID.
 -- Consensus streams place each stream on three keepers in distinct failure domains and move one voter at a time off draining keepers.
 -- With installed keeper trust they prove timed originals from signed syncs on two voters, so funded appends work on them.
 -- The Multi writer checkpoints and trims before its retained journal suffix reaches the consensus stream's record bound.
 -- With deferred checkpoints the writer captures that checkpoint under its database lock, builds and uploads it without the lock, and announces it later, so commits continue while it builds.
 -- The stream driver submits contiguous append groups in LSN order and acknowledges the group after every record in it commits.
 -- An unavailable append can leave a committed prefix, which the driver recovers from the journal before resuming writes.
--- After an operator recovery cuts a consensus stream back to its survivor's head, the next writer acknowledges the recovery, records it in the journal before any transaction, and resumes, unless its node is configured to hold writes until someone else acknowledges it.
+-- After an operator recovery cuts a legacy consensus stream back to its survivor's head, the next writer acknowledges the recovery, records it in the journal before any transaction, and resumes, unless its node is configured to hold writes until someone else acknowledges it.
 -- A node whose replayed state the recovered journal no longer holds rebuilds it from the journal floor.
 -- A cluster of the opt-in stream driver runs one node role per process and takes one journal URL with a client identity and trust bundle.
 -- A development process opens FileJournal and a filesystem object store under its selected data directory.

@@ -2338,6 +2338,40 @@ async fn classic_candidate_status_recovers_a_lost_checkpoint_append_after_reopen
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn immutable_history_moves_the_rtdb_writer_without_changing_committed_receipts() {
+    use stream_logkeeper::stream::consensus::{CLUSTER_VERSION_CURRENT, testing::LocalCluster};
+
+    const PRINCIPAL: &str = "urn:logkeeper:client:immutable-rtdb";
+    let mut keepers = LocalCluster::start_replicated_catalog(&[PRINCIPAL]).await.unwrap();
+    let config = keepers.journal_config(8 << 30, 4 << 20);
+    let journal = Arc::new(keepers.journal(PRINCIPAL, &config).unwrap());
+    assert_eq!(journal.client().finalize_version(CLUSTER_VERSION_CURRENT).await.unwrap(),
+        CLUSTER_VERSION_CURRENT);
+    let cluster = Cluster::new();
+    let mut writer = cluster.node(1, journal.clone()).with_immutable_journal();
+    writer.create().await.unwrap();
+    assert_eq!(writer.tick(&live(1)).await.unwrap(), Role::Writer(Epoch(1)));
+    let before = put(1, 1, "first writer");
+    let receipt = writer.transact(&before).await.unwrap();
+
+    let mut successor = cluster.node(2, journal.clone()).with_immutable_journal();
+    assert_eq!(successor.tick(&live(2)).await.unwrap(), Role::Follower);
+    assert_eq!(successor.tx_status(&before.key).await.unwrap().basis, receipt.basis);
+    cluster.at(125);
+    assert_eq!(successor.tick(&live(2)).await.unwrap(), Role::Writer(Epoch(2)));
+    assert!(writer.transact(&put(2, 2, "expired writer")).await.is_err());
+    let after = put(3, 3, "second writer");
+    let after_receipt = successor.transact(&after).await.unwrap();
+
+    let mut reopened = cluster.node(3, journal).with_immutable_journal();
+    assert_eq!(reopened.tick(&live(2)).await.unwrap(), Role::Follower);
+    assert_eq!(reopened.tx_status(&before.key).await.unwrap().basis, receipt.basis);
+    assert_eq!(reopened.tx_status(&after.key).await.unwrap().basis, after_receipt.basis);
+
+    keepers.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multi_driver_resumes_after_every_keeper_restarts() {
     let mut journal = journals().await;
     let cluster = Cluster::new();

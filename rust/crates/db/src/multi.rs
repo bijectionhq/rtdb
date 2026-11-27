@@ -249,6 +249,11 @@ impl MultiDatabase {
         self.token_keys.destroy_retired(self.stream.kms.as_ref(), generation).await
     }
 
+    pub fn with_immutable_journal(mut self) -> Self {
+        self.stream = self.stream.with_immutable_history();
+        self
+    }
+
     pub fn with_batch_appender(mut self, batch: Arc<dyn JournalBatchAppender>) -> Self {
         self.stream.batch = Some(batch);
         self
@@ -391,7 +396,7 @@ impl MultiDatabase {
         loop {
             match self.stream.seal(attempt.epoch).await {
                 Ok(end) => return Ok(Some((attempt, end))),
-                Err(JournalError::Recovered { head }) if !self.hold_writes_after_recovery && acknowledged.is_none() => {
+                Err(JournalError::Recovered { head }) if !self.stream.immutable_history() && !self.hold_writes_after_recovery && acknowledged.is_none() => {
                     tracing::error!(
                         database = %self.options.database, code = "rtdb/journal-recovered", head = head.0,
                         epoch = attempt.epoch.0,
@@ -1136,7 +1141,7 @@ impl MultiDatabase {
             // Only an operator recovery shortens the journal below what this
             // process replayed or replaces records it applied. Report the
             // loss once, then rebuild from the recovered journal.
-            Err(lost @ (ReplayError::Shortened { .. } | ReplayError::Rewritten { .. })) => {
+            Err(lost @ (ReplayError::Shortened { .. } | ReplayError::Rewritten { .. })) if !self.stream.immutable_history() => {
                 let lost = lost.into_anomaly();
                 tracing::error!(database = %self.options.database, code = %lost.code,
                     "{}; replaying the recovered journal from its floor", lost.message.as_deref().unwrap_or(""));

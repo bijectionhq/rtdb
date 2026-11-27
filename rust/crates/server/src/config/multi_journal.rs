@@ -1,5 +1,5 @@
 use rtdb_format::config::{Yaml, YamlFields};
-use rtdb_types::Result;
+use rtdb_types::{Anomaly, Result};
 
 use super::empty;
 
@@ -11,6 +11,7 @@ pub struct MultiJournalSettings {
     /// an administrator acknowledges the recovery. By default the writer
     /// acknowledges it, records it in the journal and resumes.
     pub hold_writes_after_recovery: bool,
+    pub immutable_streams: bool,
 }
 
 impl MultiJournalSettings {
@@ -18,8 +19,15 @@ impl MultiJournalSettings {
     pub(crate) fn decode(value: Option<Yaml>) -> Result<Self> {
         let mut fields = YamlFields::new(value.unwrap_or_else(empty), "multiJournal")?;
         let hold_writes_after_recovery = fields.boolean("holdWritesAfterRecovery")?.unwrap_or(false);
+        let immutable_streams = fields.boolean("immutableStreams")?.unwrap_or(false);
         fields.finish()?;
-        Ok(Self { hold_writes_after_recovery })
+        if hold_writes_after_recovery && immutable_streams {
+            return Err(Anomaly::incorrect(
+                "rtdb/multi-journal",
+                "Immutable streams cannot be configured to acknowledge an in-place recovery",
+            ));
+        }
+        Ok(Self { hold_writes_after_recovery, immutable_streams })
     }
 }
 
@@ -31,6 +39,14 @@ mod tests {
 
     fn decode(yaml: &str) -> Result<MultiJournalSettings> {
         MultiJournalSettings::decode(Some(parse_yaml(yaml)?))
+    }
+
+    #[test]
+    fn selects_immutable_streams_explicitly() {
+        assert!(!decode("{}").unwrap().immutable_streams);
+        assert!(decode("{immutableStreams: true}").unwrap().immutable_streams);
+        assert!(decode("{immutableStreams: maybe}").is_err());
+        assert!(decode("{immutableStreams: true, holdWritesAfterRecovery: true}").is_err());
     }
 
     #[test]

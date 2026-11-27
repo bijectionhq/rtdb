@@ -41,6 +41,17 @@ Replication admission, the restart read rule and the read index sit inside
 the keepers, so the Multi driver needs no change to use them. Epoch zero is
 never a sealed writer epoch, and Multi always seals epoch one or later.
 
+## Immutable stream history
+
+Set `multiJournal: {immutableStreams: true}` for a Multi cell using a Logkeeper consensus cluster with cluster version 4 finalized.
+This setting applies to newly created stream IDs.
+A residence verifies the durable stream mode before opening the history and presents a fresh session identity when seeking the writer epoch.
+Seal binds that session to the exact committed head, and subsequent appends and trims carry its fence.
+Followers request pages that cover their observed head and resume at the next LSN.
+A history change under the same ID faults the residence.
+The keeper manages replica replacement for immutable streams.
+To adopt this mode for existing databases, restore a verified application cut into a fresh database incarnation and stream before changing the database route.
+
 ## Operator recovery
 
 When a stream loses two of its three voters, an operator can run `logkeeper keeper recover-stream --acknowledge-data-loss` on the survivor.
