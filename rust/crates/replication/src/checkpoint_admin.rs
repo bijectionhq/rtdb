@@ -386,13 +386,14 @@ impl NativeServingHandle {
         if hash(&manifest_bytes) != control.manifest { return Err(invalid("The archived manifest differs from the ordered pin")); }
         let manifest: Manifest = decode(&manifest_bytes)?;
         if &manifest.selection != cut { return Err(invalid("The archive selection differs from the ordered pin")); }
+        let apple_sync = source.apple_sync();
         let ready = output_parent.join(format!("checkpoint-{}-{}", Uuid::from_bytes(cut.basis.incarnation()), cut.pin));
         if ready.try_exists().map_err(io)? {
             reopen_detached(&ready, &self.authority, ticket, control, &manifest, memory, cancellation).await?;
         } else {
             let directory = tempfile::Builder::new().prefix(".checkpoint-restore-").tempdir_in(&output_parent).map_err(io)?;
             let staged = directory.path().join("storage");
-            let destination = Arc::new(LocalStore::open(&staged)?);
+            let destination = Arc::new(LocalStore::open(&staged)?.with_apple_sync(apple_sync));
             for file in &manifest.files {
                 let key = ObjectKey::new(file.key.clone())?;
                 let archived = archive_key(&namespace, &key)?;
@@ -408,9 +409,9 @@ impl NativeServingHandle {
                 if !ready.try_exists().map_err(io)? { return Err(io(error)); }
                 reopen_detached(&ready, &self.authority, ticket, control, &manifest, memory, cancellation).await?;
             }
-            rtdb_storage::sync_directory(directory.path()).map_err(io)?;
+            rtdb_storage::sync_directory(directory.path(), apple_sync).map_err(io)?;
         }
-        rtdb_storage::sync_directory(&output_parent).map_err(io)?;
+        rtdb_storage::sync_directory(&output_parent, apple_sync).map_err(io)?;
         self.check_restore_delivery(cut, cancellation)?;
         Ok(DetachedDefaultCheckpoint { path: ready, basis: cut.basis, checkpoint: cut.published(), source: cut.source, receipt })
     }

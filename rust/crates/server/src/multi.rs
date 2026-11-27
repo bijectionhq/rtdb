@@ -190,7 +190,7 @@ impl MultiRuntime {
                 }
             };
         let io = IoRegion::new();
-        let store = Arc::new(LocalStore::open_in(path.join("objects"), Arc::clone(&io))?);
+        let store = Arc::new(LocalStore::open_in(path.join("objects"), Arc::clone(&io))?.with_apple_sync(config.apple_sync));
         let path = path
             .join("catalog")
             .into_os_string()
@@ -1566,6 +1566,8 @@ struct ServingResources {
 
 #[async_trait::async_trait]
 impl ResourceFactory for ServingResources {
+    fn apple_sync(&self) -> rtdb_storage::AppleSync { self.native.apple_sync() }
+
     async fn provision_managed_database(&self, name: &str, expected: Option<Uuid>) -> Result<(DatabaseConfig, Uuid)> {
         self.runtime.provision(name, expected).await
     }

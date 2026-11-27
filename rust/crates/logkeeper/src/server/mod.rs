@@ -26,6 +26,8 @@ pub struct ServerOptions {
     pub data_dir: PathBuf,
     /// Syncs every round before acknowledging it; only tests turn this off.
     pub fsync: bool,
+    /// How durable syncs flush to storage on Apple platforms when `fsync` is enabled.
+    pub apple_sync: rtdb_storage::AppleSync,
     /// The most bytes of recently written or read payloads the server keeps in memory, across every stream; the rest are read from the segments.
     pub cache_bytes: usize,
     pub connections: ConnectionLimits,
@@ -35,7 +37,12 @@ impl ServerOptions {
     pub const DEFAULT_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
     pub fn new(data_dir: PathBuf, fsync: bool, cache_bytes: usize) -> Self {
-        Self { data_dir, fsync, cache_bytes, connections: ConnectionLimits::default() }
+        Self { data_dir, fsync, apple_sync: rtdb_storage::AppleSync::Full, cache_bytes, connections: ConnectionLimits::default() }
+    }
+
+    pub fn with_apple_sync(mut self, apple_sync: rtdb_storage::AppleSync) -> Self {
+        self.apple_sync = apple_sync;
+        self
     }
 }
 
@@ -118,10 +125,10 @@ impl PreparedJournal {
         options: ServerOptions,
         member: Option<MemberIdentity>,
     ) -> Result<Self> {
-        let ServerOptions { data_dir, fsync, cache_bytes, connections } = options;
+        let ServerOptions { data_dir, fsync, apple_sync, cache_bytes, connections } = options;
         connections.validate()?;
         let (journal, recovered, identity) = tokio::task::spawn_blocking(move || {
-            Journal::open(&data_dir, fsync, cache_bytes, member)
+            Journal::open_with_sync(&data_dir, fsync, apple_sync, cache_bytes, member)
         }).await.map_err(|error| Anomaly::fault("rtdb.logkeeper/recovery", error.to_string()))??;
         Ok(Self { journal, recovered, identity: identity.into(), connections })
     }

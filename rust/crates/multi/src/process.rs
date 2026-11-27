@@ -3,7 +3,10 @@
 mod owned_worlds;
 pub(crate) mod standalone;
 
-pub use standalone::{STANDALONE_PROTOCOL, StandaloneSettings, initialize_standalone, serve_standalone};
+pub use standalone::{
+    STANDALONE_PROTOCOL, StandaloneSettings, initialize_standalone, initialize_standalone_with_sync,
+    serve_standalone, serve_standalone_with_sync,
+};
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -113,7 +116,9 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
         (Some(_), _) => return Err(Anomaly::incorrect("rtdb.multi/scoped-storage", "A scoped S3 write role requires S3 cell storage")),
         (None, _) => None,
     };
-    let bucket = Box::pin(settings.agent.storage.bucket(rtdb_storage::IoRegion::new())).await?;
+    let apple_sync = settings.configuration.apple_sync;
+    settings.agent.apple_sync = apple_sync;
+    let bucket = Box::pin(settings.agent.storage.bucket_with_sync(rtdb_storage::IoRegion::new(), apple_sync)).await?;
     let storage_namespaces = if scoped_writes.is_some() {
         let objects = crate::deployment::existing_storage_namespace(bucket.as_ref()).await?
             .ok_or_else(|| Anomaly::incorrect("rtdb.multi/storage-namespace-missing", "Initialize the cell object namespace before starting a scoped writer"))?;
@@ -176,6 +181,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
         storage_regions: storage_regions.clone(),
         local_witnesses,
         replay_broker: settings.agent.replay_broker.clone(),
+        apple_sync,
     });
     let receiver_clock = crate::receiver_clock::ReceiverClock::new(Arc::clone(&directory), storage_namespaces.objects);
     let decision_clock: Arc<dyn rtdb_node::DecisionClock> = receiver_clock.clone();
@@ -193,7 +199,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
             (crate::journal::hosted::STORE_TYPE.into(), Arc::new(crate::journal::hosted::StoreFactory {
                 routes: Arc::clone(&ordered), storage: settings.agent.storage.clone(),
                 keys: Arc::clone(&settings.keys), scoped_writes: scoped_writes.clone(),
-                releases: storage_regions.clone(),
+                releases: storage_regions.clone(), apple_sync,
             })),
         ],
         claim_wait: settings.claim_wait,
@@ -397,6 +403,14 @@ pub struct RunningLogkeeper {
 }
 
 pub async fn start_logkeeper(directory: Arc<dyn Directory>, settings: LogkeeperSettings) -> Result<RunningLogkeeper> {
+    start_logkeeper_with_sync(directory, settings, rtdb_storage::AppleSync::Full).await
+}
+
+pub async fn start_logkeeper_with_sync(
+    directory: Arc<dyn Directory>,
+    settings: LogkeeperSettings,
+    apple_sync: rtdb_storage::AppleSync,
+) -> Result<RunningLogkeeper> {
     let listener = TcpListener::bind(settings.listen).await.map_err(io)?;
     let address = listener.local_addr().map_err(io)?;
     let endpoint = advertised(address, settings.advertise_host.as_deref())?;
@@ -407,9 +421,10 @@ pub async fn start_logkeeper(directory: Arc<dyn Directory>, settings: LogkeeperS
         let socket = TcpListener::bind(listen).await.map_err(io)?;
         Some(rtdb_logkeeper::AuthorityListener { socket, source: profile.source(), connections: profile.permits() })
     } else { None };
-    let (journal, identity) = rtdb_logkeeper::PreparedJournal::open_for_member(rtdb_logkeeper::ServerOptions::new(
-        settings.data_dir, settings.fsync, settings.cache_bytes,
-    )).await?;
+    let (journal, identity) = rtdb_logkeeper::PreparedJournal::open_for_member(
+        rtdb_logkeeper::ServerOptions::new(settings.data_dir, settings.fsync, settings.cache_bytes)
+            .with_apple_sync(apple_sync),
+    ).await?;
     if !uuid::Uuid::parse_str(&identity).is_ok_and(|id| !id.is_nil() && id.to_string() == identity) {
         return Err(Anomaly::incorrect("rtdb.multi/logkeeper-identity", "The retained journal member ID is invalid"));
     }

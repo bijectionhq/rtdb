@@ -14,9 +14,12 @@ use crate::config::{NodeConfiguration, RemoteConfig};
 ///   Close the resource factory after its consumers and drivers join, including failed startup.
 /// - Errors: credential resolution and local disk-cache initialization can fail with a provider or configuration anomaly.
 pub fn open_backend_resources(config: &NodeConfiguration, memory: &Arc<MemoryBudget>, metrics: &Arc<Registry>) -> Result<(NativeResources, ExternalSources, Vec<rtdb_metrics::MetricRegistration>)> {
-    let mut resources = NativeResources::default().with_local_log_clock(Arc::new(rtdb_node::SystemClock), config.local_log_uses_clock);
+    let mut resources = NativeResources::default()
+        .with_apple_sync(config.apple_sync)
+        .with_local_log_clock(Arc::new(rtdb_node::SystemClock), config.local_log_uses_clock);
     let classic_vault = config.key_vaults.classic.as_deref()
-        .map(rtdb_storage::sealing::ClassicKeyVault::open).transpose()?;
+        .map(|path| rtdb_storage::sealing::ClassicKeyVault::open(path).map(|vault| vault.with_apple_sync(config.apple_sync)))
+        .transpose()?;
     if let Some(vault) = &classic_vault {
         resources = resources.with_classic_key_vault(vault.clone());
     }

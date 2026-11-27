@@ -1073,7 +1073,16 @@ impl Placement {
         storage: &crate::deployment::CellStorage,
         keys: &Arc<dyn KeyService>,
     ) -> Result<Vec<(u64, prefix_retirement::Outcome)>> {
-        prefix_retirement::retire(self, storage, keys).await
+        self.retire_serving_prefixes_with_sync(storage, keys, rtdb_storage::AppleSync::Full).await
+    }
+
+    pub(crate) async fn retire_serving_prefixes_with_sync(
+        &self,
+        storage: &crate::deployment::CellStorage,
+        keys: &Arc<dyn KeyService>,
+        apple_sync: rtdb_storage::AppleSync,
+    ) -> Result<Vec<(u64, prefix_retirement::Outcome)>> {
+        prefix_retirement::retire_with_sync(self, storage, keys, apple_sync).await
     }
 
     async fn pin_root(&self, source: Hold, tasks: &TaskTracker) -> Result<Arc<Held>> {
@@ -1105,7 +1114,16 @@ impl Placement {
         io: Arc<IoRegion>,
         keys: Arc<dyn KeyService>,
     ) -> Result<CheckpointCustody> {
-        let bucket = self.archive.bucket(Arc::clone(&io)).await?;
+        self.checkpoint_custody_with_sync(io, keys, rtdb_storage::AppleSync::Full).await
+    }
+
+    pub(crate) async fn checkpoint_custody_with_sync(
+        &self,
+        io: Arc<IoRegion>,
+        keys: Arc<dyn KeyService>,
+        apple_sync: rtdb_storage::AppleSync,
+    ) -> Result<CheckpointCustody> {
+        let bucket = self.archive.bucket_with_sync(Arc::clone(&io), apple_sync).await?;
         let owner = archive_owner(&self.archive, bucket.as_ref(), &self.archive_prefix).await?;
         let custody = CheckpointCustody::new(
             bucket,

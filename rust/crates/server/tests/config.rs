@@ -547,11 +547,25 @@ fn backend_resources_open_the_configured_classic_key_vault() {
 }
 
 #[test]
-fn apple_sync_is_validated_and_installed_from_the_startup_environment() {
+fn apple_sync_is_validated_from_the_startup_environment_and_threaded_per_node() {
+    use rtdb_node::ResourceFactory;
+
     let typo = |name: &str| (name == rtdb_server::config::APPLE_SYNC_SETTING).then(|| "fsnyc".to_owned());
-    assert_eq!(rtdb_server::config::install_apple_sync(&typo).unwrap_err().code, "rtdb.storage/apple-sync");
-    assert_eq!(rtdb_server::config::install_apple_sync(&|_| None).unwrap(), rtdb_storage::AppleSync::Full);
-    assert_eq!(rtdb_storage::AppleSync::installed(), rtdb_storage::AppleSync::Full);
+    assert_eq!(rtdb_server::config::apple_sync(&typo).unwrap_err().code, "rtdb.storage/apple-sync");
+    assert_eq!(NodeConfiguration::from_yaml_with_environment("{}", &typo, false).unwrap_err().code, "rtdb.storage/apple-sync");
+    assert_eq!(rtdb_server::config::apple_sync(&|_| None).unwrap(), rtdb_storage::AppleSync::Full);
     let weaker = |name: &str| (name == rtdb_server::config::APPLE_SYNC_SETTING).then(|| "fsync".to_owned());
-    assert!(rtdb_server::config::install_apple_sync(&weaker).is_err());
+    assert_eq!(rtdb_server::config::apple_sync(&weaker).unwrap(), rtdb_storage::AppleSync::Fsync);
+
+    let full_config = NodeConfiguration::from_yaml_with_environment("server: null\nflightSql: null", &|_| None, false).unwrap();
+    let fsync_config = NodeConfiguration::from_yaml_with_environment("server: null\nflightSql: null", &weaker, false).unwrap();
+    assert_eq!(full_config.apple_sync, rtdb_storage::AppleSync::Full);
+    assert_eq!(fsync_config.apple_sync, rtdb_storage::AppleSync::Fsync);
+
+    let memory = rtdb_columnar::MemoryBudget::new(64 << 20);
+    let metrics = rtdb_metrics::Registry::new("fixture", std::sync::Arc::clone(&memory)).unwrap();
+    let (full_resources, _, _) = rtdb_server::open_backend_resources(&full_config, &memory, &metrics).unwrap();
+    let (fsync_resources, _, _) = rtdb_server::open_backend_resources(&fsync_config, &memory, &metrics).unwrap();
+    assert_eq!(full_resources.apple_sync(), rtdb_storage::AppleSync::Full);
+    assert_eq!(fsync_resources.apple_sync(), rtdb_storage::AppleSync::Fsync);
 }

@@ -246,6 +246,7 @@ pub(crate) struct Journal {
     pub(super) signer: rtdb_storage::attestation::SigningKey,
     segments: PathBuf,
     fsync: bool,
+    apple_sync: rtdb_storage::AppleSync,
     _lock: File,
     current: Mutex<Current>,
     /// Bytes in the segments from the last base on.
@@ -309,9 +310,9 @@ fn read_exact_at(file: &File, mut bytes: &mut [u8], mut offset: u64) -> std::io:
 
 fn segment_path(segments: &Path, sequence: u64) -> PathBuf { segments.join(format!("{sequence:020}.seg")) }
 
-fn sync_directory(directory: &Path, fsync: bool) -> Result<()> {
+fn sync_directory(directory: &Path, fsync: bool, apple_sync: rtdb_storage::AppleSync) -> Result<()> {
     if !fsync { return Ok(()); }
-    rtdb_storage::sync_directory(directory).map_err(|error| io_error(directory, error))
+    rtdb_storage::sync_directory(directory, apple_sync).map_err(|error| io_error(directory, error))
 }
 
 fn list_segments(segments: &Path, remove_temporary: bool) -> Result<BTreeMap<u64, PathBuf>> {
@@ -375,7 +376,7 @@ fn read_identity(path: &Path, length: usize) -> Result<Option<String>> {
     Ok(Some(identity))
 }
 
-fn write_identity(data_dir: &Path, path: &Path, contents: &[u8], fsync: bool) -> Result<()> {
+fn write_identity(data_dir: &Path, path: &Path, contents: &[u8], fsync: bool, apple_sync: rtdb_storage::AppleSync) -> Result<()> {
     let temporary = path.with_extension("tmp");
     let mut options = OpenOptions::new();
     options.create(true).truncate(true).write(true);
@@ -386,9 +387,9 @@ fn write_identity(data_dir: &Path, path: &Path, contents: &[u8], fsync: bool) ->
     }
     let mut file = options.open(&temporary).map_err(|error| io_error(&temporary, error))?;
     file.write_all(contents).map_err(|error| io_error(&temporary, error))?;
-    if fsync { rtdb_storage::sync_file(&file).map_err(|error| io_error(&temporary, error))?; }
+    if fsync { rtdb_storage::sync_file(&file, apple_sync).map_err(|error| io_error(&temporary, error))?; }
     fs::rename(&temporary, path).map_err(|error| io_error(path, error))?;
-    sync_directory(data_dir, fsync)
+    sync_directory(data_dir, fsync, apple_sync)
 }
 
 pub(super) enum MemberIdentity {
@@ -398,9 +399,20 @@ pub(super) enum MemberIdentity {
 
 impl Journal {
     /// Replays the segments from the last base on, deleting any earlier ones a crash left behind, and opens the last for appending.
+    #[cfg(test)]
     pub fn open(
         data_dir: &Path,
         fsync: bool,
+        cache_bytes: usize,
+        member: Option<MemberIdentity>,
+    ) -> Result<(Self, Vec<Recovered>, String)> {
+        Self::open_with_sync(data_dir, fsync, rtdb_storage::AppleSync::Full, cache_bytes, member)
+    }
+
+    pub fn open_with_sync(
+        data_dir: &Path,
+        fsync: bool,
+        apple_sync: rtdb_storage::AppleSync,
         cache_bytes: usize,
         member: Option<MemberIdentity>,
     ) -> Result<(Self, Vec<Recovered>, String)> {
@@ -440,7 +452,7 @@ impl Journal {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && identity.is_none() => {
                 let key = rtdb_storage::attestation::SigningKey::generate()
                     .map_err(|error| io_error(&private_key, error))?;
-                write_identity(data_dir, &private_key, &key, fsync)?;
+                write_identity(data_dir, &private_key, &key, fsync, apple_sync)?;
                 key
             }
             Err(error) => return Err(io_error(&private_key, error)),
@@ -471,7 +483,7 @@ impl Journal {
         chain.reverse();
         if let Some((first, _)) = chain.first() {
             remove_before(&segments, *first)?;
-            sync_directory(&segments, fsync)?;
+            sync_directory(&segments, fsync, apple_sync)?;
         }
         let mut replay = Replay::default();
         let mut total = 0u64;
@@ -482,7 +494,7 @@ impl Journal {
             if end < length {
                 if Some(index) != last_index { return Err(corrupt(path, format!("a damaged record at {end} before the last segment"))); }
                 let file = OpenOptions::new().write(true).open(path).map_err(|error| io_error(path, error))?;
-                file.set_len(end).and_then(|_| rtdb_storage::sync_file(&file)).map_err(|error| io_error(path, error))?;
+                file.set_len(end).and_then(|_| rtdb_storage::sync_file(&file, apple_sync)).map_err(|error| io_error(path, error))?;
             }
             if Some(index) != last_index { files.insert(*sequence, Arc::new(File::open(path).map_err(|error| io_error(path, error))?)); }
             total += end;
@@ -490,7 +502,7 @@ impl Journal {
         let (sequence, path) = chain.last().map_or_else(|| (0, segment_path(&segments, 0)), |(sequence, path)| (*sequence, path.clone()));
         let file = open_segment(&path)?;
         files.insert(sequence, Arc::clone(&file));
-        if chain.is_empty() { sync_directory(&segments, fsync)?; }
+        if chain.is_empty() { sync_directory(&segments, fsync, apple_sync)?; }
         let bytes = file.metadata().map_err(|error| io_error(&path, error))?.len();
         let declared = replay.names.keys().copied().collect();
         let next_id = replay.names.keys().max().map_or(0, |id| id + 1);
@@ -498,15 +510,16 @@ impl Journal {
         let identity = if let Some(identity) = identity {
             identity
         } else {
-            if fsync { rtdb_storage::sync_file(&file).map_err(|error| io_error(&path, error))?; }
-            sync_directory(&segments, fsync)?;
-            write_identity(data_dir, identity_path, candidate.as_bytes(), fsync)?;
+            if fsync { rtdb_storage::sync_file(&file, apple_sync).map_err(|error| io_error(&path, error))?; }
+            sync_directory(&segments, fsync, apple_sync)?;
+            write_identity(data_dir, identity_path, candidate.as_bytes(), fsync, apple_sync)?;
             candidate
         };
         let journal = Self {
             signer,
             segments,
             fsync,
+            apple_sync,
             _lock: lock,
             current: Mutex::new(Current { file, path, sequence, bytes, declared }),
             bytes: AtomicU64::new(total),
@@ -639,7 +652,7 @@ impl Journal {
             let sequence = current.sequence + 1;
             let path = segment_path(&self.segments, sequence);
             let file = open_segment(&path)?;
-            sync_directory(&self.segments, self.fsync)?;
+            sync_directory(&self.segments, self.fsync, self.apple_sync)?;
             self.files.lock().insert(sequence, Arc::clone(&file));
             *current = Current { file, path, sequence, bytes: 0, declared: std::mem::take(&mut current.declared) };
         }
@@ -695,7 +708,7 @@ impl Journal {
         self.sync(&file, &temporary)?;
         drop(file);
         fs::rename(&temporary, &path).map_err(|error| io_error(&path, error))?;
-        sync_directory(&self.segments, self.fsync)?;
+        sync_directory(&self.segments, self.fsync, self.apple_sync)?;
         let file = open_segment(&path)?;
         self.files.lock().insert(sequence, Arc::clone(&file));
         *current = Current { file, path, sequence, bytes: written, declared: captured.iter().map(|stream| stream.slot.id).collect() };
@@ -703,7 +716,7 @@ impl Journal {
         for (stream, locations) in captured.iter().zip(copies) { self.moved(stream, &locations); }
         remove_before(&self.segments, sequence)?;
         self.files.lock().retain(|segment, _| *segment >= sequence);
-        sync_directory(&self.segments, self.fsync)?;
+        sync_directory(&self.segments, self.fsync, self.apple_sync)?;
         *self.compacted.lock() = captured.iter().filter(|stream| stream.state.dropped)
             .map(|stream| (stream.slot.id, stream.state.promised)).collect();
         Ok(())
@@ -790,7 +803,7 @@ impl Journal {
     pub fn cache_bytes(&self) -> usize { self.cache.lock().bytes() }
 
     fn sync(&self, file: &File, path: &Path) -> Result<()> {
-        if self.fsync { rtdb_storage::sync_file(file).map_err(|error| io_error(path, error))?; }
+        if self.fsync { rtdb_storage::sync_file(file, self.apple_sync).map_err(|error| io_error(path, error))?; }
         Ok(())
     }
 }
@@ -1358,5 +1371,19 @@ mod tests {
         assert_eq!((recovered.len(), recovered[0].name.as_str(), recovered[0].state.promised, recovered[0].state.last()), (1, "a/b", 4, -1));
         assert_eq!(fs::metadata(&path).unwrap().len(), good as u64);
         assert_eq!(journal.allocate_id(), 8);
+    }
+
+    #[test]
+    fn journals_carry_independent_apple_sync_policies() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let (full, _, _) = Journal::open_with_sync(first.path(), true, rtdb_storage::AppleSync::Full, 0, None).unwrap();
+        let (fsync, _, _) = Journal::open_with_sync(second.path(), true, rtdb_storage::AppleSync::Fsync, 0, None).unwrap();
+        assert_eq!(full.apple_sync, rtdb_storage::AppleSync::Full);
+        assert_eq!(fsync.apple_sync, rtdb_storage::AppleSync::Fsync);
+        let first_slot = slot(&full, "db/a");
+        let second_slot = slot(&fsync, "db/b");
+        synced(&full, &first_slot, 1);
+        synced(&fsync, &second_slot, 1);
     }
 }

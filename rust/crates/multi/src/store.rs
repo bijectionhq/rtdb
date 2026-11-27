@@ -106,6 +106,7 @@ pub struct CellStoreFactory {
     pub(crate) scoped_writes: Option<Arc<ScopedCellWrites>>,
     pub(crate) local_witnesses: Option<Arc<LocalWitnessPool>>,
     pub(crate) replay_broker: Option<crate::replay_broker::Client>,
+    pub(crate) apple_sync: rtdb_storage::AppleSync,
 }
 
 enum LocalWitnessSlot {
@@ -260,7 +261,7 @@ impl RemoteStorageFactory for CellStoreFactory {
             if record.storage_namespaces.is_some() {
                 crate::deployment::require_storage_namespaces(&record, self.storage_namespaces)?;
             }
-            let bucket = config.storage.open_bucket(Arc::clone(&region), audience_writer).await?;
+            let bucket = config.storage.open_bucket_with_sync(Arc::clone(&region), audience_writer, self.apple_sync).await?;
             let store = format!("{}/{}", config.prefix, storage_root.as_str());
             if let Some(journal) = region.publication_journal_owner() {
                 publications = publications.with_attempts(journal, store.clone());
@@ -1328,6 +1329,7 @@ impl FencedStore {
 #[async_trait]
 impl ObjectStore for FencedStore {
     fn permits_shared_read_cache(&self) -> bool { self.inner.permits_shared_read_cache() }
+    fn apple_sync(&self) -> rtdb_storage::AppleSync { self.inner.apple_sync() }
     fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { self.inner.supports_scan_ranges(key) }
     fn supports_observed_scan_ranges(&self, key: &ObjectKey) -> bool { self.inner.supports_observed_scan_ranges(key) }
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head(key).await }
@@ -1572,6 +1574,7 @@ fn permits_release(record: &DeploymentRecord, store: &str, release: &GarbageReco
 #[async_trait]
 impl ObjectStore for GarbageStore {
     fn permits_shared_read_cache(&self) -> bool { self.inner.permits_shared_read_cache() }
+    fn apple_sync(&self) -> rtdb_storage::AppleSync { self.inner.apple_sync() }
     fn supports_directory_page_release(&self) -> bool {
         self.catalog_readers.is_none() || self.requires_search_publication
     }
@@ -2866,6 +2869,7 @@ mod tests {
         let factory = CellStoreFactory {
             directory: directory.clone(), keys, storage_namespaces, storage_regions: TaskTracker::new(),
             scoped_writes: None, hosted_task: None, local_witnesses: None, replay_broker: None, audience_source: None,
+            apple_sync: rtdb_storage::AppleSync::Full,
         };
         for (writer_epoch, compactor) in [(Some(0), false), (None, true)] {
             let configuration = CellStoreConfig {
@@ -2891,7 +2895,7 @@ mod tests {
         deleting.lifecycle = Lifecycle::Deleting;
         let deleting = directory.create_deployment(deleting).await.unwrap();
         let config = CellStoreConfig { storage, prefix: deleting.storage_prefix(), deployment: deleting.id, writer_epoch: None, compactor: false, snapshot_block: None };
-        let factory = CellStoreFactory { directory, keys, storage_namespaces, storage_regions: TaskTracker::new(), scoped_writes: None, hosted_task: None, local_witnesses: None, replay_broker: None, audience_source: None };
+        let factory = CellStoreFactory { directory, keys, storage_namespaces, storage_regions: TaskTracker::new(), scoped_writes: None, hosted_task: None, local_witnesses: None, replay_broker: None, audience_source: None, apple_sync: rtdb_storage::AppleSync::Full };
         let config = Any { type_url: CELL_STORAGE_TYPE.into(), value: serde_json::to_vec(&config).unwrap() };
         let result = factory.open(&config, &key("v06"), IoRegion::new()).await;
         assert!(matches!(result, Err(error) if error.code == rtdb_node::NOT_HELD));
@@ -2909,6 +2913,7 @@ mod tests {
         let factory = CellStoreFactory {
             directory: directory.clone(), keys: keys.clone(), storage_namespaces,
             storage_regions: TaskTracker::new(), scoped_writes: None, hosted_task: None, local_witnesses: None, replay_broker: None, audience_source: None,
+            apple_sync: rtdb_storage::AppleSync::Full,
         };
         let mut record = DeploymentRecord::new("shop", "acme", Vec::new(), 0);
         record.epoch = 2;
@@ -2955,6 +2960,7 @@ mod tests {
             directory, keys: keys.clone(), storage_namespaces, storage_regions: TaskTracker::new(),
             scoped_writes: None, hosted_task: None, local_witnesses: None, replay_broker: None,
             audience_source: Some(Uuid::parse_str(&record.id).unwrap()),
+            apple_sync: rtdb_storage::AppleSync::Full,
         };
         let storage: CellStorage = serde_json::from_value(serde_json::json!({
             "kind": "s3",
@@ -3296,6 +3302,7 @@ mod tests {
             storage_namespaces,
             scoped_writes: None,
             hosted_task: None,
+            apple_sync: rtdb_storage::AppleSync::Full,
         };
         let config = CellStoreConfig {
             storage: storage.clone(),
@@ -3683,6 +3690,7 @@ mod tests {
         let storage_factory = CellStoreFactory {
             directory: directory.clone(), keys, storage_namespaces, hosted_task: None,
             storage_regions: tasks.clone(), scoped_writes: None, local_witnesses: None, replay_broker: None, audience_source: None,
+            apple_sync: rtdb_storage::AppleSync::Full,
         };
         let configuration = |snapshot_block| Any { type_url: String::new(), value: serde_json::to_vec(&CellStoreConfig {
             storage: storage.clone(), prefix: record.storage_prefix(), deployment: record.id.clone(),

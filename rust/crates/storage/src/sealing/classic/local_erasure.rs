@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::io;
-use crate::{Error, Result, sync_directory, sync_file};
+use crate::{AppleSync, Error, Result, sync_directory, sync_file};
 
 pub(super) const LINEAGE_VERSION: u8 = 1;
 pub(super) const KAFKA_LINEAGE_VERSION: u8 = 2;
@@ -70,7 +70,7 @@ impl LocalErasureResidence {
         if self.journal.is_some() { LINEAGE_VERSION } else { KAFKA_LINEAGE_VERSION }
     }
 
-    pub(super) fn enroll_if_pristine(&self, scope: &Path) -> Result<bool> {
+    pub(super) fn enroll_if_pristine(&self, scope: &Path, apple_sync: AppleSync) -> Result<bool> {
         let Some(parent) = self.payload.path.parent() else { return Err(invalid()); };
         let payload_name = self.payload.path.file_name().ok_or_else(invalid)?;
         let boot_name = std::ffi::OsStr::new(".rtdb-local-residence");
@@ -81,15 +81,15 @@ impl LocalErasureResidence {
         if !empty(&self.payload.path)? || self.journal.as_ref().map(|journal| empty(&journal.path)).transpose()? == Some(false) {
             return Ok(false);
         }
-        persist(scope, "local-erasure-residence", &serde_json::to_vec(self).map_err(|_| invalid())?)?;
+        persist(scope, "local-erasure-residence", &serde_json::to_vec(self).map_err(|_| invalid())?, apple_sync)?;
         Ok(true)
     }
 
-    pub(super) fn reopen(self, scope: PathBuf, owner: Uuid) -> Result<LocalErasureCustody> {
+    pub(super) fn reopen(self, scope: PathBuf, owner: Uuid, apple_sync: AppleSync) -> Result<LocalErasureCustody> {
         let expected = read(&scope.join("local-erasure-residence"), 16 << 10)?.ok_or_else(invalid)?;
         let enrolled: Self = serde_json::from_slice(&expected).map_err(|_| invalid())?;
         if enrolled != self { return Err(invalid()); }
-        Ok(LocalErasureCustody { scope, journal: self.journal.map(|journal| journal.path), owner })
+        Ok(LocalErasureCustody { scope, journal: self.journal.map(|journal| journal.path), owner, apple_sync })
     }
 }
 
@@ -101,12 +101,12 @@ fn empty(path: &Path) -> Result<bool> {
 }
 
 /// Keeps a sealed Local residence from being enrolled while another attachment owns it.
-pub fn open_local_residence(parent: &Path, exclusive: bool) -> Result<File> {
+pub fn open_local_residence(parent: &Path, exclusive: bool, apple_sync: AppleSync) -> Result<File> {
     let path = parent.join(".rtdb-local-residence");
     let file = lock_file(&path)?;
     let lock = if exclusive { FileExt::try_lock_exclusive(&file) } else { FileExt::try_lock_shared(&file) };
     lock.map_err(io(&path))?;
-    sync_directory(parent).map_err(io(parent))?;
+    sync_directory(parent, apple_sync).map_err(io(parent))?;
     Ok(file)
 }
 
@@ -115,6 +115,7 @@ pub struct LocalErasureCustody {
     scope: PathBuf,
     journal: Option<PathBuf>,
     owner: Uuid,
+    apple_sync: AppleSync,
 }
 
 impl LocalErasureCustody {
@@ -149,8 +150,8 @@ impl LocalErasureCustody {
         }
         identities.extend_from_slice(source.as_bytes());
         identities.extend_from_slice(replica.as_bytes());
-        persist(&self.scope, "local-erasure-journals", &identities)?;
-        persist(&self.scope, "local-erasure-database", database.as_bytes())
+        persist(&self.scope, "local-erasure-journals", &identities, self.apple_sync)?;
+        persist(&self.scope, "local-erasure-database", database.as_bytes(), self.apple_sync)
     }
 
     pub fn admit(&self, database: Uuid, generation: u64) -> Result<File> {
@@ -169,14 +170,14 @@ impl LocalErasureCustody {
     pub fn seal_admission(&self, database: Uuid, generation: u64) -> Result<()> {
         let _gate = self.gate()?;
         self.require_database(database, generation)?;
-        persist(&self.scope, &generation_name(generation, "admission"), &[])
+        persist(&self.scope, &generation_name(generation, "admission"), &[], self.apple_sync)
     }
 
     pub fn bind_cut(&self, database: Uuid, generation: u64, commitment: [u8; 32]) -> Result<()> {
         let _gate = self.gate()?;
         self.require_database(database, generation)?;
         if read(&self.scope.join(generation_name(generation, "admission")), 0)?.is_none() { return Err(invalid()); }
-        persist(&self.scope, &generation_name(generation, "closed"), &commitment)
+        persist(&self.scope, &generation_name(generation, "closed"), &commitment, self.apple_sync)
     }
 
     /// Records the drain while holding exclusive custody of the closed generation.
@@ -188,7 +189,7 @@ impl LocalErasureCustody {
         let file = lock_file(&path)?;
         match FileExt::try_lock_exclusive(&file) {
             Ok(()) => {
-                persist(&self.scope, &generation_name(generation, "drained"), &commitment)?;
+                persist(&self.scope, &generation_name(generation, "drained"), &commitment, self.apple_sync)?;
                 Ok(true)
             }
             Err(error) if error.kind() == fs2::lock_contended_error().kind() => Ok(false),
@@ -237,17 +238,17 @@ fn lock_file(path: &Path) -> Result<File> {
     OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path).map_err(io(path))
 }
 
-fn persist(scope: &Path, name: &str, expected: &[u8]) -> Result<()> {
+fn persist(scope: &Path, name: &str, expected: &[u8], apple_sync: AppleSync) -> Result<()> {
     let path = scope.join(name);
     if let Some(existing) = read(&path, expected.len())? {
         if existing.as_slice() != expected { return Err(invalid()); }
-        return sync_directory(scope).map_err(io(scope));
+        return sync_directory(scope, apple_sync).map_err(io(scope));
     }
     let mut file = tempfile::NamedTempFile::new_in(scope).map_err(io(scope))?;
     file.write_all(expected).map_err(io(&path))?;
-    sync_file(file.as_file()).map_err(io(&path))?;
+    sync_file(file.as_file(), apple_sync).map_err(io(&path))?;
     file.persist_noclobber(&path).map_err(|error| io(&path)(error.error))?;
-    sync_directory(scope).map_err(io(scope))
+    sync_directory(scope, apple_sync).map_err(io(scope))
 }
 
 fn read(path: &Path, limit: usize) -> Result<Option<Vec<u8>>> {
@@ -279,13 +280,13 @@ mod tests {
         fs::create_dir(&journal).unwrap();
         let residence = LocalErasureResidence::open(&payload, &journal, vault.path(), 0).unwrap();
         fs::write(journal.join("LOG"), b"prior plaintext").unwrap();
-        assert!(!residence.enroll_if_pristine(vault.path()).unwrap());
+        assert!(!residence.enroll_if_pristine(vault.path(), AppleSync::Full).unwrap());
         fs::remove_file(journal.join("LOG")).unwrap();
         fs::create_dir(object_root.join("v05")).unwrap();
-        assert!(!residence.enroll_if_pristine(vault.path()).unwrap());
+        assert!(!residence.enroll_if_pristine(vault.path(), AppleSync::Full).unwrap());
         fs::remove_dir(object_root.join("v05")).unwrap();
-        assert!(residence.enroll_if_pristine(vault.path()).unwrap());
-        assert!(residence.clone().reopen(vault.path().to_owned(), Uuid::new_v4()).is_ok());
+        assert!(residence.enroll_if_pristine(vault.path(), AppleSync::Full).unwrap());
+        assert!(residence.clone().reopen(vault.path().to_owned(), Uuid::new_v4(), AppleSync::Full).is_ok());
     }
 
     #[test]
@@ -298,7 +299,7 @@ mod tests {
             fs::create_dir(directory.path().join(id.simple().to_string())).unwrap();
             fs::write(directory.path().join(name).with_extension("key-lineage"), id.as_bytes()).unwrap();
         }
-        let owner = || LocalErasureCustody { scope: scope.clone(), journal: Some(directory.path().to_owned()), owner: Uuid::nil() };
+        let owner = || LocalErasureCustody { scope: scope.clone(), journal: Some(directory.path().to_owned()), owner: Uuid::nil(), apple_sync: AppleSync::Full };
         let database = Uuid::new_v4();
         let cut = [42; 32];
         owner().bind(database, Uuid::new_v4(), Uuid::new_v4()).unwrap();
@@ -326,8 +327,8 @@ mod tests {
         let scope = vault_dir.path().join(owner.simple().to_string());
         fs::create_dir(&scope).unwrap();
         let residence = LocalErasureResidence::open_kafka(&payload, checkpoint.path(), 0)?;
-        assert!(residence.enroll_if_pristine(&scope)?);
-        let custody = residence.clone().reopen(scope.clone(), owner)?;
+        assert!(residence.enroll_if_pristine(&scope, AppleSync::Full)?);
+        let custody = residence.clone().reopen(scope.clone(), owner, AppleSync::Full)?;
         let vault = super::super::ClassicKeyVault::open(vault_dir.path())?;
         let io = crate::IoRegion::new();
         let [source, replica, other] = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
@@ -340,7 +341,7 @@ mod tests {
         assert!(vault.kafka_erasure_keys(replica.into_bytes(), false, io.clone(), owner.into_bytes(), false).is_err());
         assert!(custody.bind(database, replica, source).is_err());
         custody.bind(database, source, replica)?;
-        let reopened = residence.reopen(scope, owner)?;
+        let reopened = residence.reopen(scope, owner, AppleSync::Full)?;
         assert_eq!(reopened.bound_kafka_topics()?, Some([source, replica]));
         let legacy = Uuid::new_v4().into_bytes();
         vault.kafka_log_keys(legacy, true, io.clone())?;

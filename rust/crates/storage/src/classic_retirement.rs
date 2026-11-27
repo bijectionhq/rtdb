@@ -171,9 +171,10 @@ impl ClassicLogDeletionGrant {
         let source_through = catalog.latest_source_position()
             .filter(|source| source.after_offset(anchor.boundary.epoch()) >= 0).ok_or_else(unavailable)?;
         let replica = replica.to_path_buf();
+        let apple_sync = store.apple_sync();
         store.io_region().run(move || {
-            let mut source_file = JournalFile::lock(&source, false)?;
-            let mut replica_file = JournalFile::lock(&replica, false)?;
+            let mut source_file = JournalFile::lock(&source, false, apple_sync)?;
+            let mut replica_file = JournalFile::lock(&replica, false, apple_sync)?;
             replica_file.cached_lineage(&replica)?;
             let source_end = prefix_end(&mut source_file, &source, maximum,
                 LogOffset(source_through.after_offset(anchor.boundary.epoch())), true)?;

@@ -1,4 +1,4 @@
-use crate::{Error, IoRegion, Result};
+use crate::{AppleSync, Error, IoRegion, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::RwLock;
@@ -173,6 +173,10 @@ pub trait ObjectStore: Send + Sync {
     }
     /// Whether returned bytes may be reused across reads without returning to this owner.
     fn permits_shared_read_cache(&self) -> bool { false }
+    /// The durability policy used for local filesystem syncs on Apple platforms.
+    fn apple_sync(&self) -> AppleSync {
+        self.local_maintenance_store().map_or(AppleSync::Full, LocalStore::apple_sync)
+    }
     fn local_maintenance_store(&self) -> Option<&LocalStore> { None }
     fn local_erasure_custody(&self) -> Option<&Arc<crate::sealing::LocalErasureCustody>> { None }
     fn local_classic_key_slots(&self) -> Option<&dyn crate::sealing::ObjectCipher> { None }
@@ -517,6 +521,7 @@ pub struct LocalStore {
     io: Arc<IoRegion>,
     catalog: Option<Arc<crate::local_catalog::LocalCatalogLedger>>,
     mapped: Arc<parking_lot::Mutex<MappedObjects>>,
+    apple_sync: AppleSync,
 }
 
 /// The mappings of every local store on one root, so that removing an object through any of them releases its mapping.
@@ -687,20 +692,31 @@ impl LocalStore {
         fs::create_dir_all(root).map_err(|err| Error::io(root, err))?;
         let root = fs::canonicalize(root).map_err(|err| Error::io(root, err))?;
         let mapped = root_mappings(&root);
-        Ok(Self { root: Arc::new(root), io, catalog: None, mapped })
+        Ok(Self { root: Arc::new(root), io, catalog: None, mapped, apple_sync: AppleSync::Full })
     }
+    /// Selects the Apple platform sync policy for this store's durable file and directory flushes.
+    pub fn with_apple_sync(mut self, apple_sync: AppleSync) -> Self {
+        self.apple_sync = apple_sync;
+        if let Some(catalog) = &self.catalog {
+            self.catalog = Some(Arc::new(catalog.with_apple_sync(apple_sync)));
+        }
+        self
+    }
+    /// The durability policy used for local filesystem syncs on Apple platforms.
+    pub fn apple_sync(&self) -> AppleSync { self.apple_sync }
     /// Joins the retirement and erasure ledger on a shared local filesystem.
     pub fn with_catalog_ledger(mut self, replica_epoch: rtdb_types::StorageEpoch) -> Self {
-        self.catalog = Some(Arc::new(crate::local_catalog::LocalCatalogLedger::new(self.root.clone(), replica_epoch)));
+        self.catalog = Some(Arc::new(crate::local_catalog::LocalCatalogLedger::new(self.root.clone(), replica_epoch, self.apple_sync)));
         self
     }
     /// Synchronizes an existing immutable object and its directory entries through the storage root.
     pub async fn sync_existing(&self, key: &ObjectKey) -> Result<()> {
-        self.io.read(self.root.clone(), key.clone(), |root, key| {
+        let apple_sync = self.apple_sync;
+        self.io.read(self.root.clone(), key.clone(), move |root, key| {
             let path = root.join(key.as_str());
             let file = open_object(&path, key)?;
-            crate::sync_file(&file).map_err(|error| Error::io(&path, error))?;
-            sync_parents(&path, root)
+            crate::sync_file(&file, apple_sync).map_err(|error| Error::io(&path, error))?;
+            sync_parents(&path, root, apple_sync)
         }).await
     }
 
@@ -741,14 +757,14 @@ impl LocalStore {
 
     /// Persists a verified repair anchor selected at the current checkpoint under exclusive maintenance.
     pub async fn install_repair_anchor(&self, anchor: crate::LocalRepairAnchor) -> rtdb_types::Result<()> {
-        let ledger = Arc::new(crate::local_catalog::LocalCatalogLedger::new(self.root.clone(), anchor.boundary.epoch()));
+        let ledger = Arc::new(crate::local_catalog::LocalCatalogLedger::new(self.root.clone(), anchor.boundary.epoch(), self.apple_sync));
         self.io.read(ledger, "repair-anchor", move |ledger, _| Ok(ledger.install_repair_anchor(anchor))).await?
     }
 
     /// Loads the durable repair anchor at this local storage root.
     pub async fn retained_repair_anchor(&self) -> rtdb_types::Result<Option<crate::LocalRepairAnchor>> {
         let ledger = self.catalog.clone().unwrap_or_else(|| {
-            Arc::new(crate::local_catalog::LocalCatalogLedger::new(self.root.clone(), rtdb_types::StorageEpoch(0)))
+            Arc::new(crate::local_catalog::LocalCatalogLedger::new(self.root.clone(), rtdb_types::StorageEpoch(0), self.apple_sync))
         });
         self.io.read(ledger, "repair-anchor", |ledger, _| Ok(ledger.retained_repair_anchor())).await?
     }
@@ -771,6 +787,7 @@ impl LocalStore {
     async fn publish_file(&self, key: &ObjectKey, input: AdmittedFile) -> Result<()> {
         let (root, path, key) = (Arc::clone(&self.root), self.path(key), key.clone());
         let catalog = self.catalog.clone();
+        let apple_sync = self.apple_sync;
         self.io.run(move || {
             let mut input = input;
             let parent = path.parent().ok_or_else(|| Error::InvalidKey(key.to_string()))?;
@@ -779,7 +796,7 @@ impl LocalStore {
             fs::create_dir_all(&temp_dir).map_err(|error| Error::io(&temp_dir, error))?;
             let mut upload = tempfile::NamedTempFile::new_in(&temp_dir).map_err(|error| Error::io(&temp_dir, error))?;
             std::io::copy(&mut input.file, &mut upload).map_err(|error| Error::io(upload.path(), error))?;
-            crate::sync_file(upload.as_file()).map_err(|error| Error::io(upload.path(), error))?;
+            crate::sync_file(upload.as_file(), apple_sync).map_err(|error| Error::io(upload.path(), error))?;
             let _gate = match catalog.as_ref() {
                 Some(catalog) => catalog.publication_gate(&key)?,
                 None => None,
@@ -791,7 +808,7 @@ impl LocalStore {
                 }
                 Err(error) => return Err(Error::io(&path, error.error)),
             }
-            sync_parents(&path, &root)
+            sync_parents(&path, &root, apple_sync)
         }).await
     }
 }
@@ -803,14 +820,14 @@ fn open_object(path: &Path, key: &ObjectKey) -> Result<File> {
     })
 }
 
-fn sync_directory(path: &Path) -> Result<()> {
-    crate::sync_directory(path).map_err(|error| Error::io(path, error))
+fn sync_directory(path: &Path, apple_sync: AppleSync) -> Result<()> {
+    crate::sync_directory(path, apple_sync).map_err(|error| Error::io(path, error))
 }
 
-fn sync_parents(path: &Path, root: &Path) -> Result<()> {
+fn sync_parents(path: &Path, root: &Path, apple_sync: AppleSync) -> Result<()> {
     let mut current = path.parent().ok_or_else(|| Error::InvalidKey(path.display().to_string()))?;
     loop {
-        sync_directory(current)?;
+        sync_directory(current, apple_sync)?;
         if current == root { return Ok(()); }
         current = current.parent().ok_or_else(|| Error::InvalidKey(path.display().to_string()))?;
     }
@@ -847,6 +864,7 @@ fn read_local_range(path: &Path, key: &ObjectKey, range: Range<u64>) -> Result<B
 #[async_trait]
 impl ObjectStore for LocalStore {
     fn permits_shared_read_cache(&self) -> bool { true }
+    fn apple_sync(&self) -> AppleSync { self.apple_sync }
     fn local_maintenance_store(&self) -> Option<&LocalStore> { Some(self) }
     fn syncs_checkpoints(&self) -> bool { true }
 
@@ -963,6 +981,7 @@ impl ObjectStore for LocalStore {
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()> {
         let (root, path, key) = (self.root.clone(), self.path(key), key.clone());
         let catalog = self.catalog.clone();
+        let apple_sync = self.apple_sync;
         self.io.run(move || {
             let parent = path.parent().ok_or_else(|| Error::InvalidKey(key.to_string()))?;
             fs::create_dir_all(parent).map_err(|error| Error::io(parent, error))?;
@@ -970,7 +989,7 @@ impl ObjectStore for LocalStore {
             fs::create_dir_all(&temp_dir).map_err(|error| Error::io(&temp_dir, error))?;
             let mut upload = tempfile::NamedTempFile::new_in(&temp_dir).map_err(|error| Error::io(&temp_dir, error))?;
             upload.write_all(&bytes).map_err(|error| Error::io(upload.path(), error))?;
-            crate::sync_file(upload.as_file()).map_err(|error| Error::io(upload.path(), error))?;
+            crate::sync_file(upload.as_file(), apple_sync).map_err(|error| Error::io(upload.path(), error))?;
             let _gate = match catalog.as_ref() {
                 Some(catalog) => catalog.publication_gate(&key)?,
                 None => None,
@@ -985,7 +1004,7 @@ impl ObjectStore for LocalStore {
                 }
                 Err(error) => return Err(Error::io(&path, error.error)),
             }
-            sync_parents(&path, &root)
+            sync_parents(&path, &root, apple_sync)
         }).await
     }
 
@@ -1041,7 +1060,8 @@ impl ObjectStore for LocalStore {
         let path = self.path(key);
         let root = self.root.clone();
         let mapped = Arc::clone(&self.mapped);
-        self.io.run(move || remove_local_object(&root, &path, &mapped)).await
+        let apple_sync = self.apple_sync;
+        self.io.run(move || remove_local_object(&root, &path, &mapped, apple_sync)).await
     }
 
     async fn forget(&self, key: &ObjectKey) -> Result<()> {
@@ -1059,15 +1079,16 @@ impl ObjectStore for LocalStore {
         };
         let path = self.path(key);
         let root = self.root.clone();
-        let ledger = Arc::new(crate::local_catalog::LocalCatalogLedger::new(root.clone(), rtdb_types::StorageEpoch(0)));
+        let apple_sync = self.apple_sync;
+        let ledger = Arc::new(crate::local_catalog::LocalCatalogLedger::new(root.clone(), rtdb_types::StorageEpoch(0), apple_sync));
         let mapped = Arc::clone(&self.mapped);
         self.io.read(ledger, ("repair-anchor", key.clone(), block), move |ledger, (_, _, block)| {
-            Ok(ledger.collect_recovery_file(*block, || remove_local_object(&root, &path, &mapped)))
+            Ok(ledger.collect_recovery_file(*block, || remove_local_object(&root, &path, &mapped, apple_sync)))
         }).await?
     }
 }
 
-fn remove_local_object(root: &Path, path: &Path, mapped: &parking_lot::Mutex<MappedObjects>) -> Result<()> {
+fn remove_local_object(root: &Path, path: &Path, mapped: &parking_lot::Mutex<MappedObjects>, apple_sync: AppleSync) -> Result<()> {
     // A mapping keeps a removed file's space allocated, so it goes with the file;
     // the second eviction catches a read that mapped the file again before the unlink.
     let evicted = mapped.lock().evict(path);
@@ -1084,7 +1105,7 @@ fn remove_local_object(root: &Path, path: &Path, mapped: &parking_lot::Mutex<Map
     // If a containing directory is also absent, confirm its removal.
     let mut parent = path.parent().ok_or_else(|| Error::InvalidKey(path.display().to_string()))?;
     loop {
-        match crate::sync_directory(parent) {
+        match crate::sync_directory(parent, apple_sync) {
             Ok(()) => return Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && parent != root => {
                 parent = parent.parent().ok_or_else(|| Error::InvalidKey(path.display().to_string()))?;
@@ -1097,6 +1118,23 @@ fn remove_local_object(root: &Path, path: &Path, mapped: &parking_lot::Mutex<Map
 #[cfg(test)]
 mod mapping_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn local_stores_carry_independent_apple_sync_policies() {
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let full = LocalStore::open(first_dir.path()).unwrap();
+        let fsync = LocalStore::open(second_dir.path()).unwrap().with_apple_sync(AppleSync::Fsync);
+        assert_eq!(full.apple_sync(), AppleSync::Full);
+        assert_eq!(fsync.apple_sync(), AppleSync::Fsync);
+        let key = ObjectKey::new("tables/t/data/entry.arrow").unwrap();
+        full.put(&key, Bytes::from_static(b"full")).await.unwrap();
+        fsync.put(&key, Bytes::from_static(b"fsync")).await.unwrap();
+        assert_eq!(full.get(&key).await.unwrap().as_ref(), b"full");
+        assert_eq!(fsync.get(&key).await.unwrap().as_ref(), b"fsync");
+        full.close_and_wait().await;
+        fsync.close_and_wait().await;
+    }
 
     #[tokio::test]
     async fn removing_an_object_releases_its_mapping() {

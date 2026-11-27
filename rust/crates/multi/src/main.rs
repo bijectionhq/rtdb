@@ -346,7 +346,7 @@ fn watch_parent(arguments: &Arguments, cancellation: &CancellationToken) {
 }
 
 async fn run(arguments: Vec<String>) -> Result<()> {
-    rtdb_server::config::install_apple_sync(&|key| std::env::var(key).ok())?;
+    let apple_sync = rtdb_server::config::apple_sync(&|key| std::env::var(key).ok())?;
     rtdb_server::config::install_process_settings(&|key| std::env::var(key).ok())?;
     rtdb_server::logging::install(rtdb_server::logging::LogConfig::from_environment(rtdb_server::logging::process_environment())?, rtdb_server::logging::LogOutput::Stderr)?;
     let Some((command, rest)) = arguments.split_first() else { print!("{HELP}"); return Ok(()); };
@@ -399,11 +399,11 @@ async fn run(arguments: Vec<String>) -> Result<()> {
     match command.as_str() {
         "help" | "--help" | "-h" => { print!("{HELP}"); Ok(()) }
         "initialize-standalone" => {
-            process::initialize_standalone(std::path::Path::new(arguments.required("state")?), arguments.required("name")?, installation_id(&arguments)?).await
+            process::initialize_standalone_with_sync(std::path::Path::new(arguments.required("state")?), arguments.required("name")?, installation_id(&arguments)?, apple_sync).await
         }
         "standalone" => {
             watch_parent(&arguments, &cancellation);
-            process::serve_standalone(process::StandaloneSettings {
+            process::serve_standalone_with_sync(process::StandaloneSettings {
                 root: arguments.required("state")?.into(),
                 name: arguments.required("name")?.into(),
                 id: installation_id(&arguments)?,
@@ -418,7 +418,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                     .transpose()?,
                 custody_provider_config: arguments.present("custody-provider-config")
                     .then(|| arguments.required("custody-provider-config").map(PathBuf::from)).transpose()?,
-            }, cancellation).await
+            }, apple_sync, cancellation).await
         }
         "initialize-directory" => MemoryDirectory::initialize(std::path::Path::new(arguments.required("state")?)),
         "directory" => {
@@ -496,14 +496,14 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 Some(spec) => Some(custodian::Discovery::new(directory(spec).await?, &cell)?),
                 None => None,
             };
-            custodian::run(custodian::Settings {
+            custodian::run_with_sync(custodian::Settings {
                 placements, discovery,
                 serving: CellStorage::parse(arguments.required("storage-root")?)?,
                 archive: CellStorage::parse(arguments.optional("archive-root").unwrap_or(&cell.archive_root))?,
                 keys: key_service(arguments.optional("keys").unwrap_or(&cell.keys)).await?,
                 broker: replay_broker_client(&arguments, "")?,
                 memory: rtdb_columnar::MemoryBudget::new(arguments.number("memory-limit", 1usize << 30)?),
-            }, cancellation).await
+            }, apple_sync, cancellation).await
         }
         "ordered-journal" | "initialize-ordered-journal" => {
             let failure = |error: Box<dyn std::error::Error + Send + Sync>| {
@@ -557,13 +557,13 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         }
         "logkeeper" => {
             let directory = directory(arguments.required("directory")?).await?;
-            let logkeeper = process::start_logkeeper(directory, process::LogkeeperSettings {
+            let logkeeper = process::start_logkeeper_with_sync(directory, process::LogkeeperSettings {
                 authority: arguments.audience_listener("audience-authority", "audience-authority-listen")?,
                 advertise_host: arguments.optional("advertise-host").map(str::to_owned),
                 listen: arguments.address("listen", "127.0.0.1:0")?, data_dir: PathBuf::from(arguments.required("data")?), fsync: !arguments.present("no-fsync"),
                 cache_bytes: arguments.number("cache-bytes", rtdb_logkeeper::ServerOptions::DEFAULT_CACHE_BYTES)?,
                 availability_zone: arguments.optional("zone").unwrap_or("local").into(), lease: LeaseOptions::default(),
-            }).await?;
+            }, apple_sync).await?;
             tracing::info!("logkeeper {} listening on {}", logkeeper.lease.id(), logkeeper.address);
             logkeeper.run_until(cancellation).await
         }

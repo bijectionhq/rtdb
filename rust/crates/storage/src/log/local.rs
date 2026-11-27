@@ -1,6 +1,6 @@
 use super::{AppendReceipt, AppendTimestampSource, LOG_RECORD_OVERHEAD_BYTES, Log, LogMetadata, LogOffset, LogRecord, LogReplayTail, LogTail, Progress, ReplayHead, SuppliedTimestamp, await_tip};
 use super::journal_file::JournalFile;
-use crate::{Error, IoRegion, Result, object_store::ReadReservation, sealing::{ClassicKeyVault, ClassicObjectKeys, LOG_SEAL_OVERHEAD}};
+use crate::{AppleSync, Error, IoRegion, Result, object_store::ReadReservation, sealing::{ClassicKeyVault, ClassicObjectKeys, LOG_SEAL_OVERHEAD}};
 use async_trait::async_trait;
 use bytes::Bytes;
 use rtdb_types::Timestamp;
@@ -57,6 +57,7 @@ pub struct LocalLog {
     keys: Option<Arc<ClassicObjectKeys>>,
     reads: Arc<IoRegion>,
     recent: Arc<RecentFrames>,
+    apple_sync: AppleSync,
 }
 
 pub struct LocalLogDriver {
@@ -268,7 +269,12 @@ impl LocalLog {
     /// Opens the exact LOG/REPLICA_LOG file selected by the caller, coordinating its syncs with no other log.
     /// The database owner runs the returned driver, cancels and joins it, then calls `close_and_wait` before runtime shutdown.
     pub fn open(path: impl AsRef<Path>, options: LocalLogOptions) -> Result<(Arc<Self>, LocalLogDriver)> {
-        Self::open_with_timestamp_source(path, options, Arc::new(SuppliedTimestamp))
+        Self::open_with_sync(path, options, AppleSync::Full)
+    }
+
+    /// Opens the exact LOG/REPLICA_LOG file selected by the caller with an explicit Apple sync policy.
+    pub fn open_with_sync(path: impl AsRef<Path>, options: LocalLogOptions, apple_sync: AppleSync) -> Result<(Arc<Self>, LocalLogDriver)> {
+        Self::open_with_key_slots_and_sync(path, options, Arc::new(SuppliedTimestamp), IoRegion::new(), None, apple_sync)
     }
 
     /// Uses `timestamps` in the writer; enqueued timestamps remain available to that policy.
@@ -285,7 +291,13 @@ impl LocalLog {
     pub fn open_with_key_slots(path: impl AsRef<Path>, options: LocalLogOptions, timestamps: Arc<dyn AppendTimestampSource>,
         reads: Arc<IoRegion>, keys: Option<Arc<ClassicObjectKeys>>,
     ) -> Result<(Arc<Self>, LocalLogDriver)> {
-        Self::open_journal(path.as_ref(), options, timestamps, reads, keys, false)
+        Self::open_with_key_slots_and_sync(path, options, timestamps, reads, keys, AppleSync::Full)
+    }
+
+    pub fn open_with_key_slots_and_sync(path: impl AsRef<Path>, options: LocalLogOptions, timestamps: Arc<dyn AppendTimestampSource>,
+        reads: Arc<IoRegion>, keys: Option<Arc<ClassicObjectKeys>>, apple_sync: AppleSync,
+    ) -> Result<(Arc<Self>, LocalLogDriver)> {
+        Self::open_journal(path.as_ref(), options, timestamps, reads, keys, false, apple_sync)
     }
 
     /// Durably binds a native replica journal's lineage, preserving any existing record offsets.
@@ -293,11 +305,20 @@ impl LocalLog {
     pub fn open_replica(path: impl AsRef<Path>, options: LocalLogOptions, timestamps: Arc<dyn AppendTimestampSource>,
         reads: Arc<IoRegion>, keys: Option<Arc<ClassicObjectKeys>>,
     ) -> Result<(Arc<Self>, LocalLogDriver)> {
-        Self::open_journal(path.as_ref(), options, timestamps, reads, keys, true)
+        Self::open_replica_with_sync(path, options, timestamps, reads, keys, AppleSync::Full)
     }
 
+    pub fn open_replica_with_sync(path: impl AsRef<Path>, options: LocalLogOptions, timestamps: Arc<dyn AppendTimestampSource>,
+        reads: Arc<IoRegion>, keys: Option<Arc<ClassicObjectKeys>>, apple_sync: AppleSync,
+    ) -> Result<(Arc<Self>, LocalLogDriver)> {
+        Self::open_journal(path.as_ref(), options, timestamps, reads, keys, true, apple_sync)
+    }
+
+    /// The durability policy used for local filesystem syncs on Apple platforms.
+    pub fn apple_sync(&self) -> AppleSync { self.apple_sync }
+
     fn open_journal(path: &Path, options: LocalLogOptions, timestamps: Arc<dyn AppendTimestampSource>,
-        reads: Arc<IoRegion>, keys: Option<Arc<ClassicObjectKeys>>, bind_lineage: bool,
+        reads: Arc<IoRegion>, keys: Option<Arc<ClassicObjectKeys>>, bind_lineage: bool, apple_sync: AppleSync,
     ) -> Result<(Arc<Self>, LocalLogDriver)> {
         let path = Arc::new(path.to_path_buf());
         let _operation = reads.admit_read(path.clone(), ())?;
@@ -310,13 +331,13 @@ impl LocalLog {
             return Err(Error::Task("local log requires a positive queue and an i32 payload limit".into()));
         }
         if let Some(parent) = file_path.parent() { fs::create_dir_all(parent).map_err(|error| Error::io(parent, error))?; }
-        let mut file = JournalFile::lock(file_path, true)?;
+        let mut file = JournalFile::lock(file_path, true, apple_sync)?;
         let mut cached = file.cached_lineage(file_path)?;
         let latest = inspect(&mut file, file_path, maximum, keys.is_some())?;
         if file.lineage().is_none() && latest == LogOffset(-1) && cached.take().is_some() {
             // A crash after publishing a fresh UUID would leave a mismatched sidecar and block reopening.
             file.sync_open(file_path)?;
-            JournalFile::remove_lineage_sidecar(file_path)?;
+            JournalFile::remove_lineage_sidecar(file_path, apple_sync)?;
         }
         if file.lineage().is_none() && (bind_lineage || cached.is_some()) {
             file = file.bind_lineage(file_path, cached.unwrap_or_else(Uuid::new_v4))?;
@@ -324,13 +345,13 @@ impl LocalLog {
             file.sync_open(file_path)?;
         }
         if cached.is_some() {
-            JournalFile::remove_lineage_sidecar(file_path)?;
+            JournalFile::remove_lineage_sidecar(file_path, apple_sync)?;
         }
         let progress = Arc::new(Progress::new(latest));
         let recent = Arc::new(RecentFrames::default());
         let (send, queue) = mpsc::channel(options.queue_capacity);
         let log = Arc::new(Self { path: path.clone(), lineage: file.lineage(), queue: send, progress: progress.clone(),
-            maximum_message_bytes: options.maximum_message_bytes, keys: keys.clone(), reads, recent: recent.clone() });
+            maximum_message_bytes: options.maximum_message_bytes, keys: keys.clone(), reads, recent: recent.clone(), apple_sync });
         Ok((log, LocalLogDriver { writer: Some(Writer { file, path, timestamps, keys }), queue, progress, recent }))
     }
 
@@ -768,7 +789,7 @@ mod tests {
             let reader = ReadOnlyLocalLog::open(&path, Default::default())?;
             assert_eq!(reader.latest()?, LogOffset(-1));
             assert_eq!(reader.journal_lineage(), None);
-            let locked = JournalFile::lock(&path, false)?;
+            let locked = JournalFile::lock(&path, false, AppleSync::Full)?;
             assert_eq!(locked.cached_lineage(&path)?, Some(cached));
             drop(locked);
 
@@ -875,7 +896,7 @@ mod tests {
             shutdown.cancel();
             task.await.unwrap()?;
 
-            let mut file = JournalFile::lock(&path, false)?;
+            let mut file = JournalFile::lock(&path, false, AppleSync::Full)?;
             let end = prefix_end(&mut file, &path, 1024, second.offset, false)?;
             settle_prefix(&mut file, &path, 1024, end, None)?;
             drop(file);
@@ -1226,7 +1247,7 @@ mod retention_tests {
         let path = Arc::new(payloads.path().join("REPLICA_LOG"));
         let keys = key_vault.log_keys(&path, true, IoRegion::new()).map_err(|error| Error::Task(error.to_string()))?;
         let mut writer = Writer {
-            file: JournalFile::lock(&path, true)?,
+            file: JournalFile::lock(&path, true, AppleSync::Full)?,
             path: Arc::clone(&path),
             timestamps: Arc::new(SuppliedTimestamp),
             keys: Some(Arc::clone(&keys)),
@@ -1256,7 +1277,7 @@ mod retention_tests {
         let scratch = tempfile::NamedTempFile::new().map_err(|error| Error::Task(error.to_string()))?;
         let path = Arc::new(scratch.path().to_path_buf());
         let mut writer = Writer {
-            file: JournalFile::lock(&path, false)?,
+            file: JournalFile::lock(&path, false, AppleSync::Full)?,
             path: Arc::clone(&path),
             timestamps: Arc::new(SuppliedTimestamp),
             keys: None,
@@ -1357,5 +1378,25 @@ mod held_journal_tests {
 
         fs::remove_file(&path).unwrap();
         assert!(reopen_at(Some(reopened), &path, None, 0).is_err());
+    }
+
+    #[tokio::test]
+    async fn local_logs_carry_independent_apple_sync_policies() -> Result<()> {
+        let first_dir = tempfile::tempdir().map_err(|error| Error::Task(error.to_string()))?;
+        let second_dir = tempfile::tempdir().map_err(|error| Error::Task(error.to_string()))?;
+        let options = || LocalLogOptions { maximum_message_bytes: 1024, queue_capacity: 2 };
+        let (full, full_driver) = LocalLog::open_with_sync(first_dir.path().join("LOG"), options(), AppleSync::Full)?;
+        let (fsync, fsync_driver) = LocalLog::open_with_sync(second_dir.path().join("LOG"), options(), AppleSync::Fsync)?;
+        assert_eq!(full.apple_sync(), AppleSync::Full);
+        assert_eq!(fsync.apple_sync(), AppleSync::Fsync);
+        let shutdown = CancellationToken::new();
+        let full_task = tokio::spawn(full_driver.run(shutdown.clone()));
+        let fsync_task = tokio::spawn(fsync_driver.run(shutdown.clone()));
+        full.enqueue(Bytes::from_static(b"full"), Timestamp(1)).await?.durable().await?;
+        fsync.enqueue(Bytes::from_static(b"fsync"), Timestamp(2)).await?.durable().await?;
+        shutdown.cancel();
+        full_task.await.map_err(|error| Error::Task(error.to_string()))??;
+        fsync_task.await.map_err(|error| Error::Task(error.to_string()))??;
+        Ok(())
     }
 }

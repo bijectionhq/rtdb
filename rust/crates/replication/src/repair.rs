@@ -16,7 +16,7 @@ use rtdb_format::{
 };
 use rtdb_index::{TableCatalog, TrieCatalog, TrieState};
 use rtdb_storage::{
-    HeldView, IoRegion, LocalRepairAnchor, LocalStore, ObjectKey, ObjectStore,
+    AppleSync, HeldView, IoRegion, LocalRepairAnchor, LocalStore, ObjectKey, ObjectStore,
     cache::{BufferPool, CacheBudget},
     log::{MemoryLog, ReadOnlyLocalLog, ReadOnlyLocalLogOptions},
     object_store::ReadReservation,
@@ -82,28 +82,38 @@ pub struct RetainRepairBase {
 impl RetainRepairBase {
     /// Installs a durable block-collection bound after verifying the detached base and its journal boundary.
     pub async fn install(&self, memory: Arc<MemoryBudget>, cancellation: &CancellationToken) -> Result<ReplicaPosition> {
-        self.install_with_retention(memory, cancellation, false).await
+        self.install_with_sync(memory, cancellation, AppleSync::Full).await
+    }
+
+    pub async fn install_with_sync(&self, memory: Arc<MemoryBudget>, cancellation: &CancellationToken, apple_sync: AppleSync) -> Result<ReplicaPosition> {
+        self.install_with_retention(memory, cancellation, false, apple_sync).await
     }
 
     pub async fn install_and_reclaim(&self, memory: Arc<MemoryBudget>, cancellation: &CancellationToken) -> Result<ReplicaPosition> {
-        self.install_with_retention(memory, cancellation, true).await
+        self.install_and_reclaim_with_sync(memory, cancellation, AppleSync::Full).await
     }
 
-    async fn install_with_retention(&self, memory: Arc<MemoryBudget>, cancellation: &CancellationToken, reclaim: bool) -> Result<ReplicaPosition> {
+    pub async fn install_and_reclaim_with_sync(&self, memory: Arc<MemoryBudget>, cancellation: &CancellationToken, apple_sync: AppleSync) -> Result<ReplicaPosition> {
+        self.install_with_retention(memory, cancellation, true, apple_sync).await
+    }
+
+    async fn install_with_retention(&self, memory: Arc<MemoryBudget>, cancellation: &CancellationToken, reclaim: bool, apple_sync: AppleSync) -> Result<ReplicaPosition> {
         cancelled(cancellation)?;
-        let vault = self.classic_key_vault.as_deref().map(ClassicKeyVault::open).transpose()?;
+        let vault = self.classic_key_vault.as_deref()
+            .map(|path| ClassicKeyVault::open(path).map(|vault| vault.with_apple_sync(apple_sync)))
+            .transpose()?;
         let root = StorageRoot::new(CURRENT_STORAGE_VERSION, StorageEpoch(0))?.key();
         let source_root = fs::canonicalize(self.source_storage.join(&root)).map_err(io)?;
         let base_root = fs::canonicalize(self.base_storage.join(&root)).map_err(io)?;
         require_detached_base(&source_root, &base_root)?;
         let (journal, region) = exclusive_journal(&self.replica_log)?;
-        let result = self.install_locked(source_root.clone(), base_root, &journal, &region, &memory, cancellation, vault.as_ref()).await;
+        let result = self.install_locked(source_root.clone(), base_root, &journal, &region, &memory, cancellation, vault.as_ref(), apple_sync).await;
         region.close_and_wait().await;
         drop(region);
         let anchor = result?;
         if reclaim {
             cancelled(cancellation)?;
-            let source = LocalStore::open(source_root)?.with_catalog_ledger(anchor.boundary.epoch());
+            let source = LocalStore::open(source_root)?.with_apple_sync(apple_sync).with_catalog_ledger(anchor.boundary.epoch());
             let result = source.retire_classic_log_prefixes(anchor, &journal, ReadOnlyLocalLogOptions::default().maximum_message_bytes, vault.as_ref()).await;
             source.close_and_wait().await;
             result?;
@@ -114,12 +124,12 @@ impl RetainRepairBase {
     async fn install_locked(
         &self, source_root: PathBuf, base_root: PathBuf, journal: &Path,
         region: &Arc<IoRegion>, memory: &Arc<MemoryBudget>, cancellation: &CancellationToken,
-        vault: Option<&ClassicKeyVault>,
+        vault: Option<&ClassicKeyVault>, apple_sync: AppleSync,
     ) -> Result<LocalRepairAnchor> {
         let _cache_charge = memory.reserve(CACHE_BYTES)?;
         let cache = CacheBudget::new(CACHE_BYTES);
-        let source = Arc::new(LocalStore::open_in(&source_root, region.clone())?);
-        let base_store = Arc::new(LocalStore::open_in(&base_root, region.clone())?);
+        let source = Arc::new(LocalStore::open_in(&source_root, region.clone())?.with_apple_sync(apple_sync));
+        let base_store = Arc::new(LocalStore::open_in(&base_root, region.clone())?.with_apple_sync(apple_sync));
         let source_body = repair_body(source.clone(), vault, region).await?;
         let base_body = repair_body(base_store.clone(), vault, region).await?;
         let source_pool = pool(source_body.clone(), &cache, memory);
@@ -160,7 +170,7 @@ impl RetainRepairBase {
         base_store.sync_existing(&ObjectKey::new(block_key(self.base.block)?)?).await?;
         for parent in base_root.ancestors().skip(1) {
             cancelled(cancellation)?;
-            rtdb_storage::sync_directory(parent).map_err(io)?;
+            rtdb_storage::sync_directory(parent, apple_sync).map_err(io)?;
         }
         let boundary = base.boundary_replica_position().filter(|position| position.0 >= 0)
             .ok_or_else(|| invalid("The base has no usable replica boundary"))?;
@@ -206,11 +216,18 @@ impl LocalRepair {
     pub async fn rebuild_with_checkpoint_keys(
         &self, keys: Option<Arc<dyn Kms>>, memory: Arc<MemoryBudget>, cancellation: &CancellationToken,
     ) -> Result<RepairedStore> {
+        self.rebuild_with_checkpoint_keys_and_sync(keys, memory, cancellation, AppleSync::Full).await
+    }
+
+    /// Sealed images use the original NativeCheckpointAuthority's KMS for both selections.
+    pub async fn rebuild_with_checkpoint_keys_and_sync(
+        &self, keys: Option<Arc<dyn Kms>>, memory: Arc<MemoryBudget>, cancellation: &CancellationToken, apple_sync: AppleSync,
+    ) -> Result<RepairedStore> {
         require_advancing_cut(self.base, self.through)?;
         cancelled(cancellation)?;
         let paths = RepairPaths::resolve(&self.source_storage, self.base_storage.as_deref(), &self.output_parent)?;
         RepairRange { base: BaseSelection::Explicit(self.base), through: self.through }
-            .rebuild(paths, &self.replica_log, &memory, cancellation, keys.as_ref()).await
+            .rebuild(paths, &self.replica_log, &memory, cancellation, keys.as_ref(), apple_sync).await
     }
 }
 
@@ -226,11 +243,18 @@ impl RetainedLocalRepair {
     pub async fn rebuild_with_checkpoint_keys(
         &self, keys: Option<Arc<dyn Kms>>, memory: Arc<MemoryBudget>, cancellation: &CancellationToken,
     ) -> Result<RepairedStore> {
+        self.rebuild_with_checkpoint_keys_and_sync(keys, memory, cancellation, AppleSync::Full).await
+    }
+
+    /// Sealed images use the original NativeCheckpointAuthority's KMS for both selections.
+    pub async fn rebuild_with_checkpoint_keys_and_sync(
+        &self, keys: Option<Arc<dyn Kms>>, memory: Arc<MemoryBudget>, cancellation: &CancellationToken, apple_sync: AppleSync,
+    ) -> Result<RepairedStore> {
         cancelled(cancellation)?;
         let paths = RepairPaths::resolve(&self.source_storage, Some(&self.base_storage), &self.output_parent)?;
         require_detached_base(&paths.source_root, &paths.base_root)?;
         RepairRange { base: BaseSelection::Retained, through: self.through }
-            .rebuild(paths, &self.replica_log, &memory, cancellation, keys.as_ref()).await
+            .rebuild(paths, &self.replica_log, &memory, cancellation, keys.as_ref(), apple_sync).await
     }
 }
 
@@ -318,9 +342,10 @@ impl PrimaryReset {
             return Err(invalid("The repair anchor and target must be in the held replica journal"));
         }
 
+        let apple_sync = local.apple_sync();
         let directory = Arc::new(tempfile::Builder::new().prefix("rtdb-reset-").tempdir().map_err(io)?);
         let region = IoRegion::new().child_holding(Some(directory.clone()));
-        let archive = Arc::new(LocalStore::open_in(export, region.clone())?);
+        let archive = Arc::new(LocalStore::open_in(export, region.clone())?.with_apple_sync(apple_sync));
         let base_blocks = BlockStore::new(archive.clone(), pool(archive.clone(), &cache, memory), Arc::clone(memory), file_size_target)?;
         let (base, tables) = base_blocks.load(anchor.block).await?;
         require_root(&base, base_receipt)?;
@@ -328,7 +353,7 @@ impl PrimaryReset {
         if base.boundary_replica_position() != Some(anchor.boundary) {
             return Err(invalid("The retained repair boundary differs from its exported checkpoint"));
         }
-        let staged = Arc::new(LocalStore::open_in(directory.path(), region)?);
+        let staged = Arc::new(LocalStore::open_in(directory.path(), region)?.with_apple_sync(apple_sync));
         stage_primary_base(&archive, &staged, &base, &tables, memory, cancellation).await?;
         let observed_inventory = primary_inventory_digest(staged.as_ref(), &base, &tables, memory, cancellation).await?;
         if observed_inventory != anchor.primary_inventory_sha256 {
@@ -428,10 +453,10 @@ struct RepairRange {
 impl RepairRange {
     async fn rebuild(
         &self, paths: RepairPaths, replica_log: &Path, memory: &Arc<MemoryBudget>, cancellation: &CancellationToken,
-        keys: Option<&Arc<dyn Kms>>,
+        keys: Option<&Arc<dyn Kms>>, apple_sync: AppleSync,
     ) -> Result<RepairedStore> {
         let (journal, region) = exclusive_journal(replica_log)?;
-        let built = self.build(&paths, &journal, memory, &region, cancellation, keys).await;
+        let built = self.build(&paths, &journal, memory, &region, cancellation, keys, apple_sync).await;
         region.close_and_wait().await;
         built
     }
@@ -439,12 +464,12 @@ impl RepairRange {
     async fn build(
         &self, paths: &RepairPaths, journal: &Path,
         memory: &Arc<MemoryBudget>, io_region: &Arc<IoRegion>, cancellation: &CancellationToken,
-        keys: Option<&Arc<dyn Kms>>,
+        keys: Option<&Arc<dyn Kms>>, apple_sync: AppleSync,
     ) -> Result<RepairedStore> {
         let RepairPaths { source_root, base_root, output_parent, root } = paths;
         let _cache_charge = memory.reserve(CACHE_BYTES)?;
         let cache = CacheBudget::new(CACHE_BYTES);
-        let source = Arc::new(LocalStore::open_in(source_root, Arc::clone(io_region))?);
+        let source = Arc::new(LocalStore::open_in(source_root, Arc::clone(io_region))?.with_apple_sync(apple_sync));
         let (base_receipt, retained_anchor) = match self.base {
             BaseSelection::Explicit(base) => (base, None),
             BaseSelection::Retained => {
@@ -460,7 +485,7 @@ impl RepairRange {
         let (base_storage, base_blocks) = if base_root == source_root {
             (source.clone(), source_blocks.clone())
         } else {
-            let store = Arc::new(LocalStore::open_in(base_root, Arc::clone(io_region))?);
+            let store = Arc::new(LocalStore::open_in(base_root, Arc::clone(io_region))?.with_apple_sync(apple_sync));
             let blocks = BlockStore::new(store.clone(), pool(store.clone(), &cache, memory), Arc::clone(memory), file_size_target)?;
             (store, blocks)
         };
@@ -485,7 +510,7 @@ impl RepairRange {
         let directory = Arc::new(tempfile::Builder::new().prefix("repair-").tempdir_in(output_parent).map_err(io)?);
         let staged = directory.path().join(".staging");
         let stage_io = io_region.child_holding(Some(directory.clone()));
-        let destination = Arc::new(LocalStore::open_in(staged.join(root), Arc::clone(&stage_io))?);
+        let destination = Arc::new(LocalStore::open_in(staged.join(root), Arc::clone(&stage_io))?.with_apple_sync(apple_sync));
         stage_primary_base(&base_storage, &destination, &base, &tables, memory, cancellation).await?;
         let residence = source_root.to_string_lossy();
         let observation = if let Some(anchor) = retained_anchor {
@@ -518,8 +543,8 @@ impl RepairRange {
         }
         let ready = directory.path().join("storage");
         fs::rename(staged, &ready).map_err(io)?;
-        rtdb_storage::sync_directory(directory.path()).map_err(io)?;
-        rtdb_storage::sync_directory(output_parent).map_err(io)?;
+        rtdb_storage::sync_directory(directory.path(), apple_sync).map_err(io)?;
+        rtdb_storage::sync_directory(output_parent, apple_sync).map_err(io)?;
         let path = directory.keep().join("storage");
         Ok(RepairedStore { path, checkpoint, latest_transaction, source_replica_epoch: epoch })
     }

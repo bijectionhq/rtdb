@@ -23,9 +23,10 @@ impl LocalLog {
     /// The caller retains independent recovery and has durably closed prior recovery admission.
     pub async fn settle_erasure_prefix(&self, retirement: CheckpointPrefix) -> Result<bool> {
         let maximum = physical_maximum(self.maximum_message_bytes, true)?;
+        let apple_sync = self.apple_sync;
         self.with_retirement_file(retirement, move |path, keys, (mut file, before)| {
             keys.with_local_prefix_retirement(|intent_path| {
-                let mut intent = prepare(intent_path, retirement, before)?;
+                let mut intent = prepare(intent_path, retirement, before, apple_sync)?;
                 for _ in 0..BATCH {
                     if intent.settled == before {
                         break;
@@ -54,7 +55,7 @@ impl LocalLog {
                     }
                     intent.settled = next;
                 }
-                write_intent(intent_path, intent)?;
+                write_intent(intent_path, intent, apple_sync)?;
                 Ok(intent.settled == before)
             })
         })
@@ -113,10 +114,10 @@ pub(crate) fn read_floor(path: &Path) -> Result<i64> {
     Ok(read_intent(path)?.map_or(0, |intent| intent.before as i64))
 }
 
-fn prepare(path: &Path, retirement: CheckpointPrefix, before: u64) -> Result<Intent> {
+fn prepare(path: &Path, retirement: CheckpointPrefix, before: u64, apple_sync: AppleSync) -> Result<Intent> {
     let settled = match read_intent(path)? {
         Some(prior) if prior.retirement == retirement && prior.before == before => {
-            crate::sync_directory(path.parent().ok_or_else(invalid)?)
+            crate::sync_directory(path.parent().ok_or_else(invalid)?, apple_sync)
                 .map_err(|error| Error::io(path, error))?;
             return Ok(prior);
         }
@@ -129,7 +130,7 @@ fn prepare(path: &Path, retirement: CheckpointPrefix, before: u64) -> Result<Int
         before,
         settled,
     };
-    write_intent(path, intent)?;
+    write_intent(path, intent, apple_sync)?;
     Ok(intent)
 }
 
@@ -150,14 +151,14 @@ fn read_intent(path: &Path) -> Result<Option<Intent>> {
     Ok(Some(intent))
 }
 
-fn write_intent(path: &Path, intent: Intent) -> Result<()> {
+fn write_intent(path: &Path, intent: Intent, apple_sync: AppleSync) -> Result<()> {
     let dir = path.parent().ok_or_else(invalid)?;
     let mut file = tempfile::NamedTempFile::new_in(dir).map_err(|error| Error::io(path, error))?;
     serde_json::to_writer(&mut file, &intent).map_err(|_| invalid())?;
-    crate::sync_file(file.as_file()).map_err(|error| Error::io(path, error))?;
+    crate::sync_file(file.as_file(), apple_sync).map_err(|error| Error::io(path, error))?;
     file.persist(path)
         .map_err(|error| Error::io(path, error.error))?;
-    crate::sync_directory(dir).map_err(|error| Error::io(dir, error))
+    crate::sync_directory(dir, apple_sync).map_err(|error| Error::io(dir, error))
 }
 
 fn invalid() -> Error {

@@ -456,6 +456,7 @@ fn key(name: &str) -> rtdb_storage::Result<ObjectKey> { ObjectKey::new(name).map
 #[async_trait]
 impl ObjectStore for PackingStore {
     fn permits_shared_read_cache(&self) -> bool { self.inner.permits_shared_read_cache() }
+    fn apple_sync(&self) -> rtdb_storage::AppleSync { self.inner.apple_sync() }
     fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { self.inner.supports_scan_ranges(key) }
     async fn head(&self, object: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
         if IoRegion::requires_audience_transport() { return Ok(self.observe_head(object).await?.value); }

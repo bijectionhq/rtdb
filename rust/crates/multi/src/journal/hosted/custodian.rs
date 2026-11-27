@@ -48,6 +48,14 @@ struct DiscoveredJournal {
 }
 
 pub async fn run(settings: Settings, cancellation: CancellationToken) -> Result<()> {
+    run_with_sync(settings, rtdb_storage::AppleSync::Full, cancellation).await
+}
+
+pub async fn run_with_sync(
+    settings: Settings,
+    apple_sync: rtdb_storage::AppleSync,
+    cancellation: CancellationToken,
+) -> Result<()> {
     let routes = settings
         .placements
         .as_deref()
@@ -93,7 +101,7 @@ pub async fn run(settings: Settings, cancellation: CancellationToken) -> Result<
                 }
             }
             for (_, placement) in routes.custody_placements() {
-                maintain(
+                maintain_with_sync(
                     placement,
                     None,
                     settings.broker.as_ref(),
@@ -102,6 +110,7 @@ pub async fn run(settings: Settings, cancellation: CancellationToken) -> Result<
                     &settings.memory,
                     &releases,
                     Duration::from_secs(30),
+                    apple_sync,
                 )
                 .await;
             }
@@ -179,6 +188,20 @@ pub(crate) async fn maintain(
     releases: &TaskTracker,
     limit: Duration,
 ) {
+    maintain_with_sync(placement, offered, broker, keys, serving, memory, releases, limit, rtdb_storage::AppleSync::Full).await;
+}
+
+pub(crate) async fn maintain_with_sync(
+    placement: &Placement,
+    offered: Option<(WriterAdmission, Checkpoint)>,
+    broker: Option<&Client>,
+    keys: &Arc<dyn KeyService>,
+    serving: &CellStorage,
+    memory: &Arc<MemoryBudget>,
+    releases: &TaskTracker,
+    limit: Duration,
+    apple_sync: rtdb_storage::AppleSync,
+) {
     if let Some(broker) = broker {
         let erasure = placement.advance_installed_erasure(broker, keys);
         if let Ok(Err(error)) = tokio::time::timeout(limit, erasure).await {
@@ -204,5 +227,5 @@ pub(crate) async fn maintain(
     }
     let _ = tokio::time::timeout(limit, placement.retire_unheld_checkpoint(keys)).await;
     let _ = tokio::time::timeout(limit, placement.settle_serving_receipts(serving, keys)).await;
-    let _ = tokio::time::timeout(limit, placement.retire_serving_prefixes(serving, keys)).await;
+    let _ = tokio::time::timeout(limit, placement.retire_serving_prefixes_with_sync(serving, keys, apple_sync)).await;
 }

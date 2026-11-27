@@ -212,7 +212,7 @@ impl CheckpointCustody {
     }
 
     pub(crate) fn on_local_volume(mut self, path: &Path) -> Result<Self> {
-        self.local = Some(local::LocalArchive::new(path)?);
+        self.local = Some(local::LocalArchive::new(path)?.with_apple_sync(self.bucket.apple_sync()));
         Ok(self)
     }
 
@@ -834,6 +834,7 @@ impl ObjectStore for ExactStore {
         self.bucket.s3_publication_address(&physical)
     }
     fn permits_shared_read_cache(&self) -> bool { self.bucket.permits_shared_read_cache() }
+    fn apple_sync(&self) -> rtdb_storage::AppleSync { self.bucket.apple_sync() }
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
         Ok(self.observe_head(key).await?.value)
     }

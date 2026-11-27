@@ -138,6 +138,7 @@ pub struct NodeConfiguration {
     pub query_spill_limit_bytes: Option<u64>,
     pub generate_series_end_exclusive: bool,
     pub object_sort: rtdb_types::ObjectSort,
+    pub apple_sync: rtdb_storage::AppleSync,
     pub multi_checkpoints: MultiCheckpointSettings,
     pub multi_journal: MultiJournalSettings,
 }
@@ -202,6 +203,7 @@ impl NodeConfiguration {
         let ordered_index_arrow_references_on_private_storage = references.is_none();
         let multi_checkpoints = MultiCheckpointSettings::decode(fields.take("multiCheckpoints"), environment)?;
         let multi_journal = MultiJournalSettings::decode(fields.take("multiJournal"))?;
+        let apple_sync = apple_sync(environment)?;
         let configuration = if ingest {
             let fixed_databases = match fields.take("databases") {
                 Some(value) => YamlFields::new(value, "databases")?.into_entries().into_iter().map(|(name, value)| Ok((name, decode_database_value(value)?))).collect::<Result<_>>()?,
@@ -214,7 +216,7 @@ impl NodeConfiguration {
                 default_checkpoint_restore_directory: None,
                 health, remotes, primary, fixed_databases: Some(fixed_databases), memory_cache, disk_cache,
                 default_timezone: None, host_timezone, indexer, compactor: compactor(None, environment)?, garbage: garbage(None)?, search: search(None)?, auth: authentication::default_auth(environment),
-                tracing: tracing(None)?, modules: Vec::new(), read_only_databases: false, default_v1_serving: false, default_erasure, key_vaults, query_spill_limit_bytes, ordered_index_arrow_references, ordered_index_arrow_references_on_private_storage, skipped_databases: BTreeSet::new(), node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default(), multi_checkpoints, multi_journal }
+                tracing: tracing(None)?, modules: Vec::new(), read_only_databases: false, default_v1_serving: false, default_erasure, key_vaults, query_spill_limit_bytes, ordered_index_arrow_references, ordered_index_arrow_references_on_private_storage, skipped_databases: BTreeSet::new(), node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default(), apple_sync, multi_checkpoints, multi_journal }
         } else {
             let server = match fields.take("server") { None => Some(PgwireSettings::default()), Some(Yaml::Null) => None, Some(value) => Some(pgwire(value)?) };
             let flight_sql = match fields.take("flightSql") { None => Some(FlightSettings::default()), Some(Yaml::Null) => None, Some(value) => Some(flight(value)?) };
@@ -251,7 +253,7 @@ impl NodeConfiguration {
                 deployment_admin,
                 #[cfg(feature = "multi")]
                 default_checkpoint_restore_directory,
-                health, remotes, primary, fixed_databases: None, memory_cache, disk_cache, default_timezone, host_timezone, indexer, compactor, garbage, search, auth, tracing, modules, read_only_databases, default_v1_serving, default_erasure, key_vaults, query_spill_limit_bytes, ordered_index_arrow_references, ordered_index_arrow_references_on_private_storage, skipped_databases, node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default(), multi_checkpoints, multi_journal }
+                health, remotes, primary, fixed_databases: None, memory_cache, disk_cache, default_timezone, host_timezone, indexer, compactor, garbage, search, auth, tracing, modules, read_only_databases, default_v1_serving, default_erasure, key_vaults, query_spill_limit_bytes, ordered_index_arrow_references, ordered_index_arrow_references_on_private_storage, skipped_databases, node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default(), apple_sync, multi_checkpoints, multi_journal }
         };
         fields.finish()?;
         Ok(configuration)
@@ -273,13 +275,11 @@ fn erasure_flag(fields: &mut YamlFields, key: &str, variable: &str, environment:
 /// The process setting that selects the Apple durable-write policy for every command of a binary.
 pub const APPLE_SYNC_SETTING: &str = "RTDB_APPLE_SYNC";
 
-/// Validates `RTDB_APPLE_SYNC` from the startup environment and installs it as the process's durability policy.
-/// - Errors: a value other than blank, `full` or `fsync`, or a policy different from one already installed.
-pub fn install_apple_sync(environment: &impl Fn(&str) -> Option<String>) -> Result<rtdb_storage::AppleSync> {
-    let policy = rtdb_storage::AppleSync::from_setting(environment(APPLE_SYNC_SETTING).as_deref())
-        .map_err(|error| error.with_context("setting", APPLE_SYNC_SETTING.into()))?;
-    policy.install()?;
-    Ok(policy)
+/// Validates `RTDB_APPLE_SYNC` from the startup environment.
+/// - Errors: a value other than blank, `full` or `fsync`.
+pub fn apple_sync(environment: &impl Fn(&str) -> Option<String>) -> Result<rtdb_storage::AppleSync> {
+    rtdb_storage::AppleSync::from_setting(environment(APPLE_SYNC_SETTING).as_deref())
+        .map_err(|error| error.with_context("setting", APPLE_SYNC_SETTING.into()))
 }
 
 /// Installs the process-wide settings the libraries read no environment for: the `XTDB_VERSION` and `GIT_SHA` version

@@ -40,6 +40,7 @@ pub(crate) struct StoreFactory {
     pub keys: Arc<dyn KeyService>,
     pub scoped_writes: Option<Arc<ScopedCellWrites>>,
     pub releases: tokio_util::task::TaskTracker,
+    pub apple_sync: rtdb_storage::AppleSync,
 }
 
 struct WriteScope {
@@ -172,7 +173,7 @@ impl RemoteStorageFactory for StoreFactory {
         let installed = placement.worker.placement();
         let grant_prefix = grant_prefix(&storage_prefix, installed.generation, grant.epoch);
         let io = local_lifetime(&self.storage, &grant_prefix, &io)?;
-        let (bucket, s3) = serving_bucket(&self.storage, Arc::clone(&io)).await?;
+        let (bucket, s3) = serving_bucket_with_sync(&self.storage, Arc::clone(&io), self.apple_sync).await?;
         let prefix = source_prefix(&storage_prefix, installed.generation, grant.epoch, root);
         let queue_prefix = queue_prefix(&grant_prefix);
         let (writer, queue_writer): (Option<crate::reference::Bucket>, Option<crate::reference::Bucket>) = match (&self.storage, &self.scoped_writes, s3) {
@@ -263,7 +264,7 @@ impl StoreFactory {
             (None, BlockDiscovery::List)
         } else {
             let custody = placement
-                .checkpoint_custody(Arc::clone(&io), Arc::clone(&self.keys))
+                .checkpoint_custody_with_sync(Arc::clone(&io), Arc::clone(&self.keys), self.apple_sync)
                 .await?;
             let opened = custody.open(hold.checkpoint).await?;
             let checkpoint = opened.checkpoint;
@@ -307,7 +308,7 @@ impl StoreFactory {
         }).await?;
         let objects = ReplicaObjects {
             installed: placement.worker.placement(), storage_prefix: placement.record.storage_prefix(),
-            root: root.clone(), bucket: serving_bucket(&self.storage, Arc::clone(&io)).await?.0,
+            root: root.clone(), bucket: serving_bucket_with_sync(&self.storage, Arc::clone(&io), self.apple_sync).await?.0,
             io: Arc::clone(&io), storage: self.storage.clone(), keys: Arc::clone(&self.keys),
         };
         let upper: Arc<dyn ObjectStore> = if hold.start == hold.through && route.writer.grant.is_none() {
@@ -329,7 +330,13 @@ impl StoreFactory {
 pub(super) async fn serving_bucket(
     storage: &CellStorage, io: Arc<IoRegion>,
 ) -> Result<(crate::reference::Bucket, Option<Arc<RemoteStore>>)> {
-    let CellStorage::S3 { config } = storage else { return Ok((storage.bucket(io).await?, None)); };
+    serving_bucket_with_sync(storage, io, rtdb_storage::AppleSync::Full).await
+}
+
+pub(super) async fn serving_bucket_with_sync(
+    storage: &CellStorage, io: Arc<IoRegion>, apple_sync: rtdb_storage::AppleSync,
+) -> Result<(crate::reference::Bucket, Option<Arc<RemoteStore>>)> {
+    let CellStorage::S3 { config } = storage else { return Ok((storage.bucket_with_sync(io, apple_sync).await?, None)); };
     let s3 = Box::pin(config.open_cell(&config.cell_root()?, &BTreeMap::new(), io)).await?;
     let s3 = Arc::new(Arc::unwrap_or_clone(s3).with_read_drain(super::reclamation::read_census_scope));
     Ok((s3.clone(), Some(s3)))
@@ -436,7 +443,7 @@ impl ReplicaObjects {
                     .map_err(|error| Error::Task(error.to_string()))?;
                 let bucket = self
                     .storage
-                    .bucket(Arc::clone(&lifetime))
+                    .bucket_with_sync(Arc::clone(&lifetime), self.bucket.apple_sync())
                     .await
                     .map_err(|error| Error::Task(error.to_string()))?;
                 (bucket, lifetime)
@@ -602,6 +609,8 @@ where
 
 #[async_trait]
 impl ObjectStore for ServingStore {
+    fn apple_sync(&self) -> rtdb_storage::AppleSync { self.upper.apple_sync() }
+
     fn ordered_index_arrow_only(&self) -> bool {
         self.snapshot.as_ref().is_some_and(|source| source.ordered_index_arrow_only)
     }

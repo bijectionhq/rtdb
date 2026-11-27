@@ -7,7 +7,7 @@ use fs2::FileExt;
 use uuid::Uuid;
 
 use super::local::corrupt;
-use crate::{Error, Result, sync_directory, sync_file};
+use crate::{AppleSync, Error, Result, sync_directory, sync_file};
 
 const MAGIC: [u8; 8] = *b"\x1aRTDBJ01";
 const LINEAGE_HEADER_BYTES: u64 = 24;
@@ -19,30 +19,31 @@ fn migration_name(destination: &Path) -> OsString {
     name
 }
 
-fn discard_interrupted_migration(destination: &Path) -> Result<()> {
+fn discard_interrupted_migration(destination: &Path, apple_sync: AppleSync) -> Result<()> {
     let staged = destination.with_file_name(migration_name(destination));
     match fs::remove_file(&staged) {
         Ok(()) => {
             let directory = destination.parent().expect("canonical journal directory");
-            sync_directory(directory).map_err(|error| Error::io(directory, error))
+            sync_directory(directory, apple_sync).map_err(|error| Error::io(directory, error))
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(Error::io(staged, error)),
     }
 }
 
-fn sync_parent_directory(path: &Path) -> Result<()> {
+fn sync_parent_directory(path: &Path, apple_sync: AppleSync) -> Result<()> {
     let directory = path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    sync_directory(directory).map_err(|error| Error::io(directory, error))
+    sync_directory(directory, apple_sync).map_err(|error| Error::io(directory, error))
 }
 
 pub(crate) struct JournalFile {
     file: File,
     lineage: Option<Uuid>,
+    apple_sync: AppleSync,
 }
 
 impl JournalFile {
-    fn inspect_header(mut file: File, path: &Path) -> Result<Self> {
+    fn inspect_header(mut file: File, path: &Path, apple_sync: AppleSync) -> Result<Self> {
         let mut magic = [0; MAGIC.len()];
         let lineage = if file.read(&mut magic[..1]).map_err(|error| Error::io(path, error))? == 1 && magic[0] == MAGIC[0] {
             let invalid = || corrupt(path, 0, "invalid replica journal lineage header");
@@ -57,7 +58,7 @@ impl JournalFile {
             file.rewind().map_err(|error| Error::io(path, error))?;
             None
         };
-        Ok(Self { file, lineage })
+        Ok(Self { file, lineage, apple_sync })
     }
 
     /// Whether `path` still names this open file, so that reading through it reads the journal at that path.
@@ -79,7 +80,7 @@ impl JournalFile {
 
     pub(super) fn open(path: &Path, expected: Option<Uuid>) -> Result<Option<Self>> {
         let journal = match File::open(path) {
-            Ok(file) => Some(Self::inspect_header(file, path)?),
+            Ok(file) => Some(Self::inspect_header(file, path, AppleSync::Full)?),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(Error::io(path, error)),
         };
@@ -89,7 +90,7 @@ impl JournalFile {
         Ok(journal)
     }
 
-    pub(crate) fn lock(path: &Path, create: bool) -> Result<Self> {
+    pub(crate) fn lock(path: &Path, create: bool, apple_sync: AppleSync) -> Result<Self> {
         let file = OpenOptions::new().read(true).write(true).create(create).truncate(false).open(path)
             .map_err(|error| Error::io(path, error))?;
         FileExt::try_lock_exclusive(&file).map_err(|error| Error::io(path, error))?;
@@ -102,10 +103,10 @@ impl JournalFile {
                 return Err(corrupt(path, 0, "journal file was replaced while acquiring its writer lock"));
             }
         }
-        let journal = Self::inspect_header(file, path)?;
+        let journal = Self::inspect_header(file, path, apple_sync)?;
         if journal.lineage.is_some() || path.file_name().is_some_and(|name| name == "REPLICA_LOG") {
             let destination = fs::canonicalize(path).map_err(|error| Error::io(path, error))?;
-            discard_interrupted_migration(&destination)?;
+            discard_interrupted_migration(&destination, apple_sync)?;
         }
         Ok(journal)
     }
@@ -128,21 +129,22 @@ impl JournalFile {
         Ok(Some(cached))
     }
 
-    pub(super) fn remove_lineage_sidecar(path: &Path) -> Result<()> {
+    pub(super) fn remove_lineage_sidecar(path: &Path, apple_sync: AppleSync) -> Result<()> {
         let sidecar = path.with_extension("lineage");
         match fs::remove_file(&sidecar) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(Error::io(sidecar, error)),
         }
-        sync_parent_directory(&sidecar)
+        sync_parent_directory(&sidecar, apple_sync)
     }
 
     pub(super) fn bind_lineage(mut self, path: &Path, lineage: Uuid) -> Result<Self> {
+        let apple_sync = self.apple_sync;
         let io = |error| Error::io(path, error);
         let destination = fs::canonicalize(path).map_err(io)?;
         let directory = destination.parent().ok_or_else(|| corrupt(path, 0, "replica journal has no owner directory"))?;
-        discard_interrupted_migration(&destination)?;
+        discard_interrupted_migration(&destination, apple_sync)?;
         let mut staged = tempfile::Builder::new().prefix(&migration_name(&destination)).rand_bytes(0).tempfile_in(directory).map_err(io)?;
         let permissions = self.file.metadata().map_err(io)?.permissions();
         staged.write_all(&MAGIC).map_err(io)?;
@@ -152,10 +154,10 @@ impl JournalFile {
         staged.as_file().set_permissions(permissions).map_err(io)?;
         // Hold both inodes locked across publication so the replacement has no unlocked interval.
         FileExt::try_lock_exclusive(staged.as_file()).map_err(io)?;
-        sync_file(staged.as_file()).map_err(io)?;
+        sync_file(staged.as_file(), apple_sync).map_err(io)?;
         let file = staged.persist(&destination).map_err(|error| io(error.error))?;
-        sync_directory(directory).map_err(io)?;
-        Ok(Self { file, lineage: Some(lineage) })
+        sync_directory(directory, apple_sync).map_err(io)?;
+        Ok(Self { file, lineage: Some(lineage), apple_sync })
     }
 
     pub(super) fn lineage(&self) -> Option<Uuid> { self.lineage }
@@ -179,13 +181,13 @@ impl JournalFile {
         self.file.set_len(self.physical_offset(length)?)
     }
 
-    pub(super) fn sync(&self) -> io::Result<()> { sync_file(&self.file) }
+    pub(super) fn sync(&self) -> io::Result<()> { sync_file(&self.file, self.apple_sync) }
 
     pub(super) fn sync_open(&self, path: &Path) -> Result<()> {
         let io = |error| Error::io(path, error);
         self.sync().map_err(io)?;
         let destination = if self.lineage.is_some() { fs::canonicalize(path).map_err(io)? } else { path.to_path_buf() };
-        sync_parent_directory(&destination)
+        sync_parent_directory(&destination, self.apple_sync)
     }
 
     fn physical_offset(&self, offset: u64) -> io::Result<u64> {
@@ -220,6 +222,6 @@ mod tests {
 
     #[test]
     fn replica_journal_lineage_sync_accepts_a_bare_relative_path() -> Result<()> {
-        sync_parent_directory(Path::new("REPLICA_LOG.lineage"))
+        sync_parent_directory(Path::new("REPLICA_LOG.lineage"), AppleSync::Full)
     }
 }

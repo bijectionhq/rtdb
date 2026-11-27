@@ -110,12 +110,31 @@ impl CellStorage {
 
     /// The cell's objects as one store, keyed relative to the cell's storage root.
     pub async fn bucket(&self, io: std::sync::Arc<rtdb_storage::IoRegion>) -> rtdb_types::Result<crate::reference::Bucket> {
-        self.open_bucket(io, false).await
+        self.bucket_with_sync(io, rtdb_storage::AppleSync::Full).await
+    }
+
+    pub async fn bucket_with_sync(
+        &self,
+        io: std::sync::Arc<rtdb_storage::IoRegion>,
+        apple_sync: rtdb_storage::AppleSync,
+    ) -> rtdb_types::Result<crate::reference::Bucket> {
+        self.open_bucket_with_sync(io, false, apple_sync).await
     }
 
     pub(crate) async fn open_bucket(&self, io: std::sync::Arc<rtdb_storage::IoRegion>, audience: bool) -> rtdb_types::Result<crate::reference::Bucket> {
+        self.open_bucket_with_sync(io, audience, rtdb_storage::AppleSync::Full).await
+    }
+
+    pub(crate) async fn open_bucket_with_sync(
+        &self,
+        io: std::sync::Arc<rtdb_storage::IoRegion>,
+        audience: bool,
+        apple_sync: rtdb_storage::AppleSync,
+    ) -> rtdb_types::Result<crate::reference::Bucket> {
         match self {
-            CellStorage::Local { root } => Ok(std::sync::Arc::new(rtdb_storage::LocalStore::open_in(root, io)?)),
+            CellStorage::Local { root } => Ok(std::sync::Arc::new(
+                rtdb_storage::LocalStore::open_in(root, io)?.with_apple_sync(apple_sync),
+            )),
             CellStorage::S3 { config } => {
                 let root = config.cell_root()?;
                 let remotes = std::collections::BTreeMap::<String, rtdb_s3::S3Credentials>::new();

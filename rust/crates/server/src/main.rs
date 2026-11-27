@@ -37,7 +37,7 @@ fn main() -> ExitCode {
 }
 
 async fn run() -> Result<()> {
-    rtdb_server::config::install_apple_sync(&|key| std::env::var(key).ok())?;
+    let apple_sync = rtdb_server::config::apple_sync(&|key| std::env::var(key).ok())?;
     rtdb_server::config::install_process_settings(&|key| std::env::var(key).ok())?;
     let command = cli::parse(std::env::args().skip(1), &|key| std::env::var(key).ok())?;
     rtdb_server::logging::install(rtdb_server::logging::LogConfig::from_environment(rtdb_server::logging::process_environment())?, log_output(&command))?;
@@ -82,8 +82,8 @@ async fn run() -> Result<()> {
             serde_json::to_writer(&mut *output, &report).map_err(std::io::Error::other)?;
             writeln!(output)
         }),
-        Command::InitializeStandalone(target) => rtdb_server::standalone::initialize(target).await,
-        Command::Standalone(launch) => run_standalone(launch).await,
+        Command::InitializeStandalone(target) => rtdb_server::standalone::initialize_with_sync(target, apple_sync).await,
+        Command::Standalone(launch) => run_standalone(launch, apple_sync).await,
         Command::HashPassword { bcrypt, password } => { println!("{}", cli::hash_password(bcrypt, password, &mut std::io::stdin().lock())?); Ok(()) }
         Command::Inspect { kind, path, allocation_limit_bytes } => rtdb_server::inspect::file(kind, &path, &rtdb_columnar::MemoryBudget::new(allocation_limit_bytes), &mut std::io::stdout().lock()),
         Command::SnapshotExport { options, database, dry_run } => export_snapshot(options, database, dry_run).await,
@@ -92,8 +92,8 @@ async fn run() -> Result<()> {
             let memory = rtdb_columnar::MemoryBudget::new(memory_bytes);
             let cancellation = tokio_util::sync::CancellationToken::new();
             let installation = async {
-                if reclaim_receipts { request.install_and_reclaim(memory, &cancellation).await }
-                else { request.install(memory, &cancellation).await }
+                if reclaim_receipts { request.install_and_reclaim_with_sync(memory, &cancellation, apple_sync).await }
+                else { request.install_with_sync(memory, &cancellation, apple_sync).await }
             };
             tokio::pin!(installation);
             let boundary = tokio::select! {
@@ -108,13 +108,13 @@ async fn run() -> Result<()> {
             let memory = rtdb_columnar::MemoryBudget::new(memory_bytes);
             let cancellation = tokio_util::sync::CancellationToken::new();
             let keys = repair_checkpoint_keys(checkpoint_key_vault.as_deref())?;
-            report_checkpoint_repair(request.rebuild_with_checkpoint_keys(keys, memory, &cancellation), &cancellation).await
+            report_checkpoint_repair(request.rebuild_with_checkpoint_keys_and_sync(keys, memory, &cancellation, apple_sync), &cancellation).await
         },
         Command::RepairRetainedCheckpoint { request, memory_bytes, checkpoint_key_vault } => {
             let memory = rtdb_columnar::MemoryBudget::new(memory_bytes);
             let cancellation = tokio_util::sync::CancellationToken::new();
             let keys = repair_checkpoint_keys(checkpoint_key_vault.as_deref())?;
-            report_checkpoint_repair(request.rebuild_with_checkpoint_keys(keys, memory, &cancellation), &cancellation).await
+            report_checkpoint_repair(request.rebuild_with_checkpoint_keys_and_sync(keys, memory, &cancellation, apple_sync), &cancellation).await
         },
         Command::Start(options) => {
             let (config, memory, _configuration) = options.load_reserved()?.into_execution(options.allocation_limit_bytes)?;
@@ -179,14 +179,14 @@ fn log_output(command: &Command) -> rtdb_server::logging::LogOutput {
     }
 }
 
-async fn run_standalone(launch: rtdb_server::standalone::Launch) -> Result<()> {
+async fn run_standalone(launch: rtdb_server::standalone::Launch, apple_sync: rtdb_storage::AppleSync) -> Result<()> {
     let stop = tokio_util::sync::CancellationToken::new();
     let parent = stop.clone();
     std::thread::Builder::new().name("rtdb-parent-stdin".into()).spawn(move || {
         let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
         parent.cancel();
     }).map_err(signal_error)?;
-    let serving = rtdb_server::standalone::serve(launch, stop.clone());
+    let serving = rtdb_server::standalone::serve_with_sync(launch, apple_sync, stop.clone());
     tokio::pin!(serving);
     tokio::select! {
         biased;

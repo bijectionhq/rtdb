@@ -16,7 +16,7 @@ use rtdb_types::{Anomaly, Result};
 use uuid::Uuid;
 
 use super::{EncryptingStore, ObjectCipher, UnitOperation, UnitOutput, cipher::Cipher};
-use crate::{Error, IoRegion, ObjectKey, ObjectStore, sync_directory};
+use crate::{AppleSync, Error, IoRegion, ObjectKey, ObjectStore, sync_directory};
 
 mod kafka_references;
 mod kafka_retirement;
@@ -30,7 +30,10 @@ pub const KAFKA_LOG_SEAL_OVERHEAD: usize = LOG_SEAL_OVERHEAD;
 pub(crate) const LOG_SEAL_OVERHEAD: usize = 16 + super::cipher::SEALED_OVERHEAD;
 
 #[derive(Clone)]
-pub struct ClassicKeyVault(Arc<Path>);
+pub struct ClassicKeyVault {
+    path: Arc<Path>,
+    apple_sync: AppleSync,
+}
 
 impl ClassicKeyVault {
     /// The vault path belongs to the original key owner and is excluded from payload backups.
@@ -47,12 +50,20 @@ impl ClassicKeyVault {
                 return Err(invalid("The Classic key vault directory must be private"));
             }
         }
-        Ok(Self(path.into()))
+        Ok(Self { path: path.into(), apple_sync: AppleSync::Full })
     }
+
+    /// Selects the Apple platform sync policy for this vault's durable writes.
+    pub fn with_apple_sync(mut self, apple_sync: AppleSync) -> Self {
+        self.apple_sync = apple_sync;
+        self
+    }
+
+    pub fn apple_sync(&self) -> AppleSync { self.apple_sync }
 
     pub fn require_separate_path(&self, payload: &Path) -> Result<()> {
         let payload = payload.canonicalize().map_err(io(payload))?;
-        if payload.starts_with(self.0.as_ref()) || self.0.starts_with(payload) {
+        if payload.starts_with(self.path.as_ref()) || self.path.starts_with(payload) {
             return Err(invalid(
                 "The Classic key vault must be outside the payload tree",
             ));
@@ -116,13 +127,13 @@ impl ClassicKeyVault {
                 let proposed = erasure.clone();
                 let proposal = region.run_blocking(move || {
                     let id = Uuid::new_v4();
-                    let scope = vault.0.join(id.simple().to_string());
+                    let scope = vault.path.join(id.simple().to_string());
                     fs::create_dir(&scope).map_err(io(&scope))?;
                     let version = match proposed {
-                        Some(residence) if residence.enroll_if_pristine(&scope)? => Some(residence.version()),
+                        Some(residence) if residence.enroll_if_pristine(&scope, vault.apple_sync)? => Some(residence.version()),
                         _ => None,
                     };
-                    sync_directory(&vault.0).map_err(io(&vault.0))?;
+                    sync_directory(&vault.path, vault.apple_sync).map_err(io(&vault.path))?;
                     let mut bytes = id.as_bytes().to_vec();
                     bytes.extend(version);
                     Ok(bytes)
@@ -140,21 +151,22 @@ impl ClassicKeyVault {
         };
         let id = Uuid::from_slice(&anchor[..16])
             .map_err(|_| invalid("The Classic key lineage is malformed"))?;
-        let path = self.0.join(id.simple().to_string());
+        let path = self.path.join(id.simple().to_string());
         if !path.is_dir() {
             return Err(invalid("The original Classic key authority is unavailable"));
         }
+        let apple_sync = self.apple_sync;
         let erasure = match anchor.get(16) {
             None => None,
             Some(&version) if matches!(version, local_erasure::LINEAGE_VERSION | local_erasure::KAFKA_LINEAGE_VERSION) => {
                 let residence = erasure.ok_or_else(|| invalid("The enrolled Local root requires its original erasure custody"))?;
                 if residence.version() != version { return Err(invalid("The Local root has another erasure journal provider")); }
                 let path = path.clone();
-                Some(Arc::new(region.run_blocking(move || residence.reopen(path, id)).await?))
+                Some(Arc::new(region.run_blocking(move || residence.reopen(path, id, apple_sync)).await?))
             }
             _ => return Err(invalid("The Classic key lineage version is unsupported")),
         };
-        Ok(Arc::new(ClassicObjectKeys { path: path.into(), region, erasure }))
+        Ok(Arc::new(ClassicObjectKeys { path: path.into(), region, erasure, apple_sync }))
     }
 
     pub fn log_keys(
@@ -200,23 +212,23 @@ impl ClassicKeyVault {
                         Err(error) => return Err(io(path)(error).into()),
                     }
                     let id = Uuid::new_v4();
-                    let scope = self.0.join(id.simple().to_string());
+                    let scope = self.path.join(id.simple().to_string());
                     fs::create_dir(&scope).map_err(io(&scope))?;
-                    sync_directory(&self.0).map_err(io(&self.0))?;
+                    sync_directory(&self.path, self.apple_sync).map_err(io(&self.path))?;
                     let mut temporary =
                         tempfile::NamedTempFile::new_in(parent).map_err(io(parent))?;
                     temporary.write_all(id.as_bytes()).map_err(io(&marker))?;
-                    crate::sync_file(temporary.as_file()).map_err(io(&marker))?;
+                    crate::sync_file(temporary.as_file(), self.apple_sync).map_err(io(&marker))?;
                     temporary
                         .persist_noclobber(&marker)
                         .map_err(|error| io(&marker)(error.error))?;
-                    sync_directory(parent).map_err(io(parent))?;
+                    sync_directory(parent, self.apple_sync).map_err(io(parent))?;
                     id
                 }
             }
             None => return Err(invalid("The Classic log has no enrolled key lineage")),
         };
-        let namespace = self.0.join(id.simple().to_string());
+        let namespace = self.path.join(id.simple().to_string());
         if !namespace.is_dir() {
             return Err(invalid(
                 "The original Classic log key authority is unavailable",
@@ -226,6 +238,7 @@ impl ClassicKeyVault {
             path: namespace.into(),
             region,
             erasure: None,
+            apple_sync: self.apple_sync,
         }))
     }
 
@@ -244,23 +257,23 @@ impl ClassicKeyVault {
         if topic.is_nil() {
             return Err(invalid("A Classic Kafka log must have a broker topic identity"));
         }
-        let classic = self.0.join(format!("kafka-{}", topic.simple()));
-        let erasure = kafka_erasure_scope(&self.0, topic);
+        let classic = self.path.join(format!("kafka-{}", topic.simple()));
+        let erasure = kafka_erasure_scope(&self.path, topic);
         let _gate = (enroll || owner.is_some()).then(|| lock(&classic)).transpose()?;
         if let Some(owner) = owner
             && enroll
             && !classic.try_exists().map_err(io(&classic))?
             && !erasure.try_exists().map_err(io(&erasure))?
         {
-            let staging = tempfile::tempdir_in(&self.0).map_err(io(&self.0))?;
-            write_kafka_marker(&staging.path().join("owner"), &kafka_owner_bytes(owner), false)?;
+            let staging = tempfile::tempdir_in(&self.path).map_err(io(&self.path))?;
+            write_kafka_marker(&staging.path().join("owner"), &kafka_owner_bytes(owner), false, self.apple_sync)?;
             fs::rename(staging.path(), &erasure).map_err(io(&erasure))?;
-            sync_directory(&self.0).map_err(io(&self.0))?;
+            sync_directory(&self.path, self.apple_sync).map_err(io(&self.path))?;
         }
-        require_kafka_erasure_owner(&self.0, topic, owner)?;
+        require_kafka_erasure_owner(&self.path, topic, owner)?;
         if enroll && owner.is_none() {
             match fs::create_dir(&classic) {
-                Ok(()) => sync_directory(&self.0).map_err(io(&self.0))?,
+                Ok(()) => sync_directory(&self.path, self.apple_sync).map_err(io(&self.path))?,
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(io(&classic)(error).into()),
             }
@@ -269,7 +282,7 @@ impl ClassicKeyVault {
         if !path.is_dir() {
             return Err(invalid("The Classic Kafka topic requires its original enrolled key vault"));
         }
-        Ok(Arc::new(KafkaFrameKeys(ClassicObjectKeys { path: path.into(), region, erasure: None })))
+        Ok(Arc::new(KafkaFrameKeys(ClassicObjectKeys { path: path.into(), region, erasure: None, apple_sync: self.apple_sync })))
     }
 
     pub fn require_unsealed_log(path: &Path) -> Result<()> {
@@ -325,6 +338,7 @@ pub struct ClassicObjectKeys {
     path: Arc<Path>,
     region: Arc<IoRegion>,
     erasure: Option<Arc<LocalErasureCustody>>,
+    apple_sync: AppleSync,
 }
 
 impl ClassicObjectKeys {
@@ -347,24 +361,25 @@ impl ClassicObjectKeys {
             if key.as_str() == OWNER { return Err(Error::InvalidKey(key.to_string())); }
             Ok(self.name(key))
         }).collect::<crate::Result<Vec<_>>>()?;
+        let apple_sync = self.apple_sync;
         self.region.run_blocking(move || {
-            for path in paths { withdraw_slot(&path)?; }
+            for path in paths { withdraw_slot(&path, apple_sync)?; }
             Ok(())
         }).await?;
         Ok(())
     }
 }
 
-fn withdraw_slot(path: &Path) -> crate::Result<()> {
+fn withdraw_slot(path: &Path, apple_sync: AppleSync) -> crate::Result<()> {
     let _lock = lock(path)?;
     let fence = path.with_extension("closed");
     match File::options().write(true).create_new(true).open(&fence) {
-        Ok(file) => crate::sync_file(&file).map_err(io(&fence))?,
+        Ok(file) => crate::sync_file(&file, apple_sync).map_err(io(&fence))?,
         Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
         Err(error) => return Err(io(&fence)(error)),
     }
     let parent = path.parent().expect("the slot has its vault directory");
-    sync_directory(parent).map_err(io(parent))?;
+    sync_directory(parent, apple_sync).map_err(io(parent))?;
     for file in [path, path.with_extension("pending").as_path()] {
         match fs::remove_file(file) {
             Ok(()) => {}
@@ -372,7 +387,7 @@ fn withdraw_slot(path: &Path) -> crate::Result<()> {
             Err(error) => return Err(io(file)(error)),
         }
     }
-    sync_directory(parent).map_err(io(parent))
+    sync_directory(parent, apple_sync).map_err(io(parent))
 }
 
 #[async_trait::async_trait]
@@ -394,6 +409,7 @@ impl ObjectCipher for ClassicObjectKeys {
             return Err(Error::InvalidKey(key.to_string()));
         }
         let path = self.name(key);
+        let apple_sync = self.apple_sync;
         self.region
             .read(Arc::clone(&self.path), key.clone(), move |_, key| {
                 if matches!(operation, UnitOperation::Grant) {
@@ -407,7 +423,7 @@ impl ObjectCipher for ClassicObjectKeys {
                     }
                     return Ok(UnitOutput::HeldGrant { until: None, custody });
                 }
-                with_key(&path, operation.provisions(), |cipher| {
+                with_key(&path, operation.provisions(), apple_sync, |cipher| {
                     operation.apply(cipher, key)
                 })
             })
@@ -433,7 +449,7 @@ impl KafkaFrameKeys {
         let publication = kafka_publication(frame)?;
         let name = ObjectKey::new(format!("frames/{publication}"))?;
         let associated = format!("rtdb.classic.kafka-frame/v1/{publication}");
-        with_key(&self.0.name(&name), false, |cipher| cipher.open(&associated, &frame[16..]))
+        with_key(&self.0.name(&name), false, self.0.apple_sync, |cipher| cipher.open(&associated, &frame[16..]))
     }
 
     /// Persists the exact broker-acknowledged position before acknowledging it to RTDB.
@@ -465,7 +481,7 @@ impl KafkaFrameKeys {
     fn record_publication_locked(&self, offset: i64, frame: &[u8], retain_new: bool) -> crate::Result<()> {
         let index = self.0.path.join("positions");
         match fs::create_dir(&index) {
-            Ok(()) => sync_directory(self.0.path.as_ref()).map_err(io(&index))?,
+            Ok(()) => sync_directory(self.0.path.as_ref(), self.0.apple_sync).map_err(io(&index))?,
             Err(error) if error.kind() == ErrorKind::AlreadyExists => (),
             Err(error) => return Err(io(&index)(error)),
         }
@@ -476,7 +492,7 @@ impl KafkaFrameKeys {
         match fs::read(&marker) {
             Ok(bytes) if bytes == identity => Ok(()),
             Ok(_) => Err(Error::Task("The Kafka position changed its sealed publication".into())),
-            Err(error) if error.kind() == ErrorKind::NotFound && retain_new => write_kafka_marker(&marker, &identity, false),
+            Err(error) if error.kind() == ErrorKind::NotFound && retain_new => write_kafka_marker(&marker, &identity, false, self.0.apple_sync),
             Err(error) if error.kind() == ErrorKind::NotFound => Err(Error::ErasedUnderView),
             Err(error) => Err(io(&marker)(error)),
         }
@@ -511,9 +527,10 @@ impl KafkaFrameKeys {
         if before < 0 {
             return Err(Error::Task("The Kafka floor is negative".into()));
         }
-        let keys = Self(ClassicObjectKeys { path: Arc::clone(&self.0.path), region: Arc::clone(&self.0.region), erasure: None });
+        let keys = Self(ClassicObjectKeys { path: Arc::clone(&self.0.path), region: Arc::clone(&self.0.region), erasure: None, apple_sync: self.0.apple_sync });
         self.0.region.run_blocking(move || {
             let path = &keys.0.path;
+            let apple_sync = keys.0.apple_sync;
             let floor = path.join("retired-before");
             let _gate = lock(&floor)?;
             let mut next = kafka_retired_before(&floor)?;
@@ -526,12 +543,12 @@ impl KafkaFrameKeys {
                 let marker = index.join(next.to_string());
                 let publication = kafka_retirement::publication_at(&index, next)?;
                 let name = ObjectKey::new(format!("frames/{publication}"))?;
-                withdraw_slot(&keys.0.name(&name))?;
+                withdraw_slot(&keys.0.name(&name), apple_sync)?;
                 let advanced = next + 1;
-                write_kafka_marker(&floor, &advanced.to_be_bytes(), true)?;
+                write_kafka_marker(&floor, &advanced.to_be_bytes(), true, apple_sync)?;
                 // The floor now carries the receipt and makes a failed unlink harmless.
                 match fs::remove_file(&marker) {
-                    Ok(()) => sync_directory(&index).map_err(io(&index))?,
+                    Ok(()) => sync_directory(&index, apple_sync).map_err(io(&index))?,
                     Err(error) if error.kind() == ErrorKind::NotFound => (),
                     Err(error) => return Err(io(&marker)(error)),
                 }
@@ -577,7 +594,7 @@ impl ClassicObjectKeys {
         let publication = Uuid::new_v4();
         let name = ObjectKey::new(format!("frames/{publication}"))?;
         let associated = format!("rtdb.classic.log-frame/v1/{publication}/{offset}/{timestamp}");
-        with_key(&self.name(&name), true, |cipher| {
+        with_key(&self.name(&name), true, self.apple_sync, |cipher| {
             cipher.seal_prefixed(&associated, publication.as_bytes(), payload)
         })
     }
@@ -602,7 +619,7 @@ impl ClassicObjectKeys {
             .map_err(|_| Error::Task("Invalid log publication identity".into()))?;
         let name = ObjectKey::new(format!("frames/{publication}"))?;
         let associated = format!("rtdb.classic.log-frame/v1/{publication}/{offset}/{timestamp}");
-        with_key(&self.name(&name), false, |cipher| {
+        with_key(&self.name(&name), false, self.apple_sync, |cipher| {
             cipher.open(&associated, ciphertext)
         })
     }
@@ -629,13 +646,13 @@ impl ClassicObjectKeys {
                 self.open_original_record(offset, timestamp, sealed)?;
                 let mut intent = tempfile::NamedTempFile::new_in(self.path.as_ref()).map_err(io(&marker))?;
                 intent.write_all(binding.as_ref()).map_err(io(&marker))?;
-                crate::sync_file(intent.as_file()).map_err(io(&marker))?;
+                crate::sync_file(intent.as_file(), self.apple_sync).map_err(io(&marker))?;
                 intent.persist_noclobber(&marker).map_err(|error| io(&marker)(error.error))?;
-                sync_directory(self.path.as_ref()).map_err(io(&marker))?;
+                sync_directory(self.path.as_ref(), self.apple_sync).map_err(io(&marker))?;
             }
             Err(error) => return Err(io(&marker)(error)),
         }
-        withdraw_slot(&slot)
+        withdraw_slot(&slot, self.apple_sync)
     }
 
 }
@@ -653,19 +670,20 @@ fn kafka_retired_before(path: &Path) -> crate::Result<i64> {
     }
 }
 
-fn write_kafka_marker(path: &Path, bytes: &[u8], replace: bool) -> crate::Result<()> {
+fn write_kafka_marker(path: &Path, bytes: &[u8], replace: bool, apple_sync: AppleSync) -> crate::Result<()> {
     let parent = path.parent().expect("Kafka marks have a vault directory");
     let mut file = tempfile::NamedTempFile::new_in(parent).map_err(io(path))?;
     file.write_all(bytes).map_err(io(path))?;
-    crate::sync_file(file.as_file()).map_err(io(path))?;
+    crate::sync_file(file.as_file(), apple_sync).map_err(io(path))?;
     if replace { file.persist(path) } else { file.persist_noclobber(path) }
         .map_err(|error| io(path)(error.error))?;
-    sync_directory(parent).map_err(io(parent))
+    sync_directory(parent, apple_sync).map_err(io(parent))
 }
 
 fn with_key<T>(
     path: &Path,
     provision: bool,
+    apple_sync: AppleSync,
     operate: impl FnOnce(&Cipher) -> crate::Result<T>,
 ) -> crate::Result<T> {
     let _lock = lock(path)?;
@@ -680,7 +698,7 @@ fn with_key<T>(
         Ok(bytes) => bytes
             .try_into()
             .map_err(|_| Error::Task("Invalid Classic unit key".into()))?,
-        Err(error) if error.kind() == ErrorKind::NotFound && provision => create(path)?,
+        Err(error) if error.kind() == ErrorKind::NotFound && provision => create(path, apple_sync)?,
         Err(error) => return Err(io(path)(error)),
     };
     let cipher = Cipher::new(&material).map_err(|error| Error::Task(error.to_string()));
@@ -705,7 +723,7 @@ fn lock(path: &Path) -> crate::Result<File> {
     Ok(file)
 }
 
-fn create(path: &Path) -> crate::Result<[u8; KEY_BYTES]> {
+fn create(path: &Path, apple_sync: AppleSync) -> crate::Result<[u8; KEY_BYTES]> {
     let mut material = [0; KEY_BYTES];
     SystemRandom::new()
         .fill(&mut material)
@@ -725,11 +743,11 @@ fn create(path: &Path) -> crate::Result<[u8; KEY_BYTES]> {
     }
     let mut file = options.open(&temporary).map_err(io(&temporary))?;
     file.write_all(&material).map_err(io(&temporary))?;
-    crate::sync_file(&file).map_err(io(&temporary))?;
+    crate::sync_file(&file, apple_sync).map_err(io(&temporary))?;
     drop(file);
     fs::rename(&temporary, path).map_err(io(path))?;
     let parent = path.parent().expect("the slot has its vault directory");
-    sync_directory(parent).map_err(io(parent))?;
+    sync_directory(parent, apple_sync).map_err(io(parent))?;
     Ok(material)
 }
 
@@ -823,6 +841,27 @@ mod tests {
             sealed.put(&key, body).await,
             Err(Error::ErasedUnderView)
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn classic_vaults_carry_independent_apple_sync_policies() -> Result<()> {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in [first.path(), second.path()] {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+        let full = ClassicKeyVault::open(first.path())?;
+        let fsync = ClassicKeyVault::open(second.path())?.with_apple_sync(AppleSync::Fsync);
+        assert_eq!(full.apple_sync(), AppleSync::Full);
+        assert_eq!(fsync.apple_sync(), AppleSync::Fsync);
+        let store: Arc<dyn ObjectStore> = Arc::new(MemoryStore::default());
+        let units = fsync.units(store.as_ref(), IoRegion::new(), true).await?;
+        assert_eq!(units.apple_sync, AppleSync::Fsync);
         Ok(())
     }
 }

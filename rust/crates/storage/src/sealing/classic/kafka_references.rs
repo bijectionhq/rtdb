@@ -49,7 +49,7 @@ impl KafkaFrameKeys {
     ) -> crate::Result<()> {
         let directory = self.0.path.join("replica-references");
         match fs::create_dir(&directory) {
-            Ok(()) => sync_directory(&self.0.path).map_err(io(&directory))?,
+            Ok(()) => sync_directory(&self.0.path, self.0.apple_sync).map_err(io(&directory))?,
             Err(error) if error.kind() == ErrorKind::AlreadyExists => (),
             Err(error) => return Err(io(&directory)(error)),
         }
@@ -65,12 +65,12 @@ impl KafkaFrameKeys {
         let bytes = serde_json::to_vec(&evidence).map_err(invalid_reference)?;
         let path = directory.join(offset.to_string());
         match fs::read(&path) {
-            Ok(prior) if prior == bytes => sync_directory(&directory).map_err(io(&directory)),
+            Ok(prior) if prior == bytes => sync_directory(&directory, self.0.apple_sync).map_err(io(&directory)),
             Ok(_) => Err(invalid_reference(
                 "the sealed offset changed its object reference",
             )),
             Err(error) if error.kind() == ErrorKind::NotFound => {
-                write_kafka_marker(&path, &bytes, false)
+                write_kafka_marker(&path, &bytes, false, self.0.apple_sync)
             }
             Err(error) => Err(io(&path)(error)),
         }

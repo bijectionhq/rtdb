@@ -5,7 +5,7 @@ use rtdb_types::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, IoRegion, LocalStore, ObjectKey, ObjectStore};
+use crate::{AppleSync, Error, IoRegion, LocalStore, ObjectKey, ObjectStore};
 
 const MARKER: &str = ".tmp/catalog-ledger/erasure-recovery";
 const OBJECT_BATCH: usize = 128;
@@ -49,13 +49,14 @@ impl LocalStore {
         let Some(gate) = self.try_lock_recovery_deletion().await? else {
             return Ok(false);
         };
+        let apple_sync = self.apple_sync();
         IoRegion::retaining(
             gate,
             self.io_region().run_blocking(move || {
                 let dir = marker.parent().ok_or_else(invalid)?;
                 if let Some(prior) = read(&marker)? {
                     if prior == next {
-                        crate::sync_directory(dir).map_err(|error| Error::io(dir, error))?;
+                        crate::sync_directory(dir, apple_sync).map_err(|error| Error::io(dir, error))?;
                         return Ok(true);
                     }
                     if prior.block >= next.block
@@ -67,7 +68,7 @@ impl LocalStore {
                         return Err(invalid());
                     }
                 }
-                write_synced(&marker, &next)?;
+                write_synced(&marker, &next, apple_sync)?;
                 Ok(true)
             }),
         )
@@ -152,11 +153,12 @@ impl LocalStore {
             let path = self.object_progress_path(fence);
             let count = objects.len();
             let names_sha256 = object_names_sha256(objects);
+            let apple_sync = self.apple_sync();
             let mut progress = self
                 .io_region()
                 .run_blocking({
                     let path = path.clone();
-                    move || open_object_progress(&path, fence, count, names_sha256)
+                    move || open_object_progress(&path, fence, count, names_sha256, apple_sync)
                 })
                 .await?;
             let end = progress.settled.saturating_add(OBJECT_BATCH).min(count);
@@ -168,7 +170,7 @@ impl LocalStore {
             }
             progress.settled = end;
             self.io_region()
-                .run_blocking(move || write_synced(&path, &progress))
+                .run_blocking(move || write_synced(&path, &progress, apple_sync))
                 .await?;
             Ok(end == count)
         })
@@ -239,6 +241,7 @@ fn open_object_progress(
     fence: LocalErasureRecovery,
     count: usize,
     names_sha256: [u8; 32],
+    apple_sync: AppleSync,
 ) -> crate::Result<ObjectProgress> {
     if let Some(progress) = read_object_progress(path, fence, count, names_sha256)? {
         return Ok(progress);
@@ -249,7 +252,7 @@ fn open_object_progress(
         names_sha256,
         settled: 0,
     };
-    write_synced(path, &progress)?;
+    write_synced(path, &progress, apple_sync)?;
     Ok(progress)
 }
 
@@ -279,14 +282,14 @@ fn read_progress(path: &Path) -> crate::Result<Option<ObjectProgress>> {
         Ok(Some(serde_json::from_slice(&bytes).map_err(|_| invalid())?))
     }
 
-fn write_synced(path: &Path, value: &impl Serialize) -> crate::Result<()> {
+fn write_synced(path: &Path, value: &impl Serialize, apple_sync: AppleSync) -> crate::Result<()> {
     let dir = path.parent().ok_or_else(invalid)?;
     let mut file = tempfile::NamedTempFile::new_in(dir).map_err(|error| Error::io(dir, error))?;
     serde_json::to_writer(&mut file, value).map_err(|_| invalid())?;
-    crate::sync_file(file.as_file()).map_err(|error| Error::io(path, error))?;
+    crate::sync_file(file.as_file(), apple_sync).map_err(|error| Error::io(path, error))?;
     file.persist(path)
         .map_err(|error| Error::io(path, error.error))?;
-    crate::sync_directory(dir).map_err(|error| Error::io(dir, error))
+    crate::sync_directory(dir, apple_sync).map_err(|error| Error::io(dir, error))
 }
 
 fn valid(fence: LocalErasureRecovery) -> bool {

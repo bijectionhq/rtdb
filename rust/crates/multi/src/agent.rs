@@ -87,6 +87,8 @@ pub struct AgentOptions {
     pub snapshot_lifetime: Duration,
     /// When this node's sessions split a scan into fragments, and how it reads the fragments other nodes send it.
     pub fragments: crate::fragments::FragmentOptions,
+    /// Durability sync policy for local file/directory syncs on Apple platforms.
+    pub apple_sync: rtdb_storage::AppleSync,
 }
 
 #[derive(Clone, Debug)]
@@ -97,7 +99,7 @@ impl AgentOptions {
         Self { audience_journal_port: None, storage, installed_journal_manifest: None, installed_cell: None, world_archive: None, s3_write_role: None, replay_broker: None, activation_timeout: Duration::from_secs(30), activations_per_second: NonZeroUsize::new(200).unwrap(),
             watch_interval: Duration::from_millis(250), clean_after_idle: Duration::from_secs(60), park_after: None, resident_idle_after: None, min_residency: Duration::ZERO,
             unsubscribe_after: Duration::from_secs(60), max_active: None, quarantine_after: 2, compaction_worker: false, max_tail_rows: None, snapshot_lifetime: SNAPSHOT_LIFETIME,
-            fragments: crate::fragments::FragmentOptions::default() }
+            fragments: crate::fragments::FragmentOptions::default(), apple_sync: rtdb_storage::AppleSync::Full }
     }
 }
 
@@ -1947,8 +1949,8 @@ impl NodeAgent {
         }
 
         for (name, placement) in self.ordered.custody_placements() {
-            custodian::maintain(placement, offered.remove(name), self.replay_broker(), &self.keys,
-                &self.options.storage, self.node.memory(), &self.ordered_releases, self.options.activation_timeout).await;
+            custodian::maintain_with_sync(placement, offered.remove(name), self.replay_broker(), &self.keys,
+                &self.options.storage, self.node.memory(), &self.ordered_releases, self.options.activation_timeout, self.options.apple_sync).await;
         }
     }
 

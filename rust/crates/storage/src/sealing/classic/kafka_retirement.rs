@@ -48,14 +48,14 @@ impl Intent {
         }))
     }
 
-    fn write(self, path: &Path) -> crate::Result<()> {
+    fn write(self, path: &Path, apple_sync: AppleSync) -> crate::Result<()> {
         let mut bytes = [0; 57];
         bytes[0] = 1;
         bytes[1..9].copy_from_slice(&self.retirement.before.to_be_bytes());
         bytes[9..17].copy_from_slice(&self.settled_before.to_be_bytes());
         bytes[17..25].copy_from_slice(&self.retirement.unreadable_by.0.to_be_bytes());
         bytes[25..].copy_from_slice(&self.retirement.checkpoint_sha256);
-        write_kafka_marker(path, &bytes, true)
+        write_kafka_marker(path, &bytes, true, apple_sync)
     }
 }
 
@@ -92,6 +92,7 @@ impl KafkaFrameKeys {
 
     pub async fn validate_kafka_position_history(&self, recovery_next: i64, before: i64, broker_end: i64) -> crate::Result<()> {
         let path = Arc::clone(&self.0.path);
+        let apple_sync = self.0.apple_sync;
         self.0.region.run_blocking(move || {
             let classic = path.join("retired-before");
             let _gate = lock(&classic)?;
@@ -105,7 +106,7 @@ impl KafkaFrameKeys {
             }
             let positions = path.join("positions");
             for offset in 0..recovery_next { publication_at(&positions, offset)?; }
-            validate_slots(&positions, recovery_next, before, broker_end)
+            validate_slots(&positions, recovery_next, before, broker_end, apple_sync)
         }).await
     }
 
@@ -129,6 +130,7 @@ impl KafkaFrameKeys {
         broker_end: i64,
     ) -> crate::Result<()> {
         let path = Arc::clone(&self.0.path);
+        let apple_sync = self.0.apple_sync;
         self.0
             .region
             .run_blocking(move || {
@@ -139,8 +141,9 @@ impl KafkaFrameKeys {
                     kafka_retired_before(&classic)?,
                     retirement,
                     broker_end,
+                    apple_sync,
                 )?;
-                intent.write(&path.join(INTENT))
+                intent.write(&path.join(INTENT), apple_sync)
             })
             .await
     }
@@ -153,6 +156,7 @@ impl KafkaFrameKeys {
         broker_end: i64,
     ) -> crate::Result<()> {
         let path = Arc::clone(&self.0.path);
+        let apple_sync = self.0.apple_sync;
         self.0
             .region
             .run_blocking(move || {
@@ -163,6 +167,7 @@ impl KafkaFrameKeys {
                     kafka_retired_before(&classic)?,
                     retirement,
                     broker_end,
+                    apple_sync,
                 )?;
                 Ok(())
             })
@@ -179,6 +184,7 @@ impl KafkaFrameKeys {
             path: Arc::clone(&self.0.path),
             region: Arc::clone(&self.0.region),
             erasure: None,
+            apple_sync: self.0.apple_sync,
         };
         self.0
             .region
@@ -199,10 +205,10 @@ impl KafkaFrameKeys {
                     .min(intent.settled_before.saturating_add(BATCH));
                 for offset in intent.settled_before..stop {
                     let publication = publication_at(&census, offset)?;
-                    withdraw_slot(&keys.name(&ObjectKey::new(format!("frames/{publication}"))?))?;
+                    withdraw_slot(&keys.name(&ObjectKey::new(format!("frames/{publication}"))?), keys.apple_sync)?;
                 }
                 intent.settled_before = stop;
-                intent.write(&intent_path)?;
+                intent.write(&intent_path, keys.apple_sync)?;
                 Ok(stop == retirement.before)
             })
             .await
@@ -225,6 +231,7 @@ fn prepare(
     classic_floor: i64,
     retirement: KafkaPrefixRetirement,
     broker_end: i64,
+    apple_sync: AppleSync,
 ) -> crate::Result<Intent> {
     if retirement.before <= 0 || retirement.before > broker_end {
         return Err(invalid_intent());
@@ -244,20 +251,20 @@ fn prepare(
     if settled_before > retirement.before {
         return Err(invalid_intent());
     }
-    validate_slots(&path.join("positions"), settled_before, retirement.before, broker_end)?;
+    validate_slots(&path.join("positions"), settled_before, retirement.before, broker_end, apple_sync)?;
     Ok(Intent {
         retirement,
         settled_before,
     })
 }
 
-fn validate_slots(census: &Path, from: i64, before: i64, broker_end: i64) -> crate::Result<()> {
+fn validate_slots(census: &Path, from: i64, before: i64, broker_end: i64, apple_sync: AppleSync) -> crate::Result<()> {
     for offset in from..before {
         let marker = retirement_slot(census, publication_at(census, offset)?);
         match retirement_offset(&marker)? {
             Some(prior) if prior == offset => (),
             Some(_) => return Err(aliased_publication()),
-            None => write_kafka_marker(&marker, &offset.to_be_bytes(), false)?,
+            None => write_kafka_marker(&marker, &offset.to_be_bytes(), false, apple_sync)?,
         }
     }
     for offset in before..broker_end {

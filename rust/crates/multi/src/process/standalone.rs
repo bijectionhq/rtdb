@@ -58,6 +58,15 @@ struct Authority {
 /// Creates the authority in an empty, caller-owned staging directory.
 /// The caller publishes the directory only after initialization succeeds.
 pub async fn initialize_standalone(root: &Path, name: &str, id: Uuid) -> Result<()> {
+    initialize_standalone_with_sync(root, name, id, rtdb_storage::AppleSync::Full).await
+}
+
+pub async fn initialize_standalone_with_sync(
+    root: &Path,
+    name: &str,
+    id: Uuid,
+    apple_sync: rtdb_storage::AppleSync,
+) -> Result<()> {
     private_directory(root)?;
     if fs::read_dir(root).map_err(io)?.next().is_some() {
         return Err(invalid(
@@ -70,7 +79,7 @@ pub async fn initialize_standalone(root: &Path, name: &str, id: Uuid) -> Result<
         private_mkdir(&root.join(directory))?;
     }
 
-    let (journal, journal_id) = PreparedJournal::open_for_member(journal_options(root)).await?;
+    let (journal, journal_id) = PreparedJournal::open_for_member(journal_options(root, apple_sync)).await?;
     let journal_id = MemberId(journal_id);
     record.ensemble = vec![journal_id.clone()];
 
@@ -87,8 +96,8 @@ pub async fn initialize_standalone(root: &Path, name: &str, id: Uuid) -> Result<
         key_digest: digest(&key),
     };
     directory.create_deployment(record).await?;
-    write_private(&root.join(AUTHORITY), &authority, true)?;
-    rtdb_storage::sync_directory(root).map_err(io)?;
+    write_private_with_sync(&root.join(AUTHORITY), &authority, Some(apple_sync))?;
+    rtdb_storage::sync_directory(root, apple_sync).map_err(io)?;
     drop(journal);
     Ok(())
 }
@@ -119,6 +128,14 @@ struct Ready<'a> {
 
 pub async fn serve_standalone(
     settings: StandaloneSettings,
+    cancellation: CancellationToken,
+) -> Result<()> {
+    serve_standalone_with_sync(settings, rtdb_storage::AppleSync::Full, cancellation).await
+}
+
+pub async fn serve_standalone_with_sync(
+    settings: StandaloneSettings,
+    apple_sync: rtdb_storage::AppleSync,
     cancellation: CancellationToken,
 ) -> Result<()> {
     private_directory(&settings.root)?;
@@ -161,6 +178,7 @@ pub async fn serve_standalone(
     let mut configuration = NodeConfiguration::from_yaml(&format!(
         "server:\n  host: 127.0.0.1\n  port: 0\nauthn: !SingleRootUser\n  password: \"{password}\"\n"
     ))?;
+    configuration.apple_sync = apple_sync;
     if let Some(flight) = owned_flight_settings(
         settings.owned_flight, settings.flight_control_relations,
         settings.custody_provider_config.as_deref(), &settings.name,
@@ -181,7 +199,7 @@ pub async fn serve_standalone(
     let capabilities = Arc::new(CellSecret::generate()?);
 
     let journal = PreparedJournal::reopen_member(
-        journal_options(&settings.root),
+        journal_options(&settings.root, apple_sync),
         authority.journal.0.clone(),
     )
     .await?;
@@ -353,8 +371,9 @@ fn read_authority(root: &Path, name: &str, id: Uuid) -> Result<Authority> {
     Ok(authority)
 }
 
-fn journal_options(root: &Path) -> ServerOptions {
+fn journal_options(root: &Path, apple_sync: rtdb_storage::AppleSync) -> ServerOptions {
     ServerOptions::new(root.join(JOURNAL), true, ServerOptions::DEFAULT_CACHE_BYTES)
+        .with_apple_sync(apple_sync)
 }
 
 fn digest(key: &[u8; 32]) -> String {
@@ -398,6 +417,14 @@ pub(crate) fn read_bounded(path: &Path, maximum: usize) -> Result<String> {
 }
 
 pub(crate) fn write_private(path: &Path, value: &impl Serialize, durable: bool) -> Result<()> {
+    write_private_with_sync(path, value, durable.then_some(rtdb_storage::AppleSync::Full))
+}
+
+fn write_private_with_sync(
+    path: &Path,
+    value: &impl Serialize,
+    durable: Option<rtdb_storage::AppleSync>,
+) -> Result<()> {
     let mut options = OpenOptions::new();
     options.create_new(true).write(true);
     #[cfg(unix)]
@@ -408,8 +435,8 @@ pub(crate) fn write_private(path: &Path, value: &impl Serialize, durable: bool) 
     let mut file = options.open(path).map_err(io)?;
     let json = serde_json::to_vec(value).map_err(|error| invalid(error.to_string()))?;
     file.write_all(&json).map_err(io)?;
-    if durable {
-        rtdb_storage::sync_file(&file).map_err(io)?;
+    if let Some(apple_sync) = durable {
+        rtdb_storage::sync_file(&file, apple_sync).map_err(io)?;
     }
     Ok(())
 }

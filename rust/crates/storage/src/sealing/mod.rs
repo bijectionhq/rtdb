@@ -431,6 +431,7 @@ impl ObjectStore for EncryptingStore {
     fn s3_publication_address(&self, key: &ObjectKey) -> Option<(rtdb_types::S3ObjectNamespace, String)> {
         self.inner.s3_publication_address(key)
     }
+    fn apple_sync(&self) -> crate::AppleSync { self.inner.apple_sync() }
     fn local_maintenance_store(&self) -> Option<&crate::LocalStore> {
         if self.classic_control.is_some() {
             self.inner.local_maintenance_store()

@@ -4,7 +4,7 @@ use bytes::Bytes;
 use rtdb_format::{database::proto::{DatabaseConfig, LocalLog as LocalLogConfig, LocalStorage, database_config::{Log, Storage}},
     envelope::{SourceBody, SourceMessage}, keys::{CURRENT_STORAGE_VERSION, StorageRoot}, log::proto::AttachDatabase};
 use rtdb_replication::{LocalDefaultRestoreSeed, NativeServingHandle, PublishedCheckpoint};
-use rtdb_storage::{LocalStore, ObjectKey, ObjectStore, log::{LocalLog, LocalLogOptions, Log as Journal, LogOffset}};
+use rtdb_storage::{AppleSync, LocalStore, ObjectKey, ObjectStore, log::{LocalLog, LocalLogOptions, Log as Journal, LogOffset}};
 use rtdb_types::{Anomaly, AnomalyCategory, Result, StorageEpoch, Timestamp, rtdb_v1::Basis};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -75,7 +75,7 @@ pub(crate) fn check_pending_attachment(name: &str, configuration: &DatabaseConfi
 pub(crate) async fn mark_ordered_attachment(database: &Database) -> Result<()> {
     let configuration = database.configuration();
     let Some(install) = read_install(database.name(), configuration)? else { return Ok(()); };
-    let store = LocalStore::open(installation_root(configuration)?)?;
+    let store = LocalStore::open(installation_root(configuration)?)?.with_apple_sync(database.logs.store().apple_sync());
     let result = store.put(&ObjectKey::new(ATTACHED)?, Bytes::copy_from_slice(&install.seed.original_receipt)).await;
     store.close_and_wait().await;
     result?;
@@ -158,6 +158,7 @@ impl super::Node {
         let primary = self.catalog.database("xtdb")?;
         primary.require_writable()?;
         if primary.configuration().external_source.is_some() || !primary.logs.retains_recovery_history() { return Err(unsupported()); }
+        let apple_sync = self.factory.resources.apple_sync();
         let install = match read_terminal(&root)? {
             Some(install) => install,
             None => {
@@ -170,15 +171,15 @@ impl super::Node {
                 let detached = source_handle.materialize_checkpoint_export(receipt, &inbound, cancellation).await?;
                 let staged = directory.path().join("deployment");
                 let storage = StorageRoot::new(CURRENT_STORAGE_VERSION, StorageEpoch(0))?.key();
-                let storage = Arc::new(LocalStore::open(staged.join(storage))?);
+                let storage = Arc::new(LocalStore::open(staged.join(storage))?.with_apple_sync(apple_sync));
                 let seed = detached.seed_local(storage.clone(), *Uuid::new_v4().as_bytes(), self.memory(), cancellation).await?;
                 storage.close_and_wait().await;
                 drop(storage);
-                create_empty_journals(&staged.join(JOURNAL)).await?;
+                create_empty_journals(&staged.join(JOURNAL), apple_sync).await?;
                 seed.validate_original_receipt(receipt)?;
                 let prepared = LocalInstall { source: source.into(), destination: destination.into(), receipt: receipt.to_vec(), seed };
                 let terminal = serde_json::to_vec(&prepared).map_err(invalid)?;
-                let staging = LocalStore::open(&staged)?;
+                let staging = LocalStore::open(&staged)?.with_apple_sync(apple_sync);
                 staging.put(&ObjectKey::new(INSTALL)?, Bytes::from(terminal)).await?;
                 staging.close_and_wait().await;
                 self.catalog.with_current_attachment(&source_database, || {
@@ -186,14 +187,14 @@ impl super::Node {
                     if let Err(error) = fs::rename(&staged, &root)
                         && !root.try_exists().map_err(io)?
                     { return Err(io(error)); }
-                    rtdb_storage::sync_directory(directory.path()).map_err(io)?;
-                    rtdb_storage::sync_directory(&parent).map_err(io)
+                    rtdb_storage::sync_directory(directory.path(), apple_sync).map_err(io)?;
+                    rtdb_storage::sync_directory(&parent, apple_sync).map_err(io)
                 })?;
                 read_terminal(&root)?.ok_or_else(|| invalid("The Local restore terminal did not survive publication"))?
             }
         };
         if !install.matches(source, destination, receipt) { return Err(conflict()); }
-        rtdb_storage::sync_directory(&parent).map_err(io)?;
+        rtdb_storage::sync_directory(&parent, apple_sync).map_err(io)?;
         primary.replication.await_source(primary.logs.latest_source_position()?, cancellation).await?;
         let configuration = install.configuration(&root)?;
         if let Ok(database) = self.catalog.database(destination) {
@@ -245,15 +246,15 @@ impl super::Node {
     }
 }
 
-async fn create_empty_journals(directory: &Path) -> Result<()> {
+async fn create_empty_journals(directory: &Path, apple_sync: AppleSync) -> Result<()> {
     fs::create_dir_all(directory).map_err(io)?;
     for name in ["LOG", "REPLICA_LOG"] {
-        let (log, writer) = LocalLog::open(directory.join(name), LocalLogOptions { maximum_message_bytes: 1 << 20, queue_capacity: 1 })?;
+        let (log, writer) = LocalLog::open_with_sync(directory.join(name), LocalLogOptions { maximum_message_bytes: 1 << 20, queue_capacity: 1 }, apple_sync)?;
         if log.latest()? != LogOffset(-1) { return Err(invalid("The provisioned Local journal is not empty")); }
         drop(writer);
         log.close_and_wait().await;
     }
-    rtdb_storage::sync_directory(directory).map_err(io)
+    rtdb_storage::sync_directory(directory, apple_sync).map_err(io)
 }
 
 fn require_independent_parent(source: &DatabaseConfig, parent: &Path) -> Result<()> {

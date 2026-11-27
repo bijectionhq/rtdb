@@ -7,7 +7,7 @@ use fs2::FileExt;
 use rtdb_format::{catalog::same_publication_digest, keys::is_compacted_primary_file, search_manifest::is_ranged_run};
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, CatalogCut, ReplicaPosition, Result, StorageEpoch};
 
-use crate::{Error, repair_anchor_decision::{self, AnchorInstallation, RecoveryCollection}};
+use crate::{AppleSync, Error, repair_anchor_decision::{self, AnchorInstallation, RecoveryCollection}};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LocalRepairAnchor {
@@ -32,13 +32,18 @@ pub(crate) struct LocalCatalogLedger {
     directory: PathBuf,
     root: Arc<PathBuf>,
     replica_epoch: StorageEpoch,
+    apple_sync: AppleSync,
     search_witness: parking_lot::Mutex<Option<(uuid::Uuid, File)>>,
 }
 
 impl LocalCatalogLedger {
-    pub(crate) fn new(root: Arc<PathBuf>, replica_epoch: StorageEpoch) -> Self {
-        Self { directory: root.join(".tmp/catalog-ledger"), root, replica_epoch,
+    pub(crate) fn new(root: Arc<PathBuf>, replica_epoch: StorageEpoch, apple_sync: AppleSync) -> Self {
+        Self { directory: root.join(".tmp/catalog-ledger"), root, replica_epoch, apple_sync,
             search_witness: parking_lot::Mutex::new(None) }
+    }
+
+    pub(crate) fn with_apple_sync(&self, apple_sync: AppleSync) -> Self {
+        Self::new(Arc::clone(&self.root), self.replica_epoch, apple_sync)
     }
 
     /// Records an installed retirement and closes the publication of each exact path it names, so a retired name is never
@@ -98,7 +103,7 @@ impl LocalCatalogLedger {
     fn install_floor(&self, cut: CatalogCut) -> Result<()> {
         let mut next = tempfile::NamedTempFile::new_in(&self.directory).map_err(|error| Error::io(&self.directory, error))?;
         next.write_all(&serde_json::to_vec(&cut).map_err(invalid)?).map_err(|error| Error::io(next.path(), error))?;
-        crate::sync_file(next.as_file()).map_err(|error| Error::io(next.path(), error))?;
+        crate::sync_file(next.as_file(), self.apple_sync).map_err(|error| Error::io(next.path(), error))?;
         let path = self.directory.join("floor");
         next.persist(&path).map_err(|error| Error::io(&path, error.error))?;
         Ok(())
@@ -133,8 +138,8 @@ impl LocalCatalogLedger {
         fs::create_dir_all(parent).map_err(|error| Error::io(parent, error))?;
         let file = OpenOptions::new().write(true).create(true).truncate(false).open(&path)
             .map_err(|error| Error::io(&path, error))?;
-        crate::sync_file(&file).map_err(|error| Error::io(&path, error))?;
-        crate::sync_directory(parent).map_err(|error| Error::io(parent, error))?;
+        crate::sync_file(&file, self.apple_sync).map_err(|error| Error::io(&path, error))?;
+        crate::sync_directory(parent, self.apple_sync).map_err(|error| Error::io(parent, error))?;
         self.sync_ledger()
     }
 
@@ -147,8 +152,8 @@ impl LocalCatalogLedger {
         let file = OpenOptions::new().write(true).read(true).create_new(true).open(&path)
             .map_err(|error| Error::io(&path, error))?;
         FileExt::lock_exclusive(&file).map_err(|error| Error::io(&path, error))?;
-        crate::sync_file(&file).map_err(|error| Error::io(&path, error))?;
-        crate::sync_directory(&self.directory).map_err(|error| Error::io(&self.directory, error))?;
+        crate::sync_file(&file, self.apple_sync).map_err(|error| Error::io(&path, error))?;
+        crate::sync_directory(&self.directory, self.apple_sync).map_err(|error| Error::io(&self.directory, error))?;
         *live = Some((attachment, file));
         Ok(attachment)
     }
@@ -188,7 +193,7 @@ impl LocalCatalogLedger {
             .map_err(|error| Error::io(&self.directory, error))?;
         staged.write_all(&serde_json::to_vec(&(next.block, next.boundary, next.sha256, next.primary_inventory_sha256)).map_err(invalid)?)
             .map_err(|error| Error::io(staged.path(), error))?;
-        crate::sync_file(staged.as_file()).map_err(|error| Error::io(staged.path(), error))?;
+        crate::sync_file(staged.as_file(), self.apple_sync).map_err(|error| Error::io(staged.path(), error))?;
         let path = self.directory.join("repair-anchor");
         staged.persist(&path).map_err(|error| Error::io(&path, error.error))?;
         self.sync_ledger()
@@ -248,7 +253,7 @@ impl LocalCatalogLedger {
 
     fn sync_ledger(&self) -> Result<()> {
         for directory in [&self.directory, &self.root.join(".tmp"), self.root.as_ref()] {
-            crate::sync_directory(directory).map_err(|error| Error::io(directory, error))?;
+            crate::sync_directory(directory, self.apple_sync).map_err(|error| Error::io(directory, error))?;
         }
         Ok(())
     }
@@ -316,7 +321,7 @@ mod tests {
     fn a_retirement_releases_every_candidate_and_closes_each_exact_name_for_good() {
         let root = tempfile::tempdir().unwrap();
         let epoch = StorageEpoch(0);
-        let ledger = LocalCatalogLedger::new(Arc::new(root.path().to_owned()), epoch);
+        let ledger = LocalCatalogLedger::new(Arc::new(root.path().to_owned()), epoch, AppleSync::Full);
         let name = |block| TableSlug::recorded("public$docs").unwrap()
             .data_key(&TrieKey::new(1, None, Vec::new(), BlockIndex(block)).unwrap());
         let (retired, other) = (name(2), name(3));
@@ -331,7 +336,7 @@ mod tests {
     fn only_an_erasure_floor_refuses_an_older_catalog() {
         let root = tempfile::tempdir().unwrap();
         let epoch = StorageEpoch(0);
-        let ledger = LocalCatalogLedger::new(Arc::new(root.path().to_owned()), epoch);
+        let ledger = LocalCatalogLedger::new(Arc::new(root.path().to_owned()), epoch, AppleSync::Full);
         ledger.close_erasure_admission(cut(epoch, 8)).unwrap();
         assert_eq!(ledger.require_erasure_admission(Some(cut(epoch, 7))).unwrap_err().code, "rtdb/erased-under-view");
         assert_eq!(ledger.require_erasure_admission(None).unwrap_err().code, "rtdb/erased-under-view");

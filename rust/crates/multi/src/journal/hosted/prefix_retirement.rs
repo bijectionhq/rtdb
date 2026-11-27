@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use ordered_logkeeper::ordered::{Cut, Grant, service::Route};
-use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectStore, sync_directory};
+use rtdb_storage::{AppleSync, Error, IoRegion, ObjectKey, ObjectStore, sync_directory};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -179,9 +179,9 @@ fn local_error(path: &Path, error: std::io::Error) -> Anomaly {
     Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/serving-prefix-local", format!("{}: {error}", path.display()))
 }
 
-fn sync_up(root: &Path, mut directory: PathBuf) -> Result<()> {
+fn sync_up(root: &Path, mut directory: PathBuf, apple_sync: AppleSync) -> Result<()> {
     loop {
-        sync_directory(&directory).map_err(|error| local_error(&directory, error))?;
+        sync_directory(&directory, apple_sync).map_err(|error| local_error(&directory, error))?;
         if directory == root || !directory.pop() { return Ok(()); }
     }
 }
@@ -259,10 +259,16 @@ async fn superseded_prefixes(provider: &Provider, placement: &Placement, route: 
 /// Retires every superseded serving prefix that the evidence covers and
 /// reports, per epoch, what this pass established.
 pub(crate) async fn retire(placement: &Placement, storage: &CellStorage, keys: &Arc<dyn KeyService>) -> Result<Vec<(u64, Outcome)>> {
+    retire_with_sync(placement, storage, keys, AppleSync::Full).await
+}
+
+pub(crate) async fn retire_with_sync(
+    placement: &Placement, storage: &CellStorage, keys: &Arc<dyn KeyService>, apple_sync: AppleSync,
+) -> Result<Vec<(u64, Outcome)>> {
     let Some(custodian) = placement.custodian.as_ref() else { return Ok(Vec::new()); };
     let route = custodian.route().await?;
     let erasure = if route.erasure_floor != 0 {
-        let custody = placement.checkpoint_custody(IoRegion::new(), Arc::clone(keys)).await?;
+        let custody = placement.checkpoint_custody_with_sync(IoRegion::new(), Arc::clone(keys), apple_sync).await?;
         let Some(through) = super::erasure::serving_retirement_epoch(&custody, route.placement, route.erasure_floor).await? else {
             return Ok(Vec::new());
         };
@@ -274,7 +280,7 @@ pub(crate) async fn retire(placement: &Placement, storage: &CellStorage, keys: &
         None
     };
     let Some(provider) = Provider::qualify(storage).await? else { return Ok(Vec::new()); };
-    let bucket = storage.bucket(IoRegion::new()).await?;
+    let bucket = storage.bucket_with_sync(IoRegion::new(), apple_sync).await?;
     let (epochs, receipts) = serving_retirement_inventory(&provider, placement, bucket.as_ref(), &route).await?;
     let mut candidates = Vec::new();
     for epoch in epochs {
@@ -431,12 +437,13 @@ async fn retire_one(one: RetireOne<'_>) -> Result<Outcome> {
 
     match provider {
         Provider::Local(root) => {
+            let apple_sync = bucket.apple_sync();
             let lock = lock.ok_or_else(|| unavailable("The local prefix lock was not acquired"))?;
             let lifecycle = lifecycle_path(root, prefix)?;
             let digest = serde_json::to_vec(&intent).map_err(|error| Anomaly::fault("rtdb.multi/serving-prefix-retirement", error.to_string()))?;
             let lifetime: Arc<dyn Send + Sync> = Arc::new(lock);
             let io = IoRegion::new().child_holding(Some(lifetime));
-            let state = rtdb_storage::LocalStore::open_in(&lifecycle, Arc::clone(&io))?;
+            let state = rtdb_storage::LocalStore::open_in(&lifecycle, Arc::clone(&io))?.with_apple_sync(apple_sync);
             let closed = ObjectKey::new(CLOSED)?;
             match state.get_fresh(&closed).await {
                 Ok(existing) if existing.as_ref() == digest.as_slice() => {}
@@ -446,7 +453,7 @@ async fn retire_one(one: RetireOne<'_>) -> Result<Outcome> {
             }
             let volume = root.clone();
             io.run_blocking(move || {
-                sync_up(&volume, lifecycle).map_err(|error| Error::Task(error.to_string()))
+                sync_up(&volume, lifecycle, apple_sync).map_err(|error| Error::Task(error.to_string()))
             }).await?;
             let ledger = super::storage::serving_ledger(
                 Arc::clone(keys), placement.worker.placement(), identity, objects, Arc::clone(&io),
@@ -461,7 +468,7 @@ async fn retire_one(one: RetireOne<'_>) -> Result<Outcome> {
                     Err(source) => return Err(Error::Io { path: prefix_path.clone(), source }),
                 }
                 if let Some(parent) = prefix_path.parent() {
-                    sync_up(&root, parent.to_path_buf()).map_err(|error| Error::Task(error.to_string()))?;
+                    sync_up(&root, parent.to_path_buf(), apple_sync).map_err(|error| Error::Task(error.to_string()))?;
                 }
                 Ok(())
             }).await?;

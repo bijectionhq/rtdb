@@ -2,7 +2,7 @@
 
 use crate::keys::{UnitLedger, UnitOperation};
 use bytes::Bytes;
-use rtdb_storage::{Error, IoRegion, LocalStore, ObjectKey, ObjectStore, sync_directory};
+use rtdb_storage::{AppleSync, Error, IoRegion, LocalStore, ObjectKey, ObjectStore, sync_directory};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use std::fs::{self, OpenOptions, TryLockError};
 use std::io;
@@ -13,6 +13,7 @@ use super::{Fingerprint, invalid};
 
 pub(super) struct LocalArchive {
     root: PathBuf,
+    apple_sync: AppleSync,
 }
 
 pub(super) struct Allocation<'a> {
@@ -26,7 +27,12 @@ pub(super) struct Allocation<'a> {
 impl LocalArchive {
     pub(super) fn new(root: &Path) -> Result<Self> {
         let root = root.canonicalize().map_err(local_error)?;
-        Ok(Self { root })
+        Ok(Self { root, apple_sync: AppleSync::Full })
+    }
+
+    pub(super) fn with_apple_sync(mut self, apple_sync: AppleSync) -> Self {
+        self.apple_sync = apple_sync;
+        self
     }
 
     pub(super) async fn acquire<'a>(
@@ -70,7 +76,7 @@ impl LocalArchive {
         let state = LocalStore::open_in(
             self.root.join(format!("{relative}.lifecycle")),
             Arc::clone(&io),
-        )?;
+        )?.with_apple_sync(self.apple_sync);
         Ok(Allocation {
             archive: self,
             scope,
@@ -103,7 +109,7 @@ impl Allocation<'_> {
     }
 
     pub(super) fn read_store(&self, ledger: UnitLedger) -> Result<Arc<dyn ObjectStore>> {
-        let raw = LocalStore::open_in(&self.archive.root, self.region())?;
+        let raw = LocalStore::open_in(&self.archive.root, self.region())?.with_apple_sync(self.archive.apple_sync);
         Ok(Arc::new(crate::store::EncryptingStore::with_units(
             Arc::new(raw),
             Arc::new(ledger),
@@ -112,6 +118,7 @@ impl Allocation<'_> {
 
     pub(super) async fn sync_existing(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
         LocalStore::open_in(&self.archive.root, Arc::clone(&self.io))?
+            .with_apple_sync(self.archive.apple_sync)
             .sync_existing(key)
             .await
     }
@@ -123,10 +130,11 @@ impl Allocation<'_> {
             .ok_or_else(|| Error::InvalidKey(self.scope.into()))?
             .to_path_buf();
         let root = self.archive.root.clone();
+        let apple_sync = self.archive.apple_sync;
         self.io
             .run_blocking(move || {
                 loop {
-                    sync_directory(&directory).map_err(|source| Error::Io {
+                    sync_directory(&directory, apple_sync).map_err(|source| Error::Io {
                         path: directory.clone(),
                         source,
                     })?;
@@ -160,7 +168,7 @@ impl Allocation<'_> {
         let relative = ObjectKey::new(relative)?;
         // Puts use the allocation's own scratch directory. The I/O region
         // holds the file lock through cancellation of any blocking write.
-        let data = LocalStore::open_in(&self.data, Arc::clone(&self.io))?;
+        let data = LocalStore::open_in(&self.data, Arc::clone(&self.io))?.with_apple_sync(self.archive.apple_sync);
         let existing = match data.get_fresh(&relative).await {
             Ok(sealed) => sealed,
             Err(Error::MissingObject(_)) => {

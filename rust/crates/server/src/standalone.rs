@@ -19,7 +19,7 @@ use rtdb_node::{
 };
 use rtdb_replication::Role;
 use rtdb_storage::{
-    IoRegion,
+    AppleSync, IoRegion,
     log::{
         AppendTimestampSource, LocalLogOptions, Log as _, ReadOnlyLocalLog, ReadOnlyLocalLogOptions,
     },
@@ -98,7 +98,7 @@ impl Target {
         Ok(())
     }
 
-    fn configuration(&self) -> Result<NodeConfiguration> {
+    fn configuration(&self, apple_sync: AppleSync) -> Result<NodeConfiguration> {
         let path = |name| {
             self.state
                 .join(name)
@@ -107,6 +107,7 @@ impl Target {
                 .map_err(|_| invalid("Standalone paths must be UTF-8"))
         };
         let mut config = NodeConfiguration::from_yaml_with_environment("", &|_| None, false)?;
+        config.apple_sync = apple_sync;
         config.primary.log = Some(Log::LocalLog(LocalLog {
             path: Some(path(LOGS)?),
             epoch: Some(0),
@@ -126,8 +127,9 @@ impl Target {
         Ok(config)
     }
 
-    fn resources(&self, tokens: FileKms, checkpoints: Arc<FileKms>) -> NativeResources {
+    fn resources(&self, tokens: FileKms, checkpoints: Arc<FileKms>, apple_sync: AppleSync) -> NativeResources {
         NativeResources::default()
+            .with_apple_sync(apple_sync)
             .with_token_kms(Arc::new(tokens))
             .with_native_serving_authority(
                 self.name.clone(),
@@ -168,6 +170,10 @@ impl Target {
 }
 
 pub async fn initialize(target: Target) -> Result<()> {
+    initialize_with_sync(target, AppleSync::Full).await
+}
+
+pub async fn initialize_with_sync(target: Target, apple_sync: AppleSync) -> Result<()> {
     target.validate()?;
     private_directory(&target.state)?;
     if fs::read_dir(&target.state)
@@ -179,7 +185,7 @@ pub async fn initialize(target: Target) -> Result<()> {
             "Standalone initialization requires an empty private staging directory",
         ));
     }
-    let config = target.configuration()?;
+    let config = target.configuration(apple_sync)?;
     for name in [LOGS, OBJECTS, TOKEN_KEYS, CHECKPOINT_KEYS] {
         let mut directory = fs::DirBuilder::new();
         #[cfg(unix)]
@@ -192,10 +198,10 @@ pub async fn initialize(target: Target) -> Result<()> {
             .map_err(io_error)?;
     }
 
-    let source_lineage = initialize_journal(&target.state.join(LOGS).join(SOURCE)).await?;
-    let replica_lineage = initialize_journal(&target.state.join(LOGS).join(REPLICA)).await?;
+    let source_lineage = initialize_journal(&target.state.join(LOGS).join(SOURCE), apple_sync).await?;
+    let replica_lineage = initialize_journal(&target.state.join(LOGS).join(REPLICA), apple_sync).await?;
     let (tokens, checkpoints) = open_keys(&target.state)?;
-    let resources = target.resources(tokens, Arc::clone(&checkpoints));
+    let resources = target.resources(tokens, Arc::clone(&checkpoints), apple_sync);
     let (handle, driver) =
         ServerDriver::open_installed(config, ALLOCATION_LIMIT, resources, None).await?;
     let witness = async {
@@ -226,11 +232,15 @@ pub async fn initialize(target: Target) -> Result<()> {
             token_witness,
             checkpoint_witness,
         },
-        true,
+        Some(apple_sync),
     )
 }
 
 pub async fn serve(launch: Launch, stop: CancellationToken) -> Result<()> {
+    serve_with_sync(launch, AppleSync::Full, stop).await
+}
+
+pub async fn serve_with_sync(launch: Launch, apple_sync: AppleSync, stop: CancellationToken) -> Result<()> {
     let target = &launch.target;
     target.validate()?;
     private_directory(&target.state)?;
@@ -325,7 +335,7 @@ pub async fn serve(launch: Launch, stop: CancellationToken) -> Result<()> {
         return Ok(());
     }
 
-    let mut config = target.configuration()?;
+    let mut config = target.configuration(apple_sync)?;
     config.auth = AuthConfig::SingleRootUser {
         password: Some(password),
     };
@@ -334,7 +344,7 @@ pub async fn serve(launch: Launch, stop: CancellationToken) -> Result<()> {
     let (handle, driver) = ServerDriver::open_installed(
         config,
         ALLOCATION_LIMIT,
-        target.resources(tokens, checkpoints),
+        target.resources(tokens, checkpoints, apple_sync),
         Some(tls),
     )
     .await?;
@@ -377,7 +387,7 @@ pub async fn serve(launch: Launch, stop: CancellationToken) -> Result<()> {
             if stop.is_cancelled() {
                 return Ok(());
             }
-            publish_json(&launch.ready_file, &ready, false)?;
+            publish_json(&launch.ready_file, &ready, None)?;
             let _acknowledgement = ReadyFile(&launch.ready_file);
             stop.cancelled().await;
             Ok(())
@@ -476,8 +486,8 @@ impl AppendTimestampSource for JournalTimestamp {
     }
 }
 
-async fn initialize_journal(path: &Path) -> Result<Uuid> {
-    let (log, driver) = rtdb_storage::log::LocalLog::open_replica(
+async fn initialize_journal(path: &Path, apple_sync: AppleSync) -> Result<Uuid> {
+    let (log, driver) = rtdb_storage::log::LocalLog::open_replica_with_sync(
         path,
         LocalLogOptions {
             maximum_message_bytes: ReadOnlyLocalLogOptions::default().maximum_message_bytes,
@@ -486,6 +496,7 @@ async fn initialize_journal(path: &Path) -> Result<Uuid> {
         Arc::new(JournalTimestamp),
         IoRegion::new(),
         None,
+        apple_sync,
     )?;
     drop(driver);
     log.close_and_wait().await;
@@ -556,18 +567,18 @@ fn parent(path: &Path) -> &Path {
         .unwrap_or(Path::new("."))
 }
 
-fn publish_json(path: &Path, value: &impl Serialize, durable: bool) -> Result<()> {
+fn publish_json(path: &Path, value: &impl Serialize, durable: Option<AppleSync>) -> Result<()> {
     let mut staged = tempfile::NamedTempFile::new_in(parent(path)).map_err(io_error)?;
     serde_json::to_writer(&mut staged, value).map_err(|error| invalid(error.to_string()))?;
     staged.flush().map_err(io_error)?;
-    if durable {
-        rtdb_storage::sync_file(staged.as_file()).map_err(io_error)?;
+    if let Some(apple_sync) = durable {
+        rtdb_storage::sync_file(staged.as_file(), apple_sync).map_err(io_error)?;
     }
     staged
         .persist_noclobber(path)
         .map_err(|error| io_error(error.error))?;
-    if durable {
-        rtdb_storage::sync_directory(parent(path)).map_err(io_error)?;
+    if let Some(apple_sync) = durable {
+        rtdb_storage::sync_directory(parent(path), apple_sync).map_err(io_error)?;
     }
     Ok(())
 }

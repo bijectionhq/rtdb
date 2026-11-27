@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use futures::{FutureExt, future::BoxFuture};
 use prost_types::Any;
 use rtdb_format::{database::proto::{DatabaseConfig, database_config}, keys::{CURRENT_STORAGE_VERSION, StorageRoot}};
-use rtdb_storage::{IoRegion, LocalStore, MemoryStore, ObjectKey, ObjectStore, log::{AppendTimestampSource, LocalLog, LocalLogOptions, Log, MemoryLog, ReadOnlyLocalLog, ReadOnlyLocalLogOptions}};
+use rtdb_storage::{AppleSync, IoRegion, LocalStore, MemoryStore, ObjectKey, ObjectStore, log::{AppendTimestampSource, LocalLog, LocalLogOptions, Log, MemoryLog, ReadOnlyLocalLog, ReadOnlyLocalLogOptions}};
 use rtdb_storage::disk_cache::DiskCache;
 use rtdb_types::{Anomaly, Result, SourcePosition, StorageEpoch, StorageVersion, Timestamp};
 use tokio_util::sync::CancellationToken;
@@ -173,6 +173,7 @@ pub enum DeploymentTransfer {
 #[async_trait]
 pub trait ResourceFactory: Send + Sync {
     fn supports_default_local_restore(&self) -> bool { false }
+    fn apple_sync(&self) -> AppleSync { AppleSync::Full }
     /// Provisions or recovers an ordered registration before the node attaches it.
     async fn provision_managed_database(&self, _name: &str, _expected: Option<uuid::Uuid>) -> Result<(DatabaseConfig, uuid::Uuid)> {
         Err(Anomaly::unsupported("rtdb/deployment-catalog", "The runtime has no ordered deployment catalog"))
@@ -269,6 +270,7 @@ pub struct NativeResources {
     memory_transaction_clock: Option<Arc<TransactionClock>>,
     local_log_clock: Arc<TransactionClock>,
     local_log_uses_clock_for_non_transactions: bool,
+    apple_sync: AppleSync,
     serving_authorities: NativeServingAuthorities,
 }
 
@@ -277,11 +279,13 @@ impl Default for NativeResources {
         Self { maximum_log_message_bytes: 64 * 1024 * 1024, log_queue_capacity: 64, read_only_log: ReadOnlyLocalLogOptions::default(),
             log_factories: BTreeMap::new(), storage_factories: BTreeMap::new(), disk_cache: None, classic_vault: None, token_kms: None, native_checkpoint_kms: None, local_checkpoint_vault: None, kafka_checkpoint_vault: None, io: IoRegion::new(),
             memory_transaction_clock: None, local_log_clock: Arc::new(|| Ok(crate::Clock::now(&crate::SystemClock))), local_log_uses_clock_for_non_transactions: false,
+            apple_sync: AppleSync::Full,
             serving_authorities: BTreeMap::new() }
     }
 }
 
 impl NativeResources {
+    pub fn with_apple_sync(mut self, apple_sync: AppleSync) -> Self { self.apple_sync = apple_sync; self }
     pub fn with_disk_cache(mut self, cache: Arc<DiskCache>) -> Self { self.disk_cache = Some(cache); self }
     pub fn with_token_kms(mut self, kms: Arc<dyn rtdb_crypt::Kms>) -> Self {
         self.token_kms = Some(kms);
@@ -349,9 +353,9 @@ impl NativeResources {
         let timestamps = Arc::new(NativeLogTimestamps { clock: Arc::clone(&self.local_log_clock), source, use_for_non_transactions: self.local_log_uses_clock_for_non_transactions });
         let options = LocalLogOptions { maximum_message_bytes: self.maximum_log_message_bytes, queue_capacity: self.log_queue_capacity };
         let (log, driver) = if bind_lineage {
-            LocalLog::open_replica(path, options, timestamps, io, keys)?
+            LocalLog::open_replica_with_sync(path, options, timestamps, io, keys, self.apple_sync)?
         } else {
-            LocalLog::open_with_key_slots(path, options, timestamps, io, keys)?
+            LocalLog::open_with_key_slots_and_sync(path, options, timestamps, io, keys, self.apple_sync)?
         };
         Ok((log, Some(async move { driver.run(cancellation).await.map_err(Into::into) }.boxed())))
     }
@@ -402,6 +406,7 @@ pub(crate) fn validate_database_shape(name: &str, configuration: &DatabaseConfig
 #[async_trait]
 impl ResourceFactory for NativeResources {
     fn supports_default_local_restore(&self) -> bool { self.classic_vault.is_none() && self.native_checkpoint_kms.is_none() }
+    fn apple_sync(&self) -> AppleSync { self.apple_sync }
     fn token_kms(&self) -> Option<Arc<dyn rtdb_crypt::Kms>> { self.token_kms.clone() }
 
     fn native_checkpoint_kms(&self) -> Option<Arc<dyn rtdb_crypt::Kms>> { self.native_checkpoint_kms.clone() }
@@ -475,9 +480,10 @@ impl ResourceFactory for NativeResources {
                 let path = PathBuf::from(storage.path.as_deref().ok_or_else(|| invalid("Local storage has no path"))?);
                 let exclusive = kafka_erasure_vault.is_some()
                     || local_erasure_vault.is_some() && matches!(log, Some(database_config::Log::LocalLog(_)));
+                let apple_sync = self.apple_sync;
                 Some(Arc::new(self.io.run_blocking(move || {
                     std::fs::create_dir_all(&path).map_err(|error| rtdb_storage::Error::Task(error.to_string()))?;
-                    rtdb_storage::sealing::open_local_residence(&path, exclusive)
+                    rtdb_storage::sealing::open_local_residence(&path, exclusive, apple_sync)
                 }).await?) as Arc<dyn Send + Sync>)
             }
             _ => None,
@@ -501,7 +507,7 @@ impl ResourceFactory for NativeResources {
                 None | Some(database_config::Storage::InMemoryStorage(_)) => Arc::new(MemoryStore::default()),
                 Some(database_config::Storage::LocalStorage(storage)) => {
                     let payload = PathBuf::from(storage.path.as_deref().ok_or_else(|| invalid("Local storage has no path"))?);
-                    let store = LocalStore::open_in(payload.join(root.as_str()), Arc::clone(&io))?;
+                    let store = LocalStore::open_in(payload.join(root.as_str()), Arc::clone(&io))?.with_apple_sync(self.apple_sync);
                     let kafka_erasure_epoch = if let (Some(_), Some(log)) = (kafka_erasure_vault, kafka) {
                         Some(kafka_log_epoch(log)?)
                     } else { None };
