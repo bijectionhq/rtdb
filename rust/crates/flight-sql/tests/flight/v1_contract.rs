@@ -176,6 +176,55 @@ async fn store_sizes_reports_the_committed_version_and_checks_incarnation() {
     running.stop().await;
 }
 
+#[tokio::test]
+async fn default_store_reads_every_range_at_the_selected_retained_version() {
+    use rtdb_flight_sql::rtdb::store::v1 as store;
+    use rtdb_node::serving::NativeServingAuthority;
+
+    let incarnation = [52; 16];
+    let resources: FixtureResources = Box::new(move |clock| Arc::new(super::fixture_resources(clock)
+        .with_native_serving_authority("xtdb", NativeServingAuthority { incarnation, checkpoints: None })));
+    let config = FlightConfig { store_only: true, ..Default::default() };
+    let running = Running::start_with_clocked_resources(
+        None, config, &[], None, Default::default(), None, Some(resources),
+    ).await;
+    let mut status = running.node.catalog().database("xtdb").unwrap().watch_status();
+    tokio::time::timeout(Duration::from_secs(5), status.wait_for(|status| {
+        matches!(status.role, rtdb_replication::Role::Leading(_))
+    })).await.unwrap().unwrap();
+    let mut client = Client::connect(&running.server, None).await;
+
+    let mut versions = Vec::new();
+    for value in [1, 2] {
+        let writes = [b"ax", b"cz"].into_iter().map(|key| store::Write {
+            key: key.to_vec(), value: Some(vec![value]), ..Default::default()
+        }).collect();
+        let append = store::AppendRequest {
+            key: vec![value; 16], incarnation: incarnation.to_vec(), writes, ..Default::default()
+        };
+        let replies = client.action("rtdb.store.v1.Append", append.encode_to_vec().into()).await.unwrap();
+        let reply = store::AppendReply::decode(replies[0].body.clone()).unwrap();
+        let Some(store::append_reply::Outcome::Committed(stamp)) = reply.outcome else { panic!("expected commit"); };
+        versions.push(stamp.version);
+    }
+
+    let range = |start, end| store::KeyRange { start: vec![start], end: Some(vec![end]) };
+    for (at, version, value) in [(Some(versions[0]), versions[0], 1), (None, versions[1], 2)] {
+        let read = store::ReadRequest {
+            ranges: vec![range(b'c', b'd'), range(b'b', b'c'), range(b'a', b'b')],
+            incarnation: incarnation.to_vec(), at, limit: 1, ..Default::default()
+        };
+        let replies = client.action("rtdb.store.v1.Read", read.encode_to_vec().into()).await.unwrap();
+        let reply = store::ReadReply::decode(replies[0].body.clone()).unwrap();
+        assert_eq!(reply.incarnation, incarnation);
+        assert_eq!(reply.at, version);
+        let pages: Vec<_> = reply.pages.into_iter().map(|page| page.entries).collect();
+        let entry = |key: &[u8]| store::Entry { key: key.to_vec(), value: Some(vec![value]), written: version };
+        assert_eq!(pages, [vec![entry(b"cz")], vec![], vec![entry(b"ax")]]);
+    }
+    running.stop().await;
+}
+
 #[cfg(feature = "multi")]
 #[path = "managed_workload_qualification.rs"]
 mod managed_workload_qualification;

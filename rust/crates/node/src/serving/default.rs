@@ -24,6 +24,17 @@ pub(crate) struct DefaultServing {
 }
 
 impl DefaultServing {
+    async fn store_snapshot(&self, at: At, cancellation: &CancellationToken) -> Result<NativeServingView> {
+        if self.handle.has_classic_read() || !self.handle.is_compatible() {
+            return Err(Anomaly::unsupported("rtdb.store/unsupported", "This database does not serve the ordered-bytes store"));
+        }
+        let snapshot = self.handle.view(at, cancellation).await?;
+        if snapshot.index.has_custody_groups() || snapshot.index.has_visibility_history() {
+            return Err(Anomaly::unsupported("rtdb.store/unsupported", "The ordered-bytes store serves only an unlabelled database"));
+        }
+        Ok(snapshot)
+    }
+
     async fn open_change_page(&self, view: &NativeServingView, mut page: ChangePage) -> Result<ChangePage> {
         page.key_generation = view.key_generation;
         page.read_custody = view.read_custody.clone();
@@ -172,15 +183,20 @@ impl ServingDriver for DefaultServing {
     async fn read_store(
         &self, read: StoreRead, at: At, now: Timestamp, cancellation: &CancellationToken,
     ) -> Result<StorePage> {
-        if self.handle.has_classic_read() || !self.handle.is_compatible() {
-            return Err(Anomaly::unsupported("rtdb.store/unsupported", "This database does not serve the ordered-bytes store"));
-        }
-        let snapshot = self.handle.view(at, cancellation).await?;
-        if snapshot.index.has_custody_groups() || snapshot.index.has_visibility_history() {
-            return Err(Anomaly::unsupported("rtdb.store/unsupported", "The ordered-bytes store serves only an unlabelled database"));
-        }
+        let snapshot = self.store_snapshot(at, cancellation).await?;
         let at = if at == At::Linearizable { At::Latest } else { at };
         snapshot.index.view(rtdb_types::rtdb_v1::MAIN_BRANCH, at, Layer::Merged, now)?.store_page(&read)
+    }
+
+    async fn read_store_batch(
+        &self, reads: &mut (dyn ExactSizeIterator<Item = StoreRead> + Send),
+        at: At, now: Timestamp, cancellation: &CancellationToken,
+    ) -> Result<Vec<StorePage>> {
+        if reads.len() == 0 { return Ok(Vec::new()); }
+        let snapshot = self.store_snapshot(at, cancellation).await?;
+        let at = if at == At::Linearizable { At::Latest } else { at };
+        let view = snapshot.index.view(rtdb_types::rtdb_v1::MAIN_BRANCH, at, Layer::Merged, now)?;
+        reads.map(|read| view.store_page(&read)).collect()
     }
 
     async fn store_sizes(&self, epoch: Option<u64>, now: Timestamp, cancellation: &CancellationToken) -> Result<StorageSizes> {

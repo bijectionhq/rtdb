@@ -186,6 +186,8 @@ surface StatelessDatabase {
     @guarantee StandaloneStoreContract
         -- A standalone installation's Flight listener serves rtdb.store.v1 and rtdb.admin.v1 of the v1 surface, and nothing else of it.
         -- It refuses every other rtdb.v1 action and every rtdb.v1 query or changes ticket.
+        -- A Default Store Read materializes every range from one captured retained view at its selected version.
+        -- Each range batch in Default Rank uses the same retained view for all of its pages.
 
     @guarantee StoreReleaseAgreement
         -- A caller offers one store release in the x-rtdb-store-release metadata of a new Flight handshake using verified credentials.

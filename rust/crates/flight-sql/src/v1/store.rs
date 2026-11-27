@@ -68,8 +68,6 @@ pub(crate) fn check_rank_digest() -> rtdb_types::Result<()> {
     Ok(())
 }
 
-/// The store's ordered entries as the ranges `store_read` reads: each read
-/// takes one cut, selected by its first range, as `Read` does.
 struct StoreRanges<'a> {
     service: &'a Service,
     driver: &'a dyn rtdb_node::serving::ServingDriver,
@@ -82,7 +80,7 @@ struct StoreRanges<'a> {
 impl store_read::source::RangeSource for StoreRanges<'_> {
     fn read(&self, read: store_read::source::RangeRead) -> impl std::future::Future<Output = anyhow::Result<store_read::source::RangePages>> + Send {
         async move {
-            let mut at = read.at.map_or(At::Latest, |at| At::Exactly(Basis::new(self.incarnation, at.0)));
+            let at = read.at.map_or(At::Latest, |at| At::Exactly(Basis::new(self.incarnation, at.0)));
             let limit = read.limit.clamp(1, MAX_PAGE_ENTRIES);
             let read_ranges: Vec<_> = read.ranges.into_iter()
                 .map(|range| KeyRange { start: range.start, end: range.end })
@@ -91,24 +89,21 @@ impl store_read::source::RangeSource for StoreRanges<'_> {
                 range.check().map_err(error::anomaly)?;
             }
             reads_within(self.scope, &read_ranges)?;
-            let mut pages = Vec::with_capacity(read_ranges.len());
-            let mut read_at = None;
-            for range in read_ranges {
+            let mut reads = read_ranges.into_iter().map(|range| {
                 let after = read.after.clone().filter(|after| range.contains(after));
-                let request = StoreRead { range, after, limit, projection: Projection::Values, filter: None, reverse: false };
-                let page = self.service.read_store_page(self.driver, request, at, self.now, self.cancellation).await?;
-                at = At::Exactly(page.cut.basis);
-                read_at = Some(page.cut.basis.position());
-                pages.push(store_read::source::RangePage {
-                    entries: page.entries.into_iter().map(|entry| store_read::store::Entry {
-                        key: entry.key,
-                        value: entry.value,
-                        written: store_read::store::Version(entry.written.position()),
-                    }).collect(),
-                    resume: page.resume,
-                });
-            }
-            Ok(store_read::source::RangePages { at: store_read::store::Version(read_at.unwrap_or_default()), pages })
+                StoreRead { range, after, limit, projection: Projection::Values, filter: None, reverse: false }
+            });
+            let pages = self.service.read_store_batch(self.driver, &mut reads, at, self.now, self.cancellation).await?;
+            let at = store_read::store::Version(pages.last().map_or(0, |page| page.cut.basis.position()));
+            let pages = pages.into_iter().map(|page| store_read::source::RangePage {
+                entries: page.entries.into_iter().map(|entry| store_read::store::Entry {
+                    key: entry.key,
+                    value: entry.value,
+                    written: store_read::store::Version(entry.written.position()),
+                }).collect(),
+                resume: page.resume,
+            }).collect();
+            Ok(store_read::source::RangePages { at, pages })
         }
     }
 }
@@ -194,15 +189,23 @@ impl Service {
         Ok((database, current, scope))
     }
 
-    async fn read_store_page(
-        &self, driver: &dyn rtdb_node::serving::ServingDriver, read: StoreRead, at: At, now: Timestamp,
+    async fn read_store_batch(
+        &self, driver: &dyn rtdb_node::serving::ServingDriver,
+        reads: &mut (dyn ExactSizeIterator<Item = StoreRead> + Send), at: At, now: Timestamp,
         cancellation: &tokio_util::sync::CancellationToken,
-    ) -> Result<StorePage, Status> {
+    ) -> Result<Vec<StorePage>, Status> {
         #[cfg(feature = "multi")]
         if let Some(follower) = self.follower() {
-            return follower.reader.read_store(read, at, now, cancellation).await.map_err(error::follower);
+            let mut at = at;
+            let mut pages = Vec::with_capacity(reads.len());
+            for read in reads {
+                let page = follower.reader.read_store(read, at, now, cancellation).await.map_err(error::follower)?;
+                at = At::Exactly(page.cut.basis);
+                pages.push(page);
+            }
+            return Ok(pages);
         }
-        driver.read_store(read, at, now, cancellation).await.map_err(error::anomaly)
+        driver.read_store_batch(reads, at, now, cancellation).await.map_err(error::anomaly)
     }
 
     async fn store_read(&self, call: &Call, request: proto::ReadRequest) -> Result<Vec<u8>, Status> {
@@ -216,7 +219,7 @@ impl Service {
         let read_ranges = ranges(request.ranges)?;
         reads_within(scope, &read_ranges)?;
         let driver = database.serving_driver().ok_or_else(|| error::unsupported("rtdb.store.v1"))?;
-        let mut at = request.at.map_or(At::Latest, |at| At::Exactly(Basis::new(incarnation, at)));
+        let at = request.at.map_or(At::Latest, |at| At::Exactly(Basis::new(incarnation, at)));
         let limit = (request.limit as usize).clamp(1, MAX_PAGE_ENTRIES);
         let projection = match proto::Projection::try_from(request.projection)
             .map_err(|_| error::incorrect("Invalid store projection"))?
@@ -229,27 +232,23 @@ impl Service {
             .map(ValueFilter::decode)
             .transpose()
             .map_err(|refused| error::incorrect(&refused.to_string()))?;
-        let mut pages = Vec::with_capacity(read_ranges.len());
-        let mut read_at = None;
+        let mut reads = read_ranges.into_iter().map(|range| {
+            let after = request.after.clone().filter(|after| range.contains(after));
+            StoreRead { range, after, limit, projection, filter: filter.clone(), reverse: request.reverse }
+        });
         let clock = self.0.node.now();
-        for key_range in read_ranges {
-            let after = request.after.clone().filter(|after| key_range.contains(after));
-            let read = StoreRead { range: key_range, after, limit, projection, filter: filter.clone(), reverse: request.reverse };
-            let page = self.read_store_page(driver, read, at, clock, &call.cancellation).await?;
-            // Every later range reads the cut the first one selected.
-            at = At::Exactly(page.cut.basis);
-            read_at = Some(page.cut.basis.position());
-            pages.push(proto::RangePage {
-                entries: page.entries.into_iter().map(|entry| proto::Entry {
-                    key: entry.key, value: entry.value, written: entry.written.position(),
-                }).collect(),
-                resume: page.resume,
-            });
-        }
+        let pages = self.read_store_batch(driver, &mut reads, at, clock, &call.cancellation).await?;
+        let at = pages.last().map_or(0, |page| page.cut.basis.position());
+        let pages = pages.into_iter().map(|page| proto::RangePage {
+            entries: page.entries.into_iter().map(|entry| proto::Entry {
+                key: entry.key, value: entry.value, written: entry.written.position(),
+            }).collect(),
+            resume: page.resume,
+        }).collect();
         self.check_attachment(call, &database)?;
         Ok(proto::ReadReply {
             incarnation: incarnation.to_vec(),
-            at: read_at.unwrap_or_default(),
+            at,
             pages,
             clock_micros: Some(clock.0),
         }.encode_to_vec())

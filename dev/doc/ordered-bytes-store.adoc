@@ -25,6 +25,7 @@ The reply carries the serving node's clock sample at the read, `clock_micros`, s
 With `reverse`, each page descends by key: the limit counts from the range's end and a stopped page names its smallest key, before which the next page resumes.
 A reverse read equals the ascending read at the same version reversed, for every projection and filter, so "the latest at or before" is a one-entry read and no caller inverts its keys.
 All ranges of one request read the same version.
+The Default driver holds one applied view while it materializes the whole batch, including each batch issued by Rank.
 A page stops at its limit and names the key to resume after.
 A projection selects what each entry returns of its value: the whole value, nothing, or one byte slice at a fixed offset.
 Every projection equals reading the whole value and projecting it afterwards.

@@ -378,6 +378,19 @@ pub trait ServingDriver: Send + Sync {
         Err(rtdb_types::Anomaly::unsupported("rtdb.store/unsupported", "This route does not serve the ordered-bytes store"))
     }
 
+    async fn read_store_batch(
+        &self, reads: &mut (dyn ExactSizeIterator<Item = StoreRead> + Send),
+        mut at: At, now: Timestamp, cancellation: &CancellationToken,
+    ) -> Result<Vec<StorePage>> {
+        let mut pages = Vec::with_capacity(reads.len());
+        for read in reads {
+            let page = self.read_store(read, at, now, cancellation).await?;
+            at = At::Exactly(page.cut.basis);
+            pages.push(page);
+        }
+        Ok(pages)
+    }
+
     async fn store_sizes(&self, _epoch: Option<u64>, _now: Timestamp, _cancellation: &CancellationToken) -> Result<StorageSizes> {
         Err(rtdb_types::Anomaly::unsupported("rtdb.store/unsupported", "This route does not serve the ordered-bytes store"))
     }
