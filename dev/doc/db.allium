@@ -2458,6 +2458,7 @@ surface QueryAccess {
         -- An Arrow join can evaluate a residual predicate from borrowed cells on either side while gathering the result payloads from the input batches.
         -- A single residual testing whether a period contains a zoned microsecond timestamp can compare the stored endpoints and timestamp directly.
         -- This comparison includes the lower endpoint and excludes the upper endpoint, and null operands do not match.
+        -- A left join without equality keys can reuse the decoded build periods across probe points while retaining build order within each probe row.
         -- An inner hash join feeding only unfiltered row counts can emit batch cardinalities without gathering payload columns.
         -- A hash join shares probe positions across the retained Arrow probe columns and represents an initial one-to-one span by its length.
         -- A batch anti join on compatible validated scalar column equalities can search hash candidates when every equal key pair shares a hash and comparison is infallible.

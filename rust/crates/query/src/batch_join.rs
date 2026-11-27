@@ -365,6 +365,48 @@ struct PreparedResidual<'a> {
     _metadata: rtdb_expr::EvaluationScope,
 }
 
+struct PeriodProbe {
+    point: usize,
+    ranges: Vec<Option<(i64, i64)>>,
+    _reservation: Arc<MemoryReservation>,
+}
+
+impl PeriodProbe {
+    fn new(table: &Table, residual: &PreparedResidual<'_>, context: &crate::QueryContext) -> Result<Option<Self>> {
+        let Some((period, point)) = residual.period_point else { return Ok(None); };
+        let (Some(&(true, period)), Some(&(false, point))) = (residual.sides.get(period), residual.sides.get(point))
+            else { return Ok(None); };
+        let bytes = table.rows.checked_mul(size_of::<Option<(i64, i64)>>()).ok_or_else(size_error)?;
+        let Ok(reservation) = context.memory.reserve(bytes) else { return Ok(None); };
+        let mut ranges = Vec::with_capacity(table.rows);
+        for batch in &table.batches {
+            let ranges_column = &batch.columns[period];
+            for row in 0..batch.len {
+                context.check_cancelled_at(ranges.len())?;
+                let Some(bounds) = periods::bounds(ranges_column, row) else { return Ok(None); };
+                ranges.push(bounds);
+            }
+        }
+        Ok(Some(Self { point, ranges, _reservation: reservation }))
+    }
+
+    fn matching_rows(&self, probe: &ColumnBatch, row: usize, table: &Table, context: &crate::QueryContext,
+        mut accept: impl FnMut(usize, (usize, usize)) -> Result<ControlFlow<()>>,
+    ) -> Result<Option<bool>> {
+        let Some(point) = periods::timestamp_ticks(&probe.columns[self.point], row) else { return Ok(None); };
+        let Some(point) = point else { return Ok(Some(false)); };
+        let mut matched = false;
+        for (ordinal, bounds) in self.ranges.iter().enumerate() {
+            context.check_cancelled_at(ordinal)?;
+            if bounds.is_some_and(|(lower, upper)| (lower..upper).contains(&point)) {
+                matched = true;
+                if accept(ordinal, table.position(ordinal))?.is_break() { break; }
+            }
+        }
+        Ok(Some(matched))
+    }
+}
+
 struct ResidualCandidate {
     build: (usize, usize),
     probe: usize,
@@ -1171,6 +1213,11 @@ impl Spec {
 
     async fn probe_outer(&self, table: &mut Table, probe: &ColumnBatch, residual: Option<&PreparedResidual<'_>>) -> Result<Option<ColumnBatch>> {
         let context = &self.execution.context;
+        let periods = if let Some(residual) = residual.filter(|_| {
+            self.kind == JoinKind::Left && self.build_keys.is_empty() && probe.len > 1
+        }) {
+            PeriodProbe::new(table, residual, context)?
+        } else { None };
         let mut build = JoinPositions::new();
         let mut runs = ProbeRuns::new();
         let equality = self.execution.scope()?;
@@ -1179,17 +1226,25 @@ impl Spec {
         for row in 0..probe.len {
             context.check_cancelled_at(row)?;
             let mut matched_once = false;
-            let matched = self.matching_build_rows(table, probe, ProbeCandidates::HashBuckets(hashed.as_ref()), row, &equality, residual, |ordinal, position| {
+            let mut accept = |ordinal, position| {
                 if matched_once && self.kind == JoinKind::Single { return Err(crate::cardinality_violation()); }
                 matched_once = true;
                 if let Some((unmatched, _)) = &mut unmatched { unmatched[ordinal] = 0; }
                 build.push_outer(Some(position), &context.memory)?;
                 Ok(ControlFlow::Continue(()))
-            }).await?;
+            };
+            let matched = if let Some(periods) = &periods
+                && let Some(matched) = periods.matching_rows(probe, row, table, context, &mut accept)?
+            {
+                matched
+            } else {
+                self.matching_build_rows(table, probe, ProbeCandidates::HashBuckets(hashed.as_ref()), row, &equality, residual, accept).await?
+            };
             if !matched && self.preserves_probe() { build.push_outer(None, &context.memory)?; }
             runs.end_row(row, build.rows.len(), &context.memory)?;
         }
         drop(hashed);
+        drop(periods);
         table.unmatched = unmatched;
         self.gather_matches(build.rows.len(), Some((probe, runs)), |position| {
             gather_nullable_column(|batch| &table.batches[batch], &build.rows, position, &context.memory)

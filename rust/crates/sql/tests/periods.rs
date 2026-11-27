@@ -133,6 +133,28 @@ async fn tsbs_period_point_left_join_preserves_boundaries_duplicates_and_null_ex
 }
 
 #[tokio::test]
+async fn tsbs_period_probe_keeps_each_overlapping_build_occurrence() {
+    let sql = "WITH hours AS (
+                 SELECT h::timestamptz AS hour FROM generate_series(
+                   TIMESTAMP '1970-01-01T00:00:00Z', TIMESTAMP '1970-01-01T00:00:00.000040Z',
+                   INTERVAL 'PT0.000010S') AS x(h)
+               ), reports AS (
+                 SELECT n, PERIOD(lo, hi) AS p FROM (VALUES
+                   (1, TIMESTAMP '1970-01-01T00:00:00.000010Z', TIMESTAMP '1970-01-01T00:00:00.000030Z'),
+                   (2, TIMESTAMP '1970-01-01T00:00:00.000010Z', TIMESTAMP '1970-01-01T00:00:00.000030Z'),
+                   (3, TIMESTAMP '1970-01-01T00:00:00.000020Z', NULL::timestamptz)
+                 ) r(n, lo, hi)
+               )
+               SELECT hour, COUNT(reports.n) AS n FROM hours
+               LEFT JOIN reports ON reports.p CONTAINS hours.hour
+               GROUP BY hour ORDER BY hour";
+    assert_eq!(query(sql).await.unwrap().1, [
+        vec![timestamp(0), V::I64(0)], vec![timestamp(10), V::I64(2)], vec![timestamp(20), V::I64(3)],
+        vec![timestamp(30), V::I64(1)], vec![timestamp(40), V::I64(1)],
+    ]);
+}
+
+#[tokio::test]
 async fn temporal_test_period_projections_and_upper_infinity() {
     let (schema, rows) = query("SELECT _valid_time,_system_time FROM foo").await.unwrap();
     assert_eq!(schema.fields().iter().map(|field| field.name.as_str()).collect::<Vec<_>>(), ["_valid_time", "_system_time"]);

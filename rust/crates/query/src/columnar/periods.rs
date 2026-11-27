@@ -21,7 +21,7 @@ pub(crate) fn is_period(ty: &LogicalType) -> bool {
     matches!(nonnull(ty), LogicalType::List { kind: ListKind::TimestampTzRange, element } if is_zoned_micros(element))
 }
 
-fn timestamp_ticks(column: &Column, row: usize) -> Option<Option<i64>> {
+pub(crate) fn timestamp_ticks(column: &Column, row: usize) -> Option<Option<i64>> {
     if let Column::Values(values) = column {
         return match values.get(row)? {
             Value::Timestamp { unit: TimeUnit::Microsecond, timezone: Some(_), value } => Some(Some(*value)),
