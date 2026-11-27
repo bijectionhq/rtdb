@@ -13,6 +13,10 @@ Snapshots add the common `node-id` tag and retain the first metric registered wi
 Dropping or cancelling the cursor records the timer once; a failed pull increments `query.error`.
 `node.tx.submit` records asynchronous connection submission.
 `node.tx.execute` records synchronous submission and waiting, while `node.tx.await` records that wait alone.
+The native `rtdb.tx.source.append`, `rtdb.tx.resolve`, `rtdb.tx.replica.append`, and `rtdb.tx.readback.apply` timers measure source-log durability, resolution, replica serialization through durability, and application of read-back effects.
+Stages can overlap across transactions.
+The `rtdb.live.retained` gauge reports current live batch reservations and `rtdb.block.memory.cuts` counts block boundaries ordered at the memory threshold before the row threshold.
+
 Submission failures, synchronous abort results and ingestion aborts increment `tx.error` at their respective source call sites.
 An ingestion skip does not increment it.
 Internal transaction-result and role-membership queries use unobserved contexts.

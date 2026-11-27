@@ -866,7 +866,10 @@ impl Node {
         }
         let submitted_bytes = payload.len() as u64;
         let append_time = submitted_at.unwrap_or_else(|| self.now());
-        let position = cancellation.run_until_cancelled(database.replication.submit_source_encoded(payload, append_time)).await.ok_or_else(cancelled)??;
+        let position = {
+            let _append = rtdb_plan::ExecutionSample::new(self.execution_observer(), rtdb_plan::ExecutionTimer::SourceAppend);
+            cancellation.run_until_cancelled(database.replication.submit_source_encoded(payload, append_time)).await.ok_or_else(cancelled)??
+        };
         if let Some(admission) = &admission {
             database.record_submission(submitted_bytes);
             let mut latest = admission.lock();

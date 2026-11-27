@@ -23,9 +23,9 @@ impl CatalogMetrics for NodeMetrics {
     fn metrics(&self) -> Result<CatalogRows<CatalogMetric>> {
         let (Some(catalog), Some(factory)) = (self.catalog.upgrade(), self.factory.upgrade()) else { return Ok(CatalogRows::new(Vec::new(), self.memory.reserve(0)?)); };
         let databases = catalog.open_database_snapshot(&self.memory)?;
-        let bound = databases.rows().iter().try_fold(8192usize, |bytes, database| database.name().len().checked_add(1024).and_then(|size| size.checked_mul(9)).and_then(|size| bytes.checked_add(size)).ok_or_else(overflow))?;
+        let bound = databases.rows().iter().try_fold(8192usize, |bytes, database| database.name().len().checked_add(1024).and_then(|size| size.checked_mul(11)).and_then(|size| bytes.checked_add(size)).ok_or_else(overflow))?;
         let reservation = self.memory.reserve(bound)?;
-        let mut rows = Vec::with_capacity(15 + databases.rows().len() * 9);
+        let mut rows = Vec::with_capacity(15 + databases.rows().len() * 11);
         let push_allocator = |rows: &mut Vec<CatalogMetric>, allocator: &str, database: &str, allocated: usize, limit: usize| {
             let tags = BTreeMap::from([("allocator".into(), allocator.into()), ("database".into(), database.into())]);
             rows.push(CatalogMetric::Gauge { name: "xtdb.allocator.memory.allocated".into(), tags: tags.clone(), unit: Some(rtdb_plan::CatalogMetricUnit::Bytes), value: allocated as f64 });

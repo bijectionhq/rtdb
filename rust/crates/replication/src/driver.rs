@@ -697,6 +697,7 @@ impl ReplicationDriver {
     }
 
     async fn apply_transaction(&mut self, write: &StagedWrite, search_delta: Option<SearchDelta>, replica: ReplicaPosition) -> Result<()> {
+        let _apply = rtdb_plan::ExecutionSample::new(self.resolve.execution_observer.clone(), rtdb_plan::ExecutionTimer::ReadBackApply);
         if let Some(serving) = &self.serving { serving.require_classic_effects(write)?; }
         self.install_classic_transaction(write, search_delta).await?;
         if let Some(serving) = &mut self.serving { serving.observe_classic(write, replica, &self.resolve.memory)?; }
@@ -1186,7 +1187,8 @@ impl ReplicationDriver {
         let (appender, pump) = ReplicaAppender::new(Arc::clone(&self.logs), Arc::clone(&self.resolve.memory),
             term, self.config.assertion_interval, cancellation.clone(), Arc::clone(&self.clock));
         // Without a claim, the term's first appended record opens it.
-        let pump = pump.starting_at(TermSequence(initial_term_sequence(self.logs.fences_writer_terms())));
+        let pump = pump.starting_at(TermSequence(initial_term_sequence(self.logs.fences_writer_terms())))
+            .with_execution_observer(self.resolve.execution_observer.clone());
         let pump = match self.resolve.execution_observer.clone() {
             Some(observer) => pump.with_durable_commit_observer(move |basis, lag| match basis {
                 CommitLagBasis::Ordered => observer.record_durable_commit_lag(lag),
@@ -2347,6 +2349,7 @@ impl ReplicationDriver {
         let partition = Arc::clone(&self.partition);
         leader.resolution = Some(Resolution { completion: Completion(None), future: Box::pin(async move {
             let SourceInput { position, log_time, work, reservation, _decode_charge } = source;
+            let _resolution = rtdb_plan::ExecutionSample::new(context.execution_observer.clone(), rtdb_plan::ExecutionTimer::ResolveSource);
             let result = match work {
                 SourceWork::Resolve(mut request, operations) => {
                     let prepared = async {

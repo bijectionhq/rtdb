@@ -2,9 +2,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExecutionTimer { Query, TxAwait, TxSubmit, TxExecute, PgwireTransaction, TxOp, CompactorJob, DurableCommitLag, StagedCommitLag, BlockUpload, TrieDelete, BlockFileDelete, TableBlockFileDelete, OffloadedPayloadDelete }
+pub enum ExecutionTimer { Query, TxAwait, TxSubmit, TxExecute, PgwireTransaction, TxOp, CompactorJob, DurableCommitLag, StagedCommitLag, BlockUpload, TrieDelete, BlockFileDelete, TableBlockFileDelete, OffloadedPayloadDelete, SourceAppend, ResolveSource, ReplicaAppend, ReadBackApply }
 impl ExecutionTimer {
-    pub fn name(self) -> &'static str { match self { Self::Query => "query.timer", Self::TxAwait => "node.tx.await", Self::TxSubmit => "node.tx.submit", Self::TxExecute => "node.tx.execute", Self::PgwireTransaction => "pgwire.tx.latency", Self::TxOp => "tx.op.timer", Self::CompactorJob => "compactor.job.timer", Self::DurableCommitLag => "rtdb.replica.commit.ordered_to_durable", Self::StagedCommitLag => "rtdb.replica.commit.staged_to_durable", Self::BlockUpload => "block.upload.timer", Self::TrieDelete => "xtdb.gc.tries.delete.timer", Self::BlockFileDelete => "xtdb.gc.block_files.delete.timer", Self::TableBlockFileDelete => "xtdb.gc.table_block_files.delete.timer", Self::OffloadedPayloadDelete => "xtdb.gc.offloaded_payloads.delete.timer" } }
+    pub fn name(self) -> &'static str { match self { Self::Query => "query.timer", Self::TxAwait => "node.tx.await", Self::TxSubmit => "node.tx.submit", Self::TxExecute => "node.tx.execute", Self::PgwireTransaction => "pgwire.tx.latency", Self::TxOp => "tx.op.timer", Self::CompactorJob => "compactor.job.timer", Self::DurableCommitLag => "rtdb.replica.commit.ordered_to_durable", Self::StagedCommitLag => "rtdb.replica.commit.staged_to_durable", Self::BlockUpload => "block.upload.timer", Self::TrieDelete => "xtdb.gc.tries.delete.timer", Self::BlockFileDelete => "xtdb.gc.block_files.delete.timer", Self::TableBlockFileDelete => "xtdb.gc.table_block_files.delete.timer", Self::OffloadedPayloadDelete => "xtdb.gc.offloaded_payloads.delete.timer",
+        Self::SourceAppend => "rtdb.tx.source.append", Self::ResolveSource => "rtdb.tx.resolve",
+        Self::ReplicaAppend => "rtdb.tx.replica.append", Self::ReadBackApply => "rtdb.tx.readback.apply" } }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

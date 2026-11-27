@@ -111,6 +111,7 @@ pub(crate) struct ReplicaAppender {
     queue: mpsc::UnboundedReceiver<AppendRequest>, assertion_interval: Duration, cancellation: CancellationToken, clock: ReplicationClock,
     heartbeat: bool,
     durable_commit_observer: Option<DurableCommitObserver>,
+    execution_observer: Option<Arc<dyn rtdb_plan::ExecutionObserver>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,10 +148,14 @@ impl DurableCommitObservation {
 impl ReplicaAppender {
     pub fn new(logs: Arc<PartitionLogs>, memory: Arc<MemoryBudget>, term: Term, assertion_interval: Duration, cancellation: CancellationToken, clock: ReplicationClock) -> (AppenderHandle, Self) {
         let (sender, queue) = mpsc::unbounded_channel();
-        (AppenderHandle { sender }, Self { logs, memory, term, sequence: TermSequence(1), queue, assertion_interval, cancellation, clock, heartbeat: true, durable_commit_observer: None })
+        (AppenderHandle { sender }, Self { logs, memory, term, sequence: TermSequence(1), queue, assertion_interval, cancellation, clock, heartbeat: true, durable_commit_observer: None, execution_observer: None })
     }
     pub fn with_heartbeat(mut self, heartbeat: bool) -> Self { self.heartbeat = heartbeat; self }
     pub fn starting_at(mut self, sequence: TermSequence) -> Self { self.sequence = sequence; self }
+    pub fn with_execution_observer(mut self, observer: Option<Arc<dyn rtdb_plan::ExecutionObserver>>) -> Self {
+        self.execution_observer = observer;
+        self
+    }
     pub fn with_durable_commit_observer(mut self, observer: impl Fn(CommitLagBasis, Option<Duration>) + Send + Sync + 'static) -> Self {
         self.durable_commit_observer = Some(Arc::new(observer));
         self
@@ -191,6 +196,8 @@ impl ReplicaAppender {
                         Ok(next) => next,
                         Err(error) => { request.fail(error.clone()); break Err(error); }
                     };
+                    let append_sample = matches!(&request.write.body, WriteBody::Resolved(..))
+                        .then(|| rtdb_plan::ExecutionSample::new(self.execution_observer.clone(), rtdb_plan::ExecutionTimer::ReplicaAppend));
                     let resolved;
                     let (body, allow_offload) = match &request.write.body {
                         WriteBody::Resolved(tx, _) => match tx.inline_replica_body() {
@@ -243,7 +250,7 @@ impl ReplicaAppender {
                             {
                                 request.write.finish(outcome.map(|result| Applied::Transaction(Arc::new(result.clone()))));
                             }
-                            let receipt = track_receipt(receipt, Some(Arc::clone(&request.write)), request.durable, observation);
+                            let receipt = track_receipt(receipt, Some(Arc::clone(&request.write)), request.durable, observation, append_sample);
                             if guarded {
                                 // A guarded provider owns the tail until its exact quorum settles.
                                 // Keep heartbeats and later requests out of that flight.
@@ -268,7 +275,7 @@ impl ReplicaAppender {
                     self.sequence = match sequence.next() { Ok(next) => next, Err(error) => break Err(error) };
                     let envelope = ReplicaEnvelope { term: self.term, term_sequence: Some(sequence), message: ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() }) };
                     match observe_enqueue(self.logs.enqueue_replica(&envelope, BlockIndex(0), (self.clock)()), &self.cancellation, &mut receipts).await {
-                        EnqueueOutcome::Current(Ok(receipt)) => receipts.push(track_receipt(receipt, None, None, None)),
+                        EnqueueOutcome::Current(Ok(receipt)) => receipts.push(track_receipt(receipt, None, None, None, None)),
                         EnqueueOutcome::Current(Err(error)) | EnqueueOutcome::EarlierFailed(error) => break Err(error),
                         EnqueueOutcome::Cancelled => break Ok(()),
                     }
@@ -309,9 +316,10 @@ async fn observe_enqueue(
     }
 }
 
-fn track_receipt(receipt: crate::ReplicaReceipt, write: Option<Arc<PendingWrite>>, durable: Option<oneshot::Sender<Result<ReplicaMetadata>>>, observation: Option<DurableCommitObservation>) -> futures::future::BoxFuture<'static, Result<()>> {
+fn track_receipt(receipt: crate::ReplicaReceipt, write: Option<Arc<PendingWrite>>, durable: Option<oneshot::Sender<Result<ReplicaMetadata>>>, observation: Option<DurableCommitObservation>, sample: Option<rtdb_plan::ExecutionSample>) -> futures::future::BoxFuture<'static, Result<()>> {
     Box::pin(async move {
         let outcome = receipt.durable().await;
+        drop(sample);
         if outcome.is_ok() && let Some(observation) = observation { observation.record(); }
         if let Some(sender) = durable { let _ = sender.send(outcome.clone()); }
         if let Err(error) = &outcome { if let Some(write) = write { write.finish(Err(error.clone())); } }
@@ -451,7 +459,7 @@ mod tests {
             ordered_at: Timestamp(ordered), staging_clock_upper: staged.map(Timestamp),
             clock: Arc::new(move || Timestamp(observed)), observer: Arc::clone(&observer),
         };
-        assert!(track_receipt(receipt, None, None, Some(observation(100, Some(115), 120))).await.is_err());
+        assert!(track_receipt(receipt, None, None, Some(observation(100, Some(115), 120)), None).await.is_err());
         assert!(samples.lock().is_empty());
         observation(100, Some(115), 120).record();
         observation(100, Some(121), 120).record();

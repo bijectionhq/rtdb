@@ -26,7 +26,8 @@ use rtdb_maintenance::CollectionObserver;
 use rtdb_plan::{CatalogMetric, CatalogMetrics, CatalogRows, ConnectionEvent, ExecutionError, ExecutionObserver, ExecutionTimer, ReplicaRecordKind};
 use rtdb_types::{Anomaly, Result, TableRef};
 
-const TIMERS: [ExecutionTimer; 14] = [ExecutionTimer::Query, ExecutionTimer::TxAwait, ExecutionTimer::TxSubmit, ExecutionTimer::TxExecute, ExecutionTimer::PgwireTransaction, ExecutionTimer::TxOp, ExecutionTimer::CompactorJob, ExecutionTimer::DurableCommitLag, ExecutionTimer::StagedCommitLag, ExecutionTimer::BlockUpload, ExecutionTimer::TrieDelete, ExecutionTimer::BlockFileDelete, ExecutionTimer::TableBlockFileDelete, ExecutionTimer::OffloadedPayloadDelete];
+const TIMERS: [ExecutionTimer; 18] = [ExecutionTimer::Query, ExecutionTimer::TxAwait, ExecutionTimer::TxSubmit, ExecutionTimer::TxExecute, ExecutionTimer::PgwireTransaction, ExecutionTimer::TxOp, ExecutionTimer::CompactorJob, ExecutionTimer::DurableCommitLag, ExecutionTimer::StagedCommitLag, ExecutionTimer::BlockUpload, ExecutionTimer::TrieDelete, ExecutionTimer::BlockFileDelete, ExecutionTimer::TableBlockFileDelete, ExecutionTimer::OffloadedPayloadDelete,
+    ExecutionTimer::SourceAppend, ExecutionTimer::ResolveSource, ExecutionTimer::ReplicaAppend, ExecutionTimer::ReadBackApply];
 struct Counters { query_errors: step::Counter, query_warnings: step::Counter, transaction_errors: step::Counter, collection_errors: step::Counter, durable_commit_clock_invalid: step::Counter, staged_commit_clock_invalid: step::Counter, kafka_warnings: [step::Counter; 5], connections: [step::Counter; 3] }
 impl Counters {
     fn roll(&mut self, now: i64, closing: bool) {
@@ -125,7 +126,9 @@ impl Registry {
 }
 impl ExecutionObserver for Registry {
     fn record_duration(&self, timer: ExecutionTimer, elapsed: Duration) {
-        let index = match timer { ExecutionTimer::Query => 0, ExecutionTimer::TxAwait => 1, ExecutionTimer::TxSubmit => 2, ExecutionTimer::TxExecute => 3, ExecutionTimer::PgwireTransaction => 4, ExecutionTimer::TxOp => 5, ExecutionTimer::CompactorJob => 6, ExecutionTimer::DurableCommitLag => 7, ExecutionTimer::StagedCommitLag => 8, ExecutionTimer::BlockUpload => 9, ExecutionTimer::TrieDelete => 10, ExecutionTimer::BlockFileDelete => 11, ExecutionTimer::TableBlockFileDelete => 12, ExecutionTimer::OffloadedPayloadDelete => 13 };
+        let index = match timer { ExecutionTimer::Query => 0, ExecutionTimer::TxAwait => 1, ExecutionTimer::TxSubmit => 2, ExecutionTimer::TxExecute => 3, ExecutionTimer::PgwireTransaction => 4, ExecutionTimer::TxOp => 5, ExecutionTimer::CompactorJob => 6, ExecutionTimer::DurableCommitLag => 7, ExecutionTimer::StagedCommitLag => 8, ExecutionTimer::BlockUpload => 9, ExecutionTimer::TrieDelete => 10, ExecutionTimer::BlockFileDelete => 11, ExecutionTimer::TableBlockFileDelete => 12, ExecutionTimer::OffloadedPayloadDelete => 13,
+            ExecutionTimer::SourceAppend => 14, ExecutionTimer::ResolveSource => 15,
+            ExecutionTimer::ReplicaAppend => 16, ExecutionTimer::ReadBackApply => 17 };
         let sample = Sample { timer: index, elapsed, now_ms: wall_time_millis() };
         let shard = &self.shards[shard_index()];
         loop {

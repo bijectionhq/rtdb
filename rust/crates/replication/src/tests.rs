@@ -1247,6 +1247,10 @@ async fn block_production_records_the_upload_timer_once_the_block_is_appended() 
     handle.shutdown();
     writer.await.unwrap().unwrap();
     assert_eq!(timers.0.lock().iter().filter(|timer| **timer == rtdb_plan::ExecutionTimer::BlockUpload).count(), 1);
+    let timers = timers.0.lock();
+    for stage in [rtdb_plan::ExecutionTimer::ResolveSource, rtdb_plan::ExecutionTimer::ReplicaAppend, rtdb_plan::ExecutionTimer::ReadBackApply] {
+        assert!(timers.contains(&stage));
+    }
 }
 
 fn serving_source_put(key: u8) -> rtdb_tx::transact::Transact {
