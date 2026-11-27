@@ -51,7 +51,7 @@ impl Intent {
         )
     }
 
-    fn evidence(&self, cut: SourceCut, manifest_sha256: [u8; 32], key: Option<KeyEvidence>) -> Result<Evidence> {
+    fn evidence(&self, cut: SourceCut, manifest_sha256: [u8; 32], key: Option<KeyEvidence>, funded_inventory_sha256: Option<[u8; 32]>) -> Result<Evidence> {
         Ok(Evidence {
             version: if key.is_some() { HELD_KEY_VERSION } else { VERSION },
             intent: self.clone(),
@@ -62,6 +62,7 @@ impl Intent {
             manifest_sha256,
             key,
             objects_sha256: None,
+            funded_inventory_sha256,
         })
     }
 
@@ -75,7 +76,7 @@ impl Intent {
             position: archive.source_basis().position(),
             system_time: archive.source_system_time().0,
         };
-        self.evidence(cut, archive.manifest_sha256(), Some(key))?.key_hold()?.ok_or_else(invalid)
+        self.evidence(cut, archive.manifest_sha256(), Some(key), archive.funded_inventory_sha256()?)?.key_hold()?.ok_or_else(invalid)
     }
 
     #[cfg(feature = "backup-object-holds")]
@@ -101,7 +102,7 @@ impl Intent {
             position: installed.source_basis().position(),
             system_time: installed.source_system_time().0,
         };
-        self.evidence(cut, manifest_sha256, key)
+        self.evidence(cut, manifest_sha256, key, installed.funded_inventory_sha256())
     }
 }
 
@@ -121,6 +122,8 @@ struct Evidence {
     key: Option<KeyEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     objects_sha256: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    funded_inventory_sha256: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -159,6 +162,13 @@ impl Evidence {
                 bytes.extend_from_slice(&objects);
             }
             _ => return Err(invalid()),
+        }
+        if let Some(inventory) = self.funded_inventory_sha256 {
+            if inventory == [0; 32] {
+                return Err(invalid());
+            }
+            bytes.extend_from_slice(b"funded-inventory\0");
+            bytes.extend_from_slice(&inventory);
         }
         Ok(bytes)
     }
@@ -238,6 +248,7 @@ impl Attestation {
                     && (selected.loss_policy != LossPolicy::Lossless || final_source_lsn == Some(Lsn(evidence.source_lsn)))
                     && installation.is_none_or(|prior| {
                         prior.manifest_digest == evidence.manifest_sha256 && prior.key_hold == Some(hold)
+                            && prior.funded_inventory_sha256 == evidence.funded_inventory_sha256
                             && prior.source_cut == SourceCut {
                                 lsn: evidence.source_lsn,
                                 position: evidence.source_position,
@@ -337,6 +348,7 @@ impl Attestation {
             key_hold,
             journal_hold,
             objects_sha256: evidence.objects_sha256,
+            funded_inventory_sha256: evidence.funded_inventory_sha256,
             source_cut: SourceCut {
                 lsn: evidence.source_lsn,
                 position: evidence.source_position,
@@ -452,6 +464,7 @@ mod tests {
                 manifest_sha256: [5; 32],
                 key: Some(KeyEvidence { generation: 1, authority_sha256: fingerprint }),
                 objects_sha256: None,
+                funded_inventory_sha256: None,
             }, &signer).unwrap()
         };
         let recovery = |operation_id| RecoveryIntent {
@@ -514,6 +527,7 @@ mod tests {
                 manifest_sha256,
                 key: None,
                 objects_sha256: None,
+                funded_inventory_sha256: None,
             },
             &key,
         )
@@ -528,6 +542,16 @@ mod tests {
                 .successor,
             intent.candidate().unwrap(),
         );
+        let mut funded = transported.evidence.clone();
+        funded.funded_inventory_sha256 = Some([17; 32]);
+        let funded = Attestation::signed(funded, &key).unwrap();
+        assert_eq!(
+            funded.verify(&intent, manifest_sha256, &trusted).unwrap().funded_inventory_sha256,
+            Some([17; 32])
+        );
+        let mut changed = funded;
+        changed.evidence.funded_inventory_sha256 = Some([18; 32]);
+        assert!(changed.verify(&intent, manifest_sha256, &trusted).is_err());
         assert!(proof.verify(&intent, [2; 32], &trusted).is_err());
         assert!(
             proof

@@ -6,6 +6,15 @@ pub(super) struct Export {
     incarnation: Uuid,
     scope: ActivationScope,
     source: HostedDatabase,
+    funded: Option<FundedAuthority>,
+}
+
+#[derive(Clone, Debug)]
+struct FundedAuthority {
+    url: String,
+    tls: PathBuf,
+    authority: Uuid,
+    revision: u64,
 }
 
 impl Export {
@@ -13,27 +22,86 @@ impl Export {
         let archive = backup_field(&mut fields, "--archive")?.into();
         let incarnation = backup_uuid(&backup_field(&mut fields, "--incarnation")?)?;
         let authority = backup_uuid(&backup_field(&mut fields, "--authority-id")?)?;
-        let cell = fields.remove("--cell-id").as_deref().map(backup_uuid).transpose()?;
+        let cell = fields
+            .remove("--cell-id")
+            .as_deref()
+            .map(backup_uuid)
+            .transpose()?;
         let source = HostedDatabase::parse(&mut fields)?;
         let scope = ActivationScope::for_cell(authority, &source.name, cell)?;
+        let funded = if let Some(url) = fields.remove("--funded-authority-url") {
+            let revision = backup_field(&mut fields, "--predecessor-revision")?
+                .parse::<u64>()
+                .ok()
+                .filter(|revision| *revision != 0)
+                .ok_or_else(arguments_error)?;
+            Some(FundedAuthority {
+                url,
+                authority,
+                revision,
+                tls: backup_field(&mut fields, "--funded-authority-tls-dir")?.into(),
+            })
+        } else {
+            None
+        };
         if !fields.is_empty() {
             return Err(arguments_error());
         }
-        Ok(Self { archive, incarnation, scope, source })
+        Ok(Self {
+            archive,
+            incarnation,
+            scope,
+            source,
+            funded,
+        })
     }
 
     pub(super) async fn run(self, apple_sync: rtdb_storage::AppleSync) -> Result<Value> {
         if self.archive.try_exists().map_err(io_error)? {
-            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb/backup-exists", "The portable backup path is already occupied"));
+            return Err(Anomaly::new(
+                AnomalyCategory::Conflict,
+                "rtdb/backup-exists",
+                "The portable backup path is already occupied",
+            ));
         }
+        let funded = if let Some(profile) = self.funded {
+            use crate::multi::activation::{ActivationAuthority, Binding};
+
+            let authority = ActivationAuthority::funded_export_reader(
+                &profile.url,
+                crate::cli::journal_credentials(&profile.tls)?,
+                profile.authority,
+                &self.source.journal_url,
+            )
+            .await?;
+            Some(
+                authority
+                    .funded_backup_settlements(
+                        &self.source.name,
+                        Binding {
+                            incarnation: self.incarnation,
+                            revision: profile.revision,
+                        },
+                    )
+                    .await?,
+            )
+        } else {
+            None
+        };
         let credentials = crate::cli::journal_credentials(&self.source.journal_tls)?;
         let JournalBackend { journal, batch, .. } =
             connect_stream_journal(&self.source.journal_url, &credentials).await?;
-        let keys = Arc::new(FileKms::open(&self.source.key_vault, || SystemClock.now().0)?);
+        let keys = Arc::new(FileKms::open(&self.source.key_vault, || {
+            SystemClock.now().0
+        })?);
         let io = IoRegion::new();
         let backup = async {
             let root = rtdb_storage::ObjectKey::new("multi")?;
-            let store = self.source.objects.open(&root, &BTreeMap::new(), Arc::clone(&io)).await?;
+            let store = self
+                .source
+                .objects
+                .open(&root, &BTreeMap::new(), Arc::clone(&io))
+                .await?;
             let mut database = MultiDatabase::new(
                 MultiOptions {
                     database: self.incarnation,
@@ -41,13 +109,25 @@ impl Export {
                     lease_micros: WRITER_LEASE_MICROS,
                     drift_micros: CLOCK_DRIFT_MICROS,
                 },
-                journal, store, keys, Arc::new(|| SystemClock.now()),
-            )?.with_immutable_journal()
-                .with_activation_scope(self.scope)?
-                .with_batch_appender(batch)
-                .with_manifest_budget(MemoryBudget::new(PortableBackup::MAX_BYTES));
-            database.portable_backup().await
-        }.await;
+                journal,
+                store,
+                keys,
+                Arc::new(|| SystemClock.now()),
+            )?
+            .with_immutable_journal()
+            .with_activation_scope(self.scope)?
+            .with_batch_appender(batch)
+            .with_manifest_budget(MemoryBudget::new(PortableBackup::MAX_BYTES));
+            match funded {
+                Some((source_lsn, settlements)) => {
+                    database
+                        .portable_backup_with_funding(source_lsn, &settlements)
+                        .await
+                }
+                None => database.portable_backup().await,
+            }
+        }
+        .await;
         io.close_and_wait().await;
         export_archive(&self.archive, backup?, apple_sync)
     }

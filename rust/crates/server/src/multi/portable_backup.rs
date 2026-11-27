@@ -21,6 +21,7 @@ Usage: rtdb multi-backup export --data DIR --archive FILE [--journal-url URL --t
        rtdb multi-backup export-hosted --archive FILE --incarnation UUID --authority-id UUID [--cell-id UUID]
                     [--database NAME]
                     --journal-url URL --tls-dir DIR --key-vault DIR --bucket BUCKET [--region REGION] [--s3-endpoint URL]
+                    [--funded-authority-url URL --funded-authority-tls-dir DIR --predecessor-revision N]
        rtdb multi-backup stage --archive FILE --source-key-vault DIR --operation-id UUID
                     --expected-incarnation UUID --expected-revision REVISION [--database NAME]
                     --journal-url URL --tls-dir DIR --key-vault DIR --bucket BUCKET [--region REGION] [--s3-endpoint URL]

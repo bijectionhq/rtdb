@@ -1495,6 +1495,7 @@ mod tests {
                     key_hold: None,
                     journal_hold: None,
                     objects_sha256: None,
+                    funded_inventory_sha256: None,
                     source_cut: recovery::SourceCut::default(),
                     activation_scope: Some(
                         rtdb_db::ActivationScope::new(authority.identity(), &database).unwrap(),

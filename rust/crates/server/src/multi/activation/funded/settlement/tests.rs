@@ -238,7 +238,7 @@ async fn reconciles_funded_bookings_with_original_commitments_and_a_lossless_sea
         .unwrap();
     assert_eq!(
         authority
-            .require_funded_settlements(&state.unwrap(), Lsn(2))
+            .funded_settlements(&state.unwrap(), Lsn(2))
             .await
             .unwrap_err()
             .code,
@@ -311,37 +311,80 @@ async fn reconciles_funded_bookings_with_original_commitments_and_a_lossless_sea
         .unwrap();
     assert_eq!(
         authority
-            .require_funded_settlements(&state.unwrap(), Lsn(1))
+            .funded_settlements(&state.unwrap(), Lsn(1))
             .await
             .unwrap_err()
             .code,
         "rtdb/activation-funded-source-cut"
     );
 
+    let (_, settlements) = authority
+        .funded_backup_settlements(DATABASE, predecessor)
+        .await
+        .unwrap();
+    let funded_inventory_sha256 =
+        funded_settlement_digest(*predecessor.incarnation.as_bytes(), &settlements).unwrap();
+    let installed = VerifiedSuccessor {
+        predecessor: predecessor.incarnation,
+        successor: candidate,
+        manifest_digest: [20; 32],
+        activation_scope: Some(rtdb_db::ActivationScope::new(identity, DATABASE).unwrap()),
+        destination_cell: None,
+        key_hold: None,
+        journal_hold: None,
+        objects_sha256: None,
+        funded_inventory_sha256: None,
+        source_cut: SourceCut {
+            lsn: 2,
+            position: 1,
+            system_time: 1,
+        },
+    };
+    authority
+        .record_recovery_installation(DATABASE, operation, installed)
+        .await
+        .unwrap();
+    assert_eq!(
+        authority
+            .publish_recovery(DATABASE, operation)
+            .await
+            .unwrap_err()
+            .code,
+        "rtdb/activation-funded-installation"
+    );
+    let replacement = Operation {
+        predecessor,
+        operation_id: Uuid::new_v4(),
+    };
+    let status = authority
+        .begin_recovery(
+            DATABASE,
+            Intent {
+                operation: replacement,
+                destination_cell: None,
+                loss_policy: LossPolicy::Lossless,
+            },
+            Some(operation.operation_id),
+        )
+        .await
+        .unwrap();
+    let Status::Pending { candidate, .. } = status else {
+        panic!("Expected a pending replacement")
+    };
     authority
         .record_recovery_installation(
             DATABASE,
-            operation,
+            replacement,
             VerifiedSuccessor {
-                predecessor: predecessor.incarnation,
                 successor: candidate,
-                manifest_digest: [20; 32],
-                activation_scope: Some(rtdb_db::ActivationScope::new(identity, DATABASE).unwrap()),
-                destination_cell: None,
-                key_hold: None,
-                journal_hold: None,
-                objects_sha256: None,
-                source_cut: SourceCut {
-                    lsn: 2,
-                    position: 1,
-                    system_time: 1,
-                },
+                funded_inventory_sha256,
+                ..installed
             },
         )
         .await
         .unwrap();
     authority
-        .publish_recovery(DATABASE, operation)
+        .publish_recovery(DATABASE, replacement)
         .await
         .unwrap();
     assert_eq!(

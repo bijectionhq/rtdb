@@ -300,6 +300,15 @@ impl AppointmentSample {
 }
 
 impl FundedReceipt {
+    pub(in crate::transact) fn portable_appointment(self) -> Option<([u8; 32], Option<BranchCut>)> {
+        let Phase::Appointment(appointment) = self.phase else { return None };
+        let activated = match appointment.stage {
+            AppointmentStage::Prepared => None,
+            AppointmentStage::Activated(activation) | AppointmentStage::Consumed { activation, .. } => Some(activation.order.cut),
+        };
+        Some((appointment.intent, activated))
+    }
+
     pub fn is_appointment(self) -> bool { matches!(self.phase, Phase::Appointment(_)) }
 
     pub(in crate::transact) fn check_managed_appointment(self, scope: &workload::FundedAppointmentScope) -> Result<()> {

@@ -4,6 +4,7 @@ use bytes::Bytes;
 use journal_contract::{Epoch, JournalError, Lsn, StreamId};
 use ring::signature::{ED25519, UnparsedPublicKey};
 use rtdb_stream_journal::{KeeperId, TimedCommitment, TimedOriginal, TimedOriginalVerifier};
+use rtdb_tx::transact::{FundedOutcome, FundedSettlement, funded_settlement_digest};
 use rtdb_types::{Anomaly, AnomalyCategory, Result, rtdb_v1::Basis};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -17,6 +18,8 @@ use crate::multi::activation::{
 
 #[cfg(test)]
 mod tests;
+
+const BOOKINGS_PER_PAGE: u64 = 32;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -323,6 +326,37 @@ pub(in crate::multi::activation) struct VerifiedBooking {
     exclusion_fence: Option<(Epoch, Lsn)>,
 }
 
+impl VerifiedBooking {
+    fn portable(&self) -> Result<FundedSettlement> {
+        let booking = &self.resolution.booking;
+        let committed = |stage| {
+            booking
+                .authorizations
+                .iter()
+                .zip(&self.resolution.stages)
+                .find_map(|(authorization, evidence)| {
+                    (authorization.stage == stage && matches!(evidence, Evidence::Committed { .. }))
+                        .then_some(authorization.at.0)
+                })
+        };
+        let encoded = serde_json::to_vec(self).map_err(|_| corrupt())?;
+        Ok(FundedSettlement {
+            namespace: booking.receipt.namespace,
+            key: booking.receipt.key.clone(),
+            outcome: FundedOutcome {
+                booking: *booking.id.as_bytes(),
+                owner: booking.owner,
+                predecessor: booking.predecessor,
+                intent_sha256: booking.intent_sha256,
+                appointment: booking.kind == Kind::Appointment,
+                activation_lsn: committed(Stage::Activate),
+                consumption_lsn: committed(Stage::Consume),
+                evidence_sha256: Sha256::digest(encoded).into(),
+            },
+        })
+    }
+}
+
 #[derive(Clone, Copy)]
 struct OutcomeLocation {
     stream: StreamId,
@@ -332,7 +366,6 @@ struct OutcomeLocation {
 
 impl Scope {
     fn outcome(&self, closure: &Closure, index: u64) -> OutcomeLocation {
-        const BOOKINGS_PER_PAGE: u64 = 32;
         let offset = index - 1;
         let mut digest = Sha256::new();
         digest.update(b"rtdb.activation.funded-outcomes/v1\0");
@@ -496,11 +529,31 @@ impl ActivationAuthority {
             .await
     }
 
-    pub(in crate::multi::activation) async fn require_funded_settlements(
+    pub(in crate::multi) async fn funded_backup_settlements(
+        &self,
+        name: &str,
+        predecessor: Binding,
+    ) -> Result<(Option<Lsn>, Vec<FundedSettlement>)> {
+        let (_, state) = self.read(self.stream_id(name)?).await?;
+        let state = state.ok_or_else(unavailable)?;
+        state.require(predecessor)?;
+        let pending = state
+            .recovery
+            .filter(|_| state.grants_closed)
+            .ok_or_else(conflict)?;
+        let sealed = pending.source_lsn_for_backup()?;
+        let settlements = self
+            .funded_settlements(&state, sealed.unwrap_or(Lsn(u64::MAX)))
+            .await?;
+        Ok((sealed, settlements))
+    }
+
+    pub(in crate::multi::activation) async fn funded_settlements(
         &self,
         state: &State,
         source_cut: Lsn,
-    ) -> Result<()> {
+    ) -> Result<Vec<FundedSettlement>> {
+        let mut settlements = Vec::new();
         for scope in state.require_funded_closures()? {
             let closure = scope.closure.as_ref().ok_or_else(corrupt)?;
             if closure.bookings == 0 {
@@ -520,8 +573,22 @@ impl ActivationAuthority {
                     "The installed recovery cut does not cover every committed funded stage",
                 ));
             }
+            for index in (1..closure.bookings).step_by(BOOKINGS_PER_PAGE as usize) {
+                let count = (closure.bookings - index).min(BOOKINGS_PER_PAGE);
+                let page = self
+                    .read_funded_page(scope.outcome(closure, index), count)
+                    .await?
+                    .ok_or_else(corrupt)?;
+                for booking in page {
+                    settlements.push(booking.portable()?);
+                }
+            }
+            settlements.push(last.portable()?);
         }
-        Ok(())
+        settlements
+            .sort_by(|left, right| (left.namespace, &left.key).cmp(&(right.namespace, &right.key)));
+        funded_settlement_digest(*state.binding.incarnation.as_bytes(), &settlements)?;
+        Ok(settlements)
     }
 
     async fn outcome_head(&self, stream: StreamId) -> Result<Lsn> {
@@ -543,29 +610,50 @@ impl ActivationAuthority {
         &self,
         outcome: OutcomeLocation,
     ) -> Result<Option<VerifiedBooking>> {
+        Ok(self
+            .read_funded_page(outcome, 1)
+            .await?
+            .and_then(|mut page| page.pop()))
+    }
+
+    async fn read_funded_page(
+        &self,
+        outcome: OutcomeLocation,
+        count: u64,
+    ) -> Result<Option<Vec<VerifiedBooking>>> {
         let OutcomeLocation { stream, at, index } = outcome;
-        if at > self.outcome_head(stream).await? {
+        let last = Lsn(at.0 + count - 1);
+        if last > self.outcome_head(stream).await? {
             return Ok(None);
         }
         let page = if self.access.is_local() {
-            self.journal.read(stream, at, 1, Duration::ZERO).await
+            self.journal
+                .read(stream, at, count as usize, Duration::ZERO)
+                .await
         } else {
             self.journal
-                .read_page(stream, at, at, 1, Duration::ZERO)
+                .read_page(stream, at, last, count as usize, Duration::ZERO)
                 .await
         }
         .map_err(journal_error)?;
-        let [(position, bytes)] = page.records.as_slice() else {
-            return Err(corrupt());
-        };
-        if *position != at {
+        if page.records.len() != count as usize {
             return Err(corrupt());
         }
-        let record: VerifiedBooking = serde_json::from_slice(bytes).map_err(|_| corrupt())?;
-        if record.resolution.index != index {
-            return Err(corrupt());
-        }
-        Ok(Some(record))
+        page.records
+            .into_iter()
+            .enumerate()
+            .map(|(offset, (position, bytes))| {
+                let record: VerifiedBooking =
+                    serde_json::from_slice(&bytes).map_err(|_| corrupt())?;
+                if position.0 != at.0 + offset as u64
+                    || record.resolution.index != index + offset as u64
+                {
+                    return Err(corrupt());
+                }
+                Ok(record)
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Some)
     }
 }
 

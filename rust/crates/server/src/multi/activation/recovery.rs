@@ -1,5 +1,5 @@
 use super::{
-    ActivationAuthority, Binding, Publication, RECOVERY_HOSTED_CUSTODY_PROTOCOL, RECOVERY_INTENT_PROTOCOL, RECOVERY_JOURNAL_CUSTODY_PROTOCOL,
+    ActivationAuthority, Binding, FUNDED_PORTABLE_PROTOCOL, Publication, RECOVERY_HOSTED_CUSTODY_PROTOCOL, RECOVERY_INTENT_PROTOCOL, RECOVERY_JOURNAL_CUSTODY_PROTOCOL,
     RECOVERY_KEY_CUSTODY_PROTOCOL, State, VerifiedSuccessor,
     clock, conflict, journal_custody::RetainedJournal, journal_error, unavailable,
 };
@@ -51,6 +51,8 @@ pub(crate) struct Installation {
     pub(super) journal_hold: Option<RetainedJournal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) objects_sha256: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) funded_inventory_sha256: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -81,6 +83,8 @@ pub(super) struct Completed {
     journal_hold: Option<RetainedJournal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     objects_sha256: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    funded_inventory_sha256: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -234,11 +238,22 @@ impl Completed {
             key_hold: self.key_hold,
             journal_hold: self.journal_hold,
             objects_sha256: self.objects_sha256,
+            funded_inventory_sha256: self.funded_inventory_sha256,
         }
     }
 }
 
 impl Pending {
+    pub(super) fn source_lsn_for_backup(self) -> Result<Option<Lsn>> {
+        if self.intent.loss_policy == LossPolicy::Lossless && self.final_source_lsn.is_none() {
+            return Err(Anomaly::incorrect(
+                "rtdb/activation-final-source-cut",
+                "Lossless recovery requires the sealed predecessor's final position",
+            ));
+        }
+        Ok(self.final_source_lsn)
+    }
+
     pub(super) fn source_fence(self) -> Option<(Epoch, Lsn)> {
         self.final_source_epoch.zip(self.final_source_lsn)
     }
@@ -409,11 +424,15 @@ impl ActivationAuthority {
                     return Ok(None);
                 }
                 state.pending(operation)?;
-                if state.grants_closed {
+                let upgrade = state.version < FUNDED_PORTABLE_PROTOCOL && !state.funded_scopes().is_empty();
+                if state.grants_closed && !upgrade {
                     return Ok(None);
                 }
                 let mut next = state.clone();
                 next.grants_closed = true;
+                if upgrade {
+                    next.version = FUNDED_PORTABLE_PROTOCOL;
+                }
                 Ok(Some(next))
             })
             .await?;
@@ -432,6 +451,7 @@ impl ActivationAuthority {
             key_hold: installed.key_hold,
             journal_hold: installed.journal_hold,
             objects_sha256: installed.objects_sha256,
+            funded_inventory_sha256: installed.funded_inventory_sha256,
         };
         if installation.source_cut.lsn == 0 {
             return Err(conflict());
@@ -596,7 +616,15 @@ impl ActivationAuthority {
         })?;
         let ranked_closure = frozen.require_ranked_closure()?;
         let funded_scopes = frozen.require_funded_closures()?;
-        self.require_funded_settlements(&frozen, Lsn(installation.source_cut.lsn)).await?;
+        let settlements = self.funded_settlements(&frozen, Lsn(installation.source_cut.lsn)).await?;
+        if rtdb_tx::transact::funded_settlement_digest(*operation.predecessor.incarnation.as_bytes(), &settlements)?
+            != installation.funded_inventory_sha256
+        {
+            return Err(Anomaly::incorrect(
+                "rtdb/activation-funded-installation",
+                "The installed backup does not retain the reconciled funded receipt inventory",
+            ));
+        }
         let successor = self.candidate(name, pending.intent)?;
         let publication = Publication {
             operation: operation.operation_id,
@@ -613,6 +641,7 @@ impl ActivationAuthority {
                 key_hold: installation.key_hold,
                 journal_hold: installation.journal_hold,
                 objects_sha256: installation.objects_sha256,
+                funded_inventory_sha256: installation.funded_inventory_sha256,
             }),
         };
         self.preserve_publication(name, &frozen).await?;
@@ -633,8 +662,11 @@ impl ActivationAuthority {
                 {
                     return Err(conflict());
                 }
-                self.install_binding(name, state, &publication, successor)
-                    .map(Some)
+                let mut next = self.install_binding(name, state, &publication, successor)?;
+                if !funded_scopes.is_empty() {
+                    next.version = FUNDED_PORTABLE_PROTOCOL;
+                }
+                Ok(Some(next))
             })
             .await?;
         self.recovery_status_at(name, &state, operation)
@@ -774,6 +806,7 @@ mod tests {
             key_hold: None,
             journal_hold: None,
             objects_sha256: None,
+            funded_inventory_sha256: None,
             activation_scope: Some(rtdb_db::ActivationScope::new(identity, "xtdb").unwrap()),
             source_cut: SourceCut {
                 lsn,

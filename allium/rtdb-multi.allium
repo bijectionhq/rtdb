@@ -509,6 +509,8 @@ contract OriginalFundedAdmission {
         -- RTDB verifies every predecessor scope closure against its enrolled issuer and reconciles the complete inventories before the successor advertises or admits commissioned funded work.
         -- A retained RTDB recovery record binds the verified original issuer evidence to its booking and scope.
         -- The authority retains verified outcomes in issuer inventory order and publishes only when the installed cut covers every committed stage.
+        -- The portable cut preserves reconciled bookings under their original namespaces and keys as terminal receipts.
+        -- Installation attests the funded receipt inventory, and activation matches it against the predecessor's retained reconciliation.
         -- A successor uses its own commissioned scope and preserves the original booking identity for retry and outcome lookup.
 }
 
@@ -1248,7 +1250,7 @@ contract PortableApplicationBackup {
         -- The writer captures one settled applied cut and binds its source incarnation, basis, system time and journal position to the encrypted checkpoint.
         -- An immutable stream can capture its settled application state at a quorum-confirmed head with read authority and without provisioning any source streams.
         -- The checkpoint contains its inline application state and exact retained receipt index.
-        -- A portable cut requires ordinary receipt and row custody state and a closed export-pin inventory.
+        -- A portable cut carries ordinary receipts and reconciled funded receipts, requires ordinary row custody state, and closes its export-pin inventory.
         -- The archive authenticates each ordinary checkpoint file under its exact source object identity.
         -- The writer reads each file from the current generation's custody and verifies its stored identity before capture.
         -- Publication follows durable archive creation under the source generation's independently available key custody.

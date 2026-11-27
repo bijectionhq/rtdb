@@ -405,6 +405,68 @@ mod tests {
     }
 
     #[test]
+    fn reconciled_funded_receipts_survive_checkpoint_rebase_without_live_offers() {
+        let mut pipeline = TransactPipeline::new(TransactState::new(INCARNATION), 1, 4).unwrap();
+        let mut accepted = request(1, vec![put(TableRef::new("public", "items"), Interval::ALL.into(),
+            StructFields::from([("reading".into(), Cell::TxTime)]))]);
+        let mut pending = accepted.clone();
+        pending.key = vec![2; 16];
+        accepted.require.push(DECISION_CLOCK_OFFER.into());
+        pending.require.push(DECISION_CLOCK_OFFER.into());
+        let predecessor = pipeline.durable().index().head().basis;
+        let booked = funded(&mut pipeline, &accepted, None, book(predecessor, BOOKING)).unwrap();
+        append(&mut pipeline, booked);
+        let terminal = funded(&mut pipeline, &accepted, None, consume(1_200_000)).unwrap();
+        let (receipt, _) = append(&mut pipeline, terminal);
+        let pending_booking = [5; 16];
+        let booked = funded(&mut pipeline, &pending, None, book(predecessor, pending_booking)).unwrap();
+        append(&mut pipeline, booked);
+        let orphan_key = vec![3; 16];
+        let settled = |key, booking, intent_sha256, consumption_lsn| FundedSettlement {
+            namespace: None, key,
+            outcome: FundedOutcome {
+                booking, owner: OWNER, predecessor, intent_sha256, appointment: false,
+                activation_lsn: None, consumption_lsn, evidence_sha256: [7; 32],
+            },
+        };
+        let settlements = [
+            settled(accepted.key.clone(), BOOKING, accepted.logical_sha256().unwrap(), Some(2)),
+            settled(pending.key.clone(), pending_booking, pending.logical_sha256().unwrap(), None),
+            settled(orphan_key.clone(), [6; 16], [8; 32], None),
+        ];
+        let original = pipeline.durable();
+        assert!(original.require_portable_checkpoint().is_err());
+        assert!(original.settle_funded_checkpoint(&settlements[..1], 0).is_err());
+        let mut wrong = settlements.clone();
+        wrong[0].outcome.consumption_lsn = Some(1);
+        assert!(original.settle_funded_checkpoint(&wrong, 0).is_err());
+        let mut portable = original.settle_funded_checkpoint(&settlements, 0).unwrap();
+        let digest = funded_settlement_digest(INCARNATION, &settlements).unwrap();
+        assert_eq!(portable.funded_inventory_digest(INCARNATION).unwrap(), digest);
+        assert_eq!(original.tx_status(&pending.key).unwrap_err().code, "rtdb/transaction-pending");
+        let successor = [27; 16];
+        portable.restore_in(successor).unwrap();
+        let cut = portable.index().head();
+        let bytes = portable.encode_binary_checkpoint().unwrap();
+        let restored = TransactState::decode_binary_checkpoint(&bytes, cut).unwrap();
+        let (terminal, history) = restored.historical_funding(&accepted.key, None).unwrap().unwrap();
+        assert_eq!(terminal.outcome, receipt.outcome);
+        assert_eq!(terminal.basis, Basis::new(successor, receipt.basis.position()));
+        assert!(terminal.replayed && terminal.decision_clock.is_none());
+        assert_eq!(history.original_receipt_basis, Some(receipt.basis));
+        assert_eq!(history.outcome.booking, BOOKING);
+        for (key, booking) in [(&pending.key, pending_booking), (&orphan_key, [6; 16])] {
+            let (terminal, history) = restored.historical_funding(key, None).unwrap().unwrap();
+            assert!(matches!(&terminal.outcome, Outcome::Refused { error } if error.code == "rtdb/funded-booking-closed"));
+            assert_eq!(history.outcome.booking, booking);
+        }
+        assert!(restored.historical_funding(&accepted.key, Some(OWNER)).unwrap().is_none());
+        assert_eq!(restored.funded_inventory_digest(INCARNATION).unwrap(), digest);
+        let mut reopened = TransactPipeline::new(restored, cut.basis.position() + 1, 4).unwrap();
+        assert!(funded(&mut reopened, &accepted, None, consume(1_200_000)).is_err());
+    }
+
+    #[test]
     fn scoped_guards_and_window_ignore_hidden_clock_and_row() {
         let labels = LabelScope { read: [vec![1]].into(), write: Default::default() };
         let scope = ScopedTransact { labels: &labels, receipt_namespace: OWNER };

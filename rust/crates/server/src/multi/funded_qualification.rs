@@ -426,6 +426,85 @@ async fn offloaded_funded_record_keeps_its_exact_timed_proof() {
     assert_eq!(timed_stream::proof(original, verified), Ok(accepted));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn portable_backup_reopens_a_reconciled_funded_receipt_without_its_source() {
+    use rtdb_crypt::FileKms;
+    use rtdb_tx::transact::{FundedOutcome, FundedSettlement, Outcome, funded_settlement_digest};
+
+    const PRINCIPAL: &str = "urn:logkeeper:client:portable-funded";
+    let home = tempfile::tempdir().unwrap();
+    let vault = |name: &str| {
+        let path = home.path().join(name);
+        FileKms::create_directory(&path).unwrap();
+        Arc::new(FileKms::open(&path, || SystemClock.now().0).unwrap())
+    };
+    let source_keys = vault("source");
+    let destination_keys = vault("destination");
+    let mut source = LocalCluster::start_independent_catalog(&[PRINCIPAL]).await.unwrap();
+    let mut destination = LocalCluster::start_independent_catalog(&[PRINCIPAL]).await.unwrap();
+    let open_journal = |keepers: &LocalCluster| {
+        Arc::new(keepers.journal(PRINCIPAL, &keepers.journal_config(8 << 20, 1 << 20)).unwrap())
+    };
+    source.finalize_version(PRINCIPAL, CLUSTER_VERSION_CURRENT).await.unwrap();
+    destination.finalize_version(PRINCIPAL, CLUSTER_VERSION_CURRENT).await.unwrap();
+    let source_incarnation = Uuid::new_v4();
+    let successor = Uuid::new_v4();
+    let identity = Uuid::new_v4();
+    let scope = ActivationScope::new(identity, "portable-funded").unwrap();
+    let node = Ipv4Addr::LOCALHOST.into();
+    let options = |database| MultiOptions {
+        database, node, lease_micros: 60_000_000, drift_micros: 0,
+    };
+    let source_journal = open_journal(&source);
+    let mut original = MultiDatabase::new(
+        options(source_incarnation), source_journal.clone(), Arc::new(rtdb_storage::MemoryStore::default()),
+        source_keys.clone(), Arc::new(|| SystemClock.now()),
+    ).unwrap().with_immutable_journal().with_activation_scope(scope).unwrap();
+    original.create().await.unwrap();
+    original.tick(&BTreeSet::from([node])).await.unwrap();
+    // The issuer retained a booking even though its admission never reached the data journal.
+    let key = vec![7; 16];
+    let outcome = FundedOutcome {
+        booking: [8; 16],
+        owner: [9; 32],
+        predecessor: Basis::new(*source_incarnation.as_bytes(), 0),
+        intent_sha256: [10; 32],
+        appointment: false,
+        activation_lsn: None,
+        consumption_lsn: None,
+        evidence_sha256: [11; 32],
+    };
+    let settlements = [FundedSettlement { namespace: None, key: key.clone(), outcome }];
+    let digest = funded_settlement_digest(*source_incarnation.as_bytes(), &settlements).unwrap();
+    let head = source_journal.head(original.journal_stream()).await.unwrap();
+    assert!(original.portable_backup_with_funding(Some(Lsn(head.0 + 1)), &settlements).await.is_err());
+    let archive = original.portable_backup_with_funding(Some(head), &settlements).await.unwrap().into_bytes();
+    assert_eq!(original.tx_status(&key).await.unwrap_err().code, "rtdb/unknown-transaction");
+    drop(original);
+    source.shutdown().await.unwrap();
+
+    let backup = rtdb_db::PortableBackup::verify(&archive, source_keys).await.unwrap();
+    assert_eq!(backup.funded_inventory_sha256().unwrap(), digest);
+    let destination_journal = open_journal(&destination);
+    let store = Arc::new(rtdb_storage::MemoryStore::default());
+    let open = || MultiDatabase::new(
+        options(successor), destination_journal.clone(), store.clone(), destination_keys.clone(),
+        Arc::new(|| SystemClock.now()),
+    ).unwrap().with_immutable_journal().with_activation_scope(scope).unwrap();
+    let mut restored = open();
+    restored.create().await.unwrap();
+    restored.tick(&BTreeSet::from([node])).await.unwrap();
+    let installed = restored.install_portable_backup(backup).await.unwrap();
+    assert_eq!(installed.funded_inventory_sha256(), digest);
+    drop(restored);
+    let mut reopened = open();
+    assert_eq!(reopened.installed_backup().await.unwrap(), Some(installed));
+    let receipt = reopened.tx_status(&key).await.unwrap();
+    assert!(matches!(&receipt.outcome, Outcome::Refused { error } if error.code == "rtdb/funded-booking-closed"));
+    assert!(receipt.replayed && receipt.decision_clock.is_none());
+    destination.shutdown().await.unwrap();
+}
+
 struct WithholdTimedAppend {
     keeper_trust: Arc<dyn TimedOriginalVerifier>,
     verified_samples: AtomicUsize,

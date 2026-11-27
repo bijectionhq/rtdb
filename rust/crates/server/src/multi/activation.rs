@@ -39,6 +39,7 @@ const RECOVERY_HOSTED_CUSTODY_PROTOCOL: u8 = 7;
 const RANKED_RECOVERY_PROTOCOL: u8 = 8;
 const FUNDED_RECOVERY_PROTOCOL: u8 = 9;
 const FUNDED_SETTLEMENT_PROTOCOL: u8 = 10;
+const FUNDED_PORTABLE_PROTOCOL: u8 = 11;
 #[cfg(any(unix, feature = "backup-object-holds"))]
 const BROKER_FRAME_BYTES: usize = 16 * 1024;
 const RENEW_AHEAD: Duration = Duration::from_secs(1);
@@ -127,6 +128,7 @@ pub struct VerifiedSuccessor {
     key_hold: Option<rtdb_crypt::RecoveryKeyHold>,
     journal_hold: Option<journal_custody::RetainedJournal>,
     objects_sha256: Option<[u8; 32]>,
+    funded_inventory_sha256: Option<[u8; 32]>,
     source_cut: recovery::SourceCut,
 }
 
@@ -141,6 +143,7 @@ impl VerifiedSuccessor {
             key_hold: None,
             journal_hold: None,
             objects_sha256: None,
+            funded_inventory_sha256: installed.funded_inventory_sha256(),
             source_cut: recovery::SourceCut {
                 lsn: installed.source_lsn().0,
                 position: installed.source_basis().position(),
@@ -221,6 +224,13 @@ impl State {
 }
 
 impl ActivationAuthority {
+    pub(super) async fn funded_export_reader(
+        url: &str, credentials: super::Credentials, identity: Uuid, source_journal_url: &str,
+    ) -> Result<Arc<Self>> {
+        require_independent_journals(url, source_journal_url)?;
+        Self::connect(url, credentials, identity, Access::ConsensusReader).await
+    }
+
     async fn connect(
         url: &str,
         credentials: super::Credentials,
@@ -438,6 +448,7 @@ impl ActivationAuthority {
         if successor.predecessor != expected.incarnation
             || successor.successor != successor_incarnation(self.identity, name, expected, operation, successor.destination_cell)?
             || successor.successor == expected.incarnation
+            || successor.funded_inventory_sha256.is_some()
             || successor.activation_scope != Some(rtdb_db::ActivationScope::for_cell(self.identity, name, successor.destination_cell)?)
         {
             return Err(conflict());
@@ -978,6 +989,7 @@ mod tests {
             key_hold: None,
             journal_hold: None,
             objects_sha256: None,
+            funded_inventory_sha256: None,
             source_cut: recovery::SourceCut::default(),
             activation_scope: Some(rtdb_db::ActivationScope::new(authority.identity(), "xtdb").unwrap()),
         };
@@ -1034,6 +1046,7 @@ mod tests {
             key_hold: None,
             journal_hold: None,
             objects_sha256: None,
+            funded_inventory_sha256: None,
             source_cut: recovery::SourceCut::default(),
             activation_scope: Some(rtdb_db::ActivationScope::new(identity, "xtdb").unwrap()),
         };

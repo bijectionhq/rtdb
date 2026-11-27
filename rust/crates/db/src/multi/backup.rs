@@ -5,7 +5,7 @@ use rtdb_crypt::{Context, Generation, Kms, RecoveryKeyHold};
 use rtdb_format::journal::{Checkpoint, Manifest, ObjectId, Record};
 use rtdb_index::branches::BranchCut;
 use rtdb_store::{ObjectStore, ObjectVersionHold, read_file_bounded, read_fresh_manifest, read_versioned_file, read_versioned_manifest};
-use rtdb_tx::transact::{Receipt, TransactState};
+use rtdb_tx::transact::{FundedSettlement, Receipt, TransactState};
 use rtdb_types::{Anomaly, AnomalyCategory, PhysicalObjectVersion, Result, Timestamp, rtdb_v1::Basis};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -80,6 +80,10 @@ pub struct VerifiedBackup {
 }
 
 impl VerifiedBackup {
+    pub fn funded_inventory_sha256(&self) -> Result<Option<[u8; 32]>> {
+        self.transactions.funded_inventory_digest(self.source.cut.basis.incarnation())
+    }
+
     pub fn source_basis(&self) -> Basis {
         self.source.cut.basis
     }
@@ -108,6 +112,7 @@ pub struct InstalledBackup {
     destination_basis: Basis,
     manifest_sha256: [u8; 32],
     activation_scope: Option<crate::ActivationScope>,
+    funded_inventory_sha256: Option<[u8; 32]>,
 }
 
 pub struct BackupObjectReadback {
@@ -120,6 +125,10 @@ pub struct BackupObjectReadback {
 }
 
 impl InstalledBackup {
+    pub fn funded_inventory_sha256(&self) -> Option<[u8; 32]> {
+        self.funded_inventory_sha256
+    }
+
     pub fn source_incarnation(&self) -> Uuid {
         Uuid::from_bytes(self.source_basis().incarnation())
     }
@@ -151,6 +160,22 @@ impl InstalledBackup {
 
 impl MultiDatabase {
     pub async fn portable_backup(&mut self) -> Result<PortableBackup> {
+        self.capture_portable_backup(None).await
+    }
+
+    /// Exports a commissioned immutable cut after applying the authority's reconciled bookings.
+    pub async fn portable_backup_with_funding(
+        &mut self, final_source_lsn: Option<Lsn>, settlements: &[FundedSettlement],
+    ) -> Result<PortableBackup> {
+        if !self.stream.immutable_history() || self.stream.activation_scope.is_none() {
+            return Err(invalid_backup());
+        }
+        self.capture_portable_backup(Some((final_source_lsn, settlements))).await
+    }
+
+    async fn capture_portable_backup(
+        &mut self, funded: Option<(Option<Lsn>, &[FundedSettlement])>,
+    ) -> Result<PortableBackup> {
         Box::pin(async move {
             require_durable_custody(self.stream.kms.as_ref())?;
             self.refresh().await?;
@@ -179,7 +204,19 @@ impl MultiDatabase {
                 return Err(backup_dependencies());
             }
             let transactions = if writer_lease.is_some() { self.durable_transactions() } else { &state.transactions };
-            transactions.require_portable_checkpoint()?;
+            let settled = if let Some((expected, settlements)) = funded {
+                if expected.is_some_and(|expected| expected != through_lsn)
+                    || settlements.iter().any(|settled| settled.outcome.activation_lsn.into_iter()
+                        .chain(settled.outcome.consumption_lsn).any(|lsn| lsn > through_lsn.0))
+                {
+                    return Err(invalid_backup());
+                }
+                Some(transactions.settle_funded_checkpoint(settlements, state.coordinates.offset)?)
+            } else {
+                transactions.require_portable_checkpoint()?;
+                None
+            };
+            let transactions = settled.as_ref().unwrap_or(transactions);
             let cut = transactions.index().head();
             let checkpoint = transactions.encode_binary_checkpoint()?;
             let prior_index = if let Some((index, relocations)) = read_relocation_index(
@@ -247,14 +284,17 @@ impl MultiDatabase {
         &mut self, backup: VerifiedBackup, hold: Option<RecoveryKeyHold>,
     ) -> Result<InstalledBackup> {
         Box::pin(async move {
+            let funded_inventory_sha256 = backup.funded_inventory_sha256()?;
             let VerifiedBackup { source, manifest_sha256, mut transactions, files, source_kms, source_generation } = backup;
             if source.cut.basis.incarnation() == self.incarnation() {
                 return Err(Anomaly::incorrect("rtdb/restore-same-deployment", "Restore needs a fresh deployment identity"));
             }
             self.refresh().await?;
             self.require_active()?;
-            if let Some(installed) = self.applied_backup() {
-                if installed.manifest_sha256 == manifest_sha256 && installed.source == source {
+            if let Some(installed) = self.applied_backup()? {
+                if installed.manifest_sha256 == manifest_sha256 && installed.source == source
+                    && installed.funded_inventory_sha256 == funded_inventory_sha256
+                {
                     self.verify_installed_files().await?;
                     if let Some(hold) = hold {
                         self.check_backup_key_hold(hold, self.staged_backup_checkpoint()?.key_generation)?;
@@ -311,6 +351,7 @@ impl MultiDatabase {
                 destination_basis: cut.basis,
                 manifest_sha256,
                 activation_scope: self.stream.activation_scope,
+                funded_inventory_sha256,
             })
         }).await
     }
@@ -328,7 +369,7 @@ impl MultiDatabase {
         self.refresh().await?;
         self.require_active()?;
         self.verify_installed_files().await?;
-        Ok(self.applied_backup())
+        self.applied_backup()
     }
 
     pub async fn installed_backup_file_relocations(&mut self) -> Result<Vec<BackupFileRelocation>> {
@@ -354,7 +395,7 @@ impl MultiDatabase {
     ) -> Result<BackupObjectReadback> {
         self.refresh().await?;
         self.require_active()?;
-        let installed = self.applied_backup().filter(|installed| {
+        let installed = self.applied_backup()?.filter(|installed| {
             installed.activation_scope().is_some() && installed.manifest_sha256() == archive_sha256
         }).ok_or_else(invalid_backup)?;
         let state = self.state();
@@ -409,7 +450,7 @@ impl MultiDatabase {
 
     async fn verify_installed_files(&self) -> Result<Vec<BackupFileRelocation>> {
         let state = self.state();
-        if self.applied_backup().is_none() {
+        if !state.coordinates.origin.is_some_and(|origin| origin.backup.is_some()) {
             return Ok(Vec::new());
         }
         let checkpoint = self.installed_backup_checkpoint()?;
@@ -453,14 +494,18 @@ impl MultiDatabase {
         Ok(checkpoint)
     }
 
-    fn applied_backup(&self) -> Option<InstalledBackup> {
-        let origin = self.state().coordinates.origin?;
-        Some(InstalledBackup {
-            source: origin.backup?,
+    fn applied_backup(&self) -> Result<Option<InstalledBackup>> {
+        let state = self.state();
+        let Some((origin, source)) = state.coordinates.origin.and_then(|origin| origin.backup.map(|source| (origin, source))) else {
+            return Ok(None);
+        };
+        Ok(Some(InstalledBackup {
+            source,
             destination_basis: Basis::new(self.incarnation(), origin.through),
             manifest_sha256: origin.digest,
             activation_scope: self.stream.activation_scope,
-        })
+            funded_inventory_sha256: state.transactions.funded_inventory_digest(source.cut.basis.incarnation())?,
+        }))
     }
 
     pub(super) async fn install_restored_state(

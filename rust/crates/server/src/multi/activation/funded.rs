@@ -6,8 +6,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
-    ActivationAuthority, Binding, ELAPSED_GRANT_PROTOCOL, FUNDED_RECOVERY_PROTOCOL,
-    FUNDED_SETTLEMENT_PROTOCOL, State, conflict, corrupt, unavailable,
+    ActivationAuthority, Binding, ELAPSED_GRANT_PROTOCOL, FUNDED_PORTABLE_PROTOCOL,
+    FUNDED_RECOVERY_PROTOCOL, FUNDED_SETTLEMENT_PROTOCOL, State, conflict, corrupt, unavailable,
 };
 
 pub(super) mod settlement;
@@ -158,7 +158,7 @@ impl State {
             Some(funded) => {
                 matches!(
                     self.version,
-                    FUNDED_RECOVERY_PROTOCOL | FUNDED_SETTLEMENT_PROTOCOL
+                    FUNDED_RECOVERY_PROTOCOL | FUNDED_SETTLEMENT_PROTOCOL | FUNDED_PORTABLE_PROTOCOL
                 ) && funded.base_version >= ELAPSED_GRANT_PROTOCOL
                     && valid_scopes(stream, self.binding, &funded.scopes)
                     && funded
@@ -173,13 +173,13 @@ impl State {
             None => {
                 !matches!(
                     self.version,
-                    FUNDED_RECOVERY_PROTOCOL | FUNDED_SETTLEMENT_PROTOCOL
+                    FUNDED_RECOVERY_PROTOCOL | FUNDED_SETTLEMENT_PROTOCOL | FUNDED_PORTABLE_PROTOCOL
                 ) && closed.is_none_or(|(_, scopes)| scopes.is_empty())
             }
         }
     }
 
-    fn funded_scopes(&self) -> &[Scope] {
+    pub(super) fn funded_scopes(&self) -> &[Scope] {
         self.funded.as_ref().map_or(&[], |funded| &funded.scopes)
     }
 
@@ -242,7 +242,7 @@ impl ActivationAuthority {
                         let mut next = state.clone();
                         next.funded.as_mut().ok_or_else(corrupt)?.scopes[index].journal =
                             journal.clone();
-                        next.version = FUNDED_SETTLEMENT_PROTOCOL;
+                        next.version = FUNDED_PORTABLE_PROTOCOL;
                         return Ok(Some(next));
                     }
                     Ok(_) => return Err(conflict()),
@@ -268,7 +268,7 @@ impl ActivationAuthority {
                         closure: None,
                     },
                 );
-                next.version = FUNDED_SETTLEMENT_PROTOCOL;
+                next.version = FUNDED_PORTABLE_PROTOCOL;
                 Ok(Some(next))
             })
             .await?;
@@ -312,7 +312,7 @@ impl ActivationAuthority {
                 let mut next = state.clone();
                 next.funded.as_mut().ok_or_else(corrupt)?.scopes[index].closure =
                     Some(closure.clone());
-                next.version = FUNDED_SETTLEMENT_PROTOCOL;
+                next.version = FUNDED_PORTABLE_PROTOCOL;
                 Ok(Some(next))
             })
             .await?;
@@ -478,6 +478,7 @@ mod tests {
             key_hold: None,
             journal_hold: None,
             objects_sha256: None,
+            funded_inventory_sha256: None,
             source_cut: SourceCut {
                 lsn: 3,
                 position: 1,
@@ -561,7 +562,7 @@ mod tests {
                 .await
                 .unwrap()
                 .grant_protocol_version,
-            FUNDED_SETTLEMENT_PROTOCOL
+            FUNDED_PORTABLE_PROTOCOL
         );
         assert!(authority.close_grants("xtdb", predecessor).await.is_err());
 

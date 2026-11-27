@@ -817,6 +817,7 @@ mod tests {
                 key_hold: None,
                 journal_hold: None,
                 objects_sha256: None,
+                funded_inventory_sha256: None,
                 activation_scope: Some(rtdb_db::ActivationScope::new(identity, "xtdb").unwrap()),
                 source_cut: SourceCut { lsn: 3, position: 3, system_time: 4 },
             }).await.unwrap();
@@ -909,6 +910,7 @@ mod tests {
             key_hold: None,
             journal_hold: None,
             objects_sha256: None,
+            funded_inventory_sha256: None,
             activation_scope: Some(rtdb_db::ActivationScope::new(identity, "xtdb").unwrap()),
             source_cut: SourceCut {
                 lsn: 3,
