@@ -1133,6 +1133,14 @@ contract EpochScopedStorage {
         -- A pin deadline closes admission, and admitted work drains before Unpin commits.
         -- An in-database branch's base history remains in the current checkpoint's file set.
 
+    @invariant RankedAdmissionClosure
+        -- The original object provider orders each ranked publication and admission closure on the same conditional scope root.
+        -- The scope binds the commissioned activation identity and source incarnation.
+        -- A published sequence slot retains the exact catalogue and remains discoverable without its operation ID.
+        -- Closure is irreversible and exposes the final immutable inventory through sequence pages.
+        -- A staged slot outside the committed prefix grants no admission.
+        -- An exact retry observes its original sequence even after closure.
+
     @invariant PermanentUnreachability
         -- In Multi mode the writer captures all retained records through a committed head after sealing.
         -- In default mode the confirmed leader supplies the retained checkpoint, replica records, pins and inputs of admitted reads and compaction under its term.

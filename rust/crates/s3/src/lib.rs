@@ -16,7 +16,7 @@ use aws_credential_types::provider::SharedCredentialsProvider;
 use object_store::{RetryConfig, StaticCredentialProvider, aws::{AmazonS3Builder, AmazonS3ConfigKey, AwsCredential, S3ConditionalPut, S3CopyIfNotExists}, client::ReqwestConnector};
 use rtdb_format::generated::xtdb::aws::proto as pb;
 use rtdb_format::keys::StorageRoot;
-use rtdb_storage::{IoRegion, ObjectKey, ObjectStore, remote::{RemoteKeyLayout, RemoteStore, cache_http}};
+use rtdb_storage::{IoRegion, ObjectKey, ObjectStore, remote::{RankedAdmission, RankedAdmissionScope, RemoteKeyLayout, RemoteStore, cache_http}};
 use rtdb_types::{Anomaly, Result, S3ObjectNamespace};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -151,6 +151,23 @@ impl S3Config {
     /// The owner closes and joins `io` after store consumers finish and before shutting down the runtime.
     pub async fn open(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>> {
         self.open_classic(storage_root, remotes, io, RemoteKeyLayout::Escaped).await
+    }
+
+    /// Opens ranked admission on the same original provider allocation as serving objects.
+    pub async fn ranked_admission(
+        &self,
+        storage_root: &ObjectKey,
+        remotes: &dyn S3CredentialResolver,
+        io: Arc<IoRegion>,
+        scope: RankedAdmissionScope,
+    ) -> Result<RankedAdmission> {
+        if self.terminal_scope.is_some() {
+            return Err(Anomaly::incorrect("xtdb.aws/terminal-scope", "Ranked admission requires an ordinary S3 allocation"));
+        }
+        self.require_cell_root(storage_root)?;
+        self.open_store(storage_root, remotes, io, StoreKind::Classic(RemoteKeyLayout::Escaped))
+            .await?
+            .ranked_admission(scope)
     }
 
     pub async fn open_classic_jvm_literal(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>> {

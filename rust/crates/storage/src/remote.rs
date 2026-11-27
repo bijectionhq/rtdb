@@ -13,6 +13,9 @@ pub use crate::{object_store::strong_entity_tag, valid_object_version};
 mod catalog;
 #[path = "remote_read_drain.rs"]
 mod read_drain;
+#[path = "remote_ranked_admission.rs"]
+mod ranked_admission;
+pub use ranked_admission::{ClosedRankedAdmission, RankedAdmission, RankedAdmissionPage, RankedAdmissionScope};
 #[cfg(feature = "remote-cache-http")]
 pub mod cache_http;
 
