@@ -1135,9 +1135,16 @@ impl crate::columnar::BatchCursor for BatchUnnest {
     async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> {
         let context = Arc::clone(&self.execution.context);
         while let Some(batch) = crate::columnar::poll_nested_batch(self.input.as_mut()).await? {
-            if let Some(position) = self.position
-                && let Some(output) = batch.expand_list(position, self.ordinality.as_deref(), self.outer, &context)?
-            {
+            let ordinality = self.ordinality.as_deref();
+            let output = if let Some(position) = self.position {
+                batch.expand_list(position, ordinality, self.outer, &context)?
+            } else if let Some((column, owner)) = crate::columnar::lists::numeric_constructor(&self.expr, &self.schema, &batch, &self.execution).await? {
+                let expanded = batch.expand_list_column((&column, &owner), ordinality, self.outer, &context)?;
+                Some(expanded.ok_or_else(|| rtdb_types::Anomaly::fault("rtdb.query/list-result", "An Arrow list constructor produced an unreadable list"))?)
+            } else {
+                None
+            };
+            if let Some(output) = output {
                 if output.len != 0 { return Ok(Some(output)); }
                 continue;
             }

@@ -4,6 +4,7 @@ pub(crate) mod apply;
 mod concat;
 pub(crate) mod float_vector;
 mod float_vectors;
+pub(crate) mod lists;
 pub(crate) mod functions;
 mod patch;
 pub(crate) mod periods;
@@ -790,7 +791,12 @@ impl ColumnBatch {
 
     pub(crate) fn expand_list(&self, position: usize, ordinality: Option<&str>, outer: bool, context: &crate::QueryContext)
         -> Result<Option<Self>> {
-        let Some(expansion) = self.list_expansion(position, None, ordinality.is_some(), outer, context)? else {
+        self.expand_list_column((&self.columns[position], self.column_reservation(position)), ordinality, outer, context)
+    }
+
+    pub(crate) fn expand_list_column(&self, list: (&Column, &Arc<MemoryReservation>), ordinality: Option<&str>, outer: bool,
+        context: &crate::QueryContext) -> Result<Option<Self>> {
+        let Some(expansion) = self.list_column_expansion(list, None, ordinality.is_some(), outer, context)? else {
             return Ok(None);
         };
         let runs = Arc::clone(&expansion.runs);
@@ -804,6 +810,12 @@ impl ColumnBatch {
 
     fn list_expansion(&self, position: usize, expected: Option<&LogicalType>, narrow_ordinality: bool, outer: bool,
         context: &crate::QueryContext) -> Result<Option<UnnestExpansion>> {
+        self.list_column_expansion((&self.columns[position], self.column_reservation(position)), expected, narrow_ordinality, outer, context)
+    }
+
+    fn list_column_expansion(&self, (list, list_owner): (&Column, &Arc<MemoryReservation>), expected: Option<&LogicalType>,
+        narrow_ordinality: bool, outer: bool,
+        context: &crate::QueryContext) -> Result<Option<UnnestExpansion>> {
         let skip_empty_variable_lists = expected.is_some_and(|ty| {
             let ty = match ty { LogicalType::Maybe(inner) => inner.as_ref(), ty => ty };
             !matches!(ty, LogicalType::List { kind: ListKind::FixedSizeList(_), .. })
@@ -814,8 +826,6 @@ impl ColumnBatch {
         let mut layouts = HashSet::new();
         let mut sources = vec![None];
         let mut runs = UnnestRows::new(memory)?;
-        let list = &self.columns[position];
-        let list_owner = self.column_reservation(position);
         for row in 0..self.len {
             context.check_cancelled_at(row)?;
             let vector = match list {
@@ -841,7 +851,7 @@ impl ColumnBatch {
                         lease.grow_to(lease.bytes().checked_add(bytes).ok_or_else(size_error)?)?;
                         let inferred = if logical.is_none() && expected.is_some() { rtdb_columnar::from_field(field).ok() } else { None };
                         let Some(logical) = logical.or(inferred.as_ref()) else { return Ok(None); };
-                        let readable = readable_list_type(logical, field)
+                        let readable = readable_list_type(logical, field, expected.is_none())
                             || (expected.is_some() && readable_mixed_unnest_layout(logical, field, true));
                         if expected.is_some_and(|expected| expected.join(logical) != *expected)
                             || !stable_read_layout(logical, field) || !readable
@@ -3601,7 +3611,7 @@ pub(crate) fn stable_read_layout(logical: &LogicalType, field: &ArrowField) -> b
     stable_values(logical) && rtdb_columnar::execution_type(logical) == *logical && rtdb_columnar::from_field(field).is_ok_and(|ty| ty == *logical)
 }
 
-fn readable_list_type(logical: &LogicalType, field: &ArrowField) -> bool {
+fn readable_list_type(logical: &LogicalType, field: &ArrowField, numeric_unions: bool) -> bool {
     fn readable(field: &ArrowField) -> bool {
         match field.data_type() {
             DataType::Null => field.is_nullable(),
@@ -3614,8 +3624,9 @@ fn readable_list_type(logical: &LogicalType, field: &ArrowField) -> bool {
     let logical = match logical { LogicalType::Maybe(inner) => inner.as_ref(), ty => ty };
     match (logical, field.data_type()) {
         (LogicalType::Null, DataType::Null) => true,
-        (LogicalType::List { kind: ListKind::List | ListKind::FixedSizeList(_) | ListKind::Set, .. },
-         DataType::List(child) | DataType::FixedSizeList(child, _)) => readable(child),
+        (LogicalType::List { kind: kind @ (ListKind::List | ListKind::FixedSizeList(_) | ListKind::Set), .. },
+         DataType::List(child) | DataType::FixedSizeList(child, _)) => readable(child)
+            || (numeric_unions && *kind != ListKind::Set && lists::readable_numeric_union(child)),
         _ => false,
     }
 }
@@ -4399,6 +4410,44 @@ mod tests {
         drop((elements, expansion));
         assert!(owner.upgrade().is_none());
         assert_eq!(memory.used_bytes(), baseline);
+    }
+
+    #[test]
+    fn numeric_list_batch_unnest_keeps_null_and_active_fixed_and_variable_children() {
+        let memory = MemoryBudget::new(1 << 20);
+        let catalog = crate::CatalogSnapshot::new("xtdb", [("xtdb".into(), crate::DatabaseSnapshot {
+            partitions: vec![],
+            storage: Arc::new(rtdb_storage::cache::BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
+        })].into(), false).unwrap();
+        let context = crate::QueryContext::new(catalog, Arc::clone(&memory), Timestamp(0), "UTC", Default::default(),
+            &tokio_util::sync::CancellationToken::new()).unwrap();
+        let baseline = memory.used_bytes();
+        let element = LogicalType::from_legs([LogicalType::Scalar(ScalarType::I64), LogicalType::Scalar(ScalarType::F32), LogicalType::Null]);
+
+        for kind in [ListKind::List, ListKind::FixedSizeList(2)] {
+            let list = |values| match kind {
+                ListKind::List => Value::list(values),
+                _ => Value::FixedSizeList(values.into()),
+            };
+            let values = [list(vec![Value::I64(6), Value::Null]), Value::Null, list(vec![Value::F32(-0.0), Value::I64(7)])];
+            let logical = LogicalType::List { kind: kind.clone(), element: Box::new(element.clone()) }.maybe();
+            let array = rtdb_columnar::build_array(&logical, &values).unwrap();
+            let field = Arc::new(rtdb_columnar::to_field("items", &logical).unwrap());
+            let batch = ColumnBatch::settled(vec![Column::Arrow { array, field, logical: Some(logical) }], 3, memory.reserve(4096).unwrap()).unwrap();
+            let batch = batch.select(&[false, true, true], &memory).unwrap();
+            let output = batch.expand_list(0, Some("ordinal"), true, &context).unwrap().unwrap();
+            drop(batch);
+            assert_eq!(output.len, 3);
+            assert_eq!(output.columns[0].value(0).unwrap(), Value::Null);
+            assert_eq!(output.columns[0].value(1).unwrap(), values[2]);
+            assert!(matches!(output.columns[1].value(1).unwrap(), Value::F32(value) if value.to_bits() == (-0.0f32).to_bits()));
+            assert_eq!(output.columns[1].value(0).unwrap(), Value::Null);
+            assert_eq!(output.columns[1].value(2).unwrap(), Value::I64(7));
+            let ordinals = (0..output.len).map(|row| output.columns[2].value(row).unwrap()).collect::<Vec<_>>();
+            assert_eq!(ordinals, [Value::Null, Value::I32(1), Value::I32(2)]);
+            drop(output);
+            assert_eq!(memory.used_bytes(), baseline);
+        }
     }
 
     #[tokio::test]
@@ -5664,6 +5713,11 @@ impl BatchCursor for BatchExpressions {
                     Err(error) if matches!(kernel, rtdb_plan::Expr::List(_)) && error.is(rtdb_types::AnomalyKind::ResourceExhausted) => {},
                     Err(error) => return Err(error),
                 }
+            }
+            if let Some((column, owner)) = lists::numeric_constructor(expression, &self.schema, &batch, &self.execution).await? {
+                columns.push(column);
+                owners[index] = Some(owner);
+                continue;
             }
             if let Some(projection) = self.functions[index].as_ref() {
                 let admission = &self.admissions[index];

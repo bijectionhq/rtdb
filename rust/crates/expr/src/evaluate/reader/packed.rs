@@ -7,7 +7,8 @@ use super::{EvalValue, Kind, ListReader, PackedList, Target};
 use crate::{evaluate::EvalContext, list_cast, scalar_list_cast};
 
 pub(super) fn cast(
-    input: &EvalValue<'_>, element: Target<'_>, selection: Range<usize>, projection: bool, context: &EvalContext<'_>,
+    input: &EvalValue<'_>, element: Target<'_>, union_admitted: bool, selection: Range<usize>,
+    projection: bool, context: &EvalContext<'_>,
 ) -> Result<Option<PackedList>> {
     let EvalValue::List(Kind::List | Kind::Fixed, reader) = input else { return Ok(None); };
     let fixed;
@@ -15,7 +16,18 @@ pub(super) fn cast(
         Target::Cast(target) => target,
         Target::Fixed(ty) => { fixed = CastTarget::fixed(ty.clone()); &fixed }
     };
-    if target.union_target().is_some() { return Ok(None); }
+    if target.union_target().is_some() {
+        if union_admitted
+            && let ListReader::Arrow { cell, .. } = reader.as_ref()
+            && let Some(span) = cell.numeric_list_span_range(selection)
+        {
+            let per_component = 2 * std::mem::size_of::<rtdb_types::Value>() + 32;
+            context.reserve(span.len().checked_mul(per_component).and_then(|bytes| bytes.checked_add(4096))
+                .ok_or_else(crate::numeric::overflow)?)?;
+            return Ok(rtdb_columnar::repack_numeric_list(&span, true).map(PackedList::from));
+        }
+        return Ok(None);
+    }
     let reserve = |bytes| context.reserve(bytes);
     let stored;
     let source = match reader.as_ref() {
@@ -65,4 +77,35 @@ pub(super) fn cast(
 fn target_is_float(target: &CastTarget) -> bool {
     matches!(list_cast::scalar_target(target),
         Some(list_cast::Target::Scalar(rtdb_types::ScalarType::F32 | rtdb_types::ScalarType::F64)))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_schema::Field;
+    use rtdb_columnar::ArrowCell;
+    use rtdb_types::{LogicalType, ScalarType, Value};
+
+    use super::*;
+
+    #[test]
+    fn accepted_borrowed_union_list_cast_packs_only_the_selected_children() {
+        let values = ListValue::from(vec![Value::F64(2.0), Value::F32(-0.0), Value::I64(7), Value::Null]);
+        let (child_field, child) = values.packed_column().unwrap();
+        let lists = rtdb_columnar::build_list_array(child_field, vec![0, 1, 4].into(), &child, None).unwrap();
+        let field = Field::new("items", lists.data_type().clone(), false);
+        let input = |row| EvalValue::List(Kind::List, Arc::new(ListReader::Arrow {
+            cell: ArrowCell { array: lists.as_ref(), field: &field, row }, backing: None,
+        }));
+        let target = LogicalType::from_legs([LogicalType::Scalar(ScalarType::I64), LogicalType::Scalar(ScalarType::F32), LogicalType::Null]);
+        let context = EvalContext::default();
+        assert!(cast(&input(0), Target::Fixed(&target), false, 0..1, false, &context).unwrap().is_none());
+        let actual = cast(&input(1), Target::Fixed(&target), true, 0..3, false, &context).unwrap().unwrap().values;
+        assert!(actual.array().is_some());
+        assert_eq!(actual.element_type(), target);
+        assert!(matches!(actual.get(0).as_deref(), Some(Value::F32(value)) if value.to_bits() == (-0.0f32).to_bits()));
+        assert_eq!(actual.get(1).as_deref(), Some(&Value::I64(7)));
+        assert_eq!(actual.get(2).as_deref(), Some(&Value::Null));
+    }
 }

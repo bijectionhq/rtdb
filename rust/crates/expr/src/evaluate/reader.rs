@@ -416,6 +416,19 @@ pub(super) async fn execute_list_async(expr: &Expr, schema: &Schema, row: Expres
     Ok(super::EvaluatedList { storage })
 }
 
+pub(super) async fn append_list_items(
+    items: &[Expr], schema: &Schema, row: ExpressionRow<'_>, context: &EvalContext<'_>,
+    replacements: &Replacements<'_>, builder: &mut rtdb_types::ListBuilder,
+) -> Result<()> {
+    let frame = EvaluationFrame { schema, row, context, asynchronous: true, replacements: Some(replacements) };
+    let list = make_list(Kind::List, ListReader::Expressions(items), &frame)?;
+    for index in 0..items.len() {
+        append_list_element(&list, index, &frame, builder, false).await?;
+        if index % 1024 == 1023 { tokio::task::yield_now().await; }
+    }
+    Ok(())
+}
+
 fn clone_value<'a>(value: &EvalValue<'a>,frame: &EvaluationFrame<'_>) -> Result<EvalValue<'a>> {
     if let EvalValue::Scalar(value) = value { frame.context.reserve(value.retained_bytes()?)?; }
     Ok(value.clone())
@@ -588,7 +601,9 @@ fn packed_slice(value: &EvalValue<'_>, offset: usize, count: usize, projection: 
             let values = rtdb_types::ListValue::from_numeric_arrow(Arc::new(field.clone()), array);
             Ok(values.map(PackedList::from))
         }
-        ListReader::Cast { input, element, .. } => packed::cast(input, *element, offset..end, projection, context),
+        ListReader::Cast { input, element, union_admitted } => {
+            packed::cast(input, *element, *union_admitted, offset..end, projection, context)
+        }
         ListReader::Trim { input, size } if end <= crate::collection::view_size(*size)? => {
             packed_slice(input, offset, count, projection, context)
         }
@@ -675,8 +690,8 @@ fn materialize<'a>(value: EvalValue<'a>,frame: &'a EvaluationFrame<'a>) -> Resul
                     }
                 }
                 if let EvalValue::List(Kind::List, reader) = &value
-                    && let ListReader::Cast { input, element, .. } = reader.as_ref()
-                    && let Some(PackedList { values, .. }) = packed::cast(input, *element, 0..len(input)?, false, frame.context)?
+                    && let ListReader::Cast { input, element, union_admitted } = reader.as_ref()
+                    && let Some(PackedList { values, .. }) = packed::cast(input, *element, *union_admitted, 0..len(input)?, false, frame.context)?
                 {
                     return Ok(Value::List(values));
                 }

@@ -327,22 +327,94 @@ async fn evaluated_values_feed_the_batch_executor_as_arrow() {
 }
 
 #[tokio::test]
-async fn unnesting_a_computed_list_keeps_parent_payloads_in_arrow() {
+async fn numeric_list_batch_unnest_shares_one_child_array_across_parents() {
+    use rtdb_plan::BinaryOp;
+
     let execution = execution(128);
+    let baseline = execution.context.memory.used_bytes();
     let input = table(&[2, 3]);
     let parent = input.schema().fields()[0].expression();
-    let element = Field { id: ColumnId(1), name: "element".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: LogicalType::Scalar(ScalarType::I64) };
+    let element_type = LogicalType::from_legs([LogicalType::Scalar(ScalarType::I64), LogicalType::Scalar(ScalarType::F32), LogicalType::Null]);
+    let element = Field { id: ColumnId(1), name: "element".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: element_type };
     let ordinal = Field { id: ColumnId(2), name: "ordinal".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: LogicalType::Scalar(ScalarType::I32) };
-    let expr = Expr::List(vec![parent, Expr::Literal(Value::I64(9))]);
+    let expr = Expr::List(vec![
+        Expr::binary(BinaryOp::Add, parent, Expr::Literal(Value::I64(7))),
+        Expr::Literal(Value::F32(-0.0)),
+        Expr::Literal(Value::Null),
+    ]);
     let schema = Schema::new(vec![input.schema().fields()[0].clone(), element.clone(), ordinal.clone()]).unwrap();
     let relation = Arc::new(Relation::new(schema, RelationNode::Unnest { input, expr, element, ordinality: Some(ordinal), outer: false }).unwrap());
     let runtime = EmittedRelation::derive(relation, &execution.context.catalog, &[], &execution.context.memory).unwrap();
+    let mut batches = build_columns(runtime, execution.clone()).await.unwrap().unwrap();
+    let batch = batches.next_batch().await.unwrap().unwrap();
+    assert!(batches.next_batch().await.unwrap().is_none());
+    drop(batches);
+    assert_eq!(batch.len, 6);
+    assert!(!matches!(batch.columns[0], crate::columnar::Column::Values(_)));
+    let (child, ..) = batch.columns[1].arrow_cell(0).unwrap().unwrap();
+    assert_eq!(child.len(), 6);
+    let expected = [
+        (2, Value::I64(9), 1), (2, Value::F32(-0.0), 2), (2, Value::Null, 3),
+        (3, Value::I64(10), 1), (3, Value::F32(-0.0), 2), (3, Value::Null, 3),
+    ];
+    for (row, (parent, element, ordinal)) in expected.into_iter().enumerate() {
+        let (array, ..) = batch.columns[1].arrow_cell(row).unwrap().unwrap();
+        assert!(std::ptr::eq(array, child));
+        assert_eq!(batch.columns[0].value(row).unwrap(), Value::I64(parent));
+        let actual = batch.columns[1].value(row).unwrap();
+        assert_eq!(actual, element);
+        if let Value::F32(value) = actual { assert_eq!(value.to_bits(), (-0.0f32).to_bits()); }
+        assert_eq!(batch.columns[2].value(row).unwrap(), Value::I32(ordinal));
+    }
+    drop(batch);
+    assert_eq!(execution.context.memory.used_bytes(), baseline);
+}
+
+#[tokio::test]
+async fn numeric_list_batch_projection_retains_the_list_and_element_layout() {
+    use arrow_array::{Array, ListArray};
+    use rtdb_plan::{BinaryOp, NamedExpr};
+
+    let execution = execution(128);
+    let input = table(&[2, 3]);
+    let parent = input.schema().fields()[0].expression();
+    let expr = Expr::List(vec![
+        Expr::binary(BinaryOp::Add, parent, Expr::Literal(Value::I64(7))),
+        Expr::Literal(Value::Null),
+    ]);
+    let field = Field { id: ColumnId(1), name: "items".into(), data_type: expr.data_type(), ..input.schema().fields()[0].clone() };
+    let relation = Arc::new(input.project(vec![NamedExpr { field, expr }]).unwrap());
+    let runtime = EmittedRelation::derive(relation, &execution.context.catalog, &[], &execution.context.memory).unwrap();
     let mut batches = build_columns(runtime, execution).await.unwrap().unwrap();
     let batch = batches.next_batch().await.unwrap().unwrap();
-    assert_eq!(batch.len, 4);
-    assert!(!matches!(batch.columns[0], crate::columnar::Column::Values(_)));
-    assert_eq!(batch.columns[1].value(2).unwrap(), Value::I64(3));
-    assert_eq!(batch.columns[2].value(3).unwrap(), Value::I32(2));
+    let crate::columnar::Column::Arrow { array, .. } = &batch.columns[0] else { panic!("expected one list array"); };
+    let array = array.as_any().downcast_ref::<ListArray>().unwrap();
+    assert_eq!(array.value_offsets(), [0, 2, 4]);
+    assert_eq!(array.null_count(), 0);
+    assert_eq!(batch.columns[0].value(0).unwrap(), Value::list(vec![Value::I64(9), Value::Null]));
+    assert_eq!(batch.columns[0].value(1).unwrap(), Value::list(vec![Value::I64(10), Value::Null]));
+}
+
+#[tokio::test]
+async fn numeric_list_batch_unnest_reports_the_first_reached_element_error() {
+    use rtdb_plan::BinaryOp;
+
+    let execution = execution(128);
+    let baseline = execution.context.memory.used_bytes();
+    let input = table(&[0, 1]);
+    let element = Field { id: ColumnId(1), name: "element".into(), ..input.schema().fields()[0].clone() };
+    let parent = input.schema().fields()[0].expression();
+    let expr = Expr::List(vec![
+        Expr::binary(BinaryOp::Add, Expr::Literal(Value::I64(i64::MAX)), parent.clone()),
+        Expr::binary(BinaryOp::Divide, Expr::Literal(Value::I64(1)), parent),
+    ]);
+    let schema = Schema::new(vec![input.schema().fields()[0].clone(), element.clone()]).unwrap();
+    let relation = Arc::new(Relation::new(schema, RelationNode::Unnest { input, expr, element, ordinality: None, outer: false }).unwrap());
+    let runtime = EmittedRelation::derive(relation, &execution.context.catalog, &[], &execution.context.memory).unwrap();
+    let mut batches = build_columns(runtime, execution.clone()).await.unwrap().unwrap();
+    assert_eq!(batches.next_batch().await.err().unwrap().code, "xtdb.expression/division-by-zero");
+    drop(batches);
+    assert_eq!(execution.context.memory.used_bytes(), baseline);
 }
 
 #[tokio::test]

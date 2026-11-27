@@ -2520,6 +2520,8 @@ surface QueryAccess {
         -- A missing keyed collection yields null for ARRAY_AGG and an empty list for VEC_AGG.
         -- Short-circuiting correlated queries observe the dependent plan's semantic pages.
         -- UNNEST over compatible Arrow lists retains each selected child span under its source owner and repeats the corresponding parent position for its elements.
+        -- A computed numeric list constructor evaluates items in row and expression order and can publish one Arrow list column per input page.
+        -- UNNEST of that constructor uses its shared child array and preserves element nulls, active numeric types, and per-list ordinality.
         -- A RANGE_BINS projection over a compatible period column with a constant stride and default origin can write one Arrow list column of bin endpoints and weights per input page.
         -- A null period or an unbounded upper endpoint produces a null list.
         -- A period projection can write compatible zoned microsecond endpoints directly to Arrow, with a null endpoint denoting the corresponding infinity.
@@ -2576,6 +2578,7 @@ surface QueryAccess {
         -- A reached random expression draws once for each selected element.
         -- Supported list casts write typed child buffers using scalar conversion rules, including mixed numeric and text inputs and session-clock time-to-timestamp casts.
         -- Nullable element targets preserve union remapping.
+        -- A nullable or union element cast that accepts the observed numeric types of a borrowed list can pack its selected components directly.
         -- Numeric list predicates read the active child buffers and apply scalar equality and ordering in list order.
         -- Integer and decimal pairs compare exactly, pairs that include a float use scalar binary64 comparison, and strict equality preserves numeric categories.
         -- A struct expression over compatible Arrow fields retains the child arrays, including admitted computed fields.

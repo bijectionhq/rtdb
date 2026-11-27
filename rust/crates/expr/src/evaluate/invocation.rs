@@ -184,6 +184,17 @@ impl<'expr> ExpressionInvocation<'expr> {
         reader::execute_list_async(self.expression,self.schema,row,context,Some(&self.replacements)).await
     }
 
+    /// Appends the items of a numeric list constructor in expression order to a caller-owned builder.
+    /// The caller bounds the builder for all rows and admits constructors with only primitive numeric or null results.
+    pub async fn append_numeric_list_items(
+        &self, row: ExpressionRow<'_>, context: &EvalContext<'_>, builder: &mut ListBuilder,
+    ) -> Result<()> {
+        let Expr::List(items) = self.expression else {
+            return Err(Anomaly::fault("rtdb.expr/list-state", "Expected a list constructor"));
+        };
+        reader::append_list_items(items, self.schema, row, context, &self.replacements, builder).await
+    }
+
     /// Opens one list descriptor without demanding any element.
     /// Requires `context.allocation` and a positive `batch_rows`; each pull emits at most that many cells, and non-list inputs yield no batches.
     /// Descriptor errors occur while opening; element errors occur when their complete page is pulled.
