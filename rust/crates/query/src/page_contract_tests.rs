@@ -418,6 +418,51 @@ async fn evaluated_values_feed_the_batch_executor_as_arrow() {
 }
 
 #[tokio::test]
+async fn single_row_values_keeps_bound_text_backing_alongside_a_computed_cell() {
+    use arrow_array::{RecordBatch, StringArray};
+    use arrow_schema::Schema as ArrowSchema;
+    use crate::columnar::Column;
+    use rtdb_columnar::OwnedBatch;
+    use rtdb_plan::BinaryOp;
+
+    let mut execution = execution(2);
+    let source = MemoryBudget::new(1 << 20);
+    let ty = LogicalType::Scalar(ScalarType::Utf8).maybe();
+    let text = StringArray::from(vec![None, Some("bound é")]);
+    let address = text.value(1).as_ptr();
+    let args = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![rtdb_columnar::to_field("arg", &ty).unwrap()])),
+        vec![Arc::new(text)],
+    ).unwrap();
+    let args = OwnedBatch::new(args, &source).unwrap();
+    execution.parameters = Arc::new(BoundParameters::from_arrow(args, 1, vec![ty.clone()], &execution.context.memory).unwrap());
+    let fields = Schema::new(vec![schema().fields()[0].clone(), Field {
+        id: ColumnId(1), name: "label".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: ty.clone(),
+    }]).unwrap();
+    let rows = vec![vec![
+        Expr::binary(BinaryOp::Add, Expr::Literal(Value::I64(2)), Expr::Literal(Value::I64(3))),
+        Expr::Parameter { index: 0, data_type: ty },
+    ]];
+    let relation = Arc::new(Relation::new(fields, RelationNode::Values { rows }).unwrap());
+    let runtime = EmittedRelation::derive(relation, &execution.context.catalog, execution.parameters.types(), &execution.context.memory).unwrap();
+    let mut batches = build_columns(runtime, execution.clone()).await.unwrap().unwrap();
+    assert!(rtdb_expr::ParameterLookup::known_value(execution.parameters.as_ref(), 0).is_none());
+    drop(execution);
+    let batch = batches.next_batch().await.unwrap().unwrap();
+    drop(batches);
+
+    let [number, Column::Arrow { array, field, .. }] = batch.columns.as_slice() else { panic!("Expected a bound Arrow text cell"); };
+    assert_eq!(number.value(0).unwrap(), Value::I64(5));
+    assert!(!field.is_nullable());
+    let text = array.as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(text.value(0), "bound é");
+    assert_eq!(text.value(0).as_ptr(), address);
+    assert!(source.used_bytes() > 0);
+    drop(batch);
+    assert_eq!(source.used_bytes(), 0);
+}
+
+#[tokio::test]
 async fn numeric_list_batch_unnest_shares_one_child_array_across_parents() {
     use rtdb_plan::BinaryOp;
 

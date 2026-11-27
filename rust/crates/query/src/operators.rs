@@ -759,7 +759,8 @@ async fn row_limit(expr: Option<&Expr>, execution: &Execution) -> Result<Option<
 async fn materialize_columns(
     rows: &[Vec<Expr>], width: usize, execution: &Execution,
 ) -> Result<Option<crate::columnar::ColumnBatch>> {
-    use crate::columnar::{ColumnBatch, pack_evaluated_column};
+    use arrow_schema::DataType;
+    use crate::columnar::{Column, ColumnBatch, FundedArrowCell, pack_evaluated_column};
 
     if rows.is_empty() { return Ok(None); }
     let memory = &execution.context.memory;
@@ -768,22 +769,48 @@ async fn materialize_columns(
     let bytes = rows.len().checked_mul(std::mem::size_of::<Value>()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(size)?;
     let mut columns = (0..width).map(|_| {
         let reservation = memory.reserve(bytes)?;
-        Ok((Vec::with_capacity(rows.len()), reservation))
+        Ok((Vec::with_capacity(rows.len()), reservation, None))
     }).collect::<Result<Vec<_>>>()?;
     let input = Schema::default();
     for (index, expressions) in rows.iter().enumerate() {
         execution.context.check_cancelled_at(index)?;
         if expressions.len() != width { return Err(invalid("table-width", "Table row does not match its declared width")); }
         let scope = execution.scope()?;
-        for (expression, (column, reservation)) in expressions.iter().zip(&mut columns) {
-            let value = execution.evaluate(&scope, expression, &input, &[]).await?;
+        for (expression, (column, reservation, bound)) in expressions.iter().zip(&mut columns) {
+            let invocation = execution.prepare_expression(expression, &input, &scope)?;
+            if rows.len() == 1
+                && let Expr::Parameter { index, .. } = expression
+                && let Some((source, row)) = execution.parameters.arrow_input(*index)
+            {
+                let array = source.batch().column(*index);
+                let field = &source.batch().schema_ref().fields()[*index];
+                if field.metadata().is_empty() && array.data_type() == field.data_type() && array.is_valid(row)
+                    && matches!(field.data_type(), DataType::Boolean | DataType::Int8 | DataType::Int16
+                        | DataType::Int32 | DataType::Int64 | DataType::Float32 | DataType::Float64 | DataType::Utf8 | DataType::Binary)
+                    && let Ok(logical) = rtdb_columnar::from_field(field)
+                    && &logical == invocation.data_type()
+                {
+                    *bound = Some(FundedArrowCell { array, field, logical: None, owner: source.reservation(), row });
+                    continue;
+                }
+            }
+            let value = execution.evaluate_invocation(&scope, &invocation, &[]).await?;
             let lease = Arc::get_mut(reservation).expect("table evaluation owns its column");
             lease.grow_to(lease.bytes().checked_add(value.retained_bytes()?).ok_or_else(size)?)?;
             column.push(value);
         }
     }
     let mut output = ColumnBatch::settled(Vec::new(), rows.len(), memory.reserve(256)?)?;
-    for (values, scratch) in columns {
+    for (values, scratch, bound) in columns {
+        if let Some(cell) = bound {
+            let reservation = memory.reserve_with_backing(1024, std::iter::once(Arc::clone(cell.owner)))?;
+            let field = Arc::new(arrow_schema::Field::new("value", cell.field.data_type().clone(), false));
+            let logical = rtdb_columnar::from_field(&field)?;
+            let column = Column::Arrow { array: cell.array.slice(cell.row, 1), field, logical: Some(logical) };
+            drop((values, scratch));
+            output.append_funded_column(column, reservation, memory)?;
+            continue;
+        }
         let (column, reservation) = pack_evaluated_column(&values, memory)?;
         drop((values, scratch));
         output.append_column(column, reservation, memory)?;

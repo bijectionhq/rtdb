@@ -2436,6 +2436,8 @@ surface QueryAccess {
         -- The projection admits its own copied values, descriptors, and validity storage.
         -- System catalog and native inspection scans publish typed Arrow pages at the scan boundary.
         -- Direct outputs from those scans and from prepacked literal pages retain compatible scalar Arrow buffers.
+        -- A single-row native VALUES page can retain an exact bound scalar Arrow cell and its source charge.
+        -- Its cells are reached in expression order, and the borrowed cell uses its observed result nullability.
         -- The table block files relation validates its persisted schema types even when the projection omits their rendered forms.
         -- A scan preserves compatible list and struct columns as Arrow arrays when projecting selected rows.
         -- Transaction metadata projection preserves receipt precedence and retains Arrow positions from receipt and original event payloads in the same selection.
