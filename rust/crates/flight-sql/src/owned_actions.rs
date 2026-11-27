@@ -6916,6 +6916,74 @@ mod world_point_tests {
     }
 
     #[test]
+    fn world_point_writes_empty_collections_and_timestamp_ranges_at_the_original_charge() {
+        let text = LogicalType::Scalar(ScalarType::Utf8);
+        let set_type = LogicalType::List { kind: ListKind::Set, element: Box::new(text.clone()) };
+        let map_type = Value::Map {
+            entries: vec![(Value::Utf8("elsewhere".into()), Value::I64(123))], sorted: true,
+        }.logical_type();
+        let range = Value::TimestampTzRange { lower: -7, upper: 13 };
+        let values = [Value::Set(vec![]), Value::Map { entries: vec![], sorted: true }, range.clone()];
+        let source = [
+            ("s", set_type, Value::Set(vec![Value::Utf8("elsewhere".into())])),
+            ("m", map_type, Value::Map { entries: vec![(Value::Utf8("elsewhere".into()), Value::I64(123))], sorted: true }),
+            ("r", range.logical_type(), Value::TimestampTzRange { lower: -11, upper: -10 }),
+        ];
+        let columns = source.into_iter().zip(&values).map(|((name, logical, earlier), selected)| {
+            let field = to_field(name, &logical).unwrap();
+            let array = rtdb_columnar::build_array(&logical, &[earlier, selected.clone()]).unwrap();
+            (field, array)
+        }).collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(columns.iter().map(|(field, _)| field.clone()).collect::<Vec<_>>())),
+            columns.into_iter().map(|(_, array)| array).collect()).unwrap().slice(1, 1);
+        let original = crate::WorldPointRow::cells(&batch).map(|cell| {
+            (cell.field.name().clone(), rtdb_columnar::read_value(cell.field, cell.array, cell.row).unwrap())
+        }).collect::<StructFields<_>>();
+        let bytes = Value::document_retained_bytes(&original).unwrap();
+        let memory = MemoryBudget::new(4096 + 8 * bytes);
+        let (planned, charge) = prepare_world_point(&batch, &memory).unwrap();
+        assert_eq!(charge.bytes(), 4096 + 8 * bytes);
+        assert_eq!(crate::WorldPointRow::document_bytes(&batch).unwrap(), bytes);
+        for (point, (name, expected)) in planned.into_iter().zip(original.iter()) {
+            let (field, actual) = point.write(name).unwrap();
+            let logical = expected.logical_type();
+            assert_eq!(field, to_field(name, &logical).unwrap());
+            let expected = rtdb_columnar::build_array_refs(&logical, &[expected]).unwrap();
+            let schema = Arc::new(Schema::new(vec![field]));
+            let ipc = |array| {
+                let batch = RecordBatch::try_new(Arc::clone(&schema), vec![array]).unwrap();
+                write_arrow_stream(&schema, &[batch], IpcWriteOptions::default()).unwrap()
+            };
+            assert_eq!(ipc(actual), ipc(expected));
+        }
+        drop(charge);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn world_point_canonicalizes_other_timestamp_ranges_and_reaches_null_endpoint_errors_before_admission() {
+        use arrow_array::{FixedSizeListArray, TimestampMicrosecondArray};
+
+        let endpoint = LogicalType::Scalar(ScalarType::Timestamp {
+            unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("Europe/Paris".into()),
+        }).maybe();
+        let logical = LogicalType::List { kind: ListKind::TimestampTzRange, element: Box::new(endpoint) };
+        let field = to_field("r", &logical).unwrap();
+        let DataType::FixedSizeList(item, width) = field.data_type() else { unreachable!(); };
+        let array = Arc::new(FixedSizeListArray::new(Arc::clone(item), *width,
+            Arc::new(TimestampMicrosecondArray::from(vec![Some(-7), Some(13), Some(-7), None]).with_timezone("Europe/Paris")), None));
+        let (canonical, output) = world_point_cell(ArrowCell { field: &field, array: array.as_ref(), row: 0 }).unwrap();
+        let expected = Value::TimestampTzRange { lower: -7, upper: 13 };
+        assert_eq!(canonical, to_field("r", &expected.logical_type()).unwrap());
+        assert_eq!(rtdb_columnar::read_value(&canonical, output.as_ref(), 0).unwrap(), expected);
+        let expected = rtdb_columnar::read_value(&field, array.as_ref(), 1).unwrap_err();
+        assert_eq!(expected.code, "rtdb/timestamp-range");
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![array]).unwrap().slice(1, 1);
+        let error = prepare_world_point(&batch, &MemoryBudget::new(1)).err().unwrap();
+        assert_eq!(error.message(), status(expected).message());
+    }
+
+    #[test]
     fn world_point_validates_only_the_selected_nested_decimal() {
         use arrow_array::Decimal128Array;
 

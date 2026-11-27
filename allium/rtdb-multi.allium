@@ -2184,6 +2184,7 @@ rule ConsumeIntake {
 -- A local replacement or tombstone covers only its written half-open business-valid interval.
 -- A world point checks the complete local identity at the requested valid instant.
 -- The point carries the selected Arrow fields and writes the winning concrete value type for each returned cell.
+-- A selected empty set, empty map, or canonical timestamp range keeps its concrete output type and retained document charge through Arrow delivery.
 -- Compatible nested fields write compact values from the winning Arrow positions.
 -- The point preserves the distinctions between an absent child, a present null, and a present value.
 -- The reply uses the selected document's retained-value size for admission and validates the reached decimal coefficients before encoding.

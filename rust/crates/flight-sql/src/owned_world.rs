@@ -7,7 +7,7 @@ use arrow_schema::{DataType, Field};
 use futures::future::BoxFuture;
 use rtdb_columnar::{ArrowCell, MemoryReservation};
 use rtdb_node::{OwnedChangeEdge, Database, NativeSession, Node, OwnedCountRequest, OwnedRangeCount, OwnedRangePage, OwnedRangeRequest, OwnedWorldWitness};
-use rtdb_types::{EntityId, Iid, Interval, ListKind, LogicalType, OwnedRelation, OwnedWorldAssertion, Result, ScalarType, StructFields, Timestamp, TransactionKey, Value, WorldClockMode};
+use rtdb_types::{EntityId, Iid, Interval, ListKind, LogicalType, OwnedRelation, OwnedWorldAssertion, Result, ScalarType, StructFields, TimeUnit, Timestamp, TransactionKey, Value, WorldClockMode};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -153,6 +153,7 @@ pub(crate) struct PointCell<'a> {
 
 enum PointStorage<'a> {
     Empty,
+    EmptySequence,
     Slice(ArrowCell<'a>),
     Compact { cell: ArrowCell<'a>, validate_uri: bool },
     FloatList { values: &'a dyn Array, rows: Range<usize> },
@@ -241,6 +242,30 @@ impl<'a> PointCell<'a> {
                 let bytes = bytes.checked_add(Value::document_retained_bytes(&shape)?).ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
                 (LogicalType::Struct(fields), bytes, PointStorage::Struct(output))
             }
+            LogicalType::List { kind: kind @ (ListKind::Set | ListKind::Map { .. }), .. }
+                if selected.sequence_range().is_some_and(|(_, _, rows)| rows.is_empty()) =>
+            {
+                let element = if matches!(kind, ListKind::Set) {
+                    LogicalType::Nothing
+                } else {
+                    LogicalType::Struct(StructFields::from([
+                        ("key".into(), LogicalType::Nothing), ("value".into(), LogicalType::Nothing),
+                    ]))
+                };
+                (LogicalType::List { kind: kind.clone(), element: Box::new(element) }, 0, PointStorage::EmptySequence)
+            }
+            LogicalType::List { kind: ListKind::TimestampTzRange, element } => {
+                let endpoint = LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) });
+                let Some((_, values, rows)) = selected.sequence_range() else { return Ok(None); };
+                if **element != endpoint || rows.len() != 2 || rows.clone().any(|row| values.is_null(row))
+                    || !rtdb_columnar::to_field(selected.field.name(), &logical).is_ok_and(|field| {
+                        field.data_type() == selected.field.data_type() && field.metadata() == selected.field.metadata()
+                    })
+                {
+                    return Ok(None);
+                }
+                (logical, 0, PointStorage::Compact { cell: selected, validate_uri: false })
+            }
             LogicalType::List { kind: kind @ (ListKind::List | ListKind::FixedSizeList(_)), element } => {
                 let Some((item, values, rows)) = selected.sequence_range() else { return Ok(None); };
                 if rows.is_empty() || !item.metadata().is_empty()
@@ -278,6 +303,12 @@ impl<'a> PointCell<'a> {
     fn write_as(self, field: &Field) -> Result<ArrayRef> {
         Ok(match self.storage {
             PointStorage::Empty => Arc::new(NullArray::new(1)),
+            PointStorage::EmptySequence => {
+                let offsets = ScalarBuffer::from(vec![0_i32, 0]);
+                let data = arrow_array::new_empty_array(field.data_type()).to_data().into_builder().len(1)
+                    .buffers(vec![offsets.into_inner()]).build().map_err(point_arrow)?;
+                arrow_array::make_array(data)
+            }
             PointStorage::Slice(cell) => {
                 cell.validate_decimal_precision()?;
                 let array = cell.array.slice(cell.row, 1);
