@@ -115,6 +115,32 @@ struct Scope {
 struct Reply {
     nonce: Uuid,
     result: Result<Answer>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    unavailable: bool,
+}
+
+#[derive(Debug)]
+enum PeerError {
+    Unavailable(Anomaly),
+    Other(Anomaly),
+}
+
+impl PeerError {
+    fn unavailable() -> Self {
+        Self::Unavailable(unavailable())
+    }
+
+    fn into_anomaly(self) -> Anomaly {
+        match self {
+            Self::Unavailable(error) | Self::Other(error) => error,
+        }
+    }
+}
+
+impl From<PeerError> for Anomaly {
+    fn from(error: PeerError) -> Self {
+        error.into_anomaly()
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -223,10 +249,14 @@ impl Peer {
             ));
         }
         let nonce = request.nonce;
-        let result = self.apply(runtime, node, request, reservation).await;
-        let reply = serde_json::to_vec(&Reply { nonce, result }).map_err(encoding)?;
+        let (result, unavailable) = match self.apply(runtime, node, request, reservation).await {
+            Ok(answer) => (Ok(answer), false),
+            Err(PeerError::Unavailable(error)) => (Err(error), true),
+            Err(PeerError::Other(error)) => (Err(error), false),
+        };
+        let reply = serde_json::to_vec(&Reply { nonce, result, unavailable }).map_err(encoding)?;
         let token = self.tokens.seal_peer_reply(&reply).await?;
-        write_frame(&mut stream, &token).await
+        write_frame(&mut stream, &token).await.map_err(Anomaly::from)
     }
 
     async fn apply(
@@ -235,10 +265,10 @@ impl Peer {
         node: &Node,
         frame: Request,
         reservation: Arc<MemoryReservation>,
-    ) -> Result<Answer> {
+    ) -> std::result::Result<Answer, PeerError> {
         let target = self.selected(Uuid::from_bytes(frame.incarnation));
         if target != Some(self.address) && !matches!(&frame.admission, Admission::Workload { .. }) {
-            return Err(unavailable());
+            return Err(PeerError::unavailable());
         }
         let incarnation = Uuid::from_bytes(frame.incarnation);
         let name = &frame.database;
@@ -249,21 +279,21 @@ impl Peer {
                         installed.identity == profile && installed.point == request.point
                     })
                 {
-                    return Err(workload::denied());
+                    return Err(PeerError::Other(workload::denied()));
                 }
-                let attached = node.catalog().database(name)?;
-                let serving = attached.serving_driver().ok_or_else(unavailable)?;
-                if serving.incarnation() != frame.incarnation { return Err(unavailable()); }
-                let writer = runtime.workload_driver(name, incarnation).await?;
+                let attached = node.catalog().database(name).map_err(PeerError::Other)?;
+                let serving = attached.serving_driver().ok_or_else(PeerError::unavailable)?;
+                if serving.incarnation() != frame.incarnation { return Err(PeerError::unavailable()); }
+                let writer = runtime.workload_driver(name, incarnation).await.map_err(PeerError::Other)?;
                 if !std::ptr::addr_eq(serving, writer.as_ref() as &dyn ServingDriver) {
-                    return Err(unavailable());
+                    return Err(PeerError::unavailable());
                 }
                 if let workload::Operation::Submit { transaction: Some(transaction), .. } = &mut request.operation {
                     transaction.request_memory = Some(reservation);
                 }
-                let reply = writer.managed_workload_local(*request).await?;
+                let reply = writer.managed_workload_local(*request).await.map_err(PeerError::Other)?;
                 if !node.catalog().database(name).is_ok_and(|current| Arc::ptr_eq(&current, &attached)) {
-                    return Err(unavailable());
+                    return Err(PeerError::unavailable());
                 }
                 return Ok(Answer::Workload(Box::new(reply)));
             }
@@ -273,53 +303,59 @@ impl Peer {
                     runtime
                         .catalog
                         .apply_peer_write(frame.incarnation, &request)
-                        .await?,
+                        .await
+                        .map_err(PeerError::Other)?,
                 ));
             }
             Admission::Export { pin, basis, until } if frame.request.is_none() => {
-                let writer = runtime.ready_driver(name, incarnation).await?;
+                let writer = runtime.ready_driver(name, incarnation).await.map_err(PeerError::Other)?;
                 let ticket = writer
                     .export_checkpoint(pin, basis, until, &CancellationToken::new())
-                    .await?;
+                    .await
+                    .map_err(PeerError::Other)?;
                 return Ok(Answer::Ticket(ticket));
             }
             Admission::Restore { request } if frame.request.is_none() => {
                 let basis = runtime
                     .install_peer_transfer(name, incarnation, request)
-                    .await?;
+                    .await
+                    .map_err(PeerError::Other)?;
                 return Ok(Answer::Installed(basis));
             }
             Admission::ManagedPin { destination, target, pin, basis } => {
                 if frame.request.is_some() || basis.incarnation() != frame.incarnation {
-                    return Err(reservation_conflict());
+                    return Err(PeerError::Other(reservation_conflict()));
                 }
-                let identity = runtime.pin_peer_managed_transfer(name, incarnation, &destination, target, pin, basis).await?;
+                let identity = runtime
+                    .pin_peer_managed_transfer(name, incarnation, &destination, target, pin, basis)
+                    .await
+                    .map_err(PeerError::Other)?;
                 return Ok(Answer::ManagedPinned(identity));
             }
             Admission::ManagedInstall { reservation } => {
                 if frame.request.is_some() || reservation.target.incarnation != frame.incarnation {
-                    return Err(reservation_conflict());
+                    return Err(PeerError::Other(reservation_conflict()));
                 }
-                let basis = runtime.install_peer_managed_transfer(name, reservation).await?;
+                let basis = runtime.install_peer_managed_transfer(name, reservation).await.map_err(PeerError::Other)?;
                 return Ok(Answer::Installed(basis));
             }
             Admission::ManagedRelease { destination, reservation } => {
                 if frame.request.is_some() || reservation.source.basis.incarnation() != frame.incarnation {
-                    return Err(reservation_conflict());
+                    return Err(PeerError::Other(reservation_conflict()));
                 }
-                runtime.release_peer_managed_transfer(name, &destination, reservation).await?;
+                runtime.release_peer_managed_transfer(name, &destination, reservation).await.map_err(PeerError::Other)?;
                 return Ok(Answer::ManagedReleased);
             }
             Admission::NativeCopy { destination, reservation } => {
                 if frame.request.is_some() || reservation.source.basis.incarnation() != frame.incarnation {
-                    return Err(reservation_conflict());
+                    return Err(PeerError::Other(reservation_conflict()));
                 }
-                let custody = runtime.claim_peer_native_copy(name, &destination, reservation).await?;
+                let custody = runtime.claim_peer_native_copy(name, &destination, reservation).await.map_err(PeerError::Other)?;
                 return Ok(Answer::NativeCopyClaimed(custody));
             }
             Admission::Retire if frame.request.is_none() => {
-                let writer = runtime.ready_driver(name, incarnation).await?;
-                let event = writer.retire_deployment().await?;
+                let writer = runtime.ready_driver(name, incarnation).await.map_err(PeerError::Other)?;
+                let event = writer.retire_deployment().await.map_err(PeerError::Other)?;
                 return Ok(Answer::Retired {
                     terminal: event.terminal.0,
                     generation: event.generation,
@@ -328,10 +364,10 @@ impl Peer {
             }
             admitted => admitted,
         };
-        let attached = node.catalog().database(&frame.database)?;
-        let serving = attached.serving_driver().ok_or_else(unavailable)?;
+        let attached = node.catalog().database(&frame.database).map_err(PeerError::Other)?;
+        let serving = attached.serving_driver().ok_or_else(PeerError::unavailable)?;
         if serving.incarnation() != frame.incarnation {
-            return Err(unavailable());
+            return Err(PeerError::unavailable());
         }
         let writer = runtime
             .databases
@@ -339,9 +375,9 @@ impl Peer {
             .expect("Multi serving catalog")
             .get(&frame.database)
             .cloned()
-            .ok_or_else(unavailable)?;
+            .ok_or_else(PeerError::unavailable)?;
         if writer.incarnation() != frame.incarnation {
-            return Err(unavailable());
+            return Err(PeerError::unavailable());
         }
         let request = transaction(frame.request, reservation)?;
         let receipt = match admitted {
@@ -357,9 +393,10 @@ impl Peer {
                         }),
                     )
                     .await
+                    .map_err(PeerError::Other)
             }
-            Admission::CustodyResponse => writer.submit_response_local(request).await,
-            _ => Err(unavailable()),
+            Admission::CustodyResponse => writer.submit_response_local(request).await.map_err(PeerError::Other),
+            _ => Err(PeerError::unavailable()),
         }?;
         Ok(Answer::Receipt(receipt))
     }
@@ -559,8 +596,9 @@ impl Peer {
                 };
                 match self.send(frame).await {
                     Ok(Answer::Workload(reply)) => return Ok(*reply),
-                    Err(error) if matches!(error.code.as_str(), "rtdb/no-writer" | "rtdb/peer-unavailable") => (),
-                    Err(error) => return Err(error),
+                    Err(PeerError::Unavailable(_)) => (),
+                    Err(PeerError::Other(error)) if error.code == "rtdb/no-writer" => (),
+                    Err(PeerError::Other(error)) => return Err(error),
                     Ok(_) => return Err(unavailable()),
                 }
             }
@@ -591,38 +629,42 @@ impl Peer {
             admission,
             request,
         };
-        tokio::time::timeout(TIMEOUT, self.send(frame))
+        let answer = tokio::time::timeout(TIMEOUT, self.send(frame))
             .await
-            .map_err(|_| unavailable())?
-            .map(Some)
+            .map_err(|_| unavailable())??;
+        Ok(Some(answer))
     }
 
-    async fn send(&self, request: Request) -> Result<Answer> {
-        let _permit = self.outgoing.try_acquire().map_err(|_| overloaded())?;
-        let encoded = serde_json::to_vec(&request).map_err(encoding)?;
+    async fn send(&self, request: Request) -> std::result::Result<Answer, PeerError> {
+        let _permit = self.outgoing.try_acquire().map_err(|_| PeerError::Other(overloaded()))?;
+        let encoded = serde_json::to_vec(&request).map_err(|error| PeerError::Other(encoding(error)))?;
         if encoded.len() > MAX_PEER_MESSAGE_BYTES {
-            return Err(overloaded());
+            return Err(PeerError::Other(overloaded()));
         }
-        let token = self.tokens.seal_peer_request(&encoded).await?;
+        let token = self.tokens.seal_peer_request(&encoded).await.map_err(PeerError::Other)?;
         let target = SocketAddr::new(request.to, PORT);
         let socket = if request.to.is_ipv4() {
             TcpSocket::new_v4()
         } else {
             TcpSocket::new_v6()
         }
-        .map_err(network)?;
+        .map_err(network_peer)?;
         socket
             .bind(SocketAddr::new(self.address, 0))
-            .map_err(network)?;
-        let mut stream = socket.connect(target).await.map_err(network)?;
+            .map_err(network_peer)?;
+        let mut stream = socket.connect(target).await.map_err(network_peer)?;
         write_frame(&mut stream, &token).await?;
         let (reply, _reservation) = read_frame(&mut stream, &self.memory).await?;
-        let bytes = self.tokens.open_peer_reply(&reply).await?;
-        let reply: Reply = serde_json::from_slice(&bytes).map_err(encoding)?;
+        let bytes = self.tokens.open_peer_reply(&reply).await.map_err(PeerError::Other)?;
+        let reply: Reply = serde_json::from_slice(&bytes).map_err(|error| PeerError::Other(encoding(error)))?;
         if reply.nonce != request.nonce {
-            return Err(unavailable());
+            return Err(PeerError::unavailable());
         }
-        reply.result
+        match reply.result {
+            Ok(answer) => Ok(answer),
+            Err(error) if reply.unavailable => Err(PeerError::Unavailable(error)),
+            Err(error) => Err(PeerError::Other(error)),
+        }
     }
 }
 
@@ -652,8 +694,8 @@ impl MultiWriteRoute for DatabaseRoute {
     }
 }
 
-fn transaction(raw: Option<CanonicalRequest>, reservation: Arc<MemoryReservation>) -> Result<Transact> {
-    let mut request = raw.ok_or_else(unavailable)?.decode()?;
+fn transaction(raw: Option<CanonicalRequest>, reservation: Arc<MemoryReservation>) -> std::result::Result<Transact, PeerError> {
+    let mut request = raw.ok_or_else(PeerError::unavailable)?.decode().map_err(PeerError::Other)?;
     request.request_memory = Some(reservation);
     Ok(request)
 }
@@ -661,26 +703,26 @@ fn transaction(raw: Option<CanonicalRequest>, reservation: Arc<MemoryReservation
 async fn read_frame(
     stream: &mut TcpStream,
     memory: &Arc<MemoryBudget>,
-) -> Result<(Vec<u8>, Arc<MemoryReservation>)> {
-    let size = stream.read_u32().await.map_err(network)? as usize;
+) -> std::result::Result<(Vec<u8>, Arc<MemoryReservation>), PeerError> {
+    let size = stream.read_u32().await.map_err(network_peer)? as usize;
     if !(1..=MAX_FRAME_BYTES).contains(&size) {
-        return Err(overloaded());
+        return Err(PeerError::Other(overloaded()));
     }
-    let reservation = memory.reserve(size * 32 + 4096)?;
+    let reservation = memory.reserve(size * 32 + 4096).map_err(PeerError::Other)?;
     let mut token = vec![0; size];
-    stream.read_exact(&mut token).await.map_err(network)?;
+    stream.read_exact(&mut token).await.map_err(network_peer)?;
     Ok((token, reservation))
 }
 
-async fn write_frame(stream: &mut TcpStream, token: &[u8]) -> Result<()> {
+async fn write_frame(stream: &mut TcpStream, token: &[u8]) -> std::result::Result<(), PeerError> {
     if !(1..=MAX_FRAME_BYTES).contains(&token.len()) {
-        return Err(overloaded());
+        return Err(PeerError::Other(overloaded()));
     }
     stream
         .write_u32(token.len() as u32)
         .await
-        .map_err(network)?;
-    stream.write_all(token).await.map_err(network)
+        .map_err(network_peer)?;
+    stream.write_all(token).await.map_err(network_peer)
 }
 
 fn encoding(error: serde_json::Error) -> Anomaly {
@@ -689,6 +731,10 @@ fn encoding(error: serde_json::Error) -> Anomaly {
 
 fn network(_: std::io::Error) -> Anomaly {
     unavailable()
+}
+
+fn network_peer(_: std::io::Error) -> PeerError {
+    PeerError::unavailable()
 }
 
 fn unavailable() -> Anomaly {
@@ -764,5 +810,24 @@ mod tests {
         let decoded: Request = serde_json::from_slice(&serde_json::to_vec(&frame).unwrap()).unwrap();
         assert_eq!(decoded.request.as_ref(), Some(&canonical));
         assert_eq!(decoded.request.unwrap().decode().unwrap().key, transaction.key);
+    }
+
+    #[test]
+    fn peer_reply_round_trips_typed_unavailability_flag() {
+        let nonce = Uuid::new_v4();
+        let reply = Reply { nonce, result: Err(unavailable()), unavailable: true };
+        let encoded = serde_json::to_vec(&reply).unwrap();
+        let decoded: Reply = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.nonce, nonce);
+        assert!(decoded.unavailable);
+        assert_eq!(decoded.result.err().unwrap().code, "rtdb/peer-unavailable");
+
+        let legacy = serde_json::json!({
+            "nonce": nonce,
+            "result": { "Err": overloaded() },
+        });
+        let decoded: Reply = serde_json::from_value(legacy).unwrap();
+        assert!(!decoded.unavailable);
+        assert_eq!(decoded.result.err().unwrap().code, "rtdb/peer-admission");
     }
 }
