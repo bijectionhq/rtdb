@@ -268,10 +268,38 @@ journal marker, and encrypted commissioning scope before using the source
 writer credential. The provider configuration is installed with the broker.
 The socket request supplies the operation identity only.
 
-The portable installer and these verification paths use the existing local
-object and key custody. The local custodian retains the staged closure through
-publication. Hosted object and key custody needs a provider hold for the same
-closure before a hosted verifier can certify it.
+These verification paths use the local object store and key vault.
+The local procedure relies on operator custody of the destination volume and keys through publication.
+
+### Hosted custody and effect prerequisites
+
+Hosted recovery needs custody of the destination journal's recorded installation cut and provider retention of the exact checkpoint and relocated objects until publication or supersession.
+The object custodian needs an enrolled provider identity and an independently authorized readback of the hold after restart.
+The byte-store Version hold lives with the current writer and fences the Store purge floor.
+For S3 Object Lock, commission a dedicated versioned allocation and bind both verification and recovery reads to the held versions.
+Give the verifier version-read access and either `s3:GetObjectLegalHold` or `s3:GetObjectRetention` for the selected hold mechanism.
+Object Lock allows delete markers and newer versions above a held version. [S3 Object Lock](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html)
+
+The installed server opens its generation keys through `FileKms` at `RTDB_KEY_DIRECTORY`.
+A hosted key custodian must retain decryption of the exact copies' generations across worker and verifier loss and order hold placement and release against key retirement.
+Key readability at the time of verification proves one read.
+For an AWS KMS design, establish which authority can disable or schedule deletion of a held key, since a key in pending deletion cannot decrypt. [AWS KMS key deletion](https://docs.aws.amazon.com/kms/latest/developerguide/deleting-keys.html)
+The object and key custodian receipts must bind the same recovery operation, destination incarnation and verified dependency closure.
+Any finite hold must still cover the activation decision when it commits.
+Release after publication requires a handoff to the destination's serving custody.
+
+Ranked derivative publication needs an authority that admits staging for the current incarnation and fences or drains provider work before that incarnation loses authority.
+It must retain or retire the exact primary cut, derivative object versions and generation keys.
+An assertion erasure report also needs signed settlements from each backup and derivative custodian in its ordered roster.
+
+Funded dispatch needs an effect authority for the receiver and keeper original quorum.
+Commission the receiver identity and certificate, the original keeper clock signers and their common clock bounds, and bind both admission and retry to the exact activation and booking.
+Keeper timed-original proof authenticates the append and its cutoff.
+The activation effect authority also has to close predecessor receiver admissions and reconcile issued bookings before a successor can admit funded work.
+
+A hosted qualification requires a named non-production allocation with scoped object and key provider credentials, an independent activation quorum, and separate reader, operator and custodian identities.
+Drive the same recovery through lost replies and process restart, prove the selected versions and keys stay usable with the verifier offline, and verify that supersession or publication settles only the selected operation's hold.
+Exercise derivative staging and funded dispatch across that same handoff only after enrolling their effect authorities.
 
 ## Batches, placement, funded appends and journal size
 
