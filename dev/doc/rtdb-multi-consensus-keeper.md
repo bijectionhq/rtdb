@@ -457,8 +457,29 @@ The provider closure drains an outstanding recorded multipart upload and binds t
 Derivative custody must retain or retire the exact primary cut, derivative object versions and generation keys.
 An assertion erasure report also needs signed settlements from each backup and derivative custodian in its ordered roster.
 
-RTDB keeps commissioned funded dispatch fenced pending integration with an original booking issuer.
-Commissioning requires the issuer to be enrolled for the exact activation authority, database, serving binding and receiver certificate. [Original funded admission contract](../../allium/rtdb-multi.allium)
+### Kernel-funded admission
+
+The Bijection Kernel owns original funded bookings for RTDB scopes in its `sys.slots` ledger.
+RTDB orders, seals, and serializes the append under the offered clock slot's commit window.
+The Kernel's task and obligation fates supply the business outcome during recovery. [Claim-move 4](https://github.com/bijectionhq/bijection/commit/ccd0a3cd32210e16b84fe3f3ff4b2f7ee78469b7) [Kernel-funded admission contract](../../allium/rtdb-multi.allium)
+
+The Kernel records a slot by commit label and scheduled reading and binds it to the obligation and once identity in the inbox commit.
+An exact call retry needs to recover the same slot by call identity as soon as the offer commits, including when the reply is lost before the inbox commit. [Slot offer](https://github.com/bijectionhq/bijection/blob/c85db1809eed26f9e741d519d55ce13701696065/crates/kernel/src/pipeline/mod.rs#L5689-L5730) [Inbox binding](https://github.com/bijectionhq/bijection/blob/c85db1809eed26f9e741d519d55ce13701696065/crates/kernel/src/pipeline/mod.rs#L5935-L6002)
+
+Carry the original Kernel scope, selected store cut, and committed journal evidence through hosted custody.
+Use Kernel readmission to reconcile the original obligations and expose their fates under the original call identities. [Kernel readmission](https://github.com/bijectionhq/bijection/blob/c85db1809eed26f9e741d519d55ce13701696065/crates/kernel/src/pipeline/mod.rs#L3142-L3229)
+Let the Kernel finish its readmission writes on the selected successor store while funded calls remain fenced.
+If the original decision may be in an unavailable tail, keep it unresolved until the original commitment or exclusion is established.
+
+RTDB currently fences live funded dispatch for activation-commissioned databases.
+The existing import command can register a signed receipt scope without a Kernel, and the Object Lock qualification uses that path with a test issuer.
+Standalone and pre-Kernel deployments can start and recover ordinary RTDB state independently.
+Whether a permanently Kernel-free deployment must support live funded calls is a deployment design decision.
+
+### Signed funded receipt import
+
+Activation protocol 11 retains and verifies historical receipt scopes registered through the signed import protocol.
+An import enrollment binds the exact activation authority, database, serving binding and receiver certificate. [Signed funded import contract](../../allium/rtdb-multi.allium)
 The installed `fundedReceiverClock` transport supplies clock observations for that certificate and source incarnation.
 `RTDB_TIMED_ORIGINAL_TRUST_FILE` pins the original keeper proof signers, and the receiver and keepers use the same guarded clock scale.
 Give recovery an independently authenticated route to the original issuer and retain the original issuer and keeper verification identities through settlement.
@@ -496,7 +517,6 @@ Encode the predecessor basis as incarnation UUID and position. Each authorizatio
 The issuer signs a resolution over the UTF-8 domain `rtdb.activation.funded-resolution/v1` followed by one zero byte, the scope digest, the signed inventory digest, the index, the prefix for that index, the disposition byte, and the count and contents of the stage evidence.
 Disposition zero means accepted and one means refused. A committed stage contributes byte zero and the SHA-256 digest of its encoded keeper commitment. An excluded stage contributes byte one and requires the original lossless seal.
 RTDB re-verifies the pinned keeper receipt for each committed stage and checks the original source fence for each excluded stage. It retains earlier appointment activation evidence even when consumption ends in refusal.
-Live funded dispatch requires the original issuer to commission and authorize bookings and retain their evidence.
 After reconciliation, run `export-hosted` with `--funded-authority-url`, `--funded-authority-tls-dir`, and `--predecessor-revision`. The activation reader supplies the verified booking inventory. A lossless export selects the sealed predecessor head.
 The archive retains terminal results under their original receipt namespace and idempotency key. It preserves the original booking identity and evidence digest and clears live offers. A booking recorded only by the issuer receives a terminal refusal at the selected cut.
 For label-scoped `TxStatus`, use a current credential with the same issuer, subject, database name, and read and write labels. RTDB derives the original namespace from the retained receipt's source incarnation and projects the result through the current label scope. A current-namespace result takes precedence. If multiple inherited bookings match, use the activation broker's `funded-outcome` to select by predecessor and issuer scope.
@@ -512,14 +532,6 @@ Logkeeper can commit an authorized append after the journal cutoff using signed 
 A lossless seal of the original immutable stream excludes an exact attempt when its authorized position is above the sealed committed head and its writer epoch is fenced by the seal.
 Verify the stream, writer fence and head from the original seal receipt together. [Seal receipt](https://github.com/bijectionhq/logkeeper/blob/14d7b7ec7c3d74667d95bebbe9ee143ca6eb8d98/contract/src/lib.rs#L246-L252) [Atomic seal](https://github.com/bijectionhq/logkeeper/blob/14d7b7ec7c3d74667d95bebbe9ee143ca6eb8d98/src/stream/consensus/state.rs#L1113-L1152)
 Keep successor funded admission closed until the original evidence settles every booking.
-
-Bijection's managed inbox records a slot by commit label and scheduled reading, then binds it in the transaction that records the call's receipt. [Slot offer](https://github.com/bijectionhq/bijection/blob/56843bdd7c095fd209c3ea74e03b95eaa146b140/crates/kernel/src/pipeline/mod.rs#L5641-L5684) [Receipt binding](https://github.com/bijectionhq/bijection/blob/56843bdd7c095fd209c3ea74e03b95eaa146b140/crates/kernel/src/pipeline/mod.rs#L5858-L5898)
-If the slot offer commits and its reply is lost before receipt binding, a retry chooses from the current store time and can select a new slot.
-RTDB's original issuer must recover the exact same booking by request identity in that case.
-Bijection's managed RTDB placement issuer mints version 6 writer-fence and version 7 first-placement provisioning grants. [Placement grant roles](https://github.com/bijectionhq/bijection/blob/56843bdd7c095fd209c3ea74e03b95eaa146b140/crates/cell_catalog/src/catalog/managed_workload.rs#L251-L285)
-Managed funded appointments require an enrolled issuer for the version 2 funded-appointment grant. [Funded appointment contract](rtdb-v1.allium)
-Bijection removed its managed v2 appointment credential wiring during the scoped v1 cutover. [Bijection cutover](https://github.com/bijectionhq/bijection/commit/64db580bd422d32cd93249f150cc288858dabeec)
-Its current Native Root path orders inbox slots in the Kernel's `_sys_slots`. Commission RTDB recovery against the provider that durably owns the booking inventory for the RTDB scope. [Native Root clock](https://github.com/bijectionhq/bijection/blob/29b7c79c889a6566807cb9469789f5a483432e58/crates/store_flight/src/owned_flight/engine_clocks.rs#L15-L17)
 
 A hosted qualification requires a named non-production allocation with scoped object and key provider credentials, an independent activation quorum, and separate reader, operator and custodian identities.
 Drive the same recovery through lost replies and process restart, prove the selected versions and keys stay usable with the verifier offline, and verify that supersession or publication settles only the selected operation's hold.

@@ -472,7 +472,24 @@ contract RecoveryJournalCustody {
         -- The custodian releases only the matching hold after an authoritative publication or supersession.
 }
 
-contract OriginalFundedAdmission {
+contract KernelFundedAdmission {
+    @invariant KernelOwnsTheBooking
+        -- The Bijection Kernel offers each funded call through its own sys.slots ledger.
+        -- The booking binds the original Kernel scope, the exact active RTDB binding, the call identity, and the ordered clock slot.
+        -- The original slot is discoverable by call identity after the offer commits, including before the caller receives a reply or records a delivery.
+        -- Binding the slot to a delivery orders the matching obligation and once identity in the Kernel's inbox commit.
+        -- RTDB orders and seals the store append for the offered slot, and provides physical commitment evidence at the exact journal cut.
+
+    @invariant RecoveryUsesKernelFates
+        -- Recovery retains the original Kernel scope and ordered store cut through custody and readmission.
+        -- The Kernel reconciles inherited bookings through its task and obligation fates and reads completed work by original call identity.
+        -- The selected store can admit the Kernel's recovery writes before funded calls resume.
+        -- Funded admission at the successor requires an active RTDB binding, its matching authenticated Kernel enrollment, and reconciled predecessor evidence.
+        -- A predecessor decision beyond the available cut remains unresolved until the original commit or exclusion is established.
+}
+
+contract SignedFundedReceiptImport {
+    -- The existing RTDB recovery protocol for previously enrolled signed receipt scopes.
     @invariant IssuerOwnsBooking
         -- Commissioning enrolls an original booking issuer for an exact activation authority, database name, serving binding and receiver certificate.
         -- The activation authority retains the complete roster of issuer and certificate scopes enrolled for that binding through recovery, including scopes closed before certificate rotation.
@@ -1148,7 +1165,7 @@ contract FencedStreamWriter {
         -- Refuse returns the unsent suffix for redecision against the refused state.
 
     @invariant ActivationEffectAdmission
-        -- A commissioned incarnation requires start authorization under OriginalFundedAdmission before contacting the receiver clock for a funded command.
+        -- Commissioned funded dispatch follows KernelFundedAdmission.
         -- A commissioned incarnation requires derivative custody authority before staging or publishing a ranked catalogue.
 
     @invariant SpeculativeWriteSuffix
