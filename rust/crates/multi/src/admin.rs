@@ -2934,23 +2934,27 @@ mod tests {
         let storage = CellStorage::Local { root: data.path().join("objects") };
         let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await.unwrap();
         let directory: std::sync::Arc<dyn Directory> = MemoryDirectory::new();
-        let broker = fork_broker(&directory, &storage, data.path());
         let mut source = DeploymentRecord::new("source", "acme", Vec::new(), 0);
         let namespaces = super::storage_namespaces(bucket.as_ref(), &keys).await.unwrap();
         source.storage_namespaces = Some(namespaces);
         let source = directory.create_deployment(source).await.unwrap();
-        let source = publish_test_fork_cut(directory.as_ref(), &bucket, source, &keys, 0).await;
         let source_prefix = source.storage_prefix();
-        let source_store = format!("{source_prefix}/v06");
+        let version = crate::archive::checkpoint_storage_root().unwrap();
+        let source_store = format!("{source_prefix}/{version}");
+        let mut base = crate::reference::Base::default();
         for name in ["old", "shared"] {
             let key = ObjectKey::new(format!("{source_store}/{name}")).unwrap();
             bucket.put(&key, Bytes::from_static(name.as_bytes())).await.unwrap();
+            base.objects.insert(name.into(), source_store.clone());
         }
 
-        let destination = super::ForkDestination { name: "child", org: None, hosted_task: None, broker: Some(&broker) };
-        let child = super::with_fork_access(directory.as_ref(), &storage, &keys, &source, None, |access|
-            super::fork_with_tail(directory.clone(), &storage, access, &keys, &source, destination, None, Vec::new(), 4 << 20)).await.unwrap();
-        let fork_store = format!("{}/v06", child.storage_prefix());
+        let mut child = DeploymentRecord::new("child", &source.org, Vec::new(), 0);
+        child.parent = Some(source.id.clone());
+        child.lineage.clone_from(&source.lineage);
+        child.storage_namespaces = source.storage_namespaces;
+        let fork_store = format!("{}/{version}", child.storage_prefix());
+        base.initialize(bucket.as_ref(), &fork_store).await.unwrap();
+        let child = directory.create_deployment(child).await.unwrap();
         for name in ["old", "shared"] {
             let owned = ObjectKey::new(format!("{fork_store}/{name}")).unwrap();
             assert!(matches!(bucket.head(&owned).await, Err(rtdb_storage::Error::MissingObject(_))));
@@ -3179,9 +3183,11 @@ mod tests {
         source.storage_namespaces = Some(namespaces);
         let source = directory.create_deployment(source).await.unwrap();
         let source = publish_test_fork_cut(directory.as_ref(), &bucket, source, &keys, 0).await;
-        let object = ObjectKey::new(format!("{}/v06/rows", source.storage_prefix())).unwrap();
-        let bytes = Bytes::from_static(b"rows");
-        bucket.put(&object, bytes.clone()).await.unwrap();
+        let version = crate::archive::checkpoint_storage_root().unwrap();
+        let pack = |block| crate::packing::block_pack(&rtdb_format::keys::block_key(rtdb_types::BlockIndex(block)).unwrap());
+        let first_pack = pack(0);
+        let object = ObjectKey::new(format!("{}/{version}/{first_pack}", source.storage_prefix())).unwrap();
+        let bytes = bucket.get(&object).await.unwrap();
 
         let broker = fork_broker(&directory, &storage, data.path());
         let destination = super::ForkDestination { name: "child", org: None, hosted_task: None, broker: Some(&broker) };
@@ -3220,7 +3226,7 @@ mod tests {
         super::close_fork_stage(directory.as_ref(), stage).await.unwrap();
         super::finish_disposal(directory.as_ref(), &storage, &keys, &staged.id, 4 << 20).await.unwrap();
         assert!(matches!(bucket.get(&object).await, Err(rtdb_storage::Error::MissingObject(_))));
-        let copied = ObjectKey::new(format!("{}/v06/rows", child.storage_prefix())).unwrap();
+        let copied = ObjectKey::new(format!("{}/{version}/{first_pack}", child.storage_prefix())).unwrap();
         assert_eq!(bucket.get(&copied).await.unwrap(), bytes);
 
         let child = publish_test_fork_cut(directory.as_ref(), &bucket, child, &keys, 1).await;
@@ -3228,9 +3234,9 @@ mod tests {
         let destination = super::ForkDestination { name: "grandchild", org: None, hosted_task: None, broker: Some(&broker) };
         let grandchild = super::with_fork_access(directory.as_ref(), &storage, &keys, &child, None, |access|
             super::fork_with_tail(directory.clone(), &storage, access, &keys, &child, destination, None, Vec::new(), 4 << 20)).await.unwrap();
-        let child_store = format!("{}/v06", child.storage_prefix());
-        let manifest = crate::reference::Base::load(bucket.as_ref(), &format!("{}/v06", grandchild.storage_prefix())).await.unwrap();
-        assert_eq!(manifest.objects.get("rows"), Some(&child_store));
+        let child_store = format!("{}/{version}", child.storage_prefix());
+        let manifest = crate::reference::Base::load(bucket.as_ref(), &format!("{}/{version}", grandchild.storage_prefix())).await.unwrap();
+        assert_eq!(manifest.objects.get(&pack(1)), Some(&child_store));
     }
 
     #[tokio::test]
