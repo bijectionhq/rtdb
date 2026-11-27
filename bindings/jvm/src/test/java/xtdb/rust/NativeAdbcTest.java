@@ -22,8 +22,10 @@ import org.apache.arrow.vector.BitVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.VectorUnloader;
 import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
+import org.apache.arrow.vector.types.UnionMode;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import xtdb.api.TableRef;
@@ -234,6 +236,38 @@ final class NativeAdbcTest {
                 assertEquals(42L, batch.getVector(0).getObject(0));
                 assertEquals(1, ((BitVector) batch.getVector(1)).get(0));
             }
+        }
+    }
+
+    @Test void describesImplicitUnionParameterFieldsAndUnknownTypes() throws Exception {
+        var legs = List.of(Field.notNullable("i32", new ArrowType.Int(32, true)),
+                Field.notNullable("utf8", ArrowType.Utf8.INSTANCE), Field.nullable("null", ArrowType.Null.INSTANCE));
+        var implicit = new Field("", FieldType.notNullable(new ArrowType.Union(UnionMode.Dense, null)), legs);
+        var setType = new FieldType(false, ArrowType.List.INSTANCE, null, Map.of("ARROW:extension:name", "set"));
+        var nested = new Field("", setType, List.of(
+                new Field("$data$", FieldType.notNullable(new ArrowType.Union(UnionMode.Dense, new int[0])), legs)));
+        var unknown = Field.notNullable("", new ArrowType.Union(UnionMode.Dense, null));
+        var nullField = Field.nullable("", ArrowType.Null.INSTANCE);
+        String sql = "SELECT ? AS a, ? AS b, ? AS c, COALESCE(?, CAST(42 AS BIGINT)) AS fallback";
+        try (var allocator = new RootAllocator(); var database = open(allocator); var connection = database.connect();
+             var statement = connection.prepareStatement(sql)) {
+            var defaults = statement.executeSchema().getFields();
+            var described = statement.executeSchema(List.of(implicit, nested, unknown, nullField)).getFields();
+
+            var union = FieldType.notNullable(new ArrowType.Union(UnionMode.Dense, new int[] {0, 1, 2}));
+            assertEquals(new Field("a", union, legs), described.get(0));
+            assertEquals("b", described.get(1).getName());
+            assertEquals("set", described.get(1).getMetadata().get("ARROW:extension:name"));
+            assertEquals(List.of(new Field("$data$", union, legs)), described.get(1).getChildren());
+            assertEquals(Field.nullable("c", ArrowType.Null.INSTANCE), described.get(2));
+            assertEquals(new ArrowType.Int(64, true), described.get(3).getType());
+            assertEquals(defaults.subList(2, 4), described.subList(2, 4));
+
+            var duplicateIds = new Field("", FieldType.notNullable(new ArrowType.Union(UnionMode.Dense, new int[] {1, 1, 2})), legs);
+            var invalid = assertThrows(NativeException.class,
+                    () -> statement.executeSchema(List.of(duplicateIds, nested, unknown, nullField)));
+            assertEquals("rtdb.ffi/arrow", invalid.code());
+            assertEquals(defaults, statement.executeSchema().getFields());
         }
     }
 

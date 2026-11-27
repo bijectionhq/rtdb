@@ -6,6 +6,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.IntStream;
 import org.apache.arrow.adbc.core.AdbcException;
 import org.apache.arrow.adbc.core.AdbcStatement;
 import org.apache.arrow.c.ArrowArray;
@@ -18,7 +19,9 @@ import org.apache.arrow.memory.OutOfMemoryException;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.VectorUnloader;
 import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
+import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 /** Bound Arrow arguments are copied before bind returns; result buffers are independently retained. */
@@ -109,6 +112,18 @@ public final class NativeStatement extends NativeResource implements AdbcStateme
     public Schema executeSchema(List<Field> parameterFields) throws AdbcException {
         return schema(false, Objects.requireNonNull(parameterFields));
     }
+    private static Field parameterFieldForExport(Field field) {
+        var children = field.getChildren().stream().map(NativeStatement::parameterFieldForExport).toList();
+        var fieldType = field.getFieldType();
+        if (field.getType() instanceof ArrowType.Union union && (union.getTypeIds() == null || union.getTypeIds().length == 0)) {
+            boolean empty = children.isEmpty();
+            ArrowType type = empty ? ArrowType.Null.INSTANCE
+                    : new ArrowType.Union(union.getMode(), IntStream.range(0, children.size()).toArray());
+            fieldType = new FieldType(empty || field.isNullable(), type, field.getDictionary(), field.getMetadata());
+        }
+        if (fieldType == field.getFieldType() && children.equals(field.getChildren())) return field;
+        return new Field(field.getName(), fieldType, children);
+    }
     private Schema schema(boolean parameters, List<Field> parameterFields) throws AdbcException {
         try (NativeConnection.Operation operation = connection.operation();
              ArrowSchema schema = ArrowSchema.allocateNew(connection.allocator);
@@ -119,7 +134,8 @@ public final class NativeStatement extends NativeResource implements AdbcStateme
                 if (input == null) {
                     abi.call("statement_schema", handle(), operation.id(), parameters ? 1 : 0, out);
                 } else {
-                    Data.exportSchema(connection.allocator, new Schema(parameterFields), null, input);
+                    var transportFields = parameterFields.stream().map(NativeStatement::parameterFieldForExport).toList();
+                    Data.exportSchema(connection.allocator, new Schema(transportFields), null, input);
                     abi.call("statement_schema_with_parameters", handle(), operation.id(), NativeAbi.address(input.memoryAddress()), out);
                 }
                 return Data.importSchema(connection.allocator, schema, null, false);

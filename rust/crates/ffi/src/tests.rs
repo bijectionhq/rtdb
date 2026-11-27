@@ -160,20 +160,34 @@ fn a_principal_is_bound_to_its_region_and_a_session_retains_it() {
 }
 
 #[test]
-fn typed_statement_schema_borrows_parameter_fields_in_ordinal_order() {
+fn typed_statement_schema_borrows_fields_by_position_and_exports_independent_metadata() {
     let mut native = Native::open();
     let operation = native.operation();
     let statement = native.statement("SELECT ? AS a, ? AS b");
     let mut error = 0;
     ok(unsafe { rtdb_v1_statement_prepare(statement, operation, &mut error) }, error);
-    let fields = Schema::new(vec![Field::new("", DataType::Int64, false), Field::new("", DataType::Boolean, false)]);
+    let uri = Field::new("same", DataType::Utf8, true).with_metadata([
+        (rtdb_columnar::EXTENSION_NAME_KEY.into(), "uri".into()),
+        (rtdb_columnar::EXTENSION_METADATA_KEY.into(), String::new()),
+    ].into());
+    let fields = Schema::new(vec![Field::new("same", DataType::Int64, false), uri.clone()]);
     let parameters = FFI_ArrowSchema::try_from(&fields).unwrap();
+    let missing = FFI_ArrowSchema::try_from(&Schema::empty()).unwrap();
     let mut out = FFI_ArrowSchema::empty();
+    let status = unsafe { rtdb_v1_statement_schema_with_parameters(statement, operation, &missing, &mut out, &mut error) };
+    incorrect(status, error, "xtdb/parameter-count-mismatch");
+    assert!(missing.release.is_some());
+    assert!(out.release.is_none());
+
     ok(unsafe { rtdb_v1_statement_schema_with_parameters(statement, operation, &parameters, &mut out, &mut error) }, error);
     assert!(parameters.release.is_some());
+    assert_eq!(Schema::try_from(&parameters).unwrap(), fields);
+    drop(parameters);
+    drop(native);
+
     let schema = Schema::try_from(&out).unwrap();
-    assert_eq!(schema.field(0).data_type(), &DataType::Int64);
-    assert_eq!(schema.field(1).data_type(), &DataType::Boolean);
+    assert_eq!(schema.field(0), &Field::new("a", DataType::Int64, false));
+    assert_eq!(schema.field(1), &uri.with_name("b"));
 }
 
 #[test]
