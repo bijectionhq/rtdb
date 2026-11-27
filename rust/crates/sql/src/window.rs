@@ -36,9 +36,7 @@ impl BoundWindow {
 
 impl Context<'_> {
     pub(crate) fn bind_window(&mut self, schema: &Schema, function: &ast::Function, replacements: &Replacements) -> Result<BoundWindow> {
-        let names = identifiers(&function.name)?;
-        if names.len() != 1 { return Err(grammar_rejected("A qualified window function name")); }
-        let name = names[0].normalized();
+        let name = grammar_window_name(function)?;
         let aggregate = AGGREGATE_WINDOW_FUNCTIONS.contains(&name.as_str());
         let modifier = |construct: &str| if aggregate { unsupported(construct) } else { grammar_rejected(format!("{construct} on {name}")) };
         let Some(ast::WindowType::WindowSpec(specification)) = &function.over else { return Err(unsupported("TODO: Window names currently not supported!")); };
@@ -98,9 +96,31 @@ const AGGREGATE_WINDOW_FUNCTIONS: &[&str] = &[
     "stddev_pop", "stddev_samp", "var_samp", "var_pop", "percentile_cont", "percentile_disc",
 ];
 
+pub(crate) fn grammar_window_name(function: &ast::Function) -> Result<String> {
+    let names = identifiers(&function.name)?;
+    let [name] = names.as_slice() else { return Err(grammar_rejected("A qualified window function name")); };
+    let normalized = name.normalized();
+    if !name.quoted && (matches!(normalized.as_str(), "row_number" | "lead" | "lag")
+        || REFERENCE_WINDOW_FUNCTIONS.contains(&normalized.as_str())
+        || AGGREGATE_WINDOW_FUNCTIONS.contains(&normalized.as_str()))
+    {
+        Ok(normalized)
+    } else {
+        Err(grammar_rejected(format!("Window function {}", function.name)))
+    }
+}
+
 fn offset(expression: &ast::Expr) -> Result<u64> {
-    let ast::Expr::Value(value) = expression else { return Err(grammar_rejected("A window offset other than an unsigned integer literal")); };
-    let ast::Value::Number(value, false) = &value.value else { return Err(grammar_rejected("A window offset other than an unsigned integer literal")); };
-    if !value.bytes().all(|byte| byte.is_ascii_digit()) { return Err(grammar_rejected("A window offset other than an unsigned integer literal")); }
-    value.parse::<i64>().map(|offset| offset as u64).map_err(|_| error("Window offset exceeds signed 64 bits"))
+    offset_literal(expression)?.parse::<i64>().map(|offset| offset as u64).map_err(|_| error("Window offset exceeds signed 64 bits"))
+}
+
+pub(crate) fn offset_literal(expression: &ast::Expr) -> Result<&str> {
+    if let ast::Expr::Value(value) = expression
+        && let ast::Value::Number(value, false) = &value.value
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        Ok(value)
+    } else {
+        Err(grammar_rejected("A window offset other than an unsigned integer literal"))
+    }
 }

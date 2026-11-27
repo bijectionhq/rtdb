@@ -1573,7 +1573,7 @@ impl Context<'_> {
         let (database, table) = match parts.as_slice() {
             [table] => (self.catalog.default_database().to_owned(), TableRef::new(self.options.search_path.first().cloned().unwrap_or_else(|| "public".into()), table)),
             [schema, table] => (self.catalog.default_database().to_owned(), TableRef::new(schema, table)),
-            _ => return Err(error("DML target names have one or two components")),
+            _ => return Err(grammar_rejected("A DML target name with more than two components")),
         };
         Ok(QualifiedTable { database, table })
     }

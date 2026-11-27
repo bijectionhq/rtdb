@@ -238,6 +238,7 @@ fn mutation_columns_require_unqualified_identifiers() {
         "INSERT INTO docs (_id, where) VALUES (1)",
         "INSERT INTO docs (_id, docs.a) VALUES (1, 2)",
         "INSERT INTO docs (_id, where) SELECT _id, a FROM absent",
+        "INSERT INTO xtdb.public.docs (_id) VALUES (1)",
         "UPDATE docs SET where = 1",
         "UPDATE docs SET docs.a = 1",
     ] {
@@ -283,7 +284,7 @@ fn join_and_projection_names_use_their_identifier_grammar() {
 
 #[test]
 fn malformed_window_arguments_are_grammar_errors() {
-    for window in ["LEAD() OVER ()", "LAG(a, ?, 0) OVER ()", "LEAD(a, 1, 0, 0) OVER ()",
+    for window in ["LEAD() OVER ()", "LAG(a, ?, 0) OVER ()", "LEAD(a, 1, 0, 0) OVER ()", "ABS(a) OVER w",
         "ROW_NUMBER() OVER (PARTITION BY a + 1)"]
     {
         let sql = format!("SELECT {window} FROM docs");

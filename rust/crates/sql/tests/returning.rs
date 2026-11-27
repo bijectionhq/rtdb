@@ -87,6 +87,8 @@ fn ignored_returning_expressions_still_require_sql_syntax() {
         "(SELECT CAST(missing AS BLOB) FROM absent)",
         "(SELECT _id FROM absent FOR VALID_TIME AS OF CAST(missing AS BLOB))",
         "(SELECT _id FROM absent FOR VALID_TIME FROM DATE '2000-01-01')",
+        "(SELECT _id FOR ALL VALID_TIME FROM absent)",
+        "(SELECT _id FROM absent AS z FOR ALL VALID_TIME)",
         "1 <=> 2",
         "SUBSTRING('abc')",
         "TRIM('abc', 'a')",
@@ -94,6 +96,8 @@ fn ignored_returning_expressions_still_require_sql_syntax() {
         "COUNT(ALL *)",
         "ARRAY_AGG(DISTINCT missing)",
         "ABS('abc' USING OCTETS)",
+        "unknown_function(missing) OVER ()",
+        "LAG(missing, ?) OVER ()",
     ] {
         let sql = format!("INSERT INTO docs (_id) VALUES (1) RETURNING {suffix}");
         let error = parse(&sql).unwrap_err();
@@ -102,7 +106,7 @@ fn ignored_returning_expressions_still_require_sql_syntax() {
     }
 
     let sql = "DELETE FROM docs RETURNING CAST(missing AS INT), missing::TEXT, \
-        COUNT(*), CARDINALITY(ARRAY[missing]), SUBSTRING('abc' FROM 1), \
+        COUNT(*), LAG(missing, 1) OVER (), CARDINALITY(ARRAY[missing]), SUBSTRING('abc' FROM 1), \
         ABS(9223372036854775808), (SELECT a FROM absent FOR VALID_TIME FROM ? TO $7)";
     let prepared = prepare(sql, &Fixture, &PrepareOptions::default()).unwrap();
     assert!(prepared.parameter_types.is_empty());
