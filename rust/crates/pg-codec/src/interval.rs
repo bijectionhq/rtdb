@@ -47,6 +47,8 @@ pub(crate) fn period_duration(period: &str, text: &str) -> Result<Value> {
     let period = period.strip_prefix(['P', 'p']).filter(|period| !period.is_empty()).ok_or_else(|| invalid("Period requires an ISO component"))?;
     let (months, days) = period_parts(period, negative, true)?;
     let (seconds, nanos) = duration(text)?;
+    // Parity with XTDB IntervalVector.kt (0b9fa440f2): Long.toInt() truncates months and
+    // normalized days when PeriodDuration components exceed i32.
     if days == 0 && seconds == 0 && nanos == 0 { return Ok(Value::IntervalYearMonth(months as i32)); }
     if months == 0 {
         let nanoseconds = duration_nanos(seconds, nanos)?;
