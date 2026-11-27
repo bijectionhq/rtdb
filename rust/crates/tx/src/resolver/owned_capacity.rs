@@ -154,9 +154,9 @@ impl CapacityRule {
         self.bucket(key).map(Some).ok_or_else(invalid_key)
     }
 
-    fn decode(value: &Value) -> Result<Self> {
+    fn decode(value: &Value) -> Option<Self> {
         let Value::Struct(rule) = value else {
-            return Err(uncovered());
+            return None;
         };
         let (
             Some(Value::Utf8(column)),
@@ -170,12 +170,12 @@ impl CapacityRule {
             rule.get("when"),
         )
         else {
-            return Err(uncovered());
+            return None;
         };
         if rule.len() != 4 {
-            return Err(uncovered());
+            return None;
         }
-        Self::new(column.clone(), *prefix_bytes, *cap, when.clone()).map_err(|_| uncovered())
+        Self::new(column.clone(), *prefix_bytes, *cap, when.clone()).ok()
     }
 }
 
@@ -250,29 +250,29 @@ impl CapacityPolicy {
         ])
     }
 
-    fn decode(value: Value) -> Result<Self> {
+    fn decode(value: Value) -> Option<Self> {
         let Value::Struct(policy) = value else {
-            return Err(uncovered());
+            return None;
         };
         let (Some(Value::List(rules)), Some(Value::I64(through_events))) =
             (policy.get("rules"), policy.get("through_events"))
         else {
-            return Err(uncovered());
+            return None;
         };
         if policy.len() != 2 || !(1..=MAX_RULES).contains(&rules.len()) || *through_events < 0 {
-            return Err(uncovered());
+            return None;
         }
         let rules = rules
             .iter()
             .map(|value| CapacityRule::decode(value.as_ref()))
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Option<Vec<_>>>()?;
         if rules
             .windows(2)
             .any(|pair| pair[0].identity() >= pair[1].identity())
         {
-            return Err(uncovered());
+            return None;
         }
-        Ok(Self {
+        Some(Self {
             rules,
             through_events: *through_events,
         })
@@ -507,7 +507,7 @@ impl OpenTransaction<'_> {
                             && matches!(control.id(), EntityId::String(id) if id == "authority"))
                     )
                 {
-                    return Err(count_uncovered(uncovered()));
+                    return Err(count_bound_uncovered());
                 }
                 let (schema, _) = self.read_owned_schema(owner, root).await?
                     .ok_or_else(uncovered)?;
@@ -558,7 +558,7 @@ impl OpenTransaction<'_> {
         if let Some(archive) = self.context.world_constraints.as_deref() {
             self.check_world_constraints(operations, archive).await?;
         } else if capacity_conditions(operations).any(|condition| condition.relation.world().is_some()) {
-            return Err(count_uncovered(uncovered()));
+            return Err(count_bound_uncovered());
         }
         if !capacity_conditions(operations).any(|condition| condition.relation.world().is_none()) {
             return Ok(());
@@ -617,9 +617,8 @@ impl OpenTransaction<'_> {
             ));
         }
         let policy = self
-            .capacity_policy(snapshot.clone(), owner, relation)
-            .await
-            .map_err(count_uncovered)?;
+            .capacity_policy_with(snapshot.clone(), owner, relation, count_bound_uncovered)
+            .await?;
         let rule = policy.rules.iter().find(|rule| {
             rule.column == column && rule.when.is_empty() && rule.bucket(prefix) == Some(prefix)
         });
@@ -630,17 +629,16 @@ impl OpenTransaction<'_> {
             ));
         };
         if snapshot.relation_event_frontier(&relation.table(owner))? != policy.through_events {
-            return Err(count_uncovered(uncovered()));
+            return Err(count_bound_uncovered());
         }
         let _key = self.context.memory.reserve(prefix.len() * 4 + 512)?;
         match self
-            .capacity_cell(snapshot, owner, relation, &rule.bucket_id(prefix), "count")
-            .await
-            .map_err(count_uncovered)?
+            .capacity_cell_with(snapshot, owner, relation, &rule.bucket_id(prefix), "count", count_bound_uncovered)
+            .await?
         {
             None => Ok(0),
             Some(Value::I64(count)) if (1..=rule.cap).contains(&count) => Ok(count),
-            Some(_) => Err(count_uncovered(uncovered())),
+            Some(_) => Err(count_bound_uncovered()),
         }
     }
 
@@ -1148,19 +1146,30 @@ impl OpenTransaction<'_> {
         owner: &str,
         relation: &OwnedRelation,
     ) -> Result<CapacityPolicy> {
+        self.capacity_policy_with(snapshot, owner, relation, uncovered).await
+    }
+
+    async fn capacity_policy_with(
+        &self,
+        snapshot: Snapshot,
+        owner: &str,
+        relation: &OwnedRelation,
+        on_uncovered: fn() -> Anomaly,
+    ) -> Result<CapacityPolicy> {
         if !snapshot.contains_table(&relation.capacity_table(owner)) {
             return Ok(CapacityPolicy::default());
         }
-        self.capacity_cell(
+        self.capacity_cell_with(
             snapshot,
             owner,
             relation,
             &EntityId::String(RULE.into()),
             "policy",
+            on_uncovered,
         )
         .await?
-        .ok_or_else(uncovered)
         .and_then(CapacityPolicy::decode)
+        .ok_or_else(on_uncovered)
     }
 
     async fn capacity_cell(
@@ -1171,6 +1180,18 @@ impl OpenTransaction<'_> {
         id: &EntityId,
         column: &str,
     ) -> Result<Option<Value>> {
+        self.capacity_cell_with(snapshot, owner, relation, id, column, uncovered).await
+    }
+
+    async fn capacity_cell_with(
+        &self,
+        snapshot: Snapshot,
+        owner: &str,
+        relation: &OwnedRelation,
+        id: &EntityId,
+        column: &str,
+        on_uncovered: fn() -> Anomaly,
+    ) -> Result<Option<Value>> {
         let context = self.context.query_context(
             snapshot,
             self.tx_key().system_time,
@@ -1179,7 +1200,7 @@ impl OpenTransaction<'_> {
         )?;
         let cursor =
             rtdb_query::open_owned_capacity_point(context, owner, relation, id, &[column]).await?;
-        self.read_occupancy_cell(cursor, id, column, uncovered)
+        self.read_occupancy_cell(cursor, id, column, on_uncovered)
             .await
     }
 }
@@ -1234,14 +1255,10 @@ pub(super) fn uncovered() -> Anomaly {
     )
 }
 
-fn count_uncovered(error: Anomaly) -> Anomaly {
-    if error.code == "rtdb.owned/capacity-uncovered" {
-        Anomaly::new(
-            AnomalyCategory::Conflict,
-            "rtdb.owned/count-bound-uncovered",
-            "The declared prefix cannot prove its exact count at the ordered cut",
-        )
-    } else {
-        error
-    }
+fn count_bound_uncovered() -> Anomaly {
+    Anomaly::new(
+        AnomalyCategory::Conflict,
+        "rtdb.owned/count-bound-uncovered",
+        "The declared prefix cannot prove its exact count at the ordered cut",
+    )
 }
