@@ -582,6 +582,7 @@ variant TxMessage : SourceMessage {
     -- Canonical argument gathering applies the row writer's layouts when combining Arrow and row arguments.
     -- Source replay decodes each Arrow IPC message from its retained transaction bytes.
     -- SQL source replay decodes the argument stream from the selected Arrow binary cell.
+    -- Native SQL source replay can retain an aligned plain Binary run value under the source allocation through nested IPC decoding.
     -- JVM SQL source replay borrows plain binary argument bytes through nested IPC decoding while the source relation owns the cell buffers.
     -- SQL source replay binds Arrow arguments by position and reads a scalar parameter when evaluation reaches it.
     -- Compatible row-local mutations bind Arrow argument rows as one column table and stage their results in argument order.

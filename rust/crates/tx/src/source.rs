@@ -3080,15 +3080,7 @@ impl SourceOperationReader<'_> {
             }
             "sql" => {
                 let sql = match value("query")? { Value::Utf8(sql) => sql, _ => return Err(invalid("SQL operation has no query")) };
-                let arguments = body.fields().find("args").and_then(|(index, field)| {
-                    (field.data_type() == &DataType::Binary && field.metadata().is_empty())
-                        .then(|| body.column(index).as_any().downcast_ref::<arrow_array::BinaryArray>()).flatten()
-                }).filter(|array| array.is_valid(offset));
-                let args = if let Some(array) = arguments {
-                    let offsets = array.value_offsets();
-                    let start = offsets[offset] as usize;
-                    let length = offsets[offset + 1] as usize - start;
-                    let bytes = array.values().slice_with_length(start, length);
+                let args = if let Some(bytes) = sql_argument_buffer(body, offset) {
                     Some(decode_arguments(bytes, memory)?)
                 } else {
                     match value("args")? {
@@ -3364,6 +3356,33 @@ fn ordinal_union_column(column: &ArrayRef) -> Result<ArrayRef> {
     let data = data.into_builder().data_type(data_type).buffers(buffers).child_data(children)
         .build().map_err(|error| invalid(error.to_string()))?;
     Ok(arrow_array::make_array(data))
+}
+
+fn sql_argument_buffer(body: &StructArray, row: usize) -> Option<Buffer> {
+    let (index, field) = body.fields().find("args")?;
+    if !field.metadata().is_empty() {
+        return None;
+    }
+    let run = match field.data_type() {
+        DataType::Binary => false,
+        DataType::RunEndEncoded(_, child)
+            if child.data_type() == &DataType::Binary && child.metadata().is_empty() => {
+                from_field(field).ok()?;
+                true
+            }
+        _ => return None,
+    };
+    let cell = ArrowCell { field, array: body.column(index).as_ref(), row }.physical().ok()?;
+    let array = cell.array.as_any().downcast_ref::<BinaryArray>()?;
+    if array.is_null(cell.row) {
+        return None;
+    }
+    let offsets = array.value_offsets();
+    let start = offsets[cell.row] as usize;
+    let length = offsets[cell.row + 1] as usize - start;
+    let bytes = array.values().slice_with_length(start, length);
+    // Preserve the IPC alignment of the owned Binary fallback when borrowing a run value.
+    (!run || bytes.as_ptr().align_offset(std::mem::align_of::<u128>()) == 0).then_some(bytes)
 }
 
 pub(crate) fn decode_arguments(bytes: impl Into<Buffer>, memory: &Arc<MemoryBudget>) -> Result<SqlArguments> {
@@ -6193,6 +6212,62 @@ mod tests {
         assert!(matches!(&decoded.operations[0], Operation::Public(TxOp::Sql { args: None, .. })));
         assert!(matches!(&decoded.operations[1], Operation::Public(TxOp::Sql { args: Some(args), .. }) if args.row_count() == 0));
         assert!(matches!(&decoded.operations[2], Operation::Public(TxOp::Sql { args: Some(args), .. }) if args.row_count() == 1 && args.types().is_empty()));
+    }
+
+    #[test]
+    fn sql_source_replay_borrows_aligned_binary_runs_with_canonical_readback() {
+        use arrow_array::{Int16Array, RunArray, StringArray, types::Int16Type};
+
+        let memory = budget();
+        let source_memory = budget();
+        let arguments = SqlArguments::from_rows(vec![vec![Value::Binary(vec![1, 3, 5])]], &memory).unwrap();
+        let ipc = encode_arguments(&arguments, &memory).unwrap();
+        let values = BinaryArray::from(vec![Some(ipc.as_slice()), None, Some(&b"x"[..]), Some(ipc.as_slice())]);
+        let runs = RunArray::<Int16Type>::try_new(&Int16Array::from(vec![2, 3, 4, 5]), &values).unwrap();
+        drop(values);
+        let body = StructArray::new(
+            vec![Field::new("query", DataType::Utf8, false), Field::new("args", runs.data_type().clone(), false)].into(),
+            vec![Arc::new(StringArray::from(vec!["SELECT ?"; 5])), Arc::new(runs)], None,
+        );
+        let selected = sql_argument_buffer(&body, 1).unwrap();
+        let child = body.column(1).as_run::<Int16Type>().values().as_binary::<i32>();
+        assert_eq!(selected.as_ptr(), child.value(0).as_ptr());
+        assert_eq!(selected.as_slice(), ipc.as_slice());
+        assert!(sql_argument_buffer(&body, 2).is_none());
+        assert!(sql_argument_buffer(&body, 4).is_none());
+        drop(selected);
+
+        let fields = UnionFields::try_new([0], [Field::new("sql", body.data_type().clone(), false)]).unwrap();
+        let operations = Arc::new(UnionArray::try_new(fields, vec![0_i8; 5].into(), Some(vec![0_i32, 1, 2, 3, 4].into()), vec![Arc::new(body)]).unwrap());
+        let schema = Arc::new(Schema::new(vec![Field::new("tx-ops", operations.data_type().clone(), false)]));
+        let pages = OwnedBatch::new(RecordBatch::try_new(schema, vec![operations]).unwrap(), &source_memory).unwrap();
+        let mut charge = memory.reserve(0).unwrap();
+        let mut reader = SourceOperationReader { memory: &memory, parsed_fields: Arc::get_mut(&mut charge).unwrap(), layouts: BTreeMap::new() };
+        let union = pages.batch().column(0).as_union();
+        let replayed = [0, 1, 2, 4].into_iter().map(|row| reader.operation(union, row, pages.reservation().bytes())).collect::<Result<Vec<_>>>().unwrap();
+        let expected_error = decode_arguments(Buffer::from_vec(b"x".to_vec()), &memory).unwrap_err();
+        let replay_error = reader.operation(union, 3, pages.reservation().bytes()).unwrap_err();
+        assert_eq!((replay_error.code, replay_error.message), (expected_error.code, expected_error.message));
+        drop(pages);
+        assert!(source_memory.used_bytes() > 0);
+        let [Operation::Public(TxOp::Sql { args: Some(first), .. }), Operation::Public(TxOp::Sql { args: Some(second), .. }),
+            Operation::Public(TxOp::Sql { args: None, .. }), Operation::Public(TxOp::Sql { args: Some(unaligned), .. })] = replayed.as_slice() else {
+            panic!("Expected three populated argument bindings and one absent binding");
+        };
+        for args in [first, second, unaligned] {
+            assert_eq!(&*args.rows().next().unwrap().unwrap(), &[Value::Binary(vec![1, 3, 5])]);
+            assert_eq!(encode_arguments(args, &memory).unwrap().as_slice(), ipc.as_slice());
+        }
+        let replayed = SourceTransaction::from_operations(replayed, SubmitOptions::default(), &memory).unwrap();
+        let canonical = SourceTransaction::new(
+            [Some(arguments.clone()), Some(arguments.clone()), None, Some(arguments)].into_iter()
+                .map(|args| TxOp::Sql { sql: "SELECT ?".into(), args }).collect(),
+            SubmitOptions::default(), &memory,
+        ).unwrap();
+        assert_eq!(replayed.encode().unwrap().as_slice(), canonical.encode().unwrap().as_slice());
+        assert_eq!(replayed.body_digest().unwrap(), canonical.body_digest().unwrap());
+        drop(replayed);
+        assert_eq!(source_memory.used_bytes(), 0);
     }
 
     #[test]
