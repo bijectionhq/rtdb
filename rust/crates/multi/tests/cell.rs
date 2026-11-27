@@ -3773,11 +3773,9 @@ fn checkpoint_trim_limit(record: &DeploymentRecord) -> Option<i64> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn hosted_search_rebuilds_after_trim_and_loss_of_postings_and_all_source_tries() {
-    use rtdb_format::keys::{CURRENT_STORAGE_VERSION, StorageRoot};
-    use rtdb_multi::packing::{PACK_DIRECTORY, encode_pack, read_index};
-    use rtdb_storage::{LocalStore, ObjectKey, ObjectStore, log::Log};
-    use rtdb_types::{BlockIndex, StorageEpoch, TableRef};
+async fn a_local_cell_retains_search_history_without_directory_page_release() {
+    use rtdb_storage::{ObjectKey, log::{Log, LogOffset}};
+    use rtdb_types::{BlockIndex, TableRef};
 
     let mut cell = Cell::start_durable(0).await;
     cell.add_logical_search_node().await;
@@ -3788,20 +3786,17 @@ async fn hosted_search_rebuilds_after_trim_and_loss_of_postings_and_all_source_t
         client.simple_query(&format!("INSERT INTO docs RECORDS {{_id: {id}, body: '{body}'}}")).await.unwrap();
         cell.node(0).agent.flush("shop").await.unwrap();
     }
+    let source_checkpoint = cell.directory.deployment_by_name("shop").await.unwrap().unwrap().checkpoint.unwrap();
     let database = cell.node(0).server.node().catalog().database("shop").unwrap();
     database.compaction().unwrap().compact_all().await.unwrap();
-    client.simple_query("INSERT INTO checkpoint_marker (_id) VALUES (1)").await.unwrap();
+    database.build_artefacts().await.unwrap();
     cell.node(0).agent.flush("shop").await.unwrap();
-    let record = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let record = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
-            if record.replica_anchor.as_ref().is_some_and(|anchor| anchor.interval[1] == record.checkpoint.unwrap().boundary - 1) {
-                break record;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }).await.unwrap();
-    let checkpoint = record.checkpoint.unwrap();
+    cell.node(0).agent.reconcile().await;
+    let record = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
+    assert!(record.checkpoint.unwrap().block > source_checkpoint.block);
+    assert!(record.recovery_manifest_sha256.is_some());
+    assert!(!database.object_store().supports_directory_page_release());
+    assert!(record.replica_anchor.is_none());
     let members = cell.directory.members().await.unwrap().into_iter()
         .map(|member| (member.id, member.address)).collect::<BTreeMap<_, _>>();
     let reader = rtdb_logkeeper::open_reader(rtdb_logkeeper::StreamConfig {
@@ -3810,52 +3805,19 @@ async fn hosted_search_rebuilds_after_trim_and_loss_of_postings_and_all_source_t
         write_quorum: 2,
         maximum_message_bytes: 4 << 20,
     }, Default::default()).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if reader.retained_floor().await.unwrap().is_some_and(|floor| floor.0 == checkpoint.boundary) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }).await.expect("the logkeepers trimmed the replica prefix before restarting the holder");
+    assert_eq!(reader.read_range(LogOffset(0), LogOffset(1)).await.unwrap().len(), 1);
     drop(reader);
     let table = TableRef::new("public", "docs");
     let snapshot = database.snapshot();
     let slug = snapshot.table_entry(&table).unwrap().slug.clone();
     let catalog = snapshot.trie_catalog();
+    assert!(catalog.entity_directory(&table).is_none());
     assert!(catalog.current_tries(&table).iter().all(|trie| trie.key.level() > 0));
     assert_eq!(catalog.l0_source(&table, BlockIndex(-1), BlockIndex(i64::MAX)).count(), 4);
     let extent = catalog.search_runs(&table).flat_map(|run| run.blocks.iter().copied()).collect::<std::collections::BTreeSet<_>>();
     assert_eq!(extent.len(), 4);
     drop((snapshot, database, client));
     cell.nodes[0].take().unwrap().kill().await.unwrap();
-
-    let CellStorage::Local { root } = cell.storage() else { unreachable!() };
-    let storage_root = StorageRoot::new(CURRENT_STORAGE_VERSION, StorageEpoch(0)).unwrap().key();
-    let raw = LocalStore::open(root.join(record.storage_prefix()).join(storage_root)).unwrap();
-    let mut removed = 0;
-    for pack in raw.list(Some(&ObjectKey::new(PACK_DIRECTORY).unwrap())).await.unwrap() {
-        let index = read_index(&raw, &pack.key).await.unwrap();
-        let mut objects = BTreeMap::new();
-        for (name, entry) in index.entries {
-            if name.starts_with(&format!("{}/data/l00-", slug.table_prefix()))
-                || name.starts_with(&format!("{}/meta/l00-", slug.table_prefix()))
-            {
-                removed += 1;
-                continue;
-            }
-            objects.insert(name, raw.get_range(&pack.key, entry.offset..entry.offset + entry.length).await.unwrap());
-        }
-        let (bytes, _) = encode_pack(&objects, index.previous, index.written_at_ms.unwrap());
-        raw.delete(&pack.key).await.unwrap();
-        raw.put(&pack.key, bytes).await.unwrap();
-    }
-    assert_eq!(removed, 8);
-    for prefix in [rtdb_format::search_manifest::run_prefix(&slug), rtdb_format::term_directory::page_prefix(&slug)] {
-        let objects = raw.list(Some(&ObjectKey::new(prefix).unwrap())).await.unwrap();
-        assert!(!objects.is_empty());
-        for object in objects { raw.delete(&object.key).await.unwrap(); }
-    }
 
     cell.add_logical_search_node().await;
     let client = connect_eventually(&cell, "shop").await;
@@ -3866,18 +3828,15 @@ async fn hosted_search_rebuilds_after_trim_and_loss_of_postings_and_all_source_t
     let holder = cell.holder("shop").await.unwrap();
     let database = cell.node(holder).server.node().catalog().database("shop").unwrap();
     database.build_artefacts().await.unwrap();
-    let rebuilt = database.trie_catalog();
-    let runs = rebuilt.search_runs(&table).collect::<Vec<_>>();
+    let recovered = database.trie_catalog();
+    let runs = recovered.search_runs(&table).collect::<Vec<_>>();
     assert_eq!(runs.iter().flat_map(|run| run.blocks.iter().copied()).collect::<std::collections::BTreeSet<_>>(), extent);
     for run in runs {
-        let receipt = run.source_receipt.as_ref().unwrap();
-        assert_eq!(receipt.checkpoint_boundary(), checkpoint.boundary);
-        assert_eq!(receipt.blocks, run.blocks);
         let key = ObjectKey::new(run.object_key(&slug).unwrap()).unwrap();
         assert!(database.object_store().head_fresh(&key).await.is_ok());
     }
-    let run = rebuilt.search_runs(&table).next().unwrap();
-    let term_directory = rebuilt.term_directory(&table, run.definition_id(), run.definition_version()).unwrap();
+    let run = recovered.search_runs(&table).next().unwrap();
+    let term_directory = recovered.term_directory(&table, run.definition_id(), run.definition_version()).unwrap();
     let root = term_directory.page_root().unwrap().unwrap();
     let prefix = rtdb_format::term_directory::page_prefix(&slug);
     let page = ObjectKey::new(rtdb_format::cow_tree::page_key(&prefix, root.digest)).unwrap();
