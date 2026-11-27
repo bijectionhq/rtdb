@@ -9,6 +9,8 @@ use super::*;
 mod held_objects;
 #[cfg(feature = "backup-object-holds")]
 mod staged;
+#[cfg(all(unix, feature = "backup-object-holds"))]
+mod settle_objects;
 
 pub const MULTI_BACKUP_HELP: &str = "\
 Usage: rtdb multi-backup export --data DIR --archive FILE [--journal-url URL --tls-dir DIR] [--immutable-streams] [--authority-id UUID [--cell-id UUID]]
@@ -23,12 +25,15 @@ Usage: rtdb multi-backup export --data DIR --archive FILE [--journal-url URL --t
        rtdb multi-backup attest --archive FILE --incarnation UUID --authority-id UUID --cell-id UUID
                     --journal-url URL --tls-dir DIR --key-vault DIR --bucket BUCKET [--region REGION] [--s3-endpoint URL]
                     --readback FILE --stage-receipt FILE --attestation-signing-key PKCS8
+       rtdb multi-backup release-object-holds --readback FILE --installation-proof FILE --authority-socket PATH
+                    --bucket BUCKET [--region REGION] [--s3-endpoint URL]
 Export and restore operate on stopped, local RTDB Multi development data.
 Stage installs a pending activation's backup in S3 and holds its destination key.
 Verify-object-holds reads a staged immutable journal and an S3 allocation.
 Pass a saved readback to reopen and verify its exact S3 versions.
 Hosted backup commands require the backup-object-holds build feature.
 Attest emits the signed installation proof for the activation broker and requires Unix.
+Release-object-holds settles an abandoned candidate through the activation broker and requires Unix.
 These commands run without a serving listener.
 ";
 
@@ -60,6 +65,8 @@ enum BackupCommand {
     VerifyObjects(held_objects::Verifier),
     #[cfg(all(unix, feature = "backup-object-holds"))]
     AttestObjects(held_objects::Attester),
+    #[cfg(all(unix, feature = "backup-object-holds"))]
+    ReleaseObjects(settle_objects::Release),
 }
 
 impl MultiBackupOptions {
@@ -77,16 +84,18 @@ impl MultiBackupOptions {
                 return Err(arguments_error());
             }
         }
-        if matches!(operation.as_str(), "stage" | "verify-object-holds" | "attest") {
+        if matches!(operation.as_str(), "stage" | "verify-object-holds" | "attest" | "release-object-holds") {
             if immutable_streams { return Err(arguments_error()); }
             #[cfg(feature = "backup-object-holds")]
             return Ok(Self(match operation.as_str() {
                 "stage" => BackupCommand::Stage(staged::Stage::parse(fields)?),
                 "verify-object-holds" => BackupCommand::VerifyObjects(held_objects::Verifier::parse(fields)?),
                 #[cfg(unix)]
+                "release-object-holds" => BackupCommand::ReleaseObjects(settle_objects::Release::parse(fields)?),
+                #[cfg(unix)]
                 _ => BackupCommand::AttestObjects(held_objects::Attester::parse(fields)?),
                 #[cfg(not(unix))]
-                _ => return Err(Anomaly::unsupported("rtdb/backup-attestation", "Hosted attestation requires the Unix signing key reader")),
+                _ => return Err(Anomaly::unsupported("rtdb/backup-attestation", "Hosted attestation and hold release require Unix")),
             }));
             #[cfg(not(feature = "backup-object-holds"))]
             return Err(Anomaly::unsupported("rtdb/backup-object-holds", "Hosted backup commands require the backup-object-holds build feature"));
@@ -139,6 +148,8 @@ impl MultiBackupOptions {
             BackupCommand::VerifyObjects(verifier) => verifier.run().await,
             #[cfg(all(unix, feature = "backup-object-holds"))]
             BackupCommand::AttestObjects(attester) => attester.run().await,
+            #[cfg(all(unix, feature = "backup-object-holds"))]
+            BackupCommand::ReleaseObjects(release) => release.run().await,
         }
     }
 }
@@ -161,11 +172,17 @@ impl HostedDestination {
         }
         let journal_tls = backup_field(fields, "--tls-dir")?.into();
         let key_vault = backup_field(fields, "--key-vault")?.into();
-        let mut objects = rtdb_s3::S3Config::new(backup_field(fields, "--bucket")?);
-        objects.region = fields.remove("--region");
-        objects.endpoint = fields.remove("--s3-endpoint");
+        let objects = hosted_s3(fields)?;
         Ok(Self { journal_url, journal_tls, key_vault, objects })
     }
+}
+
+#[cfg(feature = "backup-object-holds")]
+fn hosted_s3(fields: &mut BTreeMap<String, String>) -> Result<rtdb_s3::S3Config> {
+    let mut objects = rtdb_s3::S3Config::new(backup_field(fields, "--bucket")?);
+    objects.region = fields.remove("--region");
+    objects.endpoint = fields.remove("--s3-endpoint");
+    Ok(objects)
 }
 
 #[cfg(feature = "backup-object-holds")]

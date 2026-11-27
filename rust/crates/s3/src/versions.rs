@@ -3,7 +3,7 @@ use std::{collections::BTreeSet, sync::Arc};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{ChecksumAlgorithm, CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier, RequestPayer};
+use aws_sdk_s3::types::{ChecksumAlgorithm, CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier, ObjectLockLegalHold, ObjectLockLegalHoldStatus, RequestPayer};
 use bytes::Bytes;
 use object_store::path::Path;
 use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectVersionHold, remote::{ClassicVersionRetirement, PublicationResult, PublicationUploads, RemoteKeyLayout, S3_RETIREMENT_ATTRIBUTE, strong_entity_tag, valid_object_version}};
@@ -49,10 +49,7 @@ impl ObjectVersionHold for VersionedInventory {
         let path = self.observed_path(key, version)
             .map_err(|_| unavailable("The hold does not name an immutable version in this allocation"))?;
         self.inspect((path.to_string(), version.version.clone()), |owner, (path, version)| async move {
-            let reply = owner.client.get_object_legal_hold().bucket(&owner.namespace.bucket)
-                .key(path).version_id(version).set_request_payer(owner.request_payer.clone()).send().await
-                .map_err(|error| unavailable(format!("Reading the S3 legal hold failed: {error}")))?;
-            if reply.legal_hold().and_then(|hold| hold.status()) != Some(&aws_sdk_s3::types::ObjectLockLegalHoldStatus::On) {
+            if owner.legal_hold_status(&path, &version).await? != ObjectLockLegalHoldStatus::On {
                 return Err(unavailable("The exact S3 object version has no legal hold"));
             }
             Ok(())
@@ -105,6 +102,41 @@ fn version_error(key: &ObjectKey, error: Anomaly) -> Error {
 }
 
 impl VersionedInventory {
+    /// Validates an exact legal-hold target before contacting S3.
+    pub fn check_legal_hold_target(&self, key: &ObjectKey, version: &PhysicalObjectVersion) -> Result<()> {
+        self.observed_path(key, version).map(drop)
+    }
+
+    /// Turns the caller's selected version's legal hold off and confirms the result from S3.
+    /// The caller authorizes the release.
+    pub async fn release_legal_hold(&self, key: &ObjectKey, version: &PhysicalObjectVersion) -> Result<()> {
+        let path = self.observed_path(key, version)?;
+        self.inspect((path.to_string(), version.version.clone()), |owner, (path, version)| async move {
+            match owner.legal_hold_status(&path, &version).await? {
+                ObjectLockLegalHoldStatus::Off => return Ok(()),
+                ObjectLockLegalHoldStatus::On => (),
+                _ => return Err(unavailable("S3 reported an unknown legal hold state")),
+            }
+            let hold = ObjectLockLegalHold::builder().status(ObjectLockLegalHoldStatus::Off).build();
+            owner.client.put_object_legal_hold().bucket(&owner.namespace.bucket)
+                .key(&path).version_id(&version).legal_hold(hold)
+                .set_request_payer(owner.request_payer.clone()).send().await
+                .map_err(|error| unavailable(format!("Releasing the S3 legal hold failed: {error}")))?;
+            if owner.legal_hold_status(&path, &version).await? != ObjectLockLegalHoldStatus::Off {
+                return Err(unavailable("S3 did not confirm release of the exact version's legal hold"));
+            }
+            Ok(())
+        }).await
+    }
+
+    async fn legal_hold_status(&self, path: &str, version: &str) -> Result<ObjectLockLegalHoldStatus> {
+        let reply = self.client.get_object_legal_hold().bucket(&self.namespace.bucket)
+            .key(path).version_id(version).set_request_payer(self.request_payer.clone()).send().await
+            .map_err(|error| unavailable(format!("Reading the S3 legal hold failed: {error}")))?;
+        reply.legal_hold().and_then(|hold| hold.status()).cloned()
+            .ok_or_else(|| unavailable("S3 did not report the exact object's legal hold state"))
+    }
+
     pub(crate) fn new(client: Client, namespace: S3ObjectNamespace, root: ObjectKey, requester_pays: bool, scope_multipart_listing: bool) -> Self {
         Self { reads: IoRegion::new(), client, namespace, root, key_layout: RemoteKeyLayout::Escaped, request_payer: requester_pays.then_some(RequestPayer::Requester), scope_multipart_listing, terminal_allocation: None }
     }

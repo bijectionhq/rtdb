@@ -288,6 +288,30 @@ impl ActivationAuthority {
         ))
     }
 
+    #[cfg(all(unix, feature = "backup-object-holds"))]
+    pub(super) async fn require_abandoned_recovery(
+        &self, name: &str, operation: Operation, candidate: Uuid,
+    ) -> Result<()> {
+        let (_, state) = self.read(self.stream_id(name)?).await?;
+        let state = state.ok_or_else(unavailable)?;
+        let superseded = state.binding == operation.predecessor
+            && state.superseded_recoveries.contains(&operation.operation_id);
+        let replaced = operation.predecessor.revision.checked_add(1) == Some(state.binding.revision)
+            && state.publication.is_some_and(|publication| {
+                publication.predecessor == operation.predecessor
+                    && publication.operation != operation.operation_id
+                    && publication.recovery.is_some()
+            });
+        if state.binding.incarnation != candidate && (superseded || replaced) {
+            return Ok(());
+        }
+        Err(Anomaly::new(
+            rtdb_types::AnomalyCategory::Conflict,
+            "rtdb/activation-object-custody",
+            "The retained activation decision must prove this candidate was abandoned",
+        ))
+    }
+
     fn recovery_status_at(
         &self,
         name: &str,

@@ -70,6 +70,11 @@ enum Authority {
 #[serde(deny_unknown_fields)]
 enum Action {
     Status,
+    #[cfg(all(unix, feature = "backup-object-holds"))]
+    AuthorizeObjectRelease {
+        proof: Attestation,
+        objects_sha256: [u8; 32],
+    },
     Bootstrap {
         incarnation: Uuid,
     },
@@ -554,6 +559,22 @@ impl Request {
         let database = self.database;
         match self.action {
             Action::Status => (),
+            #[cfg(all(unix, feature = "backup-object-holds"))]
+            Action::AuthorizeObjectRelease { proof, objects_sha256 } => {
+                let (intent, hold, manifest_sha256) = proof.hosted_hold(objects_sha256)?;
+                if intent.database != database || hold.authority != authority.identity()
+                    || hold.authority_sha256 != authority.connection_digest()?
+                {
+                    return Err(super::conflict());
+                }
+                proof.verify(intent, manifest_sha256, attestors)?;
+                let operation = recovery::Operation {
+                    predecessor: intent.expected,
+                    operation_id: intent.operation_id,
+                };
+                authority.require_abandoned_recovery(&database, operation, hold.generation.database).await?;
+                return Ok(Value::Null);
+            }
             Action::Bootstrap { incarnation } => {
                 authority.bootstrap(&database, incarnation).await?;
             }
@@ -641,6 +662,17 @@ impl Request {
         }
         Ok(report(&database, authority.status(&database).await?))
     }
+}
+
+#[cfg(all(unix, feature = "backup-object-holds"))]
+pub(in crate::multi) async fn authorize_object_release(
+    socket: &std::path::Path, database: &str, proof: Attestation, objects_sha256: [u8; 32],
+) -> Result<()> {
+    broker::call(socket, Request {
+        database: database.to_owned(),
+        action: Action::AuthorizeObjectRelease { proof, objects_sha256 },
+    }).await?;
+    Ok(())
 }
 
 async fn verify_recovery_installation(

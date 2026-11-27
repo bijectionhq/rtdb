@@ -8,20 +8,20 @@ use rtdb_types::PhysicalObjectVersion;
 
 #[derive(Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
-struct Readback {
-    incarnation: Uuid,
-    archive_sha256: String,
+pub(super) struct Readback {
+    pub(super) incarnation: Uuid,
+    pub(super) archive_sha256: String,
     journal_head: u64,
-    checkpoint: String,
-    held_versions: Vec<PhysicalObjectVersion>,
-    object_holds_verified: bool,
+    pub(super) checkpoint: String,
+    pub(super) held_versions: Vec<PhysicalObjectVersion>,
+    pub(super) object_holds_verified: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    key_hold: Option<RecoveryKeyHold>,
+    pub(super) key_hold: Option<RecoveryKeyHold>,
 }
 
 impl Readback {
     #[cfg(unix)]
-    fn digest(&self) -> Result<[u8; 32]> {
+    pub(super) fn digest(&self) -> Result<[u8; 32]> {
         let bytes = serde_json::to_vec(self).map_err(|error| Anomaly::fault("rtdb/backup-object-readback", error.to_string()))?;
         let mut digest = Sha256::new();
         digest.update(b"rtdb.hosted-recovery-readback/v1\0");
@@ -45,7 +45,7 @@ enum ReadSource {
     ServingNames,
 }
 
-fn read_receipt<T: serde::de::DeserializeOwned>(path: &Path, max_bytes: u64) -> Result<T> {
+pub(super) fn read_receipt<T: serde::de::DeserializeOwned>(path: &Path, max_bytes: u64) -> Result<T> {
     let file = File::open(path).map_err(io_error)?;
     if !file.metadata().map_err(io_error)?.is_file() {
         return Err(invalid_readback());
@@ -496,6 +496,17 @@ mod tests {
         let recorded = record(&proof_path).await.unwrap();
         assert_eq!(record(&proof_path).await.unwrap(), recorded);
         assert_eq!(attest(&readback).await.unwrap(), proof_json);
+        let release_objects = |readback: &Path, proof: &Path| MultiBackupOptions::parse([
+            "release-object-holds".into(), "--readback".into(), readback.display().to_string(),
+            "--installation-proof".into(), proof.display().to_string(),
+            "--authority-socket".into(), socket.display().to_string(),
+            "--bucket".into(), bucket.clone(), "--region".into(), "us-east-1".into(),
+            "--s3-endpoint".into(), endpoint.clone(),
+        ].into_iter()).unwrap().run(rtdb_storage::AppleSync::Full);
+        assert_eq!(
+            release_objects(&readback, &proof_path).await.unwrap_err().code,
+            "rtdb/activation-object-custody",
+        );
 
         let wrong_readback = home.path().join("wrong-readback.json");
         let mut wrong = result.clone();
@@ -545,11 +556,35 @@ mod tests {
         activation.begin_recovery(DEVELOPMENT_DATABASE, replacement_intent, Some(operation_id)).await.unwrap();
         assert!(stage(operation_id).await.is_err());
         assert!(attest(&new_readback).await.is_err());
+        assert!(release_objects(&new_readback, &proof_path).await.is_err());
+        let altered_signature = home.path().join("altered-signature.json");
+        let mut altered = proof_json.clone();
+        let first_byte = altered["signature"][0].as_u64().unwrap();
+        altered["signature"][0] = json!(first_byte ^ 1);
+        fs::write(&altered_signature, serde_json::to_vec(&altered).unwrap()).unwrap();
+        assert!(release_objects(&readback, &altered_signature).await.is_err());
+        assert_eq!(verify(Some(&readback), &receipt_path).await.unwrap(), result);
+        let settled = release_objects(&readback, &proof_path).await.unwrap();
+        assert_eq!(settled["incarnation"], incarnation.to_string());
+        assert_eq!(settled["operation_id"], operation_id.to_string());
+        assert_eq!(settled["released_versions"], verified_readback.held_versions.len());
+        let observe_hold = |version: &PhysicalObjectVersion| {
+            aws("get-object-legal-hold", &["--key", &version.key, "--version-id", &version.version])
+        };
+        for target in &verified_readback.held_versions {
+            assert_eq!(observe_hold(target)["LegalHold"]["Status"], "OFF");
+        }
+        assert_eq!(observe_hold(&replacement)["LegalHold"]["Status"], "ON");
         release().await.unwrap();
         assert!(verify(Some(&readback), &receipt_path).await.is_err());
         assert_eq!(journal.head(stream).await.unwrap(), head);
         broker.abort();
         assert!(broker.await.unwrap_err().is_cancelled());
+        let completion = format!("multi/recovery-custody/{authority}/{incarnation}/released");
+        aws("delete-object", &["--key", &completion]);
+        assert_eq!(release_objects(&readback, &proof_path).await.unwrap(), settled);
+        aws("delete-object", &["--key", &physical.key, "--version-id", &physical.version]);
+        assert_eq!(release_objects(&readback, &proof_path).await.unwrap(), settled);
         io.close_and_wait().await;
         keepers.shutdown().await.unwrap();
         authority_keepers.shutdown().await.unwrap();

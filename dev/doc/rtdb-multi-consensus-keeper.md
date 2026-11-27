@@ -317,7 +317,18 @@ Reserve permission to change a legal hold or delete a version for the object cus
 In the loopback MinIO qualification, the version reader could also read the current object name.
 The pinned verifier always supplies the recorded version ID.
 Journal retention, hosted provider enrollment and permission to publish require their own authority.
-The custody owner releases the original hold after the activation journal orders publication with a serving custody handoff or supersession.
+
+For an abandoned candidate with operation-exclusive holds, use `rtdb multi-backup release-object-holds` with the saved readback, signed installation proof, protected activation broker socket and original S3 settings.
+The broker matches the cell signature and the activation connection and requires the retained decision to prove supersession or publication of a different recovery from the same binding.
+Run the first authorization while that decision remains available to the broker.
+The custodian records this authorization under `multi/recovery-custody/` before changing any legal hold.
+Protect that prefix with create-only writes, custodian-only reads and writes, and retention through settlement.
+On AWS, give the custodian `s3:GetBucketVersioning`, `s3:GetObjectLegalHold` and `s3:PutObjectLegalHold` for the allocation and staged candidate paths.
+Give it `s3:GetObject` and conditional `s3:PutObject` on the ledger prefix. [S3 conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html)
+Its ledger read must distinguish an absent key from denied access, which requires `s3:ListBucket` on AWS S3. [S3 GetObject permissions](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html)
+The command confirms `OFF` on each signed version and creates a completion record.
+Retry with the same signed proof and readback to resume from the stored authorization or return the completed result.
+Release after publication of the candidate requires a serving-custody handoff.
 
 The installed server opens its generation keys through `FileKms` at `RTDB_KEY_DIRECTORY`.
 A hosted key custodian must retain decryption of the exact copies' generations across worker and verifier loss and order hold placement and release against key retirement.

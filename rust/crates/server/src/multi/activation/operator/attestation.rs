@@ -262,8 +262,17 @@ impl Attestation {
     }
 
     #[cfg(unix)]
-    pub(super) fn read(path: &Path) -> Result<Self> {
+    pub(in crate::multi) fn read(path: &Path) -> Result<Self> {
         serde_json::from_slice(&read_file(path, 4096, false)?).map_err(|_| invalid())
+    }
+
+    #[cfg(all(unix, feature = "backup-object-holds"))]
+    pub(in crate::multi) fn hosted_hold(&self, objects_sha256: [u8; 32]) -> Result<(&Intent, RecoveryKeyHold, [u8; 32])> {
+        if self.evidence.version != HOSTED_CUSTODY_VERSION || self.evidence.objects_sha256 != Some(objects_sha256) {
+            return Err(invalid());
+        }
+        let (intent, hold) = self.held_key()?;
+        Ok((intent, hold, self.evidence.manifest_sha256))
     }
 
     #[cfg(unix)]

@@ -1198,6 +1198,14 @@ contract PortableApplicationBackup {
         -- The attestor checks the exact pending recovery through the activation connection enrolled in that key hold.
         -- The resulting installation proof signs the digest of the verified object readback and identifies the original key hold for settlement.
         -- Destination object custody preserves serving-name visibility of the held versions through handoff.
+
+    @invariant HostedAbandonment
+        -- Supersession settlement releases only operation-exclusive versions in the signed staged closure.
+        -- The activation broker checks the registered cell signature and proves abandonment at the original binding before authorizing release.
+        -- The object custodian persists that authorization for the exact signed inventory before changing any provider hold.
+        -- Release checks the state of each exact version at the provider and records completion after every hold is off.
+        -- Retries use the same authorization and completed receipts across custodian and activation broker restart.
+        -- A published candidate's object custody requires a serving handoff before release.
 }
 
 ------------------------------------------------------------
