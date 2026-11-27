@@ -371,8 +371,20 @@ impl LocalLog {
                     let mut trailer = [0; TRAILER_BYTES as usize];
                     file.seek(SeekFrom::Start(length - TRAILER_BYTES)).map_err(|error| Error::io(path, error))?;
                     file.read_exact(&mut trailer).map_err(|error| Error::io(path, error))?;
-                    if i64::from_be_bytes(trailer) == header.metadata.offset.0 {
+                    let final_offset = u64::try_from(i64::from_be_bytes(trailer)).ok();
+                    if final_offset == Some(offset) {
                         return Err(corrupt(path, offset, "final frame has a complete trailer with an inconsistent length"));
+                    }
+                    if let Some(final_offset) = final_offset.filter(|last| {
+                        *last > offset && *last <= length - HEADER_BYTES - TRAILER_BYTES
+                    }) {
+                        match read_record_header_at(&mut file, path, maximum, final_offset, length) {
+                            Ok(last) if !last.sealed && last.end() == length => {
+                                return Err(corrupt(path, offset, "inconsistent frame length precedes a complete journal record"));
+                            }
+                            Ok(_) | Err(Error::CorruptLog { .. }) => (),
+                            Err(error) => return Err(error),
+                        }
                     }
                 }
                 break;
@@ -1313,6 +1325,30 @@ mod tests {
         let corrupt = fs::read(&path).unwrap();
         assert!(LocalLog::recover_incomplete_replica_tail(&path, lineage, 1024, AppleSync::Full).is_err());
         assert_eq!(fs::read(&path).unwrap(), corrupt);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn single_journal_tail_recovery_preserves_a_complete_suffix_after_length_corruption() -> Result<()> {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("REPLICA_LOG");
+        let options = LocalLogOptions { maximum_message_bytes: 1024, queue_capacity: 3 };
+        let (log, mut driver) = LocalLog::open_replica(&path, options, Arc::new(SuppliedTimestamp), IoRegion::new(), None)?;
+        let lineage = log.journal_lineage().unwrap();
+        let records = [b"first".as_slice(), b"invalid", b"last"].map(|payload| Queued {
+            payload: Bytes::from_static(payload), timestamp: Timestamp(1), durable: oneshot::channel().0,
+        });
+        let frames = driver.writer.append(&records)?;
+        let corrupt_offset = frames[1].metadata.offset.0 as u64;
+        driver.writer.file.seek(SeekFrom::Start(corrupt_offset + 1)).unwrap();
+        driver.writer.file.write_all(&500_i32.to_be_bytes()).unwrap();
+        drop(driver);
+        drop(log);
+
+        let original = fs::read(&path).unwrap();
+        let result = LocalLog::recover_incomplete_replica_tail(&path, lineage, 1024, AppleSync::Full);
+        assert!(matches!(result, Err(Error::CorruptLog { offset, .. }) if offset == corrupt_offset));
+        assert_eq!(fs::read(&path).unwrap(), original);
         Ok(())
     }
 
