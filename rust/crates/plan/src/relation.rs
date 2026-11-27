@@ -428,23 +428,56 @@ pub enum RelationNode {
     ArrowLiteralPages { #[serde(serialize_with = "LiteralArrowPages::serialize_legacy")] pages: LiteralArrowPages },
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinBuildReason { SmallerInput, KnownInput, StableTie, UnknownInputs, ExistingOrder }
+
+impl JoinBuildReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SmallerInput => "smaller-input",
+            Self::KnownInput => "known-input",
+            Self::StableTie => "stable-tie",
+            Self::UnknownInputs => "unknown-inputs",
+            Self::ExistingOrder => "existing-order",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JoinPlanEvidence {
+    pub build_left: bool,
+    pub build_rows: Option<u64>,
+    pub probe_rows: Option<u64>,
+    pub reason: JoinBuildReason,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(try_from = "RelationParts", into = "RelationParts")]
-pub struct Relation { schema: Schema, node: RelationNode }
+pub struct Relation { schema: Schema, node: RelationNode, join_evidence: Option<JoinPlanEvidence> }
+
+impl PartialEq for Relation {
+    fn eq(&self, other: &Self) -> bool { self.schema == other.schema && self.node == other.node }
+}
 
 #[derive(Serialize, Deserialize)]
 struct RelationParts { schema: Schema, node: RelationNode }
 
 impl Relation {
     pub fn new(schema: Schema, node: RelationNode) -> Result<Self> {
-        let result = Self { schema, node };
+        let result = Self { schema, node, join_evidence: None };
         result.validate()?;
         Ok(result)
     }
     pub fn schema(&self) -> &Schema { &self.schema }
     pub fn node(&self) -> &RelationNode { &self.node }
-    pub fn empty(schema: Schema) -> Self { Self { schema, node: RelationNode::Values { rows: vec![] } } }
-    pub fn unit() -> Self { Self { schema: Schema::default(), node: RelationNode::Values { rows: vec![vec![]] } } }
+    pub fn empty(schema: Schema) -> Self { Self { schema, node: RelationNode::Values { rows: vec![] }, join_evidence: None } }
+    pub fn unit() -> Self { Self { schema: Schema::default(), node: RelationNode::Values { rows: vec![vec![]] }, join_evidence: None } }
+
+    pub fn with_join_evidence(mut self, evidence: JoinPlanEvidence) -> Self {
+        self.join_evidence = Some(evidence);
+        self
+    }
+    pub fn join_evidence(&self) -> Option<JoinPlanEvidence> { self.join_evidence }
 
     pub fn scan(scan: Scan) -> Result<Self> { Self::new(Schema::new(scan.columns.clone())?, RelationNode::Scan(scan)) }
     pub fn project(self: Arc<Self>, expressions: Vec<NamedExpr>) -> Result<Self> {

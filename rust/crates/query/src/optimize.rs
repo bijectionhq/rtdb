@@ -1,6 +1,6 @@
 use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
-use rtdb_plan::{BinaryOp, ColumnId, Expr, JoinKind, NamedExpr, QualifiedTable, Relation, RelationNode, Schema, WindowFunction};
-use rtdb_types::Result;
+use rtdb_plan::{BinaryOp, ColumnId, Expr, JoinBuildReason, JoinKind, JoinPlanEvidence, NamedExpr, QualifiedTable, Relation, RelationNode, Schema, WindowFunction};
+use rtdb_types::{LogicalType, Result, ScalarType, Value};
 
 use crate::CatalogSnapshot;
 use rtdb_columnar::MemoryReservation;
@@ -15,7 +15,7 @@ pub(crate) fn prepare(relation: Arc<Relation>) -> Result<Arc<Relation>> {
     prepare_with(relation, &mut ids)
 }
 
-/// As `prepare`, then ordering each run of inner joins by the row counts `statistics` gives its inputs.
+/// As `prepare`, then ranking inner join inputs using the plan and captured table counts.
 pub(crate) fn prepare_with_statistics(relation: Arc<Relation>, statistics: &mut dyn TableStatistics) -> Result<Arc<Relation>> {
     order_joins(prepare(relation)?, statistics)
 }
@@ -104,16 +104,105 @@ fn an_empty_partition_adds_no_rows_rather_than_hiding_the_others() {
     assert_eq!(partition_rows([]), None);
 }
 
-/// The rows a join input holds as the reference's planner estimates them: a scan's table row count, carried through the
-/// operators that keep or only narrow their input's rows, and `None` elsewhere.
 fn estimated_rows(relation: &Relation, statistics: &mut dyn TableStatistics) -> Result<Option<u64>> {
-    match relation.node() {
-        RelationNode::Scan(scan) => statistics.row_count(&scan.table.name),
-        RelationNode::Values { rows } => Ok(u64::try_from(rows.len()).ok()),
-        RelationNode::Project { input, .. } | RelationNode::Extend { input, .. } | RelationNode::Rename { input, .. } | RelationNode::Filter { input, .. } => estimated_rows(input, statistics),
+    stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || match relation.node() {
+        RelationNode::Scan(scan) => {
+            let table = statistics.row_count(&scan.table.name)?;
+            let rows = scan.predicates.iter().fold(table, |rows, predicate| {
+                smaller_estimate(rows, filtered_rows(table, predicate))
+            });
+            Ok(if scan.iids.as_ref().is_some_and(BTreeSet::is_empty) { Some(0) } else { rows })
+        }
+        RelationNode::Values { rows } => Ok(Some(rows.len() as u64)),
+        RelationNode::LiteralPages { pages } =>
+            Ok(Some(pages.iter().fold(0u64, |total, page| total.saturating_add(page.len() as u64)))),
+        RelationNode::ArrowLiteralPages { pages } =>
+            Ok(Some(pages.pages().iter().fold(0u64, |total, page| total.saturating_add(page.batch().num_rows() as u64)))),
+        RelationNode::Project { input, .. } | RelationNode::Extend { input, .. } | RelationNode::Rename { input, .. }
+        | RelationNode::Sort { input, .. } | RelationNode::Ordinality { input, .. } | RelationNode::Window { input, .. }
+        | RelationNode::Distinct { input } => estimated_rows(input, statistics),
+        RelationNode::Filter { input, predicate } => Ok(filtered_rows(estimated_rows(input, statistics)?, predicate)),
+        RelationNode::Limit { input, fetch, .. } | RelationNode::SortLimit { input, fetch, .. } =>
+            Ok(smaller_estimate(estimated_rows(input, statistics)?, literal_fetch(fetch.as_ref()))),
+        RelationNode::Aggregate { groups, .. } if groups.is_empty() => Ok(Some(1)),
+        RelationNode::Aggregate { input, .. } => estimated_rows(input, statistics),
+        RelationNode::Join { left, right, kind: JoinKind::Inner | JoinKind::Cross, condition } =>
+            Ok(joined_rows(estimated_rows(left, statistics)?, estimated_rows(right, statistics)?,
+                condition.as_ref().is_some_and(|expr| direct_equijoin(expr, left.schema(), right.schema())))),
         RelationNode::Let { body, .. } => estimated_rows(body, statistics),
         RelationNode::Reference { binding } => estimated_rows(&binding.relation, statistics),
         _ => Ok(None),
+    })
+}
+
+fn literal_fetch(fetch: Option<&Expr>) -> Option<u64> {
+    let Expr::Literal(value) = fetch? else { return None };
+    crate::limit_bounds::checked_row_count(rtdb_expr::integer(value)?)
+}
+
+fn smaller_estimate(first: Option<u64>, second: Option<u64>) -> Option<u64> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(first.min(second)),
+        (Some(rows), None) | (None, Some(rows)) => Some(rows),
+        (None, None) => None,
+    }
+}
+
+fn filtered_rows(rows: Option<u64>, predicate: &Expr) -> Option<u64> {
+    stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || match predicate {
+        Expr::Literal(Value::Bool(false) | Value::Null) => Some(0),
+        Expr::Binary { op: BinaryOp::And, left, right } =>
+            smaller_estimate(filtered_rows(rows, left), filtered_rows(rows, right)),
+        Expr::Binary { op, left, right } if column_constant(left, right) || column_constant(right, left) => {
+            // Without column distributions, discount a conjunction by its strongest term.
+            let divisor = match op {
+                BinaryOp::Eq => 4,
+                BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq => 2,
+                _ => 1,
+            };
+            rows.map(|rows| rows.div_ceil(divisor))
+        }
+        _ => rows,
+    })
+}
+
+fn column_constant(column: &Expr, constant: &Expr) -> bool {
+    matches!(column, Expr::Column { .. }) && matches!(constant, Expr::Literal(_) | Expr::Parameter { .. })
+}
+
+fn direct_equijoin(condition: &Expr, left: &Schema, right: &Schema) -> bool {
+    stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || match condition {
+        Expr::Binary { op: BinaryOp::And, left: first, right: second } =>
+            direct_equijoin(first, left, right) && direct_equijoin(second, left, right),
+        _ => direct_join_columns(condition).is_some_and(|(a, b)| {
+            (left.get(a).is_some() && right.get(b).is_some()) || (left.get(b).is_some() && right.get(a).is_some())
+        }),
+    })
+}
+
+fn direct_join_columns(condition: &Expr) -> Option<(ColumnId, ColumnId)> {
+    let Expr::Binary { op: BinaryOp::Eq, left, right } = condition else { return None };
+    let (Expr::Column { id: a, data_type: a_type }, Expr::Column { id: b, data_type: b_type }) =
+        (left.as_ref(), right.as_ref()) else { return None };
+    (direct_join_key(a_type) && direct_join_key(b_type)).then_some((*a, *b))
+}
+
+fn direct_join_key(data_type: &LogicalType) -> bool {
+    let ty = match data_type {
+        LogicalType::Maybe(inner) => inner.as_ref(),
+        ty => ty,
+    };
+    matches!(ty, LogicalType::Null | LogicalType::Scalar(ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64
+        | ScalarType::F32 | ScalarType::F64 | ScalarType::Bool | ScalarType::Utf8 | ScalarType::Uuid))
+}
+
+fn joined_rows(left: Option<u64>, right: Option<u64>, equijoin: bool) -> Option<u64> {
+    match (left, right) {
+        (Some(0), _) | (_, Some(0)) => Some(0),
+        // Use the larger input as the equality-join estimate when distinct counts are unavailable.
+        (Some(left), Some(right)) if equijoin => Some(left.max(right)),
+        (Some(left), Some(right)) => Some(left.saturating_mul(right)),
+        _ => None,
     }
 }
 
@@ -755,14 +844,51 @@ fn reorder_selected(relation: Arc<Relation>) -> Result<Arc<Relation>> {
 
 fn reorder(relation: Arc<Relation>) -> Result<Arc<Relation>> { reorder_by(relation, None) }
 
-/// Joins each relation to the plan built so far as soon as a condition connects them, rather than in FROM order.
-/// Relations keep their written order otherwise, which is the reference's order when no relation has row-count statistics.
-/// With `statistics`, the relations with an estimate come first, fewest rows first, and the rest after them in their
-/// written order, as the reference's mega-join sorts its inputs.
-/// Disconnected groups are crossed last, the final join taking the conditions none of them could.
+struct JoinInput { plan: Arc<Relation>, rows: Option<u64> }
+
+impl JoinInput {
+    fn rank(&self) -> (bool, u64) {
+        (self.rows.is_none(), self.rows.unwrap_or_default())
+    }
+
+    fn join(self, other: Self, kind: JoinKind, condition: Option<Expr>, estimate: bool) -> Result<Self> {
+        let direct = estimate && condition.as_ref().is_some_and(|expr| direct_equijoin(expr, self.plan.schema(), other.plan.schema()));
+        let build_left = !direct || self.rank() <= other.rank();
+        let (build_rows, probe_rows) = if build_left { (self.rows, other.rows) } else { (other.rows, self.rows) };
+        let rows = joined_rows(self.rows, other.rows, direct);
+        let mut plan = Relation::join(self.plan, other.plan, kind, condition)?;
+        if estimate && kind == JoinKind::Inner {
+            let reason = match (build_rows, probe_rows) {
+                (Some(build), Some(probe)) if build < probe => JoinBuildReason::SmallerInput,
+                (Some(build), Some(probe)) if build == probe => JoinBuildReason::StableTie,
+                (Some(_), None) => JoinBuildReason::KnownInput,
+                (None, None) => JoinBuildReason::UnknownInputs,
+                _ => JoinBuildReason::ExistingOrder,
+            };
+            plan = plan.with_join_evidence(JoinPlanEvidence { build_left, build_rows, probe_rows, reason });
+        }
+        Ok(Self { plan: Arc::new(plan), rows })
+    }
+}
+
+fn has_volatile_input(relation: &Relation) -> bool {
+    let mut pending = vec![relation];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(relation) = pending.pop() {
+        if !seen.insert(std::ptr::from_ref(relation)) { continue; }
+        if relation.expressions().into_iter().any(Expr::is_volatile) { return true; }
+        if let RelationNode::Reference { binding } = relation.node() {
+            pending.push(&binding.relation);
+        }
+        pending.extend(relation.children().into_iter().map(Arc::as_ref));
+    }
+    false
+}
+
+/// Greedily joins connected inputs in stable rank order, then crosses the disconnected groups.
 fn reorder_by(relation: Arc<Relation>, statistics: Option<&mut dyn TableStatistics>) -> Result<Arc<Relation>> {
     fn flatten(relation: &Arc<Relation>, leaves: &mut Vec<Arc<Relation>>, conditions: &mut Vec<Expr>) {
-        match relation.node() {
+        stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || match relation.node() {
             RelationNode::Join { left, right, condition, .. } if reorderable_join(relation) => {
                 flatten(left, leaves, conditions);
                 flatten(right, leaves, conditions);
@@ -773,53 +899,66 @@ fn reorder_by(relation: Arc<Relation>, statistics: Option<&mut dyn TableStatisti
                 }
             }
             _ => leaves.push(Arc::clone(relation)),
-        }
+        })
     }
     let (mut leaves, mut conditions) = (Vec::new(), Vec::new());
     flatten(&relation, &mut leaves, &mut conditions);
-    match statistics {
-        None => if leaves.len() < 3 { return Ok(relation); },
-        Some(statistics) => {
-            let estimates = leaves.iter().map(|leaf| estimated_rows(leaf, statistics)).collect::<Result<Vec<_>>>()?;
-            let mut order: Vec<usize> = (0..leaves.len()).collect();
-            order.sort_by_key(|&index| (estimates[index].is_none(), estimates[index]));
-            if order.iter().enumerate().all(|(position, &index)| position == index) { return Ok(relation); }
-            leaves = order.into_iter().map(|index| Arc::clone(&leaves[index])).collect();
+    let estimate = statistics.is_some();
+    let mut inputs = match statistics {
+        None => {
+            if leaves.len() < 3 { return Ok(relation); }
+            leaves.into_iter().map(|plan| JoinInput { plan, rows: None }).collect::<Vec<_>>()
         }
+        Some(statistics) => {
+            if leaves.iter().any(|leaf| has_volatile_input(leaf)) { return Ok(relation); }
+            let inputs = leaves.into_iter().map(|plan| {
+                let rows = estimated_rows(&plan, statistics)?;
+                Ok(JoinInput { plan, rows })
+            }).collect::<Result<Vec<_>>>()?;
+            let consider_builds = !conditions.is_empty() && conditions.iter().all(|condition| direct_join_columns(condition).is_some());
+            if inputs.iter().all(|input| input.rows.is_none())
+                || !consider_builds && inputs.is_sorted_by_key(JoinInput::rank) {
+                return Ok(relation);
+            }
+            inputs
+        }
+    };
+    if estimate {
+        inputs.sort_by_key(JoinInput::rank);
     }
     let ids = |relation: &Relation| relation.schema().ids();
     let mut conditions: Vec<(BTreeSet<ColumnId>, Expr)> = conditions.into_iter().map(|condition| (condition.referenced_columns(), condition)).collect();
-    let mut remaining: std::collections::VecDeque<Arc<Relation>> = leaves.into();
+    let mut remaining: std::collections::VecDeque<JoinInput> = inputs.into();
     let mut groups = Vec::new();
     while let Some(first) = remaining.pop_front() {
         let mut plan = first;
         loop {
-            let planned = ids(&plan);
-            let connects = |candidate: &Relation, columns: &BTreeSet<ColumnId>| {
-                let candidate = ids(candidate);
+            let planned = ids(&plan.plan);
+            let connects = |candidate: &JoinInput, columns: &BTreeSet<ColumnId>| {
+                let candidate = ids(&candidate.plan);
                 columns.iter().any(|id| planned.contains(id)) && columns.iter().any(|id| candidate.contains(id))
                     && columns.iter().all(|id| planned.contains(id) || candidate.contains(id))
             };
             let Some(index) = remaining.iter().position(|candidate| conditions.iter().any(|(columns, _)| connects(candidate, columns))) else { break };
             let candidate = remaining.remove(index).expect("candidate index is in range");
-            let joined = planned.union(&ids(&candidate)).copied().collect::<BTreeSet<_>>();
+            let joined = planned.union(&ids(&candidate.plan)).copied().collect::<BTreeSet<_>>();
             let (used, kept): (Vec<_>, Vec<_>) = conditions.into_iter().partition(|(columns, _)| !columns.is_empty() && columns.is_subset(&joined));
             conditions = kept;
             let condition = used.into_iter().map(|(_, condition)| condition).reduce(|first, second| Expr::binary(BinaryOp::And, first, second));
-            plan = Arc::new(Relation::join(plan, candidate, JoinKind::Inner, condition)?);
+            plan = plan.join(candidate, JoinKind::Inner, condition, estimate)?;
         }
         groups.push(plan);
     }
     let last = groups.pop().expect("a join has relations");
     let mut groups = groups.into_iter();
     let crossed = match groups.next() {
-        Some(first) => Some(groups.try_fold(first, |left, right| Relation::join(left, right, JoinKind::Cross, None).map(Arc::new))?),
+        Some(first) => Some(groups.try_fold(first, |left, right| left.join(right, JoinKind::Cross, None, estimate))?),
         None => None,
     };
     let condition = conditions.into_iter().map(|(_, condition)| condition).reduce(|first, second| Expr::binary(BinaryOp::And, first, second));
     let reordered = match crossed {
-        Some(crossed) => Arc::new(Relation::join(crossed, last, if condition.is_some() { JoinKind::Inner } else { JoinKind::Cross }, condition)?),
-        None => match condition { Some(condition) => Arc::new(last.filter(condition)?), None => last },
+        Some(crossed) => crossed.join(last, if condition.is_some() { JoinKind::Inner } else { JoinKind::Cross }, condition, estimate)?.plan,
+        None => match condition { Some(condition) => Arc::new(last.plan.filter(condition)?), None => last.plan },
     };
     if reordered.schema().fields().iter().map(|field| field.id).eq(relation.schema().fields().iter().map(|field| field.id)) { return Ok(reordered); }
     let expressions = relation.schema().fields().iter().map(|field| NamedExpr { field: field.clone(), expr: field.expression() }).collect();
@@ -931,6 +1070,116 @@ mod tests {
     fn conjunction(predicates: Vec<Expr>) -> Expr { predicates.into_iter().reduce(|left, right| Expr::binary(BinaryOp::And, left, right)).unwrap() }
     fn scan_predicates(relation: &Relation) -> &[Expr] {
         match relation.node() { RelationNode::Scan(scan) => &scan.predicates, other => panic!("Expected a scan, found {other:?}") }
+    }
+
+    struct TableCounts(BTreeMap<&'static str, u64>);
+
+    impl TableStatistics for TableCounts {
+        fn row_count(&mut self, table: &QualifiedTable) -> Result<Option<u64>> {
+            Ok(self.0.get(table.table.table.as_str()).copied())
+        }
+    }
+
+    fn named_scan(name: &str, field: &Field) -> Arc<Relation> {
+        let base = base_scan(vec![field.clone()]);
+        let RelationNode::Scan(scan) = base.node() else { unreachable!() };
+        let mut scan = scan.clone();
+        scan.table.name.table.table = name.into();
+        Arc::new(Relation::scan(scan).unwrap())
+    }
+
+    fn equijoin(left: Arc<Relation>, right: Arc<Relation>, a: &Field, b: &Field) -> Arc<Relation> {
+        let on = Expr::binary(BinaryOp::Eq, a.expression(), b.expression());
+        Arc::new(Relation::join(left, right, JoinKind::Inner, Some(on)).unwrap())
+    }
+
+    fn through_projection(relation: &Relation) -> &Relation {
+        match relation.node() {
+            RelationNode::Project { input, .. } => through_projection(input),
+            _ => relation,
+        }
+    }
+
+    #[test]
+    fn a_pushed_selection_can_make_the_larger_table_the_smaller_build() {
+        let [a, b] = [0, 1].map(field);
+        let range = conjunction(vec![
+            Expr::binary(BinaryOp::GtEq, a.expression(), Expr::Literal(Value::I64(7))),
+            Expr::binary(BinaryOp::Lt, a.expression(), Expr::Literal(Value::I64(12))),
+        ]);
+        for (predicate, estimate) in [(equals(&a, 7), 26), (range, 51)] {
+            let selective = Arc::new(named_scan("a", &a).filter(predicate).unwrap());
+            let join = equijoin(named_scan("b", &b), selective, &b, &a);
+            let mut statistics = TableCounts(BTreeMap::from([("a", 101), ("b", 75)]));
+            let planned = prepare_with_statistics(Arc::clone(&join), &mut statistics).unwrap();
+            assert_eq!(planned.schema(), join.schema());
+            let hash = through_projection(&planned);
+            assert!(matches!(hash.node(), RelationNode::Join { left, .. } if left.schema().get(a.id).is_some()));
+            assert_eq!(hash.join_evidence(), Some(JoinPlanEvidence {
+                build_left: true, build_rows: Some(estimate), probe_rows: Some(75), reason: JoinBuildReason::SmallerInput,
+            }));
+        }
+    }
+
+    #[test]
+    fn zero_and_bounded_unknown_inputs_rank_ahead_of_unbounded_unknown_inputs() {
+        let [a, b] = [0, 1].map(field);
+        for fetch in [0, 3] {
+            let bounded = Arc::new(named_scan("b", &b).limit(None, Some(Expr::Literal(Value::I64(fetch)))).unwrap());
+            let join = equijoin(named_scan("a", &a), bounded, &a, &b);
+            let planned = prepare_with_statistics(Arc::clone(&join), &mut TableCounts(BTreeMap::new())).unwrap();
+            assert_eq!(planned.schema(), join.schema());
+            let hash = through_projection(&planned);
+            assert!(matches!(hash.node(), RelationNode::Join { left, right, .. }
+                if left.schema().get(b.id).is_some() && right.schema().get(a.id).is_some()));
+            assert_eq!(hash.join_evidence(), Some(JoinPlanEvidence {
+                build_left: true, build_rows: Some(fetch as u64), probe_rows: None, reason: JoinBuildReason::KnownInput,
+            }));
+        }
+        assert_eq!(partition_rows([(None, 0), (Some(0), 0)]), Some(0));
+        assert_eq!(joined_rows(Some(0), None, true), Some(0));
+        assert_eq!(joined_rows(Some(u64::MAX), Some(2), false), Some(u64::MAX));
+    }
+
+    #[test]
+    fn a_connected_intermediate_keeps_logical_order_and_can_build_on_a_smaller_right_input() {
+        let [a, b, c] = [0, 1, 2].map(field);
+        let first = equijoin(named_scan("a", &a), named_scan("b", &b), &a, &b);
+        let join = equijoin(first, named_scan("c", &c), &b, &c);
+        for (b_rows, evidence) in [
+            (10, JoinPlanEvidence { build_left: true, build_rows: Some(10), probe_rows: Some(10), reason: JoinBuildReason::StableTie }),
+            (10_000, JoinPlanEvidence { build_left: false, build_rows: Some(10), probe_rows: Some(10_000), reason: JoinBuildReason::SmallerInput }),
+        ] {
+            let mut statistics = TableCounts(BTreeMap::from([("a", 1), ("b", b_rows), ("c", 10)]));
+            let planned = prepare_with_statistics(Arc::clone(&join), &mut statistics).unwrap();
+            assert_eq!(planned.schema(), join.schema());
+            let RelationNode::Join { left, right, .. } = planned.node() else { panic!("Expected the connected join"); };
+            assert_eq!(left.schema().ids(), BTreeSet::from([a.id, b.id]));
+            assert_eq!(right.schema().ids(), BTreeSet::from([c.id]));
+            assert_eq!(planned.join_evidence(), Some(evidence));
+        }
+    }
+
+    #[test]
+    fn statistics_keep_volatile_inputs_and_outer_join_builds_on_their_existing_paths() {
+        let [a, b] = [0, 1].map(field);
+        let mut statistics = TableCounts(BTreeMap::from([("a", 1000), ("b", 1)]));
+        let random = Expr::Call { name: "random".into(), args: vec![], return_type: LogicalType::Scalar(ScalarType::F64) };
+        let pred = Expr::binary(BinaryOp::Lt, random, Expr::Literal(Value::F64(1.0)));
+        let volatile = Arc::new(named_scan("a", &a).filter(pred).unwrap());
+        let inner = equijoin(volatile, named_scan("b", &b), &a, &b);
+        let planned = prepare_with_statistics(Arc::clone(&inner), &mut statistics).unwrap();
+        assert_eq!(planned, prepare(inner).unwrap());
+        assert!(planned.join_evidence().is_none());
+
+        for kind in [JoinKind::Left, JoinKind::Right, JoinKind::Full] {
+            let condition = Expr::binary(BinaryOp::Eq, a.expression(), b.expression());
+            let outer = Arc::new(Relation::join(named_scan("a", &a), named_scan("b", &b), kind, Some(condition)).unwrap());
+            let planned = prepare_with_statistics(Arc::clone(&outer), &mut statistics).unwrap();
+            assert_eq!(planned.schema(), outer.schema());
+            assert_eq!(planned, prepare(outer).unwrap());
+            assert!(planned.join_evidence().is_none());
+        }
     }
 
     #[test]

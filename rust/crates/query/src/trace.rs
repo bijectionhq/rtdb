@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use async_trait::async_trait;
 use rtdb_columnar::MemoryReservation;
-use rtdb_plan::{Relation, RelationNode, SpanContext, TraceSpan, TraceValue, Tracer};
+use rtdb_plan::{JoinPlanEvidence, Relation, RelationNode, SpanContext, TraceSpan, TraceValue, Tracer};
 use rtdb_types::Result;
 use crate::{QueryContext, pages::{BoxPageCursor, OwnedPage, PageCursor}};
 
@@ -76,6 +76,7 @@ pub(crate) struct CursorTrace {
     tracer: Arc<dyn Tracer>, parent: SpanContext, name: String, kind: &'static str,
     span: Option<Box<dyn TraceSpan>>, started: bool, total: Duration, first: Option<Duration>,
     rows: u64, pulls: u64, end: SystemTime, pages: bool, operator_memory: Option<Arc<rtdb_columnar::MemoryBudget>>, _reservation: Arc<MemoryReservation>,
+    join_evidence: Option<JoinPlanEvidence>,
 }
 impl CursorTrace {
     pub fn new(context: &Arc<QueryContext>, kind: &'static str, name: &str, pages: bool) -> Option<Self> {
@@ -84,12 +85,22 @@ impl CursorTrace {
         let reservation = context.memory.reserve(name.len().checked_add(2048)?).ok()?;
         Some(Self { tracer, parent, name: name.into(), kind, span: None, started: false, total: Duration::ZERO,
             first: None, rows: 0, pulls: 0, end: SystemTime::now(), pages,
-            operator_memory: context.operator_root.as_ref().map(|_| Arc::clone(&context.memory)), _reservation: reservation })
+            operator_memory: context.operator_root.as_ref().map(|_| Arc::clone(&context.memory)), _reservation: reservation, join_evidence: None })
     }
     pub fn start(&mut self) {
         if !self.started {
             self.started = true;
             self.span = self.tracer.start(Some(self.parent), &self.name, &[("cursor.type", TraceValue::Text(self.kind))]);
+            if let (Some(span), Some(evidence)) = (&mut self.span, self.join_evidence) {
+                span.attribute("cursor.join.build_side", TraceValue::Text(if evidence.build_left { "left" } else { "right" }));
+                span.attribute("cursor.join.build_reason", TraceValue::Text(evidence.reason.as_str()));
+                if let Some(rows) = evidence.build_rows {
+                    span.attribute("cursor.join.estimated_build_rows", TraceValue::Unsigned(rows));
+                }
+                if let Some(rows) = evidence.probe_rows {
+                    span.attribute("cursor.join.estimated_probe_rows", TraceValue::Unsigned(rows));
+                }
+            }
             self.end = SystemTime::now();
         }
     }
@@ -118,7 +129,9 @@ pub(crate) fn operator_trace(relation: &Relation, context: &Arc<QueryContext>) -
     let extra = match relation.node() { RelationNode::Scan(scan) => scan.table.name.table.schema.len().saturating_add(scan.table.name.table.table.len()), _ => 0 };
     let _name = context.memory.reserve(extra.saturating_add(1024)).ok()?;
     let name = match relation.node() { RelationNode::Scan(scan) => format!("query.cursor.scan.{}.{}", scan.table.name.table.schema, scan.table.name.table.table), _ => format!("query.cursor.{kind}") };
-    CursorTrace::new(context, kind, &name, true)
+    let mut trace = CursorTrace::new(context, kind, &name, true)?;
+    trace.join_evidence = relation.join_evidence();
+    Some(trace)
 }
 pub(crate) fn wrap(input: BoxPageCursor, relation: &Relation, context: &Arc<QueryContext>) -> BoxPageCursor {
     match operator_trace(relation, context) { Some(trace) => Box::new(TracedCursor { input: Some(input), trace }), None => input }

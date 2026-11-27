@@ -1975,6 +1975,11 @@ rule CompactionJobConfirmed {
 
 ---- Rules: Query Serving
 
+-- Native inner-join planning uses row estimates to rank inputs and choose a build side for admitted equijoins.
+-- A zero estimate leaves both join inputs in the plan.
+-- Volatile expressions keep their evaluation scope.
+-- Physical build selection preserves the logical result schema and the outer-join build and comparator rules.
+
 rule ClientOpensSnapshot {
     -- External queries open at the DURABLE head, never the resolved head.
     -- A query must never see a transaction that could vanish if the leader crashed before its replica-log write landed, nor one a newer-term leader superseded.

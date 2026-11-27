@@ -389,7 +389,10 @@ async fn build_batches_at(
         }
         RelationNode::Join { left, right, kind, condition } => {
             let (Some(build_projected),Some(probe_projected)) = (batch_shape(&runtime.child(0)?)?,batch_shape(&runtime.child(1)?)?) else { return Ok(None) };
-            let swapped = !crate::join::build_left(left, right, *kind, &execution)?;
+            let swapped = match relation.join_evidence() {
+                Some(evidence) if *kind == rtdb_plan::JoinKind::Inner => !evidence.build_left,
+                _ => !crate::join::build_left(left, right, *kind, &execution)?,
+            };
             let (build_side,probe_side,build_relation,probe_relation) = if swapped { (1,0,right,left) } else { (0,1,left,right) };
             let mut layout = crate::join_key::JoinLayout::new(build_relation,probe_relation,condition.as_ref(),&execution.context.memory)?;
             layout.resolve_types(runtime.child(build_side)?.schema(),runtime.child(probe_side)?.schema(),&execution)?;
