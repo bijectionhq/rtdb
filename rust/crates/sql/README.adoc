@@ -97,7 +97,7 @@ Plain `EXPLAIN` stops after operator emission.
 PERCENTILE_CONT and PERCENTILE_DISC accept a numeric literal or parameter fraction, one WITHIN GROUP ordering expression, and FILTER.
 Null input is excluded; explicit NULLS FIRST or NULLS LAST produces the pinned `NullOrderingIgnored` warning and does not change the result.
 Continuous results are nullable doubles; discrete results retain the nullable input type.
-The discrete function clamps fractions to the first or last sorted value, while continuous fractions outside the ranks fail for a multi-value input, as in the pinned implementation.
+Both functions reject fractions outside `[0, 1]` up front with `xtdb.operator.group-by/percentile-fraction-out-of-range` before reading input rows, matching upstream XTDB.
 `tests/percentiles.rs` maps `test-ordered-set-aggregates`, `test-aggregate-filter`, and pgwire's `error-propagation`, and adds parameter, type, rank, and syntax assertions.
 These are source regressions; none has executed in Phase 1.
 
