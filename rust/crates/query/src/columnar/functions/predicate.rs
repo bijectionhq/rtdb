@@ -4,7 +4,7 @@
 use std::cmp::Ordering;
 
 use arrow_array::{
-    Array, BooleanArray, FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+    Array, BooleanArray, FixedSizeBinaryArray, Float16Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
     Int64Array, PrimitiveArray, RunArray, StringArray, TimestampMicrosecondArray, UnionArray,
     types::{ArrowPrimitiveType, Int16Type, Int32Type, Int64Type},
 };
@@ -29,7 +29,7 @@ impl CellKind {
     fn of_scalar(scalar: &ScalarType) -> Option<Self> {
         Some(match scalar {
             ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64 => Self::Int,
-            ScalarType::F32 | ScalarType::F64 => Self::Float,
+            ScalarType::F16 | ScalarType::F32 | ScalarType::F64 => Self::Float,
             ScalarType::Utf8 => Self::Text,
             ScalarType::Bool => Self::Bool,
             ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone } => Self::Micros(timezone.clone()),
@@ -65,7 +65,7 @@ pub(super) fn value_cell_kind(value: &Value) -> Option<Option<CellKind>> {
     Some(match value {
         Value::Null => None,
         Value::I8(_) | Value::I16(_) | Value::I32(_) | Value::I64(_) => Some(CellKind::Int),
-        Value::F32(_) | Value::F64(_) => Some(CellKind::Float),
+        Value::F16(_) | Value::F32(_) | Value::F64(_) => Some(CellKind::Float),
         Value::Utf8(_) => Some(CellKind::Text),
         Value::Bool(_) => Some(CellKind::Bool),
         Value::Timestamp { unit: TimeUnit::Microsecond, timezone, .. } => Some(CellKind::Micros(timezone.clone())),
@@ -109,7 +109,7 @@ pub(super) enum Cell<'a> {
 /// A batch column's cells, read in place.
 pub(super) enum Cells<'a> {
     Null, Uuid(&'a FixedSizeBinaryArray), Int(&'a Int64Array), Int32(&'a Int32Array), Int16(&'a Int16Array), Int8(&'a Int8Array),
-    Float(&'a Float64Array), Float32(&'a Float32Array), Text(&'a StringArray), Bool(&'a BooleanArray),
+    Float(&'a Float64Array), Float16(&'a Float16Array), Float32(&'a Float32Array), Text(&'a StringArray), Bool(&'a BooleanArray),
     Micros(&'a TimestampMicrosecondArray, Option<&'a str>), Values(&'a [Value]),
     /// A dense union whose legs are each a plain cell type, read through the leg each cell's type id names.
     Union { array: &'a UnionArray, legs: Vec<Option<Cells<'a>>> },
@@ -145,6 +145,7 @@ impl<'a> Cells<'a> {
             DataType::Int32 if plain(ScalarType::I32) => any.downcast_ref().map(Self::Int32),
             DataType::Int16 if plain(ScalarType::I16) => any.downcast_ref().map(Self::Int16),
             DataType::Int8 if plain(ScalarType::I8) => any.downcast_ref().map(Self::Int8),
+            DataType::Float16 if plain(ScalarType::F16) => any.downcast_ref().map(Self::Float16),
             DataType::Float32 if plain(ScalarType::F32) => any.downcast_ref().map(Self::Float32),
             DataType::Float64 if plain(ScalarType::F64) => any.downcast_ref().map(Self::Float),
             DataType::Utf8 if plain(ScalarType::Utf8) => any.downcast_ref().map(Self::Text),
@@ -213,6 +214,7 @@ impl<'a> Cells<'a> {
             Self::Int16(array) => array.null_count() == 0,
             Self::Int8(array) => array.null_count() == 0,
             Self::Float(array) => array.null_count() == 0,
+            Self::Float16(array) => array.null_count() == 0,
             Self::Float32(array) => array.null_count() == 0,
             Self::Text(array) => array.null_count() == 0,
             Self::Bool(array) => array.null_count() == 0,
@@ -240,6 +242,7 @@ impl<'a> Cells<'a> {
             Self::Int16(array) => integral(*array, row),
             Self::Int8(array) => integral(*array, row),
             Self::Float(array) => valid(*array, row).then(|| Cell::Float(array.value(row))),
+            Self::Float16(array) => valid(*array, row).then(|| Cell::Float(array.value(row).to_f64())),
             Self::Float32(array) => valid(*array, row).then(|| Cell::Float(f64::from(array.value(row)))),
             Self::Text(array) => valid(*array, row).then(|| Cell::Text(array.value(row))),
             Self::Bool(array) => valid(*array, row).then(|| Cell::Bool(array.value(row))),
@@ -282,8 +285,7 @@ pub(super) fn scalar(value: &Value) -> Result<Option<Cell<'_>>, ()> {
         Value::I16(value) => Some(Cell::Int(i64::from(*value))),
         Value::I32(value) => Some(Cell::Int(i64::from(*value))),
         Value::I64(value) => Some(Cell::Int(*value)),
-        Value::F32(value) => Some(Cell::Float(f64::from(*value))),
-        Value::F64(value) => Some(Cell::Float(*value)),
+        Value::F16(_) | Value::F32(_) | Value::F64(_) => Some(Cell::Float(rtdb_expr::number(value).ok_or(())?)),
         Value::Utf8(value) => Some(Cell::Text(value)),
         Value::Bool(value) => Some(Cell::Bool(*value)),
         Value::Timestamp { value, unit: TimeUnit::Microsecond, timezone } => Some(Cell::Micros(*value, timezone.as_deref())),

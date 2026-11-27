@@ -2456,6 +2456,7 @@ surface QueryAccess {
         -- An ordinary scan can apply a bound, total scalar predicate to its referenced columns after bitemporal resolution and gather other columns from the surviving positions.
         -- When every resolved row in a group passes, the scan can reuse the predicate's gathered columns and their charges for matching output fields.
         -- A bound predicate over UTC microsecond timestamps can use those resolved positions, including the nullable bounds of a visible fragment.
+        -- A total comparison over half-precision floating-point values can select resolved positions before the scan gathers unrelated payload columns.
         -- Scan traces distinguish the Arrow buffer bytes of freshly decoded data from the buffers materialized by output gathering and the filtered rows retained by position.
         -- Gathered bytes exclude Arrow buffers that share their backing with a resolved source page.
         -- A spatial fallback read projects IIDs from persisted pages.
@@ -2627,6 +2628,7 @@ surface QueryAccess {
         -- ROUND with a literal or omitted scale can read Float32 and Float64 column cells in place through compatible selections, unions and run ends, writing admitted Float64 results and reporting overflow only for reached non-null cells.
         -- A projection casting a numeric column to double precision can read supported signed integer and floating-point cells through compatible selections, unions and run ends and write admitted Float64 results.
         -- Eligible comparisons and LIKE write Arrow truth values with validity, preserving the distinction between false and unknown.
+        -- Comparisons read compatible half-precision cells in place and use the scalar floating-point rules for signed zero and NaN.
         -- A literal LIKE matcher can be reused across batches, and a pattern error is reported when evaluation reaches the pattern.
         -- A CASE projection with cosine scores, double literals or null as its only results can write Arrow values and validity as each row's selected branch is evaluated.
         -- Scalar-evaluated projections with provably fixed Boolean, signed integer, Float32 or Float64 results can write them directly to Arrow in row order.

@@ -2635,6 +2635,45 @@ mod tests {
     }
 
     #[test]
+    fn half_float_comparisons_write_scalar_equivalent_truths_and_selection() {
+        let memory = MemoryBudget::new(1 << 20);
+        let logical = LogicalType::Scalar(ScalarType::F16).maybe();
+        let field = Field {
+            id: ColumnId(0), name: "half".into(), qualifier: None, qualified_only: false, unnamed: false,
+            data_type: logical.clone(),
+        };
+        let values = [
+            Value::F16(0x8000), Value::F16(0), Value::F16(0x7e42), Value::Null,
+            Value::F16(0x3c00), Value::F16(0x7c00),
+        ];
+        let batch = ColumnBatch::settled(vec![Column::Arrow {
+            array: rtdb_columnar::build_array(&logical, &values).unwrap(),
+            field: Arc::new(rtdb_columnar::to_field("half", &logical).unwrap()),
+            logical: Some(logical),
+        }], values.len(), memory.reserve(0).unwrap()).unwrap();
+        let schema = Schema::new(vec![field.clone()]).unwrap();
+        let zero = Expr::Literal(Value::F16(0));
+        let expressions = [
+            Expr::binary(BinaryOp::Eq, field.expression(), zero.clone()),
+            Expr::binary(BinaryOp::NotEq, field.expression(), zero.clone()),
+            Expr::binary(BinaryOp::Lt, field.expression(), Expr::Literal(Value::F64(0.0))),
+            Expr::Between { operand: Box::new(field.expression()), low: Box::new(zero),
+                high: Box::new(Expr::Literal(Value::F16(0x3c00))), symmetric: false },
+            Expr::Call { name: "===".into(), args: vec![field.expression(), Expr::Literal(Value::I32(1))],
+                return_type: LogicalType::Scalar(ScalarType::Bool) },
+        ];
+        for predicate in expressions {
+            let compiled = Predicate::bind(&predicate, &schema).unwrap();
+            let parameters = rtdb_expr::Parameters::Values(&[]);
+            let expected = evaluated_truths(&predicate, &schema, &batch).unwrap();
+            assert_eq!(compiled.truth(&batch, parameters).unwrap().unwrap(), expected);
+            let selection = compiled.selection(&batch, parameters, &memory, || Ok(())).unwrap().unwrap();
+            assert_eq!((0..batch.len).map(|row| selection.contains(row)).collect::<Vec<_>>(),
+                expected.into_iter().map(|truth| truth == Some(true)).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
     fn plan_time_binding_decides_column_vs_row_path_from_schema() {
         let memory = MemoryBudget::new(1 << 20);
         let mk = |id: u32, name: &str, data_type: LogicalType| Field {

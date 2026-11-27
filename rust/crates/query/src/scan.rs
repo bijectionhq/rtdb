@@ -738,7 +738,7 @@ impl ScanFilter {
             total &= range_operator || match expr {
                 Expr::Column { data_type, .. } | Expr::Parameter { data_type, .. } => Self::total_scalar(data_type),
                 Expr::Literal(Value::Null | Value::Bool(_) | Value::Utf8(_) | Value::I8(_) | Value::I16(_)
-                    | Value::I32(_) | Value::I64(_) | Value::F32(_) | Value::F64(_)) => true,
+                    | Value::I32(_) | Value::I64(_) | Value::F16(_) | Value::F32(_) | Value::F64(_)) => true,
                 Expr::Literal(Value::Timestamp { unit: TimeUnit::Microsecond, timezone, .. }) => timezone.as_deref() == Some("UTC"),
                 Expr::Binary { op: BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Or, .. }
                 | Expr::Unary { op: UnaryOp::Not | UnaryOp::IsNull | UnaryOp::IsNotNull, .. } => true,
@@ -772,7 +772,8 @@ impl ScanFilter {
             LogicalType::Maybe(inner) => Self::total_scalar(inner),
             LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone }) => timezone.as_deref() == Some("UTC"),
             LogicalType::Scalar(scalar) => matches!(scalar, ScalarType::Bool | ScalarType::Utf8
-                | ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64 | ScalarType::F32 | ScalarType::F64),
+                | ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64
+                | ScalarType::F16 | ScalarType::F32 | ScalarType::F64),
             _ => false,
         }
     }
@@ -3842,6 +3843,48 @@ mod tests {
             }
             actual.sort_unstable();
             assert_eq!(actual, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn late_half_float_comparison_filters_the_visible_version() {
+        let one = Value::F16(0x3c00);
+        let (state, table, events) = live_table_with_values([one.clone(), one.clone(), Value::Null]);
+        let key = TransactionKey { tx_id: TxId(1), system_time: Timestamp(101) };
+        let mut write = TransactionBuffer::new(state.value().snapshot(), key, MemoryBudget::new(1 << 20)).unwrap();
+        write.append(table.clone(), StoredEvent {
+            system_from: key.system_time,
+            operation: StoredOperation::Put(StructFields::from([
+                ("_id".into(), Value::I64(1)), ("v".into(), Value::F16(0x4000)),
+            ])),
+            ..events[0].clone()
+        }).unwrap();
+        state.apply(&write.stage().unwrap()).unwrap();
+
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let (mut scan, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        scan.columns.push(Field { id: ColumnId(1), name: "_id".into(), qualifier: None, qualified_only: false,
+            unnamed: false, data_type: scan.table.scan_column_type("_id") });
+        let schema = Schema::new(scan.columns.clone()).unwrap();
+        let predicate = Expr::binary(BinaryOp::Eq, scan.columns[0].expression(), Expr::Literal(one.clone()));
+        assert!(ScanFilter::new(&schema, &predicate, false, &memory).unwrap().is_some());
+        let predicates = Predicates::new(Arc::new(schema), vec![predicate].into());
+        for (at, expected) in [(100, vec![1, 2]), (101, vec![2])] {
+            scan.system_time = TemporalFilter::At(Expr::Literal(Value::Timestamp {
+                value: at, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()),
+            }));
+            let input = ScanCursor::new(scan.clone(), execution.clone(), None).await.unwrap();
+            let mut cursor = input.filtered(&predicates, execution.clone()).unwrap();
+            let mut ids = Vec::new();
+            while let Some(page) = cursor.next_batch().await.unwrap() {
+                for row in 0..page.len {
+                    assert_eq!(page.columns[0].value(row).unwrap(), one);
+                    let Value::I64(id) = page.columns[1].value(row).unwrap() else { panic!("Expected a visible ID"); };
+                    ids.push(id);
+                }
+            }
+            ids.sort_unstable();
+            assert_eq!(ids, expected);
         }
     }
 
