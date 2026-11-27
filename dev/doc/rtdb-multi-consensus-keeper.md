@@ -186,6 +186,26 @@ rtdb multi-activation status xtdb --authority-socket /run/rtdb-activation/author
 The socket accepts typed commands. An operator supplies the expected binding and recovery operation ID.
 For same-host verification, the broker account owns the stopped destination's data and TLS directories. The local verifier supports a stopped Multi development destination and loopback keeper addresses.
 
+### Ranked catalogue admission
+
+Configure `ranked_providers` in the broker configuration as a map from operator-selected names to S3 settings. Each allocation requires an explicit region. Keep the original bucket, endpoint and prefix registered while its recovery outcomes are needed. Credentials may rotate without changing the allocation identity.
+
+Commission a provider against the active binding before enabling the ranked writer for that incarnation.
+
+```sh
+rtdb multi-activation commission-ranked xtdb --authority-socket "$SOCKET" --provider "$PROVIDER" \
+  --expected-incarnation "$PREDECESSOR" --expected-revision "$REVISION"
+```
+
+For a commissioned ranked scope, `freeze-recovery` first closes activation grants and then closes admission at the original provider. Publication requires the resulting closure receipt. If the provider is unavailable, restore access and retry freeze with the same binding and operation ID. Replacing a pending recovery operation for the same predecessor preserves its closure. Commission the successor separately if it needs ranked publication.
+
+Use `ranked-outcomes` on the pending or published recovery to page through the original provider's admitted catalogues, including entries whose source operation IDs were lost. Pass the returned `next_after` value as `--after` until the response ends the scan.
+
+```sh
+rtdb multi-activation ranked-outcomes xtdb --authority-socket "$SOCKET" \
+  --expected-incarnation "$PREDECESSOR" --expected-revision "$REVISION" --operation-id "$OPERATION"
+```
+
 ### Cross-cell publication
 
 Register each destination's cell UUID and raw 32-byte Ed25519 public key in the broker configuration under `destination_attestors`, a JSON object keyed by cell UUID.

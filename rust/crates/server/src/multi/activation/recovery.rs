@@ -64,6 +64,8 @@ pub(super) struct Pending {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Completed {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ranked_closure: Option<super::ranked::RankedClosure>,
     loss_policy: LossPolicy,
     source_cut: SourceCut,
     final_source_lsn: Option<Lsn>,
@@ -84,12 +86,16 @@ pub(crate) enum Status {
         grants_closed: bool,
         installation: Option<Installation>,
         final_source_lsn: Option<Lsn>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ranked_closure: Option<super::ranked::RankedClosure>,
     },
     Published {
         intent: Intent,
         binding: Binding,
         installation: Installation,
         final_source_lsn: Option<Lsn>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ranked_closure: Option<super::ranked::RankedClosure>,
     },
 }
 
@@ -109,7 +115,7 @@ fn custody_protocol(
 
 impl State {
     pub(super) fn valid_recovery(&self) -> bool {
-        if self.version < RECOVERY_INTENT_PROTOCOL {
+        if self.recovery_protocol() < RECOVERY_INTENT_PROTOCOL {
             return self.recovery.is_none()
                 && self.superseded_recoveries.is_empty()
                 && self
@@ -130,7 +136,7 @@ impl State {
                 && pending.installation.is_none_or(|installation| {
                     installation.source_cut.lsn != 0
                         && custody_protocol(installation.key_hold, installation.journal_hold, installation.objects_sha256)
-                            .is_some_and(|protocol| self.version >= protocol)
+                            .is_some_and(|protocol| self.recovery_protocol() >= protocol)
                         && match pending.intent.loss_policy {
                             LossPolicy::Lossless => {
                                 pending.final_source_lsn == Some(Lsn(installation.source_cut.lsn))
@@ -143,7 +149,10 @@ impl State {
             if let Some(completed) = publication.recovery {
                 completed.source_cut.lsn != 0
                     && custody_protocol(completed.key_hold, completed.journal_hold, completed.objects_sha256)
-                        .is_some_and(|protocol| self.version >= protocol)
+                        .is_some_and(|protocol| self.recovery_protocol() >= protocol)
+                    && completed.ranked_closure.is_none_or(|closure| {
+                        self.ranked.is_some() && closure.valid_for(publication.predecessor.incarnation)
+                    })
                     && publication.predecessor.revision.checked_add(1)
                         == Some(self.binding.revision)
                     && match completed.loss_policy {
@@ -162,14 +171,14 @@ impl State {
             && (pending_valid || publication_valid)
     }
 
-    fn pending(&self, operation: Operation) -> Result<Pending> {
+    pub(super) fn pending(&self, operation: Operation) -> Result<Pending> {
         self.require(operation.predecessor)?;
         self.recovery
             .filter(|pending| pending.intent.operation == operation)
             .ok_or_else(conflict)
     }
 
-    fn publication_status(&self, operation: Operation) -> Result<Option<Status>> {
+    pub(super) fn publication_status(&self, operation: Operation) -> Result<Option<Status>> {
         let Some(publication) = self
             .publication
             .filter(|prior| prior.operation == operation.operation_id)
@@ -195,6 +204,7 @@ impl State {
                 objects_sha256: completed.objects_sha256,
             },
             final_source_lsn: completed.final_source_lsn,
+            ranked_closure: completed.ranked_closure,
         }))
     }
 }
@@ -248,7 +258,7 @@ impl ActivationAuthority {
                 } else if supersedes.is_some() {
                     return Err(conflict());
                 }
-                next.version = state.version.max(RECOVERY_INTENT_PROTOCOL);
+                next.advance_protocol(RECOVERY_INTENT_PROTOCOL);
                 next.recovery = Some(Pending {
                     intent,
                     installation: None,
@@ -348,6 +358,7 @@ impl ActivationAuthority {
             grants_closed: state.grants_closed,
             installation: pending.installation,
             final_source_lsn: pending.final_source_lsn,
+            ranked_closure: state.ranked.and_then(|ranked| ranked.closure),
         })
     }
 
@@ -418,7 +429,8 @@ impl ActivationAuthority {
             if let Some(Status::Published { installation: prior, .. }) = published {
                 return same_installation(prior, installation);
             }
-            if state.version >= RECOVERY_JOURNAL_CUSTODY_PROTOCOL && protocol < state.version {
+            let required = state.recovery_protocol();
+            if required >= RECOVERY_JOURNAL_CUSTODY_PROTOCOL && protocol < required {
                 return Err(conflict());
             }
             let mut pending = state.pending(operation)?;
@@ -435,7 +447,7 @@ impl ActivationAuthority {
             }
             pending.installation = Some(installation);
             let mut next = state.clone();
-            next.version = state.version.max(protocol);
+            next.advance_protocol(protocol);
             next.recovery = Some(pending);
             Ok(Some(next))
         }).await?;
@@ -533,6 +545,7 @@ impl ActivationAuthority {
                 "Recovery requires a verified installation recorded by the authority",
             )
         })?;
+        let ranked_closure = frozen.require_ranked_closure()?;
         let successor = self.candidate(name, pending.intent)?;
         let publication = Publication {
             operation: operation.operation_id,
@@ -540,6 +553,7 @@ impl ActivationAuthority {
             manifest_digest: installation.manifest_digest,
             destination_cell: pending.intent.destination_cell,
             recovery: Some(Completed {
+                ranked_closure,
                 loss_policy: pending.intent.loss_policy,
                 source_cut: installation.source_cut,
                 final_source_lsn: pending.final_source_lsn,
@@ -559,7 +573,7 @@ impl ActivationAuthority {
                 if state.already_published(publication, successor)? {
                     return Ok(None);
                 }
-                if state.pending(operation)? != pending {
+                if state.pending(operation)? != pending || state.require_ranked_closure()? != ranked_closure {
                     return Err(conflict());
                 }
                 self.install_binding(name, state, publication, successor)

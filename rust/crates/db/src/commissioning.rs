@@ -10,6 +10,8 @@ const COMMISSIONED_ENVELOPE: u8 = 2;
 pub struct ActivationScope([u8; 32]);
 
 impl ActivationScope {
+    pub fn digest(self) -> [u8; 32] { self.0 }
+
     pub fn new(authority_id: Uuid, database_name: &str) -> Result<Self> {
         Self::for_cell(authority_id, database_name, None)
     }

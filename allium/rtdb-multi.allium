@@ -1140,6 +1140,10 @@ contract EpochScopedStorage {
         -- Closure is irreversible and exposes the final immutable inventory through sequence pages.
         -- A staged slot outside the committed prefix grants no admission.
         -- An exact retry observes its original sequence even after closure.
+        -- The activation broker commissions an exact original provider allocation against the active binding.
+        -- Recovery freezes the predecessor's grants before obtaining closure from that allocation.
+        -- Publication requires the durable closure of each commissioned predecessor ranked scope.
+        -- Replacing the pending operation preserves the predecessor's closure; publication retains it for outcome discovery.
 
     @invariant PermanentUnreachability
         -- In Multi mode the writer captures all retained records through a committed head after sealing.

@@ -22,6 +22,8 @@ use uuid::Uuid;
 
 use super::{Access, ActivationAuthority, Attestors, Destination, DestinationReader, JournalReaders, Request, Source};
 
+use super::super::ranked::Providers;
+
 const MAX_FRAME_BYTES: usize = 16 * 1024;
 const MAX_CONNECTIONS: usize = 16;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
@@ -39,6 +41,8 @@ struct Config {
     destination_attestors: Attestors,
     #[serde(default)]
     destination_journal_readers: JournalReaders,
+    #[serde(default)]
+    ranked_providers: Providers,
 }
 
 impl Config {
@@ -84,6 +88,7 @@ impl Config {
         {
             return Err(configuration());
         }
+        config.ranked_providers.validate()?;
         Ok(config)
     }
 }
@@ -141,7 +146,7 @@ pub(super) async fn serve(
                     handle_peer(
                         stream, &authority, &config.operator_uids, config.destination.as_ref(),
                         config.source.as_ref(), &config.destination_attestors,
-                        &config.destination_journal_readers, apple_sync,
+                        &config.destination_journal_readers, &config.ranked_providers, apple_sync,
                     )
                     .await;
                 });
@@ -160,6 +165,7 @@ async fn handle_peer(
     source: Option<&Source>,
     attestors: &Attestors,
     journals: &JournalReaders,
+    ranked: &Providers,
     apple_sync: rtdb_storage::AppleSync,
 ) {
     let result: Result<Value> = if stream
@@ -175,6 +181,7 @@ async fn handle_peer(
                         source,
                         attestors,
                         journals,
+                        ranked,
                         apple_sync,
                     )
                     .await
@@ -361,6 +368,7 @@ mod tests {
                     None,
                     &Attestors::new(),
                     &JournalReaders::new(),
+                    &Providers::default(),
                     rtdb_storage::AppleSync::default(),
                 )
                 .await;
@@ -427,6 +435,7 @@ pub(super) async fn call_test_peer(
     let (mut client, server) = UnixStream::pair().unwrap();
     let allowed = BTreeSet::from([effective_uid()]);
     let journals = JournalReaders::new();
+    let ranked = Providers::default();
     let (_, result) = tokio::join!(
         handle_peer(
             server,
@@ -436,6 +445,7 @@ pub(super) async fn call_test_peer(
             None,
             attestors,
             &journals,
+            &ranked,
             rtdb_storage::AppleSync::default(),
         ),
         async {

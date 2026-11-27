@@ -19,26 +19,9 @@ const PAGE_SIZE: usize = 100;
 const MAX_ATTEMPTS: usize = 12;
 const MAX_RECORD_BYTES: u64 = 1024;
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct RankedAdmissionScope {
-    pub incarnation: Uuid,
-    pub activation_sha256: [u8; 32],
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClosedRankedAdmission {
-    pub scope: RankedAdmissionScope,
-    pub admitted: u64,
-    pub inventory_sha256: [u8; 32],
-}
-
-#[derive(Debug)]
-pub struct RankedAdmissionPage {
-    pub catalogues: Vec<RankedCatalog>,
-    pub next_after: Option<u64>,
-}
+pub use crate::ranked_admission::{
+    ClosedRankedAdmission, RankedAdmissionPage, RankedAdmissionScope,
+};
 
 /// The original store orders publication and closure on one conditional root.
 #[derive(Clone)]
@@ -118,6 +101,18 @@ impl RankedAdmission {
         scope: ClosedRankedAdmission,
         after: u64,
     ) -> Result<RankedAdmissionPage> {
+        self.outcome_page(scope, after, PAGE_SIZE).await
+    }
+
+    pub async fn outcome_page(
+        &self,
+        scope: ClosedRankedAdmission,
+        after: u64,
+        limit: usize,
+    ) -> Result<RankedAdmissionPage> {
+        if !(1..=PAGE_SIZE).contains(&limit) {
+            return Err(invalid());
+        }
         let owner = self.clone();
         self.region
             .run_async(async move {
@@ -126,7 +121,7 @@ impl RankedAdmission {
                     if !ledger.closed || scope != owner.receipt(ledger) || after > ledger.count {
                         return Err(invalid());
                     }
-                    let end = after.saturating_add(PAGE_SIZE as u64).min(ledger.count);
+                    let end = after.saturating_add(limit as u64).min(ledger.count);
                     let mut catalogues = Vec::with_capacity((end - after) as usize);
                     for sequence in after..end {
                         catalogues.push(owner.entry(sequence + 1).await?);

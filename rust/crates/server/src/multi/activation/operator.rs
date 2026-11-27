@@ -28,6 +28,10 @@ pub const HELP: &str = "Usage: rtdb multi-activation status DATABASE AUTHORITY
                  --loss-policy lossless|accept-unknown-tail [--cell-id UUID] [--supersede-operation-id UUID]
        rtdb multi-activation recovery-status|freeze-recovery|publish-recovery DATABASE AUTHORITY
                  --expected-incarnation UUID --expected-revision N --operation-id UUID
+       rtdb multi-activation commission-ranked DATABASE --authority-socket PATH --provider NAME
+                 --expected-incarnation UUID --expected-revision N
+       rtdb multi-activation ranked-outcomes DATABASE --authority-socket PATH [--after N]
+                 --expected-incarnation UUID --expected-revision N --operation-id UUID
        rtdb multi-activation seal-source DATABASE --authority-socket PATH
                  --expected-incarnation UUID --expected-revision N --operation-id UUID
        rtdb multi-activation record-install DATABASE AUTHORITY --expected-incarnation UUID --expected-revision N --operation-id UUID
@@ -78,6 +82,10 @@ enum Action {
     Bootstrap {
         incarnation: Uuid,
     },
+    CommissionRanked {
+        expected: Binding,
+        provider: String,
+    },
     Freeze {
         expected: Binding,
     },
@@ -109,6 +117,7 @@ enum RecoveryAction {
     Status,
     Freeze,
     SealSource,
+    RankedOutcomes { after: u64 },
     RecordInstall {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         installation: Option<RemoteInstallation>,
@@ -331,6 +340,10 @@ impl Options {
             "bootstrap" => Action::Bootstrap {
                 incarnation: id(take(&mut fields, "--incarnation")?)?,
             },
+            "commission-ranked" => Action::CommissionRanked {
+                expected: binding(&mut fields)?,
+                provider: take(&mut fields, "--provider")?,
+            },
             "freeze" => Action::Freeze {
                 expected: binding(&mut fields)?,
             },
@@ -348,7 +361,7 @@ impl Options {
                 installation: None,
             },
             "begin-recovery" | "recovery-status" | "freeze-recovery" | "seal-source"
-            | "record-install" | "publish-recovery" => {
+            | "record-install" | "publish-recovery" | "ranked-outcomes" => {
                 let selection = recovery::Operation {
                     predecessor: binding(&mut fields)?,
                     operation_id: id(take(&mut fields, "--operation-id")?)?,
@@ -366,6 +379,10 @@ impl Options {
                     "recovery-status" => RecoveryAction::Status,
                     "freeze-recovery" => RecoveryAction::Freeze,
                     "seal-source" => RecoveryAction::SealSource,
+                    "ranked-outcomes" => RecoveryAction::RankedOutcomes {
+                        after: fields.remove("--after").map(|value| value.parse())
+                            .transpose().map_err(|_| arguments_error())?.unwrap_or(0),
+                    },
                     "record-install" => RecoveryAction::RecordInstall { installation: None },
                     _ => RecoveryAction::Publish,
                 };
@@ -398,7 +415,9 @@ impl Options {
             }));
         }
 
-        if matches!(request.action, Action::Recovery { action: RecoveryAction::SealSource, .. }) {
+        if matches!(request.action, Action::CommissionRanked { .. }
+            | Action::Recovery { action: RecoveryAction::SealSource | RecoveryAction::RankedOutcomes { .. }, .. })
+        {
             return Err(arguments_error());
         }
         let identity = id(take(&mut fields, "--authority-id")?)?;
@@ -476,6 +495,7 @@ impl Options {
                         None,
                         &Attestors::new(),
                         &JournalReaders::new(),
+                        &super::ranked::Providers::default(),
                         apple_sync,
                     )
                     .await
@@ -578,6 +598,7 @@ impl Request {
         source: Option<&Source>,
         attestors: &Attestors,
         journals: &JournalReaders,
+        ranked: &super::ranked::Providers,
         apple_sync: rtdb_storage::AppleSync,
     ) -> Result<Value> {
         let database = self.database;
@@ -616,6 +637,9 @@ impl Request {
             }
             Action::Bootstrap { incarnation } => {
                 authority.bootstrap(&database, incarnation).await?;
+            }
+            Action::CommissionRanked { expected, provider } => {
+                ranked.commission(authority, &database, expected, &provider).await?;
             }
             Action::Freeze { expected } => {
                 authority.close_grants(&database, expected).await?;
@@ -686,7 +710,10 @@ impl Request {
                     RecoveryAction::Begin { cell, loss_policy, supersedes } => authority
                         .begin_recovery(&database, recovery::Intent { operation, destination_cell: cell, loss_policy }, supersedes).await?,
                     RecoveryAction::Status => authority.recovery_status(&database, operation).await?,
-                    RecoveryAction::Freeze => authority.freeze_recovery(&database, operation).await?,
+                    RecoveryAction::Freeze => ranked.freeze(authority, &database, operation).await?,
+                    RecoveryAction::RankedOutcomes { after } => {
+                        return ranked.outcomes(authority, &database, operation, after).await;
+                    }
                     RecoveryAction::SealSource => seal_source(authority, &database, operation, source).await?,
                     RecoveryAction::RecordInstall { installation } => {
                         let verified = verify_recovery_installation(
@@ -1247,6 +1274,7 @@ mod tests {
                 None,
                 &Attestors::new(),
                 &JournalReaders::new(),
+                &super::super::ranked::Providers::default(),
                 rtdb_storage::AppleSync::default(),
             )
             .await
@@ -1276,6 +1304,7 @@ mod tests {
                     None,
                     &Attestors::new(),
                     &JournalReaders::new(),
+                    &super::super::ranked::Providers::default(),
                     rtdb_storage::AppleSync::default()
                 )
                 .await

@@ -153,6 +153,21 @@ impl S3Config {
         self.open_classic(storage_root, remotes, io, RemoteKeyLayout::Escaped).await
     }
 
+    pub fn ranked_allocation(&self, root: &ObjectKey) -> Result<(S3ObjectNamespace, String)> {
+        let region = self.region.as_ref().filter(|region| !region.is_empty())
+            .ok_or_else(|| Anomaly::incorrect("rtdb.s3/ranked-admission", "Ranked admission requires an explicit S3 region"))?;
+        if self.bucket.is_empty() || self.terminal_scope.is_some() {
+            return Err(Anomaly::incorrect("rtdb.s3/ranked-admission", "Ranked admission requires an ordinary S3 allocation"));
+        }
+        self.require_cell_root(root)?;
+        let (endpoint, _) = self.endpoint_addressing()?;
+        Ok((S3ObjectNamespace {
+            bucket: self.bucket.clone(),
+            endpoint: endpoint.map(|endpoint| endpoint.to_string()),
+            region: Some(region.clone()),
+        }, self.object_prefix(root)?.to_string()))
+    }
+
     /// Opens ranked admission on the same original provider allocation as serving objects.
     pub async fn ranked_admission(
         &self,

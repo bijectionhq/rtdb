@@ -22,6 +22,7 @@ mod clock;
 pub(super) mod journal_custody;
 pub(crate) mod operator;
 pub(super) mod recovery;
+mod ranked;
 pub use operator::{HELP as ACTIVATION_HELP, Options as ActivationOptions};
 
 use clock::{ElapsedClock, HOLDER_WINDOW};
@@ -33,6 +34,7 @@ const RECOVERY_INTENT_PROTOCOL: u8 = 4;
 const RECOVERY_KEY_CUSTODY_PROTOCOL: u8 = 5;
 const RECOVERY_JOURNAL_CUSTODY_PROTOCOL: u8 = 6;
 const RECOVERY_HOSTED_CUSTODY_PROTOCOL: u8 = 7;
+const RANKED_RECOVERY_PROTOCOL: u8 = 8;
 const RENEW_AHEAD: Duration = Duration::from_secs(1);
 const ATTEMPTS: usize = 8;
 
@@ -149,6 +151,8 @@ struct State {
     grants_closed: bool,
     grants_end: Option<i64>,
     retired: BTreeSet<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ranked: Option<ranked::RankedState>,
     publication: Option<Publication>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     recovery: Option<recovery::Pending>,
@@ -167,6 +171,7 @@ impl State {
             grants_closed: false,
             grants_end: None,
             retired: BTreeSet::new(),
+            ranked: None,
             publication: None,
             recovery: None,
             superseded_recoveries: BTreeSet::new(),
@@ -464,7 +469,7 @@ impl ActivationAuthority {
         } else {
             ELAPSED_GRANT_PROTOCOL
         };
-        next.version = state.version.max(version);
+        next.advance_protocol(version);
         let predecessor = publication.predecessor;
         // Retain identities that were assigned outside the successor protocol.
         let derived_predecessor = state.publication.and_then(|prior| {
@@ -482,6 +487,10 @@ impl ActivationAuthority {
         next.publication = Some(publication);
         next.recovery = None;
         next.superseded_recoveries.clear();
+        if let Some(ranked) = &mut next.ranked {
+            ranked.provider = None;
+            ranked.closure = None;
+        }
         Ok(next)
     }
 
@@ -560,11 +569,12 @@ impl ActivationAuthority {
                 return Err(corrupt());
             }
             let state: State = serde_json::from_slice(bytes).map_err(|_| corrupt())?;
-            if !matches!(state.version, ABSOLUTE_GRANT_PROTOCOL | ELAPSED_GRANT_PROTOCOL | CELL_GRANT_PROTOCOL | RECOVERY_INTENT_PROTOCOL | RECOVERY_KEY_CUSTODY_PROTOCOL | RECOVERY_JOURNAL_CUSTODY_PROTOCOL | RECOVERY_HOSTED_CUSTODY_PROTOCOL)
+            if !matches!(state.version, ABSOLUTE_GRANT_PROTOCOL | ELAPSED_GRANT_PROTOCOL | CELL_GRANT_PROTOCOL | RECOVERY_INTENT_PROTOCOL | RECOVERY_KEY_CUSTODY_PROTOCOL | RECOVERY_JOURNAL_CUSTODY_PROTOCOL | RECOVERY_HOSTED_CUSTODY_PROTOCOL | RANKED_RECOVERY_PROTOCOL)
                 || state.destination_cell().is_some_and(|cell| cell.is_nil() || state.version < CELL_GRANT_PROTOCOL)
                 || state.binding.incarnation.is_nil()
                 || state.binding.revision == 0
                 || state.retired.contains(&state.binding.incarnation)
+                || !state.valid_ranked()
                 || !state.valid_recovery()
             {
                 return Err(corrupt());
