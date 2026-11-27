@@ -130,6 +130,50 @@ mod tests {
     }
 
     #[test]
+    fn insert_values_returning_reports_the_first_reached_syntax_error() {
+        let memory = MemoryBudget::new(64 << 20);
+        for (source, expected) in [
+            (
+                "INSERT INTO docs (_id) VALUES (1) RETURNING CAST(a AS BLOB)",
+                "line 1:54 no viable alternative at input 'CAST(aASBLOB'",
+            ),
+            (
+                "INSERT INTO \"🙂\".\"select\" (\"_id\") VALUES (1), (2) RETURNING CAST(a AS BLOB)",
+                "line 1:69 no viable alternative at input 'CAST(aASBLOB'",
+            ),
+            (
+                "INSERT docs (_id) VALUES (1) RETURNING CAST(a AS BLOB)",
+                "line 1:7 missing 'INTO' at 'docs'",
+            ),
+        ] {
+            let legacy = crate::parse_in(source, &memory).unwrap_err();
+            for diagnose in [statement_syntax_diagnostic as fn(_, _, _) -> _, batch_syntax_diagnostic] {
+                let report = diagnose(source, &legacy, &memory).unwrap().unwrap();
+                assert_eq!(report.anomaly().category, AnomalyCategory::Incorrect);
+                assert_eq!(report.anomaly().code, "xtdb/sql-error");
+                assert_eq!(report.anomaly().message.as_deref().unwrap(),
+                    format!("Errors parsing SQL statement:\n  - {expected}"), "{source}");
+                assert!(report.anomaly().context.is_empty());
+            }
+            assert_eq!(memory.used_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn an_unported_insert_source_keeps_the_original_error() {
+        let memory = MemoryBudget::new(64 << 20);
+        for source in [
+            "INSERT INTO docs RECORDS {_id: 1} RETURNING CAST(a AS BLOB)",
+            "INSERT INTO docs (_id) VALUES (abs(1)) RETURNING CAST(a AS BLOB)",
+        ] {
+            let legacy = crate::parse_in(source, &memory).unwrap_err();
+            assert!(statement_syntax_diagnostic(source, &legacy, &memory).unwrap().is_none(), "{source}");
+            assert!(batch_syntax_diagnostic(source, &legacy, &memory).unwrap().is_none(), "{source}");
+            assert_eq!(memory.used_bytes(), 0);
+        }
+    }
+
+    #[test]
     fn unrecognised_failures_keep_the_vendor_anomaly() {
         let memory = MemoryBudget::new(64 << 20);
         for source in ["SELECT 1", "extra @", "PREPARE q AS SELECT 1 LIMIT ALL"] {

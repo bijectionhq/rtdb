@@ -1408,10 +1408,12 @@ async fn simple_batch_reports_the_first_statement_grammar_error_after_lexing() {
     let running = Running::start(ServerConfig::default(), None).await;
     let mut client = Client::connect(&running.server, None).await;
     let limit_all = "Errors parsing SQL statement:\n  - line 1:15 mismatched input 'ALL' expecting {UNSIGNED_INTEGER, POSTGRES_PARAMETER_SPECIFICATION, '?'}".to_owned();
+    let invalid_returning = "Errors parsing SQL statement:\n  - line 3:32 no viable alternative at input 'CAST(aASBLOB'".to_owned();
     for (source, expected) in [
         ("SELEC 7; SELECT 1 LIMIT ALL", initial_statement_mismatch(1, 0)),
         ("SELECT 1 LIMIT ALL; SELEC 7", limit_all),
         ("SELEC 7; SELECT @", initial_statement_mismatch(1, 0)),
+        ("SELECT 1;\n  INSERT INTO docs (_id) VALUES (1)\n  RETURNING CAST(a /* gap */ AS BLOB), COUNT(ALL *);\nSELECT 2", invalid_returning),
     ] {
         let frames = client.query(source).await;
         assert_eq!(tags(&frames), b"EZ");
@@ -1902,16 +1904,23 @@ async fn nested_simple_prepare_emits_terminal_planning_warnings_when_the_child_i
 async fn extended_parse_reports_the_reference_multi_statement_grammar_error() {
     let running = Running::start(ServerConfig::default(), None).await;
     let mut client = Client::connect(&running.server, None).await;
-    client.parse("broken", "SELEC 7", &[]).await;
-    client.send(b'S', &[]).await;
-    let frames = client.through(b'Z').await;
-    assert_eq!(tags(&frames), b"EZ");
-    let (_, message, detail) = error_fields(&frames[0].1);
-    let expected = initial_statement_mismatch(1, 0);
-    assert_eq!(message, expected);
-    assert_eq!(detail["code"], "xtdb/sql-error");
-    assert_eq!(detail["category"], "incorrect");
-    assert_eq!(detail["data"]["sql"], "SELEC 7");
+    for (source, expected) in [
+        ("SELEC 7", initial_statement_mismatch(1, 0)),
+        (
+            "INSERT INTO docs (_id) VALUES (1) RETURNING CAST(a AS BLOB)",
+            "Errors parsing SQL statement:\n  - line 1:54 no viable alternative at input 'CAST(aASBLOB'".to_owned(),
+        ),
+    ] {
+        client.parse("broken", source, &[]).await;
+        client.send(b'S', &[]).await;
+        let frames = client.through(b'Z').await;
+        assert_eq!(tags(&frames), b"EZ");
+        let (_, message, detail) = error_fields(&frames[0].1);
+        assert_eq!(message, expected);
+        assert_eq!(detail["code"], "xtdb/sql-error");
+        assert_eq!(detail["category"], "incorrect");
+        assert_eq!(detail["data"]["sql"], source);
+    }
     drop(client);
     running.stop().await;
 }

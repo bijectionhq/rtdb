@@ -208,7 +208,7 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
         })
     }
 
-    fn select_list(&mut self, mode: PredictionMode) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
+    pub(super) fn select_list(&mut self, mode: PredictionMode) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
         self.generated_ordinary(SELECT_LIST, |session, local| {
             if session.predict_select(LIST_BASE, mode)?.number() == 1 {
                 return session.decline_select_call(FIRST_STAR);

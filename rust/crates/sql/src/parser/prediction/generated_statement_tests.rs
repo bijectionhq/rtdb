@@ -153,6 +153,43 @@ fn rollback_root_matches_optional_semicolon_and_attaches_actual_eof_in_both_prof
     }
 }
 
+#[test]
+fn insert_values_uses_the_original_returning_rule_and_select_list_call() {
+    let source = "INSERT INTO \"select\".\"table\" (\"_id\") VALUES (1), (2) RETURNING 3 AS \"order\";";
+    let (result, memory) = environment_fixture(|environment, work, _| {
+        for profile in [ParserProfile::SllBail, ParserProfile::LlDefault] {
+            with_parser_session(environment, source, work, |session| {
+                session.profile = profile;
+                let root = session.direct_sql_statement().unwrap();
+                let view = session.invocation_view();
+                let [ContextChild::Context(insert), ContextChild::Terminal(_), ContextChild::Terminal(_)] =
+                    view.context(root).unwrap().children() else { panic!("expected INSERT and statement delimiters"); };
+                let insert = view.context(*insert).unwrap();
+                assert_eq!(insert.class(), Some(ContextClass::InsertStatement));
+                let Some(ContextChild::Context(returning)) = insert.children().last() else { panic!("expected RETURNING child"); };
+                let returning = view.context(*returning).unwrap();
+                assert_eq!((returning.class(), returning.invoking_state()),
+                    (Some(ContextClass::DmlReturningStatement), ParserState::State(385)));
+                let [ContextChild::Terminal(keyword), ContextChild::Context(list)] = returning.children() else {
+                    panic!("expected RETURNING and its select list");
+                };
+                assert_eq!(keyword.lexeme().raw(), "RETURNING");
+                let list = view.context(*list).unwrap();
+                assert_eq!(list.invoking_state(), ParserState::State(2746));
+                assert_eq!(list.start().unwrap().lexeme().raw(), "3");
+                assert_eq!(list.stop().unwrap().lexeme().raw(), "\"order\"");
+                assert_eq!(session.current(), None);
+                assert_eq!(session.precedence(), 0);
+                assert!(session.matched_eof);
+                Ok(())
+            })?;
+        }
+        Ok(())
+    });
+    result.unwrap();
+    assert_eq!(memory.used_bytes(), 0);
+}
+
 fn assert_initial_failure_tree<'parse>(
     session: &ParserSession<'parse, '_, '_, '_>, first: usize,
 ) -> (InvocationKey<'parse>, InvocationKey<'parse>) {

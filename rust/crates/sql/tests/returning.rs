@@ -64,6 +64,18 @@ fn returning_keeps_literal_insert_and_records_static_expansion_eligible() {
 }
 
 #[test]
+fn valid_insert_returning_preserves_the_values_planning_error() {
+    let prefix = "INSERT INTO docs VALUES (1)";
+    let with_returning = format!("{prefix} RETURNING \"select\"");
+    assert!(parse(&with_returning).is_ok());
+
+    let options = PrepareOptions::default();
+    let expected = prepare(prefix, &Fixture, &options).unwrap_err();
+    assert!(expected.message.as_deref().unwrap().contains("INSERT with VALUES needs column name list"));
+    assert_eq!(prepare(&with_returning, &Fixture, &options).unwrap_err(), expected);
+}
+
+#[test]
 fn returning_requires_select_list_syntax_and_is_rejected_by_erase_and_patch() {
     for returning in ["x FROM docs", "x WHERE TRUE", "x ORDER BY x", "x LIMIT 1", "x UNION SELECT 1", "x FOR ALL VALID_TIME", "DISTINCT x", "x DEFAULT", "x AS 'text'", "x+", "f(", "* EXCLUDE ()", "* RENAME x", "* EXCLUDE t.x", "t.* RENAME t.x AS y", "x,*,y", ",*,y", "*,*", "x,*,", "* EXCEPT (x)", "* REPLACE (1 AS x)", "(XTQL ('bad',1))"] {
         let sql = format!("INSERT INTO docs (_id) VALUES (1) RETURNING {returning}");

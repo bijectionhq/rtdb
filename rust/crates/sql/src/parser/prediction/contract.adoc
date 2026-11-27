@@ -913,6 +913,15 @@ The actual return record is reparented to the saved query caller before the atte
 An outer attachment failure leaves the caller restored and the recursive precedence popped.
 Public parser entry adoption and the remaining generated query and expression bodies remain open.
 
+== Generated INSERT VALUES diagnostics
+
+Decision 34 selects InsertStatement, whose prefix matches INSERT and INTO, resolves the optional schema and identifier, and enters the source decision d335.
+The recognizer adopts InsertValues and follows the optional column list and the original row list loop at d199.
+It adopts the single-expression row alternative of d198, including one pair of wrapping parentheses at common-value states 1136–1138.
+Once the prefix reaches RETURNING, its labelled rule invokes the SELECT list at state 2746.
+The replay follows both wrapper profiles from the original statement or batch root, so errors reached during prediction or matching in the prefix take precedence over errors in the list.
+Replay stops at the selected private scope boundary for RECORDS and query sources, multi-expression row constructors and unported expressions.
+
 == Finishing-alternative selection
 
 The adaptive caller constructs the candidate no-viable error and seeks the prediction origin before asking the current Local or Full facade for a finishing alternative.
