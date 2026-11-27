@@ -19,6 +19,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 mod clock;
+mod journal_custody;
 pub(crate) mod operator;
 pub(super) mod recovery;
 pub use operator::{HELP as ACTIVATION_HELP, Options as ActivationOptions};
@@ -30,6 +31,7 @@ const ELAPSED_GRANT_PROTOCOL: u8 = 2;
 const CELL_GRANT_PROTOCOL: u8 = 3;
 const RECOVERY_INTENT_PROTOCOL: u8 = 4;
 const RECOVERY_KEY_CUSTODY_PROTOCOL: u8 = 5;
+const RECOVERY_JOURNAL_CUSTODY_PROTOCOL: u8 = 6;
 const RENEW_AHEAD: Duration = Duration::from_secs(1);
 const ATTEMPTS: usize = 8;
 
@@ -114,6 +116,7 @@ pub struct VerifiedSuccessor {
     activation_scope: Option<rtdb_db::ActivationScope>,
     destination_cell: Option<Uuid>,
     key_hold: Option<rtdb_crypt::RecoveryKeyHold>,
+    journal_hold: Option<journal_custody::RetainedJournal>,
     source_cut: recovery::SourceCut,
 }
 
@@ -126,6 +129,7 @@ impl VerifiedSuccessor {
             activation_scope: installed.activation_scope(),
             destination_cell: None,
             key_hold: None,
+            journal_hold: None,
             source_cut: recovery::SourceCut {
                 lsn: installed.source_lsn().0,
                 position: installed.source_basis().position(),
@@ -206,20 +210,9 @@ impl ActivationAuthority {
         identity: Uuid,
         access: Access,
     ) -> Result<Arc<Self>> {
-        let path = Path::new(url.strip_prefix(super::CONSENSUS_SCHEME).ok_or_else(configuration)?);
-        if !path.is_absolute() { return Err(configuration()); }
-        let config = super::JournalConfig::read(path).map_err(super::io_error)?;
-        let ca = std::fs::read(&credentials.ca).map_err(super::io_error)?;
-        let peers = serde_json::to_vec(&(config.catalog, config.catalog_voters, &config.keepers))
-            .map_err(|_| configuration())?;
-        let mut binding = Sha256::new();
-        binding.update(b"rtdb.activation.connection/v1\0");
-        binding.update(Sha256::digest(peers));
-        binding.update(Sha256::digest(ca));
-        let journal = rtdb_stream_journal::ConsensusJournal::new(&credentials, &config)
-            .map_err(super::io_error)?;
-        let mut authority = Self::with_access(Arc::new(journal), identity, access)?;
-        Arc::get_mut(&mut authority).expect("just connected").connection_sha256 = Some(binding.finalize().into());
+        let journal_custody::KeeperJournal { journal, connection_sha256 } = journal_custody::KeeperJournal::connect(url, &credentials)?;
+        let mut authority = Self::with_access(journal, identity, access)?;
+        Arc::get_mut(&mut authority).expect("just connected").connection_sha256 = Some(connection_sha256);
         Ok(authority)
     }
 
@@ -554,7 +547,7 @@ impl ActivationAuthority {
                 return Err(corrupt());
             }
             let state: State = serde_json::from_slice(bytes).map_err(|_| corrupt())?;
-            if !matches!(state.version, ABSOLUTE_GRANT_PROTOCOL | ELAPSED_GRANT_PROTOCOL | CELL_GRANT_PROTOCOL | RECOVERY_INTENT_PROTOCOL | RECOVERY_KEY_CUSTODY_PROTOCOL)
+            if !matches!(state.version, ABSOLUTE_GRANT_PROTOCOL | ELAPSED_GRANT_PROTOCOL | CELL_GRANT_PROTOCOL | RECOVERY_INTENT_PROTOCOL | RECOVERY_KEY_CUSTODY_PROTOCOL | RECOVERY_JOURNAL_CUSTODY_PROTOCOL)
                 || state.destination_cell().is_some_and(|cell| cell.is_nil() || state.version < CELL_GRANT_PROTOCOL)
                 || state.binding.incarnation.is_nil()
                 || state.binding.revision == 0
@@ -949,6 +942,7 @@ mod tests {
             manifest_digest: [3; 32],
             destination_cell: None,
             key_hold: None,
+            journal_hold: None,
             source_cut: recovery::SourceCut::default(),
             activation_scope: Some(rtdb_db::ActivationScope::new(authority.identity(), "xtdb").unwrap()),
         };
@@ -1003,6 +997,7 @@ mod tests {
             manifest_digest: [4; 32],
             destination_cell: None,
             key_hold: None,
+            journal_hold: None,
             source_cut: recovery::SourceCut::default(),
             activation_scope: Some(rtdb_db::ActivationScope::new(identity, "xtdb").unwrap()),
         };

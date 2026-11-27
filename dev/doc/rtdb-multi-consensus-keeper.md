@@ -99,6 +99,18 @@ Run `release-recovery-key` against the original vault with the installation proo
 The provider can settle the hold after the verifier has exited.
 Hosted journal and object custody still require their own provider evidence.
 
+## Recovery journal custody
+
+For a stopped destination on Logkeeper cluster level 11, give `attest` the destination custodian's `--journal-custodian-tls-dir` in addition to the activation reader credentials.
+The verifier reads the selected checkpoint, checks the staged installation, and asks the keeper quorum to retain the exact announcement before emitting the proof.
+The journal attestation authenticates that hold together with the installation's key evidence.
+Configure the broker's `destination_journal_readers` map by cell UUID, with `journal_url` and `journal_tls_dir` for each original destination.
+The broker reads the committed hold with that cell's journal reader before recording the installation.
+Recording journal custody advances the name to activation protocol 6. Subsequent recoveries for that name require journal custody evidence.
+Upgrade participating readers and brokers before recording the proof.
+After publication or supersession, use `release-recovery-journal` with the original proof, activation reader credentials, and the destination custodian credential.
+The key custodian uses its separate `release-recovery-key` action.
+
 ## Independent database activation
 
 A Multi runtime can bind a stable name and its exact database incarnation to a separately commissioned immutable activation journal.

@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::super::{Binding, VerifiedSuccessor, recovery::SourceCut, successor_incarnation};
+use super::super::journal_custody::{JournalAttestation, JournalEvidence, RetainedJournal};
 
 const VERSION: u8 = 1;
 const HELD_KEY_VERSION: u8 = 2;
@@ -119,6 +120,8 @@ impl Evidence {
 pub(super) struct Attestation {
     evidence: Evidence,
     signature: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    journal: Option<JournalAttestation>,
 }
 
 impl Attestation {
@@ -169,6 +172,7 @@ impl Attestation {
         Ok(Self {
             evidence,
             signature,
+            journal: None,
         })
     }
 
@@ -184,6 +188,22 @@ impl Attestation {
         }
         let hold = self.evidence.key_hold()?.ok_or_else(invalid)?;
         Ok((&self.evidence.intent, hold))
+    }
+
+    #[cfg(unix)]
+    pub(super) fn bind_journal(&mut self, evidence: JournalEvidence, signer: &Ed25519KeyPair) -> Result<RetainedJournal> {
+        let (_, hold) = self.held_key()?;
+        let journal = JournalAttestation::sign(evidence, hold, signer);
+        let retained = journal.retained(hold);
+        self.journal = Some(journal);
+        Ok(retained)
+    }
+
+    #[cfg(unix)]
+    pub(super) fn held_journal(&self) -> Result<(&Intent, RecoveryKeyHold, RetainedJournal)> {
+        let (intent, key) = self.held_key()?;
+        let journal = self.journal.as_ref().ok_or_else(invalid)?;
+        Ok((intent, key, journal.retained(key)))
     }
 
     pub(super) fn verify(
@@ -205,13 +225,18 @@ impl Attestation {
         UnparsedPublicKey::new(&ED25519, key)
             .verify(&evidence.message()?, &self.signature)
             .map_err(|_| invalid())?;
+        let key_hold = evidence.key_hold()?;
+        let journal_hold = self.journal.as_ref().map(|journal| {
+            journal.verify(key_hold.ok_or_else(invalid)?, key)
+        }).transpose()?;
         Ok(VerifiedSuccessor {
             predecessor: intent.expected.incarnation,
             successor: evidence.candidate,
             manifest_digest: evidence.manifest_sha256,
             activation_scope: Some(intent.scope()?),
             destination_cell: Some(cell),
-            key_hold: evidence.key_hold()?,
+            key_hold,
+            journal_hold,
             source_cut: SourceCut {
                 lsn: evidence.source_lsn,
                 position: evidence.source_position,

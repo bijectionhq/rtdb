@@ -20,7 +20,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use super::{Access, ActivationAuthority, Attestors, Destination, DestinationReader, Request, Source};
+use super::{Access, ActivationAuthority, Attestors, Destination, DestinationReader, JournalReaders, Request, Source};
 
 const MAX_FRAME_BYTES: usize = 16 * 1024;
 const MAX_CONNECTIONS: usize = 16;
@@ -37,6 +37,8 @@ struct Config {
     source: Option<Source>,
     #[serde(default)]
     destination_attestors: Attestors,
+    #[serde(default)]
+    destination_journal_readers: JournalReaders,
 }
 
 impl Config {
@@ -68,6 +70,11 @@ impl Config {
                 .len()
                 != config.destination_attestors.len()
             || !config.authority_url.starts_with(super::CONSENSUS_SCHEME)
+            || config.destination_journal_readers.iter().any(|(cell, reader)| {
+                !config.destination_attestors.contains_key(cell)
+                    || !reader.journal_url.starts_with(super::CONSENSUS_SCHEME)
+                    || !reader.journal_tls_dir.is_absolute()
+            })
             || !config.authority_tls_dir.is_absolute()
             || config.destination.as_ref().is_some_and(|destination| !absolute_location(destination))
             || config.source.as_ref().is_some_and(|source| {
@@ -106,6 +113,10 @@ pub(super) async fn serve(
             &source.location.journal_url,
         )?;
     }
+    for reader in config.destination_journal_readers.values() {
+        require_directory(&reader.journal_tls_dir, 0o022)?;
+        super::super::require_independent_journals(&config.authority_url, &reader.journal_url)?;
+    }
     let authority = ActivationAuthority::connect(
         &config.authority_url,
         crate::cli::journal_credentials(&config.authority_tls_dir)?,
@@ -129,7 +140,8 @@ pub(super) async fn serve(
                 requests.spawn(async move {
                     handle_peer(
                         stream, &authority, &config.operator_uids, config.destination.as_ref(),
-                        config.source.as_ref(), &config.destination_attestors, apple_sync,
+                        config.source.as_ref(), &config.destination_attestors,
+                        &config.destination_journal_readers, apple_sync,
                     )
                     .await;
                 });
@@ -147,6 +159,7 @@ async fn handle_peer(
     destination: Option<&Destination>,
     source: Option<&Source>,
     attestors: &Attestors,
+    journals: &JournalReaders,
     apple_sync: rtdb_storage::AppleSync,
 ) {
     let result: Result<Value> = if stream
@@ -161,6 +174,7 @@ async fn handle_peer(
                         destination.map(DestinationReader::Broker),
                         source,
                         attestors,
+                        journals,
                         apple_sync,
                     )
                     .await
@@ -346,6 +360,7 @@ mod tests {
                     None,
                     None,
                     &Attestors::new(),
+                    &JournalReaders::new(),
                     rtdb_storage::AppleSync::default(),
                 )
                 .await;
@@ -411,6 +426,7 @@ pub(super) async fn call_test_peer(
 ) -> Result<Value> {
     let (mut client, server) = UnixStream::pair().unwrap();
     let allowed = BTreeSet::from([effective_uid()]);
+    let journals = JournalReaders::new();
     let (_, result) = tokio::join!(
         handle_peer(
             server,
@@ -419,6 +435,7 @@ pub(super) async fn call_test_peer(
             None,
             None,
             attestors,
+            &journals,
             rtdb_storage::AppleSync::default(),
         ),
         async {

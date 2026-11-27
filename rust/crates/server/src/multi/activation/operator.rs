@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use self::attestation::{Attestation, Attestors, Intent};
+use super::journal_custody::KeeperJournal;
 use super::{Access, ActivationAuthority, ActivationStatus, Binding, VerifiedSuccessor, recovery};
 use crate::{
     config::NodeConfiguration,
@@ -34,9 +35,11 @@ pub const HELP: &str = "Usage: rtdb multi-activation status DATABASE AUTHORITY
        rtdb multi-activation attest xtdb --authority-id UUID --expected-incarnation UUID --expected-revision N --operation-id UUID
                  --data DIR --journal-url URL --tls-dir DIR --immutable-streams
                  --cell-id UUID --attestation-signing-key PKCS8 --manifest-sha256 HEX
-                 [--authority-url URL --authority-tls-dir DIR]
+                 [--authority-url URL --authority-tls-dir DIR [--journal-custodian-tls-dir DIR]]
        rtdb multi-activation release-recovery-key DATABASE --authority-id UUID --authority-url URL --authority-tls-dir DIR
                  --installation-proof FILE --key-vault DIR
+       rtdb multi-activation release-recovery-journal DATABASE --authority-id UUID --authority-url URL --authority-tls-dir DIR
+                 --installation-proof FILE --journal-url URL --journal-custodian-tls-dir DIR
        rtdb multi-activation serve --authority-socket PATH --broker-config PATH
 
 AUTHORITY is --authority-socket PATH for a local operator broker, or
@@ -141,6 +144,21 @@ struct Destination {
     journal_tls_dir: PathBuf,
 }
 
+type JournalReaders = BTreeMap<Uuid, JournalReader>;
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JournalReader {
+    journal_url: String,
+    journal_tls_dir: PathBuf,
+}
+
+impl JournalReader {
+    fn connect(&self) -> Result<KeeperJournal> {
+        KeeperJournal::connect(&self.journal_url, &crate::cli::journal_credentials(&self.journal_tls_dir)?)
+    }
+}
+
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Source {
@@ -201,6 +219,7 @@ enum Command {
         signing_key: PathBuf,
         destination: Destination,
         hold_authority: Option<(String, PathBuf)>,
+        journal_custodian: Option<PathBuf>,
     },
     #[cfg(unix)]
     ReleaseRecoveryKey {
@@ -210,6 +229,16 @@ enum Command {
         tls: PathBuf,
         proof: PathBuf,
         vault: PathBuf,
+    },
+    #[cfg(unix)]
+    ReleaseRecoveryJournal {
+        database: String,
+        identity: Uuid,
+        url: String,
+        tls: PathBuf,
+        proof: PathBuf,
+        journal_url: String,
+        journal_tls: PathBuf,
     },
     #[cfg(unix)]
     ServeBroker { socket: PathBuf, config: PathBuf },
@@ -253,7 +282,8 @@ impl Options {
                 (None, None) => None,
                 _ => return Err(arguments_error()),
             };
-            if !fields.is_empty() {
+            let journal_custodian = fields.remove("--journal-custodian-tls-dir").map(PathBuf::from);
+            if !fields.is_empty() || journal_custodian.is_some() && hold_authority.is_none() {
                 return Err(arguments_error());
             }
             return Ok(Self(Command::Attest {
@@ -262,17 +292,25 @@ impl Options {
                 signing_key,
                 destination,
                 hold_authority,
+                journal_custodian,
             }));
         }
         #[cfg(unix)]
-        if operation == "release-recovery-key" {
+        if matches!(operation.as_str(), "release-recovery-key" | "release-recovery-journal") {
             let identity = id(take(&mut fields, "--authority-id")?)?;
             let url = take(&mut fields, "--authority-url")?;
             let tls = take(&mut fields, "--authority-tls-dir")?.into();
             let proof = take(&mut fields, "--installation-proof")?.into();
-            let vault = take(&mut fields, "--key-vault")?.into();
+            let release = if operation == "release-recovery-key" {
+                let vault = take(&mut fields, "--key-vault")?.into();
+                Command::ReleaseRecoveryKey { database, identity, url, tls, proof, vault }
+            } else {
+                let journal_url = take(&mut fields, "--journal-url")?;
+                let journal_tls = take(&mut fields, "--journal-custodian-tls-dir")?.into();
+                Command::ReleaseRecoveryJournal { database, identity, url, tls, proof, journal_url, journal_tls }
+            };
             if immutable_streams || !fields.is_empty() { return Err(arguments_error()); }
-            return Ok(Self(Command::ReleaseRecoveryKey { database, identity, url, tls, proof, vault }));
+            return Ok(Self(release));
         }
 
         let action = match operation.as_str() {
@@ -424,6 +462,7 @@ impl Options {
                         destination.as_ref().map(DestinationReader::Direct),
                         None,
                         &Attestors::new(),
+                        &JournalReaders::new(),
                         apple_sync,
                     )
                     .await
@@ -450,6 +489,7 @@ impl Options {
                 signing_key,
                 destination,
                 hold_authority,
+                journal_custodian,
             } => {
                 broker::validate_destination(&destination)?;
                 let key = attestation::signing_key(&signing_key)?;
@@ -459,8 +499,11 @@ impl Options {
                         &url, crate::cli::journal_credentials(&tls)?, intent.authority_id, Access::ConsensusReader,
                     ).await?)
                 } else { None };
+                let custodian = journal_custodian.as_deref().map(|tls| {
+                    KeeperJournal::connect(&destination.journal_url, &crate::cli::journal_credentials(tls)?)
+                }).transpose()?;
                 let proof = attest_installation(
-                    &destination, intent, manifest_sha256, &key, authority.as_deref(),
+                    &destination, intent, manifest_sha256, &key, authority.as_deref(), custodian.as_ref(),
                 ).await?;
                 Ok(json!(proof))
             }
@@ -478,6 +521,18 @@ impl Options {
                 Ok(json!({ "released": hold }))
             }
             #[cfg(unix)]
+            Command::ReleaseRecoveryJournal { database, identity, url, tls, proof, journal_url, journal_tls } => {
+                let proof = Attestation::read(&proof)?;
+                let authority = ActivationAuthority::connect(
+                    &url, crate::cli::journal_credentials(&tls)?, identity, Access::ConsensusReader,
+                ).await?;
+                let (intent, key, journal) = proof.held_journal()?;
+                require_hold_release(&authority, &database, intent, key).await?;
+                let custodian = KeeperJournal::connect(&journal_url, &crate::cli::journal_credentials(&journal_tls)?)?;
+                custodian.release(key.generation.database, journal).await?;
+                Ok(json!({ "released": journal }))
+            }
+            #[cfg(unix)]
             Command::ServeBroker { socket, config } => {
                 broker::serve(&socket, &config, apple_sync).await?;
                 Ok(Value::Null)
@@ -493,6 +548,7 @@ impl Request {
         destination: Option<DestinationReader<'_>>,
         source: Option<&Source>,
         attestors: &Attestors,
+        journals: &JournalReaders,
         apple_sync: rtdb_storage::AppleSync,
     ) -> Result<Value> {
         let database = self.database;
@@ -574,7 +630,7 @@ impl Request {
                     RecoveryAction::SealSource => seal_source(authority, &database, operation, source).await?,
                     RecoveryAction::RecordInstall { installation } => {
                         let verified = verify_recovery_installation(
-                            authority, &database, operation, installation, destination, attestors, apple_sync,
+                            authority, &database, operation, installation, destination, attestors, journals, apple_sync,
                         ).await?;
                         authority.record_recovery_installation(&database, operation, verified).await?
                     }
@@ -594,10 +650,12 @@ async fn verify_recovery_installation(
     proof: Option<RemoteInstallation>,
     destination: Option<DestinationReader<'_>>,
     attestors: &Attestors,
+    journals: &JournalReaders,
     apple_sync: rtdb_storage::AppleSync,
 ) -> Result<VerifiedSuccessor> {
-    let recovery_intent = match authority.recovery_status(database, operation).await? {
-        recovery::Status::Pending { intent, .. } | recovery::Status::Published { intent, .. } => intent,
+    let (recovery_intent, published) = match authority.recovery_status(database, operation).await? {
+        recovery::Status::Pending { intent, .. } => (intent, false),
+        recovery::Status::Published { intent, .. } => (intent, true),
     };
     let intent = Intent {
         authority_id: authority.identity(),
@@ -610,7 +668,18 @@ async fn verify_recovery_installation(
         if Some(proof.cell) != intent.cell {
             return Err(super::conflict());
         }
-        return proof.attestation.verify(&intent, proof.manifest_sha256, attestors);
+        let verified = proof.attestation.verify(&intent, proof.manifest_sha256, attestors)?;
+        if !published {
+            match (journals.get(&proof.cell), verified.journal_hold) {
+                (Some(reader), Some(hold)) => reader.connect()?.require_retained(verified.successor, hold).await?,
+                (None, None) => (),
+                _ => return Err(Anomaly::incorrect(
+                    "rtdb/activation-journal-custody",
+                    "The destination must match its registered journal custody reader and hold",
+                )),
+            }
+        }
+        return Ok(verified);
     }
     let destination = destination
         .filter(|_| database == DEVELOPMENT_DATABASE && intent.cell.is_none())
@@ -807,11 +876,16 @@ async fn attest_installation(
     manifest_sha256: [u8; 32],
     key: &ring::signature::Ed25519KeyPair,
     authority: Option<&ActivationAuthority>,
+    custodian: Option<&KeeperJournal>,
 ) -> Result<Attestation> {
     use rtdb_crypt::Kms;
 
-    let mut stopped = StoppedDatabase::open(destination, intent.candidate()?, intent.scope()?)?;
+    let candidate = intent.candidate()?;
+    let mut stopped = StoppedDatabase::open(destination, candidate, intent.scope()?)?;
     let result = async {
+        let selected = if let Some(custodian) = custodian {
+            Some(custodian.selected(candidate).await?)
+        } else { None };
         let installed = stopped.database.installed_backup().await?.ok_or_else(missing_installation)?;
         let Some(authority) = authority else {
             return Attestation::sign(intent, manifest_sha256, &installed, key);
@@ -819,7 +893,6 @@ async fn attest_installation(
         let operation = recovery::Operation {
             predecessor: intent.expected, operation_id: intent.operation_id,
         };
-        let candidate = intent.candidate()?;
         if !matches!(authority.recovery_status(&intent.database, operation).await?,
             recovery::Status::Pending { intent: pending, candidate: selected, .. }
                 if candidate == selected && intent.cell == pending.destination_cell)
@@ -830,9 +903,13 @@ async fn attest_installation(
             generation: stopped.database.generation().ok_or_else(missing_installation)?,
             authority_sha256: authority.connection_sha256.ok_or_else(super::configuration)?,
         };
-        let proof = Attestation::sign_installation(intent, manifest_sha256, &installed, Some(evidence), key)?;
+        let mut proof = Attestation::sign_installation(intent, manifest_sha256, &installed, Some(evidence), key)?;
         let (_, hold) = proof.held_key()?;
         stopped.keys.retain_recovery_key(hold).await?;
+        if let Some((custodian, selected)) = custodian.zip(selected) {
+            let retained = proof.bind_journal(selected, key)?;
+            custodian.retain(candidate, retained).await?;
+        }
         Ok(proof)
     }.await;
     stopped.io.close_and_wait().await;
@@ -847,6 +924,15 @@ async fn release_recovery_key(
     kms: &dyn rtdb_crypt::Kms,
 ) -> Result<rtdb_crypt::RecoveryKeyHold> {
     let (intent, hold) = proof.held_key()?;
+    require_hold_release(authority, database, intent, hold).await?;
+    kms.release_recovery_key(hold).await?;
+    Ok(hold)
+}
+
+#[cfg(unix)]
+async fn require_hold_release(
+    authority: &ActivationAuthority, database: &str, intent: &Intent, hold: rtdb_crypt::RecoveryKeyHold,
+) -> Result<()> {
     if intent.database != database || authority.identity() != hold.authority
         || authority.connection_sha256 != Some(hold.authority_sha256)
     {
@@ -855,9 +941,7 @@ async fn release_recovery_key(
     let operation = recovery::Operation {
         predecessor: intent.expected, operation_id: intent.operation_id,
     };
-    authority.require_custody_release(database, operation, intent.cell, hold.generation.database).await?;
-    kms.release_recovery_key(hold).await?;
-    Ok(hold)
+    authority.require_custody_release(database, operation, intent.cell, hold.generation.database).await
 }
 
 #[cfg(unix)]
@@ -1056,6 +1140,7 @@ mod tests {
                     manifest_digest: [2; 32],
                     destination_cell: None,
                     key_hold: None,
+                    journal_hold: None,
                     source_cut: recovery::SourceCut::default(),
                     activation_scope: Some(
                         rtdb_db::ActivationScope::new(authority.identity(), &database).unwrap(),
@@ -1081,6 +1166,7 @@ mod tests {
                 None,
                 None,
                 &Attestors::new(),
+                &JournalReaders::new(),
                 rtdb_storage::AppleSync::default(),
             )
             .await
@@ -1109,6 +1195,7 @@ mod tests {
                     None,
                     None,
                     &Attestors::new(),
+                    &JournalReaders::new(),
                     rtdb_storage::AppleSync::default()
                 )
                 .await
