@@ -158,7 +158,7 @@ fn uncorrelated(input: &Arc<Relation>, dependent: &Arc<Relation>, kind: ApplyKin
 /// Projections the correlated selection was beneath are evaluated over the join, as rule 4 does for a cross apply.
 fn lateral(input: &Arc<Relation>, dependent: &Arc<Relation>, correlation: &Correlation<'_>, kind: ApplyKind, schema: &Schema) -> Result<Option<Arc<Relation>>> {
     let Some(lifted) = lift(dependent, correlation, matches!(kind, ApplyKind::Semi | ApplyKind::Anti))? else { return Ok(None) };
-    let conditions: Vec<Expr> = lifted.filters.into_iter().map(|filter| correlation.substitute(filter)).collect();
+    let mut conditions: Vec<Expr> = lifted.filters.into_iter().map(|filter| correlation.substitute(filter)).collect();
     // A computed column the dependent does not return was read only by selections, into which it is already inlined, as
     // the reference's `push-decorrelated-predicate-down-past-period-constructor` inlines a period into its predicate.
     let computed: Vec<NamedExpr> = lifted.computed.into_iter().filter(|named| dependent.schema().get(named.field.id).is_some()).collect();
@@ -173,7 +173,10 @@ fn lateral(input: &Arc<Relation>, dependent: &Arc<Relation>, correlation: &Corre
         ApplyKind::Anti if spanning => JoinKind::Anti,
         _ => return Ok(None),
     };
-    let joined = Arc::new(Relation::join(Arc::clone(input), lifted.base, join_kind, conjunction(conditions))?);
+    let right = if matches!(join_kind, JoinKind::Left | JoinKind::Single) {
+        exclude_null_keys(input.schema(), lifted.base, &mut conditions)?
+    } else { lifted.base };
+    let joined = Arc::new(Relation::join(Arc::clone(input), right, join_kind, conjunction(conditions))?);
     let rows = if matches!(join_kind, JoinKind::Inner | JoinKind::Cross) && !computed.is_empty() {
         let computed = computed.into_iter().map(|named| NamedExpr { field: named.field, expr: correlation.substitute(named.expr) }).collect();
         Arc::new(joined.extend(computed)?)
@@ -202,12 +205,13 @@ fn scalar_aggregate(input: &Arc<Relation>, dependent: &Arc<Relation>, correlatio
     if !groups.is_empty() || !aggregates.iter().all(empty_group_safe) || correlation.in_fractions(aggregates) { return Ok(None); }
     if input.schema().fields().iter().any(|field| rtdb_plan::validate_equality_types(&field.data_type, &field.data_type).is_err()) { return Ok(None); }
     let Some(lifted) = lift(source, correlation, false)? else { return Ok(None) };
-    let conditions: Vec<Expr> = lifted.filters.into_iter().map(|filter| correlation.substitute(filter)).collect();
+    let mut conditions: Vec<Expr> = lifted.filters.into_iter().map(|filter| correlation.substitute(filter)).collect();
     if !spans(&conditions, input.schema(), lifted.base.schema()) { return Ok(None); }
+    let base = exclude_null_keys(input.schema(), lifted.base, &mut conditions)?;
     let number = hidden(ids.next()?, "_row_number", LogicalType::Scalar(ScalarType::I64));
     let matched = hidden(ids.next()?, "_dep_countable", LogicalType::Scalar(ScalarType::Bool));
     let numbered = Arc::new(Arc::clone(input).with_ordinality(number.clone(), OrdinalityScope::Relation)?);
-    let marked = Arc::new(Arc::clone(&lifted.base).extend(vec![NamedExpr { field: matched.clone(), expr: Expr::Literal(Value::Bool(true)) }])?);
+    let marked = Arc::new(base.extend(vec![NamedExpr { field: matched.clone(), expr: Expr::Literal(Value::Bool(true)) }])?);
     let joined = Arc::new(Relation::join(numbered, marked, JoinKind::Left, conjunction(conditions))?);
     let unmatched = Expr::unary(UnaryOp::IsNull, matched.expression());
     let rows = if lifted.computed.is_empty() { joined } else {
@@ -241,16 +245,17 @@ fn scalar_aggregate(input: &Arc<Relation>, dependent: &Arc<Relation>, correlatio
 fn scalar_single(input: &Arc<Relation>, dependent: &Arc<Relation>, correlation: &Correlation<'_>, output: &Field, ids: &mut Ids) -> Result<Option<Arc<Relation>>> {
     let [source] = dependent.schema().fields() else { return Ok(None) };
     let Some(lifted) = lift(dependent, correlation, false)? else { return Ok(None) };
-    let conditions: Vec<Expr> = lifted.filters.into_iter().map(|filter| correlation.substitute(filter)).collect();
+    let mut conditions: Vec<Expr> = lifted.filters.into_iter().map(|filter| correlation.substitute(filter)).collect();
     if !spans(&conditions, input.schema(), lifted.base.schema()) { return Ok(None); }
+    let base = exclude_null_keys(input.schema(), lifted.base, &mut conditions)?;
     let computed = lifted.computed.into_iter().find(|named| named.field.id == source.id).map(|named| correlation.substitute(named.expr));
     let (right, matched) = match &computed {
         // Over the rows the join supplies nulls for, a computed value must stay null, as the apply's empty result is.
         Some(value) if !matches!(value, Expr::Column { .. }) => {
             let matched = hidden(ids.next()?, "_dep_countable", LogicalType::Scalar(ScalarType::Bool));
-            (Arc::new(Arc::clone(&lifted.base).extend(vec![NamedExpr { field: matched.clone(), expr: Expr::Literal(Value::Bool(true)) }])?), Some(matched))
+            (Arc::new(base.extend(vec![NamedExpr { field: matched.clone(), expr: Expr::Literal(Value::Bool(true)) }])?), Some(matched))
         }
-        _ => (lifted.base, None),
+        _ => (base, None),
     };
     let joined = Arc::new(Relation::join(Arc::clone(input), right, JoinKind::Single, conjunction(conditions))?);
     let value = match (computed, matched) {
@@ -346,6 +351,43 @@ fn empty_group_safe(aggregate: &AggregateExpr) -> bool {
 
 fn hidden(id: ColumnId, prefix: &str, data_type: LogicalType) -> Field {
     Field { id, name: format!("{prefix}_{}", id.0), qualifier: None, qualified_only: true, unnamed: true, data_type }
+}
+
+/// Whether `expression` references at least one column, and all of them belong to `schema`.
+fn belongs_to(expression: &Expr, schema: &Schema) -> bool {
+    let columns = expression.referenced_columns();
+    !columns.is_empty() && columns.iter().all(|id| schema.get(*id).is_some())
+}
+
+/// Drops right-side rows whose equi-join key is null before a left or single join, and pushes right-only conjuncts below
+/// it. Normal left and single hash joins compare top-level null equi-keys as equal (matching XTDB's `with-nil-row?`
+/// comparator), whereas the apply they replace evaluated `=` under SQL three-valued equality where NULL never matches.
+fn exclude_null_keys(left: &Schema, right: Arc<Relation>, conditions: &mut Vec<Expr>) -> Result<Arc<Relation>> {
+    let right_schema = right.schema().clone();
+    let (right_only, remaining): (Vec<Expr>, Vec<Expr>) = std::mem::take(conditions).into_iter()
+        .partition(|condition| belongs_to(condition, &right_schema));
+    *conditions = remaining;
+    let mut right = finish(right, right_only)?;
+    let mut non_null = Vec::new();
+    for condition in conditions.iter() {
+        if let Expr::Binary { op: BinaryOp::Eq, left: first, right: second } = condition {
+            let key = if belongs_to(first, left) && belongs_to(second, &right_schema) {
+                Some(second.as_ref())
+            } else if belongs_to(first, &right_schema) && belongs_to(second, left) {
+                Some(first.as_ref())
+            } else {
+                None
+            };
+            if let Some(key) = key && !non_null.contains(key) {
+                non_null.push(key.clone());
+            }
+        }
+    }
+    if !non_null.is_empty() {
+        let filters = non_null.into_iter().map(|key| Expr::unary(UnaryOp::IsNotNull, key)).collect();
+        right = finish(right, filters)?;
+    }
+    Ok(right)
 }
 
 /// Whether a condition reads both inputs, so that it stays the join's own rather than moving into one side.

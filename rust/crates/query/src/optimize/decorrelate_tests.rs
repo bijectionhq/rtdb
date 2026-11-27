@@ -223,6 +223,7 @@ fn corpus() -> Vec<(&'static str, Arc<Relation>, bool)> {
         ("lateral inner", keep(apply(&customers(), customer_orders(), by_customer(), ApplyKind::Inner, None),
             &[customer_id(), customer_region(), order_customer(), order_amount()]), true),
         ("lateral left", apply(&customers(), customer_orders(), by_customer(), ApplyKind::Left, None), true),
+        ("lateral left with smaller right input", apply(&customers(), customer_lookup(), by_customer(), ApplyKind::Left, None), true),
         ("scalar count", scalar(aggregate(customer_orders(), vec![counted(count.clone(), AggregateFunction::CountStar, None, None)]), by_customer()), true),
         ("scalar sum", scalar(Arc::clone(&summed), by_customer()), true),
         ("scalar sum plus one", scalar(Arc::new(summed.project(vec![NamedExpr {
