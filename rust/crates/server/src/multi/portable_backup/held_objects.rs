@@ -10,6 +10,8 @@ use rtdb_types::PhysicalObjectVersion;
 
 mod acquire;
 pub(super) use acquire::Acquirer;
+#[cfg(unix)]
+pub(super) use acquire::Abandon;
 
 #[derive(Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
@@ -768,7 +770,77 @@ mod tests {
         release().await.unwrap();
         assert!(verify(Some(&readback), &receipt_path).await.is_err());
         assert_eq!(journal.head(stream).await.unwrap(), head);
-        let operation = replacement_intent.operation;
+        let abandon_from = |receipt: &Path, key_vault: &Path| MultiBackupOptions::parse([
+            "abandon-object-acquisition".into(), "--stage-receipt".into(), receipt.display().to_string(),
+            "--authority-socket".into(), socket.display().to_string(),
+            "--journal-url".into(), journal_url.clone(),
+            "--journal-custodian-tls-dir".into(), custodian_tls.display().to_string(),
+            "--key-vault".into(), key_vault.display().to_string(),
+            "--bucket".into(), bucket.clone(), "--region".into(), "us-east-1".into(),
+            "--s3-endpoint".into(), endpoint.clone(),
+        ].into_iter()).unwrap().run(rtdb_storage::AppleSync::Full);
+        let abandon = |receipt: &Path| abandon_from(receipt, &vault);
+        let settling_operation = replacement_intent.operation;
+        let Status::Pending { candidate: abandoned, .. } = activation.recovery_status(DATABASE, settling_operation).await.unwrap()
+        else { panic!("expected the staged recovery"); };
+        let abandoned_receipt = home.path().join("abandoned-stage.json");
+        fs::write(&abandoned_receipt, serde_json::to_vec(&stage(settling_operation.operation_id).await.unwrap()).unwrap()).unwrap();
+        let older_key = store.list(None).await.unwrap().into_iter().find(|entry| {
+            entry.key.as_str().parse::<rtdb_format::journal::ObjectId>().is_ok_and(|id| {
+                id.database == abandoned && id.kind == rtdb_format::journal::ObjectKind::File
+            })
+        }).unwrap().key;
+        let older = store.observe_head(&older_key).await.unwrap().version.unwrap();
+        fs::write(&retry_bytes, store.get_fresh(&older_key).await.unwrap()).unwrap();
+        aws("put-object", &["--key", &older.key, "--body", retry_bytes.to_str().unwrap()]);
+        let document = acquire(abandoned, &abandoned_receipt).await.unwrap();
+        let plan: Readback = serde_json::from_value(document).unwrap();
+        let journal_stream = journal_contract::StreamId(abandoned.as_u128());
+        assert!(reader.journal.checkpoint_custody(journal_stream).await.unwrap().is_none());
+        assert!(abandon(&abandoned_receipt).await.is_err());
+        let version = plan.held_versions.iter().find(|version| version.key == format!("multi/{}", plan.checkpoint)).unwrap();
+        assert_eq!(observe_hold(version)["LegalHold"]["Status"], "ON");
+        let checkpoint_key = ObjectKey::new(&plan.checkpoint).unwrap();
+        fs::write(&retry_bytes, store.get_fresh(&checkpoint_key).await.unwrap()).unwrap();
+        aws("put-object", &["--key", &version.key, "--body", retry_bytes.to_str().unwrap()]);
+        let unrelated = store.observe_head(&checkpoint_key).await.unwrap().version.unwrap();
+        hold(&unrelated);
+        aws("put-object-legal-hold", &["--key", &version.key, "--version-id", &version.version, "--legal-hold", "Status=OFF"]);
+
+        let serving_intent = Intent {
+            operation: Operation { predecessor, operation_id: Uuid::new_v4() },
+            ..replacement_intent
+        };
+        activation.begin_recovery(DATABASE, serving_intent, Some(settling_operation.operation_id)).await.unwrap();
+        let empty_vault = home.path().join("empty-custody-vault");
+        FileKms::create_directory(&empty_vault).unwrap();
+        assert!(abandon_from(&abandoned_receipt, &empty_vault).await.is_err());
+        let original_keys = FileKms::open(&vault, || SystemClock.now().0).unwrap();
+        original_keys.require_recovery_key(plan.key_hold.unwrap()).await.unwrap();
+        let abandoned_result = abandon(&abandoned_receipt).await.unwrap();
+        assert_eq!(abandoned_result["retired_versions"], plan.held_versions.len());
+        assert_eq!(abandon(&abandoned_receipt).await.unwrap(), abandoned_result);
+        assert_eq!(observe_hold(&unrelated)["LegalHold"]["Status"], "ON");
+        for version in &plan.held_versions {
+            let listed = aws("list-object-versions", &["--prefix", &version.key]);
+            assert!(listed["Versions"].as_array().into_iter().flatten().all(|entry| entry["VersionId"] != version.version));
+        }
+        let listed = aws("list-object-versions", &["--prefix", &older.key]);
+        assert!(listed["Versions"].as_array().unwrap().iter().any(|entry| {
+            entry["VersionId"] == older.version && entry["IsLatest"] == false
+        }));
+        let inventory = s3.versioned_inventory(&root, &BTreeMap::new()).await.unwrap();
+        assert!(inventory.acquire_legal_hold(&checkpoint_key, version).await.is_err());
+        let released = reader.journal.checkpoint_custody(journal_stream).await.unwrap().unwrap();
+        assert!(released.released);
+        let custodian = KeeperJournal::connect(&journal_url, &crate::cli::journal_credentials(&custodian_tls).unwrap()).unwrap();
+        let retained = crate::multi::activation::journal_custody::RetainedJournal {
+            connection_sha256: custodian.connection_sha256, hold: released.hold,
+        };
+        assert!(custodian.retain(abandoned, retained).await.is_err());
+        assert!(original_keys.require_recovery_key(plan.key_hold.unwrap()).await.is_err());
+
+        let operation = serving_intent.operation;
         let Status::Pending { candidate, .. } = activation.recovery_status(DATABASE, operation).await.unwrap()
         else { panic!("expected the replacement recovery"); };
         let next_receipt = stage(operation.operation_id).await.unwrap();
@@ -814,6 +886,7 @@ mod tests {
         let key_only_proof = home.path().join("key-only-proof.json");
         fs::write(&key_only_proof, serde_json::to_vec(&key_only).unwrap()).unwrap();
         let release_pending = || release_objects(&serving_readback, &serving_proof);
+        assert!(abandon(&receipt).await.is_err());
         let release_key = |proof: &Path| ActivationOptions::parse([
             "release-recovery-key".into(), DATABASE.into(),
             "--authority-id".into(), authority.to_string(), "--authority-url".into(), authority_url.clone(),
@@ -855,6 +928,7 @@ mod tests {
         }
         let archive_digest: [u8; 32] = Sha256::digest(&archive).into();
         assert_eq!(serving.installed_backup().await.unwrap().unwrap().manifest_sha256(), archive_digest);
+        assert_eq!(abandon(&abandoned_receipt).await.unwrap(), abandoned_result);
         broker.abort();
         assert!(broker.await.unwrap_err().is_cancelled());
         let completion = format!("multi/recovery-custody/{authority}/{incarnation}/released");

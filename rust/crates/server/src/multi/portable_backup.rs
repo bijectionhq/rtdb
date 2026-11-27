@@ -38,15 +38,20 @@ Usage: rtdb multi-backup export --data DIR --archive FILE [--journal-url URL --t
                     --readback FILE --stage-receipt FILE --attestation-signing-key PKCS8 --journal-custodian-tls-dir DIR
        rtdb multi-backup release-object-holds --readback FILE --installation-proof FILE --authority-socket PATH
                     --bucket BUCKET [--region REGION] [--s3-endpoint URL]
+       rtdb multi-backup abandon-object-acquisition --stage-receipt FILE --authority-socket PATH
+                    --journal-url URL --journal-custodian-tls-dir DIR --key-vault DIR
+                    --bucket BUCKET [--region REGION] [--s3-endpoint URL]
 Export and restore operate on stopped, local RTDB Multi development data.
 Export-hosted reads one commissioned immutable source and its original S3 allocation.
 Stage installs a pending activation's backup in S3 and holds its destination key.
 Verify-object-holds reads a staged immutable journal and an S3 allocation.
 Pass a saved readback to reopen and verify its exact S3 versions.
 Acquire-object-holds selects and retains the staged backup's exact S3 versions, then emits their verified readback.
+Abandon-object-acquisition settles the exact journal, S3 and generation holds of a superseded acquisition.
 Hosted backup commands require the backup-object-holds build feature.
 Attest emits the signed installation proof for the activation broker and requires Unix.
 Release-object-holds settles an abandoned candidate or a published candidate with a replacement checkpoint. It requires Unix.
+Abandon-object-acquisition retires the versions selected by an abandoned candidate's saved acquisition. It requires Unix.
 These commands run without a serving listener.
 ";
 
@@ -84,6 +89,8 @@ enum BackupCommand {
     AttestObjects(held_objects::Attester),
     #[cfg(all(unix, feature = "backup-object-holds"))]
     ReleaseObjects(settle_objects::Release),
+    #[cfg(all(unix, feature = "backup-object-holds"))]
+    AbandonAcquisition(held_objects::Abandon),
 }
 
 impl MultiBackupOptions {
@@ -102,7 +109,7 @@ impl MultiBackupOptions {
             }
         }
         if matches!(operation.as_str(), "export-hosted" | "stage" | "verify-object-holds"
-            | "acquire-object-holds" | "attest" | "release-object-holds")
+            | "acquire-object-holds" | "attest" | "release-object-holds" | "abandon-object-acquisition")
         {
             if immutable_streams { return Err(arguments_error()); }
             #[cfg(feature = "backup-object-holds")]
@@ -113,6 +120,8 @@ impl MultiBackupOptions {
                 "acquire-object-holds" => BackupCommand::AcquireObjects(held_objects::Acquirer::parse(fields)?),
                 #[cfg(unix)]
                 "release-object-holds" => BackupCommand::ReleaseObjects(settle_objects::Release::parse(fields)?),
+                #[cfg(unix)]
+                "abandon-object-acquisition" => BackupCommand::AbandonAcquisition(held_objects::Abandon::parse(fields)?),
                 #[cfg(unix)]
                 _ => BackupCommand::AttestObjects(held_objects::Attester::parse(fields)?),
                 #[cfg(not(unix))]
@@ -175,6 +184,8 @@ impl MultiBackupOptions {
             BackupCommand::AttestObjects(attester) => attester.run().await,
             #[cfg(all(unix, feature = "backup-object-holds"))]
             BackupCommand::ReleaseObjects(release) => release.run().await,
+            #[cfg(all(unix, feature = "backup-object-holds"))]
+            BackupCommand::AbandonAcquisition(abandon) => abandon.run().await,
         }
     }
 }

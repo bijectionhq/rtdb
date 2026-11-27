@@ -5,6 +5,11 @@ use rtdb_storage::{Error, ObjectKey, remote::decode_provider_key};
 use super::*;
 use crate::multi::activation::ActivationAuthority;
 
+#[cfg(unix)]
+mod abandon;
+#[cfg(unix)]
+pub(in super::super) use abandon::Abandon;
+
 const MAX_PLAN_BYTES: usize = 32 << 20;
 
 #[derive(Clone, Debug)]
@@ -15,6 +20,8 @@ pub(in super::super) struct Acquirer(Verifier);
 struct HoldPlan {
     key_hold: RecoveryKeyHold,
     journal_head: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    journal_anchor: Option<journal_contract::CheckpointAnchor>,
     checkpoint: String,
     versions: Vec<PhysicalObjectVersion>,
 }
@@ -63,7 +70,7 @@ impl Acquirer {
             return Err(invalid_plan());
         }
         let key_hold = receipt.key_hold;
-        let plan_key = ObjectKey::new(format!("recovery-custody/{}/{}/acquisition", key_hold.authority, self.0.incarnation))?;
+        let plan_key = acquisition_key(key_hold, "acquisition")?;
         let saved = read_plan(store.as_ref(), &plan_key).await?;
         if saved.as_ref().is_some_and(|plan| plan.key_hold != key_hold) {
             return Err(invalid_plan());
@@ -77,8 +84,12 @@ impl Acquirer {
         if observed_key != Some(key_hold) {
             return Err(invalid_plan());
         }
+        let journal_anchor = observed.journal_anchor.ok_or_else(invalid_plan)?;
         let plan = HoldPlan {
-            key_hold, journal_head: observed.journal_head.0, checkpoint: observed.checkpoint.to_string(),
+            key_hold,
+            journal_head: observed.journal_head.0,
+            journal_anchor: saved.as_ref().is_none_or(|plan| plan.journal_anchor.is_some()).then_some(journal_anchor),
+            checkpoint: observed.checkpoint.to_string(),
             versions: observed.versions,
         };
         let targets = plan.targets(inventory)?;
@@ -99,11 +110,13 @@ impl Acquirer {
             receipt.require_pending(authority, observed.installation.source_lsn()).await?;
         }
         for (key, version) in targets {
+            receipt.require_pending(authority, observed.installation.source_lsn()).await?;
             inventory.acquire_legal_hold(&key, version).await?;
         }
         let pinned = inventory.pinned_read_store(&plan.versions)?;
         let (checked, checked_key) = self.0.inspect(staged, pinned, Some(inventory)).await?;
         if checked_key != Some(plan.key_hold) || checked.journal_head.0 != plan.journal_head
+            || plan.journal_anchor.is_some_and(|anchor| checked.journal_anchor != Some(anchor))
             || checked.checkpoint.to_string() != plan.checkpoint || checked.versions != plan.versions
         {
             return Err(invalid_plan());
@@ -115,17 +128,39 @@ impl Acquirer {
 
 impl HoldPlan {
     fn targets(&self, inventory: &VersionedInventory) -> Result<Vec<(ObjectKey, &PhysicalObjectVersion)>> {
+        use rtdb_format::journal::{ObjectId, ObjectKind};
+
+        let generation = self.key_hold.generation;
+        let checkpoint: ObjectId = self.checkpoint.parse()?;
+        if checkpoint.database != generation.database || checkpoint.kind != ObjectKind::Manifest {
+            return Err(invalid_plan());
+        }
+        let token = format!("~rtdb-v1/{}/keys/{:016x}", generation.database.simple(), generation.number);
         let mut seen = BTreeSet::new();
-        self.versions.iter().map(|version| {
+        let targets = self.versions.iter().map(|version| {
             let relative = version.key.strip_prefix("multi/").ok_or_else(invalid_plan)?;
             let key = decode_provider_key(relative)?;
+            if key.as_str() != token && key.as_str() != self.checkpoint {
+                let file: ObjectId = key.as_str().parse()?;
+                if file.database != generation.database || file.kind != ObjectKind::File {
+                    return Err(invalid_plan());
+                }
+            }
             if !seen.insert(key.clone()) {
                 return Err(invalid_plan());
             }
             inventory.check_legal_hold_target(&key, version)?;
             Ok((key, version))
-        }).collect()
+        }).collect::<Result<Vec<_>>>()?;
+        if !seen.contains(&ObjectKey::new(token)?) || !seen.contains(&ObjectKey::new(self.checkpoint.as_str())?) {
+            return Err(invalid_plan());
+        }
+        Ok(targets)
     }
+}
+
+fn acquisition_key(hold: RecoveryKeyHold, entry: &str) -> Result<ObjectKey> {
+    Ok(ObjectKey::new(format!("recovery-custody/{}/{}/{entry}", hold.authority, hold.generation.database))?)
 }
 
 async fn read_plan(store: &dyn ObjectStore, key: &ObjectKey) -> Result<Option<HoldPlan>> {

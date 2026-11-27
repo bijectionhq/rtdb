@@ -79,6 +79,13 @@ enum Action {
         proof: Attestation,
         objects_sha256: [u8; 32],
     },
+    #[cfg(all(unix, feature = "backup-object-holds"))]
+    AuthorizeAbandonedAcquisition {
+        intent: Intent,
+        hold: rtdb_crypt::RecoveryKeyHold,
+        head: journal_contract::Lsn,
+        anchor: Option<journal_contract::CheckpointAnchor>,
+    },
     Bootstrap {
         incarnation: Uuid,
     },
@@ -589,6 +596,22 @@ impl Request {
         match self.action {
             Action::Status => (),
             #[cfg(all(unix, feature = "backup-object-holds"))]
+            Action::AuthorizeAbandonedAcquisition { intent, hold, head, anchor } => {
+                use recovery::CustodySettlement;
+                let cell = intent.cell.ok_or_else(super::conflict)?;
+                let candidate = intent.candidate()?;
+                if candidate != hold.generation.database
+                    || intent.operation_id != hold.operation
+                    || intent.authority_id != hold.authority
+                    || !matches!(require_hold_release(authority, &database, &intent, hold).await?, CustodySettlement::Abandoned)
+                {
+                    return Err(super::conflict());
+                }
+                let reader = journals.get(&cell).ok_or_else(super::configuration)?.connect()?;
+                let selected = reader.selected_for_abandonment(candidate, head, anchor).await?;
+                return serde_json::to_value(selected.retained(hold)).map_err(|_| super::conflict());
+            }
+            #[cfg(all(unix, feature = "backup-object-holds"))]
             Action::AuthorizeObjectRelease { proof, objects_sha256 } => {
                 let (intent, hold, manifest_sha256) = proof.hosted_hold(objects_sha256)?;
                 if intent.database != database || hold.authority != authority.identity()
@@ -723,6 +746,18 @@ pub(in crate::multi) async fn authorize_object_release(
         action: Action::AuthorizeObjectRelease { proof, objects_sha256 },
     }).await?;
     Ok(())
+}
+
+#[cfg(all(unix, feature = "backup-object-holds"))]
+pub(in crate::multi) async fn authorize_abandoned_acquisition(
+    socket: &std::path::Path, intent: Intent, hold: rtdb_crypt::RecoveryKeyHold,
+    head: journal_contract::Lsn, anchor: Option<journal_contract::CheckpointAnchor>,
+) -> Result<super::journal_custody::RetainedJournal> {
+    let response = broker::call(socket, Request {
+        database: intent.database.clone(),
+        action: Action::AuthorizeAbandonedAcquisition { intent, hold, head, anchor },
+    }).await?;
+    serde_json::from_value(response).map_err(|_| super::conflict())
 }
 
 async fn verify_recovery_installation(

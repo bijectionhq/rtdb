@@ -101,18 +101,22 @@ impl JournalAttestation {
     }
 
     pub(super) fn retained(&self, key: RecoveryKeyHold) -> RetainedJournal {
-        RetainedJournal {
-            connection_sha256: self.evidence.connection_sha256,
-            hold: CheckpointHold {
-                operation_id: key.operation.as_u128(),
-                installation_sha256: Sha256::digest(self.evidence.message(key)).into(),
-                anchor: self.evidence.anchor,
-            },
-        }
+        self.evidence.retained(key)
     }
 }
 
 impl JournalEvidence {
+    pub(super) fn retained(self, key: RecoveryKeyHold) -> RetainedJournal {
+        RetainedJournal {
+            connection_sha256: self.connection_sha256,
+            hold: CheckpointHold {
+                operation_id: key.operation.as_u128(),
+                installation_sha256: Sha256::digest(self.message(key)).into(),
+                anchor: self.anchor,
+            },
+        }
+    }
+
     fn message(self, key: RecoveryKeyHold) -> Vec<u8> {
         let mut message = b"rtdb.activation.journal-custody/v1\0".to_vec();
         message.extend_from_slice(&key.installation_sha256);
@@ -161,6 +165,19 @@ impl KeeperJournal {
     ) -> Result<JournalEvidence> {
         let (selected, observed_head) = self.observe_selection(candidate).await?;
         if selected.anchor != anchor || observed_head != head {
+            return Err(conflict());
+        }
+        Ok(selected)
+    }
+
+    #[cfg(all(unix, feature = "backup-object-holds"))]
+    pub(super) async fn selected_for_abandonment(
+        &self, candidate: Uuid, head: Lsn, anchor: Option<CheckpointAnchor>,
+    ) -> Result<JournalEvidence> {
+        let (selected, observed_head) = self.observe_selection(candidate).await?;
+        if observed_head < head || selected.anchor.announced_at > head
+            || anchor.is_some_and(|anchor| selected.anchor != anchor)
+        {
             return Err(conflict());
         }
         Ok(selected)
@@ -256,6 +273,22 @@ impl KeeperJournal {
             return Err(conflict());
         }
         Ok(())
+    }
+
+    #[cfg(all(unix, feature = "backup-object-holds"))]
+    pub(in crate::multi) async fn abandon(&self, candidate: Uuid, retained: RetainedJournal) -> Result<()> {
+        let hold = self.require_connection(retained)?;
+        let observed = self.journal.checkpoint_custody(StreamId(candidate.as_u128())).await.map_err(journal_error)?;
+        if observed.is_none() {
+            // Record a terminal disposition even if the attestor never reached the keeper.
+            if let Err(error) = self.retain(candidate, retained).await {
+                let observed = self.journal.checkpoint_custody(StreamId(candidate.as_u128())).await.map_err(journal_error)?;
+                if observed.is_none_or(|state| state.hold != hold) {
+                    return Err(error);
+                }
+            }
+        }
+        self.release(candidate, retained).await
     }
 
     #[cfg(unix)]

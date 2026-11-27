@@ -1244,7 +1244,7 @@ contract PortableApplicationBackup {
         -- The custodian records one exact operation-exclusive provider inventory before placing any object holds.
         -- Acquisition retries use that same inventory even when a serving name resolves to a different version.
         -- Acquisition confirms each hold with the provider and reopens the recorded inventory before returning its verified readback.
-        -- The activation operator completes acquisition and preserves its signed installation proof before recording or superseding the staged installation.
+        -- The activation operator completes acquisition and preserves its signed installation proof before recording the staged installation.
         -- A hosted attestor requires the staged serving names to resolve to the recorded physical versions.
         -- The attestor rechecks each provider hold and the original key hold before signing.
         -- The attestor checks the exact pending recovery through the activation connection enrolled in that key hold.
@@ -1252,11 +1252,14 @@ contract PortableApplicationBackup {
         -- Destination object custody preserves serving-name visibility of the held versions through handoff.
 
     @invariant HostedAbandonment
-        -- Supersession settlement releases only operation-exclusive versions in the signed staged closure.
-        -- The activation broker checks the registered cell signature and proves abandonment at the original binding before authorizing release.
-        -- The object custodian persists that authorization for the exact signed inventory before changing any provider hold.
-        -- Release checks the state of each exact version at the provider and records completion after every hold is off.
-        -- Retries use the same authorization and completed receipts across custodian and activation broker restart.
+        -- The activation broker proves abandonment at the original binding before authorizing settlement.
+        -- For an interrupted acquisition, the broker confirms the selected checkpoint with the custodian enrolled for the destination cell.
+        -- Interrupted acquisition settlement obtains authorization from the activation broker on every attempt and uses the recorded version plan.
+        -- The original keeper records a terminal checkpoint custody disposition even when attestation never acquired its hold.
+        -- The original object provider confirms every version in the interrupted acquisition's plan is absent before the vault releases its generation hold.
+        -- A conditional tombstone keeps any older version hidden when the current version is retired.
+        -- Signed installation settlement verifies the registered cell signature and exact signed inventory before releasing provider holds.
+        -- Settlement retries use the same operation-exclusive version plan across provider restart.
         -- A published candidate's object custody requires a serving handoff before release.
 }
 

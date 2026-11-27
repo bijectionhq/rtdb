@@ -347,8 +347,13 @@ Acquisition authenticates the staged checkpoint, files and token key envelope an
 Use the same settings and stage receipt to retry a partial acquisition.
 The command reopens the recorded versions on retry and returns the verified readback after the original provider confirms every hold.
 Keep current-name visibility on the held versions for the later `attest` step.
-Finish acquisition and save the signed installation proof before recording or superseding the installation.
-If acquisition was interrupted after placing some holds, resume it while the recovery is pending and retain the signed proof even when abandoning the candidate.
+Finish acquisition and save the signed installation proof before recording the installation.
+To settle an acquisition interrupted before attestation, first supersede the candidate in the activation authority.
+Run `rtdb multi-backup abandon-object-acquisition --stage-receipt FILE --authority-socket PATH --journal-url URL --journal-custodian-tls-dir DIR --key-vault DIR --bucket BUCKET` with the original destination providers.
+The original activation broker verifies abandonment and the destination journal selection on each attempt.
+The command settles the keeper's exact checkpoint hold, deletes the exact planned S3 versions, verifies their absence, and releases the held key generation.
+The S3 custodian needs version listing, legal-hold read and write access, `s3:DeleteObjectVersion`, and conditional writes for tombstones that keep older versions hidden.
+Use the same stage receipt and provider settings to retry a partial settlement while the activation authority retains the abandonment decision.
 The custodian owns the create-only `multi/recovery-custody/` ledger prefix and needs to read its records, with absence distinguishable from denied access.
 Protect acquisition records against deletion and replacement through settlement.
 Scope the custodian's S3 version reads and legal-hold writes to the operation-exclusive candidate paths.
