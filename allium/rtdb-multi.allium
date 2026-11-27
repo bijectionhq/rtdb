@@ -479,6 +479,7 @@ contract OriginalFundedAdmission {
         -- The issuer authorizes the start of a funded command under its open commissioned scope.
         -- The issuer durably orders each booking before returning its receipt or authorizing its accepting appends.
         -- The booking carries the original receipt namespace, idempotency key, authenticated owner, predecessor basis, canonical request or appointment intent digest, and exclusive decision and journal cutoffs.
+        -- The issuer authorizes a new accepting append only before its exclusive decision cutoff.
         -- Before dispatch, each accepting-append authorization durably binds the booking and stage to the exact stream, writer epoch, position, sealed payload digest, receiver certificate and exclusive journal cutoff.
         -- Exact retries recover the same booking and ordered stages, and a changed request for the same stage conflicts.
         -- The issuer authenticates booking authority, the receiver authenticates clock evidence, and the original journal quorum authenticates timed appends.
@@ -494,8 +495,10 @@ contract OriginalFundedAdmission {
         -- The original issuer returns one durable terminal disposition for each inventoried booking under its original identity.
         -- The verifier reconciles every append authorization and checks each accepting append's original keeper proof against its exact authorized request.
         -- An accepted appointment activation retains its original proof even when the final appointment disposition is a refusal.
-        -- A terminal refusal requires original evidence excluding an earlier accepting quorum and a fence against any later acceptance of that stage.
-        -- Expiry removes the right to start a new acceptance and leaves an earlier possible acceptance unresolved until the original authorities determine its outcome.
+        -- A terminal refusal requires original evidence that no accepting append committed for that stage and a fence against future acceptance under every issued authorization for it.
+        -- The exclusive journal cutoff bounds the original durability samples.
+        -- An authorized append with timely samples can commit after that cutoff while its original writer and journal roster still have authority.
+        -- A lossless seal of the original immutable stream excludes an authorized position above the sealed committed head when the seal fences the authorization's writer epoch.
         -- Settlement evidence remains verifiable through writer replacement and source retirement, including when a checkpoint trims the accepting record.
         -- Recovery leaves an authorized stage unresolved when it cannot verify the original evidence needed for settlement.
         -- RTDB verifies every predecessor scope closure against its enrolled issuer and reconciles the complete inventories before the successor advertises or admits commissioned funded work.

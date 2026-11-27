@@ -469,6 +469,9 @@ Obtain a durable closure for each scope and enumerate its complete booking inven
 Resume from that same closure after a restart or replacement recovery operation.
 Reconcile each booking with its original terminal disposition and verify the original keeper proof of every accepting append, including an accepted appointment activation followed by a refusal.
 When a lookup misses or is trimmed, settle the stage only from preserved acceptance proof or an original exclusion and fence.
+Logkeeper can commit an authorized append after the journal cutoff using signed samples that place durability before it, while the original writer and roster still have authority. [Timed append](https://github.com/bijectionhq/logkeeper/blob/14d7b7ec7c3d74667d95bebbe9ee143ca6eb8d98/src/stream/consensus/keeper.rs#L2513-L2564)
+A lossless seal of the original immutable stream excludes an exact attempt when its authorized position is above the sealed committed head and its writer epoch is fenced by the seal.
+Verify the stream, writer fence and head from the original seal receipt together. [Seal receipt](https://github.com/bijectionhq/logkeeper/blob/14d7b7ec7c3d74667d95bebbe9ee143ca6eb8d98/contract/src/lib.rs#L246-L252) [Atomic seal](https://github.com/bijectionhq/logkeeper/blob/14d7b7ec7c3d74667d95bebbe9ee143ca6eb8d98/src/stream/consensus/state.rs#L1113-L1152)
 Keep successor funded admission closed until the original evidence settles every booking.
 
 Bijection's managed inbox records a slot by commit label and scheduled reading, then binds it in the transaction that records the call's receipt. [Slot offer](https://github.com/bijectionhq/bijection/blob/56843bdd7c095fd209c3ea74e03b95eaa146b140/crates/kernel/src/pipeline/mod.rs#L5641-L5684) [Receipt binding](https://github.com/bijectionhq/bijection/blob/56843bdd7c095fd209c3ea74e03b95eaa146b140/crates/kernel/src/pipeline/mod.rs#L5858-L5898)

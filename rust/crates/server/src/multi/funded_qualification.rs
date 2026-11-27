@@ -1,8 +1,12 @@
-use std::process::{Child, Command, Stdio};
+use std::{
+    process::{Child, Command, Stdio},
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use journal_contract::{CheckpointInstallation, Epoch, JournalError, Lsn, WriterSessionId};
 use rtdb_db::{TimedOriginal, WritePipeline};
 use rtdb_node::DecisionClock;
+use rtdb_stream_journal::{KeeperId, TimedOriginalVerifier};
 use rtdb_tx::transact::{Cell, DECISION_CLOCK_OFFER, FundingCommand, Op, Row, Transact};
 use rtdb_types::{
     EntityId, Interval, StructFields, TableRef, TimedJournalCutoff, Timestamp, rtdb_v1::MAIN_BRANCH,
@@ -292,6 +296,122 @@ async fn funded_acceptance_proof_survives_replacement_and_expiry_until_checkpoin
     assert!(matches!(
         batch.prove_timed_original(original).await,
         Err(JournalError::Trimmed { floor: Lsn(2) })
+    ));
+    keepers.shutdown().await.unwrap();
+}
+
+struct WithholdTimedAppend {
+    keeper_trust: Arc<dyn TimedOriginalVerifier>,
+    verified_samples: AtomicUsize,
+}
+
+impl TimedOriginalVerifier for WithholdTimedAppend {
+    fn verify(&self, keeper: KeeperId, statement: &[u8], signature: &[u8; 64]) -> bool {
+        if self.keeper_trust.verify(keeper, statement, signature) {
+            self.verified_samples.fetch_add(1, Ordering::Relaxed);
+        }
+        false
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn staged_funded_append_can_commit_after_cutoff_until_original_writer_is_fenced() {
+    const PRINCIPAL: &str = "urn:logkeeper:client:funded-seal-exclusion";
+    let mut keepers = LocalCluster::start_timed(&[PRINCIPAL]).await.unwrap();
+    let config = keepers.journal_config(1 << 20, 4096);
+    let journal = Arc::new(
+        keepers
+            .journal(PRINCIPAL, &config)
+            .unwrap()
+            .with_timed_original(keepers.timed_verifier(), Some(2048)),
+    );
+    journal
+        .finalize_version(CLUSTER_VERSION_CURRENT)
+        .await
+        .unwrap();
+    let withhold = Arc::new(WithholdTimedAppend {
+        keeper_trust: keepers.timed_verifier(),
+        verified_samples: AtomicUsize::new(0),
+    });
+    let staging = ConsensusJournalBatch(Arc::new(
+        keepers
+            .journal(PRINCIPAL, &config)
+            .unwrap()
+            .with_timed_original(withhold.clone(), Some(2048)),
+    ));
+    let stage = async |payload: bytes::Bytes| {
+        let stream = StreamId(Uuid::new_v4().as_u128());
+        journal.create_immutable(stream).await.unwrap();
+        let writer = journal
+            .seal_session(stream, Epoch(0), WriterSessionId(1))
+            .await
+            .unwrap();
+        let original = TimedOriginal {
+            stream,
+            epoch: writer.fence.writer_epoch,
+            at: Lsn(1),
+            payload_sha256: Sha256::digest(&payload).into(),
+            cutoff: TimedJournalCutoff::new(Timestamp(SystemClock.now().0 + 60_000_000), [9; 32])
+                .unwrap(),
+        };
+        let verified_before = withhold.verified_samples.load(Ordering::Relaxed);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match staging
+                    .append_session_timed_original(writer.fence, original, payload.clone())
+                    .await
+                {
+                    Err(JournalError::Unavailable)
+                        if withhold.verified_samples.load(Ordering::Relaxed) > verified_before =>
+                    {
+                        break;
+                    }
+                    Err(JournalError::Unavailable | JournalError::NotFound) => (),
+                    Err(JournalError::Fenced { current }) if current < original.epoch => (),
+                    unexpected => panic!("unexpected result while staging: {unexpected:?}"),
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(journal.head(stream).await.unwrap(), Lsn(0));
+        (writer.fence, original, payload)
+    };
+    let (open_writer, open_stage, open_payload) = stage(bytes::Bytes::from_static(b"open")).await;
+    let (old_writer, closed_stage, closed_payload) =
+        stage(bytes::Bytes::from_static(b"closed")).await;
+
+    keepers.shift_timed_clock(120_000_000);
+    let batch = ConsensusJournalBatch(journal.clone());
+    let committed = batch
+        .append_session_timed_original(open_writer, open_stage, open_payload)
+        .await
+        .unwrap();
+    assert!(committed.quorum_sync_at < open_stage.cutoff.before());
+    assert_eq!(
+        batch.prove_timed_original(open_stage).await.unwrap(),
+        committed
+    );
+
+    let seal = journal
+        .seal_session(
+            closed_stage.stream,
+            old_writer.writer_epoch,
+            WriterSessionId(2),
+        )
+        .await
+        .unwrap();
+    assert_eq!(seal.fence.stream, closed_stage.stream);
+    assert!(seal.fence.writer_epoch > closed_stage.epoch);
+    assert!(seal.sealed_head_lsn < closed_stage.at);
+    assert!(matches!(
+        batch.append_session_timed_original(old_writer, closed_stage, closed_payload).await,
+        Err(JournalError::Fenced { current }) if current == seal.fence.writer_epoch
+    ));
+    assert!(matches!(
+        batch.prove_timed_original(closed_stage).await,
+        Err(JournalError::Conflict { head }) if head == seal.sealed_head_lsn
     ));
     keepers.shutdown().await.unwrap();
 }
