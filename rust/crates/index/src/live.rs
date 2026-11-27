@@ -795,6 +795,8 @@ pub struct BlockPages<'a> {
 
 impl BlockPages<'_> {
     pub fn live_table(&self) -> &LiveTable { self.table }
+    /// The captured layout every copied page has, which is also the layout of a table with no rows.
+    pub fn schema(&self) -> &SchemaRef { &self.schema }
 
     /// Writes a leaf's distinct, ordered rows using the captured table layout.
     pub fn copy(&self, rows: &[u32]) -> Result<OwnedBatch> {
@@ -1794,23 +1796,38 @@ impl TransactionBuffer {
     pub fn snapshot(&self) -> Result<Snapshot> {
         let mut segments = self.segments.lock().map_err(|_| invalid("Transaction segment cache was poisoned"))?;
         for (table, pending) in &self.tables {
-            if let Some(batch) = &pending.adopted_history {
-                let segment = Arc::new(LiveTable::new(table.clone(), self.base.block_index(), TrieConfig::default())
-                    .append(&TableWrite::new(StructFields::new(), Some(Arc::clone(batch))).as_adopted_history(), self.tx_key.system_time)?);
-                segments.insert(table.clone(), (segment, WritePosition::default(), StructFields::new()));
-                continue;
-            }
-            let (segment, done, declared) = match segments.get(table) {
-                Some((segment, done, declared)) => (Arc::clone(segment), *done, Some(declared)),
-                None => (Arc::new(LiveTable::new(table.clone(), self.base.block_index(), TrieConfig::default())), WritePosition::default(), None),
-            };
-            let position = pending.position();
-            if done == position && declared == Some(&pending.declared) { continue; }
-            let segment = Arc::new(pending.append_since(done, &segment, self.tx_key.system_time, &self.budget)?);
-            segments.insert(table.clone(), (segment, position, pending.declared.clone()));
+            self.refresh_segment(&mut segments, table, pending)?;
         }
         let current = segments.iter().map(|(table, (segment, ..))| (table.clone(), Arc::clone(segment))).collect();
         self.base.with_transaction_segments(self.tx_key, &current)
+    }
+    /// The transaction's own segment of one table as written so far, the reference's `OpenTx.Table`: empty for a table it has not written.
+    pub fn transaction_segment(&self, table: &TableRef) -> Result<Arc<LiveTable>> {
+        let Some(pending) = self.tables.get(table) else {
+            return Ok(Arc::new(LiveTable::new(table.clone(), self.base.block_index(), TrieConfig::default())));
+        };
+        let mut segments = self.segments.lock().map_err(|_| invalid("Transaction segment cache was poisoned"))?;
+        self.refresh_segment(&mut segments, table, pending)
+    }
+    /// Appends what was written to `table` since its segment was last read.
+    fn refresh_segment(
+        &self, segments: &mut BTreeMap<TableRef, (Arc<LiveTable>, WritePosition, StructFields<LogicalType>)>, table: &TableRef, pending: &PendingTable,
+    ) -> Result<Arc<LiveTable>> {
+        if let Some(batch) = &pending.adopted_history {
+            let segment = Arc::new(LiveTable::new(table.clone(), self.base.block_index(), TrieConfig::default())
+                .append(&TableWrite::new(StructFields::new(), Some(Arc::clone(batch))).as_adopted_history(), self.tx_key.system_time)?);
+            segments.insert(table.clone(), (Arc::clone(&segment), WritePosition::default(), StructFields::new()));
+            return Ok(segment);
+        }
+        let (segment, done, declared) = match segments.get(table) {
+            Some((segment, done, declared)) => (Arc::clone(segment), *done, Some(declared)),
+            None => (Arc::new(LiveTable::new(table.clone(), self.base.block_index(), TrieConfig::default())), WritePosition::default(), None),
+        };
+        let position = pending.position();
+        if done == position && declared == Some(&pending.declared) { return Ok(segment); }
+        let segment = Arc::new(pending.append_since(done, &segment, self.tx_key.system_time, &self.budget)?);
+        segments.insert(table.clone(), (Arc::clone(&segment), position, pending.declared.clone()));
+        Ok(segment)
     }
     pub fn stage(mut self) -> Result<StagedWrite> {
         self.require_archived_positions_consumed()?;
@@ -2613,6 +2630,32 @@ mod chunk_tests {
         let second = batch.view().read_event(1).unwrap();
         assert_eq!((first.header().commit_position, first.header().op), (3, EventOp::Put));
         assert_eq!((second.header().commit_position, second.header().op), (7, EventOp::Delete));
+    }
+
+    #[test]
+    fn a_transaction_segment_holds_the_tables_writes_so_far_and_is_the_one_the_snapshot_reads() {
+        let memory = MemoryBudget::new(32 << 20);
+        let state = crate::PartitionState::empty(Default::default()).unwrap();
+        let table = TableRef::new("public", "docs");
+        let key = TransactionKey { tx_id: rtdb_types::TxId(0), system_time: Timestamp(1) };
+        let mut transaction = TransactionBuffer::new(state.snapshot(), key, Arc::clone(&memory)).unwrap();
+        let put = |transaction: &mut TransactionBuffer, id: i64| transaction
+            .put(table.clone(), StructFields::from([("_id".into(), Value::I64(id))]), Interval::ALL).unwrap();
+
+        let unwritten = transaction.transaction_segment(&table).unwrap();
+        assert_eq!((unwritten.table(), unwritten.row_count()), (&table, 0));
+        assert!(!transaction.has_pending_table(&table), "reading an unwritten table's segment writes nothing");
+
+        put(&mut transaction, 1);
+        put(&mut transaction, 2);
+        let segment = transaction.transaction_segment(&table).unwrap();
+        assert_eq!(segment.row_count(), 2);
+        assert_eq!(segment.row(1).unwrap().event().unwrap().operation, StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(2))])));
+        assert!(Arc::ptr_eq(&segment, &transaction.snapshot().unwrap().segments(&table)[0]), "the snapshot reuses the segment read since nothing was written");
+
+        put(&mut transaction, 3);
+        assert_eq!(transaction.transaction_segment(&table).unwrap().row_count(), 3);
+        assert_eq!(transaction.snapshot().unwrap().segments(&table)[0].row_count(), 3);
     }
 
     #[test]

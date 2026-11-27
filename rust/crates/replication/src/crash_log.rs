@@ -25,19 +25,18 @@ pub(crate) struct Slices<'a> {
     pub tx_ops: Option<&'a Bytes>,
     /// The live index when the write failed.
     pub live: &'a LiveIndex,
-    /// The failed operation, when the resolver hands it over; otherwise the table is read from the error's context.
+    /// The failed operation, when the failure came from a put, delete or erase; otherwise the table is read from the error's context.
     pub site: Option<CrashSite<'a>>,
 }
 
 /// What the reference's `withCrashLog` is given by the failed put, delete or erase.
-// The resolver does not hand its failed operation over yet, so only the tests build one.
-#[allow(dead_code)]
 pub(crate) struct CrashSite<'a> {
     pub table: TableRef,
     /// The reference's `msg`: `error putting documents`, `error deleting documents` or `error erasing documents`.
     pub message: &'static str,
-    /// The failed transaction's own segment of the table: the reference's `OpenTx.Table`.
-    pub open_tx: &'a LiveTable,
+    /// The failed transaction's own segment of the table: the reference's `OpenTx.Table`, or why it could not be read.
+    pub open_tx: std::result::Result<&'a LiveTable, &'a Anomaly>,
+    /// The reference's call sites never pass a query relation, so the resolver hands none over.
     pub query_rel: Option<&'a arrow_array::RecordBatch>,
 }
 
@@ -60,8 +59,16 @@ pub(crate) async fn write(store: &dyn ObjectStore, node_id: &str, now: Timestamp
             complete &= report(&directory, "live-table.arrow", put_rows(store, &directory, "live-table.arrow", live, memory).await);
         }
         if let Some(site) = &slices.site {
-            complete &= report(&directory, "open-tx-table.arrow", put_rows(store, &directory, "open-tx-table.arrow", site.open_tx, memory).await);
-            complete &= report(&directory, "open-tx-trie.binpb", put_trie(store, &directory, "open-tx-trie.binpb", site.open_tx, memory).await);
+            match site.open_tx {
+                Ok(open_tx) => {
+                    complete &= report(&directory, "open-tx-table.arrow", put_rows(store, &directory, "open-tx-table.arrow", open_tx, memory).await);
+                    complete &= report(&directory, "open-tx-trie.binpb", put_trie(store, &directory, "open-tx-trie.binpb", open_tx, memory).await);
+                }
+                Err(failure) => {
+                    tracing::warn!("crash log {directory}/open-tx-table.arrow and open-tx-trie.binpb could not be written: {failure}");
+                    complete = false;
+                }
+            }
             if let Some(query_rel) = site.query_rel {
                 complete &= report(&directory, "query-rel.arrow", put_batch(store, &directory, "query-rel.arrow", query_rel, memory).await);
             }
@@ -107,9 +114,12 @@ async fn put_trie(store: &dyn ObjectStore, directory: &str, file: &str, table: &
     put(store, directory, file, encoded, memory).await
 }
 
-/// The table's rows in the order they were written, in the layout of a block's data file.
+/// The table's rows in the order they were written, in the layout of a block's data file; a table with no rows writes that layout alone.
 async fn put_rows(store: &dyn ObjectStore, directory: &str, file: &str, table: &LiveTable, memory: &Arc<MemoryBudget>) -> Result<()> {
     let pages = table.block_pages(memory)?;
+    if table.row_count() == 0 {
+        return put_batch(store, directory, file, &arrow_array::RecordBatch::new_empty(Arc::clone(pages.schema())), memory).await;
+    }
     let rows: Vec<u32> = (0..table.row_count()).collect();
     let page = pages.copy(&rows)?;
     put_batch(store, directory, file, page.batch(), memory).await
@@ -373,7 +383,7 @@ mod tests {
         let query_rel = arrow_array::RecordBatch::try_from_iter([
             ("_id", Arc::new(arrow_array::Int64Array::from(vec![7, 8])) as arrow_array::ArrayRef),
         ]).unwrap();
-        let site = CrashSite { table: TableRef::new("public", "foo"), message: "error putting documents", open_tx: &open_tx, query_rel: Some(&query_rel) };
+        let site = CrashSite { table: TableRef::new("public", "foo"), message: "error putting documents", open_tx: Ok(&open_tx), query_rel: Some(&query_rel) };
         let live = live.apply(&rtdb_index::StagedWrite::new(rtdb_types::TransactionKey { tx_id: rtdb_types::TxId(0), system_time: Timestamp(0) },
             None, BlockIndex(0), std::collections::BTreeMap::from([(table.clone(), rows(10..11, Timestamp(0)))])).unwrap()).unwrap();
 
@@ -388,5 +398,63 @@ mod tests {
         let trie = rtdb_format::memory_trie::decode(&store.get(&file("open-tx-trie.binpb")).await.unwrap()).unwrap();
         assert_eq!(trie, open_tx.trie().persisted(&open_tx).unwrap());
         assert_eq!(arrow(store.get(&file("query-rel.arrow")).await.unwrap()).read_page(0).unwrap().num_rows(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_open_transaction_that_has_not_written_the_table_writes_its_empty_rows_and_trie() {
+        use rtdb_index::{IndexBatch, TableWrite};
+        use rtdb_types::{BlockIndex, EntityId, Interval, StructFields, Value};
+        use rtdb_format::data::{StoredEvent, StoredOperation};
+
+        let store = MemoryStore::default();
+        let memory = MemoryBudget::new(1 << 24);
+        let table = TableRef::new("public", "foo");
+        let event = StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None, iid: EntityId::Integer(1).iid(),
+            system_from: Timestamp(0), valid_time: Interval::ALL, operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(1))])), recency: None };
+        let table_write = TableWrite::new(StructFields::new(), Some(IndexBatch::copy_events(&[event], &StructFields::new(), &memory).unwrap()));
+        let live = LiveIndex::new(BlockIndex(0), None, rtdb_trie::TrieConfig::default()).apply(&rtdb_index::StagedWrite::new(
+            rtdb_types::TransactionKey { tx_id: rtdb_types::TxId(0), system_time: Timestamp(0) }, None, BlockIndex(0),
+            std::collections::BTreeMap::from([(table.clone(), table_write)])).unwrap()).unwrap();
+        let open_tx = LiveTable::new(table.clone(), BlockIndex(0), rtdb_trie::TrieConfig::default());
+        let site = CrashSite { table: table.clone(), message: "error deleting documents", open_tx: Ok(&open_tx), query_rel: None };
+
+        write(&store, "node", Timestamp(1_500_000), &failed_put(AnomalyCategory::Fault), Slices { tx_ops: None, live: &live, site: Some(site) }, &memory).await;
+
+        let file = |name: &str| ObjectKey::new(format!("crashes/node/1970-01-01T00:00:01Z/{name}")).unwrap();
+        let mut rows = rtdb_format::ipc::ArrowFile::open(Arc::from(store.get(&file("open-tx-table.arrow")).await.unwrap().as_ref()), None).unwrap();
+        assert_eq!((0..rows.page_count()).map(|page| rows.read_page(page).unwrap().num_rows()).sum::<usize>(), 0);
+        assert!(rows.schema().field_with_name("_iid").is_ok(), "the empty file has a block data file's layout");
+        let trie = rtdb_format::memory_trie::decode(&store.get(&file("open-tx-trie.binpb")).await.unwrap()).unwrap();
+        assert_eq!(trie, open_tx.trie().persisted(&open_tx).unwrap());
+        assert!(store.get(&file("query-rel.arrow")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn an_open_transaction_that_could_not_be_read_leaves_the_rest_of_the_crash_log() {
+        use rtdb_index::{IndexBatch, TableWrite};
+        use rtdb_types::{BlockIndex, EntityId, Interval, StructFields, Value};
+        use rtdb_format::data::{StoredEvent, StoredOperation};
+
+        let store = MemoryStore::default();
+        let memory = MemoryBudget::new(1 << 24);
+        let table = TableRef::new("public", "foo");
+        let event = StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None, iid: EntityId::Integer(1).iid(),
+            system_from: Timestamp(0), valid_time: Interval::ALL, operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(1))])), recency: None };
+        let table_write = TableWrite::new(StructFields::new(), Some(IndexBatch::copy_events(&[event], &StructFields::new(), &memory).unwrap()));
+        let live = LiveIndex::new(BlockIndex(0), None, rtdb_trie::TrieConfig::default()).apply(&rtdb_index::StagedWrite::new(
+            rtdb_types::TransactionKey { tx_id: rtdb_types::TxId(0), system_time: Timestamp(0) }, None, BlockIndex(0),
+            std::collections::BTreeMap::from([(table.clone(), table_write)])).unwrap()).unwrap();
+        let unreadable = Anomaly::fault("rtdb.live/append", "segment unavailable");
+        let site = CrashSite { table: table.clone(), message: "error erasing documents", open_tx: Err(&unreadable), query_rel: None };
+
+        write(&store, "node", Timestamp(1_500_000), &failed_put(AnomalyCategory::Fault), Slices { tx_ops: None, live: &live, site: Some(site) }, &memory).await;
+
+        let file = |name: &str| ObjectKey::new(format!("crashes/node/1970-01-01T00:00:01Z/{name}")).unwrap();
+        let edn = store.get(&file("crash.edn")).await.unwrap();
+        assert!(std::str::from_utf8(&edn).unwrap().contains(":msg \"error erasing documents\""));
+        assert!(store.get(&file("live-trie.binpb")).await.is_ok());
+        assert!(store.get(&file("live-table.arrow")).await.is_ok());
+        assert!(store.get(&file("open-tx-table.arrow")).await.is_err());
+        assert!(store.get(&file("open-tx-trie.binpb")).await.is_err());
     }
 }

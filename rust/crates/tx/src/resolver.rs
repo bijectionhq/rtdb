@@ -54,6 +54,8 @@ mod owned_unique;
 use owned_unique::OwnedUniqueChanges;
 mod world_constraints;
 pub use world_constraints::{ArchivedWorldConstraints, AssertionFenceClaim, AssertionFenceWorldWinner, PreparedFamilyDerivative, WorldConstraintArchive};
+mod source_failure;
+pub use source_failure::{FailedOperation, SourceFailure};
 
 pub const IDEMPOTENCY_GUARD_RESULT: &str = "rtdb/idempotency-guard";
 
@@ -348,17 +350,18 @@ impl TxResolver {
         writer: Option<WriterPublication<'_>>,
     ) -> Result<Arc<ResolvedTx>> {
         rtdb_types::boxed_with(self, |this| this.resolve_source_with_authority(durable, position, log_time, request, context, writer, None)).await
+            .map_err(Anomaly::from)
     }
 
     pub async fn resolve_source_with_authority(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp,
         mut request: SourceTransaction, context: &ResolveContext, writer: Option<WriterPublication<'_>>,
         classic_authority: Option<&rtdb_index::branches::BranchIndex>,
-    ) -> Result<Arc<ResolvedTx>> {
+    ) -> std::result::Result<Arc<ResolvedTx>, SourceFailure> {
         let _sample = rtdb_plan::ExecutionSample::new(context.execution_observer.clone(), rtdb_plan::ExecutionTimer::TxOp);
         let span = context.transaction_span(None, "xtdb.transaction", &[("operations.count", rtdb_plan::TraceValue::Unsigned(request.operations.len() as u64))]);
         context.check_cancelled()?;
         if request.requires_durable_predecessor() && !self.queue.is_empty() {
-            return Err(Anomaly::fault("rtdb.tx/strict-predecessor", "A strict source transaction requires a durable predecessor"));
+            return Err(Anomaly::fault("rtdb.tx/strict-predecessor", "A strict source transaction requires a durable predecessor").into());
         }
         let base = self.resolving_snapshot(durable)?;
         let has_owned_operations = request.operations.iter().any(Operation::is_owned);
@@ -458,6 +461,7 @@ impl TxResolver {
         let mut constraint_failed = false;
         let mut prepared_writes = None;
         let mut settled = false;
+        let mut failed_op = None;
         let outcome = if let Some(error) = supplied_time.err().or(slot_time.err()).or(placement.err()).or(plan_error).or(retry_error) {
             Err(error)
         } else if has_owned_operations && matches!(request.guard, Some(SourceGuard::Bounded(_))) {
@@ -471,7 +475,7 @@ impl TxResolver {
             Err(Anomaly::incorrect("rtdb.owned/staging-deadline", "A staging deadline requires a fresh placed source attempt"))
         } else if let Some(generation) = request.prepared_landing.take() {
             if request.guard.is_some() || request.options.user_metadata.is_some() || request.options.system_time.is_some() {
-                return Err(Anomaly::fault("rtdb.owned/prepared-generation", "A prepared generation carried unsupported transaction options"));
+                return Err(Anomaly::fault("rtdb.owned/prepared-generation", "A prepared generation carried unsupported transaction options").into());
             }
             if primary.iter().any(|operation| matches!(operation,
                 Operation::Public(TxOp::OwnedDeadline { until, .. }) if !crate::system_time::owned_deadline_is_live(tx.decision_time().0, until.0)
@@ -515,8 +519,9 @@ impl TxResolver {
                     break;
                 }
                 if let Err(error) = tx.apply(operation).await {
-                    let error = match document_table(operation) {
-                        Some(table) if !error.context.contains_key("table") => error.with_transit_context("table", &T::table_ref(table))?,
+                    failed_op = source_failure::failed_operation(&tx.buffer, operation, &error);
+                    let error = match source_failure::document_write(operation) {
+                        Some((table, _)) if !error.context.contains_key("table") => error.with_transit_context("table", &T::table_ref(table))?,
                         _ => error,
                     };
                     let error = if error.code == footprint_grant_state::ASSERT_FAILED {
@@ -642,7 +647,7 @@ impl TxResolver {
                 };
                 (tx, None, result)
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(SourceFailure { error, operation: failed_op }),
         };
         if !result.committed()
             && result.error().is_some_and(footprint_grant_state::is_definite_occ_conflict)
@@ -661,7 +666,7 @@ impl TxResolver {
         if resolved.result().committed() && let Some((until, journal_before)) = staging_deadline
             && let Err(error) = resolved.prepare_inline_replica(writer.as_ref(), until, journal_before, &context.memory)
         {
-            if !error.is_caller_error() { return Err(error); }
+            if !error.is_caller_error() { return Err(error.into()); }
             drop(resolved);
             if let Some(observer) = &context.execution_observer { observer.record_error(rtdb_plan::ExecutionError::Transaction); }
             let mut tx = OpenTransaction::new(base, key, &request.options, context)?;
@@ -670,7 +675,7 @@ impl TxResolver {
             resolved = tx.finish_source(result, input, log_time, clock, &[], None).await?;
         }
         context.check_cancelled()?;
-        self.stage_resolved(resolved, receipt_time)
+        self.stage_resolved(resolved, receipt_time).map_err(SourceFailure::from)
     }
 
     pub async fn resolve_external(&mut self, durable: Snapshot, now: Timestamp, system_time: Option<Timestamp>, token: Option<Vec<u8>>, writer: &mut dyn TransactionWriter, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
@@ -4415,16 +4420,6 @@ fn validate_document_columns(table: &TableRef, columns: &[String], verb: &str, p
     Err(Anomaly::incorrect("xtdb/forbidden-columns", format!("Cannot {verb} documents with columns: [{}]", forbidden.join(", ")))
         .with_transit_context("table", &T::table_ref(table))?
         .with_context("forbidden-cols", serde_json::json!(forbidden)))
-}
-
-/// The table a put, delete or erase writes; the reference's crash-log wrapper around those adds it to any error they raise.
-/// Its patch path has no such wrapper.
-fn document_table(operation: &Operation) -> Option<&TableRef> {
-    match operation {
-        Operation::Public(TxOp::InsertDocs { table, .. } | TxOp::PutDocs { table, .. } | TxOp::PutArrowDocs { table, .. } | TxOp::WriteArrowDocs { table, write: ArrowDocumentWrite::Put, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. })
-        | Operation::InsertIids { table, .. } | Operation::InsertArrowIids { table, .. } | Operation::PutIids { table, .. } | Operation::PutReplayArrow { table, .. } => Some(table),
-        _ => None,
-    }
 }
 
 fn check_writer_table(table: &TableRef) -> Result<()> {

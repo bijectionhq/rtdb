@@ -2260,12 +2260,18 @@ impl ReplicationDriver {
                         Ok(_) => {
                             let result = resolver.resolve_source_with_authority(durable, position, log_time, request, &context,
                                 Some(WriterPublication { clock: clock.as_ref(), maximum_inline_bytes, maximum_timed_original_bytes }), classic_authority.as_ref()).await;
-                            if let Err(error) = &result && crate::crash_log::applies(error) {
+                            if let Err(failure) = &result && crate::crash_log::applies(&failure.error) {
                                 let value = partition.value();
-                                let slices = crate::crash_log::Slices { tx_ops: operations.as_ref(), live: value.live(), site: None };
-                                crate::crash_log::write(&**context.storage.object_store(), &node_id, clock(), error, slices, &context.memory).await;
+                                let site = failure.operation.as_ref().map(|operation| crate::crash_log::CrashSite {
+                                    table: operation.table.clone(),
+                                    message: operation.message,
+                                    open_tx: operation.open_tx.as_deref(),
+                                    query_rel: None,
+                                });
+                                let slices = crate::crash_log::Slices { tx_ops: operations.as_ref(), live: value.live(), site };
+                                crate::crash_log::write(&**context.storage.object_store(), &node_id, clock(), &failure.error, slices, &context.memory).await;
                             }
-                            result
+                            result.map_err(Anomaly::from)
                         }
                         Err(error) if error.is_caller_error() => resolver.resolve_source_abort(
                             durable, position, log_time, reservation.map(|slot| slot.attempt), &context, error, false,
