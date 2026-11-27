@@ -195,6 +195,7 @@ surface StatelessDatabase {
         -- Read, Watch and Rank are the Store actions admitted on a reader route after agreement.
         -- An assigned follower selects byte-store read and rank pages from its locally applied prefix.
         -- It rechecks the assigned replica and the observed key generation before returning a byte-store page or watch result.
+        -- An unknown or expired assigned-follower Store bearer requires a new handshake and returns UNAUTHENTICATED.
         -- Each store action on a listener with a linked release requires the session established by that agreement.
 
     @guarantee StoreStorageSizes
