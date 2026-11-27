@@ -478,6 +478,7 @@ fn aggregate_preflight_reads_selected_cells_in_page_order() {
     let batch = page(valid.to_vec());
     let baseline = context.memory.used_bytes();
     assert!(!accepts_typed_column(&batch.columns[0], count_layout));
+    assert!(!accepts_masked_count(&batch.columns[0]));
     assert!(Rows::columns(&batch, &[0], false, context).is_ok());
     assert_eq!(context.memory.used_bytes(), baseline);
 
@@ -1249,6 +1250,57 @@ fn variance_and_average_read_nullable_numeric_runs() {
     states.sum_page(rows, GroupMapping::Global(5), |row| mask[row], Some(0), &factory, &execution).unwrap();
     states.count_page(rows, GroupMapping::Global(5), |row| mask[row], Some(0), &execution).unwrap();
     assert_eq!(states.values[0].average_double(), Some(4.0));
+}
+
+#[test]
+fn variance_and_count_read_active_numeric_union_cells() {
+    use arrow_array::{Int64Array, NullArray, UInt64Array, UnionArray};
+    use arrow_schema::UnionFields;
+
+    let execution = execution(8);
+    let memory = &execution.context.memory;
+    let baseline = memory.used_bytes();
+    let fields = UnionFields::try_new([3, 6, 9], [
+        ArrowField::new("i64", DataType::Int64, true),
+        ArrowField::new("u64", DataType::UInt64, false),
+        ArrowField::new("null", DataType::Null, true),
+    ]).unwrap();
+    let array = UnionArray::try_new(fields, vec![3_i8, 6, 9, 3].into(), Some(vec![0_i32, 0, 0, 1].into()), vec![
+        Arc::new(Int64Array::from(vec![Some(-4), None])),
+        Arc::new(UInt64Array::from(vec![u64::MAX])),
+        Arc::new(NullArray::new(1)),
+    ]).unwrap();
+    let len = array.len();
+    let field = Arc::new(ArrowField::new("c0", array.data_type().clone(), false));
+    let input = rtdb_columnar::execution_field_type(&field).unwrap();
+    assert_eq!(input, LogicalType::Scalar(ScalarType::I64).maybe());
+    let batch = ColumnBatch::settled(vec![Column::Arrow { array: Arc::new(array), field, logical: None }],
+        len, memory.reserve(4096).unwrap()).unwrap();
+    let page = Rows::columns(&batch, &[0], false, &execution.context).unwrap();
+    let scope = execution.scope().unwrap();
+    let scratch = len * size_of::<Option<f64>>() + 256;
+    let pressure = memory.reserve(memory.available_bytes() - scratch).unwrap();
+    let squares = square_column(page, Some(0), &input, &scope, &execution).unwrap();
+    assert_eq!(squares, [Some(16.0), Some(1.0), None, None]);
+    let typed = page.arrow_column(Some(0)).filter(|column| accepts_masked_count(column));
+    assert!(typed.is_some());
+    let present = [true, true, false, false];
+    for (row, expected) in present.into_iter().enumerate() {
+        assert_eq!(count_is_present(page, typed, row, Some(0)).unwrap(), expected);
+    }
+    drop((squares, pressure, scope));
+
+    let mut states = ScalarGroups::new(&execution).unwrap();
+    states.ensure(1).unwrap();
+    let output = LogicalType::Scalar(ScalarType::F64);
+    let factory = SumFactory::new(&input, &output).unwrap();
+    let pressure = memory.reserve(memory.available_bytes() - 4096).unwrap();
+    let selected = |row| row != 0;
+    states.sum_page(page, GroupMapping::Global(len), selected, Some(0), &factory, &execution).unwrap();
+    states.count_page(page, GroupMapping::Global(len), selected, Some(0), &execution).unwrap();
+    assert_eq!(states.values[0].average_double(), Some(-1.0));
+    drop((pressure, states, batch));
+    assert_eq!(memory.used_bytes(), baseline);
 }
 
 #[test]

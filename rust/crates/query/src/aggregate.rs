@@ -841,7 +841,24 @@ fn masked_count_layout(data_type: &DataType) -> bool {
 fn accepts_masked_count(column: &Column) -> bool {
     admits_reduction_column(column, |field, logical| {
         if decimal_storage(field.data_type()) { return decimal_leaf(field, logical); }
-        admits_plain_leaf(field, logical, masked_count_layout)
+        admits_plain_leaf(field, logical, masked_count_layout) || admits_dense_numeric(field, logical)
+    })
+}
+
+fn admits_dense_numeric(field: &ArrowField, logical: Option<&LogicalType>) -> bool {
+    use DataType as T;
+    let T::Union(children, arrow_schema::UnionMode::Dense) = field.data_type() else { return false; };
+    if !field.metadata().is_empty() || logical == Some(&LogicalType::Nothing) { return false; }
+    children.iter().all(|(_, child)| {
+        if !child.metadata().is_empty() { return false; }
+        // A named leg can override the physical type during scalar reads.
+        match (child.name().as_str(), child.data_type()) {
+            ("null", T::Null) => child.is_nullable(),
+            ("i8", T::Int8) | ("i16", T::Int16) | ("i32", T::Int32) | ("i64", T::Int64)
+            | ("u8", T::UInt8) | ("u16", T::UInt16) | ("u32", T::UInt32) | ("u64", T::UInt64)
+            | ("f32", T::Float32) | ("f64", T::Float64) => true,
+            _ => false,
+        }
     })
 }
 
@@ -1759,7 +1776,9 @@ impl<'a> NumericColumn<'a> {
     }
 
     fn bind(column: &'a Column, expected: Option<&LogicalType>) -> Option<Self> {
-        admits_reduction_column(column, |field, logical| Self::admits_leaf(field, logical, expected)).then_some(Self(column))
+        admits_reduction_column(column, |field, logical| {
+            Self::admits_leaf(field, logical, expected) || (expected.is_none() && admits_dense_numeric(field, logical))
+        }).then_some(Self(column))
     }
 
     fn get(&self, row: usize) -> Result<Option<NumericCell>> {
