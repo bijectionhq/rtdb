@@ -1,4 +1,4 @@
-use std::{collections::{BTreeMap, BTreeSet}, ops::Bound::{Excluded, Included}};
+use std::{collections::{BTreeMap, BTreeSet}, ops::Bound::{Excluded, Included}, sync::Arc};
 
 use rtdb_types::CivilDate;
 use rtdb_format::{block::proto as block_pb, catalog::TableBlock, keys::{BRANCH_FACTOR, PartGroup, TrieKey}, log::proto as log_pb};
@@ -72,9 +72,9 @@ impl Shard {
 }
 
 #[derive(Clone, Debug)]
-struct ShardValue { max_block_index: BlockIndex, tries: BTreeMap<BlockIndex, CatalogTrie> }
+struct ShardValue { max_block_index: BlockIndex, tries: imbl::OrdMap<BlockIndex, CatalogTrie> }
 impl Default for ShardValue {
-    fn default() -> Self { Self { max_block_index: BlockIndex(-1), tries: BTreeMap::new() } }
+    fn default() -> Self { Self { max_block_index: BlockIndex(-1), tries: imbl::OrdMap::new() } }
 }
 impl ShardValue {
     fn insert(&mut self, trie: CatalogTrie) {
@@ -87,11 +87,16 @@ impl ShardValue {
         }
     }
     fn supersede(&mut self, block: BlockIndex, partial_limit: Option<i64>, as_of: Timestamp) {
-        for (_, trie) in self.tries.range_mut(..=block) {
-            if trie.state == TrieState::Live && partial_limit.is_none_or(|limit| trie.data_file_size < limit) {
-                trie.garbage(as_of);
-            }
-        }
+        let covered: Vec<_> = self.tries.range(..=block).filter_map(|(block, trie)| {
+            (trie.state == TrieState::Live && partial_limit.is_none_or(|limit| trie.data_file_size < limit)).then_some(*block)
+        }).collect();
+        for block in covered { self.tries[&block].garbage(as_of); }
+    }
+    fn retire(&mut self, as_of: Timestamp) {
+        let serving: Vec<_> = self.tries.iter().filter_map(|(block, trie)| {
+            matches!(trie.state, TrieState::Live | TrieState::Nascent).then_some(*block)
+        }).collect();
+        for block in serving { self.tries[&block].garbage(as_of); }
     }
 }
 
@@ -117,9 +122,7 @@ impl TableTries {
     /// Supersedes every trie the table holds with no successor.
     fn retire(&mut self, as_of: Timestamp) {
         let at = *self.retired.get_or_insert(as_of);
-        for trie in self.shards.values_mut().flat_map(|shard| shard.tries.values_mut()) {
-            if matches!(trie.state, TrieState::Live | TrieState::Nascent) { trie.garbage(at); }
-        }
+        for shard in self.shards.values_mut() { shard.retire(at); }
         self.l1h_recencies.clear();
         std::sync::Arc::make_mut(&mut self.search).retire_all(at);
     }
@@ -199,14 +202,20 @@ impl TableTries {
 }
 
 #[derive(Clone, Debug)]
-pub struct TrieCatalog { tables: BTreeMap<TableRef, TableTries>, file_size_target: i64, naming_epoch: u64 }
+pub struct TrieCatalog { tables: imbl::OrdMap<TableRef, Arc<TableTries>>, file_size_target: i64, naming_epoch: u64 }
 
-impl Default for TrieCatalog { fn default() -> Self { Self { tables: BTreeMap::new(), file_size_target: 100 * 1024 * 1024, naming_epoch: 0 } } }
+impl Default for TrieCatalog { fn default() -> Self { Self { tables: imbl::OrdMap::new(), file_size_target: 100 * 1024 * 1024, naming_epoch: 0 } } }
 
 impl TrieCatalog {
     pub fn new(file_size_target: i64) -> Result<Self> {
         if file_size_target <= 0 { return Err(invalid("Trie file size target must be positive")); }
-        Ok(Self { tables: BTreeMap::new(), file_size_target, naming_epoch: 0 })
+        Ok(Self { tables: imbl::OrdMap::new(), file_size_target, naming_epoch: 0 })
+    }
+    fn table_or_default(&mut self, table: TableRef) -> &mut TableTries {
+        Arc::make_mut(self.tables.entry(table).or_default())
+    }
+    fn table_mut(&mut self, table: &TableRef) -> Option<&mut TableTries> {
+        self.tables.get_mut(table).map(Arc::make_mut)
     }
     pub fn tables(&self) -> impl Iterator<Item = &TableRef> { self.tables.keys() }
     pub fn file_size_target(&self) -> i64 { self.file_size_target }
@@ -269,7 +278,7 @@ impl TrieCatalog {
     /// A table already retired keeps its first retirement time.
     pub fn with_retired_tables(&self, tables: impl IntoIterator<Item = TableRef>, as_of: Timestamp) -> Self {
         let mut next = self.clone();
-        for table in tables { next.tables.entry(table).or_default().retire(as_of); }
+        for table in tables { next.table_or_default(table).retire(as_of); }
         next
     }
 
@@ -361,7 +370,7 @@ impl TrieCatalog {
     pub fn with_tries(&self, table: TableRef, tries: impl IntoIterator<Item = CatalogTrie>, as_of: Timestamp) -> Result<Self> {
         let mut next = self.clone();
         let expiring_metadata = table.stores_expiring_transaction_metadata();
-        let state = next.tables.entry(table).or_default();
+        let state = next.table_or_default(table);
         for mut trie in tries {
             let (mut directory, mut search) = (Vec::new(), Vec::new());
             let mut held = Vec::with_capacity(trie.artefacts.len());
@@ -391,7 +400,7 @@ impl TrieCatalog {
     pub fn without_tries(&self, table: &TableRef, keys: &BTreeSet<TrieKey>) -> Self {
         let mut next = self.clone();
         let expiring_metadata = table.stores_expiring_transaction_metadata();
-        if let Some(table) = next.tables.get_mut(table) {
+        if let Some(table) = next.table_mut(table) {
             for key in keys {
                 if key.level() == 0 && !expiring_metadata { continue; }
                 if let Some(shard) = table.shards.get_mut(&Shard::of(key)) {
@@ -410,7 +419,7 @@ impl TrieCatalog {
 
     pub fn with_artefacts_at(&self, table: &TableRef, entries: impl IntoIterator<Item = (TrieKey, log_pb::ArtefactRecord)>, as_of: Timestamp) -> Self {
         let mut next = self.clone();
-        if let Some(state) = next.tables.get_mut(table) {
+        if let Some(state) = next.table_mut(table) {
             for (key, record) in entries {
                 if record.kind() == rtdb_format::entity_directory::RECORD_KIND {
                     let anchored = state.shards.get(&Shard::of(&key)).and_then(|shard| shard.tries.get(&key.block_index()))
@@ -461,7 +470,7 @@ impl TrieCatalog {
     pub(crate) fn without_artefacts_at(&self, table: &TableRef, entries: impl IntoIterator<Item = (TrieKey, log_pb::ArtefactRecord)>,
         position: Option<rtdb_types::ReplicaPosition>) -> Self {
         let mut next = self.clone();
-        if let Some(state) = next.tables.get_mut(table) {
+        if let Some(state) = next.table_mut(table) {
             for (key, record) in entries {
                 if record.kind() == rtdb_format::entity_directory::RECORD_KIND {
                     if key.level() == 0 && let Ok(change) = log_pb::EntityDirectoryChange::from_artefact(&record)
@@ -493,9 +502,13 @@ impl TrieCatalog {
     pub fn reset_from_primary(&self, mut primary: Self, block: BlockIndex, as_of: Timestamp) -> Result<(Self, u64)> {
         let files_epoch = reset_epochs::recovery_file_epoch(block.0).ok_or_else(|| invalid("Recovery file epoch exhausted"))?;
         primary.naming_epoch = reset_epochs::next_compaction_epoch(self.naming_epoch).ok_or_else(|| invalid("Naming epoch exhausted"))?;
-        for table in primary.tables.values_mut() {
+        let table_names: Vec<_> = primary.tables.keys().cloned().collect();
+        for table in table_names {
+            let table = Arc::make_mut(&mut primary.tables[&table]);
             for (shard, value) in &mut table.shards {
-                for trie in value.tries.values_mut() {
+                let blocks: Vec<_> = value.tries.keys().copied().collect();
+                for block in blocks {
+                    let trie = &mut value.tries[&block];
                     if matches!(trie.state, TrieState::Garbage { .. }) {
                         return Err(invalid("Primary recovery contains a garbage trie"));
                     }
@@ -508,11 +521,12 @@ impl TrieCatalog {
             }
         }
         for (table, old) in &self.tables {
-            primary.tables.entry(table.clone()).or_default().search = std::sync::Arc::clone(&old.search);
-            if let Some(retired) = old.retired { primary.tables.entry(table.clone()).or_default().retire(retired); }
-            primary.tables.entry(table.clone()).or_default().directory = std::sync::Arc::clone(&old.directory);
+            let table = primary.table_or_default(table.clone());
+            table.search = Arc::clone(&old.search);
+            if let Some(retired) = old.retired { table.retire(retired); }
+            table.directory = Arc::clone(&old.directory);
             for (shard, old) in old.shards.iter().filter(|(shard, _)| shard.level == 0) {
-                let new = primary.tables.entry(table.clone()).or_default().shards.entry(shard.clone()).or_default();
+                let new = table.shards.entry(shard.clone()).or_default();
                 new.max_block_index = new.max_block_index.max(old.max_block_index);
                 for (block, previous) in &old.tries {
                     new.tries.entry(*block).or_insert_with(|| {
@@ -601,7 +615,7 @@ impl TrieCatalog {
                 .find_map(|(block, trie)| (trie.state == TrieState::Live).then_some(*block)) {
                 state.cover_l0(block, as_of);
             }
-            catalog.tables.insert(table, state);
+            catalog.tables.insert(table, Arc::new(state));
         }
         Ok(catalog)
     }

@@ -31,6 +31,21 @@ fn historical_l1_waits_for_current_file_and_covered_l0_stays_in_source_inventory
 }
 
 #[test]
+fn publishing_tries_shares_other_tables_and_preserves_the_prior_catalog() {
+    let changed = table();
+    let untouched = TableRef::new("public", "unchanged");
+    let l0 = notification("l00-rc-b00", 10);
+    let before = apply(&[("l00-rc-b00", 10)])
+        .with_tries(untouched.clone(), [l0.clone()], Timestamp(100)).unwrap();
+    let after = before.with_tries(changed.clone(), [notification("l01-rc-b00", 15)], Timestamp(101)).unwrap();
+
+    assert!(std::ptr::eq(before.trie(&untouched, &l0.key).unwrap(), after.trie(&untouched, &l0.key).unwrap()));
+    assert_eq!(before.trie(&changed, &l0.key).unwrap().state, TrieState::Live);
+    assert_eq!(after.trie(&changed, &l0.key).unwrap().state, TrieState::Garbage { as_of: Timestamp(101) });
+    assert_eq!(before.partitions(&untouched).unwrap(), after.partitions(&untouched).unwrap());
+}
+
+#[test]
 fn a_retired_table_supersedes_every_trie_with_no_successor_and_keeps_its_retirement_across_checkpoints() {
     let initial = apply(&[("l00-rc-b00", 10), ("l00-rc-b01", 10), ("l01-rc-b00", 15), ("l02-rc-p0-b01", 10)]);
     assert!(!current(&initial).is_empty());
