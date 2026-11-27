@@ -5155,9 +5155,13 @@ mod tests {
         let text = StringArray::from_iter((0..len).map(|row| (row % 3 == 0).then_some("é😀")));
         let logical = LogicalType::Scalar(ScalarType::Utf8).maybe();
         let field = Arc::new(rtdb_columnar::to_field("c1", &logical).unwrap());
+        let null_field = Arc::new(ArrowField::new("c1", DataType::Null, true));
         let text = SelectedColumn::new(
-            vec![Some((Arc::new(text), field, Some(logical), Some(memory.reserve(0).unwrap())))],
-            Arc::new((0..len).map(|row| (0, row % 3)).collect()),
+            vec![
+                Some((Arc::new(text), field, Some(logical), Some(memory.reserve(0).unwrap()))),
+                Some((Arc::new(NullArray::new(1)), null_field, Some(LogicalType::Null), None)),
+            ],
+            Arc::new((0..len).map(|row| match row % 3 { 1 => (1, 0), position => (0, position) }).collect()),
         );
         let batch = ColumnBatch::settled(vec![
             arrow(Arc::new(selector), ScalarType::I64),
@@ -5173,6 +5177,40 @@ mod tests {
         let actual = array.as_any().downcast_ref::<StringArray>().unwrap();
         assert!(field.is_nullable());
         assert!(actual.iter().enumerate().all(|(row, value)| value == [Some("é😀"), None, Some("other")][row % 3]));
+    }
+
+    #[tokio::test]
+    async fn bounded_case_reads_selected_text_children_under_valid_parents() {
+        let memory = MemoryBudget::new(1 << 22);
+        let len = 256;
+        let text: ArrayRef = Arc::new(StringArray::from(vec!["keep", "hidden under null"]));
+        let child = Arc::new(ArrowField::new("label", DataType::Utf8, false));
+        let parent = StructArray::new(vec![child].into(), vec![text], Some(vec![true, false].into()));
+        let physical = Arc::new(ArrowField::new("record", parent.data_type().clone(), true));
+        let logical = rtdb_columnar::from_field(&physical).unwrap();
+        let mut input = field(0, ScalarType::Utf8);
+        input.data_type = logical.clone();
+        let schema = Schema::new(vec![input.clone()]).unwrap();
+        let text = Expr::Field {
+            expr: Box::new(input.expression()), name: "label".into(),
+            data_type: rtdb_plan::field_type(&logical, "label"),
+        };
+        let expr = Expr::Case {
+            branches: vec![(Expr::Literal(Value::Bool(true)), text)],
+            otherwise: Box::new(Expr::Literal(Value::Null)),
+        };
+        let selected = SelectedColumn::new(vec![Some((Arc::new(parent), physical, Some(logical), None))],
+            Arc::new((0..len).map(|row| (0, row % 2)).collect()));
+        let batch = ColumnBatch::settled(vec![Column::Selected(selected)], len, memory.reserve(0).unwrap()).unwrap();
+        assert!(matches!(
+            ProjectionValues::new(&expr, &expr.data_type(), len, Some((&schema, &batch))),
+            ProjectionValues::Text(_)
+        ));
+        let mut cursor = record_projection_cursor(batch, schema, vec![expr], &memory);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        let [Column::Arrow { array, .. }] = page.columns.as_slice() else { panic!("Expected an Arrow text column"); };
+        let text = array.as_any().downcast_ref::<StringArray>().unwrap();
+        assert!(text.iter().enumerate().all(|(row, value)| value == (row % 2 == 0).then_some("keep")));
     }
 
     #[tokio::test]
@@ -6700,22 +6738,35 @@ fn text_result_width(expression: &Expr, input: Option<(&rtdb_plan::Schema, &Colu
                     .map(|next| width.max(next))
             })
         }
-        Expr::Column { id, .. } => {
+        Expr::Column { .. } | Expr::Field { .. } => {
             let (schema, batch) = input?;
+            let (base, child) = match expression {
+                Expr::Field { expr, name, .. } => (expr.as_ref(), Some(name.as_str())),
+                base => (base, None),
+            };
+            let Expr::Column { id, .. } = base else { return None; };
             let position = schema.position(*id)?;
-            let width = |array: &dyn Array, field: &ArrowField, logical: Option<&LogicalType>| {
-                if !field.metadata().is_empty() || field.data_type() != array.data_type()
-                    || !logical.is_none_or(|ty| plain_scalar(ty) == Some(&ScalarType::Utf8) && ty.nullable() == field.is_nullable())
+            let width = |array: &ArrayRef, field: &ArrowField, logical: Option<&LogicalType>| {
+                let (array, field, logical) = if let Some(name) = child {
+                    let (_, array, field, logical) = projection::struct_child(array, field, logical?, name)?;
+                    (array, field.as_ref(), Some(logical))
+                } else {
+                    (array, field, logical)
+                };
+                if !field.metadata().is_empty() || field.data_type() != array.data_type() { return None; }
+                if field.data_type() == &DataType::Null && field.is_nullable()
+                    && logical.is_none_or(|ty| *ty == LogicalType::Null)
                 {
-                    return None;
+                    return Some(0);
                 }
+                if !logical.is_none_or(|ty| plain_scalar(ty) == Some(&ScalarType::Utf8) && ty.nullable() == field.is_nullable()) { return None; }
                 let array = array.as_any().downcast_ref::<StringArray>()?;
                 Some(array.value_offsets().windows(2).map(|pair| (pair[1] - pair[0]) as usize).max().unwrap_or(0))
             };
             match batch.columns.get(position)? {
-                Column::Arrow { array, field, logical } => width(array.as_ref(), field, logical.as_ref()),
-                Column::Selected(selected) => selected.source_layouts().try_fold(0, |max, (array, field, logical)| {
-                    width(array, field, logical).map(|next| max.max(next))
+                Column::Arrow { array, field, logical } => width(array, field, logical.as_ref()),
+                Column::Selected(selected) => selected.sources.iter().flatten().try_fold(0, |max, (array, field, logical, _)| {
+                    width(array, field, logical.as_ref()).map(|next| max.max(next))
                 }),
                 Column::Values(_) => None,
             }
@@ -7524,7 +7575,7 @@ pub(crate) mod projection {
         Some((input, parent, child, field, logical))
     }
 
-    fn struct_child<'a>(array: &'a ArrayRef, field: &ArrowField, logical: &'a LogicalType, name: &str)
+    pub(super) fn struct_child<'a>(array: &'a ArrayRef, field: &ArrowField, logical: &'a LogicalType, name: &str)
         -> Option<(&'a StructArray, &'a ArrayRef, &'a Arc<ArrowField>, &'a LogicalType)> {
         if !super::stable_read_layout(logical, field) { return None; }
         let logical = match logical { LogicalType::Maybe(inner) => inner.as_ref(), logical => logical };
