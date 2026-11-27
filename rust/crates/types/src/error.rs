@@ -89,7 +89,7 @@ impl AnomalyKind {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct Anomaly {
     pub category: AnomalyCategory,
     pub code: String,
@@ -98,6 +98,32 @@ pub struct Anomaly {
     pub context: BTreeMap<String, Value>,
     #[serde(default)]
     pub kind: Option<AnomalyKind>,
+}
+
+/// Omits an absent `kind` in human-readable formats (such as JSON) so other errors
+/// serialise as before, while always writing all fields in positional binary formats.
+impl Serialize for Anomaly {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+
+        struct Context<'a>(&'a BTreeMap<String, Value>);
+        impl Serialize for Context<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+                context::serialize(self.0, serializer)
+            }
+        }
+
+        let skip_kind = serializer.is_human_readable() && self.kind.is_none();
+        let mut state = serializer.serialize_struct("Anomaly", if skip_kind { 4 } else { 5 })?;
+        state.serialize_field("category", &self.category)?;
+        state.serialize_field("code", &self.code)?;
+        state.serialize_field("message", &self.message)?;
+        state.serialize_field("context", &Context(&self.context))?;
+        if !skip_kind {
+            state.serialize_field("kind", &self.kind)?;
+        }
+        state.end()
+    }
 }
 
 /// A JSON value decodes only from a self-describing format, so a binary
