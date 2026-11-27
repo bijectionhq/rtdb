@@ -21,6 +21,72 @@ fn stage(state: &PartitionState, budget: &Arc<MemoryBudget>, id: i64) -> StagedW
 }
 
 #[test]
+fn sealed_checkpoint_keeps_later_writes_and_exact_table_registry() {
+    let memory = MemoryBudget::new(16 << 20);
+    let state = PartitionState::empty(TrieConfig::default()).unwrap();
+    let table = table();
+    let new_table = TableRef::new("public", "next_generation");
+    let declaration = ("historic_column".to_owned(), LogicalType::Scalar(ScalarType::I64));
+
+    let mut first = TransactionBuffer::new(state.snapshot(), key(0), Arc::clone(&memory)).unwrap();
+    first.declare_table(table.clone(), [declaration.0.clone()]).unwrap();
+    first.record_sql_declaration(&table, &[declaration.clone()]).unwrap();
+    first.put(table.clone(), document(0, 10), Interval::ALL).unwrap();
+    state.apply(&first.stage().unwrap()).unwrap();
+    let original = state.snapshot();
+    let prepared = state.seal_block().unwrap();
+    assert!(state.seal_block().is_err());
+    assert!(state.prepare_block().is_err());
+    assert_eq!(prepared.block_index(), BlockIndex(0));
+    assert_eq!(state.value().live().block_row_count(), 0);
+    assert_eq!(state.value().live_batch_bytes(), prepared.value().live_batch_bytes());
+
+    let sealed = state.snapshot();
+    assert_eq!(sealed.block_index(), BlockIndex(1));
+    assert_eq!(sealed.tx_basis(), Some(key(0)));
+    assert_eq!(sealed.relation_event_frontier(&table).unwrap(), 1);
+    assert_eq!(sealed.declared_columns(&table)[&declaration.0], declaration.1);
+    assert_eq!(sealed.column_types(&table), original.column_types(&table));
+
+    let mut writer = TransactionBuffer::new(state.snapshot(), key(1), Arc::clone(&memory)).unwrap();
+    writer.put(table.clone(), document(0, 20), Interval::ALL).unwrap();
+    writer.put(new_table.clone(), document(0, 30), Interval::ALL).unwrap();
+    state.apply(&writer.stage().unwrap()).unwrap();
+    let before_adoption = state.open_snapshot(Some(key(1).tx_id));
+    let entry = before_adoption.table_entry(&new_table).unwrap().clone();
+    assert!(state.value().live_batch_bytes() > state.value().live().live_batch_bytes());
+    assert_eq!(before_adoption.relation_event_frontier(&table).unwrap(), 2);
+    assert_eq!(before_adoption.iter_segments(&table).map(|segment| segment.block_index()).collect::<Vec<_>>(),
+        [BlockIndex(1), BlockIndex(0)]);
+    assert_eq!(before_adoption.relation_event_frontier(&new_table).unwrap(), 1);
+
+    let durable = block(&prepared);
+    let tries = BTreeMap::from([(table.clone(), vec![CatalogTrie::notification(TrieKey::l0(BlockIndex(0)).unwrap(), 128, None).unwrap()])]);
+    let tables = prepared.table_blocks(&tries, key(0).system_time).unwrap();
+    assert!(!tables.contains_key(&new_table));
+    assert!(state.adopt_block(prepared.clone(), durable.clone(), &tables, &tries, key(0).system_time).is_err());
+    assert!(state.adopt_sealed_block(prepared.clone(), durable.clone(), &tables, &BTreeMap::new(), key(0).system_time).is_err());
+    state.adopt_sealed_block(prepared.clone(), durable.clone(), &tables, &tries, key(0).system_time).unwrap();
+    assert!(state.adopt_sealed_block(prepared, durable, &tables, &tries, key(0).system_time).is_err());
+
+    let adopted = state.snapshot();
+    assert_eq!(adopted.block_index(), BlockIndex(1));
+    assert_eq!(adopted.tx_basis(), Some(key(1)));
+    assert_eq!(adopted.table_entry(&new_table), Some(&entry));
+    assert_eq!(adopted.declared_columns(&table)[&declaration.0], declaration.1);
+    assert_eq!(adopted.relation_event_frontier(&table).unwrap(), 2);
+    assert_eq!(adopted.relation_event_frontier(&new_table).unwrap(), 1);
+    assert_eq!(adopted.iter_segments(&table).map(|segment| segment.block_index()).collect::<Vec<_>>(), [BlockIndex(1)]);
+    assert_eq!(state.value().live().block_row_count(), 2);
+    assert_eq!(state.value().live_batch_bytes(), state.value().live().live_batch_bytes());
+    let original_row = original.iter_segments(&table).next().unwrap().row(0).unwrap().event().unwrap();
+    let mut expected = document(0, 10);
+    expected.insert(declaration.0, Value::Null);
+    assert_eq!(original_row.operation, StoredOperation::Put(expected));
+    assert_eq!(before_adoption.iter_segments(&table).nth(1).unwrap().row(0).unwrap().event().unwrap(), original_row);
+}
+
+#[test]
 fn stored_event_copy_preserves_raw_decimal_and_retains_charge_after_index_release() {
     use rtdb_index::{IndexBatch, StoredEvent};
     use rtdb_types::{DecimalValue, Iid};

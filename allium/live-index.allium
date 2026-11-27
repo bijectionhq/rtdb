@@ -89,6 +89,12 @@
 --   It keeps anything from applying between the point where the live tables are written to block storage and the point where they are cleared — rows applied there would be written nowhere.
 --   And it keeps a transaction from resolving ACROSS the cut: a transaction resolving there holds a transient over a relation NextBlock removes, and would apply one block's rows into a table re-created at the next block index.
 --   Block double-buffering (#4495) has to keep the pause, or replace what that third obligation buys.
+--   The native partition can instead seal one applied block and open its successor in the same publication.
+--   A snapshot includes both applied generations until the catalog adopts the sealed block.
+--   The active generation supplies the staging block index and the applied transaction basis.
+--   Adoption replaces only the exact sealed generation with its published L0 and table metadata.
+--   Its catalog keeps relation identities allocated by writes to the active generation.
+--   The sealed generation stays charged while a captured snapshot or checkpoint worker retains it.
 --
 --   Two heads, two homes — callers choose:
 --     - the RESOLVED head, on the resolver: the highest transaction RESOLVED, and so staged.

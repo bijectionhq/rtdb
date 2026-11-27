@@ -30,6 +30,7 @@ struct VisibleState {
     trie_catalog: Arc<TrieCatalog>,
     table_catalog: Arc<TableCatalog>,
     durable: Arc<LiveIndex>,
+    sealed: Option<Arc<LiveIndex>>,
     layered: BTreeMap<TableRef, Vec<Arc<LiveTable>>>,
     basis: Option<TransactionKey>,
     system_time_cap: Option<Timestamp>,
@@ -42,6 +43,7 @@ impl Clone for VisibleState {
             trie_catalog: Arc::clone(&self.trie_catalog),
             table_catalog: Arc::clone(&self.table_catalog),
             durable: Arc::clone(&self.durable),
+            sealed: self.sealed.clone(),
             layered: self.layered.clone(),
             basis: self.basis,
             system_time_cap: self.system_time_cap,
@@ -51,8 +53,18 @@ impl Clone for VisibleState {
 }
 
 impl VisibleState {
+    fn applied_indexes(&self) -> impl Iterator<Item = &LiveIndex> {
+        std::iter::once(self.durable.as_ref()).chain(self.sealed.as_deref())
+    }
+
+    fn applied_segments<'a>(&'a self, table: &'a TableRef) -> impl Iterator<Item = &'a Arc<LiveTable>> {
+        self.applied_indexes().filter_map(move |index| index.tables().get(table))
+    }
+
     fn contains_table(&self, table: &TableRef) -> bool {
-        self.table_catalog.tables().contains_key(table) || self.durable.tables().contains_key(table) || self.layered.contains_key(table)
+        self.table_catalog.tables().contains_key(table)
+            || self.applied_segments(table).next().is_some()
+            || self.layered.contains_key(table)
     }
 
     fn require_virgin_adoption(&self, write: &StagedWrite) -> Result<()> {
@@ -100,11 +112,17 @@ impl OwnedRoutingInventory {
 
 impl Snapshot {
     pub fn new(trie_catalog: Arc<TrieCatalog>, table_catalog: Arc<TableCatalog>, live: Arc<LiveIndex>) -> Self {
+        Self::with_applied_generations(trie_catalog, table_catalog, live, None)
+    }
+
+    pub(crate) fn with_applied_generations(
+        trie_catalog: Arc<TrieCatalog>, table_catalog: Arc<TableCatalog>, live: Arc<LiveIndex>, sealed: Option<Arc<LiveIndex>>,
+    ) -> Self {
         let basis = live.latest_completed_tx();
         let system_time_cap = basis.map(|key| key.system_time);
         Self {
             visible: Arc::new(VisibleState {
-                trie_catalog, table_catalog, durable: live, layered: BTreeMap::new(),
+                trie_catalog, table_catalog, durable: live, sealed, layered: BTreeMap::new(),
                 basis, system_time_cap, memos: SnapshotMemos::default(),
             }),
             catalog_cut: None, catalog_read: None, read_custody: None, certified_read: None,
@@ -202,7 +220,8 @@ impl Snapshot {
     }
     /// Borrows each table identity source. A name can occur in more than one source.
     pub fn table_names(&self) -> impl Iterator<Item = &TableRef> {
-        self.visible.table_catalog.tables().keys().chain(self.visible.durable.tables().keys()).chain(self.visible.layered.keys())
+        self.visible.table_catalog.tables().keys().chain(self.visible.applied_indexes().flat_map(|index| index.tables().keys()))
+            .chain(self.visible.layered.keys())
     }
     /// Tests this snapshot's table names without allocating, including empty declarations and superseded live tables.
     pub fn contains_table(&self, table: &TableRef) -> bool {
@@ -212,7 +231,8 @@ impl Snapshot {
     /// It borrows the schema sources and allocates nothing; event buffers and HLLs are excluded.
     pub fn schema_allocation_bound(&self, database: &str) -> Result<usize> {
         let catalog = self.visible.table_catalog.tables().iter().map(|(table, metadata)| (table, &metadata.column_types));
-        let applied = self.visible.durable.tables().iter().map(|(table, live)| (table, live.column_types()));
+        let applied = self.visible.applied_indexes().flat_map(|index| index.tables().iter())
+            .map(|(table, live)| (table, live.column_types()));
         let overlays = self.visible.layered.iter().flat_map(|(table, segments)| {
             segments.iter().map(move |segment| (table, segment.column_types()))
         });
@@ -221,7 +241,7 @@ impl Snapshot {
     /// Bounds the schema merge for just one table in this snapshot.
     pub fn table_schema_allocation_bound(&self, database: &str, table: &TableRef) -> Result<usize> {
         let catalog = self.visible.table_catalog.metadata(table).map(|metadata| &metadata.column_types);
-        let live = self.visible.durable.tables().get(table).into_iter()
+        let live = self.visible.applied_segments(table)
             .chain(self.visible.layered.get(table).into_iter().flatten())
             .map(|segment| segment.column_types());
         schema_sources_bound(database, catalog.into_iter().chain(live).map(|types| (table, types)))
@@ -229,15 +249,15 @@ impl Snapshot {
     pub fn column_names(&self, table: &TableRef) -> BTreeSet<String> {
         let mut names = BTreeSet::new();
         if let Some(metadata) = self.visible.table_catalog.metadata(table) { names.extend(metadata.column_types.keys().cloned()); }
-        if let Some(durable) = self.visible.durable.tables().get(table) { names.extend(durable.column_types().keys().cloned()); }
+        for durable in self.visible.applied_segments(table) { names.extend(durable.column_types().keys().cloned()); }
         for segment in self.visible.layered.get(table).into_iter().flatten() { names.extend(segment.column_types().keys().cloned()); }
         names
     }
 
-    /// Borrows segments from newest overlay to oldest, followed by the applied segment unless L0 already covers it.
+    /// Borrows segments from newest to oldest, omitting applied segments already covered by L0.
     pub fn iter_segments<'a>(&'a self, table: &'a TableRef) -> impl Iterator<Item = &'a Arc<LiveTable>> {
         let overlays = self.visible.layered.get(table).into_iter().flat_map(|layers| layers.iter().rev());
-        let applied = self.visible.durable.tables().get(table)
+        let applied = self.visible.applied_segments(table)
             .filter(|segment| segment.block_index() > self.visible.trie_catalog.l0_max_block_index(table));
         overlays.chain(applied)
     }
@@ -284,7 +304,7 @@ impl Snapshot {
     pub fn declared_columns(&self, table: &TableRef) -> StructFields<LogicalType> {
         let mut declarations = self.visible.table_catalog.metadata(table)
             .map_or_else(StructFields::new, |metadata| metadata.declared_columns.clone());
-        if let Some(live) = self.visible.durable.tables().get(table) {
+        for live in self.visible.applied_segments(table) {
             crate::catalog::add_declarations(&mut declarations, live.declared_columns());
         }
         declarations
@@ -295,7 +315,8 @@ impl Snapshot {
         self.column_types_for(table, self.column_names(table))
     }
     pub fn column_types_for(&self, table: &TableRef, columns: impl IntoIterator<Item = String>) -> StructFields<LogicalType> {
-        let sources: Vec<_> = self.visible.durable.tables().get(table).into_iter().chain(self.visible.layered.get(table).into_iter().flatten()).map(|segment| segment.column_types()).collect();
+        let sources: Vec<_> = self.visible.applied_segments(table).chain(self.visible.layered.get(table).into_iter().flatten())
+            .map(|segment| segment.column_types()).collect();
         let absent: Vec<_> = sources.iter().map(|types| absent_type(types)).collect();
         columns.into_iter().map(|name| {
             let mut ty = self.visible.table_catalog.contributed_type(table, &name);

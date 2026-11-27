@@ -23,6 +23,7 @@ pub struct PartitionValue {
     checkpoint_tries: Option<Arc<CheckpointTries>>,
     table_catalog: Arc<TableCatalog>,
     live: Arc<LiveIndex>,
+    sealed: Option<Arc<LiveIndex>>,
     live_snapshot: Option<Arc<LiveIndex>>,
     catalog_publication: CatalogPublication,
 }
@@ -34,11 +35,14 @@ impl PartitionValue {
         let latest_completed_tx = table_catalog.block().and_then(BlockCatalog::latest_completed_tx);
         let checkpoint_tries = table_catalog.block_index().map(|_| Arc::new(CheckpointTries::capture(&trie_catalog)));
         Ok(Self { trie_catalog: Arc::new(trie_catalog), checkpoint_tries, table_catalog: Arc::new(table_catalog),
-            live: Arc::new(LiveIndex::new(block_index, latest_completed_tx, config)), live_snapshot: None, catalog_publication: CatalogPublication::Untracked })
+            live: Arc::new(LiveIndex::new(block_index, latest_completed_tx, config)), sealed: None, live_snapshot: None, catalog_publication: CatalogPublication::Untracked })
     }
     pub fn trie_catalog(&self) -> &Arc<TrieCatalog> { &self.trie_catalog }
     pub fn table_catalog(&self) -> &Arc<TableCatalog> { &self.table_catalog }
     pub fn live(&self) -> &Arc<LiveIndex> { &self.live }
+    pub fn live_batch_bytes(&self) -> u64 {
+        self.live.live_batch_bytes().saturating_add(self.sealed.as_ref().map_or(0, |sealed| sealed.live_batch_bytes()))
+    }
     pub fn snapshot(&self) -> Snapshot { self.snapshot_with_live(&self.live) }
 
     pub fn retains_trie(&self, table: &TableRef, key: &TrieKey) -> bool {
@@ -51,7 +55,8 @@ impl PartitionValue {
             CatalogPublication::Installed(cut) => Some(cut),
             CatalogPublication::Untracked | CatalogPublication::Suspended => None,
         };
-        Snapshot::new(Arc::clone(&self.trie_catalog), Arc::clone(&self.table_catalog), Arc::clone(live)).with_catalog_cut(cut)
+        Snapshot::with_applied_generations(Arc::clone(&self.trie_catalog), Arc::clone(&self.table_catalog),
+            Arc::clone(live), self.sealed.clone()).with_catalog_cut(cut)
     }
 }
 
@@ -87,7 +92,7 @@ impl CheckpointTries {
 #[derive(Clone, Debug)]
 pub struct BlockPreparation {
     captured: Arc<PartitionValue>,
-    metadata: Arc<PreparedBlockMetadata>,
+    metadata: Arc<Mutex<Option<Arc<PreparedBlockMetadata>>>>,
 }
 
 #[derive(Debug, Default)]
@@ -97,10 +102,30 @@ struct PreparedBlockMetadata {
 }
 
 impl BlockPreparation {
+    fn capture(captured: Arc<PartitionValue>) -> Self {
+        Self { captured, metadata: Arc::new(Mutex::new(None)) }
+    }
+
     pub fn block_index(&self) -> BlockIndex { self.captured.live.block_index() }
     pub fn value(&self) -> &Arc<PartitionValue> { &self.captured }
-    pub fn metadata(&self) -> &BTreeMap<TableRef, TableMeta> { &self.metadata.tables }
-    pub fn table_catalog(&self) -> Result<TableCatalog> { self.captured.table_catalog.fold(self.metadata()) }
+
+    fn metadata(&self) -> Result<Arc<PreparedBlockMetadata>> {
+        let mut stored = self.metadata.lock();
+        if let Some(metadata) = stored.as_ref() { return Ok(Arc::clone(metadata)); }
+        let mut metadata = PreparedBlockMetadata::default();
+        for (table, live) in self.captured.live.tables() {
+            let (table_metadata, hll_reservation) = live.block_metadata()?;
+            metadata.tables.insert(table.clone(), table_metadata);
+            metadata.hll_reservations.extend(hll_reservation);
+        }
+        let metadata = Arc::new(metadata);
+        *stored = Some(Arc::clone(&metadata));
+        Ok(metadata)
+    }
+
+    pub fn table_catalog(&self) -> Result<TableCatalog> {
+        self.captured.table_catalog.fold(&self.metadata()?.tables)
+    }
     pub fn table_blocks(&self, tries: &BTreeMap<TableRef, Vec<CatalogTrie>>, as_of: Timestamp) -> Result<BTreeMap<TableRef, TableBlock>> {
         let mut trie_catalog = self.captured.trie_catalog.as_ref().clone();
         for (table, tries) in tries { trie_catalog = trie_catalog.with_tries(table.clone(), tries.clone(), as_of)?; }
@@ -421,7 +446,8 @@ impl PartitionState {
     }
     pub fn install_reset_primary(&self, catalog: TrieCatalog, target: TransactionKey) -> Result<()> {
         let mut value = self.value.write();
-        if value.table_catalog.block().and_then(BlockCatalog::latest_completed_tx) != Some(target)
+        if value.sealed.is_some()
+            || value.table_catalog.block().and_then(BlockCatalog::latest_completed_tx) != Some(target)
             || value.live.latest_completed_tx() != Some(target) || value.live.block_row_count() != 0
             || value.trie_catalog.naming_epoch().checked_add(1) != Some(catalog.naming_epoch())
         {
@@ -436,13 +462,22 @@ impl PartitionState {
     }
     pub fn prepare_block(&self) -> Result<BlockPreparation> {
         let captured = self.value();
-        let mut metadata = PreparedBlockMetadata::default();
-        for (table, live) in captured.live.tables() {
-            let (table_metadata, hll_reservation) = live.block_metadata()?;
-            metadata.tables.insert(table.clone(), table_metadata);
-            metadata.hll_reservations.extend(hll_reservation);
-        }
-        Ok(BlockPreparation { captured, metadata: Arc::new(metadata) })
+        if captured.sealed.is_some() { return Err(invalid("A sealed block is awaiting adoption")); }
+        let prepared = BlockPreparation::capture(captured);
+        prepared.metadata()?;
+        Ok(prepared)
+    }
+
+    pub fn seal_block(&self) -> Result<BlockPreparation> {
+        let mut value = self.value.write();
+        if value.sealed.is_some() { return Err(invalid("A sealed block is awaiting adoption")); }
+        let mut captured = value.as_ref().clone();
+        captured.live_snapshot = None;
+        let mut next = captured.clone();
+        next.sealed = Some(Arc::clone(&captured.live));
+        next.live = Arc::new(captured.live.next_block()?);
+        *value = Arc::new(next);
+        Ok(BlockPreparation::capture(Arc::new(captured)))
     }
 
     /// Installs the full catalog from an independently rewritten recovery block.
@@ -455,7 +490,7 @@ impl PartitionState {
         let checkpoint_tries = Some(Arc::new(CheckpointTries::capture(&durable)));
         let tables = TableCatalog::load(Some(block.clone()), table_blocks)?.with_system_tables()?;
         let mut value = self.value.write();
-        if !Arc::ptr_eq(&value.live, &prepared.captured.live)
+        if value.sealed.is_some() || !Arc::ptr_eq(&value.live, &prepared.captured.live)
             || block.block_index() != value.live.block_index()
             || block.latest_completed_tx() != value.live.latest_completed_tx()
             || value.trie_catalog.naming_epoch().checked_add(1) != Some(naming_epoch)
@@ -465,7 +500,7 @@ impl PartitionState {
         let live = value.live.next_block()?;
         *self.published.lock() = None;
         *value = Arc::new(PartitionValue { trie_catalog: Arc::new(durable), checkpoint_tries,
-            table_catalog: Arc::new(tables), live: Arc::new(live), live_snapshot: None,
+            table_catalog: Arc::new(tables), live: Arc::new(live), sealed: None, live_snapshot: None,
             catalog_publication: CatalogPublication::Untracked });
         Ok(())
     }
@@ -474,14 +509,51 @@ impl PartitionState {
     /// Collection protects the tries used to restore the recorded checkpoint.
     pub fn adopt_block(&self, prepared: BlockPreparation, block: BlockCatalog, table_blocks: &BTreeMap<TableRef, TableBlock>,
         tries: &BTreeMap<TableRef, Vec<CatalogTrie>>, as_of: Timestamp) -> Result<()> {
+        self.install_checkpoint(prepared, block, table_blocks, tries, as_of, BlockAdoption::Active)
+    }
+
+    pub fn adopt_sealed_block(&self, prepared: BlockPreparation, block: BlockCatalog,
+        table_blocks: &BTreeMap<TableRef, TableBlock>, tries: &BTreeMap<TableRef, Vec<CatalogTrie>>, as_of: Timestamp,
+    ) -> Result<()> {
+        self.install_checkpoint(prepared, block, table_blocks, tries, as_of, BlockAdoption::Sealed)
+    }
+
+    fn install_checkpoint(&self, prepared: BlockPreparation, block: BlockCatalog,
+        table_blocks: &BTreeMap<TableRef, TableBlock>, tries: &BTreeMap<TableRef, Vec<CatalogTrie>>, as_of: Timestamp,
+        adoption: BlockAdoption,
+    ) -> Result<()> {
         let durable_tries = TrieCatalog::load(table_blocks, prepared.captured.trie_catalog.file_size_target(), as_of)?;
         let checkpoint_tries = Some(Arc::new(CheckpointTries::capture(&durable_tries)));
+        let metadata = prepared.metadata()?;
         let mut value = self.value.write();
-        if !Arc::ptr_eq(&value.live, &prepared.captured.live) { return Err(invalid("Live data moved while the block was being prepared")); }
-        if block.block_index() != value.live.block_index() || block.latest_completed_tx() != value.live.latest_completed_tx() {
+        let covered = match (adoption, &value.sealed) {
+            (BlockAdoption::Active, None) => &value.live,
+            (BlockAdoption::Sealed, Some(sealed)) => sealed,
+            _ => return Err(invalid("Checkpoint adoption does not match the pending block generation")),
+        };
+        if !Arc::ptr_eq(covered, &prepared.captured.live) {
+            return Err(invalid("Live data moved while the block was being prepared"));
+        }
+        if block.block_index() != covered.block_index() || block.latest_completed_tx() != covered.latest_completed_tx() {
             return Err(invalid("Durable block does not describe the prepared live boundary"));
         }
         let epoch = block.naming_epoch();
+        if matches!(adoption, BlockAdoption::Sealed) {
+            if epoch != value.trie_catalog.naming_epoch() || block.relation_oid_order() != value.table_catalog.relation_oid_order() {
+                return Err(invalid("A sealed block cannot change the catalog naming epoch or relation OID order"));
+            }
+            let key = TrieKey::l0(covered.block_index())?;
+            for (table, live) in covered.tables() {
+                if live.row_count() == 0 { continue; }
+                let stored = durable_tries.trie(table, &key);
+                let announced = tries.get(table).into_iter().flatten().find(|entry| entry.key == key);
+                if stored.zip(announced).is_none_or(|(stored, announced)| {
+                    stored.data_file_size != announced.data_file_size || stored.published_files != announced.published_files
+                }) {
+                    return Err(invalid("Block upload does not install the sealed table's recorded L0"));
+                }
+            }
+        }
         let trie_catalog = if value.trie_catalog.naming_epoch() == epoch {
             let mut current = value.trie_catalog.as_ref().clone();
             for (table, tries) in tries { current = current.with_tries(table.clone(), tries.clone(), as_of)?; }
@@ -496,17 +568,23 @@ impl PartitionState {
             CatalogPublication::Suspended if epoch > old_epoch && epoch == value.trie_catalog.naming_epoch() => CatalogPublication::Untracked,
             publication => publication,
         };
-        let table_catalog = value.table_catalog.adopt(block, prepared.metadata())?;
+        let table_catalog = value.table_catalog.adopt(block, &metadata.tables)?;
         if !table_catalog.tables().keys().eq(table_blocks.keys()) {
             return Err(invalid("Table blocks do not match the adopted checkpoint registry"));
         }
-        let live = value.live.next_block()?;
+        let live = match adoption {
+            BlockAdoption::Active => Arc::new(value.live.next_block()?),
+            BlockAdoption::Sealed => Arc::clone(&value.live),
+        };
         *value = Arc::new(PartitionValue { trie_catalog: Arc::new(trie_catalog), checkpoint_tries,
-            table_catalog: Arc::new(table_catalog), live: Arc::new(live), live_snapshot: None,
+            table_catalog: Arc::new(table_catalog), live, sealed: None, live_snapshot: None,
             catalog_publication });
         Ok(())
     }
 }
+
+#[derive(Clone, Copy)]
+enum BlockAdoption { Active, Sealed }
 
 /// `catalog` with entries for `tables`, sharing it when every table already has one: a catalog is replaced rather than
 /// changed, and its identity keys the memos built from it.
