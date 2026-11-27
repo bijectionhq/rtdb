@@ -70,6 +70,24 @@ Every seal returns `JournalError::Recovered { head }` until a writer or an admin
   Either way the node logs the loss and rebuilds its state from the journal floor.
 - **Holding writes.** With `multiJournal: {holdWritesAfterRecovery: true}` the node instead refuses the writer role with `rtdb/journal-recovered` until someone else acknowledges the recovery, and records nothing.
 
+## Independent database activation
+
+A Multi runtime can bind a stable name and its exact database incarnation to a separately commissioned immutable activation journal.
+The authority records the maximum lease expiry before it issues a serving grant.
+A successor publication compares the original activation revision, requires closed grant issuance, and waits for the previous grant window to close.
+It rejects a retired incarnation as a successor.
+A cached grant expires at the earlier of its original monotonic deadline and the conservative real-time upper bound.
+The authority assumes a bound of 250 milliseconds on real-time clock offset across all its participants.
+
+Every member serving an activated database name must enforce the same authority.
+The runtime gates client operations, peer writes, journal mutations, and retained result delivery on the incarnation's grant.
+Transactions with an external custody or erasure effect, funded dispatch, and the existing local catalog's create, erase and checkpoint-transfer operations return an explicit refusal in activation mode.
+Those capabilities require separately commissioned effect fences before they can serve an activated database name.
+
+On installed Multi nodes, `RTDB_ACTIVATION_JOURNAL_URL` selects the independent immutable consensus authority and `RTDB_ACTIVATION_AUTHORITY_ID` identifies it.
+The authority's TLS files come from `RTDB_ACTIVATION_CERTIFICATE_PATH`, `RTDB_ACTIVATION_PRIVATE_KEY_PATH`, and `RTDB_ACTIVATION_CA_PATH`.
+All replicas of the authority protect its state against rewind and survive failure of the databases they activate.
+
 ## Batches, placement, funded appends and journal size
 
 - **Batches.** The consensus `JournalBatchAppender` sends a Multi group as

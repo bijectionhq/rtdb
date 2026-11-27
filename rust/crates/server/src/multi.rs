@@ -38,6 +38,7 @@ use crate::config::NodeConfiguration;
 
 pub use rtdb_flight_sql::NativeFollowerAssignment;
 
+pub mod activation;
 mod catalog;
 pub mod classic_ingress;
 mod classic_migration;
@@ -50,6 +51,7 @@ mod native_checkpoint;
 pub use native_checkpoint::NativeDependentCustodyAuthority;
 pub use dependent_custody::{InheritedAdmission, InheritedAdmissionRegistration, InheritedCarrierBinding, InheritedDisposition, InheritedReadProof, InheritedRegistration, InheritedRelease};
 mod peer;
+use activation::ActivationAuthority;
 use catalog::{Status, TransferExport};
 
 const WRITER_LEASE_MICROS: i64 = 5_000_000;
@@ -169,6 +171,17 @@ impl MultiRuntime {
         expected: Option<Uuid>,
         stream_journal: Option<DevelopmentStreamJournal>,
     ) -> Result<Self> {
+        Self::development_with_activation(path, config, memory, expected, stream_journal, None).await
+    }
+
+    pub async fn development_with_activation(
+        path: &Path,
+        config: &mut NodeConfiguration,
+        memory: Arc<MemoryBudget>,
+        expected: Option<Uuid>,
+        stream_journal: Option<DevelopmentStreamJournal>,
+        activation: Option<Arc<ActivationAuthority>>,
+    ) -> Result<Self> {
         if expected.is_some_and(|id| id.is_nil()) {
             return Err(invalid("Multi development requires a nonzero incarnation"));
         }
@@ -219,6 +232,7 @@ impl MultiRuntime {
             peers: None,
             checkpoints: config.multi_checkpoints,
             journal_settings: config.multi_journal,
+            activation,
             _journal_lock: writer_lock,
         };
         Self::open(
@@ -327,6 +341,7 @@ impl MultiRuntime {
         if config.multi_journal.immutable_streams && placement.is_none() {
             return Err(invalid("Immutable streams require a Logkeeper consensus journal"));
         }
+        let activation = activation::installed(&journal_url).await?;
         let io = IoRegion::new();
         let store = s3
             .open(
@@ -346,10 +361,11 @@ impl MultiRuntime {
             peers,
             checkpoints: config.multi_checkpoints,
             journal_settings: config.multi_journal,
+            activation,
             _journal_lock: Some(Arc::new(lock)),
         };
         let mut runtime = Self::open(config, memory, databases, backends, follower).await?;
-        if runtime.follower.is_none() {
+        if runtime.follower.is_none() && runtime.backends.activation.is_none() {
             runtime.native_checkpoint_source = Some(native_checkpoint::NativeCheckpointSource);
             runtime.classic_ingress = classic_ingress::Ingress::installed()?;
             runtime.classic_opening_ingress = classic_opening::Ingress::installed()?;
@@ -434,6 +450,7 @@ impl MultiRuntime {
         let database_open = if follower.is_some() { DatabaseOpen::Prepared } else { DatabaseOpen::Startup };
         for (name, id) in initial {
             let database = open_database(&backends, &kms, id, database_open).await?;
+            let database = backends.bound_database(database, &name, id)?;
             serving.insert(
                 name.clone(),
                 serving_driver(database, &name, &memory, peer.as_ref()),
@@ -470,6 +487,10 @@ impl MultiRuntime {
         })
     }
 
+    pub fn activation_authority(&self) -> Option<Arc<ActivationAuthority>> {
+        self.backends.activation.clone()
+    }
+
     pub(crate) fn resource_override(
         &self,
     ) -> Box<dyn FnOnce(NativeResources) -> Arc<dyn ResourceFactory> + Send> {
@@ -486,7 +507,18 @@ impl MultiRuntime {
         Ok(())
     }
 
+    fn require_local_lifecycle(&self) -> Result<()> {
+        if self.backends.activation.is_some() {
+            return Err(Anomaly::unsupported(
+                "rtdb/activation-lifecycle",
+                "This database name is commissioned through the activation authority",
+            ));
+        }
+        Ok(())
+    }
+
     async fn provision(&self, name: &str, expected: Option<Uuid>) -> Result<(DatabaseConfig, Uuid)> {
+        self.require_local_lifecycle()?;
         validate_deployment_name(name)?;
         let bootstrap = self.bootstrap.get(name).copied();
         let registered = self.catalog.read().await?.get(name).map(|entry| entry.database);
@@ -599,6 +631,7 @@ impl MultiRuntime {
         transfer: DeploymentTransfer,
         cancellation: &CancellationToken,
     ) -> Result<(DatabaseConfig, Basis)> {
+        self.require_local_lifecycle()?;
         validate_deployment_name(source)?;
         validate_deployment_name(destination)?;
         if source == destination {
@@ -844,6 +877,7 @@ impl MultiRuntime {
     }
 
     async fn erase(&self, name: &str) -> Result<(Vec<u8>, Timestamp)> {
+        self.require_local_lifecycle()?;
         let selected = self
             .catalog
             .read()
@@ -1343,6 +1377,7 @@ impl MultiRuntime {
         if database.deployment_retirement().await?.is_none() {
             database.token_authority().issuer().await?;
         }
+        let database = self.backends.bound_database(database, name, id)?;
         let mut databases = self.databases.write().expect("Multi serving catalog");
         let mut inserted = false;
         let driver = databases
@@ -1413,7 +1448,17 @@ struct Backends {
     peers: Option<String>,
     checkpoints: crate::config::MultiCheckpointSettings,
     journal_settings: crate::config::MultiJournalSettings,
+    activation: Option<Arc<ActivationAuthority>>,
     _journal_lock: Option<Arc<File>>,
+}
+
+impl Backends {
+    fn bound_database(&self, database: MultiDatabase, name: &str, id: Uuid) -> Result<MultiDatabase> {
+        match &self.activation {
+            Some(activation) => Ok(database.with_serving_authority(activation.serving_authority(name, id)?)),
+            None => Ok(database),
+        }
+    }
 }
 
 fn assignment_peer_profile(auth: &AuthConfig) -> Option<peer::WorkloadProfile> {
@@ -2203,6 +2248,7 @@ mod tests {
             peers: None,
             checkpoints: crate::config::MultiCheckpointSettings::default(),
             journal_settings: crate::config::MultiJournalSettings::default(),
+            activation: None,
             _journal_lock: None,
         };
         let incarnation = Uuid::from_u128(1);

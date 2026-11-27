@@ -256,6 +256,15 @@ impl MultiDatabase {
         self
     }
 
+    pub fn with_serving_authority(mut self, authority: Arc<dyn crate::ServingAuthority>) -> Self {
+        self.stream.serving_authority = Some(authority);
+        self
+    }
+
+    pub fn serving_authority(&self) -> Option<Arc<dyn crate::ServingAuthority>> {
+        self.stream.serving_authority.clone()
+    }
+
     pub fn with_batch_appender(mut self, batch: Arc<dyn JournalBatchAppender>) -> Self {
         self.stream.batch = Some(batch);
         self

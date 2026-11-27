@@ -9,3 +9,6 @@ pub use multi::{
 };
 pub use placement::{discover_nodes, preferred};
 pub use replay::{AppliedEffects, ChangeHistory, CheckpointSource, JournalRecovery};
+
+mod serving_authority;
+pub use serving_authority::{ServingAuthority, ServingPermit};

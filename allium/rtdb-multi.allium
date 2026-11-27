@@ -412,6 +412,13 @@ contract CellMap {
     @invariant OneCellPerDeployment
         -- A deployment is live in exactly one cell at a time.
         -- A move flips the row only after the source cell has fenced the deployment (MoveCutover).
+
+    @invariant SuccessorHasExclusiveServingAuthority
+        -- A separately commissioned immutable activation journal records the current incarnation and the maximum expiry of every serving grant.
+        -- Closing grant issuance applies to one expected incarnation and activation revision.
+        -- Publication compares that same binding, verifies the installed successor, and waits until the clock's lower bound reaches the last recorded expiry.
+        -- A serving operation acquires a grant for the incarnation it admitted and checks its deadline before releasing a result.
+        -- A retained follower or writer handle acquires only grants for its own incarnation.
 }
 
 contract Directory {
