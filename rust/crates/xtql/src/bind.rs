@@ -42,9 +42,9 @@ fn compile_with(source: &str, catalog: &dyn Catalog, options: &CompileOptions, f
     }
     let mut binder = Binder::default();
     let mut compiler = Compiler { catalog, binder: &mut binder, next_parameter: &mut next_parameter, timezone: &options.default_timezone, forms, symbols: Symbols::Xtql };
-    let mut parameters = BTreeMap::new();
+    let mut parameters = Parameters::default();
     for (name, (index, data_type)) in &options.named_parameters {
-        parameters.insert(normal(name), compiler.binder.parameter(*index, data_type.clone()));
+        parameters.named.insert(normal(name), compiler.binder.parameter(*index, data_type.clone()));
     }
     let body = if let Query::Function { parameters: names, body } = &query {
         if options.parameter_indices.as_ref().is_some_and(|indices| indices.len() != names.len())
@@ -53,7 +53,7 @@ fn compile_with(source: &str, catalog: &dyn Catalog, options: &CompileOptions, f
         for (position, name) in names.iter().enumerate() {
             let index = options.parameter_indices.as_ref().map_or(position, |indices| indices[position]);
             let data_type = options.parameter_types.get(index).cloned().unwrap_or(LogicalType::Null);
-            parameters.insert(normal(name), compiler.binder.parameter(index, data_type));
+            parameters.lexical.insert(name.clone(), compiler.binder.parameter(index, data_type));
             *compiler.next_parameter = (*compiler.next_parameter).max(index.checked_add(1).ok_or_else(|| error("xtdb/query-too-large", "Parameter identifier space is exhausted"))?);
         }
         body.as_ref()
@@ -78,12 +78,12 @@ pub fn compile_query_in(query: &Query, catalog: &dyn Catalog, binder: &mut Binde
 }
 
 fn compile_query_with(query: &Query, catalog: &dyn Catalog, binder: &mut Binder, next_parameter: &mut usize, arguments: &[(usize, LogicalType)], timezone: &str, forms: FormAllocation<'_>) -> Result<Arc<Relation>> {
-    let mut parameters = BTreeMap::new();
+    let mut parameters = Parameters::default();
     let body = if let Query::Function { parameters: names, body } = query {
         if names.len() != arguments.len() { return Err(error("xtql/fn-arity-error", format!("XTQL fn expects {} argument(s), got {}", names.len(), arguments.len()))); }
         for (name, (index, data_type)) in names.iter().zip(arguments) {
             *next_parameter = (*next_parameter).max(index.checked_add(1).ok_or_else(|| error("xtdb/query-too-large", "Parameter identifier space is exhausted"))?);
-            parameters.insert(normal(name), binder.parameter(*index, data_type.clone()));
+            parameters.lexical.insert(name.clone(), binder.parameter(*index, data_type.clone()));
         }
         body.as_ref()
     } else { query };
@@ -91,7 +91,17 @@ fn compile_query_with(query: &Query, catalog: &dyn Catalog, binder: &mut Binder,
     Ok(compiler.query(body, &parameters)?.relation)
 }
 
-type Parameters = BTreeMap<String, PExpr>;
+#[derive(Clone, Default)]
+struct Parameters {
+    lexical: BTreeMap<String, PExpr>,
+    named: BTreeMap<String, PExpr>,
+}
+
+impl Parameters {
+    fn xtql(&self, name: &str) -> Option<&PExpr> {
+        self.lexical.get(name).or_else(|| self.named.get(&normal(name)))
+    }
+}
 
 #[derive(Clone, Copy)]
 enum Symbols { Xtql, Relational }
@@ -101,13 +111,6 @@ impl Symbols {
         match self {
             Self::Xtql => error("xtql/invalid-expression", format!("Not all variables in expression are in scope: {name}")),
             Self::Relational => error("xtdb.expression/unknown-symbol", format!("Unknown symbol: '{name}'")).with_context("symbol", name.into()),
-        }
-    }
-
-    fn parameter(self, name: &str) -> String {
-        match self {
-            Self::Xtql => normal(name),
-            Self::Relational => normal(name.strip_prefix('?').unwrap_or(name)),
         }
     }
 
@@ -148,7 +151,7 @@ impl Compiler<'_, '_> {
     fn query(&mut self, query: &Query, parameters: &Parameters) -> Result<Bound> {
         match query {
             Query::Function { parameters: names, body } => {
-                if names.iter().any(|name| !parameters.contains_key(&normal(name))) { return Err(error("xtql/fn-arity-error", "Query function has unbound parameters")); }
+                if names.iter().any(|name| parameters.xtql(name).is_none()) { return Err(error("xtql/fn-arity-error", "Query function has unbound parameters")); }
                 self.query(body, parameters)
             }
             Query::Pipeline { head, tails } => {
@@ -196,10 +199,8 @@ impl Compiler<'_, '_> {
             if names.remove(period) { names.insert(from.into()); names.insert(to.into()); }
         }
         let columns = names.iter().map(|name| self.binder.field(name, None, table.scan_column_type(name))).collect::<Result<Vec<_>>>()?;
-        let mut temporal_scope = Bound::unit();
-        let valid_time = self.temporal(from.valid_time.as_ref(), &mut temporal_scope, parameters)?;
-        let system_time = self.temporal(from.system_time.as_ref(), &mut temporal_scope, parameters)?;
-        if !matches!(temporal_scope.relation.node(), RelationNode::Values { .. }) { return Err(error("xtql/invalid-expression", "Temporal scan filters cannot contain relational subqueries")); }
+        let valid_time = self.temporal(from.valid_time.as_ref(), parameters)?;
+        let system_time = self.temporal(from.system_time.as_ref(), parameters)?;
         let scan = Relation::scan(Scan { table, columns, valid_time, system_time, clamp_valid_time: false, iids: None, predicates: Vec::new(), top_k: None, ordered_top_k: None, matches: Vec::new() })?;
         let mut bound = Bound::from_relation(scan);
         let mut period_projections = Vec::new();
@@ -219,14 +220,20 @@ impl Compiler<'_, '_> {
         self.outputs(bound, &from.bindings, from.star.then_some(&star_names), parameters)
     }
 
-    fn temporal(&mut self, filter: Option<&TemporalFilter>, bound: &mut Bound, parameters: &Parameters) -> Result<PTemporal> {
+    fn temporal(&mut self, filter: Option<&TemporalFilter>, parameters: &Parameters) -> Result<PTemporal> {
+        let mut endpoint = |expr: &Expr| {
+            if contains_subquery(expr) {
+                return Err(error("xtql/invalid-expression", "Temporal scan filters cannot contain relational subqueries; pass the bound as a query parameter"));
+            }
+            self.expr(expr, &mut Bound::unit(), parameters)
+        };
         Ok(match filter {
             None => PTemporal::Default,
             Some(TemporalFilter::All) => PTemporal::All,
-            Some(TemporalFilter::At(at)) => PTemporal::At(self.expr(at, bound, parameters)?),
+            Some(TemporalFilter::At(at)) => PTemporal::At(endpoint(at)?),
             Some(TemporalFilter::In { from, to }) => PTemporal::FromTo {
-                from: from.as_ref().map(|value| self.expr(value, bound, parameters)).transpose()?.unwrap_or(PExpr::Literal(Value::Null)),
-                to: to.as_ref().map(|value| self.expr(value, bound, parameters)).transpose()?.unwrap_or(PExpr::Literal(Value::Null)),
+                from: from.as_ref().map(&mut endpoint).transpose()?.unwrap_or(PExpr::Literal(Value::Null)),
+                to: to.as_ref().map(endpoint).transpose()?.unwrap_or(PExpr::Literal(Value::Null)),
             },
         })
     }
@@ -303,7 +310,7 @@ impl Compiler<'_, '_> {
                 } else { Bound::from_relation(Relation::empty(schema)) }
             }
             RelationInput::Parameter(name) => {
-                let expression = parameters.get(&normal(name)).cloned().ok_or_else(|| error("xtql/rel", "Illegal second argument to rel: symbol is not a parameter"))?;
+                let expression = parameters.xtql(name).cloned().ok_or_else(|| error("xtql/rel", "Illegal second argument to `rel`"))?;
                 let element_type = list_element(&expression.data_type());
                 let element = self.binder.field("xt$document", None, element_type.clone())?;
                 let relation = Relation::new(Schema::new(vec![element.clone()])?, RelationNode::Unnest {
@@ -463,7 +470,7 @@ impl Compiler<'_, '_> {
                 let implicit = Expr::Variable(name.clone());
                 let argument = self.expr(args.map_or(&implicit, |args| &args[position]), outer, parameters)?;
                 let index = self.parameter_index()?;
-                local.insert(normal(name), PExpr::Parameter { index, data_type: argument.data_type() });
+                local.lexical.insert(name.clone(), PExpr::Parameter { index, data_type: argument.data_type() });
                 arguments.push((index, argument));
             }
             body.as_ref()
@@ -484,8 +491,12 @@ impl Compiler<'_, '_> {
                 PExpr::Cast { expr: Box::new(expr), target: target.bind_timezone(self.timezone) }
             }
             Expr::Variable(name) => {
-                let parameter = matches!(self.symbols, Symbols::Xtql) || name.starts_with('?');
-                parameter.then(|| parameters.get(&self.symbols.parameter(name))).flatten().cloned()
+                let parameter = match self.symbols {
+                    Symbols::Xtql => parameters.xtql(name),
+                    Symbols::Relational if name.starts_with('?') => parameters.named.get(&relational_parameter(name)),
+                    Symbols::Relational => None,
+                };
+                parameter.cloned()
                     .or_else(|| bound.variables.get(self.symbols.column(name).as_ref()).map(Field::expression))
                     .ok_or_else(|| self.symbols.out_of_scope(name))?
             }
@@ -505,6 +516,12 @@ impl Compiler<'_, '_> {
             }
             Expr::Map(values) => PExpr::Struct(values.iter().map(|(name, value)| Ok((normal(name), self.expr(value, bound, parameters)?))).collect::<Result<_>>()?),
             Expr::Call { function, arguments } => {
+                if matches!(self.symbols, Symbols::Xtql)
+                    && ["percentile-cont", "percentile_cont", "percentile-disc", "percentile_disc"]
+                        .iter().any(|name| function.eq_ignore_ascii_case(name))
+                {
+                    return Err(error("xtql/invalid-expression", "Ordered-set percentiles require SQL PERCENTILE_CONT or PERCENTILE_DISC with WITHIN GROUP"));
+                }
                 if aggregate_function(function).is_some() { return Err(error("xtql/invalid-expression", "Aggregate functions require an aggregate clause")); }
                 let args = arguments.iter().map(|value| self.expr(value, bound, parameters)).collect::<Result<Vec<_>>>()?;
                 rtdb_plan::bind_clock_timezone(scalar_call(function, args)?,Some(self.timezone))?
@@ -609,10 +626,11 @@ impl Compiler<'_, '_> {
 }
 
 fn normal(name: &str) -> String { Identifier::unquoted(name).normalized() }
+fn relational_parameter(name: &str) -> String { normal(name.strip_prefix('?').unwrap_or(name)) }
 fn binding_variable<'a>(expr: &'a Expr, parameters: &Parameters) -> Option<&'a str> {
     match expr {
         Expr::LogicVariable(name) => Some(name),
-        Expr::Variable(name) if !parameters.contains_key(&normal(name)) => Some(name),
+        Expr::Variable(name) if parameters.xtql(name).is_none() => Some(name),
         _ => None,
     }
 }
@@ -666,7 +684,7 @@ fn scalar_call(name: &str, args: Vec<PExpr>) -> Result<PExpr> {
 }
 fn required_expr(expr: &Expr, parameters: &Parameters, result: &mut BTreeSet<String>) {
     match expr {
-        Expr::Variable(name) if !parameters.contains_key(&normal(name)) => { result.insert(normal(name)); }
+        Expr::Variable(name) if parameters.xtql(name).is_none() => { result.insert(normal(name)); }
         Expr::LogicVariable(name) => { result.insert(normal(name)); }
         Expr::Call { arguments, .. } | Expr::List(arguments) | Expr::Set(arguments) => for argument in arguments { required_expr(argument, parameters, result); },
         Expr::Get { object, .. } => required_expr(object, parameters, result),
@@ -680,7 +698,7 @@ fn required_expr(expr: &Expr, parameters: &Parameters, result: &mut BTreeSet<Str
 fn required_arguments(query: &Query, arguments: Option<&[Expr]>, parameters: &Parameters, result: &mut BTreeSet<String>) {
     if let Some(arguments) = arguments { for argument in arguments { required_expr(argument, parameters, result); } }
     else if let Query::Function { parameters: names, .. } = query {
-        for name in names { if !parameters.contains_key(&normal(name)) { result.insert(normal(name)); } }
+        for name in names { if parameters.xtql(name).is_none() { result.insert(normal(name)); } }
     }
 }
 fn required_clause(clause: &Clause, parameters: &Parameters) -> BTreeSet<String> {
@@ -729,6 +747,16 @@ fn contains_aggregate(expr: &Expr) -> bool {
         Expr::List(values) | Expr::Set(values) => values.iter().any(contains_aggregate),
         Expr::Map(values) => values.iter().any(|(_, value)| contains_aggregate(value)),
         _ => false,
+    }
+}
+
+fn contains_subquery(expr: &Expr) -> bool {
+    match expr {
+        Expr::Subquery { .. } => true,
+        Expr::Call { arguments, .. } | Expr::List(arguments) | Expr::Set(arguments) => arguments.iter().any(contains_subquery),
+        Expr::Get { object, .. } | Expr::RegexReplace { source: object, .. } | Expr::Cast { expr: object, .. } => contains_subquery(object),
+        Expr::Map(fields) => fields.iter().any(|(_, value)| contains_subquery(value)),
+        Expr::Literal(_) | Expr::Variable(_) | Expr::LogicVariable(_) => false,
     }
 }
 

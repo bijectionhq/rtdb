@@ -191,7 +191,7 @@ pub(crate) fn data_type(form: &Edn) -> Result<LogicalType> {
     Ok(LogicalType::Scalar(scalar))
 }
 
-fn field_name(form: &Edn) -> Result<String> {
+pub(crate) fn field_name(form: &Edn) -> Result<String> {
     field_text(form, false)
 }
 

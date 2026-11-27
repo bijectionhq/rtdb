@@ -24,6 +24,11 @@ Parameterized dependent relations use `RelationNode::Apply`; bindings remain loc
 Left-join unification predicates execute inside the dependent plan before null extension.
 Shorthand binding symbols remain logic variables even when a function parameter has the same spelling.
 Scan value predicates remain above temporal resolution.
+Use `#(rel % [age])` to read a list of documents from the first query argument.
+Declared function parameters use their exact symbol spelling, and SQL-inline functions take the argument positions assigned by the SQL statement.
+An explicit `nil` for the optional database, temporal filters or join bindings selects the same default as omitting the option.
+An expression map derives each field name by dropping the first UTF-16 code unit from the key's string representation.
+Use keyword keys such as `:name` to express the field name directly.
 
 The checked-in test source retains names from `xtdb.xtql-test` and `xtdb.xtql.plan-test`.
 Its structural checks are native preparation checks, not receipts proving the upstream result assertions executed.
@@ -31,8 +36,8 @@ Its structural checks are native preparation checks, not receipts proving the up
 Compilation and all execution remain pending for Phase 2.
 
 The shared plan and executor implement SQL ordered-set percentiles.
-The pinned XTQL aggregate lowering projects every argument to a column, which cannot construct the literal-or-parameter fraction and sort specification required by the ordered-set operator.
-No successful XTQL percentile call syntax is added.
+Use SQL `PERCENTILE_CONT` or `PERCENTILE_DISC` with `WITHIN GROUP` for the ordered-set syntax.
+The XTQL planner reports an invalid expression for these calls.
 
 The following surfaces remain outside this checkpoint's implementation.
 
@@ -41,7 +46,8 @@ The following surfaces remain outside this checkpoint's implementation.
 Reader evaluation, reader conditionals, automatic namespace aliases, unreadable Java objects, and regex objects are outside the native text surface.
 Use explicit namespace names or `#:namespace` maps, choose conditional forms before submission, and pass regex patterns as strings.
 Use a fixed-arity `fn` with a list parameter in place of a variadic anonymous function.
-* Temporal scan filters containing relational subqueries are rejected.
+* Compute a relational subquery for a temporal scan bound separately and pass its date or timestamp as a function parameter.
+Use the same snapshot basis for both queries when the bound depends on database contents.
 * SQL and XTQL share the catalog scan types for bitemporal columns, including nullable upper bounds for open intervals.
 * Untyped prepared relation parameters require concrete argument types before they can produce their correct output schema.
 * Protocol submission, result-key conversion, and transaction submission require the production frontend and session owners.

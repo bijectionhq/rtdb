@@ -1,7 +1,7 @@
 use rtdb_types::StructFields;
-use rtdb_plan::{ApplyKind, BinaryOp, Catalog, Expr as PlanExpr, QualifiedTable, Relation, RelationNode, Statement, TableBinding};
+use rtdb_plan::{ApplyKind, BinaryOp, Binder, Catalog, Expr as PlanExpr, QualifiedTable, Relation, RelationNode, Statement, TableBinding, TemporalFilter};
 use rtdb_types::{LogicalType, Result, ScalarType, TableRef, Value};
-use rtdb_xtql::{CompileOptions, EdnKind, Expr, Query, compile, parse_query, read};
+use rtdb_xtql::{CompileOptions, EdnKind, Expr, Query, compile, compile_query, parse_query, read};
 use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 
 struct FixtureCatalog;
@@ -69,6 +69,52 @@ fn xtdb_xtql_test_parse_from_rejects_missing_bindings_and_invalid_options() {
     for source in ["(from :foo)", "(from :foo {})", "(from :foo {:bind [a] :bar x})", "(from :foo [{bar x}])"] {
         assert!(parse_query(&read(source).unwrap()).is_err(), "{source}");
     }
+}
+
+#[test]
+fn parser_diagnostics_identify_the_kind_of_binding_or_option() {
+    for (source, code, message) in [
+        ("(from :docs [{age x}])", "xtql/malformed-bind-spec", "Attribute in bind spec must be keyword"),
+        ("(from :docs :all-time)", "xtql/malformed-table-opts", "Malformed table opts"),
+        ("(from :docs {:bind nil})", "xtql/missing-bind", "Missing bind"),
+        ("(unify (with {:age 1}))", "xtql/malformed-var-spec", "Attribute in var spec must be symbol"),
+        ("(unify (with (+ 1 1)))", "xtql/malformed-var-spec", "Var specs must be pairs of bindings"),
+        ("(unify (join (not-a-query) {:x x}))", "xtql/malformed-bind", "Malformed bind"),
+        ("(-> (rel [{}] []) (with {age 1}))", "xtql/malformed-col-spec", "Attribute in col spec must be keyword"),
+        ("(-> (rel [{}] []) (with (+ 1 1)))", "xtql/malformed-col-spec", "Short form of col spec must be a symbol"),
+        ("(-> (rel [{}] []) (without age))", "xtql/malformed-without", "Columns must be keywords in without"),
+        ("(-> (rel [{}] []) (limit 1 2))", "xtql/limit", "Limit can only take a single value"),
+        ("(-> (rel [{}] []) (offset))", "xtql/offset", "Offset can only take a single value"),
+    ] {
+        let error = parse_query(&read(source).unwrap()).unwrap_err();
+        assert_eq!(error.code, code, "{source}");
+        assert_eq!(error.message.as_deref(), Some(message), "{source}");
+    }
+}
+
+#[test]
+fn from_nil_options_and_join_nil_use_their_omitted_defaults() {
+    let relation = plan("(from {:table :docs :db nil} {:bind [age] :for-valid-time nil :for-system-time nil})");
+    let scan = find(&relation, &|node| matches!(node, RelationNode::Scan(_))).unwrap();
+    let RelationNode::Scan(scan) = scan.node() else { panic!("Expected scan") };
+    assert_eq!(scan.table.name.database, "xtdb");
+    assert!(matches!(&scan.valid_time, TemporalFilter::Default));
+    assert!(matches!(&scan.system_time, TemporalFilter::Default));
+
+    let join = plan("(unify (with {x 1}) (join (rel [{}] []) nil))");
+    assert_eq!(join.schema().fields()[0].name, "x");
+    assert_eq!(join.schema().len(), 1);
+}
+
+#[test]
+fn expression_map_keys_use_the_reference_string_suffix() {
+    let query = parse_query(&read(r#"(rel [{:doc {"Xname" age foo (+ age 1) :name 2}}] [doc])"#).unwrap()).unwrap();
+    let Query::Rel { input: rtdb_xtql::RelationInput::Documents(documents), .. } = query else { panic!("Expected relation") };
+    let Expr::Map(fields) = &documents[0][0].1 else { panic!("Expected expression map") };
+    assert_eq!(fields.len(), 2);
+    assert_eq!(fields[0], ("name".to_owned(), Expr::Literal(Value::I64(2))));
+    assert!(matches!(&fields[1], (name, Expr::Call { arguments, .. })
+        if name == "oo" && arguments[0] == Expr::Variable("age".into())));
 }
 
 #[test]
@@ -191,6 +237,78 @@ fn anonymous_functions_bind_percent_parameters_without_reader_evaluation() {
     let prepared = compile("#(rel [{:name %}] [name])", &FixtureCatalog,
         &CompileOptions { parameter_types: vec![LogicalType::Scalar(ScalarType::Utf8)], ..Default::default() }).unwrap();
     assert_eq!(prepared.parameter_types.len(), 1);
+}
+
+#[test]
+fn xtdb_xtql_plan_test_rel_accepts_an_anonymous_relation_parameter() {
+    let integer = LogicalType::Scalar(ScalarType::I64);
+    let documents = LogicalType::list(LogicalType::Struct(StructFields::from([("age".into(), integer.clone())])));
+    let options = CompileOptions { parameter_types: vec![documents.clone()], ..Default::default() };
+    for source in ["#(rel % [age])", "#(rel %01 [age])"] {
+        let prepared = compile(source, &FixtureCatalog, &options).unwrap();
+        let Statement::Query(relation) = prepared.statement else { panic!("Expected a query") };
+        assert_eq!(prepared.parameter_types.get(&0), Some(&documents));
+        assert_eq!(relation.schema().fields()[0].data_type, integer);
+        assert!(find(&relation, &|node| matches!(node, RelationNode::Unnest { expr: PlanExpr::Parameter { index: 0, .. }, .. })).is_some());
+    }
+}
+
+#[test]
+fn function_parameter_symbols_resolve_independently_of_column_normalization() {
+    let options = CompileOptions {
+        parameter_types: vec![LogicalType::Scalar(ScalarType::I64), LogicalType::Scalar(ScalarType::Utf8)],
+        ..Default::default()
+    };
+    let source = "(fn [x-y x_y] (-> (rel [{}] []) (return {:a x-y :b x_y})))";
+    let Statement::Query(relation) = compile(source, &FixtureCatalog, &options).unwrap().statement else { panic!("Expected a query") };
+    let RelationNode::Project { expressions, .. } = relation.node() else { panic!("Expected projection") };
+    assert!(matches!(&expressions[0].expr, PlanExpr::Parameter { index: 0, .. }));
+    assert!(matches!(&expressions[1].expr, PlanExpr::Parameter { index: 1, .. }));
+
+    let single_parameter = CompileOptions { parameter_types: options.parameter_types[..1].to_vec(), ..Default::default() };
+    let source = "(fn [Age] (-> (rel [{:age 23}] [age]) (return {:column age :parameter Age})))";
+    let Statement::Query(relation) = compile(source, &FixtureCatalog, &single_parameter).unwrap().statement else { panic!("Expected a query") };
+    let RelationNode::Project { expressions, .. } = relation.node() else { panic!("Expected projection") };
+    assert!(matches!(&expressions[0].expr, PlanExpr::Column { .. }));
+    assert!(matches!(&expressions[1].expr, PlanExpr::Parameter { index: 0, .. }));
+}
+
+#[test]
+fn inline_query_functions_preserve_explicit_parameter_positions() {
+    let form = read("(fn [x-y x_y] (-> (rel [{}] []) (return {:a x-y :b x_y})))").unwrap();
+    let query = parse_query(&form).unwrap();
+    let integer = LogicalType::Scalar(ScalarType::I64);
+    let mut next_parameter = 8;
+    let relation = compile_query(&query, &FixtureCatalog, &mut Binder::default(), &mut next_parameter, &[(7, integer.clone()), (4, integer)], "UTC").unwrap();
+    let RelationNode::Project { expressions, .. } = relation.node() else { panic!("Expected projection") };
+    assert!(matches!(&expressions[0].expr, PlanExpr::Parameter { index: 7, .. }));
+    assert!(matches!(&expressions[1].expr, PlanExpr::Parameter { index: 4, .. }));
+}
+
+#[test]
+fn scan_bound_subqueries_report_the_context_before_binding_their_query() {
+    for source in [
+        "(from :docs {:bind [age] :for-valid-time (at (q (rel [{}] [])))})",
+        "(from :docs {:bind [age] :for-system-time (to (if true (q (rel [{}] [])) nil))})",
+    ] {
+        let error = compile(source, &FixtureCatalog, &CompileOptions::default()).unwrap_err();
+        assert_eq!(error.code, "xtql/invalid-expression");
+        assert!(error.message.as_deref().unwrap().contains("Temporal scan filters cannot contain relational subqueries"));
+    }
+    let relation = plan("(fn [bound] (from :docs {:bind [age] :for-valid-time (at bound)}))");
+    let scan = find(&relation, &|node| matches!(node, RelationNode::Scan(_))).unwrap();
+    let RelationNode::Scan(scan) = scan.node() else { panic!("Expected scan") };
+    assert!(matches!(&scan.valid_time, TemporalFilter::At(PlanExpr::Parameter { index: 0, .. })));
+}
+
+#[test]
+fn ordered_set_percentiles_point_to_sql_even_with_null_arguments() {
+    for function in ["percentile-cont", "percentile_disc"] {
+        let source = format!("(-> (rel [{{}}] []) (aggregate {{:v ({function} nil)}}))");
+        let error = compile(&source, &FixtureCatalog, &CompileOptions::default()).unwrap_err();
+        assert_eq!(error.code, "xtql/invalid-expression");
+        assert!(error.message.as_deref().unwrap().contains("WITHIN GROUP"));
+    }
 }
 
 #[test]

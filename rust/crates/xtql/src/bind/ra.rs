@@ -13,11 +13,11 @@ pub fn compile_ra_in(source: &str, catalog: &dyn Catalog, options: &CompileOptio
     let form = read(source)?;
     let mut binder = Binder::default();
     let symbols = Symbols::Relational;
-    let mut parameters = Parameters::new();
+    let mut parameters = Parameters::default();
     let mut next_parameter = 0;
     for (name, (index, data_type)) in &options.named_parameters {
-        let name = symbols.parameter(name);
-        if parameters.insert(name, binder.parameter(*index, data_type.clone())).is_some() {
+        let name = relational_parameter(name);
+        if parameters.named.insert(name, binder.parameter(*index, data_type.clone())).is_some() {
             return Err(invalid("Duplicate normalized logical relation parameter"));
         }
         next_parameter = next_parameter.max(index.checked_add(1).ok_or_else(|| invalid("Parameter index exceeds addressable range"))?);
@@ -504,7 +504,7 @@ impl Importer<'_, '_, '_> {
     }
 
     fn numeric_parameter(&self, name: &str) -> Result<PExpr> {
-        self.parameters.get(&self.compiler.symbols.parameter(name)).cloned()
+        self.parameters.named.get(&relational_parameter(name)).cloned()
             .ok_or_else(|| error("xtdb/expected-number", "Expected: number, got: null").with_context("param", name.into()))
     }
 
@@ -782,10 +782,10 @@ impl Importer<'_, '_, '_> {
             })?;
             let name = parameter.symbol().filter(|name| name.starts_with('?'))
                 .ok_or_else(|| invalid("Apply parameter must be a parameter symbol"))?;
-            let name = self.compiler.symbols.parameter(name);
+            let name = relational_parameter(name);
             if !names.insert(name.clone()) { return Err(invalid("Apply parameter is bound more than once")); }
             let index = self.compiler.parameter_index()?;
-            parameters.insert(name, PExpr::Parameter { index, data_type: field.data_type.clone() });
+            parameters.named.insert(name, PExpr::Parameter { index, data_type: field.data_type.clone() });
             arguments.push((index, field.expression()));
         }
         let mut child = Importer { compiler: self.compiler, parameters: &parameters, relations: self.relations, memory: self.memory };
