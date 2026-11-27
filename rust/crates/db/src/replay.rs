@@ -227,7 +227,9 @@ pub struct JournalRecovery {
     pub at: Lsn,
     /// The head the recovery left; records acknowledged after it may be lost.
     pub head: Lsn,
-    /// The writer epoch that resumed after the recovery.
+    /// The epoch the record was written under: the recovery fence's when the
+    /// journal recorded it atomically with the acknowledgement, otherwise
+    /// the epoch of the writer that resumed.
     pub epoch: Epoch,
     /// The writer's clock when it resumed.
     pub time: Timestamp,

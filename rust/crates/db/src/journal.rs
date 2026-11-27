@@ -1,7 +1,7 @@
 use std::{sync::{Arc, RwLock}, time::Duration};
 
 use bytes::Bytes;
-use journal_contract::{BoxFuture, Epoch, Journal, JournalError, Lsn, Page, StreamId, WriterFence, WriterSessionId};
+use journal_contract::{BoxFuture, Epoch, Journal, JournalError, Lsn, Page, RecoveryFence, StreamId, WriterFence, WriterSessionId};
 use rtdb_crypt::{Context, Generation, Kms};
 use rtdb_format::journal::Record;
 use rtdb_tx::transact::TransactionRecord;
@@ -241,6 +241,19 @@ impl Stream {
     pub(crate) async fn acknowledge_recovery(&self) -> journal_contract::Result<Lsn> {
         self.authorize_mutation().await?;
         self.journal.acknowledge_recovery(self.id()).await
+    }
+
+    /// The pending operator recovery's fence, `None` once it is acknowledged.
+    /// A journal without atomic recovery markers returns `Unsupported`.
+    pub(crate) async fn recovery_fence(&self) -> journal_contract::Result<Option<RecoveryFence>> {
+        self.journal.recovery_fence(self.id()).await
+    }
+
+    /// Appends `marker` right after the recovered head under the recovery's
+    /// epoch and lifts exactly that fence, in one journal decision.
+    pub(crate) async fn acknowledge_recovery_with_marker(&self, fence: RecoveryFence, marker: Bytes) -> journal_contract::Result<Lsn> {
+        self.authorize_mutation().await?;
+        self.journal.acknowledge_recovery_with_marker(self.id(), fence, marker).await
     }
 
     pub(crate) async fn read(&self, from: Lsn) -> journal_contract::Result<Page> {

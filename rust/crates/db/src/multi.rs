@@ -414,15 +414,24 @@ impl MultiDatabase {
                         "An operator recovered the Multi journal after it lost two of its three voters; commits acknowledged after its head may be lost. The writer acknowledges the recovery, records it in the journal and resumes",
                     );
                     RECOVERIES_ACKNOWLEDGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    self.stream.acknowledge_recovery().await.map_err(journal_error)?;
-                    acknowledged = Some(head);
+                    let after = match self.acknowledge_recovery_with_record(head).await? {
+                        Some(after) => after,
+                        None => {
+                            self.stream.acknowledge_recovery().await.map_err(journal_error)?;
+                            head
+                        }
+                    };
+                    acknowledged = Some(after);
+                    // Recorded unless the journal already holds a record of
+                    // this recovery, such as the atomic marker.
                     self.unrecorded_recovery = Some(head);
                     self.replay_afresh = true;
                 }
                 Err(JournalError::Fenced { current }) => {
                     // The recovery's fence stands above the epoch this node
                     // chose before it saw the recovery. Seal once above it,
-                    // unless a writer already appended after the recovery.
+                    // unless a writer already appended after the recovery
+                    // (and after its marker).
                     if let Some(head) = acknowledged.take()
                         && self.stream.head().await? == head
                     {
@@ -436,6 +445,47 @@ impl MultiDatabase {
                 }
                 Err(error) => return Err(journal_error(error)),
             }
+        }
+    }
+
+    /// Acknowledges the operator recovery that left the journal at `head`
+    /// and records it in the same journal decision: the keeper appends this
+    /// node's `Recovered` record right after the recovered head, under the
+    /// recovery's epoch, and lifts exactly that fence. So whichever node
+    /// acknowledges also records, and a racing node's marker is refused
+    /// rather than written twice. Returns the journal head after the
+    /// acknowledgement, or `None` when the journal has no atomic markers and
+    /// the caller acknowledges and records in two steps.
+    async fn acknowledge_recovery_with_record(&mut self, head: Lsn) -> Result<Option<Lsn>> {
+        let fence = match self.stream.recovery_fence().await {
+            Ok(Some(fence)) => fence,
+            // Another node or an administrator already acknowledged it.
+            Ok(None) => return Ok(Some(self.stream.head().await?)),
+            Err(JournalError::Unsupported) => return Ok(None),
+            Err(error) => return Err(journal_error(error)),
+        };
+        if fence.head != head {
+            return Err(journal_error(JournalError::Recovered { head: fence.head }));
+        }
+        // Rebuild through the recovered head first, so the record is sealed
+        // under the key generation the recovered history ends with.
+        self.replay_afresh = true;
+        self.catch_up(fence.head).await?;
+        let at = next(fence.head)?;
+        let entry = Entry {
+            epoch: fence.epoch,
+            generation: self.state().generation,
+            record: Record::Recovered { head: fence.head.0, epoch: fence.epoch.0, time: (self.clock)().0 },
+        };
+        let marker = self.stream.encode(at, &entry).await?;
+        match self.stream.acknowledge_recovery_with_marker(fence, marker).await {
+            Ok(at) => Ok(Some(at)),
+            // Another node lifted this fence first; its acknowledgement
+            // stands, and this node records the recovery after sealing if
+            // the journal does not hold a record of it.
+            Err(JournalError::Conflict { .. }) => Ok(Some(self.stream.head().await?)),
+            Err(JournalError::Unsupported) => Ok(None),
+            Err(error) => Err(journal_error(error)),
         }
     }
 

@@ -1278,6 +1278,11 @@ async fn multi_resumes_after_a_real_keeper_recovery_and_followers_rebuild() {
     let principals = principals.iter().map(String::as_str).collect::<Vec<_>>();
     let mut keepers = LocalCluster::start_spared(&principals).await.unwrap();
     let config = keepers.journal_config(8 << 30, 4 << 20);
+    // Atomic recovery markers need the finalized current cluster version, as
+    // after an upgrade; before it the writer records in two steps.
+    let current = stream_logkeeper::stream::consensus::CLUSTER_VERSION_CURRENT;
+    let finalized = keepers.journal(&principals[0], &config).unwrap().client().finalize_version(current).await.unwrap();
+    assert_eq!(finalized, current);
     let handle = |keepers: &LocalCluster, identity: Identity| -> Arc<dyn Journal> {
         Arc::new(keepers.journal(&keeper_principal(&identity), &config).unwrap())
     };
@@ -1323,8 +1328,11 @@ async fn multi_resumes_after_a_real_keeper_recovery_and_followers_rebuild() {
     let role = successor.tick(&live(3)).await.unwrap();
     assert_eq!(role, Role::Writer(Epoch(report.epoch.0 + 1)));
     assert!(journal_recoveries_acknowledged() > recoveries);
+    // The keeper wrote the record with the acknowledgement, right after the
+    // recovered head and under the recovery's fence.
     let recovery = successor.journal_recovery().unwrap();
-    assert_eq!((recovery.head, recovery.epoch), (kept, Epoch(report.epoch.0 + 1)));
+    assert_eq!((recovery.at, recovery.head, recovery.epoch), (Lsn(kept.0 + 1), kept, report.epoch));
+    assert_eq!(recovery_records(&successor).len(), 1);
     for id in 10..16 {
         let receipt = successor.transact(&put(id as u8, id, "new")).await.unwrap();
         cluster.at(receipt.system_time.0);
