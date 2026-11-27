@@ -552,6 +552,18 @@ fn a_selected_exists_becomes_a_semi_join_and_its_negation_an_anti_join() {
 }
 
 #[test]
+fn a_volatile_selection_keeps_its_exists_conjunct() {
+    let mark = typed(11, "_sq_11", bool_type());
+    let applied = apply(&customers(), one(customer_orders()), by_customer(), ApplyKind::Exists, Some(mark.clone()));
+    let random = Expr::Call { name: "random".into(), args: Vec::new(), return_type: LogicalType::Scalar(ScalarType::F64) };
+    let predicate = Expr::binary(BinaryOp::And,
+        Expr::binary(BinaryOp::Gt, random, Expr::Literal(Value::F64(0.5))), mark.expression());
+    let prepared = prepare(select(applied, predicate.clone())).unwrap();
+    assert_eq!(joins(&prepared, JoinKind::Semi), 0);
+    assert_eq!(count_nodes(&prepared, &|node| matches!(node, RelationNode::Filter { predicate: kept, .. } if kept == &predicate)), 1);
+}
+
+#[test]
 fn a_selected_quantified_comparison_becomes_a_semi_or_anti_join() {
     let semi = prepare(quantified(false, true)).unwrap();
     assert_eq!((applies(&semi), joins(&semi, JoinKind::Semi)), (0, 1), "{semi:?}");

@@ -16,7 +16,8 @@ pub(super) fn decorrelate(relation: Arc<Relation>, ids: &mut Ids) -> Result<Arc<
 fn decorrelate_at(relation: Arc<Relation>, ids: &mut Ids) -> Result<Arc<Relation>> {
     match relation.node() {
         // The selection is seen before the apply or mark beneath it, which it may turn into a semi- or anti-join.
-        RelationNode::Filter { input, predicate } if selects_through(input) => filter_over(Arc::clone(input), conjuncts(predicate), ids),
+        RelationNode::Filter { input, predicate } if selects_through(input) && !predicate.is_volatile() =>
+            filter_over(Arc::clone(input), conjuncts(predicate), ids),
         RelationNode::Apply { input, dependent, arguments, kind, output } => {
             let input = decorrelate(Arc::clone(input), ids)?;
             let dependent = decorrelate(Arc::clone(dependent), ids)?;
