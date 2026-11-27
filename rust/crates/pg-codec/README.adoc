@@ -21,6 +21,7 @@ The signed-short fields wrap on output, and a zero digit count returns zero befo
 Numeric text retains the signed 32-bit scale and Java's bounded canonical scientific notation.
 Negative-scale binary output reserves its expanded base-10000 representation before encoding; the minimum signed scale fails like the pinned power conversion.
 Timestamp and date binary values use PostgreSQL's 2000 epoch.
+Binary timestamptz input carries the UTC offset `Z` in its Arrow timezone, matching the reference's offset date-time value.
 Millisecond date text truncates epoch milliseconds to days toward zero, including in JSON, JSON-LD and Transit output.
 Binary date output accepts day vectors; the pinned millisecond vector has no integer reader and fails with an internal-error category.
 Timestamp output, local and zoned, floors submicrosecond fractions, so binary sends the microsecond the text form shows.

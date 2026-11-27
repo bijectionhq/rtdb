@@ -1,9 +1,23 @@
-use arrow_array::{Array, cast::AsArray, types::{Decimal128Type, Decimal256Type, Int32Type, Int64Type}};
+use arrow_array::{Array, cast::AsArray, types::{Decimal128Type, Decimal256Type, Int32Type, Int64Type, TimestampMicrosecondType}};
 use arrow_buffer::i256;
-use arrow_schema::DataType;
+use arrow_schema::{DataType, TimeUnit};
 use rtdb_columnar::MemoryBudget;
 use rtdb_pg_codec::{Format, decode, decode_argument};
 use rtdb_types::PgType;
+
+#[test]
+fn binary_timestamptz_bind_uses_the_zero_offset_arrow_timezone() {
+    let memory = MemoryBudget::new(1 << 20);
+    let binary = (-946_684_800_000_001i64).to_be_bytes();
+    let expected = decode(PgType::TimestampTz, Format::Text, b"1969-12-31 23:59:59.999999Z", &memory).unwrap();
+    let decoded = decode(PgType::TimestampTz, Format::Binary, &binary, &memory).unwrap();
+    assert_eq!(decoded.value(), expected.value());
+
+    let (field, array, _charge) = decode_argument("?_0", PgType::TimestampTz, Format::Binary, &binary, &memory).unwrap();
+    assert_eq!(field.data_type(), &DataType::Timestamp(TimeUnit::Microsecond, Some("Z".into())));
+    assert_eq!(array.data_type(), field.data_type());
+    assert_eq!(array.as_primitive::<TimestampMicrosecondType>().value(0), -1);
+}
 
 #[test]
 fn numeric_bind_writes_exact_coefficients_with_full_scale_metadata() {

@@ -22,7 +22,11 @@ pub(crate) fn read(ty: PgType, bytes: &[u8]) -> Result<Value> {
         PgType::Float4 => Value::F32(f32::from_bits(input.i32()? as u32)), PgType::Float8 => Value::F64(f64::from_bits(input.i64()? as u64)),
         PgType::Bool => Value::Bool(boolean(&mut input)?),
         PgType::Numeric => numeric_read(&mut input)?.into_value()?,
-        PgType::Timestamp | PgType::TimestampTz => Value::Timestamp { value: input.i64()?.wrapping_add(PG_EPOCH_MICROS), unit: TimeUnit::Microsecond, timezone: (ty == PgType::TimestampTz).then(|| "UTC".into()) },
+        PgType::Timestamp | PgType::TimestampTz => Value::Timestamp {
+            value: input.i64()?.wrapping_add(PG_EPOCH_MICROS),
+            unit: TimeUnit::Microsecond,
+            timezone: (ty == PgType::TimestampTz).then(|| "Z".into()),
+        },
         PgType::Date => Value::DateDay(input.i32()?.checked_add(PG_EPOCH_DAYS).ok_or_else(|| invalid("Date exceeds Arrow Date32 range"))?),
         PgType::Time => { let micros = input.i64()?; if !(0..86_400_000_000).contains(&micros) { return Err(invalid("Time is outside a day")); } Value::Time { value: micros * 1000, unit: TimeUnit::Nanosecond, bit_width: 64 } },
         PgType::Interval => { let nanoseconds = input.i64()?.checked_mul(1000).ok_or_else(|| invalid("Interval overflow"))?; let days = input.i32()?; let months = input.i32()?; if nanoseconds == 0 && days == 0 { Value::IntervalYearMonth(months) } else { Value::IntervalMonthDayMicro { months, days, nanoseconds } } },
