@@ -2643,6 +2643,7 @@ surface QueryAccess {
         -- An inverted or empty period fails with the period constructor's validation error.
         -- A DATE_TRUNC projection with a literal field and compatible date or timestamp input can write Arrow cells in the input unit and retain the timestamp's zone label.
         -- DATE_TRUNC over an exact interval cell preserves its layout and truncates signed month, day and time components toward zero.
+        -- DATE_BIN and RANGE_BINS can consume the components of a compatible truncated interval without materializing an intermediate column.
         -- Whole-second and coarser truncation of zoned timestamps uses the timestamp's zone rules or the explicit override, preserving the scalar result at gaps and overlaps.
         -- Truncation raises errors in reached row order.
         -- A DATE_BIN projection with a compatible month-day interval stride and timestamp bounds can write Arrow timestamp ticks with the origin's zone label.

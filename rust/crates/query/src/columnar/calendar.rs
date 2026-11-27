@@ -145,10 +145,15 @@ impl<'a> CalendarInput<'a> {
     }
 }
 
+enum IntervalSource<'a> {
+    Column(&'a Column),
+    Constant(Option<IntervalMonthDayNano>),
+}
+
 struct IntervalInput<'a> {
-    column: Option<&'a Column>,
-    constant: Option<IntervalMonthDayNano>,
+    source: IntervalSource<'a>,
     scalar: ScalarType,
+    truncation: Option<TemporalField>,
 }
 
 impl<'a> IntervalInput<'a> {
@@ -161,14 +166,14 @@ impl<'a> IntervalInput<'a> {
             Expr::Literal(value) => {
                 let scalar = interval(&value.logical_type())?;
                 let constant = Self::value(value, &scalar)?;
-                Some(Self { column: None, constant, scalar })
+                Some(Self { source: IntervalSource::Constant(constant), scalar, truncation: None })
             }
             Expr::Column { id, .. } => {
                 let position = schema.position(*id)?;
                 let scalar = interval(&schema.fields()[position].data_type)?;
                 let column = batch.columns.get(position)?;
                 if matches!(column, Column::Values(_)) { return None; }
-                Some(Self { column: Some(column), constant: None, scalar })
+                Some(Self { source: IntervalSource::Column(column), scalar, truncation: None })
             }
             Expr::Parameter { index, data_type } => {
                 let scalar = interval(params.types().get(*index)?)?;
@@ -178,10 +183,23 @@ impl<'a> IntervalInput<'a> {
                     Some(cell) => Self::arrow(&scalar, cell.array, cell.field, None, cell.row)?,
                     None => Self::value(parameters.known(*index)?, &scalar)?,
                 };
-                Some(Self { column: None, constant, scalar })
+                Some(Self { source: IntervalSource::Constant(constant), scalar, truncation: None })
             }
             _ => None,
         }
+    }
+
+    fn bind_truncation(expr: &'a Expr, schema: &'a Schema, batch: &'a ColumnBatch, params: &'a BoundParameters) -> Option<Self> {
+        let Expr::Call { name, args, return_type } = expr else { return None; };
+        if !matches!(name.as_str(), "date_trunc" | "date-trunc") { return None; }
+        let [Expr::Literal(Value::Utf8(field)), source] = args.as_slice() else { return None; };
+        let result = plain_scalar(return_type)?;
+        let mut input = Self::bind(source, schema, batch, params)?;
+        if &input.scalar != result { return None; }
+        let field = TemporalField::parse(field).ok()?;
+        if !field.supports("date_trunc", result) { return None; }
+        input.truncation = Some(field);
+        Some(input)
     }
 
     fn value(value: &Value, scalar: &ScalarType) -> Option<Option<IntervalMonthDayNano>> {
@@ -229,10 +247,21 @@ impl<'a> IntervalInput<'a> {
         }
     }
 
-    fn parts(&self, row: usize) -> Option<Option<IntervalMonthDayNano>> {
-        let Some(column) = self.column else { return Some(self.constant); };
-        let Some((array, field, logical, row)) = column.arrow_cell(row)? else { return Some(None); };
-        Self::arrow(&self.scalar, array, field, logical, row)
+    fn source_parts(&self, row: usize) -> Option<Option<IntervalMonthDayNano>> {
+        match self.source {
+            IntervalSource::Constant(parts) => Some(parts),
+            IntervalSource::Column(column) => {
+                let Some((array, field, logical, row)) = column.arrow_cell(row)? else { return Some(None); };
+                Self::arrow(&self.scalar, array, field, logical, row)
+            }
+        }
+    }
+
+    fn parts(&self, row: usize) -> Result<Option<Option<IntervalMonthDayNano>>> {
+        let Some(parts) = self.source_parts(row) else { return Ok(None); };
+        let (Some(parts), Some(field)) = (parts, self.truncation) else { return Ok(Some(parts)); };
+        let (months, days, nanos) = truncate_interval(field, parts.months, parts.days, parts.nanoseconds)?;
+        Ok(Some(Some(IntervalMonthDayNano::new(months, days, nanos))))
     }
 }
 
@@ -243,7 +272,8 @@ pub(super) struct BinStride<'a> {
 
 impl<'a> BinStride<'a> {
     pub(super) fn bind(expr: &'a Expr, schema: &'a Schema, batch: &'a ColumnBatch, params: &'a BoundParameters) -> Option<Self> {
-        let input = IntervalInput::bind(expr, schema, batch, params)?;
+        let input = IntervalInput::bind(expr, schema, batch, params)
+            .or_else(|| IntervalInput::bind_truncation(expr, schema, batch, params))?;
         let unit = match input.scalar {
             ScalarType::IntervalMonthDayMicro => TimeUnit::Microsecond,
             ScalarType::Interval(IntervalUnit::MonthDayNano) => TimeUnit::Nanosecond,
@@ -252,7 +282,7 @@ impl<'a> BinStride<'a> {
         Some(Self { input, unit })
     }
 
-    pub(super) fn parts(&self, row: usize) -> Option<Option<IntervalMonthDayNano>> {
+    pub(super) fn parts(&self, row: usize) -> Result<Option<Option<IntervalMonthDayNano>>> {
         self.input.parts(row)
     }
 }
@@ -339,22 +369,19 @@ pub(super) fn project(expr: &Expr, schema: &Schema, batch: &ColumnBatch, params:
     if batch.len == 0 { return Ok(None); }
     let Some(result) = plain_scalar(return_type) else { return Ok(None); };
     match (name.as_str(), args.as_slice()) {
-        ("date_trunc" | "date-trunc", [Expr::Literal(Value::Utf8(field)), source])
-            if matches!(result, ScalarType::Interval(_) | ScalarType::IntervalMonthDayMicro) =>
-        {
-            let Some(source) = IntervalInput::bind(source, schema, batch, params) else { return Ok(None); };
-            if &source.scalar != result { return Ok(None); }
-            let Ok(field) = TemporalField::parse(field) else { return Ok(None); };
-            if !field.supports("date_trunc", result) { return Ok(None); }
+        ("date_trunc" | "date-trunc", [_, _]) if matches!(result, ScalarType::Interval(_) | ScalarType::IntervalMonthDayMicro) => {
+            let Some(source) = IntervalInput::bind_truncation(expr, schema, batch, params) else { return Ok(None); };
             match result {
-                ScalarType::Interval(IntervalUnit::YearMonth) =>
-                    truncate_interval_projection::<IntervalYearMonthType>(batch, context, result, &source, field, |months, _, _| months),
-                ScalarType::Interval(IntervalUnit::DayTime) =>
-                    truncate_interval_projection::<IntervalDayTimeType>(batch, context, result, &source, field, |_, days, nanos| {
+                ScalarType::Interval(IntervalUnit::YearMonth) => build::<IntervalYearMonthType>(batch, context, result, |row| {
+                    Ok(source.parts(row)?.map(|parts| parts.map(|parts| parts.months)))
+                }),
+                ScalarType::Interval(IntervalUnit::DayTime) => build::<IntervalDayTimeType>(batch, context, result, |row| {
+                    Ok(source.parts(row)?.map(|parts| parts.map(|parts| {
                         // Truncation only reduces the magnitude of the original i32 millisecond count.
-                        IntervalDayTime::new(days, (nanos / 1_000_000) as i32)
-                    }),
-                _ => truncate_interval_projection::<IntervalMonthDayNanoType>(batch, context, result, &source, field, IntervalMonthDayNano::new),
+                        IntervalDayTime::new(parts.days, (parts.nanoseconds / 1_000_000) as i32)
+                    })))
+                }),
+                _ => build::<IntervalMonthDayNanoType>(batch, context, result, |row| source.parts(row)),
             }
         }
         ("date_trunc" | "date-trunc", [Expr::Literal(Value::Utf8(field)), source] | [Expr::Literal(Value::Utf8(field)), source, _]) => {
@@ -409,7 +436,7 @@ pub(super) fn project(expr: &Expr, schema: &Schema, batch: &ColumnBatch, params:
             let bin = DateBin::new(stride.unit, source_unit, source_zone.is_some(), origin_unit, origin_zone);
             if *unit != bin.output_unit() || result_zone.as_deref() != origin_zone { return Ok(None); }
             let cell = |row| {
-                let Some(stride_parts) = stride.parts(row) else { return Ok(None); };
+                let Some(stride_parts) = stride.parts(row)? else { return Ok(None); };
                 let Some(origin) = origin.prepare(row, timezone)? else { return Ok(None); };
                 let origin = origin.map(|origin| origin.demand(timezone)).transpose()?;
                 let (Some(parts), Some(origin)) = (stride_parts, origin) else { return Ok(Some(None)); };
@@ -448,18 +475,6 @@ pub(super) fn project(expr: &Expr, schema: &Schema, batch: &ColumnBatch, params:
         }
         _ => Ok(None),
     }
-}
-
-fn truncate_interval_projection<T: ArrowPrimitiveType>(
-    batch: &ColumnBatch, context: &QueryContext, scalar: &ScalarType, source: &IntervalInput<'_>, field: TemporalField,
-    encode: impl Fn(i32, i32, i64) -> T::Native,
-) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
-    build::<T>(batch, context, scalar, |row| {
-        let Some(parts) = source.parts(row) else { return Ok(None); };
-        let Some(parts) = parts else { return Ok(Some(None)); };
-        let (months, days, nanos) = truncate_interval(field, parts.months, parts.days, parts.nanoseconds)?;
-        Ok(Some(Some(encode(months, days, nanos))))
-    })
 }
 
 fn build<T: ArrowPrimitiveType>(batch: &ColumnBatch, context: &QueryContext, scalar: &ScalarType,
@@ -785,6 +800,22 @@ mod tests {
         let bin = call("date_bin", vec![parameter(0, &stride), source.expression(), parameter(1, &origin)]);
         execution.parameters = Arc::new(BoundParameters::infer(vec![stride, origin], &execution.context.memory).unwrap());
         assert_parity(execution, schema, batch, vec![bin], vec![ScalarType::Timestamp { unit: TimeUnit::Nanosecond, timezone: None }]).await;
+    }
+
+    #[tokio::test]
+    async fn date_bin_reads_truncated_stride_components_without_an_intermediate_column() {
+        let ts = field(0, TimeUnit::Microsecond, Some("UTC"));
+        let stride = Field { data_type: LogicalType::Scalar(ScalarType::Interval(IntervalUnit::MonthDayNano)).maybe(),
+            ..field(1, TimeUnit::Microsecond, None) };
+        let schema = Schema::new(vec![ts.clone(), stride.clone()]).unwrap();
+        let source = TimestampMicrosecondArray::from(vec![Some(-2_499_999), Some(1_500_000), None]).with_timezone("UTC");
+        let strides = IntervalMonthDayNanoArray::from(vec![Some(IntervalMonthDayNano::new(0, 0, 1_500_000_000)),
+            None, Some(IntervalMonthDayNano::new(1, 0, 0))]);
+        let batch = dataset(vec![arrow(source, &ts), arrow(strides, &stride)], 3);
+        let trunc = call("date_trunc", vec![Expr::Literal(Value::Utf8("SECOND".into())), stride.expression()]);
+        let bin = call("date_bin", vec![trunc, ts.expression()]);
+        assert_parity(execution("UTC"), schema, batch, vec![bin],
+            vec![ScalarType::Timestamp { unit: TimeUnit::Nanosecond, timezone: Some("UTC".into()) }]).await;
     }
 
     #[tokio::test]

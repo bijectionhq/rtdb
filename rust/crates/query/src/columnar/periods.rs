@@ -289,7 +289,7 @@ pub(super) fn range_bins(expr: &Expr, schema: &Schema, batch: &ColumnBatch, para
     let mut valid = NullBufferBuilder::new(batch.len);
     let mut total = 0usize;
     let read = |row| -> Result<Option<Option<RangeBins>>> {
-        let Some(stride) = stride.parts(row) else { return Ok(None); };
+        let Some(stride) = stride.parts(row)? else { return Ok(None); };
         let Some(stride) = stride else { return Ok(Some(None)); };
         let Some(bounds) = bounds.prepare(row, timezone)? else { return Ok(None); };
         let Some((from_cell, to_cell)) = bounds else { return Ok(Some(None)); };
@@ -674,6 +674,37 @@ mod tests {
         let oracle = scalar(&expr, &schema, &input, 0, &params, &ctx).unwrap_err();
         assert_eq!(error.code, "xtdb/invalid-period");
         assert_eq!((error.code, error.message, error.context), (oracle.code, oracle.message, oracle.context));
+    }
+
+    #[test]
+    fn range_bins_reads_truncated_strides_and_checks_zero_only_for_reached_bounds() {
+        let ctx = context("UTC");
+        let stride = field(0, interval(0, 0, 0).logical_type().maybe());
+        let finite = Value::TimestampTzRange { lower: -7_000, upper: 8_000 };
+        let open = Value::TimestampTzRange { lower: -7_000, upper: i64::MAX };
+        let period = field(1, finite.logical_type());
+        let schema = Schema::new(vec![stride.clone(), period.clone()]).unwrap();
+        let truncated = call("date_trunc", vec![Expr::Literal(Value::Utf8("MILLISECOND".into())), stride.expression()]);
+        let bins = call("range_bins", vec![truncated, call("lower", vec![period.expression()]),
+            call("upper", vec![period.expression()])]);
+        let params = BoundParameters::infer(vec![], &ctx.memory).unwrap();
+        let input = [
+            vec![interval(0, 0, 2_850_000), interval(0, 0, 999_999), Value::Null],
+            vec![finite.clone(), open, finite.clone()],
+        ];
+        let page = batch(&schema, &input, &ctx);
+        let (output, _owner) = range_bins(&bins, &schema, &page, &params, &ctx).unwrap().unwrap();
+        for row in 0..3 {
+            assert_eq!(output.value(row).unwrap(), scalar(&bins, &schema, &input, row, &params, &ctx).unwrap());
+        }
+        assert_eq!(output.value(1).unwrap(), Value::Null);
+
+        let input = [vec![interval(0, 0, 999_999)], vec![finite]];
+        let page = batch(&schema, &input, &ctx);
+        let error = range_bins(&bins, &schema, &page, &params, &ctx).err().unwrap();
+        let oracle = scalar(&bins, &schema, &input, 0, &params, &ctx).unwrap_err();
+        assert_eq!(error.code, "xtdb.expression/division-by-zero");
+        assert_eq!(error.code, oracle.code);
     }
 
     #[test]
