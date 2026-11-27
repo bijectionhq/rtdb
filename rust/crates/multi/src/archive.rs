@@ -455,11 +455,11 @@ async fn verify_transfer_envelope(
 
 pub(crate) async fn verify_cell_move_checkpoint(
     record: &DeploymentRecord, bucket: Arc<dyn ObjectStore>, cipher: &PublicationSealing,
-) -> Result<()> {
+) -> Result<Option<BlockCatalog>> {
     let root = format!("{}/{}", record.storage_prefix(), checkpoint_storage_root()?);
     let physical = PrefixedStore::new(bucket.clone(), root.clone());
     crate::store::check_root(&physical, &record.id, false).await?;
-    let Some(checkpoint) = record.checkpoint else { return Ok(()); };
+    let Some(checkpoint) = record.checkpoint else { return Ok(None); };
     let raw = open_deployment_store(bucket, &root, PackDiscovery::From(checkpoint.block), wall_clock()).await?;
     let plaintext = EncryptingStore::published(raw.clone(), cipher.clone());
     let catalog = BlockCatalog::decode(&plaintext.get_fresh(&key(&block_key(BlockIndex(checkpoint.block))?)?).await?)?;
@@ -474,9 +474,10 @@ pub(crate) async fn verify_cell_move_checkpoint(
             } else {
                 raw.head_fresh(name).await?;
             }
-            Ok(())
+            Ok::<_, Anomaly>(())
         }
-    }).await
+    }).await?;
+    Ok(Some(catalog))
 }
 
 pub(crate) async fn require_transferable_serving_archive(
@@ -3337,7 +3338,8 @@ mod tests {
         assert_eq!(absent.code, "rtdb.storage/missing-object");
 
         raw.put(metadata, cipher.seal(metadata, fixture.files[metadata].clone()).await?).await?;
-        verify_cell_move_checkpoint(&record, bucket, &cipher).await
+        verify_cell_move_checkpoint(&record, bucket, &cipher).await?;
+        Ok(())
     }
 
     #[tokio::test]

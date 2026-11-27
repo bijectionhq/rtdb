@@ -3,7 +3,7 @@
 use base64::Engine as _;
 use bytes::Bytes;
 use prost::Message;
-use rtdb_directory::{Checkpoint, CheckpointSuffixCustody, CheckpointSuffixPin, CheckpointTransferFence, CheckpointTransferTerminal, DeploymentRecord, Directory, HostedTask, Lifecycle, now_ms};
+use rtdb_directory::{CellTransferReplay, Checkpoint, CheckpointSuffixCustody, CheckpointSuffixPin, CheckpointTransferFence, CheckpointTransferTerminal, DeploymentRecord, Directory, HostedTask, Lifecycle, now_ms};
 use rtdb_format::{
     catalog::BlockCatalog,
     envelope::{ReplicaBody, ReplicaEnvelope, ReplicaFrame},
@@ -523,17 +523,30 @@ impl TerminalReplicaCipher {
 pub(crate) async fn reseal_live_journal(
     from: &crate::admin::CellHandle<'_>, source: &DeploymentRecord, source_stream: &rtdb_logkeeper::StreamConfig,
     to: &crate::admin::CellHandle<'_>, target: &DeploymentRecord, target_stream: &rtdb_logkeeper::StreamConfig,
-    task: Option<&HostedTask>,
-) -> Result<()> {
+    catalog: Option<&BlockCatalog>, task: Option<&HostedTask>,
+) -> Result<CellTransferReplay> {
     use rtdb_logkeeper::{bootstrap_committed_page, certify_committed_range, seal_recover_bounds, verify_certified_range};
+    use rtdb_replication::TermFence;
     use rtdb_storage::log::LogOffset;
+    use rtdb_types::{PlacedTransfer, Term};
 
     let (trim, through) = seal_recover_bounds(source_stream, source.epoch).await?;
     let trim = LogOffset(trim.0.max(crate::hosted_recovery::replay_admission_floor(source)?));
     let first = LogOffset(trim.0.checked_add(1).ok_or_else(suffix_unavailable)?);
-    if trim > through { return Err(suffix_unavailable()); }
+    let after = source.checkpoint.map_or(-1, |checkpoint| checkpoint.boundary);
+    if trim.0 > after || after > through.0 { return Err(suffix_unavailable()); }
+    let (mut fence, mut replay) = match (source.checkpoint, catalog) {
+        (Some(checkpoint), Some(catalog)) => (TermFence::from_catalog(catalog)?, LogicalReplay::new(checkpoint, source.log_epoch, catalog)),
+        (None, None) => {
+            let epoch = StorageEpoch(source.log_epoch);
+            let empty = BlockCut { block: -1, source: SourcePosition::from_epoch_offset(epoch, -1)?.0 };
+            (TermFence::from_boundary(Term(0), None)?, LogicalReplay { epoch, source: -1, installed: empty, pending: None })
+        }
+        _ => return Err(suffix_unavailable()),
+    };
     if first > through {
-        return bootstrap_committed_page(target_stream, source.epoch, trim, first, &[], true).await;
+        bootstrap_committed_page(target_stream, source.epoch, trim, first, &[], true).await?;
+        return Ok(CellTransferReplay { source_through: replay.source, replica: PlacedTransfer { after, through: through.0, debt: None } });
     }
 
     with_region(
@@ -559,6 +572,8 @@ pub(crate) async fn reseal_live_journal(
             let payloads = ServingPayloads::new(&current, region, &certificate, from.broker, &memory)?;
             let cursor = rtdb_logkeeper::CertifiedRangeReader::new(source_stream, &certificate)?;
             let mut segments = CertifiedSegments::new(cursor);
+            let mut previous_writer = None;
+            let mut placed = PlacedReplay::default();
             while let Some(mut entries) = segments.next().await? {
                 let first = entries.first().ok_or_else(suffix_unavailable)?.lsn;
                 let last = entries.last().ok_or_else(suffix_unavailable)?.lsn;
@@ -570,6 +585,12 @@ pub(crate) async fn reseal_live_journal(
                     let last = page.last().ok_or_else(suffix_unavailable)?.lsn;
                     let mut detached = Vec::new();
                     for entry in &mut *page {
+                        let admitted = if entry.lsn > after {
+                            admit_record(entry, &mut fence, &mut previous_writer, source.epoch)?
+                        } else {
+                            None
+                        };
+                        let mut materialized = None;
                         if ReplicaFrame::has_external_payload(&entry.payload)? {
                             let envelope = ReplicaEnvelope::decode(&entry.payload)?.ok_or_else(suffix_unavailable)?;
                             let relative = envelope.oversized_payload(CURRENT_STORAGE_VERSION, StorageEpoch(0))?
@@ -580,7 +601,19 @@ pub(crate) async fn reseal_live_journal(
                             let broker = to.broker.ok_or_else(suffix_unavailable)?;
                             let publication = broker.copy(target, entry.lsn, &object, body.clone()).await?;
                             entry.payload = target_payload_proxy(&envelope, &resolved, &body, publication)?;
+                            materialized = Some(resolved);
                             detached.push((broker, entry.lsn, object));
+                        }
+                        if let Some(admitted) = admitted {
+                            let envelope = materialized.as_ref().unwrap_or(&admitted);
+                            match &envelope.message {
+                                ReplicaBody::ResolvedTx(message) => {
+                                    let next = replay.transaction_source(message.src_msg_id)?;
+                                    placed.finish_transaction(message, envelope.term)?;
+                                    replay.source = next;
+                                }
+                                control => placed.apply_control(control, envelope.term, entry.lsn, &mut replay)?,
+                            }
                         }
                         entry.payload = target_units.seed(entry.lsn, entry.payload.clone()).await?;
                     }
@@ -592,7 +625,10 @@ pub(crate) async fn reseal_live_journal(
                     }
                 }
             }
-            Ok(())
+            Ok(CellTransferReplay {
+                source_through: replay.source,
+                replica: PlacedTransfer { after, through: through.0, debt: placed.debt },
+            })
         },
     ).await
 }

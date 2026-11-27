@@ -3352,15 +3352,13 @@ impl rtdb_multi::cells::CellMap for InterruptedCutover {
     }
 }
 
-struct InterruptedInstall {
+struct InterruptedJournalKey {
     keys: rtdb_multi::keys::LocalKeyService,
     failed: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait::async_trait]
-impl KeyService for InterruptedInstall {
-    // Everything but `install` goes to the wrapped service, including the
-    // unit, journal and archive key operations whose defaults refuse.
+impl KeyService for InterruptedJournalKey {
     async fn existing_namespace_id(&self) -> rtdb_types::Result<Option<[u8; 32]>> { self.keys.existing_namespace_id().await }
     fn assertion_keys(&self) -> Option<&dyn rtdb_multi::keys::AssertionKeyService> { self.keys.assertion_keys() }
     fn assertion_families(&self, region: Arc<rtdb_storage::IoRegion>) -> Option<rtdb_multi::keys::AssertionFamilies<'_>> { self.keys.assertion_families(region) }
@@ -3388,6 +3386,9 @@ impl KeyService for InterruptedInstall {
         self.keys.archive_key(id, provision, region).await
     }
     async fn scoped_unit_key(&self, id: &str, region: Arc<rtdb_storage::IoRegion>) -> rtdb_types::Result<Arc<dyn rtdb_multi::keys::ArchiveKey>> {
+        if !self.failed.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return Err(rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "test/journal-key-interrupted", "The destination journal key was unavailable"));
+        }
         self.keys.scoped_unit_key(id, region).await
     }
     async fn archive_key_is_operation_only(&self, id: &str) -> rtdb_types::Result<bool> { self.keys.archive_key_is_operation_only(id).await }
@@ -3420,9 +3421,6 @@ impl KeyService for InterruptedInstall {
     async fn deletion_verification_key(&self) -> rtdb_types::Result<String> { self.keys.deletion_verification_key().await }
 
     async fn install(&self, deployment: &str, key: [u8; 32]) -> rtdb_types::Result<()> {
-        if !self.failed.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            return Err(rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "test/key-install-interrupted", "The destination key service was unavailable"));
-        }
         self.keys.install(deployment, key).await
     }
 }
@@ -3433,7 +3431,7 @@ async fn a_cell_move_resumes_when_preparation_or_the_placement_switch_is_interru
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn s3_a_cell_move_resumes_after_key_install_and_cutover_interruptions() {
+async fn s3_a_cell_move_resumes_after_journal_key_and_cutover_interruptions() {
     let (Some(east), Some(west)) = (s3_storage(), s3_storage()) else {
         eprintln!("RTDB_S3_ENDPOINT is not set: skipped");
         return;
@@ -3447,7 +3445,7 @@ async fn exercise_interrupted_cell_move(east: Option<CellStorage>, west: Option<
     let west = Cell::start_on(west, vec![MemberPool::General; 2], None, None, Some((map.clone(), "west".into()))).await;
     let (east_storage, west_storage) = (east.storage(), west.storage());
     let east_keys = east.keys();
-    let west_keys = InterruptedInstall { keys: west.keys(), failed: Default::default() };
+    let west_keys = InterruptedJournalKey { keys: west.keys(), failed: Default::default() };
     let from = admin::CellHandle { name: "east", directory: &east.directory, storage: &east_storage, keys: &east_keys, broker: None, maximum_deployments: 10 };
     let to = admin::CellHandle { name: "west", directory: &west.directory, storage: &west_storage, keys: &west_keys, broker: None, maximum_deployments: 10 };
     let (_, original) = admin::create_in_cells(map.as_ref(), std::slice::from_ref(&from), "shop", "acme", 3).await.unwrap();
@@ -3459,7 +3457,7 @@ async fn exercise_interrupted_cell_move(east: Option<CellStorage>, west: Option<
     drop(client);
 
     let move_shop = || admin::move_cell(map.as_ref(), &from, &to, "shop", 4 << 20, owner.clone());
-    assert_eq!(move_shop().await.unwrap_err().code, "test/key-install-interrupted");
+    assert_eq!(move_shop().await.unwrap_err().code, "test/journal-key-interrupted");
     let incomplete = east.directory.deployment(&original.id).await.unwrap().unwrap();
     assert_eq!(incomplete.lifecycle, Lifecycle::Moving);
     let partial = west.directory.deployment(&original.id).await.unwrap().unwrap();
@@ -3585,6 +3583,9 @@ async fn a_deployment_moves_cells_with_its_unflushed_tail_and_its_old_gateway_fo
     assert_eq!(pending.lifecycle, Lifecycle::Moving);
     assert!(pending.move_from.is_none(), "the destination recovered the tail before the route changed");
     assert!(fenced.replica_journals.is_disjoint(&pending.replica_journals));
+    let cut = &pending.cell_transfer_replay.as_ref().unwrap().replica;
+    assert_eq!((cut.after, cut.through), (pending.checkpoint.unwrap().boundary, through));
+    assert!(cut.debt.is_none());
     let replay = admin::audit(west.directory.as_ref(), &west_keys, "shop", 4 << 20).await.unwrap();
     assert!(replay.transactions >= 2 && replay.violations.is_empty());
     assert_eq!(pending.replica_anchor.as_deref(), Some(&anchor));
@@ -3596,10 +3597,10 @@ async fn a_deployment_moves_cells_with_its_unflushed_tail_and_its_old_gateway_fo
         write_quorum: rtdb_multi::deployment::write_quorum(servers.len()), servers, stream: stream.clone(), maximum_message_bytes: 4 << 20,
     };
     let prefix = rtdb_logkeeper::JournalDigest::from_digest_bytes(stream, anchor.interval, anchor.digest);
-    assert_eq!(
-        rtdb_logkeeper::certify_committed_prefix(&config, through, Some(&prefix)).await.unwrap().digest,
-        preceding,
-    );
+    assert_eq!(replay.replica_interval.map(|[_, end]| end), Some(through));
+    let resealed = rtdb_logkeeper::certify_committed_prefix(&config, through, Some(&prefix)).await.unwrap();
+    assert_eq!(replay.replica_continued_digest.as_deref(), Some(resealed.digest.as_str()));
+    assert_ne!(resealed.digest, preceding);
 
     let arrived = admin::move_cell(map.as_ref(), &source, &destination, "shop", 4 << 20, None).await.unwrap();
     assert_eq!(arrived.epoch, fenced.epoch);
@@ -3785,20 +3786,26 @@ async fn hosted_search_rebuilds_after_trim_and_loss_of_postings_and_all_source_t
         client.simple_query(&format!("INSERT INTO docs RECORDS {{_id: {id}, body: '{body}'}}")).await.unwrap();
         cell.node(0).agent.flush("shop").await.unwrap();
     }
+    let source_checkpoint = cell.directory.deployment_by_name("shop").await.unwrap().unwrap().checkpoint.unwrap();
     let database = cell.node(0).server.node().catalog().database("shop").unwrap();
     database.compaction().unwrap().compact_all().await.unwrap();
     client.simple_query("INSERT INTO checkpoint_marker (_id) VALUES (1)").await.unwrap();
     cell.node(0).agent.flush("shop").await.unwrap();
+    let mut latest = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
     let record = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            let record = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
-            if record.replica_anchor.as_ref().is_some_and(|anchor| anchor.interval[1] == record.checkpoint.unwrap().boundary - 1) {
-                break record;
+            if latest.checkpoint.is_some_and(|checkpoint| checkpoint.block > source_checkpoint.block)
+                && latest.replica_anchor.as_ref().is_some_and(|anchor| anchor.interval[1] >= source_checkpoint.boundary)
+            {
+                break latest.clone();
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
+            latest = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
         }
-    }).await.unwrap();
+    }).await.unwrap_or_else(|_| panic!("checkpoint covering the original search events was not trimmed: source {source_checkpoint:?}, latest {:?}, anchor {:?}, certified limit {:?}",
+        latest.checkpoint, latest.replica_anchor, checkpoint_trim_limit(&latest)));
     let checkpoint = record.checkpoint.unwrap();
+    let trim_through = record.replica_anchor.as_ref().unwrap().interval[1];
     let members = cell.directory.members().await.unwrap().into_iter()
         .map(|member| (member.id, member.address)).collect::<BTreeMap<_, _>>();
     let reader = rtdb_logkeeper::open_reader(rtdb_logkeeper::StreamConfig {
@@ -3809,7 +3816,7 @@ async fn hosted_search_rebuilds_after_trim_and_loss_of_postings_and_all_source_t
     }, Default::default()).await.unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if reader.retained_floor().await.unwrap().is_some_and(|floor| floor.0 == checkpoint.boundary) {
+            if reader.retained_floor().await.unwrap().is_some_and(|floor| floor.0 == trim_through + 1) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -4889,7 +4896,7 @@ async fn exercise_conflicting_copy(managed: bool) {
     let west = Cell::start_on(None, vec![MemberPool::General; 2], None, None, Some((map.clone(), "west".into()))).await;
     let (east_storage, west_storage) = (east.storage(), west.storage());
     let east_keys = east.keys();
-    let west_keys = InterruptedInstall { keys: west.keys(), failed: Default::default() };
+    let west_keys = InterruptedJournalKey { keys: west.keys(), failed: Default::default() };
     let from = admin::CellHandle { name: "east", directory: &east.directory, storage: &east_storage, keys: &east_keys, broker: None, maximum_deployments: 10 };
     let to = admin::CellHandle { name: "west", directory: &west.directory, storage: &west_storage, keys: &west_keys, broker: None, maximum_deployments: 10 };
     let (_, original) = admin::create_in_cells(map.as_ref(), std::slice::from_ref(&from), "shop", "acme", 3).await.unwrap();
@@ -4919,7 +4926,7 @@ async fn exercise_conflicting_copy(managed: bool) {
     } else {
         admin::move_cell(map.as_ref(), &from, &to, "shop", 4 << 20, None).await.map(drop)
     };
-    assert_eq!(interrupted.unwrap_err().code, "test/key-install-interrupted");
+    assert_eq!(interrupted.unwrap_err().code, "test/journal-key-interrupted");
     let partial = west.directory.deployment(&original.id).await.unwrap().unwrap();
     let first = partial.cell_transfer.as_ref().unwrap().attempt.clone().unwrap();
     assert_eq!(first.ordinal, 1);
@@ -5033,7 +5040,7 @@ async fn exercise_interrupted_replacement(case: Replacement) {
     let west = Cell::start_on(None, vec![MemberPool::General], None, None, Some((map.clone(), "west".into()))).await;
     let (east_storage, west_storage) = (east.storage(), west.storage());
     let east_keys = east.keys();
-    let west_keys = InterruptedInstall { keys: west.keys(), failed: Default::default() };
+    let west_keys = InterruptedJournalKey { keys: west.keys(), failed: Default::default() };
     let from = admin::CellHandle { name: "east", directory: &east.directory, storage: &east_storage, keys: &east_keys, broker: None, maximum_deployments: 10 };
     let to = admin::CellHandle { name: "west", directory: &west.directory, storage: &west_storage, keys: &west_keys, broker: None, maximum_deployments: 10 };
     let (_, original) = admin::create_in_cells(map.as_ref(), std::slice::from_ref(&from), "shop", "acme", 3).await.unwrap();
@@ -5045,7 +5052,7 @@ async fn exercise_interrupted_replacement(case: Replacement) {
     let id = original.id.clone();
     let move_shop = || admin::move_cell(map.as_ref(), &from, &to, "shop", 4 << 20, None);
 
-    assert_eq!(move_shop().await.unwrap_err().code, "test/key-install-interrupted");
+    assert_eq!(move_shop().await.unwrap_err().code, "test/journal-key-interrupted");
     let partial = west.directory.deployment(&id).await.unwrap().unwrap();
     let first = partial.storage_generation.unwrap();
     let CellStorage::Local { root } = &west_storage else { panic!("a disposable local fixture") };

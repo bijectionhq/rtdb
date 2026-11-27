@@ -1486,6 +1486,7 @@ async fn prepare_cell_move(
             .map_or_else(uuid::Uuid::new_v4, |attempt| attempt.generation));
         staged.abandoned_generations.clear();
         staged.transfer_replay_namespace = None;
+        staged.cell_transfer_replay = None;
         staged.recovery_manifest_sha256 = None;
         staged.checkpoint_decision = None;
         staged.storage_namespaces = Some(target_binding);
@@ -1563,7 +1564,7 @@ async fn prepare_cell_move(
     await_storage_drain(from.directory.as_ref(), from.storage, from.keys, &source).await?;
     let mut source = source;
     let mut replaced = false;
-    loop {
+    let catalog = loop {
         let closed = staged.storage_generation.is_some_and(|generation| staged.abandoned_generations.contains_key(&generation));
         if closed && !replaced {
             // An earlier invocation closed this attempt before selecting its successor.
@@ -1576,18 +1577,18 @@ async fn prepare_cell_move(
         let staging = crate::store::with_source_lineage(from.directory.as_ref(), hosted_lineage, hosted_task.as_ref(),
             Box::pin(stage_cell_storage(from, to, &source, &staged, hosted_task.clone()))).await;
         match staging {
-            Ok(()) => break,
+            Ok(catalog) => break catalog,
             Err(error) if !replaced && cell_attempts::is_conflicting_copy(&error, &staged) => {
                 (source, staged) = cell_attempts::replace(from, to, &source, &staged).await?;
                 replaced = true;
             }
             Err(error) => return Err(error),
         }
-    }
+    };
 
     target_stream.stream = staged.stream("replica");
-    crate::archive::reseal_live_journal(
-        from, &source, &source_stream, to, &staged, &target_stream, hosted_task.as_ref(),
+    let replay = crate::archive::reseal_live_journal(
+        from, &source, &source_stream, to, &staged, &target_stream, catalog.as_ref(), hosted_task.as_ref(),
     ).await?;
     let prepared = update_installation(to.directory.as_ref(), &staged.id, |record| {
         if !same_cell_move(record, &staged) || record.lifecycle != Lifecycle::Moving || record.epoch != staged.epoch
@@ -1600,6 +1601,8 @@ async fn prepare_cell_move(
             return Err(conflict());
         }
         require_storage_drained(record)?;
+        if record.cell_transfer_replay.as_deref().is_some_and(|prior| prior != &replay) { return Err(conflict()); }
+        record.cell_transfer_replay = Some(Box::new(replay.clone()));
         record.move_from = None;
         Ok(())
     }).await?;
@@ -1621,7 +1624,7 @@ async fn stage_cell_storage(
     source: &DeploymentRecord,
     staged: &DeploymentRecord,
     hosted_task: Option<rtdb_directory::HostedTask>,
-) -> Result<()> {
+) -> Result<Option<BlockCatalog>> {
     use rtdb_directory::StorageRegion;
     use rtdb_storage::IoRegion;
     let local = matches!(to.storage, CellStorage::Local { .. });
@@ -1654,12 +1657,22 @@ async fn stage_cell_storage(
         to.keys.key(&staged.key_id()).await?;
         let source_cipher = crate::store::directory_publications(from.keys, source, Arc::clone(&io))?;
         let destination_cipher = crate::store::directory_publications(to.keys, staged, Arc::clone(&io))?;
+        let destination_origin = crate::keys::UnitScope::publication_origin(&staged.storage_prefix());
+        let open_source = async |name: &ObjectKey, body: bytes::Bytes| source_cipher.open(name, body).await;
+        let open_destination = async |name: &ObjectKey, body: bytes::Bytes| {
+            if !rtdb_types::ServingPublication::from_prefix(&body).is_some_and(|unit| unit.origin == destination_origin) {
+                return Err(rtdb_storage::Error::ConflictingObject(name.to_string()));
+            }
+            destination_cipher.open(name, body).await
+        };
         let reseal_member = async |name: &ObjectKey, body: bytes::Bytes| {
-            let plaintext = source_cipher.open(name, body).await?;
+            let plaintext = open_source(name, body).await?;
             destination_cipher.seal(name, plaintext).await
         };
+        let is_garbage_record = |name: &ObjectKey| name.as_str().strip_prefix(crate::store::GARBAGE_DIRECTORY)
+            .is_some_and(|path| path.starts_with('/'));
         let reseal = async |name: &ObjectKey, body: bytes::Bytes| {
-            if name.as_str().strip_prefix(crate::store::GARBAGE_DIRECTORY).is_some_and(|path| path.starts_with('/')) {
+            if is_garbage_record(name) {
                 return Ok(body);
             }
             if crate::packing::is_pack_key(name.as_str()) {
@@ -1668,10 +1681,28 @@ async fn stage_cell_storage(
                 reseal_member(name, body).await
             }
         };
+        let matches = async |name: &ObjectKey, source: bytes::Bytes, existing: bytes::Bytes| {
+            use rtdb_storage::Error;
+
+            if is_garbage_record(name) {
+                return Ok(source == existing);
+            }
+            let (expected, observed) = if crate::packing::is_pack_key(name.as_str()) {
+                (crate::packing::reseal_pack(name, source, &open_source).await?,
+                 crate::packing::reseal_pack(name, existing, &open_destination).await)
+            } else {
+                (open_source(name, source).await?, open_destination(name, existing).await)
+            };
+            match observed {
+                Ok(plaintext) => Ok(plaintext == expected),
+                Err(Error::ConflictingObject(_) | Error::InvalidKey(_) | Error::Task(_)) => Ok(false),
+                Err(error) => Err(error),
+            }
+        };
         let source_bucket = from.storage.bucket(io.clone()).await?;
         let target_bucket = to.storage.bucket(io.clone()).await?;
         crate::reference::materialize(
-            source_bucket.as_ref(), &source.storage_prefix(), target_bucket.as_ref(), &staged.storage_prefix(), reseal,
+            source_bucket.as_ref(), &source.storage_prefix(), target_bucket.as_ref(), &staged.storage_prefix(), reseal, matches,
         ).await?;
         Box::pin(crate::archive::materialize_serving_archive(
             from.directory.as_ref(), from.keys, source, staged, target_bucket.clone(), &destination_cipher, hosted_task.as_ref(),
@@ -1679,8 +1710,7 @@ async fn stage_cell_storage(
         if let Some(checkpoint) = staged.checkpoint {
             crate::reference::verify_block_pack(target_bucket.as_ref(), &staged.storage_prefix(), checkpoint.block).await?;
         }
-        Box::pin(crate::archive::verify_cell_move_checkpoint(staged, target_bucket, &destination_cipher)).await?;
-        Ok(())
+        Box::pin(crate::archive::verify_cell_move_checkpoint(staged, target_bucket, &destination_cipher)).await
     }.await;
     io.close_and_wait().await;
     drop(io);

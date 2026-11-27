@@ -633,14 +633,29 @@ async fn copy_in(bucket: &dyn ObjectStore, from: &str, to: &str, expected: Optio
     }
 }
 
-/// An earlier attempt can leave objects in the target. Only identical bytes
-/// satisfy a retry, and a concurrent create remains conditional in the store.
-async fn stage_object(bucket: &dyn ObjectStore, key: &ObjectKey, bytes: Bytes) -> Result<()> {
-    match bucket.get(key).await {
-        Ok(existing) if existing == bytes => Ok(()),
-        Ok(_) => Err(Error::ConflictingObject(key.to_string()).into()),
-        Err(Error::MissingObject(_)) => bucket.put(key, bytes).await.map_err(storage),
-        Err(error) => Err(error.into()),
+async fn stage_object(
+    bucket: &dyn ObjectStore, target: &ObjectKey, name: &ObjectKey, source: Bytes,
+    reseal: &impl AsyncFn(&ObjectKey, Bytes) -> rtdb_storage::Result<Bytes>,
+    matches: &impl AsyncFn(&ObjectKey, Bytes, Bytes) -> rtdb_storage::Result<bool>,
+) -> Result<()> {
+    let existing = match bucket.get_fresh(target).await {
+        Ok(existing) => existing,
+        Err(Error::MissingObject(_)) => {
+            let bytes = reseal(name, source.clone()).await?;
+            match bucket.put(target, bytes).await {
+                Err(conflict @ Error::ConflictingObject(_)) => match bucket.get_fresh(target).await {
+                    Err(Error::MissingObject(_)) => return Err(conflict.into()),
+                    existing => existing?,
+                },
+                result => return result.map_err(storage),
+            }
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if matches(name, source, existing).await? {
+        Ok(())
+    } else {
+        Err(Error::ConflictingObject(target.to_string()).into())
     }
 }
 
@@ -674,6 +689,7 @@ async fn read_transfer_source(
 pub(crate) async fn materialize(
     from_bucket: &dyn ObjectStore, from: &str, to_bucket: &dyn ObjectStore, to: &str,
     reseal: impl AsyncFn(&ObjectKey, Bytes) -> rtdb_storage::Result<Bytes>,
+    matches: impl AsyncFn(&ObjectKey, Bytes, Bytes) -> rtdb_storage::Result<bool>,
 ) -> Result<()> {
     for store in stores(from_bucket, from).await? {
         let version = store.rsplit('/').next().expect("a store has a version").to_owned();
@@ -685,8 +701,7 @@ pub(crate) async fn materialize(
             let source = key(&format!("{store}/{name}"))?;
             let destination = key(&format!("{target}/{name}"))?;
             let bytes = read_transfer_source(from_bucket, &source, None).await?;
-            let bytes = reseal(&key(name)?, bytes).await?;
-            stage_object(to_bucket, &destination, bytes).await?;
+            stage_object(to_bucket, &destination, &key(name)?, bytes, &reseal, &matches).await?;
         }
         for (name, owner) in &base.objects {
             if own.contains(name) || crate::store::stays_in_source_residence(name) { continue; }
@@ -701,8 +716,7 @@ pub(crate) async fn materialize(
                 },
                 result => result?,
             };
-            let bytes = reseal(&key(name)?, bytes).await?;
-            stage_object(to_bucket, &destination, bytes).await?;
+            stage_object(to_bucket, &destination, &key(name)?, bytes, &reseal, &matches).await?;
         }
     }
     Ok(())
@@ -714,7 +728,11 @@ pub async fn simulate_materialize(
     from_bucket: &rtdb_storage::MemoryStore, from: &str,
     to_bucket: &rtdb_storage::MemoryStore, to: &str,
 ) -> Result<()> {
-    materialize(from_bucket, from, to_bucket, to, async |_, bytes| Ok(bytes)).await
+    materialize(from_bucket, from, to_bucket, to, async |_, bytes| Ok(bytes), same_bytes).await
+}
+
+async fn same_bytes(_: &ObjectKey, source: Bytes, existing: Bytes) -> rtdb_storage::Result<bool> {
+    Ok(source == existing)
 }
 
 #[cfg(test)]
@@ -853,7 +871,7 @@ mod tests {
             copy: key("child/v06/row").unwrap(),
             transferred: Default::default(),
         };
-        materialize(&transferring, "child", there.as_ref(), "arrived", unchanged).await.unwrap();
+        materialize(&transferring, "child", there.as_ref(), "arrived", unchanged, same_bytes).await.unwrap();
         assert_eq!(there.get(&key("arrived/v06/row").unwrap()).await.unwrap().as_ref(), b"parent");
         assert!(!holds(here.as_ref(), "parent/v06", "row").await.unwrap());
     }
@@ -864,7 +882,7 @@ mod tests {
         put(&here, "parent/v06/row", b"parent").await;
         simulate_fork(here.as_ref(), "parent", "child", None).await.unwrap();
         here.delete(&key("parent/v06/row").unwrap()).await.unwrap();
-        assert!(materialize(here.as_ref(), "child", there.as_ref(), "arrived", unchanged).await.is_err());
+        assert!(materialize(here.as_ref(), "child", there.as_ref(), "arrived", unchanged, same_bytes).await.is_err());
     }
 
     #[tokio::test]
@@ -872,10 +890,10 @@ mod tests {
         let (here, there) = (bucket(), bucket());
         put(&here, "source/v06/blocks/b00", b"accepted").await;
         put(&there, "target/v06/blocks/b00", b"substitute").await;
-        assert!(materialize(here.as_ref(), "source", there.as_ref(), "target", unchanged).await.is_err());
+        assert!(materialize(here.as_ref(), "source", there.as_ref(), "target", unchanged, same_bytes).await.is_err());
         there.delete(&key("target/v06/blocks/b00").unwrap()).await.unwrap();
-        materialize(here.as_ref(), "source", there.as_ref(), "target", unchanged).await.unwrap();
-        materialize(here.as_ref(), "source", there.as_ref(), "target", unchanged).await.unwrap();
+        materialize(here.as_ref(), "source", there.as_ref(), "target", unchanged, same_bytes).await.unwrap();
+        materialize(here.as_ref(), "source", there.as_ref(), "target", unchanged, same_bytes).await.unwrap();
     }
 
     #[tokio::test]
@@ -899,7 +917,7 @@ mod tests {
         simulate_fork(here.as_ref(), "source", "child", None).await.unwrap();
         let base = Base::load(here.as_ref(), "child/v06").await.unwrap();
         assert_eq!(base.objects.into_keys().collect::<Vec<_>>(), ["blocks/b00"]);
-        materialize(here.as_ref(), "source", there.as_ref(), "target", unchanged).await.unwrap();
+        materialize(here.as_ref(), "source", there.as_ref(), "target", unchanged, same_bytes).await.unwrap();
         assert_eq!(physical_objects(there.as_ref(), "target/v06").await.unwrap(), ["blocks/b00"]);
     }
 
@@ -910,7 +928,7 @@ mod tests {
         put(&here, &format!("p/v06/{}", crate::store::ROOT_MARKER), b"p").await;
         simulate_fork(here.as_ref(), "p", "c", None).await.unwrap();
         put(&here, "c/v06/blocks/b01", b"child").await;
-        materialize(here.as_ref(), "c", there.as_ref(), "c", unchanged).await.unwrap();
+        materialize(here.as_ref(), "c", there.as_ref(), "c", unchanged, same_bytes).await.unwrap();
         let mut moved = physical_objects(there.as_ref(), "c/v06").await.unwrap();
         moved.sort();
         assert_eq!(moved, ["blocks/b00", "blocks/b01"]);

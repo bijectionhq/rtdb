@@ -3944,11 +3944,13 @@ rule BeginCellMove {
     -- The source and target have distinct object and key namespaces.
     -- Each cell's object namespace lies outside the other's cleanup prefix for the deployment.
     -- A retry holds the original source fence and resumes the registered destination prefix.
+    -- A retry authenticates existing destination publications and compares their plaintext to the source before reusing them.
     -- The source selects one copy attempt at a time, binding its destination generation and namespaces, selected checkpoint, sealed source journals, and route intent.
     -- A copy that meets conflicting immutable bytes closes its staging attempt, waits until the attempt's admitted writes and uploads are accounted for, and continues in a fresh generation selected by the source.
     -- The destination follows only the successor of the attempt it closed, and retains each closed generation until the provider shows its exact prefix empty, on remote storage again after the scoped write horizon from the first empty observation.
     -- A replacement is triggered only by conflicting bytes found under the destination generation's own prefix.
     -- A prepared attempt is never closed, and only its own receipt can activate it.
+    -- The prepared destination retains the exact certified replica cut, source progress and outstanding receiver reservation for replay in the new residence.
     -- A record staged before attempts were recorded continues as attempt zero.
     -- A source whose selected replay archive still overlays unframed original members reports the envelope mismatch before fencing.
     -- Only the attempt recorded as prepared can be published.

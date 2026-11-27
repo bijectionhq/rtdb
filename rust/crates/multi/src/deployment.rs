@@ -327,6 +327,11 @@ pub fn database_config(record: &DeploymentRecord, servers: Vec<JournalEndpoint>,
 
 /// The configuration a holder opens `record` with when it moves the stream from `previous_servers` to `servers`.
 pub fn moving_config(record: &DeploymentRecord, servers: Vec<JournalEndpoint>, previous_servers: Option<Vec<JournalEndpoint>>, storage: &CellStorage, role: Role) -> DatabaseConfig {
+    let transfer = record.cell_transfer_replay.as_deref().map(|replay| (replay.source_through, replay.replica.clone()))
+        .or_else(|| record.checkpoint_transfer_activation.as_deref().map(|activation| {
+            let terminal = &activation.replica.bootstrap.terminal;
+            (terminal.source_through, terminal.placed_transfer())
+        }));
     let log = LogkeeperLogConfig {
         write_quorum: write_quorum(servers.len()),
         servers,
@@ -338,16 +343,13 @@ pub fn moving_config(record: &DeploymentRecord, servers: Vec<JournalEndpoint>, p
         require_read_index: record.linearizable_reads && matches!(role, Role::Holder | Role::Subscriber | Role::Compactor),
         placed_receipt_retirement: record.placed_receipt_retirement,
         log_epoch: record.log_epoch,
-        transferred_source_through: record.checkpoint_transfer_activation.as_deref().map(|activation| {
-            let terminal = activation.replica.bootstrap.terminal.source_through;
-            record.checkpoint.map_or(terminal, |checkpoint| terminal.max(checkpoint.source))
+        transferred_source_through: transfer.as_ref().map(|(source, _)| {
+            record.checkpoint.map_or(*source, |checkpoint| (*source).max(checkpoint.source))
         }),
-        transfer_intake_cut: record.checkpoint_transfer_activation.as_deref().map(|activation| {
-            let terminal = &activation.replica.bootstrap.terminal;
-            TransferIntakeCut { replica_through: terminal.replica_through, source_through: terminal.source_through }
+        transfer_intake_cut: transfer.as_ref().map(|(source, replica)| {
+            TransferIntakeCut { replica_through: replica.through, source_through: *source }
         }),
-        placed_transfer: record.checkpoint_transfer_activation.as_ref()
-            .map(|activation| activation.replica.bootstrap.terminal.placed_transfer()),
+        placed_transfer: transfer.map(|(_, replica)| replica),
         frozen_at: match role { Role::Snapshot(checkpoint) => Some(checkpoint), _ => None },
         previous_servers,
     };
