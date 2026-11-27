@@ -1,9 +1,7 @@
 # RTDB and upstream XTDB: deliberate design divergences
 
-This document lists the remaining deliberate divergences between RTDB (`rust/crates/*`) and upstream XTDB (`0b9fa440f2`).
-Divergences that have been closed to match upstream XTDB are omitted.
+This document describes deliberate design differences between RTDB (`rust/crates/*`) and upstream XTDB at `0b9fa440f2`.
 Classic assigns strictly increasing system times as XTDB does, advancing the previous time by one microsecond when the automatic time stalls and rejecting supplied times at or before the head.
-Plain SQL snapshot tokens name those times using XTDB's `TimeBasis` format.
 
 Path abbreviations:
 
@@ -355,7 +353,8 @@ RTDB deliberately accepts several SQL extensions that upstream rejects:
 - `COPY (query) TO STDOUT WITH (FORMAT 'arrow-stream')` (plus a `/* rtdb-history-label-dictionary-v1 */` variant);
 - scalar subqueries in `UPDATE ... SET`;
 - internal helpers `epoch_nanos_be` and `_id_eq_any`.
-In addition, `RECORDS` emits columns in first-seen key order rather than hash-set iteration order, and constructs where upstream crashes with raw JVM exceptions (unsupported window forms, `MIN`/`MAX` on decimal or time, `SUM` on `i8`/`i16`, set equality) return structured `Unsupported` errors (`xtdb/sql-unsupported`).
+`RECORDS` emits columns in first-seen key order.
+Unsupported window forms return a structured `xtdb/sql-unsupported` error.
 
 **Why.**
 The extensions expose RTDB's secondary indexes, Arrow streaming export, and typed table declarations while keeping standard XTDB SQL rejections intact.
@@ -363,7 +362,8 @@ Deterministic `RECORDS` column ordering and structured `Unsupported` errors avoi
 
 **What a user sees.**
 Queries using these extensions run on RTDB but fail with parse or planning errors on upstream XTDB.
-Unsupported constructs return clean `0A000` errors instead of JVM `UnsupportedOperationException` traces, and `RECORDS` output columns appear in deterministic first-seen order.
+Unsupported window forms use SQLSTATE `0A000`.
+`RECORDS` output columns appear in first-seen order.
 
 **Where in the code.**
 - `RC/sql/src/dialect.rs`
@@ -485,16 +485,12 @@ Operators who configure `query.spillLimitBytes` get a hard cap on temporary spil
 
 **What differs.**
 Upstream XTDB compiles each expression per input vector schema into Clojure/JVM bytecode and memoises the compiled projection (`emit-projection`).
-RTDB evaluates expressions with one native column evaluator (`RC/query/src/columnar`) backed by a tree-walking scalar interpreter (`RC/expr`) over `Value`.
-There is no JIT codegen and no DataFusion fallback.
+RTDB chooses a native Arrow kernel or a scalar interpreter at expression preparation.
 A failing cell raises the scalar's own error, strict calls short-circuit on null in argument order as in XTDB, and `CASE` evaluates each branch only on its selected rows.
 
 **Why.**
-Compiling and loading machine code at query time adds large complexity and attack surface in Rust; column kernels over Arrow buffers cover hot scalar paths while the interpreter guarantees exact XTDB edge-case semantics.
-
-**What a user sees.**
-Query results and error semantics match XTDB, including null short-circuiting and `CASE` laziness.
-CPU-heavy expressions that fall outside the column kernels run slower per row than XTDB's JIT-compiled bytecode, while cold query compilation is faster.
+Arrow kernels handle supported column operations directly.
+The scalar interpreter implements operations and layouts that require cell-wise evaluation.
 
 **Where in the code.**
 - `RC/query/src/columnar.rs`
@@ -591,7 +587,7 @@ RTDB implements several core engine internals differently from XTDB while preser
 - **Live index.** Each `LiveTable` version holds a persistent `LiveRelation` of immutable Arrow `IndexBatch` chunks with stable row addresses.
   Later versions share the prefix, and readers keep their original version.
   XTDB appends to a growable in-place `Relation`.
-  RTDB's `TrieCatalog` clones its `BTreeMap` on change.
+  RTDB's trie catalog shares immutable table and block maps across catalog versions.
 - **Scan merge and temporal resolution:** `PartitionScan` runs a `BinaryHeap` k-way merge and general `HistoryResolver` polygon calculation rather than per-page `SingleIidSelector` binary search and `AsOfResolver` early exit.
 - **Metadata pruning:** leaf statistics are decoded lazily into `Value` trees (`LeafColumns`) per visited leaf and roaring bloom filters are deserialized per check rather than queried zero-copy.
 - **Value boundaries:** while system columns (`_iid`, `_valid_*`, `_system_*`) are Arrow arrays, spill uses Arrow IPC, and pgwire encodes directly from Arrow where supported, several operators (non-columnar joins, aggregates, window, set ops), DML writes (`TransactionBuffer`), Flight bulk ingest, and compaction merges (`SegmentCompactor`, running parallel jobs on `spawn_blocking`) still convert through owned `Value` / `StoredEvent` trees.
@@ -601,8 +597,8 @@ RTDB implements several core engine internals differently from XTDB while preser
 Immutable Rust data structures, cooperative async cancellation, and incremental columnarization fit Rust's ownership model without requiring unsafe shared-memory mutation.
 
 **What a user sees.**
-Query semantics match XTDB.
-Performance profiles differ: RTDB starts faster and uses less memory, while heavy joins, multi-file point lookups, non-columnar expressions, and high-throughput compaction can spend more CPU than XTDB's end-to-end vector paths.
+Snapshots retain their own live relation prefix as new writes arrive.
+The representations above affect which queries and compactions decode or copy values.
 
 **Where in the code.**
 - `RC/index/src/live.rs`
