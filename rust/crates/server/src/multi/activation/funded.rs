@@ -202,12 +202,34 @@ impl State {
 }
 
 impl ActivationAuthority {
+    pub(super) async fn readmit_funded_enrollment(
+        &self,
+        name: &str,
+        binding: Binding,
+        enrollment: Enrollment,
+        journal: Option<settlement::JournalTrust>,
+    ) -> Result<Scope> {
+        self.update_funded_enrollment(name, binding, enrollment, journal, false).await
+    }
+
+    #[cfg(test)]
     pub(super) async fn commission_funded(
         &self,
         name: &str,
         binding: Binding,
         enrollment: Enrollment,
         journal: Option<settlement::JournalTrust>,
+    ) -> Result<Scope> {
+        self.update_funded_enrollment(name, binding, enrollment, journal, true).await
+    }
+
+    async fn update_funded_enrollment(
+        &self,
+        name: &str,
+        binding: Binding,
+        enrollment: Enrollment,
+        journal: Option<settlement::JournalTrust>,
+        allow_new: bool,
     ) -> Result<Scope> {
         let stream = self.stream_id(name)?;
         if !enrollment.valid() || journal.as_ref().is_some_and(|journal| !journal.valid()) {
@@ -247,6 +269,7 @@ impl ActivationAuthority {
                         return Ok(Some(next));
                     }
                     Ok(_) => return Err(conflict()),
+                    Err(_) if !allow_new => return Err(rtdb_tx::transact::funding_kernel_unavailable()),
                     Err(index) => index,
                 };
                 if state.grants_closed
@@ -490,6 +513,31 @@ mod tests {
             .record_recovery_installation("xtdb", intent.operation, installed)
             .await
             .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn funded_enrollment_requires_the_kernel_for_new_scopes() {
+        const PRINCIPAL: &str = "urn:logkeeper:client:funded-enrollment";
+        let keepers = LocalCluster::start_independent_catalog(&[PRINCIPAL]).await.unwrap();
+        keepers.finalize_version(PRINCIPAL, CLUSTER_VERSION_CURRENT).await.unwrap();
+        let config = keepers.journal_config(8 << 20, 1 << 20);
+        let authority = open(Arc::new(keepers.journal(PRINCIPAL, &config).unwrap()), Uuid::new_v4());
+        let binding = authority.bootstrap("xtdb", Uuid::new_v4()).await.unwrap();
+        let key = Ed25519KeyPair::from_seed_unchecked(&[1; 32]).unwrap();
+        let enrollment = Enrollment {
+            issuer: Uuid::new_v4(),
+            receiver_certificate_sha256: [3; 32],
+            verification_key: key.public_key().as_ref().try_into().unwrap(),
+        };
+        let refusal = authority.readmit_funded_enrollment("xtdb", binding, enrollment, None)
+            .await.unwrap_err();
+        assert_eq!(refusal.category, AnomalyCategory::Unavailable);
+        assert_eq!(refusal.code, "rtdb/funding-kernel-unavailable");
+        assert_eq!(authority.funded_scope_page("xtdb", binding, 0).await.unwrap().total_scopes, 0);
+
+        let historical = authority.commission_funded("xtdb", binding, enrollment, None).await.unwrap();
+        let replay = authority.readmit_funded_enrollment("xtdb", binding, enrollment, None).await.unwrap();
+        assert_eq!(replay, historical);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

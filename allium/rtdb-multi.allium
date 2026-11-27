@@ -480,6 +480,14 @@ contract KernelFundedAdmission {
         -- Binding the slot to a delivery orders the matching obligation and once identity in the Kernel's inbox commit.
         -- RTDB orders and seals the store append for the offered slot, and provides physical commitment evidence at the exact journal cut.
 
+    @invariant StandaloneAdmission
+        -- Ordinary reads, writes, recovery and ordered clock slots remain available independently of the Kernel.
+        -- A live funded call without a reachable Kernel fails at admission with Unavailable and rtdb/funding-kernel-unavailable.
+        -- A refused call never enters the write queue and cannot fall through to an ordinary transaction.
+        -- A clock certificate and a managed workload grant authenticate clock evidence and workload scope respectively.
+        -- The standalone deployment probe returns the typed refusal and the RTDB v1 capabilities omit the legacy funded actions.
+        -- The authenticated historical receipt route can read back the exact original retired DecisionClock request and keyed status.
+
     @invariant RecoveryUsesKernelFates
         -- Recovery retains the original Kernel scope and ordered store cut through custody and readmission.
         -- The Kernel reconciles inherited bookings through its task and obligation fates and reads completed work by original call identity.
@@ -490,13 +498,14 @@ contract KernelFundedAdmission {
 
 contract SignedFundedReceiptImport {
     -- The existing RTDB recovery protocol for previously enrolled signed receipt scopes.
-    @invariant IssuerOwnsBooking
-        -- Commissioning enrolls an original booking issuer for an exact activation authority, database name, serving binding and receiver certificate.
+    @invariant RetainedIssuerBooking
+        -- A historical import enrollment identifies its original issuer, activation authority, database, serving binding and receiver certificate.
+        -- The operator may replay an existing enrollment and supply its missing journal trust before recovery.
+        -- A new issuer scope receives the missing-Kernel refusal and never joins the retained roster.
         -- The activation authority retains the complete roster of issuer and certificate scopes enrolled for that binding through recovery, including scopes closed before certificate rotation.
-        -- The issuer authorizes the start of a funded command under its open commissioned scope.
-        -- The issuer durably orders each booking before returning its receipt or authorizing its accepting appends.
+        -- For each imported booking, the original issuer ordered it before returning its receipt or authorizing its accepting appends.
         -- The booking carries the original receipt namespace, idempotency key, authenticated owner, predecessor basis, canonical request or appointment intent digest, and exclusive decision and journal cutoffs.
-        -- The issuer authorizes a new accepting append only before its exclusive decision cutoff.
+        -- The original issuer's accepting-append authorizations precede its exclusive decision cutoff.
         -- Before dispatch, each accepting-append authorization durably binds the booking and stage to the exact stream, writer epoch, position, sealed payload digest, receiver certificate and exclusive journal cutoff.
         -- Exact retries recover the same booking and ordered stages, and a changed request for the same stage conflicts.
         -- The issuer authenticates booking authority, the receiver authenticates clock evidence, and the original journal quorum authenticates timed appends.

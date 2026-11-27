@@ -37,7 +37,7 @@ use workload::Family as WorkloadFamily;
 pub use custody_prepare::prepare_custody;
 pub use custody_release::{CUSTODY_RELEASE_NAMESPACE, CustodyWriterFence, TrustedCustodyAdmission, TrustedCustodyCommand, TrustedCustodyRelease};
 pub use pipeline::{Decision, Terminal, TransactPipeline, TxKey};
-pub use funding::{DECISION_CLOCK_OFFER, FundedReceipt, FundingCommand, FundingInput, funding_invalid, funding_unsupported};
+pub use funding::{DECISION_CLOCK_OFFER, FundedReceipt, FundingCommand, FundingInput, funding_invalid, funding_kernel_unavailable, funding_unsupported};
 pub use funding::appointment::{AppointmentCommand, FUNDED_APPOINTMENT, appointment_invalid, appointment_unavailable};
 use funding::{FundingDecision, resolve_funding};
 use funding::appointment::{AppointmentDecision, check_appointment_effects, resolve_appointment};

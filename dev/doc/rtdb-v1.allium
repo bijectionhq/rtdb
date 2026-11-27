@@ -284,46 +284,21 @@ surface StatelessDatabase {
         -- Classic receipt read-through fingerprints the complete inspected relation and returns the history at the requested physical identity.
         -- Validation evaluates requirements and guards at a fresh basis and leaves the applied position unchanged.
 
-    @guarantee FundedDecisionClock
-        -- A writer advertises transact.decision-clock-offer after installing an authenticated receiver clock, a certificate verifier and a journal provider that attests the timed original quorum.
-        -- The receiver supplies a live observation from the installed durable clock domain when the writer checks certificate expiry for advertisement.
-        -- The stock receiver verifies a bounded private challenge response over the purpose, source, domain, exact certificate digest and signed evidence digest.
-        -- The receiver authority durably orders the positive publisher epoch and sequence across replacements and signs the fresh sample within the certified clock bounds.
-        -- The installed issuer signs the exact attachment, service scope, expiry and clock margins.
-        -- The admitted predecessor belongs to that attachment even when its coordinate is projected on the wire.
-        -- A funded request lists transact.decision-clock-offer among its required capabilities.
-        -- OfferDecisionClock books the exact canonical Transact request and predecessor under the caller's existing receipt key and namespace.
-        -- A retry of that booking recovers the original seat.
-        -- Transact field 8 consumes the seat under the same request, caller and incarnation.
-        -- The original receiver lineage and the inclusive lower and exclusive upper bounds govern eligibility.
-        -- A fresh acceptance uses the booked certificate under the current receiver authority.
-        -- The advertised reading supplies transaction-relative terms.
-        -- The original-quorum append binds the receiver certificate and exclusive journal cutoff to the exact accepting record.
-        -- Receipt field 9 preserves the original offer on terminal acknowledgement and keyed recovery.
-        -- A scoped request evaluates an effect-free validation against its projected history and returns only the opaque booking and projected predecessor.
-        -- Independently identical receiver evidence and projected histories produce identical scoped outcomes.
+    @guarantee KernelFundedAdmission
+        -- RTDB v1 admits ordinary transactions under their existing requirements.
+        -- A live funded call requires a reachable Bijection Kernel for a booking from its sys.slots ledger.
+        -- Stock RTDB listeners refuse OfferDecisionClock, PrepareFundedAppointment and ActivateFundedAppointment as Unavailable with rtdb/funding-kernel-unavailable.
+        -- Transact with a legacy funding instrument or funded capability requirement is refused before entering the write queue, except for exact retired ordinary receipt readback.
+        -- RTDB v1 capabilities omit the legacy funded feature names.
+        -- Standalone ordinary Store reads, writes, recovery and ordered clock slots operate independently of live funding.
 
-    @guarantee FundedAppointment
-        -- An authenticated Original writer sees transact.funded-appointment on a route with an installed receiver and positive timed original journal capacity.
-        -- PrepareFundedAppointment reserves the native key and one absent main-branch receipt point, identified by its table, typed ID and explicit valid time.
-        -- Preparation binds the Original predecessor and business intent digest to an inert booking, the advertised reading and separate exclusive receiver and journal cutoffs.
-        -- ActivateFundedAppointment uses the same key and booking and orders the guarded control writes together before the advertised reading.
-        -- Activation requires at least two explicitly guarded control points and absence of the exact business receipt.
-        -- Final Transact field 9 supplies the booking and intent digest and requires transact.funded-appointment.
-        -- The final request requires the original activation Basis on two distinct live control points, the exact business receipt's absence and the caller's live prerequisites.
-        -- Live requirements use the authenticated decision observation, and transaction-relative terms use the advertised reading.
-        -- The selected terminal arm creates the exact business receipt point alongside its effects and settlement.
-        -- Activation and the accepting terminal each verify the original timed append proof for their exact sealed record under the retained certificate.
-        -- Each stage accepts an exact retry by canonical request, and one canonical final request can consume the active appointment.
-        -- Prepare returns the preparation Basis, and Activate and terminal Receipt field 10 return the original activation Basis and bounds.
-        -- Keyed status is pending until a terminal publishes and then returns the original terminal Basis, system time and appointment after the window closes.
-        -- An ordered exclusion at the same Original receipt point blocks later consumption while leaving the appointment's keyed status pending.
-        -- A commissioned managed call uses the same actions and wire fields under an independently authenticated v2 funded-appointment grant.
-        -- The grant binds the exact database and incarnation, current placement and namespaced ClaimWriter, one native key, one typed receipt point, the business intent and its approved funding context.
-        -- The managed call can prepare, activate, consume and recover only that appointment in its private receipt namespace.
-        -- The managed appointment route admits clear Original history and clear effects under the managed workload custody checks.
-        -- The managed writer validates any tracked read claims against the same placement and ClaimWriter binding.
-        -- Managed status returns pending before the terminal publishes and returns the exact terminal with field 10 under a current grant for the same scope.
+    @guarantee RetiredFundedReceipt
+        -- An authenticated matching owner may use original Transact field 8 for exact retired DecisionClock receipt readback.
+        -- Readback matches the retained caller, key, original booking and canonical request without ordering a write or asking the receiver for a fresh observation.
+        -- Receipt field 9 preserves the authorized original offer. Scoped responses use the projected predecessor and omit the clock numbers.
+        -- Keyed status returns historical terminal receipts under the original authorized owner or receipt namespace.
+        -- A managed funded-appointment credential can read its original keyed status for the exact current scope.
+        -- Managed status carries no appointment while pending and returns the retained terminal with Receipt field 10 after publication.
 
     @guarantee TransactionRequirements
         -- A write route that supports requirements advertises transact.requires.

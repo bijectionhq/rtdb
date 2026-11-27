@@ -471,10 +471,13 @@ Use Kernel readmission to reconcile the original obligations and expose their fa
 Let the Kernel finish its readmission writes on the selected successor store while funded calls remain fenced.
 If the original decision may be in an unavailable tail, keep it unresolved until the original commitment or exclusion is established.
 
-RTDB currently fences live funded dispatch for activation-commissioned databases.
-The existing import command can register a signed receipt scope without a Kernel, and the Object Lock qualification uses that path with a test issuer.
-Standalone and pre-Kernel deployments can start and recover ordinary RTDB state independently.
-Whether a permanently Kernel-free deployment must support live funded calls is a deployment design decision.
+Live funding requires a reachable Bijection Kernel.
+Standalone and pre-Kernel deployments admit ordinary reads, writes, recovery and ordered clock slots.
+The stock RTDB listeners refuse fresh funded requests at admission with `Unavailable` (`rtdb/funding-kernel-unavailable`) before queuing any work.
+Exact retries of retired ordinary DecisionClock receipts and keyed status remain available on the authenticated historical receipt route.
+
+The stock RTDB deployment check for a standalone listener is a legacy `OfferDecisionClock` Flight action. It returns the typed missing-Kernel refusal before using the request body. A listener serving RTDB v1 also omits the legacy funded feature names from `Capabilities`.
+The stock RTDB launchers have no live Kernel funding route. A deployment serving live funded calls must admit them through the Bijection Kernel and use RTDB's ordered store interface for the append.
 
 ### Signed funded receipt import
 
@@ -489,10 +492,10 @@ A hold on the selected checkpoint preceding a funded append keeps its timed proo
 Logkeeper accepts one checkpoint hold identity per stream and retains its terminal release record through later checkpoint replacements. [Exact checkpoint hold](https://github.com/bijectionhq/logkeeper/blob/14d7b7ec7c3d74667d95bebbe9ee143ca6eb8d98/src/stream/consensus/state/checkpoint.rs#L99-L123) [Released custody regression](https://github.com/bijectionhq/logkeeper/blob/14d7b7ec7c3d74667d95bebbe9ee143ca6eb8d98/src/stream/consensus/keeper/tests/authority.rs#L748-L761)
 Logkeeper can export a portable commitment receipt with `attest_timed_original` on immutable streams after cluster feature level 13 is finalized. The original keeper signs the commitment after a quorum read barrier. The receipt includes the original signed timing samples. Retain the receipt at the original issuer before a covering trim or retirement. Verification uses the enrolled catalog and historical keeper keys and works after the source keepers shut down. [Commitment receipt](https://github.com/bijectionhq/logkeeper/blob/0f056c0570a2a68b74991e1a45f211a280dcfc6e/src/stream/timed.rs)
 Read the complete funded scope roster from the original activation decision that closed predecessor grants, including scopes closed before certificate rotation.
-Upgrade the activation broker and serving readers to activation protocol 11 before enrolling a funded scope or resuming a pending funded handoff.
-Use the activation broker's `commission-funded` operation to enroll the original issuer's Ed25519 public key and exact receiver certificate against the current binding.
-Use `--journal-trust FILE` to pin the original catalog UUID and historical keeper public keys before the predecessor starts recovery. The file contains `catalog` and a `keepers` array of `identity` and `verification_key` entries.
-The authority orders enrollments by issuer identity and certificate digest and freezes that roster with the predecessor's grants.
+Upgrade the activation broker and serving readers to activation protocol 11 before resuming a pending historical funded handoff.
+The activation broker's `commission-funded` operation accepts exact retries of an existing historical enrollment identified by the original issuer's Ed25519 public key and exact receiver certificate on the current binding. A new enrollment receives `rtdb/funding-kernel-unavailable`.
+For an existing enrollment with no journal trust, use `--journal-trust FILE` to pin the original catalog UUID and historical keeper public keys before the predecessor starts recovery. The file contains `catalog` and a `keepers` array of `identity` and `verification_key` entries.
+The authority retains enrollments in issuer identity and certificate digest order and freezes that roster with the predecessor's grants.
 After `freeze-recovery`, page through `funded-scopes` by predecessor incarnation and revision and follow `next_offset`.
 The same lookup returns the frozen roster and recorded closures after supersession, publication, or later recoveries.
 

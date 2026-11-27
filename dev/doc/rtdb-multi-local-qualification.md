@@ -423,21 +423,13 @@ RTDB_FUNDED_TEST_OPENSSL="$OPENSSL3" cargo test --locked -p rtdb-server --featur
 The regression books with the installed loopback receiver and an uncommissioned Multi writer backed by Logkeeper.
 It reopens that history under an independent activation quorum and verifies that a funded consume leaves the original booking pending, the journal head fixed and the receiver's durable sample sequence unchanged.
 
-Qualify the exact installed route with the following cases.
+Qualify the installed profile and the standalone deployment with these cases.
 
-- Check that `transact.decision-clock-offer` appears for the matching authenticated, writable attachment with a live receiver and commissioned timed journal.
-- Remove the receiver, expire its certificate, change the domain or original source, and repeat with proof-only keeper trust, Multi FileJournal, and ordinary Default Local and Kafka profiles.
-  Confirm the funded feature is absent in each case and literal `Window` remains available on the ordinary write routes.
-- Replay an earlier challenge reply, stall an exchange, and regress the receiver's durable lineage after authority replacement.
-  Confirm the capability closes until a fresh, signed observation advances the installed lineage.
-- Rebook after offer-reply loss using the same key, transaction and predecessor.
-  Recover the original terminal and its offer with the same consume request and keyed `TxStatus` after terminal-reply loss, writer takeover, and checkpoint recovery.
-- Try a changed owner, key, request body, predecessor, receiver lineage and certificate digest.
-  Exercise a read before the decision interval, staging at its exclusive end, and original keeper durability at the exclusive journal cutoff.
-- Recover proof after keeper restart and successor sealing with a distinct writer.
-  Compare the exact original proof before and after takeover and verify that a current-quorum copy cannot satisfy it.
-- Use two scoped projected histories with the same visible state and hidden-only changes.
-  Compare the outcomes for effect-free funded guards, including recovery through `TxStatus`.
-  The funded reply carries an opaque booking and the projected predecessor with both clock numbers omitted.
+- With the certified receiver and timed journal installed, verify that the legacy funded features are absent from RTDB v1 capabilities and a fresh `OfferDecisionClock` returns `Unavailable` with `rtdb/funding-kernel-unavailable`.
+- Send a legacy funded transaction and verify that the receiver sample sequence and journal head stay at their previous positions.
+- Confirm that literal `Window` and ordinary Store reads and writes remain available. Exercise the Store's ordered clock slot independently of live funded admission.
+- For a retained original receipt, verify exact keyed `TxStatus` and ordinary DecisionClock readback before and after takeover and checkpoint recovery. A different owner, key, request or booking cannot return that receipt.
+- Replay an earlier receiver challenge reply, stall an exchange, and regress the receiver's durable lineage after authority replacement. The verifier requires a fresh signed observation that advances the installed lineage.
+- Recover proof after keeper restart and successor sealing with a distinct writer. Compare the exact original proof before and after takeover and verify that a current-quorum copy cannot satisfy it.
 
 These cases require the actual receiver and keeper mounts and remain pending local qualification.

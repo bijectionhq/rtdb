@@ -10,6 +10,107 @@ const CHANGE_IMAGE_HEADER: &str = "x-rtdb-changes-images";
 #[path = "store_purge.rs"]
 mod store_purge;
 
+fn assert_kernel_unavailable(status: Status) {
+    assert_eq!(status.code(), tonic::Code::Unavailable);
+    let detail = error(status, v1::AnomalyCategory::Unavailable, "rtdb/funding-kernel-unavailable");
+    assert!(detail.message.contains("Bijection Kernel"));
+}
+
+#[tokio::test]
+async fn without_a_kernel_funded_calls_refuse_before_serving() {
+    for store_only in [true, false] {
+        let config = FlightConfig { store_only, ..Default::default() };
+        let running = Running::start(Some("secret"), config).await;
+        let mut client = Client::connect(&running.server, Some("xtdb:secret")).await;
+        for action in [
+            "rtdb.v1.OfferDecisionClock",
+            "rtdb.v1.PrepareFundedAppointment",
+            "rtdb.v1.ActivateFundedAppointment",
+            "rtdb.owned.OfferFundedMutationClock.v1",
+        ] {
+            assert_kernel_unavailable(client.action(action, Bytes::new()).await.unwrap_err());
+        }
+        let request = v1::TransactRequest { key: vec![7; 16], ..Default::default() };
+        for funded in [
+            v1::TransactRequest {
+                require: vec!["transact.decision-clock-offer".into()],
+                ..request.clone()
+            },
+            v1::TransactRequest {
+                require: vec!["transact.funded-appointment".into()],
+                ..request.clone()
+            },
+            v1::TransactRequest {
+                require: vec!["transact.decision-clock-offer".into()],
+                decision_clock_offer: Some(vec![5; 16]),
+                ops: vec![v1::Op {
+                    op: Some(v1::op::Op::Put(v1::Put {
+                        branch: "main".into(),
+                        table: "funded_probe".into(),
+                        rows: vec![v1::Row {
+                            cells: [("_id".into(), integer_cell(1))].into(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    })),
+                }],
+                ..request.clone()
+            },
+            v1::TransactRequest {
+                funded_appointment: Some(v1::FundedAppointmentUse {
+                    booking: vec![5; 16], intent_sha256: vec![6; 32],
+                }),
+                ..request.clone()
+            },
+        ] {
+            let status = client.action("rtdb.v1.Transact", funded.encode_to_vec().into()).await.unwrap_err();
+            assert_kernel_unavailable(status);
+        }
+        if store_only {
+            let status = client.action("rtdb.v1.Transact", request.encode_to_vec().into()).await.unwrap_err();
+            assert_eq!(status.code(), tonic::Code::Unimplemented);
+        } else {
+            let reply = client.action("rtdb.v1.Capabilities", Bytes::new()).await.unwrap();
+            let capabilities = v1::CapabilitiesResponse::decode(reply[0].body.clone()).unwrap();
+            assert!(capabilities.features.iter().all(|feature| !matches!(
+                feature.as_str(), "transact.decision-clock-offer" | "transact.funded-appointment"
+            )));
+        }
+        running.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn without_a_kernel_funded_hosted_upload_refuses_after_its_prefix() {
+    let running = Running::start_with_placements(Some("secret"), FlightConfig {
+        owned_native_actions: true,
+        hosted_controls: Some(rtdb_flight_sql::HostedControlConfig {
+            owner: "xtdb".into(),
+            relations: ["bj_installation"].map(str::to_owned).into(),
+        }),
+        ..Default::default()
+    }, &["application"]).await;
+    let mut client = Client::connect_with_database(
+        &running.server, Some("xtdb:secret"), Some("application"),
+    ).await;
+    let mut prefix = 1i64.to_be_bytes().to_vec();
+    prefix.extend([7; 16]);
+    prefix.extend([0x11; 16]);
+    prefix.push(32);
+    let prefix = Bytes::from(prefix);
+
+    assert_kernel_unavailable(client.action("rtdb.owned.DecideHosted.v4", prefix.clone()).await.unwrap_err());
+    let stream = futures::stream::iter([FlightData { data_body: prefix, ..Default::default() }])
+        .chain(futures::stream::pending());
+    let mut upload = client.request(stream);
+    upload.metadata_mut().insert("x-rtdb-owned-write", "rtdb.owned.DecideHostedStream.v1".parse().unwrap());
+    let status = tokio::time::timeout(Duration::from_secs(5), client.client.do_exchange(upload))
+        .await.expect("Funded admission must complete before the client supplies controls")
+        .err().expect("A funded upload without a Kernel is refused");
+    assert_kernel_unavailable(status);
+    running.stop().await;
+}
+
 #[tokio::test]
 async fn store_reads_on_the_writer_route_request_a_new_handshake_for_an_unknown_bearer() {
     let running = Running::start_with_placements(

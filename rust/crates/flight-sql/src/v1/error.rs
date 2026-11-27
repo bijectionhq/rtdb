@@ -86,6 +86,10 @@ fn code(category: Category) -> &'static str {
     }
 }
 
+pub(crate) fn funding_kernel_unavailable() -> Status {
+    anomaly(rtdb_tx::transact::funding_kernel_unavailable())
+}
+
 pub fn anomaly(native: Anomaly) -> Status {
     as_status(detail(native))
 }
@@ -135,7 +139,7 @@ pub(super) fn detail(native: Anomaly) -> Error {
         | "rtdb.store/hold-unsupported"
         | "rtdb/default-serving-classic-history" | "rtdb/idempotency-key"
         | "rtdb/window-expired" | "rtdb/timed-transaction-refused"
-        | "rtdb/funded-appointment"
+        | "rtdb/funded-appointment" | "rtdb/funding-kernel-unavailable"
         | "rtdb/already-present" | "rtdb/count-constraint" | "rtdb/grouped-count-constraint"
         | REQUIREMENT_FAILED => {
             native.code.as_str()

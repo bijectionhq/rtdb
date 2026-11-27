@@ -3,7 +3,7 @@ use rtdb_server::{ServerDriver, config::NodeConfiguration};
 use tokio::net::TcpStream;
 
 #[tokio::test]
-async fn configured_funded_receiver_requires_a_live_host_mount() {
+async fn configured_funded_receiver_reports_that_live_funding_requires_a_kernel() {
     let config = NodeConfiguration::from_yaml_with_environment(
         r#"
 fundedReceiverClock:
@@ -16,7 +16,9 @@ fundedReceiverClock:
         false,
     ).unwrap();
     let error = ServerDriver::open(config, 128 * 1024 * 1024).await.err().unwrap();
-    assert_eq!(error.code, "rtdb.clock/installation");
+    assert_eq!(error.category, rtdb_types::AnomalyCategory::Unavailable);
+    assert_eq!(error.code, "rtdb/funding-kernel-unavailable");
+    assert!(error.message.as_deref().unwrap().contains("Bijection Kernel"));
 }
 
 #[tokio::test]

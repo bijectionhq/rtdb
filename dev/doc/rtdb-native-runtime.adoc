@@ -42,9 +42,9 @@ Applications depending on concrete JVM `Xtdb.Connection` or `RelationReader` cla
 Native buffer owners survive statement closure until the foreign consumer releases them.
 
 [[funded-decision-clock-receiver]]
-== Funded DecisionClock receiver
+== Certified receiver clock
 
-The optional native profile pairs the signed site receiver certificate with a private receiver authority.
+The optional native profile pairs the signed site receiver certificate with a private receiver authority for clock observations and historical proof verification.
 
 [source,yaml]
 ----
@@ -102,11 +102,11 @@ The keeper's separate post-fsync exchange supplies the original-quorum proof.
 The stock Multi launcher selects the configured transport when its StreamJournal has a timed-original writer limit in `RTDB_TIMED_ORIGINAL_TRUST_FILE`.
 For Default, use `ServerDriver::open_with_installed_receiver_clock` with `defaultV1Serving: true` and the installed resources, including a provider such as guarded `QuorumLog` that supplies recoverable original-quorum evidence on the same replica path.
 The existing certified openers also accept a host-supplied receiver through `NodeConfiguration::certify_receiver_clock`.
-Only an authenticated writable attachment with the matching source, live receiver and timed-original provider advertises `transact.decision-clock-offer`.
-Missing mounts, stale exchanges and unsupported journals keep the capability closed.
 An invalid installed certificate or mismatched trust pin rejects the selected profile at open.
-Ordinary Default Local and Kafka and native Multi FileJournal remain outside the funded profile.
-CUT and the receiver owner supply the commissioned receiver service and the separate qualified keeper mounts before activation.
+A standalone store can serve ordinary operations and ordered clock slots without a Kernel.
+Live funding uses the Bijection Kernel's `sys.slots` ledger. Stock RTDB listeners return the typed `rtdb/funding-kernel-unavailable` refusal for a fresh legacy funded request.
+Check that refusal with a legacy `OfferDecisionClock` Flight action during standalone deployment. On an RTDB v1 listener, confirm that `Capabilities` omits `transact.decision-clock-offer` and `transact.funded-appointment`.
+An ordinary server opener also refuses a raw `fundedReceiverClock` configuration with `rtdb/funding-kernel-unavailable`. Use the certified opener for installed clock observations.
 See link:rtdb-multi-local-qualification.md[the local qualification checklist] for the paired StreamJournal and receiver cases.
 
 == Expression equality

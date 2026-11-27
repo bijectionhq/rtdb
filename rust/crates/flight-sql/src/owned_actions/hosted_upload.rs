@@ -24,6 +24,7 @@ impl<'a> HostedUpload<'a> {
             call, input, bytes_left: MAX_UPLOAD_BODY - 4, frames_left: MAX_UPLOAD_FRAMES,
         };
         let prefix = upload.required().await?;
+        Service::hosted_decision_parts(&prefix)?;
         let controls = upload.required().await?;
         let packed = PackedGroups::receive(call, &mut upload).await?;
         if !upload.next().await?.is_empty() || upload.input.message().await?.is_some() {

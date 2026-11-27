@@ -3,10 +3,10 @@ use std::{sync::Arc, time::Duration};
 use arrow_flight::{self as flight, FlightData, sql::Any};
 use bytes::Bytes;
 use prost::{Message, Name};
-use rtdb_node::serving::{FundingSubmission, ROW_VISIBILITY, ServingDriver, ServingScope};
+use rtdb_node::serving::{ROW_VISIBILITY, ServingDriver, ServingScope};
 use rtdb_node::{Database, DatabaseAccess, SessionIdentity};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions};
-use rtdb_tx::transact::{DECISION_CLOCK_OFFER, FundedStatus, FundingCommand, PHYSICAL_ERASURE, REVIEWED_CUSTODY_PLACEMENT, ROW_CUSTODY, TIMED_TRANSACT, TRANSACT_REQUIRES};
+use rtdb_tx::transact::{DECISION_CLOCK_OFFER, FUNDED_APPOINTMENT, FundedStatus, PHYSICAL_ERASURE, REVIEWED_CUSTODY_PLACEMENT, ROW_CUSTODY, TIMED_TRANSACT, TRANSACT_REQUIRES};
 use rtdb_types::{Timestamp, rtdb_v1::{CLEAR_RANK_INPUT, RANKED_ARTEFACT_READINESS, RANKED_IVF}};
 use tonic::{Response, Status, metadata::MetadataMap};
 
@@ -48,18 +48,16 @@ const MAX_WAIT: Duration = Duration::from_secs(30);
 pub(crate) const CAPABILITIES: &str = "rtdb.v1.Capabilities";
 pub(crate) const MANAGED_CREATE: &str = "rtdb.admin.v1.CreateDeployment";
 pub(crate) const MANAGED_WORKLOAD: &str = "rtdb.v1.ManagedWorkload";
+pub(crate) const TRANSACT: &str = "rtdb.v1.Transact";
 pub(crate) const TX_STATUS: &str = "rtdb.v1.TxStatus";
 pub(crate) const OFFER_DECISION_CLOCK: &str = "rtdb.v1.OfferDecisionClock";
 pub(crate) use store::ACTIONS as STORE_ACTIONS;
-pub(crate) const ACTIONS: [&str; 9] = [
+pub(crate) const ACTIONS: [&str; 6] = [
     CAPABILITIES,
     exact_read::OPEN,
     exact_read::CLOSE,
-    "rtdb.v1.Transact",
+    TRANSACT,
     TX_STATUS,
-    OFFER_DECISION_CLOCK,
-    appointment::PREPARE,
-    appointment::ACTIVATE,
     MANAGED_WORKLOAD,
 ];
 
@@ -100,6 +98,19 @@ pub(crate) fn is_store_reader_action(name: &str) -> bool {
 
 pub(crate) fn is_action(name: &str) -> bool {
     ACTIONS.contains(&name) || store::ACTIONS.contains(&name) || name == custody::RELEASE || name == scoped_hold::ACTION || name == original_family_landing::ACTION || name == original_family_readback::ACTION || name == original_family_landing::private_replay::ACTION || name.starts_with("rtdb.admin.v1.")
+}
+
+pub(crate) fn requests_funded_offer(name: &str) -> bool {
+    matches!(name, OFFER_DECISION_CLOCK | appointment::PREPARE | appointment::ACTIVATE
+        | crate::owned_actions::OFFER_FUNDED_MUTATION_CLOCK_V1)
+}
+
+fn requires_live_funding(request: &proto::TransactRequest) -> bool {
+    request.require.iter().any(|feature| matches!(feature.as_str(), DECISION_CLOCK_OFFER | FUNDED_APPOINTMENT))
+}
+
+fn requests_funding(request: &proto::TransactRequest) -> bool {
+    request.decision_clock_offer.is_some() || request.funded_appointment.is_some() || requires_live_funding(request)
 }
 
 fn decode<M: Message + Default + Name>(bytes: Bytes) -> Result<M, Status> {
@@ -302,20 +313,6 @@ impl Service {
                         features.push(custody::SCOPED_CUSTODY.into());
                     }
                 }
-                if funding_owner(&call).is_some() && let Some(clock) = self.0.node.funded_offer_clock()
-                    && features.iter().any(|feature| feature == "transact")
-                    && (scoped || call.session.caller.principal.authorize_database(&call.database, DatabaseAccess::Write).is_ok())
-                    && let Ok(database) = self.0.node.catalog().database(&call.database)
-                    && !database.read_only()
-                    && let Some(driver) = database.serving_driver()
-                    && driver.supports_funded_transact().await
-                    && clock.funded_offers_for(driver.incarnation()).await
-                {
-                    features.push(DECISION_CLOCK_OFFER.into());
-                    if appointment::owner(&call).is_some() && driver.supports_funded_appointment().await {
-                        features.push(rtdb_tx::transact::FUNDED_APPOINTMENT.into());
-                    }
-                }
                 Ok(proto::CapabilitiesResponse {
                     api: API.into(),
                     features,
@@ -340,20 +337,8 @@ impl Service {
             custody::RELEASE => rtdb_types::boxed(|| self.custody_release_action(&call, &action.body)).await,
             original_family_landing::ACTION => rtdb_types::boxed(|| self.original_family_landing(&call, &action.body)).await,
             original_family_landing::private_replay::ACTION => rtdb_types::boxed(|| self.original_private_replay(&call, &action.body)).await,
-            OFFER_DECISION_CLOCK => match decode(action.body) {
-                Ok(request) => rtdb_types::boxed(|| self.v1_offer_decision_clock(&call, request)).await,
-                Err(status) => Err(status),
-            },
-            appointment::PREPARE => match decode(action.body) {
-                Ok(request) => rtdb_types::boxed(|| self.prepare_funded_appointment(&call, request)).await,
-                Err(status) => Err(status),
-            },
-            appointment::ACTIVATE => match decode(action.body) {
-                Ok(request) => rtdb_types::boxed(|| self.activate_funded_appointment(&call, request)).await,
-                Err(status) => Err(status),
-            },
             name if store::ACTIONS.contains(&name) => rtdb_types::boxed(|| self.store_action(&call, name, action.body)).await,
-            "rtdb.v1.Transact" => rtdb_types::boxed(|| self.v1_transact(&call, action.body)).await,
+            TRANSACT => rtdb_types::boxed(|| self.v1_transact(&call, action.body)).await,
             MANAGED_WORKLOAD => rtdb_types::boxed(|| self.managed_workload_action(&call, action.body)).await,
             TX_STATUS => match decode(action.body) {
                 Ok(request) => rtdb_types::boxed(|| self.v1_tx_status(&call, request)).await,
@@ -378,19 +363,28 @@ impl Service {
 
     async fn v1_transact(&self, call: &Call, source: Bytes) -> Result<Vec<u8>, Status> {
         let mut request: proto::TransactRequest = decode(source)?;
+        if self.0.config.store_only {
+            return Err(if requests_funding(&request) {
+                error::funding_kernel_unavailable()
+            } else {
+                Status::unimplemented(format!("This listener serves rtdb.store.v1, not {TRANSACT}"))
+            });
+        }
         check_key(&request.key)?;
-        if let Some(appointment) = request.funded_appointment.take() {
+        if request.funded_appointment.is_some() {
             if request.decision_clock_offer.is_some() {
                 return Err(error::incorrect("Transact may consume one funding instrument"));
             }
-            return self.consume_funded_appointment(call, request, appointment).await;
+            return Err(error::funding_kernel_unavailable());
         }
-        if appointment::is_managed(call) { return Err(appointment::denied()); }
         if let Some(booking) = request.decision_clock_offer.take() {
+            if appointment::is_managed(call) { return Err(appointment::denied()); }
             let booking = booking.as_slice().try_into().map_err(|_| error::incorrect("Invalid DecisionClock booking"))?;
-            let receipt = self.funded_transact(call, request, FundingCommand::Consume { booking }).await?;
+            let receipt = self.retry_funded_transact(call, request, booking).await?;
             return Ok(self.funded_wire_receipt(call, receipt).encode_to_vec());
         }
+        if requires_live_funding(&request) { return Err(error::funding_kernel_unavailable()); }
+        if appointment::is_managed(call) { return Err(appointment::denied()); }
         let access = if request.ops.is_empty() && request.otherwise.is_empty() {
             DatabaseAccess::Read
         } else {
@@ -416,40 +410,20 @@ impl Service {
         Ok(transact::receipt(receipt).encode_to_vec())
     }
 
-    async fn v1_offer_decision_clock(&self, call: &Call, request: proto::OfferDecisionClockRequest) -> Result<Vec<u8>, Status> {
-        let transaction = request.transaction.ok_or_else(|| error::incorrect("A DecisionClock offer requires its transaction"))?;
-        let predecessor = request.predecessor.ok_or_else(|| error::incorrect("A DecisionClock offer requires its exact predecessor"))?;
-        let predecessor = rtdb_types::rtdb_v1::Basis::from_bytes(&predecessor.value).map_err(error::anomaly)?;
-        let command = FundingCommand::Book { predecessor, booking: *uuid::Uuid::new_v4().as_bytes() };
-        let receipt = self.funded_transact(call, transaction, command).await?;
-        let offer = receipt.decision_clock.ok_or_else(|| error::unsupported(DECISION_CLOCK_OFFER))?;
-        Ok(transact::decision_clock(offer, call.session.caller.principal.label_scope().is_some()).encode_to_vec())
-    }
-
-    async fn funded_transact(
-        &self, call: &Call, request: proto::TransactRequest, command: FundingCommand,
+    async fn retry_funded_transact(
+        &self, call: &Call, request: proto::TransactRequest, booking: [u8; 16],
     ) -> Result<rtdb_tx::transact::Receipt, Status> {
-        let owner = funding_owner(call).ok_or_else(|| error::unsupported(DECISION_CLOCK_OFFER))?;
+        let owner = funding_owner(call).ok_or_else(error::funding_kernel_unavailable)?;
         let database = self.wire_attachment(call, DatabaseAccess::Write).await?;
-        let driver = database.serving_driver().ok_or_else(|| error::unsupported(DECISION_CLOCK_OFFER))?;
+        let driver = database.serving_driver().ok_or_else(error::funding_kernel_unavailable)?;
         let scope = self.serving_scope(call, driver)?;
-        let mut request = transact::request(request, call.memory())?;
+        let request = transact::request(request, call.memory())?;
         request.check_funded_shape(scope.is_some()).map_err(error::anomaly)?;
-        if let FundingCommand::Consume { booking } = command {
-            let credential = call.session.caller.principal.label_scope();
-            let namespace_at = |incarnation| credential.expect("admitted label scope").funded_receipt_namespace_at(incarnation);
-            let funding = if credential.is_some() { FundedStatus::Scoped(&namespace_at) } else { FundedStatus::Owner(owner) };
-            if let Some(receipt) = driver.retry_retired_funding(&request, booking, scope.as_ref(), funding, &call.cancellation)
-                .await.map_err(error::anomaly)?
-            {
-                self.check_attachment(call, &database)?;
-                return Ok(receipt);
-            }
-        }
-        let clock = self.0.node.funded_offer_clock().ok_or_else(|| error::unsupported(DECISION_CLOCK_OFFER))?;
-        request.request_memory = Some(call.request_reservation());
-        let receipt = driver.transact_funded(request, scope, FundingSubmission { command, owner, clock }, &call.cancellation)
-            .await.map_err(error::anomaly)?;
+        let credential = call.session.caller.principal.label_scope();
+        let namespace_at = |incarnation| credential.expect("admitted label scope").funded_receipt_namespace_at(incarnation);
+        let funding = if credential.is_some() { FundedStatus::Scoped(&namespace_at) } else { FundedStatus::Owner(owner) };
+        let receipt = driver.retry_retired_funding(&request, booking, scope.as_ref(), funding, &call.cancellation)
+            .await.map_err(error::anomaly)?.ok_or_else(error::funding_kernel_unavailable)?;
         self.check_attachment(call, &database)?;
         Ok(receipt)
     }

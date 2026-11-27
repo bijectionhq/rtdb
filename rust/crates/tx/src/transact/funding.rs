@@ -282,6 +282,14 @@ fn original_predecessor(index: &BranchIndex, predecessor: Basis, scope: Option<S
     }
 }
 
+pub fn funding_kernel_unavailable() -> Anomaly {
+    Anomaly::new(
+        rtdb_types::AnomalyCategory::Unavailable,
+        "rtdb/funding-kernel-unavailable",
+        "A reachable Bijection Kernel is required for live funding",
+    )
+}
+
 pub fn funding_unsupported() -> Anomaly {
     Anomaly::unsupported("rtdb/decision-clock-offer", "The route has no certified DecisionClock offer authority")
 }

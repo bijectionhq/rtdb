@@ -21,7 +21,7 @@ use tokio::{sync::Mutex, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::serving::{
-    ChangeGroup, ChangeOrder, ChangePage, Changes, FamilyReviewSelection, FundingSubmission, QuerySource, QueryView, ROW_VISIBILITY,
+    ChangeGroup, ChangeOrder, ChangePage, Changes, FamilyReviewSelection, QuerySource, QueryView, ROW_VISIBILITY,
     ServingDriver, ServingScope, StoreVersionHoldReply, StoreVersionHoldRequest, WorkloadReadCut, append_change_rows,
 };
 use crate::{Database, DatabaseCatalog};
@@ -845,33 +845,10 @@ impl ServingDriver for MultiServing {
         self.transact_routed(request, Some(scope), cancellation).await
     }
 
-    async fn supports_funded_transact(&self) -> bool {
-        matches!(self.access, ServingAccess::Unscoped) && self.database.lock().await.supports_funded_transact()
-    }
-
-    async fn supports_funded_appointment(&self) -> bool {
-        matches!(self.access, ServingAccess::Unscoped)
-            && self.classic_workload_fence.is_none()
-            && self.database.lock().await.supports_funded_appointment()
-    }
-
     async fn managed_appointment_ready(&self, appointment: &workload::ManagedAppointment) -> Result<bool> {
         self.require_unmanaged_effects()?;
         self.check_appointment_origin(appointment)?;
         self.database.lock().await.managed_appointment_ready(appointment).await
-    }
-
-    async fn transact_managed_appointment(
-        &self, request: Transact, appointment: workload::ManagedAppointment,
-        command: rtdb_tx::transact::AppointmentCommand, clock: Arc<dyn rtdb_tx::DecisionClock>,
-        cancellation: &CancellationToken,
-    ) -> Result<Receipt> {
-        self.require_unmanaged_effects()?;
-        self.serve(async {
-            self.check_appointment_origin(&appointment)?;
-            cancellation.run_until_cancelled(self.writes.transact_managed_appointment(request, appointment, command, clock))
-                .await.ok_or_else(interrupted)?
-        }).await
     }
 
     async fn managed_appointment_status(
@@ -882,20 +859,6 @@ impl ServingDriver for MultiServing {
             cancellation.run_until_cancelled(async {
                 self.database.lock().await.managed_appointment_status(appointment, key).await
             }).await.ok_or_else(interrupted)?
-        }).await
-    }
-
-    async fn transact_funded(
-        &self, request: Transact, scope: Option<ServingScope>, funding: FundingSubmission,
-        cancellation: &CancellationToken,
-    ) -> Result<Receipt> {
-        self.require_unmanaged_effects()?;
-        self.serve(async {
-            if self.classic_workload_fence.is_some() { return Err(workload::denied()); }
-            let scope = scope.map(|scope| (scope.labels, scope.receipt_namespace));
-            cancellation.run_until_cancelled(self.writes.transact_funded(
-                request, scope, funding.owner, funding.command, funding.clock,
-            )).await.ok_or_else(interrupted)?
         }).await
     }
 

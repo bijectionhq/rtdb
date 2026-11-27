@@ -35,6 +35,7 @@ pub const HELP: &str = "Usage: rtdb multi-activation status DATABASE AUTHORITY
        rtdb multi-activation commission-funded DATABASE --authority-socket PATH
                  --expected-incarnation UUID --expected-revision N --issuer-id UUID
                  --issuer-key HEX --receiver-certificate-sha256 HEX [--journal-trust FILE]
+                 (for an existing historical enrollment)
        rtdb multi-activation funded-scopes DATABASE --authority-socket PATH [--offset N]
                  --expected-incarnation UUID --expected-revision N
        rtdb multi-activation reconcile-funded DATABASE --authority-socket PATH [--offset N]
@@ -729,7 +730,7 @@ impl Request {
                 return ranked.outcomes(authority, &database, predecessor, None, after).await;
             }
             Action::CommissionFunded { expected, enrollment, journal } => {
-                return Ok(json!(authority.commission_funded(&database, expected, enrollment, journal).await?));
+                return Ok(json!(authority.readmit_funded_enrollment(&database, expected, enrollment, journal).await?));
             }
             Action::FundedScopes { predecessor, offset } => {
                 return Ok(json!(authority.funded_scope_page(&database, predecessor, offset).await?));

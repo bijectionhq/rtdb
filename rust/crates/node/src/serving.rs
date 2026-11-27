@@ -235,7 +235,7 @@ pub trait ServingDriver: Send + Sync {
         _command: rtdb_tx::transact::AppointmentCommand, _clock: Arc<dyn rtdb_tx::DecisionClock>,
         _cancellation: &CancellationToken,
     ) -> Result<Receipt> {
-        Err(workload::denied())
+        Err(rtdb_tx::transact::funding_kernel_unavailable())
     }
 
     async fn managed_appointment_status(
@@ -248,7 +248,7 @@ pub trait ServingDriver: Send + Sync {
         &self, _request: Transact, _scope: Option<ServingScope>, _funding: FundingSubmission,
         _cancellation: &CancellationToken,
     ) -> Result<Receipt> {
-        Err(rtdb_tx::transact::funding_unsupported())
+        Err(rtdb_tx::transact::funding_kernel_unavailable())
     }
 
     async fn apply_token_key_rotation(&self, _generation: u64, _unreadable_by: i64) -> Result<()> {

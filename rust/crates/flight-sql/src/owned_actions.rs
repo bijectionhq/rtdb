@@ -1482,24 +1482,6 @@ impl Service {
         .await
     }
 
-    pub(crate) async fn offer_funded_mutation_clock_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
-        let (slot, trailing) = self.owned_clock_slot(call, body).await?;
-        let (fingerprint, receipt) = trailing.split_first_chunk::<32>().ok_or_else(|| invalid("Missing original request fingerprint"))?;
-        let receipt = std::str::from_utf8(receipt).map_err(|_| invalid("Invalid original receipt coordinate"))?;
-        let connection = self.connection(call, &call.database).await?;
-        let native = connection.borrow().await?;
-        require_idle(&native)?;
-        let token = native.seal_funded_mutation_clock(slot, receipt, *fingerprint).map_err(status)?;
-        let bound = 56 + token.len();
-        let charge = call.reserve(bound)?;
-        let mut body = Vec::with_capacity(bound);
-        body.extend_from_slice(&slot.through.0.to_be_bytes());
-        body.extend_from_slice(&slot.reading.0.to_be_bytes());
-        body.extend_from_slice(&slot.issued.encode());
-        body.extend_from_slice(token.as_bytes());
-        Ok(ActionResult { body: wire::retain(body, charge) })
-    }
-
     async fn wait_for_clock_slot(&self, call: &Call, slot: OwnedClockSlot) -> Result<(), Status> {
         let delay = rtdb_tx::clock_slot_wait(slot.reading, self.0.node.now()).ok_or_else(Self::clock_slot_missed)?;
         if !delay.is_zero() {
@@ -1647,47 +1629,40 @@ impl Service {
             .await.map(OwnedIpcReply::into_unary)
     }
 
-    async fn decide_hosted_reply(
-        &self, call: &Call, envelope: &Bytes, input: HostedDecisionInput<'_>, ipc_stream: bool,
-        retired_enrollment: Option<&[u8]>,
-    ) -> Result<OwnedIpcReply, Status> {
-        self.hosted_control_policy(call)?;
+    fn hosted_decision_parts(envelope: &[u8]) -> Result<(rtdb_tx::HostedAuthority, u8, &[u8]), Status> {
         let (authority, body) = Self::installed_authority(envelope)?;
         let ([flags], body) = body.split_first_chunk::<1>()
             .ok_or_else(|| invalid("Missing hosted decision flags"))?;
         if *flags & !0b11_1111 != 0 || *flags & 48 == 48 {
             return Err(invalid("Invalid hosted decision flags"));
         }
-        if retired_enrollment.is_some() && *flags != 0 {
+        if *flags & 32 != 0 {
+            return Err(crate::v1::error::funding_kernel_unavailable());
+        }
+        Ok((authority, *flags, body))
+    }
+
+    async fn decide_hosted_reply(
+        &self, call: &Call, envelope: &Bytes, input: HostedDecisionInput<'_>, ipc_stream: bool,
+        retired_enrollment: Option<&[u8]>,
+    ) -> Result<OwnedIpcReply, Status> {
+        self.hosted_control_policy(call)?;
+        let (authority, flags, body) = Self::hosted_decision_parts(envelope)?;
+        if retired_enrollment.is_some() && flags != 0 {
             return Err(invalid("Retired family custody requires a Root retirement decision"));
         }
-        if matches!(input, HostedDecisionInput::Inline(HostedDecisionWire::ImportPage)) && *flags != 0 {
+        if matches!(input, HostedDecisionInput::Inline(HostedDecisionWire::ImportPage)) && flags != 0 {
             return Err(invalid("A hosted import page requires an ordinary Root decision"));
         }
-        let counted = *flags & 1 != 0;
-        let recheck_at_staging = *flags & 8 != 0;
-        let (funded, body) = if *flags & 32 != 0 {
-            let (length, body) = body.split_first_chunk::<2>().ok_or_else(|| invalid("Missing funded clock offer length"))?;
-            let length = usize::from(u16::from_be_bytes(*length));
-            if length == 0 || length > rtdb_node::MAX_FUNDED_MUTATION_CLOCK_TOKEN_BYTES {
-                return Err(invalid("Invalid funded clock offer length"));
-            }
-            let (token, body) = body.split_at_checked(length).ok_or_else(|| invalid("Truncated funded clock offer"))?;
-            let token = std::str::from_utf8(token).map_err(|_| invalid("Invalid funded clock offer"))?;
-            let connection = self.connection(call, &call.database).await?;
-            let native = connection.borrow().await?;
-            require_idle(&native)?;
-            (Some(native.open_funded_mutation_clock(token).map_err(status)?), body)
-        } else {
-            (None, body)
-        };
-        let (slot, body) = if *flags & 16 != 0 {
+        let counted = flags & 1 != 0;
+        let recheck_at_staging = flags & 8 != 0;
+        let (slot, body) = if flags & 16 != 0 {
             let (slot, body) = self.owned_clock_slot(call, body).await?;
             (Some(slot), body)
         } else {
-            (funded.as_ref().map(|offer| offer.slot), body)
+            (None, body)
         };
-        let (refusal, primary) = if *flags & 4 != 0 {
+        let (refusal, primary) = if flags & 4 != 0 {
             let (length, body) = body.split_first_chunk::<4>()
                 .ok_or_else(|| invalid("Missing hosted refusal length"))?;
             let (refusal, primary) = body.split_at_checked(u32::from_be_bytes(*length) as usize)
@@ -1696,20 +1671,20 @@ impl Service {
         } else {
             (None, body)
         };
-        let (worlds, primary) = if *flags & 0b10 != 0 {
+        let (worlds, primary) = if flags & 0b10 != 0 {
             self.hosted_world_read_prefix(call, primary)?
         } else {
             (Vec::new(), primary)
         };
         self.commit_hosted_with_reads(
-            call, envelope, primary, counted, worlds, refusal, recheck_at_staging, slot, funded.as_ref(), authority, input, ipc_stream, retired_enrollment,
+            call, envelope, primary, counted, worlds, refusal, recheck_at_staging, slot, authority, input, ipc_stream, retired_enrollment,
         ).await
     }
 
     async fn commit_hosted_with_reads(
         &self, call: &Call, envelope: &Bytes, body: &[u8], counted: bool, worlds: Vec<HostedWorldRead>,
         refusal: Option<&[u8]>, recheck_at_staging: bool, slot: Option<OwnedClockSlot>,
-        funded: Option<&rtdb_node::FundedMutationClock>, authority: rtdb_tx::HostedAuthority, input: HostedDecisionInput<'_>,
+        authority: rtdb_tx::HostedAuthority, input: HostedDecisionInput<'_>,
         ipc_stream: bool, retired_enrollment: Option<&[u8]>,
     ) -> Result<OwnedIpcReply, Status> {
         let policy = self.hosted_control_policy(call)?;
@@ -1795,18 +1770,6 @@ impl Service {
         } else {
             rtdb_tx::bind_installed_authority(&mut controls, authority).map_err(status)?;
         }
-        if let Some(offer) = funded {
-            let reading = offer.slot.reading;
-            let end = reading.0.checked_add(1_000_000).ok_or_else(Self::clock_slot_missed)?;
-            let held_seat = controls.iter().any(|control| control.is_check() && control.expected().is_some()
-                && control.table().table == "bj_fact_root_admission"
-                && matches!(control.id(), EntityId::String(id) if id == "funded_mutation_seat:v1"));
-            if deadline <= reading || journal_before.is_none_or(|cutoff| cutoff.before().0 > end)
-                || !worlds.is_empty() || !held_seat || !offer.admits_terminal(&controls)
-            {
-                return Err(invalid("Funded mutation requires the original guarded receipt and clock window"));
-            }
-        }
         let replay = rtdb_tx::hosted_replay_controls(controls.iter()).map_err(status)?.is_some();
         if replay && slot.is_some() {
             return Err(invalid("A replay cannot consume an ordered clock slot"));
@@ -1849,9 +1812,6 @@ impl Service {
             let (controls, held) = self.decode_hosted_control_groups(
                 call, &control_envelope, controls, scope, &mut rows_left, false,
             )?;
-            if funded.is_some_and(|offer| !offer.admits_terminal(&controls)) {
-                return Err(invalid("Funded mutation refusal requires the original receipt"));
-            }
             let facts = self.decode_owned_commit_groups(
                 call, envelope, facts, &mut alternative, &mut rows_left, CommitEffects::Facts,
             )?;

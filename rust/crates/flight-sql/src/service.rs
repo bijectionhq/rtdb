@@ -706,8 +706,11 @@ impl FlightService for Service {
     }
     async fn do_action(&self, request: Request<flight::Action>) -> Result<Response<Self::DoActionStream>, Status> {
         let name = request.get_ref().r#type.as_str();
+        if crate::v1::requests_funded_offer(name) {
+            return Err(crate::v1::error::funding_kernel_unavailable());
+        }
         if crate::v1::is_action(name) {
-            if self.0.config.store_only && !crate::v1::store_only_admits(name) {
+            if self.0.config.store_only && name != crate::v1::TRANSACT && !crate::v1::store_only_admits(name) {
                 return Err(Status::unimplemented(format!("This listener serves rtdb.store.v1, not {name}")));
             }
             let kind = match name {
@@ -720,7 +723,7 @@ impl FlightService for Service {
                 crate::v1::original_family_landing::ACTION => CallKind::V1OriginalFamily,
                 crate::v1::original_family_readback::ACTION => CallKind::V1OriginalFamilyReadback,
                 crate::v1::original_family_landing::private_replay::ACTION => CallKind::V1OriginalPrivateReplay,
-                crate::v1::appointment::PREPARE | crate::v1::appointment::ACTIVATE | "rtdb.v1.Transact" => CallKind::V1Appointment,
+                crate::v1::TRANSACT => CallKind::V1Appointment,
                 name if crate::v1::is_store_reader_action(name) => CallKind::StoreRead,
                 name if crate::v1::is_store_action(name) => CallKind::Store,
                 _ => CallKind::V1Action,

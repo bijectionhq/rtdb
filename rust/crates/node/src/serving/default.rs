@@ -10,7 +10,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::{At, Basi
 use tokio_util::sync::CancellationToken;
 
 use super::{ChangeGroup, ChangeOrder, ChangePage, Changes, QuerySource, QueryView, ServingDriver,
-    FundingSubmission, ServingScope, append_change_rows, ranked_ivf};
+    ServingScope, append_change_rows, ranked_ivf};
 use crate::Clock;
 
 pub(crate) struct DefaultServing {
@@ -142,29 +142,6 @@ impl ServingDriver for DefaultServing {
     fn uses_database_tokens(&self) -> bool { true }
     fn supports_query_tokens(&self) -> bool { self.handle.is_compatible() }
     fn supports_row_visibility(&self) -> bool { self.handle.is_compatible() && self.tokens.supported() }
-
-    async fn supports_funded_transact(&self) -> bool {
-        self.writable && self.handle.supports_funded_transact()
-    }
-
-    async fn supports_funded_appointment(&self) -> bool {
-        self.writable && self.handle.supports_funded_appointment()
-    }
-
-    async fn transact_funded(
-        &self, request: Transact, scope: Option<ServingScope>, funding: FundingSubmission,
-        cancellation: &CancellationToken,
-    ) -> Result<Receipt> {
-        if !self.supports_funded_transact().await { return Err(rtdb_tx::transact::funding_unsupported()); }
-        let claims = if request.claims().next().is_some() {
-            self.tokens.authority().await?.verify_claims_in(request.claims(), scope.as_ref().map(|scope| &scope.labels)).await
-        } else {
-            VerifiedClaims::default()
-        };
-        let input = rtdb_tx::transact::FundingInput::new(funding.command, funding.owner);
-        let scope = scope.map(|scope| NativeServingScope { labels: scope.labels, receipt_namespace: scope.receipt_namespace });
-        self.handle.transact_funded(request, claims, scope, input, cancellation).await
-    }
 
     fn features(&self) -> &[&str] {
         if self.handle.has_classic_read() {
