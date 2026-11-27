@@ -385,58 +385,21 @@ impl AggregateCursor {
             let bytes = batch.len.checked_mul(std::mem::size_of::<Value>().max(40)).and_then(|bytes| bytes.checked_add(field.name.len()))
                 .and_then(|bytes| bytes.checked_add(512)).ok_or_else(|| invalid("aggregate-size", "Aggregate output exceeds addressable memory"))?;
             let reservation = context.memory.reserve(bytes)?;
-            let array: arrow_array::ArrayRef = match aggregate.function {
-                AggregateFunction::Sum | AggregateFunction::Average
-                    if without_nullability(&field.data_type) == &LogicalType::Scalar(ScalarType::F64) => {
-                    let mut sums = Vec::with_capacity(batch.len);
-                    for (index, state) in states.values.iter().enumerate() {
-                        context.check_cancelled_at(index)?;
-                        let result = if aggregate.function == AggregateFunction::Average {
-                            state.average_double()
-                        } else {
-                            match state.accumulator {
-                                ScalarState::F64(value) => Some(value),
-                                ScalarState::Empty => None,
-                                _ => return Err(invalid("aggregate-input", "Expected a floating-point aggregate state")),
-                            }
-                        };
-                        sums.push(result);
-                    }
-                    Arc::new(arrow_array::Float64Array::from(sums))
-                }
-                AggregateFunction::VariancePopulation | AggregateFunction::VarianceSample
-                | AggregateFunction::StddevPopulation | AggregateFunction::StddevSample => {
-                    let mut results = Vec::with_capacity(batch.len);
-                    for (index, state) in states.values.iter().enumerate() {
-                        context.check_cancelled_at(index)?;
-                        results.push(state.variance_double(&aggregate.function));
-                    }
-                    let (column, charge) = double_results(results, reservation)?;
-                    batch.append_column(column, charge, &context.memory)?;
-                    continue;
-                }
-                _ => {
-                    let scope = self.execution.scope()?;
-                    let mut reservation = reservation;
-                    let lease = Arc::get_mut(&mut reservation).expect("Aggregate results own their reservation");
-                    let mut values = Vec::with_capacity(batch.len);
-                    for (row, state) in states.values.iter().enumerate() {
-                        context.check_cancelled_at(row)?;
-                        let value = state.finish(aggregate, types.output_type(), &scope)?;
-                        lease.grow_to(lease.bytes().checked_add(value.retained_bytes()?)
-                            .ok_or_else(|| invalid("aggregate-size", "Aggregate output exceeds addressable memory"))?)?;
-                        values.push(value);
-                        scope.reset()?;
-                    }
-                    let (column, scratch) = crate::columnar::pack_evaluated_column(&values, &context.memory)?;
-                    drop((values, reservation));
-                    batch.append_column(column, scratch, &context.memory)?;
-                    continue;
-                }
-            };
-            let logical = field.data_type.clone();
-            let field = Arc::new(rtdb_columnar::to_field(&field.name, &logical)?);
-            batch.append_column(Column::Arrow { array, field, logical: Some(logical) }, reservation, &context.memory)?;
+            let scope = self.execution.scope()?;
+            let mut reservation = reservation;
+            let lease = Arc::get_mut(&mut reservation).expect("Aggregate results own their reservation");
+            let mut values = Vec::with_capacity(batch.len);
+            for (row, state) in states.values.iter().enumerate() {
+                context.check_cancelled_at(row)?;
+                let value = state.finish(aggregate, types.output_type(), &scope)?;
+                lease.grow_to(lease.bytes().checked_add(value.retained_bytes()?)
+                    .ok_or_else(|| invalid("aggregate-size", "Aggregate output exceeds addressable memory"))?)?;
+                values.push(value);
+                scope.reset()?;
+            }
+            let (column, scratch) = crate::columnar::pack_evaluated_column(&values, &context.memory)?;
+            drop((values, reservation));
+            batch.append_column(column, scratch, &context.memory)?;
         }
         Ok(Some(batch))
     }
@@ -502,12 +465,24 @@ fn fixed_scalar_results(
         (A::Sum | A::Min | A::Max, S::I64) => numeric!(Int64Type, I64),
         (A::Sum | A::Min | A::Max, S::F32) => numeric!(Float32Type, F32),
         (A::Min | A::Max, S::F64) => numeric!(Float64Type, F64),
+        (A::Sum, S::F64) => primitive!(Float64Type, |state| match state.accumulator {
+            ScalarState::F64(sum) => Ok(Some(sum)),
+            ScalarState::Empty => Ok(None),
+            _ => Err(invalid("aggregate-input", "Expected a floating-point aggregate state")),
+        }),
+        (A::Average, S::F64) => primitive!(Float64Type, |state| Ok(state.average_double())),
+        (A::VariancePopulation | A::VarianceSample | A::StddevPopulation | A::StddevSample, S::F64) =>
+            primitive!(Float64Type, |state| Ok(state.variance_double(function))),
         (A::Min | A::Max, S::I8) => numeric!(Int8Type, I8),
         (A::Min | A::Max, S::I16) => numeric!(Int16Type, I16),
         (A::Min | A::Max, S::Time { unit: TimeUnit::Second, bit_width: 32 }) => primitive!(Time32SecondType, time32),
         (A::Min | A::Max, S::Time { unit: TimeUnit::Millisecond, bit_width: 32 }) => primitive!(Time32MillisecondType, time32),
         (A::Min | A::Max, S::Time { unit: TimeUnit::Microsecond, bit_width: 64 }) => primitive!(Time64MicrosecondType, time),
         (A::Min | A::Max, S::Time { unit: TimeUnit::Nanosecond, bit_width: 64 }) => primitive!(Time64NanosecondType, time),
+        (A::Min | A::Max, S::DateDay) => primitive!(Date32Type, |state| {
+            date_result(state, rtdb_types::DateUnit::Day)?.map(i32::try_from).transpose().map_err(|_| state_error())
+        }),
+        (A::Min | A::Max, S::DateMilli) => primitive!(Date64Type, |state| date_result(state, rtdb_types::DateUnit::Millisecond)),
         (A::Min | A::Max, S::Timestamp { unit, .. }) => match unit {
             TimeUnit::Second => primitive!(TimestampSecondType, timestamp),
             TimeUnit::Millisecond => primitive!(TimestampMillisecondType, timestamp),
@@ -547,6 +522,23 @@ fn fixed_scalar_results(
             Ok(Some((column, charge)))
         }
         _ => Ok(None),
+    }
+}
+
+fn date_result(state: &ScalarAccumulator, unit: rtdb_types::DateUnit) -> Result<Option<i64>> {
+    match &state.accumulator {
+        ScalarState::Empty => Ok(None),
+        ScalarState::TemporalExtremum(value) => Ok(Some(*value)),
+        state => {
+            if let Some(Value::Date(value)) = state.retained() {
+                match rtdb_types::CalendarDate::new(value.date(), unit).object_value()? {
+                    Value::DateDay(days) => return Ok(Some(i64::from(days))),
+                    Value::DateMilli(millis) => return Ok(Some(millis)),
+                    _ => {}
+                }
+            }
+            Err(invalid("aggregate-state", "Expected a date extremum"))
+        }
     }
 }
 
@@ -761,14 +753,35 @@ fn count_layout(data_type: &DataType) -> bool {
         | T::Utf8 | T::Binary | T::FixedSizeBinary(_))
 }
 
+fn masked_count_layout(data_type: &DataType) -> bool {
+    count_layout(data_type) || matches!(data_type,
+        DataType::Date32 | DataType::Date64 | DataType::Timestamp(..) | DataType::Duration(_)
+        | DataType::Time32(ArrowTimeUnit::Second | ArrowTimeUnit::Millisecond)
+        | DataType::Time64(ArrowTimeUnit::Microsecond | ArrowTimeUnit::Nanosecond)
+        | DataType::Decimal32(..) | DataType::Decimal64(..) | DataType::Decimal128(..) | DataType::Decimal256(..))
+}
+
+fn count_is_present(page: Rows<'_>, typed: Option<&Column>, row: usize, argument: Option<usize>) -> Result<bool> {
+    match typed {
+        Some(column) => Ok(present_column_cell(column, row)?.is_some()),
+        None => Ok(!page.is_null(row, argument)?),
+    }
+}
+
 fn accepts_typed_column(column: &Column, accepts_type: impl Fn(&DataType) -> bool) -> bool {
-    let accepts = |array: &dyn Array, field: &arrow_schema::Field, logical: Option<&LogicalType>| {
-        if !field.metadata().is_empty() || field.data_type() != array.data_type() { return false; }
-        if array.data_type() == &DataType::Null {
+    admits_reduction_column(column, |field, logical| {
+        if !field.metadata().is_empty() { return false; }
+        if field.data_type() == &DataType::Null {
             return field.is_nullable() && logical.is_none_or(|ty| *ty == LogicalType::Null);
         }
-        accepts_type(array.data_type())
+        accepts_type(field.data_type())
             && logical.is_none_or(|ty| crate::columnar::stable_read_layout(ty, field))
+    })
+}
+
+fn admits_reduction_column(column: &Column, leaf: impl Fn(&ArrowField, Option<&LogicalType>) -> bool) -> bool {
+    let accepts = |array: &dyn Array, field: &ArrowField, logical: Option<&LogicalType>| {
+        field.data_type() == array.data_type() && admits_reduction_field(field, logical, &leaf)
     };
     match column {
         Column::Arrow { array, field, logical } => accepts(array.as_ref(), field, logical.as_ref()),
@@ -777,9 +790,27 @@ fn accepts_typed_column(column: &Column, accepts_type: impl Fn(&DataType) -> boo
     }
 }
 
+fn admits_reduction_field(field: &ArrowField, logical: Option<&LogicalType>, leaf: &impl Fn(&ArrowField, Option<&LogicalType>) -> bool) -> bool {
+    if let DataType::RunEndEncoded(ends, values) = field.data_type() {
+        if !field.metadata().is_empty() || !matches!(ends.data_type(), DataType::Int16 | DataType::Int32 | DataType::Int64) {
+            return false;
+        }
+        let child_type = match logical {
+            Some(LogicalType::RunEndEncoded { value, .. }) => Some(value.as_ref()),
+            None => None,
+            _ => return false,
+        };
+        return admits_reduction_field(values, child_type, leaf);
+    }
+    leaf(field, logical)
+}
+
 fn present_column_cell(column: &Column, row: usize) -> Result<Option<(&dyn Array, usize)>> {
-    let cell = column.arrow_cell(row).ok_or_else(|| invalid("column-row", "Column row is outside its page"))?;
-    present_arrow_cell(cell)
+    Ok(present_column_position(column, row)?.map(|cell| (cell.array, cell.row)))
+}
+
+fn present_column_position(column: &Column, row: usize) -> Result<Option<ArrowCell<'_>>> {
+    present_arrow_position(column.arrow_cell(row).ok_or_else(|| invalid("column-row", "Column row is outside its page"))?)
 }
 
 fn present_column_cells(column: &Column) -> impl Iterator<Item = Result<Option<(&dyn Array, usize)>>> + '_ {
@@ -790,18 +821,16 @@ fn present_column_cells(column: &Column) -> impl Iterator<Item = Result<Option<(
     (0..).map(move |row| match &mut selected {
         Some(cells) => {
             let cell = cells.next().ok_or_else(|| invalid("column-row", "Column row is outside its page"))?;
-            present_arrow_cell(cell)
+            Ok(present_arrow_position(cell)?.map(|cell| (cell.array, cell.row)))
         }
         None => present_column_cell(column, row),
     })
 }
 
-fn present_arrow_cell<'a>(cell: Option<(&'a dyn Array, &arrow_schema::Field, Option<&LogicalType>, usize)>) -> Result<Option<(&'a dyn Array, usize)>> {
-    let Some((array, _, _, offset)) = cell else { return Ok(None); };
-    if offset >= array.len() {
-        return Err(rtdb_types::Anomaly::incorrect("rtdb/array-layout", "Arrow array and logical field layout disagree"));
-    }
-    Ok((array.data_type() != &DataType::Null && !array.is_null(offset)).then_some((array, offset)))
+fn present_arrow_position<'a>(cell: Option<(&'a dyn Array, &'a ArrowField, Option<&LogicalType>, usize)>) -> Result<Option<ArrowCell<'a>>> {
+    let Some((array, field, _, row)) = cell else { return Ok(None); };
+    let cell = ArrowCell { array, field, row }.physical()?;
+    Ok((cell.array.data_type() != &DataType::Null && !cell.array.is_null(cell.row)).then_some(cell))
 }
 
 fn same_temporal_layout(ty: &LogicalType, physical: &DataType) -> bool {
@@ -816,6 +845,8 @@ fn same_temporal_layout(ty: &LogicalType, physical: &DataType) -> bool {
         (LogicalType::Scalar(ScalarType::Time { unit, bit_width: 32 }), DataType::Time32(actual))
         | (LogicalType::Scalar(ScalarType::Time { unit, bit_width: 64 }), DataType::Time64(actual))
         | (LogicalType::Scalar(ScalarType::Duration(unit)), DataType::Duration(actual)) => matches_unit(*unit, actual),
+        (LogicalType::Scalar(ScalarType::DateDay), DataType::Date32)
+        | (LogicalType::Scalar(ScalarType::DateMilli), DataType::Date64) => true,
         _ => false,
     }
 }
@@ -826,6 +857,8 @@ fn temporal_ticks(array: &dyn Array, row: usize) -> Result<i64> {
         ($ty:ty) => { array.as_primitive_opt::<$ty>().map(|array| i64::from(array.value(row))) };
     }
     let value = match array.data_type() {
+        DataType::Date32 => ticks!(Date32Type),
+        DataType::Date64 => ticks!(Date64Type),
         DataType::Timestamp(T::Second, _) => ticks!(TimestampSecondType),
         DataType::Timestamp(T::Millisecond, _) => ticks!(TimestampMillisecondType),
         DataType::Timestamp(T::Microsecond, _) => ticks!(TimestampMicrosecondType),
@@ -884,7 +917,7 @@ impl AggregateCursor {
                     let column = &batch.columns[position];
                     let mut cells = present_column_cells(column);
                     let direct = match column {
-                        Column::Arrow { array, .. } if array.len() >= batch.len && array.data_type() != &DataType::Null => Some(array.as_ref()),
+                        Column::Arrow { array, .. } if array.len() >= batch.len && count_layout(array.data_type()) => Some(array.as_ref()),
                         _ => None,
                     };
                     for (row, group) in mapping.iter().enumerate() {
@@ -1029,9 +1062,10 @@ impl AggregateColumn {
             Accumulation::Counts(counts) => {
                 counts.ensure(group_count)?;
                 let all = aggregate.function == AggregateFunction::CountStar;
+                let typed = input.arrow_column(argument).filter(|column| accepts_typed_column(column, masked_count_layout));
                 for (row, (group, selected)) in mapping.iter().zip(&mask).enumerate() {
                     execution.context.check_cancelled_at(row)?;
-                    if *selected && (all || !input.is_null(row, argument)?) {
+                    if *selected && (all || count_is_present(input, typed, row, argument)?) {
                         counts.values[group] = counts.values[group].wrapping_add(1);
                     }
                 }
@@ -1512,9 +1546,9 @@ struct NumericColumn<'a>(&'a Column);
 
 impl<'a> NumericColumn<'a> {
     fn bind(column: &'a Column, expected: Option<&LogicalType>) -> Option<Self> {
-        let accepts = |array: &dyn Array, field: &arrow_schema::Field, logical: Option<&LogicalType>| {
-            if !field.metadata().is_empty() || field.data_type() != array.data_type() { return false; }
-            let physical = match array.data_type() {
+        let admitted = admits_reduction_column(column, |field, logical| {
+            if !field.metadata().is_empty() { return false; }
+            let physical = match field.data_type() {
                 DataType::Null => return field.is_nullable() && logical.is_none_or(|ty| *ty == LogicalType::Null),
                 DataType::Int8 => ScalarType::I8,
                 DataType::Int16 => ScalarType::I16,
@@ -1531,34 +1565,17 @@ impl<'a> NumericColumn<'a> {
             let physical = LogicalType::Scalar(physical);
             logical.is_none_or(|ty| without_nullability(ty) == &physical)
                 && expected.is_none_or(|ty| without_nullability(ty) == &physical)
-        };
-        let admitted = match column {
-            Column::Arrow { array, field, logical } => accepts(array.as_ref(), field, logical.as_ref()),
-            Column::Selected(selected) => selected.source_layouts().all(|(array, field, logical)| accepts(array, field, logical)),
-            Column::Values(_) => false,
-        };
+        });
         admitted.then_some(Self(column))
     }
 
-    fn get(&self, row: usize) -> Option<NumericCell> {
-        let (array, _, _, row) = self.0.arrow_cell(row)??;
-        if array.data_type() == &DataType::Null || array.is_null(row) { return None; }
-        macro_rules! cell {
-            ($ty:ty) => { array.as_primitive::<$ty>().value(row) };
-        }
-        Some(match array.data_type() {
-            DataType::Int8 => NumericCell::Integer(i64::from(cell!(Int8Type))),
-            DataType::Int16 => NumericCell::Integer(i64::from(cell!(Int16Type))),
-            DataType::Int32 => NumericCell::Integer(i64::from(cell!(Int32Type))),
-            DataType::Int64 => NumericCell::Integer(cell!(Int64Type)),
-            DataType::UInt8 => NumericCell::Integer(i64::from(cell!(UInt8Type) as i8)),
-            DataType::UInt16 => NumericCell::Integer(i64::from(cell!(UInt16Type) as i16)),
-            DataType::UInt32 => NumericCell::Integer(i64::from(cell!(UInt32Type) as i32)),
-            DataType::UInt64 => NumericCell::Integer(cell!(UInt64Type) as i64),
-            DataType::Float32 => NumericCell::Float32(cell!(Float32Type)),
-            DataType::Float64 => NumericCell::Float64(cell!(Float64Type)),
-            _ => unreachable!("only admitted numeric vectors are read"),
-        })
+    fn get(&self, row: usize) -> Result<Option<NumericCell>> {
+        let Some(cell) = present_column_position(self.0, row)? else { return Ok(None); };
+        Ok(Some(match cell.field.data_type() {
+            DataType::Float32 => NumericCell::Float32(cell.array.as_primitive::<Float32Type>().value(cell.row)),
+            DataType::Float64 => NumericCell::Float64(cell.array.as_primitive::<Float64Type>().value(cell.row)),
+            _ => NumericCell::Integer(cell.signed_integer().ok_or_else(sum_state)?),
+        }))
     }
 }
 
@@ -1617,6 +1634,7 @@ impl ScalarGroups {
                 self.ensure(group_count)?;
                 let minimum = aggregate.function == A::Min;
                 let output = types.output_type();
+                let date_millis = without_nullability(output) == &LogicalType::Scalar(ScalarType::DateMilli);
                 let column = page.arrow_column(argument);
                 let numeric = column.and_then(|column| NumericColumn::bind(column, Some(output)));
                 let temporal = column.filter(|column| accepts_typed_column(column, |ty| same_temporal_layout(output, ty)));
@@ -1630,12 +1648,17 @@ impl ScalarGroups {
                     if *selected {
                         let state = &mut self.values[group];
                         if let Some(column) = &numeric {
-                            if let Some(value) = column.get(row) {
+                            if let Some(value) = column.get(row)? {
                                 state.numeric_extremum(value, output, minimum)?;
                             }
                         } else if let Some(column) = temporal {
                             if let Some((array, offset)) = present_column_cell(column, row)? {
-                                state.temporal_extremum(temporal_ticks(array, offset)?, minimum)?;
+                                let ticks = temporal_ticks(array, offset)?;
+                                if matches!(array.data_type(), DataType::Date32 | DataType::Date64) {
+                                    state.date_extremum(ticks, date_millis, minimum);
+                                } else {
+                                    state.temporal_extremum(ticks, minimum)?;
+                                }
                             }
                         } else if let Some(column) = bytes {
                             if let Some((array, offset)) = present_column_cell(column, row)? {
@@ -1684,17 +1707,21 @@ impl ScalarGroups {
         let _scratch = execution.context.memory.reserve(4096)?;
         let numeric = matches!(summer.output, LogicalType::Scalar(ScalarType::I32 | ScalarType::I64 | ScalarType::F32 | ScalarType::F64))
             .then(|| NumericColumn::bind(page.arrow_column(argument)?, None)).flatten();
-        let decimal = match (without_nullability(summer.input), page.arrow_column(argument)) {
-            (LogicalType::Scalar(ScalarType::Decimal { scale, bit_width: 128, .. }), Some(column))
-                if accepts_typed_column(column, |ty| {
-                    matches!(ty, DataType::Decimal128(_, storage_scale) if i32::from(*storage_scale) == *scale)
-                }) => Some((column, *scale)),
-            _ => None,
-        };
+        let decimal = page.arrow_column(argument).filter(|column| {
+            matches!(without_nullability(summer.input), LogicalType::Scalar(ScalarType::Decimal { .. }))
+                && admits_reduction_column(column, |field, logical| {
+                    if field.data_type() == &DataType::Null {
+                        return field.metadata().is_empty() && field.is_nullable() && logical.is_none_or(|ty| *ty == LogicalType::Null);
+                    }
+                    matches!(field.data_type(), DataType::Decimal32(..) | DataType::Decimal64(..) | DataType::Decimal128(..) | DataType::Decimal256(..))
+                        && rtdb_columnar::decimal_field_parameters(field).is_ok_and(|parameters| parameters.is_some())
+                        && logical.is_none_or(|ty| crate::columnar::stable_read_layout(ty, field))
+                })
+        });
         let duration = match (without_nullability(summer.input), summer.output) {
-            (input @ LogicalType::Scalar(ScalarType::Duration(unit)), LogicalType::Scalar(ScalarType::Duration(output))) =>
-                page.arrow_column(argument).filter(|column| accepts_typed_column(column, |ty| same_temporal_layout(input, ty)))
-                    .map(|column| (column, *unit, *output)),
+            (LogicalType::Scalar(ScalarType::Duration(_)), LogicalType::Scalar(ScalarType::Duration(output))) =>
+                page.arrow_column(argument).filter(|column| accepts_typed_column(column, |ty| matches!(ty, DataType::Duration(_))))
+                    .map(|column| (column, *output)),
             _ => None,
         };
         for (index,(group,selected)) in mapping.iter().zip(mask).enumerate() {
@@ -1702,34 +1729,49 @@ impl ScalarGroups {
             if !*selected { continue; }
             let state = &mut self.values[group];
             if let Some(column) = &numeric {
-                if let Some(value) = column.get(index) {
+                if let Some(value) = column.get(index)? {
                     state.add_numeric(value, summer.output)?;
                 }
                 continue;
             }
-            if let Some((column, unit, output)) = duration {
+            if let Some((column, output)) = duration {
                 let Some((array, offset)) = present_column_cell(column, index)? else {
                     return Err(duration_null(index));
+                };
+                let DataType::Duration(unit) = array.data_type() else { return Err(sum_state()); };
+                let unit = match unit {
+                    ArrowTimeUnit::Second => TimeUnit::Second,
+                    ArrowTimeUnit::Millisecond => TimeUnit::Millisecond,
+                    ArrowTimeUnit::Microsecond => TimeUnit::Microsecond,
+                    ArrowTimeUnit::Nanosecond => TimeUnit::Nanosecond,
                 };
                 state.add_duration(temporal_ticks(array, offset)?, unit, output)?;
                 continue;
             }
-            if let Some((column, input_scale)) = decimal {
-                let coefficient = || Ok::<_, rtdb_types::Anomaly>(present_column_cell(column, index)?
-                    .map(|(array, offset)| array.as_primitive::<Decimal128Type>().value(offset)));
+            if let Some(column) = decimal {
+                let cell = present_column_position(column, index)?;
                 match summer.output {
                     LogicalType::Scalar(ScalarType::F64) => {
-                        if let Some(coefficient) = coefficient()? {
-                            let value = rtdb_types::jvm_number::decimal_bytes_to_f64(&coefficient.to_be_bytes(), input_scale);
+                        if let Some(ArrowCell { field, array, row }) = cell {
+                            let value = rtdb_columnar::decimal_cell_as_f64(field, array, row)?;
                             state.add_numeric(NumericCell::Float64(value), summer.output)?;
                         }
                         continue;
                     }
                     LogicalType::Scalar(ScalarType::Decimal { scale, bit_width: 128, .. })
-                        if *scale == input_scale && *scale >= 0 && !matches!(state.accumulator, ScalarState::Retained(_)) =>
+                        if *scale >= 0 && !matches!(state.accumulator, ScalarState::Retained(_)) =>
                     {
-                        state.add_decimal128(coefficient()?.unwrap_or(0))?;
-                        continue;
+                        if let Some(cell) = cell {
+                            if let Some((parameters, bytes)) = cell.decimal_coefficient()?
+                                && parameters.bit_width == 128 && parameters.scale == *scale
+                            {
+                                state.add_decimal128(i128::from_be_bytes(bytes[16..].try_into().expect("Decimal128 coefficient width")))?;
+                                continue;
+                            }
+                        } else {
+                            state.add_decimal128(0)?;
+                            continue;
+                        }
                     }
                     _ => {}
                 }
@@ -1740,17 +1782,11 @@ impl ScalarGroups {
         Ok(())
     }
     fn count_page(&mut self,page: Rows<'_>,mapping: GroupMapping<'_>,mask: &[bool],argument: Option<usize>,execution: &Execution) -> Result<()> {
-        let typed = page.arrow_column(argument).filter(|column| accepts_typed_column(column, |ty| {
-            count_layout(ty) || matches!(ty, DataType::Duration(_) | DataType::Decimal128(..))
-        }));
+        let typed = page.arrow_column(argument).filter(|column| accepts_typed_column(column, masked_count_layout));
         for (row,(group,selected)) in mapping.iter().zip(mask).enumerate() {
             execution.context.check_cancelled_at(row)?;
             if !*selected { continue; }
-            let present = match typed {
-                Some(column) => present_column_cell(column, row)?.is_some(),
-                None => !page.is_null(row,argument)?,
-            };
-            if present {
+            if count_is_present(page, typed, row, argument)? {
                 let state = &mut self.values[group];
                 state.count = state.count.wrapping_add(1);
             }
@@ -1828,6 +1864,20 @@ impl ScalarAccumulator {
             _ => return Err(invalid("aggregate-state", "Expected a temporal extremum")),
         }
         Ok(())
+    }
+
+    fn date_extremum(&mut self, ticks: i64, millis: bool, minimum: bool) {
+        if self.date_wins(date_days(ticks, millis), millis, minimum) {
+            self.accumulator = ScalarState::TemporalExtremum(ticks);
+        }
+    }
+
+    fn date_wins(&self, days: i64, millis: bool, minimum: bool) -> bool {
+        let previous = match &self.accumulator {
+            ScalarState::TemporalExtremum(ticks) => Some(date_days(*ticks, millis)),
+            state => state.retained().and_then(Value::date_days),
+        };
+        previous.is_none_or(|previous| days.cmp(&previous) == if minimum { Ordering::Less } else { Ordering::Greater })
     }
 
     fn add_duration(&mut self, value: i64, input: TimeUnit, output: TimeUnit) -> Result<()> {
@@ -1930,6 +1980,18 @@ impl ScalarAccumulator {
         if let Some(value) = numeric {
             return self.numeric_extremum(value, output, minimum);
         }
+        match &value {
+            Value::DateDay(ticks) => return Ok(self.date_extremum(i64::from(*ticks), false, minimum)),
+            Value::DateMilli(ticks) => return Ok(self.date_extremum(*ticks, true, minimum)),
+            Value::Date(date) => {
+                let millis = date.unit() == rtdb_types::DateUnit::Millisecond;
+                if self.date_wins(date.date().epoch_day(), millis, minimum) {
+                    self.accumulator = ScalarState::Retained(OwnedRow::new(vec![value], state)?);
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
         if let Value::Timestamp { value, .. } | Value::Time { value, .. } | Value::Duration { value, .. } = value {
             return self.temporal_extremum(value, minimum);
         }
@@ -1987,6 +2049,8 @@ impl ScalarAccumulator {
                     }
                     LogicalType::Scalar(ScalarType::Time { unit, bit_width }) => Value::Time { value: *value, unit: *unit, bit_width: *bit_width },
                     LogicalType::Scalar(ScalarType::Duration(unit)) => Value::Duration { value: *value, unit: *unit },
+                    LogicalType::Scalar(ScalarType::DateDay) => Value::DateDay(*value as i32),
+                    LogicalType::Scalar(ScalarType::DateMilli) => Value::DateMilli(*value),
                     _ => return Err(invalid("aggregate-state", "Expected a temporal extremum output type")),
                 },
                 ScalarState::Boolean(value) => Value::Bool(*value),
@@ -2000,6 +2064,10 @@ impl ScalarAccumulator {
         };
         Ok(value)
     }
+}
+
+fn date_days(ticks: i64, millis: bool) -> i64 {
+    if millis { ticks.div_euclid(rtdb_types::java_date::MILLIS_PER_DAY) } else { ticks }
 }
 
 fn percentile_ranks(kind: PercentileKind, fraction: f64, count: i32) -> Result<(i32, i32, f64)> {
@@ -2169,7 +2237,7 @@ fn square_column(page: Rows<'_>,argument: Option<usize>,input: &LogicalType,scop
     if let Some(column) = page.arrow_column(argument).and_then(|column| NumericColumn::bind(column, None)) {
         for row in 0..page.len() {
             execution.context.check_cancelled()?;
-            squares.push(column.get(row).map(|cell| {
+            squares.push(column.get(row)?.map(|cell| {
                 let value = cell.as_f64();
                 value * value
             }));

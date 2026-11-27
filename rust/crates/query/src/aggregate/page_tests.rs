@@ -366,7 +366,7 @@ async fn global_counts_fit_without_a_group_ordinal_for_each_row() {
 }
 
 #[tokio::test]
-async fn grouped_count_excludes_null_runs() {
+async fn grouped_count_excludes_null_runs_with_or_without_a_filter() {
     use arrow_array::{Float64Array, Int16Array, Int64Array, RecordBatch, RunArray, types::Int16Type};
     use arrow_schema::Schema as ArrowSchema;
     use rtdb_types::RunEndWidth;
@@ -381,30 +381,32 @@ async fn grouped_count_excludes_null_runs() {
     let schema = Schema::new(vec![field(0, key.clone()), field(1, runs.clone())]).unwrap();
     let input = Arc::new(Relation::new(schema.clone(), RelationNode::Values { rows: vec![] }).unwrap());
     let groups = vec![NamedExpr { field: field(2, key.clone()), expr: schema.fields()[0].expression() }];
-    let aggregates = vec![AggregateExpr {
-        function: AggregateFunction::Count,
-        argument: Some(schema.fields()[1].expression()),
-        ..count(3, None)
-    }];
-    let output = Schema::new(vec![groups[0].field.clone(), aggregates[0].field.clone()]).unwrap();
-    let relation = Arc::new(Relation::new(output, RelationNode::Aggregate { input, groups: groups.clone(), aggregates: aggregates.clone() }).unwrap());
-    let runtime = EmittedRelation::derive(relation, &execution.context.catalog, &[], memory).unwrap();
-    let physical = Arc::new(ArrowSchema::new(vec![
-        rtdb_columnar::to_field("c0", &key).unwrap(),
-        rtdb_columnar::to_field("c1", &runs).unwrap(),
-    ]));
-    let values = RunArray::<Int16Type>::try_new(
-        &Int16Array::from(vec![1, 3]), &Int64Array::from(vec![Some(7), None]),
-    ).unwrap();
-    let batch = RecordBatch::try_new(physical, vec![Arc::new(Float64Array::from(vec![1.0; 3])), Arc::new(values)]).unwrap();
-    let batch = ColumnBatch::from_owned(rtdb_columnar::OwnedBatch::new(batch, memory).unwrap()).unwrap();
-    let mut cursor = AggregateCursor::from_batches(
-        Box::new(Batches(Some(batch))), false, schema, groups, aggregates, runtime, execution.clone(),
-    ).unwrap();
-    let result = cursor.next_batch().await.unwrap().unwrap();
-    assert_eq!(result.len, 1);
-    assert_eq!(result.columns[0].value(0).unwrap(), Value::F64(1.0));
-    assert_eq!(result.columns[1].value(0).unwrap(), Value::I64(1));
+    for filter in [None, Some(Expr::Literal(Value::Bool(true)))] {
+        let aggregates = vec![AggregateExpr {
+            function: AggregateFunction::Count,
+            argument: Some(schema.fields()[1].expression()),
+            ..count(3, filter)
+        }];
+        let output = Schema::new(vec![groups[0].field.clone(), aggregates[0].field.clone()]).unwrap();
+        let relation = Arc::new(Relation::new(output, RelationNode::Aggregate { input: Arc::clone(&input), groups: groups.clone(), aggregates: aggregates.clone() }).unwrap());
+        let runtime = EmittedRelation::derive(relation, &execution.context.catalog, &[], memory).unwrap();
+        let physical = Arc::new(ArrowSchema::new(vec![
+            rtdb_columnar::to_field("c0", &key).unwrap(),
+            rtdb_columnar::to_field("c1", &runs).unwrap(),
+        ]));
+        let values = RunArray::<Int16Type>::try_new(
+            &Int16Array::from(vec![1, 3]), &Int64Array::from(vec![Some(7), None]),
+        ).unwrap();
+        let batch = RecordBatch::try_new(physical, vec![Arc::new(Float64Array::from(vec![1.0; 3])), Arc::new(values)]).unwrap();
+        let batch = ColumnBatch::from_owned(rtdb_columnar::OwnedBatch::new(batch, memory).unwrap()).unwrap();
+        let mut cursor = AggregateCursor::from_batches(
+            Box::new(Batches(Some(batch))), false, schema.clone(), groups.clone(), aggregates, runtime, execution.clone(),
+        ).unwrap();
+        let result = cursor.next_batch().await.unwrap().unwrap();
+        assert_eq!(result.len, 1);
+        assert_eq!(result.columns[0].value(0).unwrap(), Value::F64(1.0));
+        assert_eq!(result.columns[1].value(0).unwrap(), Value::I64(1));
+    }
 }
 
 #[test]
@@ -813,6 +815,7 @@ async fn fixed_aggregate_results_keep_declared_layout_nulls_and_page_custody() {
         (AggregateFunction::Sum, decimal(1, 20, 0), decimal(2, 20, 2), decimal(102, 22, 2)),
         (AggregateFunction::Every, Value::Bool(true), Value::Bool(false), Value::Bool(false)),
         (AggregateFunction::Any, Value::Bool(false), Value::Bool(true), Value::Bool(true)),
+        (AggregateFunction::VariancePopulation, Value::F64(2.0), Value::F64(4.0), Value::F64(1.0)),
         (AggregateFunction::Max, Value::I16(-257), Value::I16(1300), Value::I16(1300)),
         (AggregateFunction::Min,
             Value::Time { value: 19, unit: TimeUnit::Millisecond, bit_width: 32 },
@@ -999,6 +1002,8 @@ fn aggregate_input_inline_extrema_and_boolean_fit_in_reserved_group_state() {
         (Value::I64(i64::MIN), Value::I64(i64::MAX)),
         (Value::F32(-9.5), Value::F32(0.0)),
         (Value::F64(-1.5), Value::F64(19.25)),
+        (Value::DateDay(i32::MIN), Value::DateDay(i32::MAX)),
+        (Value::DateMilli(-1), Value::DateMilli(4)),
     ]);
     for (lesser, greater) in inputs {
         let input = lesser.logical_type().maybe();
@@ -1056,6 +1061,45 @@ fn numeric_winner_keeps_nan_bits_and_signed_zero_across_input_routes() {
 }
 
 #[test]
+fn date64_extremum_keeps_the_first_tick_on_a_calendar_day() {
+    let execution = execution(8);
+    let output = field(0, LogicalType::Scalar(ScalarType::DateMilli).maybe());
+    let mut states = ScalarGroups::new(&execution).unwrap();
+    states.ensure(2).unwrap();
+    states.values[0].date_extremum(-1, true, true);
+    states.values[0].scalar_extremum(&Value::DateMilli(-3), &output.data_type, true, &execution, &execution.context.memory).unwrap();
+    let (column, _charge) = fixed_scalar_results(&states, &AggregateFunction::Min, &output, &execution.context).unwrap().unwrap();
+    assert_eq!(column.value(0).unwrap(), Value::DateMilli(-1));
+    assert_eq!(column.value(1).unwrap(), Value::Null);
+}
+
+#[test]
+fn variance_and_average_read_nullable_numeric_runs() {
+    use arrow_array::{Int16Array, Int64Array, RunArray};
+    let execution = execution(8);
+    let memory = &execution.context.memory;
+    let input = LogicalType::Scalar(ScalarType::I64).maybe();
+    let array = RunArray::<Int16Type>::try_new(
+        &Int16Array::from(vec![2, 3, 5]), &Int64Array::from(vec![Some(5), None, Some(2)]),
+    ).unwrap();
+    let field = Arc::new(ArrowField::new("c0", array.data_type().clone(), false));
+    let batch = ColumnBatch::settled(vec![Column::Arrow { array: Arc::new(array), field, logical: None }], 5, memory.reserve(4096).unwrap()).unwrap();
+    let rows = Rows::columns(&batch, &[0], false, &execution.context).unwrap();
+    let scope = execution.scope().unwrap();
+    let column = NumericColumn::bind(&batch.columns[0], None).expect("A scalar run is admitted");
+    assert!(column.get(2).unwrap().is_none());
+    assert_eq!(square_column(rows, Some(0), &input, &scope, &execution).unwrap(), vec![Some(25.0), Some(25.0), None, Some(4.0), Some(4.0)]);
+    let mut states = ScalarGroups::new(&execution).unwrap();
+    states.ensure(1).unwrap();
+    let mask = [true, true, true, false, true];
+    let output = LogicalType::Scalar(ScalarType::F64);
+    let factory = SumFactory::new(&input, &output).unwrap();
+    states.sum_page(rows, GroupMapping::Global(5), &mask, Some(0), &factory, &execution).unwrap();
+    states.count_page(rows, GroupMapping::Global(5), &mask, Some(0), &execution).unwrap();
+    assert_eq!(states.values[0].average_double(), Some(4.0));
+}
+
+#[test]
 fn byte_extremum_result_owns_the_winners_and_keeps_empty_groups_null() {
     let execution = execution(8);
     let context = &execution.context;
@@ -1094,9 +1138,11 @@ fn aggregate_input_duration_sum_preserves_the_reached_null_index_and_wrapping() 
         };
         let types = AggregateTypes::derive(&aggregate, input.clone(), true, EmissionMode::Execution).unwrap();
         let arrow_field = Arc::new(rtdb_columnar::to_field("c0", &input).unwrap());
-        let array = Arc::new(arrow_array::DurationSecondArray::from(vec![i64::MAX, 3]));
-        let selected = SelectedColumn::new(vec![Some((array, arrow_field, None, None)), None],
-            Arc::new(vec![(0, 0), (1, 0), (0, 1)]));
+        let array = Arc::new(arrow_array::DurationSecondArray::from(vec![i64::MAX]));
+        let millis_field = Arc::new(rtdb_columnar::to_field("c0", &output).unwrap());
+        let millis = Arc::new(arrow_array::DurationMillisecondArray::from(vec![3000]));
+        let selected = SelectedColumn::new(vec![Some((array, arrow_field, None, None)), None, Some((millis, millis_field, None, None))],
+            Arc::new(vec![(0, 0), (1, 0), (2, 0)]));
         let batch = ColumnBatch::settled(vec![Column::Selected(selected)], 3, memory.reserve(4096).unwrap()).unwrap();
         let page = Rows::columns(&batch, &[0], false, &execution.context).unwrap();
         let scope = execution.scope().unwrap();
@@ -1122,6 +1168,30 @@ fn aggregate_input_duration_sum_preserves_the_reached_null_index_and_wrapping() 
         }
     }
     assert_eq!(memory.used_bytes(), baseline);
+}
+
+#[test]
+fn decimal_average_reads_the_annotated_scale_before_rounding_to_double() {
+    let execution = execution(8);
+    let memory = &execution.context.memory;
+    let decimal = decimal128_value(-123, 20, 400).unwrap();
+    let expected = rtdb_expr::decimal_to_f64(&decimal);
+    let values = [Value::Decimal(decimal), Value::Null];
+    let input = values[0].logical_type().maybe();
+    let arrow_field = Arc::new(rtdb_columnar::to_field("c0", &input).unwrap());
+    let array = rtdb_columnar::copy_array(&input, &values).unwrap();
+    let batch = ColumnBatch::settled(vec![Column::Arrow { array, field: arrow_field, logical: Some(input.clone()) }],
+        2, memory.reserve(4096).unwrap()).unwrap();
+    let rows = Rows::columns(&batch, &[0], false, &execution.context).unwrap();
+    let mut states = ScalarGroups::new(&execution).unwrap();
+    states.ensure(1).unwrap();
+    let output = LogicalType::Scalar(ScalarType::F64);
+    let factory = SumFactory::new(&input, &output).unwrap();
+    let pressure = memory.reserve(memory.available_bytes() - 4096).unwrap();
+    states.sum_page(rows, GroupMapping::Global(2), &[true, true], Some(0), &factory, &execution).unwrap();
+    drop(pressure);
+    states.count_page(rows, GroupMapping::Global(2), &[true, true], Some(0), &execution).unwrap();
+    assert_eq!(states.values[0].average_double().unwrap().to_bits(), expected.to_bits());
 }
 
 #[tokio::test]

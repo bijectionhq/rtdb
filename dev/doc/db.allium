@@ -2470,10 +2470,14 @@ surface QueryAccess {
         -- Direct writers for fixed-width aggregate results preserve the declared Arrow layout even when every group yields null.
         -- The output page owns the charge for those buffers.
         -- A same-scale Decimal128 sum at non-negative scale accumulates its exact coefficient and checks physical overflow.
+        -- A compatible decimal input to a double result converts its coefficient at the field's logical scale.
         -- Duration sums and averages keep the declared unit and use wrapping signed arithmetic for unit conversion and addition.
-        -- A duration sum or average reads Arrow cells with a matching input layout in selection order and reports the first selected null at its page index for a concrete duration input.
+        -- A duration sum or average reads compatible Arrow cells in selection order using each cell's unit and reports the first selected null at its page index for a concrete duration input.
         -- Timestamp, time and duration extrema compare Arrow ticks directly when the input layout matches the result type.
         -- An extremum requiring temporal conversion casts each reached candidate before comparison and preserves the result type's unit and timezone label.
+        -- Date extrema compare calendar days and preserve the first winner's ticks among peers.
+        -- A masked count over compatible run-end scalars uses the selected run's nullness.
+        -- Variance computes its square inputs in page order before applying the aggregate mask.
         -- Text and binary extrema compare compatible Arrow cells by bytes and copy only a replacement winner.
         -- A compatible text or binary result copies the retained winners directly into the output page's Arrow buffers.
         -- EVERY and ANY read compatible Arrow Boolean cells in selection order and retain a nullable Boolean per group.
