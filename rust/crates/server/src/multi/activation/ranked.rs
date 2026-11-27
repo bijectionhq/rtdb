@@ -34,6 +34,7 @@ impl RankedClosure {
             && self.receipt.scope.incarnation == incarnation
             && self.receipt.scope.activation_sha256 != [0; 32]
             && (self.receipt.admitted == 0) == (self.receipt.inventory_sha256 == [0; 32])
+            && self.receipt.staging.valid()
     }
 }
 
@@ -375,13 +376,21 @@ async fn read_outcomes(
 ) -> Result<Value> {
     let io = rtdb_storage::IoRegion::new();
     let result = async {
-        let page = open_provider(config, receipt.scope, io.clone()).await?
-            .outcome_page(receipt, after, 32).await?;
+        if after > receipt.admitted.max(receipt.staging.completed) {
+            return Err(Anomaly::incorrect("rtdb.storage/ranked-admission", "The ranked outcome cursor is beyond the closed inventories"));
+        }
+        let provider = open_provider(config, receipt.scope, io.clone()).await?;
+        let page = provider.outcome_page(receipt, after.min(receipt.admitted), 32).await?;
+        let staging = provider.staging_page(receipt, after.min(receipt.staging.completed), 32).await?;
         let catalogues = page.catalogues.into_iter().map(|entry| serde_json::json!({
             "manifest": entry.manifest.to_string(), "position": entry.position,
             "system_time": entry.system_time, "key_generation": entry.key_generation,
         })).collect::<Vec<_>>();
-        Ok(serde_json::json!({ "scope": receipt, "catalogues": catalogues, "next_after": page.next_after }))
+        let staged = staging.objects.into_iter().map(|entry| serde_json::json!({
+            "object": entry.object.to_string(), "attempt": entry.attempt, "physical": entry.physical,
+        })).collect::<Vec<_>>();
+        Ok(serde_json::json!({ "scope": receipt, "catalogues": catalogues, "staged": staged,
+            "next_after": page.next_after.max(staging.next_after) }))
     }.await;
     io.close_and_wait().await;
     result
@@ -537,6 +546,14 @@ mod tests {
         assert_eq!(outcome["scope"]["admitted"], 1);
         assert_eq!(outcome["catalogues"][0]["position"], receipt.basis.position());
         assert_eq!(outcome["catalogues"][0]["system_time"], receipt.system_time.0);
+        let staged = outcome["staged"].as_array().unwrap();
+        assert!(staged.len() >= 2);
+        assert_eq!(outcome["scope"]["staging"]["completed"], staged.len());
+        let manifest = staged.iter().find(|entry| entry["object"] == outcome["catalogues"][0]["manifest"]).unwrap();
+        assert_eq!(manifest["attempt"]["position"], receipt.basis.position());
+        assert_eq!(manifest["attempt"]["key_generation"], outcome["catalogues"][0]["key_generation"]);
+        assert_eq!(manifest["physical"]["key"], format!("multi/{}", manifest["object"].as_str().unwrap()));
+        assert_eq!(manifest["physical"]["namespace"]["bucket"], config.bucket);
     }
 
     #[cfg(any(feature = "s3", feature = "backup-object-holds"))]
@@ -723,6 +740,7 @@ mod tests {
                 scope,
                 admitted: 1,
                 inventory_sha256: [31; 32],
+                staging: Default::default(),
             },
         };
         assert!(

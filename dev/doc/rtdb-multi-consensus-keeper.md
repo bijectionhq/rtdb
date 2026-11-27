@@ -217,8 +217,15 @@ An interrupted upload that stays recorded keeps subsequent ranked staging busy u
 Closure cancels any recorded upload and waits for the original provider to confirm that its parts can no longer be addressed.
 Give the writer permission to verify bucket versioning.
 Give both the writer and original ranked custodian permission to abort scoped multipart uploads and inspect their parts at the commissioned allocation.
+Give both identities permission to read the staged object's metadata and list versions at its exact key so they can resolve an interrupted completion.
+On AWS, grant `s3:GetObject` and `s3:ListBucket` so `HeadObject` can report a missing key, and grant `s3:ListBucketVersions` for the exact derivative key prefix. [HeadObject permissions](https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadObject.html) · [ListObjectVersions permissions](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectVersions.html)
+Preserve the staged object versions and provider ledger records through outcome discovery, and keep unresolved completions visible at their current object keys.
 
-Use `ranked-outcomes` on the pending or published recovery to page through the original provider's admitted catalogues, including entries whose source operation IDs were lost. Pass the returned `next_after` value as `--after` until the response ends the scan.
+Use `ranked-outcomes` on the pending or published recovery to page through the original provider's admitted catalogues and independently recorded staged versions.
+The `staged` array identifies each completed object's exact provider version, build cut and key generation, including files and manifests that never reached a catalogue.
+The inventory covers writes through recorded staging, and older writes require separate provider inventory evidence.
+Use brokers that understand staged receipts before commissioning writers with recorded staging.
+Pass the returned `next_after` value as `--after` until the response ends the scan.
 
 ```sh
 rtdb multi-activation ranked-outcomes xtdb --authority-socket "$SOCKET" \
@@ -410,7 +417,7 @@ Release after publication requires a handoff to the destination's serving custod
 
 Ranked derivative publication needs an authority that admits staging for the current incarnation and fences or drains provider work before that incarnation loses authority.
 The closed ranked prefix accounts for admitted catalogues.
-The provider closure accounts for an outstanding recorded multipart upload and leaves completed objects in their original allocation.
+The provider closure drains an outstanding recorded multipart upload and binds the exact completed versions it discovers, including a completion whose reply was lost.
 Derivative custody must retain or retire the exact primary cut, derivative object versions and generation keys.
 An assertion erasure report also needs signed settlements from each backup and derivative custodian in its ordered roster.
 

@@ -131,6 +131,20 @@ async fn ranked_admission_closure_requires_the_original_s3_inventory() {
 }
 
 #[cfg(feature = "versioning")]
+async fn loopback_client(config: &S3Config) -> aws_sdk_s3::Client {
+    let sdk = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(aws_config::Region::new("us-east-1"))
+        .endpoint_url(config.endpoint.as_deref().unwrap())
+        .load()
+        .await;
+    aws_sdk_s3::Client::from_conf(
+        aws_sdk_s3::config::Builder::from(&sdk)
+            .force_path_style(true)
+            .build(),
+    )
+}
+
+#[cfg(feature = "versioning")]
 #[tokio::test]
 #[ignore = "requires a disposable versioned S3-compatible loopback bucket"]
 async fn ranked_admission_closure_drains_only_the_recorded_multipart_upload() {
@@ -140,19 +154,10 @@ async fn ranked_admission_closure_drains_only_the_recorded_multipart_upload() {
     use bytes::Bytes;
     use object_store::aws::S3ConditionalPut;
     use ring::digest::{SHA256, digest};
-    use rtdb_storage::remote::{PublicationResult, RemoteStore};
+    use rtdb_storage::{ranked_admission::RankedAttempt, remote::RemoteStore};
 
     let config = loopback_config();
-    let sdk = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .region(aws_config::Region::new("us-east-1"))
-        .endpoint_url(config.endpoint.as_deref().unwrap())
-        .load()
-        .await;
-    let client = aws_sdk_s3::Client::from_conf(
-        aws_sdk_s3::config::Builder::from(&sdk)
-            .force_path_style(true)
-            .build(),
-    );
+    let client = loopback_client(&config).await;
     let root = ObjectKey::new("multi").unwrap();
     let scope = RankedAdmissionScope {
         incarnation: Uuid::new_v4(),
@@ -173,24 +178,28 @@ async fn ranked_admission_closure_drains_only_the_recorded_multipart_upload() {
         seq: 1,
         digest: digest(&SHA256, &bytes).as_ref().try_into().unwrap(),
     };
-    let ready = writer.reserve_staging(first).await.unwrap();
+    let attempt = RankedAttempt {
+        epoch: 1,
+        position: 2,
+        system_time: 3,
+        key_generation: 4,
+    };
+    let ready = writer.reserve_staging(attempt, first).await.unwrap();
     assert!(
         writer
             .complete_staging(ready.clone(), Bytes::from_static(b"different bytes"))
             .await
             .is_err()
     );
-    assert!(matches!(
-        writer.complete_staging(ready, bytes.clone()).await.unwrap(),
-        PublicationResult::Published {
-            version: Some(_),
-            ..
-        }
-    ));
+    let published = writer.complete_staging(ready, bytes.clone()).await.unwrap();
     let interrupted = ObjectId { seq: 2, ..first };
-    let reserved = writer.reserve_staging(interrupted).await.unwrap();
+    let reserved = writer.reserve_staging(attempt, interrupted).await.unwrap();
     assert_eq!(
-        writer.reserve_staging(first).await.unwrap_err().code,
+        writer
+            .reserve_staging(attempt, first)
+            .await
+            .unwrap_err()
+            .code,
         "rtdb.storage/ranked-staging-busy"
     );
 
@@ -270,6 +279,13 @@ async fn ranked_admission_closure_drains_only_the_recorded_multipart_upload() {
         .unwrap();
     let closed = recovered.close().await.unwrap();
     assert_eq!(closed.admitted, 0);
+    assert_eq!(closed.staging.completed, 1);
+    let staged = recovered.staging_page(closed, 0, 1).await.unwrap();
+    assert_eq!(staged.objects.len(), 1);
+    assert_eq!(staged.objects[0].object, first);
+    assert_eq!(staged.objects[0].attempt, attempt);
+    assert_eq!(staged.objects[0].physical, published);
+    assert_eq!(staged.next_after, None);
     let absent = client
         .list_parts()
         .bucket(&config.bucket)
@@ -314,5 +330,171 @@ async fn ranked_admission_closure_drains_only_the_recorded_multipart_upload() {
         .send()
         .await
         .unwrap();
+    recovery_io.close_and_wait().await;
+}
+
+#[cfg(feature = "versioning")]
+#[tokio::test]
+#[ignore = "requires a disposable versioned S3-compatible loopback bucket"]
+async fn ranked_admission_closure_recovers_the_exact_version_after_a_lost_completion_reply() {
+    use aws_sdk_s3::{
+        primitives::ByteStream,
+        types::{ChecksumAlgorithm, CompletedMultipartUpload, CompletedPart},
+    };
+    use bytes::Bytes;
+    use ring::digest::{SHA256, digest};
+    use rtdb_storage::ranked_admission::{RankedAdmissionWriter, RankedAttempt};
+
+    let config = loopback_config();
+    let client = loopback_client(&config).await;
+    let root = ObjectKey::new("multi").unwrap();
+    let scope = RankedAdmissionScope {
+        incarnation: Uuid::new_v4(),
+        activation_sha256: [8; 32],
+    };
+    let io = IoRegion::new();
+    let remotes = BTreeMap::new();
+    let writer = config
+        .ranked_admission(&root, &remotes, io.clone(), scope)
+        .await
+        .unwrap();
+    writer.commission().await.unwrap();
+    let bytes = Bytes::from_static(b"ranked completed ciphertext");
+    let first = ObjectId {
+        database: scope.incarnation,
+        kind: ObjectKind::File,
+        epoch: 1,
+        seq: 1,
+        digest: digest(&SHA256, &bytes).as_ref().try_into().unwrap(),
+    };
+    let attempt = RankedAttempt {
+        epoch: 1,
+        position: 2,
+        system_time: 3,
+        key_generation: 4,
+    };
+    let first_version = writer.stage(attempt, first, bytes.clone()).await.unwrap();
+    let lost = ObjectId {
+        kind: ObjectKind::Manifest,
+        seq: 2,
+        ..first
+    };
+    writer.reserve_staging(attempt, lost).await.unwrap();
+    let key = format!("{root}/{lost}");
+    let upload = client
+        .list_multipart_uploads()
+        .bucket(&config.bucket)
+        .prefix(&key)
+        .send()
+        .await
+        .unwrap();
+    let [upload] = upload.uploads() else {
+        panic!("expected one registered multipart upload")
+    };
+    assert_eq!(upload.key(), Some(key.as_str()));
+    let upload_id = upload.upload_id().unwrap();
+    let part = client
+        .upload_part()
+        .bucket(&config.bucket)
+        .key(&key)
+        .upload_id(upload_id)
+        .part_number(1)
+        .checksum_algorithm(ChecksumAlgorithm::Sha256)
+        .body(ByteStream::from(bytes))
+        .send()
+        .await
+        .unwrap();
+    let parts = CompletedMultipartUpload::builder()
+        .parts(
+            CompletedPart::builder()
+                .part_number(1)
+                .e_tag(part.e_tag().unwrap())
+                .checksum_sha256(part.checksum_sha256().unwrap())
+                .build(),
+        )
+        .build();
+    let completion = client
+        .complete_multipart_upload()
+        .bucket(&config.bucket)
+        .key(&key)
+        .upload_id(upload_id)
+        .multipart_upload(parts)
+        .if_none_match("*")
+        .send()
+        .await
+        .unwrap();
+    let exact_version = completion.version_id().unwrap();
+    drop(writer);
+    io.close_and_wait().await;
+
+    let recovery_io = IoRegion::new();
+    let recovery = config
+        .ranked_admission(&root, &remotes, recovery_io.clone(), scope)
+        .await
+        .unwrap();
+    let closed = recovery.close().await.unwrap();
+    assert_eq!(closed.admitted, 0);
+    assert_eq!(closed.staging.completed, 2);
+    assert_eq!(recovery.close().await.unwrap(), closed);
+    let first_page = recovery.staging_page(closed, 0, 1).await.unwrap();
+    assert_eq!(first_page.objects[0].physical, first_version);
+    let second_page = recovery
+        .staging_page(closed, first_page.next_after.unwrap(), 1)
+        .await
+        .unwrap();
+    assert_eq!(second_page.next_after, None);
+    let [entry] = second_page.objects.as_slice() else {
+        panic!("expected one recovered version")
+    };
+    assert_eq!(entry.object, lost);
+    assert_eq!(entry.attempt, attempt);
+    assert_eq!(entry.physical.key, key);
+    assert_eq!(entry.physical.version, exact_version);
+
+    let prefix = format!("{root}/ranked-admission/v1/");
+    let suffix = format!("/{}/staged/0000000000000002", scope.incarnation);
+    let records = client
+        .list_objects_v2()
+        .bucket(&config.bucket)
+        .prefix(prefix)
+        .send()
+        .await
+        .unwrap();
+    let staged_record = records
+        .contents()
+        .iter()
+        .filter_map(|object| object.key())
+        .find(|key| key.ends_with(&suffix))
+        .unwrap();
+    let body = client
+        .get_object()
+        .bucket(&config.bucket)
+        .key(staged_record)
+        .send()
+        .await
+        .unwrap()
+        .body
+        .collect()
+        .await
+        .unwrap()
+        .into_bytes();
+    let mut replacement: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    replacement["version"] = serde_json::json!(Uuid::new_v4().to_string());
+    client
+        .put_object()
+        .bucket(&config.bucket)
+        .key(staged_record)
+        .body(ByteStream::from(serde_json::to_vec(&replacement).unwrap()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        recovery.staging_page(closed, 0, 1).await.unwrap_err().code,
+        "rtdb.storage/ranked-staging-inventory"
+    );
+    assert_eq!(
+        recovery.close().await.unwrap_err().code,
+        "rtdb.storage/ranked-staging-inventory"
+    );
     recovery_io.close_and_wait().await;
 }

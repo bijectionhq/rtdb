@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{RemoteObjects, RemoteStore, provider_error};
-use crate::ranked_admission::{RankedAdmissionWriter, RankedAttempt};
+use crate::ranked_admission::{RankedAdmissionWriter, RankedAttempt, RankedStagingInventory};
 use crate::{IoRegion, ObjectKey};
 
 #[path = "remote_ranked_staging.rs"]
@@ -51,6 +51,8 @@ struct Ledger {
     closed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     staging: Option<RankedStagingUpload>,
+    #[serde(default, skip_serializing_if = "RankedStagingInventory::is_empty")]
+    completed_staging: RankedStagingInventory,
 }
 
 impl RemoteStore {
@@ -245,8 +247,10 @@ impl RankedAdmission {
             }
             if let Some(upload) = &ledger.staging {
                 self.drain_staging(upload).await?;
+                continue;
             }
             self.verify_inventory(&ledger).await?;
+            self.verify_staging(ledger.completed_staging).await?;
             return Ok(self.receipt(&ledger));
         }
         Err(contention())
@@ -274,13 +278,16 @@ impl RankedAdmission {
             scope: self.scope,
             admitted: ledger.count,
             inventory_sha256: ledger.inventory_sha256,
+            staging: ledger.completed_staging,
         }
     }
 
     async fn root(&self) -> Result<(Ledger, UpdateVersion)> {
         let (bytes, version) = self.read(&self.path.clone().join("root"), MAX_ROOT_BYTES).await?;
         let ledger: Ledger = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
-        if version.e_tag.is_none() || (ledger.count == 0) != (ledger.inventory_sha256 == [0; 32]) {
+        if version.e_tag.is_none() || (ledger.count == 0) != (ledger.inventory_sha256 == [0; 32])
+            || !ledger.completed_staging.valid()
+        {
             return Err(invalid());
         }
         if let Some(upload) = &ledger.staging {
@@ -391,8 +398,8 @@ impl RankedAdmissionWriter for RankedAdmission {
         self.publish(catalogue).await.map(drop)
     }
 
-    async fn stage(&self, object: ObjectId, ciphertext: Bytes) -> Result<PhysicalObjectVersion> {
-        self.stage_object(object, ciphertext).await
+    async fn stage(&self, attempt: RankedAttempt, object: ObjectId, ciphertext: Bytes) -> Result<PhysicalObjectVersion> {
+        self.stage_object(attempt, object, ciphertext).await
     }
 }
 
@@ -569,8 +576,7 @@ mod tests {
         let proposed = Ledger {
             count: 2,
             inventory_sha256: [9; 32],
-            closed: false,
-            staging: None,
+            ..Ledger::default()
         };
         assert!(
             !writer

@@ -113,6 +113,11 @@ pub trait PublicationUploads: Send + Sync {
     async fn complete(&self, path: &Path, upload: &str, bytes: Bytes) -> Result<PublicationResult>;
     /// Cancels this upload and confirms that it retains no parts.
     async fn abort(&self, path: &Path, upload: &str) -> Result<()>;
+    /// Resolves an exact attempt's completed version after the caller drains its upload.
+    /// `None` confirms absence. An indeterminate outcome returns an error.
+    async fn completed_version(&self, _path: &Path, _attempt: uuid::Uuid) -> Result<Option<String>> {
+        Err(Error::Closed("The publication provider does not identify completed attempts".into()))
+    }
 }
 
 /// Provider inventory used to settle exactly the Classic publication selected by a grant.

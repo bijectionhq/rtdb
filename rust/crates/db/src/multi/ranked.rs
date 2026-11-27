@@ -24,6 +24,17 @@ pub struct RankedBuild {
     generation: u64,
 }
 
+impl RankedBuild {
+    fn attempt(&self) -> RankedAttempt {
+        RankedAttempt {
+            epoch: self.epoch,
+            position: self.cut.basis.position(),
+            system_time: self.cut.system_time.0,
+            key_generation: self.generation,
+        }
+    }
+}
+
 pub struct RankedPublication {
     record: RankedCatalog,
     store: Arc<dyn ObjectStore>,
@@ -136,12 +147,7 @@ impl MultiDatabase {
         let prepared = if let Some(admission) = &admission {
             self.stream.require_serving().await?;
             self.require_authority(lease)?;
-            admission.prepared(RankedAttempt {
-                epoch: build.epoch,
-                position: build.cut.basis.position(),
-                system_time: build.cut.system_time.0,
-                key_generation: build.generation,
-            }).await?
+            admission.prepared(build.attempt()).await?
         } else {
             None
         };
@@ -178,6 +184,7 @@ impl MultiDatabase {
             return Err(uncovered());
         }
         let mut members = Vec::with_capacity(files.len());
+        let attempt = build.attempt();
         let mut inventory = Inventory {
             version: 1,
             files: Vec::with_capacity(files.len()),
@@ -195,7 +202,7 @@ impl MultiDatabase {
                 .await?;
             let (ciphertext_bytes, version) = if let Some(admission) = &self.ranked_admission {
                 let ciphertext = object.ciphertext();
-                let version = admission.stage(object.id(), ciphertext.clone()).await?;
+                let version = admission.stage(attempt, object.id(), ciphertext.clone()).await?;
                 (ciphertext.len(), Some(version))
             } else {
                 object.put_observed(self.store.as_ref()).await?
@@ -228,7 +235,7 @@ impl MultiDatabase {
             )
             .await?;
         if let Some(admission) = &self.ranked_admission {
-            admission.stage(manifest.id(), manifest.ciphertext().clone()).await?;
+            admission.stage(attempt, manifest.id(), manifest.ciphertext().clone()).await?;
         } else {
             manifest.put(self.store.as_ref()).await?;
         }

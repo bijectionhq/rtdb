@@ -1157,6 +1157,9 @@ contract EpochScopedStorage {
         -- A closure receipt requires the digest of every committed sequence slot in order to match the closed provider ledger.
         -- A staged ranked object has a provider upload recorded against the scope before payload submission.
         -- The original provider confirms that any recorded upload has drained before the custodian returns a closure receipt.
+        -- The closure receipt also binds the complete inventory of staged versions, with each version's exact build cut and key generation.
+        -- A recorded upload that the provider completes appears in that inventory even when its reply or catalogue admission is lost.
+        -- Outcome pages expose staged versions only after their inventory matches the receipt.
         -- A staged slot outside the committed prefix grants no admission.
         -- An exact retry observes its original sequence even after closure.
         -- The activation broker commissions an exact original provider allocation against the active binding.

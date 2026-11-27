@@ -227,32 +227,36 @@ impl VersionedInventory {
     ) -> Result<CreateAttemptPublication> {
         self.inspect((key.clone(), attempt), |owner, (key, attempt)| async move {
             let path = Path::from(format!("{}/{key}", owner.root));
-            match owner.client.head_object().bucket(&owner.namespace.bucket).key(path.as_ref())
-                .set_request_payer(owner.request_payer.clone()).send().await
-            {
-                Ok(head) => {
-                    let matched = attempt.is_some_and(|attempt| head.metadata().is_some_and(|metadata| {
-                        metadata.get("rtdb-publication").is_some_and(|published| published == &attempt.to_string())
-                    }));
-                    if !matched { return Ok(CreateAttemptPublication::Other); }
-                    let version = head.version_id().filter(|version| valid_object_version(version.as_bytes()))
-                        .ok_or_else(|| unavailable("The successful upload has no exact version"))?;
-                    Ok(CreateAttemptPublication::Published(PhysicalObjectVersion {
-                        namespace: owner.namespace.clone(), key: path.to_string(), version: version.to_owned(),
-                    }))
-                }
-                Err(error) if error.as_service_error().is_some_and(|error| error.is_not_found()) => {
-                    let page = owner.client.list_object_versions().bucket(&owner.namespace.bucket)
-                        .prefix(path.as_ref()).max_keys(1).set_request_payer(owner.request_payer.clone()).send().await
-                        .map_err(|error| unavailable(format!("The staged version inventory could not be read: {error}")))?;
-                    let had_history = page.is_truncated() != Some(false)
-                        || page.versions().iter().any(|object| object.key() == Some(path.as_ref()))
-                        || page.delete_markers().iter().any(|object| object.key() == Some(path.as_ref()));
-                    Ok(if had_history { CreateAttemptPublication::Other } else { CreateAttemptPublication::Absent })
-                }
-                Err(error) => Err(unavailable(format!("The staged upload could not be observed: {error}"))),
-            }
+            owner.inspect_create_attempt(&path, attempt).await
         }).await
+    }
+
+    async fn inspect_create_attempt(&self, path: &Path, attempt: Option<uuid::Uuid>) -> Result<CreateAttemptPublication> {
+        match self.client.head_object().bucket(&self.namespace.bucket).key(path.as_ref())
+            .set_request_payer(self.request_payer.clone()).send().await
+        {
+            Ok(head) => {
+                let matched = attempt.is_some_and(|attempt| head.metadata().is_some_and(|metadata| {
+                    metadata.get("rtdb-publication").is_some_and(|published| published == &attempt.to_string())
+                }));
+                if !matched { return Ok(CreateAttemptPublication::Other); }
+                let version = head.version_id().filter(|version| valid_object_version(version.as_bytes()))
+                    .ok_or_else(|| unavailable("The successful upload has no exact version"))?;
+                Ok(CreateAttemptPublication::Published(PhysicalObjectVersion {
+                    namespace: self.namespace.clone(), key: path.to_string(), version: version.to_owned(),
+                }))
+            }
+            Err(error) if error.as_service_error().is_some_and(|error| error.is_not_found()) => {
+                let page = self.client.list_object_versions().bucket(&self.namespace.bucket)
+                    .prefix(path.as_ref()).max_keys(1).set_request_payer(self.request_payer.clone()).send().await
+                    .map_err(|error| unavailable(format!("The staged version inventory could not be read: {error}")))?;
+                let had_history = page.is_truncated() != Some(false)
+                    || page.versions().iter().any(|object| object.key() == Some(path.as_ref()))
+                    || page.delete_markers().iter().any(|object| object.key() == Some(path.as_ref()));
+                Ok(if had_history { CreateAttemptPublication::Other } else { CreateAttemptPublication::Absent })
+            }
+            Err(error) => Err(unavailable(format!("The staged upload could not be observed: {error}"))),
+        }
     }
 
     /// All readable data versions at this exact path, including versions hidden by markers.
@@ -813,6 +817,16 @@ impl PublicationUploads for VersionedInventory {
     async fn abort(&self, path: &Path, upload: &str) -> rtdb_storage::Result<()> {
         self.abort_upload(path.as_ref(), upload).await
             .map_err(|error| publication_failure(path, error.code))
+    }
+
+    async fn completed_version(&self, path: &Path, attempt: uuid::Uuid) -> rtdb_storage::Result<Option<String>> {
+        match self.inspect_create_attempt(path, Some(attempt)).await
+            .map_err(|error| publication_failure(path, error.code))?
+        {
+            CreateAttemptPublication::Published(version) => Ok(Some(version.version)),
+            CreateAttemptPublication::Absent => Ok(None),
+            CreateAttemptPublication::Other => Err(publication_failure(path, "S3 did not establish the outcome of the exact upload attempt")),
+        }
     }
 }
 
