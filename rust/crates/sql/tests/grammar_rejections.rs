@@ -327,6 +327,7 @@ fn query_settings_validate_operator_syntax_without_evaluating_the_expression() {
         let sql = format!("SETTING SNAPSHOT_TIME = ({expression}) SELECT 1");
         assert_eq!(rejection(&sql).code, "xtdb/sql-error", "{sql}");
     }
+    assert_eq!(rejection("SETTING DEFAULT VALID_TIME AS OF (1 <=> 2) SELECT 1").code, "xtdb/sql-error");
     let position = rejection("SETTING SNAPSHOT_TIME = POSITION('x' IN 'xy' USING octets) SELECT 1");
     assert_eq!(position.code, "xtdb.error/illegal-arg");
     assert_eq!(position.message.as_deref(), Some("No matching clause: octets"));

@@ -113,8 +113,7 @@ pub(crate) fn extract(tokens: Vec<TokenWithSpan>, source: &str) -> Result<(Vec<T
             at += 1;
             if word(tokens.get(at), "TO") || tokens.get(at).is_some_and(|token| token.token == Token::Eq) { at += 1; }
             else { return Err(sql_error("Expected TO or = after query setting", source, token.span)); }
-            let (value, used) = expression(&tokens[at..], source, 0)?;
-            validate_setting_expression(&value, source)?;
+            let (value, used) = setting_expression(&tokens[at..], source, 0)?;
             settings.entries.push(constructor(value));
             at += used;
         }
@@ -123,6 +122,12 @@ pub(crate) fn extract(tokens: Vec<TokenWithSpan>, source: &str) -> Result<(Vec<T
     let mut output = tokens[..start].to_vec();
     output.extend_from_slice(&tokens[at..]);
     Ok((output, settings))
+}
+
+fn setting_expression(tokens: &[TokenWithSpan], source: &str, precedence: u8) -> Result<(ast::Expr, usize)> {
+    let (value, used) = expression(tokens, source, precedence)?;
+    validate_setting_expression(&value, source)?;
+    Ok((value, used))
 }
 
 fn validate_setting_expression(value: &ast::Expr, source: &str) -> Result<()> {
@@ -178,21 +183,21 @@ fn validate_setting_expression(value: &ast::Expr, source: &str) -> Result<()> {
 fn parse_extent(tokens: &[TokenWithSpan], source: &str, span: sqlparser::tokenizer::Span) -> Result<(TemporalExtent, usize)> {
     if word(tokens.first(), "ALL") { return Ok((TemporalExtent::All, 1)); }
     if word(tokens.first(), "AS") && word(tokens.get(1), "OF") {
-        let (value, used) = expression(&tokens[2..], source, 0)?;
+        let (value, used) = setting_expression(&tokens[2..], source, 0)?;
         return Ok((TemporalExtent::At(value), used + 2));
     }
     if word(tokens.first(), "FROM") {
-        let (from, used) = expression(&tokens[1..], source, 0)?;
+        let (from, used) = setting_expression(&tokens[1..], source, 0)?;
         let at = used + 1;
         if !word(tokens.get(at), "TO") { return Err(sql_error("FROM requires TO", source, span)); }
-        let (to, used) = expression(&tokens[at + 1..], source, 0)?;
+        let (to, used) = setting_expression(&tokens[at + 1..], source, 0)?;
         return Ok((TemporalExtent::FromTo(from, Some(to)), at + used + 1));
     }
     if word(tokens.first(), "BETWEEN") {
-        let (from, used) = expression(&tokens[1..], source, 20)?;
+        let (from, used) = setting_expression(&tokens[1..], source, 20)?;
         let at = used + 1;
         if !word(tokens.get(at), "AND") { return Err(sql_error("BETWEEN requires AND", source, span)); }
-        let (to, used) = expression(&tokens[at + 1..], source, 20)?;
+        let (to, used) = setting_expression(&tokens[at + 1..], source, 20)?;
         return Ok((TemporalExtent::Between(from, to), at + used + 1));
     }
     Err(sql_error("Invalid temporal default", source, span))
