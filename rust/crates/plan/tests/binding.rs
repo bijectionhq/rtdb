@@ -205,3 +205,12 @@ fn strict_null_arguments_infer_null_type() {
     assert_eq!(function_type_with_args("round", &[one, null.clone()]).unwrap(), LogicalType::Null);
     assert_eq!(function_type_with_args("round", &[null, Expr::Literal(Value::I64(2))]).unwrap(), LogicalType::Null);
 }
+
+#[test]
+fn log_requires_two_arguments_matching_xtdb() {
+    let i64_ty = LogicalType::Scalar(ScalarType::I64);
+    assert_eq!(function_type("log", &[i64_ty.clone()]).unwrap_err().code, "xtdb/invalid-function-arity");
+    assert_eq!(function_type("log", &[LogicalType::Null]).unwrap_err().code, "xtdb/invalid-function-arity");
+    assert_eq!(function_type("log", &[i64_ty.clone(), i64_ty.clone()]).unwrap(), LogicalType::Scalar(ScalarType::F64));
+    assert_eq!(function_type("log", &[i64_ty, LogicalType::Null]).unwrap(), LogicalType::Null);
+}
