@@ -792,6 +792,10 @@ impl VersionedInventory {
 
 #[async_trait::async_trait]
 impl PublicationUploads for VersionedInventory {
+    async fn require_versioned(&self) -> rtdb_storage::Result<()> {
+        VersionedInventory::require_versioned(self).await.map_err(|error| version_error(&self.root, error))
+    }
+
     async fn reserve(&self, path: &Path, attempt: uuid::Uuid) -> rtdb_storage::Result<String> {
         let key = path.as_ref();
         let reserved = self.client.create_multipart_upload().bucket(&self.namespace.bucket).key(key)

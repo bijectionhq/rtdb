@@ -1,4 +1,6 @@
-use rtdb_format::journal::RankedCatalog;
+use bytes::Bytes;
+use rtdb_format::journal::{ObjectId, RankedCatalog};
+use rtdb_types::PhysicalObjectVersion;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -47,6 +49,9 @@ pub trait RankedAdmissionWriter: Send + Sync {
     fn scope(&self) -> RankedAdmissionScope;
 
     async fn prepared(&self, attempt: RankedAttempt) -> rtdb_types::Result<Option<RankedCatalog>>;
+
+    /// Stages ciphertext at the scope's original provider and returns its exact version.
+    async fn stage(&self, object: ObjectId, ciphertext: Bytes) -> rtdb_types::Result<PhysicalObjectVersion>;
 
     async fn admit(&self, catalogue: RankedCatalog) -> rtdb_types::Result<()>;
 }

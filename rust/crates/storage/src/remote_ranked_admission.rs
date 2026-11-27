@@ -4,23 +4,29 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use futures::{StreamExt, stream};
 use object_store::{
-    Error as ProviderError, ObjectStore as ProviderStore, ObjectStoreExt, PutMode, PutOptions,
+    Error as ProviderError, ObjectStoreExt, PutMode, PutOptions,
     UpdateVersion, path::Path,
 };
 use ring::digest::{Context, SHA256};
-use rtdb_format::journal::{ObjectKind, RankedCatalog, Record};
-use rtdb_types::{Anomaly, AnomalyCategory, Result};
+use rtdb_format::journal::{ObjectId, ObjectKind, RankedCatalog, Record};
+use rtdb_types::{Anomaly, AnomalyCategory, PhysicalObjectVersion, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::{RemoteStore, provider_error};
+use super::{RemoteObjects, RemoteStore, provider_error};
 use crate::ranked_admission::{RankedAdmissionWriter, RankedAttempt};
 use crate::{IoRegion, ObjectKey};
+
+#[path = "remote_ranked_staging.rs"]
+mod staging;
+pub use staging::RankedStagingUpload;
+use staging::StagingProvider;
 
 const PAGE_SIZE: usize = 100;
 const INVENTORY_READ_CONCURRENCY: usize = 16;
 const MAX_ATTEMPTS: usize = 12;
 const MAX_RECORD_BYTES: u64 = 1024;
+const MAX_ROOT_BYTES: u64 = 4096;
 
 pub use crate::ranked_admission::{
     ClosedRankedAdmission, RankedAdmissionPage, RankedAdmissionScope,
@@ -29,19 +35,22 @@ pub use crate::ranked_admission::{
 /// The original store orders publication and closure on one conditional root.
 #[derive(Clone)]
 pub struct RankedAdmission {
-    client: Arc<dyn ProviderStore>,
+    objects: Arc<RemoteObjects>,
     region: Arc<IoRegion>,
     scope: RankedAdmissionScope,
     key: ObjectKey,
     path: Path,
+    uploads: Option<StagingProvider>,
 }
 
-#[derive(Clone, Copy, Default, Deserialize, Serialize)]
+#[derive(Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Ledger {
     count: u64,
     inventory_sha256: [u8; 32],
     closed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    staging: Option<RankedStagingUpload>,
 }
 
 impl RemoteStore {
@@ -55,11 +64,12 @@ impl RemoteStore {
             scope.incarnation
         ))?;
         Ok(RankedAdmission {
-            client: self.objects.client.clone(),
+            objects: Arc::clone(&self.objects),
             region: self.io.clone(),
             scope,
             path: self.objects.path(&key)?,
             key,
+            uploads: None,
         })
     }
 }
@@ -71,7 +81,7 @@ impl RankedAdmission {
             .run_async(async move {
                 Ok(async {
                     let root = owner.path.clone().join("root");
-                    owner.create(&root, encode_root(Ledger::default())?).await?;
+                    owner.create(&root, encode_root(&Ledger::default())?).await?;
                     let (ledger, _) = owner.root().await?;
                     if ledger.closed {
                         return Err(closed());
@@ -91,8 +101,8 @@ impl RankedAdmission {
             .await?
     }
 
-    /// Closes admission and verifies the committed inventory before returning its receipt.
-    /// A verification error leaves admission closed.
+    /// Closes admission, drains the recorded upload and verifies the committed inventory.
+    /// A drain or verification error leaves admission closed for retry.
     pub async fn close(&self) -> Result<ClosedRankedAdmission> {
         let owner = self.clone();
         self.region
@@ -123,7 +133,7 @@ impl RankedAdmission {
             .run_async(async move {
                 Ok(async {
                     let (ledger, _) = owner.root().await?;
-                    if !ledger.closed || scope != owner.receipt(ledger) || after > ledger.count {
+                    if !ledger.closed || ledger.staging.is_some() || scope != owner.receipt(&ledger) || after > ledger.count {
                         return Err(invalid());
                     }
                     let end = after.saturating_add(limit as u64).min(ledger.count);
@@ -185,9 +195,9 @@ impl RankedAdmission {
             let next = Ledger {
                 count: sequence,
                 inventory_sha256: inventory_step(ledger.inventory_sha256, selected)?,
-                closed: false,
+                ..ledger
             };
-            if self.replace_root(next, version).await? && selected == catalogue {
+            if self.replace_root(&next, version).await? && selected == catalogue {
                 return Ok(sequence);
             }
         }
@@ -226,20 +236,23 @@ impl RankedAdmission {
 
     async fn close_admission(&self) -> Result<ClosedRankedAdmission> {
         for _ in 0..MAX_ATTEMPTS {
-            let (ledger, version) = self.root().await?;
-            let closed = Ledger {
-                closed: true,
-                ..ledger
-            };
-            if ledger.closed || self.replace_root(closed, version).await? {
-                self.verify_inventory(closed).await?;
-                return Ok(self.receipt(closed));
+            let (mut ledger, version) = self.root().await?;
+            if !ledger.closed {
+                ledger.closed = true;
+                if !self.replace_root(&ledger, version).await? {
+                    continue;
+                }
             }
+            if let Some(upload) = &ledger.staging {
+                self.drain_staging(upload).await?;
+            }
+            self.verify_inventory(&ledger).await?;
+            return Ok(self.receipt(&ledger));
         }
         Err(contention())
     }
 
-    async fn verify_inventory(&self, ledger: Ledger) -> Result<()> {
+    async fn verify_inventory(&self, ledger: &Ledger) -> Result<()> {
         let mut catalogues = stream::iter(1..=ledger.count)
             .map(|sequence| self.entry(sequence))
             .buffered(INVENTORY_READ_CONCURRENCY);
@@ -256,7 +269,7 @@ impl RankedAdmission {
         Ok(())
     }
 
-    fn receipt(&self, ledger: Ledger) -> ClosedRankedAdmission {
+    fn receipt(&self, ledger: &Ledger) -> ClosedRankedAdmission {
         ClosedRankedAdmission {
             scope: self.scope,
             admitted: ledger.count,
@@ -265,15 +278,18 @@ impl RankedAdmission {
     }
 
     async fn root(&self) -> Result<(Ledger, UpdateVersion)> {
-        let (bytes, version) = self.read(&self.path.clone().join("root")).await?;
+        let (bytes, version) = self.read(&self.path.clone().join("root"), MAX_ROOT_BYTES).await?;
         let ledger: Ledger = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
         if version.e_tag.is_none() || (ledger.count == 0) != (ledger.inventory_sha256 == [0; 32]) {
             return Err(invalid());
         }
+        if let Some(upload) = &ledger.staging {
+            upload.object(self.scope)?;
+        }
         Ok((ledger, version))
     }
 
-    async fn replace_root(&self, ledger: Ledger, version: UpdateVersion) -> Result<bool> {
+    async fn replace_root(&self, ledger: &Ledger, version: UpdateVersion) -> Result<bool> {
         self.put(
             &self.path.clone().join("root"),
             encode_root(ledger)?,
@@ -294,7 +310,7 @@ impl RankedAdmission {
     }
 
     async fn read_catalogue(&self, path: &Path) -> Result<RankedCatalog> {
-        let (bytes, _) = self.read(path).await?;
+        let (bytes, _) = self.read(path, MAX_RECORD_BYTES).await?;
         let Record::RankedCatalog(catalogue) = Record::decode(&bytes)? else {
             return Err(invalid());
         };
@@ -313,13 +329,13 @@ impl RankedAdmission {
         Ok(())
     }
 
-    async fn read(&self, path: &Path) -> Result<(Bytes, UpdateVersion)> {
+    async fn read(&self, path: &Path, max_bytes: u64) -> Result<(Bytes, UpdateVersion)> {
         let reply = self
-            .client
+            .objects.client
             .get(path)
             .await
             .map_err(|error| provider_error(&self.key, error))?;
-        if reply.meta.size > MAX_RECORD_BYTES {
+        if reply.meta.size > max_bytes {
             return Err(invalid());
         }
         let version = UpdateVersion {
@@ -342,7 +358,7 @@ impl RankedAdmission {
             mode,
             ..Default::default()
         };
-        match self.client.put_opts(path, bytes.into(), options).await {
+        match self.objects.client.put_opts(path, bytes.into(), options).await {
             Ok(_) => Ok(true),
             Err(ProviderError::AlreadyExists { .. } | ProviderError::Precondition { .. }) => {
                 Ok(false)
@@ -352,8 +368,8 @@ impl RankedAdmission {
     }
 }
 
-fn encode_root(ledger: Ledger) -> Result<Bytes> {
-    serde_json::to_vec(&ledger)
+fn encode_root(ledger: &Ledger) -> Result<Bytes> {
+    serde_json::to_vec(ledger)
         .map(Bytes::from)
         .map_err(|_| invalid())
 }
@@ -373,6 +389,10 @@ impl RankedAdmissionWriter for RankedAdmission {
 
     async fn admit(&self, catalogue: RankedCatalog) -> Result<()> {
         self.publish(catalogue).await.map(drop)
+    }
+
+    async fn stage(&self, object: ObjectId, ciphertext: Bytes) -> Result<PhysicalObjectVersion> {
+        self.stage_object(object, ciphertext).await
     }
 }
 
@@ -550,10 +570,11 @@ mod tests {
             count: 2,
             inventory_sha256: [9; 32],
             closed: false,
+            staging: None,
         };
         assert!(
             !writer
-                .replace_root(proposed, earlier_version)
+                .replace_root(&proposed, earlier_version)
                 .await
                 .unwrap()
         );

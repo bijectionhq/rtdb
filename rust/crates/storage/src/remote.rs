@@ -15,7 +15,7 @@ mod catalog;
 mod read_drain;
 #[path = "remote_ranked_admission.rs"]
 mod ranked_admission;
-pub use ranked_admission::{ClosedRankedAdmission, RankedAdmission, RankedAdmissionPage, RankedAdmissionScope};
+pub use ranked_admission::{ClosedRankedAdmission, RankedAdmission, RankedAdmissionPage, RankedAdmissionScope, RankedStagingUpload};
 #[cfg(feature = "remote-cache-http")]
 pub mod cache_http;
 
@@ -103,6 +103,10 @@ pub enum PublicationResult {
 /// A provider with a durable, independently abortable upload capability.
 #[async_trait]
 pub trait PublicationUploads: Send + Sync {
+    /// Confirms that completed uploads will have immutable provider version IDs.
+    async fn require_versioned(&self) -> Result<()> {
+        Err(Error::Closed("The publication provider does not confirm immutable versions".into()))
+    }
     /// Reserves an empty upload for a provider-encoded key.
     async fn reserve(&self, path: &Path, attempt: uuid::Uuid) -> Result<String>;
     /// Makes the upload visible only if no object already holds that key.

@@ -180,9 +180,17 @@ impl S3Config {
             return Err(Anomaly::incorrect("xtdb.aws/terminal-scope", "Ranked admission requires an ordinary S3 allocation"));
         }
         self.require_cell_root(storage_root)?;
-        self.open_store(storage_root, remotes, io, StoreKind::Classic(RemoteKeyLayout::Escaped))
-            .await?
-            .ranked_admission(scope)
+        let store = self.open_store(storage_root, remotes, io, StoreKind::Classic(RemoteKeyLayout::Escaped)).await?;
+        let admission = store.ranked_admission(scope)?;
+        #[cfg(feature = "versioning")]
+        let admission = {
+            let inventory = self.open_inventory(storage_root, remotes).await?;
+            if store.s3_namespace() != Some(inventory.namespace()) {
+                return Err(Anomaly::incorrect("rtdb.s3/ranked-admission", "Ranked staging and admission must use the same S3 namespace"));
+            }
+            admission.with_staging_uploads(inventory.namespace().clone(), Arc::new(inventory))
+        };
+        Ok(admission)
     }
 
     pub async fn open_classic_jvm_literal(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>> {

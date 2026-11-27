@@ -126,6 +126,10 @@ impl PreparedObject {
         self.id
     }
 
+    pub fn ciphertext(&self) -> &Bytes {
+        &self.bytes
+    }
+
     pub async fn put(&self, store: &dyn ObjectStore) -> Result<()> {
         let key = key(self.id)?;
         store

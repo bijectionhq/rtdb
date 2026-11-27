@@ -210,6 +210,14 @@ A missing or different committed entry leaves admission closed and prevents the 
 Restore the original committed entries and retry freeze for the same recovery.
 Preserve committed entries against replacement through outcome discovery.
 
+The commissioned ranked writer stages files and manifests at the original versioned allocation.
+The writer records the exact multipart upload in the provider ledger before sending bytes.
+The ledger permits one recorded upload per ranked scope.
+An interrupted upload that stays recorded keeps subsequent ranked staging busy until the scope closes and the original provider drains it.
+Closure cancels any recorded upload and waits for the original provider to confirm that its parts can no longer be addressed.
+Give the writer permission to verify bucket versioning.
+Give both the writer and original ranked custodian permission to abort scoped multipart uploads and inspect their parts at the commissioned allocation.
+
 Use `ranked-outcomes` on the pending or published recovery to page through the original provider's admitted catalogues, including entries whose source operation IDs were lost. Pass the returned `next_after` value as `--after` until the response ends the scan.
 
 ```sh
@@ -402,7 +410,7 @@ Release after publication requires a handoff to the destination's serving custod
 
 Ranked derivative publication needs an authority that admits staging for the current incarnation and fences or drains provider work before that incarnation loses authority.
 The closed ranked prefix accounts for admitted catalogues.
-Qualification also needs original-provider evidence that staging reservations outside that prefix have drained or been retired.
+The provider closure accounts for an outstanding recorded multipart upload and leaves completed objects in their original allocation.
 Derivative custody must retain or retire the exact primary cut, derivative object versions and generation keys.
 An assertion erasure report also needs signed settlements from each backup and derivative custodian in its ordered roster.
 

@@ -193,7 +193,13 @@ impl MultiDatabase {
                 .objects
                 .file(self.stream.kms.as_ref(), build.generation, &file)
                 .await?;
-            let (ciphertext_bytes, version) = object.put_observed(self.store.as_ref()).await?;
+            let (ciphertext_bytes, version) = if let Some(admission) = &self.ranked_admission {
+                let ciphertext = object.ciphertext();
+                let version = admission.stage(object.id(), ciphertext.clone()).await?;
+                (ciphertext.len(), Some(version))
+            } else {
+                object.put_observed(self.store.as_ref()).await?
+            };
             members.push(object.id());
             inventory.files.push(File {
                 plaintext_bytes: file.len(),
@@ -221,7 +227,11 @@ impl MultiDatabase {
                 },
             )
             .await?;
-        manifest.put(self.store.as_ref()).await?;
+        if let Some(admission) = &self.ranked_admission {
+            admission.stage(manifest.id(), manifest.ciphertext().clone()).await?;
+        } else {
+            manifest.put(self.store.as_ref()).await?;
+        }
         Ok(RankedCatalog {
             manifest: manifest.id(),
             position: build.cut.basis.position(),
