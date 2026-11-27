@@ -231,11 +231,17 @@
   (let [overrides (into {} (keep (fn [[sym fixture]] (when-let [v (resolve sym)] [@v fixture]))) fixture-overrides)]
     (mapv #(get overrides % %) fixtures)))
 
+(defn- direct-redefs []
+  (if-let [with-xtdb (resolve 'xtdb.sql.logic-test.runner/with-xtdb)]
+    {with-xtdb (fixture-overrides 'xtdb.sql.logic-test.runner/with-xtdb)}
+    {}))
+
 (defn- run-case [v]
   (let [fixtures (meta (:ns (meta v)))
         once (t/join-fixtures (native-fixtures (::t/once-fixtures fixtures)))
         each (t/join-fixtures (native-fixtures (::t/each-fixtures fixtures)))]
-    (once #(tu/with-allocator (fn [] (each (:test (meta v))))))))
+    (with-redefs-fn (direct-redefs)
+      #(once (fn [] (tu/with-allocator (fn [] (each (:test (meta v))))))))))
 
 (def ^:private max-recorded-failures 200)
 

@@ -24,7 +24,7 @@
   },
   "sql-logic-runs-through-run-sql-logic": {
    "outcome": "jvm-api-boundary",
-   "decision": "The SQL logic test runner's XTDB engine plans through the JVM node's database catalog; RTDB runs the SQL logic corpus through rust/conformance/run_sql_logic.py (rust/conformance/sql-logic.adoc) instead.",
+   "decision": "The SQL logic test runner's XTDB engine plans through the JVM node's database catalog; RTDB runs the SQL logic corpus through rust/conformance/run_sql_logic.py and rust/conformance/run_sql_logic_native.py (rust/conformance/sql-logic.adoc) instead.",
    "match": [
     "plans through the JVM database catalog"
    ]
@@ -963,67 +963,67 @@
   },
   {
    "var": "xtdb.sql.logic-test.direct-sql-test/direct-sql--dml",
-   "decision": "native-database-is-not-a-jvm-node"
+   "decision": "sql-logic-runs-through-run-sql-logic"
   },
   {
    "var": "xtdb.sql.logic-test.direct-sql-test/direct-sql--dollar_identifiers",
-   "decision": "native-database-is-not-a-jvm-node"
+   "decision": "sql-logic-runs-through-run-sql-logic"
   },
   {
    "var": "xtdb.sql.logic-test.direct-sql-test/direct-sql--gcse-statistics",
-   "decision": "native-database-is-not-a-jvm-node"
+   "decision": "sql-logic-runs-through-run-sql-logic"
   },
   {
    "var": "xtdb.sql.logic-test.direct-sql-test/direct-sql--limit",
-   "decision": "native-database-is-not-a-jvm-node"
+   "decision": "sql-logic-runs-through-run-sql-logic"
   },
   {
    "var": "xtdb.sql.logic-test.direct-sql-test/direct-sql--no-projected-cols",
-   "decision": "native-database-is-not-a-jvm-node"
+   "decision": "sql-logic-runs-through-run-sql-logic"
   },
   {
    "var": "xtdb.sql.logic-test.direct-sql-test/direct-sql--numeric-value-functions-6.28",
-   "decision": "native-database-is-not-a-jvm-node"
+   "decision": "sql-logic-runs-through-run-sql-logic"
   },
   {
    "var": "xtdb.sql.logic-test.direct-sql-test/direct-sql--object-array",
-   "decision": "native-database-is-not-a-jvm-node"
+   "decision": "sql-logic-runs-through-run-sql-logic"
   },
   {
    "var": "xtdb.sql.logic-test.direct-sql-test/direct-sql--period_predicates",
-   "decision": "native-database-is-not-a-jvm-node"
+   "decision": "sql-logic-runs-through-run-sql-logic"
   },
   {
    "var": "xtdb.sql.logic-test.direct-sql-test/direct-sql--period_specifications",
-   "decision": "native-database-is-not-a-jvm-node"
+   "decision": "sql-logic-runs-through-run-sql-logic"
   },
   {
    "var": "xtdb.sql.logic-test.direct-sql-test/direct-sql--periods-and-derived-cols",
-   "decision": "native-database-is-not-a-jvm-node"
+   "decision": "sql-logic-runs-through-run-sql-logic"
   },
   {
    "var": "xtdb.sql.logic-test.direct-sql-test/direct-sql--qualified_joins",
-   "decision": "native-database-is-not-a-jvm-node"
+   "decision": "sql-logic-runs-through-run-sql-logic"
   },
   {
    "var": "xtdb.sql.logic-test.direct-sql-test/direct-sql--qualified_joins-correlated",
-   "decision": "native-database-is-not-a-jvm-node"
+   "decision": "sql-logic-runs-through-run-sql-logic"
   },
   {
    "var": "xtdb.sql.logic-test.direct-sql-test/direct-sql--set-functions",
-   "decision": "native-database-is-not-a-jvm-node"
+   "decision": "sql-logic-runs-through-run-sql-logic"
   },
   {
    "var": "xtdb.sql.logic-test.direct-sql-test/direct-sql--sl-a5",
-   "decision": "native-database-is-not-a-jvm-node"
+   "decision": "sql-logic-runs-through-run-sql-logic"
   },
   {
    "var": "xtdb.sql.logic-test.direct-sql-test/direct-sql--sl-demo",
-   "decision": "native-database-is-not-a-jvm-node"
+   "decision": "sql-logic-runs-through-run-sql-logic"
   },
   {
    "var": "xtdb.sql.logic-test.direct-sql-test/direct-sql--system_time",
-   "decision": "native-database-is-not-a-jvm-node"
+   "decision": "sql-logic-runs-through-run-sql-logic"
   },
   {
    "var": "xtdb.sql.logic-test.runner-test/test-insert->doc->doc",
