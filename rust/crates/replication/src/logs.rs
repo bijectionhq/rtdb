@@ -288,8 +288,12 @@ impl PartitionLogs {
 
     pub fn validate_source_boundary(&self, database: &str, after: SourcePosition) -> Result<()> {
         let offset = after.after_offset(self.source_epoch);
+        let future_epoch = after.0 >= 0 && after.epoch() > self.source_epoch;
+        if !future_epoch {
+            self.source.establish_source_checkpoint(LogOffset(offset));
+        }
         let latest = latest(self.source.as_ref())?.0;
-        if after.0 >= 0 && after.epoch() > self.source_epoch || offset > latest {
+        if future_epoch || offset > latest {
             let log_state = if latest == -1 { "the log is empty".to_owned() } else { format!("epoch={}, offset={latest}", self.source_epoch.0) };
             let message = format!("Database '{database}' failed to start due to an invalid transaction log state ({log_state}) \
                 that does not correspond with the latest processed message (epoch={} and offset={}).\n\n\

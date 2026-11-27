@@ -11,8 +11,9 @@
 -- Source and replica are separate ordered streams.
 -- Classic uses two durable logs, while a single-journal standalone attachment keeps its source intake in process and uses the local replica journal for durability.
 -- The standalone replica carries resolved transactions and source coordinates for applied control messages.
--- On reopen, the standalone source starts after the replica's durable frame byte offset.
+-- On reopen, the standalone source allocates new positions above the replica's durable frame byte offset.
 -- Every advance of a durable source position has a replica frame, so no reopened source position can reuse a committed coordinate.
+-- The source reports the actual position restored from a checkpoint, advanced by replay or application admission.
 -- The default source and replica logs share the `SharedLog` port for ordered append, latest position, and replay from a prior position.
 -- The sealed Kafka provider can close key admission below an ordered native recovery cut on the original topic.
 -- The cut binds the clean checkpoint digest, the exclusive offset and the receipt deadline.

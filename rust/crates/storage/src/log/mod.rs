@@ -370,6 +370,8 @@ pub trait Log: Send + Sync {
     /// The reopened journal retains its synced prefix, and reads expose only that durable history.
     fn retains_synced_history(&self) -> bool { false }
     fn is_volatile_intake(&self) -> bool { false }
+    /// Establishes an applied source position from the selected checkpoint when intake is volatile.
+    fn establish_source_checkpoint(&self, _through: LogOffset) {}
     /// The provider's fixed size limit for one append, before any provider-specific wrapping.
     /// Absence means callers cannot admit an inline-only write using this provider.
     fn maximum_append_bytes(&self) -> Option<usize> { None }

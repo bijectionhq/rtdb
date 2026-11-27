@@ -635,7 +635,7 @@ impl NativeResources {
                     // New intake therefore starts above all durable source positions without scanning the replica.
                     let start = replica.latest()?.0.checked_add(1).ok_or_else(|| invalid("The local journal has no remaining source positions"))?;
                     SourcePosition::from_epoch_offset(epoch, start)?;
-                    let source = Arc::new(IntakeLog::new(self.maximum_log_message_bytes, LogOffset(start)));
+                    let source = Arc::new(IntakeLog::for_local_replica(self.maximum_log_message_bytes, LogOffset(start)));
                     let trimming = {
                         let source = Arc::clone(&source);
                         async move {
@@ -805,7 +805,9 @@ async fn single_local_journal_reopens_intake_after_its_committed_prefix() -> Res
     let reopened = native.open_logs("xtdb", &config, LogAccess::ReadWrite, CancellationToken::new(), &storage).await?;
     assert!(!logs.join("LOG").exists());
     assert_eq!(reopened.replica.journal_lineage(), lineage);
-    assert_eq!(reopened.source.latest()?, terminal.offset);
+    assert_eq!(reopened.source.latest()?, LogOffset(-1));
+    reopened.source.record_applied(original_source.offset);
+    assert_eq!(reopened.source.latest()?, original_source.offset);
     let next = reopened.source.enqueue(Bytes::from_static(b"next"), Timestamp(0)).await?.durable().await?;
     assert_eq!(next.offset, LogOffset(terminal.offset.0 + 1));
     assert!(next.offset > original_source.offset);

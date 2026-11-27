@@ -8,7 +8,12 @@ use super::{AppendReceipt, Log, LogOffset, LogRange, LogRecord, LogTail, MemoryL
 use crate::Result;
 
 /// The holder's in-process source log keeps pending bytes until their replica outcomes are installed.
-pub struct IntakeLog { log: MemoryLog, consumed: AtomicI64, start: i64 }
+pub struct IntakeLog {
+    log: MemoryLog,
+    consumed: AtomicI64,
+    start: i64,
+    reported: Option<AtomicI64>,
+}
 
 impl IntakeLog {
     pub fn new(maximum_message_bytes: usize, start: LogOffset) -> Self {
@@ -18,6 +23,17 @@ impl IntakeLog {
             log: MemoryLog::bounded_starting_at(maximum_message_bytes, start, capacity),
             consumed: AtomicI64::new(start.0 - 1),
             start: start.0,
+            reported: None,
+        }
+    }
+
+    pub fn for_local_replica(maximum_message_bytes: usize, start: LogOffset) -> Self {
+        Self { reported: Some(AtomicI64::new(-1)), ..Self::new(maximum_message_bytes, start) }
+    }
+
+    fn report(&self, position: LogOffset) {
+        if let Some(reported) = &self.reported {
+            reported.fetch_max(position.0, Ordering::AcqRel);
         }
     }
 
@@ -37,11 +53,26 @@ impl Log for IntakeLog {
 
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt> {
         self.trim();
-        self.log.append_owned(payload, timestamp)
+        let appended = self.log.append_owned(payload, timestamp)?;
+        if self.reported.is_some() {
+            self.report(self.log.latest()?);
+        }
+        Ok(appended)
     }
-    fn latest(&self) -> Result<LogOffset> { self.log.latest() }
+    fn latest(&self) -> Result<LogOffset> {
+        match &self.reported {
+            Some(reported) => Ok(LogOffset(reported.load(Ordering::Acquire))),
+            None => self.log.latest(),
+        }
+    }
+    fn establish_source_checkpoint(&self, through: LogOffset) {
+        if through.0 < self.start {
+            self.report(through);
+        }
+    }
     fn record_applied(&self, through: LogOffset) {
         self.consumed.fetch_max(through.0, Ordering::AcqRel);
+        self.report(through);
     }
     async fn tail(&self, after: LogOffset) -> Result<Box<dyn LogTail>> {
         // Positions below the intake's start were never assigned to it, so a reader asking for them starts at the start; trimmed positions above it still fail as unavailable.
@@ -74,6 +105,23 @@ mod tests {
         assert!(intake.tail(LogOffset(9)).await.is_err());
         let pending = intake.read_range(LogOffset(11), LogOffset(12)).await.unwrap();
         assert_eq!(pending[0].payload.as_ref(), b"pending");
+    }
+
+    #[tokio::test]
+    async fn local_intake_reports_source_progress_independently_of_its_allocation_floor() {
+        let intake = IntakeLog::for_local_replica(4096, LogOffset(100));
+        assert_eq!(intake.latest().unwrap(), LogOffset(-1));
+        intake.establish_source_checkpoint(LogOffset(101));
+        assert_eq!(intake.latest().unwrap(), LogOffset(-1));
+        intake.establish_source_checkpoint(LogOffset(42));
+        assert_eq!(intake.latest().unwrap(), LogOffset(42));
+        intake.record_applied(LogOffset(49));
+        assert_eq!(intake.latest().unwrap(), LogOffset(49));
+        let appended = intake.enqueue(Bytes::from_static(b"next"), Timestamp(0)).await.unwrap();
+        assert_eq!(appended.durable().await.unwrap().offset, LogOffset(100));
+        assert_eq!(intake.latest().unwrap(), LogOffset(100));
+        intake.record_applied(LogOffset(50));
+        assert_eq!(intake.latest().unwrap(), LogOffset(100));
     }
 
     #[tokio::test]
