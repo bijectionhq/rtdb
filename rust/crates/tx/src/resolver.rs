@@ -169,7 +169,7 @@ impl ResolvedTx {
             clock_certificate_sha256: journal_before.map(|cutoff| cutoff.certificate_sha256().to_vec()),
         }))?;
         if ReplicaEnvelope::maximum_encoded_len(body.body()) > maximum {
-            return Err(Anomaly::incorrect("rtdb.owned/replica-inline-bound", "The resolved transaction exceeds the writer's inline replica limit"));
+            return Err(Anomaly::incorrect("rtdb.owned/replica-inline-bound", "The resolved transaction exceeds the writer's inline replica limit").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded));
         }
         // The effect and receipt are encoded, and the candidate can still be discarded.
         // Round up the sampled clock because its microsecond coordinate was truncated.
@@ -1103,6 +1103,7 @@ impl<'a> OpenTransaction<'a> {
             Mutation::Erase { table, input } => (Some(table), input, MutationKind::Erase),
             Mutation::Assert { input, message } => {
                 let mut cursor = execute(input, context, arguments, syntax).await?;
+                // TODO(w4/errors): assert_failed helper
                 if cursor.next_batch().await?.is_none() { return Err(Anomaly::new(AnomalyCategory::Conflict, footprint_grant_state::ASSERT_FAILED, message.unwrap_or_else(|| "Assert failed".into()))); }
                 return Ok(());
             }
@@ -3915,7 +3916,7 @@ impl<'a> OpenTransaction<'a> {
         assertion_ordinal: Option<NonZeroU32>,
         fixed: Result<Option<(FixedRangeSide, Arc<MemoryReservation>)>>,
     ) -> Result<()> {
-        let too_large = || Anomaly::incorrect("rtdb.owned/change-group-too-large", "An owned relation's change group exceeds its byte limit");
+        let too_large = || Anomaly::incorrect("rtdb.owned/change-group-too-large", "An owned relation's change group exceeds its byte limit").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded);
         use rtdb_types::{OwnedChange, OwnedChangeKind};
         let group = self.owned_changes.entry(relation.name().to_owned()).or_insert_with(|| PendingOwnedChanges {
             fixed_sides: Some(Vec::new()), ..PendingOwnedChanges::default()
