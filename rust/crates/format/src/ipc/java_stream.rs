@@ -1,14 +1,15 @@
-//! Writes Arrow streams directly in the reference's Java layout, without an arrow-rs stream to rewrite.
-//! The bytes are those of `JavaLayout` over arrow-rs's `StreamWriter` with the decimal schema patch: every schema and batch
-//! message is built in the reference's call order, and each body buffer is the slice arrow-rs would have written, kept, dropped
-//! or replaced with an all-valid bitmap exactly as `JavaLayout` plans it.
-//! Dictionaries, views, list views and run-end encoding are not written here; `supports` sends those schemas to the rewrite.
+//! Writes Arrow streams and files directly in the reference's Java layout (`xtdb.arrow.ArrowUnloader` in `STREAM` and `FILE`
+//! modes), without an arrow-rs stream to rewrite.
+//! Every schema, record-batch and file-footer message is built in the reference's call order, and each body buffer is the slice
+//! arrow-rs would have written, kept, dropped or replaced with an all-valid bitmap exactly as `JavaLayout` plans it.
+//! Streams leave out dictionaries, views, list views and run-end encoding (`supports` sends those to `plain_layout`); files also
+//! write run-end encoded columns natively as XTDB's `RunEndEncodedVector` does.
 
 use std::collections::HashMap;
 use std::io::{self, Write};
 
-use arrow_array::{Array, OffsetSizeTrait, RecordBatch};
-use arrow_buffer::Buffer;
+use arrow_array::{Array, ArrowNativeTypeOp, OffsetSizeTrait, RecordBatch, types::{Int16Type, Int32Type, Int64Type, RunEndIndexType}};
+use arrow_buffer::{ArrowNativeType, Buffer};
 use arrow_data::{ArrayData, BufferSpec};
 use arrow_ipc::MessageHeader;
 use arrow_schema::{ArrowError, DataType, Field, IntervalUnit, Schema, TimeUnit, UnionMode};
@@ -20,6 +21,7 @@ use super::invalid;
 use super::java_layout::{frame, message, write_all_valid};
 
 const VERSION: i16 = arrow_ipc::MetadataVersion::V5.0;
+pub(super) const FILE_MAGIC: &[u8; 6] = b"ARROW1";
 
 /// Whether every field of `schema` has a layout this writer reproduces.
 pub(super) fn supports(schema: &Schema) -> bool {
@@ -65,11 +67,87 @@ pub(super) fn write_stream<'a, W: Write>(schema: &Schema, pages: impl IntoIterat
     Ok(sink)
 }
 
+/// Incremental Arrow file writer in the reference's Java layout (`xtdb.arrow.ArrowUnloader.Mode.FILE`):
+/// the magic padded to eight bytes, the schema and batch frames, its single zero end marker, then the Java-layout footer,
+/// its length and the magic.
+pub(super) struct FileWriter<W> {
+    sink: W,
+    schema: Schema,
+    position: u64,
+    blocks: Vec<arrow_ipc::Block>,
+    body: Body,
+}
+
+impl<W: Write> FileWriter<W> {
+    pub(super) fn new(mut sink: W, schema: &Schema) -> Result<Self> {
+        let metadata = schema_message(schema)?;
+        sink.write_all(FILE_MAGIC).map_err(invalid)?;
+        sink.write_all(&[0; 2]).map_err(invalid)?;
+        let framed = frame(&mut sink, &metadata, true).map_err(io_error)?;
+        let position = 8u64.checked_add(u64::try_from(framed).map_err(invalid)?)
+            .ok_or_else(|| invalid("Arrow file length exceeds the format"))?;
+        Ok(Self {
+            sink,
+            schema: schema.clone(),
+            position,
+            blocks: Vec::new(),
+            body: Body::default(),
+        })
+    }
+
+    pub(super) fn validate_batch(&self, page: &RecordBatch) -> Result<()> {
+        if page.schema_ref().as_ref() != &self.schema {
+            return Err(Anomaly::incorrect("rtdb.format/arrow-schema", "Arrow page schema differs from its declared stream schema"));
+        }
+        Ok(())
+    }
+
+    /// Writes one page whose schema matches this file's schema.
+    pub(super) fn write_batch(&mut self, page: &RecordBatch) -> Result<()> {
+        self.body.clear();
+        for (field, column) in self.schema.fields().iter().zip(page.columns()) {
+            self.body.column(field, &column.to_data(), column.null_count())?;
+        }
+        let metadata = self.body.message(page.num_rows())?;
+        let offset = i64::try_from(self.position).map_err(invalid)?;
+        let framed = frame(&mut self.sink, &metadata, true).map_err(io_error)?;
+        let metadata_length = i32::try_from(framed).map_err(invalid)?;
+        self.body.write(&mut self.sink).map_err(io_error)?;
+        let body_length = self.body.length;
+        let block_bytes = u64::try_from(framed).map_err(invalid)?
+            .checked_add(u64::try_from(body_length).map_err(invalid)?)
+            .ok_or_else(|| invalid("Arrow file length exceeds the format"))?;
+        self.position = self.position.checked_add(block_bytes)
+            .ok_or_else(|| invalid("Arrow file length exceeds the format"))?;
+        self.blocks.push(arrow_ipc::Block::new(offset, metadata_length, body_length));
+        Ok(())
+    }
+
+    pub(super) fn sink(&mut self) -> &mut W { &mut self.sink }
+
+    pub(super) fn finish(mut self) -> Result<W> {
+        self.sink.write_all(&[0; 4]).map_err(invalid)?;
+        let footer = file_footer(&self.schema, &self.blocks)?;
+        self.sink.write_all(&footer).map_err(invalid)?;
+        self.sink.write_all(&i32::try_from(footer.len()).map_err(invalid)?.to_le_bytes()).map_err(invalid)?;
+        self.sink.write_all(FILE_MAGIC).map_err(invalid)?;
+        self.sink.flush().map_err(invalid)?;
+        Ok(self.sink)
+    }
+}
+
 fn io_error(error: io::Error) -> Anomaly { invalid(ArrowError::from(error)) }
 
 /// The Java-layout schema message for `schema`, decimal parameters at their full signed width.
 /// Annotation errors are those `DecimalSchema::new` reports, found in the same post-order.
 pub(super) fn schema_message(schema: &Schema) -> Result<Vec<u8>> {
+    validate_schema(schema)?;
+    let mut builder = FlatBufferBuilder::new();
+    let header = java_schema(&mut builder, schema)?;
+    Ok(message(builder, VERSION, MessageHeader::Schema, header.as_union_value(), 0))
+}
+
+fn validate_schema(schema: &Schema) -> Result<()> {
     fn validate(field: &Field) -> Result<()> {
         for child in children(field.data_type()) { validate(child)?; }
         decimal_field_parameters(field).map(drop)
@@ -78,16 +156,34 @@ pub(super) fn schema_message(schema: &Schema) -> Result<Vec<u8>> {
         return Err(Anomaly::unsupported("rtdb.format/decimal-metadata", "Decimal annotation belongs to a field"));
     }
     for field in schema.fields() { validate(field)?; }
-    let mut builder = FlatBufferBuilder::new();
-    let fields = schema.fields().iter().map(|field| java_field(&mut builder, field)).collect::<Result<Vec<_>>>()?;
+    Ok(())
+}
+
+fn java_schema<'b>(builder: &mut FlatBufferBuilder<'b>, schema: &Schema) -> Result<WIPOffset<arrow_ipc::Schema<'b>>> {
+    let fields = schema.fields().iter().map(|field| java_field(builder, field)).collect::<Result<Vec<_>>>()?;
     let fields = builder.create_vector(&fields);
-    let metadata = key_values(&mut builder, schema.metadata(), false);
-    let mut table = arrow_ipc::SchemaBuilder::new(&mut builder);
+    let metadata = key_values(builder, schema.metadata(), false);
+    let mut table = arrow_ipc::SchemaBuilder::new(builder);
     table.add_endianness(arrow_ipc::Endianness::Little);
     table.add_fields(fields);
     table.add_custom_metadata(metadata);
-    let header = table.finish();
-    Ok(message(builder, VERSION, MessageHeader::Schema, header.as_union_value(), 0))
+    Ok(table.finish())
+}
+
+/// `ArrowFooter.writeTo` without dictionaries or custom metadata, as `ArrowUnloader`'s file mode writes it.
+fn file_footer(schema: &Schema, blocks: &[arrow_ipc::Block]) -> Result<Vec<u8>> {
+    let mut builder = FlatBufferBuilder::new();
+    let schema = java_schema(&mut builder, schema)?;
+    let dictionaries = builder.create_vector::<arrow_ipc::Block>(&[]);
+    let batches = builder.create_vector(blocks);
+    let mut table = arrow_ipc::FooterBuilder::new(&mut builder);
+    table.add_schema(schema);
+    table.add_dictionaries(dictionaries);
+    table.add_recordBatches(batches);
+    table.add_version(arrow_ipc::MetadataVersion::V5);
+    let root = table.finish();
+    builder.finish(root, None);
+    Ok(builder.finished_data().to_vec())
 }
 
 fn reserved(key: &str) -> bool { matches!(key, INTERNAL_DECIMAL_PRECISION_KEY | INTERNAL_DECIMAL_SCALE_KEY) }
@@ -230,6 +326,9 @@ fn java_type<'b>(builder: &mut FlatBufferBuilder<'b>, field: &Field) -> Result<(
             if let Some(ids) = ids { t.add_typeIds(ids); }
             (Type::Union, t.finish().as_union_value())
         }
+        DataType::RunEndEncoded(ends, _) if matches!(ends.data_type(), DataType::Int16 | DataType::Int32 | DataType::Int64) => {
+            empty!(RunEndEncoded, RunEndEncodedBuilder)
+        }
         other => return Err(invalid(format!("Arrow type {other} has no native Java-layout encoding"))),
     })
 }
@@ -272,11 +371,12 @@ impl Body {
         let nulls = match data.data_type() {
             DataType::Union(..) => -1,
             DataType::Null => length,
+            DataType::RunEndEncoded(..) => 0,
             _ if field.is_nullable() => -1,
             _ => 0,
         };
         self.nodes.push(arrow_ipc::FieldNode::new(length, nulls));
-        if !matches!(data.data_type(), DataType::Null | DataType::Union(..)) {
+        if !matches!(data.data_type(), DataType::Null | DataType::Union(..) | DataType::RunEndEncoded(..)) {
             // arrow-rs writes a bitmap only for a column with nulls; the reference keeps one only for nullable fields, always present.
             let part = match data.nulls() {
                 _ if !field.is_nullable() => Part::Empty,
@@ -298,6 +398,14 @@ impl Body {
                 let child = data.child_data()[0].slice(data.offset() * size, rows * size);
                 let field = fields.first().ok_or_else(|| invalid("Arrow list field has no child"))?;
                 self.column(field, &child, child.null_count())
+            }
+            DataType::RunEndEncoded(..) => {
+                let [ends_field, values_field] = fields.as_slice() else {
+                    return Err(invalid("Arrow run-end column differs from its field's children"));
+                };
+                let (run_ends, values) = unslice_run_end(data)?;
+                self.column(ends_field, &run_ends, run_ends.null_count())?;
+                self.column(values_field, &values, values.null_count())
             }
             DataType::Struct(_) | DataType::Union(..) | DataType::Null => {
                 for buffer in data.buffers() { self.push(Part::Bytes(buffer.clone()))?; }
@@ -385,6 +493,58 @@ fn rebase<O: OffsetSizeTrait>(data: &ArrayData) -> (Buffer, usize, usize) {
         slice.iter().map(|offset| *offset - first).collect()
     };
     (rebased, first.as_usize(), last.as_usize() - first.as_usize())
+}
+
+/// Returns zero-offset `(run_ends, values)` children covering `data`'s logical slice.
+fn unslice_run_end(data: &ArrayData) -> Result<(ArrayData, ArrayData)> {
+    let [run_ends, values] = data.child_data() else {
+        return Err(invalid("Arrow run-end column differs from its field's children"));
+    };
+    if data.is_empty() {
+        return Ok((run_ends.slice(0, 0), values.slice(0, 0)));
+    }
+    match run_ends.data_type() {
+        DataType::Int16 => unslice_runs::<Int16Type>(data, run_ends, values),
+        DataType::Int32 => unslice_runs::<Int32Type>(data, run_ends, values),
+        DataType::Int64 => unslice_runs::<Int64Type>(data, run_ends, values),
+        other => Err(invalid(format!("Arrow run-end index type {other} is unsupported"))),
+    }
+}
+
+fn unslice_runs<R: RunEndIndexType>(data: &ArrayData, run_ends: &ArrayData, values: &ArrayData) -> Result<(ArrayData, ArrayData)>
+where
+    R::Native: Ord,
+{
+    let buffer = run_ends.buffers().first().ok_or_else(|| invalid("Arrow run-ends child has no buffer"))?;
+    let all = buffer.typed_data::<R::Native>()
+        .get(run_ends.offset()..run_ends.offset() + run_ends.len())
+        .ok_or_else(|| invalid("Arrow run-ends buffer is shorter than its child"))?;
+    let max_value = all.last().copied().ok_or_else(|| invalid("Non-empty run-end column has no runs"))?.to_usize();
+    if data.offset() == 0 && max_value == Some(data.len()) {
+        return Ok((run_ends.clone(), values.clone()));
+    }
+    let logical_offset = R::Native::from_usize(data.offset()).ok_or_else(|| invalid("Arrow run-end offset exceeds index width"))?;
+    let logical_end = data.offset().checked_add(data.len())
+        .and_then(R::Native::from_usize)
+        .ok_or_else(|| invalid("Arrow run-end slice exceeds index width"))?;
+    let start = all.partition_point(|&end| end <= logical_offset);
+    let end = all.partition_point(|&end| end < logical_end);
+    if start > end || end >= all.len() || end >= values.len() {
+        return Err(invalid("Arrow run-end slice exceeds its physical runs"));
+    }
+    let physical = end - start + 1;
+    let last = R::Native::from_usize(data.len()).ok_or_else(|| invalid("Arrow run-end length exceeds index width"))?;
+    let mut rebased = Vec::with_capacity(physical);
+    for &value in &all[start..end] {
+        rebased.push(value.sub_wrapping(logical_offset));
+    }
+    rebased.push(last);
+    let new_ends = ArrayData::builder(R::DATA_TYPE)
+        .len(physical)
+        .add_buffer(Buffer::from_vec(rebased))
+        .build()
+        .map_err(invalid)?;
+    Ok((new_ends, values.slice(start, physical)))
 }
 
 #[cfg(test)]

@@ -23,19 +23,26 @@ struct FieldLayout { nulls: NullCount, buffers: usize, validity: bool, nullable:
 /// The end marker and any message it doesn't recognise pass through as written.
 pub(crate) struct JavaLayout<W> {
     pub(crate) inner: W, pending: Vec<u8>, state: State, layouts: Option<Vec<FieldLayout>>,
+    #[cfg(test)]
     footer: Option<FileFooter>,
 }
 
+#[cfg(test)]
 struct FileFooter {
     position: u64,
     blocks: Vec<arrow_ipc::Block>,
     schema: Option<Vec<u8>>,
 }
 
-struct Output<'a, W> { inner: &'a mut W, footer: Option<&'a mut FileFooter> }
+struct Output<'a, W> {
+    inner: &'a mut W,
+    #[cfg(test)]
+    footer: Option<&'a mut FileFooter>,
+}
 impl<W: Write> Write for Output<'_, W> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let count = self.inner.write(bytes)?;
+        #[cfg(test)]
         if let Some(footer) = self.footer.as_deref_mut() {
             footer.position += count as u64;
         }
@@ -63,16 +70,29 @@ enum Emit {
 }
 
 impl<W> JavaLayout<W> {
-    fn new(inner: W, footer: Option<FileFooter>) -> Self {
-        Self { inner, pending: Vec::new(), state: State::Prefix, layouts: None, footer }
+    pub(super) fn new_stream(inner: W) -> Self {
+        Self {
+            inner,
+            pending: Vec::new(),
+            state: State::Prefix,
+            layouts: None,
+            #[cfg(test)]
+            footer: None,
+        }
     }
 
-    pub(super) fn new_stream(inner: W) -> Self { Self::new(inner, None) }
-
+    #[cfg(test)]
     pub(super) fn new_file(inner: W, start: u64) -> Self {
-        Self::new(inner, Some(FileFooter { position: start, blocks: Vec::new(), schema: None }))
+        Self {
+            inner,
+            pending: Vec::new(),
+            state: State::Prefix,
+            layouts: None,
+            footer: Some(FileFooter { position: start, blocks: Vec::new(), schema: None }),
+        }
     }
 
+    #[cfg(test)]
     pub(super) fn file_footer(&self) -> Result<Vec<u8>, String> {
         let file = self.footer.as_ref().ok_or("Arrow writer has no file footer state")?;
         let schema = file.schema.as_deref().ok_or("Arrow file has no schema message")?;
@@ -83,7 +103,11 @@ impl<W> JavaLayout<W> {
 impl<W: Write> Write for JavaLayout<W> {
     fn write(&mut self, mut bytes: &[u8]) -> io::Result<usize> {
         let written = bytes.len();
-        let mut out = Output { inner: &mut self.inner, footer: self.footer.as_mut() };
+        let mut out = Output {
+            inner: &mut self.inner,
+            #[cfg(test)]
+            footer: self.footer.as_mut(),
+        };
         while !bytes.is_empty() {
             match &mut self.state {
                 State::Ended => { out.write_all(bytes)?; break; }
@@ -121,8 +145,10 @@ impl<W: Write> Write for JavaLayout<W> {
                     let metadata = std::mem::take(&mut self.pending);
                     let rewritten = rewrite(&mut self.layouts, &metadata).map_err(io::Error::other)?;
                     let encoded = rewritten.metadata.unwrap_or(metadata);
+                    #[cfg(test)]
                     let offset = out.footer.as_ref().map_or(0, |footer| footer.position);
                     frame(&mut out, &encoded, continuation)?;
+                    #[cfg(test)]
                     if let Some(footer) = out.footer.as_deref_mut() {
                         match rewritten.header {
                             MessageHeader::Schema => footer.schema = Some(encoded),
@@ -149,7 +175,13 @@ impl<W: Write> Write for JavaLayout<W> {
 }
 
 /// A rewritten message: its Java-layout metadata (none passes it through), its body plan, its input body length and its kind.
-struct Rewritten { metadata: Option<Vec<u8>>, plan: Option<BodyPlan>, body: usize, header: MessageHeader }
+struct Rewritten {
+    metadata: Option<Vec<u8>>,
+    plan: Option<BodyPlan>,
+    body: usize,
+    #[cfg(test)]
+    header: MessageHeader,
+}
 
 /// Rewrites one message's metadata and plans its body; a schema replaces the batch layouts.
 fn rewrite(layouts: &mut Option<Vec<FieldLayout>>, metadata: &[u8]) -> Result<Rewritten, String> {
@@ -174,7 +206,13 @@ fn rewrite(layouts: &mut Option<Vec<FieldLayout>>, metadata: &[u8]) -> Result<Re
         }
         _ => (None, None),
     };
-    Ok(Rewritten { metadata, plan, body, header })
+    Ok(Rewritten {
+        metadata,
+        plan,
+        body,
+        #[cfg(test)]
+        header,
+    })
 }
 
 impl BodyPlan {
@@ -267,13 +305,16 @@ pub(super) fn write_all_valid(out: &mut impl Write, length: usize, last_byte: u8
 }
 
 /// `MessageSerializer.writeMessageBuffer`: the length is padded so the prefix and metadata end on an 8-byte boundary.
-pub(super) fn frame(out: &mut impl Write, metadata: &[u8], continuation: bool) -> io::Result<()> {
+/// Returns the total number of framed bytes written.
+pub(super) fn frame(out: &mut impl Write, metadata: &[u8], continuation: bool) -> io::Result<usize> {
     let prefix = if continuation { 8 } else { 4 };
     let padding = (8 - (metadata.len() + prefix) % 8) % 8;
+    let padded = metadata.len() + padding;
     if continuation { out.write_all(&(-1i32).to_le_bytes())?; }
-    out.write_all(&i32::try_from(metadata.len() + padding).map_err(io::Error::other)?.to_le_bytes())?;
+    out.write_all(&i32::try_from(padded).map_err(io::Error::other)?.to_le_bytes())?;
     out.write_all(metadata)?;
-    out.write_all(&[0; 8][..padding])
+    out.write_all(&[0; 8][..padding])?;
+    Ok(prefix + padded)
 }
 
 /// Fields in batch node order; none when a field's buffers aren't modelled, which leaves that schema's batches as written.
@@ -320,6 +361,7 @@ fn java_schema<'b>(builder: &mut FlatBufferBuilder<'b>, schema: &arrow_ipc::Sche
 
 /// `ArrowFooter.writeTo` without dictionaries or custom metadata, as `ArrowUnloader`'s file mode writes it,
 /// over a Java-layout schema message and the record batches' blocks.
+#[cfg(test)]
 fn footer(schema_message: &[u8], blocks: &[arrow_ipc::Block]) -> Result<Vec<u8>, String> {
     let message = arrow_ipc::root_as_message(schema_message).map_err(|error| error.to_string())?;
     let schema = message.header_as_schema().ok_or("Arrow schema message has no schema")?;

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch, make_array};
@@ -7,24 +8,55 @@ use arrow_data::{ArrayData, BufferSpec};
 use arrow_schema::{DataType, Field, IntervalUnit, Schema, TimeUnit, UnionFields, UnionMode};
 use rtdb_types::{LogicalType, ScalarType};
 
-use super::{supports, write_stream};
-use crate::ipc::{ArrowStream, FirstSchemaWriter, TailWriter, invalid, java_layout::JavaLayout, write_options, write_stream_to};
+use super::{FILE_MAGIC, FileWriter, supports, write_stream};
+use crate::ipc::{
+    ArrowFile, ArrowStream, FirstSchemaWriter, invalid, java_layout::JavaLayout, jvm_end_marker, undefined, write_file,
+    write_options, write_stream_to,
+};
 
-/// The oracle the native writer must match byte for byte: arrow-rs's stream, decimal-patched and rewritten into the
+/// The oracle the native stream writer must match byte for byte: arrow-rs's stream, decimal-patched and rewritten into the
 /// reference's Java layout as it passes.
 fn write_rewritten_stream_to(schema: &Schema, pages: &[RecordBatch], sink: Vec<u8>) -> rtdb_types::Result<Vec<u8>> {
-    use std::io::Write;
     let decimal_schema = Arc::new(crate::ipc_decimal::DecimalSchema::new(schema)?);
     let sink = FirstSchemaWriter { inner: JavaLayout::new_stream(sink), schema: Arc::clone(&decimal_schema), pending: Vec::new(), expected: None, complete: false };
-    let mut writer = arrow_ipc::writer::StreamWriter::try_new_with_options(TailWriter { inner: sink, pending: Vec::with_capacity(8) }, &decimal_schema.wire, write_options()?).map_err(invalid)?;
+    let mut writer = arrow_ipc::writer::StreamWriter::try_new_with_options(sink, &decimal_schema.wire, write_options()?).map_err(invalid)?;
     for page in pages { decimal_schema.validate_batch(page)?; writer.write(page).map_err(invalid)?; }
     writer.finish().map_err(invalid)?;
     let mut sink = writer.into_inner().map_err(invalid)?;
-    if sink.pending.as_slice() != [0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0] { return Err(invalid("Arrow writer produced an unexpected end marker")); }
-    sink.inner.write_all(&[0; 4]).map_err(invalid)?;
-    sink.inner.flush().map_err(invalid)?;
-    if !sink.inner.complete { return Err(invalid("Arrow stream ended before its schema")); }
-    Ok(sink.inner.inner.inner)
+    sink.flush().map_err(invalid)?;
+    if !sink.complete { return Err(invalid("Arrow stream ended before its schema")); }
+    let mut bytes = sink.inner.inner;
+    let end = bytes.len();
+    jvm_end_marker(&mut bytes, end)?;
+    Ok(bytes)
+}
+
+/// The oracle the native file writer must match byte for byte: arrow-rs's stream, decimal-patched and rewritten into the
+/// reference's Java file layout with footer and magic.
+fn write_rewritten_file(schema: &Schema, pages: &[RecordBatch]) -> rtdb_types::Result<Vec<u8>> {
+    let decimal_schema = Arc::new(crate::ipc_decimal::DecimalSchema::new(schema)?);
+    let mut bytes = Vec::new();
+    bytes.write_all(FILE_MAGIC).map_err(invalid)?;
+    bytes.write_all(&[0; 2]).map_err(invalid)?;
+    let layout = JavaLayout::new_file(bytes, 8);
+    let first = FirstSchemaWriter { inner: layout, schema: Arc::clone(&decimal_schema), pending: Vec::new(), expected: None, complete: false };
+    let mut writer = arrow_ipc::writer::StreamWriter::try_new_with_options(first, &decimal_schema.wire, write_options()?).map_err(invalid)?;
+    for page in pages {
+        decimal_schema.validate_batch(page)?;
+        writer.write(&undefined::undefine(page)?).map_err(invalid)?;
+    }
+    writer.finish().map_err(invalid)?;
+    let first = writer.into_inner().map_err(invalid)?;
+    if !first.complete { return Err(invalid("Arrow file ended before its schema")); }
+    let layout = first.inner;
+    let footer = layout.file_footer().map_err(invalid)?;
+    let mut sink = layout.inner;
+    let end = sink.len();
+    jvm_end_marker(&mut sink, end)?;
+    sink.write_all(&footer).map_err(invalid)?;
+    sink.write_all(&i32::try_from(footer.len()).map_err(invalid)?.to_le_bytes()).map_err(invalid)?;
+    sink.write_all(FILE_MAGIC).map_err(invalid)?;
+    Ok(sink)
 }
 
 /// xorshift64*, so that a failing case is reproducible from its seed.
@@ -208,6 +240,13 @@ fn assert_same_stream(schema: &Schema, pages: &[RecordBatch], case: &str) {
     assert_eq!(write_stream_to(schema, pages, Vec::new()).unwrap(), expected, "{case}");
 }
 
+fn assert_same_file(schema: &Schema, pages: &[RecordBatch], case: &str) {
+    let expected = write_rewritten_file(schema, pages).unwrap();
+    let actual = write_file(schema, pages).unwrap();
+    assert!(actual == expected, "{case} (file): {} bytes against {}, first difference at {:?}\n{schema:#?}",
+        actual.len(), expected.len(), actual.iter().zip(&expected).position(|(a, b)| a != b));
+}
+
 #[test]
 fn native_streams_match_the_rewritten_arrow_rs_stream_byte_for_byte() {
     for seed in 1..=600u64 {
@@ -223,7 +262,9 @@ fn native_streams_match_the_rewritten_arrow_rs_stream_byte_for_byte() {
             pages.push(page);
             pages.push(sliced);
         }
-        assert_same_stream(&schema, &pages, &format!("seed {seed}"));
+        let case = format!("seed {seed}");
+        assert_same_stream(&schema, &pages, &case);
+        assert_same_file(&schema, &pages, &case);
     }
 }
 
@@ -250,9 +291,12 @@ fn native_streams_match_for_log_shaped_schemas() {
     let schema = Arc::new(Schema::new(vec![ops, Field::new("system-time", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), true)]));
     for rows in [0, 1, 3] {
         let pages: Vec<_> = (0..3).map(|_| batch(&mut rng, &schema, rows)).collect();
-        assert_same_stream(&schema, &pages, &format!("{rows} rows"));
+        let case = format!("{rows} rows");
+        assert_same_stream(&schema, &pages, &case);
+        assert_same_file(&schema, &pages, &case);
     }
     assert_same_stream(&schema, &[], "no pages");
+    assert_same_file(&schema, &[], "no pages");
 }
 
 #[test]
@@ -268,6 +312,9 @@ fn native_streams_reject_what_the_rewritten_stream_rejects() {
         let expected = write_rewritten_stream_to(schema, &pages, Vec::new()).unwrap_err();
         let actual = write_stream_to(schema, &pages, Vec::new()).unwrap_err();
         assert_eq!((actual.code, actual.message), (expected.code, expected.message));
+        let expected_file = write_rewritten_file(schema, &pages).unwrap_err();
+        let actual_file = write_file(schema, &pages).unwrap_err();
+        assert_eq!((actual_file.code, actual_file.message), (expected_file.code, expected_file.message));
     }
 }
 
@@ -315,4 +362,121 @@ fn layouts_xtdb_does_not_write_are_written_in_their_plain_layout() {
     let read = ArrowStream::open(written.into(), None).unwrap().collect::<rtdb_types::Result<Vec<_>>>().unwrap();
     assert_eq!(read.iter().map(RecordBatch::num_rows).collect::<Vec<_>>(), [4, 2]);
     assert_eq!(write_stream_to(&schema, &[], Vec::new()).unwrap(), write_stream(&plain_schema, &[], Vec::new()).unwrap());
+}
+
+#[test]
+fn native_files_write_run_end_encoded_columns_in_java_layout() {
+    use arrow_array::{
+        Int16Array, Int32Array, Int64Array, RunArray,
+        types::{Int16Type, Int32Type, Int64Type},
+    };
+
+    fn check_width(ends_type: DataType, runs: ArrayRef, empty_runs: ArrayRef) {
+        let values_field = Arc::new(Field::new("values", DataType::Int64, true));
+        let ree_field = Field::new("runs", DataType::RunEndEncoded(Arc::new(Field::new("run_ends", ends_type, false)), values_field), false);
+        let plain_field = Field::new("tag", DataType::Int64, true);
+        let schema = Arc::new(Schema::new(vec![ree_field, plain_field]));
+
+        let full = RecordBatch::try_new(Arc::clone(&schema), vec![
+            runs,
+            Arc::new(Int64Array::from(vec![10, 20, 30, 40, 50, 60])) as ArrayRef,
+        ]).unwrap();
+        let empty = RecordBatch::try_new(Arc::clone(&schema), vec![
+            empty_runs,
+            Arc::new(Int64Array::from(Vec::<i64>::new())) as ArrayRef,
+        ]).unwrap();
+        let pages = [full.clone(), full.slice(2, 3), full.slice(3, 1), full.slice(4, 0), empty];
+        let expected_logical: [&[Option<i64>]; 5] = [
+            &[Some(7), Some(7), Some(7), None, Some(9), Some(9)],
+            &[Some(7), None, Some(9)],
+            &[None],
+            &[],
+            &[],
+        ];
+        let expected_run_counts: [i64; 5] = [3, 3, 1, 0, 0];
+
+        let bytes = write_file(&schema, &pages).unwrap();
+        assert_eq!(&bytes[..8], b"ARROW1\0\0");
+        assert_eq!(&bytes[bytes.len() - 6..], FILE_MAGIC);
+        let footer_len = arrow_ipc::reader::read_footer_length(bytes[bytes.len() - 10..].try_into().unwrap()).unwrap();
+        let footer_start = bytes.len() - 10 - footer_len;
+        assert_eq!(&bytes[footer_start - 4..footer_start], &[0; 4]);
+        let footer = arrow_ipc::root_as_footer(&bytes[footer_start..bytes.len() - 10]).unwrap();
+        assert_eq!(footer.dictionaries().map_or(0, |blocks| blocks.len()), 0);
+        let blocks = footer.recordBatches().unwrap();
+        assert_eq!(blocks.len(), pages.len());
+
+        for (index, block) in blocks.iter().enumerate() {
+            let start = block.offset() as usize;
+            let meta_end = start + block.metaDataLength() as usize;
+            let message = arrow_ipc::root_as_message(&bytes[start + 8..meta_end]).unwrap();
+            let batch = message.header_as_record_batch().unwrap();
+            let nodes = batch.nodes().unwrap();
+            assert_eq!(nodes.len(), 4);
+            // REE parent has null_count 0 and no buffers; run_ends has null_count 0; nullable values and tag carry -1.
+            assert_eq!((nodes.get(0).length(), nodes.get(0).null_count()), (pages[index].num_rows() as i64, 0));
+            assert_eq!((nodes.get(1).length(), nodes.get(1).null_count()), (expected_run_counts[index], 0));
+            assert_eq!((nodes.get(2).length(), nodes.get(2).null_count()), (expected_run_counts[index], -1));
+            assert_eq!((nodes.get(3).length(), nodes.get(3).null_count()), (pages[index].num_rows() as i64, -1));
+            // 2 buffers for run_ends + 2 for values + 2 for tag = 6 buffers total (0 for REE parent).
+            let buffers = batch.buffers().unwrap();
+            assert_eq!(buffers.len(), 6);
+            assert_eq!(buffers.get(0).length(), 0); // non-nullable run_ends validity is empty
+            let expected_tag_validity = if pages[index].num_rows() > 0 { pages[index].num_rows().div_ceil(8) as i64 } else { 0 };
+            assert_eq!(buffers.get(4).length(), expected_tag_validity); // all-valid bitmap materialized for nullable tag
+        }
+
+        let mut file = ArrowFile::open(bytes.into(), None).unwrap();
+        assert_eq!(file.page_count(), pages.len());
+        assert_eq!(file.schema().as_ref(), schema.as_ref());
+        for (index, expected) in expected_logical.iter().enumerate() {
+            let decoded = file.read_page(index).unwrap();
+            assert_eq!(decoded.num_rows(), expected.len());
+            let actual: Vec<Option<i64>> = (0..decoded.num_rows()).map(|row| {
+                match rtdb_columnar::read_value(schema.field(0), decoded.column(0).as_ref(), row).unwrap() {
+                    rtdb_types::Value::Null => None,
+                    rtdb_types::Value::I64(value) => Some(value),
+                    other => panic!("unexpected value {other:?}"),
+                }
+            }).collect();
+            assert_eq!(actual.as_slice(), *expected, "page {index}");
+        }
+    }
+
+    let values = Arc::new(Int64Array::from(vec![Some(7), None, Some(9)])) as ArrayRef;
+    let empty_values = Arc::new(Int64Array::from(Vec::<Option<i64>>::new())) as ArrayRef;
+    check_width(
+        DataType::Int16,
+        Arc::new(RunArray::<Int16Type>::try_new(&Int16Array::from(vec![3, 4, 6]), &values).unwrap()),
+        Arc::new(RunArray::<Int16Type>::try_new(&Int16Array::from(Vec::<i16>::new()), &empty_values).unwrap()),
+    );
+    check_width(
+        DataType::Int32,
+        Arc::new(RunArray::<Int32Type>::try_new(&Int32Array::from(vec![3, 4, 6]), &values).unwrap()),
+        Arc::new(RunArray::<Int32Type>::try_new(&Int32Array::from(Vec::<i32>::new()), &empty_values).unwrap()),
+    );
+    check_width(
+        DataType::Int64,
+        Arc::new(RunArray::<Int64Type>::try_new(&Int64Array::from(vec![3, 4, 6]), &values).unwrap()),
+        Arc::new(RunArray::<Int64Type>::try_new(&Int64Array::from(Vec::<i64>::new()), &empty_values).unwrap()),
+    );
+}
+
+#[test]
+fn native_files_reject_layouts_xtdb_does_not_write() {
+    let unsupported = [
+        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+        DataType::Utf8View,
+        DataType::BinaryView,
+        DataType::ListView(Arc::new(Field::new("$data$", DataType::Int64, true))),
+        DataType::LargeListView(Arc::new(Field::new("$data$", DataType::Int64, true))),
+        DataType::RunEndEncoded(Arc::new(Field::new("run_ends", DataType::Int8, false)), Arc::new(Field::new("values", DataType::Int64, true))),
+    ];
+    for data_type in unsupported {
+        let schema = Schema::new(vec![Field::new("c", data_type, true)]);
+        let mut sink = Vec::new();
+        assert!(FileWriter::new(&mut sink, &schema).is_err());
+        assert!(sink.is_empty(), "rejected schema must not write any bytes");
+        assert!(write_file(&schema, &[]).is_err());
+    }
 }

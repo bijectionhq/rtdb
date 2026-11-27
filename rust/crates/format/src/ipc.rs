@@ -1696,45 +1696,21 @@ impl<W: Write> ArrowFileEncoder<W> {
 /// `ArrowUnloader`'s file mode, `xtdb.arrow.ArrowUnloader.Mode.FILE`: the magic padded to eight bytes, the stream's messages in the
 /// reference's Java layout, its single zero end marker, then the Java-layout footer, its length and the magic.
 struct JavaFile<W: Write> {
-    writer: StreamWriter<TailWriter<FirstSchemaWriter<java_layout::JavaLayout<W>>>>,
-    decimal_schema: Arc<crate::ipc_decimal::DecimalSchema>,
+    writer: java_stream::FileWriter<W>,
 }
 
-const FILE_MAGIC: &[u8; 6] = b"ARROW1";
-
 impl<W: Write> JavaFile<W> {
-    fn new(mut sink: W, schema: &Schema) -> Result<Self> {
-        let decimal_schema = Arc::new(crate::ipc_decimal::DecimalSchema::new(schema)?);
-        sink.write_all(FILE_MAGIC).map_err(invalid)?;
-        sink.write_all(&[0; 2]).map_err(invalid)?;
-        let layout = java_layout::JavaLayout::new_file(sink, 8);
-        let first = FirstSchemaWriter { inner: layout, schema: Arc::clone(&decimal_schema), pending: Vec::new(), expected: None, complete: false };
-        let writer = StreamWriter::try_new_with_options(TailWriter { inner: first, pending: Vec::with_capacity(8) }, &decimal_schema.wire, write_options()?).map_err(invalid)?;
-        Ok(Self { writer, decimal_schema })
+    fn new(sink: W, schema: &Schema) -> Result<Self> {
+        Ok(Self { writer: java_stream::FileWriter::new(sink, schema)? })
     }
+    fn validate_batch(&self, page: &RecordBatch) -> Result<()> { self.writer.validate_batch(page) }
     fn write(&mut self, page: &RecordBatch) -> Result<()> {
-        self.decimal_schema.validate_batch(page)?;
+        self.validate_batch(page)?;
         self.write_translated(&undefined::undefine(page)?)
     }
-    fn write_translated(&mut self, page: &RecordBatch) -> Result<()> { self.writer.write(page).map_err(invalid) }
-    fn sink(&mut self) -> &mut W { &mut self.writer.get_mut().inner.inner.inner }
-    /// Bytes the sink has received plus those the end-marker lookahead still holds.
-    fn pending_bytes(&mut self) -> u64 { self.writer.get_mut().pending.len() as u64 }
-    fn finish(mut self) -> Result<W> {
-        self.writer.finish().map_err(invalid)?;
-        let mut tail = self.writer.into_inner().map_err(invalid)?;
-        if tail.pending.as_slice() != [0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0] { return Err(invalid("Arrow writer produced an unexpected end marker")); }
-        tail.inner.write_all(&[0; 4]).map_err(invalid)?;
-        if !tail.inner.complete { return Err(invalid("Arrow file ended before its schema")); }
-        let layout = tail.inner.inner;
-        let footer = layout.file_footer().map_err(invalid)?;
-        let mut sink = layout.inner;
-        sink.write_all(&footer).map_err(invalid)?;
-        sink.write_all(&i32::try_from(footer.len()).map_err(invalid)?.to_le_bytes()).map_err(invalid)?;
-        sink.write_all(FILE_MAGIC).map_err(invalid)?;
-        sink.flush().map_err(invalid)?;
-        Ok(sink)
-    }
+    fn write_translated(&mut self, page: &RecordBatch) -> Result<()> { self.writer.write_batch(page) }
+    fn sink(&mut self) -> &mut W { self.writer.sink() }
+    fn finish(self) -> Result<W> { self.writer.finish() }
 }
 
 pub struct ArrowFileWriter { writer: JavaFile<LimitedFile>, allocation: WriterAllocation }
@@ -1814,13 +1790,12 @@ impl ArrowFileWriter {
         Ok(writer)
     }
 
-    pub fn bytes_written(&mut self) -> u64 { self.writer.pending_bytes() + self.writer.sink().position }
+    pub fn bytes_written(&mut self) -> u64 { self.writer.sink().position }
 
     /// The owner may lower the remaining allowance between writes; already-written bytes must still fit.
     pub fn set_byte_limit(&mut self, byte_limit: u64) -> Result<()> {
-        let pending = self.writer.pending_bytes();
         let sink = self.writer.sink();
-        if sink.position + pending > byte_limit { return Err(invalid("Arrow output already exceeds the requested byte limit")); }
+        if sink.position > byte_limit { return Err(invalid("Arrow output already exceeds the requested byte limit")); }
         sink.limit = byte_limit;
         Ok(())
     }
@@ -1834,14 +1809,10 @@ impl ArrowFileWriter {
         if dictionary_count(page.schema_ref())? != 0 {
             return Err(invalid("Arrow page hashing requires a dictionary-free schema"));
         }
-        // The lookahead normally carries the previous frame's last eight bytes into the next write.
-        self.writer.writer.get_mut().write_pending().map_err(invalid)?;
         let sink = self.writer.sink();
         let start = sink.position;
         sink.page_sha256 = Some(sha2::Digest::new());
-        let written = self.write(page).and_then(|()| {
-            self.writer.writer.get_mut().write_pending().map_err(invalid)
-        });
+        let written = self.write(page);
         let sink = self.writer.sink();
         let hash = sink.page_sha256.take().expect("page hashing is active");
         written?;
@@ -1859,7 +1830,7 @@ impl ArrowFileWriter {
     }
 
     fn write_page(&mut self, page: &RecordBatch, copies: &mut Option<undefined::EventCopies<'_>>) -> Result<()> {
-        self.writer.decimal_schema.validate_batch(page)?;
+        self.writer.validate_batch(page)?;
         let block = match &self.allocation {
             WriterAllocation::CallerReserved => None,
             WriterAllocation::Owned { memory, block_bound, .. } => Some(memory.reserve(*block_bound)?),
@@ -2140,29 +2111,6 @@ pub fn write_stream_to<'a, W: Write>(schema: &Schema, pages: impl IntoIterator<I
         plain_layout::plain_page(&plain, page)
     }).collect::<Result<Vec<_>>>()?;
     java_stream::write_stream(&plain, &pages, sink)
-}
-
-struct TailWriter<W> { inner: W, pending: Vec<u8> }
-
-impl<W: Write> TailWriter<W> {
-    fn write_pending(&mut self) -> std::io::Result<()> {
-        self.inner.write_all(&self.pending)?;
-        self.pending.clear();
-        Ok(())
-    }
-}
-
-impl<W: Write> Write for TailWriter<W> {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        let count = self.pending.len().saturating_add(bytes.len()).saturating_sub(8);
-        let old = count.min(self.pending.len());
-        self.inner.write_all(&self.pending[..old])?;
-        self.pending.drain(..old);
-        self.inner.write_all(&bytes[..count - old])?;
-        self.pending.extend_from_slice(&bytes[count - old..]);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> { self.inner.flush() }
 }
 
 pub fn read_schema_message(bytes: &[u8]) -> Result<Schema> {
