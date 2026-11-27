@@ -1631,9 +1631,10 @@ impl ReplicationDriver {
                     collection
                 } else { None };
                 let ReplicaBody::BlockUploaded(message) = &record.envelope.message else { return Err(invalid("Matching upload changed type")); };
-                let pending = self.pending_block.as_mut().ok_or_else(|| invalid("Matching upload has no pending block"))?;
+                let loaded = self.pending_block.as_mut().and_then(|pending| pending.loaded.take());
+                let pending = self.pending_block.as_ref().ok_or_else(|| invalid("Matching upload has no pending block"))?;
                 let deferred = pending.is_deferred();
-                let (catalog, table_blocks) = match pending.loaded.take() {
+                let (catalog, table_blocks) = match loaded {
                     Some(loaded) => loaded,
                     None => self.blocks.load(pending.block_index()).await?,
                 };
