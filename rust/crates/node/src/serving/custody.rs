@@ -82,8 +82,11 @@ pub(crate) async fn open_changes(index: &BranchIndex, vault: &CustodyVault, mut 
             }
             page.custody_groups.insert(group);
             let image = image.as_mut().expect("a custody group belongs to an image");
-            if let Some(payload) = image.custody_payload.take() {
-                image.cells.extend(open(vault, group, &payload).await?);
+            if let Some(payload) = &image.custody_payload {
+                let cells = open(vault, group, payload).await?;
+                let image = Arc::make_mut(image);
+                image.custody_payload = None;
+                image.cells.extend(cells);
             }
         }
     }
@@ -322,7 +325,7 @@ mod tests {
                     kind: ChangeKind::Opened,
                     erased_written_basis: None,
                     before: None,
-                    after: Some(image.as_ref().clone()),
+                    after: Some(Arc::clone(image)),
                 }],
             }],
             through: row.cut.basis,
@@ -333,6 +336,8 @@ mod tests {
         let opened_changes = open_changes(state.index(), &vault, page()).await.unwrap();
         let after = opened_changes.groups[0].rows[0].after.as_ref().unwrap();
         assert_eq!(after.cells.get("private"), private.get("private"));
+        assert!(image.cells.get("private").is_none());
+        assert!(image.custody_payload.is_some());
         assert_eq!(opened_changes.custody_groups, groups);
         let pending_changes = page();
 

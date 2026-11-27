@@ -494,4 +494,6 @@ surface StatelessDatabase {
         -- A route advertising changes.images.stream-v1 accepts an explicit request for shared image streams and acknowledges the selected representation in the response.
         -- In the shared representation each present image column carries one Arrow IPC stream in its first cell, with one image per result row in that batch's order.
         -- Image selection, change ordering and covered intervals apply equally to both representations.
+        -- A branch change interval splits at each selected event's expiry, and the image covers only its visible interval.
+        -- Opening a protected change image for delivery leaves the retained branch image sealed.
 }

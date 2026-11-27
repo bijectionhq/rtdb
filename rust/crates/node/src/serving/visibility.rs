@@ -103,9 +103,9 @@ impl ServingScope {
                 },
                 erased_written_basis: row.erased_written_basis,
                 before: row.before.as_ref().filter(|_| matches!(request.images, ChangeImages::Before | ChangeImages::Both))
-                    .map(|image| image.as_ref().clone()),
+                    .cloned(),
                 after: row.after.as_ref().filter(|_| matches!(request.images, ChangeImages::After | ChangeImages::Both))
-                    .map(|image| image.as_ref().clone()),
+                    .cloned(),
             }).collect::<Vec<_>>();
             if rows.is_empty() { continue; }
             if groups.len() == request.limit {

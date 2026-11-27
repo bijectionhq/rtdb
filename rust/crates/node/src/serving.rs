@@ -106,8 +106,8 @@ pub struct ChangeRow {
     pub valid: Option<Interval>,
     pub kind: ChangeKind,
     pub erased_written_basis: Option<Basis>,
-    pub before: Option<RowImage>,
-    pub after: Option<RowImage>,
+    pub before: Option<Arc<RowImage>>,
+    pub after: Option<Arc<RowImage>>,
 }
 
 pub(crate) fn append_change_rows(
@@ -138,9 +138,8 @@ pub(crate) fn append_change_rows(
                 .into_iter().flatten().filter(|boundary| valid.contains(*boundary)));
         }
     }
-    fn image_at<'a>(view: Option<&BranchView<'a>>, write: &BranchWrite, from: Timestamp) -> Option<&'a RowImage> {
-        view.and_then(|view| view.row(&write.table, &write.id, from))
-            .and_then(|event| event.image_at(from))
+    fn image_at<'a>(view: Option<&BranchView<'a>>, write: &BranchWrite, from: Timestamp) -> Option<&'a Arc<RowImage>> {
+        view?.row(&write.table, &write.id, from)?.image.as_ref()
     }
     let starts = boundaries.iter().copied();
     for (from, to) in starts.clone().zip(starts.skip(1)) {
@@ -157,6 +156,39 @@ pub(crate) fn append_change_rows(
         }
     }
     Ok(())
+}
+
+#[test]
+fn change_rows_share_the_selected_image_only_inside_its_expiry_slice() {
+    use rtdb_index::branches::{BranchEffect, BranchEvent, WrittenVersion};
+    use rtdb_types::{StructFields, Value, rtdb_v1::MAIN_BRANCH};
+
+    let table = TableRef::new("public", "facts");
+    let id = EntityId::Integer(2);
+    let valid = Interval::new(Timestamp(0), Timestamp(10)).unwrap();
+    let image = Arc::new(RowImage {
+        cells: StructFields::from([("_id".into(), Value::I64(2))]),
+        expires_at: Some(Timestamp(4)), custody_group: None, custody_payload: None,
+    });
+    let mut index = BranchIndex::new([1; 16]);
+    let cut = BranchCut { basis: Basis::new([1; 16], 1), system_time: Timestamp(1) };
+    index.advance(cut).unwrap();
+    index.apply(BranchEffect::Write {
+        branch: MAIN_BRANCH.into(),
+        table: table.clone(),
+        event: BranchEvent { id: id.clone(), valid, cut, image: Some(Arc::clone(&image)), written: WrittenVersion::Branch },
+    }).unwrap();
+    let view = index.view(MAIN_BRANCH, At::Latest, Layer::Merged, cut.system_time).unwrap();
+    let write = BranchWrite { branch: MAIN_BRANCH.into(), table, id, valid: Some(valid), erased_written_basis: None };
+    let mut rows = Vec::new();
+    append_change_rows(&mut rows, &write, None, Some(&view), ChangeImages::Both).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].valid, Some(Interval::new(Timestamp(0), Timestamp(4)).unwrap()));
+    assert!(rows[0].kind == ChangeKind::Opened);
+    assert!(Arc::ptr_eq(rows[0].after.as_ref().unwrap(), &image));
+    assert_eq!(rows[1].valid, Some(Interval::new(Timestamp(4), Timestamp(10)).unwrap()));
+    assert!(rows[1].kind == ChangeKind::Closed);
+    assert!(rows[1].after.is_none());
 }
 
 pub struct FundingSubmission {
