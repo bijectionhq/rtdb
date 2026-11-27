@@ -185,6 +185,67 @@ async fn computed_capture_lends_the_reached_float_list_with_its_source_charge() 
 }
 
 #[tokio::test]
+async fn computed_capture_lends_nested_list_children_with_their_parent_validity() {
+    use arrow_array::{Array, RecordBatch, cast::AsArray};
+    use arrow_schema::Schema as ArrowSchema;
+    use rtdb_columnar::{OwnedBatch, build_array, to_field};
+    use crate::{columnar::{Column, ColumnBatch}, context::ApplyArguments};
+
+    let execution = execution(1, vec![]);
+    let source_memory = MemoryBudget::new(1 << 20);
+    let element = LogicalType::list(LogicalType::Scalar(ScalarType::Utf8).maybe()).maybe();
+    let ty = LogicalType::list(element.clone());
+    let values = vec![
+        Value::Null,
+        Value::list(vec![]),
+        Value::list(vec![Value::Utf8("nested".into()), Value::Null]),
+    ];
+    let array = build_array(&ty, &[
+        Value::list(vec![Value::list(vec![Value::Utf8("unreached".into())])]),
+        Value::list(values.clone()),
+    ]).unwrap();
+    let leaf = array.as_list::<i32>().values().as_list::<i32>().values().as_string::<i32>();
+    let address = leaf.value(1).as_ptr();
+    let physical = Arc::new(ArrowSchema::new(vec![to_field("items", &ty).unwrap()]));
+    let record = RecordBatch::try_new(physical, vec![array]).unwrap();
+    let source = Arc::new(ColumnBatch::from_owned(OwnedBatch::new(record, &source_memory).unwrap()).unwrap());
+    let field = Field {
+        id: ColumnId(0), name: "items".into(), data_type: ty.clone(),
+        qualifier: None, qualified_only: false, unnamed: false,
+    };
+    let expression = Expr::Case {
+        branches: vec![(Expr::Literal(Value::Bool(true)), field.expression())],
+        otherwise: Box::new(Expr::Cast {
+            expr: Box::new(Expr::Literal(Value::Utf8("invalid array".into()))),
+            target: rtdb_plan::CastTarget::fixed(ty),
+        }),
+    };
+    let schema = RuntimeSchema::fixed(&Schema::new(vec![field]).unwrap(), &execution.context.memory).unwrap();
+    let arguments = ApplyArguments::new(schema, vec![(0, expression)]);
+    let bound = arguments.bind(&execution, source, 1).await.unwrap();
+    assert!(bound.parameters.captured_arrow_cell(0).is_some());
+    let mut cursor = crate::column_table::open_arrow(&bound, 0).unwrap().unwrap();
+    drop(bound);
+    let page = cursor.next_batch().await.unwrap().unwrap();
+    assert!(cursor.next_batch().await.unwrap().is_none());
+    drop(cursor);
+
+    let [Column::Arrow { array, logical: Some(logical), .. }] = page.columns.as_slice() else {
+        panic!("Expected the nested child slice");
+    };
+    assert_eq!(logical, &element);
+    let lists = array.as_list::<i32>();
+    assert!(lists.is_null(0));
+    assert!(lists.value(1).is_empty());
+    let child = lists.value(2);
+    assert_eq!(child.as_string::<i32>().value(0).as_ptr(), address);
+    assert_eq!((0..page.len).map(|row| page.columns[0].value(row).unwrap()).collect::<Vec<_>>(), values);
+    assert!(source_memory.used_bytes() > 0);
+    drop((child, page));
+    assert_eq!(source_memory.used_bytes(), 0);
+}
+
+#[tokio::test]
 async fn computed_column_table_lends_an_arrow_parameter_through_the_list_reader() {
     use arrow_array::{RecordBatch, cast::AsArray};
     use arrow_schema::Schema as ArrowSchema;

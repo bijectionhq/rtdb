@@ -54,6 +54,8 @@ pub(super) fn readable_numeric_union(field: &Field) -> bool {
 
 pub(crate) fn captured_list_child(field: &Field) -> bool {
     rtdb_columnar::lendable_list_child(field) || readable_numeric_union(field)
+        || (field.metadata().is_empty()
+            && matches!(field.data_type(), DataType::List(child) if rtdb_columnar::lendable_list_child(child)))
 }
 
 fn numeric_item(expr: &Expr, schema: &Schema, batch: &ColumnBatch) -> bool {
