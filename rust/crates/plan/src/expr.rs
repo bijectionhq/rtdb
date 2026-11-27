@@ -573,6 +573,11 @@ fn boolean_type(nullable: bool) -> LogicalType {
     if nullable { ty.maybe() } else { ty }
 }
 
+fn pure_null(ty: &LogicalType) -> bool {
+    let legs = ty.legs();
+    !legs.is_empty() && legs.iter().all(|leg| *leg == LogicalType::Null)
+}
+
 /// Computes literal-dependent function metadata and validates constant fields, precisions, and scales.
 pub fn function_type_with_args(name: &str, arguments: &[Expr]) -> Result<LogicalType> {
     let types = arguments.iter().map(Expr::data_type).collect::<Vec<_>>();
