@@ -85,21 +85,30 @@ pub fn needs_durable_grant(remaining: u8) -> bool {
     remaining == 0
 }
 
-/// All-writer fence covering both Flight and SQL writers.
-/// While a durable grant is active on an overlapping footprint, only the
-/// matching active holder attempt may apply a write.
+/// All-writer fence covering both Flight and SQL writers, with round-4 T3
+/// label-dominance non-interference.
+/// While a durable grant is active on an overlapping footprint, only writers
+/// whose commit label dominates the held commit label are fenced (other than
+/// the matching active holder attempt). Writers below or beside the held
+/// commit label are never held so higher work cannot induce a covert wait on
+/// lower or incomparable outcomes.
 #[cfg_attr(verus_keep_ghost, verus_spec(allowed => ensures
-    allowed == (!overlapping || !grant_active || matches_active_holder),
+    allowed == (!overlapping || !writer_dominates_grant || !grant_active || matches_active_holder),
 ))]
 pub fn writer_may_apply(
     writer: WriterKind,
     overlapping: bool,
+    writer_dominates_grant: bool,
     grant_active: bool,
     matches_active_holder: bool,
 ) -> bool {
     match writer {
-        WriterKind::Flight => !overlapping || !grant_active || matches_active_holder,
-        WriterKind::Sql => !overlapping || !grant_active || matches_active_holder,
+        WriterKind::Flight => {
+            !overlapping || !writer_dominates_grant || !grant_active || matches_active_holder
+        }
+        WriterKind::Sql => {
+            !overlapping || !writer_dominates_grant || !grant_active || matches_active_holder
+        }
     }
 }
 

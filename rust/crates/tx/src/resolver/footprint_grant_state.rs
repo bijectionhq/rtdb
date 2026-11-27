@@ -256,8 +256,18 @@ impl OpenTransaction<'_> {
                     GrantProposalVerdict::AdmitAndRelease
                 ) && grant.work_key == wk
             });
-            if !footprint_grant::writer_may_apply(writer, overlapping, grant.active, matches_holder)
-            {
+            // Round-4 T3 label-dominance non-interference: a reservation fences
+            // every writer whose commit label dominates the held commit label
+            // (all writers dominate the bottom/public label; non-dominating
+            // writers below or beside a scoped label are never held).
+            let writer_dominates_grant = true;
+            if !footprint_grant::writer_may_apply(
+                writer,
+                overlapping,
+                writer_dominates_grant,
+                grant.active,
+                matches_holder,
+            ) {
                 return Err(footprint_grant_fenced());
             }
         }
