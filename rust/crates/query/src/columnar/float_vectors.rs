@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{borrow::Borrow, sync::Arc};
 
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, ListArray, NullArray, UnionArray,
     builder::{ArrayBuilder, Float32Builder, Float64Builder}};
@@ -28,12 +28,13 @@ pub(super) fn kind(value: &Value) -> Option<ListKind> {
 }
 
 pub(super) fn pack(
-    values: &[Value], kind: ListKind, memory: &Arc<MemoryBudget>,
+    values: &[impl Borrow<Value>], kind: ListKind, memory: &Arc<MemoryBudget>,
 ) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
     let mut logical = LogicalType::Nothing;
     let mut count = 0usize;
     let width = match kind { ListKind::FixedSizeList(width) => Some(width), _ => None };
-    for value in values {
+    let cells = values.iter().map(Borrow::borrow);
+    for value in cells.clone() {
         let length = if value.is_null() {
             width.unwrap_or(0) as usize
         } else if let Value::List(list) | Value::FixedSizeList(list) = value {
@@ -61,7 +62,7 @@ pub(super) fn pack(
         .and_then(|bytes| bytes.checked_add(8192)).ok_or_else(size_error)?;
     let mut reservation = memory.reserve(bound)?;
 
-    let components = values.iter().flat_map(|value| {
+    let components = cells.clone().flat_map(|value| {
         let view = value.list_view();
         let len = view.map_or(width.unwrap_or(0) as usize, |view| view.len());
         (0..len).map(move |index| {
@@ -91,8 +92,8 @@ pub(super) fn pack(
         DataType::Null => Arc::new(NullArray::new(count)),
         _ => unreachable!("checked float layout"),
     };
-    let nulls = values.iter().any(Value::is_null)
-        .then(|| NullBuffer::from(values.iter().map(|value| !value.is_null()).collect::<Vec<_>>()));
+    let nulls = cells.clone().any(Value::is_null)
+        .then(|| NullBuffer::from(cells.clone().map(|value| !value.is_null()).collect::<Vec<_>>()));
     // XTDB's union field is non-nullable even when one of its selected legs is null.
     let construction_item = if union.is_some() {
         Arc::new(item.as_ref().clone().with_nullable(true))
@@ -105,7 +106,7 @@ pub(super) fn pack(
         let mut offsets = Vec::with_capacity(values.len() + 1);
         offsets.push(0);
         let mut end = 0;
-        for value in values {
+        for value in cells {
             let len = value.list_view().map_or(0, |view| view.len());
             end += len;
             offsets.push(i32::try_from(end).map_err(|_| Anomaly::incorrect("rtdb/list-offset-overflow", "List children exceed i32 offsets").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded))?);

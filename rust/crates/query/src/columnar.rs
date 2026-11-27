@@ -10,7 +10,7 @@ pub(crate) mod periods;
 pub(crate) mod search;
 pub(crate) mod window;
 
-use std::{collections::{HashMap, HashSet}, ops::Range, sync::Arc};
+use std::{borrow::Borrow, collections::{HashMap, HashSet}, ops::Range, sync::Arc};
 
 use arrow_array::{
     Array, ArrayRef, BooleanArray, FixedSizeListArray, ListArray, MapArray, NullArray, StructArray, UnionArray,
@@ -2395,6 +2395,58 @@ fn mixed_gather_retains_arrow_payloads_alongside_evaluated_cells() {
 }
 
 #[test]
+fn mixed_gather_borrows_repeated_text_and_preserves_bottom_metadata() {
+    let memory = MemoryBudget::new(1 << 20);
+    let text = Value::Utf8("x".repeat(64 * 1024));
+    let evaluated = Column::Values(vec![text.clone(), Value::Undefined]);
+    let bottom = Column::Arrow {
+        array: Arc::new(NullArray::new(1)),
+        field: Arc::new(rtdb_columnar::to_field("value", &LogicalType::Nothing).unwrap()),
+        logical: Some(LogicalType::Nothing),
+    };
+    let batches = [
+        ColumnBatch::settled(vec![evaluated], 2, memory.reserve(0).unwrap()).unwrap(),
+        ColumnBatch::settled(vec![bottom], 1, memory.reserve(0).unwrap()).unwrap(),
+    ];
+    let scratch = memory.scope_with_limit(160 * 1024);
+    let picks = [Some((0, 0)), None, Some((1, 0)), Some((0, 0))];
+    let (column, charge) = gather_column_cells(|index| &batches[index], picks.into_iter(), picks.len(), 0, true, &scratch).unwrap();
+    drop(batches);
+    assert_eq!(column.value(0).unwrap(), text);
+    assert!(matches!(column.arrow_cell(1), Some(None)));
+    let (_, field, logical, _) = column.arrow_cell(2).unwrap().unwrap();
+    assert!(!field.is_nullable());
+    assert_eq!(logical, Some(&LogicalType::Nothing));
+    assert_eq!(column.value(2).unwrap_err().code, "xtdb/zero-leg-read");
+    assert_eq!(column.value(3).unwrap(), text);
+    drop((column, charge));
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn mixed_gather_packs_borrowed_records_timestamps_and_lists_in_pick_order() {
+    use rtdb_types::{ListValue, StructFields, TimeUnit};
+
+    let memory = MemoryBudget::new(1 << 20);
+    let values = [
+        Value::Struct(StructFields::from([("a".into(), Value::I64(42))])),
+        Value::Timestamp { value: -1001, unit: TimeUnit::Millisecond, timezone: Some("Europe/Paris".into()) },
+        Value::List(ListValue::from_f32(arrow_array::Float32Array::from(vec![None, Some(-0.0)]))),
+        Value::Struct(StructFields::from([("b".into(), Value::Null)])),
+    ];
+    let batch = ColumnBatch::settled(vec![Column::Values(values.to_vec())], values.len(), memory.reserve(0).unwrap()).unwrap();
+    let rows = [3, 1, 2, 0, 1];
+    let picks = rows.into_iter().map(|row| Some((0, row)));
+    let (column, charge) = gather_column_cells(|_| &batch, picks, rows.len(), 0, true, &memory).unwrap();
+    drop(batch);
+    for (position, source) in rows.into_iter().enumerate() {
+        assert_eq!(column.value(position).unwrap(), values[source]);
+    }
+    drop((column, charge));
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
 fn fixed_size_vector_output_keeps_its_component_buffer() {
     let embedding = Value::FixedSizeList(rtdb_types::ListValue::from_f32(arrow_array::Float32Array::from(vec![Some(-0.0), None, Some(f32::MAX)])));
     let logical = embedding.logical_type().maybe();
@@ -2456,17 +2508,15 @@ fn gather_column_cells<'a>(
         (&batch.columns[position], batch.column_reservation(position))
     };
     let evaluated = rows.clone().flatten().filter(|&(index, _)| matches!(source(index).0, Column::Values(_)));
-    let converted = if evaluated.clone().next().is_some() {
-        let (len, bytes) = evaluated.clone().try_fold((0usize, 4096usize), |(len, bound), (index, row)| {
-            let bytes = source(index).0.bound(row)?;
-            Ok::<_, rtdb_types::Anomaly>((len.checked_add(1).ok_or_else(size_error)?, bound.checked_add(bytes).ok_or_else(size_error)?))
-        })?;
-        let scratch = memory.reserve(bytes)?;
+    let len = evaluated.clone().count();
+    let converted = if len != 0 {
+        let _scratch = memory.reserve(len.checked_mul(size_of::<&Value>()).ok_or_else(size_error)?)?;
         let mut values = Vec::with_capacity(len);
-        for (index, row) in evaluated { values.push(source(index).0.value(row)?); }
-        let packed = pack_evaluated_column(&values, memory)?;
-        drop((values, scratch));
-        Some(packed)
+        for (index, row) in evaluated {
+            let Column::Values(column) = source(index).0 else { unreachable!("Only evaluated cells were selected") };
+            values.push(column.get(row).ok_or_else(|| invalid("column-row", "Column row is outside its page"))?);
+        }
+        Some(pack_evaluated_cells(&values, memory, rtdb_columnar::copy_array_refs)?)
     } else { None };
     let mut next_evaluated = 0;
     let picks = rows.map(|cell| cell.map(|(index, row)| {
@@ -5931,18 +5981,24 @@ fn repeat_cell(value: &Value, count: usize) -> Result<Column> {
 }
 
 fn pack_scalar_values(values: &[Value], ty: LogicalType, memory: &Arc<MemoryBudget>) -> Result<(Column, Arc<MemoryReservation>)> {
+    pack_scalar_cells(values, ty, memory, rtdb_columnar::copy_array)
+}
+
+fn pack_scalar_cells<T: Borrow<Value>>(
+    values: &[T], ty: LogicalType, memory: &Arc<MemoryBudget>, copy: impl FnOnce(&LogicalType, &[T]) -> Result<ArrayRef>,
+) -> Result<(Column, Arc<MemoryReservation>)> {
     let (array, scratch) = if plain_scalar(&ty) == Some(&ScalarType::Utf8) {
         pack_utf8_values(values, memory)?
     } else {
-        let scratch = memory.reserve(rtdb_columnar::estimate_builder_bytes(&ty, values)?)?;
-        (rtdb_columnar::copy_array(&ty, values)?, scratch)
+        let scratch = memory.reserve(rtdb_columnar::estimate_builder_bytes_refs(&ty, values.iter().map(Borrow::borrow))?)?;
+        (copy(&ty, values)?, scratch)
     };
     let field = Arc::new(rtdb_columnar::to_field("value", &ty)?);
     Ok((Column::Arrow { array, field, logical: Some(ty) }, scratch))
 }
 
-fn pack_utf8_values(values: &[Value], memory: &Arc<MemoryBudget>) -> Result<(ArrayRef, Arc<MemoryReservation>)> {
-    let texts = values.iter().map(|value| match value {
+fn pack_utf8_values(values: &[impl Borrow<Value>], memory: &Arc<MemoryBudget>) -> Result<(ArrayRef, Arc<MemoryReservation>)> {
+    let texts = values.iter().map(|value| match value.borrow() {
         Value::Utf8(text) => Some(text.as_str()),
         Value::Null => None,
         _ => unreachable!("The scalar result type admitted only strings and nulls"),
@@ -5965,8 +6021,15 @@ fn pack_utf8_values(values: &[Value], memory: &Arc<MemoryBudget>) -> Result<(Arr
 }
 
 pub(crate) fn pack_evaluated_column(values: &[Value], memory: &Arc<MemoryBudget>) -> Result<(Column, Arc<MemoryReservation>)> {
-    if let Some(ty) = scalar_result_type(values.iter()) {
-        return pack_scalar_values(values, ty, memory);
+    pack_evaluated_cells(values, memory, rtdb_columnar::copy_array)
+}
+
+fn pack_evaluated_cells<T: Borrow<Value>>(
+    values: &[T], memory: &Arc<MemoryBudget>, copy: impl Fn(&LogicalType, &[T]) -> Result<ArrayRef>,
+) -> Result<(Column, Arc<MemoryReservation>)> {
+    let cells_in = values.iter().map(Borrow::borrow);
+    if let Some(ty) = scalar_result_type(cells_in.clone()) {
+        return pack_scalar_cells(values, ty, memory, copy);
     }
     let bytes = values.len().checked_mul(
         2 * std::mem::size_of::<(usize, usize)>() + 2 * std::mem::size_of::<Option<StoredVector>>(),
@@ -5977,16 +6040,16 @@ pub(crate) fn pack_evaluated_column(values: &[Value], memory: &Arc<MemoryBudget>
     let cell_type = |value: &Value| {
         if matches!(value, Value::Undefined) { LogicalType::Null } else { value.logical_type() }
     };
-    if let Some(kind) = values.iter().find(|value| !value.is_null()).and_then(float_vectors::kind)
-        && values.iter().all(|value| value.is_null() || float_vectors::kind(value) == Some(kind.clone()))
+    if let Some(kind) = cells_in.clone().find(|value| !value.is_null()).and_then(float_vectors::kind)
+        && cells_in.clone().all(|value| value.is_null() || float_vectors::kind(value) == Some(kind.clone()))
         && let Some(packed) = float_vectors::pack(values, kind, memory)?
     {
         return Ok(packed);
     }
     let mut start = 0;
     while start < values.len() {
-        if let Some(kind) = float_vectors::kind(&values[start]) {
-            let end = start + values[start..].iter().take_while(|value| {
+        if let Some(kind) = float_vectors::kind(values[start].borrow()) {
+            let end = start + values[start..].iter().map(Borrow::borrow).take_while(|value| {
                 float_vectors::kind(value) == Some(kind.clone())
             }).count();
             if let Some((Column::Arrow { array, field, logical }, custody)) = float_vectors::pack(&values[start..end], kind, memory)? {
@@ -5997,17 +6060,17 @@ pub(crate) fn pack_evaluated_column(values: &[Value], memory: &Arc<MemoryBudget>
                 continue;
             }
         }
-        let ty = cell_type(&values[start]);
+        let ty = cell_type(values[start].borrow());
         let field = Arc::new(rtdb_columnar::to_field("value", &ty)?);
         let mut end = start + 1;
         while end < values.len()
-            && rtdb_columnar::to_field("value", &cell_type(&values[end]))? == *field {
+            && rtdb_columnar::to_field("value", &cell_type(values[end].borrow()))? == *field {
             end += 1;
         }
         let run = &values[start..end];
-        let bound = rtdb_columnar::estimate_builder_bytes(&ty, run)?;
+        let bound = rtdb_columnar::estimate_builder_bytes_refs(&ty, run.iter().map(Borrow::borrow))?;
         let mut custody = memory.reserve(bound)?;
-        let array = rtdb_columnar::copy_array(&ty, run)?;
+        let array = copy(&ty, run)?;
         let lease = Arc::get_mut(&mut custody).expect("The evaluated column owns its run");
         let retained = array.get_array_memory_size().checked_add(field.size()).ok_or_else(size_error)?;
         if retained > lease.bytes() { lease.grow_to(retained)?; } else { lease.shrink_to(retained)?; }

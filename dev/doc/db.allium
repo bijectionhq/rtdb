@@ -2408,7 +2408,7 @@ surface QueryAccess {
         -- COALESCE over compatible floating-point vector columns selects the first non-null vector in each row by Arrow position.
         -- COALESCE over compatible selected or mixed-layout scalar columns retains the first non-null cell by Arrow position and keeps its source charged.
         -- It emits a null where every operand is null.
-        -- A mixed gather packs evaluated cells independently of compatible nested Arrow payloads, which it selects by position.
+        -- A mixed gather borrows reached evaluated cells for packing and selects compatible nested Arrow payloads by position.
         -- Evaluated vectors of one list kind pack into a single Arrow column across row and component nulls.
         -- Mixed Float32 and Float64 components retain their respective widths in a dense Arrow union.
         -- A scan reads compatible leaf counts, bounds, and Bloom bytes at cached Arrow positions.
