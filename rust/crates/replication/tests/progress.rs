@@ -69,6 +69,23 @@ async fn cancelling_a_wait_leaves_other_subscriptions_and_applied_progress_intac
     assert!(older.is_none());
 }
 
+#[tokio::test]
+async fn a_synchronous_wait_can_read_a_recent_commit_after_the_applied_head_advances() {
+    let monitor = ProgressMonitor::new(AppliedProgress {
+        source_position: SourcePosition(-1), tx_key: None, latest_result: None, external_token: None,
+    });
+    for id in 0_i64..65 {
+        let result = committed(id, id + 100);
+        monitor.applied(Some(SourcePosition(id)), Some(result.into()), None).unwrap();
+    }
+    let cancellation = CancellationToken::new();
+    assert!(monitor.await_tx(TxId(63), &cancellation).await.unwrap().is_none());
+    let retained = monitor.await_tx_with_recent_commits(TxId(63), &cancellation).await.unwrap();
+    assert_eq!(retained, Some(committed(63, 163)));
+    let evicted = monitor.await_tx_with_recent_commits(TxId(0), &cancellation).await.unwrap();
+    assert!(evicted.is_none());
+}
+
 #[test]
 fn resolved_rows_seed_from_applied_rows_and_resolution_stops_until_adoption() {
     let mut cycle = BlockCycle::Filling { rows: 9 };

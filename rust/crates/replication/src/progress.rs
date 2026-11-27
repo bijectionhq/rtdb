@@ -46,9 +46,13 @@ impl AppliedProgress {
 #[derive(Debug)]
 pub(crate) struct DriverRestart;
 
+const RECENT_COMMITS: usize = 64;
+
 #[derive(Clone, Debug)]
 struct ProgressState {
     applied: AppliedProgress,
+    recent_commits: [Option<TransactionKey>; RECENT_COMMITS],
+    next_commit: usize,
     placed: Option<PlacedReservation>,
     fault: Option<Anomaly>,
     stopped: bool,
@@ -66,7 +70,7 @@ impl ProgressState {
 pub struct ProgressMonitor { state: watch::Sender<ProgressState> }
 impl ProgressMonitor {
     pub fn new(applied: AppliedProgress) -> Arc<Self> {
-        Arc::new(Self { state: watch::channel(ProgressState { applied, placed: None, fault: None, stopped: false, restart: None }).0 })
+        Arc::new(Self { state: watch::channel(ProgressState { applied, recent_commits: [None; RECENT_COMMITS], next_commit: 0, placed: None, fault: None, stopped: false, restart: None }).0 })
     }
     pub fn current(&self) -> AppliedProgress { self.state.borrow().applied.clone() }
     pub fn fault(&self) -> Option<Anomaly> { self.state.borrow().fault.clone() }
@@ -121,7 +125,15 @@ impl ProgressMonitor {
                 state.placed = None;
             }
             state.applied.source_position = SourcePosition(update.source);
-            if let Some((_, result)) = update.completed { state.applied.tx_key = Some(result.result.tx_key()); state.applied.latest_result = Some(result); }
+            if let Some((_, result)) = update.completed {
+                let key = result.result.tx_key();
+                if result.attempt.is_none() && result.result.committed() {
+                    state.recent_commits[state.next_commit] = Some(key);
+                    state.next_commit = (state.next_commit + 1) % RECENT_COMMITS;
+                }
+                state.applied.tx_key = Some(key);
+                state.applied.latest_result = Some(result);
+            }
             if let Some(token) = token { state.applied.external_token = Some(token.into()); }
         });
         failure.map_or(Ok(()), Err)
@@ -181,11 +193,15 @@ impl ProgressMonitor {
     }
 
     async fn until(&self, ready: impl Fn(&ProgressState) -> bool + Send, cancellation: &CancellationToken) -> Result<AppliedProgress> {
+        self.observe_until(move |state| ready(state).then(|| state.applied.clone()), cancellation).await
+    }
+
+    async fn observe_until<T>(&self, sample: impl Fn(&ProgressState) -> Option<T> + Send, cancellation: &CancellationToken) -> Result<T> {
         let mut state = self.state.subscribe();
         loop {
             {
                 let state = state.borrow_and_update();
-                if ready(&state) { return Ok(state.applied.clone()); }
+                if let Some(value) = sample(&state) { return Ok(value); }
                 if let Some(error) = &state.fault { return Err(error.clone()); }
                 if state.stopped { return Err(stopped()); }
             }
@@ -201,6 +217,17 @@ impl ProgressMonitor {
         let progress = self.until(|state| state.applied.tx_id() >= tx_id, cancellation).await?;
         Ok(progress.latest_result.map(|completed| completed.result).filter(|result| result.tx_key().tx_id == tx_id))
     }
+    pub async fn await_tx_with_recent_commits(&self, tx_id: TxId, cancellation: &CancellationToken) -> Result<Option<Arc<TransactionResult>>> {
+        self.observe_until(|state| {
+            if state.applied.tx_id() < tx_id { return None; }
+            let current = state.applied.latest_result.as_ref()
+                .filter(|entry| entry.result.tx_key().tx_id == tx_id)
+                .map(|entry| Arc::clone(&entry.result));
+            Some(current.or_else(|| state.recent_commits.iter().flatten().find(|key| key.tx_id == tx_id)
+                .map(|&tx_key| Arc::new(TransactionResult::Committed { tx_key }))))
+        }, cancellation).await
+    }
+
     pub async fn await_source(&self, source: SourcePosition, cancellation: &CancellationToken) -> Result<()> {
         self.until(|state| state.applied.source_position >= source, cancellation).await.map(|_| ())
     }

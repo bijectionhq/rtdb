@@ -127,6 +127,7 @@
 -- A leader feeds that index from its own replica-log READ-BACK; a follower feeds it from the replica messages it reads.
 -- A native leader can order a block boundary when live and queued batch reservations reach the memory threshold for the open block.
 -- It counts published live batches and queued transactions beyond the applied head.
+-- Native synchronous transaction waits can use the exact outcome of a recent ordinary commit after a later transaction has applied.
 -- The memory trigger uses the same resolution pause, ordered boundary and checkpoint adoption as the row and timer triggers.
 
 -- The compactor writes L1+ tries to the source log, and the leader forwards them to the replica log.

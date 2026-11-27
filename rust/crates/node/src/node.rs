@@ -1030,7 +1030,7 @@ impl Node {
         self.ensure_indexing()?;
         let db = self.attached_database(database, placement)?;
         if expected.is_none() && !matches!(db.await_authority, AwaitAuthority::SourcePosition) { return Err(invalid_token()); }
-        let latest = db.replication.await_tx(tx_id, cancellation).await?
+        let latest = db.replication.progress().await_tx_with_recent_commits(tx_id, cancellation).await?
             .filter(|result| expected.is_none_or(|outcome| outcome.key == result.tx_key()));
         if expected.zip(latest.as_deref()).is_some_and(|(outcome, result)| outcome.committed != result.committed()) {
             return Err(bad_attempt_outcome());
