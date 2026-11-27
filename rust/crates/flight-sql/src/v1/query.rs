@@ -22,7 +22,6 @@ use rtdb_node::{Database, PreparedSql, ResultSignaturePolicy, serving::{QuerySou
 use rtdb_query::{QueryContext, QueryCursor};
 use rtdb_tx::transact::CustodyGroupId;
 use rtdb_types::{LogicalType, TableRef, Timestamp, Value, rtdb_v1::{At, Basis, ClaimEvidence, ClaimFootprint, ClaimScope, LabelScope, Layer}};
-use rtdb_types::AnomalyKind;
 use sha2::{Digest, Sha256};
 use tonic::{Response, Status};
 
@@ -912,18 +911,12 @@ impl Parameters {
     ) -> Result<Option<QueryCursor>, Status> {
         let types = self.types.as_slice();
         let skip_row_admission = self.binds_arrow_without_row_admission();
-        // Use the scalar path to report its original error if its eager row admission may fail.
-        let _scalar_row = if skip_row_admission {
-            None
-        } else {
+        if !skip_row_admission {
             if prepared.parameter_count() != types.len() || !self.can_bind_arrow() {
                 return Ok(None);
             }
-            let Ok(row) = self.reserve_scalar_row_bound(&context.memory) else {
-                return Ok(None);
-            };
-            Some(row)
-        };
+            drop(self.reserve_scalar_row_bound(&context.memory)?);
+        }
         let result = if skip_row_admission {
             prepared
                 .try_open_query_arrow(Arc::clone(context), &self.batch, types)
@@ -936,11 +929,8 @@ impl Parameters {
                 .iter()
                 .any(|field| field.data_type().is_unsigned_integer())
             {
-                let Ok(metadata) = wire::schema_bound(batch.schema_ref())
-                    .and_then(|bytes| context.memory.reserve(bytes).map_err(error::anomaly))
-                else {
-                    return Ok(None);
-                };
+                let metadata = wire::schema_bound(batch.schema_ref())
+                    .and_then(|bytes| context.memory.reserve(bytes).map_err(error::anomaly))?;
                 let Some(signed) = self.signed_batch() else {
                     return Ok(None);
                 };
@@ -972,15 +962,7 @@ impl Parameters {
                 )
                 .await
         };
-        match result {
-            Err(error)
-                if error.code == "rtdb.query/column-plan"
-                    || (!skip_row_admission && error.is(AnomalyKind::ResourceExhausted)) =>
-            {
-                Ok(None)
-            }
-            result => result.map_err(error::anomaly),
-        }
+        result.map_err(error::anomaly)
     }
 
     fn signed_batch(&self) -> Option<OwnedBatch> {
