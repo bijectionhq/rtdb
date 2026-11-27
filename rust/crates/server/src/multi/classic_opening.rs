@@ -394,20 +394,20 @@ mod tests {
             DatabaseOpen::Required,
         )
         .await?;
-        // Installing the candidate held a writer lease on another handle of
-        // this database; this handle becomes writer once that lease lapses.
-        let lapsed = std::time::Duration::from_micros(
+        let live = BTreeSet::from([runtime.backends.node]);
+        let lease_window = std::time::Duration::from_micros(
             (crate::multi::WRITER_LEASE_MICROS + crate::multi::CLOCK_DRIFT_MICROS) as u64,
         );
-        let deadline = tokio::time::Instant::now() + lapsed + std::time::Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + 2 * lease_window;
         loop {
-            match database.tick(&BTreeSet::from([runtime.backends.node])).await? {
-                Role::Writer(_) => break,
-                role => {
-                    assert!(tokio::time::Instant::now() < deadline, "{role:?} after the candidate lease lapsed");
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
+            let catalog_role = catalog.tick(&live).await?;
+            let candidate_role = database.tick(&live).await?;
+            if matches!((catalog_role, candidate_role), (Role::Writer(_), Role::Writer(_))) {
+                break;
             }
+            assert!(tokio::time::Instant::now() < deadline,
+                "Classic opening needs a catalog and candidate writer: {catalog_role:?}, {candidate_role:?}");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         let ready = &witness.held_ready.ready;
         let placement = workload::ImportedPlacement::new(
@@ -424,9 +424,17 @@ mod tests {
                 &placement,
             )
             .await?;
+        drop(database);
+        let mut reopened = open_database(
+            &runtime.backends,
+            &runtime.kms,
+            witness.database(),
+            DatabaseOpen::Required,
+        )
+        .await?;
         assert_eq!(
             ordered_fence,
-            database
+            reopened
                 .open_classic_placement(
                     witness.held_ready.binding_sha256,
                     &ready.installation,
@@ -474,7 +482,6 @@ mod tests {
                 .await
                 .is_err()
         );
-        drop(database);
         runtime.close().await;
         Ok(())
     }
