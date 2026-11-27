@@ -5571,6 +5571,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nested_field_keeps_selected_children_when_one_record_layout_omits_the_parent() {
+        use rtdb_types::StructFields;
+
+        let memory = MemoryBudget::new(1 << 20);
+        let source = MemoryBudget::new(1 << 20);
+        let present = Value::Struct(StructFields::from([("inner".into(), Value::Struct(StructFields::from([
+            ("leaf".into(), Value::Utf8("borrowed".into())),
+        ])))]));
+        let absent = Value::Struct(StructFields::from([("other".into(), Value::I64(9))]));
+        let present_type = present.logical_type().maybe();
+        let absent_type = absent.logical_type();
+        let mut input = field(0, ScalarType::Utf8);
+        input.data_type = present_type.join(&absent_type);
+        let schema = Schema::new(vec![input.clone()]).unwrap();
+        let present = rtdb_columnar::copy_array(&present_type, &[present, Value::Null]).unwrap();
+        let parent = present.as_any().downcast_ref::<StructArray>().unwrap();
+        let child = parent.column(0).as_any().downcast_ref::<StructArray>().unwrap();
+        let address = child.column(0).as_any().downcast_ref::<StringArray>().unwrap().value(0).as_ptr();
+        let absent = rtdb_columnar::copy_array(&absent_type, &[absent]).unwrap();
+        let sources = [(present, present_type), (absent, absent_type)].into_iter().map(|(array, logical)| {
+            let field = Arc::new(rtdb_columnar::to_field("source", &logical).unwrap());
+            let owner = source.reserve(array.get_array_memory_size()).unwrap();
+            Some((array, field, Some(logical), Some(owner)))
+        }).collect();
+        let selected = SelectedColumn::new(sources, Arc::new(vec![(1, 0), (0, 0), (0, 1), (0, 0)]));
+        let batch = ColumnBatch::settled(vec![Column::Selected(selected)], 4, memory.reserve(0).unwrap()).unwrap();
+        let inner = Expr::Field { expr: Box::new(input.expression()), name: "inner".into(),
+            data_type: rtdb_plan::field_type(&input.data_type, "inner") };
+        let leaf = Expr::Field { data_type: rtdb_plan::field_type(&inner.data_type(), "leaf"),
+            expr: Box::new(inner), name: "leaf".into() };
+        let mut cursor = record_projection_cursor(batch, schema, vec![leaf], &memory);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        drop(cursor);
+        assert!(matches!(&page.columns[0], Column::Selected(_)));
+        let Some(Some((array, field, _, row))) = page.columns[0].arrow_cell(1) else { panic!("Expected the selected Arrow text"); };
+        assert_eq!((rtdb_columnar::ArrowCell { array, field, row }).utf8().unwrap().as_ptr(), address);
+        let actual = (0..page.len).map(|row| page.columns[0].value(row).unwrap()).collect::<Vec<_>>();
+        assert_eq!(actual, [Value::Null, Value::Utf8("borrowed".into()), Value::Null, Value::Utf8("borrowed".into())]);
+        assert!(source.used_bytes() > 0);
+        drop(page);
+        assert_eq!(source.used_bytes(), 0);
+    }
+
+    #[tokio::test]
     async fn record_projection_row_copy_keeps_selected_nested_layout_and_last_field() {
         use rtdb_types::StructFields;
 
@@ -7223,7 +7267,13 @@ pub(crate) mod projection {
                         sources.push(None);
                         continue;
                     }
-                    let Some((parent, child, field, logical)) = struct_child(array, field, logical, name) else { return Ok(None); };
+                    let Some((parent, child, field, logical)) = struct_child(array, field, logical, name) else {
+                        if absent_in_plain_record(array, field, logical, name) {
+                            sources.push(None);
+                            continue;
+                        }
+                        return Ok(None);
+                    };
                     if !record_field(field, true) { return Ok(None); }
                     let Some((Column::Arrow { array, field, logical }, charge)) =
                         funded_child(parent, child, field, logical, custody.as_ref().unwrap_or(owner), memory)? else { return Ok(None); };
@@ -7234,6 +7284,19 @@ pub(crate) mod projection {
             }
             _ => Ok(None),
         }
+    }
+
+    fn absent_in_plain_record(array: &ArrayRef, field: &ArrowField, logical: &LogicalType, name: &str) -> bool {
+        let DataType::Struct(children) = field.data_type() else { return false; };
+        array.data_type() == field.data_type() && field.metadata().is_empty() && super::stable_read_layout(logical, field)
+            && children.iter().all(|child| {
+                child.name() != name && child.metadata().is_empty() && match child.data_type() {
+                    DataType::Null => child.is_nullable(),
+                    DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+                    | DataType::Float32 | DataType::Float64 | DataType::Utf8 | DataType::Binary => true,
+                    _ => false,
+                }
+            })
     }
 
     fn funded_child(
