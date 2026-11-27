@@ -3390,6 +3390,40 @@ struct InterruptedInstall {
 
 #[async_trait::async_trait]
 impl KeyService for InterruptedInstall {
+    // Everything but `install` goes to the wrapped service, including the
+    // unit, journal and archive key operations whose defaults refuse.
+    async fn existing_namespace_id(&self) -> rtdb_types::Result<Option<[u8; 32]>> { self.keys.existing_namespace_id().await }
+    fn assertion_keys(&self) -> Option<&dyn rtdb_multi::keys::AssertionKeyService> { self.keys.assertion_keys() }
+    fn assertion_families(&self, region: Arc<rtdb_storage::IoRegion>) -> Option<rtdb_multi::keys::AssertionFamilies<'_>> { self.keys.assertion_families(region) }
+    fn assertion_issuers(&self, region: Arc<rtdb_storage::IoRegion>) -> Option<rtdb_multi::keys::AssertionIssuers<'_>> { self.keys.assertion_issuers(region) }
+    async fn use_unit_key(&self, slot: rtdb_multi::keys::UnitSlot, name: rtdb_storage::ObjectKey, operation: rtdb_multi::keys::UnitOperation,
+        io: &Arc<rtdb_storage::IoRegion>) -> rtdb_storage::Result<rtdb_multi::keys::UnitOutput>
+    {
+        self.keys.use_unit_key(slot, name, operation, io).await
+    }
+    async fn withdraw_unit_key(&self, slot: rtdb_multi::keys::UnitSlot, io: &Arc<rtdb_storage::IoRegion>) -> rtdb_types::Result<()> {
+        self.keys.withdraw_unit_key(slot, io).await
+    }
+    async fn provision_journal_key(&self, key: rtdb_multi::keys::JournalKey) -> rtdb_types::Result<()> { self.keys.provision_journal_key(key).await }
+    async fn seal_journal_payload(&self, key: rtdb_multi::keys::JournalKey, io: &Arc<rtdb_storage::IoRegion>, plaintext: bytes::Bytes)
+        -> rtdb_storage::Result<bytes::Bytes>
+    {
+        self.keys.seal_journal_payload(key, io, plaintext).await
+    }
+    async fn open_journal_payload(&self, key: rtdb_multi::keys::JournalKey, io: &Arc<rtdb_storage::IoRegion>, ciphertext: bytes::Bytes)
+        -> rtdb_storage::Result<bytes::Bytes>
+    {
+        self.keys.open_journal_payload(key, io, ciphertext).await
+    }
+    async fn archive_key(&self, id: &str, provision: bool, region: Arc<rtdb_storage::IoRegion>) -> rtdb_types::Result<Arc<dyn rtdb_multi::keys::ArchiveKey>> {
+        self.keys.archive_key(id, provision, region).await
+    }
+    async fn scoped_unit_key(&self, id: &str, region: Arc<rtdb_storage::IoRegion>) -> rtdb_types::Result<Arc<dyn rtdb_multi::keys::ArchiveKey>> {
+        self.keys.scoped_unit_key(id, region).await
+    }
+    async fn archive_key_is_operation_only(&self, id: &str) -> rtdb_types::Result<bool> { self.keys.archive_key_is_operation_only(id).await }
+    async fn schedule_archive_key(&self, id: &str, due_at_ms: i64) -> rtdb_types::Result<bool> { self.keys.schedule_archive_key(id, due_at_ms).await }
+    async fn withdraw_archive_key(&self, id: &str) -> rtdb_types::Result<rtdb_multi::keys::ArchiveKeyWithdrawal> { self.keys.withdraw_archive_key(id).await }
     async fn withdraw_unit_scope(&self, scope: rtdb_multi::keys::UnitScope, io: &Arc<rtdb_storage::IoRegion>)
         -> rtdb_types::Result<()>
     {
