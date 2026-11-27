@@ -160,6 +160,23 @@ fn a_principal_is_bound_to_its_region_and_a_session_retains_it() {
 }
 
 #[test]
+fn typed_statement_schema_borrows_parameter_fields_in_ordinal_order() {
+    let mut native = Native::open();
+    let operation = native.operation();
+    let statement = native.statement("SELECT ? AS a, ? AS b");
+    let mut error = 0;
+    ok(unsafe { rtdb_v1_statement_prepare(statement, operation, &mut error) }, error);
+    let fields = Schema::new(vec![Field::new("", DataType::Int64, false), Field::new("", DataType::Boolean, false)]);
+    let parameters = FFI_ArrowSchema::try_from(&fields).unwrap();
+    let mut out = FFI_ArrowSchema::empty();
+    ok(unsafe { rtdb_v1_statement_schema_with_parameters(statement, operation, &parameters, &mut out, &mut error) }, error);
+    assert!(parameters.release.is_some());
+    let schema = Schema::try_from(&out).unwrap();
+    assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+    assert_eq!(schema.field(1).data_type(), &DataType::Boolean);
+}
+
+#[test]
 fn diagnostic_slices_distinguish_absent_empty_and_present_messages_through_retain() {
     for message in [None, Some(String::new()), Some("échec".into())] {
         let original = handles::diagnostic(Anomaly::new_nullable(AnomalyCategory::Fault, "test/error", message.clone()));

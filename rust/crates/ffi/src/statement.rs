@@ -116,6 +116,10 @@ impl StatementHandle {
         })
     }
     pub fn schema(self: &Arc<Self>, parameters: bool, token: &CancellationToken) -> Result<crate::arrow::OwnedSchema> {
+        self.schema_with_types(parameters, None, token)
+    }
+
+    pub fn schema_with_types(self: &Arc<Self>, parameters: bool, types: Option<crate::arrow::ParameterTypes>, token: &CancellationToken) -> Result<crate::arrow::OwnedSchema> {
         self.session.ensure_open()?;
         let statement = Arc::clone(self);
         let token = token.clone();
@@ -129,8 +133,10 @@ impl StatementHandle {
                     if parameters { return crate::arrow::OwnedSchema::parameters(prepared.parameter_count(), statement.session.region.memory()); }
                     if prepared.is_dml() { return crate::arrow::OwnedSchema::empty(statement.session.region.memory()); }
                     let context = session.prepare_context_for(&statement.creation_database, &token).await?;
-                    let result = {
-                        context.check_cancelled()?;
+                    context.check_cancelled()?;
+                    let result = if let Some(types) = types {
+                        prepared.result_schema(&context, &types.types)?
+                    } else {
                         let count = prepared.parameter_count();
                         let _parameter_types = context.memory.reserve(super::mul(count, std::mem::size_of::<LogicalType>())?)?;
                         let types = vec![LogicalType::Null; count];

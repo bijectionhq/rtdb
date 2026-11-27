@@ -4,6 +4,7 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.arrow.adbc.core.AdbcException;
 import org.apache.arrow.adbc.core.AdbcStatement;
@@ -17,6 +18,7 @@ import org.apache.arrow.memory.OutOfMemoryException;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.VectorUnloader;
 import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
+import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 /** Bound Arrow arguments are copied before bind returns; result buffers are independently retained. */
@@ -101,15 +103,31 @@ public final class NativeStatement extends NativeResource implements AdbcStateme
     public void bindTransit(byte[] rows) throws AdbcException {
         try (Arena arena = Arena.ofConfined()) { MemorySegment bytes = NativeAbi.bytes(arena, rows); abi.call("statement_bind_transit", handle(), bytes, bytes.byteSize()); }
     }
-    @Override public Schema getParameterSchema() throws AdbcException { return schema(true); }
-    @Override public Schema executeSchema() throws AdbcException { return schema(false); }
-    private Schema schema(boolean parameters) throws AdbcException {
-        try (NativeConnection.Operation operation = connection.operation(); ArrowSchema schema = ArrowSchema.allocateNew(connection.allocator)) {
+    @Override public Schema getParameterSchema() throws AdbcException { return schema(true, null); }
+    @Override public Schema executeSchema() throws AdbcException { return schema(false, null); }
+    /** Infers the result schema from positional Arrow parameter fields. */
+    public Schema executeSchema(List<Field> parameterFields) throws AdbcException {
+        return schema(false, Objects.requireNonNull(parameterFields));
+    }
+    private Schema schema(boolean parameters, List<Field> parameterFields) throws AdbcException {
+        try (NativeConnection.Operation operation = connection.operation();
+             ArrowSchema schema = ArrowSchema.allocateNew(connection.allocator);
+             ArrowSchema input = parameterFields == null ? null : ArrowSchema.allocateNew(connection.allocator)) {
             running.set(operation);
             try {
-                abi.call("statement_schema", handle(), operation.id(), parameters ? 1 : 0, NativeAbi.address(schema.memoryAddress()));
+                var out = NativeAbi.address(schema.memoryAddress());
+                if (input == null) {
+                    abi.call("statement_schema", handle(), operation.id(), parameters ? 1 : 0, out);
+                } else {
+                    Data.exportSchema(connection.allocator, new Schema(parameterFields), null, input);
+                    abi.call("statement_schema_with_parameters", handle(), operation.id(), NativeAbi.address(input.memoryAddress()), out);
+                }
                 return Data.importSchema(connection.allocator, schema, null, false);
-            } finally { running.compareAndSet(operation, null); if (schema.snapshot().release != 0) schema.release(); }
+            } finally {
+                running.compareAndSet(operation, null);
+                if (input != null && input.snapshot().release != 0) input.release();
+                if (schema.snapshot().release != 0) schema.release();
+            }
         }
     }
     private record Opened(long cursor, NativeConnection.Operation operation) {}

@@ -76,6 +76,7 @@ Replacement C format strings share each schema child's retained release owner, s
 
 ADBC parameter schema requests admit the Arrow fields before constructing them and return one empty-name nullable Null field per positional parameter.
 ADBC query schema requests acquire a preparation context for each call and report type errors without opening a cursor.
+The typed schema entry point borrows a C Data parameter schema and admits its fields by position without changing the statement's binding.
 Result schema inference releases its temporary vector of unknown parameter types and the vector's reservation before converting result fields to Arrow.
 DML result schema requests return an empty schema without acquiring that context.
 ADBC cursor schemas retain the advertised result layout.

@@ -70,6 +70,7 @@ final class NativeAbi {
         registerOptional(library, linker, "statement_bind_retained", I64, PTR, PTR, PTR);
         register(library, linker, "statement_bind_transit", I64, PTR, I64, PTR);
         register(library, linker, "statement_schema", I64, I64, I32, PTR, PTR);
+        registerOptional(library, linker, "statement_schema_with_parameters", I64, I64, PTR, PTR, PTR);
         register(library, linker, "statement_query", I64, I64, PTR, PTR);
         register(library, linker, "statement_update", I64, I64, PTR, PTR);
         register(library, linker, "cursor_schema", I64, PTR, PTR);

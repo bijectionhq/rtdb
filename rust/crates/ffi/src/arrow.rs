@@ -369,6 +369,20 @@ pub(crate) struct BoundArguments {
     pub _reservation: Arc<MemoryReservation>,
 }
 
+pub(crate) struct ParameterTypes {
+    pub(crate) types: Vec<LogicalType>,
+    _reservation: Arc<MemoryReservation>,
+}
+
+pub(crate) unsafe fn read_parameter_types(schema: &FFI_ArrowSchema, memory: &Arc<MemoryBudget>) -> Result<ParameterTypes> {
+    if schema.release.is_none() { return Err(super::invalid("Arrow parameter schema has already been released")); }
+    let _import = memory.reserve(unsafe { foreign_schema_bound(schema, 0) }?)?;
+    let schema = unsafe { import_foreign_schema(schema) }?;
+    let reservation = memory.reserve(rtdb_format::ipc::schema_translation_bound(&schema)?)?;
+    let types = schema.fields().iter().map(|field| rtdb_columnar::from_field(field)).collect::<Result<_>>()?;
+    Ok(ParameterTypes { types, _reservation: reservation })
+}
+
 /// Takes ownership of a valid Arrow C Data array and schema by replacing both with released structs.
 /// Foreign buffers are copied into native Arrow allocations before returning, including on zero-row binds.
 /// Decimal precision and scale come from C format strings; reserved native field annotations are rejected.
@@ -387,11 +401,7 @@ unsafe fn import_arguments_with_lifetime(
     let schema_charge = memory.reserve(unsafe { foreign_schema_bound(schema, 0) }?)?;
     let array = std::mem::replace(array, FFI_ArrowArray::empty());
     let schema = std::mem::replace(schema, FFI_ArrowSchema::empty());
-    let native_schema = Arc::new(if unsafe { foreign_schema_needs_carrier(&schema) }? {
-        import_decimal_schema(&schema)?
-    } else {
-        Schema::try_from(&schema).map_err(arrow_error)?
-    });
+    let native_schema = Arc::new(unsafe { import_foreign_schema(&schema) }?);
     let imported = unsafe { from_ffi_and_data_type(array, DataType::Struct(native_schema.fields().clone())) }.map_err(arrow_error)?;
     imported.validate_full().map_err(arrow_error)?;
     let array = StructArray::from(imported);
@@ -414,6 +424,11 @@ unsafe fn import_arguments_with_lifetime(
     drop(array);
     let arguments = SqlArguments::from_admitted_arrow_with_canonical_source(batch, types)?;
     Ok(BoundArguments { arguments, names, _reservation: schema_charge })
+}
+
+unsafe fn import_foreign_schema(schema: &FFI_ArrowSchema) -> Result<Schema> {
+    if unsafe { foreign_schema_needs_carrier(schema) }? { import_decimal_schema(schema) }
+    else { Schema::try_from(schema).map_err(arrow_error) }
 }
 
 fn copy_foreign_data(data: ArrayData) -> Result<ArrayData> {

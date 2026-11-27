@@ -52,6 +52,7 @@ Close the principal after opening the sessions that need it and close a pending 
 Only `CREATE_APPEND` bulk ingest is supported, matching the pinned embedded API.
 Arrow binds are copied, including duplicate or unnamed parameter columns, so an external source allocator may close immediately after `bind` returns.
 Metadata includes `getInfo`, `getObjects`, `getTableTypes` and `getTableSchema` with the standard ADBC schemas.
+`NativeStatement.executeSchema(parameterFields)` uses the supplied Arrow fields by position to describe a prepared query independently of its bound arguments.
 SQL transaction-control statements are rejected; use autocommit, commit and rollback, or the explicit native begin/commit methods.
 `beginReadOnly()` and `beginWriteOnly()` have overloads for a read basis or write settings.
 `setTransactionReadOnly`, `setTransactionReadWrite` and `setTransactionTimeZone` shape the transaction before its first query or write.

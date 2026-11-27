@@ -18,9 +18,11 @@ import org.apache.arrow.adbc.core.BulkIngestMode;
 import org.apache.arrow.adbc.core.StandardSchemas;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.BigIntVector;
+import org.apache.arrow.vector.BitVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.VectorUnloader;
 import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
+import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -215,6 +217,23 @@ final class NativeAdbcTest {
                 assertEquals(supplied, time.toInstant());
             }
             assertNull(connection.commitSyncResult());
+        }
+    }
+
+    @Test void describesTypedParameterResultsWithoutChangingTheBinding() throws Exception {
+        try (var allocator = new RootAllocator(); var database = open(allocator); var connection = database.connect();
+             var statement = connection.prepareStatement("SELECT ? AS a, ? AS b")) {
+            assertTrue(statement.tryBindNativeArguments(List.of(42L, true)));
+            var logical = statement.executeSchema(List.of(Field.notNullable("", new ArrowType.Int(32, true)),
+                Field.notNullable("", ArrowType.Bool.INSTANCE)));
+            assertEquals(new ArrowType.Int(32, true), logical.getFields().get(0).getType());
+            assertEquals(ArrowType.Bool.INSTANCE, logical.getFields().get(1).getType());
+            try (var result = statement.executeQuery()) {
+                assertTrue(result.getReader().loadNextBatch());
+                var batch = result.getReader().getVectorSchemaRoot();
+                assertEquals(42L, batch.getVector(0).getObject(0));
+                assertEquals(1, ((BitVector) batch.getVector(1)).get(0));
+            }
         }
     }
 

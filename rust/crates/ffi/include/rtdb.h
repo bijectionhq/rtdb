@@ -213,6 +213,11 @@ int32_t rtdb_v1_statement_bind_transit(RtdbHandle statement, const uint8_t *msgp
  * parameters=0 returns result schema; 1 returns positional parameter schema after prepare.
  */
 int32_t rtdb_v1_statement_schema(RtdbHandle statement, RtdbHandle operation, uint32_t parameters, struct ArrowSchema *out, RtdbHandle *error);
+/* Infer a result schema from a borrowed parameter schema in positional order.
+ * The parameter schema and the distinct output use independent release callbacks.
+ * The call does not bind or retain argument arrays.
+ */
+int32_t rtdb_v1_statement_schema_with_parameters(RtdbHandle statement, RtdbHandle operation, const struct ArrowSchema *parameters, struct ArrowSchema *out, RtdbHandle *error);
 int32_t rtdb_v1_statement_query(RtdbHandle statement, RtdbHandle operation, RtdbHandle *out, RtdbHandle *error);
 int32_t rtdb_v1_statement_update(RtdbHandle statement, RtdbHandle operation, int64_t *affected, RtdbHandle *error);
 int32_t rtdb_v1_cursor_schema(RtdbHandle cursor, struct ArrowSchema *out, RtdbHandle *error);

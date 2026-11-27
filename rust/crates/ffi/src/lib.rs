@@ -600,6 +600,25 @@ pub unsafe extern "C" fn rtdb_v1_statement_schema(handle: u64, operation: u64, p
     }) }
 }
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn rtdb_v1_statement_schema_with_parameters(
+    handle: u64, operation: u64, parameters: *const FFI_ArrowSchema, out: *mut FFI_ArrowSchema, error: *mut u64,
+) -> i32 {
+    unsafe { call(error, || {
+        if std::ptr::eq(parameters, out) { return Err(invalid("Parameter and output schemas must be distinct")); }
+        let out = output(out)?;
+        if out.release.is_some() { return Err(invalid("Output Arrow schema is still owned")); }
+        let parameters = parameters.as_ref().ok_or_else(|| invalid("Parameter Arrow schema is null"))?;
+        let statement = handles::statement(handle)?;
+        let _admitted = statement.session.region.enter()?;
+        let token = handles::cancellation(operation, &statement.session)?;
+        let memory = statement.session.region.memory();
+        let types = arrow::read_parameter_types(parameters, memory)?;
+        let schema = statement.schema_with_types(false, Some(types), &token)?;
+        *out = arrow::export_schema(&schema.schema, memory)?;
+        Ok(())
+    }) }
+}
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn rtdb_v1_statement_query(handle: u64, operation: u64, out: *mut u64, error: *mut u64) -> i32 {
     unsafe { call(error, || {
         let out = output(out)?; *out = 0;
