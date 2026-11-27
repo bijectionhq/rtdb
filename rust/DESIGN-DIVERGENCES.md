@@ -271,6 +271,13 @@ At-least-once clients and placed deployments need server-enforced deduplication 
 Clients that do not attach RTDB retry guards see standard XTDB transaction behaviour.
 Clients using guards get deduplicated replay receipts, and the resulting framed records cannot be replayed by XTDB.
 
+**Classic dense-union argument tags (POST-18).**
+Eligible unkeyed, unguarded and unplaced Classic writes encode dense-union tags in typed SQL arguments as child ordinals.
+Keyed, guarded and placed writes preserve explicit type IDs in uniform Arrow argument uploads.
+Different type IDs can give identical SQL values distinct retry body digests, and placed reservations bind the exact source bytes.
+Bijection's hosted world attempts carry an explicit attempt key and request digest alongside their mutations.
+Revisit the retained Classic encoding when a client requires XTDB replay of protected Classic SQL records.
+
 **Where in the code.**
 - `RC/tx/src/replay_submission.rs`
 - `RC/tx/src/bounded_retry.rs`
