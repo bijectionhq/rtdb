@@ -164,10 +164,38 @@ fn status(error: Status) -> Anomaly {
         .and_then(|encoded| encoded.to_bytes().ok())
         .and_then(|bytes| data::Error::decode(bytes).ok())
     {
+        // The detail names the server's category exactly; the gRPC code does
+        // not, since the v1 wire sends a conflict as `Aborted`.
+        let category = match detail.category() {
+            data::AnomalyCategory::Incorrect => AnomalyCategory::Incorrect,
+            data::AnomalyCategory::Unsupported => AnomalyCategory::Unsupported,
+            data::AnomalyCategory::NotFound => AnomalyCategory::NotFound,
+            data::AnomalyCategory::Forbidden => AnomalyCategory::Forbidden,
+            data::AnomalyCategory::Conflict => AnomalyCategory::Conflict,
+            data::AnomalyCategory::Busy => AnomalyCategory::Busy,
+            data::AnomalyCategory::Unavailable => AnomalyCategory::Unavailable,
+            data::AnomalyCategory::Interrupted => AnomalyCategory::Interrupted,
+            data::AnomalyCategory::Fault => AnomalyCategory::Fault,
+            data::AnomalyCategory::Unspecified => category,
+        };
         let kind = rtdb_types::AnomalyKind::from_wire_code(&detail.code);
         let mut anomaly = Anomaly::new(category, detail.code, detail.message);
         anomaly.kind = kind;
         return anomaly;
     }
     Anomaly::new(category, "rtdb.admin/request", error.message())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_wire_conflict_stays_a_conflict() {
+        let conflict = Anomaly::new(AnomalyCategory::Conflict, "rtdb/multi-catalog-conflict", "taken");
+        let received = status(crate::v1::error::anomaly(conflict));
+        assert_eq!(received.category, AnomalyCategory::Conflict);
+        let interrupted = Anomaly::new(AnomalyCategory::Interrupted, "rtdb/interrupted", "stopped");
+        assert_eq!(status(crate::v1::error::anomaly(interrupted)).category, AnomalyCategory::Interrupted);
+    }
 }
