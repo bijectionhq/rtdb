@@ -132,7 +132,7 @@ async fn spill_shuffle_replays_probe_partitions_within_each_build_partition() {
 }
 
 #[tokio::test]
-async fn hash_join_traces_completed_spill_bytes_after_replay() {
+async fn hash_join_traces_completed_spill_bytes_and_decoded_replay_frames() {
     use rtdb_plan::Tracer;
 
     for threshold in [1, 100] {
@@ -149,20 +149,29 @@ async fn hash_join_traces_completed_spill_bytes_after_replay() {
         drop(parent);
         tracer.close();
 
-        let mut bytes = None;
+        let mut spill_attributes = BTreeMap::new();
         while let Some(span) = receiver.next().await {
-            if let Some((_, written)) = span.attributes().find(|(name, _)| *name == "cursor.spill.bytes_written") {
+            for (name, value) in span.attributes().filter(|(name, _)| {
+                *name == "cursor.spill.bytes_written" || name.starts_with("cursor.join_spill.")
+            }) {
                 assert_eq!(span.name, "query.cursor.inner-join");
-                assert!(bytes.replace(written.parse::<u64>().unwrap()).is_none());
+                assert!(spill_attributes.insert(name.to_owned(), value.parse::<u64>().unwrap()).is_none());
             }
         }
-        let bytes = bytes.unwrap();
+        let bytes = spill_attributes["cursor.spill.bytes_written"];
+        let replay = [
+            spill_attributes["cursor.join_spill.build_replay_frames"],
+            spill_attributes["cursor.join_spill.probe_replay_frames"],
+            spill_attributes["cursor.join_spill.peak_build_partition_rows"],
+        ];
         if threshold == 1 {
             let peak = execution.context.spill_peak_bytes();
             assert!(peak > 0);
             assert!(bytes > peak);
+            assert_eq!(replay, [1, 1, 2]);
         } else {
             assert_eq!(bytes, 0);
+            assert_eq!(replay, [0, 0, 0]);
         }
     }
 }

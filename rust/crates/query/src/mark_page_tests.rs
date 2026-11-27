@@ -351,6 +351,72 @@ async fn spilled_scalar_mark_retains_null_facts_from_other_partitions() {
 }
 
 #[tokio::test]
+async fn scalar_membership_traces_replay_and_peak_rows_across_build_partitions() {
+    use rtdb_plan::Tracer;
+    use Value::{Bool, I64, Null};
+
+    let ty = LogicalType::Scalar(ScalarType::I64).maybe();
+    let repeated = vec![I64(1); 600];
+    let dependent = union(
+        union(
+            typed_table(1, &repeated, ty.clone()),
+            typed_table(1, &repeated, ty.clone()),
+        ),
+        typed_table(1, &[Null], ty.clone()),
+    );
+    let input = typed_table(0, &[I64(1), Null], ty);
+    let relation = mark(input, dependent, Expr::binary(BinaryOp::Eq, column(0), column(1)), false);
+
+    for (threshold, tracing, drain) in [(1, true, true), (1, true, false), (1, false, true), (10_000, true, true)] {
+        let mut execution = execution_threshold(32, threshold);
+        let (tracer, mut receiver) = rtdb_metrics::TraceRecorder::new(MemoryBudget::new(1 << 20), 16, tracing, false).unwrap();
+        let parent = tracer.start(None, "xtdb.query", &[]).unwrap();
+        execution.context = Arc::clone(&execution.context).with_tracer(Some(tracer.clone()), Some(parent.context()));
+        let mut cursor = open(Arc::clone(&relation), &execution).await;
+        let mut rows = Vec::new();
+        while let Some(batch) = cursor.next_batch().await.unwrap() {
+            rows.extend(page_rows(batch));
+            if !drain { break; }
+        }
+        let matched = vec![I64(1), Bool(true)];
+        let unknown = vec![Null, Null];
+        let spilled = threshold == 1;
+        let expected = match (spilled, drain) {
+            (true, true) => vec![unknown, matched],
+            (true, false) => vec![unknown],
+            (false, _) => vec![matched, unknown],
+        };
+        assert_eq!(rows, expected);
+        drop((cursor, parent));
+        assert_eq!(execution.context.spill_bytes(), 0);
+        assert_eq!(execution.context.spill_peak_bytes() > 0, spilled);
+        tracer.close();
+
+        let mut replay = BTreeMap::new();
+        while let Some(span) = receiver.next().await {
+            for (name, value) in span.attributes().filter(|(name, _)| name.starts_with("cursor.join_spill.")) {
+                assert_eq!(span.name, "query.cursor.mark-join");
+                assert!(replay.insert(name.to_owned(), value.parse::<u64>().unwrap()).is_none());
+            }
+        }
+        if tracing {
+            let expected = match (spilled, drain) {
+                (true, true) => [3, 2, 1200],
+                (true, false) => [1, 1, 1],
+                (false, _) => [0, 0, 0],
+            };
+            assert_eq!([
+                replay["cursor.join_spill.build_replay_frames"],
+                replay["cursor.join_spill.probe_replay_frames"],
+                replay["cursor.join_spill.peak_build_partition_rows"],
+            ], expected);
+        } else {
+            assert!(replay.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
 async fn spilled_nested_mark_keeps_probe_pages_and_compares_all_build_partitions() {
     let execution = execution_threshold(1,0);let baseline = execution.context.memory.used_bytes();
     let nested = |left,right|Value::list(vec![Value::I64(left),right]);

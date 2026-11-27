@@ -25,7 +25,7 @@ use crate::columnar::{
 use crate::context::Execution;
 use crate::invalid;
 use crate::join_key::JoinLayout;
-use crate::join_spill::{BlockWriter, Partitions};
+use crate::join_spill::{BlockWriter, Partitions, ReplayStats};
 use crate::join_storage::{HashIndex, combine_cell_hash};
 use crate::operators::{BatchOutput, build_batch_input};
 use crate::pushdown::{PushdownBuilder, Pushdowns};
@@ -512,7 +512,7 @@ struct DiskJoin {
 }
 
 impl DiskJoin {
-    async fn next(&mut self, spec: &Spec) -> Result<Option<ColumnBatch>> {
+    async fn next(&mut self, spec: &mut Spec) -> Result<Option<ColumnBatch>> {
         let context = &spec.execution.context;
         let memory = &context.memory;
         loop {
@@ -537,9 +537,15 @@ impl DiskJoin {
                 let reservation = memory.reserve(inventory(count)?)?;
                 let mut batches = Vec::with_capacity(count);
                 let mut rows = 0usize;
+                if let Some(stats) = &mut spec.spill_stats {
+                    stats.replay.start_build_partition();
+                }
                 for frame in 0..count {
                     context.check_cancelled()?;
                     let batch = self.build.read(self.build_partition, frame)?;
+                    if let Some(stats) = &mut spec.spill_stats {
+                        stats.replay.build_frame(batch.len);
+                    }
                     rows = rows.checked_add(batch.len).ok_or_else(size_error)?;
                     batches.push(batch);
                 }
@@ -560,6 +566,9 @@ impl DiskJoin {
             for frame in 0..count {
                 context.check_cancelled()?;
                 let batch = self.probe.read(partition, frame)?;
+                if let Some(stats) = &mut spec.spill_stats {
+                    stats.replay.probe_frame();
+                }
                 if let Some(batch) = spec.probe_batch(table, batch).await? {
                     rows = rows.checked_add(batch.len).filter(|rows| *rows <= i32::MAX as usize).ok_or_else(size_error)?;
                     ready.push_back(batch);
@@ -573,11 +582,17 @@ impl DiskJoin {
 
 pub(crate) struct BatchJoin { state: State, spec: Spec }
 
+#[derive(Default)]
+struct JoinSpillStats {
+    bytes_written: u64,
+    replay: ReplayStats,
+}
+
 struct Spec {
     order: Vec<bool>, build_keys: Vec<usize>, probe_keys: Vec<usize>, widths: [usize; 2], kind: JoinKind, count_only: bool,
     projected: [bool; 2], swapped: bool, _original_layout_charge: Option<Arc<MemoryReservation>>, theta: ThetaTests, residual: Option<Residual>, execution: Execution,
     hash: JoinHash,
-    spill_bytes_written: Option<u64>,
+    spill_stats: Option<JoinSpillStats>,
 }
 
 impl BatchJoin {
@@ -585,10 +600,10 @@ impl BatchJoin {
         let build_keys = layout.left.key_positions().to_vec();
         let probe_keys = layout.right.key_positions().to_vec();
         let widths = [layout.left.original.len(), layout.right.original.len()];
-        let spill_bytes_written = crate::trace::operator_evidence_enabled(&execution.context).then_some(0);
+        let spill_stats = crate::trace::operator_evidence_enabled(&execution.context).then(JoinSpillStats::default);
         Self { state: State::Build { build, probe, layout }, spec: Spec { order, build_keys, probe_keys, widths, kind: JoinKind::Inner, count_only: false,
             projected, swapped: false, _original_layout_charge: None, theta: ThetaTests::default(), residual: None, execution, hash: JoinHash::Vector,
-            spill_bytes_written } }
+            spill_stats } }
     }
 }
 
@@ -771,8 +786,9 @@ impl Spec {
             build.append(batch, context)?;
         }
         drop(rest);
-        let build = build.finish_counted(context, self.spill_bytes_written.as_mut())?;
-        let build = build.shuffle_keys(1, context, &self.build_keys, self.projected[0], self.hash, self.spill_bytes_written.as_mut())?;
+        let mut bytes_written = self.spill_stats.as_mut().map(|stats| &mut stats.bytes_written);
+        let build = build.finish_counted(context, bytes_written.as_deref_mut())?;
+        let build = build.shuffle_keys(1, context, &self.build_keys, self.projected[0], self.hash, bytes_written.as_deref_mut())?;
         let Some((input, projected)) = build_batch_input(probe.runtime, probe.execution, probe.pushdowns, probe.output).await? else {
             return Err(crate::join_spill::layout_error());
         };
@@ -783,8 +799,8 @@ impl Spec {
             batch.validate_readable(context)?;
             probe.append(batch, context)?;
         }
-        let probe = probe.finish_counted(context, self.spill_bytes_written.as_mut())?;
-        let probe = probe.shuffle_keys(build.count(), context, &self.probe_keys, self.projected[1], self.hash, self.spill_bytes_written.as_mut())?;
+        let probe = probe.finish_counted(context, bytes_written.as_deref_mut())?;
+        let probe = probe.shuffle_keys(build.count(), context, &self.probe_keys, self.projected[1], self.hash, bytes_written)?;
         Ok(DiskJoin { build, probe, table: None, build_partition: 0, probe_partition: 0, ready: None })
     }
 
@@ -1398,7 +1414,7 @@ impl BatchCursor for BatchJoin {
                     if let Some(output) = output { return Ok(Some(output)); }
                 }
                 State::Disk(mut join) => {
-                    let output = join.next(&self.spec).await?;
+                    let output = join.next(&mut self.spec).await?;
                     if output.is_some() { self.state = State::Disk(join); }
                     return Ok(output);
                 }
@@ -1408,8 +1424,9 @@ impl BatchCursor for BatchJoin {
     }
 
     fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) {
-        if let Some(bytes) = self.spec.spill_bytes_written {
-            crate::trace::OperatorCounter::SpillBytesWritten.record(span, bytes);
+        if let Some(stats) = &self.spec.spill_stats {
+            crate::trace::OperatorCounter::SpillBytesWritten.record(span, stats.bytes_written);
+            stats.replay.record(span);
         }
     }
 }

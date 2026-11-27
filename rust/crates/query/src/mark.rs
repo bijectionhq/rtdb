@@ -1,11 +1,12 @@
 use std::sync::Arc;
 use async_trait::async_trait;
-use rtdb_plan::{BinaryOp,Expr,Relation,RelationNode,Schema,TemporalFilter};
+use rtdb_plan::{BinaryOp, Expr, Relation, RelationNode, Schema, TemporalFilter, TraceSpan};
 use rtdb_types::{LogicalType,Result,Value};
 use crate::{context::Execution, invalid};
 use crate::columnar::{BatchCursor, BoxBatchCursor, Column, ColumnBatch, poll_nested_batch};
 use crate::set_keys::BatchKeyIndex;
 use crate::batch_join::ProbeInput;
+use crate::join_spill::ReplayStats;
 
 fn membership_key(input: &Schema,dependent: &Schema,comparison: &Expr) -> Option<(usize, usize)> {
     let Expr::Binary { op: BinaryOp::Eq,left,right } = comparison else { return None; };
@@ -46,6 +47,7 @@ pub(crate) struct BatchMembership {
     keys: (usize, usize),
     facts: CandidateFacts,
     spill: bool,
+    spill_replay: Option<ReplayStats>,
     execution: Execution,
 }
 
@@ -68,7 +70,8 @@ struct MembershipSpill {
 impl BatchMembership {
     pub fn new(build: ProbeInput, probe: ProbeInput, keys: (usize, usize),
         spill: bool, execution: Execution) -> Self {
-        Self { state: MembershipState::Build { build, probe }, keys, spill,
+        let spill_replay = crate::trace::operator_evidence_enabled(&execution.context).then(ReplayStats::default);
+        Self { state: MembershipState::Build { build, probe }, keys, spill, spill_replay,
             facts: CandidateFacts { empty: true, null: false }, execution }
     }
 
@@ -170,7 +173,7 @@ impl BatchMembership {
 }
 
 impl MembershipSpill {
-    fn next(&mut self, mark: &BatchMembership) -> Result<Option<ColumnBatch>> {
+    fn next(&mut self, mark: &mut BatchMembership) -> Result<Option<ColumnBatch>> {
         let context = &mark.execution.context;
         loop {
             context.check_cancelled()?;
@@ -186,9 +189,16 @@ impl MembershipSpill {
             }
             if self.index.is_none() {
                 let mut index = BatchKeyIndex::vector_hashing(context)?;
+                if let Some(stats) = &mut mark.spill_replay {
+                    stats.start_build_partition();
+                }
                 for frame in 0..self.build.frames(self.build_partition) {
                     context.check_cancelled()?;
-                    index.build(self.build.read(self.build_partition, frame)?, false, context)?;
+                    let batch = self.build.read(self.build_partition, frame)?;
+                    if let Some(stats) = &mut mark.spill_replay {
+                        stats.build_frame(batch.len);
+                    }
+                    index.build(batch, false, context)?;
                 }
                 self.index = Some(index);
             }
@@ -200,6 +210,9 @@ impl MembershipSpill {
             let mut ready = std::collections::VecDeque::with_capacity(count);
             for frame in 0..count {
                 let batch = self.probe.read(partition, frame)?;
+                if let Some(stats) = &mut mark.spill_replay {
+                    stats.probe_frame();
+                }
                 ready.push_back(mark.mark_batch(batch, index, false)?);
             }
             self.probe_partition += 1;
@@ -242,6 +255,12 @@ impl BatchCursor for BatchMembership {
                 }
                 MembershipState::Done => return Ok(None),
             }
+        }
+    }
+
+    fn trace_attributes(&self, span: &mut dyn TraceSpan) {
+        if let Some(stats) = &self.spill_replay {
+            stats.record(span);
         }
     }
 }

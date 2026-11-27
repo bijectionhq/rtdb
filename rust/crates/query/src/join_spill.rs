@@ -4,7 +4,7 @@ use arrow_array::{Array, RecordBatch, RecordBatchOptions};
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use rtdb_columnar::MemoryReservation;
 use rtdb_format::ipc::RecordSpans;
-use rtdb_plan::Schema;
+use rtdb_plan::{Schema, TraceSpan, TraceValue};
 use rtdb_types::{LogicalType, Result, ScalarType};
 
 use crate::{
@@ -18,6 +18,36 @@ use crate::{
 };
 
 const FRAME_ROWS: usize = 1024;
+
+#[derive(Default)]
+pub(crate) struct ReplayStats {
+    build_frames: u64,
+    probe_frames: u64,
+    build_partition_rows: u64,
+    peak_build_partition_rows: u64,
+}
+
+impl ReplayStats {
+    pub fn start_build_partition(&mut self) {
+        self.build_partition_rows = 0;
+    }
+
+    pub fn build_frame(&mut self, rows: usize) {
+        self.build_frames = self.build_frames.saturating_add(1);
+        self.build_partition_rows = self.build_partition_rows.saturating_add(rows as u64);
+        self.peak_build_partition_rows = self.peak_build_partition_rows.max(self.build_partition_rows);
+    }
+
+    pub fn probe_frame(&mut self) {
+        self.probe_frames = self.probe_frames.saturating_add(1);
+    }
+
+    pub fn record(&self, span: &mut dyn TraceSpan) {
+        span.attribute("cursor.join_spill.build_replay_frames", TraceValue::Unsigned(self.build_frames));
+        span.attribute("cursor.join_spill.probe_replay_frames", TraceValue::Unsigned(self.probe_frames));
+        span.attribute("cursor.join_spill.peak_build_partition_rows", TraceValue::Unsigned(self.peak_build_partition_rows));
+    }
+}
 
 pub(crate) fn compatible_schema(schema: &Schema) -> bool {
     fn compatible(ty: &LogicalType) -> bool {
