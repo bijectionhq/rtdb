@@ -100,6 +100,11 @@ pub struct Checkpoint {
     pub key_generation: u64,
     /// Installs an independently rewritten state into a fresh deployment.
     pub restore: bool,
+    /// The epoch of the last operator recovery the checkpointed state
+    /// includes, or 0. A follower that has not seen that recovery rebuilds
+    /// instead of resuming past a checkpoint that trimmed the recovery's
+    /// record. Older checkpoints decode as 0.
+    pub recovery_epoch: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

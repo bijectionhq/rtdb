@@ -89,6 +89,7 @@ impl MultiDatabase {
                 through: through.0,
                 key_generation: generation,
                 restore: true,
+                recovery_epoch: self.state().checkpoint_recovery_epoch(through),
             }),
         )
         .await?;

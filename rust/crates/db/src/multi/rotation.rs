@@ -129,6 +129,7 @@ impl MultiDatabase {
                 through: cut.0 - 1,
                 key_generation: generation.number,
                 restore: false,
+                recovery_epoch: self.state().checkpoint_recovery_epoch(Lsn(cut.0 - 1)),
             }),
         )
         .await?;

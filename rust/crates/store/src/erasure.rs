@@ -103,6 +103,7 @@ impl ErasurePlan {
             through: self.trim_through,
             key_generation: self.next.number,
             restore: false,
+            recovery_epoch: 0,
         };
         let checkpoint_record = self
             .seal_record(kms, self.cut, Record::Checkpoint(checkpoint.clone()))

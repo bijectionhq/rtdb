@@ -1290,10 +1290,13 @@ struct Recoverable {
     acknowledgements: AtomicUsize,
     /// Holds each acknowledgement until this many nodes are acknowledging.
     rendezvous: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    /// Refuses atomic recovery markers, as a journal without them does.
+    without_markers: AtomicBool,
 }
 
 const RECOVERY_IDENTITY: Identity = Identity::from_static("urn:rtdb:test:recovery");
 const RECOVERY_FENCE: Epoch = Epoch(5);
+const OPERATOR_IDENTITY: Identity = Identity::from_static("urn:rtdb:test:operator");
 
 impl Recoverable {
     fn handle(self: &Arc<Self>, identity: Identity) -> Arc<dyn Journal> {
@@ -1320,9 +1323,32 @@ impl Recoverable {
                 at = Lsn(lsn.0 + 1);
             }
         }
-        survivor.handle(Identity::from_static("urn:rtdb:test:operator")).seal(stream, RECOVERY_FENCE).await.unwrap();
+        survivor.handle(OPERATOR_IDENTITY).seal(stream, RECOVERY_FENCE).await.unwrap();
         *self.current.lock().unwrap() = survivor;
         *self.pending.lock().unwrap() = Some(head);
+    }
+
+    fn fence(&self) -> Option<journal_contract::RecoveryFence> {
+        self.pending.lock().unwrap().map(|head| journal_contract::RecoveryFence { epoch: RECOVERY_FENCE, head })
+    }
+
+    /// Appends `marker` right after the recovered head under the recovery
+    /// fence and lifts the fence in one step, as the consensus keeper does.
+    async fn acknowledge_with_marker(&self, stream: StreamId, fence: journal_contract::RecoveryFence, marker: Bytes) -> journal_contract::Result<Lsn> {
+        let rendezvous = self.rendezvous.lock().unwrap().clone();
+        if let Some(rendezvous) = rendezvous {
+            rendezvous.wait().await;
+        }
+        self.acknowledgements.fetch_add(1, Ordering::SeqCst);
+        let operator = self.journal(&OPERATOR_IDENTITY);
+        let taken = {
+            let mut pending = self.pending.lock().unwrap();
+            if fence.epoch == RECOVERY_FENCE && *pending == Some(fence.head) { pending.take() } else { None }
+        };
+        if taken.is_none() {
+            return Err(JournalError::Conflict { head: operator.head(stream).await? });
+        }
+        operator.append(stream, RECOVERY_FENCE, Lsn(fence.head.0 + 1), marker).await
     }
 
     async fn acknowledge(&self, stream: StreamId) -> journal_contract::Result<Lsn> {
@@ -1386,6 +1412,15 @@ impl Journal for RecoverableHandle {
     fn acknowledge_recovery(&self, stream: StreamId) -> BoxFuture<'_, journal_contract::Result<Lsn>> {
         Box::pin(self.shared.acknowledge(stream))
     }
+
+    fn recovery_fence(&self, _stream: StreamId) -> BoxFuture<'_, journal_contract::Result<Option<journal_contract::RecoveryFence>>> {
+        let fence = (!self.shared.without_markers.load(Ordering::SeqCst)).then(|| self.shared.fence());
+        Box::pin(async move { fence.ok_or(JournalError::Unsupported) })
+    }
+
+    fn acknowledge_recovery_with_marker(&self, stream: StreamId, fence: journal_contract::RecoveryFence, marker: Bytes) -> BoxFuture<'_, journal_contract::Result<Lsn>> {
+        Box::pin(self.shared.acknowledge_with_marker(stream, fence, marker))
+    }
 }
 
 /// The recovery records a node's retained journal holds.
@@ -1433,8 +1468,9 @@ async fn multi_driver_acknowledges_a_journal_recovery_records_it_and_resumes_wri
     assert_eq!(follower.tick(&live(2)).await.unwrap(), Role::Writer(Epoch(RECOVERY_FENCE.0 + 1)));
     assert_eq!(journal.acknowledgements.load(Ordering::SeqCst), 1);
     let recovery = follower.journal_recovery().unwrap();
-    assert_eq!((recovery.head, recovery.epoch, recovery.time), (kept, Epoch(RECOVERY_FENCE.0 + 1), Timestamp(10 + LEASE + DRIFT + 1)));
-    assert!(recovery.at > kept);
+    // The journal recorded the recovery with the acknowledgement, right
+    // after the recovered head and under the recovery's fence.
+    assert_eq!((recovery.at, recovery.head, recovery.epoch, recovery.time), (Lsn(kept.0 + 1), kept, RECOVERY_FENCE, Timestamp(10 + LEASE + DRIFT + 1)));
     assert_eq!(text_at(&mut follower, MAIN_BRANCH, 1).await, Some(Value::Utf8("kept".into())));
     assert_eq!(text_at(&mut follower, MAIN_BRANCH, 2).await, None);
     follower.transact(&put(4, 2, "after recovery")).await.unwrap();
@@ -1445,6 +1481,27 @@ async fn multi_driver_acknowledges_a_journal_recovery_records_it_and_resumes_wri
     assert_eq!(text_at(&mut reader, MAIN_BRANCH, 2).await, Some(Value::Utf8("after recovery".into())));
     assert_eq!(text_at(&mut reader, MAIN_BRANCH, 3).await, None);
     assert_eq!(reader.journal_recovery(), Some(recovery));
+}
+
+#[tokio::test]
+async fn multi_driver_resumes_without_a_record_on_a_journal_without_recovery_markers() {
+    let cluster = Cluster::new();
+    let journal = Arc::new(Recoverable::default());
+    journal.without_markers.store(true, Ordering::SeqCst);
+    let (writer, mut follower, kept) = recoverable_cluster(&cluster, &journal).await;
+    let stream = writer.journal_stream();
+    drop(writer);
+    journal.recover(stream, kept).await;
+
+    // The writer acknowledges and resumes; it never appends a recovery
+    // record of its own, so nothing records the recovery in the journal.
+    cluster.at(10 + LEASE + DRIFT + 1);
+    assert_eq!(follower.tick(&live(2)).await.unwrap(), Role::Writer(Epoch(RECOVERY_FENCE.0 + 1)));
+    assert_eq!(journal.acknowledgements.load(Ordering::SeqCst), 1);
+    assert_eq!(follower.journal_recovery(), None);
+    assert!(recovery_records(&follower).is_empty());
+    assert_eq!(text_at(&mut follower, MAIN_BRANCH, 1).await, Some(Value::Utf8("kept".into())));
+    assert_eq!(text_at(&mut follower, MAIN_BRANCH, 2).await, None);
 }
 
 #[tokio::test]
@@ -2903,6 +2960,7 @@ async fn immutable_trim_requires_the_exact_committed_checkpoint() {
         through: through.0,
         key_generation: generation,
         restore: false,
+        recovery_epoch: 0,
     })).await.unwrap();
     let announced = writer.state().head;
     let base = writer.state().checkpoint_at(announced).unwrap();

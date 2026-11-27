@@ -43,6 +43,7 @@ fn checkpoint(manifest: &VerifiedManifest, through: u64) -> Record {
         through,
         key_generation: manifest.generation.number,
         restore: false,
+        recovery_epoch: 0,
     })
 }
 

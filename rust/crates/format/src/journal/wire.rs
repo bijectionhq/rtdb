@@ -65,6 +65,8 @@ struct Checkpoint {
     key_generation: u64,
     #[prost(bool, tag = "4")]
     restore: bool,
+    #[prost(uint64, tag = "5")]
+    recovery_epoch: u64,
 }
 
 #[derive(Message)]
@@ -172,6 +174,7 @@ impl TryFrom<&super::Record> for Record {
                 through: checkpoint.through,
                 key_generation: checkpoint.key_generation,
                 restore: checkpoint.restore,
+                recovery_epoch: checkpoint.recovery_epoch,
             }),
             RankedCatalog(catalog) => Kind::RankedCatalog(self::RankedCatalog {
                 manifest: require_kind(catalog.manifest, ObjectKind::Manifest)?.to_string(),
@@ -234,6 +237,7 @@ impl TryFrom<Record> for super::Record {
                     through: checkpoint.through,
                     key_generation: checkpoint.key_generation,
                     restore: checkpoint.restore,
+                    recovery_epoch: checkpoint.recovery_epoch,
                 }),
                 Kind::RankedCatalog(catalog) => Self::RankedCatalog(super::RankedCatalog {
                     manifest: require_kind(catalog.manifest.parse()?, ObjectKind::Manifest)?,

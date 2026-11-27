@@ -177,6 +177,7 @@ impl MultiDatabase {
             through: prepared.through.0,
             key_generation: prepared.generation,
             restore: false,
+            recovery_epoch: self.state().checkpoint_recovery_epoch(prepared.through),
         };
         let state = self.state();
         if lease.epoch != prepared.lease.epoch

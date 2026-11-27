@@ -28,6 +28,7 @@ fn record_kinds_round_trip_with_fixed_tags() {
             through: 9,
             key_generation: 2,
             restore: true,
+            recovery_epoch: 7,
         }),
         Record::Lease { until: i64::MIN },
         Record::Pin(pin.clone()),
@@ -92,6 +93,7 @@ fn malformed_record_envelopes_are_refused() {
             through: 3,
             key_generation: 1,
             restore: false,
+            recovery_epoch: 0,
         })
         .encode()
         .is_err()

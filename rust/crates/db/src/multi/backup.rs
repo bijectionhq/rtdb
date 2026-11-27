@@ -351,6 +351,7 @@ impl MultiDatabase {
             through: through.0,
             key_generation: generation,
             restore: true,
+            recovery_epoch: self.state().checkpoint_recovery_epoch(through),
         })).await?;
         self.trim_committed_checkpoint(lease, self.state().head, through).await?;
         Ok(cut)

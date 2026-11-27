@@ -28,6 +28,16 @@ pub fn journal_recoveries_acknowledged() -> u64 {
 }
 
 mod backup;
+/// How a writer's acknowledgement of an operator recovery ended.
+enum Acknowledgement {
+    /// This node's marker lifted the fence; the journal head after it.
+    Recorded(Lsn),
+    /// Another node or an administrator lifted the fence first.
+    Elsewhere,
+    /// The journal has no recovery markers.
+    Unsupported,
+}
+
 mod classic_migration;
 mod deferred;
 mod pin;
@@ -142,8 +152,6 @@ pub struct MultiDatabase {
     hold_writes_after_recovery: bool,
     /// The next catch-up replays from the journal floor instead of resuming.
     replay_afresh: bool,
-    /// A recovery this node acknowledged and has not yet recorded.
-    unrecorded_recovery: Option<Lsn>,
 }
 
 impl MultiDatabase {
@@ -185,7 +193,6 @@ impl MultiDatabase {
             binary_checkpoints: false,
             hold_writes_after_recovery: false,
             replay_afresh: false,
-            unrecorded_recovery: None,
         })
     }
 
@@ -405,10 +412,6 @@ impl MultiDatabase {
                 self.withdraw_writer();
                 return Err(error);
             }
-            if let Err(error) = self.record_recovery(attempt).await {
-                self.withdraw_writer();
-                return Err(error);
-            }
         }
         Ok(())
         }).await
@@ -429,17 +432,16 @@ impl MultiDatabase {
                         epoch = attempt.epoch.0,
                         "An operator recovered the Multi journal after it lost two of its three voters. Commits acknowledged after the recovered head may be lost",
                     );
-                    let after = match self.acknowledge_recovery_with_record(head).await? {
-                        Some(after) => after,
-                        None => {
+                    // Only the node that lifted the fence seals above it
+                    // at once; a node that lost the race competes as usual.
+                    acknowledged = match self.acknowledge_recovery_with_record(head).await? {
+                        Acknowledgement::Recorded(after) => Some(after),
+                        Acknowledgement::Elsewhere => Some(Lsn(u64::MAX)),
+                        Acknowledgement::Unsupported => {
                             self.stream.acknowledge_recovery().await.map_err(journal_error)?;
-                            head
+                            Some(head)
                         }
                     };
-                    acknowledged = Some(after);
-                    // Recorded unless the journal already holds a record of
-                    // this recovery, such as the atomic marker.
-                    self.unrecorded_recovery = Some(head);
                     self.replay_afresh = true;
                 }
                 Err(JournalError::Fenced { current }) => {
@@ -464,21 +466,25 @@ impl MultiDatabase {
     }
 
     /// Acknowledges the operator recovery that left the journal at `head`
-    /// and records it in the same journal decision: the keeper appends this
-    /// node's `Recovered` record right after the recovered head, under the
-    /// recovery's epoch, and lifts exactly that fence. So whichever node
-    /// acknowledges also records, and a racing node's marker is refused
-    /// rather than written twice. Returns the journal head after the
-    /// acknowledgement, or `None` when the journal has no atomic markers and
-    /// the caller acknowledges and records in two steps.
-    async fn acknowledge_recovery_with_record(&mut self, head: Lsn) -> Result<Option<Lsn>> {
+    /// and records it in the same journal decision: the journal appends the
+    /// `Recovered` marker right after the recovered head, under the
+    /// recovery's epoch, and lifts exactly that fence. The marker is the
+    /// only record of a recovery; the writer never appends one of its own.
+    /// So whichever node acknowledges also records, and a racing node's
+    /// marker is refused rather than written twice. Returns the journal head
+    /// after the acknowledgement, `Elsewhere` when another node or an
+    /// administrator lifted the fence, or `Unsupported` when the journal has
+    /// no recovery markers: the caller then only acknowledges, and the error
+    /// event, the counters and the followers' rebuilds are what remain of
+    /// the recovery.
+    async fn acknowledge_recovery_with_record(&mut self, head: Lsn) -> Result<Acknowledgement> {
         let fence = match self.stream.recovery_fence().await {
             Ok(Some(fence)) => fence,
             Ok(None) => {
                 tracing::debug!(database = %self.options.database, head = head.0, "The journal recovery fence is already clear");
-                return Ok(Some(self.stream.head().await?));
+                return Ok(Acknowledgement::Elsewhere);
             }
-            Err(JournalError::Unsupported) => return Ok(None),
+            Err(JournalError::Unsupported) => return Ok(Acknowledgement::Unsupported),
             Err(error) => return Err(journal_error(error)),
         };
         if fence.head != head {
@@ -498,29 +504,20 @@ impl MultiDatabase {
         match self.stream.acknowledge_recovery_with_marker(fence, marker).await {
             Ok(at) => {
                 RECOVERIES_ACKNOWLEDGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Ok(Some(at))
+                Ok(Acknowledgement::Recorded(at))
             }
+            // Another node lifted this fence first, with its own marker or
+            // an administrator's acknowledgement; that stands.
             Err(JournalError::Conflict { head: current }) => {
                 tracing::debug!(database = %self.options.database, head = head.0, epoch = fence.epoch.0,
                     current_head = current.0, "The journal recovery fence changed before the marker was accepted");
-                Ok(Some(self.stream.head().await?))
+                Ok(Acknowledgement::Elsewhere)
             }
-            Err(JournalError::Unsupported) => Ok(None),
+            Err(JournalError::Unsupported) => Ok(Acknowledgement::Unsupported),
             Err(error) => Err(journal_error(error)),
         }
     }
 
-    /// Appends the recovery this node acknowledged, unless the journal
-    /// already records it.
-    async fn record_recovery(&mut self, lease: Lease) -> Result<()> {
-        let Some(head) = self.unrecorded_recovery else { return Ok(()) };
-        if self.state().recovery.is_none_or(|recovery| recovery.head != head) {
-            let time = (self.clock)().0;
-            self.append_control(lease, Record::Recovered { head: head.0, epoch: lease.epoch.0, time }).await?;
-        }
-        self.unrecorded_recovery = None;
-        Ok(())
-    }
 
     fn note_competing_seal(&mut self, epoch: Epoch) {
         if self.competing_seal.is_none_or(|lease| epoch > lease.epoch) {
@@ -932,6 +929,7 @@ impl MultiDatabase {
             through: through.0,
             key_generation: generation,
             restore: false,
+            recovery_epoch: self.state().checkpoint_recovery_epoch(through),
         };
         self.append_control(lease, Record::Checkpoint(checkpoint))
             .await?;

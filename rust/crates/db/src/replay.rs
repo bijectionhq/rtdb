@@ -255,6 +255,11 @@ pub(crate) struct Committed {
     pub(crate) store_purge_floor: u64,
     /// The latest retained recovery record.
     pub(crate) recovery: Option<JournalRecovery>,
+    /// The epoch of the latest recovery this state includes, from a
+    /// recovery record or an installed checkpoint, or 0.
+    pub(crate) recovery_epoch: u64,
+    /// `recovery_epoch` before the latest recovery record applied.
+    prior_recovery_epoch: u64,
     /// The digest of the journal bytes at `head`, when this state read them.
     tail: Option<[u8; 32]>,
 }
@@ -277,7 +282,18 @@ impl Committed {
             coordinates: JournalCoordinates::default(),
             store_purge_floor: 0,
             recovery: None,
+            recovery_epoch: 0,
+            prior_recovery_epoch: 0,
             tail: None,
+        }
+    }
+
+    /// The recovery epoch a checkpoint through `through` carries: the latest
+    /// recovery whose record is at or before `through`.
+    pub(crate) fn checkpoint_recovery_epoch(&self, through: Lsn) -> u64 {
+        match self.recovery {
+            Some(recovery) if recovery.at > through => self.prior_recovery_epoch,
+            _ => self.recovery_epoch,
         }
     }
 
@@ -397,6 +413,11 @@ impl Committed {
                 if (seeded || stream.immutable_history()) && matches!(entry.record, Record::Recovered { .. }) {
                     return Err(ReplayError::Rewritten { at: state.head });
                 }
+                // A checkpoint can trim a recovery's record; it still names
+                // the recovery, so a state that missed it rebuilds.
+                if seeded && matches!(&entry.record, Record::Checkpoint(checkpoint) if checkpoint.recovery_epoch > state.recovery_epoch) {
+                    return Err(ReplayError::Rewritten { at: state.head });
+                }
                 // A failed entry may have applied part of itself, so the state
                 // is no longer a prefix of the journal.
                 state
@@ -458,6 +479,9 @@ impl Committed {
                 }
                 self.install_checkpoint(stream, store, lsn, entry.epoch, checkpoint).await?;
                 self.generation = checkpoint.key_generation;
+                // The checkpoint stands for the recovery records it trimmed.
+                self.recovery_epoch = self.recovery_epoch.max(checkpoint.recovery_epoch);
+                self.prior_recovery_epoch = self.recovery_epoch;
                 if first {
                     self.base = Some(ReplayBase { announced: lsn, checkpoint: checkpoint.clone() });
                 }
@@ -674,6 +698,8 @@ impl Committed {
                     return Err(invalid("The recovery record does not follow the recovered head under its writer"));
                 }
                 self.recovery = Some(JournalRecovery { at: lsn, head: Lsn(*head), epoch: entry.epoch, time: Timestamp(*time) });
+                self.prior_recovery_epoch = self.recovery_epoch;
+                self.recovery_epoch = self.recovery_epoch.max(*epoch);
                 self.generation
             }
             Record::Pin(_) | Record::Unpin { .. } => self.generation,
