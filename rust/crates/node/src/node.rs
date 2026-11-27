@@ -266,6 +266,11 @@ enum DatabaseCompletion {
 }
 
 const MAXIMUM_PLACED_OPENS: usize = 8;
+/// How long an owned read stays valid, and so how long the witness it issues vouches for its catalog. A constant of the
+/// owned-read exchange, not a tuning knob: a holder that needs longer opens a new read. A witness must not outlive the
+/// garbage window that retains its catalog's files, nor the default-erasure grant that keeps a prior generation
+/// readable; both derive from that window, and the read clamps its lifetime to it.
+const OWNED_READ_LIFETIME: Duration = Duration::from_secs(60);
 
 impl Node {
     /// The provider observes current catalog generations and keeps no node or database alive between samples.
@@ -4330,10 +4335,12 @@ impl NativeSession {
         }
         let lease = context.catalog.read_lease();
         // Superseded files are retained for the garbage window alone, as in XTDB, so a witness is bounded by this read's
-        // own expiry and by a provider's lease where the store has one; an expired provider lease issues no witness.
+        // own lifetime, never past the window, and by a provider's lease where the store has one; an expired provider
+        // lease issues no witness.
         let clock = Arc::clone(&node.factory.clock);
         let now = clock.monotonic_micros();
-        let deadline = now.saturating_add(60_000_000);
+        let lifetime = OWNED_READ_LIFETIME.min(node.factory.options.garbage.garbage_lifetime);
+        let deadline = now.saturating_add(i64::try_from(lifetime.as_micros()).unwrap_or(i64::MAX));
         let lease_remaining = lease.as_ref().map(|lease| lease.local_cutoff().map_or(0, |cutoff| {
             i64::try_from(cutoff.saturating_duration_since(std::time::Instant::now()).as_micros()).unwrap_or(i64::MAX)
         }));

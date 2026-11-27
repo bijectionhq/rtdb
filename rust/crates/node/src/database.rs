@@ -17,8 +17,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::ordered_index::OrderedIndexMaintenance;
 
-/// How long Default erasure keeps the prior generation after it observes the retirement; RTDB-only, as Default erasure is.
-const DEFAULT_ERASURE_GRANT: Duration = Duration::from_secs(60 * 60 + 60);
 use crate::{Clock, DatabaseCatalog, ExternalSource, ExternalSourceFactory, ExternalSources, NodeOptions, REPLICA_BEHIND, ReplicaReadIndex, ResourceDriver, ResourceFactory, catalog::{CatalogCommand, CatalogEffects}};
 
 pub(crate) mod tokens;
@@ -664,7 +662,11 @@ impl DatabaseFactory {
                     write_features.push(rtdb_tx::transact::PHYSICAL_ERASURE);
                 }
                 if authority.checkpoints.is_some() && !read_only {
-                    let grant = DEFAULT_ERASURE_GRANT.as_micros() as i64;
+                    // Default erasure keeps the prior generation readable for the garbage window after it observes the
+                    // retirement: a reader that captured the prior catalog is protected for that window and no longer,
+                    // as XTDB keeps an erased row in superseded files until the window lets them go.
+                    let grant = i64::try_from(self.options.garbage.garbage_lifetime.as_micros())
+                        .map_err(|_| Anomaly::incorrect("rtdb.node/garbage-lifetime", "The garbage lifetime exceeds the timestamp range"))?;
                     let grant = if sealed_local_erasure {
                         grant.max(rtdb_storage::sealing::PLAINTEXT_DELIVERY_WINDOW.as_micros() as i64)
                     } else {
