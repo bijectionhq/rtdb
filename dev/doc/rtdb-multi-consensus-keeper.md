@@ -88,6 +88,12 @@ On installed Multi nodes, `RTDB_ACTIVATION_JOURNAL_URL` selects the independent 
 The authority's TLS files come from `RTDB_ACTIVATION_CERTIFICATE_PATH`, `RTDB_ACTIVATION_PRIVATE_KEY_PATH`, and `RTDB_ACTIVATION_CA_PATH`.
 All replicas of the authority protect its state against rewind and survive failure of the databases they activate.
 
+`rtdb multi-activation` supplies `bootstrap`, `status`, `freeze`, and `publish` operator actions.
+`freeze` and `publish` compare the expected incarnation and activation revision.
+`publish` independently opens the stopped destination, reads its committed portable restore, and binds the successor to that proof.
+A local rehearsal can use an exclusively opened authority file in the same process as its participating runtimes.
+Separate development processes can use a loopback immutable consensus authority through the installed activation environment variables.
+
 ## Batches, placement, funded appends and journal size
 
 - **Batches.** The consensus `JournalBatchAppender` sends a Multi group as

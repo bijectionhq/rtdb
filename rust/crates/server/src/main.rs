@@ -92,6 +92,17 @@ async fn run() -> Result<()> {
             serde_json::to_writer(&mut *output, &report).map_err(std::io::Error::other)?;
             writeln!(output)
         }),
+        #[cfg(feature = "multi")]
+        Command::ActivationHelp => {
+            print!("{}", rtdb_server::multi::activation::ACTIVATION_HELP);
+            Ok(())
+        }
+        #[cfg(feature = "multi")]
+        Command::Activation(options) => {
+            let result = options.run(apple_sync).await?;
+            println!("{result}");
+            Ok(())
+        }
         Command::InitializeStandalone(target) => rtdb_server::standalone::initialize_with_sync(target, apple_sync).await,
         Command::Standalone(launch) => run_standalone(launch, apple_sync).await,
         Command::HashPassword { bcrypt, password } => { println!("{}", cli::hash_password(bcrypt, password, &mut std::io::stdin().lock())?); Ok(()) }
@@ -171,8 +182,11 @@ async fn run() -> Result<()> {
                         Some(tls) => tls.stream_journal()?,
                         None => None,
                     };
-                    let multi = rtdb_server::multi::MultiRuntime::development_with_incarnation(
-                        &options.data, &mut config, memory.clone(), expected, stream_journal,
+                    let activation = rtdb_server::multi::activation::ActivationAuthority::for_development(
+                        stream_journal.as_ref(),
+                    ).await?;
+                    let multi = rtdb_server::multi::MultiRuntime::development_with_activation(
+                        &options.data, &mut config, memory.clone(), expected, stream_journal, activation,
                     ).await?;
                     return serve_multi(config, limit, memory, multi, qualification).await;
                 }

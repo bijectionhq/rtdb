@@ -13,6 +13,9 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+pub(crate) mod operator;
+pub use operator::{HELP as ACTIVATION_HELP, Options as ActivationOptions};
+
 const MAX_GRANT_MICROS: i64 = 5_000_000;
 const MAX_CLOCK_OFFSET_MICROS: i64 = 250_000;
 const ATTEMPTS: usize = 8;
@@ -28,6 +31,13 @@ pub struct ActivationAuthority {
 pub struct Binding {
     pub incarnation: Uuid,
     pub revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActivationStatus {
+    pub binding: Binding,
+    pub grants_closed: bool,
+    pub grants_end_micros: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -89,6 +99,31 @@ impl State {
 }
 
 impl ActivationAuthority {
+    async fn connect(
+        url: &str,
+        credentials: super::Credentials,
+        identity: Uuid,
+    ) -> Result<Arc<Self>> {
+        if !url.starts_with(super::CONSENSUS_SCHEME) {
+            return Err(configuration());
+        }
+        let backend = super::connect_stream_journal(url, &credentials).await?;
+        Self::new(backend.journal, identity)
+    }
+
+    pub async fn for_development(
+        data_journal: Option<&super::DevelopmentStreamJournal>,
+    ) -> Result<Option<Arc<Self>>> {
+        let Some((url, identity, credentials)) = environment()? else {
+            return Ok(None);
+        };
+        if data_journal.is_some_and(|data| data.url == url) {
+            return Err(configuration());
+        }
+        super::DevelopmentStreamJournal::new(&url, credentials.clone())?;
+        Ok(Some(Self::connect(&url, credentials, identity).await?))
+    }
+
     /// All participants in an authority must use its same independent ordered journal.
     pub fn new(journal: Arc<dyn Journal>, identity: Uuid) -> Result<Arc<Self>> {
         if identity.is_nil() {
@@ -138,12 +173,17 @@ impl ActivationAuthority {
     }
 
     pub async fn binding(&self, name: &str) -> Result<Binding> {
-        Ok(self
-            .read(self.stream_id(name)?)
-            .await?
-            .1
-            .ok_or_else(unavailable)?
-            .binding)
+        Ok(self.status(name).await?.binding)
+    }
+
+    pub async fn status(&self, name: &str) -> Result<ActivationStatus> {
+        let (_, state) = self.read(self.stream_id(name)?).await?;
+        let state = state.ok_or_else(unavailable)?;
+        Ok(ActivationStatus {
+            binding: state.binding,
+            grants_closed: state.grants_closed,
+            grants_end_micros: state.grants_end,
+        })
     }
 
     pub async fn close_grants(&self, name: &str, expected: Binding) -> Result<()> {
@@ -700,14 +740,23 @@ mod tests {
 
 #[cfg(feature = "s3")]
 pub(super) async fn installed(database_url: &str) -> Result<Option<Arc<ActivationAuthority>>> {
+    let Some((url, identity, credentials)) = environment()? else {
+        return Ok(None);
+    };
+    if url == database_url {
+        return Err(configuration());
+    }
+    Ok(Some(
+        ActivationAuthority::connect(&url, credentials, identity).await?,
+    ))
+}
+
+fn environment() -> Result<Option<(String, Uuid, super::Credentials)>> {
     let url = match std::env::var("RTDB_ACTIVATION_JOURNAL_URL") {
         Ok(value) => value,
         Err(std::env::VarError::NotPresent) => return Ok(None),
         Err(_) => return Err(configuration()),
     };
-    if url == database_url || !url.starts_with(super::CONSENSUS_SCHEME) {
-        return Err(configuration());
-    }
     let env = |name| std::env::var(name).map_err(|_| configuration());
     let identity =
         Uuid::parse_str(&env("RTDB_ACTIVATION_AUTHORITY_ID")?).map_err(|_| configuration())?;
@@ -716,11 +765,9 @@ pub(super) async fn installed(database_url: &str) -> Result<Option<Arc<Activatio
         private_key: env("RTDB_ACTIVATION_PRIVATE_KEY_PATH")?.into(),
         ca: env("RTDB_ACTIVATION_CA_PATH")?.into(),
     };
-    let backend = super::connect_stream_journal(&url, &credentials).await?;
-    Ok(Some(ActivationAuthority::new(backend.journal, identity)?))
+    Ok(Some((url, identity, credentials)))
 }
 
-#[cfg(feature = "s3")]
 fn configuration() -> Anomaly {
     Anomaly::incorrect(
         "rtdb/activation-configuration",
