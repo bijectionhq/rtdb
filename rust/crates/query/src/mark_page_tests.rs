@@ -312,11 +312,106 @@ async fn shared_mark_stops_after_true_within_loaded_candidate_rows() {
     assert_eq!(page_rows(cursor.next_batch().await.unwrap().unwrap()),[[Value::I64(1),Value::Bool(true)]]);
 }
 
+#[tokio::test]
+async fn shared_mark_reuses_the_first_spill_page_until_a_later_page_is_reached() {
+    use rtdb_plan::Tracer;
+    use Value::{Bool, I64, Null};
+
+    let comparison = Expr::binary(BinaryOp::Eq, column(0), Expr::binary(BinaryOp::Add, column(1), literal(0)));
+    let nullable = LogicalType::Scalar(ScalarType::I64).maybe();
+    let single = typed_table(1, &[I64(1), Null], nullable.clone());
+    let multiple = union(typed_table(1, &[I64(1)], nullable.clone()), typed_table(1, &[I64(2), Null], nullable));
+    for (dependent, two, expected_frames) in [(single, Null, 1), (multiple, Bool(true), 5)] {
+        let mut execution = execution_threshold(1, 0);
+        let baseline = execution.context.memory.used_bytes();
+        let (tracer, mut receiver) = rtdb_metrics::TraceRecorder::new(MemoryBudget::new(1 << 20), 16, true, false).unwrap();
+        let parent = tracer.start(None, "xtdb.query", &[]).unwrap();
+        execution.context = Arc::clone(&execution.context).with_tracer(Some(tracer.clone()), Some(parent.context()));
+        let relation = mark(table(0, &[1, 1, 2, 1, 3, 1]), dependent, comparison.clone(), false);
+        let mut cursor = open(relation, &execution).await;
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert_eq!(page_rows(page), [
+            vec![I64(1), Bool(true)], vec![I64(1), Bool(true)], vec![I64(2), two],
+            vec![I64(1), Bool(true)], vec![I64(3), Null], vec![I64(1), Bool(true)],
+        ]);
+        assert!(cursor.next_batch().await.unwrap().is_none());
+        drop((cursor, parent));
+        assert!(execution.context.spill_peak_bytes() > 0);
+        assert_eq!(execution.context.spill_bytes(), 0);
+        assert_eq!(execution.context.memory.used_bytes(), baseline);
+        tracer.close();
+
+        let mut frames = Vec::new();
+        while let Some(span) = receiver.next().await {
+            for (_, value) in span.attributes().filter(|(name, _)| *name == "cursor.mark_spill.candidate_replay_frames") {
+                assert_eq!(span.name, "query.cursor.mark-join");
+                frames.push(value.parse::<u64>().unwrap());
+            }
+        }
+        assert_eq!(frames, [expected_frames]);
+    }
+}
+
+#[tokio::test]
+async fn shared_mark_reports_the_first_reached_spill_comparison_error_after_page_reuse() {
+    let execution = execution_threshold(1, 0);
+    let baseline = execution.context.memory.used_bytes();
+    let dependent = union(table(1, &[1]), table(1, &[0]));
+    let comparison = Expr::Case {
+        branches: vec![(Expr::binary(BinaryOp::Eq, column(0), column(1)), Expr::Literal(Value::Bool(true)))],
+        otherwise: Box::new(Expr::binary(BinaryOp::Eq,
+            Expr::binary(BinaryOp::Divide, literal(1), column(1)), literal(2))),
+    };
+    let mut cursor = open(mark(table(0, &[1, 1, 3]), dependent, comparison, false), &execution).await;
+    assert_eq!(cursor.next_batch().await.err().unwrap().code, "xtdb.expression/division-by-zero");
+    drop(cursor);
+    assert!(execution.context.spill_peak_bytes() > 0);
+    assert_eq!(execution.context.spill_bytes(), 0);
+    assert_eq!(execution.context.memory.used_bytes(), baseline);
+}
+
 fn typed_table(id: u32,values: &[Value],data_type: LogicalType) -> Arc<Relation> {
     Arc::new(Relation::new(Schema::new(vec![field(id,data_type)]).unwrap(),RelationNode::Values { rows: values.iter().cloned().map(|value|vec![Expr::Literal(value)]).collect() }).unwrap())
 }
 fn page_rows(page: ColumnBatch) -> Vec<Vec<Value>> {
     (0..page.len).map(|row| page.columns.iter().map(|column| column.value(row).unwrap()).collect()).collect()
+}
+
+#[tokio::test]
+async fn spilled_timestamp_membership_preserves_the_typed_multiset() {
+    use rtdb_types::TimeUnit;
+    use Value::{Bool, Null};
+
+    let timestamp = |value, zone: &str| Value::Timestamp {
+        value, unit: TimeUnit::Microsecond, timezone: Some(zone.into()),
+    };
+    let probe_key = timestamp(-1_000_001, "America/New_York");
+    let miss = timestamp(1_000_001, "America/New_York");
+    let build_key = timestamp(-1_000_001, "UTC");
+    let input = typed_table(0, &[probe_key.clone(), miss.clone(), Null, probe_key.clone()], probe_key.logical_type().maybe());
+    let dependent = typed_table(1, &[build_key.clone(), Null], build_key.logical_type().maybe());
+    let comparison = Expr::binary(BinaryOp::Eq, input.schema().fields()[0].expression(), dependent.schema().fields()[0].expression());
+    let relation = mark(input, dependent, comparison, false);
+    let expected = [vec![probe_key.clone(), Bool(true)], vec![probe_key, Bool(true)], vec![miss, Null], vec![Null, Null]];
+    for threshold in [0, 10] {
+        let execution = execution_threshold(1, threshold);
+        let baseline = execution.context.memory.used_bytes();
+        let mut cursor = open(Arc::clone(&relation), &execution).await;
+        let mut rows = Vec::new();
+        while let Some(page) = cursor.next_batch().await.unwrap() {
+            assert!(page.columns.iter().all(|column| !matches!(column, crate::columnar::Column::Values(_))));
+            rows.extend(page_rows(page));
+        }
+        assert_eq!(rows.len(), expected.len());
+        for row in &expected {
+            let index = rows.iter().position(|actual| actual == row).unwrap_or_else(|| panic!("Missing row {row:?}"));
+            rows.swap_remove(index);
+        }
+        drop(cursor);
+        assert_eq!(execution.context.spill_peak_bytes() > 0, threshold == 0);
+        assert_eq!(execution.context.spill_bytes(), 0);
+        assert_eq!(execution.context.memory.used_bytes(), baseline);
+    }
 }
 
 #[tokio::test]

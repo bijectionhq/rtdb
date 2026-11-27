@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use async_trait::async_trait;
-use rtdb_plan::{BinaryOp, Expr, Relation, RelationNode, Schema, TemporalFilter, TraceSpan};
-use rtdb_types::{LogicalType,Result,Value};
+use rtdb_plan::{BinaryOp, Expr, Relation, RelationNode, Schema, TemporalFilter, TraceSpan, TraceValue};
+use rtdb_types::{LogicalType, Result, ScalarType, Value};
 use crate::{context::Execution, invalid};
 use crate::columnar::{BatchCursor, BoxBatchCursor, Column, ColumnBatch, poll_nested_batch};
 use crate::set_keys::BatchKeyIndex;
@@ -222,6 +222,15 @@ impl MembershipSpill {
 }
 
 fn membership_hash(batch: &ColumnBatch, row: usize, key: usize, context: &crate::QueryContext) -> Result<u32> {
+    if let Some(Some((array, field, Some(logical), row))) = batch.columns[key].arrow_cell(row)
+        && let LogicalType::Scalar(scalar @ ScalarType::Timestamp { .. }) =
+            crate::columnar::float_vector::nonnull(logical)
+        && field.metadata().is_empty()
+        && (rtdb_columnar::ArrowCell { array, field, row }).has_scalar_storage(scalar)
+        && let Ok(hash) = rtdb_columnar::hash_cell(field, array, row, 0)
+    {
+        return Ok(crate::join_storage::combine_cell_hash(0, hash));
+    }
     crate::set_keys::Key::for_columns(batch, row, false, &[key], context)?.vector_hash()
 }
 
@@ -335,6 +344,7 @@ pub(crate) struct SharedBatchMark {
     schema: Schema,
     comparison: Expr,
     execution: Execution,
+    candidate_replay_frames: Option<u64>,
 }
 
 enum SharedState {
@@ -345,12 +355,13 @@ enum SharedState {
 
 enum CandidatePages {
     Memory(Vec<ColumnBatch>, Arc<rtdb_columnar::MemoryReservation>),
-    Spill(Arc<crate::spill::SpillFile>, usize),
+    Spill { file: Arc<crate::spill::SpillFile>, width: usize, multiple_pages: bool },
 }
 
 impl SharedBatchMark {
     pub fn new(build: ProbeInput, probe: ProbeInput, schema: Schema, comparison: Expr, execution: Execution) -> Self {
-        Self { state: SharedState::Unopened { build, probe }, schema, comparison, execution }
+        let candidate_replay_frames = crate::trace::operator_evidence_enabled(&execution.context).then_some(0);
+        Self { state: SharedState::Unopened { build, probe }, schema, comparison, execution, candidate_replay_frames }
     }
 
     async fn candidates(&mut self, build: ProbeInput) -> Result<CandidatePages> {
@@ -359,11 +370,13 @@ impl SharedBatchMark {
         let (mut input, _) = BatchMembership::open(build).await?;
         let mut batches = Vec::new();
         let mut rows = 0i64;
+        let mut multiple_pages = false;
         let mut inventory = context.memory.reserve(256)?;
         let mut spill = None::<crate::spill::SpillWriter>;
         while let Some(batch) = poll_nested_batch(input.as_mut()).await? {
             batch.validate_readable(context)?;
             if batch.len == 0 { continue; }
+            multiple_pages |= rows > 0;
             rows = rows.checked_add(i64::try_from(batch.len).map_err(|_| mark_size())?).ok_or_else(mark_size)?;
             if spill.is_none() && rows > context.options.join_build_rows {
                 let mut writer = context.spill.create()?;
@@ -379,7 +392,7 @@ impl SharedBatchMark {
             }
         }
         match spill {
-            Some(writer) => Ok(CandidatePages::Spill(writer.finish()?, schema.len())),
+            Some(writer) => Ok(CandidatePages::Spill { file: writer.finish()?, width: schema.len(), multiple_pages }),
             None => Ok(CandidatePages::Memory(batches, inventory)),
         }
     }
@@ -406,9 +419,10 @@ impl SharedBatchMark {
         let invocation = self.execution.prepare_expression(&self.comparison, &self.schema, &metadata)?;
         let mut marks = arrow_array::builder::BooleanBuilder::with_capacity(batch.len);
         let mut spill = match candidates {
-            CandidatePages::Spill(file, width) => Some((file.reader(context)?, *width)),
+            CandidatePages::Spill { file, .. } => Some(file.reader(context)?),
             _ => None,
         };
+        let mut first_page = None;
         for row in 0..batch.len {
             context.check_cancelled_at(row)?;
             let probe = crate::columnar::BatchRow { batch: &batch, row, admit_dates: true };
@@ -418,22 +432,49 @@ impl SharedBatchMark {
                     compare_page(&probe, page, &invocation, &mut mark, true, vector_keys, &self.execution).await?;
                     if mark == Some(true) { break; }
                 },
-                CandidatePages::Spill(_, _) => {
-                    let (reader, width) = spill.as_mut().expect("The mark opened its candidate spill");
-                    reader.rewind()?;
-                    while let Some(page) = reader.read_columns(*width)? {
-                        compare_page(&probe, &page, &invocation, &mut mark, true, vector_keys, &self.execution).await?;
-                        if mark == Some(true) { break; }
+                CandidatePages::Spill { width, multiple_pages, .. } => {
+                    let reader = spill.as_mut().expect("The mark opened its candidate spill");
+                    let replay_frames = &mut self.candidate_replay_frames;
+                    if first_page.is_none() {
+                        reader.rewind()?;
+                        first_page = read_mark_candidate(reader, *width, replay_frames)?;
+                    }
+                    if let Some(page) = &first_page {
+                        compare_page(&probe, page, &invocation, &mut mark, true, vector_keys, &self.execution).await?;
+                        if mark != Some(true) {
+                            if *multiple_pages {
+                                drop(first_page.take());
+                                while let Some(page) = read_mark_candidate(reader, *width, replay_frames)? {
+                                    compare_page(&probe, &page, &invocation, &mut mark, true, vector_keys, &self.execution).await?;
+                                    if mark == Some(true) { break; }
+                                }
+                            } else if context.cancellation.is_cancelled() || context.owner_cancellation.is_cancelled() {
+                                return Err(crate::context::cancelled());
+                            }
+                        }
                     }
                 }
             }
             marks.append_option(mark);
         }
+        drop(first_page);
         let ty = LogicalType::Scalar(rtdb_types::ScalarType::Bool).maybe();
         let field = Arc::new(rtdb_columnar::to_field("mark", &ty)?);
         batch.append_column(Column::Arrow { array: Arc::new(marks.finish()), field, logical: Some(ty) }, reservation, memory)?;
         Ok(batch)
     }
+}
+
+fn read_mark_candidate(
+    reader: &mut crate::spill::SpillReader, width: usize, replay_frames: &mut Option<u64>,
+) -> Result<Option<ColumnBatch>> {
+    let page = reader.read_columns(width)?;
+    if let Some(frames) = replay_frames
+        && page.is_some()
+    {
+        *frames = frames.saturating_add(1);
+    }
+    Ok(page)
 }
 
 #[async_trait]
@@ -457,31 +498,62 @@ impl BatchCursor for SharedBatchMark {
             }
         }
     }
+
+    fn trace_attributes(&self, span: &mut dyn TraceSpan) {
+        if let Some(frames) = self.candidate_replay_frames {
+            span.attribute("cursor.mark_spill.candidate_replay_frames", TraceValue::Unsigned(frames));
+        }
+    }
 }
 
 #[cfg(test)]
 mod facts_tests {
-    use std::sync::Arc;
+    use std::{collections::BTreeMap, sync::Arc};
     use rtdb_columnar::MemoryBudget;
-    use rtdb_types::Value;
+    use rtdb_storage::{MemoryStore, cache::BufferPool};
+    use rtdb_types::{LogicalType, TimeUnit, Timestamp, Value};
+    use tokio_util::sync::CancellationToken;
 
     use super::{Column, ColumnBatch, membership_hash};
     use crate::join_storage::hash_values;
 
+    fn hash_context() -> Arc<crate::QueryContext> {
+        let database = crate::DatabaseSnapshot { partitions: vec![], storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)) };
+        let catalog = crate::CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
+        crate::QueryContext::new(catalog, MemoryBudget::new(64 * 1024), Timestamp(0), "UTC",
+            crate::QueryOptions::default(), &CancellationToken::new()).unwrap()
+    }
+
+    #[test]
+    fn membership_hash_reads_timestamp_vectors_without_scalar_scratch() {
+        let context = hash_context();
+        let source = MemoryBudget::new(1 << 20);
+        let _full = context.memory.reserve(context.memory.available_bytes()).unwrap();
+        for unit in [TimeUnit::Second, TimeUnit::Millisecond, TimeUnit::Microsecond, TimeUnit::Nanosecond] {
+            for zone in [None, Some("America/New_York")] {
+                let timestamp = |value| Value::Timestamp { value, unit, timezone: zone.map(str::to_owned) };
+                let logical = timestamp(0).logical_type().maybe();
+                let values = [timestamp(i64::MIN), timestamp(0), Value::Null, timestamp(i64::MAX)];
+                let field = Arc::new(rtdb_columnar::to_field("t", &logical).unwrap());
+                let array = rtdb_columnar::build_array(&logical, &values).unwrap();
+                let charge = source.reserve(array.get_array_memory_size() + 1024).unwrap();
+                let column = Column::Arrow { array, field, logical: Some(logical) };
+                let batch = ColumnBatch::settled(vec![column], values.len(), charge).unwrap();
+                for (row, value) in values.iter().enumerate() {
+                    assert_eq!(membership_hash(&batch, row, 0, &context).unwrap(), hash_values([value]).unwrap());
+                }
+            }
+        }
+    }
+
     #[test]
     fn membership_hash_reads_decorated_float_lists_under_the_cell_decode_budget() {
-        use std::collections::{BTreeMap, HashMap};
+        use std::collections::HashMap;
         use arrow_array::{Array, Float32Array, ListArray};
         use arrow_buffer::OffsetBuffer;
         use arrow_schema::{DataType, Field};
-        use rtdb_storage::{MemoryStore, cache::BufferPool};
-        use rtdb_types::Timestamp;
-        use tokio_util::sync::CancellationToken;
 
-        let database = crate::DatabaseSnapshot { partitions: vec![], storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)) };
-        let catalog = crate::CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
-        let context = crate::QueryContext::new(catalog, MemoryBudget::new(64 * 1024),
-            Timestamp(0), "UTC", crate::QueryOptions::default(), &CancellationToken::new()).unwrap();
+        let context = hash_context();
         let values = Float32Array::from((0..8192).map(|row| (row % 2 == 0).then_some(-(row as f32))).collect::<Vec<_>>());
         let items = Arc::new(Field::new("item", DataType::Float32, true).with_metadata(HashMap::from([("source".into(), "test".into())])));
         let array = Arc::new(ListArray::new(items, OffsetBuffer::new(vec![0, 8192].into()), Arc::new(values.clone()), None));

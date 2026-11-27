@@ -2478,6 +2478,7 @@ surface QueryAccess {
         -- A compatible scalar membership join indexes the build key vectors and appends nullable Boolean marks to the probe batches.
         -- Scalar membership uses the raw vector hash to select candidates before comparing them.
         -- A spilled scalar membership join retains the probe payloads and the build's global null facts through Arrow partition replay.
+        -- Membership shuffle can hash compatible timestamp cells directly from their Arrow vectors.
         -- An Arrow join can evaluate a residual predicate from borrowed cells on either side while gathering the result payloads from the input batches.
         -- A single residual testing whether a period contains a zoned microsecond timestamp can compare the stored endpoints and timestamp directly.
         -- This comparison includes the lower endpoint and excludes the upper endpoint, and null operands do not match.
@@ -2504,6 +2505,9 @@ surface QueryAccess {
         -- A replayed fragment shares the decoded buffers' existing admission, and a nested fragment column selects its complete decoded span.
         -- Fragment and mixed-layout spill replay always retain their decoded frames and fail the query when the memory budget refuses them.
         -- A shared mark can replay its candidate Arrow pages to evaluate arbitrary Boolean comparisons.
+        -- Within a probe page it can reuse the first spilled candidate page across rows, releasing its charge before reading a later candidate page.
+        -- Shared mark comparisons visit candidates in their original order for each probe row and stop for that row at its first true comparison.
+        -- Traced shared marks count successfully decoded candidate spill frames.
         -- Direct floating-point list comparisons in a shared mark preserve SQL unknown results across candidate pages.
         -- Materialized bindings retain their semantic page boundaries and physical fields in Arrow IPC.
         -- Outer joins track unmatched build positions through partition replay.
