@@ -105,10 +105,11 @@ fn cancelled_local_replay_keeps_its_charge_until_the_worker_releases_the_undeliv
     let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).max_blocking_threads(1).enable_all().build().unwrap();
     runtime.block_on(async {
         let directory = tempfile::tempdir().unwrap();
-        let (log, driver) = LocalLog::open(directory.path().join("LOG"), LocalLogOptions { maximum_message_bytes: 1024, queue_capacity: 4 }).unwrap();
+        let payload = Bytes::from(vec![b'p'; 64 * 1024 + 1]);
+        let (log, driver) = LocalLog::open(directory.path().join("LOG"), LocalLogOptions { maximum_message_bytes: payload.len(), queue_capacity: 4 }).unwrap();
         let cancellation = CancellationToken::new();
         let writer = tokio::spawn(driver.run(cancellation.clone()));
-        log.enqueue(Bytes::from_static(b"payload"), Timestamp(5)).await.unwrap().durable().await.unwrap();
+        log.enqueue(payload.clone(), Timestamp(5)).await.unwrap().durable().await.unwrap();
         let mut tail = log.tail(LogOffset(-1)).await.unwrap();
         let replay = tail.replay().unwrap();
         let head = replay.poll_head(Duration::ZERO).await.unwrap().unwrap();
@@ -137,7 +138,7 @@ fn cancelled_local_replay_keeps_its_charge_until_the_worker_releases_the_undeliv
 
         let charge = ReadReservation::new(head.allocation_bound, memory.reserve(head.allocation_bound).unwrap());
         let record = replay.read_head(head, charge).await.unwrap();
-        assert_eq!(record.payload.as_ref(), b"payload");
+        assert_eq!(record.payload, payload);
         drop(record);
         assert_eq!(replay.poll_head(Duration::ZERO).await.unwrap(), None);
         cancellation.cancel();

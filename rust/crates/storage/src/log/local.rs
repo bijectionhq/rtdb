@@ -90,6 +90,17 @@ pub(super) struct RecordHeader {
 }
 
 impl RecordHeader {
+    fn end(&self) -> u64 {
+        self.metadata.offset.0 as u64 + HEADER_BYTES + self.payload_size as u64 + TRAILER_BYTES
+    }
+
+    fn require_live(&self) -> Result<()> {
+        if self.retired {
+            return Err(Error::UnavailableLogRange { requested: self.metadata.offset.0, first_retained: self.end() as i64 });
+        }
+        Ok(())
+    }
+
     pub(super) fn replay_head(&self) -> ReplayHead {
         ReplayHead {
             metadata: self.metadata,
@@ -134,15 +145,22 @@ pub(super) fn read_record_header_at(file: &mut JournalFile, path: &Path, maximum
 fn parse_record_header(file: &mut JournalFile, path: &Path, maximum: usize, offset: u64, length: u64) -> Result<RecordHeader> {
     let mut header = [0; HEADER_BYTES as usize];
     file.read_exact(&mut header).map_err(|error| corrupt(path, offset, format!("incomplete record header: {error}")))?;
+    let header = decode_record_header(&header, path, maximum, offset)?;
+    if header.end() > length {
+        return Err(corrupt(path, offset, format!("incomplete record ends at {}, file length {length}", header.end())));
+    }
+    Ok(header)
+}
+
+fn decode_record_header(header: &[u8; HEADER_BYTES as usize], path: &Path, maximum: usize, offset: u64) -> Result<RecordHeader> {
     if !is_record_separator(header[0]) { return Err(corrupt(path, offset, "invalid local log record separator")); }
     let size = i32::from_be_bytes(header[1..5].try_into().expect("fixed header size"));
     let sealed = matches!(header[0], SEALED_SEPARATOR | RETIRED_SEALED_SEPARATOR);
     if size < 0 || size as usize > maximum || (sealed && (size as usize) < LOG_SEAL_OVERHEAD) {
         return Err(corrupt(path, offset, format!("invalid payload size {size}, maximum {maximum}")));
     }
-    let end = offset.checked_add(HEADER_BYTES + size as u64 + TRAILER_BYTES)
+    offset.checked_add(HEADER_BYTES + size as u64 + TRAILER_BYTES)
         .ok_or_else(|| corrupt(path, offset, "record end overflows"))?;
-    if end > length { return Err(corrupt(path, offset, format!("incomplete record ends at {end}, file length {length}"))); }
     let timestamp = Timestamp(i64::from_be_bytes(header[5..13].try_into().expect("fixed header size")));
     Ok(RecordHeader { metadata: LogMetadata { offset: LogOffset(offset as i64), timestamp },
         payload_size: size as usize, retired: matches!(header[0], RETIRED_SEPARATOR | RETIRED_SEALED_SEPARATOR), sealed })
@@ -151,6 +169,10 @@ fn parse_record_header(file: &mut JournalFile, path: &Path, maximum: usize, offs
 fn read_record_trailer(file: &mut JournalFile, path: &Path, offset: LogOffset) -> Result<()> {
     let mut trailer = [0; TRAILER_BYTES as usize];
     file.read_exact(&mut trailer).map_err(|error| Error::io(path, error))?;
+    validate_record_trailer(trailer, path, offset)
+}
+
+fn validate_record_trailer(trailer: [u8; TRAILER_BYTES as usize], path: &Path, offset: LogOffset) -> Result<()> {
     if i64::from_be_bytes(trailer) != offset.0 {
         return Err(corrupt(path, offset.0 as u64, "record trailer does not name its start offset"));
     }
@@ -163,12 +185,7 @@ pub(super) fn read_record(file: &mut JournalFile, path: &Path, maximum: usize, k
 }
 
 pub(super) fn read_record_body(file: &mut JournalFile, path: &Path, header: RecordHeader, keys: Option<&ClassicObjectKeys>) -> Result<LogRecord> {
-    if header.retired {
-        let requested = header.metadata.offset.0;
-        return Err(Error::UnavailableLogRange {
-            requested, first_retained: requested + HEADER_BYTES as i64 + header.payload_size as i64 + TRAILER_BYTES as i64,
-        });
-    }
+    header.require_live()?;
     let mut payload = vec![0; header.payload_size];
     file.read_exact(&mut payload).map_err(|error| Error::io(path, error))?;
     read_record_trailer(file, path, header.metadata.offset)?;
@@ -576,16 +593,18 @@ impl LocalLog {
         if after.0 < -1 || after > latest {
             return Err(Error::UnavailableLogRange { requested: after.0, first_retained: 0 });
         }
-        let next = if after.0 < 0 { 0 } else {
-            self.reads.read(path.clone(), after, move |path, &after| {
-                let mut file = open_at(path, lineage, 0)?;
-                file.seek(SeekFrom::Start(after.0 as u64)).map_err(|error| Error::io(path.as_path(), error))?;
-                inspect_record(&mut file, path, maximum)?;
-                file.stream_position().map_err(|error| Error::io(path.as_path(), error))
-            }).await?
+        let held = if after.0 < 0 { None } else {
+            Some(self.reads.read(path.clone(), after, move |path, &after| {
+                let mut held = HeldJournal::at(None, path, lineage, after.0 as u64)?;
+                let header = held.read_header(path, maximum)?;
+                inspect_record_body(&mut held.file, path, header)?;
+                held.position = header.end();
+                Ok(held)
+            }).await?)
         };
+        let next = held.as_ref().map_or(0, |held| held.position);
         if let Some(keys) = &self.keys { keys.require_local_offset(next as i64)?; }
-        Ok(LocalTail { path, lineage, progress, maximum, after, next, reads: Arc::clone(&self.reads), keys: self.keys.clone(), held: None,
+        Ok(LocalTail { path, lineage, progress, maximum, after, next, reads: Arc::clone(&self.reads), keys: self.keys.clone(), held,
             recent: Arc::clone(&self.recent) })
     }
 }
@@ -664,8 +683,7 @@ struct LocalTail {
     path: Arc<PathBuf>, lineage: Option<Uuid>, progress: Arc<Progress>, maximum: usize, after: LogOffset, next: u64,
     reads: Arc<IoRegion>,
     keys: Option<Arc<ClassicObjectKeys>>,
-    /// The journal the last read went through, kept open for the next one.
-    held: Option<JournalFile>,
+    held: Option<HeldJournal>,
     recent: Arc<RecentFrames>,
 }
 
@@ -678,27 +696,29 @@ impl LocalTail {
         let payload_limit = payload_limit.max(maximum);
         let lineage = self.lineage;
         let held = self.held.take();
-        let (records, next, held) = self.reads.read(self.path.clone(), (self.next, tip), move |path, &(next, tip)| {
-            let mut file = reopen_at(held, path, lineage, next)?;
+        let (records, held) = self.reads.read(self.path.clone(), (self.next, tip), move |path, &(next, tip)| {
+            let mut held = HeldJournal::at(held, path, lineage, next)?;
+            let length = held.file.records_len().map_err(|error| Error::io(path, error))?;
             let mut records = Vec::new();
             let mut payload_bytes = 0usize;
-            while file.stream_position().map_err(|error| Error::io(path.as_path(), error))? <= tip.0 as u64 {
+            while held.position <= tip.0 as u64 {
                 if records.len() == MAXIMUM_POLL_RECORDS
                     || payload_bytes.checked_add(maximum).is_none_or(|bytes| bytes > payload_limit)
                 {
                     break;
                 }
-                let record = read_record(&mut file, path, maximum, keys.as_deref())?;
+                let header = parse_record_header(&mut held.file, path, maximum, held.position, length)?;
+                let record = read_record_body(&mut held.file, path, header, keys.as_deref())?;
+                held.position = header.end();
                 payload_bytes += record.payload.len();
                 records.push(record);
             }
-            let next = file.stream_position().map_err(|error| Error::io(path.as_path(), error))?;
-            Ok::<_, Error>((records, next, file))
+            Ok((records, held))
         }).await?;
-        self.held = Some(held);
         let last = records.last().ok_or_else(|| corrupt(&self.path, self.next, "durable tip yielded no record"))?;
         self.after = last.metadata.offset;
-        self.next = next;
+        self.next = held.position;
+        self.held = Some(held);
         Ok(records)
     }
 }
@@ -712,11 +732,29 @@ impl LogTail for LocalTail {
     fn replay(&mut self) -> Option<&mut dyn LogReplayTail> { Some(self) }
 }
 
-/// The journal at `next`, reading through `held` while the path still names that file.
-fn reopen_at(held: Option<JournalFile>, path: &Path, lineage: Option<Uuid>, next: u64) -> Result<JournalFile> {
-    let Some(mut file) = held.filter(|file| file.is_at(path).unwrap_or(false)) else { return open_at(path, lineage, next); };
-    file.seek(SeekFrom::Start(next)).map_err(|error| Error::io(path, error))?;
-    Ok(file)
+struct HeldJournal {
+    file: JournalFile,
+    position: u64,
+}
+
+impl HeldJournal {
+    fn at(held: Option<Self>, path: &Path, lineage: Option<Uuid>, next: u64) -> Result<Self> {
+        let Some(mut held) = held.filter(|held| held.file.is_at(path).unwrap_or(false)) else {
+            return Ok(Self { file: open_at(path, lineage, next)?, position: next });
+        };
+        if held.position != next {
+            held.file.seek(SeekFrom::Start(next)).map_err(|error| Error::io(path, error))?;
+            held.position = next;
+        }
+        Ok(held)
+    }
+
+    fn read_header(&mut self, path: &Path, maximum: usize) -> Result<RecordHeader> {
+        let length = self.file.records_len().map_err(|error| Error::io(path, error))?;
+        let header = parse_record_header(&mut self.file, path, maximum, self.position, length)?;
+        self.position += HEADER_BYTES;
+        Ok(header)
+    }
 }
 
 fn open_at(path: &Path, lineage: Option<Uuid>, next: u64) -> Result<JournalFile> {
@@ -725,21 +763,31 @@ fn open_at(path: &Path, lineage: Option<Uuid>, next: u64) -> Result<JournalFile>
     Ok(file)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn read_prepared(held: Option<JournalFile>, path: &Path, lineage: Option<Uuid>, next: u64, maximum: usize, head: ReplayHead,
-    reservation: ReadReservation, keys: Option<&ClassicObjectKeys>,
-) -> Result<(LogRecord, u64, JournalFile)> {
-    let mut file = reopen_at(held, path, lineage, next)?;
-    let header = read_record_header(&mut file, path, maximum)?;
+fn check_replay_head(path: &Path, header: RecordHeader, head: ReplayHead, reservation: &ReadReservation) -> Result<()> {
     if header.replay_head() != head {
-        return Err(corrupt(path, next, "log replay head changed before delivery"));
+        return Err(corrupt(path, header.metadata.offset.0 as u64, "log replay head changed before delivery"));
     }
     if reservation.length() < head.allocation_bound {
         return Err(Error::Task("log read reservation is too small".into()));
     }
-    let record = read_record_body(&mut file, path, header, keys)?.retain(reservation)?;
-    let next = file.stream_position().map_err(|error| Error::io(path, error))?;
-    Ok((record, next, file))
+    Ok(())
+}
+
+fn read_recent_plain(file: &mut JournalFile, path: &Path, maximum: usize, expected: RecordHeader) -> Result<LogRecord> {
+    let offset = expected.metadata.offset.0 as u64;
+    let payload = HEADER_BYTES as usize..HEADER_BYTES as usize + expected.payload_size;
+    let mut bytes = vec![0; payload.end + TRAILER_BYTES as usize];
+    file.read_exact(&mut bytes).map_err(|error| match error.kind() {
+        ErrorKind::UnexpectedEof => corrupt(path, offset, "incomplete local log frame"),
+        _ => Error::io(path, error),
+    })?;
+    let header = decode_record_header(bytes[..payload.start].try_into().expect("fixed header size"), path, maximum, offset)?;
+    if header.sealed || header.replay_head() != expected.replay_head() {
+        return Err(corrupt(path, offset, "log replay head changed before delivery"));
+    }
+    header.require_live()?;
+    validate_record_trailer(bytes[payload.end..].try_into().expect("fixed trailer size"), path, header.metadata.offset)?;
+    Ok(LogRecord::new(header.metadata, Bytes::from(bytes).slice(payload)))
 }
 
 #[async_trait]
@@ -754,8 +802,8 @@ impl LogReplayTail for LocalTail {
         let lineage = self.lineage;
         let held = self.held.take();
         let (head, held) = self.reads.read(self.path.clone(), self.next, move |path, &next| {
-            let mut file = reopen_at(held, path, lineage, next)?;
-            Ok((read_record_header(&mut file, path, maximum)?.replay_head(), file))
+            let mut held = HeldJournal::at(held, path, lineage, next)?;
+            Ok((held.read_header(path, maximum)?.replay_head(), held))
         }).await?;
         self.held = Some(held);
         Ok(Some(head))
@@ -772,22 +820,30 @@ impl LogReplayTail for LocalTail {
         let maximum = self.maximum;
         let lineage = self.lineage;
         let held = self.held.take();
-        // A frame this process's writer has just written is read back from the page cache, which costs less than the
-        // hop to a blocking thread; opening a sealed frame reads its key slot, so that always takes the hop.
-        let cached = self.keys.is_none()
-            && self.recent.get(self.next).is_some_and(|frame| frame.payload_size <= INLINE_READ_BYTES);
-        let (record, next, held) = if cached {
-            let next = self.next;
-            self.reads.read_inline(|| read_prepared(held, &self.path, lineage, next, maximum, head, reservation, None))?
+        let recent_plain = self.recent.get(self.next)
+            .filter(|frame| self.keys.is_none() && !frame.sealed && frame.payload_size <= INLINE_READ_BYTES);
+        let (record, held) = if let Some(frame) = recent_plain {
+            self.reads.read_inline(|| {
+                check_replay_head(&self.path, frame, head, &reservation)?;
+                let mut held = HeldJournal::at(held, &self.path, lineage, self.next)?;
+                let record = read_recent_plain(&mut held.file, &self.path, maximum, frame)?.retain(reservation)?;
+                held.position = frame.end();
+                Ok((record, held))
+            })?
         } else {
             let keys = self.keys.clone();
             self.reads.read(self.path.clone(), self.next, move |path, &next| {
-                read_prepared(held, path, lineage, next, maximum, head, reservation, keys.as_deref())
+                let mut held = HeldJournal::at(held, path, lineage, next)?;
+                let header = held.read_header(path, maximum)?;
+                check_replay_head(path, header, head, &reservation)?;
+                let record = read_record_body(&mut held.file, path, header, keys.as_deref())?.retain(reservation)?;
+                held.position = header.end();
+                Ok((record, held))
             }).await?
         };
-        self.held = Some(held);
         self.after = record.metadata.offset;
-        self.next = next;
+        self.next = held.position;
+        self.held = Some(held);
         Ok(record)
     }
 }
@@ -1286,6 +1342,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recent_frame_delivery_checks_the_on_disk_header_and_retries_at_the_same_offset() -> Result<()> {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("LOG");
+        let (log, driver) = LocalLog::open(&path, replica_options())?;
+        let shutdown = CancellationToken::new();
+        let writer = tokio::spawn(driver.run(shutdown.clone()));
+        let payload = Bytes::from_static(b"recent frame");
+        let metadata = log.enqueue(payload.clone(), Timestamp(5)).await?.durable().await?;
+        let mut tail = log.tail(LogOffset(-1)).await?;
+        let replay = tail.replay().unwrap();
+        let head = replay.poll_head(Duration::ZERO).await?.unwrap();
+        let reservation = || ReadReservation::new(head.allocation_bound, ());
+
+        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(5)).unwrap();
+        file.write_all(&6_i64.to_be_bytes()).unwrap();
+        assert!(matches!(replay.read_head(head, reservation()).await, Err(Error::CorruptLog { offset: 0, .. })));
+        assert_eq!(replay.poll_head(Duration::ZERO).await?, Some(head));
+
+        file.seek(SeekFrom::Start(5)).unwrap();
+        file.write_all(&metadata.timestamp.0.to_be_bytes()).unwrap();
+        let record = replay.read_head(head, reservation()).await?;
+        assert_eq!((record.metadata, record.payload), (metadata, payload));
+        shutdown.cancel();
+        writer.await.unwrap()?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn local_tail_checks_room_for_a_maximum_size_message_before_reading_the_next_payload() {
         let directory = tempfile::tempdir().unwrap();
         let (log, driver) = LocalLog::open(directory.path().join("LOG"), LocalLogOptions {
@@ -1443,21 +1528,23 @@ mod held_journal_tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("LOG");
         fs::write(&path, b"first").unwrap();
-        let mut held = reopen_at(None, &path, None, 1).unwrap();
+        let mut held = HeldJournal::at(None, &path, None, 1).unwrap();
         let mut text = String::new();
-        held.read_to_string(&mut text).unwrap();
+        held.file.read_to_string(&mut text).unwrap();
+        held.position += text.len() as u64;
         assert_eq!(text, "irst");
 
         let replacement = directory.path().join("LOG.next");
         fs::write(&replacement, b"second").unwrap();
         fs::rename(&replacement, &path).unwrap();
-        let mut reopened = reopen_at(Some(held), &path, None, 0).unwrap();
+        let mut reopened = HeldJournal::at(Some(held), &path, None, 0).unwrap();
         text.clear();
-        reopened.read_to_string(&mut text).unwrap();
+        reopened.file.read_to_string(&mut text).unwrap();
+        reopened.position += text.len() as u64;
         assert_eq!(text, "second");
 
         fs::remove_file(&path).unwrap();
-        assert!(reopen_at(Some(reopened), &path, None, 0).is_err());
+        assert!(HeldJournal::at(Some(reopened), &path, None, 0).is_err());
     }
 
     #[tokio::test]
