@@ -46,8 +46,8 @@ mod owned_world;
 mod owned_changes;
 mod assertion;
 pub use assertion::{ASSERTION_FAMILY_FENCES, AssertionFamilyFenceMarker,
-    AssertionId, AssertionWireError, AudienceCut, AudienceFrontier, ExactEraseSelector, PlacedId,
-    PlacementBinding, Position, RootFamilyDerivativeId, RootLandingBinding, RootLandingTarget, ShadowBound, ShadowV1,
+    AssertionId, AssertionWireError, PlacedId,
+    PlacementBinding, Position, RootFamilyDerivativeId, RootLandingBinding, RootLandingTarget,
 };
 pub use owned_changes::{OwnedChange, OwnedChangeGroup, OwnedChangeKind, OwnedEntityRegion, OwnedRangeEvidence, OWNED_CHANGE_GROUP_BYTES, OWNED_CHANGE_PAGE_BYTES, OWNED_CHANGE_PAGE_GROUPS, change_feed_uncovered, expired_lifetime_interval};
 pub use owned_world::{OwnedWorld, OwnedWorldAncestor, OwnedWorldAssertion, OwnedWorldForkLink, WorldClockLimit, WorldClockMode, WorldSchemas, WorldShadow};
