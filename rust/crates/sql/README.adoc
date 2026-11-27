@@ -112,6 +112,7 @@ INSERT, UPDATE, and DELETE accept RETURNING select lists and ignore them, as in 
 This includes INSERT RECORDS; ERASE and PATCH reject RETURNING.
 The parser validates select-list syntax without binding its names, functions, subqueries, or typed expressions.
 It checks cast types, literal forms and expression modifiers inside the list and its subqueries.
+Subqueries also use the ordinary query grammar checks for join constraints, aliases, set operations and row-limiting clauses.
 Its passive borrowed `ReturningClause` descriptor retains the original token spans while the mutation prefix supplies parameter requirements and inline-XTQL descriptors.
 RETURNING-only parameters do not increase the prepared parameter count, and mutation-prefix question marks keep their original indices.
 The retained source SQL and statement span still include the clause.

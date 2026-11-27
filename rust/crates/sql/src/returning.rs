@@ -3,7 +3,7 @@ use std::{collections::BTreeSet, ops::ControlFlow};
 use rtdb_types::{Anomaly, AnomalyKind, Result};
 use sqlparser::{ast, parser::Parser, tokenizer::{Location, Span, Token, TokenWithSpan}};
 use sqlparser::ast::Visit;
-use crate::{bind::{grammar_join, grammar_rejected, grammar_table_alias, grammar_table_name}, dialect::{CustomStringLiteral, SqlDialect}, parse::{TemporalExtent, sql_error, word}};
+use crate::{bind::{grammar_join, grammar_query, grammar_records, grammar_rejected, grammar_select, grammar_table_alias, grammar_table_name}, dialect::{CustomStringLiteral, SqlDialect}, parse::{TemporalExtent, sql_error, word}};
 
 pub(crate) struct ReturningClause<'a> { keyword: Span, items: &'a [TokenWithSpan] }
 
@@ -134,14 +134,23 @@ fn validate_joins(table: &ast::TableWithJoins) -> ControlFlow<Anomaly> {
     ControlFlow::Continue(())
 }
 
-fn validate_query_joins(body: &ast::SetExpr) -> ControlFlow<Anomaly> {
+fn validate_query_body(body: &ast::SetExpr) -> ControlFlow<Anomaly> {
     match body {
         ast::SetExpr::FromPipeline(pipeline) => for table in &pipeline.from { validate_joins(table)?; },
-        ast::SetExpr::SetOperation { left, right, .. } => {
-            validate_query_joins(left)?;
-            validate_query_joins(right)?;
+        ast::SetExpr::SetOperation { left, op, set_quantifier, right } => {
+            if !matches!(op, ast::SetOperator::Union | ast::SetOperator::Intersect | ast::SetOperator::Except)
+                || !matches!(set_quantifier, ast::SetQuantifier::None | ast::SetQuantifier::All | ast::SetQuantifier::Distinct)
+            {
+                return ControlFlow::Break(grammar_rejected("A dialect-specific set operation"));
+            }
+            validate_query_body(left)?;
+            validate_query_body(right)?;
         }
-        _ => (),
+        ast::SetExpr::Query(query) if query.with.is_none() => (),
+        ast::SetExpr::Values(values) if !values.value_keyword => (),
+        ast::SetExpr::Select(_) => (),
+        ast::SetExpr::Records(records) => if let Err(error) = grammar_records(records) { return ControlFlow::Break(error); },
+        _ => return ControlFlow::Break(grammar_rejected("A dialect-specific query body")),
     }
     ControlFlow::Continue(())
 }
@@ -150,10 +159,12 @@ impl ast::Visitor for ReturningSyntax {
     type Break = Anomaly;
 
     fn pre_visit_query(&mut self, query: &ast::Query) -> ControlFlow<Anomaly> {
-        validate_query_joins(&query.body)
+        if let Err(error) = grammar_query(query) { return ControlFlow::Break(error); }
+        validate_query_body(&query.body)
     }
 
     fn pre_visit_select(&mut self, select: &ast::Select) -> ControlFlow<Anomaly> {
+        if let Err(error) = grammar_select(select) { return ControlFlow::Break(error); }
         for table in &select.from { validate_joins(table)?; }
         ControlFlow::Continue(())
     }

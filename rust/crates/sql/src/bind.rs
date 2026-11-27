@@ -442,12 +442,8 @@ impl Context<'_> {
     }
 
     fn bind_records(&mut self, records: &[ast::Expr]) -> Result<Vec<Expr>> {
-        records.iter().map(|expr| {
-            let allowed = matches!(expr, ast::Expr::Dictionary(_))
-                || matches!(expr, ast::Expr::Value(value) if matches!(value.value, ast::Value::Placeholder(_)));
-            if !allowed { return Err(grammar_rejected("A non-record expression in RECORDS")); }
-            self.expr(expr, &Schema::default(), &BTreeMap::new())
-        }).collect()
+        grammar_records(records)?;
+        records.iter().map(|expr| self.expr(expr, &Schema::default(), &BTreeMap::new())).collect()
     }
 
     fn records_query(&mut self, records: &[ast::Expr]) -> Result<Arc<Relation>> {
@@ -608,7 +604,7 @@ impl Context<'_> {
     }
 
     pub(crate) fn query(&mut self, query: &ast::Query) -> Result<Arc<Relation>> {
-        if !query.locks.is_empty() || query.for_clause.is_some() || !query.pipe_operators.is_empty() || query.settings.is_some() || query.format_clause.is_some() { return Err(grammar_rejected("Query locking, an output clause, a pipe, FORMAT or SETTINGS")); }
+        grammar_query(query)?;
         let old_ctes = self.ctes.clone();
         let mut bindings = Vec::new();
         if let Some(with) = &query.with {
@@ -650,19 +646,12 @@ impl Context<'_> {
         }
         let mut offset = None;
         let mut fetch = None;
-        if let Some(limit) = &query.limit_clause {
-            match limit {
-                ast::LimitClause::LimitOffset { limit, offset: value, limit_by } => {
-                    if !limit_by.is_empty() { return Err(grammar_rejected("LIMIT BY")); }
-                    fetch = limit.as_ref().map(|expr| self.row_count(expr)).transpose()?;
-                    offset = value.as_ref().map(|offset| self.row_count(&offset.value)).transpose()?;
-                }
-                ast::LimitClause::OffsetCommaLimit { .. } => return Err(grammar_rejected("Comma LIMIT syntax")),
-            }
+        if let Some(ast::LimitClause::LimitOffset { limit, offset: value, .. }) = &query.limit_clause {
+            fetch = limit.as_ref().map(|expr| self.row_count(expr)).transpose()?;
+            offset = value.as_ref().map(|offset| self.row_count(&offset.value)).transpose()?;
         }
         if let Some(value) = &query.fetch {
             if fetch.is_some() { return Err(error("LIMIT and FETCH cannot both specify the row count")); }
-            if value.percent || value.with_ties { return Err(grammar_rejected("FETCH PERCENT or WITH TIES")); }
             fetch = Some(value.quantity.as_ref().map(|expr| self.row_count(expr)).transpose()?.unwrap_or(Expr::Literal(Value::I64(1))));
         }
         if offset.is_some() || fetch.is_some() { input = Arc::new(input.limit(offset, fetch)?); }
@@ -732,16 +721,12 @@ impl Context<'_> {
     }
 
     fn select(&mut self, select: &ast::Select, order_by: Option<&ast::OrderBy>) -> Result<Arc<Relation>> {
-        if select.top.is_some() || select.into.is_some() || select.qualify.is_some() || !select.lateral_views.is_empty() || select.prewhere.is_some() || !select.cluster_by.is_empty() || !select.distribute_by.is_empty() || !select.sort_by.is_empty() || !select.connect_by.is_empty() { return Err(grammar_rejected("A dialect-specific SELECT clause")); }
+        grammar_select(select)?;
         let mut input = self.table_input(&select.from)?;
         if let Some(predicate) = &select.selection {
             input = self.bind_filter(input, predicate)?;
         }
-        let distinct = match &select.distinct {
-            None | Some(ast::Distinct::All) => false,
-            Some(ast::Distinct::Distinct) => true,
-            Some(ast::Distinct::On(_)) => return Err(grammar_rejected("DISTINCT ON")),
-        };
+        let distinct = matches!(select.distinct, Some(ast::Distinct::Distinct));
         self.select_projection(input, SelectProjection {
             items: &select.projection,
             group_by: Some(&select.group_by),
@@ -1675,6 +1660,42 @@ pub(crate) fn grammar_table_alias(alias: &ast::TableAlias) -> Result<()> {
         if column.data_type.is_some() { return Err(grammar_rejected("Typed table alias columns")); }
         grammar_identifier(&column.name, "table alias column")?;
     }
+    Ok(())
+}
+
+pub(crate) fn grammar_records(records: &[ast::Expr]) -> Result<()> {
+    for record in records {
+        let allowed = matches!(record, ast::Expr::Dictionary(_))
+            || matches!(record, ast::Expr::Value(value) if matches!(value.value, ast::Value::Placeholder(_)));
+        if !allowed { return Err(grammar_rejected("A non-record expression in RECORDS")); }
+    }
+    Ok(())
+}
+
+pub(crate) fn grammar_query(query: &ast::Query) -> Result<()> {
+    if !query.locks.is_empty() || query.for_clause.is_some() || !query.pipe_operators.is_empty()
+        || query.settings.is_some() || query.format_clause.is_some()
+    {
+        return Err(grammar_rejected("Query locking, an output clause, a pipe, FORMAT or SETTINGS"));
+    }
+    if query.fetch.as_ref().is_some_and(|fetch| fetch.percent || fetch.with_ties) {
+        return Err(grammar_rejected("FETCH PERCENT or WITH TIES"));
+    }
+    match &query.limit_clause {
+        Some(ast::LimitClause::LimitOffset { limit_by, .. }) if !limit_by.is_empty() => Err(grammar_rejected("LIMIT BY")),
+        Some(ast::LimitClause::OffsetCommaLimit { .. }) => Err(grammar_rejected("Comma LIMIT syntax")),
+        _ => Ok(()),
+    }
+}
+
+pub(crate) fn grammar_select(select: &ast::Select) -> Result<()> {
+    if select.top.is_some() || select.into.is_some() || select.qualify.is_some() || !select.lateral_views.is_empty()
+        || select.prewhere.is_some() || !select.cluster_by.is_empty() || !select.distribute_by.is_empty()
+        || !select.sort_by.is_empty() || !select.connect_by.is_empty()
+    {
+        return Err(grammar_rejected("A dialect-specific SELECT clause"));
+    }
+    if matches!(&select.distinct, Some(ast::Distinct::On(_))) { return Err(grammar_rejected("DISTINCT ON")); }
     Ok(())
 }
 
