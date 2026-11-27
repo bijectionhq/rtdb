@@ -233,6 +233,20 @@ enum Kind {
     Case { conditions: Vec<Expr>, values: Vec<Node> },
 }
 
+impl Kind {
+    /// The arguments of a strict node, which is null wherever one of them is, in the order the row evaluator prepares
+    /// them; `None` for a leaf, a predicate or a CASE.
+    fn arguments(&self) -> Option<Vec<&Node>> {
+        Some(match self {
+            Self::Column(_) | Self::Literal(_) | Self::Parameter(_) | Self::Truth(_) | Self::Case { .. } => return None,
+            Self::Extract { source: argument, .. } | Self::Round { value: argument, .. } | Self::Abs(argument) | Self::TextCase { text: argument, .. }
+                | Self::Length(argument) | Self::Double(_, argument) | Self::Negate(argument) | Self::Cast(argument) => vec![argument.as_ref()],
+            Self::Substring { text, position, length } => [Some(text), Some(position), length.as_ref()].into_iter().flatten().map(|argument| argument.as_ref()).collect(),
+            Self::Arithmetic { left, right, .. } => vec![left.as_ref(), right.as_ref()],
+        })
+    }
+}
+
 impl Projection {
     /// `None` for an expression no batch can compute here; a bare column, literal or parameter is copied elsewhere.
     pub(crate) fn bind(expr: &Expr, schema: &Schema) -> Option<Self> {
@@ -278,6 +292,15 @@ pub(crate) fn bound_column(expr: &Expr, schema: &Schema, columns: &[Column], arg
     let Some(projection) = Projection::bind(expr, schema) else { return Ok(None) };
     let evaluation = Evaluation { schema, columns, len: 1, batch: None, parameters: Parameters::Columns(arguments), memory };
     let Some(Column::Arrow { array, field, logical }) = projection.evaluated(&evaluation)? else { return Ok(None) };
+    // A null result keeps the expression's declared type, as the query's result schema gives it.
+    let (array, field, logical) = match (&logical, plain_scalar(&expr.data_type())) {
+        (Some(LogicalType::Null), Some(_)) if expr.data_type().nullable() => {
+            let declared = expr.data_type();
+            let field = rtdb_columnar::to_field("value", &declared)?;
+            (new_null_array(field.data_type(), array.len()), Arc::new(field), Some(declared))
+        }
+        _ => (array, field, logical),
+    };
     let charge = memory.reserve(array.get_array_memory_size())?;
     let array = rtdb_columnar::retain_array(array, &charge)?;
     Ok(Some(Column::Arrow { array, field, logical }))
@@ -379,6 +402,10 @@ struct Evaluation<'a> {
     memory: &'a Arc<MemoryBudget>,
 }
 
+/// A strict node's arguments once prepared: null at every row, or computed with the rows none is null at, `None` for
+/// every row.
+enum Prepared { Null, Live { rows: Option<Vec<bool>>, arguments: Vec<Charged> } }
+
 /// Integers of the type `result`, held as 64-bit integers, as a vector of that type.
 fn narrowed(values: Int64Array, result: &ScalarType) -> Vector {
     match result {
@@ -402,6 +429,21 @@ impl Evaluation<'_> {
     fn vector_at(&self, node: &Node, selection: Selection<'_>) -> Result<Option<Charged>> {
         let len = self.len;
         let null = || -> Result<Option<Charged>> { Ok(Some(Charged::shared(Vector::Null))) };
+        // A strict node's arguments are prepared, in order, before any payload is read.
+        let live;
+        let (selection, arguments) = match node.kind.arguments() {
+            None => (selection, Vec::new()),
+            Some(arguments) => match self.prepared(&arguments, selection)? {
+                None => return Ok(None),
+                Some(Prepared::Null) => return null(),
+                Some(Prepared::Live { rows, arguments }) => {
+                    live = rows;
+                    (live.as_deref(), arguments)
+                }
+            },
+        };
+        let mut arguments = arguments.into_iter();
+        let mut argument = move || arguments.next().expect("a strict node's arguments are prepared");
         let charged = match &node.kind {
             Kind::Column(position) => read(&self.columns[*position], &node.declared, len, self.memory)?,
             Kind::Literal(value) => self.built(constant(value, len))?,
@@ -415,16 +457,16 @@ impl Evaluation<'_> {
                     None => None,
                 },
             },
-            Kind::Extract { field, source } => {
-                let Some(source) = self.vector(source, selection)? else { return Ok(None) };
+            Kind::Extract { field, .. } => {
+                let source = argument();
                 match &source.vector {
                     Vector::Null => return null(),
                     Vector::Micros(values, zone) => self.built(kernels::extract_timestamps(field, values, zone.as_deref(), selection)?.map(Vector::I32))?,
                     _ => None,
                 }
             }
-            Kind::Round { value, scale } => {
-                let Some(value) = self.vector(value, selection)? else { return Ok(None) };
+            Kind::Round { scale, .. } => {
+                let value = argument();
                 // Rounding an integer to no places is the integer itself.
                 if scale.is_none() && matches!(value.vector, Vector::I32(_) | Vector::I64(_)) {
                     Some(value)
@@ -436,8 +478,8 @@ impl Evaluation<'_> {
                     }
                 }
             }
-            Kind::Abs(argument) => {
-                let Some(argument) = self.vector(argument, selection)? else { return Ok(None) };
+            Kind::Abs(_) => {
+                let argument = argument();
                 match &argument.vector {
                     Vector::Null => return null(),
                     Vector::F64(values) => self.built(Some(Vector::F64(kernels::doubles(f64::abs, values))))?,
@@ -445,33 +487,25 @@ impl Evaluation<'_> {
                     _ => None,
                 }
             }
-            Kind::TextCase { text, upper } => {
-                let Some(text) = self.vector(text, selection)? else { return Ok(None) };
+            Kind::TextCase { upper, .. } => {
+                let text = argument();
                 match &text.vector {
                     Vector::Null => return null(),
                     Vector::Text(values) => self.built(kernels::text_case(values, *upper, selection)?.map(Vector::Text))?,
                     _ => None,
                 }
             }
-            Kind::Length(text) => {
-                let Some(text) = self.vector(text, selection)? else { return Ok(None) };
+            Kind::Length(_) => {
+                let text = argument();
                 match &text.vector {
                     Vector::Null => return null(),
                     Vector::Text(values) => self.built(Some(Vector::I32(kernels::text_lengths(values))))?,
                     _ => None,
                 }
             }
-            Kind::Substring { text, position, length } => {
-                let Some(text) = self.vector(text, selection)? else { return Ok(None) };
-                let Some(position) = self.vector(position, selection)? else { return Ok(None) };
-                let length = match length {
-                    Some(length) => match self.vector(length, selection)? { Some(length) => Some(length), None => return Ok(None) },
-                    None => None,
-                };
-                // The scalar call answers null for a null argument before reading the others.
-                if [Some(&text), Some(&position), length.as_ref()].into_iter().flatten().any(|argument| matches!(argument.vector, Vector::Null)) {
-                    return null();
-                }
+            Kind::Substring { length, .. } => {
+                let (text, position) = (argument(), argument());
+                let length = length.as_ref().map(|_| argument());
                 let Vector::Text(values) = &text.vector else { return Ok(None) };
                 let Some(positions) = self.integers(&position.vector)? else { return Ok(None) };
                 let lengths = match &length {
@@ -480,17 +514,13 @@ impl Evaluation<'_> {
                 };
                 self.built(kernels::text_substrings(values, &positions.0, lengths.as_ref().map(|lengths| &lengths.0), selection)?.map(Vector::Text))?
             }
-            Kind::Double(function, argument) => {
-                let Some(argument) = self.vector(argument, selection)? else { return Ok(None) };
-                if matches!(argument.vector, Vector::Null) { return null(); }
+            Kind::Double(function, _) => {
+                let argument = argument();
                 let Some(values) = self.doubles(&argument.vector)? else { return Ok(None) };
                 self.built(Some(Vector::F64(kernels::doubles(*function, &values.0))))?
             }
-            Kind::Arithmetic { op, left, right } => {
-                // Both operands are evaluated, as the row evaluator evaluates both before reading either.
-                let Some(left) = self.vector(left, selection)? else { return Ok(None) };
-                let Some(right) = self.vector(right, selection)? else { return Ok(None) };
-                if matches!(left.vector, Vector::Null) || matches!(right.vector, Vector::Null) { return null(); }
+            Kind::Arithmetic { op, .. } => {
+                let (left, right) = (argument(), argument());
                 let floating = matches!(left.vector, Vector::F64(_)) || matches!(right.vector, Vector::F64(_));
                 let wide = matches!(left.vector, Vector::I64(_)) || matches!(right.vector, Vector::I64(_));
                 match plain_scalar(&node.declared) {
@@ -507,8 +537,8 @@ impl Evaluation<'_> {
                     _ => None,
                 }
             }
-            Kind::Negate(operand) => {
-                let Some(operand) = self.vector(operand, selection)? else { return Ok(None) };
+            Kind::Negate(_) => {
+                let operand = argument();
                 match &operand.vector {
                     Vector::Null => return null(),
                     Vector::F64(values) => self.built(Some(Vector::F64(kernels::doubles(|value: f64| -value, values))))?,
@@ -520,8 +550,8 @@ impl Evaluation<'_> {
                     _ => None,
                 }
             }
-            Kind::Cast(operand) => {
-                let Some(operand) = self.vector(operand, selection)? else { return Ok(None) };
+            Kind::Cast(_) => {
+                let operand = argument();
                 let Some(target) = plain_scalar(&node.declared) else { return Ok(None) };
                 let identity = !matches!(operand.vector, Vector::Micros(..)) && operand.vector.scalar().as_ref() == Some(target);
                 if identity {
@@ -538,9 +568,13 @@ impl Evaluation<'_> {
                 }
             }
             Kind::Truth(predicate) => {
-                let (Some(batch), Parameters::Values(parameters)) = (self.batch, self.parameters) else { return Ok(None) };
                 // The predicate kernel raises nothing, so its truths can be computed for every row.
-                let Some(truth) = super::kernel::truth(predicate, self.schema, batch, parameters) else { return Ok(None) };
+                let truth = match (self.batch, self.parameters) {
+                    (Some(batch), Parameters::Values(parameters)) => super::kernel::truth(predicate, self.schema, batch, parameters),
+                    (None, Parameters::Columns(arguments)) => self.bound_truth(predicate, arguments)?,
+                    _ => None,
+                };
+                let Some(truth) = truth else { return Ok(None) };
                 self.built(Some(Vector::Bool(BooleanArray::from(truth))))?
             }
             Kind::Case { conditions, values } => self.case(conditions, values, selection)?,
@@ -552,6 +586,97 @@ impl Evaluation<'_> {
             Some(scalar) => plain_scalar(&node.declared) == Some(&scalar),
         };
         Ok(typed.then_some(charged))
+    }
+
+    /// A strict node's `arguments` prepared over `selection` as the row evaluator's continuations prepare them, one
+    /// after another, each over the rows no earlier one is null at. An argument typed null is null at every row, after
+    /// its own arguments are prepared; one of a type with several legs, a nullable one among them, is demanded as it
+    /// is prepared, and is null where its value is; one of a single other type is typed so at every row, and its
+    /// payload is computed once all are prepared, over only the rows none is null at, where it would be demanded.
+    /// Where an argument is null at every row, the single-typed ones before it are left unread but for what preparing
+    /// them demands.
+    fn prepared(&self, arguments: &[&Node], selection: Selection<'_>) -> Result<Option<Prepared>> {
+        let len = self.len;
+        let mut rows: Option<Vec<bool>> = selection.map(<[bool]>::to_vec);
+        let mut computed: Vec<Option<Charged>> = Vec::with_capacity(arguments.len());
+        let null = |computed: &[Option<Charged>]| -> Option<Prepared> {
+            let deferred = arguments.iter().zip(computed).filter(|(_, value)| value.is_none());
+            deferred.into_iter().all(|(argument, _)| self.settles(argument)).then_some(Prepared::Null)
+        };
+        for argument in arguments {
+            if argument.declared == LogicalType::Null {
+                if null(&computed).is_none() || self.vector(argument, rows.as_deref())?.is_none() { return Ok(None); }
+                return Ok(Some(Prepared::Null));
+            }
+            if argument.declared.legs().len() < 2 { computed.push(None); continue; }
+            let Some(value) = self.vector(argument, rows.as_deref())? else { return Ok(None) };
+            let Some(array) = value.vector.array() else { return Ok(null(&computed)) };
+            if array.null_count() != 0 {
+                let live: Vec<bool> = (0..len).map(|row| array.is_valid(row) && rows.as_ref().is_none_or(|rows| rows[row])).collect();
+                if !live.contains(&true) { return Ok(null(&computed)); }
+                rows = Some(live);
+            }
+            computed.push(Some(value));
+        }
+        let mut prepared = Vec::with_capacity(arguments.len());
+        for (argument, value) in arguments.iter().zip(computed) {
+            let value = match value {
+                Some(value) => value,
+                None => match self.vector(argument, rows.as_deref())? { Some(value) => value, None => return Ok(None) },
+            };
+            prepared.push(value);
+        }
+        Ok(Some(Prepared::Live { rows, arguments: prepared }))
+    }
+
+    /// Whether preparing `node`, of a single type other than null, demands only what the predicate kernel computes
+    /// without raising: the conditions of each CASE and the operands of each predicate in it.
+    fn settles(&self, node: &Node) -> bool {
+        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || match &node.kind {
+            Kind::Column(_) | Kind::Literal(_) | Kind::Parameter(_) => true,
+            Kind::Truth(predicate) => match (self.batch, self.parameters) {
+                (Some(batch), Parameters::Values(parameters)) => super::kernel::truth(predicate, self.schema, batch, parameters).is_some(),
+                _ => false,
+            },
+            Kind::Case { conditions, values } => matches!(self.branches(conditions), Ok(Some(_))) && values.iter().all(|value| self.settles(value)),
+            kind => kind.arguments().is_some_and(|arguments| arguments.into_iter().all(|argument| self.settles(argument))),
+        })
+    }
+
+    /// For each row, the branch it takes and the row: the first branch whose condition holds, else the otherwise
+    /// value at `conditions.len()`; `Ok(None)` where the predicate kernel leaves a condition to the row evaluator.
+    fn branches(&self, conditions: &[Expr]) -> Result<Option<Vec<(usize, usize)>>> {
+        let (Some(batch), Parameters::Values(parameters)) = (self.batch, self.parameters) else { return Ok(None) };
+        let len = self.len;
+        let truth_bytes = conditions.len().checked_mul(len).and_then(|cells| cells.checked_mul(size_of::<Option<bool>>())).ok_or_else(super::size_error)?;
+        let _truths = self.memory.reserve(truth_bytes)?;
+        let mut truths = Vec::with_capacity(conditions.len());
+        for condition in conditions {
+            let Some(truth) = super::kernel::truth(condition, self.schema, batch, parameters) else { return Ok(None) };
+            truths.push(truth);
+        }
+        Ok(Some((0..len).map(|row| (truths.iter().position(|truth| truth[row] == Some(true)).unwrap_or(conditions.len()), row)).collect()))
+    }
+
+    /// The predicate kernel's truths of `predicate` over one row bound with the query: the parameters it reads are
+    /// that row's values, charged while they are read.
+    fn bound_truth(&self, predicate: &Expr, arguments: &[Column]) -> Result<Option<Vec<Option<bool>>>> {
+        let mut read = vec![false; arguments.len()];
+        let mut missing = false;
+        predicate.visit(&mut |expr| if let Expr::Parameter { index, .. } = expr {
+            match read.get_mut(*index) { Some(read) => *read = true, None => missing = true }
+        });
+        if missing { return Ok(None); }
+        let mut values = Vec::with_capacity(arguments.len());
+        let mut bytes = arguments.len().checked_mul(size_of::<Value>()).ok_or_else(super::size_error)?;
+        for (argument, read) in arguments.iter().zip(read) {
+            let value = if read { argument.value(0)? } else { Value::Null };
+            bytes = bytes.checked_add(value.retained_bytes()?).ok_or_else(super::size_error)?;
+            values.push(value);
+        }
+        let _values = self.memory.reserve(bytes)?;
+        let batch = ColumnBatch::settled(self.columns.iter().map(Column::duplicate).collect(), self.len, self.memory.reserve(0)?)?;
+        Ok(super::kernel::truth(predicate, self.schema, &batch, rtdb_expr::Parameters::Values(&values)))
     }
 
     /// Integers widened as the scalar functions widen their integer arguments, with the charge for any copy.
@@ -582,20 +707,9 @@ impl Evaluation<'_> {
     /// Each row takes the value of the first branch whose condition holds, as the evaluator's searched CASE does,
     /// and each branch is computed over only the rows that take it.
     fn case(&self, conditions: &[Expr], values: &[Node], selection: Selection<'_>) -> Result<Option<Charged>> {
-        let (Some(batch), Parameters::Values(parameters)) = (self.batch, self.parameters) else { return Ok(None) };
         let len = self.len;
-        let truth_bytes = conditions.len().checked_mul(len).and_then(|cells| cells.checked_mul(size_of::<Option<bool>>())).ok_or_else(super::size_error)?;
-        let _truths = self.memory.reserve(truth_bytes)?;
-        let mut truths = Vec::with_capacity(conditions.len());
-        for condition in conditions {
-            let Some(truth) = super::kernel::truth(condition, self.schema, batch, parameters) else { return Ok(None) };
-            truths.push(truth);
-        }
         let _cells = self.memory.reserve(cell_bytes(len)?.checked_add(len).ok_or_else(super::size_error)?)?;
-        let cells: Vec<(usize, usize)> = (0..len)
-            .map(|row| (truths.iter().position(|truth| truth[row] == Some(true)).unwrap_or(conditions.len()), row))
-            .collect();
-        drop(truths);
+        let Some(cells) = self.branches(conditions)? else { return Ok(None) };
         let mut computed = Vec::with_capacity(values.len());
         for (branch, value) in values.iter().enumerate() {
             let taken: Vec<bool> = cells.iter().map(|(chosen, row)| *chosen == branch && selection.is_none_or(|rows| rows[*row])).collect();

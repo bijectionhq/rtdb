@@ -242,7 +242,7 @@ async fn prepared_vector_projection_reads_arrow_operands_for_division_comparison
 }
 
 #[tokio::test]
-async fn prepared_vector_projection_admits_the_masked_utf8_span_before_evaluation() {
+async fn prepared_vector_projection_never_reads_a_masked_utf8_span() {
     use arrow_array::{RecordBatch, StringArray};
     use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Schema};
@@ -263,11 +263,12 @@ async fn prepared_vector_projection_admits_the_masked_utf8_span_before_evaluatio
     let types = [LogicalType::Scalar(ScalarType::Utf8).maybe()];
     let query = PreparedSql::prepare("SELECT CHAR_LENGTH(UPPER($1)) AS size", &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
 
-    let mut small = query.try_open_parameter_projection(Arc::clone(&context), &bound(1), &types).await.unwrap().unwrap();
-    let page = small.next_batch().await.unwrap().unwrap();
-    assert_eq!(page.batch().column(0).null_count(), 1);
-    drop((small, page));
-    assert!(query.try_open_parameter_projection(Arc::clone(&context), &bound(1 << 19), &types).await.unwrap().is_none());
+    // A null cell's bytes are never computed over, so even a span near the budget projects to the null result.
+    for masked_bytes in [1, 1 << 19] {
+        let mut cursor = query.try_open_parameter_projection(Arc::clone(&context), &bound(masked_bytes), &types).await.unwrap().unwrap();
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert_eq!(page.batch().column(0).null_count(), 1, "{masked_bytes}");
+    }
     let mut cursor = query.open_query_columns_typed(context, vec![Value::Null], &types).await.unwrap();
     let output = cursor.next_batch().await.unwrap().unwrap();
     assert_eq!(read_value(output.batch().schema_ref().field(0), output.batch().column(0).as_ref(), 0).unwrap(), Value::Null);

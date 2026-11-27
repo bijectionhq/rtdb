@@ -608,7 +608,8 @@ fn project_bound_columns(
                 column => Ok(Some(column)),
             };
         }
-        crate::columnar::functions::bound_column(expr, schema, input, &parameters.columns, memory)
+        // A cell that fails declines the projection, so the ordinary path raises its error where it reaches it.
+        Result::Ok(crate::columnar::functions::bound_column(expr, schema, input, &parameters.columns, memory).unwrap_or(None))
     };
     let mut layers = Vec::new();
     let mut relation = relation;
