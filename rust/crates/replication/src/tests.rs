@@ -3608,9 +3608,11 @@ async fn native_coordinated_startup_refuses_a_checkpoint_missing_primary_data() 
     local.delete(&primary_data).await.unwrap();
     let missing = ready().await.err().unwrap();
     assert_eq!(missing.code, "rtdb.storage/missing-object");
+    assert!(missing.is(rtdb_types::AnomalyKind::MissingObject));
     local.put(&primary_data, Bytes::from_static(b"x")).await.unwrap();
     let damaged = ready().await.err().unwrap();
     assert_eq!(damaged.code, "rtdb.replication/checkpoint-primary-extent");
+    assert!(damaged.is(rtdb_types::AnomalyKind::CorruptObject), "a primary of the wrong length is a corrupt object, so repair classifies it by kind");
     drop(hold);
 }
 

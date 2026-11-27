@@ -415,7 +415,7 @@ impl BlockStore {
                         self.require_recovery_floor(index, Some(&catalog)).await?;
                         return Ok(Some((catalog, tables)));
                     }
-                    Err(error) if refresh && error.code == "rtdb.storage/missing-object" => {
+                    Err(error) if refresh && error.is(rtdb_types::AnomalyKind::MissingObject) => {
                         let listed = self.latest_block(BlockDiscovery::List).await?.map(|index| index.0);
                         let Some(next) = crate::checkpoint_discovery::newer_checkpoint(index.0, listed) else {
                             return Err(error);
@@ -617,7 +617,7 @@ impl BlockStore {
         tables: &BTreeMap<rtdb_types::TableRef, TableBlock>, held: bool,
     ) -> Result<()> {
         let invalid_extent = |key| Anomaly::fault("rtdb.replication/checkpoint-primary-extent",
-            format!("The checkpoint primary file has the wrong length: {key}"));
+            format!("The checkpoint primary file has the wrong length: {key}")).with_kind(rtdb_types::AnomalyKind::CorruptObject);
         for entry in root.table_entries()? {
             if held && entry.table.stores_expiring_transaction_metadata() { continue; }
             let table = tables.get(&entry.table).ok_or_else(|| invalid("The checkpoint has no table block"))?;

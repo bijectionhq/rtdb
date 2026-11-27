@@ -22,7 +22,7 @@ use rtdb_storage::{
     object_store::ReadReservation,
     sealing::ClassicKeyVault,
 };
-use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, CatalogCut, ReplicaPosition, Result, SourcePosition, StorageEpoch, TableRef, Timestamp, TransactionKey};
+use rtdb_types::{Anomaly, AnomalyCategory, AnomalyKind, BlockIndex, CatalogCut, ReplicaPosition, Result, SourcePosition, StorageEpoch, TableRef, Timestamp, TransactionKey};
 use rtdb_types::residence_trace::{self, RepairInventory, RepairInventoryTarget};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -273,10 +273,10 @@ impl PrimaryReset {
             let hold = HeldView::catalog(store.as_ref(), Arc::new(root.clone()), cut).await?;
             IoRegion::reading(Arc::clone(&hold), cancellation.run_until_cancelled(blocks.verify_primary_inventory(&root, &tables)))
                 .await.ok_or_else(crate::progress::cancelled)?
-                .map_err(|error| match error.code.as_str() {
-                    "rtdb.storage/missing-object" | "rtdb.replication/checkpoint-primary-extent" =>
-                        reset_inventory(error.message.unwrap_or_default()),
-                    _ => error,
+                .map_err(|error| if error.is(AnomalyKind::MissingObject) || error.is(AnomalyKind::CorruptObject) {
+                    reset_inventory(error.message.unwrap_or_default())
+                } else {
+                    error
                 })?;
             let table_catalog = TableCatalog::load(Some(root), &tables)?;
             let primary = tables.into_iter().map(|(table, block)| (table, block.for_primary_repair())).collect();
