@@ -9,7 +9,8 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result, TimedJournalCutoff, Timestamp
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-const ENVELOPE_VERSION: u8 = 1;
+use crate::{ActivationScope, commissioning};
+
 const PAGE_SIZE: usize = 128;
 const KEEPER_BATCH_RECORDS: usize = 256;
 const KEEPER_BATCH_BYTES: usize = 4 * 1024 * 1024;
@@ -85,6 +86,7 @@ pub(crate) struct Stream {
     pub(crate) database: Uuid,
     journal: Arc<dyn Journal>,
     pub(crate) serving_authority: Option<Arc<dyn crate::ServingAuthority>>,
+    pub(crate) activation_scope: Option<ActivationScope>,
     pub(crate) batch: Option<Arc<dyn JournalBatchAppender>>,
     pub(crate) kms: Arc<dyn Kms>,
     pub(crate) manifests: Arc<crate::replay::ManifestCache>,
@@ -96,6 +98,13 @@ struct WriterSession {
     id: WriterSessionId,
     fence: RwLock<Option<WriterFence>>,
     verified_history: tokio::sync::OnceCell<()>,
+}
+
+/// A trim bound to this stream residence and an exact checkpoint announcement.
+pub(crate) struct CertifiedCheckpoint {
+    stream_id: StreamId,
+    writer_session_id: Option<WriterSessionId>,
+    through: Lsn,
 }
 
 /// One journal long poll shared by every waiter of a stream: the first waiter
@@ -135,6 +144,7 @@ impl Stream {
             database,
             journal,
             serving_authority: None,
+            activation_scope: None,
             batch: None,
             kms,
             manifests: Arc::default(),
@@ -190,6 +200,69 @@ impl Stream {
     pub(crate) async fn head(&self) -> Result<Lsn> {
         self.verify_history().await.map_err(journal_error)?;
         self.journal.head(self.id()).await.map_err(journal_error)
+    }
+
+    pub(crate) async fn check_commissioning(&self, head: Lsn) -> Result<()> {
+        let mut head = head;
+        for _ in 0..4 {
+            let page = match self.page(head, head, 1, Duration::ZERO).await {
+                Ok(page) => page,
+                Err(JournalError::Trimmed { .. }) => {
+                    head = self.head().await?;
+                    continue;
+                }
+                Err(error) => return Err(journal_error(error)),
+            };
+            let Some((at, bytes)) = page.records.first().filter(|(at, _)| *at == head) else {
+                return Err(journal_error(JournalError::Unavailable));
+            };
+            self.decode_unproven(*at, bytes).await?;
+            return Ok(());
+        }
+        Err(journal_error(JournalError::Unavailable))
+    }
+
+    /// Commit the scope before a new incarnation can acquire an application writer.
+    pub(crate) async fn commission(&self) -> Result<()> {
+        if self.activation_scope.is_none() {
+            return Ok(());
+        }
+        let session = self.session.as_ref().ok_or_else(commissioning::scope_mismatch)?;
+        let mut expected_writer_epoch = Epoch(0);
+        for _ in 0..8 {
+            let head = self.head().await?;
+            if head != Lsn(0) {
+                return self.check_commissioning(head).await;
+            }
+            let seal = match self.journal.seal_session(self.id(), expected_writer_epoch, session.id).await {
+                Ok(seal) => seal,
+                Err(JournalError::Fenced { current }) => {
+                    expected_writer_epoch = current;
+                    continue;
+                }
+                Err(error) => return Err(journal_error(error)),
+            };
+            if seal.sealed_head_lsn != Lsn(0) {
+                return self.check_commissioning(seal.sealed_head_lsn).await;
+            }
+            let first_lsn = Lsn(1);
+            let entry = Entry {
+                epoch: seal.fence.writer_epoch,
+                generation: 1,
+                record: Record::Commissioned,
+            };
+            let bytes = self.encode(first_lsn, &entry).await?;
+            match self.journal.append_session_batch(seal.fence, first_lsn, vec![bytes]).await {
+                Ok(at) if at == first_lsn => return Ok(()),
+                Ok(_) => return Err(journal_error(JournalError::Unavailable)),
+                Err(JournalError::Fenced { current }) => expected_writer_epoch = current,
+                Err(JournalError::Conflict { head }) if head != Lsn(0) => {
+                    return self.check_commissioning(head).await;
+                }
+                Err(error) => return Err(journal_error(error)),
+            }
+        }
+        Err(journal_error(JournalError::Unavailable))
     }
 
     pub(crate) async fn require_serving(&self) -> Result<()> {
@@ -302,20 +375,66 @@ impl Stream {
         }
     }
 
-    pub(crate) async fn trim(&self, epoch: Epoch, through: Lsn) -> journal_contract::Result<()> {
+    pub(crate) async fn certify_checkpoint(
+        &self,
+        base: &crate::replay::ReplayBase,
+        minimum_head: Lsn,
+    ) -> Result<CertifiedCheckpoint> {
+        let through = Lsn(base.checkpoint.through);
+        let invalid = || {
+            Anomaly::fault("rtdb/checkpoint-trim-proof", "The trim does not name an exact committed checkpoint")
+        };
+        if through >= base.announced
+            || base.announced > minimum_head
+            || base.checkpoint.manifest.database != self.database
+        {
+            return Err(invalid());
+        }
+        if self.immutable_history() {
+            let page = self
+                .page(base.announced, minimum_head, 1, Duration::ZERO)
+                .await
+                .map_err(journal_error)?;
+            let [(announced, bytes)] = page.records.as_slice() else {
+                return Err(invalid());
+            };
+            if *announced != base.announced || page.head < minimum_head || page.floor > *announced {
+                return Err(invalid());
+            }
+            let entry = self.decode_unproven(*announced, bytes).await?;
+            if entry.generation != base.checkpoint.key_generation
+                || !matches!(entry.record, Record::Checkpoint(checkpoint) if checkpoint == base.checkpoint)
+            {
+                return Err(invalid());
+            }
+        }
+        Ok(CertifiedCheckpoint {
+            stream_id: self.id(),
+            writer_session_id: self.session.as_ref().map(|session| session.id),
+            through,
+        })
+    }
+
+    pub(crate) async fn trim(
+        &self,
+        epoch: Epoch,
+        checkpoint: CertifiedCheckpoint,
+    ) -> journal_contract::Result<()> {
+        if checkpoint.stream_id != self.id()
+            || checkpoint.writer_session_id != self.session.as_ref().map(|session| session.id)
+        {
+            return Err(JournalError::Unsupported);
+        }
         self.authorize_mutation().await?;
         match self.session_fence(epoch)? {
-            Some(fence) => self.journal.trim_session(fence, through).await,
-            None => self.journal.trim(self.id(), epoch, through).await,
+            Some(fence) => self.journal.trim_session(fence, checkpoint.through).await,
+            None => self.journal.trim(self.id(), epoch, checkpoint.through).await,
         }
     }
 
     pub(crate) async fn encode(&self, lsn: Lsn, entry: &Entry) -> Result<Bytes> {
         let record = entry.record.encode()?;
-        let mut plaintext = Vec::with_capacity(9 + record.len());
-        plaintext.push(ENVELOPE_VERSION);
-        plaintext.extend_from_slice(&entry.epoch.0.to_be_bytes());
-        plaintext.extend_from_slice(&record);
+        let plaintext = commissioning::encode_entry(self.activation_scope, entry.epoch.0, &record);
         let generation = Generation {
             database: self.database,
             number: entry.generation,
@@ -345,19 +464,12 @@ impl Stream {
     pub(crate) async fn decode_unproven(&self, lsn: Lsn, bytes: &[u8]) -> Result<Entry> {
         let context = Context::Journal { lsn: lsn.0 };
         let plaintext = rtdb_crypt::open(self.kms.as_ref(), self.database, context, bytes).await?;
-        let (header, record) = plaintext
-            .bytes
-            .split_first_chunk::<9>()
-            .ok_or_else(invalid_entry)?;
-        if header[0] != ENVELOPE_VERSION {
-            return Err(invalid_entry());
-        }
-        let epoch = Epoch(u64::from_be_bytes(header[1..].try_into().unwrap()));
-        if epoch == Epoch(0) {
-            return Err(invalid_entry());
-        }
+        let (epoch, record) = commissioning::decode_entry(self.activation_scope, &plaintext.bytes)?;
         let record = Record::decode(record)?;
-        Ok(Entry { epoch, generation: plaintext.generation.number, record })
+        if matches!(record, Record::Commissioned) && self.activation_scope.is_none() {
+            return Err(commissioning::scope_mismatch());
+        }
+        Ok(Entry { epoch: Epoch(epoch), generation: plaintext.generation.number, record })
     }
 
     pub(crate) async fn append(
@@ -446,13 +558,6 @@ pub(crate) fn next(lsn: Lsn) -> Result<Lsn> {
         .checked_add(1)
         .map(Lsn)
         .ok_or_else(|| Anomaly::fault("rtdb/journal-exhausted", "The journal has no next position"))
-}
-
-fn invalid_entry() -> Anomaly {
-    Anomaly::fault(
-        "rtdb/multi-journal-envelope",
-        "Invalid Multi journal record envelope",
-    )
 }
 
 /// The journal head is behind what this process already replayed: the stream

@@ -13,6 +13,7 @@ pub struct Reachability {
     objects: BTreeSet<ObjectId>,
     pins: BTreeMap<Uuid, Pin>,
     rewrite_files: bool,
+    pinned_files: bool,
 }
 
 impl Reachability {
@@ -28,6 +29,7 @@ impl Reachability {
             objects: BTreeSet::new(),
             pins: BTreeMap::new(),
             rewrite_files: false,
+            pinned_files: false,
         };
         for id in objects {
             reachable.rewrite_files |= id.kind == ObjectKind::File;
@@ -80,7 +82,7 @@ impl Reachability {
                     let image = reachable.include_checkpoint(&manifests, checkpoint)?;
                     for pin in &image.manifest.pins {
                         let pinned = reachable.include_manifest(&manifests, pin.manifest)?;
-                        reachable.rewrite_files |= !pinned.manifest.files.is_empty();
+                        reachable.record_pinned_files(pinned);
                     }
                 }
                 Record::RankedCatalog(catalog) => {
@@ -112,6 +114,7 @@ impl Reachability {
                 | Record::WriterRelease { .. }
                 | Record::DeploymentRetirement { .. }
                 | Record::Recovered { .. }
+                | Record::Commissioned
                 | Record::KeyRotate { .. }
                 | Record::KeyRetirement { .. }
                 | Record::Settle { .. }
@@ -126,11 +129,19 @@ impl Reachability {
     }
 
     pub fn contains_files(&self) -> bool {
-        self.objects.iter().any(|id| id.kind == ObjectKind::File)
+        self.files().next().is_some()
+    }
+
+    pub fn files(&self) -> impl Iterator<Item = ObjectId> + '_ {
+        self.objects.iter().copied().filter(|id| id.kind == ObjectKind::File)
     }
 
     pub fn requires_file_rewrite(&self) -> bool {
         self.rewrite_files
+    }
+
+    pub fn contains_pinned_files(&self) -> bool {
+        self.pinned_files
     }
 
     /// Active pins reconstructed by `from_records`.
@@ -212,7 +223,7 @@ impl Reachability {
         pin: &Pin,
     ) -> Result<()> {
         let image = self.include_manifest(manifests, pin.manifest)?;
-        self.rewrite_files |= !image.manifest.files.is_empty();
+        self.record_pinned_files(image);
         if self.pins.insert(pin.id, pin.clone()).is_some() {
             return Err(Anomaly::fault(
                 "rtdb.store/duplicate-pin",
@@ -220,6 +231,12 @@ impl Reachability {
             ));
         }
         Ok(())
+    }
+
+    fn record_pinned_files(&mut self, image: &VerifiedManifest) {
+        let has_files = !image.manifest.files.is_empty();
+        self.rewrite_files |= has_files;
+        self.pinned_files |= has_files;
     }
 
     fn include(&mut self, id: ObjectId) -> Result<()> {

@@ -1,4 +1,9 @@
-use std::{collections::BTreeSet, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeSet,
+    path::Path,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 use bytes::Bytes;
 use journal_contract::{
@@ -6,25 +11,52 @@ use journal_contract::{
     reference::{FileJournal, Limits},
 };
 use rtdb_db::{ServingAuthority, ServingPermit};
-use rtdb_node::{Clock, SystemClock};
-use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp};
+use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+mod clock;
 pub(crate) mod operator;
 pub use operator::{HELP as ACTIVATION_HELP, Options as ActivationOptions};
 
-const MAX_GRANT_MICROS: i64 = 5_000_000;
-const MAX_CLOCK_OFFSET_MICROS: i64 = 250_000;
+use clock::{ElapsedClock, HOLDER_WINDOW};
+
+const ABSOLUTE_GRANT_PROTOCOL: u8 = 1;
+const ELAPSED_GRANT_PROTOCOL: u8 = 2;
+const RENEW_AHEAD: Duration = Duration::from_secs(1);
 const ATTEMPTS: usize = 8;
 
 pub struct ActivationAuthority {
     journal: Arc<dyn Journal>,
     identity: Uuid,
-    local: bool,
-    clock: Arc<dyn Clock>,
+    access: Access,
+    clock: Arc<ElapsedClock>,
+}
+
+#[derive(Clone, Copy)]
+enum Access {
+    LocalOperator,
+    ConsensusOperator,
+    ConsensusReader,
+}
+
+impl Access {
+    fn is_local(self) -> bool {
+        matches!(self, Self::LocalOperator)
+    }
+
+    fn require_operator(self) -> Result<()> {
+        if matches!(self, Self::ConsensusReader) {
+            return Err(Anomaly::new(
+                AnomalyCategory::Forbidden,
+                "rtdb/activation-operator",
+                "Only the activation operator may change the binding",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -38,6 +70,18 @@ pub struct ActivationStatus {
     pub binding: Binding,
     pub grants_closed: bool,
     pub grants_end_micros: Option<i64>,
+    pub grant_protocol_version: u8,
+}
+
+impl ActivationStatus {
+    fn published(binding: Binding) -> Self {
+        Self {
+            binding,
+            grants_closed: false,
+            grants_end_micros: None,
+            grant_protocol_version: ELAPSED_GRANT_PROTOCOL,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -53,6 +97,7 @@ pub struct VerifiedSuccessor {
     predecessor: Uuid,
     successor: Uuid,
     manifest_digest: [u8; 32],
+    activation_scope: Option<rtdb_db::ActivationScope>,
 }
 
 impl VerifiedSuccessor {
@@ -61,6 +106,7 @@ impl VerifiedSuccessor {
             predecessor: installed.source_incarnation(),
             successor: Uuid::from_bytes(installed.destination_basis().incarnation()),
             manifest_digest: installed.manifest_sha256(),
+            activation_scope: installed.activation_scope(),
         }
     }
 }
@@ -78,7 +124,7 @@ struct State {
 impl State {
     fn initial(incarnation: Uuid) -> Self {
         Self {
-            version: 1,
+            version: ELAPSED_GRANT_PROTOCOL,
             binding: Binding {
                 incarnation,
                 revision: 1,
@@ -96,6 +142,24 @@ impl State {
         }
         Ok(())
     }
+
+    fn already_published(
+        &self,
+        publication: Publication,
+        successor: Uuid,
+    ) -> Result<bool> {
+        if let Some(prior) = self.publication.filter(|prior| prior.operation == publication.operation) {
+            if prior == publication && self.binding.incarnation == successor {
+                return Ok(true);
+            }
+            return Err(conflict());
+        }
+        self.require(publication.predecessor)?;
+        if !self.grants_closed || self.retired.contains(&successor) {
+            return Err(conflict());
+        }
+        Ok(false)
+    }
 }
 
 impl ActivationAuthority {
@@ -103,12 +167,13 @@ impl ActivationAuthority {
         url: &str,
         credentials: super::Credentials,
         identity: Uuid,
+        access: Access,
     ) -> Result<Arc<Self>> {
         if !url.starts_with(super::CONSENSUS_SCHEME) {
             return Err(configuration());
         }
         let backend = super::connect_stream_journal(url, &credentials).await?;
-        Self::new(backend.journal, identity)
+        Self::with_access(backend.journal, identity, access)
     }
 
     pub async fn for_development(
@@ -117,23 +182,29 @@ impl ActivationAuthority {
         let Some((url, identity, credentials)) = environment()? else {
             return Ok(None);
         };
-        if data_journal.is_some_and(|data| data.url == url) {
-            return Err(configuration());
+        if let Some(data_journal) = data_journal {
+            require_independent_journals(&url, &data_journal.url)?;
         }
         super::DevelopmentStreamJournal::new(&url, credentials.clone())?;
-        Ok(Some(Self::connect(&url, credentials, identity).await?))
+        Ok(Some(Self::connect(&url, credentials, identity, Access::ConsensusReader).await?))
     }
 
     /// All participants in an authority must use its same independent ordered journal.
     pub fn new(journal: Arc<dyn Journal>, identity: Uuid) -> Result<Arc<Self>> {
+        Self::with_access(journal, identity, Access::ConsensusOperator)
+    }
+
+    fn with_access(journal: Arc<dyn Journal>, identity: Uuid, access: Access) -> Result<Arc<Self>> {
         if identity.is_nil() {
             return Err(conflict());
         }
+        let clock: Arc<ElapsedClock> = Arc::new(clock::continuous_now);
+        clock().ok_or_else(clock::unavailable)?;
         Ok(Arc::new(Self {
             journal,
             identity,
-            local: false,
-            clock: Arc::new(SystemClock),
+            access,
+            clock,
         }))
     }
 
@@ -143,20 +214,40 @@ impl ActivationAuthority {
         }
         let journal = FileJournal::open(path, Limits::default()).map_err(super::io_error)?;
         let journal = Arc::new(journal.handle(Identity::from_static("urn:rtdb:activation:local")));
-        Ok(Arc::new(Self {
-            journal,
-            identity,
-            local: true,
-            clock: Arc::new(SystemClock),
-        }))
+        Self::with_access(journal, identity, Access::LocalOperator)
+    }
+
+    pub fn identity(&self) -> Uuid {
+        self.identity
+    }
+
+    pub fn commissioning_stream_id(&self, name: &str) -> Result<StreamId> {
+        self.stream_id(name)
+    }
+
+    pub fn successor_incarnation(
+        &self, name: &str, expected: Binding, operation: Uuid,
+    ) -> Result<Uuid> {
+        if operation.is_nil() {
+            return Err(conflict());
+        }
+        let stream = self.stream_id(name)?;
+        let next_revision = expected.revision.checked_add(1).ok_or_else(conflict)?;
+        let mut digest = Sha256::new();
+        digest.update(b"rtdb.activation.successor.v1");
+        digest.update(stream.0.to_be_bytes());
+        digest.update(next_revision.to_be_bytes());
+        digest.update(operation.as_bytes());
+        Ok(Uuid::from_bytes(digest.finalize()[..16].try_into().unwrap()))
     }
 
     pub async fn bootstrap(&self, name: &str, incarnation: Uuid) -> Result<Binding> {
+        self.access.require_operator()?;
         if incarnation.is_nil() {
             return Err(conflict());
         }
         let stream = self.stream_id(name)?;
-        if self.local {
+        if self.access.is_local() {
             self.journal.create(stream).await
         } else {
             self.journal.create_immutable(stream).await
@@ -183,7 +274,23 @@ impl ActivationAuthority {
             binding: state.binding,
             grants_closed: state.grants_closed,
             grants_end_micros: state.grants_end,
+            grant_protocol_version: state.version,
         })
+    }
+
+    pub async fn upgrade_grants(&self, name: &str, expected: Binding) -> Result<()> {
+        self.change(self.stream_id(name)?, |state| {
+            let state = state.ok_or_else(unavailable)?;
+            state.require(expected)?;
+            if state.version == ELAPSED_GRANT_PROTOCOL {
+                return Ok(None);
+            }
+            let mut next = state.clone();
+            next.version = ELAPSED_GRANT_PROTOCOL;
+            Ok(Some(next))
+        })
+        .await
+        .map(drop)
     }
 
     pub async fn close_grants(&self, name: &str, expected: Binding) -> Result<()> {
@@ -194,11 +301,36 @@ impl ActivationAuthority {
                 return Ok(None);
             }
             let mut next = state.clone();
+            next.version = ELAPSED_GRANT_PROTOCOL;
             next.grants_closed = true;
             Ok(Some(next))
         })
         .await
         .map(drop)
+    }
+
+    async fn publication_status(
+        &self,
+        name: &str,
+        expected: Binding,
+        operation: Uuid,
+    ) -> Result<Option<ActivationStatus>> {
+        if operation.is_nil() {
+            return Err(conflict());
+        }
+        let (_, state) = self.read(self.stream_id(name)?).await?;
+        let state = state.ok_or_else(unavailable)?;
+        if let Some(publication) = state.publication.filter(|prior| prior.operation == operation) {
+            if publication.predecessor != expected {
+                return Err(conflict());
+            }
+            return Ok(Some(ActivationStatus::published(state.binding)));
+        }
+        state.require(expected)?;
+        if !state.grants_closed {
+            return Err(conflict());
+        }
+        Ok(None)
     }
 
     pub async fn publish_successor(
@@ -208,10 +340,11 @@ impl ActivationAuthority {
         operation: Uuid,
         successor: VerifiedSuccessor,
     ) -> Result<Binding> {
-        if operation.is_nil()
-            || successor.predecessor != expected.incarnation
-            || successor.successor.is_nil()
+        self.access.require_operator()?;
+        if successor.predecessor != expected.incarnation
+            || successor.successor != self.successor_incarnation(name, expected, operation)?
             || successor.successor == expected.incarnation
+            || successor.activation_scope != Some(rtdb_db::ActivationScope::new(self.identity, name)?)
         {
             return Err(conflict());
         }
@@ -220,32 +353,30 @@ impl ActivationAuthority {
             predecessor: expected,
             manifest_digest: successor.manifest_digest,
         };
+        let stream = self.stream_id(name)?;
+        let (_, frozen) = self.read(stream).await?;
+        let frozen = frozen.ok_or_else(unavailable)?;
+        if frozen.already_published(publication, successor.successor)? {
+            return Ok(frozen.binding);
+        }
+        clock::wait_out(self.clock.as_ref(), clock::drain_window(frozen.grants_end.is_some())).await?;
+
         let state = self
-            .change(self.stream_id(name)?, |state| {
+            .change(stream, |state| {
                 let state = state.ok_or_else(unavailable)?;
-                if let Some(prior) = state
-                    .publication
-                    .filter(|prior| prior.operation == operation)
-                {
-                    if prior == publication && state.binding.incarnation == successor.successor {
-                        return Ok(None);
-                    }
-                    return Err(conflict());
-                }
-                state.require(expected)?;
-                if !state.grants_closed || state.retired.contains(&successor.successor) {
-                    return Err(conflict());
-                }
-                let clock_lower_bound = self.clock.now().0.saturating_sub(MAX_CLOCK_OFFSET_MICROS);
-                if state.grants_end.is_some_and(|end| clock_lower_bound < end) {
-                    return Err(Anomaly::new(
-                        AnomalyCategory::Busy,
-                        "rtdb/activation-draining",
-                        "The previous incarnation still holds a serving grant",
-                    ));
+                if state.already_published(publication, successor.successor)? {
+                    return Ok(None);
                 }
                 let mut next = state.clone();
-                next.retired.insert(expected.incarnation);
+                next.version = ELAPSED_GRANT_PROTOCOL;
+                // A higher revision already excludes successors issued by this
+                // protocol. Retain arbitrary identities from older bindings.
+                let derived_predecessor = state.publication.and_then(|prior| {
+                    self.successor_incarnation(name, prior.predecessor, prior.operation).ok()
+                });
+                if derived_predecessor != Some(expected.incarnation) {
+                    next.retired.insert(expected.incarnation);
+                }
                 next.binding = Binding {
                     incarnation: successor.successor,
                     revision: expected.revision.checked_add(1).ok_or_else(conflict)?,
@@ -264,34 +395,29 @@ impl ActivationAuthority {
         name: &str,
         incarnation: Uuid,
     ) -> Result<Arc<dyn ServingAuthority>> {
-        Ok(Arc::new(BoundAuthority {
+        Ok(Arc::new(ServingBinding(Arc::new(BoundAuthority {
             authority: Arc::clone(self),
             stream: self.stream_id(name)?,
             incarnation,
-            grant: Mutex::new(None),
-        }))
+            grant: RwLock::new(None),
+            renewal: Arc::new(Mutex::new(())),
+        }))))
     }
 
-    async fn grant(&self, stream: StreamId, incarnation: Uuid) -> Result<i64> {
-        let state = self
-            .change(stream, |state| {
-                let state = state.ok_or_else(unavailable)?;
-                if state.grants_closed || state.binding.incarnation != incarnation {
-                    return Err(not_active());
-                }
-                let now = self.clock.now().0;
-                if state
-                    .grants_end
-                    .is_some_and(|end| end.saturating_sub(now) > MAX_GRANT_MICROS / 2)
-                {
-                    return Ok(None);
-                }
-                let mut next = state.clone();
-                next.grants_end = Some(now.checked_add(MAX_GRANT_MICROS).ok_or_else(unavailable)?);
-                Ok(Some(next))
-            })
-            .await?;
-        state.grants_end.ok_or_else(unavailable)
+    async fn grant(&self, stream: StreamId, incarnation: Uuid) -> Result<ServingPermit> {
+        let requested_at = (self.clock)().ok_or_else(clock::unavailable)?;
+        let (_, state) = self.read(stream).await?;
+        let state = state.ok_or_else(unavailable)?;
+        if state.grants_closed || state.binding.incarnation != incarnation {
+            return Err(not_active());
+        }
+        if state.version != ELAPSED_GRANT_PROTOCOL {
+            return Err(Anomaly::unsupported(
+                "rtdb/activation-grant-protocol",
+                "Upgrade the activation binding before opening this incarnation",
+            ));
+        }
+        ServingPermit::bounded(requested_at, HOLDER_WINDOW, self.clock.clone())
     }
 
     fn stream_id(&self, name: &str) -> Result<StreamId> {
@@ -306,7 +432,7 @@ impl ActivationAuthority {
     }
 
     async fn read(&self, stream: StreamId) -> Result<(Lsn, Option<State>)> {
-        if !self.local {
+        if !self.access.is_local() {
             self.journal
                 .require_immutable(stream)
                 .await
@@ -317,7 +443,7 @@ impl ActivationAuthority {
             if head == Lsn(0) {
                 return Ok((head, None));
             }
-            let page = if self.local {
+            let page = if self.access.is_local() {
                 self.journal.read(stream, head, 1, Duration::ZERO).await
             } else {
                 self.journal
@@ -336,7 +462,7 @@ impl ActivationAuthority {
                 return Err(corrupt());
             }
             let state: State = serde_json::from_slice(bytes).map_err(|_| corrupt())?;
-            if state.version != 1
+            if !matches!(state.version, ABSOLUTE_GRANT_PROTOCOL | ELAPSED_GRANT_PROTOCOL)
                 || state.binding.incarnation.is_nil()
                 || state.binding.revision == 0
                 || state.retired.contains(&state.binding.incarnation)
@@ -353,13 +479,15 @@ impl ActivationAuthority {
         stream: StreamId,
         mut next: impl FnMut(Option<&State>) -> Result<Option<State>>,
     ) -> Result<State> {
-        let mut epoch = Epoch(u64::from(self.local));
+        self.access.require_operator()?;
+        let local = self.access.is_local();
+        let mut epoch = Epoch(u64::from(local));
         for _ in 0..ATTEMPTS {
             let (head, observed) = self.read(stream).await?;
             let Some(state) = next(observed.as_ref())? else {
                 return observed.ok_or_else(corrupt);
             };
-            let sealed = if self.local {
+            let sealed = if local {
                 self.journal
                     .seal(stream, epoch)
                     .await
@@ -378,7 +506,7 @@ impl ActivationAuthority {
                     epoch = Epoch(
                         current
                             .0
-                            .checked_add(u64::from(self.local))
+                            .checked_add(u64::from(local))
                             .ok_or_else(unavailable)?,
                     );
                     continue;
@@ -425,26 +553,47 @@ struct BoundAuthority {
     authority: Arc<ActivationAuthority>,
     stream: StreamId,
     incarnation: Uuid,
-    grant: Mutex<Option<ServingPermit>>,
+    grant: RwLock<Option<ServingPermit>>,
+    renewal: Arc<Mutex<()>>,
 }
 
-impl ServingAuthority for BoundAuthority {
+impl BoundAuthority {
+    fn cached(&self) -> Option<(ServingPermit, Duration)> {
+        let cached = self.grant.read().unwrap();
+        let permit = cached.as_ref()?;
+        Some((permit.clone(), permit.remaining().ok()?))
+    }
+
+    async fn renew(&self) -> Result<ServingPermit> {
+        let permit = self.authority.grant(self.stream, self.incarnation).await?;
+        *self.grant.write().unwrap() = Some(permit.clone());
+        Ok(permit)
+    }
+}
+
+struct ServingBinding(Arc<BoundAuthority>);
+
+impl ServingAuthority for ServingBinding {
     fn acquire(&self) -> BoxFuture<'_, Result<ServingPermit>> {
         Box::pin(async move {
-            let mut current = self.grant.lock().await;
-            if let Some(grant) = current.as_ref()
-                && grant.check().is_ok()
-            {
-                return Ok(grant.clone());
+            let binding = &self.0;
+            if let Some((permit, remaining)) = binding.cached() {
+                if remaining <= RENEW_AHEAD
+                    && let Ok(renewing) = binding.renewal.clone().try_lock_owned()
+                {
+                    let binding = binding.clone();
+                    tokio::spawn(async move {
+                        let _renewing = renewing;
+                        let _ = binding.renew().await;
+                    });
+                }
+                return Ok(permit);
             }
-            let end = self.authority.grant(self.stream, self.incarnation).await?;
-            let clock = Arc::clone(&self.authority.clock);
-            let permit = ServingPermit::until(
-                end,
-                Arc::new(move || clock.now().0.saturating_add(MAX_CLOCK_OFFSET_MICROS)),
-            )?;
-            *current = Some(permit.clone());
-            Ok(permit)
+            let _renewing = binding.renewal.lock().await;
+            if let Some((permit, _)) = binding.cached() {
+                return Ok(permit);
+            }
+            binding.renew().await
         })
     }
 }
@@ -489,15 +638,19 @@ fn journal_error(error: JournalError) -> Anomaly {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use rtdb_types::Timestamp;
+    use tokio::sync::Notify;
 
     use super::*;
 
-    struct TestClock(AtomicI64);
-    impl Clock for TestClock {
-        fn now(&self) -> Timestamp {
-            Timestamp(self.0.load(Ordering::Relaxed))
-        }
+    fn manual_clock(micros: Arc<AtomicU64>, sampled: Arc<Notify>) -> Arc<ElapsedClock> {
+        Arc::new(move || {
+            let time = micros.load(Ordering::SeqCst);
+            sampled.notify_one();
+            Some(Duration::from_micros(time))
+        })
     }
 
     #[test]
@@ -522,27 +675,60 @@ mod tests {
         use rtdb_crypt::Generation;
         use rtdb_db::DeploymentRetirement;
         use rtdb_tx::transact::{Outcome, PHYSICAL_ERASURE, ROW_CUSTODY, Transact};
+        use stream_logkeeper::stream::consensus::{CLUSTER_VERSION_CURRENT, testing::LocalCluster};
         use tokio_util::sync::CancellationToken;
 
         let data = tempfile::tempdir().unwrap();
+        const PRINCIPAL: &str = "urn:logkeeper:client:activation-test";
+        let mut keepers = LocalCluster::start_replicated_catalog(&[PRINCIPAL]).await.unwrap();
+        let journal_config = keepers.journal_config(64 << 20, 4 << 20);
+        let journal = keepers.journal(PRINCIPAL, &journal_config).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match journal.client().finalize_version(CLUSTER_VERSION_CURRENT).await {
+                    Ok(version) => break assert_eq!(version, CLUSTER_VERSION_CURRENT),
+                    Err(JournalError::Unavailable) => tokio::time::sleep(Duration::from_millis(50)).await,
+                    Err(error) => panic!("Unexpected journal finalization error: {error:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let journal_path = data.path().join("journal.json");
+        let journal_config = serde_json::json!({
+            "keepers": journal_config.keepers,
+            "catalog": journal_config.catalog,
+            "catalog_voters": journal_config.catalog_voters,
+            "voters": journal_config.voters,
+            "quota_bytes": journal_config.quota_bytes,
+            "max_record_bytes": journal_config.max_record_bytes,
+        });
+        std::fs::write(&journal_path, serde_json::to_vec(&journal_config).unwrap()).unwrap();
+        let application_journal = super::super::DevelopmentStreamJournal::new(
+            &format!("{}{}", super::super::CONSENSUS_SCHEME, journal_path.display()),
+            keepers.credentials(PRINCIPAL).unwrap(),
+        )
+        .unwrap();
         let authority =
             ActivationAuthority::open_local(&data.path().join("authority"), Uuid::new_v4())
                 .unwrap();
         let incumbent = Uuid::new_v4();
-        let successor = Uuid::new_v4();
         let original = authority.bootstrap("xtdb", incumbent).await.unwrap();
+        let operation = Uuid::new_v4();
+        let successor = authority.successor_incarnation("xtdb", original, operation).unwrap();
         let limit = 256 << 20;
         let mut config =
             crate::config::NodeConfiguration::from_yaml_with_environment("", &|_| None, false)
                 .unwrap();
         config.flight_sql = None;
+        config.multi_journal.immutable_streams = true;
         let memory = MemoryBudget::new(config.node_options(limit).unwrap().execution_memory_bytes);
         let runtime = super::super::MultiRuntime::development_with_activation(
             &data.path().join("source"),
             &mut config,
             memory.clone(),
             Some(incumbent),
-            None,
+            Some(application_journal),
             Some(authority.clone()),
         )
         .await
@@ -615,27 +801,16 @@ mod tests {
             predecessor: incumbent,
             successor,
             manifest_digest: [3; 32],
+            activation_scope: Some(rtdb_db::ActivationScope::new(authority.identity(), "xtdb").unwrap()),
         };
-        let operation = Uuid::new_v4();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match authority
-                    .publish_successor("xtdb", original, operation, ready)
-                    .await
-                {
-                    Ok(binding) => {
-                        assert_eq!(binding.incarnation, successor);
-                        break;
-                    }
-                    Err(error) if error.code == "rtdb/activation-draining" => {
-                        tokio::time::sleep(Duration::from_millis(25)).await;
-                    }
-                    Err(error) => panic!("Unexpected successor publication error: {error:?}"),
-                }
-            }
-        })
+        let published = tokio::time::timeout(
+            Duration::from_secs(10),
+            authority.publish_successor("xtdb", original, operation, ready),
+        )
         .await
+        .unwrap()
         .unwrap();
+        assert_eq!(published.incarnation, successor);
         assert_eq!(
             retained
                 .transact(transaction(22), &stop)
@@ -657,29 +832,35 @@ mod tests {
         server.await.unwrap().unwrap();
         drop(handle);
         runtime.close().await;
+        keepers.shutdown().await.unwrap();
     }
 
     #[tokio::test]
-    async fn freezes_grants_and_publishes_exact_successor_after_expiry() {
+    async fn freeze_waits_from_each_publisher_observation() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("activation");
-        let clock = Arc::new(TestClock(AtomicI64::new(1_000_000)));
-        let mut authority = ActivationAuthority::open_local(&path, Uuid::new_v4()).unwrap();
-        Arc::get_mut(&mut authority).unwrap().clock = clock.clone();
-        let old = Uuid::new_v4();
-        let next = Uuid::new_v4();
-        let incumbent = authority.bootstrap("xtdb", old).await.unwrap();
-        let installed = VerifiedSuccessor {
-            predecessor: old,
-            successor: next,
-            manifest_digest: [4; 32],
-        };
+        let micros = Arc::new(AtomicU64::new(1_000_000));
+        let sampled = Arc::new(Notify::new());
+        let identity = Uuid::new_v4();
+        let mut authority = ActivationAuthority::open_local(&path, identity).unwrap();
+        Arc::get_mut(&mut authority).unwrap().clock = manual_clock(micros.clone(), sampled.clone());
+        let predecessor = Uuid::new_v4();
+        let incumbent = authority.bootstrap("xtdb", predecessor).await.unwrap();
         let operation = Uuid::new_v4();
-        let old_grant = authority.serving_authority("xtdb", old).unwrap();
-        old_grant.acquire().await.unwrap();
+        let successor = authority.successor_incarnation("xtdb", incumbent, operation).unwrap();
+        let installed = VerifiedSuccessor {
+            predecessor,
+            successor,
+            manifest_digest: [4; 32],
+            activation_scope: Some(rtdb_db::ActivationScope::new(identity, "xtdb").unwrap()),
+        };
+        let serving = authority.serving_authority("xtdb", predecessor).unwrap();
+        let old_grant = serving.acquire().await.unwrap();
+        let stream = authority.commissioning_stream_id("xtdb").unwrap();
+        assert_eq!(authority.journal.head(stream).await.unwrap(), Lsn(1));
         assert_eq!(
             authority
-                .serving_authority("xtdb", next)
+                .serving_authority("xtdb", successor)
                 .unwrap()
                 .acquire()
                 .await
@@ -690,7 +871,7 @@ mod tests {
         authority.close_grants("xtdb", incumbent).await.unwrap();
         assert_eq!(
             authority
-                .serving_authority("xtdb", old)
+                .serving_authority("xtdb", predecessor)
                 .unwrap()
                 .acquire()
                 .await
@@ -698,73 +879,128 @@ mod tests {
                 .code,
             "rtdb/activation-fenced"
         );
-        assert_eq!(
-            authority
-                .publish_successor("xtdb", incumbent, operation, installed)
-                .await
-                .unwrap_err()
-                .code,
-            "rtdb/activation-draining"
-        );
-        drop(old_grant);
-        let identity = authority.identity;
+        old_grant.check().unwrap();
+
+        let started = Arc::new(Notify::new());
+        let first_clock = manual_clock(micros.clone(), started.clone());
+        drop(serving);
+        Arc::get_mut(&mut authority).unwrap().clock = first_clock;
+        let publishing = {
+            let authority = authority.clone();
+            tokio::spawn(async move {
+                authority.publish_successor("xtdb", incumbent, operation, installed).await
+            })
+        };
+        started.notified().await;
+        let holder_end = 1_000_000 + u64::try_from(HOLDER_WINDOW.as_micros()).unwrap();
+        micros.store(holder_end - 1, Ordering::SeqCst);
+        old_grant.check().unwrap();
+        micros.store(holder_end, Ordering::SeqCst);
+        assert_eq!(old_grant.check().unwrap_err().code, "rtdb/activation-fenced");
+        assert_eq!(authority.binding("xtdb").await.unwrap(), incumbent);
+        assert!(!publishing.is_finished());
+        publishing.abort();
+        assert!(publishing.await.unwrap_err().is_cancelled());
         drop(authority);
 
+        let started = Arc::new(Notify::new());
         let mut authority = ActivationAuthority::open_local(&path, identity).unwrap();
-        Arc::get_mut(&mut authority).unwrap().clock = clock.clone();
+        Arc::get_mut(&mut authority).unwrap().clock = manual_clock(micros.clone(), started.clone());
+        let restarted = {
+            let authority = authority.clone();
+            tokio::spawn(async move {
+                authority.publish_successor("xtdb", incumbent, operation, installed).await
+            })
+        };
+        started.notified().await;
+        let drain = u64::try_from(clock::drain_window(false).as_micros()).unwrap();
+        micros.store(holder_end + drain - 1, Ordering::SeqCst);
         assert_eq!(authority.binding("xtdb").await.unwrap(), incumbent);
+        assert!(!restarted.is_finished());
+        micros.store(holder_end + drain, Ordering::SeqCst);
+        let active = tokio::time::timeout(Duration::from_secs(1), restarted)
+            .await.unwrap().unwrap().unwrap();
+        assert_eq!(active, Binding { incarnation: successor, revision: 2 });
         assert_eq!(
-            authority
-                .publish_successor("xtdb", incumbent, operation, installed)
-                .await
-                .unwrap_err()
-                .code,
-            "rtdb/activation-draining"
-        );
-        clock.0.store(6_250_000, Ordering::Relaxed);
-        let active = authority
-            .publish_successor("xtdb", incumbent, operation, installed)
-            .await
-            .unwrap();
-        assert_eq!(
-            active,
-            Binding {
-                incarnation: next,
-                revision: 2
-            }
-        );
-        assert_eq!(
-            authority
-                .publish_successor("xtdb", incumbent, operation, installed)
-                .await
-                .unwrap(),
+            authority.publish_successor("xtdb", incumbent, operation, installed).await.unwrap(),
             active
         );
         assert_eq!(
-            authority
-                .close_grants("xtdb", incumbent)
-                .await
-                .unwrap_err()
-                .code,
+            authority.close_grants("xtdb", incumbent).await.unwrap_err().code,
             "rtdb/activation-conflict"
         );
-        assert_eq!(
-            authority
-                .serving_authority("xtdb", old)
-                .unwrap()
-                .acquire()
-                .await
-                .unwrap_err()
-                .code,
-            "rtdb/activation-fenced"
-        );
-        authority
-            .serving_authority("xtdb", next)
-            .unwrap()
-            .acquire()
-            .await
-            .unwrap();
+        authority.serving_authority("xtdb", successor).unwrap().acquire().await.unwrap();
     }
+
+    #[tokio::test]
+    async fn a_delayed_renewal_cannot_refresh_its_request_timestamp() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut authority = ActivationAuthority::open_local(
+            &directory.path().join("activation"), Uuid::new_v4()
+        ).unwrap();
+        let incarnation = Uuid::new_v4();
+        authority.bootstrap("xtdb", incarnation).await.unwrap();
+        let stream = authority.commissioning_stream_id("xtdb").unwrap();
+        let clock_samples = AtomicU64::new(0);
+        Arc::get_mut(&mut authority).unwrap().clock = Arc::new(move || {
+            let sample = clock_samples.fetch_add(1, Ordering::SeqCst);
+            Some(if sample == 0 { Duration::ZERO } else { HOLDER_WINDOW })
+        });
+        assert_eq!(authority.grant(stream, incarnation).await.unwrap_err().code, "rtdb/activation-fenced");
+        assert_eq!(authority.journal.head(stream).await.unwrap(), Lsn(1));
+    }
+
+    #[tokio::test]
+    async fn legacy_grant_metadata_survives_explicit_upgrade() {
+        let directory = tempfile::tempdir().unwrap();
+        let authority = ActivationAuthority::open_local(
+            &directory.path().join("activation"), Uuid::new_v4()
+        ).unwrap();
+        let incarnation = Uuid::new_v4();
+        let binding = authority.bootstrap("xtdb", incarnation).await.unwrap();
+        let stream = authority.commissioning_stream_id("xtdb").unwrap();
+        authority.change(stream, |state| {
+            let mut state = state.unwrap().clone();
+            state.version = ABSOLUTE_GRANT_PROTOCOL;
+            state.grants_end = Some(123);
+            Ok(Some(state))
+        }).await.unwrap();
+        assert_eq!(
+            authority.grant(stream, incarnation).await.unwrap_err().code,
+            "rtdb/activation-grant-protocol"
+        );
+        authority.upgrade_grants("xtdb", binding).await.unwrap();
+        authority.upgrade_grants("xtdb", binding).await.unwrap();
+        let status = authority.status("xtdb").await.unwrap();
+        assert_eq!(status.binding, binding);
+        assert_eq!(status.grant_protocol_version, ELAPSED_GRANT_PROTOCOL);
+        assert_eq!(status.grants_end_micros, Some(123));
+        authority.grant(stream, incarnation).await.unwrap();
+        assert_eq!(authority.journal.head(stream).await.unwrap(), Lsn(3));
+        assert!(clock::drain_window(true) > clock::drain_window(false));
+    }
+
+    #[tokio::test]
+    async fn runtime_capability_cannot_mutate_an_authority_binding() {
+        let directory = tempfile::tempdir().unwrap();
+        let operator = ActivationAuthority::open_local(
+            &directory.path().join("activation"), Uuid::new_v4()
+        ).unwrap();
+        let incumbent = operator.bootstrap("xtdb", Uuid::new_v4()).await.unwrap();
+        let reader = ActivationAuthority::with_access(
+            operator.journal.clone(), operator.identity(), Access::ConsensusReader,
+        ).unwrap();
+        assert_eq!(
+            reader.bootstrap("xtdb", incumbent.incarnation).await.unwrap_err().code,
+            "rtdb/activation-operator"
+        );
+        assert_eq!(
+            reader.close_grants("xtdb", incumbent).await.unwrap_err().code,
+            "rtdb/activation-operator"
+        );
+        assert!(!operator.status("xtdb").await.unwrap().grants_closed);
+    }
+
 }
 
 #[cfg(feature = "s3")]
@@ -781,12 +1017,25 @@ pub(super) async fn installed(
             "Installed activation requires multiJournal.immutableStreams",
         ));
     }
-    if url == database_url {
+    require_independent_journals(&url, database_url)?;
+    Ok(Some(
+        ActivationAuthority::connect(&url, credentials, identity, Access::ConsensusReader).await?,
+    ))
+}
+
+fn require_independent_journals(authority_url: &str, database_url: &str) -> Result<()> {
+    let read = |url: &str| {
+        let path = url.strip_prefix(super::CONSENSUS_SCHEME).ok_or_else(configuration)?;
+        super::JournalConfig::read(Path::new(path)).map_err(|_| configuration())
+    };
+    let authority = read(authority_url)?;
+    let database = read(database_url)?;
+    if authority.catalog == database.catalog
+        || authority.keepers.keys().any(|keeper| database.keepers.contains_key(keeper))
+    {
         return Err(configuration());
     }
-    Ok(Some(
-        ActivationAuthority::connect(&url, credentials, identity).await?,
-    ))
+    Ok(())
 }
 
 fn environment() -> Result<Option<(String, Uuid, super::Credentials)>> {
@@ -799,8 +1048,8 @@ fn environment() -> Result<Option<(String, Uuid, super::Credentials)>> {
     let identity =
         Uuid::parse_str(&env("RTDB_ACTIVATION_AUTHORITY_ID")?).map_err(|_| configuration())?;
     let credentials = super::Credentials {
-        certificate: env("RTDB_ACTIVATION_CERTIFICATE_PATH")?.into(),
-        private_key: env("RTDB_ACTIVATION_PRIVATE_KEY_PATH")?.into(),
+        certificate: env("RTDB_ACTIVATION_READER_CERTIFICATE_PATH")?.into(),
+        private_key: env("RTDB_ACTIVATION_READER_PRIVATE_KEY_PATH")?.into(),
         ca: env("RTDB_ACTIVATION_CA_PATH")?.into(),
     };
     Ok(Some((url, identity, credentials)))
@@ -809,6 +1058,6 @@ fn environment() -> Result<Option<(String, Uuid, super::Credentials)>> {
 fn configuration() -> Anomaly {
     Anomaly::incorrect(
         "rtdb/activation-configuration",
-        "Activation requires an independent consensus journal, authority ID and commissioned TLS paths",
+        "Activation requires an independent consensus journal, authority ID and reader TLS paths",
     )
 }

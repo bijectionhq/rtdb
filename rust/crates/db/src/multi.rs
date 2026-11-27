@@ -38,7 +38,7 @@ mod ranked;
 mod rotation;
 mod retirement;
 mod timing;
-pub use backup::{InstalledBackup, PortableBackup, VerifiedBackup};
+pub use backup::{BackupFileRelocation, InstalledBackup, PortableBackup, VerifiedBackup};
 pub use classic_migration::{ClassicInstallation, classic_import_basis};
 pub use pin::{NativeCheckpointInstallation, NativeDependentCarrier, NativeDependentOriginal, PinnedExport};
 pub use pipeline::WritePipeline;
@@ -193,7 +193,20 @@ impl MultiDatabase {
     pub async fn create(&self) -> Result<()> {
         self.stream.create().await?;
         self.token_keys.install(self.stream.kms.as_ref(), 1).await?;
+        self.stream.commission().await?;
         Ok(())
+    }
+
+    pub fn with_activation_scope(mut self, scope: crate::ActivationScope) -> Result<Self> {
+        if !self.stream.immutable_history() {
+            return Err(crate::commissioning::scope_mismatch());
+        }
+        self.stream.activation_scope = Some(scope);
+        Ok(self)
+    }
+
+    pub async fn check_activation_scope(&self, head: Lsn) -> Result<()> {
+        self.stream.check_commissioning(head).await
     }
 
     pub fn token_authority(&self) -> TokenAuthority { self.tokens.clone() }
@@ -263,6 +276,10 @@ impl MultiDatabase {
 
     pub fn serving_authority(&self) -> Option<Arc<dyn crate::ServingAuthority>> {
         self.stream.serving_authority.clone()
+    }
+
+    pub fn activation_required(&self) -> bool {
+        self.stream.activation_scope.is_some() || self.stream.serving_authority.is_some()
     }
 
     pub fn with_batch_appender(mut self, batch: Arc<dyn JournalBatchAppender>) -> Self {
@@ -824,6 +841,13 @@ impl MultiDatabase {
         self.require_destroyed_generation()?;
         let closure = self.reachability(lease).await?;
         timing.mark("reachability");
+        let mut files = files;
+        let portable_files = backup::portable_attachment_files(&self.stream, self.store.as_ref(), self.state().coordinates.origin).await?;
+        for id in portable_files {
+            if !files.contains(&id) {
+                files.push(id);
+            }
+        }
         self.validate_files(&closure, &files)?;
         let manifest = Manifest {
             files,
@@ -854,11 +878,11 @@ impl MultiDatabase {
             key_generation: generation,
             restore: false,
         };
-        self.append_control(lease, Record::Checkpoint(checkpoint.clone()))
+        self.append_control(lease, Record::Checkpoint(checkpoint))
             .await?;
         timing.mark("append");
         let announced = self.state().head;
-        self.trim_to_base(lease, ReplayBase { announced, checkpoint }, lease.until).await?;
+        self.trim_to_base(lease, announced, lease.until).await?;
         timing.mark("trim");
         timing.report(self.options.database, manifest.payload.len(), through);
         Ok(image.id())
@@ -996,25 +1020,40 @@ impl MultiDatabase {
     /// Trims through the cut of a checkpoint this writer announced, then keeps
     /// its replayed state over the new floor instead of replaying the
     /// checkpoint again.
-    async fn trim_to_base(&mut self, lease: Lease, base: ReplayBase, until: i64) -> Result<()> {
-        self.require_authority(lease)?;
-        match self.stream.trim(lease.epoch, Lsn(base.checkpoint.through)).await {
-            Ok(()) => {
-                if let Some(state) = self.committed.as_mut() {
-                    state.advance_floor(base, until, lease.epoch);
-                }
-                self.refresh().await
-            }
-            Err(error) => Err(self.mutation_failed(error)),
+    async fn trim_to_base(&mut self, lease: Lease, announced: Lsn, until: i64) -> Result<()> {
+        let base = self.state().checkpoint_at(announced)?;
+        self.trim_checkpoint(lease, &base).await?;
+        if let Some(state) = self.committed.as_mut() {
+            state.advance_floor(base, until, lease.epoch);
         }
+        self.refresh().await
     }
 
-    async fn trim(&mut self, lease: Lease, through: Lsn) -> Result<()> {
-        self.require_authority(lease)?;
-        match self.stream.trim(lease.epoch, through).await {
-            Ok(()) => self.refresh().await,
-            Err(error) => Err(self.mutation_failed(error)),
+    async fn trim_committed_checkpoint(
+        &mut self,
+        lease: Lease,
+        announced: Lsn,
+        through: Lsn,
+    ) -> Result<()> {
+        let base = self.state().checkpoint_at(announced)?;
+        if base.checkpoint.through != through.0 {
+            return Err(Anomaly::fault(
+                "rtdb/checkpoint-trim-proof",
+                "The checkpoint announces a different trim position",
+            ));
         }
+        self.trim_checkpoint(lease, &base).await?;
+        self.refresh().await
+    }
+
+    async fn trim_checkpoint(&mut self, lease: Lease, base: &ReplayBase) -> Result<()> {
+        self.require_authority(lease)?;
+        let checkpoint = self.stream.certify_checkpoint(base, self.state().head).await?;
+        self.require_authority(lease)?;
+        self.stream
+            .trim(lease.epoch, checkpoint)
+            .await
+            .map_err(|error| self.mutation_failed(error))
     }
 
     async fn append(&mut self, lease: Lease, record: Record) -> Result<Option<Receipt>> {

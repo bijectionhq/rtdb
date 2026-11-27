@@ -6,7 +6,7 @@ use super::{ObjectKind, invalid, require_kind};
 
 #[derive(Message)]
 pub(super) struct Record {
-    #[prost(oneof = "Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13")]
+    #[prost(oneof = "Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14")]
     kind: Option<Kind>,
 }
 
@@ -38,7 +38,12 @@ enum Kind {
     RankedCatalog(RankedCatalog),
     #[prost(message, tag = "13")]
     Recovered(Recovered),
+    #[prost(message, tag = "14")]
+    Commissioned(Commissioned),
 }
+
+#[derive(Message)]
+struct Commissioned {}
 
 #[derive(Message)]
 struct Tx {
@@ -187,6 +192,7 @@ impl TryFrom<&super::Record> for Record {
             WriterRelease { lease_until } => Kind::WriterRelease(self::Lease { until: *lease_until }),
             DeploymentRetirement { lease_until } => Kind::DeploymentRetirement(self::Lease { until: *lease_until }),
             Recovered { head, epoch, time } => Kind::Recovered(self::Recovered { head: *head, epoch: *epoch, time: *time }),
+            Commissioned => Kind::Commissioned(self::Commissioned {}),
         };
         Ok(Self { kind: Some(kind) })
     }
@@ -250,6 +256,7 @@ impl TryFrom<Record> for super::Record {
                     epoch: recovered.epoch,
                     time: recovered.time,
                 },
+                Kind::Commissioned(_) => Self::Commissioned,
             },
         )
     }

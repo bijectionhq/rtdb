@@ -192,6 +192,20 @@ pub async fn read_file(store: &dyn ObjectStore, kms: &dyn Kms, id: ObjectId) -> 
     read(store, kms, id).await
 }
 
+/// Verify a fresh immutable file read within a ciphertext size budget.
+pub async fn read_file_bounded(
+    store: &dyn ObjectStore, kms: &dyn Kms, id: ObjectId, max_bytes: usize,
+) -> Result<Plaintext> {
+    require_kind(id, ObjectKind::File)?;
+    let key = key(id)?;
+    let size = usize::try_from(store.head_fresh(&key).await?.size).ok();
+    let size = size.filter(|size| *size <= max_bytes).ok_or_else(|| {
+        Anomaly::unsupported("rtdb.store/file-size", "The encrypted file exceeds the read budget")
+    })?;
+    let bytes = store.get_fresh_exact(&key, size).await?;
+    open(kms, id, &bytes).await
+}
+
 pub async fn read_observed_file(store: &dyn ObjectStore, kms: &dyn Kms, id: ObjectId,
     length: usize, expected_version: Option<&PhysicalObjectVersion>) -> Result<Plaintext> {
     require_kind(id, ObjectKind::File)?;

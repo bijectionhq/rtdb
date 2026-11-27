@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, RecordBatch, make_array};
+use arrow_array::{Array, ArrayRef, RecordBatch, make_array};
 use arrow_buffer::{Buffer, NullBuffer};
 use arrow_data::{ArrayData, BufferSpec};
 use arrow_schema::{DataType, Field, IntervalUnit, Schema, TimeUnit, UnionFields, UnionMode};

@@ -6,9 +6,9 @@ use serde_json::{Value, json};
 use super::*;
 
 pub const MULTI_BACKUP_HELP: &str = "\
-Usage: rtdb multi-backup export --data DIR --archive FILE [--journal-url URL --tls-dir DIR] [--immutable-streams]
+Usage: rtdb multi-backup export --data DIR --archive FILE [--journal-url URL --tls-dir DIR] [--immutable-streams] [--authority-id UUID]
        rtdb multi-backup restore --data DIR --archive FILE --incarnation UUID --source-key-vault DIR
-                                 [--journal-url URL --tls-dir DIR] [--immutable-streams]
+                                 [--journal-url URL --tls-dir DIR] [--immutable-streams] [--authority-id UUID]
 Operates on stopped, local RTDB Multi development data. The source key vault
 is supplied separately during restore. Neither command mounts a serving listener.
 ";
@@ -26,6 +26,7 @@ pub struct MultiBackupOptions {
     archive: PathBuf,
     journal: Option<(String, PathBuf)>,
     immutable_streams: bool,
+    activation_scope: Option<ActivationScope>,
 }
 
 impl MultiBackupOptions {
@@ -53,6 +54,13 @@ impl MultiBackupOptions {
         if immutable_streams && !journal.as_ref().is_some_and(|(url, _)| url.starts_with(CONSENSUS_SCHEME)) {
             return Err(arguments_error());
         }
+        let activation_scope = fields.remove("--authority-id").map(|authority_id| {
+            if !immutable_streams {
+                return Err(arguments_error());
+            }
+            let authority_id = Uuid::parse_str(&authority_id).map_err(|_| arguments_error())?;
+            ActivationScope::new(authority_id, DEVELOPMENT_DATABASE)
+        }).transpose()?;
         let operation = match operation.as_str() {
             "export" => Operation::Export,
             "restore" => {
@@ -66,7 +74,7 @@ impl MultiBackupOptions {
             _ => return Err(arguments_error()),
         };
         if !fields.is_empty() { return Err(arguments_error()); }
-        Ok(Self { operation, data, archive, journal, immutable_streams })
+        Ok(Self { operation, data, archive, journal, immutable_streams, activation_scope })
     }
 
     pub async fn run(self, apple_sync: rtdb_storage::AppleSync) -> Result<Value> {
@@ -96,12 +104,14 @@ impl MultiBackupOptions {
         let journal = self.journal.as_ref()
             .map(|(url, directory)| crate::cli::development_stream_journal(url, directory))
             .transpose()?;
-        let runtime = MultiRuntime::development_with_incarnation(
+        let runtime = MultiRuntime::development_with_access(
             &self.data,
             &mut configuration,
             MemoryBudget::new(PortableBackup::MAX_BYTES),
             incarnation,
             journal,
+            None,
+            self.activation_scope,
         ).await?;
         let result = self.transfer(&runtime, backup).await;
         runtime.close().await;
@@ -110,13 +120,15 @@ impl MultiBackupOptions {
 
     async fn transfer(&self, runtime: &MultiRuntime, backup: Option<VerifiedBackup>) -> Result<Value> {
         let database = runtime.ensure_driver(DEVELOPMENT_DATABASE, runtime.bootstrap[DEVELOPMENT_DATABASE]).await?;
-        let live = BTreeSet::from([runtime.backends.node]);
-        tokio::time::timeout(Duration::from_secs(12), async {
-            loop {
-                if matches!(database.tick(&live).await?, Role::Writer(_)) { return Ok::<(), Anomaly>(()); }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        }).await.map_err(|_| Anomaly::new(AnomalyCategory::Busy, "rtdb/backup-writer", "The local Multi writer lease did not become available"))??;
+        if backup.is_some() || !self.immutable_streams {
+            let live = BTreeSet::from([runtime.backends.node]);
+            tokio::time::timeout(Duration::from_secs(12), async {
+                loop {
+                    if matches!(database.tick(&live).await?, Role::Writer(_)) { return Ok::<(), Anomaly>(()); }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }).await.map_err(|_| Anomaly::new(AnomalyCategory::Busy, "rtdb/backup-writer", "The local Multi writer lease did not become available"))??;
+        }
 
         match backup {
             Some(backup) => {

@@ -64,6 +64,7 @@ impl MultiDatabase {
                 through: cut.basis.position(),
                 source: None,
                 backup: None,
+                portable_file_index: None,
             }),
         };
         coordinates.position(next(entry)?)?;

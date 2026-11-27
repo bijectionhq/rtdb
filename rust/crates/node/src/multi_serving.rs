@@ -53,11 +53,17 @@ impl rtdb_storage::sealing::PlaintextReleaseCheck for MultiSqlDelivery {
     }
 }
 
+enum ServingAccess {
+    Unscoped,
+    Activated(Arc<dyn ServingAuthority>),
+    Offline,
+}
+
 pub struct MultiServing {
     database: Arc<Mutex<MultiDatabase>>,
     writes: WritePipeline,
     incarnation: [u8; 16],
-    serving_authority: Option<Arc<dyn ServingAuthority>>,
+    access: ServingAccess,
     tokens: TokenAuthority,
     features: Vec<&'static str>,
     memory: Arc<MemoryBudget>,
@@ -242,9 +248,14 @@ pub enum MultiWriteAdmission<'a> {
 
 impl MultiServing {
     async fn serve<T>(&self, operation: impl Future<Output = Result<T>>) -> Result<T> {
-        let permit = match &self.serving_authority {
-            Some(authority) => Some(authority.acquire().await?),
-            None => None,
+        let permit = match &self.access {
+            ServingAccess::Activated(authority) => Some(authority.acquire().await?),
+            ServingAccess::Unscoped => None,
+            ServingAccess::Offline => return Err(Anomaly::new(
+                AnomalyCategory::Unavailable,
+                "rtdb/activation-fenced",
+                "The commissioned database is open for offline operations",
+            )),
         };
         let result = operation.await?;
         if let Some(permit) = permit {
@@ -254,7 +265,7 @@ impl MultiServing {
     }
 
     fn require_unmanaged_effects(&self) -> Result<()> {
-        if self.serving_authority.is_some() {
+        if !matches!(self.access, ServingAccess::Unscoped) {
             return Err(Anomaly::unsupported(
                 "rtdb/activation-effects",
                 "This operation requires an effect provider commissioned for database activation",
@@ -434,10 +445,14 @@ impl MultiServing {
     pub fn new(database: MultiDatabase, memory: Arc<MemoryBudget>) -> Self {
         let database = database.with_manifest_budget(Arc::clone(&memory));
         let incarnation = database.incarnation();
-        let serving_authority = database.serving_authority();
+        let access = match database.serving_authority() {
+            Some(authority) => ServingAccess::Activated(authority),
+            None if database.activation_required() => ServingAccess::Offline,
+            None => ServingAccess::Unscoped,
+        };
         let tokens = database.token_authority();
         let mut features = database.write_features().to_vec();
-        if serving_authority.is_some() {
+        if !matches!(access, ServingAccess::Unscoped) {
             features.retain(|&feature| feature != PHYSICAL_ERASURE && feature != ROW_CUSTODY);
         }
         features.extend([
@@ -450,7 +465,7 @@ impl MultiServing {
         let writes = WritePipeline::start(Arc::clone(&database));
         Self {
             incarnation,
-            serving_authority,
+            access,
             tokens,
             features,
             database,
@@ -794,11 +809,11 @@ impl ServingDriver for MultiServing {
     }
 
     async fn supports_funded_transact(&self) -> bool {
-        self.serving_authority.is_none() && self.database.lock().await.supports_funded_transact()
+        matches!(self.access, ServingAccess::Unscoped) && self.database.lock().await.supports_funded_transact()
     }
 
     async fn supports_funded_appointment(&self) -> bool {
-        self.serving_authority.is_none()
+        matches!(self.access, ServingAccess::Unscoped)
             && self.classic_workload_fence.is_none()
             && self.database.lock().await.supports_funded_appointment()
     }

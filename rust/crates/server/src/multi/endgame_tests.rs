@@ -1,7 +1,7 @@
 use super::activation::{ActivationAuthority, VerifiedSuccessor};
 use journal_contract::Journal;
 use rtdb_crypt::FileKms;
-use rtdb_db::{MultiDatabase, MultiOptions, PortableBackup, Role};
+use rtdb_db::{ActivationScope, MultiDatabase, MultiOptions, PortableBackup, Role};
 use rtdb_node::{Clock, MultiServing, SystemClock, serving::ServingDriver};
 use rtdb_storage::MemoryStore;
 use rtdb_tx::transact::{Cell, Op, Outcome, Row, Transact};
@@ -97,9 +97,11 @@ fn transaction(key: u8) -> Transact {
 async fn portable_cut_replaces_a_lost_cell_and_fences_its_return() {
     let (mut authority_keepers, control_journal) = journal().await;
     let authority = ActivationAuthority::new(control_journal, Uuid::new_v4()).unwrap();
+    let activation_scope = ActivationScope::new(authority.identity(), NAME).unwrap();
     let predecessor_id = Uuid::new_v4();
-    let successor_id = Uuid::new_v4();
     let predecessor_binding = authority.bootstrap(NAME, predecessor_id).await.unwrap();
+    let operation = Uuid::new_v4();
+    let successor_id = authority.successor_incarnation(NAME, predecessor_binding, operation).unwrap();
     let vaults = tempfile::tempdir().unwrap();
     let (mut source_keepers, source_journal) = journal().await;
     let source_keeper_ids = source_keepers.keepers().keys().copied().collect::<Vec<_>>();
@@ -111,6 +113,8 @@ async fn portable_cut_replaces_a_lost_cell_and_fences_its_return() {
         source_store.clone(),
         source_keys.clone(),
     )
+    .with_activation_scope(activation_scope)
+    .unwrap()
     .with_serving_authority(authority.serving_authority(NAME, predecessor_id).unwrap());
     source.create().await.unwrap();
     let live = BTreeSet::from([NODE]);
@@ -135,7 +139,9 @@ async fn portable_cut_replaces_a_lost_cell_and_fences_its_return() {
         destination_journal.clone(),
         destination_store.clone(),
         destination_keys.clone(),
-    );
+    )
+    .with_activation_scope(activation_scope)
+    .unwrap();
     staging.create().await.unwrap();
     assert!(matches!(
         staging.tick(&live).await.unwrap(),
@@ -161,10 +167,39 @@ async fn portable_cut_replaces_a_lost_cell_and_fences_its_return() {
         destination_journal.clone(),
         destination_store.clone(),
         destination_keys.clone(),
-    );
+    )
+    .with_activation_scope(activation_scope)
+    .unwrap();
     let installed = staged_reopen.installed_backup().await.unwrap().unwrap();
+    let offline = MultiServing::new(
+        database(successor_id, destination_journal.clone(), destination_store.clone(), destination_keys.clone())
+            .with_activation_scope(activation_scope).unwrap(),
+        rtdb_types::MemoryBudget::new(64 << 20),
+    );
+    assert_eq!(
+        offline.tx_status(&transaction(1).key, &CancellationToken::new()).await.unwrap_err().code,
+        "rtdb/activation-fenced"
+    );
+    let destination_stream = journal_contract::StreamId(successor_id.as_u128());
+    let head = destination_journal.head(destination_stream).await.unwrap();
+    assert!(destination_journal.read_page(
+        destination_stream, journal_contract::Lsn(1), head, 1, Duration::ZERO
+    ).await.is_err_and(|error| matches!(error, journal_contract::JournalError::Trimmed { .. })));
+    let uncommissioned = database(
+        successor_id, destination_journal.clone(), destination_store.clone(), destination_keys.clone(),
+    );
+    assert_eq!(
+        uncommissioned.check_activation_scope(head).await.unwrap_err().code,
+        "rtdb/activation-scope"
+    );
+    let wrong_authority = uncommissioned.with_activation_scope(
+        ActivationScope::new(Uuid::new_v4(), NAME).unwrap()
+    ).unwrap();
+    assert_eq!(
+        wrong_authority.check_activation_scope(head).await.unwrap_err().code,
+        "rtdb/activation-scope"
+    );
     let successor = VerifiedSuccessor::from_installation(&installed);
-    let operation = Uuid::new_v4();
     let active = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match authority
@@ -221,6 +256,8 @@ async fn portable_cut_replaces_a_lost_cell_and_fences_its_return() {
     }
     let returned = MultiServing::new(
         database(predecessor_id, source_journal, source_store, source_keys)
+            .with_activation_scope(activation_scope)
+            .unwrap()
             .with_serving_authority(authority.serving_authority(NAME, predecessor_id).unwrap()),
         rtdb_types::MemoryBudget::new(64 << 20),
     );

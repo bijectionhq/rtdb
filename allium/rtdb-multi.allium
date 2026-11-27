@@ -414,9 +414,16 @@ contract CellMap {
         -- A move flips the row only after the source cell has fenced the deployment (MoveCutover).
 
     @invariant SuccessorHasExclusiveServingAuthority
-        -- A separately commissioned immutable activation journal records the current incarnation and the maximum expiry of every serving grant.
+        -- A separately commissioned immutable activation journal records the current incarnation and whether it can renew serving grants.
+        -- A commissioned application's retained journal authenticates its exact authority and database name, including across trim.
+        -- A fresh linearizable read of the binding authorizes a grant under reader credentials.
+        -- Its holder expires the grant from before that read using a suspend-aware clock and a conservative rate bound.
         -- Closing grant issuance applies to one expected incarnation and activation revision.
-        -- Publication compares that same binding, verifies the installed successor, and waits until the clock's lower bound reaches the last recorded expiry.
+        -- Publication compares that same binding, verifies the installed successor, and measures a full conservative grant window after observing the committed closure.
+        -- The successor's identity is derived from the name, next activation revision and recovery operation.
+        -- The local activation broker authenticates operator peers and owns its journal writer credential.
+        -- Broker publication verifies its configured destination and takes the expected binding and operation identity from the operator.
+        -- A restarted publisher observes the committed closure and measures its own grant window.
         -- A serving operation acquires a grant for the incarnation it admitted and checks its deadline before releasing a result.
         -- A retained follower or writer handle acquires only grants for its own incarnation.
 }
@@ -761,6 +768,8 @@ contract LogService {
         -- The journal orders publication under the custodian before accepting trim through that cut.
         -- An ordinary native checkpoint cut is the inclusive replica boundary plus one.
         -- The custodian names the selected checkpoint and its exact cut when advancing the retained floor.
+        -- An immutable Multi journal trim requires the exact retained checkpoint announcement in an applied journal view covering the writer's observed head.
+        -- The certified trim retains its announcement and is scoped to the stream and writer session.
         -- A live replay reservation protects its exact interval, and an independent checkpoint hold protects its original root.
 
     @invariant InstalledServingPrefixRetirement
@@ -1104,13 +1113,19 @@ contract EpochScopedStorage {
 contract PortableApplicationBackup {
     @invariant AuthenticatedCut
         -- The writer captures one settled applied cut and binds its source incarnation, basis, system time and journal position to the encrypted checkpoint.
+        -- An immutable stream can capture its settled application state at a quorum-confirmed head with read authority.
         -- The checkpoint contains its inline application state and exact retained receipt index.
-        -- A portable inline cut requires an empty external object and pin inventory plus ordinary portable receipt and row custody state.
+        -- A portable cut requires ordinary receipt and row custody state and a closed export-pin inventory.
+        -- The archive authenticates each ordinary checkpoint file under its exact source object identity.
+        -- The writer reads each file from the current generation's custody and verifies its stored identity before capture.
         -- Publication follows durable archive creation under the source generation's independently available key custody.
 
     @invariant IndependentInstallation
         -- The destination verifies the archive with independent key custody and requires that generation to remain readable through checkpoint publication.
         -- A fresh destination installs the authenticated cut under a fresh incarnation and retains its source basis, source journal position and archive digest.
+        -- The destination seals each captured file under a new destination identity and includes the relocation index and every relocated file in its committed checkpoint closure.
+        -- Later checkpoints retain the installed file closure.
+        -- A recorded installation proves the dependency closure only while the exact installed index and every referenced file verify.
         -- The installed receipt can be recovered from the destination journal alone.
         -- Installation and activation are separate decisions.
 }

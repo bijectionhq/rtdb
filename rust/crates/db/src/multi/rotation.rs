@@ -73,7 +73,7 @@ impl MultiDatabase {
         &mut self,
         clean_files: &[Bytes],
     ) -> Result<RotationReceipt> {
-        if self.stream.serving_authority.is_some() {
+        if self.activation_required() {
             return Err(activation_effects_unavailable());
         }
         Box::pin(async move {
@@ -137,7 +137,7 @@ impl MultiDatabase {
         let Some(rotation) = self.state().rotation else {
             return Ok(None);
         };
-        if self.stream.serving_authority.is_some() {
+        if self.activation_required() {
             return Err(activation_effects_unavailable());
         }
         let lease = self.authority()?;
@@ -202,7 +202,7 @@ impl MultiDatabase {
                         armed: true,
                     }).await?;
                 }
-                self.trim(lease, Lsn(plan.trim_through())).await?;
+                self.trim_committed_checkpoint(lease, rotation.cut, Lsn(plan.trim_through())).await?;
                 let armed = ArmedRotation {
                     cut: rotation.cut,
                     retirement,

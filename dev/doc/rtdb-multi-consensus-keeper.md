@@ -49,6 +49,8 @@ This setting applies to newly created stream IDs.
 A residence verifies the durable stream mode before opening the history and presents a fresh session identity when seeking the writer epoch.
 Seal binds that session to the exact committed head, and subsequent appends and trims carry its fence.
 Followers request pages that cover their observed head and resume at the next LSN.
+A trim of an immutable Multi stream checks the exact retained checkpoint announcement in a journal view that covers the writer's observed head.
+The trim removes records through the checkpoint's cut and retains its announcement for replay.
 A history change under the same ID faults the residence.
 The keeper manages replica replacement for immutable streams.
 To adopt this mode for existing databases, restore a verified application cut into a fresh database incarnation and stream before changing the database route.
@@ -74,31 +76,77 @@ Every seal returns `JournalError::Recovered { head }` until a writer or an admin
 ## Independent database activation
 
 A Multi runtime can bind a stable name and its exact database incarnation to a separately commissioned immutable activation journal.
-The authority records the maximum lease expiry before it issues a serving grant.
-A successor publication compares the original activation revision, requires closed grant issuance, and waits for the previous grant window to close.
+A serving grant is derived from a fresh quorum-confirmed read of the active binding.
+Renewal uses a reader identity and leaves the activation journal unchanged.
+The holder measures its grant from before issuing that read, so a delayed reply cannot prolong its authority.
+A successor publication compares the original activation revision, requires closed grant issuance, and waits a full conservative grant window after reading the committed freeze.
+A restarted publication observes the freeze and waits again.
 It rejects a retired incarnation as a successor.
-A cached grant expires at the earlier of its original monotonic deadline and the conservative real-time upper bound.
-The authority assumes a bound of 250 milliseconds on real-time clock offset across all its participants.
+The protocol allows at most five seconds in real time per grant and assumes that its suspend-aware monotonic clocks stay within 1,000 parts per million of real time.
+Holders expire early and publication waits late under that rate allowance.
+Linux uses `CLOCK_BOOTTIME` and macOS uses `CLOCK_MONOTONIC_RAW`.
 
 Every member serving an activated database name must enforce the same authority.
-Commission every serving endpoint with the activation configuration before accepting client traffic.
+Commission a fresh application stream before accepting client traffic.
+Its encrypted journal envelopes bind the authority ID and database name from the first record onward.
+A node with missing or different commissioning refuses the history, including after trim or checkpoint restore.
 Keep the authority in a failure domain separate from both the predecessor and the successor.
-The current implementation gives grant renewals and operator actions the same underlying journal write capability and assumes trusted participants.
+The runtime rejects authority and application catalogs with a shared keeper identity.
+Enroll the runtime's TLS identity only in the activation keeper cluster's `readers` list.
+Use a different TLS identity with write access for the operator commands that change bindings.
+The operator process owns the activation journal's writer credential and the runtime exposes reader operations through its activation handle.
 The runtime gates client operations, peer writes, journal mutations, and retained result delivery on the incarnation's grant.
 Transactions with an external custody or erasure effect, funded dispatch, and the existing local catalog's create, erase and checkpoint-transfer operations return an explicit refusal in activation mode.
 Those capabilities require separately commissioned effect fences before they can serve an activated database name.
 
 On installed Multi nodes, `RTDB_ACTIVATION_JOURNAL_URL` selects the independent immutable consensus authority and `RTDB_ACTIVATION_AUTHORITY_ID` identifies it.
 Installed activation requires `multiJournal: {immutableStreams: true}` for the application journal.
-The authority's TLS files come from `RTDB_ACTIVATION_CERTIFICATE_PATH`, `RTDB_ACTIVATION_PRIVATE_KEY_PATH`, and `RTDB_ACTIVATION_CA_PATH`.
+The authority reader TLS files come from `RTDB_ACTIVATION_READER_CERTIFICATE_PATH`, `RTDB_ACTIVATION_READER_PRIVATE_KEY_PATH`, and `RTDB_ACTIVATION_CA_PATH`.
 All replicas of the authority protect its state against rewind and survive failure of the databases they activate.
 
-`rtdb multi-activation` supplies `bootstrap`, `status`, `freeze`, and `publish` operator actions.
+`rtdb multi-activation` supplies `bootstrap`, `status`, `upgrade-grants`, `candidate`, `freeze`, and `publish` operator actions.
+`upgrade-grants` moves an existing binding to elapsed-time grants at the expected incarnation and revision.
+After upgrade, older binaries reject that authority format.
+Publication waits an additional allowance for any outstanding legacy wall-clock grants.
 `freeze` and `publish` compare the expected incarnation and activation revision.
-`publish` independently opens the stopped destination, reads its committed portable restore, and binds the successor to that proof.
-If the predecessor still holds a serving grant, retry with the same operation ID after the grant window closes.
+`candidate` derives the destination incarnation from the active name, its next revision, and the recovery operation ID.
+Restore into that incarnation with `multi-backup restore --immutable-streams --authority-id UUID`.
+`publish` independently opens the stopped destination, verifies its commissioned scope and committed portable restore, and binds the successor to that proof.
+Use the same recovery operation ID for candidate selection and publication.
+If publication is interrupted, retry with the same expected binding and operation ID.
+A retry of the retained committed publication returns its binding even after the destination has started serving.
 A local rehearsal can use an exclusively opened authority file in the same process as its participating runtimes.
 Separate development processes can use a loopback immutable consensus authority through the installed activation environment variables.
+
+On Unix, run the activation broker as a dedicated service account that alone can read the authority writer key.
+Create its socket directory with that account as owner, the operator group as group, and mode `2750`.
+Store the broker configuration in a regular file owned by the service account with mode `0600`.
+The broker also checks the kernel-reported peer UID against `operator_uids`.
+
+```json
+{
+  "authority_id": "dd76afcd-7722-4d6f-8692-dca52bf431d0",
+  "authority_url": "logkeeper-consensus:///etc/rtdb/activation-journal.json",
+  "authority_tls_dir": "/etc/rtdb/activation-writer",
+  "operator_uids": [1100],
+  "destination": {
+    "data": "/var/lib/rtdb/staged",
+    "journal_url": "logkeeper-consensus:///etc/rtdb/destination-journal.json",
+    "journal_tls_dir": "/etc/rtdb/destination-journal"
+  }
+}
+```
+
+```sh
+rtdb multi-activation serve --authority-socket /run/rtdb-activation/authority.sock --broker-config /etc/rtdb/activation-broker.json
+rtdb multi-activation status xtdb --authority-socket /run/rtdb-activation/authority.sock
+```
+
+The broker accepts typed commands and obtains the installation proof from its configured stopped development destination.
+An operator using `--authority-socket` supplies the expected binding and recovery operation ID for publication.
+The broker configuration may omit `destination` when it serves status and lifecycle operations only.
+The service account owns the staged data directory and both TLS directories. Operator accounts cannot modify those directories or their contents.
+Serve the Unix socket on the authority host. The current installation verifier expects a locally mounted stopped Multi development destination and loopback keeper addresses.
 
 ## Batches, placement, funded appends and journal size
 
@@ -153,7 +201,9 @@ Separate development processes can use a loopback immutable consensus authority 
 ## Portable application backups
 
 `rtdb multi-backup export` captures a settled cut from a stopped, initialized development deployment, using its journal and object store to verify the current checkpoint dependencies.
-For an ordinary inline cut, the archive carries the complete checkpoint and retained receipt index under the source key generation.
+An immutable export replays a quorum-confirmed head without acquiring the writer lease.
+Legacy exports and destination installation acquire the writer lease.
+For an ordinary cut, the archive carries the complete checkpoint, retained receipt index, and verified checkpoint files under the source key generation.
 Its authenticated header binds the source incarnation, basis, system time, and journal position.
 The archive contains a wrapped data key. The source generation key remains in its vault.
 
@@ -161,12 +211,19 @@ The archive contains a wrapped data key. The source generation key remains in it
 The source journal, object store, and process can be absent.
 Keep source key custody available independently until a restore is admitted; retired key generations follow their existing deadlines.
 The destination checkpoint records the source coordinates and archive digest so the committed installation can be read back after restart.
+Each captured file is sealed under a fresh destination object identity.
+The committed destination checkpoint retains the source-to-destination file index and the new file identities through subsequent checkpoints.
+Opening the installation proof verifies the index and each relocated file using the destination's custody.
 Recovered ordinary receipts use the new incarnation's basis, and the archive retains the original receipts.
 The commands work with the local development journal and the optional loopback Logkeeper connections configured with `--journal-url` and `--tls-dir`.
 For a version 4 immutable stream, pass `--immutable-streams` to export, restore, and activation publication.
+Pass the commissioning `--authority-id UUID` when exporting a commissioned source or staging a commissioned destination.
+A history created before durable commissioning can become an activated name by restoring a cut into a fresh commissioned incarnation.
+Withdraw access to the uncommissioned predecessor's endpoints before publishing the first commissioned successor.
 
-This archive version supports inline checkpoints with ordinary retained receipts.
-Active pins, external object dependencies, ranked catalogues, protected custody, and scoped or funded receipts require a separate portable transfer.
+Existing inline archives remain readable.
+Archives with files cover ordinary checkpoint attachments within the archive size limit and the current source key generation.
+Active pins, files retained only through pin history, transaction object inventories, ranked catalogues, protected custody, and scoped or funded receipts require a separate portable transfer.
 The export refuses incomplete erasure and key rotation.
 The command stages a destination cut for local rehearsal; a shared database name requires its own activation decision and predecessor fence.
 

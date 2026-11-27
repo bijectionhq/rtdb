@@ -448,8 +448,9 @@ impl MultiDatabase {
             through: transactions.index().head().basis.position(),
             source: Some(CheckpointSource { cut: source_cut, pin: export.pin.id }),
             backup: None,
+            portable_file_index: None,
         };
-        self.install_restored_state(lease, transactions, origin, async || export.check_readable().await).await
+        self.install_restored_state(lease, transactions, origin, Vec::new(), async || export.check_readable().await).await
         }).await
     }
 

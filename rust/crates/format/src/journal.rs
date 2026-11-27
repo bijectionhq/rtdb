@@ -168,6 +168,14 @@ pub enum Record {
         epoch: u64,
         time: i64,
     },
+    /// Establishes the activation scope of a fresh immutable application history.
+    Commissioned,
+}
+
+impl Record {
+    pub fn permits_fresh_restore(&self) -> bool {
+        matches!(self, Self::Commissioned | Self::Lease { .. } | Self::WriterRelease { .. })
+    }
 }
 
 impl Record {

@@ -443,7 +443,7 @@ mod bulk_tests {
     #[test]
     fn metadata_bloom_rejects_aliased_physical_legs() {
         use std::sync::Arc;
-        use arrow_array::{BinaryArray, StringArray, UnionArray};
+        use arrow_array::{Array, BinaryArray, StringArray, UnionArray};
         use arrow_schema::{DataType, UnionFields};
 
         let array = UnionArray::try_new(UnionFields::try_new([0, 1], [

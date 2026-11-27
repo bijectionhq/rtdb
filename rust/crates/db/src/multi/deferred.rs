@@ -16,10 +16,10 @@ use rtdb_store::{ObjectStore, ReservedManifest};
 use rtdb_tx::transact::TransactState;
 use rtdb_types::{Anomaly, Result};
 
-use super::{Lease, MultiDatabase, no_writer, timing};
+use super::{Lease, MultiDatabase, backup::portable_attachment_files, no_writer, timing};
 use crate::{
     journal::Stream,
-    replay::{ClosureInputs, Committed, JournalCoordinates, ReplayBase},
+    replay::{ClosureInputs, Committed, JournalCoordinates},
 };
 use journal_contract::Lsn;
 
@@ -75,6 +75,8 @@ impl CheckpointBuilder {
     pub async fn build(&self, capture: CheckpointCapture) -> Result<PreparedCheckpoint> {
         let mut timing = timing::Phases::start();
         let closure = capture.closure.resolve(&self.stream, self.store.as_ref(), capture.lease.epoch).await?;
+        let files = portable_attachment_files(&self.stream, self.store.as_ref(), capture.coordinates.origin).await?;
+        closure.validate_publication(files.iter().copied())?;
         timing.mark("reachability");
         // Serializing the whole state is the longest step; keep it off the
         // runtime's worker threads.
@@ -85,7 +87,7 @@ impl CheckpointBuilder {
         })
         .await
         .map_err(|error| Anomaly::fault("rtdb/checkpoint-build", error.to_string()))??;
-        let manifest = Manifest { files: Vec::new(), pins: closure.pins().cloned().collect(), payload };
+        let manifest = Manifest { files, pins: closure.pins().cloned().collect(), payload };
         timing.mark("payload");
         let image = capture.slot.seal(self.stream.kms.as_ref(), capture.generation, &manifest).await?;
         timing.mark("seal");
@@ -185,10 +187,10 @@ impl MultiDatabase {
             return Ok(Announcement::Invalidated);
         }
         timing.mark("validate");
-        self.append_control(lease, Record::Checkpoint(checkpoint.clone())).await?;
+        self.append_control(lease, Record::Checkpoint(checkpoint)).await?;
         timing.mark("append");
         let announced = self.state().head;
-        self.trim_to_base(lease, ReplayBase { announced, checkpoint }, prepared.lease.until).await?;
+        self.trim_to_base(lease, announced, prepared.lease.until).await?;
         timing.mark("trim");
         timing.report_phase("deferred_announce", self.options.database, 0, prepared.through);
         Ok(Announcement::Announced(prepared.manifest))

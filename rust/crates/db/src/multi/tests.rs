@@ -905,7 +905,7 @@ async fn portable_backup_restores_a_fresh_stream_without_source_data() {
 }
 
 #[tokio::test]
-async fn portable_backup_refuses_external_objects_and_revoked_keys() {
+async fn portable_backup_refuses_pins_and_revoked_keys() {
     use rtdb_crypt::FileKms;
 
     let vault = tempfile::tempdir().unwrap();
@@ -919,7 +919,8 @@ async fn portable_backup_refuses_external_objects_and_revoked_keys() {
     writer.tick(&live(1)).await.unwrap();
     let archive = writer.portable_backup().await.unwrap().into_bytes();
     let file = writer.write_file(b"external checkpoint dependency").await.unwrap();
-    writer.checkpoint(vec![file]).await.unwrap();
+    let manifest = writer.checkpoint(vec![file]).await.unwrap();
+    writer.pin_checkpoint(manifest, None).await.unwrap();
     assert_eq!(writer.portable_backup().await.err().unwrap().code, "rtdb/backup-dependencies");
     let verified = crate::PortableBackup::verify(&archive, keys.clone()).await.unwrap();
     let destination = Uuid::from_u128(999);
@@ -938,6 +939,81 @@ async fn portable_backup_refuses_external_objects_and_revoked_keys() {
     assert_eq!(successor.stream.head().await.unwrap(), head_before_restore);
     assert_eq!(store.list(None).await.unwrap(), objects_before_restore);
     assert_eq!(successor.installed_backup().await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn portable_backup_relocates_verified_files_without_source_storage() {
+    use rtdb_crypt::FileKms;
+
+    let vaults = tempfile::tempdir().unwrap();
+    let open_vault = |name| {
+        let path = vaults.path().join(name);
+        FileKms::create_directory(&path).unwrap();
+        Arc::new(FileKms::open(&path, || 10).unwrap())
+    };
+    let source_keys = open_vault("source");
+    let target_keys = open_vault("target");
+    let cut = |database, node| MultiOptions { database, node: ip(node), lease_micros: LEASE, drift_micros: DRIFT };
+    let (archive, first, second, receipt) = {
+        let journal = journals().await;
+        let store = Arc::new(MemoryStore::default());
+        let mut source = MultiDatabase::new(cut(DATABASE, 1), Arc::new(journal.handle(NODE_1_IDENTITY)),
+            store.clone(), source_keys.clone(), Arc::new(|| Timestamp(10))).unwrap();
+        source.create().await.unwrap();
+        source.tick(&live(1)).await.unwrap();
+        let receipt = source.transact(&put(1, 1, "retained receipt")).await.unwrap();
+        let first = source.write_file(b"first external body").await.unwrap();
+        let second = source.write_file(b"second external body").await.unwrap();
+        source.checkpoint(vec![second, first]).await.unwrap();
+        let archive = source.portable_backup().await.unwrap().into_bytes();
+
+        let key = ObjectKey::new(first.to_string()).unwrap();
+        store.delete(&key).await.unwrap();
+        assert!(source.portable_backup().await.is_err());
+        store.put(&key, Bytes::from_static(b"substitute ciphertext")).await.unwrap();
+        assert_eq!(source.portable_backup().await.err().unwrap().code, "rtdb.store/object-digest");
+        (archive, first, second, receipt)
+    };
+    let mut changed = archive.clone();
+    *changed.last_mut().unwrap() ^= 1;
+    assert!(crate::PortableBackup::verify(&changed, source_keys.clone()).await.is_err());
+    let verified = crate::PortableBackup::verify(&archive, source_keys.clone()).await.unwrap();
+    assert_eq!(verified.source_receipt(&receipt.key).await.unwrap(), Receipt { replayed: true, ..receipt });
+
+    let target_id = Uuid::from_u128(2);
+    let target_journal = journals().await;
+    let target_store = Arc::new(MemoryStore::default());
+    let open = |node, handle| MultiDatabase::new(cut(target_id, node), Arc::new(target_journal.handle(handle)),
+        target_store.clone(), target_keys.clone(), Arc::new(|| Timestamp(10))).unwrap();
+    let mut target = open(2, NODE_2_IDENTITY).with_deferred_checkpoints(true);
+    target.create().await.unwrap();
+    target.tick(&live(2)).await.unwrap();
+    let installed = target.install_portable_backup(verified).await.unwrap();
+    let files = target.installed_backup_file_relocations().await.unwrap();
+    assert_eq!(files.len(), 2);
+    for (relocation, (source, bytes)) in files.iter().zip([(first, b"first external body".as_slice()), (second, b"second external body".as_slice())]) {
+        assert_eq!(relocation.source_file, source);
+        assert_eq!(relocation.destination_file.database, target_id);
+        let relocated = read_file(target_store.as_ref(), target_keys.as_ref(), relocation.destination_file).await.unwrap();
+        assert_eq!(relocated.bytes.as_slice(), bytes);
+    }
+
+    target.checkpoint(Vec::new()).await.unwrap();
+    target.checkpoint_retained_suffix(1).await.unwrap().unwrap();
+    let before_retry = target_store.list(None).await.unwrap();
+    let retry = crate::PortableBackup::verify(&archive, source_keys.clone()).await.unwrap();
+    assert_eq!(target.install_portable_backup(retry).await.unwrap(), installed);
+    assert_eq!(target_store.list(None).await.unwrap(), before_retry);
+    drop(target);
+    drop(source_keys);
+    std::fs::remove_dir_all(vaults.path().join("source")).unwrap();
+
+    let mut reopened = open(3, NODE_3_IDENTITY);
+    assert_eq!(reopened.installed_backup().await.unwrap(), Some(installed));
+    assert_eq!(reopened.installed_backup_file_relocations().await.unwrap(), files);
+    let missing = ObjectKey::new(files[0].destination_file.to_string()).unwrap();
+    target_store.delete(&missing).await.unwrap();
+    assert!(reopened.installed_backup().await.is_err());
 }
 
 #[tokio::test]
@@ -2487,6 +2563,93 @@ async fn immutable_history_moves_the_rtdb_writer_without_changing_committed_rece
     assert_eq!(reopened.tx_status(&before.key).await.unwrap().basis, receipt.basis);
     assert_eq!(reopened.tx_status(&after.key).await.unwrap().basis, after_receipt.basis);
 
+    keepers.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn portable_backup_reads_an_immutable_cut_without_acquiring_the_writer() {
+    use rtdb_crypt::FileKms;
+    use stream_logkeeper::stream::consensus::{CLUSTER_VERSION_CURRENT, testing::LocalCluster};
+
+    const PRINCIPAL: &str = "urn:logkeeper:client:portable-backup-read-only";
+    let mut keepers = LocalCluster::start_replicated_catalog(&[PRINCIPAL]).await.unwrap();
+    let config = keepers.journal_config(8 << 30, 4 << 20);
+    let journal = Arc::new(keepers.journal(PRINCIPAL, &config).unwrap());
+    journal.client().finalize_version(CLUSTER_VERSION_CURRENT).await.unwrap();
+    let vault = tempfile::tempdir().unwrap();
+    let path = vault.path().join("keys");
+    FileKms::create_directory(&path).unwrap();
+    let keys = Arc::new(FileKms::open(&path, || 10).unwrap());
+    let store = Arc::new(MemoryStore::default());
+    let open = |node| MultiDatabase::new(
+        MultiOptions { database: DATABASE, node: ip(node), lease_micros: LEASE, drift_micros: DRIFT },
+        journal.clone(), store.clone(), keys.clone(), Arc::new(|| Timestamp(10)),
+    ).unwrap().with_immutable_journal();
+    let mut writer = open(1);
+    writer.create().await.unwrap();
+    assert_eq!(writer.tick(&live(1)).await.unwrap(), Role::Writer(Epoch(1)));
+    let request = put(1, 1, "read-only archive");
+    let receipt = writer.transact(&request).await.unwrap();
+    let head = journal.head(writer.journal_stream()).await.unwrap();
+
+    let mut reader = open(2);
+    let bytes = reader.portable_backup().await.unwrap().into_bytes();
+    assert!(reader.writer.is_none());
+    assert_eq!(journal.head(writer.journal_stream()).await.unwrap(), head);
+    let archive = crate::PortableBackup::verify(&bytes, keys.clone()).await.unwrap();
+    assert_eq!(archive.source_lsn(), head);
+    assert_eq!(archive.source_receipt(&request.key).await.unwrap(), Receipt { replayed: true, ..receipt });
+    assert_eq!(writer.transact(&put(2, 2, "still the writer")).await.unwrap().outcome, Outcome::Then);
+    keepers.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn immutable_trim_requires_the_exact_committed_checkpoint() {
+    use stream_logkeeper::stream::consensus::{CLUSTER_VERSION_CURRENT, testing::LocalCluster};
+
+    const PRINCIPAL: &str = "urn:logkeeper:client:checkpoint-trim-rtdb";
+    let mut keepers = LocalCluster::start_replicated_catalog(&[PRINCIPAL]).await.unwrap();
+    let config = keepers.journal_config(8 << 30, 4 << 20);
+    let journal = Arc::new(keepers.journal(PRINCIPAL, &config).unwrap());
+    journal.client().finalize_version(CLUSTER_VERSION_CURRENT).await.unwrap();
+    let cluster = Cluster::new();
+    let mut writer = cluster.node(1, journal.clone()).with_immutable_journal();
+    writer.create().await.unwrap();
+    assert_eq!(writer.tick(&live(1)).await.unwrap(), Role::Writer(Epoch(1)));
+
+    let before_cut = put(1, 1, "before the cut");
+    let before_receipt = writer.transact(&before_cut).await.unwrap();
+    let capture = writer.capture_checkpoint(1).await.unwrap().unwrap();
+    let through = capture.through();
+    let prepared = writer.checkpoint_builder().build(capture).await.unwrap();
+    let after_cut = put(2, 2, "after the cut");
+    let after_receipt = writer.transact(&after_cut).await.unwrap();
+
+    let lease = writer.authority().unwrap();
+    let generation = writer.state().generation;
+    writer.append_control(lease, Record::Checkpoint(Checkpoint {
+        manifest: prepared.manifest(),
+        through: through.0,
+        key_generation: generation,
+        restore: false,
+    })).await.unwrap();
+    let announced = writer.state().head;
+    let base = writer.state().checkpoint_at(announced).unwrap();
+    let mut other_manifest = base.clone();
+    other_manifest.checkpoint.manifest.digest[0] ^= 1;
+    let rejected = writer.stream.certify_checkpoint(&other_manifest, announced).await.err().unwrap();
+    assert_eq!(rejected.code, "rtdb/checkpoint-trim-proof");
+    let rejected = writer.trim_committed_checkpoint(lease, announced, next(through).unwrap()).await.unwrap_err();
+    assert_eq!(rejected.code, "rtdb/checkpoint-trim-proof");
+    let mut reopened = cluster.node(2, journal).with_immutable_journal();
+    let proof = writer.stream.certify_checkpoint(&base, announced).await.unwrap();
+    assert_eq!(reopened.stream.trim(lease.epoch, proof).await, Err(JournalError::Unsupported));
+    assert_eq!(writer.stream.read_through(Lsn(1), announced).await.unwrap().floor, Lsn(1));
+
+    writer.trim_to_base(lease, announced, lease.until).await.unwrap();
+    assert_eq!(writer.state().floor, next(through).unwrap());
+    assert_eq!(reopened.tx_status(&before_cut.key).await.unwrap().basis, before_receipt.basis);
+    assert_eq!(reopened.tx_status(&after_cut.key).await.unwrap().basis, after_receipt.basis);
     keepers.shutdown().await.unwrap();
 }
 

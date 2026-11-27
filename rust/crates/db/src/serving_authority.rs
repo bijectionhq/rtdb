@@ -2,7 +2,6 @@ use std::{fmt, sync::Arc, time::Duration};
 
 use journal_contract::BoxFuture;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
-use tokio::time::Instant;
 
 /// The host commissions a database incarnation against its publishing authority.
 pub trait ServingAuthority: Send + Sync {
@@ -11,39 +10,36 @@ pub trait ServingAuthority: Send + Sync {
 
 #[derive(Clone)]
 pub struct ServingPermit {
-    deadline: Instant,
-    expires_micros: i64,
-    upper_clock_micros: Arc<dyn Fn() -> i64 + Send + Sync>,
+    requested_at: Duration,
+    window: Duration,
+    elapsed_clock: Arc<dyn Fn() -> Option<Duration> + Send + Sync>,
 }
 
 impl ServingPermit {
-    pub fn until(
-        expires_micros: i64,
-        upper_clock_micros: Arc<dyn Fn() -> i64 + Send + Sync>,
+    pub fn bounded(
+        requested_at: Duration,
+        window: Duration,
+        elapsed_clock: Arc<dyn Fn() -> Option<Duration> + Send + Sync>,
     ) -> Result<Self> {
-        let observed = Instant::now();
-        let remaining = expires_micros
-            .checked_sub(upper_clock_micros())
-            .and_then(|remaining| u64::try_from(remaining).ok())
-            .ok_or_else(expired)?;
-        let deadline = observed
-            .checked_add(Duration::from_micros(remaining))
-            .ok_or_else(expired)?;
         let permit = Self {
-            deadline,
-            expires_micros,
-            upper_clock_micros,
+            requested_at,
+            window,
+            elapsed_clock,
         };
         permit.check()?;
         Ok(permit)
     }
 
     pub fn check(&self) -> Result<()> {
-        if Instant::now() < self.deadline && (self.upper_clock_micros)() < self.expires_micros {
-            Ok(())
-        } else {
-            Err(expired())
-        }
+        self.remaining().map(drop)
+    }
+
+    pub fn remaining(&self) -> Result<Duration> {
+        (self.elapsed_clock)()
+            .and_then(|now| now.checked_sub(self.requested_at))
+            .and_then(|elapsed| self.window.checked_sub(elapsed))
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(expired)
     }
 }
 
@@ -51,7 +47,8 @@ impl fmt::Debug for ServingPermit {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ServingPermit")
-            .field("expires_micros", &self.expires_micros)
+            .field("requested_at", &self.requested_at)
+            .field("window", &self.window)
             .finish_non_exhaustive()
     }
 }

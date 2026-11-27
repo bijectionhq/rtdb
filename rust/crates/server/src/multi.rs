@@ -17,7 +17,8 @@ use rtdb_auth::{AuthConfig, Authenticator};
 use rtdb_columnar::MemoryBudget;
 use rtdb_crypt::{FileKms, Generation, Kms};
 use rtdb_db::{
-    DeploymentRetirement, JournalBatchAppender, MultiDatabase, MultiOptions, Role, discover_nodes,
+    ActivationScope, DeploymentRetirement, JournalBatchAppender, MultiDatabase, MultiOptions, Role,
+    discover_nodes,
 };
 use rtdb_format::database::proto::{DatabaseConfig, LocalStorage, database_config::Storage};
 use rtdb_node::{
@@ -186,8 +187,23 @@ impl MultiRuntime {
         stream_journal: Option<DevelopmentStreamJournal>,
         activation: Option<Arc<ActivationAuthority>>,
     ) -> Result<Self> {
+        Self::development_with_access(path, config, memory, expected, stream_journal, activation, None).await
+    }
+
+    async fn development_with_access(
+        path: &Path,
+        config: &mut NodeConfiguration,
+        memory: Arc<MemoryBudget>,
+        expected: Option<Uuid>,
+        stream_journal: Option<DevelopmentStreamJournal>,
+        activation: Option<Arc<ActivationAuthority>>,
+        offline_scope: Option<ActivationScope>,
+    ) -> Result<Self> {
         if expected.is_some_and(|id| id.is_nil()) {
             return Err(invalid("Multi development requires a nonzero incarnation"));
+        }
+        if (activation.is_some() || offline_scope.is_some()) && !config.multi_journal.immutable_streams {
+            return Err(invalid("Activation commissioning requires an immutable consensus journal"));
         }
         fs::create_dir_all(path).map_err(io_error)?;
         let vault = path.join("keys");
@@ -237,6 +253,7 @@ impl MultiRuntime {
             checkpoints: config.multi_checkpoints,
             journal_settings: config.multi_journal,
             activation,
+            offline_scope,
             _journal_lock: writer_lock,
         };
         Self::open(
@@ -366,6 +383,7 @@ impl MultiRuntime {
             checkpoints: config.multi_checkpoints,
             journal_settings: config.multi_journal,
             activation,
+            offline_scope: None,
             _journal_lock: Some(Arc::new(lock)),
         };
         let mut runtime = Self::open(config, memory, databases, backends, follower).await?;
@@ -453,8 +471,7 @@ impl MultiRuntime {
         };
         let database_open = if follower.is_some() { DatabaseOpen::Prepared } else { DatabaseOpen::Startup };
         for (name, id) in initial {
-            let database = open_database(&backends, &kms, id, database_open).await?;
-            let database = backends.bound_database(database, &name, id)?;
+            let database = open_database_for_name(&backends, &kms, id, database_open, Some(&name)).await?;
             serving.insert(
                 name.clone(),
                 serving_driver(database, &name, &memory, peer.as_ref()),
@@ -1381,11 +1398,10 @@ impl MultiRuntime {
             if driver.classic_workload_fence() != fence { return Err(catalog::conflict()); }
             return Ok(Arc::clone(driver));
         }
-        let mut database = open_database(&self.backends, &self.kms, id, DatabaseOpen::Required).await?;
+        let mut database = open_database_for_name(&self.backends, &self.kms, id, DatabaseOpen::Required, Some(name)).await?;
         if database.deployment_retirement().await?.is_none() {
             database.token_authority().issuer().await?;
         }
-        let database = self.backends.bound_database(database, name, id)?;
         let mut databases = self.databases.write().expect("Multi serving catalog");
         let mut inserted = false;
         let driver = databases
@@ -1457,14 +1473,20 @@ struct Backends {
     checkpoints: crate::config::MultiCheckpointSettings,
     journal_settings: crate::config::MultiJournalSettings,
     activation: Option<Arc<ActivationAuthority>>,
+    offline_scope: Option<ActivationScope>,
     _journal_lock: Option<Arc<File>>,
 }
 
 impl Backends {
     fn bound_database(&self, database: MultiDatabase, name: &str, id: Uuid) -> Result<MultiDatabase> {
         match &self.activation {
-            Some(activation) => Ok(database.with_serving_authority(activation.serving_authority(name, id)?)),
-            None => Ok(database),
+            Some(activation) => Ok(database
+                .with_activation_scope(ActivationScope::new(activation.identity(), name)?)?
+                .with_serving_authority(activation.serving_authority(name, id)?)),
+            None => match self.offline_scope {
+                Some(scope) => database.with_activation_scope(scope),
+                None => Ok(database),
+            },
         }
     }
 }
@@ -1509,6 +1531,16 @@ async fn open_database(
     id: Uuid,
     mode: DatabaseOpen,
 ) -> Result<MultiDatabase> {
+    open_database_for_name(backends, kms, id, mode, None).await
+}
+
+async fn open_database_for_name(
+    backends: &Backends,
+    kms: &Arc<dyn Kms>,
+    id: Uuid,
+    mode: DatabaseOpen,
+    application_name: Option<&str>,
+) -> Result<MultiDatabase> {
     let mut database = MultiDatabase::new(
         MultiOptions {
             database: id,
@@ -1534,8 +1566,15 @@ async fn open_database(
     if backends.journal_settings.immutable_streams {
         database = database.with_immutable_journal();
     }
+    if let Some(name) = application_name {
+        database = backends.bound_database(database, name, id)?;
+    }
     match backends.journal.head(StreamId(id.as_u128())).await {
-        Ok(head) if head.0 > 0 => (),
+        Ok(head) if head.0 > 0 => {
+            if application_name.is_some() {
+                database.check_activation_scope(head).await?;
+            }
+        }
         Ok(_) | Err(JournalError::NotFound) if matches!(mode, DatabaseOpen::Prepared) => {
             return Err(follower_unavailable());
         }
@@ -2260,13 +2299,14 @@ mod tests {
             checkpoints: crate::config::MultiCheckpointSettings::default(),
             journal_settings: crate::config::MultiJournalSettings::default(),
             activation: None,
+            offline_scope: None,
             _journal_lock: None,
         };
         let incarnation = Uuid::from_u128(1);
         let stream = StreamId(incarnation.as_u128());
         let missing = backends.journal.head(stream).await;
         assert!(matches!(&missing, Err(JournalError::NotFound)));
-        let result = open_database(&backends, &kms, incarnation, DatabaseOpen::Prepared).await;
+        let result = open_database_for_name(&backends, &kms, incarnation, DatabaseOpen::Prepared, Some("xtdb")).await;
         assert_eq!(result.err().unwrap().code, "rtdb/follower-unavailable");
         assert!(matches!(backends.journal.head(stream).await, Err(JournalError::NotFound)));
         assert!(!backends.vault.join(format!("bootstrap-{incarnation}.lock")).exists());
