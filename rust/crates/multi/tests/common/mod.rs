@@ -234,6 +234,7 @@ impl Cell {
             self.directory.clone(), CellStorage::Local { root: root.join("fork-custody") }, &self.objects,
             Arc::new(rtdb_multi::keys::LocalKeyService::new(root.join("fork-custody-keys")).unwrap()),
             tokio_util::task::TaskTracker::new(),
+            tokio_util::sync::CancellationToken::new(),
         ).unwrap()
     }
 

@@ -7,7 +7,7 @@ use ring::signature::{Ed25519KeyPair, KeyPair};
 use rtdb_types::Result;
 use serde::Deserialize;
 use tokio::sync::oneshot;
-use tokio_util::task::TaskTracker;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use uuid::Uuid;
 
 use crate::replay_broker::{
@@ -84,6 +84,7 @@ impl WorkOwner {
         &self,
         kind: CustodyWork,
         tasks: &TaskTracker,
+        stop: &CancellationToken,
     ) -> Result<Arc<dyn Send + Sync>> {
         let view = self
             .broker
@@ -110,6 +111,7 @@ impl WorkOwner {
         let (send, ready) = oneshot::channel();
         let (lease, drained) = oneshot::channel::<()>();
         let owner = self.clone();
+        let stop = stop.child_token();
         tasks.spawn(async move {
             let admitted = owner
                 .broker
@@ -126,14 +128,14 @@ impl WorkOwner {
             let _ = send.send(admitted.map(|_| Arc::new(lease) as Arc<dyn Send + Sync>));
             let _ = drained.await;
             // A lost admission response can leave a duty in the roster too.
-            owner.join(generation, id, duty).await;
+            owner.join(generation, id, duty, &stop).await;
         });
         ready
             .await
             .map_err(|_| invalid("The custody work admission ended"))?
     }
 
-    async fn join(&self, generation: u64, id: Uuid, duty: Duty) {
+    async fn join(&self, generation: u64, id: Uuid, duty: Duty, stop: &CancellationToken) {
         let observation: [u8; 32] = ring::digest::digest(&ring::digest::SHA256, id.as_bytes())
             .as_ref()
             .try_into()
@@ -147,7 +149,7 @@ impl WorkOwner {
             signature: self.process.sign(&statement).as_ref().to_vec(),
         };
         let join = &join;
-        crate::hold_release::release_hold(format!("custody work {id} join in generation {generation}"), move || async move {
+        crate::hold_release::release_hold(format!("custody work {id} join in generation {generation}"), stop, move || async move {
             self.broker.custody_domain(self.domain, Action::Join { generation, id, join: join.clone() }).await.map(drop)
         }).await;
     }

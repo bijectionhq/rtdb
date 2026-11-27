@@ -226,6 +226,7 @@ pub async fn serve_standalone_with_sync(
     let journal_task = tokio::spawn(journal.serve_local(listener, journal_stop.clone()));
     let lease_task = tokio::spawn(Arc::clone(&lease).run(journal_stop.clone()));
     let broker_tasks = TaskTracker::new();
+    let broker_release_stop = CancellationToken::new();
     let outcome = async {
         let storage = CellStorage::Local {
             root: settings.root.join(OBJECTS),
@@ -237,7 +238,7 @@ pub async fn serve_standalone_with_sync(
         let mut agent = AgentOptions::new(storage.clone());
         agent.replay_broker = Some(crate::replay_broker::Client::standalone(
             Arc::clone(&directory), CellStorage::Local { root: payload_root }, &storage,
-            Arc::new(LocalKeyService::new(key_root)?), broker_tasks.clone(),
+            Arc::new(LocalKeyService::new(key_root)?), broker_tasks.clone(), broker_release_stop.child_token(),
         )?);
         let mut node = start_node(
             Arc::clone(&directory),
@@ -315,7 +316,11 @@ pub async fn serve_standalone_with_sync(
     };
     journal_stop.cancel();
     broker_tasks.close();
-    broker_tasks.wait().await;
+    if tokio::time::timeout(Duration::from_secs(10), broker_tasks.wait()).await.is_err() {
+        broker_release_stop.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(1), broker_tasks.wait()).await;
+    }
+    broker_release_stop.cancel();
     let _ = lease_task.await;
     result.and(lease.retire().await)
 }

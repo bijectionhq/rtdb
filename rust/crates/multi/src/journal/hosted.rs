@@ -444,7 +444,7 @@ fn worker_endpoints(peers: Vec<WorkerEndpoint>) -> Result<BTreeMap<Enrollment, W
 impl Placement {
     pub(crate) async fn enroll_installed_fork(
         &self, child: &Self, broker: &crate::replay_broker::Client, keys: &Arc<dyn KeyService>,
-        memory: &Arc<MemoryBudget>, tasks: &TaskTracker,
+        memory: &Arc<MemoryBudget>, tasks: &TaskTracker, stop: &CancellationToken,
     ) -> Result<()> {
         let unavailable = || invalid("The installed fork needs both original provider authorities and custody signers");
         let parent_owner = self.custody_work.as_ref().ok_or_else(unavailable)?;
@@ -463,8 +463,8 @@ impl Placement {
         {
             return Err(invalid("The installed child does not name its enrolled parent"));
         }
-        let _parent_work = parent_owner.hold(erasure::CustodyWork::Copy, tasks).await?;
-        let _child_work = child_owner.hold(erasure::CustodyWork::Copy, tasks).await?;
+        let _parent_work = parent_owner.hold(erasure::CustodyWork::Copy, tasks, stop).await?;
+        let _child_work = child_owner.hold(erasure::CustodyWork::Copy, tasks, stop).await?;
         let parent_route = parent_custodian.route().await?;
         let child_route = child_custodian.route().await?;
         let parent_cut = parent_route.checkpoint;
@@ -732,17 +732,17 @@ impl Placement {
         Ok(Some(staged.checkpoint))
     }
 
-    pub(crate) async fn hold_worker_custody(&self, tasks: &TaskTracker) -> Result<Option<Arc<dyn Send + Sync>>> {
+    pub(crate) async fn hold_worker_custody(&self, tasks: &TaskTracker, stop: &CancellationToken) -> Result<Option<Arc<dyn Send + Sync>>> {
         match &self.custody_work {
-            Some(owner) => owner.hold(erasure::CustodyWork::Plaintext, tasks).await.map(Some),
+            Some(owner) => owner.hold(erasure::CustodyWork::Plaintext, tasks, stop).await.map(Some),
             None => Ok(None),
         }
     }
 
-    async fn hold_query_custody(&self, tasks: &TaskTracker) -> Result<Option<Arc<dyn Send + Sync>>> {
+    async fn hold_query_custody(&self, tasks: &TaskTracker, stop: &CancellationToken) -> Result<Option<Arc<dyn Send + Sync>>> {
         let Some(owner) = &self.custody_work else { return Ok(None); };
-        let plaintext = owner.hold(erasure::CustodyWork::Plaintext, tasks).await?;
-        let egress = owner.hold(erasure::CustodyWork::Egress, tasks).await?;
+        let plaintext = owner.hold(erasure::CustodyWork::Plaintext, tasks, stop).await?;
+        let egress = owner.hold(erasure::CustodyWork::Egress, tasks, stop).await?;
         Ok(Some(Arc::new((plaintext, egress))))
     }
 
@@ -753,6 +753,7 @@ impl Placement {
         serving: &crate::deployment::CellStorage,
         memory: &Arc<MemoryBudget>,
         releases: &TaskTracker,
+        release_stop: &CancellationToken,
     ) -> Result<Option<RtdbCheckpoint>> {
         let mut inspected = self.publication.lock().await;
         let custodian = self
@@ -842,7 +843,7 @@ impl Placement {
                         Arc::clone(&io),
                     )
                     .await?;
-                    let Some(candidate) = self.checkpoint_copy(published, releases, discovery::discover(
+                    let Some(candidate) = self.checkpoint_copy(published, releases, release_stop, discovery::discover(
                         self, custodian, &provider, cut, &objects, (keys.as_ref(), &io), memory,
                     )).await?
                     else {
@@ -852,7 +853,7 @@ impl Placement {
                     candidate
                 }
             };
-            let staged = self.checkpoint_copy(origin.base, releases, async {
+            let staged = self.checkpoint_copy(origin.base, releases, release_stop, async {
                 if current.preparing.is_none() {
                     let source =
                         storage::reopen_source(self, serving, &provider, Arc::clone(keys), &io, origin)
@@ -902,6 +903,7 @@ impl Placement {
         &self,
         checkpoint: Checkpoint,
         releases: &TaskTracker,
+        release_stop: &CancellationToken,
         work: impl std::future::Future<Output = Result<T>>,
     ) -> Result<T> {
         let route = self.worker.route().await?;
@@ -910,12 +912,12 @@ impl Placement {
             from: checkpoint.cut.next_lsn,
             through: checkpoint.cut.next_lsn,
         })?;
-        let held = Held::acquire(&self.worker, request, releases).await?;
+        let held = Held::acquire(&self.worker, request, releases, release_stop).await?;
         if held.scope().checkpoint != checkpoint {
             return Err(invalid("The ordered copy hold selected a different checkpoint"));
         }
         let custody = match &self.custody_work {
-            Some(custody) => Some(custody.hold(erasure::CustodyWork::Copy, releases).await?),
+            Some(custody) => Some(custody.hold(erasure::CustodyWork::Copy, releases, release_stop).await?),
             None => None,
         };
         let mut work = std::pin::pin!(IoRegion::retaining(Arc::new((Arc::clone(&held), custody)), work));
@@ -1085,12 +1087,12 @@ impl Placement {
         prefix_retirement::retire_with_sync(self, storage, keys, apple_sync).await
     }
 
-    async fn pin_root(&self, source: Hold, tasks: &TaskTracker) -> Result<Arc<Held>> {
+    async fn pin_root(&self, source: Hold, tasks: &TaskTracker, stop: &CancellationToken) -> Result<Arc<Held>> {
         let route = self.worker.route().await?;
         let request = self
             .worker
             .request(&route, Command::ProtectRoot { source })?;
-        Held::acquire(&self.worker, request, tasks).await
+        Held::acquire(&self.worker, request, tasks, stop).await
     }
     pub async fn nominate(&self, route: &Route) -> Result<WriterAdmission> {
         let mut pending = self.nomination.lock().await;
@@ -1164,13 +1166,13 @@ impl Placement {
     }
 
     pub(crate) async fn reader_configuration(
-        &self, route: &Route, keys: &Arc<dyn KeyService>, tasks: &TaskTracker,
+        &self, route: &Route, keys: &Arc<dyn KeyService>, tasks: &TaskTracker, stop: &CancellationToken,
     ) -> Result<(DatabaseConfig, Arc<Held>)> {
         let request = self.worker.request(route, Command::ProtectRange {
             from: route.checkpoint.cut.next_lsn,
             through: route.head.next_lsn,
         })?;
-        let recovery = Held::acquire(&self.worker, request, tasks).await?;
+        let recovery = Held::acquire(&self.worker, request, tasks, stop).await?;
         let hold = recovery.scope();
         if hold.checkpoint != route.checkpoint || hold.start != route.checkpoint.cut || hold.through != route.head {
             return Err(invalid("The requested cold reader basis changed"));
@@ -1223,6 +1225,7 @@ pub(crate) struct Logs {
     pub routes: Arc<Routes>,
     pub keys: Arc<dyn crate::keys::KeyService>,
     pub releases: TaskTracker,
+    pub release_stop: CancellationToken,
 }
 
 #[async_trait]
@@ -1234,14 +1237,14 @@ impl LogFactory for Logs {
         cancellation: CancellationToken,
     ) -> Result<OpenedLogs> {
         let (placement, attachment) = self.routes.resolve(configuration)?;
-        let custody = placement.hold_worker_custody(&self.releases).await?;
+        let custody = placement.hold_worker_custody(&self.releases, &self.release_stop).await?;
         let material = material(self.keys.as_ref(), &placement.record).await?;
         let max_frame = crate::process::MAXIMUM_LOG_MESSAGE_BYTES;
         let admission = match attachment.admission {
             AttachmentAdmission::Writer { admission } if access == LogAccess::ReadWrite => admission,
             AttachmentAdmission::Reader { epoch, hold, .. } if access == LogAccess::ReadOnly => {
                 let replica = JournalLog::open_reader(Arc::clone(&placement.worker), Arc::clone(&self.keys),
-                    epoch, placement.retained_reader(hold)?, max_frame, self.releases.clone(), custody).await?;
+                    epoch, placement.retained_reader(hold)?, max_frame, self.releases.clone(), self.release_stop.child_token(), custody).await?;
                 return crate::logs::ordered_reader_opened(replica, &material, &placement.record, epoch,
                     attachment.base.checkpoint, max_frame);
             }
@@ -1255,10 +1258,12 @@ impl LogFactory for Logs {
                 Arc::clone(&placement.worker),
                 admission.recovery,
                 &self.releases,
+                &self.release_stop,
             ),
             max_frame,
             placement.journal_window_bytes,
             self.releases.clone(),
+            self.release_stop.child_token(),
             custody,
         )
         .await?;

@@ -22,7 +22,7 @@ use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectObservation, ObjectStore, R
 use rtdb_types::{Anomaly, BlockIndex, CatalogCut, PhysicalObjectVersion, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
-use tokio_util::task::TaskTracker;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use uuid::Uuid;
 
 use crate::cipher::{Cipher, object};
@@ -103,6 +103,7 @@ pub struct CellStoreFactory {
     pub(crate) hosted_task: Option<HostedTask>,
     pub(crate) audience_source: Option<Uuid>,
     pub(crate) storage_regions: TaskTracker,
+    pub(crate) release_stop: CancellationToken,
     pub(crate) scoped_writes: Option<Arc<ScopedCellWrites>>,
     pub(crate) local_witnesses: Option<Arc<LocalWitnessPool>>,
     pub(crate) replay_broker: Option<crate::replay_broker::Client>,
@@ -294,10 +295,11 @@ impl RemoteStorageFactory for CellStoreFactory {
             });
             check_root(root.as_ref(), &config.deployment, config.writer_epoch.is_some()).await?;
             let pages = HostedIndexPages::new(
-                self.directory.clone(), config.deployment, store.clone(), owner, config.writer_epoch, self.storage_regions.clone(),
+                self.directory.clone(), config.deployment, store.clone(), owner, config.writer_epoch,
+                self.storage_regions.clone(), self.release_stop.child_token(),
             );
             let custody = ReferenceReads::new(
-                self.directory.clone(), self.keys.clone(), self.storage_regions.clone(), &record,
+                self.directory.clone(), self.keys.clone(), self.storage_regions.clone(), self.release_stop.child_token(), &record,
                 storage_root.as_str(), self.storage_namespaces,
                 if matches!(config.storage, CellStorage::Local { .. }) { ReplayCustody::Local }
                 else { ReplayCustody::Hosted { owner: self.hosted_task.clone() } },
@@ -481,6 +483,7 @@ impl CellStoreFactory {
         let keys = self.keys.clone();
         let config = config.clone();
         let hosted_task = self.hosted_task.clone();
+        let release_stop = self.release_stop.child_token();
         let local = matches!(config.storage, CellStorage::Local { .. });
         let prepared = self.local_witnesses.as_ref().filter(|_| local).and_then(|pool| pool.take(&self.storage_regions));
         let id = prepared.as_ref().map_or_else(Uuid::new_v4, |(id, _)| *id);
@@ -544,7 +547,7 @@ impl CellStoreFactory {
                     _ = &mut dropped => {}
                     _ = read => {
                         let (directory, deployment) = (&directory, &config.deployment);
-                        let startup = release_hold(format!("checkpoint startup of storage region {id} in {deployment}"), move || async move {
+                        let startup = release_hold(format!("checkpoint startup of storage region {id} in {deployment}"), &release_stop, move || async move {
                             crate::admin::update_installation(directory.as_ref(), deployment, |record| {
                                 if let Some(region) = record.storage_regions.get_mut(&id) {
                                     region.release_checkpoint_startup();
@@ -565,7 +568,7 @@ impl CellStoreFactory {
             // replace even if absent to fence that attempt's old version.
             let released = if opened || uncertain {
                 let (directory, deployment) = (&directory, &config.deployment);
-                release_hold(format!("storage region {id} in {deployment}"), move || release_region(directory.as_ref(), deployment, id, uncertain)).await
+                release_hold(format!("storage region {id} in {deployment}"), &release_stop, move || release_region(directory.as_ref(), deployment, id, uncertain)).await
                     .is_released()
             } else { true };
             // An unreleased region keeps its witness, unlocked, for `reconcile_storage_regions`.
@@ -2876,6 +2879,7 @@ mod tests {
         let record = directory.create_deployment(DeploymentRecord::new("shop", "acme", Vec::new(), 0)).await.unwrap();
         let factory = CellStoreFactory {
             directory: directory.clone(), keys, storage_namespaces, storage_regions: TaskTracker::new(),
+            release_stop: CancellationToken::new(),
             scoped_writes: None, hosted_task: None, local_witnesses: None, replay_broker: None, audience_source: None,
             apple_sync: rtdb_storage::AppleSync::Full,
         };
@@ -2903,7 +2907,7 @@ mod tests {
         deleting.lifecycle = Lifecycle::Deleting;
         let deleting = directory.create_deployment(deleting).await.unwrap();
         let config = CellStoreConfig { storage, prefix: deleting.storage_prefix(), deployment: deleting.id, writer_epoch: None, compactor: false, snapshot_block: None };
-        let factory = CellStoreFactory { directory, keys, storage_namespaces, storage_regions: TaskTracker::new(), scoped_writes: None, hosted_task: None, local_witnesses: None, replay_broker: None, audience_source: None, apple_sync: rtdb_storage::AppleSync::Full };
+        let factory = CellStoreFactory { directory, keys, storage_namespaces, storage_regions: TaskTracker::new(), release_stop: CancellationToken::new(), scoped_writes: None, hosted_task: None, local_witnesses: None, replay_broker: None, audience_source: None, apple_sync: rtdb_storage::AppleSync::Full };
         let config = Any { type_url: CELL_STORAGE_TYPE.into(), value: serde_json::to_vec(&config).unwrap() };
         let result = factory.open(&config, &key("v06"), IoRegion::new()).await;
         assert!(matches!(result, Err(error) if error.code == rtdb_node::NOT_HELD));
@@ -2920,7 +2924,7 @@ mod tests {
         let storage_namespaces = crate::deployment::storage_namespaces(bucket.as_ref(), keys.as_ref()).await.unwrap();
         let factory = CellStoreFactory {
             directory: directory.clone(), keys: keys.clone(), storage_namespaces,
-            storage_regions: TaskTracker::new(), scoped_writes: None, hosted_task: None, local_witnesses: None, replay_broker: None, audience_source: None,
+            storage_regions: TaskTracker::new(), release_stop: CancellationToken::new(), scoped_writes: None, hosted_task: None, local_witnesses: None, replay_broker: None, audience_source: None,
             apple_sync: rtdb_storage::AppleSync::Full,
         };
         let mut record = DeploymentRecord::new("shop", "acme", Vec::new(), 0);
@@ -2966,6 +2970,7 @@ mod tests {
         let record = directory.create_deployment(record).await.unwrap();
         let factory = CellStoreFactory {
             directory, keys: keys.clone(), storage_namespaces, storage_regions: TaskTracker::new(),
+            release_stop: CancellationToken::new(),
             scoped_writes: None, hosted_task: None, local_witnesses: None, replay_broker: None,
             audience_source: Some(Uuid::parse_str(&record.id).unwrap()),
             apple_sync: rtdb_storage::AppleSync::Full,
@@ -3306,6 +3311,7 @@ mod tests {
             directory: directory.clone(),
             keys: keys.clone(),
             storage_regions: TaskTracker::new(),
+            release_stop: CancellationToken::new(),
             local_witnesses: None, replay_broker: None, audience_source: None,
             storage_namespaces,
             scoped_writes: None,
@@ -3697,7 +3703,7 @@ mod tests {
         let tasks = TaskTracker::new();
         let storage_factory = CellStoreFactory {
             directory: directory.clone(), keys, storage_namespaces, hosted_task: None,
-            storage_regions: tasks.clone(), scoped_writes: None, local_witnesses: None, replay_broker: None, audience_source: None,
+            storage_regions: tasks.clone(), release_stop: CancellationToken::new(), scoped_writes: None, local_witnesses: None, replay_broker: None, audience_source: None,
             apple_sync: rtdb_storage::AppleSync::Full,
         };
         let configuration = |snapshot_block| Any { type_url: String::new(), value: serde_json::to_vec(&CellStoreConfig {
@@ -3800,7 +3806,7 @@ mod tests {
         let local = Arc::new(crate::reference::PrefixedStore::new(bucket.clone(), &child_store));
         let files = tempfile::tempdir().unwrap();
         let keys = Arc::new(crate::keys::LocalKeyService::new(files.path().join("keys")).unwrap());
-        let custody = ReferenceReads::new(rtdb_directory::MemoryDirectory::new(), keys, TaskTracker::new(), &child,
+        let custody = ReferenceReads::new(rtdb_directory::MemoryDirectory::new(), keys, TaskTracker::new(), CancellationToken::new(), &child,
             "v06", rtdb_directory::StorageNamespaces { objects: Uuid::new_v4(), keys: [0; 32] }, ReplayCustody::Local);
         let (_, audience_reads) = open_cell_store(bucket, &child_store, local, &child, wall_clock(), None, custody).await.unwrap();
         assert!(!audience_reads);
@@ -3825,7 +3831,7 @@ mod tests {
         let local = Arc::new(crate::reference::PrefixedStore::new(Arc::clone(&bucket), &store));
         let files = tempfile::tempdir().unwrap();
         let keys = Arc::new(crate::keys::LocalKeyService::new(files.path().join("keys")).unwrap());
-        let custody = ReferenceReads::new(rtdb_directory::MemoryDirectory::new(), keys, TaskTracker::new(), &record,
+        let custody = ReferenceReads::new(rtdb_directory::MemoryDirectory::new(), keys, TaskTracker::new(), CancellationToken::new(), &record,
             "v06", rtdb_directory::StorageNamespaces { objects: Uuid::new_v4(), keys: [0; 32] }, ReplayCustody::Local);
         let (cold, audience_reads) = open_cell_store(bucket, &store, local, &record, wall_clock(), None, custody).await.unwrap();
         assert!(audience_reads, "the cold checkpoint uses its own immutable storage");

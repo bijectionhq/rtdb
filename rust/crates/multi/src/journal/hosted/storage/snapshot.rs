@@ -5,6 +5,7 @@ pub(super) struct Source {
     pub(super) keys: Arc<dyn KeyService>,
     pub(super) io: Arc<IoRegion>,
     pub(super) tasks: tokio_util::task::TaskTracker,
+    pub(super) release_stop: tokio_util::sync::CancellationToken,
     pub(super) ordered_index_arrow_only: bool,
 }
 
@@ -12,7 +13,7 @@ impl Source {
     pub(super) async fn retain(
         &self, cut: rtdb_types::CatalogCut, base: rtdb_types::CatalogCheckpoint,
     ) -> Result<Arc<dyn Send + Sync>> {
-        let custody = self.placement.hold_query_custody(&self.tasks).await?;
+        let custody = self.placement.hold_query_custody(&self.tasks, &self.release_stop).await?;
         let journal = &self.placement.worker;
         let epoch = journal.log_epoch();
         let genesis = ReplicaPosition::from_epoch_offset(epoch, -1)?;
@@ -29,7 +30,7 @@ impl Source {
         let route = journal.route().await?;
         if from < route.erasure_floor { return Err(Error::ErasedUnderView.into()); }
         let request = journal.request(&route, crate::journal::owned_read::protect_snapshot(base.root, from, through))?;
-        let held = crate::journal::Held::acquire(journal, request, &self.tasks).await?;
+        let held = crate::journal::Held::acquire(journal, request, &self.tasks, &self.release_stop).await?;
         let scope = held.scope();
         if scope.checkpoint.root != base.root || scope.checkpoint.cut != scope.start
             || scope.start.next_lsn != from || scope.through.next_lsn != through
@@ -66,6 +67,7 @@ impl Source {
         Ok(Arc::new(SnapshotStore {
             checkpoint, objects, files, scope, allocation,
             placement: Arc::clone(&self.placement), tasks: self.tasks.clone(),
+            release_stop: self.release_stop.child_token(),
             ordered_index_arrow_only: self.ordered_index_arrow_only,
         }))
     }
@@ -80,6 +82,7 @@ struct SnapshotStore {
     allocation: Arc<dyn ObjectStore>,
     placement: Arc<super::super::Placement>,
     tasks: tokio_util::task::TaskTracker,
+    release_stop: tokio_util::sync::CancellationToken,
     ordered_index_arrow_only: bool,
 }
 
@@ -128,7 +131,7 @@ impl ObjectStore for SnapshotStore {
     /// An exact snapshot's files and its erasure custody, kept for the read.
     async fn admit_catalog(&self, _cut: Option<rtdb_types::CatalogCut>, _checkpoint: Option<rtdb_types::CatalogCheckpoint>)
         -> Result<Option<Arc<dyn Send + Sync>>> {
-        let custody = self.placement.hold_query_custody(&self.tasks).await?;
+        let custody = self.placement.hold_query_custody(&self.tasks, &self.release_stop).await?;
         self.scope.serving().await?;
         Ok(Some(Arc::new((Arc::clone(&self.files), custody))))
     }

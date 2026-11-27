@@ -68,6 +68,7 @@ pub struct RunningNode {
     cancellation: CancellationToken,
     lease_cancellation: CancellationToken,
     storage_regions: TaskTracker,
+    release_cancellation: CancellationToken,
     tasks: JoinSet<Result<()>>,
     // Dropping the JoinSet aborts the async tasks but cannot abort the receiver clock's blocking thread, which would then hold the caller's runtime shutdown forever.
     _stop_clock_on_drop: DropGuard,
@@ -135,10 +136,11 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     let options = settings.configuration.node_options(settings.allocation_limit_bytes)?;
     let memory = MemoryBudget::new(options.execution_memory_bytes);
     let writers: crate::logs::Writers = Default::default();
-    let fence = Arc::new(FenceSlot { agent: Default::default(), hosted_task: settings.hosted_task.clone() });
+    let storage_regions = TaskTracker::new();
+    let release_cancellation = CancellationToken::new();
+    let fence = Arc::new(FenceSlot { agent: Default::default(), hosted_task: settings.hosted_task.clone(), release_stop: release_cancellation.child_token() });
     let cache_bytes = settings.configuration.disk_cache.as_ref().and_then(|cache| cache.maximum_bytes).unwrap_or(u64::MAX);
     let fragmenter = crate::fragments::CellFragmenter::new(Arc::clone(&directory), storage_namespaces.objects, &settings.agent.fragments, cache_bytes, settings.capabilities.clone());
-    let storage_regions = TaskTracker::new();
     let local_witnesses = matches!(&settings.agent.storage, crate::deployment::CellStorage::Local { .. })
         .then(|| crate::store::LocalWitnessPool::new(Arc::clone(&settings.keys), &storage_regions));
     let holds = Arc::new(crate::recovery_holds::RecoveryHolds {
@@ -148,6 +150,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
         custody: if local_witnesses.is_some() { rtdb_directory::ReplayCustody::Local }
             else { rtdb_directory::ReplayCustody::Hosted { owner: settings.hosted_task.clone() } },
         tasks: storage_regions.clone(),
+        stop: release_cancellation.child_token(),
     });
     let owned_archive = crate::archive::WorldArchive {
         directory: Arc::clone(&directory),
@@ -179,6 +182,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
         hosted_task: settings.hosted_task,
         audience_source: audience.map(|(_, profile)| profile.source()),
         storage_regions: storage_regions.clone(),
+        release_stop: release_cancellation.child_token(),
         local_witnesses,
         replay_broker: settings.agent.replay_broker.clone(),
         apple_sync,
@@ -192,6 +196,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
             (LOGKEEPER_LOG_TYPE.into(), LogkeeperLogFactory::new(MAXIMUM_LOG_MESSAGE_BYTES, Arc::clone(&writers), holds)),
             (crate::journal::hosted::LOG_TYPE.into(), Arc::new(crate::journal::hosted::Logs {
                 routes: Arc::clone(&ordered), keys: Arc::clone(&settings.keys), releases: storage_regions.clone(),
+                release_stop: release_cancellation.child_token(),
             })),
         ],
         storage_factories: vec![
@@ -199,7 +204,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
             (crate::journal::hosted::STORE_TYPE.into(), Arc::new(crate::journal::hosted::StoreFactory {
                 routes: Arc::clone(&ordered), storage: settings.agent.storage.clone(),
                 keys: Arc::clone(&settings.keys), scoped_writes: scoped_writes.clone(),
-                releases: storage_regions.clone(), apple_sync,
+                releases: storage_regions.clone(), apple_sync, release_stop: release_cancellation.child_token(),
             })),
         ],
         claim_wait: settings.claim_wait,
@@ -235,7 +240,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     }, settings.lease).await?;
     if let Some(writes) = scoped_writes { writes.set_member(lease.id()); }
     fragmenter.set_member(lease.id());
-    let agent = NodeAgent::new(directory, Arc::clone(&settings.keys), server.node().clone(), Arc::clone(&lease), pgwire_endpoint, flight_endpoint, settings.agent, storage_namespaces, writers, ordered, storage_regions.clone(), settings.capabilities.clone());
+    let agent = NodeAgent::new(directory, Arc::clone(&settings.keys), server.node().clone(), Arc::clone(&lease), pgwire_endpoint, flight_endpoint, settings.agent, storage_namespaces, writers, ordered, storage_regions.clone(), release_cancellation.child_token(), settings.capabilities.clone());
     let _ = fence.agent.set(Arc::downgrade(&agent));
     let cancellation = CancellationToken::new();
     let lease_cancellation = CancellationToken::new();
@@ -256,7 +261,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
         cancellation.clone(), pgwire_address, relay_limit, pgwire.watch_status(),
     ));
     let _stop_clock_on_drop = lease_cancellation.clone().drop_guard();
-    Ok(RunningNode { server, agent, fragmenter, lease, control_address, pgwire_address, cancellation, lease_cancellation, storage_regions, tasks, _stop_clock_on_drop })
+    Ok(RunningNode { server, agent, fragmenter, lease, control_address, pgwire_address, cancellation, lease_cancellation, storage_regions, release_cancellation, tasks, _stop_clock_on_drop })
 }
 
 impl RunningNode {
@@ -293,12 +298,15 @@ impl RunningNode {
         self.agent.drop_subscriptions();
         self.storage_regions.close();
         if tokio::time::timeout(Duration::from_secs(10), self.storage_regions.wait()).await.is_err() {
+            self.release_cancellation.cancel();
+            let _ = tokio::time::timeout(Duration::from_secs(1), self.storage_regions.wait()).await;
             failure.get_or_insert_with(|| Anomaly::new(
                 AnomalyCategory::Unavailable,
                 "rtdb.multi/storage-release-pending",
                 "The directory has not confirmed all serving storage region releases",
             ));
         }
+        self.release_cancellation.cancel();
         failure.map_or(Ok(()), Err)
     }
 }
@@ -307,6 +315,7 @@ impl RunningNode {
 struct FenceSlot {
     agent: std::sync::OnceLock<std::sync::Weak<NodeAgent>>,
     hosted_task: Option<rtdb_directory::HostedTask>,
+    release_stop: CancellationToken,
 }
 
 #[async_trait::async_trait]
@@ -370,7 +379,7 @@ impl rtdb_node::ReadFence for FenceSlot {
         // The write may have committed after losing its reply. Fence the
         // claim and its predecessor before returning the local permit.
         let claim = &claim;
-        crate::hold_release::release_hold(format!("audience seat {index}"), move || claim.release()).await;
+        crate::hold_release::release_hold(format!("audience seat {index}"), &self.release_stop, move || claim.release()).await;
     }
 }
 

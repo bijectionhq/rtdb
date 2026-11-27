@@ -174,9 +174,10 @@ impl Client {
     }
 
     pub fn standalone(
-        directory: Arc<dyn Directory>, storage: CellStorage, serving: &CellStorage, keys: Arc<dyn KeyService>, tasks: TaskTracker,
+        directory: Arc<dyn Directory>, storage: CellStorage, serving: &CellStorage, keys: Arc<dyn KeyService>,
+        tasks: TaskTracker, stop: CancellationToken,
     ) -> Result<Self> {
-        let service = Service::open(directory, storage, serving, keys, None, None, None, None)?;
+        let service = Service::open(directory, storage, serving, keys, None, None, None, None, stop)?;
         Ok(Self(Arc::new(ClientRoute::Standalone { service, tasks })))
     }
 
@@ -439,6 +440,7 @@ pub struct Service {
     custody_token: Option<Token>,
     custody: ReplayCustody,
     memory: Arc<MemoryBudget>,
+    release_stop: CancellationToken,
 }
 
 struct BrokerDuty {
@@ -463,12 +465,14 @@ impl Service {
             return Err(Anomaly::incorrect("rtdb.multi/replay-broker-credential", "Transfer, erasure custody and replay require distinct credentials"));
         }
         Self::open(directory, storage, serving, keys, Some(Token::new(&ordinary)?),
-            transfer.as_deref().map(Token::new).transpose()?, custody.as_deref().map(Token::new).transpose()?, task)
+            transfer.as_deref().map(Token::new).transpose()?, custody.as_deref().map(Token::new).transpose()?, task,
+            CancellationToken::new())
     }
 
     fn open(
         directory: Arc<dyn Directory>, storage: CellStorage, serving: &CellStorage, keys: Arc<dyn KeyService>,
         token: Option<Token>, transfer_token: Option<Token>, custody_token: Option<Token>, task: Option<rtdb_directory::HostedTask>,
+        release_stop: CancellationToken,
     ) -> Result<Arc<Self>> {
         let shares_media = match (&storage, serving) {
             (CellStorage::S3 { config: payload }, CellStorage::S3 { config: serving }) => payload.bucket == serving.bucket,
@@ -488,6 +492,7 @@ impl Service {
         Ok(Arc::new(Self {
             directory, storage, namespace, keys, custody, token, transfer_token, custody_token,
             memory: MemoryBudget::new(rtdb_node::NodeOptions::default().execution_memory_bytes),
+            release_stop,
         }))
     }
 
@@ -530,7 +535,14 @@ impl Service {
                 }
             });
         };
-        while connections.join_next().await.is_some() {}
+        let drain = tokio::time::timeout(Duration::from_secs(10), async {
+            while connections.join_next().await.is_some() {}
+        }).await;
+        if drain.is_err() {
+            self.release_stop.cancel();
+            while connections.join_next().await.is_some() {}
+        }
+        self.release_stop.cancel();
         result
     }
 
@@ -1090,12 +1102,14 @@ impl Service {
             io.close_and_wait().await;
             read
         }.await;
-        if attempted {
-            self.release(history, region).await;
-        }
+        let released = if attempted {
+            self.release(history, region).await
+        } else { true };
         if local.is_some() {
             drop(local);
-            self.keys.forget_local_storage_region(region)?;
+            if released {
+                self.keys.forget_local_storage_region(region)?;
+            }
         }
         result
     }
@@ -1184,12 +1198,14 @@ impl Service {
             }
             Ok(version)
         }.await;
-        if attempted {
-            self.release(history, region).await;
-        }
+        let released = if attempted {
+            self.release(history, region).await
+        } else { true };
         if local.is_some() {
             drop(local);
-            self.keys.forget_local_storage_region(region)?;
+            if released {
+                self.keys.forget_local_storage_region(region)?;
+            }
         }
         result
     }
@@ -1287,10 +1303,10 @@ impl Service {
         Ok(EncryptingStore::with_units(files, Arc::new(ledger)))
     }
 
-    async fn release(&self, history: History, region: Uuid) {
+    async fn release(&self, history: History, region: Uuid) -> bool {
         let deployment = history.deployment.to_string();
         let (directory, installation) = (&self.directory, deployment.as_str());
-        let settled = crate::hold_release::release_hold(format!("broker read region {region} for {deployment}"),
+        let settled = crate::hold_release::release_hold(format!("broker read region {region} for {deployment}"), &self.release_stop,
             move || crate::store::release_region(directory.as_ref(), installation, region, true)).await;
         if let rtdb_storage::release::Settled::Released = settled {
             crate::residence_trace::record("finish-recovery", || serde_json::json!({
@@ -1298,6 +1314,7 @@ impl Service {
                 "epoch": history.log_epoch, "hold": region,
             }));
         }
+        settled.is_released()
     }
 }
 
@@ -1603,7 +1620,8 @@ mod tests {
         let body = Bytes::from(data_frame.encode());
         let broker = Service::open(directory.clone(), CellStorage::Local { root: data.path().join("detached") },
             &CellStorage::Local { root: data.path().join("serving") },
-            Arc::new(LocalKeyService::new(data.path().join("detached-keys")).unwrap()), None, None, None, None).unwrap();
+            Arc::new(LocalKeyService::new(data.path().join("detached-keys")).unwrap()), None, None, None, None,
+            CancellationToken::new()).unwrap();
         let relative = ObjectKey::new(relative).unwrap();
         let opened = broker.open_store(&record, io.clone()).await.unwrap();
         opened.put(&relative, body.clone()).await.unwrap();
@@ -1649,7 +1667,7 @@ mod tests {
         let mut attempted = false;
         broker.admit_read(history, affected, 1, delegated, &mut attempted).await.unwrap();
         assert!(attempted);
-        broker.release(history, delegated).await;
+        assert!(broker.release(history, delegated).await);
 
         let candidate = &record.replica_payload_trim.as_ref().unwrap().candidates[0];
         broker.settle_candidate(&record, candidate, relative.clone(), key.clone(), |_, _| async {

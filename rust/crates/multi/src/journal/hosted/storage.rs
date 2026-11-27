@@ -41,6 +41,7 @@ pub(crate) struct StoreFactory {
     pub scoped_writes: Option<Arc<ScopedCellWrites>>,
     pub releases: tokio_util::task::TaskTracker,
     pub apple_sync: rtdb_storage::AppleSync,
+    pub release_stop: tokio_util::sync::CancellationToken,
 }
 
 struct WriteScope {
@@ -152,7 +153,7 @@ impl RemoteStorageFactory for StoreFactory {
     ) -> Result<OpenedRecoveryStore> {
         use rtdb_s3::WriteAuthorization;
         let (placement, attachment) = self.routes.resolve(configuration)?;
-        let custody = placement.hold_worker_custody(&self.releases).await?;
+        let custody = placement.hold_worker_custody(&self.releases, &self.release_stop).await?;
         let io = io.child_holding(custody);
         let (grant, hold) = match attachment.admission {
             AttachmentAdmission::Writer { admission } => (admission.grant, admission.recovery),
@@ -167,7 +168,7 @@ impl RemoteStorageFactory for StoreFactory {
         });
         scope.authorize(None).await?;
         placement.worker.replay_head(hold, hold.start).await?;
-        let protection = placement.pin_root(hold, &self.releases).await?;
+        let protection = placement.pin_root(hold, &self.releases, &self.release_stop).await?;
         let (lower, blocks) = self.open_checkpoint(&placement, &attachment, hold, Arc::clone(&io)).await?;
         let storage_prefix = placement.record.storage_prefix();
         let installed = placement.worker.placement();
@@ -226,6 +227,7 @@ impl RemoteStorageFactory for StoreFactory {
             upper,
             snapshot: Some(snapshot::Source {
                 placement, keys: Arc::clone(&self.keys), io: Arc::clone(&io), tasks: self.releases.clone(),
+                release_stop: self.release_stop.child_token(),
                 ordered_index_arrow_only: self.routes.is_runtime(),
             }),
             reader: None,
@@ -320,6 +322,7 @@ impl StoreFactory {
             lower, upper, writer: None, reader: Some(ServingReader { scope, objects }),
             snapshot: Some(snapshot::Source {
                 placement, keys: Arc::clone(&self.keys), io, tasks: self.releases.clone(),
+                release_stop: self.release_stop.child_token(),
                 ordered_index_arrow_only: self.routes.is_runtime(),
             }),
         });

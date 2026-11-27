@@ -39,6 +39,7 @@ pub(crate) struct HostedIndexPages {
     owner: Uuid,
     writer_epoch: Option<u64>,
     tasks: TaskTracker,
+    release_stop: CancellationToken,
     directory_watch: OnceLock<watch::Receiver<Option<DeploymentRecord>>>,
     cancelled: CancellationToken,
     permits: Mutex<BTreeMap<Scope, Arc<OnceCell<PermitSlot>>>>,
@@ -52,8 +53,9 @@ impl HostedIndexPages {
         owner: Uuid,
         writer_epoch: Option<u64>,
         tasks: TaskTracker,
+        release_stop: CancellationToken,
     ) -> Self {
-        Self { directory, deployment, store, owner, writer_epoch, tasks, directory_watch: OnceLock::new(),
+        Self { directory, deployment, store, owner, writer_epoch, tasks, release_stop, directory_watch: OnceLock::new(),
             cancelled: CancellationToken::new(), permits: Mutex::default() }
     }
 
@@ -70,6 +72,7 @@ impl HostedIndexPages {
             rtdb_directory::watch_deployment(self.directory.clone(), self.deployment.clone(), WATCH_INTERVAL)
         }).clone();
         let cancelled = self.cancelled.clone();
+        let release_stop = self.release_stop.child_token();
         let directory = self.directory.clone();
         let deployment = self.deployment.clone();
         let owner = self.owner;
@@ -109,7 +112,7 @@ impl HostedIndexPages {
             // A lost CAS response may have recorded the permit. Fence an
             // ambiguous admission even if the first read sees it absent.
             let (directory, installation, scope) = (&directory, deployment.as_str(), &scope);
-            crate::hold_release::release_hold(format!("ordered index permit {permit_id} for {installation}"),
+            crate::hold_release::release_hold(format!("ordered index permit {permit_id} for {installation}"), &release_stop,
                 move || release_permit(directory.as_ref(), installation, scope, permit_id)).await;
         });
         admitted.await.map_err(|_| closed_scope())?
@@ -533,7 +536,7 @@ mod tests {
         let store = format!("{}/v06", record.storage_prefix());
         let tasks = TaskTracker::new();
         let lifecycle = HostedIndexPages::new(
-            directory.clone(), record.id.clone(), store.clone(), owner, Some(1), tasks.clone(),
+            directory.clone(), record.id.clone(), store.clone(), owner, Some(1), tasks.clone(), CancellationToken::new(),
         );
         let index = ObjectKey::new(format!("{ORDERED_INDEX_ROOT}/0000000000000001-{}", "a".repeat(64))).unwrap();
         let old = IndexPageScope { index: &index, generation: 0 };
@@ -628,7 +631,7 @@ mod tests {
         let store = format!("{}/v06", record.storage_prefix());
         let tasks = TaskTracker::new();
         let indexes = HostedIndexPages::new(
-            directory.clone(), record.id.clone(), store.clone(), owner, Some(1), tasks.clone(),
+            directory.clone(), record.id.clone(), store.clone(), owner, Some(1), tasks.clone(), CancellationToken::new(),
         );
         let dropped = ObjectKey::new(format!("{ORDERED_INDEX_ROOT}/0000000000000001-{}", "a".repeat(64))).unwrap();
         let active = ObjectKey::new(format!("{ORDERED_INDEX_ROOT}/0000000000000003-{}", "b".repeat(64))).unwrap();

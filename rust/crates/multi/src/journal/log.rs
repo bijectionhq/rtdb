@@ -21,7 +21,7 @@ use rtdb_storage::{
     },
     object_store::ReadReservation,
 };
-use rtdb_types::{Anomaly, BlockIndex, Timestamp};
+use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, Timestamp};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
     Arc, OnceLock,
@@ -29,7 +29,7 @@ use std::sync::{
 };
 use std::time::Duration;
 use tokio::sync::{Mutex, oneshot};
-use tokio_util::task::TaskTracker;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const ORDERED_ADMISSION_RETRY: Duration = Duration::from_secs(1);
@@ -70,6 +70,7 @@ struct Reads {
     io: Arc<IoRegion>,
     tip: AtomicI64,
     tasks: TaskTracker,
+    release_stop: CancellationToken,
     maximum: usize,
     unsettled: Mutex<Vec<RequestId>>,
     reader_epoch: Option<u64>,
@@ -139,10 +140,12 @@ impl Held {
         journal: &Arc<InstalledJournal>,
         request: Request,
         tasks: &TaskTracker,
+        stop: &CancellationToken,
     ) -> rtdb_types::Result<Arc<Self>> {
         let (mut send, receive) = oneshot::channel();
         let journal = Arc::clone(journal);
         let worker = tasks.clone();
+        let stop = stop.child_token();
         tasks.spawn(async move {
             let admitted = loop {
                 if send.is_closed() {
@@ -158,7 +161,7 @@ impl Held {
                     result => break result.map_err(JournalError::into_anomaly),
                 }
             };
-            let result = admitted.map(|hold| Self::pin(journal, hold, &worker));
+            let result = admitted.map(|hold| Self::pin(journal, hold, &worker, &stop));
             let _ = send.send(result);
         });
         receive.await.map_err(|_| {
@@ -173,12 +176,14 @@ impl Held {
         journal: Arc<InstalledJournal>,
         hold: Hold,
         tasks: &TaskTracker,
+        stop: &CancellationToken,
     ) -> Arc<Self> {
         let (release, closed) = oneshot::channel();
+        let stop = stop.child_token();
         tasks.spawn(async move {
             let _ = closed.await;
             let journal = &journal;
-            crate::hold_release::release_hold(format!("ordered replay hold {}", hold.id.nonce), move || journal.release(hold)).await;
+            crate::hold_release::release_hold(format!("ordered replay hold {}", hold.id.nonce), &stop, move || journal.release(hold)).await;
         });
         Arc::new(Self {
             hold,
@@ -196,6 +201,7 @@ impl JournalLog {
         maximum_message_bytes: usize,
         configured_window: Option<u64>,
         tasks: TaskTracker,
+        release_stop: CancellationToken,
         custody: Option<Arc<dyn Send + Sync>>,
     ) -> Result<Arc<Self>> {
         let current = journal.route().await.map_err(storage)?;
@@ -219,6 +225,7 @@ impl JournalLog {
             io: IoRegion::new().child_holding(custody),
             tip: AtomicI64::new(latest(current.head).map_err(storage)?.0),
             tasks,
+            release_stop,
             maximum: maximum_message_bytes,
             unsettled: Mutex::new(Vec::new()),
             reader_epoch: None,
@@ -245,10 +252,11 @@ impl JournalLog {
         recovery: Arc<Held>,
         maximum: usize,
         tasks: TaskTracker,
+        release_stop: CancellationToken,
         custody: Option<Arc<dyn Send + Sync>>,
     ) -> Result<Arc<Self>> {
         let reads = Arc::new(Reads {
-            journal, keys, io: IoRegion::new().child_holding(custody), maximum, tasks,
+            journal, keys, io: IoRegion::new().child_holding(custody), maximum, tasks, release_stop,
             tip: AtomicI64::new(latest(recovery.scope().through).map_err(storage)?.0),
             unsettled: Mutex::new(Vec::new()), reader_epoch: Some(epoch),
         });
@@ -512,13 +520,13 @@ impl Reads {
     }
 
     fn retain(self: &Arc<Self>, hold: Hold) -> Arc<Held> {
-        Held::pin(Arc::clone(&self.journal), hold, &self.tasks)
+        Held::pin(Arc::clone(&self.journal), hold, &self.tasks, &self.release_stop)
     }
 
     async fn acquire(self: &Arc<Self>, view: &Route, from: u64, through: u64) -> Result<Arc<Held>> {
         let command = Command::ProtectRange { from, through };
         let request = self.journal.request(view, command).map_err(storage)?;
-        Held::acquire(&self.journal, request, &self.tasks)
+        Held::acquire(&self.journal, request, &self.tasks, &self.release_stop)
             .await
             .map_err(storage)
     }
@@ -907,7 +915,7 @@ impl Log for JournalLog {
         let source = self.reference_source.get().ok_or_else(unavailable)?;
         let command = Command::ProtectCheckpoint { root, from: start, through: end };
         let request = self.reads.journal.request(&view, command).map_err(storage)?;
-        let held = match Held::acquire(&self.reads.journal, request, &self.reads.tasks).await {
+        let held = match Held::acquire(&self.reads.journal, request, &self.reads.tasks, &self.reads.release_stop).await {
             Ok(held) => held,
             Err(error) => {
                 if start < self.reads.route().await?.erasure_floor { return Err(Error::ErasedUnderView); }

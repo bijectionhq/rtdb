@@ -2998,6 +2998,7 @@ mod tests {
             directory.clone(), CellStorage::Local { root: root.join("fork-custody") }, storage,
             std::sync::Arc::new(LocalKeyService::new(root.join("fork-custody-keys")).unwrap()),
             tokio_util::task::TaskTracker::new(),
+            tokio_util::sync::CancellationToken::new(),
         ).unwrap()
     }
 

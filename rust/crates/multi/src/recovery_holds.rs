@@ -8,7 +8,7 @@ use rtdb_storage::{Error, ObjectKey, Result,
     log::{LogOffset, LogRecord, ReplicaObjectCustody, ReplicaPayload, ReplicaPayloadBroker}, release::Settled};
 use rtdb_types::{Anomaly, PhysicalObjectVersion, StorageEpoch};
 use tokio::sync::oneshot;
-use tokio_util::task::TaskTracker;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use uuid::Uuid;
 
 use crate::deployment::LogkeeperLogConfig;
@@ -23,6 +23,7 @@ pub(crate) struct RecoveryHolds {
     pub custody: ReplayCustody,
     pub broker: Option<Client>,
     pub tasks: TaskTracker,
+    pub stop: CancellationToken,
 }
 
 #[derive(Clone)]
@@ -116,7 +117,7 @@ impl RecoveryAdmission {
             }
             let released = if attempted {
                 let (directory, deployment) = (&worker.holds.directory, &worker.deployment);
-                let settled = release_hold(format!("recovery hold {id} for {deployment}"),
+                let settled = release_hold(format!("recovery hold {id} for {deployment}"), &worker.holds.stop,
                     move || crate::store::release_region(directory.as_ref(), deployment, id, !opened)).await;
                 if let Settled::Released = settled {
                     crate::residence_trace::record("finish-recovery", || serde_json::json!({
@@ -284,7 +285,6 @@ mod tests {
         use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope}, keys::oversized_key, log::proto::NoOp};
         use rtdb_storage::{IoRegion, MemoryStore, log::Log};
         use rtdb_types::{BlockIndex, Term, TermSequence, Timestamp};
-        use tokio_util::sync::CancellationToken;
 
         let data = tempfile::tempdir().unwrap();
         let directory = rtdb_directory::MemoryDirectory::new();
@@ -308,9 +308,10 @@ mod tests {
         let detached = CellStorage::Local { root: data.path().join("detached") };
         let keys = Arc::new(LocalKeyService::new(data.path().join("journal-keys")).unwrap());
         let broker = Client::standalone(directory.clone(), detached, &serving,
-            Arc::new(LocalKeyService::new(data.path().join("detached-keys")).unwrap()), tasks.clone()).unwrap();
+            Arc::new(LocalKeyService::new(data.path().join("detached-keys")).unwrap()), tasks.clone(), CancellationToken::new()).unwrap();
         let holds = Arc::new(RecoveryHolds {
             directory: directory.clone(), keys: keys.clone(), custody: ReplayCustody::Local, broker: Some(broker), tasks: tasks.clone(),
+            stop: CancellationToken::new(),
         });
         let admission = RecoveryAdmission {
             holds, deployment: record.id.clone(), stream: record.stream("replica"),
@@ -358,6 +359,7 @@ mod tests {
             custody: ReplayCustody::Local,
             broker: None,
             tasks: TaskTracker::new(),
+            stop: CancellationToken::new(),
         });
         let admission = RecoveryAdmission {
             holds: holds.clone(), deployment: record.id.clone(), stream: record.stream("replica"),
@@ -420,5 +422,45 @@ mod tests {
         assert!(matches!(pending, Err(oneshot::error::TryRecvError::Empty)));
         region.close_and_wait().await;
         assert!(matches!(closed.try_recv(), Err(oneshot::error::TryRecvError::Closed)));
+    }
+
+    #[tokio::test]
+    async fn stopping_shutdown_cancels_a_retrying_recovery_hold_and_keeps_its_witness() {
+        use std::time::Duration;
+        use crate::{deployment::CellStorage, hold_release::tests::{Fault, ScriptedDirectory}};
+
+        let files = tempfile::tempdir().unwrap();
+        let storage = CellStorage::Local { root: files.path().join("objects") };
+        let keys = Arc::new(crate::keys::LocalKeyService::new(files.path().join("keys")).unwrap());
+        let directory = ScriptedDirectory::new();
+        let record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
+        let tasks = TaskTracker::new();
+        let stop = CancellationToken::new();
+        let holds = Arc::new(RecoveryHolds {
+            directory: directory.clone(), keys: keys.clone(), custody: ReplayCustody::Local, broker: None,
+            tasks: tasks.clone(), stop: stop.child_token(),
+        });
+        let admission = RecoveryAdmission {
+            holds, deployment: record.id.clone(), stream: record.stream("replica"),
+            log_epoch: record.log_epoch, writer_epoch: record.epoch,
+        };
+        let hold = admission.hold(LogOffset(0), LogOffset(2)).await.unwrap().unwrap();
+        let held = directory.deployment(&record.id).await.unwrap().unwrap();
+        assert_eq!(held.storage_regions.len(), 1);
+        let region = *held.storage_regions.keys().next().unwrap();
+
+        for _ in 0..8 {
+            directory.inject(Fault::Read);
+        }
+        drop(hold);
+        stop.cancel();
+        tasks.close();
+        tokio::time::timeout(Duration::from_secs(2), tasks.wait()).await.unwrap();
+
+        let remaining = directory.inner.deployment(&record.id).await.unwrap().unwrap();
+        assert!(remaining.storage_regions.contains_key(&region), "stopped release leaves the hold registered");
+        assert!(keys.local_storage_region_drained(region).unwrap(), "the witness survives, unlocked");
+        crate::store::reconcile_storage_regions(directory.inner.as_ref(), &storage, keys.as_ref(), &remaining).await.unwrap();
+        assert!(directory.inner.deployment(&record.id).await.unwrap().unwrap().storage_regions.is_empty());
     }
 }

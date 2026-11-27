@@ -1317,7 +1317,7 @@ mod custody_tests {
         let broker_tasks = tokio_util::task::TaskTracker::new();
         let broker_media = CellStorage::Local { root: location.path().join("replay-bodies") };
         let broker_keys = Arc::new(crate::keys::LocalKeyService::new(&location.path().join("replay-keys"))?);
-        let broker = Client::standalone(directory.clone(), broker_media.clone(), &storage, broker_keys.clone(), broker_tasks.clone())?;
+        let broker = Client::standalone(directory.clone(), broker_media.clone(), &storage, broker_keys.clone(), broker_tasks.clone(), cancellation.child_token())?;
         let history = History::of(&source)?;
         broker.publish(history, source.epoch, &earlier_path, earlier_body.clone()).await?;
         writer.enqueue(earlier_proxy.encode().into(), Timestamp(20)).await?.durable().await?;
@@ -1414,8 +1414,8 @@ mod custody_tests {
             let rtdb_directory::ReplaceOutcome::Applied(holder) = directory.replace_deployment(holder, version).await else {
                 panic!("the transfer holder lost its placement");
             };
-            let broker = Client::standalone(directory.clone(), broker_media.clone(), &storage, broker_keys.clone(), broker_tasks.clone())?;
-            let holdings = Arc::new(RecoveryHolds { directory: directory.clone(), keys: keys.clone(), broker: Some(broker), custody: ReplayCustody::Local, tasks: Default::default() });
+            let broker = Client::standalone(directory.clone(), broker_media.clone(), &storage, broker_keys.clone(), broker_tasks.clone(), cancellation.child_token())?;
+            let holdings = Arc::new(RecoveryHolds { directory: directory.clone(), keys: keys.clone(), broker: Some(broker), custody: ReplayCustody::Local, tasks: Default::default(), stop: cancellation.child_token() });
             let factory = LogkeeperLogFactory::new(MAXIMUM_LOG_MESSAGE_BYTES, Default::default(), holdings);
             let config = holder_config(&holder, seeded.journals.clone(), &storage, Role::Holder);
             let Some(database_config::Log::OtherLog(config)) = config.log else { panic!("target did not use Logkeeper"); };

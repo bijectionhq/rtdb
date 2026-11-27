@@ -273,6 +273,7 @@ pub struct NodeAgent {
     writers: crate::logs::Writers,
     ordered: Arc<crate::journal::hosted::Routes>,
     ordered_releases: tokio_util::task::TaskTracker,
+    ordered_release_stop: CancellationToken,
     subscriptions: Mutex<BTreeMap<String, LocalSubscription>>,
     /// One activation, subscription or park at a time per deployment name.
     turns: Turns,
@@ -288,8 +289,8 @@ impl NodeAgent {
         self.options.replay_broker.as_ref()
     }
 
-    pub(crate) fn new(directory: Arc<dyn Directory>, keys: Arc<dyn crate::keys::KeyService>, node: Node, lease: Arc<MemberLease>, address: String, flight_endpoint: Option<String>, options: AgentOptions, storage_namespaces: rtdb_directory::StorageNamespaces, writers: crate::logs::Writers, ordered: Arc<crate::journal::hosted::Routes>, ordered_releases: tokio_util::task::TaskTracker, secret: Option<Arc<crate::capability::CellSecret>>) -> Arc<Self> {
-        Arc::new(Self { directory, keys, node, lease, address, flight_endpoint, options, storage_namespaces, secret, warming: Mutex::new(BTreeSet::new()), holdings: Mutex::new(BTreeMap::new()), writers, ordered, ordered_releases, subscriptions: Mutex::new(BTreeMap::new()), turns: Mutex::new(HashMap::new()), activations: Default::default(), resident_deadlines: Mutex::default(), memory_relief: Default::default(), fragments_read: Mutex::new(BTreeMap::new()) })
+    pub(crate) fn new(directory: Arc<dyn Directory>, keys: Arc<dyn crate::keys::KeyService>, node: Node, lease: Arc<MemberLease>, address: String, flight_endpoint: Option<String>, options: AgentOptions, storage_namespaces: rtdb_directory::StorageNamespaces, writers: crate::logs::Writers, ordered: Arc<crate::journal::hosted::Routes>, ordered_releases: tokio_util::task::TaskTracker, ordered_release_stop: CancellationToken, secret: Option<Arc<crate::capability::CellSecret>>) -> Arc<Self> {
+        Arc::new(Self { directory, keys, node, lease, address, flight_endpoint, options, storage_namespaces, secret, warming: Mutex::new(BTreeSet::new()), holdings: Mutex::new(BTreeMap::new()), writers, ordered, ordered_releases, ordered_release_stop, subscriptions: Mutex::new(BTreeMap::new()), turns: Mutex::new(HashMap::new()), activations: Default::default(), resident_deadlines: Mutex::default(), memory_relief: Default::default(), fragments_read: Mutex::new(BTreeMap::new()) })
     }
 
     pub fn member(&self) -> MemberId { self.lease.id() }
@@ -602,7 +603,7 @@ impl NodeAgent {
             return Err(unavailable());
         }
         self.stop_running(name).await;
-        let (configuration, recovery) = placement.reader_configuration(&route, &self.keys, &self.ordered_releases).await?;
+        let (configuration, recovery) = placement.reader_configuration(&route, &self.keys, &self.ordered_releases, &self.ordered_release_stop).await?;
         let opened = async {
             let database = self.node.database_or_attach(name.to_owned(), configuration).await?.ok_or_else(unavailable)?;
             self.await_ordered_cut(&database, placement.worker.log_epoch(), recovery.scope().through).await?;
@@ -964,7 +965,7 @@ impl NodeAgent {
                         "An earlier committed SQL erase owns the next checkpoint"));
                 }
                 placement.publish_checkpoint(&self.keys, Some((admission, checkpoint)),
-                    &self.options.storage, self.node.memory(), &self.ordered_releases).await?.ok_or_else(||
+                    &self.options.storage, self.node.memory(), &self.ordered_releases, &self.ordered_release_stop).await?.ok_or_else(||
                         Anomaly::fault("rtdb.multi/flush-checkpoint", "The flush did not choose a checkpoint"))
             }).await.map_err(|_| checkpoint_timeout(name))??;
             return Ok(Response::Flushed { checkpoint });
@@ -1748,7 +1749,7 @@ impl NodeAgent {
 
     pub(crate) async fn hold_transaction_custody(&self, database: &Database) -> Result<Option<Arc<dyn Send + Sync>>> {
         match self.ordered.by_name(database.name()) {
-            Some(placement) => placement.hold_worker_custody(&self.ordered_releases).await,
+            Some(placement) => placement.hold_worker_custody(&self.ordered_releases, &self.ordered_release_stop).await,
             None => Ok(None),
         }
     }
@@ -1952,7 +1953,7 @@ impl NodeAgent {
 
         for (name, placement) in self.ordered.custody_placements() {
             custodian::maintain_with_sync(placement, offered.remove(name), self.replay_broker(), &self.keys,
-                &self.options.storage, self.node.memory(), &self.ordered_releases, self.options.activation_timeout, self.options.apple_sync).await;
+                &self.options.storage, self.node.memory(), &self.ordered_releases, &self.ordered_release_stop, self.options.activation_timeout, self.options.apple_sync).await;
         }
     }
 
@@ -2075,7 +2076,7 @@ impl Handler for NodeAgent {
                 let destination = self.ordered.by_name(&child).ok_or_else(unavailable)?;
                 let broker = self.replay_broker().ok_or_else(unavailable)?;
                 source.enroll_installed_fork(&destination, broker, &self.keys, self.node.memory(),
-                    &self.ordered_releases).await?;
+                    &self.ordered_releases, &self.ordered_release_stop).await?;
                 Ok(Response::InstalledForkEnrolled)
             }.await,
             Request::StageSqlErasure { name, request } => self.stage_sql_erasure(&name, request).await,

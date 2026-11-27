@@ -4,7 +4,7 @@ use rtdb_directory::{DeploymentRecord, Directory, Lifecycle, ReplayCustody, Stor
 use rtdb_storage::Error;
 use rtdb_types::{Anomaly, AnomalyCategory};
 use tokio::sync::oneshot;
-use tokio_util::task::TaskTracker;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use uuid::Uuid;
 
 use crate::hold_release::{ChangeFailure, release_hold};
@@ -18,6 +18,7 @@ pub(crate) struct ReferenceReads {
     directory: Arc<dyn Directory>,
     keys: Arc<dyn KeyService>,
     tasks: TaskTracker,
+    stop: CancellationToken,
     org: String,
     lineage: String,
     root: String,
@@ -29,10 +30,10 @@ const CLOSED: &str = "rtdb.multi/reference-source-closed";
 
 impl ReferenceReads {
     pub(crate) fn new(
-        directory: Arc<dyn Directory>, keys: Arc<dyn KeyService>, tasks: TaskTracker,
+        directory: Arc<dyn Directory>, keys: Arc<dyn KeyService>, tasks: TaskTracker, stop: CancellationToken,
         fork: &DeploymentRecord, root: &str, namespaces: StorageNamespaces, custody: ReplayCustody,
     ) -> Self {
-        Self { directory, keys, tasks, org: fork.org.clone(), lineage: fork.lineage.clone(),
+        Self { directory, keys, tasks, stop, org: fork.org.clone(), lineage: fork.lineage.clone(),
             root: root.to_owned(), namespaces, custody }
     }
 
@@ -80,7 +81,7 @@ impl ReferenceReads {
             }
             let released = if opened || uncertain {
                 let (directory, installation) = (&worker.directory, deployment.as_str());
-                release_hold(format!("reference read {id} for {deployment}"),
+                release_hold(format!("reference read {id} for {deployment}"), &worker.stop,
                     move || crate::store::release_region(directory.as_ref(), installation, id, uncertain)).await.is_released()
             } else { true };
             if let Some(witness) = witness {
@@ -123,7 +124,7 @@ mod tests {
         let owner = directory.create_deployment(owner).await.unwrap();
         let source = format!("{}/v06", owner.storage_prefix());
         let tasks = TaskTracker::new();
-        let custody = ReferenceReads::new(directory.clone(), keys.clone(), tasks.clone(), &owner, "v06", namespaces, ReplayCustody::Local);
+        let custody = ReferenceReads::new(directory.clone(), keys.clone(), tasks.clone(), CancellationToken::new(), &owner, "v06", namespaces, ReplayCustody::Local);
         let permit = custody.retain(&source, &key(&format!("{source}/payload")).unwrap()).await.unwrap();
         let reads = |record: &DeploymentRecord| record.storage_regions.iter()
             .filter(|(_, region)| matches!(region, StorageRegion::ReferenceRead { .. }))
@@ -173,13 +174,13 @@ mod tests {
         let base = Base::load(bucket.as_ref(), &child_store).await.unwrap();
 
         let tasks = TaskTracker::new();
-        let custody = ReferenceReads::new(directory.clone(), keys.clone(), tasks.clone(), &child, "v06", namespaces, ReplayCustody::Local);
+        let custody = ReferenceReads::new(directory.clone(), keys.clone(), tasks.clone(), CancellationToken::new(), &child, "v06", namespaces, ReplayCustody::Local);
         let own = Arc::new(PrefixedStore::new(bucket.clone(), child_store));
         let store = Arc::new(ReferencingStore::new(own, bucket.clone(), base).with_custody(custody.clone()));
         assert_eq!(store.get_range(&object, 1..4).await.unwrap(), bytes.slice(1..4));
 
         let unrelated = DeploymentRecord::new("unrelated", "org", Vec::new(), 0);
-        let other_custody = ReferenceReads::new(directory.clone(), keys.clone(), tasks.clone(), &unrelated, "v06", namespaces, ReplayCustody::Local);
+        let other_custody = ReferenceReads::new(directory.clone(), keys.clone(), tasks.clone(), CancellationToken::new(), &unrelated, "v06", namespaces, ReplayCustody::Local);
         assert!(matches!(other_custody.retain(&parent_store, &parent_object).await, Err(Error::Closed(_))));
         assert!(matches!(custody.retain(&format!("{}/v05", parent.storage_prefix()), &parent_object).await, Err(Error::Closed(_))));
 
@@ -241,5 +242,42 @@ mod tests {
         crate::admin::finish_disposal(directory.as_ref(), &storage, keys.as_ref(), &parent.id, 4 << 20).await.unwrap();
         assert!(matches!(bucket.get(&parent_object).await, Err(Error::MissingObject(_))));
         assert_eq!(store.get(&object).await.unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn cancelling_shutdown_stops_a_retrying_reference_read_release_and_leaves_its_witness() {
+        use crate::hold_release::tests::{Fault, ScriptedDirectory};
+
+        let files = tempfile::tempdir().unwrap();
+        let storage = CellStorage::Local { root: files.path().join("objects") };
+        let keys = Arc::new(LocalKeyService::new(files.path().join("keys")).unwrap());
+        let directory = ScriptedDirectory::new();
+        let namespaces = StorageNamespaces { objects: Uuid::new_v4(), keys: [0; 32] };
+        let mut owner = DeploymentRecord::new("owner", "org", Vec::new(), 0);
+        owner.storage_namespaces = Some(namespaces);
+        let owner = directory.create_deployment(owner).await.unwrap();
+        let source = format!("{}/v06", owner.storage_prefix());
+        let tasks = TaskTracker::new();
+        let stop = CancellationToken::new();
+        let custody = ReferenceReads::new(
+            directory.clone(), keys.clone(), tasks.clone(), stop.child_token(),
+            &owner, "v06", namespaces, ReplayCustody::Local,
+        );
+        let permit = custody.retain(&source, &key(&format!("{source}/payload")).unwrap()).await.unwrap();
+        let region = *directory.deployment(&owner.id).await.unwrap().unwrap().storage_regions.keys().next().unwrap();
+
+        for _ in 0..8 {
+            directory.inject(Fault::Read);
+        }
+        drop(permit);
+        stop.cancel();
+        tasks.close();
+        tokio::time::timeout(Duration::from_secs(2), tasks.wait()).await.unwrap();
+
+        let held = directory.inner.deployment(&owner.id).await.unwrap().unwrap();
+        assert!(held.storage_regions.contains_key(&region), "the stopped release leaves the read registered");
+        assert!(keys.local_storage_region_drained(region).unwrap(), "the witness survives, unlocked");
+        crate::store::reconcile_storage_regions(directory.inner.as_ref(), &storage, keys.as_ref(), &held).await.unwrap();
+        assert!(directory.inner.deployment(&owner.id).await.unwrap().unwrap().storage_regions.is_empty());
     }
 }

@@ -76,6 +76,7 @@ pub async fn run_with_sync(
     }
 
     let releases = TaskTracker::new();
+    let release_stop = CancellationToken::new();
     let configured: BTreeSet<_> = routes
         .configured
         .values()
@@ -109,6 +110,7 @@ pub async fn run_with_sync(
                     &settings.serving,
                     &settings.memory,
                     &releases,
+                    &release_stop,
                     Duration::from_secs(30),
                     apple_sync,
                 )
@@ -132,14 +134,19 @@ pub async fn run_with_sync(
         }
     }
     releases.close();
-    tokio::time::timeout(Duration::from_secs(10), releases.wait())
+    if tokio::time::timeout(Duration::from_secs(10), releases.wait())
         .await
-        .map_err(|_| {
-            Anomaly::fault(
-                "rtdb.multi/custodian-shutdown",
-                "Installed custody read releases are still pending",
-            )
-        })
+        .is_err()
+    {
+        release_stop.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(1), releases.wait()).await;
+        return Err(Anomaly::fault(
+            "rtdb.multi/custodian-shutdown",
+            "Installed custody read releases are still pending",
+        ));
+    }
+    release_stop.cancel();
+    Ok(())
 }
 
 async fn refresh(
@@ -186,9 +193,10 @@ pub(crate) async fn maintain(
     serving: &CellStorage,
     memory: &Arc<MemoryBudget>,
     releases: &TaskTracker,
+    release_stop: &CancellationToken,
     limit: Duration,
 ) {
-    maintain_with_sync(placement, offered, broker, keys, serving, memory, releases, limit, rtdb_storage::AppleSync::Full).await;
+    maintain_with_sync(placement, offered, broker, keys, serving, memory, releases, release_stop, limit, rtdb_storage::AppleSync::Full).await;
 }
 
 pub(crate) async fn maintain_with_sync(
@@ -199,6 +207,7 @@ pub(crate) async fn maintain_with_sync(
     serving: &CellStorage,
     memory: &Arc<MemoryBudget>,
     releases: &TaskTracker,
+    release_stop: &CancellationToken,
     limit: Duration,
     apple_sync: rtdb_storage::AppleSync,
 ) {
@@ -218,7 +227,7 @@ pub(crate) async fn maintain_with_sync(
             }
             RetentionAction::Publish => {
                 let publish =
-                    placement.publish_checkpoint(keys, offered, serving, memory, releases);
+                    placement.publish_checkpoint(keys, offered, serving, memory, releases, release_stop);
                 if matches!(tokio::time::timeout(limit, publish).await, Ok(Ok(Some(_)))) {
                     let _ = placement.retain_selected().await;
                 }

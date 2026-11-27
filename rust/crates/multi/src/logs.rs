@@ -1017,7 +1017,7 @@ mod tests {
         };
         let configuration = Any { type_url: String::new(), value: serde_json::to_vec(&configuration).unwrap() };
         let holds = Arc::new(RecoveryHolds { directory: directory.clone(), keys: keys.clone(),
-            broker: None, custody: rtdb_directory::ReplayCustody::Local, tasks: Default::default() });
+            broker: None, custody: rtdb_directory::ReplayCustody::Local, tasks: Default::default(), stop: CancellationToken::new() });
         let factory = LogkeeperLogFactory::new(1024, Default::default(), holds);
 
         let refused = factory.open(&configuration, LogAccess::ReadWrite, CancellationToken::new()).await.err().unwrap();
@@ -1054,7 +1054,7 @@ mod tests {
         let holds = Arc::new(RecoveryHolds {
             directory: directory.clone(), keys: Arc::new(crate::keys::LocalKeyService::new(files.path()).unwrap()),
             broker: None,
-            custody: ReplayCustody::Local, tasks: Default::default(),
+            custody: ReplayCustody::Local, tasks: Default::default(), stop: CancellationToken::new(),
         });
         holds.keys.key(&config.key_id).await.unwrap();
         let replica = SealedLog::for_serving(provider.clone(), &config, holds.clone()).await.unwrap();
@@ -1115,11 +1115,11 @@ mod tests {
         let tasks = TaskTracker::new();
         let broker = Client::standalone(directory.clone(), CellStorage::Local { root: directory_files.path().join("detached") },
             &CellStorage::Local { root: directory_files.path().join("serving") },
-            Arc::new(LocalKeyService::new(directory_files.path().join("detached-keys")).unwrap()), tasks.clone()).unwrap();
+            Arc::new(LocalKeyService::new(directory_files.path().join("detached-keys")).unwrap()), tasks.clone(), CancellationToken::new()).unwrap();
         let holds = Arc::new(RecoveryHolds {
             directory: directory.clone(), keys: Arc::new(LocalKeyService::new(directory_files.path().join("keys")).unwrap()),
             broker: Some(broker),
-            custody: ReplayCustody::Local, tasks,
+            custody: ReplayCustody::Local, tasks, stop: CancellationToken::new(),
         });
         holds.keys.key(&config.key_id).await.unwrap();
         let replica = SealedLog::for_serving(Arc::new(MemoryLog::new(1024)), &config, holds.clone()).await.unwrap();

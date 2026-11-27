@@ -1,6 +1,6 @@
 //! What a failed directory change leaves behind, and settling the release of a hold.
 
-use std::{fmt::Display, future::Future};
+use std::{fmt::Display, future::Future, time::Duration};
 
 use rtdb_storage::release::{Backoff, Settled, settle};
 use rtdb_types::Anomaly;
@@ -29,19 +29,46 @@ impl From<ChangeFailure> for Anomaly {
     }
 }
 
-/// Repeats an idempotent release until it applies or fails permanently,
-/// logging each retry and a permanent failure against `hold`.
+/// Repeats an idempotent release until it applies, fails permanently, or `stop`
+/// is cancelled, logging each retry and any unfinished outcome against `hold`.
 ///
-/// The release is unbounded, as no reconciliation retires every kind of hold
-/// that a bound would abandon. Multi does not yet hand these tasks the
-/// process's shutdown token, so the release is not cancelled at shutdown; the
-/// process waits a bounded time for the task tracker instead.
-pub(crate) async fn release_hold<F, Fut>(hold: impl Display, release: F) -> Settled
+/// The release is unbounded while its owner runs, for witnessed holds whose
+/// reconciliation only retires them once the owner stops.
+pub(crate) async fn release_hold<F, Fut>(hold: impl Display, stop: &CancellationToken, release: F) -> Settled
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<(), Anomaly>>,
 {
-    let settled = settle(Backoff::RELEASE, &CancellationToken::new(), release, |attempt, error, delay| {
+    release_with_backoff(hold, Backoff::RELEASE, stop, release).await
+}
+
+/// Repeats an idempotent release with a deadline cap, for holds that lease
+/// expiry or active reconciliation retires even while the owner keeps running.
+pub(crate) async fn release_hold_bounded<F, Fut>(
+    hold: impl Display,
+    stop: &CancellationToken,
+    give_up_after: Duration,
+    release: F,
+) -> Settled
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<(), Anomaly>>,
+{
+    let backoff = Backoff { give_up_after: Some(give_up_after), ..Backoff::RELEASE };
+    release_with_backoff(hold, backoff, stop, release).await
+}
+
+async fn release_with_backoff<F, Fut>(
+    hold: impl Display,
+    backoff: Backoff,
+    stop: &CancellationToken,
+    release: F,
+) -> Settled
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<(), Anomaly>>,
+{
+    let settled = settle(backoff, stop, release, |attempt, error, delay| {
         tracing::warn!(%hold, attempt, code = %error.code, retry_in = ?delay, "Hold release failed; retrying");
     }).await;
     match &settled {
@@ -196,5 +223,28 @@ pub(crate) mod tests {
         let failure = change_installation(directory.as_ref(), &created.id, rename).await.unwrap_err();
         assert!(failure.may_have_applied());
         assert_eq!(directory.deployment(&created.id).await.unwrap().unwrap().org, "renamed");
+    }
+
+    #[tokio::test]
+    async fn release_hold_stops_when_its_shutdown_token_is_cancelled() {
+        let stop = CancellationToken::new();
+        let cancelled = stop.clone();
+        let settled = release_hold("test hold", &stop, move || {
+            let cancelled = cancelled.clone();
+            async move {
+                cancelled.cancel();
+                Err(unavailable())
+            }
+        }).await;
+        assert!(matches!(settled, Settled::Stopped));
+    }
+
+    #[tokio::test]
+    async fn release_hold_bounded_gives_up_after_its_deadline() {
+        let stop = CancellationToken::new();
+        let settled = release_hold_bounded("bounded hold", &stop, Duration::ZERO, || async {
+            Err(unavailable())
+        }).await;
+        assert!(matches!(settled, Settled::GaveUp(error) if error.category == AnomalyCategory::Unavailable));
     }
 }
