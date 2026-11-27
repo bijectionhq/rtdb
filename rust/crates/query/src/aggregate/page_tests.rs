@@ -191,6 +191,106 @@ async fn global_reductions_emit_arrow_vectors_for_nullable_and_empty_inputs() {
 }
 
 #[tokio::test]
+async fn selected_global_reductions_fit_without_materializing_row_masks() {
+    use arrow_array::{Float64Array, NullArray};
+    use crate::columnar::SelectedColumn;
+
+    let execution = execution(1024);
+    let memory = &execution.context.memory;
+    let baseline = memory.used_bytes();
+    let len = 32_768;
+    let float = LogicalType::Scalar(ScalarType::F64).maybe();
+    let null_field = Arc::new(rtdb_columnar::to_field("c0", &LogicalType::Null).unwrap());
+    let float_field = Arc::new(rtdb_columnar::to_field("c0", &float).unwrap());
+    let schema = Schema::new(vec![field(0, float.clone())]).unwrap();
+    let argument = schema.fields()[0].expression();
+    let aggregates = vec![
+        count(1, None),
+        AggregateExpr { function: AggregateFunction::Count, argument: Some(argument.clone()), ..count(2, None) },
+        AggregateExpr { field: field(3, float.clone()), function: AggregateFunction::Sum, argument: Some(argument.clone()), ..count(3, None) },
+        AggregateExpr { field: field(4, float.clone()), function: AggregateFunction::Average, argument: Some(argument), ..count(4, None) },
+    ];
+    let output = Schema::new(aggregates.iter().map(|aggregate| aggregate.field.clone()).collect()).unwrap();
+    let relation = Arc::new(Relation::new(output, RelationNode::Aggregate {
+        input: Arc::new(Relation::empty(schema.clone())), groups: vec![], aggregates: aggregates.clone(),
+    }).unwrap());
+    let runtime = EmittedRelation::derive(relation, &execution.context.catalog, &[], memory).unwrap();
+
+    let selected = SelectedColumn::new(vec![
+        Some((Arc::new(Float64Array::from(vec![Some(-0.0), None])), float_field, Some(float), None)),
+        Some((Arc::new(NullArray::new(1)), null_field, Some(LogicalType::Null), None)),
+        None,
+    ], Arc::new([(0, 0), (0, 1), (1, 0), (2, 0)].into_iter().cycle().take(len).collect()));
+    let input = ColumnBatch::settled(vec![Column::Selected(selected)], len, memory.reserve(0).unwrap()).unwrap();
+    let mut cursor = AggregateCursor::from_batches(Box::new(Batches(Some(input))), false,
+        schema, vec![], aggregates, runtime, execution.clone()).unwrap();
+    let pressure = memory.reserve(memory.available_bytes() - 16 * 1024).unwrap();
+    let result = cursor.next_batch().await.unwrap().unwrap();
+    assert_eq!(result.columns[0].value(0).unwrap(), Value::I64(len as i64));
+    assert_eq!(result.columns[1].value(0).unwrap(), Value::I64(len as i64 / 4));
+    for column in &result.columns[2..] {
+        let Value::F64(value) = column.value(0).unwrap() else { panic!("Expected a double result"); };
+        assert_eq!(value.to_bits(), (-0.0_f64).to_bits());
+    }
+    assert!(cursor.next_batch().await.unwrap().is_none());
+    drop((result, cursor, pressure));
+    assert_eq!(memory.used_bytes(), baseline);
+}
+
+#[tokio::test]
+async fn grouped_floating_reductions_keep_input_order_across_selected_and_value_pages() {
+    use arrow_array::{Float64Array, Int64Array};
+    use crate::columnar::SelectedColumn;
+
+    struct Pages(VecDeque<ColumnBatch>);
+    #[async_trait]
+    impl BatchCursor for Pages {
+        async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> { Ok(self.0.pop_front()) }
+    }
+
+    let execution = execution(8);
+    let memory = &execution.context.memory;
+    let integer = LogicalType::Scalar(ScalarType::I64);
+    let float = LogicalType::Scalar(ScalarType::F64).maybe();
+    let schema = Schema::new(vec![field(0, integer.clone()), field(1, float.clone())]).unwrap();
+    let group = NamedExpr { field: field(2, integer.clone()), expr: schema.fields()[0].expression() };
+    let argument = schema.fields()[1].expression();
+    let aggregates = vec![
+        count(3, None),
+        AggregateExpr { function: AggregateFunction::Count, argument: Some(argument.clone()), ..count(4, None) },
+        AggregateExpr { field: field(5, float.clone()), function: AggregateFunction::Sum, argument: Some(argument.clone()), ..count(5, None) },
+        AggregateExpr { field: field(6, float.clone()), function: AggregateFunction::Average, argument: Some(argument), ..count(6, None) },
+    ];
+    let output = Schema::new(std::iter::once(group.field.clone()).chain(aggregates.iter().map(|aggregate| aggregate.field.clone())).collect()).unwrap();
+    let relation = Arc::new(Relation::new(output, RelationNode::Aggregate {
+        input: Arc::new(Relation::empty(schema.clone())), groups: vec![group.clone()], aggregates: aggregates.clone(),
+    }).unwrap());
+    let runtime = EmittedRelation::derive(relation, &execution.context.catalog, &[], memory).unwrap();
+    let selected = SelectedColumn::new(vec![
+        Some((Arc::new(Float64Array::from(vec![Some(1e16), Some(1.0), Some(-1e16), None])),
+            Arc::new(rtdb_columnar::to_field("c1", &float).unwrap()), Some(float), None)),
+        None,
+    ], Arc::new(vec![(0, 0), (0, 3), (0, 2), (1, 0), (0, 1)]));
+    let first = ColumnBatch::settled(vec![
+        Column::Arrow { array: Arc::new(Int64Array::from(vec![9, 1, 9, 7, 9])),
+            field: Arc::new(rtdb_columnar::to_field("c0", &integer).unwrap()), logical: Some(integer) },
+        Column::Selected(selected),
+    ], 5, memory.reserve(0).unwrap()).unwrap();
+    let second = ColumnBatch::settled(vec![
+        Column::Values(vec![Value::I64(9), Value::I64(1), Value::I64(7)]),
+        Column::Values(vec![Value::F64(2.0), Value::F64(8.0), Value::Null]),
+    ], 3, memory.reserve(0).unwrap()).unwrap();
+    let mut cursor = AggregateCursor::from_batches(Box::new(Pages([first, second].into())), false,
+        schema, vec![group], aggregates, runtime, execution.clone()).unwrap();
+    let result = cursor.next_batch().await.unwrap().unwrap();
+    assert_eq!(result.len, 3);
+    assert_eq!(batch_row(&result, 0), vec![Value::I64(9), Value::I64(4), Value::I64(4), Value::F64(3.0), Value::F64(0.75)]);
+    assert_eq!(batch_row(&result, 1), vec![Value::I64(1), Value::I64(2), Value::I64(1), Value::F64(8.0), Value::F64(8.0)]);
+    assert_eq!(batch_row(&result, 2), vec![Value::I64(7), Value::I64(2), Value::I64(0), Value::Null, Value::Null]);
+    assert!(cursor.next_batch().await.unwrap().is_none());
+}
+
+#[tokio::test]
 async fn global_counts_fit_without_a_group_ordinal_for_each_row() {
     for filtered in [false, true] {
         let execution = execution(1024);
@@ -280,7 +380,7 @@ fn count_does_not_use_the_parent_bitmap_for_nested_cells_that_can_fail_to_read()
     ));
     let column = Column::Arrow { array, field, logical: Some(logical) };
     assert!(column.value(0).is_err());
-    assert!(marked_nulls(&column).is_none());
+    assert!(!accepts_typed_column(&column, count_layout));
 }
 
 #[test]
@@ -333,6 +433,7 @@ fn aggregate_preflight_reads_selected_cells_in_page_order() {
     let valid = [(3, 0), (1, 1), (2, 0), (1, 1), (2, 0)];
     let batch = page(valid.to_vec());
     let baseline = context.memory.used_bytes();
+    assert!(!accepts_typed_column(&batch.columns[0], count_layout));
     assert!(Rows::columns(&batch, &[0], false, context).is_ok());
     assert_eq!(context.memory.used_bytes(), baseline);
 
@@ -697,6 +798,26 @@ async fn sum_uses_vector_narrowing_and_float_accumulator_width() {
     assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
 }
 
+#[test]
+fn primitive_group_sums_wrap_within_the_reserved_state() {
+    let execution = execution(32);
+    let memory = &execution.context.memory;
+    let baseline = memory.used_bytes();
+    let mut states = ScalarGroups::new(&execution).unwrap();
+    states.ensure(32).unwrap();
+    let pressure = memory.reserve(memory.available_bytes()).unwrap();
+    let output = LogicalType::Scalar(ScalarType::I64);
+
+    for state in &mut states.values {
+        state.add_numeric(NumericCell::Integer(i64::MAX), &output).unwrap();
+        state.add_numeric(NumericCell::Integer(1), &output).unwrap();
+        assert!(matches!(state.accumulator, ScalarState::I64(i64::MIN)));
+    }
+
+    drop((pressure, states));
+    assert_eq!(memory.used_bytes(), baseline);
+}
+
 #[tokio::test]
 async fn duration_sum_wraps_conversion_and_distinguishes_null_vector_slots() {
     let execution = execution(1);let baseline = execution.context.memory.used_bytes();
@@ -746,7 +867,7 @@ fn failing_duration_average_sum_does_not_start_the_count_pass() {
     let mut states = ScalarGroups::new(&execution).unwrap();
     assert_eq!(states.aggregate(Rows { batch: &page, projected: false, memory: &execution.context.memory },GroupMapping::Global(2),&[true,true],1,Some(0),&aggregate,&types,&scope,&execution).unwrap_err().code,"xtdb.error/unknown");
     assert_eq!(states.values[0].count,0);
-    assert_eq!(states.values[0].accumulator.as_ref().unwrap().values,[Value::Duration { value: 10,unit: TimeUnit::Millisecond }]);
+    assert_eq!(states.values[0].accumulator.retained(), Some(&Value::Duration { value: 10,unit: TimeUnit::Millisecond }));
     drop(states);drop(scope);drop(page);
     assert_eq!(execution.context.memory.used_bytes(),baseline);
 }

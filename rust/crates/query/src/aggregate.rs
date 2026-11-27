@@ -121,7 +121,7 @@ struct AggregateInput { batches: crate::columnar::BoxBatchCursor, projected: boo
 #[derive(Clone, Copy)]
 enum GroupMapping<'a> {
     Global(usize),
-    Grouped(&'a [usize]),
+    Grouped(&'a [i32]),
 }
 
 impl<'a> GroupMapping<'a> {
@@ -130,7 +130,7 @@ impl<'a> GroupMapping<'a> {
             Self::Global(len) => (len, None),
             Self::Grouped(ordinals) => (ordinals.len(), Some(ordinals)),
         };
-        (0..len).map(move |row| ordinals.map_or(0, |groups| groups[row]))
+        (0..len).map(move |row| ordinals.map_or(0, |groups| groups[row] as usize))
     }
 }
 
@@ -291,7 +291,7 @@ impl AggregateCursor {
             context.check_cancelled()?;
             crate::operators::validate_distinct_types(&key_schema)?;
             if batch.len == 0 { continue; }
-            let _mapping = memory.reserve(batch.len.checked_mul(std::mem::size_of::<usize>() + std::mem::size_of::<Option<usize>>())
+            let _mapping = memory.reserve(batch.len.checked_mul(size_of::<i32>())
                 .ok_or_else(|| invalid("aggregate-size", "Group mapping exceeds addressable memory"))?)?;
             let keys = KeyColumns::projection(&batch, group_positions);
             let mut mapping = Vec::with_capacity(batch.len);
@@ -299,7 +299,7 @@ impl AggregateCursor {
                 if ordinal >= i32::MAX as usize {
                     return Err(invalid("group-count", "Aggregate group count exceeds the reference vector limit"));
                 }
-                mapping.push(ordinal);
+                mapping.push(ordinal as i32);
                 Ok(())
             })?;
             let mapping = GroupMapping::Grouped(&mapping);
@@ -382,9 +382,9 @@ impl AggregateCursor {
                         let result = if aggregate.function == AggregateFunction::Average {
                             state.average_double()
                         } else {
-                            match state.accumulator.as_ref().map(|row| &row.values[0]) {
-                                Some(Value::F64(value)) => Some(*value),
-                                None => None,
+                            match state.accumulator {
+                                ScalarState::F64(value) => Some(value),
+                                ScalarState::Empty => None,
                                 _ => return Err(invalid("aggregate-input", "Expected a floating-point aggregate state")),
                             }
                         };
@@ -448,17 +448,36 @@ fn direct_rank_type(ty: &LogicalType) -> bool {
         S::Bool | S::I8 | S::I16 | S::I32 | S::I64 | S::F32 | S::F64 | S::Utf8 | S::Binary))
 }
 
-fn float_column(column: &crate::columnar::Column) -> Option<&arrow_array::Float64Array> {
-    let crate::columnar::Column::Arrow { array, field, .. } = column else { return None };
-    if !field.metadata().is_empty() { return None; }
-    array.as_any().downcast_ref::<arrow_array::Float64Array>()
+fn count_layout(data_type: &DataType) -> bool {
+    use DataType as T;
+    matches!(data_type, T::Boolean | T::Int8 | T::Int16 | T::Int32 | T::Int64
+        | T::UInt8 | T::UInt16 | T::UInt32 | T::UInt64 | T::Float32 | T::Float64
+        | T::Utf8 | T::Binary | T::FixedSizeBinary(_))
 }
-fn marked_nulls(column: &crate::columnar::Column) -> Option<&dyn arrow_array::Array> {
-    use arrow_schema::DataType as T;
-    let crate::columnar::Column::Arrow { array, field, .. } = column else { return None };
-    (field.metadata().is_empty() && matches!(array.data_type(),
-        T::Boolean | T::Int8 | T::Int16 | T::Int32 | T::Int64 | T::UInt8 | T::UInt16 | T::UInt32 | T::UInt64 |
-        T::Float32 | T::Float64 | T::Utf8 | T::Binary | T::FixedSizeBinary(_))).then_some(array.as_ref())
+
+fn accepts_typed_column(column: &Column, accepts_type: impl Fn(&DataType) -> bool) -> bool {
+    let accepts = |array: &dyn Array, field: &arrow_schema::Field, logical: Option<&LogicalType>| {
+        if !field.metadata().is_empty() || field.data_type() != array.data_type() { return false; }
+        if array.data_type() == &DataType::Null {
+            return field.is_nullable() && logical.is_none_or(|ty| *ty == LogicalType::Null);
+        }
+        accepts_type(array.data_type())
+            && logical.is_none_or(|ty| crate::columnar::stable_read_layout(ty, field))
+    };
+    match column {
+        Column::Arrow { array, field, logical } => accepts(array.as_ref(), field, logical.as_ref()),
+        Column::Selected(selected) => selected.source_layouts().all(|(array, field, logical)| accepts(array, field, logical)),
+        Column::Values(_) => false,
+    }
+}
+
+fn present_column_cell(column: &Column, row: usize) -> Result<Option<(&dyn Array, usize)>> {
+    let cell = column.arrow_cell(row).ok_or_else(|| invalid("column-row", "Column row is outside its page"))?;
+    let Some((array, _, _, offset)) = cell else { return Ok(None); };
+    if offset >= array.len() {
+        return Err(rtdb_types::Anomaly::incorrect("rtdb/array-layout", "Arrow array and logical field layout disagree"));
+    }
+    Ok((array.data_type() != &DataType::Null && !array.is_null(offset)).then_some((array, offset)))
 }
 
 impl AggregateCursor {
@@ -471,9 +490,10 @@ impl AggregateCursor {
             let argument = aggregate.argument.as_ref().map(|argument|argument_position(argument,&self.schema)).transpose()?;
             let fits = match (&aggregate.function,argument) {
                 (A::CountStar,_) => true,
-                (A::Count,Some(position)) => marked_nulls(&batch.columns[position]).is_some(),
-                (A::Sum | A::Average,Some(position)) => float_column(&batch.columns[position]).is_some()
-                    && without_nullability(&types.input) == &float && without_nullability(types.output_type()) == &float,
+                (A::Count,Some(position)) => accepts_typed_column(&batch.columns[position], count_layout),
+                (A::Sum | A::Average,Some(position)) =>
+                    without_nullability(&types.input) == &float && without_nullability(types.output_type()) == &float
+                        && accepts_typed_column(&batch.columns[position], |ty| *ty == DataType::Float64),
                 _ => false,
             };
             if !fits { return Ok(false); }
@@ -484,6 +504,7 @@ impl AggregateCursor {
     fn reduce_typed(&self, batch: &ColumnBatch, mapping: GroupMapping<'_>, group_count: usize, columns: &mut [AggregateColumn]) -> Result<()> {
         use AggregateFunction as A;
         let types = self.runtime.aggregates()?;
+        let float = LogicalType::Scalar(ScalarType::F64);
         for ((column,aggregate),types) in columns.iter_mut().zip(&self.aggregates).zip(types) {
             validate_aggregate_input(aggregate,types)?;
             let Accumulation::Scalar(states) = &mut column.accumulation else { return Err(invalid("aggregate-input","A typed aggregate collects its rows")) };
@@ -495,26 +516,38 @@ impl AggregateCursor {
                     states.values[group].count = states.values[group].count.wrapping_add(1);
                 },
                 (A::Count,Some(position)) => {
-                    let array = marked_nulls(&batch.columns[position]).ok_or_else(||invalid("aggregate-input","A typed count lost its column"))?;
+                    let column = &batch.columns[position];
+                    let direct = match column {
+                        Column::Arrow { array, .. } if array.len() >= batch.len && array.data_type() != &DataType::Null => Some(array.as_ref()),
+                        _ => None,
+                    };
                     for (row, group) in mapping.iter().enumerate() {
                         self.execution.context.check_cancelled_at(row)?;
-                        if !array.is_null(row) { states.values[group].count = states.values[group].count.wrapping_add(1); }
+                        let present = match direct {
+                            Some(array) => !array.is_null(row),
+                            None => present_column_cell(column, row)?.is_some(),
+                        };
+                        if present { states.values[group].count = states.values[group].count.wrapping_add(1); }
                     }
                 }
                 (A::Sum | A::Average,Some(position)) => {
-                    let array = float_column(&batch.columns[position]).ok_or_else(||invalid("aggregate-input","A typed sum lost its column"))?;
+                    let column = &batch.columns[position];
+                    let direct = match column {
+                        Column::Arrow { array, .. } if array.len() >= batch.len =>
+                            array.as_any().downcast_ref::<arrow_array::Float64Array>(),
+                        _ => None,
+                    };
+                    let average = aggregate.function == A::Average;
                     for (row, group) in mapping.iter().enumerate() {
                         self.execution.context.check_cancelled_at(row)?;
-                        if array.is_null(row) { continue; }
-                        let value = array.value(row);
+                        let value = match direct {
+                            Some(array) => (!array.is_null(row)).then(|| array.value(row)),
+                            None => present_column_cell(column, row)?.map(|(array, offset)| array.as_primitive::<Float64Type>().value(offset)),
+                        };
+                        let Some(value) = value else { continue; };
                         let state = &mut states.values[group];
-                        if let Some(accumulator) = &mut state.accumulator {
-                            let Value::F64(sum) = &mut accumulator.values[0] else { return Err(sum_state()); };
-                            *sum += value;
-                        } else {
-                            state.accumulator = Some(OwnedRow::new(vec![Value::F64(value)], &states.state)?);
-                        }
-                        if aggregate.function == A::Average { state.count = state.count.wrapping_add(1); }
+                        state.add_numeric(NumericCell::Float64(value), &float)?;
+                        if average { state.count = state.count.wrapping_add(1); }
                     }
                 }
                 _ => return Err(invalid("aggregate-input","A typed aggregate has no typed accumulator")),
@@ -1203,18 +1236,12 @@ impl ScalarGroups {
             let state = &mut self.values[group];
             if let Some(column) = &numeric {
                 if let Some(value) = column.get(index) {
-                    state.add_numeric(value, summer.output, &self.state)?;
+                    state.add_numeric(value, summer.output)?;
                 }
                 continue;
             }
             let value = page.value(index,argument)?;
-            if let Some(next) = summer.add(state.accumulator.as_ref().map(|row|&row.values[0]),value.as_ref(),index)? {
-                match &mut state.accumulator {
-                    // A sum that retains what the previous one did reuses its cell and charge.
-                    Some(accumulator) if accumulator.values[0].retained_bytes()? == next.retained_bytes()? => accumulator.values[0] = next,
-                    accumulator => *accumulator = Some(OwnedRow::new(vec![next],&self.state)?),
-                }
-            }
+            summer.add(state, value.as_ref(), index, &self.state)?;
         }
         Ok(())
     }
@@ -1230,41 +1257,60 @@ impl ScalarGroups {
     }
 }
 #[derive(Default)]
-struct ScalarAccumulator { count: i64, accumulator: Option<OwnedRow>, squares: Option<f64> }
+enum ScalarState {
+    #[default]
+    Empty,
+    I32(i32),
+    I64(i64),
+    F32(f32),
+    F64(f64),
+    Retained(OwnedRow),
+}
+
+impl ScalarState {
+    fn retained(&self) -> Option<&Value> {
+        match self {
+            Self::Retained(row) => Some(&row.values[0]),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ScalarAccumulator { count: i64, accumulator: ScalarState, squares: Option<f64> }
 impl ScalarAccumulator {
-    fn add_numeric(&mut self, value: NumericCell, output: &LogicalType, state: &Arc<rtdb_columnar::MemoryBudget>) -> Result<()> {
-        let previous = self.accumulator.as_mut().map(|row| &mut row.values[0]);
-        let next = match (output, previous, value) {
-            (LogicalType::Scalar(ScalarType::I32), Some(Value::I32(sum)), NumericCell::Integer(value)) => {
+    fn add_numeric(&mut self, value: NumericCell, output: &LogicalType) -> Result<()> {
+        use ScalarState as S;
+        self.accumulator = match (output, &mut self.accumulator, value) {
+            (LogicalType::Scalar(ScalarType::I32), S::I32(sum), NumericCell::Integer(value)) => {
                 *sum = sum.wrapping_add(value as i32);
                 return Ok(());
             }
-            (LogicalType::Scalar(ScalarType::I64), Some(Value::I64(sum)), NumericCell::Integer(value)) => {
+            (LogicalType::Scalar(ScalarType::I64), S::I64(sum), NumericCell::Integer(value)) => {
                 *sum = sum.wrapping_add(value);
                 return Ok(());
             }
-            (LogicalType::Scalar(ScalarType::F32), Some(Value::F32(sum)), value) => {
+            (LogicalType::Scalar(ScalarType::F32), S::F32(sum), value) => {
                 *sum += value.as_f32();
                 return Ok(());
             }
-            (LogicalType::Scalar(ScalarType::F64), Some(Value::F64(sum)), value) => {
+            (LogicalType::Scalar(ScalarType::F64), S::F64(sum), value) => {
                 *sum += value.as_f64();
                 return Ok(());
             }
-            (LogicalType::Scalar(ScalarType::I32), None, NumericCell::Integer(value)) => Value::I32(value as i32),
-            (LogicalType::Scalar(ScalarType::I64), None, NumericCell::Integer(value)) => Value::I64(value),
-            (LogicalType::Scalar(ScalarType::F32), None, value) => Value::F32(value.as_f32()),
-            (LogicalType::Scalar(ScalarType::F64), None, value) => Value::F64(value.as_f64()),
+            (LogicalType::Scalar(ScalarType::I32), S::Empty, NumericCell::Integer(value)) => S::I32(value as i32),
+            (LogicalType::Scalar(ScalarType::I64), S::Empty, NumericCell::Integer(value)) => S::I64(value),
+            (LogicalType::Scalar(ScalarType::F32), S::Empty, value) => S::F32(value.as_f32()),
+            (LogicalType::Scalar(ScalarType::F64), S::Empty, value) => S::F64(value.as_f64()),
             _ => return Err(sum_state()),
         };
-        self.accumulator = Some(OwnedRow::new(vec![next], state)?);
         Ok(())
     }
 
     fn numeric_extremum(&mut self, value: NumericCell, output: &LogicalType, minimum: bool, state: &Arc<rtdb_columnar::MemoryBudget>) -> Result<()> {
         use crate::scalar_key::ScalarKey;
-        if let Some(previous) = &self.accumulator {
-            let previous = match &previous.values[0] {
+        if let Some(previous) = self.accumulator.retained() {
+            let previous = match previous {
                 Value::I8(value) => ScalarKey::Signed(i64::from(*value)),
                 Value::I16(value) => ScalarKey::Signed(i64::from(*value)),
                 Value::I32(value) => ScalarKey::Signed(i64::from(*value)),
@@ -1286,7 +1332,7 @@ impl ScalarAccumulator {
             (LogicalType::Scalar(ScalarType::F64), NumericCell::Float64(value)) => Value::F64(value),
             _ => return Err(invalid("aggregate-state", "Numeric extremum does not match its output vector")),
         };
-        self.accumulator = Some(OwnedRow::new(vec![next], state)?);
+        self.accumulator = ScalarState::Retained(OwnedRow::new(vec![next], state)?);
         Ok(())
     }
 
@@ -1295,7 +1341,7 @@ impl ScalarAccumulator {
         let value = value.clone();
         if matches!(value, Value::Null | Value::Undefined) { return Ok(()); }
         use AggregateFunction as A;
-        let previous = self.accumulator.as_ref().map(|row| &row.values[0]);
+        let previous = self.accumulator.retained();
         let next = match &aggregate.function {
             A::Min | A::Max => {
                 let value = cast(&value, types.output_type(), &execution.context.timezone)?;
@@ -1316,13 +1362,13 @@ impl ScalarAccumulator {
             }
             _ => unreachable!(),
         };
-        if let Some(next) = next { self.accumulator = Some(OwnedRow::new(vec![next], state)?); }
+        if let Some(next) = next { self.accumulator = ScalarState::Retained(OwnedRow::new(vec![next], state)?); }
         Ok(())
     }
     fn average_double(&self) -> Option<f64> {
         if self.count == 0 { return None; }
-        match self.accumulator.as_ref().map(|row| &row.values[0]) {
-            Some(Value::F64(sum)) => Some(*sum / self.count as f64),
+        match self.accumulator {
+            ScalarState::F64(sum) => Some(sum / self.count as f64),
             _ => None,
         }
     }
@@ -1330,10 +1376,7 @@ impl ScalarAccumulator {
     fn variance_double(&self, function: &AggregateFunction) -> Option<f64> {
         use AggregateFunction as A;
         let sample = matches!(function, A::VarianceSample | A::StddevSample);
-        let sum = match self.accumulator.as_ref().map(|row| &row.values[0]) {
-            Some(Value::F64(sum)) => *sum,
-            _ => return None,
-        };
+        let ScalarState::F64(sum) = self.accumulator else { return None; };
         if self.count < if sample { 2 } else { 1 } { return None; }
         let variance = (self.squares? - sum * sum / self.count as f64) / (self.count - i64::from(sample)) as f64;
         Some(if matches!(function, A::StddevPopulation | A::StddevSample) { variance.sqrt() } else { variance })
@@ -1341,17 +1384,24 @@ impl ScalarAccumulator {
 
     fn finish(&self,aggregate: &AggregateExpr,output: &rtdb_expr::EvaluationScope) -> Result<Value> {
         use AggregateFunction as A;
-        if let Some(accumulator) = &self.accumulator { output.reserve(accumulator.values[0].retained_bytes()?)?; }
+        if let Some(value) = self.accumulator.retained() { output.reserve(value.retained_bytes()?)?; }
         let value = match &aggregate.function {
             A::Count | A::CountStar => Value::I64(self.count),
             A::Average if self.count == 0 => Value::Null,
-            A::Average => match self.accumulator.as_ref().map(|row| &row.values[0]) {
+            A::Average => match self.accumulator.retained() {
                 Some(Value::Duration { value, unit }) => Value::Duration { value: value.wrapping_div(self.count), unit: *unit },
                 _ => self.average_double().map_or(Value::Null, Value::F64),
             },
             A::VariancePopulation | A::VarianceSample | A::StddevPopulation | A::StddevSample =>
                 self.variance_double(&aggregate.function).map_or(Value::Null, Value::F64),
-            _ => self.accumulator.as_ref().map_or(Value::Null, |row| row.values[0].clone()),
+            _ => match &self.accumulator {
+                ScalarState::Empty => Value::Null,
+                ScalarState::I32(sum) => Value::I32(*sum),
+                ScalarState::I64(sum) => Value::I64(*sum),
+                ScalarState::F32(sum) => Value::F32(*sum),
+                ScalarState::F64(sum) => Value::F64(*sum),
+                ScalarState::Retained(row) => row.values[0].clone(),
+            },
         };
         Ok(value)
     }
@@ -1408,30 +1458,23 @@ impl<'a> SumFactory<'a> {
         validate_sum_factory(input,without_nullability(output))?;
         Ok(Self { input,output: without_nullability(output) })
     }
-    fn add(&self,previous: Option<&Value>,value: &Value,index: usize) -> Result<Option<Value>> {
+    fn add(&self, state: &mut ScalarAccumulator, value: &Value, index: usize, memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<()> {
         use ScalarType as S;
         let null = matches!(value,Value::Null | Value::Undefined);
         if null && matches!(without_nullability(self.input),LogicalType::Scalar(S::Duration(_))) {
             return Err(rtdb_types::Anomaly::fault("xtdb.error/unknown",format!("null at index {index}")));
         }
         if null && !matches!((without_nullability(self.input),self.output),
-            (LogicalType::Scalar(S::Decimal { .. }),LogicalType::Scalar(S::Decimal { .. }))) { return Ok(None); }
-        let output = match self.output {
-            LogicalType::Scalar(S::I32) => {
-                let value = signed_integer(value)? as i32;
-                Value::I32(match previous { Some(Value::I32(previous)) => previous.wrapping_add(value),None => value,_ => return Err(sum_state()) })
-            }
-            LogicalType::Scalar(S::I64) => {
-                let value = signed_integer(value)?;
-                Value::I64(match previous { Some(Value::I64(previous)) => previous.wrapping_add(value),None => value,_ => return Err(sum_state()) })
-            }
+            (LogicalType::Scalar(S::Decimal { .. }),LogicalType::Scalar(S::Decimal { .. }))) { return Ok(()); }
+        let previous = state.accumulator.retained();
+        let next = match self.output {
+            LogicalType::Scalar(S::I32 | S::I64) =>
+                return state.add_numeric(NumericCell::Integer(signed_integer(value)?), self.output),
             LogicalType::Scalar(S::F32) => {
-                let value = vector_float(value)?;
-                Value::F32(match previous { Some(Value::F32(previous)) => previous + value,None => value,_ => return Err(sum_state()) })
+                return state.add_numeric(NumericCell::Float32(vector_float(value)?), self.output);
             }
             LogicalType::Scalar(S::F64) => {
-                let value = vector_double(value)?;
-                Value::F64(match previous { Some(Value::F64(previous)) => previous + value,None => value,_ => return Err(sum_state()) })
+                return state.add_numeric(NumericCell::Float64(vector_double(value)?), self.output);
             }
             LogicalType::Scalar(S::Decimal { precision,scale,bit_width }) => Value::Decimal(rtdb_expr::decimal_sum(previous.map(decimal_value).transpose()?,if null { None } else { Some(decimal_value(value)?) },*precision,*scale,*bit_width)?),
             LogicalType::Scalar(S::Duration(unit)) => {
@@ -1443,7 +1486,11 @@ impl<'a> SumFactory<'a> {
             }
             _ => return Err(sum_state()),
         };
-        Ok(Some(output))
+        match &mut state.accumulator {
+            ScalarState::Retained(row) if row.values[0].retained_bytes()? == next.retained_bytes()? => row.values[0] = next,
+            accumulator => *accumulator = ScalarState::Retained(OwnedRow::new(vec![next], memory)?),
+        }
+        Ok(())
     }
 }
 
