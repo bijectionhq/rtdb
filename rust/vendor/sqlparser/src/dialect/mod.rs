@@ -636,10 +636,12 @@ pub trait Dialect: Debug + Any {
         false
     }
 
+    /// Requires both operand separators in a three-argument `SUBSTRING` to use the same form.
     fn requires_consistent_substring_separators(&self) -> bool {
         false
     }
 
+    /// Requires a direction, a row keyword, and `ONLY` or `WITH TIES` in `FETCH`.
     fn requires_complete_fetch_syntax(&self) -> bool {
         false
     }
@@ -1160,6 +1162,7 @@ pub trait Dialect: Debug + Any {
         false
     }
 
+    /// Allows an alias after extra parentheses around a lone table factor.
     fn supports_alias_on_wrapped_table_factor(&self) -> bool {
         true
     }
