@@ -488,6 +488,13 @@ Historical JSONL without a recorded selection and process receipts remains diagn
 The summary prints the upstream commit the run loaded, or says the run does not measure upstream conformance, and lists uncovered exclusions (a recorded failure outside the decision), stale ones (the Var no longer fails) and absent ones (the Var is gone from its namespace).
 Review and edit the list from those lines after every run; the shipped entries were seeded from a run over the fork's edited tests that kept only first failures, so expect uncovered and stale entries on the first upstream run.
 
+== Native CI coverage
+
+The native push jobs run Rust unit and integration targets for the transaction, query, node, pgwire, Flight SQL, FFI, format, conformance and simulation crates.
+The native binding job also runs the upstream Clojure corpus, and the native SLT job runs the original direct SQL and numbered SQL logic selections.
+Both corpus jobs fetch the SHA in `upstream-commit.txt` and retain their summaries and available diagnostics as CI artifacts.
+The original JVM test, property, and SQL logic jobs continue to exercise the JVM implementation.
+
 == Corpus-backed assertion ledger
 
 `corpus_ledger.py` derives the assertion ledger, the `--invocations` bindings and the native inventory that `runtime_inventory.py` reconciles, from the source inventory, a recorded reference runtime inventory and a native corpus run.
