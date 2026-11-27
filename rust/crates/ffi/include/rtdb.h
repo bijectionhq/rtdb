@@ -80,6 +80,11 @@ int32_t rtdb_v1_database_flush_all(RtdbHandle handle, int64_t timeout_nanos, Rtd
  * began. timeout_nanos is a positive overall deadline.
  */
 int32_t rtdb_v1_database_sync_all(RtdbHandle handle, int64_t timeout_nanos, RtdbHandle *error);
+/* Requests compaction for the named database and awaits all scheduled output becoming visible.
+ * timeout_nanos bounds the wait. Compaction can continue after a timeout.
+ */
+int32_t rtdb_v1_database_compact(RtdbHandle handle, const uint8_t *name, size_t name_length,
+                                 int64_t timeout_nanos, RtdbHandle *error);
 /* Listener ports are -1 when absent. Host calls write UTF-8 without a terminator.
  * A wildcard address is reported as localhost; absent listeners write length 0.
  */

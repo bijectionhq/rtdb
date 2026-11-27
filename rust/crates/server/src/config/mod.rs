@@ -56,6 +56,7 @@ pub struct IndexerSettings { pub log_limit: usize, pub page_limit: usize, pub ro
 #[derive(Clone, Debug)]
 pub struct CompactorSettings {
     pub threads: usize,
+    pub automatic: bool,
     pub run_end_encoded_iids: bool,
     pub within_file_recency_branching: bool,
     pub scan_tie_order_from_naming_epoch: Option<std::num::NonZeroU64>,
@@ -406,12 +407,13 @@ fn indexer(value: Option<Yaml>, environment: &impl Fn(&str) -> Option<String>) -
 fn compactor(value: Option<Yaml>, environment: &impl Fn(&str) -> Option<String>) -> Result<CompactorSettings> {
     let mut fields = YamlFields::new(value.unwrap_or_else(empty), "compactor")?;
     let threads = fields.integer("threads")?.map_or_else(|| NodeOptions::default_compaction_threads(environment), |threads| threads.max(0) as usize);
+    let automatic = fields.boolean("automatic")?.unwrap_or(true);
     let opt_in_221 = fields.boolean("optIn221")?.unwrap_or_else(|| env_boolean(environment, "XTDB_COMPACTOR_221_OPT_IN"));
     let scan_tie_order_from_naming_epoch = fields.integer("scanTieOrderFromNamingEpoch")?
         .map(|epoch| u64::try_from(epoch).ok().and_then(std::num::NonZeroU64::new)
             .ok_or_else(|| invalid("compactor.scanTieOrderFromNamingEpoch must be positive"))).transpose()?;
     fields.finish()?;
-    Ok(CompactorSettings { threads, run_end_encoded_iids: opt_in_221, within_file_recency_branching: opt_in_221, scan_tie_order_from_naming_epoch })
+    Ok(CompactorSettings { threads, automatic, run_end_encoded_iids: opt_in_221, within_file_recency_branching: opt_in_221, scan_tie_order_from_naming_epoch })
 }
 fn garbage(value: Option<Yaml>) -> Result<GarbageSettings> {
     let mut fields = YamlFields::new(value.unwrap_or_else(empty), "garbageCollector")?;

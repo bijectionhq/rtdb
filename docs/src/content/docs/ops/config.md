@@ -295,6 +295,10 @@ compactor:
   threads: 4
 ```
 
+RTDB embedded nodes support `compactor.automatic: false` to run compaction on request.
+Use a positive thread count and call `NativeDatabase.compact(database, timeout)` or `rtdb_v1_database_compact` to wait for the compacted tries to become visible.
+The timeout bounds the caller's wait, and the compactor can continue processing after it expires.
+
 ### Indexer
 
 Responsible for indexing transactions from the [transaction log](config/log).

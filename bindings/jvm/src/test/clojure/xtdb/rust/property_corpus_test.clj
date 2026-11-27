@@ -33,7 +33,7 @@
                   :predicate (fn [n]
                                (vswap! inputs conj n)
                                (= n (expression/project1 '(character-length a) {:a "€☃😀"})))}]
-    (corpus/with-native-observers
+    (corpus/with-observers
       "defspec"
       (fn []
         (let [result (corpus/sweep property settings (constantly nil))
@@ -60,7 +60,7 @@
     (t/is (= :unobserved (get-in result [:failure :first_evidence :outcome])))))
 
 (t/deftest native-interval-projection-keeps-its-qualifier-literal
-  (corpus/with-native-observers
+  (corpus/with-observers
     "defspec"
     (fn []
       (let [{:keys [outcome observations]}

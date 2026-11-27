@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run or replay independently counted native properties from the pinned XTDB corpus."""
+"""Run or replay the native and JVM reader properties from the pinned XTDB corpus."""
 
 import argparse
 import json
@@ -13,15 +13,18 @@ from run_controls import HERE, REPOSITORY, digest, git, run_process, write_json
 
 MANIFEST = HERE / "property-corpus.json"
 COUNTS = ("planned_trials", "passed_trials", "failed_trials", "unobserved_trials")
+NATIVE_OBSERVATIONS = {"sql_query", "logical_query", "numeric_anomaly"}
+JVM_OBSERVATIONS = {"jvm_vector_reader"}
 
 
-def plan_cases(manifest, family, case_name, seed, trials, max_size):
+def plan_cases(manifest, family, case_name, seed, trials, max_size, coverage=None):
     selected = []
     reports = []
     for group in manifest["families"]:
-        if family and group["id"] != family:
+        domain = "jvm-reference" if group["kind"] == "jvm-vector" else "native"
+        if (family and group["id"] != family) or (coverage and domain != coverage):
             continue
-        report = {"family": group["id"], "pinned_vars": len(group["cases"]),
+        report = {"family": group["id"], "coverage": domain, "pinned_vars": len(group["cases"]),
                   "implemented_vars": 0, "selected_vars": 0, "unported_vars": []}
         for item in group["cases"]:
             case = dict(item, family=group["id"], namespace=group["namespace"],
@@ -72,6 +75,7 @@ def summarize(plan, rows, completed):
         receipts = by_case[case_key(case)]
         terminals = [row for row in receipts if row["event"] == "case_complete"]
         trials = [row for row in receipts if row["event"] == "trial"]
+        observations = JVM_OBSERVATIONS if case["kind"] == "jvm-vector" else NATIVE_OBSERVATIONS
         observed = [row["evidence"]["outcome"] for row in trials]
         passed = observed.count("passed")
         failed = len(observed) - passed
@@ -81,7 +85,7 @@ def summarize(plan, rows, completed):
                         and len(trials) <= planned and failed <= 1
                         and all(outcome == "passed" for outcome in observed[:-1])
                         and all(outcome in {"passed", "invariant_failed", "error", "unobserved"} for outcome in observed)
-                        and all(any(event.get("kind") in {"sql_query", "logical_query"}
+                        and all(any(event.get("kind") in observations
                                     for event in row["evidence"]["observations"])
                                 for row in trials if row["evidence"]["outcome"] in {"passed", "invariant_failed"}))
         terminal = terminals[0] if len(terminals) == 1 else {}
@@ -113,33 +117,49 @@ def read_stream(path):
     return rows
 
 
+def jvm_command(java, classpath, source, library, plan, output):
+    source_dirs = [source / "src" / group / kind
+                   for group in ("test", "testFixtures") for kind in ("clojure", "resources")]
+    return [java, "--enable-native-access=ALL-UNNAMED", "--add-opens=java.base/java.nio=ALL-UNNAMED",
+            "-Xmx4g", "-XX:-OmitStackTraceInFastThrow", "-Dio.netty.noUnsafe=false",
+            "-Dio.netty.tryReflectionSetAccessible=true", "-Dfile.encoding=UTF-8",
+            "-Duser.language=en", "-Duser.country=US", "-Duser.timezone=UTC",
+            *([f"-Dxtdb.native.library={library}"] if library else []),
+            "-cp", os.pathsep.join([*map(str, source_dirs), classpath]),
+            "clojure.main", "-m", "xtdb.rust.property-corpus", plan, MANIFEST, source, output]
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("native_library", type=Path)
+    parser.add_argument("native_library", type=Path, nargs="?", help="required for native properties")
     parser.add_argument("output", type=Path)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--family")
     mode.add_argument("--replay", type=Path)
     parser.add_argument("--case", help="exact upstream namespace/Var")
+    parser.add_argument("--coverage", choices=("native", "jvm-reference"))
     parser.add_argument("--seed", type=int, default=6269)
     parser.add_argument("--trials", type=int)
     parser.add_argument("--max-size", type=int, default=32)
     parser.add_argument("--timeout", type=int, default=1800)
+    parser.add_argument("--jvm-classpath", help="prebuilt bindings and XTDB test dependencies for direct Java execution")
+    parser.add_argument("--java", default="java", help="Java executable for --jvm-classpath")
     args = parser.parse_args(argv)
     if (not -(1 << 63) <= args.seed < 1 << 63 or not 1 <= args.max_size <= 200
             or (args.trials is not None and not 1 <= args.trials <= 1000) or args.timeout <= 0):
         parser.error("seed must fit i64, max size must be 1–200, trials must be 1–1000, and timeout must be positive")
-    if args.replay and args.case:
-        parser.error("--case selects generated trials")
+    if args.replay and (args.case or args.coverage):
+        parser.error("--case and --coverage select generated trials")
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
     if manifest["upstream_commit"] != (HERE / "upstream-commit.txt").read_text(encoding="ascii").strip():
         parser.error("property manifest needs review against the updated upstream inventory baseline")
-    library = args.native_library.resolve(strict=True)
-    if not library.is_file():
+    library = args.native_library.resolve() if args.native_library else None
+    if library is not None and not library.is_file():
         parser.error("native library must be a regular file")
     plan = {"schema_version": 1, "mode": "replay" if args.replay else "sweep",
             "upstream_commit": manifest["upstream_commit"], "manifest_sha256": digest(MANIFEST),
-            "native_library_sha256": digest(library), "runner_checkout": git(REPOSITORY, "rev-parse", "HEAD"),
+            "native_library_sha256": digest(library) if library else None,
+            "runner_checkout": git(REPOSITORY, "rev-parse", "HEAD"),
             "runner_checkout_dirty": bool(git(REPOSITORY, "status", "--porcelain"))}
     output = args.output.resolve()
     if args.replay:
@@ -153,28 +173,34 @@ def main(argv=None):
     else:
         try:
             plan["selected"], plan["families"] = plan_cases(manifest, args.family, args.case, args.seed,
-                                                           args.trials, args.max_size)
+                                                           args.trials, args.max_size, args.coverage)
         except ValueError as exc:
             parser.error(str(exc))
+        if library is None and any(item["case"]["kind"] != "jvm-vector" for item in plan["selected"]):
+            parser.error("native properties require a native library")
         output.mkdir(parents=True)
     plan_path = output / "selection.json"
     write_json(plan_path, plan)
     source = output / ".upstream-tests"
     env = {**os.environ, "XTDB_UPSTREAM_COMMIT": manifest["upstream_commit"]}
     subprocess.run([HERE / "upstream_tests.sh", source], cwd=REPOSITORY, check=True, env=env)
-    process = run_process(
-        [REPOSITORY / "gradlew", "--no-daemon", "--console=plain", "-I", HERE / "property-corpus.init.gradle",
-         ":bindings:xtdb-rust-bindings:propertyCorpus", f"-PcorpusSources={source}",
-         f"-Dxtdb.native.library={library}", f"-Prtdb.propertyPlan={plan_path}",
-         f"-Prtdb.propertyManifest={MANIFEST}", f"-Prtdb.propertyOutput={output}"],
-        REPOSITORY, output / "stdout.log", output / "stderr.log", args.timeout,
-    )
+    if args.jvm_classpath:
+        command = jvm_command(args.java, args.jvm_classpath, source, library, plan_path, output)
+    else:
+        command = [REPOSITORY / "gradlew", "--no-daemon", "--console=plain", "-I", HERE / "property-corpus.init.gradle",
+                   ":bindings:xtdb-rust-bindings:propertyCorpus", f"-PcorpusSources={source}",
+                   *([f"-Dxtdb.native.library={library}"] if library else []),
+                   f"-Prtdb.propertyPlan={plan_path}",
+                   f"-Prtdb.propertyManifest={MANIFEST}", f"-Prtdb.propertyOutput={output}"]
+    process = run_process(command, REPOSITORY, output / "stdout.log", output / "stderr.log", args.timeout)
     write_json(output / "process.json", process)
     rows = read_stream(output / "properties.jsonl")
     result = summarize(plan, rows, process["completed"] and process.get("exit_code") == 0)
     write_json(output / "summary.json", result)
     print(json.dumps(result, indent=2))
-    return 0 if result["execution_complete"] and result.get("all_selected_passed", True) else 1
+    passed = (result["replay"]["reproduced"] if args.replay and result["execution_complete"]
+              else result.get("all_selected_passed", False))
+    return 0 if result["execution_complete"] and passed else 1
 
 
 if __name__ == "__main__":

@@ -23,17 +23,17 @@
         {"name": "multiple-writes-to-doc", "line": 17},
         {"name": "multiple-writes-to-doc-in-same-tx", "line": 40},
         {"name": "mixed-records-flush-boundary", "line": 64},
-        {"name": "mixed-records-flush-and-compact-boundary", "line": 84, "unported": "requires a native compact-all observer"},
+        {"name": "mixed-records-flush-and-compact-boundary", "line": 84},
         {"name": "mixed-records-flush-and-live-boundary", "line": 106},
         {"name": "mixed-records-live-boundary", "line": 125},
-        {"name": "type-change-across-blocks", "line": 142, "unported": "requires a native compact-all observer"},
-        {"name": "single-typed-value-to-nils-across-blocks", "line": 167, "unported": "requires a native compact-all observer"},
+        {"name": "type-change-across-blocks", "line": 142},
+        {"name": "single-typed-value-to-nils-across-blocks", "line": 167},
         {"name": "delete-records-across-flush-boundaries", "line": 191},
         {"name": "deleting-all-from-table-across-flush-boundaries", "line": 245},
         {"name": "erase-records-across-flush-boundaries", "line": 268},
         {"name": "erase-and-re-add-record-across-flush-boundaries", "line": 288},
         {"name": "erasing-all-from-table-across-flush-boundaries", "line": 319},
-        {"name": "mixed-ops-across-boundaries", "line": 339, "unported": "requires a native compact-all observer and a mapping for the original CREATE TABLE setup"},
+        {"name": "mixed-ops-across-boundaries", "line": 339},
         {"name": "local-log-restart-block-boundary", "line": 360},
         {"name": "updates-adding-new-keys-cross-boundaries", "line": 409},
         {"name": "update-deduplication", "line": 470},
@@ -86,10 +86,10 @@
       "namespace": "xtdb.expression-test",
       "source": "src/test/clojure/xtdb/expression_test.clj",
       "kind": "defspec",
-      "default_trials": 0,
+      "default_trials": 32,
       "cases": [
-        {"name": "mod-double-is-equiv-to-core-mod-prop", "line": 1644, "unported": "requires an adapter for the JVM helper and numeric exception outcome"},
-        {"name": "mod-is-equiv-to-core-mod-cast-to-lub-prop", "line": 1662, "unported": "requires a native typed projection and anomaly comparison adapter"}
+        {"name": "mod-double-is-equiv-to-core-mod-prop", "line": 1644},
+        {"name": "mod-is-equiv-to-core-mod-cast-to-lub-prop", "line": 1662}
       ]
     },
     {
@@ -121,16 +121,16 @@
       "id": "vector-reader",
       "namespace": "xtdb.vector.reader-test",
       "source": "src/test/clojure/xtdb/vector/reader_test.clj",
-      "kind": "test",
-      "default_trials": 0,
+      "kind": "jvm-vector",
+      "default_trials": 32,
       "cases": [
-        {"name": "vector-read-what-you-write", "line": 13, "unported": "directly exercises JVM Arrow vector classes and layout"},
-        {"name": "full-vector-copy-preserves-data", "line": 35, "unported": "directly exercises JVM Arrow vector classes and layout"},
-        {"name": "partial-vector-copy-preserves-data", "line": 43, "unported": "directly exercises JVM Arrow vector classes and layout"},
-        {"name": "copy-two-distinct-single-typed-vectors", "line": 64, "unported": "directly exercises JVM Arrow vector classes and layout"},
-        {"name": "copy-two-duvs", "line": 75, "unported": "directly exercises JVM Arrow vector classes and layout"},
-        {"name": "multiple-type-promotions", "line": 86, "unported": "directly exercises JVM Arrow vector classes and layout"},
-        {"name": "multiple-open-slice-calls", "line": 101, "unported": "directly exercises JVM Arrow vector classes and layout"}
+        {"name": "vector-read-what-you-write", "line": 13},
+        {"name": "full-vector-copy-preserves-data", "line": 35},
+        {"name": "partial-vector-copy-preserves-data", "line": 43},
+        {"name": "copy-two-distinct-single-typed-vectors", "line": 64},
+        {"name": "copy-two-duvs", "line": 75},
+        {"name": "multiple-type-promotions", "line": 86},
+        {"name": "multiple-open-slice-calls", "line": 101}
       ]
     }
   ]

@@ -865,6 +865,7 @@ config {
     -- The worst-case interval over which an external source's upstream must retain its log, so the value bounds more than block cadence.
     flush_timeout: Duration = 15.minutes
     rows_per_block: Integer = 102400
+    -- Native YAML exposes this setting as compactor.automatic.
     automatic_compaction: Boolean = true
 }
 
@@ -1951,6 +1952,10 @@ rule FollowerHandlesBlockUploaded {
 
 -- The signal-driven wake rule covers automatic compaction.
 -- In native manual mode, compaction schedules jobs only while a compact-all request is pending.
+-- An embedded host can request compaction for a named open database with an enabled compactor.
+-- Success means the requested compaction jobs have published visible outputs.
+-- The host's wait is bounded by the request deadline.
+-- Submitted compaction work can continue after that deadline.
 -- Job selection and the merge algorithm are compaction.allium's.
 -- The compactor writes L1+ tries to the SOURCE log, and the leader forwards them to the replica log.
 

@@ -558,6 +558,28 @@ Historical JSONL without a recorded selection and process receipts remains diagn
 The summary prints the upstream commit the run loaded, or says the run does not measure upstream conformance, and lists uncovered exclusions (a recorded failure outside the decision), stale ones (the Var no longer fails) and absent ones (the Var is gone from its namespace).
 Review and edit the list from those lines after every run; the shipped entries were seeded from a run over the fork's edited tests that kept only first failures, so expect uncovered and stale entries on the first upstream run.
 
+=== Pinned property corpus
+
+`run_property_corpus.py` runs the pinned test.check 1.1.3 generators and predicates with a deterministic seed and family-specific trial counts.
+The native lane exercises document transactions, manual compaction, and typed scalar projections through the JVM binding.
+The JVM reference lane runs the seven vector-reader Vars through XTDB's Arrow vectors and reports its own coverage denominator.
+The default sweep plans 1,440 native trials across 60 Vars and 224 JVM trials across seven Vars.
+The summary accounts for passed, failed, and unobserved trials per family.
+When shrinking finishes, the runner writes a replay token with the original and smallest counterexamples.
+The trial stream records the first failure before shrinking begins.
+
+Use `--jvm-classpath` with prebuilt binding classes, the binding's main and test Clojure paths, and the pinned XTDB runtime and test dependencies to launch Java directly.
+Use `--family`, `--case` or `--coverage` to select a subset, and give every invocation a fresh output path.
+With `--coverage jvm-reference`, supply only the output path to run the vector-reader cases without a native library.
+
+[source,shell]
+----
+python3 rust/conformance/run_property_corpus.py "$native_library" "$sweep_output" \
+  --java "$java" --jvm-classpath "$property_classpath"
+python3 rust/conformance/run_property_corpus.py "$native_library" "$replay_output" \
+  --java "$java" --jvm-classpath "$property_classpath" --replay "$token"
+----
+
 === Fallible anti-join residuals
 
 link:fixtures/anti-join-contract.json[The anti-join contract fixture] supplies both engines with the same ordered build rows and a fallible division predicate.

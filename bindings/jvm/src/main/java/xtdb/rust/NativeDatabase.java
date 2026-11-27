@@ -196,6 +196,27 @@ public final class NativeDatabase extends NativeResource implements AdbcDatabase
         abi.call("database_sync_all", handle(), nanos);
     }
 
+    /**
+     * Requests compaction of the named database and waits for its output to become visible.
+     * Compaction can continue after the caller's timeout expires.
+     */
+    public void compact(String database, Duration timeout) throws AdbcException {
+        if (database == null || database.isBlank())
+            throw AdbcException.invalidArgument("Compaction requires a database name");
+        if (timeout == null || timeout.isZero() || timeout.isNegative())
+            throw AdbcException.invalidArgument("Compaction timeout must be positive");
+        long nanos;
+        try {
+            nanos = timeout.toNanos();
+        } catch (ArithmeticException tooLarge) {
+            throw AdbcException.invalidArgument("Compaction timeout exceeds the signed nanosecond range").withCause(tooLarge);
+        }
+        try (var arena = Arena.ofConfined()) {
+            var name = NativeAbi.text(arena, database);
+            abi.call("database_compact", handle(), name, name.byteSize(), nanos);
+        }
+    }
+
     @Override public NativeConnection connect() throws AdbcException { return connect("xtdb"); }
     public BufferAllocator getAllocator() { return allocator; }
     public Set<String> getDatabaseNames() throws AdbcException { return latestCompletedTxs().keySet(); }

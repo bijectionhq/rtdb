@@ -117,6 +117,26 @@ pub unsafe extern "C" fn rtdb_v1_database_sync_all(handle: u64, timeout_nanos: i
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn rtdb_v1_database_compact(
+    handle: u64, name: *const u8, name_length: usize, timeout_nanos: i64, error: *mut u64,
+) -> i32 {
+    unsafe { call(error, || {
+        if timeout_nanos <= 0 { return Err(invalid("Compaction timeout must be positive")); }
+        let database = handles::database(handle)?;
+        let _admitted = database.0.enter()?;
+        let node = database.0.server.node().clone();
+        let target = node.catalog().database(text(name, name_length)?)?;
+        let timeout = std::time::Duration::from_nanos(timeout_nanos as u64);
+        database.0.run(move || async move {
+            let compaction = target.compaction().ok_or_else(|| invalid("Compaction is disabled for this database"))?;
+            tokio::time::timeout(timeout, node.cancellation().run_until_cancelled(compaction.compact_all()))
+                .await.map_err(|_| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.ffi/compaction-timeout", "Timed out awaiting compaction"))?
+                .ok_or_else(closed)?
+        })
+    }) }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn rtdb_v1_retain(handle: u64, out: *mut u64, error: *mut u64) -> i32 {
     unsafe { call(error, || { let out = output(out)?; *out = 0; *out = if handle == 1 { 1 } else { handles::insert(handles::get(handle)?)? }; Ok(()) }) }
 }

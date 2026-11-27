@@ -33,6 +33,7 @@ final class NativeAbi {
         registerOptional(library, linker, "database_open_with_log_clock", PTR, I64, I64, PTR, I64, PTR, I64, PTR, PTR);
         registerOptional(library, linker, "database_flush_all", I64, I64, PTR);
         registerOptional(library, linker, "database_sync_all", I64, I64, PTR);
+        registerOptional(library, linker, "database_compact", I64, PTR, I64, I64, PTR);
         register(library, linker, "retain", I64, PTR, PTR);
         register(library, linker, "release", I64, PTR);
         register(library, linker, "close", I64, PTR);

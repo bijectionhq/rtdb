@@ -55,6 +55,34 @@ fn sync_all_validates_timeout_waits_on_an_open_node_and_refuses_closed_handles()
 }
 
 #[test]
+fn compact_waits_for_manual_output_to_become_visible() {
+    let mut native = Native::open_yaml(b"server: null\nflightSql: null\ncompactor: {threads: 1, automatic: false}\n");
+    let node = handles::database(native.database).unwrap().0.server.node().clone();
+    let database = node.catalog().database("xtdb").unwrap();
+    let table = rtdb_types::TableRef::new("public", "docs");
+    let mut error = 0;
+    for value in [1, 2] {
+        let handle = native.statement(&format!("INSERT INTO docs (_id) VALUES ({value})"));
+        let statement = handles::statement(handle).unwrap();
+        let token = handles::cancellation(native.operation(), &statement.session).unwrap();
+        statement.update(&token).unwrap();
+        ok(unsafe { rtdb_v1_database_flush_all(native.database, 5_000_000_000, &mut error) }, error);
+    }
+    let before = database.trie_catalog();
+    let before = before.current_tries(&table);
+    assert_eq!(before.len(), 2);
+    assert!(before.iter().all(|trie| trie.key.level() == 0));
+
+    let name = b"xtdb";
+    let status = unsafe { rtdb_v1_database_compact(native.database, name.as_ptr(), name.len(), 0, &mut error) };
+    incorrect(status, error, "rtdb.ffi/invalid-argument");
+    ok(unsafe { rtdb_v1_database_compact(native.database, name.as_ptr(), name.len(), 5_000_000_000, &mut error) }, error);
+    let after = database.trie_catalog();
+    let after = after.current_tries(&table);
+    assert!(!after.is_empty() && after.iter().all(|trie| trie.key.level() > 0));
+}
+
+#[test]
 fn pgwire_port_reports_the_bound_listener_or_its_absence() {
     let port = |native: &Native| { let mut port = 0; let mut error = 0; ok(unsafe { rtdb_v1_database_pgwire_port(native.database, &mut port, &mut error) }, error); port };
     assert_eq!(port(&Native::open()), -1);
