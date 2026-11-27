@@ -159,24 +159,6 @@ impl FramedObject {
         self.boundary(frames.start) as u64..self.boundary(frames.end) as u64
     }
 
-    pub fn selected_frames(&self, key: &ObjectKey, range: &Range<u64>) -> Result<Range<usize>> {
-        let start = range
-            .start
-            .checked_sub(SEALED_HEADER_BYTES as u64)
-            .ok_or_else(|| invalid(key))?;
-        let end = range
-            .end
-            .checked_sub(SEALED_HEADER_BYTES as u64)
-            .ok_or_else(|| invalid(key))?;
-        let first = usize::try_from(start / FRAME_STRIDE as u64).map_err(|_| invalid(key))?;
-        let after = usize::try_from(end.div_ceil(FRAME_STRIDE as u64)).map_err(|_| invalid(key))?;
-        let frames = first..after;
-        if first >= after || after > self.frame_count() || self.physical_range(&frames) != *range {
-            return Err(invalid(key));
-        }
-        Ok(frames)
-    }
-
     pub fn seal_frames(
         &self,
         cipher: &Cipher,

@@ -535,24 +535,6 @@ impl TokenAuthority {
         Ok((page, TokenIssuer { authority: self.clone(), key }))
     }
 
-    pub async fn check_claim_readable(&self, claim: &Claim) -> Result<()> {
-        self.check_readable(Purpose::Claim, claim.as_bytes()).await
-    }
-
-    pub async fn check_page_readable(&self, token: &[u8]) -> Result<()> {
-        self.check_readable(Purpose::Page, token).await
-    }
-
-    async fn check_readable(&self, purpose: Purpose, token: &[u8]) -> Result<()> {
-        let (_, number, _) = self.split(purpose, token)?;
-        self.kms
-            .check_readable(Generation {
-                database: self.incarnation,
-                number,
-            })
-            .await
-    }
-
     async fn seal(&self, key: &TokenKey, purpose: Purpose, plaintext: &[u8]) -> Result<Vec<u8>> {
         if plaintext.len() > purpose.max_payload() {
             return Err(purpose.invalid());
@@ -1071,10 +1053,6 @@ mod tests {
         assert_eq!(rotated.open_page(&next_page).await.unwrap_err().code, "rtdb/erased-under-view");
         assert_eq!(
             rotated.open_claim(&claim).await.unwrap_err().code,
-            "rtdb/erased-under-view"
-        );
-        assert_eq!(
-            rotated.check_page_readable(&resume).await.unwrap_err().code,
             "rtdb/erased-under-view"
         );
         kms.destroy(generation).await.unwrap();
