@@ -171,7 +171,7 @@ rule StartupCreatesFixedSet {
     -- There is no instruction to respond to and no record to read.
     -- The operator supplies the set, and it does not change for as long as the node runs.
     -- An installed standalone node supplies one database selected by its private authority record.
-    -- Startup verifies its name, incarnation, journal lineages and key authority before acknowledging the recovered writer.
+    -- Startup verifies its authority format, name, incarnation, journal lineage and key authority before acknowledging the recovered writer.
     when: NodeStarted()
     requires: catalog.membership_source = fixed
 

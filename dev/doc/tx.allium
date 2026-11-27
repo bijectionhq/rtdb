@@ -561,8 +561,8 @@
 --        crosses this boundary (submit when async, execute-and-await when sync). The
 --        async/sync choice is the commit's own COMMIT SYNC / COMMIT ASYNC if it states one,
 --        else the transaction's begin-time async flag.
--- A single-journal standalone attachment accepts synchronous SQL submissions.
--- An explicit synchronous SQL BEGIN READ WRITE on a single-journal standalone attachment opens an interactive transaction when no retry metadata is supplied.
+-- Installed standalone accepts synchronous SQL submissions and rejects asynchronous submissions before queuing.
+-- An explicit synchronous SQL BEGIN READ WRITE on installed standalone opens an interactive transaction when no retry metadata is supplied.
 -- Interactive begin waits for the connection's await floor and captures the attached database's exact applied generation and predecessor.
 -- Begin fixes the system time of the transaction and its statement clock.
 -- Every ordinary SQL mutation executes against the captured snapshot with the transaction's earlier staged effects.
@@ -581,7 +581,6 @@
 -- Interactive commits above the inline size limit publish a rejection.
 -- An intervening transaction or generation change makes the ordered outcome SQLSTATE 40001, with no application effects.
 -- Success journals the staged effects, their original system time, and the assigned ordered identity together, then acknowledges after publication.
--- Asynchronous SQL submission requires a durable handoff and is rejected before queuing on that attachment.
 -- Above: the Frontend (pgwire / ADBC / Flight SQL client) that decodes the wire protocol and feeds SQL strings and transaction API calls into the Connection.
 -- A trusted frontend may supply a private replay permit for the synchronous commit of exactly one buffered write operation.
 -- The permit names the command's effective key and exclusive submission cutoff.

@@ -315,48 +315,35 @@ async fn standalone_single_journal_recovers_a_multi_table_commit_after_kill() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn standalone_classic_journals_keep_durable_async_submission() {
+#[test]
+fn standalone_rejects_the_two_journal_native_authority() {
     let state = private_dir();
     assert!(
         command("initialize-standalone", state.path(), UUID)
-            .arg("--classic-journals")
             .status()
             .unwrap()
             .success()
     );
-    let authority: Value =
-        serde_json::from_slice(&fs::read(state.path().join("native-authority.json")).unwrap())
-            .unwrap();
-    assert_eq!(authority["format"], 1);
-    assert!(authority["source_lineage"].is_string());
-    assert!(state.path().join("journal/LOG").is_file());
-
     let session = private_dir();
-    let tls = sql_identity(session.path());
-    let mut child = Process(launch(state.path(), session.path(), UUID).spawn().unwrap());
-    let port = child.ready(&session.path().join("ready.json"))["port"]
-        .as_u64()
-        .unwrap()
-        .try_into()
-        .unwrap();
-    tokio::time::timeout(TIMEOUT, async {
-        let client = sql_client(port, tls).await;
-        client
-            .batch_execute(
-                "BEGIN READ WRITE; INSERT INTO orders (_id, total) VALUES (1, 42); COMMIT ASYNC",
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            rows(&client, "SELECT total FROM orders").await,
-            vec![vec!["42"]]
-        );
-    })
-    .await
-    .unwrap();
-    drop(child.0.stdin.take().unwrap());
-    assert!(child.exit().success());
+    let marker = state.path().join("native-authority.json");
+    let mut authority: Value = serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+    authority["format"] = 1.into();
+    let retired_format = serde_json::to_vec(&authority).unwrap();
+    fs::write(&marker, &retired_format).unwrap();
+
+    let rejected = launch(state.path(), session.path(), UUID).output().unwrap();
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("Unsupported native standalone authority format"));
+    assert_eq!(fs::read(&marker).unwrap(), retired_format);
+
+    authority["source_lineage"] = Value::String("01234567-89ab-4def-8000-000000000002".into());
+    let retired_authority = serde_json::to_vec(&authority).unwrap();
+    fs::write(&marker, &retired_authority).unwrap();
+    let rejected = launch(state.path(), session.path(), UUID).output().unwrap();
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("Invalid native standalone authority record"));
+    assert_eq!(fs::read(&marker).unwrap(), retired_authority);
+    assert!(!session.path().join("ready.json").exists());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

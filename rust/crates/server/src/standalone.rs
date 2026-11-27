@@ -40,11 +40,9 @@ use crate::{
 };
 
 pub const PROTOCOL: u32 = 3;
-const CLASSIC_FORMAT: u32 = 1;
-const SINGLE_JOURNAL_FORMAT: u32 = 2;
+const AUTHORITY_FORMAT: u32 = 2;
 const AUTHORITY: &str = "native-authority.json";
 const LOGS: &str = "journal";
-const SOURCE: &str = "LOG";
 const REPLICA: &str = "REPLICA_LOG";
 const OBJECTS: &str = "objects";
 const TOKEN_KEYS: &str = "token-keys";
@@ -75,36 +73,9 @@ struct Authority {
     format: u32,
     database: String,
     installation: Uuid,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    source_lineage: Option<Uuid>,
     replica_lineage: Uuid,
     token_witness: Claim,
     checkpoint_witness: Vec<u8>,
-}
-
-#[derive(Clone, Copy)]
-enum JournalMode {
-    Classic,
-    Single,
-}
-
-impl JournalMode {
-    fn format(self) -> u32 {
-        match self {
-            Self::Classic => CLASSIC_FORMAT,
-            Self::Single => SINGLE_JOURNAL_FORMAT,
-        }
-    }
-}
-
-impl Authority {
-    fn journal_mode(&self) -> Result<JournalMode> {
-        match (self.format, self.source_lineage) {
-            (CLASSIC_FORMAT, Some(_)) => Ok(JournalMode::Classic),
-            (SINGLE_JOURNAL_FORMAT, None) => Ok(JournalMode::Single),
-            _ => Err(invalid("Invalid native standalone journal authority")),
-        }
-    }
 }
 
 impl Target {
@@ -155,9 +126,10 @@ impl Target {
     }
 
     fn resources(
-        &self, tokens: FileKms, checkpoints: Arc<FileKms>, apple_sync: AppleSync, journal_mode: JournalMode,
+        &self, tokens: FileKms, checkpoints: Arc<FileKms>, apple_sync: AppleSync,
     ) -> NativeResources {
-        let resources = NativeResources::default()
+        NativeResources::default()
+            .with_single_journal()
             .with_apple_sync(apple_sync)
             .with_token_kms(Arc::new(tokens))
             .with_native_serving_authority(
@@ -169,11 +141,7 @@ impl Target {
                         generation: CHECKPOINT_GENERATION,
                     }),
                 },
-            );
-        match journal_mode {
-            JournalMode::Classic => resources,
-            JournalMode::Single => resources.with_single_journal(),
-        }
+            )
     }
 
     fn generation(&self, number: u64) -> Generation {
@@ -207,14 +175,6 @@ pub async fn initialize(target: Target) -> Result<()> {
 }
 
 pub async fn initialize_with_sync(target: Target, apple_sync: AppleSync) -> Result<()> {
-    initialize_journal_mode(target, apple_sync, JournalMode::Single).await
-}
-
-pub async fn initialize_classic_with_sync(target: Target, apple_sync: AppleSync) -> Result<()> {
-    initialize_journal_mode(target, apple_sync, JournalMode::Classic).await
-}
-
-async fn initialize_journal_mode(target: Target, apple_sync: AppleSync, journal_mode: JournalMode) -> Result<()> {
     target.validate()?;
     private_directory(&target.state)?;
     if fs::read_dir(&target.state)
@@ -239,13 +199,9 @@ async fn initialize_journal_mode(target: Target, apple_sync: AppleSync, journal_
             .map_err(io_error)?;
     }
 
-    let source_lineage = match journal_mode {
-        JournalMode::Classic => Some(initialize_journal(&target.state.join(LOGS).join(SOURCE), apple_sync).await?),
-        JournalMode::Single => None,
-    };
     let replica_lineage = initialize_journal(&target.state.join(LOGS).join(REPLICA), apple_sync).await?;
     let (tokens, checkpoints) = open_keys(&target.state)?;
-    let resources = target.resources(tokens, Arc::clone(&checkpoints), apple_sync, journal_mode);
+    let resources = target.resources(tokens, Arc::clone(&checkpoints), apple_sync);
     let (handle, driver) =
         ServerDriver::open_installed(config, ALLOCATION_LIMIT, resources, None).await?;
     let witness = async {
@@ -262,16 +218,15 @@ async fn initialize_journal_mode(target: Target, apple_sync: AppleSync, journal_
         .wrap(
             target.generation(CHECKPOINT_GENERATION),
             &target.checkpoint_challenge(),
-            checkpoint_context(&target, journal_mode).as_bytes(),
+            checkpoint_context(&target).as_bytes(),
         )
         .await?;
     publish_json(
         &target.state.join(AUTHORITY),
         &Authority {
-            format: journal_mode.format(),
+            format: AUTHORITY_FORMAT,
             database: target.name,
             installation: target.id,
-            source_lineage,
             replica_lineage,
             token_witness,
             checkpoint_witness,
@@ -309,7 +264,9 @@ pub async fn serve_with_sync(launch: Launch, apple_sync: AppleSync, stop: Cancel
         ));
     }
 
-    let journal_mode = authority.journal_mode()?;
+    if authority.format != AUTHORITY_FORMAT {
+        return Err(invalid("Unsupported native standalone authority format"));
+    }
     for name in [LOGS, OBJECTS, TOKEN_KEYS, CHECKPOINT_KEYS] {
         private_directory(&target.state.join(name))?;
     }
@@ -325,7 +282,7 @@ pub async fn serve_with_sync(launch: Launch, apple_sync: AppleSync, stop: Cancel
         .unwrap(
             target.generation(CHECKPOINT_GENERATION),
             &authority.checkpoint_witness,
-            checkpoint_context(target, journal_mode).as_bytes(),
+            checkpoint_context(target).as_bytes(),
         )
         .await?;
     if *checkpoint != *target.checkpoint_challenge() {
@@ -335,13 +292,7 @@ pub async fn serve_with_sync(launch: Launch, apple_sync: AppleSync, stop: Cancel
     }
 
     let replica = target.state.join(LOGS).join(REPLICA);
-    match journal_mode {
-        JournalMode::Classic => verify_journal(&replica, authority.replica_lineage)?,
-        JournalMode::Single => verify_single_journal(&replica, authority.replica_lineage, apple_sync)?,
-    }
-    if let Some(lineage) = authority.source_lineage {
-        verify_journal(&target.state.join(LOGS).join(SOURCE), lineage)?;
-    }
+    verify_single_journal(&replica, authority.replica_lineage, apple_sync)?;
 
     let password = Zeroizing::new(read_bounded(private_input(&launch.password_file)?, 64)?);
     if password.len() != 64 || !password.iter().all(u8::is_ascii_hexdigit) {
@@ -380,7 +331,7 @@ pub async fn serve_with_sync(launch: Launch, apple_sync: AppleSync, stop: Cancel
     let (handle, driver) = ServerDriver::open_installed(
         config,
         ALLOCATION_LIMIT,
-        target.resources(tokens, checkpoints, apple_sync, journal_mode),
+        target.resources(tokens, checkpoints, apple_sync),
         Some(tls),
     )
     .await?;
@@ -571,11 +522,8 @@ fn open_keys(root: &Path) -> Result<(FileKms, Arc<FileKms>)> {
     Ok((tokens, Arc::new(checkpoints)))
 }
 
-fn checkpoint_context(target: &Target, journal_mode: JournalMode) -> String {
-    match journal_mode {
-        JournalMode::Classic => format!("rtdb/installed-local/{}:{}", target.id, target.name),
-        JournalMode::Single => format!("rtdb/installed-local/single-journal/{}:{}", target.id, target.name),
-    }
+fn checkpoint_context(target: &Target) -> String {
+    format!("rtdb/installed-local/single-journal/{}:{}", target.id, target.name)
 }
 
 fn tls(certificate: &Path, key: &Path) -> Result<Arc<rustls::ServerConfig>> {
