@@ -64,6 +64,54 @@ async fn an_unlinked_store_release_does_not_establish_a_flight_session() {
     running.stop().await;
 }
 
+#[tokio::test]
+async fn store_sizes_reports_the_committed_version_and_checks_incarnation() {
+    use rtdb_flight_sql::rtdb::store::v1 as store;
+    use rtdb_node::serving::NativeServingAuthority;
+    use store_read::segment::segment;
+
+    let incarnation = [51; 16];
+    let resources: FixtureResources = Box::new(move |clock| Arc::new(super::fixture_resources(clock)
+        .with_native_serving_authority("xtdb", NativeServingAuthority { incarnation, checkpoints: None })));
+    let config = FlightConfig { store_only: true, ..Default::default() };
+    let running = Running::start_with_clocked_resources(
+        None, config, &[], None, Default::default(), None, Some(resources),
+    ).await;
+    let mut status = running.node.catalog().database("xtdb").unwrap().watch_status();
+    tokio::time::timeout(Duration::from_secs(5), status.wait_for(|status| {
+        matches!(status.role, rtdb_replication::Role::Leading(_))
+    })).await.unwrap().unwrap();
+    let mut client = Client::connect(&running.server, None).await;
+    let tablet = [8; 16];
+    let mut key = vec![0, 1, b'p', 16];
+    key.extend(segment(&[7; 16]));
+    key.extend(segment(&tablet));
+    key.extend(segment(b"row"));
+    key.push(0);
+    let append = store::AppendRequest {
+        key: vec![1; 16], incarnation: incarnation.to_vec(),
+        writes: vec![store::Write { key: key.clone(), value: Some(vec![0; 42]), ..Default::default() }],
+        ..Default::default()
+    };
+    let replies = client.action("rtdb.store.v1.Append", append.encode_to_vec().into()).await.unwrap();
+    let reply = store::AppendReply::decode(replies[0].body.clone()).unwrap();
+    let Some(store::append_reply::Outcome::Committed(stamp)) = reply.outcome.as_ref() else { panic!("{reply:?}"); };
+
+    let replies = client.action("rtdb.store.v1.StorageSizes", Bytes::new()).await.unwrap();
+    let reply = store::StorageSizesReply::decode(replies[0].body.clone()).unwrap();
+    assert_eq!(reply.incarnation, incarnation);
+    let snapshot = reply.snapshot.unwrap();
+    assert_eq!(snapshot.at, stamp.version);
+    assert_eq!(snapshot.buckets, [store::SizeBucket {
+        family: 16, tablet: tablet.to_vec(), key_bytes: key.len() as u64, value_bytes: 42, presences: 1,
+    }]);
+
+    let stale = store::StorageSizesRequest { incarnation: vec![0; 16], reconcile_epoch: Some(1) };
+    let refusal = client.action("rtdb.store.v1.StorageSizes", stale.encode_to_vec().into()).await.unwrap_err();
+    assert_eq!(refusal.code(), tonic::Code::FailedPrecondition);
+    running.stop().await;
+}
+
 #[cfg(feature = "multi")]
 #[path = "managed_workload_qualification.rs"]
 mod managed_workload_qualification;

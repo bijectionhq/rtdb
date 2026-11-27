@@ -3,7 +3,7 @@ use std::{collections::{BTreeMap, BTreeSet}, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use rtdb_columnar::MemoryBudget;
 use rtdb_crypt::tokens::VerifiedClaims;
-use rtdb_index::{Snapshot, branches::{BranchIndex, BranchView, RankedIndexKind, store::{StorePage, StoreRead}}};
+use rtdb_index::{Snapshot, branches::{BranchIndex, BranchView, RankedIndexKind, store::{StorePage, StoreRead, sizes::StorageSizes}}};
 use rtdb_replication::{NATIVE_READ_FEATURES, NativeServingHandle, NativeServingScope, NativeServingView};
 use rtdb_tx::transact::{CustodyGroupId, CustodyWriterFence, ROW_CUSTODY, Receipt, Transact, TrustedCustodyCommand};
 use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::{At, Basis, ClaimEvidence, ClaimScope, Layer}};
@@ -181,6 +181,14 @@ impl ServingDriver for DefaultServing {
         }
         let at = if at == At::Linearizable { At::Latest } else { at };
         snapshot.index.view(rtdb_types::rtdb_v1::MAIN_BRANCH, at, Layer::Merged, now)?.store_page(&read)
+    }
+
+    async fn store_sizes(&self, epoch: Option<u64>, now: Timestamp, cancellation: &CancellationToken) -> Result<StorageSizes> {
+        if self.handle.has_classic_read() || !self.handle.is_compatible() {
+            return Err(Anomaly::unsupported("rtdb.store/unsupported", "This database does not serve the ordered-bytes store"));
+        }
+        let snapshot = self.handle.view(At::Latest, cancellation).await?;
+        super::store_size_snapshot(snapshot.index, epoch, now, cancellation).await
     }
 
     async fn query_ranked_artefacts(

@@ -271,6 +271,8 @@ pub struct BranchIndex {
     writes: Arc<Vec<BranchWrite>>,
     #[serde(skip)]
     visibility_projection: bool,
+    #[serde(skip)]
+    store_sizes: store::sizes::Rollup,
 }
 
 impl BranchIndex {
@@ -292,6 +294,7 @@ impl BranchIndex {
             custody_transfers: Map::new(), inherited_custody: None,
             scoped_holds: Map::new(), changed_catalog: None, erased: None, writes: Arc::default(),
             visibility_projection: false, used_custody_placements: imbl::OrdSet::new(),
+            store_sizes: Default::default(),
         }
     }
 
@@ -363,6 +366,7 @@ impl BranchIndex {
         let mut retained = self.clone();
         retained.scoped_holds.clear();
         retained.head = head;
+        retained.store_sizes = Default::default();
         retained.writes = Arc::default();
         retained.times = self.times.range(..=at.position()).map(|(&position, &time)| (position, time)).collect();
         retained.catalog = self.catalog.iter().filter_map(|(table, definitions)| {
@@ -392,6 +396,7 @@ impl BranchIndex {
 
     fn rebase_history(&mut self, incarnation: [u8; 16]) {
         let rebase = |basis: Basis| Basis::new(incarnation, basis.position());
+        self.store_sizes = Default::default();
         self.head.basis = rebase(self.head.basis);
         self.classic_checkpoint = self.classic_checkpoint.map(rebase);
         self.erased = self.erased.map(rebase);
@@ -744,6 +749,13 @@ impl BranchIndex {
     }
 
     pub fn apply(&mut self, effect: BranchEffect) -> Result<()> {
+        let size_change = self.prepare_store_size_change(&effect);
+        self.apply_effect(effect)?;
+        self.finish_store_size_change(size_change);
+        Ok(())
+    }
+
+    fn apply_effect(&mut self, effect: BranchEffect) -> Result<()> {
         let basis = self.head.basis;
         match effect {
             BranchEffect::Write { branch, table, mut event } => {

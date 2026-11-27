@@ -646,7 +646,7 @@ mod store_only_tests {
 
     #[test]
     fn a_store_only_listener_admits_the_store_and_administration_alone() {
-        for action in [store::READ, store::APPEND, store::WATCH, MANAGED_CREATE, "rtdb.admin.v1.DeleteDeployment"] {
+        for action in [store::READ, store::APPEND, store::WATCH, store::STORAGE_SIZES, MANAGED_CREATE, "rtdb.admin.v1.DeleteDeployment"] {
             assert!(store_only_admits(action), "{action}");
         }
         for action in [CAPABILITIES, TX_STATUS, MANAGED_WORKLOAD, "rtdb.v1.Transact", custody::RELEASE] {

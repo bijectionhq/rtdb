@@ -30,6 +30,15 @@ A filtered read returns exactly what an unfiltered read of the same ranges and v
 Bijection defines what a filter means; RTDB only runs it next to the data.
 With `arrow`, each page is one Arrow IPC stream with columns `key`, `written` and `value`.
 
+`rtdb.store.v1.StorageSizes`:: Returns the installation-wide logical size rollup with the selected retained version and its incarnation.
+An unscoped database read grant admits the projection.
+Prefix-limited store grants cannot authorize the installation-wide projection.
+Each bucket names one structural key family (16 or 17) and one opaque tablet, and reports the full encoded key and value byte counts of the entries visible at that cut.
+Family 16 also counts its presence markers, and the reserved host partition is excluded from all buckets.
+The same key contributes its replacement size once, and deletion removes its contribution.
+A reopened or restored store rebuilds the rollup from its retained entries.
+An increasing reconciliation epoch rebuilds the rollup from a census at a single cut, and an epoch already seen by that index lineage reuses the complete rollup.
+
 `rtdb.store.v1.Append`:: Commits its writes and bounded-counter updates at a new version, unless a write committed after `since` intersects one of its read ranges, the clock falls outside its window, or a `Bound` leaves `[min, max]`.
 A refused append names the first conflicting read range (or first failing bound) and writes nothing.
 Its reads are judged first; then the writer's clock, sampled at the ordering point, is judged against the append's window `[not_before, before)`.

@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use rtdb_crypt::tokens::TokenAuthority;
 use rtdb_db::{ChangeHistory, MultiDatabase, NativeCheckpointInstallation, NativeDependentCarrier, NativeDependentOriginal, PinnedExport, Role, ServingAuthority, WritePipeline};
 use rtdb_index::branches::{BranchCut, BranchEffect, BranchIndex, BranchWrite};
+use rtdb_index::branches::store::sizes::StorageSizes;
 use rtdb_tx::transact::{
     CustodyGroupId, CustodyWriterFence, PHYSICAL_ERASURE, ROW_CUSTODY, Receipt, Transact, TrustedCustodyCommand, workload,
 };
@@ -960,6 +961,17 @@ impl ServingDriver for MultiServing {
                 let page = index.view(rtdb_types::rtdb_v1::MAIN_BRANCH, at, Layer::Merged, now)?.store_page(&read)?;
                 self.database.lock().await.check_generation(generation).await?;
                 Ok(page)
+            }).await.ok_or_else(interrupted)?
+        }).await
+    }
+
+    async fn store_sizes(&self, epoch: Option<u64>, now: Timestamp, cancellation: &CancellationToken) -> Result<StorageSizes> {
+        self.serve(async {
+            cancellation.run_until_cancelled(async {
+                let (index, generation) = self.database.lock().await.fresh_view().await?;
+                let sizes = crate::serving::store_size_snapshot(index, epoch, now, cancellation).await?;
+                self.database.lock().await.check_generation(generation).await?;
+                Ok(sizes)
             }).await.ok_or_else(interrupted)?
         }).await
     }

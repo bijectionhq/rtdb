@@ -12,6 +12,7 @@ syntax = "proto3";
 //   rtdb.store.v1.Append AppendRequest -> AppendReply
 //   rtdb.store.v1.Watch  WatchRequest  -> WatchReply
 //   rtdb.store.v1.Rank   RankRequest   -> RankReply
+//   rtdb.store.v1.StorageSizes StorageSizesRequest -> StorageSizesReply
 //
 // A version is a commit position within one store incarnation. A restore or a
 // reset starts a new incarnation; a request naming another incarnation fails
@@ -231,4 +232,30 @@ message RankReply {
   // `store_read::rank::RankReply`: the window (or a split read's part) and
   // the ranges each partition consulted.
   bytes reply = 2;
+}
+
+message StorageSizesRequest {
+  // Empty asks the server to identify the current incarnation.
+  bytes incarnation = 1;
+  optional uint64 reconcile_epoch = 2;
+}
+
+message StorageSizesReply {
+  bytes incarnation = 1;
+  // Present only for a complete rollup.
+  SizeSnapshot snapshot = 2;
+}
+
+message SizeSnapshot {
+  uint64 at = 1;
+  repeated SizeBucket buckets = 2;
+}
+
+message SizeBucket {
+  // Structural key family (16 or 17) and its opaque 16-byte tablet.
+  uint32 family = 1;
+  bytes tablet = 2;
+  uint64 key_bytes = 3;
+  uint64 value_bytes = 4;
+  uint64 presences = 5;
 }

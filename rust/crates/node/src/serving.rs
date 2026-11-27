@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use rtdb_crypt::tokens::TokenAuthority;
 use rtdb_index::{
     Snapshot,
-    branches::{BranchCut, BranchIndex, BranchView, BranchWrite, RowImage, store::{StorePage, StoreRead}},
+    branches::{BranchCut, BranchIndex, BranchView, BranchWrite, RowImage, store::{StorePage, StoreRead, sizes::StorageSizes}},
 };
 use rtdb_tx::transact::{CustodyGroupId, CustodyWriterFence, Receipt, Transact, TrustedCustodyCommand, workload};
 pub use rtdb_replication::{NativeCheckpointAuthority, NativeServingAuthority};
@@ -378,10 +378,31 @@ pub trait ServingDriver: Send + Sync {
         Err(rtdb_types::Anomaly::unsupported("rtdb.store/unsupported", "This route does not serve the ordered-bytes store"))
     }
 
+    async fn store_sizes(&self, _epoch: Option<u64>, _now: Timestamp, _cancellation: &CancellationToken) -> Result<StorageSizes> {
+        Err(rtdb_types::Anomaly::unsupported("rtdb.store/unsupported", "This route does not serve the ordered-bytes store"))
+    }
+
     /// A cursor below the retained effect floor reports `rtdb/cursor-expired`.
     async fn changes(
         &self,
         request: Changes,
         cancellation: &CancellationToken,
     ) -> Result<ChangePage>;
+}
+
+pub(crate) async fn store_size_snapshot(
+    index: BranchIndex, epoch: Option<u64>, now: Timestamp, cancellation: &CancellationToken,
+) -> Result<StorageSizes> {
+    use rtdb_types::{Anomaly, AnomalyCategory};
+
+    if index.has_custody_groups() || index.has_visibility_history() {
+        return Err(Anomaly::unsupported("rtdb.store/unsupported", "The ordered-bytes store serves only an unlabelled database"));
+    }
+    let cancellation = cancellation.clone();
+    tokio::task::spawn_blocking(move || index.storage_sizes(now, epoch, || {
+        if cancellation.is_cancelled() {
+            return Err(Anomaly::new(AnomalyCategory::Interrupted, "rtdb/request-cancelled", "The request was cancelled"));
+        }
+        Ok(())
+    })).await.map_err(|error| Anomaly::fault("rtdb.store/size-snapshot", error.to_string()))?
 }
