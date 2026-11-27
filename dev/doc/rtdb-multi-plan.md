@@ -226,6 +226,17 @@ A bounded wall-time guarantee requires a separately qualified time source.
 Provider work checks the schedule before and after cryptography.
 The directory reaper can resume the scheduled revocation and waits for admitted regions before removing ciphertext.
 
+The authenticated native recovery socket accepts `close_archive_revocations` and `read_archive_revocation_outcomes` for the original installation UUID and capture incarnation.
+Both actions use the nil UUID in the request's `capture` field and require the original enrolled key vault.
+Closing records a durable fence against further operation-only revocation admissions for that incarnation.
+Close admission only when ending work for that incarnation, after upgrading every process with access to the original vault to a release that enforces scoped closure.
+The closed set starts at durable vault admission. The directory retains its own capture retirement preparations.
+The vault continues previously admitted orders and returns them in UUID order, with their request digest and any terminal withdrawal time.
+Pass the returned `next_after` UUID as `after` to continue until `next_after` is null.
+A null `revoked_at_ms` means the original vault has admitted the order and still owes its terminal observation.
+An older schedule can be enrolled by retrying its original authenticated request before closing.
+The vault refuses to certify an inventory containing a legacy schedule or withdrawal that lacks an exact order.
+
 Physical cleanup confirms the original capture media witness before reporting an empty inventory.
 This contract covers the enrolled archive's ability to decrypt, which is revoked by the time the commitment is recorded.
 The capture protocol's deadline request requires a qualified provider and active-reader policy, and remains unavailable with these providers.

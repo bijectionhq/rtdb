@@ -984,6 +984,25 @@ fn archive_binding(archive: &CellStorage) -> Result<String> {
     serde_json::to_string(archive).map_err(|_| inconsistent("Cannot retain the archive binding"))
 }
 
+pub(crate) async fn require_archive_revocation_scope(
+    record: &DeploymentRecord, archive: &CellStorage, keys: &dyn KeyService, incarnation: u64,
+) -> Result<()> {
+    if !matches!(archive, CellStorage::Local { .. }) {
+        return Err(unavailable("The configured archive does not own native revocation admission"));
+    }
+    let archive = archive_binding(archive)?;
+    let namespace = keys.existing_namespace_id().await?
+        .ok_or_else(|| unavailable("The original archive key authority is unavailable"))?;
+    let expected = (archive.as_str(), namespace);
+    let mut enrolled = record.checkpoint_captures.values()
+        .filter(|capture| capture.incarnation == incarnation && capture.media_bound)
+        .filter_map(|capture| capture.key_namespace.map(|namespace| (capture.archive.as_str(), namespace)));
+    if enrolled.next() != Some(expected) || enrolled.any(|binding| binding != expected) {
+        return Err(unavailable("The configured vault is not the original checkpoint key authority"));
+    }
+    Ok(())
+}
+
 fn capture_point(record: &DeploymentRecord, deployment: Uuid, operation: Uuid, archive: &str) -> Result<CapturePoint> {
     let registration = record.checkpoint_captures.get(&operation)
         .filter(|registration| registration.archive == archive)
@@ -1186,7 +1205,9 @@ pub async fn retain_serving_replay(
 }
 
 fn archive_key_id(point: &CapturePoint) -> String {
-    format!("checkpoint-{}-{}-{}", point.deployment, point.incarnation, point.operation)
+    crate::keys::ArchiveRevocationScope {
+        deployment: point.deployment, incarnation: point.incarnation,
+    }.capture_key(point.operation)
 }
 
 async fn archive_key(keys: &dyn KeyService, point: &CapturePoint, region: Arc<IoRegion>) -> Result<Arc<dyn ArchiveKey>> {

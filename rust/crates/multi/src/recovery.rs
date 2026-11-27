@@ -27,7 +27,7 @@ use crate::{
     deployment::CellStorage,
     family_custody::{FAMILY_CUSTODY_GRANT_BYTES, WORLD_RANK_CUSTODY_GRANT_BYTES, WorldRankCustodyGrant, endorse_family_custody, grant_id, original_family_custody},
     install::Token,
-    keys::KeyService,
+    keys::{ArchiveRevocationPage, ArchiveRevocationScope, KeyService},
 };
 
 mod classic_destination;
@@ -94,6 +94,13 @@ enum Action {
     },
     CommitCheckpointCaptureRevocation {
         manifest_sha256: String,
+    },
+    CloseArchiveRevocations {
+        incarnation: u64,
+    },
+    ReadArchiveRevocationOutcomes {
+        incarnation: u64,
+        after: Option<Uuid>,
     },
     SettleCheckpointCaptureDiscard {
         manifest_sha256: Option<String>,
@@ -292,6 +299,13 @@ enum Reply {
         manifest_sha256: String,
         authorized_at_ms: i64,
         operation_revoked_at_ms: i64,
+    },
+    ArchiveRevocationsClosed {
+        scope: ArchiveRevocationScope,
+    },
+    ArchiveRevocationOutcomes {
+        scope: ArchiveRevocationScope,
+        page: ArchiveRevocationPage,
     },
     CaptureDiscardDeadlineUnsupported,
     CaptureDiscarded {
@@ -505,8 +519,10 @@ impl RecoveryService {
         directory: &dyn Directory,
         request: &Request,
     ) -> Result<Option<DeploymentRecord>> {
+        let scoped = matches!(request.action,
+            Action::CloseArchiveRevocations { .. } | Action::ReadArchiveRevocationOutcomes { .. });
         if !self.token.accepts(&request.token)
-            || request.capture.is_nil()
+            || request.capture.is_nil() != scoped
             || request.authority.is_nil()
         {
             return Ok(None);
@@ -672,6 +688,8 @@ impl RecoveryService {
             | Action::CheckpointCaptureDiscardStatus { .. }
             | Action::ScheduleCheckpointCaptureRevocation { .. }
             | Action::CommitCheckpointCaptureRevocation { .. }
+            | Action::CloseArchiveRevocations { .. }
+            | Action::ReadArchiveRevocationOutcomes { .. }
             | Action::SettleCheckpointCaptureDiscard { .. } => unreachable!("dispatched separately"),
             Action::RecoverCheckpoint { manifest_sha256 } => {
                 if !valid_manifest(&manifest_sha256) {
@@ -1181,6 +1199,18 @@ impl RecoveryService {
             return Ok(Reply::Refused);
         }
         match request.action {
+            Action::CloseArchiveRevocations { incarnation } => {
+                archive::require_archive_revocation_scope(&installation, &self.archive, self.keys.as_ref(), incarnation).await?;
+                let scope = ArchiveRevocationScope { deployment: request.authority, incarnation };
+                self.keys.close_archive_revocations(scope).await?;
+                Ok(Reply::ArchiveRevocationsClosed { scope })
+            }
+            Action::ReadArchiveRevocationOutcomes { incarnation, after } => {
+                archive::require_archive_revocation_scope(&installation, &self.archive, self.keys.as_ref(), incarnation).await?;
+                let scope = ArchiveRevocationScope { deployment: request.authority, incarnation };
+                let page = self.keys.archive_revocation_outcomes(scope, after).await?;
+                Ok(Reply::ArchiveRevocationOutcomes { scope, page })
+            }
             Action::DiscardCheckpointCapture { manifest_sha256 } => {
                 let release = archive::retire_capture(
                     directory.as_ref(), &installation, &self.storage, &self.archive,
@@ -1283,6 +1313,8 @@ impl RecoveryService {
             | Action::CheckpointCaptureDiscardStatus { .. }
             | Action::ScheduleCheckpointCaptureRevocation { .. }
             | Action::CommitCheckpointCaptureRevocation { .. }
+            | Action::CloseArchiveRevocations { .. }
+            | Action::ReadArchiveRevocationOutcomes { .. }
             | Action::SettleCheckpointCaptureDiscard { .. } => self.dispatch_capture_discard(directory, request).await,
             _ => Box::pin(self.dispatch(directory, request)).await,
         };
@@ -1787,31 +1819,51 @@ mod tests {
             tracks_ordered_index_pages: false, checkpoint_metadata_from: None, checkpoint_replay_from: None,
         });
         let key_id = format!("checkpoint-{authority}-{}-{capture}", installation.incarnation);
+        let incarnation = installation.incarnation;
         let retained = keys.archive_key(&key_id, true, rtdb_storage::IoRegion::new()).await?;
         let plaintext = bytes::Bytes::from_static(b"held archive");
         let ciphertext = retained.seal("member", plaintext.clone()).await?;
         bind_test_archive_media(&service, &installation, capture).await?;
         directory.create_deployment(installation).await?;
-        let request = |action: serde_json::Value| {
+        let request = |action: serde_json::Value| -> Request {
             serde_json::from_value(serde_json::json!({
                 "token": token, "name": "tenant", "authority": authority, "capture": capture, "action": action,
             })).unwrap()
         };
-        let due_at_ms = rtdb_directory::now_ms() + 400;
+        let due_at_ms = rtdb_directory::now_ms() + 1500;
         let schedule = |due_at_ms: i64| request(serde_json::json!({
             "operation": "schedule_checkpoint_capture_revocation", "manifest_sha256": manifest, "due_at_ms": due_at_ms,
         }));
         let commit = || request(serde_json::json!({
             "operation": "commit_checkpoint_capture_revocation", "manifest_sha256": manifest,
         }));
+        let scoped = |operation: &str| {
+            let mut request = request(serde_json::json!({ "operation": operation, "incarnation": incarnation }));
+            request.capture = Uuid::nil();
+            request
+        };
+        let mut unauthorized = scoped("close_archive_revocations");
+        unauthorized.token = "bad".into();
+        assert!(matches!(service.handle(directory.clone(), unauthorized).await, Reply::Refused));
+        service.keys = Arc::new(crate::keys::LocalKeyService::with_archive_broker(temporary.path().join("substitute"))?);
+        service.keys.namespace_id().await?;
+        assert!(matches!(service.handle(directory.clone(), scoped("close_archive_revocations")).await, Reply::Deferred));
+        service.keys = keys.clone();
         assert!(matches!(service.handle(directory.clone(), schedule(due_at_ms)).await,
             Reply::CaptureRevocationScheduled { due_at_ms: accepted, .. } if accepted == due_at_ms));
         assert!(matches!(service.handle(directory.clone(), schedule(due_at_ms + 1)).await, Reply::Refused));
         assert!(matches!(service.handle(directory.clone(), commit()).await, Reply::Deferred));
+        assert!(matches!(service.handle(directory.clone(), scoped("read_archive_revocation_outcomes")).await, Reply::Deferred));
+        assert!(matches!(service.handle(directory.clone(), scoped("close_archive_revocations")).await,
+            Reply::ArchiveRevocationsClosed { scope } if scope.deployment == authority && scope.incarnation == incarnation));
 
         drop(keys);
         let reopened = Arc::new(crate::keys::LocalKeyService::new(&key_root)?);
         service.keys = reopened.clone();
+        assert!(matches!(service.handle(directory.clone(), scoped("read_archive_revocation_outcomes")).await,
+            Reply::ArchiveRevocationOutcomes { page, .. } if page.next_after.is_none()
+                && page.outcomes.len() == 1 && page.outcomes[0].request.operation_id == capture
+                && page.outcomes[0].revoked_at_ms.is_none()));
         assert!(matches!(service.handle(directory.clone(), schedule(due_at_ms)).await,
             Reply::CaptureRevocationScheduled { due_at_ms: accepted, .. } if accepted == due_at_ms));
         let remaining = due_at_ms.saturating_sub(rtdb_directory::now_ms());
@@ -1835,6 +1887,9 @@ mod tests {
         service.keys = Arc::new(crate::keys::LocalKeyService::new(&key_root)?);
         assert!(matches!(service.handle(directory.clone(), commit()).await,
             Reply::CaptureRevocationCommitted { operation_revoked_at_ms, .. } if operation_revoked_at_ms == observed));
+        assert!(matches!(service.handle(directory.clone(), scoped("read_archive_revocation_outcomes")).await,
+            Reply::ArchiveRevocationOutcomes { page, .. } if page.outcomes[0].request == order
+                && page.outcomes[0].revoked_at_ms == Some(observed)));
         assert!(matches!(service.handle(directory.clone(), commit()).await,
             Reply::CaptureRevocationCommitted { operation_revoked_at_ms, .. } if operation_revoked_at_ms == observed));
         let settle = request(serde_json::json!({

@@ -3663,7 +3663,7 @@ rule PrepareCheckpointCaptureDiscard {
 }
 
 rule ScheduleCheckpointCaptureRevocation {
-    -- The original operation authority preserves the due time across restart.
+    -- The original operation authority preserves the exact order and its due time in one durable admission.
     -- A due schedule closes further cryptographic operations, including through already issued handles.
     when: AuthenticatedCaptureRevocationScheduled(operator, authority, capture, due_at)
 
@@ -3674,6 +3674,33 @@ rule ScheduleCheckpointCaptureRevocation {
     ensures:
         CommitCaptureAdmissionFence(capture)
         RecordExactAuthorityRevocationSchedule(capture, due_at)
+}
+
+rule CloseArchiveRevocationAdmission {
+    -- The native vault scopes its inventory to the original installation and incarnation.
+    -- The same vault serializes closure against admission and retains the exact admitted set across restart.
+    -- An unattributed prior withdrawal or schedule prevents an exhaustive result.
+    when: AuthenticatedArchiveRevocationClose(operator, installation, incarnation)
+
+    requires: ConfiguredOrganizationOwnsOriginalInstallation(operator, installation)
+              and ExactOriginalOperationOnlyKeyAuthorityForScope(installation, incarnation)
+              and AllPriorVaultRevocationsHaveExactOrders(installation, incarnation)
+
+    ensures:
+        SealVaultRevocationAdmission(installation, incarnation)
+        RejectNewVaultRevocationOrders(installation, incarnation)
+        PreservePreviouslyAdmittedOrdersAndTheirOutcomes(installation, incarnation)
+}
+
+rule ReadClosedArchiveRevocationOutcomes {
+    when: AuthenticatedArchiveRevocationOutcomes(operator, installation, incarnation, cursor)
+
+    requires: ConfiguredOrganizationOwnsOriginalInstallation(operator, installation)
+              and ExactOriginalOperationOnlyKeyAuthorityForScope(installation, incarnation)
+              and VaultRevocationAdmissionSealed(installation, incarnation)
+
+    ensures:
+        ReturnOrderedPageOfExactAdmittedOrdersAndCurrentOutcomes(installation, incarnation, cursor)
 }
 
 rule CommitCheckpointCaptureRevocation {

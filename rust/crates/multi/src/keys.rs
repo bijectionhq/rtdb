@@ -83,6 +83,33 @@ pub struct ArchiveRevocation {
     pub not_before_ms: i64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveRevocationScope {
+    pub deployment: uuid::Uuid,
+    pub incarnation: u64,
+}
+
+impl ArchiveRevocationScope {
+    pub(crate) fn capture_key(self, capture: uuid::Uuid) -> String {
+        format!("checkpoint-{}-{}-{capture}", self.deployment, self.incarnation)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveRevocationOutcome {
+    pub request: ArchiveRevocation,
+    pub revoked_at_ms: Option<i64>,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveRevocationPage {
+    pub outcomes: Vec<ArchiveRevocationOutcome>,
+    pub next_after: Option<uuid::Uuid>,
+}
+
 #[async_trait::async_trait]
 pub trait KeyService: Send + Sync {
     async fn namespace_id(&self) -> Result<[u8; KEY_BYTES]> { self.key(NAMESPACE_KEY_ID).await }
@@ -173,6 +200,10 @@ pub trait KeyService: Send + Sync {
         Err(Anomaly::unsupported("rtdb.multi/archive-vault", "The archive vault does not own scheduled revocation"))
     }
 
+    async fn schedule_archive_revocation(&self, _id: &str, _request: ArchiveRevocation, _due_at_ms: i64) -> Result<bool> {
+        Err(Anomaly::unsupported("rtdb.multi/archive-vault", "The archive vault cannot admit an exact schedule"))
+    }
+
     async fn withdraw_archive_key(&self, id: &str) -> Result<ArchiveKeyWithdrawal> {
         self.destroy(id).await?;
         Ok(ArchiveKeyWithdrawal::Vault)
@@ -180,6 +211,14 @@ pub trait KeyService: Send + Sync {
 
     async fn reconcile_archive_revocation(&self, _id: &str, _request: ArchiveRevocation) -> Result<i64> {
         Err(Anomaly::unsupported("rtdb.multi/archive-vault", "The archive vault cannot settle an exact revocation"))
+    }
+
+    async fn close_archive_revocations(&self, _scope: ArchiveRevocationScope) -> Result<()> {
+        Err(Anomaly::unsupported("rtdb.multi/archive-vault", "The archive vault cannot close revocation admission"))
+    }
+
+    async fn archive_revocation_outcomes(&self, _scope: ArchiveRevocationScope, _after: Option<uuid::Uuid>) -> Result<ArchiveRevocationPage> {
+        Err(Anomaly::unsupported("rtdb.multi/archive-vault", "The archive vault cannot enumerate revocation outcomes"))
     }
 
     /// The standalone key authority can witness the lifetime of a local I/O
@@ -528,6 +567,8 @@ impl KeyService for LocalKeyService {
         let id = id.to_owned();
         tokio::task::spawn_blocking(move || {
             service.require_service_root()?;
+            let scope = service.lock_capture_revocations(&id)?;
+            if let Some(scope) = &scope { scope.require_open()?; }
             let raw_path = service.path(&id)?;
             let _raw_lock = service.lock_key(&raw_path)?;
             if !service.is_brokered(&id)? {
@@ -540,6 +581,10 @@ impl KeyService for LocalKeyService {
         }).await.map_err(|error| Anomaly::fault("rtdb.multi/archive-vault-task", error.to_string()))?
     }
 
+    async fn schedule_archive_revocation(&self, id: &str, request: ArchiveRevocation, due_at_ms: i64) -> Result<bool> {
+        self.schedule_exact_revocation(id, request, due_at_ms).await
+    }
+
     async fn withdraw_archive_key(&self, id: &str) -> Result<ArchiveKeyWithdrawal> {
         require_general_key_namespace(id)?;
         let vault = self.clone();
@@ -547,6 +592,7 @@ impl KeyService for LocalKeyService {
         let id = id.to_owned();
         let withdrawal = tokio::task::spawn_blocking(move || -> Result<ArchiveKeyWithdrawal> {
             vault.require_service_root()?;
+            let scope = vault.lock_capture_revocations(&id)?;
             let raw_path = vault.path(&id)?;
             let _raw_lock = vault.lock_key(&raw_path)?;
             let (authority, path) = if vault.is_brokered(&id)? {
@@ -558,6 +604,9 @@ impl KeyService for LocalKeyService {
                 return Ok(ArchiveKeyWithdrawal::Vault);
             };
             let _lock = authority.lock_key(&path)?;
+            if let Some(scope) = &scope {
+                scope.require_legacy_withdrawal(&path)?;
+            }
             archive::withdraw_locked(&authority, &path)?;
             Ok(ArchiveKeyWithdrawal::OperationAuthority)
         }).await.map_err(|error| Anomaly::fault("rtdb.multi/archive-vault-task", error.to_string()))??;
@@ -567,6 +616,14 @@ impl KeyService for LocalKeyService {
 
     async fn reconcile_archive_revocation(&self, id: &str, request: ArchiveRevocation) -> Result<i64> {
         self.revoke_archive(id, request).await
+    }
+
+    async fn close_archive_revocations(&self, scope: ArchiveRevocationScope) -> Result<()> {
+        self.close_exact_revocations(scope).await
+    }
+
+    async fn archive_revocation_outcomes(&self, scope: ArchiveRevocationScope, after: Option<uuid::Uuid>) -> Result<ArchiveRevocationPage> {
+        self.exact_revocation_outcomes(scope, after).await
     }
 
     fn hold_local_storage_region(&self, region: uuid::Uuid) -> Result<Option<File>> {

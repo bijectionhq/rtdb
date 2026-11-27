@@ -12,8 +12,10 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result};
 
 use crate::cipher::Cipher;
 
+mod revocations;
+
 use super::{
-    ArchiveRevocation, DESTROYED, FramedObject, KEY_BYTES, LocalKeyService, UnitOperation, UnitOutput,
+    DESTROYED, FramedObject, KEY_BYTES, LocalKeyService, UnitOperation, UnitOutput,
     UnitScope, io, is_destroyed, malformed, read_key, require_general_key_namespace,
     unit::{self, OPERATION_LIMIT},
 };
@@ -195,6 +197,9 @@ pub(super) fn schedule_locked(
             "The archive revocation date must be positive",
         ));
     }
+    if revocations::read_revocation(path)?.is_some() {
+        return Err(schedule_conflict());
+    }
     match read_schedule(path)? {
         Some(prior) if prior != due_at_ms => return Err(schedule_conflict()),
         Some(_) => vault.sync_directory()?,
@@ -207,7 +212,7 @@ pub(super) fn schedule_locked(
 }
 
 pub(super) fn withdraw_locked(vault: &LocalKeyService, path: &Path) -> Result<()> {
-    if read_schedule(path)?.is_some() {
+    if revocations::revocation_deadline(path)?.is_some() {
         if expire_locked(vault, path)?.is_some() {
             return Ok(());
         }
@@ -221,10 +226,10 @@ pub(super) fn withdraw_locked(vault: &LocalKeyService, path: &Path) -> Result<()
 }
 
 pub(super) fn expire_locked(vault: &LocalKeyService, path: &Path) -> Result<Option<i64>> {
-    let Some(due_at_ms) = read_schedule(path)? else {
+    let Some(due_at_ms) = revocations::revocation_deadline(path)? else {
         return Ok(None);
     };
-    let material = fs::read(path).map_err(io)?;
+    let material = zeroize::Zeroizing::new(fs::read(path).map_err(io)?);
     if is_destroyed(&material) {
         vault.sync_directory()?;
         return Ok(Some(due_at_ms));
@@ -234,88 +239,6 @@ pub(super) fn expire_locked(vault: &LocalKeyService, path: &Path) -> Result<Opti
     }
     vault.publish(path, DESTROYED)?;
     Ok(Some(due_at_ms))
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RevocationRecord {
-    request: ArchiveRevocation,
-    revoked_at_ms: Option<i64>,
-}
-
-impl LocalKeyService {
-    pub(super) async fn revoke_archive(&self, id: &str, request: ArchiveRevocation) -> Result<i64> {
-        if request.operation_id.is_nil() || request.request_sha256 == [0; 32] || request.not_before_ms <= 0 {
-            return Err(Anomaly::incorrect("rtdb.multi/archive-vault", "Invalid archive revocation order"));
-        }
-        if let Some(revoked_at) = self.update_archive_revocation(id, request, false).await? {
-            return Ok(revoked_at);
-        }
-        self.withdraw_local_scope(UnitScope::archive(id), &IoRegion::new()).await?;
-        self.update_archive_revocation(id, request, true).await?.ok_or_else(malformed)
-    }
-
-    async fn update_archive_revocation(
-        &self, id: &str, request: ArchiveRevocation, drained: bool,
-    ) -> Result<Option<i64>> {
-        require_general_key_namespace(id)?;
-        let service = self.clone();
-        let id = id.to_owned();
-        tokio::task::spawn_blocking(move || {
-            service.require_service_root()?;
-            let raw_path = service.path(&id)?;
-            let _raw_lock = service.lock_key(&raw_path)?;
-            if !service.is_brokered(&id)? {
-                return Err(Anomaly::unsupported("rtdb.multi/archive-vault", "The capture has no operation-only key authority"));
-            }
-            let vault = service.archive_vault()?;
-            let path = vault.path(&id)?;
-            let _lock = vault.lock_key(&path)?;
-            let record_path = path.with_extension("revocation");
-            let now_ms = rtdb_directory::now_ms();
-            let material = zeroize::Zeroizing::new(fs::read(&path).map_err(io)?);
-            let withdrawn = is_destroyed(&material);
-            if !withdrawn && material.len() != KEY_BYTES { return Err(malformed()); }
-            let retained = match fs::read(&record_path) {
-                Ok(bytes) => {
-                    let record: RevocationRecord = serde_json::from_slice(&bytes).map_err(|_| malformed())?;
-                    if record.request != request {
-                        return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/archive-vault", "The capture has another exact revocation order"));
-                    }
-                    if let Some(revoked_at_ms) = record.revoked_at_ms {
-                        if !withdrawn || revoked_at_ms < request.not_before_ms {
-                            return Err(malformed());
-                        }
-                        vault.sync_directory()?;
-                        return Ok(Some(revoked_at_ms));
-                    }
-                    true
-                }
-                Err(error) if error.kind() == ErrorKind::NotFound => false,
-                Err(error) => return Err(io(error)),
-            };
-            if now_ms < request.not_before_ms {
-                return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/archive-vault", "The archive authority is waiting for revocation"));
-            }
-            let publish = |revoked_at_ms| {
-                let bytes = serde_json::to_vec(&RevocationRecord { request, revoked_at_ms }).map_err(|_| malformed())?;
-                vault.publish(&record_path, &bytes)
-            };
-            if drained {
-                if !retained || !withdrawn { return Err(malformed()); }
-                publish(Some(now_ms))?;
-                Ok(Some(now_ms))
-            } else {
-                if !retained { publish(None)?; }
-                if withdrawn {
-                    vault.sync_directory()?;
-                } else {
-                    withdraw_locked(&vault, &path)?;
-                }
-                Ok(None)
-            }
-        }).await.map_err(|error| Anomaly::fault("rtdb.multi/archive-vault-task", error.to_string()))?
-    }
 }
 
 fn archive_io(error: Anomaly) -> Error {
@@ -594,13 +517,14 @@ impl CaptureCryptography for LocalArchiveKey {
 
 #[cfg(test)]
 mod tests {
+    use super::revocations::RevocationStep;
     use super::*;
     use std::{
         future::{Future, poll_fn},
         task::Poll,
     };
 
-    use crate::keys::KeyService;
+    use crate::keys::{ArchiveRevocation, KeyService};
     use rtdb_storage::ReadReservation;
     use rtdb_types::MemoryBudget;
 
@@ -615,7 +539,7 @@ mod tests {
             request_sha256: [1; 32],
             not_before_ms: rtdb_directory::now_ms(),
         };
-        assert_eq!(vault.update_archive_revocation("capture", request, false).await?, None);
+        assert_eq!(vault.update_archive_revocation("capture", request, RevocationStep::WithdrawRoot).await?, None);
         assert!(key.open("member", body).await.is_err());
         drop(vault);
 
