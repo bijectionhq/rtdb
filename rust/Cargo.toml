@@ -1,9 +1,10 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
-exclude = ["vendor/bijection-geometry", "vendor/bijection-store-derive", "vendor/bijection-store-filter", "vendor/bijection-store-judge", "vendor/apache-avro", "vendor/fancy-regex", "vendor/validation-json", "vendor/validation-referencing", "vendor/validation-jsonschema", "vendor/rdkafka", "vendor/rdkafka-sys", "vendor/rustls", "vendor/openssl-src", "vendor/sqlparser", "vendor/bijection/store_read", "vendor/bijection/kernel_text", "vendor/bijection/geometry"]
+exclude = ["vendor/bijection-geometry", "vendor/bijection-store-derive", "vendor/bijection-store-filter", "vendor/bijection-store-judge", "vendor/apache-avro", "vendor/arrow-data", "vendor/fancy-regex", "vendor/validation-json", "vendor/validation-referencing", "vendor/validation-jsonschema", "vendor/rdkafka", "vendor/rdkafka-sys", "vendor/rustls", "vendor/openssl-src", "vendor/sqlparser", "vendor/bijection/store_read", "vendor/bijection/kernel_text", "vendor/bijection/geometry"]
 
 [patch.crates-io]
+arrow-data = { path = "vendor/arrow-data" }
 rustls = { path = "vendor/rustls" }
 openssl-src = { path = "vendor/openssl-src" }
 

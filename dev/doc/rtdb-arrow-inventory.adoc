@@ -61,6 +61,7 @@ See link:../../rust/crates/tx/src/resolver.rs[resolution] and link:../../rust/cr
 |The live index, replica event payloads, persisted tries and compaction carry Arrow events.
 The live index checks canonical IIDs against the active identity cells.
 Block flush gathers compatible evolving chunks under the captured Arrow layout.
+Staging, block production, and query gathering copy nested Arrow intervals using the alignment of their declared interval type.
 Block flush and compaction join per-page statistics into the persisted Arrow metadata schema.
 |Trie navigation, event headers, temporal resolution and compaction decisions use Rust control values.
 Explicit event readers can produce a row for callers of the event API.

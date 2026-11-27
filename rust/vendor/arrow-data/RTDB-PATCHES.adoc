@@ -1,0 +1,6 @@
+= RTDB patches to arrow-data
+
+The base is the crates.io release of arrow-data 58.4.1, with archive SHA-256 `10791765e6927cdd8ace5bf0e51a69f38a1c3aded2db93561b003c332d02ee2a`.
+The copy kernel in `src/transform/mod.rs` backports the Arrow-native interval types from https://github.com/apache/arrow-rs/pull/10171[Arrow #10171] and https://github.com/apache/arrow-rs/pull/11906[Arrow #11906].
+`MutableArrayData` accepts the 8-byte alignment of MonthDayNano and the 4-byte alignment of DayTime when extending values and nulls.
+Remove the workspace override when the pinned Arrow release includes both copy-kernel fixes.

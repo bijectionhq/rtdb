@@ -2229,6 +2229,63 @@ fn batches_built_from_other_batches_rows_keep_the_headers_and_put_types_a_fresh_
 
 #[cfg(test)]
 #[test]
+fn pending_runs_preserve_nested_intervals_with_arrow_alignment() {
+    use arrow_array::types::{IntervalDayTimeType, IntervalMonthDayNanoType};
+    use arrow_array::{Int64Array, IntervalDayTimeArray, IntervalMonthDayNanoArray};
+
+    let memory = MemoryBudget::new(8 << 20);
+    let runs = [1_i32, 2].map(|id| {
+        let month_day = IntervalMonthDayNanoArray::from(vec![
+            IntervalMonthDayNanoType::make_value(0, 0, i64::from(id)),
+            IntervalMonthDayNanoType::make_value(3, 0, 0),
+        ]);
+        let day_time = IntervalDayTimeArray::from(vec![
+            IntervalDayTimeType::make_value(0, id),
+            IntervalDayTimeType::make_value(5, 0),
+        ]);
+        let month_day = month_day.values().inner().slice_with_length(8, 16);
+        let day_time = day_time.values().inner().slice_with_length(4, 8);
+        assert_eq!(month_day.as_ptr().align_offset(16), 8);
+        assert_eq!(day_time.as_ptr().align_offset(8), 4);
+
+        let month_day = IntervalMonthDayNanoArray::new(month_day.into(), None);
+        let day_time = IntervalDayTimeArray::new(day_time.into(), None);
+        let intervals = StructArray::from(vec![
+            (Arc::new(Field::new("month_day", month_day.data_type().clone(), false)), Arc::new(month_day) as ArrayRef),
+            (Arc::new(Field::new("day_time", day_time.data_type().clone(), false)), Arc::new(day_time) as ArrayRef),
+        ]);
+        let id = i64::from(id);
+        let docs = StructArray::from(vec![
+            (Arc::new(Field::new("_id", DataType::Int64, false)), Arc::new(Int64Array::from(vec![id])) as ArrayRef),
+            (Arc::new(Field::new("intervals", intervals.data_type().clone(), false)), Arc::new(intervals.clone()) as ArrayRef),
+        ]);
+        let header = EventHeader {
+            position: None, commit_position: 0, iid: EntityId::Integer(id).iid(), system_from: Timestamp(1),
+            valid_time: Interval::ALL, op: EventOp::Put,
+        };
+        let batch = rtdb_format::data::owned_put_batch(Arc::new(docs), &[header], None, &memory).unwrap();
+        PendingBatch { preceding_events: 0, batch: IndexBatch::from_owned(batch).unwrap(), can_concat: true }
+    });
+    let [first, second] = runs.each_ref().map(|run| run.batch.as_ref());
+    let expected = [first.events.read_event(0).unwrap(), second.events.read_event(0).unwrap()];
+    let merged = PendingTable::concat_runs(&runs, &memory).unwrap();
+    let packed = first.try_join_live_tail(second).unwrap();
+    for batch in [merged, packed] {
+        assert_eq!(batch.len(), expected.len());
+        for (row, event) in expected.iter().enumerate() {
+            assert_eq!(&batch.events.read_event(row).unwrap(), event);
+        }
+    }
+
+    let reversed = OwnedBatch::interleave_distinct_rows(&[&first.owned, &second.owned], &[(1, 0), (0, 0)], &memory).unwrap();
+    let reversed = IndexBatch::from_owned(reversed).unwrap();
+    assert_eq!(reversed.len(), expected.len());
+    assert_eq!(reversed.events.read_event(0).unwrap(), expected[1]);
+    assert_eq!(reversed.events.read_event(1).unwrap(), expected[0]);
+}
+
+#[cfg(test)]
+#[test]
 fn repeated_appends_merge_column_types_as_a_fresh_merge_does_in_field_order() {
     use rtdb_types::ScalarType;
     let int = LogicalType::Scalar(ScalarType::I64);

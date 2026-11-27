@@ -22,6 +22,7 @@
 --   A discarded append or forked branch leaves no orphaned slots in any earlier value's relation and releases its unretained batch funding immediately.
 --   An incremental transaction snapshot appends the pending Arrow runs written since its last read as one batch.
 --   A holder of an earlier snapshot retains its prefix batches and their funding.
+--   Pending-run assembly and live batch packing preserve nested interval values at any buffer alignment valid for their Arrow type.
 --   The row lineage starts a new generation at its revision limit.
 --   The derived index builds coverage anew for that generation.
 --   A derived posting page can serve a related snapshot when its covered rows lie in both snapshots' shared prefix.

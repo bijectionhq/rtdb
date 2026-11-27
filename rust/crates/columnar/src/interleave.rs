@@ -346,18 +346,6 @@ fn copy_flat_cells(arrays: &[&dyn Array], cells: Selection<'_>) -> Result<ArrayR
     }
 }
 
-// MutableArrayData extends a MonthDayNano interval as i128, which needs 16-byte alignment, while the interval's own layout
-// only promises 8, so a buffer sliced from a larger page can be valid Arrow and still panic the copy.
-fn extendable_data(data: ArrayData) -> ArrayData {
-    if !matches!(data.data_type(), DataType::Interval(arrow_schema::IntervalUnit::MonthDayNano))
-        || data.buffers()[0].as_ptr().align_offset(std::mem::align_of::<i128>()) == 0 {
-        return data;
-    }
-    let values = arrow_buffer::Buffer::from_slice_ref(data.buffers()[0].as_slice());
-    // SAFETY: only the values buffer moves; its bytes, length, offset and null mask are unchanged.
-    unsafe { data.into_builder().buffers(vec![values]).build_unchecked() }
-}
-
 fn copy_flat_ranges(arrays: &[&dyn Array], ranges: &CellRanges) -> Result<Option<ArrayRef>> {
     let layout = arrays[0].data_type();
     let len = ranges.len;
@@ -376,7 +364,7 @@ fn copy_flat_ranges(arrays: &[&dyn Array], ranges: &CellRanges) -> Result<Option
         check_buffer_size(len.checked_mul(width).ok_or_else(size_error)?)?;
     }
 
-    let data = arrays.iter().map(|array| extendable_data(array.to_data())).collect::<Vec<_>>();
+    let data = arrays.iter().map(|array| array.to_data()).collect::<Vec<_>>();
     let capacity = match layout {
         DataType::Utf8 | DataType::Binary => byte_range_capacity::<i32>(arrays, &data, ranges)?,
         DataType::LargeUtf8 | DataType::LargeBinary => byte_range_capacity::<i64>(arrays, &data, ranges)?,
@@ -502,6 +490,37 @@ fn copying_contiguous_flat_cells_owns_the_values() {
     let copied = copied.as_primitive::<Int64Type>();
     assert_eq!(copied.values().as_ref(), &[10, 20]);
     assert_ne!(copied.values().as_ptr(), original);
+}
+
+#[test]
+fn copying_interval_ranges_accepts_arrow_alignment_and_extends_nulls() {
+    use arrow_array::{IntervalDayTimeArray, IntervalMonthDayNanoArray};
+    use arrow_buffer::{Buffer, IntervalDayTime, IntervalMonthDayNano, MutableBuffer};
+
+    let day_time = IntervalDayTime::new(3, 7);
+    let mut day_time_buffer = MutableBuffer::new(12);
+    day_time_buffer.push(0_u32);
+    day_time_buffer.push(day_time);
+    let day_time_buffer = Buffer::from(day_time_buffer).slice(4);
+    assert_eq!(day_time_buffer.as_ptr().align_offset(8), 4);
+    let day_time_source = IntervalDayTimeArray::new(day_time_buffer.into(), None);
+
+    let month_day = IntervalMonthDayNano::new(2, 5, 11);
+    let mut month_day_buffer = MutableBuffer::new(24);
+    month_day_buffer.push(0_u64);
+    month_day_buffer.push(month_day);
+    let month_day_buffer = Buffer::from(month_day_buffer).slice(8);
+    assert_eq!(month_day_buffer.as_ptr().align_offset(16), 8);
+    let month_day_source = IntervalMonthDayNanoArray::new(month_day_buffer.into(), None);
+
+    let mut ranges = CellRanges::default();
+    ranges.push(CellRange::Source { source: 0, start: 0, end: 1 }).unwrap();
+    ranges.push(CellRange::Nulls(1)).unwrap();
+
+    let day_time_copy = copy_flat_ranges(&[&day_time_source], &ranges).unwrap().unwrap();
+    let month_day_copy = copy_flat_ranges(&[&month_day_source], &ranges).unwrap().unwrap();
+    assert_eq!(day_time_copy.as_ref(), &IntervalDayTimeArray::from(vec![Some(day_time), None]));
+    assert_eq!(month_day_copy.as_ref(), &IntervalMonthDayNanoArray::from(vec![Some(month_day), None]));
 }
 
 #[test]
