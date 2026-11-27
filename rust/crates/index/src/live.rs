@@ -128,6 +128,11 @@ impl IndexBatch {
     pub fn copy_events_with_put_schema(events: &[StoredEvent], declared: &StructFields<LogicalType>, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
         Self::build_events(events, declared, EventBuild::CopyCaptured, budget)
     }
+    /// Infers the put layout used by `copy_events` without declarations.
+    /// The caller must fund schema inference scratch before calling.
+    pub fn inferred_event_put_types(events: &[StoredEvent]) -> Option<StructFields<LogicalType>> {
+        event_column_types(events)
+    }
     fn build_events(events: &[StoredEvent], declared: &StructFields<LogicalType>, mode: EventBuild, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
         let mut schema_bytes = 4096usize;
         for (name, ty) in declared {
@@ -140,7 +145,7 @@ impl IndexBatch {
         }
         let _schema_scratch = budget.reserve(schema_bytes.checked_mul(4).ok_or_else(|| invalid("Put schema allocation size overflow"))?)?;
         let captured = matches!(mode, EventBuild::CopyCaptured);
-        let rows = if captured { None } else { event_column_types(events) };
+        let rows = if captured { None } else { Self::inferred_event_put_types(events) };
         let has_put = captured || rows.is_some() || !declared.is_empty();
         let fields = match rows { Some(rows) => declare_column_types(&rows, declared), None => declared.clone() };
         let copy = !matches!(mode, EventBuild::Write);

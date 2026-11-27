@@ -1,4 +1,4 @@
-use std::{borrow::Cow, collections::BTreeSet, fmt::Write, io::Cursor, mem::size_of, num::NonZeroU32, sync::Arc};
+use std::{borrow::Cow, collections::{BTreeMap, BTreeSet}, fmt::Write, io::Cursor, mem::size_of, num::NonZeroU32, sync::Arc};
 
 use arrow_schema::{DataType, Field};
 use sha2::{Digest, Sha256};
@@ -180,7 +180,14 @@ impl OpenTransaction<'_> {
         if data_history.events.iter().chain(&journal_history.events).any(|event| event.system_from >= key.system_time) {
             return Err(uncovered("Adoption must follow the original SQL history clock"));
         }
-        let data = IndexBatch::copy_events(&data_history.events, &StructFields::new(), &self.context.memory)?;
+        let data = match try_copy_positioned_data(
+            &data_history.events,
+            base.iter_segments(&data).flat_map(|segment| segment.batches().map(|batch| batch.view())),
+            field, orders, &self.context.memory,
+        ) {
+            Ok(Some(batch)) => batch,
+            _ => IndexBatch::copy_events(&data_history.events, &StructFields::new(), &self.context.memory)?,
+        };
         let journal = copy_adoption_journal(
             &journal_history.events,
             base.iter_segments(&journal).flat_map(|segment| segment.batches().map(|batch| batch.view())),
@@ -401,25 +408,68 @@ fn try_copy_positioned_journal<'a>(
         StoredOperation::Put(document) => Some(document),
         _ => None,
     });
-    let Some(first) = documents().next() else { return Ok(None); };
     if !documents().all(|doc| doc.len() == NAMES.len() && NAMES.iter().all(|name| doc.contains_key(*name))) {
         return Ok(None);
     }
-    let schema_bytes = documents().try_fold(4096usize, |bytes, doc| {
-        bytes.checked_add(Value::document_retained_bytes(doc)?).ok_or_else(overflow)
+    let _scratch = reserve_positioned_copy(events, memory)?;
+    let Some(positions) = live_history_positions(events, live)? else { return Ok(None); };
+    let Some(fields) = IndexBatch::inferred_event_put_types(events) else { return Ok(None); };
+    let target = fields.iter().map(|(name, ty)| to_field(name, ty)).collect::<Result<Vec<_>>>()?;
+    let mut columns = BTreeMap::new();
+    for field in &target {
+        let name = field.name().as_str();
+        if !plain_journal_field(field) || !exact_column(&positions, events, name, field) {
+            return Ok(None);
+        }
+        columns.insert(name, name);
+    }
+    write_positioned_history(positions, events, &columns, fields, memory).map(Some)
+}
+
+fn try_copy_positioned_data<'a>(
+    events: &'a [StoredEvent], live: impl Iterator<Item = &'a EventBatch>,
+    converted: &str, orders: [(&str, &str); 2], memory: &Arc<MemoryBudget>,
+) -> Result<Option<Arc<IndexBatch>>> {
+    let _scratch = reserve_positioned_copy(events, memory)?;
+    let Some(positions) = live_history_positions(events, live)? else { return Ok(None); };
+    let Some(fields) = IndexBatch::inferred_event_put_types(events) else { return Ok(None); };
+    let target = fields.iter().map(|(name, ty)| to_field(name, ty)).collect::<Result<Vec<_>>>()?;
+    let mut columns = BTreeMap::new();
+    for field in &target {
+        let name = field.name().as_str();
+        if name == converted || !plain_data_field(field) { continue; }
+        let source = orders.iter().find_map(|(old, new)| (*new == name).then_some(*old)).unwrap_or(name);
+        if exact_column(&positions, events, source, field) {
+            columns.insert(name, source);
+        }
+    }
+    if orders.iter().any(|(_, target)| !columns.contains_key(*target)) { return Ok(None); }
+    write_positioned_history(positions, events, &columns, fields, memory).map(Some)
+}
+
+fn reserve_positioned_copy(events: &[StoredEvent], memory: &Arc<MemoryBudget>) -> Result<Arc<MemoryReservation>> {
+    let schema_bytes = events.iter().try_fold(4096usize, |bytes, event| {
+        match &event.operation {
+            StoredOperation::Put(document) => bytes.checked_add(Value::document_retained_bytes(document)?).ok_or_else(overflow),
+            _ => Ok(bytes),
+        }
     })?;
-    let row_bytes = size_of::<EventRef<'_>>() + size_of::<PositionedJournalEntry<'_>>();
+    let row_bytes = size_of::<EventRef<'_>>() + size_of::<PositionedAdoptionEvent<'_>>();
     let scratch = schema_bytes.checked_mul(4)
         .and_then(|bytes| bytes.checked_add(events.len().checked_mul(row_bytes)?)).ok_or_else(overflow)?;
-    let _scratch = memory.reserve(scratch)?;
+    memory.reserve(scratch)
+}
+
+fn live_history_positions<'a>(
+    events: &[StoredEvent], live: impl Iterator<Item = &'a EventBatch>,
+) -> Result<Option<Vec<EventRef<'a>>>> {
     let mut positions = Vec::with_capacity(events.len());
     for batch in live {
         if batch.is_empty() { continue; }
-        if batch.len() > events.len() - positions.len()
-            || !batch.put_document()?.is_some_and(|put| put.fields().len() == NAMES.len()
-                && NAMES.iter().all(|name| put.fields().iter().any(|field| field.name().as_str() == *name)))
-        {
-            return Ok(None);
+        if batch.len() > events.len() - positions.len() { return Ok(None); }
+        if let Some(put) = batch.put_document()? {
+            let mut names = BTreeSet::new();
+            if put.fields().iter().any(|field| !names.insert(field.name())) { return Ok(None); }
         }
         for row in 0..batch.len() {
             positions.push(batch.borrow_event(row)?);
@@ -427,28 +477,48 @@ fn try_copy_positioned_journal<'a>(
     }
     if positions.len() != events.len() { return Ok(None); }
     positions.sort_unstable_by_key(|event| event.header().position);
+    Ok(positions.iter().zip(events).all(|(source, verified)| source.header() == verified.header())
+        .then_some(positions))
+}
 
-    let fields: StructFields<LogicalType> = first.keys().map(|name| {
-        let types = documents().map(|doc| doc[name.as_str()].logical_type()).collect::<Vec<_>>();
-        (name.clone(), LogicalType::join_all(&types))
-    }).collect();
-    let target = fields.iter().map(|(name, ty)| to_field(name, ty)).collect::<Result<Vec<_>>>()?;
-    if !target.iter().all(plain_journal_field) { return Ok(None); }
-
-    let mut positioned = Vec::with_capacity(events.len());
-    for (source, verified) in positions.into_iter().zip(events) {
-        if source.header() != verified.header() { return Ok(None); }
-        let event = PositionedJournalEntry { source, verified };
-        if !target.iter().all(|field| match event.put_column(field.name()) {
-            Some(PutColumn::Absent) => field.is_nullable(),
-            Some(PutColumn::Stored(source, _, _)) => {
-                source.data_type() == field.data_type() && source.metadata() == field.metadata()
+fn exact_column(positions: &[EventRef<'_>], events: &[StoredEvent], name: &str, target: &Field) -> bool {
+    positions.iter().zip(events).all(|(source, verified)| {
+        let StoredOperation::Put(document) = &verified.operation else { return true; };
+        match positioned_cell(source, name, document.get(target.name())) {
+            Some(PutColumn::Absent) => target.is_nullable(),
+            Some(PutColumn::Stored(field, _, _)) => {
+                field.data_type() == target.data_type() && field.metadata() == target.metadata()
             }
             None => false,
-        }) { return Ok(None); }
-        positioned.push(event);
+        }
+    })
+}
+
+fn plain_data_field(field: &Field) -> bool {
+    field.metadata().is_empty() && matches!(field.data_type(),
+        DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+        | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64
+        | DataType::Utf8 | DataType::Binary)
+}
+
+fn positioned_cell<'a>(source: &'a EventRef<'_>, name: &str, value: Option<&Value>) -> Option<PutColumn<'a>> {
+    if matches!(value, None | Some(Value::Null)) {
+        return Some(PutColumn::Absent);
     }
-    IndexBatch::from_owned(owned_event_batch(&positioned, Some(fields), true, memory)?).map(Some)
+    match source.put_column(name)? {
+        stored @ PutColumn::Stored(..) => Some(stored),
+        PutColumn::Absent => None,
+    }
+}
+
+fn write_positioned_history<'a>(
+    positions: Vec<EventRef<'a>>, events: &'a [StoredEvent], columns: &BTreeMap<&str, &str>,
+    fields: StructFields<LogicalType>, memory: &Arc<MemoryBudget>,
+) -> Result<Arc<IndexBatch>> {
+    let positioned = positions.into_iter().zip(events).map(|(source, verified)| {
+        PositionedAdoptionEvent { source, verified, columns }
+    }).collect::<Vec<_>>();
+    IndexBatch::from_owned(owned_event_batch(&positioned, Some(fields), true, memory)?)
 }
 
 fn plain_journal_field(field: &Field) -> bool {
@@ -460,26 +530,28 @@ fn plain_journal_field(field: &Field) -> bool {
     }
 }
 
-struct PositionedJournalEntry<'a> {
+struct PositionedAdoptionEvent<'a> {
     source: EventRef<'a>,
     verified: &'a StoredEvent,
+    columns: &'a BTreeMap<&'a str, &'a str>,
 }
 
-impl EncodedEvent for PositionedJournalEntry<'_> {
+impl EncodedEvent for PositionedAdoptionEvent<'_> {
     fn header(&self) -> EventHeader { self.verified.header() }
     fn recency(&self) -> Option<Timestamp> { self.verified.recency }
     fn entity_key(&self) -> Option<&[u8]> { self.verified.entity_key() }
     fn origin(&self) -> Option<EventOrigin> { self.verified.origin }
     fn put_within(&self, fields: &StructFields<LogicalType>) -> bool { self.verified.put_within(fields) }
-    fn put_cell(&self, _name: &str, _ty: &LogicalType) -> Result<Cow<'_, Value>> {
-        Err(uncovered("The journal copy requires a compatible Arrow position"))
+    fn put_cell(&self, name: &str, ty: &LogicalType) -> Result<Cow<'_, Value>> {
+        if self.columns.contains_key(name) {
+            return Err(uncovered("The history copy requires a compatible Arrow position"));
+        }
+        self.verified.put_cell(name, ty)
     }
     fn put_column(&self, name: &str) -> Option<PutColumn<'_>> {
+        let source = self.columns.get(name)?;
         let StoredOperation::Put(document) = &self.verified.operation else { return None; };
-        if matches!(document.get(name), Some(Value::Null)) {
-            return Some(PutColumn::Absent);
-        }
-        self.source.put_column(name)
+        positioned_cell(&self.source, source, document.get(name))
     }
 }
 
@@ -549,7 +621,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use crate::{Documents, HostedAuthority, HostedControlWrite, SourceTransaction, SubmitOptions, TxOp, bind_installed_authority};
-    use super::{copy_adoption_journal, intrinsic_orders, try_copy_positioned_journal, verify_journal};
+    use super::{copy_adoption_journal, intrinsic_orders, try_copy_positioned_data, try_copy_positioned_journal, verify_journal};
     use super::super::{OpenTransaction, OwnedPathKind, ResolveContext, TransactionAuthorization, TxResolver, attempt_marker_document};
 
     const PAYLOAD: &str = "c_0123456789abcdef0123456789abcdef";
@@ -604,6 +676,79 @@ mod tests {
         let copied = copy_adoption_journal(&events, live.into_iter(), &memory)?;
         let expected = IndexBatch::copy_events(&events, &StructFields::new(), &memory)?;
         assert_eq!(wire(&copied)?.as_slice(), wire(&expected)?.as_slice());
+        Ok(())
+    }
+
+    #[test]
+    fn positioned_data_copy_preserves_canonical_renamed_fields_and_compound_cells() -> Result<()> {
+        let memory = MemoryBudget::new(32 << 20);
+        let orders = [("old_order", "new_order"), ("old_creation", "new_creation")];
+        let document = |id: u8| {
+            StructFields::from([
+                ("_id".into(), Value::Binary(vec![id])),
+                ("old_order".into(), Value::Binary(Vec::new())),
+                ("old_creation".into(), Value::Binary(vec![id])),
+            ])
+        };
+        let mut first = document(1);
+        first.insert(PAYLOAD.into(), Value::Binary(vec![12, 6]));
+        first.insert("caption".into(), Value::Utf8("unchanged".into()));
+        first.insert("nullable".into(), Value::Bool(true));
+        let mut second = document(2);
+        second.insert(PAYLOAD.into(), Value::Binary(vec![2]));
+        second.insert("nullable".into(), Value::Null);
+        let mut third = document(3);
+        third.insert("caption".into(), Value::Null);
+        let valid_time = Interval::new(Timestamp(180), Timestamp(900))?;
+        let event = |id, transaction, ordinal, operation| {
+            let id = EntityId::Binary(vec![id]);
+            StoredEvent {
+                position: Some(EventPosition { transaction: TxId(transaction), ordinal }),
+                origin: Some(EventOrigin([ordinal as u8; 32])),
+                entity_key: Some(id.handle_bytes().into()),
+                iid: id.iid(),
+                system_from: Timestamp(200),
+                commit_position: ordinal,
+                valid_time,
+                operation,
+                recency: Some(Timestamp(230)),
+            }
+        };
+        let originals = [
+            event(1, 10, 1, StoredOperation::Put(first)),
+            event(2, 10, 2, StoredOperation::Put(second)),
+            event(3, 10, 3, StoredOperation::Put(third)),
+            event(1, 11, 1, StoredOperation::Delete),
+        ];
+        let old = IndexBatch::copy_events(&originals[..1], &StructFields::new(), &memory)?;
+        let new = IndexBatch::copy_events(&originals[1..], &StructFields::new(), &memory)?;
+        let mut events = [old.view().read_event(0)?, new.view().read_event(0)?,
+            new.view().read_event(1)?, new.view().read_event(2)?];
+        for event in &mut events {
+            let StoredOperation::Put(document) = &mut event.operation else { continue; };
+            if matches!(document.get("caption"), Some(Value::Null)) {
+                document.remove("caption");
+            }
+            for (before, after) in orders {
+                let key = document.remove(before).unwrap();
+                document.insert(after.into(), key);
+            }
+        }
+        let StoredOperation::Put(first) = &mut events[0].operation else { unreachable!(); };
+        first.insert(PAYLOAD.into(), Value::Struct(StructFields::from([
+            ("v2_value".into(), Value::Decimal(DecimalValue::new((-123i128).to_be_bytes().to_vec(), 38, 0, 128)?)),
+        ])));
+
+        let copied = try_copy_positioned_data(&events, [new.view(), old.view()].into_iter(), PAYLOAD, orders, &memory)?
+            .expect("both renamed binary order columns are positioned");
+        drop((old, new));
+        let scalar = IndexBatch::copy_events(&events, &StructFields::new(), &memory)?;
+        let wire = |batch: &IndexBatch| crate::ipc::encode(batch.arrow().schema_ref(), [batch.arrow()], &memory);
+        assert_eq!(copied.arrow(), scalar.arrow());
+        assert_eq!(wire(&copied)?.as_slice(), wire(&scalar)?.as_slice());
+        for row in 0..events.len() {
+            assert_eq!(copied.view().read_event(row)?, scalar.view().read_event(row)?);
+        }
         Ok(())
     }
 
