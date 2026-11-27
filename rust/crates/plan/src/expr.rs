@@ -156,7 +156,14 @@ pub fn function_type(name: &str, arguments: &[LogicalType]) -> Result<LogicalTyp
         "length" | "cardinality" => (LogicalType::Scalar(S::I32), 1..=1, true),
         "abs" => (LogicalType::join_all(arguments), 1..=1, true),
         "floor" | "ceil" | "ceiling" => (LogicalType::Scalar(S::F64), 1..=1, true),
-        "round" => (round_type(arguments.first().unwrap_or(&LogicalType::Nothing), None, arguments.len() == 2)?, 1..=2, true),
+        "round" => {
+            let ty = if arguments.len() == 2 && arguments.iter().all(|ty| !ty.legs().is_empty()) && arguments.iter().any(is_null_only) {
+                LogicalType::Null
+            } else {
+                round_type(arguments.first().unwrap_or(&LogicalType::Nothing), None, arguments.len() == 2)?
+            };
+            (ty, 1..=2, true)
+        }
         "greatest" | "least" => (if arguments.is_empty() { LogicalType::Null } else { LogicalType::join_all(arguments) }, 0..=usize::MAX, true),
         "power" => (LogicalType::Scalar(S::F64), 2..=2, true),
         "sqrt" | "exp" | "ln" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" => (LogicalType::Scalar(S::F64), 1..=1, true),
@@ -170,7 +177,7 @@ pub fn function_type(name: &str, arguments: &[LogicalType]) -> Result<LogicalTyp
         "local_name" => (LogicalType::Scalar(S::Utf8), 1..=1, true),
         "boolean" | "true?" | "false?" | "nil?" | "is_true" | "is_false" | "is_null" => (LogicalType::Scalar(S::Bool), 1..=1, false),
         "null_eq" | "===" => (LogicalType::Scalar(S::Bool), 2..=2, false),
-        "nullif" => (arguments.first().cloned().unwrap_or(LogicalType::Null).maybe(), 2..=2, true),
+        "nullif" => (arguments.first().cloned().unwrap_or(LogicalType::Null).maybe(), 2..=2, false),
         "coalesce" => (LogicalType::join_all(arguments), 0..=usize::MAX, false),
         "set" => (LogicalType::List { kind: rtdb_types::ListKind::Set, element: Box::new(LogicalType::join_all(arguments)) }, 0..=usize::MAX, false),
         "period" => (LogicalType::List { kind: rtdb_types::ListKind::TimestampTzRange, element: Box::new(LogicalType::Scalar(S::Timestamp { unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) })) }, 2..=2, false),
@@ -215,6 +222,9 @@ pub fn function_type(name: &str, arguments: &[LogicalType]) -> Result<LogicalTyp
                 }
             }
         }
+    }
+    if nullable && !arguments.iter().any(|ty| ty.legs().is_empty()) && arguments.iter().any(is_null_only) {
+        return Ok(LogicalType::Null);
     }
     Ok(if nullable && arguments.iter().any(LogicalType::nullable) { ty.maybe() } else { ty })
 }
@@ -342,7 +352,10 @@ impl Expr {
             Self::Cast { expr, target } => target.result_type(&expr.data_type()),
             Self::Call { return_type, .. } | Self::RegexReplace { return_type,.. } => return_type.clone(),
             Self::Unary { op: U::IsNull | U::IsNotNull | U::IsTrue | U::IsFalse | U::IsUnknown, .. } => LogicalType::Scalar(ScalarType::Bool),
-            Self::Unary { op: U::Not, expr } => boolean_type(expr.data_type().nullable()),
+            Self::Unary { op: U::Not, expr } => {
+                let ty = expr.data_type();
+                if is_null_only(&ty) { LogicalType::Null } else { boolean_type(ty.nullable()) }
+            }
             Self::Unary { op: U::BitNot, expr } => crate::bitwise::signature("bit_not", &[expr.data_type()]).unwrap().unwrap_or(LogicalType::Nothing),
             Self::Unary { expr, .. } => expr.data_type(),
             Self::Binary { op: B::IsDistinctFrom | B::IsNotDistinctFrom, left, right } => {
@@ -354,8 +367,17 @@ impl Expr {
                 }
                 boolean_type(nullable)
             }
-            Self::Binary { op: B::Eq | B::NotEq, left, right } => boolean_type(equality_nullable(&left.data_type(), &right.data_type())),
-            Self::Binary { op: B::Lt | B::LtEq | B::Gt | B::GtEq | B::And | B::Or, left, right } => boolean_type(left.data_type().nullable() || right.data_type().nullable()),
+            Self::Binary { op: B::Eq | B::NotEq, left, right } => {
+                let (left, right) = (left.data_type(), right.data_type());
+                if is_null_only(&left) || is_null_only(&right) { LogicalType::Null }
+                else { boolean_type(equality_nullable(&left, &right)) }
+            }
+            Self::Binary { op: B::Lt | B::LtEq | B::Gt | B::GtEq, left, right } => {
+                let (left, right) = (left.data_type(), right.data_type());
+                if is_null_only(&left) || is_null_only(&right) { LogicalType::Null }
+                else { boolean_type(left.nullable() || right.nullable()) }
+            }
+            Self::Binary { op: B::And | B::Or, left, right } => boolean_type(left.data_type().nullable() || right.data_type().nullable()),
             Self::In { expr, values, .. } => boolean_type(values.iter().any(|value| equality_nullable(&expr.data_type(), &value.data_type()))),
             Self::Like { expr, pattern, case_insensitive,.. } => function_type(if *case_insensitive { "ilike" } else { "like" }, &[expr.data_type(),pattern.data_type()]).unwrap_or(LogicalType::Nothing),
             Self::Binary { op: B::Concat, left, right } => {
@@ -543,6 +565,10 @@ pub fn field_type(source: &LogicalType, name: &str) -> LogicalType {
     }).collect::<Vec<_>>())
 }
 
+fn is_null_only(ty: &LogicalType) -> bool {
+    *ty == LogicalType::Null || ty.legs() == OrderedSet::from([LogicalType::Null])
+}
+
 fn boolean_type(nullable: bool) -> LogicalType {
     let ty = LogicalType::Scalar(ScalarType::Bool);
     if nullable { ty.maybe() } else { ty }
@@ -553,7 +579,7 @@ pub fn function_type_with_args(name: &str, arguments: &[Expr]) -> Result<Logical
     let types = arguments.iter().map(Expr::data_type).collect::<Vec<_>>();
     let result = crate::temporal_functions::with_args(name, arguments, function_type(name, &types)?)?;
     let result = crate::interval_constructor::with_args(name, arguments, result)?;
-    if !name.eq_ignore_ascii_case("round") { return Ok(result); }
+    if !name.eq_ignore_ascii_case("round") || is_null_only(&result) { return Ok(result); }
     let source = types.first().unwrap_or(&LogicalType::Nothing);
     let constant_scale_input = source.legs().iter().find_map(|leg| match leg {
         LogicalType::Scalar(ScalarType::Decimal { .. }) => Some("DECIMAL"),

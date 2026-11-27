@@ -246,7 +246,8 @@ fn scalar_comparisons_and_not_preserve_nonnullable_boolean_schemas() {
     assert_eq!(expr(B::Eq, V::I64(1), V::I64(2)).data_type(), boolean);
     assert_eq!(expr(B::And, V::Bool(true), V::Bool(false)).data_type(), boolean);
     assert_eq!(Expr::unary(rtdb_plan::UnaryOp::Not, Expr::Literal(V::Bool(true))).data_type(), boolean);
-    assert_eq!(expr(B::Eq, V::Null, V::I64(2)).data_type(), boolean.clone().maybe());
+    assert_eq!(expr(B::Eq, V::Null, V::I64(2)).data_type(), T::Null);
+    assert_eq!(Expr::binary(B::Eq, Expr::column(rtdb_plan::ColumnId(0), T::Scalar(S::I64).maybe()), Expr::Literal(V::I64(2))).data_type(), boolean.clone().maybe());
     assert_eq!(expr(B::Eq, V::list(vec![V::I64(1)]), V::list(vec![V::I64(1)])).data_type(), boolean.maybe());
 }
 

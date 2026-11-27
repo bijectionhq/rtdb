@@ -174,3 +174,34 @@ fn qualified_only_columns_keep_wildcard_order_and_qualified_resolution() {
     assert_eq!(schema.fields(), &[left, right]);
     assert_eq!(serde_json::from_slice::<Schema>(&serde_json::to_vec(&schema).unwrap()).unwrap(), schema);
 }
+
+#[test]
+fn strict_null_arguments_infer_null_type() {
+    let i64_ty = LogicalType::Scalar(ScalarType::I64);
+    let bool_ty = LogicalType::Scalar(ScalarType::Bool);
+    let null = Expr::Literal(Value::Null);
+    let one = Expr::Literal(Value::I64(1));
+    for op in [BinaryOp::Eq, BinaryOp::NotEq, BinaryOp::Lt, BinaryOp::LtEq, BinaryOp::Gt, BinaryOp::GtEq] {
+        assert_eq!(Expr::binary(op, null.clone(), null.clone()).data_type(), LogicalType::Null);
+        assert_eq!(Expr::binary(op, one.clone(), null.clone()).data_type(), LogicalType::Null);
+        assert_eq!(Expr::binary(op, null.clone(), one.clone()).data_type(), LogicalType::Null);
+    }
+    assert_eq!(Expr::unary(UnaryOp::Not, null.clone()).data_type(), LogicalType::Null);
+    assert_eq!(Expr::unary(UnaryOp::Not, Expr::column(ColumnId(0), bool_ty.clone().maybe())).data_type(), bool_ty.clone().maybe());
+    assert_eq!(Expr::binary(BinaryOp::And, null.clone(), Expr::Literal(Value::Bool(true))).data_type(), bool_ty.clone().maybe());
+    assert_eq!(Expr::binary(BinaryOp::Or, null.clone(), Expr::Literal(Value::Bool(false))).data_type(), bool_ty.clone().maybe());
+    assert_eq!(Expr::binary(BinaryOp::IsDistinctFrom, null.clone(), one.clone()).data_type(), bool_ty);
+
+    assert_eq!(function_type("least", &[i64_ty.clone(), LogicalType::Null, i64_ty.clone()]).unwrap(), LogicalType::Null);
+    assert_eq!(function_type("greatest", &[i64_ty.clone(), LogicalType::Null]).unwrap(), LogicalType::Null);
+    assert_eq!(function_type("least", &[i64_ty.clone(), i64_ty.clone().maybe()]).unwrap(), i64_ty.clone().maybe());
+    for name in ["abs", "floor", "ceil", "ceiling", "sqrt", "exp", "ln", "length", "cardinality", "_iid", "keyword", "namespace", "local_name", "lower_inf", "upper_inf"] {
+        assert_eq!(function_type(name, &[LogicalType::Null]).unwrap(), LogicalType::Null, "{name}");
+    }
+    assert_eq!(function_type("power", &[i64_ty.clone(), LogicalType::Null]).unwrap(), LogicalType::Null);
+    assert_eq!(function_type("floor", &[LogicalType::Nothing]).unwrap(), LogicalType::Scalar(ScalarType::F64));
+    assert_eq!(function_type("nullif", &[i64_ty.clone(), LogicalType::Null]).unwrap(), i64_ty.clone().maybe());
+    assert_eq!(function_type("nullif", &[LogicalType::Null, i64_ty]).unwrap(), LogicalType::Null);
+    assert_eq!(function_type_with_args("round", &[one, null.clone()]).unwrap(), LogicalType::Null);
+    assert_eq!(function_type_with_args("round", &[null, Expr::Literal(Value::I64(2))]).unwrap(), LogicalType::Null);
+}
