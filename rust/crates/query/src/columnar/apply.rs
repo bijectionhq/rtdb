@@ -197,6 +197,23 @@ impl ApplyPages {
         Ok(())
     }
 
+    pub(crate) fn span_count(&self) -> usize {
+        self.spans.spans.len()
+    }
+
+    pub(crate) fn repeat(&mut self, outer: usize, spans: Range<usize>, context: &crate::QueryContext) -> Result<()> {
+        for index in spans {
+            context.check_cancelled_at(index)?;
+            let span = &self.spans.spans[index];
+            let end = self.end_after(span.end - self.spans.start(index))?;
+            let page = span.page;
+            let spans = Arc::get_mut(&mut self.spans).expect("Apply owns its spans until projection");
+            admit(&mut spans.reservation, 4 * size_of::<ApplySpan>())?;
+            spans.spans.push(ApplySpan { end, outer, page });
+        }
+        Ok(())
+    }
+
     pub(crate) fn joined(
         &self,
         outer: &ColumnBatch,
@@ -458,7 +475,8 @@ impl ApplyPages {
             matches!(column,
             Column::Arrow { field, logical: Some(ty), .. } if stable_read_layout(ty, field))
         };
-        if let [page] = self.pages.as_slice()
+        if self.span_count() == 1
+            && let [page] = self.pages.as_slice()
             && let Column::Arrow { array, field, .. } = &page.columns[0]
             && stable(&page.columns[0])
         {

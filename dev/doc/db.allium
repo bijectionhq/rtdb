@@ -2415,6 +2415,12 @@ surface QueryAccess {
         -- Batched expansion preserves the reached input validation and retains selected child spans under their source owners.
         -- The dependent Apply evaluates fallible predicates and bindings and handles input layouts outside the batch admission.
         -- Apply builds its document from funded child arrays when their physical fields are admitted.
+        -- A document Apply can replay a completed dependent result within its current outer page when the captured scan key or lexical reference is the same.
+        -- Reuse binds each reached outer row and preserves dependent document order, duplicates, null results and the single-document cardinality check.
+        -- A bounded literal outer-join rewrite preserves one null-extended row per unmatched outer occurrence when the dependent preserved side has one row.
+        -- Keyed collection over bounded literal relations groups real dependent rows and retains an outer result for each occurrence.
+        -- Collection preserves source order for unordered aggregates and among peers in an explicitly ordered aggregate.
+        -- A missing keyed collection yields null for ARRAY_AGG and an empty list for VEC_AGG.
         -- Short-circuiting correlated queries observe the dependent plan's semantic pages.
         -- UNNEST over compatible Arrow lists retains each selected child span under its source owner and repeats the corresponding parent position for its elements.
         -- A column table over a compatible Arrow list parameter reads the bound row's child slice as one semantic page.

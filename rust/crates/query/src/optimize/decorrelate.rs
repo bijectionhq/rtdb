@@ -5,7 +5,7 @@
 //! A rule answers `Ok(None)` where it does not apply, which keeps the apply; an error building a rewrite fails the plan.
 
 use std::sync::Arc;
-use rtdb_plan::{AggregateExpr, AggregateFunction, ApplyKind, BinaryOp, CastTarget, ColumnId, Expr, Field, JoinKind, MaterializedBinding, NamedExpr, OrdinalityScope, PercentileFraction, Relation, RelationNode, Schema, UnaryOp};
+use rtdb_plan::{AggregateExpr, AggregateFunction, ApplyKind, BinaryOp, CastTarget, ColumnId, Expr, Field, JoinKind, MaterializedBinding, NamedExpr, OrdinalityScope, PercentileFraction, Relation, RelationNode, Schema, SortExpr, UnaryOp};
 use rtdb_types::{ListKind, LogicalType, Result, ScalarType, Value};
 use super::{Ids, with_children};
 
@@ -128,8 +128,14 @@ fn rewrite(input: &Arc<Relation>, dependent: &Arc<Relation>, arguments: &[(usize
     if !movable(dependent) { return Ok(None); }
     let correlation = Correlation { arguments };
     if !correlation.references(dependent) { return uncorrelated(input, dependent, kind, output, schema, ids); }
+    if let Some(rewritten) = keyed_collection(input, dependent, &correlation, kind, output, schema, ids)? {
+        return Ok(Some(rewritten));
+    }
     match (kind, output) {
         (ApplyKind::Inner, _) => {
+            if let Some(joined) = singleton_outer_join(input, dependent, &correlation, schema, ids)? {
+                return Ok(Some(joined));
+            }
             if let Some(joined) = lateral(input, dependent, &correlation, kind, schema, ids)? { return Ok(Some(joined)); }
             if let Some(unnested) = column_table(input, dependent, &correlation, false, ids)? { return restore(unnested, schema); }
             if let Some(grouped) = grouped_lateral(input, dependent, &correlation, schema, ids)? { return Ok(Some(grouped)); }
@@ -282,6 +288,170 @@ fn peel_projections(relation: &Arc<Relation>) -> Option<(Vec<NamedExpr>, &Arc<Re
         }
         _ => None,
     }
+}
+
+fn plain_type(ty: &LogicalType) -> &LogicalType {
+    match ty { LogicalType::Maybe(inner) => inner, ty => ty }
+}
+
+fn i64_column(schema: &Schema, expr: &Expr) -> bool {
+    matches!(expr, Expr::Column { id, data_type }
+        if *plain_type(data_type) == LogicalType::Scalar(ScalarType::I64)
+            && schema.get(*id).is_some_and(|field| &field.data_type == data_type))
+}
+
+fn plain_projection(input: &Relation, expressions: &[NamedExpr]) -> bool {
+    expressions.iter().all(|named| matches!(&named.expr, Expr::Column { id, data_type }
+        if *data_type == named.field.data_type && input.schema().get(*id).is_some_and(|f| f.data_type == *data_type)))
+}
+
+fn small_literal_rows(mut relation: &Relation) -> Option<usize> {
+    loop {
+        if relation.schema().len() > 16 || relation.schema().fields().iter().any(|field|
+            !matches!(plain_type(&field.data_type), LogicalType::Scalar(ScalarType::I64 | ScalarType::Bool) | LogicalType::Null)) {
+            return None;
+        }
+        match relation.node() {
+            RelationNode::Values { rows } if rows.len() <= 256 => {
+                let valid = rows.iter().all(|row| row.iter().zip(relation.schema().fields()).all(|(expr, field)| match expr {
+                    Expr::Literal(Value::Null) => field.data_type.nullable(),
+                    Expr::Literal(Value::I64(_)) => *plain_type(&field.data_type) == LogicalType::Scalar(ScalarType::I64),
+                    Expr::Literal(Value::Bool(_)) => *plain_type(&field.data_type) == LogicalType::Scalar(ScalarType::Bool),
+                    _ => false,
+                }));
+                return valid.then_some(rows.len());
+            }
+            RelationNode::Project { input, expressions } | RelationNode::Rename { input, expressions, .. }
+            | RelationNode::Extend { input, expressions } if plain_projection(input, expressions) => {
+                relation = input;
+            }
+            RelationNode::Reference { binding } => relation = &binding.relation,
+            _ => return None,
+        }
+    }
+}
+
+// The equality ran as a WHERE predicate, so its right key must be present for a match even under an outer join.
+fn literal_key_source(
+    source: &Arc<Relation>, input: &Schema, correlation: &Correlation<'_>,
+) -> Result<Option<(Arc<Relation>, Field, Expr, usize)>> {
+    let [(parameter, argument)] = correlation.arguments else { return Ok(None) };
+    if !i64_column(input, argument) { return Ok(None); }
+    let mut selection = source.as_ref();
+    while let RelationNode::Project { input, expressions } | RelationNode::Rename { input, expressions, .. }
+        | RelationNode::Extend { input, expressions } = selection.node()
+        && plain_projection(input, expressions)
+    {
+        selection = input;
+    }
+    let RelationNode::Filter { input: base, predicate: Expr::Binary { op: BinaryOp::Eq, left, right } } = selection.node() else {
+        return Ok(None);
+    };
+    let Some(key) = [(left.as_ref(), right.as_ref()), (right.as_ref(), left.as_ref())].into_iter().find_map(|(column, bound)| {
+        let Expr::Parameter { index, data_type } = bound else { return None };
+        let Expr::Column { id, .. } = column else { return None };
+        (*index == *parameter && *plain_type(data_type) == LogicalType::Scalar(ScalarType::I64)
+            && i64_column(base.schema(), column)).then(|| base.schema().get(*id).cloned()).flatten()
+    }) else { return Ok(None) };
+    let Some(count) = small_literal_rows(base) else { return Ok(None) };
+    let Some(lifted) = lift(source, correlation, false)? else { return Ok(None) };
+    let base = if lifted.computed.is_empty() { lifted.base } else { Arc::new(lifted.base.extend(lifted.computed)?) };
+    if !input.ids().is_disjoint(&base.schema().ids()) { return Ok(None); }
+    let base = Arc::new(base.filter(Expr::unary(UnaryOp::IsNotNull, key.expression()))?);
+    Ok(Some((base, key, argument.clone(), count)))
+}
+
+fn ascending(field: &Field) -> SortExpr {
+    SortExpr { expr: field.expression(), descending: false, nulls_first: false }
+}
+
+// With one preserved row, the original outer join visits its matches in dependent-source order.
+fn singleton_outer_join(
+    input: &Arc<Relation>, dependent: &Arc<Relation>, correlation: &Correlation<'_>, schema: &Schema, ids: &mut Ids,
+) -> Result<Option<Arc<Relation>>> {
+    let RelationNode::Join { left, right, kind, condition } = dependent.node() else { return Ok(None) };
+    let (preserved, supplied) = match kind {
+        JoinKind::Left => (left, right),
+        JoinKind::Right => (right, left),
+        _ => return Ok(None),
+    };
+    let Some(outer_count) = small_literal_rows(input) else { return Ok(None) };
+    if small_literal_rows(preserved) != Some(1) { return Ok(None); }
+    match condition {
+        None | Some(Expr::Literal(Value::Bool(true))) => {}
+        Some(Expr::Binary { op: BinaryOp::Eq, left, right })
+            if (!left.data_type().nullable() || !right.data_type().nullable())
+                && (i64_column(preserved.schema(), left) && i64_column(supplied.schema(), right)
+                    || i64_column(preserved.schema(), right) && i64_column(supplied.schema(), left)) => {}
+        _ => return Ok(None),
+    }
+    let Some((base, key, capture, inner_count)) = literal_key_source(supplied, input.schema(), correlation)? else { return Ok(None) };
+    if outer_count * inner_count.max(1) > 4096 || !preserved.schema().ids().is_disjoint(&base.schema().ids()) {
+        return Ok(None);
+    }
+    let outer = hidden(ids.next()?, "_outer_order", LogicalType::Scalar(ScalarType::I64));
+    let inner = hidden(ids.next()?, "_inner_order", LogicalType::Scalar(ScalarType::I64));
+    let numbered = Arc::new(Arc::clone(input).with_ordinality(outer.clone(), OrdinalityScope::Relation)?);
+    let probe = Arc::new(Relation::join(numbered, Arc::clone(preserved), JoinKind::Cross, None)?);
+    let base = Arc::new(base.with_ordinality(inner.clone(), OrdinalityScope::Relation)?);
+    let matching = Expr::binary(BinaryOp::Eq, capture, key.expression());
+    let condition = match condition {
+        Some(condition) if !matches!(condition, Expr::Literal(Value::Bool(true))) =>
+            Expr::binary(BinaryOp::And, condition.clone(), matching),
+        _ => matching,
+    };
+    let joined = Arc::new(Relation::join(probe, base, JoinKind::Left, Some(condition))?);
+    let inner = joined.schema().get(inner.id).expect("Joined schema includes the dependent ordinal");
+    let order = vec![ascending(&outer), ascending(inner)];
+    restore(Arc::new(joined.sort(order)?), schema)
+}
+
+// Group the dependent rows before joining, so the collector never sees a synthetic null-extended row.
+fn keyed_collection(
+    input: &Arc<Relation>, dependent: &Arc<Relation>, correlation: &Correlation<'_>, kind: ApplyKind,
+    output: Option<&Field>, schema: &Schema, ids: &mut Ids,
+) -> Result<Option<Arc<Relation>>> {
+    if !matches!(kind, ApplyKind::Scalar | ApplyKind::Inner | ApplyKind::Left | ApplyKind::Single) { return Ok(None); }
+    let Some((outputs, aggregate)) = peel_projections(dependent) else { return Ok(None) };
+    let RelationNode::Aggregate { input: source, groups, aggregates } = aggregate.node() else { return Ok(None) };
+    let [aggregate] = aggregates.as_slice() else { return Ok(None) };
+    let [projected] = outputs.as_slice() else { return Ok(None) };
+    let Some(Expr::Column { id: argument, .. }) = &aggregate.argument else { return Ok(None) };
+    let vector = aggregate.function == AggregateFunction::VecAgg;
+    if !groups.is_empty() || !(aggregate.function == AggregateFunction::ArrayAgg || vector && aggregate.order_by.is_empty())
+        || aggregate.filter.is_some() || aggregate.distinct
+        || !matches!(&projected.expr, Expr::Column { id, .. } if *id == aggregate.field.id)
+        || small_literal_rows(input).is_none()
+    {
+        return Ok(None);
+    }
+    let Some((base, key, capture, _)) = literal_key_source(source, input.schema(), correlation)? else { return Ok(None) };
+    let Some(argument_field) = base.schema().get(*argument) else { return Ok(None) };
+    let list_type = LogicalType::list(argument_field.data_type.clone());
+    let declared = if vector { list_type.clone() } else { list_type.clone().maybe() };
+    if aggregate.field.data_type != declared || aggregate.order_by.iter().any(|order| !i64_column(base.schema(), &order.expr)) {
+        return Ok(None);
+    }
+    let target = output.or_else(|| schema.get(projected.field.id));
+    let Some(target) = target.filter(|target| target.data_type == declared || target.data_type == declared.clone().maybe()) else {
+        return Ok(None);
+    };
+    let outer = hidden(ids.next()?, "_outer_order", LogicalType::Scalar(ScalarType::I64));
+    let group = hidden(ids.next()?, "_collection_key", key.data_type.clone());
+    let groups = vec![NamedExpr { field: group.clone(), expr: key.expression() }];
+    let grouped_schema = Schema::new(vec![group.clone(), aggregate.field.clone()])?;
+    let grouped = Arc::new(Relation::new(grouped_schema, RelationNode::Aggregate { input: base, groups, aggregates: vec![aggregate.clone()] })?);
+    let numbered = Arc::new(Arc::clone(input).with_ordinality(outer.clone(), OrdinalityScope::Relation)?);
+    let joined = Arc::new(Relation::join(numbered, grouped, JoinKind::Left, Some(Expr::binary(BinaryOp::Eq, capture, group.expression())))?);
+    let collected = joined.schema().get(aggregate.field.id).expect("Joined schema includes the collection").expression();
+    let collected = if vector {
+        let empty = Expr::Cast { target: CastTarget::Fixed(list_type), expr: Box::new(Expr::List(Vec::new())) };
+        Expr::Case { branches: vec![(Expr::unary(UnaryOp::IsNull, collected.clone()), empty)], otherwise: Box::new(collected) }
+    } else { collected };
+    let expressions = input.schema().fields().iter().map(|field| NamedExpr { field: field.clone(), expr: field.expression() })
+        .chain([NamedExpr { field: target.clone(), expr: collected }]).collect();
+    let sorted = Arc::new(joined.sort(vec![ascending(&outer)])?);
+    restore(Arc::new(sorted.project(expressions)?), schema)
 }
 
 /// Rule 9: `R A⊗ (G F1 E) = G columns(R),F' (R A⟕ E)`, for a scalar, single, inner or left apply over an aggregate

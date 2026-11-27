@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 
 use async_trait::async_trait;
 use rtdb_expr::{integer, is_true, null_eq_in_timezone};
@@ -336,8 +336,9 @@ async fn build_batches_at(
             let Some((input, projected)) = build_batch_input(child, execution.child(0), None, output).await? else { return Ok(None); };
             let arguments = crate::context::ApplyArguments::new(schema, arguments.clone());
             let plan = BatchApplyPlan { dependent, arguments, kind: ApplyKind::Mark,
-                document_field: None, comparison: Some((comparison, comparison_schema)), execution };
-            let apply = BatchApply { input, plan };
+                document_field: None, comparison: Some((comparison, comparison_schema)),
+                inner_executions: apply_open_counter(&execution.context), execution };
+            let apply = BatchApply { input, plan, document_reuse: None };
             Ok(Some((Box::new(apply), projected)))
         }
         RelationNode::Apply { arguments, kind: ApplyKind::LeftUnnest, .. } => {
@@ -348,10 +349,11 @@ async fn build_batches_at(
             let Some((input, projected)) = build_batch_input(child, execution.child(0), None, output).await? else { return Ok(None); };
             let arguments = crate::context::ApplyArguments::new(schema, arguments.clone());
             let plan = BatchApplyPlan { dependent, arguments, kind: ApplyKind::Left,
-                document_field: None, comparison: None, execution };
+                document_field: None, comparison: None,
+                inner_executions: apply_open_counter(&execution.context), execution };
             let cursor: BoxBatchCursor = match expansion {
                 Some(expansion) => Box::new(BatchFilteredUnnest { input, expansion, fallback: plan }),
-                None => Box::new(BatchApply { input, plan }),
+                None => Box::new(BatchApply { input, plan, document_reuse: None }),
             };
             Ok(Some((cursor, projected)))
         }
@@ -362,9 +364,12 @@ async fn build_batches_at(
             let Some((input, projected)) = build_batch_input(child, execution.child(0), None, output).await? else { return Ok(None); };
             let document_field = matches!(kind, ApplyKind::Pull | ApplyKind::PullMany)
                 .then(|| runtime.schema().fields().last().cloned()).flatten();
+            let document_reuse = document_field.as_ref()
+                .and_then(|_| DocumentReuse::admit(dependent.relation(), schema.schema(), arguments));
             let arguments = crate::context::ApplyArguments::new(schema, arguments.clone());
-            let plan = BatchApplyPlan { dependent, arguments, kind: *kind, document_field, comparison: None, execution };
-            let apply = BatchApply { input, plan };
+            let plan = BatchApplyPlan { dependent, arguments, kind: *kind, document_field, comparison: None,
+                inner_executions: apply_open_counter(&execution.context), execution };
+            let apply = BatchApply { input, plan, document_reuse };
             Ok(Some((Box::new(apply), projected)))
         }
         RelationNode::PatchGaps { input, iid, valid_from, valid_to, document, from, to } => {
@@ -1212,6 +1217,10 @@ struct BatchFilteredUnnest {
 
 #[async_trait]
 impl crate::columnar::BatchCursor for BatchFilteredUnnest {
+    fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) {
+        self.fallback.trace_opens(span);
+    }
+
     async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> {
         let execution = &self.fallback.execution;
         let context = &execution.context;
@@ -1236,6 +1245,81 @@ impl crate::columnar::BatchCursor for BatchFilteredUnnest {
 struct BatchApply {
     input: crate::columnar::BoxBatchCursor,
     plan: BatchApplyPlan,
+    document_reuse: Option<DocumentReuse>,
+}
+
+#[derive(Clone, Copy)]
+enum DocumentReuse { Uncorrelated, I64Column(usize) }
+
+impl DocumentReuse {
+    fn admit(mut dependent: &Relation, outer: &Schema, arguments: &[(usize, Expr)]) -> Option<Self> {
+        use rtdb_plan::{BinaryOp, TemporalFilter};
+        let i64_type = LogicalType::Scalar(rtdb_types::ScalarType::I64);
+        let is_i64 = |ty: &LogicalType| *ty == i64_type || *ty == i64_type.clone().maybe();
+        let (reuse, mut parameter) = match arguments {
+            [] => (Self::Uncorrelated, None),
+            [(index, Expr::Column { id, data_type })] if is_i64(data_type)
+                && outer.get(*id).is_some_and(|field| field.data_type == *data_type) =>
+                (Self::I64Column(outer.position(*id)?), Some(*index)),
+            _ => return None,
+        };
+        let is_key = |predicate: &Expr, schema: &Schema, parameter: usize| {
+            let Expr::Binary { op: BinaryOp::Eq, left, right } = predicate else { return false };
+            [(left.as_ref(), right.as_ref()), (right.as_ref(), left.as_ref())].into_iter().any(|(key, capture)| {
+                matches!(key, Expr::Column { id, data_type } if is_i64(data_type)
+                    && schema.get(*id).is_some_and(|field| field.data_type == *data_type))
+                    && matches!(capture, Expr::Parameter { index, data_type } if *index == parameter && is_i64(data_type))
+            })
+        };
+        loop {
+            match dependent.node() {
+                RelationNode::Scan(scan) if scan.matches.is_empty() && scan.top_k.is_none() && scan.ordered_top_k.is_none()
+                    && matches!(scan.valid_time, TemporalFilter::Default | TemporalFilter::All)
+                    && matches!(scan.system_time, TemporalFilter::Default | TemporalFilter::All) =>
+                    return match (parameter, scan.predicates.as_slice()) {
+                        (None, []) => Some(reuse),
+                        (Some(index), [predicate]) if is_key(predicate, dependent.schema(), index) => Some(reuse),
+                        _ => None,
+                    },
+                RelationNode::Reference { .. } if parameter.is_none() => return Some(reuse),
+                RelationNode::Filter { input, predicate } if parameter.is_some_and(|index| is_key(predicate, input.schema(), index)) => {
+                    parameter = None;
+                    dependent = input;
+                }
+                RelationNode::Project { input, expressions } | RelationNode::Rename { input, expressions, .. }
+                    if expressions.iter().all(|named| matches!(named.expr, Expr::Column { .. })) => dependent = input,
+                RelationNode::Sort { input, order_by } | RelationNode::SortLimit { input, order_by, offset: None, fetch: None }
+                    if order_by.iter().all(|key| matches!(key.expr, Expr::Column { .. })) => dependent = input,
+                _ => return None,
+            }
+        }
+    }
+
+    fn key(self, batch: &crate::columnar::ColumnBatch, row: usize) -> Option<Option<i64>> {
+        use arrow_array::{Array, Int64Array};
+        use crate::columnar::Column;
+        let Self::I64Column(position) = self else { return Some(None) };
+        let column = batch.columns.get(position)?;
+        if let Column::Values(values) = column {
+            return match values.get(row)? {
+                Value::I64(value) => Some(Some(*value)),
+                Value::Null => Some(None),
+                _ => None,
+            };
+        }
+        let Some((array, field, logical, offset)) = column.arrow_cell(row)? else { return Some(None) };
+        if array.data_type() == &arrow_schema::DataType::Null { return Some(None); }
+        let i64_type = LogicalType::Scalar(rtdb_types::ScalarType::I64);
+        if !logical.map_or_else(|| field.metadata().is_empty(), |ty| *ty == i64_type || *ty == i64_type.clone().maybe()) {
+            return None;
+        }
+        let integers = array.as_any().downcast_ref::<Int64Array>()?;
+        Some((!integers.is_null(offset)).then(|| integers.value(offset)))
+    }
+}
+
+fn apply_open_counter(context: &crate::QueryContext) -> Option<AtomicU64> {
+    crate::trace::operator_evidence_enabled(context).then(|| AtomicU64::new(0))
 }
 
 struct BatchApplyPlan {
@@ -1244,10 +1328,17 @@ struct BatchApplyPlan {
     kind: ApplyKind,
     document_field: Option<rtdb_plan::Field>,
     comparison: Option<(Expr, Schema)>,
+    inner_executions: Option<AtomicU64>,
     execution: Execution,
 }
 
 impl BatchApplyPlan {
+    fn trace_opens(&self, span: &mut dyn rtdb_plan::TraceSpan) {
+        if let Some(opens) = &self.inner_executions {
+            crate::trace::OperatorCounter::InnerExecutions.record(span, opens.load(Ordering::Relaxed));
+        }
+    }
+
     async fn bind(&self, batch: &Arc<crate::columnar::ColumnBatch>, row: usize) -> Result<Execution> {
         self.arguments.bind(&self.execution, Arc::clone(batch), row).await
     }
@@ -1257,6 +1348,10 @@ impl BatchApplyPlan {
     }
 
     async fn open_dependent(&self, execution: Execution) -> Result<crate::columnar::BoxBatchCursor> {
+        if let Some(opens) = &self.inner_executions {
+            let current = opens.load(Ordering::Relaxed);
+            opens.store(current.saturating_add(1), Ordering::Relaxed);
+        }
         let execution = execution.child(1);
         let runtime = Arc::clone(&self.dependent);
         let input = if matches!(self.kind, ApplyKind::Inner | ApplyKind::Left | ApplyKind::PullMany) {
@@ -1267,7 +1362,7 @@ impl BatchApplyPlan {
         input.ok_or_else(|| invalid("apply-input", "Dependent plan cannot open as Arrow"))
     }
 
-    async fn documents(&self, batch: Arc<crate::columnar::ColumnBatch>, output: &rtdb_plan::Field) -> Result<crate::columnar::ColumnBatch> {
+    async fn documents(&self, batch: Arc<crate::columnar::ColumnBatch>, output: &rtdb_plan::Field, reuse: Option<DocumentReuse>) -> Result<crate::columnar::ColumnBatch> {
         use crate::columnar::{apply::ApplyPages, poll_nested_batch};
 
         let context = &self.execution.context;
@@ -1290,17 +1385,34 @@ impl BatchApplyPlan {
         } else {
             None
         };
+        // The cache borrows completed spans from this outer page; a later page still opens its own dependent.
+        const REUSE_KEYS: usize = 16;
+        let reuse = reuse.filter(|_| batch.len > 1);
+        let cache_charge = reuse.and_then(|_| memory.reserve(1024).ok());
+        let mut completed: Vec<(Option<i64>, std::ops::Range<usize>)> =
+            Vec::with_capacity(if cache_charge.is_some() { REUSE_KEYS } else { 0 });
         for row in 0..batch.len {
             context.check_cancelled_at(row)?;
-            let mut input = self.dependent_batches(&batch, row).await?;
+            let bound = self.bind(&batch, row).await?;
+            let key = reuse.filter(|_| cache_charge.is_some()).and_then(|reuse| reuse.key(&batch, row));
             let before = pages.len();
-            while let Some(page) = poll_nested_batch(input.as_mut()).await? {
-                if page.len == 0 { continue; }
-                page.validate_readable(context)?;
-                if !many && (pages.len() != before || page.len > 1) { return Err(crate::cardinality_violation()); }
-                pages.end_after(page.len)?;
-                let doc = page.apply_document(&positions, &schema, memory)?;
-                pages.push(row, Some(doc))?;
+            if let Some((_, spans)) = completed.iter().find(|(previous, _)| Some(*previous) == key) {
+                drop(bound);
+                pages.repeat(row, spans.clone(), context)?;
+            } else {
+                let mut input = self.open_dependent(bound).await?;
+                let first = pages.span_count();
+                while let Some(page) = poll_nested_batch(input.as_mut()).await? {
+                    if page.len == 0 { continue; }
+                    page.validate_readable(context)?;
+                    if !many && (pages.len() != before || page.len > 1) { return Err(crate::cardinality_violation()); }
+                    pages.end_after(page.len)?;
+                    let doc = page.apply_document(&positions, &schema, memory)?;
+                    pages.push(row, Some(doc))?;
+                }
+                if let Some(key) = key && completed.len() < REUSE_KEYS {
+                    completed.push((key, first..pages.span_count()));
+                }
             }
             let found = before < pages.len();
             if let Some((offsets, valid, _)) = &mut list {
@@ -1345,6 +1457,10 @@ impl BatchApplyPlan {
 
 #[async_trait]
 impl crate::columnar::BatchCursor for BatchApply {
+    fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) {
+        self.plan.trace_opens(span);
+    }
+
     async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> {
         use crate::columnar::Column;
         let plan = &self.plan;
@@ -1355,7 +1471,7 @@ impl crate::columnar::BatchCursor for BatchApply {
             let Some(batch) = crate::columnar::poll_nested_batch(self.input.as_mut()).await? else { return Ok(None); };
             batch.validate_readable(context)?;
             let batch = Arc::new(batch);
-            if let Some(field) = &plan.document_field { return plan.documents(batch, field).await.map(Some); }
+            if let Some(field) = &plan.document_field { return plan.documents(batch, field, self.document_reuse).await.map(Some); }
             if matches!(plan.kind, ApplyKind::Inner | ApplyKind::Left | ApplyKind::Single | ApplyKind::Scalar) {
                 if let Some(output) = plan.joined(&batch).await? { return Ok(Some(output)); }
                 continue;

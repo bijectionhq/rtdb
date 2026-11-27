@@ -393,16 +393,26 @@ Each parent with zero surviving candidates gets one row with null dependent fiel
 Selected child spans retain their Arrow owners, including the positions of surviving null elements.
 The batched path validates the reached page and keeps the original Apply when the reached layout is incompatible.
 The list gate remains available for its existing total outer-row predicates over plain literal inputs.
-Correlated selections on the null-supplying side of an outer join remain in place to preserve unmatched rows.
-These shapes still run once per input row, and keep their applies:
+An inner apply over a LEFT or RIGHT join can decorrelate an equality selection on its null-supplying input when the preserved side has exactly one row and the inputs are bounded fixed-width literal relations.
+It moves that selection into the join condition, excludes null correlation keys from the supplied side, and restores outer-row and dependent-row order with ordinality.
+An existing ON condition can be true or a direct integer equality with a non-nullable operand.
+Bounded literal sources include direct column projections and references to materialized definitions that satisfy the same proof.
+With one direct signed 64-bit equality capture and a bounded literal source, an ungrouped ARRAY_AGG or VEC_AGG can collect once per dependent key.
+ARRAY_AGG can order by direct signed 64-bit columns, with original source order retained among ties.
+The lookup preserves duplicate outer rows and real null elements, with null for a missing ARRAY_AGG and an empty list for a missing VEC_AGG.
+PULL and PULL_MANY (`NEST_ONE` / `NEST_MANY`) retain their document Apply.
+Within one outer page, a plain snapshot scan or lexical reference can reuse a completed result for a direct signed 64-bit equality capture, or for a dependent with no captures.
+Direct column projections and column-only sorts can retain this reuse.
+The cache holds at most 16 completed keys and preserves the original argument binding, document construction, and cardinality check on the first use.
+These shapes retain per-row evaluation:
 
 * a dependent plan with a volatile call, or an outer reference to an enclosing apply;
-* an ungrouped collecting or ordered aggregate (such as `ARRAY_AGG` or `VEC_AGG`) under a scalar, single, inner or left apply;
+* collecting or ordered aggregates outside the bounded keyed collection rule, including computed or filtered aggregate inputs;
 * outside a lateral inner join, which rule 8 handles, a correlated selection beneath a grouping that reads a column the grouping drops, or a grouping or aggregate that reads a bound parameter itself, including a percentile fraction;
 * a filtered left apply over an unnest with a fallible expression or a shape outside the captured-list rewrite;
 * an unnest whose list reads a bound parameter inside a semi/anti/mark/exists apply or below another operator;
-* a correlated selection beneath the null-supplying side of an outer join, a full outer or single join, a set operation, a window, a row numbering or ordinality, or, outside an existence test, DISTINCT, a sort or a limit;
-* `PULL` and `PULL_MANY` applies (`NEST_ONE` / `NEST_MANY`).
+* a correlated selection beneath the null-supplying side of an outer join outside the singleton rewrite, or beneath a full outer or single join, a set operation, a window, a row numbering or ordinality, or, outside an existence test, DISTINCT, a sort or a limit;
+* document applies with other captures, computed projections, limits, volatile calls or a different scan shape.
 Append projections, windows and UNNEST retain the input columns required by their expressions and those requested by their parents.
 For conjunctive filters, expressions with fewer column dependencies can reach the scan before multi-column expressions.
 Scan explanations use the reference traversal order of the symbol set and the resulting text set.

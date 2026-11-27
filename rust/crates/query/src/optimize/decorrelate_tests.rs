@@ -441,13 +441,20 @@ fn corpus() -> Vec<(&'static str, Arc<Relation>, bool)> {
 }
 
 fn context() -> Arc<QueryContext> {
+    context_with_options(QueryOptions::default())
+}
+
+fn context_with_options(options: QueryOptions) -> Arc<QueryContext> {
     let database = DatabaseSnapshot { partitions: vec![], storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)) };
     let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
-    QueryContext::new(catalog, MemoryBudget::new(1 << 26), Timestamp(0), "UTC", QueryOptions::default(), &CancellationToken::new()).unwrap()
+    QueryContext::new(catalog, MemoryBudget::new(1 << 26), Timestamp(0), "UTC", options, &CancellationToken::new()).unwrap()
 }
 
 async fn run_in_order(query: &PreparedQuery) -> std::result::Result<Vec<String>, String> {
-    let context = context();
+    run_with_context(query, context()).await
+}
+
+async fn run_with_context(query: &PreparedQuery, context: Arc<QueryContext>) -> std::result::Result<Vec<String>, String> {
     let rows = async {
         let mut cursor = query.execute(Arc::clone(&context), vec![]).await?;
         let mut rows = Vec::new();
@@ -461,6 +468,171 @@ async fn run_in_order(query: &PreparedQuery) -> std::result::Result<Vec<String>,
         Ok::<_, rtdb_types::Anomaly>(rows)
     }.await;
     rows.map_err(|error| error.code.to_string())
+}
+
+fn materialized(
+    relation: Arc<Relation>, body: impl FnOnce(Arc<Relation>) -> Arc<Relation>,
+) -> Arc<Relation> {
+    let binding = Arc::new(rtdb_plan::MaterializedBinding { name: "materialized_orders".into(), relation });
+    let reference = Arc::new(Relation::new(binding.relation.schema().clone(),
+        RelationNode::Reference { binding: Arc::clone(&binding) }).unwrap());
+    let body = body(reference);
+    Arc::new(Relation::new(body.schema().clone(), RelationNode::Let { binding, body }).unwrap())
+}
+
+#[tokio::test]
+async fn singleton_outer_joins_keep_the_preserved_row_and_the_order_of_each_customers_matches() {
+    let preserved = values(vec![integer(80, "marker")], &[&[Some(8)]]);
+    for kind in [JoinKind::Left, JoinKind::Right] {
+        let relation = materialized(orders(), |reference| {
+            let selected = select(reference, equals(order_customer().expression(), parameter(0, &customer_id())));
+            let (left, right) = if kind == JoinKind::Left {
+                (Arc::clone(&preserved), selected)
+            } else {
+                (selected, Arc::clone(&preserved))
+            };
+            let dependent = Arc::new(Relation::join(left, right, kind, None).unwrap());
+            apply(&customers(), dependent, by_customer(), ApplyKind::Inner, None)
+        });
+        let (original, optimized) = both_ways(&relation);
+        assert_eq!(applies(optimized.relation()), 0);
+        assert_eq!(optimized.relation().schema(), relation.schema());
+        let expected = run_in_order(&original).await.unwrap();
+        assert_eq!(expected.len(), 8);
+        for join_build_rows in [0, 1024] {
+            let ctx = context_with_options(QueryOptions { join_build_rows, ..Default::default() });
+            assert_eq!(run_with_context(&optimized, ctx).await.unwrap(), expected);
+        }
+    }
+}
+
+#[tokio::test]
+async fn keyed_collections_distinguish_empty_matches_and_real_null_elements() {
+    for function in [AggregateFunction::ArrayAgg, AggregateFunction::VecAgg] {
+        let ordered = function == AggregateFunction::ArrayAgg;
+        let relation = materialized(orders(), |reference| {
+            let selected = select(reference, equals(order_customer().expression(), parameter(0, &customer_id())));
+            let ty = LogicalType::list(order_amount().data_type);
+            let field = typed(81, "collected", if ordered { ty.maybe() } else { ty });
+            let mut collection = counted(field, function, Some(order_amount().expression()), None);
+            if ordered {
+                collection.order_by = vec![rtdb_plan::SortExpr {
+                    expr: order_amount().expression(), descending: true, nulls_first: true,
+                }];
+            }
+            scalar(aggregate(selected, vec![collection]), by_customer())
+        });
+        let (original, optimized) = both_ways(&relation);
+        assert_eq!(applies(optimized.relation()), 0);
+        assert_eq!(optimized.relation().schema(), relation.schema());
+        let expected = run_in_order(&original).await.unwrap();
+        assert_eq!(expected.len(), 6);
+        assert_eq!(expected[1], expected[2]);
+        assert_eq!(run_in_order(&optimized).await.unwrap(), expected);
+    }
+}
+
+#[tokio::test]
+async fn a_fallible_collection_projection_keeps_the_correlated_filter_ahead_of_the_error() {
+    let projected = integer(82, "quotient");
+    let selected = select(
+        values(vec![order_customer(), order_amount()], &[&[Some(1), Some(2)], &[Some(9), Some(0)]]),
+        equals(order_customer().expression(), parameter(0, &customer_id())),
+    );
+    let division = Expr::binary(BinaryOp::Divide, literal(10), order_amount().expression());
+    let source = Arc::new(selected.project(vec![NamedExpr { field: projected.clone(), expr: division }]).unwrap());
+    let output = typed(83, "collected", LogicalType::list(projected.data_type.clone()).maybe());
+    let relation = scalar(aggregate(source, vec![
+        counted(output, AggregateFunction::ArrayAgg, Some(projected.expression()), None),
+    ]), by_customer());
+    let (original, optimized) = both_ways(&relation);
+    assert_eq!(applies(optimized.relation()), 1);
+    let expected = run_in_order(&original).await.unwrap();
+    assert_eq!(run_in_order(&optimized).await.unwrap(), expected);
+}
+
+#[tokio::test]
+async fn document_apply_reuses_only_completed_keys_in_the_current_page() {
+    for kind in [ApplyKind::Pull, ApplyKind::PullMany] {
+        let probes = values(vec![customer_id()], &[&[Some(1)], &[None], &[Some(1)], &[Some(2)], &[Some(1)]]);
+        let relation = materialized(lookup(), |reference| {
+            let selected = select(reference, equals(lookup_key().expression(), parameter(0, &customer_id())));
+            let dependent = keep(selected, &[lookup_name()]);
+            let document = LogicalType::Struct([("name".into(), lookup_name().data_type)].into_iter().collect());
+            let ty = if kind == ApplyKind::PullMany { LogicalType::list(document) } else { document };
+            apply(&probes, dependent, by_customer(), kind, Some(typed(84, "document", ty.maybe())))
+        });
+        let prepared = PreparedQuery::new(relation).unwrap();
+        let context = context();
+        let (tracer, mut spans) = rtdb_metrics::TraceRecorder::new(Arc::clone(&context.memory), 64, true, true).unwrap();
+        let rows = run_with_context(&prepared, context.with_tracer(Some(tracer.clone()), None)).await.unwrap();
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[0], rows[2]);
+        assert_eq!(rows[0], rows[4]);
+        assert_eq!(rows[1], "[Null, Null]");
+        assert_eq!(rows[3], "[I64(2), Null]");
+        assert_ne!(rows[0], "[I64(1), Null]");
+        tracer.close();
+        let mut opens = Vec::new();
+        while let Some(span) = spans.next().await {
+            for (name, value) in span.attributes() {
+                if name == "cursor.apply.inner_executions" { opens.push(value.parse::<u64>().unwrap()); }
+            }
+        }
+        assert_eq!(opens, [3]);
+    }
+}
+
+#[tokio::test]
+async fn document_reuse_still_reaches_the_first_multirow_single_document_key() {
+    let probes = values(vec![customer_id()], &[&[Some(2)], &[Some(2)], &[Some(1)]]);
+    let relation = materialized(orders(), |reference| {
+        let selected = select(reference, equals(order_customer().expression(), parameter(0, &customer_id())));
+        let dependent = keep(selected, &[order_amount()]);
+        let document = LogicalType::Struct([("amount".into(), order_amount().data_type)].into_iter().collect());
+        apply(&probes, dependent, by_customer(), ApplyKind::Pull, Some(typed(85, "document", document.maybe())))
+    });
+    let prepared = PreparedQuery::new(relation).unwrap();
+    assert_eq!(run_in_order(&prepared).await, Err(crate::cardinality_violation().code.to_string()));
+}
+
+#[tokio::test]
+async fn repeated_document_keys_open_a_snapshot_scan_once_per_distinct_key() {
+    let key = order_customer();
+    let scan = rtdb_plan::Scan {
+        table: rtdb_plan::TableBinding {
+            name: QualifiedTable { database: "xtdb".into(), table: rtdb_types::TableRef::new("public", "orders") },
+            oid: None,
+            columns: [(key.name.clone(), key.data_type.clone())].into_iter().collect(),
+        },
+        columns: vec![key.clone()],
+        valid_time: rtdb_plan::TemporalFilter::Default,
+        system_time: rtdb_plan::TemporalFilter::Default,
+        clamp_valid_time: false,
+        iids: None,
+        predicates: Vec::new(),
+        top_k: None,
+        ordered_top_k: None,
+        matches: Vec::new(),
+    };
+    let selected = select(Arc::new(Relation::scan(scan).unwrap()), equals(key.expression(), parameter(0, &customer_id())));
+    let probes = values(vec![customer_id()], &[&[Some(1)], &[Some(2)], &[Some(1)], &[Some(2)]]);
+    let document = LogicalType::Struct([(key.name, key.data_type)].into_iter().collect());
+    let relation = apply(&probes, selected, by_customer(), ApplyKind::PullMany,
+        Some(typed(86, "orders", LogicalType::list(document).maybe())));
+    let prepared = PreparedQuery::new(relation).unwrap();
+    let context = context();
+    let (tracer, mut spans) = rtdb_metrics::TraceRecorder::new(Arc::clone(&context.memory), 64, true, true).unwrap();
+    let rows = run_with_context(&prepared, context.with_tracer(Some(tracer.clone()), None)).await.unwrap();
+    assert_eq!(rows, ["[I64(1), Null]", "[I64(2), Null]", "[I64(1), Null]", "[I64(2), Null]"]);
+    tracer.close();
+    let mut opens = Vec::new();
+    while let Some(span) = spans.next().await {
+        for (name, value) in span.attributes() {
+            if name == "cursor.apply.inner_executions" { opens.push(value.parse::<u64>().unwrap()); }
+        }
+    }
+    assert_eq!(opens, [2]);
 }
 
 /// The query's rows in a canonical order, or its error code.
