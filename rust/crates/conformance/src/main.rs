@@ -85,9 +85,22 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
 }
 
 fn main() -> ExitCode {
-    match run() {
-        Ok(true) => ExitCode::SUCCESS,
-        Ok(false) => ExitCode::FAILURE,
-        Err(error) => { eprintln!("{error}"); ExitCode::from(2) }
+    let worker = std::thread::Builder::new()
+        .name("rtdb-conformance".into())
+        .stack_size(rtdb_node::WORKER_STACK_BYTES)
+        .spawn(|| match run() {
+            Ok(true) => ExitCode::SUCCESS,
+            Ok(false) => ExitCode::FAILURE,
+            Err(error) => { eprintln!("{error}"); ExitCode::from(2) }
+        });
+    match worker {
+        Ok(handle) => handle.join().unwrap_or_else(|_| {
+            eprintln!("rtdb-conformance worker thread panicked");
+            ExitCode::from(2)
+        }),
+        Err(error) => {
+            eprintln!("failed to spawn rtdb-conformance worker thread: {error}");
+            ExitCode::from(2)
+        }
     }
 }
