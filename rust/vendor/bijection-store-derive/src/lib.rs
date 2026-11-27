@@ -73,8 +73,19 @@
 //! (`owned_relations::owned::OwnedStore::rebase_without`), from the line as
 //! of the base's cut ([`line_through`]).
 //!
-//! The function is pure, total and deterministic: [`apply`] and [`purge`]
-//! return a result for every input, and a malformed derive is a request error
+//! A unit's closure stops its rows counting before any purge ([`close`],
+//! aggregates-close): the closing commit names each closed row's line
+//! blindly, and the store, at ordering, writes at the closing stamp the
+//! negation of every counted contribution the line holds (unretained edged
+//! records, claims, statistics and presence deltas). The eraser reads
+//! nothing and no hold decides it, so every aggregate, count and claim
+//! changes at closure, the same whether a hold keeps the row or not. The
+//! retractions join the line's inventory, so the destruction's purge,
+//! whenever holds let it run, deletes them with the rest and changes no
+//! read at or after the closure.
+//!
+//! The function is pure, total and deterministic: [`apply`], [`close`] and
+//! [`purge`] return a result for every input, and a malformed derive is a request error
 //! [`check`] decides before ordering. Every emitted key lies at the
 //! manifest's own `(partition, world)` (P10, `emission_confined`), and
 //! [`apply`] judges nothing: its outcome never depends on a manifest (P8).
@@ -325,6 +336,16 @@ pub enum DeriveMode {
     /// one to the line's inventory, so a purge deletes them with the rest.
     /// The line's segments are unchanged (erase-derive).
     Backfill { writes: Vec<(Vec<u8>, Vec<u8>)> },
+    /// Close (a unit's closure, aggregates-close): from the append's stamp
+    /// on, the row's line counts nothing. The store retracts, at the stamp,
+    /// every live counted contribution of the line ([`close`]): each
+    /// unretained `Edged` and `Claim` segment's records, and each live
+    /// `Boundary` and `Present` delta. The retractions join the line's
+    /// inventory, so a later [`purge`] deletes them with the rest; the line
+    /// keeps its markers, singles and retained records. The writer reads
+    /// nothing: the store computes the compensation from the line at
+    /// ordering, whatever compaction folded before.
+    Close,
 }
 
 /// One derived write of a store append (`fact_store::persistence::Derive`).
@@ -1087,6 +1108,25 @@ pub fn live_counts(segments: &[Segment], horizon: i64) -> Vec<(Vec<u8>, Vec<u8>,
     live
 }
 
+/// The segments of `previous` (a line stored at the target place, or
+/// inherited from a parent world at its fork stamp) as the target place's
+/// own: an inherited segment is re-rooted into `target_world` (P10), and a
+/// parent's live Single key is never the target's to delete.
+#[cfg_attr(verus_keep_ghost, verifier::external)]
+fn own_line(manifest_prefix: &[u8], target_world: &[u8], previous: &Manifest) -> Vec<Segment> {
+    previous
+        .segments
+        .iter()
+        .filter(|segment| same_partition(&segment.identity, manifest_prefix))
+        .filter_map(|segment| {
+            let own = same_place(&segment.identity, manifest_prefix);
+            let identity = if own { segment.identity.clone() } else { reroot(&segment.identity, target_world)? };
+            let live_key = if own && same_place(&segment.live_key, manifest_prefix) { segment.live_key.clone() } else { Vec::new() };
+            Some(Segment { identity, live_key, ..segment.clone() })
+        })
+        .collect()
+}
+
 /// Apply one `DeriveMode::Replace` step to the row's previous line (which
 /// may be inherited from a parent world at its fork stamp, and is re-rooted
 /// into the target world). Pure, total and deterministic: both
@@ -1113,22 +1153,11 @@ pub fn apply(
     if interval.from >= interval.to {
         return unchanged();
     }
-    let target_world = &manifest_prefix[m_partition + 1..m_world_end];
     let mut ordinal = ordinal;
 
     // 1. The previous line, re-rooted into the target world when inherited
-    //    (P10). A parent's live Single key is never the target's to delete.
-    let prev: Vec<Segment> = previous
-        .segments
-        .iter()
-        .filter(|segment| same_partition(&segment.identity, manifest_prefix))
-        .filter_map(|segment| {
-            let own = same_place(&segment.identity, manifest_prefix);
-            let identity = if own { segment.identity.clone() } else { reroot(&segment.identity, target_world)? };
-            let live_key = if own && same_place(&segment.live_key, manifest_prefix) { segment.live_key.clone() } else { Vec::new() };
-            Some(Segment { identity, live_key, ..segment.clone() })
-        })
-        .collect();
+    //    (P10).
+    let prev = own_line(manifest_prefix, &manifest_prefix[m_partition + 1..m_world_end], previous);
     let horizon = previous.horizon.max(interval.to);
 
     // 2. The new entries over the interval, stamp placeholders filled in
@@ -1464,6 +1493,74 @@ pub fn backfill(manifest_prefix: &[u8], previous: &Manifest, writes: &[(Vec<u8>,
     }
 }
 
+/// Apply one `DeriveMode::Close` step to the row's previous line (a unit's
+/// closure, aggregates-close): from `stamp` on, the line counts nothing.
+/// Total, and judges nothing.
+///
+/// At `stamp` it writes the exact negation of every counted contribution
+/// the line holds: for each unretained [`EntryKind::Edged`] and each
+/// [`EntryKind::Claim`] segment, its leave value at its start edge and,
+/// unless open, its enter value at its end edge (the records then sum to
+/// zero at every instant, P9); and for each live [`EntryKind::Boundary`] and
+/// [`EntryKind::Present`] entry ([`live_counts`]), its leave delta. A read
+/// at any cut at or after `stamp` therefore sums exactly the other rows'
+/// contributions, whether or not a compaction already folded the row's
+/// older records into a base: the retractions are new records past every
+/// floor. A read below `stamp` is unchanged.
+///
+/// The new line keeps its markers, singles and retained edged segments
+/// (`onErase: "retain"` outlives erasure, so it outlives closure) and
+/// drops every counted segment, so its [`live_counts`] are empty and a base
+/// compacted at or after `stamp` folded nothing of it ([`line_through`]).
+/// The retractions are this step's inventory, so the destruction's
+/// [`purge`] deletes them with the rest of the row's history: the purge
+/// changes no read at or after `stamp` (it removes contributions summing to
+/// zero there), only the history below it. A line that counts nothing
+/// (none at all where the row never sat) writes nothing, and the store then
+/// keeps no new manifest version: a close changes a place only where the
+/// row counted.
+#[cfg_attr(verus_keep_ghost, verifier::external)]
+pub fn close(manifest_prefix: &[u8], previous: &Manifest, stamp: [u8; STAMP_BYTES], ordinal: u64) -> Applied {
+    let mut ordinal = ordinal;
+    let Some((m_partition, m_world_end)) = place_bounds(manifest_prefix) else {
+        return Applied { writes: Vec::new(), manifest: Manifest { written_keys: Vec::new(), ..previous.clone() }, next_ordinal: ordinal };
+    };
+    let prev = own_line(manifest_prefix, &manifest_prefix[m_partition + 1..m_world_end], previous);
+    let mut writes: Vec<EmittedWrite> = Vec::new();
+    let mut written_keys: Vec<Vec<u8>> = Vec::new();
+    let mut kept: Vec<Segment> = Vec::new();
+    for segment in &prev {
+        match segment.kind {
+            EntryKind::Edged { retain: false } | EntryKind::Claim => {
+                let key = edged_key(&segment.identity, segment.from, &stamp, ordinal);
+                ordinal = ordinal.wrapping_add(1);
+                written_keys.push(key.clone());
+                writes.push(put(key, segment.leave_value.clone()));
+                if segment.to != OPEN_END {
+                    let key = edged_key(&segment.identity, segment.to, &stamp, ordinal);
+                    ordinal = ordinal.wrapping_add(1);
+                    written_keys.push(key.clone());
+                    writes.push(put(key, segment.enter_value.clone()));
+                }
+            },
+            // The live set's retraction, below.
+            EntryKind::Boundary | EntryKind::Present => {},
+            EntryKind::Marker | EntryKind::Single { .. } | EntryKind::Edged { retain: true } => kept.push(segment.clone()),
+        }
+    }
+    for (identity, _, leave) in live_counts(&prev, previous.horizon) {
+        let key = stamped_key(&identity, &stamp, ordinal);
+        ordinal = ordinal.wrapping_add(1);
+        written_keys.push(key.clone());
+        writes.push(put(key, leave));
+    }
+    Applied {
+        writes,
+        manifest: Manifest { segments: kept, horizon: previous.horizon, written_keys },
+        next_ordinal: ordinal,
+    }
+}
+
 // ---------------------------------------------------------------- Binary codec
 
 #[cfg_attr(verus_keep_ghost, verifier::external)]
@@ -1608,6 +1705,7 @@ impl Derive {
         }
         match &self.mode {
             DeriveMode::Purge => out.push(0),
+            DeriveMode::Close => out.push(3),
             DeriveMode::Backfill { writes } => {
                 out.push(2);
                 out.extend_from_slice(&(writes.len() as u32).to_be_bytes());
@@ -1690,6 +1788,7 @@ impl Derive {
         }
         let mode = match take_u8(&mut rest)? {
             0 => DeriveMode::Purge,
+            3 => DeriveMode::Close,
             2 => {
                 let count = take_u32(&mut rest)? as usize;
                 let mut writes = Vec::with_capacity(count.min(256));
@@ -1848,6 +1947,46 @@ mod tests {
             assert_eq!(purged.contains(key), !retained.contains(key), "every unretained key the line emitted, at either stamp, is deleted");
         }
         assert!(purged.contains(&m1) && purged.contains(&m2), "and every manifest version");
+    }
+
+    #[test]
+    fn a_close_retracts_every_counted_contribution_at_its_stamp_and_the_purge_deletes_it() {
+        let marker = entry(EntryKind::Marker, INDEX, b"idx_a", &[1], &[]);
+        let stats = entry(EntryKind::Boundary, PERSISTENCE, b"stats", &[1], &[0x81]);
+        let present = entry(EntryKind::Present, PERSISTENCE, b"rows", &[1], &[0x81]);
+        let edged = entry(EntryKind::Edged { retain: false }, PERSISTENCE, b"agg", &[2], &[0x82]);
+        let kept = entry(EntryKind::Edged { retain: true }, PERSISTENCE, b"kept", &[3], &[0x83]);
+        let entries = [marker.clone(), stats, present, edged.clone(), kept.clone()];
+        let first = apply(&prefix(), &Manifest::empty(), ValidInterval { from: 10, to: 40 }, &entries, stamp(10, 1), DERIVE_ORDINAL_BASE);
+        let closed = close(&prefix(), &first.manifest, stamp(30, 2), DERIVE_ORDINAL_BASE);
+        // The edged segment's two records negated at the closing stamp, and
+        // the two live counts' leave deltas; nothing for the marker or the
+        // retained aggregate.
+        let agg = |edge: i64| edged_key(&edged.identity, edge, &stamp(30, 2), 0)[..edged.identity.len() + EDGE_BYTES].to_vec();
+        assert_eq!(closed.writes.len(), 4);
+        assert!(closed.writes.iter().any(|write| write.key.starts_with(&agg(10)) && write.value == Some(vec![0x82])), "the start edge takes the leave value");
+        assert!(closed.writes.iter().any(|write| write.key.starts_with(&agg(40)) && write.value == Some(vec![2])), "the end edge takes the enter value");
+        assert!(closed.writes.iter().any(|write| write.value == Some(vec![0x81]) && write.key.windows(5).any(|w| w == b"stats")));
+        assert!(closed.writes.iter().any(|write| write.value == Some(vec![0x81]) && write.key.windows(4).any(|w| w == b"rows")));
+        assert!(closed.writes.iter().all(|write| !write.key.windows(4).any(|w| w == b"kept") && !write.key.windows(5).any(|w| w == b"idx_a")));
+        assert!(closed.writes.iter().all(|write| write.key.windows(STAMP_BYTES).any(|w| w == stamp(30, 2))), "every retraction is stamped at the closure");
+        let kinds: Vec<EntryKind> = closed.manifest.segments.iter().map(|segment| segment.kind).collect();
+        assert_eq!(kinds, vec![EntryKind::Marker, EntryKind::Edged { retain: true }], "the line keeps its marker and its retained record");
+        assert!(live_counts(&closed.manifest.segments, closed.manifest.horizon).is_empty());
+        // A closed line counts nothing, so closing it again writes nothing;
+        // a place where the row never sat writes nothing either.
+        assert!(close(&prefix(), &closed.manifest, stamp(31, 3), DERIVE_ORDINAL_BASE).writes.is_empty());
+        assert!(close(&prefix(), &Manifest::empty(), stamp(31, 3), DERIVE_ORDINAL_BASE).writes.is_empty());
+        // The destruction's purge deletes the retractions with the rest.
+        let stored = [
+            (stamped_key(&prefix(), &stamp(10, 1), DERIVE_ORDINAL_BASE + 100), first.manifest),
+            (stamped_key(&prefix(), &stamp(30, 2), DERIVE_ORDINAL_BASE + 100), closed.manifest),
+        ];
+        let purged: Vec<Vec<u8>> = purge(&prefix(), &stored).into_iter().map(|write| write.key).collect();
+        assert!(closed.writes.iter().all(|write| purged.contains(&write.key)));
+        let derive = Derive { manifest_prefix: prefix(), levels: vec![DeriveLevel { prefix: prefix(), through: None }], mode: DeriveMode::Close };
+        check(&derive).unwrap();
+        assert_eq!(Derive::decode(&derive.encode()).unwrap(), derive);
     }
 
     #[test]

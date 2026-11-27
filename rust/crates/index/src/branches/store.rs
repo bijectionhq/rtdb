@@ -20,7 +20,7 @@ pub use store_filter::ValueFilter;
 
 /// SHA-256 of Bijection's `crates/store_read/src/derive.rs`, vendored verbatim
 /// as `rust/vendor/bijection-store-derive/src/lib.rs`.
-pub const DERIVE_DIGEST: &str = "a6dc8ba5abd7044dd63137f324b267faa2d7bd117d7311e2d83462aaa0d02a88";
+pub const DERIVE_DIGEST: &str = "b1585a69e9abb47f84aa479740462b7a174015b65463705f66d91b2d73bed157";
 
 pub const STORE_SCHEMA: &str = "store";
 pub const STORE_RELATION: &str = "entries";
@@ -275,7 +275,7 @@ pub fn resolve_derives(
 
     for derive in derives {
         match &derive.mode {
-            store_derive::DeriveMode::Replace { .. } | store_derive::DeriveMode::Backfill { .. } => {
+            store_derive::DeriveMode::Replace { .. } | store_derive::DeriveMode::Backfill { .. } | store_derive::DeriveMode::Close => {
                 let mut previous = store_derive::Manifest::empty();
                 for level in &derive.levels {
                     if level.through.is_none() {
@@ -319,8 +319,16 @@ pub fn resolve_derives(
                     // A path backfill's history entries, joining the line's
                     // inventory (Bijection erase-derive).
                     store_derive::DeriveMode::Backfill { writes } => store_derive::backfill(&derive.manifest_prefix, &previous, writes, ordinal),
+                    // A unit's closure: the line's counted contributions
+                    // retracted at the stamp (Bijection aggregates-close).
+                    store_derive::DeriveMode::Close => store_derive::close(&derive.manifest_prefix, &previous, stamp_bytes, ordinal),
                     store_derive::DeriveMode::Purge => unreachable!("matched above"),
                 };
+                // A close where the row counts nothing (or never sat)
+                // changes nothing there.
+                if matches!(derive.mode, store_derive::DeriveMode::Close) && applied.writes.is_empty() {
+                    continue;
+                }
                 ordinal = applied.next_ordinal;
                 for write in applied.writes {
                     out.push((write.key, write.value));

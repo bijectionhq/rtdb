@@ -260,6 +260,55 @@ fn a_store_derive_claim_is_judged_on_its_filled_key_at_ordering() {
 }
 
 #[test]
+fn a_store_derive_close_retracts_a_claim_at_ordering() {
+    use rtdb_index::branches::store::store_derive::{Derive, DeriveEntry, DeriveInterval, DeriveLevel, DeriveMode, EntryKind};
+    let mut state = TransactState::new(INCARNATION);
+    let place = |family: u8, inner: &[u8]| {
+        let world: Vec<u8> = [0u8; 16].iter().flat_map(|_| [0u8, 0xff]).chain([0u8, 1]).collect();
+        [vec![0u8, 1, b'p', family], world, inner.to_vec()].concat()
+    };
+    let value = place(32, b"claim/x");
+    let derive = |row: &[u8], mode: DeriveMode| {
+        let manifest_prefix = place(16, row);
+        Derive { levels: vec![DeriveLevel { prefix: manifest_prefix.clone(), through: None }], manifest_prefix, mode }
+    };
+    let claim = |row: &[u8]| derive(row, DeriveMode::Replace {
+        interval: DeriveInterval::from_stamp(i64::MAX),
+        entries: vec![DeriveEntry {
+            kind: EntryKind::Claim,
+            identity: value.clone(),
+            key_stamp: None,
+            key_instants: Vec::new(),
+            value_instants: Vec::new(),
+            enter_value: 1i64.to_be_bytes().to_vec(),
+            leave_value: (-1i64).to_be_bytes().to_vec(),
+        }],
+    });
+    let make = |key: u8, derive: Derive| Transact {
+        key: vec![key; 16],
+        require: Vec::new(),
+        window: Window::default(),
+        guards: Vec::new(),
+        ops: vec![Op::Store(StoreAppend { writes: Vec::new(), bounds: Vec::new(), derives: vec![derive.encode()], window: Window::default() })],
+        otherwise: Vec::new(),
+        requires: Vec::new(),
+        custody_request_digest: None,
+        request_memory: None,
+    };
+    let first = plan(&state, &make(1, claim(b"row1\x04")), 1, 100, DEFAULT);
+    assert_eq!(apply(&mut state, 1, first.record()).unwrap().outcome, Outcome::Then);
+    let refused = plan(&state, &make(2, claim(b"row2\x04")), 2, 200, DEFAULT);
+    assert!(matches!(apply(&mut state, 2, refused.record()).unwrap().outcome, Outcome::Refused { .. }), "a second claimant is refused");
+    // Bijection aggregates-close: the first row's unit closes, and the
+    // resolver retracts its claim at the closing stamp, reading nothing for
+    // the writer, so the value is free from the closure on.
+    let closed = plan(&state, &make(3, derive(b"row1\x04", DeriveMode::Close)), 3, 300, DEFAULT);
+    assert_eq!(apply(&mut state, 3, closed.record()).unwrap().outcome, Outcome::Then);
+    let again = plan(&state, &make(4, claim(b"row2\x04")), 4, 400, DEFAULT);
+    assert_eq!(apply(&mut state, 4, again.record()).unwrap().outcome, Outcome::Then, "the closed row's claim no longer counts");
+}
+
+#[test]
 fn a_store_append_records_its_validation_and_conflict_as_receipts() {
     use rtdb_index::branches::store::{Projection, StoreRead};
     let mut state = TransactState::new(INCARNATION);
