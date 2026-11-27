@@ -74,8 +74,8 @@ fn decode(token: &str, owner: Option<&str>, codec: Option<&dyn crate::placed_rec
 }
 
 /// Caps each partition at its time in the token, as XTDB reads a snapshot token against the snapshot it opens.
-/// A partition the token gives no time reads uncapped, as in XTDB. A time after the partition's latest completed
-/// transaction refuses with `xtdb/unindexed-tx`, as `validate-basis-not-before` does.
+/// A partition the token gives no time keeps its current read, through its head, as in XTDB. A time after the
+/// partition's latest completed transaction refuses with `xtdb/unindexed-tx`, as `validate-basis-not-before` does.
 fn read_at(times: Option<&Vec<Option<Instant>>>, current: &[rtdb_index::Snapshot]) -> Result<Vec<rtdb_index::Snapshot>> {
     current.iter().enumerate().map(|(index, snapshot)| {
         if snapshot.has_overlays() { return Err(overlaid()); }
@@ -196,9 +196,11 @@ mod tests {
 
         let ahead = vec![Some(Instant::from(Timestamp(90)))];
         assert_eq!(read_at(Some(&ahead), &[partition.snapshot()]).unwrap_err().code, "xtdb/unindexed-tx");
+        // XTDB bounds such a scan by nothing but the snapshot it opened, so it sees through the head; an RTDB
+        // snapshot already carries its head as its cap, which redeeming leaves alone.
         let uncapped = read_at(None, &[partition.snapshot()]).unwrap().pop().unwrap();
-        assert_eq!(uncapped.system_time_cap(), None, "a database the token leaves out reads uncapped, as in XTDB");
+        assert_eq!(uncapped.system_time_cap(), Some(Timestamp(30)), "a database the token leaves out reads through its head, as in XTDB");
         let absent = read_at(Some(&vec![None]), &[partition.snapshot()]).unwrap().pop().unwrap();
-        assert_eq!(absent.system_time_cap(), None);
+        assert_eq!(absent.system_time_cap(), Some(Timestamp(30)), "a partition the token gives no time reads through its head");
     }
 }
