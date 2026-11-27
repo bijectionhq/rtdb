@@ -1132,13 +1132,16 @@ impl Service {
                         else { row.before.as_ref().map(|image| write_change_image(&image.cells, &id, row.valid, &memory)).transpose()? };
                     let after = if erased || !matches!(images, ChangeImages::After | ChangeImages::Both) { None }
                         else { row.after.as_ref().map(|image| write_change_image(&image.cells, &id, row.valid, &memory)).transpose()? };
+                    let key = applied_image_array(key).map_err(batch_error)?;
+                    let before = applied_image_array(before).map_err(batch_error)?;
+                    let after = applied_image_array(after).map_err(batch_error)?;
                     let mut columns: Vec<ArrayRef> = vec![
                         Arc::new(StringArray::from(vec![format!("{}.{}", row.table.schema, row.table.table)])),
                         Arc::new(TimestampMicrosecondArray::from(vec![group.cut.system_time.0]).with_timezone("UTC")),
                         Arc::new(BooleanArray::from(vec![row.kind == ChangeKind::Opened])),
-                        Arc::new(applied_image_array(key).map_err(batch_error)?),
-                        Arc::new(applied_image_array(before).map_err(batch_error)?),
-                        Arc::new(applied_image_array(after).map_err(batch_error)?),
+                        Arc::new(key),
+                        Arc::new(before),
+                        Arc::new(after),
                         Arc::new(BooleanArray::from(vec![erased])),
                     ];
                     if observe_positions {
