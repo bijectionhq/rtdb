@@ -740,6 +740,7 @@ value CommitOpts {
     --                   Day-resolution dates retain their signed epoch-day values.
     --                   A null-only top-level child leaves the corresponding receipt field absent for that row.
     --                   New source-log and external submissions project user metadata in xt.txs until the installed receipt clock reaches one hour after admission.
+    --                   Compatible encoded original metadata stays in its funded Arrow source under the original selected-cell admission and can be gathered with projected receipt cells.
     --                   A reusable SQL retry key has separate stored receipt identities for separate hour buckets.
     --                   Lookup covers the current and previous buckets and checks the exclusive expiry.
     --                   A typed metadata association names one ordinary record or an exact record in the submitting owner's Root.

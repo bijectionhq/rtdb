@@ -3641,7 +3641,7 @@ impl SelectedColumn {
 
         let widened = if widen.is_empty() { None } else {
             let selected = Self { sources: Arc::clone(&self.sources), cells: SelectedRows::Picks(Arc::new(widen)) };
-            let Some(output) = selected.relayout(target, field, memory, true)? else { return Ok(None); };
+            let Some(output) = selected.relayout(target, field, memory, true, false)? else { return Ok(None); };
             Some(output)
         };
         let (adapted, _adapted_charge) = rtdb_columnar::copy_evaluated_cells(target, declined.len(), memory,
@@ -3661,7 +3661,12 @@ impl SelectedColumn {
 
     fn relayout_result(&self, target: &LogicalType, field: &ArrowField, memory: &Arc<MemoryBudget>, compact_sources: bool)
         -> Result<Option<(ArrayRef, Arc<MemoryReservation>)>> {
-        if let Some(output) = self.relayout(target, field, memory, compact_sources)? {
+        if let Some(output) = self.relayout(target, field, memory, compact_sources, false)? {
+            return Ok(Some(output));
+        }
+        if self.cells.iter().any(|(source, _)| self.sources[source].as_ref().is_some_and(|(_, field, _, _)| has_run_end_child(field)))
+            && let Ok(Some(output)) = self.relayout(target, field, memory, compact_sources, true)
+        {
             return Ok(Some(output));
         }
         self.gather_scalar_result(target, field, memory)
@@ -3724,7 +3729,7 @@ impl SelectedColumn {
         Ok(Some((array, scratch)))
     }
 
-    fn relayout(&self, target: &LogicalType, field: &ArrowField, memory: &Arc<MemoryBudget>, compact_sources: bool)
+    fn relayout(&self, target: &LogicalType, field: &ArrowField, memory: &Arc<MemoryBudget>, compact_sources: bool, allow_encoded: bool)
         -> Result<Option<(ArrayRef, Arc<MemoryReservation>)>> {
         let base = self.cells.len().checked_mul(64).and_then(|bytes| self.sources.len().checked_mul(128).and_then(|extra| bytes.checked_add(extra)))
             .and_then(|bytes| field.size().checked_mul(8).and_then(|extra| bytes.checked_add(extra))).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size_error)?;
@@ -3738,7 +3743,10 @@ impl SelectedColumn {
         let null = ArrowField::new(field.name(), DataType::Null, true);
         for (position, source) in self.sources.iter().enumerate().filter(|(position, _)| counts[*position] != 0) {
             let (source, mut array, logical) = match source {
-                Some((array, source, Some(logical), _)) if *logical != LogicalType::Nothing && stable_read_layout(logical, source) => {
+                Some((array, source, Some(logical), _)) if *logical != LogicalType::Nothing
+                    && (stable_read_layout(logical, source) || allow_encoded && array.data_type() == source.data_type()
+                        && stable_encoded_result_layout(logical, source)) =>
+                {
                     (source.as_ref(), Arc::clone(array), logical)
                 }
                 Some(_) => return Ok(None),
@@ -3747,14 +3755,14 @@ impl SelectedColumn {
             let array = if source.data_type() == field.data_type() && logical.clone().maybe() == target.clone().maybe() {
                 array
             } else {
-                if logical.join(target) != *target { return Ok(None); }
+                if logical.unencoded().join(target) != *target { return Ok(None); }
                 let reserve_relayout = |scratch: &mut Arc<MemoryReservation>, array: &dyn Array| -> Result<bool> {
                     let bound = rtdb_columnar::arrow_relayout_bound(array, source, field)?;
                     let lease = Arc::get_mut(scratch).expect("A selection owns its scratch");
                     Ok(lease.grow_to(lease.bytes().checked_add(bound).ok_or_else(size_error)?).is_ok())
                 };
                 let missing = self.sources[position].is_none();
-                let compact = compact_sources && !missing;
+                let compact = (compact_sources || allow_encoded && has_run_end_child(source)) && !missing;
                 if compact || !reserve_relayout(&mut scratch, array.as_ref())? {
                     if missing || (!compact && counts[position] >= array.len()) { return Ok(None); }
                     let groups = rows_by_source.get_or_insert_with(|| {
@@ -3852,7 +3860,17 @@ fn plain_result_children(logical: &LogicalType) -> bool {
     }
 }
 
-fn stable_encoded_result_layout(logical: &LogicalType, field: &ArrowField) -> bool {
+fn has_run_end_child(field: &ArrowField) -> bool {
+    match field.data_type() {
+        DataType::RunEndEncoded(..) => true,
+        DataType::Struct(fields) => fields.iter().any(|field| has_run_end_child(field)),
+        DataType::List(field) | DataType::FixedSizeList(field, _) => has_run_end_child(field),
+        _ => false,
+    }
+}
+
+pub(crate) fn stable_encoded_result_layout(logical: &LogicalType, field: &ArrowField) -> bool {
+    if !has_run_end_child(field) { return false; }
     let plain = logical.unencoded();
     plain != *logical && plain_result_children(&plain)
         && rtdb_columnar::to_field(field.name(), logical).is_ok_and(|canonical| canonical == *field)

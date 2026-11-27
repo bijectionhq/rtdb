@@ -9,7 +9,7 @@ use rtdb_plan::{Catalog, ColumnId, Expr, Field, QualifiedTable, Scan, TemporalFi
 use rtdb_temporal::ResolvedRow;
 use rtdb_types::{Iid, LogicalType, Result, TableRef, TimeUnit, Value};
 
-use crate::columnar::{Column, FundedArrowCell, SelectedColumn, stable_read_layout};
+use crate::columnar::{Column, FundedArrowCell, SelectedColumn, stable_encoded_result_layout, stable_read_layout};
 use super::{PartitionScan, ScanCursor, invalid};
 
 fn sidecar() -> TableRef { TableRef::new("xt", "idempotency_receipts") }
@@ -154,6 +154,13 @@ enum MetadataCell<'a> {
     Original(Option<FundedArrowCell<'a>>),
 }
 
+#[derive(Clone, Copy)]
+enum OriginalRead {
+    Checked,
+    Encoded,
+    Decoded,
+}
+
 fn project_metadata(cells: &[MetadataCell<'_>], memory: &Arc<MemoryBudget>) -> Result<(Column, Arc<MemoryReservation>)> {
     if let Some(projected) = select_metadata(cells, memory)? { return Ok(projected); }
 
@@ -208,7 +215,7 @@ fn select_metadata(cells: &[MetadataCell<'_>], memory: &Arc<MemoryBudget>)
             _ => return Ok(None),
         };
         let key = (Arc::as_ptr(array).cast::<()>(), Arc::as_ptr(field), logical.map(std::ptr::from_ref), Arc::as_ptr(owner));
-        let (source, check_layout) = if let Some(&source) = inputs.get(&key) {
+        let (source, read) = if let Some(&source) = inputs.get(&key) {
             source
         } else {
             let schema = field.size().checked_mul(8).ok_or_else(projection_size)?;
@@ -218,9 +225,17 @@ fn select_metadata(cells: &[MetadataCell<'_>], memory: &Arc<MemoryBudget>)
             let signed = if let Some(logical) = logical {
                 signed_metadata_source(array, field, logical, owner, memory)?
             } else { None };
-            let check_layout = signed.is_some() || typed.is_some_and(|logical| {
+            let read = if signed.is_some() || typed.is_some_and(|logical| {
                 *logical != LogicalType::Nothing && stable_read_layout(logical, field)
-            });
+            }) {
+                OriginalRead::Checked
+            } else if array.data_type() == field.data_type()
+                && typed.is_some_and(|logical| stable_encoded_result_layout(logical, field))
+            {
+                OriginalRead::Encoded
+            } else {
+                OriginalRead::Decoded
+            };
             let (array, field, logical, owner) = signed.map_or_else(
                 || (Arc::clone(array), Arc::clone(field), typed.cloned(), Arc::clone(owner)),
                 |(array, field, logical, owner)| (array, field, Some(logical), owner),
@@ -229,11 +244,11 @@ fn select_metadata(cells: &[MetadataCell<'_>], memory: &Arc<MemoryBudget>)
             reserve_more(&mut charge, bytes.checked_add(256).ok_or_else(projection_size)?)?;
             let source = sources.len();
             sources.push(Some((array, field, logical, Some(owner))));
-            inputs.insert(key, (source, check_layout));
-            (source, check_layout)
+            inputs.insert(key, (source, read));
+            (source, read)
         };
         if let MetadataCell::Original(cell) = cell {
-            if check_layout {
+            if matches!(read, OriginalRead::Checked) {
                 let logical = logical.or_else(|| sources[source].as_ref().and_then(|(_, _, logical, _)| logical.as_ref()))
                     .expect("A checked metadata layout has a logical type");
                 validate_readable_cell(field, array.as_ref(), logical, row, memory)?;
@@ -241,7 +256,13 @@ fn select_metadata(cells: &[MetadataCell<'_>], memory: &Arc<MemoryBudget>)
                 let bound = if logical.is_some() { estimate_read_cell_bytes(field, array.as_ref(), row) }
                     else { rtdb_columnar::estimate_read_value_bytes(field, array.as_ref(), row) }?;
                 let _read = memory.reserve(bound)?;
-                read_event_cell(cell)?;
+                if matches!(read, OriginalRead::Encoded) && row < array.len() {
+                    let logical = sources[source].as_ref().and_then(|(_, _, logical, _)| logical.as_ref())
+                        .expect("An encoded metadata layout has a logical type");
+                    validate_readable_cell(field, array.as_ref(), logical, row, memory)?;
+                } else {
+                    read_event_cell(cell)?;
+                }
             }
         }
         positions.push((source, row));
@@ -408,4 +429,67 @@ fn retained_metadata_mixes_a_funded_unsigned_view_with_a_packed_receipt() {
     drop((column, charge));
     assert!(backing.upgrade().is_none());
     assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn retained_metadata_gathers_original_run_children_beside_receipts_and_missing_rows() {
+    use rtdb_types::{RunEndWidth, ScalarType, StructFields};
+
+    let memory = MemoryBudget::new(1 << 20);
+    let int = LogicalType::Scalar(ScalarType::I64);
+    let logical = LogicalType::Struct(StructFields::from([
+        ("count".into(), int.run_end_encoded(RunEndWidth::I16).unwrap()),
+        ("explicit_null".into(), LogicalType::Null),
+    ]));
+    let record = |count| Value::Struct(StructFields::from([
+        ("count".into(), Value::I64(count)),
+        ("explicit_null".into(), Value::Null),
+    ]));
+    let field = Arc::new(rtdb_columnar::to_field("user_metadata", &logical).unwrap());
+    let array = rtdb_columnar::copy_array(&logical, &[record(-1), record(7), record(7)]).unwrap().slice(1, 2);
+    let owner = memory.reserve(array.get_array_memory_size()).unwrap();
+    let original = FundedArrowCell { array: &array, field: &field, logical: Some(&logical), owner: &owner, row: 1 };
+    let receipt = Column::Values(vec![record(9)]);
+    let receipt_owner = memory.reserve(receipt.retained_bytes().unwrap()).unwrap();
+    let backing = Arc::downgrade(&owner);
+    let (column, charge) = project_metadata(&[
+        MetadataCell::Original(Some(original)), MetadataCell::Original(None),
+        MetadataCell::Receipt { column: &receipt, owner: &receipt_owner, row: 0 },
+    ], &memory).unwrap();
+    drop((array, owner, receipt, receipt_owner));
+    assert!(backing.upgrade().is_some());
+    assert_eq!(charge.bytes(), column.retained_bytes().unwrap());
+    let target = logical.unencoded().maybe();
+    let field = rtdb_columnar::to_field("user_metadata", &target).unwrap();
+    let (output, output_charge) = crate::columnar::relayout_output(&column, &target, &field, &memory).unwrap().unwrap();
+    let expected = rtdb_columnar::copy_array(&target, &[record(7), Value::Null, record(9)]).unwrap();
+    assert_eq!(output.to_data(), expected.to_data());
+    assert_eq!(read_execution_value(&field, output.as_ref(), 0).unwrap(), record(7));
+    assert_eq!(read_execution_value(&field, output.as_ref(), 1).unwrap(), Value::Null);
+    drop((column, charge));
+    assert!(backing.upgrade().is_none());
+    drop((output, output_charge));
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn retained_encoded_metadata_still_reserves_the_original_cell_decode_bound() {
+    use rtdb_types::{RunEndWidth, ScalarType};
+
+    let logical = LogicalType::Scalar(ScalarType::Utf8).run_end_encoded(RunEndWidth::I16).unwrap();
+    let field = Arc::new(rtdb_columnar::to_field("user_metadata", &logical).unwrap());
+    let value = Value::Utf8("x".repeat(64 * 1024));
+    let array = rtdb_columnar::copy_array(&logical, std::slice::from_ref(&value)).unwrap();
+    let source_memory = MemoryBudget::new(1 << 20);
+    let owner = source_memory.reserve(array.get_array_memory_size()).unwrap();
+    let cell = FundedArrowCell { array: &array, field: &field, logical: Some(&logical), owner: &owner, row: 0 };
+    let bound = 4096 + size_of::<(usize, usize)>() + 256 + logical.retained_bytes().unwrap()
+        + estimate_read_cell_bytes(&field, array.as_ref(), 0).unwrap();
+
+    let cells = [MetadataCell::Original(Some(cell))];
+    let memory = MemoryBudget::new(bound - 1);
+    assert_eq!(project_metadata(&cells, &memory).err().unwrap().code, "rtdb/memory-budget-exceeded");
+    assert_eq!(memory.used_bytes(), 0);
+    let (column, _) = project_metadata(&cells, &MemoryBudget::new(bound)).unwrap();
+    assert_eq!(column.value(0).unwrap(), value);
 }
