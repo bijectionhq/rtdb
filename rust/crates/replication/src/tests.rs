@@ -4032,14 +4032,18 @@ async fn startup_replay_preserves_exact_and_restored_anchors_across_prefix_loss(
     let boundary = rtdb_types::ReplicaPosition(1);
     assert!(matches!(fixture.logs.recovery_tail(boundary).await,
         Err(rtdb_storage::Error::UnavailableLogRange { requested: 2, first_retained: 5 })));
+    let root = rtdb_storage::ObjectKey::new(rtdb_format::keys::block_key(BlockIndex(0)).unwrap()).unwrap();
+    let digest = rtdb_format::catalog::publication_digest(&fixture.store.get(&root).await.unwrap());
 
     let cancellation = CancellationToken::new();
-    for (discovery, cutoff) in [
-        (BlockDiscovery::At(BlockIndex(0)), None),
-        (BlockDiscovery::FromRestored { checkpoint: BlockIndex(0), compaction_cutoff: boundary, root_sha256: None }, Some(boundary)),
+    for (discovery, cutoff, tracks_catalog_cut) in [
+        (BlockDiscovery::At(BlockIndex(0)), None, false),
+        (BlockDiscovery::FromRestored { checkpoint: BlockIndex(0), compaction_cutoff: boundary, root_sha256: None }, Some(boundary), false),
+        (BlockDiscovery::FromRestored { checkpoint: BlockIndex(0), compaction_cutoff: boundary, root_sha256: Some(digest) }, Some(boundary), true),
     ] {
         let recovered = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0), discovery).await.unwrap();
         let selected = fixture.blocks.recover_for_replay(recovered, &fixture.logs, TrieConfig::default(), Timestamp(0), &cancellation).await.unwrap();
+        assert_eq!(selected.allows_catalog_cut_tracking(), tracks_catalog_cut);
         assert_eq!(selected.block.unwrap().block_index(), BlockIndex(0));
         assert_eq!(selected.compaction_replay_cutoff, cutoff);
     }

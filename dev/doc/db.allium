@@ -1043,6 +1043,7 @@ config {
 -- Coordinated native local startup checks the selected checkpoint's live and nascent primary inventory while its recovery gate is held.
 -- In the Rust partition owner, a query captures the catalog and its installed replica cut in the same partition value.
 -- Ordinary recovery with a matching journal boundary seeds the cut after the driver opens its replica tail.
+-- A restored checkpoint with a verified root receipt seeds the cut in its admitted journal as replica application proceeds.
 -- Every admitted replica position is tracked in strictly increasing replica order and applied once before promotion, writer activation, or installed-prefix publication.
 -- The driver advances the cut through delivered records after pending block adoption and resolution read-back buffers have drained.
 -- A placed replication driver publishes its installed replica prefix and the source position covered by that same prefix together.
@@ -1052,7 +1053,8 @@ config {
 -- An exact attempt witness in that checkpoint establishes a positive outcome at its cut.
 -- Missing outcomes from a frozen checkpoint remain retryable.
 -- Snapshots captured before the advance retain their original cut.
--- Exact and restored recovery modes and checkpoints without a matching journal boundary leave the cut unavailable.
+-- Exact or restored recovery without a verified root receipt leaves live catalog-cut publication disabled.
+-- Every published catalog cut requires a matching journal boundary.
 -- An admitted unrecognized replica body consumes its position and stops installed-prefix publication and promotion on that open partition.
 -- A compactor reset prepares its primary inventory from the adopted checkpoint or rebuilds it from a retained checkpoint and the held journal.
 -- It publishes the replacement compacted files under fresh names before submitting the reset against the captured block and catalog.

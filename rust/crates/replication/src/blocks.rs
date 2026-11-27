@@ -389,9 +389,13 @@ impl BlockStore {
         };
         let fence = match &block { Some(block) => TermFence::from_catalog(block)?, None => TermFence::from_boundary(rtdb_types::Term(0), None)? };
         let refresh_allowed = matches!(discovery, BlockDiscovery::List | BlockDiscovery::From(_) | BlockDiscovery::FromPublished(_));
-        let published_checkpoint = published.zip(block.as_ref()).and_then(|(admitted, block)| {
+        let published_checkpoint = block.as_ref().and_then(|block| {
+            let root_sha256 = match discovery {
+                BlockDiscovery::FromRestored { root_sha256: Some(digest), .. } => Some(digest),
+                _ => published?.root_sha256,
+            };
             block.boundary_replica_position().map(|boundary| PublishedCheckpoint {
-                block: block.block_index(), boundary, root_sha256: admitted.root_sha256,
+                block: block.block_index(), boundary, root_sha256,
             })
         });
         let erasure_checkpoint = matches!(discovery, BlockDiscovery::AtErasure(_));
