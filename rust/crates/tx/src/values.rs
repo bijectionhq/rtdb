@@ -494,7 +494,10 @@ impl ArrowDocuments {
 
     /// Retains readable Root upload layouts while keeping the legacy source and receipt encoding.
     pub fn from_legacy_root_payload(batch: &OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
-        Self::from_legacy_payload(batch, memory, legacy_root_arrow_field)
+        Self::from_legacy_payload(batch, memory, |field| {
+            legacy_root_arrow_field(field) || field.extension_type_name() == Some("uri")
+                && field.data_type() == &DataType::Utf8 && !field.is_nullable() && compatible_document_metadata(field)
+        })
     }
 
     fn from_legacy_payload(

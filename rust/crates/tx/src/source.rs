@@ -5727,6 +5727,48 @@ mod tests {
     }
 
     #[test]
+    fn legacy_root_uri_upload_preserves_spelling_and_receipt_bytes() {
+        use arrow_array::{Int64Array, StringArray};
+
+        let memory = budget();
+        let uri = to_field("link", &LogicalType::Scalar(ScalarType::Uri)).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("_id", DataType::Int64, false), uri.clone()]));
+        let upload = |links: [&str; 2]| {
+            let batch = RecordBatch::try_new(Arc::clone(&schema), vec![
+                Arc::new(Int64Array::from(vec![1, 2])), Arc::new(StringArray::from(links.to_vec())),
+            ]).unwrap();
+            OwnedBatch::new(batch, &memory).unwrap()
+        };
+        let links = ["https://example.test/a%2fb?q=1", "https://example.test/a%2Fb?q=2"];
+        let batch = upload(links);
+        let relation = rtdb_types::OwnedRelation::new("links").unwrap();
+        for (create_only, selected) in [(true, batch.clone()), (false, batch.slice(1, 1).unwrap())] {
+            let documents = ArrowDocuments::from_legacy_root_payload(&selected, &memory).unwrap().unwrap();
+            let input = selected.batch().column(1).as_string::<i32>();
+            let retained = documents.array().column(1).as_string::<i32>();
+            assert_eq!(retained.value(0).as_ptr(), input.value(0).as_ptr());
+            let rows = selected.batch().column(0).as_primitive::<arrow_array::types::Int64Type>().values().iter().zip(input.iter())
+                .map(|(&id, link)| StructFields::from([("_id".into(), Value::I64(id)), ("link".into(), Value::Uri(link.unwrap().into()))]))
+                .collect();
+            let rows = Documents::new(rows, &memory).unwrap();
+            let source = |operation| SourceTransaction::new(vec![operation], SubmitOptions::default(), &memory).unwrap();
+            let actual = source(TxOp::OwnedArrowDocs {
+                relation: relation.clone(), documents, create_only, valid_from: None, valid_to: None,
+            });
+            let expected = source(if create_only {
+                TxOp::OwnedInsertDocs { relation: relation.clone(), documents: rows, valid_from: None, valid_to: None }
+            } else {
+                TxOp::OwnedReplaceDocs { relation: relation.clone(), documents: rows, valid_from: None, valid_to: None }
+            });
+            assert_eq!(actual.encode().unwrap().as_slice(), expected.encode().unwrap().as_slice());
+            assert_eq!(actual.body_digest().unwrap(), expected.body_digest().unwrap());
+        }
+        let invalid = upload([links[0], "not a URI"]);
+        assert!(ArrowDocuments::from_legacy_root_payload(&invalid, &memory).unwrap().is_none());
+        assert!(rtdb_columnar::read_value(&uri, invalid.batch().column(1).as_ref(), 1).is_err());
+    }
+
+    #[test]
     fn nullable_legacy_scalar_uploads_keep_the_row_codec_bytes_with_native_siblings() {
         let memory = budget();
         let relation = rtdb_types::OwnedRelation::new("facts").unwrap();

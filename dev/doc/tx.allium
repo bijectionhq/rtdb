@@ -285,6 +285,7 @@
 -- An acceptance-valid root declaration requires every create, replacement and deletion to begin at its original receiver decision reading and have no valid end.
 -- Source encoding preserves whether an owned field was omitted or explicitly null.
 -- A Flight owned create or commit with compatible legacy Root document fields retains its vectors, structs, decimals, intervals and keywords through source encoding.
+-- A top-level non-nullable URI field with canonical extension metadata retains its validated spelling through legacy Root upload and source encoding.
 -- The legacy Root payload contributes the same transaction source bytes and receipt digest as its row encoding.
 -- Declared scalar Root replay with exact field presence checks the declaration and reached decimal coefficients in document order before staging the selected Arrow cells.
 -- Legacy Root replay can select a flat Boolean, signed 64-bit, text or null union leg while keeping the document field name and its recorded presence.
