@@ -19,6 +19,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 mod clock;
+mod funded;
 mod history;
 pub(super) mod journal_custody;
 pub(crate) mod operator;
@@ -36,6 +37,7 @@ const RECOVERY_KEY_CUSTODY_PROTOCOL: u8 = 5;
 const RECOVERY_JOURNAL_CUSTODY_PROTOCOL: u8 = 6;
 const RECOVERY_HOSTED_CUSTODY_PROTOCOL: u8 = 7;
 const RANKED_RECOVERY_PROTOCOL: u8 = 8;
+const FUNDED_RECOVERY_PROTOCOL: u8 = 9;
 #[cfg(any(unix, feature = "backup-object-holds"))]
 const BROKER_FRAME_BYTES: usize = 16 * 1024;
 const RENEW_AHEAD: Duration = Duration::from_secs(1);
@@ -102,7 +104,7 @@ impl ActivationStatus {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct Publication {
     operation: Uuid,
     predecessor: Binding,
@@ -156,6 +158,8 @@ struct State {
     retired: BTreeSet<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ranked: Option<ranked::RankedState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    funded: Option<funded::FundedState>,
     publication: Option<Publication>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     recovery: Option<recovery::Pending>,
@@ -175,6 +179,7 @@ impl State {
             grants_end: None,
             retired: BTreeSet::new(),
             ranked: None,
+            funded: None,
             publication: None,
             recovery: None,
             superseded_recoveries: BTreeSet::new(),
@@ -182,7 +187,7 @@ impl State {
     }
 
     fn destination_cell(&self) -> Option<Uuid> {
-        self.publication.and_then(|publication| publication.destination_cell)
+        self.publication.as_ref().and_then(|publication| publication.destination_cell)
     }
 
     fn require(&self, expected: Binding) -> Result<()> {
@@ -194,10 +199,10 @@ impl State {
 
     fn already_published(
         &self,
-        publication: Publication,
+        publication: &Publication,
         successor: Uuid,
     ) -> Result<bool> {
-        if let Some(prior) = self.publication.filter(|prior| prior.operation == publication.operation) {
+        if let Some(prior) = self.publication.as_ref().filter(|prior| prior.operation == publication.operation) {
             if prior == publication && self.binding.incarnation == successor {
                 return Ok(true);
             }
@@ -394,7 +399,7 @@ impl ActivationAuthority {
         }
         let (_, state) = self.read(self.stream_id(name)?).await?;
         let state = state.ok_or_else(unavailable)?;
-        if let Some(publication) = state.publication.filter(|prior| prior.operation == operation) {
+        if let Some(publication) = state.publication.as_ref().filter(|prior| prior.operation == operation) {
             if publication.predecessor != expected
                 || installation.is_some_and(|(digest, cell)| {
                     digest != publication.manifest_digest || Some(cell) != publication.destination_cell
@@ -446,7 +451,7 @@ impl ActivationAuthority {
         let stream = self.stream_id(name)?;
         let (_, frozen) = self.read(stream).await?;
         let frozen = frozen.ok_or_else(unavailable)?;
-        if frozen.already_published(publication, successor.successor)? {
+        if frozen.already_published(&publication, successor.successor)? {
             return Ok(ActivationStatus::published(&frozen));
         }
         clock::wait_out(self.clock.as_ref(), clock::drain_window(frozen.grants_end.is_some())).await?;
@@ -454,17 +459,17 @@ impl ActivationAuthority {
         let state = self
             .change(stream, |state| {
                 let state = state.ok_or_else(unavailable)?;
-                if state.already_published(publication, successor.successor)? {
+                if state.already_published(&publication, successor.successor)? {
                     return Ok(None);
                 }
-                Ok(Some(self.install_binding(name, state, publication, successor.successor)?))
+                Ok(Some(self.install_binding(name, state, &publication, successor.successor)?))
             })
             .await?;
         Ok(ActivationStatus::published(&state))
     }
 
     fn install_binding(
-        &self, name: &str, state: &State, publication: Publication, incarnation: Uuid,
+        &self, name: &str, state: &State, publication: &Publication, incarnation: Uuid,
     ) -> Result<State> {
         let mut next = state.clone();
         let version = if publication.destination_cell.is_some() {
@@ -475,7 +480,7 @@ impl ActivationAuthority {
         next.advance_protocol(version);
         let predecessor = publication.predecessor;
         // Retain identities that were assigned outside the successor protocol.
-        let derived_predecessor = state.publication.and_then(|prior| {
+        let derived_predecessor = state.publication.as_ref().and_then(|prior| {
             successor_incarnation(self.identity, name, prior.predecessor, prior.operation, prior.destination_cell).ok()
         });
         if derived_predecessor != Some(predecessor.incarnation) {
@@ -487,12 +492,15 @@ impl ActivationAuthority {
         };
         next.grants_closed = false;
         next.grants_end = None;
-        next.publication = Some(publication);
+        next.publication = Some(publication.clone());
         next.recovery = None;
         next.superseded_recoveries.clear();
         if let Some(ranked) = &mut next.ranked {
             ranked.provider = None;
             ranked.closure = None;
+        }
+        if let Some(funded) = &mut next.funded {
+            funded.scopes.clear();
         }
         Ok(next)
     }
@@ -572,12 +580,13 @@ impl ActivationAuthority {
                 return Err(corrupt());
             }
             let state: State = serde_json::from_slice(bytes).map_err(|_| corrupt())?;
-            if !matches!(state.version, ABSOLUTE_GRANT_PROTOCOL | ELAPSED_GRANT_PROTOCOL | CELL_GRANT_PROTOCOL | RECOVERY_INTENT_PROTOCOL | RECOVERY_KEY_CUSTODY_PROTOCOL | RECOVERY_JOURNAL_CUSTODY_PROTOCOL | RECOVERY_HOSTED_CUSTODY_PROTOCOL | RANKED_RECOVERY_PROTOCOL)
+            if !matches!(state.base_version(), ABSOLUTE_GRANT_PROTOCOL | ELAPSED_GRANT_PROTOCOL | CELL_GRANT_PROTOCOL | RECOVERY_INTENT_PROTOCOL | RECOVERY_KEY_CUSTODY_PROTOCOL | RECOVERY_JOURNAL_CUSTODY_PROTOCOL | RECOVERY_HOSTED_CUSTODY_PROTOCOL | RANKED_RECOVERY_PROTOCOL)
                 || state.destination_cell().is_some_and(|cell| cell.is_nil() || state.version < CELL_GRANT_PROTOCOL)
                 || state.binding.incarnation.is_nil()
                 || state.binding.revision == 0
                 || state.retired.contains(&state.binding.incarnation)
                 || !state.valid_ranked()
+                || !state.valid_funded(stream)
                 || !state.valid_recovery()
             {
                 return Err(corrupt());

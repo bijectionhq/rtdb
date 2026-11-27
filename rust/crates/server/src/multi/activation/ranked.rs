@@ -44,22 +44,22 @@ impl RankedClosure {
 
 impl State {
     pub(super) fn recovery_protocol(&self) -> u8 {
-        self.ranked.map_or(self.version, |ranked| ranked.protocol)
+        self.ranked.map_or_else(|| self.base_version(), |ranked| ranked.protocol)
     }
 
     pub(super) fn advance_protocol(&mut self, protocol: u8) {
         if let Some(ranked) = &mut self.ranked {
             ranked.protocol = ranked.protocol.max(protocol);
         } else {
-            self.version = self.version.max(protocol);
+            self.set_base_version(self.base_version().max(protocol));
         }
     }
 
     pub(super) fn valid_ranked(&self) -> bool {
         match self.ranked {
-            None => self.version != RANKED_RECOVERY_PROTOCOL,
+            None => self.base_version() != RANKED_RECOVERY_PROTOCOL,
             Some(ranked) => {
-                self.version == RANKED_RECOVERY_PROTOCOL
+                self.base_version() == RANKED_RECOVERY_PROTOCOL
                     && (ELAPSED_GRANT_PROTOCOL..=RECOVERY_HOSTED_CUSTODY_PROTOCOL)
                         .contains(&ranked.protocol)
                     && ranked.provider != Some([0; 32])
@@ -149,7 +149,7 @@ impl ActivationAuthority {
                 };
             }
             let mut next = state.clone();
-            next.version = RANKED_RECOVERY_PROTOCOL;
+            next.set_base_version(RANKED_RECOVERY_PROTOCOL);
             next.ranked = Some(RankedState {
                 protocol: state.recovery_protocol(),
                 provider: Some(provider),
@@ -235,8 +235,8 @@ impl ActivationAuthority {
             if predecessor.revision >= state.binding.revision {
                 return Err(conflict());
             }
-            let publication = match state.publication {
-                Some(publication) if publication.predecessor == predecessor => Some(publication),
+            let publication = match state.publication.as_ref() {
+                Some(publication) if publication.predecessor == predecessor => Some(publication.clone()),
                 _ => self.archived_publication(name, predecessor).await?,
             }.ok_or_else(missing_closure)?;
             if operation_id.is_some_and(|operation_id| operation_id != publication.operation) {

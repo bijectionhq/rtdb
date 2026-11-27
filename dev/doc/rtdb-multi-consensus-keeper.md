@@ -468,6 +468,20 @@ A hold on the selected checkpoint preceding a funded append keeps its timed proo
 Logkeeper accepts one checkpoint hold identity per stream and retains its terminal release record through later checkpoint replacements. [Exact checkpoint hold](https://github.com/bijectionhq/logkeeper/blob/14d7b7ec7c3d74667d95bebbe9ee143ca6eb8d98/src/stream/consensus/state/checkpoint.rs#L99-L123) [Released custody regression](https://github.com/bijectionhq/logkeeper/blob/14d7b7ec7c3d74667d95bebbe9ee143ca6eb8d98/src/stream/consensus/keeper/tests/authority.rs#L748-L761)
 Logkeeper can export a portable commitment receipt with `attest_timed_original` on immutable streams after cluster feature level 13 is finalized. The original keeper signs the commitment after a quorum read barrier. The receipt includes the original signed timing samples. Retain the receipt at the original issuer before a covering trim or retirement. Verification uses the enrolled catalog and historical keeper keys and works after the source keepers shut down. [Commitment receipt](https://github.com/bijectionhq/logkeeper/blob/0f056c0570a2a68b74991e1a45f211a280dcfc6e/src/stream/timed.rs)
 Read the complete funded scope roster from the original activation decision that closed predecessor grants, including scopes closed before certificate rotation.
+Upgrade the activation broker and serving readers to activation protocol 9 before enrolling a funded scope.
+Use the activation broker's `commission-funded` operation to enroll the original issuer's Ed25519 public key and exact receiver certificate against the current binding.
+The authority orders enrollments by issuer identity and certificate digest and freezes that roster with the predecessor's grants.
+After `freeze-recovery`, page through `funded-scopes` by predecessor incarnation and revision and follow `next_offset`.
+The same lookup returns the frozen roster and recorded closures after supersession, publication, or later recoveries.
+
+For each scope, authenticate the frozen binding to the original issuer and import its signed closure with `record-funded-closure`.
+The closure is JSON with `scope_sha256`, `bookings`, `inventory_sha256`, and `signature`.
+Digests and signatures are arrays of unsigned bytes.
+The issuer signs the concatenation of the UTF-8 domain `rtdb.activation.funded-closure/v1` followed by one zero byte, the 32-byte scope digest returned by the broker, the eight-byte big-endian booking count, and the 32-byte inventory digest.
+An empty inventory uses count zero and an all-zero digest.
+The authority verifies the receipt against the enrolled issuer and refuses publication until every predecessor scope has an admission closure.
+These broker operations enroll issuers and import closures. Funded dispatch and per-booking reconciliation still require the original issuer integration.
+
 Obtain a durable closure for each scope and enumerate its complete booking inventory, including bookings whose replies were lost.
 Resume from that same closure after a restart or replacement recovery operation.
 Reconcile each booking with its original terminal disposition and verify the original keeper proof of every accepting append, including an accepted appointment activation followed by a refusal.

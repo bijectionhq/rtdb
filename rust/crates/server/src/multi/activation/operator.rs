@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use self::attestation::{Attestation, Attestors, Intent};
 use super::journal_custody::KeeperJournal;
-use super::{Access, ActivationAuthority, ActivationStatus, Binding, VerifiedSuccessor, recovery};
+use super::{Access, ActivationAuthority, ActivationStatus, Binding, VerifiedSuccessor, funded, recovery};
 use crate::{
     config::NodeConfiguration,
     multi::{CONSENSUS_SCHEME, DEVELOPMENT_DATABASE, MultiRuntime},
@@ -32,6 +32,13 @@ pub const HELP: &str = "Usage: rtdb multi-activation status DATABASE AUTHORITY
                  --expected-incarnation UUID --expected-revision N
        rtdb multi-activation ranked-outcomes DATABASE --authority-socket PATH [--after N]
                  --expected-incarnation UUID --expected-revision N [--operation-id UUID]
+       rtdb multi-activation commission-funded DATABASE --authority-socket PATH
+                 --expected-incarnation UUID --expected-revision N --issuer-id UUID
+                 --issuer-key HEX --receiver-certificate-sha256 HEX
+       rtdb multi-activation funded-scopes DATABASE --authority-socket PATH [--offset N]
+                 --expected-incarnation UUID --expected-revision N
+       rtdb multi-activation record-funded-closure DATABASE --authority-socket PATH --closure FILE
+                 --expected-incarnation UUID --expected-revision N
        rtdb multi-activation seal-source DATABASE --authority-socket PATH
                  --expected-incarnation UUID --expected-revision N --operation-id UUID
        rtdb multi-activation record-install DATABASE AUTHORITY --expected-incarnation UUID --expected-revision N --operation-id UUID
@@ -104,6 +111,18 @@ enum Action {
     RankedOutcomes {
         predecessor: Binding,
         after: u64,
+    },
+    CommissionFunded {
+        expected: Binding,
+        enrollment: funded::Enrollment,
+    },
+    FundedScopes {
+        predecessor: Binding,
+        offset: usize,
+    },
+    RecordFundedClosure {
+        predecessor: Binding,
+        closure: funded::Closure,
     },
     Freeze {
         expected: Binding,
@@ -321,7 +340,7 @@ impl Options {
                 operation_id: id(take(&mut fields, "--operation-id")?)?,
                 cell: Some(id(take(&mut fields, "--cell-id")?)?),
             };
-            let manifest_sha256 = manifest_digest(take(&mut fields, "--manifest-sha256")?)?;
+            let manifest_sha256 = hex_digest(take(&mut fields, "--manifest-sha256")?)?;
             let signing_key = take(&mut fields, "--attestation-signing-key")?.into();
             let destination = destination(&mut fields)?;
             let hold_authority = match (fields.remove("--authority-url"), fields.remove("--authority-tls-dir")) {
@@ -386,6 +405,25 @@ impl Options {
                     None => Action::RankedOutcomes { predecessor, after },
                 }
             },
+            #[cfg(unix)]
+            "commission-funded" => Action::CommissionFunded {
+                expected: binding(&mut fields)?,
+                enrollment: funded::Enrollment {
+                    issuer: id(take(&mut fields, "--issuer-id")?)?,
+                    receiver_certificate_sha256: hex_digest(take(&mut fields, "--receiver-certificate-sha256")?)?,
+                    verification_key: hex_digest(take(&mut fields, "--issuer-key")?)?,
+                },
+            },
+            "funded-scopes" => Action::FundedScopes {
+                predecessor: binding(&mut fields)?,
+                offset: fields.remove("--offset").map(|offset| offset.parse()).transpose()
+                    .map_err(|_| arguments_error())?.unwrap_or(0),
+            },
+            #[cfg(unix)]
+            "record-funded-closure" => Action::RecordFundedClosure {
+                predecessor: binding(&mut fields)?,
+                closure: read_funded_closure(&take(&mut fields, "--closure")?)?,
+            },
             "freeze" => Action::Freeze {
                 expected: binding(&mut fields)?,
             },
@@ -438,7 +476,7 @@ impl Options {
                 Some(ProofFile {
                     path: path.into(),
                     cell: id(take(&mut fields, "--cell-id")?)?,
-                    manifest_sha256: manifest_digest(take(&mut fields, "--manifest-sha256")?)?,
+                    manifest_sha256: hex_digest(take(&mut fields, "--manifest-sha256")?)?,
                 })
             } else {
                 None
@@ -454,6 +492,7 @@ impl Options {
         }
 
         if matches!(request.action, Action::CommissionRanked { .. } | Action::RankedOutcomes { .. }
+            | Action::CommissionFunded { .. } | Action::FundedScopes { .. } | Action::RecordFundedClosure { .. }
             | Action::Recovery { action: RecoveryAction::SealSource | RecoveryAction::RankedOutcomes { .. }, .. })
         {
             return Err(arguments_error());
@@ -646,6 +685,15 @@ impl Request {
             Action::Status => (),
             Action::RankedOutcomes { predecessor, after } => {
                 return ranked.outcomes(authority, &database, predecessor, None, after).await;
+            }
+            Action::CommissionFunded { expected, enrollment } => {
+                return Ok(json!(authority.commission_funded(&database, expected, enrollment).await?));
+            }
+            Action::FundedScopes { predecessor, offset } => {
+                return Ok(json!(authority.funded_scope_page(&database, predecessor, offset).await?));
+            }
+            Action::RecordFundedClosure { predecessor, closure } => {
+                return Ok(json!(authority.record_funded_closure(&database, predecessor, closure).await?));
             }
             #[cfg(all(unix, feature = "backup-object-holds"))]
             Action::AuthorizeAbandonedAcquisition { intent, hold, head, anchor, object_namespace } => {
@@ -1019,7 +1067,7 @@ fn destination(fields: &mut BTreeMap<String, String>) -> Result<Destination> {
 }
 
 #[cfg(unix)]
-fn manifest_digest(input: String) -> Result<[u8; 32]> {
+fn hex_digest(input: String) -> Result<[u8; 32]> {
     let bytes = input.as_bytes();
     if bytes.len() != 64 || !bytes.iter().all(u8::is_ascii_hexdigit) {
         return Err(arguments_error());
@@ -1030,6 +1078,20 @@ fn manifest_digest(input: String) -> Result<[u8; 32]> {
         *byte = u8::from_str_radix(digits, 16).map_err(|_| arguments_error())?;
     }
     Ok(digest)
+}
+
+#[cfg(unix)]
+fn read_funded_closure(path: &str) -> Result<funded::Closure> {
+    use std::io::Read;
+
+    let mut bytes = Vec::new();
+    std::fs::File::open(path).map_err(|_| arguments_error())?
+        .take((super::BROKER_FRAME_BYTES + 1) as u64).read_to_end(&mut bytes)
+        .map_err(|_| arguments_error())?;
+    if bytes.len() > super::BROKER_FRAME_BYTES {
+        return Err(arguments_error());
+    }
+    serde_json::from_slice(&bytes).map_err(|_| arguments_error())
 }
 
 async fn read_installation(

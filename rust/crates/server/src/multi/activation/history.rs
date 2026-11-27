@@ -13,7 +13,7 @@ impl ActivationAuthority {
 
     pub(super) async fn preserve_publication(&self, name: &str, state: &State) -> Result<()> {
         // Copy the decision already committed in the authority's previous binding before replacing it.
-        let Some(publication) = state.publication.filter(|publication| publication.recovery.is_some()) else {
+        let Some(publication) = state.publication.as_ref().filter(|publication| publication.recovery.is_some()) else {
             return Ok(());
         };
         let stream = self.history_stream(name, publication.predecessor)?;
@@ -23,11 +23,11 @@ impl ActivationAuthority {
         } else {
             self.journal.create_immutable(stream).await
         }.map_err(journal_error)?;
-        let bytes = Bytes::from(serde_json::to_vec(&publication).map_err(|_| corrupt())?);
+        let bytes = Bytes::from(serde_json::to_vec(publication).map_err(|_| corrupt())?);
         let mut epoch = Epoch(u64::from(local));
         for _ in 0..ATTEMPTS {
             if let Some(prior) = self.read_publication(stream).await? {
-                return if prior == publication { Ok(()) } else { Err(corrupt()) };
+                return if &prior == publication { Ok(()) } else { Err(corrupt()) };
             }
             let fence = match self.seal_fence(stream, epoch).await {
                 Ok((Lsn(0), fence)) => fence,
@@ -55,7 +55,7 @@ impl ActivationAuthority {
     pub(super) async fn archived_publication(&self, name: &str, predecessor: Binding) -> Result<Option<Publication>> {
         let stream = self.history_stream(name, predecessor)?;
         let found = self.read_publication(stream).await?;
-        if found.is_some_and(|publication| publication.predecessor != predecessor || publication.recovery.is_none()) {
+        if found.as_ref().is_some_and(|publication| publication.predecessor != predecessor || publication.recovery.is_none()) {
             return Err(corrupt());
         }
         Ok(found)

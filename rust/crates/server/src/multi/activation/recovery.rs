@@ -61,11 +61,13 @@ pub(super) struct Pending {
     final_source_lsn: Option<Lsn>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Completed {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) ranked_closure: Option<super::ranked::RankedClosure>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) funded_scopes: Vec<super::funded::Scope>,
     loss_policy: LossPolicy,
     source_cut: SourceCut,
     final_source_lsn: Option<Lsn>,
@@ -127,6 +129,7 @@ impl State {
                 && self.superseded_recoveries.is_empty()
                 && self
                     .publication
+                    .as_ref()
                     .is_none_or(|publication| publication.recovery.is_none());
         }
         let pending_valid = self.recovery.is_some_and(|pending| {
@@ -152,8 +155,8 @@ impl State {
                         }
                 })
         });
-        let publication_valid = self.publication.is_some_and(|publication| {
-            if let Some(completed) = publication.recovery {
+        let publication_valid = self.publication.as_ref().is_some_and(|publication| {
+            if let Some(completed) = &publication.recovery {
                 completed.source_cut.lsn != 0
                     && custody_protocol(completed.key_hold, completed.journal_hold, completed.objects_sha256)
                         .is_some_and(|protocol| self.recovery_protocol() >= protocol)
@@ -188,6 +191,7 @@ impl State {
     pub(super) fn publication_status(&self, operation: Operation) -> Result<Option<Status>> {
         let Some(publication) = self
             .publication
+            .as_ref()
             .filter(|prior| prior.operation == operation.operation_id)
         else {
             return Ok(None);
@@ -195,7 +199,7 @@ impl State {
         if operation.predecessor != publication.predecessor {
             return Err(conflict());
         }
-        let completed = publication.recovery.ok_or_else(conflict)?;
+        let completed = publication.recovery.as_ref().ok_or_else(conflict)?;
         Ok(Some(Status::Published {
             intent: Intent {
                 operation,
@@ -211,7 +215,7 @@ impl State {
 }
 
 impl Completed {
-    fn installation(self, manifest_digest: [u8; 32]) -> Installation {
+    fn installation(&self, manifest_digest: [u8; 32]) -> Installation {
         Installation {
             manifest_digest,
             source_cut: self.source_cut,
@@ -559,6 +563,7 @@ impl ActivationAuthority {
             )
         })?;
         let ranked_closure = frozen.require_ranked_closure()?;
+        let funded_scopes = frozen.require_funded_closures()?;
         let successor = self.candidate(name, pending.intent)?;
         let publication = Publication {
             operation: operation.operation_id,
@@ -567,6 +572,7 @@ impl ActivationAuthority {
             destination_cell: pending.intent.destination_cell,
             recovery: Some(Completed {
                 ranked_closure,
+                funded_scopes: funded_scopes.to_vec(),
                 loss_policy: pending.intent.loss_policy,
                 source_cut: installation.source_cut,
                 final_source_lsn: pending.final_source_lsn,
@@ -584,13 +590,16 @@ impl ActivationAuthority {
         let state = self
             .change(stream, |state| {
                 let state = state.ok_or_else(unavailable)?;
-                if state.already_published(publication, successor)? {
+                if state.already_published(&publication, successor)? {
                     return Ok(None);
                 }
-                if state.pending(operation)? != pending || state.require_ranked_closure()? != ranked_closure {
+                if state.pending(operation)? != pending
+                    || state.require_ranked_closure()? != ranked_closure
+                    || state.require_funded_closures()? != funded_scopes
+                {
                     return Err(conflict());
                 }
-                self.install_binding(name, state, publication, successor)
+                self.install_binding(name, state, &publication, successor)
                     .map(Some)
             })
             .await?;
