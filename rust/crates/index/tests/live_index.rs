@@ -78,6 +78,60 @@ fn uncommitted_rows_are_visible_only_to_transaction_snapshot() {
 }
 
 #[test]
+fn live_relation_packs_uneven_writes_and_keeps_pinned_table_prefixes() {
+    let state = PartitionState::empty(TrieConfig::default()).unwrap();
+    let memory = MemoryBudget::new(64 << 20);
+    let table = table();
+    let markers = TableRef::new("public", "markers");
+    let sizes = [1, 3, 5, 8, 2, 6, 7, 4];
+    let mut next_row = 0;
+    let mut pinned = None;
+
+    for id in 0..64 {
+        let mut tx = TransactionBuffer::new(state.resolving_snapshot(&[]).unwrap(), key(id), Arc::clone(&memory)).unwrap();
+        let row_count = sizes[id as usize % sizes.len()];
+        for row in next_row..next_row + row_count {
+            tx.put(table.clone(), document(row, row), Interval::ALL).unwrap();
+        }
+        tx.put(markers.clone(), document(id, next_row), Interval::ALL).unwrap();
+        next_row += row_count;
+        state.apply(&tx.stage().unwrap()).unwrap();
+        if id == 7 {
+            pinned = Some(state.open_snapshot(Some(key(id).tx_id)));
+        }
+    }
+
+    let pinned = pinned.unwrap();
+    let current = state.open_snapshot(Some(key(63).tx_id));
+    let prior_docs = pinned.iter_segments(&table).next().unwrap();
+    let docs = current.iter_segments(&table).next().unwrap();
+    assert_eq!(pinned.tx_basis(), Some(key(7)));
+    assert_eq!(current.tx_basis(), Some(key(63)));
+    assert_eq!(pinned.segments(&markers)[0].row_count(), 8);
+    assert_eq!(current.segments(&markers)[0].row_count(), 64);
+    assert_eq!(prior_docs.row_count(), 36);
+    assert_eq!(docs.row_count(), 288);
+    assert!(docs.batches().count() <= 8);
+
+    for row in 0..docs.row_count() {
+        let source = docs.row(row).unwrap();
+        let id = i64::from(row);
+        assert_eq!(source.header().unwrap().iid, EntityId::Integer(id).iid());
+        assert_eq!(source.event().unwrap().operation, StoredOperation::Put(document(id, id)));
+        if row < prior_docs.row_count() {
+            assert_eq!(prior_docs.row(row).unwrap().event().unwrap(), source.event().unwrap());
+        }
+    }
+
+    let current_bytes = state.value().live().live_batch_bytes();
+    assert!(memory.used_bytes() as u64 > current_bytes);
+    drop(pinned);
+    assert_eq!(memory.used_bytes() as u64, current_bytes);
+    drop((current, state));
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
 fn rejected_event_releases_its_reservation_and_does_not_create_a_table() {
     let state = PartitionState::empty(TrieConfig::default()).unwrap();
     let budget = MemoryBudget::new(4096);

@@ -27,6 +27,7 @@ pub struct IndexBatch {
     put_field_types: Vec<LogicalType>,
     system_times: Option<(Timestamp, Timestamp)>,
     canonical_iids: OnceLock<bool>,
+    packing_level: u8,
     /// Every row's header, decoded once with the batch: a scan reads each row's several times, and a batch is shared by every query.
     headers: (Box<[EventHeader]>, Arc<MemoryReservation>),
 }
@@ -80,7 +81,7 @@ impl IndexBatch {
         };
         let system_times = headers.iter().map(|header| header.system_from)
             .fold(None, |times: Option<(Timestamp, Timestamp)>, time| Some(times.map_or((time, time), |(first, last)| (first.min(time), last.max(time)))));
-        Ok(Arc::new(Self { owned, events, put_types, put_field_types, system_times, canonical_iids: OnceLock::new(), headers: (headers.into_boxed_slice(), header_reservation) }))
+        Ok(Arc::new(Self { owned, events, put_types, put_field_types, system_times, canonical_iids: OnceLock::new(), packing_level: 0, headers: (headers.into_boxed_slice(), header_reservation) }))
     }
     /// As `from_owned`, for `owned` holding the rows of `parts` in order with their event columns unchanged, such as their
     /// concatenation or a copy with a column added: the parts' decoded headers and put types are taken rather than derived again.
@@ -111,7 +112,7 @@ impl IndexBatch {
         }
         Ok(Arc::new(Self {
             owned, events, put_types: first.put_types.clone(), put_field_types: first.put_field_types.clone(), system_times,
-            canonical_iids: OnceLock::new(), headers: (headers.into_boxed_slice(), header_reservation),
+            canonical_iids: OnceLock::new(), packing_level: 0, headers: (headers.into_boxed_slice(), header_reservation),
         }))
     }
     pub fn from_events(events: &[StoredEvent], declared: &StructFields<LogicalType>, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
@@ -199,18 +200,17 @@ impl IndexBatch {
         (self.owned.reservation().bytes() as u64).saturating_add(self.headers.1.bytes() as u64)
     }
 
-    /// Joins a run of equal-length live batches into one, or `None` when the run is not packable.
     fn try_join_live_run(run: &[&Self]) -> Option<Arc<Self>> {
         let (first, rest) = run.split_first()?;
-        let rows = first.len().checked_mul(run.len())?;
-        if rest.is_empty() || !first.len().is_power_of_two() || rows > MAX_PACKED_LIVE_ROWS
+        let rows = run.iter().try_fold(0usize, |rows, batch| rows.checked_add(batch.len()))?;
+        if rest.is_empty() || rows > MAX_PACKED_LIVE_ROWS
             || first.events.has_entity_keys() || first.events.has_commit_positions() || first.events.has_origin_column()
         {
             return None;
         }
         let budget = first.arrow_reservation().budget().snapshot_budget()?;
         for batch in rest {
-            if batch.len() != first.len() || batch.arrow().schema_ref() != first.arrow().schema_ref()
+            if batch.packing_level != first.packing_level || batch.arrow().schema_ref() != first.arrow().schema_ref()
                 || batch.events.has_entity_keys() || batch.events.has_commit_positions() || batch.events.has_origin_column()
                 || !Arc::ptr_eq(budget, batch.arrow_reservation().budget().snapshot_budget()?)
             {
@@ -229,7 +229,9 @@ impl IndexBatch {
         let batch = arrow_select::concat::concat_batches(schema, run.iter().map(|batch| batch.arrow())).ok()?;
         Arc::get_mut(&mut reservation)?.shrink_to(batch.get_array_memory_size().checked_add(schema_bytes)?).ok()?;
         let owned = OwnedBatch::with_reservation(batch, reservation).ok()?;
-        Self::from_owned_rows_of(owned, run.iter().copied()).ok()
+        let mut packed = Self::from_owned_rows_of(owned, run.iter().copied()).ok()?;
+        Arc::get_mut(&mut packed)?.packing_level = first.packing_level.checked_add(1)?;
+        Some(packed)
     }
 
     pub fn arrow(&self) -> &RecordBatch { self.owned.batch() }
@@ -399,16 +401,31 @@ impl LiveRelation {
         self.batches.push_back((start, batch));
         Arc::make_mut(&mut self.starts).push(start);
     }
-    /// Joins the trailing run of equal-length batches once it is `PACK_FAN_IN` long, or once it fills a packed batch.
-    /// A row is copied once per level (1, 8, 64, then 128 rows) rather than once per doubling.
     fn pack_tail(&mut self) -> bool {
         let Some((_, last)) = self.batches.back() else { return false; };
-        let size = last.len();
-        if size == 0 || !size.is_power_of_two() || size >= MAX_PACKED_LIVE_ROWS { return false; }
-        let fan_in = PACK_FAN_IN.min(MAX_PACKED_LIVE_ROWS / size);
-        let Some(first) = self.batches.len().checked_sub(fan_in) else { return false; };
-        let run = self.batches.focus().narrow(first..).into_iter().map(|(_, batch)| batch.as_ref()).collect::<Vec<_>>();
-        let Some(joined) = IndexBatch::try_join_live_run(&run) else { return false; };
+        if last.is_empty() || last.len() > MAX_PACKED_LIVE_ROWS / 2 { return false; }
+
+        let mut rows = 0;
+        let mut largest = 0;
+        let mut fan_in = None;
+        for (index, (_, batch)) in self.batches.iter().rev().take(PACK_FAN_IN).enumerate() {
+            if batch.packing_level != last.packing_level || batch.len() > MAX_PACKED_LIVE_ROWS - rows { break; }
+            rows += batch.len();
+            largest = largest.max(batch.len());
+            let count = index + 1;
+            let target = (MAX_PACKED_LIVE_ROWS / largest).min(PACK_FAN_IN);
+            if count >= target && rows >= largest * 2 {
+                fan_in = Some(count);
+                break;
+            }
+        }
+        let Some(fan_in) = fan_in else { return false; };
+        let first = self.batches.len() - fan_in;
+        let mut run = [last.as_ref(); PACK_FAN_IN];
+        for ((_, batch), part) in self.batches.focus().narrow(first..).into_iter().zip(&mut run) {
+            *part = batch.as_ref();
+        }
+        let Some(joined) = IndexBatch::try_join_live_run(&run[..fan_in]) else { return false; };
         let start = self.batches[first].0;
         for _ in 0..fan_in {
             if let Some((_, batch)) = self.batches.pop_back() { self.retained_bytes -= batch.retained_bytes(); }
@@ -2862,7 +2879,7 @@ mod chunk_tests {
     }
 
     #[test]
-    fn a_table_written_a_row_per_transaction_with_long_string_ids_tracks_its_relation_bytes() {
+    fn live_relation_packs_single_row_writes_with_long_string_ids() {
         let memory = MemoryBudget::new(1 << 26);
         let table = TableRef::new("public", "keys");
         let mut live = LiveIndex::new(BlockIndex(0), None, TrieConfig::default());

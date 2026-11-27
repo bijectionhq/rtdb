@@ -15,7 +15,8 @@
 --   A table's immutable row lineage advances when rows are appended.
 --   Each live table holds a single growing relation of appended batches with no fixed slot limit.
 --   Appending extends the relation and publishes the new row count and trie root without mutating any previous value.
---   Native application can pack adjacent small batches of the same layout into one reserved segment in the successor relation.
+--   Native application can pack adjacent small batches of the same layout and packing level into one reserved segment in the successor relation.
+--   A packed segment contains at least twice the rows of its largest input and is one packing level above its inputs.
 --   Packing preserves event order and logical row addresses, and each older relation retains its original segments and reservations.
 --   Each snapshot value shares and reads only its own stable prefix of the relation, so concurrent readers never see later appends or partially written rows, and row addresses within a prefix never change.
 --   Applied live index values share their ordered table inventory structurally across transactions.
