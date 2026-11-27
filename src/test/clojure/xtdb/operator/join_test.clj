@@ -1489,7 +1489,7 @@
 (t/deftest non-uuid-id-iid-pushdown-test
   (doseq [id-type [:string :integer]
           :let [ids (case id-type
-                      :string (mapv #(str "id-" %) (range 1000))
+                      :string (mapv #(str "idé-東京-" %) (range 1000))
                       :integer (vec (range 1000)))
                 lookup-ids (take 3 ids)]]
     (t/testing (str "IID pushdown with " (name id-type) " _id")

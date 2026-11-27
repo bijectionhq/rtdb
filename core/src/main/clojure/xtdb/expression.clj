@@ -12,8 +12,8 @@
            (com.github.benmanes.caffeine.cache Cache Caffeine)
            (java.lang NumberFormatException)
            (java.math RoundingMode)
-           (java.nio ByteBuffer)
-           (java.nio.charset StandardCharsets)
+           (java.nio ByteBuffer ByteOrder)
+           (java.nio.charset Charset StandardCharsets)
            (java.time Duration Instant InstantSource LocalDate LocalDateTime LocalTime OffsetDateTime ZoneId ZoneOffset ZonedDateTime)
            (java.util Arrays Date List Map UUID)
            (java.util.regex Pattern)
@@ -25,7 +25,7 @@
            (xtdb.operator ProjectionSpec ProjectionSpec$Factory SelectionSpec SelectionSpec$Factory)
            (xtdb.pgwire PgTypes)
            xtdb.time.Interval
-           (xtdb.util StringUtil)))
+           (xtdb.util Iid StringUtil)))
 
 (set! *unchecked-math* :warn-on-boxed)
 
@@ -1174,17 +1174,17 @@
 (defmethod codegen-call [:_iid :i64] [_]
   {:return-type #xt/type [:fixed-size-binary 16]
    :->call-code (fn [[id]]
-                  `(resolve-buf (util/->iid ~id)))})
+                  `(ByteBuffer/wrap (Iid/iidFromLong ~id)))})
 
 (defmethod codegen-call [:_iid :utf8] [_]
   {:return-type #xt/type [:fixed-size-binary 16]
    :->call-code (fn [[id]]
-                  `(resolve-buf (util/->iid (buf->str ~id))))})
+                  `(iid-from-utf8 ~id))})
 
 (defmethod codegen-call [:_iid :uuid] [_]
   {:return-type #xt/type [:fixed-size-binary 16]
    :->call-code (fn [[id]]
-                  `(resolve-buf (util/->iid (util/byte-buffer->uuid ~id))))})
+                  `(iid-from-uuid ~id))})
 
 (defmethod codegen-call [:_iid :keyword] [_]
   {:return-type #xt/type [:fixed-size-binary 16]
@@ -1889,6 +1889,16 @@
     (.get buf bs)
     (.position buf pos)
     (String. bs)))
+
+(defn iid-from-utf8 ^ByteBuffer [^ByteBuffer id]
+  (ByteBuffer/wrap (or (when (= (Charset/defaultCharset) StandardCharsets/UTF_8)
+                        (Iid/iidFromUtf8OrNull id))
+                      (util/->iid (buf->str id)))))
+
+(defn iid-from-uuid ^ByteBuffer [^ByteBuffer id]
+  (if (and (zero? (.position id)) (= 16 (.limit id)) (= ByteOrder/BIG_ENDIAN (.order id)))
+    (.duplicate id)
+    (resolve-buf (util/->iid (util/byte-buffer->uuid id)))))
 
 (defn str->buf ^ByteBuffer [^String s]
   (-> (.getBytes s StandardCharsets/UTF_8) (ByteBuffer/wrap)))

@@ -17,7 +17,8 @@
            (xtdb.arrow RelationReader VectorType)
            (xtdb.bloom BloomUtils)
            (xtdb.operator ProjectionSpec$Factory)
-           (xtdb.operator.join BuildSide BuildKeyFacts ComparatorFactory DiskHashJoin EveryRowMarkJoin JoinType JoinType$Mark JoinType$Mark$Spec$Compare JoinType$Mark$Spec$Exists JoinType$Mark$Spec$KeyedIn MemoryHashJoin)))
+           (xtdb.operator.join BuildSide BuildKeyFacts ComparatorFactory DiskHashJoin EveryRowMarkJoin JoinType JoinType$Mark JoinType$Mark$Spec$Compare JoinType$Mark$Spec$Exists JoinType$Mark$Spec$KeyedIn MemoryHashJoin)
+           xtdb.util.Iid))
 
 (defmethod lp/ra-expr :cross-join [_]
   (s/cat :op #{:⨯ :cross-join}
@@ -186,8 +187,9 @@
               iid-col? (= "_iid" (name build-col-name))]
           (dotimes [build-idx (.getRowCount build-rel)]
             (when (and col-pushdown-iids (not (.isNull build-col build-idx)))
-              (let [v (.getObject build-col build-idx)]
-                (.add col-pushdown-iids (if iid-col? v (util/->iid v)))))
+              (.add col-pushdown-iids (if iid-col?
+                                       (.getObject build-col build-idx)
+                                       (Iid/iidFromId build-col build-idx))))
             (.add pushdown-bloom ^ints (BloomUtils/bloomHashes build-col build-idx))))))))
 
 (defn- ->child-cursors [build-plan-side build-cursor probe-cursors]

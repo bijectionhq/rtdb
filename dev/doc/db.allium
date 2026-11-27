@@ -678,6 +678,8 @@ variant TxMessage : SourceMessage {
     -- An existing marker can resolve the duplicate before operation execution.
     -- Execution of the assertion aborts the transaction before any user operation.
     -- A document union leg retains columns in their first encounter order across document operations for the same table and mutation kind.
+    -- JVM staging derives IIDs from compatible Arrow ID cells using the submitted identity's canonical bytes.
+    -- A staged JVM put with a supplied IID copies that IID as given.
     -- system_time is the caller's requested system time, for an initial backfill; see AdmitSuppliedSystemTime.
     system_time: Timestamp?
     default_tz: ZoneId               -- always present
@@ -2481,6 +2483,7 @@ surface QueryAccess {
         -- When an additional distinct candidate exceeds the bound, the probe scan uses the Bloom filter and the join still checks exact equality.
         -- The candidate set is stored as a charged sorted slice, and a scan task walks it in the order in which it merges event headers.
         -- Pruning by entity ID requires matching identity domains and proof that the scan's snapshot uses canonical IIDs.
+        -- JVM equality filters on an Arrow parameter derive an IID only for a supported identity value.
         -- A composite set key borrows an already materialized row value when its calendar values are admitted.
         -- A key that requires an owned scalar read retains that value under the comparison reservation.
         -- Unfiltered counts and double-precision sums and averages without DISTINCT can reduce compatible Arrow vectors and selections without materialising a row mask.

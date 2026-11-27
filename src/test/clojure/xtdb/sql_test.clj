@@ -3347,6 +3347,20 @@ UNION ALL
   (t/is (= [{:xt/id #uuid "2f64d726-b528-4897-b3b1-db41cd9e887b"}]
            (xt/q tu/*node* "SELECT * FROM foo"))))
 
+(t/deftest patch-record-uses-the-same-iid-as-the-original-put
+  (doseq [[id sql-id] [["é/東京" "'é/東京'"]
+                       [42 "42::bigint"]
+                       [#uuid "2f64d726-b528-4897-b3b1-db41cd9e887b" "UUID '2f64d726-b528-4897-b3b1-db41cd9e887b'"]]]
+    (xt/execute-tx tu/*node* [[:put-docs :docs {:xt/id id, :v 1}]])
+    (xt/execute-tx tu/*node* [(str "PATCH INTO docs RECORDS {_id: " sql-id ", v: 2}")])
+    (t/is (= [{:xt/id id, :v 2}] (xt/q tu/*node* ["SELECT _id, v FROM docs WHERE _id = ?" id])))))
+
+(t/deftest insert-from-filtered-select-derives-the-selected-integer-iid
+  (xt/execute-tx tu/*node* ["INSERT INTO srcdocs RECORDS {_id: 1, expected_id: 0}, {_id: -2, expected_id: -2}"])
+  (xt/execute-tx tu/*node* ["INSERT INTO dstdocs SELECT _id FROM srcdocs WHERE _id = expected_id"])
+  (t/is (= [{:xt/id -2}]
+           (xt/q tu/*node* ["SELECT _id FROM dstdocs WHERE _id = ?" -2]))))
+
 (t/deftest null->struct-ingestion-stopped-4300
   ;; FIXME #4300
   #_#_#_

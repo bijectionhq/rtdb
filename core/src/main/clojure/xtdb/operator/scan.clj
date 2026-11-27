@@ -35,7 +35,7 @@
            (xtdb.segment BufferPoolSegment MergePlanner)
            xtdb.api.TableRef
            (xtdb.trie Bucketer)
-           (xtdb.util TemporalBounds TemporalDimension)))
+           (xtdb.util Iid TemporalBounds TemporalDimension)))
 
 (s/def ::db-name string?)
 (s/def ::table ::table/ref)
@@ -143,9 +143,7 @@
     (s/valid? ::lp/param eid)
     (when-let [eid-rdr (.vectorForOrNull args-rel (name eid))]
       (when (= 1 (.getValueCount eid-rdr))
-        (let [eid-val (.getObject eid-rdr 0)]
-          (when (util/valid-iid? eid-val)
-            (util/->iid eid-val)))))))
+        (Iid/iidFromIdOrNull eid-rdr 0)))))
 
 (defn- flatten-or
   [expr]

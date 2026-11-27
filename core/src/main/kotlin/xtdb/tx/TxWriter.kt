@@ -23,6 +23,7 @@ import xtdb.api.error.Incorrect
 import xtdb.api.SchemaName
 import xtdb.api.TableName
 import xtdb.util.asIid
+import xtdb.util.writeIid
 import java.nio.channels.Channels
 import java.time.Instant
 import java.time.ZoneId
@@ -96,8 +97,7 @@ private class PutDocsWriter(ops: VectorWriter) : TxOpWriter<TxOp.PutDocs> {
 
         val idVec = op.docs["_id"]
         for (idx in 0 until op.docs.rowCount) {
-            val eid = idVec.getObject(idx)
-            iidWriter.writeBytes(eid.asIid)
+            idVec.writeIid(idx, iidWriter)
         }
         iidsVec.endList()
 
@@ -132,8 +132,7 @@ private class PatchDocsWriter(ops: VectorWriter) : TxOpWriter<TxOp.PatchDocs> {
 
         val idVec = op.patches["_id"]
         for (idx in 0 until op.patches.rowCount) {
-            val eid = idVec.getObject(idx)
-            iidWriter.writeBytes(eid.asIid)
+            idVec.writeIid(idx, iidWriter)
         }
         iidsVec.endList()
 

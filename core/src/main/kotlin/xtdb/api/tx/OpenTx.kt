@@ -36,6 +36,7 @@ import xtdb.time.microsAsInstant
 import xtdb.trie.Trie
 import xtdb.types.ClojureForm
 import xtdb.util.asIid
+import xtdb.util.writeIid
 import xtdb.util.closeAll
 import xtdb.util.closeAllOnCatch
 import xtdb.util.closeOnCatch
@@ -528,7 +529,7 @@ class OpenTx
             } else {
                 val idRdr = rel["_id"]
 
-                repeat(rowCount) { idx -> iidVec.writeBytes(idRdr.getObject(idx).asIid) }
+                repeat(rowCount) { idx -> idRdr.writeIid(idx, iidVec) }
             }
 
             val vfRdr = rel.vectorForOrNull("_valid_from")

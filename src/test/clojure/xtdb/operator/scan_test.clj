@@ -13,12 +13,13 @@
             [xtdb.trie-catalog :as cat]
             [xtdb.types :as types]
             [xtdb.util :as util]
+            [xtdb.vector.reader :as vr]
             [xtdb.vector.writer :as vw])
   (:import java.time.InstantSource
            java.util.Arrays
            java.util.Date
            java.util.SortedSet
-           xtdb.arrow.RelationReader
+           (xtdb.arrow MaskedRelation RelationReader RowMask$Builder)
            (xtdb.compactor RecencyPartition)))
 
 (t/use-fixtures :each tu/with-mock-clock tu/with-allocator tu/with-node)
@@ -487,6 +488,25 @@
                                                                       (list '== '_id uuid1)
                                                                       (list '== '_id uuid2))}]}]
                                      {:node tu/*node*})))))))))
+
+(t/deftest test-iid-scan-parameter-matches-the-object-identity
+  (doseq [id [(byte -128) (short -32768) (int Integer/MAX_VALUE) Long/MIN_VALUE
+              "" "é/東京" :example/item #uuid "90abc123-d456-475c-8ab9-0123456789ef"]]
+    (with-open [args (tu/open-args {:eid id})]
+      (let [^SortedSet iids (scan/selects->iid-set '{"_id" (== _id ?eid)} args)]
+        (t/is (Arrays/equals (util/->iid id) ^bytes (.first iids)) (pr-str id)))))
+  (doseq [id [nil 7.0]]
+    (with-open [args (tu/open-args {:eid id})]
+      (t/is (nil? (scan/selects->iid-set '{"_id" (== _id ?eid)} args)) (pr-str id))))
+  (with-open [ids (tu/open-vec "?eid" #xt/type :i16 [(short 1) (short -2)])]
+    (let [mask (.build (doto (RowMask$Builder. 2) (.add 1)))
+          args (MaskedRelation/of (vr/rel-reader [ids]) mask)
+          ^SortedSet iids (scan/selects->iid-set '{"_id" (== _id ?eid)} args)]
+      (t/is (Arrays/equals (util/->iid (short -2)) ^bytes (.first iids)))))
+  (with-open [ids (tu/open-vec "?eid" #xt/type :utf8 [])]
+    (.writeBytes ids (byte-array [-61 40]))
+    (let [^SortedSet iids (scan/selects->iid-set '{"_id" (== _id ?eid)} (vr/rel-reader [ids]))]
+      (t/is (Arrays/equals (util/->iid "�(") ^bytes (.first iids))))))
 
 (t/deftest test-id-equality-against-an-unresolvable-eid-still-finds-the-row-5987
   (xt/execute-tx tu/*node* ["INSERT INTO docs RECORDS {_id: 7, name: 'seven'}, {_id: 'abc', name: 'abc'}"])
