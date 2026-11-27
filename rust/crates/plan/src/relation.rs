@@ -369,15 +369,31 @@ impl LiteralArrowPages {
     pub fn pages(&self) -> &[rtdb_columnar::OwnedBatch] { &self.0 }
 
     fn serialize_legacy<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        let pages = self.0.iter().map(|page| {
-            let batch = page.batch();
-            (0..batch.num_rows()).map(|row| {
-                batch.schema_ref().fields().iter().zip(batch.columns()).map(|(field, column)| {
-                    rtdb_columnar::read_value(field, column.as_ref(), row).map(Expr::Literal)
-                }).collect::<Result<Vec<_>>>()
-            }).collect::<Result<Vec<_>>>()
-        }).collect::<Result<Vec<_>>>().map_err(serde::ser::Error::custom)?;
-        pages.serialize(serializer)
+        serializer.collect_seq(self.0.iter().map(LegacyLiteralPage))
+    }
+}
+
+struct LegacyLiteralPage<'a>(&'a rtdb_columnar::OwnedBatch);
+
+impl Serialize for LegacyLiteralPage<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.collect_seq((0..self.0.batch().num_rows()).map(|row| LegacyLiteralRow(self.0, row)))
+    }
+}
+
+struct LegacyLiteralRow<'a>(&'a rtdb_columnar::OwnedBatch, usize);
+
+impl Serialize for LegacyLiteralRow<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::{Error, SerializeSeq};
+
+        let batch = self.0.batch();
+        let mut row = serializer.serialize_seq(Some(batch.num_columns()))?;
+        for (field, column) in batch.schema_ref().fields().iter().zip(batch.columns()) {
+            let value = rtdb_columnar::read_value(field, column.as_ref(), self.1).map_err(S::Error::custom)?;
+            row.serialize_element(&Expr::Literal(value))?;
+        }
+        row.end()
     }
 }
 

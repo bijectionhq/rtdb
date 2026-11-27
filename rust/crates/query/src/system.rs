@@ -852,6 +852,38 @@ mod tests {
         assert_eq!(context.memory.used_bytes(), baseline);
     }
 
+    #[test]
+    fn arrow_literal_pages_serialize_with_the_legacy_page_order_and_scalar_types() -> Result<()> {
+        use arrow_array::{RecordBatch, Float64Array};
+        use rtdb_columnar::{OwnedBatch, to_field};
+        use rtdb_plan::{Binder, Expr, LiteralArrowPages, Relation, RelationNode, Schema};
+
+        let memory = MemoryBudget::new(1 << 20);
+        let double = LogicalType::Scalar(ScalarType::F64).maybe();
+        let field = Binder::default().field("x", None, double.clone())?;
+        let schema = Schema::new(vec![field])?;
+        let bits = f64::from_bits(0x7ff8_0000_0000_0001);
+        let record = RecordBatch::try_new(
+            Arc::new(arrow_schema::Schema::new(vec![to_field("x", &double)?])),
+            vec![Arc::new(Float64Array::from(vec![Some(99.0), Some(-0.0), None, Some(bits)]))],
+        ).unwrap();
+        let arrow = Relation::new(schema.clone(), RelationNode::ArrowLiteralPages {
+            pages: LiteralArrowPages::new([(1, 2), (0, 0), (3, 1)].into_iter()
+                .map(|(offset, len)| OwnedBatch::new(record.slice(offset, len), &memory))
+                .collect::<Result<_>>()?),
+        })?;
+        let legacy = Relation::new(schema, RelationNode::LiteralPages { pages: vec![
+            vec![vec![Expr::Literal(Value::F64(-0.0))], vec![Expr::Literal(Value::Null)]],
+            vec![],
+            vec![vec![Expr::Literal(Value::F64(bits))]],
+        ] })?;
+        let bytes = serde_json::to_vec(&arrow).unwrap();
+        assert_eq!(bytes, serde_json::to_vec(&legacy).unwrap());
+        let recovered: Relation = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(serde_json::to_vec(&recovered).unwrap(), bytes);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn inspection_output_metadata_reuses_prepacked_literal_text() -> Result<()> {
         use arrow_array::{RecordBatch, StringArray};
