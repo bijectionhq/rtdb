@@ -2673,6 +2673,8 @@ surface QueryAccess {
         -- Supported physical sort keys are read from their vectors in memory and during Arrow spill replay.
         -- Sort type observation can use field metadata for flat keys with known, infallible read types.
         -- A selected page can use the same metadata when its source layouts and reached positions cover every key.
+        -- In a mixed sort tuple, compatible unannotated text and binary keys contribute their observed types and nulls from Arrow positions.
+        -- The sort observes other reached cells in row and key order before checking the comparator.
         -- Compatible Arrow decimal cells supply the same binary64 comparison keys as decoded decimals and retain their original decimal payloads.
         -- A decimal at an active union leg or run end uses its reached logical scale.
         -- A sort can retain comparison keys within its memory grant and reuse them across comparisons in the same block or at the head of a spill run.

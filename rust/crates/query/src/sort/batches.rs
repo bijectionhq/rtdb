@@ -10,11 +10,12 @@ use crate::{
     columnar::{BatchCursor, BoxBatchCursor, Column, ColumnBatch},
     context::Execution,
     invalid,
+    scalar_key::{ScalarColumn, ScalarKey},
     spill::{SpillFile, SpillReader, SpillWriter},
 };
 
 use super::{
-    BLOCK_ROWS, KeyTypes, MERGE_FAN_IN, SortPlan, legacy, native_keys::{self, ByteKey, BytePrefix, NativeOrder}, orders_consistently, select,
+    BLOCK_ROWS, KeyObservation, KeyTypes, MERGE_FAN_IN, SortPlan, legacy, native_keys::{self, ByteKey, BytePrefix, NativeOrder}, orders_consistently, select,
     size_error, timsort,
 };
 
@@ -610,12 +611,27 @@ fn observe_scalar_keys(
     }
     for row in 0..batch.len {
         context.check_cancelled_at(row)?;
-        let _scratch = plan.execution.context.memory.reserve(key_bound(batch, columns, row, size_of::<Value>())?)?;
-        let values = columns.iter().map(|&column| batch.columns[column].expression_value(row, projected, None))
+        let _scratch = context.memory.reserve(key_bound(batch, columns, row, size_of::<KeyObservation>())?)?;
+        let values = columns.iter().map(|&column| observe_key(&batch.columns[column], row, projected))
             .collect::<Result<Vec<_>>>()?;
         types.observe(&values, plan)?;
     }
     Ok(())
+}
+
+fn observe_key(column: &Column, row: usize, projected: bool) -> Result<KeyObservation> {
+    if let Some(Some((array, field, logical, offset))) = column.arrow_cell(row)
+        && matches!(field.data_type(), arrow_schema::DataType::Utf8 | arrow_schema::DataType::Binary)
+        && let Some(reader) = ScalarColumn::bind(array, field, logical)
+    {
+        match reader.read(offset) {
+            ScalarKey::Text(value) => return Ok(KeyObservation::Utf8(value.len())),
+            ScalarKey::Bytes(value) => return Ok(KeyObservation::Binary(value.len())),
+            ScalarKey::Null => return Ok(KeyObservation::Decoded(Value::Null)),
+            _ => (),
+        }
+    }
+    column.expression_value(row, projected, None).map(KeyObservation::Decoded)
 }
 
 fn covered_arrow_key(column: &Column, rows: usize, known: &LogicalType, memory: &Arc<MemoryBudget>) -> bool {
@@ -1169,6 +1185,51 @@ fn declared_arrow_sort_key_types_cover_only_infallible_scalar_reads() {
     assert!(!covered_arrow_key(&invalid, 1, &uri, &memory));
     assert!(invalid.value(0).is_err());
     assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn mixed_sort_observes_byte_keys_without_copying_and_reports_the_reached_uri_error() {
+    use arrow_array::{ArrayRef, BinaryArray, StringArray};
+    use crate::{context::OuterRows, parameters::BoundParameters};
+    use rtdb_plan::{ColumnId, Field};
+
+    let context = super::object_sort_tests::context(ObjectSort::TimSort);
+    let memory = &context.memory;
+    let execution = Execution {
+        parameters: Arc::new(BoundParameters::infer(vec![], memory).unwrap()),
+        outer: OuterRows::empty(memory).unwrap(),
+        context: Arc::clone(&context), bindings: None, analysis: None,
+    };
+    let fields = [ScalarType::Utf8, ScalarType::Binary, ScalarType::Uri].into_iter().enumerate().map(|(index, scalar)| {
+        Field { id: ColumnId(index as u32), name: format!("k{index}"), qualifier: None, qualified_only: false,
+            unnamed: false, data_type: LogicalType::Scalar(scalar).maybe() }
+    }).collect::<Vec<_>>();
+    let order = fields.iter().map(|field| SortExpr { expr: field.expression(), descending: false, nulls_first: false }).collect();
+    let plan = SortPlan { schema: Schema::new(fields.clone()).unwrap(), order, limit: 2, execution };
+    let arrays: [ArrayRef; 3] = [
+        Arc::new(StringArray::from(vec![Some("été"), None])),
+        Arc::new(BinaryArray::from(vec![Some(&[0x00, 0xff][..]), None])),
+        Arc::new(StringArray::from(vec!["http://example.com", "invalid URI"])),
+    ];
+    let columns = fields.iter().zip(arrays).map(|(field, array)| Column::Arrow {
+        array, field: Arc::new(rtdb_columnar::to_field(&field.name, &field.data_type).unwrap()),
+        logical: Some(field.data_type.clone()),
+    }).collect();
+    let batch = ColumnBatch::settled(columns, 2, memory.reserve(4096).unwrap()).unwrap();
+    assert!(matches!(observe_key(&batch.columns[0], 0, true).unwrap(), KeyObservation::Utf8(5)));
+    assert!(matches!(observe_key(&batch.columns[1], 0, true).unwrap(), KeyObservation::Binary(2)));
+    for column in &batch.columns[..2] {
+        let value = column.value(0).unwrap();
+        let observation = observe_key(column, 0, true).unwrap();
+        assert_eq!(observation.logical_type(), value.logical_type());
+        assert_eq!(observation.retained_bytes().unwrap(), value.retained_bytes().unwrap());
+        assert_eq!(observe_key(column, 1, true).unwrap().logical_type(), LogicalType::Null);
+    }
+
+    let mut types = KeyTypes::new(vec![LogicalType::Nothing; 3], &plan).unwrap();
+    let expected = batch.columns[2].value(1).unwrap_err();
+    assert_eq!(observe_scalar_keys(&batch, &[0, 1, 2], true, &mut types, &plan).unwrap_err(), expected);
+    assert_eq!(types.values, batch.columns.iter().map(|column| column.value(0).unwrap().logical_type()).collect::<Vec<_>>());
 }
 
 #[test]
