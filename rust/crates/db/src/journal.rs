@@ -107,6 +107,15 @@ pub(crate) struct CertifiedCheckpoint {
     trim: CheckpointTrim,
 }
 
+impl CertifiedCheckpoint {
+    pub(crate) fn immutable_anchor(&self) -> Option<CheckpointAnchor> {
+        match self.trim {
+            CheckpointTrim::Immutable(anchor) => Some(anchor),
+            CheckpointTrim::Local(_) => None,
+        }
+    }
+}
+
 enum CheckpointTrim {
     Local(Lsn),
     Immutable(CheckpointAnchor),

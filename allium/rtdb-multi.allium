@@ -1208,7 +1208,8 @@ contract PortableApplicationBackup {
         -- Later checkpoints retain the installed file closure.
         -- Installation readback reopens the selected replay checkpoint from its backing store and verifies the installed relocation index and every relocated file named by that checkpoint.
         -- A hosted object-hold check binds the commissioned staged checkpoint, every direct member and the token key envelope to the provider versions that supplied their authenticated ciphertext.
-        -- The hosted attestor also retains the selected checkpoint at the original journal quorum and binds its exact announcement to the installation proof.
+        -- The hosted attestor matches the selected checkpoint announcement and journal head to the authenticated object readback.
+        -- The original journal quorum retains that exact checkpoint announcement before the attestor issues the installation proof.
         -- The activation broker confirms the retained checkpoint through the registered destination reader and records the signed object inventory digest.
         -- An enrolled hosted recovery cannot fall back to an installation without object, journal and key custody.
         -- The check requires an affirmative provider hold for each of those versions and the same staged journal cut at readback.

@@ -329,7 +329,8 @@ Save the JSON result with the archive and the custodian's recovery records.
 Pass it back with `--readback FILE` and the same archive and destination settings to reopen the recorded versions, including when a delete marker or a newer version masks a held object.
 The command checks the complete inventory and journal cut against the saved readback and obtains fresh legal-hold status from S3.
 On Unix, run `rtdb multi-backup attest` with the same archive and destination arguments, the saved readback and stage receipt, and the destination cell's protected Ed25519 PKCS8 signing key and its `--journal-custodian-tls-dir`.
-The hosted attestor reads the selected keeper checkpoint before reopening the serving object names.
+The hosted attestor matches the selected keeper checkpoint's announcement position, covered position and ciphertext digest to the authenticated replay checkpoint.
+The attestor checks that the journal head still matches the object readback before asking the quorum to retain the checkpoint.
 The original journal quorum must retain that checkpoint before the attestor issues the combined proof.
 Register the destination's journal reader with the broker and set `require_object_custody` for the cell.
 The broker confirms the exact keeper hold and records the signed object inventory digest.

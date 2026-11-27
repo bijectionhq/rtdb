@@ -1,6 +1,6 @@
 use std::{ops::AsyncFnOnce, sync::Arc};
 
-use journal_contract::Lsn;
+use journal_contract::{CheckpointAnchor, Lsn};
 use rtdb_crypt::{Context, Generation, Kms, RecoveryKeyHold};
 use rtdb_format::journal::{Checkpoint, Manifest, ObjectId, Record};
 use rtdb_index::branches::BranchCut;
@@ -113,6 +113,7 @@ pub struct InstalledBackup {
 pub struct BackupObjectReadback {
     pub installation: InstalledBackup,
     pub journal_head: Lsn,
+    pub journal_anchor: Option<CheckpointAnchor>,
     pub checkpoint: ObjectId,
     pub generation: Generation,
     pub versions: Vec<PhysicalObjectVersion>,
@@ -376,13 +377,18 @@ impl MultiDatabase {
             }
         }
         versions.push(self.token_keys.check_object_hold(checkpoint.key_generation, kms, holds).await?);
+        let journal_anchor = if let Some(base) = &self.state().base {
+            self.stream.certify_checkpoint(base, head).await?.immutable_anchor()
+        } else {
+            None
+        };
         self.refresh().await?;
         if self.state().head != head || self.staged_backup_checkpoint()? != &checkpoint {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb/backup-installation-changed",
                 "The staged backup changed during the object hold readback"));
         }
         Ok(BackupObjectReadback {
-            installation: installed, journal_head: head, checkpoint: checkpoint.manifest,
+            installation: installed, journal_head: head, journal_anchor, checkpoint: checkpoint.manifest,
             generation: manifest.generation, versions,
         })
     }

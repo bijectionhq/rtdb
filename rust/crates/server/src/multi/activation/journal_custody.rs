@@ -1,7 +1,7 @@
 use std::{path::Path, sync::Arc, time::Duration};
 
 use journal_contract::{
-    CheckpointAnchor, CheckpointCustody, CheckpointHold, Journal, JournalError, StreamId,
+    CheckpointAnchor, CheckpointCustody, CheckpointHold, Journal, JournalError, Lsn, StreamId,
 };
 use ring::signature::{ED25519, UnparsedPublicKey};
 use rtdb_crypt::RecoveryKeyHold;
@@ -150,6 +150,23 @@ impl KeeperJournal {
     }
 
     pub(in crate::multi) async fn selected(&self, candidate: Uuid) -> Result<JournalEvidence> {
+        Ok(self.observe_selection(candidate).await?.0)
+    }
+
+    pub(in crate::multi) async fn selected_for_readback(
+        &self,
+        candidate: Uuid,
+        head: Lsn,
+        anchor: CheckpointAnchor,
+    ) -> Result<JournalEvidence> {
+        let (selected, observed_head) = self.observe_selection(candidate).await?;
+        if selected.anchor != anchor || observed_head != head {
+            return Err(conflict());
+        }
+        Ok(selected)
+    }
+
+    async fn observe_selection(&self, candidate: Uuid) -> Result<(JournalEvidence, Lsn)> {
         let stream = StreamId(candidate.as_u128());
         let receipt = self
             .journal
@@ -169,14 +186,14 @@ impl KeeperJournal {
         if *found != at || page.floor != receipt.logical_floor_lsn || page.head < at {
             return Err(conflict());
         }
-        Ok(JournalEvidence {
+        Ok((JournalEvidence {
             connection_sha256: self.connection_sha256,
             anchor: CheckpointAnchor {
                 announced_at: at,
                 covered_through: receipt.covered_through_lsn,
                 record_sha256: Sha256::digest(bytes).into(),
             },
-        })
+        }, page.head))
     }
 
     pub(in crate::multi) async fn retain(
