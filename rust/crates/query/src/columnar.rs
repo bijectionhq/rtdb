@@ -1410,18 +1410,26 @@ impl ColumnBatch {
         Ok(Self { columns, len: self.len, reservation, appended })
     }
 
-    pub(crate) fn spill_record(&self, schema: &rtdb_plan::Schema, memory: &Arc<MemoryBudget>) -> Result<Option<rtdb_columnar::OwnedBatch>> {
-        self.physical_record(schema, memory)?.map(|(batch, allocation)| rtdb_columnar::OwnedBatch::with_reservation(batch, allocation)).transpose()
+    pub(crate) fn with_spill_record(&self, schema: &rtdb_plan::Schema, memory: &Arc<MemoryBudget>,
+        write: impl FnOnce(&arrow_array::RecordBatch) -> Result<()>) -> Result<bool> {
+        let Some((record, _scratch)) = self.prepare_physical_record(schema, memory, true)? else { return Ok(false); };
+        write(&record)?;
+        Ok(true)
     }
 
     pub(crate) fn physical_record(&self, schema: &rtdb_plan::Schema, memory: &Arc<MemoryBudget>)
+        -> Result<Option<(arrow_array::RecordBatch, Arc<MemoryReservation>)>> {
+        self.prepare_physical_record(schema, memory, false)
+    }
+
+    fn prepare_physical_record(&self, schema: &rtdb_plan::Schema, memory: &Arc<MemoryBudget>, for_spill: bool)
         -> Result<Option<(arrow_array::RecordBatch, Arc<MemoryReservation>)>> {
         if self.columns.len() != schema.len() { return Ok(None); }
         let mut reservation = memory.reserve(crate::runtime_schema::schema_bound(schema)?.checked_add(8192).ok_or_else(size_error)?)?;
         let mut fields = Vec::with_capacity(self.columns.len());
         let mut arrays = Vec::with_capacity(self.columns.len());
         for (column, output) in self.columns.iter().zip(schema.fields()) {
-            let (vector, _scratch) = match column {
+            let (vector, scratch) = match column {
                 Column::Arrow { array, field, logical } => ((Arc::clone(array), Arc::clone(field), logical.clone()), None),
                 Column::Selected(selected) => match selected.uniform_fragment_vector(0..self.len, memory)? {
                     Some((vector, scratch)) => (vector, Some(scratch)),
@@ -1437,8 +1445,16 @@ impl ColumnBatch {
             if !logical.as_ref().is_some_and(|logical| *logical != LogicalType::Nothing && stable_read_layout(logical, &field)) {
                 return Ok(None);
             }
-            let bytes = array.get_array_memory_size().checked_add(field.size()).ok_or_else(size_error)?;
             let lease = Arc::get_mut(&mut reservation).expect("The spill page owns its reservation");
+            let bytes = if for_spill {
+                // The writer borrows this page, so only its new arrays and field descriptors need a charge here.
+                if let Some(mut scratch) = scratch {
+                    lease.absorb(Arc::get_mut(&mut scratch).expect("A newly packed vector owns its reservation"))?;
+                }
+                field.size()
+            } else {
+                array.get_array_memory_size().checked_add(field.size()).ok_or_else(size_error)?
+            };
             lease.grow_to(lease.bytes().checked_add(bytes).ok_or_else(size_error)?)?;
             fields.push(field.as_ref().clone().with_name(output.name.clone()));
             arrays.push(array);

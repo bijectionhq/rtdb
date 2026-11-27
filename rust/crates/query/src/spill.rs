@@ -229,8 +229,7 @@ impl SpillWriter {
         })
     }
 
-    fn write_arrow(&mut self, marker: Option<u8>, batch: &OwnedBatch, schema_bytes: usize, memory: &Arc<MemoryBudget>, error: &str) -> Result<()> {
-        let batch = batch.batch();
+    fn write_arrow(&mut self, marker: Option<u8>, batch: &RecordBatch, schema_bytes: usize, memory: &Arc<MemoryBudget>, error: &str) -> Result<()> {
         const MESSAGE_PREFIX_BYTES: usize = 8;
         const END_MARKER: [u8; MESSAGE_PREFIX_BYTES] = [0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0];
         let ipc_error = |cause| match cause {
@@ -279,9 +278,11 @@ impl SpillWriter {
     /// otherwise as its fragments. A budget or quota that cannot hold the page fails the query.
     pub fn write_columns(&mut self, batch: &ColumnBatch, schema: &rtdb_plan::Schema, memory: &Arc<MemoryBudget>) -> Result<()> {
         if batch.len == 0 { return self.write_frame(&[0]); }
-        if let Some(record) = batch.spill_record(schema, memory)? {
+        if batch.with_spill_record(schema, memory, |record| {
             let schema_bytes = crate::runtime_schema::schema_bound(schema)?;
-            return self.write_arrow(Some(1), &record, schema_bytes, memory, "spill-columns");
+            self.write_arrow(Some(1), record, schema_bytes, memory, "spill-columns")
+        })? {
+            return Ok(());
         }
         let mut fragments = FragmentBytes::new(memory)?;
         encode_batch(batch, memory, &mut fragments)?;
@@ -666,8 +667,8 @@ fn homogeneous_spill_writes_exact_ipc_framing_and_checks_quota_before_writing() 
 
     let spill = Arc::new(SpillRegion::new(size).unwrap());
     let mut writer = spill.create().unwrap();
-    writer.write_arrow(None, &batch, 0, &memory, "spill-columns").unwrap();
-    assert_eq!(writer.write_arrow(None, &batch, 0, &memory, "spill-columns").unwrap_err().code, "rtdb.query/spill-limit");
+    writer.write_arrow(None, batch.batch(), 0, &memory, "spill-columns").unwrap();
+    assert_eq!(writer.write_arrow(None, batch.batch(), 0, &memory, "spill-columns").unwrap_err().code, "rtdb.query/spill-limit");
     assert_eq!(writer.position().unwrap(), size);
     assert_eq!(spill.retained_bytes(), size);
     let mut reader = writer.finish().unwrap().test_reader(&memory).unwrap();
@@ -690,6 +691,61 @@ fn a_zero_spill_quota_refuses_the_first_byte_as_an_exceeded_temporary_file_limit
         drop(writer);
         assert_eq!(spill.retained_bytes(), 0);
     }
+}
+
+#[test]
+fn column_spill_lends_funded_nested_payloads_to_the_writer() {
+    use crate::columnar::Column;
+    use arrow_ipc::writer::StreamWriter;
+    use rtdb_plan::{Binder, Schema};
+    use rtdb_types::{LogicalType, ScalarType, Value};
+
+    let memory = MemoryBudget::new(2 << 20);
+    let replay_memory = MemoryBudget::new(32 << 20);
+    let ty = LogicalType::list(LogicalType::Scalar(ScalarType::Binary));
+    let value = Value::list(vec![Value::Binary(vec![47; 1 << 20])]);
+    let field = rtdb_columnar::to_field("input", &ty).unwrap()
+        .with_metadata([("label".into(), "payload".into())].into());
+    let array = rtdb_columnar::build_array(&ty, std::slice::from_ref(&value)).unwrap();
+    let source = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(vec![field.clone()])), vec![array]).unwrap();
+    let batch = ColumnBatch::from_owned(OwnedBatch::new(source.clone(), &memory).unwrap()).unwrap();
+    let schema = Schema::new(vec![Binder::default().field("output", None, ty).unwrap()]).unwrap();
+    let retained = memory.used_bytes();
+    assert!(retained > 1 << 20);
+
+    let expected_field = field.with_name("output");
+    let expected = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(vec![expected_field.clone()])), source.columns().to_vec()).unwrap();
+    let mut reference = StreamWriter::try_new(Vec::new(), expected.schema_ref()).unwrap();
+    reference.write(&expected).unwrap();
+    let bytes = reference.into_inner().unwrap();
+    let size = bytes.len() as u64 + 17;
+
+    let spill = Arc::new(SpillRegion::new(size + 9).unwrap());
+    let mut writer = spill.create().unwrap();
+    writer.write_columns(&batch, &schema, &memory).unwrap();
+    assert_eq!(writer.write_columns(&batch, &schema, &memory).unwrap_err().code, "rtdb.query/spill-limit");
+    assert_eq!(writer.position().unwrap(), size);
+    assert_eq!(spill.peak_bytes(), size);
+    assert_eq!(memory.used_bytes(), retained);
+    drop(batch);
+    assert_eq!(memory.used_bytes(), 0);
+
+    let file = writer.finish().unwrap();
+    let mut reader = file.test_reader(&replay_memory).unwrap();
+    assert_eq!(reader.read_frame(1).unwrap().unwrap().0, [1]);
+    assert_eq!(reader.read_frame(1).unwrap().unwrap().0, bytes);
+    reader.rewind().unwrap();
+    let page = reader.read_columns(1).unwrap().unwrap();
+    let Column::Arrow { array, field, .. } = &page.columns[0] else { panic!("Expected a single Arrow record") };
+    assert_eq!(field.as_ref(), &expected_field);
+    assert_eq!(page.columns[0].value(0).unwrap(), value);
+    assert!(reader.read_columns(1).unwrap().is_none());
+    let array = Arc::clone(array);
+    drop((page, reader, file));
+    assert_eq!(spill.retained_bytes(), 0);
+    assert!(replay_memory.used_bytes() > 1 << 20);
+    drop(array);
+    assert_eq!(replay_memory.used_bytes(), 0);
 }
 
 #[test]
@@ -722,8 +778,8 @@ fn homogeneous_spill_streams_exact_ipc_with_only_span_scratch() {
 
     let spill = Arc::new(SpillRegion::new(size + 9).unwrap());
     let mut writer = spill.create().unwrap();
-    writer.write_arrow(Some(1), &batch, 0, &scratch, "spill-columns").unwrap();
-    let error = writer.write_arrow(Some(1), &batch, 0, &scratch, "spill-columns").unwrap_err();
+    writer.write_arrow(Some(1), batch.batch(), 0, &scratch, "spill-columns").unwrap();
+    let error = writer.write_arrow(Some(1), batch.batch(), 0, &scratch, "spill-columns").unwrap_err();
     assert_eq!(error.code, "rtdb.query/spill-limit");
     assert_eq!(writer.position().unwrap(), size);
     assert_eq!(spill.retained_bytes(), size);
@@ -753,7 +809,7 @@ fn homogeneous_spill_preserves_unused_bits_in_aligned_bitmap_slices() {
         let batch = OwnedBatch::new(record, &memory).unwrap();
         let mut reference = StreamWriter::try_new(Vec::new(), batch.batch().schema_ref()).unwrap();
         reference.write(batch.batch()).unwrap();
-        writer.write_arrow(None, &batch, 0, &memory, "spill-columns").unwrap();
+        writer.write_arrow(None, batch.batch(), 0, &memory, "spill-columns").unwrap();
         reference.into_inner().unwrap()
     }).collect::<Vec<_>>();
     let mut reader = writer.finish().unwrap().test_reader(&memory).unwrap();

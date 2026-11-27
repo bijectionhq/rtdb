@@ -66,7 +66,7 @@ impl RecordSpans {
             DataType::Utf8 | DataType::Binary => {
                 let offsets = &data.buffer::<i32>(0)[..=rows];
                 if offsets[0] != 0 {
-                    return self.offset_column::<i32>(std::slice::from_ref(data), rows);
+                    return self.offset_column::<i32>(std::slice::from_ref(data), rows, false);
                 }
                 let width = size_of::<i32>();
                 self.buffers.push(vec![data.buffers()[0].slice_with_length(
@@ -100,7 +100,7 @@ impl RecordSpans {
             return Ok(None);
         }
         drop(layout);
-        Self::concat(&[batch], alignment, memory)
+        Self::plan(&[batch], alignment, memory, true)
     }
 
     /// Plans one record with the same logical buffers as concatenating the input pages.
@@ -108,6 +108,10 @@ impl RecordSpans {
     pub fn concat(
         pages: &[&RecordBatch], alignment: usize, memory: &Arc<MemoryBudget>,
     ) -> Result<Option<Self>> {
+        Self::plan(pages, alignment, memory, false)
+    }
+
+    fn plan(pages: &[&RecordBatch], alignment: usize, memory: &Arc<MemoryBudget>, exact: bool) -> Result<Option<Self>> {
         let Some(first) = pages.first() else { return Ok(None) };
         if !matches!(alignment, 8 | 64) {
             return Err(invalid("Unsupported Arrow record span alignment"));
@@ -115,7 +119,7 @@ impl RecordSpans {
         if pages.iter().any(|page| page.schema_ref() != first.schema_ref()) {
             return Ok(None);
         }
-        if !first.schema_ref().fields().iter().all(|field| supported(field.data_type())) {
+        if !exact && !first.schema_ref().fields().iter().all(|field| supported(field.data_type())) {
             return Ok(None);
         }
         let schema_bound = schema_translation_bound(first.schema_ref())?;
@@ -146,12 +150,7 @@ impl RecordSpans {
         };
         let charge = Arc::get_mut(&mut self.charge).expect("Arrow span planning owns its reservation");
         let descriptors = allocation_add(4096, allocation_mul(sources.len(), 512)?)?;
-        let scratch = match data_type {
-            DataType::Utf8 | DataType::Binary | DataType::List(_) => allocation_mul(allocation_add(rows, 1)?, 4)?,
-            DataType::LargeUtf8 | DataType::LargeBinary | DataType::LargeList(_) => allocation_mul(allocation_add(rows, 1)?, 8)?,
-            DataType::Boolean => rows.div_ceil(8),
-            _ => 0,
-        };
+        let scratch = if data_type == &DataType::Boolean { rows.div_ceil(8) } else { 0 };
         let bound = allocation_add(descriptors, allocation_add(scratch, rows.div_ceil(8))?)?;
         charge.grow_to(allocation_add(charge.bytes(), bound)?)?;
         self.nodes.push(arrow_ipc::FieldNode::new(
@@ -182,10 +181,10 @@ impl RecordSpans {
                 }
                 self.buffers.push(vec![bits.finish().into_inner()]);
             }
-            DataType::Utf8 | DataType::Binary | DataType::List(_) =>
-                return self.offset_column::<i32>(sources, rows),
+            DataType::Utf8 | DataType::Binary | DataType::List(_) | DataType::Map(_, _) =>
+                return self.offset_column::<i32>(sources, rows, true),
             DataType::LargeUtf8 | DataType::LargeBinary | DataType::LargeList(_) =>
-                return self.offset_column::<i64>(sources, rows),
+                return self.offset_column::<i64>(sources, rows, true),
             DataType::Struct(fields) => {
                 for index in 0..fields.len() {
                     let children = sources.iter().map(|source| source.child_data()[index].clone()).collect::<Vec<_>>();
@@ -215,31 +214,48 @@ impl RecordSpans {
         Ok(true)
     }
 
-    fn offset_column<O: OffsetSizeTrait>(&mut self, sources: &[ArrayData], rows: usize) -> Result<bool> {
-        let mut offsets = Vec::<O>::with_capacity(allocation_add(rows, 1)?);
-        offsets.push(O::usize_as(0));
+    fn offset_column<O: OffsetSizeTrait>(&mut self, sources: &[ArrayData], rows: usize, reserve_offsets: bool) -> Result<bool> {
+        let count = allocation_add(rows, 1)?;
+        let bytes = allocation_mul(count, size_of::<O>())?;
+        let shared = match sources {
+            [source] if !source.is_empty() && source.buffer::<O>(0)[0].as_usize() == 0 => Some(
+                source.buffers()[0].slice_with_length(allocation_mul(source.offset(), size_of::<O>())?, bytes),
+            ),
+            _ => None,
+        };
+        let mut offsets = Vec::<O>::new();
+        if shared.is_none() {
+            if reserve_offsets {
+                let charge = Arc::get_mut(&mut self.charge).expect("Arrow span planning owns its reservation");
+                charge.grow_to(allocation_add(charge.bytes(), bytes)?)?;
+            }
+            offsets.reserve_exact(count);
+            offsets.push(O::usize_as(0));
+        }
         let mut length = 0;
-        let list = matches!(sources[0].data_type(), DataType::List(_) | DataType::LargeList(_));
+        let has_child = matches!(sources[0].data_type(), DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _));
         let mut values = Vec::with_capacity(sources.len());
         let mut children = Vec::new();
         for source in sources {
             let source_offsets = &source.buffer::<O>(0)[..=source.len()];
             let start = source_offsets[0].as_usize();
-            for offset in &source_offsets[1..] {
-                let rebased = allocation_add(length, offset.as_usize() - start)?;
-                let Some(rebased) = O::from_usize(rebased) else { return Ok(false) };
-                offsets.push(rebased);
+            if shared.is_none() {
+                for offset in &source_offsets[1..] {
+                    let rebased = allocation_add(length, offset.as_usize() - start)?;
+                    let Some(rebased) = O::from_usize(rebased) else { return Ok(false) };
+                    offsets.push(rebased);
+                }
             }
             let size = source_offsets[source.len()].as_usize() - start;
             length = allocation_add(length, size)?;
-            if list {
+            if has_child {
                 children.push(source.child_data()[0].slice(start, size));
             } else {
                 values.push(source.buffers()[1].slice_with_length(start, size));
             }
         }
-        self.buffers.push(vec![Buffer::from_vec(offsets)]);
-        if list {
+        self.buffers.push(vec![shared.unwrap_or_else(|| Buffer::from_vec(offsets))]);
+        if has_child {
             self.column(&children)
         } else {
             self.buffers.push(values);
@@ -340,7 +356,7 @@ fn exact_span_layout(data: &ArrayData, start: usize, len: usize) -> bool {
     match data.data_type() {
         DataType::Boolean => span_bitmap_matches(&data.buffers()[0], offset, len),
         DataType::Struct(_) => data.child_data().iter().all(|child| exact_span_layout(child, start, len)),
-        DataType::List(_) => exact_span_list::<i32>(data, start, len),
+        DataType::List(_) | DataType::Map(_, _) => exact_span_list::<i32>(data, start, len),
         DataType::LargeList(_) => exact_span_list::<i64>(data, start, len),
         DataType::FixedSizeList(_, width) => {
             let width = *width as usize;
@@ -383,6 +399,89 @@ mod tests {
     use super::*;
     use arrow_array::{ArrayRef, BooleanArray, Int32Array, ListArray, StringArray, types::Int32Type};
     use arrow_ipc::writer::CompressionContext;
+
+    #[test]
+    fn exact_spans_borrow_zero_based_nested_offsets_and_rebase_other_slices() {
+        use arrow_array::Array;
+        use arrow_buffer::OffsetBuffer;
+        use arrow_schema::Field;
+
+        let item = Arc::new(Field::new("item", DataType::Utf8, true)
+            .with_metadata([("unit".into(), "name".into())].into()));
+        let list = Arc::new(ListArray::new(item, OffsetBuffer::new(vec![0, 1, 2, 3].into()),
+            Arc::new(StringArray::from(vec![Some("first"), Some("last"), None])), None));
+        let data = list.to_data();
+        let offsets = [data.buffers()[0].as_ptr(), data.child_data()[0].buffers()[0].as_ptr()];
+        let page = RecordBatch::try_from_iter([("items", list as ArrayRef)]).unwrap();
+        let memory = MemoryBudget::new(1 << 20);
+        let options = IpcWriteOptions::try_new(64, false, MetadataVersion::V5).unwrap();
+
+        for (start, len) in [(0, 3), (0, 2), (1, 2), (2, 0)] {
+            let page = page.slice(start, len);
+            let spans = RecordSpans::exact(&page, 64, &memory).unwrap().unwrap();
+            for (buffer, offset) in [1, 3].into_iter().zip(offsets) {
+                assert_eq!(spans.buffers[buffer][0].as_ptr() == offset, start == 0 && len != 0);
+            }
+            let (_, ordinary) = IpcDataGenerator::default().encode(
+                &page, &mut DictionaryTracker::new(false), &options, &mut CompressionContext::default(),
+            ).unwrap();
+            let (metadata, _) = spans.metadata().unwrap();
+            let mut body = Vec::new();
+            spans.write_body(&mut body).unwrap();
+            assert_eq!(metadata, ordinary.ipc_message);
+            assert_eq!(body, ordinary.arrow_data);
+        }
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn exact_spans_keep_only_the_selected_map_entries_in_ordinary_ipc() {
+        use arrow_array::{Array, builder::{BinaryBuilder, MapBuilder, StringBuilder}};
+
+        let mut map = MapBuilder::new(None, StringBuilder::new(), BinaryBuilder::new());
+        for (key, value) in [("before", b"skip".as_slice()), ("selected", b"keep"), ("after", b"skip")] {
+            map.keys().append_value(key);
+            map.values().append_value(value);
+            map.append(true).unwrap();
+        }
+        let map = map.finish();
+        let data = map.to_data();
+        let selected_values = data.child_data()[0].child_data()[1].buffers()[1].slice(4);
+        let page = RecordBatch::try_from_iter([("entries", Arc::new(map) as ArrayRef)]).unwrap().slice(1, 1);
+        let memory = MemoryBudget::new(1 << 20);
+        let spans = RecordSpans::exact(&page, 64, &memory).unwrap().unwrap();
+        assert!(spans.buffers.iter().flatten().any(|buffer| buffer.as_ptr() == selected_values.as_ptr() && buffer.len() == 4));
+
+        let options = IpcWriteOptions::try_new(64, false, MetadataVersion::V5).unwrap();
+        let (_, ordinary) = IpcDataGenerator::default().encode(
+            &page, &mut DictionaryTracker::new(false), &options, &mut CompressionContext::default(),
+        ).unwrap();
+        let (metadata, _) = spans.metadata().unwrap();
+        let mut body = Vec::new();
+        spans.write_body(&mut body).unwrap();
+        assert_eq!(metadata, ordinary.ipc_message);
+        assert_eq!(body, ordinary.arrow_data);
+    }
+
+    #[test]
+    fn ordered_leaf_rebases_offsets_under_its_callers_shared_grant() {
+        let array = Arc::new(StringArray::from(vec!["before", "inside", "after"])) as ArrayRef;
+        let page = RecordBatch::try_from_iter([("value", array)]).unwrap().slice(1, 1);
+        let memory = MemoryBudget::new(64 << 10);
+        let grant = memory.reserve(memory.limit_bytes()).unwrap();
+        let spans = RecordSpans::ordered_leaf(&page, Arc::clone(&grant)).unwrap().unwrap();
+        assert_eq!(memory.used_bytes(), grant.bytes());
+
+        let options = IpcWriteOptions::try_new(16, false, MetadataVersion::V5).unwrap();
+        let (_, ordinary) = IpcDataGenerator::default().encode(
+            &page, &mut DictionaryTracker::new(false), &options, &mut CompressionContext::default(),
+        ).unwrap();
+        let (metadata, _) = spans.metadata().unwrap();
+        let mut body = Vec::new();
+        spans.write_body(&mut body).unwrap();
+        assert_eq!(metadata, ordinary.ipc_message);
+        assert_eq!(body, ordinary.arrow_data);
+    }
 
     #[test]
     fn spans_match_one_concatenated_record_and_its_canonical_stream() {

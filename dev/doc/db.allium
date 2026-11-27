@@ -2502,6 +2502,7 @@ surface QueryAccess {
         -- An Arrow equijoin uses the raw vector hash of compatible floating-point list keys and compares their selected components.
         -- Join, sort, membership, and materialized-relation spills replay Arrow batches under the query's spill budget, which is unlimited by default and refuses bytes past any configured limit (including zero).
         -- Each spilled page is written whole under its encoding reservation, and a budget or quota refusal fails the query.
+        -- A single-record column spill borrows already funded input vectors and holds newly packed vectors under their encoding charge until the write completes.
         -- Replay checks for query and owner cancellation before each reached spill frame and between bounded reads of its body.
         -- Compatible mixed-layout spill vectors retain their charged IPC body storage through replay.
         -- A replayed fragment shares the decoded buffers' existing admission, and a nested fragment column selects its complete decoded span.
@@ -2628,6 +2629,7 @@ surface QueryAccess {
         -- Each fragment frame builds its own wire field descriptors, and frame boundaries are chosen up front (including at run-end selection width limits) so a memory refusal fails the query.
         -- Compatible contiguous nested selections keep their funded source buffers through reply encoding even across frame splits.
         -- Reply encoding admits the selected nested spans and any rebased offsets before writing the frame.
+        -- A compatible IPC record can borrow zero-based offset buffers and selected value buffers, including map entries.
         -- A fragment vector that borrows its reply's IPC body keeps the reply allocation charged through its last use.
         -- A delegated reader restores literal expressions from the fragment's Arrow argument page.
         -- The literal page preserves full-width time values, decimal coefficients and their declared types until expression evaluation.
