@@ -1,7 +1,7 @@
 -- allium: 3
 -- pgsrc.allium
 --
--- Scope: PostgreSQL source confirmation and native mirror ingestion.
+-- Scope: PostgreSQL source configuration, confirmation and native mirror ingestion.
 -- The confirmation rules track received and recoverable positions, redelivery, failed imports, and stream reopening.
 -- XTDB's processing model is specified in db.allium.
 -- Type mappings, TOAST and replica-identity constraints, and slot and publication creation are outside this scope.
@@ -341,6 +341,11 @@ surface TargetIngestion {
 
     contracts:
         demands TargetDurability
+
+    @guarantee NodeLocalPostgresRemote
+        -- The durable source configuration carries the remote alias, and the ingesting node supplies the connection settings and credentials.
+        -- Preparing the source with an absent alias returns xtdb.postgres/missing-remote with the alias.
+        -- Preparing the source with an alias of a different remote type returns xtdb.postgres/wrong-remote-type with the alias and actualType.
 
     @guarantee SnapshotCompletionBarrier
         -- The target applies all snapshot batches before the completed import token becomes applied progress.

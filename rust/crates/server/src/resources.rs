@@ -112,15 +112,24 @@ pub fn open_backend_resources(config: &NodeConfiguration, memory: &Arc<MemoryBud
     { resources = resources.with_gcs()?; }
     #[cfg(feature = "pg-source")]
     {
-        let remotes = config.remotes.iter().filter_map(|(name, remote)| match remote {
-            RemoteConfig::Postgres { hostname, port, database, username, password } => {
-                let mut remote = rtdb_pg_source::Remote::new(hostname.clone(), database.clone(), username.clone(), password.expose().into());
-                remote.port = *port;
-                Some((name.clone(), remote))
-            }
-            _ => None,
+        use rtdb_node::{PostgresSourceFactory, PostgresSourceRemote};
+
+        let remotes = config.remotes.iter().map(|(name, remote)| {
+            let entry = match remote {
+                RemoteConfig::Postgres { hostname, port, database, username, password } => {
+                    let mut remote = rtdb_pg_source::Remote::new(hostname.clone(), database.clone(), username.clone(), password.expose().into());
+                    remote.port = *port;
+                    PostgresSourceRemote::Postgres(remote)
+                }
+                RemoteConfig::Kafka { .. } => PostgresSourceRemote::Other("KafkaCluster"),
+                RemoteConfig::S3 { .. } => PostgresSourceRemote::Other("S3Remote"),
+                RemoteConfig::Azure { .. } => PostgresSourceRemote::Other("AzureRemote"),
+            };
+            (name.clone(), entry)
         }).collect();
-        sources.insert("xtdb.postgres.proto.PostgresSourceConfig".into(), Arc::new(rtdb_node::PostgresSourceFactory::new(remotes, Arc::clone(memory))?.with_metrics(metrics.clone())));
+        let factory = PostgresSourceFactory::from_remote_registry(remotes, Arc::clone(memory))?
+            .with_metrics(metrics.clone());
+        sources.insert("xtdb.postgres.proto.PostgresSourceConfig".into(), Arc::new(factory));
     }
     Ok((resources, sources, registrations))
 }

@@ -91,6 +91,11 @@ remotes:
     password: !Env PG_PASSWORD
 ```
 
+Set `externalSource.remote` to the alias of a `!Postgres` entry on each node that can ingest the source.
+The durable database configuration stores the alias, and the node configuration holds the credentials.
+If source opening reports `xtdb.postgres/missing-remote`, add the alias under `remotes` on the ingesting node.
+If it reports `xtdb.postgres/wrong-remote-type`, the alias belongs to another kind of remote, reported as `actualType` in the error context.
+
 ## Phases
 
 This external source works in two phases:

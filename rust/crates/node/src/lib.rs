@@ -18,7 +18,7 @@ pub use health::{HealthChecks, HealthResponse};
 #[cfg(feature = "pg-source")]
 mod postgres;
 #[cfg(feature = "pg-source")]
-pub use postgres::{PostgresIndexerFactory, PostgresSourceFactory};
+pub use postgres::{PostgresIndexerFactory, PostgresSourceFactory, PostgresSourceRemote};
 #[cfg(feature = "kafka-connect")]
 mod kafka_connect;
 #[cfg(feature = "kafka-connect")]

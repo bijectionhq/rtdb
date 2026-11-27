@@ -17,8 +17,15 @@ pub trait PostgresIndexerFactory: Send + Sync {
     fn open(&self, configuration: &Any) -> Result<Arc<dyn PgIndexer>>;
 }
 
+/// A node-local remote as seen by the PostgreSQL source factory.
+pub enum PostgresSourceRemote {
+    Postgres(Remote),
+    /// The remote type name reported to clients. Its provider owns the connection settings.
+    Other(&'static str),
+}
+
 pub struct PostgresSourceFactory {
-    remotes: BTreeMap<String, Remote>,
+    remotes: BTreeMap<String, PostgresSourceRemote>,
     indexers: BTreeMap<String, Arc<dyn PostgresIndexerFactory>>,
     memory: Arc<MemoryBudget>,
     metrics: Option<Arc<dyn SourceMetricsFactory>>,
@@ -26,7 +33,17 @@ pub struct PostgresSourceFactory {
 impl PostgresSourceFactory {
     /// Remote credentials remain in this node-local registry; durable source messages contain aliases only.
     pub fn new(remotes: BTreeMap<String, Remote>, memory: Arc<MemoryBudget>) -> Result<Self> {
-        for remote in remotes.values() { remote.validate()?; }
+        let remotes = remotes.into_iter().map(|(alias, remote)| (alias, PostgresSourceRemote::Postgres(remote))).collect();
+        Self::from_remote_registry(remotes, memory)
+    }
+
+    /// Accepts all configured aliases and validates PostgreSQL connection settings without opening connections.
+    pub fn from_remote_registry(remotes: BTreeMap<String, PostgresSourceRemote>, memory: Arc<MemoryBudget>) -> Result<Self> {
+        for remote in remotes.values() {
+            if let PostgresSourceRemote::Postgres(remote) = remote {
+                remote.validate()?;
+            }
+        }
         Ok(Self { remotes, indexers: BTreeMap::new(), memory, metrics: None })
     }
     pub fn with_metrics(mut self, metrics: Arc<dyn SourceMetricsFactory>) -> Self { self.metrics = Some(metrics); self }
@@ -35,15 +52,26 @@ impl PostgresSourceFactory {
         self.indexers.insert(protobuf_type_url, factory);
         Ok(self)
     }
-    fn configuration(&self, configuration: &Any) -> Result<SourceConfig> {
+    fn configuration(&self, configuration: &Any) -> Result<(SourceConfig, &Remote)> {
         let source = SourceConfig::decode(configuration)?;
-        if !self.remotes.contains_key(&source.remote) { return Err(invalid(format!("No PostgreSQL remote configured with alias '{}'", source.remote))); }
+        let alias = source.remote.as_str();
+        let remote = match self.remotes.get(alias) {
+            Some(PostgresSourceRemote::Postgres(remote)) => remote,
+            Some(&PostgresSourceRemote::Other(actual_type)) => return Err(Anomaly::incorrect(
+                "xtdb.postgres/wrong-remote-type",
+                format!("remote '{alias}' is a {actual_type}, expected a !Postgres remote"),
+            ).with_context("alias", alias.into()).with_context("actualType", actual_type.into())),
+            None => return Err(Anomaly::incorrect(
+                "xtdb.postgres/missing-remote",
+                format!("no remote configured with alias '{alias}' — add a '!Postgres' entry under 'remotes:' in node config"),
+            ).with_context("alias", alias.into())),
+        };
         if let Some(indexer) = &source.indexer {
             if indexer.type_url != DIRECT_MIRROR_TYPE {
                 self.indexers.get(&indexer.type_url).ok_or_else(|| invalid(format!("No native PostgreSQL indexer registered for '{}'", indexer.type_url)))?.validate(indexer)?;
             }
         }
-        Ok(source)
+        Ok((source, remote))
     }
 }
 #[async_trait]
@@ -51,8 +79,7 @@ impl ExternalSourceFactory for PostgresSourceFactory {
     fn validate(&self, configuration: &Any) -> Result<()> { self.configuration(configuration).map(|_| ()) }
     async fn open(&self, configuration: &Any, database: &str, _: Arc<rtdb_storage::IoRegion>) -> Result<Box<dyn ExternalSource>> {
         let configuration_charge = self.memory.reserve(configuration.value.len().checked_mul(512).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(allocation_overflow)?)?;
-        let source = self.configuration(configuration)?;
-        let remote = self.remotes.get(&source.remote).ok_or_else(|| invalid("PostgreSQL remote is absent"))?;
+        let (source, remote) = self.configuration(configuration)?;
         let remote_bound = [&remote.hostname, &remote.database, &remote.username, &remote.password].into_iter().try_fold(4096usize, |bytes, value| bytes.checked_add(value.len()).ok_or_else(allocation_overflow))?;
         let remote_charge = self.memory.reserve(remote_bound)?;
         let remote = remote.clone();
