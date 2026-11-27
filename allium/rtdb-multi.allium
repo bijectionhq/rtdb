@@ -423,7 +423,9 @@ contract CellMap {
         -- Publication compares that same binding, verifies the installed successor, and measures a full conservative grant window after observing the committed closure.
         -- The successor's identity is derived from the name, next activation revision and recovery operation.
         -- The local activation broker authenticates operator peers and owns its journal writer credential.
-        -- Broker publication verifies its configured destination and takes the expected binding and operation identity from the operator.
+        -- The broker takes the expected binding and operation identity from the operator. It verifies a configured local destination or a signed receipt from the registered destination verifier.
+        -- Cross-cell successor identity includes the selected cell. Its journal scope and serving grant bind that same cell.
+        -- Cross-cell publication informs older readers by advancing the authority protocol to a version those readers refuse.
         -- A restarted publisher observes the committed closure and measures its own grant window.
         -- A serving operation acquires a grant for the incarnation it admitted and checks its deadline before releasing a result.
         -- A retained follower or writer handle acquires only grants for its own incarnation.
@@ -1135,6 +1137,9 @@ contract PortableApplicationBackup {
         -- A recorded installation proves the dependency closure only while the exact installed index and every referenced file verify.
         -- The installed receipt can be recovered from the destination journal alone.
         -- Installation and activation are separate decisions.
+        -- An independent destination verifier checks its scoped committed install and dependency closure before signing the authority, database, predecessor binding, operation, destination cell, candidate, archive digest and exact source cut.
+        -- Verification at the authority uses the registered destination public key and the selected recovery intent. It can complete without reading destination resources.
+        -- Destination custody retains the staged journal, objects and keys until activation or an authority decision that supersedes the recovery intent.
 }
 
 ------------------------------------------------------------

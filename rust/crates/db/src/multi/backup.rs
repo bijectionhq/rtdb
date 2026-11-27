@@ -119,6 +119,10 @@ impl InstalledBackup {
         self.source.through_lsn
     }
 
+    pub fn source_system_time(&self) -> Timestamp {
+        self.source.cut.system_time
+    }
+
     pub fn destination_basis(&self) -> Basis {
         self.destination_basis
     }

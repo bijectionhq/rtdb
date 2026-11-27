@@ -25,12 +25,14 @@ use clock::{ElapsedClock, HOLDER_WINDOW};
 
 const ABSOLUTE_GRANT_PROTOCOL: u8 = 1;
 const ELAPSED_GRANT_PROTOCOL: u8 = 2;
+const CELL_GRANT_PROTOCOL: u8 = 3;
 const RENEW_AHEAD: Duration = Duration::from_secs(1);
 const ATTEMPTS: usize = 8;
 
 pub struct ActivationAuthority {
     journal: Arc<dyn Journal>,
     identity: Uuid,
+    serving_cell: Option<Uuid>,
     access: Access,
     clock: Arc<ElapsedClock>,
 }
@@ -60,6 +62,7 @@ impl Access {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Binding {
     pub incarnation: Uuid,
     pub revision: u64,
@@ -68,18 +71,20 @@ pub struct Binding {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ActivationStatus {
     pub binding: Binding,
+    pub destination_cell: Option<Uuid>,
     pub grants_closed: bool,
     pub grants_end_micros: Option<i64>,
     pub grant_protocol_version: u8,
 }
 
 impl ActivationStatus {
-    fn published(binding: Binding) -> Self {
+    fn published(state: &State) -> Self {
         Self {
-            binding,
+            binding: state.binding,
+            destination_cell: state.destination_cell(),
             grants_closed: false,
             grants_end_micros: None,
-            grant_protocol_version: ELAPSED_GRANT_PROTOCOL,
+            grant_protocol_version: state.version,
         }
     }
 }
@@ -89,6 +94,8 @@ struct Publication {
     operation: Uuid,
     predecessor: Binding,
     manifest_digest: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    destination_cell: Option<Uuid>,
 }
 
 /// Produced by the destination installer after its reconstruction is committed.
@@ -98,6 +105,7 @@ pub struct VerifiedSuccessor {
     successor: Uuid,
     manifest_digest: [u8; 32],
     activation_scope: Option<rtdb_db::ActivationScope>,
+    destination_cell: Option<Uuid>,
 }
 
 impl VerifiedSuccessor {
@@ -107,6 +115,7 @@ impl VerifiedSuccessor {
             successor: Uuid::from_bytes(installed.destination_basis().incarnation()),
             manifest_digest: installed.manifest_sha256(),
             activation_scope: installed.activation_scope(),
+            destination_cell: None,
         }
     }
 }
@@ -134,6 +143,10 @@ impl State {
             retired: BTreeSet::new(),
             publication: None,
         }
+    }
+
+    fn destination_cell(&self) -> Option<Uuid> {
+        self.publication.and_then(|publication| publication.destination_cell)
     }
 
     fn require(&self, expected: Binding) -> Result<()> {
@@ -179,14 +192,16 @@ impl ActivationAuthority {
     pub async fn for_development(
         data_journal: Option<&super::DevelopmentStreamJournal>,
     ) -> Result<Option<Arc<Self>>> {
-        let Some((url, identity, credentials)) = environment()? else {
+        let Some((url, identity, credentials, cell)) = environment()? else {
             return Ok(None);
         };
         if let Some(data_journal) = data_journal {
             require_independent_journals(&url, &data_journal.url)?;
         }
         super::DevelopmentStreamJournal::new(&url, credentials.clone())?;
-        Ok(Some(Self::connect(&url, credentials, identity, Access::ConsensusReader).await?))
+        let mut authority = Self::connect(&url, credentials, identity, Access::ConsensusReader).await?;
+        Arc::get_mut(&mut authority).expect("just connected").serving_cell = cell;
+        Ok(Some(authority))
     }
 
     /// All participants in an authority must use its same independent ordered journal.
@@ -203,6 +218,7 @@ impl ActivationAuthority {
         Ok(Arc::new(Self {
             journal,
             identity,
+            serving_cell: None,
             access,
             clock,
         }))
@@ -221,6 +237,10 @@ impl ActivationAuthority {
         self.identity
     }
 
+    pub(super) fn scope(&self, name: &str) -> Result<rtdb_db::ActivationScope> {
+        rtdb_db::ActivationScope::for_cell(self.identity, name, self.serving_cell)
+    }
+
     pub fn commissioning_stream_id(&self, name: &str) -> Result<StreamId> {
         self.stream_id(name)
     }
@@ -228,17 +248,17 @@ impl ActivationAuthority {
     pub fn successor_incarnation(
         &self, name: &str, expected: Binding, operation: Uuid,
     ) -> Result<Uuid> {
-        if operation.is_nil() {
-            return Err(conflict());
-        }
-        let stream = self.stream_id(name)?;
-        let next_revision = expected.revision.checked_add(1).ok_or_else(conflict)?;
-        let mut digest = Sha256::new();
-        digest.update(b"rtdb.activation.successor.v1");
-        digest.update(stream.0.to_be_bytes());
-        digest.update(next_revision.to_be_bytes());
-        digest.update(operation.as_bytes());
-        Ok(Uuid::from_bytes(digest.finalize()[..16].try_into().unwrap()))
+        self.successor_incarnation_in_cell(name, expected, operation, None)
+    }
+
+    pub(super) fn successor_incarnation_in_cell(
+        &self,
+        name: &str,
+        expected: Binding,
+        operation: Uuid,
+        cell: Option<Uuid>,
+    ) -> Result<Uuid> {
+        successor_incarnation(self.identity, name, expected, operation, cell)
     }
 
     pub async fn bootstrap(&self, name: &str, incarnation: Uuid) -> Result<Binding> {
@@ -272,6 +292,7 @@ impl ActivationAuthority {
         let state = state.ok_or_else(unavailable)?;
         Ok(ActivationStatus {
             binding: state.binding,
+            destination_cell: state.destination_cell(),
             grants_closed: state.grants_closed,
             grants_end_micros: state.grants_end,
             grant_protocol_version: state.version,
@@ -282,7 +303,7 @@ impl ActivationAuthority {
         self.change(self.stream_id(name)?, |state| {
             let state = state.ok_or_else(unavailable)?;
             state.require(expected)?;
-            if state.version == ELAPSED_GRANT_PROTOCOL {
+            if state.version >= ELAPSED_GRANT_PROTOCOL {
                 return Ok(None);
             }
             let mut next = state.clone();
@@ -301,7 +322,7 @@ impl ActivationAuthority {
                 return Ok(None);
             }
             let mut next = state.clone();
-            next.version = ELAPSED_GRANT_PROTOCOL;
+            next.version = state.version.max(ELAPSED_GRANT_PROTOCOL);
             next.grants_closed = true;
             Ok(Some(next))
         })
@@ -314,6 +335,7 @@ impl ActivationAuthority {
         name: &str,
         expected: Binding,
         operation: Uuid,
+        installation: Option<([u8; 32], Uuid)>,
     ) -> Result<Option<ActivationStatus>> {
         if operation.is_nil() {
             return Err(conflict());
@@ -321,10 +343,14 @@ impl ActivationAuthority {
         let (_, state) = self.read(self.stream_id(name)?).await?;
         let state = state.ok_or_else(unavailable)?;
         if let Some(publication) = state.publication.filter(|prior| prior.operation == operation) {
-            if publication.predecessor != expected {
+            if publication.predecessor != expected
+                || installation.is_some_and(|(digest, cell)| {
+                    digest != publication.manifest_digest || Some(cell) != publication.destination_cell
+                })
+            {
                 return Err(conflict());
             }
-            return Ok(Some(ActivationStatus::published(state.binding)));
+            return Ok(Some(ActivationStatus::published(&state)));
         }
         state.require(expected)?;
         if !state.grants_closed {
@@ -340,11 +366,21 @@ impl ActivationAuthority {
         operation: Uuid,
         successor: VerifiedSuccessor,
     ) -> Result<Binding> {
+        Ok(self.publish(name, expected, operation, successor).await?.binding)
+    }
+
+    async fn publish(
+        &self,
+        name: &str,
+        expected: Binding,
+        operation: Uuid,
+        successor: VerifiedSuccessor,
+    ) -> Result<ActivationStatus> {
         self.access.require_operator()?;
         if successor.predecessor != expected.incarnation
-            || successor.successor != self.successor_incarnation(name, expected, operation)?
+            || successor.successor != successor_incarnation(self.identity, name, expected, operation, successor.destination_cell)?
             || successor.successor == expected.incarnation
-            || successor.activation_scope != Some(rtdb_db::ActivationScope::new(self.identity, name)?)
+            || successor.activation_scope != Some(rtdb_db::ActivationScope::for_cell(self.identity, name, successor.destination_cell)?)
         {
             return Err(conflict());
         }
@@ -352,12 +388,13 @@ impl ActivationAuthority {
             operation,
             predecessor: expected,
             manifest_digest: successor.manifest_digest,
+            destination_cell: successor.destination_cell,
         };
         let stream = self.stream_id(name)?;
         let (_, frozen) = self.read(stream).await?;
         let frozen = frozen.ok_or_else(unavailable)?;
         if frozen.already_published(publication, successor.successor)? {
-            return Ok(frozen.binding);
+            return Ok(ActivationStatus::published(&frozen));
         }
         clock::wait_out(self.clock.as_ref(), clock::drain_window(frozen.grants_end.is_some())).await?;
 
@@ -368,11 +405,16 @@ impl ActivationAuthority {
                     return Ok(None);
                 }
                 let mut next = state.clone();
-                next.version = ELAPSED_GRANT_PROTOCOL;
+                let version = if successor.destination_cell.is_some() {
+                    CELL_GRANT_PROTOCOL
+                } else {
+                    ELAPSED_GRANT_PROTOCOL
+                };
+                next.version = state.version.max(version);
                 // A higher revision already excludes successors issued by this
                 // protocol. Retain arbitrary identities from older bindings.
                 let derived_predecessor = state.publication.and_then(|prior| {
-                    self.successor_incarnation(name, prior.predecessor, prior.operation).ok()
+                    successor_incarnation(self.identity, name, prior.predecessor, prior.operation, prior.destination_cell).ok()
                 });
                 if derived_predecessor != Some(expected.incarnation) {
                     next.retired.insert(expected.incarnation);
@@ -387,7 +429,7 @@ impl ActivationAuthority {
                 Ok(Some(next))
             })
             .await?;
-        Ok(state.binding)
+        Ok(ActivationStatus::published(&state))
     }
 
     pub(super) fn serving_authority(
@@ -395,23 +437,33 @@ impl ActivationAuthority {
         name: &str,
         incarnation: Uuid,
     ) -> Result<Arc<dyn ServingAuthority>> {
+        self.serving_authority_for_cell(name, incarnation, self.serving_cell)
+    }
+
+    pub(super) fn serving_authority_for_cell(
+        self: &Arc<Self>,
+        name: &str,
+        incarnation: Uuid,
+        cell: Option<Uuid>,
+    ) -> Result<Arc<dyn ServingAuthority>> {
         Ok(Arc::new(ServingBinding(Arc::new(BoundAuthority {
             authority: Arc::clone(self),
             stream: self.stream_id(name)?,
             incarnation,
+            cell,
             grant: RwLock::new(None),
             renewal: Arc::new(Mutex::new(())),
         }))))
     }
 
-    async fn grant(&self, stream: StreamId, incarnation: Uuid) -> Result<ServingPermit> {
+    async fn grant(&self, stream: StreamId, incarnation: Uuid, cell: Option<Uuid>) -> Result<ServingPermit> {
         let requested_at = (self.clock)().ok_or_else(clock::unavailable)?;
         let (_, state) = self.read(stream).await?;
         let state = state.ok_or_else(unavailable)?;
-        if state.grants_closed || state.binding.incarnation != incarnation {
+        if state.grants_closed || state.binding.incarnation != incarnation || state.destination_cell() != cell {
             return Err(not_active());
         }
-        if state.version != ELAPSED_GRANT_PROTOCOL {
+        if state.version < ELAPSED_GRANT_PROTOCOL {
             return Err(Anomaly::unsupported(
                 "rtdb/activation-grant-protocol",
                 "Upgrade the activation binding before opening this incarnation",
@@ -421,14 +473,7 @@ impl ActivationAuthority {
     }
 
     fn stream_id(&self, name: &str) -> Result<StreamId> {
-        super::validate_deployment_name(name)?;
-        let mut hash = Sha256::new();
-        hash.update(b"rtdb.activation.v1");
-        hash.update(self.identity.as_bytes());
-        hash.update(name.as_bytes());
-        let digest: [u8; 32] = hash.finalize().into();
-        let id = StreamId(u128::from_be_bytes(digest[..16].try_into().unwrap()));
-        Ok(id)
+        activation_stream_id(self.identity, name)
     }
 
     async fn read(&self, stream: StreamId) -> Result<(Lsn, Option<State>)> {
@@ -462,7 +507,8 @@ impl ActivationAuthority {
                 return Err(corrupt());
             }
             let state: State = serde_json::from_slice(bytes).map_err(|_| corrupt())?;
-            if !matches!(state.version, ABSOLUTE_GRANT_PROTOCOL | ELAPSED_GRANT_PROTOCOL)
+            if !matches!(state.version, ABSOLUTE_GRANT_PROTOCOL | ELAPSED_GRANT_PROTOCOL | CELL_GRANT_PROTOCOL)
+                || state.destination_cell().is_some_and(|cell| cell.is_nil() || state.version < CELL_GRANT_PROTOCOL)
                 || state.binding.incarnation.is_nil()
                 || state.binding.revision == 0
                 || state.retired.contains(&state.binding.incarnation)
@@ -553,6 +599,7 @@ struct BoundAuthority {
     authority: Arc<ActivationAuthority>,
     stream: StreamId,
     incarnation: Uuid,
+    cell: Option<Uuid>,
     grant: RwLock<Option<ServingPermit>>,
     renewal: Arc<Mutex<()>>,
 }
@@ -565,7 +612,7 @@ impl BoundAuthority {
     }
 
     async fn renew(&self) -> Result<ServingPermit> {
-        let permit = self.authority.grant(self.stream, self.incarnation).await?;
+        let permit = self.authority.grant(self.stream, self.incarnation, self.cell).await?;
         *self.grant.write().unwrap() = Some(permit.clone());
         Ok(permit)
     }
@@ -612,6 +659,37 @@ fn not_active() -> Anomaly {
         "rtdb/activation-fenced",
         "The database incarnation may not serve",
     )
+}
+
+fn activation_stream_id(authority: Uuid, name: &str) -> Result<StreamId> {
+    super::validate_deployment_name(name)?;
+    let mut hash = Sha256::new();
+    hash.update(b"rtdb.activation.v1");
+    hash.update(authority.as_bytes());
+    hash.update(name.as_bytes());
+    let digest: [u8; 32] = hash.finalize().into();
+    Ok(StreamId(u128::from_be_bytes(digest[..16].try_into().unwrap())))
+}
+
+fn successor_incarnation(
+    authority: Uuid, name: &str, expected: Binding, operation: Uuid, cell: Option<Uuid>,
+) -> Result<Uuid> {
+    if operation.is_nil() || cell.is_some_and(|id| id.is_nil()) {
+        return Err(conflict());
+    }
+    let stream = activation_stream_id(authority, name)?;
+    let next_revision = expected.revision.checked_add(1).ok_or_else(conflict)?;
+    let mut digest = Sha256::new();
+    if let Some(cell) = cell {
+        digest.update(b"rtdb.activation.cell-successor.v1");
+        digest.update(cell.as_bytes());
+    } else {
+        digest.update(b"rtdb.activation.successor.v1");
+    }
+    digest.update(stream.0.to_be_bytes());
+    digest.update(next_revision.to_be_bytes());
+    digest.update(operation.as_bytes());
+    Ok(Uuid::from_bytes(digest.finalize()[..16].try_into().unwrap()))
 }
 
 fn conflict() -> Anomaly {
@@ -801,6 +879,7 @@ mod tests {
             predecessor: incumbent,
             successor,
             manifest_digest: [3; 32],
+            destination_cell: None,
             activation_scope: Some(rtdb_db::ActivationScope::new(authority.identity(), "xtdb").unwrap()),
         };
         let published = tokio::time::timeout(
@@ -852,6 +931,7 @@ mod tests {
             predecessor,
             successor,
             manifest_digest: [4; 32],
+            destination_cell: None,
             activation_scope: Some(rtdb_db::ActivationScope::new(identity, "xtdb").unwrap()),
         };
         let serving = authority.serving_authority("xtdb", predecessor).unwrap();
@@ -946,7 +1026,7 @@ mod tests {
             let sample = clock_samples.fetch_add(1, Ordering::SeqCst);
             Some(if sample == 0 { Duration::ZERO } else { HOLDER_WINDOW })
         });
-        assert_eq!(authority.grant(stream, incarnation).await.unwrap_err().code, "rtdb/activation-fenced");
+        assert_eq!(authority.grant(stream, incarnation, None).await.unwrap_err().code, "rtdb/activation-fenced");
         assert_eq!(authority.journal.head(stream).await.unwrap(), Lsn(1));
     }
 
@@ -966,7 +1046,7 @@ mod tests {
             Ok(Some(state))
         }).await.unwrap();
         assert_eq!(
-            authority.grant(stream, incarnation).await.unwrap_err().code,
+            authority.grant(stream, incarnation, None).await.unwrap_err().code,
             "rtdb/activation-grant-protocol"
         );
         authority.upgrade_grants("xtdb", binding).await.unwrap();
@@ -975,7 +1055,7 @@ mod tests {
         assert_eq!(status.binding, binding);
         assert_eq!(status.grant_protocol_version, ELAPSED_GRANT_PROTOCOL);
         assert_eq!(status.grants_end_micros, Some(123));
-        authority.grant(stream, incarnation).await.unwrap();
+        authority.grant(stream, incarnation, None).await.unwrap();
         assert_eq!(authority.journal.head(stream).await.unwrap(), Lsn(3));
         assert!(clock::drain_window(true) > clock::drain_window(false));
     }
@@ -1008,7 +1088,7 @@ pub(super) async fn installed(
     database_url: &str,
     immutable_streams: bool,
 ) -> Result<Option<Arc<ActivationAuthority>>> {
-    let Some((url, identity, credentials)) = environment()? else {
+    let Some((url, identity, credentials, cell)) = environment()? else {
         return Ok(None);
     };
     if !immutable_streams {
@@ -1018,9 +1098,9 @@ pub(super) async fn installed(
         ));
     }
     require_independent_journals(&url, database_url)?;
-    Ok(Some(
-        ActivationAuthority::connect(&url, credentials, identity, Access::ConsensusReader).await?,
-    ))
+    let mut authority = ActivationAuthority::connect(&url, credentials, identity, Access::ConsensusReader).await?;
+    Arc::get_mut(&mut authority).expect("just connected").serving_cell = cell;
+    Ok(Some(authority))
 }
 
 fn require_independent_journals(authority_url: &str, database_url: &str) -> Result<()> {
@@ -1038,7 +1118,7 @@ fn require_independent_journals(authority_url: &str, database_url: &str) -> Resu
     Ok(())
 }
 
-fn environment() -> Result<Option<(String, Uuid, super::Credentials)>> {
+fn environment() -> Result<Option<(String, Uuid, super::Credentials, Option<Uuid>)>> {
     let url = match std::env::var("RTDB_ACTIVATION_JOURNAL_URL") {
         Ok(value) => value,
         Err(std::env::VarError::NotPresent) => return Ok(None),
@@ -1052,7 +1132,12 @@ fn environment() -> Result<Option<(String, Uuid, super::Credentials)>> {
         private_key: env("RTDB_ACTIVATION_READER_PRIVATE_KEY_PATH")?.into(),
         ca: env("RTDB_ACTIVATION_CA_PATH")?.into(),
     };
-    Ok(Some((url, identity, credentials)))
+    let cell = match std::env::var("RTDB_ACTIVATION_CELL_ID") {
+        Ok(value) => Some(Uuid::parse_str(&value).ok().filter(|cell| !cell.is_nil()).ok_or_else(configuration)?),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(_) => return Err(configuration()),
+    };
+    Ok(Some((url, identity, credentials, cell)))
 }
 
 fn configuration() -> Anomaly {

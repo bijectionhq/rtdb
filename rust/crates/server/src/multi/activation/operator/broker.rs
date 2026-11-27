@@ -20,7 +20,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use super::{Access, ActivationAuthority, Destination, DestinationReader, Request};
+use super::{Access, ActivationAuthority, Attestors, Destination, DestinationReader, Request};
 
 const MAX_FRAME_BYTES: usize = 16 * 1024;
 const MAX_CONNECTIONS: usize = 16;
@@ -34,6 +34,8 @@ struct Config {
     authority_tls_dir: PathBuf,
     operator_uids: BTreeSet<u32>,
     destination: Option<Destination>,
+    #[serde(default)]
+    destination_attestors: Attestors,
 }
 
 impl Config {
@@ -54,6 +56,16 @@ impl Config {
         let config: Self = serde_json::from_slice(&bytes).map_err(|_| configuration())?;
         if config.operator_uids.is_empty()
             || config.authority_id.is_nil()
+            || config
+                .destination_attestors
+                .iter()
+                .any(|(cell, key)| cell.is_nil() || *key == [0; 32])
+            || config
+                .destination_attestors
+                .values()
+                .collect::<BTreeSet<_>>()
+                .len()
+                != config.destination_attestors.len()
             || !config.authority_url.starts_with(super::CONSENSUS_SCHEME)
             || !config.authority_tls_dir.is_absolute()
             || config.destination.as_ref().is_some_and(|destination| {
@@ -76,7 +88,10 @@ pub(super) async fn serve(
     let config = Arc::new(Config::read(configuration)?);
     require_directory(&config.authority_tls_dir, 0o022)?;
     if let Some(destination) = &config.destination {
-        super::super::require_independent_journals(&config.authority_url, &destination.journal_url)?;
+        super::super::require_independent_journals(
+            &config.authority_url,
+            &destination.journal_url,
+        )?;
     }
     let authority = ActivationAuthority::connect(
         &config.authority_url,
@@ -100,7 +115,8 @@ pub(super) async fn serve(
                 let config = config.clone();
                 requests.spawn(async move {
                     handle_peer(
-                        stream, &authority, &config.operator_uids, config.destination.as_ref(), apple_sync,
+                        stream, &authority, &config.operator_uids, config.destination.as_ref(),
+                        &config.destination_attestors, apple_sync,
                     )
                     .await;
                 });
@@ -116,6 +132,7 @@ async fn handle_peer(
     authority: &ActivationAuthority,
     operator_uids: &BTreeSet<u32>,
     destination: Option<&Destination>,
+    attestors: &Attestors,
     apple_sync: rtdb_storage::AppleSync,
 ) {
     let result: Result<Value> = if stream
@@ -128,6 +145,7 @@ async fn handle_peer(
                     .execute(
                         authority,
                         destination.map(DestinationReader::Broker),
+                        attestors,
                         apple_sync,
                     )
                     .await
@@ -232,7 +250,7 @@ impl Drop for BoundSocket {
     }
 }
 
-fn effective_uid() -> u32 {
+pub(super) fn effective_uid() -> u32 {
     // geteuid reads the current process credential and takes no arguments.
     unsafe { libc::geteuid() }
 }
@@ -311,6 +329,7 @@ mod tests {
                     &authority,
                     &allowed,
                     None,
+                    &Attestors::new(),
                     rtdb_storage::AppleSync::default(),
                 )
                 .await;
@@ -334,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn wire_publication_accepts_no_destination_or_proof_from_the_caller() {
+    fn wire_publication_accepts_no_destination_paths_from_the_caller() {
         let mut request = serde_json::json!({
             "database": "xtdb",
             "action": {
@@ -366,4 +385,29 @@ mod tests {
         assert!(BoundSocket::bind(&path).is_err());
         assert_eq!(fs::read(&path).unwrap(), b"keep");
     }
+}
+
+#[cfg(test)]
+pub(super) async fn call_test_peer(
+    authority: &ActivationAuthority,
+    attestors: &Attestors,
+    request: &Request,
+) -> Result<Value> {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let allowed = BTreeSet::from([effective_uid()]);
+    let (_, result) = tokio::join!(
+        handle_peer(
+            server,
+            authority,
+            &allowed,
+            None,
+            attestors,
+            rtdb_storage::AppleSync::default(),
+        ),
+        async {
+            write_frame(&mut client, request).await?;
+            read_frame::<Result<Value>>(&mut client).await?
+        },
+    );
+    result
 }

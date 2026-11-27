@@ -6,9 +6,9 @@ use serde_json::{Value, json};
 use super::*;
 
 pub const MULTI_BACKUP_HELP: &str = "\
-Usage: rtdb multi-backup export --data DIR --archive FILE [--journal-url URL --tls-dir DIR] [--immutable-streams] [--authority-id UUID]
+Usage: rtdb multi-backup export --data DIR --archive FILE [--journal-url URL --tls-dir DIR] [--immutable-streams] [--authority-id UUID [--cell-id UUID]]
        rtdb multi-backup restore --data DIR --archive FILE --incarnation UUID --source-key-vault DIR
-                                 [--journal-url URL --tls-dir DIR] [--immutable-streams] [--authority-id UUID]
+                                 [--journal-url URL --tls-dir DIR] [--immutable-streams] [--authority-id UUID [--cell-id UUID]]
 Operates on stopped, local RTDB Multi development data. The source key vault
 is supplied separately during restore. Neither command mounts a serving listener.
 ";
@@ -54,13 +54,19 @@ impl MultiBackupOptions {
         if immutable_streams && !journal.as_ref().is_some_and(|(url, _)| url.starts_with(CONSENSUS_SCHEME)) {
             return Err(arguments_error());
         }
+        let cell = fields.remove("--cell-id").map(|cell| {
+            Uuid::parse_str(&cell).ok().filter(|cell| !cell.is_nil()).ok_or_else(arguments_error)
+        }).transpose()?;
         let activation_scope = fields.remove("--authority-id").map(|authority_id| {
             if !immutable_streams {
                 return Err(arguments_error());
             }
             let authority_id = Uuid::parse_str(&authority_id).map_err(|_| arguments_error())?;
-            ActivationScope::new(authority_id, DEVELOPMENT_DATABASE)
+            ActivationScope::for_cell(authority_id, DEVELOPMENT_DATABASE, cell)
         }).transpose()?;
+        if cell.is_some() && activation_scope.is_none() {
+            return Err(arguments_error());
+        }
         let operation = match operation.as_str() {
             "export" => Operation::Export,
             "restore" => {

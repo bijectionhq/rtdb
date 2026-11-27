@@ -114,14 +114,15 @@ Installed activation requires `multiJournal: {immutableStreams: true}` for the a
 The authority reader TLS files come from `RTDB_ACTIVATION_READER_CERTIFICATE_PATH`, `RTDB_ACTIVATION_READER_PRIVATE_KEY_PATH`, and `RTDB_ACTIVATION_CA_PATH`.
 All replicas of the authority protect its state against rewind and survive failure of the databases they activate.
 
-`rtdb multi-activation` supplies `bootstrap`, `status`, `upgrade-grants`, `candidate`, `freeze`, and `publish` operator actions.
+`rtdb multi-activation` supplies `bootstrap`, `status`, `upgrade-grants`, `candidate`, `freeze`, `attest`, and `publish` operator actions.
 `upgrade-grants` moves an existing binding to elapsed-time grants at the expected incarnation and revision.
 After upgrade, older binaries reject that authority format.
 Publication waits an additional allowance for any outstanding legacy wall-clock grants.
 `freeze` and `publish` compare the expected incarnation and activation revision.
 `candidate` derives the destination incarnation from the active name, its next revision, and the recovery operation ID.
 Restore into that incarnation with `multi-backup restore --immutable-streams --authority-id UUID`.
-`publish` independently opens the stopped destination, verifies its commissioned scope and committed portable restore, and binds the successor to that proof.
+For same-host recovery, `publish` verifies the commissioned scope and committed portable restore in the configured stopped destination.
+For cross-cell recovery, it verifies a signed installation attestation and records the destination cell with the successor.
 Use the same recovery operation ID for candidate selection and publication.
 If publication is interrupted, retry with the same expected binding and operation ID.
 A retry of the retained committed publication returns its binding even after the destination has started serving.
@@ -152,11 +153,45 @@ rtdb multi-activation serve --authority-socket /run/rtdb-activation/authority.so
 rtdb multi-activation status xtdb --authority-socket /run/rtdb-activation/authority.sock
 ```
 
-The broker accepts typed commands and obtains the installation proof from its configured stopped development destination.
-An operator using `--authority-socket` supplies the expected binding and recovery operation ID for publication.
-The broker configuration may omit `destination` when it serves status and lifecycle operations only.
-The service account owns the staged data directory and both TLS directories. Operator accounts cannot modify those directories or their contents.
-Serve the Unix socket on the authority host. The current installation verifier expects a locally mounted stopped Multi development destination and loopback keeper addresses.
+The socket accepts typed commands. An operator supplies the expected binding and recovery operation ID.
+For same-host verification, the broker account owns the stopped destination's data and TLS directories. The local verifier supports a stopped Multi development destination and loopback keeper addresses.
+
+### Cross-cell publication
+
+Register each destination's cell UUID and raw 32-byte Ed25519 public key in the broker configuration under `destination_attestors`, a JSON object keyed by cell UUID.
+Omit `destination` on an authority host that publishes solely from registered attestations.
+The authority broker and operator account have no destination journal credentials, object storage access or private signing key.
+Keep the Ed25519 private key in a mode-0600 PKCS#8 DER file owned by the destination verifier account. Use a separate key for each cell.
+The verifier account runs inside the destination cell and uses its read-only journal TLS principal and the stopped installation's existing data and key vault.
+
+Run `candidate` with the expected binding, recovery operation ID and `--cell-id`.
+Stage the portable archive on the selected cell using the returned incarnation, `--immutable-streams`, the authority ID and the same `--cell-id`.
+Use the selected archive's SHA-256 from `multi-backup export` when requesting and presenting the attestation.
+
+```sh
+# On the destination, after a committed restore.
+rtdb multi-activation attest xtdb --authority-id "$AUTHORITY" \
+  --expected-incarnation "$PREDECESSOR" --expected-revision "$REVISION" --operation-id "$OPERATION" \
+  --cell-id "$CELL" --manifest-sha256 "$ARCHIVE_SHA256" --attestation-signing-key /etc/rtdb/attestor.pkcs8 \
+  --data /var/lib/rtdb/staged --journal-url logkeeper-consensus:///etc/rtdb/destination-journal.json \
+  --tls-dir /etc/rtdb/destination-reader --immutable-streams > installation.json
+
+# From the operator account, after freeze on the same expected binding.
+rtdb multi-activation publish xtdb --authority-socket /run/rtdb-activation/authority.sock \
+  --expected-incarnation "$PREDECESSOR" --expected-revision "$REVISION" --operation-id "$OPERATION" \
+  --cell-id "$CELL" --manifest-sha256 "$ARCHIVE_SHA256" --installation-proof installation.json
+```
+
+The verifier replays the commissioned immutable journal, reconstructs the committed restore, and checks its relocated files before signing.
+The receipt covers the authority, database, predecessor binding, recovery operation, destination cell, candidate, and the installed source cut and archive digest.
+The bounded JSON receipt can travel through untrusted transport. The broker checks its signature against the key registered for the selected cell and verifies the selection against the current authority binding.
+The destination can issue the same receipt again after restart. A retry after publication can omit the receipt and use the retained authority result.
+
+The staged restore's committed checkpoint and subsequent checkpoints retain its data and file closure.
+Keep the staged journal, object store and keys in the destination's custody until activation or until the authority advances past this recovery intent. The destination's storage administrators are trusted to retain those resources.
+Starting a serving listener for the staged incarnation requires a grant for both its incarnation and cell.
+Set `RTDB_ACTIVATION_CELL_ID` on the selected cell when serving or reopening the incarnation.
+Cross-cell publication upgrades the binding to cell-aware grant protocol version 3. Earlier readers reject that binding.
 
 ## Batches, placement, funded appends and journal size
 

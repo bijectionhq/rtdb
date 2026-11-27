@@ -5,12 +5,14 @@ use rtdb_types::{Anomaly, Result};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use self::attestation::{Attestation, Attestors, Intent};
 use super::{Access, ActivationAuthority, ActivationStatus, Binding, VerifiedSuccessor};
 use crate::{
     config::NodeConfiguration,
     multi::{CONSENSUS_SCHEME, DEVELOPMENT_DATABASE, MultiRuntime},
 };
 
+mod attestation;
 #[cfg(unix)]
 mod broker;
 
@@ -18,16 +20,21 @@ pub const HELP: &str = "Usage: rtdb multi-activation status DATABASE AUTHORITY
        rtdb multi-activation bootstrap DATABASE AUTHORITY --incarnation UUID
        rtdb multi-activation upgrade-grants DATABASE AUTHORITY --expected-incarnation UUID --expected-revision N
        rtdb multi-activation freeze DATABASE AUTHORITY --expected-incarnation UUID --expected-revision N
-       rtdb multi-activation candidate DATABASE AUTHORITY --expected-incarnation UUID --expected-revision N --operation-id UUID
+       rtdb multi-activation candidate DATABASE AUTHORITY --expected-incarnation UUID --expected-revision N --operation-id UUID [--cell-id UUID]
        rtdb multi-activation publish DATABASE AUTHORITY --expected-incarnation UUID --expected-revision N --operation-id UUID
+                 [--cell-id UUID --installation-proof FILE --manifest-sha256 HEX]
+       rtdb multi-activation attest xtdb --authority-id UUID --expected-incarnation UUID --expected-revision N --operation-id UUID
+                 --data DIR --journal-url URL --tls-dir DIR --immutable-streams
+                 --cell-id UUID --attestation-signing-key PKCS8 --manifest-sha256 HEX
        rtdb multi-activation serve --authority-socket PATH --broker-config PATH
 
 AUTHORITY is --authority-socket PATH for a local operator broker, or
 --authority-id UUID with either --authority-file PATH or
 --authority-url URL --authority-tls-dir DIR for direct access. Direct publish
 also requires --data DIR --journal-url URL --tls-dir DIR --immutable-streams.
-The broker owns its writer TLS and reads the committed install from its
-configured stopped Multi development destination for xtdb.
+The broker owns its writer TLS. It can verify a signed installation proof from
+a registered destination or read its configured stopped development destination.
+Run attest on the stopped destination with its own protected signing key.
 ";
 
 #[derive(Clone, Debug)]
@@ -59,11 +66,23 @@ enum Action {
     Candidate {
         expected: Binding,
         operation_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cell: Option<Uuid>,
     },
     Publish {
         expected: Binding,
         operation_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        installation: Option<RemoteInstallation>,
     },
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteInstallation {
+    cell: Uuid,
+    manifest_sha256: [u8; 32],
+    attestation: Attestation,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -90,9 +109,9 @@ enum DestinationReader<'a> {
 impl DestinationReader<'_> {
     async fn read(
         self,
-        scope: rtdb_db::ActivationScope,
+        intent: &Intent,
         apple_sync: rtdb_storage::AppleSync,
-    ) -> Result<VerifiedSuccessor> {
+    ) -> Result<rtdb_db::InstalledBackup> {
         let destination = match self {
             Self::Direct(destination) => destination,
             #[cfg(unix)]
@@ -101,8 +120,16 @@ impl DestinationReader<'_> {
                 destination
             }
         };
-        read_installation(destination, scope, apple_sync).await
+        read_installation(destination, intent, apple_sync).await
     }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+struct ProofFile {
+    path: PathBuf,
+    cell: Uuid,
+    manifest_sha256: [u8; 32],
 }
 
 #[derive(Clone, Debug)]
@@ -113,7 +140,18 @@ enum Command {
         destination: Option<Destination>,
     },
     #[cfg(unix)]
-    CallBroker { socket: PathBuf, request: Request },
+    CallBroker {
+        socket: PathBuf,
+        request: Request,
+        proof: Option<ProofFile>,
+    },
+    #[cfg(unix)]
+    Attest {
+        intent: Intent,
+        manifest_sha256: [u8; 32],
+        signing_key: PathBuf,
+        destination: Destination,
+    },
     #[cfg(unix)]
     ServeBroker { socket: PathBuf, config: PathBuf },
 }
@@ -136,6 +174,32 @@ impl Options {
         }
         let database = arguments.next().ok_or_else(arguments_error)?;
         let (mut fields, immutable_streams) = fields(arguments)?;
+        #[cfg(unix)]
+        if operation == "attest" {
+            if !immutable_streams || database != DEVELOPMENT_DATABASE {
+                return Err(arguments_error());
+            }
+            let intent = Intent {
+                authority_id: id(take(&mut fields, "--authority-id")?)?,
+                database,
+                expected: binding(&mut fields)?,
+                operation_id: id(take(&mut fields, "--operation-id")?)?,
+                cell: Some(id(take(&mut fields, "--cell-id")?)?),
+            };
+            let manifest_sha256 = manifest_digest(take(&mut fields, "--manifest-sha256")?)?;
+            let signing_key = take(&mut fields, "--attestation-signing-key")?.into();
+            let destination = destination(&mut fields)?;
+            if !fields.is_empty() {
+                return Err(arguments_error());
+            }
+            return Ok(Self(Command::Attest {
+                intent,
+                manifest_sha256,
+                signing_key,
+                destination,
+            }));
+        }
+
         let action = match operation.as_str() {
             "status" => Action::Status,
             "bootstrap" => Action::Bootstrap {
@@ -150,22 +214,37 @@ impl Options {
             "candidate" => Action::Candidate {
                 expected: binding(&mut fields)?,
                 operation_id: id(take(&mut fields, "--operation-id")?)?,
+                cell: fields.remove("--cell-id").map(id).transpose()?,
             },
             "publish" => Action::Publish {
                 expected: binding(&mut fields)?,
                 operation_id: id(take(&mut fields, "--operation-id")?)?,
+                installation: None,
             },
             _ => return Err(arguments_error()),
         };
         let request = Request { database, action };
         #[cfg(unix)]
         if let Some(socket) = fields.remove("--authority-socket") {
+            let proof = if let Some(path) = fields.remove("--installation-proof") {
+                if !matches!(request.action, Action::Publish { .. }) {
+                    return Err(arguments_error());
+                }
+                Some(ProofFile {
+                    path: path.into(),
+                    cell: id(take(&mut fields, "--cell-id")?)?,
+                    manifest_sha256: manifest_digest(take(&mut fields, "--manifest-sha256")?)?,
+                })
+            } else {
+                None
+            };
             if immutable_streams || !fields.is_empty() {
                 return Err(arguments_error());
             }
             return Ok(Self(Command::CallBroker {
                 socket: socket.into(),
                 request,
+                proof,
             }));
         }
 
@@ -187,15 +266,7 @@ impl Options {
             _ => return Err(arguments_error()),
         };
         let destination = if matches!(request.action, Action::Publish { .. }) && immutable_streams {
-            let journal_url = take(&mut fields, "--journal-url")?;
-            if !journal_url.starts_with(CONSENSUS_SCHEME) {
-                return Err(arguments_error());
-            }
-            Some(Destination {
-                data: take(&mut fields, "--data")?.into(),
-                journal_url,
-                journal_tls_dir: take(&mut fields, "--tls-dir")?.into(),
-            })
+            Some(destination(&mut fields)?)
         } else if matches!(request.action, Action::Publish { .. }) || immutable_streams {
             return Err(arguments_error());
         } else {
@@ -247,12 +318,41 @@ impl Options {
                     .execute(
                         &authority,
                         destination.as_ref().map(DestinationReader::Direct),
+                        &Attestors::new(),
                         apple_sync,
                     )
                     .await
             }
             #[cfg(unix)]
-            Command::CallBroker { socket, request } => broker::call(&socket, request).await,
+            Command::CallBroker {
+                socket,
+                mut request,
+                proof,
+            } => {
+                if let (Some(proof), Action::Publish { installation, .. }) =
+                    (proof, &mut request.action)
+                {
+                    *installation = Some(RemoteInstallation {
+                        cell: proof.cell,
+                        manifest_sha256: proof.manifest_sha256,
+                        attestation: Attestation::read(&proof.path)?,
+                    });
+                }
+                broker::call(&socket, request).await
+            }
+            #[cfg(unix)]
+            Command::Attest {
+                intent,
+                manifest_sha256,
+                signing_key,
+                destination,
+            } => {
+                broker::validate_destination(&destination)?;
+                let key = attestation::signing_key(&signing_key)?;
+                let proof =
+                    attest_installation(&destination, intent, manifest_sha256, &key).await?;
+                Ok(json!(proof))
+            }
             #[cfg(unix)]
             Command::ServeBroker { socket, config } => {
                 broker::serve(&socket, &config, apple_sync).await?;
@@ -267,6 +367,7 @@ impl Request {
         self,
         authority: &ActivationAuthority,
         destination: Option<DestinationReader<'_>>,
+        attestors: &Attestors,
         apple_sync: rtdb_storage::AppleSync,
     ) -> Result<Value> {
         let database = self.database;
@@ -284,36 +385,59 @@ impl Request {
             Action::Candidate {
                 expected,
                 operation_id,
+                cell,
             } => {
                 if authority.binding(&database).await? != expected {
                     return Err(super::conflict());
                 }
-                let incarnation =
-                    authority.successor_incarnation(&database, expected, operation_id)?;
+                let incarnation = authority.successor_incarnation_in_cell(
+                    &database,
+                    expected,
+                    operation_id,
+                    cell,
+                )?;
                 return Ok(json!({ "database": database, "incarnation": incarnation }));
             }
             Action::Publish {
                 expected,
                 operation_id,
+                installation,
             } => {
+                let selected = installation
+                    .as_ref()
+                    .map(|proof| (proof.manifest_sha256, proof.cell));
                 if let Some(committed) = authority
-                    .publication_status(&database, expected, operation_id)
+                    .publication_status(&database, expected, operation_id, selected)
                     .await?
                 {
                     return Ok(report(&database, committed));
                 }
-                let destination = destination.filter(|_| database == DEVELOPMENT_DATABASE).ok_or_else(|| {
-                    Anomaly::incorrect(
-                        "rtdb/activation-destination",
-                        "Publish requires the configured stopped Multi development destination for xtdb",
+                let intent = Intent {
+                    authority_id: authority.identity(),
+                    database: database.clone(),
+                    expected,
+                    operation_id,
+                    cell: selected.map(|(_, cell)| cell),
+                };
+                let ready = if let Some(proof) = installation {
+                    proof
+                        .attestation
+                        .verify(&intent, proof.manifest_sha256, attestors)?
+                } else {
+                    let destination = destination.filter(|_| database == DEVELOPMENT_DATABASE).ok_or_else(|| {
+                        Anomaly::incorrect(
+                            "rtdb/activation-destination",
+                            "Publish requires a registered destination installation proof or configured stopped destination",
+                        )
+                    })?;
+                    VerifiedSuccessor::from_installation(
+                        &destination.read(&intent, apple_sync).await?,
                     )
-                })?;
-                let scope = rtdb_db::ActivationScope::new(authority.identity(), &database)?;
-                let ready = destination.read(scope, apple_sync).await?;
-                let binding = authority
-                    .publish_successor(&database, expected, operation_id, ready)
+                };
+                let published = authority
+                    .publish(&database, expected, operation_id, ready)
                     .await?;
-                return Ok(report(&database, ActivationStatus::published(binding)));
+                return Ok(report(&database, published));
             }
         }
         Ok(report(&database, authority.status(&database).await?))
@@ -325,6 +449,7 @@ fn report(database: &str, status: ActivationStatus) -> Value {
         "database": database,
         "incarnation": status.binding.incarnation,
         "revision": status.binding.revision,
+        "destination_cell": status.destination_cell,
         "grants_closed": status.grants_closed,
         "grants_end_micros": status.grants_end_micros,
         "grant_protocol_version": status.grant_protocol_version,
@@ -384,20 +509,40 @@ fn arguments_error() -> Anomaly {
     )
 }
 
+fn destination(fields: &mut BTreeMap<String, String>) -> Result<Destination> {
+    let journal_url = take(fields, "--journal-url")?;
+    if !journal_url.starts_with(CONSENSUS_SCHEME) {
+        return Err(arguments_error());
+    }
+    Ok(Destination {
+        data: take(fields, "--data")?.into(),
+        journal_url,
+        journal_tls_dir: take(fields, "--tls-dir")?.into(),
+    })
+}
+
+#[cfg(unix)]
+fn manifest_digest(input: String) -> Result<[u8; 32]> {
+    let bytes = input.as_bytes();
+    if bytes.len() != 64 || !bytes.iter().all(u8::is_ascii_hexdigit) {
+        return Err(arguments_error());
+    }
+    let mut digest = [0; 32];
+    for (byte, digits) in digest.iter_mut().zip(bytes.chunks_exact(2)) {
+        let digits = std::str::from_utf8(digits).map_err(|_| arguments_error())?;
+        *byte = u8::from_str_radix(digits, 16).map_err(|_| arguments_error())?;
+    }
+    Ok(digest)
+}
+
 async fn read_installation(
     destination: &Destination,
-    scope: rtdb_db::ActivationScope,
+    intent: &Intent,
     apple_sync: rtdb_storage::AppleSync,
-) -> Result<VerifiedSuccessor> {
-    let missing = || {
-        Anomaly::incorrect(
-            "rtdb/activation-destination",
-            "Publish requires a committed portable restore on initialized destination data",
-        )
-    };
+) -> Result<rtdb_db::InstalledBackup> {
     let data = &destination.data;
     if !data.join("database-id").is_file() || !data.join("journal").is_file() {
-        return Err(missing());
+        return Err(missing_installation());
     }
     let mut configuration = NodeConfiguration::from_yaml_with_environment("", &|_| None, false)?;
     configuration.apple_sync = apple_sync;
@@ -410,10 +555,10 @@ async fn read_installation(
         data,
         &mut configuration,
         MemoryBudget::new(256 << 20),
-        None,
+        Some(intent.candidate()?),
         Some(journal),
         None,
-        Some(scope),
+        Some(intent.scope()?),
     )
     .await?;
     let result = async {
@@ -423,12 +568,124 @@ async fn read_installation(
                 runtime.bootstrap[DEVELOPMENT_DATABASE],
             )
             .await?;
-        let proof = database.installed_backup().await?.ok_or_else(missing)?;
-        Ok(VerifiedSuccessor::from_installation(&proof))
+        database
+            .installed_backup()
+            .await?
+            .ok_or_else(missing_installation)
     }
     .await;
     runtime.close().await;
     result
+}
+
+#[cfg(unix)]
+async fn attest_installation(
+    destination: &Destination,
+    intent: Intent,
+    manifest_sha256: [u8; 32],
+    key: &ring::signature::Ed25519KeyPair,
+) -> Result<Attestation> {
+    use std::{net::Ipv4Addr, sync::Arc};
+
+    use rtdb_crypt::FileKms;
+    use rtdb_db::{MultiDatabase, MultiOptions};
+    use rtdb_node::{Clock, SystemClock};
+    use rtdb_storage::{IoRegion, LocalStore};
+    use sha2::{Digest, Sha256};
+
+    use crate::multi::{CLOCK_DRIFT_MICROS, WRITER_LEASE_MICROS, io_error};
+
+    let data = &destination.data;
+    let candidate = intent.candidate()?;
+    // Serialize with local restore and serving without opening a development runtime.
+    let lock = existing_marker(&data.join("journal"))?;
+    match fs2::FileExt::try_lock_exclusive(&lock) {
+        Ok(()) => (),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            return Err(Anomaly::new(
+                rtdb_types::AnomalyCategory::Busy,
+                "rtdb.multi/development-journal",
+                "Multi development data already has a local writer",
+            ));
+        }
+        Err(error) => return Err(io_error(error)),
+    }
+    let journal_marker: [u8; 32] = Sha256::digest(destination.journal_url.as_bytes()).into();
+    check_marker(&lock, &journal_marker)?;
+    check_marker(
+        &existing_marker(&data.join("database-id"))?,
+        candidate.as_bytes(),
+    )?;
+
+    let connection = crate::cli::development_stream_journal(
+        &destination.journal_url,
+        &destination.journal_tls_dir,
+    )?;
+    let journal = rtdb_stream_journal::connect_consensus(&connection.url, &connection.credentials)
+        .ok_or_else(missing_installation)?
+        .map_err(io_error)?;
+    let keys = Arc::new(FileKms::open(&data.join("keys"), || SystemClock.now().0)?);
+    let objects = data.join("objects");
+    if !objects.is_dir() {
+        return Err(missing_installation());
+    }
+
+    let io = IoRegion::new();
+    let store = Arc::new(LocalStore::open_in(objects, io.clone())?);
+    let mut database = MultiDatabase::new(
+        MultiOptions {
+            database: candidate,
+            node: Ipv4Addr::LOCALHOST.into(),
+            lease_micros: WRITER_LEASE_MICROS,
+            drift_micros: CLOCK_DRIFT_MICROS,
+        },
+        Arc::new(journal),
+        store,
+        keys,
+        Arc::new(|| SystemClock.now()),
+    )?
+    .with_immutable_journal()
+    .with_activation_scope(intent.scope()?)?;
+    let result = database.installed_backup().await;
+    io.close_and_wait().await;
+    let installed = result?.ok_or_else(missing_installation)?;
+    Attestation::sign(intent, manifest_sha256, &installed, key)
+}
+
+#[cfg(unix)]
+fn existing_marker(path: &std::path::Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(crate::multi::io_error)?;
+    if !file.metadata().map_err(crate::multi::io_error)?.is_file() {
+        return Err(missing_installation());
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn check_marker<const LENGTH: usize>(file: &std::fs::File, expected: &[u8; LENGTH]) -> Result<()> {
+    use std::io::Read;
+
+    let mut bytes = Vec::new();
+    file.take((LENGTH + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(crate::multi::io_error)?;
+    if bytes != expected {
+        return Err(missing_installation());
+    }
+    Ok(())
+}
+
+fn missing_installation() -> Anomaly {
+    Anomaly::incorrect(
+        "rtdb/activation-destination",
+        "Activation requires a committed portable restore on initialized destination data",
+    )
 }
 
 #[cfg(test)]
@@ -446,7 +703,7 @@ mod tests {
         let options = Options::parse(arguments.split_whitespace().map(str::to_owned)).unwrap();
         assert!(matches!(options.0,
                 Command::Direct { request: Request { action: Action::Publish {
-                    expected: Binding { incarnation, revision: 7 }, operation_id
+                    expected: Binding { incarnation, revision: 7 }, operation_id, installation: None,
                 }, .. }, destination: Some(_), .. }
                 if incarnation == predecessor && operation_id == operation));
         assert!(Options::parse(arguments.split_whitespace().map(str::to_owned).take(12)).is_err());
@@ -508,6 +765,7 @@ mod tests {
                     predecessor: expected.incarnation,
                     successor,
                     manifest_digest: [2; 32],
+                    destination_cell: None,
                     activation_scope: Some(
                         rtdb_db::ActivationScope::new(authority.identity(), &database).unwrap(),
                     ),
@@ -523,15 +781,30 @@ mod tests {
             action: Action::Publish {
                 expected,
                 operation_id,
+                installation: None,
             },
         };
         let reply = request(expected)
-            .execute(&authority, None, rtdb_storage::AppleSync::default())
+            .execute(
+                &authority,
+                None,
+                &Attestors::new(),
+                rtdb_storage::AppleSync::default(),
+            )
             .await
             .unwrap();
         assert_eq!(
             reply,
-            report(&database, ActivationStatus::published(published))
+            report(
+                &database,
+                ActivationStatus {
+                    binding: published,
+                    destination_cell: None,
+                    grants_closed: false,
+                    grants_end_micros: None,
+                    grant_protocol_version: super::super::ELAPSED_GRANT_PROTOCOL,
+                }
+            )
         );
         let wrong = Binding {
             incarnation: Uuid::new_v4(),
@@ -539,11 +812,83 @@ mod tests {
         };
         assert_eq!(
             request(wrong)
-                .execute(&authority, None, rtdb_storage::AppleSync::default())
+                .execute(
+                    &authority,
+                    None,
+                    &Attestors::new(),
+                    rtdb_storage::AppleSync::default()
+                )
                 .await
                 .unwrap_err()
                 .code,
             "rtdb/activation-conflict",
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+pub(in crate::multi) mod testing {
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+
+    use super::*;
+
+    pub(in crate::multi) struct Installation {
+        request: Request,
+        attestors: Attestors,
+    }
+
+    impl Installation {
+        pub(in crate::multi) fn attest(
+            authority: &ActivationAuthority,
+            database: &str,
+            expected: Binding,
+            operation_id: Uuid,
+            cell: Uuid,
+            installed: &rtdb_db::InstalledBackup,
+        ) -> Self {
+            let key = Ed25519KeyPair::from_seed_unchecked(&[7; 32]).unwrap();
+            let intent = Intent {
+                authority_id: authority.identity(),
+                database: database.to_owned(),
+                expected,
+                operation_id,
+                cell: Some(cell),
+            };
+            let manifest_sha256 = installed.manifest_sha256();
+            let attestation = Attestation::sign(intent, manifest_sha256, installed, &key).unwrap();
+            Self {
+                request: Request {
+                    database: database.to_owned(),
+                    action: Action::Publish {
+                        expected,
+                        operation_id,
+                        installation: Some(RemoteInstallation {
+                            cell,
+                            manifest_sha256,
+                            attestation,
+                        }),
+                    },
+                },
+                attestors: Attestors::from([(cell, key.public_key().as_ref().try_into().unwrap())]),
+            }
+        }
+
+        pub(in crate::multi) async fn publish(
+            &self,
+            authority: &ActivationAuthority,
+        ) -> Result<Value> {
+            broker::call_test_peer(authority, &self.attestors, &self.request).await
+        }
+
+        pub(in crate::multi) async fn retry_without_proof(
+            &self,
+            authority: &ActivationAuthority,
+        ) -> Result<Value> {
+            let mut request = self.request.clone();
+            if let Action::Publish { installation, .. } = &mut request.action {
+                *installation = None;
+            }
+            broker::call_test_peer(authority, &Attestors::new(), &request).await
+        }
     }
 }

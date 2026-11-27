@@ -1481,7 +1481,7 @@ impl Backends {
     fn bound_database(&self, database: MultiDatabase, name: &str, id: Uuid) -> Result<MultiDatabase> {
         match &self.activation {
             Some(activation) => Ok(database
-                .with_activation_scope(ActivationScope::new(activation.identity(), name)?)?
+                .with_activation_scope(activation.scope(name)?)?
                 .with_serving_authority(activation.serving_authority(name, id)?)),
             None => match self.offline_scope {
                 Some(scope) => database.with_activation_scope(scope),

@@ -11,14 +11,23 @@ pub struct ActivationScope([u8; 32]);
 
 impl ActivationScope {
     pub fn new(authority_id: Uuid, database_name: &str) -> Result<Self> {
-        if authority_id.is_nil() || database_name.is_empty() {
+        Self::for_cell(authority_id, database_name, None)
+    }
+
+    pub fn for_cell(authority_id: Uuid, database_name: &str, cell: Option<Uuid>) -> Result<Self> {
+        if authority_id.is_nil() || database_name.is_empty() || cell.is_some_and(|id| id.is_nil()) {
             return Err(Anomaly::incorrect(
                 "rtdb/activation-scope",
                 "Activation requires an authority identity and database name",
             ));
         }
         let mut digest = Sha256::new();
-        digest.update(b"rtdb.database-activation.v1");
+        if let Some(cell) = cell {
+            digest.update(b"rtdb.database-cell-activation.v1");
+            digest.update(cell.as_bytes());
+        } else {
+            digest.update(b"rtdb.database-activation.v1");
+        }
         digest.update(authority_id.as_bytes());
         digest.update(database_name.as_bytes());
         Ok(Self(digest.finalize().into()))
@@ -27,7 +36,11 @@ impl ActivationScope {
 
 pub(crate) fn encode_entry(scope: Option<ActivationScope>, epoch: u64, record: &[u8]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(9 + scope.map_or(0, |scope| scope.0.len()) + record.len());
-    bytes.push(if scope.is_some() { COMMISSIONED_ENVELOPE } else { LEGACY_ENVELOPE });
+    bytes.push(if scope.is_some() {
+        COMMISSIONED_ENVELOPE
+    } else {
+        LEGACY_ENVELOPE
+    });
     bytes.extend_from_slice(&epoch.to_be_bytes());
     if let Some(scope) = scope {
         bytes.extend_from_slice(&scope.0);
@@ -45,7 +58,8 @@ pub(crate) fn decode_entry(scope: Option<ActivationScope>, bytes: &[u8]) -> Resu
     match (header[0], scope) {
         (LEGACY_ENVELOPE, None) => Ok((epoch, record)),
         (COMMISSIONED_ENVELOPE, Some(scope)) => {
-            let (record_scope, record) = record.split_first_chunk::<32>().ok_or_else(invalid_entry)?;
+            let (record_scope, record) =
+                record.split_first_chunk::<32>().ok_or_else(invalid_entry)?;
             if *record_scope != scope.0 {
                 return Err(scope_mismatch());
             }

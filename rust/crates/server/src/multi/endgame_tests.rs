@@ -1,4 +1,6 @@
-use super::activation::{ActivationAuthority, VerifiedSuccessor};
+use super::activation::ActivationAuthority;
+#[cfg(not(unix))]
+use super::activation::VerifiedSuccessor;
 use journal_contract::Journal;
 use rtdb_crypt::FileKms;
 use rtdb_db::{ActivationScope, MultiDatabase, MultiOptions, PortableBackup, Role};
@@ -101,7 +103,11 @@ async fn portable_cut_replaces_a_lost_cell_and_fences_its_return() {
     let predecessor_id = Uuid::new_v4();
     let predecessor_binding = authority.bootstrap(NAME, predecessor_id).await.unwrap();
     let operation = Uuid::new_v4();
-    let successor_id = authority.successor_incarnation(NAME, predecessor_binding, operation).unwrap();
+    let destination_cell = cfg!(unix).then(Uuid::new_v4);
+    let successor_id = authority
+        .successor_incarnation_in_cell(NAME, predecessor_binding, operation, destination_cell)
+        .unwrap();
+    let destination_scope = ActivationScope::for_cell(authority.identity(), NAME, destination_cell).unwrap();
     let vaults = tempfile::tempdir().unwrap();
     let (mut source_keepers, source_journal) = journal().await;
     let source_keeper_ids = source_keepers.keepers().keys().copied().collect::<Vec<_>>();
@@ -140,7 +146,7 @@ async fn portable_cut_replaces_a_lost_cell_and_fences_its_return() {
         destination_store.clone(),
         destination_keys.clone(),
     )
-    .with_activation_scope(activation_scope)
+    .with_activation_scope(destination_scope)
     .unwrap();
     staging.create().await.unwrap();
     assert!(matches!(
@@ -168,12 +174,12 @@ async fn portable_cut_replaces_a_lost_cell_and_fences_its_return() {
         destination_store.clone(),
         destination_keys.clone(),
     )
-    .with_activation_scope(activation_scope)
+    .with_activation_scope(destination_scope)
     .unwrap();
     let installed = staged_reopen.installed_backup().await.unwrap().unwrap();
     let offline = MultiServing::new(
         database(successor_id, destination_journal.clone(), destination_store.clone(), destination_keys.clone())
-            .with_activation_scope(activation_scope).unwrap(),
+            .with_activation_scope(destination_scope).unwrap(),
         rtdb_types::MemoryBudget::new(64 << 20),
     );
     assert_eq!(
@@ -199,13 +205,27 @@ async fn portable_cut_replaces_a_lost_cell_and_fences_its_return() {
         wrong_authority.check_activation_scope(head).await.unwrap_err().code,
         "rtdb/activation-scope"
     );
+    #[cfg(not(unix))]
     let successor = VerifiedSuccessor::from_installation(&installed);
-    let active = tokio::time::timeout(Duration::from_secs(10), async {
+    #[cfg(unix)]
+    let publication = super::activation::operator::testing::Installation::attest(
+        &authority,
+        NAME,
+        predecessor_binding,
+        operation,
+        destination_cell.unwrap(),
+        &installed,
+    );
+    let destination_keeper_ids = destination_keepers.keepers().keys().copied().collect::<Vec<_>>();
+    destination_keepers.shutdown().await.unwrap();
+
+    let _active = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            match authority
-                .publish_successor(NAME, predecessor_binding, operation, successor)
-                .await
-            {
+            #[cfg(unix)]
+            let result = publication.publish(&authority).await;
+            #[cfg(not(unix))]
+            let result = authority.publish_successor(NAME, predecessor_binding, operation, successor).await;
+            match result {
                 Ok(active) => break active,
                 Err(error) if error.code == "rtdb/activation-draining" => {
                     tokio::time::sleep(Duration::from_millis(25)).await;
@@ -216,19 +236,44 @@ async fn portable_cut_replaces_a_lost_cell_and_fences_its_return() {
     })
     .await
     .unwrap();
-    assert_eq!(active.incarnation, successor_id);
-    assert_eq!(active.revision, predecessor_binding.revision + 1);
+    #[cfg(unix)]
+    {
+        assert_eq!(_active["incarnation"], successor_id.to_string());
+        assert_eq!(_active["revision"], predecessor_binding.revision + 1);
+        assert_eq!(_active["destination_cell"], destination_cell.unwrap().to_string());
+        assert_eq!(_active["grant_protocol_version"], 3);
+        assert_eq!(publication.retry_without_proof(&authority).await.unwrap(), _active);
+        let wrong_cell = Uuid::new_v4();
+        assert_ne!(
+            authority.successor_incarnation_in_cell(NAME, predecessor_binding, operation, Some(wrong_cell)).unwrap(),
+            successor_id,
+        );
+        for cell in [None, Some(wrong_cell)] {
+            assert_eq!(
+                authority.serving_authority_for_cell(NAME, successor_id, cell).unwrap()
+                    .acquire().await.unwrap_err().code,
+                "rtdb/activation-fenced",
+            );
+        }
+    }
+    let binding = authority.binding(NAME).await.unwrap();
+    assert_eq!(binding.incarnation, successor_id);
+    assert_eq!(binding.revision, predecessor_binding.revision + 1);
+    #[cfg(not(unix))]
     assert_eq!(
         authority
             .publish_successor(NAME, predecessor_binding, operation, successor)
             .await
             .unwrap(),
-        active
+        binding
     );
 
+    for keeper in destination_keeper_ids {
+        destination_keepers.restart(keeper).await.unwrap();
+    }
     let destination = MultiServing::new(
         staged_reopen
-            .with_serving_authority(authority.serving_authority(NAME, successor_id).unwrap()),
+            .with_serving_authority(authority.serving_authority_for_cell(NAME, successor_id, destination_cell).unwrap()),
         rtdb_types::MemoryBudget::new(64 << 20),
     );
     let cancellation = CancellationToken::new();
@@ -269,6 +314,12 @@ async fn portable_cut_replaces_a_lost_cell_and_fences_its_return() {
             .code,
         "rtdb/activation-fenced"
     );
+    authority.close_grants(NAME, binding).await.unwrap();
+    let frozen = authority.status(NAME).await.unwrap();
+    assert!(frozen.grants_closed);
+    assert_eq!(frozen.destination_cell, destination_cell);
+    #[cfg(unix)]
+    assert_eq!(frozen.grant_protocol_version, 3);
     source_keepers.shutdown().await.unwrap();
     destination_keepers.shutdown().await.unwrap();
     authority_keepers.shutdown().await.unwrap();
