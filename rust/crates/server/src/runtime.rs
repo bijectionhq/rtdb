@@ -249,6 +249,10 @@ impl ServerDriver {
         let mut options = config.node_options(allocation_limit_bytes)?;
         options.owned_relations = config.flight_sql.as_ref().is_some_and(|flight| flight.port >= 0 && flight.owned_native_actions);
         if let Some(placed) = &placed {
+            if options.replication.activate_classic_utf16_relation_oids {
+                return Err(Anomaly::incorrect("rtdb.config/classic-relation-oid-order",
+                    "indexer.activateClassicUtf16RelationOids requires a Classic node"));
+            }
             options.membership = rtdb_node::Membership::Placed;
             options.replication.claim_wait = Some(placed.claim_wait);
             options.replication.idle_heartbeat = false;

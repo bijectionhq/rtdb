@@ -44,7 +44,7 @@ pub fn replica_uses_extension(body: &ReplicaBody) -> bool {
             || upload.tries.iter().any(trie_uses_extension),
         ReplicaBody::OversizedMessage(oversized) => oversized.publication.is_some()
             || oversized.storage_version == Some(ADMITTED_OFFLOAD_STORAGE),
-        ReplicaBody::BlockBoundary(_) => false,
+        ReplicaBody::BlockBoundary(boundary) => boundary.relation_oid_order.is_some(),
     }
 }
 
@@ -56,7 +56,7 @@ fn resolved_uses_extension(tx: &ResolvedTx) -> bool {
 /// A block catalog XTDB would open without the feature it records: a later naming epoch, a serving checkpoint,
 /// or a table XTDB does not have.
 pub fn block_uses_extension(block: &block_pb::Block) -> bool {
-    block.naming_epoch.is_some_and(|epoch| epoch > 0)
+    block.relation_oid_order.is_some() || block.naming_epoch.is_some_and(|epoch| epoch > 0)
         || block.serving_checkpoint.is_some() || block.serving_checkpoint_object.is_some()
         || block.tables.iter().any(|entry| rtdb_only_table_ref(&TableRef::new(
             entry.schema_name.as_deref().unwrap_or_default(), entry.table_name.as_deref().unwrap_or_default())))

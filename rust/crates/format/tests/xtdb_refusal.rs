@@ -3,13 +3,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use prost::{Message, bytes::Bytes};
 use rtdb_format::block::proto as block_pb;
-use rtdb_format::catalog::{BlockCatalog, TableBlock};
+use rtdb_format::catalog::{BlockCatalog, RelationOidOrder, TableBlock, TableEntry, FIRST_TABLE_OID};
 use rtdb_format::envelope::{
     ReplicaBody, ReplicaEnvelope, ReplicaFrame, SourceBody, SourceMessage, replica_uses_extension, source_uses_extension,
 };
 use rtdb_format::generated::xtdb::log::proto as pb;
 use rtdb_format::{PROTOBUF_LOG_HEADER, RTDB_EXTENSION_LOG_HEADER, XTDB_REFUSAL_PREFIX};
-use rtdb_types::{BlockIndex, StorageEpoch, StorageVersion, Term, TermSequence};
+use rtdb_types::{BlockIndex, StorageEpoch, StorageVersion, TableRef, Term, TermSequence};
 
 const LOG_PROTO: &str = include_str!("../../../../core/src/main/proto/xtdb/log/proto/log.proto");
 const REPLICA_PROTO: &str = include_str!("../../../../core/src/main/proto/xtdb/log/proto/replica-log.proto");
@@ -68,6 +68,7 @@ const FORK_FIELDS: &[(&str, u32, Fork)] = &[
     ("ResolvedTx", 1001, Fork::Framed),
     ("ResolvedTx", 1002, Fork::Framed),
     ("ResolvedTx", 1003, Fork::Framed),
+    ("BlockBoundary", 1000, Fork::Framed),
     ("NoOp", 1000, Fork::Framed),
     ("NoOp", 1001, Fork::Framed),
     ("OversizedMessage", 1000, Fork::Annotation("the digest of the payload, which XTDB fetches by its key")),
@@ -83,7 +84,40 @@ const FORK_FIELDS: &[(&str, u32, Fork)] = &[
     ("Block", 1001, Fork::Annotation("the digests of the table block files, which XTDB reads by their keys")),
     ("Block", 1002, Fork::Framed),
     ("Block", 1003, Fork::Framed),
+    ("Block", 1004, Fork::Framed),
 ];
+
+#[test]
+fn relation_oid_order_requires_a_reader_that_understands_the_version() {
+    let rule = RelationOidOrder::Utf16.wire_value();
+    let body = ReplicaBody::BlockBoundary(pb::BlockBoundary {
+        block_index: Some(5), relation_oid_order: rule, ..Default::default()
+    });
+    let envelope = ReplicaEnvelope { term: Term(1), term_sequence: Some(TermSequence(0)), message: body };
+    let record = envelope.encode();
+    assert_eq!(&record[..3], &[RTDB_EXTENSION_LOG_HEADER, 0, 0]);
+    assert_eq!(record.len(), envelope.encoded_len());
+    let mut appended = Vec::new();
+    ReplicaEnvelope::encode_body(envelope.term, envelope.term_sequence, &envelope.message, &mut appended);
+    assert_eq!(appended, record);
+    assert!(pb::ReplicaLogMessage::decode(&record[1..]).is_err());
+    assert!(pb::ReplicaLogMessage::decode(&record[2..]).is_err());
+    assert_eq!(ReplicaEnvelope::decode(&record).unwrap(), Some(envelope.clone()));
+    assert_eq!(ReplicaFrame::decode_bytes(Bytes::copy_from_slice(&record)).unwrap().into_envelope(), Some(envelope));
+    assert!(!ReplicaFrame::has_external_payload(&record).unwrap());
+    assert!(ReplicaFrame::decode(&[&record[..2], &record[3..]].concat()).is_err());
+
+    let root = block_pb::Block {
+        tables: vec![TableEntry::new(FIRST_TABLE_OID, TableRef::new("public", "docs")).unwrap().to_proto()],
+        relation_oid_order: rule, ..Default::default()
+    };
+    let bytes = BlockCatalog::from_proto(root.clone()).unwrap().encode();
+    assert_eq!(&bytes[..2], &[0, 0]);
+    assert!(block_pb::Block::decode(&bytes[1..]).is_err());
+    assert_eq!(BlockCatalog::decode(&bytes).unwrap().relation_oid_order(), RelationOidOrder::Utf16);
+    assert!(BlockCatalog::decode(&bytes[1..]).is_err());
+    assert!(BlockCatalog::from_proto(block_pb::Block { relation_oid_order: Some(2), ..root }).is_err());
+}
 
 /// The field numbers a `.proto` file declares for `message`, oneof members included.
 fn declared_fields(proto: &str, message: &str) -> BTreeSet<u32> {
@@ -203,6 +237,9 @@ fn extension_replica_bodies() -> Vec<(Option<(&'static str, u32)>, ReplicaBody)>
             message.storage_version = Some(-1);
             message.publication = Some(pb::ReplicaPayloadPublication { storage_version: Some(6), ..Default::default() });
         })),
+        (Some(("BlockBoundary", 1000)), ReplicaBody::BlockBoundary(pb::BlockBoundary {
+            relation_oid_order: RelationOidOrder::Utf16.wire_value(), ..Default::default()
+        })),
     ]
 }
 
@@ -250,6 +287,7 @@ fn extension_block_files() -> Vec<(Option<(&'static str, u32)>, Vec<u8>)> {
         (Some(("Block", 1000)), block(|wire| wire.naming_epoch = Some(1))),
         (Some(("Block", 1002)), block(|wire| wire.serving_checkpoint = Some(vec![1].into()))),
         (Some(("Block", 1003)), block(|wire| wire.serving_checkpoint_object = Some("checkpoint".into()))),
+        (Some(("Block", 1004)), block(|wire| wire.relation_oid_order = RelationOidOrder::Utf16.wire_value())),
         (None, block(|wire| wire.tables = vec![block_pb::TableEntry {
             oid: Some(16_384), schema_name: Some("xt".into()), table_name: Some("idempotency_receipts".into()), slug: Some("xt$idempotency_receipts".into()),
         }])),
@@ -343,11 +381,15 @@ fn an_extension_replica_record_fails_xtdbs_parser_and_reads_as_itself_to_rtdb() 
 
 #[test]
 fn replica_records_framed_before_the_extension_header_still_decode() {
-    for (_, message) in extension_replica_bodies() {
+    for (field, message) in extension_replica_bodies() {
         let stamped = envelope(message);
         let mut legacy = vec![PROTOBUF_LOG_HEADER];
         pb::ReplicaLogMessage { term_id: Some(3), term_seq: Some(5), message: Some(stamped.message.clone()) }.encode(&mut legacy).unwrap();
-        assert_eq!(ReplicaEnvelope::decode(&legacy).unwrap(), Some(stamped));
+        if field == Some(("BlockBoundary", 1000)) {
+            assert!(ReplicaEnvelope::decode(&legacy).is_err());
+        } else {
+            assert_eq!(ReplicaEnvelope::decode(&legacy).unwrap(), Some(stamped));
+        }
     }
 }
 

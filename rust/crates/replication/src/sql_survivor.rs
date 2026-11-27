@@ -220,6 +220,7 @@ impl SurvivorInput<'_> {
             term_id: Some(self.fence.highest_term().0),
             boundary_term_seq: sequence,
             naming_epoch: Some(naming_epoch),
+            relation_oid_order: registry.relation_oid_order().wire_value(),
             table_block_manifest: Some(pb::TableBlockManifest {
                 sha256_by_oid: digests,
             }),

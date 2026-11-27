@@ -90,6 +90,7 @@ message BlockBoundary {
     int64 block_index = 1;
     int64 latest_processed_msg_id = 2;
     bytes external_source_token = 3;
+    int32 relation_oid_order = 1000;
 }
 
 message NoOp {

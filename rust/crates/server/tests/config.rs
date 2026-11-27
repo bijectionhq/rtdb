@@ -407,6 +407,15 @@ fn node_options_apply_indexer_compactor_gc_and_shared_memory_settings() {
 }
 
 #[test]
+fn classic_oid_order_activation_requires_an_explicit_indexer_setting() {
+    let defaults = decode("{}").unwrap().node_options(1 << 20).unwrap();
+    assert!(!defaults.replication.activate_classic_utf16_relation_oids);
+    let opted_in = decode("indexer: {activateClassicUtf16RelationOids: true}").unwrap().node_options(1 << 20).unwrap();
+    assert!(opted_in.replication.activate_classic_utf16_relation_oids);
+    assert!(decode("indexer: {activateClassicUtf16RelationOids: utf16}").is_err());
+}
+
+#[test]
 fn garbage_collector_settings_accept_the_forms_xtdb_yaml_accepts() {
     for (text, blocks) in [("4", 4), ("+4", 4), ("'4'", 4), ("0x1A", 26), ("0o17", 15), ("0x+2", 2), ("-0x-1", 0), ("0x", 0), ("4.0", 0), ("0", 0), ("-0x1", 0)] {
         let decoded = decode(&format!("garbageCollector:\n  blocksToKeep: {text}\n"));

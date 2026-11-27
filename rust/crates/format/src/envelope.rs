@@ -5,6 +5,23 @@ use rtdb_types::{Anomaly, BlockIndex, PhysicalObjectVersion, PlacedAttempt, Resu
 use crate::stage_journal::{InvalidStageJournal, checked_journal_fields};
 use crate::{LEGACY_FLUSH_HEADER, LEGACY_TX_HEADER, PROTOBUF_LOG_HEADER, RTDB_EXTENSION_LOG_HEADER, XTDB_REFUSAL_PREFIX};
 
+pub(crate) const REQUIRED_RTDB_PREFIX: [u8; 2] = [0, 0];
+const REQUIRED_REPLICA_PREFIX: [u8; 3] = [RTDB_EXTENSION_LOG_HEADER, 0, 0];
+
+fn requires_oid_order(body: &ReplicaBody) -> bool {
+    matches!(body, ReplicaBody::BlockBoundary(boundary) if boundary.relation_oid_order.is_some())
+}
+
+fn check_oid_order(body: Option<&ReplicaBody>, required: bool) -> Result<()> {
+    if body.is_some_and(requires_oid_order) != required {
+        return Err(invalid("Replica framing and relation OID order version disagree"));
+    }
+    if let Some(ReplicaBody::BlockBoundary(boundary)) = body {
+        crate::catalog::RelationOidOrder::from_wire(boundary.relation_oid_order)?;
+    }
+    Ok(())
+}
+
 mod decoder;
 mod decoder_leaves;
 mod detached;
@@ -242,14 +259,25 @@ impl crate::log::proto::ResolvedTx {
 
 impl ReplicaFrame {
     pub fn has_external_payload(bytes: &[u8]) -> Result<bool> {
+        if bytes.starts_with(&REQUIRED_REPLICA_PREFIX) {
+            return Self::decode(bytes).map(|_| false);
+        }
         decoder::has_external_payload(bytes)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        decoder::decode_replica_frame(bytes)
+        if let Some(body) = bytes.strip_prefix(&REQUIRED_REPLICA_PREFIX) {
+            return Self::decode_body(body, true);
+        }
+        let frame = decoder::decode_replica_frame(bytes)?;
+        check_oid_order(frame.message.as_ref(), false)?;
+        Ok(frame)
     }
 
     pub fn decode_bytes(bytes: Bytes) -> Result<Self> {
+        if bytes.starts_with(&REQUIRED_REPLICA_PREFIX) {
+            return Self::decode_body(bytes.slice(REQUIRED_REPLICA_PREFIX.len()..), true);
+        }
         let Some(&header) = bytes.first() else { return Err(invalid("Empty replica message")); };
         let body = match header {
             PROTOBUF_LOG_HEADER => bytes.slice(1..),
@@ -257,8 +285,13 @@ impl ReplicaFrame {
             RTDB_EXTENSION_LOG_HEADER => return Err(invalid("RTDB extension replica record is missing its XTDB refusal prefix")),
             _ => return Err(decoder_leaves::unknown_header(header, "replica")),
         };
+        Self::decode_body(body, false)
+    }
+
+    fn decode_body(body: impl prost::bytes::Buf, required: bool) -> Result<Self> {
         let message = crate::log::proto::ReplicaLogMessage::decode(body).map_err(|error| invalid(error.to_string()))?;
         decoder_leaves::check_stage(&message.message)?;
+        check_oid_order(message.message.as_ref(), required)?;
         Ok(Self { term: Term(message.term_id.unwrap_or_default()), term_sequence: message.term_seq.map(TermSequence), message: message.message })
     }
 }
@@ -278,27 +311,38 @@ impl ReplicaEnvelope {
     }
 
     fn framed_len(message: &ReplicaBody, term: u64, sequence: Option<u64>) -> usize {
-        let prefix = if replica_uses_extension(message) { XTDB_REFUSAL_PREFIX.len() } else { 0 };
-        1 + prefix + message.encoded_len() + 1 + varint_length(term)
+        Self::prefix(message).len() + message.encoded_len() + 1 + varint_length(term)
             + sequence.map_or(0, |sequence| 1 + varint_length(sequence))
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Option<Self>> {
-        decoder::decode_replica_envelope(bytes)
+        if bytes.starts_with(&REQUIRED_REPLICA_PREFIX) {
+            return Ok(ReplicaFrame::decode(bytes)?.into_envelope());
+        }
+        let envelope = decoder::decode_replica_envelope(bytes)?;
+        check_oid_order(envelope.as_ref().map(|envelope| &envelope.message), false)?;
+        Ok(envelope)
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        decoder::encode_replica_envelope(self)
+        if !requires_oid_order(&self.message) { return decoder::encode_replica_envelope(self); }
+        let mut output = Vec::with_capacity(self.encoded_len());
+        Self::encode_body(self.term, self.term_sequence, &self.message, &mut output);
+        output
+    }
+
+    fn prefix(message: &ReplicaBody) -> &'static [u8] {
+        if requires_oid_order(message) {
+            &REQUIRED_REPLICA_PREFIX
+        } else if replica_uses_extension(message) {
+            &[RTDB_EXTENSION_LOG_HEADER, XTDB_REFUSAL_PREFIX[0]]
+        } else {
+            &[PROTOBUF_LOG_HEADER]
+        }
     }
 
     pub fn encode_body(term: Term, sequence: Option<TermSequence>, message: &ReplicaBody, output: &mut impl BufMut) {
-        let extension = replica_uses_extension(message);
-        if extension {
-            output.put_u8(RTDB_EXTENSION_LOG_HEADER);
-            output.put_slice(&XTDB_REFUSAL_PREFIX);
-        } else {
-            output.put_u8(PROTOBUF_LOG_HEADER);
-        }
+        output.put_slice(Self::prefix(message));
         // Prost sorts the oneof by its smallest tag, ahead of both term fields.
         message.encode(output);
         int64::encode(7, &term.0, output);

@@ -22,6 +22,38 @@ macro_rules! each_checkpoint_input {
 
 pub const FIRST_TABLE_OID: u32 = 16_384;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RelationOidOrder {
+    #[default]
+    LegacyUtf8,
+    Utf16,
+}
+
+impl RelationOidOrder {
+    pub fn from_wire(value: Option<i32>) -> Result<Self> {
+        match value {
+            None => Ok(Self::LegacyUtf8),
+            Some(1) => Ok(Self::Utf16),
+            Some(value) => Err(Anomaly::unsupported("rtdb.format/relation-oid-order",
+                format!("Unsupported relation OID order version {value}"))),
+        }
+    }
+
+    pub fn wire_value(self) -> Option<i32> {
+        match self {
+            Self::LegacyUtf8 => None,
+            Self::Utf16 => Some(1),
+        }
+    }
+
+    pub fn sort_names<T>(self, names: &mut [(String, T)]) {
+        names.sort_by(|(a, _), (b, _)| match self {
+            Self::LegacyUtf8 => a.cmp(b),
+            Self::Utf16 => a.encode_utf16().cmp(b.encode_utf16()),
+        });
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TableEntry {
     pub oid: u32,
@@ -51,6 +83,7 @@ impl TableEntry {
 #[derive(Clone, Debug)]
 pub struct BlockCatalog {
     wire: Arc<pb::Block>,
+    relation_oid_order: RelationOidOrder,
     publication_sha256: Option<[u8; 32]>,
     charge: Option<Arc<MemoryReservation>>,
 }
@@ -59,7 +92,11 @@ impl PartialEq for BlockCatalog { fn eq(&self, other: &Self) -> bool { self.wire
 
 impl BlockCatalog {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let mut catalog = Self::from_proto(pb::Block::decode(unframed(bytes)).map_err(invalid)?)?;
+        let required = bytes.strip_prefix(&crate::envelope::REQUIRED_RTDB_PREFIX);
+        let mut catalog = Self::from_proto(pb::Block::decode(required.unwrap_or_else(|| unframed(bytes))).map_err(invalid)?)?;
+        if required.is_some() != catalog.relation_oid_order.wire_value().is_some() {
+            return Err(invalid("Checkpoint framing and relation OID order version disagree"));
+        }
         catalog.publication_sha256 = Some(publication_digest(bytes));
         Ok(catalog)
     }
@@ -75,7 +112,11 @@ impl BlockCatalog {
 
     pub fn from_proto(wire: pb::Block) -> Result<Self> {
         if wire.block_index.unwrap_or_default() < 0 { return Err(invalid("Block index is negative")); }
-        let catalog = Self { wire: Arc::new(wire), charge: None, publication_sha256: None };
+        let relation_oid_order = RelationOidOrder::from_wire(wire.relation_oid_order)?;
+        if relation_oid_order != RelationOidOrder::LegacyUtf8 && wire.tables.is_empty() && !wire.table_names.is_empty() {
+            return Err(invalid("Versioned relation OID order requires a recorded table registry"));
+        }
+        let catalog = Self { wire: Arc::new(wire), relation_oid_order, charge: None, publication_sha256: None };
         let entries = catalog.table_entries()?;
         if let Some(manifest) = &catalog.wire.table_block_manifest {
             let digests = &manifest.sha256_by_oid;
@@ -89,7 +130,16 @@ impl BlockCatalog {
     }
 
     /// A catalog that records an RTDB-only feature starts with [crate::XTDB_REFUSAL_PREFIX], which XTDB's parser rejects.
-    pub fn encode(&self) -> Vec<u8> { framed(&*self.wire, crate::envelope::block_uses_extension(&self.wire)) }
+    pub fn encode(&self) -> Vec<u8> {
+        let prefix: &[u8] = if self.relation_oid_order.wire_value().is_some() {
+            &crate::envelope::REQUIRED_RTDB_PREFIX
+        } else if crate::envelope::block_uses_extension(&self.wire) {
+            &crate::XTDB_REFUSAL_PREFIX
+        } else {
+            &[]
+        };
+        prefixed(&*self.wire, prefix)
+    }
     /// Binds the catalog to the exact bytes that the writer will publish.
     pub fn encode_for_publication(&mut self) -> Vec<u8> {
         let bytes = self.encode();
@@ -103,6 +153,7 @@ impl BlockCatalog {
         )
     }
     pub fn as_proto(&self) -> &pb::Block { &self.wire }
+    pub fn relation_oid_order(&self) -> RelationOidOrder { self.relation_oid_order }
     pub fn block_index(&self) -> BlockIndex { BlockIndex(self.wire.block_index.unwrap_or_default()) }
     pub fn boundary_term(&self) -> Term { Term(self.wire.term_id.unwrap_or_default()) }
     pub fn boundary_term_sequence(&self) -> Option<TermSequence> { self.wire.boundary_term_seq.map(TermSequence) }
@@ -398,6 +449,10 @@ fn unframed(bytes: &[u8]) -> &[u8] {
 
 fn framed(message: &impl Message, extension: bool) -> Vec<u8> {
     let prefix: &[u8] = if extension { &crate::XTDB_REFUSAL_PREFIX } else { &[] };
+    prefixed(message, prefix)
+}
+
+fn prefixed(message: &impl Message, prefix: &[u8]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(prefix.len() + message.encoded_len());
     bytes.extend_from_slice(prefix);
     message.encode(&mut bytes).expect("a Vec can hold the advertised encoded protobuf length");

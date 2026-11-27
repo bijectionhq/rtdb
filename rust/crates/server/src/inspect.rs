@@ -227,6 +227,7 @@ fn block_catalog(block: &BlockCatalog) -> Value {
         "tables": block.tables.iter().map(|table| json!({"oid": table.oid, "schema-name": table.schema_name, "table-name": table.table_name, "slug": table.slug})).collect::<Vec<_>>(),
         "secondary-dbs": block.secondary_databases.iter().map(|(name, config)| (name.clone(), database(config))).collect::<serde_json::Map<_, _>>(),
         "boundary-replica-msg-id": block.boundary_replica_msg_id, "boundary-term-seq": block.boundary_term_seq,
+        "relation-oid-order": block.relation_oid_order,
         "term-id": block.term_id, "external-source-token": block.external_source_token,
     })
 }

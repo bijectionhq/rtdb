@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     BlockStore, ErasureTarget, PartitionLogs, ProducedBlock, PublishedCheckpoint, ReplicaRecord,
     TermFence,
-    blocks::{checkpoint_digest, l0_tries, validate_boundary},
+    blocks::{checkpoint_digest, l0_tries, relation_oid_order_at_boundary, validate_boundary},
     serving::{self, NativeCheckpointImage, NativeServingAuthority, ServingCheckpoint},
     snapshot_replay::erasure_targets,
     sql_survivor::SurvivorInput,
@@ -240,6 +240,7 @@ impl AppliedErasure {
         }
         let mut wire = survivor.catalog.as_proto().clone();
         wire.serving_checkpoint_object = Some(object);
+        wire.relation_oid_order = relation_oid_order_at_boundary(prepared, message)?.wire_value();
         let mut catalog = BlockCatalog::from_proto(wire)?;
         validate_boundary(&catalog, prepared, boundary)?;
         store

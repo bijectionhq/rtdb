@@ -2,7 +2,7 @@ use rtdb_types::StructFields;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use rtdb_format::{block::proto as block_pb, catalog::{BlockCatalog, TableBlock, TableEntry, FIRST_TABLE_OID}, columns::column_from_type, keys::TableSlug};
+use rtdb_format::{block::proto as block_pb, catalog::{BlockCatalog, RelationOidOrder, TableBlock, TableEntry, FIRST_TABLE_OID}, columns::column_from_type, keys::TableSlug};
 use rtdb_types::{Anomaly, BlockIndex, LogicalType, Result, TableRef};
 
 pub fn absent_type(types: &StructFields<LogicalType>) -> LogicalType {
@@ -104,6 +104,9 @@ impl TableCatalog {
         Ok(Self { block: block.map(Arc::new), _retained_catalogs: table_blocks.values().filter_map(TableBlock::retain_charge).collect(), tables, entries })
     }
     pub fn block(&self) -> Option<&BlockCatalog> { self.block.as_deref() }
+    pub fn relation_oid_order(&self) -> RelationOidOrder {
+        self.block().map_or(RelationOidOrder::LegacyUtf8, BlockCatalog::relation_oid_order)
+    }
     pub fn block_index(&self) -> Option<BlockIndex> { self.block().map(BlockCatalog::block_index) }
     pub fn tables(&self) -> &BTreeMap<TableRef, TableMeta> { &self.tables }
     pub fn entries(&self) -> impl Iterator<Item = &TableEntry> { self.entries.values() }
@@ -113,13 +116,14 @@ impl TableCatalog {
         self.tables.get(table).map_or(LogicalType::Nothing, |meta| meta.contributed_type(name))
     }
     pub fn with_entries_for(&self, tables: impl IntoIterator<Item = TableRef>) -> Result<Self> {
-        let mut fresh: Vec<_> = tables.into_iter().filter(|table| !self.entries.contains_key(table)).collect::<BTreeSet<_>>().into_iter().collect();
+        let mut fresh: Vec<_> = tables.into_iter().filter(|table| !self.entries.contains_key(table))
+            .collect::<BTreeSet<_>>().into_iter().map(|table| (table.schema_and_table(), table)).collect();
         if fresh.is_empty() { return Ok(self.clone()); }
-        fresh.sort_by_key(TableRef::schema_and_table);
+        self.relation_oid_order().sort_names(&mut fresh);
         let mut next = self.clone();
         let mut oid = self.entries.values().map(|entry| entry.oid).max().map_or(Ok(FIRST_TABLE_OID), |oid| oid.checked_add(1).ok_or_else(|| invalid("Table OID space exhausted")))?;
         let mut used_slugs: BTreeSet<_> = self.entries.values().map(|entry| entry.slug.clone()).collect();
-        for (index, table) in fresh.iter().enumerate() {
+        for (index, (_, table)) in fresh.iter().enumerate() {
             let mut entry = TableEntry::new(oid, table.clone())?;
             if !used_slugs.insert(entry.slug.clone()) {
                 let base = entry.slug.as_str();
@@ -158,6 +162,9 @@ impl TableCatalog {
     }
     pub fn adopt(&self, block: BlockCatalog, delta: &BTreeMap<TableRef, TableMeta>) -> Result<Self> {
         if self.block_index().is_some_and(|previous| previous >= block.block_index()) { return Err(invalid("Block has already been adopted or is stale")); }
+        if self.relation_oid_order() == RelationOidOrder::Utf16 && block.relation_oid_order() != RelationOidOrder::Utf16 {
+            return Err(invalid("Block regresses the active relation OID order"));
+        }
         let mut next = self.fold(delta)?;
         let entries = block.table_entries()?;
         let recorded: BTreeSet<_> = entries.iter().map(|entry| &entry.table).collect();

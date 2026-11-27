@@ -741,8 +741,13 @@ async fn replay(
                     } else { Some(serving.checkpoint(record.envelope.term, false)?) }
                 } else { None };
                 let output = blocks.produce_with_search(&prepared, &record, Default::default(), cancellation, None, serving_checkpoint).await?;
-                if position == through && output.catalog.table_entries()? != target.table_entries()? {
-                    return Err(invalid("The rebuilt table registry differs from the target checkpoint"));
+                if position == through {
+                    if output.catalog.relation_oid_order() != target.relation_oid_order() {
+                        return Err(invalid("The rebuilt relation OID order differs from the target checkpoint"));
+                    }
+                    if output.catalog.table_entries()? != target.table_entries()? {
+                        return Err(invalid("The rebuilt table registry differs from the target checkpoint"));
+                    }
                 }
                 let (stored, table_blocks) = blocks.load(index).await?;
                 let digest = stored.publication_sha256().filter(|digest| Some(*digest) == output.catalog.publication_sha256())

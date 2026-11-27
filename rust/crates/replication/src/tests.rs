@@ -88,7 +88,7 @@ fn unrecognized_replica_frame(term: u8, sequence: u8, unknown_field: bool) -> By
     assert!(ReplicaEnvelope::decode(&frame).unwrap().is_none());
     frame
 }
-fn boundary(index: i64, source: i64) -> ReplicaBody { ReplicaBody::BlockBoundary(proto::BlockBoundary { block_index: Some(index), latest_processed_msg_id: Some(source), external_source_token: None }) }
+fn boundary(index: i64, source: i64) -> ReplicaBody { ReplicaBody::BlockBoundary(proto::BlockBoundary { block_index: Some(index), latest_processed_msg_id: Some(source), ..Default::default() }) }
 fn resolved(id: i64, source: i64) -> ReplicaBody { ReplicaBody::ResolvedTx(proto::ResolvedTx { tx_id: Some(id), system_time_micros: Some(id * 100 + 100), committed: Some(true), src_msg_id: Some(source), ..Default::default() }) }
 fn upload(index: i64, source: i64) -> ReplicaBody {
     ReplicaBody::BlockUploaded(proto::BlockUploaded { storage_version: Some(CURRENT_STORAGE_VERSION.0), storage_epoch: Some(0), block_index: Some(index), latest_processed_msg_id: Some(source), tries: Vec::new(), external_source_token: None, catalog_sha256: None, naming_epoch: None })
@@ -815,6 +815,7 @@ async fn recovery_advances_to_the_source_epoch_floor_without_changing_the_persis
     let token = vec![1, 2, 3];
     fixture.driver.consume(raw(1, 1, 1, ReplicaBody::BlockBoundary(proto::BlockBoundary {
         block_index: Some(0), latest_processed_msg_id: Some(4), external_source_token: Some(token.clone()),
+        ..Default::default()
     }))).await.unwrap();
     let pending = fixture.driver.pending_block.as_ref().unwrap();
     fixture.blocks.produce(&pending.prepared, &pending.boundary, BTreeMap::new()).await.unwrap();
@@ -1816,6 +1817,7 @@ async fn native_local_restart_confirms_missing_retained_blocks_in_order_for_a_su
                 })),
                 (2, ReplicaBody::BlockBoundary(proto::BlockBoundary {
                     block_index: Some(1), latest_processed_msg_id: Some(legacy.0), external_source_token: Some(vec![1]),
+                    ..Default::default()
                 })),
             ] {
                 old.logs.enqueue_replica(&ReplicaEnvelope { term: Term(2), term_sequence: Some(TermSequence(seq)), message }, BlockIndex(1), Timestamp(200))
@@ -1847,6 +1849,7 @@ async fn native_local_restart_confirms_missing_retained_blocks_in_order_for_a_su
                     confirmed.external_source_token = Some(vec![1]);
                     let later_boundary = ReplicaBody::BlockBoundary(proto::BlockBoundary {
                         block_index: Some(2), latest_processed_msg_id: Some(legacy.0), external_source_token: Some(vec![2]),
+                        ..Default::default()
                     });
                     for (sequence, message) in [(3, ReplicaBody::BlockUploaded(confirmed)), (4, later_boundary)] {
                         pre_repair_reader.logs.enqueue_replica(&ReplicaEnvelope { term: Term(2), term_sequence: Some(TermSequence(sequence)), message },
@@ -2173,6 +2176,79 @@ async fn classic_replay_refuses_conflicting_oids_and_restart_keeps_the_recorded_
     assert_eq!(restored.table_catalog().entry(&supplementary).unwrap().oid, native_bmp_oid);
     for entry in base.table_catalog().entries() {
         assert_eq!(restored.table_catalog().entry(&entry.table), Some(entry));
+    }
+}
+
+#[tokio::test]
+async fn classic_oid_order_changes_only_after_the_ordered_checkpoint() {
+    use rtdb_format::catalog::RelationOidOrder;
+
+    let writer = fixture(ReplicationConfig {
+        activate_classic_utf16_relation_oids: true, assertion_interval: Duration::from_millis(10),
+        ..Default::default()
+    }, 1 << 20).await;
+    let mut follower = fixture_over(ReplicationConfig { may_lead: false, ..Default::default() }, 1 << 20,
+        None, |replica| replica, Arc::clone(&writer.store), writer.store.clone()).await;
+    let partition = Arc::clone(&writer.driver.partition);
+    let runner = tokio::spawn(writer.driver.run());
+    let cancellation = CancellationToken::new();
+
+    let mut legacy_entries = None;
+    for (index, (prefix, order)) in [
+        ("legacy", RelationOidOrder::LegacyUtf8), ("activated", RelationOidOrder::Utf16),
+    ].into_iter().enumerate() {
+        let bmp = TableRef::new("public", format!("{prefix}Ａ"));
+        let supplementary = TableRef::new("public", format!("{prefix}𐐀"));
+        let ops = [&supplementary, &bmp].into_iter().map(|table|
+            TxOp::Sql { sql: format!("INSERT INTO \"{}\" (_id) VALUES (1)", table.table), args: None }
+        ).collect();
+        let tx = SourceTransaction::new(ops, SubmitOptions::default(), &writer.memory).unwrap();
+        let position = writer.handle.submit_source_encoded(tx.encode().unwrap().into_bytes(), Timestamp(100 + index as i64))
+            .await.unwrap();
+        let applied = tokio::time::timeout(Duration::from_secs(10), writer.handle.await_tx(TxId(position.0), &cancellation))
+            .await.unwrap().unwrap().unwrap();
+        assert!(applied.committed());
+
+        let value = partition.value();
+        let catalog = value.table_catalog();
+        assert_eq!(catalog.relation_oid_order(), order);
+        let bmp_entry = catalog.entry(&bmp).unwrap();
+        let supplementary_entry = catalog.entry(&supplementary).unwrap();
+        if index == 0 {
+            assert_eq!(bmp_entry.oid + 1, supplementary_entry.oid);
+            legacy_entries = Some([bmp_entry.clone(), supplementary_entry.clone()]);
+        } else {
+            assert_eq!(supplementary_entry.oid + 1, bmp_entry.oid);
+        }
+        let flush = writer.handle.flush().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), writer.handle.await_source(flush, &cancellation)).await.unwrap().unwrap();
+        assert_eq!(partition.value().table_catalog().block_index(), Some(BlockIndex(index as i64)));
+        assert_eq!(partition.value().table_catalog().relation_oid_order(), RelationOidOrder::Utf16);
+    }
+    writer.handle.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), runner).await.unwrap().unwrap().unwrap();
+
+    let end = LogOffset(writer.replica.latest().unwrap().0 + 1);
+    let mut activations = Vec::new();
+    for record in writer.replica.read_range(LogOffset(0), end).await.unwrap() {
+        if let Some(ReplicaEnvelope { message: ReplicaBody::BlockBoundary(boundary), .. }) = ReplicaEnvelope::decode(&record.payload).unwrap()
+            && boundary.relation_oid_order.is_some()
+        {
+            activations.push(boundary.block_index);
+        }
+        follower.driver.consume(record).await.unwrap();
+    }
+    assert_eq!(activations, vec![Some(0)]);
+    let writer_state = partition.value();
+    let follower_state = follower.driver.partition.value();
+    assert!(writer_state.table_catalog().entries().eq(follower_state.table_catalog().entries()));
+
+    let restarted = writer.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(1000), BlockDiscovery::List).await.unwrap();
+    let restored = restarted.partition.value();
+    assert_eq!(restored.table_catalog().relation_oid_order(), RelationOidOrder::Utf16);
+    assert!(writer_state.table_catalog().entries().eq(restored.table_catalog().entries()));
+    for entry in legacy_entries.unwrap() {
+        assert_eq!(restored.table_catalog().entry(&entry.table), Some(&entry));
     }
 }
 

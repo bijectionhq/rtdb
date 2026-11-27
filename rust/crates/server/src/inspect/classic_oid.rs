@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use rtdb_format::catalog::{BlockCatalog, FIRST_TABLE_OID, TableEntry, legacy_table_ref};
+use rtdb_format::catalog::{BlockCatalog, FIRST_TABLE_OID, RelationOidOrder, TableEntry, legacy_table_ref};
 use rtdb_types::{BlockIndex, Result, TableRef};
 use serde::Serialize;
 
@@ -63,12 +63,12 @@ pub(super) fn preflight(block: &BlockCatalog, rtdb_only_root: bool, tables: &[Ta
     let allocation_batch = if tables.is_empty() {
         None
     } else {
-        Some(assess_batch(&entries, tables, checkpoint_registry.eligible)?)
+        Some(assess_batch(&entries, tables, checkpoint_registry.eligible, block.relation_oid_order())?)
     };
     Ok(Report { block_index: block.block_index(), registry_source, rtdb_only_root, checkpoint_registry, allocation_batch })
 }
 
-fn assess_batch(entries: &[TableEntry], tables: &[TableRef], checkpoint_eligible: bool) -> Result<Assessment> {
+fn assess_batch(entries: &[TableEntry], tables: &[TableRef], checkpoint_eligible: bool, native_order: RelationOidOrder) -> Result<Assessment> {
     let mut known: BTreeSet<_> = entries.iter().map(|entry| &entry.table).collect();
     let mut last_oid = entries.iter().map(|entry| entry.oid).max().unwrap_or(FIRST_TABLE_OID - 1);
     let mut allocated = Vec::new();
@@ -82,10 +82,10 @@ fn assess_batch(entries: &[TableEntry], tables: &[TableRef], checkpoint_eligible
 
     let mut fresh: Vec<_> = tables.iter().filter(|table| known.insert(*table))
         .map(|table| (table.schema_and_table(), table)).collect();
-    fresh.sort_by(|(a, _), (b, _)| a.cmp(b));
+    native_order.sort_names(&mut fresh);
     let native_oids = fresh.iter().enumerate().map(|(i, (_, table))| Ok((*table, oid_after(last_oid, i)?)))
         .collect::<Result<BTreeMap<_, _>>>()?;
-    fresh.sort_by(|(a, _), (b, _)| a.encode_utf16().cmp(b.encode_utf16()));
+    RelationOidOrder::Utf16.sort_names(&mut fresh);
     let mut relations = Vec::new();
     for (i, (_, table)) in fresh.into_iter().enumerate() {
         let entry = TableEntry::new(oid_after(last_oid, i)?, table.clone())?;

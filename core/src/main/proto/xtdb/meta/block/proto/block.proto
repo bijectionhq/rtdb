@@ -105,5 +105,7 @@ message Block {
     bytes serving_checkpoint = 1002;
     string serving_checkpoint_object = 1003;
 
+    int32 relation_oid_order = 1004;
+
     reserved 11 to 14;
 }

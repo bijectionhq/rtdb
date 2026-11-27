@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_format::{catalog::{BlockCatalog, legacy_table_ref}, database::proto::DatabaseConfig, envelope::{ReplicaBody, ReplicaEnvelope, SourceBody, SourceMessage}, keys::TrieKey, log::proto::{self, resolved_tx::DbOp}};
+use rtdb_format::{catalog::{BlockCatalog, RelationOidOrder, legacy_table_ref}, database::proto::DatabaseConfig, envelope::{ReplicaBody, ReplicaEnvelope, SourceBody, SourceMessage}, keys::TrieKey, log::proto::{self, resolved_tx::DbOp}};
 use rtdb_index::{CatalogCut, CatalogTrie, PartitionState, PreparedSearchDelta, SearchDelta, ServingSearch, Snapshot, StagedWrite, TrieCatalog};
 use rtdb_storage::{Error as StorageError, IoRegion, ObjectKey, ObjectStore, log::{AppendCapacity, LogOffset, LogRecord, ReplayHead}, object_store::ReadReservation};
 use rtdb_tx::{ResolveContext, ResolvedTx, SourceTransaction, TransactionResult, TransactionWriter, TxResolver, WriterPublication};
@@ -71,6 +71,7 @@ pub struct ReplicationConfig {
     pub external_source: bool,
     pub skipped_transactions: BTreeSet<SourcePosition>,
     pub rows_per_block: u64,
+    pub activate_classic_utf16_relation_oids: bool,
     pub assertion_interval: Duration,
     pub flush_timeout: Duration,
     pub pending_block_records: usize,
@@ -96,7 +97,7 @@ impl ReplicationConfig {
 }
 impl Default for ReplicationConfig {
     fn default() -> Self {
-        Self { enabled: true, may_lead: true, external_source: false, skipped_transactions: BTreeSet::new(), rows_per_block: Self::DEFAULT_ROWS_PER_BLOCK, assertion_interval: Duration::from_millis(100), flush_timeout: Self::DEFAULT_FLUSH_TIMEOUT,
+        Self { enabled: true, may_lead: true, external_source: false, skipped_transactions: BTreeSet::new(), rows_per_block: Self::DEFAULT_ROWS_PER_BLOCK, activate_classic_utf16_relation_oids: false, assertion_interval: Duration::from_millis(100), flush_timeout: Self::DEFAULT_FLUSH_TIMEOUT,
             pending_block_records: 1024, pending_block_bytes: 64 * 1024 * 1024, election_seed: uuid::Uuid::new_v4().as_u128() as u64,
             idle_heartbeat: true, claim_wait: None, node_id: Self::default_node_id() }
     }
@@ -2469,10 +2470,21 @@ impl ReplicationDriver {
             return Ok(());
         }
         self.deferred_cut = false;
-        let block = self.partition.value().live().block_index();
+        let value = self.partition.value();
+        let block = value.live().block_index();
+        let relation_oid_order = if self.config.activate_classic_utf16_relation_oids
+            && value.table_catalog().relation_oid_order() == RelationOidOrder::LegacyUtf8
+        {
+            RelationOidOrder::Utf16.wire_value()
+        } else {
+            None
+        };
         let leader = self.leader.as_mut().ok_or_else(term_ended)?;
         leader.cycle.cut()?;
-        let boundary = proto::BlockBoundary { block_index: Some(block.0), latest_processed_msg_id: Some(leader.resolver()?.source_position().0), external_source_token: leader.resolver()?.external_token().map(<[u8]>::to_vec) };
+        let boundary = proto::BlockBoundary {
+            block_index: Some(block.0), latest_processed_msg_id: Some(leader.resolver()?.source_position().0),
+            external_source_token: leader.resolver()?.external_token().map(<[u8]>::to_vec), relation_oid_order,
+        };
         leader.enqueue(WriteBody::Message(ReplicaBody::BlockBoundary(boundary)), block, None, &self.resolve.memory)
     }
     async fn flush_if_due(&mut self) -> Result<()> {

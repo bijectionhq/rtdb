@@ -4,7 +4,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_format::{block::proto as block_pb, catalog::{BlockCatalog, CheckpointContents, TableBlock, legacy_table_ref}, database::proto::DatabaseConfig, envelope::ReplicaBody, ipc::ArrowFileWriter, keys::{block_index_from_key, block_key, TrieKey}, log::proto, metadata::MetadataBuilder};
+use rtdb_format::{block::proto as block_pb, catalog::{BlockCatalog, CheckpointContents, RelationOidOrder, TableBlock, legacy_table_ref}, database::proto::DatabaseConfig, envelope::ReplicaBody, ipc::ArrowFileWriter, keys::{block_index_from_key, block_key, TrieKey}, log::proto, metadata::MetadataBuilder};
 use rtdb_index::{BlockPages, BlockPreparation, CatalogTrie, PartitionState, PartitionValue, TableCatalog, TrieCatalog};
 use rtdb_format::journal::{ObjectId, ObjectKind};
 use rtdb_storage::{IoRegion, ObjectKey, ObjectStore, cache::BufferPool};
@@ -205,6 +205,7 @@ pub(crate) fn matches_catalog_boundary(catalog: &BlockCatalog, record: &ReplicaR
         && boundary.block_index == Some(catalog.block_index().0)
         && boundary.latest_processed_msg_id == catalog.as_proto().latest_processed_msg_id
         && boundary.external_source_token.as_deref() == catalog.external_source_token()
+        && boundary.relation_oid_order.is_none_or(|order| catalog.relation_oid_order().wire_value() == Some(order))
 }
 
 #[derive(Clone, Debug)]
@@ -784,6 +785,7 @@ impl BlockStore {
             naming_epoch: Some(i64::try_from(prepared.value().trie_catalog().naming_epoch()).map_err(|_| invalid("Naming epoch exceeds the block format"))?),
             table_block_manifest: Some(block_pb::TableBlockManifest { sha256_by_oid }),
             serving_checkpoint, serving_checkpoint_object,
+            relation_oid_order: relation_oid_order_at_boundary(prepared, message)?.wire_value(),
         })?;
         self.store.put(&key, Bytes::from(catalog.encode_for_publication())).await?;
         Ok(ProducedBlock { catalog, tries })
@@ -907,10 +909,16 @@ pub(crate) fn validate_boundary(catalog: &BlockCatalog, prepared: &BlockPreparat
         || catalog.boundary_replica_position() != Some(boundary.metadata.position)
         || catalog.boundary_term() != boundary.envelope.term || catalog.boundary_term_sequence() != boundary.envelope.term_sequence
         || catalog.as_proto().latest_processed_msg_id != message.latest_processed_msg_id
-        || catalog.external_source_token() != message.external_source_token.as_deref() {
+        || catalog.external_source_token() != message.external_source_token.as_deref()
+        || catalog.relation_oid_order() != relation_oid_order_at_boundary(prepared, message)? {
         return Err(invalid("Published block does not describe the retained boundary"));
     }
     Ok(())
+}
+
+pub(crate) fn relation_oid_order_at_boundary(prepared: &BlockPreparation, boundary: &proto::BlockBoundary) -> Result<RelationOidOrder> {
+    let prior = prepared.value().table_catalog().relation_oid_order();
+    RelationOidOrder::from_wire(boundary.relation_oid_order.or(prior.wire_value()))
 }
 fn invalid(message: impl Into<String>) -> Anomaly { Anomaly::fault("rtdb.replication/invalid-block", message) }
 fn io_error(error: impl std::fmt::Display) -> Anomaly { Anomaly::fault("rtdb.replication/block-io", error.to_string()) }

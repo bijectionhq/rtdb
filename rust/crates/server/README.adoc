@@ -193,6 +193,18 @@ Native RTDB can allocate different OIDs during replay and then refuse the checkp
 Starting directly at an explicit checkpoint loads the recorded OIDs and slugs.
 Storage qualification requires the referenced table and trie objects.
 
+To select JVM UTF-16 order for fresh relation OIDs on a Native Classic database, set `indexer.activateClassicUtf16RelationOids: true` on an upgraded writer.
+The setting applies to every Classic database for which that node leads.
+Upgrade all readers and writers of the affected history before enabling it.
+The selected order takes effect after the next checkpoint is adopted.
+Use `POST /system/finish-block` to request that boundary.
+Wait for that checkpoint before submitting transactions that need the new order.
+Inspect its root with `rtdb read-block-file ROOT` and check that `relation-oid-order` is `1`.
+The activation checkpoint preserves its recorded OIDs and slugs and carries the version into every successor.
+Removing the setting leaves the database on its recorded order.
+Earlier Native RTDB binaries and JVM XTDB refuse the activation boundary and versioned checkpoint.
+For a migration from JVM XTDB, start from a checkpoint with an explicit registry and qualify any retained suffix through the activation boundary.
+
 Tracing and cloud metric exporter construction and lifecycle paths are source-written; executable compatibility qualification remains pending.
 The local-log `useInstantSourceForNonTx` option controls the writer's timestamp policy.
 Exact Micrometer output and the configuration bounds' runtime allocation qualification remain pending.

@@ -38,6 +38,7 @@ impl NodeConfiguration {
         options.trie = rtdb_trie::TrieConfig::new(self.indexer.log_limit, self.indexer.page_limit)?;
         options.replication.enabled = self.indexer.enabled;
         options.replication.rows_per_block = self.indexer.rows_per_block;
+        options.replication.activate_classic_utf16_relation_oids = self.indexer.activate_classic_utf16_relation_oids;
         options.replication.flush_timeout = self.indexer.flush_duration;
         options.replication.skipped_transactions = self.indexer.skip_transactions.clone();
         options.replication.node_id = self.node_id.clone();
