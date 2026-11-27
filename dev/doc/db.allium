@@ -1469,9 +1469,10 @@ rule AppendReplicaMessage {
     --
     -- The append fixes the record's position in the log's order when it returns; its durability is reported separately, and this rule does not wait for it before the term's next append.
     -- The block upload is the exception, its caller needing the append's result.
-    -- A record lost in flight is not reported here — the term's later records still land behind it.
-    -- Every reader, this leader's own read-back included, meets the missing record as a gap in the term's positions and voids the rest of the term, the fold log-processor-lifecycle.allium already carries (VOIDED, ResignOnVoidedTerm, ClaimOnVoidedTerm).
-    -- A lost record with nothing behind it is voided once something is appended after it, which the leader's next idle assertion supplies if no other traffic already did, taking the position right after the loss.
+    -- The native appender sends a reported preparation, dispatch or durability fault to the waiters for the append that failed.
+    -- A subsequent queued append abandoned on term teardown receives the term-ended result.
+    -- Every reader voids the rest of the term when a silently lost record leaves a sequence gap, as log-processor-lifecycle.allium specifies.
+    -- A later append exposes a silent loss at the tip, including the next idle assertion if the leader is still appending.
     when: AppendReplicaMessage(msg)
 
     requires: log_processor.mode = Leader
@@ -1750,6 +1751,7 @@ rule ExternalSourceIndexesTx {
     --
     -- The caller's handle completes on READ-BACK (LeaderAppliesOwnTx), so it means durably replicated AND confirmed unfenced.
     -- Every path on which the transaction will never be applied MUST fail it instead, or the caller waits forever — see live-index.allium.
+    -- A fault preparing the resolved transaction for enqueue reaches that transaction's caller.
     --
     -- Backpressure is one transaction of lookahead plus the block-cut pause: while a block is in progress the external source is suspended, so a bursty source cannot grow the resolver's queue without bound.
     when: ExternalSourceIndexTx(external_source_token, system_time, writer)

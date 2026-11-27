@@ -3209,6 +3209,40 @@ async fn queue_external_write(fixture: &mut Fixture, token: &[u8]) -> (ExternalR
     (receipt, key)
 }
 
+#[tokio::test]
+async fn preparing_a_pending_write_reports_its_failure_to_the_external_writer() {
+    for overflow in [false, true] {
+        let config = ReplicationConfig { may_lead: false, external_source: true, idle_heartbeat: false, ..Default::default() };
+        let mut fixture = fixture(config, 1 << 27).await;
+        fixture.driver.fence.admit(Term(1), Some(TermSequence(0))).unwrap();
+        fixture.driver.promote().await.unwrap();
+        let receipt = fixture.handle.term().unwrap()
+            .submit_external(Box::new(CommitExternal), Some(Timestamp(100)), Some(b"source".to_vec())).await.unwrap();
+        let command = fixture.driver.commands.try_recv().unwrap();
+        fixture.driver.command(command).await.unwrap();
+        let leader = fixture.driver.leader.as_mut().unwrap();
+        let (resolver, result) = super::pending_resolution(&mut leader.resolution).await;
+        assert!(result.is_ok());
+        let _blocker = if overflow {
+            leader.cycle = crate::BlockCycle::Filling { rows: u64::MAX };
+            None
+        } else {
+            Some(fixture.memory.reserve(fixture.memory.limit_bytes() - fixture.memory.used_bytes()).unwrap())
+        };
+
+        let error = fixture.driver.resolution_finished(resolver, result).await.unwrap_err();
+        if overflow {
+            assert_eq!(error.message.as_deref(), Some("Resolved row gauge overflow"));
+        } else {
+            assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+        }
+        assert_eq!(receipt.applied().await.unwrap_err(), error);
+        assert_eq!(fixture.replica.latest().unwrap(), LogOffset(-1));
+        assert!(fixture.handle.progress().current().tx_key.is_none());
+        fixture.driver.demote().await.unwrap();
+    }
+}
+
 async fn queued_external_readback() -> (Fixture, [ExternalReceipt; 2], LogRecord, TransactionKey) {
     let mut fixture = fixture(ReplicationConfig { may_lead: false, external_source: true, ..Default::default() }, 1 << 27).await;
     fixture.driver.fence.admit(Term(1), Some(TermSequence(0))).unwrap();

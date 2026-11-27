@@ -98,6 +98,8 @@ Leadership is confirmed by reading back that node's own claim at a position that
 The append pump assigns subsequent term sequences, fixes each append's order before accepting the next one, and emits heartbeat assertions independently of transaction resolution.
 Ordinary transaction writes do not wait for durability before the pump accepts the next write.
 Block-upload production retains its durability receipt.
+The appender delivers reported failures to the affected write and its durability waiter.
+Later writes abandoned when the pump shuts down receive the term-ended error.
 
 Resolution sees the durable snapshot overlaid with every unresolved predecessor.
 While a resolution future owns the resolver, the driver continues term admission and retains admitted readbacks under its configured limits.

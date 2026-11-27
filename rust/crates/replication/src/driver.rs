@@ -2394,31 +2394,38 @@ impl ReplicationDriver {
         Ok(())
     }
     async fn enqueue_resolved(&mut self, resolved: Arc<ResolvedTx>, completion: Option<oneshot::Sender<Result<Applied>>>) -> Result<()> {
-        let strict = resolved.staging_clock_upper().is_some();
-        let search_delta = if !strict && resolved.result().committed()
-            && let Some(builder) = self.serving_search.as_ref().filter(|builder| builder.journals_deltas()) {
-            let leader = self.leader.as_ref().ok_or_else(term_ended)?;
-            let snapshot = leader.resolver()?.resolving_snapshot(self.partition.value().snapshot())?;
-            builder.prepare_delta(snapshot, Arc::clone(resolved.writes()), &leader.cancellation).await?
-        } else { None };
-        let leader = self.leader.as_mut().ok_or_else(term_ended)?;
-        leader.cycle.resolved(resolved.writes().row_count()?)?;
-        let block = self.partition.value().live().block_index();
-        if let Some(attempt) = resolved.placed_attempt() {
-            let slot = self.placed_slot.filter(|slot| slot.reservation.attempt == attempt)
-                .ok_or_else(|| invalid("Placed resolution lost its original receiver reservation"))?;
-            if !leader.settling_placed || completion.is_some() {
-                return Err(invalid("Placed resolution bypassed receiver settlement"));
+        let mut completion = Completion(completion);
+        let result = async {
+            let strict = resolved.staging_clock_upper().is_some();
+            let search_delta = if !strict && resolved.result().committed()
+                && let Some(builder) = self.serving_search.as_ref().filter(|builder| builder.journals_deltas()) {
+                let leader = self.leader.as_ref().ok_or_else(term_ended)?;
+                let snapshot = leader.resolver()?.resolving_snapshot(self.partition.value().snapshot())?;
+                builder.prepare_delta(snapshot, Arc::clone(resolved.writes()), &leader.cancellation).await?
+            } else { None };
+            let leader = self.leader.as_mut().ok_or_else(term_ended)?;
+            leader.cycle.resolved(resolved.writes().row_count()?)?;
+            let block = self.partition.value().live().block_index();
+            if let Some(attempt) = resolved.placed_attempt() {
+                let slot = self.placed_slot.filter(|slot| slot.reservation.attempt == attempt)
+                    .ok_or_else(|| invalid("Placed resolution lost its original receiver reservation"))?;
+                if !leader.settling_placed || completion.0.is_some() {
+                    return Err(invalid("Placed resolution bypassed receiver settlement"));
+                }
+                let terminal = PlacedTerminal { commitment: slot.reservation.commitment, fenced: slot.term < leader.term };
+                let write = PendingWrite::placed(WriteBody::Resolved(resolved, search_delta), block, terminal, &self.resolve.memory)?;
+                leader.appender.enqueue(Arc::clone(&write))?;
+                leader.pending.push_back(write);
+            } else {
+                leader.enqueue(WriteBody::Resolved(resolved, search_delta), block, completion.0.take(), &self.resolve.memory)?;
+                if !strict && leader.cycle.is_full(self.config.rows_per_block) { self.cut().await?; }
             }
-            let terminal = PlacedTerminal { commitment: slot.reservation.commitment, fenced: slot.term < leader.term };
-            let write = PendingWrite::placed(WriteBody::Resolved(resolved, search_delta), block, terminal, &self.resolve.memory)?;
-            leader.appender.enqueue(Arc::clone(&write))?;
-            leader.pending.push_back(write);
-        } else {
-            leader.enqueue(WriteBody::Resolved(resolved, search_delta), block, completion, &self.resolve.memory)?;
-            if !strict && leader.cycle.is_full(self.config.rows_per_block) { self.cut().await?; }
+            Ok(())
+        }.await;
+        if let Err(error) = &result && let Some(completion) = completion.0.take() {
+            let _ = completion.send(Err(error.clone()));
         }
-        Ok(())
+        result
     }
     /// Drops this node's cached copies of objects the log records as deleted.
     /// XTDB keeps no such copies to drop; a copy left behind costs only local disk, so a failure is reported rather than raised.
