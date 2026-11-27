@@ -86,6 +86,11 @@ async fn run() -> Result<()> {
         Command::Standalone(launch) => run_standalone(launch, apple_sync).await,
         Command::HashPassword { bcrypt, password } => { println!("{}", cli::hash_password(bcrypt, password, &mut std::io::stdin().lock())?); Ok(()) }
         Command::Inspect { kind, path, allocation_limit_bytes } => rtdb_server::inspect::file(kind, &path, &rtdb_columnar::MemoryBudget::new(allocation_limit_bytes), &mut std::io::stdout().lock()),
+        Command::InspectClassicOid { path, allocation_limit_bytes, allocation_batch } => {
+            rtdb_server::inspect::classic_oid_preflight(
+                &path, &allocation_batch, &rtdb_columnar::MemoryBudget::new(allocation_limit_bytes), &mut std::io::stdout().lock(),
+            )
+        }
         Command::SnapshotExport { options, database, dry_run } => export_snapshot(options, database, dry_run).await,
         Command::CompactorReset { options, database, dry_run, retained_base } => reset_compactor(options, database, dry_run, retained_base).await,
         Command::RetainRepairBase { request, memory_bytes, reclaim_receipts } => {

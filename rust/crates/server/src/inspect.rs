@@ -1,23 +1,31 @@
 use std::{fs::File, io::{Read, Write}, path::Path, sync::Arc};
 use arrow_array::RecordBatch;
-use rtdb_columnar::{ArrowCell, MemoryBudget, estimate_read_value_bytes, read_value};
+use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation, estimate_read_value_bytes, read_value};
 use rtdb_format::{catalog::{BlockCatalog, TableBlock}, ipc::{self, ArrowFile, ArrowStream}};
-use rtdb_types::{Anomaly, FloatComponent, FloatListSlice, ListKind, Result, StructFields};
+use rtdb_types::{Anomaly, FloatComponent, FloatListSlice, ListKind, Result, StructFields, TableRef};
 use serde_json::{Value, json};
+
+mod classic_oid;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FileKind { ArrowFile, ArrowStream, HashTrie, TableBlock, Block }
+
+fn read_input(path: &Path, memory: &Arc<MemoryBudget>) -> Result<(Arc<MemoryReservation>, Vec<u8>)> {
+    let input = File::open(path).map_err(invalid)?;
+    let size = usize::try_from(input.metadata().map_err(invalid)?.len()).map_err(invalid)?;
+    let encoded = memory.reserve(bound(size, 2, 8192)?)?;
+    let mut bytes = Vec::with_capacity(size);
+    input.take(u64::try_from(size).map_err(invalid)?.saturating_add(1)).read_to_end(&mut bytes).map_err(invalid)?;
+    if bytes.len() != size { return Err(invalid("Inspection input changed while being read")); }
+    Ok((encoded, bytes))
+}
 
 /// Writes one JSON document containing physical schemas, typed cells or catalog fields.
 /// The caller keeps the input immutable; decoding and retained row values use `memory`.
 /// Output is written incrementally and may be incomplete if decoding or the output sink fails.
 pub fn file(kind: FileKind, path: &Path, memory: &Arc<MemoryBudget>, output: &mut impl Write) -> Result<()> {
-    let input = File::open(path).map_err(invalid)?;
-    let size = usize::try_from(input.metadata().map_err(invalid)?.len()).map_err(invalid)?;
-    let _encoded = memory.reserve(bound(size, 2, 8192)?)?;
-    let mut bytes = Vec::with_capacity(size);
-    input.take(u64::try_from(size).map_err(invalid)?.saturating_add(1)).read_to_end(&mut bytes).map_err(invalid)?;
-    if bytes.len() != size { return Err(invalid("Inspection input changed while being read")); }
+    let (_encoded, bytes) = read_input(path, memory)?;
+    let size = bytes.len();
     match kind {
         FileKind::ArrowFile => {
             let _decoded = memory.reserve(ipc::file_allocation_bound(&bytes)?)?;
@@ -59,6 +67,22 @@ pub fn file(kind: FileKind, path: &Path, memory: &Arc<MemoryBudget>, output: &mu
             output.write_all(b"\n").map_err(invalid)
         }
     }
+}
+
+pub fn classic_oid_preflight(path: &Path, allocation_batch: &[TableRef], memory: &Arc<MemoryBudget>, output: &mut impl Write) -> Result<()> {
+    let (_encoded, bytes) = read_input(path, memory)?;
+    let reservation = memory.reserve(bound(bytes.len(), 256, 65_536)?)?;
+    let block = BlockCatalog::decode_reserved(&bytes, reservation)?;
+    let overflow = || invalid("Inspection allocation exceeds addressable memory");
+    let batch_bytes = allocation_batch.iter().try_fold(0usize, |total, table| {
+        let name_bytes = table.schema.len().checked_add(table.table.len()).ok_or_else(overflow)?;
+        total.checked_add(bound(name_bytes, 16, 1024)?).ok_or_else(overflow)
+    })?;
+    let _batch = memory.reserve(batch_bytes)?;
+    let rtdb_only_root = bytes.starts_with(&rtdb_format::XTDB_REFUSAL_PREFIX)
+        || rtdb_format::envelope::block_uses_extension(block.as_proto());
+    write_json(output, &classic_oid::preflight(&block, rtdb_only_root, allocation_batch)?)?;
+    output.write_all(b"\n").map_err(invalid)
 }
 
 fn schema_json(schema: &arrow_schema::Schema) -> Result<Value> {

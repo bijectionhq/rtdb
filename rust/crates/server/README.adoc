@@ -177,6 +177,20 @@ Arrow output contains the physical schema and positional typed values, preservin
 Arrow stream inspection reports the first batch, matching the reference helper's single-relation behavior.
 Catalog output retains optional wire-field presence, including absent versus zero boundary term sequence, and retains opaque provider configuration bytes.
 The passive inspection routines own their input and decoding reservations for the duration of the call, write output incrementally, and reject declared decoded allocations beyond the budget.
+
+Use `rtdb read-block-file ROOT --classic-oid-preflight` on a local copy of the exact Classic checkpoint root selected for migration or restart.
+The JSON field `checkpoint_registry.eligible` requires matching OIDs, distinct physical slugs and a root free of RTDB refusal framing and known RTDB-only features.
+The report reads explicit entries as recorded and compares Native RTDB UTF-8 and XTDB UTF-16 ordering only for a names-only root.
+Duplicate recorded relation names or OIDs cause a decode error.
+A valid root with incompatible identities produces a report with `eligible: false`.
+
+Repeat `--allocate SCHEMA/TABLE` for the exact relation names in one proposed allocation batch immediately after startup from that root.
+The comparison accounts for missing startup system relations and reports both OIDs for each fresh relation.
+It also reports collisions among existing recorded slugs and XTDB's proposed escaped slugs for the startup relations and the batch.
+`allocation_batch.eligible` includes the checkpoint result, and `allocation_batch` is null when no batch was supplied.
+The command checks the supplied identities only.
+Replay qualification still requires the actual ordered source and replica suffix, and storage qualification requires the referenced table and trie objects.
+
 Tracing and cloud metric exporter construction and lifecycle paths are source-written; executable compatibility qualification remains pending.
 The local-log `useInstantSourceForNonTx` option controls the writer's timestamp policy.
 Exact Micrometer output and the configuration bounds' runtime allocation qualification remain pending.

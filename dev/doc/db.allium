@@ -971,6 +971,12 @@ config {
 -- A successor must advance both the block and the replica boundary in that journal, including on a retry after prefix collection.
 -- The opened replica log must belong to the same journal as the admitted checkpoint.
 -- On a hosted loglet, each connection verifies the durable identity named by its ensemble slot before sending replay or recovery operations.
+-- A checkpoint with a recorded table registry carries each relation's OID and slug forward.
+-- For a names-only checkpoint, the JVM derives OIDs by sorting the serialized names as UTF-16 code units and Native RTDB sorts them as UTF-8 bytes.
+-- Each Classic resolved transaction identifies its effects by table name.
+-- First appearance in a resolved transaction allocates any fresh OIDs in the engine's corresponding name order.
+-- Native RTDB refuses to adopt a checkpoint that changes a table OID or slug already allocated during replay.
+-- Offline Classic OID preflight reports the two checkpoint registry interpretations, duplicate physical slugs, and the result for an optional single allocation batch.
 -- A new Rust checkpoint root carries the SHA-256 digest of each table block, keyed by the table registry OID.
 -- The root is written after every referenced table block write completes.
 -- Recovery checks the manifest covers exactly those OIDs and checks the stored bytes before accepting table metadata.

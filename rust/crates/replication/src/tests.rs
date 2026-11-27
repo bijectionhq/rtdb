@@ -1050,12 +1050,13 @@ async fn staged_leader_and_decoding_follower_publish_the_same_transaction_prefix
     follower.driver.consume(claim).await.unwrap();
     leader.driver.promote().await.unwrap();
 
-    let transactions: [(&[&str], bool); 5] = [
+    let transactions: [(&[&str], bool); 6] = [
         (&["CREATE TABLE empty_docs (_id, v)"], true),
         (&["INSERT INTO docs (_id, v) VALUES (1, 7), (2, 8)", "INSERT INTO other_docs (_id, v) VALUES (1, 10)"], true),
         (&["INSERT INTO docs (_id, v) VALUES (3, 11)", "ASSERT FALSE"], false),
         (&["UPDATE docs SET v = 9 WHERE _id = 1"], true),
         (&["DELETE FROM docs WHERE _id = 2"], true),
+        (&["INSERT INTO \"oid𐐀\" (_id) VALUES (1)", "INSERT INTO \"oidＡ\" (_id) VALUES (2)"], true),
     ];
     for (index, (statements, committed)) in transactions.into_iter().enumerate() {
         let position = SourcePosition(index as i64);
@@ -1079,6 +1080,7 @@ async fn staged_leader_and_decoding_follower_publish_the_same_transaction_prefix
         let actual = follower.driver.partition.value();
         assert_eq!(expected.live().latest_completed_tx(), actual.live().latest_completed_tx(), "{statements:?}");
         assert_eq!(expected.snapshot().tables(), actual.snapshot().tables(), "{statements:?}");
+        assert!(expected.table_catalog().entries().eq(actual.table_catalog().entries()), "{statements:?}");
         for (name, staged) in expected.live().tables() {
             let decoded = &actual.live().tables()[name];
             assert_eq!(staged.column_types(), decoded.column_types(), "{statements:?}, {name:?}");
@@ -1095,6 +1097,10 @@ async fn staged_leader_and_decoding_follower_publish_the_same_transaction_prefix
         assert_eq!(actual.tx_key, expected.tx_key);
         assert_eq!(actual.latest_result, expected.latest_result, "{statements:?}");
     }
+    let applied = follower.driver.partition.value();
+    let first = rtdb_format::catalog::FIRST_TABLE_OID;
+    assert_eq!(applied.table_catalog().entry(&TableRef::new("public", "oidＡ")).unwrap().oid, first + 5);
+    assert_eq!(applied.table_catalog().entry(&TableRef::new("public", "oid𐐀")).unwrap().oid, first + 6);
     leader.driver.demote().await.unwrap();
 }
 

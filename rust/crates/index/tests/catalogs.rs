@@ -2,7 +2,7 @@ use rtdb_types::StructFields;
 use std::collections::{BTreeMap, BTreeSet};
 
 use rtdb_format::{block::proto as pb, catalog::{BlockCatalog, TableBlock, TableEntry}, keys::TableSlug};
-use rtdb_index::{CatalogTrie, Shard, TableCatalog, TrieCatalog, TrieState, merge_column_types};
+use rtdb_index::{CatalogTrie, Shard, TableCatalog, TableMeta, TrieCatalog, TrieState, merge_column_types};
 use rtdb_types::{BlockIndex, LogicalType, ScalarType, TableRef, Timestamp};
 
 fn table() -> TableRef { TableRef::new("public", "foo") }
@@ -291,6 +291,40 @@ fn table_oid_allocation_is_sorted_and_recorded_slugs_stay_frozen() {
     assert_eq!(next.entry(&alpha).unwrap().slug.as_str(), "historical-location");
     assert_eq!(next.entry(&table()).unwrap().oid, 20_001);
     assert_eq!(next.entry(&zeta).unwrap().oid, 20_002);
+}
+
+#[test]
+fn unicode_suffix_replay_refuses_changed_oids_and_explicit_restart_preserves_them() {
+    let bmp = TableRef::new("public", "tＡ");
+    let supplementary = TableRef::new("public", "t𐐀");
+    let existing = TableRef::new("public", "renamed");
+    let anchor = TableEntry { table: existing.clone(), oid: 20_000, slug: TableSlug::recorded("historical-location").unwrap() };
+    let base = BlockCatalog::from_proto(pb::Block { block_index: Some(0), tables: vec![anchor.to_proto()], ..Default::default() }).unwrap();
+    let metadata = TableBlock::from_parts(BTreeMap::new(), &Default::default(), 0, vec![]).unwrap();
+    let predecessor = TableCatalog::load(Some(base), &BTreeMap::from([(existing.clone(), metadata.clone())])).unwrap();
+    let replayed = predecessor.with_entries_for([supplementary.clone(), bmp.clone()]).unwrap();
+    assert_eq!(replayed.entry(&bmp).unwrap().oid, 20_001);
+    assert_eq!(replayed.entry(&supplementary).unwrap().oid, 20_002);
+
+    let pinned_supplementary = TableEntry::new(20_001, supplementary.clone()).unwrap();
+    let pinned_bmp = TableEntry::new(20_002, bmp.clone()).unwrap();
+    let successor = BlockCatalog::from_proto(pb::Block {
+        block_index: Some(1), tables: vec![anchor.to_proto(), pinned_supplementary.to_proto(), pinned_bmp.to_proto()], ..Default::default()
+    }).unwrap();
+    let delta = BTreeMap::from([(bmp.clone(), TableMeta::default()), (supplementary.clone(), TableMeta::default())]);
+    let error = replayed.adopt(successor.clone(), &delta).unwrap_err();
+    assert_eq!(error.message.as_deref(), Some("Block changes a previously allocated table OID or slug"));
+    assert_eq!(replayed.entry(&existing), Some(&anchor));
+
+    let restarted = TableCatalog::load(Some(BlockCatalog::decode(&successor.encode()).unwrap()), &BTreeMap::from([
+        (existing.clone(), metadata.clone()), (bmp.clone(), metadata.clone()), (supplementary.clone(), metadata),
+    ])).unwrap();
+    let added = TableRef::new("public", "a");
+    let later = restarted.with_entries_for([added.clone(), existing.clone(), bmp.clone(), supplementary.clone()]).unwrap();
+    assert_eq!(later.entry(&existing), Some(&anchor));
+    assert_eq!(later.entry(&bmp), Some(&pinned_bmp));
+    assert_eq!(later.entry(&supplementary), Some(&pinned_supplementary));
+    assert_eq!(later.entry(&added).unwrap().oid, 20_003);
 }
 
 #[test]

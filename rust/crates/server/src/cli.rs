@@ -2,7 +2,7 @@ use std::{fs::File, io::{BufRead, Read}, path::{Path, PathBuf}};
 use rtdb_auth::{PasswordHash, Secret};
 use rtdb_columnar::MemoryBudget;
 use rtdb_format::database::proto::{LocalLog, LocalStorage, database_config::{Log, Storage}};
-use rtdb_types::{Anomaly, Result};
+use rtdb_types::{Anomaly, Result, TableRef};
 use zeroize::Zeroizing;
 
 use crate::config::{ConfigurationEnvironment, CustodyProviderSettings, NodeConfiguration, ParsedConfiguration, ProcessEnvironment, ParsedYamlDocument, PgwireSettings, FlightSettings, parse_custody_provider_config};
@@ -24,7 +24,7 @@ pub const NATIVE_DEPENDENT_CUSTODY_HELP: &str = "Usage: rtdb native-dependent-cu
 
 pub const ADMIN_HELP: &str = "Usage: rtdb admin create NAME [--incarnation UUID]\n       rtdb admin delete NAME\n       rtdb admin export NAME BASIS_HEX PIN_UUID\n       rtdb admin fork NAME SOURCE BASIS_HEX PIN_UUID\n       rtdb admin restore NAME SOURCE CHECKPOINT_HEX\n\nUse --endpoint URL and --authorization-file PATH, or set RTDB_ADMIN_ENDPOINT and RTDB_ADMIN_AUTHORIZATION_FILE. Export and fork also accept --retain-until-micros TIME.\n";
 
-pub const HELP: &str = "RTDB\n\nUsage: rtdb --build-info\n       rtdb dev [--multi] [--data PATH] [--port PORT] [--flight-sql-port PORT] [--memory-limit BYTES]\n       rtdb dev --multi --data PATH --multi-tls-dir DIR --incarnation UUID [--multi-authn FILE] [--multi-journal-url URL] [--multi-receiver-clock FILE] [--custody-provider-config FILE] [--flight-sql-port PORT]\n       rtdb initialize-standalone --state STAGE --name NAME --id UUID\n       rtdb standalone --state PATH --name NAME --id UUID --certificate PEM --private-key PEM\n                       --password-file FILE --ready-file FILE --parent-stdin [--custody-provider-config FILE]\n       rtdb admin --help\n       rtdb classic-opening --help\n       rtdb native-dependent-custody --help\n       rtdb node --multi [-f FILE | --config-env NAME] [--native-follower FILE] [--memory-limit BYTES]\n       rtdb [node|ingest|playground|compactor] [-f FILE] [--memory-limit BYTES]\n       rtdb [export-snapshot|reset-compactor] DATABASE [-f FILE] [--dry-run] [--memory-limit BYTES]\n       rtdb reset-compactor DATABASE --retained-base PATH [-f FILE] [--dry-run]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT BASE@SHA256 THROUGH@SHA256 [--base-storage PATH] [--checkpoint-key-vault PATH] [--memory-limit BYTES]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT THROUGH@SHA256 --retained-base --base-storage PATH [--checkpoint-key-vault PATH] [--memory-limit BYTES]\n       rtdb retain-repair-base STORAGE REPLICA_LOG EXPORTED_STORAGE BASE@SHA256 [--reclaim-receipts] [--memory-limit BYTES]\n       rtdb hash-password [--argon2id|--bcrypt] [PASSWORD]\n\nNode defaults to xtdb.yaml, xtdb.yml or xtdb.edn in the working directory.\nIngest configuration uses YAML.\nDev stores data in .rtdb by default and binds to loopback.\nPlayground accepts --port PORT and --flight-sql-port PORT.\nStartup accepts -Djava.util.Arrays.useLegacyMergeSort=true before or after the command.\nPasswords may be read from standard input.\nFile inspection: read-arrow-file, read-arrow-stream-file, read-hash-trie-file,\n                 read-table-block-file, read-block-file PATH [--memory-limit BYTES].\nInspection output is typed JSON.\nMemory defaults to RTDB_MEMORY_LIMIT_BYTES, else half the available physical or cgroup memory. If both are unknown, it defaults to 1073741824 bytes.\n";
+pub const HELP: &str = "RTDB\n\nUsage: rtdb --build-info\n       rtdb dev [--multi] [--data PATH] [--port PORT] [--flight-sql-port PORT] [--memory-limit BYTES]\n       rtdb dev --multi --data PATH --multi-tls-dir DIR --incarnation UUID [--multi-authn FILE] [--multi-journal-url URL] [--multi-receiver-clock FILE] [--custody-provider-config FILE] [--flight-sql-port PORT]\n       rtdb initialize-standalone --state STAGE --name NAME --id UUID\n       rtdb standalone --state PATH --name NAME --id UUID --certificate PEM --private-key PEM\n                       --password-file FILE --ready-file FILE --parent-stdin [--custody-provider-config FILE]\n       rtdb admin --help\n       rtdb classic-opening --help\n       rtdb native-dependent-custody --help\n       rtdb node --multi [-f FILE | --config-env NAME] [--native-follower FILE] [--memory-limit BYTES]\n       rtdb [node|ingest|playground|compactor] [-f FILE] [--memory-limit BYTES]\n       rtdb [export-snapshot|reset-compactor] DATABASE [-f FILE] [--dry-run] [--memory-limit BYTES]\n       rtdb reset-compactor DATABASE --retained-base PATH [-f FILE] [--dry-run]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT BASE@SHA256 THROUGH@SHA256 [--base-storage PATH] [--checkpoint-key-vault PATH] [--memory-limit BYTES]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT THROUGH@SHA256 --retained-base --base-storage PATH [--checkpoint-key-vault PATH] [--memory-limit BYTES]\n       rtdb retain-repair-base STORAGE REPLICA_LOG EXPORTED_STORAGE BASE@SHA256 [--reclaim-receipts] [--memory-limit BYTES]\n       rtdb hash-password [--argon2id|--bcrypt] [PASSWORD]\n\nNode defaults to xtdb.yaml, xtdb.yml or xtdb.edn in the working directory.\nIngest configuration uses YAML.\nDev stores data in .rtdb by default and binds to loopback.\nPlayground accepts --port PORT and --flight-sql-port PORT.\nStartup accepts -Djava.util.Arrays.useLegacyMergeSort=true before or after the command.\nPasswords may be read from standard input.\nFile inspection: read-arrow-file, read-arrow-stream-file, read-hash-trie-file,\n                 read-table-block-file, read-block-file PATH [--memory-limit BYTES].\nClassic relation OID preflight: read-block-file PATH --classic-oid-preflight [--allocate SCHEMA/TABLE]...\nInspection output is typed JSON.\nMemory defaults to RTDB_MEMORY_LIMIT_BYTES, else half the available physical or cgroup memory. If both are unknown, it defaults to 1073741824 bytes.\n";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeMode { Node, Ingest, Playground, Compactor }
@@ -53,6 +53,7 @@ pub struct MultiDevTls {
 
 #[derive(Clone, Debug)]
 pub enum Command { Help, Version, BuildInfo, Start(StartOptions), StartMulti { options: StartOptions, config_env: Option<String>, native_follower: Option<PathBuf> }, Dev(DevOptions), Inspect { kind: crate::inspect::FileKind, path: PathBuf, allocation_limit_bytes: usize }, SnapshotExport { options: StartOptions, database: String, dry_run: bool }, CompactorReset { options: StartOptions, database: String, dry_run: bool, retained_base: Option<PathBuf> }, RepairCheckpoint { request: rtdb_node::LocalRepair, memory_bytes: usize, checkpoint_key_vault: Option<PathBuf> },
+    InspectClassicOid { path: PathBuf, allocation_limit_bytes: usize, allocation_batch: Vec<TableRef> },
     InitializeStandalone(crate::standalone::Target),
     Standalone(crate::standalone::Launch),
     AdminHelp,
@@ -175,15 +176,28 @@ pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(
         arguments.next();
         let mut path = None;
         let mut allocation_limit_bytes = memory_limit(environment)?;
+        let mut classic_oid = false;
+        let mut allocation_batch = Vec::new();
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
                 "-h" | "--help" => return Ok(Command::Help),
                 "--memory-limit" => allocation_limit_bytes = bytes(&arguments.next().ok_or_else(|| invalid("--memory-limit requires bytes"))?)?,
+                "--classic-oid-preflight" if kind == crate::inspect::FileKind::Block => classic_oid = true,
+                "--allocate" if kind == crate::inspect::FileKind::Block => {
+                    let name = arguments.next().filter(|name| name.contains('/'))
+                        .ok_or_else(|| invalid("--allocate requires a relation name in SCHEMA/TABLE form"))?;
+                    allocation_batch.push(rtdb_format::catalog::legacy_table_ref(&name).map_err(invalid)?);
+                }
                 name if !name.starts_with('-') && path.is_none() => path = Some(PathBuf::from(argument)),
                 _ => return Err(invalid("File inspection accepts one path and --memory-limit")),
             }
         }
-        return Ok(Command::Inspect { kind, path: path.ok_or_else(|| invalid("File inspection requires a path"))?, allocation_limit_bytes });
+        let path = path.ok_or_else(|| invalid("File inspection requires a path"))?;
+        if classic_oid {
+            return Ok(Command::InspectClassicOid { path, allocation_limit_bytes, allocation_batch });
+        }
+        if !allocation_batch.is_empty() { return Err(invalid("--allocate requires --classic-oid-preflight")); }
+        return Ok(Command::Inspect { kind, path, allocation_limit_bytes });
     }
     if arguments.peek().is_some_and(|argument| matches!(argument.as_str(), "export-snapshot" | "reset-compactor")) {
         let command = arguments.next().expect("matched maintenance command");

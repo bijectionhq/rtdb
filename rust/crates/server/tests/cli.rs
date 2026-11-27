@@ -543,3 +543,24 @@ fn inspection_commands_require_a_path_and_accept_memory_limits() {
         assert!(cli::parse([command.to_owned()], &|_| None).is_err());
     }
 }
+
+#[test]
+fn only_block_inspection_accepts_the_classic_oid_preflight_and_its_allocation_batch() {
+    let Command::InspectClassicOid { path, allocation_limit_bytes, allocation_batch } = parse(&[
+        "read-block-file", "input.bin", "--classic-oid-preflight", "--memory-limit", "1000000",
+        "--allocate", "public/𐐀", "--allocate", "Mixed/Ａ",
+    ]) else { panic!("expected Classic OID preflight") };
+    assert_eq!(path.to_str(), Some("input.bin"));
+    assert_eq!(allocation_limit_bytes, 1_000_000);
+    assert_eq!(allocation_batch, [
+        rtdb_types::TableRef::new("public", "𐐀"), rtdb_types::TableRef::new("Mixed", "Ａ"),
+    ]);
+    for arguments in [
+        &["read-table-block-file", "input.bin", "--classic-oid-preflight"][..],
+        &["read-block-file", "input.bin", "--allocate", "public/table"],
+        &["read-block-file", "input.bin", "--classic-oid-preflight", "--allocate"],
+        &["read-block-file", "input.bin", "--classic-oid-preflight", "--allocate", "public/a/b"],
+    ] {
+        assert!(cli::parse(arguments.iter().copied().map(str::to_owned), &|_| None).is_err());
+    }
+}

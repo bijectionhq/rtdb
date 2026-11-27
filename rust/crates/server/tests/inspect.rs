@@ -2,8 +2,10 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use rtdb_columnar::MemoryBudget;
+use rtdb_format::{block::proto::Block, catalog::{BlockCatalog, FIRST_TABLE_OID, TableEntry}, keys::TableSlug};
 use rtdb_server::inspect::{self, FileKind};
-use rtdb_types::Value;
+use rtdb_types::{TableRef, Value};
+use serde_json::json;
 
 fn inspect_bytes(kind: FileKind, bytes: &[u8], budget: usize) -> rtdb_types::Result<serde_json::Value> {
     let directory = tempfile::tempdir().unwrap();
@@ -61,6 +63,95 @@ fn block_inspection_preserves_absent_and_zero_term_sequences() {
         let inspected = inspect_bytes(FileKind::Block, &block.encode(), 1 << 20).unwrap();
         assert_eq!(inspected["boundary-term-seq"], sequence.map_or(serde_json::Value::Null, |sequence| sequence.0.into()));
     }
+}
+
+fn classic_oid_preflight(wire: Block, batch: &[TableRef]) -> serde_json::Value {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("block.binpb");
+    let bytes = BlockCatalog::from_proto(wire).unwrap().encode();
+    std::fs::write(&path, &bytes).unwrap();
+    let memory = MemoryBudget::new(1 << 20);
+    let mut output = Vec::new();
+    inspect::classic_oid_preflight(&path, batch, &memory, &mut output).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert_eq!(memory.used_bytes(), 0);
+    serde_json::from_slice(&output).unwrap()
+}
+
+#[test]
+fn oid_preflight_compares_the_names_only_wire_order_under_both_decoders() {
+    let wire = Block { block_index: Some(7), table_names: vec!["public/t𐐀".into(), "public/tＡ".into()], ..Default::default() };
+    let report = classic_oid_preflight(wire, &[]);
+    assert_eq!(report["block_index"], 7);
+    assert_eq!(report["registry_source"], "names_only");
+    assert_eq!(report["checkpoint_registry"], json!({
+        "eligible": false,
+        "relations": [
+            {"table": {"schema": "public", "table": "tＡ"}, "native_oid": FIRST_TABLE_OID, "xtdb_oid": FIRST_TABLE_OID + 1, "xtdb_slug": "public$tＡ"},
+            {"table": {"schema": "public", "table": "t𐐀"}, "native_oid": FIRST_TABLE_OID + 1, "xtdb_oid": FIRST_TABLE_OID, "xtdb_slug": "public$t𐐀"},
+        ],
+        "xtdb_slug_collisions": {},
+    }));
+    assert!(report["allocation_batch"].is_null());
+}
+
+#[test]
+fn oid_preflight_preserves_explicit_identity_and_compares_only_fresh_batch_names() {
+    let existing = TableRef::new("public", "existing");
+    let recorded = TableEntry { table: existing.clone(), oid: 20_000, slug: TableSlug::recorded("original-locator").unwrap() };
+    let wire = Block {
+        tables: vec![recorded.to_proto()],
+        table_names: vec!["public/would_sort_first".into()],
+        ..Default::default()
+    };
+    let bmp = TableRef::new("public", "tＡ");
+    let supplementary = TableRef::new("public", "t𐐀");
+    let report = classic_oid_preflight(wire.clone(), &[bmp.clone(), existing, supplementary, bmp.clone()]);
+    assert_eq!(report["registry_source"], "recorded");
+    assert_eq!(report["checkpoint_registry"], json!({
+        "eligible": true,
+        "relations": [
+            {"table": {"schema": "public", "table": "existing"}, "native_oid": 20_000, "xtdb_oid": 20_000, "xtdb_slug": "original-locator"},
+        ],
+        "xtdb_slug_collisions": {},
+    }));
+    assert_eq!(report["allocation_batch"], json!({
+        "eligible": false,
+        "relations": [
+            {"table": {"schema": "public", "table": "t𐐀"}, "native_oid": 20_004, "xtdb_oid": 20_003, "xtdb_slug": "public$t𐐀"},
+            {"table": {"schema": "public", "table": "tＡ"}, "native_oid": 20_003, "xtdb_oid": 20_004, "xtdb_slug": "public$tＡ"},
+        ],
+        "xtdb_slug_collisions": {},
+    }));
+    let single = classic_oid_preflight(wire, &[bmp]);
+    assert_eq!(single["allocation_batch"]["eligible"], true);
+    assert_eq!(single["allocation_batch"]["relations"][0]["native_oid"], 20_003);
+}
+
+#[test]
+fn oid_preflight_flags_slug_aliases_in_legacy_roots_and_against_recorded_locations() {
+    let legacy = classic_oid_preflight(Block {
+        table_names: vec!["public/a.b".into(), "public/a$b".into()], ..Default::default()
+    }, &[]);
+    assert_eq!(legacy["checkpoint_registry"]["eligible"], false);
+    assert_eq!(legacy["checkpoint_registry"]["xtdb_slug_collisions"], json!({
+        "public$a$b": [{"schema": "public", "table": "a$b"}, {"schema": "public", "table": "a.b"}],
+    }));
+    let anchor = TableEntry { table: TableRef::new("public", "renamed"), oid: 21_000, slug: TableSlug::recorded("public$a$b").unwrap() };
+    let report = classic_oid_preflight(Block { tables: vec![anchor.to_proto()], ..Default::default() }, &[TableRef::new("public", "a.b")]);
+    assert_eq!(report["checkpoint_registry"]["eligible"], true);
+    assert_eq!(report["allocation_batch"]["eligible"], false);
+    assert_eq!(report["allocation_batch"]["xtdb_slug_collisions"], json!({
+        "public$a$b": [{"schema": "public", "table": "a.b"}, {"schema": "public", "table": "renamed"}],
+    }));
+}
+
+#[test]
+fn oid_preflight_marks_a_native_only_root_ineligible_even_when_oids_agree() {
+    let report = classic_oid_preflight(Block { naming_epoch: Some(1), ..Default::default() }, &[TableRef::new("public", "a")]);
+    assert_eq!(report["rtdb_only_root"], true);
+    assert_eq!(report["checkpoint_registry"]["eligible"], false);
+    assert_eq!(report["allocation_batch"]["eligible"], false);
 }
 
 #[test]

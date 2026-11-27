@@ -183,6 +183,20 @@ fn legacy_block_names_allocate_oids_in_name_order() {
 }
 
 #[test]
+fn checkpoint_decode_refuses_duplicate_recorded_oids_and_legacy_name_aliases() {
+    use rtdb_format::catalog::TableEntry;
+
+    let entries = ["first", "second"].map(|name| TableEntry::new(FIRST_TABLE_OID, TableRef::new("public", name)).unwrap().to_proto());
+    for wire in [
+        Block { tables: entries.to_vec(), ..Default::default() },
+        Block { table_names: vec!["one".into(), "public/one".into()], ..Default::default() },
+    ] {
+        let error = BlockCatalog::decode(&wire.encode_to_vec()).unwrap_err();
+        assert_eq!(error.message.as_deref(), Some("Block catalog contains duplicate table names or OIDs"));
+    }
+}
+
+#[test]
 fn reads_xtdb_legacy_catalogs_and_writes_the_same_fallback_schema() {
     let samples: [(&[u8], &[u8], Option<i32>); 2] = [
         (
