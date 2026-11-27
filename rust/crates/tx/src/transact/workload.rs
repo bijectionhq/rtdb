@@ -1326,16 +1326,15 @@ impl TransactState {
         key: &[u8],
         commitment: Commitment,
     ) -> Result<Option<Receipt>> {
-        match self.workload_receipt(namespace, key) {
-            Ok(stored)
+        match self.find_receipt(key, Some(namespace))? {
+            Some(stored)
                 if stored.workload == Some(commitment.family)
                     && stored.matches_workload_digest(commitment.digest) =>
             {
                 Ok(Some(replay(&stored.receipt)))
             }
-            Ok(_) => Err(conflicting_key()),
-            Err(error) if error.code == "rtdb/unknown-transaction" => Ok(None),
-            Err(error) => Err(error),
+            Some(_) => Err(conflicting_key()),
+            None => Ok(None),
         }
     }
 

@@ -1118,15 +1118,21 @@ impl TransactState {
     }
 
     fn lookup_receipt(&self, key: &[u8], namespace: Option<[u8; 32]>) -> Result<&StoredReceipt> {
+        self.find_receipt(key, namespace)?.ok_or_else(unknown_receipt)
+    }
+
+    /// The committed receipt under `key`, or None where no transaction has committed with it.
+    /// A key whose transaction is still pending is an error, not an absence.
+    fn find_receipt(&self, key: &[u8], namespace: Option<[u8; 32]>) -> Result<Option<&StoredReceipt>> {
         validate_key(key)?;
         if self.pending.as_ref().is_some_and(|pending| {
             pending.tx.receipt_namespace == namespace && pending.tx.receipt.key == key
         }) {
             return Err(pending_error());
         }
-        let stored = self.receipts.get(&namespace).and_then(|receipts| receipts.get(key)).ok_or_else(unknown_receipt)?;
+        let Some(stored) = self.receipts.get(&namespace).and_then(|receipts| receipts.get(key)) else { return Ok(None); };
         if stored.receipt.decision_clock.is_some_and(|offer| offer.booked()) { return Err(pending_error()); }
-        Ok(stored)
+        Ok(Some(stored))
     }
 
     pub fn resolve(
