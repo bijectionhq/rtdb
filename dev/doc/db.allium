@@ -2410,6 +2410,7 @@ surface QueryAccess {
         -- Correlated Apply retains dependent Arrow pages as ordered spans with an outer position for each span.
         -- A left, single or scalar Apply with no match retains one outer position with a missing dependent row.
         -- A left lateral UNNEST with a supported total predicate processes the real candidates of each reached input page and retains each candidate for which the predicate is true.
+        -- An admitted fixed-size Arrow list has the declared width and contributes the selected parent's child span within the reached slice.
         -- Each surviving candidate retains its parent, its original one-based ordinality, and its element value, including a real null element.
         -- A parent with a null list, an empty list, or zero surviving candidates yields one row with null dependent columns.
         -- Batched expansion preserves the reached input validation and retains selected child spans under their source owners.

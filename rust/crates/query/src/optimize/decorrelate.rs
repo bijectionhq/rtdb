@@ -987,7 +987,7 @@ fn plain_unnest_scalar(ty: &LogicalType) -> bool {
 
 fn plain_unnest_list(ty: &LogicalType) -> bool {
     let ty = match ty { LogicalType::Maybe(inner) => inner.as_ref(), ty => ty };
-    matches!(ty, LogicalType::List { kind: ListKind::List, element }
+    matches!(ty, LogicalType::List { kind: ListKind::List | ListKind::FixedSizeList(0..), element }
         if **element == LogicalType::Nothing || plain_unnest_scalar(element))
 }
 

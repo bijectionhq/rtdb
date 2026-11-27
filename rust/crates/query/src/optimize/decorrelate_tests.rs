@@ -1149,3 +1149,121 @@ fn an_error_building_a_rewrite_fails_the_plan_rather_than_keeping_the_apply() {
     let relation = scalar(aggregate(customer_orders(), vec![counted(count, AggregateFunction::CountStar, None, None)]), by_customer());
     assert_eq!(decorrelate::decorrelate(relation, &mut Ids(u32::MAX)).unwrap_err(), exhausted());
 }
+
+fn filtered_fixed_size_tags(
+    width: i32, pages: Vec<rtdb_columnar::OwnedBatch>, payload: Option<Field>, predicate: Expr,
+) -> Arc<Relation> {
+    let tags = typed(40, "tags", LogicalType::List {
+        kind: rtdb_types::ListKind::FixedSizeList(width), element: Box::new(int().maybe()),
+    }.maybe());
+    let mut fields = vec![customer_id(), tags.clone()];
+    fields.extend(payload);
+    let input = Arc::new(Relation::new(Schema::new(fields).unwrap(), RelationNode::ArrowLiteralPages {
+        pages: rtdb_plan::LiteralArrowPages::new(pages),
+    }).unwrap());
+    let element = integer(41, "tag");
+    let table = Arc::new(Relation::new(Schema::new(vec![element.clone()]).unwrap(),
+        RelationNode::ColumnTable { expr: parameter(0, &tags), element }).unwrap());
+    let table = Arc::new(table.with_ordinality(typed(42, "n", int()), rtdb_plan::OrdinalityScope::Page).unwrap());
+    let relation = apply(&input, select(table, predicate), vec![(0, tags.expression())], ApplyKind::Left, None);
+    let output = [0, 41, 42].map(|id| relation.schema().get(ColumnId(id)).unwrap().clone());
+    keep(relation, &output)
+}
+
+async fn run_with_no_dependent_opens(query: &PreparedQuery, context: Arc<QueryContext>) -> Vec<String> {
+    let (tracer, mut spans) = rtdb_metrics::TraceRecorder::new(Arc::clone(&context.memory), 64, true, true).unwrap();
+    let rows = run_with_context(query, context.with_tracer(Some(tracer.clone()), None)).await.unwrap();
+    tracer.close();
+    let mut opens = Vec::new();
+    while let Some(span) = spans.next().await {
+        for (name, value) in span.attributes() {
+            if name == "cursor.apply.inner_executions" { opens.push(value.parse::<u64>().unwrap()); }
+        }
+    }
+    assert_eq!(opens, [0]);
+    rows
+}
+
+#[tokio::test]
+async fn left_unnest_batches_sliced_fixed_size_lists_and_keeps_real_nulls_and_sparse_ordinals() {
+    use arrow_array::{Array, FixedSizeListArray, Int64Array, RecordBatch};
+    use arrow_buffer::NullBuffer;
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+
+    let item = Arc::new(ArrowField::new("item", DataType::Int64, true));
+    let values = Int64Array::from(vec![
+        Some(1), None, Some(3), Some(90),
+        Some(41), None, Some(42), Some(51),
+        Some(1), Some(3), Some(4), Some(5),
+        Some(1), None, Some(3), Some(90),
+        Some(41), None, Some(42), Some(51),
+    ]);
+    let lists = FixedSizeListArray::new(item, 4, Arc::new(values),
+        Some(NullBuffer::from(vec![true, true, true, false, true])));
+    let schema = Arc::new(ArrowSchema::new(vec![
+        rtdb_columnar::to_field("id", &customer_id().data_type).unwrap(),
+        ArrowField::new("tags", lists.data_type().clone(), true),
+    ]));
+    let record = RecordBatch::try_new(schema,
+        vec![Arc::new(Int64Array::from(vec![99, 1, 2, 3, 1])), Arc::new(lists)]).unwrap().slice(1, 4);
+    let context = context();
+    let page = rtdb_columnar::OwnedBatch::new(record, &context.memory).unwrap();
+    let element = integer(41, "tag").expression();
+    let ordinal = typed(42, "n", int()).expression();
+    let real_null = Expr::binary(BinaryOp::And, equals(ordinal.clone(), literal(2)),
+        Expr::unary(UnaryOp::IsNull, element.clone()));
+    let keep_fourth = Expr::binary(BinaryOp::And, equals(ordinal, literal(4)),
+        Expr::binary(BinaryOp::Gt, element, literal(50)));
+    let relation = filtered_fixed_size_tags(4, vec![page], None, Expr::binary(BinaryOp::Or, real_null, keep_fourth));
+    let (correlated, rewritten) = both_ways(&relation);
+    assert_eq!(count_nodes(rewritten.relation(), &|node| matches!(node,
+        RelationNode::Apply { kind: ApplyKind::LeftUnnest, .. })), 1);
+    let expected = [
+        "[I64(1), Null, I64(2)]", "[I64(1), I64(51), I64(4)]",
+        "[I64(2), Null, Null]", "[I64(3), Null, Null]",
+        "[I64(1), Null, I64(2)]", "[I64(1), I64(51), I64(4)]",
+    ];
+    assert_eq!(run_in_order(&correlated).await.unwrap(), expected);
+    assert_eq!(run_with_no_dependent_opens(&rewritten, context).await, expected);
+}
+
+#[tokio::test]
+async fn left_unnest_zero_width_fixed_size_lists_extend_each_parent_and_validate_only_reached_pages() {
+    use arrow_array::{Array, FixedSizeListArray, Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+
+    let uri = typed(45, "uri", LogicalType::Scalar(ScalarType::Uri));
+    let uri_field = rtdb_columnar::to_field("uri", &uri.data_type).unwrap();
+    let context = context();
+    let page = |ids, uris| {
+        let ids = Int64Array::from(ids);
+        let lists = FixedSizeListArray::try_new_with_length(
+            Arc::new(ArrowField::new("item", DataType::Int64, true)), 0,
+            Arc::new(Int64Array::from(Vec::<i64>::new())), None, ids.len(),
+        ).unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            rtdb_columnar::to_field("id", &customer_id().data_type).unwrap(),
+            ArrowField::new("tags", lists.data_type().clone(), true),
+            uri_field.clone(),
+        ]));
+        let record = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(lists), Arc::new(uris)]).unwrap();
+        rtdb_columnar::OwnedBatch::new(record, &context.memory).unwrap()
+    };
+    let invalid = StringArray::from(vec!["https://xtdb.com", "not a URI"]);
+    let error = read_value(&uri_field, &invalid, 1).unwrap_err().code.to_string();
+    let first = page(vec![1i64, 2], StringArray::from(vec!["https://xtdb.com"; 2]));
+    let second = page(vec![3i64, 4], invalid);
+    let predicate = Expr::unary(UnaryOp::IsNull, integer(41, "tag").expression());
+    let relation = filtered_fixed_size_tags(0, vec![first, second], Some(uri), predicate);
+    let limited = Arc::new(Arc::clone(&relation).limit(None, Some(literal(2))).unwrap());
+    let (correlated, rewritten) = both_ways(&limited);
+    assert_eq!(count_nodes(rewritten.relation(), &|node| matches!(node,
+        RelationNode::Apply { kind: ApplyKind::LeftUnnest, .. })), 1);
+    let expected = ["[I64(1), Null, Null]", "[I64(2), Null, Null]"];
+    assert_eq!(run_in_order(&correlated).await.unwrap(), expected);
+    assert_eq!(run_with_no_dependent_opens(&rewritten, context).await, expected);
+
+    let (correlated, rewritten) = both_ways(&relation);
+    assert_eq!(run_in_order(&correlated).await, Err(error.clone()));
+    assert_eq!(run_in_order(&rewritten).await, Err(error));
+}

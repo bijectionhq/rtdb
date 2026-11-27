@@ -757,6 +757,10 @@ impl ColumnBatch {
 
     fn list_expansion(&self, position: usize, expected: Option<&LogicalType>, narrow_ordinality: bool, outer: bool,
         context: &crate::QueryContext) -> Result<Option<UnnestExpansion>> {
+        let skip_empty_variable_lists = expected.is_some_and(|ty| {
+            let ty = match ty { LogicalType::Maybe(inner) => inner.as_ref(), ty => ty };
+            !matches!(ty, LogicalType::List { kind: ListKind::FixedSizeList(_), .. })
+        });
         let memory = &context.memory;
         let mut selection = memory.reserve(4096)?;
         let mut inputs = HashMap::new();
@@ -777,7 +781,7 @@ impl ColumnBatch {
             let (source, start, count) = match vector {
                 None => (0, 0, 0),
                 Some((array, field, logical, offset, custody)) => {
-                    if expected.is_some() && array.as_any().downcast_ref::<ListArray>().is_some_and(|list| {
+                    if skip_empty_variable_lists && array.as_any().downcast_ref::<ListArray>().is_some_and(|list| {
                         let offsets = list.value_offsets();
                         offsets[offset] == offsets[offset + 1]
                     }) {
@@ -809,10 +813,19 @@ impl ColumnBatch {
                                 (field, list.values(), start, offsets[offset + 1] as usize - start)
                             }
                             DataType::FixedSizeList(field, width) => {
-                                use arrow_array::cast::AsArray;
-                                let width = *width as usize;
-                                let list = array.as_fixed_size_list();
-                                (field, list.values(), offset.checked_mul(width).ok_or_else(size_error)?, width)
+                                let list = array.as_any().downcast_ref::<FixedSizeListArray>().ok_or_else(|| {
+                                    rtdb_types::Anomaly::fault("rtdb.query/fixed-list-layout", "Fixed-size list field has an incompatible Arrow array")
+                                })?;
+                                let width = usize::try_from(*width).map_err(|_| {
+                                    rtdb_types::Anomaly::fault("rtdb.query/fixed-list-width", "Fixed-size list width is negative")
+                                })?;
+                                // Arrow slices rebase the child array, and value_offset narrows its index to i32.
+                                let start = offset.checked_mul(width)
+                                    .filter(|&start| start.checked_add(width).is_some_and(|end| end <= list.values().len()))
+                                    .ok_or_else(|| rtdb_types::Anomaly::fault(
+                                        "rtdb.query/fixed-list-span", "Fixed-size list child span exceeds its Arrow array",
+                                    ))?;
+                                (field, list.values(), start, width)
                             }
                             _ => return Ok(None),
                         };
@@ -4172,6 +4185,65 @@ mod tests {
             assert_eq!(column.value(0).unwrap(), Value::I64(values[0]));
             assert_eq!(column.value(1).unwrap(), Value::I64(values[1]));
         }
+    }
+
+    #[test]
+    fn fixed_size_unnest_checks_the_layout_and_borrows_funded_selected_children() {
+        use arrow_array::{RecordBatch, types::Int64Type};
+
+        let memory = MemoryBudget::new(1 << 20);
+        let catalog = crate::CatalogSnapshot::new("xtdb", [("xtdb".into(), crate::DatabaseSnapshot {
+            partitions: vec![],
+            storage: Arc::new(rtdb_storage::cache::BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
+        })].into(), false).unwrap();
+        let context = crate::QueryContext::new(catalog, Arc::clone(&memory), Timestamp(0), "UTC", Default::default(),
+            &tokio_util::sync::CancellationToken::new()).unwrap();
+        let baseline = memory.used_bytes();
+        let item = Arc::new(ArrowField::new("item", DataType::Int64, false));
+        let lists = FixedSizeListArray::new(item, 2, Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5, 6])), None);
+        let field = Arc::new(ArrowField::new("tags", lists.data_type().clone(), false));
+        let schema = Arc::new(arrow_schema::Schema::new(vec![Arc::clone(&field)]));
+        let record = RecordBatch::try_new(schema, vec![Arc::new(lists)]).unwrap();
+        let owned = rtdb_columnar::OwnedBatch::new(record, &memory).unwrap();
+        let array = owned.batch().column(0);
+        let owner = Arc::downgrade(owned.reservation());
+        let lists = array.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+        let child = Arc::downgrade(lists.values());
+        let logical = rtdb_columnar::from_field(&field).unwrap();
+        let selected = SelectedColumn {
+            sources: Arc::new(vec![Some((Arc::clone(array), field, Some(logical.clone()), Some(Arc::clone(owned.reservation()))))]),
+            cells: SelectedRows::Picks(Arc::new(vec![(0, 2), (0, 1)])),
+        };
+        let batch = ColumnBatch::settled(vec![Column::Selected(selected)], 2, memory.reserve(4096).unwrap()).unwrap();
+
+        let pressure = memory.reserve(memory.available_bytes()).unwrap();
+        assert!(matches!(batch.list_expansion(0, Some(&logical), false, false, &context),
+            Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted)));
+        drop(pressure);
+        let wrong_width = LogicalType::List {
+            kind: ListKind::FixedSizeList(1), element: Box::new(LogicalType::Scalar(ScalarType::I64)),
+        };
+        assert!(batch.list_expansion(0, Some(&wrong_width), false, false, &context).unwrap().is_none());
+        let empty_variable = ListArray::from_iter_primitive::<Int64Type, _, _>([Some(Vec::<Option<i64>>::new())]);
+        let field = Arc::new(ArrowField::new("tags", empty_variable.data_type().clone(), true));
+        let other = ColumnBatch::settled(vec![Column::Arrow { array: Arc::new(empty_variable), field, logical: None }],
+            1, memory.reserve(4096).unwrap()).unwrap();
+        assert!(other.list_expansion(0, Some(&logical.clone().maybe()), false, false, &context).unwrap().is_none());
+        drop(other);
+
+        let expansion = batch.list_expansion(0, Some(&logical), false, false, &context).unwrap().unwrap();
+        let elements = expansion.elements(&expansion.runs);
+        drop((owned, batch));
+
+        assert!(owner.upgrade().is_some());
+        for (row, expected) in [5, 6, 3, 4].into_iter().enumerate() {
+            let (array, ..) = elements.arrow_cell(row).unwrap().unwrap();
+            assert!(std::ptr::eq(array, child.upgrade().unwrap().as_ref()));
+            assert_eq!(elements.value(row).unwrap(), Value::I64(expected));
+        }
+        drop((elements, expansion));
+        assert!(owner.upgrade().is_none());
+        assert_eq!(memory.used_bytes(), baseline);
     }
 
     #[tokio::test]
