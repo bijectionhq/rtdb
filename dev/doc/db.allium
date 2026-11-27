@@ -2469,7 +2469,11 @@ surface QueryAccess {
         -- The output page owns the charge for those buffers.
         -- A same-scale Decimal128 sum at non-negative scale accumulates its exact coefficient and checks physical overflow.
         -- Duration sums and averages keep the declared unit and use wrapping signed arithmetic for unit conversion and addition.
-        -- Text extrema compare compatible Arrow text by bytes and copy the text only when it becomes a new extremum.
+        -- A duration sum or average reads Arrow cells with a matching input layout in selection order and reports the first selected null at its page index for a concrete duration input.
+        -- Timestamp, time and duration extrema compare Arrow ticks directly when the input layout matches the result type.
+        -- An extremum requiring temporal conversion casts each reached candidate before comparison and preserves the result type's unit and timezone label.
+        -- Text and binary extrema compare compatible Arrow cells by bytes and copy only a replacement winner.
+        -- EVERY and ANY read compatible Arrow Boolean cells in selection order and retain a nullable Boolean per group.
         -- Aggregate DISTINCT indexes its selected argument positions within each group and retains arguments whose SQL equality is unknown.
         -- A sparsely retained typed DISTINCT argument page can compact to the positions that entered the index.
         -- List aggregates collect selected Arrow positions after applying filters and distinctness, and sort Arrow keys in memory when the aggregate specifies an order.

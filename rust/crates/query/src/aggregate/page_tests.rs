@@ -64,6 +64,12 @@ impl BatchCursor for Batches {
     async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> { Ok(self.0.take()) }
 }
 
+struct Pages(VecDeque<ColumnBatch>);
+#[async_trait]
+impl BatchCursor for Pages {
+    async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> { Ok(self.0.pop_front()) }
+}
+
 #[tokio::test]
 async fn empty_arrow_groups_validate_aggregate_order_types() {
     let execution = execution(8);
@@ -241,12 +247,6 @@ async fn selected_global_reductions_fit_without_materializing_row_masks() {
 async fn grouped_floating_reductions_keep_input_order_across_selected_and_value_pages() {
     use arrow_array::{Float64Array, Int64Array};
     use crate::columnar::SelectedColumn;
-
-    struct Pages(VecDeque<ColumnBatch>);
-    #[async_trait]
-    impl BatchCursor for Pages {
-        async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> { Ok(self.0.pop_front()) }
-    }
 
     let execution = execution(8);
     let memory = &execution.context.memory;
@@ -968,6 +968,155 @@ async fn primitive_result(mut cursor: AggregateCursor) -> Value {
     let page = cursor.next_batch().await.unwrap().unwrap();
     assert!(cursor.next_batch().await.unwrap().is_none());
     page.columns[0].value(0).unwrap()
+}
+
+#[test]
+fn aggregate_input_temporal_extrema_and_boolean_fit_in_reserved_group_state() {
+    use crate::columnar::SelectedColumn;
+
+    let execution = execution(8);
+    let memory = &execution.context.memory;
+    let baseline = memory.used_bytes();
+    let mut inputs = Vec::new();
+    for unit in [TimeUnit::Second, TimeUnit::Millisecond, TimeUnit::Microsecond, TimeUnit::Nanosecond] {
+        for timezone in [None, Some("America/New_York".to_owned())] {
+            let value = |value| Value::Timestamp { value, unit, timezone: timezone.clone() };
+            inputs.push((value(i64::MIN), value(i64::MAX)));
+        }
+        let bit_width = if unit < TimeUnit::Microsecond { 32 } else { 64 };
+        inputs.push((Value::Time { value: 1, unit, bit_width }, Value::Time { value: 2, unit, bit_width }));
+        inputs.push((Value::Duration { value: -9, unit }, Value::Duration { value: 9, unit }));
+    }
+    inputs.push((Value::Bool(false), Value::Bool(true)));
+    for (lesser, greater) in inputs {
+        let input = lesser.logical_type().maybe();
+        let functions = if matches!(lesser, Value::Bool(_)) {
+            [AggregateFunction::Every, AggregateFunction::Any]
+        } else {
+            [AggregateFunction::Min, AggregateFunction::Max]
+        };
+        let arrow_field = Arc::new(rtdb_columnar::to_field("c0", &input).unwrap());
+        let array = rtdb_columnar::copy_array(&input, &[greater.clone(), Value::Null, lesser.clone()]).unwrap();
+        let picks = Arc::new(vec![(0, 2), (1, 0), (0, 0), (0, 1), (0, 2)]);
+        let selected = SelectedColumn::new(vec![Some((array, arrow_field, Some(input.clone()), None)), None], picks);
+        let batch = ColumnBatch::settled(vec![Column::Selected(selected)], 5, memory.reserve(4096).unwrap()).unwrap();
+        let page = Rows::columns(&batch, &[0], true, &execution.context).unwrap();
+        let scope = execution.scope().unwrap();
+        for (function, expected) in functions.into_iter().zip([lesser.clone(), greater.clone()]) {
+            let aggregate = AggregateExpr {
+                field: field(1, input.clone()), function,
+                argument: Some(field(0, input.clone()).expression()), distinct: false, filter: None, order_by: vec![],
+            };
+            let types = AggregateTypes::derive(&aggregate, input.clone(), false, EmissionMode::Execution).unwrap();
+            let mut states = ScalarGroups::new(&execution).unwrap();
+            states.ensure(3).unwrap();
+            let pressure = memory.reserve(memory.available_bytes()).unwrap();
+            states.aggregate(page, GroupMapping::Grouped(&[0, 1, 0, 1, 2]), &[true, true, true, true, false],
+                3, Some(0), &aggregate, &types, &scope, &execution).unwrap();
+            drop(pressure);
+            assert_eq!(states.values[0].finish(&aggregate, types.output_type(), &scope).unwrap(), expected);
+            for state in &states.values[1..] {
+                assert_eq!(state.finish(&aggregate, types.output_type(), &scope).unwrap(), Value::Null);
+            }
+        }
+    }
+    assert_eq!(memory.used_bytes(), baseline);
+}
+
+#[test]
+fn aggregate_input_duration_sum_preserves_the_reached_null_index_and_wrapping() {
+    use crate::columnar::SelectedColumn;
+
+    let execution = execution(8);
+    let memory = &execution.context.memory;
+    let baseline = memory.used_bytes();
+    {
+        let input = LogicalType::Scalar(ScalarType::Duration(TimeUnit::Second)).maybe();
+        let output = LogicalType::Scalar(ScalarType::Duration(TimeUnit::Millisecond)).maybe();
+        let aggregate = AggregateExpr {
+            field: field(1, output.clone()), function: AggregateFunction::Average,
+            argument: Some(field(0, output.clone()).expression()), distinct: false, filter: None, order_by: vec![],
+        };
+        let types = AggregateTypes::derive(&aggregate, input.clone(), true, EmissionMode::Execution).unwrap();
+        let arrow_field = Arc::new(rtdb_columnar::to_field("c0", &input).unwrap());
+        let array = Arc::new(arrow_array::DurationSecondArray::from(vec![i64::MAX, 3]));
+        let selected = SelectedColumn::new(vec![Some((array, arrow_field, None, None)), None],
+            Arc::new(vec![(0, 0), (1, 0), (0, 1)]));
+        let batch = ColumnBatch::settled(vec![Column::Selected(selected)], 3, memory.reserve(4096).unwrap()).unwrap();
+        let page = Rows::columns(&batch, &[0], false, &execution.context).unwrap();
+        let scope = execution.scope().unwrap();
+        for selected in [false, true] {
+            let mut states = ScalarGroups::new(&execution).unwrap();
+            states.ensure(1).unwrap();
+            let pressure = memory.reserve(memory.available_bytes() - 4096).unwrap();
+            let result = states.aggregate(page, GroupMapping::Global(3), &[true, selected, true], 1,
+                Some(0), &aggregate, &types, &scope, &execution);
+            drop(pressure);
+            let state = &states.values[0];
+            if selected {
+                let error = result.unwrap_err();
+                assert_eq!(error.code, "xtdb.error/unknown");
+                assert_eq!(error.message.as_deref(), Some("null at index 1"));
+                assert_eq!(state.count, 0);
+                assert!(matches!(state.accumulator, ScalarState::Duration(-1000, TimeUnit::Millisecond)));
+            } else {
+                result.unwrap();
+                assert_eq!(state.finish(&aggregate, &output, &scope).unwrap(),
+                    Value::Duration { value: 1000, unit: TimeUnit::Millisecond });
+            }
+        }
+    }
+    assert_eq!(memory.used_bytes(), baseline);
+}
+
+#[tokio::test]
+async fn aggregate_input_timestamp_extremum_keeps_units_and_casts_each_reached_value() {
+    let execution = execution(8);
+    let memory = &execution.context.memory;
+    let baseline = memory.used_bytes();
+    let timestamp = |value, unit, zone: &str| Value::Timestamp { value, unit, timezone: Some(zone.to_owned()) };
+    let initial = timestamp(10, TimeUnit::Microsecond, "Z");
+    let coarse = timestamp(-2, TimeUnit::Second, "America/New_York");
+    let overflow = timestamp(i64::MAX, TimeUnit::Second, "America/New_York");
+    let declared = initial.logical_type().join(&coarse.logical_type()).maybe();
+    for later in [coarse.clone(), overflow.clone()] {
+        let ty = initial.logical_type();
+        let first = ColumnBatch::settled(vec![Column::Arrow {
+            array: rtdb_columnar::copy_array(&ty, std::slice::from_ref(&initial)).unwrap(),
+            field: Arc::new(rtdb_columnar::to_field("c0", &ty).unwrap()), logical: Some(ty),
+        }], 1, memory.reserve(4096).unwrap()).unwrap();
+        let is_overflow = later == overflow;
+        let second = ColumnBatch::settled(vec![Column::Values(vec![later])], 1, memory.reserve(4096).unwrap()).unwrap();
+        let mut cursor = primitive_cursor(&execution, AggregateFunction::Min, declared.clone(), declared.clone(), vec![], None);
+        cursor.input = Some(AggregateInput { batches: Box::new(Pages([first, second].into())), projected: true });
+        if is_overflow {
+            assert_eq!(cursor.next_batch().await.err().unwrap().code, "xtdb.expression/overflow-error");
+        } else {
+            assert_eq!(primitive_result(cursor).await, timestamp(-2_000_000, TimeUnit::Microsecond, "Z"));
+        }
+    }
+    assert_eq!(memory.used_bytes(), baseline);
+}
+
+#[tokio::test]
+async fn aggregate_input_binary_extrema_compare_unsigned_bytes_across_pages() {
+    let execution = execution(8);
+    let memory = &execution.context.memory;
+    let baseline = memory.used_bytes();
+    let ty = LogicalType::Scalar(ScalarType::Binary).maybe();
+    for (function, expected) in [(AggregateFunction::Min, vec![0x7f]), (AggregateFunction::Max, vec![0xff, 0x01])] {
+        let first = ColumnBatch::settled(vec![Column::Values(vec![Value::Binary(vec![0xff])])],
+            1, memory.reserve(4096).unwrap()).unwrap();
+        let values = [Value::Binary(vec![0x7f]), Value::Null, Value::Binary(vec![0xff, 0x01])];
+        let second = ColumnBatch::settled(vec![Column::Arrow {
+            array: rtdb_columnar::copy_array(&ty, &values).unwrap(),
+            field: Arc::new(rtdb_columnar::to_field("c0", &ty).unwrap()), logical: Some(ty.clone()),
+        }], values.len(), memory.reserve(4096).unwrap()).unwrap();
+        let mut cursor = primitive_cursor(&execution, function, ty.clone(), ty.clone(), vec![], None);
+        cursor.input = Some(AggregateInput { batches: Box::new(Pages([first, second].into())), projected: false });
+        assert_eq!(primitive_result(cursor).await, Value::Binary(expected));
+    }
+    assert_eq!(memory.used_bytes(), baseline);
 }
 
 #[tokio::test]

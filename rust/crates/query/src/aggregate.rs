@@ -1,12 +1,12 @@
 use std::{cmp::Ordering, collections::{HashMap, HashSet}, mem::size_of, sync::Arc};
 
 use arrow_array::{Array, cast::AsArray, types::*};
-use arrow_schema::{DataType, Field as ArrowField};
+use arrow_schema::{DataType, Field as ArrowField, TimeUnit as ArrowTimeUnit};
 use async_trait::async_trait;
 use rtdb_columnar::{ArrowCell, CellReadCheck, MemoryReservation};
 use rtdb_expr::{cast, compare_in_timezone, is_true, number, sql_eq_in_timezone};
 use rtdb_plan::{AggregateExpr, AggregateFunction, Binder, NamedExpr, PercentileFraction, PercentileKind, Schema};
-use rtdb_types::{LogicalType, Result, ScalarType, Value};
+use rtdb_types::{LogicalType, Result, ScalarType, TimeUnit, Value};
 
 use crate::context::Execution;
 use crate::columnar::{BatchCursor, Column, ColumnBatch};
@@ -473,11 +473,15 @@ fn fixed_scalar_results(
         };
     }
     // A winning timestamp has already been cast to the output type by the reducer.
-    let timestamp = |state: &ScalarAccumulator| retained!(state, Value::Timestamp { value, .. } => *value);
+    let timestamp = |state: &ScalarAccumulator| match &state.accumulator {
+        ScalarState::TemporalExtremum(value) => Ok(Some(*value)),
+        _ => retained!(state, Value::Timestamp { value, .. } => *value),
+    };
     let duration = |state: &ScalarAccumulator| match (&state.accumulator, function) {
         (_, A::Average) if state.count == 0 => Ok(None),
         (ScalarState::Duration(value, _), A::Average) => Ok(Some(value.wrapping_div(state.count))),
         (ScalarState::Duration(value, _), _) => Ok(Some(*value)),
+        (ScalarState::TemporalExtremum(value), A::Min | A::Max) => Ok(Some(*value)),
         _ => retained!(state, Value::Duration { value, .. } => *value),
     };
     match (function, scalar) {
@@ -515,7 +519,11 @@ fn fixed_scalar_results(
                 let mut builder = BooleanBuilder::with_capacity(len);
                 for (row, state) in states.values.iter().enumerate() {
                     context.check_cancelled_at(row)?;
-                    builder.append_option(retained!(state, Value::Bool(value) => *value)?);
+                    let value = match state.accumulator {
+                        ScalarState::Boolean(value) => Some(value),
+                        _ => retained!(state, Value::Bool(value) => *value)?,
+                    };
+                    builder.append_option(value);
                 }
                 Ok(Arc::new(builder.finish()))
             })?;
@@ -727,6 +735,45 @@ fn present_arrow_cell<'a>(cell: Option<(&'a dyn Array, &arrow_schema::Field, Opt
         return Err(rtdb_types::Anomaly::incorrect("rtdb/array-layout", "Arrow array and logical field layout disagree"));
     }
     Ok((array.data_type() != &DataType::Null && !array.is_null(offset)).then_some((array, offset)))
+}
+
+fn same_temporal_layout(ty: &LogicalType, physical: &DataType) -> bool {
+    let matches_unit = |unit, physical: &ArrowTimeUnit| matches!((unit, physical),
+        (TimeUnit::Second, ArrowTimeUnit::Second)
+        | (TimeUnit::Millisecond, ArrowTimeUnit::Millisecond)
+        | (TimeUnit::Microsecond, ArrowTimeUnit::Microsecond)
+        | (TimeUnit::Nanosecond, ArrowTimeUnit::Nanosecond));
+    match (without_nullability(ty), physical) {
+        (LogicalType::Scalar(ScalarType::Timestamp { unit, timezone }), DataType::Timestamp(actual, zone)) =>
+            matches_unit(*unit, actual) && timezone.as_deref() == zone.as_deref(),
+        (LogicalType::Scalar(ScalarType::Time { unit, bit_width: 32 }), DataType::Time32(actual))
+        | (LogicalType::Scalar(ScalarType::Time { unit, bit_width: 64 }), DataType::Time64(actual))
+        | (LogicalType::Scalar(ScalarType::Duration(unit)), DataType::Duration(actual)) => matches_unit(*unit, actual),
+        _ => false,
+    }
+}
+
+fn temporal_ticks(array: &dyn Array, row: usize) -> Result<i64> {
+    use ArrowTimeUnit as T;
+    macro_rules! ticks {
+        ($ty:ty) => { array.as_primitive_opt::<$ty>().map(|array| i64::from(array.value(row))) };
+    }
+    let value = match array.data_type() {
+        DataType::Timestamp(T::Second, _) => ticks!(TimestampSecondType),
+        DataType::Timestamp(T::Millisecond, _) => ticks!(TimestampMillisecondType),
+        DataType::Timestamp(T::Microsecond, _) => ticks!(TimestampMicrosecondType),
+        DataType::Timestamp(T::Nanosecond, _) => ticks!(TimestampNanosecondType),
+        DataType::Time32(T::Second) => ticks!(Time32SecondType),
+        DataType::Time32(T::Millisecond) => ticks!(Time32MillisecondType),
+        DataType::Time64(T::Microsecond) => ticks!(Time64MicrosecondType),
+        DataType::Time64(T::Nanosecond) => ticks!(Time64NanosecondType),
+        DataType::Duration(T::Second) => ticks!(DurationSecondType),
+        DataType::Duration(T::Millisecond) => ticks!(DurationMillisecondType),
+        DataType::Duration(T::Microsecond) => ticks!(DurationMicrosecondType),
+        DataType::Duration(T::Nanosecond) => ticks!(DurationNanosecondType),
+        _ => None,
+    };
+    value.ok_or_else(|| rtdb_types::Anomaly::incorrect("rtdb/array-layout", "Arrow array and logical field layout disagree"))
 }
 
 impl AggregateCursor {
@@ -1499,37 +1546,70 @@ impl ScalarGroups {
                 }
                 self.count_page(page,mapping,mask,argument,execution)?;
             }
-            _ => {
+            A::Min | A::Max => {
                 self.ensure(group_count)?;
-                let extremum = matches!(aggregate.function, A::Min | A::Max);
                 let minimum = aggregate.function == A::Min;
-                let extrema = extremum.then(|| {
-                    NumericColumn::bind(page.arrow_column(argument)?, Some(types.output_type()))
-                }).flatten();
-                let text = page.arrow_column(argument).filter(|column| {
-                    extremum && without_nullability(types.output_type()) == &LogicalType::Scalar(ScalarType::Utf8)
-                        && accepts_typed_column(column, |ty| *ty == DataType::Utf8)
+                let output = types.output_type();
+                let column = page.arrow_column(argument);
+                let numeric = column.and_then(|column| NumericColumn::bind(column, Some(output)));
+                let temporal = column.filter(|column| accepts_typed_column(column, |ty| same_temporal_layout(output, ty)));
+                let bytes = column.filter(|column| {
+                    accepts_typed_column(column, |ty| matches!((without_nullability(output), ty),
+                        (LogicalType::Scalar(ScalarType::Utf8), DataType::Utf8)
+                        | (LogicalType::Scalar(ScalarType::Binary), DataType::Binary)))
                 });
                 for (row,(group,selected)) in mapping.iter().zip(mask).enumerate() {
                     execution.context.check_cancelled_at(row)?;
                     if *selected {
                         let state = &mut self.values[group];
-                        if let Some(column) = &extrema {
+                        if let Some(column) = &numeric {
                             if let Some(value) = column.get(row) {
-                                state.numeric_extremum(value, types.output_type(), minimum, &self.state)?;
+                                state.numeric_extremum(value, output, minimum, &self.state)?;
                             }
-                        } else if let Some(column) = text {
+                        } else if let Some(column) = temporal {
                             if let Some((array, offset)) = present_column_cell(column, row)? {
-                                let value = array.as_string::<i32>().value(offset);
-                                state.text_extremum(value, minimum, &self.state)?;
+                                state.temporal_extremum(temporal_ticks(array, offset)?, minimum)?;
+                            }
+                        } else if let Some(column) = bytes {
+                            if let Some((array, offset)) = present_column_cell(column, row)? {
+                                if array.data_type() == &DataType::Utf8 {
+                                    let text = array.as_string::<i32>().value(offset);
+                                    state.byte_extremum(text.as_bytes(), minimum, &self.state, || Value::Utf8(text.to_owned()))?;
+                                } else {
+                                    let bytes = array.as_binary::<i32>().value(offset);
+                                    state.byte_extremum(bytes, minimum, &self.state, || Value::Binary(bytes.to_vec()))?;
+                                }
                             }
                         } else {
                             let value = page.value(row,argument)?;
-                            state.step(value.as_ref(),aggregate,types,execution,&self.state)?;
+                            state.scalar_extremum(value.as_ref(), output, minimum, execution, &self.state)?;
                         }
                     }
                 }
             }
+            A::Every | A::Any => {
+                self.ensure(group_count)?;
+                let every = aggregate.function == A::Every;
+                let boolean = page.arrow_column(argument).filter(|column| accepts_typed_column(column, |ty| *ty == DataType::Boolean));
+                for (row, (group, selected)) in mapping.iter().zip(mask).enumerate() {
+                    execution.context.check_cancelled_at(row)?;
+                    if !*selected { continue; }
+                    let state = &mut self.values[group];
+                    if let Some(column) = boolean {
+                        if let Some((array, offset)) = present_column_cell(column, row)? {
+                            state.reduce_boolean(Some(array.as_boolean().value(offset)), every)?;
+                        }
+                    } else {
+                        let value = page.value(row, argument)?;
+                        match value.as_ref() {
+                            Value::Null | Value::Undefined => (),
+                            Value::Bool(value) => state.reduce_boolean(Some(*value), every)?,
+                            _ => state.reduce_boolean(None, every)?,
+                        }
+                    }
+                }
+            }
+            _ => unreachable!(),
         }
         Ok(())
     }
@@ -1544,6 +1624,12 @@ impl ScalarGroups {
                 }) => Some((column, *scale)),
             _ => None,
         };
+        let duration = match (without_nullability(summer.input), summer.output) {
+            (input @ LogicalType::Scalar(ScalarType::Duration(unit)), LogicalType::Scalar(ScalarType::Duration(output))) =>
+                page.arrow_column(argument).filter(|column| accepts_typed_column(column, |ty| same_temporal_layout(input, ty)))
+                    .map(|column| (column, *unit, *output)),
+            _ => None,
+        };
         for (index,(group,selected)) in mapping.iter().zip(mask).enumerate() {
             execution.context.check_cancelled_at(index)?;
             if !*selected { continue; }
@@ -1552,6 +1638,13 @@ impl ScalarGroups {
                 if let Some(value) = column.get(index) {
                     state.add_numeric(value, summer.output)?;
                 }
+                continue;
+            }
+            if let Some((column, unit, output)) = duration {
+                let Some((array, offset)) = present_column_cell(column, index)? else {
+                    return Err(duration_null(index));
+                };
+                state.add_duration(temporal_ticks(array, offset)?, unit, output)?;
                 continue;
             }
             if let Some((column, input_scale)) = decimal {
@@ -1580,9 +1673,17 @@ impl ScalarGroups {
         Ok(())
     }
     fn count_page(&mut self,page: Rows<'_>,mapping: GroupMapping<'_>,mask: &[bool],argument: Option<usize>,execution: &Execution) -> Result<()> {
+        let typed = page.arrow_column(argument).filter(|column| accepts_typed_column(column, |ty| {
+            count_layout(ty) || matches!(ty, DataType::Duration(_) | DataType::Decimal128(..))
+        }));
         for (row,(group,selected)) in mapping.iter().zip(mask).enumerate() {
             execution.context.check_cancelled_at(row)?;
-            if *selected && !page.is_null(row,argument)? {
+            if !*selected { continue; }
+            let present = match typed {
+                Some(column) => present_column_cell(column, row)?.is_some(),
+                None => !page.is_null(row,argument)?,
+            };
+            if present {
                 let state = &mut self.values[group];
                 state.count = state.count.wrapping_add(1);
             }
@@ -1598,8 +1699,10 @@ enum ScalarState {
     I64(i64),
     F32(f32),
     F64(f64),
-    Duration(i64, rtdb_types::TimeUnit),
+    Duration(i64, TimeUnit),
     Decimal128([u8; 16]),
+    TemporalExtremum(i64),
+    Boolean(bool),
     Retained(OwnedRow),
 }
 
@@ -1627,19 +1730,61 @@ impl ScalarAccumulator {
         Ok(())
     }
 
-    fn text_extremum(&mut self, text: &str, minimum: bool, memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<()> {
+    fn byte_extremum(&mut self, bytes: &[u8], minimum: bool, memory: &Arc<rtdb_columnar::MemoryBudget>, winner: impl FnOnce() -> Value) -> Result<()> {
         if let Some(previous) = self.accumulator.retained() {
-            let Value::Utf8(previous) = previous else {
-                return Err(invalid("aggregate-state", "Expected a text extremum"));
+            let previous = match previous {
+                Value::Utf8(text) => text.as_bytes(),
+                Value::Binary(bytes) => bytes,
+                _ => return Err(invalid("aggregate-state", "Expected a text or binary extremum")),
             };
-            if text.as_bytes().cmp(previous.as_bytes()) != if minimum { Ordering::Less } else { Ordering::Greater } {
+            if bytes.cmp(previous) != if minimum { Ordering::Less } else { Ordering::Greater } {
                 return Ok(());
             }
         }
-        let bytes = text.len().checked_add(size_of::<Value>() + 256)
-            .ok_or_else(|| invalid("aggregate-size", "Text aggregate state exceeds addressable memory"))?;
-        let reservation = memory.reserve(bytes)?;
-        self.accumulator = ScalarState::Retained(OwnedRow::with_reservation(vec![Value::Utf8(text.to_owned())], reservation)?);
+        let charge = bytes.len().checked_add(size_of::<Value>() + 256)
+            .ok_or_else(|| invalid("aggregate-size", "Byte aggregate state exceeds addressable memory"))?;
+        let reservation = memory.reserve(charge)?;
+        self.accumulator = ScalarState::Retained(OwnedRow::with_reservation(vec![winner()], reservation)?);
+        Ok(())
+    }
+
+    fn temporal_extremum(&mut self, value: i64, minimum: bool) -> Result<()> {
+        match self.accumulator {
+            ScalarState::Empty => self.accumulator = ScalarState::TemporalExtremum(value),
+            ScalarState::TemporalExtremum(ref mut previous) => {
+                if value.cmp(previous) == if minimum { Ordering::Less } else { Ordering::Greater } {
+                    *previous = value;
+                }
+            }
+            _ => return Err(invalid("aggregate-state", "Expected a temporal extremum")),
+        }
+        Ok(())
+    }
+
+    fn add_duration(&mut self, value: i64, input: TimeUnit, output: TimeUnit) -> Result<()> {
+        if input > output { return Err(sum_state()); }
+        let value = value.wrapping_mul(output.units_per_second() / input.units_per_second());
+        let sum = match self.accumulator {
+            ScalarState::Empty => value,
+            ScalarState::Duration(previous, unit) if unit == output => previous.wrapping_add(value),
+            _ => return Err(sum_state()),
+        };
+        self.accumulator = ScalarState::Duration(sum, output);
+        Ok(())
+    }
+
+    fn reduce_boolean(&mut self, value: Option<bool>, every: bool) -> Result<()> {
+        match &mut self.accumulator {
+            ScalarState::Empty => {
+                let value = value.ok_or_else(|| rtdb_types::Anomaly::unsupported("rtdb.query/boolean-setter", "Reference boolean accumulator does not implement this value setter"))?;
+                self.accumulator = ScalarState::Boolean(value);
+            }
+            ScalarState::Boolean(previous) => {
+                let value = value.unwrap_or(true);
+                *previous = if every { *previous && value } else { *previous || value };
+            }
+            _ => return Err(invalid("aggregate-state", "Expected a Boolean reduction")),
+        }
         Ok(())
     }
 
@@ -1700,33 +1845,21 @@ impl ScalarAccumulator {
         Ok(())
     }
 
-    fn step(&mut self,value: &Value,aggregate: &AggregateExpr,types: &AggregateTypes,execution: &Execution,state: &Arc<rtdb_columnar::MemoryBudget>) -> Result<()> {
-        let _value = execution.context.memory.reserve(value.retained_bytes()?)?;
-        let value = value.clone();
+    fn scalar_extremum(&mut self, value: &Value, output: &LogicalType, minimum: bool, execution: &Execution, state: &Arc<rtdb_columnar::MemoryBudget>) -> Result<()> {
         if matches!(value, Value::Null | Value::Undefined) { return Ok(()); }
-        use AggregateFunction as A;
-        let previous = self.accumulator.retained();
-        let next = match &aggregate.function {
-            A::Min | A::Max => {
-                let value = cast(&value, types.output_type(), &execution.context.timezone)?;
-                let replace = match previous { None => true, Some(previous) => {
-                    let order = match (&value,previous) { (Value::Uri(left),Value::Uri(right)) => left.as_bytes().cmp(right.as_bytes()), _ => compare_in_timezone(&value, previous, false, &execution.context.timezone)? };
-                    order == if aggregate.function == A::Min { Ordering::Less } else { Ordering::Greater }
-                } };
-                if replace { Some(value) } else { None }
-            }
-            A::Every | A::Any => {
-                let previous = previous.and_then(|value| if let Value::Bool(value) = value { Some(*value) } else { None });
-                let value = match (previous,&value) {
-                    (None,Value::Bool(value)) => *value,
-                    (None,_) => return Err(rtdb_types::Anomaly::unsupported("rtdb.query/boolean-setter","Reference boolean accumulator does not implement this value setter")),
-                    (Some(previous),value) => if aggregate.function == A::Every { previous && !matches!(value,Value::Bool(false)) } else { previous || !matches!(value,Value::Bool(false)) },
-                };
-                Some(Value::Bool(value))
-            }
-            _ => unreachable!(),
-        };
-        if let Some(next) = next { self.accumulator = ScalarState::Retained(OwnedRow::new(vec![next], state)?); }
+        let _value = execution.context.memory.reserve(value.retained_bytes()?)?;
+        let value = cast(value, output, &execution.context.timezone)?;
+        if let Value::Timestamp { value, .. } | Value::Time { value, .. } | Value::Duration { value, .. } = value {
+            return self.temporal_extremum(value, minimum);
+        }
+        if let Some(previous) = self.accumulator.retained() {
+            let order = match (&value, previous) {
+                (Value::Uri(left), Value::Uri(right)) => left.as_bytes().cmp(right.as_bytes()),
+                _ => compare_in_timezone(&value, previous, false, &execution.context.timezone)?,
+            };
+            if order != if minimum { Ordering::Less } else { Ordering::Greater } { return Ok(()); }
+        }
+        self.accumulator = ScalarState::Retained(OwnedRow::new(vec![value], state)?);
         Ok(())
     }
     fn average_double(&self) -> Option<f64> {
@@ -1764,6 +1897,16 @@ impl ScalarAccumulator {
                 ScalarState::F32(sum) => Value::F32(*sum),
                 ScalarState::F64(sum) => Value::F64(*sum),
                 ScalarState::Duration(value, unit) => Value::Duration { value: *value, unit: *unit },
+                ScalarState::TemporalExtremum(value) => match without_nullability(ty) {
+                    LogicalType::Scalar(ScalarType::Timestamp { unit, timezone }) => {
+                        if let Some(zone) = timezone { output.reserve(zone.len())?; }
+                        Value::Timestamp { value: *value, unit: *unit, timezone: timezone.clone() }
+                    }
+                    LogicalType::Scalar(ScalarType::Time { unit, bit_width }) => Value::Time { value: *value, unit: *unit, bit_width: *bit_width },
+                    LogicalType::Scalar(ScalarType::Duration(unit)) => Value::Duration { value: *value, unit: *unit },
+                    _ => return Err(invalid("aggregate-state", "Expected a temporal extremum output type")),
+                },
+                ScalarState::Boolean(value) => Value::Bool(*value),
                 ScalarState::Decimal128(coefficient) => {
                     let Some((precision, scale, 128)) = decimal_type(ty) else { return Err(sum_state()); };
                     output.reserve(16)?;
@@ -1834,7 +1977,7 @@ impl<'a> SumFactory<'a> {
         use ScalarType as S;
         let null = matches!(value,Value::Null | Value::Undefined);
         if null && matches!(without_nullability(self.input),LogicalType::Scalar(S::Duration(_))) {
-            return Err(rtdb_types::Anomaly::fault("xtdb.error/unknown",format!("null at index {index}")));
+            return Err(duration_null(index));
         }
         if null && !matches!((without_nullability(self.input),self.output),
             (LogicalType::Scalar(S::Decimal { .. }),LogicalType::Scalar(S::Decimal { .. }))) { return Ok(()); }
@@ -1869,19 +2012,10 @@ impl<'a> SumFactory<'a> {
                 };
                 Value::Decimal(rtdb_expr::decimal_sum(previous, input, *precision, *scale, *bit_width)?)
             }
-            LogicalType::Scalar(S::Duration(unit)) => {
-                let value = match value {
-                    Value::Duration { value,unit: input } if input <= unit => value.wrapping_mul(unit.units_per_second() / input.units_per_second()),
-                    _ => return Err(sum_state()),
-                };
-                let sum = match state.accumulator {
-                    ScalarState::Empty => value,
-                    ScalarState::Duration(previous, previous_unit) if previous_unit == *unit => previous.wrapping_add(value),
-                    _ => return Err(sum_state()),
-                };
-                state.accumulator = ScalarState::Duration(sum, *unit);
-                return Ok(());
-            }
+            LogicalType::Scalar(S::Duration(output)) => match value {
+                Value::Duration { value, unit } => return state.add_duration(*value, *unit, *output),
+                _ => return Err(sum_state()),
+            },
             _ => return Err(sum_state()),
         };
         match &mut state.accumulator {
@@ -1938,6 +2072,10 @@ fn vector_double(value: &Value) -> Result<f64> {
     }
 }
 fn sum_state() -> rtdb_types::Anomaly { invalid("aggregate-state","SUM cell does not match its admitted vector factory") }
+
+fn duration_null(index: usize) -> rtdb_types::Anomaly {
+    rtdb_types::Anomaly::fault("xtdb.error/unknown", format!("null at index {index}"))
+}
 
 fn square_column(page: Rows<'_>,argument: Option<usize>,input: &LogicalType,scope: &rtdb_expr::EvaluationScope,execution: &Execution) -> Result<Vec<Option<f64>>> {
     if !matches!(without_nullability(input),LogicalType::Scalar(ScalarType::I32 | ScalarType::I64 | ScalarType::U32 | ScalarType::U64 | ScalarType::F64)) {
