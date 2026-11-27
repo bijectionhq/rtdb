@@ -11,6 +11,7 @@ use crate::compiled::{OperatorTemplate, Predicates, Projections, StackedFilters}
 use crate::context::Execution;
 use crate::limit_bounds::{checked_row_count, sort_prefix_len};
 use crate::runtime_schema::{EmittedRelation, RuntimeSchema};
+use crate::scalar_key::ScalarKey;
 use crate::window::{RowNumberLimit, TopKWindow};
 use crate::invalid;
 

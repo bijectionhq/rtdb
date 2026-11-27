@@ -1499,7 +1499,7 @@ impl ColumnBatch {
         use arrow_array::cast::AsArray;
         let FundedArrowCell { array, field, owner, row, .. } = cell;
         let mut reservation = memory.reserve(field.size().checked_mul(8).and_then(|bytes| bytes.checked_add(512)).ok_or_else(size_error)?)?;
-        if !stable_read_layout(parameter_type, field) || !readable_list_type(parameter_type, field) {
+        if !stable_read_layout(parameter_type, field) || !readable_list_type(parameter_type, field, false) {
             return Ok(None);
         }
         if array.is_null(row) || *parameter_type == LogicalType::Null {
