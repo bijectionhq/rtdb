@@ -389,9 +389,9 @@ async fn build_batches_at(
             let mut layout = crate::join_key::JoinLayout::new(build_relation,probe_relation,condition.as_ref(),&execution.context.memory)?;
             layout.resolve_types(runtime.child(build_side)?.schema(),runtime.child(probe_side)?.schema(),&execution)?;
             let Some(order) = crate::batch_join::key_order(&layout) else { return Ok(None) };
-            let (theta, residual) = match crate::batch_join::theta_tests(&layout) {
+            let (theta, residual) = match crate::batch_join::theta_tests(&layout, &execution.context.memory) {
                 Some(theta) => (theta, None),
-                None => (Vec::new(), Some(crate::batch_join::Residual::new(&layout, &execution)?)),
+                None => (Default::default(), Some(crate::batch_join::Residual::new(&layout, &execution)?)),
             };
             let Some((build,projected)) = build_batch_input(runtime.child(build_side)?,execution.child(build_side),pushdowns.clone(),output).await? else { return Ok(None) };
             let probe = crate::batch_join::ProbeInput { runtime: runtime.child(probe_side)?,execution: execution.child(probe_side),pushdowns, output };

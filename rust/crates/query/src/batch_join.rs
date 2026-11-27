@@ -1,11 +1,22 @@
 //! Equi-joins of batch inputs on column equalities.
 //! Build rows are indexed in input order and the probe gathers its matches from the saved column positions.
-use std::{cmp::Ordering, collections::VecDeque, ops::{ControlFlow, Range}};
+use std::{borrow::Cow, cmp::Ordering, collections::VecDeque, ops::{ControlFlow, Range}};
 use std::sync::Arc;
 
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_plan::{BinaryOp, Expr, JoinKind};
-use rtdb_types::{LogicalType, Result, ScalarType, Value};
+use arrow_array::{
+    Array,
+    cast::AsArray,
+    types::{
+        Date32Type, Date64Type, DurationMicrosecondType, DurationMillisecondType,
+        DurationNanosecondType, DurationSecondType, IntervalYearMonthType, Time32MillisecondType, Time32SecondType,
+        Time64MicrosecondType, Time64NanosecondType, TimestampMicrosecondType,
+        TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType,
+    },
+};
+use arrow_schema::{DataType, TimeUnit as ArrowTimeUnit};
+use rtdb_types::{IntervalUnit, LogicalType, Result, ScalarType, TimeUnit, Value};
 
 use crate::columnar::{BatchCursor, BoxBatchCursor, Column, ColumnBatch, gather_column_rows, gather_join_probe, gather_nullable_column, poll_nested_batch};
 use crate::context::Execution;
@@ -30,11 +41,117 @@ pub(crate) fn key_order(layout: &JoinLayout) -> Option<Vec<bool>> {
     }).collect()
 }
 
-#[derive(Clone, Copy)]
 enum ThetaOperand {
     Build(usize),
     Probe(usize),
-    Literal(Option<ThetaNumber>),
+    Literal(Option<ThetaValue<'static>>),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ThetaKind {
+    Number,
+    Text,
+    Bool,
+    DateDay,
+    DateMilli,
+    Timestamp(TimeUnit, bool),
+    Time(TimeUnit),
+    Duration(TimeUnit),
+    YearMonth,
+}
+
+impl ThetaKind {
+    fn scalar(ty: &ScalarType) -> Option<Self> {
+        Some(match ty {
+            ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64 | ScalarType::F32 | ScalarType::F64 => Self::Number,
+            ScalarType::Utf8 => Self::Text,
+            ScalarType::Bool => Self::Bool,
+            ScalarType::DateDay => Self::DateDay,
+            ScalarType::DateMilli => Self::DateMilli,
+            ScalarType::Timestamp { unit, timezone } => Self::Timestamp(*unit, timezone.is_some()),
+            ScalarType::Time { unit, .. } => Self::Time(*unit),
+            ScalarType::Duration(unit) => Self::Duration(*unit),
+            ScalarType::Interval(IntervalUnit::YearMonth) => Self::YearMonth,
+            _ => return None,
+        })
+    }
+
+    fn temporal_ticks(self, array: &dyn Array, row: usize) -> Option<i64> {
+        use ArrowTimeUnit as A;
+        use TimeUnit as T;
+        macro_rules! ticks {
+            ($ty:ty) => { array.as_primitive_opt::<$ty>()?.value(row) as i64 };
+        }
+        Some(match (self, array.data_type()) {
+            (Self::DateDay, DataType::Date32) => ticks!(Date32Type),
+            (Self::DateMilli, DataType::Date64) => ticks!(Date64Type).div_euclid(rtdb_types::java_date::MILLIS_PER_DAY),
+            (Self::Timestamp(T::Second, zoned), DataType::Timestamp(A::Second, zone)) if zoned == zone.is_some() => ticks!(TimestampSecondType),
+            (Self::Timestamp(T::Millisecond, zoned), DataType::Timestamp(A::Millisecond, zone)) if zoned == zone.is_some() => ticks!(TimestampMillisecondType),
+            (Self::Timestamp(T::Microsecond, zoned), DataType::Timestamp(A::Microsecond, zone)) if zoned == zone.is_some() => ticks!(TimestampMicrosecondType),
+            (Self::Timestamp(T::Nanosecond, zoned), DataType::Timestamp(A::Nanosecond, zone)) if zoned == zone.is_some() => ticks!(TimestampNanosecondType),
+            (Self::Time(T::Second), DataType::Time32(A::Second)) => ticks!(Time32SecondType),
+            (Self::Time(T::Millisecond), DataType::Time32(A::Millisecond)) => ticks!(Time32MillisecondType),
+            (Self::Time(T::Microsecond), DataType::Time64(A::Microsecond)) => ticks!(Time64MicrosecondType),
+            (Self::Time(T::Nanosecond), DataType::Time64(A::Nanosecond)) => ticks!(Time64NanosecondType),
+            (Self::Duration(T::Second), DataType::Duration(A::Second)) => ticks!(DurationSecondType),
+            (Self::Duration(T::Millisecond), DataType::Duration(A::Millisecond)) => ticks!(DurationMillisecondType),
+            (Self::Duration(T::Microsecond), DataType::Duration(A::Microsecond)) => ticks!(DurationMicrosecondType),
+            (Self::Duration(T::Nanosecond), DataType::Duration(A::Nanosecond)) => ticks!(DurationNanosecondType),
+            (Self::YearMonth, DataType::Interval(arrow_schema::IntervalUnit::YearMonth)) => ticks!(IntervalYearMonthType),
+            _ => return None,
+        })
+    }
+
+    fn arrow(self, column: &Column, row: usize) -> Option<Option<ThetaValue<'_>>> {
+        if matches!(self, Self::Number | Self::Text | Self::Bool) {
+            return Some(match (self, ScalarKey::read(column, row)?) {
+                (_, ScalarKey::Null) => None,
+                (Self::Number, ScalarKey::Signed(value)) => Some(ThetaValue::integer(value)),
+                (Self::Number, ScalarKey::Float(value)) => Some(ThetaValue::Number(ThetaNumber::Float(value))),
+                (Self::Text, ScalarKey::Text(value)) => Some(ThetaValue::Text { value: Cow::Borrowed(value), _charge: None }),
+                (Self::Bool, ScalarKey::Bool(value)) => Some(ThetaValue::Bool(value)),
+                _ => return None,
+            });
+        }
+        let Some((array, field, logical, row)) = column.arrow_cell(row)? else { return Some(None); };
+        if array.is_null(row) || (field.data_type() == &DataType::Null && field.is_nullable()) { return Some(None); }
+        if field.metadata().contains_key(rtdb_columnar::EXTENSION_NAME_KEY)
+            || logical.is_some_and(|logical| {
+                let logical = crate::columnar::float_vector::nonnull(logical);
+                !matches!(logical, LogicalType::Scalar(scalar) if Self::scalar(scalar) == Some(self))
+            })
+        {
+            return None;
+        }
+        self.temporal_ticks(array, row).map(|ticks| Some(ThetaValue::integer(ticks)))
+    }
+
+    fn fixed_value(self, value: &Value) -> Option<ThetaValue<'static>> {
+        Some(match (self, value) {
+            (Self::Number, value) => ThetaValue::Number(ThetaNumber::from_value(value)?),
+            (Self::Bool, Value::Bool(value)) => ThetaValue::Bool(*value),
+            (Self::DateDay | Self::DateMilli, value) => ThetaValue::integer(value.date_days()?),
+            (Self::Timestamp(expected, zoned), Value::Timestamp { value, unit, timezone })
+                if expected == *unit && zoned == timezone.is_some() => ThetaValue::integer(*value),
+            (Self::Time(expected), Value::Time { value, unit, .. })
+            | (Self::Duration(expected), Value::Duration { value, unit })
+                if expected == *unit => ThetaValue::integer(*value),
+            (Self::YearMonth, Value::IntervalYearMonth(value)) => ThetaValue::integer(i64::from(*value)),
+            _ => return None,
+        })
+    }
+
+    fn literal(self, value: &Value, memory: &Arc<MemoryBudget>) -> Option<Option<ThetaValue<'static>>> {
+        Some(match value {
+            Value::Null => None,
+            Value::Utf8(value) if self == Self::Text => {
+                let charge = memory.reserve(value.len()).ok()?;
+                Some(ThetaValue::Text { value: Cow::Owned(value.clone()), _charge: Some(charge) })
+            }
+            Value::Date(_) => return None,
+            value => Some(self.fixed_value(value)?),
+        })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -67,7 +184,45 @@ impl ThetaNumber {
     }
 }
 
-pub(crate) struct ThetaTest { left: ThetaOperand, right: ThetaOperand, op: BinaryOp }
+enum ThetaValue<'a> {
+    Number(ThetaNumber),
+    Text { value: Cow<'a, str>, _charge: Option<Arc<MemoryReservation>> },
+    Bool(bool),
+}
+
+impl ThetaValue<'_> {
+    fn integer(value: i64) -> Self { Self::Number(ThetaNumber::Integer(i128::from(value))) }
+
+    fn borrowed(&self) -> ThetaValue<'_> {
+        match self {
+            Self::Number(value) => ThetaValue::Number(*value),
+            Self::Text { value, .. } => ThetaValue::Text { value: Cow::Borrowed(value), _charge: None },
+            Self::Bool(value) => ThetaValue::Bool(*value),
+        }
+    }
+
+    fn compare(&self, other: &Self, equality: bool) -> Result<Option<Ordering>> {
+        Ok(match (self, other) {
+            (Self::Number(left), Self::Number(right)) => left.compare(*right, equality),
+            (Self::Text { value: left, .. }, Self::Text { value: right, .. }) => Some(left.as_bytes().cmp(right.as_bytes())),
+            (Self::Bool(left), Self::Bool(right)) => Some(left.cmp(right)),
+            _ => return Err(invalid("join-key", "Join predicate comparison operands have different types")),
+        })
+    }
+}
+
+struct ThetaTest { left: ThetaOperand, right: ThetaOperand, op: BinaryOp, kind: ThetaKind }
+
+#[derive(Default)]
+pub(crate) struct ThetaTests {
+    tests: Vec<ThetaTest>,
+    use_residual_keys: bool,
+    _reservation: Option<Arc<MemoryReservation>>,
+}
+
+impl ThetaTests {
+    fn is_empty(&self) -> bool { self.tests.is_empty() }
+}
 
 /// Whether no value of the type can hold a date, which is all that admitting a projected input's dates changes.
 fn date_free(ty: &LogicalType) -> bool {
@@ -82,47 +237,115 @@ fn date_free(ty: &LogicalType) -> bool {
     }
 }
 
-pub(crate) fn theta_tests(layout: &JoinLayout) -> Option<Vec<ThetaTest>> {
-    fn supported(ty: &LogicalType) -> bool {
-        match ty {
-            LogicalType::Scalar(ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64 | ScalarType::F32 | ScalarType::F64)
-            | LogicalType::Null => true,
-            LogicalType::Maybe(ty) => supported(ty),
-            _ => false,
-        }
-    }
-    fn operand(layout: &JoinLayout, expr: &Expr) -> Option<ThetaOperand> {
-        match expr {
+pub(crate) fn theta_tests(layout: &JoinLayout, memory: &Arc<MemoryBudget>) -> Option<ThetaTests> {
+    fn operand<'a>(layout: &'a JoinLayout, expr: &Expr, memory: &Arc<MemoryBudget>)
+        -> Option<(ThetaOperand, Cow<'a, LogicalType>)> {
+        let operand = match expr {
             Expr::Column { id, .. } => {
                 if let Some(position) = layout.left.schema.position(*id) {
-                    supported(&layout.left.schema.fields()[position].data_type).then_some(ThetaOperand::Build(position))
+                    (ThetaOperand::Build(position), &layout.left.schema.fields()[position].data_type)
                 } else {
                     let position = layout.right.schema.position(*id)?;
-                    supported(&layout.right.schema.fields()[position].data_type).then_some(ThetaOperand::Probe(position))
+                    (ThetaOperand::Probe(position), &layout.right.schema.fields()[position].data_type)
                 }
             }
-            Expr::Literal(Value::Null) => Some(ThetaOperand::Literal(None)),
-            Expr::Literal(value) if supported(&value.logical_type()) =>
-                ThetaNumber::from_value(value).map(|number| ThetaOperand::Literal(Some(number))),
+            Expr::Literal(value) => {
+                let ty = value.logical_type();
+                let kind = comparison(&ty, &ty)?;
+                return Some((ThetaOperand::Literal(kind.literal(value, memory)?), Cow::Owned(ty)));
+            }
+            _ => return None,
+        };
+        Some((operand.0, Cow::Borrowed(operand.1)))
+    }
+    fn scalar(ty: &LogicalType) -> Option<Option<&ScalarType>> {
+        match ty {
+            LogicalType::Scalar(ty) => Some(Some(ty)),
+            LogicalType::Null => Some(None),
+            LogicalType::Maybe(ty) => scalar(ty),
             _ => None,
         }
     }
-    fn tests(layout: &JoinLayout, expr: &Expr, output: &mut Vec<ThetaTest>) -> Option<()> {
+    fn comparison(left: &LogicalType, right: &LogicalType) -> Option<ThetaKind> {
+        match (scalar(left)?, scalar(right)?) {
+            (None, None) => Some(ThetaKind::Number),
+            (Some(ty), None) | (None, Some(ty)) => ThetaKind::scalar(ty),
+            (Some(left), Some(right)) if left == right => ThetaKind::scalar(left),
+            (Some(left), Some(right))
+                if ThetaKind::scalar(left) == Some(ThetaKind::Number)
+                    && ThetaKind::scalar(right) == Some(ThetaKind::Number) => Some(ThetaKind::Number),
+            _ => None,
+        }
+    }
+    fn tests(layout: &JoinLayout, expr: &Expr, output: &mut ThetaTests, memory: &Arc<MemoryBudget>) -> Option<()> {
         let Expr::Binary { op, left, right } = expr else { return None; };
         if *op == BinaryOp::And {
-            tests(layout, left, output)?;
-            tests(layout, right, output)?;
-            return Some(());
+            tests(layout, left, output, memory)?;
+            return tests(layout, right, output, memory);
         }
         if !matches!(op, BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq) {
             return None;
         }
-        output.push(ThetaTest { left: operand(layout, left)?, right: operand(layout, right)?, op: *op });
+        let (left, left_type) = operand(layout, left, memory)?;
+        let (right, right_type) = operand(layout, right, memory)?;
+        let kind = comparison(&left_type, &right_type)?;
+        let bytes = output.tests.len().checked_add(1)?.checked_mul(4 * size_of::<ThetaTest>())?;
+        if let Some(reservation) = &mut output._reservation {
+            Arc::get_mut(reservation)?.grow_to(bytes).ok()?;
+        } else {
+            output._reservation = Some(memory.reserve(bytes).ok()?);
+        }
+        output.tests.push(ThetaTest { left, right, op: *op, kind });
+        output.use_residual_keys |= kind != ThetaKind::Number;
         Some(())
     }
-    let mut output = Vec::new();
-    for expr in layout.comparisons.iter().skip(layout.left.key_count()) { tests(layout, expr, &mut output)?; }
+    let mut output = ThetaTests::default();
+    for expr in layout.comparisons.iter().skip(layout.left.key_count()) { tests(layout, expr, &mut output, memory)?; }
     Some(output)
+}
+
+#[test]
+fn theta_binding_accepts_plain_comparable_types_and_declines_temporal_coercions() {
+    use rtdb_plan::{ColumnId, Field, Relation, Schema};
+
+    let input = |id, ty| {
+        Relation::empty(Schema::new(vec![Field {
+            id: ColumnId(id),
+            name: format!("v{id}"),
+            qualifier: None,
+            qualified_only: false,
+            unnamed: false,
+            data_type: LogicalType::Scalar(ty).maybe(),
+        }]).unwrap())
+    };
+    let timestamp = |unit, timezone: Option<&str>| ScalarType::Timestamp {
+        unit, timezone: timezone.map(str::to_owned),
+    };
+    let micros = timestamp(TimeUnit::Microsecond, Some("UTC"));
+    let seconds = timestamp(TimeUnit::Second, Some("UTC"));
+    let local = timestamp(TimeUnit::Microsecond, None);
+    let memory = MemoryBudget::new(1 << 20);
+    for (left, right, admitted) in [
+        (ScalarType::Utf8, ScalarType::Utf8, true),
+        (ScalarType::Bool, ScalarType::Bool, true),
+        (ScalarType::DateDay, ScalarType::DateDay, true),
+        (ScalarType::DateMilli, ScalarType::DateMilli, true),
+        (micros.clone(), micros.clone(), true),
+        (micros.clone(), seconds, false),
+        (micros, local, false),
+        (ScalarType::Utf8, ScalarType::Keyword, false),
+        (ScalarType::DateDay, ScalarType::DateMilli, false),
+        (ScalarType::Duration(TimeUnit::Second), ScalarType::Duration(TimeUnit::Second), true),
+        (ScalarType::I64, ScalarType::F32, true),
+        (ScalarType::Interval(IntervalUnit::MonthDayNano), ScalarType::Interval(IntervalUnit::MonthDayNano), false),
+    ] {
+        let left = input(0, left);
+        let right = input(1, right);
+        let condition = Expr::binary(BinaryOp::Lt, left.schema().fields()[0].expression(), right.schema().fields()[0].expression());
+        let layout = JoinLayout::new(&left, &right, Some(&condition), &memory).unwrap();
+        assert_eq!(theta_tests(&layout, &memory).is_some(), admitted, "{condition:?}");
+    }
+    assert_eq!(memory.used_bytes(), 0);
 }
 
 pub(crate) struct Residual {
@@ -343,7 +566,7 @@ pub(crate) struct BatchJoin { state: State, spec: Spec }
 
 struct Spec {
     order: Vec<bool>, build_keys: Vec<usize>, probe_keys: Vec<usize>, widths: [usize; 2], kind: JoinKind, count_only: bool,
-    projected: [bool; 2], swapped: bool, _original_layout_charge: Option<Arc<MemoryReservation>>, theta: Vec<ThetaTest>, residual: Option<Residual>, execution: Execution,
+    projected: [bool; 2], swapped: bool, _original_layout_charge: Option<Arc<MemoryReservation>>, theta: ThetaTests, residual: Option<Residual>, execution: Execution,
     hash: JoinHash,
 }
 
@@ -353,7 +576,7 @@ impl BatchJoin {
         let probe_keys = layout.right.key_positions().to_vec();
         let widths = [layout.left.original.len(), layout.right.original.len()];
         Self { state: State::Build { build, probe, layout }, spec: Spec { order, build_keys, probe_keys, widths, kind: JoinKind::Inner, count_only: false,
-            projected, swapped: false, _original_layout_charge: None, theta: Vec::new(), residual: None, execution, hash: JoinHash::Vector } }
+            projected, swapped: false, _original_layout_charge: None, theta: ThetaTests::default(), residual: None, execution, hash: JoinHash::Vector } }
     }
 }
 
@@ -368,7 +591,7 @@ impl BatchJoin {
 
     pub fn counting_rows(mut self) -> Self { self.spec.count_only = true; self }
 
-    pub fn with_theta(mut self, theta: Vec<ThetaTest>) -> Self { self.spec.theta = theta; self }
+    pub fn with_theta(mut self, theta: ThetaTests) -> Self { self.spec.theta = theta; self }
     pub fn with_residual(mut self, residual: Option<Residual>) -> Self { self.spec.residual = residual; self }
 
 }
@@ -780,17 +1003,18 @@ impl Spec {
             context.check_cancelled_at(candidate + checked_before_probe)?;
             let (batch, offset) = table.position(ordinal);
             let build = &table.batches[batch];
-            if let Some(residual) = residual {
-                if self.matches_residual(residual, build, offset, probe, row, equality).await? {
-                    matched = true;
-                    if accept(ordinal, (batch, offset))?.is_break() { break; }
-                }
-                continue;
-            }
-            if key.is_none() { key = Some(self.key(probe, row, 1)?); }
-            let probe_key = key.as_ref().expect("The probe key has been read");
-            let build_key = self.key(build, offset, 0)?;
-            if self.equal_keys(&build_key, probe_key, Some(equality))? && self.matches_theta(build, offset, probe, row)? {
+            let accepted = if let Some(residual) = residual {
+                self.matches_residual(residual, build, offset, probe, row, equality).await?
+            } else if self.theta.use_residual_keys {
+                let Some(keys) = self.residual_keys(build, offset, probe, row, equality)? else { continue; };
+                self.matches_theta(build, offset, probe, row)? && keys
+            } else {
+                if key.is_none() { key = Some(self.key(probe, row, 1)?); }
+                let probe_key = key.as_ref().expect("The probe key has been read");
+                let build_key = self.key(build, offset, 0)?;
+                self.equal_keys(&build_key, probe_key, Some(equality))? && self.matches_theta(build, offset, probe, row)?
+            };
+            if accepted {
                 matched = true;
                 if accept(ordinal, (batch, offset))?.is_break() { break; }
             }
@@ -841,28 +1065,46 @@ impl Spec {
         Ok(Some(!unknown))
     }
 
-    fn matches_theta(&self, build: &ColumnBatch, build_row: usize, probe: &ColumnBatch, probe_row: usize) -> Result<bool> {
-        let read = |operand| -> Result<Option<ThetaNumber>> {
-            let (column, row, side) = match operand {
-                ThetaOperand::Literal(value) => return Ok(value),
-                ThetaOperand::Build(position) => (&build.columns[position], build_row, 0),
-                ThetaOperand::Probe(position) => (&probe.columns[position], probe_row, 1),
-            };
-            match ScalarKey::read(column, row) {
-                Some(ScalarKey::Signed(value)) => Ok(Some(ThetaNumber::Integer(i128::from(value)))),
-                Some(ScalarKey::Float(value)) => Ok(Some(ThetaNumber::Float(value))),
-                Some(ScalarKey::Null) => Ok(None),
-                _ => {
-                    let _scratch = self.execution.context.memory.reserve(column.bound(row)?)?;
-                    let value = self.cell(column, row, side)?;
-                    if matches!(value, Value::Null | Value::Undefined) { return Ok(None); }
-                    ThetaNumber::from_value(&value).map(Some).ok_or_else(|| invalid("join-key", "Expected a numeric comparison operand"))
-                }
-            }
+    #[allow(clippy::too_many_arguments)]
+    fn theta_value<'a>(&self, operand: &'a ThetaOperand, kind: ThetaKind,
+        build: &'a ColumnBatch, build_row: usize, probe: &'a ColumnBatch, probe_row: usize) -> Result<Option<ThetaValue<'a>>> {
+        let (column, row, side) = match operand {
+            ThetaOperand::Literal(value) => return Ok(value.as_ref().map(ThetaValue::borrowed)),
+            ThetaOperand::Build(position) => (&build.columns[*position], build_row, 0),
+            ThetaOperand::Probe(position) => (&probe.columns[*position], probe_row, 1),
         };
-        for test in &self.theta {
-            let (Some(left), Some(right)) = (read(test.left)?, read(test.right)?) else { return Ok(false); };
-            let order = left.compare(right, matches!(test.op, BinaryOp::Eq | BinaryOp::NotEq));
+        if let Some(value) = kind.arrow(column, row) { return Ok(value); }
+        if kind == ThetaKind::Text && let Column::Values(values) = column
+            && let Some(Value::Utf8(value)) = values.get(row)
+        {
+            return Ok(Some(ThetaValue::Text { value: Cow::Borrowed(value), _charge: None }));
+        }
+
+        let charge = self.execution.context.memory.reserve(column.bound(row)?)?;
+        let value = self.cell(column, row, side)?;
+        match value {
+            Value::Null | Value::Undefined => Ok(None),
+            Value::Utf8(value) if kind == ThetaKind::Text => Ok(Some(ThetaValue::Text { value: Cow::Owned(value), _charge: Some(charge) })),
+            _ => kind.fixed_value(&value).map(Some)
+                .ok_or_else(|| invalid("join-key", "Unexpected join predicate comparison operand")),
+        }
+    }
+
+    fn matches_theta(&self, build: &ColumnBatch, build_row: usize, probe: &ColumnBatch, probe_row: usize) -> Result<bool> {
+        let mut known = true;
+        for test in &self.theta.tests {
+            let left = self.theta_value(&test.left, test.kind, build, build_row, probe, probe_row)?;
+            if self.theta.use_residual_keys && left.is_none() {
+                known = false;
+                continue;
+            }
+            let right = self.theta_value(&test.right, test.kind, build, build_row, probe, probe_row)?;
+            let (Some(left), Some(right)) = (left, right) else {
+                if !self.theta.use_residual_keys { return Ok(false); }
+                known = false;
+                continue;
+            };
+            let order = left.compare(&right, matches!(test.op, BinaryOp::Eq | BinaryOp::NotEq))?;
             let accepted = match test.op {
                 BinaryOp::Eq => order == Some(Ordering::Equal),
                 BinaryOp::NotEq => order != Some(Ordering::Equal),
@@ -874,7 +1116,7 @@ impl Spec {
             };
             if !accepted { return Ok(false); }
         }
-        Ok(true)
+        Ok(known)
     }
 
     async fn probe_outer(&self, table: &mut Table, probe: &ColumnBatch, residual: Option<&PreparedResidual<'_>>) -> Result<Option<ColumnBatch>> {

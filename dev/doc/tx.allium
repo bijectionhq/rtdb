@@ -185,7 +185,10 @@
 -- Its Bloom and bounded entity ID filters use those same build-side vectors.
 -- A query-generated join Bloom covers both persisted floating zero encodings for a numeric zero build key.
 -- An equijoin can partition and replay its consumed input as Arrow record batches and Arrow selections.
--- Supported computed keys and plain numeric residual comparisons retain the payload positions through match selection.
+-- Supported computed join keys retain the payload positions through match selection.
+-- A hash join binds plain numeric, text, Boolean, and same-type date, timestamp, time, duration, and year-month interval comparisons once and evaluates them at the candidate positions.
+-- Text residuals compare UTF-8 bytes in unsigned order.
+-- Residuals that require fallible evaluation retain the generic evaluation order.
 -- Floating-point residuals preserve unknown for null operands and unordered comparison for NaN.
 -- Compatible semi and anti equijoins select their output from the probe vectors and emit each selected probe position once.
 -- A complete Arrow probe page or an admissible consecutive span can supply semi and anti output directly.

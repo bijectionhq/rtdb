@@ -489,6 +489,94 @@ async fn float_join_residuals_distinguish_unordered_values_from_nulls_and_order_
     }
 }
 
+fn residual_input(id: u32, ty: ScalarType, payloads: Vec<Value>) -> Arc<Relation> {
+    let fields = [
+        ("key", LogicalType::Scalar(ScalarType::I64)),
+        ("payload", LogicalType::Scalar(ty).maybe()),
+        ("position", LogicalType::Scalar(ScalarType::I64)),
+    ].into_iter().enumerate().map(|(offset, (name, data_type))| Field {
+        id: ColumnId(id + offset as u32),
+        name: format!("{name}{id}"),
+        qualifier: None,
+        qualified_only: false,
+        unnamed: false,
+        data_type,
+    }).collect();
+    let rows = payloads.into_iter().enumerate().map(|(position, payload)| {
+        vec![Expr::Literal(Value::I64(1)), Expr::Literal(payload), Expr::Literal(Value::I64(position as i64))]
+    }).collect();
+    Arc::new(Relation::new(Schema::new(fields).unwrap(), RelationNode::Values { rows }).unwrap())
+}
+
+#[tokio::test]
+async fn typed_join_residuals_keep_true_pairs_in_candidate_order() {
+    let text = |value: &str| Value::Utf8(value.into());
+    let timestamp = |value| Value::Timestamp { value, unit: TimeUnit::Second, timezone: Some("UTC".into()) };
+    let time = |value| Value::Time { value, unit: TimeUnit::Millisecond, bit_width: 32 };
+    let duration = |value| Value::Duration { value, unit: TimeUnit::Nanosecond };
+    for (low, high, equal_to_high) in [
+        (text("z"), text("é"), text("é")),
+        (Value::Bool(false), Value::Bool(true), Value::Bool(true)),
+        (Value::DateDay(-1), Value::DateDay(0), Value::DateDay(0)),
+        (Value::DateMilli(-1), Value::DateMilli(0), Value::DateMilli(1)),
+        (timestamp(i64::MIN), timestamp(i64::MAX), timestamp(i64::MAX)),
+        (time(0), time(100), time(100)),
+        (duration(-1), duration(0), duration(0)),
+        (Value::IntervalYearMonth(2), Value::IntervalYearMonth(3), Value::IntervalYearMonth(3)),
+    ] {
+        let LogicalType::Scalar(ty) = low.logical_type() else { unreachable!() };
+        let left = residual_input(0, ty.clone(), vec![high.clone(), low.clone(), high, Value::Null]);
+        let right = residual_input(3, ty.clone(), vec![low.clone(), Value::Null, low]);
+        let key = Expr::binary(BinaryOp::Eq, left.schema().fields()[0].expression(), right.schema().fields()[0].expression());
+        let left_value = left.schema().fields()[1].expression();
+        let right_value = right.schema().fields()[1].expression();
+        let greater = Expr::binary(BinaryOp::Gt, left_value.clone(), right_value);
+        let matches_literal = Expr::binary(BinaryOp::Eq, left_value, Expr::Literal(equal_to_high));
+        let condition = Expr::binary(BinaryOp::And, key, Expr::binary(BinaryOp::And, greater, matches_literal));
+        let query = join(left, right, JoinKind::Inner, condition);
+        for threshold in [i64::MAX, 1] {
+            let context = join_context(&CancellationToken::new(), threshold);
+            let rows = collect(&query, &context).await.unwrap();
+            let positions: Vec<_> = rows.into_iter().map(|row| (row[2].clone(), row[5].clone())).collect();
+            let expected = [(0, 0), (2, 0), (0, 2), (2, 2)].map(|(left, right)| (Value::I64(left), Value::I64(right)));
+            assert_eq!(positions, expected, "{ty:?}, spill threshold {threshold}");
+            assert_eq!(context.memory.used_bytes(), 0);
+            assert_eq!(context.spill_bytes(), 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn mixed_temporal_residuals_rescale_only_for_reached_candidates() {
+    let timestamp = |value, unit| Value::Timestamp { value, unit, timezone: None };
+    let ty = |unit| ScalarType::Timestamp { unit, timezone: None };
+    let left = residual_input(0, ty(TimeUnit::Second), vec![timestamp(1, TimeUnit::Second)]);
+    let right = residual_input(3, ty(TimeUnit::Microsecond), vec![timestamp(1_000_000, TimeUnit::Microsecond)]);
+    let condition = |left: &Relation, right: &Relation, residual| {
+        let key = Expr::binary(BinaryOp::Eq, left.schema().fields()[0].expression(), right.schema().fields()[0].expression());
+        Expr::binary(BinaryOp::And, key, residual)
+    };
+    let differs = Expr::binary(BinaryOp::NotEq, left.schema().fields()[1].expression(), right.schema().fields()[1].expression());
+    let context = context(&CancellationToken::new());
+    let predicate = condition(&left, &right, differs);
+    assert!(collect(&join(left, right.clone(), JoinKind::Inner, predicate), &context).await.unwrap().is_empty());
+
+    let left = residual_input(0, ty(TimeUnit::Second), vec![timestamp(i64::MAX, TimeUnit::Second)]);
+    for (guard, reached) in [(Value::Bool(false), false), (Value::Null, true)] {
+        let text = Expr::binary(BinaryOp::Gt, Expr::Literal(Value::Utf8("é".into())), Expr::Literal(Value::Utf8("z".into())));
+        let guard = Expr::binary(BinaryOp::Eq, text, Expr::Literal(guard));
+        let later = Expr::binary(BinaryOp::Gt, left.schema().fields()[1].expression(), right.schema().fields()[1].expression());
+        let predicate = condition(&left, &right, Expr::binary(BinaryOp::And, guard, later));
+        let rows = collect(&join(left.clone(), right.clone(), JoinKind::Inner, predicate), &context).await;
+        if reached {
+            assert_eq!(rows.unwrap_err().code, "xtdb.expression/overflow-error");
+        } else {
+            assert!(rows.unwrap().is_empty());
+        }
+        assert_eq!(context.memory.used_bytes(), 0);
+    }
+}
+
 #[tokio::test]
 async fn count_of_changed_float_values_in_a_temporal_self_join_matches_across_spill() {
     use rtdb_index::{PartitionState, TransactionBuffer};
