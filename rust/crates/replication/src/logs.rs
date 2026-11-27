@@ -221,6 +221,19 @@ impl PartitionLogs {
     pub(crate) async fn replica_replay(&self, after: ReplicaPosition) -> rtdb_storage::Result<PartitionReplay> {
         PartitionReplay::open(self.replica.as_ref(), LogOffset(after.after_offset(self.replica_epoch))).await
     }
+    pub(crate) async fn verify_checkpoint_reopen(&self, source: Option<SourcePosition>, boundary: ReplicaPosition, upload: ReplicaPosition) -> Result<()> {
+        let invalid = || Anomaly::fault("rtdb.replication/checkpoint-reopen", "The collection cut does not belong to the current journal epochs");
+        let source = source.ok_or_else(invalid)?;
+        if (source != self.source_floor()? && source.after_offset(self.source_epoch) < 0)
+            || boundary.after_offset(self.replica_epoch) < 0 || upload.after_offset(self.replica_epoch) < 0 || upload <= boundary
+        {
+            return Err(invalid());
+        }
+        self.source_replay(source).await?;
+        self.replica_replay(boundary).await?;
+        self.replica_replay(upload).await?;
+        Ok(())
+    }
     pub(crate) async fn recovery_tail(&self, after: ReplicaPosition) -> rtdb_storage::Result<Option<PartitionReplay>> {
         let offset = after.after_offset(self.replica_epoch);
         let tail = if let Some(shared) = self.replica.shared() {

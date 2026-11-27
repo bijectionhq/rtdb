@@ -1604,8 +1604,15 @@ async fn default_local_reclaims_an_older_orphan_at_checkpoint_readback() {
             .await.unwrap().adopted_block.clone().unwrap();
         assert!(matches!(store.head_fresh(&orphan_key).await, Err(rtdb_storage::Error::MissingObject(_))));
         let wire = checkpoint.as_proto();
-        assert!(authority.read_checkpoint(store.as_ref(), wire.serving_checkpoint.as_deref(), wire.serving_checkpoint_object.as_deref())
-            .await.unwrap().is_some());
+        let image = authority.read_checkpoint(store.as_ref(), wire.serving_checkpoint.as_deref(), wire.serving_checkpoint_object.as_deref())
+            .await.unwrap().unwrap();
+        let (fold, _, shared) = crate::serving::decode_checkpoint_image(image.bytes(), *database.as_bytes()).unwrap();
+        assert!(shared);
+        assert_eq!(fold.index().exact(written.basis).unwrap().system_time, written.system_time);
+        let installed = fold.installed_receipt(None, &written.key, written.basis).unwrap();
+        assert_eq!(installed.source.0, checkpoint.latest_completed_tx().unwrap().tx_id.0);
+        assert!(installed.replica < checkpoint.boundary_replica_position().unwrap());
+        assert_eq!(installed.term, checkpoint.boundary_term());
         assert_eq!(serving.view(At::Exactly(written.basis), &cancellation).await.unwrap().index.head().basis, written.basis);
     }).await.unwrap();
     handle.shutdown();
@@ -1887,7 +1894,7 @@ async fn native_local_restart_confirms_missing_retained_blocks_in_order_for_a_su
         let boundary_offset = boundary_record.metadata.offset;
         old.consume(boundary_record).await.unwrap();
         let mut production = old.leader.as_mut().unwrap().production.take();
-        let super::ProductionResult::Written(_, Ok(produced)) = super::pending_production(&mut production).await else {
+        let super::ProductionResult::Written(_, Ok(produced), _) = super::pending_production(&mut production).await else {
             panic!("expected the catalog to be persisted before the upload append");
         };
         drop(production);

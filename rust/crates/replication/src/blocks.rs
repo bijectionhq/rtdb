@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use crate::logs::PartitionReplay;
-use crate::serving::ServingCheckpoint;
+use crate::serving::{ServingCheckpoint, ServingCheckpointSeal};
 use crate::{AppliedProgress, PartitionLogs, ReplicaRecord, TermFence};
 
 pub struct RecoveredPartition {
@@ -484,8 +484,8 @@ impl BlockStore {
 
     pub(crate) async fn latest_listed_block(&self) -> Result<Option<BlockIndex>> { latest_stored_block(self.store.as_ref(), None).await }
 
-    pub(crate) async fn collect_serving_checkpoints(&self, database: uuid::Uuid, epoch: u64,
-        checkpoint: PublishedCheckpoint, cancellation: &CancellationToken) -> Result<()> {
+    pub(crate) async fn collect_serving_checkpoints(&self, epoch: u64, checkpoint: PublishedCheckpoint,
+        seal: &ServingCheckpointSeal, cancellation: &CancellationToken) -> Result<()> {
         let Some(local) = self.store.local_maintenance_store().filter(|store| store.defers_trie_releases()) else { return Ok(()); };
         let Some(custody) = local.try_lock_recovery_deletion().await? else { return Ok(()); };
         IoRegion::retaining(custody, async {
@@ -498,7 +498,8 @@ impl BlockStore {
             }
             let Some(key) = &selected.as_proto().serving_checkpoint_object else { return Ok(()); };
             let image = serving_checkpoint_id(key)?;
-            self.store.head_fresh(&ObjectKey::new(key)?).await?;
+            seal.verify(self.store.as_ref(), &self.memory, image).await?;
+            let database = seal.database();
             let files = self.store.list(Some(&ObjectKey::new(format!("db/{database}/file"))?)).await?;
             let mut roots = vec![image];
             for stored in self.store.list(Some(&ObjectKey::new("blocks")?)).await? {

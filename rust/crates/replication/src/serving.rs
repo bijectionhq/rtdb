@@ -11,11 +11,12 @@ use rtdb_tx::transact::{
     TIMED_TRANSACT, TRANSACT_REQUIRES, Transact, TransactPipeline, TransactState,
     TransactionRecord, TrustedCustodyCommand,
 };
-use rtdb_storage::ObjectStore;
+use rtdb_storage::{ObjectKey, ObjectStore};
 use rtdb_store::{Reachability, WriterObjects};
 use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, ReplicaPosition, Result, SourcePosition, Term, Timestamp, rtdb_v1::{At, Basis, LabelScope, QUERY_WRITTEN_BASIS}};
 use parking_lot::Mutex as ReplyLock;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -433,7 +434,38 @@ struct CheckpointWriter {
     epoch: u64,
 }
 
+#[derive(Clone)]
+pub(crate) struct ServingCheckpointSeal {
+    database: Uuid,
+    authority: NativeCheckpointAuthority,
+    plaintext_sha256: [u8; 32],
+}
+
+impl ServingCheckpointSeal {
+    pub(crate) fn database(&self) -> Uuid { self.database }
+
+    pub(crate) async fn verify(&self, store: &dyn ObjectStore, memory: &Arc<MemoryBudget>, id: ObjectId) -> Result<()> {
+        if id.database != self.database { return Err(foreign_basis()); }
+        let key = ObjectKey::new(id.to_string())?;
+        let size = usize::try_from(store.head_fresh(&key).await?.size).map_err(|_| invalid())?;
+        let _charge = memory.reserve(size.checked_mul(2).ok_or_else(invalid)?)?;
+        let opened = rtdb_store::read_file_bounded(store, self.authority.kms.as_ref(), id, size).await?;
+        let digest: [u8; 32] = Sha256::digest(opened.bytes.as_slice()).into();
+        if opened.generation.number != self.authority.generation || digest != self.plaintext_sha256 { return Err(invalid()); }
+        Ok(())
+    }
+}
+
 impl ServingCheckpoint {
+    pub(crate) fn seal_for_collection(&self) -> Option<ServingCheckpointSeal> {
+        let CheckpointPublication::Writer(writer) = &self.publication else { return None; };
+        Some(ServingCheckpointSeal {
+            database: writer.database,
+            authority: writer.authority.clone(),
+            plaintext_sha256: Sha256::digest(self.image.as_ref()).into(),
+        })
+    }
+
     pub(crate) fn write_generation(&self) -> Result<u64> {
         let CheckpointPublication::Writer(writer) = &self.publication else {
             return Err(default_erasure::unsupported());
@@ -1520,15 +1552,27 @@ mod tests {
         let blocks = crate::BlockStore::new(store.clone(), Arc::new(BufferPool::new(store.clone(), 1 << 20)),
             MemoryBudget::new(1 << 24), 100_000_000).unwrap();
         let database = Uuid::from_bytes(INCARNATION);
-        let kms = LocalKms::new(|| 0);
+        let kms = Arc::new(LocalKms::new(|| 0));
         kms.create(Generation { database, number: 1 }).await.unwrap();
+        kms.create(Generation { database, number: 2 }).await.unwrap();
+        let authority = NativeServingAuthority { incarnation: INCARNATION,
+            checkpoints: Some(NativeCheckpointAuthority { kms: kms.clone(), generation: 1 }) };
+        let (mut serving, _) = NativeServing::open(authority, store.clone(), None).unwrap();
+        let earlier = serving.checkpoint(Term(2)).unwrap().image;
+        let decision = serving.decide_source(SourcePosition(3), Timestamp(40), Ok(unscoped(put(1)))).unwrap();
+        let (_, result) = serving.apply_ordered(&decision, true, Some((ReplicaPosition(4), Term(2))), |_, _, _, _| Ok(())).unwrap().unwrap();
+        assert!(matches!(result.unwrap().outcome, rtdb_tx::transact::Outcome::Then));
+        let checkpoint = serving.checkpoint(Term(2)).unwrap();
+        let seal = checkpoint.seal_for_collection().unwrap();
         let mut old = WriterObjects::new(database, 1);
         let mut current = WriterObjects::new(database, 2);
-        let retained = old.file(&kms, 1, b"retained").await.unwrap();
-        let orphan = old.file(&kms, 1, b"orphan").await.unwrap();
-        let inflight = current.file(&kms, 1, b"in flight").await.unwrap();
-        let adopted = current.file(&kms, 1, b"adopted").await.unwrap();
-        for object in [&retained, &orphan, &inflight, &adopted] { object.put(store.as_ref()).await.unwrap(); }
+        let retained = old.file(kms.as_ref(), 1, b"retained").await.unwrap();
+        let orphan = old.file(kms.as_ref(), 1, b"orphan").await.unwrap();
+        let inflight = current.file(kms.as_ref(), 1, b"in flight").await.unwrap();
+        let adopted = current.file(kms.as_ref(), 1, &checkpoint.image).await.unwrap();
+        let wrong_cut = current.file(kms.as_ref(), 1, &earlier).await.unwrap();
+        let wrong_generation = current.file(kms.as_ref(), 2, &checkpoint.image).await.unwrap();
+        for object in [&retained, &orphan, &inflight, &adopted, &wrong_cut, &wrong_generation] { object.put(store.as_ref()).await.unwrap(); }
         let mut root = BlockCatalog::from_proto(block_pb::Block { block_index: Some(1),
             serving_checkpoint_object: Some(retained.id().to_string()), ..Default::default() }).unwrap();
         let root_key = ObjectKey::new(block_key(BlockIndex(1)).unwrap()).unwrap();
@@ -1551,20 +1595,30 @@ mod tests {
             PublishedCheckpoint { root_sha256: root.publication_sha256(), ..publication },
             PublishedCheckpoint { boundary: ReplicaPosition(4), ..publication },
         ] {
-            assert!(blocks.collect_serving_checkpoints(database, 2, wrong, &cancellation).await.is_err());
+            assert!(blocks.collect_serving_checkpoints(2, wrong, &seal, &cancellation).await.is_err());
             assert!(store.head(&orphan_key).await.is_ok());
         }
-        assert!(blocks.collect_serving_checkpoints(Uuid::from_bytes([99; 16]), 2, publication, &cancellation).await.is_err());
+        let foreign = ServingCheckpointSeal { database: Uuid::from_bytes([99; 16]), ..seal.clone() };
+        assert!(blocks.collect_serving_checkpoints(2, publication, &foreign, &cancellation).await.is_err());
         assert!(store.head(&orphan_key).await.is_ok());
+        for (index, wrong_image) in [(BlockIndex(3), wrong_cut.id()), (BlockIndex(4), wrong_generation.id())] {
+            let mut wrong = BlockCatalog::from_proto(block_pb::Block { block_index: Some(index.0), boundary_replica_msg_id: Some(5),
+                serving_checkpoint_object: Some(wrong_image.to_string()), ..Default::default() }).unwrap();
+            let key = ObjectKey::new(block_key(index).unwrap()).unwrap();
+            store.put(&key, Bytes::from(wrong.encode_for_publication())).await.unwrap();
+            let publication = PublishedCheckpoint { block: index, boundary: ReplicaPosition(5), root_sha256: wrong.publication_sha256() };
+            assert!(blocks.collect_serving_checkpoints(2, publication, &seal, &cancellation).await.is_err());
+            assert!(store.head(&orphan_key).await.is_ok());
+        }
         let recovery = local.hold_recovery_open().await.unwrap();
-        blocks.collect_serving_checkpoints(database, 2, publication, &cancellation).await.unwrap();
+        blocks.collect_serving_checkpoints(2, publication, &seal, &cancellation).await.unwrap();
         assert!(store.head(&orphan_key).await.is_ok());
         drop(recovery);
-        blocks.collect_serving_checkpoints(database, 2, publication, &cancellation).await.unwrap();
+        blocks.collect_serving_checkpoints(2, publication, &seal, &cancellation).await.unwrap();
         assert!(matches!(store.head(&orphan_key).await, Err(rtdb_storage::Error::MissingObject(_))));
         assert!(store.head(&staged_key).await.is_ok());
-        assert_eq!(rtdb_store::read_file(store.as_ref(), &kms, retained.id()).await.unwrap().bytes.as_slice(), b"retained");
-        assert_eq!(rtdb_store::read_file(store.as_ref(), &kms, inflight.id()).await.unwrap().bytes.as_slice(), b"in flight");
-        assert_eq!(rtdb_store::read_file(store.as_ref(), &kms, adopted.id()).await.unwrap().bytes.as_slice(), b"adopted");
+        assert_eq!(rtdb_store::read_file(store.as_ref(), kms.as_ref(), retained.id()).await.unwrap().bytes.as_slice(), b"retained");
+        assert_eq!(rtdb_store::read_file(store.as_ref(), kms.as_ref(), inflight.id()).await.unwrap().bytes.as_slice(), b"in flight");
+        assert_eq!(rtdb_store::read_file(store.as_ref(), kms.as_ref(), adopted.id()).await.unwrap().bytes.as_slice(), checkpoint.image.as_ref());
     }
 }

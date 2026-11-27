@@ -17,7 +17,10 @@
 -- Coordinated native startup retains a shared recovery gate while choosing a checkpoint and admitting the replica cursor.
 -- Native metadata collection needs exclusive access to that gate through unlink.
 -- The Default Local writer collects older-term sealed serving images after adopting its own replica upload confirmation.
--- The collector verifies the exact published root and replica boundary under the exclusive recovery gate.
+-- The admitted confirmation matches the writer's durable upload receipt in the current replica log.
+-- The writer reopens replay at the exact source cut, replica boundary and upload position.
+-- Under the exclusive recovery gate the collector verifies the exact published root and replica boundary, then authenticates its sealed image with the installed checkpoint authority.
+-- The image's key generation and encoded contents match the fold captured at the boundary, including its retained cuts and receipt coordinates.
 -- Every retained block catalog remains a root for its sealed image.
 --
 -- Multi records a logical release first. For a versioned or enrolled terminal S3 block pack,

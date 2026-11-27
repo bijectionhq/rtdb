@@ -16,7 +16,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::promotion::{initial_term_sequence, replica_read_is_empty, should_start_claim};
-use crate::{BlockCycle, BlockStore, FlushTimer, PartitionLogs, PendingBlock, ProgressMonitor, PublishedCheckpoint, PublishedPrimaryReset, RecoveredPartition, ReplicaRecord, TermFence, TermPosition, Verdict};
+use crate::{BlockCycle, BlockStore, FlushTimer, PartitionLogs, PendingBlock, ProgressMonitor, PublishedCheckpoint, PublishedPrimaryReset, RecoveredPartition, ReplicaMetadata, ReplicaRecord, TermFence, TermPosition, Verdict};
 use crate::admission::AdmittedReplica;
 use crate::appender::{Applied, AppenderHandle, CommitLagBasis, PendingWrite, ReplicaAppender, WriteBody, complete_record, join_error, now};
 use crate::blocks::{RecoveredBlockConfirmation, checkpoint_digest, matches_catalog_boundary, matches_confirmation, validate_uploaded_root};
@@ -26,7 +26,7 @@ use crate::readback_identity::{TransactionEvent, matching_present_integer, own_r
 use crate::applied_prefix::AppliedPrefix;
 use crate::recovery_promotion::{WriterActivation, publish_installed_prefix, writer_activation};
 use crate::state::fail_pending;
-use crate::serving::{self, NativeRequest, NativeServing, NativeServingAuthority, NativeServingHandle, SourceRequest};
+use crate::serving::{self, NativeRequest, NativeServing, NativeServingAuthority, NativeServingHandle, ServingCheckpointSeal, SourceRequest};
 use crate::checkpoint_admin::{PinControl, ReleaseControl};
 use rtdb_tx::transact::{Erasure, Outcome as ServingOutcome, Receipt as ServingReceipt};
 use crate::default_erasure::{self, AppliedErasure, DefaultErasure, ErasureCut};
@@ -450,20 +450,23 @@ struct Resolution {
     future: BoxFuture<'static, (TxResolver, Result<Arc<ResolvedTx>>)>,
     completion: Completion,
 }
-/// Each stage carries the instant the block's production started, which `block.upload.timer` measures from.
 enum Production {
-    Writing(std::time::Instant, BoxFuture<'static, Result<crate::ProducedBlock>>),
-    Appending(std::time::Instant, BoxFuture<'static, Result<crate::ReplicaMetadata>>),
+    Writing(std::time::Instant, BoxFuture<'static, Result<crate::ProducedBlock>>, Option<ServingCheckpointSeal>),
+    Appending(std::time::Instant, BoxFuture<'static, Result<ReplicaMetadata>>, Option<ServingCheckpointSeal>),
+    AwaitingReadback(ReplicaMetadata, ServingCheckpointSeal),
 }
-enum ProductionResult { Written(std::time::Instant, Result<crate::ProducedBlock>), Appended(std::time::Instant, Result<crate::ReplicaMetadata>) }
+enum ProductionResult {
+    Written(std::time::Instant, Result<crate::ProducedBlock>, Option<ServingCheckpointSeal>),
+    Appended(std::time::Instant, Result<ReplicaMetadata>, Option<ServingCheckpointSeal>),
+}
 async fn pending_resolution(resolution: &mut Option<Resolution>) -> (TxResolver, Result<Arc<ResolvedTx>>) {
     match resolution { Some(resolution) => resolution.future.as_mut().await, None => futures::future::pending().await }
 }
 async fn pending_production(production: &mut Option<Production>) -> ProductionResult {
     match production {
-        Some(Production::Writing(started, future)) => ProductionResult::Written(*started, future.as_mut().await),
-        Some(Production::Appending(started, future)) => ProductionResult::Appended(*started, future.as_mut().await),
-        None => futures::future::pending().await,
+        Some(Production::Writing(started, future, seal)) => ProductionResult::Written(*started, future.as_mut().await, seal.take()),
+        Some(Production::Appending(started, future, seal)) => ProductionResult::Appended(*started, future.as_mut().await, seal.take()),
+        Some(Production::AwaitingReadback(..)) | None => futures::future::pending().await,
     }
 }
 
@@ -692,7 +695,7 @@ impl ReplicationDriver {
             serving.funded_record_limit = self.logs.replica_timed_original_append_limit().map(|limit| limit.saturating_sub(1024));
         }
         let funded_record_limit = serving.funded_record_limit;
-        self.collect_serving_checkpoints = collect_checkpoints && self.logs.retains_recovery_history();
+        self.collect_serving_checkpoints = collect_checkpoints && self.logs.local_recovery_store().is_some();
         self.serving = Some(serving);
         Ok(NativeServingHandle { replication, view, authority, source_authority, source_replies, funded_record_limit,
             local_read_fence: self.local_erasure_read_fence.clone() })
@@ -1226,7 +1229,11 @@ impl ReplicationDriver {
             if let Some(resolver) = &mut leader.resolver { resolver.discard_staged(); }
             let result = if let Some(job) = leader.job.take() { job.await.map_err(join_error).and_then(|result| result) } else { Ok(()) };
             if let Some(production) = leader.production.take() {
-                match production { Production::Writing(_, future) => { if future.await.is_ok() { self.record_block_upload(); } }, Production::Appending(_, future) => { let _ = future.await; } }
+                match production {
+                    Production::Writing(_, future, _) => { if future.await.is_ok() { self.record_block_upload(); } }
+                    Production::Appending(_, future, _) => { let _ = future.await; }
+                    Production::AwaitingReadback(..) => {}
+                }
             }
             self.publish_status(Role::Following);
             result?;
@@ -1585,13 +1592,19 @@ impl ReplicationDriver {
                 if self.leader.is_none() && let (Some(observer), Some(pending)) = (&self.resolve.execution_observer, &self.pending_block) {
                     observer.record_replica_block_buffer(&self.resolve.database, pending.opened().elapsed(), pending.buffered_len());
                 }
-                if let Some(production) = self.leader.as_mut().and_then(|leader| leader.production.take()) {
-                    match production {
-                        Production::Writing(_, future) => { future.await?; self.record_block_upload(); }
-                        Production::Appending(started, future) => { future.await?; self.time_block_upload(started); }
-                    }
+                let collection = if let Some(production) = self.leader.as_mut().and_then(|leader| leader.production.take()) {
+                    let collection = match production {
+                        Production::Writing(_, future, _) => { future.await?; self.record_block_upload(); None }
+                        Production::Appending(started, future, seal) => {
+                            let receipt = future.await?;
+                            self.time_block_upload(started);
+                            seal.map(|seal| (receipt, seal))
+                        }
+                        Production::AwaitingReadback(receipt, seal) => Some((receipt, seal)),
+                    };
                     if let Some(leader) = &mut self.leader { leader.confirmed = true; }
-                }
+                    collection
+                } else { None };
                 let ReplicaBody::BlockUploaded(message) = &record.envelope.message else { return Err(invalid("Matching upload changed type")); };
                 let pending = self.pending_block.as_ref().ok_or_else(|| invalid("Matching upload has no pending block"))?;
                 let (catalog, table_blocks) = self.blocks.load(pending.block_index()).await?;
@@ -1601,7 +1614,7 @@ impl ReplicationDriver {
                     block: catalog.block_index(), boundary: pending.boundary.metadata.position,
                     root_sha256: message.catalog_sha256.as_deref().and_then(|digest| digest.try_into().ok()),
                 };
-                let collect = self.collect_serving_checkpoints && checkpoint.root_sha256.is_some()
+                let collect = checkpoint.root_sha256.is_some()
                     && catalog.as_proto().serving_checkpoint_object.is_some()
                     && matches_confirmation(&catalog, message, self.logs.storage_version, self.logs.storage_epoch);
                 let tries = additions(&message.tries)?;
@@ -1634,13 +1647,18 @@ impl ReplicationDriver {
                 if collect && self.default_erasure.is_none()
                     && let Role::Leading(term) = self.role() && term == record.envelope.term
                     && let Ok(epoch) = u64::try_from(term.0)
-                    && let Some(incarnation) = self.serving.as_ref().map(NativeServing::incarnation)
-                    && let Err(error) = self.blocks.collect_serving_checkpoints(
-                        uuid::Uuid::from_bytes(incarnation), epoch, checkpoint, &self.cancellation,
-                    ).await
-                    && !self.cancellation.is_cancelled()
+                    && let Some((receipt, seal)) = collection && receipt == record.metadata
                 {
-                    tracing::warn!(%error, block = checkpoint.block.0, "Could not collect older serving checkpoint files");
+                    let result = async {
+                        let installed = self.partition.value();
+                        let catalog = installed.table_catalog().block().ok_or_else(|| invalid("Adopted block disappeared"))?;
+                        self.serving.as_ref().ok_or_else(serving::unavailable)?.verify_checkpoint_prefix(catalog)?;
+                        self.logs.verify_checkpoint_reopen(catalog.latest_source_position(), checkpoint.boundary, receipt.position).await?;
+                        self.blocks.collect_serving_checkpoints(epoch, checkpoint, &seal, &self.cancellation).await
+                    }.await;
+                    if let Err(error) = result && !self.cancellation.is_cancelled() {
+                        tracing::warn!(%error, block = checkpoint.block.0, "Could not collect older serving checkpoint files");
+                    }
                 }
                 self.publish_status(self.role());
                 continue;
@@ -2004,6 +2022,9 @@ impl ReplicationDriver {
         };
         let term = rewrite.as_ref().map_or(leader.term, |_| boundary.envelope.term);
         let serving_checkpoint = self.serving.as_mut().map(|serving| serving.checkpoint(term)).transpose()?;
+        let seal = if self.collect_serving_checkpoints && rewrite.is_none() {
+            serving_checkpoint.as_ref().and_then(serving::ServingCheckpoint::seal_for_collection)
+        } else { None };
         let logs = Arc::clone(&self.logs);
         let cancellation = leader.cancellation.clone();
         leader.production = Some(Production::Writing(std::time::Instant::now(), Box::pin(async move {
@@ -2013,20 +2034,20 @@ impl ReplicationDriver {
                     serving_checkpoint.ok_or_else(default_erasure::unsupported)?, &cancellation).await;
             }
             blocks.produce_with_search(&prepared, &boundary, databases, &cancellation, search.as_deref(), serving_checkpoint).await
-        })));
+        }), seal));
         Ok(())
     }
     async fn production_finished(&mut self, result: ProductionResult) -> Result<()> {
         let leader = self.leader.as_mut().ok_or_else(term_ended)?;
         leader.production = None;
-        let error = match &result { ProductionResult::Written(_, result) => result.as_ref().err(), ProductionResult::Appended(_, result) => result.as_ref().err() };
+        let error = match &result { ProductionResult::Written(_, result, _) => result.as_ref().err(), ProductionResult::Appended(_, result, _) => result.as_ref().err() };
         if let Some(error) = error {
             let error = error.clone();
             if leader.confirmed { return Err(error); }
             return self.promotion_failed(error).await;
         }
         match result {
-            ProductionResult::Written(started, result) => {
+            ProductionResult::Written(started, result, seal) => {
                 let produced = result?;
                 let upload_time = (self.clock)().0.div_euclid(1_000_000);
                 self.status.send_modify(|status| status.last_block_upload_epoch_seconds = upload_time);
@@ -2042,9 +2063,15 @@ impl ReplicationDriver {
                 let write = PendingWrite::new(WriteBody::Message(message), pending.block_index(), None, &self.resolve.memory)?;
                 leader.pending.push_back(Arc::clone(&write));
                 let appender = leader.appender.clone();
-                leader.production = Some(Production::Appending(started, Box::pin(async move { appender.append_durable(write).await })));
+                leader.production = Some(Production::Appending(started, Box::pin(async move { appender.append_durable(write).await }), seal));
             }
-            ProductionResult::Appended(started, result) => { result?; leader.confirmed = true; self.time_block_upload(started); self.publish_status(self.role()); }
+            ProductionResult::Appended(started, result, seal) => {
+                let receipt = result?;
+                leader.production = seal.map(|seal| Production::AwaitingReadback(receipt, seal));
+                leader.confirmed = true;
+                self.time_block_upload(started);
+                self.publish_status(self.role());
+            }
         }
         Ok(())
     }
