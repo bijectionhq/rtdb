@@ -18,9 +18,9 @@
            (java.util.stream IntStream IntStream$Builder)
            (org.apache.arrow.memory BufferAllocator)
            (org.apache.arrow.vector.types DateUnit TimeUnit)
-           (org.apache.arrow.vector.types.pojo ArrowType$Date ArrowType$Duration ArrowType$FixedSizeBinary ArrowType$Timestamp)
+           (org.apache.arrow.vector.types.pojo ArrowType$Date ArrowType$Decimal ArrowType$Duration ArrowType$FixedSizeBinary ArrowType$Timestamp)
            (xtdb.api ICursor)
-           (xtdb.arrow ArrowTypes IntVector MonoVector RelationReader RowMask RowMask$Builder Vector VectorReader VectorType VectorWriter)
+           (xtdb.arrow ArrowTypes IntVector MonoVector RelationReader RowMask RowMask$Builder RowValueReader Vector VectorReader VectorType VectorWriter)
            (xtdb.arrow.agg AggregateSpec AggregateSpec$Factory Average Count GroupMapper GroupMapper$Mapper GroupMapper$Null RowCount StdDevPop StdDevSamp Sum VarWidthMinMax VariancePop VarianceSamp)
            xtdb.arrow.extensions.UuidType
            (xtdb.expression.map IndexHasher RelationMapBuilder)
@@ -431,22 +431,38 @@
     (double (.getObject values (int idx)))))
 
 (defn- copy-percentile-value! [^VectorWriter out-vec, ^VectorReader values, ^long idx]
-  (let [arrow-type (.getArrowType values)]
-    (if (and (= (.getArrowType out-vec) arrow-type)
-             (or (percentile-primitive-numeric-types arrow-type)
-                 (= ArrowTypes/BOOL_TYPE arrow-type)
-                 (= ArrowTypes/VAR_BINARY_TYPE arrow-type)
-                 (= UuidType/INSTANCE arrow-type)
-                 (instance? ArrowType$FixedSizeBinary arrow-type)
-                 (instance? ArrowType$Duration arrow-type)
-                 (and (instance? ArrowType$Date arrow-type)
-                      (= DateUnit/DAY (.getUnit ^ArrowType$Date arrow-type)))
-                 (and (instance? ArrowType$Timestamp arrow-type)
-                      (not= TimeUnit/SECOND (.getUnit ^ArrowType$Timestamp arrow-type)))
-                 (and (= ArrowTypes/UTF8_TYPE arrow-type)
-                      (.isValidUtf8 (UnsafeByteOperations/unsafeWrap (.getBytes values (int idx)))))))
+  (let [arrow-type (.getArrowType values)
+        same-type? (= (.getArrowType out-vec) arrow-type)]
+    (cond
+      (and same-type? (instance? ArrowType$Decimal arrow-type))
+      (let [^RowValueReader value (.valueReader values)]
+        (.setPos value (int idx))
+        (.writeValue out-vec value))
+
+      (and same-type? (instance? ArrowType$Date arrow-type)
+           (= DateUnit/MILLISECOND (.getUnit ^ArrowType$Date arrow-type)))
+      (let [millis (.getLong values (int idx))
+            time-of-day (Math/floorMod millis (long 86400000))]
+        (if (>= millis (+ Long/MIN_VALUE time-of-day))
+          (.writeLong out-vec (- millis time-of-day))
+          (.writeObject out-vec (.getObject values (int idx)))))
+
+      (and same-type?
+           (or (percentile-primitive-numeric-types arrow-type)
+               (= ArrowTypes/BOOL_TYPE arrow-type)
+               (= ArrowTypes/VAR_BINARY_TYPE arrow-type)
+               (= UuidType/INSTANCE arrow-type)
+               (instance? ArrowType$FixedSizeBinary arrow-type)
+               (instance? ArrowType$Duration arrow-type)
+               (and (instance? ArrowType$Date arrow-type)
+                    (= DateUnit/DAY (.getUnit ^ArrowType$Date arrow-type)))
+               (and (instance? ArrowType$Timestamp arrow-type)
+                    (not= TimeUnit/SECOND (.getUnit ^ArrowType$Timestamp arrow-type)))
+               (and (= ArrowTypes/UTF8_TYPE arrow-type)
+                    (.isValidUtf8 (UnsafeByteOperations/unsafeWrap (.getBytes values (int idx)))))))
       (.copyRow (.rowCopier values out-vec) (int idx))
-      (.writeObject out-vec (.getObject values (int idx))))))
+
+      :else (.writeObject out-vec (.getObject values (int idx))))))
 
 (defn- write-percentiles! [^VectorWriter out-vec, ^LongArrayList counts, fraction, cont?, ^Spliterator sorted-pages]
   (let [fraction (double fraction)

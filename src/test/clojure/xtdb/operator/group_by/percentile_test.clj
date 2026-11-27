@@ -5,11 +5,12 @@
             [xtdb.operator.order-by :as order-by]
             [xtdb.test-util :as tu]
             [xtdb.util :as util])
-  (:import (java.nio.file Files)
+  (:import (java.math BigDecimal)
+           (java.nio.file Files)
            (java.nio.file.attribute FileAttribute)
            (java.time LocalDate)
            (java.util Random)
-           (xtdb.arrow RelationReader RowMask)
+           (xtdb.arrow DateMilliVector DecimalVector RelationReader RowMask)
            (xtdb.arrow.agg AggregateSpec)))
 
 (t/use-fixtures :each tu/with-allocator tu/with-node)
@@ -159,6 +160,30 @@
   (let [[{:keys [p]}] (tu/query-ra '[:group-by {:columns [{p (percentile_cont 0.5 [v {:direction :asc}])}]}
                                      [:table {:rows [{:v -0.0} {:v nil}]}]])]
     (t/is (= Long/MIN_VALUE (Double/doubleToRawLongBits p)))))
+
+(t/deftest test-discrete-percentile-date-milli-winner-normalization
+  (with-open [^DateMilliVector src (tu/open-vec "v" #xt/type [:date :milli] [])
+              ^DateMilliVector out (tu/open-vec "p" #xt/type [:? [:date :milli]] [])]
+    (.writeLong src -86400000)
+    (.writeLong src -1)
+    (#'group-by/copy-percentile-value! out src 0)
+    (#'group-by/copy-percentile-value! out src 1)
+    (t/is (= [-86400000 -86400000] (mapv #(.getLong out %) [0 1])))
+    (.writeLong src Long/MIN_VALUE)
+    (t/is (thrown-with-msg? Exception #"date out of range"
+                            (#'group-by/copy-percentile-value! out src 2)))))
+
+(t/deftest test-discrete-percentile-decimal-winner-precision
+  (let [decimal-type #xt/type [:decimal 5 2 32]]
+    (with-open [^DecimalVector src (tu/open-vec "v" decimal-type [-3.75M 999.99M])
+                ^DecimalVector out (tu/open-vec "p" #xt/type [:? [:decimal 5 2 32]] [])]
+      (#'group-by/copy-percentile-value! out src 0)
+      (#'group-by/copy-percentile-value! out src 1)
+      (t/is (= ["-3.75" "999.99"] (mapv #(str (.getDecimal out %)) [0 1])))
+      (.setBigDecimal src 2 (BigDecimal. "1000.00"))
+      (t/is (thrown-with-msg? Exception #"invalid writeObject"
+                              (#'group-by/copy-percentile-value! out src 2)))
+      (t/is (= 2 (.getValueCount out))))))
 
 (defn- reference-percentile [mode fraction direction vs]
   (let [vs (vec (cond-> (sort (remove nil? vs))

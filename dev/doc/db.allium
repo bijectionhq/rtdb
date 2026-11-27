@@ -2542,6 +2542,8 @@ surface QueryAccess {
         -- Decimal precision is checked for the winners of a discrete percentile.
         -- Continuous percentiles interpolate compatible numeric operands into a nullable Arrow result.
         -- JVM discrete percentiles copy compatible selected scalar cells into the result before the sorted page advances.
+        -- A millisecond date winner is normalized to the start of its calendar day, with the original out-of-range error when that tick cannot be represented.
+        -- A same-type decimal winner uses a checked positioned write that preserves its coefficient and scale.
         -- JVM continuous percentiles interpolate the reached primitive numbers without changing the order of the arithmetic.
         -- JVM variable-width extrema compare borrowed candidates in unsigned byte order and retain a copy only when the winner changes.
         -- A compatible scalar membership join indexes the build key vectors and appends nullable Boolean marks to the probe batches.
