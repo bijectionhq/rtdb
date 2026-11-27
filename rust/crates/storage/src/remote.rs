@@ -429,10 +429,11 @@ impl ObjectStore for RemoteStore {
         let (objects, key, source, namespace) = (Arc::clone(&self.objects), key.clone(), source.to_owned(), self.version_namespace.clone());
         let inventory = self.classic_versions.clone();
         IoRegion::run_async_admitted(admission, async move {
-            objects.put_opened_file(&key, tokio::fs::File::from_std(input), &source, inventory.as_deref()).await?;
-            let Some(namespace) = namespace else { return Ok(None); };
-            let published = objects.metadata(&key).await?;
-            Ok(physical_version(Some(&namespace), &objects.path(&key), published.version).map(PhysicalObjectPublication::Version))
+            let publication = objects.put_opened_file(
+                &key, tokio::fs::File::from_std(input), &source, inventory.as_deref(), namespace.is_some(),
+            ).await?;
+            Ok(physical_version(namespace.as_deref(), &objects.path(&key), publication.and_then(|object| object.version))
+                .map(PhysicalObjectPublication::Version))
         }).await
     }
     async fn copy(&self, source: &ObjectKey, destination: &ObjectKey) -> Result<()> { self.copy_to(source, self, destination).await }
@@ -512,20 +513,28 @@ impl RemoteObjects {
         decode_provider_key(relative)
     }
 
-    async fn compare_file(&self, key: &ObjectKey, file: &mut tokio::fs::File, source: &std::path::Path, length: u64) -> Result<()> {
-        if self.head(key).await?.size != length { return Err(Error::ConflictingObject(key.to_string())); }
-        file.rewind().await.map_err(|error| Error::io(source, error))?;
-        let mut offset = 0;
-        let mut buffer = vec![0u8; 1024 * 1024];
-        while offset < length {
-            let count = (length - offset).min(buffer.len() as u64) as usize;
-            file.read_exact(&mut buffer[..count]).await.map_err(|error| Error::io(source, error))?;
-            if self.get_range(key, offset..offset + count as u64).await?.as_ref() != &buffer[..count] {
-                return Err(Error::ConflictingObject(key.to_string()));
+    async fn compare_file(&self, key: &ObjectKey, file: &mut tokio::fs::File, source: &std::path::Path,
+        length: u64) -> Result<ProviderPublication> {
+        self.with_read(key, async {
+            let conflict = || Error::ConflictingObject(key.to_string());
+            let object = self.read(key, GetOptions::default()).await?;
+            if object.meta.size != length || object.range != (0..length) { return Err(conflict()); }
+            let publication = ProviderPublication { version: object.meta.version.clone(), etag: object.meta.e_tag.clone() };
+            file.rewind().await.map_err(|error| Error::io(source, error))?;
+            let mut stream = object.into_stream();
+            let mut remaining = length;
+            let mut buffer = vec![0; length.clamp(1, 1024 * 1024) as usize];
+            while let Some(bytes) = stream.try_next().await.map_err(|error| provider_error(key, error))? {
+                if bytes.len() as u64 > remaining { return Err(conflict()); }
+                for chunk in bytes.chunks(buffer.len()) {
+                    file.read_exact(&mut buffer[..chunk.len()]).await.map_err(|error| Error::io(source, error))?;
+                    if chunk != &buffer[..chunk.len()] { return Err(conflict()); }
+                }
+                remaining -= bytes.len() as u64;
             }
-            offset += count as u64;
-        }
-        Ok(())
+            if remaining != 0 { return Err(conflict()); }
+            Ok(publication)
+        }).await
     }
 }
 
@@ -756,14 +765,15 @@ impl RemoteObjects {
         }
     }
 
-    async fn put_opened_file(&self, key: &ObjectKey, mut input: tokio::fs::File, source: &std::path::Path, inventory: Option<&dyn ClassicVersionRetirement>) -> Result<()> {
+    async fn put_opened_file(&self, key: &ObjectKey, mut input: tokio::fs::File, source: &std::path::Path,
+        inventory: Option<&dyn ClassicVersionRetirement>, bind_publication: bool) -> Result<Option<ProviderPublication>> {
         let length = input.metadata().await.map_err(|error| Error::io(source, error))?.len();
         match self.head(key).await {
-            Ok(_) => return self.compare_file(key, &mut input, source, length).await,
+            Ok(_) => return self.compare_file(key, &mut input, source, length).await.map(Some),
             Err(Error::MissingObject(_)) => (),
             Err(error) => return Err(error),
         }
-        if length == 0 { return self.put(key, Bytes::new(), None).await.map(drop); }
+        if length == 0 { return self.put(key, Bytes::new(), None).await.map(Some); }
         let upload_id = uuid::Uuid::new_v4();
         let temporary = format!(".tmp/upload-{upload_id}");
         let temporary = Path::from(match &self.prefix { Some(prefix) => format!("{prefix}/{temporary}"), None => temporary });
@@ -790,8 +800,11 @@ impl RemoteObjects {
             }
         };
         let published = match self.client.copy_if_not_exists(&temporary, &self.path(key)).await {
-            Ok(()) => Ok(()),
-            Err(object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }) => self.compare_file(key, &mut input, source, length).await,
+            Ok(()) if !bind_publication => Ok(None),
+            Ok(()) | Err(object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }) => {
+                // The conditional copy returns no destination version.
+                self.compare_file(key, &mut input, source, length).await.map(Some)
+            }
             // A pending copy still depends on its private source.
             Err(error) if copy_outcome_unknown(&error) => return Err(provider_error(key, error)),
             Err(error) => Err(provider_error(key, error)),
@@ -800,7 +813,9 @@ impl RemoteObjects {
             Some(inventory) => inventory.settle_staging_upload(upload_id, version.as_deref()).await,
             None => self.client.delete(&temporary).await.map_err(|error| provider_error(key, error)),
         };
-        published.and(cleanup)
+        let publication = published?;
+        cleanup?;
+        Ok(publication)
     }
 
     async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>> {

@@ -24,6 +24,8 @@ File uploads open their source before offloading so an unlinked temporary source
 Remote uploads retain that source through conditional publication and private-object cleanup.
 Reserved remote reads transfer their allocation charge into the admitted operation and then into the returned bytes.
 Local object copies stream through the destination's immutable file publication path.
+Remote file publication compares immutable retries against one complete provider response.
+Versioned remote file receipts identify the provider response that supplied the verified bytes, or the direct write acknowledgement for an empty file.
 `LocalStore::copy_to` accepts an explicit destination store for copies across filesystem roots.
 The open source file retains admission in the source region until the destination operation finishes, including after caller cancellation.
 `RemoteStore::copy_to` accepts an explicit destination prefix backed by the same provider client.

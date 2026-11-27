@@ -292,6 +292,39 @@ async fn publication_versions_come_from_the_acknowledgement_or_verified_existing
 }
 
 #[tokio::test]
+async fn multipart_file_publication_reports_the_version_whose_bytes_were_verified() {
+    let provider = ControlledStore::new(Hooks {
+        put_version: Some("write-version"),
+        read_version: Some("verified-version"),
+        head_version: Some("unverified-head-version"),
+        ..Default::default()
+    });
+    let store = RemoteStore::new(provider.clone(), None)
+        .with_s3_versioning(rtdb_types::S3ObjectNamespace { bucket: "objects".into(), endpoint: None, region: None });
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("data.arrow");
+    let key = ObjectKey::new("data.arrow").unwrap();
+    let mut contents = vec![17u8; 1024 * 1024 + 1];
+    std::fs::write(&file, &contents).unwrap();
+
+    for _ in 0..2 {
+        let publication = store.put_file_with_publication(&key, &file).await.unwrap().unwrap().into_version().unwrap();
+        assert_eq!(publication.key, key.as_str());
+        assert_eq!(publication.version, "verified-version");
+    }
+    assert_eq!(store.retirement_version(&key).await.unwrap().unwrap().version, "unverified-head-version");
+    contents[1024 * 1024] = 29;
+    std::fs::write(&file, &contents).unwrap();
+    assert!(matches!(store.put_file_with_publication(&key, &file).await, Err(Error::ConflictingObject(_))));
+    assert_eq!(paths(&provider.inner).await, ["data.arrow"]);
+
+    let empty = ObjectKey::new("empty.arrow").unwrap();
+    std::fs::write(&file, []).unwrap();
+    let publication = store.put_file_with_publication(&empty, &file).await.unwrap().unwrap().into_version().unwrap();
+    assert_eq!(publication.version, "write-version");
+}
+
+#[tokio::test]
 async fn terminal_publication_carries_the_tag_from_its_acknowledgement_or_confirmed_retry() {
     let path = ObjectKey::new("data.arrow").unwrap();
     let prefix = ObjectKey::new("terminal-root").unwrap();
