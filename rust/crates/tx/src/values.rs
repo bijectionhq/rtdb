@@ -489,10 +489,21 @@ impl ArrowDocuments {
     /// Retains compatible legacy document columns with complete entity IDs.
     /// `None` lets the caller use the legacy row reader.
     pub fn from_legacy_owned_payload(batch: &OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
+        Self::from_legacy_payload(batch, memory, legacy_owned_arrow_field)
+    }
+
+    /// Retains readable Root upload layouts while keeping the legacy source and receipt encoding.
+    pub fn from_legacy_root_payload(batch: &OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
+        Self::from_legacy_payload(batch, memory, legacy_root_arrow_field)
+    }
+
+    fn from_legacy_payload(
+        batch: &OwnedBatch, memory: &Arc<MemoryBudget>, compatible: fn(&arrow_schema::Field) -> bool,
+    ) -> Result<Option<Self>> {
         let source = batch.batch();
         let fields = source.schema_ref().fields();
         if source.num_rows() == 0 || fields.iter().any(|field| {
-            !legacy_owned_field_name(field.name()) || !legacy_owned_arrow_field(field)
+            !legacy_owned_field_name(field.name()) || !compatible(field)
         })
             || fields.iter().map(|field| field.name()).collect::<BTreeSet<_>>().len() != fields.len()
         {
@@ -624,6 +635,7 @@ impl ArrowDocuments {
         if let Some((index, reader)) = reader {
             let column = self.array.column(*index);
             if column.data_type() != &DataType::Null && column.is_valid(row) {
+                if let Some(id) = reader.borrow_entity_id(column.as_ref(), row) { return Ok(id.iid()); }
                 let _scratch = memory.reserve(rtdb_columnar::estimate_read_cell_bytes(&self.array.fields()[*index], column.as_ref(), row)?)?;
                 if let Some(id) = reader.read_entity_id(column.as_ref(), row)? { return Ok(id.iid()); }
             }
@@ -809,18 +821,30 @@ pub(crate) fn legacy_owned_field_name(name: &str) -> bool {
 }
 
 pub(crate) fn legacy_owned_arrow_field(field: &arrow_schema::Field) -> bool {
-    if field.extension_type_name().is_some() { return uuid_field(field); }
+    legacy_arrow_field(field, false)
+}
+
+pub(crate) fn legacy_root_arrow_field(field: &arrow_schema::Field) -> bool {
+    legacy_arrow_field(field, true)
+}
+
+fn legacy_arrow_field(field: &arrow_schema::Field, root: bool) -> bool {
+    let compatible = |field: &arrow_schema::Field| legacy_arrow_field(field, root);
+    if field.extension_type_name().is_some() {
+        return uuid_field(field) || root && field.extension_type_name() == Some("xt/clj-keyword")
+            && from_field(field).is_ok();
+    }
     match field.data_type() {
         DataType::Struct(fields) => {
             let mut names = BTreeSet::new();
-            fields.iter().all(|field| names.insert(field.name()) && legacy_owned_arrow_field(field))
+            fields.iter().all(|field| names.insert(field.name()) && compatible(field))
         }
-        DataType::List(item) | DataType::FixedSizeList(item, _) => legacy_owned_arrow_field(item),
+        DataType::List(item) | DataType::FixedSizeList(item, _) => compatible(item),
         DataType::Union(legs, arrow_schema::UnionMode::Dense) => {
             let mut names = BTreeSet::new();
             let Ok(LogicalType::Union(types)) = from_field(field) else { return false; };
             legs.iter().all(|(_, leg)| {
-                if !legacy_owned_arrow_field(leg) { return false; }
+                if !compatible(leg) { return false; }
                 let Ok(ty) = from_field(leg) else { return false; };
                 let Ok(name) = rtdb_columnar::leg_name(&ty) else { return false; };
                 names.insert(name) && types.iter().all(|candidate| {
@@ -830,6 +854,8 @@ pub(crate) fn legacy_owned_arrow_field(field: &arrow_schema::Field) -> bool {
         }
         DataType::Null | DataType::Float16 | DataType::Date32 | DataType::Date64
         | DataType::Time32(_) | DataType::Time64(_) | DataType::Duration(_) | DataType::Timestamp(..) => true,
+        DataType::Interval(_) | DataType::Decimal32(..) | DataType::Decimal64(..)
+        | DataType::Decimal128(..) | DataType::Decimal256(..) if root => from_field(field).is_ok(),
         _ => plain_scalar_field(&field.clone().with_metadata(Default::default())),
     }
 }

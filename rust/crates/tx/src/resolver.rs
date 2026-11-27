@@ -3677,10 +3677,23 @@ impl<'a> OpenTransaction<'a> {
         let table = relation.table(owner);
         let declaration = self.read_owned_schema(owner, relation).await?;
         require_root_carrier_schema(relation, declaration.as_ref().map(|(schema, _)| schema))?;
+        let mut legacy_scalar_root = false;
         if legacy && (declaration.is_some() || self.hosted_replay.is_some()) {
-            let typed_lifetime = declaration.as_ref().is_some_and(|(schema, _)| schema.lifetime_micros().is_some())
-                && matches!(documents.legacy_owned_presence(), Some(LegacyOwnedPresence::Exact(_) | LegacyOwnedPresence::Submitted));
-            if !typed_lifetime {
+            let exact = matches!(documents.legacy_owned_presence(), Some(LegacyOwnedPresence::Exact(_) | LegacyOwnedPresence::Submitted));
+            let typed_lifetime = exact && declaration.as_ref().is_some_and(|(schema, _)| schema.lifetime_micros().is_some())
+                && documents.array().fields().iter().all(|field| crate::values::legacy_owned_arrow_field(field));
+            legacy_scalar_root = exact && declaration.as_ref().is_some_and(|(schema, _)| schema.lifetime_micros().is_none())
+                && relation.is_root_data()
+                && !matches!(relation.name(), SHARED_COLUMN_CARRIERS | ROOT_ROW_CARRIERS)
+                && documents.declared_types().iter().all(|(name, ty)| {
+                    !matches!(name.as_str(), "_valid_from" | "_valid_to" | ordered_micros::FIELD)
+                        && match ty {
+                            LogicalType::Scalar(_) | LogicalType::Null => true,
+                            LogicalType::Maybe(ty) => matches!(ty.as_ref(), LogicalType::Scalar(_)),
+                            _ => false,
+                        }
+                });
+            if !typed_lifetime && !legacy_scalar_root {
                 let rows = documents.read_legacy_owned_rows(&self.context.memory)?;
                 return self.write_owned(relation, &rows, replay.map(|(iids, _)| iids), from, to, create_only).await;
             }
@@ -3743,6 +3756,35 @@ impl<'a> OpenTransaction<'a> {
         let memory = Arc::clone(&self.context.memory);
         let _scratch = memory.reserve(4096usize.saturating_add(array.fields().len().saturating_mul(256)))?;
         let row_cells = |row: usize| array.fields().iter().zip(array.columns()).map(move |(field, values)| ArrowCell { field, array: values.as_ref(), row });
+        if legacy_scalar_root {
+            let (schema, _) = declaration.as_ref().expect("Declared legacy Root write");
+            for row in 0..array.len() {
+                let bounded = schema.requires_bounded_period();
+                let reserve_period = |tx: &mut Self| {
+                    let id = documents.owned_id_ref(row)?;
+                    let _id = memory.reserve(id.owned_payload_bytes().checked_mul(4).ok_or_else(overflow)?)?;
+                    tx.reserve_bounded_period_write(relation, id.into_owned())
+                };
+                if bounded && restoring.is_none() {
+                    reserve_period(self)?;
+                } else if restoring.is_none() {
+                    schema.require_write_validity(false)?;
+                }
+                let mut types = StructFields::new();
+                for cell in row_cells(row) {
+                    if documents.legacy_owned_cell_is_present(cell)? {
+                        types.insert(cell.field.name().clone(), cell.logical_type()?);
+                    }
+                }
+                schema.validate_types(&types)?;
+                for cell in row_cells(row) {
+                    if types.contains_key(cell.field.name()) { cell.validate_decimal_precision()?; }
+                }
+                if bounded && restoring.is_some() {
+                    reserve_period(self)?;
+                }
+            }
+        }
         let endpoint = |cell: ArrowCell<'_>| -> Result<Option<Timestamp>> {
             if cell.is_null()? { return Ok(None); }
             cell.zoned_micros().map(Some).ok_or_else(|| Anomaly::fault("xtdb/invalid-timestamp-col-type", "Invalid timestamp col type"))
@@ -3815,7 +3857,7 @@ impl<'a> OpenTransaction<'a> {
                             let source_type = documents.column_type(name).expect("documents carry their column types");
                             rtdb_columnar::validate_readable_cell(cell.field, cell.array, source_type, row, &memory)?;
                         }
-                        if declaration.is_some() { types.insert(name.to_owned(), cell.logical_type()?); }
+                        if declaration.is_some() && !legacy_scalar_root { types.insert(name.to_owned(), cell.logical_type()?); }
                         positions.push(position);
                     }
                 }
@@ -3824,7 +3866,7 @@ impl<'a> OpenTransaction<'a> {
                 return Err(Anomaly::incorrect("rtdb.tx/document-presence", "Document presence names an unknown column"));
             }
             if restoring.is_some() && explicit_validity { return Err(replay_period_unavailable()); }
-            if let Some((schema, _)) = &declaration {
+            if !legacy_scalar_root && let Some((schema, _)) = &declaration {
                 if schema.requires_bounded_period() {
                     if explicit_validity {
                         return Err(Anomaly::incorrect(
@@ -3855,8 +3897,12 @@ impl<'a> OpenTransaction<'a> {
             };
             let key = self.admit_owned_put(&table, relation, owner, &id, iid, valid_time, create_only).await?
                 .ok_or_else(|| Anomaly::fault("rtdb.owned/missing-entity-key", "Governed put has no complete key"))?;
-            let content = projection.select(array, positions, row, filled)?;
-            let header = EventHeader { position: None, commit_position: 0, iid, system_from: base_time, valid_time, op: EventOp::Put };
+            let (content, system_from) = if legacy_scalar_root {
+                (project_legacy_scalar_row(array, &positions, row)?, self.tx_key().system_time)
+            } else {
+                (projection.select(array, positions, row, filled)?, base_time)
+            };
+            let header = EventHeader { position: None, commit_position: 0, iid, system_from, valid_time, op: EventOp::Put };
             let fixed_before = self.fixed_range_before(owner, relation, &id, valid_time).await;
             let fixed = self.fixed_range_pair(&id, fixed_before, |column| {
                 let content = content.as_any().downcast_ref::<arrow_array::StructArray>()
@@ -4375,6 +4421,29 @@ fn replay_period(from: Option<Timestamp>, to: Option<Timestamp>) -> Result<Inter
 
 fn replay_period_unavailable() -> Anomaly {
     Anomaly::incorrect("rtdb.owned/restore-validity", "Native replay requires explicit original intervals and an exact declared effect")
+}
+
+fn project_legacy_scalar_row(array: &arrow_array::StructArray, positions: &[usize], row: usize) -> Result<ArrayRef> {
+    let mut fields = Vec::with_capacity(positions.len());
+    let mut columns = Vec::with_capacity(positions.len());
+    for &position in positions {
+        let cell = ArrowCell { field: &array.fields()[position], array: array.column(position).as_ref(), row }.physical()?;
+        let ty = cell.logical_type()?;
+        let field = rtdb_columnar::to_field(cell.field.name(), &ty)?;
+        let column = if ty == LogicalType::Null {
+            arrow_array::new_null_array(&DataType::Null, 1)
+        } else {
+            let selected = cell.array.slice(cell.row, 1);
+            if selected.nulls().is_none() { selected } else {
+                let data = selected.to_data().into_builder().nulls(None).build()
+                    .map_err(|error| Anomaly::fault("rtdb.tx/document-schema", error.to_string()))?;
+                arrow_array::make_array(data)
+            }
+        };
+        fields.push(Arc::new(field));
+        columns.push(column);
+    }
+    rtdb_columnar::build_struct_array(fields.into(), &columns, 1, None)
 }
 
 #[derive(Default)]
@@ -5126,6 +5195,87 @@ mod tests {
         assert_eq!(written.value(0).as_ptr(), pointer);
         assert_eq!(written.value(0), b"accepted");
         assert_eq!(source.value(0), b"original");
+    }
+
+    #[tokio::test]
+    async fn declared_legacy_scalar_root_replay_preserves_presence_time_and_decimal_validation() -> Result<()> {
+        let memory = MemoryBudget::new(1 << 24);
+        let context = ResolveContext {
+            footprint_grants: Default::default(), decision_clock: None,
+            write_event_origins: false, placed_receipt_retirement: false, owned_witness_scope: None,
+            world_constraints: None, database: "application".into(),
+            storage: Arc::new(BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
+            memory: Arc::clone(&memory), query_options: QueryOptions::default(), scan_accelerators: Default::default(),
+            cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(NoRoleChecks),
+            execution_observer: None, tracer: None,
+        };
+        let partition = rtdb_index::PartitionState::empty(Default::default())?;
+        let relation = OwnedRelation::new("scalar_facts")?;
+        let schema = rtdb_types::OwnedSchema::from_json(br#"{
+            "fields":[{"name":"v","type":{"kind":"decimal","precision":4,"scale":2,"bitWidth":128},"optional":true,"nullable":true}],
+            "validity":"acceptance"
+        }"#)?;
+        let options = SubmitOptions { user: Some("owner".into()), ..Default::default() };
+        let mut declare = OpenTransaction::new(partition.snapshot(), TransactionKey { tx_id: TxId(1), system_time: Timestamp(1) }, &options, &context)?;
+        declare.declare_owned_relation(&relation, &schema).await?;
+        let snapshot = declare.snapshot()?;
+        let key = TransactionKey { tx_id: TxId(2), system_time: Timestamp(10) };
+        let hosted = serde_json::json!({
+            "binding": [1u8; 32], "archive": [2u8; 32], "through": 4000,
+            "original_authority": [4u8; 16], "captured": {"tx_id": 3, "system_time": 4},
+            "handoff": null, "previous": null, "source": {"tx_id": 3, "system_time": 4},
+            "logical_at": 3000, "fingerprint": [3u8; 32], "commit_positions": [],
+            "assertion_lines": {"lines": [], "by_position": []},
+        }).to_string();
+        let table = relation.table("owner");
+        for restoring in [false, true] {
+            let from = restoring.then_some(Timestamp(3));
+            let to = restoring.then_some(Timestamp::MAX);
+            for coefficient in [-123i128, 10000] {
+                let decimal = Value::Decimal(rtdb_types::DecimalValue::new(coefficient.to_be_bytes().to_vec(), 4, 2, 128)?);
+                let documents = crate::Documents::new(vec![
+                    StructFields::from([("_id".into(), Value::I64(1)), ("v".into(), Value::Null)]),
+                    StructFields::from([("_id".into(), Value::I64(2))]),
+                    StructFields::from([("_id".into(), Value::I64(3)), ("v".into(), decimal)]),
+                ], &memory)?;
+                let source = SourceTransaction::new(vec![TxOp::OwnedInsertDocs {
+                    relation: relation.clone(), documents, valid_from: from, valid_to: to,
+                }], options.clone(), &memory)?;
+                let bytes = source.encode()?;
+                let message = rtdb_format::envelope::SourceMessage::decode(bytes.as_slice())?.unwrap();
+                let replay = SourceTransaction::decode(&message, &memory)?;
+                let [op @ Operation::OwnedArrowIids { documents, iids, .. }] = replay.operations.as_slice() else {
+                    panic!("expected a retained legacy scalar mutation");
+                };
+                let rows = documents.read_legacy_owned_rows(&memory)?;
+                let mut baseline = OpenTransaction::new(snapshot.clone(), key, &options, &context)?;
+                let mut typed = OpenTransaction::new(snapshot.clone(), key, &options, &context)?;
+                if restoring {
+                    for tx in [&mut baseline, &mut typed] {
+                        tx.hosted_replay = Some(crate::hosted_control::HostedReplay::decode_resolved(hosted.as_bytes(), key.system_time)?);
+                        tx.terms_time = Timestamp(3);
+                    }
+                }
+                let expected = baseline.write_owned(&relation, &rows, Some(iids), from, to, true).await;
+                let observed = typed.apply(op).await;
+                if coefficient == 10000 {
+                    let error = expected.unwrap_err();
+                    assert_eq!(error.code, "rtdb/decimal-precision");
+                    assert_eq!(observed.unwrap_err(), error);
+                    assert!(!typed.buffer.stage()?.tables().contains_key(&table));
+                } else {
+                    expected?;
+                    observed?;
+                    let baseline = baseline.buffer.stage()?;
+                    let typed = typed.buffer.stage()?;
+                    let expected = baseline.tables()[&table].batch().unwrap().arrow();
+                    let observed = typed.tables()[&table].batch().unwrap().arrow();
+                    let encode = |batch: &RecordBatch| crate::ipc::encode(batch.schema_ref(), [batch], &memory);
+                    assert_eq!(encode(expected)?.as_slice(), encode(observed)?.as_slice());
+                }
+            }
+        }
+        Ok(())
     }
 
     #[tokio::test]

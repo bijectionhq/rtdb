@@ -593,6 +593,7 @@ variant TxMessage : SourceMessage {
     -- Put and create-only insert replay retain their Arrow document vectors.
     -- Governed Arrow writes fill acceptance-relative binary slots during staging and give the filled buffers to their selected Arrow columns.
     -- For an Arrow document, source encoding and replay derive any required IID from its active typed ID cell.
+    -- A supported ID borrows its selected payload under the source buffer's reservation.
     -- A missing ID reports the original document in its error context.
     -- A static INSERT from compatible positional Arrow batches projects Arrow arguments into source document vectors in upload order, including supported lists and structs.
     -- Static INSERT and PATCH retain projected floating-point Arrow arguments while evaluating scalar operands and valid-time bounds.
@@ -618,6 +619,8 @@ variant TxMessage : SourceMessage {
     -- The legacy source writer derives compatible structured document types from selected Arrow cells and aligns dense union tags to the source schema.
     -- It preserves the canonical union padding beneath null parent cells.
     -- A legacy document page with a stable logical layout can share a source leg with authored Arrow documents.
+    -- Submitted legacy scalar pages with matching concrete column types can share that leg when a column is nullable or a page omits it.
+    -- The combined leg retains the legacy source field order, values and receipt bytes.
     -- An undeclared compatible owned relation stages those floating-point vectors from the decoded Arrow fields.
     -- A legacy owned operation retains its row encoding for source IPC and receipt generation.
     -- Acceptance-relative Root writes retain those columns when their validity offsets are placed at the ordered system time.

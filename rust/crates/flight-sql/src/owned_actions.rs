@@ -2011,7 +2011,11 @@ impl Service {
                 return Ok(None);
             }
         }
-        ArrowDocuments::from_legacy_owned_payload(&selected, self.memory()).map_err(status)
+        if relation.is_root_data() {
+            ArrowDocuments::from_legacy_root_payload(&selected, self.memory()).map_err(status)
+        } else {
+            ArrowDocuments::from_legacy_owned_payload(&selected, self.memory()).map_err(status)
+        }
     }
 
     fn append_owned_arrow_row(

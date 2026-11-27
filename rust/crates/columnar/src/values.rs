@@ -700,6 +700,13 @@ impl<'a> ColumnReader<'a> {
     pub fn read_entity_id<'b>(&self, array: &'b dyn Array, row: usize) -> Result<Option<EntityIdRef<'b>>> {
         read_selected(&self.logical, self.field, array, row, read_id::<false, false>)
     }
+
+    /// Borrows a supported raw ID. Other cells still require the caller's normal validation.
+    pub fn borrow_entity_id<'b>(&self, array: &'b dyn Array, row: usize) -> Option<EntityIdRef<'b>> {
+        read_selected(&self.logical, self.field, array, row, |logical, _, array, row| {
+            Ok(if array.is_null(row) { None } else { borrow_id_scalar(logical, array, row, false, false) })
+        }).ok().flatten()
+    }
 }
 
 /// Borrows an entity ID with the same signed-integer interpretation as an execution value.

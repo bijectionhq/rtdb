@@ -272,7 +272,7 @@ pub(crate) fn owned_payload(batch: &OwnedBatch, memory: &Arc<MemoryBudget>) -> R
     if let Some(documents) = ArrowDocuments::from_owned_payload(batch, memory).map_err(status)? {
         return Ok(Some(documents));
     }
-    ArrowDocuments::from_legacy_owned_payload(batch, memory).map_err(status)
+    ArrowDocuments::from_legacy_root_payload(batch, memory).map_err(status)
 }
 
 #[test]
