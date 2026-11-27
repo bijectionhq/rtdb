@@ -213,7 +213,6 @@ async fn a_fragment_is_served_only_from_its_residence_and_answers_as_of_its_basi
     fragmenter.enabled.store(true, Ordering::Relaxed);
     let _ = answers(&mut session).await;
     let fragment = fragmenter.last.lock().clone().unwrap();
-    let at_basis = node.scan_fragment(&fragment, Duration::ZERO, &CancellationToken::new()).await.unwrap();
     let mut other_store = fragment.clone();
     other_store.residence.as_mut().unwrap().storage = Arc::from("other-store");
     let error = node.scan_fragment(&other_store, Duration::ZERO, &CancellationToken::new()).await.unwrap_err();
@@ -232,6 +231,12 @@ async fn a_fragment_is_served_only_from_its_residence_and_answers_as_of_its_basi
     let error = tokio::time::timeout(Duration::from_secs(10), waiting).await
         .expect("the wait ends when the basis is applied, not at the catch-up deadline").unwrap().unwrap_err();
     assert_eq!(error.code, "rtdb.query/fragment-basis", "the reader reached the basis and then compared its exact transaction key");
+    let error = node.scan_fragment(&fragment, Duration::ZERO, &CancellationToken::new()).await.unwrap_err();
+    assert_eq!(error.code, "rtdb.query/fragment-basis", "the catch-up probe advanced the retained snapshot");
+
+    let _ = answers(&mut session).await;
+    let fragment = fragmenter.last.lock().clone().unwrap();
+    let at_basis = node.scan_fragment(&fragment, Duration::ZERO, &CancellationToken::new()).await.unwrap();
 
     // Every row changes, some are deleted and new ones arrive, after the basis.
     for table in ["orders", "items", "users"] {
