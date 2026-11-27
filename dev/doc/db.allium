@@ -1077,6 +1077,7 @@ config {
 -- A block is filled, cut, produced and adopted, and the leader term that holds the cycle runs it for this term's own blocks and for the one a promotion inherited alike.
 -- A blocking boundary suspends resolution until adoption.
 -- A deferred boundary installs its captured source watermark and immediately permits resolution against the sealed and active generations.
+-- Retained table replay applies serving decisions after a deferred boundary and uses uploaded boundaries to recover Classic serving anchors.
 -- Exactly one sealed checkpoint may be pending, and ordinary admission pauses when the active generation or the remaining memory reaches its checkpoint budget.
 -- The writer builds, uploads and verifies the sealed block on a task owned by its term.
 -- During adoption the writer removes the sealed generation and installs the verified checkpoint catalog in the same partition change.

@@ -1185,6 +1185,13 @@ async fn native_deferred_checkpoint_upload_preserves_live_commits_and_recovery()
     let (fold, _, _) = crate::serving::decode_checkpoint_image(checkpoint, authority.incarnation).unwrap();
     assert_eq!(fold.tx_status(&first.key).unwrap().basis, first_receipt.basis);
     assert!(fold.tx_status(&second.key).is_err());
+    let (second_root, _) = fixture.blocks.load(BlockIndex(1)).await.unwrap();
+    let intake_table = TableRef::new("public", "intake");
+    let mut history = RetainedTableReplay::open_retained_range(&fixture.logs, &second_root, &intake_table).await.unwrap().unwrap();
+    assert_eq!(history.next_block(&running, |_, _| Ok(())).await.unwrap(), Some((BlockIndex(0), 1)));
+    assert_eq!(history.next_block(&running, |_, _| Ok(())).await.unwrap(), Some((BlockIndex(1), 1)));
+    assert!(history.next_block(&running, |_, _| Ok(())).await.unwrap().is_none());
+    drop(history);
     fixture.handle.shutdown();
     writer.await.unwrap().unwrap();
 

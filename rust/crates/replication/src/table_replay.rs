@@ -21,9 +21,15 @@ pub struct RetainedTableReplay<'a> {
     source: SourcePosition,
     latest_tx: Option<TransactionKey>,
     serving: Option<NativeServing>,
-    awaiting_upload: Option<BlockIndex>,
-    last_boundary: Option<ReplicaPosition>,
+    awaiting_upload: Option<AwaitingUpload>,
+    last_uploaded_boundary: Option<ReplicaPosition>,
     finished: bool,
+}
+
+struct AwaitingUpload {
+    block: BlockIndex,
+    boundary: ReplicaPosition,
+    deferred: bool,
 }
 
 pub enum RetainedHistory<'a> {
@@ -39,6 +45,10 @@ impl<'a> RetainedTableReplay<'a> {
         {
             return Ok(None);
         }
+        Self::open_retained_range(logs, target, table).await
+    }
+
+    pub(crate) async fn open_retained_range(logs: &'a PartitionLogs, target: &'a BlockCatalog, table: &'a TableRef) -> Result<Option<Self>> {
         let Some(through) = target.boundary_replica_position().filter(|position| position.0 >= 0 && position.epoch() == logs.replica_epoch) else {
             return Ok(None);
         };
@@ -54,7 +64,7 @@ impl<'a> RetainedTableReplay<'a> {
             latest_tx: None,
             serving,
             awaiting_upload: None,
-            last_boundary: None,
+            last_uploaded_boundary: None,
             finished: false,
         }))
     }
@@ -165,22 +175,25 @@ impl<'a> RetainedTableReplay<'a> {
                     }
                     self.source = source;
                     self.finished = terminal;
-                    self.awaiting_upload = (!terminal).then_some(block);
-                    self.last_boundary = Some(record.metadata.position);
+                    self.awaiting_upload = (!terminal).then_some(AwaitingUpload {
+                        block, boundary: record.metadata.position, deferred: boundary.deferred_checkpoint == Some(true),
+                    });
                     self.block = BlockIndex(block.0.checked_add(1).ok_or_else(|| invalid("The replay block index overflows"))?);
                     return Ok(Some((block, live)));
                 }
                 ReplicaBody::BlockUploaded(upload) => {
-                    if self.awaiting_upload.is_some_and(|block| upload.block_index == Some(block.0))
+                    if self.awaiting_upload.as_ref().is_some_and(|pending| upload.block_index == Some(pending.block.0))
                         && upload.storage_version == Some(self.logs.storage_version.0)
                         && upload.storage_epoch.unwrap_or_default() == self.logs.storage_epoch.0
                     {
-                        self.awaiting_upload = None;
+                        self.last_uploaded_boundary = self.awaiting_upload.take().map(|pending| pending.boundary);
                     }
                 }
                 ReplicaBody::NoOp(message) if message.serving_record.is_some() => {
-                    if let (Some(serving), Some(boundary), Some(latest)) = (&mut self.serving, self.last_boundary, self.latest_tx) {
-                        if self.awaiting_upload.is_some() { return Err(invalid("A serving record preceded the checkpoint upload")); }
+                    if self.awaiting_upload.as_ref().is_some_and(|pending| !pending.deferred) {
+                        return Err(invalid("A serving record preceded the checkpoint upload"));
+                    }
+                    if let (Some(serving), Some(boundary), Some(latest)) = (&mut self.serving, self.last_uploaded_boundary, self.latest_tx) {
                         serving.replay_classic_anchor(message, boundary, latest.system_time)?;
                     }
                     let snapshot = Snapshot::new(Arc::new(TrieCatalog::new(100_000_000)?), Arc::new(TableCatalog::load(None, &Default::default())?),
