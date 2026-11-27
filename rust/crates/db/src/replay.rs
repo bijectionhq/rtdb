@@ -8,7 +8,7 @@ use rtdb_format::journal::{Checkpoint, ObjectId, ObjectKind, Record};
 use rtdb_index::branches::{BranchCut, BranchEffect, BranchIndex};
 use rtdb_store::{ObjectStore, Reachability, VerifiedManifest, read_manifest};
 use rtdb_tx::transact::{Receipt, TransactState, TransactionRecord};
-use rtdb_types::{Anomaly, Result, Timestamp, rtdb_v1::Basis};
+use rtdb_types::{Anomaly, MemoryBudget, MemoryReservation, Result, Timestamp, rtdb_v1::Basis};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -115,35 +115,52 @@ impl ReplayError {
 /// Manifests are immutable and named by their ciphertext digest, so a summary
 /// never goes stale. Reachability reads them instead of the object store.
 ///
-/// The cache holds the manifests the last reachability closure reached, plus
-/// those inserted since it started: each closure drops the rest, so the cache
-/// is bounded by the retained journal suffix rather than by a count.
+/// Each kept summary holds a reservation of its bytes from the memory budget
+/// the database is opened with; a summary the budget has no room for, or any
+/// summary before a budget is set, is not kept and is read again when needed.
+/// Each closure also drops the summaries it no longer reached.
 pub(crate) type ManifestCache = SummaryCache<VerifiedManifest>;
 
 pub(crate) struct SummaryCache<T>(Mutex<Summaries<T>>);
 
 struct Summaries<T> {
-    entries: BTreeMap<ObjectId, (u64, Arc<T>)>,
+    budget: Option<Arc<MemoryBudget>>,
+    entries: BTreeMap<ObjectId, Summary<T>>,
     inserted: u64,
+}
+
+struct Summary<T> {
+    stamp: u64,
+    summary: Arc<T>,
+    _charge: Arc<MemoryReservation>,
 }
 
 impl<T> Default for SummaryCache<T> {
     fn default() -> Self {
-        Self(Mutex::new(Summaries { entries: BTreeMap::new(), inserted: 0 }))
+        Self(Mutex::new(Summaries { budget: None, entries: BTreeMap::new(), inserted: 0 }))
     }
 }
 
 impl<T> SummaryCache<T> {
-    fn get(&self, id: ObjectId) -> Option<Arc<T>> {
-        self.0.lock().expect("manifest cache").entries.get(&id).map(|(_, summary)| Arc::clone(summary))
+    /// Charges every summary kept from now on to `budget`.
+    pub(crate) fn charge_to(&self, budget: Arc<MemoryBudget>) {
+        self.0.lock().expect("manifest cache").budget = Some(budget);
     }
 
-    fn insert_as(&self, id: ObjectId, summary: T) -> Arc<T> {
+    fn get(&self, id: ObjectId) -> Option<Arc<T>> {
+        self.0.lock().expect("manifest cache").entries.get(&id).map(|entry| Arc::clone(&entry.summary))
+    }
+
+    fn insert_as(&self, id: ObjectId, summary: T, bytes: usize) -> Arc<T> {
         let summary = Arc::new(summary);
         let mut cache = self.0.lock().expect("manifest cache");
         cache.inserted += 1;
         let stamp = cache.inserted;
-        cache.entries.insert(id, (stamp, Arc::clone(&summary)));
+        // Release a replaced entry's charge before admitting the new one.
+        cache.entries.remove(&id);
+        if let Some(charge) = cache.budget.as_ref().and_then(|budget| budget.try_reserve(bytes)) {
+            cache.entries.insert(id, Summary { stamp, summary: Arc::clone(&summary), _charge: charge });
+        }
         summary
     }
 
@@ -156,13 +173,18 @@ impl<T> SummaryCache<T> {
     /// summary inserted after it, which a newer closure may need.
     fn retain_reached(&self, mark: u64, reached: &BTreeMap<ObjectId, Arc<T>>) {
         self.0.lock().expect("manifest cache").entries
-            .retain(|id, (stamp, _)| *stamp > mark || reached.contains_key(id));
+            .retain(|id, entry| entry.stamp > mark || reached.contains_key(id));
     }
 }
 
 impl ManifestCache {
     pub(crate) fn insert(&self, manifest: VerifiedManifest) -> Arc<VerifiedManifest> {
-        self.insert_as(manifest.id(), manifest)
+        let contents = manifest.contents();
+        let bytes = std::mem::size_of::<VerifiedManifest>()
+            + std::mem::size_of::<(ObjectId, Summary<VerifiedManifest>)>()
+            + contents.files.capacity() * std::mem::size_of::<ObjectId>()
+            + contents.pins.capacity() * std::mem::size_of::<rtdb_format::journal::Pin>();
+        self.insert_as(manifest.id(), manifest, bytes)
     }
 }
 
@@ -1014,15 +1036,21 @@ mod tests {
         ObjectId { database: Uuid::nil(), kind: ObjectKind::Manifest, epoch: 1, seq, digest: [0; 32] }
     }
 
+    fn charged(limit: usize) -> SummaryCache<u64> {
+        let cache = SummaryCache::<u64>::default();
+        cache.charge_to(MemoryBudget::new(limit));
+        cache
+    }
+
     #[test]
     fn a_closure_drops_the_summaries_it_no_longer_reaches() {
-        let cache = SummaryCache::<u64>::default();
+        let cache = charged(1 << 10);
         for seq in 0..4 {
-            cache.insert_as(id(seq), seq);
+            cache.insert_as(id(seq), seq, 8);
         }
         let mark = cache.mark();
         // Committed while the closure ran, so the closure could not reach it.
-        cache.insert_as(id(9), 9);
+        cache.insert_as(id(9), 9, 8);
         let reached: BTreeMap<_, _> = [2, 3].into_iter().map(|seq| (id(seq), cache.get(id(seq)).unwrap())).collect();
         cache.retain_reached(mark, &reached);
         assert!(cache.get(id(0)).is_none());
@@ -1030,5 +1058,22 @@ mod tests {
         assert_eq!(cache.get(id(2)).as_deref(), Some(&2));
         assert_eq!(cache.get(id(3)).as_deref(), Some(&3));
         assert_eq!(cache.get(id(9)).as_deref(), Some(&9));
+    }
+
+    #[test]
+    fn summaries_are_kept_only_within_the_memory_budget() {
+        let budget = MemoryBudget::new(16);
+        let cache = SummaryCache::<u64>::default();
+        assert_eq!(*cache.insert_as(id(0), 0, 8), 0);
+        assert!(cache.get(id(0)).is_none(), "nothing is kept before a budget is set");
+        cache.charge_to(Arc::clone(&budget));
+        cache.insert_as(id(1), 1, 8);
+        cache.insert_as(id(2), 2, 8);
+        assert_eq!(*cache.insert_as(id(3), 3, 8), 3);
+        assert!(cache.get(id(3)).is_none(), "the budget has no room for a third summary");
+        assert_eq!(budget.used_bytes(), 16);
+        let mark = cache.mark();
+        cache.retain_reached(mark, &BTreeMap::new());
+        assert_eq!(budget.used_bytes(), 0);
     }
 }

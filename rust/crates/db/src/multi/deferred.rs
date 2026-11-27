@@ -107,6 +107,13 @@ impl CheckpointBuilder {
 }
 
 impl MultiDatabase {
+    /// Charges the manifest summaries reachability keeps to `memory`. Without
+    /// a budget, reachability reads every manifest from the store.
+    pub fn with_manifest_budget(self, memory: Arc<rtdb_types::MemoryBudget>) -> Self {
+        self.stream.manifests.charge_to(memory);
+        self
+    }
+
     /// Captures a deferred checkpoint of the current head once the retained
     /// suffix reaches `limit`. Cheap: one journal head read, a clone of the
     /// persistent transaction state and the closure inputs, and a manifest

@@ -387,6 +387,7 @@ impl MultiServing {
     }
 
     pub fn new(database: MultiDatabase, memory: Arc<MemoryBudget>) -> Self {
+        let database = database.with_manifest_budget(Arc::clone(&memory));
         let incarnation = database.incarnation();
         let tokens = database.token_authority();
         let mut features = database.write_features().to_vec();

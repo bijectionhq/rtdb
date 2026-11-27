@@ -162,6 +162,7 @@ impl Cluster {
         )
         .unwrap()
         .with_binary_checkpoints(true)
+        .with_manifest_budget(rtdb_types::MemoryBudget::new(16 << 20))
     }
 }
 
