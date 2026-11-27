@@ -838,7 +838,9 @@ async fn classic_xt_txs_wildcard_exclude_keeps_native_columns_selectable() {
     let empty = first.query(&portable_sql).await;
     assert_eq!(tags(&empty), b"TCZ");
     assert_eq!(column_names(&empty[0].1), classic);
+    assert_eq!(tags(&first.query("BEGIN READ WRITE WITH (SYSTEM_TIME TIMESTAMP '1970-01-01T00:00:01Z')").await), b"CZ");
     assert_eq!(tags(&first.query("INSERT INTO docs (_id) VALUES (1)").await), b"CZ");
+    assert_eq!(tags(&first.query("COMMIT").await), b"CZ");
 
     let baseline = first.query(&format!("SELECT {} {from}", native.join(", "))).await;
     assert_eq!(tags(&baseline), b"TDCZ");
@@ -851,7 +853,7 @@ async fn classic_xt_txs_wildcard_exclude_keeps_native_columns_selectable() {
 
     for (name, sql, expected_names) in [
         ("classic", portable_sql, classic.as_slice()),
-        ("native", format!("SELECT * {from}"), native.as_slice()),
+        ("native", "SELECT * FROM xt.txs".to_owned(), native.as_slice()),
         ("classic_qualified", format!("SELECT tx.* {excluded} {from}"), classic.as_slice()),
         ("native_qualified", format!("SELECT tx.* {from}"), native.as_slice()),
         ("classic_explicit", format!("SELECT {} {from}", classic.join(", ")), classic.as_slice()),
