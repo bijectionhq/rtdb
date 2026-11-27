@@ -4329,11 +4329,16 @@ impl NativeSession {
             floor.require_transactions(&context, present, None).await?;
         }
         let lease = context.catalog.read_lease();
-        let witness_scope = attached_scope.filter(|_| applied_scope.is_none() && lease.as_ref().and_then(|lease| lease.deadline()).is_some());
+        // Superseded files are retained for the garbage window alone, as in XTDB, so a witness is bounded by this read's
+        // own expiry and by a provider's lease where the store has one; an expired provider lease issues no witness.
         let clock = Arc::clone(&node.factory.clock);
         let now = clock.monotonic_micros();
         let deadline = now.saturating_add(60_000_000);
-        let lease_deadline = lease.as_ref().map_or(deadline, |lease| lease.deadline().unwrap_or(now).min(deadline));
+        let lease_remaining = lease.as_ref().map(|lease| lease.local_cutoff().map_or(0, |cutoff| {
+            i64::try_from(cutoff.saturating_duration_since(std::time::Instant::now()).as_micros()).unwrap_or(i64::MAX)
+        }));
+        let witness_scope = attached_scope.filter(|_| applied_scope.is_none() && lease_remaining.is_none_or(|remaining| remaining > 0));
+        let lease_deadline = lease_remaining.map_or(deadline, |remaining| now.saturating_add(remaining).min(deadline));
         let witness_until = if witness_scope.is_some() {
             Timestamp(observed.0.saturating_add(lease_deadline.saturating_sub(now)))
         } else {
