@@ -8,8 +8,8 @@ mod store;
 pub use journal::{JournalDigest, inspect_retained, inspect_retained_with_prefix};
 use crate::local::LocalListener;
 
-use crate::protocol::{AUTHORITY_FRAME_BYTES, FrameParts, MAXIMUM_FRAME_BYTES, WIRE_BATCH_FRAMES, JournalIdentity, Request, RequestBody, Response, ResponseBody, encode_frame, read_bounded_frame, read_sized_frame};
-use bytes::{Bytes, BytesMut};
+use crate::protocol::{FrameParts, MAXIMUM_FRAME_BYTES, WIRE_BATCH_FRAMES, JournalIdentity, Request, RequestBody, Response, ResponseBody, read_sized_frame};
+use bytes::Bytes;
 use journal::{Journal, MemberIdentity};
 use rtdb_types::{Anomaly, AnomalyCategory, MemoryBudget, MemoryReservation, Result};
 use std::path::PathBuf;
@@ -80,22 +80,6 @@ impl Default for ConnectionLimits {
     }
 }
 
-/// A finite read-only listener for the installed deployment's replica authority.
-pub struct AuthorityListener {
-    pub socket: TcpListener,
-    pub source: uuid::Uuid,
-    pub connections: usize,
-}
-
-impl AuthorityListener {
-    fn admits(&self, stream: &str) -> bool {
-        let Some((source, rest)) = stream.split_once('/') else { return false; };
-        let Some((incarnation, kind)) = rest.split_once('/') else { return false; };
-        uuid::Uuid::parse_str(source).ok() == Some(self.source)
-            && !incarnation.is_empty() && kind == "replica"
-    }
-}
-
 /// A recovered journal holding the exclusive data-directory lock.
 pub struct PreparedJournal {
     journal: Journal,
@@ -134,18 +118,11 @@ impl PreparedJournal {
     }
 
     pub async fn serve(self, listener: TcpListener, cancellation: CancellationToken) -> Result<()> {
-        self.serve_with_authority(listener, None, cancellation).await
-    }
-
-    pub async fn serve_with_authority(self, listener: TcpListener, authority: Option<AuthorityListener>, cancellation: CancellationToken) -> Result<()> {
-        if authority.as_ref().is_some_and(|config| config.source.is_nil() || !(1..=Semaphore::MAX_PERMITS).contains(&config.connections)) {
-            return Err(Anomaly::incorrect("rtdb.logkeeper/authority-listener", "The authority listener requires an exact source and a finite connection count"));
-        }
-        serve_prepared(Listener::Tcp(listener), authority, self, cancellation).await
+        serve_prepared(Listener::Tcp(listener), self, cancellation).await
     }
 
     pub async fn serve_local(self, listener: LocalListener, cancellation: CancellationToken) -> Result<()> {
-        serve_prepared(Listener::Local(listener), None, self, cancellation).await
+        serve_prepared(Listener::Local(listener), self, cancellation).await
     }
 }
 
@@ -175,7 +152,7 @@ impl Listener {
 }
 
 async fn serve_prepared(
-    mut listener: Listener, authority: Option<AuthorityListener>, opened: PreparedJournal, cancellation: CancellationToken,
+    mut listener: Listener, opened: PreparedJournal, cancellation: CancellationToken,
 ) -> Result<()> {
     let PreparedJournal { journal, recovered, identity, connections: limits } = opened;
     let limits = Arc::new(limits);
@@ -187,33 +164,10 @@ async fn serve_prepared(
     let mut journal_task = tokio::spawn(journal::run(journal, Arc::downgrade(&store), work));
     let connections = TaskTracker::new();
     let stopping = cancellation.child_token();
-    let authority = authority.map(Arc::new);
-    let authority_permits = authority.as_ref().map(|listener| Arc::new(Semaphore::new(listener.connections)));
-    let accepting_authority = || async {
-        match &authority {
-            Some(listener) => listener.socket.accept().await,
-            None => std::future::pending().await,
-        }
-    };
     let result = loop {
         tokio::select! {
             _ = cancellation.cancelled() => break Ok(()),
             result = &mut journal_task => break result.map_err(|error| Anomaly::fault("rtdb.logkeeper/journal-task", error.to_string())).and_then(|result| result.and(Err(Anomaly::fault("rtdb.logkeeper/journal-stopped", "the journal stopped")))),
-            accepted = accepting_authority() => match accepted {
-                Ok((socket, _)) => {
-                    let listener = authority.as_ref().expect("authority listener accepted");
-                    let permits = authority_permits.as_ref().expect("authority connection limit");
-                    if let Ok(permit) = Arc::clone(permits).try_acquire_owned() {
-                        let (store, identity, listener, stopping) =
-                            (Arc::clone(&store), Arc::clone(&identity), Arc::clone(listener), stopping.clone());
-                        connections.spawn(async move {
-                            let _permit = permit;
-                            let _ = stopping.run_until_cancelled(authority_connection(socket, store, identity, listener)).await;
-                        });
-                    }
-                }
-                Err(error) => break Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.logkeeper/authority-accept", error.to_string())),
-            },
             accepted = listener.accept() => match accepted {
                 Ok(Socket::Tcp(socket)) => {
                     let _ = socket.set_nodelay(true);
@@ -235,28 +189,6 @@ async fn serve_prepared(
     drop(store);
     if result.is_err() { return result; }
     journal_task.await.map_err(|error| Anomaly::fault("rtdb.logkeeper/journal-task", error.to_string()))?
-}
-
-async fn authority_connection(
-    mut socket: TcpStream, store: Arc<Store>, identity: Arc<str>, listener: Arc<AuthorityListener>,
-) -> std::io::Result<()> {
-    socket.set_nodelay(true)?;
-    let mut buffer = BytesMut::new();
-    loop {
-        let Ok(incoming) = tokio::time::timeout(
-            Duration::from_secs(180), read_bounded_frame::<Request>(&mut socket, AUTHORITY_FRAME_BYTES),
-        ).await else { return Ok(()); };
-        let Some((request, _)) = incoming? else { return Ok(()); };
-        let Some(RequestBody::ConfirmAuthority(check)) = request.body else { return Ok(()); };
-        if request.target_journal != *identity || !listener.admits(&check.stream) {
-            return Ok(());
-        }
-        let reply = Response { id: request.id, body: Some(store.confirm_authority(check)) };
-        encode_frame(&reply, &mut buffer);
-        let Ok(sent) = tokio::time::timeout(Duration::from_secs(2), socket.write_all(&buffer)).await else { return Ok(()); };
-        sent?;
-        buffer.clear();
-    }
 }
 
 /// A reply's room in its connection's outbox and its charge to the server's reply memory, both released once it is written.
@@ -374,9 +306,6 @@ async fn connection(
                     }
                 }
             }
-            Some(RequestBody::ConfirmAuthority(_)) => {
-                replies.send(reply(failed("writer authority requires its dedicated listener"))).await;
-            }
             Some(RequestBody::Check(check)) => { replies.send(reply(store.check(&check.stream, check.epoch))).await; }
             Some(RequestBody::Retire(retire)) => {
                 let Some(admitted) = admit(&requests, &cancellation).await else { break };
@@ -460,7 +389,8 @@ async fn write_replies(mut writer: impl AsyncWrite + Unpin, mut outbox: mpsc::Un
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{Seal, read_frame};
+    use crate::protocol::{Seal, encode_frame, read_frame};
+    use bytes::BytesMut;
 
     #[tokio::test]
     async fn a_request_addressed_to_another_journal_cannot_seal_this_one() {

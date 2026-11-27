@@ -3,7 +3,7 @@ use std::{collections::{BTreeMap, BTreeSet}, ops::Range, sync::Arc};
 use futures::{FutureExt, TryStreamExt};
 use rtdb_format::entity_history::{self, HistoryRoot};
 use rtdb_index::{CatalogTrie, TrieState};
-use rtdb_storage::{ObjectKey, audience_work, cache::{BufferPool, CacheLease}};
+use rtdb_storage::{ObjectKey, cache::{BufferPool, CacheLease}};
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, EventHeader, EventOp, Iid, MemoryBudget, Result};
 
 use crate::{LocatedHistoryEvent, ResolvedSearchRow, ScanRequest, SearchRowLocation, resolve_located_point};
@@ -117,7 +117,6 @@ async fn read_history(request: &ScanRequest<'_>, keys: &BTreeSet<Iid>) -> Result
             if request.cancellation.is_cancelled() { return Err(cancelled()); }
             for located in segment.iid_sources(iid, request.memory)? {
                 let (header, source) = located?;
-                audience_work::scan_items(1)?;
                 count = count.saturating_add(1);
                 let batch = source.batch.view();
                 let key = batch.entity_key(source.row)?;
@@ -178,7 +177,6 @@ pub(crate) async fn visit_trie_events(request: &ScanRequest<'_>, slug: &rtdb_for
         if request.cancellation.is_cancelled() { return Err(cancelled()); }
         inspected = inspected.saturating_add(range.rows as usize);
         if inspected > max_rows { return Ok(None); }
-        audience_work::scan_items(range.rows as usize)?;
         let bytes = file.read(range.range()).await?;
         let _decoded = request.memory.reserve(bytes.as_slice().len().saturating_mul(4).saturating_add(4096))?;
         let page = range.read(arrow_buffer::Buffer::from(bytes::Bytes::from_owner(bytes)))?;

@@ -70,7 +70,6 @@ impl Service {
             && principal.user_id().is_some()
             && principal.label_scope().is_none()
             && principal.workload_grant().is_none()
-            && call.session.audience_source().is_none()
             && !call.session.fresh_replica
     }
 
@@ -86,7 +85,6 @@ impl Service {
             if name != CREATE
                 || !catalog.is_managed()
                 || !call.session.caller.verified_credential
-                || call.session.audience_source().is_some()
                 || call.session.fresh_replica
             {
                 return Err(Status::permission_denied("The session cannot create a managed deployment"));

@@ -332,7 +332,6 @@ impl LivePostingPage {
         lists.sort_by_key(|rows| rows.len());
         let Some((shortest, rest)) = lists.split_first() else { return Ok(true); };
         for &row in *shortest {
-            rtdb_storage::audience_work::scan_items(1)?;
             if !rest.iter().all(|other| other.binary_search(&row).is_ok()) { continue; }
             if phrases && !query.matches_arrow(&self.tokens(row)) { continue; }
             if !visit(row, LiveMatch::Posting(self, row))? { return Ok(false); }
@@ -699,7 +698,6 @@ impl SearchRuntime {
         if segment.row_count().saturating_sub(covered) > 2048 { return Ok(false); }
         let mut bytes = 0usize;
         visit_live_rows(segment, covered, segment.row_count(), column, |_, column, offset| {
-            rtdb_storage::audience_work::scan_items(1)?;
             if let (_, PutText::Utf8(text)) = column.read(offset)? {
                 bytes = bytes.saturating_add(text.len());
             }
@@ -1111,9 +1109,7 @@ impl SearchRuntime {
         if query.terms().is_empty() { return Ok(true); }
         visit_live_rows(segment, covered, segment.row_count(), column, |row, column, offset| {
             if row % 128 == 0 && cancellation.is_cancelled() { return Err(crate::accelerate::search_cancelled()); }
-            rtdb_storage::audience_work::scan_items(1)?;
             let (_, PutText::Utf8(text)) = column.read(offset)? else { return Ok(true); };
-            rtdb_storage::audience_work::decode_bytes(text.len().saturating_mul(32))?;
             if query.text_terms(text, phrases).2 { visit(row, LiveMatch::Text(text)) } else { Ok(true) }
         })
     }

@@ -465,7 +465,7 @@ impl Service {
         }
         if request.observe_applied_position && (
             !call.session.caller.verified_credential || visibility.is_some()
-                || call.session.audience_source().is_some() || call.session.fresh_replica
+                || call.session.fresh_replica
                 || driver.is_none_or(|driver| !driver.supports_query_tokens())
                 || !database.wire_tokens_supported()
         ) {

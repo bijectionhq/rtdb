@@ -201,7 +201,6 @@ pub fn resolve_located_point<W: Copy>(mut history: BTreeMap<Iid, Vec<LocatedHist
         }) { return Ok(None); }
         let first = visible.len();
         for event in events {
-            rtdb_storage::audience_work::scan_items(1)?;
             resolver.resolve_fragments(&event.header, |valid_time, system_time| {
                 visible.push((ResolvedSearchRow { version: event.header.version(), origin: event.origin, location: event.location.clone(),
                     visibility: TemporalBounds { valid_time, system_time } }, event.witness));

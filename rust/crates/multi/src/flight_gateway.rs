@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, convert::Infallible, io, net::IpAddr, num::NonZeroU16, pin::Pin, sync::Arc, task::{Context, Poll}, time::Duration};
+use std::{collections::BTreeMap, convert::Infallible, io, net::IpAddr, pin::Pin, sync::Arc, task::{Context, Poll}, time::Duration};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::{Bytes, BytesMut};
@@ -9,8 +9,7 @@ use hyper_util::{client::legacy::{Client, connect::HttpConnector}, rt::{TokioExe
 use prost::Message;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_directory::{DeploymentRecord, Directory, Lifecycle, MemberId, MemberRecord, now_ms};
-use rtdb_flight_sql::{FlightEgress, FlightEgressIo, GATEWAY_ANSWER_DEADLINE_HEADER, AUDIENCE_FLIGHT_HEADER, AUDIENCE_SEAT_HEADER, FORWARDED_PEER_HEADER, AudienceFlightConfig, AudienceSeat};
-use rtdb_flight_sql::{AUDIENCE_GATEWAY_TRANSPORT_BYTES, AUDIENCE_H2_CONNECTION_WINDOW, AUDIENCE_H2_STREAM_WINDOW, AUDIENCE_H2_STREAMS};
+use rtdb_flight_sql::{FlightEgress, FlightEgressIo, GATEWAY_ANSWER_DEADLINE_HEADER, FORWARDED_PEER_HEADER};
 use rtdb_storage::sealing::DeliveryDeadline;
 use rtdb_types::{Anomaly, Result};
 use serde::{Deserialize, Serialize};
@@ -57,13 +56,6 @@ struct FreshReplica {
 struct SessionRoute {
     target: Target,
     session: Uuid,
-    audience: Option<String>,
-}
-
-#[derive(Clone, Copy)]
-struct AudienceRoute {
-    profile: AudienceFlightConfig,
-    holder_port: NonZeroU16,
 }
 
 struct Router {
@@ -73,9 +65,7 @@ struct Router {
     routes: Cipher,
     transport: Client<HttpConnector, RequestBody>,
     calls: Arc<Semaphore>,
-    transport_bytes: Option<Arc<MemoryBudget>>,
-    deployments: Option<Arc<DeploymentConnections>>,
-    audience: Option<AudienceRoute>,
+    deployments: Arc<DeploymentConnections>,
     options: GatewayOptions,
     timeout: Duration,
     retained_key: Option<[u8; 32]>,
@@ -84,23 +74,9 @@ struct Router {
 
 struct RoutedBody {
     body: Incoming,
-    admission: Arc<GatewayCall>,
-    _deployment: Option<DeploymentConnection>,
-    deadline: Option<DeliveryDeadline>,
-}
-
-struct GatewayCall {
     _call: OwnedSemaphorePermit,
-    transport: Option<Arc<MemoryReservation>>,
-}
-
-struct RoutedData {
-    data: Bytes,
-    _admission: Arc<GatewayCall>,
-}
-
-impl AsRef<[u8]> for RoutedData {
-    fn as_ref(&self) -> &[u8] { &self.data }
+    _deployment: DeploymentConnection,
+    deadline: Option<DeliveryDeadline>,
 }
 
 impl Body for RoutedBody {
@@ -110,14 +86,7 @@ impl Body for RoutedBody {
         if self.deadline.is_some_and(|deadline| !deadline.is_live()) {
             return Poll::Ready(Some(Err(io::Error::new(io::ErrorKind::TimedOut, "The routed Flight answer expired"))));
         }
-        Pin::new(&mut self.body).poll_frame(cx).map(|frame| frame.map(|result| {
-            result.map_err(io::Error::other).map(|frame| {
-                if self.admission.transport.is_none() { return frame; }
-                frame.map_data(|data| Bytes::from_owner(RoutedData {
-                    data, _admission: Arc::clone(&self.admission),
-                }))
-            })
-        }))
+        Pin::new(&mut self.body).poll_frame(cx).map(|frame| frame.map(|result| result.map_err(io::Error::other)))
     }
     fn is_end_stream(&self) -> bool { self.body.is_end_stream() }
     fn size_hint(&self) -> SizeHint { self.body.size_hint() }
@@ -136,20 +105,6 @@ impl AsRef<[u8]> for InspectedAction {
 }
 
 pub async fn serve(listener: TcpListener, directory: Arc<dyn Directory>, options: GatewayOptions, cancellation: CancellationToken) -> Result<()> {
-    serve_listener(listener, directory, options, None, cancellation).await
-}
-
-pub async fn serve_audience(
-    listener: TcpListener, directory: Arc<dyn Directory>, options: GatewayOptions,
-    audience: AudienceFlightConfig, holder_port: NonZeroU16, cancellation: CancellationToken,
-) -> Result<()> {
-    serve_listener(listener, directory, options, Some(AudienceRoute { profile: audience, holder_port }), cancellation).await
-}
-
-async fn serve_listener(
-    listener: TcpListener, directory: Arc<dyn Directory>, options: GatewayOptions,
-    audience: Option<AudienceRoute>, cancellation: CancellationToken,
-) -> Result<()> {
     let secret = options.capabilities.as_ref().ok_or_else(|| Anomaly::incorrect("rtdb.multi/flight-secret", "Flight SQL routing requires the cell secret"))?;
     let address = listener.local_addr().map_err(network)?;
     let tls = options.tls.as_ref().map(|config| {
@@ -167,26 +122,16 @@ async fn serve_listener(
     let mut connector = HttpConnector::new();
     connector.set_connect_timeout(Some(options.control_timeout));
     connector.set_nodelay(true);
-    let limit = audience.map_or(options.maximum_connections, |audience| audience.profile.permits());
+    let limit = options.maximum_connections;
     let mut client = Client::builder(TokioExecutor::new());
     client.http2_only(true).retry_canceled_requests(false).pool_timer(TokioTimer::new())
         .pool_max_idle_per_host(1).pool_idle_timeout(Duration::from_secs(30));
-    let transport_bytes = audience.map(|_| {
-        client.pool_max_idle_per_host(0)
-            .http2_max_header_list_size(MAXIMUM_HEADER_BYTES)
-            .http2_initial_stream_window_size(AUDIENCE_H2_STREAM_WINDOW)
-            .http2_initial_connection_window_size(AUDIENCE_H2_CONNECTION_WINDOW)
-            .http2_max_send_buf_size(AUDIENCE_H2_STREAM_WINDOW as usize);
-        MemoryBudget::new(2 * limit * AUDIENCE_GATEWAY_TRANSPORT_BYTES)
-    });
     let transport = client.build(connector);
-    let retained_key = if audience.is_none() {
-        options.classic_retained_flight_key.as_deref().map(classic_flight::read_retained_key).transpose()?
-    } else { None };
+    let retained_key = options.classic_retained_flight_key.as_deref().map(classic_flight::read_retained_key).transpose()?;
     let router = Arc::new(Router { directory, control: control::ControlKey(Some(Arc::clone(secret))),
-        secret: Arc::clone(secret), routes: secret.flight_session_cipher()?, transport, audience, transport_bytes,
+        secret: Arc::clone(secret), routes: secret.flight_session_cipher()?, transport,
         calls: Arc::new(Semaphore::new(limit)),
-        deployments: audience.is_none().then(|| Arc::new(DeploymentConnections::new(options.maximum_connections_per_deployment))),
+        deployments: Arc::new(DeploymentConnections::new(options.maximum_connections_per_deployment)),
         timeout: options.startup_timeout, options, retained_key, inspected_actions: MemoryBudget::new(8 * MAXIMUM_ACTION_FRAME_BYTES) });
     let connections = Arc::new(Semaphore::new(limit));
     loop {
@@ -195,12 +140,9 @@ async fn serve_listener(
             result = listener.accept() => result.map_err(network)?,
         };
         let Ok(connection) = Arc::clone(&connections).try_acquire_owned() else { continue };
-        let Ok(codec) = router.transport_bytes.as_ref().map(|bytes| bytes.reserve(AUDIENCE_GATEWAY_TRANSPORT_BYTES)).transpose()
-            else { continue };
         let (tls, router, cancellation) = (tls.clone(), Arc::clone(&router), cancellation.clone());
         tokio::spawn(async move {
             let _connection = connection;
-            let _codec = codec;
             let egress = Arc::new(FlightEgress::default());
             let stream = FlightEgressIo::new(stream, egress.clone());
             let io = async {
@@ -219,7 +161,6 @@ async fn serve_listener(
 }
 
 async fn serving(stream: impl AsyncRead + AsyncWrite + Send + Unpin + 'static, remote: IpAddr, router: Arc<Router>, egress: Arc<FlightEgress>) {
-    let audience = router.audience.is_some();
     let service = service_fn(move |request| {
         let router = Arc::clone(&router);
         let egress = Arc::clone(&egress);
@@ -232,15 +173,7 @@ async fn serving(stream: impl AsyncRead + AsyncWrite + Send + Unpin + 'static, r
         }
     });
     let mut http = http2::Builder::new(TokioExecutor::new());
-    http.max_header_list_size(MAXIMUM_HEADER_BYTES);
-    if audience {
-        http.max_concurrent_streams(AUDIENCE_H2_STREAMS)
-            .initial_stream_window_size(AUDIENCE_H2_STREAM_WINDOW)
-            .initial_connection_window_size(AUDIENCE_H2_CONNECTION_WINDOW)
-            .max_send_buf_size(AUDIENCE_H2_STREAM_WINDOW as usize);
-    } else {
-        http.max_concurrent_streams(256);
-    }
+    http.max_header_list_size(MAXIMUM_HEADER_BYTES).max_concurrent_streams(256);
     let _ = http.serve_connection(TokioIo::new(stream), service).await;
 }
 
@@ -263,10 +196,6 @@ impl Router {
 
     async fn first_target(&self, selector: &str, fresh: bool) -> std::result::Result<(Target, Option<DeploymentRecord>), Status> {
         let (name, installation) = database_selector(selector).map_err(|_| Status::invalid_argument("Invalid Flight SQL deployment selector"))?;
-        if let Some(audience) = self.audience {
-            if fresh { return Err(Status::permission_denied("The reserved audience has its own admission")); }
-            return self.audience_target(name, installation, audience).await.map(|target| (target, None));
-        }
         if fresh {
             return self.fresh_target(name, installation).await.map(|target| (target, None));
         }
@@ -388,41 +317,6 @@ impl Router {
         }
     }
 
-    async fn audience_target(
-        &self, name: &str, installation: Option<Uuid>, route: AudienceRoute,
-    ) -> std::result::Result<Target, Status> {
-        let source = route.profile.source();
-        if installation.is_some_and(|id| id != source) {
-            return Err(Status::not_found("No matching installed Flight audience"));
-        }
-        if let Some(installed) = self.options.ordered_placement(name).await.map_err(directory_error)? {
-            if installed.deployment != source {
-                return Err(Status::not_found("No matching installed Flight audience"));
-            }
-            let current = installed.journal.route().await.map_err(|_| moved())?;
-            let grant = current.writer.grant.ok_or_else(moved)?;
-            let worker = installed.endpoints.get(&grant.enrollment).ok_or_else(moved)?;
-            return Ok(Target {
-                name: name.to_owned(), deployment: source.to_string(),
-                holder: MemberId(grant.enrollment.worker.to_string()), epoch: grant.epoch,
-                address: audience_holder_address(&worker.pgwire, route.holder_port)?,
-                enrollment: Some(grant.enrollment), replica: None, ordered_reader: None, fresh: false,
-            });
-        }
-        if self.options.installed_cell.is_some() { return Err(moved()); }
-        let (record, member) = self.directory.audience_holder(&source.to_string()).await.map_err(directory_error)?
-            .ok_or_else(moved)?;
-        // This lookup only locates the existing holder. The peer proof names
-        // the epoch and the holder confirms the recovered source and quorum.
-        if record.id != source.to_string() || record.name != name || record.epoch == 0
-            || !record.linearizable_reads || !holder_is_current(&record, &member)
-        {
-            return Err(moved());
-        }
-        let address = audience_holder_address(&member.address, route.holder_port)?;
-        Ok(Target { name: record.name, deployment: record.id, holder: member.id, epoch: record.epoch, address, enrollment: None, replica: None, ordered_reader: None, fresh: false })
-    }
-
     async fn validate(&self, target: &Target) -> std::result::Result<Option<DeploymentRecord>, Status> {
         if let Some(installed) = self.options.ordered_placement(&target.name).await.map_err(directory_error)? {
             let Some(enrollment) = target.enrollment.filter(|id| installed.endpoints.contains_key(id)) else { return Err(moved()); };
@@ -480,45 +374,14 @@ impl Router {
         if route.as_ref().is_some_and(|route| route.target.fresh) && request.uri().path() != DO_ACTION {
             return Err(Status::permission_denied("The fresh Flight route carries owned reads"));
         }
-        let parse_audience = |value: &str| AudienceFlightConfig::parse(value)
-            .map_err(|_| Status::invalid_argument("Invalid Flight audience reservation"));
-        let requested_audience = single_header(request.headers(), AUDIENCE_FLIGHT_HEADER)?
-            .map(parse_audience).transpose()?;
-        let routed_audience = route.as_ref().and_then(|route| route.audience.as_deref())
-            .map(parse_audience).transpose()?;
-        let audience = match (route.as_ref(), requested_audience) {
-            (None, Some(source)) if request.uri().path() == HANDSHAKE => Some(source),
-            (None, None) => None,
-            (Some(_), None) => routed_audience,
-            _ => return Err(Status::permission_denied("The Flight audience is fixed at its handshake")),
-        };
-        if audience != self.audience.map(|route| route.profile) {
-            return Err(Status::permission_denied("The Flight route belongs to another listener"));
-        }
-        let requested_seat = single_header(request.headers(), AUDIENCE_SEAT_HEADER)?;
-        let seat = match (requested_audience, requested_seat) {
-            (Some(profile), Some(value)) => Some(profile.parse_seat(value)
-                .map_err(|_| Status::invalid_argument("Invalid Flight audience reader seat"))?),
-            (Some(_), None) | (None, Some(_)) => {
-                return Err(Status::permission_denied("The reader seat belongs to the audience handshake"));
-            }
-            (None, None) => None,
-        };
-        if routed_audience.is_some() && request.uri().path() != DO_ACTION {
-            return Err(Status::permission_denied("The Flight audience only routes observation actions"));
-        }
         let call = Arc::clone(&self.calls).try_acquire_owned().map_err(|_| Status::resource_exhausted("Flight SQL gateway call limit reached"))?;
-        let transport = self.transport_bytes.as_ref().map(|bytes| bytes.reserve(AUDIENCE_GATEWAY_TRANSPORT_BYTES))
-            .transpose().map_err(|_| Status::resource_exhausted("Flight SQL gateway transport capacity exhausted"))?;
-        let admission = Arc::new(GatewayCall { _call: call, transport });
         let name = match (&route, selector) {
             (None, None) => return Err(Status::invalid_argument("Flight SQL startup requires x-xtdb-database")),
             (None, Some(selector)) => database_selector(selector).map_err(|_| Status::invalid_argument("Invalid Flight SQL deployment selector"))?.0,
             (Some(route), _) => route.target.name.as_str(),
         };
-        let deployment = self.deployments.as_ref().map(|deployments| {
-            deployments.admit(name).ok_or_else(|| Status::resource_exhausted("This deployment has reached its Flight SQL call limit"))
-        }).transpose()?;
+        let deployment = self.deployments.admit(name)
+            .ok_or_else(|| Status::resource_exhausted("This deployment has reached its Flight SQL call limit"))?;
         let routing = async move {
             match route {
                 Some(route) => {
@@ -528,8 +391,7 @@ impl Router {
                             return Err(Status::permission_denied("This Flight SQL session belongs to another deployment"));
                         }
                     }
-                    // An audience route locates a socket. Serving authority is checked on the holder.
-                    let classic = if self.audience.is_none() { self.validate(&route.target).await? } else { None };
+                    let classic = self.validate(&route.target).await?;
                     Ok((route.target, Some(route.session), classic))
                 }
                 None => self.first_target(selector.expect("a new session has a selector"), fresh).await
@@ -538,26 +400,15 @@ impl Router {
         };
         let (target, session, classic) = tokio::time::timeout(self.timeout, routing).await
             .map_err(|_| Status::deadline_exceeded("Timed out resolving the Flight SQL route"))??;
-        if audience.is_some_and(|profile| Uuid::parse_str(&target.deployment).ok() != Some(profile.source())) {
-            return Err(Status::permission_denied("The Flight route belongs to another audience source"));
-        }
 
         let has_bearer = bearer.is_some();
         let headers = request.headers_mut();
         headers.remove(header::HOST);
         headers.remove(header::COOKIE);
         headers.remove(FORWARDED_PEER_HEADER);
-        headers.remove(AUDIENCE_FLIGHT_HEADER);
         headers.remove(FRESH_HEADER);
-        headers.remove(AUDIENCE_SEAT_HEADER);
         headers.insert(GATEWAY_ANSWER_DEADLINE_HEADER, HeaderValue::from_static("forward"));
-        if let Some(seat) = seat {
-            headers.insert(AUDIENCE_SEAT_HEADER, header_value(&seat.to_string())?);
-        }
         headers.insert(DATABASE_HEADER, header_value(&target.name)?);
-        if let Some(source) = audience {
-            headers.insert(AUDIENCE_FLIGHT_HEADER, header_value(&source.to_string())?);
-        }
         if let Some(session) = session {
             headers.insert(header::COOKIE, header_value(&format!("{COOKIE}={session}"))?);
             if has_bearer { headers.insert(header::AUTHORIZATION, header_value(&format!("Bearer {session}"))?); }
@@ -592,8 +443,8 @@ impl Router {
         if let Some(deadline) = deadline {
             egress.restrict(deadline).map_err(|_| Status::unavailable("The Flight answer cannot reach this socket before expiry"))?;
         }
-        self.rewrite_response(response.headers_mut(), target, audience, seat)?;
-        Ok(response.map(|body| Either::Right(RoutedBody { body, admission, _deployment: deployment, deadline })))
+        self.rewrite_response(response.headers_mut(), target)?;
+        Ok(response.map(|body| Either::Right(RoutedBody { body, _call: call, _deployment: deployment, deadline })))
     }
 
     async fn inspect_classic_action(
@@ -637,7 +488,7 @@ impl Router {
         Ok(Full::new(wire).map_err(|never| -> io::Error { match never {} }).boxed_unsync())
     }
 
-    fn rewrite_response(&self, headers: &mut HeaderMap, target: Target, audience: Option<AudienceFlightConfig>, seat: Option<AudienceSeat>) -> std::result::Result<(), Status> {
+    fn rewrite_response(&self, headers: &mut HeaderMap, target: Target) -> std::result::Result<(), Status> {
         let Some(cookie) = headers.remove(header::SET_COOKIE) else { return Ok(()); };
         let cookie = cookie.to_str().map_err(|_| Status::internal("Invalid private Flight SQL cookie"))?;
         if cookie.contains("Max-Age=0") {
@@ -647,18 +498,10 @@ impl Router {
         }
         let session = cookie.strip_prefix("arrow_flight_session_id=").and_then(|id| Uuid::parse_str(id).ok())
             .ok_or_else(|| Status::internal("Invalid private Flight SQL session"))?;
-        let audience = audience.map(|profile| profile.to_string());
-        if audience.as_deref() != single_header(headers, AUDIENCE_FLIGHT_HEADER)? {
-            return Err(Status::unavailable("The holder did not acknowledge the exact Flight audience"));
-        }
-        let seat = seat.map(|seat| seat.to_string());
-        if seat.as_deref() != single_header(headers, AUDIENCE_SEAT_HEADER)? {
-            return Err(Status::unavailable("The holder did not acknowledge the exact Flight audience seat"));
-        }
         if target.replica.is_some() || target.ordered_reader.is_some() {
             headers.insert(FRESH_HEADER, HeaderValue::from_static("1"));
         }
-        let route = self.encode(&SessionRoute { target, session, audience })?;
+        let route = self.encode(&SessionRoute { target, session })?;
         headers.insert(header::SET_COOKIE, header_value(&format!("{COOKIE}={route}"))?);
         if headers.contains_key(header::AUTHORIZATION) {
             headers.insert(header::AUTHORIZATION, header_value(&format!("Bearer {route}"))?);
@@ -681,12 +524,6 @@ fn flight_cookie(headers: &HeaderMap) -> std::result::Result<Option<&str>, Statu
     let first = named.next();
     if named.next().is_some() { return Err(Status::unauthenticated("Duplicate Flight SQL session cookies")); }
     Ok(first)
-}
-
-fn audience_holder_address(advertised: &str, port: NonZeroU16) -> std::result::Result<String, Status> {
-    let authority = advertised.parse::<http::uri::Authority>().map_err(|_| moved())?;
-    let (host, _) = advertised.rsplit_once(':').filter(|_| authority.port_u16().is_some()).ok_or_else(moved)?;
-    Ok(format!("{host}:{port}"))
 }
 
 fn holder_is_current(record: &DeploymentRecord, member: &MemberRecord) -> bool {

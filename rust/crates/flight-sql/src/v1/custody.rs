@@ -457,7 +457,6 @@ impl Service {
             || caller.principal.user_id() != owner
             || !caller.verified_credential
             || caller.principal.label_scope().is_some()
-            || call.session.audience_source().is_some()
             || call.session.fresh_replica
             || call
                 .session
@@ -717,7 +716,7 @@ impl Service {
         let caller = &call.session.caller;
         if !caller.verified_credential || route.owner().is_none() || caller.principal.user_id() != route.owner()
             || !self.0.node.catalog().is_managed() || self.follower_only()
-            || call.session.audience_source().is_some() || call.session.fresh_replica
+            || call.session.fresh_replica
         {
             return Err(denied());
         }

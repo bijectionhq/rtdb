@@ -980,7 +980,7 @@ impl Service {
             }
             if observe_positions && (
                 !call.session.caller.verified_credential || visibility.is_some()
-                    || call.session.audience_source().is_some() || call.session.fresh_replica
+                    || call.session.fresh_replica
                     || !driver.supports_query_tokens() || !database.wire_tokens_supported()
             ) {
                 return Err(error::unsupported(APPLIED_POSITIONS));

@@ -31,7 +31,7 @@ impl Service {
         let caller = &call.session.caller;
         if !caller.verified_credential || caller.principal.label_scope().is_some()
             || !self.0.node.catalog().is_managed() || self.follower_only()
-            || call.session.audience_source().is_some() || call.session.fresh_replica
+            || call.session.fresh_replica
         {
             return Err(denied());
         }

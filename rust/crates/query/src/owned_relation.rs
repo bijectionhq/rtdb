@@ -250,10 +250,7 @@ pub async fn try_owned_lifetime_range_expiry(
     use rtdb_columnar::{ColumnReader, IidView};
     use std::collections::btree_map::Entry;
 
-    // A failed speculative read consumes part of the audience's work allowance.
-    if !(2..=128).contains(&page.num_rows()) || owner.is_empty() || !relation.is_root_data()
-        || !valid.is_point() || rtdb_storage::audience_work::is_bounded()
-    {
+    if !(2..=128).contains(&page.num_rows()) || owner.is_empty() || !relation.is_root_data() || !valid.is_point() {
         return Ok(None);
     }
     let Some((column, field)) = page.schema_ref().column_with_name("_id") else { return Ok(None); };

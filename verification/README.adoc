@@ -144,16 +144,6 @@ It also exercises the Azure adapter against a loopback provider and separately m
 
 == Evidence boundaries
 
-* link:tla/CrossHolderAudienceSeats.tla[Cross-holder audience seats] checks two holders and two positions of a prepaid turn through placement moves, lost replies and closes, retained I/O, and periodic expiry.
-  On 2026-11-23 TLC 2026.11.19.180144 exhausted 9,522 and 25,252 distinct states in the one- and two-move bounds, rejected nine mutations at their named laws, and reached the concurrent replacement witness.
-  On 2026-11-23 Verus 0.2026.11.20.9da409b verified three shipped decisions in link:verus/audience_cross_holder_claim/area.json[the shared seat claim area] and rejected all six controls at their declared diagnostics.
-  The production correspondence and timing premises are in link:../dev/doc/rtdb-multi-bijection.md[the Bijection integration notes].
-* link:tla/AudienceSeatResourceFence.tla[Audience seat resource fence] models one logical position with a durable generation compared when the resource applies an operation.
-  On 2026-11-24, TLC 2026.11.19.180144 exhausted 1,088 and 13,120 distinct states with one and two replacements, rejected all six mutations at their declared laws, and reached both retained-charge witnesses.
-  Reclaim with exact readback assumes fair fence and readback service.
-  On the same date, Verus 0.2026.11.20.9da409b checked eight items and 16 controls in link:verus/audience_session_seats/area.json[the Flight seat area] and five items and seven controls in link:verus/audience_cross_holder_claim/area.json[the shared claim area].
-  The production checks cover the local handoff decision and exact release condition.
-  See link:../dev/doc/rtdb-multi-bijection.md#resource-enforced-seat-generations[the resource design and correspondence limits].
 * link:verus/journal_custody/README.md[Journal custody] checks the eligibility epoch succession, the journal reference fence and copy release admission behind logkeeper decommission, and models their custody and durability laws in link:lean/JournalCustody.lean[Lean].
   On 2026-11-26, Verus 0.2026.11.02.8bf68ee verified 14 functions and rejected all six controls at their declared functions, and Lean 4.35.0 proved the seven audited theorems with standard axioms and rejected all five model controls.
 * link:verus/shared_plans/README.md[Shared plans] checks the node plan cache's key lookup, catalog replay and bounded admission, and models its reuse, invalidation, exclusion and budget laws in link:lean/SharedPlans.lean[Lean].
@@ -172,12 +162,12 @@ It also exercises the Azure adapter against a loopback provider and separately m
   A failed page open or record retention leaves the selected record eligible for retry, and snapshot references become available for admission only after successful delivery.
   link:multi/lean/CheckpointReplay.lean[Checkpoint replay] relates any finite trace of exact deliveries and retries to the original checkpoint and journal prefix.
   The provider must supply the original certified records, and the partition installer must apply their complete decoded effects.
-* link:verus/framing_decoders/area.json[Framing decoders] imports the Rust functions used for source and replica envelopes, replica retirement attempts, journal framing and Flight audience seats.
+* link:verus/framing_decoders/area.json[Framing decoders] imports the Rust functions used for source and replica envelopes, replica retirement attempts and journal framing.
   On 2026-11-24, Verus 0.2026.11.20.9da409b with Rust 1.100.0 and Z3 4.16.0 checked 56 items, and all 27 mutations failed at their declared laws.
   A journal read requires a complete header and the whole declared body with its matching checksum, and a retained location requires exact consumption.
   Both journal readers preserve the record's certified publication mode, and the composed writer and located reader round-trip it under the Prost contract.
   The protobuf wire scanner validates the suffix after an external reference, enforces the field bounds, and terminates with at most 100 nested groups.
-  Round-trip and canonical-spelling checks cover the applicable source, replica, journal, retirement and Flight decisions.
+  Round-trip and canonical-spelling checks cover the applicable source, replica, journal and retirement decisions.
   The link:verus/foreign_contracts/prost.md[Prost contract] supplies generated decode behavior, and its authored conformance cases remain unverified by native execution.
   See the link:../dev/doc/rtdb-multi-bijection.md#framing-decoder-evidence[production correspondence and premises].
 * link:verus/guarded_tail_recovery/area.json[Guarded-tail recovery] imports the Rust decisions called by the Logkeeper writer.
@@ -413,11 +403,6 @@ It also exercises the Azure adapter against a loopback provider and separately m
 * `verus/original_sync_audit` checks the original Logkeeper sync bound and digest-bound lookup decisions in `client/audit.rs` and `server/store.rs`.
   Verus 0.2026.11.20.9da409b checked 11 items and all 17 negative controls failed at their expected laws on 2026-11-23.
   See link:../dev/doc/rtdb-multi-bijection.md[the strict acceptance audit] for the call-site inspection and premises.
-* `verus/audience_drain_wiring` checks the production-shared Flight owner capture, asynchronous storage spawn and poll, and task-local allowance wiring with RTDB-local runtime contracts.
-  Verus 0.2026.11.20.9da409b checked 39 items and all seven controls failed at their declared laws on 2026-11-23.
-  The runner records the named foreign contracts for the area in its evidence directory.
-  The conformance tests for those contracts were authored and remain unrun.
-  See link:../dev/doc/rtdb-multi-bijection.md#audience-action-work[the audience action evidence] for the checked laws and source correspondence.
 
 The run ledger identifies tool identities, positive cases, bounded negative traces and unresolved obligations.
 

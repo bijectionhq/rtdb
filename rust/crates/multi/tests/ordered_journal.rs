@@ -925,8 +925,6 @@ async fn exercise_installed_owned_reads() {
     assert!(closed.message().await.unwrap().is_some());
 
     let local = node.server.node();
-    let db = local.catalog().database("shop").unwrap();
-    local.confirm_audience_route(&db, deployment).await.unwrap();
     let tx = local.latest_completed_transactions().unwrap()["shop"][0].unwrap();
     let floor = rtdb_node::AppliedReadFloor::new(deployment, vec![tx]).unwrap();
     let mut session = local.session("shop", Arc::new(Reader)).unwrap();
@@ -958,18 +956,6 @@ async fn exercise_installed_owned_reads() {
     assert!(original.current(deployment, session.state().cancellation()).await.unwrap()
         .require_unretired_family_source().await.is_err());
     drop(session);
-    let prepaid = local.memory().prepay(32 << 20).unwrap();
-    let cache = rtdb_storage::cache::CacheBudget::with_memory(local.memory().prepay(32 << 20).unwrap());
-    let mut audience = local.audience_session("shop", Arc::new(Reader), deployment, prepaid, cache).unwrap();
-    assert!(audience.prepare_applied_owned_reads(&floor).await.unwrap() > 0);
-    drop(audience.open_applied_owned_read(&floor).await.unwrap());
-    drop(audience);
-    let worker = authority.workers[1].client(&cohort.route);
-    let prior = route(&worker).await;
-    let grant = prior.writer.grant.unwrap();
-    assert!(execute(&worker, request(prior, Principal::Worker(grant.enrollment), Command::Vacate { grant }))
-        .await.receipt.outcome.is_ok());
-    assert!(local.confirm_audience_route(&db, deployment).await.is_err());
 
     stop.cancel();
     flight.await.unwrap().unwrap();

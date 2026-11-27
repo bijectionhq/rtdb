@@ -16,7 +16,7 @@ use rtdb_columnar::{IidView, MemoryBudget, MemoryReservation, OwnedBatch, estima
 use rtdb_format::{data::{EventBatch, PutText}, ipc::{PageDecoder, PageProjection, inspect_file_reserved}, keys::{TableSlug, TrieKey}, metadata::{MetadataFile, MetadataNode}};
 use rtdb_index::{CatalogTrie, IndexBatch, LiveTable, LocatedRows, RowSource, Snapshot, TrieState};
 use rtdb_plan::{Expr, Scan, Schema, TemporalFilter, UnaryOp};
-use rtdb_storage::{ObjectKey, audience_work, cache::{BufferPool, CacheLease, Cached, View}};
+use rtdb_storage::{ObjectKey, cache::{BufferPool, CacheLease, Cached, View}};
 use rtdb_temporal::{HistoryResolver, ResolvedRow};
 use rtdb_trie::{PageSummary, PruningOptions, TemporalSummary, select_pages_from_iter, select_pages_with_scratch};
 use rtdb_types::{ARCHIVE_TX_FROM, ARCHIVE_TX_TO, HOSTED_RECEIPT_TX_ID, OWNED_EVENT_POSITION_COLUMN,
@@ -78,7 +78,6 @@ impl DataFileReader {
         let reader = &opened.layout.decoder;
         let bytes = self.read_range(opened.whole.as_ref(), reader.page_range(page)?, memory).await?;
         let bound = opened.layout.page_decode_bound(page, &bytes, include_builder_bound)?;
-        audience_work::decode_bytes(bound)?;
         let charged = memory.reserve(bound)?;
         let bytes = page_buffer(bytes);
         let batch = match projection {
@@ -107,9 +106,7 @@ impl DataFileReader {
             if let Some(headers) = self.storage.admit(IndexBatch::header_bytes(rows)?)
                 && let Ok(charged) = memory.reserve(bound)
             {
-                audience_work::decode_bytes(bound)?;
                 let batch = reader.decode_page(page, page_buffer(wire))?;
-                audience_work::scan_items(batch.num_rows())?;
                 let batch = IndexBatch::from_owned_with_headers(OwnedBatch::with_reservation(batch, reservation)?, headers)?;
                 return Ok((batch, Some(charged)));
             }
@@ -123,11 +120,9 @@ impl DataFileReader {
         let (batch, charged) = if let Some(projected) = projected {
             projected
         } else {
-            audience_work::decode_bytes(bound)?;
             let charged = memory.reserve(bound)?;
             (reader.decode_page(page, page_buffer(wire))?, charged)
         };
-        audience_work::scan_items(batch.num_rows())?;
         Ok((IndexBatch::from_owned(OwnedBatch::with_reservation(batch, charged)?)?, None))
     }
 
@@ -145,7 +140,6 @@ impl DataFileReader {
         }
 
         let bound = reader.full_page_decode_bound(page, wire.as_slice())?;
-        audience_work::decode_bytes(bound)?;
         let charge = memory.reserve(bound)?;
         let bytes = match projection {
             PageProjection::Iid => Buffer::from(Bytes::from_owner(wire)),
@@ -156,11 +150,6 @@ impl DataFileReader {
     }
 
     async fn read_range(&self, whole: Option<&CacheLease>, range: std::ops::Range<u64>, memory: &Arc<MemoryBudget>) -> Result<CacheLease> {
-        if audience_work::is_bounded() {
-            let bytes = range.end.checked_sub(range.start).and_then(|value| usize::try_from(value).ok())
-                .ok_or_else(|| invalid("page-range", "Scan range exceeds addressable memory"))?;
-            audience_work::decode_bytes(bytes)?;
-        }
         if let Some(whole) = whole {
             let start = usize::try_from(range.start).map_err(|error| invalid("page-range", error))?;
             let end = usize::try_from(range.end).map_err(|error| invalid("page-range", error))?;
@@ -171,7 +160,6 @@ impl DataFileReader {
 
     async fn open_layout(&self, whole: Option<&CacheLease>, memory: &Arc<MemoryBudget>) -> Result<(Arc<CachedLayout>, Arc<MemoryReservation>)> {
         if let Some(cached) = self.storage.view::<CachedLayout>(&self.key, View::Layout) {
-            audience_work::decode_bytes(cached._reservation.bytes())?;
             let opening = memory.reserve(cached._reservation.bytes())?;
             return Ok((cached, opening));
         }
@@ -184,14 +172,12 @@ impl DataFileReader {
         let bytes = self.read_range(whole, footer..tail, memory).await?;
         let bound = length.checked_mul(16).and_then(|bytes| bytes.checked_add(65_536))
             .ok_or_else(|| invalid("file-layout-size", "Arrow footer allocation exceeds addressable memory"))?;
-        audience_work::decode_bytes(bound)?;
         let opening = memory.reserve(bound)?;
         let mut decoder = PageDecoder::from_footer(bytes.as_slice(), footer, None)?;
         let mut dictionaries = Vec::new();
         for index in 0..decoder.dictionary_count() {
             let bytes = self.read_range(whole, decoder.dictionary_range(index)?, memory).await?;
             let bound = decoder.dictionary_bound(index, bytes.as_slice())?;
-            audience_work::decode_bytes(bound)?;
             dictionaries.push(memory.reserve(bound)?);
             decoder.load_dictionary(index, page_buffer(bytes))?;
         }
@@ -214,7 +200,6 @@ fn decode_projected_page(
     reader: &PageDecoder, page: usize, wire: &CacheLease, projection: PageProjection<'_>, memory: &Arc<MemoryBudget>,
 ) -> Result<Option<(arrow_array::RecordBatch, Arc<MemoryReservation>)>> {
     let Some((mut batch, charge)) = reader.decode_projected_page_reserved(page, wire.clone(), projection, |bound| {
-        audience_work::decode_bytes(bound)?;
         memory.reserve(bound)
     })? else { return Ok(None); };
     if matches!(projection, PageProjection::PutColumns(_)) && batch.get_array_memory_size() > charge.bytes() {
@@ -342,7 +327,6 @@ fn visit_iids(context: &crate::QueryContext, iids: IidView<'_>, visit: &mut impl
 
 async fn read_metadata(storage: &Arc<BufferPool>, key: &ObjectKey, memory: &Arc<MemoryBudget>) -> Result<(Arc<MetadataFile>, Arc<MemoryReservation>)> {
     if let Some(cached) = storage.view::<CachedMetadata>(key, View::File) {
-        audience_work::decode_bytes(cached.bound)?;
         return Ok((Arc::clone(&cached.metadata), memory.reserve(cached.bound)?));
     }
     let (lease, cache_owned) = match storage.get(key).await {
@@ -350,11 +334,9 @@ async fn read_metadata(storage: &Arc<BufferPool>, key: &ObjectKey, memory: &Arc<
         Err(rtdb_storage::Error::MemoryLimit { .. }) => (storage.get_or(key, memory).await?, false),
         Err(error) => return Err(error.into()),
     };
-    audience_work::decode_bytes(lease.as_slice().len())?;
     let mut cursor = Cursor::new(lease);
     let layout = inspect_file_reserved(&mut cursor, |bytes| memory.reserve(bytes))?;
     let bound = layout.full_allocation_bound()?;
-    audience_work::decode_bytes(bound)?;
     let reservation = memory.reserve(bound)?;
     let file = if cache_owned {
         rtdb_format::ipc::ArrowFile::from_inspected_buffer(page_buffer(cursor.into_inner()), None, layout)?
@@ -382,7 +364,6 @@ pub(crate) async fn primary_point_events(
     let mut pending = metadata.root_index().map(|root| vec![(root, Vec::<u8>::new())]).unwrap_or_default();
     while let Some((node, path)) = pending.pop() {
         if request.cancellation.is_cancelled() { return Err(point_cancelled()); }
-        audience_work::scan_items(1)?;
         let (lower, upper) = path_range(&path)?;
         if keys.is_some_and(|keys| !keys.intersects(lower, upper)) { continue; }
         match &metadata.nodes()[node] {
@@ -408,12 +389,10 @@ pub(crate) async fn primary_point_events(
         if let Some(rows) = preflight_rows {
             if request.cancellation.is_cancelled() { return Err(point_cancelled()); }
             if rows > remaining { return Ok(None); }
-            audience_work::scan_items(rows)?;
         }
         let (batch, _charged) = match held {
             Some(held) => {
                 file.storage.record_batch_requested();
-                audience_work::decode_bytes(held.bound)?;
                 (held.batch.view().clone(), memory.reserve(held.bound)?)
             }
             None => {
@@ -429,7 +408,6 @@ pub(crate) async fn primary_point_events(
             Some(_) => {}
             None => {
                 if rows > remaining { return Ok(None); }
-                audience_work::scan_items(rows)?;
             }
         }
         inspected += rows;
@@ -1844,7 +1822,6 @@ impl ScanVerifier<'_> {
             if selection.as_ref().is_some_and(|selection| !selection.contains(position_in_batch)) { continue; }
             let PutText::Utf8(text) = types.text(&batch.columns[position], position_in_batch)? else { continue; };
             let token_bytes = text.len().saturating_mul(32);
-            audience_work::decode_bytes(token_bytes)?;
             let scratch = memory.reserve(256usize.saturating_add(token_bytes))?;
             let score = scorer.bm25_text(text);
             drop(scratch);
@@ -1973,12 +1950,10 @@ impl ScanVerifier<'_> {
                 let batch = match cached {
                     Some(cached) => {
                         file.storage.record_batch_requested();
-                        audience_work::decode_bytes(cached.bound)?;
                         Arc::clone(&cached.batch)
                     }
                     None => {
                         let (batch, lease) = file.decode_event_page(page as usize, memory, DataProjection::PutColumns(put_columns), true).await?;
-                        audience_work::scan_items(batch.num_rows())?;
                         IndexBatch::from_owned(OwnedBatch::with_reservation(batch, lease)?)?
                     }
                 };
@@ -2108,14 +2083,7 @@ impl PartitionScan {
         let candidate = |trie: &CatalogTrie| trie.state == TrieState::Live
             && !trie.metadata.as_ref().is_some_and(|metadata| metadata.row_count == Some(0));
         let current_tries = || catalog.iter_tries(table).filter(|trie| candidate(trie));
-        let trie_count = if audience_work::is_bounded() {
-            catalog.iter_tries(table).try_fold(0, |count, trie| -> Result<usize> {
-                audience_work::scan_items(1)?;
-                Ok(count + candidate(trie) as usize)
-            })?
-        } else {
-            current_tries().count()
-        };
+        let trie_count = current_tries().count();
         let candidate_reservation = if trie_count == 0 { None } else {
             let bytes = trie_count.checked_mul(std::mem::size_of::<&CatalogTrie>()).and_then(|bytes| bytes.checked_add(256))
                 .ok_or_else(|| invalid("scan-candidate-size", "Scan trie candidate capacity exceeds addressable memory"))?;
@@ -2141,17 +2109,12 @@ impl PartitionScan {
         let mut pages = PageDescriptors::default();
         let mut live_segment_count = 0;
         for segment in self.snapshot.iter_segments(table) {
-            audience_work::scan_items(1)?;
             let priority = live_segment_count;
             live_segment_count += 1;
             segment.trie().try_visit_leaves(|leaf| {
-                audience_work::scan_items(1)?;
                 let (lower, upper) = path_range(leaf.path().as_slice())?;
                 if !self.path_matches(lower, upper) { return Ok(()); }
-                audience_work::scan_items(leaf.len())?;
-                let rows = if audience_work::is_bounded() {
-                    segment.located_rows_in(leaf, &self.execution.context.memory)?
-                } else if let Some(iids) = self.scan.iids.as_ref()
+                let rows = if let Some(iids) = self.scan.iids.as_ref()
                     .filter(|iids| self.candidate_iids.is_none() && iids.len().saturating_mul(LOCATED_IID_FRACTION) < leaf.len())
                 {
                     // The merge drops rows of other IIDs, so the page never needs them located; a page left with no rows
@@ -2236,7 +2199,6 @@ impl PartitionScan {
                 pending.push(MetadataVisit { node, path: [0; MAX_IID_DEPTH], depth: 0, recency: trie_recency }, memory)?;
             }
             while let Some(visit) = pending.entries.pop() {
-                audience_work::scan_items(1)?;
                 self.execution.context.check_cancelled()?;
                 let path = visit.path.get(..visit.depth).ok_or_else(invalid_iid_path)?;
                 let (lower, upper) = path_range(path)?;
@@ -2251,7 +2213,6 @@ impl PartitionScan {
                         }
                     },
                     MetadataNode::RecencyBranch(children) => {
-                        audience_work::scan_items(children.len())?;
                         for (upper, node) in children.iter().rev() {
                             pending.push(MetadataVisit { node: *node, recency: visit.recency.min(*upper), ..visit }, memory)?;
                         }
@@ -2297,7 +2258,6 @@ impl PartitionScan {
             let file = &self.files.entries[*file];
             let read = match file.reader.storage.view::<CachedMetadata>(&file.metadata, View::File) {
                 Some(cached) => {
-                    audience_work::decode_bytes(cached.bound)?;
                     let _charge = self.execution.context.memory.reserve(cached.bound)?;
                     let Some(MetadataNode::Leaf { columns, .. }) = cached.metadata.nodes().get(node) else { return Err(invalid("metadata-node", "A page's metadata node is not a leaf")) };
                     let columns = &columns.statistics()?;
@@ -2331,7 +2291,6 @@ impl PartitionScan {
             (PageSource::File { file, .. }, Some(held)) => {
                 self.files.entries[*file].reader.storage.record_batch_requested();
                 if !self.execution.context.spatial_refinement {
-                    audience_work::decode_bytes(held.bound)?;
                     charge = Some(self.execution.context.memory.reserve(held.bound)?);
                 }
                 cached = true;
@@ -2343,7 +2302,6 @@ impl PartitionScan {
                 let batch = if context.spatial_refinement {
                     let selected = self.scan.columns.iter().map(|field| field.name.clone()).collect::<Vec<_>>();
                     let (page, charged) = data.decode_spatial_page(*page_index, &context.memory, PageProjection::PutColumns(&selected), None).await?;
-                    audience_work::scan_items(page.num_rows())?;
                     IndexBatch::from_owned(OwnedBatch::with_reservation(page, charged)?)?
                 } else {
                     let scan = &self.scan;
@@ -2430,7 +2388,6 @@ impl PartitionScan {
             self.execution.context.check_cancelled()?;
             let task = self.tasks.as_mut().map(ScanTaskPlan::next).transpose()?.flatten();
             let Some(task) = task else { self.loaded.clear(); return Ok(None); };
-            audience_work::scan_items(1)?;
             if self.path_matches(task.range.lower, task.range.upper) {
                 return self.resolve_task(task).await.map(Some);
             }
@@ -2438,7 +2395,6 @@ impl PartitionScan {
     }
 
     async fn resolve_task(&mut self, task: ScanTask) -> Result<ResolvedScanTask> {
-        audience_work::scan_items(task.pages.len())?;
         let bound = task.pages.len().checked_mul(std::mem::size_of::<PageSummary>() + std::mem::size_of::<Head>() + std::mem::size_of::<PageBuilder>() + std::mem::size_of::<OwnedPage>() + 256).and_then(|bytes|bytes.checked_add(4096)).ok_or_else(||invalid("scan-task-size","Scan task scratch exceeds addressable memory"))?;
         let reservation = self.execution.context.memory.reserve(bound)?;
         self.read_statistics(&task.pages)?;
@@ -2500,7 +2456,6 @@ impl PartitionScan {
         let mut handles: Vec<Vec<u32>> = vec![Vec::new(); active.len()];
         let mut next = heads.pop();
         while let Some(head) = next.take() {
-            audience_work::scan_items(1)?;
             self.execution.context.check_cancelled_at(visited)?;
             visited += 1;
             let rows = active[head.active];
@@ -3330,15 +3285,11 @@ mod tests {
         let store = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
         let (mut scan, execution, _) = descriptor_scan(snapshot, table, store);
         scan.system_time = TemporalFilter::Default;
-        let limits = audience_work::Limits { provider_requests: 0, provider_bytes: 0, provider_metadata_bytes: 0, scan_items: 2300, decode_bytes: 0 };
-        let mut values = audience_work::within(Some(limits), async {
-            let mut cursor = ScanCursor::new(scan, execution, None).await.unwrap();
-            let mut values = Vec::new();
-            while let Some(page) = cursor.next_page().await.unwrap() {
-                values.extend(page.rows().iter().map(|row| row.values[0].clone()));
-            }
-            values
-        }).await;
+        let mut cursor = ScanCursor::new(scan, execution, None).await.unwrap();
+        let mut values = Vec::new();
+        while let Some(page) = cursor.next_page().await.unwrap() {
+            values.extend(page.rows().iter().map(|row| row.values[0].clone()));
+        }
         values.sort_by_key(|value| match value { Value::I64(value) => *value, other => panic!("{other:?}") });
         assert_eq!(values, [Value::I64(2), Value::I64(3)]);
     }
@@ -4383,23 +4334,13 @@ mod tests {
             crate::uncovered_history_iids(&request, covered, None, 2).await.unwrap()
         };
         let mut covered: BTreeSet<_> = (0..newest).map(BlockIndex).collect();
-        let latest_page_work = audience_work::Limits {
-            provider_requests: usize::MAX, provider_bytes: usize::MAX, provider_metadata_bytes: usize::MAX,
-            scan_items: newest_rows + 1, decode_bytes: usize::MAX,
-        };
-        audience_work::within(Some(latest_page_work), async {
-            assert_eq!(nominate(&state.value().snapshot(), &covered).await, Some(BTreeSet::from([iid(newest)])));
-            assert!(audience_work::scan_items(1).is_err());
-        }).await;
+        assert_eq!(nominate(&state.value().snapshot(), &covered).await, Some(BTreeSet::from([iid(newest)])));
 
         let compacted = CatalogTrie::notification(TrieKey::new(1, None, vec![], BlockIndex(newest - 1)).unwrap(), 0, None).unwrap();
         state.add_tries(&BTreeMap::from([(table.clone(), vec![compacted])]), Timestamp(1500)).unwrap();
         let value = state.value();
         let snapshot = value.snapshot();
-        audience_work::within(Some(latest_page_work), async {
-            assert_eq!(nominate(&snapshot, &covered).await, Some(BTreeSet::from([iid(newest)])));
-            assert!(audience_work::scan_items(1).is_err());
-        }).await;
+        assert_eq!(nominate(&snapshot, &covered).await, Some(BTreeSet::from([iid(newest)])));
 
         let missing = BlockIndex(3);
         covered.remove(&missing);
@@ -4421,10 +4362,7 @@ mod tests {
         assert_eq!(nominate(&reloaded, &covered).await, expected);
 
         covered.insert(missing);
-        audience_work::within(Some(latest_page_work), async {
-            assert_eq!(nominate(&reloaded, &covered).await, Some(BTreeSet::from([iid(newest)])));
-            assert!(audience_work::scan_items(1).is_err());
-        }).await;
+        assert_eq!(nominate(&reloaded, &covered).await, Some(BTreeSet::from([iid(newest)])));
     }
 
     #[tokio::test]

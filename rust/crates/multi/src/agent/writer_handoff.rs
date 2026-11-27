@@ -73,8 +73,7 @@ impl NodeAgent {
                     if !successor(&record, plan) || !leading {
                         return Err(handoff_changed());
                     }
-                    self.confirm_holder(name, &record.id, self.options.audience_journal_port)
-                        .await?;
+                    self.confirm_holder(name, &record.id).await?;
                     let current = self.record(name).await?;
                     if current.writer_handoffs.last() != Some(entry) || !successor(&current, plan) {
                         return Err(handoff_changed());
@@ -199,8 +198,7 @@ impl NodeAgent {
                         self.open_with_handoff(record.clone(), &members, true)
                             .await?;
                     }
-                    self.confirm_holder(name, &record.id, self.options.audience_journal_port)
-                        .await?;
+                    self.confirm_holder(name, &record.id).await?;
                     next.writer_handoffs
                         .last_mut()
                         .expect("fenced handoff")

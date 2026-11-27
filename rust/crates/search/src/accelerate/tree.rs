@@ -475,9 +475,7 @@ impl RankSource for PartitionRankSource<'_> {
             }
             Task::ExpandLogical(index) => {
                 let rank = self.logical_ranks[index].as_mut().expect("logical rank is opened before expansion");
-                let before = self.work.postings_visited;
                 let expanded = rank.expand(self.scope, &mut self.work.postings_visited).await;
-                rtdb_storage::audience_work::scan_items(self.work.postings_visited - before)?;
                 match expanded {
                     Ok(candidates) => {
                         self.work.tree_expansions += 1;
@@ -516,9 +514,7 @@ impl RankSource for PartitionRankSource<'_> {
             Task::Expand(index) => {
                 self.work.tree_expansions += 1;
                 let rank = self.ranks[index].as_mut().expect("rank is opened before it expands");
-                let before = self.work.postings_visited;
                 let expanded = rank.expand(self.scope, &mut self.work.postings_visited).await;
-                rtdb_storage::audience_work::scan_items(self.work.postings_visited - before)?;
                 let candidates = match expanded {
                     Ok(candidates) => candidates,
                     Err(error) if error.category == AnomalyCategory::Interrupted => return Err(error),
@@ -536,9 +532,7 @@ impl RankSource for PartitionRankSource<'_> {
             }
             Task::Legacy(index) => {
                 let (selected, rank) = &mut self.legacy[index];
-                let before = self.work.postings_visited;
                 let expanded = rank.expand(self.scope, &mut self.work.postings_visited).await;
-                rtdb_storage::audience_work::scan_items(self.work.postings_visited - before)?;
                 let hits = match expanded {
                     Ok(hits) => hits,
                     Err(error) if error.category == AnomalyCategory::Interrupted => return Err(error),

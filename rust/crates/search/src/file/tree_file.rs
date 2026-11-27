@@ -7,7 +7,7 @@ use std::sync::Arc;
 use arrow_array::{Array, FixedSizeBinaryArray, RecordBatch, StructArray, UInt32Array, cast::AsArray, types::{Int32Type, Int64Type, UInt32Type}};
 use arrow_buffer::{Buffer, MutableBuffer};
 use bytes::Bytes;
-use rtdb_storage::{ObjectKey, audience_work, cache::BufferPool};
+use rtdb_storage::{ObjectKey, cache::BufferPool};
 use rtdb_types::{EventHeader, Iid, Interval, MemoryBudget, MemoryReservation, Result, Timestamp};
 use rtdb_types::AnomalyKind;
 use sha2::{Digest, Sha256};
@@ -427,7 +427,6 @@ impl TreeLocator {
             Err(error) if error.is(AnomalyKind::ResourceExhausted) => return Ok(None),
             Err(error) => return Err(error),
         };
-        audience_work::decode_bytes(expected)?;
         let Some(bytes) = expand_inline_root(hex, expected) else { return Ok(None); };
         Arc::get_mut(&mut reservation).expect("Inline root expansion owns its reservation").shrink_to(bytes.capacity())?;
         let bytes = rtdb_columnar::retain_buffer(&Buffer::from_vec(bytes), &reservation);
@@ -537,8 +536,7 @@ impl TreeFile {
         inline: Option<(&str, &Arc<MemoryBudget>)>, memory: Arc<MemoryBudget>) -> Result<Self> {
         let reader = TreeReader::new(source, locator.length, locator.format, memory);
         let root = if let Some((hex, memory)) = inline && let Some(page) = locator.admit_inline_root(hex, memory)? {
-            let wire = locator.page.metadata as usize + locator.page.body as usize;
-            match reader.authenticated_page(page, wire) {
+            match reader.authenticated_page(page) {
                 Ok(root) => root,
                 Err(error) if error.is(AnomalyKind::ResourceExhausted) => reader.page(locator.page, PageKind::Root).await?,
                 Err(error) => return Err(error),
@@ -976,7 +974,7 @@ fn lower_bound(len: usize, before: impl Fn(usize) -> bool) -> usize {
 mod tests {
     use super::*;
     use rtdb_format::{keys::TableSlug, log::proto::SearchRun};
-    use rtdb_storage::{MemoryStore, ObjectStore, audience_work::Limits};
+    use rtdb_storage::{MemoryStore, ObjectStore};
     use rtdb_text::{Query, Scorer};
     fn tokens(text: &str) -> Vec<String> { rtdb_text::Analyzer::Simple.tokens(text) }
     use rtdb_types::{EntityId, EventOp, Interval, TemporalBounds, Timestamp};
@@ -1020,32 +1018,18 @@ mod tests {
         Ok((slug, run, bytes, range.start as usize..range.end as usize))
     }
 
-    fn root_work(decode_bytes: usize) -> Limits {
-        Limits { provider_requests: 0, provider_bytes: 0, provider_metadata_bytes: 0, scan_items: 0, decode_bytes }
-    }
-
-    fn root_decode_bytes(bytes: &[u8], range: std::ops::Range<usize>, run: &SearchRun) -> Result<usize> {
-        let locator = TreeLocator::decode_route(std::str::from_utf8(run.locator()).unwrap()).unwrap();
-        let wire = range.len();
-        let page = locator.page.authenticate(Buffer::from_slice_ref(&bytes[range]))?;
-        Ok(page.decode_bound()?.max(wire))
-    }
-
     #[tokio::test]
-    async fn logical_inline_root_spends_one_decode_and_warm_reuse_checks_identity() -> Result<()> {
+    async fn logical_inline_root_warm_reuse_checks_identity() -> Result<()> {
         let columns = ["body".to_owned()];
-        let (slug, mut run, bytes, range) = logical_run(&columns)?;
-        let work = root_decode_bytes(&bytes, range, &run)?;
+        let (slug, mut run, _, _) = logical_run(&columns)?;
         let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
         let runtime = crate::SearchRuntime::with_logical_search(1 << 20);
 
-        let denied = audience_work::within(Some(root_work(work - 1)), runtime.logical_file(&storage, &slug, &run, &columns)).await;
-        assert_eq!(denied.err().unwrap().code, "rtdb.storage/audience-work-limit");
-        let opened = audience_work::within(Some(root_work(work)), runtime.logical_file(&storage, &slug, &run, &columns)).await?;
-        let warm = audience_work::within(Some(root_work(0)), runtime.logical_file(&storage, &slug, &run, &columns)).await?;
+        let opened = runtime.logical_file(&storage, &slug, &run, &columns).await?;
+        let warm = runtime.logical_file(&storage, &slug, &run, &columns).await?;
         assert!(Arc::ptr_eq(&opened, &warm));
         run.rebuild = Some(1);
-        let mismatched = audience_work::within(Some(root_work(0)), runtime.logical_file(&storage, &slug, &run, &columns)).await;
+        let mismatched = runtime.logical_file(&storage, &slug, &run, &columns).await;
         assert_eq!(mismatched.err().unwrap().code, "rtdb.search/corrupt-file");
         Ok(())
     }
@@ -1054,7 +1038,6 @@ mod tests {
     async fn logical_fresh_and_unusable_inline_roots_read_the_persisted_root() -> Result<()> {
         let columns = ["body".to_owned()];
         let (slug, mut run, bytes, range) = logical_run(&columns)?;
-        let work = root_decode_bytes(&bytes, range.clone(), &run)?;
         let store = Arc::new(MemoryStore::default());
         let storage = Arc::new(BufferPool::new(store.clone(), 1 << 20));
         let runtime = crate::SearchRuntime::with_logical_search(1 << 20);
@@ -1069,23 +1052,21 @@ mod tests {
         drop(opened);
         store.delete(&key).await?;
         store.put(&key, bytes.clone().into()).await?;
-        audience_work::within(Some(root_work(work)), runtime.open_logical(&storage, &slug, &run, &columns, true)).await?;
+        runtime.open_logical(&storage, &slug, &run, &columns, true).await?;
 
         let constrained = crate::SearchRuntime::with_logical_search(0);
-        audience_work::within(Some(root_work(work)), constrained.logical_file(&storage, &slug, &run, &columns)).await?;
+        constrained.logical_file(&storage, &slug, &run, &columns).await?;
 
         let mut wrong_root = bytes[range.clone()].to_vec();
         wrong_root[0] ^= 1;
         let (prefix, _) = std::str::from_utf8(run.locator()).unwrap().rsplit_once(':').unwrap();
         run.locator = Some(format!("{prefix}:{}", encode_hex(&lz4_flex::block::compress(&wrong_root))).into_bytes());
-        audience_work::within(Some(root_work(work + range.len())), runtime.logical_file(&storage, &slug, &run, &columns)).await?;
+        runtime.logical_file(&storage, &slug, &run, &columns).await?;
         Ok(())
     }
 
     #[tokio::test]
-    async fn term_routing_reports_corruption_without_recharging_a_warm_ancestor() -> Result<()> {
-        use rtdb_storage::{MemoryStore, audience_work::{self, Limits}};
-
+    async fn term_routing_reports_corruption_below_a_warm_ancestor() -> Result<()> {
         let key = term_key(0, "invoice");
         let child = |page| Child { lower: key.clone(), upper: key.clone(), page };
         let mut bytes = Vec::new();
@@ -1108,13 +1089,8 @@ mod tests {
             routes: BTreeMap::new(),
             format: TREE_FORMAT_VERSION,
         };
-        let bytes_for = |page: PageRef| page.metadata as usize + page.body as usize;
-        let limits = Limits {
-            provider_requests: 0, provider_bytes: 0, provider_metadata_bytes: 0, scan_items: 0,
-            decode_bytes: bytes_for(root) + bytes_for(lower),
-        };
         let names = ["invoice".to_owned()];
-        let error = audience_work::within(Some(limits), tree.term_pages(0, &names)).await.unwrap_err();
+        let error = tree.term_pages(0, &names).await.unwrap_err();
         assert_eq!(error.code, "rtdb.search/corrupt-file");
         Ok(())
     }

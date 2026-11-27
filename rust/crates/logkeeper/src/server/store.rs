@@ -25,13 +25,13 @@ use super::journal::{Captured, Journal, ObservedAppend, Recovered, Work, Write};
 #[cfg(not(verus_keep_ghost))]
 use super::payload::{Item, Source, Stored};
 #[cfg(not(verus_keep_ghost))]
-use super::state::{Decision, StreamState, Window, WriterAuthority};
+use super::state::{Decision, StreamState, Window};
 #[cfg(not(verus_keep_ghost))]
 use crate::decision::{DecisionCertificate, DecisionVoteRequest, Handoff};
 #[cfg(not(verus_keep_ghost))]
 use crate::history::RetainedChain;
 #[cfg(not(verus_keep_ghost))]
-use crate::protocol::{AuthorityConfirmed, DigestPage, LogletCheck, Refused, Entries, Entry, Failed, MAXIMUM_FRAME_BYTES, PageDigest, ReadIndexReply, RequestBody, ResponseBody};
+use crate::protocol::{DigestPage, Refused, Entries, Entry, Failed, MAXIMUM_FRAME_BYTES, PageDigest, ReadIndexReply, RequestBody, ResponseBody};
 #[cfg(not(verus_keep_ghost))]
 use bytes::Bytes;
 #[cfg(not(verus_keep_ghost))]
@@ -67,7 +67,6 @@ pub(crate) struct Slot {
     pub id: u64,
     pub name: String,
     pub state: Mutex<StreamState<Stored>>,
-    authority: Arc<Mutex<AuthorityProjection>>,
     /// Woken when the commit lsn or trim point moves, or the stream is dropped.
     pub progressed: Notify,
 }
@@ -75,39 +74,7 @@ pub(crate) struct Slot {
 #[cfg(not(verus_keep_ghost))]
 impl Slot {
     pub fn new(id: u64, name: String, state: StreamState<Stored>) -> Self {
-        let authority = Arc::new(Mutex::new(AuthorityProjection {
-            accepted: state.writer_authority(), revision: Some(0), durable_revision: 0,
-        }));
-        Self { id, name, state: Mutex::new(state), authority, progressed: Notify::new() }
-    }
-
-    pub fn publish_authority_revision(&self, revision: u64) {
-        self.authority.lock().durable_revision = revision;
-    }
-}
-
-#[cfg(not(verus_keep_ghost))]
-struct AuthorityProjection {
-    accepted: WriterAuthority,
-    revision: Option<u64>,
-    durable_revision: u64,
-}
-
-#[cfg(not(verus_keep_ghost))]
-impl AuthorityProjection {
-    fn record(&mut self, authority: WriterAuthority) -> Option<u64> {
-        self.accepted = authority;
-        self.revision = self.revision.and_then(|revision| revision.checked_add(1));
-        self.revision
-    }
-
-    fn confirm(&self, epoch: u64, ensemble: [u8; 32]) -> ResponseBody {
-        if self.revision == Some(self.durable_revision) && self.accepted.confirms(epoch, ensemble) {
-            ResponseBody::AuthorityConfirmed(AuthorityConfirmed {})
-        } else {
-            // A pending higher promise also fences the earlier writer.
-            ResponseBody::Refused(Refused { promised: self.accepted.promised, last_lsn: -1 })
-        }
+        Self { id, name, state: Mutex::new(state), progressed: Notify::new() }
     }
 }
 
@@ -115,7 +82,6 @@ impl AuthorityProjection {
 pub(crate) struct Store {
     journal: Arc<Journal>,
     streams: Mutex<HashMap<String, Arc<Slot>>>,
-    authorities: Mutex<HashMap<String, Arc<Mutex<AuthorityProjection>>>>,
     queue: mpsc::UnboundedSender<Work>,
     pending_writes: Arc<Semaphore>,
     digest_pages: Semaphore,
@@ -138,8 +104,7 @@ impl Store {
             let slot = Slot::new(stream.id, stream.name.clone(), stream.state);
             (stream.name, Arc::new(slot))
         }).collect();
-        let authorities = streams.iter().map(|(name, slot)| (name.clone(), Arc::clone(&slot.authority))).collect();
-        Self { journal, streams: Mutex::new(streams), authorities: Mutex::new(authorities), queue, pending_writes: Arc::new(Semaphore::new(PENDING_WRITE_BYTES)), digest_pages: Semaphore::new(CONCURRENT_DIGEST_PAGES) }
+        Self { journal, streams: Mutex::new(streams), queue, pending_writes: Arc::new(Semaphore::new(PENDING_WRITE_BYTES)), digest_pages: Semaphore::new(CONCURRENT_DIGEST_PAGES) }
     }
 
     pub(super) fn prove_identity(&self, nonce: &[u8; 16]) -> ([u8; 32], [u8; 64]) {
@@ -151,7 +116,6 @@ impl Store {
         let mut streams = self.streams.lock();
         if let Some(slot) = streams.get(name) { return Arc::clone(slot); }
         let slot = Arc::new(Slot::new(self.journal.allocate_id(), name.to_owned(), StreamState::default()));
-        self.authorities.lock().insert(name.to_owned(), Arc::clone(&slot.authority));
         streams.insert(name.to_owned(), Arc::clone(&slot));
         slot
     }
@@ -313,12 +277,11 @@ impl Store {
                     }
                 });
             }
-            RequestBody::VoteDecision(_) | RequestBody::Read(_) | RequestBody::Fetch(_) | RequestBody::Check(_) | RequestBody::Retire(_) | RequestBody::DigestPage(_) | RequestBody::Identify(_) | RequestBody::ConfirmAuthority(_) => return Outcome::Now(failed("not a direct mutation")),
+            RequestBody::VoteDecision(_) | RequestBody::Read(_) | RequestBody::Fetch(_) | RequestBody::Check(_) | RequestBody::Retire(_) | RequestBody::DigestPage(_) | RequestBody::Identify(_) => return Outcome::Now(failed("not a direct mutation")),
         };
         let slot = self.slot(&stream);
         let mut state = slot.state.lock();
         let before = (state.commit, state.trim, state.dropped);
-        let previous_authority = state.writer_authority();
         let decision = decide(&mut state);
         if matches!(decision.reply, ResponseBody::Refused(_) | ResponseBody::Failed(_)) { return Outcome::Now(decision.reply); }
         let observed_append = observation.map(|(lsn, before)| {
@@ -326,15 +289,9 @@ impl Store {
             assert!(state.track_sync(lsn, Arc::clone(&sample)), "admitted append holds its new entry");
             ObservedAppend { lsn, sample, before }
         });
-        let authority = state.writer_authority();
-        let authority_revision = if authority == previous_authority {
-            None
-        } else {
-            slot.authority.lock().record(authority)
-        };
         let (done, durable) = oneshot::channel();
         if self.queue.send(Work { write: Write::Events(Arc::clone(&slot), decision.events), done,
-            _admission: Some(admission), authority_revision, observed_append }).is_err() {
+            _admission: Some(admission), observed_append }).is_err() {
             return Outcome::Now(failed("the journal has stopped"));
         }
         if (state.commit, state.trim, state.dropped) != before { slot.progressed.notify_waiters(); }
@@ -358,7 +315,7 @@ impl Store {
         let locked: Vec<_> = streams.values().map(|slot| (slot, slot.state.lock())).collect();
         let captured = locked.iter().map(|(slot, state)| Captured { slot: Arc::clone(slot), state: (**state).clone() }).collect();
         let (done, finished) = oneshot::channel();
-        if self.queue.send(Work { write: Write::Compact(captured), done, _admission: None, authority_revision: None, observed_append: None }).is_err() {
+        if self.queue.send(Work { write: Write::Compact(captured), done, _admission: None, observed_append: None }).is_err() {
             self.journal.release_compaction();
             return Err("the journal has stopped".into());
         }
@@ -399,15 +356,6 @@ impl Store {
         match self.existing(stream) { Some(slot) => slot.state.lock().check(epoch), None => StreamState::<Stored>::default().check(epoch) }
     }
 
-    pub fn confirm_authority(&self, check: LogletCheck) -> ResponseBody {
-        if !self.journal.is_durable() || self.queue.is_closed() { return failed("durable writer authority is unavailable"); }
-        let Ok(ensemble) = check.ensemble.as_ref().try_into() else { return failed("invalid ensemble digest"); };
-        let authority = self.authorities.lock().get(&check.stream).cloned();
-        let Some(authority) = authority else { return failed("the authority stream was not found"); };
-        let reply = authority.lock().confirm(check.epoch, ensemble);
-        reply
-    }
-
     fn check_after_durability(
         &self, stream: &str, admission: tokio::sync::OwnedSemaphorePermit, check: impl FnOnce(&StreamState<Stored>) -> ResponseBody,
     ) -> Outcome {
@@ -420,7 +368,7 @@ impl Store {
 
         // The reply's position includes accepted mutations that the journal may still be syncing.
         let (done, durable) = oneshot::channel();
-        let barrier = Work { write: Write::Events(Arc::clone(&slot), Vec::new()), done, _admission: Some(admission), authority_revision: None, observed_append: None };
+        let barrier = Work { write: Write::Events(Arc::clone(&slot), Vec::new()), done, _admission: Some(admission), observed_append: None };
         if self.queue.send(barrier).is_err() { return Outcome::Now(failed("the journal has stopped")); }
         Outcome::Durable(durable, reply)
     }
@@ -558,7 +506,7 @@ impl Store {
             let selection = self.select(&state, first, prefix.through, DIGEST_PAGE_ENTRIES, DIGEST_PAGE_BYTES);
             let (done, durable) = oneshot::channel();
             let work = Work { write: Write::Events(Arc::clone(&slot), Vec::new()), done,
-                _admission: None, authority_revision: None, observed_append: None };
+                _admission: None, observed_append: None };
             if self.queue.send(work).is_err() {
                 return failed("the journal has stopped");
             }
@@ -639,7 +587,7 @@ impl Store {
             let window = self.select(&state, page.from_lsn, page.through_lsn, DIGEST_PAGE_ENTRIES, DIGEST_PAGE_BYTES);
             let (done, durable) = oneshot::channel();
             // A selected commit can still be queued for fsync. The barrier is ordered after that commit.
-            if self.queue.send(Work { write: Write::Events(Arc::clone(&slot), Vec::new()), done, _admission: None, authority_revision: None, observed_append: None }).is_err() {
+            if self.queue.send(Work { write: Write::Events(Arc::clone(&slot), Vec::new()), done, _admission: None, observed_append: None }).is_err() {
                 return failed("the journal has stopped");
             }
             (window, durable, observation)
@@ -838,31 +786,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authority_confirms_only_a_durable_epoch_without_admitting_an_append() {
-        let directory = tempfile::tempdir().unwrap();
-        let (journal, recovered, _) = Journal::open(directory.path(), true, 0, None).unwrap();
-        let journal = Arc::new(journal);
-        let (queue, work) = mpsc::unbounded_channel();
-        let store = Arc::new(Store::new(Arc::clone(&journal), recovered, queue));
-        let check = |ensemble| LogletCheck { stream: "authority".into(), epoch: 2, ensemble, certified: false, handoff: None };
-        let ensemble = Bytes::from_static(&[7; 32]);
-        let Outcome::Durable(installed, _) = store.mutate(RequestBody::Overwrite(Overwrite {
-            stream: "authority".into(), epoch: 2, from_lsn: 0, entries: Vec::new(),
-            complete: true, commit_lsn: -1, activate_ensemble: ensemble.clone(), certified: false,
-        }), 32).await else { panic!("the ensemble needs a journal write"); };
-        assert!(matches!(store.confirm_authority(check(ensemble.clone())), ResponseBody::Refused(_)));
-
-        let driver = tokio::spawn(crate::server::journal::run(journal, Arc::downgrade(&store), work));
-        installed.await.unwrap().unwrap();
-        let all_writes = store.pending_writes.clone().acquire_many_owned(PENDING_WRITE_BYTES as u32).await.unwrap();
-        assert!(matches!(store.confirm_authority(check(ensemble)), ResponseBody::AuthorityConfirmed(_)));
-        assert!(matches!(store.confirm_authority(check(Bytes::from_static(&[8; 32]))), ResponseBody::Refused(_)));
-        drop(all_writes);
-        drop(store);
-        driver.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
     async fn a_drop_queued_after_an_older_compaction_schedules_reclamation_again() {
         let directory = tempfile::tempdir().unwrap();
         let (journal, recovered, _) = Journal::open(directory.path(), true, 0, None).unwrap();
@@ -880,7 +803,7 @@ mod tests {
         let slot = store.existing("drop-me").unwrap();
         let capture = Captured { slot: Arc::clone(&slot), state: slot.state.lock().clone() };
         assert!(journal.claim_compaction());
-        let first_compaction = Work { write: Write::Compact(vec![capture]), done: oneshot::channel().0, _admission: None, authority_revision: None, observed_append: None };
+        let first_compaction = Work { write: Write::Compact(vec![capture]), done: oneshot::channel().0, _admission: None, observed_append: None };
         assert!(store.queue.send(first_compaction).is_ok());
         let Outcome::Durable(dropped, _) = store.mutate(RequestBody::DropStream(DropStream { stream: "drop-me".into(), epoch: 2 }), 32).await else {
             panic!("the drop was refused");

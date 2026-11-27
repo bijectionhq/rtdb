@@ -10,7 +10,7 @@ mod unique;
 
 pub(crate) use hosted_control::{READ_HELD_HOSTED_CONTROL_AT_PUBLICATION_V1, READ_HELD_HOSTED_CONTROL_V3, READ_HELD_ROOT_CATALOG_V1};
 pub(crate) use hosted_upload::{DECIDE_HOSTED_STREAM_V1, HOSTED_UPLOAD_HEADER};
-pub(crate) use hosted_observation::{CONFIRM_APPLIED_HOSTED_V6, CONFIRM_HOSTED_SOURCE_V1, OBSERVE_HELD_HOSTED_V1, PREPARE_APPLIED_READ_V3};
+pub(crate) use hosted_observation::{CONFIRM_APPLIED_HOSTED_V6, CONFIRM_HOSTED_SOURCE_V1, OBSERVE_HELD_HOSTED_V1};
 pub(crate) use import_page::DECIDE_HOSTED_IMPORT_PAGE_V1;
 pub(crate) use packed_groups::DECIDE_HOSTED_PACKED_V1;
 pub(crate) use unique::{READ_HELD_UNIQUE_V1, READ_HELD_UNIQUE_WINDOW_V1};
@@ -429,11 +429,9 @@ pub(crate) struct OwnedReadResource {
     pub(crate) session: String,
     database: String,
     purpose: ReadPurpose,
-    audience_work: Option<rtdb_storage::audience_work::TurnAllowance>,
-    audience_projection_work: Option<rtdb_storage::audience_work::TurnAllowance>,
     witnesses: Mutex<BTreeMap<Uuid, RetainedRangeWitness>>,
     spatial_filters: Mutex<BTreeMap<Uuid, Arc<RetainedSpatialFilter>>>,
-    _permit: Option<OwnedSemaphorePermit>,
+    _permit: OwnedSemaphorePermit,
     _reservation: Arc<MemoryReservation>,
 }
 
@@ -956,27 +954,6 @@ fn split_relation(body: &[u8]) -> Result<(OwnedRelation, &[u8]), Status> {
     Ok((OwnedRelation::new(name).map_err(status)?, arrow_bytes))
 }
 
-fn require_audience_point(
-    session: &crate::state::Session, relation: &OwnedRelation, id: &EntityId, recovering: bool,
-) -> Result<(), Status> {
-    let projection = session.audience_projection()?;
-    if audience_point_admitted(&projection.relation, relation, id, recovering) {
-        Ok(())
-    } else {
-        Err(Status::permission_denied("The point is outside the prepared audience projection"))
-    }
-}
-
-fn audience_point_admitted(
-    projection: &OwnedRelation, relation: &OwnedRelation, id: &EntityId, recovering: bool,
-) -> bool {
-    relation == projection
-        || (recovering && relation.name() == "fact_layout_readiness")
-        || (relation.name() == rtdb_types::OWNED_ROOT_PUBLICATION_RELATION
-            && matches!(id, EntityId::String(id) if id == "sync_receipt_head"
-                || id.strip_prefix("fact_partition_head:") == Some(projection.name())))
-}
-
 /// `[commit position: i64 BE][commit system time: i64 BE][first masked: u32 BE]`.
 /// The masked commit is named by its position (T7): a tied commit shares its time.
 fn split_position_mask(body: &[u8]) -> Result<((TransactionKey, u32), &[u8]), Status> {
@@ -987,24 +964,13 @@ fn split_position_mask(body: &[u8]) -> Result<((TransactionKey, u32), &[u8]), St
 }
 
 fn decode_batch(call: &Call, arrow: Bytes) -> Result<OwnedBatch, Status> {
-    charge_audience_arrow(&arrow)?;
     let stream = OwnedStream::read_bytes(arrow, call.memory()).map_err(status)?;
     single_owned_batch(stream)
 }
 
 fn decode_retained_batch(call: &Call, arrow: Bytes) -> Result<OwnedBatch, Status> {
-    charge_audience_arrow(&arrow)?;
     let stream = OwnedStream::read_buffer(arrow_buffer::Buffer::from(arrow), call.memory()).map_err(status)?;
     single_owned_batch(stream)
-}
-
-fn charge_audience_arrow(arrow: &[u8]) -> Result<(), Status> {
-    use rtdb_storage::audience_work;
-    if audience_work::is_bounded() {
-        let bound = rtdb_format::ipc::stream_allocation_bound(arrow).map_err(status)?;
-        audience_work::decode_bytes(bound).map_err(|error| Status::resource_exhausted(error.to_string()))?;
-    }
-    Ok(())
 }
 
 fn single_owned_batch(stream: OwnedStream) -> Result<OwnedBatch, Status> {
@@ -1613,7 +1579,6 @@ impl Service {
         &self, call: &Call, envelope: &Bytes,
     ) -> Result<ActionResult, Status> {
         let policy = self.hosted_control_policy(call)?;
-        if call.session.audience_source().is_some() { return Err(unsupported()); }
         let (floor, body) = hosted_observation::applied_read_floor(envelope)?;
         let (tokens, body) = self.durable_hosted_ranges(body)?;
         let token_bytes = tokens.iter().map(|token| token.len()).sum();
@@ -2372,7 +2337,7 @@ impl Service {
     pub(crate) async fn open_owned_read_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         if !body.is_empty() { return Err(invalid("Owned read open takes an empty body")); }
-        self.retain_new_owned_read(call, None, 0).await
+        self.retain_new_owned_read(call, None).await
     }
 
     pub(crate) async fn open_fresh_owned_read_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
@@ -2383,14 +2348,11 @@ impl Service {
             None if call.classic_flight_excluded => return Err(crate::service::classic_flight_refusal()),
             None => ReadPurpose::OrdinaryFresh,
         };
-        if call.session.placed_database() != Some(call.database.as_str()) || call.session.audience_source().is_some() {
+        if call.session.placed_database() != Some(call.database.as_str()) {
             return Err(Status::permission_denied("A fresh owned read requires its ordinary placed session"));
         }
         let (deployment, suffix) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Fresh read requires a deployment"))?;
         let deployment = Uuid::from_bytes(*deployment);
-        if self.0.config.reserved_applied_source == Some(deployment) {
-            return Err(Status::permission_denied("This source requires a reserved Flight session"));
-        }
         let required = if matches!(suffix, [0]) {
             None
         } else {
@@ -2407,7 +2369,7 @@ impl Service {
         if call.classic_retained.is_some_and(|retained| !retained.deadline.is_live() || retained.snapshot != snapshot.present()) {
             return Err(Status::failed_precondition("The retained read did not capture the authorized Classic snapshot"));
         }
-        self.retain_owned_read(call, snapshot, Some(permit), 0, purpose)
+        self.retain_owned_read(call, snapshot, permit, purpose)
     }
 
     pub(crate) async fn open_applied_owned_read_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
@@ -2417,36 +2379,25 @@ impl Service {
         }
         let (floor, rest) = hosted_observation::applied_read_floor(body)?;
         let generation = u64::from_be_bytes(rest.try_into().map_err(|_| invalid("Applied read requires an exact generation"))?);
-        if let Some(source) = call.session.audience_source() {
-            if floor.history() != source {
-                return Err(Status::permission_denied("The applied floor belongs to another audience source"));
-            }
-        } else if self.0.config.reserved_applied_source == Some(floor.history()) {
-            return Err(Status::permission_denied("This source requires a reserved Flight session"));
-        } else if generation != 0 {
+        if generation != 0 {
             return Err(invalid("An ordinary applied read uses generation zero"));
         }
-        self.retain_new_owned_read(call, Some(&floor), generation).await
+        self.retain_new_owned_read(call, Some(&floor)).await
     }
 
     async fn retain_new_owned_read(
-        &self, call: &Call, applied_floor: Option<&rtdb_node::AppliedReadFloor>, generation: u64,
+        &self, call: &Call, applied_floor: Option<&rtdb_node::AppliedReadFloor>,
     ) -> Result<ActionResult, Status> {
-        let audience = call.session.audience_source().is_some();
-        let permit = if audience { None } else {
-            Some(Arc::clone(&self.0.owned_read_slots).try_acquire_owned()
-                .map_err(|_| Status::resource_exhausted("The node has too many retained owned reads"))?)
-        };
+        let permit = Arc::clone(&self.0.owned_read_slots).try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("The node has too many retained owned reads"))?;
         let connection = self.connection(call, &call.database).await?;
         let mut native = connection.borrow().await?;
         require_idle(&native)?;
-        // The audience session owns one prepaid slot. A lost reply can leave its last handle behind.
-        if audience { call.session.begin_audience_read(generation)?; }
         let snapshot = match applied_floor {
             Some(minimum) => native.open_applied_owned_read(minimum).await,
             None => native.open_owned_read().await,
         }.map_err(status)?;
-        self.retain_owned_read(call, snapshot, permit, generation, ReadPurpose::Other)
+        self.retain_owned_read(call, snapshot, permit, ReadPurpose::Other)
     }
 
     pub(crate) async fn open_owned_scoped_read_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
@@ -2470,7 +2421,7 @@ impl Service {
         let permit = Arc::clone(&self.0.owned_read_slots).try_acquire_owned()
             .map_err(|_| Status::resource_exhausted("The node has too many retained owned reads"))?;
         let snapshot = original.snapshot.scope_root_read(relations).await.map_err(status)?;
-        self.retain_owned_read(call, snapshot, Some(permit), 0, original.purpose)
+        self.retain_owned_read(call, snapshot, permit, original.purpose)
     }
 
     pub(crate) async fn open_owned_read_as_of_action(&self, call: &Call, body: &[u8], positioned: bool) -> Result<ActionResult, Status> {
@@ -2510,13 +2461,13 @@ impl Service {
         }.map_err(status)?;
         held.snapshot.check_relation(&publication).map_err(status)?;
         match snapshot {
-            Some(snapshot) => self.retain_owned_read(call, snapshot, Some(permit), 0, held.purpose),
+            Some(snapshot) => self.retain_owned_read(call, snapshot, permit, held.purpose),
             None => Ok(ActionResult { body: Bytes::from_static(&[0]) }),
         }
     }
 
     fn retain_owned_read(
-        &self, call: &Call, snapshot: OwnedReadSession, permit: Option<OwnedSemaphorePermit>, generation: u64, purpose: ReadPurpose,
+        &self, call: &Call, snapshot: OwnedReadSession, permit: OwnedSemaphorePermit, purpose: ReadPurpose,
     ) -> Result<ActionResult, Status> {
         let reservation = call.reserve(wire::add(2048, wire::add(call.session.id.len(), call.database.len())?)?)?;
         let reply_charge = call.reserve(64)?;
@@ -2529,21 +2480,11 @@ impl Service {
         reply.extend_from_slice(&snapshot.query_time().map_err(status)?.0.to_be_bytes());
         let held = Arc::new(OwnedReadResource {
             snapshot, owner: call.session.owner(), session: call.session.id.clone(), database: call.database.clone(), purpose,
-            audience_work: rtdb_storage::audience_work::current_turn(),
-            audience_projection_work: (generation > 1 && call.session.audience_source().is_some()).then(|| {
-                rtdb_storage::audience_work::TurnAllowance::new(
-                    crate::config::AUDIENCE_TURN_LIMITS, crate::config::AUDIENCE_TURN_ACTIONS,
-                )
-            }),
             witnesses: Mutex::default(), spatial_filters: Mutex::default(), _permit: permit, _reservation: reservation,
         });
         let handle = Bytes::copy_from_slice(handle.as_bytes());
-        if call.session.audience_source().is_some() {
-            call.session.install_audience_read(generation, handle, held)?;
-        } else {
-            call.session.register_read(||
-                self.0.owned_reads.insert(handle, held, READ_IDLE, READ_IDLE, false, 16).map_err(status))?;
-        }
+        call.session.register_read(||
+            self.0.owned_reads.insert(handle, held, READ_IDLE, READ_IDLE, false, 16).map_err(status))?;
         Ok(ActionResult { body: wire::retain(reply, reply_charge) })
     }
 
@@ -2556,11 +2497,7 @@ impl Service {
     }
 
     fn retained_owned_read(&self, call: &Call, handle: &Bytes) -> Result<Arc<OwnedReadResource>, Status> {
-        let entry = if call.session.audience_source().is_some() {
-            call.session.audience_read(handle).ok_or_else(|| Status::not_found("unknown owned read"))?
-        } else {
-            found(self.0.owned_reads.lookup(handle, false), "owned read")?
-        };
+        let entry = found(self.0.owned_reads.lookup(handle, false), "owned read")?;
         if entry.session != call.session.id || entry.database != call.database || !call.session.owns(&entry.owner) {
             return Err(Status::not_found("unknown owned read"));
         }
@@ -2578,43 +2515,6 @@ impl Service {
         Ok(entry)
     }
 
-    pub(crate) fn audience_open_generation(&self, body: &[u8]) -> Result<u64, Status> {
-        let (_, rest) = hosted_observation::applied_read_floor(body)?;
-        let generation = u64::from_be_bytes(rest.try_into().map_err(|_| invalid("Applied read requires an exact generation"))?);
-        if generation == 0 { return Err(invalid("An audience read requires a prepaid generation")); }
-        Ok(generation)
-    }
-
-    pub(crate) fn audience_read_work(
-        &self, call: &Call, action: &str, body: &[u8],
-    ) -> Result<rtdb_storage::audience_work::TurnAllowance, Status> {
-        let (handle, request) = body.split_first_chunk::<16>()
-            .ok_or_else(|| invalid("The audience observation has no original read handle"))?;
-        let held = self.retained_owned_read(call, &Bytes::copy_from_slice(handle))?;
-        let work = match action {
-            HELD_OWNED_POINT_V2 | HELD_OWNED_RANGE_V2 | HELD_TABLE_PUBLICATION_SEQUENCE_V1 => {
-                if request.len() > 16 * 1024 {
-                    return Err(invalid("The audience projection request exceeds its carrier bound"));
-                }
-                let (relation, _) = split_relation(request)?;
-                let projection = call.session.audience_projection()?;
-                if relation == projection.relation {
-                    &held.audience_projection_work
-                } else if action == HELD_OWNED_POINT_V2
-                    && (relation.name() == rtdb_types::OWNED_ROOT_PUBLICATION_RELATION
-                        || (held.audience_projection_work.is_none() && relation.name() == "fact_layout_readiness"))
-                {
-                    &held.audience_work
-                } else {
-                    return Err(Status::permission_denied("The relation is outside the prepared audience projection"));
-                }
-            },
-            READ_HELD_HOSTED_CONTROL_V3 | CONFIRM_APPLIED_HOSTED_V6 => &held.audience_work,
-            _ => return Err(unsupported()),
-        };
-        work.clone().ok_or_else(|| Status::failed_precondition("The original read has no audience work allowance"))
-    }
-
     pub(crate) async fn held_owned_point(&self, call: &Call, body: &Bytes, time: PointTime, compact: Option<CompactIdentity>, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held point has no handle"))?;
@@ -2625,9 +2525,6 @@ impl Service {
             return Err(status(error));
         }
         let (relation, id, valid, _identity) = selected_point_request(call, body, request, time, compact)?;
-        if call.session.audience_source().is_some() {
-            require_audience_point(&call.session, &relation, &id, held.audience_projection_work.is_none())?;
-        }
         let fixed = matches!(time, PointTime::Required);
         self.execute_owned_point(&held.snapshot, &relation, &id, valid, fixed, Some((call, &held)), reply_format).await
     }
@@ -3302,17 +3199,9 @@ impl Service {
 
     pub(crate) async fn held_owned_range_action(&self, call: &Call, body: &Bytes, version: HeldRangeFormat, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
-        let audience = call.session.audience_source().is_some();
-        if audience && (!matches!(version, HeldRangeFormat::Full) || body.len() > 16 * 1024) {
-            return Err(invalid("The audience page exceeds its carrier bounds"));
-        }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held range has no handle"))?;
         let handle = Bytes::copy_from_slice(handle);
-        let held = if audience {
-            self.retained_owned_read(call, &handle)?
-        } else {
-            self.owned_read(call, &handle)?
-        };
+        let held = self.owned_read(call, &handle)?;
         if let Err(error) = held.snapshot.check() {
             if let Ok(entry) = self.take_owned_read(call, &handle) { entry.close(); }
             return Err(status(error));
@@ -3320,7 +3209,7 @@ impl Service {
         let (relation, arrow) = split_relation(request)?;
         let batch = decode_batch(call, call.retain_request_bytes(body.slice_ref(arrow)))?;
         let covers_clock = batch.batch().column_by_name("cover_valid").is_some();
-        if covers_clock && (!matches!(version, HeldRangeFormat::Full) || audience) {
+        if covers_clock && !matches!(version, HeldRangeFormat::Full) {
             return Err(invalid("Valid-time range coverage requires the original live hold"));
         }
         let expected_fields = match version {
@@ -3366,15 +3255,6 @@ impl Service {
                 descending,
                 limit,
             };
-            if audience {
-                let projection = call.session.audience_projection()?;
-                if relation != projection.relation || path != projection.address_path
-                    || !(1..=5).contains(&request.limit) || request.descending
-                    || request.lower.is_some() || request.upper.is_some()
-                {
-                    return Err(invalid("The audience page requires its bounded inline address order"));
-                }
-            }
             if covers_clock {
                 held.snapshot.range_page_by_key_covered(&relation, &path, request).await
             } else if let (Some(system), Some(valid)) = (system, valid_at) {
@@ -4624,9 +4504,6 @@ impl Service {
         let (relation, request) = split_relation(request)?;
         let (publication, trailing) = split_world_publication(request)?;
         if !trailing.is_empty() { return Err(invalid("Unexpected table publication fields")); }
-        if call.session.audience_source().is_some() && relation != call.session.audience_projection()?.relation {
-            return Err(Status::permission_denied("The relation is outside the prepared audience projection"));
-        }
         let sequence = held.snapshot.table_publication_sequence(&relation, publication).await.map_err(status)?;
         held.snapshot.check().map_err(status)?;
         Ok(ActionResult { body: wire::retain(sequence.to_be_bytes().to_vec(), call.reserve(8)?) })
@@ -4808,11 +4685,7 @@ impl Service {
     }
 
     fn take_owned_read(&self, call: &Call, handle: &Bytes) -> Result<Arc<OwnedReadResource>, Status> {
-        if call.session.audience_source().is_some() {
-            call.session.take_audience_read(handle).ok_or_else(|| Status::not_found("unknown owned read"))
-        } else {
-            found(self.0.owned_reads.take(handle), "owned read")
-        }
+        found(self.0.owned_reads.take(handle), "owned read")
     }
 
     pub(crate) fn close_owned_read_action(&self, call: &Call, body: &[u8]) -> Result<(), Status> {
@@ -6105,8 +5978,7 @@ impl Service {
         }).transpose().map(Option::flatten);
         let memory = origin.map_or(self.memory(), |(call, _)| call.memory());
         let attempt = (origin.is_some() && !snapshot.is_scoped_root()
-            && relation.name() == rtdb_types::OWNED_ATTEMPT_RELATION
-            && origin.is_some_and(|(call, _)| call.session.audience_source().is_none()))
+            && relation.name() == rtdb_types::OWNED_ATTEMPT_RELATION)
             .then_some(snapshot);
         let reply = self.finish_owned_point_inner(memory, present, valid.unwrap_or(present), id, cursor, lifetime, None, attempt, reply_format, witness).await?;
         snapshot.check_live_point_relation(relation).map_err(status)?;
@@ -6196,7 +6068,7 @@ impl Service {
         Self::with_owned_point_page(memory, schema, batch, present, valid, revision, until, |schema, batch| {
             let stream = match reply_format {
                 OwnedReplyFormat::Selection(selection) => {
-                    let maximum = self.0.config.maximum_message_bytes.min(crate::config::AUDIENCE_REPLY_BYTES);
+                    let maximum = self.0.config.maximum_message_bytes.min(crate::config::POINT_REPLY_BYTES);
                     if let Some(reply) = selection.point(memory, schema, batch, maximum)? {
                         return Ok(OwnedIpcReply::Unary(reply));
                     }
@@ -6773,27 +6645,6 @@ mod protected_carrier_wire_tests {
         let column = rows.column(0).as_ref();
         assert_eq!(read_owned_entity_id(field, column, 0).unwrap(), EntityIdRef::Binary(&raw));
         assert_eq!(read_owned_entity_id(field, column, 1).unwrap(), EntityIdRef::String(&world));
-    }
-}
-
-#[cfg(test)]
-mod audience_projection_tests {
-    use super::*;
-
-    #[test]
-    fn excludes_foreign_relations_and_their_markers_from_the_projection() {
-        let visible = OwnedRelation::new("visible").unwrap();
-        let hidden = OwnedRelation::new("hidden").unwrap();
-        let markers = OwnedRelation::new(rtdb_types::OWNED_ROOT_PUBLICATION_RELATION).unwrap();
-        let readiness = OwnedRelation::new("fact_layout_readiness").unwrap();
-        let id = |value: &str| EntityId::String(value.into());
-        assert!(audience_point_admitted(&visible, &visible, &id("doc"), false));
-        assert!(!audience_point_admitted(&visible, &hidden, &id("doc"), false));
-        assert!(audience_point_admitted(&visible, &markers, &id("fact_partition_head:visible"), false));
-        assert!(!audience_point_admitted(&visible, &markers, &id("head"), false));
-        assert!(!audience_point_admitted(&visible, &markers, &id("fact_partition_head:hidden"), false));
-        assert!(!audience_point_admitted(&visible, &readiness, &id("layout"), false));
-        assert!(audience_point_admitted(&visible, &readiness, &id("layout"), true));
     }
 }
 

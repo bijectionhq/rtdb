@@ -1,10 +1,5 @@
 #![feature(proc_macro_hygiene)]
 
-#[path = "../../../rust/crates/flight-sql/src/audience_seat.rs"]
-mod audience_seat;
-#[path = "../../../rust/crates/flight-sql/src/config/seat_wire.rs"]
-mod seat_wire;
-mod seat_uuid;
 #[path = "../../../rust/crates/format/src/envelope/wire.rs"]
 mod wire;
 #[path = "../../../rust/crates/logkeeper/src/server/journal/framing.rs"]

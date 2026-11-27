@@ -66,10 +66,6 @@ impl MemoryBudget {
         (!root.is_prepaid()).then_some(root)
     }
 
-    pub fn prepaid_by(&self, budget: &Arc<Self>) -> bool {
-        self.funding.as_ref().is_some_and(|funding| Arc::ptr_eq(funding.budget(), budget))
-    }
-
     /// Reserves bytes without waiting; release occurs when the last reservation handle drops.
     /// Exceeding this budget or an ancestor limit, including size overflow, returns an error of kind `ResourceExhausted`.
     pub fn reserve(self: &Arc<Self>, bytes: usize) -> Result<Arc<MemoryReservation>> {

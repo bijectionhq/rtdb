@@ -1,85 +1,13 @@
-use std::{sync::{Arc, Mutex, Weak}, time::Duration};
+use std::sync::Arc;
 
 use arrow_array::{Int64Array, RecordBatch, TimestampMicrosecondArray};
-use rtdb_columnar::{MemoryBudget, MemoryReservation, selected_cell};
-use rtdb_storage::cache::{BufferPool, CatalogAdmission};
+use rtdb_columnar::{MemoryBudget, selected_cell};
 use rtdb_tx::HostedControlWrite;
-use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, EntityId, Interval, LogicalType, OwnedRelation, PlacedAttemptScope, Result, ScalarType, Timestamp, TransactionKey, Value};
+use rtdb_types::{Anomaly, AnomalyCategory, EntityId, Interval, LogicalType, OwnedRelation, PlacedAttemptScope, Result, ScalarType, Timestamp, TransactionKey, Value};
 
-use crate::Database;
-use super::{AppliedCatalogAdmission, CatalogReadCut, DurableRange, NativeSession, OwnedRangeWitness, OwnedReadSession, QueryBasis, TimeBasis, covers_transaction, hosted_source_unavailable, prepare_query};
+use super::{CatalogReadCut, DurableRange, NativeSession, OwnedRangeWitness, OwnedReadSession, QueryBasis, TimeBasis, covers_transaction, hosted_source_unavailable, prepare_query};
 use super::transaction_evidence::exact_transaction_row;
 use rtdb_query::QueryContext;
-
-/// A lower bound on the physical catalogs read by a prepared session, with any custody its storage owner granted.
-/// Only a hosted journal grants custody; other storage keeps the catalog readable for the GC window.
-pub(super) struct PreparedAppliedCatalog {
-    attachment: Weak<Database>,
-    floor: CatalogCut,
-    storage: Arc<BufferPool>,
-    registration: Arc<Mutex<Option<Arc<CatalogAdmission>>>>,
-    expires_at: tokio::time::Instant,
-    expiry: tokio::task::JoinHandle<()>,
-    _reservation: Arc<MemoryReservation>,
-}
-
-impl PreparedAppliedCatalog {
-    pub(super) fn from_read(read: &OwnedReadSession, memory: &Arc<MemoryBudget>) -> Result<Self> {
-        let reservation = memory.reserve(2048)?;
-        let database = read.context.catalog.database(&read.database)?;
-        let [snapshot] = database.partitions.as_slice() else { return Err(unavailable()); };
-        let floor = snapshot.catalog_cut().ok_or_else(unavailable)?;
-        let registration = snapshot.catalog_read_permit::<CatalogAdmission>()
-            .filter(|admission| database.storage.admitted(admission, Some(floor)));
-        let registration = Arc::new(Mutex::new(registration));
-        let weak = Arc::downgrade(&registration);
-        let expires_at = tokio::time::Instant::now() + Duration::from_secs(180);
-        let expiry = tokio::spawn(async move {
-            tokio::time::sleep_until(expires_at).await;
-            if let Some(registration) = weak.upgrade() {
-                let retired = registration.lock().expect("applied catalog lease").take();
-                drop(retired);
-            }
-        });
-        Ok(Self { attachment: read.attachment.clone(), floor, storage: Arc::clone(&database.storage), registration, expires_at, expiry, _reservation: reservation })
-    }
-
-    pub(super) fn storage(&self) -> &Arc<BufferPool> { &self.storage }
-
-    pub(super) fn remaining_micros(&self) -> Result<u64> {
-        self.check_live()?;
-        let remaining = self.expires_at.saturating_duration_since(tokio::time::Instant::now()).as_micros();
-        u64::try_from(remaining).ok().filter(|remaining| *remaining != 0).ok_or_else(unavailable)
-    }
-
-    pub(super) fn check_live(&self) -> Result<()> {
-        if tokio::time::Instant::now() >= self.expires_at {
-            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/applied-preparation-expired",
-                "The prepared applied catalog lease expired"));
-        }
-        Ok(())
-    }
-
-    /// The custody granted for the prepared floor, which a later capture at or after it shares.
-    pub(super) fn pin(&self, database: &Arc<Database>, cut: CatalogCut) -> Result<Option<Arc<CatalogAdmission>>> {
-        self.check_live()?;
-        if !self.attachment.upgrade().is_some_and(|original| Arc::ptr_eq(&original, database))
-            || !covers_catalog(self.floor, cut)
-        {
-            return Err(unavailable());
-        }
-        Ok(self.registration.lock().expect("applied catalog lease").as_ref().cloned())
-    }
-}
-
-impl Drop for PreparedAppliedCatalog {
-    fn drop(&mut self) { self.expiry.abort(); }
-}
-
-fn covers_catalog(floor: CatalogCut, cut: CatalogCut) -> bool {
-    cut.storage_version == floor.storage_version && cut.storage_epoch == floor.storage_epoch
-        && cut.replica_epoch == floor.replica_epoch && cut.through >= floor.through
-}
 
 /// Exact original ordinary Root point condition. Absence is a condition.
 pub struct AppliedOwnedPoint {
@@ -113,13 +41,12 @@ impl AppliedReadFloor {
 
     pub(super) fn cut<'a>(
         &self, original: Option<TransactionKey>, memory: &'a Arc<MemoryBudget>,
-        admission: AppliedCatalogAdmission<'a>,
     ) -> Result<CatalogReadCut<'a>> {
         let minimum = match original {
             Some(original) => confirmation_floor(original, self.minimum)?,
             None => self.minimum,
         };
-        Ok(CatalogReadCut::HostedApplied { minimum, history: self.history, memory, admission })
+        Ok(CatalogReadCut::HostedApplied { minimum, history: self.history, memory })
     }
 
     pub(super) async fn require_transactions(
@@ -175,7 +102,7 @@ impl NativeSession {
         floor: Option<&AppliedReadFloor>,
     ) -> Result<Option<TransactionKey>> {
         if history.is_nil() || floor.is_some_and(|floor| floor.history() != history)
-            || self.service.audience_storage.is_some() || self.placed_history()?.is_none()
+            || self.placed_history()?.is_none()
         {
             return Err(hosted_source_unavailable());
         }
@@ -479,13 +406,7 @@ impl OwnedReadSession {
             return Err(unavailable());
         }
         let purge_guard = point.map(|point| {
-            let audience_marker = self.applied_preparation.is_some()
-                && point.relation.name() == rtdb_types::OWNED_ROOT_PUBLICATION_RELATION
-                && matches!(&point.id, rtdb_types::EntityId::String(id) if id
-                    .strip_prefix("fact_partition_head:")
-                    .and_then(|relation| rtdb_types::OwnedRelation::new(relation).ok())
-                    .is_some_and(|relation| relation.is_root_data()));
-            if !(point.relation.is_root_data() || audience_marker) || point.valid_at != self.present.system_time {
+            if !point.relation.is_root_data() || point.valid_at != self.present.system_time {
                 return Err(unavailable());
             }
             self.relation_release_guard([&point.relation])
@@ -506,12 +427,9 @@ impl OwnedReadSession {
             current_time: self.node.query_instant(),
             timezone: self.context.timezone.clone(),
         };
-        let admission = self.applied_preparation.as_deref().map_or(
-            AppliedCatalogAdmission::Ordinary, AppliedCatalogAdmission::PreparedAudience,
-        );
         let current = self.node.query_context_in_placement(
             &self.database, &basis, self.identity.as_ref(), Some(&self.attachment),
-            floor.cut(Some(self.present), &self.context.memory, admission)?, &self.cancellation,
+            floor.cut(Some(self.present), &self.context.memory)?, &self.cancellation,
         ).await?;
         let database = current.catalog.database(&self.database)?;
         let [captured] = database.partitions.as_slice() else {
@@ -555,26 +473,6 @@ mod tests {
 
     fn cut(offset: i64, time: i64) -> TransactionKey {
         TransactionKey { tx_id: TxId(offset), system_time: Timestamp(time) }
-    }
-
-    #[test]
-    fn a_preparation_covers_only_forward_catalogs_in_its_residence() {
-        use rtdb_types::{ReplicaPosition, StorageEpoch, StorageVersion};
-
-        let floor = CatalogCut {
-            storage_version: StorageVersion(1), storage_epoch: StorageEpoch(2),
-            replica_epoch: StorageEpoch(3), through: ReplicaPosition(10),
-        };
-        assert!(covers_catalog(floor, floor));
-        assert!(covers_catalog(floor, CatalogCut { through: ReplicaPosition(11), ..floor }));
-        for other in [
-            CatalogCut { through: ReplicaPosition(9), ..floor },
-            CatalogCut { storage_version: StorageVersion(2), ..floor },
-            CatalogCut { storage_epoch: StorageEpoch(4), ..floor },
-            CatalogCut { replica_epoch: StorageEpoch(4), ..floor },
-        ] {
-            assert!(!covers_catalog(floor, other));
-        }
     }
 
     #[test]

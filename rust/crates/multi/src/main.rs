@@ -42,11 +42,11 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi ordered-dispose-expired-worker --manifest CONTROL_JSON --worker UUID --serial N\n\
        rtdb-multi ordered-archive-identity --archive-root PATH --archive-prefix PREFIX\n\
        rtdb-multi prepare-ordered-deployment --route FILE --name NAME --org ORG --keys PATH [--directory DIR]\n\
-       rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--advertise-host HOST] [--zone ZONE] [--cache-bytes BYTES] [--no-fsync] [--audience-authority UUID/TURNS --audience-authority-listen ADDR]\n\
-       rtdb-multi node [--directory DIR] [--installed-journals FILE | --installed-cell FILE] --storage-root PATH [--keys PATH] --cache PATH [--archive-root PATH] [--config FILE] [--control ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR --audience-journal-port PORT] [--advertise-host HOST] [--zone ZONE] [--engine-version VERSION] [--ecs-cluster ARN] [--park-after SECONDS] [--resident-idle-after SECONDS] [--min-residency SECONDS] [--max-active N] [--activations-per-second N] [--s3-write-role ARN] [--sts-endpoint URL] [--s3-compat-write-policy] [--replay-broker HOST:PORT --replay-broker-name DNS --replay-broker-ca FILE --replay-broker-token-file FILE] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE] [--classic-retained-flight-key FILE]\n\
+       rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--advertise-host HOST] [--zone ZONE] [--cache-bytes BYTES] [--no-fsync]\n\
+       rtdb-multi node [--directory DIR] [--installed-journals FILE | --installed-cell FILE] --storage-root PATH [--keys PATH] --cache PATH [--archive-root PATH] [--config FILE] [--control ADDR] [--advertise-host HOST] [--zone ZONE] [--engine-version VERSION] [--ecs-cluster ARN] [--park-after SECONDS] [--resident-idle-after SECONDS] [--min-residency SECONDS] [--max-active N] [--activations-per-second N] [--s3-write-role ARN] [--sts-endpoint URL] [--s3-compat-write-policy] [--replay-broker HOST:PORT --replay-broker-name DNS --replay-broker-ca FILE --replay-broker-token-file FILE] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE] [--classic-retained-flight-key FILE]\n\
        rtdb-multi init-storage --storage-root PATH --keys PATH\n\
        rtdb-multi enroll-terminal-storage --storage-root URL --qualification FILE\n\
-       rtdb-multi gateway [--directory DIR] [--installed-journals FILE | --installed-cell FILE] --listen ADDR [--flight-listen ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR --flight-audience-holder-port PORT] [--config FILE] [--cell NAME --cell-map ADDR] [--cell-secret FILE] [--classic-retained-flight-key FILE] [--max-connections N] [--max-connections-per-deployment N] [--max-buffered-bytes BYTES] [--shutdown-grace SECONDS]\n\
+       rtdb-multi gateway [--directory DIR] [--installed-journals FILE | --installed-cell FILE] --listen ADDR [--flight-listen ADDR] [--config FILE] [--cell NAME --cell-map ADDR] [--cell-secret FILE] [--classic-retained-flight-key FILE] [--max-connections N] [--max-connections-per-deployment N] [--max-buffered-bytes BYTES] [--shutdown-grace SECONDS]\n\
                           [--install-listen ADDR --install-token-file FILE --install-org ORG --install-replicas N]\n\
                           [--disposal-token-file FILE]\n\
        rtdb-multi cell-map --listen ADDR [--dynamodb-prefix PREFIX]\n\
@@ -124,13 +124,6 @@ impl Arguments {
     fn present(&self, name: &str) -> bool { self.flags.contains_key(name) }
     fn address(&self, name: &str, default: &str) -> Result<SocketAddr> {
         self.optional(name).unwrap_or(default).parse().map_err(|_| usage(format!("--{name} must be HOST:PORT")))
-    }
-    fn audience_listener(&self, profile: &str, listen: &str) -> Result<Option<(SocketAddr, rtdb_flight_sql::AudienceFlightConfig)>> {
-        if !self.present(profile) && !self.present(listen) { return Ok(None); }
-        let address = self.required(listen)?.parse()
-            .map_err(|_| usage(format!("--{listen} must be HOST:PORT")))?;
-        let audience = rtdb_flight_sql::AudienceFlightConfig::parse(self.required(profile)?)?;
-        Ok(Some((address, audience)))
     }
     fn number<T: std::str::FromStr>(&self, name: &str, default: T) -> Result<T> {
         self.optional(name).map(|value| value.parse().map_err(|_| usage(format!("--{name} must be a number")))).transpose().map(|value| value.unwrap_or(default))
@@ -558,7 +551,6 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         "logkeeper" => {
             let directory = directory(arguments.required("directory")?).await?;
             let logkeeper = process::start_logkeeper_with_sync(directory, process::LogkeeperSettings {
-                authority: arguments.audience_listener("audience-authority", "audience-authority-listen")?,
                 advertise_host: arguments.optional("advertise-host").map(str::to_owned),
                 listen: arguments.address("listen", "127.0.0.1:0")?, data_dir: PathBuf::from(arguments.required("data")?), fsync: !arguments.present("no-fsync"),
                 cache_bytes: arguments.number("cache-bytes", rtdb_logkeeper::ServerOptions::DEFAULT_CACHE_BYTES)?,
@@ -568,15 +560,10 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             logkeeper.run_until(cancellation).await
         }
         "node" => {
-            let mut configuration = match arguments.optional("config") {
+            let configuration = match arguments.optional("config") {
                 Some(path) => NodeConfiguration::from_yaml(&std::fs::read_to_string(path).map_err(io)?)?,
                 None => NodeConfiguration::from_yaml("server:\n  port: 0\n")?,
             };
-            if let Some(audience) = arguments.audience_listener("flight-audience", "flight-audience-listen")? {
-                configuration.flight_sql.as_mut().filter(|flight| flight.port >= 0)
-                    .ok_or_else(|| usage("--flight-audience requires a Flight SQL configuration".into()))?.audience = Some(audience);
-            }
-            let audience = configuration.flight_sql.as_ref().is_some_and(|flight| flight.audience.is_some());
             let installed_journals = arguments.optional("installed-journals").map(PathBuf::from);
             let installed_cell = arguments.optional("installed-cell")
                 .map(|path| rtdb_multi::journal::cell::InstalledCell::read(std::path::Path::new(path))).transpose()?;
@@ -585,18 +572,14 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 None => arguments.required("keys")?.to_owned(),
             };
             let directory: Arc<dyn rtdb_directory::Directory> = match arguments.optional("directory") {
-                Some(directory) => open_directory(directory, audience && arguments.present("audience-journal-port")).await?,
-                None if (installed_journals.is_some() || installed_cell.is_some()) && !audience => rtdb_directory::MemoryDirectory::new(),
+                Some(spec) => directory(spec).await?,
+                None if installed_journals.is_some() || installed_cell.is_some() => rtdb_directory::MemoryDirectory::new(),
                 None => return Err(usage("--directory is required without an installed journal manifest".into())),
             };
             let mut agent = AgentOptions::new(CellStorage::parse(arguments.required("storage-root")?)?);
             agent.installed_journal_manifest = installed_journals;
             agent.installed_cell = installed_cell;
             agent.replay_broker = replay_broker_client(&arguments, "")?;
-            if let Some(port) = arguments.optional("audience-journal-port") {
-                agent.audience_journal_port = Some(port.parse::<u16>().ok()
-                    .filter(|port| *port != 0).ok_or_else(|| usage("--audience-journal-port must be a positive port".into()))?);
-            }
             agent.world_archive = arguments.optional("archive-root").map(CellStorage::parse).transpose()?;
             if arguments.present("s3-write-role") {
                 let sts_endpoint = if arguments.present("sts-endpoint") { Some(arguments.required("sts-endpoint")?.to_owned()) } else { None };
@@ -644,14 +627,6 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             Ok(())
         }
         "gateway" => {
-            let audience = arguments.audience_listener("flight-audience", "flight-audience-listen")?;
-            let holder_port = match (audience.is_some(), arguments.optional("flight-audience-holder-port")) {
-                (true, Some(port)) => Some(port.parse::<std::num::NonZeroU16>()
-                    .map_err(|_| usage("--flight-audience-holder-port must be a nonzero TCP port".into()))?),
-                (true, None) => return Err(usage("--flight-audience-holder-port is required with an audience listener".into())),
-                (false, Some(_)) => return Err(usage("--flight-audience-holder-port requires an audience listener".into())),
-                (false, None) => None,
-            };
             let installed_journals = arguments.optional("installed-journals")
                 .map(|path| rtdb_multi::journal::hosted::GatewayRoutes::read(std::path::Path::new(path))).transpose()?.map(Arc::new);
             let installed_cell = arguments.optional("installed-cell")
@@ -659,15 +634,11 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             if installed_cell.is_some() && installed_journals.is_some() {
                 return Err(usage("Choose --installed-cell or --installed-journals".into()));
             }
-            let classic_audience = installed_cell.is_none() && arguments.present("directory") && audience.is_some_and(|(_, profile)| {
-                installed_journals.as_ref().is_none_or(|routes| !routes.contains_deployment(profile.source()))
-            });
             let directory: Arc<dyn rtdb_directory::Directory> = match arguments.optional("directory") {
-                Some(address) => open_directory(address, classic_audience).await?,
-                None if installed_journals.is_some() || installed_cell.is_some() && audience.is_none() => rtdb_directory::MemoryDirectory::new(),
-                None => return Err(usage("--directory is required without an installed journal manifest or for runtime audience Flight".into())),
+                Some(address) => directory(address).await?,
+                None if installed_journals.is_some() || installed_cell.is_some() => rtdb_directory::MemoryDirectory::new(),
+                None => return Err(usage("--directory is required without an installed journal manifest".into())),
             };
-            if classic_audience { directory.require_audience_reads()?; }
             let listener = tokio::net::TcpListener::bind(arguments.address("listen", "127.0.0.1:5432")?).await.map_err(io)?;
             tracing::info!("gateway listening on {}", listener.local_addr().map_err(io)?);
             let tls = if let Some(path) = arguments.optional("config") {
@@ -713,18 +684,6 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 }
             };
             let serving = gateway::serve(listener, directory.clone(), options.clone(), cancellation.clone());
-            let audience = if let Some(((address, audience), holder_port)) = audience.zip(holder_port) {
-                let listener = tokio::net::TcpListener::bind(address).await.map_err(io)?;
-                tracing::info!("Audience Flight gateway listening on {}", listener.local_addr().map_err(io)?);
-                Some((listener, audience, holder_port))
-            } else { None };
-            let audience_flight = async {
-                match audience {
-                    Some((listener, audience, holder_port)) => rtdb_multi::flight_gateway::serve_audience(listener,
-                        Arc::clone(&directory), options.clone(), audience, holder_port, cancellation.clone()).await,
-                    None => Ok(()),
-                }
-            };
             if arguments.present("install-listen") {
                 if let Some(routes) = &options.installed_journals {
                     routes.reserve_deployments(directory.as_ref()).await?;
@@ -745,9 +704,9 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 };
                 let installs = tokio::net::TcpListener::bind(arguments.address("install-listen", "127.0.0.1:0")?).await.map_err(io)?;
                 let installation = rtdb_multi::install::serve(installs, tls, directory.clone(), Arc::new(installer), cancellation.clone());
-                tokio::try_join!(serving, flight, audience_flight, installation)?;
+                tokio::try_join!(serving, flight, installation)?;
             } else {
-                tokio::try_join!(serving, flight, audience_flight)?;
+                tokio::try_join!(serving, flight)?;
             }
             Ok(())
         }
@@ -1369,15 +1328,8 @@ async fn dynamo_cell_map(_: &str) -> Result<Arc<dyn CellMap>> {
 }
 
 async fn directory(spec: &str) -> Result<Arc<dyn Directory>> {
-    open_directory(spec, false).await
-}
-
-async fn open_directory(spec: &str, audience: bool) -> Result<Arc<dyn Directory>> {
-    if let Some(prefix) = spec.strip_prefix("dynamodb:") { return dynamodb(prefix, false, audience).await; }
-    if let Some(prefix) = spec.strip_prefix("dynamodb+packed:") { return dynamodb(prefix, true, audience).await; }
-    if audience {
-        return Err(Anomaly::unsupported("rtdb.multi/audience-directory", "An audience listener requires a directory with a dedicated read transport"));
-    }
+    if let Some(prefix) = spec.strip_prefix("dynamodb:") { return dynamodb(prefix, false).await; }
+    if let Some(prefix) = spec.strip_prefix("dynamodb+packed:") { return dynamodb(prefix, true).await; }
     let mut attempts = 0;
     loop {
         match RemoteDirectory::connect(spec).await {
@@ -1389,35 +1341,24 @@ async fn open_directory(spec: &str, audience: bool) -> Result<Arc<dyn Directory>
 }
 
 #[cfg(feature = "dynamodb")]
-async fn dynamodb(prefix: &str, pack_parked: bool, audience: bool) -> Result<Arc<dyn Directory>> {
+async fn dynamodb(prefix: &str, pack_parked: bool) -> Result<Arc<dyn Directory>> {
     let tables = rtdb_directory::DynamoTables::with_prefix(prefix);
     let directory = match std::env::var("RTDB_DYNAMODB_ENDPOINT") {
         Ok(endpoint) => {
             let directory = rtdb_directory::DynamoDirectory::local(&endpoint, tables);
             directory.create_tables().await?;
-            if audience { directory.with_audience_reader(rtdb_directory::DynamoDirectory::local_client(&endpoint))? }
-            else { directory }
+            directory
         }
-        Err(_) => {
-            let load = || aws_config::load_defaults(aws_config::BehaviorVersion::latest());
-            if audience {
-                let (ordinary, reader) = tokio::join!(load(), load());
-                if ordinary.endpoint_url() != reader.endpoint_url() {
-                    return Err(Anomaly::incorrect("rtdb.multi/audience-directory", "Both clients must name the same directory endpoint"));
-                }
-                rtdb_directory::DynamoDirectory::from_sdk_config(&ordinary, tables)
-                    .with_audience_reader(aws_sdk_dynamodb::Client::new(&reader))?
-            } else {
-                rtdb_directory::DynamoDirectory::from_sdk_config(&load().await, tables)
-            }
-        }
+        Err(_) => rtdb_directory::DynamoDirectory::from_sdk_config(
+            &aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await, tables,
+        ),
     };
     let directory = if pack_parked { directory.with_packed_parked_records() } else { directory };
     Ok(Arc::new(directory))
 }
 
 #[cfg(not(feature = "dynamodb"))]
-async fn dynamodb(_: &str, _: bool, _: bool) -> Result<Arc<dyn Directory>> {
+async fn dynamodb(_: &str, _: bool) -> Result<Arc<dyn Directory>> {
     Err(Anomaly::unsupported("rtdb.multi/dynamodb", "This binary was built without the dynamodb feature"))
 }
 

@@ -71,7 +71,7 @@ impl ScopedS3Writes {
             None
         };
         let provider = self.provider(storage, root, authorization)?;
-        let writer = storage.open_authorized(storage.object_prefix(cell_root)?, S3Authorization::Rotating { provider, region: self.region.clone() }, io, true, None)?;
+        let writer = storage.open_authorized(storage.object_prefix(cell_root)?, S3Authorization::Rotating { provider, region: self.region.clone() }, io, true)?;
         if let Some(expected) = &terminal_namespace && writer.s3_namespace() != Some(expected) {
             return Err(Anomaly::incorrect("rtdb.s3/write-scope", "The writer credentials resolve to a different S3 namespace"));
         }

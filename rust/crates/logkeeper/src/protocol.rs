@@ -12,7 +12,6 @@ mod frame_parts;
 pub(crate) use frame_parts::{FrameParts, WIRE_BATCH_FRAMES};
 
 pub(crate) const MAXIMUM_FRAME_BYTES: usize = 256 * 1024 * 1024;
-pub(crate) const AUTHORITY_FRAME_BYTES: usize = 4096;
 
 #[derive(Clone, PartialEq, Eq, Message)]
 pub struct Entry {
@@ -374,8 +373,7 @@ pub(crate) enum RequestBody {
     ReadIndex(ReadIndexRequest),
     #[prost(message, tag = "16")]
     Identify(Identify),
-    #[prost(message, tag = "18")]
-    ConfirmAuthority(LogletCheck),
+    // Tag 18 (ConfirmAuthority) is retired; never reuse it.
     // Providers that do not enforce the journal cutoff cannot acknowledge this request.
     #[prost(message, tag = "31")]
     AppendObserved(Append),
@@ -395,7 +393,7 @@ pub(crate) enum RequestBody {
 pub(crate) struct Request {
     #[prost(uint64, tag = "1")]
     pub id: u64,
-    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 18, 30, 31, 32, 33, 34, 35, 36, 37")]
+    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 30, 31, 32, 33, 34, 35, 36, 37")]
     pub body: Option<RequestBody>,
     #[prost(string, tag = "17")]
     pub target_journal: String,
@@ -505,10 +503,6 @@ pub struct PageDigest {
     pub timed_origin_identity: Bytes,
 }
 
-/// Confirms only the promised writer. It conveys no append or commit position.
-#[derive(Clone, PartialEq, Message)]
-pub struct AuthorityConfirmed {}
-
 #[derive(Clone, PartialEq, prost::Oneof)]
 pub enum ResponseBody {
     #[prost(message, tag = "2")]
@@ -525,8 +519,7 @@ pub enum ResponseBody {
     PageDigest(PageDigest),
     #[prost(message, tag = "8")]
     JournalIdentity(JournalIdentity),
-    #[prost(message, tag = "9")]
-    AuthorityConfirmed(AuthorityConfirmed),
+    // Tag 9 (AuthorityConfirmed) is retired; never reuse it.
     #[prost(message, tag = "10")]
     ReadIndex(ReadIndexReply),
     #[prost(message, tag = "11")]
@@ -539,7 +532,7 @@ pub enum ResponseBody {
 pub(crate) struct Response {
     #[prost(uint64, tag = "1")]
     pub id: u64,
-    #[prost(oneof = "ResponseBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12")]
+    #[prost(oneof = "ResponseBody", tags = "2, 3, 4, 5, 6, 7, 8, 10, 11, 12")]
     pub body: Option<ResponseBody>,
 }
 
@@ -603,41 +596,6 @@ fn a_legacy_peer_cannot_decode_a_durable_trim_as_an_ordinary_trim() {
     let durable = LegacyTrimRequest::decode(request(RequestBody::TrimDurable(trim)).as_slice()).unwrap();
     assert!(durable.trim.is_none());
     assert_eq!(durable.target_journal, "journal");
-}
-
-#[cfg(test)]
-#[test]
-fn authority_confirmation_and_durable_trim_use_disjoint_requests() {
-    #[derive(Message)]
-    struct AuthorityRequest {
-        #[prost(message, optional, tag = "18")]
-        confirm_authority: Option<LogletCheck>,
-    }
-
-    let confirm = AuthorityRequest {
-        confirm_authority: Some(LogletCheck {
-            stream: "scope".into(),
-            epoch: 8,
-            ensemble: Bytes::from_static(&[42; 32]),
-            certified: false,
-            handoff: None,
-        }),
-    };
-    let decoded = Request::decode(confirm.encode_to_vec().as_slice()).unwrap();
-    assert!(matches!(decoded.body, Some(RequestBody::ConfirmAuthority(check))
-        if check.stream == "scope" && check.epoch == 8 && check.ensemble == &[42; 32][..]));
-
-    let trim = Request {
-        id: 1,
-        body: Some(RequestBody::TrimDurable(Trim { stream: "scope".into(), through_lsn: 4 })),
-        target_journal: "journal".into(),
-    };
-    let encoded = trim.encode_to_vec();
-    let legacy = AuthorityRequest::decode(encoded.as_slice()).unwrap();
-    assert!(legacy.confirm_authority.is_none());
-    let decoded = Request::decode(encoded.as_slice()).unwrap();
-    assert!(matches!(decoded.body, Some(RequestBody::TrimDurable(trim))
-        if trim.stream == "scope" && trim.through_lsn == 4));
 }
 
 /// Groups consecutive lsns written at the same epoch.

@@ -696,7 +696,6 @@ impl Service {
             || self.follower_only()
             || route.owner().is_none()
             || caller.principal.user_id() != route.owner()
-            || call.session.audience_source().is_some()
             || call.session.fresh_replica
         {
             return Err(denied());

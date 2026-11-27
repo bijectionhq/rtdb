@@ -56,8 +56,6 @@ pub enum Error {
     GuardedAppendUnsupported,
     #[error("cache requires {requested} bytes; limit is {limit} with {retained} retained")]
     MemoryLimit { requested: usize, limit: usize, retained: usize },
-    #[error("audience read work exceeded its installed allowance")]
-    AudienceWorkLimit,
     #[error("storage task failed: {0}")]
     Task(String),
     #[error("remote storage at {key}: {message}")]
@@ -111,7 +109,6 @@ impl From<Error> for rtdb_types::Anomaly {
             Error::GuardedAppendUnavailable => (Category::Unavailable, "rtdb.storage/guarded-append-unavailable", serde_json::json!({})),
             Error::GuardedAppendUnsupported => (Category::Unsupported, "rtdb.storage/guarded-append-unsupported", serde_json::json!({})),
             Error::MemoryLimit { requested, limit, retained } => (Category::Busy, "rtdb.storage/memory-limit", serde_json::json!({"requested": requested, "limit": limit, "retained": retained})),
-            Error::AudienceWorkLimit => (Category::Busy, "rtdb.storage/audience-work-limit", serde_json::json!({})),
             Error::Task(_) | Error::ImmutableLength { .. } => (Category::Fault, "rtdb.storage/task", serde_json::json!({})),
             Error::Remote { key, .. } => (Category::Unavailable, "rtdb.storage/remote", serde_json::json!({"key": key})),
             Error::Deposed { epoch, promised } => (Category::Conflict, "rtdb.storage/deposed", serde_json::json!({"epoch": epoch, "promised": promised})),
@@ -179,6 +176,5 @@ mod tests {
         let exhausted = rtdb_types::Anomaly::from(Error::MemoryLimit { requested: 2, limit: 1, retained: 0 });
         assert!(exhausted.is(rtdb_types::AnomalyKind::ResourceExhausted));
         assert_eq!(exhausted.category, rtdb_types::AnomalyCategory::Busy);
-        assert!(!rtdb_types::Anomaly::from(Error::AudienceWorkLimit).is(rtdb_types::AnomalyKind::ResourceExhausted));
     }
 }

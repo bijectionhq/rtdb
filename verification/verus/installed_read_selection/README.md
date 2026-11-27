@@ -25,4 +25,4 @@ The authenticated Logkeeper reducer, runtime ordering, clock qualification, and 
 The linearization point is the chosen Barrier decision.
 The corresponding Lean history can end with journal controls that leave the data LSN unchanged.
 A later append can happen while the worker waits or materializes the read.
-A query with a historical system-time cap, restored snapshot token, or a separate frozen or audience path has its own time or capture semantics.
+A query with a historical system-time cap, restored snapshot token, or a separate frozen path has its own time or capture semantics.

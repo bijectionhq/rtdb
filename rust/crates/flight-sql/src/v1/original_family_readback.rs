@@ -128,7 +128,6 @@ impl Service {
         if !caller.verified_credential
             || !catalog.is_managed()
             || self.follower_only()
-            || call.session.audience_source().is_some()
             || call.session.fresh_replica
         {
             return Err(denied());

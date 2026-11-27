@@ -1590,7 +1590,7 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let directory = MemoryDirectory::new();
         let journal = process::start_logkeeper(directory.clone(), process::LogkeeperSettings {
-            listen: "127.0.0.1:0".parse().unwrap(), advertise_host: None, authority: None,
+            listen: "127.0.0.1:0".parse().unwrap(), advertise_host: None,
             data_dir: data.path().join("journal"), fsync: true, cache_bytes: 1 << 20,
             availability_zone: "local".into(), lease: LeaseOptions::default(),
         }).await.unwrap();

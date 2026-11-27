@@ -146,27 +146,18 @@ impl S3Config {
             return Err(Anomaly::incorrect("xtdb.aws/terminal-scope", "A terminal S3 allocation must be opened as a cell"));
         }
         self.require_cell_root(storage_root)?;
-        Ok(self.open_store(storage_root, remotes, io, false, false).await?)
+        Ok(self.open_store(storage_root, remotes, io, false).await?)
     }
 
     /// Opens the cell's immutable namespace. Any result that leaves an
     /// individual write uncertain belongs to the region's retirement owner.
     pub async fn open_cell(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver, io: Arc<IoRegion>) -> Result<Arc<RemoteStore>> {
-        self.open_cell_storage(storage_root, remotes, io, false).await
-    }
-
-    /// Opens the same namespace with a second read client and its own credential provider.
-    pub async fn open_audience_cell(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver, io: Arc<IoRegion>) -> Result<Arc<RemoteStore>> {
-        self.open_cell_storage(storage_root, remotes, io, true).await
-    }
-
-    async fn open_cell_storage(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver, io: Arc<IoRegion>, audience: bool) -> Result<Arc<RemoteStore>> {
         self.require_cell_root(storage_root)?;
         #[cfg(not(feature = "versioning"))]
         if self.terminal_scope.is_some() {
             return Err(Anomaly::incorrect("xtdb.aws/terminal-scope", "Terminal cells require S3 inventory support"));
         }
-        let store = self.open_store(storage_root, remotes, io, true, audience).await?;
+        let store = self.open_store(storage_root, remotes, io, true).await?;
         #[cfg(feature = "versioning")]
         if let Some(scope) = &self.terminal_scope {
             terminal::require_enrollment(store.as_ref(), &self.object_prefix(storage_root)?, scope).await?;
@@ -174,21 +165,14 @@ impl S3Config {
         Ok(store)
     }
 
-    async fn open_store(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver, io: Arc<IoRegion>, cell: bool, audience: bool) -> Result<Arc<RemoteStore>> {
+    async fn open_store(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver, io: Arc<IoRegion>, cell: bool) -> Result<Arc<RemoteStore>> {
         if self.bucket.is_empty() { return Err(Anomaly::incorrect("xtdb.aws/invalid-config", "S3 bucket is empty")); }
         let prefix = self.object_prefix(storage_root)?;
-        let (authorization, reader) = match self.resolve_credentials(remotes)? {
-            Some(credentials) => {
-                let reader = audience.then(|| S3Authorization::Static(credentials.clone()));
-                (S3Authorization::Static(credentials), reader)
-            }
-            None if audience => {
-                let (writer, reader) = tokio::try_join!(self.default_authorization(), self.default_authorization())?;
-                (writer, Some(reader))
-            }
-            None => (self.default_authorization().await?, None),
+        let authorization = match self.resolve_credentials(remotes)? {
+            Some(credentials) => S3Authorization::Static(credentials),
+            None => self.default_authorization().await?,
         };
-        self.open_authorized(prefix, authorization, io, cell, reader)
+        self.open_authorized(prefix, authorization, io, cell)
     }
 
     async fn default_authorization(&self) -> Result<S3Authorization> {
@@ -199,7 +183,7 @@ impl S3Config {
         Ok(S3Authorization::Rotating { provider, region: configuration.region().map(|region| region.as_ref().to_owned()) })
     }
 
-    fn open_authorized(&self, prefix: ObjectKey, authorization: S3Authorization, io: Arc<IoRegion>, cell: bool, reader: Option<S3Authorization>) -> Result<Arc<RemoteStore>> {
+    fn open_authorized(&self, prefix: ObjectKey, authorization: S3Authorization, io: Arc<IoRegion>, cell: bool) -> Result<Arc<RemoteStore>> {
         #[cfg(feature = "versioning")]
         let uploads = (cell && io.publication_journal().is_some())
             .then(|| self.authorized_inventory(prefix.clone(), &authorization)).transpose()?;
@@ -220,15 +204,8 @@ impl S3Config {
         };
         if let Some(region) = &self.region { builder = builder.with_region(region); }
         if let Some(endpoint) = &endpoint { builder = builder.with_config(AmazonS3ConfigKey::S3Endpoint, endpoint.as_str()).with_allow_http(endpoint.scheme() == "http"); }
-        let audience = reader.map(|authorization| configure_authorization(builder.clone(), authorization)).transpose()?;
         let ordinary = configure_authorization(builder, authorization)?;
         let region = ordinary.get_config_value(&AmazonS3ConfigKey::Region);
-        let audience_reader = audience.map(|audience| {
-            if audience.get_config_value(&AmazonS3ConfigKey::Region) != region {
-                return Err(Anomaly::incorrect("xtdb.aws/audience-region", "Both S3 clients must name the same cell region"));
-            }
-            build_client(audience)
-        }).transpose()?;
         let namespace = S3ObjectNamespace {
             bucket: self.bucket.clone(),
             endpoint: endpoint.map(|endpoint| endpoint.to_string()),
@@ -249,10 +226,7 @@ impl S3Config {
         };
         #[cfg(not(feature = "versioning"))]
         let store = RemoteStore::new_single_put(client, prefix, io);
-        let store = match audience_reader {
-            Some(reader) => store.with_audience_reader(reader),
-            None => store,
-        }.with_s3_versioning(namespace);
+        let store = store.with_s3_versioning(namespace);
         Ok(Arc::new(match &self.terminal_scope {
             Some(scope) => store.with_terminal_allocation(scope.allocation),
             None => store,

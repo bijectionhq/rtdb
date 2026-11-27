@@ -212,7 +212,7 @@ impl Service {
                     if self.follower().is_some_and(|route| route.reader.supports_ranked_ivf()) {
                         features.push(RANKED_IVF.into());
                     }
-                } else if call.session.audience_source().is_none() && !call.session.fresh_replica {
+                } else if !call.session.fresh_replica {
                     features.extend(
                         [
                             "query",
@@ -534,7 +534,7 @@ impl Service {
         call: &Call,
         access: DatabaseAccess,
     ) -> Result<Arc<Database>, Status> {
-        if self.follower_only() || call.session.audience_source().is_some() || call.session.fresh_replica {
+        if self.follower_only() || call.session.fresh_replica {
             return Err(error::unsupported("rtdb.v1.route"));
         }
         let scoped = call.session.caller.principal.label_scope().is_some();

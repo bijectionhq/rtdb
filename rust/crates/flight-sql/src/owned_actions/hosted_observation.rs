@@ -2,7 +2,6 @@ use super::*;
 use rtdb_node::AppliedOwnedPoint;
 
 pub(crate) const OBSERVE_HELD_HOSTED_V1: &str = "rtdb.owned.ObserveHeldHosted.v1";
-pub(crate) const PREPARE_APPLIED_READ_V3: &str = "rtdb.owned.PrepareAppliedRead.v3";
 pub(crate) const CONFIRM_APPLIED_HOSTED_V6: &str = "rtdb.owned.ConfirmAppliedHosted.v6";
 pub(crate) const CONFIRM_HOSTED_SOURCE_V1: &str = "rtdb.owned.ConfirmHostedSource.v1";
 
@@ -103,27 +102,6 @@ impl Service {
         self.encode_owned_stream_reply(call.memory(), rows.schema_ref(), std::slice::from_ref(&rows), stream)
     }
 
-    pub(crate) async fn prepare_applied_read_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
-        let source = call.session.audience_source().ok_or_else(unsupported)?;
-        let (floor, rest) = applied_read_floor(body)?;
-        let (relation, rest) = split_relation(rest)?;
-        let (address_path, rest) = split_relation(rest)?;
-        if !rest.is_empty() || !relation.is_root_data() {
-            return Err(invalid("Applied preparation requires one Root relation and its address order"));
-        }
-        if floor.history() != source {
-            return Err(Status::permission_denied("The applied preparation belongs to another audience source"));
-        }
-        let connection = self.connection(call, &call.database).await?;
-        let mut native = connection.borrow().await?;
-        require_idle(&native)?;
-        let remaining = native.prepare_applied_owned_reads(&floor).await.map_err(status)?;
-        call.session.install_audience_projection(crate::state::AudienceProjection { relation, address_path })?;
-        let lease = call.session.audience_remaining_micros().ok_or_else(|| Status::unavailable("The audience session expired during catalog preparation"))?;
-        let remaining = remaining.min(lease);
-        Ok(ActionResult { body: Bytes::copy_from_slice(&remaining.to_be_bytes()) })
-    }
-
     pub(crate) async fn confirm_applied_hosted_action(
         &self,
         call: &Call,
@@ -133,19 +111,11 @@ impl Service {
         let (handle, body) = envelope.split_first_chunk::<16>()
             .ok_or_else(|| invalid("Applied confirmation requires a held handle"))?;
         let (floor, body) = applied_read_floor(body)?;
-        if call.session.audience_source().is_some_and(|source| floor.history() != source) {
-            return Err(Status::permission_denied("The applied confirmation belongs to another audience source"));
-        }
         let (deadline, body) = body.split_first_chunk::<8>()
             .ok_or_else(|| invalid("Applied confirmation requires a deadline"))?;
         let held = self.retained_owned_read(call, &Bytes::copy_from_slice(handle))?;
         let _framing = call.reserve(MAX_COMMIT_GROUPS * 512 + 8192)?;
         let (point, body) = applied_point(body)?;
-        if call.session.audience_source().is_some() {
-            if let Some(point) = &point {
-                require_audience_point(&call.session, &point.relation, &point.id, false)?;
-            }
-        }
         let groups = owned_groups(body, true, false)?;
         hosted_control::admit_control_targets(policy, groups.iter().map(|(relation, _)| relation))?;
         let scope = self.hosted_control_scope(call).await?;
@@ -153,11 +123,6 @@ impl Service {
         let control_frame = call.retain_request_bytes(envelope.clone());
         let (controls, _control_charges) =
             self.decode_hosted_control_groups(call, &control_frame, groups, scope, &mut rows_left, true)?;
-        for control in &controls {
-            if let EntityId::String(id) = control.id() {
-                hosted_control::require_audience_control(&call.session, &control.table().table, id)?;
-            }
-        }
         let until = Timestamp(i64::from_be_bytes(*deadline));
         let covered = held.snapshot.confirm_applied_hosted_read(scope, &floor, until, &controls, point.as_ref())
             .await.map_err(status)?;

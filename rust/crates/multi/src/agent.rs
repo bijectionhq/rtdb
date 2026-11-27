@@ -54,7 +54,6 @@ impl SuffixCut<'_> {
 
 #[derive(Clone, Debug)]
 pub struct AgentOptions {
-    pub audience_journal_port: Option<u16>,
     pub storage: CellStorage,
     pub installed_journal_manifest: Option<std::path::PathBuf>,
     pub installed_cell: Option<Arc<crate::journal::cell::InstalledCell>>,
@@ -96,7 +95,7 @@ pub struct S3WriteRole { pub arn: String, pub sts_endpoint: Option<String>, pub 
 
 impl AgentOptions {
     pub fn new(storage: CellStorage) -> Self {
-        Self { audience_journal_port: None, storage, installed_journal_manifest: None, installed_cell: None, world_archive: None, s3_write_role: None, replay_broker: None, activation_timeout: Duration::from_secs(30), activations_per_second: NonZeroUsize::new(200).unwrap(),
+        Self { storage, installed_journal_manifest: None, installed_cell: None, world_archive: None, s3_write_role: None, replay_broker: None, activation_timeout: Duration::from_secs(30), activations_per_second: NonZeroUsize::new(200).unwrap(),
             watch_interval: Duration::from_millis(250), clean_after_idle: Duration::from_secs(60), park_after: None, resident_idle_after: None, min_residency: Duration::ZERO,
             unsubscribe_after: Duration::from_secs(60), max_active: None, quarantine_after: 2, compaction_worker: false, max_tail_rows: None, snapshot_lifetime: SNAPSHOT_LIFETIME,
             fragments: crate::fragments::FragmentOptions::default(), apple_sync: rtdb_storage::AppleSync::Full }
@@ -137,14 +136,6 @@ fn require_recovered_checkpoint(record: &DeploymentRecord, database: &Database) 
             format!("{} has not recovered the directory's durable checkpoint", record.name),
         ))
     }
-}
-
-#[derive(Clone, Copy)]
-enum HostedReadCheck {
-    Ordinary,
-    AudienceRoute,
-    AudienceHeld,
-    AudienceCapture,
 }
 
 struct LocalHolding {
@@ -718,41 +709,10 @@ impl NodeAgent {
     /// Before a query on a deployment held with linearizable reads, confirms with a quorum of its logkeepers that no later holder has sealed its stream (`ServeLinearizableReadOnWriter`).
     pub async fn confirm_read(&self, name: &str) -> Result<()> {
         let Some(id) = self.holdings.lock().get(name).filter(|holding| holding.linearizable).map(|holding| holding.id.clone()) else { return Ok(()) };
-        self.confirm_holder(name, &id, None).await
+        self.confirm_holder(name, &id).await
     }
 
     pub async fn confirm_hosted_read(&self, database: &Database) -> Result<String> {
-        self.confirm_placed_read(database, HostedReadCheck::Ordinary).await
-    }
-
-    pub(crate) async fn confirm_audience_read(&self, database: &Database, require_quorum: bool) -> Result<String> {
-        let check = if require_quorum { HostedReadCheck::AudienceCapture } else { HostedReadCheck::AudienceRoute };
-        self.confirm_placed_read(database, check).await
-    }
-
-    pub(crate) async fn confirm_held_audience_read(&self, database: &Database) -> Result<String> {
-        self.confirm_placed_read(database, HostedReadCheck::AudienceHeld).await
-    }
-
-    pub(crate) async fn prepare_audience_seat(&self, database: Weak<Database>, index: usize,
-        task: Option<&rtdb_directory::HostedTask>) -> Result<Option<Box<dyn rtdb_directory::AudienceSeatClaim>>> {
-        let unavailable = || Anomaly::new(AnomalyCategory::Unavailable,
-            "rtdb.multi/audience-seat-unavailable", "The audience seat is not available at this placement");
-        let database = database.upgrade().ok_or_else(unavailable)?;
-        let (id, epoch) = {
-            self.holdings.lock().get(database.name())
-                .filter(|holding| holding.linearizable && holding.database.as_ptr() == Arc::as_ptr(&database))
-                .map(|holding| (holding.id.clone(), holding.epoch)).ok_or_else(unavailable)?
-        };
-        let source = uuid::Uuid::parse_str(&id).map_err(|_| unavailable())?;
-        if database.requires_anchored_catalog() {
-            self.confirm_audience_read(&database, false).await?;
-            return self.directory.prepare_installed_audience_seat(source, index, task).await;
-        }
-        self.directory.prepare_audience_seat(source, index, &self.member(), epoch, task).await
-    }
-
-    async fn confirm_placed_read(&self, database: &Database, check: HostedReadCheck) -> Result<String> {
         let name = database.name();
         let unavailable = || Anomaly::new(
             AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, format!("This node does not hold a linearizable database for {name}"),
@@ -780,68 +740,26 @@ impl NodeAgent {
             return Ok(id);
         }
         let member_id = self.member();
-        let record = match check {
-            HostedReadCheck::Ordinary => self.directory.deployment(&id).await?,
-            HostedReadCheck::AudienceRoute | HostedReadCheck::AudienceHeld | HostedReadCheck::AudienceCapture => {
-                self.directory.audience_authority(&id, &member_id).await?.and_then(|(record, member)| {
-                    (member.id == member_id && record.may_hold_on(&member, now_ms())).then_some(record)
-                })
-            }
-        }.filter(|record| record.id == id && record.name == name && record.linearizable_reads
-            && matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
-            && (record.epoch == epoch && record.holder.as_ref() == Some(&member_id)
-                || matches!(check, HostedReadCheck::AudienceHeld)
-                    && writer_handoff::retains_incumbent_read(record, &member_id, epoch)))
+        let record = self.directory.deployment(&id).await?
+            .filter(|record| record.id == id && record.name == name && record.linearizable_reads
+                && matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
+                && record.epoch == epoch && record.holder.as_ref() == Some(&member_id))
             .ok_or_else(unavailable)?;
-        if !matches!(check, HostedReadCheck::Ordinary) {
-            let scope = rtdb_types::PlacedAttemptScope::new(&record.stream("replica"), epoch)?;
-            if database.placed_writer_scope() != Some(scope) {
-                return Err(unavailable());
-            }
-        }
-        match check {
-            HostedReadCheck::Ordinary => {
-                require_recovered_checkpoint(&record, database)?;
-                self.confirm_holder(name, &id, None).await?;
-            },
-            HostedReadCheck::AudienceRoute | HostedReadCheck::AudienceHeld => {}
-            HostedReadCheck::AudienceCapture => {
-                let port = self.options.audience_journal_port.ok_or_else(unavailable)?;
-                self.confirm_holder(name, &id, Some(port)).await?;
-            }
-        }
-        // The holder recovers its commissioning checkpoint before it is
-        // installed. Audience captures prove their own pinned catalog and
-        // projected floor, even as the directory's maintenance cut advances.
-        if !matches!(check, HostedReadCheck::Ordinary)
-            && !self.holdings.lock().get(name).is_some_and(|holding|
-                holding.epoch == epoch && holding.linearizable
-                    && std::ptr::eq(holding.database.as_ptr(), database))
-        {
-            return Err(unavailable());
-        }
+        require_recovered_checkpoint(&record, database)?;
+        self.confirm_holder(name, &id).await?;
         Ok(id)
     }
 
-    async fn confirm_holder(&self, name: &str, id: &str, authority_port: Option<u16>) -> Result<()> {
+    async fn confirm_holder(&self, name: &str, id: &str) -> Result<()> {
         let ordered = self.holdings.lock().get(name).filter(|holding| holding.id == id)
             .filter(|holding| matches!(&holding.authority, HoldingAuthority::Journal(_)))
             .and_then(|holding| holding.database.upgrade());
         if let Some(database) = ordered {
-            if authority_port.is_some() {
-                return Err(Anomaly::incorrect("rtdb.multi/ordered-audience", "An ordered holder uses its protected read receipt"));
-            }
             return database.confirm_replica_snapshot(&CancellationToken::new()).await;
         }
         let writer = self.writers.lock().get(id).and_then(std::sync::Weak::upgrade)
             .ok_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, format!("This node no longer holds {name}")))?;
-        let confirmation = async {
-            match authority_port {
-                Some(port) => writer.confirm_authority(port).await,
-                None => writer.confirm_leadership().await,
-            }
-        };
-        match tokio::time::timeout(CONFIRM_WITHIN, confirmation).await {
+        match tokio::time::timeout(CONFIRM_WITHIN, writer.confirm_leadership()).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(_)) => Err(Anomaly::new(AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, format!("This node no longer holds {name}"))),
             Err(_) => Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/leadership-unconfirmed", format!("A quorum of {name}'s logkeepers did not confirm its holder in time"))),

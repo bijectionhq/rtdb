@@ -126,7 +126,6 @@ impl OwnedReadSession {
             receiver_observation: None,
             witness_scope: None,
             applied_scope: None,
-            applied_preparation: None,
             witness_until: selected.system_time,
             fork_until: self.fork_until,
             cancellation,

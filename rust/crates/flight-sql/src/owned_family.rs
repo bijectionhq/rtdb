@@ -555,12 +555,12 @@ impl Service {
     pub(crate) fn supports_retired_original_family(&self, call: &Call) -> bool {
         self.0.config.owned_native_actions && self.0.config.owned_world_host.as_ref()
             .is_some_and(|host| host.supports_retired_original_family())
-            && !call.session.fresh_replica && call.session.audience_source().is_none()
+            && !call.session.fresh_replica
             && is_authenticated_original_attachment(call.session.caller.owner, call.session.placed_database(), &call.database)
     }
 
     pub(crate) async fn assertion_family_action(&self, call: &Call, action: &str, body: &Bytes) -> Result<ActionResult, Status> {
-        if !self.0.config.owned_native_actions || call.session.audience_source().is_some() { return Err(unsupported()); }
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
         if (action == FAMILY_RESPONSE_RELEASE_V2 && !self.supports_hosted_upload(call))
             || (matches!(action, RETIRED_ORIGINAL_FAMILY_V1 | RETIRED_ORIGINAL_WORLD_RANK_V1)

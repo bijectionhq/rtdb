@@ -293,7 +293,6 @@ pub async fn run_rank_partition<S: RankSource>(
     let mut prepare = std::pin::pin!(prepare);
     let mut source = None::<S>;
     while let Some((claim, work)) = ranking.claim(partition, cancellation).await? {
-        rtdb_storage::audience_work::scan_items(1)?;
         let outcome = match work {
             Work::Open => {
                 let opened = cancellation.run_until_cancelled(prepare.as_mut()).await.ok_or_else(cancelled)??;

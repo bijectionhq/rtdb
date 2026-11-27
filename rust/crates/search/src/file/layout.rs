@@ -379,11 +379,10 @@ impl AuthenticatedPage {
     }
 
     pub fn decode_admitted(mut self, decoder: &FileDecoder,
-        reserve: impl Fn(usize) -> Result<Arc<rtdb_types::MemoryReservation>>, detach: bool, wire_credit: usize,
+        reserve: impl Fn(usize) -> Result<Arc<rtdb_types::MemoryReservation>>, detach: bool,
     ) -> Result<RecordBatch> {
         let bound = self.decode_bound()?;
         let wire = self.bytes.len();
-        rtdb_storage::audience_work::decode_bytes(bound.max(wire).saturating_sub(wire_credit))?;
         let mut charge = reserve(bound)?;
         if detach {
             let copy = reserve(wire.next_multiple_of(64))?;

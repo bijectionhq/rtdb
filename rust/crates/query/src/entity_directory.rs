@@ -10,7 +10,7 @@ use rtdb_format::{
     log::proto::EntityDirectoryRoot,
 };
 use rtdb_index::{Snapshot, TrieState};
-use rtdb_storage::{audience_work, cache::BufferPool};
+use rtdb_storage::cache::BufferPool;
 use rtdb_types::{
     Anomaly, BlockIndex, EventHeader, EventOp, Iid, MemoryBudget, Result, TableRef,
 };
@@ -140,7 +140,6 @@ async fn visit_rows(
             if read.cancellation.is_cancelled() {
                 return Err(cancelled());
             }
-            audience_work::scan_items(1)?;
             done = !visit(LogicalEvent::decode(&row)?)?;
             Ok(!done)
         })
@@ -225,7 +224,6 @@ pub async fn resolve_points(
             }
             for row in segment.iid_sources(iid, request.memory)? {
                 let (header, source) = row?;
-                audience_work::scan_items(1)?;
                 let batch = source.batch.view();
                 let origin = batch.origin(source.row)?;
                 let key = batch.entity_key(source.row)?.map(<[u8]>::to_vec);

@@ -1,5 +1,5 @@
 {
-  "summary": "Replica and source envelope decoding, protobuf wire limits, exact journal framing and Flight audience seat decoding.",
+  "summary": "Replica and source envelope decoding, protobuf wire limits and exact journal framing.",
   "flags": [
     "--no-external-by-default"
   ],
@@ -7,7 +7,7 @@
     "prost-log-message",
     "prost-journal-record"
   ],
-  "min_verified_functions": 60,
+  "min_verified_functions": 45,
   "controls": {
     "ignore-delimited-length": {
       "defect": "A short length-delimited field is clipped to the available bytes.",
@@ -25,7 +25,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 59
+      "min_verified_functions": 44
     },
     "stop-after-external-field": {
       "defect": "A recognized external payload hides a malformed suffix.",
@@ -43,7 +43,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 59
+      "min_verified_functions": 44
     },
     "drop-group-depth-check": {
       "defect": "Nested groups can recurse past the protobuf depth ceiling.",
@@ -66,7 +66,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 59
+      "min_verified_functions": 44
     },
     "no-progress-in-group": {
       "defect": "Group traversal processes the same nested field without advancing.",
@@ -84,7 +84,7 @@
           "category": "decreases not satisfied at end of loop"
         }
       ],
-      "min_verified_functions": 59
+      "min_verified_functions": 44
     },
     "discard-high-key-bits": {
       "defect": "A key beyond the maximum field number can alias an in-range field.",
@@ -102,7 +102,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 59
+      "min_verified_functions": 44
     },
     "ignore-located-trailing-bytes": {
       "defect": "A single-record payload location can contain a suffix outside its declared body.",
@@ -120,7 +120,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 59
+      "min_verified_functions": 44
     },
     "decode-torn-stream-body": {
       "defect": "A journal reader shortens the declared length and tries to decode the shorter body.",
@@ -138,7 +138,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 59
+      "min_verified_functions": 44
     },
     "ignore-body-checksum": {
       "defect": "A whole body can be accepted without its checksum matching the header.",
@@ -156,7 +156,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 59
+      "min_verified_functions": 44
     },
     "short-frame-size": {
       "defect": "Frame sizing computes an off-by-one byte span for a nonempty journal body.",
@@ -174,7 +174,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 59
+      "min_verified_functions": 44
     },
     "write-uncertified-activation": {
       "defect": "A certified record is dropped instead of framed.",
@@ -192,7 +192,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 59
+      "min_verified_functions": 44
     },
     "discard-stream-certification": {
       "defect": "A sequential journal read clears the record's certification bit.",
@@ -210,7 +210,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 59
+      "min_verified_functions": 44
     },
     "discard-located-certification": {
       "defect": "A read at a retained record location clears the certification bit.",
@@ -228,7 +228,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 59
+      "min_verified_functions": 44
     },
     "discard-round-trip-certification": {
       "defect": "The composed writer and located reader return a record with its certification bit cleared.",
@@ -246,7 +246,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 59
+      "min_verified_functions": 44
     },
     "discard-replica-term": {
       "defect": "Decoding an encoded replica envelope replaces its term with a default.",
@@ -264,7 +264,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 59
+      "min_verified_functions": 44
     },
     "drop-refusal-prefix-check": {
       "defect": "An RTDB extension replica record is accepted without its XTDB refusal prefix.",
@@ -282,7 +282,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 59
+      "min_verified_functions": 44
     },
     "reverse-external-classification": {
       "defect": "The envelope substitutes the opposite of the completed scan's answer.",
@@ -300,7 +300,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 59
+      "min_verified_functions": 44
     },
     "discard-decoded-envelope-term": {
       "defect": "The decoded frame loses its retained term when converted into an envelope.",
@@ -318,7 +318,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 59
+      "min_verified_functions": 44
     },
     "omit-encoded-source-body": {
       "defect": "A source protobuf encode loses the message it must round-trip.",
@@ -336,7 +336,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 59
+      "min_verified_functions": 44
     },
     "drop-legacy-source-header": {
       "defect": "The stored legacy transaction loses its original header in the decoded value.",
@@ -354,7 +354,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 59
+      "min_verified_functions": 44
     },
     "bypass-replica-stage": {
       "defect": "An invalid timed stage may enter a decoded replica frame.",
@@ -372,7 +372,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 59
+      "min_verified_functions": 44
     },
     "refuse-encoded-retirement": {
       "defect": "A canonical tagged retirement no longer round-trips.",
@@ -390,7 +390,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 59
+      "min_verified_functions": 44
     },
     "classify-plain-as-retirement": {
       "defect": "The exact untagged attempt is reported as a retirement.",
@@ -408,7 +408,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 59
+      "min_verified_functions": 44
     },
     "change-log-version-byte": {
       "defect": "The protobuf framing header changes its wire identity.",
@@ -426,7 +426,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 59
+      "min_verified_functions": 44
     },
     "change-extension-header-byte": {
       "defect": "The RTDB extension framing header changes its wire identity.",
@@ -444,7 +444,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 59
+      "min_verified_functions": 44
     },
     "change-retirement-marker": {
       "defect": "The fixed retirement marker changes its wire identity.",
@@ -462,97 +462,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 59
-    },
-    "permit-seat-leading-zero": {
-      "defect": "A prepaid turn can have a second textual encoding with a leading zero.",
-      "mutate": [
-        {
-          "file": "rust/crates/flight-sql/src/config/seat_wire.rs",
-          "find": "41 if bytes[0] >= b'1' &&",
-          "replace": "41 if bytes[0] >= b'0' &&"
-        }
-      ],
-      "expect": [
-        {
-          "file": "rust/crates/flight-sql/src/config/seat_wire.rs",
-          "function": "seat_prefix",
-          "category": "assertion failed"
-        }
-      ],
-      "min_verified_functions": 59
-    },
-    "ignore-uuid-spelling": {
-      "defect": "A parsed UUID alias can bypass the unique lowercase hyphenated seat spelling.",
-      "mutate": [
-        {
-          "file": "rust/crates/flight-sql/src/config/seat_wire.rs",
-          "find": "    if !canonical_attempt_text(bytes, start, &canonical) { return None; }\n",
-          "replace": ""
-        }
-      ],
-      "expect": [
-        {
-          "file": "rust/crates/flight-sql/src/config/seat_wire.rs",
-          "function": "parse_seat_fields",
-          "category": "postcondition not satisfied"
-        }
-      ],
-      "min_verified_functions": 59
-    },
-    "permit-third-alternate": {
-      "defect": "Flight can select an alternate outside the two reserved session slots.",
-      "mutate": [
-        {
-          "file": "rust/crates/flight-sql/src/audience_seat.rs",
-          "find": "        b'1' => Some(true),",
-          "replace": "        b'1' => Some(true),\n        b'2' => Some(false),"
-        }
-      ],
-      "expect": [
-        {
-          "file": "rust/crates/flight-sql/src/audience_seat.rs",
-          "function": "parse_seat_alternate",
-          "category": "postcondition not satisfied"
-        }
-      ],
-      "min_verified_functions": 59
-    },
-    "accept-duplicate-seat-header": {
-      "defect": "A handshake can contain two copies of its seat header.",
-      "mutate": [
-        {
-          "file": "rust/crates/flight-sql/src/config/seat_wire.rs",
-          "find": "    audience && handshake && first && !second\n",
-          "replace": "    audience && handshake && first\n"
-        }
-      ],
-      "expect": [
-        {
-          "file": "rust/crates/flight-sql/src/config/seat_wire.rs",
-          "function": "accepts_seat_header",
-          "category": "postcondition not satisfied"
-        }
-      ],
-      "min_verified_functions": 59
-    },
-    "change-seat-header": {
-      "defect": "The reserved Flight seat header is replaced with another name.",
-      "mutate": [
-        {
-          "file": "rust/crates/flight-sql/src/config/seat_wire.rs",
-          "find": "pub const AUDIENCE_SEAT_HEADER: &str = \"x-rtdb-audience-reader-seat\";",
-          "replace": "pub const AUDIENCE_SEAT_HEADER: &str = \"x-rtdb-audience-reader-seats\";"
-        }
-      ],
-      "expect": [
-        {
-          "file": "rust/crates/flight-sql/src/config/seat_wire.rs",
-          "function": "audience_header_names_keep_their_protocol_spelling",
-          "category": "postcondition not satisfied"
-        }
-      ],
-      "min_verified_functions": 59
+      "min_verified_functions": 44
     }
   }
 }

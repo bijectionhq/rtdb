@@ -2913,7 +2913,7 @@ async fn follower_compactor_publishes_results_through_the_writer_without_claimin
         fn validate(&self, _: &str, _: &DatabaseConfig) -> Result<()> { Ok(()) }
         async fn open_storage(&self, _: &str, _: &DatabaseConfig) -> Result<DatabaseStorage> {
             Ok(DatabaseStorage {
-                audience_storage: None,
+                installed_journal: false,
                 checkpoint_metadata: None, fragment_storage: None,
                 store: self.store.clone(), blocks: Default::default(), storage_epoch: rtdb_types::StorageEpoch(0), storage_version: rtdb_format::keys::CURRENT_STORAGE_VERSION,
                 io: rtdb_storage::IoRegion::new(),
@@ -2977,7 +2977,7 @@ async fn a_successor_retires_an_old_leaders_trie_once_it_leaves_the_garbage_wind
             let io = IoRegion::new();
             let store = LocalStore::open_in(&self.storage, Arc::clone(&io))?.with_catalog_ledger(StorageEpoch(0));
             Ok(DatabaseStorage {
-                audience_storage: None,
+                installed_journal: false,
                 store: Arc::new(store), blocks: Default::default(), checkpoint_metadata: None, fragment_storage: None,
                 storage_epoch: StorageEpoch(0), storage_version: CURRENT_STORAGE_VERSION, io,
             })
@@ -3143,7 +3143,7 @@ async fn startup_selects_a_newer_checkpoint_when_its_initial_replica_prefix_was_
 
         async fn open_storage(&self, _: &str, _: &DatabaseConfig) -> Result<DatabaseStorage> {
             Ok(DatabaseStorage {
-                audience_storage: None,
+                installed_journal: false,
                 checkpoint_metadata: None, fragment_storage: None,
                 store: self.shared.store.clone(),
                 blocks: Default::default(),

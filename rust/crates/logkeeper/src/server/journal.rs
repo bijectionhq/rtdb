@@ -212,7 +212,6 @@ pub(crate) struct Work {
     pub write: Write,
     pub done: oneshot::Sender<std::result::Result<(), String>>,
     pub _admission: Option<tokio::sync::OwnedSemaphorePermit>,
-    pub authority_revision: Option<u64>,
     pub observed_append: Option<ObservedAppend>,
 }
 
@@ -1006,10 +1005,7 @@ pub(crate) async fn run(journal: Arc<Journal>, store: Weak<Store>, mut queue: mp
                 let mut released = false;
                 for work in works {
                     match &work.write {
-                        Write::Events(slot, events) => {
-                            if let Some(revision) = work.authority_revision {
-                                slot.publish_authority_revision(revision);
-                            }
+                        Write::Events(_, events) => {
                             released |= events.iter().any(|event| matches!(event, Event::Trim(_) | Event::Drop(_)));
                         }
                         Write::Compact(_) => released = false,
@@ -1051,7 +1047,7 @@ mod tests {
 
     fn sized(lsn: i64, epoch: u64, bytes: usize) -> Entry { Entry { lsn, epoch, timestamp: lsn, guarded: false, guarded_before: None, timed_origin: None, payload: Bytes::from(format!("{lsn}@{epoch}:{}", "x".repeat(bytes))) } }
 
-    fn work(write: Write) -> Work { Work { write, done: oneshot::channel().0, _admission: None, authority_revision: None, observed_append: None } }
+    fn work(write: Write) -> Work { Work { write, done: oneshot::channel().0, _admission: None, observed_append: None } }
 
     fn slot(journal: &Journal, name: &str) -> Arc<Slot> {
         Arc::new(Slot::new(journal.allocate_id(), name.into(), StreamState::default()))

@@ -3,14 +3,10 @@ use parking_lot::Mutex;
 use tokio_util::task::{TaskTracker, task_tracker::TaskTrackerToken};
 use crate::{Error, ReadLease, Result};
 
-#[macro_use]
-mod provider_task;
-
 tokio::task_local! {
     static RETAINED_OWNER: Arc<dyn Send + Sync>;
     static READ_LEASE: Arc<ReadLease>;
     static HELD_VIEW: Arc<HeldView>;
-    static AUDIENCE_OBJECT_READ: ();
 }
 
 /// The owners an execution keeps alive while it reads the physical catalogs it captured: the captured values themselves
@@ -78,19 +74,21 @@ impl IoRegion {
     pub async fn retaining<T>(
         owner: Arc<dyn Send + Sync>, work: impl std::future::Future<Output = T>,
     ) -> T {
-        macro_rules! combine { ($parent:ident, $owner:ident) => {{
-            if Arc::ptr_eq(&$parent, &$owner) { $owner } else { Arc::new(($parent, $owner)) }
-        }}; }
-        scope_io_owner!(RETAINED_OWNER, owner, work; combine).await
+        let owner: Arc<dyn Send + Sync> = match RETAINED_OWNER.try_with(Arc::clone) {
+            Ok(parent) if !Arc::ptr_eq(&parent, &owner) => Arc::new((parent, owner)),
+            _ => owner,
+        };
+        RETAINED_OWNER.scope(owner, work).await
     }
     /// Carries a held view into both synchronous and provider-backed reads in this execution.
     pub fn reading<F: std::future::Future>(view: Arc<HeldView>, work: F) -> impl std::future::Future<Output = F::Output> {
-        macro_rules! combine { ($parent:ident, $view:ident) => {{
-            if Arc::ptr_eq(&$parent, &$view) { $view } else {
-                Arc::new(HeldView { _owners: Arc::from([$parent as Arc<dyn Send + Sync>, $view]) })
+        let view = match HELD_VIEW.try_with(Arc::clone) {
+            Ok(parent) if !Arc::ptr_eq(&parent, &view) => {
+                Arc::new(HeldView { _owners: Arc::from([parent as Arc<dyn Send + Sync>, view]) })
             }
-        }}; }
-        scope_io_owner!(HELD_VIEW, view, work; combine)
+            _ => view,
+        };
+        HELD_VIEW.scope(view, work)
     }
 
     /// Transfers this read's held authority before spawning work that may admit reads of its own.
@@ -133,12 +131,6 @@ impl IoRegion {
         READ_LEASE.try_with(Arc::clone).ok()
     }
 
-    /// Selects the dedicated provider read transport within an audience object read.
-    pub async fn audience_object_read<T>(work: impl std::future::Future<Output = T>) -> T {
-        AUDIENCE_OBJECT_READ.scope((), work).await
-    }
-    /// Whether this storage operation must use the audience object path.
-    pub fn requires_audience_transport() -> bool { AUDIENCE_OBJECT_READ.try_with(|_| ()).is_ok() }
     /// Operations admitted through this child also belong to every ancestor's drain.
     /// Closing a child leaves siblings open; closing an ancestor rejects subsequent admissions through the child.
     /// Idle child handles do not delay any drain.
@@ -178,7 +170,7 @@ impl IoRegion {
         if let Some(lease) = &lease { lease.check()?; }
         let mut admission = self.parent.as_ref().map(|parent| parent.admit()).transpose()?
             .unwrap_or_else(|| {
-                let mut lifetimes: Vec<Arc<dyn Send + Sync>> = retain_admitted_owner!(RETAINED_OWNER).into_iter().collect();
+                let mut lifetimes: Vec<Arc<dyn Send + Sync>> = RETAINED_OWNER.try_with(Arc::clone).ok().into_iter().collect();
                 if let Ok(view) = HELD_VIEW.try_with(Arc::clone) { lifetimes.push(view); }
                 IoAdmission { tokens: Vec::new(), lifetimes, lease }
             });
@@ -283,29 +275,13 @@ impl IoRegion {
     #[cfg(any(feature = "remote", test))]
     async fn run_async_admitted_unclassified<T: Send + 'static>(operation: IoAdmission, work: impl std::future::Future<Output = Result<T>> + Send + 'static) -> Result<T> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
-        let audience = Self::requires_audience_transport();
         let work = Self::inherit_reading(work);
-        // Verus checks the shared captures with contract adapters for the coroutine blocks.
-        macro_rules! spawn {
-            ($worker:ident; $captures:tt => $body:block) => { tokio::spawn(async move $body) };
-        }
-        macro_rules! hold {
-            ($custody:ident, $body:block) => {
-                crate::audience_work::hold_provider_custody($custody, async move $body).await
-            };
-        }
-        macro_rules! inherit {
-            ($worker:ident, $budget:expr, $work:ident) => { crate::audience_work::inherit($budget, $work) };
-        }
-        macro_rules! deliver {
-            ($sender:ident, $audience:ident, $work:ident) => {{
-                let result = if $audience { Self::audience_object_read($work).await } else { $work.await };
-                drop($sender.send(result));
-            }};
-        }
-        spawn_provider_task!(operation, work, sender, audience;
-            crate::audience_work::current(), spawn, hold, inherit, deliver
-        ).await.map_err(|error| Error::Task(error.to_string()))?;
+        // The worker owns the admission until the provider work drains, even after its caller stops waiting.
+        tokio::spawn(async move {
+            let operation = operation;
+            drop(sender.send(work.await));
+            drop(operation);
+        }).await.map_err(|error| Error::Task(error.to_string()))?;
         receiver.await.map_err(|error| Error::Task(error.to_string()))?
     }
 }

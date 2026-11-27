@@ -1,8 +1,8 @@
-use crate::{audience_work, Error, IoRegion, ObjectKey, ObjectObservation, ObjectStore, ReadReservation, Result, RetainedBytes, StoredObject};
+use crate::{Error, IoRegion, ObjectKey, ObjectObservation, ObjectStore, ReadReservation, Result, RetainedBytes, StoredObject};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
-use object_store::{Attribute, GetOptions, GetRange, GetResult, ObjectMeta, ObjectStore as ProviderStore, ObjectStoreExt, PutMode, PutOptions, path::Path};
+use object_store::{Attribute, GetOptions, GetResult, ObjectMeta, ObjectStore as ProviderStore, ObjectStoreExt, PutMode, PutOptions, path::Path};
 use rtdb_types::{PhysicalObjectPublication, PhysicalObjectVersion, S3ObjectNamespace, TerminalObjectPublication};
 use std::{ops::Range, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -108,13 +108,13 @@ impl RemoteStore {
     /// Uses the owner's I/O region, which must be closed and joined after all store consumers finish.
     /// Every admitted operation remains owned through caller cancellation, including publication cleanup.
     pub fn new_in(client: Arc<dyn ProviderStore>, prefix: Option<ObjectKey>, io: Arc<IoRegion>) -> Self {
-        Self { objects: Arc::new(RemoteObjects { client, audience_reader: None, prefix, uploads: None, hide_tombstones: false, read_drain: None }), io, cell: false, version_namespace: None, terminal_allocation: None, catalog: None, classic_versions: None }
+        Self { objects: Arc::new(RemoteObjects { client, prefix, uploads: None, hide_tombstones: false, read_drain: None }), io, cell: false, version_namespace: None, terminal_allocation: None, catalog: None, classic_versions: None }
     }
 
     /// Cell storage publishes a final object with one conditional provider
     /// write for untracked cell operations.
     pub fn new_single_put(client: Arc<dyn ProviderStore>, prefix: ObjectKey, io: Arc<IoRegion>) -> Self {
-        Self { objects: Arc::new(RemoteObjects { client, audience_reader: None, prefix: Some(prefix), uploads: None, hide_tombstones: true, read_drain: None }), io, cell: true, version_namespace: None, terminal_allocation: None, catalog: None, classic_versions: None }
+        Self { objects: Arc::new(RemoteObjects { client, prefix: Some(prefix), uploads: None, hide_tombstones: true, read_drain: None }), io, cell: true, version_namespace: None, terminal_allocation: None, catalog: None, classic_versions: None }
     }
 
     /// Opens a cell store with abortable, journaled publication.
@@ -124,7 +124,7 @@ impl RemoteStore {
         io: Arc<IoRegion>,
         uploads: Arc<dyn PublicationUploads>,
     ) -> Self {
-        let objects = Arc::new(RemoteObjects { client, audience_reader: None, prefix: Some(prefix), uploads: Some(uploads), hide_tombstones: true, read_drain: None });
+        let objects = Arc::new(RemoteObjects { client, prefix: Some(prefix), uploads: Some(uploads), hide_tombstones: true, read_drain: None });
         Self { objects, io, cell: true, version_namespace: None, terminal_allocation: None, catalog: None, classic_versions: None }
     }
 
@@ -136,12 +136,6 @@ impl RemoteStore {
         });
         self.catalog = Some(catalog::CatalogLedger::new(Arc::clone(&self.objects.client), key, path));
         Ok(self)
-    }
-
-    /// Uses a separate read client for the same provider namespace and credentials.
-    pub fn with_audience_reader(mut self, reader: Arc<dyn ProviderStore>) -> Self {
-        Arc::make_mut(&mut self.objects).audience_reader = Some(reader);
-        self
     }
 
     pub fn with_read_drain(mut self, scope: fn(&ObjectKey) -> Option<&str>) -> Self {
@@ -375,7 +369,7 @@ impl ObjectStore for RemoteStore {
                 .map_err(|_| Error::Task("The reserved provider range exceeds addressable memory".into()))?;
             let mut check_tombstone = false;
             let response = objects.with_read(&key, async {
-                let response = objects.read(&key, GetOptions::new().with_range(Some(range.clone())), Some(length)).await
+                let response = objects.read(&key, GetOptions::new().with_range(Some(range.clone()))).await
                     .inspect_err(|error| check_tombstone = objects.hide_tombstones && !matches!(error, Error::MissingObject(_)))?;
                 if response.range != range || response.meta.size < range.end {
                     return Err(Error::InvalidRange { key: key.to_string(), start: range.start, end: range.end, length: response.meta.size });
@@ -457,7 +451,6 @@ impl ObjectStore for RemoteStore {
 #[derive(Clone)]
 struct RemoteObjects {
     client: Arc<dyn ProviderStore>,
-    audience_reader: Option<Arc<dyn ProviderStore>>,
     prefix: Option<ObjectKey>,
     uploads: Option<Arc<dyn PublicationUploads>>,
     hide_tombstones: bool,
@@ -589,35 +582,8 @@ async fn collect_exact_body(object: GetResult, key: &ObjectKey, length: usize, w
 }
 
 impl RemoteObjects {
-    fn reader(&self) -> Result<&dyn ProviderStore> {
-        if IoRegion::requires_audience_transport() {
-            return self.audience_reader.as_deref().ok_or_else(|| Error::Closed("The provider has no dedicated audience read transport".into()));
-        }
-        if audience_work::is_bounded() {
-            return Err(Error::Closed("The audience action requires its dedicated object transport".into()));
-        }
-        Ok(self.client.as_ref())
-    }
-
-    async fn read(&self, key: &ObjectKey, options: GetOptions, body_bytes: Option<usize>) -> Result<GetResult> {
-        let audience = audience_work::is_bounded();
-        if audience {
-            let bytes = body_bytes.ok_or_else(|| Error::Closed("An audience provider read requires an exact body length".into()))?;
-            audience_work::provider_read(bytes)?;
-        }
-        let response = self.reader()?.get_opts(&self.path(key), options).await.map_err(|error| provider_error(key, error))?;
-        if audience {
-            let metadata = &response.meta;
-            let mut remaining = audience_work::PROVIDER_METADATA_BYTES.checked_sub(
-                512 + metadata.location.as_ref().len() + metadata.e_tag.as_ref().map_or(0, String::len)
-                    + metadata.version.as_ref().map_or(0, String::len)
-            ).ok_or(Error::AudienceWorkLimit)?;
-            for (key, value) in response.attributes.iter() {
-                let key_bytes = match key { Attribute::Metadata(key) => key.len(), _ => 0 };
-                remaining = remaining.checked_sub(128 + key_bytes + value.as_ref().len())
-                    .ok_or(Error::AudienceWorkLimit)?;
-            }
-        }
+    async fn read(&self, key: &ObjectKey, options: GetOptions) -> Result<GetResult> {
+        let response = self.client.get_opts(&self.path(key), options).await.map_err(|error| provider_error(key, error))?;
         if self.is_tombstone(&response) {
             return Err(Error::MissingObject(key.to_string()));
         }
@@ -635,11 +601,10 @@ impl RemoteObjects {
     }
 
     async fn read_metadata(&self, key: &ObjectKey) -> Result<ObjectMeta> {
-        if self.hide_tombstones || audience_work::is_bounded() {
-            return Ok(self.read(key, GetOptions { head: true, ..GetOptions::default() }, Some(0)).await?.meta);
+        if self.hide_tombstones {
+            return Ok(self.read(key, GetOptions { head: true, ..GetOptions::default() }).await?.meta);
         }
-        audience_work::provider_read(0)?;
-        self.reader()?.head(&self.path(key)).await.map_err(|error| provider_error(key, error))
+        self.client.head(&self.path(key)).await.map_err(|error| provider_error(key, error))
     }
 
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {
@@ -649,7 +614,7 @@ impl RemoteObjects {
 
     async fn get(&self, key: &ObjectKey) -> Result<Bytes> {
         self.with_read(key, async {
-            self.read(key, GetOptions::default(), None).await?.bytes().await.map_err(|error| provider_error(key, error))
+            self.read(key, GetOptions::default()).await?.bytes().await.map_err(|error| provider_error(key, error))
         }).await
     }
 
@@ -659,7 +624,7 @@ impl RemoteObjects {
 
     async fn read_exact(&self, key: &ObjectKey, length: usize, namespace: Option<&S3ObjectNamespace>) -> Result<ObjectObservation<Bytes>> {
         let path = self.path(key);
-        let object = self.read(key, GetOptions::default(), Some(length)).await?;
+        let object = self.read(key, GetOptions::default()).await?;
         let wrong_size = || crate::object_store::wrong_size(key, length);
         if object.meta.size != length as u64 || object.range != (0..length as u64) {
             return Err(wrong_size());
@@ -675,19 +640,11 @@ impl RemoteObjects {
             return Err(Error::InvalidRange { key: key.to_string(), start: range.start, end: range.end, length });
         }
         if range.is_empty() { return Ok(Bytes::new()); }
-        self.with_read(key, self.read_range(key, range, length)).await
+        self.with_read(key, self.read_range(key, range)).await
     }
 
-    async fn read_range(&self, key: &ObjectKey, range: Range<u64>, length: u64) -> Result<Bytes> {
-        let requested = usize::try_from(range.end - range.start).map_err(|_| Error::AudienceWorkLimit)?;
-        if audience_work::is_bounded() {
-            let options = GetOptions { range: Some(GetRange::Bounded(range.clone())), ..Default::default() };
-            let object = self.read(key, options, Some(requested)).await?;
-            let wrong_size = || crate::object_store::wrong_size(key, requested);
-            if object.range != range || object.meta.size != length { return Err(wrong_size()); }
-            return collect_exact_body(object, key, requested, wrong_size).await;
-        }
-        let bytes = self.reader()?.get_range(&self.path(key), range.clone()).await.map_err(|error| provider_error(key, error))?;
+    async fn read_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes> {
+        let bytes = self.client.get_range(&self.path(key), range.clone()).await.map_err(|error| provider_error(key, error))?;
         if bytes.len() as u64 != range.end - range.start {
             return Err(Error::Remote { key: key.to_string(), message: "provider returned an incomplete byte range".into() });
         }
@@ -847,13 +804,10 @@ impl RemoteObjects {
     }
 
     async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>> {
-        if audience_work::is_bounded() {
-            return Err(Error::Closed("An audience action cannot list provider objects".into()));
-        }
         let namespace = self.prefix.as_ref().map(|key| Path::from(key.as_str()));
         let path = directory.map(|key| self.path(key)).or_else(|| namespace.clone());
         let prefix = namespace.map(|path| format!("{path}/"));
-        let mut stream = self.reader()?.list(path.as_ref());
+        let mut stream = self.client.list(path.as_ref());
         let mut result = Vec::new();
         while let Some(metadata) = stream.try_next().await.map_err(|error| {
             let key = directory.map(ToString::to_string).unwrap_or_default();
@@ -939,27 +893,6 @@ mod tests {
             store: "test", source: Box::new(std::io::Error::other("403 AccessDenied PermissionDenied")),
         };
         assert!(matches!(provider_error(&key, error), Error::Remote { .. }));
-    }
-
-    #[tokio::test]
-    async fn an_audience_read_uses_its_own_client_or_refuses() {
-        use object_store::memory::InMemory;
-
-        let regular = Arc::new(InMemory::new());
-        let audience = Arc::new(InMemory::new());
-        let key = ObjectKey::new("receipt").unwrap();
-        regular.put(&Path::from("cell/receipt"), Bytes::from_static(b"regular").into()).await.unwrap();
-        audience.put(&Path::from("cell/receipt"), Bytes::from_static(b"audience").into()).await.unwrap();
-        let store = RemoteStore::new_single_put(regular, ObjectKey::new("cell").unwrap(), IoRegion::new());
-
-        let refused = IoRegion::audience_object_read(store.get(&key)).await;
-        assert!(matches!(refused, Err(Error::Closed(_))));
-
-        let store = store.with_audience_reader(audience);
-        assert_eq!(store.get(&key).await.unwrap(), Bytes::from_static(b"regular"));
-        assert_eq!(IoRegion::audience_object_read(store.head(&key)).await.unwrap().size, 8);
-        assert_eq!(IoRegion::audience_object_read(store.get_fresh_exact(&key, 8)).await.unwrap(), Bytes::from_static(b"audience"));
-        assert_eq!(store.get(&key).await.unwrap(), Bytes::from_static(b"regular"));
     }
 
     #[tokio::test]

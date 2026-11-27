@@ -128,7 +128,6 @@ The expanded model, replay controls and Rust changes have source review only.
 The storage pool issues an opaque catalog registration bound to its physical cut and pool residence.
 Query entry points verify that authority before opening or advancing a cursor, returning an in-memory answer, or sending a delegated or direct owned answer.
 Provider admission retains the held catalogs and registered owner through I/O drain.
-Prepared audience queries reuse their registration on the same pool and within its admitted scope.
 
 A shared byte or decoded-page cache requires an explicit opt-in by the underlying object owner.
 Encrypted and captured object stores use fresh owner-mediated reads, and coordinated raw providers can cache ciphertext below decryption.

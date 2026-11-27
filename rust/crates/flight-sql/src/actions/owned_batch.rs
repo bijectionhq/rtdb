@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use rtdb_types::AnomalyKind;
 
-use arrow_flight::{Action, Result as ActionResult};
+use arrow_flight::Result as ActionResult;
 use arrow_array::RecordBatch;
 use arrow_ipc::{
     MessageHeader,
@@ -12,13 +12,12 @@ use bytes::{Buf, Bytes};
 use prost::Message;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::ipc::RecordSpans;
-use rtdb_storage::{IoRegion, audience_work, sealing::{PlaintextDelivery, PlaintextView}};
+use rtdb_storage::sealing::{PlaintextDelivery, PlaintextView};
 use tonic::{Response, Status, metadata::MetadataValue};
 
 use crate::{
-    config::{AUDIENCE_READ_LIMITS, AUDIENCE_REPLY_BYTES, AUDIENCE_REQUEST_BYTES},
     error::{arrow, cancelled, invalid, status},
-    owned_actions::{HELD_OWNED_POINT_V2, CompactIdentity, HeldRangeFormat, OwnedReplyFormat, PointTime, ValidHistoryMode, WorldOrder},
+    owned_actions::{CompactIdentity, HeldRangeFormat, OwnedReplyFormat, PointTime, ValidHistoryMode, WorldOrder},
     service::{Call, Output, Service},
     wire,
 };
@@ -26,12 +25,10 @@ use crate::{
 pub(crate) const OWNED_IPC_HEADER: &str = "x-rtdb-owned-ipc";
 pub(super) const READ_POINTS: &str = "rtdb.owned.ReadPoints.v1";
 pub(super) const READ_SELECTION: &str = "rtdb.owned.ReadSelection.v1";
-pub(super) const READ_AUDIENCE_POINTS: &str = "rtdb.owned.ReadAudiencePoints.v1";
 pub(super) const READ_RANGES: &str = "rtdb.owned.ReadRanges.v1";
 const MAX_REQUEST_BYTES: usize = 2 << 20;
 const MAX_POINTS: u16 = 256;
 const MAX_RANGES: u16 = 32;
-const MAX_AUDIENCE_POINTS: u16 = 4;
 const DEFAULT_IPC_ALIGNMENT: usize = 64;
 const IPC_EOS: [u8; 8] = [255, 255, 255, 255, 0, 0, 0, 0];
 
@@ -39,7 +36,6 @@ const IPC_EOS: [u8; 8] = [255, 255, 255, 255, 0, 0, 0, 0];
 pub(super) enum BatchKind {
     Point,
     Selection,
-    AudiencePoints,
     Range,
 }
 
@@ -48,7 +44,6 @@ impl BatchKind {
         match action {
             READ_POINTS => Some(Self::Point),
             READ_SELECTION => Some(Self::Selection),
-            READ_AUDIENCE_POINTS => Some(Self::AudiencePoints),
             READ_RANGES => Some(Self::Range),
             _ => None,
         }
@@ -58,13 +53,8 @@ impl BatchKind {
         match self {
             Self::Point => "x-rtdb-owned-points",
             Self::Selection => "x-rtdb-owned-selection",
-            Self::AudiencePoints => "x-rtdb-audience-points",
             Self::Range => "x-rtdb-owned-ranges",
         }
-    }
-
-    pub(super) fn audience(self) -> bool {
-        matches!(self, Self::AudiencePoints)
     }
 
     fn request(self, body: Bytes) -> Result<Bytes, Status> {
@@ -72,17 +62,14 @@ impl BatchKind {
             .ok_or_else(|| invalid("Missing held read batch count"))?;
         let max = match self {
             Self::Point | Self::Selection => MAX_POINTS,
-            Self::AudiencePoints => MAX_AUDIENCE_POINTS,
             Self::Range => MAX_RANGES,
         };
-        let bytes = if self.audience() { AUDIENCE_REQUEST_BYTES } else { MAX_REQUEST_BYTES };
-        if !(2..=max).contains(&u16::from_be_bytes(*count)) || body.len() > bytes {
+        if !(2..=max).contains(&u16::from_be_bytes(*count)) || body.len() > MAX_REQUEST_BYTES {
             return Err(invalid("Held read batch exceeds its request bound"));
         }
         let max_selector = match self {
             Self::Point | Self::Range => 7,
             Self::Selection => 11,
-            Self::AudiencePoints => 0,
         };
         for _ in 0..u16::from_be_bytes(*count) {
             let (selector, request, rest) = entry(remaining)?;
@@ -115,7 +102,7 @@ impl Service {
         let mut selection = SelectionEncoder::default();
         let first = self.read_batch_entry(&call, kind, &mut body, &mut selection).await;
         let (mut headers, cutoff) = match &first {
-            Ok((_, grant)) => call.delivery_headers(grant, !kind.audience())?,
+            Ok((_, grant)) => call.delivery_headers(grant, true)?,
             Err(_) => (call.response(())?.metadata().clone(), None),
         };
         headers.insert(kind.header(), MetadataValue::from_static("v1"));
@@ -128,7 +115,7 @@ impl Service {
                 if call.cancellation.is_cancelled() {
                     Err(call.error(cancelled()))?;
                 }
-                call.handoff_action(grant, cutoff).map_err(|error| call.error(error))?;
+                call.handoff(grant, cutoff).map_err(|error| call.error(error))?;
                 service.publish();
                 yield reply;
                 if body.is_empty() {
@@ -150,31 +137,7 @@ impl Service {
         let result = call.cancellation.run_until_cancelled(async {
             let plaintext = PlaintextView::new(Arc::clone(call.memory()));
             let reply = plaintext.reading(async {
-                if kind.audience() {
-                    let owner = call.audience_io_owner().ok_or_else(|| invalid("Missing audience I/O owner"))?;
-                    let turn = self.audience_read_work(call, HELD_OWNED_POINT_V2, request)?;
-                    turn.admit_action().map_err(|error| Status::resource_exhausted(error.to_string()))?;
-                    let original = Action {
-                        r#type: HELD_OWNED_POINT_V2.to_owned(),
-                        body: body.slice_ref(request),
-                    };
-                    let work = async {
-                        audience_work::decode_bytes(original.encoded_len())
-                            .map_err(|error| Status::resource_exhausted(error.to_string()))?;
-                        self.confirm_audience_observation(call).await?;
-                        self.held_owned_point(call, &original.body, PointTime::Optional, None, OwnedReplyFormat::Selection(selection))
-                            .await.map(OwnedIpcReply::into_unary)
-                    };
-                    let reply = IoRegion::retaining(owner, audience_work::within_turn(
-                        Some(AUDIENCE_READ_LIMITS), Some(turn), work,
-                    )).await?;
-                    if reply.encoded_len() > AUDIENCE_REPLY_BYTES {
-                        return Err(Status::resource_exhausted("The audience reply exceeds its transport allowance"));
-                    }
-                    Ok(reply)
-                } else {
-                    self.batch_read(call, kind, selector, &body.slice_ref(request), selection).await
-                }
+                self.batch_read(call, kind, selector, &body.slice_ref(request), selection).await
             }).await?;
             let grant = plaintext.grant().await.map_err(status)?;
             Ok((reply, grant))
@@ -188,7 +151,6 @@ impl Service {
         selection: &mut SelectionEncoder,
     ) -> Result<ActionResult, Status> {
         match kind {
-            BatchKind::AudiencePoints => unreachable!("audience points use the reserved action allowance"),
             BatchKind::Selection if matches!(selector, 8 | 11) => {
                 let identity = if selector == 11 { CompactIdentity::Binary } else { CompactIdentity::Text };
                 self.held_owned_valid_during(call, request, ValidHistoryMode::Timeline, Some(identity), false)
@@ -534,12 +496,10 @@ mod tests {
     }
 
     #[test]
-    fn selected_windows_and_reserved_points_have_separate_bounds() {
+    fn selected_windows_and_points_have_separate_bounds() {
         let selection = Bytes::from_static(&[0, 2, 8, 0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 2]);
         assert!(BatchKind::Selection.request(selection.clone()).is_ok());
-        assert!(BatchKind::Point.request(selection.clone()).is_err());
-        assert!(BatchKind::AudiencePoints.request(selection).is_err());
-        assert!(BatchKind::AudiencePoints.request(Bytes::from_static(&[0, 5])).is_err());
+        assert!(BatchKind::Point.request(selection).is_err());
     }
 
     #[test]

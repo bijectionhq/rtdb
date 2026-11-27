@@ -44,7 +44,8 @@ pub struct Database {
     pub(crate) partition: Arc<PartitionState>,
     pub(crate) storage: Arc<BufferPool>,
     pub(crate) resolve: Arc<ResolveContext>,
-    pub(crate) audience_storage: Option<crate::AudienceReadStorage>,
+    /// An installed ordered journal serves this database's storage; original custody release is refused on it.
+    installed_journal: bool,
     pub(crate) logs: Arc<PartitionLogs>,
     pub(crate) replication: ReplicationHandle,
     serving: Option<Arc<dyn crate::serving::ServingDriver>>,
@@ -68,9 +69,6 @@ pub struct Database {
 }
 
 impl Database {
-    pub fn serves_audience_storage(&self, source: uuid::Uuid) -> bool {
-        self.audience_storage.as_ref().is_some_and(|storage| storage.source == source)
-    }
     pub fn serving_driver(&self) -> Option<&dyn crate::serving::ServingDriver> { self.serving.as_deref() }
 
     pub(crate) fn original_custody_carrier_journal<'a>(
@@ -80,7 +78,7 @@ impl Database {
         original: &'a dyn crate::serving::custody_release::OriginalCarrierObservations,
     ) -> Result<crate::serving::custody_release::AttachedCustodyCarrierJournal<'a>> {
         use crate::serving::custody_release::{AttachedCustodyCarrierJournal, release_unavailable};
-        if self.read_only || self.audience_storage.is_some() || self.cancellation.is_cancelled() {
+        if self.read_only || self.installed_journal || self.cancellation.is_cancelled() {
             return Err(release_unavailable());
         }
         let driver = self.serving_driver().filter(|driver| driver.features().contains(&"transact")).ok_or_else(release_unavailable)?;
@@ -660,7 +658,7 @@ impl DatabaseFactory {
             }
             static ATTACHMENTS: AtomicU64 = AtomicU64::new(0);
             let database = Arc::new(Database { attachment: ATTACHMENTS.fetch_add(1, Ordering::Relaxed), writes_event_history: event_history, protected_equality_epoch: uuid::Uuid::new_v4(), tokens, name, configuration, read_only, partition, storage, resolve,
-                audience_storage: resources.audience_storage, logs, replication, serving, native_serving_authority: native_authority, default_native_handle,
+                installed_journal: resources.installed_journal, logs, replication, serving, native_serving_authority: native_authority, default_native_handle,
                 custody_provider: Default::default(), replica_read_index: opened_logs.replica_read_index,
                 await_authority: opened_logs.await_authority,
                 transaction_admission: RwLock::default(), submitted_bytes: AtomicU64::new(0), replica_read_sessions: AtomicUsize::new(0), latest_stored_block: AtomicI64::new(-1),

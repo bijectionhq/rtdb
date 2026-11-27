@@ -289,7 +289,7 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let directory = rtdb_directory::MemoryDirectory::new();
         let journal = process::start_logkeeper(directory.clone(), process::LogkeeperSettings {
-            authority: None, advertise_host: None, listen: "127.0.0.1:0".parse().unwrap(),
+            advertise_host: None, listen: "127.0.0.1:0".parse().unwrap(),
             data_dir: data.path().join("journal"), fsync: true, cache_bytes: 1 << 20,
             availability_zone: "local".into(), lease: LeaseOptions::default(),
         }).await.unwrap();

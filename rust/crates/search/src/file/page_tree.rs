@@ -8,7 +8,7 @@ use arrow_buffer::Buffer;
 use arrow_ipc::{MetadataVersion, reader::FileDecoder};
 use parking_lot::Mutex;
 use futures::{StreamExt, TryStreamExt};
-use rtdb_storage::{ObjectKey, audience_work, cache::BufferPool};
+use rtdb_storage::{ObjectKey, cache::BufferPool};
 use rtdb_types::{MemoryBudget, MemoryReservation, Result};
 use rtdb_types::AnomalyKind;
 use tokio::sync::OnceCell;
@@ -327,25 +327,24 @@ impl TreeReader {
     }
 
     pub fn inline_page(&self, page: PageRef, bytes: bytes::Bytes) -> Result<RecordBatch> {
-        self.decode(page.authenticate(Buffer::from(bytes))?, None, false, 0)
+        self.decode(page.authenticate(Buffer::from(bytes))?, None, false)
     }
 
-    pub fn authenticated_page(&self, page: AuthenticatedPage, expanded: usize) -> Result<RecordBatch> {
-        self.decode(page, None, false, expanded)
+    pub fn authenticated_page(&self, page: AuthenticatedPage) -> Result<RecordBatch> {
+        self.decode(page, None, false)
     }
 
-    fn decode(&self, page: AuthenticatedPage, cache: Option<&PageCache>, detach: bool, wire_credit: usize) -> Result<RecordBatch> {
+    fn decode(&self, page: AuthenticatedPage, cache: Option<&PageCache>, detach: bool) -> Result<RecordBatch> {
         page.decode_admitted(&self.decoder, |bytes| match cache {
             Some(cache) => cache.reserve(&self.memory, bytes),
             None => self.memory.reserve(bytes),
-        }, detach, wire_credit)
+        }, detach)
     }
 
     pub async fn page(&self, page: PageRef, kind: PageKind) -> Result<RecordBatch> {
         let range = page.range()?;
         if range.end > self.length { return Err(corrupt("Search directory points outside its object")); }
         let len = usize::try_from(range.end - range.start).map_err(fault)?;
-        audience_work::decode_bytes(len)?;
         match &self.source {
             PageSource::Local { bytes, owner } => {
                 let start = usize::try_from(range.start).map_err(fault)?;
@@ -354,10 +353,10 @@ impl TreeReader {
                     let fill = owner.cache.entry(&owner.storage()?, &owner.object, page, len);
                     if let Some(batch) = fill.get() { observe_hit(); return Ok(batch.clone()); }
                     Ok(fill.get_or_try_init(|| async {
-                        self.decode(input()?, Some(&owner.cache), len <= owner.cache.limit, len)
+                        self.decode(input()?, Some(&owner.cache), len <= owner.cache.limit)
                     }).await?.clone())
                 } else {
-                    self.decode(input()?, None, false, len)
+                    self.decode(input()?, None, false)
                 }
             }
             PageSource::Remote(owner) => {
@@ -368,7 +367,7 @@ impl TreeReader {
                     observe_request(kind, range.end - range.start);
                     let lease = storage.get_scan_range(&owner.object, range).await?;
                     let page = page.authenticate(Buffer::from(bytes::Bytes::from_owner(lease)))?;
-                    self.decode(page, Some(&owner.cache), false, len)
+                    self.decode(page, Some(&owner.cache), false)
                 }).await?;
                 Ok(batch.clone())
             }
@@ -391,7 +390,6 @@ impl TreeReader {
             let range = reference.range()?;
             if range.end > self.length { return Err(corrupt("Search directory points outside its object")); }
             let len = usize::try_from(range.end - range.start).map_err(fault)?;
-            audience_work::decode_bytes(len)?;
             let fill = cache.entry(&storage, object, reference, len);
             if let Some(batch) = fill.get() { observe_hit(); result.insert(reference, batch.clone()); }
             else { needed.insert(reference, (range, fill)); }
@@ -427,7 +425,7 @@ impl TreeReader {
                         return Err(corrupt("Search planned range exceeds its returned bytes"));
                     }
                     let input = reference.authenticate(bytes.slice_with_length(start, length))?;
-                    self.decode(input, Some(cache), length <= cache.limit && length != bytes.len(), length)
+                    self.decode(input, Some(cache), length <= cache.limit && length != bytes.len())
                 }).await?;
                 result.push((reference, batch.clone()));
             }
@@ -500,8 +498,7 @@ impl TreeReader {
 
     pub(super) async fn find_sorted_keys<K: AsRef<[u8]> + Sync>(&self, directory: DirectoryRef, keys: &[K]) -> Result<Vec<Option<PageRef>>> {
         if keys.is_empty() { return Ok(Vec::new()); }
-        // Bounded audience reads spend their allowance on one page at a time.
-        let concurrency = if audience_work::is_bounded() { 1 } else { 8 };
+        let concurrency = 8;
         let mut level = vec![(directory.page, 0..keys.len())];
         for _ in 0..directory.height {
             level = futures::stream::iter(level).map(|(page, rows)| async move {

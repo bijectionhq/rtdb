@@ -184,7 +184,6 @@ async fn observe_archive_object(
 /// Other reads continue through the current serving store.
 pub(crate) struct ArchivedCheckpoint {
     files: PrefixedStore,
-    audience_transport: bool,
     objects: BTreeMap<ObjectKey, ArchivedObject>,
     archive_cipher: Arc<dyn ArchiveKey>,
     serving_cipher: PublicationSealing,
@@ -281,7 +280,7 @@ where
             Ok(None)
         },
         |admitted, owner, io| Box::pin(async move {
-            let archive = Box::pin(ArchivedCheckpoint::load(&admitted, keys, owner, io, false)).await?
+            let archive = Box::pin(ArchivedCheckpoint::load(&admitted, keys, owner, io)).await?
                 .ok_or_else(|| inconsistent("The installation lost its retained replay archive"))?;
             run(admitted, owner, archive).await.map(Some)
         }),
@@ -294,7 +293,6 @@ impl ArchivedCheckpoint {
         keys: &dyn KeyService,
         owner: Uuid,
         region: Arc<IoRegion>,
-        audience: bool,
     ) -> Result<Option<Self>> {
         let Some(source) = serving_archive(record)? else { return Ok(None); };
         let operation = source.point.operation;
@@ -302,8 +300,7 @@ impl ArchivedCheckpoint {
             return Err(inconsistent("Opening the serving archive requires its own storage admission"));
         }
         let archive = source.media()?;
-        let audience_transport = audience && matches!(&archive, CellStorage::S3 { .. });
-        let bucket = archive.open_bucket(Arc::clone(&region), audience_transport).await?;
+        let bucket = archive.bucket(Arc::clone(&region)).await?;
         let prefix = format!("checkpoint-captures/{}/{operation}", record.id);
         let scope = PrefixedStore::new(bucket.clone(), prefix.clone());
         let capture = read::<Capture>(&scope, &key("capture.json")?)
@@ -327,7 +324,6 @@ impl ArchivedCheckpoint {
         }
         Ok(Some(Self {
             files: PrefixedStore::new(bucket, format!("{prefix}/objects")),
-            audience_transport,
             objects,
             archive_cipher: archive_key(keys, &capture.point, Arc::clone(&region)).await?,
             serving_cipher: crate::store::directory_publications(keys, record, region)?,
@@ -335,10 +331,6 @@ impl ArchivedCheckpoint {
     }
 
     pub(crate) fn object_cipher(&self) -> Arc<dyn ObjectCipher> { self.archive_cipher.clone() }
-
-    pub(crate) fn supports_audience_reads(&self) -> bool {
-        self.audience_transport
-    }
 
     async fn verify_serving_transfer_envelopes(&self, raw: &dyn ObjectStore) -> Result<()> {
         for name in self.objects.keys().filter(|key| crate::cipher::object::framed(key)) {
@@ -352,13 +344,11 @@ impl ArchivedCheckpoint {
     }
 
     async fn read_plaintext(&self, name: &ObjectKey, object: &ArchivedObject) -> rtdb_storage::Result<Bytes> {
-        object.require_audience_frame(name)?;
         let ciphertext = read_object(&self.files, name, object).await?;
         object.open(self.archive_cipher.as_ref(), name, ciphertext).await
     }
 
     async fn archived_envelope(&self, name: &ObjectKey, object: &ArchivedObject) -> rtdb_storage::Result<Bytes> {
-        object.require_audience_frame(name)?;
         let sealed = read_object(&self.files, name, object).await?;
         Ok(PublicationSealing::archived(sealed))
     }
@@ -507,7 +497,7 @@ pub(crate) async fn require_transferable_serving_archive(
             Ok(None)
         },
         |record, owner, io| Box::pin(async move {
-            let retained = Box::pin(ArchivedCheckpoint::load(&record, keys, owner, io.clone(), false)).await?
+            let retained = Box::pin(ArchivedCheckpoint::load(&record, keys, owner, io.clone())).await?
                 .ok_or_else(|| inconsistent("The transfer lost its admitted serving archive"))?;
             let root = format!("{}/{}", record.storage_prefix(), checkpoint_storage_root()?);
             let discovery = record.checkpoint.map_or(PackDiscovery::List, |checkpoint| PackDiscovery::From(checkpoint.block));
@@ -547,7 +537,7 @@ pub(crate) async fn materialize_serving_archive(
             Ok(None)
         },
         |record, owner, io| Box::pin(async move {
-            let repair = Box::pin(ArchivedCheckpoint::load(&record, keys, owner, io, false)).await?
+            let repair = Box::pin(ArchivedCheckpoint::load(&record, keys, owner, io)).await?
                 .ok_or_else(|| inconsistent("The source lost its admitted repair"))?;
             Box::pin(repair.materialize(target, destination, destination_cipher)).await
         }),
@@ -612,7 +602,6 @@ impl ObjectStore for CheckpointStore {
         let Some(object) = self.archive.objects.get(key) else {
             return self.serving.observe_fresh_exact(key, length).await;
         };
-        object.require_audience_frame(key)?;
         if object.serving_bytes(key)? != length as u64 {
             return Err(Error::ConflictingObject(key.to_string()));
         }
@@ -818,13 +807,6 @@ impl ArchivedObject {
 
     fn is_legacy_trie(&self, name: &ObjectKey) -> bool {
         crate::cipher::object::framed(name) && self.frame_header_sha256.is_none()
-    }
-
-    fn require_audience_frame(&self, name: &ObjectKey) -> rtdb_storage::Result<()> {
-        if IoRegion::requires_audience_transport() && self.is_legacy_trie(name) {
-            return Err(Error::Closed("The audience archive requires authenticated trie frames".into()));
-        }
-        Ok(())
     }
 
     fn plaintext_bytes(&self, name: &ObjectKey) -> rtdb_storage::Result<u64> {
@@ -2144,7 +2126,7 @@ async fn capture_registered(
     }
 
     let archive_cipher = keys.archive_key(&archive_key_id(&point), true, Arc::clone(&io)).await?;
-    let recovery = ArchivedCheckpoint::load(record, keys, region, io.clone(), false).await?;
+    let recovery = ArchivedCheckpoint::load(record, keys, region, io.clone()).await?;
     let mut publications = crate::store::directory_publications(keys, record, io.clone())?;
     if let Some(recovery) = &recovery { publications = publications.with_archive(recovery.object_cipher()); }
     // A local sweep and this source read share the maintenance witness. The
@@ -3381,7 +3363,7 @@ mod tests {
             checkpoint_metadata_from: None, checkpoint_replay_from: None,
         });
 
-        let refused = ArchivedCheckpoint::load(&record, &keys, region, IoRegion::new(), true).await;
+        let refused = ArchivedCheckpoint::load(&record, &keys, region, IoRegion::new()).await;
         assert!(refused.is_err());
         Ok(())
     }
@@ -3401,7 +3383,7 @@ mod tests {
         let record = DeploymentRecord::new("serving", "acme", vec![], 0);
         let serving_cipher = crate::store::directory_publications(&keys, &record, IoRegion::new())?;
         let archive = ArchivedCheckpoint {
-            files, audience_transport: false, archive_cipher: crate::keys::legacy_archive_key(&material)?,
+            files, archive_cipher: crate::keys::legacy_archive_key(&material)?,
             serving_cipher, objects: BTreeMap::from([(name.clone(), ArchivedObject {
                 name: name.to_string(), bytes: original.len() as u64, sha256: digest(&original), frame_header_sha256: None,
             })]),
@@ -3443,7 +3425,6 @@ mod tests {
         let read = |object| -> Result<EncryptingStore> {
             let archive = ArchivedCheckpoint {
                 files: PrefixedStore::new(Arc::clone(&raw), "capture/objects"),
-                audience_transport: true,
                 objects: BTreeMap::from([(name.clone(), object)]),
                 archive_cipher: Arc::clone(&archive_cipher),
                 serving_cipher: publications.clone(),
@@ -3484,7 +3465,7 @@ mod tests {
         let original = serving_cipher.seal(&name, Bytes::from_static(b"first input")).await?;
         let substituted = serving_cipher.seal(&name, Bytes::from_static(b"other input")).await?;
         let archive = ArchivedCheckpoint {
-            files, audience_transport: false,
+            files,
             objects: BTreeMap::from([(name.clone(), ArchivedObject::from_sealed(&name, &ciphertext)?)]),
             archive_cipher, serving_cipher,
         };
@@ -3508,7 +3489,6 @@ mod tests {
         files.put(&name, ciphertext.clone()).await?;
         let archive = ArchivedCheckpoint {
             files,
-            audience_transport: false,
             objects: BTreeMap::from([(name.clone(), ArchivedObject {
                 name: name.to_string(), bytes: ciphertext.len() as u64, sha256: digest(&ciphertext), frame_header_sha256: None,
             })]),
@@ -3739,7 +3719,6 @@ mod tests {
         serving.put(&newer, Bytes::from_static(b"current tail")).await?;
         let archived = ArchivedCheckpoint {
             files,
-            audience_transport: false,
             objects: [(covered.clone(), ArchivedObject {
                 name: covered.to_string(), bytes: ciphertext.len() as u64, sha256: digest(&ciphertext), frame_header_sha256: None,
             })].into(),

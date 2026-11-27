@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -1663,20 +1663,6 @@ impl<T> ReplaceOutcome<T> {
         }
     }
 }
-/// How long a claimed audience seat stays reserved without renewal before
-/// another caller may reclaim it.
-pub const AUDIENCE_SEAT_LEASE: Duration = Duration::from_secs(60);
-
-#[async_trait]
-pub trait AudienceSeatClaim: Send + Sync {
-    async fn acquire(&self) -> Result<bool>;
-    /// Extends the seat's lease while its holder is still active; returns `false`
-    /// if the seat was already released or reclaimed.
-    async fn renew(&self) -> Result<bool> {
-        Ok(true)
-    }
-    async fn release(&self) -> Result<()>;
-}
 
 #[async_trait]
 pub trait Directory: Send + Sync {
@@ -1713,32 +1699,6 @@ pub trait Directory: Send + Sync {
     async fn begin_reference_disposal(&self, id: &str, expected: Version) -> Result<ReferenceDisposal>;
     async fn settle_reference_disposal(&self, permit: &ReferenceDisposal, record: DeploymentRecord, expected: Version) -> Result<Cas<DeploymentRecord>>;
     async fn change_lineage(&self, lineage: &str, change: LineageChange) -> Result<LineageState>;
-    /// Requires the read transport installed for a reserved audience listener.
-    fn require_audience_reads(&self) -> Result<()> {
-        Err(Anomaly::unsupported("rtdb.directory/audience-transport", "The directory has no audience read transport"))
-    }
-    fn require_installed_audience_seats(&self) -> Result<()> {
-        Err(Anomaly::unsupported("rtdb.directory/audience-seats", "The directory has no durable audience seat authority"))
-    }
-    /// Locates the existing holder using the audience's point-read transport.
-    /// The caller must still check its exact name, authority, and eligibility.
-    async fn audience_holder(&self, _id: &str) -> Result<Option<(DeploymentRecord, MemberRecord)>> {
-        Err(Anomaly::unsupported("rtdb.directory/audience-transport", "The directory has no audience read transport"))
-    }
-    /// Reads the current deployment and member over the audience transport.
-    /// These strongly consistent point reads leave the exact writer epoch check to the holder and journal.
-    async fn audience_authority(&self, _id: &str, _member: &MemberId) -> Result<Option<(DeploymentRecord, MemberRecord)>> {
-        Err(Anomaly::unsupported("rtdb.directory/audience-transport", "The directory has no audience read transport"))
-    }
-    /// Prepares a revision-fenced claim for one of the deployment's prepaid Flight seats.
-    async fn prepare_audience_seat(&self, _source: uuid::Uuid, _index: usize, _member: &MemberId,
-        _epoch: u64, _task: Option<&HostedTask>) -> Result<Option<Box<dyn AudienceSeatClaim>>> {
-        Err(Anomaly::unsupported("rtdb.directory/audience-seats", "The directory has no audience seat authority"))
-    }
-    async fn prepare_installed_audience_seat(&self, _source: uuid::Uuid, _index: usize,
-        _task: Option<&HostedTask>) -> Result<Option<Box<dyn AudienceSeatClaim>>> {
-        Err(Anomaly::unsupported("rtdb.directory/audience-seats", "The directory has no audience seat authority"))
-    }
     async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>>;
     async fn deployment_by_name(&self, name: &str) -> Result<Option<DeploymentRecord>>;
     async fn deployments(&self) -> Result<Vec<DeploymentRecord>>;
@@ -1833,10 +1793,9 @@ pub use receiver_clock::ReceiverClockSample;
 use receiver_clock::CLOCK_PREFIX;
 
 const REFERENCE_REVISION_PREFIX: &str = "~reference-revision/";
-const AUDIENCE_SEAT_PREFIX: &str = "~audience-seat/";
 
 fn reserved_deployment_name(name: &str) -> bool {
-    name.starts_with(REFERENCE_REVISION_PREFIX) || name.starts_with(AUDIENCE_SEAT_PREFIX) || name.starts_with(CLOCK_PREFIX)
+    name.starts_with(REFERENCE_REVISION_PREFIX) || name.starts_with(CLOCK_PREFIX)
 }
 
 fn require_deployment_name(name: &str) -> Result<()> {

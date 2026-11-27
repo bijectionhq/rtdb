@@ -22,7 +22,6 @@ fn fresh_replica_action(action: &str) -> bool {
     matches!(action, CLOSE_SESSION
         | owned_batch::READ_POINTS
         | owned_batch::READ_SELECTION
-        | owned_batch::READ_AUDIENCE_POINTS
         | owned_batch::READ_RANGES
         | OWNED_SPATIAL_READINESS_V1
         | OBSERVE_HELD_HOSTED_V1
@@ -110,71 +109,20 @@ fn classic_retained_grants_admit_only_the_selected_owned_read_surface() {
 }
 
 impl Service {
-    async fn confirm_audience_observation(&self, call: &Call) -> Result<(), Status> {
-        let source = call.session.audience_source().ok_or_else(unsupported)?;
-        let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
-        let attachment = attachment.ok_or_else(unsupported)?;
-        self.0.node.confirm_held_audience_route(&attachment, source).await.map_err(status)?;
-        Ok(())
-    }
-
     pub async fn action(&self, call: Call, action: Action, ipc_stream: bool) -> Result<Response<Output<ActionResult>>, Status> {
-        use crate::config::{AUDIENCE_READ_LIMITS, AUDIENCE_REPLY_BYTES, AUDIENCE_TURN_ACTIONS, AUDIENCE_TURN_LIMITS};
-        use crate::owned_actions::{CLOSE_OWNED_READ_V1, CONFIRM_APPLIED_HOSTED_V6, HELD_OWNED_POINT_V2, HELD_OWNED_RANGE_V2, HELD_TABLE_PUBLICATION_SEQUENCE_V1, OPEN_APPLIED_OWNED_READ_V5, PREPARE_APPLIED_READ_V3, READ_HELD_HOSTED_CONTROL_V3};
-        use rtdb_storage::audience_work;
+        use crate::owned_actions::HELD_TABLE_PUBLICATION_SEQUENCE_V1;
         if call.session.fresh_replica && !fresh_replica_action(&action.r#type) {
             return Err(call.error(Status::permission_denied("The fresh Flight route only admits reads and release of their holds")));
         }
         if let Some(batch) = owned_batch::BatchKind::for_action(&action.r#type) {
-            if call.session.audience_source().is_some() != batch.audience() {
-                return Err(call.error(Status::permission_denied("The reserved Flight session only admits audience observations")));
-            }
             if !self.0.config.owned_native_actions {
                 return Err(call.error(unsupported()));
             }
             return rtdb_types::boxed(|| self.held_read_batch(call, batch, action.body)).await;
         }
-        let ipc_stream = ipc_stream && action.r#type.starts_with("rtdb.owned.")
-            && call.session.audience_source().is_none();
-        let turn = if call.session.audience_source().is_some() {
-            let admit = || -> Result<_, Status> {
-                Ok(match action.r#type.as_str() {
-                    PREPARE_APPLIED_READ_V3 => call.session.audience_recovery_work(),
-                    OPEN_APPLIED_OWNED_READ_V5 => {
-                        let generation = self.audience_open_generation(&action.body)?;
-                        call.session.audience_projection()?;
-                        if generation == 1 {
-                            call.session.audience_recovery_work()
-                        } else {
-                            Some(audience_work::TurnAllowance::new(AUDIENCE_TURN_LIMITS, AUDIENCE_TURN_ACTIONS))
-                        }
-                    },
-                    HELD_OWNED_POINT_V2 | HELD_OWNED_RANGE_V2 | HELD_TABLE_PUBLICATION_SEQUENCE_V1 | READ_HELD_HOSTED_CONTROL_V3 | CONFIRM_APPLIED_HOSTED_V6 =>
-                        Some(self.audience_read_work(&call, &action.r#type, &action.body)?),
-                    _ => None,
-                })
-            };
-            admit().map_err(|error| call.error(error))?
-        } else { None };
-        if let Some(turn) = &turn {
-            turn.admit_action().map_err(|error| call.error(Status::resource_exhausted(error.to_string())))?;
-        }
+        let ipc_stream = ipc_stream && action.r#type.starts_with("rtdb.owned.");
         let work = Box::pin(async {
             let action_type = action.r#type.as_str();
-            if call.session.audience_source().is_some() {
-                audience_work::decode_bytes(action.encoded_len())
-                    .map_err(|error| Status::resource_exhausted(error.to_string()))?;
-                match action_type {
-                    // Catalog acquisition checks the placement and quorum at the captured cut.
-                    PREPARE_APPLIED_READ_V3 | OPEN_APPLIED_OWNED_READ_V5 | CONFIRM_APPLIED_HOSTED_V6 => {}
-                    HELD_OWNED_POINT_V2 | HELD_OWNED_RANGE_V2 | HELD_TABLE_PUBLICATION_SEQUENCE_V1 | READ_HELD_HOSTED_CONTROL_V3 => {
-                        rtdb_types::boxed(|| self.confirm_audience_observation(&call)).await?;
-                    }
-                    // These actions only relinquish resources under the authenticated local session.
-                    CLOSE_OWNED_READ_V1 | CLOSE_SESSION => {}
-                    _ => return Err(Status::permission_denied("The reserved Flight session only admits audience observations")),
-                }
-            }
             use crate::owned_actions::{
                 COMMIT_ORDERED_V1, COMMIT_OWNED_V1, COMMIT_OWNED_V3, COMMIT_OWNED_V4,
                 CommitFormat, OwnedReplyFormat, PointTime, SPATIAL_HELD_OWNED_V1, SPATIAL_HELD_OWNED_V2, SPATIAL_HELD_OWNED_V3,
@@ -280,7 +228,6 @@ impl Service {
                     self.close_spatial_owned_action(&call, &action.body)?;
                     Ok(Vec::new())
                 }
-                PREPARE_APPLIED_READ_V3 => Ok(vec![Ok(rtdb_types::boxed(|| self.prepare_applied_read_action(&call, &action.body)).await?)]),
                 crate::owned_actions::OPEN_APPLIED_OWNED_READ_V5 => Ok(vec![Ok(rtdb_types::boxed(|| self.open_applied_owned_read_action(&call, &action.body)).await?)]),
                 crate::owned_actions::SEARCH_HELD_OWNED_V7 =>
                     return rtdb_types::boxed(|| self.search_held_owned_action(&call, &action.body, reply_format)).await.map(ActionReplies::Owned),
@@ -559,14 +506,6 @@ impl Service {
             }?;
             Ok(ActionReplies::Results(results))
         });
-        let owner = call.audience_io_owner();
-        let work = async move {
-            match owner {
-                Some(owner) => rtdb_storage::IoRegion::retaining(owner,
-                    audience_work::within_turn(Some(AUDIENCE_READ_LIMITS), turn, work)).await,
-                None => work.await,
-            }
-        };
         let plaintext = rtdb_storage::sealing::PlaintextView::new(Arc::clone(call.memory()));
         let replies = call.cancellation.run_until_cancelled(plaintext.reading(work)).await
             .ok_or_else(cancelled).and_then(|result| result).map_err(|error| call.error(error))?;
@@ -578,12 +517,6 @@ impl Service {
                 return ipc_action_result_stream(call, frames.into_iter().map(Ok), plaintext).await;
             }
         };
-        if call.session.audience_source().is_some()
-            && (results.len() > 1 || results.iter().any(|result| result.as_ref().is_ok_and(|reply|
-                reply.encoded_len() > AUDIENCE_REPLY_BYTES)))
-        {
-            return Err(call.error(Status::resource_exhausted("The audience reply exceeds its transport allowance")));
-        }
         self.publish();
         if ipc_stream && matches!(results.as_slice(), [Ok(reply)] if owned_batch::is_ipc_stream(&reply.body)) {
             let reply = results.pop().expect("one action result")?;

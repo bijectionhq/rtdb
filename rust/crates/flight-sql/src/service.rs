@@ -1,4 +1,4 @@
-use std::{pin::Pin, sync::{Arc, Weak}, time::Duration};
+use std::{pin::Pin, sync::Arc};
 use arrow_flight::{self as flight, flight_service_server::FlightService, sql::{Any, Command, ProstMessageExt, TicketStatementQuery}};
 use bytes::Bytes;
 use futures::Stream;
@@ -6,19 +6,13 @@ use prost::Message;
 use rtdb_auth::Authenticator;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_node::{Clock, DatabaseAccess, Node, SessionIdentity};
-use rtdb_storage::cache::CacheBudget;
 use sha2::{Digest, Sha256};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
-use tokio_util::sync::{CancellationToken, DropGuard};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status, Streaming};
 use uuid::Uuid;
-use crate::config::accepts_seat_header;
 use rtdb_storage::sealing::{DeliveryDeadline, PlaintextDelivery};
-use crate::{AUDIENCE_FLIGHT_HEADER, AUDIENCE_SEAT_HEADER, FORWARDED_PEER_HEADER, AudienceFlightConfig, FlightConfig, auth::{self, Authentication, Credentials}, error::{arrow, cancelled, status, unsupported}, lease::{Leased, Lookup, Registry}, server::{Binding, ServerStatus}, state::{AudienceSession, ConnectionResource, Prepared, PreparedScope, Session, Transaction}, wire};
-use crate::audience_seat::{OccupiedSeatAction, SeatAttachment, SeatDecision, SeatState, admit_audience_seat, occupied_seat_action};
-
-#[macro_use]
-mod audience_owner;
+use crate::{FORWARDED_PEER_HEADER, FlightConfig, auth::{self, Authentication, Credentials}, error::{arrow, cancelled, status, unsupported}, lease::{Leased, Lookup, Registry}, server::{Binding, ServerStatus}, state::{ConnectionResource, Prepared, PreparedScope, Session, Transaction}, wire};
 
 pub(crate) const CLOSE_SESSION: &str = "CloseSession";
 const CLASSIC_RETAINED_PROOF: &str = "x-rtdb-classic-retained-proof";
@@ -40,28 +34,13 @@ pub(crate) struct Inner {
     pub owned_world_reads: Registry<Bytes, crate::owned_actions::OwnedWorldReadResource>,
     pub owned_read_slots: Arc<Semaphore>,
     pub exact_reads: Registry<Uuid, crate::v1::exact_read::ExactRead>,
-    pub audience: Option<AudienceAdmission>,
     auth: Authentication,
     permits: Arc<Semaphore>,
     pub status: watch::Sender<ServerStatus>,
 }
 
-pub(crate) struct AudienceAdmission {
-    calls: Arc<Semaphore>,
-    seats: Vec<AudienceSessionSeat>,
-    memory: Arc<MemoryBudget>,
-    cache: Arc<CacheBudget>,
-    pub(crate) transport: Arc<MemoryBudget>,
-    sessions: Registry<String, Session>,
-}
-
-struct AudienceSessionSeat {
-    permit: Arc<Semaphore>,
-    original: tokio::sync::Mutex<Weak<Session>>,
-}
-
 #[derive(Clone, Copy)]
-enum CallKind { Ordinary, Handshake, Action, OwnedAction, OpenFresh, AudienceCleanup, V1Query, V1Changes, V1Capabilities, V1ExactRead, V1Action, V1CustodyRelease, V1OriginalFamily, V1OriginalFamilyReadback, V1OriginalPrivateReplay, V1Appointment, ManagedCreate, ManagedWorkload, TxStatus, Store }
+enum CallKind { Ordinary, Handshake, Action, OwnedAction, OpenFresh, V1Query, V1Changes, V1Capabilities, V1ExactRead, V1Action, V1CustodyRelease, V1OriginalFamily, V1OriginalFamilyReadback, V1OriginalPrivateReplay, V1Appointment, ManagedCreate, ManagedWorkload, TxStatus, Store }
 
 impl CallKind {
     fn allows_label_scope(self) -> bool {
@@ -102,10 +81,8 @@ impl CallKind {
         matches!(self, Self::Handshake | Self::V1Capabilities | Self::V1Appointment | Self::TxStatus)
     }
 
-    fn action(audience: bool, name: &str) -> Self {
-        if audience && matches!(name, CLOSE_SESSION | crate::owned_actions::CLOSE_OWNED_READ_V1) {
-            Self::AudienceCleanup
-        } else if name == crate::owned_actions::OPEN_FRESH_OWNED_READ_V2 {
+    fn action(name: &str) -> Self {
+        if name == crate::owned_actions::OPEN_FRESH_OWNED_READ_V2 {
             Self::OpenFresh
         } else if name.starts_with("rtdb.owned.") {
             Self::OwnedAction
@@ -136,7 +113,7 @@ impl Admission {
 }
 impl Drop for Admission { fn drop(&mut self) { self.permit.take(); self.service.0.status.send_modify(|status| status.active_calls -= 1); self.service.publish(); } }
 struct AcquiredSession { service: Service, session: Arc<Session> }
-impl Drop for AcquiredSession { fn drop(&mut self) { self.service.sessions(self.session.audience_source().is_some()).release(&self.session.id); self.service.publish(); } }
+impl Drop for AcquiredSession { fn drop(&mut self) { self.service.0.sessions.release(&self.session.id); self.service.publish(); } }
 impl Drop for Call {
     fn drop(&mut self) { self.cancellation.cancel(); self._lease.take(); }
 }
@@ -184,10 +161,6 @@ impl Call {
         if allowed { Ok(()) } else { Err(Status::permission_denied("This deployment requires its exact imported workload assignment")) }
     }
 
-    pub(crate) fn audience_io_owner(&self) -> Option<Arc<dyn Send + Sync>> {
-        capture_audience_io_owner!(self)
-    }
-
     pub(crate) fn handoff(&self, grant: PlaintextDelivery, relay: Option<DeliveryDeadline>) -> Result<(), Status> {
         let relay = self.classic_deadline(relay);
         if let Some(egress) = &self.egress { return egress.admit(grant, relay).map_err(status); }
@@ -195,15 +168,6 @@ impl Call {
         if grant.is_bounded() || relay.is_some() { return Err(Status::unavailable("Flight answer transport has no delivery fence")); }
         grant.observe_answer();
         Ok(())
-    }
-
-    pub(crate) fn handoff_action(&self, grant: PlaintextDelivery, relay: Option<DeliveryDeadline>) -> Result<(), Status> {
-        let handoff = || self.handoff(grant, relay);
-        if self.session.audience_source().is_some() {
-            self.session.with_audience_handoff(matches!(self.kind, CallKind::AudienceCleanup), handoff)
-        } else {
-            handoff()
-        }
     }
 
     pub(crate) fn delivery_headers(
@@ -234,13 +198,6 @@ impl Call {
         } else if self.minted {
             response.metadata_mut().insert("set-cookie", format!("{}={}", auth::COOKIE, self.session.id).parse().map_err(arrow)?);
             if self.session.caller.mac.is_some() { response.metadata_mut().insert("authorization", format!("Bearer {}", self.session.id).parse().map_err(arrow)?); }
-            if let Some(source) = self.session.audience_source() {
-                let audience = self.service.0.config.audience.filter(|profile| profile.source() == source)
-                    .ok_or_else(unsupported)?;
-                let seat = self.session.audience_seat().ok_or_else(unsupported)?;
-                response.metadata_mut().insert(AUDIENCE_FLIGHT_HEADER, audience.to_string().parse().map_err(arrow)?);
-                response.metadata_mut().insert(AUDIENCE_SEAT_HEADER, seat.to_string().parse().map_err(arrow)?);
-            }
         }
         Ok(response)
     }
@@ -263,23 +220,8 @@ impl Call {
 impl Service {
     pub fn new(node: Node, auth: Arc<Authenticator>, config: FlightConfig, clock: Arc<dyn Clock>, cancellation: CancellationToken, status: watch::Sender<ServerStatus>, binding: Binding) -> rtdb_types::Result<Self> {
         let memory = Arc::clone(node.memory());
-        let audience = if let Some(profile) = config.audience {
-            let cache = CacheBudget::with_memory(memory.prepay(profile.cache_bytes())?);
-            let transport = memory.prepay(profile.transport_bytes())?;
-            let memory = memory.prepay(profile.execution_bytes())?;
-            Some(AudienceAdmission {
-                calls: Arc::new(Semaphore::new(profile.permits())),
-                seats: (0..profile.session_seats()).map(|_| AudienceSessionSeat {
-                    permit: Arc::new(Semaphore::new(1)), original: tokio::sync::Mutex::new(Weak::new()),
-                }).collect(),
-                sessions: Registry::new(clock.clone(), memory.clone()),
-                cache,
-                memory,
-                transport,
-            })
-        } else { None };
         let exact_reads = Registry::new(clock.clone(), memory.clone());
-        Ok(Self(Arc::new(Inner { sessions: Registry::new(clock.clone(), memory.clone()), transactions: Registry::new(clock.clone(), memory.clone()), prepared: Registry::new(clock.clone(), memory.clone()), owned_reads: Registry::new(clock.clone(), memory.clone()), owned_world_reads: Registry::new(clock, memory), owned_read_slots: Arc::new(Semaphore::new(64)), exact_reads, audience, v1: Default::default(), auth: Authentication::new(auth), permits: Arc::new(Semaphore::new(config.maximum_concurrent_calls)), node, config, binding, cancellation, status })))
+        Ok(Self(Arc::new(Inner { sessions: Registry::new(clock.clone(), memory.clone()), transactions: Registry::new(clock.clone(), memory.clone()), prepared: Registry::new(clock.clone(), memory.clone()), owned_reads: Registry::new(clock.clone(), memory.clone()), owned_world_reads: Registry::new(clock, memory), owned_read_slots: Arc::new(Semaphore::new(64)), exact_reads, v1: Default::default(), auth: Authentication::new(auth), permits: Arc::new(Semaphore::new(config.maximum_concurrent_calls)), node, config, binding, cancellation, status })))
     }
     pub(crate) fn standalone_custody_owner(&self) -> Option<&'static str> {
         matches!(&self.0.binding, Binding::Standalone).then_some("xtdb")
@@ -298,48 +240,31 @@ impl Service {
     pub fn memory(&self) -> &Arc<MemoryBudget> { self.0.node.memory() }
     /// The largest request message the transport decodes.
     pub(crate) fn request_bytes(&self) -> usize {
-        let maximum = self.0.config.maximum_message_bytes;
-        if self.0.config.audience.is_some() { maximum.min(crate::config::AUDIENCE_REQUEST_BYTES) } else { maximum }
+        self.0.config.maximum_message_bytes
     }
         pub(crate) fn ticket_binding<'a>(&self, call: &'a Call) -> crate::ticket::Binding<'a> {
         crate::ticket::Binding { mac: self.0.auth.ticket_mac(), session: &call.session.id, owner: call.session.caller.owner }
     }
-    fn sessions(&self, reserved: bool) -> &Registry<String, Session> {
-        if reserved {
-            &self.0.audience.as_ref().expect("reserved session has an installed audience").sessions
-        } else {
-            &self.0.sessions
-        }
-    }
     fn retire_session(&self, session: &Session) {
-        if let Lookup::Found(registered) = self.sessions(session.audience_source().is_some()).take(&session.id) {
+        if let Lookup::Found(registered) = self.0.sessions.take(&session.id) {
             registered.close();
         }
-        if session.audience_source().is_none() {
-            self.0.owned_reads.close_where(|read| read.session == session.id);
-            self.0.owned_world_reads.close_where(|read| read.session == session.id);
-            self.0.exact_reads.close_where(|read| read.session == session.id);
-        }
+        self.0.owned_reads.close_where(|read| read.session == session.id);
+        self.0.owned_world_reads.close_where(|read| read.session == session.id);
+        self.0.exact_reads.close_where(|read| read.session == session.id);
     }
     pub fn sweep(&self) {
-        if let Some(audience) = &self.0.audience {
-            audience.sessions.sweep();
-        }
         self.0.sessions.sweep(); self.0.transactions.sweep(); self.0.prepared.sweep(); self.0.owned_reads.sweep(); self.0.owned_world_reads.sweep();
         self.0.exact_reads.sweep();
         self.publish();
     }
     pub fn close(&self) {
-        if let Some(audience) = &self.0.audience {
-            audience.sessions.close();
-        }
         self.0.exact_reads.close();
         self.0.owned_world_reads.close(); self.0.owned_reads.close(); self.0.prepared.close(); self.0.transactions.close(); self.0.sessions.close();
         self.publish();
     }
     pub fn publish(&self) {
-        let reserved = self.0.audience.as_ref().map_or(0, |audience| audience.sessions.len());
-        let counts = (self.0.sessions.len() + reserved, self.0.transactions.len(), self.0.prepared.len());
+        let counts = (self.0.sessions.len(), self.0.transactions.len(), self.0.prepared.len());
         self.0.status.send_if_modified(|status| {
             let changed = (status.sessions, status.transactions, status.prepared_statements) != counts;
             (status.sessions, status.transactions, status.prepared_statements) = counts;
@@ -368,46 +293,15 @@ impl Service {
             return Err(follower_refusal());
         }
         let transport = request.extensions().get::<crate::server::FlightConnectInfo>();
-        let source_headers = request.metadata().get_all(AUDIENCE_FLIGHT_HEADER);
-        let mut sources = source_headers.iter();
-        let audience_source = sources.next().map(|source| {
-            source.to_str().ok().and_then(|source| AudienceFlightConfig::parse(source).ok())
-                .filter(|profile| self.0.config.audience == Some(*profile))
-                .map(AudienceFlightConfig::source)
-                .ok_or_else(|| Status::permission_denied("Flight audience reservation is not installed"))
-        }).transpose()?;
-        if sources.next().is_some() || audience_source.is_some() != self.0.config.audience.is_some()
-            || audience_source.is_some() && matches!(kind, CallKind::Ordinary | CallKind::V1Query | CallKind::V1Changes) {
-            return Err(Status::permission_denied("Flight audience reservation requires its observation transport"));
-        }
-        let audience = if audience_source.is_some() { Some(self.0.audience.as_ref().ok_or_else(unsupported)?) } else { None };
-        if retained_proof && audience.is_some() { return Err(classic_retained_refusal()); }
-        let seat_headers = request.metadata().get_all(AUDIENCE_SEAT_HEADER);
-        let mut seats = seat_headers.iter();
-        let (first, second) = (seats.next(), seats.next());
         let is_handshake = matches!(kind, CallKind::Handshake);
-        let seat = match first {
-            Some(value) if accepts_seat_header(audience.is_some(), is_handshake, true, second.is_some()) => {
-                let profile = self.0.config.audience.ok_or_else(unsupported)?;
-                let seat = value.to_str().ok().and_then(|value| profile.parse_seat(value).ok())
-                    .ok_or_else(|| Status::permission_denied("Invalid audience reader seat"))?;
-                Some(seat)
-            }
-            _ if first.is_some() || (audience.is_some() && is_handshake) => {
-                return Err(Status::permission_denied("An audience seat is fixed at its authenticated handshake"));
-            }
-            _ => None,
-        };
-        let sessions = self.sessions(audience.is_some());
-        let permits = audience.map_or(&self.0.permits, |audience| &audience.calls);
-        let permit = Arc::clone(permits).try_acquire_owned().map_err(|_| Status::resource_exhausted("Flight concurrent-call limit reached"))?;
+        let sessions = &self.0.sessions;
+        let permit = Arc::clone(&self.0.permits).try_acquire_owned().map_err(|_| Status::resource_exhausted("Flight concurrent-call limit reached"))?;
         let admission = Arc::new(Admission::new(self.clone(), permit));
         let header_bytes = request.metadata().iter().try_fold(4096usize, |bytes, entry| {
             let size = match entry { tonic::metadata::KeyAndValueRef::Ascii(key, value) => wire::add(key.as_str().len(), value.as_encoded_bytes().len())?, tonic::metadata::KeyAndValueRef::Binary(key, value) => wire::add(key.as_str().len(), value.as_encoded_bytes().len())? };
             wire::add(bytes, wire::mul(size, 16)?)
         })?;
-        let request_memory = audience.map_or(self.memory(), |audience| &audience.memory);
-        let reservation = request_memory.reserve(wire::add(header_bytes, wire::mul(body_bytes, 32)?)?).map_err(status)?;
+        let reservation = self.memory().reserve(wire::add(header_bytes, wire::mul(body_bytes, 32)?)?).map_err(status)?;
         let requested_database = request.metadata().get("x-xtdb-database").map(|value| value.to_str().map_err(arrow)).transpose()?;
         let follower_attachment: Option<Arc<rtdb_node::Database>> = None;
         #[cfg(feature = "multi")]
@@ -440,7 +334,6 @@ impl Service {
                     || matches!(kind, CallKind::ManagedCreate) && grant.is_assignment()
                     || matches!(kind, CallKind::ManagedWorkload | CallKind::TxStatus)
                         && !grant.is_assignment() && !grant.is_funded_appointment()
-                    || audience.is_some()
                     || self.follower_only()
                     || fresh_replica
                     || forwarded_peer.is_some()
@@ -463,8 +356,7 @@ impl Service {
             let session = match sessions.lookup(&id.to_owned(), true) {
                 Lookup::Found(session) => session,
                 Lookup::Expired(after) => {
-                    let message = if audience_source.is_some() { "audience session expired".into() }
-                        else { format!("session expired after {} idle", crate::lease::duration(after)) };
+                    let message = format!("session expired after {} idle", crate::lease::duration(after));
                     return Err(session_error(bearer.is_some(), message));
                 }
                 Lookup::Unknown => return Err(session_error(bearer.is_some(), "unknown session")),
@@ -472,11 +364,6 @@ impl Service {
             let lease = AcquiredSession { service: self.clone(), session: Arc::clone(&session) };
             if session.fresh_replica && !matches!(kind, CallKind::Action | CallKind::OwnedAction | CallKind::OpenFresh | CallKind::V1Capabilities | CallKind::V1Action | CallKind::Store | CallKind::V1Appointment | CallKind::TxStatus) {
                 return Err(Status::permission_denied("The fresh Flight session carries owned read actions"));
-            }
-            if session.audience_source() != audience_source
-                || audience_source.is_some() && !matches!(kind, CallKind::Action | CallKind::OwnedAction | CallKind::V1Capabilities | CallKind::V1Action | CallKind::Store | CallKind::V1Appointment | CallKind::TxStatus | CallKind::AudienceCleanup)
-            {
-                return Err(Status::permission_denied("Flight session belongs to another admission class"));
             }
             if let Some(raw) = credentials.raw() {
                 if session.caller.mac.is_none_or(|mac| !auth::equal(&mac, &self.0.auth.mac(raw))) { return Err(auth::unauthenticated("these credentials aren't the ones the session was authenticated with")); }
@@ -489,9 +376,6 @@ impl Service {
             admit_workload(&session.caller.principal, session.fresh_replica)?;
             (session, false, lease, None)
         } else {
-            if audience_source.is_some() && (!matches!(kind, CallKind::Handshake) || forwarded_peer.is_none()) {
-                return Err(Status::permission_denied("An audience session requires an authenticated placed handshake"));
-            }
             let catalog = self.0.node.catalog();
             let placed_name = || requested_database.filter(|name| !name.is_empty())
                 .ok_or_else(|| Status::invalid_argument("A placed Flight SQL session requires x-xtdb-database"));
@@ -501,7 +385,7 @@ impl Service {
                 let proof = proof.to_str().map_err(|_| auth::unauthenticated("Invalid forwarded peer proof"))?;
                 let attachment = catalog.database(placed_name()?).map_err(status)?;
                 let (peer, fresh_replica) = verifier.verify(proof, &attachment).map_err(auth::auth_error)?;
-                if fresh_replica && (!is_handshake || audience_source.is_some()) {
+                if fresh_replica && !is_handshake {
                     return Err(Status::permission_denied("A replica route requires its fresh Flight handshake"));
                 }
                 (Some(peer.to_string()), Some(attachment), fresh_replica)
@@ -514,7 +398,7 @@ impl Service {
             }
             admit_workload(&caller.principal, fresh_replica)?;
             if let Some(scope) = caller.principal.label_scope() {
-                if !kind.allows_label_scope() || audience.is_some() || fresh_replica {
+                if !kind.allows_label_scope() || fresh_replica {
                     return Err(Status::permission_denied("The credential requires the scoped RTDB v1 route"));
                 }
                 let database = requested_database.filter(|name| !name.is_empty())
@@ -535,105 +419,17 @@ impl Service {
                 }
                 match verified_attachment { Some(attachment) => Some(attachment), None => Some(catalog.database(name).map_err(status)?) }
             } else { None };
-            let excluded = if audience.is_none() && (fresh_replica || matches!(kind, CallKind::OwnedAction | CallKind::OpenFresh)) {
+            let excluded = if fresh_replica || matches!(kind, CallKind::OwnedAction | CallKind::OpenFresh) {
                 self.classic_flight_excluded(placement.as_deref()).await?
             } else { false };
             if excluded && (fresh_replica || matches!(kind, CallKind::OpenFresh)) {
                 return Err(classic_flight_refusal());
             }
-            if audience_source.is_some() && (placement.is_none() || caller.mac.is_none() || self.0.config.hosted_controls.as_ref()
-                .is_none_or(|controls| caller.principal.user_id() != Some(controls.owner.as_str())))
-            {
-                return Err(Status::permission_denied("An audience session requires the installed hosted principal"));
-            }
-            if let Some(source) = audience_source {
-                if placement.as_ref().is_none_or(|database| !database.serves_audience_storage(source)) {
-                    return Err(Status::failed_precondition("The attachment has no eligible audience storage for this source"));
-                }
-            }
             let capacity = 1024 + placement.as_ref().map_or(0, |database| database.name().len());
-            let memory = audience.map_or(self.memory(), |audience| &audience.memory);
-            let mint = |audience_slot| -> Result<Arc<Session>, Status> {
-                let session = Arc::new(Session::new(Uuid::new_v4().to_string(), Arc::clone(&caller),
-                    placement.as_ref(), fresh_replica, audience_slot, memory.reserve(capacity).map_err(status)?));
-                sessions.insert(session.id.clone(), Arc::clone(&session), self.0.config.session_idle_timeout,
-                    self.0.config.session_unclaimed_timeout, true, session.id.len()).map_err(status)?;
-                Ok(session)
-            };
-            let session = if let Some(((audience, source), requested)) = audience.zip(audience_source).zip(seat) {
-                let slot = &audience.seats[requested.index()];
-                let occupied = || Status::resource_exhausted("The audience reader seat still owns a session");
-                let displaced = || Status::unavailable("The audience Flight writer attachment changed during handshake");
-                let authenticated = placement.as_ref().ok_or_else(displaced)?;
-                self.0.node.confirm_audience_route(authenticated, source).await.map_err(status)?;
-                let mut original = slot.original.try_lock().map_err(|_| occupied())?;
-                let current = catalog.database(authenticated.name()).map_err(|_| displaced())?;
-                let candidate_is_current = Arc::ptr_eq(authenticated, &current);
-                let existing = match original.upgrade() {
-                    Some(session) => {
-                        let attachment = if session.placed_database() != Some(current.name()) {
-                            SeatAttachment::ForeignDeployment
-                        } else if session.holds_attachment(&current) {
-                            SeatAttachment::Current { unexpired: session.audience_remaining_micros().is_some() }
-                        } else {
-                            SeatAttachment::Displaced
-                        };
-                        match occupied_seat_action(candidate_is_current, attachment) {
-                            OccupiedSeatAction::RejectStaleCandidate => return Err(displaced()),
-                            OccupiedSeatAction::RejectForeignDeployment => return Err(occupied()),
-                            OccupiedSeatAction::CheckRetry => Some(session),
-                            OccupiedSeatAction::Retire => {
-                                self.retire_session(&session);
-                                None
-                            }
-                        }
-                    }
-                    None if candidate_is_current => None,
-                    None => return Err(displaced()),
-                };
-                let seat_state = if let Some(session) = existing {
-                    let same_credential = session.caller.mac.as_ref().zip(caller.mac.as_ref())
-                        .is_some_and(|(left, right)| auth::equal(left, right));
-                    SeatState::Live {
-                        same_credential,
-                        same_attempt: session.audience_seat() == Some(requested),
-                        session,
-                    }
-                } else {
-                    match Arc::clone(&slot.permit).try_acquire_owned() {
-                        Ok(permit) => SeatState::Vacant(permit),
-                        Err(_) => SeatState::Draining,
-                    }
-                };
-                match admit_audience_seat(seat_state) {
-                    SeatDecision::Resume(session) => match sessions.lookup(&session.id, true) {
-                        Lookup::Found(registered) => registered,
-                        _ => return Err(occupied()),
-                    },
-                    SeatDecision::Mint(permit) => {
-                        let expires_at = tokio::time::Instant::now() + Duration::from_secs(180);
-                        let claim = self.reserve_audience_seat(Arc::downgrade(authenticated), requested.index(), permit).await?;
-                        if authenticated.requires_anchored_catalog() {
-                            self.0.node.confirm_audience_route(authenticated, source).await.map_err(status)?;
-                        }
-                        if tokio::time::Instant::now() >= expires_at {
-                            return Err(Status::deadline_exceeded("The audience session ceiling elapsed during handshake"));
-                        }
-                        let session = mint(Some(AudienceSession { source, seat: requested,
-                            cache: Arc::clone(&audience.cache), expires_at, _claim: claim,
-                            projection: std::sync::OnceLock::new(),
-                            recovery_work: rtdb_storage::audience_work::TurnAllowance::new(
-                                crate::config::AUDIENCE_RECOVERY_LIMITS, crate::config::AUDIENCE_RECOVERY_ACTIONS,
-                            ),
-                        }))?;
-                        *original = Arc::downgrade(&session);
-                        session
-                    }
-                    SeatDecision::Refuse => return Err(occupied()),
-                }
-            } else {
-                mint(None)?
-            };
+            let session = Arc::new(Session::new(Uuid::new_v4().to_string(), Arc::clone(&caller),
+                placement.as_ref(), fresh_replica, self.memory().reserve(capacity).map_err(status)?));
+            sessions.insert(session.id.clone(), Arc::clone(&session), self.0.config.session_idle_timeout,
+                self.0.config.session_unclaimed_timeout, true, session.id.len()).map_err(status)?;
             let lease = AcquiredSession { service: self.clone(), session: Arc::clone(&session) };
             (session, true, lease, Some(excluded))
         };
@@ -642,29 +438,13 @@ impl Service {
         }
         let requested_database = requested_database
             .or_else(|| session.caller.principal.workload_grant().map(|grant| grant.database()));
-        let (database, attachment) = if matches!(kind, CallKind::AudienceCleanup) {
-            let original = session.placed_database().ok_or_else(unsupported)?;
-            if requested_database.is_some_and(|requested| requested != original) {
-                return Err(Status::permission_denied("The audience cleanup belongs to another deployment"));
-            }
-            // Close is scoped to the authenticated original carrier. It
-            // opens no native connection and cannot prolong writer residency.
-            (original.to_owned(), None)
-        } else {
-            match session.resolve_database(requested_database, &self.0.node) {
-                Ok(resolved) => resolved,
-                Err(error) => {
-                    if minted && audience_source.is_some() { self.retire_session(&session); }
-                    return Err(error);
-                }
-            }
-        };
+        let (database, attachment) = session.resolve_database(requested_database, &self.0.node)?;
         if let Some(scope) = session.caller.principal.label_scope() {
             scope.admit_database_name(&database).map_err(status)?;
         }
         let classic_flight_excluded = match mint_exclusion {
             Some(excluded) => excluded,
-            None if !retained_proof && audience.is_none() && matches!(kind, CallKind::OwnedAction | CallKind::OpenFresh) =>
+            None if !retained_proof && matches!(kind, CallKind::OwnedAction | CallKind::OpenFresh) =>
                 self.classic_flight_excluded(attachment.as_deref()).await?,
             None => false,
         };
@@ -683,21 +463,6 @@ impl Service {
         }
         self.publish(); Ok(call)
     }
-    async fn reserve_audience_seat(&self, database: Weak<rtdb_node::Database>, index: usize,
-        permit: OwnedSemaphorePermit) -> Result<DropGuard, Status> {
-        let (ready, acquired) = oneshot::channel();
-        let release = CancellationToken::new();
-        let guard = release.clone().drop_guard();
-        let node = self.0.node.clone();
-        tokio::spawn(async move {
-            // An interrupted handshake still owns the permit until its directory write is resolved.
-            let _permit = permit;
-            node.hold_audience_seat(database, index, ready, release).await;
-        });
-        acquired.await.map_err(|_| cancelled())?.map_err(status)?;
-        Ok(guard)
-    }
-
     pub async fn admit_database(&self, database: &str) -> Result<bool, Status> {
         if self.0.config.playground { self.0.node.database_or_attach(database.into(), Default::default()).await.map(|database| database.is_some()).map_err(status) }
         else { Ok(self.0.node.catalog().database(database).is_ok()) }
@@ -760,7 +525,7 @@ where
             let result = call.cancellation.run_until_cancelled(async {
                 let value = value?;
                 let grant = match first.take() { Some(grant) => grant, None => plaintext.grant().await.map_err(status)? };
-                call.handoff_action(grant, cutoff)?;
+                call.handoff(grant, cutoff)?;
                 Ok(value)
             }).await.unwrap_or_else(|| Err(cancelled()));
             let stop = result.is_err();
@@ -825,11 +590,11 @@ impl FlightService for Service {
             crate::owned_actions::HELD_PROTECTED_CARRIERS_V2,
             crate::owned_actions::HELD_SEALED_SEARCH_UNIT_ROWS_V2,
         ];
-        let root_rank = self.0.config.owned_native_actions && call.session.audience_source().is_none();
+        let root_rank = self.0.config.owned_native_actions;
         #[cfg(feature = "multi")]
         let actions = actions.into_iter().chain(crate::admin::ACTIONS.into_iter().filter(|name| self.supports_admin_action(&call, name)))
             .collect::<Vec<_>>();
-        let store_enabled = !call.session.fresh_replica && call.session.audience_source().is_none()
+        let store_enabled = !call.session.fresh_replica
             && call.session.caller.principal.label_scope().is_none();
         result_stream(call, actions.into_iter().chain(crate::v1::ACTIONS.into_iter()
             .filter(|name| !matches!(*name, crate::v1::MANAGED_WORKLOAD | crate::v1::exact_read::OPEN | crate::v1::exact_read::CLOSE)))
@@ -919,7 +684,7 @@ impl FlightService for Service {
                 .await.map_err(crate::v1::error::map_status)?;
             return rtdb_types::boxed(|| self.v1_action(call, request.into_inner())).await;
         }
-        let kind = CallKind::action(self.0.audience.is_some(), name);
+        let kind = CallKind::action(name);
         let mut call = rtdb_types::boxed(|| self.call_with_kind(&request, request.get_ref().encoded_len(), kind)).await?;
         let proof_headers = request.metadata().get_all(CLASSIC_RETAINED_PROOF);
         let mut proofs = proof_headers.iter();
@@ -967,15 +732,14 @@ pub(crate) fn query_ticket(ticket: Bytes, memory: &Arc<MemoryBudget>) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{CLOSE_SESSION, CallKind};
-    use crate::owned_actions::CLOSE_OWNED_READ_V1;
+    use super::CallKind;
 
     #[test]
     fn label_scope_is_only_admitted_to_v1_and_handshake() {
         for kind in [CallKind::Handshake, CallKind::V1Query, CallKind::V1Changes, CallKind::V1Capabilities, CallKind::V1Action, CallKind::TxStatus] {
             assert!(kind.allows_label_scope());
         }
-        for kind in [CallKind::Ordinary, CallKind::Action, CallKind::AudienceCleanup, CallKind::ManagedCreate, CallKind::ManagedWorkload] {
+        for kind in [CallKind::Ordinary, CallKind::Action, CallKind::ManagedCreate, CallKind::ManagedWorkload] {
             assert!(!kind.allows_label_scope());
         }
     }
@@ -985,7 +749,7 @@ mod tests {
         for kind in [CallKind::Handshake, CallKind::V1Query, CallKind::V1Capabilities, CallKind::V1ExactRead] {
             assert!(kind.serves_assigned_follower());
         }
-        for kind in [CallKind::Ordinary, CallKind::Action, CallKind::AudienceCleanup, CallKind::V1Changes, CallKind::V1Action, CallKind::ManagedCreate, CallKind::ManagedWorkload, CallKind::TxStatus] {
+        for kind in [CallKind::Ordinary, CallKind::Action, CallKind::V1Changes, CallKind::V1Action, CallKind::ManagedCreate, CallKind::ManagedWorkload, CallKind::TxStatus] {
             assert!(!kind.serves_assigned_follower());
         }
     }
@@ -995,7 +759,7 @@ mod tests {
         for kind in [CallKind::Handshake, CallKind::V1Query, CallKind::V1Changes, CallKind::V1Capabilities] {
             assert!(kind.allows_workload_root_read());
         }
-        for kind in [CallKind::Ordinary, CallKind::Action, CallKind::AudienceCleanup,
+        for kind in [CallKind::Ordinary, CallKind::Action,
             CallKind::V1Action, CallKind::ManagedWorkload,
             CallKind::ManagedCreate, CallKind::TxStatus] {
             assert!(!kind.allows_workload_root_read());
@@ -1007,7 +771,7 @@ mod tests {
         for kind in [CallKind::Handshake, CallKind::ManagedCreate, CallKind::ManagedWorkload, CallKind::TxStatus] {
             assert!(kind.allows_workload_grant());
         }
-        for kind in [CallKind::Ordinary, CallKind::Action, CallKind::AudienceCleanup, CallKind::V1Query, CallKind::V1Changes, CallKind::V1Capabilities, CallKind::V1Action] {
+        for kind in [CallKind::Ordinary, CallKind::Action, CallKind::V1Query, CallKind::V1Changes, CallKind::V1Capabilities, CallKind::V1Action] {
             assert!(!kind.allows_workload_grant());
         }
     }
@@ -1017,7 +781,7 @@ mod tests {
         for kind in [CallKind::Handshake, CallKind::V1Capabilities, CallKind::V1Appointment, CallKind::TxStatus] {
             assert!(kind.allows_funded_appointment());
         }
-        for kind in [CallKind::Ordinary, CallKind::Action, CallKind::AudienceCleanup, CallKind::V1Query,
+        for kind in [CallKind::Ordinary, CallKind::Action, CallKind::V1Query,
             CallKind::V1Changes, CallKind::V1Action, CallKind::V1CustodyRelease, CallKind::V1OriginalFamily,
             CallKind::ManagedCreate, CallKind::ManagedWorkload] {
             assert!(!kind.allows_funded_appointment());
@@ -1026,11 +790,11 @@ mod tests {
     }
 
     #[test]
-    fn original_control_is_separate_from_workload_and_audience_routes() {
+    fn original_control_is_separate_from_workload_routes() {
         for kind in [CallKind::Handshake, CallKind::V1CustodyRelease] {
             assert!(kind.allows_original_custody_control());
         }
-        for kind in [CallKind::Ordinary, CallKind::Action, CallKind::AudienceCleanup, CallKind::V1Query,
+        for kind in [CallKind::Ordinary, CallKind::Action, CallKind::V1Query,
             CallKind::V1Changes, CallKind::V1Capabilities, CallKind::V1Action, CallKind::ManagedCreate,
             CallKind::ManagedWorkload, CallKind::TxStatus] {
             assert!(!kind.allows_original_custody_control());
@@ -1047,7 +811,7 @@ mod tests {
         for kind in [CallKind::Handshake, CallKind::V1Capabilities, CallKind::V1Query, CallKind::V1OriginalFamily] {
             assert!(kind.allows_original_family());
         }
-        for kind in [CallKind::Ordinary, CallKind::Action, CallKind::AudienceCleanup, CallKind::V1Changes,
+        for kind in [CallKind::Ordinary, CallKind::Action, CallKind::V1Changes,
             CallKind::V1Action, CallKind::V1CustodyRelease, CallKind::ManagedCreate, CallKind::ManagedWorkload,
             CallKind::TxStatus] {
             assert!(!kind.allows_original_family());
@@ -1065,7 +829,7 @@ mod tests {
         for kind in [CallKind::Handshake, CallKind::V1Capabilities, CallKind::V1OriginalFamilyReadback] {
             assert!(kind.allows_original_family_readback());
         }
-        for kind in [CallKind::Ordinary, CallKind::Action, CallKind::AudienceCleanup, CallKind::V1Query,
+        for kind in [CallKind::Ordinary, CallKind::Action, CallKind::V1Query,
             CallKind::V1Changes, CallKind::V1Action, CallKind::V1CustodyRelease, CallKind::V1OriginalFamily,
             CallKind::V1Appointment, CallKind::ManagedCreate, CallKind::ManagedWorkload, CallKind::TxStatus] {
             assert!(!kind.allows_original_family_readback());
@@ -1077,22 +841,5 @@ mod tests {
         assert!(!readback.allows_original_custody_control());
         assert!(!readback.allows_label_scope());
         assert!(!readback.serves_assigned_follower());
-    }
-
-    #[test]
-    fn only_audience_closes_can_dispatch_without_a_current_attachment() {
-        for action in [CLOSE_SESSION, CLOSE_OWNED_READ_V1] {
-            assert!(matches!(CallKind::action(true, action), CallKind::AudienceCleanup));
-        }
-        assert!(matches!(CallKind::action(false, CLOSE_SESSION), CallKind::Action));
-        assert!(matches!(CallKind::action(false, CLOSE_OWNED_READ_V1), CallKind::OwnedAction));
-        for action in [
-            crate::owned_actions::PREPARE_APPLIED_READ_V3,
-            crate::owned_actions::OPEN_APPLIED_OWNED_READ_V5,
-            crate::owned_actions::CONFIRM_APPLIED_HOSTED_V6,
-        ] {
-            assert!(matches!(CallKind::action(true, action), CallKind::OwnedAction));
-        }
-        assert!(matches!(CallKind::action(true, "closesession"), CallKind::Action));
     }
 }

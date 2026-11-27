@@ -17,7 +17,7 @@ pub use client::{ActiveLogletReadIndex, CertifiedRangeReader, CopyFrom, JournalS
 pub use protocol::{Entry as ArchivedReplicaEntry, TimedJournalOrigin};
 pub use local::LocalListener;
 pub use rtdb_types::JournalEndpoint;
-pub use server::{AuthorityListener, ConnectionLimits, JournalDigest, PreparedJournal, ServerOptions, inspect_retained, inspect_retained_with_prefix, serve};
+pub use server::{ConnectionLimits, JournalDigest, PreparedJournal, ServerOptions, inspect_retained, inspect_retained_with_prefix, serve};
 
 /// Protocol fixtures and scripted stream journal faults for simulation.
 #[cfg(feature = "simulation")]

@@ -3,16 +3,13 @@
 use super::connection::{Binding, Callback, Connection, connection, remote};
 use super::{JournalEndpoint, StreamConfig, read_index_evidence::valid_reply};
 use crate::decision::{DecisionCertificate, DecisionInstallation, DecisionScope, DecisionStatement, DecisionVote, DecisionVoteRequest, Handoff, HandoffCertificate, StableDecision};
-use crate::protocol::{AUTHORITY_FRAME_BYTES, Accepted, Append, Check, Commit, DigestPage, DropStream, Entries, Entry, Fetch, LogletCheck, Overwrite, PageDigest, Read, ReadIndexReply, ReadIndexRequest, Refused, Request, RequestBody, Response, ResponseBody, Retire, Seal, Sealed, Trim, encode_frame, read_bounded_frame};
-use bytes::{Bytes, BytesMut};
+use crate::protocol::{Accepted, Append, Check, Commit, DigestPage, DropStream, Entries, Entry, Fetch, LogletCheck, Overwrite, PageDigest, Read, ReadIndexReply, ReadIndexRequest, Refused, RequestBody, ResponseBody, Retire, Seal, Sealed, Trim};
+use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
 use parking_lot::Mutex;
 use rtdb_storage::{Error, Result};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::{io::AsyncWriteExt, net::TcpStream};
-
-const AUTHORITY_IDLE: Duration = Duration::from_secs(120);
+use std::time::Duration;
 
 pub(crate) const MAXIMUM_BATCH_ENTRIES: u32 = 1024;
 pub(crate) const MAXIMUM_BATCH_BYTES: u64 = 16 * 1024 * 1024;
@@ -32,13 +29,6 @@ pub(crate) struct Ensemble {
 pub(crate) struct Peer {
     connection: Arc<Connection>,
     binding: Binding,
-    authority: tokio::sync::Mutex<Option<AuthoritySession>>,
-}
-
-struct AuthoritySession {
-    port: u16,
-    socket: TcpStream,
-    last_used: Instant,
 }
 
 impl Peer {
@@ -58,7 +48,6 @@ impl Ensemble {
         let journals = Arc::new(Mutex::new(config.servers.iter().map(|server| server.journal().map(Arc::from)).collect()));
         let links = config.servers.iter().enumerate().map(|(slot, server)| Peer {
             connection: connection(server.address()),
-            authority: tokio::sync::Mutex::new(None),
             binding: match server.journal() {
                 Some(expected) => Binding::Expected(Arc::from(expected)),
                 None => Binding::Discover { slot, journals: Arc::clone(&journals) },
@@ -284,42 +273,6 @@ impl Ensemble {
 
     fn loglet_check(&self, epoch: u64) -> LogletCheck {
         LogletCheck { stream: self.stream(), epoch, ensemble: self.identity.clone(), certified: self.decision_scope(epoch).is_some(), handoff: None }
-    }
-
-    pub async fn confirm_authority(&self, server: usize, epoch: u64, port: u16) -> Result<Option<u64>> {
-        let endpoint = &self.config.servers[server];
-        let journal = endpoint.journal().ok_or_else(|| remote(endpoint.address(), "writer authority requires an installed journal identity"))?;
-        let (host, _) = endpoint.address().rsplit_once(':')
-            .ok_or_else(|| remote(endpoint.address(), "invalid journal authority route"))?;
-        let address = format!("{host}:{port}");
-        let mut peer = self.links[server].authority.lock().await;
-
-        // A cancelled call drops its socket, so a delayed reply cannot answer another round.
-        let mut socket = match peer.take() {
-            Some(session) if session.port == port && session.last_used.elapsed() < AUTHORITY_IDLE => session.socket,
-            _ => {
-                let socket = TcpStream::connect(&address).await.map_err(|error| remote(&address, error.to_string()))?;
-                socket.set_nodelay(true).map_err(|error| remote(&address, error.to_string()))?;
-                socket
-            }
-        };
-        let request = Request {
-            id: 1,
-            body: Some(RequestBody::ConfirmAuthority(self.loglet_check(epoch))),
-            target_journal: journal.to_owned(),
-        };
-        let mut frame = BytesMut::new();
-        encode_frame(&request, &mut frame);
-        socket.write_all(&frame).await.map_err(|error| remote(&address, error.to_string()))?;
-        let response = read_bounded_frame::<Response>(&mut socket, AUTHORITY_FRAME_BYTES).await
-            .map_err(|error| remote(&address, error.to_string()))?;
-        let outcome = match response {
-            Some((Response { id: 1, body: Some(ResponseBody::AuthorityConfirmed(_)) }, _)) => None,
-            Some((Response { id: 1, body: Some(ResponseBody::Refused(refusal)) }, _)) => Some(refusal.promised),
-            _ => return Err(remote(&address, "the journal did not confirm writer authority")),
-        };
-        *peer = Some(AuthoritySession { port, socket, last_used: Instant::now() });
-        Ok(outcome)
     }
 
     pub async fn export_handoff(&self, handoff: Handoff) -> Result<HandoffCertificate> {

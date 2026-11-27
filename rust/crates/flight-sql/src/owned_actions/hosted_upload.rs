@@ -55,7 +55,7 @@ impl<'a> HostedUpload<'a> {
 
 impl Service {
     pub(crate) fn supports_hosted_upload(&self, call: &Call) -> bool {
-        !call.session.fresh_replica && call.session.audience_source().is_none()
+        !call.session.fresh_replica
             && self.hosted_control_policy(call).is_ok()
     }
 

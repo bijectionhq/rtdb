@@ -87,22 +87,6 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
         (None, None) => crate::journal::hosted::Routes::default(),
     });
     ordered.reserve_deployments(directory.as_ref()).await?;
-    let audience = settings.configuration.flight_sql.as_ref().and_then(|flight| flight.audience);
-    if settings.agent.audience_journal_port == Some(0)
-        || audience.is_none() && settings.agent.audience_journal_port.is_some()
-        || audience.is_some() && settings.agent.audience_journal_port.is_none() && settings.agent.installed_journal_manifest.is_none()
-            && settings.agent.installed_cell.is_none()
-    {
-        return Err(Anomaly::incorrect("rtdb.multi/audience-authority",
-            "A classic audience Flight listener requires its read-only journal port"));
-    }
-    if audience.is_some() {
-        if settings.agent.audience_journal_port.is_some() {
-            directory.require_audience_reads()?;
-        } else {
-            directory.require_installed_audience_seats()?;
-        }
-    }
     if let Some(archive) = &settings.agent.world_archive {
         crate::archive::require_independent_world_archive(&settings.agent.storage, archive)?;
     }
@@ -138,7 +122,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     let writers: crate::logs::Writers = Default::default();
     let storage_regions = TaskTracker::new();
     let release_cancellation = CancellationToken::new();
-    let fence = Arc::new(FenceSlot { agent: Default::default(), hosted_task: settings.hosted_task.clone(), release_stop: release_cancellation.child_token() });
+    let fence = Arc::new(FenceSlot { agent: Default::default() });
     let cache_bytes = settings.configuration.disk_cache.as_ref().and_then(|cache| cache.maximum_bytes).unwrap_or(u64::MAX);
     let fragmenter = crate::fragments::CellFragmenter::new(Arc::clone(&directory), storage_namespaces.objects, &settings.agent.fragments, cache_bytes, settings.capabilities.clone());
     let local_witnesses = matches!(&settings.agent.storage, crate::deployment::CellStorage::Local { .. })
@@ -180,7 +164,6 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
         storage_namespaces,
         scoped_writes: scoped_writes.clone(),
         hosted_task: settings.hosted_task,
-        audience_source: audience.map(|(_, profile)| profile.source()),
         storage_regions: storage_regions.clone(),
         release_stop: release_cancellation.child_token(),
         local_witnesses,
@@ -314,8 +297,6 @@ impl RunningNode {
 /// The read fence, filled once the agent that answers it exists.
 struct FenceSlot {
     agent: std::sync::OnceLock<std::sync::Weak<NodeAgent>>,
-    hosted_task: Option<rtdb_directory::HostedTask>,
-    release_stop: CancellationToken,
 }
 
 #[async_trait::async_trait]
@@ -340,78 +321,6 @@ impl rtdb_node::ReadFence for FenceSlot {
         let agent = self.agent.get().and_then(std::sync::Weak::upgrade).ok_or_else(stopped_agent)?;
         agent.confirm_hosted_read(database).await
     }
-
-    async fn confirm_audience(&self, database: &rtdb_node::Database, require_quorum: bool) -> Result<String> {
-        let agent = self.agent.get().and_then(std::sync::Weak::upgrade).ok_or_else(stopped_agent)?;
-        agent.confirm_audience_read(database, require_quorum).await
-    }
-
-    async fn confirm_held_audience(&self, database: &rtdb_node::Database) -> Result<String> {
-        let agent = self.agent.get().and_then(std::sync::Weak::upgrade).ok_or_else(stopped_agent)?;
-        agent.confirm_held_audience_read(database).await
-    }
-
-    async fn hold_audience_seat(&self, database: std::sync::Weak<rtdb_node::Database>, index: usize,
-        ready: tokio::sync::oneshot::Sender<Result<()>>, release: CancellationToken) {
-        let Some(agent) = self.agent.get().and_then(std::sync::Weak::upgrade) else {
-            let _ = ready.send(Err(stopped_agent()));
-            return;
-        };
-        let prepared = agent.prepare_audience_seat(database, index, self.hosted_task.as_ref()).await;
-        drop(agent);
-        let claim = match prepared {
-            Ok(Some(claim)) if !release.is_cancelled() => claim,
-            Ok(Some(_)) => return,
-            Ok(None) => {
-                let _ = ready.send(Err(audience_seat_unavailable()));
-                return;
-            }
-            Err(error) => {
-                let _ = ready.send(Err(error));
-                return;
-            }
-        };
-        let acquired = claim.acquire().await.and_then(|owned| owned.then_some(()).ok_or_else(audience_seat_unavailable));
-        let owns_seat = acquired.is_ok();
-        if ready.send(acquired).is_ok() && owns_seat {
-            let mut renew = tokio::time::interval(rtdb_directory::AUDIENCE_SEAT_LEASE / 3);
-            renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            renew.tick().await;
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = release.cancelled() => break,
-                    _ = renew.tick() => {
-                        match claim.renew().await {
-                            Ok(true) => {}
-                            Ok(false) => {
-                                tracing::warn!(seat = index, "Audience seat lease was lost before release");
-                                break;
-                            }
-                            Err(error) => {
-                                tracing::warn!(seat = index, code = %error.code, "Audience seat lease renewal failed");
-                            }
-                        }
-                    }
-                }
-            }
-            release.cancelled().await;
-        }
-        // The write may have committed after losing its reply. Fence the
-        // claim and its predecessor before returning the local permit.
-        let claim = &claim;
-        crate::hold_release::release_hold_bounded(
-            format!("audience seat {index}"),
-            &self.release_stop,
-            rtdb_directory::AUDIENCE_SEAT_LEASE,
-            move || claim.release(),
-        ).await;
-    }
-}
-
-fn audience_seat_unavailable() -> Anomaly {
-    Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/audience-seat-unavailable",
-        "The audience seat is not available at this placement")
 }
 
 fn stopped_agent() -> Anomaly {
@@ -420,7 +329,6 @@ fn stopped_agent() -> Anomaly {
 
 pub struct LogkeeperSettings {
     pub listen: SocketAddr,
-    pub authority: Option<(SocketAddr, rtdb_flight_sql::AudienceFlightConfig)>,
     /// Stable DNS name of the disk, so ensembles can still reach it after a process restart.
     pub advertise_host: Option<String>,
     pub data_dir: PathBuf,
@@ -449,13 +357,6 @@ pub async fn start_logkeeper_with_sync(
     let listener = TcpListener::bind(settings.listen).await.map_err(io)?;
     let address = listener.local_addr().map_err(io)?;
     let endpoint = advertised(address, settings.advertise_host.as_deref())?;
-    let authority = if let Some((listen, profile)) = settings.authority {
-        if !settings.fsync {
-            return Err(Anomaly::incorrect("rtdb.multi/audience-authority", "The audience journal requires fsync"));
-        }
-        let socket = TcpListener::bind(listen).await.map_err(io)?;
-        Some(rtdb_logkeeper::AuthorityListener { socket, source: profile.source(), connections: profile.permits() })
-    } else { None };
     let (journal, identity) = rtdb_logkeeper::PreparedJournal::open_for_member(
         rtdb_logkeeper::ServerOptions::new(settings.data_dir, settings.fsync, settings.cache_bytes)
             .with_apple_sync(apple_sync),
@@ -469,7 +370,7 @@ pub async fn start_logkeeper_with_sync(
     }, MemberId(identity), settings.advertise_host.is_some(), settings.lease).await?;
     let cancellation = CancellationToken::new();
     let mut tasks = JoinSet::new();
-    tasks.spawn(journal.serve_with_authority(listener, authority, cancellation.clone()));
+    tasks.spawn(journal.serve(listener, cancellation.clone()));
     { let lease = Arc::clone(&lease); let cancellation = cancellation.clone(); tasks.spawn(async move { lease.run(cancellation).await; Ok(()) }); }
     Ok(RunningLogkeeper { address, lease, cancellation, tasks })
 }
@@ -529,7 +430,6 @@ mod tests {
         let directory = rtdb_directory::MemoryDirectory::new();
         let data = tempfile::tempdir().unwrap();
         let settings = || LogkeeperSettings {
-            authority: None,
             listen: "127.0.0.1:0".parse().unwrap(),
             advertise_host: None,
             data_dir: data.path().to_owned(),
@@ -560,7 +460,6 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let empty = tempfile::tempdir().unwrap();
         let settings = |path: &std::path::Path, listen| LogkeeperSettings {
-            authority: None,
             listen,
             advertise_host: Some("keeper.test.internal".into()),
             data_dir: path.to_owned(),

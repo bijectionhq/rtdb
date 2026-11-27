@@ -9,7 +9,6 @@ mod durable_range;
 pub(crate) mod default_restore;
 pub use durable_range::{DurableRange, MAX_DURABLE_RANGE_BYTES};
 pub use hosted_observation::{AppliedOwnedPoint, AppliedReadConfirmation, AppliedReadFloor};
-use hosted_observation::PreparedAppliedCatalog;
 mod owned_changes;
 mod owned_usage;
 pub use owned_usage::OwnedStorageUsage;
@@ -77,18 +76,6 @@ pub trait ReadFence: Send + Sync {
     async fn confirm_hosted(&self, _database: &Database) -> Result<String> {
         Err(hosted_source_unavailable())
     }
-    /// Confirms the complete current placement. Applied snapshots also require journal leadership.
-    async fn confirm_audience(&self, _database: &Database, _require_quorum: bool) -> Result<String> {
-        Err(hosted_source_unavailable())
-    }
-    async fn confirm_held_audience(&self, database: &Database) -> Result<String> {
-        self.confirm_audience(database, false).await
-    }
-    /// Reserves one deployment seat until the final session owner drops its release guard.
-    async fn hold_audience_seat(&self, _database: Weak<Database>, _index: usize, ready: oneshot::Sender<Result<()>>,
-        _release: CancellationToken) {
-        let _ = ready.send(Err(hosted_source_unavailable()));
-    }
 }
 
 pub(crate) struct HostedSourceReceipt {
@@ -150,21 +137,13 @@ enum CatalogReadCut<'a> {
         minimum: TransactionKey,
         history: uuid::Uuid,
         memory: &'a Arc<MemoryBudget>,
-        admission: AppliedCatalogAdmission<'a>,
     },
-}
-
-#[derive(Clone, Copy)]
-enum AppliedCatalogAdmission<'a> {
-    Ordinary,
-    PrepareAudience(&'a Arc<BufferPool>),
-    PreparedAudience(&'a PreparedAppliedCatalog),
 }
 
 enum OwnedReadBasis<'a> {
     ClockReservation,
     Fresh { deployment: uuid::Uuid, required: Option<&'a AppliedReadFloor> },
-    Applied { floor: &'a AppliedReadFloor, preparation: Option<Arc<PreparedAppliedCatalog>> },
+    Applied { floor: &'a AppliedReadFloor },
 }
 
 fn covers_transaction(selected: TransactionKey, floor: TransactionKey) -> bool {
@@ -373,37 +352,6 @@ impl Node {
     pub fn hold_active_call(&self, database: &Database) -> Option<Box<dyn Send + Sync>> {
         self.read_fence.as_ref()?.hold_active_call(database)
     }
-    /// Rechecks the serving placement before reading an already-held audience snapshot.
-    pub async fn confirm_audience_route(&self, database: &Arc<Database>, source: uuid::Uuid) -> Result<()> {
-        self.confirm_audience_attachment(database, source, false).await
-    }
-
-    pub async fn confirm_held_audience_route(&self, database: &Arc<Database>, source: uuid::Uuid) -> Result<()> {
-        self.confirm_audience_attachment(database, source, true).await
-    }
-
-    async fn confirm_audience_attachment(&self, database: &Arc<Database>, source: uuid::Uuid, held: bool) -> Result<()> {
-        self.ensure_open()?;
-        let fence = self.read_fence.as_ref().ok_or_else(hosted_source_unavailable)?;
-        let history = if held {
-            fence.confirm_held_audience(database).await?
-        } else {
-            fence.confirm_audience(database, false).await?
-        };
-        let attached = self.attached_database(database.name(), None)?;
-        if uuid::Uuid::parse_str(&history).ok() != Some(source) || !Arc::ptr_eq(&attached, database) {
-            return Err(hosted_source_unavailable());
-        }
-        Ok(())
-    }
-    pub async fn hold_audience_seat(&self, database: Weak<Database>, index: usize, ready: oneshot::Sender<Result<()>>,
-        release: CancellationToken) {
-        if let Some(fence) = self.read_fence.as_ref() && self.ensure_open().is_ok() {
-            fence.hold_audience_seat(database, index, ready, release).await;
-        } else {
-            let _ = ready.send(Err(hosted_source_unavailable()));
-        }
-    }
     pub async fn receiver_time(&self) -> Result<Timestamp> {
         match &self.factory.decision_clock {
             Some(clock) => Ok(clock.observe().await?.instant),
@@ -453,33 +401,16 @@ impl Node {
     }
 
     pub fn session(&self, database: impl Into<String>, identity: Arc<dyn SessionIdentity>) -> Result<NativeSession> {
-        self.session_in_memory(database.into(), identity, Arc::clone(self.memory()), None)
-    }
-
-    /// Opens a placed audience session backed by the holder's prepaid execution and cache allocations.
-    pub fn audience_session(&self, database: impl Into<String>, identity: Arc<dyn SessionIdentity>, source: uuid::Uuid, memory: Arc<MemoryBudget>, cache: Arc<CacheBudget>) -> Result<NativeSession> {
-        if !self.catalog.is_placed() || !memory.prepaid_by(self.memory()) || !cache.prepaid_by(self.memory()) {
-            return Err(Anomaly::incorrect("rtdb.node/unfunded-session", "A placed audience session requires this holder's prepaid execution and cache allocations"));
-        }
-        self.session_in_memory(database.into(), identity, memory, Some((source, cache)))
-    }
-
-    fn session_in_memory(&self, database: String, identity: Arc<dyn SessionIdentity>, memory: Arc<MemoryBudget>, audience: Option<(uuid::Uuid, Arc<CacheBudget>)>) -> Result<NativeSession> {
+        let database = database.into();
         self.ensure_open()?;
         identity.authorize_database(&database, DatabaseAccess::Read)?;
         let local = self.catalog.database(&database)?;
         require_ordinary_attachment(&local)?;
         let placement = self.catalog.is_placed().then(|| Arc::downgrade(&local));
-        let audience_storage = if let Some((source, cache)) = audience {
-            let storage = local.audience_storage.as_ref().filter(|storage| storage.source == source)
-                .ok_or_else(hosted_source_unavailable)?;
-            Some(Arc::new(BufferPool::with_metadata_budget(Arc::clone(&storage.store), cache, Arc::clone(&memory))))
-        } else {
-            None
-        };
-        let service = Arc::new(NativeSessionService { node: self.clone(), identity, database: database.clone(), placement, memory, audience_storage });
+        let memory = Arc::clone(self.memory());
+        let service = Arc::new(NativeSessionService { node: self.clone(), identity, database: database.clone(), placement, memory });
         let state = Session::new(service.clone(), database, &self.factory.options.default_timezone, &self.run.token)?;
-        Ok(NativeSession { state, service, applied_preparation: None })
+        Ok(NativeSession { state, service })
     }
     pub fn snapshot_basis(&self) -> Result<TimeBasis> {
         self.ensure_open()?;
@@ -678,10 +609,10 @@ impl Node {
         }
         let mut confirmed = false;
         let hosted_fence = match cut {
-            CatalogReadCut::HostedApplied { history, admission, .. } => {
+            CatalogReadCut::HostedApplied { history, .. } => {
                 self.ensure_indexing()?;
                 if !placed || placement.is_none() { return Err(hosted_source_unavailable()); }
-                Some((self.read_fence.as_ref().ok_or_else(hosted_source_unavailable)?, history, admission))
+                Some((self.read_fence.as_ref().ok_or_else(hosted_source_unavailable)?, history))
             }
             CatalogReadCut::Current | CatalogReadCut::Single | CatalogReadCut::Reserved(_) => {
                 if replica_capture.is_none() && let Some(fence) = &self.read_fence {
@@ -691,7 +622,6 @@ impl Node {
                 None
             }
         };
-        let audience = hosted_fence.is_some_and(|(_, _, admission)| !matches!(admission, AppliedCatalogAdmission::Ordinary));
         // Only a suspension since admission can have changed the attachment.
         if confirmed && let Some(previous) = &held {
             let current = self.catalog.database(database).map_err(|_| lost_placement(database))?;
@@ -748,33 +678,18 @@ impl Node {
             let upper = applied.map(|selected| selected.system_time).or(basis.snapshot_time);
             let cap = match (cap, upper) { (Some(time), Some(upper)) => Some(time.min(upper)), (time, _) => time };
             let snapshot = snapshot.with_system_time_cap(cap)?;
-            let storage = match hosted_fence.map(|(_, _, admission)| admission) {
-                Some(AppliedCatalogAdmission::PrepareAudience(storage)) => Arc::clone(storage),
-                Some(AppliedCatalogAdmission::PreparedAudience(preparation)) => Arc::clone(preparation.storage()),
-                _ => Arc::clone(&database.storage),
-            };
-            let snapshot = if let Some((fence, expected_history, admission)) = hosted_fence {
+            let storage = Arc::clone(&database.storage);
+            let snapshot = if let Some((fence, expected_history)) = hosted_fence {
                 let cut = snapshot.catalog_cut().ok_or_else(applied_catalog_unretained)?;
                 // An anchored catalog is a hosted journal's protected snapshot, which must grant custody. Any other store
                 // keeps no reader state: the GC window keeps the captured catalog readable.
                 let permit = if database.requires_anchored_catalog() {
-                    if let AppliedCatalogAdmission::PreparedAudience(preparation) = admission {
-                        preparation.pin(&database, cut)?;
-                    }
                     let checkpoint = snapshot.catalog_checkpoint()?.ok_or_else(applied_catalog_unretained)?;
                     Some(storage.admit_catalog(Some(cut), Some(checkpoint)).await?.ok_or_else(applied_catalog_unretained)?)
                 } else {
-                    match admission {
-                        AppliedCatalogAdmission::PreparedAudience(preparation) => preparation.pin(&database, cut)?,
-                        AppliedCatalogAdmission::PrepareAudience(_) | AppliedCatalogAdmission::Ordinary =>
-                            storage.admit_catalog(Some(cut), None).await?,
-                    }
+                    storage.admit_catalog(Some(cut), None).await?
                 };
-                let history = match admission {
-                    AppliedCatalogAdmission::Ordinary => fence.confirm_hosted(&database).await?,
-                    AppliedCatalogAdmission::PrepareAudience(_) | AppliedCatalogAdmission::PreparedAudience(_) =>
-                        fence.confirm_audience(&database, true).await?,
-                };
+                let history = fence.confirm_hosted(&database).await?;
                 if uuid::Uuid::parse_str(&history).ok() != Some(expected_history) {
                     return Err(hosted_source_unavailable());
                 }
@@ -805,7 +720,7 @@ impl Node {
         }
         let archive_history = self.read_fence.as_ref().is_some_and(|fence| fence.archive_history(database));
         if archive_history { catalog = catalog.with_archive_history(); }
-        if !audience && !archive_history { catalog = catalog.with_fragmenter(self.scan_fragmenter.clone(), fragment_residence); }
+        if !archive_history { catalog = catalog.with_fragmenter(self.scan_fragmenter.clone(), fragment_residence); }
         if let Some(lease) = lease { catalog = catalog.with_read_lease(lease); }
         let memory = match cut {
             CatalogReadCut::HostedApplied { memory, .. } => Arc::clone(memory),
@@ -813,8 +728,7 @@ impl Node {
         };
         let context = QueryContext::with_owner(catalog, memory, basis.current_time, basis.timezone.clone(), self.factory.options.query.clone(), cancellation, self.run.query_owner())?
             .with_shared_plans(Arc::clone(&self.shared_plans));
-        let context = if audience { context } else { context.with_accelerators(Arc::clone(&self.factory.accelerators)) };
-        context
+        context.with_accelerators(Arc::clone(&self.factory.accelerators))
             .with_read_options(&basis.snapshot, basis.snapshot_time, basis.current_time)
             .map(|context| context.with_query_cpu(query_cpu))
     }
@@ -1665,7 +1579,6 @@ pub struct OwnedReadSession {
     receiver_observation: Option<rtdb_tx::DecisionObservation>,
     witness_scope: Option<rtdb_types::PlacedAttemptScope>,
     applied_scope: Option<rtdb_types::PlacedAttemptScope>,
-    applied_preparation: Option<Arc<PreparedAppliedCatalog>>,
     witness_until: Timestamp,
     fork_until: Timestamp,
     cancellation: CancellationToken,
@@ -1727,7 +1640,7 @@ impl OwnedReadSession {
             context, node: self.node.clone(), identity: Arc::clone(&self.identity),
             database: self.database.clone(), owner: self.owner.clone(), present: self.present,
             receiver_observation: self.receiver_observation,
-            witness_scope: self.witness_scope, applied_scope: None, applied_preparation: None, witness_until: self.witness_until, fork_until: self.fork_until,
+            witness_scope: self.witness_scope, applied_scope: None, witness_until: self.witness_until, fork_until: self.fork_until,
             cancellation, session_cancellation: self.session_cancellation.clone(),
             historical: None, scoped_root: Some(relations), attachment: self.attachment.clone(),
             _reservation: reservation,
@@ -3703,7 +3616,6 @@ fn expiry_nomination_digest(
 pub struct NativeSession {
     pub(crate) state: Session,
     pub(crate) service: Arc<NativeSessionService>,
-    applied_preparation: Option<Arc<PreparedAppliedCatalog>>,
 }
 impl NativeSession {
     pub fn track_replica_read_session(&self) -> Result<impl Send + use<>> {
@@ -4214,35 +4126,18 @@ impl NativeSession {
         rtdb_types::boxed_with(self, |this| this.retain_owned_read(OwnedReadBasis::Fresh { deployment, required })).await
     }
 
-    /// Enrolls one nonrenewable lower catalog pin for a prepaid session before use.
-    pub async fn prepare_applied_owned_reads(&mut self, floor: &AppliedReadFloor) -> Result<u64> {
-        if self.service.audience_storage.is_none() || self.applied_preparation.is_some() {
-            return Err(hosted_source_unavailable());
-        }
-        let read = self.retain_owned_read(OwnedReadBasis::Applied { floor, preparation: None }).await?;
-        let preparation = PreparedAppliedCatalog::from_read(&read, &self.service.memory)?;
-        let remaining = preparation.remaining_micros()?;
-        self.applied_preparation = Some(Arc::new(preparation));
-        Ok(remaining)
-    }
     /// Retains the already-applied catalog from the current recovered hosted holder.
     pub async fn open_applied_owned_read(&mut self, floor: &AppliedReadFloor) -> Result<OwnedReadSession> {
-        let preparation = if self.service.audience_storage.is_some() {
-            Some(Arc::clone(self.applied_preparation.as_ref().ok_or_else(hosted_source_unavailable)?))
-        } else {
-            None
-        };
-        self.retain_owned_read(OwnedReadBasis::Applied { floor, preparation }).await
+        self.retain_owned_read(OwnedReadBasis::Applied { floor }).await
     }
     async fn retain_owned_read(
         &mut self, read_basis: OwnedReadBasis<'_>,
     ) -> Result<OwnedReadSession> {
         if !self.service.node.factory.options.owned_relations { return Err(owned_relations_disabled()); }
         let applied = match &read_basis {
-            OwnedReadBasis::Applied { floor, .. } => Some(*floor),
+            OwnedReadBasis::Applied { floor } => Some(*floor),
             _ => None,
         };
-        if applied.is_none() && self.service.audience_storage.is_some() { return Err(hosted_source_unavailable()); }
         let node = self.service.node.clone();
         let identity = Arc::clone(&self.service.identity);
         let database = self.state.database().to_owned();
@@ -4262,19 +4157,11 @@ impl NativeSession {
         let applied_memory;
         let mut replica_capture = None;
         let mut floor_to_check = None;
-        let mut applied_preparation = None;
         let (reserved, cut) = match read_basis {
-            OwnedReadBasis::Applied { floor, ref preparation } => {
-                applied_preparation = preparation.clone();
+            OwnedReadBasis::Applied { floor } => {
                 floor_to_check = Some(floor);
                 applied_memory = node.query_memory_for(&self.service.memory);
-                let admission = match applied_preparation.as_deref() {
-                    Some(preparation) => AppliedCatalogAdmission::PreparedAudience(preparation),
-                    None => self.service.audience_storage.as_ref().map_or(
-                        AppliedCatalogAdmission::Ordinary, AppliedCatalogAdmission::PrepareAudience,
-                    ),
-                };
-                (None, floor.cut(None, &applied_memory, admission)?)
+                (None, floor.cut(None, &applied_memory)?)
             }
             OwnedReadBasis::Fresh { deployment, required } => {
                 if attached.replica_read_deployment() != Some(deployment)
@@ -4347,19 +4234,17 @@ impl NativeSession {
         let placement = attached.clone();
         let guarded_node = node.clone();
         let guarded_database = database.clone();
-        let guarded_preparation = applied_preparation.clone();
         let context = context.with_owned_read_guard(Arc::new(move || {
             if clock.monotonic_micros() >= deadline {
                 return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/read-expired", "The retained owned read expired"));
             }
             guarded_node.attached_database(&guarded_database, Some(&attached))?;
             if let Some(lease) = &lease { lease.check()?; }
-            if let Some(preparation) = &guarded_preparation { preparation.check_live()?; }
             Ok(())
         }));
         context.check_cancelled()?;
         Ok(OwnedReadSession {
-            context, node, identity, database, owner, present, receiver_observation, witness_scope, applied_scope, applied_preparation, witness_until, fork_until: witness_until,
+            context, node, identity, database, owner, present, receiver_observation, witness_scope, applied_scope, witness_until, fork_until: witness_until,
             cancellation, session_cancellation, historical: None, scoped_root: None, attachment: placement, _reservation: charge,
         })
     }
@@ -4468,7 +4353,6 @@ pub(crate) struct NativeSessionService {
     pub(crate) database: String,
     placement: Option<Weak<Database>>,
     memory: Arc<MemoryBudget>,
-    audience_storage: Option<Arc<BufferPool>>,
 }
 
 async fn ordered_commit_observation(

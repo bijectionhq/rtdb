@@ -50,7 +50,7 @@ pub struct PlacedOptions {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct ListenerAddresses { pub pgwire: Option<SocketAddr>, pub read_only_pgwire: Option<SocketAddr>, pub flight_sql: Option<SocketAddr>, pub audience_flight: Option<SocketAddr>, pub health: Option<SocketAddr> }
+pub struct ListenerAddresses { pub pgwire: Option<SocketAddr>, pub read_only_pgwire: Option<SocketAddr>, pub flight_sql: Option<SocketAddr>, pub health: Option<SocketAddr> }
 
 #[derive(Clone)]
 pub struct ServerHandle {
@@ -376,22 +376,7 @@ impl ServerDriver {
                 deployment_admin: config.deployment_admin.clone(),
                 #[cfg(feature = "multi")]
                 default_checkpoint_restore_directory: config.default_checkpoint_restore_directory.clone(),
-                reserved_applied_source: settings.audience.map(|(_, audience)| audience.source()),
                 ..Default::default() };
-            if let Some((address, audience)) = settings.audience {
-                let reserved = rtdb_flight_sql::FlightConfig {
-                    address, audience: Some(audience), reserved_applied_source: None, playground: false, owned_world_host: None, custody_providers: Default::default(),
-                    classic_flight_exclusion: None,
-                    #[cfg(feature = "multi")]
-                    deployment_admin: None,
-                    #[cfg(feature = "multi")]
-                    default_checkpoint_restore_directory: None,
-                    ..ordinary.clone()
-                };
-                let (handle, driver) = rtdb_flight_sql::ServerDriver::bind(reserved, node.clone(), auth.clone()).await?;
-                addresses.audience_flight = Some(handle.address());
-                flight.push((handle, driver));
-            }
             let (handle, driver) = match (&installed_tls, &development_tls) {
                 (Some(tls), _) => rtdb_flight_sql::ServerDriver::bind_standalone(ordinary, node.clone(), auth.clone(), tls.as_ref().clone()).await?,
                 (None, Some(tls)) => rtdb_flight_sql::ServerDriver::bind_loopback_tls(ordinary, node.clone(), auth.clone(), tls.as_ref().clone()).await?,

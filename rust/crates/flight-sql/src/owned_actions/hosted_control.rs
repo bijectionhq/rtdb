@@ -5,21 +5,6 @@ pub(crate) const READ_HELD_HOSTED_CONTROL_V3: &str = "rtdb.owned.ReadHeldHostedC
 pub(crate) const READ_HELD_HOSTED_CONTROL_AT_PUBLICATION_V1: &str = "rtdb.owned.ReadHeldHostedControlAtPublication.v1";
 pub(crate) const READ_HELD_ROOT_CATALOG_V1: &str = "rtdb.owned.ReadHeldRootCatalog.v1";
 
-pub(super) fn require_audience_control(
-    session: &crate::state::Session, relation: &str, id: &str,
-) -> Result<(), Status> {
-    if session.audience_source().is_some() && !audience_control_admitted(relation, id) {
-        return Err(Status::permission_denied("The control is outside the prepared audience"));
-    }
-    Ok(())
-}
-
-fn audience_control_admitted(relation: &str, id: &str) -> bool {
-    // Provider discovery belongs to the ordinary authentication path.
-    relation != "bj_fact_root_admission"
-        || (id != "provider_issuers" && !rtdb_tx::protected_proposal_landing_control(id))
-}
-
 impl Service {
     pub(crate) async fn read_held_root_catalog_action(
         &self,
@@ -28,8 +13,7 @@ impl Service {
         stream: bool,
     ) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
-        if call.session.audience_source().is_some()
-            || call.session.caller.principal.user_id().is_none()
+        if call.session.caller.principal.user_id().is_none()
             || matches!(call.session.caller.owner, crate::state::Owner::Anonymous)
         {
             return Err(Status::permission_denied("Root catalog reads require an ordinary authenticated session"));
@@ -127,7 +111,6 @@ impl Service {
             .ok_or_else(|| invalid("Hosted control point has no held handle"))?;
         let held = self.retained_owned_read(call, &Bytes::copy_from_slice(handle))?;
         let (at, body) = if positioned {
-            if call.session.audience_source().is_some() { return Err(unsupported()); }
             let (at, body) = split_world_publication(body)?;
             (Some(at), body)
         } else {
@@ -156,7 +139,6 @@ impl Service {
             return Err(invalid("Hosted control point ID exceeds its bound"));
         }
         let _key = call.reserve(id.len() * 4 + 1024)?;
-        require_audience_control(&call.session, table.name(), id)?;
         let scope = self.hosted_control_scope(call).await?;
         if positioned && !matches!((table.name(), id),
             ("bj_fact_root_program", "active") | ("bj_fact_root_admission", "application"))
@@ -232,17 +214,4 @@ pub(super) fn admit_control_targets<'a>(
         ));
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod audience_tests {
-    use super::*;
-
-    #[test]
-    fn provider_discovery_is_outside_audience_control_admission() {
-        assert!(!audience_control_admitted("bj_fact_root_admission", "provider_issuers"));
-        assert!(audience_control_admitted("bj_fact_root_admission", "application"));
-        assert!(!audience_control_admitted("bj_fact_root_admission", "root_proposal_private_landing:key"));
-        assert!(!audience_control_admitted("bj_fact_root_admission", "root_proposal_private_landing_proof:key"));
-    }
 }

@@ -179,7 +179,6 @@ impl Service {
         if !call.session.caller.verified_credential
             || !self.0.node.catalog().is_managed()
             || self.follower_only()
-            || call.session.audience_source().is_some()
             || call.session.fresh_replica
         {
             return Err(denied());

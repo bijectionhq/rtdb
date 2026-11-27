@@ -147,7 +147,6 @@ impl CacheBudget {
     pub fn with_memory(memory: Arc<MemoryBudget>) -> Arc<Self> {
         Arc::new(Self { memory, lru: Mutex::new(Lru::new()), pools: AtomicU64::new(0), misses: AtomicU64::new(0), record_batch_requests: AtomicU64::new(0) })
     }
-    pub fn prepaid_by(&self, parent: &Arc<MemoryBudget>) -> bool { self.memory.prepaid_by(parent) }
     pub fn retained_bytes(&self) -> usize { self.memory.used_bytes() }
     pub fn limit_bytes(&self) -> usize { self.memory.limit_bytes() }
     /// The reads, since the budget opened, that its pools could not serve from memory.
@@ -663,7 +662,6 @@ mod fairness_tests {
     async fn a_prepaid_cache_admits_and_retains_objects_during_ordinary_pressure() {
         let parent = MemoryBudget::new(200);
         let prepaid = CacheBudget::with_memory(parent.prepay(100).unwrap());
-        assert!(prepaid.prepaid_by(&parent));
         let store = Arc::new(MemoryStore::default());
         let a = ObjectKey::new("a").unwrap();
         let b = ObjectKey::new("b").unwrap();

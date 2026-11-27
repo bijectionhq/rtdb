@@ -3,11 +3,10 @@ use bytes::Bytes;
 use rtdb_auth::Principal;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_node::{Database, NativeSession, Node, PreparedSql};
-use rtdb_storage::cache::CacheBudget;
-use tokio_util::sync::{CancellationToken, DropGuard};
+use tokio_util::sync::CancellationToken;
 use tonic::Status;
 use uuid::Uuid;
-use crate::{error::status, lease::Leased, owned_actions::OwnedReadResource, wire::BoundParameters};
+use crate::{error::status, lease::Leased, wire::BoundParameters};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Owner { Anonymous, Authenticated(Uuid) }
@@ -42,27 +41,10 @@ enum SessionState {
     Open {
         connections: BTreeMap<String, (Arc<ConnectionResource>, Arc<MemoryReservation>)>,
         catalog: Option<CatalogSelection>,
-        audience_generation: u64,
-        audience_read: Option<(Bytes, Arc<OwnedReadResource>)>,
     },
     Closed,
 }
 struct Placement { name: String, attachment: Weak<Database> }
-
-pub(crate) struct AudienceProjection {
-    pub relation: rtdb_types::OwnedRelation,
-    pub address_path: rtdb_types::OwnedRelation,
-}
-
-pub(crate) struct AudienceSession {
-    pub source: Uuid,
-    pub projection: std::sync::OnceLock<AudienceProjection>,
-    pub recovery_work: rtdb_storage::audience_work::TurnAllowance,
-    pub seat: crate::AudienceSeat,
-    pub cache: Arc<CacheBudget>,
-    pub expires_at: tokio::time::Instant,
-    pub _claim: DropGuard,
-}
 
 pub(crate) struct Session {
     pub id: String,
@@ -71,21 +53,16 @@ pub(crate) struct Session {
     placement: Option<Placement>,
     state: Mutex<SessionState>,
     _reservation: Arc<MemoryReservation>,
-    // Release the directory claim after the registered session state and its charge.
-    audience: Option<AudienceSession>,
 }
 impl Session {
-    pub fn new(id: String, caller: Arc<Caller>, local: Option<&Arc<Database>>, fresh_replica: bool, audience: Option<AudienceSession>, reservation: Arc<MemoryReservation>) -> Self {
+    pub fn new(id: String, caller: Arc<Caller>, local: Option<&Arc<Database>>, fresh_replica: bool, reservation: Arc<MemoryReservation>) -> Self {
         let placement = local.map(|database| Placement { name: database.name().into(), attachment: Arc::downgrade(database) });
         Self {
             id, caller, placement, fresh_replica,
-            state: Mutex::new(SessionState::Open { connections: BTreeMap::new(), catalog: None, audience_generation: 0, audience_read: None }),
+            state: Mutex::new(SessionState::Open { connections: BTreeMap::new(), catalog: None }),
             _reservation: reservation,
-            audience,
         }
     }
-    pub fn audience_source(&self) -> Option<Uuid> { self.audience.as_ref().map(|audience| audience.source) }
-    pub fn audience_seat(&self) -> Option<crate::AudienceSeat> { self.audience.as_ref().map(|audience| audience.seat) }
 
     pub(crate) fn register_read(&self, register: impl FnOnce() -> Result<(), Status>) -> Result<(), Status> {
         let state = self.state.lock().expect("session lock");
@@ -93,79 +70,6 @@ impl Session {
             return Err(Status::not_found("session closed"));
         }
         register()
-    }
-
-    pub(crate) fn with_audience_handoff<T>(
-        &self,
-        cleanup: bool,
-        handoff: impl FnOnce() -> Result<T, Status>,
-    ) -> Result<T, Status> {
-        let state = self.state.lock().expect("session lock");
-        let open = matches!(*state, SessionState::Open { .. });
-        if !crate::audience_seat::audience_handoff_permitted(open, cleanup) {
-            return Err(Status::not_found("session closed"));
-        }
-        let result = handoff();
-        drop(state);
-        result
-    }
-
-    pub fn install_audience_projection(&self, projection: AudienceProjection) -> Result<(), Status> {
-        self.audience.as_ref().ok_or_else(crate::error::unsupported)?.projection.set(projection)
-            .map_err(|_| Status::failed_precondition("The audience projection is already prepared"))
-    }
-
-    pub fn audience_projection(&self) -> Result<&AudienceProjection, Status> {
-        self.audience.as_ref().and_then(|audience| audience.projection.get())
-            .ok_or_else(|| Status::failed_precondition("The audience projection is not prepared"))
-    }
-
-    pub fn audience_recovery_work(&self) -> Option<rtdb_storage::audience_work::TurnAllowance> {
-        self.audience.as_ref().map(|audience| audience.recovery_work.clone())
-    }
-
-    pub fn audience_remaining_micros(&self) -> Option<u64> {
-        let remaining = self.audience.as_ref()?.expires_at.saturating_duration_since(tokio::time::Instant::now());
-        u64::try_from(remaining.as_micros()).ok().filter(|remaining| *remaining > 0)
-    }
-
-    pub fn audience_read(&self, handle: &Bytes) -> Option<Arc<OwnedReadResource>> {
-        let state = self.state.lock().expect("session lock");
-        let SessionState::Open { audience_read: Some((id, read)), .. } = &*state else { return None; };
-        (id == handle).then(|| Arc::clone(read))
-    }
-
-    pub fn begin_audience_read(&self, generation: u64) -> Result<(), Status> {
-        let previous = {
-            let mut state = self.state.lock().expect("session lock");
-            let SessionState::Open { audience_generation, audience_read, .. } = &mut *state else {
-                return Err(Status::not_found("session closed"));
-            };
-            if self.audience.is_none() || generation <= *audience_generation {
-                return Err(Status::failed_precondition("The audience read generation is stale"));
-            }
-            *audience_generation = generation;
-            audience_read.take()
-        };
-        if let Some((_, read)) = previous { read.close(); }
-        Ok(())
-    }
-
-    pub fn take_audience_read(&self, handle: &Bytes) -> Option<Arc<OwnedReadResource>> {
-        let mut state = self.state.lock().expect("session lock");
-        let SessionState::Open { audience_read, .. } = &mut *state else { return None; };
-        if audience_read.as_ref().is_none_or(|(id, _)| id != handle) { return None; }
-        audience_read.take().map(|(_, read)| read)
-    }
-
-    pub fn install_audience_read(&self, generation: u64, handle: Bytes, read: Arc<OwnedReadResource>) -> Result<(), Status> {
-        let mut state = self.state.lock().expect("session lock");
-        let SessionState::Open { audience_generation, audience_read, .. } = &mut *state else { return Err(Status::not_found("session closed")); };
-        if generation == 0 || generation != *audience_generation || audience_read.is_some() {
-            return Err(Status::failed_precondition("The audience read generation changed"));
-        }
-        *audience_read = Some((handle, read));
-        Ok(())
     }
 
     pub fn memory(&self) -> &Arc<MemoryBudget> { self._reservation.budget() }
@@ -206,11 +110,7 @@ impl Session {
     pub fn open_native(&self, database: &str, node: &Node) -> Result<NativeSession, Status> {
         self.require_database(database, node)?;
         let identity = self.caller.principal.clone();
-        let mut native = if let Some(audience) = &self.audience {
-            node.audience_session(database, identity, audience.source, Arc::clone(self.memory()), Arc::clone(&audience.cache))
-        } else {
-            node.session(database, identity)
-        }.map_err(status)?;
+        let mut native = node.session(database, identity).map_err(status)?;
         native.state_mut().set_application_name("XTDB Flight SQL").map_err(status)?;
         self.require_database(database, node)?;
         Ok(native)
@@ -229,12 +129,9 @@ impl Session {
 fn placement_changed() -> Status { Status::unavailable("This node no longer holds the Flight SQL session's deployment") }
 
 impl Leased for Session {
-    fn hard_deadline(&self) -> Option<tokio::time::Instant> { self.audience.as_ref().map(|audience| audience.expires_at) }
-
     fn close(&self) {
         let state = std::mem::replace(&mut *self.state.lock().expect("session lock"), SessionState::Closed);
-        if let SessionState::Open { connections, audience_read, .. } = state {
-            if let Some((_, read)) = audience_read { read.close(); }
+        if let SessionState::Open { connections, .. } = state {
             for (connection, _) in connections.into_values() { connection.close(); }
         }
     }
@@ -249,37 +146,3 @@ pub(crate) enum PreparedScope { Session(String), Transaction(Bytes) }
 pub(crate) struct Prepared { pub owner: ResourceOwner, pub sql: String, pub plan: Option<PreparedSql>, pub scope: PreparedScope, pub params: Mutex<Option<Arc<BoundParameters>>>, _reservation: Arc<MemoryReservation> }
 impl Prepared { pub fn new(owner: ResourceOwner, sql: String, plan: Option<PreparedSql>, scope: PreparedScope, reservation: Arc<MemoryReservation>) -> Self { Self { owner, sql, plan, scope, params: Mutex::new(None), _reservation: reservation } } }
 impl Leased for Prepared { fn close(&self) { *self.params.lock().expect("prepared parameters lock") = None; } }
-
-#[cfg(test)]
-mod tests {
-    use super::{Caller, Leased, Owner, Session};
-    use rtdb_auth::{AuthConfig, Authenticator, NativeHttp};
-    use rtdb_columnar::MemoryBudget;
-    use std::{sync::Arc, time::Duration};
-    use tonic::Code;
-
-    #[tokio::test]
-    async fn closed_session_refuses_data_handoff_and_acknowledges_cleanup() {
-        let memory = MemoryBudget::new(4096);
-        let http = NativeHttp::new(Arc::clone(&memory), Duration::from_secs(1), 1024).unwrap();
-        let auth = Authenticator::open(
-            AuthConfig::SingleRootUser { password: None },
-            Arc::clone(&memory),
-            Arc::new(rtdb_node::SystemClock),
-            Arc::new(http),
-        ).await.unwrap();
-        let caller = Arc::new(Caller {
-            owner: Owner::Anonymous,
-            principal: auth.unauthenticated().unwrap(),
-            mac: None,
-            verified_credential: false,
-        });
-        let session = Session::new("session".into(), caller, None, false, None, memory.reserve(256).unwrap());
-
-        session.with_audience_handoff(false, || Ok(())).unwrap();
-        session.close();
-        let refusal = session.with_audience_handoff::<()>(false, || panic!("closed egress ran"));
-        assert_eq!(refusal.unwrap_err().code(), Code::NotFound);
-        session.with_audience_handoff(true, || Ok(())).unwrap();
-    }
-}
