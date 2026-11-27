@@ -261,25 +261,26 @@ fn score_f32(
 
 #[test]
 fn native_nearest_scores_run_encoded_f32_and_preserves_admission_and_component_errors() {
-    use arrow_array::{Array, FixedSizeListArray, Float32Array, Int16Array, RunArray, types::Int16Type};
-    use arrow_schema::Field;
+    use rtdb_types::{ListKind, RunEndWidth};
 
-    let values = RunArray::<Int16Type>::try_new(
-        &Int16Array::from(vec![1, 2, 3, 4, 5, 6]),
-        &Float32Array::from(vec![Some(3.0), Some(0.0), None, Some(1.0), Some(f32::NAN), Some(1.0)]),
-    ).unwrap();
-    let array = FixedSizeListArray::new(
-        Arc::new(Field::new("item", values.data_type().clone(), true)), 2, Arc::new(values), None,
-    );
-    let field = Field::new("vector", array.data_type().clone(), false);
-    let cell = ArrowCell { field: &field, array: &array, row: 0 };
+    let logical = LogicalType::List {
+        kind: ListKind::FixedSizeList(2),
+        element: Box::new(LogicalType::Scalar(ScalarType::F32).maybe().run_end_encoded(RunEndWidth::I16).unwrap()),
+    };
+    let array = rtdb_columnar::build_array(&logical, &[
+        Value::FixedSizeList(vec![Value::F32(3.0), Value::F32(0.0)].into()),
+        Value::FixedSizeList(vec![Value::Null, Value::F32(1.0)].into()),
+        Value::FixedSizeList(vec![Value::F32(f32::NAN), Value::F32(1.0)].into()),
+    ]).unwrap();
+    let field = rtdb_columnar::to_field("vector", &logical).unwrap();
+    let cell = ArrowCell { field: &field, array: array.as_ref(), row: 0 };
     let query = NearestQuery::new(vec![1.0, 0.0], Vec::new(), 1).unwrap();
     let memory = MemoryBudget::new(1 << 20);
     assert_eq!(score_f32(&memory, cell, &query).unwrap(), Some(0.0));
     let error = Anomaly::from(super::InvalidComponents);
     assert_eq!(score_f32(&memory, ArrowCell { row: 1, ..cell }, &query).unwrap_err(), error);
     assert_eq!(score_f32(&memory, ArrowCell { row: 2, ..cell }, &query).unwrap_err(), error);
-    let decode = rtdb_columnar::estimate_read_value_bytes(&field, &array, 0).unwrap().saturating_mul(2);
+    let decode = rtdb_columnar::estimate_read_value_bytes(&field, array.as_ref(), 0).unwrap().saturating_mul(2);
     assert_eq!(score_f32(&MemoryBudget::new(decode), cell, &query).unwrap(), Some(0.0));
     assert_eq!(score_f32(&MemoryBudget::new(decode - 1), cell, &query).unwrap_err().code, "rtdb/memory-budget-exceeded");
     assert_eq!(memory.used_bytes(), 0);

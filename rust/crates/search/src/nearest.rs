@@ -849,15 +849,14 @@ mod tests {
             &Int16Array::from(vec![2, 4, 5, 6, 7, 9, 10]),
             &Float32Array::from(vec![Some(7.0), Some(-0.3), Some(0.125), Some(f32::NAN), None, Some(1.0), Some(f32::INFINITY)]),
         ).unwrap();
-        let array = ListArray::new(
-            Arc::new(Field::new("item", values.data_type().clone(), true)),
-            OffsetBuffer::new(vec![0, 2, 5, 7, 10].into()), Arc::new(values), None,
-        ).slice(1, 3);
+        let values = Arc::new(values) as arrow_array::ArrayRef;
+        let item = Arc::new(Field::new("item", values.data_type().clone(), false));
+        let array = rtdb_columnar::build_list_array(item, vec![0, 2, 5, 7, 10].into(), &values, None).unwrap().slice(1, 3);
         let field = Field::new("vector", array.data_type().clone(), false);
         let query = NearestQuery::new(vec![0.25, -0.5, 0.125], Vec::new(), 1).unwrap();
         for row in 0..array.len() {
-            let cell = ArrowCell { field: &field, array: &array, row };
-            let Value::List(decoded) = rtdb_columnar::read_value(&field, &array, row).unwrap() else { panic!("Expected a list"); };
+            let cell = ArrowCell { field: &field, array: array.as_ref(), row };
+            let Value::List(decoded) = rtdb_columnar::read_value(&field, array.as_ref(), row).unwrap() else { panic!("Expected a list"); };
             let expected = score_decoded_list(&decoded, &query);
             let actual = read_vector(cell, &query, None).map(|vector| {
                 let vector = vector.unwrap();
