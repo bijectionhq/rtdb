@@ -8,14 +8,10 @@ use std::{
     sync::Arc,
 };
 
-use arrow_array::{
-    Array, BinaryArray, BooleanArray, Date32Array, Date64Array, FixedSizeBinaryArray, Float16Array,
-    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray,
-    StructArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
-};
+use arrow_array::{Array, BinaryArray, BooleanArray, FixedSizeBinaryArray, StringArray, StructArray};
 use arrow_buffer::Buffer;
 use bytes::Bytes;
-use rtdb_columnar::{MemoryBudget, MemoryReservation};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, from_field};
 use rtdb_format::{
     block::proto as pb,
     catalog::{BlockCatalog, TableEntry, publication_digest},
@@ -29,7 +25,7 @@ use rtdb_storage::{IoRegion, MemoryStore, ObjectKey, ObjectStore, ReadReservatio
 use rtdb_trie::{TrieConfig, TrieNode};
 use rtdb_types::{
     Anomaly, AnomalyCategory, AnomalyKind, BlockIndex, CatalogCut, EventHeader, EventOp, EventOrigin,
-    EventPosition, Iid, LogicalType, Result, ScalarType, SourcePosition, StructFields, Value,
+    EventPosition, Iid, LogicalType, Result, SourcePosition, StructFields, Value,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -325,7 +321,7 @@ impl Events<'_> {
                 }
                 Entry::Vacant(entry) => {
                     let positioned = self.positions && !batch.has_entity_keys()
-                        && (header.op != EventOp::Put || flat_put(batch, row)?.is_some());
+                        && (header.op != EventOp::Put || positioned_put(batch, row)?.is_some());
                     if positioned && source.is_none() {
                         let bytes = batch.arrow().num_columns().checked_mul(32)
                             .and_then(|bytes| bytes.checked_add(1024))
@@ -394,32 +390,44 @@ impl Events<'_> {
     }
 }
 
-fn flat_type(array: &dyn Array) -> Option<ScalarType> {
+fn plain_survivor_leaf(array: &dyn Array) -> bool {
+    let ty = array.data_type();
     let physical = array.as_any();
-    macro_rules! scalar_types {
-        ($($array:ty => $scalar:ident),+ $(,)?) => {
-            $(if physical.is::<$array>() { return Some(ScalarType::$scalar); })+
-        };
-    }
-    scalar_types!(
-        BooleanArray => Bool, StringArray => Utf8, BinaryArray => Binary,
-        Int8Array => I8, Int16Array => I16, Int32Array => I32, Int64Array => I64,
-        UInt8Array => U8, UInt16Array => U16, UInt32Array => U32, UInt64Array => U64,
-        Float16Array => F16, Float32Array => F32, Float64Array => F64,
-        Date32Array => DateDay, Date64Array => DateMilli,
-    );
-    physical.downcast_ref::<FixedSizeBinaryArray>()
-        .filter(|array| array.value_length() > 0)
-        .map(|array| ScalarType::FixedSizeBinary(array.value_length()))
+    ty.is_integer() || ty.is_floating() || ty.is_temporal()
+        || physical.is::<BooleanArray>() || physical.is::<StringArray>() || physical.is::<BinaryArray>()
+        || physical.downcast_ref::<FixedSizeBinaryArray>().is_some_and(|array| array.value_length() > 0)
 }
 
-fn flat_put(batch: &EventBatch, row: usize) -> Result<Option<&StructArray>> {
+fn unpadded_fields(document: &StructArray, row: usize) -> bool {
+    document.fields().iter().zip(document.columns()).all(|(field, array)| {
+        field.metadata().is_empty() && array.is_valid(row)
+            && if let Some(child) = array.as_any().downcast_ref::<StructArray>() {
+                unpadded_fields(child, row)
+            } else {
+                plain_survivor_leaf(array.as_ref())
+            }
+    })
+}
+
+fn positioned_put(batch: &EventBatch, row: usize) -> Result<Option<&StructArray>> {
     batch.borrow_event(row)?;
     let put = batch.put_document()?.ok_or_else(|| invalid("A put operation must contain a document struct"))?;
     let offset = batch.operations()?.value_offset(row);
-    Ok(put.fields().iter().zip(put.columns()).all(|(field, array)| {
-        field.metadata().is_empty() && array.is_valid(offset) && flat_type(array.as_ref()).is_some()
-    }).then_some(put))
+    Ok(unpadded_fields(put, offset).then_some(put))
+}
+
+fn positioned_fields(document: &StructArray) -> Result<StructFields<LogicalType>> {
+    document.fields().iter().zip(document.columns()).map(|(field, array)| {
+        let ty = if let Some(child) = array.as_any().downcast_ref::<StructArray>() {
+            LogicalType::Struct(positioned_fields(child)?)
+        } else {
+            match from_field(field)? {
+                LogicalType::Maybe(inner) => *inner,
+                ty => ty,
+            }
+        };
+        Ok((field.name().clone(), ty))
+    }).collect()
 }
 
 fn copy_positions<'a>(
@@ -430,7 +438,7 @@ fn copy_positions<'a>(
     for row in rows.clone() {
         let SurvivorPayload::Position(page, index) = &row.payload else { return Ok(None); };
         if row.header.op == EventOp::Put {
-            let document = flat_put(&page.batch, *index)?.expect("admitted flat put");
+            let document = positioned_put(&page.batch, *index)?.expect("admitted put");
             if put.is_some_and(|first: &StructArray| first.fields() != document.fields()) {
                 return Ok(None);
             }
@@ -444,9 +452,7 @@ fn copy_positions<'a>(
         })
     })?;
     let _schema = memory.reserve(bound)?;
-    let fields = put.map(|put| put.fields().iter().zip(put.columns()).map(|(field, array)| {
-        (field.name().clone(), LogicalType::Scalar(flat_type(array.as_ref()).expect("admitted flat column")))
-    }).collect());
+    let fields = put.map(positioned_fields).transpose()?;
     let events = rows.map(|row| {
         let SurvivorPayload::Position(page, index) = &row.payload else { unreachable!("admitted position"); };
         Ok(page.batch.borrow_event(*index)?.without_recency())
@@ -742,7 +748,7 @@ fn invalid(message: &str) -> Anomaly {
 mod tests {
     use super::*;
     use rtdb_format::ipc::write_file_pages;
-    use rtdb_types::{BlockIndex, Interval, ScalarType, TableRef, Timestamp, TxId};
+    use rtdb_types::{BlockIndex, Interval, ScalarType, TableRef, TimeUnit, Timestamp, TxId};
 
     #[test]
     fn survivor_stream_preserves_ipc_bytes_and_retains_only_final_capacity() -> Result<()> {
@@ -858,9 +864,20 @@ mod tests {
             ("fixed".into(), Value::FixedSizeBinary(vec![0x42, 0])),
             ("day".into(), Value::DateDay(-1)),
             ("millis".into(), Value::DateMilli(-86_400_000)),
+            ("nested".into(), Value::Struct(StructFields::from([
+                ("zoned".into(), Value::Timestamp {
+                    value: -1001, unit: TimeUnit::Nanosecond, timezone: Some("Europe/Paris".into()),
+                }),
+                ("inner".into(), Value::Struct(StructFields::from([
+                    ("z".into(), Value::Duration { value: -42, unit: TimeUnit::Millisecond }),
+                    ("a".into(), Value::IntervalMonthDayNano { months: -2, days: 4, nanoseconds: -17 }),
+                ]))),
+            ]))),
         ]));
         let StoredOperation::Put(example) = document(-0.0) else { unreachable!() };
-        let fields = Some(example.into_iter().map(|(name, value)| (name, value.logical_type())).collect());
+        let fields = Some(example.into_iter().map(|(name, value)| {
+            (name, value.logical_type().maybe())
+        }).collect());
         let disk = build_event_batch(&[
             event(3, document(-0.0), 110),
             event(1, document(-0.0), 110),
@@ -914,6 +931,25 @@ mod tests {
         assert_eq!(outputs[0], outputs[1]);
         drop(outputs);
         assert_eq!(memory.used_bytes(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn survivor_put_with_a_null_nested_field_requires_scalar_normalization() -> Result<()> {
+        let memory = MemoryBudget::new(4 << 20);
+        let event = StoredEvent {
+            position: Some(EventPosition { transaction: TxId(10), ordinal: 0 }),
+            origin: None, entity_key: None, iid: Iid([5; 16]), system_from: Timestamp(10),
+            commit_position: 0, valid_time: Interval::ALL, recency: None,
+            operation: StoredOperation::Put(StructFields::from([("nested".into(), Value::Struct(
+                StructFields::from([("padding".into(), Value::Null), ("kept".into(), Value::I64(42))]),
+            ))])),
+        };
+        let batch = IndexBatch::copy_events(&[event], &StructFields::new(), &memory)?;
+        assert!(positioned_put(batch.view(), 0)?.is_none());
+        let (event, _reservation) = normalized_event(batch.view(), 0, &memory)?;
+        let StoredOperation::Put(document) = event.operation else { unreachable!() };
+        assert_eq!(document["nested"], Value::Struct(StructFields::from([("kept".into(), Value::I64(42))])));
         Ok(())
     }
 
