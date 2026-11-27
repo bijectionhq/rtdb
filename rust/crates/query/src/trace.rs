@@ -343,4 +343,35 @@ mod tests {
         assert!(bytes > 0);
         assert_eq!(attributes["query.spill_region_peak_bytes"].parse::<u64>().unwrap(), bytes);
     }
+
+    #[tokio::test]
+    async fn plain_explain_retains_report_and_submission_text_without_operator_spans() {
+        let (tracer, mut receiver) = rtdb_metrics::TraceRecorder::new(MemoryBudget::new(1 << 20), 8, true, false).unwrap();
+        let context = query_context().with_tracer(Some(tracer.clone()), None);
+        let mut cursor = {
+            let source = String::from("EXPLAIN SELECT 1 AS n");
+            let relation = Arc::new(Relation::unit()).project(vec![
+                NamedExpr { field: field(0, "n", ScalarType::I64), expr: Expr::Literal(Value::I64(1)) },
+            ]).unwrap();
+            let prepared = rtdb_plan::PreparedStatement {
+                statement: rtdb_plan::Statement::Explain { relation: Arc::new(relation), mode: rtdb_plan::ExplainMode::Plan },
+                parameter_types: BTreeMap::new(),
+                source: "EXPLAIN SELECT 1 AS n /* prepared */".into(),
+                notices: Vec::new(),
+                settings: Default::default(),
+            };
+            let query = crate::PreparedQuery::from_prepared(prepared, &context.memory).unwrap();
+            query.execute_with_text(Arc::clone(&context), vec![], Some(&source)).await.unwrap()
+        };
+        assert!(cursor.next_batch().await.unwrap().is_some());
+        drop(cursor);
+        tracer.close();
+
+        let span = receiver.next().await.unwrap();
+        assert_eq!(span.name, "xtdb.query");
+        let attributes: BTreeMap<_, _> = span.attributes().collect();
+        assert_eq!(attributes["query.text"], "EXPLAIN SELECT 1 AS n");
+        assert!(receiver.next().await.is_none());
+        assert_eq!(context.memory.used_bytes(), 0);
+    }
 }

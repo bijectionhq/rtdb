@@ -509,6 +509,20 @@ pub(crate) fn scalar_argument_units(arguments: &ast::FunctionArgumentList) -> Re
     Err(grammar_rejected("A scalar function argument modifier"))
 }
 
+pub(crate) fn retain_explain_projection_symbol(mut syntax: &ast::Expr, bound: &mut Expr) {
+    while let ast::Expr::Nested(inner) = syntax {
+        syntax = inner;
+    }
+    let (ast::Expr::Function(function), Expr::Call { name, .. }) = (syntax, bound) else { return; };
+    match name.as_str() {
+        "character_length" => "character-length".clone_into(name),
+        "octet_length" if matches!(&function.args, ast::FunctionArguments::List(arguments)
+            if matches!(arguments.clauses.as_slice(), [ast::FunctionArgumentClause::UsingCharacterLengthUnits(_)])) =>
+            "octet-length".clone_into(name),
+        _ => {}
+    }
+}
+
 pub(crate) fn character_length_function(units: &ast::CharacterLengthUnits) -> Result<&'static str> {
     let (unit, accepted, function) = match units {
         ast::CharacterLengthUnits::Characters(unit) => (unit, "CHARACTERS", "character_length"),

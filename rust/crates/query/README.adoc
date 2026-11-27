@@ -422,6 +422,8 @@ These shapes retain per-row evaluation:
 Append projections, windows and UNNEST retain the input columns required by their expressions and those requested by their parents.
 For conjunctive filters, expressions with fewer column dependencies can reach the scan before multi-column expressions.
 Scan explanations use the reference traversal order of the symbol set and the resulting text set.
+Direct projections of SQL `CHAR_LENGTH` and `CHARACTER_LENGTH` appear in EXPLAIN as `character-length` for character counts and `octet-length` with `USING OCTETS`.
+A direct `OCTET_LENGTH` call retains the symbol `octet_length`.
 Complete original-form retention for explanation strings remains a production gap.
 Aggregate descriptions retain supported factory spellings, explicit XTQL `all` spellings, and integer percentile literals.
 `AggregateAlias` and the validated owned `AggregateName` are immutable plan data with fixed canonical evaluators; each cursor normalizes its private descriptors without rewriting the retained plan.

@@ -82,3 +82,33 @@ async fn plain_explain_emits_types_without_opening_a_values_table() {
     assert_eq!(described.schema(), cursor.schema());
     assert!(cursor.next_batch().await.unwrap().is_some());
 }
+
+#[tokio::test]
+async fn prepared_explain_keeps_bound_character_length_forms_across_rebinds() {
+    let context = context();
+    let prepared = {
+        let source = String::from(
+            "EXPLAIN SELECT CHAR_LENGTH($1) AS nchars, CHARACTER_LENGTH($1 USING CHARACTERS) AS explicit_chars, \
+             CHAR_LENGTH($2 USING OCTETS) AS nbytes, OCTET_LENGTH($2) AS generic",
+        );
+        PreparedSql::prepare(&source, &context, Default::default(), ResultSignaturePolicy::Dynamic).unwrap()
+    };
+    let expected = Value::Utf8(
+        "[{nchars (character-length ?_0)} {explicit_chars (character-length ?_0)} \
+         {nbytes (octet-length ?_1)} {generic (octet_length ?_1)}]".into(),
+    );
+
+    for second in [Value::Utf8("é😀".into()), Value::Binary(vec![0, 255]), Value::Null] {
+        let arguments = vec![Value::Utf8("é😀".into()), second];
+        let types = arguments.iter().map(Value::logical_type).collect::<Vec<_>>();
+        let described = prepared.result_schema(&context, &types).unwrap();
+        let mut cursor = prepared.open_query(Arc::clone(&context), arguments).await.unwrap();
+        assert_eq!(cursor.schema(), described.schema());
+        let batch = cursor.next_batch().await.unwrap().unwrap();
+        let explanation = read_value(batch.batch().schema().field(2), batch.batch().column(2).as_ref(), 0).unwrap();
+        let Value::Struct(explanation) = explanation else { panic!("Expected projection metadata") };
+        assert_eq!(explanation["project"], expected);
+    }
+    drop(prepared);
+    assert_eq!(context.memory.used_bytes(), 0);
+}

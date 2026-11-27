@@ -135,6 +135,7 @@
 -- Measured operators reserve against sibling scopes of the same query budget.
 -- Each operator can report its own retained-allocation peak and the query reports the peak across all operators.
 -- EXPLAIN renders packed floating-point literals from their Arrow children at the original float width.
+-- EXPLAIN retains the bound symbols of direct SQL character-length projections, including after a prepared statement rebinds.
 -- EXPLAIN lists equi-join key mappings and residual predicates in condition order.
 -- EXPLAIN ANALYZE measures the opened Arrow operators when the query uses Arrow execution.
 -- EXPLAIN cursors share their preparation's report values.

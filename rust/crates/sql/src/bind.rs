@@ -62,6 +62,7 @@ impl<'a> FormAllocation<'a> {
 pub(crate) struct Context<'a> {
     pub(crate) forms: FormAllocation<'a>,
     pub(crate) literals: crate::literal_admission::LiteralAdmission,
+    pub(crate) is_explain_plan: bool,
     pub source: &'a str,
     pub catalog: &'a dyn Catalog,
     pub options: &'a PrepareOptions,
@@ -108,7 +109,7 @@ pub(crate) fn control_expression(source: &str, expression: &ast::Expr, options: 
         fn table(&self, _: &QualifiedTable) -> Result<Option<TableBinding>> { Err(error("Control expression cannot read a table")) }
         fn tables(&self, _: &str) -> Result<Vec<TableBinding>> { Err(error("Control expression cannot read a table")) }
     }
-    let mut context = Context { forms, literals: Default::default(), source, catalog: &ScalarCatalog, options, cast_timezone: None, binder: Binder::default(), temporal: &[], used_temporal: BTreeSet::new(), inline_xtql: &[], wildcard_renames: &[], ctes: BTreeMap::new(), next_symbol: 0, next_rewrite_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), inferred_group_scopes: Vec::new(), next_parameter: 0, period_columns: &BTreeSet::new(), notices: Vec::new(), diagnostics: Vec::new(), default_valid: None, default_system: None };
+    let mut context = Context { forms, literals: Default::default(), is_explain_plan: false, source, catalog: &ScalarCatalog, options, cast_timezone: None, binder: Binder::default(), temporal: &[], used_temporal: BTreeSet::new(), inline_xtql: &[], wildcard_renames: &[], ctes: BTreeMap::new(), next_symbol: 0, next_rewrite_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), inferred_group_scopes: Vec::new(), next_parameter: 0, period_columns: &BTreeSet::new(), notices: Vec::new(), diagnostics: Vec::new(), default_valid: None, default_system: None };
     context.admit_expression_literals(expression)?;
     let expression = context.expr(expression, &Schema::default(), &BTreeMap::new())?;
     context.literals.check()?;
@@ -217,7 +218,8 @@ fn bind_parsed<T>(
     let crate::parse::StatementTree { statement, temporal, period_columns, settings, wildcard_renames, .. } = parsed.tree.as_ref();
     let scoped_catalog = TransactionCatalog(catalog);
     let catalog: &dyn Catalog = if matches!(statement, Syntax::Records { .. } | Syntax::CreateTable { .. } | Syntax::CreateSearchIndex { .. } | Syntax::DropSearchIndex { .. } | Syntax::CreateOrderedIndex { .. } | Syntax::DropOrderedIndex { .. } | Syntax::CreateVectorIndex { .. } | Syntax::DropVectorIndex { .. } | Syntax::GrantRole { .. } | Syntax::Erase(_) | Syntax::Assert(_, _) | Syntax::Standard(ast::Statement::Insert(_) | ast::Statement::Update(_) | ast::Statement::Delete(_))) { &scoped_catalog } else { catalog };
-    let mut context = Context { forms, literals: Default::default(), source: parsed.source.input, catalog, options, cast_timezone: Some(&options.default_timezone), binder: Binder::default(), temporal, used_temporal: BTreeSet::new(), inline_xtql: &parsed.inline_xtql, wildcard_renames, ctes: BTreeMap::new(), next_symbol: 0, next_rewrite_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), inferred_group_scopes: Vec::new(), next_parameter, period_columns, notices: Vec::new(), diagnostics: Vec::new(), default_valid: None, default_system: None };
+    let is_explain_plan = matches!(statement, Syntax::Standard(ast::Statement::Explain { analyze: false, .. }));
+    let mut context = Context { forms, literals: Default::default(), is_explain_plan, source: parsed.source.input, catalog, options, cast_timezone: Some(&options.default_timezone), binder: Binder::default(), temporal, used_temporal: BTreeSet::new(), inline_xtql: &parsed.inline_xtql, wildcard_renames, ctes: BTreeMap::new(), next_symbol: 0, next_rewrite_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), inferred_group_scopes: Vec::new(), next_parameter, period_columns, notices: Vec::new(), diagnostics: Vec::new(), default_valid: None, default_system: None };
     let (settings, valid, system) = settings.bind(&mut context)?;
     context.default_valid = valid;
     context.default_system = system;
@@ -947,13 +949,16 @@ impl Context<'_> {
         for (index, item) in projection.iter().filter(|item| !matches!(item, ast::SelectItem::Wildcard(_))).enumerate() {
             match item {
                 ast::SelectItem::UnnamedExpr(expr) | ast::SelectItem::ExprWithAlias { expr, .. } => {
-                    let expression = self.expr_bound(expr, input, replacements)?;
+                    let mut expression = self.expr_bound(expr, input, replacements)?;
                     let name = match item {
                         ast::SelectItem::ExprWithAlias { alias, .. } => identifier(alias).normalized(),
                         _ => implicit_expression_label(expr, &expression, input.relational_schema()?)
                             .unwrap_or_else(|| format!("_column_{}", index + 1)),
                     };
                     let field = self.binder.field(name, None, expression.data_type())?;
+                    if self.is_explain_plan {
+                        crate::expression::retain_explain_projection_symbol(expr, &mut expression);
+                    }
                     projected.push(NamedExpr { field, expr: expression });
                 }
                 ast::SelectItem::QualifiedWildcard(ast::SelectItemQualifiedWildcardKind::ObjectName(name), options) => {

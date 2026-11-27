@@ -60,6 +60,20 @@ async fn explain_temporal_casts_retain_requested_precision_and_interval_fields()
         assert!(project.contains(options),"{project}");
     }
 }
+
+#[tokio::test]
+async fn explain_groups_equivalent_octet_length_calls_under_one_key() {
+    let context = context(2);
+    let rows = query(&context,
+        "EXPLAIN SELECT COUNT(*) AS n FROM (VALUES ('é')) AS t(v) \
+         GROUP BY CHAR_LENGTH(t.v USING OCTETS), OCTET_LENGTH(t.v)",
+    ).await.unwrap();
+    let aggregate = rows.iter().find(|row| row["op"] == op("group-by")).unwrap();
+    let Value::Struct(explanation) = &aggregate["explain"] else { panic!("Expected grouping metadata") };
+    let Value::List(values) = &explanation["group-by"] else { panic!("Expected grouping keys") };
+    assert_eq!(values.len(), 1);
+}
+
 fn duration(value: &Value) -> i64 { let Value::Duration { value, unit: TimeUnit::Microsecond } = value else { panic!("Expected duration in microseconds") }; *value }
 fn depth(row: &StructFields<Value>) -> usize { let Value::Utf8(value) = &row["depth"] else { panic!("Expected depth") }; value.len() }
 
