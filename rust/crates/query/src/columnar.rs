@@ -72,6 +72,25 @@ struct ExpansionInput {
 }
 
 #[derive(Clone)]
+struct JoinProbeRows<'a> {
+    spans: crate::batch_join::ProbeRunSpans<'a>,
+    input: Option<&'a ExpansionInput>,
+    current: std::iter::RepeatN<Option<(usize, usize)>>,
+}
+
+impl Iterator for JoinProbeRows<'_> {
+    type Item = Option<(usize, usize)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(cell) = self.current.next() { return Some(cell); }
+        let (row, count) = self.spans.next()?;
+        let cell = self.input.map_or(Some((0, row)), |input| input.rows.get(row));
+        self.current = std::iter::repeat_n(cell, count - 1);
+        Some(cell)
+    }
+}
+
+#[derive(Clone)]
 enum RowExpansion {
     ApplyOuter(Arc<apply::ApplySpans>),
     RepeatEach(usize),
@@ -218,19 +237,34 @@ impl SelectedRows {
     }
 
     fn iter(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        let probe = self.join_probe_rows(0..self.len());
         let (picks, span, expanded, apply, window) = match self {
             Self::Picks(cells) => (cells.as_slice(), 0..0, 0..0, None, None),
             Self::Span(rows) => (&[][..], rows.clone(), 0..0, None, None),
             Self::Expanded { expansion: RowExpansion::WindowSpans(spans), rows, input: None } => {
                 (&[][..], 0..0, 0..0, None, Some((spans, rows)))
             }
+            Self::Expanded { expansion: RowExpansion::JoinProbe(_), .. } => (&[][..], 0..0, 0..0, None, None),
             Self::Expanded { rows, .. } => (&[][..], 0..0, 0..rows.len(), None, None),
             Self::Apply(selection) => (&[][..], 0..0, 0..0, Some(selection), None),
         };
-        picks.iter().copied().chain(span.map(|row| (0, row)))
+        probe.into_iter().flatten().map(|cell| cell.expect("The expansion covers the selection"))
+            .chain(picks.iter().copied())
+            .chain(span.map(|row| (0, row)))
             .chain(expanded.map(|row| self.get(row).expect("The expansion covers the selection")))
             .chain(apply.into_iter().flat_map(|selection| selection.iter()))
             .chain(window.into_iter().flat_map(|(spans, rows)| spans.iter(rows.clone())))
+    }
+
+    fn join_probe_rows(&self, rows: Range<usize>) -> Option<JoinProbeRows<'_>> {
+        let Self::Expanded { expansion: RowExpansion::JoinProbe(runs), rows: span, input } = self else {
+            return None;
+        };
+        Some(JoinProbeRows {
+            spans: runs.spans(span.start + rows.start..span.start + rows.end),
+            input: input.as_deref(),
+            current: std::iter::repeat_n(None, 0),
+        })
     }
 
     fn slice(&self, rows: Range<usize>) -> Self {
@@ -287,6 +321,14 @@ impl SelectedColumn {
 
     pub(crate) fn source_layouts(&self) -> impl Iterator<Item = (&dyn Array, &ArrowField, Option<&LogicalType>)> {
         self.sources.iter().flatten().map(|(array, field, logical, _)| (array.as_ref(), field.as_ref(), logical.as_ref()))
+    }
+
+    pub(crate) fn arrow_cells(&self) -> impl Iterator<Item = Option<(&dyn Array, &ArrowField, Option<&LogicalType>, usize)>> {
+        self.cells.iter().map(|(source, row)| {
+            self.sources[source].as_ref().map(|(array, field, logical, _)| {
+                (array.as_ref(), field.as_ref(), logical.as_ref(), row)
+            })
+        })
     }
 
     fn select(self, selection: &PredicateSelection, span: Option<&Range<usize>>) -> Self {
@@ -407,7 +449,13 @@ impl SelectedColumn {
     pub(crate) fn uniform_fragment_vector(&self, rows: Range<usize>, memory: &Arc<MemoryBudget>)
         -> Result<Option<(ArrowVector, Arc<MemoryReservation>)>> {
         let layout = |source: usize| self.sources[source].as_ref().map(|(_, field, logical, _)| (field, logical));
-        let cells = rows.clone().map(|row| self.cells.get(row).expect("A fragment has this row"));
+        let mut probe = self.cells.join_probe_rows(rows.clone());
+        let cells = rows.clone().map(move |row| {
+            match &mut probe {
+                Some(probe) => probe.next().flatten(),
+                None => self.cells.get(row),
+            }.expect("A fragment has this row")
+        });
         if let Some((first, _)) = cells.clone().next()
             && cells.clone().any(|(source, _)| layout(source) != layout(first)) {
             return Ok(None);
@@ -453,9 +501,9 @@ impl SelectedColumn {
         if !self.sources.iter().flatten().all(|(_, field, logical, _)| logical.as_ref().is_some_and(|ty| stable_read_layout(ty, field))) {
             return None;
         }
-        self.cells.iter().map(|(source, row)| {
-            let null = match &self.sources[source] {
-                Some((array, field, ..)) => arrow_cell_is_null(field, array.as_ref(), row)?,
+        self.arrow_cells().map(|cell| {
+            let null = match cell {
+                Some((array, field, _, row)) => arrow_cell_is_null(field, array, row)?,
                 None => true,
             };
             Some(Some(null == is_null))
@@ -945,7 +993,8 @@ impl ColumnBatch {
                     let bytes = column.sources.len().checked_mul(size_of::<Option<CellReadCheck<'_>>>()).ok_or_else(size_error)?;
                     let reservation = context.memory.reserve(bytes)?;
                     let mut check = BatchReadCheck::Selected {
-                        column, checks: std::iter::repeat_with(|| None).take(column.sources.len()).collect(), _reservation: reservation,
+                        column, probe: column.cells.join_probe_rows(0..column.cells.len()),
+                        checks: std::iter::repeat_with(|| None).take(column.sources.len()).collect(), _reservation: reservation,
                     };
                     check.validate(0, &context.memory)?;
                     check
@@ -1678,16 +1727,25 @@ impl ColumnBatch {
 
 enum BatchReadCheck<'a> {
     Arrow { array: &'a dyn Array, check: CellReadCheck<'a> },
-    Selected { column: &'a SelectedColumn, checks: Vec<Option<CellReadCheck<'a>>>, _reservation: Arc<MemoryReservation> },
+    Selected {
+        column: &'a SelectedColumn,
+        probe: Option<JoinProbeRows<'a>>,
+        checks: Vec<Option<CellReadCheck<'a>>>,
+        _reservation: Arc<MemoryReservation>,
+    },
 }
 
 impl BatchReadCheck<'_> {
     fn validate(&mut self, row: usize, memory: &Arc<MemoryBudget>) -> Result<()> {
         match self {
             Self::Arrow { array, check } => check.validate(*array, row),
-            Self::Selected { column, checks, .. } => {
+            Self::Selected { column, probe, checks, .. } => {
                 let column = *column;
-                let Some((source, offset)) = column.cells.get(row) else { return Ok(()); };
+                let cell = match probe {
+                    Some(probe) => probe.next().flatten(),
+                    None => column.cells.get(row),
+                };
+                let Some((source, offset)) = cell else { return Ok(()); };
                 let Some((array, field, logical, _)) = &column.sources[source] else { return Ok(()); };
                 if let Some(check) = &checks[source] {
                     check.validate(array.as_ref(), offset)

@@ -1,6 +1,6 @@
 //! Equi-joins of batch inputs on column equalities.
 //! Build rows are indexed in input order and the probe gathers its matches from the saved column positions.
-use std::{cmp::Ordering, collections::VecDeque, ops::ControlFlow};
+use std::{cmp::Ordering, collections::VecDeque, ops::{ControlFlow, Range}};
 use std::sync::Arc;
 
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
@@ -1025,6 +1025,29 @@ pub(crate) struct ProbeRuns {
     runs: JoinPositions<ProbeRun>,
 }
 
+#[derive(Clone)]
+pub(crate) struct ProbeRunSpans<'a> {
+    identity_len: usize,
+    runs: std::slice::Iter<'a, ProbeRun>,
+    rows: Range<usize>,
+}
+
+impl Iterator for ProbeRunSpans<'_> {
+    type Item = (usize, usize);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.rows.is_empty() { return None; }
+        let start = self.rows.start;
+        if start < self.identity_len {
+            self.rows.start += 1;
+            return Some((start, 1));
+        }
+        let run = self.runs.next().expect("The probe runs cover the selection");
+        self.rows.start = run.end.min(self.rows.end);
+        Some((run.row, self.rows.start - start))
+    }
+}
+
 impl ProbeRuns {
     fn new() -> Self { Self { identity_len: 0, runs: JoinPositions::new() } }
 
@@ -1063,6 +1086,15 @@ impl ProbeRuns {
 
     pub(crate) fn owner(&self) -> Option<&Arc<MemoryReservation>> {
         self.runs.reservation.as_ref()
+    }
+
+    pub(crate) fn spans(&self, rows: Range<usize>) -> ProbeRunSpans<'_> {
+        let first = if rows.is_empty() || rows.end <= self.identity_len {
+            0
+        } else {
+            self.run_at(rows.start.max(self.identity_len)) - self.identity_len
+        };
+        ProbeRunSpans { identity_len: self.identity_len, runs: self.runs.rows[first..].iter(), rows }
     }
 
     pub(crate) fn picks(&self) -> impl Iterator<Item = Option<(usize, usize)>> + Clone + '_ {
@@ -1114,6 +1146,7 @@ fn join_probe_positions_keep_identity_gaps_and_fanout_in_output_order() {
     rows.end_row(3, 3, &memory).unwrap();
     assert_eq!(rows.input_row(2), 3);
     assert!(!rows.contiguous(&(1..3)));
+    assert_eq!(rows.spans(1..3).collect::<Vec<_>>(), [(1, 1), (3, 1)]);
 
     rows.end_row(4, 5, &memory).unwrap();
     rows.end_row(5, 6, &memory).unwrap();
@@ -1121,5 +1154,65 @@ fn join_probe_positions_keep_identity_gaps_and_fanout_in_output_order() {
     assert_eq!(rows.picks().flatten().map(|(_, row)| row).collect::<Vec<_>>(), [0, 1, 3, 4, 4, 5]);
     assert!(rows.contiguous(&(2..4)));
     assert!(!rows.contiguous(&(3..6)));
+
+    for start in 0..=6 {
+        for end in start..=6 {
+            let sequential = rows.spans(start..end).flat_map(|(row, count)| std::iter::repeat_n(row, count));
+            assert!(sequential.eq((start..end).map(|row| rows.input_row(row))));
+        }
+    }
+}
+
+#[test]
+fn slicing_a_skewed_probe_run_retains_its_selected_source_and_null_positions() {
+    use arrow_array::{ArrayRef, Int64Array};
+    use arrow_schema::{DataType, Field};
+    use crate::columnar::SelectedColumn;
+
+    let memory = MemoryBudget::new(1 << 13);
+    let source = Arc::new(Int64Array::from(vec![Some(10), None, Some(30)])) as ArrayRef;
+    let source_owner = memory.reserve(512).unwrap();
+    let field = Arc::new(Field::new("payload", DataType::Int64, true));
+    let logical = LogicalType::Scalar(ScalarType::I64).maybe();
+    let input = Column::Selected(SelectedColumn::new(
+        vec![Some((source, field, Some(logical), Some(Arc::clone(&source_owner)))), None],
+        Arc::new(vec![(0, 2), (1, 0), (0, 0), (0, 1)]),
+    ));
+    let input = ColumnBatch::settled(vec![input], 4, memory.reserve(2048).unwrap()).unwrap();
+    let mut runs = ProbeRuns::new();
+    let skew_end = 1 << 20;
+    for (row, end) in [1, skew_end, skew_end + 1, skew_end + 2].into_iter().enumerate() {
+        runs.end_row(row, end, &memory).unwrap();
+    }
+    let run_owner = Arc::downgrade(runs.owner().unwrap());
+    let source_lease = Arc::downgrade(&source_owner);
+    drop(source_owner);
+    let mut columns = Vec::with_capacity(1);
+    let mut output_owner = memory.reserve(512).unwrap();
+    gather_join_probe(
+        Some((&input, runs)), skew_end + 2, 1, &mut columns, Arc::get_mut(&mut output_owner).unwrap(),
+    ).unwrap();
+    let output = ColumnBatch::settled(columns, skew_end + 2, output_owner).unwrap();
+    drop(input);
+
+    let output = output.slice(skew_end - 2, 4, &memory).unwrap();
+    let Column::Selected(selected) = &output.columns[0] else { panic!("Expected selected probe payloads"); };
+    let offsets = selected.arrow_cells().map(|cell| cell.map(|(_, _, _, row)| row)).collect::<Vec<_>>();
+    assert_eq!(offsets, [None, None, Some(0), Some(1)]);
+    let from_cells = selected.arrow_cells().map(|cell| {
+        cell.map_or(Ok(Value::Null), |(array, field, logical, row)| {
+            rtdb_columnar::read_execution_value_as(logical.unwrap(), field, array, row)
+        }).unwrap()
+    }).collect::<Vec<_>>();
+    assert_eq!(from_cells, [Value::Null, Value::Null, Value::I64(10), Value::Null]);
+    for (row, expected) in from_cells.into_iter().enumerate().rev() {
+        assert_eq!(output.columns[0].value(row).unwrap(), expected);
+    }
+    assert!(run_owner.upgrade().is_some());
+    assert!(source_lease.upgrade().is_some());
+    drop(output);
+    assert!(run_owner.upgrade().is_none());
+    assert!(source_lease.upgrade().is_none());
+    assert_eq!(memory.used_bytes(), 0);
 }
 

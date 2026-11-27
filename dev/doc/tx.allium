@@ -178,6 +178,7 @@
 -- Query analysis measures a batch-capable operator using its emitted Arrow batches.
 -- A batch join can gather matching payload positions from selected Arrow vectors.
 -- Hash join fan-out retains Arrow probe payloads under their source owners and shares the repeated probe positions across columns.
+-- Sequential readers traverse the selected probe positions in output order with bounded working storage, including when an offset or slice starts partway through the matches for one probe row.
 -- An inner hash join that feeds an unfiltered count of rows can emit the cardinality of its matches alone.
 -- A compatible inner equijoin hashes and compares its Arrow key cells at their build and probe positions.
 -- Hash joins hash admitted scalar key columns over each page and use the same row hash for other layouts.

@@ -781,6 +781,71 @@ async fn left_apply_keeps_dependent_page_order_and_pads_an_unmatched_outer_row()
 }
 
 #[tokio::test]
+async fn spread_and_skewed_join_fanout_keep_probe_payloads_in_order_through_spill() {
+    let int = scalar(ScalarType::I64);
+    let float = scalar(ScalarType::F64).maybe();
+    let probe_key = field(0, "probe", int.clone());
+    let probe_payload = field(1, "payload", float);
+    let build_key = field(2, "build", int.clone());
+    let build_payload = field(3, "match_id", int);
+    let probe_values = [Value::F64(2.0), Value::F64(3.0), Value::Null, Value::F64(11.0)]
+        .into_iter().chain(std::iter::repeat_n(Value::F64(5.0), 28)).collect::<Vec<_>>();
+    let probe_rows = probe_values.iter().enumerate().map(|(key, payload)| {
+        vec![Expr::Literal(Value::I64(key as i64)), Expr::Literal(payload.clone())]
+    }).collect();
+    let probe = Arc::new(Relation::new(
+        Schema::new(vec![probe_key.clone(), probe_payload]).unwrap(),
+        RelationNode::Values { rows: probe_rows },
+    ).unwrap());
+
+    for multiplicities in [[9, 9, 9], [1, 23, 1]] {
+        let build_rows = multiplicities.into_iter().enumerate().flat_map(|(key, count)| {
+            (0..count).map(move |offset| {
+                vec![Expr::Literal(Value::I64(key as i64)), Expr::Literal(Value::I64(offset))]
+            })
+        }).collect();
+        let build = Arc::new(Relation::new(
+            Schema::new(vec![build_key.clone(), build_payload.clone()]).unwrap(),
+            RelationNode::Values { rows: build_rows },
+        ).unwrap());
+        let condition = Expr::binary(BinaryOp::Eq, probe_key.expression(), build_key.expression());
+        let joined = join(Arc::clone(&probe), build, JoinKind::Left, Some(condition));
+
+        let mut expected = Vec::new();
+        for (key, payload) in probe_values.iter().enumerate() {
+            let count = multiplicities.get(key).copied().unwrap_or(0);
+            let key = Value::I64(key as i64);
+            if count == 0 {
+                expected.push(vec![key, payload.clone(), Value::Null, Value::Null]);
+            } else {
+                for offset in 0..count {
+                    expected.push(vec![key.clone(), payload.clone(), key.clone(), Value::I64(offset)]);
+                }
+            }
+        }
+        for join_build_rows in [i64::MAX, 0] {
+            let context = query_context(QueryOptions { join_build_rows, batch_rows: 4, ..Default::default() });
+            let mut actual = collect(Arc::clone(&joined), Arc::clone(&context)).await.unwrap();
+            if join_build_rows == 0 {
+                actual.sort_by_key(|row| match &row[0] {
+                    Value::I64(key) => *key,
+                    _ => panic!("Expected an integer probe key"),
+                });
+            }
+            assert_eq!(actual, expected);
+            assert_eq!(context.spill_peak_bytes() > 0, join_build_rows == 0);
+            assert_eq!(context.memory.used_bytes(), 0);
+            assert_eq!(context.spill_bytes(), 0);
+        }
+
+        let start = multiplicities[0] + 1;
+        let limited = Arc::new(joined.limit(Some(Expr::Literal(Value::I64(start))), Some(Expr::Literal(Value::I64(7)))).unwrap());
+        let actual = collect(limited, query_context(QueryOptions { batch_rows: 4, ..Default::default() })).await.unwrap();
+        assert_eq!(actual, expected[start as usize..start as usize + 7]);
+    }
+}
+
+#[tokio::test]
 async fn single_join_preserves_probe_rows_and_checks_cardinality_in_memory_and_on_disk() {
     for join_build_rows in [0, i64::MAX] {
         for build in [&[2, 3][..], &[2, 2][..]] {
