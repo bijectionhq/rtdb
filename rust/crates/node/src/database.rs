@@ -279,9 +279,8 @@ impl Database {
     /// Observes the replication driver's current status and subsequent changes.
     pub fn watch_status(&self) -> watch::Receiver<rtdb_replication::DriverStatus> { self.replication.watch_status() }
     pub fn compaction(&self) -> Option<&CompactionHandle> { self.compaction.as_ref() }
-    /// Rows applied since the last block, held in the live index until the next flush.
-    pub fn live_rows(&self) -> u64 { self.partition.value().live().block_row_count() }
-    pub fn live_batch_bytes(&self) -> u64 { self.partition.value().live().live_batch_bytes() }
+    pub fn live_rows(&self) -> u64 { self.partition.value().live_row_count() }
+    pub fn live_batch_bytes(&self) -> u64 { self.partition.value().live_batch_bytes() }
     pub fn cache_bytes(&self) -> u64 { self.storage.pool_retained_bytes() as u64 }
     pub fn replica_read_sessions(&self) -> usize { self.replica_read_sessions.load(Ordering::Relaxed) }
     pub(crate) fn track_replica_read_session(self: &Arc<Self>) -> impl Send + use<> {

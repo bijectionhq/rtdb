@@ -61,6 +61,8 @@ Publish the staging directory as the installation authority only after the comma
 Fresh installations write synchronous transaction outcomes to `journal/REPLICA_LOG` and hold pending requests in memory.
 Use `--classic-journals` at initialization when clients need the durable handoff contract of `COMMIT ASYNC`.
 The selected journal mode is part of the installation authority.
+Single-journal installations can build a checkpoint from a sealed applied block while writing into the next block.
+The write path waits at memory or journal capacity limits and at operations that require a quiescent checkpoint.
 Keep the whole authority together, including `native-authority.json`, `journal/REPLICA_LOG`, `objects/`, `token-keys/` and `checkpoint-keys/`.
 Classic-mode installations also retain `journal/LOG`.
 

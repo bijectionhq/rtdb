@@ -284,6 +284,7 @@ impl ServerDriver {
                 (resources, sources, registrations, install, tls, None)
             }
             Backend::Installed { resources, tls } => {
+                options.replication.deferred_checkpoints = resources.uses_single_journal();
                 options.compaction_threads = config.compactor.threads;
                 options.artefact_threads = if config.search.enabled { config.search.threads } else { 0 };
                 (*resources, rtdb_node::ExternalSources::new(), Vec::new(), None, None, tls)

@@ -40,6 +40,9 @@ impl PartitionValue {
     pub fn trie_catalog(&self) -> &Arc<TrieCatalog> { &self.trie_catalog }
     pub fn table_catalog(&self) -> &Arc<TableCatalog> { &self.table_catalog }
     pub fn live(&self) -> &Arc<LiveIndex> { &self.live }
+    pub fn live_row_count(&self) -> u64 {
+        self.live.block_row_count().saturating_add(self.sealed.as_ref().map_or(0, |sealed| sealed.block_row_count()))
+    }
     pub fn live_batch_bytes(&self) -> u64 {
         self.live.live_batch_bytes().saturating_add(self.sealed.as_ref().map_or(0, |sealed| sealed.live_batch_bytes()))
     }

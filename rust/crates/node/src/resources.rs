@@ -284,6 +284,7 @@ impl NativeResources {
         self.single_journal = true;
         self
     }
+    pub fn uses_single_journal(&self) -> bool { self.single_journal }
     pub fn with_disk_cache(mut self, cache: Arc<DiskCache>) -> Self { self.disk_cache = Some(cache); self }
     pub fn with_token_kms(mut self, kms: Arc<dyn rtdb_crypt::Kms>) -> Self {
         self.token_kms = Some(kms);
