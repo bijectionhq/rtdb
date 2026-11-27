@@ -401,7 +401,7 @@ It also exercises the Azure adapter against a loopback provider and separately m
   The ReplayedReset TLC model checks synchronization, current-cut admission and publication before retirement.
   The native replayed reset test starts with a compacted archive and a missing suffix pair, then verifies in-place adoption and restart.
   The replay floor area checks the exact signed-offset rule for a required replica record below a provider's reported floor.
-  The system time area checks the production assignment and admission decisions, including exhaustion and rejection of equal or earlier timestamps.
+  The system time area checks the production non-decreasing assignment and admission decisions, including tying a stalled clock without minting a tick, keeping `i64::MAX`, refusing earlier supplied timestamps, and clock-slot alignment.
   The IID partition area checks the base-four digit computation shared by trie and compaction code.
   The compaction heap area checks exact Rust page validation, construction, minimum extraction, cursor advancement and sift permutation.
   Its contracts refer to an immutable table of page keys and lengths supplied by the compaction adapter.
