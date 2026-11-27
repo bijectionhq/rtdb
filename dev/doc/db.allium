@@ -2483,6 +2483,7 @@ surface QueryAccess {
         -- A literal false filter rejects its input before predicates above it can evaluate those rows.
         -- For columnar query output, stacked filters apply in plan order to the surviving vectors and row positions.
         -- A tree of binary UTF-8 concatenations can read its compatible leaf cells, including active run ends and union legs, and literal operands.
+        -- A compatible UTF-8 COALESCE operand contributes the first non-null text position to the concatenation.
         -- It reserves the output buffers per page before writing them.
         -- It preserves the bytes in operand order and yields SQL null when a reached operand is null.
         -- A columnar limit applies its offset and row count to batches and slices compatible Arrow arrays.

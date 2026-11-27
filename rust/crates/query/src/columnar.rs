@@ -5252,6 +5252,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_computed_record_concatenates_the_first_reached_utf8_cell() {
+        let memory = MemoryBudget::new(1 << 20);
+        let schema = Schema::new((0..3).map(|id| field(id, ScalarType::Utf8)).collect()).unwrap();
+        let columns = [
+            [Some("["), Some("["), Some("["), None],
+            [Some("é"), None, None, Some("skipped")],
+            [Some("shadowed"), Some("😀"), None, Some("shadowed")],
+        ].into_iter().zip(schema.fields()).map(|(values, field)| Column::Arrow {
+            array: Arc::new(StringArray::from_iter(values)),
+            field: Arc::new(rtdb_columnar::to_field(&field.name, &field.data_type).unwrap()),
+            logical: Some(field.data_type.clone()),
+        }).collect();
+        let batch = ColumnBatch::settled(columns, 4, memory.reserve(0).unwrap()).unwrap();
+        let winner = Expr::Coalesce(schema.fields()[1..].iter().map(rtdb_plan::Field::expression).collect());
+        let concat = Expr::binary(BinaryOp::Concat, schema.fields()[0].expression(),
+            Expr::binary(BinaryOp::Concat, winner, Expr::Literal(Value::Utf8("]".into()))));
+        let expr = Expr::Struct(vec![("label".into(), concat)]);
+        let mut cursor = record_projection_cursor(batch, schema, vec![expr], &memory);
+        cursor.scalar_fallbacks = Some(0);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert_eq!(cursor.scalar_fallbacks, Some(0));
+        let Column::Arrow { array, .. } = &page.columns[0] else { panic!("Expected an Arrow record"); };
+        let record = array.as_any().downcast_ref::<StructArray>().unwrap();
+        let actual = record.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(actual.iter().collect::<Vec<_>>(), [Some("[é]"), Some("[😀]"), None, None]);
+    }
+
+    #[tokio::test]
     async fn record_projection_computed_struct_keeps_child_backing_and_duplicate_order() {
         let source = MemoryBudget::new(1 << 23);
         let memory = MemoryBudget::new(1 << 17);

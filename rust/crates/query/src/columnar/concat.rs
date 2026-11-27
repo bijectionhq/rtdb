@@ -70,6 +70,10 @@ impl<'a> TextSource<'a> {
 enum TextInput<'a> {
     Literal(Option<&'a str>),
     Direct(TextSource<'a>),
+    Coalesce {
+        inputs: Vec<TextInput<'a>>,
+        _reservation: Arc<MemoryReservation>,
+    },
     Selected {
         rows: &'a SelectedRows,
         sources: Vec<Option<TextSource<'a>>>,
@@ -91,6 +95,17 @@ impl<'a> TextInput<'a> {
             }
             Expr::Literal(Value::Utf8(text)) => return Ok(Some(Self::Literal(Some(text)))),
             Expr::Literal(Value::Null) => return Ok(Some(Self::Literal(None))),
+            Expr::Coalesce(args) => {
+                let bytes = args.len().checked_mul(size_of::<Self>()).ok_or_else(size_error)?;
+                let Some(reservation) = memory.try_reserve(bytes) else { return Ok(None); };
+                let mut inputs = Vec::with_capacity(args.len());
+                for arg in args {
+                    let input = stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || Self::bind(arg, schema, batch, memory))?;
+                    let Some(input) = input else { return Ok(None); };
+                    inputs.push(input);
+                }
+                return Ok(Some(Self::Coalesce { inputs, _reservation: reservation }));
+            }
             _ => return Ok(None),
         };
         Ok(match column {
@@ -123,6 +138,13 @@ impl<'a> TextInput<'a> {
         match self {
             Self::Literal(text) => Some(*text),
             Self::Direct(source) => source.get(row),
+            Self::Coalesce { inputs, .. } => {
+                for input in inputs {
+                    let text = stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || input.get(row))?;
+                    if text.is_some() { return Some(text); }
+                }
+                Some(None)
+            }
             Self::Selected { rows, sources, .. } => {
                 let (source, offset) = rows.get(row)?;
                 match sources.get(source)? {
@@ -130,6 +152,16 @@ impl<'a> TextInput<'a> {
                     None => Some(None),
                 }
             }
+        }
+    }
+
+    fn has_arrow(&self) -> bool {
+        match self {
+            Self::Literal(_) => false,
+            Self::Coalesce { inputs, .. } => inputs.iter().any(|input| {
+                stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || input.has_arrow())
+            }),
+            Self::Direct(_) | Self::Selected { .. } => true,
         }
     }
 }
@@ -164,7 +196,7 @@ pub(super) fn utf8_column(
     let Ok(_input_owner) = context.memory.reserve(bytes) else { return Ok(None); };
     let mut inputs = Vec::with_capacity(count);
     if !bind_operands(expression, schema, batch, &context.memory, &mut inputs)?
-        || inputs.iter().all(|input| matches!(input, TextInput::Literal(_)))
+        || !inputs.iter().any(TextInput::has_arrow)
     {
         return Ok(None);
     }
@@ -197,9 +229,17 @@ pub(super) fn utf8_column(
     }
 
     let (array, logical): (ArrayRef, LogicalType);
+    let reserve_output = |bytes| {
+        if inputs.iter().any(|input| matches!(input, TextInput::Coalesce { .. })) {
+            Ok(context.memory.try_reserve(bytes))
+        } else {
+            context.memory.reserve(bytes).map(Some)
+        }
+    };
     let mut owner;
     if nulls == batch.len {
-        owner = context.memory.reserve(512)?;
+        let Some(reservation) = reserve_output(512)? else { return Ok(None); };
+        owner = reservation;
         array = Arc::new(NullArray::new(batch.len));
         logical = LogicalType::Null;
     } else {
@@ -209,7 +249,8 @@ pub(super) fn utf8_column(
             .and_then(|offsets| offsets.checked_add(value_bytes))
             .and_then(|bytes| bytes.checked_add(validity_bytes))
             .and_then(|bytes| bytes.checked_add(512)).ok_or_else(size_error)?;
-        owner = context.memory.reserve(bytes)?;
+        let Some(reservation) = reserve_output(bytes)? else { return Ok(None); };
+        owner = reservation;
         let mut builder = StringBuilder::with_capacity(batch.len, value_bytes);
         for row in 0..batch.len {
             context.check_cancelled_at(row)?;
