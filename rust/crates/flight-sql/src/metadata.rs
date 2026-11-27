@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use arrow_array::{RecordBatch, builder::BinaryBuilder, cast::AsArray};
 use arrow_flight::{
-    FlightData, IpcMessage, SchemaAsIpc,
+    FlightData,
     sql::{Command, CommandGetTables, SqlInfo, metadata::{SqlInfoData, SqlInfoDataBuilder}},
 };
-use arrow_ipc::writer::IpcWriteOptions;
 use arrow_schema::{Schema, SchemaRef};
+use bytes::Bytes;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_plan::QualifiedTable;
 use rtdb_query::CatalogSnapshot;
@@ -126,6 +126,17 @@ impl Service {
     }
 }
 
+fn encode_table_schema<'a, S: AsRef<str> + 'a>(
+    columns: impl IntoIterator<Item = (S, &'a rtdb_types::LogicalType)>,
+    memory: &Arc<MemoryBudget>,
+) -> Result<Bytes, Status> {
+    let fields = columns.into_iter()
+        .map(|(name, ty)| rtdb_columnar::to_field(name.as_ref(), ty).map_err(status))
+        .collect::<Result<Vec<_>, _>>()?;
+    let table_schema = Schema::new(fields);
+    wire::schema_message(&table_schema, memory)
+}
+
 fn with_table_schemas(
     selected: RecordBatch,
     schema: SchemaRef,
@@ -136,7 +147,6 @@ fn with_table_schemas(
     let databases = selected.column(0).as_string::<i32>();
     let schemas = selected.column(1).as_string::<i32>();
     let tables = selected.column(2).as_string::<i32>();
-    let options = IpcWriteOptions::default();
     let mut ipc = BinaryBuilder::new();
     for row in 0..selected.num_rows() {
         let name = QualifiedTable {
@@ -150,13 +160,32 @@ fn with_table_schemas(
             wire::add(bytes, wire::mul(field, 32)?)
         })?;
         charges.push(memory.reserve(bytes).map_err(status)?);
-        let fields = table.columns.iter().map(|(name, ty)| rtdb_columnar::to_field(name, ty).map_err(status))
-            .collect::<Result<Vec<_>, _>>()?;
-        let table_schema = Schema::new(fields);
-        let IpcMessage(message) = SchemaAsIpc::new(&table_schema, &options).try_into().map_err(arrow)?;
+        let message = encode_table_schema(table.columns.iter().map(|(name, ty)| (name.as_str(), ty)), memory)?;
         ipc.append_value(message);
     }
     let mut columns = selected.columns().to_vec();
     columns.push(Arc::new(ipc.finish()));
     RecordBatch::try_new(schema, columns).map_err(arrow)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rtdb_types::{LogicalType, ScalarType};
+
+    #[test]
+    fn table_schema_ipc_patches_extended_decimals_without_internal_metadata() {
+        let memory = MemoryBudget::new(1 << 20);
+        let decimal = LogicalType::Scalar(ScalarType::Decimal { precision: 38, scale: 200, bit_width: 128 });
+        let encoded = encode_table_schema([("amount", &decimal)], &memory).unwrap();
+        let decoded = rtdb_format::ipc::read_schema_message(&encoded).unwrap();
+        assert_eq!(rtdb_columnar::from_field(decoded.field(0)).unwrap(), decimal);
+        let length = i32::from_le_bytes(encoded[4..8].try_into().unwrap()) as usize;
+        let message = arrow_ipc::root_as_message(&encoded[8..8 + length]).unwrap();
+        let fb_schema = message.header_as_schema().unwrap();
+        let fb_field = fb_schema.fields().unwrap().get(0);
+        assert!(fb_field.custom_metadata().is_none_or(|entries| entries.is_empty()));
+        let fb_decimal = fb_field.type_as_decimal().unwrap();
+        assert_eq!((fb_decimal.precision(), fb_decimal.scale(), fb_decimal.bitWidth()), (38, 200, 128));
+    }
 }
