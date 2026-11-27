@@ -506,7 +506,7 @@ fn shared_plan(source: &str, context: &QueryContext, options: &PrepareOptions) -
         Err(error) if error.is(AnomalyKind::ResourceExhausted) => return Ok(None),
         Err(error) => return Err(error),
     };
-    Ok(plans.insert(key, lookups, query, inferred, notices))
+    plans.insert(key, lookups, query, inferred, notices)
 }
 
 type SharablePlan = (Arc<CatalogLookups>, PreparedQuery, std::collections::BTreeMap<usize, LogicalType>, Vec<SqlNotice>);

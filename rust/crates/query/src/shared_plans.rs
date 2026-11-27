@@ -72,29 +72,27 @@ impl SharedPlans {
     }
 
     /// Keeps `query`, planned in an `entry_budget`, evicting least recently used plans while the cache is full or its budget is short.
-    /// A plan whose metadata exceeds the budget is not kept.
+    /// A plan whose metadata exceeds the whole budget is not kept, and the answer is None; sizing errors propagate.
     pub fn insert(
         &self, key: SharedPlanKey, lookups: Arc<CatalogLookups>, query: PreparedQuery,
         parameter_types: BTreeMap<usize, LogicalType>, notices: Vec<SqlNotice>,
-    ) -> Option<Arc<SharedPlan>> {
+    ) -> Result<Option<Arc<SharedPlan>>> {
         let metadata = || -> Result<usize> {
             let mut bytes = key.retained_bytes()?.checked_add(lookups.retained_bytes()?).ok_or_else(size_error)?;
             for ty in parameter_types.values() { bytes = bytes.checked_add(ty.retained_bytes()?).and_then(|n| n.checked_add(256)).ok_or_else(size_error)?; }
             for notice in &notices { bytes = bytes.checked_add(notice.message.capacity()).and_then(|n| n.checked_add(64)).ok_or_else(size_error)?; }
             Ok(bytes)
         };
-        let bytes = metadata().ok()?;
+        let bytes = metadata()?;
         let mut entries = self.entries.lock();
         if let Some(index) = find(&entries, &key) { entries.remove(index); }
         let _metadata = loop {
-            match self.memory.reserve(bytes) {
-                Ok(reservation) => break reservation,
-                Err(_) => { evict_oldest(&mut entries)?; }
-            }
+            if let Some(reservation) = self.memory.try_reserve(bytes) { break reservation; }
+            if evict_oldest(&mut entries).is_none() { return Ok(None); }
         };
         let plan = Arc::new(SharedPlan { lookups, query, parameter_types, notices, _metadata });
         admit(&mut entries, key, Arc::clone(&plan), Self::ENTRIES);
-        Some(plan)
+        Ok(Some(plan))
     }
 }
 
