@@ -86,6 +86,8 @@ COPY --from=build /source/rust/target/release/rtdb-config /usr/local/bin/rtdb-co
 COPY --from=build /source/rust/target/release/librtdb_ffi.so /usr/local/lib/librtdb_ffi.so
 COPY --from=build /source/rust/target/release/librtdb_ffi.a /usr/local/lib/librtdb_ffi.a
 COPY rust/crates/ffi/include/rtdb.h /usr/local/include/rtdb.h
+COPY rust/release/default.yaml /usr/share/rtdb/default-config.yaml
+COPY rust/release/default.yaml /usr/local/lib/xtdb/config.yaml
 COPY rust/release/default.yaml /etc/rtdb/config.yaml
 COPY rust/release/default-var-lib-rtdb.yaml /etc/rtdb/config-var-lib-rtdb.yaml
 COPY --chmod=0555 rust/release/entrypoint.sh /usr/local/bin/rtdb-entrypoint
@@ -93,10 +95,10 @@ COPY rust/release/cluster-default.yaml rust/release/cluster-multi.yaml /etc/rtdb
 ENV LD_PRELOAD=libjemalloc.so.2
 ENV MALLOC_CONF=background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0
 USER rtdb
-WORKDIR /var/lib/xtdb
+WORKDIR /usr/local/lib/xtdb
 EXPOSE 5432 3000 8080
 VOLUME /var/lib/xtdb
 HEALTHCHECK --start-period=15s --timeout=3s \
     CMD wget -q --spider http://localhost:8080/healthz/alive || exit 1
 ENTRYPOINT ["/usr/local/bin/rtdb-entrypoint"]
-CMD ["node", "--file", "/etc/rtdb/config.yaml"]
+CMD ["-f", "config.yaml"]

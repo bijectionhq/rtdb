@@ -59,10 +59,12 @@ Build success leaves qualification at `built_unqualified`; the package makes no 
 Reproducibility requires rerunning the same selection and comparing artifacts; a recorded recipe alone does not establish byte-identical builds.
 
 The default native image starts a local persistent node using `/var/lib/xtdb/log` and `/var/lib/xtdb/buffers`, upstream's standalone paths.
+As in upstream's image, the working directory is `/usr/local/lib/xtdb` and the default command is `-f config.yaml`, so a configuration mounted at `/usr/local/lib/xtdb/config.yaml` is the one served.
+A configuration mounted at `/etc/rtdb/config.yaml`, where earlier RTDB images read it, is still served when the upstream path holds the bundled default; the entrypoint says so on stderr.
 Mount persistent storage at `/var/lib/xtdb` with ownership for UID/GID 20000; the image declares it as a volume, as upstream's does, so a deployment written for upstream's image keeps its data.
 Earlier RTDB images used `/var/lib/rtdb/log` and `/var/lib/rtdb/storage`: when the default command finds either and neither of the new paths, the `rtdb-entrypoint` script serves them from there (with `/etc/rtdb/config-var-lib-rtdb.yaml`) and says so on stderr; move the data to the new paths to drop that fallback.
-The image is built on Debian Bookworm (upstream's is Alpine); that changes the shell and package tools inside the container, not the node's behaviour.
-As in upstream's image, the default root account trusts every connection unless `XTDB_PASSWORD` is set, in which case it requires that password; mount an explicit configuration and select it with `node --file` for anything else.
+The image is built on Debian Bookworm (upstream's is Alpine) and runs as the user `rtdb` (upstream's is `xtdb`) with the same UID/GID 20000; that changes the shell, package tools and user name inside the container, not the node's behaviour.
+As in upstream's image, the default root account trusts every connection unless `XTDB_PASSWORD` is set, in which case it requires that password; mount an explicit configuration at `/usr/local/lib/xtdb/config.yaml`, or select one with `-f`, for anything else.
 The cluster configurations (`/etc/rtdb/cluster-default.yaml` and `/etc/rtdb/cluster-multi.yaml`) still read the root password from `RTDB_ROOT_PASSWORD`, which the Terraform module supplies, and still cache under `/var/lib/rtdb/cache`; they are RTDB's own deployment, with no upstream counterpart.
 The image serves pgwire on 5432, Flight SQL on 3000 and health/metrics on 8080.
 Its `HEALTHCHECK` polls `/healthz/alive` with `wget` after a fifteen-second start period, as upstream's does.

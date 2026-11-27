@@ -296,6 +296,43 @@ class DefaultImageConfigurationTests(unittest.TestCase):
         self.assertIn("/etc/rtdb/config-var-lib-rtdb.yaml", entrypoint)
         self.assertTrue(entrypoint.rstrip().endswith('exec /usr/local/bin/rtdb "$@"'))
 
+    def test_the_default_command_reads_upstreams_config_path_and_keeps_the_earlier_one(self):
+        dockerfile = (HERE / "Dockerfile").read_text()
+        self.assertIn("COPY rust/release/default.yaml /usr/local/lib/xtdb/config.yaml\n", dockerfile)
+        self.assertIn("COPY rust/release/default.yaml /etc/rtdb/config.yaml\n", dockerfile)
+        self.assertIn("COPY rust/release/default.yaml /usr/share/rtdb/default-config.yaml\n", dockerfile)
+        self.assertIn("WORKDIR /usr/local/lib/xtdb\n", dockerfile)
+        self.assertIn('CMD ["-f", "config.yaml"]', dockerfile)
+        entrypoint = (HERE / "entrypoint.sh").read_text()
+        self.assertIn("set -- -f /usr/local/lib/xtdb/config.yaml", entrypoint)
+        self.assertIn("set -- -f /etc/rtdb/config.yaml", entrypoint)
+
+    def test_the_entrypoint_chooses_the_mounted_configuration(self):
+        import shutil, subprocess
+        if shutil.which("sh") is None:
+            self.skipTest("no POSIX shell")
+        script = (HERE / "entrypoint.sh").read_text()
+        default = (HERE / "default.yaml").read_text()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            def run(upstream, earlier, *arguments, workdir="/usr/local/lib/xtdb"):
+                for path, text in ((root / "upstream.yaml", upstream), (root / "earlier.yaml", earlier), (root / "default.yaml", default)):
+                    path.write_text(text)
+                rewritten = (script.replace("/usr/local/lib/xtdb/config.yaml", str(root / "upstream.yaml"))
+                             .replace("/etc/rtdb/config.yaml", str(root / "earlier.yaml"))
+                             .replace("/usr/share/rtdb/default-config.yaml", str(root / "default.yaml"))
+                             .replace("/var/lib/", str(root / "var") + "/")
+                             .replace('"$(pwd)" = /usr/local/lib/xtdb', '"$(pwd)" = "' + workdir + '"')
+                             .replace("exec /usr/local/bin/rtdb", "printf '%s\\n'"))
+                return subprocess.run(["sh", "-c", rewritten, "rtdb-entrypoint", *arguments],
+                                      check=True, capture_output=True, text=True, cwd=directory).stdout.split()
+            workdir = str(Path(directory).resolve())
+            self.assertEqual(["-f", str(root / "upstream.yaml")], run(default, default, "-f", "config.yaml", workdir=workdir))
+            self.assertEqual(["-f", str(root / "upstream.yaml")], run("mounted: true\n", default, "-f", "config.yaml", workdir=workdir))
+            self.assertEqual(["-f", str(root / "earlier.yaml")], run(default, "mounted: true\n", "-f", "config.yaml", workdir=workdir))
+            self.assertEqual(["-f", str(root / "earlier.yaml")], run(default, "mounted: true\n", "node", "--file", str(root / "earlier.yaml"), workdir=workdir))
+            self.assertEqual(["node", "--file", "other.yaml"], run("mounted: true\n", default, "node", "--file", "other.yaml", workdir=workdir))
+
 
 if __name__ == "__main__":
     unittest.main()

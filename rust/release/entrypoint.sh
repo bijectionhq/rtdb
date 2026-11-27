@@ -1,11 +1,23 @@
 #!/bin/sh
-# The default configuration keeps its data under /var/lib/xtdb, as upstream's image does.
-# A volume an earlier RTDB image filled under /var/lib/rtdb is still served from there.
+# The default command reads /usr/local/lib/xtdb/config.yaml and keeps its data under /var/lib/xtdb, as upstream's image does.
+# Earlier RTDB images read /etc/rtdb/config.yaml and kept data under /var/lib/rtdb; both still work.
 set -eu
-if [ "$#" -eq 3 ] && [ "$1" = node ] && [ "$2" = --file ] && [ "$3" = /etc/rtdb/config.yaml ] \
-    && [ ! -e /var/lib/xtdb/log ] && [ ! -e /var/lib/xtdb/buffers ] \
-    && { [ -e /var/lib/rtdb/log ] || [ -e /var/lib/rtdb/storage ]; }; then
-    echo "Serving the data an earlier RTDB image left under /var/lib/rtdb; move it to /var/lib/xtdb/log and /var/lib/xtdb/buffers to match upstream's image." >&2
-    set -- node --file /etc/rtdb/config-var-lib-rtdb.yaml
+default_command() {
+    { [ "$#" -eq 2 ] && [ "$1" = -f ] && [ "$2" = config.yaml ] && [ "$(pwd)" = /usr/local/lib/xtdb ]; } \
+        || { [ "$#" -eq 3 ] && [ "$1" = node ] && [ "$2" = --file ] && [ "$3" = /etc/rtdb/config.yaml ]; }
+}
+if default_command "$@"; then
+    if ! cmp -s /usr/local/lib/xtdb/config.yaml /usr/share/rtdb/default-config.yaml; then
+        set -- -f /usr/local/lib/xtdb/config.yaml
+    elif ! cmp -s /etc/rtdb/config.yaml /usr/share/rtdb/default-config.yaml; then
+        echo "Reading the configuration mounted at /etc/rtdb/config.yaml; mount it at /usr/local/lib/xtdb/config.yaml to match upstream's image." >&2
+        set -- -f /etc/rtdb/config.yaml
+    elif [ ! -e /var/lib/xtdb/log ] && [ ! -e /var/lib/xtdb/buffers ] \
+        && { [ -e /var/lib/rtdb/log ] || [ -e /var/lib/rtdb/storage ]; }; then
+        echo "Serving the data an earlier RTDB image left under /var/lib/rtdb; move it to /var/lib/xtdb/log and /var/lib/xtdb/buffers to match upstream's image." >&2
+        set -- -f /etc/rtdb/config-var-lib-rtdb.yaml
+    else
+        set -- -f /usr/local/lib/xtdb/config.yaml
+    fi
 fi
 exec /usr/local/bin/rtdb "$@"
