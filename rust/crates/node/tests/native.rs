@@ -3014,7 +3014,7 @@ async fn a_successor_retires_an_old_leaders_trie_once_it_leaves_the_garbage_wind
         let shared = Arc::new(SharedJournal { source: journal(), replica: journal(), storage: files.path().join("objects") });
         let old_clock = Arc::new(CollectorClock { wall: wall.clone(), monotonic: AtomicI64::new(0) });
         let new_clock = Arc::new(CollectorClock { wall: wall.clone(), monotonic: AtomicI64::new(9_000_000) });
-        let lifetime = Duration::from_secs(60 * 60);
+        let lifetime = chrono::TimeDelta::hours(1);
         let mut config = options();
         config.compaction_threads = 1;
         config.garbage.blocks_to_keep = 1;
@@ -3069,7 +3069,7 @@ async fn a_successor_retires_an_old_leaders_trie_once_it_leaves_the_garbage_wind
 
         // An open query is no hold: once the window passes, the files go while it is still open.
         let held = reader.query_sql("SELECT value FROM docs", vec![]).await.unwrap();
-        wall.0.fetch_add(i64::try_from(2 * lifetime.as_micros()).unwrap(), Ordering::Relaxed);
+        wall.0.fetch_add(2 * lifetime.num_microseconds().unwrap(), Ordering::Relaxed);
         let mut ids = 6..;
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {

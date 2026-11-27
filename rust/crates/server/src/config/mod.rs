@@ -487,6 +487,9 @@ fn ratio(fields: &mut YamlFields, key: &str, default: f64) -> Result<f64> {
 }
 fn boolean(value: &Yaml, key: &str) -> Result<bool> { match scalar_string(value, key)?.as_str() { "true" => Ok(true), "false" => Ok(false), _ => Err(invalid(format!("{key} must be a boolean"))) } }
 fn duration(fields: &mut YamlFields, key: &str, seconds: u64) -> Result<Duration> { fields.string(key)?.map(|value| parse_duration(&value)).transpose().map(|value| value.unwrap_or(Duration::from_secs(seconds))) }
+fn signed_duration(fields: &mut YamlFields, key: &str, default: chrono::TimeDelta) -> Result<chrono::TimeDelta> {
+    fields.string(key)?.map(|value| parse_signed_duration(&value)).transpose().map(|value| value.unwrap_or(default))
+}
 
 /// Parses a non-negative ISO-8601 duration of days, hours, minutes and seconds.
 pub fn parse_duration(value: &str) -> Result<Duration> {
@@ -520,5 +523,12 @@ fn duration_nanos(value: &str) -> Result<i128> {
     }
     if captures.get(1).is_some_and(|sign| sign.as_str() == "-") { nanos = nanos.checked_neg().ok_or_else(|| invalid("Duration exceeds range"))?; }
     Ok(nanos)
+}
+
+pub fn parse_signed_duration(value: &str) -> Result<chrono::TimeDelta> {
+    let nanos = parse_duration_nanos(value)?;
+    let seconds = i64::try_from(nanos.div_euclid(1_000_000_000)).map_err(|_| invalid("Duration exceeds range"))?;
+    let fraction = nanos.rem_euclid(1_000_000_000) as u32;
+    chrono::TimeDelta::new(seconds, fraction).ok_or_else(|| invalid("Duration exceeds range"))
 }
 fn invalid(message: impl Into<String>) -> Anomaly { Anomaly::incorrect("xtdb/invalid-node-config", message) }
