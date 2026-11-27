@@ -13,6 +13,7 @@ pub(super) fn open(spec: &PluginSpec, is_key: bool, parsers: &super::registry::P
     match spec.class_name.as_str() {
         "io.confluent.connect.avro.AvroConverter" => Ok(Box::new(super::registry::RegistryConverter::with_parsers(spec, super::registry::RegistryFormat::Avro, is_key, parsers.clone())?)),
         "io.confluent.connect.json.JsonSchemaConverter" => Ok(Box::new(super::registry::RegistryConverter::with_parsers(spec, super::registry::RegistryFormat::Json, is_key, parsers.clone())?)),
+        "io.confluent.connect.protobuf.ProtobufConverter" => Ok(Box::new(super::registry::RegistryConverter::with_parsers(spec, super::registry::RegistryFormat::Protobuf, is_key, parsers.clone())?)),
         "org.apache.kafka.connect.json.JsonConverter" => {
             if let Some(format) = spec.options.get("decimal.format") { if !matches!(format.to_ascii_uppercase().as_str(), "BASE64" | "NUMERIC") { return Err(error("invalid-plugin-config", "decimal.format must be BASE64 or NUMERIC")); } }
             if let Some(size) = spec.options.get("schemas.cache.size") { if size.parse::<i32>().map_err(|cause| error("invalid-plugin-config", cause))? < 0 { return Err(error("invalid-plugin-config", "schemas.cache.size is negative")); } }

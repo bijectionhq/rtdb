@@ -56,6 +56,9 @@ impl RegistryConverter {
         let mut visited = BTreeSet::new();
         let mut references = ResolvedReferences::default();
         loop {
+            if self.format == super::RegistryFormat::Protobuf && stack.len() > super::protobuf::MAX_DEPTH {
+                return Err(error("schema-registry", "Protobuf reference nesting limit exceeded"));
+            }
             let frame = stack.last_mut().expect("root reference frame");
             if frame.next == frame.schema.body.references.len() {
                 let frame = stack.pop().expect("completed reference frame");
@@ -79,6 +82,9 @@ impl RegistryConverter {
                 body: RegistrySchema { schema: response.schema, schema_type: response.schema_type, references: response.references, rule_set: response.rule_set, metadata: response.metadata },
                 subject: response.subject, version: response.version,
             };
+            if self.format == super::RegistryFormat::Protobuf {
+                self.validate_format(&fetched.body)?;
+            }
             if version == -1 {
                 stack.last_mut().expect("requesting reference frame").schema.body.references[index].as_mut().expect("requesting reference was validated").version = fetched.version;
             }

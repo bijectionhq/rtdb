@@ -92,6 +92,23 @@ connectConfig:
 
 See [Included Kafka Connect classes](#included-kafka-connect-classes) for the bundled classes and the interfaces a custom class must implement.
 
+#### Confluent Protobuf in the native source
+
+Use the Confluent converter class and a Schema Registry URL on each Protobuf key or value.
+
+```yaml
+connectConfig:
+  key.converter: org.apache.kafka.connect.storage.StringConverter
+  value.converter: io.confluent.connect.protobuf.ProtobufConverter
+  value.converter.schema.registry.url: https://registry.example.com
+```
+
+The native converter reads Confluent's schema-ID payload framing and resolves registered Protobuf imports.
+Use the `key.converter.` or `value.converter.` prefix for registry authentication, subject naming, and Protobuf conversion options such as `int.for.enums` and `flatten.unions`.
+An absent Kafka key or value is a tombstone for that converter.
+A framed empty Protobuf message still has a message type and produces its default or absent fields according to that type.
+This source uses dynamic Protobuf descriptors and requires the schema-ID prefix in the Kafka payload.
+
 XTDB runs converters, transforms, and predicates itself rather than in a Kafka Connect worker, so some Kafka Connect features are unavailable:
 - Classes are loaded from the JVM classpath by name; there is no `plugin.path` isolation.
 - Header conversion is fixed and cannot be configured.

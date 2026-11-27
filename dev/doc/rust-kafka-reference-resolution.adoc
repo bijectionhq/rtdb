@@ -7,6 +7,8 @@ The first visit determines the schema retained for a name.
 Cycles and duplicate names still demand their version lookup but do not descend again.
 Avro receives reference texts in this dependency insertion order before the root text.
 JSON Schema continues to receive a name-indexed map.
+Protobuf resolves imports by the registered reference name and validates that references contain Protobuf schemas.
+The Protobuf compiler also resolves Confluent logical-type declarations and the Google types bundled with the reference converter.
 
 Reference requests use the supplied signed version and `deleted=true`.
 A requested version of `-1` is replaced in the containing reference by the fetched response's version before duplicate detection.
@@ -26,6 +28,17 @@ The explicit default-context child `:.:child` under that parent requests `:.ctx:
 Fetched subject/version metadata belongs to a separate response envelope and cannot enter the subject-version POST body.
 Reference resolution and version replacement precede that POST, which uses `normalize=false` and `deleted=true`.
 An empty root reference list is omitted from the POST body under the source NON_EMPTY policy.
+
+== Protobuf writer and reader selection
+
+The Confluent payload prefixes the message with its Registry schema ID and a ZigZag varint path through that schema's declared messages.
+The path drives record-based subject naming and selects the writer descriptor.
+The default topic-based subject can reuse a writer document for every message in the schema.
+When reader selection is configured, the selected Registry schema supplies the Connect version and the reader descriptor.
+Projection caches hold their descriptor or schema reservation for as long as the entry is live.
+
+The bundled Google common type schemas under `connect/registry/protobuf/google` come from the Apache-2.0 `com.google.api.grpc:proto-google-common-protos:2.22.1` artifact used by Confluent Schema Registry 7.8.0.
+The artifact SHA-256 is `b0642455c9b3fbbf9bd805c3a31bdaf865b5f1d3b535df5874219e5eeaf75c37`.
 
 == Ownership and admission
 

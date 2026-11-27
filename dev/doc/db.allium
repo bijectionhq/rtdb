@@ -1709,6 +1709,9 @@ rule LeaderFlushTimeout {
 
 -- Kafka Connect interprets each record's JSON tokens in wire order and retains typed numbers for Connect coercion and optional JSON Schema validation.
 -- Avro Connect projection applies the selected schema to the admitted binary datum, preserving reader resolution and the writer's Connect output rules.
+-- Protobuf Connect conversion resolves the Registry schema and its imports, then uses the Confluent message-index path to identify the writer message.
+-- A Kafka tombstone yields a null Connect value and schema, while a well-formed empty Protobuf message yields a value with its Connect schema.
+-- Invalid Protobuf framing, imports, message indexes, or datums fail conversion before the source submits the batch.
 -- Kafka transforms receive Connect values with their declared schema and logical annotations.
 -- The Kafka document indexer submits each transformed record as a transaction using its offset as the resume token.
 
