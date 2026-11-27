@@ -401,7 +401,16 @@ impl ProtocolSession {
                         continue;
                     }
                     let bytes = input.take(usize::try_from(length).map_err(|_| protocol("Negative argument length"))?)?;
-                    let oid = *prepared.oids.get(index).ok_or_else(|| protocol("Argument count differs from parameter OIDs"))?;
+                    let oid = *prepared.oids.get(index).ok_or_else(|| {
+                        if matches!(prepared.control(), Some(
+                            ControlStatement::Begin(_) | ControlStatement::SetTransaction(_)
+                            | ControlStatement::SetTimeZone(_) | ControlStatement::SetAwaitToken(_)
+                        )) {
+                            Anomaly::new_nullable(rtdb_types::AnomalyCategory::Fault, "xtdb.error/unknown", None)
+                        } else {
+                            protocol("Argument count differs from parameter OIDs")
+                        }
+                    })?;
                     if oid == 0 && matches!(prepared.ordinary_kind(), Some(PreparedKind::Dml(_))) { self.record_transaction_error(); return Err(Anomaly::incorrect("xtdb.pgwire/missing-arg-types", "Missing types for args - client must specify types for all non-null params in DML statements")); }
                     let ty = PgType::from_oid(oid).ok_or_else(|| Anomaly::unsupported("xtdb.pgwire/unsupported-param-type", format!("Unsupported param type OID {oid}")))?;
                     let format = item_format(&formats, count, index)?;

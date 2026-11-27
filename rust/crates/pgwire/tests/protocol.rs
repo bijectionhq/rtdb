@@ -844,6 +844,60 @@ async fn unprepared_controls_consume_actual_arguments_independently_of_descripti
     drop(client); running.stop().await;
 }
 
+#[tokio::test]
+async fn control_bind_distinguishes_an_omitted_oid_from_oid_zero() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    assert_eq!(tags(&client.query("INSERT INTO docs (_id) VALUES (1)").await), b"CZ");
+    let await_token = rows(&client.query("SHOW await_token").await)[0][0].clone().unwrap();
+
+    for (sql, value, describes_parameters, completion, ready) in [
+        ("BEGIN READ ONLY WITH (TIMEZONE = $1)", b"Europe/Paris".as_slice(), true, b"2CZ".as_slice(), b'T'),
+        ("SET TIME ZONE $1", b"Europe/Paris".as_slice(), false, b"2SCZ".as_slice(), b'I'),
+        ("SET AWAIT_TOKEN = $1", await_token.as_slice(), false, b"2CZ".as_slice(), b'I'),
+    ] {
+        let mut bind = b"\0control\0\0\0\0\x01".to_vec();
+        bind.extend_from_slice(&(value.len() as i32).to_be_bytes());
+        bind.extend_from_slice(value);
+        bind.extend_from_slice(&[0; 2]);
+
+        client.parse("control", sql, &[]).await;
+        client.send(b'D', b"Scontrol\0").await;
+        client.send(b'B', &bind).await;
+        client.send(b'S', &[]).await;
+        let frames = client.through(b'Z').await;
+        let expected = if describes_parameters { b"1tnEZ".as_slice() } else { b"1nEZ".as_slice() };
+        assert_eq!(tags(&frames), expected, "{sql}");
+        if describes_parameters {
+            assert_eq!(frames[1].1, b"\0\0");
+        }
+        let (state, message, detail) = error_fields(&frames[frames.len() - 2].1);
+        assert_eq!(state, "XX000", "{sql}");
+        assert!(message.is_empty(), "{sql}");
+        assert_eq!(detail["code"], "xtdb.error/unknown", "{sql}");
+        assert_eq!(frames.last().unwrap().1, b"I", "{sql}");
+
+        client.parse("control", sql, &[0]).await;
+        client.send(b'D', b"Scontrol\0").await;
+        client.send(b'B', &bind).await;
+        client.execute("", 0).await;
+        client.send(b'S', &[]).await;
+        let frames = client.through(b'Z').await;
+        let prefix = if describes_parameters { b"1tn".as_slice() } else { b"1n".as_slice() };
+        assert_eq!(tags(&frames), [prefix, completion].concat(), "{sql}");
+        if describes_parameters {
+            assert_eq!(frames[1].1, b"\0\x01\0\0\0\x19");
+        }
+        assert_eq!(frames.last().unwrap().1, [ready], "{sql}");
+        if ready == b'T' {
+            assert_eq!(tags(&client.query("ROLLBACK").await), b"CZ");
+        }
+    }
+
+    drop(client);
+    running.stop().await;
+}
+
 fn arrow_copy_bytes(file: bool, offset: i64) -> Vec<u8> {
     use arrow_array::{ArrayRef, Int64Array, RecordBatch};
     let batch = |id, value| RecordBatch::try_from_iter(vec![("_id", Arc::new(Int64Array::from(vec![id])) as ArrayRef), ("n", Arc::new(Int64Array::from(vec![value])) as ArrayRef)]).unwrap();
