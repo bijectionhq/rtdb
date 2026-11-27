@@ -45,6 +45,8 @@ pub mod classic_ingress;
 mod classic_migration;
 pub(crate) mod classic_opening;
 pub(crate) mod dependent_custody;
+#[cfg(all(test, unix))]
+mod funded_qualification;
 mod timed_stream;
 pub use classic_migration::ClassicCandidate;
 mod managed_transfer;

@@ -413,6 +413,16 @@ Reuse the fixture directory when restarting its receiver so it retains the durab
 This fixture exercises the actual signed transports and positive original-quorum path on the shared local clock.
 Deployed clock authorities use externally commissioned bounds and independent custody.
 
+Run the activation gate regression from `rust/` with Python 3 and OpenSSL 3 available.
+
+```bash
+RTDB_FUNDED_TEST_OPENSSL="$OPENSSL3" cargo test --locked -p rtdb-server --features multi --lib \
+  commissioned_funded_dispatch_leaves_the_live_receiver_and_journal_untouched -- --ignored
+```
+
+The regression books with the installed loopback receiver and an uncommissioned Multi writer backed by Logkeeper.
+It reopens that history under an independent activation quorum and verifies that a funded consume leaves the original booking pending, the journal head fixed and the receiver's durable sample sequence unchanged.
+
 Qualify the exact installed route with the following cases.
 
 - Check that `transact.decision-clock-offer` appears for the matching authenticated, writable attachment with a live receiver and commissioned timed journal.
