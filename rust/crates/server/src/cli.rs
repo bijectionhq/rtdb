@@ -11,7 +11,6 @@ mod memory;
 pub use memory::{UNKNOWN_MEMORY_LIMIT_BYTES, default_memory_limit_bytes, scaled_memory_limit};
 
 #[cfg(feature = "multi")]
-#[cfg(feature = "multi")]
 pub use crate::multi::activation::ActivationOptions;
 
 mod admin;
@@ -27,7 +26,7 @@ pub const NATIVE_DEPENDENT_CUSTODY_HELP: &str = "Usage: rtdb native-dependent-cu
 
 pub const ADMIN_HELP: &str = "Usage: rtdb admin create NAME [--incarnation UUID]\n       rtdb admin delete NAME\n       rtdb admin export NAME BASIS_HEX PIN_UUID\n       rtdb admin fork NAME SOURCE BASIS_HEX PIN_UUID\n       rtdb admin restore NAME SOURCE CHECKPOINT_HEX\n\nUse --endpoint URL and --authorization-file PATH, or set RTDB_ADMIN_ENDPOINT and RTDB_ADMIN_AUTHORIZATION_FILE. Export and fork also accept --retain-until-micros TIME.\n";
 
-pub const HELP: &str = "RTDB\n\nUsage: rtdb --build-info\n       rtdb dev [--multi] [--data PATH] [--port PORT] [--flight-sql-port PORT] [--memory-limit BYTES]\n       rtdb dev --multi --data PATH --multi-tls-dir DIR --incarnation UUID [--multi-authn FILE] [--multi-journal-url URL] [--multi-receiver-clock FILE] [--custody-provider-config FILE] [--flight-sql-port PORT]\n       rtdb initialize-standalone --state STAGE --name NAME --id UUID\n       rtdb standalone --state PATH --name NAME --id UUID --certificate PEM --private-key PEM\n                       --password-file FILE --ready-file FILE --parent-stdin [--custody-provider-config FILE]\n       rtdb admin --help\n       rtdb multi-activation --help\n       rtdb multi-backup --help\n       rtdb classic-opening --help\n       rtdb native-dependent-custody --help\n       rtdb node --multi [-f FILE | --config-env NAME] [--native-follower FILE] [--memory-limit BYTES]\n       rtdb [node|ingest|playground|compactor] [-f FILE] [--memory-limit BYTES]\n       rtdb [export-snapshot|reset-compactor] DATABASE [-f FILE] [--dry-run] [--memory-limit BYTES]\n       rtdb reset-compactor DATABASE --retained-base PATH [-f FILE] [--dry-run]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT BASE@SHA256 THROUGH@SHA256 [--base-storage PATH] [--checkpoint-key-vault PATH] [--memory-limit BYTES]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT THROUGH@SHA256 --retained-base --base-storage PATH [--checkpoint-key-vault PATH] [--memory-limit BYTES]\n       rtdb retain-repair-base STORAGE REPLICA_LOG EXPORTED_STORAGE BASE@SHA256 [--reclaim-receipts] [--memory-limit BYTES]\n       rtdb hash-password [--argon2id|--bcrypt] [PASSWORD]\n\nNode defaults to xtdb.yaml, xtdb.yml or xtdb.edn in the working directory.\nIngest configuration uses YAML.\nDev stores data in .rtdb by default and binds to loopback.\nPlayground accepts --port PORT and --flight-sql-port PORT.\nStartup accepts -Djava.util.Arrays.useLegacyMergeSort=true before or after the command.\nPasswords may be read from standard input.\nFile inspection: read-arrow-file, read-arrow-stream-file, read-hash-trie-file,\n                 read-table-block-file, read-block-file PATH [--memory-limit BYTES].\nClassic relation OID preflight: read-block-file PATH --classic-oid-preflight [--allocate SCHEMA/TABLE]...\nInspection output is typed JSON.\nMemory defaults to RTDB_MEMORY_LIMIT_BYTES, else half the available physical or cgroup memory. If both are unknown, it defaults to 1073741824 bytes.\n";
+pub const HELP: &str = "RTDB\n\nUsage: rtdb --build-info\n       rtdb dev [--multi] [--data PATH] [--port PORT] [--flight-sql-port PORT] [--memory-limit BYTES]\n       rtdb dev --multi --data PATH --multi-tls-dir DIR --incarnation UUID [--multi-authn FILE] [--multi-journal-url URL] [--multi-immutable-streams] [--multi-receiver-clock FILE] [--custody-provider-config FILE] [--flight-sql-port PORT]\n       rtdb initialize-standalone --state STAGE --name NAME --id UUID\n       rtdb standalone --state PATH --name NAME --id UUID --certificate PEM --private-key PEM\n                       --password-file FILE --ready-file FILE --parent-stdin [--custody-provider-config FILE]\n       rtdb admin --help\n       rtdb multi-activation --help\n       rtdb multi-backup --help\n       rtdb classic-opening --help\n       rtdb native-dependent-custody --help\n       rtdb node --multi [-f FILE | --config-env NAME] [--native-follower FILE] [--memory-limit BYTES]\n       rtdb [node|ingest|playground|compactor] [-f FILE] [--memory-limit BYTES]\n       rtdb [export-snapshot|reset-compactor] DATABASE [-f FILE] [--dry-run] [--memory-limit BYTES]\n       rtdb reset-compactor DATABASE --retained-base PATH [-f FILE] [--dry-run]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT BASE@SHA256 THROUGH@SHA256 [--base-storage PATH] [--checkpoint-key-vault PATH] [--memory-limit BYTES]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT THROUGH@SHA256 --retained-base --base-storage PATH [--checkpoint-key-vault PATH] [--memory-limit BYTES]\n       rtdb retain-repair-base STORAGE REPLICA_LOG EXPORTED_STORAGE BASE@SHA256 [--reclaim-receipts] [--memory-limit BYTES]\n       rtdb hash-password [--argon2id|--bcrypt] [PASSWORD]\n\nNode defaults to xtdb.yaml, xtdb.yml or xtdb.edn in the working directory.\nIngest configuration uses YAML.\nDev stores data in .rtdb by default and binds to loopback.\nPlayground accepts --port PORT and --flight-sql-port PORT.\nStartup accepts -Djava.util.Arrays.useLegacyMergeSort=true before or after the command.\nPasswords may be read from standard input.\nFile inspection: read-arrow-file, read-arrow-stream-file, read-hash-trie-file,\n                 read-table-block-file, read-block-file PATH [--memory-limit BYTES].\nClassic relation OID preflight: read-block-file PATH --classic-oid-preflight [--allocate SCHEMA/TABLE]...\nInspection output is typed JSON.\nMemory defaults to RTDB_MEMORY_LIMIT_BYTES, else half the available physical or cgroup memory. If both are unknown, it defaults to 1073741824 bytes.\n";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeMode { Node, Ingest, Playground, Compactor }
@@ -37,6 +36,7 @@ pub struct StartOptions { pub mode: NodeMode, pub file: Option<PathBuf>, pub all
 pub struct DevOptions {
     pub data: PathBuf,
     pub multi: bool,
+    immutable_streams: bool,
     pub allocation_limit_bytes: usize,
     pub multi_tls: Option<MultiDevTls>,
     pgwire_port: i32,
@@ -284,6 +284,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(
         let mut options = DevOptions {
             data: ".rtdb".into(),
             multi: false,
+            immutable_streams: false,
             allocation_limit_bytes: memory_limit(environment)?,
             multi_tls: None,
             pgwire_port: 5432,
@@ -308,6 +309,9 @@ pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(
                     data_requested = true;
                 }
                 "--multi" => options.multi = true,
+                "--multi-immutable-streams" if !options.immutable_streams => {
+                    options.immutable_streams = true;
+                }
                 "--multi-tls-dir" if tls_directory.is_none() => {
                     let directory = arguments.next().filter(|path| !path.is_empty() && !path.starts_with('-'))
                         .ok_or_else(|| invalid("--multi-tls-dir requires a directory"))?;
@@ -365,6 +369,12 @@ pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(
             }
             _ => return Err(invalid("--multi-tls-dir and --incarnation require --multi, explicit --data and an enabled Flight SQL listener")),
         };
+        if options.immutable_streams && !options.multi_tls.as_ref()
+            .and_then(|tls| tls.journal_url.as_deref())
+            .is_some_and(|url| url.starts_with("logkeeper-consensus://"))
+        {
+            return Err(invalid("--multi-immutable-streams requires a Multi consensus journal"));
+        }
         return Ok(Command::Dev(options));
     }
     let mode = match arguments.peek().map(String::as_str) {
@@ -479,6 +489,7 @@ impl DevOptions {
             None => ParsedConfiguration::from_yaml("", &ProcessEnvironment, &memory, false)?,
         };
         let config = parsed.configuration_mut();
+        config.multi_journal.immutable_streams = self.immutable_streams;
         if let Some(file) = self.multi_tls.as_ref().and_then(|tls| tls.receiver_clock.as_deref()) {
             install_multi_dev_receiver_clock(config, file, &memory)?;
         }
@@ -611,6 +622,11 @@ impl MultiDevTls {
 
 #[cfg(feature = "multi")]
 pub(crate) fn development_stream_journal(url: &str, directory: &Path) -> Result<crate::multi::DevelopmentStreamJournal> {
+    crate::multi::DevelopmentStreamJournal::new(url, journal_credentials(directory)?)
+}
+
+#[cfg(feature = "multi")]
+pub(crate) fn journal_credentials(directory: &Path) -> Result<rtdb_stream_journal::Credentials> {
     let credential = |name| {
         let path = directory.join(name);
         let file = open_private_multi_input(&path)?;
@@ -619,12 +635,11 @@ pub(crate) fn development_stream_journal(url: &str, directory: &Path) -> Result<
         }
         Ok(path)
     };
-    let credentials = rtdb_stream_journal::Credentials {
+    Ok(rtdb_stream_journal::Credentials {
         certificate: credential("journal-certificate.pem")?,
         private_key: credential("journal-key.pem")?,
         ca: credential("journal-ca.pem")?,
-    };
-    crate::multi::DevelopmentStreamJournal::new(url, credentials)
+    })
 }
 
 fn open_private_multi_input(path: &Path) -> Result<File> {

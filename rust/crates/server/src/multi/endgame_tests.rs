@@ -2,8 +2,8 @@ use super::activation::{ActivationAuthority, VerifiedSuccessor};
 use journal_contract::Journal;
 use rtdb_crypt::LocalKms;
 use rtdb_db::{MultiDatabase, MultiOptions, PortableBackup, Role};
-use rtdb_node::{Clock, MultiServing, ServingDriver, SystemClock};
-use rtdb_store::MemoryStore;
+use rtdb_node::{Clock, MultiServing, SystemClock, serving::ServingDriver};
+use rtdb_storage::MemoryStore;
 use rtdb_tx::transact::{Cell, Op, Outcome, Row, Transact};
 use rtdb_types::{EntityId, StructFields, TableRef, Value, rtdb_v1::MAIN_BRANCH};
 use std::{

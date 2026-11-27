@@ -739,10 +739,19 @@ mod tests {
 }
 
 #[cfg(feature = "s3")]
-pub(super) async fn installed(database_url: &str) -> Result<Option<Arc<ActivationAuthority>>> {
+pub(super) async fn installed(
+    database_url: &str,
+    immutable_streams: bool,
+) -> Result<Option<Arc<ActivationAuthority>>> {
     let Some((url, identity, credentials)) = environment()? else {
         return Ok(None);
     };
+    if !immutable_streams {
+        return Err(Anomaly::incorrect(
+            "rtdb/activation-config",
+            "Installed activation requires multiJournal.immutableStreams",
+        ));
+    }
     if url == database_url {
         return Err(configuration());
     }

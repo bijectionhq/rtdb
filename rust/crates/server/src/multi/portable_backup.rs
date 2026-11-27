@@ -6,9 +6,9 @@ use serde_json::{Value, json};
 use super::*;
 
 pub const MULTI_BACKUP_HELP: &str = "\
-Usage: rtdb multi-backup export --data DIR --archive FILE [--journal-url URL --tls-dir DIR]
+Usage: rtdb multi-backup export --data DIR --archive FILE [--journal-url URL --tls-dir DIR] [--immutable-streams]
        rtdb multi-backup restore --data DIR --archive FILE --incarnation UUID --source-key-vault DIR
-                                 [--journal-url URL --tls-dir DIR]
+                                 [--journal-url URL --tls-dir DIR] [--immutable-streams]
 Operates on stopped, local RTDB Multi development data. The source key vault
 is supplied separately during restore. Neither command mounts a serving listener.
 ";
@@ -25,15 +25,21 @@ pub struct MultiBackupOptions {
     data: PathBuf,
     archive: PathBuf,
     journal: Option<(String, PathBuf)>,
+    immutable_streams: bool,
 }
 
 impl MultiBackupOptions {
     pub(crate) fn parse(mut arguments: impl Iterator<Item = String>) -> Result<Self> {
         let operation = arguments.next().ok_or_else(arguments_error)?;
         let mut fields = BTreeMap::new();
+        let mut immutable_streams = false;
         while let Some(name) = arguments.next() {
+            if name == "--immutable-streams" && !immutable_streams {
+                immutable_streams = true;
+                continue;
+            }
             let value = arguments.next().ok_or_else(arguments_error)?;
-            if !name.starts_with("--") || value.starts_with("--") || fields.insert(name, value).is_some() {
+            if name == "--immutable-streams" || !name.starts_with("--") || value.starts_with("--") || fields.insert(name, value).is_some() {
                 return Err(arguments_error());
             }
         }
@@ -44,6 +50,9 @@ impl MultiBackupOptions {
             (None, None) => None,
             _ => return Err(arguments_error()),
         };
+        if immutable_streams && !journal.as_ref().is_some_and(|(url, _)| url.starts_with(CONSENSUS_SCHEME)) {
+            return Err(arguments_error());
+        }
         let operation = match operation.as_str() {
             "export" => Operation::Export,
             "restore" => {
@@ -57,7 +66,7 @@ impl MultiBackupOptions {
             _ => return Err(arguments_error()),
         };
         if !fields.is_empty() { return Err(arguments_error()); }
-        Ok(Self { operation, data, archive, journal })
+        Ok(Self { operation, data, archive, journal, immutable_streams })
     }
 
     pub async fn run(self, apple_sync: rtdb_storage::AppleSync) -> Result<Value> {
@@ -83,6 +92,7 @@ impl MultiBackupOptions {
         };
         let mut configuration = NodeConfiguration::from_yaml_with_environment("", &|_| None, false)?;
         configuration.apple_sync = apple_sync;
+        configuration.multi_journal.immutable_streams = self.immutable_streams;
         let journal = self.journal.as_ref()
             .map(|(url, directory)| crate::cli::development_stream_journal(url, directory))
             .transpose()?;

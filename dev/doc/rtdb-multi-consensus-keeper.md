@@ -44,6 +44,7 @@ never a sealed writer epoch, and Multi always seals epoch one or later.
 ## Immutable stream history
 
 Set `multiJournal: {immutableStreams: true}` for a Multi cell using a Logkeeper consensus cluster with cluster version 4 finalized.
+The loopback development equivalent is `rtdb dev --multi --multi-immutable-streams` with a complete Multi TLS profile and the consensus journal URL.
 This setting applies to newly created stream IDs.
 A residence verifies the durable stream mode before opening the history and presents a fresh session identity when seeking the writer epoch.
 Seal binds that session to the exact committed head, and subsequent appends and trims carry its fence.
@@ -54,7 +55,7 @@ To adopt this mode for existing databases, restore a verified application cut in
 
 ## Operator recovery
 
-When a stream loses two of its three voters, an operator can run `logkeeper keeper recover-stream --acknowledge-data-loss` on the survivor.
+For a legacy mutable stream that loses two of its three voters, an operator can run `logkeeper keeper recover-stream --acknowledge-data-loss` on the survivor.
 The stream then ends at the survivor's head, and records acknowledged after it may be lost.
 Every seal returns `JournalError::Recovered { head }` until a writer or an administrator acknowledges the recovery.
 
@@ -85,6 +86,7 @@ Transactions with an external custody or erasure effect, funded dispatch, and th
 Those capabilities require separately commissioned effect fences before they can serve an activated database name.
 
 On installed Multi nodes, `RTDB_ACTIVATION_JOURNAL_URL` selects the independent immutable consensus authority and `RTDB_ACTIVATION_AUTHORITY_ID` identifies it.
+Installed activation requires `multiJournal: {immutableStreams: true}` for the application journal.
 The authority's TLS files come from `RTDB_ACTIVATION_CERTIFICATE_PATH`, `RTDB_ACTIVATION_PRIVATE_KEY_PATH`, and `RTDB_ACTIVATION_CA_PATH`.
 All replicas of the authority protect its state against rewind and survive failure of the databases they activate.
 
@@ -157,6 +159,7 @@ Keep source key custody available independently until a restore is admitted; ret
 The destination checkpoint records the source coordinates and archive digest so the committed installation can be read back after restart.
 Recovered ordinary receipts use the new incarnation's basis, and the archive retains the original receipts.
 The commands work with the local development journal and the optional loopback Logkeeper connections configured with `--journal-url` and `--tls-dir`.
+For a version 4 immutable stream, pass `--immutable-streams` to export, restore, and activation publication.
 
 This archive version supports inline checkpoints with ordinary retained receipts.
 Active pins, external object dependencies, ranked catalogues, protected custody, and scoped or funded receipts require a separate portable transfer.
@@ -179,6 +182,8 @@ cargo test -p rtdb-journal-logkeeper
 cargo test -p rtdb-server --features multi --lib multi_dev_serves_and_reopens_on_consensus_keepers
 cargo test -p rtdb-server --features multi --lib multi_dev_moves_its_stream_off_a_draining_keeper
 cargo test -p rtdb-server --features multi --lib consensus_batch_proves_funded_timed_originals
+# Restore an immutable cut with three independent keeper clusters.
+cargo test -p rtdb-server --features multi --lib portable_cut_replaces_a_lost_cell_and_fences_its_return
 # Separate keeper processes, rtdb dev --multi and rtdb.v1 commits over Flight.
 python3 bench/v1_consensus_keepers.py --rtdb target/release/rtdb \
   --logkeeper /path/to/logkeeper output-directory

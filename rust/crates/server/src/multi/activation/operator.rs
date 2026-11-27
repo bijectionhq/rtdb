@@ -1,7 +1,6 @@
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::Arc,
 };
 
 use rtdb_columnar::MemoryBudget;
@@ -12,14 +11,14 @@ use uuid::Uuid;
 use super::{ActivationAuthority, Binding, VerifiedSuccessor};
 use crate::{
     config::NodeConfiguration,
-    multi::{DEVELOPMENT_DATABASE, DevelopmentStreamJournal, MultiRuntime, io_error},
+    multi::{CONSENSUS_SCHEME, DEVELOPMENT_DATABASE, MultiRuntime, io_error},
 };
 
 pub const HELP: &str = "Usage: rtdb multi-activation status DATABASE AUTHORITY
        rtdb multi-activation bootstrap DATABASE AUTHORITY --incarnation UUID
        rtdb multi-activation freeze DATABASE AUTHORITY --expected-incarnation UUID --expected-revision N
        rtdb multi-activation publish DATABASE AUTHORITY --expected-incarnation UUID --expected-revision N
-                --operation-id UUID --data DIR [--journal-url URL --tls-dir DIR]
+                --operation-id UUID --data DIR [--journal-url URL --tls-dir DIR] [--immutable-streams]
 
 AUTHORITY is --authority-id UUID and either --authority-file PATH for a local
 rehearsal or --authority-url URL --authority-tls-dir DIR for an independent
@@ -47,6 +46,7 @@ enum Operation {
         operation_id: Uuid,
         destination_data: PathBuf,
         journal: Option<(String, PathBuf)>,
+        immutable_streams: bool,
     },
 }
 
@@ -63,9 +63,15 @@ impl Options {
         let operation = arguments.next().ok_or_else(arguments_error)?;
         let database = arguments.next().ok_or_else(arguments_error)?;
         let mut fields = BTreeMap::new();
+        let mut immutable_streams = false;
         while let Some(name) = arguments.next() {
+            if name == "--immutable-streams" && !immutable_streams {
+                immutable_streams = true;
+                continue;
+            }
             let value = arguments.next().ok_or_else(arguments_error)?;
-            if !name.starts_with("--")
+            if name == "--immutable-streams"
+                || !name.starts_with("--")
                 || value.starts_with("--")
                 || fields.insert(name, value).is_some()
             {
@@ -112,16 +118,20 @@ impl Options {
                     (None, None) => None,
                     _ => return Err(arguments_error()),
                 };
+                if immutable_streams && !journal.as_ref().is_some_and(|(url, _)| url.starts_with(CONSENSUS_SCHEME)) {
+                    return Err(arguments_error());
+                }
                 Operation::Publish {
                     expected,
                     operation_id,
                     destination_data,
                     journal,
+                    immutable_streams,
                 }
             }
             _ => return Err(arguments_error()),
         };
-        if !fields.is_empty() {
+        if !fields.is_empty() || immutable_streams && !matches!(operation, Operation::Publish { .. }) {
             return Err(arguments_error());
         }
         Ok(Self {
@@ -135,16 +145,16 @@ impl Options {
     pub async fn run(self, apple_sync: rtdb_storage::AppleSync) -> Result<Value> {
         let authority = match self.authority {
             Authority::Local(path) => {
-                if !matches!(self.operation, Operation::Bootstrap) && !path.is_file() {
+                if !matches!(self.operation, Operation::Bootstrap { .. }) && !path.is_file() {
                     return Err(super::unavailable());
                 }
                 ActivationAuthority::open_local(&path, self.authority_id)?
             }
             Authority::Consensus { url, tls } => {
-                if !url.starts_with(crate::multi::CONSENSUS_SCHEME) {
+                if !url.starts_with(CONSENSUS_SCHEME) {
                     return Err(arguments_error());
                 }
-                ActivationAuthority::connect(&url, credentials(&tls)?, self.authority_id).await?
+                ActivationAuthority::connect(&url, crate::cli::journal_credentials(&tls)?, self.authority_id).await?
             }
         };
         let database = self.database;
@@ -161,9 +171,11 @@ impl Options {
                 operation_id,
                 destination_data,
                 journal,
+                immutable_streams,
             } => {
-                let ready =
-                    read_installation(&destination_data, journal.as_ref(), apple_sync).await?;
+                let ready = read_installation(
+                    &destination_data, journal.as_ref(), immutable_streams, apple_sync,
+                ).await?;
                 authority
                     .publish_successor(&database, expected, operation_id, ready)
                     .await?;
@@ -209,25 +221,10 @@ fn arguments_error() -> Anomaly {
     )
 }
 
-fn credentials(directory: &Path) -> Result<crate::multi::Credentials> {
-    let credential = |name| {
-        let path = directory.join(name);
-        let file = crate::cli::open_private_multi_input(&path)?;
-        if file.metadata().map_err(io_error)?.len() > 64 * 1024 {
-            return Err(arguments_error());
-        }
-        Ok(path)
-    };
-    Ok(crate::multi::Credentials {
-        certificate: credential("journal-certificate.pem")?,
-        private_key: credential("journal-key.pem")?,
-        ca: credential("journal-ca.pem")?,
-    })
-}
-
 async fn read_installation(
     data: &Path,
     journal: Option<&(String, PathBuf)>,
+    immutable_streams: bool,
     apple_sync: rtdb_storage::AppleSync,
 ) -> Result<VerifiedSuccessor> {
     let missing = || {
@@ -241,8 +238,9 @@ async fn read_installation(
     }
     let mut configuration = NodeConfiguration::from_yaml_with_environment("", &|_| None, false)?;
     configuration.apple_sync = apple_sync;
+    configuration.multi_journal.immutable_streams = immutable_streams;
     let journal = journal
-        .map(|(url, tls)| DevelopmentStreamJournal::new(url, credentials(tls)?))
+        .map(|(url, tls)| crate::cli::development_stream_journal(url, tls))
         .transpose()?;
     let runtime = MultiRuntime::development_with_incarnation(
         data,

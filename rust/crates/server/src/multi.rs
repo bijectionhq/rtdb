@@ -345,7 +345,7 @@ impl MultiRuntime {
         if config.multi_journal.immutable_streams && placement.is_none() {
             return Err(invalid("Immutable streams require a Logkeeper consensus journal"));
         }
-        let activation = activation::installed(&journal_url).await?;
+        let activation = activation::installed(&journal_url, config.multi_journal.immutable_streams).await?;
         let io = IoRegion::new();
         let store = s3
             .open(
