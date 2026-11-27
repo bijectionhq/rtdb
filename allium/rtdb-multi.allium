@@ -479,6 +479,7 @@ contract OriginalFundedAdmission {
         -- The issuer authorizes the start of a funded command under its open commissioned scope.
         -- The issuer durably orders each booking before returning its receipt or authorizing its accepting appends.
         -- The booking carries the original receipt namespace, idempotency key, authenticated owner, predecessor basis, canonical request or appointment intent digest, and exclusive decision and journal cutoffs.
+        -- Before dispatch, each accepting-append authorization durably binds the booking and stage to the exact stream, writer epoch, position, sealed payload digest, receiver certificate and exclusive journal cutoff.
         -- Exact retries recover the same booking and ordered stages, and a changed request for the same stage conflicts.
         -- The issuer authenticates booking authority, the receiver authenticates clock evidence, and the original journal quorum authenticates timed appends.
 
@@ -491,10 +492,12 @@ contract OriginalFundedAdmission {
 
     @invariant SettlementUsesOriginalEvidence
         -- The original issuer returns one durable terminal disposition for each inventoried booking under its original identity.
-        -- For each accepting append, the verifier checks the original keeper proof for its exact stream, writer epoch, position, payload digest, receiver certificate and exclusive journal cutoff.
+        -- The verifier reconciles every append authorization and checks each accepting append's original keeper proof against its exact authorized request.
         -- An accepted appointment activation retains its original proof even when the final appointment disposition is a refusal.
         -- A terminal refusal requires original evidence excluding an earlier accepting quorum and a fence against any later acceptance of that stage.
         -- Expiry removes the right to start a new acceptance and leaves an earlier possible acceptance unresolved until the original authorities determine its outcome.
+        -- Settlement evidence remains verifiable through writer replacement and source retirement, including when a checkpoint trims the accepting record.
+        -- Recovery leaves an authorized stage unresolved when it cannot verify the original evidence needed for settlement.
         -- RTDB verifies every predecessor scope closure against its enrolled issuer and reconciles the complete inventories before the successor advertises or admits commissioned funded work.
         -- A retained RTDB recovery record binds the verified original issuer evidence to its booking and scope.
         -- A successor uses its own commissioned scope and preserves the original booking identity for retry and outcome lookup.

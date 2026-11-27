@@ -462,10 +462,13 @@ Commissioning requires the issuer to be enrolled for the exact activation author
 The installed `fundedReceiverClock` transport supplies clock observations for that certificate and source incarnation.
 `RTDB_TIMED_ORIGINAL_TRUST_FILE` pins the original keeper proof signers, and the receiver and keepers use the same guarded clock scale.
 Give recovery an independently authenticated route to the original issuer and retain the original issuer and keeper verification identities through settlement.
+The original issuer durably binds each accepting stage to its exact sealed append before the writer sends it to the original journal.
+Logkeeper reads timed-original proof from its retained committed record, so preserve verifiable settlement evidence before checkpoint trim or retirement can remove that record. [Timed proof read](https://github.com/bijectionhq/logkeeper/blob/14d7b7ec7c3d74667d95bebbe9ee143ca6eb8d98/src/stream/consensus/keeper.rs#L2323-L2347) [Retained floor](https://github.com/bijectionhq/logkeeper/blob/14d7b7ec7c3d74667d95bebbe9ee143ca6eb8d98/src/stream/consensus/state.rs#L1358-L1372)
 Read the complete funded scope roster from the original activation decision that closed predecessor grants, including scopes closed before certificate rotation.
 Obtain a durable closure for each scope and enumerate its complete booking inventory, including bookings whose replies were lost.
 Resume from that same closure after a restart or replacement recovery operation.
 Reconcile each booking with its original terminal disposition and verify the original keeper proof of every accepting append, including an accepted appointment activation followed by a refusal.
+When a lookup misses or is trimmed, settle the stage only from preserved acceptance proof or an original exclusion and fence.
 Keep successor funded admission closed until the original evidence settles every booking.
 
 Bijection's managed inbox records a slot by commit label and scheduled reading, then binds it in the transaction that records the call's receipt. [Slot offer](https://github.com/bijectionhq/bijection/blob/56843bdd7c095fd209c3ea74e03b95eaa146b140/crates/kernel/src/pipeline/mod.rs#L5641-L5684) [Receipt binding](https://github.com/bijectionhq/bijection/blob/56843bdd7c095fd209c3ea74e03b95eaa146b140/crates/kernel/src/pipeline/mod.rs#L5858-L5898)

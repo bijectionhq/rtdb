@@ -1,9 +1,13 @@
 use std::process::{Child, Command, Stdio};
 
-use rtdb_db::WritePipeline;
+use journal_contract::{CheckpointInstallation, Epoch, JournalError, Lsn, WriterSessionId};
+use rtdb_db::{TimedOriginal, WritePipeline};
 use rtdb_node::DecisionClock;
 use rtdb_tx::transact::{Cell, DECISION_CLOCK_OFFER, FundingCommand, Op, Row, Transact};
-use rtdb_types::{EntityId, Interval, StructFields, TableRef, rtdb_v1::MAIN_BRANCH};
+use rtdb_types::{
+    EntityId, Interval, StructFields, TableRef, TimedJournalCutoff, Timestamp, rtdb_v1::MAIN_BRANCH,
+};
+use sha2::{Digest, Sha256};
 use stream_logkeeper::stream::consensus::{CLUSTER_VERSION_CURRENT, testing::LocalCluster};
 use tokio::sync::Mutex;
 
@@ -221,5 +225,73 @@ async fn commissioned_funded_dispatch_leaves_the_live_receiver_and_journal_untou
     drop(commissioned);
     drop(receiver);
     authority_keepers.shutdown().await.unwrap();
+    keepers.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn funded_acceptance_proof_survives_replacement_and_expiry_until_checkpoint_trim() {
+    const PRINCIPAL: &str = "urn:logkeeper:client:funded-proof-retention";
+    let mut keepers = LocalCluster::start_timed(&[PRINCIPAL]).await.unwrap();
+    let journal = Arc::new(
+        keepers
+            .journal(PRINCIPAL, &keepers.journal_config(1 << 20, 4096))
+            .unwrap()
+            .with_timed_original(keepers.timed_verifier(), Some(2048)),
+    );
+    journal
+        .finalize_version(CLUSTER_VERSION_CURRENT)
+        .await
+        .unwrap();
+    let stream = StreamId(Uuid::new_v4().as_u128());
+    journal.create_immutable(stream).await.unwrap();
+    let writer = journal
+        .seal_session(stream, Epoch(0), WriterSessionId(1))
+        .await
+        .unwrap();
+    let batch = ConsensusJournalBatch(journal.clone());
+    let payload = bytes::Bytes::from_static(b"exact funded stage");
+    let original = TimedOriginal {
+        stream,
+        epoch: writer.fence.writer_epoch,
+        at: Lsn(1),
+        payload_sha256: Sha256::digest(&payload).into(),
+        cutoff: TimedJournalCutoff::new(Timestamp(SystemClock.now().0 + 60_000_000), [9; 32]).unwrap(),
+    };
+    assert!(matches!(
+        batch.prove_timed_original(original).await,
+        Err(JournalError::Conflict { head: Lsn(0) })
+    ));
+    let accepted = batch
+        .append_session_timed_original(writer.fence, original, payload)
+        .await
+        .unwrap();
+    assert_eq!(accepted.original, original);
+    assert!(accepted.quorum_sync_at < original.cutoff.before());
+
+    keepers.shift_timed_clock(120_000_000);
+    let replacement = journal
+        .seal_session(stream, writer.fence.writer_epoch, WriterSessionId(2))
+        .await
+        .unwrap();
+    assert_eq!(replacement.sealed_head_lsn, original.at);
+    assert_eq!(batch.prove_timed_original(original).await.unwrap(), accepted);
+
+    let checkpoint = journal
+        .install_checkpoint(
+            replacement.fence,
+            CheckpointInstallation {
+                operation_id: 1,
+                checkpoint_lsn: Lsn(2),
+                covered_through_lsn: original.at,
+                record: bytes::Bytes::from_static(b"checkpoint covering funded stage"),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(checkpoint.logical_floor_lsn, Lsn(2));
+    assert!(matches!(
+        batch.prove_timed_original(original).await,
+        Err(JournalError::Trimmed { floor: Lsn(2) })
+    ));
     keepers.shutdown().await.unwrap();
 }
