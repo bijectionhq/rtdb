@@ -708,9 +708,15 @@ impl<'a> StaticArrowRow<'a> {
 }
 
 fn record_field(field: &arrow_schema::Field) -> bool {
-    plain_scalar_field(field) || canonical_float_field(field)
+    static_scalar_cell_field(field) || canonical_float_field(field)
         || rtdb_columnar::decimal_field_parameters(field).is_ok_and(|decimal| decimal.is_some())
         || matches!(field.data_type(), DataType::Struct(fields) if field.metadata().is_empty() && fields.iter().all(|field| record_field(field)))
+}
+
+fn static_scalar_cell_field(field: &arrow_schema::Field) -> bool {
+    plain_scalar_field(field) || (field.metadata().is_empty() && matches!(field.data_type(),
+        DataType::Date32 | DataType::Date64 | DataType::Time32(_) | DataType::Time64(_)
+        | DataType::Timestamp(..) | DataType::Duration(_)))
 }
 
 fn materialize<'a>(
@@ -772,7 +778,7 @@ fn project_static_cell<'a>(
         && let Expr::Struct(fields) = record.as_ref()
         && fields.iter().all(|(_, expr)| match expr {
             Expr::Parameter { index, .. } => binding.argument(*index).is_some_and(|(cell, _)| {
-                plain_scalar_field(cell.field) || canonical_float_field(cell.field)
+                static_scalar_cell_field(cell.field) || canonical_float_field(cell.field)
                     || rtdb_columnar::decimal_field_parameters(cell.field).is_ok_and(|decimal| decimal.is_some())
             }),
             Expr::Literal(value) => matches!(value, Value::Null | Value::Bool(_) | Value::I64(_) | Value::I32(_) | Value::Utf8(_) | Value::Decimal(_)),
@@ -784,7 +790,7 @@ fn project_static_cell<'a>(
         expr
     } else { expr };
     if let Some((cell, declared)) = binding.position(expr) {
-        if plain_scalar_field(cell.field) && !cell.field.data_type().is_unsigned_integer() {
+        if static_scalar_cell_field(cell.field) && !cell.field.data_type().is_unsigned_integer() {
             return Ok(DocumentCell::Arrow { cell, declared: Some(declared) });
         }
         if compatible_float_cell(cell, None)
@@ -1185,15 +1191,16 @@ mod patch_endpoint_tests {
 
 #[cfg(test)]
 #[test]
-fn static_patch_and_timed_put_encode_mixed_float_bindings_as_rows_would() {
+fn static_patch_and_timed_put_encode_mixed_float_and_temporal_bindings_as_rows_would() {
     let memory = MemoryBudget::new(1 << 25);
     let first = Value::FixedSizeList(vec![Value::F32(-0.0), Value::Null, Value::F32(f32::from_bits(0x7fc00001))].into());
     let last = Value::list(vec![Value::F64(2.0), Value::Null]);
     let start = Value::Utf8("2020-01-01T00:00:00Z".into());
     let decimal = |coefficient: i32| Value::Decimal(rtdb_types::DecimalValue::new(coefficient.to_be_bytes().to_vec(), 9, 2, 32).unwrap());
-    let rows = vec![vec![Value::I64(1), first, start.clone(), decimal(123)],
-        vec![Value::I64(2), Value::Null, start.clone(), decimal(456)],
-        vec![Value::I64(3), last, start, decimal(789)]];
+    let observed = |value| Value::Timestamp { value, unit: TimeUnit::Nanosecond, timezone: Some("America/New_York".into()) };
+    let rows = vec![vec![Value::I64(1), first, start.clone(), decimal(123), observed(-1999)],
+        vec![Value::I64(2), Value::Null, start.clone(), decimal(456), Value::Null],
+        vec![Value::I64(3), last, start, decimal(789), observed(9001)]];
     let page = |rows: &[Vec<Value>]| {
         let types = SqlArguments::from_rows(rows.to_vec(), &memory).unwrap();
         let fields = types.types().iter().enumerate().map(|(index, ty)| rtdb_columnar::to_field(&index.to_string(), ty).unwrap()).collect::<Vec<_>>();
@@ -1208,8 +1215,8 @@ fn static_patch_and_timed_put_encode_mixed_float_bindings_as_rows_would() {
     mixed.append(SqlArguments::from_rows(rows[2..].to_vec(), &memory).unwrap()).unwrap();
     let boxed = SqlArguments::from_rows(rows.clone(), &memory).unwrap();
     for sql in [
-        "PATCH INTO docs FOR VALID_TIME FROM $3 RECORDS {_id: $1, embedding: $2, amount: $4}",
-        "INSERT INTO docs (_id, embedding, _valid_from, amount) VALUES ($1, $2, $3, $4)",
+        "PATCH INTO docs FOR VALID_TIME FROM $3 RECORDS {_id: $1, embedding: $2, amount: $4, observed_at: $5}",
+        "INSERT INTO docs (_id, embedding, _valid_from, amount, observed_at) VALUES ($1, $2, $3, $4, $5)",
     ] {
         let submit = |args| prepare_submission(vec![TxOp::Sql { sql: sql.into(), args: Some(args) }],
             SubmitOptions::default(), "xtdb", &memory).unwrap();
@@ -1224,25 +1231,28 @@ fn static_patch_and_timed_put_encode_mixed_float_bindings_as_rows_would() {
         })));
         let plan = rtdb_sql::prepare_static(sql, &SubmissionCatalog("xtdb"),
             &rtdb_sql::PrepareOptions { parameter_types: mixed.execution_types().enumerate().collect(), ..Default::default() }).unwrap().unwrap();
-        let (index, _) = plan.input.schema().fields().iter().enumerate().find(|(_, field)| field.name == "embedding").unwrap();
         let (_, binding, source_types) = mixed.indexed_bound_rows_with_source_types().next().unwrap().unwrap();
         let BoundArgumentRow::Arrow { batch, row, types } = binding else { panic!("Arrow arguments"); };
         let args = rtdb_query::BoundParameters::from_arrow(batch.clone(), row, types.to_vec(), &memory).unwrap();
         let context = EvalContext { parameters: args.evaluator(), ..EvalContext::default() };
         materialize(&plan.input, Some(StaticArrowRow { batch: batch.batch(), row, types: source_types.unwrap() }), &context, &mut |projected| {
-            let DocumentCell::Arrow { cell, .. } = &projected[index] else { panic!("Expected a borrowed vector"); };
-            assert!(std::ptr::eq(cell.array, batch.batch().column(1).as_ref()));
+            for (name, source) in [("embedding", 1), ("observed_at", 4)] {
+                let index = plan.input.schema().fields().iter().position(|field| field.name == name).unwrap();
+                let DocumentCell::Arrow { cell, .. } = &projected[index] else { panic!("Expected a borrowed cell for {name}"); };
+                assert!(std::ptr::eq(cell.array, batch.batch().column(source).as_ref()));
+            }
             Ok(())
         }).unwrap();
     }
 }
 
 #[test]
-fn static_patch_records_selects_the_vector_child_of_a_bound_arrow_record() {
+fn static_patch_records_selects_temporal_and_vector_children_of_a_bound_arrow_record() {
     let memory = MemoryBudget::new(1 << 25);
     let value = Value::Struct(StructFields::from([
         ("_id".into(), Value::I64(1)),
         ("embedding".into(), Value::FixedSizeList(vec![Value::F32(-0.0), Value::Null].into())),
+        ("day".into(), Value::DateMilli(-1)),
     ]));
     let ty = value.logical_type();
     let field = rtdb_columnar::to_field("record", &ty).unwrap();

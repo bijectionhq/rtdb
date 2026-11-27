@@ -600,6 +600,7 @@ variant TxMessage : SourceMessage {
     -- A missing ID reports the original document in its error context.
     -- A static INSERT from compatible positional Arrow batches projects Arrow arguments into source document vectors in upload order, including supported lists and structs.
     -- Static INSERT and PATCH retain compatible primitive and floating-point Arrow argument cells while evaluating scalar operands and valid-time bounds.
+    -- A static document projection retains plain date, time, timestamp and duration cells with their stored units and zone labels.
     -- The projected INSERT document batch carries each row's evaluated validity bounds and keeps the original row order.
     -- Static RECORDS can select a compatible primitive cell or floating-point vector from a bound Arrow struct.
     -- The selected cells use the types of their own argument page when successive pages have different layouts.
