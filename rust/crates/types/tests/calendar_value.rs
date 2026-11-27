@@ -41,6 +41,7 @@ fn calendar_objects_and_admitted_dates_report_the_same_invalid_identifier_type()
         let object = CalendarDate::new(date, unit);
         for value in [Value::Date(object), object.object_value().unwrap(), object.expression_value().unwrap()] {
             let error = value.entity_id().unwrap_err();
+            assert!(error.is(rtdb_types::AnomalyKind::InvalidEntityId));
             assert_eq!(error.code, "xtdb/invalid-id");
             assert_eq!(error.message.as_deref(), Some("Invalid ID type: java.time.LocalDate"));
             assert_eq!(error.context["type"], "java.time.LocalDate");

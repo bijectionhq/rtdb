@@ -181,9 +181,9 @@ impl Value {
             Self::I32(value) => Ok(EntityId::Integer(i64::from(*value))),
             Self::I64(value) => Ok(EntityId::Integer(*value)),
             Self::Uuid(value) => Ok(EntityId::Uuid(*value)),
-            Self::Date(_) | Self::DateDay(_) | Self::DateMilli(_) => Err(Anomaly::incorrect("xtdb/invalid-id", "Invalid ID type: java.time.LocalDate")
+            Self::Date(_) | Self::DateDay(_) | Self::DateMilli(_) => Err(Anomaly::invalid_entity_id("Invalid ID type: java.time.LocalDate")
                 .with_context("type", "java.time.LocalDate".into())),
-            _ => Err(Anomaly::incorrect("xtdb/invalid-id", "An ID must be a string, keyword, signed integer, or UUID")),
+            _ => Err(Anomaly::invalid_entity_id("An ID must be a string, keyword, signed integer, or UUID")),
         }
     }
 

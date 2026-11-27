@@ -38,7 +38,7 @@ fn kind_state(kind: AnomalyKind) -> Option<&'static str> {
         AnomalyKind::NumericValueOutOfRange => Some("22003"),
         AnomalyKind::TableNotFound | AnomalyKind::OptimisticConflict | AnomalyKind::MissingObject | AnomalyKind::CorruptObject
         | AnomalyKind::InputOutOfOrder | AnomalyKind::GrammarRejected | AnomalyKind::BasisAhead | AnomalyKind::UnknownBasis
-        | AnomalyKind::NoWriter | AnomalyKind::ReadExpired => None,
+        | AnomalyKind::NoWriter | AnomalyKind::ReadExpired | AnomalyKind::InvalidEntityId => None,
     }
 }
 
@@ -67,6 +67,20 @@ mod tests {
     #[test]
     fn a_missing_table_keeps_upstreams_state_despite_its_kind() {
         assert_eq!(state(&rtdb_plan::table_not_found("Table not found: t")), "08P01");
+    }
+
+    #[test]
+    fn invalid_entity_ids_retain_their_sqlstate_and_wire_error() {
+        let error = rtdb_types::Value::DateDay(0).entity_id().unwrap_err();
+        let untyped = Anomaly { kind: None, ..error.clone() };
+        assert_eq!(classify(&error), ("08P01", false));
+
+        for format in [rtdb_types::PgType::Json, rtdb_types::PgType::JsonLd, rtdb_types::PgType::Transit] {
+            assert_eq!(rtdb_pg_codec::encode_error(&error, format).unwrap(), rtdb_pg_codec::encode_error(&untyped, format).unwrap());
+        }
+        let stored = rtdb_format::transit::encode_anomaly(&untyped).unwrap();
+        assert_eq!(rtdb_format::transit::encode_anomaly(&error).unwrap(), stored);
+        assert_eq!(rtdb_format::transit::decode_anomaly(&stored).unwrap(), error);
     }
 
     #[test]

@@ -95,7 +95,7 @@ mod tests {
         assert_eq!((&failed.table, failed.message), (&other, "error putting documents"));
         assert_eq!(failed.open_tx.unwrap().row_count(), 0, "a table the transaction has not written has an empty segment");
 
-        assert!(failed_operation(&buffer, &delete, &Anomaly::incorrect("xtdb/invalid-id", "Invalid ID")).is_none(),
+        assert!(failed_operation(&buffer, &delete, &Anomaly::invalid_entity_id("Invalid ID")).is_none(),
             "a caller's error is not crash-logged");
         let sql = Operation::Public(TxOp::Sql { sql: "INSERT INTO docs (_id) VALUES (3)".into(), args: None });
         assert!(failed_operation(&buffer, &sql, &fault).is_none(), "only a put, delete or erase is wrapped");

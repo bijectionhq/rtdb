@@ -258,7 +258,7 @@ pub fn try_entity_id_array<'a>(ids: impl IntoIterator<Item = Result<EntityIdRef<
 }
 
 pub(crate) fn invalid() -> Anomaly {
-    Anomaly::incorrect("xtdb/invalid-id", "An ID must be a string, keyword, signed integer, or UUID")
+    Anomaly::invalid_entity_id("An ID must be a string, keyword, signed integer, or UUID")
 }
 
 #[cfg(test)]
@@ -324,6 +324,23 @@ mod tests {
         ] {
             assert_eq!(id.iid(), id.into_owned().iid());
         }
+    }
+
+    #[test]
+    fn execution_owned_id_reads_distinguish_invalid_values_from_arrow_read_errors() {
+        use arrow_array::BooleanArray;
+        use rtdb_types::AnomalyKind;
+
+        let field = Field::new("_id", DataType::Boolean, true);
+        let values = BooleanArray::from(vec![Some(true), None]);
+        let invalid = crate::read_execution_owned_entity_id(&field, &values, 0).unwrap_err();
+        assert!(invalid.is(AnomalyKind::InvalidEntityId));
+        assert_eq!(invalid.code, "xtdb/invalid-id");
+        assert_eq!(crate::read_execution_owned_entity_id(&field, &values, 1).unwrap(), None);
+
+        let out_of_bounds = crate::read_execution_owned_entity_id(&field, &values, 2).unwrap_err();
+        assert_eq!(out_of_bounds.code, "rtdb/row-index");
+        assert!(!out_of_bounds.is(AnomalyKind::InvalidEntityId));
     }
 
     #[test]

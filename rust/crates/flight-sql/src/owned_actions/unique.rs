@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use rtdb_types::Interval;
+use rtdb_types::{AnomalyKind, Interval};
 
 use super::*;
 
@@ -197,7 +197,7 @@ fn unique_window_keys<'a>(
 ) -> Result<(EntityIdRef<'a>, Cow<'a, [u8]>), Status> {
     let id = match rtdb_columnar::read_execution_owned_entity_id(id_field, ids, row) {
         Ok(id) => id,
-        Err(error) if error.code == "xtdb/invalid-id" => None,
+        Err(error) if error.is(AnomalyKind::InvalidEntityId) => None,
         Err(error) => return Err(status(error)),
     };
     let key = if let Some(keys) = keys.as_any().downcast_ref::<BinaryArray>().filter(|_| key_field.metadata().is_empty()) {
@@ -268,6 +268,22 @@ mod tests {
         let fallback_error = unique_window_keys(&tagged_id, &ids, &key_field, &keys, 1).unwrap_err();
         assert_eq!(plain_error.code(), fallback_error.code());
         assert_eq!(plain_error.message(), fallback_error.message());
+    }
+
+    #[test]
+    fn unique_window_rejects_invalid_ids_and_preserves_cell_read_errors() {
+        let id_field = Field::new("_id", DataType::Boolean, false);
+        let ids = arrow_array::BooleanArray::from(vec![true]);
+        let key_field = Field::new("key", DataType::Binary, false);
+        let keys = BinaryArray::from_iter_values([b"key".as_slice()]);
+
+        let invalid_id = unique_window_keys(&id_field, &ids, &key_field, &keys, 0).unwrap_err();
+        assert_eq!(invalid_id.code(), tonic::Code::Internal);
+        assert_eq!(invalid_id.message(), "Owned history returned invalid or overlapping slices");
+
+        let read_error = unique_window_keys(&id_field, &ids, &key_field, &keys, 1).unwrap_err();
+        assert_eq!(read_error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(read_error.message(), "Cell index exceeds array length");
     }
 
     #[test]

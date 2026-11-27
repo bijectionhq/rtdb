@@ -178,7 +178,7 @@ impl EntityId {
 
     pub fn uuid(value: &str) -> Result<Self> {
         uuid::Uuid::parse_str(value).map(|value| Self::Uuid(*value.as_bytes()))
-            .map_err(|_| Anomaly::incorrect("xtdb/invalid-id", "Invalid UUID ID"))
+            .map_err(|_| Anomaly::invalid_entity_id("Invalid UUID ID"))
     }
 }
 

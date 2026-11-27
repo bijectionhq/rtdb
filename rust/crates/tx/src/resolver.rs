@@ -4932,7 +4932,7 @@ impl<'a> OutputColumn<'a> {
         }
     }
     fn iid(&self, row: usize) -> Result<Iid> {
-        let invalid = || Anomaly::incorrect("xtdb/invalid-id", "Mutation IID is null or invalid");
+        let invalid = || Anomaly::invalid_entity_id("Mutation IID is null or invalid");
         match self {
             Self::Iids(array) => if array.is_null(row) { Err(invalid()) } else { Iid::from_slice(array.value(row)) },
             column => match column.read(row)? { Value::FixedSizeBinary(bytes) => Iid::from_slice(&bytes), _ => Err(invalid()) },
@@ -6514,7 +6514,7 @@ mod tests {
         tx.append_arrow_deletes(&table, (0u8..64).map(|id| Ok(Iid([id; 16]))))?;
 
         let bad_page = (64u8..67).map(|id| {
-            if id == 65 { Err(Anomaly::incorrect("xtdb/invalid-id", "Invalid source ID")) }
+            if id == 65 { Err(Anomaly::invalid_entity_id("Invalid source ID")) }
             else { Ok(Iid([id; 16])) }
         });
         let hold = memory.reserve(memory.limit_bytes() - memory.used_bytes() - 1024)?;
@@ -6522,6 +6522,7 @@ mod tests {
         assert_eq!(error.code, "rtdb/memory-budget-exceeded");
         drop(hold);
         let error = tx.append_arrow_deletes(&table, bad_page).unwrap_err();
+        assert!(error.is(rtdb_types::AnomalyKind::InvalidEntityId));
         assert_eq!(error.code, "xtdb/invalid-id");
 
         let owned = OwnedRelation::new("items")?.table("owner");

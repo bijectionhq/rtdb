@@ -50,6 +50,7 @@ pub enum AnomalyKind {
     NoWriter,
     /// A read's lease or plaintext delivery grant expired before its answer was delivered.
     ReadExpired,
+    InvalidEntityId,
 }
 
 impl AnomalyKind {
@@ -84,6 +85,7 @@ impl AnomalyKind {
             "rtdb/unknown-basis" => Some(Self::UnknownBasis),
             "rtdb/no-writer" => Some(Self::NoWriter),
             "rtdb.storage/read-lease-expired" | "rtdb.storage/plaintext-delivery-expired" => Some(Self::ReadExpired),
+            "xtdb/invalid-id" => Some(Self::InvalidEntityId),
             _ => None,
         }
     }
@@ -157,6 +159,10 @@ impl Anomaly {
 
     pub fn incorrect(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self::new(AnomalyCategory::Incorrect, code, message)
+    }
+
+    pub fn invalid_entity_id(message: impl Into<String>) -> Self {
+        Self::incorrect("xtdb/invalid-id", message).with_kind(AnomalyKind::InvalidEntityId)
     }
 
     pub fn unsupported(code: impl Into<String>, message: impl Into<String>) -> Self {
@@ -258,6 +264,7 @@ mod tests {
         assert_eq!(AnomalyKind::from_wire_code("rtdb/unknown-basis"), Some(AnomalyKind::UnknownBasis));
         assert_eq!(AnomalyKind::from_wire_code("rtdb/no-writer"), Some(AnomalyKind::NoWriter));
         assert_eq!(AnomalyKind::from_wire_code("rtdb.storage/read-lease-expired"), Some(AnomalyKind::ReadExpired));
+        assert_eq!(AnomalyKind::from_wire_code("xtdb/invalid-id"), Some(AnomalyKind::InvalidEntityId));
         assert_eq!(AnomalyKind::from_wire_code("xtdb/sql-error"), None);
         assert_eq!(AnomalyKind::from_wire_code("xtdb.expression/overflow-error"), None);
     }
@@ -270,7 +277,7 @@ mod tests {
             (AnomalyKind::MissingObject, "missing-object"), (AnomalyKind::CorruptObject, "corrupt-object"),
             (AnomalyKind::InputOutOfOrder, "input-out-of-order"), (AnomalyKind::GrammarRejected, "grammar-rejected"),
             (AnomalyKind::BasisAhead, "basis-ahead"), (AnomalyKind::UnknownBasis, "unknown-basis"), (AnomalyKind::NoWriter, "no-writer"),
-            (AnomalyKind::ReadExpired, "read-expired")] {
+            (AnomalyKind::ReadExpired, "read-expired"), (AnomalyKind::InvalidEntityId, "invalid-entity-id")] {
             assert_eq!(serde_json::to_value(kind).unwrap(), name);
             assert_eq!(serde_json::from_value::<AnomalyKind>(name.into()).unwrap(), kind);
         }

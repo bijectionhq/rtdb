@@ -110,7 +110,7 @@ fn cell(batch: &RecordBatch, column: usize, row: usize) -> ArrowCell<'_> {
 fn cell_iid(cell: ArrowCell<'_>) -> Result<Iid> {
     let cell = cell.physical()?;
     if !cell.is_null()? && matches!(cell.field.data_type(), DataType::Date32 | DataType::Date64) {
-        return Err(Anomaly::incorrect("xtdb/invalid-id", "Invalid ID type: java.time.LocalDate")
+        return Err(Anomaly::invalid_entity_id("Invalid ID type: java.time.LocalDate")
             .with_context("type", "java.time.LocalDate".into()));
     }
     Ok(read_entity_id(cell.field, cell.array, cell.row)?.iid())

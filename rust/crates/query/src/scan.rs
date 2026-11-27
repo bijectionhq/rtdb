@@ -20,7 +20,7 @@ use rtdb_storage::{ObjectKey, cache::{BufferPool, CacheLease, Cached, View}};
 use rtdb_temporal::{HistoryResolver, ResolvedRow};
 use rtdb_trie::{PageSummary, PruningOptions, TemporalSummary, select_pages_from_iter, select_pages_with_scratch};
 use rtdb_types::{ARCHIVE_TX_FROM, ARCHIVE_TX_TO, HOSTED_RECEIPT_TX_ID, OWNED_EVENT_POSITION_COLUMN,
-    Anomaly, EntityId, EventHeader, EventOp, EventPosition, Iid, Interval, Result, TemporalBounds, Timestamp, Value};
+    Anomaly, AnomalyKind, EntityId, EventHeader, EventOp, EventPosition, Iid, Interval, Result, TemporalBounds, Timestamp, Value};
 
 use crate::columnar::{BatchCursor, Column};
 use crate::{CandidateIids, ConstantEvaluator, PreparedSearchQuery, QueryContext, accelerate::{ExecutionConstants, SearchQueries}, context::Execution, fragment::{ScanFragment, ScanFragmenter}, pages::{OwnedPage,PageBuilder}, scan_tasks::{PageRange,ScanTask,ScanTaskPlan}, invalid};
@@ -1592,7 +1592,7 @@ fn ranked_integer_id(column: &crate::columnar::Column, row: usize) -> Result<Opt
             match rtdb_columnar::read_execution_entity_id_as(logical, field, array, offset) {
                 Ok(Some(rtdb_columnar::EntityIdRef::Integer(id))) => Ok(Some(id)),
                 Ok(_) => Ok(None),
-                Err(error) if error.code == "xtdb/invalid-id" => Ok(None),
+                Err(error) if error.is(AnomalyKind::InvalidEntityId) => Ok(None),
                 Err(error) => Err(error),
             }
         }

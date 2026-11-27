@@ -1244,7 +1244,7 @@ impl EntityIds {
     pub fn new(ids: Vec<EntityId>, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let bytes = ids.iter().try_fold(ids.capacity().checked_mul(std::mem::size_of::<EntityId>()).ok_or_else(overflow)?, |bytes, id| {
             if matches!(id, EntityId::Binary(_)) {
-                return Err(Anomaly::incorrect("xtdb/invalid-id", "An ID must be a string, keyword, signed integer, or UUID"));
+                return Err(Anomaly::invalid_entity_id("An ID must be a string, keyword, signed integer, or UUID"));
             }
             let extra = id.retained_bytes();
             bytes.checked_add(extra).ok_or_else(overflow)
