@@ -403,7 +403,9 @@ impl PreparedSql {
         let cached = self.0.plan.lock().as_ref()
             .filter(|plan| self.binds_to(&plan.options, &context.timezone, argument_types, execution))
             .and_then(|plan| plan.plan.lookups_and_query());
-        if let Some((lookups, query)) = cached && lookups.replay(&context.catalog)? { return query.recharged(&context.memory); }
+        if let Some((lookups, query)) = cached && lookups.replay(&context.catalog)? && query.join_statistics_match(&context.catalog) {
+            return query.recharged(&context.memory);
+        }
         let options = self.bound_options(&context.timezone, argument_types, execution);
         if let Some(shared) = self.0.sharable.then(|| shared_plan(&self.0.source, context, &options)).transpose()?.flatten() {
             let query = shared.query.recharged(&context.memory)?;
@@ -414,7 +416,8 @@ impl PreparedSql {
         let budget = self.0._reservation.budget();
         let plan_in = |memory| {
             let recording = RecordingCatalog::new(&context.catalog);
-            let query = PreparedQuery::from_prepared(rtdb_sql::prepare_in(&self.0.source, &recording, &options, memory)?, memory)?;
+            let prepared = rtdb_sql::prepare_in(&self.0.source, &recording, &options, memory)?;
+            let query = PreparedQuery::from_prepared_in(prepared, &context.catalog, memory)?;
             Ok::<_, Anomaly>((query, recording.finish()))
         };
         let (kept, lookups) = match plan_in(budget) {
@@ -499,7 +502,7 @@ fn shared_plan(source: &str, context: &QueryContext, options: &PrepareOptions) -
         source: source.to_owned(), search_path: search_path.clone(), parameter_types: parameter_types.clone(),
         timezone: default_timezone.clone(), generate_series_end_exclusive: *generate_series_end_exclusive,
     };
-    if let Some(shared) = plans.get(&key) && shared.lookups.replay(&context.catalog)? { return Ok(Some(shared)); }
+    if let Some(shared) = plans.get(&key, &context.catalog)? { return Ok(Some(shared)); }
     let (lookups, query, inferred, notices) = match plan_for_sharing(source, context, options, &plans.entry_budget()) {
         Ok(Some(plan)) => plan,
         Ok(None) => return Ok(None),
@@ -792,6 +795,51 @@ mod shared_plan_tests {
         let replanned = PreparedSql::prepare(sql, &after, Default::default(), ResultSignaturePolicy::Exact).unwrap();
         assert_ne!(before.prepared_schema(), replanned.prepared_schema());
         assert_eq!(first_value(&replanned, &after).await, Value::Utf8("two".into()));
+    }
+
+    #[test]
+    fn prepared_and_shared_plans_refresh_join_order_when_estimates_change() {
+        fn first_scan(relation: &rtdb_plan::Relation) -> Option<&str> {
+            if let rtdb_plan::RelationNode::Scan(scan) = relation.node() {
+                return Some(&scan.table.name.table.schema);
+            }
+            relation.children().into_iter().find_map(|child| first_scan(child))
+        }
+
+        let memory = MemoryBudget::new(1 << 26);
+        let plans = Arc::new(SharedPlans::new(&MemoryBudget::new(1 << 30)));
+        let state = PartitionState::empty(Default::default()).unwrap();
+        put(&state, 1, "public", Value::I64(1), &memory);
+        put(&state, 2, "alt", Value::I64(1), &memory);
+        put(&state, 3, "alt", Value::I64(1), &memory);
+        let databases = [("xtdb", &state)];
+        let before = session(&databases, "xtdb", "UTC", &plans);
+        let sql = "SELECT a.v FROM public.docs a JOIN alt.docs b ON a.v = b.v";
+        let explain = format!("EXPLAIN {sql}");
+        let prepare = |sql: &str, context: &Arc<QueryContext>| {
+            PreparedSql::prepare(sql, context, Default::default(), ResultSignaturePolicy::Dynamic).unwrap()
+        };
+        let query = prepare(sql, &before);
+        let explained = prepare(&explain, &before);
+        for prepared in [&query, &explained] {
+            let original = prepared.bind(&before, &[], true).unwrap();
+            assert_eq!(first_scan(original.relation()), Some("public"));
+        }
+
+        put(&state, 4, "public", Value::I64(1), &memory);
+        put(&state, 5, "public", Value::I64(1), &memory);
+        let after = session(&databases, "xtdb", "UTC", &plans);
+        let new_session = prepare(sql, &after).bind(&after, &[], true).unwrap();
+        assert_eq!(first_scan(new_session.relation()), Some("alt"));
+        let reused = query.bind(&after, &[], true).unwrap();
+        assert!(Arc::ptr_eq(reused.relation(), new_session.relation()));
+        let rebound = explained.bind(&after, &[], true).unwrap();
+        assert_eq!(rebound.relation(), reused.relation());
+
+        put(&state, 6, "unrelated", Value::I64(1), &memory);
+        let unrelated = session(&databases, "xtdb", "UTC", &plans);
+        let unchanged = query.bind(&unrelated, &[], true).unwrap();
+        assert!(Arc::ptr_eq(unchanged.relation(), reused.relation()));
     }
 
     #[tokio::test]

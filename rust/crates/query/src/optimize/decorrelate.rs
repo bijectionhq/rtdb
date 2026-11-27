@@ -723,11 +723,20 @@ fn column_table(input: &Arc<Relation>, dependent: &Arc<Relation>, correlation: &
             let Some(unnested) = column_table(input, table, correlation, false, ids)? else { return Ok(None) };
             Ok(Some(Arc::new(unnested.filter(correlation.substitute(predicate.clone()))?)))
         }
-        RelationNode::Project { input: table, expressions } if !outer => {
-            if expressions.iter().any(|named| numbers_rows(&named.expr)) { return Ok(None); }
-            let Some(unnested) = column_table(input, table, correlation, false, ids)? else { return Ok(None) };
+        RelationNode::Project { input: table, expressions } | RelationNode::Rename { input: table, expressions, .. } => {
+            if expressions.iter().any(|named| numbers_rows(&named.expr)
+                || outer && !matches!(&named.expr, Expr::Column { .. }))
+            {
+                return Ok(None);
+            }
+            let Some(unnested) = column_table(input, table, correlation, outer, ids)? else { return Ok(None) };
             let expressions = input.schema().fields().iter().map(|field| NamedExpr { field: field.clone(), expr: field.expression() })
-                .chain(expressions.iter().map(|named| NamedExpr { field: named.field.clone(), expr: correlation.substitute(named.expr.clone()) })).collect();
+                .chain(expressions.iter().map(|named| {
+                    let mut field = named.field.clone();
+                    if outer { field.data_type = field.data_type.maybe(); }
+                    let expr = refresh_types(correlation.substitute(named.expr.clone()), unnested.schema());
+                    NamedExpr { field, expr }
+                })).collect();
             Ok(Some(Arc::new(unnested.project(expressions)?)))
         }
         RelationNode::ColumnTable { expr, element } => unnest(input, expr, element, None, outer, correlation, ids),
@@ -1153,6 +1162,12 @@ fn lift_at(relation: &Arc<Relation>, correlation: &Correlation<'_>, existence: b
         RelationNode::Unnest { input, expr, element, ordinality, outer } => {
             if correlation.in_expression(expr) { return Ok(None); }
             let Some(lifted) = lift(input, correlation, false)? else { return Ok(None) };
+            // Staging the list above a correlated filter can evaluate it on rows the filter used to exclude.
+            if lifted.filters.iter().any(|filter| correlation.in_expression(filter))
+                && (!infallible(expr) || lifted.computed.iter().any(|named| !infallible(&named.expr)))
+            {
+                return Ok(None);
+            }
             let Some((base, filters)) = settle(lifted, correlation)? else { return Ok(None) };
             let fields = base.schema().fields().iter().cloned().chain([element.clone()]).chain(ordinality.clone()).collect();
             let unnested = Relation::new(Schema::new(fields)?, RelationNode::Unnest {

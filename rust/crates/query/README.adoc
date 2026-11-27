@@ -364,8 +364,11 @@ These tests have not run.
 Full optimizer equivalence, including decorrelation, projection fusion, symbol allocation, and scan-column order, remains unqualified.
 Decorrelation ports the reference's rules 1, 2, 3, 4, 8 and 9, `apply-table-col->unnest`, `select-mark-join->semi-join` and selection pushdown past applies (to both inputs of an inner apply): uncorrelated applies of all relational, scalar, exists and mark modes become joins or shared marks; correlated applies and marks lift selections (spanning or one-sided) into joins or shared marks; left and single applies with computed dependent values keep them null over unmatched rows; cross applies peel selections (including HAVING) and projections via rules 3 and 4; ungrouped aggregates (except collecting/ordered aggregates) under scalar, single, inner and left applies follow rule 9's grouped left join (and outer unnest for correlated column tables), while grouped aggregates under inner applies follow rule 8.
 Its selection lifting also ports `pull-correlated-selection-up-towards-apply` past projections, inner joins, left/semi/anti join left inputs, right join right inputs, mark join inputs, unnests and groupings, along with `push-decorrelated-selection-down-past-unnest`, `-past-group-by`, `push-decorrelated-predicate-down-past-period-constructor` and `push-decorrelated-selections-with-fewer-variables-down`.
-Selections are lifted conjunct by conjunct, so their order never matters.
-Unlike the reference, which pulls no correlated selection above an unnest, a correlated selection beneath an unnest whose list reads no bound parameter moves above it, which keeps the same rows; and unlike the reference's LOJ RHS rule, correlated selections are not lifted from the null-supplying side of an outer join, which would drop unmatched rows.
+Selection lifting separates correlated conjuncts from independent predicates.
+Volatile predicates keep their original filter or join scope during pushdown and join ordering.
+RTDB can lift a correlated selection above an unnest when the list reads no bound parameter and the rewrite preserves the rows on which fallible expressions are evaluated.
+Left lateral unnests can pass through column projections while preserving unmatched input rows and their null ordinality.
+Correlated selections on the null-supplying side of an outer join remain in place to preserve unmatched rows.
 These shapes still run once per input row, and keep their applies:
 
 * a dependent plan with a volatile call, or an outer reference to an enclosing apply;

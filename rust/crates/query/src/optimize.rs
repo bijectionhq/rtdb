@@ -1,6 +1,9 @@
 use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
-use rtdb_plan::{BinaryOp, ColumnId, Expr, JoinKind, NamedExpr, Relation, RelationNode, Schema, WindowFunction};
+use rtdb_plan::{BinaryOp, ColumnId, Expr, JoinKind, NamedExpr, QualifiedTable, Relation, RelationNode, Schema, WindowFunction};
 use rtdb_types::Result;
+
+use crate::CatalogSnapshot;
+use rtdb_columnar::MemoryReservation;
 
 mod decorrelate;
 #[cfg(test)]
@@ -13,7 +16,7 @@ pub(crate) fn prepare(relation: Arc<Relation>) -> Result<Arc<Relation>> {
 }
 
 /// As `prepare`, then ordering each run of inner joins by the row counts `statistics` gives its inputs.
-pub(crate) fn prepare_with_statistics(relation: Arc<Relation>, statistics: &dyn TableStatistics) -> Result<Arc<Relation>> {
+pub(crate) fn prepare_with_statistics(relation: Arc<Relation>, statistics: &mut dyn TableStatistics) -> Result<Arc<Relation>> {
     order_joins(prepare(relation)?, statistics)
 }
 
@@ -32,20 +35,54 @@ fn decorrelates() -> bool { true }
 /// The row counts of the tables a plan scans, which order its joins.
 pub(crate) trait TableStatistics {
     /// The rows `table` holds, or `None` where nothing is known of it.
-    fn row_count(&self, table: &rtdb_plan::QualifiedTable) -> Option<u64>;
+    fn row_count(&mut self, table: &QualifiedTable) -> Result<Option<u64>>;
+}
+
+#[derive(Default)]
+pub(crate) struct JoinStatistics(BTreeMap<QualifiedTable, Option<u64>>);
+
+impl JoinStatistics {
+    pub(crate) fn into_recorded(self) -> Option<Arc<Self>> {
+        (!self.0.is_empty()).then(|| Arc::new(self))
+    }
+
+    pub(crate) fn matches(&self, catalog: &CatalogSnapshot) -> bool {
+        self.0.iter().all(|(table, count)| table_rows(catalog, table) == *count)
+    }
+}
+
+pub(crate) struct RecordStatistics<'a> {
+    pub(crate) catalog: &'a CatalogSnapshot,
+    pub(crate) counts: &'a mut JoinStatistics,
+    pub(crate) reservation: &'a mut MemoryReservation,
+}
+
+impl TableStatistics for RecordStatistics<'_> {
+    fn row_count(&mut self, table: &QualifiedTable) -> Result<Option<u64>> {
+        if let Some(count) = self.counts.0.get(table) {
+            return Ok(*count);
+        }
+        let bytes = self.reservation.bytes().checked_add(1024)
+            .and_then(|bytes| bytes.checked_add(table.database.len()))
+            .and_then(|bytes| bytes.checked_add(table.table.schema.len()))
+            .and_then(|bytes| bytes.checked_add(table.table.table.len()))
+            .ok_or_else(|| crate::invalid("plan-size", "Join statistics size exceeds addressable memory"))?;
+        self.reservation.grow_to(bytes)?;
+        let count = table_rows(self.catalog, table);
+        self.counts.0.insert(table.clone(), count);
+        Ok(count)
+    }
 }
 
 /// Each partition's flushed rows, from its table catalog, and its live rows; a partition that holds none of the table's
 /// rows counts as none, and only a table no partition knows is unknown.
-impl TableStatistics for crate::CatalogSnapshot {
-    fn row_count(&self, table: &rtdb_plan::QualifiedTable) -> Option<u64> {
-        let partitions = self.database(&table.database).ok()?.partitions.iter().map(|partition| {
-            let flushed = partition.table_catalog().metadata(&table.table).map(|meta| meta.row_count);
-            let live = partition.iter_segments(&table.table).map(|segment| i64::from(segment.row_count())).sum::<i64>();
-            (flushed, live)
-        });
-        partition_rows(partitions)
-    }
+fn table_rows(catalog: &CatalogSnapshot, table: &QualifiedTable) -> Option<u64> {
+    let partitions = catalog.database(&table.database).ok()?.partitions.iter().map(|partition| {
+        let flushed = partition.table_catalog().metadata(&table.table).map(|meta| meta.row_count);
+        let live = partition.iter_segments(&table.table).map(|segment| i64::from(segment.row_count())).sum::<i64>();
+        (flushed, live)
+    });
+    partition_rows(partitions)
 }
 
 /// The rows of a table from each partition's flushed rows, if its catalog knows the table, and its live rows.
@@ -69,28 +106,34 @@ fn an_empty_partition_adds_no_rows_rather_than_hiding_the_others() {
 
 /// The rows a join input holds as the reference's planner estimates them: a scan's table row count, carried through the
 /// operators that keep or only narrow their input's rows, and `None` elsewhere.
-fn estimated_rows(relation: &Relation, statistics: &dyn TableStatistics) -> Option<u64> {
+fn estimated_rows(relation: &Relation, statistics: &mut dyn TableStatistics) -> Result<Option<u64>> {
     match relation.node() {
         RelationNode::Scan(scan) => statistics.row_count(&scan.table.name),
-        RelationNode::Values { rows } => u64::try_from(rows.len()).ok(),
+        RelationNode::Values { rows } => Ok(u64::try_from(rows.len()).ok()),
         RelationNode::Project { input, .. } | RelationNode::Extend { input, .. } | RelationNode::Rename { input, .. } | RelationNode::Filter { input, .. } => estimated_rows(input, statistics),
         RelationNode::Let { body, .. } => estimated_rows(body, statistics),
         RelationNode::Reference { binding } => estimated_rows(&binding.relation, statistics),
-        _ => None,
+        _ => Ok(None),
     }
 }
 
 /// Reorders each run of inner joins in the plan, dependent plans included, by its inputs' estimated rows.
-fn order_joins(relation: Arc<Relation>, statistics: &dyn TableStatistics) -> Result<Arc<Relation>> {
+fn order_joins(relation: Arc<Relation>, statistics: &mut dyn TableStatistics) -> Result<Arc<Relation>> {
     stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || {
-        if inner(&relation) { return reorder_by(order_within_leaves(&relation, statistics)?, Some(statistics)); }
+        if reorderable_join(&relation) {
+            let ordered = order_within_leaves(&relation, statistics)?;
+            return reorder_by(ordered, Some(statistics));
+        }
         with_children(&relation, |child| order_joins(Arc::clone(child), statistics))
     })
 }
 
-fn order_within_leaves(relation: &Arc<Relation>, statistics: &dyn TableStatistics) -> Result<Arc<Relation>> {
-    let RelationNode::Join { left, right, kind: kind @ (JoinKind::Inner | JoinKind::Cross), condition } = relation.node() else {
+fn order_within_leaves(relation: &Arc<Relation>, statistics: &mut dyn TableStatistics) -> Result<Arc<Relation>> {
+    if !reorderable_join(relation) {
         return order_joins(Arc::clone(relation), statistics);
+    }
+    let RelationNode::Join { left, right, kind, condition } = relation.node() else {
+        unreachable!("A reorderable join has two inputs")
     };
     let (ordered_left, ordered_right) = (order_within_leaves(left, statistics)?, order_within_leaves(right, statistics)?);
     if Arc::ptr_eq(&ordered_left, left) && Arc::ptr_eq(&ordered_right, right) { return Ok(Arc::clone(relation)); }
@@ -592,6 +635,9 @@ fn select(input: Arc<Relation>, predicate: Expr) -> Result<Arc<Relation>> {
 }
 
 fn select_at(input: Arc<Relation>, predicate: Expr) -> Result<Arc<Relation>> {
+    if predicate.is_volatile() {
+        return Ok(Arc::new(input.filter(predicate)?));
+    }
     if matches!(predicate, Expr::Binary { op: BinaryOp::And, .. }) {
         let mut remaining = vec![predicate];
         let mut conjuncts = Vec::new();
@@ -632,8 +678,12 @@ fn select_at(input: Arc<Relation>, predicate: Expr) -> Result<Arc<Relation>> {
             };
             Ok(Arc::new(Relation::new(input.schema().clone(), node)?))
         }
+        RelationNode::Filter { predicate: existing, .. } if existing.is_volatile() => Ok(Arc::new(input.filter(predicate)?)),
         RelationNode::Filter { input: child, predicate: existing } => filter(select(Arc::clone(child), predicate)?, existing.clone()),
         RelationNode::Join { left, right, kind, condition } => {
+            if condition.as_ref().is_some_and(Expr::is_volatile) {
+                return filter(input, predicate);
+            }
             let within = |side: &Relation| columns.iter().all(|id| side.schema().get(*id).is_some());
             let (in_left, in_right) = (within(left), within(right));
             if in_left && matches!(kind, JoinKind::Inner | JoinKind::Cross | JoinKind::Left | JoinKind::Semi | JoinKind::Anti | JoinKind::Single) {
@@ -671,7 +721,10 @@ fn select_at(input: Arc<Relation>, predicate: Expr) -> Result<Arc<Relation>> {
     }
 }
 
-fn inner(relation: &Relation) -> bool { matches!(relation.node(), RelationNode::Join { kind: JoinKind::Inner | JoinKind::Cross, .. }) }
+fn reorderable_join(relation: &Relation) -> bool {
+    matches!(relation.node(), RelationNode::Join { kind: JoinKind::Inner | JoinKind::Cross, condition }
+        if !condition.as_ref().is_some_and(Expr::is_volatile))
+}
 
 /// Prunes a join's inputs to the columns its parent and condition read; the outermost of a run of inner and cross joins
 /// then reorders that run, as the reference's mega-join does.
@@ -682,19 +735,19 @@ fn join_tree(relation: &Arc<Relation>, required: &BTreeSet<ColumnId>, outermost:
     let mut side = |input: &Arc<Relation>| -> Result<Arc<Relation>> {
         let mut needed: BTreeSet<ColumnId> = input.schema().ids().intersection(&columns).copied().collect();
         if needed.is_empty() { needed.extend(input.schema().fields().first().map(|field| field.id)); }
-        if inner(relation) && inner(input) { join_tree(input, &needed, false, ids) } else { prune(Arc::clone(input), &needed, ids) }
+        if reorderable_join(relation) && reorderable_join(input) { join_tree(input, &needed, false, ids) } else { prune(Arc::clone(input), &needed, ids) }
     };
     let joined = join(side(left)?, side(right)?, *kind, condition.clone())?;
-    if outermost && inner(&joined) { reorder(joined) } else { Ok(joined) }
+    if outermost && reorderable_join(&joined) { reorder(joined) } else { Ok(joined) }
 }
 
 /// Reorders the join run a selection was promoted into, beneath at most one column-preserving wrapper.
 fn reorder_selected(relation: Arc<Relation>) -> Result<Arc<Relation>> {
-    if inner(&relation) { return reorder(relation); }
+    if reorderable_join(&relation) { return reorder(relation); }
     let node = match relation.node() {
-        RelationNode::Project { input, expressions } if inner(input) => RelationNode::Project { input: reorder(Arc::clone(input))?, expressions: expressions.clone() },
-        RelationNode::Extend { input, expressions } if inner(input) => RelationNode::Extend { input: reorder(Arc::clone(input))?, expressions: expressions.clone() },
-        RelationNode::Rename { input, prefix, expressions } if inner(input) => RelationNode::Rename { input: reorder(Arc::clone(input))?, prefix: prefix.clone(), expressions: expressions.clone() },
+        RelationNode::Project { input, expressions } if reorderable_join(input) => RelationNode::Project { input: reorder(Arc::clone(input))?, expressions: expressions.clone() },
+        RelationNode::Extend { input, expressions } if reorderable_join(input) => RelationNode::Extend { input: reorder(Arc::clone(input))?, expressions: expressions.clone() },
+        RelationNode::Rename { input, prefix, expressions } if reorderable_join(input) => RelationNode::Rename { input: reorder(Arc::clone(input))?, prefix: prefix.clone(), expressions: expressions.clone() },
         _ => return Ok(relation),
     };
     Ok(Arc::new(Relation::new(relation.schema().clone(), node)?))
@@ -707,10 +760,10 @@ fn reorder(relation: Arc<Relation>) -> Result<Arc<Relation>> { reorder_by(relati
 /// With `statistics`, the relations with an estimate come first, fewest rows first, and the rest after them in their
 /// written order, as the reference's mega-join sorts its inputs.
 /// Disconnected groups are crossed last, the final join taking the conditions none of them could.
-fn reorder_by(relation: Arc<Relation>, statistics: Option<&dyn TableStatistics>) -> Result<Arc<Relation>> {
+fn reorder_by(relation: Arc<Relation>, statistics: Option<&mut dyn TableStatistics>) -> Result<Arc<Relation>> {
     fn flatten(relation: &Arc<Relation>, leaves: &mut Vec<Arc<Relation>>, conditions: &mut Vec<Expr>) {
         match relation.node() {
-            RelationNode::Join { left, right, kind: JoinKind::Inner | JoinKind::Cross, condition } => {
+            RelationNode::Join { left, right, condition, .. } if reorderable_join(relation) => {
                 flatten(left, leaves, conditions);
                 flatten(right, leaves, conditions);
                 let mut remaining: Vec<Expr> = condition.iter().cloned().collect();
@@ -727,7 +780,7 @@ fn reorder_by(relation: Arc<Relation>, statistics: Option<&dyn TableStatistics>)
     match statistics {
         None => if leaves.len() < 3 { return Ok(relation); },
         Some(statistics) => {
-            let estimates: Vec<Option<u64>> = leaves.iter().map(|leaf| estimated_rows(leaf, statistics)).collect();
+            let estimates = leaves.iter().map(|leaf| estimated_rows(leaf, statistics)).collect::<Result<Vec<_>>>()?;
             let mut order: Vec<usize> = (0..leaves.len()).collect();
             order.sort_by_key(|&index| (estimates[index].is_none(), estimates[index]));
             if order.iter().enumerate().all(|(position, &index)| position == index) { return Ok(relation); }
@@ -776,6 +829,9 @@ fn reorder_by(relation: Arc<Relation>, statistics: Option<&dyn TableStatistics>)
 /// Rebuilds a join, moving each condition conjunct that reads only one input into that input where the join kind
 /// preserves its meaning: a preserved side's rows are emitted whether or not they satisfy the condition.
 fn join(left: Arc<Relation>, right: Arc<Relation>, kind: JoinKind, condition: Option<Expr>) -> Result<Arc<Relation>> {
+    if condition.as_ref().is_some_and(Expr::is_volatile) {
+        return Ok(Arc::new(Relation::join(left, right, kind, condition)?));
+    }
     let (push_left, push_right) = match kind {
         JoinKind::Inner | JoinKind::Semi => (true, true),
         JoinKind::Left | JoinKind::Anti | JoinKind::Single => (false, true),

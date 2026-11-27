@@ -89,8 +89,8 @@
 -- An inspection ticket is JSON of type `inspect` signed for its session.
 -- An XTDB run ticket for a session `SHOW` reads the redeeming connection's state.
 -- An XTDB run ticket for `SHOW CLOCK_TIME`, `SHOW SNAPSHOT_TOKEN`, `SHOW TIME ZONE` or `SHOW TRANSACTION ISOLATION LEVEL` runs at the captured basis.
--- A prepared statement reuses its cached plan when its parameter types, planning options, and observed catalog lookups agree.
--- Query statements other than EXPLAIN prepared in any session of a node share a plan, charged to the node, when their source, planning options and observed catalog lookups agree.
+-- A prepared statement reuses its cached plan when its parameter types, planning options, observed catalog lookups and observed join estimates agree.
+-- Query statements other than EXPLAIN prepared in any session of a node share a plan, charged to the node, when their source, planning options, observed catalog lookups and observed join estimates agree.
 -- Rebinding charges execution to the query budget while the statement retains its plan charge.
 -- Compatible list and struct parameters stay in Arrow through that projection.
 -- Arithmetic on compatible integer and floating-point parameter columns uses the Arrow projection kernel.

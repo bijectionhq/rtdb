@@ -5,7 +5,7 @@ use rtdb_columnar::MemoryReservation;
 use rtdb_plan::{CatalogLookups, SqlNotice};
 use rtdb_types::{Anomaly, LogicalType, MemoryBudget, Result};
 
-use crate::PreparedQuery;
+use crate::{CatalogSnapshot, PreparedQuery};
 use crate::shared_plan_entries::{admit, evict_oldest, find, touch};
 
 /// Everything besides its catalog lookups that planning a SQL statement reads.
@@ -37,7 +37,7 @@ pub struct SharedPlan {
 }
 
 /// Plans shared between a node's sessions.
-/// A plan is reused for an equal key only where its catalog lookups replay the same answers.
+/// A plan is reused for an equal key where its catalog lookups and join estimates still agree.
 pub struct SharedPlans {
     memory: Arc<MemoryBudget>,
     entry_bytes: usize,
@@ -63,12 +63,21 @@ impl SharedPlans {
         self.memory.scope_with_limit(self.entry_bytes)
     }
 
-    pub fn get(&self, key: &SharedPlanKey) -> Option<Arc<SharedPlan>> {
+    /// Returns a retained plan for this catalog snapshot and propagates catalog lookup errors.
+    pub fn get(&self, key: &SharedPlanKey, catalog: &CatalogSnapshot) -> Result<Option<Arc<SharedPlan>>> {
+        let plan = {
+            let entries = self.entries.lock();
+            let Some(index) = find(&entries, key) else { return Ok(None); };
+            Arc::clone(&entries[index].1)
+        };
+        if !plan.lookups.replay(catalog)? || !plan.query.join_statistics_match(catalog) {
+            return Ok(None);
+        }
         let mut entries = self.entries.lock();
-        let index = find(&entries, key)?;
-        let plan = Arc::clone(&entries[index].1);
-        touch(&mut entries, index);
-        Some(plan)
+        if let Some(index) = find(&entries, key) && Arc::ptr_eq(&entries[index].1, &plan) {
+            touch(&mut entries, index);
+        }
+        Ok(Some(plan))
     }
 
     /// Keeps `query`, planned in an `entry_budget`, evicting least recently used plans while the cache is full or its budget is short.

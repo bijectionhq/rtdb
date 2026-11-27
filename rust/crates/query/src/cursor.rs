@@ -10,6 +10,7 @@ use rtdb_types::{ListKind, LogicalType, Result, ScalarType, Value};
 use crate::{QueryContext, context::{Execution, cancelled}, invalid};
 use crate::parameters::BoundParameters;
 use crate::compiled::{CompiledQuery, Fact};
+use crate::optimize::{JoinStatistics, RecordStatistics};
 use crate::runtime_schema::{EmissionMode, EmittedRelation, RuntimeSchema, declared_field_types, declared_value_types};
 
 /// A row and the lease charging it; a lease may be shared by the rows of one page, so the row records its own size.
@@ -55,7 +56,7 @@ pub(crate) type BoxCursor = Box<dyn RowCursor>;
 
 #[derive(Clone)]
 pub struct PreparedQuery { relation: Arc<Relation>, settings: Arc<rtdb_plan::QuerySettings>, output: QueryOutput, required_parameter_count: usize, _plan_reservation: Option<Arc<MemoryReservation>>,
-    compiled: Arc<CompiledQuery> }
+    compiled: Arc<CompiledQuery>, join_statistics: Option<Arc<JoinStatistics>> }
 #[derive(Clone)]
 enum QueryOutput { Rows, Plan(Arc<crate::explain::ExplainPlan>), Analyze(Schema) }
 
@@ -89,14 +90,13 @@ impl PreparedQuery {
         relation.validate()?;
         let relation = crate::optimize::prepare(relation)?;
         let required_parameter_count = relation.parameter_count().max(settings.parameter_count());
-        Ok(Self { relation, settings: Arc::new(settings), output: QueryOutput::Rows, required_parameter_count, _plan_reservation: None, compiled: Arc::new(CompiledQuery::kept_by(None)) })
+        Ok(Self { relation, settings: Arc::new(settings), output: QueryOutput::Rows, required_parameter_count, _plan_reservation: None, compiled: Arc::new(CompiledQuery::kept_by(None)), join_statistics: None })
     }
     /// Retains query metadata as well as the relation; SQL callers should use this constructor.
     pub fn from_prepared(prepared: rtdb_plan::PreparedStatement, memory: &Arc<MemoryBudget>) -> Result<Self> {
         Self::from_prepared_with(prepared, None, memory)
     }
     /// As `from_prepared`, ordering inner joins by the row counts `catalog` holds for the tables they scan.
-    /// The plan, EXPLAIN's included, keeps that order for as long as it is retained.
     pub fn from_prepared_in(prepared: rtdb_plan::PreparedStatement, catalog: &crate::CatalogSnapshot, memory: &Arc<MemoryBudget>) -> Result<Self> {
         Self::from_prepared_with(prepared, Some(catalog), memory)
     }
@@ -107,9 +107,13 @@ impl PreparedQuery {
             rtdb_plan::Statement::Explain { relation, mode } => (relation, Some(mode)),
             _ => return Err(invalid("not-a-query", "Statement does not produce a query result")),
         };
-        let plan_reservation = reserve_plan(&relation, &prepared.settings, memory)?;
+        let mut plan_reservation = reserve_plan(&relation, &prepared.settings, memory)?;
+        let mut join_statistics = JoinStatistics::default();
         let relation = match catalog {
-            Some(catalog) => crate::optimize::prepare_with_statistics(relation, catalog)?,
+            Some(catalog) => {
+                let reservation = Arc::get_mut(&mut plan_reservation).expect("Preparing the plan owns its reservation");
+                crate::optimize::prepare_with_statistics(relation, &mut RecordStatistics { catalog, counts: &mut join_statistics, reservation })?
+            }
             None => crate::optimize::prepare(relation)?,
         };
         let output = match mode {
@@ -120,10 +124,16 @@ impl PreparedQuery {
         relation.validate()?;
         let required_parameter_count = lexical_parameters.max(relation.parameter_count()).max(prepared.settings.parameter_count());
         let compiled = Arc::new(CompiledQuery::kept_by(Some(Arc::clone(plan_reservation.budget()))));
-        Ok(Self { relation, settings: Arc::new(prepared.settings), output, required_parameter_count, _plan_reservation: Some(plan_reservation), compiled })
+        Ok(Self { relation, settings: Arc::new(prepared.settings), output, required_parameter_count, _plan_reservation: Some(plan_reservation), compiled,
+            join_statistics: join_statistics.into_recorded() })
     }
     pub fn schema(&self) -> &Schema { match &self.output { QueryOutput::Rows => self.relation.schema(), QueryOutput::Plan(plan) => &plan.schema, QueryOutput::Analyze(schema) => schema } }
     pub fn relation(&self) -> &Arc<Relation> { &self.relation }
+
+    /// Checks the table estimates used for join ordering against a candidate bind snapshot.
+    pub fn join_statistics_match(&self, catalog: &crate::CatalogSnapshot) -> bool {
+        self.join_statistics.as_ref().is_none_or(|stats| stats.matches(catalog))
+    }
 
     pub fn claim_footprint(&self, context: &QueryContext, arguments: &[Value]) -> rtdb_types::rtdb_v1::ClaimFootprint {
         use rtdb_types::rtdb_v1::ClaimFootprint;

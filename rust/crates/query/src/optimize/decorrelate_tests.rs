@@ -498,6 +498,51 @@ async fn a_scalar_subquery_of_several_rows_still_fails_its_cardinality_check() {
     assert_eq!(run(&rewritten).await, Err(violation));
 }
 
+#[tokio::test]
+async fn a_correlated_filter_below_unnest_guards_list_evaluation() {
+    let x = integer(72, "x");
+    let input = values(vec![x.clone()], &[&[Some(1)], &[Some(0)]]);
+    let filtered = select(input, equals(x.expression(), parameter(0, &customer_id())));
+    let list = Expr::List(vec![Expr::binary(BinaryOp::Divide, literal(1), x.expression())]);
+    let staged = typed(73, "_unnest_div", list.data_type());
+    let elem = integer(74, "v");
+    let input = Arc::new(filtered.extend(vec![NamedExpr { field: staged.clone(), expr: list }]).unwrap());
+    let dependent = Arc::new(Relation::new(
+        Schema::new(vec![x, staged.clone(), elem.clone()]).unwrap(),
+        RelationNode::Unnest { input, expr: staged.expression(), element: elem.clone(), ordinality: None, outer: false },
+    ).unwrap());
+    let relation = apply(&customers(), keep(dependent, &[elem]), by_customer(), ApplyKind::Left, None);
+    let (correlated, rewritten) = both_ways(&relation);
+    assert_eq!(applies(rewritten.relation()), 1);
+    let expected = run(&correlated).await.unwrap();
+    assert_eq!(expected.len(), 6);
+    assert_eq!(run(&rewritten).await.unwrap(), expected);
+}
+
+#[tokio::test]
+async fn left_apply_unnests_through_a_column_projection_and_preserves_unmatched_rows() {
+    let relation = unnested(true, None);
+    let RelationNode::Apply { input, dependent, arguments, .. } = relation.node() else { panic!("Expected a lateral unnest"); };
+    let [element, ordinal] = dependent.schema().fields() else { panic!("Expected element and ordinality"); };
+    let columns = vec![
+        NamedExpr { field: typed(43, "position", ordinal.data_type.clone()), expr: ordinal.expression() },
+        NamedExpr { field: typed(44, "value", element.data_type.clone()), expr: element.expression() },
+    ];
+    let schema = Schema::new(columns.iter().map(|named| named.field.clone()).collect()).unwrap();
+    let project = RelationNode::Project { input: Arc::clone(dependent), expressions: columns.clone() };
+    let rename = RelationNode::Rename { input: Arc::clone(dependent), prefix: "tag".into(), expressions: columns };
+    for node in [project, rename] {
+        let projected = Arc::new(Relation::new(schema.clone(), node).unwrap());
+        let relation = apply(input, projected, arguments.clone(), ApplyKind::Left, None);
+        let (correlated, rewritten) = both_ways(&relation);
+        assert_eq!(applies(rewritten.relation()), 0);
+        assert_eq!(rewritten.relation().schema(), relation.schema());
+        let expected = run(&correlated).await.unwrap();
+        assert_eq!(expected.len(), 8);
+        assert_eq!(run(&rewritten).await.unwrap(), expected);
+    }
+}
+
 #[test]
 fn a_selected_exists_becomes_a_semi_join_and_its_negation_an_anti_join() {
     let semi = prepare(exists(one(customer_orders()), by_customer(), false, None)).unwrap();
@@ -661,9 +706,30 @@ async fn inner_join_runs_return_the_same_rows_ordered_by_row_counts() {
 }
 
 #[test]
+fn join_reordering_keeps_volatile_predicates_at_their_original_cardinality() {
+    let [a, b, c] = [20, 21, 22].map(|id| integer(id, &format!("c{id}")));
+    let a_rows = values(vec![a.clone()], &[&[Some(1)], &[Some(2)], &[Some(3)], &[Some(4)]]);
+    let b_rows = values(vec![b.clone()], &[&[Some(1)], &[Some(2)], &[Some(3)]]);
+    let c_rows = values(vec![c.clone()], &[&[Some(1)], &[Some(2)]]);
+    let random = Expr::Call { name: "random".into(), args: Vec::new(), return_type: LogicalType::Scalar(ScalarType::F64) };
+    let condition = Expr::binary(BinaryOp::And, equals(a.expression(), b.expression()),
+        Expr::binary(BinaryOp::Gt, random.clone(), Expr::Literal(Value::F64(0.5))));
+    let first = Arc::new(Relation::join(a_rows, b_rows, JoinKind::Inner, Some(condition.clone())).unwrap());
+    let joined = Arc::new(Relation::join(first, c_rows, JoinKind::Cross, None).unwrap());
+    let filter = Expr::binary(BinaryOp::Gt, random, a.expression());
+    let relation = select(joined, filter.clone());
+    let context = context();
+    let query = PreparedQuery::from_prepared_in(statement(rtdb_plan::Statement::Query(relation)), &context.catalog, &context.memory).unwrap();
+    let RelationNode::Filter { input, predicate } = query.relation().node() else { panic!("Expected a selection above the join run"); };
+    assert_eq!(predicate, &filter);
+    assert_eq!(count_nodes(input, &|node| matches!(node, RelationNode::Join { left, right, condition: Some(predicate), .. }
+        if predicate == &condition && left.schema().fields() == [a.clone()] && right.schema().fields() == [b.clone()])), 1);
+}
+
+#[test]
 fn relations_without_estimates_keep_the_written_order() {
     struct Unknown;
-    impl TableStatistics for Unknown { fn row_count(&self, _: &rtdb_plan::QualifiedTable) -> Option<u64> { None } }
+    impl TableStatistics for Unknown { fn row_count(&mut self, _: &QualifiedTable) -> Result<Option<u64>> { Ok(None) } }
     let [a, b, c] = [0, 1, 2].map(|id| integer(id, &format!("c{id}")));
     let scan = |field: &Field| {
         use rtdb_plan::{QualifiedTable, Scan, TableBinding, TemporalFilter};
@@ -674,7 +740,7 @@ fn relations_without_estimates_keep_the_written_order() {
     };
     let crossed = Arc::new(Relation::join(Arc::new(Relation::join(scan(&a), scan(&b), JoinKind::Cross, None).unwrap()), scan(&c), JoinKind::Cross, None).unwrap());
     let relation = select(crossed, Expr::binary(BinaryOp::And, equals(a.expression(), b.expression()), equals(b.expression(), c.expression())));
-    assert_eq!(prepare_with_statistics(Arc::clone(&relation), &Unknown).unwrap(), prepare(relation).unwrap());
+    assert_eq!(prepare_with_statistics(Arc::clone(&relation), &mut Unknown).unwrap(), prepare(relation).unwrap());
 }
 
 #[test]
