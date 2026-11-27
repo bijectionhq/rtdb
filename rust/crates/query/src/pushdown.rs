@@ -1,9 +1,9 @@
-use std::{collections::BTreeSet, sync::Arc};
+use std::{borrow::Cow, collections::BTreeSet, sync::Arc};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{bloom::BloomFilter, transit::{TransitValue, encode_msgpack}};
 use rtdb_plan::{BinaryOp, ColumnId, Expr, Field, NamedExpr, Relation, RelationNode, Schema};
 use rtdb_types::{EntityId, Iid, LogicalType, Result, ScalarType, Value};
-use crate::{columnar::ColumnBatch, context::Execution, invalid, scalar_key::ScalarKey, set_keys::{BloomKey, direct_bloom_hashes}};
+use crate::{columnar::ColumnBatch, context::Execution, invalid, scalar_key::ScalarKey, set_keys::{BloomKey, borrowed_key_value, direct_bloom_hashes}};
 
 struct IidEntries {
     values: BTreeSet<Iid>,
@@ -396,9 +396,15 @@ impl PushdownBuilder {
                 continue;
             }
             let scope = rtdb_expr::EvaluationScope::new(memory)?;
-            let value = column.expression_value(row, true, Some(&scope))?;
+            let value = match borrowed_key_value(column, row, true) {
+                Some(value) => {
+                    scope.reserve(column.bound(row)?)?;
+                    Cow::Borrowed(value)
+                }
+                None => Cow::Owned(column.expression_value(row, true, Some(&scope))?),
+            };
             key.add(BloomFilter::value_positions(&value)?);
-            if !matches!(value, Value::Null | Value::Undefined)
+            if !matches!(value.as_ref(), Value::Null | Value::Undefined)
                 && let Some(iids) = &mut key.filter.iids && !iids.insert(&value, &scope, memory)? {
                 key.filter.iids = None;
             }

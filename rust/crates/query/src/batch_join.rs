@@ -31,7 +31,7 @@ use crate::operators::{BatchOutput, build_batch_input};
 use crate::pushdown::{PushdownBuilder, Pushdowns};
 use crate::runtime_schema::EmittedRelation;
 use crate::scalar_key::{ScalarColumn, ScalarKey};
-use crate::set_keys::{JoinHash, Key, KeyColumns, TypedKeys, direct_key_equal};
+use crate::set_keys::{JoinHash, Key, KeyColumns, TypedKeys, borrowed_key_value, direct_key_equal};
 
 /// For each equality, whether its first operand is the build side's key.
 pub(crate) fn key_order(layout: &JoinLayout) -> Option<Vec<bool>> {
@@ -1149,13 +1149,18 @@ impl Spec {
                 let left_bytes = left.bound(build_row)?;
                 let cached = probe_key.and_then(|key| key.cached(index));
                 let right_bytes = if cached.is_some() { 0 } else { right.bound(probe_row)? };
+                let build_value = borrowed_key_value(left, build_row, self.projected[0]);
+                let probe_value = cached.or_else(|| borrowed_key_value(right, probe_row, self.projected[1]));
                 let _scratch = memory.reserve(left_bytes.checked_add(right_bytes).ok_or_else(size_error)?)?;
-                let left = self.cell(left, build_row, 0)?;
-                let right = match cached {
+                let left = match build_value {
+                    Some(value) => Cow::Borrowed(value),
+                    None => Cow::Owned(self.cell(left, build_row, 0)?),
+                };
+                let right = match probe_value {
                     Some(value) => Cow::Borrowed(value),
                     None => Cow::Owned(self.cell(right, probe_row, 1)?),
                 };
-                let (left, right) = if build_first { (&left, right.as_ref()) } else { (right.as_ref(), &left) };
+                let (left, right) = if build_first { (left.as_ref(), right.as_ref()) } else { (right.as_ref(), left.as_ref()) };
                 let left_null = matches!(left, Value::Null | Value::Undefined);
                 let right_null = matches!(right, Value::Null | Value::Undefined);
                 if self.preserves_probe() && (left_null || right_null) {

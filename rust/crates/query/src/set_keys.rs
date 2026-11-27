@@ -1,6 +1,6 @@
 use std::{borrow::Cow, collections::HashMap, convert::Infallible, mem::size_of, ops::Range, sync::Arc};
 
-use arrow_array::{Array, FixedSizeListArray, ListArray, cast::AsArray, types::{TimestampSecondType, TimestampMillisecondType, TimestampMicrosecondType, TimestampNanosecondType}};
+use arrow_array::{Array, FixedSizeListArray, ListArray, cast::AsArray, types::{Date32Type, Date64Type, TimestampSecondType, TimestampMillisecondType, TimestampMicrosecondType, TimestampNanosecondType}};
 use arrow_buffer::BooleanBufferBuilder;
 use arrow_schema::DataType;
 use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation};
@@ -151,7 +151,7 @@ impl TypedKeys<'_> {
             typed: Some(&self.readers),
             values: Vec::new(),
             has_uri: false,
-            index_timestamps: false,
+            index_temporals: false,
             _reservation: None,
         }
     }
@@ -165,9 +165,9 @@ pub(crate) struct Key<'a> {
     source: ArrowKey<'a>,
     positions: Option<&'a [usize]>,
     typed: Option<&'a [TypedKeyColumn<'a>]>,
-    values: Vec<(usize, Value)>,
+    values: Vec<(usize, Cow<'a, Value>)>,
     has_uri: bool,
-    index_timestamps: bool,
+    index_temporals: bool,
     _reservation: Option<Arc<MemoryReservation>>,
 }
 
@@ -262,6 +262,7 @@ enum DirectKey<'a> {
     ScalarList(PlainListKey<'a>),
     FloatList(FloatVector<'a>),
     Timestamp(TimestampKey),
+    Date(i64),
 }
 
 #[derive(Clone, Copy)]
@@ -304,11 +305,16 @@ impl TimestampKey {
 }
 
 impl<'a> DirectKey<'a> {
-    fn read_with_timestamps(column: &'a Column, row: usize, index_timestamps: bool) -> Option<Self> {
+    fn read_with_temporals(column: &'a Column, row: usize, index_temporals: bool) -> Option<Self> {
         if let Column::Values(values) = column {
             let value = values.get(row)?;
-            if index_timestamps && let Some(timestamp) = TimestampKey::from_value(value) {
-                return Some(Self::Timestamp(timestamp));
+            if index_temporals {
+                if let Some(timestamp) = TimestampKey::from_value(value) {
+                    return Some(Self::Timestamp(timestamp));
+                }
+                if matches!(value, Value::DateDay(_) | Value::DateMilli(_)) {
+                    return value.date_days().map(Self::Date);
+                }
             }
             return Self::from_value(value);
         }
@@ -321,7 +327,7 @@ impl<'a> DirectKey<'a> {
         }
         let cell = ArrowCell { array, field, row };
         if let Some(logical) = logical {
-            if index_timestamps && let Some(key) = TimestampKey::arrow(cell, logical) {
+            if index_temporals && let Some(key) = TimestampKey::arrow(cell, logical) {
                 return Some(key);
             }
             if let Some(list) = PlainListKey::arrow(cell, logical) {
@@ -333,8 +339,17 @@ impl<'a> DirectKey<'a> {
             return Some(Self::Scalar(ScalarKey::Null));
         }
         if let Some(key) = ScalarKey::read_resolved(cell, &logical) { return Some(Self::Scalar(key)); }
-        if index_timestamps && let Some(key) = TimestampKey::arrow(cell, &logical) {
-            return Some(key);
+        if index_temporals {
+            if let Some(key) = TimestampKey::arrow(cell, &logical) {
+                return Some(key);
+            }
+            match (nonnull(&logical), cell.field.data_type()) {
+                (LogicalType::Scalar(ScalarType::DateDay), DataType::Date32) =>
+                    return Some(Self::Date(i64::from(cell.array.as_primitive::<Date32Type>().value(cell.row)))),
+                (LogicalType::Scalar(ScalarType::DateMilli), DataType::Date64) =>
+                    return Some(Self::Date(cell.array.as_primitive::<Date64Type>().value(cell.row).div_euclid(rtdb_types::java_date::MILLIS_PER_DAY))),
+                _ => {}
+            }
         }
         if let Some(list) = PlainListKey::arrow(cell, &logical) {
             return Some(Self::ScalarList(list));
@@ -360,6 +375,8 @@ impl<'a> DirectKey<'a> {
                     vector.float_component(row).map_or(ScalarKey::Null, ScalarKey::Float)
                 })),
             (Self::ScalarList(_), _) | (_, Self::ScalarList(_)) => None,
+            (Self::Date(left), Self::Date(right)) => Some(Some(left == right)),
+            (Self::Date(_), _) | (_, Self::Date(_)) => None,
             (Self::Timestamp(left), Self::Timestamp(right)) if left.unit == right.unit && left.zoned == right.zoned =>
                 Some(Some(left.value == right.value)),
             (Self::Timestamp(_), Self::FloatList(_)) | (Self::FloatList(_), Self::Timestamp(_)) => Some(Some(false)),
@@ -415,6 +432,7 @@ impl<'a> DirectKey<'a> {
             Self::Timestamp(key) => local_micros_equality_hash(
                 rtdb_expr::local_timestamp_micros(key.value, key.unit, key.zoned, timezone),
             ),
+            Self::Date(days) => local_micros_equality_hash(days.checked_mul(86_400_000_000)),
             _ => self.hash() as u32,
         }
     }
@@ -423,6 +441,7 @@ impl<'a> DirectKey<'a> {
         match self {
             Self::Scalar(key) => hash_key(key) as i32,
             Self::Timestamp(key) => hash_key(ScalarKey::Float(key.value as f64 / key.unit.units_per_second() as f64)) as i32,
+            Self::Date(days) => hash_key(ScalarKey::Float(days.wrapping_mul(86_400) as f64)) as i32,
             Self::ScalarList(list) => list.hash(hash_key),
             Self::FloatList(vector) => rtdb_columnar::hash_float_components(
                 vector.range.clone().map(|index| vector.float_component(index)), 0, hash_bytes,
@@ -432,7 +451,7 @@ impl<'a> DirectKey<'a> {
 }
 
 pub(crate) fn direct_key_equal(left: &Column, l: usize, right: &Column, r: usize, nulls_equal: bool) -> Option<Option<bool>> {
-    DirectKey::read_with_timestamps(left, l, true)?.equal(DirectKey::read_with_timestamps(right, r, true)?, nulls_equal)
+    DirectKey::read_with_temporals(left, l, true)?.equal(DirectKey::read_with_temporals(right, r, true)?, nulls_equal)
 }
 
 pub(crate) struct BloomKey<'a> {
@@ -442,30 +461,40 @@ pub(crate) struct BloomKey<'a> {
 }
 
 pub(crate) fn direct_bloom_hashes(column: &Column, row: usize) -> Option<BloomKey<'_>> {
-    let key = DirectKey::read_with_timestamps(column, row, true)?;
+    let key = DirectKey::read_with_temporals(column, row, true)?;
     let scalar = match key { DirectKey::Scalar(scalar) => Some(scalar), _ => None };
-    let retain_iid_limit = matches!(key, DirectKey::ScalarList(_) | DirectKey::Timestamp(_));
+    let retain_iid_limit = matches!(key, DirectKey::ScalarList(_) | DirectKey::Timestamp(_) | DirectKey::Date(_));
     let hashes = (key.clone().hash(), key.hash_with(ScalarKey::murmur3, rtdb_columnar::murmur3_32));
     Some(BloomKey { hashes, scalar, retain_iid_limit })
 }
 
+pub(crate) fn borrowed_key_value(column: &Column, row: usize, projected: bool) -> Option<&Value> {
+    let Column::Values(values) = column else { return None; };
+    let value = values.get(row)?;
+    (!projected || !value.has_calendar_object()).then_some(value)
+}
+
 impl<'a> Key<'a> {
-    fn read(source: ArrowKey<'a>, positions: Option<&'a [usize]>, index_timestamps: bool, context: &QueryContext) -> Result<Self> {
-        let mut key = Self { source, positions, typed: None, values: Vec::new(), has_uri: false, index_timestamps, _reservation: None };
+    fn read(source: ArrowKey<'a>, positions: Option<&'a [usize]>, index_temporals: bool, context: &QueryContext) -> Result<Self> {
+        let mut key = Self { source, positions, typed: None, values: Vec::new(), has_uri: false, index_temporals, _reservation: None };
         let mut bound = 256usize;
         for index in 0..key.len() {
             let column = key.column(index);
-            if let Some(direct) = DirectKey::read_with_timestamps(column, source.row, index_timestamps) {
+            if let Some(direct) = DirectKey::read_with_temporals(column, source.row, index_temporals) {
                 key.has_uri |= matches!(direct, DirectKey::Scalar(ScalarKey::Uri(_)));
             } else {
+                let borrowed = borrowed_key_value(column, source.row, source.projected);
                 bound = bound.checked_add(column.bound(source.row)?)
-                    .and_then(|bound| bound.checked_add(4 * size_of::<(usize, Value)>()))
+                    .and_then(|bound| bound.checked_add(4 * size_of::<(usize, Cow<'_, Value>)>()))
                     .ok_or_else(size_error)?;
                 match &mut key._reservation {
                     Some(reservation) => Arc::get_mut(reservation).expect("A key owns its scratch").grow_to(bound)?,
                     None => key._reservation = Some(context.memory.reserve(bound)?),
                 }
-                let value = key.read_value(index)?;
+                let value = match borrowed {
+                    Some(value) => Cow::Borrowed(value),
+                    None => Cow::Owned(key.read_value(index)?),
+                };
                 key.has_uri |= has_uri(&value);
                 key.values.push((index, value));
             }
@@ -494,7 +523,7 @@ impl<'a> Key<'a> {
 
     pub(crate) fn cached(&self, index: usize) -> Option<&Value> {
         let position = self.values.binary_search_by_key(&index, |(column, _)| *column).ok()?;
-        Some(&self.values[position].1)
+        Some(self.values[position].1.as_ref())
     }
 
     fn direct(&self, index: usize) -> Option<DirectKey<'_>> {
@@ -503,16 +532,16 @@ impl<'a> Key<'a> {
         }
         match self.cached(index) {
             Some(value) => DirectKey::from_value(value),
-            None => DirectKey::read_with_timestamps(self.column(index), self.source.row, self.index_timestamps),
+            None => DirectKey::read_with_temporals(self.column(index), self.source.row, self.index_temporals),
         }
     }
 
     fn bind(
         columns: impl Into<KeyColumns<'a>>, row: usize, projected: bool, context: &QueryContext,
-        hashing: KeyHash, index_timestamps: bool,
+        hashing: KeyHash, index_temporals: bool,
     ) -> Result<(u32, Self)> {
         let KeyColumns { batch, positions } = columns.into();
-        let key = Self::read(ArrowKey { columns: &batch.columns, row, projected }, positions, index_timestamps, context)?;
+        let key = Self::read(ArrowKey { columns: &batch.columns, row, projected }, positions, index_temporals, context)?;
         let hash = match hashing {
             KeyHash::Set => (0..key.len()).fold(0, |hash, index| {
                 let cell = match key.cached(index) {
@@ -560,7 +589,7 @@ impl<'a> Key<'a> {
 
     fn equals(&self, other: ArrowKey<'_>, positions: Option<&[usize]>, context: &QueryContext) -> Result<bool> {
         if self.len() != positions.map_or(other.columns.len(), <[usize]>::len) { return Ok(false); }
-        let right = Key::read(other, positions, self.index_timestamps, context)?;
+        let right = Key::read(other, positions, self.index_temporals, context)?;
         // URI preflight can raise a hash error in a later cell even if an earlier cell compares unequal.
         if self.has_uri || right.has_uri {
             let _scratch = context.memory.reserve(4096)?;
@@ -581,12 +610,13 @@ impl<'a> Key<'a> {
             _ => None,
         };
         if let Some(equal) = direct { return Ok(equal); }
-        let bound = |key: &Key<'_>| -> Result<usize> {
-            if key.cached(index).is_some() { Ok(0) } else { key.column(index).bound(key.source.row) }
-        };
-        let _scratch = context.memory.reserve(bound(self)?.checked_add(bound(right)?).ok_or_else(size_error)?)?;
-        let l = if let Some(value) = self.cached(index) { Cow::Borrowed(value) } else { Cow::Owned(self.read_value(index)?) };
-        let r = if let Some(value) = right.cached(index) { Cow::Borrowed(value) } else { Cow::Owned(right.read_value(index)?) };
+        let l = self.cached(index).or_else(|| borrowed_key_value(self.column(index), self.source.row, self.source.projected));
+        let r = right.cached(index).or_else(|| borrowed_key_value(right.column(index), right.source.row, right.source.projected));
+        let left_bytes = if self.cached(index).is_some() { 0 } else { self.column(index).bound(self.source.row)? };
+        let right_bytes = if right.cached(index).is_some() { 0 } else { right.column(index).bound(right.source.row)? };
+        let _scratch = context.memory.reserve(left_bytes.checked_add(right_bytes).ok_or_else(size_error)?)?;
+        let l = match l { Some(value) => Cow::Borrowed(value), None => Cow::Owned(self.read_value(index)?) };
+        let r = match r { Some(value) => Cow::Borrowed(value), None => Cow::Owned(right.read_value(index)?) };
         let local;
         let scope = match scope {
             Some(scope) => scope,
@@ -727,13 +757,14 @@ enum Decoded {
 
 enum OwnedScalar {
     Null, Bool(bool), Signed(i64), Float(f64), Text(Box<str>), Keyword(Box<str>),
-    Bytes(Box<[u8]>), FixedBytes(Box<[u8]>), Uuid([u8; 16]), Reference(i32), Timestamp(TimestampKey),
+    Bytes(Box<[u8]>), FixedBytes(Box<[u8]>), Uuid([u8; 16]), Reference(i32), Timestamp(TimestampKey), Date(i64),
 }
 
 impl OwnedScalar {
     fn of(key: DirectKey<'_>) -> Self {
         match key {
             DirectKey::Timestamp(key) => Self::Timestamp(key),
+            DirectKey::Date(days) => Self::Date(days),
             DirectKey::Scalar(key) => match key {
                 ScalarKey::Null => Self::Null,
                 ScalarKey::Bool(value) => Self::Bool(value),
@@ -764,6 +795,7 @@ impl OwnedScalar {
             Self::Uuid(value) => ScalarKey::Uuid(value),
             Self::Reference(value) => ScalarKey::Reference(*value),
             Self::Timestamp(value) => return DirectKey::Timestamp(*value),
+            Self::Date(days) => return DirectKey::Date(*days),
         })
     }
 
@@ -780,10 +812,10 @@ impl OwnedScalar {
 impl DecodedKeys {
     fn get<'c>(
         &mut self, index: usize, columns: impl ExactSizeIterator<Item = &'c Column> + Clone, row: usize,
-        index_timestamps: bool, memory: &Arc<MemoryBudget>,
+        index_temporals: bool, memory: &Arc<MemoryBudget>,
     ) -> Result<Option<&Decoded>> {
         if !self.keys.contains_key(&index) {
-            let read = |column| DirectKey::read_with_timestamps(column, row, index_timestamps);
+            let read = |column| DirectKey::read_with_temporals(column, row, index_temporals);
             let mut payload = Some(columns.len().checked_mul(size_of::<OwnedScalar>()).ok_or_else(size_error)?);
             for column in columns.clone() {
                 let Some(bytes) = read(column).and_then(OwnedScalar::payload_bytes) else {
@@ -1004,7 +1036,7 @@ impl BatchKeyIndex {
         self.positions.find(u64::from(hash), all, context, |index, position| {
             let (batch, projected) = &batches[position.batch];
             if direct
-                && let Some(Decoded::Scalars(stored)) = decoded.get(index, batch.columns.iter(), position.row, key.index_timestamps, &context.memory)?
+                && let Some(Decoded::Scalars(stored)) = decoded.get(index, batch.columns.iter(), position.row, key.index_temporals, &context.memory)?
                 && let Some(equal) = decoded_equal(key.direct_parts(), stored)
             {
                 return Ok(equal);
@@ -1140,7 +1172,7 @@ impl BatchKeyIndex {
         for row in 0..batch.len {
             context.check_cancelled_at(row)?;
             let (hash, key) = match &typed {
-                Some(typed) => (hashes[row], Key { index_timestamps: true, ..typed.key(row, projected) }),
+                Some(typed) => (hashes[row], Key { index_temporals: true, ..typed.key(row, projected) }),
                 None => {
                     let pair = Key::bind(columns, row, projected, context, self.hashing, true)?;
                     if row == 0 { crate::operators::validate_distinct_types(schema)?; }
@@ -1527,6 +1559,80 @@ mod tests {
     }
 
     #[test]
+    fn date_keys_share_hashes_and_compare_by_the_containing_day() {
+        let context = context();
+        let days = [Value::DateDay(-1), Value::DateDay(i32::MAX)];
+        let millis = [Value::DateMilli(-1), Value::DateMilli(i64::from(i32::MAX) * rtdb_types::java_date::MILLIS_PER_DAY)];
+        let page = |values: &[Value]| {
+            let logical = values[0].logical_type();
+            let array = rtdb_columnar::copy_array(&logical, values).unwrap();
+            let field = Arc::new(rtdb_columnar::to_field("key", &logical).unwrap());
+            ColumnBatch::settled(vec![Column::Arrow { array, field, logical: Some(logical) }],
+                values.len(), context.memory.reserve(4096).unwrap()).unwrap()
+        };
+        let build = page(&days);
+        let probe = page(&millis);
+        for row in 0..build.len {
+            let (hash, l) = Key::bind(&build, row, false, &context, KeyHash::Set, true).unwrap();
+            let (right_hash, r) = Key::bind(&probe, row, false, &context, KeyHash::Set, true).unwrap();
+            assert!(l.cached(0).is_none() && r.cached(0).is_none());
+            assert_eq!(hash, right_hash);
+            assert_eq!(hash, crate::operators::equality_hash(&days[row..=row], &context.timezone));
+            assert_eq!(l.vector_hash().unwrap(), crate::join_storage::hash_values(&days[row..=row]).unwrap());
+            assert_eq!(r.vector_hash().unwrap(), crate::join_storage::hash_values(&millis[row..=row]).unwrap());
+            let bloom = direct_bloom_hashes(&probe.columns[0], row).unwrap();
+            assert_eq!(bloom.hashes, (rtdb_columnar::hash_value(&millis[row], 0).unwrap(), rtdb_columnar::hash_value_murmur3(&millis[row], 0).unwrap()));
+            assert!(bloom.scalar.is_none() && bloom.retain_iid_limit);
+            assert_eq!(l.equal_at(&r, 0, false, &context, None).unwrap(), Some(true));
+        }
+        let mut index = BatchKeyIndex::new(&context).unwrap();
+        index.build(build, false, &context).unwrap();
+        assert!(index.matches(&probe, 0, false, true, &context).unwrap());
+        assert!(index.matches(&probe, 1, false, true, &context).unwrap());
+        drop(index);
+        let timestamp = page(&[Value::Timestamp { value: -86_400, unit: TimeUnit::Second, timezone: Some("UTC".into()) }]);
+        assert_eq!(direct_key_equal(&probe.columns[0], 0, &timestamp.columns[0], 0, false), None);
+        let mut index = BatchKeyIndex::new(&context).unwrap();
+        index.build(probe, false, &context).unwrap();
+        assert!(index.matches(&timestamp, 0, false, false, &context).unwrap());
+        drop((index, timestamp));
+        assert_eq!(context.memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn generic_row_key_borrows_the_existing_value_and_releases_its_scratch() {
+        let context = context();
+        let mut fields = rtdb_types::StructFields::new();
+        fields.insert("text".into(), Value::Utf8("payload".repeat(4096)));
+        let page = ColumnBatch::settled(vec![Column::Values(vec![Value::Struct(fields)])],
+            1, context.memory.reserve(1 << 16).unwrap()).unwrap();
+        let Column::Values(values) = &page.columns[0] else { unreachable!() };
+        let before = context.memory.used_bytes();
+        let (hash, key) = Key::bind(&page, 0, true, &context, KeyHash::Set, true).unwrap();
+        assert!(std::ptr::eq(key.cached(0).unwrap(), &values[0]));
+        assert_eq!(hash, crate::operators::equality_hash(values, &context.timezone));
+        assert!(context.memory.used_bytes() > before);
+        drop(key);
+        assert_eq!(context.memory.used_bytes(), before);
+    }
+
+
+    #[test]
+    fn projected_row_key_admits_calendar_objects_on_an_owned_copy() {
+        use rtdb_types::{CalendarDate, CivilDate, DateUnit};
+
+        let context = context();
+        let mut fields = rtdb_types::StructFields::new();
+        fields.insert("day".into(), Value::Date(CalendarDate::new(CivilDate::from_epoch_day(7).unwrap(), DateUnit::Day)));
+        let page = ColumnBatch::settled(vec![Column::Values(vec![Value::Struct(fields)])],
+            1, context.memory.reserve(4096).unwrap()).unwrap();
+        let key = Key::for_columns(&page, 0, true, &[0], &context).unwrap();
+        let Some(Value::Struct(admitted)) = key.cached(0) else { panic!("Expected a struct key") };
+        assert_eq!(admitted.get("day"), Some(&Value::DateDay(7)));
+        assert!(page.columns[0].value(0).unwrap().has_calendar_object());
+    }
+
+    #[test]
     fn timestamp_keys_match_value_hashes_without_owned_values() {
         let context = context();
         let values = [TimeUnit::Second, TimeUnit::Millisecond, TimeUnit::Microsecond, TimeUnit::Nanosecond]
@@ -1846,8 +1952,8 @@ mod tests {
 
         let context = context();
         let vector = |value| Value::list(vec![value]);
-        let left = [Value::DateDay(0), vector(Value::F32(-0.0))];
-        let right = [Value::DateMilli(0), vector(Value::F64(-0.0))];
+        let left = [Value::IntervalYearMonth(3), vector(Value::F32(-0.0))];
+        let right = [Value::IntervalYearMonth(3), vector(Value::F64(-0.0))];
         let batch = |values: &[Value]| {
             let types = [values[0].logical_type(), LogicalType::list(LogicalType::from_legs([
                 LogicalType::Scalar(ScalarType::F32), LogicalType::Null, LogicalType::Scalar(ScalarType::F64),
@@ -1860,7 +1966,8 @@ mod tests {
         let right_batch = batch(&right);
         assert!(KeyColumns::from(&left_batch).bind_typed(&context).unwrap().is_none());
         let (hash, key) = Key::bind(&left_batch, 0, false, &context, KeyHash::Set, true).unwrap();
-        assert_eq!(key.values, [(0, Value::DateDay(0))]);
+        assert_eq!(key.values.len(), 1);
+        assert_eq!(key.cached(0), Some(&left[0]));
         assert_eq!(hash, crate::operators::equality_hash(&left, &context.timezone));
         assert_eq!(hash, crate::operators::equality_hash(&right, &context.timezone));
         let mut index = BatchKeyIndex::new(&context).unwrap();
@@ -1869,7 +1976,8 @@ mod tests {
         assert!(!index.matches(&right_batch, 0, false, true, &context).unwrap());
 
         let join = Key::for_columns(&right_batch, 0, false, &[0, 1], &context).unwrap();
-        assert_eq!(join.values, [(0, Value::DateMilli(0))]);
+        assert_eq!(join.values.len(), 1);
+        assert_eq!(join.cached(0), Some(&right[0]));
         assert_eq!(join.vector_hash().unwrap(), crate::join_storage::hash_values(&right).unwrap());
         assert!(matches!(join.direct(1), Some(DirectKey::FloatList(_))));
     }

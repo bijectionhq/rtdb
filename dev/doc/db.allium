@@ -2470,7 +2470,8 @@ surface QueryAccess {
         -- The per-page grouping index stages a position only for each new key and releases its chains before retaining the page.
         -- Key readers follow logical union leg names and run ends to borrow the selected scalar or vector values.
         -- Group, set and window partition keys read compatible timestamps as a count, unit and zone-presence flag.
-        -- Set keys hash timestamps in session-local microseconds and group and window partition keys use the vector hash.
+        -- Set keys hash physical dates and timestamps in session-local microseconds and group and window partition keys use the vector hash.
+        -- A Date32 key and a Date64 key compare by their containing calendar day.
         -- Timestamps with matching units and zone presence compare by count; other temporal comparisons use the scalar rules.
         -- URI keys retain the raw hash check and the SQL comparison of their spellings.
         -- Distinct intersection and difference reuse the first-seen left key and hash for right-side membership.
@@ -2480,7 +2481,8 @@ surface QueryAccess {
         -- When an additional distinct candidate exceeds the bound, the probe scan uses the Bloom filter and the join still checks exact equality.
         -- The candidate set is stored as a charged sorted slice, and a scan task walks it in the order in which it merges event headers.
         -- Pruning by entity ID requires matching identity domains and proof that the scan's snapshot uses canonical IIDs.
-        -- A composite set key reads an owned scalar cell for each column that requires scalar hashing or equality.
+        -- A composite set key borrows an already materialized row value when its calendar values are admitted.
+        -- A key that requires an owned scalar read retains that value under the comparison reservation.
         -- Unfiltered counts and double-precision sums and averages without DISTINCT can reduce compatible Arrow vectors and selections without materialising a row mask.
         -- A null-extended selected position contributes a row to COUNT(*) and is null for argument reductions.
         -- Each COUNT stores one signed 64-bit accumulator per group and can use the same buffer for its Arrow result.
