@@ -235,3 +235,45 @@ fn replica_outer_group_traversal_caps_nesting_at_one_hundred() {
         assert_eq!(ReplicaFrame::has_external_payload(&stored).is_ok(), depth == 100);
     }
 }
+
+#[test]
+fn xtdb_oversized_message_without_sha256_decodes_and_unwraps_and_plain_rtdb_offload_stays_xtdb_readable() {
+    let body = ReplicaEnvelope {
+        term: Term(3),
+        term_sequence: Some(TermSequence(4)),
+        message: ReplicaBody::NoOp(pb::NoOp { src_msg_id: Some(9), ..Default::default() }),
+    };
+    let payload_bytes = body.encode();
+
+    // Upstream XTDB writes OversizedMessage without payload_sha256 or publication.
+    let xtdb_proxy = ReplicaEnvelope {
+        term: Term(3),
+        term_sequence: Some(TermSequence(4)),
+        message: ReplicaBody::OversizedMessage(pb::OversizedMessage {
+            storage_version: Some(6),
+            storage_epoch: Some(0),
+            block_index: Some(1),
+            payload_id: Some("xtdb-payload".into()),
+            payload_sha256: None,
+            publication: None,
+        }),
+    };
+    let xtdb_encoded = xtdb_proxy.encode();
+    assert_eq!(xtdb_encoded[0], PROTOBUF_LOG_HEADER);
+    let decoded = ReplicaEnvelope::decode(&xtdb_encoded).unwrap().unwrap();
+    assert_eq!(decoded.oversized_payload(StorageVersion(6), StorageEpoch(0)).unwrap().as_deref(), Some("oversized/b01-xtdb-payload.binpb"));
+    assert_eq!(decoded.unwrap_payload(&payload_bytes).unwrap(), body);
+    assert_eq!(decoded.unwrap_payload_bytes(payload_bytes.clone().into()).unwrap(), body);
+
+    // A plain RTDB offload keeps XTDB framing (0x03) with payload_sha256 only as an unknown annotation field.
+    let mut rtdb_proxy = body.offloaded(StorageVersion(6), StorageEpoch(0), BlockIndex(1), "rtdb-payload".into(), &payload_bytes);
+    assert_eq!(rtdb_proxy.encode()[0], PROTOBUF_LOG_HEADER);
+
+    // Binding an RTDB-only publication frames the record for XTDB to refuse loudly.
+    rtdb_proxy.bind_offload_publication(rtdb_types::PhysicalObjectVersion {
+        namespace: rtdb_types::S3ObjectNamespace { bucket: "replica".into(), endpoint: None, region: None },
+        key: "objects/oversized/b01-rtdb-payload.binpb".into(),
+        version: "v1".into(),
+    }).unwrap();
+    assert_eq!(&rtdb_proxy.encode()[..2], &[RTDB_EXTENSION_LOG_HEADER, XTDB_REFUSAL_PREFIX[0]]);
+}

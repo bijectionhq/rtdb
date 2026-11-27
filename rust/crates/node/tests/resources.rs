@@ -322,3 +322,11 @@ async fn plain_remote_stores_with_a_location_share_xtdbs_c1_disk_cache_layout() 
     drop(opened);
     native.close().await.unwrap();
 }
+
+#[test]
+fn multi_partition_database_config_fails_with_xtdbs_error_code() {
+    let config = DatabaseConfig { partitions: Some(2), ..Default::default() };
+    let error = NativeResources::default().validate("xtdb", &config).unwrap_err();
+    assert_eq!(error.code, "xtdb/multi-partition-not-yet-enabled");
+    assert_eq!(error.context.get("partitions"), Some(&serde_json::json!(2)));
+}
