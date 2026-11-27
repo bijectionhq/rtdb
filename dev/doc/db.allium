@@ -2455,6 +2455,7 @@ surface QueryAccess {
         -- Archive history and owned event projections write resolved transaction bounds, physical timestamps and assertion coordinates into typed Arrow columns.
         -- COALESCE over compatible floating-point vector columns selects the first non-null vector in each row by Arrow position.
         -- COALESCE over compatible selected or mixed-layout scalar columns retains the first non-null cell by Arrow position and keeps its source charged.
+        -- A fixed identity cast over a compatible scalar column can contribute its Arrow positions to that selection.
         -- It emits a null where every operand is null.
         -- A mixed gather borrows reached evaluated cells for packing and selects compatible nested Arrow payloads by position.
         -- Evaluated vectors of one list kind pack into a single Arrow column across row and component nulls.

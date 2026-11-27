@@ -5226,6 +5226,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn coalesce_keeps_mixed_winners_from_an_identity_cast_by_position() {
+        let memory = MemoryBudget::new(1 << 20);
+        let text = field(0, ScalarType::Utf8);
+        let number = field(1, ScalarType::I64);
+        let schema = Schema::new(vec![text.clone(), number.clone()]).unwrap();
+        let columns = [
+            (Arc::new(StringArray::from(vec![Some("keep"), None, None])) as ArrayRef, &text),
+            (Arc::new(Int64Array::from(vec![Some(1), Some(2), None])) as ArrayRef, &number),
+        ].into_iter().map(|(array, field)| Column::Arrow {
+            array, field: Arc::new(rtdb_columnar::to_field(&field.name, &field.data_type).unwrap()),
+            logical: Some(field.data_type.clone()),
+        }).collect();
+        let batch = ColumnBatch::settled(columns, 3, memory.reserve(0).unwrap()).unwrap();
+        let expr = Expr::Coalesce(vec![
+            Expr::Cast { expr: Box::new(text.expression()), target: CastTarget::Fixed(LogicalType::Scalar(ScalarType::Utf8)) },
+            number.expression(),
+            Expr::Literal(Value::Null),
+        ]);
+        let mut cursor = record_projection_cursor(batch, schema, vec![expr], &memory);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert!(matches!(&page.columns[0], Column::Selected(_)));
+        let actual = (0..page.len).map(|row| page.columns[0].value(row).unwrap()).collect::<Vec<_>>();
+        assert_eq!(actual, [Value::Utf8("keep".into()), Value::I64(2), Value::Null]);
+    }
+
+    #[tokio::test]
     async fn record_projection_computed_struct_keeps_child_backing_and_duplicate_order() {
         let source = MemoryBudget::new(1 << 23);
         let memory = MemoryBudget::new(1 << 17);
@@ -7469,6 +7495,13 @@ pub(crate) mod projection {
                     let Some((column, owner)) = shared_column(arg, schema, batch, memory)? else { return Ok(None); };
                     needs_selection = true;
                     ProjectionInput::Computed(column, owner)
+                }
+                Expr::Cast { expr, target: CastTarget::Fixed(target) } => {
+                    let Expr::Column { id, .. } = expr.as_ref() else { return Ok(None); };
+                    let Some(position) = schema.position(*id) else { return Ok(None); };
+                    let Some(column) = batch.columns.get(position).filter(|column| identity_cast(column, target)) else { return Ok(None); };
+                    needs_selection = true;
+                    ProjectionInput::Stored(column, batch.column_reservation(position))
                 }
                 _ => return Ok(None),
             };
