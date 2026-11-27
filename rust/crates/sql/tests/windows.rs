@@ -95,6 +95,35 @@ async fn bounded_row_number_preserves_first_seen_partitions_nulls_and_cutoff_pee
 }
 
 #[tokio::test]
+async fn bounded_row_number_uses_both_numeric_keys_and_keeps_peers_at_the_cutoff() {
+    let input = "(VALUES (1,'z',5.0,7),(2,'z',5.0,8),(3,'a',2.0,NULL),
+        (4,'z',5.0,8),(5,'z',5.0,9),(6,'z',NULL,10),(7,'a',2.0,0),
+        (8,'a',2.0,1),(9,'a',1.0,0),(10,'a',2.0,NULL),(11,'z',5.0,NULL)) AS t(id,p,v,tie)";
+    for (order, ids) in [
+        ("v ASC NULLS LAST, tie DESC NULLS LAST", [5, 2, 9, 8]),
+        ("v DESC NULLS FIRST, tie ASC NULLS FIRST", [6, 11, 3, 10]),
+        ("v ASC NULLS LAST, tie ASC NULLS FIRST", [11, 1, 9, 3]),
+    ] {
+        let sql = format!(
+            "SELECT id,rn FROM (SELECT id,ROW_NUMBER() OVER (PARTITION BY p ORDER BY {order}) rn FROM {input}) s WHERE rn <= 2"
+        );
+        let expected = ids.into_iter().zip([1, 2, 1, 2])
+            .map(|(id, rank)| vec![V::I64(id), V::I64(rank)]).collect::<Vec<_>>();
+        for sort_memory in [256, 1 << 26] {
+            let tracer = Arc::new(WindowTrace::default());
+            let context = context_with_sort_memory(sort_memory).with_tracer(Some(tracer.clone()), None);
+            assert_eq!(query_at(&sql, context).await.unwrap().1, expected, "{order}");
+            let limits = tracer.1.lock().unwrap();
+            if sort_memory == 1 << 26 {
+                assert_eq!(*limits, [2], "{order}");
+            } else {
+                assert!(limits.is_empty(), "{order}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn bounded_row_number_keeps_the_ordinary_path_for_other_predicates_and_window_dependencies() {
     let input = "(VALUES (1,0,1),(2,0,2),(3,0,3),(4,0,4)) AS t(id,p,v)";
     let window = "PARTITION BY p ORDER BY v";

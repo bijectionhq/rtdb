@@ -219,6 +219,7 @@
 -- Relation ordinality and unpartitioned ROW_NUMBER with supported ordering append a signed 64-bit ordinal vector to Arrow batch inputs.
 -- Unpartitioned LEAD and LAG gather shifted cells from their ordered Arrow input and append null cells at the window boundary.
 -- A partitioned window over compatible Arrow keys assigns partition identifiers in first-seen order and keeps shifts within those partitions.
+-- A bounded partitioned ROW_NUMBER applies each window key's direction and null placement independently and keeps input order for peers at the cutoff.
 -- The embedded logical relation entry point runs plan reporting and measured execution on that read basis.
 -- The authenticated history position orders decisions, and the operation ordinal orders effects inside a decision.
 -- SQL system time is strictly increasing per partition.

@@ -8,7 +8,7 @@ use std::{
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 use rtdb_columnar::MemoryReservation;
-use rtdb_plan::{BinaryOp, Expr, Relation, RelationNode, Schema, WindowExpr, WindowFunction};
+use rtdb_plan::{BinaryOp, Expr, Relation, RelationNode, Schema, SortExpr, WindowExpr, WindowFunction};
 use rtdb_types::{AnomalyKind, LogicalType, ObjectSort, Result, ScalarType, Value};
 
 use super::{WindowPartitions, window_size};
@@ -23,10 +23,7 @@ use crate::{
 
 pub(crate) struct RowNumberLimit {
     count: usize,
-    key_position: usize,
-    float: bool,
-    descending: bool,
-    nulls_first: bool,
+    order: NumericOrder,
 }
 
 impl RowNumberLimit {
@@ -35,8 +32,6 @@ impl RowNumberLimit {
             return Ok(None);
         };
         let [WindowExpr { field, function: WindowFunction::RowNumber }] = expressions.as_slice() else { return Ok(None); };
-        let [order] = order_by.as_slice() else { return Ok(None); };
-        let Expr::Column { id: key, .. } = &order.expr else { return Ok(None); };
         let Expr::Binary { op, left, right } = predicate else { return Ok(None); };
         let bound = match (op, left.as_ref(), right.as_ref()) {
             (BinaryOp::LtEq, Expr::Column { id, .. }, Expr::Literal(Value::I64(count)))
@@ -51,18 +46,63 @@ impl RowNumberLimit {
             return Ok(None);
         }
         let input = window.child(0)?;
-        let Some(key_position) = input.schema().position(*key) else { return Ok(None); };
-        let float = match crate::columnar::float_vector::nonnull(&input.schema().fields()[key_position].data_type) {
+        let Some(order) = NumericOrder::bind(input.schema(), order_by) else { return Ok(None); };
+        Ok(replayable(input.relation()).then_some(Self { count, order }))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum NumericOrder {
+    Single([NumericOrderColumn; 1]),
+    Pair([NumericOrderColumn; 2]),
+}
+
+impl NumericOrder {
+    fn bind(schema: &Schema, order: &[SortExpr]) -> Option<Self> {
+        let bind = |key| NumericOrderColumn::bind(schema, key);
+        match order {
+            [first] => Some(Self::Single([bind(first)?])),
+            [first, second] => Some(Self::Pair([bind(first)?, bind(second)?])),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct NumericOrderColumn {
+    position: usize,
+    float: bool,
+    descending: bool,
+    nulls_first: bool,
+}
+
+type NumericKey = (bool, u64);
+
+impl NumericOrderColumn {
+    fn bind(schema: &Schema, order: &SortExpr) -> Option<Self> {
+        let Expr::Column { id, .. } = &order.expr else { return None; };
+        let position = schema.position(*id)?;
+        let float = match crate::columnar::float_vector::nonnull(&schema.fields()[position].data_type) {
             LogicalType::Scalar(ScalarType::F32 | ScalarType::F64) => true,
             LogicalType::Scalar(ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64) => false,
-            _ => return Ok(None),
+            _ => return None,
         };
-        Ok(replayable(input.relation()).then_some(Self {
-            count, key_position, float, descending: order.descending, nulls_first: order.nulls_first,
-        }))
+        Some(Self { position, float, descending: order.descending, nulls_first: order.nulls_first })
     }
 
-    fn key(&self, value: ScalarKey<'_>) -> Option<(bool, u64)> {
+    fn bind_batch(self, batch: &ColumnBatch) -> NumericKeyReader<'_> {
+        let column = &batch.columns[self.position];
+        let flat = match column {
+            Column::Arrow { array, field, logical } => {
+                let inferred = logical.is_none().then(|| rtdb_columnar::from_field(field).ok()).flatten();
+                ScalarColumn::bind(array.as_ref(), field, logical.as_ref().or(inferred.as_ref()))
+            }
+            _ => None,
+        };
+        NumericKeyReader { order: self, column, flat }
+    }
+
+    fn key(self, value: ScalarKey<'_>) -> Option<NumericKey> {
         const SIGN: u64 = 1 << 63;
         let value = match value {
             ScalarKey::Null => return Some((!self.nulls_first, 0)),
@@ -75,6 +115,31 @@ impl RowNumberLimit {
         };
         Some((self.nulls_first, if self.descending { !value } else { value }))
     }
+}
+
+struct NumericKeyReader<'a> {
+    order: NumericOrderColumn,
+    column: &'a Column,
+    flat: Option<ScalarColumn<'a>>,
+}
+
+impl NumericKeyReader<'_> {
+    fn key(&self, row: usize) -> Option<NumericKey> {
+        let value = match (self.flat, self.column) {
+            (Some(flat), _) => flat.read(row),
+            (_, Column::Values(values)) => ScalarKey::from_value(&values[row])?,
+            (_, column) => ScalarKey::read(column, row)?,
+        };
+        self.order.key(value)
+    }
+}
+
+fn row_key<const N: usize>(readers: &[NumericKeyReader<'_>; N], row: usize) -> Option<[NumericKey; N]> {
+    let mut keys = [(false, 0); N];
+    for (key, reader) in keys.iter_mut().zip(readers) {
+        *key = reader.key(row)?;
+    }
+    Some(keys)
 }
 
 fn replayable(mut input: &Relation) -> bool {
@@ -129,9 +194,11 @@ impl TopKWindow {
             rank_name: rank.field.name.clone(), projected, context })
     }
 
-    async fn select(&mut self, mut input: BoxBatchCursor, mut partitions: WindowPartitions) -> Result<Option<State>> {
+    async fn select<const N: usize>(
+        &mut self, mut input: BoxBatchCursor, mut partitions: WindowPartitions, order: [NumericOrderColumn; N],
+    ) -> Result<Option<State>> {
         let context = &self.context;
-        let mut groups: Vec<BinaryHeap<Candidate>> = Vec::new();
+        let mut groups: Vec<BinaryHeap<Candidate<N>>> = Vec::new();
         let mut inventory = context.memory.reserve(256)?;
         let mut seen = 0usize;
         while let Some(batch) = poll_nested_batch(input.as_mut()).await? {
@@ -141,30 +208,17 @@ impl TopKWindow {
             let next = seen.checked_add(batch.len).filter(|&total| i64::try_from(total).is_ok())
                 .ok_or_else(|| invalid("window-count", "Window row number overflow"))?;
             let batch = Arc::new(batch);
-            let reader = &batch.columns[self.limit.key_position];
-            let inferred;
-            let flat = match reader {
-                Column::Arrow { array, field, logical } => {
-                    inferred = logical.is_none().then(|| rtdb_columnar::from_field(field).ok()).flatten();
-                    ScalarColumn::bind(array.as_ref(), field, logical.as_ref().or(inferred.as_ref()))
-                }
-                _ => None,
-            };
+            let readers = order.map(|column| column.bind_batch(&batch));
             let mut compatible = true;
             partitions.identify(&batch, self.projected, context, |row, group, first| {
                 if !compatible { return Ok(()); }
-                let value = match (flat, reader) {
-                    (Some(flat), _) => Some(flat.read(row)),
-                    (_, Column::Values(values)) => ScalarKey::from_value(&values[row]),
-                    (_, reader) => ScalarKey::read(reader, row),
-                };
-                let Some(key) = value.and_then(|value| self.limit.key(value)) else {
+                let Some(key) = row_key(&readers, row) else {
                     compatible = false;
                     return Ok(());
                 };
                 if first {
                     debug_assert_eq!(group, groups.len());
-                    admit(&mut inventory, 2 * size_of::<BinaryHeap<Candidate>>(), context)?;
+                    admit(&mut inventory, 2 * size_of::<BinaryHeap<Candidate<N>>>(), context)?;
                     groups.push(BinaryHeap::new());
                 }
                 let heap = &mut groups[group];
@@ -172,7 +226,7 @@ impl TopKWindow {
                 if heap.len() < self.limit.count {
                     if heap.len() == heap.capacity() {
                         let additional = heap.len().max(1).min(self.limit.count - heap.len());
-                        let candidate_bytes = size_of::<Candidate>() + size_of::<ColumnBatch>() + 2 * size_of::<usize>();
+                        let candidate_bytes = size_of::<Candidate<N>>() + size_of::<ColumnBatch>() + 2 * size_of::<usize>();
                         admit(&mut inventory, additional.checked_mul(candidate_bytes).ok_or_else(window_size)?, context)?;
                         heap.reserve_exact(additional);
                     }
@@ -225,23 +279,23 @@ fn admit(reservation: &mut Arc<MemoryReservation>, bytes: usize, context: &Query
     Arc::get_mut(reservation).expect("Window top-k owns its inventory").grow_to(total)
 }
 
-struct Candidate {
-    order: ((bool, u64), usize),
+struct Candidate<const N: usize> {
+    order: ([NumericKey; N], usize),
     batch: Arc<ColumnBatch>,
     row: usize,
 }
 
-impl PartialEq for Candidate {
+impl<const N: usize> PartialEq for Candidate<N> {
     fn eq(&self, other: &Self) -> bool { self.order == other.order }
 }
 
-impl Eq for Candidate {}
+impl<const N: usize> Eq for Candidate<N> {}
 
-impl PartialOrd for Candidate {
+impl<const N: usize> PartialOrd for Candidate<N> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
 }
 
-impl Ord for Candidate {
+impl<const N: usize> Ord for Candidate<N> {
     fn cmp(&self, other: &Self) -> Ordering { self.order.cmp(&other.order) }
 }
 
@@ -251,7 +305,11 @@ impl BatchCursor for TopKWindow {
         self.context.check_cancelled()?;
         if matches!(self.state, State::Pending { .. }) {
             let State::Pending { input, partitions, reopen } = std::mem::replace(&mut self.state, State::Finished) else { unreachable!() };
-            self.state = match self.select(input, partitions).await {
+            let selected = match self.limit.order {
+                NumericOrder::Single(order) => self.select(input, partitions, order).await,
+                NumericOrder::Pair(order) => self.select(input, partitions, order).await,
+            };
+            self.state = match selected {
                 Ok(Some(output)) => output,
                 Ok(None) => State::Ordinary(reopen().await?),
                 Err(error) if error.is(AnomalyKind::ResourceExhausted) => State::Ordinary(reopen().await?),
