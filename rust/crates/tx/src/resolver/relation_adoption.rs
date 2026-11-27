@@ -1,18 +1,20 @@
-use std::{collections::BTreeSet, fmt::Write, io::Cursor, num::NonZeroU32, sync::Arc};
+use std::{borrow::Cow, collections::BTreeSet, fmt::Write, io::Cursor, mem::size_of, num::NonZeroU32, sync::Arc};
 
+use arrow_schema::{DataType, Field};
 use sha2::{Digest, Sha256};
 
-use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation};
+use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation, to_field};
 use rtdb_format::{
-    data::{EventBatch, StoredEvent, StoredOperation},
+    data::{EncodedEvent, EventBatch, EventRef, PutColumn, StoredEvent, StoredOperation, owned_event_batch},
     ipc::{ArrowFile, inspect_file_reserved},
     log::proto::PublishedObjectVersion,
 };
 use rtdb_index::{IndexBatch, Snapshot};
 use rtdb_storage::{HeldView, IoRegion, ObjectKey};
 use rtdb_types::{
-    Anomaly, AnomalyCategory, EntityId, EventOp, Interval, OwnedChange, OwnedChangeKind,
-    OwnedRelation, OwnedSchema, PlacedAttemptScope, Result, StructFields, TableRef, Timestamp, Value,
+    Anomaly, AnomalyCategory, EntityId, EventHeader, EventOp, EventOrigin, Interval, LogicalType,
+    OwnedChange, OwnedChangeKind, OwnedRelation, OwnedSchema, PlacedAttemptScope, Result, StructFields,
+    TableRef, Timestamp, Value,
 };
 
 use crate::{Documents, TxOp, source::Operation};
@@ -179,7 +181,11 @@ impl OpenTransaction<'_> {
             return Err(uncovered("Adoption must follow the original SQL history clock"));
         }
         let data = IndexBatch::copy_events(&data_history.events, &StructFields::new(), &self.context.memory)?;
-        let journal = IndexBatch::copy_events(&journal_history.events, &StructFields::new(), &self.context.memory)?;
+        let journal = copy_adoption_journal(
+            &journal_history.events,
+            base.iter_segments(&journal).flat_map(|segment| segment.batches().map(|batch| batch.view())),
+            &self.context.memory,
+        )?;
         self.retire_owned_relation(source, retain_micros).await?;
         self.buffer.adopt_owned_history(destination.table(owner), data)?;
         self.buffer.adopt_owned_history(destination.change_journal(owner)?, journal)?;
@@ -378,6 +384,105 @@ impl History {
     }
 }
 
+fn copy_adoption_journal<'a>(
+    events: &'a [StoredEvent], live: impl Iterator<Item = &'a EventBatch>, memory: &Arc<MemoryBudget>,
+) -> Result<Arc<IndexBatch>> {
+    if let Ok(Some(batch)) = try_copy_positioned_journal(events, live, memory) {
+        return Ok(batch);
+    }
+    IndexBatch::copy_events(events, &StructFields::new(), memory)
+}
+
+fn try_copy_positioned_journal<'a>(
+    events: &'a [StoredEvent], live: impl Iterator<Item = &'a EventBatch>, memory: &Arc<MemoryBudget>,
+) -> Result<Option<Arc<IndexBatch>>> {
+    const NAMES: [&str; 3] = ["_id", "entry", "through_events"];
+    let documents = || events.iter().filter_map(|event| match &event.operation {
+        StoredOperation::Put(document) => Some(document),
+        _ => None,
+    });
+    let Some(first) = documents().next() else { return Ok(None); };
+    if !documents().all(|doc| doc.len() == NAMES.len() && NAMES.iter().all(|name| doc.contains_key(*name))) {
+        return Ok(None);
+    }
+    let schema_bytes = documents().try_fold(4096usize, |bytes, doc| {
+        bytes.checked_add(Value::document_retained_bytes(doc)?).ok_or_else(overflow)
+    })?;
+    let row_bytes = size_of::<EventRef<'_>>() + size_of::<PositionedJournalEntry<'_>>();
+    let scratch = schema_bytes.checked_mul(4)
+        .and_then(|bytes| bytes.checked_add(events.len().checked_mul(row_bytes)?)).ok_or_else(overflow)?;
+    let _scratch = memory.reserve(scratch)?;
+    let mut positions = Vec::with_capacity(events.len());
+    for batch in live {
+        if batch.is_empty() { continue; }
+        if batch.len() > events.len() - positions.len()
+            || !batch.put_document()?.is_some_and(|put| put.fields().len() == NAMES.len()
+                && NAMES.iter().all(|name| put.fields().iter().any(|field| field.name().as_str() == *name)))
+        {
+            return Ok(None);
+        }
+        for row in 0..batch.len() {
+            positions.push(batch.borrow_event(row)?);
+        }
+    }
+    if positions.len() != events.len() { return Ok(None); }
+    positions.sort_unstable_by_key(|event| event.header().position);
+
+    let fields: StructFields<LogicalType> = first.keys().map(|name| {
+        let types = documents().map(|doc| doc[name.as_str()].logical_type()).collect::<Vec<_>>();
+        (name.clone(), LogicalType::join_all(&types))
+    }).collect();
+    let target = fields.iter().map(|(name, ty)| to_field(name, ty)).collect::<Result<Vec<_>>>()?;
+    if !target.iter().all(plain_journal_field) { return Ok(None); }
+
+    let mut positioned = Vec::with_capacity(events.len());
+    for (source, verified) in positions.into_iter().zip(events) {
+        if source.header() != verified.header() { return Ok(None); }
+        let event = PositionedJournalEntry { source, verified };
+        if !target.iter().all(|field| match event.put_column(field.name()) {
+            Some(PutColumn::Absent) => field.is_nullable(),
+            Some(PutColumn::Stored(source, _, _)) => {
+                source.data_type() == field.data_type() && source.metadata() == field.metadata()
+            }
+            None => false,
+        }) { return Ok(None); }
+        positioned.push(event);
+    }
+    IndexBatch::from_owned(owned_event_batch(&positioned, Some(fields), true, memory)?).map(Some)
+}
+
+fn plain_journal_field(field: &Field) -> bool {
+    field.metadata().is_empty() && match field.data_type() {
+        DataType::Null | DataType::Int64 | DataType::Utf8 | DataType::Binary => true,
+        DataType::List(item) => plain_journal_field(item),
+        DataType::Struct(fields) => fields.iter().all(|field| plain_journal_field(field)),
+        _ => false,
+    }
+}
+
+struct PositionedJournalEntry<'a> {
+    source: EventRef<'a>,
+    verified: &'a StoredEvent,
+}
+
+impl EncodedEvent for PositionedJournalEntry<'_> {
+    fn header(&self) -> EventHeader { self.verified.header() }
+    fn recency(&self) -> Option<Timestamp> { self.verified.recency }
+    fn entity_key(&self) -> Option<&[u8]> { self.verified.entity_key() }
+    fn origin(&self) -> Option<EventOrigin> { self.verified.origin }
+    fn put_within(&self, fields: &StructFields<LogicalType>) -> bool { self.verified.put_within(fields) }
+    fn put_cell(&self, _name: &str, _ty: &LogicalType) -> Result<Cow<'_, Value>> {
+        Err(uncovered("The journal copy requires a compatible Arrow position"))
+    }
+    fn put_column(&self, name: &str) -> Option<PutColumn<'_>> {
+        let StoredOperation::Put(document) = &self.verified.operation else { return None; };
+        if matches!(document.get(name), Some(Value::Null)) {
+            return Some(PutColumn::Absent);
+        }
+        self.source.put_column(name)
+    }
+}
+
 fn verify_journal(data: &[StoredEvent], journal: &[StoredEvent], schema: &OwnedSchema) -> Result<()> {
     let invalid = || uncovered("The source journal does not cover the original positioned population");
     let mut through = 0;
@@ -433,21 +538,74 @@ mod tests {
 
     use rtdb_columnar::MemoryBudget;
     use rtdb_format::{data::{StoredEvent, StoredOperation}, envelope::ReplicaBody};
-    use rtdb_index::PartitionState;
+    use rtdb_index::{IndexBatch, PartitionState};
     use rtdb_query::QueryOptions;
     use rtdb_storage::{MemoryStore, cache::BufferPool};
     use rtdb_types::{
-        DecimalValue, EntityId, EventPosition, Interval, OwnedChange, OwnedChangeKind, OwnedRelation,
+        DecimalValue, EntityId, EventOrigin, EventPosition, Interval, OwnedChange, OwnedChangeKind, OwnedRelation,
         OwnedSchema, PlacedAttemptScope, ROOT_ROW_CARRIERS, Result, RootRowCarrier, SHARED_COLUMN_CARRIERS,
         SourcePosition, StructFields, TableRef, Timestamp, TransactionKey, TxId, Value,
     };
     use tokio_util::sync::CancellationToken;
 
     use crate::{Documents, HostedAuthority, HostedControlWrite, SourceTransaction, SubmitOptions, TxOp, bind_installed_authority};
-    use super::{intrinsic_orders, verify_journal};
+    use super::{copy_adoption_journal, intrinsic_orders, try_copy_positioned_journal, verify_journal};
     use super::super::{OpenTransaction, OwnedPathKind, ResolveContext, TransactionAuthorization, TxResolver, attempt_marker_document};
 
     const PAYLOAD: &str = "c_0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn positioned_journal_copy_preserves_canonical_replica_bytes() -> Result<()> {
+        let memory = MemoryBudget::new(32 << 20);
+        let touch = |kind| OwnedChange {
+            id: EntityId::Binary(vec![0, 0xff]),
+            kind,
+            valid: Interval::new(Timestamp(180), Timestamp::MAX).unwrap(),
+            assertion_ordinal: NonZeroU32::new(7),
+        }.to_value();
+        let revision = |id, transaction, ordinal, entry| StoredEvent {
+            position: Some(EventPosition { transaction: TxId(transaction), ordinal }),
+            origin: Some(EventOrigin([id as u8; 32])),
+            entity_key: None,
+            iid: EntityId::Integer(id).iid(),
+            system_from: Timestamp(200),
+            commit_position: 0,
+            valid_time: Interval::ALL,
+            operation: StoredOperation::Put(StructFields::from([
+                ("_id".into(), Value::I64(id)),
+                ("entry".into(), entry),
+                ("through_events".into(), Value::I64(id)),
+            ])),
+            recency: Some(Timestamp(230)),
+        };
+        let mut events = [
+            revision(0, 10, 3, Value::Null),
+            revision(1, 10, 4, Value::list(vec![touch(OwnedChangeKind::Put)])),
+            revision(2, 11, 3, Value::list(vec![touch(OwnedChangeKind::Delete)])),
+        ];
+        let old = IndexBatch::copy_events(&events[..2], &StructFields::new(), &memory)?;
+        let new = IndexBatch::copy_events(&events[2..], &StructFields::new(), &memory)?;
+        let expected = IndexBatch::copy_events(&events, &StructFields::new(), &memory)?;
+        let copied = try_copy_positioned_journal(&events, [new.view(), old.view()].into_iter(), &memory)?
+            .expect("exact journal layouts");
+        assert!(try_copy_positioned_journal(&events, [old.view()].into_iter(), &memory)?.is_none());
+        let wire = |batch: &IndexBatch| crate::ipc::encode(batch.arrow().schema_ref(), [batch.arrow()], &memory);
+        assert_eq!(copied.arrow(), expected.arrow());
+        assert_eq!(wire(&copied)?.as_slice(), wire(&expected)?.as_slice());
+        for (row, expected) in events.iter().enumerate() {
+            assert_eq!(&copied.view().read_event(row)?, expected);
+        }
+
+        let StoredOperation::Put(document) = &mut events[0].operation else { unreachable!(); };
+        document.insert("fixed_assertion_keys".into(), Value::Null);
+        let old = IndexBatch::copy_events(&events[..2], &StructFields::new(), &memory)?;
+        let live = [new.view(), old.view()];
+        assert!(try_copy_positioned_journal(&events, live.into_iter(), &memory)?.is_none());
+        let copied = copy_adoption_journal(&events, live.into_iter(), &memory)?;
+        let expected = IndexBatch::copy_events(&events, &StructFields::new(), &memory)?;
+        assert_eq!(wire(&copied)?.as_slice(), wire(&expected)?.as_slice());
+        Ok(())
+    }
 
     #[test]
     fn clear_compound_successor_refuses_protected_declaration_roles() -> Result<()> {
