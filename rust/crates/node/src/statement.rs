@@ -1,7 +1,7 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 
 use rtdb_columnar::{MemoryReservation, OwnedBatch};
-use rtdb_plan::{Catalog, CatalogLookups, ColumnId, Field, PreparedStatement, RecordingCatalog, Schema, SqlNotice, Statement};
+use rtdb_plan::{Catalog, CatalogLookups, ColumnId, Field, PreparedStatement, RecordingCatalog, Schema, SqlNotice, Statement, TraceValue};
 use rtdb_query::{PreparedQuery, QueryContext, QueryCursor, RuntimeSchema, SharedPlan, SharedPlanKey};
 use rtdb_sql::{DeferredStatementSyntax, ParsedStatement, PrepareOptions, StatementKind, StatementSyntaxBatch};
 use rtdb_tx::{PreparedDml, ScheduledOperation, SqlArguments, TxOp};
@@ -157,7 +157,7 @@ impl PreparedSql {
             StatementKind::Query => {
                 let shared = if sharable {
                     if let Some(plans) = context.shared_plans() { plans.record_read_preparation(); }
-                    shared_plan(source, context, &options, |catalog, budget| parsed.bind_in(catalog, &options, budget))?
+                    shared_plan(source, context, &options, |catalog, budget| bind_read(context, || parsed.bind_in(catalog, &options, budget)))?
                 } else { None };
                 let (query, inferred, kept) = match shared {
                     Some(shared) => {
@@ -166,10 +166,10 @@ impl PreparedSql {
                     }
                     None => {
                         let recording = RecordingCatalog::new(&context.catalog);
-                        let prepared = parsed.bind(&recording, &options)?;
+                        let prepared = bind_read(context, || parsed.bind(&recording, &options))?;
                         let inferred = prepared.parameter_types.clone();
                         notices = prepared.notices.clone();
-                        let query = PreparedQuery::from_prepared_in(prepared, &context.catalog, &context.memory)?;
+                        let query = optimize_read(prepared, context, &context.memory)?;
                         let kept = recording.finish().map(|lookups| KeptPlan::Own { lookups: Arc::new(lookups), query: query.clone() });
                         (query, inferred, kept)
                     }
@@ -434,36 +434,49 @@ impl PreparedSql {
         context.check_cancelled()?;
         if self.is_dml() { return Err(kind_error()); }
         if argument_types.len() != self.parameter_count() { return Err(parameter_error("Parameter field count differs from the prepared statement")); }
+        let mut span = context.start_preparation_span("xtdb.query.prepare.rebind");
+        if let Some(span) = span.as_mut() { span.attribute("rebind.execution", TraceValue::Boolean(execution)); }
         let cached = self.0.plan.lock().as_ref()
             .filter(|plan| self.binds_to(&plan.options, &context.timezone, argument_types, execution))
-            .and_then(|plan| plan.plan.lookups_and_query());
-        if let Some((lookups, query)) = cached && lookups.replay(&context.catalog)? && query.join_statistics_match(&context.catalog) {
-            return query.recharged(&context.memory);
+            .and_then(|plan| plan.plan.acquire());
+        if let Some(cached) = cached && let Some(query) = cached.reuse(context)? {
+            if let Some(span) = span.as_mut() { span.attribute("rebind.path", TraceValue::Text("statement")); }
+            return Ok(query);
         }
         let options = self.bound_options(&context.timezone, argument_types, execution);
         let source = self.source();
         let syntax = std::cell::OnceCell::new();
         let prepare = |catalog: &dyn Catalog, memory: &Arc<MemoryBudget>| {
             let cached = syntax.get_or_init(|| context.shared_plans().filter(|_| self.0.sharable).and_then(|plans| plans.read_syntax(source)));
-            match cached {
-                Some(syntax) => syntax.parsed_in(memory).bind(catalog, &options),
-                None => rtdb_sql::prepare_in(source, catalog, &options, memory),
-            }
+            let parsed = match cached {
+                Some(syntax) => syntax.parsed_in(memory),
+                None => parse_read(context, || one_statement(source, memory))?,
+            };
+            bind_read(context, || parsed.bind(catalog, &options))
         };
+        let mut replanned = false;
         let shared = if self.0.sharable {
-            shared_plan(source, context, &options, &prepare)?
+            shared_plan(source, context, &options, |catalog, memory| {
+                replanned = true;
+                prepare(catalog, memory)
+            })?
         } else { None };
         if let Some(shared) = shared {
+            if let Some(span) = span.as_mut() {
+                let path = if replanned { "shared_replan" } else { "shared_hit" };
+                span.attribute("rebind.path", TraceValue::Text(path));
+            }
             let query = shared.query.recharged(&context.memory)?;
             *self.0.plan.lock() = Some(CachedPlan { options, plan: KeptPlan::Shared(Arc::downgrade(&shared)) });
             return Ok(query);
         }
+        if let Some(span) = span.as_mut() { span.attribute("rebind.path", TraceValue::Text("local")); }
         let _syntax = admit_sql_syntax(&self.0.source, &context.memory)?;
         let budget = self.0._reservation.budget();
         let plan_in = |memory: &Arc<MemoryBudget>| {
             let recording = RecordingCatalog::new(&context.catalog);
             let prepared = prepare(&recording, memory)?;
-            let query = PreparedQuery::from_prepared_in(prepared, &context.catalog, memory)?;
+            let query = optimize_read(prepared, context, memory)?;
             Ok::<_, Anomaly>((query, recording.finish()))
         };
         let (kept, lookups) = match plan_in(budget) {
@@ -519,21 +532,32 @@ impl PreparedSql {
 
 /// The last plan a statement bound, and what its planning read from the catalog: a snapshot that answers those
 /// lookups the same plans the statement the same way, so it reuses the plan.
-struct CachedPlan { options: PrepareOptions, plan: KeptPlan }
+struct CachedPlan { options: PrepareOptions, plan: KeptPlan<Weak<SharedPlan>> }
 
-enum KeptPlan {
+enum KeptPlan<Shared> {
     /// Planned by the statement and charged to it.
     Own { lookups: Arc<CatalogLookups>, query: PreparedQuery },
-    /// The node's shared plan, which stays charged to the node's cache, so the statement keeps it only while the cache does.
-    Shared(std::sync::Weak<SharedPlan>),
+    /// The statement holds a weak reference, while a rebind keeps the shared entry and its charge alive.
+    Shared(Shared),
 }
 
-impl KeptPlan {
-    fn lookups_and_query(&self) -> Option<(Arc<CatalogLookups>, PreparedQuery)> {
+impl KeptPlan<Weak<SharedPlan>> {
+    fn acquire(&self) -> Option<KeptPlan<Arc<SharedPlan>>> {
         match self {
-            Self::Own { lookups, query } => Some((Arc::clone(lookups), query.clone())),
-            Self::Shared(plan) => plan.upgrade().map(|shared| (Arc::clone(&shared.lookups), shared.query.clone())),
+            Self::Own { lookups, query } => Some(KeptPlan::Own { lookups: Arc::clone(lookups), query: query.clone() }),
+            Self::Shared(plan) => plan.upgrade().map(KeptPlan::Shared),
         }
+    }
+}
+
+impl KeptPlan<Arc<SharedPlan>> {
+    fn reuse(&self, context: &QueryContext) -> Result<Option<PreparedQuery>> {
+        let (lookups, query) = match self {
+            Self::Own { lookups, query } => (lookups, query),
+            Self::Shared(plan) => (&plan.lookups, &plan.query),
+        };
+        if !lookups.replay(&context.catalog)? || !query.join_statistics_match(&context.catalog) { return Ok(None); }
+        query.recharged(&context.memory).map(Some)
     }
 }
 
@@ -542,6 +566,7 @@ fn with_read_syntax<'input, T>(
     parse: impl FnOnce() -> Result<ParsedStatement<'input>>,
     prepare: impl for<'a> FnOnce(Result<ParsedStatement<'a>>) -> Result<T>,
 ) -> Result<T> {
+    let parse = || parse_read(context, parse);
     let Some(plans) = context.shared_plans() else { return prepare(parse()); };
     if let Some(syntax) = plans.read_syntax(source) {
         return prepare(Ok(syntax.parsed_in(&context.memory)));
@@ -551,6 +576,21 @@ fn with_read_syntax<'input, T>(
     let prepared = prepare(parsed)?;
     if let Some(candidate) = candidate { plans.remember_read_syntax(&candidate); }
     Ok(prepared)
+}
+
+fn parse_read<T>(context: &QueryContext, parse: impl FnOnce() -> Result<T>) -> Result<T> {
+    let _span = context.start_preparation_span("xtdb.query.prepare.parse");
+    parse()
+}
+
+fn bind_read(context: &QueryContext, bind: impl FnOnce() -> Result<PreparedStatement>) -> Result<PreparedStatement> {
+    let _span = context.start_preparation_span("xtdb.query.prepare.bind");
+    bind()
+}
+
+fn optimize_read(prepared: PreparedStatement, context: &QueryContext, memory: &Arc<MemoryBudget>) -> Result<PreparedQuery> {
+    let _span = context.start_preparation_span("xtdb.query.prepare.plan");
+    PreparedQuery::from_prepared_in(prepared, &context.catalog, memory)
 }
 
 /// The node's shared plan for `source`, planning it into the node's cache on a miss.
@@ -589,7 +629,7 @@ fn plan_for_sharing(
     if !matches!(&prepared.statement, Statement::Query(_)) { return Ok(None); }
     let inferred = prepared.parameter_types.clone();
     let notices = std::mem::take(&mut prepared.notices);
-    let query = PreparedQuery::from_prepared_in(prepared, &context.catalog, budget)?;
+    let query = optimize_read(prepared, context, budget)?;
     Ok(recording.finish().map(|lookups| (Arc::new(lookups), query, inferred, notices)))
 }
 
@@ -799,6 +839,83 @@ mod shared_plan_tests {
     fn plan_of(sql: &str, context: &Arc<QueryContext>) -> Arc<rtdb_plan::Relation> {
         let statement = PreparedSql::prepare(sql, context, Default::default(), ResultSignaturePolicy::Dynamic).unwrap();
         Arc::clone(statement.bind(context, &[], true).unwrap().relation())
+    }
+
+    type Stages = Arc<parking_lot::Mutex<Vec<(String, Option<String>)>>>;
+
+    struct PreparationTracer(Stages);
+    struct PreparationSpan { stages: Stages, name: String, path: Option<String> }
+
+    impl rtdb_plan::Tracer for PreparationTracer {
+        fn query_enabled(&self) -> bool { true }
+        fn transaction_enabled(&self) -> bool { false }
+        fn start(&self, _: Option<rtdb_plan::SpanContext>, name: &str, _: &[(&str, TraceValue<'_>)]) -> Option<Box<dyn rtdb_plan::TraceSpan>> {
+            if !name.starts_with("xtdb.query.prepare.") && name != "xtdb.query" { return None; }
+            Some(Box::new(PreparationSpan { stages: Arc::clone(&self.0), name: name.into(), path: None }))
+        }
+    }
+
+    impl rtdb_plan::TraceSpan for PreparationSpan {
+        fn context(&self) -> rtdb_plan::SpanContext { rtdb_plan::SpanContext { trace_id: [1; 16], span_id: [1; 8] } }
+        fn attribute(&mut self, name: &str, value: TraceValue<'_>) {
+            if name == "rebind.path" && let TraceValue::Text(path) = value { self.path = Some(path.into()); }
+        }
+        fn end_at(&mut self, _: std::time::SystemTime) {}
+    }
+
+    impl Drop for PreparationSpan {
+        fn drop(&mut self) {
+            self.stages.lock().push((std::mem::take(&mut self.name), self.path.take()));
+        }
+    }
+
+    #[tokio::test]
+    async fn preparation_trace_separates_cold_parse_warm_rebind_and_execution() {
+        let node = MemoryBudget::new(1 << 30);
+        let plans = Arc::new(SharedPlans::new(&node));
+        let state = PartitionState::empty(Default::default()).unwrap();
+        put(&state, 1, "public", Value::I64(11), &node);
+        let stages: Stages = Arc::default();
+        let at = |timezone| session(&[("xtdb", &state)], "xtdb", timezone, &plans)
+            .with_tracer(Some(Arc::new(PreparationTracer(Arc::clone(&stages)))), None);
+        let utc = at("UTC");
+        let prepare = || PreparedSql::prepare_postgres("SELECT v FROM docs", &utc, vec!["public".into()], &[]).unwrap();
+        let take = || std::mem::take(&mut *stages.lock());
+        let stage = |name: &str, path: Option<&str>| (format!("xtdb.query.prepare.{name}"), path.map(str::to_owned));
+
+        let first = prepare();
+        assert_eq!(take(), [stage("parse", None), stage("bind", None), stage("plan", None)]);
+        let second = prepare();
+        assert!(take().is_empty());
+        assert_eq!(first_value(&first, &utc).await, Value::I64(11));
+        assert_eq!(take(), [stage("rebind", Some("statement")), ("xtdb.query".into(), None)]);
+
+        let paris = at("Europe/Paris");
+        assert_eq!(first_value(&first, &paris).await, Value::I64(11));
+        assert_eq!(take(), [
+            stage("bind", None), stage("plan", None), stage("rebind", Some("shared_replan")), ("xtdb.query".into(), None),
+        ]);
+        assert_eq!(first_value(&second, &paris).await, Value::I64(11));
+        assert_eq!(take(), [stage("rebind", Some("shared_hit")), ("xtdb.query".into(), None)]);
+    }
+
+    #[test]
+    fn an_inflight_rebind_keeps_evicted_plan_metadata_charged() {
+        let node = MemoryBudget::new(1 << 30);
+        let plans = Arc::new(SharedPlans::new(&node));
+        let state = PartitionState::empty(Default::default()).unwrap();
+        let context = session(&[("xtdb", &state)], "xtdb", "UTC", &plans);
+        let statement = PreparedSql::prepare("SELECT 1 AS one", &context, Default::default(), ResultSignaturePolicy::Dynamic).unwrap();
+        let reader = statement.0.plan.lock().as_ref().unwrap().plan.acquire().unwrap();
+        assert!(matches!(&reader, KeptPlan::Shared(_)));
+        let charge = plans.stats().plan_charged_bytes;
+        assert!(charge > 0);
+        drop((context, plans));
+        assert_eq!(node.used_bytes(), charge);
+
+        drop(reader);
+        assert_eq!(node.used_bytes(), 0);
+        assert!(statement.0.plan.lock().as_ref().unwrap().plan.acquire().is_none());
     }
 
     #[test]

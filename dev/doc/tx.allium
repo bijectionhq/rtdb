@@ -104,7 +104,10 @@
 -- The syntax charge follows its last reader after eviction.
 -- Node metrics report read preparations, shared plan misses, syntax cache hits and misses, and the bytes charged to the two caches.
 -- The cache entry owns raw metadata retained by its shared plan.
+-- An in-flight rebind keeps the shared entry's catalog metadata charged through validation and query admission, including after eviction.
 -- Rebinding charges execution to the query budget while the statement retains its plan charge.
+-- Opt-in query tracing times reached text parsing, SQL binding and plan construction separately from query execution.
+-- A rebind span distinguishes schema inference from execution, and statement reuse, shared reuse, shared planning and local planning.
 -- Compatible list and struct parameters stay in Arrow through that projection.
 -- Arithmetic on compatible integer and floating-point parameter columns uses the Arrow projection kernel.
 -- Supported comparisons, casts, and string functions can consume bound Arrow columns in the vector expression evaluator.

@@ -519,6 +519,10 @@ impl QueryContext {
         self
     }
 
+    pub fn start_preparation_span(&self, name: &'static str) -> Option<Box<dyn rtdb_plan::TraceSpan>> {
+        self.tracer.as_ref().filter(|tracer| tracer.query_enabled())?.start(self.trace_parent, name, &[])
+    }
+
     pub fn with_application_name(mut self: Arc<Self>, name: Option<&str>) -> Arc<Self> {
         if self.tracer.as_ref().is_some_and(|tracer| tracer.query_enabled()) {
             let application_name = name.and_then(|name| {
