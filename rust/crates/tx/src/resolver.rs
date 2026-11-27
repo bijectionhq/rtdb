@@ -5221,10 +5221,10 @@ mod tests {
         let snapshot = declare.snapshot()?;
         let key = TransactionKey { tx_id: TxId(2), system_time: Timestamp(10) };
         let hosted = serde_json::json!({
-            "binding": [1u8; 32], "archive": [2u8; 32], "through": 4000,
-            "original_authority": [4u8; 16], "captured": {"tx_id": 3, "system_time": 4},
+            "binding": ([1u8; 32]), "archive": ([2u8; 32]), "through": 4000,
+            "original_authority": ([4u8; 16]), "captured": {"tx_id": 3, "system_time": 4},
             "handoff": null, "previous": null, "source": {"tx_id": 3, "system_time": 4},
-            "logical_at": 3000, "fingerprint": [3u8; 32], "commit_positions": [],
+            "logical_at": 3000, "fingerprint": ([3u8; 32]), "commit_positions": [],
             "assertion_lines": {"lines": [], "by_position": []},
         }).to_string();
         let table = relation.table("owner");
@@ -5257,7 +5257,7 @@ mod tests {
                     }
                 }
                 let expected = baseline.write_owned(&relation, &rows, Some(iids), from, to, true).await;
-                let observed = typed.apply(op).await;
+                let observed = typed.apply_inner(op).await;
                 if coefficient == 10000 {
                     let error = expected.unwrap_err();
                     assert_eq!(error.code, "rtdb/decimal-precision");
