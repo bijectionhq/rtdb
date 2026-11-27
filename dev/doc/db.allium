@@ -2433,6 +2433,7 @@ surface QueryAccess {
         -- Its columnar result is split to the transport row limit after the operators have processed the complete page.
         -- Scalar evaluation in columnar projections, filters, aggregate filters, and evaluated UNNEST can borrow the cells demanded by the expression.
         -- Character and octet lengths and supported unary floating-point calls can read the active cells of selected and run-end encoded inputs and write fixed-width Arrow results.
+        -- ROUND with a literal or omitted scale can read Float32 and Float64 column cells in place through compatible selections, unions and run ends, writing admitted Float64 results and reporting overflow only for reached non-null cells.
         -- Eligible comparisons and LIKE write Arrow truth values with validity, preserving the distinction between false and unknown.
         -- A literal LIKE matcher can be reused across batches, and a pattern error is reported when evaluation reaches the pattern.
         -- A CASE projection with cosine scores, double literals or null as its only results can write Arrow values and validity as each row's selected branch is evaluated.

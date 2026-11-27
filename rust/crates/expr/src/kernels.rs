@@ -73,7 +73,11 @@ pub fn doubles(function: fn(f64) -> f64, values: &Float64Array) -> Float64Array 
 
 /// ROUND(cell, `scale`) over doubles.
 pub fn round_doubles(values: &Float64Array, scale: i64, selection: Selection<'_>) -> Result<Float64Array> {
-    Ok(cells(values, selection, |row| crate::functions::round_float(values.value(row), scale))?.into())
+    Ok(cells(values, selection, |row| round_double(values.value(row), scale))?.into())
+}
+
+pub fn round_double(value: f64, scale: i64) -> Result<f64> {
+    crate::functions::round_float(value, scale)
 }
 
 /// ABS over 64-bit integers.

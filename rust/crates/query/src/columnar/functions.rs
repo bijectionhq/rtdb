@@ -287,6 +287,7 @@ enum Kind {
     Extract { field: String, source: Box<Node> },
     /// `scale` is `None` for the one-argument form, which leaves an integer as it is.
     Round { value: Box<Node>, scale: Option<i64> },
+    RoundFloatColumn { position: usize, scale: i64 },
     Abs(Box<Node>),
     TextCase { text: Box<Node>, upper: bool },
     Length { operand: Box<Node>, octets: bool },
@@ -319,11 +320,11 @@ enum Kind {
 }
 
 impl Kind {
-    /// The arguments of a strict node, which is null wherever one of them is, in the order the row evaluator prepares
-    /// them; `None` for a leaf, a CASE or a predicate answered as truths.
+    /// Strict arguments prepared as vectors, in the order the row evaluator prepares them.
     fn arguments(&self) -> Option<Vec<&Node>> {
         Some(match self {
             Self::Column(_) | Self::Literal(_) | Self::Parameter(_) | Self::Case { .. } | Self::Length { .. } | Self::Double(..)
+                | Self::RoundFloatColumn { .. }
                 | Self::Compare { .. } | Self::Identical { .. }
                 | Self::IsNull { .. } | Self::Like { .. } | Self::Between { .. } | Self::Logical { .. } => return None,
             Self::Extract { source: argument, .. } | Self::Round { value: argument, .. } | Self::Abs(argument) | Self::TextCase { text: argument, .. }
@@ -638,36 +639,11 @@ impl Node {
                     };
                     (Kind::Extract { field: field.clone(), source: Box::new(source) }, ty)
                 }
-                (Function::Round, [value]) => {
-                    let (value, v_ty) = Self::bind_vector(value, schema, params)?;
-                    if !strict_args_settle(&[&value]) { return None; }
-                    let ty = match v_ty {
-                        VectorType::Null => { if !declared.nullable() { return None; } VectorType::Null }
-                        ty @ (VectorType::I32 | VectorType::I64 | VectorType::F64) if result_ty == ty => ty,
-                        _ => return None,
-                    };
-                    (Kind::Round { value: Box::new(value), scale: None }, ty)
-                }
-                (Function::Round, [value, Expr::Literal(Value::I64(scale))]) => {
-                    let (value, v_ty) = Self::bind_vector(value, schema, params)?;
-                    if !strict_args_settle(&[&value]) { return None; }
-                    let ty = match v_ty {
-                        VectorType::Null => { if !declared.nullable() { return None; } VectorType::Null }
-                        VectorType::F64 if result_ty == VectorType::F64 => VectorType::F64,
-                        _ => return None,
-                    };
-                    (Kind::Round { value: Box::new(value), scale: Some(*scale) }, ty)
-                }
-                (Function::Round, [value, Expr::Literal(Value::I32(scale))]) => {
-                    let (value, v_ty) = Self::bind_vector(value, schema, params)?;
-                    if !strict_args_settle(&[&value]) { return None; }
-                    let ty = match v_ty {
-                        VectorType::Null => { if !declared.nullable() { return None; } VectorType::Null }
-                        VectorType::F64 if result_ty == VectorType::F64 => VectorType::F64,
-                        _ => return None,
-                    };
-                    (Kind::Round { value: Box::new(value), scale: Some(i64::from(*scale)) }, ty)
-                }
+                (Function::Round, [value]) => Self::bind_round(value, None, &declared, &result_ty, schema, params)?,
+                (Function::Round, [value, Expr::Literal(Value::I64(scale))]) =>
+                    Self::bind_round(value, Some(*scale), &declared, &result_ty, schema, params)?,
+                (Function::Round, [value, Expr::Literal(Value::I32(scale))]) =>
+                    Self::bind_round(value, Some(i64::from(*scale)), &declared, &result_ty, schema, params)?,
                 (Function::Abs, [value]) => {
                     let (value, v_ty) = Self::bind_vector(value, schema, params)?;
                     if !strict_args_settle(&[&value]) { return None; }
@@ -918,6 +894,28 @@ impl Node {
         Some((Self { kind, declared }, ty))
     }
 
+    fn bind_round(value: &Expr, scale: Option<i64>, declared: &LogicalType, result_ty: &VectorType,
+        schema: &Schema, params: Option<&[Option<LogicalType>]>,
+    ) -> Option<(Kind, VectorType)> {
+        let floating = |logical: &LogicalType| predicate::cell_kinds(logical).is_some_and(|kinds| kinds == [predicate::CellKind::Float]);
+        if *result_ty == VectorType::F64 && let Expr::Column { id, data_type } = value && floating(data_type) {
+            let position = schema.position(*id)?;
+            if floating(&schema.fields()[position].data_type) {
+                let kind = Kind::RoundFloatColumn { position, scale: scale.unwrap_or(0) };
+                return Some((kind, VectorType::F64));
+            }
+        }
+        let (value, ty) = Self::bind_vector(value, schema, params)?;
+        if !strict_args_settle(&[&value]) { return None; }
+        match ty {
+            VectorType::Null if declared.nullable() => {}
+            VectorType::F64 if ty == *result_ty => {}
+            VectorType::I32 | VectorType::I64 if scale.is_none() && ty == *result_ty => {}
+            _ => return None,
+        }
+        Some((Kind::Round { value: Box::new(value), scale }, ty))
+    }
+
     fn bind_arithmetic(
         op: BinaryOp, left: &Expr, right: &Expr, declared: &LogicalType, result_ty: &VectorType,
         schema: &Schema, params: Option<&[Option<LogicalType>]>,
@@ -951,7 +949,7 @@ impl Node {
             let add = |a: usize, b: usize| a.checked_add(b).ok_or_else(super::size_error);
             let mut bytes = add(size_of::<Self>(), self.declared.retained_bytes()?)?;
             match &self.kind {
-                Kind::Column(_) | Kind::Parameter(_) => {}
+                Kind::Column(_) | Kind::Parameter(_) | Kind::RoundFloatColumn { .. } => {}
                 Kind::Literal(value) => bytes = add(bytes, value.retained_bytes()?)?,
                 Kind::Extract { field, source } => {
                     bytes = add(bytes, field.capacity())?;
@@ -1000,7 +998,7 @@ impl Node {
     /// predicate that may be null, an argument of several legs) can't fail.
     fn settles(&self) -> bool {
         stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || match &self.kind {
-            Kind::Column(_) | Kind::Literal(_) | Kind::Parameter(_) => true,
+            Kind::Column(_) | Kind::Literal(_) | Kind::Parameter(_) | Kind::RoundFloatColumn { .. } => true,
             Kind::Compare { left, right, .. } | Kind::Identical { left, right } => left.prepares() && right.prepares(),
             Kind::Like { input, pattern, .. } => input.prepares() && pattern.prepares(),
             Kind::Length { operand, .. } | Kind::Double(_, operand) => operand.prepares(),
@@ -1176,6 +1174,14 @@ impl Evaluation<'_> {
                     }
                 }
             }
+            Kind::RoundFloatColumn { position, scale } => {
+                if len == 0 { return null(); }
+                let Some(cells) = Cells::of(&self.columns[*position]) else { return Ok(None) };
+                self.map_operand::<Float64Type>(&Operand::Cells(cells), selection, Vector::F64, |cell| match cell {
+                    Cell::Float(value) => Some(kernels::round_double(value, *scale)),
+                    _ => None,
+                })?
+            }
             Kind::Abs(_) => {
                 let argument = argument();
                 match &argument.vector {
@@ -1197,7 +1203,7 @@ impl Evaluation<'_> {
                 if len == 0 { return null(); }
                 let Some(operand) = self.operand(operand, selection)? else { return Ok(None) };
                 self.map_operand::<Int32Type>(&operand, selection, Vector::I32, |cell| match cell {
-                    Cell::Text(text) => i32::try_from(if *octets { text.len() } else { text.chars().count() }).ok(),
+                    Cell::Text(text) => i32::try_from(if *octets { text.len() } else { text.chars().count() }).ok().map(Ok),
                     _ => None,
                 })?
             }
@@ -1225,8 +1231,8 @@ impl Evaluation<'_> {
                     self.built(Some(Vector::F64(kernels::doubles(*function, values))))?
                 } else {
                     self.map_operand::<Float64Type>(&operand, selection, Vector::F64, |cell| match cell {
-                        Cell::Float(value) => Some(function(value)),
-                        Cell::Int(value) => Some(function(value as f64)),
+                        Cell::Float(value) => Some(Ok(function(value))),
+                        Cell::Int(value) => Some(Ok(function(value as f64))),
                         _ => None,
                     })?
                 }
@@ -1365,7 +1371,7 @@ impl Evaluation<'_> {
     }
 
     fn map_operand<T: ArrowPrimitiveType>(&self, operand: &Operand<'_>, selection: Selection<'_>,
-        vector: impl FnOnce(PrimitiveArray<T>) -> Vector, value: impl Fn(Cell<'_>) -> Option<T::Native>,
+        vector: impl FnOnce(PrimitiveArray<T>) -> Vector, value: impl Fn(Cell<'_>) -> Option<Result<T::Native>>,
     ) -> Result<Option<Charged>> {
         if matches!(operand, Operand::Constant(None) | Operand::Cells(Cells::Null) | Operand::Computed(Charged { vector: Vector::Null, .. })) {
             return Ok(Some(Charged::shared(Vector::Null)));
@@ -1378,6 +1384,7 @@ impl Evaluation<'_> {
             return Ok(Some(Charged::shared(Vector::Null)));
         };
         let Ok(Some(cell)) = cell else { return Ok(None) };
+        let cell = cell?;
         let bytes = self.len.checked_mul(size_of::<T::Native>())
             .and_then(|bytes| bytes.checked_add(PredicateSelection::bitmap_bound(self.len)))
             .ok_or_else(super::size_error)?;
@@ -1387,7 +1394,7 @@ impl Evaluation<'_> {
         output.append_value(cell);
         for (_, cell) in cells {
             let Ok(cell) = cell else { return Ok(None) };
-            output.append_option(cell);
+            output.append_option(cell.transpose()?);
         }
         Ok(Some(Charged { vector: vector(output.finish()), _charge: Some(charge) }))
     }
@@ -2004,6 +2011,102 @@ mod tests {
     }
 
     #[test]
+    fn round_borrows_selected_mixed_floats_with_run_ends_within_the_output_budget() {
+        use arrow_array::{Float32Array, RunArray};
+
+        let float32 = LogicalType::Scalar(ScalarType::F32);
+        let float64 = LogicalType::Scalar(ScalarType::F64);
+        let encoded_type = LogicalType::RunEndEncoded {
+            width: rtdb_types::RunEndWidth::I32,
+            value: Box::new(float32.clone().maybe()),
+        };
+        let input = Field { data_type: LogicalType::from_legs([float32, float64.clone(), LogicalType::Null]), ..field(0) };
+        let schema = Schema::new(vec![input.clone()]).unwrap();
+        let source = |array: ArrayRef, logical: LogicalType| {
+            let field = Arc::new(rtdb_columnar::to_field("c0", &logical).unwrap());
+            Some((array, field, Some(logical), None))
+        };
+        let encoded = RunArray::<Int32Type>::try_new(
+            &Int32Array::from(vec![2, 3, 5]),
+            &Float32Array::from(vec![Some(0.2), None, Some(-2.5)]),
+        ).unwrap().slice(1, 4);
+        let doubles = Float64Array::from(vec![-0.0, f64::NAN, f64::INFINITY, 1.25]);
+        let sources = vec![source(Arc::new(encoded), encoded_type), source(Arc::new(doubles), float64.clone()), None];
+        let pattern = [(0, 2), (1, 0), (2, 0), (0, 1), (0, 0), (1, 2), (1, 1), (1, 3), (0, 2)];
+        let len = pattern.len() * 128;
+        let positions = Arc::new(pattern.into_iter().cycle().take(len).collect());
+        let input_memory = MemoryBudget::new(1 << 20);
+        let batch = ColumnBatch::settled(
+            vec![Column::Selected(SelectedColumn::new(sources, positions))],
+            len,
+            input_memory.reserve(0).unwrap(),
+        ).unwrap();
+        let output_bytes = len * size_of::<f64>() + PredicateSelection::bitmap_bound(len);
+        let memory = MemoryBudget::new(output_bytes);
+        let context = rtdb_expr::EvalContext::default();
+        for scale in [None, Some(Value::I32(1)), Some(Value::I64(-1))] {
+            let args = std::iter::once(input.expression()).chain(scale.map(Expr::Literal)).collect();
+            let expr = call("round", args);
+            let Some(Column::Arrow { array, logical, .. }) = project(&expr, &schema, &batch, &memory).unwrap() else {
+                panic!("ROUND can read selected mixed float cells")
+            };
+            assert_eq!(logical, Some(float64.clone().maybe()));
+            let output = array.as_any().downcast_ref::<Float64Array>().unwrap();
+            for (row, actual) in output.iter().enumerate() {
+                let input = batch.columns[0].value(row).unwrap();
+                let expected = rtdb_expr::evaluate(&expr, &schema, &[input], &context).unwrap();
+                match expected {
+                    Value::Null => assert_eq!(actual, None),
+                    Value::F64(expected) if expected.is_nan() => assert!(actual.unwrap().is_nan()),
+                    Value::F64(expected) => assert_eq!(actual.map(f64::to_bits), Some(expected.to_bits())),
+                    other => panic!("unexpected ROUND result {other:?}"),
+                }
+            }
+        }
+        let expr = call("round", vec![input.expression()]);
+        let refused = MemoryBudget::new(output_bytes - 1);
+        let error = project(&expr, &schema, &batch, &refused).err().expect("the result needs admission");
+        assert!(error.is(rtdb_types::AnomalyKind::ResourceExhausted));
+        assert_eq!(refused.used_bytes(), 0);
+    }
+
+    #[test]
+    fn borrowed_round_skips_null_and_untaken_cells_but_reports_reached_overflow() {
+        use arrow_array::Float32Array;
+
+        let input = Field { data_type: LogicalType::Scalar(ScalarType::F32).maybe(), ..field(0) };
+        let schema = Schema::new(vec![input.clone()]).unwrap();
+        let array = Arc::new(Float32Array::from(vec![None, Some(f32::INFINITY), Some(1.0)]));
+        let arrow_field = Arc::new(rtdb_columnar::to_field("c0", &input.data_type).unwrap());
+        let batch = ColumnBatch::settled(
+            vec![Column::Arrow { array, field: arrow_field, logical: Some(input.data_type.clone()) }],
+            3,
+            MemoryBudget::new(1 << 20).reserve(0).unwrap(),
+        ).unwrap();
+        let round = call("round", vec![input.expression(), Expr::Literal(Value::I64(400))]);
+        let memory = MemoryBudget::new(1 << 20);
+        let context = rtdb_expr::EvalContext::default();
+        let expected = rtdb_expr::evaluate(&round, &schema, &[Value::F32(1.0)], &context).unwrap_err();
+        let reached = project(&round, &schema, &batch, &memory).err().expect("a finite cell overflows");
+        assert_eq!(reached.code, expected.code);
+        assert_eq!(memory.used_bytes(), 0);
+
+        let null_scale = call("round", vec![input.expression(), Expr::Literal(Value::Null)]);
+        assert!(Projection::bind(&null_scale, &schema).is_none());
+        assert_eq!(rtdb_expr::evaluate(&null_scale, &schema, &[Value::F32(1.0)], &context).unwrap(), Value::Null);
+
+        let guarded = Expr::Case {
+            branches: vec![(Expr::binary(BinaryOp::Eq, input.expression(), Expr::Literal(Value::F32(1.0))), Expr::Literal(Value::F64(-1.0)))],
+            otherwise: Box::new(round),
+        };
+        let Some(Column::Arrow { array, .. }) = project(&guarded, &schema, &batch, &memory).unwrap() else {
+            panic!("the guarded ROUND uses the Arrow kernel")
+        };
+        let output = array.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(output.iter().collect::<Vec<_>>(), [None, Some(f64::INFINITY), Some(-1.0)]);
+    }
+
+    #[test]
     fn all_null_unary_input_needs_no_fixed_width_output_buffer() {
         let fields = [field(3), field(2)];
         let schema = Schema::new(fields.to_vec()).unwrap();
@@ -2016,7 +2119,7 @@ mod tests {
         let input_memory = MemoryBudget::new(1 << 20);
         let batch = ColumnBatch::settled(columns, len, input_memory.reserve(0).unwrap()).unwrap();
         let memory = MemoryBudget::new(0);
-        for (name, input) in ["length", "sqrt"].into_iter().zip(fields) {
+        for (name, input) in [("length", &fields[0]), ("sqrt", &fields[1]), ("round", &fields[1])] {
             let expr = call(name, vec![input.expression()]);
             let Some(Column::Arrow { array, .. }) = project(&expr, &schema, &batch, &memory).unwrap() else {
                 panic!("the unary kernel accepts all-null input")
