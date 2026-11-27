@@ -815,6 +815,10 @@ async fn fixed_aggregate_results_keep_declared_layout_nulls_and_page_custody() {
         (AggregateFunction::Any, Value::Bool(false), Value::Bool(true), Value::Bool(true)),
         (AggregateFunction::Max, Value::I16(-257), Value::I16(1300), Value::I16(1300)),
         (AggregateFunction::Min,
+            Value::Time { value: 19, unit: TimeUnit::Millisecond, bit_width: 32 },
+            Value::Time { value: 11, unit: TimeUnit::Millisecond, bit_width: 32 },
+            Value::Time { value: 11, unit: TimeUnit::Millisecond, bit_width: 32 }),
+        (AggregateFunction::Min,
             timestamp(1_700_000_000_000_000, TimeUnit::Microsecond, "America/New_York"),
             timestamp(1_700_000_000_000_000_001, TimeUnit::Nanosecond, "UTC"),
             timestamp(1_700_000_000_000_000_000, TimeUnit::Nanosecond, "Z")),
@@ -971,7 +975,7 @@ async fn primitive_result(mut cursor: AggregateCursor) -> Value {
 }
 
 #[test]
-fn aggregate_input_temporal_extrema_and_boolean_fit_in_reserved_group_state() {
+fn aggregate_input_inline_extrema_and_boolean_fit_in_reserved_group_state() {
     use crate::columnar::SelectedColumn;
 
     let execution = execution(8);
@@ -988,6 +992,14 @@ fn aggregate_input_temporal_extrema_and_boolean_fit_in_reserved_group_state() {
         inputs.push((Value::Duration { value: -9, unit }, Value::Duration { value: 9, unit }));
     }
     inputs.push((Value::Bool(false), Value::Bool(true)));
+    inputs.extend([
+        (Value::I8(-2), Value::I8(3)),
+        (Value::I16(-234), Value::I16(901)),
+        (Value::I32(-132_999), Value::I32(267_444)),
+        (Value::I64(i64::MIN), Value::I64(i64::MAX)),
+        (Value::F32(-9.5), Value::F32(0.0)),
+        (Value::F64(-1.5), Value::F64(19.25)),
+    ]);
     for (lesser, greater) in inputs {
         let input = lesser.logical_type().maybe();
         let functions = if matches!(lesser, Value::Bool(_)) {
@@ -1021,6 +1033,49 @@ fn aggregate_input_temporal_extrema_and_boolean_fit_in_reserved_group_state() {
         }
     }
     assert_eq!(memory.used_bytes(), baseline);
+}
+
+#[test]
+fn numeric_winner_keeps_nan_bits_and_signed_zero_across_input_routes() {
+    let execution = execution(8);
+    let output = LogicalType::Scalar(ScalarType::F64).maybe();
+    let first_nan = f64::from_bits(0x7ff8_0000_0000_1000);
+    let next_nan = f64::from_bits(0xfff8_0000_0000_2000);
+    for (minimum, typed, generic, expected) in [
+        (false, first_nan, next_nan, first_nan),
+        (false, -0.0, 0.0, 0.0),
+        (true, 0.0, -0.0, -0.0),
+        (true, first_nan, 44.0, 44.0),
+    ] {
+        let mut state = ScalarAccumulator::default();
+        state.numeric_extremum(NumericCell::Float64(typed), &output, minimum).unwrap();
+        state.scalar_extremum(&Value::F64(generic), &output, minimum, &execution, &execution.context.memory).unwrap();
+        let ScalarState::F64(winner) = state.accumulator else { panic!("Expected an inline numeric winner"); };
+        assert_eq!(winner.to_bits(), expected.to_bits());
+    }
+}
+
+#[test]
+fn byte_extremum_result_owns_the_winners_and_keeps_empty_groups_null() {
+    let execution = execution(8);
+    let context = &execution.context;
+    let baseline = context.memory.used_bytes();
+    for winner in [Value::Utf8("winner".repeat(1024)), Value::Binary(vec![0xff; 8192])] {
+        let field = field(0, winner.logical_type().maybe());
+        let (column, charge) = {
+            let mut states = ScalarGroups::new(&execution).unwrap();
+            states.ensure(2).unwrap();
+            states.values[1].accumulator = ScalarState::Retained(OwnedRow::new(vec![winner.clone()], &context.memory).unwrap());
+            byte_scalar_results(&states, &AggregateFunction::Max, &field, context).unwrap().unwrap()
+        };
+        let batch = ColumnBatch::settled(vec![], 2, context.memory.reserve(256).unwrap()).unwrap();
+        let mut batch = batch;
+        batch.append_column(column, charge, &context.memory).unwrap();
+        assert_eq!(batch.columns[0].value(0).unwrap(), Value::Null);
+        assert_eq!(batch.columns[0].value(1).unwrap(), winner);
+        drop(batch);
+        assert_eq!(context.memory.used_bytes(), baseline);
+    }
 }
 
 #[test]

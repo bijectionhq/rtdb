@@ -2465,6 +2465,7 @@ surface QueryAccess {
         -- Grouped output keeps the configured transport row limit.
         -- Primitive numeric sums retain their state at the declared accumulation width within each group.
         -- Scalar aggregates reduce compatible numeric Arrow operands in input order and write compatible results as Arrow columns.
+        -- Fixed-width numeric extrema keep one inline winner per group and retain the first value when candidates compare equal.
         -- Direct writers for fixed-width aggregate results preserve the declared Arrow layout even when every group yields null.
         -- The output page owns the charge for those buffers.
         -- A same-scale Decimal128 sum at non-negative scale accumulates its exact coefficient and checks physical overflow.
@@ -2473,6 +2474,7 @@ surface QueryAccess {
         -- Timestamp, time and duration extrema compare Arrow ticks directly when the input layout matches the result type.
         -- An extremum requiring temporal conversion casts each reached candidate before comparison and preserves the result type's unit and timezone label.
         -- Text and binary extrema compare compatible Arrow cells by bytes and copy only a replacement winner.
+        -- A compatible text or binary result copies the retained winners directly into the output page's Arrow buffers.
         -- EVERY and ANY read compatible Arrow Boolean cells in selection order and retain a nullable Boolean per group.
         -- Aggregate DISTINCT indexes its selected argument positions within each group and retains arguments whose SQL equality is unknown.
         -- A sparsely retained typed DISTINCT argument page can compact to the positions that entered the index.

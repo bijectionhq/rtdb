@@ -378,6 +378,10 @@ impl AggregateCursor {
                 batch.append_column(column, charge, &context.memory)?;
                 continue;
             }
+            if let Some((column, charge)) = byte_scalar_results(&states, &aggregate.function, field, context)? {
+                batch.append_column(column, charge, &context.memory)?;
+                continue;
+            }
             let bytes = batch.len.checked_mul(std::mem::size_of::<Value>().max(40)).and_then(|bytes| bytes.checked_add(field.name.len()))
                 .and_then(|bytes| bytes.checked_add(512)).ok_or_else(|| invalid("aggregate-size", "Aggregate output exceeds addressable memory"))?;
             let reservation = context.memory.reserve(bytes)?;
@@ -477,6 +481,15 @@ fn fixed_scalar_results(
         ScalarState::TemporalExtremum(value) => Ok(Some(*value)),
         _ => retained!(state, Value::Timestamp { value, .. } => *value),
     };
+    let time = |state: &ScalarAccumulator| match &state.accumulator {
+        ScalarState::Empty => Ok(None),
+        ScalarState::TemporalExtremum(value) => Ok(Some(*value)),
+        _ => Err(state_error()),
+    };
+    let time32 = |state: &ScalarAccumulator| time(state)?.map(|value| {
+        i32::try_from(value).map_err(|_| rtdb_types::Anomaly::incorrect("rtdb/time-overflow", "Time exceeds i32 representation")
+            .with_kind(rtdb_types::AnomalyKind::NumericValueOutOfRange))
+    }).transpose();
     let duration = |state: &ScalarAccumulator| match (&state.accumulator, function) {
         (_, A::Average) if state.count == 0 => Ok(None),
         (ScalarState::Duration(value, _), A::Average) => Ok(Some(value.wrapping_div(state.count))),
@@ -489,8 +502,12 @@ fn fixed_scalar_results(
         (A::Sum | A::Min | A::Max, S::I64) => numeric!(Int64Type, I64),
         (A::Sum | A::Min | A::Max, S::F32) => numeric!(Float32Type, F32),
         (A::Min | A::Max, S::F64) => numeric!(Float64Type, F64),
-        (A::Min | A::Max, S::I8) => primitive!(Int8Type, |state| retained!(state, Value::I8(value) => *value)),
-        (A::Min | A::Max, S::I16) => primitive!(Int16Type, |state| retained!(state, Value::I16(value) => *value)),
+        (A::Min | A::Max, S::I8) => numeric!(Int8Type, I8),
+        (A::Min | A::Max, S::I16) => numeric!(Int16Type, I16),
+        (A::Min | A::Max, S::Time { unit: TimeUnit::Second, bit_width: 32 }) => primitive!(Time32SecondType, time32),
+        (A::Min | A::Max, S::Time { unit: TimeUnit::Millisecond, bit_width: 32 }) => primitive!(Time32MillisecondType, time32),
+        (A::Min | A::Max, S::Time { unit: TimeUnit::Microsecond, bit_width: 64 }) => primitive!(Time64MicrosecondType, time),
+        (A::Min | A::Max, S::Time { unit: TimeUnit::Nanosecond, bit_width: 64 }) => primitive!(Time64NanosecondType, time),
         (A::Min | A::Max, S::Timestamp { unit, .. }) => match unit {
             TimeUnit::Second => primitive!(TimestampSecondType, timestamp),
             TimeUnit::Millisecond => primitive!(TimestampMillisecondType, timestamp),
@@ -531,6 +548,56 @@ fn fixed_scalar_results(
         }
         _ => Ok(None),
     }
+}
+
+fn byte_scalar_results(
+    states: &ScalarGroups, function: &AggregateFunction, field: &rtdb_plan::Field, context: &crate::QueryContext,
+) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
+    use arrow_array::builder::{BinaryBuilder, StringBuilder};
+    if !matches!(function, AggregateFunction::Min | AggregateFunction::Max)
+        || !matches!(without_nullability(&field.data_type), LogicalType::Scalar(ScalarType::Utf8 | ScalarType::Binary))
+    {
+        return Ok(None);
+    }
+    let text = without_nullability(&field.data_type) == &LogicalType::Scalar(ScalarType::Utf8);
+    let len = states.values.len();
+    let mut payload = 0usize;
+    let mut has_winner = false;
+    for (row, state) in states.values.iter().enumerate() {
+        context.check_cancelled_at(row)?;
+        let size = match state.accumulator.retained() {
+            Some(Value::Utf8(value)) if text => value.len(),
+            Some(Value::Binary(value)) if !text => value.len(),
+            None if matches!(state.accumulator, ScalarState::Empty) => continue,
+            _ => return Ok(None),
+        };
+        has_winner = true;
+        let Some(bytes) = payload.checked_add(size).filter(|bytes| i32::try_from(*bytes).is_ok()) else {
+            return Ok(None);
+        };
+        payload = bytes;
+    }
+    if !has_winner { return Ok(None); }
+    let bytes = len.checked_add(1)
+        .and_then(|offsets| offsets.checked_mul(size_of::<i32>()))
+        .and_then(|bytes| bytes.checked_add(payload))
+        .ok_or_else(|| invalid("aggregate-size", "Aggregate output exceeds addressable memory"))?;
+    build_fixed_results(field, context, len, bytes, |_| {
+        macro_rules! build {
+            ($builder:ty, $variant:ident) => {{
+                let mut builder = <$builder>::with_capacity(len, payload);
+                for (row, state) in states.values.iter().enumerate() {
+                    context.check_cancelled_at(row)?;
+                    match state.accumulator.retained() {
+                        Some(Value::$variant(value)) => builder.append_value(value),
+                        _ => builder.append_null(),
+                    }
+                }
+                Ok(Arc::new(builder.finish()))
+            }};
+        }
+        if text { build!(StringBuilder, Utf8) } else { build!(BinaryBuilder, Binary) }
+    }).map(Some)
 }
 
 fn primitive_results<T: ArrowPrimitiveType>(
@@ -1564,7 +1631,7 @@ impl ScalarGroups {
                         let state = &mut self.values[group];
                         if let Some(column) = &numeric {
                             if let Some(value) = column.get(row) {
-                                state.numeric_extremum(value, output, minimum, &self.state)?;
+                                state.numeric_extremum(value, output, minimum)?;
                             }
                         } else if let Some(column) = temporal {
                             if let Some((array, offset)) = present_column_cell(column, row)? {
@@ -1695,6 +1762,8 @@ impl ScalarGroups {
 enum ScalarState {
     #[default]
     Empty,
+    I8(i8),
+    I16(i16),
     I32(i32),
     I64(i64),
     F32(f32),
@@ -1816,32 +1885,32 @@ impl ScalarAccumulator {
         Ok(())
     }
 
-    fn numeric_extremum(&mut self, value: NumericCell, output: &LogicalType, minimum: bool, state: &Arc<rtdb_columnar::MemoryBudget>) -> Result<()> {
-        use crate::scalar_key::ScalarKey;
-        if let Some(previous) = self.accumulator.retained() {
-            let previous = match previous {
-                Value::I8(value) => ScalarKey::Signed(i64::from(*value)),
-                Value::I16(value) => ScalarKey::Signed(i64::from(*value)),
-                Value::I32(value) => ScalarKey::Signed(i64::from(*value)),
-                Value::I64(value) => ScalarKey::Signed(*value),
-                Value::F32(value) => ScalarKey::Float(f64::from(*value)),
-                Value::F64(value) => ScalarKey::Float(*value),
-                _ => return Err(invalid("aggregate-state", "Expected a numeric extremum")),
-            };
-            if value.key().ordered_compare(previous) != Some(if minimum { Ordering::Less } else { Ordering::Greater }) {
+    fn numeric_extremum(&mut self, value: NumericCell, output: &LogicalType, minimum: bool) -> Result<()> {
+        use ScalarState as S;
+        let previous = match self.accumulator {
+            S::Empty => None,
+            S::I8(value) => Some(NumericCell::Integer(i64::from(value))),
+            S::I16(value) => Some(NumericCell::Integer(i64::from(value))),
+            S::I32(value) => Some(NumericCell::Integer(i64::from(value))),
+            S::I64(value) => Some(NumericCell::Integer(value)),
+            S::F32(value) => Some(NumericCell::Float32(value)),
+            S::F64(value) => Some(NumericCell::Float64(value)),
+            _ => return Err(invalid("aggregate-state", "Expected a numeric extremum")),
+        };
+        if let Some(previous) = previous {
+            if value.key().ordered_compare(previous.key()) != Some(if minimum { Ordering::Less } else { Ordering::Greater }) {
                 return Ok(());
             }
         }
-        let next = match (without_nullability(output), value) {
-            (LogicalType::Scalar(ScalarType::I8), NumericCell::Integer(value)) => Value::I8(value as i8),
-            (LogicalType::Scalar(ScalarType::I16), NumericCell::Integer(value)) => Value::I16(value as i16),
-            (LogicalType::Scalar(ScalarType::I32), NumericCell::Integer(value)) => Value::I32(value as i32),
-            (LogicalType::Scalar(ScalarType::I64), NumericCell::Integer(value)) => Value::I64(value),
-            (LogicalType::Scalar(ScalarType::F32), NumericCell::Float32(value)) => Value::F32(value),
-            (LogicalType::Scalar(ScalarType::F64), NumericCell::Float64(value)) => Value::F64(value),
+        self.accumulator = match (without_nullability(output), value) {
+            (LogicalType::Scalar(ScalarType::I8), NumericCell::Integer(value)) => S::I8(value as i8),
+            (LogicalType::Scalar(ScalarType::I16), NumericCell::Integer(value)) => S::I16(value as i16),
+            (LogicalType::Scalar(ScalarType::I32), NumericCell::Integer(value)) => S::I32(value as i32),
+            (LogicalType::Scalar(ScalarType::I64), NumericCell::Integer(value)) => S::I64(value),
+            (LogicalType::Scalar(ScalarType::F32), NumericCell::Float32(value)) => S::F32(value),
+            (LogicalType::Scalar(ScalarType::F64), NumericCell::Float64(value)) => S::F64(value),
             _ => return Err(invalid("aggregate-state", "Numeric extremum does not match its output vector")),
         };
-        self.accumulator = ScalarState::Retained(OwnedRow::new(vec![next], state)?);
         Ok(())
     }
 
@@ -1849,6 +1918,18 @@ impl ScalarAccumulator {
         if matches!(value, Value::Null | Value::Undefined) { return Ok(()); }
         let _value = execution.context.memory.reserve(value.retained_bytes()?)?;
         let value = cast(value, output, &execution.context.timezone)?;
+        let numeric = match value {
+            Value::I8(value) => Some(NumericCell::Integer(i64::from(value))),
+            Value::I16(value) => Some(NumericCell::Integer(i64::from(value))),
+            Value::I32(value) => Some(NumericCell::Integer(i64::from(value))),
+            Value::I64(value) => Some(NumericCell::Integer(value)),
+            Value::F32(value) => Some(NumericCell::Float32(value)),
+            Value::F64(value) => Some(NumericCell::Float64(value)),
+            _ => None,
+        };
+        if let Some(value) = numeric {
+            return self.numeric_extremum(value, output, minimum);
+        }
         if let Value::Timestamp { value, .. } | Value::Time { value, .. } | Value::Duration { value, .. } = value {
             return self.temporal_extremum(value, minimum);
         }
@@ -1892,6 +1973,8 @@ impl ScalarAccumulator {
                 self.variance_double(&aggregate.function).map_or(Value::Null, Value::F64),
             _ => match &self.accumulator {
                 ScalarState::Empty => Value::Null,
+                ScalarState::I8(value) => Value::I8(*value),
+                ScalarState::I16(value) => Value::I16(*value),
                 ScalarState::I32(sum) => Value::I32(*sum),
                 ScalarState::I64(sum) => Value::I64(*sum),
                 ScalarState::F32(sum) => Value::F32(*sum),
