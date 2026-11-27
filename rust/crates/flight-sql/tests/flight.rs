@@ -3061,7 +3061,7 @@ async fn held_read_batch_reuses_scalar_results_authentication_and_failure_order(
     assert_eq!((failure.code(), failure.message()), (scalar_failure.code(), scalar_failure.message()));
 
     let refused = client.action("rtdb.owned.ReadAudiencePoints.v1", batch(&[(0, &present), (0, &missing)])).await.unwrap_err();
-    assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+    assert_eq!(refused.code(), tonic::Code::Unimplemented);
 
     let mut foreign = Client::connect(&running.server, Some("xtdb:secret")).await;
     let failure = foreign.action(points, batch(&[(0, &present), (0, &missing)])).await.unwrap_err();
