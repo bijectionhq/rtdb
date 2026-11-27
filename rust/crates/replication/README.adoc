@@ -47,6 +47,11 @@ A follower still holding that boundary adopts it and drains its held records.
 The restarted writer resumes ordinary source processing after completing the confirmations and adopting any later pending block.
 The restored partition generation and applied progress are already in place on the restarted node.
 A replica that already installed the block skips its current-storage upload before buffering for a later pending block.
+On a route that enables deferred checkpoints, the journal marks each deferred boundary explicitly.
+Applying that boundary seals its live block and opens the next one while the writer owns a background build, upload and verification task.
+Readers retain the sealed rows until atomic adoption replaces them with the uploaded block.
+The writer can install later commits while one sealed checkpoint is pending, subject to the write memory budget.
+Recovery applies the suffix after the checkpoint boundary, including any commits that preceded the upload confirmation.
 A failure starting that later block during promotion preserves the recovered confirmation and returns the later block to the follower.
 Historical replay first tries to open a tail from the oldest retained historical catalog.
 If opening the tail reports that its first requested position precedes the retained log, the writer tries the next newer catalog when one exists.

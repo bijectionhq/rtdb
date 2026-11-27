@@ -69,6 +69,7 @@ const FORK_FIELDS: &[(&str, u32, Fork)] = &[
     ("ResolvedTx", 1002, Fork::Framed),
     ("ResolvedTx", 1003, Fork::Framed),
     ("BlockBoundary", 1000, Fork::Framed),
+    ("BlockBoundary", 1001, Fork::Framed),
     ("NoOp", 1000, Fork::Framed),
     ("NoOp", 1001, Fork::Framed),
     ("OversizedMessage", 1000, Fork::Annotation("the digest of the payload, which XTDB fetches by its key")),
@@ -239,6 +240,9 @@ fn extension_replica_bodies() -> Vec<(Option<(&'static str, u32)>, ReplicaBody)>
         })),
         (Some(("BlockBoundary", 1000)), ReplicaBody::BlockBoundary(pb::BlockBoundary {
             relation_oid_order: RelationOidOrder::Utf16.wire_value(), ..Default::default()
+        })),
+        (Some(("BlockBoundary", 1001)), ReplicaBody::BlockBoundary(pb::BlockBoundary {
+            deferred_checkpoint: Some(true), ..Default::default()
         })),
     ]
 }

@@ -13,7 +13,7 @@ use rtdb_tx::{ResolveContext, ResolvedTx, SourceTransaction, TransactionResult, 
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, EventOp, PlacedReservation, PlacedTerminal, ReplicaPosition, Result, SourcePosition, TableRef, Term, TermSequence, Timestamp, TransactionKey, TxId};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 
 use crate::promotion::{initial_term_sequence, replica_read_is_empty, should_start_claim};
 use crate::{BlockCycle, BlockStore, FlushTimer, PartitionLogs, PendingBlock, ProgressMonitor, PublishedCheckpoint, PublishedPrimaryReset, RecoveredPartition, ReplicaMetadata, ReplicaRecord, TermFence, TermPosition, Verdict};
@@ -71,6 +71,7 @@ pub struct ReplicationConfig {
     pub external_source: bool,
     pub skipped_transactions: BTreeSet<SourcePosition>,
     pub rows_per_block: u64,
+    pub deferred_checkpoints: bool,
     pub activate_classic_utf16_relation_oids: bool,
     pub assertion_interval: Duration,
     pub flush_timeout: Duration,
@@ -97,7 +98,7 @@ impl ReplicationConfig {
 }
 impl Default for ReplicationConfig {
     fn default() -> Self {
-        Self { enabled: true, may_lead: true, external_source: false, skipped_transactions: BTreeSet::new(), rows_per_block: Self::DEFAULT_ROWS_PER_BLOCK, activate_classic_utf16_relation_oids: false, assertion_interval: Duration::from_millis(100), flush_timeout: Self::DEFAULT_FLUSH_TIMEOUT,
+        Self { enabled: true, may_lead: true, external_source: false, skipped_transactions: BTreeSet::new(), rows_per_block: Self::DEFAULT_ROWS_PER_BLOCK, deferred_checkpoints: false, activate_classic_utf16_relation_oids: false, assertion_interval: Duration::from_millis(100), flush_timeout: Self::DEFAULT_FLUSH_TIMEOUT,
             pending_block_records: 1024, pending_block_bytes: 64 * 1024 * 1024, election_seed: uuid::Uuid::new_v4().as_u128() as u64,
             idle_heartbeat: true, claim_wait: None, node_id: Self::default_node_id() }
     }
@@ -451,20 +452,25 @@ struct Resolution {
     completion: Completion,
 }
 enum Production {
-    Writing(std::time::Instant, BoxFuture<'static, Result<crate::ProducedBlock>>, Option<ServingCheckpointSeal>),
+    Writing(std::time::Instant, BoxFuture<'static, Result<CheckpointOutput>>),
     Appending(std::time::Instant, BoxFuture<'static, Result<ReplicaMetadata>>, Option<ServingCheckpointSeal>),
     AwaitingReadback(ReplicaMetadata, ServingCheckpointSeal),
 }
 enum ProductionResult {
-    Written(std::time::Instant, Result<crate::ProducedBlock>, Option<ServingCheckpointSeal>),
+    Written(std::time::Instant, Result<CheckpointOutput>),
     Appended(std::time::Instant, Result<ReplicaMetadata>, Option<ServingCheckpointSeal>),
+}
+struct CheckpointOutput {
+    block: crate::ProducedBlock,
+    loaded: Option<crate::state::LoadedBlock>,
+    seal: Option<ServingCheckpointSeal>,
 }
 async fn pending_resolution(resolution: &mut Option<Resolution>) -> (TxResolver, Result<Arc<ResolvedTx>>) {
     match resolution { Some(resolution) => resolution.future.as_mut().await, None => futures::future::pending().await }
 }
 async fn pending_production(production: &mut Option<Production>) -> ProductionResult {
     match production {
-        Some(Production::Writing(started, future, seal)) => ProductionResult::Written(*started, future.as_mut().await, seal.take()),
+        Some(Production::Writing(started, future)) => ProductionResult::Written(*started, future.as_mut().await),
         Some(Production::Appending(started, future, seal)) => ProductionResult::Appended(*started, future.as_mut().await, seal.take()),
         Some(Production::AwaitingReadback(..)) | None => futures::future::pending().await,
     }
@@ -501,6 +507,7 @@ enum StrictSource {
     Transaction(SourceInput),
     Serving { position: SourcePosition, request: SourceRequest },
     Physical { record: LogRecord, decode: Arc<MemoryReservation> },
+    DeferredFlush(SourcePosition),
     Compaction {
         position: SourcePosition,
         log_time: Timestamp,
@@ -762,12 +769,13 @@ impl ReplicationDriver {
             enum Event { ReplicaBatch(PartitionReplay, Result<TailPoll>), Replica, SourceBatch(PartitionReplay, Result<TailPoll>), Source, Command(Option<Command>), Deferred, Appender(Result<()>), Resolved(TxResolver, Result<Arc<ResolvedTx>>), Produced(ProductionResult), Claimed(Result<crate::ReplicaMetadata>), Capacity }
             let ready_replica = self.replica_head.is_some() || !self.replica_batch.is_empty();
             let waiting_for_checkpoint = self.waiting_for_checkpoint();
+            let checkpoint_blocks_commands = waiting_for_checkpoint || self.has_deferred_checkpoint();
             let placed_open = self.placed_slot.is_some();
             let serving_timed = self.serving_holds_checkpoint();
             let erasure_pending = self.default_erasure.is_some();
             let ready_source = self.ready_source();
             let accept_commands = self.leader.as_ref().is_none_or(|leader| {
-                (!waiting_for_checkpoint && !placed_open && !serving_timed && !erasure_pending && leader.accepting_commands())
+                (!checkpoint_blocks_commands && !placed_open && !serving_timed && !erasure_pending && leader.accepting_commands())
                     || leader.deferred_commands.len() < 128
             });
             let retry_erasure = self.retry_default_erasure();
@@ -779,7 +787,7 @@ impl ReplicationDriver {
             let mut empty_production = None;
             let (source_poll, job, resolution, production, ready_source, ready_deferred) = match self.leader.as_mut() {
                 Some(leader) => {
-                    let ready_deferred = !waiting_for_checkpoint && !placed_open && !serving_timed && !erasure_pending && leader.accepting_commands()
+                    let ready_deferred = !checkpoint_blocks_commands && !placed_open && !serving_timed && !erasure_pending && leader.accepting_commands()
                         && !leader.deferred_commands.is_empty();
                     (&mut leader.source_poll, &mut leader.job, &mut leader.resolution, &mut leader.production, ready_source, ready_deferred)
                 }
@@ -883,7 +891,8 @@ impl ReplicationDriver {
     fn ready_source(&self) -> bool {
         let serving_source_ready = self.default_erasure.is_none() && self.serving.as_ref().is_none_or(NativeServing::source_ready);
         !self.waiting_for_checkpoint() && self.placed_slot.is_none() && serving_source_ready
-            && self.leader.as_ref().is_some_and(|leader| leader.ready_source())
+            && self.leader.as_ref().is_some_and(|leader| leader.ready_source()
+                && (self.pending_block.is_none() || !matches!(leader.waiting_strict_source, Some(StrictSource::DeferredFlush(_)))))
     }
     async fn source_polled(&mut self, tail: PartitionReplay, records: Result<TailPoll>) -> Result<()> {
         let Some(leader) = &mut self.leader else { return Ok(()); };
@@ -952,7 +961,22 @@ impl ReplicationDriver {
         }
     }
     fn waiting_for_checkpoint(&self) -> bool {
-        self.deferred_cut || self.required_append_bytes.is_some()
+        self.deferred_cut || self.required_append_bytes.is_some() || self.deferred_checkpoint_backpressured()
+    }
+
+    fn has_deferred_checkpoint(&self) -> bool {
+        self.pending_block.as_ref().is_some_and(PendingBlock::is_deferred)
+    }
+
+    fn deferred_checkpoint_backpressured(&self) -> bool {
+        if !self.has_deferred_checkpoint() { return false; }
+        let memory = &self.resolve.memory;
+        memory.available_bytes() <= (memory.limit_bytes() / 3).max(1)
+            || self.leader.as_ref().is_some_and(|leader| self.block_needs_memory_cut(leader))
+    }
+
+    fn holds_replica_records(&self) -> bool {
+        self.pending_block.as_ref().is_some_and(|pending| !pending.is_deferred())
     }
 
     fn serving_holds_checkpoint(&self) -> bool {
@@ -1230,7 +1254,7 @@ impl ReplicationDriver {
             let result = if let Some(job) = leader.job.take() { job.await.map_err(join_error).and_then(|result| result) } else { Ok(()) };
             if let Some(production) = leader.production.take() {
                 match production {
-                    Production::Writing(_, future, _) => { if future.await.is_ok() { self.record_block_upload(); } }
+                    Production::Writing(_, future) => { if future.await.is_ok() { self.record_block_upload(); } }
                     Production::Appending(_, future, _) => { let _ = future.await; }
                     Production::AwaitingReadback(..) => {}
                 }
@@ -1278,7 +1302,7 @@ impl ReplicationDriver {
     fn update_installed_prefix(&mut self) -> Result<()> {
         let apply_deferred = self.leader.as_ref().is_some_and(|leader| !leader.held.is_empty());
         let completed = crate::catalog_cut::completed_prefix(
-            self.read_position.0, self.recognized_prefix, self.pending_block.is_some(), apply_deferred,
+            self.read_position.0, self.recognized_prefix, self.holds_replica_records(), apply_deferred,
         );
         let prefix_applied = self.applied_prefix.is_complete_at(self.read_position.0);
         if let Some(through) = publish_installed_prefix(self.recognized_prefix, completed, prefix_applied) {
@@ -1359,7 +1383,7 @@ impl ReplicationDriver {
         if !self.applied_prefix.admit(position.0) { return Err(invalid("Replica record regressed the applied prefix")); }
         let own_term = self.leader.as_ref().map(|leader| leader.term);
         // Buffered read-back may outlive this leader and be applied as follower replay.
-        let immediate = self.pending_block.is_none() && self.claim != Some(position)
+        let immediate = !self.holds_replica_records() && self.claim != Some(position)
             && self.leader.as_ref().is_some_and(|leader| leader.resolution.is_none());
         let decoded = {
             let expected = |sequence| own_term.and_then(|term| self.own_pending_tx_at(term, sequence))
@@ -1589,12 +1613,13 @@ impl ReplicationDriver {
             };
             if closes {
                 let _timer = self.replica_process_timer(&record.envelope.message);
-                if self.leader.is_none() && let (Some(observer), Some(pending)) = (&self.resolve.execution_observer, &self.pending_block) {
+                if self.leader.is_none() && self.holds_replica_records()
+                    && let (Some(observer), Some(pending)) = (&self.resolve.execution_observer, &self.pending_block) {
                     observer.record_replica_block_buffer(&self.resolve.database, pending.opened().elapsed(), pending.buffered_len());
                 }
                 let collection = if let Some(production) = self.leader.as_mut().and_then(|leader| leader.production.take()) {
                     let collection = match production {
-                        Production::Writing(_, future, _) => { future.await?; self.record_block_upload(); None }
+                        Production::Writing(_, future) => { future.await?; self.record_block_upload(); None }
                         Production::Appending(started, future, seal) => {
                             let receipt = future.await?;
                             self.time_block_upload(started);
@@ -1606,8 +1631,12 @@ impl ReplicationDriver {
                     collection
                 } else { None };
                 let ReplicaBody::BlockUploaded(message) = &record.envelope.message else { return Err(invalid("Matching upload changed type")); };
-                let pending = self.pending_block.as_ref().ok_or_else(|| invalid("Matching upload has no pending block"))?;
-                let (catalog, table_blocks) = self.blocks.load(pending.block_index()).await?;
+                let pending = self.pending_block.as_mut().ok_or_else(|| invalid("Matching upload has no pending block"))?;
+                let deferred = pending.is_deferred();
+                let (catalog, table_blocks) = match pending.loaded.take() {
+                    Some(loaded) => loaded,
+                    None => self.blocks.load(pending.block_index()).await?,
+                };
                 crate::blocks::validate_boundary(&catalog, &pending.prepared, &pending.boundary)?;
                 validate_uploaded_root(&catalog, message, self.logs.requires_checkpoint_digest())?;
                 let checkpoint = PublishedCheckpoint {
@@ -1624,18 +1653,25 @@ impl ReplicationDriver {
                     self.partition.adopt_rewritten_block(pending.prepared.clone(), catalog, &table_blocks, record.metadata.timestamp)?;
                     serving.adopt_erasure_generation(selected.generation);
                     self.default_erasure = Some(DefaultErasure::Selected(selected));
+                } else if deferred {
+                    self.partition.adopt_sealed_block(pending.prepared.clone(), catalog, &table_blocks, &tries, record.metadata.timestamp)?;
                 } else {
                     self.partition.adopt_block(pending.prepared.clone(), catalog, &table_blocks, &tries, record.metadata.timestamp)?;
                 }
                 self.record_applied(record.metadata.position)?;
-                self.progress.applied(message.latest_processed_msg_id.map(SourcePosition), None, message.external_source_token.clone())?;
-                let pending = self.pending_block.take().ok_or_else(|| invalid("Adopted block disappeared"))?;
+                if !deferred {
+                    self.progress.applied(message.latest_processed_msg_id.map(SourcePosition), None, message.external_source_token.clone())?;
+                }
+                let mut pending = self.pending_block.take().ok_or_else(|| invalid("Adopted block disappeared"))?;
+                let sealed_serving = pending.deferred.take().and_then(|scope| scope.serving);
                 let mut held = pending.into_records();
                 held.append(&mut work);
                 work = held;
-                adopted = true;
                 if let Some(leader) = &mut self.leader {
-                    leader.cycle.adopted();
+                    if !deferred || !leader.cycle.accepting() {
+                        leader.cycle = BlockCycle::Filling { rows: self.partition.value().live().block_row_count() };
+                        adopted = true;
+                    }
                     complete_record(&mut leader.pending, record.envelope.term_sequence, Ok(Applied::Control));
                 }
                 if self.leader.is_some() && self.default_erasure.is_none() && !tries.is_empty() {
@@ -1652,7 +1688,8 @@ impl ReplicationDriver {
                     let result = async {
                         let installed = self.partition.value();
                         let catalog = installed.table_catalog().block().ok_or_else(|| invalid("Adopted block disappeared"))?;
-                        self.serving.as_ref().ok_or_else(serving::unavailable)?.verify_checkpoint_prefix(catalog)?;
+                        if let Some(capture) = &sealed_serving { capture.verify_prefix(catalog)?; }
+                        else { self.serving.as_ref().ok_or_else(serving::unavailable)?.verify_checkpoint_prefix(catalog)?; }
                         self.logs.verify_checkpoint_reopen(catalog.latest_source_position(), checkpoint.boundary, receipt.position).await?;
                         self.blocks.collect_serving_checkpoints(epoch, checkpoint, &seal, &self.cancellation).await
                     }.await;
@@ -1675,7 +1712,10 @@ impl ReplicationDriver {
                 self.complete_control(&record);
                 continue;
             }
-            if let Some(pending) = &mut self.pending_block { pending.hold(record)?; continue; }
+            if let Some(pending) = &mut self.pending_block && !pending.is_deferred() {
+                pending.hold(record)?;
+                continue;
+            }
             if self.stale(&record) {
                 self.record_applied(record.metadata.position)?;
                 self.complete_control(&record);
@@ -1809,14 +1849,32 @@ impl ReplicationDriver {
                     self.progress.applied(message.source_msg_id.map(SourcePosition), None, None)?;
                     self.complete_control(&record);
                 }
-                ReplicaBody::BlockBoundary(_) => {
+                ReplicaBody::BlockBoundary(message) => {
                     if self.placed_slot.is_some() {
                         return Err(invalid("A checkpoint boundary cannot abandon an open receiver slot"));
                     }
-                    let prepared = self.partition.prepare_block()?;
-                    self.pending_block = Some(PendingBlock::new(ReplicaRecord::clone(&record), prepared, self.config.pending_block_records, self.config.pending_block_bytes)?);
+                    if self.pending_block.is_some() { return Err(invalid("A second checkpoint boundary crossed a deferred checkpoint")); }
+                    let deferred = message.deferred_checkpoint == Some(true);
+                    let prepared = if deferred {
+                        self.partition.seal_block()?
+                    } else {
+                        self.partition.prepare_block()?
+                    };
+                    let mut pending = PendingBlock::new(ReplicaRecord::clone(&record), prepared, self.config.pending_block_records, self.config.pending_block_bytes)?;
+                    if deferred {
+                        pending.deferred = Some(crate::state::DeferredCheckpoint {
+                            databases: self.effects.secondary_databases()?,
+                            serving: self.serving.as_ref().map(NativeServing::capture_checkpoint),
+                        });
+                    }
+                    self.pending_block = Some(pending);
                     self.record_applied(record.metadata.position)?;
-                    if let Some(leader) = &mut self.leader { leader.cycle = BlockCycle::Cut; }
+                    if deferred {
+                        self.progress.applied(message.latest_processed_msg_id.map(SourcePosition), None, message.external_source_token.clone())?;
+                    }
+                    if let Some(leader) = &mut self.leader {
+                        leader.cycle = if deferred { BlockCycle::Filling { rows: 0 } } else { BlockCycle::Cut };
+                    }
                     self.complete_control(&record);
                     if self.leader.is_some() { self.produce_pending()?; }
                 }
@@ -2010,7 +2068,15 @@ impl ReplicationDriver {
         let pending = self.pending_block.as_ref().ok_or_else(|| invalid("Block production has no retained boundary"))?;
         let prepared = pending.prepared.clone();
         let boundary = pending.boundary.clone();
-        let databases = self.effects.secondary_databases()?;
+        let deferred = pending.is_deferred();
+        let databases = match &pending.deferred {
+            Some(scope) => scope.databases.clone(),
+            None => self.effects.secondary_databases()?,
+        };
+        let capture = match &pending.deferred {
+            Some(scope) => scope.serving.clone(),
+            None => self.serving.as_ref().map(NativeServing::capture_checkpoint),
+        };
         let blocks = Arc::clone(&self.blocks);
         let search = self.serving_search.clone();
         let leader = self.leader.as_mut().ok_or_else(|| invalid("Follower attempted block production"))?;
@@ -2021,37 +2087,58 @@ impl ReplicationDriver {
             None => None,
         };
         let term = rewrite.as_ref().map_or(leader.term, |_| boundary.envelope.term);
-        let serving_checkpoint = self.serving.as_mut().map(|serving| serving.checkpoint(term)).transpose()?;
-        let seal = if self.collect_serving_checkpoints && rewrite.is_none() {
-            serving_checkpoint.as_ref().and_then(serving::ServingCheckpoint::seal_for_collection)
-        } else { None };
+        let serving_checkpoint = match (&mut self.serving, capture) {
+            (Some(serving), Some(capture)) => Some(serving.prepare_checkpoint(term, capture)?),
+            (None, None) => None,
+            _ => return Err(invalid("Deferred checkpoint changed its serving state")),
+        };
+        let collect = self.collect_serving_checkpoints && rewrite.is_none();
         let logs = Arc::clone(&self.logs);
         let cancellation = leader.cancellation.clone();
-        leader.production = Some(Production::Writing(std::time::Instant::now(), Box::pin(async move {
+        let produce = async move {
+            let serving_checkpoint = serving_checkpoint.map(serving::ServingCheckpointBuilder::build).transpose()?;
+            let seal = if collect { serving_checkpoint.as_ref().and_then(serving::ServingCheckpoint::seal_for_collection) } else { None };
             if let Some(rewrite) = rewrite {
                 if !databases.is_empty() { return Err(default_erasure::unsupported()); }
-                return rewrite.produce(&blocks, &logs, &prepared, &boundary,
-                    serving_checkpoint.ok_or_else(default_erasure::unsupported)?, &cancellation).await;
+                let block = rewrite.produce(&blocks, &logs, &prepared, &boundary,
+                    serving_checkpoint.ok_or_else(default_erasure::unsupported)?, &cancellation).await?;
+                return Ok(CheckpointOutput { block, loaded: None, seal: None });
             }
-            blocks.produce_with_search(&prepared, &boundary, databases, &cancellation, search.as_deref(), serving_checkpoint).await
-        }), seal));
+            let block = blocks.produce_with_search(&prepared, &boundary, databases, &cancellation, search.as_deref(), serving_checkpoint).await?;
+            let loaded = if deferred {
+                let loaded = blocks.load(prepared.block_index()).await?;
+                if checkpoint_digest(&loaded.0)? != checkpoint_digest(&block.catalog)? {
+                    return Err(invalid("Deferred checkpoint changed before read-back"));
+                }
+                Some(loaded)
+            } else { None };
+            Ok(CheckpointOutput { block, loaded, seal })
+        };
+        let future: BoxFuture<'static, Result<CheckpointOutput>> = if deferred {
+            let job = AbortOnDropHandle::new(tokio::spawn(produce));
+            Box::pin(async move { job.await.map_err(join_error)? })
+        } else {
+            Box::pin(produce)
+        };
+        leader.production = Some(Production::Writing(std::time::Instant::now(), future));
         Ok(())
     }
     async fn production_finished(&mut self, result: ProductionResult) -> Result<()> {
         let leader = self.leader.as_mut().ok_or_else(term_ended)?;
         leader.production = None;
-        let error = match &result { ProductionResult::Written(_, result, _) => result.as_ref().err(), ProductionResult::Appended(_, result, _) => result.as_ref().err() };
+        let error = match &result { ProductionResult::Written(_, result) => result.as_ref().err(), ProductionResult::Appended(_, result, _) => result.as_ref().err() };
         if let Some(error) = error {
             let error = error.clone();
             if leader.confirmed { return Err(error); }
             return self.promotion_failed(error).await;
         }
         match result {
-            ProductionResult::Written(started, result, seal) => {
-                let produced = result?;
+            ProductionResult::Written(started, result) => {
+                let CheckpointOutput { block: produced, loaded, seal } = result?;
                 let upload_time = (self.clock)().0.div_euclid(1_000_000);
                 self.status.send_modify(|status| status.last_block_upload_epoch_seconds = upload_time);
-                let pending = self.pending_block.as_ref().ok_or_else(|| invalid("Produced block has no retained boundary"))?;
+                let pending = self.pending_block.as_mut().ok_or_else(|| invalid("Produced block has no retained boundary"))?;
+                pending.loaded = loaded;
                 let ReplicaBody::BlockBoundary(boundary) = &pending.boundary.envelope.message else { return Err(invalid("Pending boundary changed type")); };
                 let message = ReplicaBody::BlockUploaded(proto::BlockUploaded {
                     storage_version: Some(self.logs.storage_version.0), storage_epoch: Some(self.logs.storage_epoch.0), block_index: Some(pending.block_index().0),
@@ -2100,12 +2187,17 @@ impl ReplicationDriver {
         Ok(())
     }
     async fn resolve_next_source(&mut self) -> Result<()> {
+        let deferred_checkpoint = self.has_deferred_checkpoint();
         let Some(leader) = &mut self.leader else { return Ok(()); };
         let deferred = if leader.waiting_strict_source.is_some() {
             if !leader.ready_source() { return Ok(()); }
             let source = leader.waiting_strict_source.take().expect("checked for a waiting strict source");
             match source {
                 StrictSource::Physical { record, decode } => Some((record, Some(decode))),
+                StrictSource::DeferredFlush(position) => {
+                    leader.resolver_mut()?.advance_source(position)?;
+                    return self.cut().await;
+                }
                 StrictSource::Transaction(source) => return self.admit_source(source),
                 StrictSource::Serving { position, request } => return self.admit_serving_source(position, Ok(request)).await,
                 StrictSource::Compaction { position, log_time, message, _decode_charge } =>
@@ -2231,8 +2323,12 @@ impl ReplicationDriver {
             }
             Some(SourceMessage::Protobuf(SourceBody::FlushBlock(message))) => {
                 let expected = self.partition.value().table_catalog().block_index().map_or(-1, |index| index.0);
+                if deferred_checkpoint && message.expected_block_idx == Some(expected) {
+                    leader.waiting_strict_source = Some(StrictSource::DeferredFlush(position));
+                    return Ok(());
+                }
                 leader.resolver_mut()?.advance_source(position)?;
-                if message.expected_block_idx == Some(expected) { self.cut().await?; }
+                if message.expected_block_idx == Some(expected) && self.pending_block.is_none() { self.cut().await?; }
                 else { leader.enqueue(WriteBody::Message(ReplicaBody::NoOp(proto::NoOp { src_msg_id: Some(position.0), ..Default::default() })), block, None, &self.resolve.memory)?; }
                 None
             }
@@ -2504,6 +2600,7 @@ impl ReplicationDriver {
     }
 
     fn block_needs_cut(&self) -> bool {
+        if self.pending_block.is_some() { return false; }
         let Some(leader) = &self.leader else { return false; };
         leader.cycle.is_full(self.config.rows_per_block) || self.block_needs_memory_cut(leader)
     }
@@ -2523,6 +2620,7 @@ impl ReplicationDriver {
     }
 
     async fn cut(&mut self) -> Result<()> {
+        if self.pending_block.is_some() { return Ok(()); }
         if self.placed_slot.is_some() || self.serving_holds_checkpoint()
             || self.leader.as_ref().is_some_and(|leader| leader.awaiting_placed.is_some()) {
             self.deferred_cut = true;
@@ -2545,6 +2643,7 @@ impl ReplicationDriver {
     }
 
     fn enqueue_checkpoint_cut(&mut self) -> Result<()> {
+        if self.pending_block.is_some() { return Ok(()); }
         if self.placed_slot.is_some() || self.serving_holds_checkpoint()
             || self.leader.as_ref().is_some_and(|leader| leader.awaiting_placed.is_some()) {
             return Ok(());
@@ -2562,11 +2661,17 @@ impl ReplicationDriver {
         let memory_triggered = self.leader.as_ref().is_some_and(|leader| {
             !leader.cycle.is_full(self.config.rows_per_block) && self.block_needs_memory_cut(leader)
         });
+        let deferred_checkpoint = (self.config.deferred_checkpoints && !self.config.external_source
+            && relation_oid_order.is_none() && self.default_erasure.is_none()
+            && self.local_erasure_read_fence.is_none() && self.default_erasure_read_fence.is_none()
+            && self.serving_search.is_none()
+            && self.leader.as_ref().is_some_and(|leader| leader.confirmed && leader.compactor_reset.is_none()))
+            .then_some(true);
         let leader = self.leader.as_mut().ok_or_else(term_ended)?;
         leader.cycle.cut()?;
         let boundary = proto::BlockBoundary {
             block_index: Some(block.0), latest_processed_msg_id: Some(leader.resolver()?.source_position().0),
-            external_source_token: leader.resolver()?.external_token().map(<[u8]>::to_vec), relation_oid_order,
+            external_source_token: leader.resolver()?.external_token().map(<[u8]>::to_vec), relation_oid_order, deferred_checkpoint,
         };
         leader.enqueue(WriteBody::Message(ReplicaBody::BlockBoundary(boundary)), block, None, &self.resolve.memory)?;
         if memory_triggered {
@@ -2577,6 +2682,7 @@ impl ReplicationDriver {
     async fn flush_if_due(&mut self) -> Result<()> {
         let persisted = self.partition.value().table_catalog().block().and_then(BlockCatalog::latest_completed_tx).map(|key| key.tx_id);
         if self.default_erasure.is_none()
+            && self.pending_block.is_none()
             && !self.waiting_for_checkpoint()
             && self.leader.as_ref().is_some_and(LeaderState::accepting_commands)
             && self.flush_timer.should_flush(now(), persisted)
@@ -2595,7 +2701,8 @@ impl ReplicationDriver {
             let _ = completion.send(status);
             return Ok(());
         }
-        let waiting_for_checkpoint = self.waiting_for_checkpoint() || self.placed_slot.is_some() || self.serving_holds_checkpoint()
+        let waiting_for_checkpoint = self.waiting_for_checkpoint() || self.has_deferred_checkpoint()
+            || self.placed_slot.is_some() || self.serving_holds_checkpoint()
             || self.default_erasure.is_some();
         let Some(leader) = &mut self.leader else { command.fail(term_ended()); return Ok(()); };
         if leader.term != command.term() { command.fail(term_ended()); return Ok(()); }

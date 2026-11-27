@@ -1127,6 +1127,74 @@ async fn source_transaction_reads_back_applies_flushes_and_recovers() {
 }
 
 #[tokio::test]
+async fn native_deferred_checkpoint_upload_preserves_live_commits_and_recovery() {
+    let store = Arc::new(MemoryStore::default());
+    let upload = Arc::new(PendingCheckpointUpload {
+        key: ObjectKey::new(rtdb_format::keys::block_key(BlockIndex(0)).unwrap()).unwrap(),
+        started: tokio::sync::Notify::new(),
+        resume: tokio::sync::Notify::new(),
+    });
+    let objects = Arc::new(RecordingStore { inner: Arc::clone(&store), upload: Some(Arc::clone(&upload)), ..Default::default() });
+    let options = ReplicationConfig {
+        deferred_checkpoints: true, rows_per_block: u64::MAX, assertion_interval: Duration::from_millis(10),
+        idle_heartbeat: false, ..Default::default()
+    };
+    let fixture = fixture_over(options, 1 << 27, None, |replica| replica, store, objects).await;
+    let partition = Arc::clone(&fixture.driver.partition);
+    let resolve = Arc::clone(&fixture.driver.resolve);
+    let writer = tokio::spawn(fixture.driver.run());
+    let running = CancellationToken::new();
+    let table = TableRef::new("public", "docs");
+    let before = submit_recovery_row(&fixture.handle, &fixture.memory, 1, 100).await;
+    fixture.handle.await_tx(TxId(before.0), &running).await.unwrap();
+    let pinned = partition.snapshot();
+    fixture.handle.flush().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), upload.started.notified()).await.unwrap();
+
+    let suffix = submit_recovery_row(&fixture.handle, &fixture.memory, 2, 200).await;
+    let applied = tokio::time::timeout(Duration::from_secs(5), fixture.handle.await_tx(TxId(suffix.0), &running))
+        .await.expect("commit while the checkpoint upload is paused").unwrap().unwrap();
+    assert!(applied.committed());
+    assert!(fixture.handle.status().adopted_block.is_none());
+    assert_eq!(fixture.handle.status().open_block, BlockIndex(1));
+    assert_eq!(pinned.iter_segments(&table).map(|segment| segment.row_count()).sum::<u32>(), 1);
+    assert_eq!(partition.snapshot().iter_segments(&table).map(|segment| segment.row_count()).sum::<u32>(), 2);
+    let later_flush = fixture.handle.flush().await.unwrap();
+
+    upload.resume.notify_one();
+    let mut status = fixture.handle.watch_status();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while status.borrow_and_update().adopted_block.as_ref().is_none_or(|block| block.block_index() < BlockIndex(1)) {
+            status.changed().await.unwrap();
+        }
+    }).await.unwrap();
+    assert!(fixture.handle.progress().current().source_position >= later_flush);
+    assert_eq!(partition.value().table_catalog().metadata(&table).unwrap().row_count, 2);
+    assert_eq!(partition.snapshot().iter_segments(&table).map(|segment| segment.row_count()).sum::<u32>(), 0);
+    fixture.handle.shutdown();
+    writer.await.unwrap().unwrap();
+
+    let recovered = fixture.blocks.recover(TrieConfig::new(2, 2).unwrap(), SourcePosition(-1), Timestamp(1000),
+        BlockDiscovery::At(BlockIndex(0))).await.unwrap();
+    let recovered = fixture.blocks.recover_for_replay(recovered, &fixture.logs, TrieConfig::new(2, 2).unwrap(),
+        Timestamp(1000), &running).await.unwrap();
+    assert_eq!(recovered.progress.tx_key.unwrap().tx_id, TxId(before.0));
+    let recovered_partition = Arc::clone(&recovered.partition);
+    let progress = ProgressMonitor::new(recovered.progress.clone());
+    let (reader, follower) = ReplicationDriver::new(ReplicationConfig { may_lead: false, ..Default::default() },
+        fixture.logs, fixture.blocks, recovered, progress, resolve, Arc::new(NoEffects), running.clone()).unwrap();
+    let follower = tokio::spawn(follower.run());
+    tokio::time::timeout(Duration::from_secs(5), reader.await_tx(TxId(suffix.0), &running))
+        .await.unwrap().unwrap();
+    let recovered = recovered_partition.value();
+    assert_eq!(recovered.live().latest_completed_tx(), Some(applied.tx_key()));
+    assert_eq!(recovered.table_catalog().metadata(&table).unwrap().row_count
+        + recovered.snapshot().iter_segments(&table).map(|segment| i64::from(segment.row_count())).sum::<i64>(), 2);
+    reader.shutdown();
+    follower.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn a_follower_applies_every_record_from_a_legacy_replica_poll_in_order() {
     let mut fixture = fixture(ReplicationConfig { may_lead: false, ..Default::default() }, 1 << 27).await;
     for record in [raw(0, 1, 0, resolved(0, 0)), raw(1, 2, 0, resolved(1, 1)),
@@ -1894,7 +1962,7 @@ async fn native_local_restart_confirms_missing_retained_blocks_in_order_for_a_su
         let boundary_offset = boundary_record.metadata.offset;
         old.consume(boundary_record).await.unwrap();
         let mut production = old.leader.as_mut().unwrap().production.take();
-        let super::ProductionResult::Written(_, Ok(produced), _) = super::pending_production(&mut production).await else {
+        let super::ProductionResult::Written(_, Ok(super::CheckpointOutput { block: produced, .. })) = super::pending_production(&mut production).await else {
             panic!("expected the catalog to be persisted before the upload append");
         };
         drop(production);
@@ -3956,11 +4024,18 @@ async fn startup_replay_preserves_exact_and_restored_anchors_across_prefix_loss(
 
 enum HeadFault { Unavailable, Hang }
 
+struct PendingCheckpointUpload {
+    key: ObjectKey,
+    started: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
 #[derive(Default)]
 struct RecordingStore {
     inner: Arc<MemoryStore>,
     reads: Mutex<BTreeSet<rtdb_storage::ObjectKey>>,
     head_faults: Mutex<VecDeque<HeadFault>>,
+    upload: Option<Arc<PendingCheckpointUpload>>,
 }
 impl RecordingStore {
     fn read(&self, key: &rtdb_storage::ObjectKey) { self.reads.lock().insert(key.clone()); }
@@ -3982,7 +4057,13 @@ impl ObjectStore for RecordingStore {
     async fn get_fresh(&self, key: &rtdb_storage::ObjectKey) -> rtdb_storage::Result<Bytes> { self.read(key); self.inner.get_fresh(key).await }
     async fn get_fresh_exact(&self, key: &rtdb_storage::ObjectKey, length: usize) -> rtdb_storage::Result<Bytes> { self.read(key); self.inner.get_fresh_exact(key, length).await }
     async fn get_range(&self, key: &rtdb_storage::ObjectKey, range: std::ops::Range<u64>) -> rtdb_storage::Result<Bytes> { self.read(key); self.inner.get_range(key, range).await }
-    async fn put(&self, key: &rtdb_storage::ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> { self.inner.put(key, bytes).await }
+    async fn put(&self, key: &rtdb_storage::ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> {
+        if let Some(upload) = self.upload.as_ref().filter(|upload| &upload.key == key) {
+            upload.started.notify_one();
+            upload.resume.notified().await;
+        }
+        self.inner.put(key, bytes).await
+    }
     async fn put_file(&self, key: &rtdb_storage::ObjectKey, path: &std::path::Path) -> rtdb_storage::Result<()> { self.inner.put_file(key, path).await }
     async fn list(&self, key: Option<&rtdb_storage::ObjectKey>) -> rtdb_storage::Result<Vec<rtdb_storage::StoredObject>> { self.inner.list(key).await }
     async fn delete(&self, key: &rtdb_storage::ObjectKey) -> rtdb_storage::Result<()> { self.inner.delete(key).await }

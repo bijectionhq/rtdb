@@ -421,6 +421,39 @@ pub(crate) struct ServingCheckpoint {
     publication: CheckpointPublication,
 }
 
+#[derive(Clone)]
+pub(crate) struct ServingCheckpointCapture {
+    position: u64,
+    shares_main: bool,
+    fold: TransactState,
+}
+
+impl ServingCheckpointCapture {
+    pub(crate) fn verify_prefix(&self, block: &rtdb_format::catalog::BlockCatalog) -> Result<()> {
+        self.fold.validate_installed_receipts(block.latest_source_position(), block.boundary_replica_position(), block.boundary_term())
+    }
+}
+
+pub(crate) struct ServingCheckpointBuilder {
+    capture: ServingCheckpointCapture,
+    publication: CheckpointPublication,
+}
+
+impl ServingCheckpointBuilder {
+    pub(crate) fn build(self) -> Result<ServingCheckpoint> {
+        let ServingCheckpointCapture { position, shares_main, fold } = self.capture;
+        let cut = fold.index().head();
+        let checkpoint = fold.encode_checkpoint()?;
+        let mut frame = BytesMut::with_capacity(CHECKPOINT_HEADER_BYTES + usize::from(shares_main) + checkpoint.len());
+        frame.put_u64(position);
+        frame.extend_from_slice(&cut.basis.to_bytes());
+        frame.put_i64(cut.system_time.0);
+        if shares_main { frame.put_u8(SHARED_CHECKPOINT); }
+        frame.extend_from_slice(&checkpoint);
+        Ok(ServingCheckpoint { image: frame.freeze(), publication: self.publication })
+    }
+}
+
 enum CheckpointPublication {
     Inline,
     Writer(CheckpointWriter),
@@ -588,15 +621,15 @@ impl NativeServing {
     }
 
     pub(crate) fn checkpoint(&mut self, term: Term) -> Result<ServingCheckpoint> {
-        let fold = self.durable();
-        let cut = fold.index().head();
-        let checkpoint = fold.encode_checkpoint()?;
-        let mut frame = BytesMut::with_capacity(CHECKPOINT_HEADER_BYTES + usize::from(self.shares_main) + checkpoint.len());
-        frame.put_u64(self.position);
-        frame.extend_from_slice(&cut.basis.to_bytes());
-        frame.put_i64(cut.system_time.0);
-        if self.shares_main { frame.put_u8(SHARED_CHECKPOINT); }
-        frame.extend_from_slice(&checkpoint);
+        let capture = self.capture_checkpoint();
+        self.prepare_checkpoint(term, capture)?.build()
+    }
+
+    pub(crate) fn capture_checkpoint(&self) -> ServingCheckpointCapture {
+        ServingCheckpointCapture { position: self.position, shares_main: self.shares_main, fold: self.durable().clone() }
+    }
+
+    pub(crate) fn prepare_checkpoint(&mut self, term: Term, capture: ServingCheckpointCapture) -> Result<ServingCheckpointBuilder> {
         let writer = if let Some(authority) = &self.authority.checkpoints {
             let epoch = u64::try_from(term.0).map_err(|_| invalid())?;
             let database = Uuid::from_bytes(self.authority.incarnation);
@@ -607,7 +640,7 @@ impl NativeServing {
             Some(CheckpointWriter { allocator: Arc::clone(writer), authority: authority.clone(), database, epoch })
         } else { None };
         let publication = writer.map_or(CheckpointPublication::Inline, CheckpointPublication::Writer);
-        Ok(ServingCheckpoint { image: frame.freeze(), publication })
+        Ok(ServingCheckpointBuilder { capture, publication })
     }
 
     pub(crate) fn repair_checkpoint(&self, selected: &NativeCheckpointImage, kms: Option<Arc<dyn Kms>>) -> Result<ServingCheckpoint> {

@@ -2,16 +2,25 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rtdb_format::envelope::ReplicaBody;
+use rtdb_format::{catalog::{BlockCatalog, TableBlock}, database::proto::DatabaseConfig, envelope::ReplicaBody};
 use rtdb_index::BlockPreparation;
-use rtdb_types::{Anomaly, BlockIndex, Result, StorageEpoch, StorageVersion, Timestamp, TxId};
+use rtdb_types::{Anomaly, BlockIndex, Result, StorageEpoch, StorageVersion, TableRef, Timestamp, TxId};
 
 use crate::ReplicaRecord;
 use crate::admission::AdmittedReplica;
 
+pub(crate) type LoadedBlock = (BlockCatalog, std::collections::BTreeMap<TableRef, TableBlock>);
+
+pub(crate) struct DeferredCheckpoint {
+    pub(crate) databases: std::collections::BTreeMap<String, DatabaseConfig>,
+    pub(crate) serving: Option<crate::serving::ServingCheckpointCapture>,
+}
+
 pub struct PendingBlock {
     pub boundary: ReplicaRecord,
     pub prepared: BlockPreparation,
+    pub(crate) loaded: Option<LoadedBlock>,
+    pub(crate) deferred: Option<DeferredCheckpoint>,
     buffered: VecDeque<AdmittedReplica>,
     buffered_bytes: usize,
     max_records: usize,
@@ -23,9 +32,13 @@ impl PendingBlock {
     pub fn new(boundary: ReplicaRecord, prepared: BlockPreparation, max_records: usize, max_bytes: usize) -> Result<Self> {
         let ReplicaBody::BlockBoundary(message) = &boundary.envelope.message else { return Err(invalid("Pending block requires a boundary")); };
         if BlockIndex(message.block_index.unwrap_or_default()) != prepared.block_index() { return Err(invalid("Boundary does not match the open block")); }
-        Ok(Self { boundary, prepared, buffered: VecDeque::new(), buffered_bytes: 0, max_records, max_bytes, opened: std::time::Instant::now() })
+        Ok(Self { boundary, prepared, loaded: None, deferred: None, buffered: VecDeque::new(), buffered_bytes: 0, max_records, max_bytes, opened: std::time::Instant::now() })
     }
     pub fn block_index(&self) -> BlockIndex { self.prepared.block_index() }
+    pub(crate) fn is_deferred(&self) -> bool {
+        matches!(&self.boundary.envelope.message, ReplicaBody::BlockBoundary(boundary)
+            if boundary.deferred_checkpoint == Some(true))
+    }
     pub fn matches_upload(&self, message: &rtdb_format::log::proto::BlockUploaded, version: StorageVersion, epoch: StorageEpoch) -> bool {
         BlockIndex(message.block_index.unwrap_or_default()) == self.block_index()
             && StorageVersion(message.storage_version.unwrap_or_default()) == version

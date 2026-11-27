@@ -8,16 +8,22 @@ use crate::{LEGACY_FLUSH_HEADER, LEGACY_TX_HEADER, PROTOBUF_LOG_HEADER, RTDB_EXT
 pub(crate) const REQUIRED_RTDB_PREFIX: [u8; 2] = [0, 0];
 const REQUIRED_REPLICA_PREFIX: [u8; 3] = [RTDB_EXTENSION_LOG_HEADER, 0, 0];
 
-fn requires_oid_order(body: &ReplicaBody) -> bool {
-    matches!(body, ReplicaBody::BlockBoundary(boundary) if boundary.relation_oid_order.is_some())
+fn requires_boundary_support(body: &ReplicaBody) -> bool {
+    matches!(body, ReplicaBody::BlockBoundary(boundary)
+        if boundary.relation_oid_order.is_some() || boundary.deferred_checkpoint == Some(true))
 }
 
-fn check_oid_order(body: Option<&ReplicaBody>, required: bool) -> Result<()> {
-    if body.is_some_and(requires_oid_order) != required {
-        return Err(invalid("Replica framing and relation OID order version disagree"));
+fn check_boundary_support(body: Option<&ReplicaBody>, required: bool) -> Result<()> {
+    if body.is_some_and(requires_boundary_support) != required {
+        return Err(invalid("Replica framing and checkpoint boundary mode disagree"));
     }
     if let Some(ReplicaBody::BlockBoundary(boundary)) = body {
         crate::catalog::RelationOidOrder::from_wire(boundary.relation_oid_order)?;
+        if boundary.deferred_checkpoint == Some(false)
+            || boundary.deferred_checkpoint == Some(true) && boundary.relation_oid_order.is_some()
+        {
+            return Err(invalid("Invalid deferred checkpoint boundary"));
+        }
     }
     Ok(())
 }
@@ -270,7 +276,7 @@ impl ReplicaFrame {
             return Self::decode_body(body, true);
         }
         let frame = decoder::decode_replica_frame(bytes)?;
-        check_oid_order(frame.message.as_ref(), false)?;
+        check_boundary_support(frame.message.as_ref(), false)?;
         Ok(frame)
     }
 
@@ -291,7 +297,7 @@ impl ReplicaFrame {
     fn decode_body(body: impl prost::bytes::Buf, required: bool) -> Result<Self> {
         let message = crate::log::proto::ReplicaLogMessage::decode(body).map_err(|error| invalid(error.to_string()))?;
         decoder_leaves::check_stage(&message.message)?;
-        check_oid_order(message.message.as_ref(), required)?;
+        check_boundary_support(message.message.as_ref(), required)?;
         Ok(Self { term: Term(message.term_id.unwrap_or_default()), term_sequence: message.term_seq.map(TermSequence), message: message.message })
     }
 }
@@ -320,19 +326,19 @@ impl ReplicaEnvelope {
             return Ok(ReplicaFrame::decode(bytes)?.into_envelope());
         }
         let envelope = decoder::decode_replica_envelope(bytes)?;
-        check_oid_order(envelope.as_ref().map(|envelope| &envelope.message), false)?;
+        check_boundary_support(envelope.as_ref().map(|envelope| &envelope.message), false)?;
         Ok(envelope)
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        if !requires_oid_order(&self.message) { return decoder::encode_replica_envelope(self); }
+        if !requires_boundary_support(&self.message) { return decoder::encode_replica_envelope(self); }
         let mut output = Vec::with_capacity(self.encoded_len());
         Self::encode_body(self.term, self.term_sequence, &self.message, &mut output);
         output
     }
 
     fn prefix(message: &ReplicaBody) -> &'static [u8] {
-        if requires_oid_order(message) {
+        if requires_boundary_support(message) {
             &REQUIRED_REPLICA_PREFIX
         } else if replica_uses_extension(message) {
             &[RTDB_EXTENSION_LOG_HEADER, XTDB_REFUSAL_PREFIX[0]]

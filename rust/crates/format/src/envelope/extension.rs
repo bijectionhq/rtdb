@@ -44,7 +44,7 @@ pub fn replica_uses_extension(body: &ReplicaBody) -> bool {
             || upload.tries.iter().any(trie_uses_extension),
         ReplicaBody::OversizedMessage(oversized) => oversized.publication.is_some()
             || oversized.storage_version == Some(ADMITTED_OFFLOAD_STORAGE),
-        ReplicaBody::BlockBoundary(boundary) => boundary.relation_oid_order.is_some(),
+        ReplicaBody::BlockBoundary(boundary) => boundary.relation_oid_order.is_some() || boundary.deferred_checkpoint == Some(true),
     }
 }
 

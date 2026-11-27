@@ -794,11 +794,14 @@ variant ResolvedTxMessage : ReplicaMessage {
 variant BlockBoundaryMessage : ReplicaMessage {
     -- The leader signals that a block boundary has been reached.
     -- Injected in RESOLUTION order, off the resolve-side row gauge or on a successful flush CAS, so that it lands after this block's transactions and before the next block's.
-    -- Whichever role reads it holds a pending block on it and holds the messages behind it until the matching upload; the leader that cut it also produces the block here.
+    -- Whichever role reads it holds a pending block until the matching upload, and the leader that cut it also produces the block here.
+    -- A blocking boundary holds the records behind it until adoption.
+    -- A deferred boundary seals the applied live generation and opens the next live generation in a single partition change.
     -- L0 tries are delivered in the subsequent upload rather than separately.
     block_index: Integer
     latest_processed_msg_id: MessageId           -- the resolve-side source watermark at block time
     external_source_token: ExternalSourceToken?
+    deferred_checkpoint: Boolean?
 }
 
 variant BlockUploadedMessage : ReplicaMessage {
@@ -1072,7 +1075,13 @@ config {
 -- == The block cycle ==
 --
 -- A block is filled, cut, produced and adopted, and the leader term that holds the cycle runs it for this term's own blocks and for the one a promotion inherited alike.
--- Resolution is armed only while filling, so nothing is resolved between a boundary and the adopt that closes its block.
+-- A blocking boundary suspends resolution until adoption.
+-- A deferred boundary installs its captured source watermark and immediately permits resolution against the sealed and active generations.
+-- Exactly one sealed checkpoint may be pending, and ordinary admission pauses when the active generation or the remaining memory reaches its checkpoint budget.
+-- The writer builds, uploads and verifies the sealed block on a task owned by its term.
+-- During adoption the writer removes the sealed generation and installs the verified checkpoint catalog in the same partition change.
+-- The active generation, its transaction basis and the later applied source watermark carry through adoption.
+-- A successor reads from the selected checkpoint boundary and applies every subsequent committed record, including writes between the cut and the matching upload.
 -- live_index.block_row_count and Leader.block_in_progress are the coarser view this spec's rules take of that cycle.
 --
 -- A cut is TWO operations — the block is PRODUCED on the boundary and ADOPTED on the confirmation coming back — which is also how a follower reads the same pair of messages.
@@ -2233,8 +2242,9 @@ contract XtdbRefusesRtdbExtensionRecords {
         -- is stored with XTDB_REFUSAL_PREFIX before its protobuf, so XTDB's Block.parseFrom and TableBlock.parseFrom fail with the same invalid-tag error when a node opens the store or follows a block upload.
         -- An RTDB reader strips a leading zero byte, which no encoded protobuf message starts with; digests cover the stored bytes, prefix included.
 
-    @invariant VersionedRelationOidOrder
+    @invariant VersionedReplicaBoundaries
         -- A Classic relation OID activation boundary carries an explicit version under replica header 4 and two zero bytes.
+        -- A native deferred checkpoint uses the same required framing and carries its own mode marker.
         -- A checkpoint with an explicit relation OID order starts with two zero bytes and records every relation's entry explicitly.
         -- Older RTDB readers strip one zero and refuse the remaining invalid protobuf tag before applying the boundary or opening the checkpoint.
         -- An upgraded reader requires the versioned framing and a supported version to agree.
