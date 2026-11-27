@@ -5,7 +5,7 @@ use rtdb_format::database::proto::{LocalLog, LocalStorage, database_config::{Log
 use rtdb_types::{Anomaly, Result};
 use zeroize::Zeroizing;
 
-use crate::config::{CustodyProviderSettings, NodeConfiguration, ParsedConfiguration, ProcessEnvironment, ParsedYamlDocument, PgwireSettings, FlightSettings, parse_custody_provider_config};
+use crate::config::{ConfigurationEnvironment, CustodyProviderSettings, NodeConfiguration, ParsedConfiguration, ProcessEnvironment, ParsedYamlDocument, PgwireSettings, FlightSettings, parse_custody_provider_config};
 
 mod memory;
 pub use memory::{UNKNOWN_MEMORY_LIMIT_BYTES, default_memory_limit_bytes, scaled_memory_limit};
@@ -626,15 +626,14 @@ impl StartOptions {
 
     /// Reserves parsing and environment expansion before constructing startup configuration.
     pub fn load_reserved(&self) -> Result<ParsedConfiguration> {
+        self.load_reserved_with_environment(&ProcessEnvironment)
+    }
+
+    fn load_reserved_with_environment(&self, environment: &impl ConfigurationEnvironment) -> Result<ParsedConfiguration> {
         let memory = MemoryBudget::new(self.allocation_limit_bytes);
         if self.mode == NodeMode::Playground {
-            let mut parsed = ParsedConfiguration::from_yaml("", &ProcessEnvironment, &memory, false)?;
-            let config = parsed.configuration_mut();
-            config.playground = true;
-            config.auth = rtdb_auth::AuthConfig::SingleRootUser { password: None };
-            config.server = Some(PgwireSettings { host: "0.0.0.0".into(), port: self.pgwire_port, ..Default::default() });
-            config.flight_sql = Some(FlightSettings { host: "0.0.0.0".into(), port: self.flight_sql_port, ..Default::default() });
-            config.object_sort = self.object_sort;
+            let mut parsed = ParsedConfiguration::from_yaml("", environment, &memory, false)?;
+            self.configure_playground(parsed.configuration_mut());
             return Ok(parsed);
         }
         let path = self.file.clone().or_else(|| ["xtdb.yaml", "xtdb.yml", "xtdb.edn"].into_iter().map(PathBuf::from).find(|path| path.is_file()));
@@ -643,9 +642,9 @@ impl StartOptions {
         let text = path.as_deref().map(read_configuration).transpose()?.unwrap_or_default();
         let parsed = match (self.mode, path.as_deref().and_then(Path::extension).and_then(|extension| extension.to_str())) {
             (NodeMode::Ingest, Some("edn")) => return Err(invalid("Ingest configuration uses YAML")),
-            (NodeMode::Ingest, _) => ParsedConfiguration::from_yaml(&text, &ProcessEnvironment, &memory, true)?,
-            (_, Some("edn")) => ParsedConfiguration::from_edn(&text, &ProcessEnvironment, &memory)?,
-            _ => ParsedConfiguration::from_yaml(&text, &ProcessEnvironment, &memory, false)?,
+            (NodeMode::Ingest, _) => ParsedConfiguration::from_yaml(&text, environment, &memory, true)?,
+            (_, Some("edn")) => ParsedConfiguration::from_edn(&text, environment, &memory)?,
+            _ => ParsedConfiguration::from_yaml(&text, environment, &memory, false)?,
         };
         for warning in parsed.warnings() { ::tracing::warn!("{warning}"); }
         Ok(parsed.with_object_sort(self.object_sort))
@@ -654,11 +653,7 @@ impl StartOptions {
     pub fn load(&self) -> Result<NodeConfiguration> {
         if self.mode == NodeMode::Playground {
             let mut config = NodeConfiguration::from_yaml("")?;
-            config.playground = true;
-            config.auth = rtdb_auth::AuthConfig::SingleRootUser { password: None };
-            config.server = Some(PgwireSettings { host: "0.0.0.0".into(), port: self.pgwire_port, ..Default::default() });
-            config.flight_sql = Some(FlightSettings { host: "0.0.0.0".into(), port: self.flight_sql_port, ..Default::default() });
-            config.object_sort = self.object_sort;
+            self.configure_playground(&mut config);
             return Ok(config);
         }
         let path = self.file.clone().or_else(|| ["xtdb.yaml", "xtdb.yml", "xtdb.edn"].into_iter().map(PathBuf::from).find(|path| path.is_file()));
@@ -676,6 +671,13 @@ impl StartOptions {
         }?;
         configuration.object_sort = self.object_sort;
         Ok(configuration)
+    }
+
+    fn configure_playground(&self, config: &mut NodeConfiguration) {
+        config.playground = true;
+        config.server = Some(PgwireSettings { host: "0.0.0.0".into(), port: self.pgwire_port, ..Default::default() });
+        config.flight_sql = Some(FlightSettings { host: "0.0.0.0".into(), port: self.flight_sql_port, ..Default::default() });
+        config.object_sort = self.object_sort;
     }
 }
 
@@ -709,3 +711,37 @@ fn memory_limit(environment: &impl Fn(&str) -> Option<String>) -> Result<usize> 
 fn bytes(value: &str) -> Result<usize> { value.parse::<usize>().ok().filter(|value| *value > 1).ok_or_else(|| invalid("Memory limit must be a positive byte count greater than one")) }
 fn port(value: Option<String>) -> Result<i32> { value.and_then(|value| value.parse::<i32>().ok()).filter(|value| (-1..=65535).contains(value)).ok_or_else(|| invalid("Port must be between -1 and 65535")) }
 pub(crate) fn invalid(message: impl std::fmt::Display) -> Anomaly { Anomaly::incorrect("rtdb.cli/arguments", message.to_string()) }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use rtdb_auth::AuthConfig;
+    use rtdb_columnar::MemoryBudget;
+    use rtdb_types::Result;
+
+    use super::{Command, parse};
+    use crate::config::{ConfigurationEnvironment, EnvironmentValue};
+
+    struct PlaygroundEnvironment(Option<&'static str>);
+
+    impl ConfigurationEnvironment for PlaygroundEnvironment {
+        fn lookup(&self, name: &str, memory: &Arc<MemoryBudget>) -> Result<Option<EnvironmentValue>> {
+            if name == "XTDB_PASSWORD" { self.0.map(|password| EnvironmentValue::copy(password, memory)).transpose() } else { Ok(None) }
+        }
+    }
+
+    #[test]
+    fn playground_uses_the_configured_root_password_and_defaults_to_trust() {
+        let Command::Start(options) = parse(["playground".into(), "--memory-limit".into(), "67108864".into()], &|_| None).unwrap() else {
+            panic!("expected playground startup");
+        };
+        for expected in [None, Some("playground-password")] {
+            let parsed = options.load_reserved_with_environment(&PlaygroundEnvironment(expected)).unwrap();
+            let (config, _, _reservation) = parsed.into_execution(options.allocation_limit_bytes).unwrap();
+            let AuthConfig::SingleRootUser { password } = config.auth else { panic!("expected the default authenticator"); };
+            assert!(config.playground);
+            assert_eq!(password.as_ref().map(|password| password.expose()), expected);
+        }
+    }
+}

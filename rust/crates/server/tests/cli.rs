@@ -413,7 +413,7 @@ fn node_and_ingest_options_keep_configuration_and_allocation_limits() {
 }
 
 #[test]
-fn playground_sets_ephemeral_ports_and_trusted_in_memory_configuration() {
+fn playground_sets_ephemeral_ports_and_wildcard_listeners() {
     let Command::Start(options) = parse(&["playground", "--port", "0", "--flight-sql-port", "-1"]) else { panic!("expected start") };
     let config = options.load().unwrap();
     assert!(config.playground);
@@ -421,7 +421,6 @@ fn playground_sets_ephemeral_ports_and_trusted_in_memory_configuration() {
     assert_eq!(config.flight_sql.as_ref().unwrap().host, "0.0.0.0");
     assert_eq!(config.server.unwrap().port, 0);
     assert_eq!(config.flight_sql.unwrap().port, -1);
-    assert!(matches!(config.auth, rtdb_auth::AuthConfig::SingleRootUser { password: None }));
     let config = options.load_reserved().unwrap();
     assert_eq!(config.configuration().server.as_ref().unwrap().host, "0.0.0.0");
     assert_eq!(config.configuration().flight_sql.as_ref().unwrap().host, "0.0.0.0");
