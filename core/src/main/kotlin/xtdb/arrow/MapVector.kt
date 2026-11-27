@@ -99,7 +99,8 @@ class MapVector(private val listVector: ListVector, private val keysSorted: Bool
         val keyType = keys.arrowType
         val valueType = values.arrowType
         when (keyType) {
-            I8_TYPE, I16_TYPE, I32_TYPE, I64_TYPE, UTF8_TYPE -> Unit
+            BOOL_TYPE, I8_TYPE, I16_TYPE, I32_TYPE, I64_TYPE, UTF8_TYPE -> Unit
+            VAR_BINARY_TYPE -> if (keys !is VarBinaryVector) return false
             else -> return false
         }
         if (!valueType.hasScalarObjectIdentity() && valueType != UTF8_TYPE) return false
@@ -107,13 +108,20 @@ class MapVector(private val listVector: ListVector, private val keysSorted: Bool
 
         val start = src.getListStartIndex(idx)
         val count = src.getListCount(idx)
-        val seen = if (count > 1) HashSet<Any>() else null
+        // Decoding allocates a fresh ByteArray for each binary key, including keys with identical bytes.
+        val seen = if (count > 1 && keyType != VAR_BINARY_TYPE) HashSet<Any>() else null
         for (i in start until start + count) {
-            if (keyType == UTF8_TYPE) {
-                if (!keys.isAscii(i) || seen?.add(keys.getBytes(i)) == false) return false
-            } else if (seen?.add(keys.getAsLong(i)) == false) return false
+            when (keyType) {
+                UTF8_TYPE -> {
+                    val bytes = keys.getBytes(i)
+                    if (!bytes.isWellFormedUtf8() || seen?.add(bytes) == false) return false
+                }
+                VAR_BINARY_TYPE -> keys.getBytes(i)
+                BOOL_TYPE -> if (seen?.add(keys.getBoolean(i)) == false) return false
+                else -> if (seen?.add(keys.getAsLong(i)) == false) return false
+            }
 
-            if (valueType == UTF8_TYPE && !values.isNull(i) && !values.isAscii(i)) return false
+            if (valueType == UTF8_TYPE && !values.isNull(i) && !values.getBytes(i).isWellFormedUtf8()) return false
         }
 
         src.rowCopier(this).copyRow(idx)

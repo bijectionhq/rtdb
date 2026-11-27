@@ -82,18 +82,13 @@ internal fun ArrowType.hasScalarObjectIdentity() = when (this) {
     else -> false
 }
 
-internal fun VectorReader.isAscii(idx: Int): Boolean {
-    val bytes = getBytes(idx)
-    return (bytes.position() until bytes.limit()).all { bytes.get(it) >= 0 }
-}
-
-internal fun VectorReader.hasValidUtf8(idx: Int) = UnsafeByteOperations.unsafeWrap(getBytes(idx)).isValidUtf8
+internal fun ByteBuffer.isWellFormedUtf8() = UnsafeByteOperations.unsafeWrap(this).isValidUtf8
 
 internal fun VectorWriter.scalarObjectTarget(src: VectorReader, idx: Int): VectorWriter? {
     val sourceType = src.arrowType
     if (src.type.encoding != Encoding.Plain) return null
     if (!sourceType.hasScalarObjectIdentity() &&
-        !(sourceType == UTF8_TYPE && (src.isNull(idx) || src.hasValidUtf8(idx)))) return null
+        !(sourceType == UTF8_TYPE && (src.isNull(idx) || src.getBytes(idx).isWellFormedUtf8()))) return null
 
     val target = if (this is DenseUnionVector) vectorForOrNull(sourceType.toLeg()) else this
     return target?.takeIf { it.arrowType == sourceType }

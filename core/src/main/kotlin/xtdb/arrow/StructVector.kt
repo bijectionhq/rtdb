@@ -165,7 +165,7 @@ class StructVector private constructor(
         childWriters.values.all { child ->
             child.type.encoding == Encoding.Plain && !child.isNull(idx) && when (child) {
                 is StructVector -> child.hasObjectIdentityChildren(idx)
-                is Utf8Vector -> child.hasValidUtf8(idx)
+                is Utf8Vector -> child.getBytes(idx).isWellFormedUtf8()
                 else -> child.arrowType.hasScalarObjectIdentity()
             }
         }

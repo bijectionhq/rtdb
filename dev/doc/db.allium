@@ -2430,6 +2430,9 @@ surface QueryAccess {
         -- A nested field read follows the reached child through each valid ancestor and yields null for a null ancestor.
         -- A compatible PATCH result selects each right-hand field when it supplies a non-null value and otherwise keeps the corresponding left-hand field when present.
         -- Arrow map value writes retain the declared key-order flag and keep the last value of a repeated key at its first position.
+        -- A positioned map identity write preserves the order of distinct boolean, signed integer or well-formed UTF-8 keys in a matching layout.
+        -- Matched binary map layouts retain every key position, including keys with identical bytes.
+        -- Malformed text keys participate in duplicate resolution after Java UTF-8 replacement.
         -- A positioned decimal identity write retains the original coefficient and scale and applies the destination's declared precision.
         -- The precision bound applies equally to positive and negative coefficients and accepts both endpoints.
         -- A positioned interval identity write retains the signed components in the units of the matching input and output layout.

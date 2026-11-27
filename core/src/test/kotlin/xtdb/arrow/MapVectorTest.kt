@@ -89,6 +89,78 @@ class MapVectorTest {
     }
 
     @Test
+    fun `positioned maps copy unique unicode and boolean keys in entry order`() {
+        val cases = listOf(
+            VectorType.UTF8 to listOf("é", "😀"),
+            VectorType.BOOL to listOf(false, true)
+        )
+        for ((keyType, keys) in cases) {
+            val type = VectorType.mapTypeOf(keyType, VectorType.UTF8, false)
+            Vector.open(allocator, "src", type).use { src ->
+                src.writeObject(linkedMapOf(keys[0] to "début", keys[1] to "🎈"))
+                for ((key, value) in listOf(keys[0] to "old", keys[1] to "other", keys[0] to "new")) {
+                    src.mapKeys.writeObject(key)
+                    src.mapValues.writeObject(value)
+                    src.listElements.endStruct()
+                }
+                src.endList()
+
+                Vector.open(allocator, "dst", type).use { dst ->
+                    val rows = src.valueReader()
+                    assertTrue(rows.next().copyIdentityTo(dst))
+                    assertFalse(rows.next().copyIdentityTo(dst))
+                    dst.writeValue(rows)
+                    assertEquals(keys + keys, dst.mapKeys.asList)
+                    assertEquals(listOf("début", "🎈", "new", "other"), dst.mapValues.asList)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `positioned binary map keys keep distinct decoded array identities`() {
+        val type = VectorType.mapTypeOf(VectorType.VAR_BINARY, VectorType.UTF8, true)
+        Vector.open(allocator, "src", type).use { src ->
+            src.writeObject(linkedMapOf(byteArrayOf(1) to "first", byteArrayOf(1) to "second", byteArrayOf(2) to "third"))
+            assertEquals(3, (src.getObject(0) as Map<*, *>).size)
+
+            Vector.open(allocator, "dst", type).use { dst ->
+                assertTrue(src.valueReader().next().copyIdentityTo(dst))
+                assertEquals(ArrowType.Map(true), dst.arrowType)
+                assertEquals(listOf(1, 1, 2), dst.mapKeys.asList.map { (it as ByteArray).single().toInt() })
+                assertEquals(listOf("first", "second", "third"), dst.mapValues.asList)
+            }
+        }
+    }
+
+    @Test
+    fun `malformed utf8 keys collapse with their java replacement at the first position`() {
+        val type = VectorType.mapTypeOf(VectorType.UTF8, VectorType.UTF8, false)
+        Vector.open(allocator, "src", type).use { src ->
+            val entries = listOf(
+                "\uFFFD".toByteArray() to "first",
+                "other".toByteArray() to "middle",
+                byteArrayOf(0xff.toByte()) to "last"
+            )
+            for ((key, value) in entries) {
+                src.mapKeys.writeBytes(key)
+                src.mapValues.writeObject(value)
+                src.listElements.endStruct()
+            }
+            src.endList()
+
+            Vector.open(allocator, "dst", type).use { dst ->
+                val row = src.valueReader().next()
+                assertFalse(row.copyIdentityTo(dst))
+                dst.writeValue(row)
+                assertEquals(listOf("\uFFFD", "other"), dst.mapKeys.asList)
+                assertEquals(listOf("last", "middle"), dst.mapValues.asList)
+                assertEquals(ByteBuffer.wrap("\uFFFD".toByteArray()), dst.mapKeys.getBytes(0))
+            }
+        }
+    }
+
+    @Test
     fun roundTripsThroughFile() {
         val m1 = mapOf(4 to "Hello", 8 to null)
         val m2 = mapOf(12 to "world")
