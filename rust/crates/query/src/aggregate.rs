@@ -9,7 +9,7 @@ use rtdb_plan::{AggregateExpr, AggregateFunction, Binder, NamedExpr, PercentileF
 use rtdb_types::{LogicalType, Result, ScalarType, TimeUnit, Value};
 
 use crate::context::Execution;
-use crate::columnar::{BatchCursor, Column, ColumnBatch};
+use crate::columnar::{BatchCursor, Column, ColumnBatch, PredicateSelection};
 use crate::cursor::OwnedRow;
 use crate::runtime_schema::{EmissionMode, EmittedRelation};
 use crate::set_keys::{BatchKeyIndex, KeyColumns};
@@ -980,11 +980,20 @@ impl DistinctSeen {
         }
         let mut retained_source = None;
         let mut admitted = false;
+        let positions = [argument.unwrap_or_default()];
+        let mut typed = None;
         for (row, (group, selected)) in mapping.iter().zip(mask).enumerate() {
             execution.context.check_cancelled()?;
             if !*selected { continue; }
             if !admitted {
                 rtdb_plan::validate_equality_types(&types.input, &types.input)?;
+                if argument.is_some() {
+                    match KeyColumns::projection(input.batch, &positions).bind_typed(&execution.context) {
+                        Ok(readers) => typed = readers,
+                        Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => {},
+                        Err(error) => return Err(error),
+                    }
+                }
                 admitted = true;
             }
             match self {
@@ -992,7 +1001,7 @@ impl DistinctSeen {
                     let (Rows { batch, projected, .. }, Some(argument)) = (input, argument) else {
                         return Err(invalid("aggregate-input", "A distinct batch argument is absent"));
                     };
-                    *selected = index.insert_distinct_argument(batch, argument, row, group, projected, &mut retained_source, &execution.context)?;
+                    *selected = index.insert_distinct_argument(batch, argument, row, group, projected, typed.as_ref(), &mut retained_source, &execution.context)?;
                 }
                 Self::Rows { index, values } => {
                     let cell = input.value(row, argument)?;
@@ -1020,6 +1029,32 @@ impl DistinctSeen {
         Ok(())
     }
 }
+
+enum AggregateMask {
+    All,
+    Bitmap(PredicateSelection),
+    Flags(Vec<bool>),
+}
+
+impl AggregateMask {
+    fn contains(&self, row: usize) -> bool {
+        match self {
+            Self::All => true,
+            Self::Bitmap(selection) => selection.contains(row),
+            Self::Flags(flags) => flags[row],
+        }
+    }
+
+    fn flags(&mut self, len: usize, scope: &rtdb_expr::EvaluationScope) -> Result<&mut [bool]> {
+        if !matches!(self, Self::Flags(_)) {
+            scope.reserve(len)?;
+            *self = Self::Flags((0..len).map(|row| self.contains(row)).collect());
+        }
+        let Self::Flags(flags) = self else { unreachable!("The aggregate mask has mutable flags"); };
+        Ok(flags)
+    }
+}
+
 enum Accumulation { Counts(GroupStates<i64>), Scalar(ScalarGroups), Vectors(CollectionVectors) }
 impl AggregateColumn {
     fn new(aggregate: &AggregateExpr,schema: &Schema,execution: &Execution) -> Result<Self> {
@@ -1037,25 +1072,28 @@ impl AggregateColumn {
     }
     async fn aggregate(&mut self,input: Rows<'_>,mapping: GroupMapping<'_>,group_count: usize,aggregate: &AggregateExpr,types: &AggregateTypes,schema: &Schema,execution: &Execution) -> Result<()> {
         let scope = execution.scope()?;
-        scope.reserve(input.len())?;
-        let mut mask = vec![true;input.len()];
-        if let Some(filter) = &aggregate.filter
-            && let Some(selected) = crate::columnar::typed_predicate_mask(input.batch, filter, schema, execution.parameters.evaluator())?
-        {
-            execution.prepare_expression(filter, schema, &scope)?;
-            mask = selected;
-        } else if let Some(filter) = &aggregate.filter {
-            let invocation = execution.prepare_expression(filter,schema,&scope)?;
-            for (row, selected) in mask.iter_mut().enumerate() {
-                let row_scope = execution.scope()?;
-                let input = crate::columnar::BatchRow { batch: input.batch, row, admit_dates: false };
-                let values = rtdb_expr::ExpressionRow::Borrowed(&input);
-                *selected = is_true(&execution.evaluate_invocation_row(&row_scope, &invocation, values).await?)?;
+        let mut mask = AggregateMask::All;
+        if let Some(filter) = &aggregate.filter {
+            execution.context.check_cancelled()?;
+            if let Some(predicate) = crate::columnar::functions::Predicate::bind(filter, schema)
+                && let Some(selection) = predicate.selection(input.batch, execution.parameters.evaluator(), &execution.context.memory, || {
+                    execution.prepare_expression(filter, schema, &scope).map(|_| ())
+                })?
+            {
+                mask = AggregateMask::Bitmap(selection);
+            } else {
+                let invocation = execution.prepare_expression(filter, schema, &scope)?;
+                for (row, selected) in mask.flags(input.len(), &scope)?.iter_mut().enumerate() {
+                    let row_scope = execution.scope()?;
+                    let input = crate::columnar::BatchRow { batch: input.batch, row, admit_dates: false };
+                    let values = rtdb_expr::ExpressionRow::Borrowed(&input);
+                    *selected = is_true(&execution.evaluate_invocation_row(&row_scope, &invocation, values).await?)?;
+                }
             }
         }
         let argument = aggregate.argument.as_ref().map(|argument|argument_position(argument,schema)).transpose()?;
         if let Some(seen) = &mut self.distinct {
-            seen.select(input, mapping, &mut mask, argument, types, execution)?;
+            seen.select(input, mapping, mask.flags(input.len(), &scope)?, argument, types, execution)?;
         }
         validate_aggregate_input(aggregate,types)?;
         match &mut self.accumulation {
@@ -1063,26 +1101,26 @@ impl AggregateColumn {
                 counts.ensure(group_count)?;
                 let all = aggregate.function == AggregateFunction::CountStar;
                 let typed = input.arrow_column(argument).filter(|column| accepts_typed_column(column, masked_count_layout));
-                for (row, (group, selected)) in mapping.iter().zip(&mask).enumerate() {
+                for (row, group) in mapping.iter().enumerate() {
                     execution.context.check_cancelled_at(row)?;
-                    if *selected && (all || count_is_present(input, typed, row, argument)?) {
+                    if mask.contains(row) && (all || count_is_present(input, typed, row, argument)?) {
                         counts.values[group] = counts.values[group].wrapping_add(1);
                     }
                 }
             }
             Accumulation::Scalar(states) => {
-                states.aggregate(input,mapping,&mask,group_count,argument,aggregate,types,&scope,execution)?;
+                states.aggregate(input,mapping,|row| mask.contains(row),group_count,argument,aggregate,types,&scope,execution)?;
             }
             Accumulation::Vectors(vectors) => {
                 let Rows { batch, projected, .. } = input;
                 let argument = argument.ok_or_else(|| invalid("aggregate-state", "Collected aggregate argument is absent"))?;
                 if matches!(aggregate.function, AggregateFunction::Percentile { .. }) {
-                    for (row, selected) in mask.iter_mut().enumerate() {
+                    for (row, selected) in mask.flags(input.len(), &scope)?.iter_mut().enumerate() {
                         execution.context.check_cancelled_at(row)?;
                         if *selected { *selected = !input.is_null(row, Some(argument))?; }
                     }
                 }
-                vectors.append(batch, argument, mapping, &mask, group_count, projected, &execution.context)?;
+                vectors.append(batch, argument, mapping, |row| mask.contains(row), group_count, projected, &execution.context)?;
             }
         }
         Ok(())
@@ -1118,18 +1156,18 @@ impl CollectionVectors {
         Ok(Self { batches: Vec::new(), groups: Vec::new(), selected: 0, present: false, reservation: memory.reserve(4096)?, order, projected: false })
     }
 
-    fn append(&mut self, batch: &ColumnBatch, position: usize, mapping: GroupMapping<'_>, mask: &[bool], groups: usize, projected: bool, context: &crate::QueryContext) -> Result<()> {
+    fn append(&mut self, batch: &ColumnBatch, position: usize, mapping: GroupMapping<'_>, selected: impl Fn(usize) -> bool + Copy, groups: usize, projected: bool, context: &crate::QueryContext) -> Result<()> {
         self.present |= batch.len != 0;
         self.projected |= projected;
         if let Some(order) = &self.order {
             if batch.len == 0 { return Ok(()); }
-            let batch = order.page(batch, mapping, mask, context)?;
+            let batch = order.page(batch, mapping, selected, context)?;
             self.account_pages(self.selected, groups)?;
             self.batches.push(batch);
             return Ok(());
         }
-        self.collect(batch, position, mapping.iter().zip(mask).enumerate()
-            .filter_map(|(row, (group, &selected))| selected.then_some((row, group))), groups, context)
+        self.collect(batch, position, mapping.iter().enumerate()
+            .filter_map(move |(row, group)| selected(row).then_some((row, group))), groups, context)
     }
 
     fn collect(&mut self, batch: &ColumnBatch, position: usize, picks: impl Iterator<Item = (usize, usize)> + Clone, groups: usize, context: &crate::QueryContext) -> Result<()> {
@@ -1386,15 +1424,16 @@ impl CollectionOrder {
         Ok(Some(Self { positions, schema, group }))
     }
 
-    fn page(&self, batch: &ColumnBatch, mapping: GroupMapping<'_>, mask: &[bool], context: &crate::QueryContext) -> Result<ColumnBatch> {
+    fn page(&self, batch: &ColumnBatch, mapping: GroupMapping<'_>, selected: impl Fn(usize) -> bool, context: &crate::QueryContext) -> Result<ColumnBatch> {
         let memory = &context.memory;
         let mut output = batch.key_projection(&self.positions, memory)?;
         let bytes = batch.len.checked_mul(16).and_then(|bytes| bytes.checked_add(512))
             .ok_or_else(|| invalid("aggregate-size", "Ordered list aggregate group vector overflow"))?;
         let reservation = memory.reserve(bytes)?;
         let mut groups = arrow_array::builder::Int64Builder::with_capacity(batch.len);
-        for (group, &selected) in mapping.iter().zip(mask) {
-            if selected { groups.append_value(group as i64); } else { groups.append_null(); }
+        for (row, group) in mapping.iter().enumerate() {
+            context.check_cancelled_at(row)?;
+            if selected(row) { groups.append_value(group as i64); } else { groups.append_null(); }
         }
         let logical = self.group.data_type.clone();
         let field = Arc::new(rtdb_columnar::to_field(&self.group.name, &logical)?);
@@ -1606,29 +1645,29 @@ impl<T: Default> GroupStates<T> {
 type ScalarGroups = GroupStates<ScalarAccumulator>;
 
 impl ScalarGroups {
-    fn aggregate(&mut self,page: Rows<'_>,mapping: GroupMapping<'_>,mask: &[bool],group_count: usize,argument: Option<usize>,aggregate: &AggregateExpr,types: &AggregateTypes,scope: &rtdb_expr::EvaluationScope,execution: &Execution) -> Result<()> {
+    fn aggregate(&mut self,page: Rows<'_>,mapping: GroupMapping<'_>,selected: impl Fn(usize) -> bool + Copy,group_count: usize,argument: Option<usize>,aggregate: &AggregateExpr,types: &AggregateTypes,scope: &rtdb_expr::EvaluationScope,execution: &Execution) -> Result<()> {
         use AggregateFunction as A;
         match aggregate.function {
             A::Sum | A::Average => {
                 let summer = SumFactory::new(&types.input,types.output_type())?;
                 self.ensure(group_count)?;
-                self.sum_page(page,mapping,mask,argument,&summer,execution)?;
-                if aggregate.function == A::Average { self.count_page(page,mapping,mask,argument,execution)?; }
+                self.sum_page(page,mapping,selected,argument,&summer,execution)?;
+                if aggregate.function == A::Average { self.count_page(page,mapping,selected,argument,execution)?; }
             }
             A::VariancePopulation | A::VarianceSample | A::StddevPopulation | A::StddevSample => {
                 let squares = square_column(page,argument,&types.input,scope,execution)?;
                 let sum_type = LogicalType::Scalar(ScalarType::F64);
                 let summer = SumFactory::new(&types.input,&sum_type)?;
                 self.ensure(group_count)?;
-                self.sum_page(page,mapping,mask,argument,&summer,execution)?;
-                for ((value,group),selected) in squares.into_iter().zip(mapping.iter()).zip(mask) {
+                self.sum_page(page,mapping,selected,argument,&summer,execution)?;
+                for (row, (value, group)) in squares.into_iter().zip(mapping.iter()).enumerate() {
                     execution.context.check_cancelled()?;
-                    if *selected { if let Some(value) = value {
+                    if selected(row) { if let Some(value) = value {
                         let state = &mut self.values[group];
                         state.squares = Some(state.squares.map_or(value,|previous|previous + value));
                     } }
                 }
-                self.count_page(page,mapping,mask,argument,execution)?;
+                self.count_page(page,mapping,selected,argument,execution)?;
             }
             A::Min | A::Max => {
                 self.ensure(group_count)?;
@@ -1643,9 +1682,9 @@ impl ScalarGroups {
                         (LogicalType::Scalar(ScalarType::Utf8), DataType::Utf8)
                         | (LogicalType::Scalar(ScalarType::Binary), DataType::Binary)))
                 });
-                for (row,(group,selected)) in mapping.iter().zip(mask).enumerate() {
+                for (row, group) in mapping.iter().enumerate() {
                     execution.context.check_cancelled_at(row)?;
-                    if *selected {
+                    if selected(row) {
                         let state = &mut self.values[group];
                         if let Some(column) = &numeric {
                             if let Some(value) = column.get(row)? {
@@ -1681,9 +1720,9 @@ impl ScalarGroups {
                 self.ensure(group_count)?;
                 let every = aggregate.function == A::Every;
                 let boolean = page.arrow_column(argument).filter(|column| accepts_typed_column(column, |ty| *ty == DataType::Boolean));
-                for (row, (group, selected)) in mapping.iter().zip(mask).enumerate() {
+                for (row, group) in mapping.iter().enumerate() {
                     execution.context.check_cancelled_at(row)?;
-                    if !*selected { continue; }
+                    if !selected(row) { continue; }
                     let state = &mut self.values[group];
                     if let Some(column) = boolean {
                         if let Some((array, offset)) = present_column_cell(column, row)? {
@@ -1703,7 +1742,7 @@ impl ScalarGroups {
         }
         Ok(())
     }
-    fn sum_page(&mut self,page: Rows<'_>,mapping: GroupMapping<'_>,mask: &[bool],argument: Option<usize>,summer: &SumFactory<'_>,execution: &Execution) -> Result<()> {
+    fn sum_page(&mut self,page: Rows<'_>,mapping: GroupMapping<'_>,selected: impl Fn(usize) -> bool + Copy,argument: Option<usize>,summer: &SumFactory<'_>,execution: &Execution) -> Result<()> {
         let _scratch = execution.context.memory.reserve(4096)?;
         let numeric = matches!(summer.output, LogicalType::Scalar(ScalarType::I32 | ScalarType::I64 | ScalarType::F32 | ScalarType::F64))
             .then(|| NumericColumn::bind(page.arrow_column(argument)?, None)).flatten();
@@ -1724,9 +1763,9 @@ impl ScalarGroups {
                     .map(|column| (column, *output)),
             _ => None,
         };
-        for (index,(group,selected)) in mapping.iter().zip(mask).enumerate() {
+        for (index, group) in mapping.iter().enumerate() {
             execution.context.check_cancelled_at(index)?;
-            if !*selected { continue; }
+            if !selected(index) { continue; }
             let state = &mut self.values[group];
             if let Some(column) = &numeric {
                 if let Some(value) = column.get(index)? {
@@ -1781,11 +1820,11 @@ impl ScalarGroups {
         }
         Ok(())
     }
-    fn count_page(&mut self,page: Rows<'_>,mapping: GroupMapping<'_>,mask: &[bool],argument: Option<usize>,execution: &Execution) -> Result<()> {
+    fn count_page(&mut self,page: Rows<'_>,mapping: GroupMapping<'_>,selected: impl Fn(usize) -> bool + Copy,argument: Option<usize>,execution: &Execution) -> Result<()> {
         let typed = page.arrow_column(argument).filter(|column| accepts_typed_column(column, masked_count_layout));
-        for (row,(group,selected)) in mapping.iter().zip(mask).enumerate() {
+        for (row, group) in mapping.iter().enumerate() {
             execution.context.check_cancelled_at(row)?;
-            if !*selected { continue; }
+            if !selected(row) { continue; }
             if count_is_present(page, typed, row, argument)? {
                 let state = &mut self.values[group];
                 state.count = state.count.wrapping_add(1);

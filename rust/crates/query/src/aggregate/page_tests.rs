@@ -796,6 +796,31 @@ async fn aggregate_output_is_complete_and_retains_distinct_state_across_pages() 
 }
 
 #[tokio::test]
+async fn aggregate_filter_bitmap_precedes_distinct_and_keeps_unknown_equalities() {
+    let execution = execution(8);
+    let value = LogicalType::Scalar(ScalarType::I64).maybe();
+    let truth = LogicalType::Scalar(ScalarType::Bool).maybe();
+    let schema = Schema::new(vec![field(0, value.clone()), field(1, truth)]).unwrap();
+    let filter = schema.fields()[1].expression();
+    let collect = AggregateExpr {
+        field: field(2, LogicalType::list(value).maybe()),
+        function: AggregateFunction::ArrayAgg,
+        argument: Some(schema.fields()[0].expression()),
+        distinct: true,
+        filter: Some(filter),
+        order_by: vec![],
+    };
+    let pages = vec![
+        vec![vec![Value::I64(9), Value::Null], vec![Value::Null, Value::Bool(true)], vec![Value::I64(3), Value::Bool(true)]],
+        vec![vec![Value::I64(9), Value::Bool(true)], vec![Value::I64(3), Value::Bool(true)],
+            vec![Value::Null, Value::Bool(true)], vec![Value::I64(4), Value::Bool(false)]],
+    ];
+    let (mut cursor, _) = cursor(&execution, schema, pages, vec![], vec![collect], None);
+    let page = cursor.next_batch().await.unwrap().unwrap();
+    assert_eq!(page.columns[0].value(0).unwrap(), Value::list(vec![Value::Null, Value::I64(3), Value::I64(9), Value::Null]));
+}
+
+#[tokio::test]
 async fn fixed_aggregate_results_keep_declared_layout_nulls_and_page_custody() {
     let execution = execution(8);
     let memory = &execution.context.memory;
@@ -1028,7 +1053,7 @@ fn aggregate_input_inline_extrema_and_boolean_fit_in_reserved_group_state() {
             let mut states = ScalarGroups::new(&execution).unwrap();
             states.ensure(3).unwrap();
             let pressure = memory.reserve(memory.available_bytes()).unwrap();
-            states.aggregate(page, GroupMapping::Grouped(&[0, 1, 0, 1, 2]), &[true, true, true, true, false],
+            states.aggregate(page, GroupMapping::Grouped(&[0, 1, 0, 1, 2]), |row| row != 4,
                 3, Some(0), &aggregate, &types, &scope, &execution).unwrap();
             drop(pressure);
             assert_eq!(states.values[0].finish(&aggregate, types.output_type(), &scope).unwrap(), expected);
@@ -1094,8 +1119,8 @@ fn variance_and_average_read_nullable_numeric_runs() {
     let mask = [true, true, true, false, true];
     let output = LogicalType::Scalar(ScalarType::F64);
     let factory = SumFactory::new(&input, &output).unwrap();
-    states.sum_page(rows, GroupMapping::Global(5), &mask, Some(0), &factory, &execution).unwrap();
-    states.count_page(rows, GroupMapping::Global(5), &mask, Some(0), &execution).unwrap();
+    states.sum_page(rows, GroupMapping::Global(5), |row| mask[row], Some(0), &factory, &execution).unwrap();
+    states.count_page(rows, GroupMapping::Global(5), |row| mask[row], Some(0), &execution).unwrap();
     assert_eq!(states.values[0].average_double(), Some(4.0));
 }
 
@@ -1150,7 +1175,7 @@ fn aggregate_input_duration_sum_preserves_the_reached_null_index_and_wrapping() 
             let mut states = ScalarGroups::new(&execution).unwrap();
             states.ensure(1).unwrap();
             let pressure = memory.reserve(memory.available_bytes() - 4096).unwrap();
-            let result = states.aggregate(page, GroupMapping::Global(3), &[true, selected, true], 1,
+            let result = states.aggregate(page, GroupMapping::Global(3), |row| row != 1 || selected, 1,
                 Some(0), &aggregate, &types, &scope, &execution);
             drop(pressure);
             let state = &states.values[0];
@@ -1188,9 +1213,9 @@ fn decimal_average_reads_the_annotated_scale_before_rounding_to_double() {
     let output = LogicalType::Scalar(ScalarType::F64);
     let factory = SumFactory::new(&input, &output).unwrap();
     let pressure = memory.reserve(memory.available_bytes() - 4096).unwrap();
-    states.sum_page(rows, GroupMapping::Global(2), &[true, true], Some(0), &factory, &execution).unwrap();
+    states.sum_page(rows, GroupMapping::Global(2), |_| true, Some(0), &factory, &execution).unwrap();
     drop(pressure);
-    states.count_page(rows, GroupMapping::Global(2), &[true, true], Some(0), &execution).unwrap();
+    states.count_page(rows, GroupMapping::Global(2), |_| true, Some(0), &execution).unwrap();
     assert_eq!(states.values[0].average_double().unwrap().to_bits(), expected.to_bits());
 }
 
@@ -1412,7 +1437,7 @@ fn failing_duration_average_sum_does_not_start_the_count_pass() {
     for value in [Value::Duration { value: 10,unit: TimeUnit::Millisecond },Value::Null] { page.push(OwnedRow::new(vec![value],&execution.context.memory).unwrap()).unwrap(); }
     let page = ColumnBatch::from_page(&page.finish(), &execution.context.memory).unwrap();let scope = execution.scope().unwrap();
     let mut states = ScalarGroups::new(&execution).unwrap();
-    assert_eq!(states.aggregate(Rows { batch: &page, projected: false, memory: &execution.context.memory },GroupMapping::Global(2),&[true,true],1,Some(0),&aggregate,&types,&scope,&execution).unwrap_err().code,"xtdb.error/unknown");
+    assert_eq!(states.aggregate(Rows { batch: &page, projected: false, memory: &execution.context.memory },GroupMapping::Global(2),|_| true,1,Some(0),&aggregate,&types,&scope,&execution).unwrap_err().code,"xtdb.error/unknown");
     assert_eq!(states.values[0].count,0);
     assert!(matches!(states.values[0].accumulator, ScalarState::Duration(10, TimeUnit::Millisecond)));
     drop(states);drop(scope);drop(page);

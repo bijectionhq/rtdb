@@ -2488,6 +2488,8 @@ surface QueryAccess {
         -- A compatible text or binary result copies the retained winners directly into the output page's Arrow buffers.
         -- EVERY and ANY read compatible Arrow Boolean cells in selection order and retain a nullable Boolean per group.
         -- Aggregate DISTINCT indexes its selected argument positions within each group and retains arguments whose SQL equality is unknown.
+        -- Aggregate FILTER can consume a compatible predicate bitmap and selects only true positions before DISTINCT and accumulation.
+        -- An admitted DISTINCT argument page uses its shared typed key reader for the selected positions.
         -- A sparsely retained typed DISTINCT argument page can compact to the positions that entered the index.
         -- List aggregates collect selected Arrow positions after applying filters and distinctness, and sort Arrow keys in memory when the aggregate specifies an order.
         -- Percentile aggregates order each group's selected nonnull positions in memory or through the spilling sort path.

@@ -1007,10 +1007,13 @@ impl BatchKeyIndex {
 
     pub fn insert_distinct_argument(
         &mut self, batch: &ColumnBatch, column: usize, row: usize, group: usize, projected: bool,
-        retained_source: &mut Option<(usize, usize)>, context: &QueryContext,
+        typed: Option<&TypedKeys<'_>>, retained_source: &mut Option<(usize, usize)>, context: &QueryContext,
     ) -> Result<bool> {
         let columns = std::slice::from_ref(&batch.columns[column]);
-        let key = Key::read(ArrowKey { columns, row, projected }, None, false, context)?;
+        let key = match typed {
+            Some(typed) => typed.key(row, projected),
+            None => Key::read(ArrowKey { columns, row, projected }, None, false, context)?,
+        };
         let hash = key.vector_hash()?;
         let source = &self.batches;
         let group = u32::try_from(group).map_err(|_| size_error())?;
@@ -1468,7 +1471,7 @@ mod tests {
         let mut index = BatchKeyIndex::vector_hashing(&context).unwrap();
         let mut source = None;
         for row in [1, 2] {
-            assert!(index.insert_distinct_argument(&input, 1, row, 2, false, &mut source, &context).unwrap());
+            assert!(index.insert_distinct_argument(&input, 1, row, 2, false, None, &mut source, &context).unwrap());
         }
         index.finish_distinct_argument(source, &context).unwrap();
         drop(input);
@@ -1476,9 +1479,9 @@ mod tests {
 
         let probe = batch(Arc::new(Int64Array::from(vec![0; 2])), vec![Some("é"), None], &context);
         let mut source = None;
-        assert!(!index.insert_distinct_argument(&probe, 1, 0, 2, false, &mut source, &context).unwrap());
-        assert!(index.insert_distinct_argument(&probe, 1, 0, 3, false, &mut source, &context).unwrap());
-        assert!(index.insert_distinct_argument(&probe, 1, 1, 2, false, &mut source, &context).unwrap());
+        assert!(!index.insert_distinct_argument(&probe, 1, 0, 2, false, None, &mut source, &context).unwrap());
+        assert!(index.insert_distinct_argument(&probe, 1, 0, 3, false, None, &mut source, &context).unwrap());
+        assert!(index.insert_distinct_argument(&probe, 1, 1, 2, false, None, &mut source, &context).unwrap());
     }
 
     /// Each hashing mode reads a cell either directly from Arrow or as a decoded value; a cell must hash alike either way,
