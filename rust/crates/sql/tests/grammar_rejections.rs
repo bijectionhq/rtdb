@@ -267,3 +267,38 @@ fn non_grammar_string_numeric_and_typed_literals_are_rejected() {
         prepare(sql, &Fixture, &PrepareOptions::default()).unwrap_or_else(|error| panic!("{sql}: {error}"));
     }
 }
+
+#[test]
+fn non_grammar_cast_data_types_are_rejected() {
+    for sql in [
+        "SELECT CAST(1 AS INT(10))",
+        "SELECT CAST(1 AS BIGINT(20))",
+        "SELECT CAST(1 AS SMALLINT(5))",
+        "SELECT CAST(1 AS DOUBLE(10))",
+        "SELECT CAST(1 AS FLOAT(10, 2))",
+        "SELECT CAST('a' AS CHARACTER)",
+        "SELECT CAST('a' AS CHARACTER(10))",
+        "SELECT CAST('a' AS CHARACTER VARYING(10))",
+        "SELECT CAST('a' AS CHAR VARYING(10))",
+        "SELECT CAST(X('00') AS BINARY)",
+        "SELECT CAST(X('00') AS VARBINARY(16))",
+        "SELECT CAST('2020-01-01T00:00:00Z' AS TIMESTAMPTZ(3))",
+        "SELECT CAST('a' AS KEYWORD(1))",
+        "SELECT CAST(1 AS OID(1))",
+        "SELECT CAST([1] AS ARRAY<INT>)",
+        "SELECT CAST([1] AS ARRAY(INT))",
+    ] {
+        let error = rejection(sql);
+        assert_eq!((error.category, error.code.as_str()), (AnomalyCategory::Incorrect, "xtdb/sql-error"), "{sql}");
+        assert!(error.message.as_deref().unwrap().starts_with("Errors parsing SQL statement:\n  - "), "{sql}");
+    }
+    for sql in [
+        "SELECT CAST(1 AS FLOAT(24))",
+        "SELECT CAST([1] AS INT[])",
+        "SELECT CAST([1] AS INT ARRAY)",
+        "SELECT CAST('2020-01-01T00:00:00Z' AS TIMESTAMPTZ)",
+        "SELECT CAST(DURATION 'PT1S' AS DURATION(6))",
+    ] {
+        prepare(sql, &Fixture, &PrepareOptions::default()).unwrap_or_else(|error| panic!("{sql}: {error}"));
+    }
+}

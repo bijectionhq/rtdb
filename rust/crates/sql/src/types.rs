@@ -16,7 +16,10 @@ pub(crate) fn cast_target(data_type: &ast::DataType, timezone: Option<&str>) -> 
             rtdb_plan::CastTarget::decimal(precision, scale)
         }
         D::Array(element) => {
-            let element = match element { ast::ArrayElemTypeDef::AngleBracket(element) | ast::ArrayElemTypeDef::SquareBracket(element, _) | ast::ArrayElemTypeDef::Parenthesis(element) | ast::ArrayElemTypeDef::Qualified(element, _) => element, _ => return Err(error("Array cast requires an element type")) };
+            let element = match element {
+                ast::ArrayElemTypeDef::SquareBracket(element, _) | ast::ArrayElemTypeDef::Qualified(element, _) => element,
+                _ => return Err(grammar_rejected(format!("Cast type {data_type}"))),
+            };
             Ok(rtdb_plan::CastTarget::List(Box::new(cast_target(element, timezone)?)))
         }
         D::Time(precision, zone) | D::Timestamp(precision, zone) => {
@@ -43,9 +46,11 @@ pub(crate) fn cast_target(data_type: &ast::DataType, timezone: Option<&str>) -> 
         }
         D::Custom(name, arguments) if identifiers(name)?.len() == 1 && matches!(identifiers(name)?[0].normalized().as_str(), "duration" | "timestamptz") => {
             use rtdb_plan::{CastTimezone, TemporalCast, TemporalKind};
+            let normalized = identifiers(name)?[0].normalized();
+            if normalized == "timestamptz" && !arguments.is_empty() { return Err(grammar_rejected(format!("Cast type {data_type}"))); }
             if arguments.len() > 1 { return Err(error("Temporal cast accepts one precision")); }
             let precision = arguments.first().map(|value| value.parse::<u64>().map_err(error)).transpose()?;
-            let kind = if identifiers(name)?[0].normalized() == "duration" { TemporalKind::Duration } else { TemporalKind::TimestampZone(timezone.map_or(CastTimezone::Session, |zone| CastTimezone::Explicit(zone.into()))) };
+            let kind = if normalized == "duration" { TemporalKind::Duration } else { TemporalKind::TimestampZone(timezone.map_or(CastTimezone::Session, |zone| CastTimezone::Explicit(zone.into()))) };
             Ok(rtdb_plan::CastTarget::Temporal(TemporalCast { kind, unit: precision_unit(precision), precision: precision.map(|precision| i64::try_from(precision).map_err(error)).transpose()? }))
         }
         other => Ok(rtdb_plan::CastTarget::fixed(self::data_type(other)?)),
@@ -58,14 +63,14 @@ pub(crate) fn data_type(data_type: &ast::DataType) -> Result<LogicalType> {
     use ast::DataType as D;
     let scalar = match data_type {
         D::Boolean | D::Bool => ScalarType::Bool,
-        D::SmallInt(_) | D::Int2(_) => ScalarType::I16,
-        D::Int(_) | D::Integer(_) | D::Int4(_) => ScalarType::I32,
-        D::BigInt(_) | D::Int8(_) => ScalarType::I64,
-        D::Float(_) | D::Real | D::Float4 => ScalarType::F32,
-        D::Double(_) | D::DoublePrecision | D::Float8 => ScalarType::F64,
+        D::SmallInt(None) | D::Int2(None) => ScalarType::I16,
+        D::Int(None) | D::Integer(None) | D::Int4(None) => ScalarType::I32,
+        D::BigInt(None) | D::Int8(None) => ScalarType::I64,
+        D::Float(ast::ExactNumberInfo::None | ast::ExactNumberInfo::Precision(_)) | D::Real | D::Float4 => ScalarType::F32,
+        D::Double(ast::ExactNumberInfo::None) | D::DoublePrecision | D::Float8 => ScalarType::F64,
         D::Numeric(info) | D::Decimal(info) | D::Dec(info) => decimal_type(info)?,
-        D::Character(_) | D::Char(_) | D::CharacterVarying(_) | D::CharVarying(_) | D::Varchar(_) | D::Text => ScalarType::Utf8,
-        D::Binary(_) | D::Varbinary(_) | D::Bytea => ScalarType::Binary,
+        D::Char(None) | D::Varchar(None) | D::Text => ScalarType::Utf8,
+        D::Varbinary(None) | D::Bytea => ScalarType::Binary,
         D::Uuid => ScalarType::Uuid,
         D::Regclass => ScalarType::RegClass,
         D::Date => ScalarType::DateDay,
@@ -75,13 +80,20 @@ pub(crate) fn data_type(data_type: &ast::DataType) -> Result<LogicalType> {
         }
         D::Timestamp(precision, timezone) => ScalarType::Timestamp { unit: time_unit(*precision)?, timezone: matches!(timezone, ast::TimezoneInfo::WithTimeZone | ast::TimezoneInfo::Tz).then(|| "UTC".to_owned()) },
         D::Array(element) => {
-            let element = match element { ast::ArrayElemTypeDef::AngleBracket(element) | ast::ArrayElemTypeDef::SquareBracket(element, _) | ast::ArrayElemTypeDef::Parenthesis(element) | ast::ArrayElemTypeDef::Qualified(element, _) => element, _ => return Err(error("Array cast requires an element type")) };
+            let element = match element {
+                ast::ArrayElemTypeDef::SquareBracket(element, _) | ast::ArrayElemTypeDef::Qualified(element, _) => element,
+                _ => return Err(grammar_rejected(format!("Cast type {data_type}"))),
+            };
             return Ok(LogicalType::list(self::data_type(element)?));
         }
         D::Custom(name, arguments) => {
             let names = identifiers(name)?;
             if names.len() != 1 { return Err(grammar_rejected("A qualified cast type")); }
-            match names[0].normalized().as_str() {
+            let normalized = names[0].normalized();
+            if normalized != "duration" && normalized != "row" && !arguments.is_empty() {
+                return Err(grammar_rejected(format!("Cast type {data_type}")));
+            }
+            match normalized.as_str() {
                 "keyword" => ScalarType::Keyword, "uri" => ScalarType::Uri, "oid" => ScalarType::Oid,
                 "regclass" => ScalarType::RegClass, "regproc" => ScalarType::RegProc,
                 "duration" => ScalarType::Duration(time_unit(arguments.first().map(|value| value.parse::<u64>().map_err(error)).transpose()?)?),
