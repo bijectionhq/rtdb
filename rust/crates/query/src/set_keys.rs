@@ -329,7 +329,7 @@ impl<'a> Key<'a> {
         Ok(value)
     }
 
-    fn cached(&self, index: usize) -> Option<&Value> {
+    pub(crate) fn cached(&self, index: usize) -> Option<&Value> {
         let position = self.values.binary_search_by_key(&index, |(column, _)| *column).ok()?;
         Some(&self.values[position].1)
     }

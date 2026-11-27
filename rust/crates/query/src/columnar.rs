@@ -4143,44 +4143,43 @@ async fn admitted_predicate_selection_counted(
     PredicateSelection::settled(BooleanArray::new(mask.finish(), None), count, reservation)
 }
 
-/// Each row's three-valued truth under the predicate, through the same evaluation tiers as `predicate_selection`,
-/// keeping unknown (null) apart from false. The charge for the truths lasts as long as the returned reservation.
-pub(crate) async fn predicate_truth(
-    batch: &ColumnBatch, predicate: &rtdb_plan::Expr, schema: &rtdb_plan::Schema, execution: &crate::context::Execution,
-) -> Result<(Vec<Option<bool>>, Arc<MemoryReservation>)> {
-    execution.context.check_cancelled()?;
-    let params = execution.parameters.evaluator();
-    let memory = &execution.context.memory;
-    let reservation = memory.reserve(batch.len.checked_mul(size_of::<Option<bool>>()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?)?;
-    let from_arrow = |values: &BooleanArray| (0..values.len()).map(|row| values.is_valid(row).then(|| values.value(row))).collect();
-    if search::shaped(predicate)
-        && let Some((Column::Arrow { array, .. }, _charge)) = search::funded_column(predicate, schema, batch, params, &execution.context)?
-        && let Some(values) = array.as_any().downcast_ref::<BooleanArray>()
-    {
-        return Ok((from_arrow(values), reservation));
+pub(crate) struct ArrowPredicate<'a> {
+    expression: &'a rtdb_plan::Expr,
+    schema: &'a rtdb_plan::Schema,
+    kernel: Option<functions::Predicate>,
+    search: bool,
+    _reservation: Arc<MemoryReservation>,
+}
+
+impl<'a> ArrowPredicate<'a> {
+    pub(crate) fn bind(expression: &'a rtdb_plan::Expr, schema: &'a rtdb_plan::Schema, memory: &Arc<MemoryBudget>) -> Option<Self> {
+        let bytes = crate::runtime_schema::expression_bound(expression).ok()?.checked_mul(4)?.checked_add(256)?;
+        let mut reservation = memory.try_reserve(bytes)?;
+        let search = search::shaped(expression);
+        let kernel = functions::Predicate::bind(expression, schema);
+        let retained = kernel.as_ref().map(functions::Predicate::retained_bytes).transpose().ok()?.unwrap_or(0)
+            .checked_add(256)?;
+        Arc::get_mut(&mut reservation)?.shrink_to(retained).ok()?;
+        (search || kernel.is_some()).then_some(Self { expression, schema, kernel, search, _reservation: reservation })
     }
-    let prepare_typed = || -> Result<()> {
-        if batch.columns.iter().any(|column| matches!(column, Column::Selected(_))) {
-            let metadata = execution.scope()?;
-            execution.prepare_expression(predicate, schema, &metadata)?;
+
+    /// Three-valued truth for every pair, or `None` if the layout needs scalar evaluation.
+    /// The caller has already prepared the expression against the schema.
+    pub(crate) fn truth(&self, batch: &ColumnBatch, execution: &crate::context::Execution)
+        -> Result<Option<(Vec<Option<bool>>, Arc<MemoryReservation>)>> {
+        execution.context.check_cancelled()?;
+        let params = execution.parameters.evaluator();
+        let reservation = execution.context.memory.reserve(batch.len.checked_mul(size_of::<Option<bool>>())
+            .and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?)?;
+        if self.search
+            && let Some((Column::Arrow { array, .. }, _charge)) = search::funded_column(self.expression, self.schema, batch, params, &execution.context)?
+            && let Some(values) = array.as_any().downcast_ref::<BooleanArray>()
+        {
+            return Ok(Some((values.iter().collect(), reservation)));
         }
-        Ok(())
-    };
-    if let Some(compiled) = functions::Predicate::bind(predicate, schema) && let Some(truth) = compiled.truth(batch, params)? {
-        prepare_typed()?;
-        return Ok((truth.into_iter().collect(), reservation));
+        let Some(kernel) = &self.kernel else { return Ok(None); };
+        Ok(kernel.truth(batch, params)?.map(|truths| (truths, reservation)))
     }
-    let metadata = execution.scope()?;
-    let invocation = execution.prepare_expression(predicate, schema, &metadata)?;
-    let scope = execution.scope()?;
-    let mut truths = Vec::with_capacity(batch.len);
-    for row in 0..batch.len {
-        let input = BatchRow { batch, row, admit_dates: false };
-        let value = execution.evaluate_invocation_row(&scope, &invocation, rtdb_expr::ExpressionRow::Borrowed(&input)).await?;
-        truths.push(if matches!(value, Value::Null | Value::Undefined) { None } else { Some(rtdb_expr::is_true(&value)?) });
-        scope.reset()?;
-    }
-    Ok((truths, reservation))
 }
 
 pub(crate) struct BatchRow<'a> { pub batch: &'a ColumnBatch, pub row: usize, pub admit_dates: bool }
@@ -7000,8 +6999,8 @@ mod integer_comparison_tests {
     use rtdb_plan::{BinaryOp, ColumnId, Expr, Schema};
     use rtdb_types::{LogicalType, ScalarType, Timestamp, Value};
 
-    #[tokio::test]
-    async fn an_integer_column_compared_with_a_constant_keeps_nulls_unknown_either_way_round() {
+    #[test]
+    fn an_integer_column_compared_with_a_constant_keeps_nulls_unknown_either_way_round() {
         let memory = MemoryBudget::new(1 << 18);
         let ty = LogicalType::Scalar(ScalarType::I64).maybe();
         let field = Arc::new(rtdb_columnar::to_field("n", &ty).unwrap());
@@ -7027,7 +7026,10 @@ mod integer_comparison_tests {
             (Expr::binary(BinaryOp::Eq, column.clone(), five.clone()), [Some(false), None, Some(true), Some(false)]),
             (Expr::binary(BinaryOp::NotEq, five, column), [Some(true), None, Some(false), Some(true)]),
         ] {
-            let (truths, _charge) = predicate_truth(&batch, &predicate, &schema, &execution).await.unwrap();
+            let metadata = execution.scope().unwrap();
+            execution.prepare_expression(&predicate, &schema, &metadata).unwrap();
+            let bound = ArrowPredicate::bind(&predicate, &schema, &memory).unwrap();
+            let (truths, _charge) = bound.truth(&batch, &execution).unwrap().unwrap();
             assert_eq!(truths, expected, "{predicate:?}");
         }
     }

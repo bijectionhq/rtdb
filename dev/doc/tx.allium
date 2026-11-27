@@ -200,10 +200,11 @@
 -- Supported computed join keys retain the payload positions through match selection.
 -- A hash join binds plain numeric, text, Boolean, and same-type date, timestamp, time, duration, and year-month interval comparisons once and evaluates them at the candidate positions.
 -- Text residuals compare UTF-8 bytes in unsigned order.
--- The column-wise inner join residual path gathers from a charged selection of candidate pairs and compacts that selection in pair order using the residual truth values.
+-- An inner join with a compatible Arrow residual gathers the predicate columns once per charged selection of candidate pairs and consumes its truth values in pair order.
 -- A false conjunct removes its pair, and a pair with an unknown key or conjunct remains eligible for later conjuncts.
 -- The inner join emits only pairs with true keys and true residuals.
--- Residuals that require fallible evaluation retain the generic evaluation order.
+-- Residuals that require scalar evaluation read the reached operands from the original input pages in pair order.
+-- A failed Arrow residual pass is retried in pair order to report the first reached error.
 -- Floating-point residuals preserve unknown for null operands and unordered comparison for NaN.
 -- Compatible semi and anti equijoins select their output from the probe vectors and emit each selected probe position once.
 -- A complete Arrow probe page or an admissible consecutive span can supply semi and anti output directly.

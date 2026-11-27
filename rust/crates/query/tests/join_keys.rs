@@ -483,6 +483,52 @@ async fn residual_conjuncts_keep_sparse_fanout_in_pair_order_and_exclude_unknown
 }
 
 #[tokio::test]
+async fn inner_join_residual_reports_the_first_candidate_error_across_conjuncts() {
+    let left = typed_rows(0, &[ScalarType::I64, ScalarType::I64], vec![
+        vec![Value::I64(1), Value::I64(0)],
+        vec![Value::I64(1), Value::I64(1)],
+    ]);
+    let right = typed_rows(2, &[ScalarType::I64, ScalarType::I64], vec![vec![Value::I64(1), Value::I64(0)]]);
+    let eq = Expr::binary(BinaryOp::Eq, left.schema().fields()[0].expression(), right.schema().fields()[0].expression());
+    let payload = Expr::binary(BinaryOp::Add, left.schema().fields()[1].expression(), right.schema().fields()[1].expression());
+    let positive = |expr| Expr::binary(BinaryOp::Gt, expr, Expr::Literal(Value::I64(0)));
+    let first = positive(Expr::binary(BinaryOp::Add, Expr::Literal(Value::I64(i64::MAX)), payload.clone()));
+    let second = positive(Expr::binary(BinaryOp::Divide, Expr::Literal(Value::I64(1)), payload));
+    let condition = Expr::binary(BinaryOp::And, eq, Expr::binary(BinaryOp::And, first, second));
+    let context = context(&CancellationToken::new());
+    let result = collect(&join(left, right, JoinKind::Inner, condition), &context).await;
+    assert_eq!(result.unwrap_err().code, "xtdb.expression/division-by-zero");
+    assert_eq!(context.memory.used_bytes(), 0);
+}
+
+#[tokio::test]
+async fn duration_keys_with_a_fallible_join_residual_preserve_outer_and_single_cardinality() {
+    let duration = |value| Value::Duration { value, unit: TimeUnit::Second };
+    let left = typed_rows(0, &[ScalarType::Duration(TimeUnit::Second)], vec![vec![duration(1)], vec![duration(2)], vec![duration(3)]]);
+    for (kind, inputs) in [(JoinKind::Left, [-1, 1, 2]), (JoinKind::Single, [1, 2, 0])] {
+        let right = typed_rows(1, &[ScalarType::Duration(TimeUnit::Second), ScalarType::I64], inputs.into_iter()
+            .map(|value| vec![duration(1), Value::I64(value)]).collect());
+        let eq = Expr::binary(BinaryOp::Eq, left.schema().fields()[0].expression(), right.schema().fields()[0].expression());
+        let divided = Expr::binary(BinaryOp::Divide, Expr::Literal(Value::I64(4)), right.schema().fields()[1].expression());
+        let residual = Expr::binary(BinaryOp::Gt, divided, Expr::Literal(Value::I64(0)));
+        let condition = Expr::binary(BinaryOp::And, eq, residual);
+        let context = context(&CancellationToken::new());
+        let result = collect(&join(left.clone(), right, kind, condition), &context).await;
+        if kind == JoinKind::Single {
+            assert_eq!(result.unwrap_err().code, "xtdb.single-join/cardinality-violation");
+        } else {
+            assert_eq!(result.unwrap(), [
+                vec![duration(1), duration(1), Value::I64(1)],
+                vec![duration(1), duration(1), Value::I64(2)],
+                vec![duration(2), Value::Null, Value::Null],
+                vec![duration(3), Value::Null, Value::Null],
+            ]);
+        }
+        assert_eq!(context.memory.used_bytes(), 0);
+    }
+}
+
+#[tokio::test]
 async fn an_inner_join_residual_is_evaluated_whole_for_every_key_matched_pair() {
     for (left_rows, matched) in [(vec![(1, Some(1.0)), (3, None)], true), (vec![(1, Some(1.0))], true)] {
         let left = measured(0, &left_rows);

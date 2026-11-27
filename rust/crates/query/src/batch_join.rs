@@ -19,7 +19,7 @@ use arrow_schema::{DataType, TimeUnit as ArrowTimeUnit};
 use rtdb_types::{IntervalUnit, LogicalType, Result, ScalarType, TimeUnit, Value};
 
 use crate::columnar::{
-    BatchCursor, BoxBatchCursor, Column, ColumnBatch, gather_column_rows, gather_column_rows_iter,
+    ArrowPredicate, BatchCursor, BoxBatchCursor, Column, ColumnBatch, gather_column_rows, gather_column_rows_iter,
     gather_join_probe, gather_nullable_column, periods, poll_nested_batch,
 };
 use crate::context::Execution;
@@ -353,13 +353,13 @@ fn theta_binding_accepts_plain_comparable_types_and_declines_temporal_coercions(
 
 pub(crate) struct Residual {
     schema: rtdb_plan::Schema,
-    expressions: Vec<Expr>,
+    expression: Expr,
     sides: Vec<(bool, usize)>,
     _reservation: Arc<MemoryReservation>,
 }
 
 struct PreparedResidual<'a> {
-    comparisons: Vec<rtdb_expr::ExpressionInvocation<'a>>,
+    comparison: rtdb_expr::ExpressionInvocation<'a>,
     sides: &'a [(bool, usize)],
     period_point: Option<(usize, usize)>,
     _metadata: rtdb_expr::EvaluationScope,
@@ -410,7 +410,7 @@ impl PeriodProbe {
 struct ResidualCandidate {
     build: (usize, usize),
     probe: usize,
-    known: bool,
+    known_key: bool,
 }
 
 struct JoinRow<'a> {
@@ -457,12 +457,13 @@ impl rtdb_expr::RowInput for JoinRow<'_> {
 
 impl Residual {
     pub fn new(layout: &JoinLayout, execution: &Execution) -> Result<Self> {
-        let expressions = &layout.comparisons[layout.left.key_count()..];
-        let bytes = expressions.iter().try_fold(crate::runtime_schema::schema_bound(&layout.theta_schema)?, |bytes, expr| {
-            bytes.checked_add(crate::runtime_schema::expression_bound(expr)?).ok_or_else(size_error)
-        })?;
+        let [expression] = &layout.comparisons[layout.left.key_count()..] else {
+            return Err(invalid("join-key", "A residual join requires one predicate"));
+        };
+        let bytes = crate::runtime_schema::schema_bound(&layout.theta_schema)?
+            .checked_add(crate::runtime_schema::expression_bound(expression)?).ok_or_else(size_error)?;
         let reservation = execution.context.memory.reserve(bytes.checked_mul(4).and_then(|bytes| bytes.checked_add(1024)).ok_or_else(size_error)?)?;
-        let columns = expressions.iter().flat_map(Expr::referenced_columns).collect::<std::collections::BTreeSet<_>>();
+        let columns = expression.referenced_columns();
         let mut sides = Vec::with_capacity(columns.len());
         let mut fields = Vec::with_capacity(columns.len());
         for id in columns {
@@ -476,18 +477,17 @@ impl Residual {
                 return Err(invalid("join-key", "A join predicate column is absent"));
             }
         }
-        Ok(Self { schema: rtdb_plan::Schema::new(fields)?, expressions: expressions.to_vec(), sides, _reservation: reservation })
+        Ok(Self { schema: rtdb_plan::Schema::new(fields)?, expression: expression.clone(), sides, _reservation: reservation })
     }
 
     fn prepare(&self, execution: &Execution) -> Result<PreparedResidual<'_>> {
         let metadata = execution.scope()?;
-        metadata.reserve(self.expressions.len().checked_mul(std::mem::size_of::<rtdb_expr::ExpressionInvocation<'_>>()).ok_or_else(size_error)?)?;
-        let comparisons = self.expressions.iter().map(|expr| execution.prepare_expression(expr, &self.schema, &metadata)).collect::<Result<_>>()?;
-        Ok(PreparedResidual { comparisons, sides: &self.sides, period_point: self.period_point(), _metadata: metadata })
+        let comparison = execution.prepare_expression(&self.expression, &self.schema, &metadata)?;
+        Ok(PreparedResidual { comparison, sides: &self.sides, period_point: self.period_point(), _metadata: metadata })
     }
 
     fn period_point(&self) -> Option<(usize, usize)> {
-        let [Expr::Call { name, args, .. }] = self.expressions.as_slice() else { return None; };
+        let Expr::Call { name, args, .. } = &self.expression else { return None; };
         if name != "contains?" { return None; }
         let [Expr::Column { id: period, .. }, Expr::Column { id: point, .. }] = args.as_slice() else { return None; };
         let period = self.schema.position(*period)?;
@@ -914,10 +914,11 @@ impl Spec {
             self.probe_arrow_keys(table, &probe, hashed.as_ref(), &mut matches)?;
         } else if let Some(predicates) = self.residual.as_ref().filter(|predicates| residual.is_some()
             && (self.projected == [false, false] || predicates.schema.fields().iter().all(|field| date_free(&field.data_type))))
-            && self.probe_residual_columns(table, &probe, hashed.as_ref(), predicates, &mut matches).await.is_ok()
+            && let Some(kernel) = ArrowPredicate::bind(&predicates.expression, &predicates.schema, &context.memory)
+            && matches!(self.probe_residual_columns(table, &probe, hashed.as_ref(), predicates, &kernel, &mut matches), Ok(true))
         {
         } else {
-            // The row path also reports the error a failed column-wise pass met, as it would have met it first.
+            // A speculative pass can reach a later pair's error before an earlier pair's error.
             matches = InnerMatches::new(self.count_only);
             let equality = self.execution.scope()?;
             for row in 0..probe.len {
@@ -944,9 +945,10 @@ impl Spec {
     /// An inner join's residual over the key-matched pairs of a probe batch, column-wise, a bounded run of probe rows at a time.
     /// As in the row path, a pair meets each conjunct until one is false; an unknown key or conjunct lets it go on,
     /// for the later conjuncts' errors, but it never matches.
-    async fn probe_residual_columns(
-        &self, table: &Table, probe: &ColumnBatch, hashed: Option<&HashedProbe<'_>>, residual: &Residual, matches: &mut InnerMatches,
-    ) -> Result<()> {
+    fn probe_residual_columns(
+        &self, table: &Table, probe: &ColumnBatch, hashed: Option<&HashedProbe<'_>>, residual: &Residual,
+        kernel: &ArrowPredicate<'_>, matches: &mut InnerMatches,
+    ) -> Result<bool> {
         const PAIRS_PER_PASS: usize = 1 << 16;
         let context = &self.execution.context;
         let memory = &context.memory;
@@ -955,60 +957,67 @@ impl Spec {
         let mut first_row = 0;
         for row in 0..probe.len {
             context.check_cancelled_at(row)?;
-            let hash = match hashed {
-                Some(hashed) => hashed.hashes[row],
-                None => self.key_hash(probe, row, 1)?,
+            let (hash, probe_key) = match hashed {
+                Some(hashed) => (hashed.hashes[row], None),
+                None => {
+                    let (hash, key) = self.hashed_probe_key(probe, row, None)?;
+                    (hash, Some(key))
+                }
             };
             for (candidate, ordinal) in table.index.candidates(hash).enumerate() {
                 context.check_cancelled_at(candidate)?;
                 let (batch, offset) = table.position(ordinal);
-                let Some(keys) = self.residual_keys(&table.batches[batch], offset, probe, row, &equality)? else { continue; };
-                candidates.push(ResidualCandidate { build: (batch, offset), probe: row, known: keys }, memory)?;
+                let Some(keys) = self.residual_keys(&table.batches[batch], offset, probe, row, probe_key.as_ref(), &equality)? else { continue; };
+                candidates.push(ResidualCandidate { build: (batch, offset), probe: row, known_key: keys }, memory)?;
             }
+            drop(probe_key);
             if candidates.rows.len() >= PAIRS_PER_PASS || row + 1 == probe.len {
-                self.residual_pass(table, probe, residual, &mut candidates.rows, first_row..row + 1, matches).await?;
+                if !self.residual_pass(table, probe, residual, kernel, &candidates.rows, first_row..row + 1, matches)? {
+                    return Ok(false);
+                }
                 candidates = JoinPositions::new();
                 first_row = row + 1;
             }
         }
-        Ok(())
+        Ok(true)
     }
 
-    async fn residual_pass(&self, table: &Table, probe: &ColumnBatch, residual: &Residual,
-        candidates: &mut Vec<ResidualCandidate>, rows: Range<usize>, matches: &mut InnerMatches) -> Result<()> {
+    #[allow(clippy::too_many_arguments)]
+    fn residual_pass(&self, table: &Table, probe: &ColumnBatch, residual: &Residual, kernel: &ArrowPredicate<'_>,
+        candidates: &[ResidualCandidate], rows: Range<usize>, matches: &mut InnerMatches) -> Result<bool> {
         let memory = &self.execution.context.memory;
-        for predicate in &residual.expressions {
-            if candidates.is_empty() { break; }
+        let (truths, _truths) = if candidates.is_empty() {
+            (Vec::new(), None)
+        } else {
+            let bytes = residual.sides.len().checked_mul(size_of::<Column>()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
+            let mut reservation = memory.reserve(bytes)?;
+            let lease = Arc::get_mut(&mut reservation).expect("The candidate page owns its reservation");
             let mut columns = Vec::with_capacity(residual.sides.len());
-            let mut charges = Vec::with_capacity(residual.sides.len());
             for &(on_build, position) in &residual.sides {
-                let (column, charge) = if on_build {
+                let (column, mut charge) = if on_build {
                     let rows = candidates.iter().map(|candidate| candidate.build);
                     gather_column_rows_iter(|batch| &table.batches[batch], rows, position, memory)?
                 } else {
                     let rows = candidates.iter().map(|candidate| (0, candidate.probe));
                     gather_column_rows_iter(|_| probe, rows, position, memory)?
                 };
+                lease.absorb(Arc::get_mut(&mut charge).expect("The gather owns its reservation"))?;
                 columns.push(column);
-                charges.push(charge);
             }
-            let pairs_batch = ColumnBatch::settled(columns, candidates.len(), memory.reserve(256)?)?;
-            let (truths, _truths) = crate::columnar::predicate_truth(&pairs_batch, predicate, &residual.schema, &self.execution).await?;
-            let mut truths = truths.into_iter();
-            candidates.retain_mut(|candidate| match truths.next().expect("Each candidate has a truth value") {
-                Some(false) => false,
-                Some(true) => true,
-                None => { candidate.known = false; true }
-            });
-        }
-        let mut kept = candidates.iter().filter(|candidate| candidate.known).peekable();
+            let pairs_batch = ColumnBatch::settled(columns, candidates.len(), reservation)?;
+            let Some((truths, charge)) = kernel.truth(&pairs_batch, &self.execution)? else { return Ok(false); };
+            (truths, Some(charge))
+        };
+        let mut kept = candidates.iter().zip(truths).filter_map(|(candidate, truth)| {
+            (candidate.known_key && truth == Some(true)).then_some(candidate)
+        }).peekable();
         for row in rows {
             while let Some(candidate) = kept.next_if(|candidate| candidate.probe == row) {
                 matches.push(candidate.build, memory)?;
             }
             matches.end_row(row, memory)?;
         }
-        Ok(())
+        Ok(true)
     }
 
     async fn probe_membership(&self, table: &Table, probe: ColumnBatch, residual: Option<&PreparedResidual<'_>>) -> Result<Option<ColumnBatch>> {
@@ -1091,9 +1100,9 @@ impl Spec {
             let (batch, offset) = table.position(ordinal);
             let build = &table.batches[batch];
             let accepted = if let Some(residual) = residual {
-                self.matches_residual(residual, build, offset, probe, row, equality).await?
+                self.matches_residual(residual, build, offset, probe, row, key.as_ref(), equality).await?
             } else if self.theta.use_residual_keys {
-                let Some(keys) = self.residual_keys(build, offset, probe, row, equality)? else { continue; };
+                let Some(keys) = self.residual_keys(build, offset, probe, row, key.as_ref(), equality)? else { continue; };
                 self.matches_theta(build, offset, probe, row)? && keys
             } else {
                 if key.is_none() { key = Some(self.key(probe, row, 1)?); }
@@ -1109,39 +1118,44 @@ impl Spec {
         Ok(matched)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn matches_residual(&self, residual: &PreparedResidual<'_>, build: &ColumnBatch, build_row: usize,
-        probe: &ColumnBatch, probe_row: usize, equality: &rtdb_expr::EvaluationScope) -> Result<bool> {
-        let Some(keys) = self.residual_keys(build, build_row, probe, probe_row, equality)? else { return Ok(false); };
-        let mut unknown = !keys;
+        probe: &ColumnBatch, probe_row: usize, probe_key: Option<&Key<'_>>, scratch: &rtdb_expr::EvaluationScope) -> Result<bool> {
+        let Some(keys) = self.residual_keys(build, build_row, probe, probe_row, probe_key, scratch)? else { return Ok(false); };
         let input = JoinRow { build, build_row, probe, probe_row, sides: residual.sides, admit_dates: self.projected };
         if let Some((period, point)) = residual.period_point
             && let Some(matched) = input.period_contains_point(period, point)
         {
             return Ok(keys && matched);
         }
-        for comparison in &residual.comparisons {
-            let scope = self.execution.scope()?;
-            let value = self.execution.evaluate_invocation_row(&scope, comparison, rtdb_expr::ExpressionRow::Borrowed(&input)).await?;
-            if matches!(value, Value::Null | Value::Undefined) { unknown = true; }
-            else if !rtdb_expr::is_true(&value)? { return Ok(false); }
-        }
-        Ok(!unknown)
+        let value = self.execution.evaluate_invocation_row(scratch, &residual.comparison, rtdb_expr::ExpressionRow::Borrowed(&input)).await?;
+        let matched = !matches!(value, Value::Null | Value::Undefined) && rtdb_expr::is_true(&value)?;
+        drop(value);
+        scratch.reset()?;
+        Ok(keys && matched)
     }
 
     /// The equality keys of a residual join's pair: `None` when a key is unequal, `Some(false)` when one is unknown.
-    fn residual_keys(&self, build: &ColumnBatch, build_row: usize, probe: &ColumnBatch, probe_row: usize, equality: &rtdb_expr::EvaluationScope)
+    fn residual_keys(&self, build: &ColumnBatch, build_row: usize, probe: &ColumnBatch, probe_row: usize,
+        probe_key: Option<&Key<'_>>, equality: &rtdb_expr::EvaluationScope)
         -> Result<Option<bool>> {
         let memory = &self.execution.context.memory;
         let mut unknown = false;
-        for ((&left, &right), &build_first) in self.build_keys.iter().zip(&self.probe_keys).zip(&self.order) {
+        for (index, ((&left, &right), &build_first)) in self.build_keys.iter().zip(&self.probe_keys).zip(&self.order).enumerate() {
             let (left, right) = (&build.columns[left], &probe.columns[right]);
             let equal = if let Some(typed) = direct_key_equal(left, build_row, right, probe_row, self.preserves_probe()) {
                 typed
             } else {
-                let _scratch = memory.reserve(left.bound(build_row)?.checked_add(right.bound(probe_row)?).ok_or_else(size_error)?)?;
+                let left_bytes = left.bound(build_row)?;
+                let cached = probe_key.and_then(|key| key.cached(index));
+                let right_bytes = if cached.is_some() { 0 } else { right.bound(probe_row)? };
+                let _scratch = memory.reserve(left_bytes.checked_add(right_bytes).ok_or_else(size_error)?)?;
                 let left = self.cell(left, build_row, 0)?;
-                let right = self.cell(right, probe_row, 1)?;
-                let (left, right) = if build_first { (&left, &right) } else { (&right, &left) };
+                let right = match cached {
+                    Some(value) => Cow::Borrowed(value),
+                    None => Cow::Owned(self.cell(right, probe_row, 1)?),
+                };
+                let (left, right) = if build_first { (&left, right.as_ref()) } else { (right.as_ref(), &left) };
                 let left_null = matches!(left, Value::Null | Value::Undefined);
                 let right_null = matches!(right, Value::Null | Value::Undefined);
                 if self.preserves_probe() && (left_null || right_null) {
@@ -1166,10 +1180,15 @@ impl Spec {
             ThetaOperand::Probe(position) => (&probe.columns[*position], probe_row, 1),
         };
         if let Some(value) = kind.arrow(column, row) { return Ok(value); }
-        if kind == ThetaKind::Text && let Column::Values(values) = column
-            && let Some(Value::Utf8(value)) = values.get(row)
+        if let Column::Values(values) = column && let Some(value) = values.get(row)
+            && !(self.projected[side] && value.has_calendar_object())
         {
-            return Ok(Some(ThetaValue::Text { value: Cow::Borrowed(value), _charge: None }));
+            return match value {
+                Value::Null | Value::Undefined => Ok(None),
+                Value::Utf8(value) if kind == ThetaKind::Text => Ok(Some(ThetaValue::Text { value: Cow::Borrowed(value), _charge: None })),
+                _ => kind.fixed_value(value).map(Some)
+                    .ok_or_else(|| invalid("join-key", "Unexpected join predicate comparison operand")),
+            };
         }
 
         let charge = self.execution.context.memory.reserve(column.bound(row)?)?;
