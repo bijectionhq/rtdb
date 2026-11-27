@@ -3686,7 +3686,7 @@ mod tests {
         let files = PrefixedStore::new(archived, format!("checkpoint-captures/{deployment}/{operation}/objects"));
         let root_object = completed.objects.iter().find(|object| object.name == fixture.root.as_str()).unwrap();
         let ciphertext = read_object(&files, &fixture.root, root_object).await?;
-        assert_eq!(broker_grant.open(fixture.root.as_str(), ciphertext.clone()).await?, fixture.files[&fixture.root]);
+        assert_eq!(broker_grant.open_object(&fixture.root, ciphertext.clone()).await?, fixture.files[&fixture.root]);
 
         let reader = Uuid::new_v4();
         let witness = keys.hold_local_storage_region(reader)?.unwrap();
@@ -3702,7 +3702,7 @@ mod tests {
         let prepared = prepare_capture_retirement(directory.as_ref(), &current, &archive, operation, Some(&manifest)).await?;
         assert!(prepared.operation_revoked_at_ms.is_none());
         assert!(commit_capture_revocation(directory.as_ref(), &storage, &keys, &id, operation).await.is_err());
-        assert_eq!(broker_grant.open(fixture.root.as_str(), ciphertext.clone()).await?, fixture.files[&fixture.root]);
+        assert_eq!(broker_grant.open_object(&fixture.root, ciphertext.clone()).await?, fixture.files[&fixture.root]);
         drop(witness);
 
         let committed = commit_capture_revocation(directory.as_ref(), &storage, &keys, &id, operation).await?;
@@ -3710,7 +3710,7 @@ mod tests {
         assert!(committed.operation_revoked_at_ms.is_some());
         assert!(committed.observed_empty_at_ms.is_none());
         assert_eq!(files.get(&fixture.root).await?, ciphertext);
-        assert!(broker_grant.open(fixture.root.as_str(), ciphertext).await.is_err());
+        assert!(broker_grant.open_object(&fixture.root, ciphertext).await.is_err());
 
         let reopened = crate::keys::LocalKeyService::new(key_root.path())?;
         assert!(archive_key(&reopened, &completed.point, IoRegion::new()).await.is_err());
