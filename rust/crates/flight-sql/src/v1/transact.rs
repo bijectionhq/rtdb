@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-use rtdb_columnar::MemoryBudget;
+use rtdb_columnar::{ArrowCell, ColumnReader, MemoryBudget};
 use rtdb_tx::transact::{
     self as tx, Cell, CountRange, Declaration, GroupedCount, Guard, IndexDefinition, Op, Row, Transact, Version,
     CustodyPlacement, CustodyReservation, CustodyReview, CustodyTarget, DerivedCustodyReservation,
@@ -467,29 +467,27 @@ fn cell(cell: proto::Cell, memory: &Arc<MemoryBudget>) -> Result<Cell, Status> {
             WireValue::TxTime(_) => Cell::TxTime,
             WireValue::TxBasis(_) => Cell::TxBasis,
             WireValue::TxTimeOffsetMicros(_) => return Err(error::incorrect("A transaction offset can only be used as a valid-time bound")),
-            WireValue::ArrowIpc(bytes) => {
-                let stream =
-                    rtdb_format::ipc::OwnedStream::read(&bytes, memory).map_err(error::anomaly)?;
-                let [batch] = stream.pages() else {
-                    return Err(error::incorrect("A scalar cell needs one Arrow batch"));
-                };
-                let batch = batch.batch();
-                if batch.num_rows() != 1 || batch.num_columns() != 1 {
-                    return Err(error::incorrect(
-                        "A scalar cell needs one Arrow row and column",
-                    ));
-                }
-                Cell::Value(
-                    rtdb_columnar::read_value(
-                        batch.schema_ref().field(0),
-                        batch.column(0).as_ref(),
-                        0,
-                    )
-                    .map_err(error::anomaly)?,
-                )
-            }
+            WireValue::ArrowIpc(bytes) => Cell::Value(read_ipc_cell(&bytes, memory, scalar_value)?),
         },
     )
+}
+
+fn read_ipc_cell<T>(
+    bytes: &[u8], memory: &Arc<MemoryBudget>, read: impl FnOnce(ArrowCell<'_>) -> Result<T, Status>,
+) -> Result<T, Status> {
+    let stream = rtdb_format::ipc::OwnedStream::read(bytes, memory).map_err(error::anomaly)?;
+    let [batch] = stream.pages() else {
+        return Err(error::incorrect("A scalar cell needs one Arrow batch"));
+    };
+    let batch = batch.batch();
+    if batch.num_rows() != 1 || batch.num_columns() != 1 {
+        return Err(error::incorrect("A scalar cell needs one Arrow row and column"));
+    }
+    read(ArrowCell { field: batch.schema_ref().field(0), array: batch.column(0).as_ref(), row: 0 })
+}
+
+fn scalar_value(cell: ArrowCell<'_>) -> Result<Value, Status> {
+    rtdb_columnar::read_value(cell.field, cell.array, cell.row).map_err(error::anomaly)
 }
 
 fn literal(cell_value: proto::Cell, memory: &Arc<MemoryBudget>) -> Result<Value, Status> {
@@ -500,12 +498,17 @@ fn literal(cell_value: proto::Cell, memory: &Arc<MemoryBudget>) -> Result<Value,
 }
 
 fn entity(id: Option<proto::Cell>, memory: &Arc<MemoryBudget>) -> Result<EntityId, Status> {
-    literal(
-        id.ok_or_else(|| error::incorrect("Missing entity ID"))?,
-        memory,
-    )?
-    .entity_id()
-    .map_err(error::anomaly)
+    let id = id.ok_or_else(|| error::incorrect("Missing entity ID"))?;
+    if let Some(proto::cell::Value::ArrowIpc(bytes)) = &id.value {
+        return read_ipc_cell(bytes, memory, |cell| {
+            let reader = ColumnReader::new(cell.field).map_err(error::anomaly)?;
+            if let Ok(Some(id)) = reader.read_entity_id(cell.array, cell.row) {
+                return Ok(id.into_owned());
+            }
+            reader.read(cell.array, cell.row).map_err(error::anomaly)?.entity_id().map_err(error::anomaly)
+        });
+    }
+    literal(id, memory)?.entity_id().map_err(error::anomaly)
 }
 
 fn bound_bytes(bound: proto::Cell, memory: &Arc<MemoryBudget>) -> Result<Vec<u8>, Status> {
@@ -588,6 +591,26 @@ mod tests {
         cells.insert("_id".into(), wire(Arc::new(Int64Array::from(vec![1]))));
         cells.insert("title".into(), wire(Arc::new(Int64Array::from(vec![7]))));
         decode_row(proto::Row { cells: cells.into_iter().collect(), custody_group: Vec::new(), protected_columns: Vec::new() }, &MemoryBudget::new(1 << 20))
+    }
+
+    #[test]
+    fn entity_cells_keep_signed_ids_and_the_scalar_rejection() {
+        use arrow_array::{Date32Array, Int16Array, UInt16Array};
+
+        let memory = MemoryBudget::new(1 << 20);
+        assert_eq!(entity(Some(wire(Arc::new(Int16Array::from(vec![-7])))), &memory).unwrap(),
+            EntityId::Integer(-7));
+        for invalid in [
+            Arc::new(Date32Array::from(vec![0])) as ArrayRef,
+            Arc::new(UInt16Array::from(vec![1])),
+            Arc::new(Int16Array::from(vec![None])),
+        ] {
+            let wire = wire(invalid);
+            let baseline = literal(wire.clone(), &memory).unwrap().entity_id().map_err(error::anomaly).unwrap_err();
+            let refused = entity(Some(wire), &memory).unwrap_err();
+            assert_eq!((refused.code(), refused.message(), refused.details()),
+                (baseline.code(), baseline.message(), baseline.details()));
+        }
     }
 
     #[test]

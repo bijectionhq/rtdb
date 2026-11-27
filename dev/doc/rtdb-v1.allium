@@ -432,6 +432,7 @@ surface StatelessDatabase {
         -- Default mode and Multi use the same scoped projection for Query, Changes, and transaction receipts.
         -- Changes waits for progress observable by the selected scope or the requested deadline.
         -- Put rows can supply literal signed-microsecond valid-time bounds in _valid_from and _valid_to.
+        -- A literal identity cell preserves the signed integer, text, keyword or UUID identity selected by its Arrow value.
 
     @guarantee ScopedExactHold
         -- A route advertising row-visibility.exact-hold accepts the authenticated ScopedHold action.
