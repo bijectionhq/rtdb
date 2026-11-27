@@ -14,7 +14,7 @@ pub type Selection<'a> = Option<&'a [bool]>;
 
 fn reads(selection: Selection<'_>, row: usize) -> bool { selection.is_none_or(|rows| rows[row]) }
 
-pub use crate::temporal_functions::{AgeOperand, FixedDateBin};
+pub use crate::temporal_functions::{AgeOperand, FixedDateBin, timestamp_truncation_zone, truncate_date32, truncate_date64, truncate_timestamp};
 
 pub fn calendar_age(end: AgeOperand<'_>, start: AgeOperand<'_>) -> Result<(i32, i32, i64)> {
     let parts = crate::temporal_functions::calendar_age(end, start)?;

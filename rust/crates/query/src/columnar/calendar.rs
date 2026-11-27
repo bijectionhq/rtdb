@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
 use arrow_array::{Array, Date32Array, Date64Array, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray, builder::PrimitiveBuilder, types::{ArrowPrimitiveType, IntervalMonthDayNano,
-        IntervalMonthDayNanoType, TimestampMicrosecondType, TimestampNanosecondType}};
+    TimestampSecondArray, builder::PrimitiveBuilder, types::{ArrowPrimitiveType, Date32Type, Date64Type, IntervalMonthDayNano,
+        IntervalMonthDayNanoType, TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType}};
 use arrow_schema::DataType;
 use rtdb_columnar::MemoryReservation;
-use rtdb_expr::kernels::{AgeOperand, FixedDateBin, calendar_age};
-use rtdb_plan::{Expr, Schema};
+use rtdb_expr::kernels::{AgeOperand, FixedDateBin, calendar_age, timestamp_truncation_zone, truncate_date32, truncate_date64, truncate_timestamp};
+use rtdb_plan::{Expr, Schema, TemporalField, truncation_zone};
 use rtdb_types::{AnomalyKind, IntervalUnit, LogicalType, Result, ScalarType, TimeUnit, Value, ZoneId, java_date::MILLIS_PER_DAY};
 
 use super::{Column, ColumnBatch, owned_projection_bytes, plain_scalar, size_error};
@@ -99,6 +99,10 @@ impl<'a> CalendarInput<'a> {
             CalendarType::Timestamp(TimeUnit::Nanosecond, _) => read!(TimestampNanosecondArray),
         }
     }
+
+    fn map_ticks<T>(&self, row: usize, f: impl FnOnce(i64) -> Result<T>) -> Result<Option<Option<T>>> {
+        self.ticks(row).map(|ticks| ticks.map(f).transpose()).transpose()
+    }
 }
 
 pub(super) fn project(expr: &Expr, schema: &Schema, batch: &ColumnBatch, context: &QueryContext)
@@ -108,6 +112,38 @@ pub(super) fn project(expr: &Expr, schema: &Schema, batch: &ColumnBatch, context
     if batch.len == 0 { return Ok(None); }
     let Some(result) = plain_scalar(return_type) else { return Ok(None); };
     match (name.as_str(), args.as_slice()) {
+        ("date_trunc" | "date-trunc", [Expr::Literal(Value::Utf8(field)), source] | [Expr::Literal(Value::Utf8(field)), source, _]) => {
+            let Some(source) = CalendarInput::bind(source, schema, batch) else { return Ok(None); };
+            if CalendarType::of(result) != Some(source.ty) { return Ok(None); }
+            let Ok(field) = TemporalField::parse(field) else { return Ok(None); };
+            if !field.supports("date_trunc", result) { return Ok(None); }
+            let override_zone = match args.get(2) {
+                None => None,
+                Some(Expr::Literal(Value::Utf8(zone))) if matches!(source.ty, CalendarType::Timestamp(_, Some(_))) => {
+                    let Ok(zone) = truncation_zone(zone) else { return Ok(None); };
+                    Some(zone)
+                }
+                _ => return Ok(None),
+            };
+            match source.ty {
+                CalendarType::DateDay => build::<Date32Type>(batch, context, result, |row| {
+                    source.map_ticks(row, |ticks| truncate_date32(field, ticks))
+                }),
+                CalendarType::DateMilli => build::<Date64Type>(batch, context, result, |row| {
+                    source.map_ticks(row, |ticks| truncate_date64(field, ticks))
+                }),
+                CalendarType::Timestamp(unit, label) => {
+                    let Ok(zone) = timestamp_truncation_zone(field, label, override_zone) else { return Ok(None); };
+                    let cell = |row| source.map_ticks(row, |ticks| truncate_timestamp(field, ticks, unit, zone.as_ref()));
+                    match unit {
+                        TimeUnit::Second => build::<TimestampSecondType>(batch, context, result, cell),
+                        TimeUnit::Millisecond => build::<TimestampMillisecondType>(batch, context, result, cell),
+                        TimeUnit::Microsecond => build::<TimestampMicrosecondType>(batch, context, result, cell),
+                        TimeUnit::Nanosecond => build::<TimestampNanosecondType>(batch, context, result, cell),
+                    }
+                }
+            }
+        }
         ("date_bin" | "date-bin", [Expr::Literal(stride), source] | [Expr::Literal(stride), source, _]) => {
             let Some(source) = CalendarInput::bind(source, schema, batch) else { return Ok(None); };
             let CalendarType::Timestamp(source_unit, source_zone) = source.ty else { return Ok(None); };
@@ -120,7 +156,7 @@ pub(super) fn project(expr: &Expr, schema: &Schema, batch: &ColumnBatch, context
             let Some(bin) = FixedDateBin::new(stride, source_unit, origin, origin_unit) else { return Ok(None); };
             let ScalarType::Timestamp { unit, timezone } = result else { return Ok(None); };
             if *unit != bin.output_unit() || timezone.as_deref() != origin_zone { return Ok(None); }
-            let cell = |row| source.ticks(row).map(|ticks| ticks.map(|ticks| bin.cell(ticks)).transpose()).transpose();
+            let cell = |row| source.map_ticks(row, |ticks| bin.cell(ticks));
             match unit {
                 TimeUnit::Microsecond => build::<TimestampMicrosecondType>(batch, context, result, cell),
                 TimeUnit::Nanosecond => build::<TimestampNanosecondType>(batch, context, result, cell),
@@ -188,7 +224,7 @@ fn build<T: ArrowPrimitiveType>(batch: &ColumnBatch, context: &QueryContext, sca
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{Array, Date64Array, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampSecondArray};
+    use arrow_array::{Array, Date32Array, Date64Array, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray};
     use rtdb_columnar::MemoryBudget;
     use rtdb_plan::{ColumnId, Expr, Field, Schema, function_type_with_args};
     use rtdb_types::{IntervalUnit, LogicalType, ScalarType, TimeUnit, Timestamp, Value};
@@ -260,6 +296,116 @@ mod tests {
         }
         drop(page);
         assert_eq!(execution.context.memory.used_bytes(), baseline);
+    }
+
+    #[tokio::test]
+    async fn date_trunc_preserves_date_width_and_timestamp_precision() {
+        use TimeUnit::{Millisecond, Nanosecond};
+        let day = Field { data_type: LogicalType::Scalar(ScalarType::DateDay).maybe(), ..field(0, Millisecond, None) };
+        let millis = Field { data_type: LogicalType::Scalar(ScalarType::DateMilli).maybe(), ..field(1, Millisecond, None) };
+        let local = field(2, Millisecond, None);
+        let zoned = field(3, Nanosecond, Some("+05:30"));
+        let schema = Schema::new(vec![day.clone(), millis.clone(), local.clone(), zoned.clone()]).unwrap();
+        let batch = dataset(vec![
+            arrow(Date32Array::from(vec![Some(-1), None, Some(7)]), &day),
+            arrow(Date64Array::from(vec![Some(-1), Some(86_400_001), None]), &millis),
+            arrow(TimestampMillisecondArray::from(vec![Some(-1), None, Some(1001)]), &local),
+            arrow(TimestampNanosecondArray::from(vec![Some(-1), Some(1001), None]).with_timezone("+05:30"), &zoned),
+        ], 3);
+        let calls = [("WEEK", &day), ("DAY", &millis), ("SECOND", &local), ("MICROSECOND", &zoned)].map(|(unit, source)| {
+            call("date_trunc", vec![Expr::Literal(Value::Utf8(unit.into())), source.expression()])
+        });
+        let types = schema.fields().iter().map(|field| plain_scalar(&field.data_type).unwrap().clone()).collect();
+        assert_parity(execution("Asia/Tokyo"), schema, batch, calls.into(), types).await;
+    }
+
+    #[tokio::test]
+    async fn date_trunc_uses_the_label_or_override_across_dst() {
+        let ts = field(0, TimeUnit::Microsecond, Some("America/New_York"));
+        let schema = Schema::new(vec![ts.clone()]).unwrap();
+        let array: Arc<dyn Array> = Arc::new(TimestampMicrosecondArray::from(vec![
+            1_636_263_000_000_123, 1_636_266_600_000_123, 1_633_189_500_000_123,
+        ]).with_timezone("America/New_York"));
+        let field = Arc::new(rtdb_columnar::to_field(&ts.name, &ts.data_type).unwrap());
+        let picks = Arc::new(vec![(0, 1), (0, 0), (1, 0), (0, 2)]);
+        let batch = dataset(vec![Column::Selected(SelectedColumn::new(
+            vec![Some((array, field, Some(ts.data_type.clone()), None)), None], picks,
+        ))], 4);
+        let unit = Expr::Literal(Value::Utf8("HOUR".into()));
+        let calls = vec![
+            call("date_trunc", vec![unit.clone(), ts.expression()]),
+            call("date-trunc", vec![unit, ts.expression(), Expr::Literal(Value::Utf8("Australia/Lord_Howe".into()))]),
+        ];
+        let mut cursor = cursor(execution("Asia/Tokyo"), schema, batch, calls);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert_eq!(cursor.scalar_fallbacks, Some(0));
+        let zoned = |ticks| timestamp(ticks, TimeUnit::Microsecond, Some("America/New_York"));
+        assert_eq!(page.columns[0].value(0).unwrap(), zoned(1_636_264_800_000_000));
+        assert_eq!(page.columns[0].value(1).unwrap(), zoned(1_636_261_200_000_000));
+        assert_eq!(page.columns[0].value(2).unwrap(), Value::Null);
+        assert_eq!(page.columns[1].value(3).unwrap(), zoned(1_633_188_600_000_000));
+    }
+
+    #[tokio::test]
+    async fn date_trunc_reports_the_first_reached_error_after_nulls() {
+        let ts = field(0, TimeUnit::Second, Some("+05:30"));
+        let schema = Schema::new(vec![ts.clone()]).unwrap();
+        let trunc = call("date_trunc", vec![Expr::Literal(Value::Utf8("DAY".into())), ts.expression()]);
+        for (values, code) in [([i64::MAX, i64::MIN], "xtdb.expression/overflow-error"), ([i64::MIN, i64::MAX], "xtdb/invalid-date")] {
+            let array = TimestampSecondArray::from(vec![None, Some(values[0]), Some(values[1])]).with_timezone("+05:30");
+            let batch = dataset(vec![arrow(array, &ts)], 3);
+            let mut cursor = cursor(execution("UTC"), schema.clone(), batch, vec![trunc.clone()]);
+            let error = cursor.next_batch().await.err().expect("A reached DATE_TRUNC row fails");
+            assert_eq!(error.code, code);
+            assert_eq!(cursor.scalar_fallbacks, Some(0));
+        }
+    }
+
+    #[tokio::test]
+    async fn date_trunc_date64_rejects_a_midnight_outside_arrow() {
+        let date = Field { data_type: LogicalType::Scalar(ScalarType::DateMilli).maybe(), ..field(0, TimeUnit::Millisecond, None) };
+        let schema = Schema::new(vec![date.clone()]).unwrap();
+        let batch = dataset(vec![arrow(Date64Array::from(vec![None, Some(i64::MIN)]), &date)], 2);
+        let trunc = call("date_trunc", vec![Expr::Literal(Value::Utf8("DAY".into())), date.expression()]);
+        let scalar = rtdb_expr::evaluate_projection(&trunc, &schema, &[Value::DateMilli(i64::MIN)], &Default::default()).unwrap_err();
+        let mut cursor = cursor(execution("UTC"), schema, batch, vec![trunc]);
+        let error = cursor.next_batch().await.err().expect("Midnight underflows Date64");
+        assert_eq!(error.code, scalar.code);
+        assert_eq!(cursor.scalar_fallbacks, Some(0));
+    }
+
+    #[tokio::test]
+    async fn date_trunc_date32_rejects_a_week_start_outside_arrow() {
+        let date = Field { data_type: LogicalType::Scalar(ScalarType::DateDay).maybe(), ..field(0, TimeUnit::Millisecond, None) };
+        let schema = Schema::new(vec![date.clone()]).unwrap();
+        let batch = dataset(vec![arrow(Date32Array::from(vec![None, Some(i32::MIN)]), &date)], 2);
+        let trunc = call("date_trunc", vec![Expr::Literal(Value::Utf8("WEEK".into())), date.expression()]);
+        let mut cursor = cursor(execution("UTC"), schema, batch, vec![trunc]);
+        let error = cursor.next_batch().await.err().expect("Week start underflows Date32");
+        assert_eq!(error.code, "xtdb.expression/overflow-error");
+        assert_eq!(cursor.scalar_fallbacks, Some(0));
+    }
+
+    #[tokio::test]
+    async fn date_trunc_resolves_a_stored_zone_only_for_reached_whole_second_fields() {
+        let label = "Not/A_Zone";
+        let ts = field(0, TimeUnit::Microsecond, Some(label));
+        let schema = Schema::new(vec![ts.clone()]).unwrap();
+        let batch = |ticks| dataset(vec![arrow(TimestampMicrosecondArray::from(vec![ticks]).with_timezone(label), &ts)], 1);
+        let trunc = |unit: &str| call("date_trunc", vec![Expr::Literal(Value::Utf8(unit.into())), ts.expression()]);
+        let ty = plain_scalar(&ts.data_type).unwrap().clone();
+        for ticks in [Some(1234), None] {
+            assert_parity(execution("UTC"), schema.clone(), batch(ticks), vec![trunc("MILLISECOND")], vec![ty.clone()]).await;
+        }
+
+        let mut nulls = cursor(execution("UTC"), schema.clone(), batch(None), vec![trunc("SECOND")]);
+        assert_eq!(nulls.next_batch().await.unwrap().unwrap().columns[0].value(0).unwrap(), Value::Null);
+        assert_eq!(nulls.scalar_fallbacks, Some(1));
+
+        let mut reached = cursor(execution("UTC"), schema, batch(Some(1234)), vec![trunc("SECOND")]);
+        let error = reached.next_batch().await.err().expect("A reached SECOND truncation resolves the zone");
+        assert_eq!(error.code, "xtdb/invalid-timezone");
+        assert_eq!(reached.scalar_fallbacks, Some(1));
     }
 
     #[tokio::test]

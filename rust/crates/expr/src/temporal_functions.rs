@@ -198,6 +198,41 @@ fn trunc_local(field: F,value: i64,hz: i64) -> Result<i64> {
     let quantum = match field { F::Hour => hz * 3600,F::Minute => hz * 60,F::Second => hz,F::Millisecond => hz / 1000,F::Microsecond => hz / 1_000_000,_ => return Err(inapplicable("date_trunc",&[])) };
     if quantum <= 1 { Ok(value) } else { value.div_euclid(quantum).checked_mul(quantum).ok_or_else(overflow) }
 }
+
+/// Truncates an Arrow Date32 cell, reporting overflow if the resulting day cannot be stored.
+pub fn truncate_date32(field: F, days: i64) -> Result<i32> {
+    let date = truncated_date(field, CivilDate::from_epoch_day(days)?)?;
+    i32::try_from(date.epoch_day()).map_err(|_| overflow())
+}
+
+/// Truncates the calendar day containing an Arrow Date64 cell and returns its midnight in milliseconds.
+pub fn truncate_date64(field: F, millis: i64) -> Result<i64> {
+    use rtdb_types::java_date::MILLIS_PER_DAY;
+
+    let day = CivilDate::from_epoch_day(millis.div_euclid(MILLIS_PER_DAY))?;
+    truncated_date(field, day)?.epoch_day().checked_mul(MILLIS_PER_DAY).ok_or_else(overflow)
+}
+
+/// Selects the calendar zone for an applicable DATE_TRUNC field and timestamp.
+pub fn timestamp_truncation_zone(field: F, label: Option<&str>, override_zone: Option<ZoneId>) -> Result<Option<ZoneId>> {
+    match label {
+        Some(label) if !matches!(field, F::Millisecond | F::Microsecond) => override_zone.map(Ok).unwrap_or_else(|| ZoneId::parse(label)).map(Some),
+        _ => Ok(None),
+    }
+}
+
+/// Truncates a timestamp in its original unit using the zone selected by `timestamp_truncation_zone`.
+pub fn truncate_timestamp(field: F, value: i64, unit: U, zone: Option<&ZoneId>) -> Result<i64> {
+    let hz = unit.units_per_second();
+    let Some(zone) = zone else { return trunc_local(field, value, hz); };
+    let seconds = value.div_euclid(hz);
+    let offset = zone.offset_at(seconds)?;
+    let local = seconds.checked_add(i64::from(offset.seconds())).ok_or_else(overflow)?;
+    let truncated = trunc_local(field, local, 1)?;
+    truncated.checked_sub(i64::from(zone.offset_for_local(truncated, Some(offset))?.seconds()))
+        .and_then(|value| value.checked_mul(hz)).ok_or_else(overflow)
+}
+
 fn truncate(field: F,value: &Value,override_zone: Option<ZoneId>) -> Result<Value> {
     if let Some(day) = value.date_days() {
         let unit = if value.logical_type() == L::Scalar(S::DateDay) { DateUnit::Day } else { DateUnit::Millisecond };
@@ -219,16 +254,8 @@ fn truncate(field: F,value: &Value,override_zone: Option<ZoneId>) -> Result<Valu
         return interval.into_value(&ty);
     }
     let Value::Timestamp { value,unit,timezone } = value else { return Err(inapplicable("date_trunc",&[value])); };
-    let hz = unit.units_per_second();
-    let result = if timezone.is_none() || matches!(field,F::Millisecond | F::Microsecond) { trunc_local(field,*value,hz)? }
-    else {
-        let zone = override_zone.map(Ok).unwrap_or_else(||ZoneId::parse(timezone.as_deref().unwrap_or("UTC")))?;
-        let seconds = value.div_euclid(hz);
-        let offset = zone.offset_at(seconds)?;
-        let local = seconds.checked_add(i64::from(offset.seconds())).ok_or_else(overflow)?;
-        let truncated = trunc_local(field,local,1)?;
-        truncated.checked_sub(i64::from(zone.offset_for_local(truncated,Some(offset))?.seconds())).and_then(|value|value.checked_mul(hz)).ok_or_else(overflow)?
-    };
+    let zone = timestamp_truncation_zone(field, timezone.as_deref(), override_zone)?;
+    let result = truncate_timestamp(field, *value, *unit, zone.as_ref())?;
     Ok(timestamp(result,*unit,timezone.clone()))
 }
 
