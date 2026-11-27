@@ -50,6 +50,8 @@ Arrow binds are copied, including duplicate or unnamed parameter columns, so an 
 Metadata includes `getInfo`, `getObjects`, `getTableTypes` and `getTableSchema` with the standard ADBC schemas.
 SQL transaction-control statements are rejected; use autocommit, commit and rollback, or the explicit native begin/commit methods.
 `beginReadOnly()` and `beginWriteOnly()` have overloads for a read basis or write settings.
+`setTransactionReadOnly`, `setTransactionReadWrite` and `setTransactionTimeZone` shape the transaction before its first query or write.
+Null arguments to the read-only and read-write setters retain the current settings for that access mode.
 `commitSyncResult()` returns the indexed key and abort information, and `commitAsyncResult()` returns the submitted transaction ID.
 Both return null when there is no write transaction to submit.
 `executeTx` and `submitTx` on a connection accept a list of typed transaction operations and optional `TxOptions`.

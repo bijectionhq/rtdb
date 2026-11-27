@@ -167,6 +167,12 @@ int32_t rtdb_v1_session_set_read_settings(RtdbHandle session, RtdbHandle operati
 int32_t rtdb_v1_session_begin_read_only(RtdbHandle session, RtdbHandle operation, const uint8_t *timezone, size_t timezone_length, const uint8_t *snapshot_token, size_t snapshot_length, const RtdbReadTime *snapshot_time, const RtdbReadTime *clock_time, RtdbHandle *error);
 /* The optional metadata is a borrowed Transit MessagePack map. asynchronous is 0 or 1. */
 int32_t rtdb_v1_session_begin_write_only(RtdbHandle session, RtdbHandle operation, const uint8_t *timezone, size_t timezone_length, const RtdbReadTime *system_time, const uint8_t *metadata, size_t metadata_length, uint32_t asynchronous, RtdbHandle *error);
+/* Shape the current transaction before its first query or write. Null options retain existing values.
+ * For read-write shaping, asynchronous is 0 (sync), 1 (async), or 2 (unchanged).
+ */
+int32_t rtdb_v1_session_set_transaction_read_only(RtdbHandle session, RtdbHandle operation, const uint8_t *snapshot, size_t snapshot_length, const RtdbReadTime *snapshot_time, const RtdbReadTime *clock_time, const uint8_t *await_token, size_t await_length, RtdbHandle *error);
+int32_t rtdb_v1_session_set_transaction_read_write(RtdbHandle session, RtdbHandle operation, const RtdbReadTime *system_time, const uint8_t *metadata, size_t metadata_length, uint32_t asynchronous, RtdbHandle *error);
+int32_t rtdb_v1_session_set_transaction_timezone(RtdbHandle session, RtdbHandle operation, const uint8_t *timezone, size_t length, RtdbHandle *error);
 
 /* bulk=0: SQL source; bulk=1: CREATE_APPEND table name.
  * A bind replaces existing arguments, preserves ordinal positions and explicit zero-row batches.

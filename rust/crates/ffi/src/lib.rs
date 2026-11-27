@@ -394,19 +394,30 @@ impl OwnedReadTime {
 pub unsafe extern "C" fn rtdb_v1_session_set_read_settings(handle: u64, operation: u64, timezone: *const u8, timezone_length: usize,
     snapshot: *const u8, snapshot_length: usize, snapshot_time: *const RtdbReadTime, clock_time: *const RtdbReadTime, error: *mut u64,
 ) -> i32 {
-    unsafe { change_read_settings(handle, operation, timezone, timezone_length, snapshot, snapshot_length, snapshot_time, clock_time, false, error) }
+    unsafe { change_read_settings(handle, operation, timezone, timezone_length, snapshot, snapshot_length,
+        snapshot_time, clock_time, std::ptr::null(), 0, false, error) }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rtdb_v1_session_begin_read_only(handle: u64, operation: u64, timezone: *const u8, timezone_length: usize,
     snapshot: *const u8, snapshot_length: usize, snapshot_time: *const RtdbReadTime, clock_time: *const RtdbReadTime, error: *mut u64,
 ) -> i32 {
-    unsafe { change_read_settings(handle, operation, timezone, timezone_length, snapshot, snapshot_length, snapshot_time, clock_time, true, error) }
+    unsafe { change_read_settings(handle, operation, timezone, timezone_length, snapshot, snapshot_length,
+        snapshot_time, clock_time, std::ptr::null(), 0, true, error) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rtdb_v1_session_set_transaction_read_only(
+    handle: u64, operation: u64, snapshot: *const u8, snapshot_length: usize, snapshot_time: *const RtdbReadTime,
+    clock_time: *const RtdbReadTime, await_token: *const u8, await_length: usize, error: *mut u64,
+) -> i32 {
+    unsafe { change_read_settings(handle, operation, std::ptr::null(), 0, snapshot, snapshot_length,
+        snapshot_time, clock_time, await_token, await_length, false, error) }
 }
 
 unsafe fn change_read_settings(handle: u64, operation: u64, timezone: *const u8, timezone_length: usize,
     snapshot: *const u8, snapshot_length: usize, snapshot_time: *const RtdbReadTime, clock_time: *const RtdbReadTime,
-    begin: bool, error: *mut u64,
+    await_token: *const u8, await_length: usize, begin: bool, error: *mut u64,
 ) -> i32 {
     use rtdb_node::{AccessSettings, OptionUpdate, ReadOnlySettings, TransactionSettings};
     unsafe { call(error, || {
@@ -415,14 +426,16 @@ unsafe fn change_read_settings(handle: u64, operation: u64, timezone: *const u8,
         let cancellation = handles::cancellation(operation, &session)?;
         let timezone = optional_text(timezone, timezone_length)?;
         let snapshot = optional_text(snapshot, snapshot_length)?;
+        let await_token = optional_text(await_token, await_length)?;
         let snapshot_time = ReadTime::parse(snapshot_time)?;
         let clock_time = ReadTime::parse(clock_time)?;
-        let bytes = [timezone.map_or(0, str::len), snapshot.map_or(0, str::len),
+        let bytes = [timezone.map_or(0, str::len), snapshot.map_or(0, str::len), await_token.map_or(0, str::len),
             snapshot_time.as_ref().map_or(0, ReadTime::text_len), clock_time.as_ref().map_or(0, ReadTime::text_len)]
             .into_iter().try_fold(0, add)?;
         let _input = session.region.memory().reserve(add(4096, mul(bytes, 4)?)?)?;
         let timezone = timezone.map(str::to_owned);
         let snapshot = snapshot.map(str::to_owned);
+        let await_token = await_token.map(str::to_owned);
         let snapshot_time = snapshot_time.map(ReadTime::into_owned);
         let clock_time = clock_time.map(ReadTime::into_owned);
         let session_handle = Arc::clone(&session);
@@ -437,7 +450,7 @@ unsafe fn change_read_settings(handle: u64, operation: u64, timezone: *const u8,
                 snapshot_token: snapshot.map_or(OptionUpdate::Unchanged, OptionUpdate::Set),
                 snapshot_time: snapshot_time.map(|time| time.snapshot(&effective_timezone)).transpose()?.map_or(OptionUpdate::Unchanged, OptionUpdate::Set),
                 clock_time: clock_time.map(|time| time.clock(&effective_timezone)).transpose()?.map_or(OptionUpdate::Unchanged, OptionUpdate::Set),
-                ..Default::default()
+                await_token: await_token.map_or(OptionUpdate::Unchanged, OptionUpdate::Set),
             };
             let settings = TransactionSettings {
                 access: Some(AccessSettings::ReadOnly(settings)),
@@ -454,13 +467,31 @@ pub unsafe extern "C" fn rtdb_v1_session_begin_write_only(
     handle: u64, operation: u64, timezone: *const u8, timezone_length: usize, system_time: *const RtdbReadTime,
     metadata: *const u8, metadata_length: usize, asynchronous: u32, error: *mut u64,
 ) -> i32 {
+    unsafe { change_write_settings(handle, operation, timezone, timezone_length, system_time,
+        metadata, metadata_length, asynchronous, true, error) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rtdb_v1_session_set_transaction_read_write(
+    handle: u64, operation: u64, system_time: *const RtdbReadTime, metadata: *const u8, metadata_length: usize,
+    asynchronous: u32, error: *mut u64,
+) -> i32 {
+    unsafe { change_write_settings(handle, operation, std::ptr::null(), 0, system_time,
+        metadata, metadata_length, asynchronous, false, error) }
+}
+
+unsafe fn change_write_settings(
+    handle: u64, operation: u64, timezone: *const u8, timezone_length: usize, system_time: *const RtdbReadTime,
+    metadata: *const u8, metadata_length: usize, asynchronous: u32, begin: bool, error: *mut u64,
+) -> i32 {
     use rtdb_node::{AccessSettings, OptionUpdate, ReadWriteSettings, TransactionSettings};
 
     unsafe { call(error, || {
         let asynchronous = match asynchronous {
-            0 => false,
-            1 => true,
-            _ => return Err(invalid("Asynchronous must be 0 or 1")),
+            0 => OptionUpdate::Set(false),
+            1 => OptionUpdate::Set(true),
+            2 if !begin => OptionUpdate::Unchanged,
+            _ => return Err(invalid("Unknown asynchronous transaction setting")),
         };
         let session = handles::session(handle)?;
         let _admitted = session.region.enter()?;
@@ -479,21 +510,46 @@ pub unsafe extern "C" fn rtdb_v1_session_begin_write_only(
         session.region.run(move || async move {
             let mut state = session_handle.state.lock().await;
             token.run_until_cancelled(async {
-                state.state().revalidate().await?;
+                if begin { state.state().revalidate().await?; }
+                else { state.admit_frontend_prepare(&[], &token).await?; }
                 let effective_timezone = match &timezone {
                     Some(zone) => rtdb_expr::normalize_timezone(zone)?,
                     None => state.state().effective_timezone().to_owned(),
                 };
                 let system_time = system_time.map(|time| time.snapshot(&effective_timezone)).transpose()?;
-                state.state_mut().begin_with(TransactionSettings {
+                let settings = TransactionSettings {
                     access: Some(AccessSettings::ReadWrite(ReadWriteSettings {
                         system_time: system_time.map_or(OptionUpdate::Unchanged, OptionUpdate::Set),
                         user_metadata: metadata.map_or(OptionUpdate::Unchanged, OptionUpdate::Set),
-                        asynchronous: OptionUpdate::Set(asynchronous),
+                        asynchronous,
                     })),
                     timezone: timezone.map_or(OptionUpdate::Unchanged, |_| OptionUpdate::Set(effective_timezone)),
-                })
+                };
+                if begin { state.state_mut().begin_with(settings) }
+                else { state.state_mut().set_transaction(settings) }
             }).await.ok_or_else(cancelled)?
+        })
+    }) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rtdb_v1_session_set_transaction_timezone(
+    handle: u64, operation: u64, timezone: *const u8, length: usize, error: *mut u64,
+) -> i32 {
+    use rtdb_node::{OptionUpdate, TransactionSettings};
+
+    unsafe { call(error, || {
+        let session = handles::session(handle)?;
+        let _admitted = session.region.enter()?;
+        let token = handles::cancellation(operation, &session)?;
+        let timezone = text(timezone, length)?;
+        let _input = session.region.memory().reserve(add(4096, mul(length, 4)?)?)?;
+        let timezone = timezone.to_owned();
+        let session_handle = Arc::clone(&session);
+        session.region.run(move || async move {
+            let mut state = session_handle.state.lock().await;
+            let _control = state.admit_frontend_prepare(&[], &token).await?;
+            state.state_mut().set_transaction(TransactionSettings { access: None, timezone: OptionUpdate::Set(timezone) })
         })
     }) }
 }

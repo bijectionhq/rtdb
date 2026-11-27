@@ -115,10 +115,38 @@ public final class NativeConnection extends NativeResource implements AdbcConnec
     public void beginWriteOnly(Instant systemTime, Map<?, ?> metadata, boolean asynchronous, ZoneId timezone) throws AdbcException {
         try (Operation operation = operation(); Arena arena = Arena.ofConfined()) {
             var zone = NativeAbi.optionalText(arena, timezone == null ? null : timezone.getId());
-            var metadataBytes = metadata == null ? MemorySegment.NULL : NativeAbi.bytes(arena, (byte[]) TransactionCodec.WRITE.invoke(metadata));
+            var metadataBytes = encodedMetadata(arena, metadata);
             abi.call("session_begin_write_only", handle(), operation.id(), zone, zone.byteSize(), readTime(arena, systemTime, false),
                 metadataBytes, metadataBytes.byteSize(), asynchronous ? 1 : 0);
         }
+    }
+    /** Makes the transaction read-only. Null options retain their current values. */
+    public void setTransactionReadOnly(String snapshotToken, Instant snapshotTime, Instant clockTime, String awaitToken) throws AdbcException {
+        try (Operation operation = operation(); Arena arena = Arena.ofConfined()) {
+            var snapshot = NativeAbi.optionalText(arena, snapshotToken);
+            var await = NativeAbi.optionalText(arena, awaitToken);
+            abi.call("session_set_transaction_read_only", handle(), operation.id(), snapshot, snapshot.byteSize(),
+                readTime(arena, snapshotTime, false), readTime(arena, clockTime, false), await, await.byteSize());
+        }
+    }
+    /** Makes the transaction read-write. Null options retain their current values. */
+    public void setTransactionReadWrite(Instant systemTime, Map<?, ?> metadata, Boolean asynchronous) throws AdbcException {
+        try (Operation operation = operation(); Arena arena = Arena.ofConfined()) {
+            var metadataBytes = encodedMetadata(arena, metadata);
+            int mode = asynchronous == null ? 2 : Boolean.TRUE.equals(asynchronous) ? 1 : 0;
+            abi.call("session_set_transaction_read_write", handle(), operation.id(), readTime(arena, systemTime, false),
+                metadataBytes, metadataBytes.byteSize(), mode);
+        }
+    }
+    /** Overrides the time zone for the current transaction. */
+    public void setTransactionTimeZone(ZoneId timezone) throws AdbcException {
+        try (Operation operation = operation(); Arena arena = Arena.ofConfined()) {
+            var zone = NativeAbi.text(arena, timezone.getId());
+            abi.call("session_set_transaction_timezone", handle(), operation.id(), zone, zone.byteSize());
+        }
+    }
+    private static MemorySegment encodedMetadata(Arena arena, Map<?, ?> metadata) {
+        return metadata == null ? MemorySegment.NULL : NativeAbi.bytes(arena, (byte[]) TransactionCodec.WRITE.invoke(metadata));
     }
     public void commitSync() throws AdbcException { action(5); }
     public void commitAsync() throws AdbcException { action(6); }

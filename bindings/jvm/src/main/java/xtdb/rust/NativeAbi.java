@@ -53,6 +53,9 @@ final class NativeAbi {
         registerOptional(library, linker, "session_set_read_settings", I64, I64, PTR, I64, PTR, I64, PTR, PTR, PTR);
         registerOptional(library, linker, "session_begin_read_only", I64, I64, PTR, I64, PTR, I64, PTR, PTR, PTR);
         registerOptional(library, linker, "session_begin_write_only", I64, I64, PTR, I64, PTR, PTR, I64, I32, PTR);
+        registerOptional(library, linker, "session_set_transaction_read_only", I64, I64, PTR, I64, PTR, PTR, PTR, I64, PTR);
+        registerOptional(library, linker, "session_set_transaction_read_write", I64, I64, PTR, PTR, I64, I32, PTR);
+        registerOptional(library, linker, "session_set_transaction_timezone", I64, I64, PTR, I64, PTR);
         register(library, linker, "statement_new", I64, PTR, I64, I32, PTR, PTR);
         register(library, linker, "statement_set_sql", I64, PTR, I64, PTR);
         register(library, linker, "statement_prepare", I64, I64, PTR);

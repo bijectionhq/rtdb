@@ -102,6 +102,7 @@ The legacy C Transit cursor still returns the same owned-byte-handle interface.
 Autonomous transaction requests carry operations, options and the asynchronous flag explicitly.
 Absent SQL arguments and a present empty row batch remain distinct.
 The typed read-only and write-only begin functions use the same transaction state as SQL and ADBC.
+The typed transaction setters shape that state before its first query or write and preserve settings for omitted options within the chosen access mode.
 The additive structured commit and autonomous transaction functions distinguish an indexed abort from a failed call.
 Release a returned abort diagnostic as a normal diagnostic handle even after the session closes.
 

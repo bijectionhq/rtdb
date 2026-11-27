@@ -6,6 +6,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
+import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.util.List;
@@ -159,6 +160,38 @@ final class NativeAdbcTest {
                 assertTrue(result.getReader().loadNextBatch());
                 assertEquals(0L, ((Number) result.getReader().getVectorSchemaRoot().getVector(0).getObject(0)).longValue());
             }
+        }
+    }
+
+    @Test void shapesTransactionSettingsBeforeTheFirstStatement() throws Exception {
+        try (var allocator = new RootAllocator(); var database = open(allocator); var connection = database.connect()) {
+            var supplied = Instant.parse("2020-02-03T04:05:06Z");
+            assertThrows(NativeException.class, () -> connection.setTransactionReadWrite(supplied, null, false));
+            connection.setAutoCommit(false);
+            connection.setTransactionReadWrite(supplied, Map.of("source", "manual transaction"), false);
+            connection.setTransactionReadWrite(null, null, null);
+            try (var insert = connection.createStatement("INSERT INTO docs (_id) VALUES (1)")) {
+                insert.executeUpdate();
+            }
+            assertThrows(NativeException.class, () -> connection.setTransactionTimeZone(ZoneId.of("Europe/Paris")));
+            assertEquals(supplied, connection.commitSyncResult().systemTime());
+            String awaitToken = connection.getAwaitToken();
+            assertNotNull(awaitToken);
+
+            connection.setTransactionTimeZone(ZoneId.of("Europe/Paris"));
+            assertThrows(NativeException.class, () -> connection.setTransactionReadOnly(null, null, null, "!"));
+            connection.setTransactionReadOnly(null, null, supplied, awaitToken);
+            try (var query = connection.createStatement("SHOW TIME ZONE"); var result = query.executeQuery()) {
+                assertTrue(result.getReader().loadNextBatch());
+                assertEquals("Europe/Paris", result.getReader().getVectorSchemaRoot().getVector(0).getObject(0).toString());
+            }
+            try (var query = connection.createStatement("SELECT CAST(CURRENT_TIMESTAMP AS TEXT)");
+                 var result = query.executeQuery()) {
+                assertTrue(result.getReader().loadNextBatch());
+                var time = ZonedDateTime.parse(result.getReader().getVectorSchemaRoot().getVector(0).getObject(0).toString());
+                assertEquals(supplied, time.toInstant());
+            }
+            assertNull(connection.commitSyncResult());
         }
     }
 
