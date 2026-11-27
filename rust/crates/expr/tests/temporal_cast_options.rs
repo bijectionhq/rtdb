@@ -40,6 +40,45 @@ fn time_to_timestamp_uses_query_date_in_session_zone_and_ignores_precision() {
 }
 
 #[test]
+fn timestamp_text_casts_check_epoch_seconds_before_adding_fractional_units() {
+    for (kind, suffix) in [
+        (TemporalKind::TimestampLocal, ""),
+        (TemporalKind::TimestampZone(CastTimezone::Session), "Z"),
+    ] {
+        let target = temporal(kind, U::Nanosecond, Some(9));
+        let fixed = CastTarget::Fixed(target.result_type(&LogicalType::Scalar(ScalarType::Utf8)));
+        for target in [target, fixed] {
+            let boundary = V::Utf8(format!("1677-09-21T00:12:43.145224192{suffix}"));
+            assert_eq!(cast_target(&boundary, &target, "UTC").unwrap_err().code, "xtdb.expression/overflow-error");
+            let next_second = V::Utf8(format!("1677-09-21T00:12:44.000000001{suffix}"));
+            let value = cast_target(&next_second, &target, "UTC").unwrap();
+            assert!(matches!(value, V::Timestamp { value: -9_223_372_035_999_999_999, unit: U::Nanosecond, .. }));
+        }
+    }
+}
+
+#[test]
+fn time_to_timestamp_checks_the_query_dates_midnight_before_adding_the_time() {
+    use rtdb_expr::{EvalContext, evaluate};
+    use rtdb_plan::{Expr, Schema};
+    use rtdb_types::Instant;
+
+    for (kind, timezone, offset, time) in [
+        (TemporalKind::TimestampLocal, "UTC", 0, 13 * 60),
+        (TemporalKind::TimestampZone(CastTimezone::Session), "-01:00", 3_600, 60),
+    ] {
+        let source = Expr::Literal(V::Time { value: time, unit: U::Second, bit_width: 32 });
+        let expression = Expr::Cast { expr: Box::new(source), target: temporal(kind, U::Nanosecond, None) };
+        let context = EvalContext { current_time: Instant::new(-9_223_372_800 + offset, 0).unwrap(), timezone, ..Default::default() };
+        assert_eq!(evaluate(&expression, &Schema::default(), &[], &context).unwrap_err().code, "xtdb.expression/overflow-error");
+        let context = EvalContext { current_time: Instant::new(-9_223_286_400 + offset, 0).unwrap(), timezone, ..Default::default() };
+        let value = evaluate(&expression, &Schema::default(), &[], &context).unwrap();
+        let V::Timestamp { value, unit: U::Nanosecond, .. } = value else { panic!("expected a nanosecond timestamp") };
+        assert_eq!(value, (-9_223_286_400 + time + offset) * 1_000_000_000);
+    }
+}
+
+#[test]
 fn cast_interval_to_duration_precision_precedes_nanos_overflow_and_month_check() {
     let value = V::IntervalMonthDayNano { months: 0, days: 1, nanoseconds: 3_601_111_111_111 };
     assert_eq!(cast_target(&value, &temporal(TemporalKind::Duration, U::Millisecond, Some(2)), "UTC").unwrap(), V::Duration { value: 90_001_110, unit: U::Millisecond });

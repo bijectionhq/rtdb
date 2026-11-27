@@ -116,8 +116,14 @@ pub(crate) fn timestamp_text_raw(text: &str, unit: TimeUnit, zoned: bool) -> Res
         _ => (),
     }
     let nanos = rtdb_types::parse_sql_timestamp_cast(text, zoned)?;
-    let value = nanos.div_euclid(1_000_000_000 / i128::from(unit.units_per_second()));
-    i64::try_from(value).map_err(|_| overflow())
+    timestamp_from_nanos(nanos, unit)
+}
+
+pub(crate) fn timestamp_from_nanos(nanos: i128, unit: TimeUnit) -> Result<i64> {
+    let seconds = i64::try_from(nanos.div_euclid(1_000_000_000)).map_err(|_| overflow())?;
+    let hz = unit.units_per_second();
+    let fraction = nanos.rem_euclid(1_000_000_000) as i64 / (1_000_000_000 / hz);
+    seconds.checked_mul(hz).and_then(|whole| whole.checked_add(fraction)).ok_or_else(overflow)
 }
 
 pub(crate) fn duration_seconds(seconds: f64, unit: TimeUnit) -> Result<i64> {

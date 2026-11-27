@@ -18,9 +18,9 @@ pub(crate) fn time_to_timestamp(
 ) -> Result<i64> {
     let zone = crate::timezone::zone(timezone)?;
     let today = zone.local_datetime(current_time)?.date();
-    let hz = i128::from(target.units_per_second());
-    let local_raw = i128::from(today.epoch_day()) * 86_400 * hz + i128::from(value) * hz / i128::from(source.units_per_second());
-    let local_raw = i64::try_from(local_raw).map_err(|_| overflow())?;
+    let midnight = crate::cast::date_to_timestamp(today.epoch_day(), target, false, timezone)?;
+    let time = crate::cast::rescale_units(value, source, target)?;
+    let local_raw = midnight.checked_add(time).ok_or_else(overflow)?;
     if !zoned { return Ok(local_raw); }
     let seconds = local_raw.div_euclid(target.units_per_second());
     let offset = zone.offset_for_local(seconds, None)?;
@@ -79,6 +79,9 @@ fn quantize(nanos: i128, target: &TemporalCast) -> Result<i64> {
         if !(0..1_000_000_000).contains(&fraction) { return Err(Anomaly::incorrect("xtdb/illegal-argument","Invalid value for NanoOfSecond")); }
         nanos.div_euclid(1_000_000_000) * 1_000_000_000 + i128::from(fraction)
     } else { nanos };
+    if matches!(target.kind, TemporalKind::TimestampLocal | TemporalKind::TimestampZone(_)) {
+        return crate::cast::timestamp_from_nanos(nanos, target.unit);
+    }
     let divisor = 1_000_000_000 / i128::from(target.unit.units_per_second());
     let raw = if matches!(target.kind, TemporalKind::Duration) {
         i128::from(i64::try_from(nanos).map_err(|_| overflow())?) / divisor

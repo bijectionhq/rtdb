@@ -122,7 +122,9 @@ Deferred XTQL options preserve that dispatch even when an ignored option has a m
 Negative duration precision floors its nonnegative nanosecond component, matching Java Duration.
 Timestamp text uses the shared SMART SQL grammar without first reducing nanosecond precision.
 Zoned timestamp casts require an explicit input offset or region, while local timestamp casts retain the parsed local clock.
+Timestamp text casts check the epoch-second conversion before adding the fractional component.
 Time-to-timestamp evaluation reads the query clock's calendar date in the session zone through `EvalContext`; the context-free `cast_target` helper cannot perform that conversion.
+The target unit must represent midnight on that date before the time of day is added.
 
 Qualified interval casts retain the requested fields and source-dependent precision checks.
 Single-field text SECOND casts retain nanoseconds with micro-interval metadata, irrespective of the requested fractional truncation.
