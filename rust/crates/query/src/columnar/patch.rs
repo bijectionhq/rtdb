@@ -6,7 +6,7 @@ use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation, from_field, to_f
 use rtdb_plan::{Expr, Schema};
 use rtdb_types::{LogicalType, Result, Value};
 
-use super::{ArrowVector, Column, ColumnBatch, SelectedColumn, SelectedRows, arrow_cell_is_null, pack_evaluated_column, size_error, stable_read_layout};
+use super::{ArrowVector, Column, ColumnBatch, ProjectionInput, SelectedColumn, SelectedRows, arrow_cell_is_null, pack_evaluated_column, size_error, stable_read_layout};
 
 #[derive(Clone, Copy)]
 struct Record<'a> {
@@ -81,47 +81,102 @@ fn uniform_record<'a>(column: &'a Column, owner: &'a Arc<MemoryReservation>) -> 
     }
 }
 
-pub(super) fn merge(
+pub(super) fn merge_expression(
+    args: &[Expr], schema: &Schema, batch: &ColumnBatch, parameters: rtdb_expr::Parameters<'_>, context: &crate::QueryContext,
+) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
+    let [left, right] = args else { return Ok(None); };
+    let memory = &context.memory;
+    if matches!(left, Expr::Column { .. }) && matches!(right, Expr::Column { .. }) {
+        return merge(args, schema, batch, memory);
+    }
+    if batch.len == 0 || rtdb_plan::function_type_with_args("_patch", args).is_err() { return Ok(None); }
+    let merged = (|| {
+        let build = |expr: &Expr| {
+            if matches!(expr, Expr::Field { .. })
+                && let Some(result) = super::projection::shared_column(expr, schema, batch, memory)?
+            {
+                return Ok(Some(result));
+            }
+            super::projection::computed_record(expr, schema, batch, parameters, context)
+        };
+        let Some(old) = bind_operand(left, schema, batch, build)? else { return Ok(None); };
+        let Some(patch) = bind_operand(right, schema, batch, build)? else { return Ok(None); };
+        let (old, patch) = (old.parts(), patch.parts());
+        if !computed_operand_layout(old.0) || !computed_operand_layout(patch.0) { return Ok(None); }
+        merge_operands([old, patch], batch.len, memory)
+    })();
+    match merged {
+        Ok(merged) => Ok(merged),
+        Err(_) => { context.check_cancelled()?; Ok(None) }
+    }
+}
+
+fn bind_operand<'a>(
+    expr: &Expr, schema: &Schema, batch: &'a ColumnBatch,
+    compute: impl FnOnce(&Expr) -> Result<Option<(Column, Arc<MemoryReservation>)>>,
+) -> Result<Option<ProjectionInput<'a>>> {
+    if let Expr::Column { id, .. } = expr {
+        return Ok(schema.position(*id).map(|position| ProjectionInput::Stored(&batch.columns[position], batch.column_reservation(position))));
+    }
+    Ok(compute(expr)?.map(|(column, owner)| ProjectionInput::Computed(column, owner)))
+}
+
+fn computed_operand_layout(column: &Column) -> bool {
+    let supported = |field: &ArrowField| super::projection::record_field(field, false);
+    match column {
+        Column::Arrow { field, .. } => supported(field),
+        Column::Selected(selected) => selected.source_layouts().all(|(_, field, _)| supported(field)),
+        Column::Values(_) => false,
+    }
+}
+
+fn merge(
     args: &[Expr], schema: &Schema, batch: &ColumnBatch, memory: &Arc<MemoryBudget>,
 ) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
     let [Expr::Column { id: old, .. }, Expr::Column { id: patch, .. }] = args else { return Ok(None); };
     let (Some(old), Some(patch)) = (schema.position(*old), schema.position(*patch)) else { return Ok(None); };
-    if batch.len != 0 {
-        let old_column = &batch.columns[old];
-        let patch_column = &batch.columns[patch];
-        if let Some(old) = uniform_record(old_column, batch.column_reservation(old))
-            && let Some(Some(patch)) = uniform_record(patch_column, batch.column_reservation(patch))
+    merge_operands([
+        (&batch.columns[old], batch.column_reservation(old)),
+        (&batch.columns[patch], batch.column_reservation(patch)),
+    ], batch.len, memory)
+}
+
+fn merge_operands(
+    [old, patch]: [(&Column, &Arc<MemoryReservation>); 2], len: usize, memory: &Arc<MemoryBudget>,
+) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
+    if len != 0 {
+        if let Some(old) = uniform_record(old.0, old.1)
+            && let Some(Some(patch)) = uniform_record(patch.0, patch.1)
             && let Some(group) = merged_group(
                 |row| (old.map(|record| Record { position: row, ..record }), Record { position: row, ..patch }),
-                0..batch.len, old.map(|record| record.array.fields()), patch.array.fields(), memory,
+                0..len, old.map(|record| record.array.fields()), patch.array.fields(), memory,
             )?
         {
             let MergedGroup { vector: (array, field, logical), charge, shared_children } = group;
             if !shared_children { return Ok(Some((Column::Arrow { array, field, logical }, charge))); }
             let reservation = memory.reserve(512)?;
             let sources = Arc::new(vec![Some((array, field, logical, Some(charge)))]);
-            let column = Column::Selected(SelectedColumn { sources, cells: SelectedRows::Span(0..batch.len) });
+            let column = Column::Selected(SelectedColumn { sources, cells: SelectedRows::Span(0..len) });
             return Ok(Some((column, reservation)));
         }
     }
-    let bytes = batch.len.checked_mul(256).and_then(|bytes| bytes.checked_add(8192)).ok_or_else(size_error)?;
+    let bytes = len.checked_mul(256).and_then(|bytes| bytes.checked_add(8192)).ok_or_else(size_error)?;
     let mut reservation = memory.reserve(bytes)?;
     fn pack_operand(column: &Column, memory: &Arc<MemoryBudget>) -> Option<(Column, Arc<MemoryReservation>)> {
         let Column::Values(values) = column else { return None; };
         values.iter().all(|value| matches!(value, Value::Struct(_) | Value::Null | Value::Undefined))
             .then(|| pack_evaluated_column(values, memory).ok()).flatten()
     }
-    let operands = [&batch.columns[old], &batch.columns[patch]];
-    let owners = [batch.column_reservation(old), batch.column_reservation(patch)];
-    let packed = operands.map(|column| pack_operand(column, memory));
+    let operands = [old, patch];
+    let packed = operands.map(|(column, _)| pack_operand(column, memory));
     let [(old, old_owner), (patch, patch_owner)] = std::array::from_fn(|index| {
-        packed[index].as_ref().map_or((operands[index], owners[index]), |(column, owner)| (column, owner))
+        packed[index].as_ref().map_or(operands[index], |(column, owner)| (column, owner))
     });
-    let mut rows = Vec::with_capacity(batch.len);
+    let mut rows = Vec::with_capacity(len);
     let mut layouts = HashMap::new();
     let mut groups = Vec::new();
-    let mut positions = Vec::with_capacity(batch.len);
-    for row in 0..batch.len {
+    let mut positions = Vec::with_capacity(len);
+    for row in 0..len {
         let (Some(old), Some(Some(patch))) = (record(old, old_owner, row), record(patch, patch_owner, row)) else { return Ok(None); };
         let fields = (old.map(|old| old.array.fields()), patch.array.fields());
         let group = *layouts.entry(fields).or_insert_with(|| {
@@ -139,7 +194,7 @@ pub(super) fn merge(
         || groups.iter().filter(|((old, _), _)| old.is_some()).count() > 1
         || groups.iter().any(|((_, fields), _)| *fields != groups[0].0.1);
     let union_records = [old, patch].iter().any(|column| {
-        (0..batch.len).any(|row| column.arrow_cell(row).flatten()
+        (0..len).any(|row| column.arrow_cell(row).flatten()
             .is_some_and(|(_, field, _, _)| matches!(field.data_type(), DataType::Union(..))))
     });
     let mut sources = Vec::with_capacity(groups.len());
@@ -151,14 +206,14 @@ pub(super) fn merge(
         if heterogeneous || union_records || packed.iter().any(Option::is_some) {
             rtdb_columnar::validate_projected_decimals(&field, array.as_ref())?;
         }
-        if indices.len() == batch.len && !shared_children {
+        if indices.len() == len && !shared_children {
             return Ok(Some((Column::Arrow { array, field, logical }, charge)));
         }
         sources.push(Some((array, field, logical, Some(charge))));
     }
     let cells = if sources.len() == 1 {
         drop(positions);
-        SelectedRows::Span(0..batch.len)
+        SelectedRows::Span(0..len)
     } else {
         SelectedRows::Picks(Arc::new(positions))
     };

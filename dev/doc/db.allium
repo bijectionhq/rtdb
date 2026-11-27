@@ -1342,6 +1342,7 @@ rule LeaderProcessesTx {
         -- PATCH projects independently over distinct pairs of old and patch struct layouts.
         -- A uniform Arrow patch can reuse compatible operand spans under their original buffer charges.
         -- PATCH can pack row-backed records while selecting the preferred children from its Arrow operand.
+        -- An expression PATCH can merge a compatible computed Arrow record with the active old record layout for each selected row.
         -- The patch projection keeps existing cells when a patch cell is null and keeps the patch's field set for an uncovered interval.
         -- A SQL mutation that targets a reserved table aborts with the table reference in the error data.
         -- An invalid SQL table projection contributes its error before dependent column binding and INSERT schema errors in the same abort.
@@ -2439,9 +2440,9 @@ surface QueryAccess {
         -- A located point read decodes the event headers and the put fields needed by its projection and predicates.
         -- Equality selection on a keyword ID includes the native and reference persisted digests.
         -- For columnar query output, stacked filters apply in plan order to the surviving vectors and row positions.
-        -- A binary UTF-8 concatenation projection reads compatible column cells, including active run ends and union legs, or uses a literal operand.
+        -- A tree of binary UTF-8 concatenations can read its compatible leaf cells, including active run ends and union legs, and literal operands.
         -- It reserves the output buffers per page before writing them.
-        -- It preserves each nonnull pair's bytes in operand order and yields SQL null when either operand is null.
+        -- It preserves the bytes in operand order and yields SQL null when a reached operand is null.
         -- A columnar limit applies its offset and row count to batches and slices compatible Arrow arrays.
         -- DISTINCT and set operations with columnar inputs select their output positions from those Arrow batches.
         -- DISTINCT holds its seen keys in memory and fails when the memory budget cannot hold them.
@@ -2601,6 +2602,10 @@ surface QueryAccess {
         -- Direct predicate comparisons keep their computed arithmetic operands in admitted Arrow buffers from construction through comparison.
         -- Checked numeric arithmetic can produce a result vector from selected Arrow positions with a compatible physical type.
         -- A nested field projection follows admitted Arrow struct children and applies each ancestor's validity.
+        -- A selected decimal field can retain its source cells after checking precision at the selected positions.
+        -- COALESCE can retain the first non-null cell from a compatible projected field.
+        -- A computed record can use compatible concatenation and COALESCE results as Arrow children.
+        -- A computed record keeps a duplicate field's first position and last value.
         -- Scalar arithmetic over a compatible field of a selected struct reads the child values at the selected positions and observes the parent's validity.
         -- Computed outputs publish Arrow columns or positions in arrays with differing physical fields.
         -- Within the scalar evaluation budget, decimal arithmetic, comparisons, and casts can consume a coefficient wider than the expression's declared decimal result field.

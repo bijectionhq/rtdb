@@ -1,6 +1,7 @@
 use std::{fmt::Write, sync::Arc};
 
 use arrow_array::{Array, ArrayRef, NullArray, StringArray, builder::StringBuilder};
+use arrow_buffer::BooleanBufferBuilder;
 use arrow_schema::{DataType, Field, UnionMode};
 use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation};
 use rtdb_plan::{BinaryOp, Expr, Schema};
@@ -67,7 +68,7 @@ impl<'a> TextSource<'a> {
 }
 
 enum TextInput<'a> {
-    Literal(&'a str),
+    Literal(Option<&'a str>),
     Direct(TextSource<'a>),
     Selected {
         rows: &'a SelectedRows,
@@ -88,7 +89,8 @@ impl<'a> TextInput<'a> {
                 if plain_scalar(logical) != Some(&ScalarType::Utf8) { return Ok(None); }
                 &batch.columns[position]
             }
-            Expr::Literal(Value::Utf8(text)) => return Ok(Some(Self::Literal(text))),
+            Expr::Literal(Value::Utf8(text)) => return Ok(Some(Self::Literal(Some(text)))),
+            Expr::Literal(Value::Null) => return Ok(Some(Self::Literal(None))),
             _ => return Ok(None),
         };
         Ok(match column {
@@ -119,7 +121,7 @@ impl<'a> TextInput<'a> {
 
     fn get(&self, row: usize) -> Option<Option<&'a str>> {
         match self {
-            Self::Literal(text) => Some(Some(text)),
+            Self::Literal(text) => Some(*text),
             Self::Direct(source) => source.get(row),
             Self::Selected { rows, sources, .. } => {
                 let (source, offset) = rows.get(row)?;
@@ -132,30 +134,64 @@ impl<'a> TextInput<'a> {
     }
 }
 
+fn operand_count(expr: &Expr) -> Option<usize> {
+    stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || match expr {
+        Expr::Binary { op: BinaryOp::Concat, left, right } => operand_count(left)?.checked_add(operand_count(right)?),
+        _ => Some(1),
+    })
+}
+
+fn bind_operands<'a>(
+    expr: &'a Expr, schema: &Schema, batch: &'a ColumnBatch, memory: &Arc<MemoryBudget>, inputs: &mut Vec<TextInput<'a>>,
+) -> Result<bool> {
+    stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
+        if let Expr::Binary { op: BinaryOp::Concat, left, right } = expr {
+            return Ok(bind_operands(left, schema, batch, memory, inputs)? && bind_operands(right, schema, batch, memory, inputs)?);
+        }
+        let Some(input) = TextInput::bind(expr, schema, batch, memory)? else { return Ok(false); };
+        inputs.push(input);
+        Ok(true)
+    })
+}
+
 pub(super) fn utf8_column(
     expression: &Expr, schema: &Schema, batch: &ColumnBatch, context: &QueryContext,
 ) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
-    let Expr::Binary { op: BinaryOp::Concat, left, right } = expression else { return Ok(None); };
-    if batch.len == 0 { return Ok(None); }
-    let (Some(left), Some(right)) = (TextInput::bind(left, schema, batch, &context.memory)?, TextInput::bind(right, schema, batch, &context.memory)?)
-    else { return Ok(None); };
-    if matches!((&left, &right), (TextInput::Literal(_), TextInput::Literal(_))) { return Ok(None); }
-    let pair = |row| {
-        let Some(left) = left.get(row)? else { return Some(None); };
-        Some(right.get(row)?.map(|right| (left, right)))
+    if batch.len == 0 || !matches!(expression, Expr::Binary { op: BinaryOp::Concat, .. }) { return Ok(None); }
+    let count = operand_count(expression).ok_or_else(size_error)?;
+    let bytes = count.checked_mul(size_of::<TextInput<'_>>())
+        .and_then(|bytes| bytes.checked_add(batch.len.div_ceil(8) + 64)).ok_or_else(size_error)?;
+    let Ok(_input_owner) = context.memory.reserve(bytes) else { return Ok(None); };
+    let mut inputs = Vec::with_capacity(count);
+    if !bind_operands(expression, schema, batch, &context.memory, &mut inputs)?
+        || inputs.iter().all(|input| matches!(input, TextInput::Literal(_)))
+    {
+        return Ok(None);
+    }
+    let row_size = |row| {
+        let mut size = 0usize;
+        for input in &inputs {
+            let Some(text) = input.get(row)? else { return Some(None); };
+            size = size.checked_add(text.len())?;
+        }
+        Some(Some(size))
     };
 
     let mut remaining_bytes = i32::MAX as usize;
     let mut nulls = 0;
+    let mut valid = BooleanBufferBuilder::new(batch.len);
     for row in 0..batch.len {
         context.check_cancelled_at(row)?;
-        match pair(row) {
-            Some(Some((left, right))) => {
-                let Some(remaining) = remaining_bytes.checked_sub(left.len()).and_then(|bytes| bytes.checked_sub(right.len()))
-                else { return Ok(None); };
+        match row_size(row) {
+            Some(Some(size)) => {
+                let Some(remaining) = remaining_bytes.checked_sub(size) else { return Ok(None); };
                 remaining_bytes = remaining;
+                valid.append(true);
             }
-            Some(None) => nulls += 1,
+            Some(None) => {
+                nulls += 1;
+                valid.append(false);
+            }
             None => return Ok(None),
         }
     }
@@ -177,9 +213,12 @@ pub(super) fn utf8_column(
         let mut builder = StringBuilder::with_capacity(batch.len, value_bytes);
         for row in 0..batch.len {
             context.check_cancelled_at(row)?;
-            if let Some((left, right)) = pair(row).expect("The page's text cells were sized") {
-                builder.write_str(left).expect("Writing into a StringBuilder only appends bytes");
-                builder.append_value(right);
+            if valid.get_bit(row) {
+                for input in &inputs {
+                    let text = input.get(row).flatten().expect("The row's text cells were sized");
+                    builder.write_str(text).expect("Writing into a StringBuilder only appends bytes");
+                }
+                builder.append_value("");
             } else {
                 builder.append_null();
             }

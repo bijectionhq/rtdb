@@ -5018,6 +5018,180 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn computed_record_lends_nested_concat_and_coalesced_field_columns() {
+        use rtdb_types::StructFields;
+
+        let memory = MemoryBudget::new(1 << 20);
+        let first = Value::Struct(StructFields::from([("note".into(), Value::Utf8("é".into()))]));
+        let mut parent = field(0, ScalarType::I64);
+        parent.data_type = first.logical_type().maybe();
+        let text = field(1, ScalarType::Utf8);
+        let schema = Schema::new(vec![parent.clone(), text.clone()]).unwrap();
+        let schema_field = |input: &rtdb_plan::Field| Arc::new(rtdb_columnar::to_field(&input.name, &input.data_type).unwrap());
+        let columns = vec![
+            Column::Arrow {
+                array: rtdb_columnar::copy_array(&parent.data_type, &[first, Value::Null, Value::Null]).unwrap(),
+                field: schema_field(&parent), logical: Some(parent.data_type.clone()),
+            },
+            Column::Arrow {
+                array: Arc::new(StringArray::from(vec![Some("x"), Some(""), None])),
+                field: schema_field(&text), logical: Some(text.data_type.clone()),
+            },
+        ];
+        let batch = ColumnBatch::settled(columns, 3, memory.reserve(0).unwrap()).unwrap();
+        let note = Expr::Field {
+            expr: Box::new(parent.expression()), name: "note".into(), data_type: text.data_type.clone(),
+        };
+        let literal = |text: &str| Expr::Literal(Value::Utf8(text.into()));
+        let label = Expr::Coalesce(vec![note, literal("default")]);
+        let concat = Expr::binary(BinaryOp::Concat, literal("["), Expr::binary(BinaryOp::Concat, text.expression(), literal("]")));
+        let record = Expr::Struct(vec![("label".into(), label.clone()), ("wrapped".into(), concat.clone())]);
+        let mut cursor = record_projection_cursor(batch, schema.clone(), vec![label, record], &memory);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        let [Column::Selected(_), Column::Arrow { array, .. }] = page.columns.as_slice() else { panic!("Expected selected winners and an Arrow record"); };
+        let record = array.as_any().downcast_ref::<StructArray>().unwrap();
+        let labels = record.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        let wrapped = record.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(labels.iter().collect::<Vec<_>>(), [Some("é"), Some("default"), Some("default")]);
+        assert_eq!(wrapped.iter().collect::<Vec<_>>(), [Some("[x]"), Some("[]"), None]);
+
+        let failing_text = Expr::Cast {
+            expr: Box::new(Expr::binary(BinaryOp::Divide, Expr::Literal(Value::I64(1)), Expr::Literal(Value::I64(0)))),
+            target: CastTarget::Fixed(LogicalType::Scalar(ScalarType::Utf8)),
+        };
+        let concat = Expr::binary(BinaryOp::Concat, concat, failing_text);
+        let batch = |value| {
+            let columns = vec![
+                Column::Values(vec![Value::Null]),
+                Column::Arrow { array: Arc::new(StringArray::from(vec![value])), field: schema_field(&text), logical: Some(text.data_type.clone()) },
+            ];
+            ColumnBatch::settled(columns, 1, memory.reserve(0).unwrap()).unwrap()
+        };
+        let mut cursor = record_projection_cursor(batch(None), schema.clone(), vec![concat.clone()], &memory);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert_eq!(page.columns[0].value(0).unwrap(), Value::Null);
+        let mut cursor = record_projection_cursor(batch(Some("x")), schema, vec![concat], &memory);
+        assert_eq!(cursor.next_batch().await.err().unwrap().code, "xtdb.expression/division-by-zero");
+    }
+
+    #[tokio::test]
+    async fn selected_decimal_field_validates_only_reached_cells() {
+        use arrow_array::Decimal128Array;
+
+        let memory = MemoryBudget::new(1 << 20);
+        let decimal = Arc::new(ArrowField::new("amount", DataType::Decimal128(2, 0), false));
+        let amounts = Decimal128Array::from(vec![12_i128, 100, 100]).with_precision_and_scale(2, 0).unwrap();
+        let amounts = StructArray::new(vec![decimal].into(), vec![Arc::new(amounts)], Some(vec![true, true, false].into()));
+        let inner = Arc::new(ArrowField::new("inner", amounts.data_type().clone(), true));
+        let array: ArrayRef = Arc::new(StructArray::new(vec![inner].into(), vec![Arc::new(amounts)], None));
+        let physical = Arc::new(ArrowField::new("source", array.data_type().clone(), false));
+        let mut input = field(0, ScalarType::I64);
+        input.data_type = rtdb_columnar::from_field(&physical).unwrap();
+        let schema = Schema::new(vec![input.clone()]).unwrap();
+        let inner = Expr::Field { expr: Box::new(input.expression()), name: "inner".into(),
+            data_type: rtdb_plan::field_type(&input.data_type, "inner") };
+        let amount = Expr::Field { data_type: rtdb_plan::field_type(&inner.data_type(), "amount"),
+            expr: Box::new(inner), name: "amount".into() };
+        let batch = |indices: &[usize]| {
+            let selection = SelectedColumn::new(
+                vec![Some((Arc::clone(&array), Arc::clone(&physical), Some(input.data_type.clone()), None))],
+                Arc::new(indices.iter().map(|&index| (0, index)).collect()),
+            );
+            ColumnBatch::settled(vec![Column::Selected(selection)], indices.len(), memory.reserve(0).unwrap()).unwrap()
+        };
+        let mut cursor = record_projection_cursor(batch(&[0, 2]), schema.clone(), vec![amount.clone()], &memory);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert!(matches!(page.columns[0], Column::Selected(_)));
+        assert_eq!(page.columns[0].value(1).unwrap(), Value::Null);
+        let mut cursor = record_projection_cursor(batch(&[1]), schema, vec![amount], &memory);
+        assert_eq!(cursor.next_batch().await.err().unwrap().code, "rtdb/decimal-precision");
+    }
+
+    #[tokio::test]
+    async fn computed_patch_keeps_each_selected_old_layout_and_missing_row() {
+        use rtdb_types::StructFields;
+
+        let memory = MemoryBudget::new(1 << 20);
+        let first = Value::Struct(StructFields::from([("a".into(), Value::I64(1)), ("kept".into(), Value::I64(7))]));
+        let second = Value::Struct(StructFields::from([("b".into(), Value::I64(2))]));
+        let mut input = field(0, ScalarType::I64);
+        input.data_type = first.logical_type().join(&second.logical_type()).maybe();
+        let score = field(1, ScalarType::I64);
+        let text = field(2, ScalarType::Utf8);
+        let schema = Schema::new(vec![input.clone(), score.clone(), text.clone()]).unwrap();
+        let sources = [first, second].into_iter().map(|value| {
+            let logical = value.logical_type();
+            let array = rtdb_columnar::copy_array(&logical, &[value]).unwrap();
+            let field = Arc::new(rtdb_columnar::to_field("old", &logical).unwrap());
+            Some((array, field, Some(logical), None))
+        }).chain([None]).collect::<Vec<_>>();
+        let selection = SelectedColumn::new(sources, Arc::new(vec![(0, 0), (2, 0), (1, 0)]));
+        let labels = StringArray::from(vec!["first", "gap", "last"]);
+        let first_label = labels.value(0).as_ptr();
+        let batch = ColumnBatch::settled(vec![
+            Column::Selected(selection),
+            arrow(Arc::new(Int64Array::from(vec![10, 20, 30])), ScalarType::I64),
+            Column::Arrow { array: Arc::new(labels), field: Arc::new(rtdb_columnar::to_field("label", &text.data_type).unwrap()),
+                logical: Some(text.data_type.clone()) },
+        ], 3, memory.reserve(0).unwrap()).unwrap();
+        let patch = Expr::Struct(vec![
+            ("kept".into(), Expr::Literal(Value::I64(99))),
+            ("score".into(), Expr::binary(BinaryOp::Add, score.expression(), Expr::Literal(Value::I64(1)))),
+            ("kept".into(), Expr::Literal(Value::Null)),
+            ("label".into(), text.expression()),
+            ("wrapped".into(), Expr::binary(BinaryOp::Concat, text.expression(), Expr::Literal(Value::Utf8("!".into())))),
+        ]);
+        let args = vec![input.expression(), patch];
+        let expression = Expr::Call {
+            name: "_patch".into(), return_type: rtdb_plan::function_type_with_args("_patch", &args).unwrap(), args: args.clone(),
+        };
+        let mut cursor = record_projection_cursor(batch.duplicate_for_replay(&memory).unwrap(), schema.clone(), vec![expression], &memory);
+        assert!(patch::merge_expression(&args, &schema, &batch, rtdb_expr::Parameters::Values(&[]), &cursor.execution.context)
+            .unwrap().is_some());
+        drop(batch);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert!(matches!(page.columns[0], Column::Selected(_)));
+        let Some(Some((array, field, _, row))) = page.columns[0].arrow_cell(0) else { panic!("Expected an Arrow record"); };
+        let label = (rtdb_columnar::ArrowCell { array, field, row }).structure().unwrap()
+            .find(|cell| cell.field.name() == "label").unwrap();
+        assert_eq!(label.utf8().unwrap().as_ptr(), first_label);
+        for (row, keys, kept, score, wrapped) in [
+            (0, &["a", "kept", "score", "label", "wrapped"][..], Value::I64(7), 11, "first!"),
+            (1, &["kept", "score", "label", "wrapped"][..], Value::Null, 21, "gap!"),
+            (2, &["b", "kept", "score", "label", "wrapped"][..], Value::Null, 31, "last!"),
+        ] {
+            let Value::Struct(record) = page.columns[0].value(row).unwrap() else { panic!("Expected a patched record"); };
+            assert_eq!(record.keys().map(String::as_str).collect::<Vec<_>>(), keys);
+            assert_eq!(record["kept"], kept);
+            assert_eq!(record["score"], Value::I64(score));
+            assert_eq!(record["wrapped"], Value::Utf8(wrapped.into()));
+        }
+    }
+
+    #[tokio::test]
+    async fn computed_patch_fallback_preserves_row_order_across_operands() {
+        let memory = MemoryBudget::new(1 << 20);
+        let schema = Schema::new(vec![field(0, ScalarType::I64)]).unwrap();
+        let batch = ColumnBatch::settled(
+            vec![arrow(Arc::new(Int64Array::from(vec![0, i64::MAX])), ScalarType::I64)], 2, memory.reserve(0).unwrap(),
+        ).unwrap();
+        let old = Expr::Struct(vec![("value".into(), Expr::binary(
+            BinaryOp::Add, schema.fields()[0].expression(), Expr::Literal(Value::I64(1)),
+        ))]);
+        let patch = Expr::Struct(vec![("value".into(), Expr::Cast {
+            expr: Box::new(Expr::Literal(Value::Utf8("patch row zero".into()))),
+            target: CastTarget::Fixed(LogicalType::Scalar(ScalarType::I64)),
+        })]);
+        let args = vec![old, patch];
+        let expr = Expr::Call {
+            name: "_patch".into(), return_type: rtdb_plan::function_type_with_args("_patch", &args).unwrap(), args,
+        };
+        let mut cursor = record_projection_cursor(batch, schema, vec![expr], &memory);
+        let error = cursor.next_batch().await.err().unwrap();
+        assert!(error.message.unwrap().contains("patch row zero"));
+    }
+
+    #[tokio::test]
     async fn record_projection_reaches_errors_in_row_then_field_order() {
         let memory = MemoryBudget::new(1 << 21);
         let schema = Schema::new(vec![field(0, ScalarType::I64)]).unwrap();
@@ -5821,7 +5995,7 @@ impl BatchCursor for BatchExpressions {
             }
             if let rtdb_plan::Expr::Call { name, args, .. } = kernel
                 && name == "_patch"
-                && let Some((column, mut charge)) = patch::merge(args, &self.schema, &batch, &self.execution.context.memory)? {
+                && let Some((column, mut charge)) = patch::merge_expression(args, &self.schema, &batch, parameters, &self.execution.context)? {
                 self.execution.context.check_cancelled()?;
                 let lease = Arc::get_mut(&mut reservation).expect("The patch projection owns its reservation");
                 lease.absorb(Arc::get_mut(&mut charge).expect("The patch projection owns the merge reservation"))?;
@@ -5834,7 +6008,7 @@ impl BatchCursor for BatchExpressions {
                 owners[index] = Some(owner);
                 continue;
             }
-            if let Some((column, owner)) = projection::computed_record(kernel, &self.schema, &batch, parameters, memory)? {
+            if let Some((column, owner)) = projection::computed_record(kernel, &self.schema, &batch, parameters, &self.execution.context)? {
                 columns.push(column);
                 owners[index] = Some(owner);
                 continue;
@@ -5973,6 +6147,20 @@ fn validate_kernel_projection(expression: &Expr, column: &Column) -> Result<()> 
         rtdb_columnar::validate_projected_decimals(field, array.as_ref())?;
     }
     Ok(())
+}
+
+enum ProjectionInput<'a> {
+    Stored(&'a Column, &'a Arc<MemoryReservation>),
+    Computed(Column, Arc<MemoryReservation>),
+}
+
+impl ProjectionInput<'_> {
+    fn parts(&self) -> (&Column, &Arc<MemoryReservation>) {
+        match self {
+            Self::Stored(column, owner) => (column, owner),
+            Self::Computed(column, owner) => (column, owner),
+        }
+    }
 }
 
 fn owned_projection_bytes(column: &Column) -> Result<usize> {
@@ -6383,7 +6571,7 @@ pub(crate) mod projection {
     use arrow_schema::{DataType, Field as ArrowField};
     use rtdb_plan::{CastTarget, Expr, Schema};
     use rtdb_types::{LogicalType, Result, StructFields, Value};
-    use super::{Column, ColumnBatch, MemoryBudget, MemoryReservation, SelectedColumn, StoredVector};
+    use super::{Column, ColumnBatch, MemoryBudget, MemoryReservation, ProjectionInput, SelectedColumn, StoredVector};
 
     /// A bare column or parameter of a projection over one bound row, shared rather than computed.
     pub(crate) fn bound_column(expr: &Expr, schema: &Schema, columns: &[Column], parameters: &[Column]) -> Option<Column> {
@@ -6437,6 +6625,8 @@ pub(crate) mod projection {
             }
             Expr::Field { .. } => match shared_field_path(expr, schema, batch, memory) {
                 Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => Ok(None),
+                Ok(Some((column, owner))) if selected_decimal_cells_valid(&column) => Ok(Some((column, owner))),
+                Ok(_) => Ok(None),
                 result => result,
             },
             Expr::Struct(fields) if direct_struct(fields, schema, batch) => {
@@ -6482,23 +6672,24 @@ pub(crate) mod projection {
     }
 
     pub(super) fn computed_record(
-        expr: &Expr, schema: &Schema, batch: &ColumnBatch, parameters: rtdb_expr::Parameters<'_>, memory: &Arc<MemoryBudget>,
+        expr: &Expr, schema: &Schema, batch: &ColumnBatch, parameters: rtdb_expr::Parameters<'_>, context: &crate::QueryContext,
     ) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
-        match try_record(expr, schema, batch, parameters, memory) {
+        match try_record(expr, schema, batch, parameters, context) {
             Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => Ok(None),
             result => result,
         }
     }
 
     fn try_record(
-        expr: &Expr, schema: &Schema, batch: &ColumnBatch, parameters: rtdb_expr::Parameters<'_>, memory: &Arc<MemoryBudget>,
+        expr: &Expr, schema: &Schema, batch: &ColumnBatch, parameters: rtdb_expr::Parameters<'_>, context: &crate::QueryContext,
     ) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
         if batch.len == 0 { return Ok(None); }
+        let memory = &context.memory;
         let (fields, row_copy) = match expr {
             Expr::Struct(fields) if !fields.is_empty() => (fields.len(), false),
             Expr::RowCopy(fields) if !fields.is_empty() => (fields.len(), true),
             Expr::Field { expr: parent, name, .. } if matches!(parent.as_ref(), Expr::Struct(_) | Expr::Field { .. }) => {
-                let Some((parent, owner)) = try_record(parent, schema, batch, parameters, memory)? else { return Ok(None); };
+                let Some((parent, owner)) = try_record(parent, schema, batch, parameters, context)? else { return Ok(None); };
                 let result = shared_field(&parent, name, &owner, memory)?;
                 return Ok(result.filter(|(column, _)| super::validate_kernel_projection(expr, column).is_ok()));
             }
@@ -6519,7 +6710,7 @@ pub(crate) mod projection {
         };
         match expr {
             Expr::Struct(fields) => for (name, expr) in fields {
-                let Some((column, owner)) = record_input(expr, schema, batch, parameters, memory)? else { return Ok(None); };
+                let Some((column, owner)) = record_input(expr, schema, batch, parameters, context)? else { return Ok(None); };
                 if !add(name.as_str(), column, owner) { return Ok(None); }
             },
             Expr::RowCopy(fields) => for field in fields {
@@ -6537,8 +6728,9 @@ pub(crate) mod projection {
     }
 
     fn record_input(
-        expr: &Expr, schema: &Schema, batch: &ColumnBatch, parameters: rtdb_expr::Parameters<'_>, memory: &Arc<MemoryBudget>,
+        expr: &Expr, schema: &Schema, batch: &ColumnBatch, parameters: rtdb_expr::Parameters<'_>, context: &crate::QueryContext,
     ) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
+        let memory = &context.memory;
         match expr {
             Expr::Column { id, .. } => {
                 let Some(position) = schema.position(*id) else { return Ok(None); };
@@ -6546,16 +6738,16 @@ pub(crate) mod projection {
             }
             Expr::Field { .. } => {
                 let Some((column, owner)) = shared_column(expr, schema, batch, memory)? else {
-                    return try_record(expr, schema, batch, parameters, memory);
+                    return try_record(expr, schema, batch, parameters, context);
                 };
                 match column {
                     Column::Arrow { .. } => Ok(Some((column, owner))),
                     _ => record_vector(&column, &owner, batch.len, memory),
                 }
             }
-            Expr::Struct(_) => try_record(expr, schema, batch, parameters, memory),
+            Expr::Struct(_) => try_record(expr, schema, batch, parameters, context),
             Expr::Cast { expr, target: CastTarget::Fixed(target) } => {
-                let Some((column, owner)) = record_input(expr, schema, batch, parameters, memory)? else { return Ok(None); };
+                let Some((column, owner)) = record_input(expr, schema, batch, parameters, context)? else { return Ok(None); };
                 Ok(identity_cast(&column, target).then_some((column, owner)))
             }
             Expr::List(_) | Expr::Literal(_) => {
@@ -6572,6 +6764,14 @@ pub(crate) mod projection {
                 let Some(column) = super::functions::column(expr, schema, batch, parameters, memory).ok().flatten() else { return Ok(None); };
                 let owner = memory.reserve(super::owned_projection_bytes(&column)?)?;
                 Ok(Some((column, owner)))
+            }
+            Expr::Binary { op: rtdb_plan::BinaryOp::Concat, .. } => match super::concat::utf8_column(expr, schema, batch, context) {
+                Ok(column) => Ok(column),
+                Err(_) => { context.check_cancelled()?; Ok(None) }
+            },
+            Expr::Coalesce(_) | Expr::Call { .. } => {
+                let Some((column, owner)) = coalesce_selection(expr, schema, batch, memory)? else { return Ok(None); };
+                record_vector(&column, &owner, batch.len, memory)
             }
             _ => Ok(None),
         }
@@ -6615,7 +6815,7 @@ pub(crate) mod projection {
         }
     }
 
-    fn record_field(field: &ArrowField, decimals: bool) -> bool {
+    pub(super) fn record_field(field: &ArrowField, decimals: bool) -> bool {
         match field.data_type() {
             DataType::Null => field.is_nullable(),
             DataType::Struct(fields) => fields.iter().all(|field| record_field(field, decimals)),
@@ -6624,6 +6824,24 @@ pub(crate) mod projection {
             DataType::RunEndEncoded(..) => false,
             ty => decimals || rtdb_columnar::decimal_parameters(ty).is_none(),
         }
+    }
+
+    fn selected_decimal_cells_valid(column: &Column) -> bool {
+        let Column::Selected(selected) = column else { return true; };
+        let mut decimal = false;
+        for (_, field, _) in selected.source_layouts() {
+            if rtdb_columnar::decimal_parameters(field.data_type()).is_some() {
+                decimal = true;
+            } else if !record_field(field, false) {
+                return false;
+            }
+        }
+        if !decimal { return true; }
+        (0..selected.cells.len()).all(|row| match column.arrow_cell(row) {
+            Some(Some((array, field, _, row))) => rtdb_columnar::ArrowCell { array, field, row }.validate_decimal_precision().is_ok(),
+            Some(None) => true,
+            None => false,
+        })
     }
 
     fn shared_field_path(
@@ -6664,7 +6882,7 @@ pub(crate) mod projection {
                         continue;
                     }
                     let Some((parent, child, field, logical)) = struct_child(array, field, logical, name) else { return Ok(None); };
-                    if !record_field(field, false) { return Ok(None); }
+                    if !record_field(field, true) { return Ok(None); }
                     let Some((Column::Arrow { array, field, logical }, charge)) =
                         funded_child(parent, child, field, logical, custody.as_ref().unwrap_or(owner), memory)? else { return Ok(None); };
                     sources.push(Some((array, field, logical, Some(charge))));
@@ -6923,7 +7141,7 @@ pub(crate) mod projection {
             _ => return Ok(None),
         };
         if batch.len == 0 { return Ok(None); }
-        let bytes = args.len().checked_mul(64).and_then(|bytes| bytes.checked_add(256)).ok_or_else(super::size_error)?;
+        let bytes = args.len().checked_mul(size_of::<ProjectionInput<'_>>()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(super::size_error)?;
         let Ok(_inputs) = memory.reserve(bytes) else { return Ok(None); };
         let mut inputs = Vec::with_capacity(args.len());
         fn layout(field: &ArrowField, logical: Option<&LogicalType>) -> bool {
@@ -6946,20 +7164,29 @@ pub(crate) mod projection {
         let mut needs_selection = false;
         let mut literal_tail = None;
         for arg in args {
-            let position = match arg {
+            let input = match arg {
                 Expr::Literal(Value::Null | Value::Undefined) => continue,
                 Expr::Literal(value) if literal(value) => { literal_tail = Some(value); break; }
-                Expr::Column { id, .. } => match schema.position(*id) { Some(position) => position, None => return Ok(None) },
+                Expr::Column { id, .. } => {
+                    let Some(position) = schema.position(*id) else { return Ok(None); };
+                    let column = &batch.columns[position];
+                    if let Column::Arrow { field, logical, .. } = column {
+                        let data_type = field.data_type();
+                        let physical_and_scalar = (data_type, logical.as_ref().and_then(super::plain_scalar));
+                        needs_selection |= !super::scalar_layout(data_type) || *direct_layout.get_or_insert(physical_and_scalar) != physical_and_scalar;
+                    }
+                    ProjectionInput::Stored(column, batch.column_reservation(position))
+                }
+                Expr::Field { .. } => {
+                    let Some((column, owner)) = shared_column(arg, schema, batch, memory)? else { return Ok(None); };
+                    needs_selection = true;
+                    ProjectionInput::Computed(column, owner)
+                }
                 _ => return Ok(None),
             };
-            let column = &batch.columns[position];
+            let (column, _) = input.parts();
             let compatible = match column {
-                Column::Arrow { field, logical, .. } => {
-                    let data_type = field.data_type();
-                    let physical_and_scalar = (data_type, logical.as_ref().and_then(super::plain_scalar));
-                    needs_selection |= !super::scalar_layout(data_type) || *direct_layout.get_or_insert(physical_and_scalar) != physical_and_scalar;
-                    layout(field, logical.as_ref())
-                }
+                Column::Arrow { field, logical, .. } => layout(field, logical.as_ref()),
                 Column::Selected(column) => {
                     needs_selection = true;
                     column.source_layouts().all(|(_, field, logical)| layout(field, logical))
@@ -6967,7 +7194,7 @@ pub(crate) mod projection {
                 Column::Values(_) => false,
             };
             if !compatible { return Ok(None); }
-            inputs.push((column, batch.column_reservation(position)));
+            inputs.push(input);
         }
         if !needs_selection { return Ok(None); }
         let tail = if let Some(value) = literal_tail {
@@ -6978,7 +7205,8 @@ pub(crate) mod projection {
                 .shrink_to(super::owned_projection_bytes(&column)?)?;
             Some((column, owner))
         } else { None };
-        let picks = (0..batch.len).map(|row| inputs.iter().find_map(|&(column, charge)| {
+        let picks = (0..batch.len).map(|row| inputs.iter().find_map(|input| {
+            let (column, charge) = input.parts();
             let (array, field, _, offset) = column.arrow_cell(row)??;
             (super::arrow_cell_is_null(field, array, offset) == Some(false)).then_some((column, charge, row))
         }).or_else(|| tail.as_ref().map(|(column, charge)| (column, charge, 0))));
