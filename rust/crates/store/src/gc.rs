@@ -4,7 +4,7 @@ use rtdb_format::journal::{Checkpoint, ObjectId, ObjectKind, Pin, Record};
 use rtdb_types::{Anomaly, Result};
 use uuid::Uuid;
 
-use crate::{ObjectKey, ObjectStore, VerifiedManifest, objects::require_kind};
+use crate::{ObjectKey, ObjectStore, VerifiedManifest, objects::{key, require_kind}};
 
 /// The complete retained storage closure captured by the current writer or leader.
 pub struct Reachability {
@@ -116,6 +116,7 @@ impl Reachability {
                 | Record::Recovered { .. }
                 | Record::Commissioned
                 | Record::StorePurgeFloor { .. }
+                | Record::StorePurgeReclaim { .. }
                 | Record::KeyRotate { .. }
                 | Record::KeyRetirement { .. }
                 | Record::Settle { .. }
@@ -167,11 +168,37 @@ impl Reachability {
 
     /// Plan against an inventory of canonical keys. Incomplete inventory defers orphan cleanup.
     pub fn plan_gc<'a>(&self, listed: impl IntoIterator<Item = &'a ObjectKey>) -> GcPlan {
+        self.plan(listed, |id| id.epoch < self.epoch)
+    }
+
+    /// Same-epoch candidates are the exact checkpoints superseded by a certified trim.
+    pub fn plan_store_history_gc<'a>(
+        &self,
+        listed: impl IntoIterator<Item = &'a ObjectKey>,
+        retired_checkpoints: &BTreeSet<ObjectId>,
+    ) -> Result<GcPlan> {
+        let mut keys: BTreeSet<_> = self.plan(listed, |id| id.kind == ObjectKind::Manifest && id.epoch < self.epoch)
+            .keys.into_iter().collect();
+        for &id in retired_checkpoints {
+            if id.database == self.database && id.epoch == self.epoch && id.kind == ObjectKind::Manifest
+                && !self.contains(id)
+            {
+                keys.insert(key(id)?);
+            }
+        }
+        Ok(GcPlan { keys: keys.into_iter().collect() })
+    }
+
+    fn plan<'a>(
+        &self,
+        listed: impl IntoIterator<Item = &'a ObjectKey>,
+        eligible: impl Fn(ObjectId) -> bool,
+    ) -> GcPlan {
         let keys: BTreeSet<_> = listed
             .into_iter()
             .filter_map(|key| {
                 let id = key.as_str().parse::<ObjectId>().ok()?;
-                (id.database == self.database && id.epoch < self.epoch && !self.contains(id))
+                (id.database == self.database && eligible(id) && !self.contains(id))
                     .then(|| key.clone())
             })
             .collect();

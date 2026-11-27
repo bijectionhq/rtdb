@@ -6,7 +6,7 @@ use super::{ObjectKind, invalid, require_kind};
 
 #[derive(Message)]
 pub(super) struct Record {
-    #[prost(oneof = "Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15")]
+    #[prost(oneof = "Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16")]
     kind: Option<Kind>,
 }
 
@@ -42,6 +42,8 @@ enum Kind {
     Commissioned(Commissioned),
     #[prost(message, tag = "15")]
     StorePurgeFloor(StorePurgeFloor),
+    #[prost(message, tag = "16")]
+    StorePurgeReclaim(StorePurgeFloor),
 }
 
 #[derive(Message)]
@@ -210,6 +212,10 @@ impl TryFrom<&super::Record> for Record {
                 since: since.to_bytes().to_vec(),
                 keep_from: *keep_from,
             }),
+            StorePurgeReclaim { since, keep_from } => Kind::StorePurgeReclaim(self::StorePurgeFloor {
+                since: since.to_bytes().to_vec(),
+                keep_from: *keep_from,
+            }),
         };
         Ok(Self { kind: Some(kind) })
     }
@@ -276,6 +282,11 @@ impl TryFrom<Record> for super::Record {
                 },
                 Kind::Commissioned(_) => Self::Commissioned,
                 Kind::StorePurgeFloor(floor) => Self::StorePurgeFloor {
+                    since: Basis::from_bytes(&floor.since)
+                        .map_err(|_| invalid("The store purge floor has an invalid basis"))?,
+                    keep_from: floor.keep_from,
+                },
+                Kind::StorePurgeReclaim(floor) => Self::StorePurgeReclaim {
                     since: Basis::from_bytes(&floor.since)
                         .map_err(|_| invalid("The store purge floor has an invalid basis"))?,
                     keep_from: floor.keep_from,

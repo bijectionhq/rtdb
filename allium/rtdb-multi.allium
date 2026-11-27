@@ -1089,7 +1089,9 @@ contract EpochScopedStorage {
     @invariant PermanentUnreachability
         -- In Multi mode the writer captures all retained records through a committed head after sealing.
         -- In default mode the confirmed leader supplies the retained checkpoint, replica records, pins and inputs of admitted reads and compaction under its term.
-        -- It deletes only database objects from earlier epochs outside the closure of the retained records, checkpoints and pins.
+        -- The collector deletes database objects from earlier epochs outside the closure of the retained records, checkpoints and pins.
+        -- After a certified trim through a checkpoint covering the authorized store floor, the Multi writer may also delete the exact manifests of superseded checkpoints outside that closure.
+        -- A replica that raced the trim loads the replacement base and applies its retained suffix.
         -- Publication inherits earlier-epoch references from the current committed closure and introduces new objects from the current epoch.
         -- A delayed delete targets the same key and that key stays unreachable after handoff.
         -- An incomplete reference closure defers collection.

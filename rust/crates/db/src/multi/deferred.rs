@@ -50,6 +50,7 @@ pub struct PreparedCheckpoint {
     generation: u64,
     through: Lsn,
     coordinates: JournalCoordinates,
+    store_history_floor: u64,
     manifest: ObjectId,
 }
 
@@ -83,6 +84,7 @@ impl CheckpointBuilder {
         // runtime's worker threads.
         let (transactions, until, coordinates, store_purge_floor, binary) =
             (capture.transactions, capture.lease.until, capture.coordinates, capture.store_purge_floor, capture.binary);
+        let store_history_floor = transactions.index().store_history_floor();
         let payload = tokio::task::spawn_blocking(move || {
             Committed::checkpoint_payload_in(&transactions, until, false, coordinates, store_purge_floor, binary)
         })
@@ -104,6 +106,7 @@ impl CheckpointBuilder {
             generation: capture.generation,
             through: capture.through,
             coordinates: capture.coordinates,
+            store_history_floor,
             manifest: image.id(),
         })
     }
@@ -194,7 +197,7 @@ impl MultiDatabase {
         self.append_control(lease, Record::Checkpoint(checkpoint)).await?;
         timing.mark("append");
         let announced = self.state().head;
-        self.trim_to_base(lease, announced, prepared.lease.until).await?;
+        self.trim_to_base(lease, announced, prepared.lease.until, prepared.store_history_floor).await?;
         timing.mark("trim");
         timing.report_phase("deferred_announce", self.options.database, 0, prepared.through);
         Ok(Announcement::Announced(prepared.manifest))

@@ -13,8 +13,8 @@ use rtdb_tx::transact::{
     COUNT_RANGE_CONSTRAINT, Decision, GROUPED_COUNT_CONSTRAINT, LINEARIZABLE, PHYSICAL_ERASURE, RELATIVE_VALID_TIME, Receipt, ScopedTransact, TIMED_TRANSACT, TRANSACT_REQUIRES, Terminal, Transact,
     TransactPipeline, TransactState, TransactionRecord, TxKey, ROW_CUSTODY, prepare_custody, workload,
 };
-use rtdb_index::branches::BranchCut;
-use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::{Basis, ClaimVerifier, LabelScope}};
+use rtdb_index::branches::{BranchCut, store::KeyRange};
+use rtdb_types::{Anomaly, AnomalyCategory, MemoryReservation, Result, Timestamp, rtdb_v1::{Basis, ClaimVerifier, LabelScope}};
 use tokio::{
     sync::{Mutex, OnceCell, mpsc, oneshot},
     task::JoinHandle,
@@ -57,6 +57,13 @@ enum Command {
         inventory: Vec<u8>,
         files: Vec<bytes::Bytes>,
         memory: Arc<rtdb_types::MemoryBudget>,
+        reply: Reply<()>,
+    },
+    PublishStorePurgeFloor {
+        since: Basis,
+        keep_from: u64,
+        reads: Vec<KeyRange>,
+        request_memory: Arc<MemoryReservation>,
         reply: Reply<()>,
     },
     BoundJournal { limit: u64, reply: Reply<Option<rtdb_format::journal::ObjectId>> },
@@ -118,6 +125,13 @@ pub struct WritePipeline {
 }
 
 impl WritePipeline {
+    /// Keeps an admitted publication in the writer's queue after the caller drops its reply.
+    pub async fn publish_store_purge_floor(
+        &self, since: Basis, keep_from: u64, reads: Vec<KeyRange>, request_memory: Arc<MemoryReservation>,
+    ) -> Result<()> {
+        self.request(|reply| Command::PublishStorePurgeFloor { since, keep_from, reads, request_memory, reply }).await
+    }
+
     pub async fn publish_ranked_catalog(
         &self, build: super::RankedBuild, inventory: Vec<u8>, files: Vec<bytes::Bytes>,
         memory: Arc<rtdb_types::MemoryBudget>,
@@ -406,10 +420,20 @@ async fn run(
                 let result = Box::pin(async { database.lock().await.publish_ranked_catalog(build, inventory, files, &memory).await }).await;
                 let _ = reply.send(result);
             }
+            Command::PublishStorePurgeFloor { since, keep_from, reads, request_memory: _request_memory, reply } => {
+                let result = Box::pin(async {
+                    database.lock().await.publish_store_purge_floor(since, keep_from, &reads).await
+                }).await;
+                let _ = reply.send(result);
+            }
             Command::BoundJournal { limit, reply } => {
                 let mut guard = database.lock().await;
                 if !guard.deferred_checkpoints() {
                     let result = Box::pin(guard.checkpoint_retained_suffix(limit)).await;
+                    let result = match result {
+                        Ok(checkpoint) => guard.reclaim_store_checkpoint_manifests().await.map(|()| checkpoint),
+                        Err(error) => Err(error),
+                    };
                     answer_checkpoint(reply, result);
                 } else if building {
                     answer_checkpoint(reply, Ok(None));
@@ -435,7 +459,8 @@ async fn run(
                                 }
                             });
                         }
-                        result => answer_checkpoint(reply, result.map(|_| None)),
+                        Ok(None) => answer_checkpoint(reply, guard.reclaim_store_checkpoint_manifests().await.map(|()| None)),
+                        Err(error) => answer_checkpoint(reply, Err(error)),
                     }
                 }
             }
@@ -443,8 +468,10 @@ async fn run(
                 building = false;
                 let result = match prepared {
                     Ok(prepared) => Box::pin(async {
-                        database.lock().await.announce_checkpoint(prepared).await
-                            .map(super::deferred::Announcement::manifest)
+                        let mut database = database.lock().await;
+                        let checkpoint = database.announce_checkpoint(prepared).await?;
+                        database.reclaim_store_checkpoint_manifests().await?;
+                        Ok(checkpoint.manifest())
                     }).await,
                     Err(error) => Err(error),
                 };
@@ -1077,6 +1104,10 @@ impl MultiDatabase {
     ) -> Result<Vec<Receipt>> {
         let through = writes.last().expect("nonempty append group").at;
         let reload = writes.iter().any(|write| reload_writer_fold(&write.entry.record));
+        let store_purge_floor = writes.iter().find_map(|write| match &write.entry.record {
+            Record::StorePurgeReclaim { keep_from, .. } => Some(*keep_from),
+            _ => None,
+        });
         if self.committed.is_none() {
             self.catch_up(through).await?;
         }
@@ -1102,6 +1133,9 @@ impl MultiDatabase {
             writer.pipeline = pipeline;
             writer.acknowledged = through;
             return Ok(Vec::new());
+        }
+        if let Some(keep_from) = store_purge_floor {
+            writer.pipeline.durable_mut().reclaim_store_history(keep_from);
         }
         match writer.pipeline.acknowledge(coordinates.position(through)?) {
             Ok(receipts) => {
@@ -1207,6 +1241,10 @@ impl MultiDatabase {
                 Record::Refuse { tx_lsn } => {
                     let bytes = TransactionRecord::Refuse { tx_lsn: coordinates.position(Lsn(*tx_lsn))? }.encode()?;
                     Some(writer.pipeline.recover(logical, &bytes))
+                }
+                Record::StorePurgeReclaim { keep_from, .. } => {
+                    writer.pipeline.durable_mut().reclaim_store_history(*keep_from);
+                    None
                 }
                 _ => None,
             };

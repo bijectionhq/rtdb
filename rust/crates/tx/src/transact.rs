@@ -550,6 +550,7 @@ const RECORD_VERSION: u8 = 6;
 const FUNDED_RECORD_VERSION: u8 = 7;
 const APPOINTMENT_RECORD_VERSION: u8 = 8;
 const MANAGED_APPOINTMENT_RECORD_VERSION: u8 = 9;
+const PRUNED_STORE_CHECKPOINT_VERSION: u8 = 10;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum TransactionRecord {
@@ -759,6 +760,10 @@ impl TransactState {
     }
 
     pub fn index(&self) -> &BranchIndex { &self.index }
+
+    pub fn reclaim_store_history(&mut self, keep_from: u64) {
+        self.index.reclaim_store_history(keep_from);
+    }
 
     pub fn replace_applied_index(&mut self, index: BranchIndex) -> Result<()> {
         if self.pending.is_some() || index.head().basis.incarnation() != self.index.head().basis.incarnation()
@@ -1014,8 +1019,15 @@ impl TransactState {
             if stored.receipt.basis <= cut { return Some(Cow::Borrowed(stored)); }
             stored.receipt.decision_clock?.appointment_checkpoint(stored, cut).map(Cow::Owned)
         }).collect::<Vec<_>>();
-        let version = receipts.iter().map(|stored| stored.receipt.record_version(stored.receipt_namespace)).max().unwrap_or(RECORD_VERSION);
+        let version = Self::checkpoint_version(index, receipts.iter().map(|receipt| receipt.as_ref()));
         (version, receipts)
+    }
+
+    fn checkpoint_version<'a>(index: &BranchIndex, receipts: impl Iterator<Item = &'a StoredReceipt>) -> u8 {
+        if index.store_history_floor() != 0 {
+            return PRUNED_STORE_CHECKPOINT_VERSION;
+        }
+        receipts.map(|stored| stored.receipt.record_version(stored.receipt_namespace)).max().unwrap_or(RECORD_VERSION)
     }
 
     /// The checkpoint of [`Self::encode_checkpoint`] in CBOR instead of JSON:
@@ -1043,7 +1055,8 @@ impl TransactState {
 
     fn from_checkpoint(version: u8, index: BranchIndex, receipts: Vec<StoredReceipt>, expected: BranchCut) -> Result<Self> {
         let invalid = || Anomaly::fault("rtdb/transaction-checkpoint", "Checkpoint does not match the expected cut");
-        if version != receipts.iter().map(|stored| stored.receipt.record_version(stored.receipt_namespace)).max().unwrap_or(RECORD_VERSION)
+        if version != Self::checkpoint_version(&index, receipts.iter())
+            || index.store_history_floor() > expected.basis.position()
             || index.head() != expected || index.exact(expected.basis)? != expected
         {
             return Err(invalid());

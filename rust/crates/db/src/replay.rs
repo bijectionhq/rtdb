@@ -253,6 +253,7 @@ pub(crate) struct Committed {
     pub(crate) rotation: Option<Rotation>,
     pub(crate) coordinates: JournalCoordinates,
     pub(crate) store_purge_floor: u64,
+    pub(crate) checkpointed_store_history_floor: u64,
     /// The latest retained recovery record.
     pub(crate) recovery: Option<JournalRecovery>,
     /// The epoch of the latest recovery this state includes, from a
@@ -281,6 +282,7 @@ impl Committed {
             rotation: None,
             coordinates: JournalCoordinates::default(),
             store_purge_floor: 0,
+            checkpointed_store_history_floor: 0,
             recovery: None,
             recovery_epoch: 0,
             prior_recovery_epoch: 0,
@@ -304,6 +306,9 @@ impl Committed {
         previous: Option<Self>,
     ) -> std::result::Result<Self, ReplayError> {
         match Self::read_prefix(stream, store, end, previous).await {
+            Err(ReplayError::Failed { error, .. }) if error.is(rtdb_types::AnomalyKind::MissingObject) => {
+                Self::read_prefix(stream, store, end, None).await
+            }
             Err(ReplayError::Failed { error, resume }) if error.code == "rtdb/erased-under-view" => {
                 let cut = match find_clean_checkpoint(stream, end).await {
                     Ok(Some(cut)) => cut,
@@ -631,8 +636,11 @@ impl Committed {
                 }
                 self.generation
             }
-            Record::StorePurgeFloor { since, keep_from } => {
-                if *keep_from <= self.store_purge_floor
+            Record::StorePurgeFloor { since, keep_from } | Record::StorePurgeReclaim { since, keep_from } => {
+                let reclaim = matches!(&entry.record, Record::StorePurgeReclaim { .. });
+                let index = self.transactions.index();
+                let advances = *keep_from > self.store_purge_floor || reclaim && *keep_from > index.store_history_floor();
+                if !advances
                     || self.lease.map(|(epoch, _)| epoch) != Some(entry.epoch)
                     || entry.generation != self.generation
                     || self.transactions.recover_pending().is_some()
@@ -640,10 +648,12 @@ impl Committed {
                 {
                     return Err(invalid("The store purge floor must advance at a settled writer cut"));
                 }
-                let index = self.transactions.index();
                 index.check_store_purge_guards(*since, *keep_from, &[])?;
                 index.check_store_purge_branch_retention(*keep_from)?;
-                self.store_purge_floor = *keep_from;
+                if reclaim {
+                    self.transactions.reclaim_store_history(*keep_from);
+                }
+                self.store_purge_floor = self.store_purge_floor.max(*keep_from);
                 self.generation
             }
             Record::KeyRotate { generation, at } => {
@@ -751,6 +761,15 @@ impl Committed {
             return Err(invalid("The journal position does not announce a retained checkpoint"));
         };
         Ok(ReplayBase { announced, checkpoint: checkpoint.clone() })
+    }
+
+    pub(crate) fn checkpoint_manifests_through(&self, through: Lsn) -> BTreeSet<ObjectId> {
+        let count = through.0.saturating_add(1).saturating_sub(self.floor.0) as usize;
+        let manifests = self.records.iter().take(count).filter_map(|record| match record {
+            Record::Checkpoint(checkpoint) => Some(checkpoint.manifest),
+            _ => None,
+        });
+        self.base.iter().map(|base| base.checkpoint.manifest).chain(manifests).collect()
     }
 
     /// Installs a checkpoint of every record through `self.head`. A classic or
@@ -892,6 +911,7 @@ impl Committed {
         } else {
             TransactState::decode_checkpoint(bytes, expected)?
         };
+        self.checkpointed_store_history_floor = self.transactions.index().store_history_floor();
         self.store_purge_floor = store_purge_floor;
         self.lease = Some((epoch, until));
         Ok(())
@@ -992,7 +1012,7 @@ impl Committed {
     /// again. The result is the state a fresh replay from `floor` installs:
     /// the transaction state is unchanged, and the lease, release and rotation
     /// are those the base installs unless a retained record set them.
-    pub(crate) fn advance_floor(&mut self, base: ReplayBase, until: i64, epoch: Epoch) -> bool {
+    pub(crate) fn advance_floor(&mut self, base: ReplayBase, until: i64, epoch: Epoch, store_history_floor: u64) -> bool {
         let floor = Lsn(base.checkpoint.through + 1);
         if floor <= self.floor || floor > next(self.head).unwrap_or(self.head) || base.announced < floor
             || base.announced > self.head || self.rotation.is_some() || self.retired.is_some()
@@ -1007,6 +1027,7 @@ impl Committed {
         self.effects.retain(|group| group.cut.basis.position() >= position);
         self.floor = floor;
         self.base = Some(base);
+        self.checkpointed_store_history_floor = store_history_floor;
         if self.recovery.is_some_and(|recovery| recovery.at < floor) {
             self.recovery = None;
         }

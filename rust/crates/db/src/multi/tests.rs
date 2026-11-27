@@ -442,7 +442,7 @@ async fn store_purge_floor_replays_through_deferred_and_classic_checkpoints() {
     assert!(matches!(writer.tick(&live(1)).await.unwrap(), Role::Writer(_)));
     let publication = writer.state().head;
     assert_eq!(writer.state().transactions.index().head().basis, second);
-    assert_eq!(first_record(&writer, publication).await, Record::StorePurgeFloor {
+    assert_eq!(first_record(&writer, publication).await, Record::StorePurgeReclaim {
         since: second, keep_from: second.position(),
     });
     writer.publish_store_purge_floor(second, second.position(), &[]).await.unwrap();
@@ -453,23 +453,118 @@ async fn store_purge_floor_replays_through_deferred_and_classic_checkpoints() {
     let mut reader = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY)));
     reader.fresh_index().await.unwrap();
     assert_eq!(reader.state().store_purge_floor, second.position());
+    assert_eq!(reader.state().checkpointed_store_history_floor, first.position());
 
     let pin = Uuid::from_u128(9);
-    writer.pin_checkpoint_at(pin, first, None).await.unwrap();
+    assert_eq!(writer.pin_checkpoint_at(pin, first, None).await.unwrap_err().code, "rtdb/cursor-expired");
+    writer.pin_checkpoint_at(pin, second, None).await.unwrap();
     let mut writer = writer.with_binary_checkpoints(false);
     writer.checkpoint(Vec::new()).await.unwrap();
     assert!(writer.retained_floor().unwrap() > publication);
     let mut reader = cluster.node(3, Arc::new(journal.handle(NODE_3_IDENTITY)));
     assert_eq!(reader.fresh_index().await.unwrap().exact(first).unwrap().basis, first);
     assert_eq!(reader.state().store_purge_floor, second.position());
+    assert_eq!(reader.state().checkpointed_store_history_floor, second.position());
     let export = reader.open_export(pin).await.unwrap();
     let destination = Uuid::from_u128(7);
     let mut restored = cluster.node_for(destination, 2, Arc::new(journal.handle(NODE_2_IDENTITY)));
     restored.create().await.unwrap();
     restored.tick(&live(2)).await.unwrap();
     let cut = restored.restore_export(&export).await.unwrap();
-    assert_eq!(cut.basis, Basis::new(*destination.as_bytes(), first.position()));
+    assert_eq!(cut.basis, Basis::new(*destination.as_bytes(), second.position()));
     assert_eq!(restored.state().store_purge_floor, 0);
+    assert_eq!(restored.fresh_index().await.unwrap().store_history_floor(), second.position());
+}
+
+#[tokio::test]
+async fn permission_only_store_floor_can_be_reclaimed_by_an_authorized_retry() {
+    let journal = journals().await;
+    let cluster = Cluster::new();
+    let mut writer = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
+    writer.create().await.unwrap();
+    writer.tick(&live(1)).await.unwrap();
+    let old = writer.transact(&store_write(1, b"a", Some(b"old"))).await.unwrap().basis;
+    let current = writer.transact(&store_write(2, b"a", Some(b"current"))).await.unwrap().basis;
+    let lease = writer.authority().unwrap();
+    writer.append_control(lease, Record::StorePurgeFloor { since: current, keep_from: current.position() }).await.unwrap();
+    let pin = writer.pin_checkpoint_at(Uuid::from_u128(5), old, None).await.unwrap();
+    writer.checkpoint(Vec::new()).await.unwrap();
+
+    let mut successor = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY)));
+    cluster.at(200);
+    successor.tick(&live(2)).await.unwrap();
+    let index = successor.fresh_index().await.unwrap();
+    let view = index.view(MAIN_BRANCH, At::Exactly(old), Layer::Merged, Timestamp(200)).unwrap();
+    assert_eq!(view.store_value(b"a").unwrap(), Some(b"old".as_slice()));
+    assert_eq!(successor.publish_store_purge_floor(current, current.position(), &[]).await.unwrap_err().code,
+        "rtdb.store/purge-pin");
+    successor.release_pin(pin.id).await.unwrap();
+    successor.publish_store_purge_floor(current, current.position(), &[]).await.unwrap();
+    assert_eq!(successor.fresh_index().await.unwrap().store_history_floor(), current.position());
+}
+
+#[tokio::test]
+async fn store_purge_keeps_boundary_values_receipts_and_recovery_roots() {
+    use rtdb_index::branches::store::{KeyRange, store_table};
+
+    let journal = journals().await;
+    let cluster = Cluster::new();
+    let mut writer = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
+    writer.create().await.unwrap();
+    writer.tick(&live(1)).await.unwrap();
+    let old_write = store_write(1, b"key", Some(b"superseded"));
+    let old = writer.transact(&old_write).await.unwrap().basis;
+    let untouched = writer.transact(&store_write(2, b"untouched", Some(b"anchor"))).await.unwrap().basis;
+    let file = writer.write_file(b"unrelated").await.unwrap();
+    let obsolete = writer.checkpoint(Vec::new()).await.unwrap();
+    let boundary = writer.transact(&store_write(3, b"key", Some(b"replacement"))).await.unwrap().basis;
+    let newest = writer.transact(&store_write(4, b"key", None)).await.unwrap().basis;
+    let keys = KeyRange { start: b"key".to_vec(), end: Some(b"kez".to_vec()) };
+    writer.publish_store_purge_floor(newest, boundary.position(), std::slice::from_ref(&keys)).await.unwrap();
+
+    let check = |index: &rtdb_index::branches::BranchIndex| {
+        let id = EntityId::Binary(b"key".to_vec());
+        let latest = index.view(MAIN_BRANCH, At::Latest, Layer::Merged, Timestamp(100)).unwrap();
+        assert!(latest.store_value(b"key").unwrap().is_none());
+        assert_eq!(latest.store_value(b"untouched").unwrap(), Some(b"anchor".as_slice()));
+        assert_eq!(latest.history(&store_table(), &id).iter().map(|event| event.cut.basis).collect::<Vec<_>>(),
+            vec![boundary, newest]);
+        assert_eq!(latest.store_written_since(&keys, boundary).unwrap().as_deref(), Some(b"key".as_slice()));
+        assert_eq!(latest.store_written_since(&keys, old).unwrap_err().code, "rtdb/cursor-expired");
+        let at_floor = index.view(MAIN_BRANCH, At::Exactly(boundary), Layer::Merged, Timestamp(100)).unwrap();
+        assert_eq!(at_floor.store_value(b"key").unwrap(), Some(b"replacement".as_slice()));
+        assert_eq!(index.exact(untouched).unwrap().basis, untouched);
+        assert!(index.view(MAIN_BRANCH, At::Exactly(old), Layer::Merged, Timestamp(100)).is_err());
+    };
+    check(&writer.fresh_index().await.unwrap());
+    let mut replica = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY)));
+    check(&replica.fresh_index().await.unwrap());
+    assert_eq!(replica.state().checkpointed_store_history_floor, 0);
+
+    assert_eq!(writer.pin_checkpoint(obsolete, None).await.unwrap_err().code, "rtdb/cursor-expired");
+    let pin = writer.pin_checkpoint_at(Uuid::from_u128(9), boundary, None).await.unwrap();
+    let capture = writer.capture_checkpoint(1).await.unwrap().unwrap();
+    let orphan = writer.checkpoint_builder().build(capture).await.unwrap().manifest();
+    let retained = writer.checkpoint(Vec::new()).await.unwrap();
+    writer.pin_checkpoint(retained, None).await.unwrap();
+    writer.reclaim_store_checkpoint_manifests().await.unwrap();
+    assert!(read_manifest(writer.store.as_ref(), writer.stream.kms.as_ref(), obsolete).await
+        .is_err_and(|error| error.is(rtdb_types::AnomalyKind::MissingObject)));
+    assert!(read_manifest(writer.store.as_ref(), writer.stream.kms.as_ref(), orphan).await.is_ok());
+    cluster.at(200);
+    assert!(matches!(replica.tick(&live(2)).await.unwrap(), Role::Writer(_)));
+    let database = Arc::new(tokio::sync::Mutex::new(replica));
+    let writes = WritePipeline::start(Arc::clone(&database));
+    assert!(writes.bound_journal(u64::MAX).await.unwrap().is_none());
+
+    let mut replica = database.lock().await;
+    check(&replica.fresh_index().await.unwrap());
+    assert!(replica.transact(&old_write).await.unwrap().replayed);
+    assert!(read_manifest(replica.store.as_ref(), replica.stream.kms.as_ref(), orphan).await
+        .is_err_and(|error| error.is(rtdb_types::AnomalyKind::MissingObject)));
+    assert!(read_manifest(replica.store.as_ref(), replica.stream.kms.as_ref(), retained).await.is_ok());
+    assert!(replica.open_export(pin.id).await.is_ok());
+    assert!(rtdb_store::read_file(replica.store.as_ref(), replica.stream.kms.as_ref(), file).await.is_ok());
 }
 
 #[tokio::test]
@@ -501,6 +596,38 @@ async fn store_purge_floor_append_is_fenced_after_admission() {
     assert_eq!(successor.publish_store_purge_floor(basis, basis.position(), &reads).await.unwrap_err().code,
         "rtdb.store/purge-guard");
     assert_eq!(successor.state().store_purge_floor, 0);
+}
+
+#[tokio::test]
+async fn queued_store_purge_keeps_its_slot_when_the_caller_drops_the_reply() {
+    use rtdb_index::branches::store::KeyRange;
+
+    let journal = journals().await;
+    let cluster = Cluster::new();
+    let gate = Arc::new(GateJournal::new(Arc::new(journal.handle(NODE_1_IDENTITY))));
+    let mut writer = cluster.node(1, gate.clone());
+    writer.create().await.unwrap();
+    writer.tick(&live(1)).await.unwrap();
+    let basis = writer.transact(&store_write(1, b"a", Some(b"value"))).await.unwrap().basis;
+    let database = Arc::new(Mutex::new(writer));
+    let writes = WritePipeline::start(Arc::clone(&database));
+    let memory = rtdb_types::MemoryBudget::new(4096);
+    let reservation = memory.try_reserve(4096).unwrap();
+    let reads = vec![KeyRange { start: b"a".to_vec(), end: Some(b"b".to_vec()) }];
+
+    gate.arm.store(true, Ordering::SeqCst);
+    let mut publish = Box::pin(writes.publish_store_purge_floor(basis, basis.position(), reads, reservation));
+    tokio::select! {
+        result = &mut publish => panic!("the floor returned before its append: {result:?}"),
+        reached = tokio::time::timeout(Duration::from_secs(2), gate.entered.notified()) => reached.unwrap(),
+    }
+    drop(publish);
+    assert!(memory.try_reserve(1).is_none());
+    gate.release.notify_one();
+    let next = writes.transact(store_write(2, b"b", Some(b"next"))).await.unwrap().basis;
+    assert_eq!(next.position(), basis.position() + 2);
+    assert_eq!(database.lock().await.state().store_purge_floor, basis.position());
+    assert!(memory.try_reserve(4096).is_some());
 }
 
 async fn text_at(node: &mut MultiDatabase, branch: &str, id: i64) -> Option<Value> {
@@ -3094,7 +3221,7 @@ async fn immutable_trim_requires_the_exact_committed_checkpoint() {
     assert_eq!(reopened.stream.trim(lease.epoch, proof).await, Err(JournalError::Unsupported));
     assert_eq!(writer.stream.read_through(Lsn(1), announced).await.unwrap().floor, Lsn(1));
 
-    writer.trim_to_base(lease, announced, lease.until).await.unwrap();
+    writer.trim_to_base(lease, announced, lease.until, 0).await.unwrap();
     assert_eq!(writer.state().floor, next(through).unwrap());
     assert_eq!(reopened.tx_status(&before_cut.key).await.unwrap().basis, before_receipt.basis);
     assert_eq!(reopened.tx_status(&after_cut.key).await.unwrap().basis, after_receipt.basis);

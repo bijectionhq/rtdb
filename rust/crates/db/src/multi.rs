@@ -129,6 +129,8 @@ struct Writer {
     rotation: Option<ArmedRotation>,
     objects: WriterObjects,
     uploaded: BTreeSet<ObjectId>,
+    reclaimed_store_history_through: Option<Lsn>,
+    retired_store_checkpoints: BTreeSet<ObjectId>,
 }
 
 /// One serialized database residence. The owner drives ticks and serving calls.
@@ -395,6 +397,8 @@ impl MultiDatabase {
                 rotation: None,
                 objects: WriterObjects::new(self.options.database, attempt.epoch.0),
                 uploaded: BTreeSet::new(),
+                reclaimed_store_history_through: None,
+                retired_store_checkpoints: BTreeSet::new(),
             });
             if let Err(error) = self.finish_pending_erasure().await {
                 self.withdraw_writer();
@@ -736,10 +740,12 @@ impl MultiDatabase {
         self.refresh().await?;
         self.require_active()?;
         let state = self.state();
+        let index = self.durable_transactions().index();
         let after_floor = state.coordinates.position(Lsn(state.floor.0 - 1))?
-            .max(state.coordinates.origin.map_or(0, |origin| origin.through));
+            .max(state.coordinates.origin.map_or(0, |origin| origin.through))
+            .max(index.store_history_floor());
         Ok(ChangeHistory {
-            index: self.durable_transactions().index(),
+            index,
             after_floor,
             through: state.coordinates.position(state.head)?,
             generation: state.generation,
@@ -900,6 +906,7 @@ impl MultiDatabase {
             }
         }
         self.validate_files(&closure, &files)?;
+        let store_history_floor = self.durable_transactions().index().store_history_floor();
         let manifest = Manifest {
             files,
             pins: closure.pins().cloned().collect(),
@@ -935,7 +942,7 @@ impl MultiDatabase {
             .await?;
         timing.mark("append");
         let announced = self.state().head;
-        self.trim_to_base(lease, announced, lease.until).await?;
+        self.trim_to_base(lease, announced, lease.until, store_history_floor).await?;
         timing.mark("trim");
         timing.report(self.options.database, manifest.payload.len(), through);
         Ok(image.id())
@@ -956,6 +963,14 @@ impl MultiDatabase {
                 "rtdb/unreachable-manifest",
                 "The manifest is outside committed reachability",
             ));
+        }
+        let state = self.state();
+        let history_floor = state.transactions.index().store_history_floor();
+        if history_floor != 0 && (state.checkpointed_store_history_floor < history_floor
+            || state.base.as_ref().is_none_or(|base| base.checkpoint.manifest != manifest))
+        {
+            return Err(Anomaly::new(AnomalyCategory::NotFound, "rtdb/cursor-expired",
+                "The manifest has no retained store history coverage"));
         }
         pin::require_ordinary_pin(&read_manifest(self.store.as_ref(), self.stream.kms.as_ref(), manifest).await?)?;
         if until.is_some_and(|deadline| !self.before(deadline.0)) {
@@ -1073,11 +1088,19 @@ impl MultiDatabase {
     /// Trims through the cut of a checkpoint this writer announced, then keeps
     /// its replayed state over the new floor instead of replaying the
     /// checkpoint again.
-    async fn trim_to_base(&mut self, lease: Lease, announced: Lsn, until: i64) -> Result<()> {
+    async fn trim_to_base(&mut self, lease: Lease, announced: Lsn, until: i64, store_history_floor: u64) -> Result<()> {
         let base = self.state().checkpoint_at(announced)?;
+        let retired = if store_history_floor != 0 && self.state().store_purge_floor != 0 {
+            self.state().checkpoint_manifests_through(Lsn(base.checkpoint.through))
+        } else {
+            BTreeSet::new()
+        };
         self.trim_checkpoint(lease, &base).await?;
+        if let Some(writer) = self.writer.as_mut() {
+            writer.retired_store_checkpoints.extend(retired);
+        }
         if let Some(state) = self.committed.as_mut() {
-            state.advance_floor(base, until, lease.epoch);
+            state.advance_floor(base, until, lease.epoch, store_history_floor);
         }
         self.refresh().await
     }

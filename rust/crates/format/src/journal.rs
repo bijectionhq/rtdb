@@ -180,6 +180,10 @@ pub enum Record {
         since: Basis,
         keep_from: u64,
     },
+    StorePurgeReclaim {
+        since: Basis,
+        keep_from: u64,
+    },
 }
 
 impl Record {

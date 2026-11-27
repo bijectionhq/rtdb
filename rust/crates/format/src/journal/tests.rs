@@ -64,10 +64,19 @@ fn record_kinds_round_trip_with_fixed_tags() {
             since: Basis::new([0xab; 16], u64::MAX),
             keep_from: u64::MAX - 1,
         },
+        Record::StorePurgeReclaim {
+            since: Basis::new([0xab; 16], u64::MAX),
+            keep_from: u64::MAX - 1,
+        },
     ];
     for (i, record) in records.into_iter().enumerate() {
         let encoded = record.encode().unwrap();
-        assert_eq!(encoded[RECORD_HEADER.len()], ((i as u8 + 1) << 3) | 2);
+        let tag = ((i as u8 + 1) << 3) | 2;
+        if tag >= 128 {
+            assert_eq!(&encoded[RECORD_HEADER.len()..][..2], &[tag, 1]);
+        } else {
+            assert_eq!(encoded[RECORD_HEADER.len()], tag);
+        }
         assert_eq!(Record::decode(&encoded).unwrap(), record);
     }
 }
@@ -82,7 +91,7 @@ fn malformed_record_envelopes_are_refused() {
     assert!(Record::decode(&bytes).is_err());
 
     let mut unknown = RECORD_HEADER.to_vec();
-    unknown.extend_from_slice(&[0x82, 0x01, 0]);
+    unknown.extend_from_slice(&[0x8a, 0x01, 0]);
     assert!(Record::decode(&unknown).is_err());
     let mut missing_floor_basis = RECORD_HEADER.to_vec();
     missing_floor_basis.extend_from_slice(&[0x7a, 0]);

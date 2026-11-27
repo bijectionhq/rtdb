@@ -132,6 +132,15 @@ A failing bound records `Outcome::Refused` with `rtdb.store/bound` and its index
 The append's smoothed time is judged by `store_judge::admit` (the vendored `judge.rs`): outside the window it answers `outside`; otherwise a write-free append validates and any other commits with stamp `{ time, position }`.
 No pending timed v1 transaction blocks a store append, and no shared-main time floor raises one: each append settles at its own position.
 
+=== Multi history reclamation
+
+The Multi writer can order an exclusive history floor at a settled, guarded cut.
+An advancing request is refused while an ordered pin, scoped hold or surviving native branch ancestry protects the affected history.
+A successful reclaim authorization closes older cuts to new snapshots, range guards, watches, forks and exports.
+The retained fold preserves the byte value visible at the floor, newer events and exact append receipts.
+The normal checkpoint cycle publishes that fold and trims under the existing journal recovery rules.
+The writer can then collect superseded manifests outside the retained checkpoint, journal and pin closure.
+
 == Ordering ceiling and sharded resolution
 
 An installation's appends share one version line.

@@ -626,6 +626,7 @@ impl BranchView<'_> {
     /// This is the whole conflict condition of a store append.
     pub fn store_written_since(&self, range: &KeyRange, since: Basis) -> Result<Option<Vec<u8>>> {
         range.check()?;
+        self.index.require_store_history(since)?;
         let table = store_table();
         let Some(rows) = self.data.tables.get(&table) else { return Ok(None); };
         for (id, events) in rows.events.range(range.ids(None, false)) {

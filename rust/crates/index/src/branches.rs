@@ -248,6 +248,8 @@ pub struct BranchIndex {
     times: Map<u64, Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     classic_checkpoint: Option<Basis>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    store_history_floor: Option<u64>,
     branches: Map<Branch, Arc<BranchData>>,
     #[serde(with = "entries")]
     catalog: Map<TableRef, Arc<Vec<(Basis, BranchTable)>>>,
@@ -288,7 +290,7 @@ impl BranchIndex {
             expiries: vec![(basis, None)], changed: None, tables: Map::new(),
         };
         Self {
-            head, times: Map::unit(0, head.system_time), classic_checkpoint: None,
+            head, times: Map::unit(0, head.system_time), classic_checkpoint: None, store_history_floor: None,
             branches: Map::unit(MAIN_BRANCH.into(), Arc::new(main)),
             catalog: Map::new(), classic_iids: Map::new(), custody: Map::new(), latest_custody_revocation: None,
             custody_transfers: Map::new(), inherited_custody: None,
@@ -301,7 +303,7 @@ impl BranchIndex {
     pub fn head(&self) -> BranchCut { self.head }
 
     pub fn oldest_retained_cut(&self) -> BranchCut {
-        let floor = self.classic_checkpoint.map_or(0, Basis::position);
+        let floor = self.classic_checkpoint.map_or(0, Basis::position).max(self.store_history_floor());
         let (&position, &system_time) = self.times.range(floor..).next()
             .expect("The retained index contains its head");
         BranchCut { basis: Basis::new(self.head.basis.incarnation(), position), system_time }
@@ -353,6 +355,7 @@ impl BranchIndex {
     /// constrain export even when a historical cut is still queryable.
     pub fn checkpoint_at(&self, at: Basis) -> Result<Self> {
         let head = self.exact(at)?;
+        self.require_store_history(at)?;
         if [self.erased, self.latest_custody_revocation].into_iter().flatten().any(|fence| fence > at) {
             return Err(Anomaly::new(AnomalyCategory::NotFound, "rtdb/erased-under-view", "The export cut precedes an erasure fence"));
         }
@@ -497,6 +500,7 @@ impl BranchIndex {
 
     pub fn view<'a>(&'a self, branch: &'a str, at: At, layer: Layer, now: Timestamp) -> Result<BranchView<'a>> {
         let cut = self.cut(at)?;
+        self.require_store_history(cut.basis)?;
         let data = self.active_branch(branch, cut, cut.system_time)?;
         self.active_branch(branch, self.head, now.max(self.head.system_time))?;
         if let Some(erased) = self.erased
@@ -523,6 +527,9 @@ impl BranchIndex {
         &self, branch: &str, created: Basis, basis: Basis, table: &TableRef, id: &EntityId,
     ) -> Result<Option<&BranchEvent>> {
         let cut = self.exact(basis)?;
+        if *table == store::store_table() {
+            self.require_store_history(basis)?;
+        }
         let data = self.active_branch(branch, cut, cut.system_time)?;
         if data.created != created || self.has_visibility_history()
             || self.erased.is_some_and(|erased| erased > basis)
