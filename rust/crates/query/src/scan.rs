@@ -3,6 +3,7 @@ mod retained_metadata;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::io::Cursor;
+use std::ops::ControlFlow;
 use std::sync::{Arc, OnceLock};
 
 use arrow_array::{Array, TimestampMicrosecondArray,
@@ -15,14 +16,15 @@ use async_trait::async_trait;
 use rtdb_columnar::{IidView, MemoryBudget, MemoryReservation, OwnedBatch, estimate_builder_bytes, from_field};
 use rtdb_format::{data::{EventBatch, PutText}, ipc::{PageDecoder, PageProjection, inspect_file_reserved}, keys::{TableSlug, TrieKey}, metadata::{MetadataFile, MetadataNode}};
 use rtdb_index::{CatalogTrie, IndexBatch, LiveTable, LocatedRows, RowSource, Snapshot, TrieState};
-use rtdb_plan::{Expr, Scan, Schema, TemporalFilter, UnaryOp};
+use rtdb_plan::{BinaryOp, Expr, Scan, Schema, TemporalFilter, UnaryOp};
 use rtdb_storage::{ObjectKey, cache::{BufferPool, CacheLease, Cached, View}};
 use rtdb_temporal::{HistoryResolver, ResolvedRow};
 use rtdb_trie::{PageSummary, PruningOptions, TemporalSummary, select_pages_from_iter, select_pages_with_scratch};
 use rtdb_types::{ARCHIVE_TX_FROM, ARCHIVE_TX_TO, HOSTED_RECEIPT_TX_ID, OWNED_EVENT_POSITION_COLUMN,
     Anomaly, AnomalyKind, EntityId, EventHeader, EventOp, EventPosition, Iid, Interval, Result, TemporalBounds, Timestamp, Value};
 
-use crate::columnar::{BatchCursor, Column};
+use crate::columnar::{BatchCursor, BatchFilter, BoxBatchCursor, Column, admitted_predicate_selection};
+use crate::compiled::{Admission, Predicates};
 use crate::{CandidateIids, ConstantEvaluator, PreparedSearchQuery, QueryContext, accelerate::{ExecutionConstants, SearchQueries}, context::Execution, fragment::{ScanFragment, ScanFragmenter}, pages::{OwnedPage,PageBuilder}, scan_tasks::{PageRange,ScanTask,ScanTaskPlan}, invalid};
 
 struct DataFileReader {
@@ -538,7 +540,14 @@ impl ActiveRows {
     }
 
     fn after_iid(&self, head: Head, upper: Iid) -> Result<Option<Head>> {
-        let low = self.seek(head.ordinal + 1, |header| header.iid <= head.header.iid)?;
+        let start = head.ordinal + 1;
+        for ordinal in start..self.len().min(start.saturating_add(2)) {
+            let header = self.header(ordinal)?;
+            if header.iid > head.header.iid {
+                return Ok((header.iid <= upper).then_some(Head { header, ordinal, ..head }));
+            }
+        }
+        let low = self.seek(start.saturating_add(2).min(self.len()), |header| header.iid <= head.header.iid)?;
         if low == self.len() { return Ok(None); }
         let header = self.header(low)?;
         Ok((header.iid <= upper).then_some(Head { header, ordinal: low, ..head }))
@@ -572,6 +581,65 @@ fn covers_history(header: EventHeader, bounds: TemporalBounds) -> bool {
             && header.valid_time.upper() >= bounds.valid_time.upper())
 }
 
+struct AsOfResolver {
+    bounds: TemporalBounds,
+    clamp_valid_time: bool,
+    iid: Option<Iid>,
+    left: Timestamp,
+    right: Timestamp,
+}
+
+impl AsOfResolver {
+    fn new(bounds: TemporalBounds, clamp_valid_time: bool) -> Option<Self> {
+        (bounds.valid_time.is_point() && bounds.system_time.is_point()).then_some(Self {
+            bounds, clamp_valid_time, iid: None, left: Timestamp::MIN, right: Timestamp::MAX,
+        })
+    }
+
+    fn resolve(&mut self, header: EventHeader) -> Result<ControlFlow<Option<TemporalBounds>>> {
+        if self.iid != Some(header.iid) {
+            self.iid = Some(header.iid);
+            self.left = Timestamp::MIN;
+            self.right = Timestamp::MAX;
+        }
+        if header.op == EventOp::Erase { return Ok(ControlFlow::Break(None)); }
+        if header.system_from >= self.bounds.system_time.upper() { return Ok(ControlFlow::Continue(())); }
+
+        let point = self.bounds.valid_time.lower();
+        let valid = header.valid_time;
+        if valid.contains(point) {
+            let fragment = match header.op {
+                EventOp::Put => Some(TemporalBounds {
+                    valid_time: if self.clamp_valid_time { self.bounds.valid_time }
+                        else { Interval::new(valid.lower().max(self.left), valid.upper().min(self.right))? },
+                    system_time: Interval::new(header.system_from, Timestamp::MAX)?,
+                }),
+                EventOp::Redacted => return Err(Anomaly::incorrect(
+                    "rtdb.temporal/erased-assertion", "A selected assertion was erased",
+                )),
+                EventOp::Delete | EventOp::Erase => None,
+            };
+            return Ok(ControlFlow::Break(fragment));
+        }
+        // Until an event covers the point, the ceiling there is open and only its nearest breakpoints matter.
+        if !valid.is_empty() {
+            if valid.upper() <= point { self.left = self.left.max(valid.upper()); }
+            else { self.right = self.right.min(valid.lower()); }
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+}
+
+fn skip_entity(mut next: Option<Head>, heads: &mut BinaryHeap<Head>, active: &[&ActiveRows], iid: Iid, upper: Iid) -> Result<Option<Head>> {
+    while let Some(pending) = next.filter(|pending| pending.header.iid == iid) {
+        if let Some(following) = active[pending.active].after_iid(pending, upper)? {
+            heads.push(following);
+        }
+        next = heads.pop();
+    }
+    Ok(next)
+}
+
 #[derive(Clone)]
 struct RankProjection {
     output: rtdb_plan::ColumnId,
@@ -595,6 +663,81 @@ struct ResolvedScanTask {
     _group_reservations: Vec<Arc<MemoryReservation>>,
 }
 
+struct ScanFilter {
+    schema: Schema,
+    stages: Arc<[Expr]>,
+    admission: Admission,
+    compiled: crate::columnar::functions::Predicate,
+    _reservation: Arc<MemoryReservation>,
+}
+
+struct FilteredScan {
+    filter: Arc<ScanFilter>,
+    pending: Option<(ResolvedScanTask, usize)>,
+}
+
+impl FilteredScan {
+    async fn next_batch(&mut self, scan: &mut PartitionScan) -> Result<Option<crate::columnar::ColumnBatch>> {
+        loop {
+            scan.execution.context.check_cancelled()?;
+            let (mut task, mut group) = match self.pending.take() {
+                Some(pending) => pending,
+                None => {
+                    let Some(task) = scan.next_resolved_task().await? else { return Ok(None); };
+                    (task, 0)
+                }
+            };
+            while let Some(rows) = task.groups.get_mut(group) {
+                let mut rows = std::mem::take(rows);
+                let page = task.selected[group];
+                group += 1;
+                if rows.is_empty() { continue; }
+                let filter = &self.filter;
+                let memory = &scan.execution.context.memory;
+                let input = crate::columnar::gather(&rows, &task.batches, filter.schema.fields(), memory, |_| Ok(None))?;
+                let selection = admitted_predicate_selection(&input, &filter.stages[0], &filter.schema, &scan.execution,
+                    Some(&filter.compiled), Some(&filter.admission)).await?;
+                if selection.is_empty() { continue; }
+                drop(input);
+                let mut row = 0;
+                rows.retain(|_| {
+                    let keep = selection.contains(row);
+                    row += 1;
+                    keep
+                });
+                drop(selection);
+                let output = scan.gather_group(page, &rows, &task.batches).await?;
+                self.pending = Some((task, group));
+                return Ok(Some(output));
+            }
+        }
+    }
+}
+
+impl ScanFilter {
+    fn new(predicates: &Predicates, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
+        let [predicate] = predicates.stages.as_ref() else { return Ok(None); };
+        let mut range = matches!(predicate, Expr::Binary { .. } | Expr::Between { .. });
+        predicate.visit(&mut |expr| {
+            range &= matches!(expr, Expr::Column { .. } | Expr::Literal(_) | Expr::Parameter { .. }
+                | Expr::Between { symmetric: false, .. }
+                | Expr::Binary { op: BinaryOp::And | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq, .. });
+        });
+        if !range || predicates.compiled[0].is_none() { return Ok(None); }
+        let referenced = predicate.referenced_columns();
+        if referenced.is_empty() || referenced.len() >= predicates.schema.len() { return Ok(None); }
+        let schema = Schema::new(predicates.schema.fields().iter()
+            .filter(|field| referenced.contains(&field.id)).cloned().collect())?;
+        if schema.len() != referenced.len() { return Ok(None); }
+        let Some(compiled) = crate::columnar::functions::Predicate::bind(predicate, &schema) else { return Ok(None); };
+        let bytes = crate::runtime_schema::schema_bound(&schema)?.checked_add(compiled.retained_bytes()?)
+            .and_then(|bytes| bytes.checked_add(size_of::<Self>()))
+            .ok_or_else(|| invalid("scan-filter-size", "Scan predicate exceeds addressable memory"))?;
+        let reservation = memory.reserve(bytes)?;
+        Ok(Some(Self { schema, stages: Arc::clone(&predicates.stages), admission: Admission::of(predicate), compiled, _reservation: reservation }))
+    }
+}
+
 pub(crate) struct PartitionScan {
     snapshot: Snapshot,
     storage: Arc<BufferPool>,
@@ -608,6 +751,7 @@ pub(crate) struct PartitionScan {
     loaded: BTreeMap<usize, LoadedPage>,
     output: VecDeque<crate::columnar::ColumnBatch>,
     output_reservation: Option<Arc<MemoryReservation>>,
+    filter: Option<FilteredScan>,
     counts: ScanCounts,
     pushdowns: Option<Arc<crate::pushdown::Pushdowns>>,
     canonical_entity_iids: bool,
@@ -1146,7 +1290,7 @@ impl ScanCursor {
                     slots: slots.clone(), scan: local_scan.clone(), execution: execution.clone(), bounds,
                     initialized: false, files: FileDescriptors::default(), pages: PageDescriptors::default(),
                     tasks: None, loaded: BTreeMap::new(), output: VecDeque::new(),
-                    output_reservation: None, counts: ScanCounts::default(), pushdowns: pushdowns.clone(),
+                    output_reservation: None, filter: None, counts: ScanCounts::default(), pushdowns: pushdowns.clone(),
                     canonical_entity_iids, confined, order, page_test: None,
                 };
                 // A scan narrowed to named IIDs reads a few pages wherever they are; only a whole scan of a single-partition database is split.
@@ -1185,7 +1329,7 @@ impl PartitionScan {
             fragment
         });
         Self { snapshot, storage, scan, execution, bounds, matches: Vec::new(), ranking: None, candidate_iids: None, slots, metadata_time: None, initialized: false, files: FileDescriptors::default(), pages: PageDescriptors::default(), tasks: None, loaded: BTreeMap::new(),
-            output: VecDeque::new(), output_reservation: None, counts: ScanCounts::default(), pushdowns, canonical_entity_iids, confined, order: None, page_test: None }
+            output: VecDeque::new(), output_reservation: None, filter: None, counts: ScanCounts::default(), pushdowns, canonical_entity_iids, confined, order: None, page_test: None }
     }
     /// The scan another node asked this one for: its fragment's rows within the bounds that node evaluated.
     pub(crate) fn fragment(snapshot: Snapshot, storage: Arc<BufferPool>, fragment: &ScanFragment, execution: Execution) -> Self {
@@ -1194,6 +1338,22 @@ impl PartitionScan {
 }
 
 impl ScanCursor {
+    pub(crate) fn filtered(mut self, predicates: &Predicates, execution: Execution) -> Result<BoxBatchCursor> {
+        if !self.parts.is_empty()
+            && self.parts.iter().all(|part| matches!(part, Part::Local(partition) if partition.can_filter_before_gather()))
+            && let Some(filter) = ScanFilter::new(predicates, &self.memory)?
+        {
+            let filter = Arc::new(filter);
+            for part in &mut self.parts {
+                if let Part::Local(partition) = part {
+                    partition.filter = Some(FilteredScan { filter: Arc::clone(&filter), pending: None });
+                }
+            }
+            return Ok(Box::new(self));
+        }
+        Ok(Box::new(BatchFilter::admitted(Box::new(self), predicates, execution)))
+    }
+
     pub(crate) async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> {
         // Every fragment is dispatched at the first pull, so the nodes they belong to read them side by side.
         if let Some(fragmenter) = self.fragmenter.take() {
@@ -2039,6 +2199,13 @@ fn projects_archive_history(scan: &Scan) -> bool {
 }
 
 impl PartitionScan {
+    fn can_filter_before_gather(&self) -> bool {
+        self.order.is_none() && self.scan.matches.is_empty() && self.scan.top_k.is_none() && self.scan.ordered_top_k.is_none()
+            && !self.scan.table.name.table.is_owned_event_data() && !projects_archive_history(&self.scan)
+            && !retained_metadata::is_projected(&self.scan)
+            && !self.execution.context.catalog.admits_owned_event_positions(&self.scan.table.name)
+    }
+
     fn reset_candidates(&mut self, candidates: crate::CandidateIids) {
         debug_assert!(self.loaded.is_empty() && self.output.is_empty());
         self.candidate_iids = Some(candidates);
@@ -2345,6 +2512,11 @@ impl PartitionScan {
         Ok(())
     }
     pub(crate) async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> {
+        if let Some(mut filter) = self.filter.take() {
+            let result = filter.next_batch(self).await;
+            self.filter = Some(filter);
+            return result;
+        }
         loop {
             self.execution.context.check_cancelled()?;
             if let Some(page) = self.output.pop_front() { return Ok(Some(page)); }
@@ -2441,6 +2613,7 @@ impl PartitionScan {
         }
         let mut resolver = HistoryResolver::new_in(resolver_bounds, self.scan.clamp_valid_time, Arc::clone(&self.execution.context.memory));
         let keyed = self.scan.table.name.table.is_owned_event_data();
+        let mut as_of = if keyed || archive_history { None } else { AsOfResolver::new(self.bounds, self.scan.clamp_valid_time) };
         let position_mask = self.execution.context.catalog.owned_position_mask;
         let transaction_cut = self.execution.context.catalog.owned_transaction_cut;
         let requested_key = if keyed { self.execution.context.catalog.owned_identity().map(EntityId::handle_bytes) } else { None };
@@ -2494,6 +2667,16 @@ impl PartitionScan {
                     .ok_or_else(|| invalid("archive-event-position", "An archive control lacks its original position"))?;
                 header.system_from = Timestamp(position.transaction.0);
             }
+            let point = if let Some(resolver) = &mut as_of {
+                match resolver.resolve(header)? {
+                    ControlFlow::Continue(()) => continue,
+                    ControlFlow::Break(fragment) => {
+                        next = skip_entity(next, &mut heads, &active, header.iid, range_upper)?;
+                        let Some(fragment) = fragment else { continue; };
+                        Some(fragment)
+                    }
+                }
+            } else { None };
             let (slot, batch, row) = rows.batch(head.ordinal)?;
             let resolver = if keyed {
                 let key = batch.view().entity_key(row as usize)?.ok_or_else(|| {
@@ -2526,7 +2709,7 @@ impl PartitionScan {
             // The merge visits rows in IID order across the task's pages, which one group keeps and a group per page does not.
             let group: &mut Vec<_> = &mut groups[if self.order.is_some() { 0 } else { head.active }];
             let memory = &self.execution.context.memory;
-            resolver.resolve_fragments(&header, |valid_time, system_time| {
+            let mut emit = |valid_time, system_time| {
                 if group.len() == group.capacity() {
                     let capacity = group.capacity().saturating_mul(2).max(64);
                     let bytes = capacity.checked_mul(std::mem::size_of::<ResolvedRow<(u32, u32)>>()).ok_or_else(|| invalid("scan-row-size", "Scan rows exceed addressable memory"))?;
@@ -2535,14 +2718,13 @@ impl PartitionScan {
                 }
                 group.push(ResolvedRow { source, valid_time, system_time });
                 Ok(())
-            })?;
-            let entity = head.header.iid;
-            if covers_history(head.header, self.bounds) && (!keyed || requested_key.is_some()) {
-                while let Some(pending) = next.filter(|pending| pending.header.iid == entity) {
-                    if let Some(following) = active[pending.active].after_iid(pending, range_upper)? {
-                        heads.push(following);
-                    }
-                    next = heads.pop();
+            };
+            if let Some(fragment) = point {
+                emit(fragment.valid_time, fragment.system_time)?;
+            } else {
+                resolver.resolve_fragments(&header, emit)?;
+                if covers_history(head.header, self.bounds) && (!keyed || requested_key.is_some()) {
+                    next = skip_entity(next, &mut heads, &active, head.header.iid, range_upper)?;
                 }
             }
         }
@@ -2555,30 +2737,34 @@ impl PartitionScan {
 
     async fn buffer_task(&mut self, task: ResolvedScanTask) -> Result<()> {
         let ResolvedScanTask { selected, groups, batches, reservation, _group_reservations } = task;
-        let archive_history = projects_archive_history(&self.scan);
-        let keyed = self.scan.table.name.table.is_owned_event_data();
-        let owned = self.execution.context.catalog.admits_owned_event_positions(&self.scan.table.name);
         for (group, rows) in groups.iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
-            let mut metadata = Box::pin(self.retained_transaction_metadata(rows, &batches)).await?;
-            let page = &self.pages.entries[selected[group]].source;
-            let memory = &self.execution.context.memory;
-            let output = crate::columnar::gather_with_funded_columns(rows, &batches, &self.scan.columns, memory, |position| {
-                let field = &self.scan.columns[position];
-                if let Some(ranking) = &self.ranking && field.id == ranking.output {
-                    return self.rank_column(ranking, rows, &batches).map(|column| Some((column, None)));
-                }
-                if let Some((column, charge)) = history_column(&field.name, rows, &batches, archive_history, keyed, owned, memory)? {
-                    return Ok(Some((column, Some(charge))));
-                }
-                if !archive_history && field.name == "user_metadata" && let Some((column, charge)) = metadata.take() {
-                    return Ok(Some((column, Some(charge))));
-                }
-                self.slots[position].map(|slot| self.match_column(slot, page, rows, &batches).map(|column| (column, None))).transpose()
-            })?;
+            let output = self.gather_group(selected[group], rows, &batches).await?;
             self.output.push_back(output);
         }
         self.output_reservation = Some(reservation);
         Ok(())
+    }
+
+    async fn gather_group(&mut self, page: usize, rows: &[ResolvedRow<(u32, u32)>], batches: &[Arc<IndexBatch>]) -> Result<crate::columnar::ColumnBatch> {
+        let archive_history = projects_archive_history(&self.scan);
+        let keyed = self.scan.table.name.table.is_owned_event_data();
+        let owned = self.execution.context.catalog.admits_owned_event_positions(&self.scan.table.name);
+        let mut metadata = Box::pin(self.retained_transaction_metadata(rows, batches)).await?;
+        let page = &self.pages.entries[page].source;
+        let memory = &self.execution.context.memory;
+        crate::columnar::gather_with_funded_columns(rows, batches, &self.scan.columns, memory, |position| {
+            let field = &self.scan.columns[position];
+            if let Some(ranking) = &self.ranking && field.id == ranking.output {
+                return self.rank_column(ranking, rows, batches).map(|column| Some((column, None)));
+            }
+            if let Some((column, charge)) = history_column(&field.name, rows, batches, archive_history, keyed, owned, memory)? {
+                return Ok(Some((column, Some(charge))));
+            }
+            if !archive_history && field.name == "user_metadata" && let Some((column, charge)) = metadata.take() {
+                return Ok(Some((column, Some(charge))));
+            }
+            self.slots[position].map(|slot| self.match_column(slot, page, rows, batches).map(|column| (column, None))).transpose()
+        })
     }
 
     fn match_column(&self, evaluated: usize, source: &PageSource, rows: &[ResolvedRow<(u32, u32)>], batches: &[Arc<IndexBatch>]) -> Result<crate::columnar::Column> {
@@ -3292,6 +3478,105 @@ mod tests {
         }
         values.sort_by_key(|value| match value { Value::I64(value) => *value, other => panic!("{other:?}") });
         assert_eq!(values, [Value::I64(2), Value::I64(3)]);
+    }
+
+    #[test]
+    fn point_and_history_resolution_agree_on_fragment_bounds_and_disclosure() {
+        let event = |system, lower, upper, op| EventHeader {
+            position: None, iid: Iid([1; 16]), system_from: Timestamp(system), commit_position: 0,
+            valid_time: Interval::from_micros(lower, upper).unwrap(), op,
+        };
+        let histories = [
+            vec![event(30, 0, 100, EventOp::Put), event(20, 0, 30, EventOp::Put),
+                event(20, 70, 100, EventOp::Delete), event(15, 50, 50, EventOp::Delete),
+                event(10, 0, 100, EventOp::Put)],
+            vec![event(30, 0, 100, EventOp::Erase), event(10, 0, 100, EventOp::Put)],
+            vec![event(20, 0, 100, EventOp::Put), event(20, 0, 100, EventOp::Redacted),
+                event(10, 0, 100, EventOp::Put)],
+            vec![event(20, 40, 60, EventOp::Redacted), event(10, 0, 100, EventOp::Put)],
+        ];
+        for events in histories {
+            for system in [9, 10, 19, 20, 29, 30] {
+                for valid in [0, 29, 30, 49, 50, 69, 70, 99, 100] {
+                    let bounds = TemporalBounds {
+                        valid_time: Interval::at(Timestamp(valid)).unwrap(),
+                        system_time: Interval::at(Timestamp(system)).unwrap(),
+                    };
+                    for clamp in [false, true] {
+                        let expected = rtdb_temporal::resolve_ordered(events.iter().enumerate().map(|(source, event)| (event, source)), bounds, clamp);
+                        let mut resolver = AsOfResolver::new(bounds, clamp).unwrap();
+                        let mut resolve = || -> Result<Vec<ResolvedRow<usize>>> {
+                            for (source, &event) in events.iter().enumerate() {
+                                if let ControlFlow::Break(fragment) = resolver.resolve(event)? {
+                                    return Ok(fragment.into_iter().map(|fragment| ResolvedRow {
+                                        source, valid_time: fragment.valid_time, system_time: fragment.system_time,
+                                    }).collect());
+                                }
+                            }
+                            Ok(Vec::new())
+                        };
+                        assert_eq!(resolve(), expected, "{events:?} at {bounds:?}, clamp={clamp}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_range_predicate_selects_resolved_rows_before_copying_wide_payloads() {
+        use rtdb_plan::Relation;
+
+        let (state, table, events) = live_table_with_values([Value::I64(10), Value::I64(20), Value::Null]);
+        let key = TransactionKey { tx_id: TxId(1), system_time: Timestamp(101) };
+        let mut write = TransactionBuffer::new(state.value().snapshot(), key, MemoryBudget::new(1 << 28)).unwrap();
+        write.append(table.clone(), StoredEvent {
+            system_from: key.system_time,
+            valid_time: Interval::from_micros(50, 150).unwrap(),
+            operation: StoredOperation::Put(StructFields::from([
+                ("_id".into(), Value::I64(1)), ("v".into(), Value::I64(90)), ("payload".into(), Value::Utf8("x".repeat(2 << 20))),
+            ])),
+            ..events[0].clone()
+        }).unwrap();
+        state.apply(&write.stage().unwrap()).unwrap();
+
+        let store = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let (mut scan, mut execution, memory) = descriptor_scan(state.value().snapshot(), table, store);
+        let memory = memory.scope_with_limit(1 << 19);
+        execution.context = execution.context.execution_child_with_memory(Arc::clone(&memory));
+        scan.valid_time = TemporalFilter::Default;
+        let id = Field { id: ColumnId(1), name: "_id".into(), data_type: LogicalType::Scalar(ScalarType::I64), ..scan.columns[0].clone() };
+        let payload = Field { id: ColumnId(2), name: "payload".into(), data_type: scan.table.columns["payload"].clone(), ..scan.columns[0].clone() };
+        let value = scan.columns[0].expression();
+        scan.columns.insert(0, id);
+        scan.columns.push(payload);
+        scan.predicates = vec![Expr::binary(BinaryOp::And,
+            Expr::binary(BinaryOp::GtEq, value.clone(), Expr::Literal(Value::I64(10))),
+            Expr::binary(BinaryOp::Lt, value, Expr::Literal(Value::I64(30))),
+        )];
+
+        for (system_time, expected) in [
+            (TemporalFilter::Default, vec![(2, 20)]),
+            (TemporalFilter::At(Expr::Literal(Value::Timestamp {
+                value: 100, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()),
+            })), vec![(1, 10), (2, 20)]),
+        ] {
+            scan.system_time = system_time;
+            let relation = Arc::new(Relation::scan(scan.clone()).unwrap());
+            let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+            let mut cursor = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().unwrap();
+            let mut actual = Vec::new();
+            while let Some(batch) = cursor.next_batch().await.unwrap() {
+                for row in 0..batch.len {
+                    let (Value::I64(id), Value::I64(value)) = (batch.columns[0].value(row).unwrap(), batch.columns[1].value(row).unwrap()) else {
+                        panic!("The range scan should return the ID and its selected value");
+                    };
+                    assert_eq!(batch.columns[2].value(row).unwrap(), Value::Null);
+                    actual.push((id, value));
+                }
+            }
+            actual.sort_unstable();
+            assert_eq!(actual, expected);
+        }
     }
 
     #[tokio::test]

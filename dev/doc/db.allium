@@ -2304,6 +2304,8 @@ surface QueryAccess {
         -- Metadata read from a cache-owned immutable object retains its Arrow buffers from that object.
         -- An ordinary persisted scan can decode only the needed put children when a full page lacks cache admission and its IPC layout supports projection.
         -- The scan retains the event headers and exact entity keys required for temporal resolution.
+        -- A point in both time dimensions selects the same visible fragment as history resolution, including its valid-time endpoints and the effects of deletes and erases.
+        -- An eligible range predicate on a local scan reads its referenced columns from the resolved rows, and payload projection gathers only the positions the predicate keeps.
         -- A spatial fallback read projects IIDs from persisted pages.
         -- A spatial refinement scan can project the requested put children from persisted pages.
         -- A located point read decodes the event headers and the put fields needed by its projection and predicates.

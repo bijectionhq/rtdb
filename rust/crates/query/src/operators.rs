@@ -90,11 +90,11 @@ async fn build_batches_at(
             Ok(Some((Box::new(LiteralBatchCursor { relation, width: runtime.schema().len(), next: 0, execution }), false)))
         }
         RelationNode::Scan(scan) if !crate::inspection::is_inspection(&scan.table.name.table) && crate::system_schema::definition(&scan.table.name.table).is_none() => {
-            let batches: crate::columnar::BoxBatchCursor = Box::new(crate::scan::ScanCursor::new(scan.clone(),execution.clone(),pushdowns).await?);
+            let cursor = crate::scan::ScanCursor::new(scan.clone(), execution.clone(), pushdowns).await?;
             let template = runtime.operators().template(|| operator_template(&runtime))?;
-            let batches = match template.as_ref() {
-                OperatorTemplate::Scan { filter: Some(predicates) } => Box::new(crate::columnar::BatchFilter::admitted(batches,predicates,execution)) as crate::columnar::BoxBatchCursor,
-                OperatorTemplate::Scan { filter: None } => batches,
+            let batches: BoxBatchCursor = match template.as_ref() {
+                OperatorTemplate::Scan { filter: Some(predicates) } => cursor.filtered(predicates, execution)?,
+                OperatorTemplate::Scan { filter: None } => Box::new(cursor),
                 _ => return Err(template_mismatch()),
             };
             Ok(Some((batches,false)))
