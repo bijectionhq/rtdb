@@ -25,6 +25,7 @@ Other spellings of these keywords report `xtdb.error/illegal-arg` during binding
 
 `OVERLAY` accepts a trailing `USING CHARACTERS` or `USING OCTETS` inside the parentheses.
 `SUBSTRING` accepts the same clause after a start expression and optional length in forms without comma separators.
+Comma-separated `SUBSTRING` uses commas for both separators.
 These clauses accept case-insensitive unit keywords.
 For either unit, positions and lengths count Unicode code points in text and bytes in binary input.
 In `SUBSTRING` without commas between operands, an unsigned decimal integer, `?`, `$n`, or `(` can begin the start expression without `FROM`.
@@ -50,13 +51,17 @@ Parsed statement metadata exposes the operation kind and lexical parameter count
 Ordinary physical scans expose temporal columns to explicit expressions while keeping their synthetic column identities outside wildcard expansion.
 Base-table alias column lists declare the available document names, preserving declaration order and discarding duplicates.
 Derived-table alias column lists rename output fields positionally.
+An alias on a grouped table reference belongs inside its outer parentheses, as in `FROM (docs AS d)`.
+An aliased parenthesized expression can still introduce a derived table, as in `FROM (VALUES (1)) q(n), (q.n) AS t(v)`.
 
 The parser tokenizes before binding so anonymous parameters follow lexical order across projection, predicate, nested query, and temporal clauses.
 Query parsing, session-control parsing and statement splitting skip nested block comments and line comments, including `/*! ... */` and `/*+ ... */` contents.
 Parameters and semicolons inside comments do not enter statement syntax; comment delimiters inside quoted text remain text.
+Parsed statement batches use a single semicolon between statements and allow one at the end.
 `tests/comments.rs` retains lexical metadata, prepared-plan, control, source-span and nested-comment regression sources; execution remains pending.
 Unquoted identifiers start with an ASCII letter or underscore and continue with ASCII letters, digits, underscores or dollar signs.
 Quoted identifiers retain Unicode and escaped quotes and reject slashes, following the pinned lexer.
+Plain single-quoted string literals must stay on one line.
 The recognition diagnostic quotes the token prefix through the first invalid character and reports its original line and character column.
 All three lexical entries reject invalid character tokens before returning statement metadata; `tests/identifiers.rs` retains admission and error-order regression sources.
 Dollar parameters retain their explicit one-based spelling and use zero-based plan indices.
@@ -553,6 +558,7 @@ Binary LIKE retains the reference hexadecimal wildcard transformation; binary IL
 `tests/like_calls.rs` covers those behaviors and nullable parameters as unexecuted regression source.
 
 LIMIT, OFFSET and explicit FETCH counts accept unsigned integer literals or parameters.
+The FETCH clause uses `FETCH FIRST` or `FETCH NEXT`, followed by an optional count and `ROW ONLY` or `ROWS ONLY`.
 Parameter values must be nonnegative integers within signed 64-bit range; null, floating and text counts raise the expected-number anomaly.
 The query opens the input cursor, then resolves the offset and row count before requesting any pages.
 FETCH without a count retains its one-row default, and LIMIT ALL is rejected.

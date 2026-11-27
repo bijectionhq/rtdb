@@ -636,6 +636,14 @@ pub trait Dialect: Debug + Any {
         false
     }
 
+    fn requires_consistent_substring_separators(&self) -> bool {
+        false
+    }
+
+    fn requires_complete_fetch_syntax(&self) -> bool {
+        false
+    }
+
     /// Dialect-specific prefix parser override
     fn parse_prefix(&self, _parser: &mut Parser) -> Option<Result<Expr, ParserError>> {
         // return None to fall back to the default behavior
@@ -1150,6 +1158,10 @@ pub trait Dialect: Debug + Any {
     /// [Snowflake](https://docs.snowflake.com/en/sql-reference/constructs/from)
     fn supports_parens_around_table_factor(&self) -> bool {
         false
+    }
+
+    fn supports_alias_on_wrapped_table_factor(&self) -> bool {
+        true
     }
 
     /// Returns true if this dialect supports `VALUES` as a table factor

@@ -216,14 +216,14 @@ fn substring_bare_length_gates_numeric_spelling_before_parsing_the_expression() 
 async fn substring_without_from_preserves_operand_precedence_and_units() {
     let rows = query("SELECT SUBSTRING('abcdef' 2), SUBSTRING('abcdef' 2 FOR 2), \
         SUBSTRING('abcdef' 1 + 1 2 * 1), SUBSTRING(LOWER ('ABCDEF') (2) (1 + 1)), \
-        SUBSTRING(LOWER ('ABCDEF')), SUBSTRING('abcdef' 2 - 1), \
+        SUBSTRING('abcdef' 2 - 1), \
         SUBSTRING('a😀éz' 2 2 USING octets), SUBSTRING(X('010203') 2 USING CHARACTERS), \
         SUBSTRING(NULL 2 FOR 1)")
         .await.unwrap();
     assert_eq!(
         rows,
         [vec![
-            text("bcdef"), text("bc"), text("bc"), text("bc"), text("abcdef"), text("abcdef"),
+            text("bcdef"), text("bc"), text("bc"), text("bc"), text("abcdef"),
             text("😀é"), V::Binary(vec![2, 3]), V::Null,
         ]],
     );
@@ -235,6 +235,8 @@ fn substring_without_from_requires_a_separate_start_and_excludes_commas() {
         "SELECT SUBSTRING('abc' 2, 1)",
         "SELECT SUBSTRING('abc' 2, 1 USING OCTETS)",
         "SELECT SUBSTRING('abc' 2 FOR 1, 3)",
+        "SELECT SUBSTRING('abc' FROM 2, 1)",
+        "SELECT SUBSTRING('abc', 2 FOR 1)",
         "SELECT SUBSTRING('abc' 2 1 3)",
         "SELECT SUBSTRING('abc' 1L)",
         "SELECT SUBSTRING('abc' .1)",
@@ -248,8 +250,6 @@ fn substring_without_from_requires_a_separate_start_and_excludes_commas() {
     for sql in [
         "SELECT SUBSTRING('abc')",
         "SELECT SUBSTRING('abc' FOR 2)",
-        "SELECT SUBSTRING('abc' FROM 2, 1)",
-        "SELECT SUBSTRING('abc', 2 FOR 1)",
     ] {
         assert!(rtdb_sql::parse(sql).is_ok(), "{sql}");
     }

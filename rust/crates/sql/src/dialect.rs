@@ -133,6 +133,9 @@ impl Dialect for SqlDialect {
     fn supports_parametric_functions(&self) -> bool { false }
     fn supports_bare_substring_start(&self) -> bool { true }
     fn supports_bare_substring_length(&self) -> bool { true }
+    fn requires_consistent_substring_separators(&self) -> bool { true }
+    fn requires_complete_fetch_syntax(&self) -> bool { true }
+    fn supports_alias_on_wrapped_table_factor(&self) -> bool { false }
     fn unparameterized_data_type(&self, word: &Word) -> Option<ast::DataType> {
         if word.quote_style.is_some() { return None; }
         match word.keyword {
@@ -147,6 +150,12 @@ impl Dialect for SqlDialect {
     fn supports_interval_identifier(&self) -> bool { true }
     fn qualifies_column_before_subscript(&self) -> bool { true }
     fn supports_table_function_syntax(&self) -> bool { false }
+    fn parse_statement(&self, parser: &mut Parser) -> Option<std::result::Result<ast::Statement, ParserError>> {
+        if parser.peek_keyword(Keyword::ABORT) || parser.peek_keyword(Keyword::END) {
+            return Some(parser.expected_ref("an XTDB SQL statement", parser.peek_token_ref()));
+        }
+        None
+    }
     fn is_column_alias(&self, keyword: &Keyword, parser: &mut Parser) -> bool {
         *keyword != Keyword::WINDOW && GenericDialect {}.is_column_alias(keyword, parser)
     }

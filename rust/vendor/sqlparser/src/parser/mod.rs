@@ -3115,8 +3115,12 @@ impl<'a> Parser<'a> {
         }
 
         let mut to_expr = None;
-        let for_keyword = self.parse_keyword(Keyword::FOR);
-        let length_comma = !for_keyword && !bare_start && self.consume_token(&Token::Comma);
+        let consistent = !shorthand && self.dialect.requires_consistent_substring_separators();
+        let for_keyword = (!consistent || !special) && self.parse_keyword(Keyword::FOR);
+        let length_comma = !for_keyword
+            && !bare_start
+            && (!consistent || special)
+            && self.consume_token(&Token::Comma);
         let noncomma_form = !shorthand && (explicit_from || bare_start) && !length_comma;
         if for_keyword
             || length_comma
@@ -16856,7 +16860,12 @@ impl<'a> Parser<'a> {
                 // [AS alias])`) as well.
                 self.expect_token(&Token::RParen)?;
 
-                if let Some(outer_alias) = self.maybe_parse_table_alias()? {
+                let outer_alias = if self.dialect.supports_alias_on_wrapped_table_factor() {
+                    self.maybe_parse_table_alias()?
+                } else {
+                    None
+                };
+                if let Some(outer_alias) = outer_alias {
                     // Snowflake also allows specifying an alias *after* parens
                     // e.g. `FROM (mytable) AS alias`
                     match &mut table_and_joins.relation {
@@ -19914,7 +19923,10 @@ impl<'a> Parser<'a> {
 
     /// Parse a FETCH clause
     pub fn parse_fetch(&mut self) -> Result<Fetch, ParserError> {
-        let _ = self.parse_one_of_keywords(&[Keyword::FIRST, Keyword::NEXT]);
+        let complete = self.dialect.requires_complete_fetch_syntax();
+        if self.parse_one_of_keywords(&[Keyword::FIRST, Keyword::NEXT]).is_none() && complete {
+            return self.expected_ref("FIRST or NEXT", self.peek_token_ref());
+        }
 
         let (quantity, percent) = if self
             .parse_one_of_keywords(&[Keyword::ROW, Keyword::ROWS])
@@ -19924,14 +19936,20 @@ impl<'a> Parser<'a> {
         } else {
             let quantity = Expr::Value(self.parse_value()?);
             let percent = self.parse_keyword(Keyword::PERCENT);
-            let _ = self.parse_one_of_keywords(&[Keyword::ROW, Keyword::ROWS]);
+            if self.parse_one_of_keywords(&[Keyword::ROW, Keyword::ROWS]).is_none() && complete {
+                return self.expected_ref("ROW or ROWS", self.peek_token_ref());
+            }
             (Some(quantity), percent)
         };
 
         let with_ties = if self.parse_keyword(Keyword::ONLY) {
             false
+        } else if self.parse_keywords(&[Keyword::WITH, Keyword::TIES]) {
+            true
+        } else if complete {
+            return self.expected_ref("ONLY or WITH TIES", self.peek_token_ref());
         } else {
-            self.parse_keywords(&[Keyword::WITH, Keyword::TIES])
+            false
         };
 
         Ok(Fetch {

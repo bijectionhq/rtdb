@@ -326,6 +326,8 @@ fn tokenize_into(
         if invalid_token.is_none() {
             invalid_token = match &token.token {
                 Token::Word(word) if word.quote_style.is_some() && word.value.contains('/') => quoted_error(token.span),
+                Token::SingleQuotedString(value) if value.contains('\n') =>
+                    Some(sql_error("A regular SQL string literal cannot contain a line feed", source, token.span)),
                 Token::ArrowAt => Some(sql_error("Invalid character in SQL source", source,
                     Span::new(Location::new(token.span.start.line, token.span.start.column + 1), token.span.end))),
                 Token::Char(_) | Token::AtSign | Token::AtAt | Token::AtArrow | Token::AtQuestion | Token::CaretAt =>
@@ -374,14 +376,28 @@ pub fn parse_syntax_in<'input>(sql: &'input str, memory: &'input Arc<MemoryBudge
 
 fn parse_syntax<'input>(sql: &'input str, forms: crate::bind::FormAllocation<'input>) -> Result<StatementSyntaxBatch<'input>> {
     let tokens = tokenize(sql, forms.memory())?;
-    let tokens: Vec<_> = tokens.into_iter().filter(|token| !matches!(token.token, Token::Whitespace(_))).collect();
+    let mut tokens: Vec<_> = tokens.into_iter().filter(|token| !matches!(token.token, Token::Whitespace(_))).collect();
     validate_common_syntax(&tokens, sql)?;
     let source = StatementSource::full(sql);
-    let statements = tokens.split(|token| token.token == Token::SemiColon).filter(|slice| !slice.is_empty())
-        .map(|slice| {
-            let span = StatementSource::tokens(sql, &slice[0], &slice[slice.len() - 1]).span();
-            Ok(StatementSyntax { syntax: parse_statement_syntax(source, span, slice)?, forms })
-        }).collect::<Result<_>>()?;
+    let trailing = tokens.last().filter(|token| token.token == Token::SemiColon).map(|token| token.span);
+    if trailing.is_some() { tokens.pop(); }
+    let mut statements = Vec::new();
+    if tokens.is_empty() {
+        if let Some(trailing) = trailing {
+            return Err(sql_error("Expected an SQL statement before the semicolon", sql, trailing));
+        }
+    } else {
+        let mut start = 0;
+        for slice in tokens.split(|token| token.token == Token::SemiColon) {
+            let (Some(first), Some(last)) = (slice.first(), slice.last()) else {
+                let at = tokens[start.min(tokens.len() - 1)].span;
+                return Err(sql_error("Expected an SQL statement between semicolons", sql, at));
+            };
+            let span = StatementSource::tokens(sql, first, last).span();
+            statements.push(StatementSyntax { syntax: parse_statement_syntax(source, span, slice)?, forms });
+            start += slice.len() + 1;
+        }
+    }
     Ok(StatementSyntaxBatch { source: sql, forms, statements })
 }
 
@@ -437,7 +453,7 @@ pub(super) fn parse_statement_syntax<'input>(
         let mut columns = Vec::new();
         if parser.consume_token(&Token::LParen) {
             loop {
-                let name = identifier_token(&parser.next_token())?;
+                let name = grammar_identifier_token(&parser.next_token(), sql)?;
                 let ty = match parser.peek_token().token {
                     Token::Comma | Token::RParen => None,
                     _ => Some(dialect.checked(parser.parse_data_type()).map_err(|error| parser_error(error, sql, parser.peek_token().span))?),
@@ -510,7 +526,7 @@ pub(super) fn parse_statement_syntax<'input>(
     } else if word(tokens.first(), "GRANT") || word(tokens.first(), "REVOKE") {
         let revoke = word(tokens.first(), "REVOKE");
         if tokens.len() != 4 || !word(tokens.get(2), if revoke { "FROM" } else { "TO" }) { return Err(sql_error("Expected one role and one user", sql, slice[0].span)); }
-        Syntax::GrantRole { role: identifier_token(&tokens[1])?, user: identifier_token(&tokens[3])?, revoke }
+        Syntax::GrantRole { role: grammar_identifier_token(&tokens[1], sql)?, user: grammar_identifier_token(&tokens[3], sql)?, revoke }
     } else if word(tokens.first(), "ERASE") {
         let replacement = Tokenizer::new(&dialect, "DELETE").tokenize().map_err(|error| Anomaly::fault("rtdb.sql/lexer", error.to_string()))?;
         tokens[0].token = replacement.into_iter().next().ok_or_else(|| Anomaly::fault("rtdb.sql/lexer", "Missing DELETE token"))?;
@@ -699,6 +715,14 @@ fn identifier_token(token: &TokenWithSpan) -> Result<Identifier> {
     match &token.token {
         Token::Word(word) => Ok(Identifier { text: word.value.clone(), quoted: word.quote_style.is_some() }),
         _ => Err(Anomaly::incorrect("xtdb/sql-error", "Expected an identifier")),
+    }
+}
+
+fn grammar_identifier_token(token: &TokenWithSpan, source: &str) -> Result<Identifier> {
+    match &token.token {
+        Token::Word(word) if word.quote_style.is_some() || crate::parser::is_unquoted_identifier(&word.value) =>
+            identifier_token(token),
+        _ => Err(sql_error("Expected an identifier", source, token.span)),
     }
 }
 

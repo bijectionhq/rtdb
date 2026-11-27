@@ -195,6 +195,14 @@ fn non_grammar_query_bodies_and_table_factors_are_rejected() {
 }
 
 #[test]
+fn an_aliased_parenthesized_name_resolves_as_an_expression() {
+    let error = rejection("SELECT * FROM (docs) AS d");
+    assert!(error.message.as_deref().unwrap().contains("docs"), "{error:?}");
+    prepare("SELECT * FROM (docs AS d)", &Fixture, &PrepareOptions::default()).unwrap();
+    prepare("SELECT * FROM (VALUES (1)) q(n), (q.n) AS t(v)", &Fixture, &PrepareOptions::default()).unwrap();
+}
+
+#[test]
 fn non_grammar_dml_ddl_and_transaction_forms_are_rejected() {
     for sql in [
         "INSERT docs (_id) VALUES (1)",
