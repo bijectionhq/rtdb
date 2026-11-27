@@ -1,9 +1,10 @@
-use std::cmp::Ordering;
+use std::{cmp::Ordering, convert::Infallible};
 use arrow_array::{
+    Array, BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray,
     cast::AsArray,
     types::{Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type},
 };
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Field};
 use rtdb_columnar::ArrowCell;
 use rtdb_types::{LogicalType, ScalarType, UriParts, Value};
 
@@ -24,22 +25,93 @@ pub(crate) enum ScalarKey<'a> {
     Uri(&'a str),
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum ScalarColumn<'a> {
+    Null,
+    Bool(&'a BooleanArray),
+    I8(&'a Int8Array),
+    I16(&'a Int16Array),
+    I32(&'a Int32Array),
+    I64(&'a Int64Array),
+    F32(&'a Float32Array),
+    F64(&'a Float64Array),
+    Text(&'a StringArray),
+    Bytes(&'a BinaryArray),
+}
+
+impl<'a> ScalarColumn<'a> {
+    pub fn bind(array: &'a dyn Array, field: &Field, logical: Option<&LogicalType>) -> Option<Self> {
+        if !field.metadata().is_empty() || array.data_type() != field.data_type() {
+            return None;
+        }
+        let logical = crate::columnar::float_vector::nonnull(logical?);
+        let array_type = array.as_any();
+        Some(match (array.data_type(), logical) {
+            (DataType::Null, LogicalType::Null) if field.is_nullable() => Self::Null,
+            (DataType::Boolean, LogicalType::Scalar(ScalarType::Bool)) => Self::Bool(array_type.downcast_ref()?),
+            (DataType::Int8, LogicalType::Scalar(ScalarType::I8)) => Self::I8(array_type.downcast_ref()?),
+            (DataType::Int16, LogicalType::Scalar(ScalarType::I16)) => Self::I16(array_type.downcast_ref()?),
+            (DataType::Int32, LogicalType::Scalar(ScalarType::I32)) => Self::I32(array_type.downcast_ref()?),
+            (DataType::Int64, LogicalType::Scalar(ScalarType::I64)) => Self::I64(array_type.downcast_ref()?),
+            (DataType::Float32, LogicalType::Scalar(ScalarType::F32)) => Self::F32(array_type.downcast_ref()?),
+            (DataType::Float64, LogicalType::Scalar(ScalarType::F64)) => Self::F64(array_type.downcast_ref()?),
+            (DataType::Utf8, LogicalType::Scalar(ScalarType::Utf8)) => Self::Text(array_type.downcast_ref()?),
+            (DataType::Binary, LogicalType::Scalar(ScalarType::Binary)) => Self::Bytes(array_type.downcast_ref()?),
+            _ => return None,
+        })
+    }
+
+    pub fn read(self, row: usize) -> ScalarKey<'a> {
+        let mut value = ScalarKey::Null;
+        self.visit(std::iter::once(Some(row)), |key| {
+            value = key;
+            Ok::<_, Infallible>(())
+        }).unwrap();
+        value
+    }
+
+    pub fn visit<E>(
+        self,
+        rows: impl IntoIterator<Item = Option<usize>>,
+        mut visit: impl FnMut(ScalarKey<'a>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        fn read_rows<'a, E>(
+            array: &impl Array,
+            rows: impl IntoIterator<Item = Option<usize>>,
+            read: impl Fn(usize) -> ScalarKey<'a>,
+            mut visit: impl FnMut(ScalarKey<'a>) -> Result<(), E>,
+        ) -> Result<(), E> {
+            for row in rows {
+                let key = match row {
+                    Some(row) if array.is_valid(row) => read(row),
+                    _ => ScalarKey::Null,
+                };
+                visit(key)?;
+            }
+            Ok(())
+        }
+
+        match self {
+            Self::Null => rows.into_iter().try_for_each(|_| visit(ScalarKey::Null)),
+            Self::Bool(array) => read_rows(array, rows, |row| ScalarKey::Bool(array.value(row)), visit),
+            Self::I8(array) => read_rows(array, rows, |row| ScalarKey::Signed(i64::from(array.value(row))), visit),
+            Self::I16(array) => read_rows(array, rows, |row| ScalarKey::Signed(i64::from(array.value(row))), visit),
+            Self::I32(array) => read_rows(array, rows, |row| ScalarKey::Signed(i64::from(array.value(row))), visit),
+            Self::I64(array) => read_rows(array, rows, |row| ScalarKey::Signed(array.value(row)), visit),
+            Self::F32(array) => read_rows(array, rows, |row| ScalarKey::Float(f64::from(array.value(row))), visit),
+            Self::F64(array) => read_rows(array, rows, |row| ScalarKey::Float(array.value(row)), visit),
+            Self::Text(array) => read_rows(array, rows, |row| ScalarKey::Text(array.value(row)), visit),
+            Self::Bytes(array) => read_rows(array, rows, |row| ScalarKey::Bytes(array.value(row)), visit),
+        }
+    }
+}
+
 impl<'a> ScalarKey<'a> {
     pub fn read(column: &'a Column, row: usize) -> Option<Self> {
         let Some((array, field, logical, row)) = column.arrow_cell(row)? else {
             return Some(Self::Null);
         };
-        if !field.metadata().is_empty() {
-            return None;
-        }
-        match (array.data_type(), crate::columnar::float_vector::nonnull(logical?)) {
-            (DataType::Null | DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32
-            | DataType::Int64 | DataType::Float32 | DataType::Float64 | DataType::Utf8 | DataType::Binary,
-            LogicalType::Null | LogicalType::Scalar(ScalarType::Bool | ScalarType::I8 | ScalarType::I16
-            | ScalarType::I32 | ScalarType::I64 | ScalarType::F32 | ScalarType::F64 | ScalarType::Utf8 | ScalarType::Binary)) =>
-                Self::read_resolved(ArrowCell { array, field, row }, logical?),
-            _ => None,
-        }
+        ScalarColumn::bind(array, field, logical).map(|column| column.read(row))
     }
 
     pub fn read_resolved(cell: ArrowCell<'a>, logical: &LogicalType) -> Option<Self> {

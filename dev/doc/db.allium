@@ -2313,6 +2313,7 @@ surface QueryAccess {
         -- DISTINCT and set operations with columnar inputs select their output positions from those Arrow batches.
         -- DISTINCT holds its seen keys in memory and fails when the memory budget cannot hold them.
         -- Their key index retains Arrow batches and hashes and compares compatible scalar and floating-point vector cells at their indexed positions.
+        -- A grouping batch with bound scalar columns hashes each column in turn and compares same-batch key candidates through those readers.
         -- Key readers follow logical union leg names and run ends to borrow the selected scalar or vector values.
         -- URI keys retain the raw hash check and the SQL comparison of their spellings.
         -- Arrow join pushdown retains the IID candidates of supported identity cells alongside their Bloom positions.

@@ -10,7 +10,7 @@ use crate::{
     invalid,
     join_storage::combine_cell_hash,
     operators::{combine_equality_hash, equality_cell_hash, has_uri},
-    scalar_key::ScalarKey,
+    scalar_key::{ScalarColumn, ScalarKey},
 };
 
 #[derive(Clone, Copy)]
@@ -30,6 +30,25 @@ impl<'a> KeyColumns<'a> {
     pub fn projection(batch: &'a ColumnBatch, positions: &'a [usize]) -> Self {
         Self { batch, positions: Some(positions) }
     }
+
+    pub(crate) fn bind_typed(self, context: &QueryContext) -> Result<Option<TypedKeys<'a>>> {
+        if self.positions.is_some_and(|positions| positions.iter().any(|&p| p >= self.batch.columns.len())) {
+            return Err(invalid("column-gather", "Row position is outside its source batch"));
+        }
+        let width = self.positions.map_or(self.batch.columns.len(), <[usize]>::len);
+        let columns = (0..width).map(|index| {
+            &self.batch.columns[self.positions.map_or(index, |positions| positions[index])]
+        });
+        if !columns.clone().all(|column| TypedKeyColumn::bind(column).is_some()) {
+            return Ok(None);
+        }
+        let bytes = width.checked_mul(size_of::<TypedKeyColumn<'_>>()).ok_or_else(size_error)?;
+        let reservation = context.memory.reserve(bytes)?;
+        let readers = columns
+            .map(|column| TypedKeyColumn::bind(column).expect("The key layout was bound"))
+            .collect();
+        Ok(Some(TypedKeys { source: self, readers, _reservation: reservation }))
+    }
 }
 
 impl<'a> From<&'a ColumnBatch> for KeyColumns<'a> {
@@ -38,9 +57,106 @@ impl<'a> From<&'a ColumnBatch> for KeyColumns<'a> {
     }
 }
 
+enum TypedKeyColumn<'a> {
+    Flat(ScalarColumn<'a>),
+    Selected { column: &'a Column, reader: ScalarColumn<'a> },
+}
+
+impl<'a> TypedKeyColumn<'a> {
+    fn bind(column: &'a Column) -> Option<Self> {
+        Some(match column {
+            Column::Arrow { array, field, logical } =>
+                Self::Flat(ScalarColumn::bind(array.as_ref(), field, logical.as_ref())?),
+            Column::Selected(selected) => {
+                let mut layouts = selected.source_layouts();
+                let Some((array, field, logical)) = layouts.next() else {
+                    return Some(Self::Flat(ScalarColumn::Null));
+                };
+                if layouts.next().is_some() { return None; }
+                Self::Selected { column, reader: ScalarColumn::bind(array, field, logical)? }
+            }
+            Column::Values(_) => return None,
+        })
+    }
+
+    fn read(&self, row: usize) -> ScalarKey<'a> {
+        match self {
+            Self::Flat(reader) => reader.read(row),
+            Self::Selected { column, reader } => Self::position(column, row)
+                .map_or(ScalarKey::Null, |position| reader.read(position)),
+        }
+    }
+
+    fn visit(&self, len: usize, visit: impl FnMut(ScalarKey<'a>) -> Result<()>) -> Result<()> {
+        match self {
+            Self::Flat(reader) => reader.visit((0..len).map(Some), visit),
+            Self::Selected { column, reader } =>
+                reader.visit((0..len).map(|row| Self::position(column, row)), visit),
+        }
+    }
+
+    fn position(column: &Column, row: usize) -> Option<usize> {
+        column.arrow_cell(row).expect("The selected key covers the batch")
+            .map(|(_, _, _, offset)| offset)
+    }
+}
+
+pub(crate) struct TypedKeys<'a> {
+    source: KeyColumns<'a>,
+    readers: Vec<TypedKeyColumn<'a>>,
+    _reservation: Arc<MemoryReservation>,
+}
+
+impl TypedKeys<'_> {
+    pub(crate) fn hash_vector_into(&self, hashes: &mut [u32], context: &QueryContext) -> Result<()> {
+        self.hash_into(hashes, context, |hash, cell| combine_cell_hash(hash, cell as i32))
+    }
+
+    fn hash_for_index(&self, hashes: &mut [u32], context: &QueryContext, hashing: KeyHash) -> Result<()> {
+        match hashing {
+            KeyHash::Set => self.hash_into(hashes, context, combine_equality_hash),
+            KeyHash::Vector => self.hash_vector_into(hashes, context),
+        }
+    }
+
+    fn hash_into(
+        &self, hashes: &mut [u32], context: &QueryContext, combine: impl Fn(u32, u32) -> u32,
+    ) -> Result<()> {
+        let len = self.source.batch.len;
+        assert_eq!(len, hashes.len());
+        hashes.fill(0);
+        for column in &self.readers {
+            let mut output = hashes.iter_mut().enumerate();
+            column.visit(len, |key| {
+                let (row, hash) = output.next().expect("The column emits one key per row");
+                context.check_cancelled_at(row)?;
+                *hash = combine(*hash, key.hash());
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn key(&self, row: usize, projected: bool) -> Key<'_> {
+        Key {
+            source: ArrowKey { columns: &self.source.batch.columns, row, projected },
+            positions: self.source.positions,
+            typed: Some(&self.readers),
+            values: Vec::new(),
+            has_uri: false,
+            _reservation: None,
+        }
+    }
+
+    fn equal_rows(&self, left: usize, right: usize) -> bool {
+        self.readers.iter().all(|column| column.read(left).equal(column.read(right)) == Some(true))
+    }
+}
+
 pub(crate) struct Key<'a> {
     source: ArrowKey<'a>,
     positions: Option<&'a [usize]>,
+    typed: Option<&'a [TypedKeyColumn<'a>]>,
     values: Vec<(usize, Value)>,
     has_uri: bool,
     _reservation: Option<Arc<MemoryReservation>>,
@@ -152,7 +268,7 @@ pub(crate) fn direct_bloom_hashes(column: &Column, row: usize) -> Option<((i32, 
 
 impl<'a> Key<'a> {
     fn read(source: ArrowKey<'a>, positions: Option<&'a [usize]>, context: &QueryContext) -> Result<Self> {
-        let mut key = Self { source, positions, values: Vec::new(), has_uri: false, _reservation: None };
+        let mut key = Self { source, positions, typed: None, values: Vec::new(), has_uri: false, _reservation: None };
         let mut bound = 256usize;
         for index in 0..key.len() {
             let column = key.column(index);
@@ -199,6 +315,9 @@ impl<'a> Key<'a> {
     }
 
     fn direct(&self, index: usize) -> Option<DirectKey<'_>> {
+        if let Some(typed) = self.typed {
+            return Some(DirectKey::Scalar(typed[index].read(self.source.row)));
+        }
         match self.cached(index) {
             Some(value) => DirectKey::from_value(value),
             None => DirectKey::read(self.column(index), self.source.row),
@@ -738,9 +857,7 @@ impl BatchKeyIndex {
     ) -> Result<()> {
         let columns = columns.into();
         let KeyColumns { batch, positions } = columns;
-        if positions.is_some_and(|positions| positions.iter().any(|&position| position >= batch.columns.len())) {
-            return Err(invalid("column-gather", "Row position is outside its source batch"));
-        }
+        let typed = columns.bind_typed(context)?;
         let width = positions.map_or(batch.columns.len(), <[usize]>::len);
         let bytes = batch
             .len
@@ -757,18 +874,31 @@ impl BatchKeyIndex {
         let previous = self.positions.rows.len();
         let mut picks = Vec::with_capacity(batch.len);
         let mut hashes = Vec::with_capacity(batch.len);
+        if let Some(typed) = &typed && batch.len != 0 {
+            context.check_cancelled()?;
+            crate::operators::validate_distinct_types(schema)?;
+            hashes.resize(batch.len, 0);
+            typed.hash_for_index(&mut hashes, context, self.hashing)?;
+        }
         for row in 0..batch.len {
             context.check_cancelled_at(row)?;
-            let (hash, key) = Key::bind(columns, row, projected, context, self.hashing)?;
-            if row == 0 {
-                crate::operators::validate_distinct_types(schema)?;
-            }
+            let (hash, key) = match &typed {
+                Some(typed) => (hashes[row], typed.key(row, projected)),
+                None => {
+                    let pair = Key::bind(columns, row, projected, context, self.hashing)?;
+                    if row == 0 { crate::operators::validate_distinct_types(schema)?; }
+                    pair
+                }
+            };
             if let Some(index) = self.find(hash, &key, false, context)? {
                 visit(row, index, false)?;
                 continue;
             }
             let direct = key.decodable();
             let known = current.find(u64::from(hash), false, context, |index, position| {
+                if let Some(typed) = &typed {
+                    return Ok(typed.equal_rows(row, position.row));
+                }
                 if direct {
                     let selected = positions.map(|positions| positions.iter().map(|&position| &batch.columns[position]));
                     let columns = selected.into_iter().flatten().chain(positions.is_none().then(|| batch.columns.iter()).into_iter().flatten());
@@ -786,8 +916,13 @@ impl BatchKeyIndex {
             visit(row, index, known.is_none())?;
             if known.is_none() {
                 current.push(u64::from(hash), 0, row);
+                if typed.is_some() {
+                    // Compact first-seen hashes into the already visited prefix.
+                    hashes[picks.len()] = hash;
+                } else {
+                    hashes.push(hash);
+                }
                 picks.push((0, row));
-                hashes.push(hash);
             }
         }
         if picks.is_empty() {
@@ -797,6 +932,7 @@ impl BatchKeyIndex {
             (None, KeyHash::Set) => batch.select_keys(&picks, &context.memory)?,
             _ => batch.compact_group_key_columns(&picks, positions, &context.memory)?,
         };
+        hashes.truncate(picks.len());
         self.append(compact, projected, &hashes)
     }
 }
@@ -809,7 +945,7 @@ fn size_error() -> rtdb_types::Anomaly {
 mod tests {
     use std::collections::BTreeMap;
 
-    use arrow_array::{Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray};
+    use arrow_array::{Array, ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use rtdb_columnar::{MemoryBudget, OwnedBatch};
     use rtdb_storage::{MemoryStore, cache::BufferPool};
@@ -817,7 +953,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use crate::{CatalogSnapshot, DatabaseSnapshot, QueryOptions, columnar::PredicateSelection};
+    use crate::{CatalogSnapshot, DatabaseSnapshot, QueryOptions, columnar::{PredicateSelection, SelectedColumn}};
 
     fn context() -> Arc<QueryContext> {
         let database = DatabaseSnapshot {
@@ -838,15 +974,93 @@ mod tests {
         .unwrap()
     }
 
-    fn batch(integers: ArrayRef, texts: Vec<Option<&str>>, context: &QueryContext) -> ColumnBatch {
+    fn batch(numbers: ArrayRef, texts: Vec<Option<&str>>, context: &QueryContext) -> ColumnBatch {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("n", integers.data_type().clone(), true),
+            Field::new("n", numbers.data_type().clone(), true),
             Field::new("s", DataType::Utf8, true),
         ]));
         let batch =
-            RecordBatch::try_new(schema, vec![integers, Arc::new(StringArray::from(texts))])
+            RecordBatch::try_new(schema, vec![numbers, Arc::new(StringArray::from(texts))])
                 .unwrap();
         ColumnBatch::from_owned(OwnedBatch::new(batch, &context.memory).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn typed_selected_key_hashes_match_value_hashes_in_projection_order() {
+        let context = context();
+        let nan = f64::from_bits(0x7ff8_0000_0000_1357);
+        let input = batch(
+            Arc::new(Float64Array::from(vec![Some(-0.0), Some(nan), None, Some(13.0)])),
+            vec![Some("zero"), Some("nan"), Some("nil"), Some("number")],
+            &context,
+        );
+        let positions = Arc::new(vec![(0, 3), (0, 1), (1, 0), (0, 2), (0, 0), (0, 3)]);
+        let columns = input.columns.iter().enumerate().map(|(index, column)| {
+            let Column::Arrow { array, field, logical } = column else { panic!("Expected an Arrow vector") };
+            let source = (Arc::clone(array), Arc::clone(field), logical.clone(),
+                Some(Arc::clone(input.column_reservation(index))));
+            Column::Selected(SelectedColumn::new(vec![Some(source), None], Arc::clone(&positions)))
+        }).collect();
+        let selected = ColumnBatch::settled(columns, positions.len(), context.memory.reserve(4096).unwrap()).unwrap();
+        let typed = KeyColumns::projection(&selected, &[1, 0, 1]).bind_typed(&context).unwrap().unwrap();
+        let mut vector = vec![u32::MAX; selected.len];
+        let mut set = vector.clone();
+        typed.hash_vector_into(&mut vector, &context).unwrap();
+        typed.hash_for_index(&mut set, &context, KeyHash::Set).unwrap();
+
+        for (row, (number, text)) in [
+            (Some(13.0), Some("number")), (Some(nan), Some("nan")), (None, None),
+            (None, Some("nil")), (Some(-0.0), Some("zero")), (Some(13.0), Some("number")),
+        ].into_iter().enumerate() {
+            let number = number.map_or(Value::Null, Value::F64);
+            let text = text.map_or(Value::Null, |value| Value::Utf8(value.into()));
+            let values = [text.clone(), number, text];
+            assert_eq!(vector[row], crate::join_storage::hash_values(&values).unwrap());
+            assert_eq!(set[row], crate::operators::equality_hash(&values, &context.timezone));
+            assert_eq!(typed.key(row, false).vector_hash().unwrap(), vector[row]);
+        }
+
+        let nulls = typed.key(2, false);
+        let nan = typed.key(1, false);
+        assert_eq!(nulls.equal_at(&nulls, 1, true, &context, None).unwrap(), Some(true));
+        assert_eq!(nulls.equal_at(&nulls, 1, false, &context, None).unwrap(), None);
+        assert_eq!(nan.equal_at(&nan, 1, true, &context, None).unwrap(), Some(false));
+        assert!(typed.equal_rows(0, 5));
+    }
+
+    #[test]
+    fn group_keys_keep_first_seen_ordinals_across_numeric_widths_and_nulls() {
+        let context = context();
+        let large = 1_i64 << 55;
+        let batches = [
+            batch(Arc::new(Int64Array::from(vec![Some(large), Some(large + 1), None, Some(0), Some(large)])),
+                vec![Some("key"); 5], &context),
+            batch(Arc::new(Float32Array::from(vec![Some(large as f32), None, Some(-0.0), Some(f32::NAN), Some(f32::NAN)])),
+                vec![Some("key"); 5], &context),
+            batch(Arc::new(Float64Array::from(vec![-0.0, 0.0, f64::NAN])),
+                vec![Some("key"); 3], &context),
+        ];
+        let mut index = BatchKeyIndex::vector_hashing(&context).unwrap();
+        let mut groups = Vec::new();
+        for batch in &batches {
+            index.identify(KeyColumns::projection(batch, &[1, 0]), false, &context,
+                &rtdb_plan::Schema::default(), |_, ordinal, first| {
+                    groups.push((ordinal, first));
+                    Ok(())
+                }).unwrap();
+        }
+        assert_eq!(groups, [
+            (0, true), (1, true), (2, true), (3, true), (0, false),
+            (0, false), (2, false), (4, true), (5, true), (6, true),
+            (4, false), (3, false), (7, true),
+        ]);
+        let keys = index.group_keys(2, &context).unwrap().unwrap();
+        assert_eq!(keys.len, 8);
+        for (row, expected) in [Value::I64(large), Value::I64(large + 1), Value::Null, Value::I64(0), Value::F32(-0.0)]
+            .into_iter().enumerate()
+        {
+            assert_eq!(keys.columns[1].value(row).unwrap(), expected);
+        }
     }
 
     /// Each hashing mode reads a cell either directly from Arrow or as a decoded value; a cell must hash alike either way,
@@ -1138,6 +1352,7 @@ mod tests {
         };
         let left_batch = batch(&left);
         let right_batch = batch(&right);
+        assert!(KeyColumns::from(&left_batch).bind_typed(&context).unwrap().is_none());
         let (hash, key) = Key::bind(&left_batch, 0, false, &context, KeyHash::Set).unwrap();
         assert_eq!(key.values, [(0, Value::DateDay(0))]);
         assert_eq!(hash, crate::operators::equality_hash(&left, &context.timezone));
