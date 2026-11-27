@@ -127,12 +127,16 @@ Targets that stand for one of upstream's main loggers also answer to that logger
 |`rtdb_columnar` |`xtdb.arrow`
 |`rtdb_plan` |`xtdb.logical-plan`
 |`rtdb_auth` |`xtdb.authn`
+|`rtdb_server::cli` |`xtdb.main`
 |`rtdb_server::health` |`xtdb.healthz`
-|`rtdb_server::prometheus` |`xtdb.metrics`
+|`rtdb_server::prometheus`, `rtdb_server::metric_export` |`xtdb.metrics`
 |`rtdb_server::tracing` |`xtdb.tracer`
 |`rtdb_s3` |`xtdb.aws`
+|`rtdb_azure` |`xtdb.azure`
 |`rtdb_gcs` |`xtdb.gcp`
 |`rtdb_pg_source` |`xtdb.postgres`
+|`rtdb_kafka::connect` |`xtdb.kafka.connectsrc`
+|`rtdb_kafka` (otherwise) |`xtdb.api.log`
 |===
 
 Every other target is reachable only by its `xtdb.<crate>.<module>` name; lines name the logger by that name.
