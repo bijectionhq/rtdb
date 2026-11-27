@@ -13,7 +13,7 @@ use arrow_buffer::Buffer;
 use bytes::Bytes;
 use arrow_schema::DataType;
 use async_trait::async_trait;
-use rtdb_columnar::{IidView, MemoryBudget, MemoryReservation, OwnedBatch, estimate_builder_bytes, from_field};
+use rtdb_columnar::{BufferIdentity, IidView, MemoryBudget, MemoryReservation, OwnedBatch, estimate_builder_bytes, from_field};
 use rtdb_columnar::arrow_flow;
 use rtdb_format::{data::{EventBatch, PutText}, ipc::{PageDecoder, PageProjection, inspect_file_reserved}, keys::{TableSlug, TrieKey}, metadata::{MetadataFile, MetadataNode}};
 use rtdb_index::{CatalogTrie, IndexBatch, LiveTable, LocatedRows, RowSource, Snapshot, TrieState};
@@ -22,7 +22,7 @@ use rtdb_storage::{ObjectKey, cache::{BufferPool, CacheLease, Cached, View}};
 use rtdb_temporal::{HistoryResolver, ResolvedRow};
 use rtdb_trie::{PageSummary, PruningOptions, TemporalSummary, select_pages_from_iter, select_pages_with_scratch};
 use rtdb_types::{ARCHIVE_TX_FROM, ARCHIVE_TX_TO, HOSTED_RECEIPT_TX_ID, OWNED_EVENT_POSITION_COLUMN,
-    Anomaly, AnomalyKind, EntityId, EventHeader, EventOp, EventPosition, Iid, Interval, Result, TemporalBounds, Timestamp, Value};
+    Anomaly, AnomalyKind, EntityId, EventHeader, EventOp, EventPosition, Iid, Interval, Result, TemporalBounds, TimeUnit, Timestamp, Value};
 
 use crate::columnar::{BatchCursor, BatchFilter, BoxBatchCursor, Column, admitted_predicate_selection};
 use crate::compiled::{Admission, Predicates};
@@ -733,6 +733,7 @@ impl ScanFilter {
                 Expr::Column { data_type, .. } | Expr::Parameter { data_type, .. } => Self::total_scalar(data_type),
                 Expr::Literal(Value::Null | Value::Bool(_) | Value::Utf8(_) | Value::I8(_) | Value::I16(_)
                     | Value::I32(_) | Value::I64(_) | Value::F32(_) | Value::F64(_)) => true,
+                Expr::Literal(Value::Timestamp { unit: TimeUnit::Microsecond, timezone, .. }) => timezone.as_deref() == Some("UTC"),
                 Expr::Binary { op: BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Or, .. }
                 | Expr::Unary { op: UnaryOp::Not | UnaryOp::IsNull | UnaryOp::IsNotNull, .. } => true,
                 _ => false,
@@ -763,6 +764,7 @@ impl ScanFilter {
         match data_type {
             LogicalType::Null => true,
             LogicalType::Maybe(inner) => Self::total_scalar(inner),
+            LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone }) => timezone.as_deref() == Some("UTC"),
             LogicalType::Scalar(scalar) => matches!(scalar, ScalarType::Bool | ScalarType::Utf8
                 | ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64 | ScalarType::F32 | ScalarType::F64),
             _ => false,
@@ -786,16 +788,20 @@ impl ProjectionEvidence {
 
     fn decoded(&mut self, batch: &arrow_array::RecordBatch) {
         for column in batch.columns() {
-            self.decoded_bytes = self.decoded_bytes.saturating_add(arrow_bytes(&column.to_data()));
+            visit_arrow_buffers(&column.to_data(), &mut |buffer| {
+                self.decoded_bytes = self.decoded_bytes.saturating_add(buffer.len() as u64);
+            });
         }
     }
 }
 
-fn arrow_bytes(data: &arrow_data::ArrayData) -> u64 {
-    // A projected IPC buffer can report the capacity of the entire input file.
-    let own = data.buffers().iter().chain(data.nulls().map(arrow_buffer::NullBuffer::buffer))
-        .fold(0u64, |bytes, buffer| bytes.saturating_add(buffer.len() as u64));
-    data.child_data().iter().fold(own, |bytes, child| bytes.saturating_add(arrow_bytes(child)))
+fn visit_arrow_buffers(data: &arrow_data::ArrayData, visit: &mut impl FnMut(&Buffer)) {
+    for buffer in data.buffers().iter().chain(data.nulls().map(arrow_buffer::NullBuffer::buffer)) {
+        visit(buffer);
+    }
+    for child in data.child_data() {
+        visit_arrow_buffers(child, visit);
+    }
 }
 
 pub(crate) struct PartitionScan {
@@ -2923,15 +2929,27 @@ impl PartitionScan {
         })?;
         let flow = arrow_flow::sample();
         if self.evidence.is_some() || flow.is_some() {
-            let mut bytes = 0u64;
+            let mut output_buffers = BTreeMap::<BufferIdentity, u64>::new();
             let mut retains_positions = false;
             for column in &output.columns {
                 match column {
-                    Column::Arrow { array, .. } => bytes = bytes.saturating_add(arrow_bytes(&array.to_data())),
+                    Column::Arrow { array, .. } => visit_arrow_buffers(&array.to_data(), &mut |buffer| {
+                        let bytes = output_buffers.entry(BufferIdentity::of(buffer)).or_default();
+                        *bytes = bytes.saturating_add(buffer.len() as u64);
+                    }),
                     Column::Selected(_) => retains_positions = true,
                     Column::Values(_) => {}
                 }
             }
+            for batch in batches {
+                if output_buffers.is_empty() { break; }
+                for column in batch.arrow().columns() {
+                    visit_arrow_buffers(&column.to_data(), &mut |buffer| {
+                        output_buffers.remove(&BufferIdentity::of(buffer));
+                    });
+                }
+            }
+            let bytes = output_buffers.into_values().fold(0u64, u64::saturating_add);
             if let Some(evidence) = &mut self.evidence {
                 evidence.gathered_bytes = evidence.gathered_bytes.saturating_add(bytes);
                 if filtered && retains_positions {

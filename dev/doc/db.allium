@@ -2348,7 +2348,9 @@ surface QueryAccess {
         -- A point in both time dimensions selects the same visible fragment as history resolution, including its valid-time endpoints and the effects of deletes and erases.
         -- An eligible range predicate on a local scan reads its referenced columns from the resolved rows, and payload projection gathers only the positions the predicate keeps.
         -- An ordinary scan can apply a bound, total scalar predicate to its referenced columns after bitemporal resolution and gather other columns from the surviving positions.
+        -- A bound predicate over UTC microsecond timestamps can use those resolved positions, including the nullable bounds of a visible fragment.
         -- Scan traces distinguish the Arrow buffer bytes of freshly decoded data from the buffers materialized by output gathering and the filtered rows retained by position.
+        -- Gathered bytes exclude Arrow buffers that share their backing with a resolved source page.
         -- A spatial fallback read projects IIDs from persisted pages.
         -- A spatial refinement scan can project the requested put children from persisted pages.
         -- A located point read decodes the event headers and the put fields needed by its projection and predicates.
@@ -2502,6 +2504,7 @@ surface QueryAccess {
         -- A sparse selection of compatible in-memory maps also stays in Arrow.
         -- A delegated scan sends selected source vectors in Arrow IPC in their scan order.
         -- A delegated reader can gather unrelated columns after applying an eligible total predicate to its resolved rows.
+        -- Its eligible predicates include bound comparisons of resolved UTC microsecond timestamps.
         -- Each fragment frame preserves its source fields and the coordinator can filter its Arrow vectors by position.
         -- Each fragment frame builds its own wire field descriptors, and frame boundaries are chosen up front (including at run-end selection width limits) so a memory refusal fails the query.
         -- Compatible contiguous nested selections keep their funded source buffers through reply encoding even across frame splits.

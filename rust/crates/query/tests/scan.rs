@@ -181,14 +181,15 @@ async fn a_fragment_filters_visible_versions_before_copying_wide_payloads() {
         row.insert("payload".into(), Value::Utf8(payload));
         row
     };
+    let bounded = Interval::from_micros(0, 100).unwrap();
     let mut first = tx(&state, &writes, 0, 100);
-    first.put(table(), row(1, Value::Utf8("keep".into()), "original".into()), Interval::ALL).unwrap();
+    first.put(table(), row(1, Value::Utf8("keep".into()), "original".into()), bounded).unwrap();
     first.put(table(), row(2, Value::Utf8("reject".into()), "x".repeat(2 << 20)), Interval::ALL).unwrap();
     first.put(table(), row(3, Value::Null, "x".repeat(2 << 20)), Interval::ALL).unwrap();
     state.apply(&first.stage().unwrap()).unwrap();
     let mut second = tx(&state, &writes, 1, 200);
     second.put(table(), row(1, Value::Utf8("reject".into()), "x".repeat(2 << 20)), Interval::ALL).unwrap();
-    second.put(table(), row(2, Value::Utf8("keep".into()), "replacement".into()), Interval::ALL).unwrap();
+    second.put(table(), row(2, Value::Utf8("keep".into()), "replacement".into()), bounded).unwrap();
     state.apply(&second.stage().unwrap()).unwrap();
 
     let snapshot = state.snapshot();
@@ -196,29 +197,35 @@ async fn a_fragment_filters_visible_versions_before_copying_wide_payloads() {
     let database = DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)) };
     let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
     let context = QueryContext::new(catalog, MemoryBudget::new(1 << 19), Timestamp(50), "UTC", QueryOptions::default(), &CancellationToken::new()).unwrap();
-    let relation = scan(&context, &["v", "_id", "payload", "_system_from"], at(50), at(200), None);
+    let relation = scan(&context, &["v", "_id", "payload", "_system_from", "_valid_to"], at(50), at(200), None);
     let rtdb_plan::RelationNode::Scan(source) = relation.node() else { unreachable!() };
-    let mut source = source.clone();
-    source.predicates = vec![Expr::binary(BinaryOp::Eq, source.columns[0].expression(), Expr::Literal(Value::Utf8("keep".into())))];
+    let predicates = [
+        Expr::binary(BinaryOp::Eq, source.columns[0].expression(), Expr::Literal(Value::Utf8("keep".into()))),
+        Expr::binary(BinaryOp::Eq, source.columns[4].expression(), Expr::Literal(timestamp(100))),
+    ];
 
-    for (system, id, payload) in [(100, 1, "original"), (200, 2, "replacement")] {
-        let fragment = ScanFragment {
-            scan: source.clone(), prefix: TriePrefix::new(Vec::new()).unwrap(), basis, residence: None,
-            bounds: rtdb_types::TemporalBounds {
-                valid_time: Interval::from_micros(50, 51).unwrap(), system_time: Interval::from_micros(system, system + 1).unwrap(),
-            },
-            timezone: "UTC".into(),
-        };
-        let wire = evaluate_fragment(Arc::clone(&context), &fragment).await.unwrap();
-        let (length, bytes) = wire.split_first_chunk::<8>().unwrap();
-        assert_eq!(u64::from_be_bytes(*length) as usize, bytes.len());
-        let mut reader = arrow_ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None).unwrap();
-        let batch = reader.next().unwrap().unwrap();
-        assert_eq!(batch.num_rows(), 1);
-        assert!(reader.next().is_none());
-        let values = batch.schema_ref().fields().iter().zip(batch.columns())
-            .map(|(field, column)| read_value(field, column.as_ref(), 0)).collect::<Result<Vec<_>>>().unwrap();
-        assert_eq!(values, [Value::Utf8("keep".into()), Value::I64(id), Value::Utf8(payload.into()), timestamp(system)]);
+    for predicate in predicates {
+        let mut source = source.clone();
+        source.predicates = vec![predicate];
+        for (system, id, payload) in [(100, 1, "original"), (200, 2, "replacement")] {
+            let fragment = ScanFragment {
+                scan: source.clone(), prefix: TriePrefix::new(Vec::new()).unwrap(), basis, residence: None,
+                bounds: rtdb_types::TemporalBounds {
+                    valid_time: Interval::from_micros(50, 51).unwrap(), system_time: Interval::from_micros(system, system + 1).unwrap(),
+                },
+                timezone: "UTC".into(),
+            };
+            let wire = evaluate_fragment(Arc::clone(&context), &fragment).await.unwrap();
+            let (length, bytes) = wire.split_first_chunk::<8>().unwrap();
+            assert_eq!(u64::from_be_bytes(*length) as usize, bytes.len());
+            let mut reader = arrow_ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None).unwrap();
+            let batch = reader.next().unwrap().unwrap();
+            assert_eq!(batch.num_rows(), 1);
+            assert!(reader.next().is_none());
+            let values = batch.schema_ref().fields().iter().zip(batch.columns())
+                .map(|(field, column)| read_value(field, column.as_ref(), 0)).collect::<Result<Vec<_>>>().unwrap();
+            assert_eq!(values, [Value::Utf8("keep".into()), Value::I64(id), Value::Utf8(payload.into()), timestamp(system), timestamp(100)]);
+        }
     }
 }
 
@@ -267,11 +274,19 @@ async fn scan_trace_distinguishes_decoded_pages_from_surviving_payload() {
     let writes = MemoryBudget::new(1 << 27);
     let store = Arc::new(MemoryStore::default());
     let width = 1 << 16;
+    let mut ids = [1, 2, 3];
+    ids.sort_by_key(|id| EntityId::Integer(*id).iid());
+    let row = |id, value, payload| {
+        let mut doc = document(id, Value::I64(value));
+        doc.insert("payload".into(), Value::Utf8(payload));
+        doc
+    };
     let mut write = tx(&state, &writes, 0, 10);
-    for (id, value, payload) in [(1, 5, "kept".into()), (2, 0, "x".repeat(width))] {
-        let mut row = document(id, Value::I64(value));
-        row.insert("payload".into(), Value::Utf8(payload));
-        write.put(table(), row, Interval::ALL).unwrap();
+    write.put(table(), row(ids[0], 5, "first".into()), Interval::ALL).unwrap();
+    state.apply(&write.stage().unwrap()).unwrap();
+    let mut write = tx(&state, &writes, 1, 20);
+    for (id, value, payload) in [(ids[1], 0, "x".repeat(width)), (ids[2], 6, "last".into())] {
+        write.put(table(), row(id, value, payload), Interval::ALL).unwrap();
     }
     state.apply(&write.stage().unwrap()).unwrap();
     persist(&state, &store).await;
@@ -279,14 +294,21 @@ async fn scan_trace_distinguishes_decoded_pages_from_surviving_payload() {
     let context = query_context(state.snapshot(), store, false);
     let (tracer, mut receiver) = rtdb_metrics::TraceRecorder::new(Arc::clone(&context.memory), 32, true, true).unwrap();
     let context = context.with_tracer(Some(tracer.clone()), None);
-    let relation = scan(&context, &["v", "payload"], TemporalFilter::All, TemporalFilter::All, None);
+    let relation = scan(&context, &["v", "payload", "_system_from"], TemporalFilter::All, TemporalFilter::All, None);
     let rtdb_plan::RelationNode::Scan(source) = relation.node() else { unreachable!() };
-    let mut source = source.clone();
-    source.predicates = vec![Expr::binary(BinaryOp::Eq, source.columns[0].expression(), Expr::Literal(Value::I64(5)))];
-    let relation = Arc::new(Relation::scan(source).unwrap());
+    let relation = |position: usize, op, value| {
+        let mut source = source.clone();
+        source.predicates = vec![Expr::binary(op, source.columns[position].expression(), Expr::Literal(value))];
+        Arc::new(Relation::scan(source).unwrap())
+    };
+    let first = vec![Value::I64(5), Value::Utf8("first".into()), timestamp(10)];
+    let last = vec![Value::I64(6), Value::Utf8("last".into()), timestamp(20)];
     for _ in 0..2 {
-        assert_eq!(collect(Arc::clone(&relation), Arc::clone(&context)).await.unwrap(), [vec![Value::I64(5), Value::Utf8("kept".into())]]);
+        let query = relation(2, BinaryOp::Eq, timestamp(10));
+        assert_eq!(collect(query, Arc::clone(&context)).await.unwrap(), [first.clone()]);
     }
+    let sparse = relation(0, BinaryOp::GtEq, Value::I64(5));
+    assert_eq!(collect(sparse, context).await.unwrap(), [first, last]);
     tracer.close();
     let mut counts = Vec::new();
     while let Some(span) = receiver.next().await {
@@ -296,11 +318,15 @@ async fn scan_trace_distinguishes_decoded_pages_from_surviving_payload() {
                 attributes["cursor.scan.gathered_bytes"].parse::<usize>().unwrap()));
         }
     }
-    let [(cold, gathered), (warm, gathered_again)] = counts.as_slice() else { panic!("Expected cold and warm scan spans: {counts:?}") };
+    let [(cold, gathered), (warm, gathered_again), (sparse_decoded, sparse_gathered)] = counts.as_slice() else {
+        panic!("Expected cold, warm and sparse scan spans: {counts:?}");
+    };
     assert!(*cold >= width);
     assert_eq!(*warm, 0);
-    assert!((1..width).contains(gathered));
-    assert_eq!(gathered, gathered_again);
+    assert_eq!(*gathered, size_of::<i64>());
+    assert_eq!(gathered_again, gathered);
+    assert_eq!(*sparse_decoded, 0);
+    assert!((2 * size_of::<i64>() + 1..width).contains(sparse_gathered));
 }
 
 #[tokio::test]
