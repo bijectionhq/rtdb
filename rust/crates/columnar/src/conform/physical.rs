@@ -80,7 +80,7 @@ pub(super) fn relayout_result(array: &ArrayRef, source: &Field, target: &Field, 
         scratch.borrow_mut().push(memory.reserve(bytes)?);
         Ok(())
     };
-    let (field, array) = relayout_in(Arc::clone(array), source, target, false, Some(&reserve))?;
+    let (field, array) = relayout_in(Arc::clone(array), source, target, false, Some(&reserve)).map_err(rtdb_types::Anomaly::from)?;
     Ok((field, array, scratch.into_inner()))
 }
 
@@ -151,11 +151,31 @@ fn undefined_union(source: &Field, target: &Field, event: bool) -> bool {
         && matches!(target.data_type(), DataType::Union(_, UnionMode::Dense))
 }
 
-pub(super) fn relayout(array: ArrayRef, source: &Field, target: &Field, event: bool) -> Result<(Field, ArrayRef)> {
-    relayout_in(array, source, target, event, None)
+enum RelayoutError {
+    Incompatible,
+    Anomaly(rtdb_types::Anomaly),
 }
 
-fn relayout_in(array: ArrayRef, source: &Field, target: &Field, event: bool, result: Option<&dyn Fn(usize) -> Result<()>>) -> Result<(Field, ArrayRef)> {
+impl From<rtdb_types::Anomaly> for RelayoutError {
+    fn from(error: rtdb_types::Anomaly) -> Self { Self::Anomaly(error) }
+}
+
+impl From<RelayoutError> for rtdb_types::Anomaly {
+    fn from(error: RelayoutError) -> Self {
+        match error {
+            RelayoutError::Incompatible => incompatible(),
+            RelayoutError::Anomaly(error) => error,
+        }
+    }
+}
+
+type RelayoutResult<T> = std::result::Result<T, RelayoutError>;
+
+pub(super) fn relayout(array: ArrayRef, source: &Field, target: &Field, event: bool) -> Result<(Field, ArrayRef)> {
+    relayout_in(array, source, target, event, None).map_err(Into::into)
+}
+
+fn relayout_in(array: ArrayRef, source: &Field, target: &Field, event: bool, result: Option<&dyn Fn(usize) -> Result<()>>) -> RelayoutResult<(Field, ArrayRef)> {
     if let Some(reserve) = result
         && let Some(bound) = collapse_bytes(array.as_ref(), source, target)?
     {
@@ -169,7 +189,7 @@ fn relayout_in(array: ArrayRef, source: &Field, target: &Field, event: bool, res
         && matches!(source.data_type(), DataType::Union(_, UnionMode::Dense))
         && !matches!(target.data_type(), DataType::Union(..) | DataType::RunEndEncoded(..))
     {
-        return gather_result_union(&array, source, target, None, reserve);
+        return gather_result_union(&array, source, target, None, reserve).map_err(RelayoutError::from);
     }
     if undefined_union(source, target, event) {
         return Ok((target.clone(), undefined_cells(target.data_type(), array.len())?));
@@ -181,7 +201,7 @@ fn relayout_in(array: ArrayRef, source: &Field, target: &Field, event: bool, res
             DataType::Int16 => pack_runs::<Int16Type>(&array)?,
             DataType::Int32 => pack_runs::<Int32Type>(&array)?,
             DataType::Int64 => pack_runs::<Int64Type>(&array)?,
-            _ => return Err(incompatible()),
+            _ => return Err(RelayoutError::Incompatible),
         };
         let layout = DataType::RunEndEncoded(Arc::clone(ends), Arc::new(field));
         let data = runs.to_data().into_builder().data_type(layout.clone()).build().map_err(crate::arrow_error)?;
@@ -193,7 +213,7 @@ fn relayout_in(array: ArrayRef, source: &Field, target: &Field, event: bool, res
             DataType::Int16 => unpack_runs::<Int16Type>(array.as_ref(), event)?,
             DataType::Int32 => unpack_runs::<Int32Type>(array.as_ref(), event)?,
             DataType::Int64 => unpack_runs::<Int64Type>(array.as_ref(), event)?,
-            _ => return Err(incompatible()),
+            _ => return Err(RelayoutError::Incompatible),
         };
         return relayout_in(expanded, values, target, event, result);
     }
@@ -202,8 +222,8 @@ fn relayout_in(array: ArrayRef, source: &Field, target: &Field, event: bool, res
             && matches!(source.data_type(), DataType::Union(_, UnionMode::Dense))
         {
             match union(Arc::clone(&array), source, target, fields, event, result) {
-                Err(error) if error.code == "xtdb/page-outside-declared-type" => {
-                    return gather_result_union(&array, source, target, Some(fields), reserve);
+                Err(RelayoutError::Incompatible) => {
+                    return gather_result_union(&array, source, target, Some(fields), reserve).map_err(RelayoutError::from);
                 }
                 outcome => return outcome,
             }
@@ -230,7 +250,7 @@ fn relayout_in(array: ArrayRef, source: &Field, target: &Field, event: bool, res
                 };
                 children.push(child.to_data());
                 Ok(field)
-            }).collect::<Result<Vec<_>>>()?;
+            }).collect::<RelayoutResult<Vec<_>>>()?;
             DataType::Struct(fields.into())
         }
         (DataType::List(source), DataType::List(target)) => {
@@ -257,7 +277,7 @@ fn relayout_in(array: ArrayRef, source: &Field, target: &Field, event: bool, res
         (source, target) if source == target => target.clone(),
         (DataType::Int8, DataType::UInt8) | (DataType::Int16, DataType::UInt16)
         | (DataType::Int32, DataType::UInt32) | (DataType::Int64, DataType::UInt64) => target.data_type().clone(),
-        _ => return Err(incompatible()),
+        _ => return Err(RelayoutError::Incompatible),
     };
     let field = target.clone().with_data_type(data_type.clone()).with_nullable(target.is_nullable() || source.is_nullable());
     let data = data.into_builder().data_type(data_type).child_data(children).build().map_err(crate::arrow_error)?;
@@ -345,7 +365,7 @@ impl<'a> ResultLeg<'a> {
         let mut children = Vec::with_capacity(self.sources.len());
         for (source, array) in self.sources {
             reserve(super::arrow_relayout_bound(array, source, &target)?)?;
-            let (field, child) = relayout_in(make_array(array.to_data()), source, &target, false, Some(reserve))?;
+            let (field, child) = relayout_in(make_array(array.to_data()), source, &target, false, Some(reserve)).map_err(rtdb_types::Anomaly::from)?;
             target = field.clone();
             children.push((field, child));
         }
@@ -355,7 +375,7 @@ impl<'a> ResultLeg<'a> {
                 inputs.push(child);
             } else {
                 reserve(super::arrow_relayout_bound(child.as_ref(), &source, &target)?)?;
-                let (_, child) = relayout_in(child, &source, &target, false, Some(reserve))?;
+                let (_, child) = relayout_in(child, &source, &target, false, Some(reserve)).map_err(rtdb_types::Anomaly::from)?;
                 inputs.push(child);
             }
         }
@@ -367,20 +387,20 @@ impl<'a> ResultLeg<'a> {
     }
 }
 
-fn pack_runs<R: RunEndIndexType>(array: &ArrayRef) -> Result<ArrayRef> {
-    let ends = (1..=array.len()).map(|end| R::Native::from_usize(end).ok_or_else(incompatible)).collect::<Result<Vec<_>>>()?;
+fn pack_runs<R: RunEndIndexType>(array: &ArrayRef) -> RelayoutResult<ArrayRef> {
+    let ends = (1..=array.len()).map(|end| R::Native::from_usize(end).ok_or(RelayoutError::Incompatible)).collect::<RelayoutResult<Vec<_>>>()?;
     let ends = PrimitiveArray::<R>::new(ends.into(), None);
     Ok(Arc::new(RunArray::<R>::try_new(&ends, array.as_ref()).map_err(crate::arrow_error)?))
 }
 
-fn unpack_runs<R: RunEndIndexType>(array: &dyn Array, event: bool) -> Result<ArrayRef> {
-    let runs = array.as_any().downcast_ref::<RunArray<R>>().ok_or_else(incompatible)?;
+fn unpack_runs<R: RunEndIndexType>(array: &dyn Array, event: bool) -> RelayoutResult<ArrayRef> {
+    let runs = array.as_any().downcast_ref::<RunArray<R>>().ok_or(RelayoutError::Incompatible)?;
     let selected = (0..runs.len()).map(|row| Some((0, runs.get_physical_index(row)))).collect::<Vec<_>>();
     let values = &[runs.values().as_ref()];
-    if event { crate::copy_event_cells(values, &selected) } else { copy_nullable_cells(values, &selected) }
+    Ok(if event { crate::copy_event_cells(values, &selected)? } else { copy_nullable_cells(values, &selected)? })
 }
 
-fn union(array: ArrayRef, source: &Field, target: &Field, targets: &UnionFields, event: bool, result: Option<&dyn Fn(usize) -> Result<()>>) -> Result<(Field, ArrayRef)> {
+fn union(array: ArrayRef, source: &Field, target: &Field, targets: &UnionFields, event: bool, result: Option<&dyn Fn(usize) -> Result<()>>) -> RelayoutResult<(Field, ArrayRef)> {
     let canonical = array.as_any().downcast_ref::<UnionArray>();
     let source_fields = match source.data_type() { DataType::Union(fields, UnionMode::Dense) => Some(fields), _ => None };
     let source_leg = if source_fields.is_none() { monomorphic_leg(source)? } else { None };
@@ -396,7 +416,7 @@ fn union(array: ArrayRef, source: &Field, target: &Field, targets: &UnionFields,
         let (source_field, child) = if let Some(sources) = source_fields {
             if let Some((_, source_id, field)) = union_leg(sources, &name) {
                 mappings.push((source_id, target_id));
-                (field.as_ref().clone(), Arc::clone(canonical.ok_or_else(incompatible)?.child(source_id)))
+                (field.as_ref().clone(), Arc::clone(canonical.ok_or(RelayoutError::Incompatible)?.child(source_id)))
             } else { (target_field.as_ref().clone(), arrow_array::new_empty_array(target_field.data_type())) }
         } else if logical == L::Null {
             null_id = Some(target_id);
@@ -421,14 +441,14 @@ fn union(array: ArrayRef, source: &Field, target: &Field, targets: &UnionFields,
     let mut value_offset = 0;
     for row in 0..array.len() {
         let (id, offset) = if let Some(source) = canonical {
-            let id = mappings.iter().find(|(id, _)| *id == source.type_id(row)).map(|(_, target)| *target).ok_or_else(incompatible)?;
+            let id = mappings.iter().find(|(id, _)| *id == source.type_id(row)).map(|(_, target)| *target).ok_or(RelayoutError::Incompatible)?;
             (id, source.value_offset(row))
         } else if array.data_type() == &DataType::Null || array.is_null(row) {
-            (null_id.ok_or_else(incompatible)?, row)
+            (null_id.ok_or(RelayoutError::Incompatible)?, row)
         } else {
             let offset = if valid.is_some() { value_offset } else { row };
             value_offset += 1;
-            (nonnull_id.ok_or_else(incompatible)?, offset)
+            (nonnull_id.ok_or(RelayoutError::Incompatible)?, offset)
         };
         ids.push(id);
         offsets.push(i32::try_from(offset).map_err(|_| super::fault("page-allocation-size", "Union child exceeds i32 offsets"))?);
