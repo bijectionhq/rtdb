@@ -251,6 +251,18 @@ impl MultiServing {
         self.database.lock().await.restored_checkpoint_basis(manifest_digest).await
     }
 
+    pub async fn portable_backup(&self) -> Result<rtdb_db::PortableBackup> {
+        self.database.lock().await.portable_backup().await
+    }
+
+    pub async fn install_portable_backup(&self, backup: rtdb_db::VerifiedBackup) -> Result<rtdb_db::InstalledBackup> {
+        self.database.lock().await.install_portable_backup(backup).await
+    }
+
+    pub async fn installed_backup(&self) -> Result<Option<rtdb_db::InstalledBackup>> {
+        self.database.lock().await.installed_backup().await
+    }
+
     pub async fn pin_managed_checkpoint(
         &self, pin: uuid::Uuid, basis: Basis, target: ManagedCheckpointTarget,
         require_unbound: impl Future<Output = Result<()>> + Send,

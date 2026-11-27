@@ -1094,6 +1094,20 @@ contract EpochScopedStorage {
         -- The original durable rotation time fixes the deadline across retries and writer replacement.
 }
 
+contract PortableApplicationBackup {
+    @invariant AuthenticatedCut
+        -- The writer captures one settled applied cut and binds its source incarnation, basis, system time and journal position to the encrypted checkpoint.
+        -- The checkpoint contains its inline application state and exact retained receipt index.
+        -- A portable inline cut requires an empty external object and pin inventory plus ordinary portable receipt and row custody state.
+        -- Publication follows durable archive creation under the source generation's independently available key custody.
+
+    @invariant IndependentInstallation
+        -- The destination verifies the archive with independent key custody and requires that generation to remain readable through checkpoint publication.
+        -- A fresh destination installs the authenticated cut under a fresh incarnation and retains its source basis, source journal position and archive digest.
+        -- The installed receipt can be recovered from the destination journal alone.
+        -- Installation and activation are separate decisions.
+}
+
 ------------------------------------------------------------
 -- Entities
 ------------------------------------------------------------

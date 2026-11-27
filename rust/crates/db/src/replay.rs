@@ -19,6 +19,7 @@ const RESTORED_HISTORY: u8 = 2;
 const CHECKPOINT_SOURCE: u8 = 4;
 /// The transaction state is CBOR rather than JSON. Readers accept both.
 const BINARY_STATE: u8 = 8;
+const PORTABLE_BACKUP_SOURCE: u8 = 16;
 
 pub struct AppliedEffects {
     pub cut: BranchCut,
@@ -47,6 +48,13 @@ pub(crate) struct RestoreOrigin {
     pub(crate) digest: [u8; 32],
     pub(crate) through: u64,
     pub(crate) source: Option<CheckpointSource>,
+    pub(crate) backup: Option<BackupSource>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BackupSource {
+    pub(crate) cut: BranchCut,
+    pub(crate) through_lsn: Lsn,
 }
 
 /// The original ordered pin and cut, authenticated by the source manifest and retained by the destination.
@@ -715,8 +723,9 @@ impl Committed {
         let system_time = Timestamp(i64::from_be_bytes(header[8..16].try_into().unwrap()));
         let until = i64::from_be_bytes(header[16..24].try_into().unwrap());
         let flags = header[24];
-        if flags & !(ROTATING_CHECKPOINT | RESTORED_HISTORY | CHECKPOINT_SOURCE | BINARY_STATE) != 0
-            || flags & CHECKPOINT_SOURCE != 0 && flags & RESTORED_HISTORY == 0
+        if flags & !(ROTATING_CHECKPOINT | RESTORED_HISTORY | CHECKPOINT_SOURCE | BINARY_STATE | PORTABLE_BACKUP_SOURCE) != 0
+            || flags & (CHECKPOINT_SOURCE | PORTABLE_BACKUP_SOURCE) != 0 && flags & RESTORED_HISTORY == 0
+            || flags & (CHECKPOINT_SOURCE | PORTABLE_BACKUP_SOURCE) == (CHECKPOINT_SOURCE | PORTABLE_BACKUP_SOURCE)
         {
             return Err(invalid("The checkpoint has an unknown generation marker"));
         }
@@ -741,9 +750,25 @@ impl Committed {
             } else {
                 (None, rest)
             };
+            let (backup, rest) = if flags & PORTABLE_BACKUP_SOURCE != 0 {
+                let (basis, rest) = rest.split_first_chunk::<24>().ok_or_else(|| invalid("The checkpoint has no backup basis"))?;
+                let (time, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("The checkpoint has no backup system time"))?;
+                let (lsn, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("The checkpoint has no backup source LSN"))?;
+                let basis = Basis::from_bytes(basis)?;
+                let time = Timestamp(i64::from_be_bytes(*time));
+                let through_lsn = Lsn(u64::from_be_bytes(*lsn));
+                if basis.incarnation() == [0; 16] || basis.incarnation() == *stream.database.as_bytes()
+                    || basis.position() != through || through_lsn.0 == 0 || checkpoint.restore && time != system_time
+                {
+                    return Err(invalid("The backup source does not match the restored cut"));
+                }
+                (Some(BackupSource { cut: BranchCut { basis, system_time: time }, through_lsn }), rest)
+            } else {
+                (None, rest)
+            };
             self.coordinates = JournalCoordinates {
                 offset: u64::from_be_bytes(*offset),
-                origin: Some(RestoreOrigin { digest: *digest, through, source }),
+                origin: Some(RestoreOrigin { digest: *digest, through, source, backup }),
             };
             bytes = rest;
         } else if checkpoint.restore {
@@ -801,11 +826,13 @@ impl Committed {
         let cut = transactions.index().head();
         let bytes = if binary { transactions.encode_binary_checkpoint()? } else { transactions.encode_checkpoint()? };
         let source = coordinates.origin.and_then(|origin| origin.source);
+        let backup = coordinates.origin.and_then(|origin| origin.backup);
         let flags = if rotating { ROTATING_CHECKPOINT } else { 0 }
             | if binary { BINARY_STATE } else { 0 }
             | if coordinates.origin.is_some() { RESTORED_HISTORY } else { 0 }
-            | if source.is_some() { CHECKPOINT_SOURCE } else { 0 };
-        let extra = coordinates.origin.map_or(0, |_| 48) + source.map_or(0, |_| 48);
+            | if source.is_some() { CHECKPOINT_SOURCE } else { 0 }
+            | if backup.is_some() { PORTABLE_BACKUP_SOURCE } else { 0 };
+        let extra = coordinates.origin.map_or(0, |_| 48) + source.map_or(0, |_| 48) + backup.map_or(0, |_| 40);
         let mut payload = Vec::with_capacity(25 + extra + bytes.len());
         payload.extend_from_slice(&cut.basis.position().to_be_bytes());
         payload.extend_from_slice(&cut.system_time.0.to_be_bytes());
@@ -820,6 +847,11 @@ impl Committed {
             payload.extend_from_slice(&source.cut.basis.to_bytes());
             payload.extend_from_slice(&source.cut.system_time.0.to_be_bytes());
             payload.extend_from_slice(source.pin.as_bytes());
+        }
+        if let Some(backup) = backup {
+            payload.extend_from_slice(&backup.cut.basis.to_bytes());
+            payload.extend_from_slice(&backup.cut.system_time.0.to_be_bytes());
+            payload.extend_from_slice(&backup.through_lsn.0.to_be_bytes());
         }
         payload.extend_from_slice(&bytes);
         Ok(payload)

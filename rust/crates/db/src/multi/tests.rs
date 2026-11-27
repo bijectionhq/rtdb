@@ -824,6 +824,109 @@ async fn append_custody_fixture(database: &mut MultiDatabase, request: &Transact
 }
 
 #[tokio::test]
+async fn portable_backup_restores_a_fresh_stream_without_source_data() {
+    use rtdb_crypt::FileKms;
+
+    let source_vault = tempfile::tempdir().unwrap();
+    let destination_vault = tempfile::tempdir().unwrap();
+    let source_path = source_vault.path().join("keys");
+    let destination_path = destination_vault.path().join("keys");
+    FileKms::create_directory(&source_path).unwrap();
+    FileKms::create_directory(&destination_path).unwrap();
+    let source_keys = Arc::new(FileKms::open(&source_path, || 10).unwrap());
+    let destination_keys = Arc::new(FileKms::open(&destination_path, || 10).unwrap());
+    let options = |database, node| MultiOptions {
+        database,
+        node: ip(node),
+        lease_micros: LEASE,
+        drift_micros: DRIFT,
+    };
+    let request = put(1, 1, "portable row");
+    let (archive, receipt, branch_cut, source_lsn) = {
+        let source = journals().await;
+        let mut writer = MultiDatabase::new(options(DATABASE, 1), Arc::new(source.handle(NODE_1_IDENTITY)),
+            Arc::new(MemoryStore::default()), source_keys.clone(), Arc::new(|| Timestamp(10))).unwrap();
+        writer.create().await.unwrap();
+        writer.tick(&live(1)).await.unwrap();
+        let receipt = writer.transact(&request).await.unwrap();
+        let branch_cut = writer.transact(&self::request(2, Op::Fork {
+            child: "backup-report".into(), from: (MAIN_BRANCH.into(), receipt.basis), writable: true, expires_at: None,
+        })).await.unwrap();
+        let source_lsn = writer.stream.head().await.unwrap();
+        let archive = writer.portable_backup().await.unwrap().into_bytes();
+        writer.transact(&put(3, 1, "after backup")).await.unwrap();
+        (archive, receipt, branch_cut, source_lsn)
+    };
+    assert!(crate::PortableBackup::verify(&archive, destination_keys.clone()).await.is_err());
+    for byte in [8, archive.len() - 1] {
+        let mut changed = archive.clone();
+        changed[byte] ^= 1;
+        assert!(crate::PortableBackup::verify(&changed, source_keys.clone()).await.is_err());
+    }
+    let backup = crate::PortableBackup::verify(&archive, source_keys.clone()).await.unwrap();
+    assert_eq!(backup.source_receipt(&request.key).await.unwrap(), Receipt { replayed: true, ..receipt.clone() });
+    assert_eq!(backup.source_basis(), branch_cut.basis);
+    assert_eq!(backup.source_lsn(), source_lsn);
+    assert_eq!(backup.source_receipt(&[3; 16]).await.unwrap_err().code, "rtdb/unknown-transaction");
+
+    let destination = Uuid::from_u128(999);
+    let destination_time = Arc::new(AtomicI64::new(10));
+    let journal = journals().await;
+    let store = Arc::new(MemoryStore::default());
+    let open = |node, handle| {
+        let clock = Arc::clone(&destination_time);
+        MultiDatabase::new(options(destination, node), Arc::new(journal.handle(handle)),
+            store.clone(), destination_keys.clone(), Arc::new(move || Timestamp(clock.load(Ordering::SeqCst)))).unwrap()
+    };
+    let mut successor = open(2, NODE_2_IDENTITY);
+    successor.create().await.unwrap();
+    successor.tick(&live(2)).await.unwrap();
+    let install = successor.install_portable_backup(backup).await.unwrap();
+    assert_eq!(install.source_incarnation(), DATABASE);
+    assert_eq!(install.source_lsn(), source_lsn);
+    let rebase = |basis: Basis| Basis::new(*destination.as_bytes(), basis.position());
+    assert_eq!(install.destination_basis(), rebase(branch_cut.basis));
+    let restored = Receipt { replayed: true, basis: rebase(receipt.basis), ..receipt };
+    assert_eq!(successor.transact(&request).await.unwrap(), restored);
+    assert_eq!(text_at(&mut successor, "backup-report", 1).await, Some(Value::Utf8("portable row".into())));
+    let retry = crate::PortableBackup::verify(&archive, source_keys.clone()).await.unwrap();
+    assert_eq!(successor.install_portable_backup(retry).await.unwrap(), install);
+    let new = successor.transact(&put(4, 2, "new history")).await.unwrap();
+    assert!(new.basis > install.destination_basis());
+    destination_time.store(new.system_time.0, Ordering::SeqCst);
+    successor.checkpoint(Vec::new()).await.unwrap();
+    drop(successor);
+    drop(source_keys);
+    drop(source_vault);
+    let mut reopened = open(3, NODE_3_IDENTITY);
+    assert_eq!(reopened.installed_backup().await.unwrap(), Some(install));
+    assert_eq!(reopened.tx_status(&request.key).await.unwrap(), restored);
+    assert_eq!(text_at(&mut reopened, MAIN_BRANCH, 2).await, Some(Value::Utf8("new history".into())));
+}
+
+#[tokio::test]
+async fn portable_backup_refuses_external_objects_and_revoked_keys() {
+    use rtdb_crypt::FileKms;
+
+    let vault = tempfile::tempdir().unwrap();
+    let path = vault.path().join("keys");
+    FileKms::create_directory(&path).unwrap();
+    let keys = Arc::new(FileKms::open(&path, || 10).unwrap());
+    let journal = journals().await;
+    let mut writer = MultiDatabase::new(MultiOptions { database: DATABASE, node: ip(1), lease_micros: LEASE, drift_micros: DRIFT },
+        Arc::new(journal.handle(NODE_1_IDENTITY)), Arc::new(MemoryStore::default()), keys.clone(), Arc::new(|| Timestamp(10))).unwrap();
+    writer.create().await.unwrap();
+    writer.tick(&live(1)).await.unwrap();
+    let archive = writer.portable_backup().await.unwrap().into_bytes();
+    let file = writer.write_file(b"external checkpoint dependency").await.unwrap();
+    writer.checkpoint(vec![file]).await.unwrap();
+    assert_eq!(writer.portable_backup().await.err().unwrap().code, "rtdb/backup-dependencies");
+    let generation = Generation { database: DATABASE, number: 1 };
+    keys.retire(generation, 10).await.unwrap();
+    assert_eq!(crate::PortableBackup::verify(&archive, keys).await.err().unwrap().code, "rtdb/erased-under-view");
+}
+
+#[tokio::test]
 async fn exact_export_pins_the_selected_branch_ancestry_after_trim() {
     let journal = journals().await;
     let cluster = Cluster::new();

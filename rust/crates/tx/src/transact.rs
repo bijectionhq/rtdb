@@ -881,6 +881,24 @@ impl TransactState {
         self.encode_checkpoint_index(&index)
     }
 
+    pub fn require_portable_checkpoint(&self) -> Result<()> {
+        if self.pending.is_some() { return Err(pending_error()); }
+        if self.pending_erasure.is_some() { return Err(erasure_pending()); }
+        let unsupported_receipt = self.receipts.values().flat_map(|scope| scope.values()).any(|stored| {
+            stored.receipt_namespace.is_some() || stored.receipt.decision_clock.is_some()
+                || stored.installed.is_some() || stored.workload.is_some()
+        });
+        if unsupported_receipt || self.index.has_custody_groups() || self.index.inherited_custody().is_some()
+            || self.index.retained_images().any(|(_, table, _, image)| {
+                image.custody_group.is_some() || image.custody_payload.is_some()
+                    || BranchIndex::unowned_checkpoint_image(table, image)
+            })
+        {
+            return Err(Anomaly::unsupported("rtdb/backup-custody", "The checkpoint needs an independent custody transfer"));
+        }
+        Ok(())
+    }
+
     pub fn encode_native_checkpoint_at(&self, basis: Basis) -> Result<Bytes> {
         if self.pending.is_some() { return Err(pending_error()); }
         if self.pending_erasure.is_some() { return Err(erasure_pending()); }

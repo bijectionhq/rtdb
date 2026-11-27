@@ -125,6 +125,10 @@ impl Reachability {
         self.objects.contains(&id)
     }
 
+    pub fn contains_files(&self) -> bool {
+        self.objects.iter().any(|id| id.kind == ObjectKind::File)
+    }
+
     pub fn requires_file_rewrite(&self) -> bool {
         self.rewrite_files
     }

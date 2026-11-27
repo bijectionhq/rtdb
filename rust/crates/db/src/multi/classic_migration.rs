@@ -63,6 +63,7 @@ impl MultiDatabase {
                 digest: import,
                 through: cut.basis.position(),
                 source: None,
+                backup: None,
             }),
         };
         coordinates.position(next(entry)?)?;

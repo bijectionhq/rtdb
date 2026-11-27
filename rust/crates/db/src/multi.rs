@@ -29,6 +29,7 @@ pub fn journal_recoveries_acknowledged() -> u64 {
     RECOVERIES_ACKNOWLEDGED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+mod backup;
 mod classic_migration;
 mod deferred;
 mod pin;
@@ -37,6 +38,7 @@ mod ranked;
 mod rotation;
 mod retirement;
 mod timing;
+pub use backup::{InstalledBackup, PortableBackup, VerifiedBackup};
 pub use classic_migration::{ClassicInstallation, classic_import_basis};
 pub use pin::{NativeCheckpointInstallation, NativeDependentCarrier, NativeDependentOriginal, PinnedExport};
 pub use pipeline::WritePipeline;

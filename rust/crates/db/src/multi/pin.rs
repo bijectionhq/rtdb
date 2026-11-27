@@ -1,7 +1,7 @@
 use std::{ops::AsyncFnOnce, sync::Arc};
 
 use rtdb_crypt::{Kms, Plaintext, tokens::ExportTicket};
-use rtdb_format::journal::{Checkpoint, Manifest, ObjectId, Pin, Record};
+use rtdb_format::journal::{Manifest, ObjectId, Pin, Record};
 use rtdb_index::branches::{BranchCut, BranchIndex, CustodyOccurrence, CustodyPayload};
 use rtdb_store::{ObjectStore, VerifiedManifest, read_file, read_manifest};
 use rtdb_tx::transact::{CustodyWriterFence, Outcome, Receipt, Transact, TransactState};
@@ -9,7 +9,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::{Basis, D
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::replay::{CheckpointSource, Committed, JournalCoordinates, RestoreOrigin};
+use crate::replay::{CheckpointSource, RestoreOrigin};
 
 use super::{MultiDatabase, next, no_writer};
 
@@ -418,7 +418,6 @@ impl MultiDatabase {
         let source_identity = manifest_identity(source);
         let state = self.state();
         let through = state.head;
-        let generation = state.generation;
         let destination = self.incarnation();
         if let Some(origin) = state.coordinates.origin
             && origin.digest == source_identity
@@ -444,34 +443,13 @@ impl MultiDatabase {
                 transactions.restore_in(destination)?;
             }
         }
-        let cut = transactions.index().head();
-        let coordinates = JournalCoordinates {
-            offset: cut.basis.position().saturating_sub(through.0),
-            origin: Some(RestoreOrigin {
-                digest: source_identity,
-                through: cut.basis.position(),
-                source: Some(CheckpointSource { cut: source_cut, pin: export.pin.id }),
-            }),
+        let origin = RestoreOrigin {
+            digest: source_identity,
+            through: transactions.index().head().basis.position(),
+            source: Some(CheckpointSource { cut: source_cut, pin: export.pin.id }),
+            backup: None,
         };
-        coordinates.position(next(next(through)?)?)?;
-        let manifest = Manifest {
-            files: Vec::new(),
-            pins: Vec::new(),
-            payload: Committed::checkpoint_payload(&transactions, lease.until, false, coordinates)?,
-        };
-        let image = self.writer.as_mut().ok_or_else(no_writer)?.objects
-            .manifest(self.stream.kms.as_ref(), generation, &manifest).await?;
-        image.put(self.store.as_ref()).await?;
-        export.check_readable().await?;
-        self.require_authority(lease)?;
-        self.append_control(lease, Record::Checkpoint(Checkpoint {
-            manifest: image.id(),
-            through: through.0,
-            key_generation: generation,
-            restore: true,
-        })).await?;
-        self.trim(lease, through).await?;
-        Ok(cut)
+        self.install_restored_state(lease, transactions, origin, async || export.check_readable().await).await
         }).await
     }
 
