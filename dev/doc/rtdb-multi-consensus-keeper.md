@@ -205,6 +205,11 @@ A replacement writer can rebuild the cut under its own epoch, and the provider r
 
 For a commissioned ranked scope, `freeze-recovery` first closes activation grants and then closes admission at the original provider. Publication requires the resulting closure receipt. If the provider is unavailable, restore access and retry freeze with the same binding and operation ID. Replacing a pending recovery operation for the same predecessor preserves its closure. Commission the successor separately if it needs ranked publication.
 
+The original provider closes ranked admission before checking the committed catalogue sequence against its inventory digest.
+A missing or different committed entry leaves admission closed and prevents the closure receipt from reaching activation.
+Restore the original committed entries and retry freeze for the same recovery.
+Preserve committed entries against replacement through outcome discovery.
+
 Use `ranked-outcomes` on the pending or published recovery to page through the original provider's admitted catalogues, including entries whose source operation IDs were lost. Pass the returned `next_after` value as `--after` until the response ends the scan.
 
 ```sh

@@ -1154,6 +1154,7 @@ contract EpochScopedStorage {
         -- A prepared manifest binds a cut and writer epoch; retries under that epoch reuse it, and a replacement epoch may rebuild the cut.
         -- A published sequence slot retains the exact catalogue and remains discoverable without its operation ID.
         -- Closure is irreversible and exposes the final immutable inventory through sequence pages.
+        -- A closure receipt requires the digest of every committed sequence slot in order to match the closed provider ledger.
         -- A staged slot outside the committed prefix grants no admission.
         -- An exact retry observes its original sequence even after closure.
         -- The activation broker commissions an exact original provider allocation against the active binding.

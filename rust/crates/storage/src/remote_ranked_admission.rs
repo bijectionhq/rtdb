@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
+use futures::{StreamExt, stream};
 use object_store::{
     Error as ProviderError, ObjectStore as ProviderStore, ObjectStoreExt, PutMode, PutOptions,
     UpdateVersion, path::Path,
@@ -17,6 +18,7 @@ use crate::ranked_admission::{RankedAdmissionWriter, RankedAttempt};
 use crate::{IoRegion, ObjectKey};
 
 const PAGE_SIZE: usize = 100;
+const INVENTORY_READ_CONCURRENCY: usize = 16;
 const MAX_ATTEMPTS: usize = 12;
 const MAX_RECORD_BYTES: u64 = 1024;
 
@@ -89,6 +91,8 @@ impl RankedAdmission {
             .await?
     }
 
+    /// Closes admission and verifies the committed inventory before returning its receipt.
+    /// A verification error leaves admission closed.
     pub async fn close(&self) -> Result<ClosedRankedAdmission> {
         let owner = self.clone();
         self.region
@@ -178,13 +182,9 @@ impl RankedAdmission {
             let path = self.entry_path(sequence);
             self.create(&path, encoded.clone()).await?;
             let selected = self.read_catalogue(&path).await?;
-            let mut hash = Context::new(&SHA256);
-            hash.update(b"rtdb.ranked-admissions/v1\0");
-            hash.update(&ledger.inventory_sha256);
-            hash.update(&Record::RankedCatalog(selected).encode()?);
             let next = Ledger {
                 count: sequence,
-                inventory_sha256: hash.finish().as_ref().try_into().expect("SHA-256 width"),
+                inventory_sha256: inventory_step(ledger.inventory_sha256, selected)?,
                 closed: false,
             };
             if self.replace_root(next, version).await? && selected == catalogue {
@@ -232,10 +232,28 @@ impl RankedAdmission {
                 ..ledger
             };
             if ledger.closed || self.replace_root(closed, version).await? {
+                self.verify_inventory(closed).await?;
                 return Ok(self.receipt(closed));
             }
         }
         Err(contention())
+    }
+
+    async fn verify_inventory(&self, ledger: Ledger) -> Result<()> {
+        let mut catalogues = stream::iter(1..=ledger.count)
+            .map(|sequence| self.entry(sequence))
+            .buffered(INVENTORY_READ_CONCURRENCY);
+        let mut digest = [0; 32];
+        while let Some(catalogue) = catalogues.next().await {
+            digest = inventory_step(digest, catalogue?)?;
+        }
+        if digest != ledger.inventory_sha256 {
+            return Err(Anomaly::fault(
+                "rtdb.storage/ranked-admission-inventory",
+                "The original ranked catalogue inventory does not match the closed ledger",
+            ));
+        }
+        Ok(())
     }
 
     fn receipt(&self, ledger: Ledger) -> ClosedRankedAdmission {
@@ -361,6 +379,14 @@ impl RankedAdmissionWriter for RankedAdmission {
 fn cut_key(attempt: RankedAttempt) -> String {
     let RankedAttempt { position, system_time, key_generation, .. } = attempt;
     format!("{position:016x}-{system_time:016x}-{key_generation:016x}")
+}
+
+fn inventory_step(previous: [u8; 32], catalogue: RankedCatalog) -> Result<[u8; 32]> {
+    let mut hash = Context::new(&SHA256);
+    hash.update(b"rtdb.ranked-admissions/v1\0");
+    hash.update(&previous);
+    hash.update(&Record::RankedCatalog(catalogue).encode()?);
+    Ok(hash.finish().as_ref().try_into().expect("SHA-256 width"))
 }
 
 fn invalid() -> Anomaly {
