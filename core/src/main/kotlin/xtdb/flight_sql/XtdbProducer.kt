@@ -821,20 +821,24 @@ class XtdbProducer(
         val schemaFilter = if (command.hasDbSchemaFilterPattern()) command.dbSchemaFilterPattern else null
 
         val conn = connectionFor(ctx, dbName)
-        // FlightSQL's catalog is an exact filter (absent = every catalog); each row keeps its own catalog.
-        val rows = conn.catalogNames(catalogFilter, exact = true).flatMap { catalog ->
-            conn.querySchemas(catalog, schemaFilter, null, null, null, GetObjectsDepth.DB_SCHEMAS)
-                .keys.map { catalog to it }
-        }
-
+        val catalogs = conn.catalogNames(catalogFilter, exact = true)
         singleBatchStream(FlightSqlProducer.Schemas.GET_SCHEMAS_SCHEMA, listener) { root ->
             val catalogVec = root.getVector("catalog_name") as VarCharVector
             val schemaVec = root.getVector("db_schema_name") as VarCharVector
-            rows.forEachIndexed { idx, (catalog, name) ->
-                catalogVec.setSafe(idx, catalog.toByteArray())
-                schemaVec.setSafe(idx, name.toByteArray())
+            var row = 0
+            for (catalog in catalogs) {
+                val catalogBytes = catalog.toByteArray()
+                conn.forEachObjectPage(catalog, schemaFilter, null, null, null, GetObjectsDepth.DB_SCHEMAS) { page ->
+                    val schemas = page["table_schema"]
+                    for (i in 0 until page.rowCount) {
+                        val schemaBytes = schemas.getBytes(i)
+                        catalogVec.setSafe(row, catalogBytes)
+                        schemaVec.setSafe(row, schemaBytes, schemaBytes.position(), schemaBytes.remaining())
+                        row++
+                    }
+                }
             }
-            root.rowCount = rows.size
+            root.rowCount = row
         }
     }
 
@@ -853,19 +857,13 @@ class XtdbProducer(
         val catalogFilter = if (command.hasCatalog()) command.catalog else null
         val schemaFilter = if (command.hasDbSchemaFilterPattern()) command.dbSchemaFilterPattern else null
         val tableFilter = if (command.hasTableNameFilterPattern()) command.tableNameFilterPattern else null
-        val typeFilters = command.tableTypesList.takeIf { it.isNotEmpty() }
+        val typeFilters = command.tableTypesList.takeIf { it.isNotEmpty() }?.toTypedArray()
 
         val schema = if (command.includeSchema) FlightSqlProducer.Schemas.GET_TABLES_SCHEMA
         else FlightSqlProducer.Schemas.GET_TABLES_SCHEMA_NO_SCHEMA
 
         val conn = connectionFor(ctx, dbName)
-
-        // querySchemas owns the TABLE-type filter (XTDB only has TABLE) and the LIKE-escaped filters.
-        // FlightSQL's catalog is an exact filter (absent = every catalog); each row keeps its own catalog.
-        val rows = conn.catalogNames(catalogFilter, exact = true).flatMap { catalog ->
-            conn.querySchemas(catalog, schemaFilter, tableFilter, typeFilters?.toTypedArray(), null, GetObjectsDepth.TABLES)
-                .flatMap { (dbSchemaName, ts) -> ts.map { Triple(catalog, dbSchemaName, it.name) } }
-        }
+        val catalogs = conn.catalogNames(catalogFilter, exact = true)
 
         singleBatchStream(schema, listener) { root ->
             val catalogVec = root.getVector("catalog_name") as VarCharVector
@@ -874,22 +872,45 @@ class XtdbProducer(
             val typeVec = root.getVector("table_type") as VarCharVector
             val tableSchemaVec =
                 if (command.includeSchema) root.getVector("table_schema") as VarBinaryVector else null
+            val catalogEnds = if (tableSchemaVec != null) IntArray(catalogs.size) else null
+            val typeBytes = "TABLE".toByteArray()
 
-            rows.forEachIndexed { idx, (catalog, dbSchemaName, tableName) ->
-                catalogVec.setSafe(idx, catalog.toByteArray())
-                schemaVec.setSafe(idx, dbSchemaName.toByteArray())
-                tableVec.setSafe(idx, tableName.toByteArray())
-                typeVec.setSafe(idx, "TABLE".toByteArray())
+            var row = 0
+            for ((catalogIdx, catalog) in catalogs.withIndex()) {
+                val catalogBytes = catalog.toByteArray()
+                conn.forEachObjectPage(catalog, schemaFilter, tableFilter, typeFilters, null, GetObjectsDepth.TABLES) { page ->
+                    val schemas = page["table_schema"]
+                    val tables = page["table_name"]
+                    for (i in 0 until page.rowCount) {
+                        val schemaBytes = schemas.getBytes(i)
+                        val tableBytes = tables.getBytes(i)
+                        catalogVec.setSafe(row, catalogBytes)
+                        schemaVec.setSafe(row, schemaBytes, schemaBytes.position(), schemaBytes.remaining())
+                        tableVec.setSafe(row, tableBytes, tableBytes.position(), tableBytes.remaining())
+                        typeVec.setSafe(row, typeBytes)
+                        row++
+                    }
+                }
+                catalogEnds?.set(catalogIdx, row)
+            }
 
-                if (tableSchemaVec != null) {
-                    tableSchemaVec.setSafe(
-                        idx,
-                        conn.getTableSchema(catalog, dbSchemaName, tableName)
-                            .serializeAsMessageInterruptibly()
-                    )
+            if (tableSchemaVec != null && catalogEnds != null) {
+                // Read all catalog pages before looking up any schema, so a catalog query error takes precedence.
+                schemaVec.valueCount = row
+                tableVec.valueCount = row
+                var start = 0
+                for ((catalogIdx, catalog) in catalogs.withIndex()) {
+                    val end = catalogEnds[catalogIdx]
+                    for (idx in start until end) {
+                        val schemaName = schemaVec.get(idx).toString(Charsets.UTF_8)
+                        val tableName = tableVec.get(idx).toString(Charsets.UTF_8)
+                        tableSchemaVec.setSafe(idx, conn.getTableSchema(catalog, schemaName, tableName)
+                            .serializeAsMessageInterruptibly())
+                    }
+                    start = end
                 }
             }
-            root.rowCount = rows.size
+            root.rowCount = row
         }
     }
 

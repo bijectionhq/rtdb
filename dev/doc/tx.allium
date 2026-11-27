@@ -93,6 +93,9 @@
 -- JVM ADBC GetObjects copies names from ordered catalog query pages into the requested levels of the nested result.
 -- A depth boundary leaves the next list null, and an expanded catalog with no matching schemas has an empty list.
 -- At full depth the column pattern selects columns before ordinal positions are assigned within each returned table.
+-- JVM Flight SQL GetDbSchemas and GetTables copy names from the ordered catalog query pages into the response.
+-- Catalog filters match exactly, and schema and table patterns use SQL LIKE.
+-- With includeSchema, GetTables finishes reading the ordered catalog pages before looking up and serializing each matched table's Arrow schema.
 -- Embedded prepared statements infer their result schema from caller-supplied Arrow parameter fields by position without replacing bound arguments.
 -- Embedded JVM schema inference accepts union parameter fields with implicit child IDs and treats an empty union as an unknown parameter type.
 -- JSON Bind preserves the spelling of numeric tokens through native type inference.

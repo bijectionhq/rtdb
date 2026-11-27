@@ -1685,10 +1685,7 @@ interface Xtdb : DataSource, AdbcDatabase, AutoCloseable {
                     }
                 }
 
-        internal data class ColumnInfo(val name: String, val dataType: String)
-        internal data class TableInfo(val name: String, val columns: List<ColumnInfo>)
-
-        private fun forEachObjectPage(
+        internal fun forEachObjectPage(
             catalog: DatabaseName,
             dbSchemaPattern: String?,
             tableNamePattern: String?,
@@ -1743,41 +1740,6 @@ interface Xtdb : DataSource, AdbcDatabase, AutoCloseable {
                     params
                 )
             }
-        }
-
-        internal fun querySchemas(
-            catalog: DatabaseName,
-            dbSchemaPattern: String?,
-            tableNamePattern: String?,
-            tableTypes: Array<out String>?,
-            columnNamePattern: String?,
-            depth: GetObjectsDepth
-        ): Map<String, List<TableInfo>> {
-            val result = linkedMapOf<String, MutableList<TableInfo>>()
-            val tableColumns = linkedMapOf<Pair<String, String>, MutableList<ColumnInfo>>()
-            forEachObjectPage(catalog, dbSchemaPattern, tableNamePattern, tableTypes, columnNamePattern, depth) { rel ->
-                val schemas = rel["table_schema"]
-                val tables = rel.vectorForOrNull("table_name")
-                for (i in 0 until rel.rowCount) {
-                    val schema = schemas.getObject(i).toString()
-                    when (depth) {
-                        GetObjectsDepth.DB_SCHEMAS -> result.getOrPut(schema) { mutableListOf() }
-                        GetObjectsDepth.ALL -> {
-                            val table = tables!!.getObject(i).toString()
-                            val column = rel["column_name"].getObject(i).toString()
-                            val dataType = rel["data_type"].getObject(i).toString()
-                            tableColumns.getOrPut(schema to table) { mutableListOf() }.add(ColumnInfo(column, dataType))
-                        }
-                        else -> result.getOrPut(schema) { mutableListOf() }
-                            .add(TableInfo(tables!!.getObject(i).toString(), emptyList()))
-                    }
-                }
-            }
-            for ((key, cols) in tableColumns) {
-                result.getOrPut(key.first) { mutableListOf() }.add(TableInfo(key.second, cols))
-            }
-
-            return result
         }
 
         override fun getCurrentCatalog(): String = dbName

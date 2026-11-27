@@ -339,6 +339,42 @@ class FlightSqlAdbcTest {
     }
 
     @Test
+    fun `FlightSQL catalog pages preserve filtered row order and exact schema lookup`() {
+        insertData("INSERT INTO reporting_z.widgets (_id, z) VALUES (1, 2)")
+        insertData("INSERT INTO reporting_a.\"widgets_é\" (_id, a) VALUES (1, 2)")
+        insertData("INSERT INTO reporting_a.widgets (_id, b) VALUES (1, 2)")
+        insertData("INSERT INTO reporting_a.other (_id) VALUES (1)")
+        attachNewDbWithWidgets()
+
+        val schemas = fsqlClient.getSchemas("xtdb", "reporting%", *emptyCallOpts).readRows()
+        assertEquals(listOf("reporting_a", "reporting_z"), schemas.map { it["db_schema_name"] })
+        assertTrue(fsqlClient.getSchemas("new%", null, *emptyCallOpts).readRows().isEmpty())
+
+        val expectedNames = listOf(
+            listOf("new_db", "public", "widgets", "TABLE"),
+            listOf("xtdb", "reporting_a", "widgets", "TABLE"),
+            listOf("xtdb", "reporting_a", "widgets_é", "TABLE"),
+            listOf("xtdb", "reporting_z", "widgets", "TABLE"),
+        )
+        for (includeSchema in listOf(false, true)) {
+            val rows = fsqlClient.getTables(null, null, "widgets%", listOf("TABLE"), includeSchema, *emptyCallOpts)
+                .readRows()
+            assertEquals(expectedNames, rows.map { listOf(it["catalog_name"], it["db_schema_name"], it["table_name"], it["table_type"]) })
+            if (includeSchema) {
+                val columns = rows.map { row ->
+                    (row["table_schema"] as ByteArray).deserialiseArrowSchema().fields.map { it.name }.toSet()
+                }
+                assertEquals(listOf(setOf("_id", "w"), setOf("_id", "b"), setOf("_id", "a"), setOf("_id", "z")), columns)
+            } else {
+                assertTrue(rows.none { it.containsKey("table_schema") })
+            }
+        }
+
+        assertTrue(fsqlClient.getTables(null, null, "widgets%", listOf("VIEW"), false, *emptyCallOpts)
+            .readRows().isEmpty())
+    }
+
+    @Test
     fun `getTables with an empty catalog string matches no catalog`() {
         insertData("INSERT INTO foo (_id) VALUES (1)")
 
