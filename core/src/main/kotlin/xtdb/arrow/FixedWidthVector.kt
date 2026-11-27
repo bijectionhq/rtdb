@@ -169,10 +169,7 @@ sealed class FixedWidthVector : MonoVector() {
 
     protected fun getBytes0(idx: Int) = dataBuffer.getBytes(idx * byteWidth, byteWidth)
 
-    protected fun getByteArray(idx: Int): ByteArray {
-        val buf = getBytes0(idx)
-        return ByteArray(buf.remaining()).also { buf.duplicate().get(it) }
-    }
+    protected fun getByteArray(idx: Int): ByteArray = dataBuffer.getByteArray(idx * byteWidth, byteWidth)
 
     protected fun writeBytes0(v: ByteBuffer) {
         dataBuffer.writeBytes(v)

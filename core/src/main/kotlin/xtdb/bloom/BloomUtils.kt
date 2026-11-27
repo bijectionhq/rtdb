@@ -28,6 +28,8 @@ fun bloomContains(bloomRdr: VectorReader, idx: Int, hashes: IntArray) = bloomToB
 
 fun BloomFilter.contains(hashes: IntArray) = hashes.all { contains(it) }
 
+private fun bloomPosition(mask: Int, hash1: Int, hash2: Int, n: Int) = mask and (hash1 + hash2 * n)
+
 // Cassandra-style hashes:
 // https://www.researchgate.net/publication/220770131_Less_Hashing_Same_Performance_Building_a_Better_Bloom_Filter
 
@@ -36,7 +38,14 @@ fun bloomHashes(col: VectorReader, idx: Int, k: Int = BLOOM_K, bits: Int = BLOOM
     val mask = (1 shl bits) - 1
     val hash1 = col.hashCode(idx, Hasher.Xx())
     val hash2 = col.hashCode(idx, Hasher.Murmur3())
-    return IntArray(k) { n -> (mask and (hash1 + hash2 * n)) }
+    return IntArray(k) { n -> bloomPosition(mask, hash1, hash2, n) }
+}
+
+fun bloomHashesInto(col: VectorReader, idx: Int, positions: IntArray) {
+    val mask = (1 shl BLOOM_BITS) - 1
+    val hash1 = col.hashCode(idx, Hasher.Xx())
+    val hash2 = col.hashCode(idx, Hasher.Murmur3())
+    for (n in positions.indices) positions[n] = bloomPosition(mask, hash1, hash2, n)
 }
 
 /**
@@ -49,7 +58,7 @@ fun bloomPositions(xxHashes: IntVector, murmur3Hashes: IntVector): IntArray {
     repeat(xxHashes.valueCount) { row ->
         val hash1 = xxHashes.getInt(row)
         val hash2 = murmur3Hashes.getInt(row)
-        repeat(BLOOM_K) { n -> positions[row * BLOOM_K + n] = mask and (hash1 + hash2 * n) }
+        repeat(BLOOM_K) { n -> positions[row * BLOOM_K + n] = bloomPosition(mask, hash1, hash2, n) }
     }
 
     return positions

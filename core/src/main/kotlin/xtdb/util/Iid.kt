@@ -14,6 +14,7 @@ import xtdb.arrow.I8_TYPE
 import xtdb.arrow.UTF8_TYPE
 import xtdb.arrow.VectorReader
 import xtdb.arrow.VectorWriter
+import xtdb.arrow.extensions.KeywordType
 import xtdb.arrow.extensions.UuidType
 import xtdb.arrow.toLeg
 import java.nio.ByteBuffer
@@ -21,6 +22,8 @@ import java.security.MessageDigest
 import java.util.UUID
 
 private val messageDigest = ThreadLocal.withInitial { MessageDigest.getInstance("SHA-256") }
+private val stringIidPrefix = byteArrayOf('s'.code.toByte())
+private val keywordIidPrefix = byteArrayOf('k'.code.toByte(), ':'.code.toByte())
 
 /** @suppress */
 @InternalApi
@@ -28,10 +31,12 @@ fun iidFromLong(id: Long) = messageDigest.get().digest("i$id".toByteArray()).cop
 
 /** @suppress */
 @InternalApi
-fun iidFromUtf8OrNull(bytes: ByteBuffer): ByteArray? {
+fun iidFromUtf8OrNull(bytes: ByteBuffer): ByteArray? = iidFromTextOrNull(bytes, stringIidPrefix)
+
+private fun iidFromTextOrNull(bytes: ByteBuffer, prefix: ByteArray): ByteArray? {
     if (!UnsafeByteOperations.unsafeWrap(bytes).isValidUtf8) return null
     return messageDigest.get().run {
-        update('s'.code.toByte())
+        update(prefix)
         update(bytes.duplicate())
         digest().copyOfRange(0, 16)
     }
@@ -55,6 +60,8 @@ private fun VectorReader.typedIid(idx: Int): ByteArray? {
         I32_TYPE -> iidFromLong(getInt(idx).toLong())
         I64_TYPE -> iidFromLong(getLong(idx))
         UTF8_TYPE -> iidFromUtf8OrNull(getBytes(idx))
+        // KeywordVector stores the symbol spelling, which Keyword.toString prefixes with a colon.
+        KeywordType -> iidFromTextOrNull(getBytes(idx), keywordIidPrefix)
         else -> null
     }
 }

@@ -5,6 +5,7 @@ import org.apache.arrow.memory.BufferAllocator
 import org.apache.arrow.memory.util.ArrowBufPointer
 import org.apache.arrow.memory.util.hash.ArrowBufHasher
 import org.apache.arrow.vector.util.DecimalUtility
+import xtdb.arrow.ArrowUtil.toByteArray
 import xtdb.arrow.ArrowUtil.toByteBuffer
 import xtdb.util.Hasher
 import java.math.BigDecimal
@@ -128,6 +129,8 @@ internal class ExtensibleBuffer private constructor(private val allocator: Buffe
     operator fun set(idx: Int, v: Double) = buf.setDouble(idx.toLong() * Double.SIZE_BYTES, v)
 
     fun getBytes(start: Int, len: Int) = buf.toByteBuffer(start.toLong(), len.toLong())
+
+    fun getByteArray(start: Int, len: Int) = buf.toByteArray(start, len)
 
     fun writeBytes(bytes: ByteArray) {
         ensureWritable(bytes.size.toLong())

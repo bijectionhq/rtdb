@@ -217,6 +217,9 @@
 -- A compatible inner equijoin hashes and compares its Arrow key cells at their build and probe positions.
 -- Hash joins hash admitted scalar key columns over each page and use the same row hash for other layouts.
 -- Its Bloom and bounded entity ID filters use those same build-side vectors.
+-- JVM IID derivation hashes a valid UTF-8 keyword cell with its canonical keyword prefix.
+-- JVM join pushdown retains owned copies of physical IID keys, ordered by unsigned byte comparison.
+-- JVM join Bloom preparation reuses a bounded position buffer while adding each reached build key to its filter.
 -- Join Bloom preparation reads the children of compatible scalar lists from their Arrow positions.
 -- Descriptive list and child field metadata leaves the key's hash and equality unchanged.
 -- A query-generated join Bloom covers both persisted floating zero encodings for an admitted primitive numeric zero build key.
