@@ -22,10 +22,10 @@ impl InputOrder {
         order_by: &[SortExpr],
         memory: &Arc<MemoryBudget>,
     ) -> Option<Self> {
-        if partition_by.is_empty() {
+        let width = partition_by.len().checked_add(order_by.len())?;
+        if width == 0 {
             return None;
         }
-        let width = partition_by.len().checked_add(order_by.len())?;
         let bytes = width
             .checked_mul(size_of::<(usize, PhysicalKey)>() + size_of::<ColumnId>())?
             .checked_add(256)?;
@@ -36,9 +36,12 @@ impl InputOrder {
             columns.push(column(&order.expr)?);
         }
         let mut keys = Vec::with_capacity(width);
-        for &id in &columns {
+        for (index, &id) in columns.iter().enumerate() {
             let position = input.schema().position(id)?;
             let layout = PhysicalKey::bind(&input.schema().fields()[position].data_type)?;
+            if index < partition_by.len() && matches!(layout, PhysicalKey::F32 | PhysicalKey::F64) {
+                return None;
+            }
             keys.push((position, layout));
         }
 
@@ -128,7 +131,6 @@ fn projection_source(projections: &[NamedExpr], id: ColumnId) -> Option<ColumnId
     )
 }
 
-// Each admitted non-null type has the same peer equality in sorting and partition identification.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PhysicalKey {
     Null,
@@ -136,6 +138,8 @@ enum PhysicalKey {
     I16,
     I32,
     I64,
+    F32,
+    F64,
     Bool,
     Utf8,
 }
@@ -149,6 +153,8 @@ impl PhysicalKey {
             LogicalType::Scalar(ScalarType::I16) => Self::I16,
             LogicalType::Scalar(ScalarType::I32) => Self::I32,
             LogicalType::Scalar(ScalarType::I64) => Self::I64,
+            LogicalType::Scalar(ScalarType::F32) => Self::F32,
+            LogicalType::Scalar(ScalarType::F64) => Self::F64,
             LogicalType::Scalar(ScalarType::Bool) => Self::Bool,
             LogicalType::Scalar(ScalarType::Utf8) => Self::Utf8,
             _ => return None,
@@ -171,6 +177,8 @@ impl PhysicalKey {
                 | (Self::I16, DataType::Int16)
                 | (Self::I32, DataType::Int32)
                 | (Self::I64, DataType::Int64)
+                | (Self::F32, DataType::Float32)
+                | (Self::F64, DataType::Float64)
                 | (Self::Bool, DataType::Boolean)
                 | (Self::Utf8, DataType::Utf8)
         )
@@ -184,6 +192,8 @@ impl PhysicalKey {
                 | (Self::I16, Value::I16(_))
                 | (Self::I32, Value::I32(_))
                 | (Self::I64, Value::I64(_))
+                | (Self::F32, Value::F32(_))
+                | (Self::F64, Value::F64(_))
                 | (Self::Bool, Value::Bool(_))
                 | (Self::Utf8, Value::Utf8(_))
         )

@@ -4,7 +4,7 @@ use rtdb_columnar::MemoryReservation;
 use rtdb_plan::{Binder, ColumnId, Schema, SortExpr, WindowExpr, WindowFunction};
 use rtdb_types::{LogicalType, Result, ScalarType};
 use crate::{context::Execution, invalid};
-use crate::columnar::{BatchCursor, BoxBatchCursor, Column, ColumnBatch, gather_nullable_column, ordinal_column_by, poll_nested_batch};
+use crate::columnar::{BatchCursor, BoxBatchCursor, Column, ColumnBatch, gather_nullable_column, ordinal_column_by, pack_evaluated_column, poll_nested_batch};
 use crate::columnar::window::{WindowSpan, lend_window_spans};
 use crate::{scalar_key::ScalarKey, set_keys::{BatchKeyIndex, KeyColumns}};
 use crate::sort::batches::BatchSort;
@@ -155,7 +155,12 @@ impl BatchWindow {
                             for row in 0..batch.len {
                                 context.check_cancelled_at(row)?;
                             }
-                            if let Some(suffix) = source.lend_window_span(position, rows, memory)? {
+                            let suffix = if let Column::Values(values) = &source.columns[position] {
+                                values.get(rows).map(|values| pack_evaluated_column(values, memory)).transpose()?
+                            } else {
+                                source.lend_window_span(position, rows, memory)?
+                            };
+                            if let Some(suffix) = suffix {
                                 suffixes.push(suffix);
                                 continue;
                             }

@@ -35,9 +35,12 @@ impl RowNumberLimit {
         let Expr::Binary { op, left, right } = predicate else { return Ok(None); };
         let bound = match (op, left.as_ref(), right.as_ref()) {
             (BinaryOp::LtEq, Expr::Column { id, .. }, Expr::Literal(Value::I64(count)))
-            | (BinaryOp::GtEq, Expr::Literal(Value::I64(count)), Expr::Column { id, .. }) if *id == field.id => *count,
-            _ => return Ok(None),
+            | (BinaryOp::GtEq, Expr::Literal(Value::I64(count)), Expr::Column { id, .. }) if *id == field.id => Some(*count),
+            (BinaryOp::Lt, Expr::Column { id, .. }, Expr::Literal(Value::I64(count)))
+            | (BinaryOp::Gt, Expr::Literal(Value::I64(count)), Expr::Column { id, .. }) if *id == field.id => count.checked_sub(1),
+            _ => None,
         };
+        let Some(bound) = bound else { return Ok(None); };
         let Ok(count) = usize::try_from(bound) else { return Ok(None); };
         if partition_by.is_empty() || count == 0 || count > context.options.top_k_rows
             || context.options.object_sort != ObjectSort::TimSort

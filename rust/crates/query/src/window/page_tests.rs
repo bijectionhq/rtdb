@@ -160,6 +160,48 @@ async fn window_shift_gathers_mixed_source_layouts_in_order() {
 }
 
 #[tokio::test]
+async fn window_shift_packs_only_the_borrowed_evaluated_span() {
+    struct Batches(VecDeque<ColumnBatch>);
+    #[async_trait]
+    impl BatchCursor for Batches {
+        async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> { Ok(self.0.pop_front()) }
+    }
+
+    let execution = execution(4);
+    let memory = &execution.context.memory;
+    let baseline = memory.used_bytes();
+    let mut value = schema().fields()[1].clone();
+    value.data_type = LogicalType::Scalar(ScalarType::Utf8)
+        .join(&LogicalType::Scalar(ScalarType::Bool)).maybe();
+    let schema = Schema::new(vec![value]).unwrap();
+    let function = WindowFunction::Lead { column: ColumnId(1), offset: 3 };
+    let mut shifts = expressions(&[function]);
+    shifts[0].field.data_type = function.result_type(&schema).unwrap();
+    let batch = |values: Vec<Value>| {
+        let len = values.len();
+        ColumnBatch::settled(vec![Column::Values(values)], len, memory.reserve(0).unwrap()).unwrap()
+    };
+    let text = Value::Utf8("borrowed".repeat(64));
+    let first = batch(vec![Value::Null, Value::Null]);
+    let second = batch(vec![Value::Bool(true), text.clone(), Value::Null, Value::Bool(false)]);
+    let source = Arc::downgrade(second.column_reservation(0));
+    let input = Box::new(Batches(VecDeque::from([first, second])));
+    let mut cursor = BatchWindow::new(input, schema, &[], vec![], &shifts, false, execution.clone()).unwrap();
+    let first = cursor.next_batch().await.unwrap().unwrap();
+    let second = cursor.next_batch().await.unwrap().unwrap();
+    assert!(cursor.next_batch().await.unwrap().is_none());
+    drop((second, cursor));
+    assert!(source.upgrade().is_none());
+    assert_eq!(first.len, 2);
+    assert!(matches!(&first.columns[1], Column::Arrow { array, .. } if array.data_type() == &arrow_schema::DataType::Utf8));
+    assert_eq!(first.columns[1].value(0).unwrap(), text);
+    assert_eq!(first.columns[1].value(1).unwrap(), Value::Null);
+    assert!(memory.used_bytes() > baseline);
+    drop(first);
+    assert_eq!(memory.used_bytes(), baseline);
+}
+
+#[tokio::test]
 async fn columnar_window_validates_unprojected_bottom_cells_before_emitting_ordinals() {
     use arrow_array::NullArray;
     use crate::columnar::Column;

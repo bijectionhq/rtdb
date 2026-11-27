@@ -124,6 +124,29 @@ async fn bounded_row_number_uses_both_numeric_keys_and_keeps_peers_at_the_cutoff
 }
 
 #[tokio::test]
+async fn bounded_row_number_admits_strict_positive_prefixes_in_either_operand_order() {
+    let input = "(VALUES (1,2,9),(2,1,NULL),(3,2,7),(4,2,7),(5,2,7),(6,1,5)) AS t(id,p,score)";
+    let order = "score NULLS LAST";
+    let prefix = vec![
+        vec![V::I64(3), V::I64(1)], vec![V::I64(4), V::I64(2)],
+        vec![V::I64(6), V::I64(1)], vec![V::I64(2), V::I64(2)],
+    ];
+    for (order, predicate, expected, limits) in [
+        (order, "rn < 3", prefix.as_slice(), &[2][..]),
+        ("score NULLS LAST, id ASC", "3 > rn", prefix.as_slice(), &[2][..]),
+        (order, "rn < 1", &[][..], &[][..]),
+    ] {
+        let tracer = Arc::new(WindowTrace::default());
+        let context = context_with_sort_memory(1 << 26).with_tracer(Some(tracer.clone()), None);
+        let sql = format!("SELECT id,rn FROM (
+            SELECT id,ROW_NUMBER() OVER (PARTITION BY p ORDER BY {order}) rn FROM {input}
+        ) s WHERE {predicate}");
+        assert_eq!(query_at(&sql, context).await.unwrap().1, expected, "{predicate}");
+        assert_eq!(tracer.1.lock().unwrap().as_slice(), limits, "{predicate}");
+    }
+}
+
+#[tokio::test]
 async fn bounded_row_number_keeps_the_ordinary_path_for_other_predicates_and_window_dependencies() {
     let input = "(VALUES (1,0,1),(2,0,2),(3,0,3),(4,0,4)) AS t(id,p,v)";
     let window = "PARTITION BY p ORDER BY v";
@@ -164,6 +187,29 @@ async fn partitioned_windows_reuse_composite_order_and_keep_peers_across_spill()
             assert_eq!(rows, expected, "{call}, {sort_memory}");
             assert_eq!(*tracer.0.lock().unwrap(), [1], "{call}, {sort_memory}");
             assert_eq!(context.spill_peak_bytes() > 0, sort_memory == 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn window_order_reuse_keeps_float_order_peers_with_and_without_partitions() {
+    let input = "SELECT p,CAST(v AS DOUBLE PRECISION) AS score,id FROM (VALUES
+        (2,'0.0',22),(2,'NaN',23),(1,'-1',11),(2,'-0.0',21),
+        (2,NULL,25),(2,'NaN',24),(1,NULL,12)) AS t(p,v,id)
+        ORDER BY p DESC,score ASC NULLS LAST,id DESC";
+    for sort_memory in [1, 1 << 26] {
+        for (ordering, ranks) in [
+            ("PARTITION BY p ORDER BY score ASC NULLS LAST", [1,2,3,4,5,1,2]),
+            ("ORDER BY p DESC,score ASC NULLS LAST", [1,2,3,4,5,6,7]),
+        ] {
+            let tracer = Arc::new(WindowTrace::default());
+            let context = context_with_sort_memory(sort_memory).with_tracer(Some(tracer.clone()), None);
+            let sql = format!("SELECT id,ROW_NUMBER() OVER({ordering}) AS rn FROM ({input}) AS s");
+            let (_, rows) = query_at(&sql, context).await.unwrap();
+            let expected = [21,22,24,23,25,11,12].into_iter().zip(ranks)
+                .map(|(id, rank)| vec![V::I64(id), V::I64(rank)]).collect::<Vec<_>>();
+            assert_eq!(rows, expected, "{ordering}, {sort_memory}");
+            assert_eq!(*tracer.0.lock().unwrap(), [1], "{ordering}, {sort_memory}");
         }
     }
 }
