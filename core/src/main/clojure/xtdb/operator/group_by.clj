@@ -12,13 +12,17 @@
             [xtdb.vector.reader :as vr]
             [xtdb.vector.writer :as vw])
   (:import (com.carrotsearch.hppc LongArrayList)
+           com.google.protobuf.UnsafeByteOperations
            (java.io Closeable)
            (java.util ArrayList Arrays LinkedList List Spliterator Spliterators)
            (java.util.stream IntStream IntStream$Builder)
            (org.apache.arrow.memory BufferAllocator)
+           (org.apache.arrow.vector.types DateUnit TimeUnit)
+           (org.apache.arrow.vector.types.pojo ArrowType$Date ArrowType$Duration ArrowType$FixedSizeBinary ArrowType$Timestamp)
            (xtdb.api ICursor)
-           (xtdb.arrow IntVector MonoVector RelationReader RowMask RowMask$Builder Vector VectorReader VectorType VectorWriter)
+           (xtdb.arrow ArrowTypes IntVector MonoVector RelationReader RowMask RowMask$Builder Vector VectorReader VectorType VectorWriter)
            (xtdb.arrow.agg AggregateSpec AggregateSpec$Factory Average Count GroupMapper GroupMapper$Mapper GroupMapper$Null RowCount StdDevPop StdDevSamp Sum VarWidthMinMax VariancePop VarianceSamp)
+           xtdb.arrow.extensions.UuidType
            (xtdb.expression.map IndexHasher RelationMapBuilder)
            xtdb.operator.SelectionSpec
            xtdb.operator.SelectionSpec$Factory
@@ -417,6 +421,33 @@
   ^long [^long n, ^double fraction]
   (max 0 (dec (long (Math/ceil (* fraction (double n)))))))
 
+(def ^:private percentile-primitive-numeric-types
+  #{ArrowTypes/I8_TYPE ArrowTypes/I16_TYPE ArrowTypes/I32_TYPE ArrowTypes/I64_TYPE
+    ArrowTypes/F32_TYPE ArrowTypes/F64_TYPE})
+
+(defn- percentile-double ^double [^VectorReader values, ^long idx]
+  (if (percentile-primitive-numeric-types (.getArrowType values))
+    (.getAsDouble values (int idx))
+    (double (.getObject values (int idx)))))
+
+(defn- copy-percentile-value! [^VectorWriter out-vec, ^VectorReader values, ^long idx]
+  (let [arrow-type (.getArrowType values)]
+    (if (and (= (.getArrowType out-vec) arrow-type)
+             (or (percentile-primitive-numeric-types arrow-type)
+                 (= ArrowTypes/BOOL_TYPE arrow-type)
+                 (= ArrowTypes/VAR_BINARY_TYPE arrow-type)
+                 (= UuidType/INSTANCE arrow-type)
+                 (instance? ArrowType$FixedSizeBinary arrow-type)
+                 (instance? ArrowType$Duration arrow-type)
+                 (and (instance? ArrowType$Date arrow-type)
+                      (= DateUnit/DAY (.getUnit ^ArrowType$Date arrow-type)))
+                 (and (instance? ArrowType$Timestamp arrow-type)
+                      (not= TimeUnit/SECOND (.getUnit ^ArrowType$Timestamp arrow-type)))
+                 (and (= ArrowTypes/UTF8_TYPE arrow-type)
+                      (.isValidUtf8 (UnsafeByteOperations/unsafeWrap (.getBytes values (int idx)))))))
+      (.copyRow (.rowCopier values out-vec) (int idx))
+      (.writeObject out-vec (.getObject values (int idx))))))
+
 (defn- write-percentiles! [^VectorWriter out-vec, ^LongArrayList counts, fraction, cont?, ^Spliterator sorted-pages]
   (let [fraction (double fraction)
         pages (Spliterators/iterator sorted-pages)]
@@ -436,17 +467,17 @@
                   rank-hi (if cont? (long (Math/ceil cont-rank)) rank-lo)
                   lo (+ group-start rank-lo)
                   hi (+ group-start rank-hi)
-                  lo-value (if (and cont? (<= page-start lo) (< lo page-end))
-                             (double (.getObject values (int (- lo page-start))))
+                  lo-value (if (and cont? (< rank-lo rank-hi) (<= page-start lo) (< lo page-end))
+                             (percentile-double values (- lo page-start))
                              lo-value)]
               (if (< hi page-end)
-                (let [v (.getObject values (int (- hi page-start)))]
+                (let [idx (- hi page-start)]
                   (if cont?
-                    (let [v-hi (double v)]
+                    (let [v-hi (percentile-double values idx)]
                       (.writeDouble out-vec (if (== rank-lo rank-hi)
                                               v-hi
                                               (+ lo-value (* (- cont-rank (double rank-lo)) (- v-hi lo-value))))))
-                    (.writeObject out-vec v))
+                    (copy-percentile-value! out-vec values idx))
                   (recur page page-start (inc group-idx) (+ group-start n) lo-value))
 
                 (recur (when (.hasNext pages) (.next pages)) page-end group-idx group-start lo-value)))))))))

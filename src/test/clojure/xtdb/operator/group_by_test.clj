@@ -593,6 +593,16 @@
                           (tu/query-ra '[:group-by {:columns [{min (min a)}]}
                                          [:table {:rows [{:a 32} {:a "foo"}]}]]))))
 
+(t/deftest test-binary-extrema-use-unsigned-prefix-order-across-pages
+  (let [low (byte-array [0])
+        prefix (byte-array [-1])
+        high (byte-array [-1 1])]
+    (t/is (= (tu/->clj [{:mn low, :mx high}])
+             (tu/->clj (tu/query-ra [:group-by '{:columns [{mn (min b)} {mx (max b)}]}
+                                    [::tu/pages '{b #xt/type [:? :varbinary]}
+                                     [[{:b high} {:b prefix}]
+                                      [{:b low} {:b nil} {:b high}]]]]))))))
+
 (t/deftest test-min-max-strings
   (t/is (= [{:mn "apple" :mx "cherry"}]
            (tu/query-ra '[:group-by {:columns [{mn (min a)} {mx (max a)}]}

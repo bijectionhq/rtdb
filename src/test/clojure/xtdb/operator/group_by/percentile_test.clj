@@ -148,6 +148,18 @@
                             [{:v 30} {:v 40}]]]]))
         "works across multiple batches"))
 
+(t/deftest test-percentiles-preserve-discrete-integers-and-continuous-signed-zero
+  (t/is (= {:res [{:p 9007199254740993}], :types '{p #xt/type [:? :i64]}}
+           (tu/query-ra '[:group-by {:columns [{p (percentile_disc 0.5 [v {:direction :asc}])}]}
+                          [::tu/pages {v #xt/type [:? :i64]}
+                           [[{:v 9007199254740994} {:v nil}]
+                            [{:v 9007199254740993}]]]]
+                        {:with-types? true})))
+
+  (let [[{:keys [p]}] (tu/query-ra '[:group-by {:columns [{p (percentile_cont 0.5 [v {:direction :asc}])}]}
+                                     [:table {:rows [{:v -0.0} {:v nil}]}]])]
+    (t/is (= Long/MIN_VALUE (Double/doubleToRawLongBits p)))))
+
 (defn- reference-percentile [mode fraction direction vs]
   (let [vs (vec (cond-> (sort (remove nil? vs))
                   (= :desc direction) reverse))
