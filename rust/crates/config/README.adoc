@@ -39,6 +39,8 @@ The package manifest contains digests of the extracted server and migrator binar
 The report retains SHA256 digests of the exact configuration, environment and provenance input bytes.
 It includes the declared provenance, compiled backend capabilities, databases, partition counts, auth methods and rules, remote aliases, module registrations, source and replica identities, and storage roots including native storage version and epoch.
 PostgreSQL CDC reports its remote, publication and slot; Kafka Connect reports the remote, topic, Docs table and option names.
+A persisted PostgreSQL source with an omitted indexer is reported as DirectMirror, matching the runtime default for legacy configurations.
+New PostgreSQL source YAML requires an explicit `indexer`.
 Passwords, hashes, keys, connection strings, Kafka option values and URL userinfo/query/fragment values are omitted or replaced with `[redacted]`.
 Decoder errors use fixed messages because parser diagnostics can contain secret values.
 Paths, usernames, database names, hosts and other deployment identifiers remain visible; protect the report as deployment metadata.

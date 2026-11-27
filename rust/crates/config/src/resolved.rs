@@ -237,7 +237,7 @@ fn external_source(any: &prost_types::Any, node: &NodeConfiguration, path: &str,
             remote(config.remote.as_deref().unwrap_or_default(), "postgres", node, path, report);
             #[cfg(feature = "pg-source")]
             if rtdb_pg_source::SourceConfig::decode(any).is_err() { report.gap("invalid-postgres-source", path, "The production PostgreSQL source description failed validation."); }
-            if config.indexer.as_ref().is_none_or(|indexer| kind(indexer) != "xtdb.postgres.proto.DirectMirrorConfig") { report.gap("unsupported-postgres-indexer", path, "Only the native DirectMirror indexer is available."); }
+            if config.indexer.as_ref().is_some_and(|indexer| kind(indexer) != "xtdb.postgres.proto.DirectMirrorConfig") { report.gap("unsupported-postgres-indexer", path, "Only the native DirectMirror indexer is available."); }
             json!({"kind":"postgres", "remote":config.remote, "slot":config.slot_name, "publication":config.publication_name, "indexer":"direct-mirror", "ignore_tables":config.ignore_tables})
         }
         "xtdb.kafka.connectsrc.proto.KafkaConnectSourceConfig" => {
@@ -289,3 +289,57 @@ fn remote(alias: &str, expected: &str, node: &NodeConfiguration, path: &str, rep
     if actual != Some(expected) { report.gap("missing-or-wrong-remote", path, "A referenced remote alias is absent or names a different backend type."); }
 }
 const KAFKA_PROPERTIES: &[&str] = &["bootstrap.servers", "security.protocol", "sasl.mechanism", "sasl.mechanisms", "sasl.username", "sasl.password", "sasl.jaas.config", "ssl.ca.location", "ssl.certificate.location", "ssl.key.location", "ssl.key.password", "enable.idempotence", "acks", "compression.type", "linger.ms", "message.max.bytes", "request.timeout.ms", "delivery.timeout.ms", "client.id", "socket.timeout.ms", "max.in.flight.requests.per.connection"];
+
+#[cfg(test)]
+mod tests {
+    use prost::Message;
+    use prost_types::Any;
+    use rtdb_columnar::MemoryBudget;
+    use rtdb_format::generated::xtdb::postgres::proto::PostgresSourceConfig;
+    use rtdb_server::config::NodeConfiguration;
+    use serde_json::json;
+
+    use crate::{InputFormat, qualify};
+    use super::external_source;
+
+    #[test]
+    fn legacy_postgres_source_without_an_indexer_reports_direct_mirror() {
+        let node = NodeConfiguration::from_yaml_with_environment(
+            "remotes: {upstream: !Postgres {hostname: pg.example, database: source, username: reader, password: fixture}}",
+            &|_| None,
+            true,
+        ).unwrap();
+        let provenance = json!({
+            "reference_revision": "a".repeat(40),
+            "implementation_revision": "b".repeat(40),
+            "server_artifact_sha256": "c".repeat(64),
+            "migrator_artifact_sha256": "d".repeat(64),
+        }).to_string();
+        let memory = MemoryBudget::new(16 * 1024 * 1024);
+        for (indexer_type, unsupported) in [
+            (None, false),
+            (Some("proto.xtdb.com/xtdb.postgres.proto.DirectMirrorConfig"), false),
+            (Some("proto.xtdb.com/example.CustomIndexer"), true),
+        ] {
+            let mut report = qualify("databases: {}", InputFormat::IngestYaml, b"{}", provenance.as_bytes(), &memory).unwrap();
+            assert!(report.configuration_gaps.is_empty());
+            let source = Any {
+                type_url: "proto.xtdb.com/xtdb.postgres.proto.PostgresSourceConfig".into(),
+                value: PostgresSourceConfig {
+                    remote: Some("upstream".into()),
+                    slot_name: Some("legacy_slot".into()),
+                    publication_name: Some("publication".into()),
+                    indexer: indexer_type.map(|type_url| Any { type_url: type_url.into(), value: Vec::new() }),
+                    ignore_tables: Vec::new(),
+                }.encode_to_vec(),
+            };
+            let description = external_source(&source, &node, "databases.mirror", &mut report);
+            if !unsupported { assert_eq!(description["indexer"], "direct-mirror"); }
+            let mut expected = Vec::new();
+            if !cfg!(feature = "pg-source") { expected.push("feature-not-compiled"); }
+            if unsupported { expected.push("unsupported-postgres-indexer"); }
+            let findings: Vec<_> = report.configuration_gaps.iter().map(|finding| finding.code).collect();
+            assert_eq!(findings, expected, "{indexer_type:?}");
+        }
+    }
+}
