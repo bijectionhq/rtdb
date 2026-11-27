@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
-use arrow_array::{Array, ArrayRef, StructArray};
+use arrow_array::{Array, ArrayRef, NullArray, StructArray};
 use arrow_schema::{DataType, Field as ArrowField, Fields, UnionMode};
 use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation, from_field, to_field};
 use rtdb_plan::{Expr, Schema};
@@ -99,7 +99,15 @@ pub(super) fn merge_expression(
             }
             super::projection::computed_record(expr, schema, batch, parameters, context)
         };
-        let Some(old) = bind_operand(left, schema, batch, build)? else { return Ok(None); };
+        let old = if matches!(left, Expr::Literal(Value::Null)) {
+            let owner = memory.reserve(512)?;
+            let field = Arc::new(ArrowField::new("value", DataType::Null, true));
+            let array = Arc::new(NullArray::new(batch.len));
+            ProjectionInput::Computed(Column::Arrow { array, field, logical: Some(LogicalType::Null) }, owner)
+        } else {
+            let Some(old) = bind_operand(left, schema, batch, build)? else { return Ok(None); };
+            old
+        };
         let Some(patch) = bind_operand(right, schema, batch, build)? else { return Ok(None); };
         let (old, patch) = (old.parts(), patch.parts());
         if !computed_operand_layout(old.0) || !computed_operand_layout(patch.0) { return Ok(None); }

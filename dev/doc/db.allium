@@ -1357,6 +1357,7 @@ rule LeaderProcessesTx {
         -- A uniform Arrow patch can reuse compatible operand spans under their original buffer charges.
         -- PATCH can pack row-backed records while selecting the preferred children from its Arrow operand.
         -- An expression PATCH can merge a compatible computed Arrow record with the active old record layout for each selected row.
+        -- An expression PATCH over a null literal old record can retain compatible Arrow children from the patch in patch field order, including explicit null fields.
         -- The patch projection keeps existing cells when a patch cell is null and keeps the patch's field set for an uncovered interval.
         -- A SQL mutation that targets a reserved table aborts with the table reference in the error data.
         -- An invalid SQL table projection contributes its error before dependent column binding and INSERT schema errors in the same abort.

@@ -5476,6 +5476,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn patch_over_a_null_literal_keeps_order_and_explicit_null_children() {
+        let memory = MemoryBudget::new(1 << 20);
+        let text = field(0, ScalarType::Utf8);
+        let number = field(1, ScalarType::I64);
+        let schema = Schema::new(vec![text.clone(), number.clone()]).unwrap();
+        let labels = StringArray::from(vec!["gap", "second"]);
+        let address = labels.value(0).as_ptr();
+        let columns = [
+            (Arc::new(labels) as ArrayRef, &text),
+            (Arc::new(Int64Array::from(vec![None, Some(2)])) as ArrayRef, &number),
+        ].into_iter().map(|(array, field)| Column::Arrow {
+            array, field: Arc::new(rtdb_columnar::to_field(&field.name, &field.data_type).unwrap()),
+            logical: Some(field.data_type.clone()),
+        }).collect();
+        let args = vec![Expr::Literal(Value::Null),
+            Expr::Struct(vec![("z".into(), text.expression()), ("a".into(), number.expression())])];
+        let expr = Expr::Call {
+            name: "_patch".into(), return_type: rtdb_plan::function_type_with_args("_patch", &args).unwrap(), args,
+        };
+        let batch = ColumnBatch::settled(columns, 2, memory.reserve(0).unwrap()).unwrap();
+        let mut cursor = record_projection_cursor(batch, schema, vec![expr], &memory);
+        cursor.scalar_fallbacks = Some(0);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert_eq!(cursor.scalar_fallbacks, Some(0));
+        let Some(Some((array, field, _, row))) = page.columns[0].arrow_cell(0) else { panic!("Expected an Arrow record"); };
+        let mut fields = (rtdb_columnar::ArrowCell { array, field, row }).structure().unwrap();
+        assert_eq!(fields.next().unwrap().utf8().unwrap().as_ptr(), address);
+        for (row, expected) in [Value::Null, Value::I64(2)].into_iter().enumerate() {
+            let Value::Struct(value) = page.columns[0].value(row).unwrap() else { panic!("Expected a patched record"); };
+            assert_eq!(value.keys().map(String::as_str).collect::<Vec<_>>(), ["z", "a"]);
+            assert_eq!(value["a"], expected);
+        }
+    }
+
+    #[tokio::test]
     async fn computed_patch_fallback_preserves_row_order_across_operands() {
         let memory = MemoryBudget::new(1 << 20);
         let schema = Schema::new(vec![field(0, ScalarType::I64)]).unwrap();
