@@ -34,9 +34,9 @@ pub(crate) struct Slices<'a> {
 pub(crate) async fn write(store: &dyn ObjectStore, node_id: &str, now: Timestamp, error: &Anomaly, slices: Slices<'_>, memory: &Arc<MemoryBudget>) {
     let directory = match directory(node_id, now) {
         Ok(directory) => directory,
-        Err(failure) => { eprintln!("crash log for {error} could not be named: {failure}"); return; }
+        Err(failure) => { tracing::warn!("crash log for {error} could not be named: {failure}"); return; }
     };
-    eprintln!("writing crash log: {directory}");
+    tracing::warn!("writing crash log: {directory}");
     let mut complete = report(&directory, "crash.edn", put_edn(store, &directory, error, memory).await);
     if let Some(table) = context_table(error)
         && let Some(live) = slices.live.tables().get(&table)
@@ -49,13 +49,13 @@ pub(crate) async fn write(store: &dyn ObjectStore, node_id: &str, now: Timestamp
     if let Some(tx_ops) = slices.tx_ops {
         complete &= report(&directory, "tx-ops.arrow", put_tx_ops(store, &directory, tx_ops, memory).await);
     }
-    if complete { eprintln!("crash log written: {directory}"); }
+    if complete { tracing::warn!("crash log written: {directory}"); }
 }
 
 fn report(directory: &str, file: &str, outcome: Result<()>) -> bool {
     match outcome {
         Ok(()) => true,
-        Err(failure) => { eprintln!("crash log {directory}/{file} could not be written: {failure}"); false }
+        Err(failure) => { tracing::warn!("crash log {directory}/{file} could not be written: {failure}"); false }
     }
 }
 
