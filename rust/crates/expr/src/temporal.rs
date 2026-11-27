@@ -61,16 +61,25 @@ pub(crate) fn date_days(value: &Value) -> Option<i64> { value.date_days() }
 /// The wall-clock microseconds a date or timestamp reads as in `timezone`: date-times that compare equal share it.
 pub fn local_micros(value: &Value, timezone: &str) -> Option<i64> { timestamp_units(value, TimeUnit::Microsecond, true, timezone).ok() }
 
+pub fn local_timestamp_micros(value: i64, source: TimeUnit, zoned: bool, timezone: &str) -> Option<i64> {
+    rescale_timestamp(value, source, TimeUnit::Microsecond, zoned, timezone).ok()
+}
+
+fn rescale_timestamp(value: i64, source: TimeUnit, target: TimeUnit, localize: bool, timezone: &str) -> Result<i64> {
+    let value = if localize {
+        let offset = offset_at(value, source, &zone(timezone)?)?;
+        value.checked_add(i64::from(offset).checked_mul(source.units_per_second()).ok_or_else(overflow)?).ok_or_else(overflow)?
+    } else {
+        value
+    };
+    rescale(value, source, target)
+}
+
 pub(crate) fn timestamp_units(value: &Value, unit: TimeUnit, localize: bool, timezone: &str) -> Result<i64> {
     if let Some(days) = date_days(value) { return days.checked_mul(86_400).and_then(|seconds| seconds.checked_mul(unit.units_per_second())).ok_or_else(overflow); }
     match value {
-        Value::Timestamp { value, unit: source, timezone: source_zone } => {
-            if localize && source_zone.is_some() {
-                let offset = offset_at(*value, *source, &zone(timezone)?)?;
-                let local = value.checked_add(i64::from(offset).checked_mul(source.units_per_second()).ok_or_else(overflow)?).ok_or_else(overflow)?;
-                rescale(local, *source, unit)
-            } else { rescale(*value, *source, unit) }
-        }
+        Value::Timestamp { value, unit: source, timezone: source_zone } =>
+            rescale_timestamp(*value, *source, unit, localize && source_zone.is_some(), timezone),
         Value::Duration { value, unit: source } | Value::Time { value, unit: source, .. } => rescale(*value, *source, unit),
         _ => Err(inapplicable("temporal arithmetic", &[value])),
     }

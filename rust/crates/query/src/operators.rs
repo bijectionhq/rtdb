@@ -956,7 +956,7 @@ impl crate::columnar::BatchCursor for BatchDistinct {
             let context = &self.execution.context;
             let memory = &context.memory;
             let selection = PredicateSelection::build(batch.len, memory, |bits| {
-                self.seen.distinct(&batch, self.projected, bits, context, self.schema.schema(), |_| Ok(true))
+                self.seen.distinct(&batch, self.projected, bits, context, self.schema.schema(), |_, _| Ok(true))
             })?;
             if !selection.is_empty() { return batch.select_predicate(&selection, memory).map(Some); }
         }
@@ -1018,8 +1018,8 @@ fn holds_temporal(value: &Value) -> bool {
 
 pub(crate) fn equality_cell_hash(value: &Value, timezone: &str) -> u32 {
     match value {
-        Value::Timestamp { .. } | Value::DateDay(_) | Value::DateMilli(_) => rtdb_expr::local_micros(value, timezone)
-            .and_then(|micros| rtdb_columnar::hash_value(&Value::I64(micros), 0).ok()).map_or(TEMPORAL_HASH, |cell| (cell as u32) ^ TEMPORAL_HASH),
+        Value::Timestamp { .. } | Value::DateDay(_) | Value::DateMilli(_) =>
+            local_micros_equality_hash(rtdb_expr::local_micros(value, timezone)),
         // Lists and structs compare element by element under the session zone, so their date-times hash as above.
         Value::List(values) | Value::FixedSizeList(values) if holds_temporal(value) => values.iter()
             .fold(TEMPORAL_HASH ^ values.len() as u32, |hash, value| combine_equality_hash(hash, equality_cell_hash(value.as_ref(), timezone))),
@@ -1031,6 +1031,10 @@ pub(crate) fn equality_cell_hash(value: &Value, timezone: &str) -> u32 {
         value if holds_temporal(value) => TEMPORAL_HASH,
         value => rtdb_columnar::hash_value(value, 0).map_or(0x5bd1_e995, |cell| cell as u32),
     }
+}
+
+pub(crate) fn local_micros_equality_hash(micros: Option<i64>) -> u32 {
+    micros.map_or(TEMPORAL_HASH, |value| ScalarKey::Signed(value).hash() ^ TEMPORAL_HASH)
 }
 
 /// A hash that a set's or map's members equal under `rows_equal` share whatever order they arrive in: set members and
@@ -1104,18 +1108,16 @@ impl crate::columnar::BatchCursor for BatchSet {
                 let left_projected = self.left_projected;
                 let all = self.all;
                 let intersect = self.operator == SetOperator::Intersect;
-                let mut retain = |row| {
-                    let matched = built.matches(&batch, row, left_projected, all, context)?;
-                    Ok(matched == intersect)
-                };
                 if all {
                     for row in 0..batch.len {
                         context.check_cancelled_at(row)?;
-                        bits.append(retain(row)?);
+                        bits.append(built.matches(&batch, row, left_projected, true, context)? == intersect);
                     }
                     Ok(())
                 } else {
-                    self.seen.distinct(&batch, left_projected, bits, context, self.runtime.child(0)?.schema(), retain)
+                    self.seen.distinct(&batch, left_projected, bits, context, self.runtime.child(0)?.schema(), |hash, key| {
+                        Ok(built.matches_key(hash, key, false, context)? == intersect)
+                    })
                 }
             })?;
             if !selection.is_empty() { return batch.select_predicate(&selection, memory).map(Some); }

@@ -83,3 +83,27 @@ async fn window_partitions_preserve_distinct_temporal_vector_hashes() {
     let rows = collect(window, &context).await.unwrap();
     assert_eq!(rows.iter().map(|row| row[1].clone()).collect::<Vec<_>>(), [Value::I64(1), Value::I64(1), Value::I64(1)]);
 }
+
+#[tokio::test]
+async fn temporal_set_probes_preserve_each_left_type_and_multiplicity() {
+    let context = context();
+    let local = timestamp(0, false);
+    let zoned = timestamp(-7_200, true);
+    let other = timestamp(1, false);
+    let left = values(vec![local.clone(), zoned.clone(), local.clone(), Value::Null, Value::Null, other.clone()]);
+    let right = values(vec![zoned.clone(), Value::Null]);
+
+    for (operator, all, expected) in [
+        (SetOperator::Intersect, false, vec![local.clone(), Value::Null]),
+        (SetOperator::Except, false, vec![other.clone()]),
+        (SetOperator::Intersect, true, vec![local.clone(), Value::Null]),
+        (SetOperator::Except, true, vec![zoned, local, Value::Null, other]),
+    ] {
+        let set = Arc::new(Relation::new(left.schema().clone(), RelationNode::Set {
+            left: Arc::clone(&left), right: Arc::clone(&right), operator, all,
+        }).unwrap());
+        let expected: Vec<_> = expected.into_iter().map(|value| vec![value]).collect();
+        assert_eq!(collect(set, &context).await.unwrap(), expected);
+    }
+    assert_eq!(context.memory.used_bytes(), 0);
+}

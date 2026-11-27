@@ -37,7 +37,7 @@ pub use string::pattern::JavaFullMatcher;
 pub use string::host_defaults;
 
 pub use cast::{cast, cast_target, parse_timestamp, query_clock_instant, timestamp_micros};
-pub use temporal::local_micros;
+pub use temporal::{local_micros, local_timestamp_micros};
 pub use compare::{compare, compare_in_timezone, equality_allocation_bound, null_eq, null_eq_in_timezone, sql_eq, sql_eq_in_timezone, sql_not_eq_in_timezone, strict_eq};
 pub use ordered::{ordered_compare_in_timezone, validate_order_type};
 pub use evaluate::{ArrowParameterCell, CompiledExpr, EvalContext, ExpressionRow, RowInput, EvaluatedList, IndexedListBatches, ListBatch, ListExpression, ExpressionInvocation, OuterRow, ParameterLookup, Parameters, expression_type, evaluate_list_async, evaluate, evaluate_async, evaluate_batch, evaluate_projection, evaluate_projection_async, is_true, validate_projection_value};

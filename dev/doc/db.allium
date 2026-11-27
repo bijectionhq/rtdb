@@ -2443,7 +2443,12 @@ surface QueryAccess {
         -- Typed probes compare earlier keys at their retained positions and borrow compatible text cells.
         -- The per-page grouping index stages a position only for each new key and releases its chains before retaining the page.
         -- Key readers follow logical union leg names and run ends to borrow the selected scalar or vector values.
+        -- Group, set and window partition keys read compatible timestamps as a count, unit and zone-presence flag.
+        -- Set keys hash timestamps in session-local microseconds and group and window partition keys use the vector hash.
+        -- Timestamps with matching units and zone presence compare by count; other temporal comparisons use the scalar rules.
         -- URI keys retain the raw hash check and the SQL comparison of their spellings.
+        -- Distinct intersection and difference reuse the first-seen left key and hash for right-side membership.
+        -- A charged comparison cache holds only the scalar and timestamp parts of admitted candidate keys and falls back to the retained positions under budget pressure.
         -- Arrow join pushdown retains at most 1024 distinct IID candidates of supported identity cells alongside their Bloom positions.
         -- A captured probe table row estimate limits a candidate set larger than a singleton to fewer IIDs than the estimated rows.
         -- When an additional distinct candidate exceeds the bound, the probe scan uses the Bloom filter and the join still checks exact equality.
