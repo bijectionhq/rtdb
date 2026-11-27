@@ -12,6 +12,7 @@ The wire is `rust/proto/rtdb.store.v1.proto`, served as Flight `DoAction` calls 
 The release-checked contract uses one ASCII `x-rtdb-store-release` metadata value in a new Flight `Handshake` with verified credentials on a store-serving route.
 The exact package version is compared byte for byte, and the successful handshake returns the linked version in the same metadata field with the session credentials and an empty response stream.
 The session retains the agreement for subsequent store actions, including through the Flight gateway.
+On an assigned follower or a gateway-routed fresh reader, the handshake binds the session to the exact admitted database attachment.
 A store action takes its release from that session, and a release header on the action is rejected.
 A listener without a linked release refuses release offers before issuing a session.
 Activation requires the same exact published `store` package on both peers, RTDB's store operations using the linked implementation, and every Store client negotiating on connect, including the direct Basic-auth route.

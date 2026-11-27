@@ -65,6 +65,39 @@ async fn an_unlinked_store_release_does_not_establish_a_flight_session() {
 }
 
 #[tokio::test]
+async fn a_forwarded_reader_checks_the_release_before_issuing_a_session() {
+    #[derive(Debug)]
+    struct FreshPeer;
+
+    impl rtdb_flight_sql::FlightPeerVerifier for FreshPeer {
+        fn verify(&self, proof: &str, _: &rtdb_node::Database) -> Result<(std::net::IpAddr, bool)> {
+            assert_eq!(proof, "fresh-fixture");
+            Ok((std::net::Ipv4Addr::LOCALHOST.into(), true))
+        }
+    }
+
+    let config = FlightConfig { forwarded_peer: Some(Arc::new(FreshPeer)), ..Default::default() };
+    let running = Running::start_with_placements(Some("secret"), config, &["application"]).await;
+    let channel = Channel::from_shared(format!("http://{}", running.server.address())).unwrap()
+        .connect().await.unwrap();
+    let mut client = FlightServiceClient::new(channel);
+    let mut request = Request::new(futures::stream::iter([arrow_flight::HandshakeRequest::default()]));
+    let headers = request.metadata_mut();
+    headers.insert("authorization", "Basic eHRkYjpzZWNyZXQ=".parse().unwrap());
+    headers.insert("x-xtdb-database", "application".parse().unwrap());
+    headers.insert(rtdb_flight_sql::FORWARDED_PEER_HEADER, "fresh-fixture".parse().unwrap());
+    headers.insert("x-rtdb-store-release", "unreleased".parse().unwrap());
+
+    let status = client.handshake(request).await.err().expect("the release offer is refused");
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(!status.metadata().contains_key("authorization"));
+    assert!(!status.metadata().contains_key("set-cookie"));
+    assert!(!status.metadata().contains_key("x-rtdb-store-release"));
+    assert_eq!(running.server.status().sessions, 0);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn store_sizes_reports_the_committed_version_and_checks_incarnation() {
     use rtdb_flight_sql::rtdb::store::v1 as store;
     use rtdb_node::serving::NativeServingAuthority;

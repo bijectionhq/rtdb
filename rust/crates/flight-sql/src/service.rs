@@ -439,8 +439,9 @@ impl Service {
                 return Err(classic_flight_refusal());
             }
             let store_release = if store_handshake {
-                if self.follower_only() || fresh_replica || caller.principal.label_scope().is_some()
+                if caller.principal.label_scope().is_some()
                     || caller.principal.workload_grant().is_some_and(|grant| !grant.is_store_grant())
+                    || (self.follower_only() || fresh_replica) && placement.is_none()
                 {
                     return Err(Status::permission_denied("This credential or route does not serve the store contract"));
                 }

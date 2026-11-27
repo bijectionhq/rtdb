@@ -191,6 +191,7 @@ surface StatelessDatabase {
         -- A caller offers one store release in the x-rtdb-store-release metadata of a new Flight handshake using verified credentials.
         -- A listener without a linked store release refuses an offer before it issues session credentials.
         -- A listener with a linked store release confirms only an exact match and returns its linked release in the handshake metadata.
+        -- A release-checked session on a reader route retains the exact admitted database attachment.
         -- Each store action on a listener with a linked release requires the session established by that agreement.
 
     @guarantee StoreStorageSizes
