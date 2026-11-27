@@ -104,6 +104,23 @@ impl<'a> Cells<'a> {
         }
     }
 
+    /// Whether the layout alone shows that no cell is null.
+    pub(super) fn complete(&self) -> bool {
+        match self {
+            Self::Int(array) => array.null_count() == 0,
+            Self::Int32(array) => array.null_count() == 0,
+            Self::Int16(array) => array.null_count() == 0,
+            Self::Int8(array) => array.null_count() == 0,
+            Self::Float(array) => array.null_count() == 0,
+            Self::Float32(array) => array.null_count() == 0,
+            Self::Text(array) => array.null_count() == 0,
+            Self::Bool(array) => array.null_count() == 0,
+            Self::Micros(array, _) => array.null_count() == 0,
+            Self::Uuid(array) => array.null_count() == 0,
+            Self::Null | Self::Values(_) | Self::Union { .. } | Self::Selected { .. } => false,
+        }
+    }
+
     /// `Err` where a cell has a type no comparison here reads.
     fn get(&self, row: usize) -> Result<Option<Cell<'a>>, ()> {
         fn valid<A: Array>(array: &A, row: usize) -> bool { array.is_valid(row) }

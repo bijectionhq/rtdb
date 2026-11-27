@@ -524,6 +524,7 @@ impl Argument for Operand<'_> {
             Self::Computed(charged) => charged.validity(rows, len),
             Self::Constant(None) | Self::Cells(Cells::Null) => Some(Validity::Null),
             Self::Constant(Some(_)) => Some(Validity::Valid),
+            Self::Cells(cells) if cells.complete() => Some(Validity::Valid),
             Self::Cells(_) | Self::Values { .. } => {
                 let mut valid = Vec::with_capacity(len);
                 for row in 0..len { valid.push(reads(rows, row) && self.get(row).ok()?.is_some()); }
