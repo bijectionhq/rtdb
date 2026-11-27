@@ -24,6 +24,7 @@ pub(crate) enum OperatorCounter {
     JoinFilterRejectedHeaders,
     SpillBytesWritten,
     WindowInputOrderReused,
+    WindowRowNumberLimit,
 }
 
 impl OperatorCounter {
@@ -45,6 +46,7 @@ impl OperatorCounter {
             Self::JoinFilterRejectedHeaders => "cursor.join_filter.rejected_headers",
             Self::SpillBytesWritten => "cursor.spill.bytes_written",
             Self::WindowInputOrderReused => "cursor.window.input_order_reused",
+            Self::WindowRowNumberLimit => "cursor.window.row_number_limit",
         };
         span.attribute(name, TraceValue::Unsigned(value));
     }

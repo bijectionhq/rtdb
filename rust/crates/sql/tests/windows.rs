@@ -39,29 +39,79 @@ async fn query_at(sql: &str, context: Arc<QueryContext>) -> Result<(Schema, Vec<
 }
 
 #[derive(Default)]
-struct WindowTrace(Arc<Mutex<Vec<u64>>>);
+struct WindowTrace(Arc<Mutex<Vec<u64>>>, Arc<Mutex<Vec<u64>>>);
 
 impl Tracer for WindowTrace {
     fn query_enabled(&self) -> bool { true }
     fn transaction_enabled(&self) -> bool { false }
     fn start(&self, _: Option<SpanContext>, name: &str, _: &[(&str, TraceValue<'_>)]) -> Option<Box<dyn TraceSpan>> {
-        let window = (name == "query.cursor.window").then(|| Arc::clone(&self.0));
+        let window = (name == "query.cursor.window").then(|| (Arc::clone(&self.0), Arc::clone(&self.1)));
         Some(Box::new(WindowSpan(window)))
     }
 }
 
-struct WindowSpan(Option<Arc<Mutex<Vec<u64>>>>);
+struct WindowSpan(Option<(Arc<Mutex<Vec<u64>>>, Arc<Mutex<Vec<u64>>>)>);
 
 impl TraceSpan for WindowSpan {
     fn context(&self) -> SpanContext { SpanContext { trace_id: [1; 16], span_id: [1; 8] } }
     fn attribute(&mut self, name: &str, value: TraceValue<'_>) {
-        if name == "cursor.window.input_order_reused"
-            && let (Some(values), TraceValue::Unsigned(reused)) = (&self.0, value)
-        {
-            values.lock().unwrap().push(reused);
+        if let (Some((orders, limits)), TraceValue::Unsigned(value)) = (&self.0, value) {
+            match name {
+                "cursor.window.input_order_reused" => orders.lock().unwrap().push(value),
+                "cursor.window.row_number_limit" => limits.lock().unwrap().push(value),
+                _ => {}
+            }
         }
     }
     fn end_at(&mut self, _: SystemTime) {}
+}
+
+#[tokio::test]
+async fn bounded_row_number_preserves_first_seen_partitions_nulls_and_cutoff_peers() {
+    let input = "(VALUES (1,'z',9),(2,NULL,2),(3,'a',7),(4,'z',1),
+        (5,'z',1),(6,'z',1),(7,NULL,NULL),(8,'a',NULL),(9,NULL,3)) AS t(id,p,v)";
+    let floats = "(VALUES (1,'z',9.0),(2,NULL,2.0),(3,'a',7.0),(4,'z',1.0),
+        (5,'z',1.0),(6,'z',1.0),(7,NULL,NULL),(8,'a',NULL),(9,NULL,3.0)) AS t(id,p,v)";
+    for (input, order, ids) in [
+        (input, "ASC NULLS LAST", [4, 5, 2, 9, 3, 8]),
+        (input, "DESC NULLS FIRST", [1, 4, 7, 9, 8, 3]),
+        (floats, "ASC NULLS FIRST", [4, 5, 7, 2, 8, 3]),
+        (floats, "DESC NULLS LAST", [1, 4, 9, 2, 3, 8]),
+    ] {
+        let sql = format!(
+            "SELECT id,rn FROM (SELECT id,ROW_NUMBER() OVER (PARTITION BY p ORDER BY v {order}) rn FROM {input}) s WHERE rn <= 2"
+        );
+        let expected = ids.into_iter().zip([1, 2, 1, 2, 1, 2])
+            .map(|(id, rank)| vec![V::I64(id), V::I64(rank)]).collect::<Vec<_>>();
+        for sort_memory in [1, 256, 1 << 26] {
+            let tracer = Arc::new(WindowTrace::default());
+            let context = context_with_sort_memory(sort_memory).with_tracer(Some(tracer.clone()), None);
+            assert_eq!(query_at(&sql, context).await.unwrap().1, expected);
+            let limits = tracer.1.lock().unwrap();
+            if sort_memory == 1 << 26 { assert_eq!(*limits, [2]); }
+            else { assert!(limits.is_empty()); }
+        }
+    }
+}
+
+#[tokio::test]
+async fn bounded_row_number_keeps_the_ordinary_path_for_other_predicates_and_window_dependencies() {
+    let input = "(VALUES (1,0,1),(2,0,2),(3,0,3),(4,0,4)) AS t(id,p,v)";
+    let window = "PARTITION BY p ORDER BY v";
+    let ranks = format!("SELECT id,p,v,ROW_NUMBER() OVER ({window}) rn FROM {input}");
+    for (sql, expected) in [
+        (format!("SELECT id,rn FROM ({ranks}) s WHERE rn >= 3"),
+            vec![vec![V::I64(3), V::I64(3)], vec![V::I64(4), V::I64(4)]]),
+        (format!("SELECT id,rn FROM ({ranks}) s WHERE rn <= 2 OR id = 4"),
+            vec![vec![V::I64(1), V::I64(1)], vec![V::I64(2), V::I64(2)], vec![V::I64(4), V::I64(4)]]),
+        (format!("SELECT id,rn,next_id FROM (SELECT id,rn,LEAD(id) OVER ({window}) next_id FROM ({ranks}) r) s WHERE rn <= 2"),
+            vec![vec![V::I64(1), V::I64(1), V::I64(2)], vec![V::I64(2), V::I64(2), V::I64(3)]]),
+    ] {
+        let tracer = Arc::new(WindowTrace::default());
+        let context = context_with_sort_memory(1 << 26).with_tracer(Some(tracer.clone()), None);
+        assert_eq!(query_at(&sql, context).await.unwrap().1, expected, "{sql}");
+        assert!(tracer.1.lock().unwrap().is_empty(), "{sql}");
+    }
 }
 
 #[tokio::test]

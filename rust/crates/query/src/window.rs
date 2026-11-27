@@ -11,6 +11,8 @@ use crate::sort::batches::BatchSort;
 
 mod order;
 pub(crate) use order::InputOrder;
+mod top_k;
+pub(crate) use top_k::{RowNumberLimit, TopKWindow};
 
 pub(crate) struct BatchWindow {
     input: Option<BoxBatchCursor>,
@@ -46,16 +48,9 @@ impl BatchWindow {
             let field = binder.field("", None, logical.clone())?;
             order_by.insert(0, SortExpr { expr: field.expression(), descending: false, nulls_first: false });
             let arrow = Arc::new(rtdb_columnar::to_field(&field.name, &logical)?);
-            let positions = partition_by.iter().map(|&column| schema.position(column).ok_or_else(|| invalid("window-column", "Window partition column is absent")))
-                .collect::<Result<Vec<_>>>()?;
-            let keys = Schema::new(positions.iter().enumerate().map(|(index, &position)| {
-                let mut field = schema.fields()[position].clone();
-                field.id = ColumnId(index as u32);
-                field
-            }).collect())?;
             let context = Arc::clone(&execution.context);
-            let index = BatchKeyIndex::vector_hashing(&context)?;
-            input = Box::new(PartitionBatches { input, context, positions, keys, index, arrow, logical, projected });
+            let partitions = WindowPartitions::new(&schema, partition_by, &context)?;
+            input = Box::new(PartitionBatches { input, context, partitions, arrow, logical, projected });
             sort_schema = schema.concat(&Schema::new(vec![field])?)?;
             Some(schema.len())
         };
@@ -233,12 +228,39 @@ impl BatchCursor for ReplayWindowInput {
 struct PartitionBatches {
     input: BoxBatchCursor,
     context: Arc<crate::QueryContext>,
-    positions: Vec<usize>,
-    keys: Schema,
-    index: BatchKeyIndex,
+    partitions: WindowPartitions,
     arrow: Arc<arrow_schema::Field>,
     logical: LogicalType,
     projected: bool,
+}
+
+struct WindowPartitions {
+    positions: Vec<usize>,
+    keys: Schema,
+    index: BatchKeyIndex,
+}
+
+impl WindowPartitions {
+    fn new(schema: &Schema, partition_by: &[ColumnId], context: &crate::QueryContext) -> Result<Self> {
+        let positions = partition_by.iter().map(|&column| schema.position(column).ok_or_else(|| invalid("window-column", "Window partition column is absent")))
+            .collect::<Result<Vec<_>>>()?;
+        let keys = Schema::new(positions.iter().enumerate().map(|(index, &position)| {
+            let mut field = schema.fields()[position].clone();
+            field.id = ColumnId(index as u32);
+            field
+        }).collect())?;
+        Ok(Self { positions, keys, index: BatchKeyIndex::vector_hashing(context)? })
+    }
+
+    fn validate(&self) -> Result<()> {
+        crate::operators::validate_distinct_types(&self.keys)
+    }
+
+    fn identify(&mut self, batch: &ColumnBatch, projected: bool, context: &crate::QueryContext,
+        visit: impl FnMut(usize, usize, bool) -> Result<()>,
+    ) -> Result<()> {
+        self.index.identify(KeyColumns::projection(batch, &self.positions), projected, context, &self.keys, visit)
+    }
 }
 
 #[async_trait]
@@ -246,13 +268,12 @@ impl BatchCursor for PartitionBatches {
     async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
         let memory = &self.context.memory;
         while let Some(mut batch) = poll_nested_batch(self.input.as_mut()).await? {
-            crate::operators::validate_distinct_types(&self.keys)?;
+            self.partitions.validate()?;
             if batch.len == 0 { continue; }
             let bytes = batch.len.checked_mul(std::mem::size_of::<i64>()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(window_size)?;
             let reservation = memory.reserve(bytes)?;
-            let keys = KeyColumns::projection(&batch, &self.positions);
             let mut groups = Vec::with_capacity(batch.len);
-            self.index.identify(keys, self.projected, &self.context, &self.keys, |_, group, _| {
+            self.partitions.identify(&batch, self.projected, &self.context, |_, group, _| {
                 groups.push(i64::try_from(group).map_err(|_| invalid("window-count", "Window partition count overflow"))?);
                 Ok(())
             })?;

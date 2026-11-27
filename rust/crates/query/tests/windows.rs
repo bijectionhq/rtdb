@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc};
 use rtdb_columnar::{MemoryBudget, read_value};
-use rtdb_plan::{Binder, ColumnId, Expr, Relation, RelationNode, Schema, SortExpr, WindowExpr, WindowFunction};
+use rtdb_plan::{BinaryOp, Binder, ColumnId, Expr, Relation, RelationNode, Schema, SortExpr, WindowExpr, WindowFunction};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryOptions};
 use rtdb_storage::{MemoryStore, cache::BufferPool};
 use rtdb_types::{LogicalType as T, ScalarType as S, Timestamp, Value as V};
@@ -23,6 +23,97 @@ fn relation(rows: Vec<Vec<V>>, partitioned: bool) -> Arc<Relation> {
     }).collect::<Vec<_>>();
     let schema = input.schema().concat(&Schema::new(expressions.iter().map(|expression| expression.field.clone()).collect()).unwrap()).unwrap();
     Arc::new(Relation::new(schema, RelationNode::Window { input, partition_by: if partitioned { vec![key.id] } else { Vec::new() }, order_by:vec![SortExpr { expr:value.expression(),descending:false,nulls_first:false }],expressions }).unwrap())
+}
+
+fn bounded_pages(pages: Vec<Vec<(i64, V, V)>>, descending: bool, with_lead: bool) -> Arc<Relation> {
+    let mut binder = Binder::default();
+    let id = binder.field("id", None, T::Scalar(S::I64)).unwrap();
+    let group = binder.field("region", None, T::Scalar(S::Utf8).maybe()).unwrap();
+    let balance = binder.field("balance", None, T::Scalar(S::F64).maybe()).unwrap();
+    let order = SortExpr { expr: balance.expression(), descending, nulls_first: descending };
+    let id_column = id.id;
+    let schema = Schema::new(vec![id, group.clone(), balance]).unwrap();
+    let pages = pages.into_iter().map(|page| page.into_iter().map(|(id, group, key)| {
+        [V::I64(id), group, key].into_iter().map(Expr::Literal).collect()
+    }).collect()).collect();
+    let input = Arc::new(Relation::new(schema.clone(), RelationNode::LiteralPages { pages }).unwrap());
+    let field = binder.field("rn", None, T::Scalar(S::I64)).unwrap();
+    let predicate = Expr::binary(BinaryOp::LtEq, field.expression(), Expr::Literal(V::I64(2)));
+    let mut expressions = vec![WindowExpr { field, function: WindowFunction::RowNumber }];
+    if with_lead {
+        let field = binder.field("next_id", None, T::Scalar(S::I64).maybe()).unwrap();
+        expressions.push(WindowExpr { field, function: WindowFunction::Lead { column: id_column, offset: 1 } });
+    }
+    let schema = schema.concat(&Schema::new(expressions.iter().map(|expr| expr.field.clone()).collect()).unwrap()).unwrap();
+    let window = Arc::new(Relation::new(schema, RelationNode::Window {
+        input, partition_by: vec![group.id], order_by: vec![order],
+        expressions,
+    }).unwrap());
+    Arc::new(window.filter(predicate).unwrap())
+}
+
+#[tokio::test]
+async fn bounded_row_number_keeps_cross_page_peers_signed_zero_and_nan_in_sort_order() {
+    let text = |text: &str| V::Utf8(text.into());
+    let pages = vec![
+        vec![(1, text("z"), V::F64(0.0)), (2, V::Null, V::F64(f64::NAN)), (3, text("a"), V::F64(7.0))],
+        vec![(4, text("z"), V::F64(-0.0)), (5, text("z"), V::F64(-0.0)), (6, text("z"), V::F64(-0.0)),
+            (7, V::Null, V::Null), (8, text("a"), V::Null)],
+        vec![(9, V::Null, V::F64(f64::INFINITY)), (10, V::Null, V::F64(-f64::NAN)), (11, text("z"), V::F64(f64::NAN))],
+    ];
+    for (descending, ids) in [(false, [4, 5, 9, 2, 3, 8]), (true, [11, 1, 7, 2, 8, 3])] {
+        for top_k_rows in [0, 2] {
+            let mut context = context(0);
+            let options = &mut Arc::get_mut(&mut context).unwrap().options;
+            options.sort_memory_bytes = 1 << 20;
+            options.top_k_rows = top_k_rows;
+            let prepared = PreparedQuery::new(bounded_pages(pages.clone(), descending, false)).unwrap();
+            let mut cursor = prepared.execute(Arc::clone(&context), vec![]).await.unwrap();
+            let mut rows = Vec::new();
+            while let Some(page) = cursor.next_batch().await.unwrap() {
+                let batch = page.batch();
+                let row = |column: usize| read_value(batch.schema().field(column), batch.column(column).as_ref(), 0).unwrap();
+                rows.push((row(0), row(3)));
+            }
+            assert_eq!(rows, ids.into_iter().zip([1, 2, 1, 2, 1, 2])
+                .map(|(id, rank)| (V::I64(id), V::I64(rank))).collect::<Vec<_>>());
+            drop(cursor);
+            assert_eq!(context.memory.used_bytes(), 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn bounded_row_number_replays_all_input_on_an_incompatible_late_key() {
+    let mut context = context(0);
+    Arc::get_mut(&mut context).unwrap().options.sort_memory_bytes = 1 << 20;
+    let group = V::Utf8("z".into());
+    let pages = vec![
+        vec![(1, group.clone(), V::F64(3.0)), (2, group.clone(), V::F64(2.0)), (3, group.clone(), V::F64(1.0))],
+        vec![(4, group, V::Utf8("incompatible".into()))],
+    ];
+    let prepared = PreparedQuery::new(bounded_pages(pages, false, false)).unwrap();
+    let mut cursor = prepared.execute(Arc::clone(&context), vec![]).await.unwrap();
+    assert_eq!(cursor.next_batch().await.err().unwrap().code, "xtdb.expression/function-type-mismatch");
+    drop(cursor);
+    assert_eq!(context.memory.used_bytes(), 0);
+}
+
+#[tokio::test]
+async fn bounded_row_number_retains_all_input_for_lead_in_the_same_window() {
+    let mut context = context(0);
+    Arc::get_mut(&mut context).unwrap().options.sort_memory_bytes = 1 << 20;
+    let pages = vec![(1..=3).map(|id| (id, V::Utf8("z".into()), V::F64(id as f64))).collect()];
+    let prepared = PreparedQuery::new(bounded_pages(pages, false, true)).unwrap();
+    let mut cursor = prepared.execute(Arc::clone(&context), vec![]).await.unwrap();
+    for next in [2, 3] {
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        let batch = page.batch();
+        assert_eq!(read_value(batch.schema().field(4), batch.column(4).as_ref(), 0).unwrap(), V::I64(next));
+    }
+    assert!(cursor.next_batch().await.unwrap().is_none());
+    drop(cursor);
+    assert_eq!(context.memory.used_bytes(), 0);
 }
 
 #[tokio::test]

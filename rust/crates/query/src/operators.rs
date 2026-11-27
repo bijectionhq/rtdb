@@ -11,6 +11,7 @@ use crate::compiled::{OperatorTemplate, Predicates, Projections, StackedFilters}
 use crate::context::Execution;
 use crate::limit_bounds::{checked_row_count, sort_prefix_len};
 use crate::runtime_schema::{EmittedRelation, RuntimeSchema};
+use crate::window::{RowNumberLimit, TopKWindow};
 use crate::invalid;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -23,12 +24,12 @@ impl BatchOutput {
 pub(crate) fn build_batch_input(
     runtime: Arc<EmittedRelation>, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, output: BatchOutput,
 ) -> futures::future::BoxFuture<'static, Result<Option<(crate::columnar::BoxBatchCursor, bool)>>> {
-    build_batch_input_with_state(runtime, execution, pushdowns, output, false, false)
+    build_batch_input_with_state(runtime, execution, pushdowns, output, false, false, None)
 }
 
 fn build_batch_input_with_state(
     runtime: Arc<EmittedRelation>, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, output: BatchOutput,
-    reserve_state: bool, count_join_rows: bool,
+    reserve_state: bool, count_join_rows: bool, row_number_limit: Option<RowNumberLimit>,
 ) -> futures::future::BoxFuture<'static, Result<Option<(crate::columnar::BoxBatchCursor, bool)>>> {
     let mut build = Box::pin(async move {
         let relation = Arc::clone(runtime.relation());
@@ -47,7 +48,7 @@ fn build_batch_input_with_state(
         } else { None };
         let metadata_scan = matches!(relation.node(), RelationNode::Scan(scan) if
             crate::inspection::is_inspection(&scan.table.name.table) || crate::system_schema::definition(&scan.table.name.table).is_some());
-        let Some((mut input, projected)) = build_batches_at(runtime, execution, pushdowns, output, count_join_rows).await? else { return Ok(None); };
+        let Some((mut input, projected)) = build_batches_at(runtime, execution, pushdowns, output, count_join_rows, row_number_limit).await? else { return Ok(None); };
         if let Some(reservation) = reservation { input = crate::columnar::retain_batch_state(input, reservation); }
         let input = if !already_in_operator && !metadata_scan {
             let input = crate::analysis::wrap_batches(input, analysis, &context.memory);
@@ -62,7 +63,7 @@ fn build_batch_input_with_state(
 
 async fn build_batches_at(
     runtime: Arc<EmittedRelation>, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, output: BatchOutput,
-    count_join_rows: bool,
+    count_join_rows: bool, row_number_limit: Option<RowNumberLimit>,
 ) -> Result<Option<(crate::columnar::BoxBatchCursor, bool)>> {
     use crate::{columnar::{BoxBatchCursor, ColumnBatch, single_batch}, sort::batches::BatchSort};
 
@@ -111,6 +112,9 @@ async fn build_batches_at(
             let OperatorTemplate::Filter { single, stacked } = template.as_ref() else { return Err(template_mismatch()); };
             let mut input = runtime.child(0)?;
             let mut input_execution = execution.child(0);
+            let row_number_limit = if output.semantic_pages() { None } else {
+                RowNumberLimit::bind(&input, predicate, &execution.context)?
+            };
             let mut state = execution.context.memory.reserve(0)?;
             // Each stage below the first is measured as the filter it was fused from.
             let mut stage_analysis = vec![None];
@@ -143,7 +147,9 @@ async fn build_batches_at(
                 }
             };
             stage_analysis.reverse();
-            let Some((batches, projected)) = build_batch_input(input, input_execution, pushdowns, output).await? else { return Ok(None); };
+            let Some((batches, projected)) = build_batch_input_with_state(
+                input, input_execution, pushdowns, output, false, false, row_number_limit,
+            ).await? else { return Ok(None); };
             let context = Arc::clone(&execution.context);
             let filter = Box::new(crate::columnar::BatchFilter::admitted(batches, predicates, execution).observing_stages(stage_analysis));
             let filter = crate::columnar::retain_batch_state(filter, state);
@@ -229,6 +235,17 @@ async fn build_batches_at(
             let input_order = if output.semantic_pages() { None } else {
                 crate::window::InputOrder::bind(&child, partition_by, order_by, &execution.context.memory)
             };
+            if input_order.is_none() && let Some(limit) = row_number_limit {
+                let window_execution = execution.clone();
+                let reopen = Box::new(move || {
+                    Box::pin(async move {
+                        build_batch_input(runtime, window_execution, None, output).await?
+                            .map(|(input, _)| input).ok_or_else(|| invalid("window-input", "Could not replay window input"))
+                    }) as futures::future::BoxFuture<'static, _>
+                });
+                let window = TopKWindow::new(input, &schema, partition_by, &expressions[0], projected, execution.context, limit, reopen)?;
+                return Ok(Some((Box::new(window), projected)));
+            }
             let window = crate::window::BatchWindow::with_input_order(
                 input, schema, partition_by, order_by.clone(), expressions, projected, execution, input_order,
             )?;
@@ -247,7 +264,7 @@ async fn build_batches_at(
                 && aggregates.iter().all(|aggregate| aggregate.function.canonical() == rtdb_plan::AggregateFunction::CountStar
                     && aggregate.argument.is_none() && aggregate.filter.is_none() && !aggregate.distinct && aggregate.order_by.is_empty());
             let Some((input, projected)) = build_batch_input_with_state(
-                child, execution.child(0), pushdowns, output, false, count_join_rows,
+                child, execution.child(0), pushdowns, output, false, count_join_rows, None,
             ).await? else { return Ok(None); };
             let (input, schema, groups) = crate::aggregate::project_group_keys(input, schema, groups, &execution)?;
             let aggregate = crate::aggregate::AggregateCursor::from_batches(input, projected, schema,
@@ -455,7 +472,7 @@ pub(crate) async fn build_column_pages(runtime: Arc<EmittedRelation>, execution:
 async fn build_column_output(runtime: Arc<EmittedRelation>, execution: Execution, output: BatchOutput) -> Result<Option<crate::columnar::BoxBatchCursor>> {
     execution.context.check_cancelled()?;
     if batch_shape(&runtime)?.is_none() { return Ok(None); }
-    Ok(build_batch_input_with_state(runtime, execution, None, output, true, false).await?.map(|(cursor, _)| cursor))
+    Ok(build_batch_input_with_state(runtime, execution, None, output, true, false, None).await?.map(|(cursor, _)| cursor))
 }
 
 async fn build_materialized_columns(runtime: &Arc<EmittedRelation>, binding: &Arc<rtdb_plan::MaterializedBinding>,

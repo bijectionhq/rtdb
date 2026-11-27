@@ -2561,7 +2561,9 @@ surface QueryAccess {
         -- A partitioned window emits the partitions in first-seen order and retains input order among peers within a partition.
         -- It can reuse the order of a stable input sort when the bound partition keys form the leading columns and the following columns match the window keys, directions, and null placement.
         -- Reuse admits key layouts whose comparison and partition equality agree.
-        -- Other inputs use the ordinary window sort.
+        -- A small positive literal upper bound on a single ROW_NUMBER over replayable input can keep just that many candidates per partition when a single numeric key has a supported total order.
+        -- The bounded window emits the same partition prefixes as the complete sort, with the same null placement, stable peers and row numbers.
+        -- The ordinary window sort handles other inputs and can restart a bounded window before publication when the reached layout or memory grant cannot support selection.
         -- The window validates and consumes the reached input before publishing results.
         -- Row numbers and shifts use complete partitions across Arrow batches and spill replay.
 }
