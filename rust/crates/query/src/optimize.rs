@@ -127,9 +127,13 @@ fn estimated_rows(relation: &Relation, statistics: &mut dyn TableStatistics) -> 
             Ok(smaller_estimate(estimated_rows(input, statistics)?, literal_fetch(fetch.as_ref()))),
         RelationNode::Aggregate { groups, .. } if groups.is_empty() => Ok(Some(1)),
         RelationNode::Aggregate { input, .. } => estimated_rows(input, statistics),
-        RelationNode::Join { left, right, kind: JoinKind::Inner | JoinKind::Cross, condition } =>
-            Ok(joined_rows(estimated_rows(left, statistics)?, estimated_rows(right, statistics)?,
-                condition.as_ref().is_some_and(|expr| direct_equijoin(expr, left.schema(), right.schema())))),
+        RelationNode::Join { left, right, kind: JoinKind::Inner | JoinKind::Cross, condition } => {
+            let left_rows = estimated_rows(left, statistics)?;
+            let right_rows = estimated_rows(right, statistics)?;
+            let equijoin = condition.as_ref().is_some_and(|expr| direct_equijoin(expr, left.schema(), right.schema()));
+            Ok(literal_equijoin_rows(left, right, condition.as_ref())
+                .or_else(|| joined_rows(left_rows, right_rows, equijoin)))
+        }
         RelationNode::Let { body, .. } => estimated_rows(body, statistics),
         RelationNode::Reference { binding } => estimated_rows(&binding.relation, statistics),
         _ => Ok(None),
@@ -204,6 +208,50 @@ fn joined_rows(left: Option<u64>, right: Option<u64>, equijoin: bool) -> Option<
         (Some(left), Some(right)) if equijoin => Some(left.max(right)),
         (Some(left), Some(right)) => Some(left.saturating_mul(right)),
         _ => None,
+    }
+}
+
+fn literal_equijoin_rows(left: &Relation, right: &Relation, condition: Option<&Expr>) -> Option<u64> {
+    let (a, b) = direct_join_columns(condition?)?;
+    let (left_key, right_key) = if left.schema().get(a).is_some() { (a, b) } else { (b, a) };
+    let (left_rows, left_column) = literal_i64_keys(left, left_key)?;
+    let (right_rows, right_column) = literal_i64_keys(right, right_key)?;
+    let mut matches = 0;
+    for row in left_rows {
+        if let Expr::Literal(Value::I64(key)) = &row[left_column] {
+            matches += right_rows.iter().filter(|row|
+                matches!(&row[right_column], Expr::Literal(Value::I64(other)) if other == key)).count() as u64;
+        }
+    }
+    Some(matches)
+}
+
+fn literal_i64_keys(mut relation: &Relation, mut key: ColumnId) -> Option<(&[Vec<Expr>], usize)> {
+    const MAX_LITERAL_ROWS: usize = 16;
+
+    loop {
+        let field = relation.schema().get(key)?;
+        let ty = match &field.data_type {
+            LogicalType::Maybe(inner) => inner.as_ref(),
+            ty => ty,
+        };
+        if *ty != LogicalType::Scalar(ScalarType::I64) { return None; }
+        match relation.node() {
+            RelationNode::Project { input, expressions } | RelationNode::Rename { input, expressions, .. } => {
+                let named = expressions.iter().find(|named| named.field.id == key)?;
+                let Expr::Column { id, data_type } = &named.expr else { return None; };
+                if *data_type != field.data_type || input.schema().get(*id)?.data_type != *data_type { return None; }
+                key = *id;
+                relation = input;
+            }
+            RelationNode::Values { rows } if rows.len() <= MAX_LITERAL_ROWS => {
+                let column = relation.schema().fields().iter().position(|field| field.id == key)?;
+                return rows.iter().all(|row|
+                    matches!(row.get(column), Some(Expr::Literal(Value::I64(_) | Value::Null))))
+                    .then_some((rows.as_slice(), column));
+            }
+            _ => return None,
+        }
     }
 }
 
@@ -856,7 +904,8 @@ impl JoinInput {
         let direct = estimate && condition.as_ref().is_some_and(|expr| direct_equijoin(expr, self.plan.schema(), other.plan.schema()));
         let build_left = !direct || self.rank() <= other.rank();
         let (build_rows, probe_rows) = if build_left { (self.rows, other.rows) } else { (other.rows, self.rows) };
-        let rows = joined_rows(self.rows, other.rows, direct);
+        let literal_rows = if direct { literal_equijoin_rows(&self.plan, &other.plan, condition.as_ref()) } else { None };
+        let rows = literal_rows.or_else(|| joined_rows(self.rows, other.rows, direct));
         let mut plan = Relation::join(self.plan, other.plan, kind, condition)?;
         if estimate && kind == JoinKind::Inner {
             let reason = match (build_rows, probe_rows) {
@@ -1158,6 +1207,43 @@ mod tests {
             assert_eq!(left.schema().ids(), BTreeSet::from([a.id, b.id]));
             assert_eq!(right.schema().ids(), BTreeSet::from([c.id]));
             assert_eq!(planned.join_evidence(), Some(evidence));
+        }
+    }
+
+    #[test]
+    fn literal_key_pairs_drive_the_later_build_choice() {
+        let [a, mut b, c, source] = [0, 1, 2, 3].map(field);
+        b.data_type = b.data_type.maybe();
+        let key = |value| Expr::Literal(Value::I64(value));
+        let values = |field: &Field, keys: Vec<Expr>| {
+            let schema = Schema::new(vec![field.clone()]).unwrap();
+            let rows = keys.into_iter().map(|key| vec![key]).collect();
+            Arc::new(Relation::new(schema, RelationNode::Values { rows }).unwrap())
+        };
+        let projected = Arc::new(values(&source, vec![key(1), key(1)])
+            .project(vec![NamedExpr { field: a.clone(), expr: source.expression() }]).unwrap());
+        let parameter = Expr::Parameter { index: 0, data_type: b.data_type.clone() };
+        for (keys, intermediate_rows, build_left) in [
+            (vec![key(1); 4], 8, false),
+            (vec![key(1), key(2), key(3), Expr::Literal(Value::Null)], 2, true),
+            (vec![key(2); 4], 0, true),
+            (vec![parameter, key(1), key(1), key(1)], 4, true),
+            (vec![key(1); 17], 17, false),
+        ] {
+            let first = equijoin(values(&b, keys), Arc::clone(&projected), &b, &a);
+            let mut statistics = TableCounts(BTreeMap::new());
+            assert_eq!(estimated_rows(&first, &mut statistics).unwrap(), Some(intermediate_rows));
+            let join = equijoin(first, values(&c, (1..=5).map(key).collect()), &b, &c);
+            let planned = prepare_with_statistics(Arc::clone(&join), &mut statistics).unwrap();
+            assert_eq!(planned.schema(), join.schema());
+            let hash = through_projection(&planned);
+            let RelationNode::Join { left, right, kind: JoinKind::Inner, .. } = hash.node() else { panic!("Expected the connected join"); };
+            assert_eq!(left.schema().ids(), BTreeSet::from([a.id, b.id]));
+            assert_eq!(right.schema().ids(), BTreeSet::from([c.id]));
+            let (build_rows, probe_rows) = if build_left { (intermediate_rows, 5) } else { (5, intermediate_rows) };
+            assert_eq!(hash.join_evidence(), Some(JoinPlanEvidence {
+                build_left, build_rows: Some(build_rows), probe_rows: Some(probe_rows), reason: JoinBuildReason::SmallerInput,
+            }));
         }
     }
 

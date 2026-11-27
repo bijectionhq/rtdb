@@ -68,7 +68,8 @@ async fn a_smaller_late_build_keeps_payload_columns_and_avoids_spilling_the_inte
             if attributes.get("cursor.join.build_side") == Some(&"right") {
                 assert_eq!(attributes["cursor.join.build_reason"], "smaller-input");
                 assert_eq!(attributes["cursor.join.estimated_build_rows"], "2");
-                assert_eq!(attributes["cursor.join.estimated_probe_rows"], "12");
+                assert_eq!(attributes["cursor.join.estimated_probe_rows"], "6");
+                assert_eq!(attributes["cursor.row_count"], "6");
                 saw_late_build = true;
             }
         }

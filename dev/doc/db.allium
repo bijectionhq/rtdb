@@ -1976,6 +1976,8 @@ rule CompactionJobConfirmed {
 ---- Rules: Query Serving
 
 -- Native inner-join planning uses row estimates to rank inputs and choose a build side for admitted equijoins.
+-- An inner join on a single equality between two VALUES inputs of at most sixteen rows each uses the count of matching signed 64-bit literal key pairs, including duplicates and excluding null keys.
+-- This estimate reads plan literals through type-preserving key aliases.
 -- A zero estimate leaves both join inputs in the plan.
 -- Volatile expressions keep their evaluation scope.
 -- Physical build selection preserves the logical result schema and the outer-join build and comparator rules.

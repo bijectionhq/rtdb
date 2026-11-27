@@ -431,7 +431,9 @@ The public relation validator requires those inputs to be columns.
 Statistics-aware preparation ranks connected inner-join inputs by estimated rows, with known estimates first and ties in incoming plan order.
 It uses captured flushed and live row counts, literal page sizes, static row bounds, and coarse discounts for simple pushed equality and range predicates.
 A conjunction uses its strongest discount because the plans carry no column distribution statistics to establish independence.
-A direct equijoin estimates its intermediate from the larger input when both counts are known, and an estimated-empty input gives an estimated-empty intermediate.
+A single equality between signed 64-bit literal keys from two VALUES inputs of at most sixteen rows each counts matching pairs, including duplicates and excluding null keys.
+The estimate follows type-preserving key aliases and uses only plan literals.
+Other direct equijoins estimate their intermediate from the larger input when both counts are known, and an estimated-empty input gives an estimated-empty intermediate.
 The estimates rank inputs and never eliminate their execution.
 When a later direct equijoin has a smaller right input, the physical join can build that side while returning fields in logical plan order.
 An equal or entirely unknown estimate keeps the existing build orientation.
