@@ -32,7 +32,21 @@ PLAIN ignores additional login options.
 SCRAM ignores additional options except `tokenauth`, whose case-insensitive `true` value selects delegation-token authentication.
 The adapter maps that option to `sasl.scram.tokenauth` and includes `tokenauth=true` in the client-first message and authenticated transcript.
 Explicit native and JAAS token-authentication settings must agree.
-Other login modules and Java client extensions require an explicit native adapter and return an error.
+The built-in Kerberos login adapter translates the principal and keytab, and accepts a pre-acquired ticket cache.
+The built-in unsecured OAuthBearer JAAS options enable librdkafka's unsecured token generator for development and tests.
+Secured broker OAuthBearer uses the HTTP(S) client-credentials grant for Kafka log producers, consumers and administrators, Connect source consumers, and dead-letter producers.
+Use `sasl.mechanism=OAUTHBEARER` with `SASL_SSL` or `SASL_PLAINTEXT` and the Kafka `OAuthBearerLoginCallbackHandler`.
+The corresponding native `sasl.oauthbearer.method=oidc` and `sasl.oauthbearer.client.id` / `sasl.oauthbearer.client.secret` properties are also accepted.
+Set `sasl.oauthbearer.token.endpoint.url` and allow the exact URL in the process environment variable `RTDB_KAFKA_OAUTHBEARER_ALLOWED_URLS`.
+This comma-separated allowlist defaults to empty and requires the final endpoint URL when a provider advertises a redirect.
+Kafka 4.4 `sasl.oauthbearer.client.credentials.client.id`, `sasl.oauthbearer.client.credentials.client.secret`, and `sasl.oauthbearer.scope` take precedence over `clientId`, `clientSecret`, and `scope` in `OAuthBearerLoginModule`.
+The adapter applies `sasl.oauthbearer.header.urlencode`, JAAS `extension_*` and endpoint `ssl.*` options, and the configured subject and scope claim names.
+Kafka broker TLS and token endpoint TLS use their respective settings.
+A failed initial login fails client construction.
+Librdkafka handles subsequent refreshes on its background queue, keeping the previous credential until expiry and retrying refresh failures after ten seconds.
+Kafka's `sasl.login.refresh.*` and `sasl.login.retry.backoff.*` properties configure scheduled refresh and HTTP retry backoff respectively.
+Token endpoint connect and read timeouts default to 60 seconds each, including a configured zero, to bound native client shutdown.
+Custom Java login callbacks, token providers, client assertions and file URL token sources require a native adapter and return a configuration error.
 Kafka log clients and Connect source consumers accept Java TLS properties through the shared native TLS adapter.
 Each log prepares one retained client configuration for its topic administrator, producer, watermark readers, ranges, and tails.
 Each source assignment prepares one configuration for its consumer.

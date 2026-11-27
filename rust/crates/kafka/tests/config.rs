@@ -234,7 +234,7 @@ fn krb5_jaas_translates_keytab_and_ticket_cache_options_to_native_kerberos() {
 }
 
 #[test]
-fn oauthbearer_unsecured_jaas_translates_and_oidc_remains_unsupported() {
+fn oauthbearer_unsecured_jaas_enables_native_token_generation_and_incomplete_oidc_is_rejected() {
     let unsecured = BTreeMap::from([
         ("security.protocol".into(), "SASL_PLAINTEXT".into()),
         ("sasl.mechanism".into(), "OAUTHBEARER".into()),
@@ -244,16 +244,19 @@ fn oauthbearer_unsecured_jaas_translates_and_oidc_remains_unsupported() {
     let native = native_properties(&unsecured).unwrap();
     assert!(!native.contains_key("sasl.jaas.config"));
     assert!(!native.contains_key("sasl.login.callback.handler.class"));
+    assert_eq!(native["enable.sasl.oauthbearer.unsecure.jwt"], "true");
     assert_eq!(native["sasl.oauthbearer.config"], "principal=admin scope=read,write lifeSeconds=600 extension_logicalCluster=lkc-1");
     let mut cfg = rdkafka::ClientConfig::new();
     for (k, v) in &native { cfg.set(k, v); }
     assert!(cfg.create_native_config().is_ok());
 
     let oidc = BTreeMap::from([
+        ("security.protocol".into(), "SASL_SSL".into()),
         ("sasl.mechanism".into(), "OAUTHBEARER".into()),
         ("sasl.jaas.config".into(), r#"org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required clientId="cid" clientSecret="top-secret";"#.into()),
     ]);
     let error = native_properties(&oidc).unwrap_err();
-    assert_eq!(error.code, "xtdb.kafka/jaas-login-module");
+    assert_eq!(error.code, "xtdb.kafka/invalid-config");
+    assert!(error.to_string().contains("token endpoint"));
     assert!(!format!("{error:?}").contains("top-secret"));
 }

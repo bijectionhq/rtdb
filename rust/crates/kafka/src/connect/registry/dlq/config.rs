@@ -5,6 +5,7 @@ use super::{error, overflow};
 
 pub(super) struct Settings {
     pub properties: BTreeMap<String, String>,
+    pub oauth: Option<crate::client::oauth::OAuthConfig>,
     pub maximum_block: Duration,
     pub delivery_timeout: Duration,
     pub maximum_record_bytes: usize,
@@ -40,12 +41,10 @@ impl Settings {
             if value > maximum { return Err(error("dlq", format!("Producer {name} exceeds its range"))); }
             Ok(value)
         };
-        for name in ["interceptor.classes", "partitioner.class", "sasl.login.class", "sasl.login.callback.handler.class", "sasl.client.callback.handler.class"] {
-            if options.get(name).is_some_and(|value| {
-                let trimmed = value.trim();
-                !trimmed.is_empty() && !(name == "sasl.login.callback.handler.class"
-                    && trimmed == "org.apache.kafka.common.security.oauthbearer.internals.unsecured.OAuthBearerUnsecuredLoginCallbackHandler")
-            }) { return Err(error("dlq", format!("Producer {name} requires a native adapter"))); }
+        for name in ["interceptor.classes", "partitioner.class", "sasl.client.callback.handler.class"] {
+            if options.get(name).is_some_and(|value| !trim_java(value).is_empty()) {
+                return Err(error("dlq", format!("Producer {name} requires a native adapter")));
+            }
         }
         if options.get("ssl.engine.factory.class").is_some_and(|value| trim_java(value) != "org.apache.kafka.common.security.ssl.DefaultSslEngineFactory") {
             return Err(error("dlq", "Producer ssl.engine.factory.class requires a native adapter"));
@@ -81,10 +80,12 @@ impl Settings {
                 "reconnect.backoff.ms" | "reconnect.backoff.max.ms" | "retry.backoff.ms" | "retry.backoff.max.ms" |
                 "connections.max.idle.ms" | "security.protocol" | "sasl.mechanism" | "sasl.jaas.config" |
                 "sasl.username" | "sasl.password" | "sasl.scram.tokenauth" | "sasl.kerberos.service.name" | "sasl.kerberos.principal" |
-                "sasl.kerberos.keytab" | "sasl.kerberos.kinit.cmd" | "sasl.kerberos.min.time.before.relogin" | "sasl.oauthbearer.config" |
+                "sasl.kerberos.keytab" | "sasl.kerberos.kinit.cmd" | "sasl.kerberos.min.time.before.relogin" |
                 "transactional.id" | "transaction.timeout.ms" | "ssl.cipher.suites" | "ssl.key.password" |
                 "ssl.ca.location" | "ssl.ca.pem" | "ssl.key.location" | "ssl.key.pem" |
                 "ssl.certificate.location" | "ssl.certificate.pem" => name.as_str(),
+                name if name.starts_with("sasl.oauthbearer.") || name.starts_with("sasl.login.")
+                    || matches!(name, "sasl.mechanisms" | "enable.sasl.oauthbearer.unsecure.jwt") => name,
                 "send.buffer.bytes" | "receive.buffer.bytes" => {
                     let size = signed_integer(value).and_then(|value| i32::try_from(value).ok())
                         .filter(|size| *size >= -1).ok_or_else(|| error("dlq", format!("Producer {name} must be -1 or a nonnegative integer")))?;
@@ -106,9 +107,9 @@ impl Settings {
             };
             properties.insert(native.into(), value.clone());
         }
-        let properties = crate::native_properties(&properties)?;
+        let (properties, _, oauth) = crate::config::native_client_properties(&properties)?;
         Ok(Self {
-            properties,
+            properties, oauth,
             maximum_block,
             delivery_timeout: Duration::from_millis(delivery_timeout),
             maximum_record_bytes: buffer_bytes.min(maximum_request),
@@ -140,6 +141,23 @@ mod tests {
         assert!(Settings::parse(&options).is_err());
         options.remove("sasl.jaas.config");
         assert_eq!(Settings::parse(&options).unwrap().properties["sasl.scram.tokenauth"], "false");
+    }
+
+    #[test]
+    fn oidc_credentials_are_retained_for_the_native_dead_letter_producer() {
+        let options = BTreeMap::from([
+            ("bootstrap.servers".into(), "127.0.0.1:1".into()),
+            ("security.protocol".into(), "SASL_SSL".into()),
+            ("sasl.mechanism".into(), "OAUTHBEARER".into()),
+            ("sasl.login.callback.handler.class".into(), "org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginCallbackHandler".into()),
+            ("sasl.oauthbearer.token.endpoint.url".into(), "https://identity.invalid/token".into()),
+            ("sasl.jaas.config".into(), "org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required clientId=fixture clientSecret=fixture;".into()),
+        ]);
+        let settings = Settings::parse(&options).unwrap();
+        assert!(settings.oauth.is_some());
+        assert_eq!(settings.properties["sasl.mechanism"], "OAUTHBEARER");
+        assert!(!settings.properties.contains_key("sasl.jaas.config"));
+        assert!(!settings.properties.contains_key("sasl.oauthbearer.token.endpoint.url"));
     }
 
     #[test]

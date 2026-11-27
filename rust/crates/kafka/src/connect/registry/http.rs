@@ -18,7 +18,7 @@ mod body;
 pub(super) use body::{BodyInput, RawResponse};
 
 #[derive(Clone)]
-pub(super) struct Client(Arc<Configuration>);
+pub(crate) struct Client(Arc<Configuration>);
 
 struct Configuration {
     // SSL_CTX cleanup uses native keys after its ex-data callbacks have run; its library-context owner must drop last.
@@ -32,7 +32,7 @@ struct Configuration {
 }
 
 impl Client {
-    pub(super) fn new(tls: SslContext, owner: Arc<crate::tls::NativeTls>, verify_names: bool, options: &BTreeMap<String, String>, charge: Arc<MemoryReservation>) -> rtdb_types::Result<Self> {
+    pub(crate) fn new(tls: SslContext, owner: Arc<crate::tls::NativeTls>, verify_names: bool, options: &BTreeMap<String, String>, charge: Arc<MemoryReservation>) -> rtdb_types::Result<Self> {
         let mut configuration = Configuration { tls, _owner: owner, verify_names, proxy: None, connect_timeout: None, read_timeout: None, charge };
         let duration = |name| -> rtdb_types::Result<Option<Duration>> {
             let millis = options.get(name).map(|value| value.parse::<i32>().map_err(|_| super::super::error("invalid-plugin-config", "Registry timeout must be a nonnegative Java integer"))).transpose()?.unwrap_or(60_000);
@@ -89,7 +89,7 @@ impl Client {
         Err(Error("HTTP redirects exceeded their limit"))
     }
 
-    async fn request_once(&self, method: Method, url: &Url, headers: &HeaderMap, body: Bytes, proxy: Option<&(String, u16)>) -> Result<Response, Error> {
+    pub(crate) async fn request_once(&self, method: Method, url: &Url, headers: &HeaderMap, body: Bytes, proxy: Option<&(String, u16)>) -> Result<Response, Error> {
         if !matches!(url.scheme(), "http" | "https") || !url.username().is_empty() || url.password().is_some() { return Err(Error("Invalid HTTP endpoint")); }
         let bound = headers.iter().try_fold(url.as_str().len().checked_add(body.len()).ok_or(Error("HTTP allocation overflow"))?, |size, (name, value)| size.checked_add(name.as_str().len()).and_then(|size| size.checked_add(value.len())).ok_or(Error("HTTP allocation overflow")))?;
         let bound = bound.checked_mul(8).and_then(|size| size.checked_add(16 * HEADER_LIMIT)).ok_or(Error("HTTP allocation overflow"))?;
@@ -276,7 +276,7 @@ fn drive(connection: &mut Option<Pin<Box<Connection>>>, cx: &mut Context<'_>) ->
     Ok(())
 }
 
-pub(super) struct Response {
+pub(crate) struct Response {
     body: Incoming,
     connection: Option<Pin<Box<Connection>>>,
     status: StatusCode,
@@ -287,8 +287,8 @@ pub(super) struct Response {
 }
 
 impl Response {
-    pub(super) fn status(&self) -> StatusCode { self.status }
-    pub(super) fn content_length(&self) -> Option<u64> { self.content_length }
+    pub(crate) fn status(&self) -> StatusCode { self.status }
+    pub(crate) fn content_length(&self) -> Option<u64> { self.content_length }
     pub(super) fn bytes_stream(self) -> Self { self }
 }
 
@@ -317,7 +317,7 @@ impl Stream for Response {
 }
 
 #[derive(Debug)]
-pub(super) struct Error(&'static str);
+pub(crate) struct Error(&'static str);
 impl Error { pub(super) fn without_url(self) -> Self { self } }
 impl fmt::Display for Error { fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result { formatter.write_str(self.0) } }
 impl std::error::Error for Error {}

@@ -329,10 +329,25 @@ rd_kafka_oauthbearer_set_token(rd_kafka_t *rk,
                                size_t extension_size,
                                char *errstr,
                                size_t errstr_size) {
+        return rd_kafka_oauthbearer_set_token_with_refresh(
+            rk, token_value, md_lifetime_ms, 0, md_principal_name, extensions,
+            extension_size, errstr, errstr_size);
+}
+
+rd_kafka_resp_err_t rd_kafka_oauthbearer_set_token_with_refresh(
+    rd_kafka_t *rk,
+    const char *token_value,
+    int64_t md_lifetime_ms,
+    int64_t refresh_at_ms,
+    const char *md_principal_name,
+    const char **extensions,
+    size_t extension_size,
+    char *errstr,
+    size_t errstr_size) {
 #if WITH_SASL_OAUTHBEARER
         return rd_kafka_oauthbearer_set_token0(
-            rk, token_value, md_lifetime_ms, md_principal_name, extensions,
-            extension_size, errstr, errstr_size);
+            rk, token_value, md_lifetime_ms, refresh_at_ms, md_principal_name,
+            extensions, extension_size, errstr, errstr_size);
 #else
         rd_snprintf(errstr, errstr_size,
                     "librdkafka not built with SASL OAUTHBEARER support");
@@ -343,7 +358,16 @@ rd_kafka_oauthbearer_set_token(rd_kafka_t *rk,
 rd_kafka_resp_err_t rd_kafka_oauthbearer_set_token_failure(rd_kafka_t *rk,
                                                            const char *errstr) {
 #if WITH_SASL_OAUTHBEARER
-        return rd_kafka_oauthbearer_set_token_failure0(rk, errstr);
+        return rd_kafka_oauthbearer_set_token_failure0(rk, errstr, rd_false);
+#else
+        return RD_KAFKA_RESP_ERR__NOT_IMPLEMENTED;
+#endif
+}
+
+rd_kafka_resp_err_t rd_kafka_oauthbearer_set_managed_token_failure(
+    rd_kafka_t *rk, const char *errstr) {
+#if WITH_SASL_OAUTHBEARER
+        return rd_kafka_oauthbearer_set_token_failure0(rk, errstr, rd_true);
 #else
         return RD_KAFKA_RESP_ERR__NOT_IMPLEMENTED;
 #endif

@@ -4,6 +4,7 @@ use rtdb_types::{AllocationScope, Anomaly, MemoryBudget, Result, jvm_number::Num
 use serde::{Deserialize, Serialize};
 
 pub(crate) mod providers;
+use crate::client::oauth::{self, OAuthConfig};
 
 pub(crate) fn trim_java(value: &str) -> &str { value.trim_matches(|ch| ch <= '\u{20}') }
 
@@ -128,7 +129,7 @@ const IGNORED_JAVA_PROPERTIES: &[&str] = &[
     "sasl.login.read.timeout.ms", "sasl.login.refresh.buffer.seconds", "sasl.login.refresh.min.period.seconds",
     "sasl.login.refresh.window.factor", "sasl.login.refresh.window.jitter", "sasl.login.retry.backoff.max.ms",
     "sasl.login.retry.backoff.ms", "sasl.oauthbearer.clock.skew.seconds", "sasl.oauthbearer.expected.audience",
-    "sasl.oauthbearer.expected.issuer", "sasl.oauthbearer.header.urlencode", "sasl.oauthbearer.jwks.endpoint.refresh.ms",
+    "sasl.oauthbearer.expected.issuer", "sasl.oauthbearer.allow.unverified.audience", "sasl.oauthbearer.allow.unverified.issuer", "sasl.oauthbearer.header.urlencode", "sasl.oauthbearer.jwks.endpoint.refresh.ms",
     "sasl.oauthbearer.jwks.endpoint.retry.backoff.max.ms", "sasl.oauthbearer.jwks.endpoint.retry.backoff.ms",
     "sasl.oauthbearer.jwks.endpoint.url", "sasl.oauthbearer.scope.claim.name", "sasl.oauthbearer.sub.claim.name",
     "security.providers", "socket.connection.setup.timeout.max.ms",
@@ -137,12 +138,14 @@ const SERIALIZER_PROPERTIES: &[&str] = &["key.serializer", "value.serializer", "
 const UNSUPPORTED_JAVA_PROPERTIES: &[&str] = &["interceptor.classes", "sasl.client.callback.handler.class", "sasl.login.callback.handler.class", "sasl.login.class"];
 
 pub fn native_properties(properties: &BTreeMap<String, String>) -> Result<BTreeMap<String, String>> {
-    native_client_properties(properties).map(|(properties, _)| properties)
+    native_client_properties(properties).map(|(properties, _, _)| properties)
 }
 
 /// Translates Java client properties to their librdkafka equivalents, returning the Java-only names it dropped.
-pub(crate) fn native_client_properties(properties: &BTreeMap<String, String>) -> Result<(BTreeMap<String, String>, Vec<String>)> {
+pub(crate) fn native_client_properties(properties: &BTreeMap<String, String>) -> Result<(BTreeMap<String, String>, Vec<String>, Option<OAuthConfig>)> {
     let mut properties = properties.clone();
+    let jaas = properties.remove("sasl.jaas.config").map(|value| parse_jaas(&value)).transpose()?;
+    let oauth = OAuthConfig::extract(&mut properties, jaas.as_ref().map(|(name, options)| (name.as_str(), options)))?;
     let ignored = java_client_properties(&mut properties)?;
     if let Some(wait) = properties.remove("fetch.max.wait.ms") {
         let wait = signed_integer(&wait).and_then(|wait| i32::try_from(wait).ok()).filter(|wait| *wait >= 0)
@@ -152,8 +155,7 @@ pub(crate) fn native_client_properties(properties: &BTreeMap<String, String>) ->
         }
         properties.insert("fetch.wait.max.ms".into(), wait.to_string());
     }
-    if let Some(jaas) = properties.remove("sasl.jaas.config") {
-        let (module, mut options) = parse_jaas(&jaas)?;
+    if let Some((module, mut options)) = jaas {
         match module.as_str() {
             "org.apache.kafka.common.security.plain.PlainLoginModule" | "org.apache.kafka.common.security.scram.ScramLoginModule" => {
                 for (jaas, native) in [("username", "sasl.username"), ("password", "sasl.password")] {
@@ -194,19 +196,18 @@ pub(crate) fn native_client_properties(properties: &BTreeMap<String, String>) ->
                     properties.insert("sasl.kerberos.min.time.before.relogin".into(), "0".into());
                 }
             }
-            "org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule" => {
-                translate_oauthbearer_jaas(&options, &mut properties)?;
+            oauth::LOGIN_MODULE => {
+                if oauth.is_none() {
+                    translate_oauthbearer_jaas(&options, &mut properties)?;
+                }
             }
             _ => return Err(Anomaly::unsupported("xtdb.kafka/jaas-login-module", "Kafka login module requires a native credential adapter")),
         }
     }
-    Ok((properties, ignored))
+    Ok((properties, ignored, oauth))
 }
 
 fn translate_oauthbearer_jaas(options: &BTreeMap<String, String>, properties: &mut BTreeMap<String, String>) -> Result<()> {
-    if options.contains_key("clientId") || options.contains_key("clientSecret") || properties.contains_key("sasl.oauthbearer.token.endpoint.url") {
-        return Err(Anomaly::unsupported("xtdb.kafka/jaas-login-module", "Kafka OAUTHBEARER OIDC login requires a native credential adapter"));
-    }
     let principal_claim = options.get("unsecuredLoginPrincipalClaimName").map_or("sub", String::as_str);
     let scope_claim = options.get("unsecuredLoginScopeClaimName").map_or("scope", String::as_str);
     let principal_key = format!("unsecuredLoginStringClaim_{principal_claim}");
@@ -265,6 +266,10 @@ fn translate_oauthbearer_jaas(options: &BTreeMap<String, String>, properties: &m
     } else if !properties.contains_key("sasl.oauthbearer.config") {
         return Err(Anomaly::incorrect("xtdb.kafka/invalid-jaas-config", "Kafka OAuthBearerLoginModule requires unsecured login options or native sasl.oauthbearer.config"));
     }
+    if properties.get("enable.sasl.oauthbearer.unsecure.jwt").is_some_and(|value| !["true", "1", "t"].iter().any(|enabled| value.eq_ignore_ascii_case(enabled))) {
+        return Err(Anomaly::incorrect("xtdb.kafka/conflicting-config", "Unsecured OAuthBearer JAAS login conflicts with enable.sasl.oauthbearer.unsecure.jwt"));
+    }
+    properties.insert("enable.sasl.oauthbearer.unsecure.jwt".into(), "true".into());
     Ok(())
 }
 
@@ -329,7 +334,7 @@ fn translate(properties: &mut BTreeMap<String, String>, java: &str, native: &str
     Ok(())
 }
 
-fn invalid_config(message: impl Into<String>) -> Anomaly { Anomaly::incorrect("xtdb.kafka/invalid-config", message.into()) }
+pub(crate) fn invalid_config(message: impl Into<String>) -> Anomaly { Anomaly::incorrect("xtdb.kafka/invalid-config", message.into()) }
 
 pub(crate) fn parse_jaas(jaas: &str) -> Result<(String, BTreeMap<String, String>)> {
     let mut tokens = jaas_tokens(jaas).into_iter();

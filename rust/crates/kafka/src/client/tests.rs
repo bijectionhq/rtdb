@@ -65,7 +65,8 @@ fn java_only_client_properties_are_dropped_and_reported() {
         ("max.poll.records", "500"), ("default.api.timeout.ms", "60000"), ("metric.reporters", ""), ("interceptor.classes", " "),
         ("partition.assignment.strategy", "org.apache.kafka.clients.consumer.StickyAssignor"),
     ]);
-    let (native, ignored) = crate::config::native_client_properties(&java).unwrap();
+    let (native, ignored, oauth) = crate::config::native_client_properties(&java).unwrap();
+    assert!(oauth.is_none());
     assert_eq!(native, options(&[("bootstrap.servers", "localhost:9092")]));
     assert_eq!(ignored, ["default.api.timeout.ms", "max.block.ms", "max.poll.records", "metric.reporters", "partition.assignment.strategy"]);
     prepare(&java, &memory).unwrap().create_native_config().unwrap();

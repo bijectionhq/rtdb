@@ -342,6 +342,7 @@ impl NativeClientConfig {
 /// Client configuration.
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
+    pub(crate) oauth_provider: Option<Arc<dyn crate::client::OAuthTokenProvider>>,
     byte_account: Option<NativeByteAccountAttachment>,
     conf_map: HashMap<String, String>,
     ssl_context: Option<Arc<SslContextConfig>>,
@@ -360,6 +361,7 @@ impl ClientConfig {
     /// Creates a new empty configuration.
     pub fn new() -> ClientConfig {
         ClientConfig {
+            oauth_provider: None,
             byte_account: None,
             conf_map: HashMap::new(),
             ssl_context: None,
@@ -430,6 +432,13 @@ impl ClientConfig {
     /// The callback runs after librdkafka's certificate and verification configuration, before connections start.
     pub fn set_ssl_context_configurer(&mut self, configuration: Arc<dyn SslContextConfigurer>) -> &mut Self {
         self.ssl_context = Some(Arc::new(SslContextConfig(configuration)));
+        self
+    }
+
+    /// Installs a credential provider for clients configured with SASL/OAUTHBEARER.
+    /// The provider owns the native configuration's opaque pointer while the client is alive.
+    pub fn set_oauth_token_provider(&mut self, provider: Arc<dyn crate::client::OAuthTokenProvider>) -> &mut Self {
+        self.oauth_provider = Some(provider);
         self
     }
 

@@ -9,7 +9,7 @@ mod security;
 mod rules;
 mod reader;
 mod dlq;
-mod http;
+pub(crate) mod http;
 mod references;
 mod json_admission;
 mod schema_id;

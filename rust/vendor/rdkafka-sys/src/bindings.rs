@@ -3634,6 +3634,25 @@ extern "C" {
     ) -> rd_kafka_resp_err_t;
 }
 extern "C" {
+    pub fn rd_kafka_oauthbearer_set_token_with_refresh(
+        rk: *mut rd_kafka_t,
+        token_value: *const c_char,
+        md_lifetime_ms: i64,
+        refresh_at_ms: i64,
+        md_principal_name: *const c_char,
+        extensions: *mut *const c_char,
+        extension_size: usize,
+        errstr: *mut c_char,
+        errstr_size: usize,
+    ) -> rd_kafka_resp_err_t;
+}
+extern "C" {
+    pub fn rd_kafka_oauthbearer_set_managed_token_failure(
+        rk: *mut rd_kafka_t,
+        errstr: *const c_char,
+    ) -> rd_kafka_resp_err_t;
+}
+extern "C" {
     pub fn rd_kafka_oauthbearer_set_token_failure(
         rk: *mut rd_kafka_t,
         errstr: *const c_char,

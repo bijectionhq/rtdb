@@ -34,6 +34,10 @@ use crate::native_byte_account::NativeByteAccount;
 use crate::statistics::Statistics;
 use crate::util::{self, AccountedNativePtr, ErrBuf, KafkaDrop, NativePtr, Timeout};
 
+mod oauth;
+pub use oauth::{ManagedOAuthToken, OAuthTokenProvider};
+use oauth::OAuthSession;
+
 /// Client-level context.
 ///
 /// Each client (consumers and producers included) has a context object that can
@@ -241,6 +245,8 @@ impl<T> From<EventPollResult<T>> for Option<T> {
 pub struct Client<C: ClientContext = DefaultClientContext> {
     native: NativeClient,
     context: Arc<C>,
+    // Native destruction joins the background queue before freeing its callback opaque.
+    _oauth: Option<Box<OAuthSession>>,
 }
 
 impl<C: ClientContext> Client<C> {
@@ -279,6 +285,16 @@ impl<C: ClientContext> Client<C> {
         };
         let ssl_context = native_config.ssl_context.take();
         let byte_account = native_config.byte_account.take();
+        let oauth = config.oauth_provider.as_ref()
+            .map(|provider| OAuthSession::new(Arc::clone(provider)).map(Box::new))
+            .transpose()?;
+        let initial_token = if let Some(session) = &oauth {
+            let token = session.initial_token()?;
+            session.configure(&native_config);
+            Some(token)
+        } else {
+            None
+        };
         let mut configuration = native_config.ptr();
         let client_ptr = match &byte_account {
             Some(attachment) if rd_kafka_type == RDKafkaType::RD_KAFKA_CONSUMER => unsafe {
@@ -320,6 +336,9 @@ impl<C: ClientContext> Client<C> {
             NativeClient::from_ptr(client_ptr, ssl_context, material_lease, byte_account.map(|attachment| attachment.into_account()))
         };
         if let Some(lease) = &mut native.material_lease { lease.loaded(); }
+        if let (Some(session), Some(token)) = (&oauth, initial_token) {
+            session.start(client_ptr, token)?;
+        }
         trace!("Create new librdkafka client {:p}", client_ptr);
 
         let log_queue = unsafe {
@@ -339,6 +358,7 @@ impl<C: ClientContext> Client<C> {
         Ok(Client {
             native,
             context,
+            _oauth: oauth,
         })
     }
 

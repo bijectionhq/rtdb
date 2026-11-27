@@ -37,6 +37,7 @@ rd_kafka_resp_err_t
 rd_kafka_oauthbearer_set_token0(rd_kafka_t *rk,
                                 const char *token_value,
                                 int64_t md_lifetime_ms,
+                                int64_t refresh_at_ms,
                                 const char *md_principal_name,
                                 const char **extensions,
                                 size_t extension_size,
@@ -44,7 +45,8 @@ rd_kafka_oauthbearer_set_token0(rd_kafka_t *rk,
                                 size_t errstr_size);
 
 rd_kafka_resp_err_t rd_kafka_oauthbearer_set_token_failure0(rd_kafka_t *rk,
-                                                            const char *errstr);
+                                        const char *errstr,
+                                        rd_bool_t keep_valid_token);
 
 int unittest_sasl_oauthbearer(void);
 

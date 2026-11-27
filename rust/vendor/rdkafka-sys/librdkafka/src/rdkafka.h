@@ -10321,6 +10321,22 @@ rd_kafka_oauthbearer_set_token(rd_kafka_t *rk,
                                char *errstr,
                                size_t errstr_size);
 
+/** Set a token and supply its next refresh time in Unix milliseconds.
+ *  Pass zero to use the default refresh schedule.
+ */
+RD_EXPORT
+rd_kafka_resp_err_t rd_kafka_oauthbearer_set_token_with_refresh(
+    rd_kafka_t *rk,
+    const char *token_value,
+    int64_t md_lifetime_ms,
+    int64_t refresh_at_ms,
+    const char *md_principal_name,
+    const char **extensions,
+    size_t extension_size,
+    char *errstr,
+    size_t errstr_size);
+
+
 /**
  * @brief SASL/OAUTHBEARER token refresh failure indicator.
  *
@@ -10344,6 +10360,13 @@ rd_kafka_oauthbearer_set_token(rd_kafka_t *rk,
 RD_EXPORT
 rd_kafka_resp_err_t rd_kafka_oauthbearer_set_token_failure(rd_kafka_t *rk,
                                                            const char *errstr);
+
+/** Schedule another refresh after a failed managed-token refresh.
+ *  A valid installed credential keeps the failure at warning level.
+ */
+RD_EXPORT
+rd_kafka_resp_err_t rd_kafka_oauthbearer_set_managed_token_failure(
+    rd_kafka_t *rk, const char *errstr);
 
 /**@}*/
 

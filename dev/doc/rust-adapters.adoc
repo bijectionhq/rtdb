@@ -44,6 +44,15 @@ Kafka applies Java ConfigDef trimming; Registry preserves raw provider and algor
 
 `rust/crates/kafka/TLS.adoc` records TLS policy coverage, retained-memory ownership, and remaining source and qualification work.
 
+== Kafka broker OAuthBearer
+
+Set `sasl.oauthbearer.token.endpoint.url` and list the exact endpoint URL in the native node's `RTDB_KAFKA_OAUTHBEARER_ALLOWED_URLS` environment variable.
+This is the native process setting corresponding to the Kafka JVM's `org.apache.kafka.sasl.oauthbearer.allowed.urls` system property.
+Use the final URL for the token service when configuring the endpoint.
+Kafka log and Connect broker clients fetch their initial credential during construction and use librdkafka's SASL background queue for refresh.
+With `OAuthBearerLoginModule`, use JAAS `ssl.*` options for the token endpoint's TLS settings.
+The link:../../rust/crates/kafka/README.adoc[Kafka adapter reference] lists accepted credentials and refresh settings.
+
 == Dead-letter producer option text
 
 The adapter decodes `buffer.memory`, `batch.size`, `max.request.size`, `max.block.ms`, `linger.ms`, `delivery.timeout.ms`, `request.timeout.ms`, `send.buffer.bytes` and `receive.buffer.bytes` as Java signed decimal text, including BMP digits and `-0`.

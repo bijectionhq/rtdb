@@ -10,7 +10,7 @@ mod avro;
 mod json_schema;
 mod json_value;
 mod json_decimal;
-mod registry;
+pub(crate) mod registry;
 mod header;
 mod schema_graph;
 use rtdb_types::java_date as legacy_calendar;

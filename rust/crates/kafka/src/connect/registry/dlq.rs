@@ -146,6 +146,9 @@ impl DlqProducer {
         charges.push(Arc::clone(&native_charge));
         let tls = tls::configure(options, &mut settings.properties, context)?;
         let mut client = crate::client_config(&settings.properties);
+        if let Some(oauth) = settings.oauth.take() {
+            oauth.attach(&mut client, &context.scratch_budget())?;
+        }
         if let Some(tls) = tls {
             let tls = crate::client::material::Configuration::capture(tls, &settings.properties, &mut |bytes| context.reserve(bytes))?;
             charges.extend(tls.reservations().cloned());
