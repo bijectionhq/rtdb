@@ -1267,6 +1267,7 @@ contract PortableApplicationBackup {
         -- Signed installation settlement verifies the registered cell signature and exact signed inventory before releasing provider holds.
         -- Settlement retries use the same operation-exclusive version plan across provider restart.
         -- A published candidate's object custody requires a serving handoff before release.
+        -- A published hosted candidate's keeper release matches the journal, generation and object custody recorded in its publication.
 }
 
 ------------------------------------------------------------

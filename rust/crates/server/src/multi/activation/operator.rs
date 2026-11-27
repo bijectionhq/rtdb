@@ -578,12 +578,30 @@ impl Options {
             }
             #[cfg(unix)]
             Command::ReleaseRecoveryJournal { database, identity, url, tls, proof, journal_url, journal_tls } => {
+                use recovery::CustodySettlement;
+
                 let proof = Attestation::read(&proof)?;
                 let authority = ActivationAuthority::connect(
                     &url, crate::cli::journal_credentials(&tls)?, identity, Access::ConsensusReader,
                 ).await?;
                 let (intent, key, journal) = proof.held_journal()?;
-                require_hold_release(&authority, &database, intent, key).await?;
+                match require_hold_release(&authority, &database, intent, key).await? {
+                    CustodySettlement::Published(installed) => {
+                        if installed.objects_sha256 != proof.objects_sha256()
+                            || installed.key_hold.is_some_and(|expected| expected != key)
+                            || installed.journal_hold.is_some_and(|expected| expected != journal)
+                        {
+                            return Err(super::conflict());
+                        }
+                    }
+                    CustodySettlement::Unrecorded { hosted_custody }
+                        if hosted_custody || proof.objects_sha256().is_some() =>
+                    {
+                        return Err(Anomaly::incorrect("rtdb/activation-journal-custody",
+                            "The activation authority must retain the checkpoint's custody disposition"));
+                    }
+                    CustodySettlement::Abandoned | CustodySettlement::Unrecorded { .. } => (),
+                }
                 let custodian = KeeperJournal::connect(&journal_url, &crate::cli::journal_credentials(&journal_tls)?)?;
                 custodian.release(key.generation.database, journal).await?;
                 Ok(json!({ "released": journal }))

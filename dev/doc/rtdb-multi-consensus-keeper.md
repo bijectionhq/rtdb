@@ -109,6 +109,7 @@ The broker reads the committed hold with that cell's journal reader before recor
 Recording journal custody advances the name to activation protocol 6. Subsequent recoveries for that name require journal custody evidence.
 Upgrade participating readers and brokers before recording the proof.
 After publication or supersession, use `release-recovery-journal` with the original proof, activation reader credentials, and the destination custodian credential.
+For a published hosted recovery, the proof must match the journal, generation and object custody in the retained publication.
 The key custodian uses its separate `release-recovery-key` action.
 
 ## Independent database activation

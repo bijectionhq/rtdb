@@ -914,14 +914,23 @@ mod tests {
         assert_eq!(release_key(&serving_proof).await.unwrap_err().code, "rtdb/activation-custody-replacement");
         assert_eq!(release_key(&key_only_proof).await.unwrap_err().code, "rtdb/activation-conflict");
         serving_keys.require_recovery_key(held).await.unwrap();
-        ActivationOptions::parse([
+        let release_journal = |proof: &Path| ActivationOptions::parse([
             "release-recovery-journal".into(), DATABASE.into(),
             "--authority-id".into(), authority.to_string(), "--authority-url".into(), authority_url.clone(),
             "--authority-tls-dir".into(), authority_tls.display().to_string(),
-            "--installation-proof".into(), serving_proof.display().to_string(),
+            "--installation-proof".into(), proof.display().to_string(),
             "--journal-url".into(), journal_url.clone(),
             "--journal-custodian-tls-dir".into(), custodian_tls.display().to_string(),
-        ].into_iter()).unwrap().run(rtdb_storage::AppleSync::Full).await.unwrap();
+        ].into_iter()).unwrap().run(rtdb_storage::AppleSync::Full);
+        let mut substituted = serde_json::to_value(&proof).unwrap();
+        let digest = &mut substituted["evidence"]["objects_sha256"][0];
+        *digest = json!(digest.as_u64().unwrap() ^ 1);
+        let mismatched = home.path().join("wrong-serving-closure.json");
+        fs::write(&mismatched, serde_json::to_vec(&substituted).unwrap()).unwrap();
+        assert_eq!(release_journal(&mismatched).await.unwrap_err().code, "rtdb/activation-conflict");
+        assert!(!reader.journal.checkpoint_custody(journal_contract::StreamId(candidate.as_u128()))
+            .await.unwrap().unwrap().released);
+        release_journal(&serving_proof).await.unwrap();
         assert_eq!(release_pending().await.unwrap_err().code, "rtdb/activation-custody-replacement");
         assert_eq!(release_key(&serving_proof).await.unwrap_err().code, "rtdb/activation-custody-replacement");
         assert!(matches!(serving.tick(&live).await.unwrap(), Role::Writer(_)));
