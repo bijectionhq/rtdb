@@ -11,6 +11,27 @@ const CHANGE_IMAGE_HEADER: &str = "x-rtdb-changes-images";
 mod store_purge;
 
 #[tokio::test]
+async fn store_reads_on_the_writer_route_request_a_new_handshake_for_an_unknown_bearer() {
+    let running = Running::start_with_placements(
+        Some("secret"), FlightConfig::default(), &["application"],
+    ).await;
+    let mut client = Client::connect_with_database(&running.server, Some("xtdb:secret"), Some("application")).await;
+    client.headers.remove("cookie");
+    client.headers.insert("authorization", "Bearer unknown-session".parse().unwrap());
+
+    for action in ["rtdb.store.v1.Read", "rtdb.store.v1.Watch", "rtdb.store.v1.Rank"] {
+        let status = client.action(action, Bytes::new()).await.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unauthenticated, "{action}");
+        assert_eq!(status.message(), "unknown session");
+    }
+    for action in ["rtdb.store.v1.Append", "rtdb.store.v1.PurgeFloor"] {
+        let status = client.action(action, Bytes::new()).await.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::PermissionDenied, "{action}");
+    }
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn an_unlinked_store_release_does_not_establish_a_flight_session() {
     const RELEASE: &str = "x-rtdb-store-release";
     let running = Running::start(Some("secret"), FlightConfig::default()).await;

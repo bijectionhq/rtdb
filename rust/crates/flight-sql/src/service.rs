@@ -82,8 +82,8 @@ impl CallKind {
         matches!(self, Self::Handshake | Self::V1Capabilities | Self::V1Appointment | Self::TxStatus)
     }
 
-    fn v1_admission_status(self, status: Status, assigned_follower: bool) -> Status {
-        if assigned_follower && matches!(self, Self::StoreRead) && status.code() == tonic::Code::Unauthenticated {
+    fn v1_admission_status(self, status: Status) -> Status {
+        if matches!(self, Self::StoreRead) && status.code() == tonic::Code::Unauthenticated {
             return status;
         }
         crate::v1::error::map_status(status)
@@ -719,7 +719,7 @@ impl FlightService for Service {
                 _ => CallKind::V1Action,
             };
             let call = self.call_with_kind(&request, request.get_ref().encoded_len(), kind)
-                .await.map_err(|status| kind.v1_admission_status(status, self.follower_only()))?;
+                .await.map_err(|status| kind.v1_admission_status(status))?;
             return rtdb_types::boxed(|| self.v1_action(call, request.into_inner())).await;
         }
         let kind = CallKind::action(name);
@@ -774,13 +774,13 @@ mod tests {
     use tonic::{Code, Status};
 
     #[test]
-    fn assigned_store_reader_distinguishes_bearer_loss_from_refused_admission() {
-        let map = |status| CallKind::StoreRead.v1_admission_status(status, true).code();
+    fn store_readers_distinguish_bearer_loss_from_refused_admission() {
+        let map = |status| CallKind::StoreRead.v1_admission_status(status).code();
         for message in ["unknown session", "session expired"] {
             assert_eq!(map(session_error(true, message)), Code::Unauthenticated);
         }
         assert_eq!(map(Status::permission_denied("refused")), Code::PermissionDenied);
-        assert_eq!(CallKind::StoreRead.v1_admission_status(session_error(true, "unknown session"), false).code(),
+        assert_eq!(CallKind::Store.v1_admission_status(session_error(true, "unknown session")).code(),
             Code::PermissionDenied);
     }
 
