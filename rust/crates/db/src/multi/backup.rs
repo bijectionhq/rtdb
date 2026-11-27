@@ -185,6 +185,7 @@ impl MultiDatabase {
             if writer.pipeline.next_position() != next(state.head)?.0 {
                 return Err(Anomaly::new(AnomalyCategory::Busy, "rtdb/restore-pending-writes", "The writer is settling an admitted transaction"));
             }
+            source_kms.check_readable(source_generation).await?;
             transactions.restore_in(self.incarnation())?;
             let origin = RestoreOrigin {
                 digest: manifest_sha256,

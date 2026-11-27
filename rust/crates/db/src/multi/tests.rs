@@ -10,7 +10,7 @@ use journal_contract::{
 };
 use rtdb_crypt::LocalKms;
 use rtdb_logkeeper::simulation::{Fault, FaultJournal};
-use rtdb_store::{MemoryStore, read_file};
+use rtdb_store::{MemoryStore, ObjectStore, read_file};
 use rtdb_tx::transact::{
     Cell, Declaration, Guard, Op, Outcome, REQUIREMENT_FAILED, Resolution, Row, Version, Visibility, Window,
 };
@@ -921,9 +921,23 @@ async fn portable_backup_refuses_external_objects_and_revoked_keys() {
     let file = writer.write_file(b"external checkpoint dependency").await.unwrap();
     writer.checkpoint(vec![file]).await.unwrap();
     assert_eq!(writer.portable_backup().await.err().unwrap().code, "rtdb/backup-dependencies");
+    let verified = crate::PortableBackup::verify(&archive, keys.clone()).await.unwrap();
+    let destination = Uuid::from_u128(999);
+    let store = Arc::new(MemoryStore::default());
+    let mut successor = MultiDatabase::new(MultiOptions { database: destination, node: ip(2), lease_micros: LEASE, drift_micros: DRIFT },
+        Arc::new(journal.handle(NODE_2_IDENTITY)), store.clone(), keys.clone(), Arc::new(|| Timestamp(10))).unwrap();
+    successor.create().await.unwrap();
+    successor.tick(&live(2)).await.unwrap();
+    let objects_before_restore = store.list(None).await.unwrap();
+    let head_before_restore = successor.stream.head().await.unwrap();
+
     let generation = Generation { database: DATABASE, number: 1 };
     keys.retire(generation, 10).await.unwrap();
     assert_eq!(crate::PortableBackup::verify(&archive, keys).await.err().unwrap().code, "rtdb/erased-under-view");
+    assert_eq!(successor.install_portable_backup(verified).await.unwrap_err().code, "rtdb/erased-under-view");
+    assert_eq!(successor.stream.head().await.unwrap(), head_before_restore);
+    assert_eq!(store.list(None).await.unwrap(), objects_before_restore);
+    assert_eq!(successor.installed_backup().await.unwrap(), None);
 }
 
 #[tokio::test]
