@@ -9,6 +9,7 @@ fn form_label(form: RegexFormView<'_>) -> &'static str {
         RegexFormKind::BigInteger(_) => "big-integer", RegexFormKind::Decimal(_) => "decimal", RegexFormKind::List(_) => "list",
         RegexFormKind::Vector(_) => "vector", RegexFormKind::Set(_) => "set", RegexFormKind::Map(_) => "map",
         RegexFormKind::Tagged { .. } => "tagged", RegexFormKind::AnonymousFunction(_) => "anonymous",
+        RegexFormKind::Ratio(_) => "ratio",
     }
 }
 
@@ -43,7 +44,7 @@ fn first_field<'a>(source: &'a Value) -> Option<(&'a str, RegexLiteralView<'a>)>
 fn cursor_traits<I: Iterator + DoubleEndedIterator + ExactSizeIterator + FusedIterator + Clone>(_: &I) {}
 
 #[test]
-fn all_eleven_raw_kinds_keep_their_source_distinctions() {
+fn raw_kinds_keep_their_source_distinctions() {
     let cases = [
         (raw_literal(Value::Null), "literal"), (raw_character('😀'), "character"),
         (raw_symbol("ns/name".into()), "symbol"), (raw_big_integer("00099".into()), "big-integer"),
@@ -51,14 +52,16 @@ fn all_eleven_raw_kinds_keep_their_source_distinctions() {
         (raw_vector(vec![]), "vector"), (raw_set(vec![]), "set"), (raw_map(vec![]), "map"),
         (raw_tagged("reader/tag".into(), raw_symbol("body".into())), "tagged"),
         (raw_anonymous(raw_symbol("%".into())), "anonymous"),
+        (raw_build(|builder| builder.ratio("-2/3")), "ratio"),
     ];
-    assert_eq!(cases.len(), 11);
+    assert_eq!(cases.len(), 12);
     for (source, label) in &cases { assert_eq!(form_label(source.view()), *label); }
     assert!(matches!(cases[1].0.view().kind(), RegexFormKind::Character('😀')));
     assert!(matches!(cases[3].0.view().kind(), RegexFormKind::BigInteger("00099")));
     assert!(matches!(cases[4].0.view().kind(), RegexFormKind::Decimal("1.00M")));
     assert!(matches!(cases[9].0.view().kind(), RegexFormKind::Tagged { tag: "reader/tag", value } if symbol(value) == "body"));
     assert!(matches!(cases[10].0.view().kind(), RegexFormKind::AnonymousFunction(value) if symbol(value) == "%"));
+    assert!(matches!(cases[11].0.view().kind(), RegexFormKind::Ratio("-2/3")));
 }
 
 #[test]

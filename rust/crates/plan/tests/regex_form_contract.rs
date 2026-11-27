@@ -144,7 +144,7 @@ fn literal_events(body: Vec<Event>) -> Vec<Event> {
 }
 
 #[test]
-fn all_eleven_raw_variants_keep_generic_serde_method_names_indices_and_payloads() {
+fn raw_variants_keep_generic_serde_method_names_indices_and_payloads() {
     let cases = vec![
         (raw_literal(V::Null), vec![NewtypeVariant("RegexForm", 0, "Literal"), UnitVariant("Value", 1, "Null")]),
         (raw_character('😀'), vec![NewtypeVariant("RegexForm", 1, "Character"), Char('😀')]),
@@ -157,8 +157,9 @@ fn all_eleven_raw_variants_keep_generic_serde_method_names_indices_and_payloads(
         (raw_map(vec![(raw_character('k'), raw_character('v'))]), vec![NewtypeVariant("RegexForm", 8, "Map"), CollectSeq, Seq(Some(1)), SeqElement, Tuple(2), TupleElement, NewtypeVariant("RegexForm", 1, "Character"), Char('k'), TupleElement, NewtypeVariant("RegexForm", 1, "Character"), Char('v'), TupleEnd, SeqEnd]),
         (raw_tagged("reader/tag".into(), raw_literal(V::Null)), vec![StructVariant("RegexForm", 9, "Tagged", 2), VariantField("tag"), s("reader/tag"), VariantField("value"), NewtypeVariant("RegexForm", 0, "Literal"), UnitVariant("Value", 1, "Null"), StructVariantEnd]),
         (raw_anonymous(raw_character('%')), vec![NewtypeVariant("RegexForm", 10, "AnonymousFunction"), NewtypeVariant("RegexForm", 1, "Character"), Char('%')]),
+        (raw_build(|builder| builder.ratio("-2/3")), vec![NewtypeVariant("RegexForm", 11, "Ratio"), s("-2/3")]),
     ];
-    assert_eq!(cases.len(), 11);
+    assert_eq!(cases.len(), 12);
     for (value, expected) in cases {
         for human_readable in [true, false] { assert_eq!(trace(&value, human_readable), expected); }
     }

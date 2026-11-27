@@ -145,7 +145,7 @@ fn spread<'a>(value: &HostValue<'a>,context: &EvalContext<'_>) -> Result<Vec<Hos
     };
     context.reserve(forms.len().checked_mul(std::mem::size_of::<HostValue<'_>>()).ok_or_else(limit)?)?;
     forms.iter().map(|form| Ok(match form.kind() {
-        FormKind::BigInteger(_) | FormKind::Decimal(_) => HostValue::Number(std::sync::Arc::new(literal_number(form,context)?)),
+        FormKind::BigInteger(_) | FormKind::Decimal(_) | FormKind::Ratio(_) => HostValue::Number(std::sync::Arc::new(literal_number(form,context)?)),
         _ => HostValue::Constant(form),
     })).collect()
 }
@@ -234,7 +234,7 @@ fn write_form(form: FormView<'_>,output: &mut Units<'_,'_>,context: &EvalContext
             output.push(u16::from(b'\\'))?;
             match value { '\n' => output.push_str("newline"),'\t' => output.push_str("tab"),' ' => output.push_str("space"),'\u{8}' => output.push_str("backspace"),'\u{c}' => output.push_str("formfeed"),'\r' => output.push_str("return"),value => output.push_str(value.encode_utf8(&mut [0;4])) }
         }
-        FormKind::BigInteger(_) | FormKind::Decimal(_) => write_printed(&HostValue::Number(std::sync::Arc::new(literal_number(form,context)?)),output,context,depth),
+        FormKind::BigInteger(_) | FormKind::Decimal(_) | FormKind::Ratio(_) => write_printed(&HostValue::Number(std::sync::Arc::new(literal_number(form,context)?)),output,context,depth),
         FormKind::List(forms) => sequence(forms.iter().map(|form|Ok(HostValue::Constant(form))),"(",")",output,context,depth),
         FormKind::Vector(forms) => sequence(forms.iter().map(|form|Ok(HostValue::Constant(form))),"[","]",output,context,depth),
         FormKind::Map(entries) if entries.is_empty() => output.push_str("{}"),

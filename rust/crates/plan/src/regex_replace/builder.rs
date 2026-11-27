@@ -208,6 +208,8 @@ impl<'a> RegexFormBuilder<'a> {
     pub fn big_integer(&mut self, value: &str) -> Result<()> { self.event(|this| this.raw_text(value, RawKind::BigInteger)) }
     /// Copies an uninterpreted decimal spelling.
     pub fn decimal(&mut self, value: &str) -> Result<()> { self.event(|this| this.raw_text(value, RawKind::Decimal)) }
+    /// Copies an uninterpreted ratio spelling.
+    pub fn ratio(&mut self, value: &str) -> Result<()> { self.event(|this| this.raw_text(value, RawKind::Ratio)) }
     fn value_text_kind(&mut self, value: &str, kind: fn(TextId) -> LiteralKind) -> Result<()> {
         self.value_slot()?;
         let text = self.text(value)?;
@@ -281,6 +283,7 @@ impl<'a> RegexFormBuilder<'a> {
                     RegexFormKind::Literal(value) => { self.begin_literal()?; work.push(Action::End)?; work.push(Action::Value(value))?; }
                     RegexFormKind::Character(value) => self.character(value)?,
                     RegexFormKind::Symbol(value) => self.symbol(value)?, RegexFormKind::BigInteger(value) => self.big_integer(value)?, RegexFormKind::Decimal(value) => self.decimal(value)?,
+                    RegexFormKind::Ratio(value) => self.ratio(value)?,
                     RegexFormKind::List(values) => { self.begin_list()?; work.push(Action::End)?; work.push(Action::RawSequence(values, 0))?; }
                     RegexFormKind::Vector(values) => { self.begin_vector()?; work.push(Action::End)?; work.push(Action::RawSequence(values, 0))?; }
                     RegexFormKind::Set(values) => { self.begin_set()?; work.push(Action::End)?; work.push(Action::RawSequence(values, 0))?; }
@@ -395,7 +398,7 @@ impl<'a> RegexFormBuilder<'a> {
             current = self.storage.next(boundary, node);
             match node {
                 NodeRef::Raw(id) => match self.storage.forms[id.0].kind {
-                    RawKind::Symbol(text) | RawKind::BigInteger(text) | RawKind::Decimal(text) | RawKind::Tagged { tag: text, .. } => self.storage.texts[text.0] = String::new(),
+                    RawKind::Symbol(text) | RawKind::BigInteger(text) | RawKind::Decimal(text) | RawKind::Ratio(text) | RawKind::Tagged { tag: text, .. } => self.storage.texts[text.0] = String::new(),
                     _ => (),
                 },
                 NodeRef::Literal(id) => match self.storage.literals[id.0].kind {

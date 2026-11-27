@@ -68,6 +68,12 @@ async fn inline_xtql_is_a_query_expression_in_derived_tables_ctes_sets_and_scala
 }
 
 #[tokio::test]
+async fn inline_xtql_runs_a_regexp_pattern_computed_from_raw_ratio_data() {
+    let sql = r#"XTQL $$(-> (rel [{}] []) (return {:v (regexp-replace "1/2" (str (+ 1/6 2/6)) "x")}))$$"#;
+    assert_eq!(query(sql, vec![]).await.unwrap(), [vec![V::Utf8("x".into())]]);
+}
+
+#[tokio::test]
 async fn explicit_inline_fn_arguments_keep_their_lexical_or_numbered_sql_positions_5995() {
     for sql in [
         "SELECT ? AS prefix,t.* FROM (XTQL ($$#(rel [{:a %1 :b %2}] [a b])$$,?,?)) t",

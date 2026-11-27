@@ -16,7 +16,7 @@ pub(super) enum RawSource<'a> { Null, Stored(&'a FormStorage, FormId) }
 pub struct RegexFormView<'a>(pub(super) RawSource<'a>);
 #[derive(Clone, Copy)]
 pub enum RegexFormKind<'a> {
-    Literal(RegexLiteralView<'a>), Character(char), Symbol(&'a str), BigInteger(&'a str), Decimal(&'a str),
+    Literal(RegexLiteralView<'a>), Character(char), Symbol(&'a str), BigInteger(&'a str), Decimal(&'a str), Ratio(&'a str),
     List(RegexForms<'a>), Vector(RegexForms<'a>), Set(RegexForms<'a>), Map(RegexFormPairs<'a>),
     Tagged { tag: &'a str, value: RegexFormView<'a> }, AnonymousFunction(RegexFormView<'a>),
 }
@@ -30,6 +30,7 @@ impl<'a> RegexFormView<'a> {
             RawKind::Symbol(text) => RegexFormKind::Symbol(&storage.texts[text.0]),
             RawKind::BigInteger(text) => RegexFormKind::BigInteger(&storage.texts[text.0]),
             RawKind::Decimal(text) => RegexFormKind::Decimal(&storage.texts[text.0]),
+            RawKind::Ratio(text) => RegexFormKind::Ratio(&storage.texts[text.0]),
             RawKind::List(span) => RegexFormKind::List(RegexForms(storage, &storage.raw_children[span.range()])),
             RawKind::Vector(span) => RegexFormKind::Vector(RegexForms(storage, &storage.raw_children[span.range()])),
             RawKind::Set(span) => RegexFormKind::Set(RegexForms(storage, &storage.raw_children[span.range()])),

@@ -70,6 +70,37 @@ async fn regex_patterns_use_portable_reader_literals_and_allow_list_calls() {
 }
 
 #[tokio::test]
+async fn raw_ratios_reach_host_numeric_and_quoted_pattern_forms() {
+    for (source, pattern) in [
+        ("-5/3", "(str -010/06)"),
+        ("a", r#"(if (ratio? 6/8) "a" "b")"#),
+        ("a", r#"(if (and (integer? 6/3) (> 9007199254740993/9007199254740992 1)) "a" "b")"#),
+        ("1/2", "(str (+ 1/6 1/3))"),
+        ("-3", "(str (long -7/2))"),
+        ("1/2", "(str (apply + '(1/6 1/3)))"),
+        ("[3/4 -5/3]", "(java.util.regex.Pattern/quote (str '[+06/08 -10/6]))"),
+        ("3/4:5/3", r#"(clojure.string/join ":" [(identity 6/8) '10/6])"#),
+    ] {
+        let expression = format!(r#"(regexp-replace "{source}" {pattern} "x")"#);
+        assert_eq!(project(&expression).await.unwrap(), Value::Utf8("x".into()), "{pattern}");
+    }
+}
+
+#[tokio::test]
+async fn raw_ratios_preserve_regex_host_demand_and_admission() {
+    let direct = project(r#"(regexp-replace "a" 2/3 "x")"#).await.unwrap_err();
+    assert_eq!(direct.message.as_deref(), Some("REGEXP_REPLACE host pattern did not produce a String"));
+
+    for pattern in ["(arbitrary/call 2/3)", "(str #arbitrary/object 2/3)"] {
+        assert_eq!(project(&format!(r#"(regexp-replace "a" {pattern} "x")"#)).await.unwrap_err().code, "rtdb.expr/regex-host-form", "{pattern}");
+    }
+    assert_eq!(project(r#"(regexp-replace nil (arbitrary/call 2/3) "x")"#).await.unwrap(), Value::Null);
+    assert_eq!(project(r#"(regexp-replace nil (str 2/0) "x")"#).await.unwrap_err().code, "xtql/edn-reader");
+    assert_eq!(project(r#"(regexp-replace "a" #=(str 2/3) "x")"#).await.unwrap_err().code, "xtql/edn-reader");
+    assert_eq!(project("2/3").await.unwrap_err().code, "xtql/invalid-literal");
+}
+
+#[tokio::test]
 async fn conditional_host_bindings_scope_only_the_selected_body() {
     for (source, pattern) in [
         ("a", r#"(let [p "a"] (if-let [p (str p "b")] (subs p 0 1) "b"))"#),

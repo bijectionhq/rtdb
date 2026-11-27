@@ -800,7 +800,7 @@ fn render<'work>(first: RenderFrame<'_>, work: &'work ExplainWork) -> Result<Wor
                 F::Literal(value) => frames.push(RenderFrame::Literal(value))?,
                 F::Character(ch) => if u32::from(ch) <= 0xffff { sink.append(&[RenderPiece::Text("\\"), RenderPiece::Text("u"), RenderPiece::HexU32(u32::from(ch), 4)])?; }
                     else { sink.append(&[RenderPiece::Text("\\"), RenderPiece::Char(ch)])?; },
-                F::Symbol(value) => sink.append(&[RenderPiece::Text(value)])?,
+                F::Symbol(value) | F::Ratio(value) => sink.append(&[RenderPiece::Text(value)])?,
                 F::BigInteger(value) => sink.append(&[RenderPiece::Text(value), RenderPiece::Text("N")])?,
                 F::Decimal(value) => sink.append(&[RenderPiece::Text(value), RenderPiece::Text("M")])?,
                 F::List(values) | F::Vector(values) | F::Set(values) => {
@@ -1069,7 +1069,7 @@ mod rendering_tests {
     }
 
     #[test]
-    fn all_eleven_raw_renderers_keep_syntax_and_character_domains() {
+    fn raw_renderers_keep_syntax_and_character_domains() {
         let cases = [
             (raw(|builder| builder.literal(&Value::Null)), "nil"),
             (raw(|builder| builder.character('\n')), "\\u000a"),
@@ -1082,8 +1082,9 @@ mod rendering_tests {
             (raw(|builder| { builder.begin_map()?; builder.symbol("k")?; builder.character('x')?; builder.end() }), "{k \\u0078}"),
             (raw(|builder| { builder.begin_tagged("reader/tag")?; builder.symbol("body")?; builder.end() }), "#reader/tag body"),
             (raw(|builder| { builder.begin_anonymous()?; builder.begin_list()?; builder.end()?; builder.end() }), "#()"),
+            (raw(|builder| builder.ratio("-2/3")), "-2/3"),
         ];
-        assert_eq!(cases.len(), 11);
+        assert_eq!(cases.len(), 12);
         let memory = MemoryBudget::new(1 << 20);
         let work = work(&memory);
         for (value, expected) in cases { assert_eq!(regex_form(value.view(), &work).unwrap().as_str(), expected); }

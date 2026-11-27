@@ -3,7 +3,7 @@ use ::serde::{Deserialize, Deserializer, Serialize, Serializer, de::{self, Deser
 use rtdb_types::{CalendarDate, DecimalValue, TimeUnit, Value};
 use super::{RegexForm, RegexFormBuilder, RegexFormKind as F, RegexFormView, RegexLiteralKind as V, RegexLiteralView};
 
-const FORMS: &[&str] = &["Literal", "Character", "Symbol", "BigInteger", "Decimal", "List", "Vector", "Set", "Map", "Tagged", "AnonymousFunction"];
+const FORMS: &[&str] = &["Literal", "Character", "Symbol", "BigInteger", "Decimal", "List", "Vector", "Set", "Map", "Tagged", "AnonymousFunction", "Ratio"];
 const VALUES: &[&str] = &["Undefined", "Null", "Bool", "I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64", "F16", "F32", "F64", "Utf8", "Binary", "FixedSizeBinary", "Decimal", "Date", "DateDay", "DateMilli", "Time", "Timestamp", "Duration", "IntervalYearMonth", "IntervalDayTime", "IntervalMonthDayNano", "IntervalMonthDayMicro", "Keyword", "Uuid", "Uri", "Transit", "Oid", "RegClass", "RegProc", "List", "Set", "Map", "FixedSizeList", "TimestampTzRange", "Struct"];
 
 struct RawSer<'a>(RegexFormView<'a>);
@@ -30,6 +30,7 @@ impl Serialize for RawSer<'_> {
             F::Map(values) => serializer.serialize_newtype_variant("RegexForm", 8, "Map", &RawPairs(values)),
             F::Tagged { tag, value } => { let mut object = serializer.serialize_struct_variant("RegexForm", 9, "Tagged", 2)?; object.serialize_field("tag", tag)?; object.serialize_field("value", &RawSer(value))?; object.end() }
             F::AnonymousFunction(value) => serializer.serialize_newtype_variant("RegexForm", 10, "AnonymousFunction", &RawSer(value)),
+            F::Ratio(value) => serializer.serialize_newtype_variant("RegexForm", 11, "Ratio", value),
         }
     }
 }
@@ -123,6 +124,7 @@ impl<'de> Visitor<'de> for RawSeed<'_, '_> {
             }
             9 => { builder.begin_tagged("").map_err(de::Error::custom)?; value.struct_variant(&["tag", "value"], Tagged(builder))?; builder.end().map_err(de::Error::custom) }
             10 => { builder.begin_anonymous().map_err(de::Error::custom)?; value.newtype_variant_seed(RawSeed(builder))?; builder.end().map_err(de::Error::custom) }
+            11 => builder.ratio(&value.newtype_variant::<String>()?).map_err(de::Error::custom),
             _ => unreachable!("closed form names"),
         }
     }
@@ -327,8 +329,9 @@ mod tests {
         assert_eq!(Field(&["tag", "value"]).deserialize(U64Deserializer::<Error>::new(2)).unwrap(), usize::MAX);
         assert_eq!(Field(&["tag", "value"]).deserialize(BorrowedBytesDeserializer::<Error>::new(b"tag")).unwrap(), 0);
         assert_eq!(Field(&["tag", "value"]).deserialize(BorrowedBytesDeserializer::<Error>::new(&[255])).unwrap(), usize::MAX);
-        let error = Name(FORMS).deserialize(U64Deserializer::<Error>::new(11)).unwrap_err();
-        assert_eq!(error.to_string(), "invalid value: integer `11`, expected variant index 0 <= i < 11");
+        assert_eq!(Name(FORMS).deserialize(U64Deserializer::<Error>::new(11)).unwrap(), 11);
+        let error = Name(FORMS).deserialize(U64Deserializer::<Error>::new(12)).unwrap_err();
+        assert_eq!(error.to_string(), "invalid value: integer `12`, expected variant index 0 <= i < 12");
         let error = Name(FORMS).deserialize(BorrowedBytesDeserializer::<Error>::new(&[255])).unwrap_err();
         assert!(error.to_string().starts_with("unknown variant `�`, expected one of"));
     }

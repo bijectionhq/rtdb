@@ -21,7 +21,7 @@ pub(super) struct Parent { pub(super) node: NodeRef, pub(super) ordinal: usize }
 pub(super) struct RawRow { pub(super) kind: RawKind, pub(super) parent: Option<Parent> }
 #[derive(Clone, Copy)]
 pub(super) enum RawKind {
-    Draft, Literal(LiteralId), Character(char), Symbol(TextId), BigInteger(TextId), Decimal(TextId),
+    Draft, Literal(LiteralId), Character(char), Symbol(TextId), BigInteger(TextId), Decimal(TextId), Ratio(TextId),
     List(Span), Vector(Span), Set(Span), Map(Span),
     Tagged { tag: TextId, value: FormId }, AnonymousFunction(FormId),
 }
@@ -93,7 +93,8 @@ impl FormStorage {
                 (NodeRef::Raw(a), NodeRef::Raw(b)) => match (self.forms[a.0].kind, other.forms[b.0].kind) {
                     (RawKind::Literal(_), RawKind::Literal(_)) | (RawKind::AnonymousFunction(_), RawKind::AnonymousFunction(_)) => true,
                     (RawKind::Character(a), RawKind::Character(b)) => a == b,
-                    (RawKind::Symbol(a), RawKind::Symbol(b)) | (RawKind::BigInteger(a), RawKind::BigInteger(b)) | (RawKind::Decimal(a), RawKind::Decimal(b)) => self.texts[a.0] == other.texts[b.0],
+                    (RawKind::Symbol(a), RawKind::Symbol(b)) | (RawKind::BigInteger(a), RawKind::BigInteger(b))
+                    | (RawKind::Decimal(a), RawKind::Decimal(b)) | (RawKind::Ratio(a), RawKind::Ratio(b)) => self.texts[a.0] == other.texts[b.0],
                     (RawKind::Tagged { tag: a, .. }, RawKind::Tagged { tag: b, .. }) => self.texts[a.0] == other.texts[b.0],
                     (RawKind::List(a), RawKind::List(b)) | (RawKind::Vector(a), RawKind::Vector(b)) | (RawKind::Set(a), RawKind::Set(b)) | (RawKind::Map(a), RawKind::Map(b)) => a.len == b.len,
                     _ => false,
@@ -144,7 +145,7 @@ impl FormStorage {
                 RawKind::Literal(_) | RawKind::Tagged { .. } | RawKind::AnonymousFunction(_) => 1,
                 RawKind::List(span) | RawKind::Vector(span) | RawKind::Set(span) => span.len,
                 RawKind::Map(span) => span.len * 2,
-                RawKind::Draft | RawKind::Character(_) | RawKind::Symbol(_) | RawKind::BigInteger(_) | RawKind::Decimal(_) => 0,
+                RawKind::Draft | RawKind::Character(_) | RawKind::Symbol(_) | RawKind::BigInteger(_) | RawKind::Decimal(_) | RawKind::Ratio(_) => 0,
             },
             NodeRef::Literal(id) => match self.literals[id.0].kind {
                 LiteralKind::List(span) | LiteralKind::Set(span) | LiteralKind::FixedSizeList(span) | LiteralKind::Struct(span) => span.len,
@@ -188,7 +189,7 @@ impl FormStorage {
                 NodeRef::Raw(id) => {
                     bytes = add(bytes, size_of::<RawRow>())?;
                     bytes = add(bytes, match self.forms[id.0].kind {
-                        RawKind::Symbol(text) | RawKind::BigInteger(text) | RawKind::Decimal(text) | RawKind::Tagged { tag: text, .. } => add(size_of::<String>(), self.texts[text.0].len())?,
+                        RawKind::Symbol(text) | RawKind::BigInteger(text) | RawKind::Decimal(text) | RawKind::Ratio(text) | RawKind::Tagged { tag: text, .. } => add(size_of::<String>(), self.texts[text.0].len())?,
                         RawKind::List(span) | RawKind::Vector(span) | RawKind::Set(span) => array_bytes::<FormId>(span.len)?,
                         RawKind::Map(span) => array_bytes::<(FormId, FormId)>(span.len)?,
                         _ => 0,
@@ -276,6 +277,7 @@ impl<'a> Virtual<'a> {
                     RawKind::BigInteger(_) => tuple("BigInteger"), RawKind::Decimal(_) => tuple("Decimal"), RawKind::List(_) => tuple("List"),
                     RawKind::Vector(_) => tuple("Vector"), RawKind::Set(_) => tuple("Set"), RawKind::Map(_) => tuple("Map"),
                     RawKind::Tagged { .. } => structure("Tagged", &["tag", "value"]), RawKind::AnonymousFunction(_) => tuple("AnonymousFunction"),
+                    RawKind::Ratio(_) => tuple("Ratio"),
                     RawKind::Draft => unreachable!("published raw node"),
                 },
                 NodeRef::Literal(_) => match self.literal() {
@@ -288,7 +290,7 @@ impl<'a> Virtual<'a> {
             Code::Payload => match self.anchor {
                 NodeRef::Raw(_) => match self.raw() {
                     RawKind::Character(value) => Shape::Atom(Atom::Char(value)),
-                    RawKind::Symbol(text) | RawKind::BigInteger(text) | RawKind::Decimal(text) | RawKind::Tagged { tag: text, .. } => Shape::Atom(Atom::Text(self.text(text))),
+                    RawKind::Symbol(text) | RawKind::BigInteger(text) | RawKind::Decimal(text) | RawKind::Ratio(text) | RawKind::Tagged { tag: text, .. } => Shape::Atom(Atom::Text(self.text(text))),
                     RawKind::List(span) | RawKind::Vector(span) | RawKind::Set(span) | RawKind::Map(span) => list(span.len),
                     _ => unreachable!("direct raw child"),
                 },

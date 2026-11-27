@@ -50,6 +50,7 @@ fn form(value: &Edn, allocation: FormAllocation<'_>) -> Result<RegexForm> {
                 EdnKind::Keyword(value) => { builder.begin_literal()?; builder.value_keyword(value)?; builder.end()?; }
                 EdnKind::Symbol(value) => builder.symbol(value)?, EdnKind::Character(value) => builder.character(*value)?,
                 EdnKind::BigInteger(value) => builder.big_integer(value)?, EdnKind::Decimal(value) => builder.decimal(value)?,
+                EdnKind::Ratio(value) => builder.ratio(value)?,
                 EdnKind::List(values) => { builder.begin_list()?; walk.push(Event::End)?; walk.push(Event::Sequence(values, 0))?; }
                 EdnKind::Vector(values) => { builder.begin_vector()?; walk.push(Event::End)?; walk.push(Event::Sequence(values, 0))?; }
                 EdnKind::Set(values) => { builder.begin_set()?; walk.push(Event::End)?; walk.push(Event::Sequence(values, 0))?; }

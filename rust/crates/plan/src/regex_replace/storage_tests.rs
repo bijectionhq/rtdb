@@ -95,6 +95,27 @@ fn fresh_copies_have_distinct_nonempty_payloads_while_shared_nan_stays_nonreflex
 }
 
 #[test]
+fn ratio_metadata_roundtrips_and_copies_with_its_owned_text_charge() {
+    let json = r#"{"List":[{"Symbol":"str"},{"Ratio":"-2/3"}]}"#;
+    let source = serde_json::from_str::<RegexForm>(json).unwrap();
+    assert_eq!(serde_json::to_string(&source).unwrap(), json);
+    assert_eq!(format!("{source:?}"), r#"List([Symbol("str"), Ratio("-2/3")])"#);
+    let symbol = serde_json::from_str::<RegexForm>(r#"{"List":[{"Symbol":"str"},{"Symbol":"-2/3"}]}"#).unwrap();
+    assert_ne!(source, symbol);
+    assert_eq!(source.work_bound().unwrap(), symbol.work_bound().unwrap());
+
+    let memory = MemoryBudget::new(1 << 20);
+    let copy = RegexForm::copy_in(source.view(), &memory).unwrap();
+    assert_eq!(copy, source);
+    assert_eq!(copy.work_bound().unwrap(), source.work_bound().unwrap());
+    let RegexFormKind::List(values) = copy.view().kind() else { panic!("raw list") };
+    assert!(matches!(values.at(1).kind(), RegexFormKind::Ratio("-2/3")));
+    assert!(memory.used_bytes() > 0);
+    drop(copy);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
 fn struct_last_value_and_first_key_backing_survive_sorted_completion_with_charged_tombstones() {
     let mut builder = RegexFormBuilder::new_untracked();
     builder.begin_literal().unwrap(); builder.begin_value_struct().unwrap();

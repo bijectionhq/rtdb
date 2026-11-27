@@ -110,7 +110,7 @@ impl<'a> Compiler<'a,'_,'_> {
                 else { return Err(unsupported("Host symbol or namespace is not implemented")); }
             }
             FormKind::List(values) => match values.split_first() { Some((head,args)) => self.list(head,args,depth + 1)?, None => Expression::Constant(form) },
-            FormKind::BigInteger(_) | FormKind::Decimal(_) => Expression::Number(Arc::new(literal_number(form,self.context)?)),
+            FormKind::BigInteger(_) | FormKind::Decimal(_) | FormKind::Ratio(_) => Expression::Number(Arc::new(literal_number(form,self.context)?)),
             FormKind::Vector(values) => Expression::Vector(self.expressions(values,depth + 1)?),
             FormKind::Map(values) if values.is_empty() => Expression::Constant(form),
             FormKind::Set(values) if values.is_empty() => Expression::Constant(form),
@@ -174,7 +174,14 @@ impl<'a> Compiler<'a,'_,'_> {
             if operation.inline(args.len()) { return self.arithmetic(operation,args,depth); }
         }
         Ok(match operation {
-            Some("quote") => { arity(args.len(),1,1)?;match args.at(0).kind() { FormKind::BigInteger(_) | FormKind::Decimal(_) => Expression::Number(Arc::new(literal_number(args.at(0),self.context)?)),_ => Expression::Constant(args.at(0)) } }
+            Some("quote") => {
+                arity(args.len(),1,1)?;
+                let form = args.at(0);
+                match form.kind() {
+                    FormKind::BigInteger(_) | FormKind::Decimal(_) | FormKind::Ratio(_) => Expression::Number(Arc::new(literal_number(form,self.context)?)),
+                    _ => Expression::Constant(form),
+                }
+            }
             Some("if") => {
                 arity(args.len(),2,3)?;
                 Expression::If(Box::new([self.expression(args.at(0),depth)?,self.expression(args.at(1),depth)?,match args.get(2) { Some(value) => self.expression(value,depth)?,None => Expression::Nil }]))
@@ -425,7 +432,7 @@ impl HostValue<'_> {
             Self::Constant(form) => match form.kind() {
                 FormKind::Symbol(_) | FormKind::Vector(_) | FormKind::Map(_) | FormKind::Set(_) => Ok(()),
                 FormKind::Character(_) | FormKind::List(_) | FormKind::AnonymousFunction(_) => Err(error("Host value is not callable")),
-                FormKind::BigInteger(_) | FormKind::Decimal(_) | FormKind::Tagged { .. } => Err(unsupported("Host call admission requires an established host literal carrier")),
+                FormKind::BigInteger(_) | FormKind::Decimal(_) | FormKind::Ratio(_) | FormKind::Tagged { .. } => Err(unsupported("Host call admission requires an established host literal carrier")),
                 FormKind::Literal(value) => match value.kind() {
                     LiteralKind::Keyword(_) => Ok(()),
                     LiteralKind::Text(_) => Err(error("Host value is not callable")),
@@ -470,7 +477,7 @@ impl HostValue<'_> {
                     _ => return Err(unsupported("Host classification requires an established host literal carrier")),
                 },
                 FormKind::Character(_) | FormKind::Symbol(_) | FormKind::List(_) | FormKind::Vector(_) | FormKind::Set(_) | FormKind::Map(_) | FormKind::AnonymousFunction(_) => false,
-                FormKind::BigInteger(_) | FormKind::Decimal(_) | FormKind::Tagged { .. } => return Err(unsupported("Host classification requires an established host literal carrier")),
+                FormKind::BigInteger(_) | FormKind::Decimal(_) | FormKind::Ratio(_) | FormKind::Tagged { .. } => return Err(unsupported("Host classification requires an established host literal carrier")),
             },
             Self::Nil | Self::Bool(_) | Self::Text(_) | Self::Function(_) | Self::Vector(_) => false,
         })
@@ -756,13 +763,24 @@ fn literal_number(form: FormView<'_>,context: &EvalContext<'_>) -> Result<Number
             LiteralKind::Leaf(leaf) => match leaf.value().as_ref() { Value::I64(value) => Number::Long(*value), Value::F64(value) => Number::Double(*value), _ => return Err(error("Host value is not a Number")) },
             _ => return Err(error("Host value is not a Number")),
         },
-        FormKind::BigInteger(value) | FormKind::Decimal(value) => {
+        FormKind::BigInteger(value) | FormKind::Decimal(value) | FormKind::Ratio(value) => {
             if value.len() > 16 * 1024 * 1024 { return Err(limit()); }
             context.reserve(value.len().checked_mul(32).and_then(|bytes|bytes.checked_add(256)).ok_or_else(limit)?)?;
-            if matches!(form.kind(),FormKind::BigInteger(_)) { Number::integer(value) } else { Number::decimal(value) }.map_err(|_|error("Invalid host numeric literal"))?
+            match form.kind() {
+                FormKind::BigInteger(_) => Number::integer(value),
+                FormKind::Decimal(_) => Number::decimal(value),
+                FormKind::Ratio(_) => ratio_literal(value),
+                _ => unreachable!(),
+            }.map_err(|_|error("Invalid host numeric literal"))?
         }
         _ => return Err(error("Host value is not a Number")),
     })
+}
+fn ratio_literal(value: &str) -> std::result::Result<Number, NumberError> {
+    let (numerator, denominator) = value.split_once('/').ok_or(NumberError::Invalid)?;
+    if !value.is_ascii() || denominator.starts_with(['+', '-']) { return Err(NumberError::Invalid); }
+    let ratio = Number::divide(&Number::integer(numerator)?, &Number::integer(denominator)?)?;
+    if matches!(ratio, Number::Ratio { .. }) { Ok(ratio) } else { Err(NumberError::Invalid) }
 }
 fn numeric_cast<'a>(kind: Cast,value: HostValue<'a>,primitive: bool,context: &EvalContext<'_>) -> Result<HostValue<'a>> {
     let source = match &value {

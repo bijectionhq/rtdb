@@ -59,6 +59,9 @@ The host evaluator accepts:
 * `clojure.string/join`, `upper-case`, `lower-case`, `replace` and `trim`, fully qualified.
 
 `str` prints vectors and quoted lists and vectors in their readable form, as `pr-str` does.
+XTQL host forms accept EDN ratio literals such as `-06/08`, with exact reduction and readable output such as `-3/4`.
+Whole-number ratios follow the reader's Long or BigInt rules.
+Use a decimal or double expression when a fraction needs to be a query column.
 `format` admits only `%s`, `%d` and `%%`, with no argument index, flags, width or precision, because those are the conversions whose output does not depend on the JVM's default locale.
 `clojure.string/upper-case` and `lower-case` apply locale-independent Unicode case mapping.
 `clojure.string/replace` admits String and Character matches.

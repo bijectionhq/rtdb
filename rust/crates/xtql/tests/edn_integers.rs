@@ -1,3 +1,4 @@
+use rtdb_plan::SourceSpan;
 use rtdb_xtql::{EdnKind, read};
 
 #[test]
@@ -31,14 +32,39 @@ fn integral_ratio_tokens_preserve_clojure_integer_widths() {
     }
     assert_eq!(read("9223372036854775808/2").unwrap().kind, EdnKind::BigInteger("4611686018427387904".into()));
     assert_eq!(read("-9223372036854775808/1").unwrap().kind, EdnKind::BigInteger(i64::MIN.to_string()));
+    assert_eq!(read("0/9223372036854775808").unwrap().kind, EdnKind::BigInteger("0".into()));
     assert!(read("#{6/3 2}").is_err());
-    for (source, message) in [
-        ("1/0", "Ratio denominator is zero"),
-        ("2/3", "Non-integral ratio literals are not supported; use a decimal or floating-point value"),
-        ("2/-1", "Invalid ratio literal"),
+}
+
+#[test]
+fn non_integral_ratio_tokens_reduce_exactly_and_keep_the_source_span() {
+    let form = read("  +006/008").unwrap();
+    assert_eq!(form.span, SourceSpan { start: 2, end: 10 });
+    assert_eq!(form.kind, EdnKind::Ratio("3/4".into()));
+
+    for (source, expected) in [
+        ("-010/06", "-5/3"),
+        ("08/09", "8/9"),
+        ("300000000000000000000000000000000000000/900000000000000000000000000000000000000", "1/3"),
+        ("100000000000000000000000000000000000001/100000000000000000000000000000000000003",
+         "100000000000000000000000000000000000001/100000000000000000000000000000000000003"),
     ] {
+        assert_eq!(read(source).unwrap().kind, EdnKind::Ratio(expected.into()), "{source}");
+    }
+    assert_eq!(read("#{2/4 1/2}").unwrap_err().message.as_deref(), Some("Duplicate EDN set element"));
+    assert_eq!(read("{[2/4] :a (1/2) :b}").unwrap_err().message.as_deref(), Some("Duplicate EDN map key"));
+    assert!(read("#{1/2 0.5 0.5M}").is_ok());
+}
+
+#[test]
+fn ratio_reader_rejects_zero_denominators_and_non_edn_spellings() {
+    for source in ["1/0", "0/0", "-10/000"] {
         let error = read(source).unwrap_err();
         assert_eq!(error.code, "xtql/edn-reader");
-        assert_eq!(error.message.as_deref(), Some(message));
+        assert_eq!(error.message.as_deref(), Some("Ratio denominator is zero"));
     }
+    for source in ["2/-1", "2/+3", "2/", "2/3/4", "2/0x3", "0x2/3", "2/3M", "2/3N", "2/٣"] {
+        assert_eq!(read(source).unwrap_err().code, "xtql/edn-reader", "{source}");
+    }
+    assert_eq!(read("2/-1").unwrap_err().message.as_deref(), Some("Invalid ratio literal"));
 }

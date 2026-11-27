@@ -13,6 +13,7 @@ pub(crate) fn value(form: &Edn) -> Result<Value> {
         EdnKind::Float(value) => Value::F64(*value),
         EdnKind::Decimal(value) => decimal(value)?,
         EdnKind::BigInteger(value) => Value::I64(BigInt::from_str(value).ok().and_then(|value| value.to_i64()).ok_or_else(|| error("xtql/invalid-literal", "Integer exceeds signed 64 bits"))?),
+        EdnKind::Ratio(_) => return Err(error("xtql/invalid-literal", "XTDB vectors do not support ratio objects")),
         EdnKind::String(value) => Value::Utf8(value.clone()),
         EdnKind::Keyword(value) => Value::Keyword(Keyword::from_name(value)),
         EdnKind::Character(_) => return Err(error("xtql/invalid-literal", "XTDB vectors do not support character objects")),

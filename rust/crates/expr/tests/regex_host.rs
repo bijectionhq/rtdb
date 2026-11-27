@@ -55,6 +55,32 @@ fn host_numeric_literal_storage_is_admitted_before_parsing_and_released_on_failu
 }
 
 #[test]
+fn host_ratio_carriers_admit_both_components_and_reject_invalid_exact_values() {
+    let schema = Schema::default();
+    let large = "9".repeat(4096);
+    for spelling in [format!("{large}/2"), format!("1/{large}"), format!("{large}/0")] {
+        let recipe = raw_build(|builder| builder.ratio(&spelling));
+        let expression = replace(call("str", vec![recipe]));
+        let memory = MemoryBudget::new(64 << 10);
+        {
+            let scope = EvaluationScope::new(&memory).unwrap();
+            let context = EvalContext { allocation: Some(&scope), ..Default::default() };
+            let error = ExpressionInvocation::prepare(&expression, &schema, &context).err().unwrap();
+            assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+            assert!(memory.peak_bytes() <= memory.limit_bytes());
+        }
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    for spelling in ["2/0", "4/2", "2/-3", "2/3/4"] {
+        let recipe = raw_build(|builder| builder.ratio(spelling));
+        let expression = replace(call("str", vec![recipe]));
+        let error = ExpressionInvocation::prepare(&expression, &schema, &EvalContext::default()).err().unwrap();
+        assert_eq!(error.message.as_deref(), Some("Invalid host numeric literal"), "{spelling}");
+    }
+}
+
+#[test]
 fn host_arithmetic_reserves_scratch_before_big_integer_products() {
     let number = raw_big_integer("9".repeat(512));
     let expression = replace(call("str",vec![call("*",vec![number.clone(),number])]));

@@ -2,6 +2,7 @@ use num_bigint::BigInt;
 use num_traits::{ToPrimitive, Zero};
 use rtdb_plan::SourceSpan;
 use rtdb_types::{Anomaly, Result};
+use rtdb_types::jvm_number::Number;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -14,6 +15,7 @@ pub enum EdnKind {
     List(Vec<Edn>), Vector(Vec<Edn>), Set(Vec<Edn>), Map(Vec<(Edn, Edn)>),
     Tagged { tag: String, value: Box<Edn> },
     AnonymousFunction(Box<Edn>),
+    Ratio(String),
 }
 
 impl Edn {
@@ -272,26 +274,32 @@ fn parse_number(value: &str) -> std::result::Result<EdnKind, &'static str> {
         return Ok(match parsed.to_i64() { Some(value) => EdnKind::Integer(value), None => EdnKind::BigInteger(parsed.to_string()) });
     }
     if let Some((numerator, denominator)) = value.split_once('/') {
-        let unsigned = numerator.strip_prefix(['+', '-']).unwrap_or(numerator);
-        if unsigned.is_empty() || denominator.is_empty() || !unsigned.bytes().chain(denominator.bytes()).all(|byte| byte.is_ascii_digit()) {
-            return Err("Invalid ratio literal");
-        }
-        let numerator = numerator.parse::<BigInt>().map_err(|_| "Invalid ratio numerator")?;
-        let denominator = denominator.parse::<BigInt>().map_err(|_| "Invalid ratio denominator")?;
-        if denominator.is_zero() { return Err("Ratio denominator is zero"); }
-        if !(&numerator % &denominator).is_zero() {
-            return Err("Non-integral ratio literals are not supported; use a decimal or floating-point value");
-        }
-        let fixed_width = numerator.to_i64().is_some_and(|value| value != i64::MIN) && denominator.to_i64().is_some();
-        let quotient = numerator / denominator;
-        return Ok(if fixed_width {
-            EdnKind::Integer(quotient.to_i64().ok_or("Ratio result exceeds signed 64 bits")?)
-        } else {
-            EdnKind::BigInteger(quotient.to_string())
-        });
+        return parse_ratio(numerator, denominator);
     }
     if value.contains(['.', 'e', 'E']) { return value.parse().map(EdnKind::Float).map_err(|_| "Invalid floating-point literal"); }
     Err("Invalid integer literal")
+}
+
+fn parse_ratio(numerator: &str, denominator: &str) -> std::result::Result<EdnKind, &'static str> {
+    let unsigned = numerator.strip_prefix(['+', '-']).unwrap_or(numerator);
+    if unsigned.is_empty() || denominator.is_empty() || !unsigned.bytes().chain(denominator.bytes()).all(|byte| byte.is_ascii_digit()) {
+        return Err("Invalid ratio literal");
+    }
+    let numerator = numerator.parse::<BigInt>().map_err(|_| "Invalid ratio numerator")?;
+    let denominator = denominator.parse::<BigInt>().map_err(|_| "Invalid ratio denominator")?;
+    if denominator.is_zero() { return Err("Ratio denominator is zero"); }
+
+    let narrow = |value: BigInt| match value.to_i64() {
+        Some(small) => Number::Long(small),
+        None => Number::BigInt(value),
+    };
+    let result = Number::divide(&narrow(numerator), &narrow(denominator)).map_err(|_| "Invalid ratio literal")?;
+    Ok(match result {
+        Number::Long(value) => EdnKind::Integer(value),
+        Number::BigInt(value) => EdnKind::BigInteger(value.to_string()),
+        ratio @ Number::Ratio { .. } => EdnKind::Ratio(ratio.text()),
+        _ => unreachable!("integer division produces an exact number"),
+    })
 }
 
 fn integer_token(value: &str) -> std::result::Result<BigInt, &'static str> {
