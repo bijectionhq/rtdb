@@ -5,63 +5,115 @@ use rtdb_types::{CivilDate, DateUnit, LogicalType as L, Result, ScalarType as S,
 
 fn overflow() -> rtdb_types::Anomaly { rtdb_types::Anomaly::incorrect("xtdb.expression/overflow-error", "data exception - overflow error") }
 
-pub(crate) fn strict_call(name: &str) -> bool {
-    ["extract","date_trunc","date-trunc","age","current_timestamp","current-timestamp","now","current_date","current-date","current_time","current-time","current_timezone","current-timezone","local_date","local-date","localdate","local_time","local-time","localtime","local_timestamp","local-timestamp","localtimestamp"].iter().any(|candidate|name.eq_ignore_ascii_case(candidate))
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TemporalFunction {
+    Extract,
+    DateTrunc,
+    Age,
+    DateBin,
+    RangeBins,
+    CurrentTimestamp,
+    CurrentDate,
+    CurrentTime,
+    CurrentTimezone,
+    LocalDate,
+    LocalTime,
+    LocalTimestamp,
 }
 
-fn canonical(name: &str) -> &str {
-    match name { "now" => "current_timestamp", "localdate" => "local_date", "localtime" => "local_time", "localtimestamp" => "local_timestamp", other => other }
+impl TemporalFunction {
+    pub(crate) fn from_canonical(name: &str) -> Option<Self> {
+        Some(match name {
+            "extract" => Self::Extract,
+            "date_trunc" => Self::DateTrunc,
+            "age" => Self::Age,
+            "date_bin" => Self::DateBin,
+            "range_bins" => Self::RangeBins,
+            "current_timestamp" | "now" => Self::CurrentTimestamp,
+            "current_date" => Self::CurrentDate,
+            "current_time" => Self::CurrentTime,
+            "current_timezone" => Self::CurrentTimezone,
+            "local_date" | "localdate" => Self::LocalDate,
+            "local_time" | "localtime" => Self::LocalTime,
+            "local_timestamp" | "localtimestamp" => Self::LocalTimestamp,
+            _ => return None,
+        })
+    }
+
+    pub(crate) fn canonical_name(self) -> &'static str {
+        match self {
+            Self::Extract => "extract",
+            Self::DateTrunc => "date_trunc",
+            Self::Age => "age",
+            Self::DateBin => "date_bin",
+            Self::RangeBins => "range_bins",
+            Self::CurrentTimestamp => "current_timestamp",
+            Self::CurrentDate => "current_date",
+            Self::CurrentTime => "current_time",
+            Self::CurrentTimezone => "current_timezone",
+            Self::LocalDate => "local_date",
+            Self::LocalTime => "local_time",
+            Self::LocalTimestamp => "local_timestamp",
+        }
+    }
+
+    pub(crate) fn is_strict(self) -> bool {
+        !matches!(self, Self::DateBin | Self::RangeBins)
+    }
+
+    pub(crate) fn eval(self, args: &[Value], context: &EvalContext<'_>) -> Result<Value> {
+        if args.iter().any(crate::compare::nullish) { return Ok(Value::Null); }
+        match self {
+            Self::Extract | Self::DateTrunc => {
+                let name = self.canonical_name();
+                let Value::Utf8(field) = &args[0] else { return Err(inapplicable(name, &[])); };
+                let field = F::parse(field)?;
+                let L::Scalar(source) = args[1].logical_type() else { return Err(inapplicable(name, &[])); };
+                field.validate_for(name, &source)?;
+                if self == Self::Extract { extract(field, &args[1]) }
+                else {
+                    let zone = args.get(2).map(|value| match value { Value::Utf8(zone) => rtdb_plan::truncation_zone(zone), _ => Err(inapplicable(name, &[])) }).transpose()?;
+                    truncate(field, &args[1], zone)
+                }
+            }
+            Self::Age => age(&args[0], &args[1], context.timezone),
+            Self::DateBin => {
+                let default_origin = origin();
+                let origin = args.get(2).unwrap_or(&default_origin);
+                let difference = crate::arithmetic_in_timezone(BinaryOp::Subtract, &args[1], origin, context.timezone)?;
+                let quotient = crate::arithmetic_in_timezone(BinaryOp::Divide, &difference, &args[0], context.timezone)?;
+                let offset = crate::arithmetic_in_timezone(BinaryOp::Multiply, &args[0], &quotient, context.timezone)?;
+                crate::arithmetic_in_timezone(BinaryOp::Add, origin, &offset, context.timezone)
+            }
+            Self::RangeBins => match RangeBins::prepare(args, context)? { Some(bins) => bins.materialize(context), None => Ok(Value::Null) },
+            _ => clock(self, args, context),
+        }
+    }
 }
+
 fn timestamp(value: i64, unit: U, timezone: Option<String>) -> Value { Value::Timestamp { value, unit, timezone } }
 fn instant_type() -> L { L::Scalar(S::Timestamp { unit: U::Microsecond, timezone: Some("UTC".into()) }) }
 fn origin() -> Value { timestamp(0,U::Microsecond,Some("UTC".into())) }
 
-pub(crate) fn call(name: &str,args: &[Value],context: &EvalContext<'_>) -> Option<Result<Value>> {
-    let name = canonical(name);
-    if !matches!(name,"extract" | "date_trunc" | "age" | "date_bin" | "range_bins" | "current_timestamp" | "current_date" | "current_time" | "current_timezone" | "local_date" | "local_time" | "local_timestamp") { return None; }
-    Some((|| -> Result<Value> {
-        if args.iter().any(crate::compare::nullish) { return Ok(Value::Null); }
-        match name {
-            "extract" | "date_trunc" => {
-                let Value::Utf8(field) = &args[0] else { return Err(inapplicable(name,&[])); };
-                let field = F::parse(field)?;
-                let L::Scalar(source) = args[1].logical_type() else { return Err(inapplicable(name,&[])); };
-                field.validate_for(name, &source)?;
-                if name == "extract" { extract(field,&args[1]) }
-                else {
-                    let zone = args.get(2).map(|value| match value { Value::Utf8(zone) => rtdb_plan::truncation_zone(zone), _ => Err(inapplicable(name,&[])) }).transpose()?;
-                    truncate(field,&args[1],zone)
-                }
-            }
-            "age" => age(&args[0],&args[1],context.timezone),
-            "date_bin" => {
-                let default_origin = origin();
-                let origin = args.get(2).unwrap_or(&default_origin);
-                let difference = crate::arithmetic_in_timezone(BinaryOp::Subtract,&args[1],origin,context.timezone)?;
-                let quotient = crate::arithmetic_in_timezone(BinaryOp::Divide,&difference,&args[0],context.timezone)?;
-                let offset = crate::arithmetic_in_timezone(BinaryOp::Multiply,&args[0],&quotient,context.timezone)?;
-                crate::arithmetic_in_timezone(BinaryOp::Add,origin,&offset,context.timezone)
-            }
-            "range_bins" => match RangeBins::prepare(args,context)? { Some(bins) => bins.materialize(context), None => Ok(Value::Null) },
-            _ => clock(name,args,context),
-        }
-    })())
-}
-
-fn clock(name: &str,args: &[Value],context: &EvalContext<'_>) -> Result<Value> {
-    if name == "current_timezone" { return Ok(Value::Utf8(ZoneId::parse(context.timezone)?.to_string())); }
-    let precision = args.first().map(|value| integer(value).map(|n|n.clamp(0,9) as u8).ok_or_else(||inapplicable(name,&[value]))).transpose()?.unwrap_or(6);
+fn clock(function: TemporalFunction, args: &[Value], context: &EvalContext<'_>) -> Result<Value> {
+    if function == TemporalFunction::CurrentTimezone { return Ok(Value::Utf8(ZoneId::parse(context.timezone)?.to_string())); }
+    let name = function.canonical_name();
+    let precision = args.first().map(|value| integer(value).map(|n| n.clamp(0, 9) as u8).ok_or_else(|| inapplicable(name, &[value]))).transpose()?.unwrap_or(6);
     let unit = match precision { 0 => U::Second, 1..=3 => U::Millisecond, 4..=6 => U::Microsecond, _ => U::Nanosecond };
     let hz = unit.units_per_second();
     let instant = context.current_time;
-    let seconds = if name.starts_with("local_") { instant.seconds().checked_add(i64::from(ZoneId::parse(context.timezone)?.offset_at(instant.seconds())?.seconds())).ok_or_else(overflow)? } else { instant.seconds() };
-    if name.ends_with("date") { return Ok(Value::calendar_date(CivilDate::from_epoch_day(seconds.div_euclid(86_400))?,DateUnit::Day)); }
-    let modulus = [1,100,10,1,100,10,1,100,10,1][usize::from(precision)];
-    let seconds = if name.ends_with("timestamp") { seconds } else { seconds.rem_euclid(86_400) };
-    let value = seconds.checked_mul(hz).and_then(|value|value.checked_add(i64::from(instant.nanos()) / (1_000_000_000 / hz))).ok_or_else(overflow)?;
+    let is_local = matches!(function, TemporalFunction::LocalDate | TemporalFunction::LocalTime | TemporalFunction::LocalTimestamp);
+    let seconds = if is_local { instant.seconds().checked_add(i64::from(ZoneId::parse(context.timezone)?.offset_at(instant.seconds())?.seconds())).ok_or_else(overflow)? } else { instant.seconds() };
+    if matches!(function, TemporalFunction::CurrentDate | TemporalFunction::LocalDate) {
+        return Ok(Value::calendar_date(CivilDate::from_epoch_day(seconds.div_euclid(86_400))?, DateUnit::Day));
+    }
+    let modulus = [1, 100, 10, 1, 100, 10, 1, 100, 10, 1][usize::from(precision)];
+    let is_timestamp = matches!(function, TemporalFunction::CurrentTimestamp | TemporalFunction::LocalTimestamp);
+    let seconds = if is_timestamp { seconds } else { seconds.rem_euclid(86_400) };
+    let value = seconds.checked_mul(hz).and_then(|value| value.checked_add(i64::from(instant.nanos()) / (1_000_000_000 / hz))).ok_or_else(overflow)?;
     let value = (value / modulus) * modulus;
-    Ok(if name.ends_with("timestamp") { timestamp(value,unit,if name == "current_timestamp" { Some("UTC".into()) } else { None }) }
-        else { Value::Time { value,unit,bit_width: if hz <= 1000 { 32 } else { 64 } } })
+    Ok(if is_timestamp { timestamp(value, unit, if function == TemporalFunction::CurrentTimestamp { Some("UTC".into()) } else { None }) }
+        else { Value::Time { value, unit, bit_width: if hz <= 1000 { 32 } else { 64 } } })
 }
 
 fn date_field(field: F,date: CivilDate) -> Result<i64> {

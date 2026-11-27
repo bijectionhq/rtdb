@@ -20,15 +20,41 @@ pub(crate) fn view_size(size: i64) -> Result<usize> {
         .map_err(|_| Anomaly::incorrect("xtdb.expression/overflow-error", "data exception - overflow error"))
 }
 
-pub(crate) fn call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Option<Result<Value>> {
-    if !matches!(name, "array_upper" | "array_lower" | "array_length" | "trim_array") { return None; }
-    Some((|| {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CollectionFunction {
+    ArrayUpper,
+    ArrayLower,
+    ArrayLength,
+    TrimArray,
+}
+
+impl CollectionFunction {
+    pub(crate) fn from_canonical(name: &str) -> Option<Self> {
+        Some(match name {
+            "array_upper" => Self::ArrayUpper,
+            "array_lower" => Self::ArrayLower,
+            "array_length" => Self::ArrayLength,
+            "trim_array" => Self::TrimArray,
+            _ => return None,
+        })
+    }
+
+    pub(crate) fn canonical_name(self) -> &'static str {
+        match self {
+            Self::ArrayUpper => "array_upper",
+            Self::ArrayLower => "array_lower",
+            Self::ArrayLength => "array_length",
+            Self::TrimArray => "trim_array",
+        }
+    }
+
+    pub(crate) fn eval(self, args: &[Value], context: &EvalContext<'_>) -> Result<Value> {
         if args.iter().any(crate::compare::nullish) { return Ok(Value::Null); }
         let [Value::List(items), count] = args else { return Err(Anomaly::incorrect("xtdb/invalid-argument-types", "Array function requires a list and an integer")); };
         let count = integer(count).and_then(|count| i64::try_from(count).ok()).ok_or_else(|| Anomaly::incorrect("xtdb/invalid-argument-types", "Array function requires an integer"))?;
-        if name != "trim_array" {
-            dimension(name, count)?;
-            return Ok(Value::I32(if name == "array_lower" { 1 } else { i32::try_from(items.len()).map_err(|_| overflow())? }));
+        if self != Self::TrimArray {
+            dimension(self.canonical_name(), count)?;
+            return Ok(Value::I32(if self == Self::ArrayLower { 1 } else { i32::try_from(items.len()).map_err(|_| overflow())? }));
         }
         let size = view_size(trim_size(items.len(), count)?)?;
         if size > items.len() { return Err(Anomaly::incorrect("xtdb/invalid-argument-types", "nth is not applicable to these collection values")); }
@@ -38,5 +64,5 @@ pub(crate) fn call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Opt
         let mut result = Vec::with_capacity(size);
         for item in items { let mut item = item.into_owned();item.admit_box_date()?;result.push(item); }
         Ok(Value::list(result))
-    })())
+    }
 }

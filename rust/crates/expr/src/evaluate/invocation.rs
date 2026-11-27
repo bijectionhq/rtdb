@@ -6,6 +6,14 @@ mod host;
 struct Replacement<'a> { expression: &'a Expr,compiled: CompiledReplacement }
 struct PendingBinding<'a> { expression: &'a Expr,recipe: &'a rtdb_plan::RegexReplacement,program: host::Program<'a> }
 
+#[derive(Clone, Copy)]
+pub(super) struct PreparedCall<'a> {
+    expression: &'a Expr,
+    pub(super) function: Option<crate::functions::ScalarFunction>,
+    pub(super) dispatch_prepared: bool,
+    pub(super) requires_reader: bool,
+}
+
 pub(super) struct PreparedList {
     pub(super) values: ListValue,
     pub(super) element: LogicalType,
@@ -14,12 +22,20 @@ pub(super) struct PreparedList {
 
 pub(super) struct Replacements<'a> {
     entries: Vec<Replacement<'a>>,
+    calls: Vec<PreparedCall<'a>>,
     lists: std::collections::HashMap<usize, PreparedList>,
     types: std::sync::Mutex<std::collections::HashMap<usize,LogicalType>>,
     validated_calls: std::sync::Mutex<std::collections::HashSet<usize>>,
 }
 
-impl Replacements<'_> {
+impl<'a> Replacements<'a> {
+    pub(super) fn prepared_call(&self, expression: &Expr) -> Option<PreparedCall<'a>> {
+        let address = expression as *const Expr as usize;
+        self.calls.binary_search_by_key(&address, |entry| entry.expression as *const Expr as usize)
+            .ok()
+            .map(|index| self.calls[index])
+    }
+
     pub(super) fn list(&self, expression: &Expr) -> Option<&PreparedList> {
         self.lists.get(&(expression as *const Expr as usize))
     }
@@ -52,6 +68,13 @@ impl Replacements<'_> {
     }
 }
 
+pub(super) fn resolve_call<'b>(prepared: Option<&Replacements<'_>>, expression: &'b Expr, name: &'b str) -> crate::functions::ResolvedFunction<'b> {
+    match prepared.and_then(|invocation| invocation.prepared_call(expression)) {
+        Some(call) => crate::functions::ResolvedFunction::from_option(call.function, name),
+        None => crate::functions::ResolvedFunction::resolve(name),
+    }
+}
+
 /// One expression invocation over a fixed input and parameter schema.
 /// Preparation admits metadata and compiles replacement patterns before any row, including an empty input.
 /// The caller keeps the preparation scope alive and supplies the same vector types to every row evaluation.
@@ -59,6 +82,7 @@ pub struct ExpressionInvocation<'expr> {
     expression: &'expr Expr,
     schema: &'expr Schema,
     output_type: LogicalType,
+    requires_reader: bool,
     replacements: Replacements<'expr>,
 }
 
@@ -72,6 +96,7 @@ impl<'expr> ExpressionInvocation<'expr> {
         context.reserve(pending.len().checked_mul(std::mem::size_of::<Replacement<'_>>()).ok_or_else(overflow)?)?;
         let mut replacements = Replacements {
             entries: Vec::with_capacity(pending.len()),
+            calls: Vec::new(),
             lists: Default::default(),
             types: Default::default(),
             validated_calls: Default::default(),
@@ -82,8 +107,10 @@ impl<'expr> ExpressionInvocation<'expr> {
             replacements.entries.push(Replacement { expression,compiled });
         }
         replacements.entries.sort_unstable_by_key(|entry|entry.expression as *const Expr as usize);
+        let requires_reader = prepare_calls(expression, context, &mut replacements.calls)?;
+        replacements.calls.sort_unstable_by_key(|entry| entry.expression as *const Expr as usize);
         prepare_lists(expression, context, &mut replacements.lists)?;
-        Ok(Self { expression,schema,output_type,replacements })
+        Ok(Self { expression,schema,output_type,requires_reader,replacements })
     }
 
     /// Returns the emitted type derived from preparation's complete input and parameter vectors.
@@ -92,8 +119,8 @@ impl<'expr> ExpressionInvocation<'expr> {
     /// Returns an owned result under the row context's allocation scope.
     pub fn evaluate(&self,row: &[Value],context: &EvalContext<'_>) -> Result<Value> {
         let row = ExpressionRow::Values(row);
-        let mut value = if reader::required(self.expression) { reader::execute_sync_prepared(self.expression,self.schema,row,context,&self.replacements)? }
-            else { super::evaluate_inner(self.expression,self.schema,row,context)? };
+        let mut value = if self.requires_reader { reader::execute_sync_prepared(self.expression,self.schema,row,context,&self.replacements)? }
+            else { super::evaluate_inner(self.expression,self.schema,row,context,Some(&self.replacements))? };
         value.admit_expression_dates()?;
         Ok(value)
     }
@@ -111,7 +138,7 @@ impl<'expr> ExpressionInvocation<'expr> {
         use std::ops::ControlFlow;
 
         let row = ExpressionRow::Values(row);
-        if !reader::required(self.expression) {
+        if !self.requires_reader {
             return self.evaluate_row_async(row, context).await.map(ControlFlow::Continue);
         }
         match reader::execute_with_arrow_list(self.expression, self.schema, row, context, &self.replacements, retain).await? {
@@ -124,8 +151,8 @@ impl<'expr> ExpressionInvocation<'expr> {
     }
 
     async fn evaluate_row_async(&self,row: ExpressionRow<'_>,context: &EvalContext<'_>) -> Result<Value> {
-        let mut value = if reader::required(self.expression) { reader::execute_async_prepared(self.expression,self.schema,row,context,&self.replacements).await? }
-            else { super::evaluate_async_inner(self.expression,self.schema,row,context).await? };
+        let mut value = if self.requires_reader { reader::execute_async_prepared(self.expression,self.schema,row,context,&self.replacements).await? }
+            else { super::evaluate_async_inner(self.expression,self.schema,row,context,Some(&self.replacements)).await? };
         value.admit_expression_dates()?;
         Ok(value)
     }
@@ -179,6 +206,53 @@ impl<'expr> ExpressionInvocation<'expr> {
     fn validate(&self,value: &Value) -> Result<()> {
         if matches!(self.expression,Expr::Column {..} | Expr::RowCopy(_)) { Ok(()) } else { validate_projection_value(value) }
     }
+}
+
+fn prepare_calls<'a>(expression: &'a Expr, context: &EvalContext<'_>, calls: &mut Vec<PreparedCall<'a>>) -> Result<bool> {
+    stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
+        Ok(match expression {
+            Expr::List(_) | Expr::Struct(_) | Expr::RegexReplace { .. }
+            | Expr::Unary { .. } | Expr::Binary { .. } | Expr::Cast { .. } | Expr::Field { .. }
+            | Expr::Subscript { .. } | Expr::Case { .. } | Expr::SimpleCase { .. }
+            | Expr::Between { .. } | Expr::Coalesce(_) | Expr::Like { .. } => {
+                for child in expression.children() { prepare_calls(child, context, calls)?; }
+                true
+            }
+            Expr::Literal(Value::List(_) | Value::Set(_) | Value::FixedSizeList(_) | Value::Struct(_)) => true,
+            Expr::Call { name, args, return_type } => {
+                let mut args_require_reader = false;
+                for arg in args {
+                    args_require_reader |= prepare_calls(arg, context, calls)?;
+                }
+                let resolved = crate::functions::ResolvedFunction::resolve(name);
+                let null_typed = reader::null_typed(resolved, return_type);
+                let dispatch_prepared = null_typed || resolved.is_prepared_call() || resolved.is_strict_temporal();
+                let requires_reader = null_typed
+                    || resolved.is_cosine()
+                    || (!args.is_empty() && resolved.is_strict_temporal())
+                    || resolved.is_prepared_call()
+                    || resolved.is_collection_call()
+                    || args_require_reader;
+                context.reserve(std::mem::size_of::<PreparedCall<'_>>())?;
+                calls.push(PreparedCall {
+                    expression,
+                    function: match resolved {
+                        crate::functions::ResolvedFunction::Known(function) => Some(function),
+                        crate::functions::ResolvedFunction::Unknown(_) => None,
+                    },
+                    dispatch_prepared,
+                    requires_reader,
+                });
+                requires_reader
+            }
+            Expr::In { expr, values, .. } => {
+                let mut required = prepare_calls(expr, context, calls)?;
+                for value in values { required |= prepare_calls(value, context, calls)?; }
+                required
+            }
+            _ => false,
+        })
+    })
 }
 
 fn prepare_lists(expression: &Expr, context: &EvalContext<'_>, lists: &mut std::collections::HashMap<usize, PreparedList>) -> Result<()> {
@@ -248,7 +322,9 @@ fn prepare<'a>(expression: &'a Expr,schema: &Schema,context: &EvalContext<'_>,bi
         return prepare_coalesce(args,schema,context,bindings);
     }
     if let Expr::Call { name,args,.. } = expression {
-        if name.eq_ignore_ascii_case("coalesce") { return prepare_coalesce(args,schema,context,bindings); }
+        if crate::functions::ScalarFunction::resolve(name) == Some(crate::functions::ScalarFunction::Coalesce) {
+            return prepare_coalesce(args,schema,context,bindings);
+        }
     }
     for child in expression.children() { prepare(child,schema,context,bindings)?; }
     Ok(())
@@ -258,4 +334,68 @@ fn prepare_coalesce<'a>(args: &'a [Expr],schema: &Schema,context: &EvalContext<'
     let Some((first,rest)) = args.split_first() else { return Ok(()); };
     if expression_type(first,schema,context)?.nullable() { prepare_coalesce(rest,schema,context,bindings)?; }
     prepare(first,schema,context,bindings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::functions::ScalarFunction;
+    use crate::session_info::SessionInfoFunction;
+    use crate::string::StringFunction;
+    use rtdb_plan::{ColumnId, Field};
+
+    #[test]
+    fn invocation_prepares_every_call_node_once_and_dispatches_across_rows() {
+        let text_type = LogicalType::Scalar(ScalarType::Utf8).maybe();
+        let schema = Schema::new(vec![Field {
+            id: ColumnId(0),
+            name: "s".into(),
+            qualifier: None,
+            qualified_only: false,
+            unnamed: false,
+            data_type: text_type.clone(),
+        }]).unwrap();
+        let inner = Expr::Call {
+            name: "CONCAT".into(),
+            args: vec![Expr::column(ColumnId(0), text_type), Expr::Literal(Value::Utf8("!".into()))],
+            return_type: LogicalType::Scalar(ScalarType::Utf8).maybe(),
+        };
+        let outer = Expr::Call {
+            name: "UPPER".into(),
+            args: vec![inner],
+            return_type: LogicalType::Scalar(ScalarType::Utf8).maybe(),
+        };
+        let context = EvalContext::default();
+        let invocation = ExpressionInvocation::prepare(&outer, &schema, &context).unwrap();
+        assert!(invocation.requires_reader);
+        assert_eq!(invocation.replacements.calls.len(), 2);
+        let Expr::Call { args, .. } = &outer else { unreachable!() };
+        assert_eq!(invocation.replacements.prepared_call(&outer).unwrap().function, Some(ScalarFunction::Upper));
+        assert_eq!(invocation.replacements.prepared_call(&args[0]).unwrap().function, Some(ScalarFunction::String(StringFunction::Concat)));
+        assert_eq!(invocation.evaluate(&[Value::Utf8("hi".into())], &context).unwrap(), Value::Utf8("HI!".into()));
+        assert_eq!(invocation.evaluate(&[Value::Null], &context).unwrap(), Value::Null);
+
+        let non_reader = Expr::Call {
+            name: "CURRENT-USER".into(),
+            args: vec![],
+            return_type: LogicalType::Scalar(ScalarType::Utf8),
+        };
+        let invocation = ExpressionInvocation::prepare(&non_reader, &Schema::default(), &context).unwrap();
+        assert!(!invocation.requires_reader);
+        assert_eq!(
+            invocation.replacements.prepared_call(&non_reader).unwrap().function,
+            Some(ScalarFunction::SessionInfo(SessionInfoFunction::CurrentUser))
+        );
+        assert_eq!(invocation.evaluate(&[], &context).unwrap(), Value::Utf8("xtdb".into()));
+
+        let unregistered = Expr::Call {
+            name: "unregistered-fn".into(),
+            args: vec![Expr::Literal(Value::Null)],
+            return_type: LogicalType::Null,
+        };
+        let invocation = ExpressionInvocation::prepare(&unregistered, &Schema::default(), &context).unwrap();
+        assert!(invocation.requires_reader);
+        assert_eq!(invocation.replacements.prepared_call(&unregistered).unwrap().function, None);
+        assert_eq!(invocation.evaluate(&[], &context).unwrap(), Value::Null);
+    }
 }

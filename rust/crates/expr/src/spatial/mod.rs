@@ -2,7 +2,7 @@
 pub mod bijection_geometry;
 
 mod sql;
-pub(crate) use sql::call;
+pub(crate) use sql::SpatialFunction;
 
 use geometry::predicates::{
     self, CoverPredicate, TopologyPredicate,

@@ -43,16 +43,21 @@ pub(super) async fn element<'a>(expr: &'a Expr, frame: &'a EvaluationFrame<'a>) 
             return Ok(Some(Output::Number(span.get(0).unwrap().signed())));
         }
     }
-    if let Expr::Call { name, args, return_type: LogicalType::Scalar(ScalarType::F64) } = expr
-        && name.eq_ignore_ascii_case("random")
-        && args.is_empty()
-    {
-        frame.context.reserve(4096)?;
-        return crate::volatile::random().map(|value| Some(Output::Number(NumericCell::F64(value))));
+    if let Expr::Call { name, args, return_type } = expr {
+        let function = frame.resolved_call(expr, name);
+        if function == crate::functions::ResolvedFunction::Known(crate::functions::ScalarFunction::Random)
+            && *return_type == LogicalType::Scalar(ScalarType::F64)
+            && args.is_empty()
+        {
+            frame.context.reserve(4096)?;
+            return crate::volatile::random().map(|value| Some(Output::Number(NumericCell::F64(value))));
+        }
+        if function.is_ordinary_call() {
+            return scalar::prepare(expr, frame)?.await?.demand_output().await.map(Some);
+        }
     }
     if matches!(expr, Expr::Unary { .. } | Expr::Binary { .. } | Expr::Cast { .. } | Expr::Case { .. }
         | Expr::SimpleCase { .. } | Expr::Coalesce(_))
-        || matches!(expr, Expr::Call { name, .. } if scalar::ordinary_call(name))
     {
         return scalar::prepare(expr, frame)?.await?.demand_output().await.map(Some);
     }

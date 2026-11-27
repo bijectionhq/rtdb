@@ -8,15 +8,102 @@ pub(crate) fn intersection(left: &Value, right: &Value) -> Option<Value> {
     Some(if lower < upper { Value::TimestampTzRange { lower, upper } } else { Value::Null })
 }
 
-pub(crate) fn predicate(name: &str, args: &[Value], context: &EvalContext<'_>) -> Option<Result<Value>> {
-    let base = name.strip_suffix('?').unwrap_or(name);
-    if !matches!(base, "contains" | "strictly_contains" | "overlaps" | "strictly_overlaps" | "equals" | "precedes" | "strictly_precedes" | "immediately_precedes" | "succeeds" | "strictly_succeeds" | "immediately_succeeds" | "leads" | "strictly_leads" | "immediately_leads" | "lags" | "strictly_lags" | "immediately_lags") { return None; }
-    Some((|| {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PeriodPredicate {
+    Contains,
+    StrictlyContains,
+    Overlaps,
+    StrictlyOverlaps,
+    Equals,
+    Precedes,
+    StrictlyPrecedes,
+    ImmediatelyPrecedes,
+    Succeeds,
+    StrictlySucceeds,
+    ImmediatelySucceeds,
+    Leads,
+    StrictlyLeads,
+    ImmediatelyLeads,
+    Lags,
+    StrictlyLags,
+    ImmediatelyLags,
+}
+
+impl PeriodPredicate {
+    pub(crate) fn from_canonical(name: &str) -> Option<(Self, bool)> {
+        let (base, question) = match name.strip_suffix('?') {
+            Some(base) => (base, true),
+            None => (name, false),
+        };
+        let predicate = match base {
+            "contains" => Self::Contains,
+            "strictly_contains" => Self::StrictlyContains,
+            "overlaps" => Self::Overlaps,
+            "strictly_overlaps" => Self::StrictlyOverlaps,
+            "equals" => Self::Equals,
+            "precedes" => Self::Precedes,
+            "strictly_precedes" => Self::StrictlyPrecedes,
+            "immediately_precedes" => Self::ImmediatelyPrecedes,
+            "succeeds" => Self::Succeeds,
+            "strictly_succeeds" => Self::StrictlySucceeds,
+            "immediately_succeeds" => Self::ImmediatelySucceeds,
+            "leads" => Self::Leads,
+            "strictly_leads" => Self::StrictlyLeads,
+            "immediately_leads" => Self::ImmediatelyLeads,
+            "lags" => Self::Lags,
+            "strictly_lags" => Self::StrictlyLags,
+            "immediately_lags" => Self::ImmediatelyLags,
+            _ => return None,
+        };
+        Some((predicate, question))
+    }
+
+    pub(crate) fn canonical_name(self, question: bool) -> &'static str {
+        match (self, question) {
+            (Self::Contains, false) => "contains",
+            (Self::Contains, true) => "contains?",
+            (Self::StrictlyContains, false) => "strictly_contains",
+            (Self::StrictlyContains, true) => "strictly_contains?",
+            (Self::Overlaps, false) => "overlaps",
+            (Self::Overlaps, true) => "overlaps?",
+            (Self::StrictlyOverlaps, false) => "strictly_overlaps",
+            (Self::StrictlyOverlaps, true) => "strictly_overlaps?",
+            (Self::Equals, false) => "equals",
+            (Self::Equals, true) => "equals?",
+            (Self::Precedes, false) => "precedes",
+            (Self::Precedes, true) => "precedes?",
+            (Self::StrictlyPrecedes, false) => "strictly_precedes",
+            (Self::StrictlyPrecedes, true) => "strictly_precedes?",
+            (Self::ImmediatelyPrecedes, false) => "immediately_precedes",
+            (Self::ImmediatelyPrecedes, true) => "immediately_precedes?",
+            (Self::Succeeds, false) => "succeeds",
+            (Self::Succeeds, true) => "succeeds?",
+            (Self::StrictlySucceeds, false) => "strictly_succeeds",
+            (Self::StrictlySucceeds, true) => "strictly_succeeds?",
+            (Self::ImmediatelySucceeds, false) => "immediately_succeeds",
+            (Self::ImmediatelySucceeds, true) => "immediately_succeeds?",
+            (Self::Leads, false) => "leads",
+            (Self::Leads, true) => "leads?",
+            (Self::StrictlyLeads, false) => "strictly_leads",
+            (Self::StrictlyLeads, true) => "strictly_leads?",
+            (Self::ImmediatelyLeads, false) => "immediately_leads",
+            (Self::ImmediatelyLeads, true) => "immediately_leads?",
+            (Self::Lags, false) => "lags",
+            (Self::Lags, true) => "lags?",
+            (Self::StrictlyLags, false) => "strictly_lags",
+            (Self::StrictlyLags, true) => "strictly_lags?",
+            (Self::ImmediatelyLags, false) => "immediately_lags",
+            (Self::ImmediatelyLags, true) => "immediately_lags?",
+        }
+    }
+
+    pub(crate) fn eval(self, question: bool, args: &[Value], context: &EvalContext<'_>) -> Result<Value> {
+        let name = self.canonical_name(question);
         if args.iter().any(nullish) { return Ok(Value::Null); }
         let Value::TimestampTzRange { lower: lf, upper: lt } = &args[0] else { return Err(inapplicable(name, &[&args[0], &args[1]])); };
         let (rf, rt) = match &args[1] {
             Value::TimestampTzRange { lower, upper } => (*lower, *upper),
-            point if name == "contains?" => {
+            point if self == Self::Contains && question => {
                 let point = match point {
                     Value::Timestamp { value, timezone: Some(_), .. } => *value,
                     Value::Timestamp { unit, .. } => {
@@ -34,25 +121,24 @@ pub(crate) fn predicate(name: &str, args: &[Value], context: &EvalContext<'_>) -
             point => return Err(inapplicable(name, &[&args[0], point])),
         };
         let (lf, lt) = (*lf, *lt);
-        Ok(Value::Bool(match base {
-            "contains" => lf <= rf && lt >= rt,
-            "strictly_contains" => lf < rf && lt > rt,
-            "overlaps" => lf < rt && lt > rf,
-            "strictly_overlaps" => lf > rf && lt < rt,
-            "equals" => lf == rf && lt == rt,
-            "precedes" => lt <= rf,
-            "strictly_precedes" => lt < rf,
-            "immediately_precedes" => lt == rf,
-            "succeeds" => lf >= rt,
-            "strictly_succeeds" => lf > rt,
-            "immediately_succeeds" => lf == rt,
-            "leads" => lf < rf && rf < lt && lt <= rt,
-            "strictly_leads" => lf < rf && rf < lt && lt < rt,
-            "immediately_leads" => lf < rf && lt == rt,
-            "lags" => lf >= rf && rf < lt && lt > rt,
-            "strictly_lags" => lf > rf && rf < lt && lt > rt,
-            "immediately_lags" => lf == rf && lt > rt,
-            _ => return Err(inapplicable(name, &[&args[0], &args[1]])),
+        Ok(Value::Bool(match self {
+            Self::Contains => lf <= rf && lt >= rt,
+            Self::StrictlyContains => lf < rf && lt > rt,
+            Self::Overlaps => lf < rt && lt > rf,
+            Self::StrictlyOverlaps => lf > rf && lt < rt,
+            Self::Equals => lf == rf && lt == rt,
+            Self::Precedes => lt <= rf,
+            Self::StrictlyPrecedes => lt < rf,
+            Self::ImmediatelyPrecedes => lt == rf,
+            Self::Succeeds => lf >= rt,
+            Self::StrictlySucceeds => lf > rt,
+            Self::ImmediatelySucceeds => lf == rt,
+            Self::Leads => lf < rf && rf < lt && lt <= rt,
+            Self::StrictlyLeads => lf < rf && rf < lt && lt < rt,
+            Self::ImmediatelyLeads => lf < rf && lt == rt,
+            Self::Lags => lf >= rf && rf < lt && lt > rt,
+            Self::StrictlyLags => lf > rf && rf < lt && lt > rt,
+            Self::ImmediatelyLags => lf == rf && lt > rt,
         }))
-    })())
+    }
 }

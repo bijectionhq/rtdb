@@ -1,16 +1,10 @@
+use crate::collection::CollectionFunction;
+use crate::functions::{FloatMath, ResolvedFunction, ScalarFunction};
+use crate::string::StringFunction;
+use crate::temporal_functions::TemporalFunction;
 use super::*;
 use super::computed::Output;
 use rtdb_types::NumericCell;
-
-pub(super) fn ordinary_call(name: &str) -> bool {
-    let matches = |candidate: &str| name.bytes().map(|byte| if byte == b'-' { b'_' } else { byte.to_ascii_lowercase() }).eq(candidate.bytes());
-    ["abs","floor","ceil","ceiling","round","power","sqrt","exp","ln","log","log10","sin","cos","tan","asin","acos","atan","sinh","cosh","tanh","double","sleep",
-        "lower","upper","length","cardinality","reverse","trim","trim_leading","trim_trailing","substring","overlay","replace","position","octet_position","quote_ident","parse_ident","character_length","octet_length","default_overlay_length",
-        "_iid","keyword","namespace","local_name","current_schemas","current_setting","uri_scheme","uri_user_info","uri_host","uri_port","uri_path","uri_query","uri_fragment",
-        "like_regex","_patch","boolean","true?","false?","nil?","is_null","null_eq","===","str","concat","format","format_type","string_to_array","period","lower_inf","upper_inf","coalesce","nullif","greatest","least"].into_iter().any(matches)
-        || ["contains","strictly_contains","overlaps","strictly_overlaps","equals","precedes","strictly_precedes","immediately_precedes","succeeds","strictly_succeeds","immediately_succeeds","leads","strictly_leads","immediately_leads","lags","strictly_lags","immediately_lags"]
-            .into_iter().any(|candidate| name.strip_suffix('?').unwrap_or(name).bytes().map(|byte| if byte == b'-' { b'_' } else { byte.to_ascii_lowercase() }).eq(candidate.bytes()))
-}
 
 pub(super) struct Continuation<'a> { ty: LogicalType, payload: Pending<'a,Output<'a>> }
 impl<'a> Continuation<'a> {
@@ -119,19 +113,20 @@ fn emitted_type_at(expr: &Expr,frame: &EvaluationFrame<'_>) -> Result<LogicalTyp
             expression.validate_columns(&Default::default())?;
             expression.data_type()
         }
-        Expr::Call { name,args,.. } => {
-            if name.eq_ignore_ascii_case("coalesce") { coalesce_type(args,frame)? }
+        Expr::Call { name, args, .. } => {
+            let function = frame.resolved_call(expr, name);
+            if function == ResolvedFunction::Known(ScalarFunction::Coalesce) { coalesce_type(args, frame)? }
             else {
                 let types = args.iter().map(child).collect::<Result<Vec<_>>>()?;
-                if ["null_eq","null-eq","distinct_from","distinct-from","nullif"].iter().any(|candidate|name.eq_ignore_ascii_case(candidate)) && types.len() == 2 { rtdb_plan::validate_equality_types(&types[0],&types[1])?; }
-                let arguments = args.iter().zip(types).enumerate().map(|(index,(arg,ty))| {
-                    if literal_argument(name,index) {
+                if function.is_equality_call() && types.len() == 2 { rtdb_plan::validate_equality_types(&types[0], &types[1])?; }
+                let arguments = args.iter().zip(types).enumerate().map(|(index, (arg, ty))| {
+                    if function.literal_argument(index) {
                         frame.context.reserve(expression_type_bound(arg, frame.replacements)?.checked_mul(8).ok_or_else(overflow)?)?;
                         frame.context.reserve(literal_payload_bound(arg)?)?;
                         Ok(arg.clone())
-                    } else { Ok(Expr::Parameter { index: 0,data_type: ty }) }
+                    } else { Ok(Expr::Parameter { index: 0, data_type: ty }) }
                 }).collect::<Result<Vec<_>>>()?;
-                rtdb_plan::function_type_with_args(name,&arguments)?
+                rtdb_plan::function_type_with_args(&function.canonical_name(), &arguments)?
             }
         }
         Expr::Like { expr,pattern,case_insensitive,.. } => rtdb_plan::function_type(if *case_insensitive { "ilike" } else { "like" }, &[child(expr)?,child(pattern)?])?,
@@ -294,16 +289,17 @@ fn prepare_inner<'a>(expr: &'a Expr,ty: LogicalType,frame: &'a EvaluationFrame<'
                     calls::binary_values(*op,left,right,frame)?.await
                 },frame)
             }
-            Expr::Call { name,args,.. } => {
-                frame.context.reserve(name.len().checked_mul(8).and_then(|bytes|bytes.checked_add(256)).ok_or_else(overflow)?)?;
-                let name = crate::functions::canonical_name(name);
-                calls::validate(expr, &name, args, frame)?;
-                match &*name {
-                    "coalesce" => coalesce(args,frame)?.await,
-                    "nullif" => nullif(args,frame)?.await,
-                    "greatest" | "least" => greatest(name == "greatest",args,frame)?.await,
-                    "trim_array" | "set" => ready(evaluate(expr,frame)?.await?,frame),
-                    _ => call(name,args,ty,frame)?.await,
+            Expr::Call { name, args, .. } => {
+                frame.context.reserve(name.len().checked_mul(8).and_then(|bytes| bytes.checked_add(256)).ok_or_else(overflow)?)?;
+                let function = frame.resolved_call(expr, name);
+                calls::validate(expr, function, args, frame)?;
+                match function {
+                    ResolvedFunction::Known(ScalarFunction::Coalesce) => coalesce(args, frame)?.await,
+                    ResolvedFunction::Known(ScalarFunction::Nullif) => nullif(args, frame)?.await,
+                    ResolvedFunction::Known(ScalarFunction::Greatest) => greatest(true, args, frame)?.await,
+                    ResolvedFunction::Known(ScalarFunction::Least) => greatest(false, args, frame)?.await,
+                    ResolvedFunction::Known(ScalarFunction::Collection(CollectionFunction::TrimArray) | ScalarFunction::Set) => ready(evaluate(expr, frame)?.await?, frame),
+                    _ => call(function, args, ty, frame)?.await,
                 }
             }
             Expr::RegexReplace { source,.. } => {
@@ -427,132 +423,140 @@ fn greatest<'a>(greatest: bool,args: &'a [Expr],frame: &'a EvaluationFrame<'a>) 
 fn payload_truth(value: &EvalValue<'_>) -> Option<bool> {
     if is_null(value) { None } else { Some(!matches!(value,EvalValue::Scalar(Value::Bool(false)))) }
 }
-fn literal_argument(name: &str,index: usize) -> bool {
-    let name = crate::functions::canonical_name(name);
-    match &*name {
-        "round" => index == 1,"extract" | "date_trunc" => index == 0 || index == 2,
-        "single_field_interval" | "multi_field_interval" => index != 0,
-        "current_timestamp" | "now" | "current_time" | "local_timestamp" | "localtimestamp" | "local_time" | "localtime" => true,
-        _ => false,
-    }
-}
 
-fn call<'a>(name: std::borrow::Cow<'a, str>,args: &'a [Expr],ty: LogicalType,frame: &'a EvaluationFrame<'a>) -> Result<Pending<'a,Continuation<'a>>> {
+fn call<'a>(function: ResolvedFunction<'a>, args: &'a [Expr], ty: LogicalType, frame: &'a EvaluationFrame<'a>) -> Result<Pending<'a, Continuation<'a>>> {
     boxed(async move {
-        if name == "date_bin" {
+        if function == ResolvedFunction::Known(ScalarFunction::Temporal(TemporalFunction::DateBin)) {
             frame.context.reserve(4096)?;
-            let stride = prepare(&args[0],frame)?.await?;
+            let stride = prepare(&args[0], frame)?.await?;
             let stride = stride.demand().await?;
             let origin = if let Some(origin) = args.get(2) {
-                let origin = prepare(origin,frame)?.await?;
+                let origin = prepare(origin, frame)?.await?;
                 origin.demand().await?
-            } else { scalar(Value::Timestamp { value: 0,unit: rtdb_types::TimeUnit::Microsecond,timezone: Some("UTC".into()) }) };
+            } else { scalar(Value::Timestamp { value: 0, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) }) };
             if is_null(&stride) || is_null(&origin) { return nil(frame); }
-            let source = prepare(&args[1],frame)?.await?;
+            let source = prepare(&args[1], frame)?.await?;
             if source.is_null() { return nil(frame); }
-            return deferred(ty,async move { calls::apply(name,vec![stride,source.demand().await?,origin],frame)?.await },frame);
+            return deferred(ty, async move { calls::apply(function, vec![stride, source.demand().await?, origin], frame)?.await }, frame);
         }
-        if name == "random" && args.is_empty() {
+        if function == ResolvedFunction::Known(ScalarFunction::Random) && args.is_empty() {
             return deferred_output(ty, async move {
                 frame.context.reserve(4096)?;
                 crate::volatile::random().map(|value| Output::Number(NumericCell::F64(value)))
             }, frame);
         }
-        let shortcut_null = !matches!(&*name,"is_true" | "is_false" | "is_null" | "true?" | "false?" | "nil?" | "boolean" | "===" | "null_eq" | "compare_nulls_first" | "compare_nulls_last" | "distinct_from" | "period" | "str" | "_patch" | "string_to_array" | "format_type" | "format");
+        let shortcut_null = function.shortcut_null();
         frame.context.reserve(args.len().checked_mul(std::mem::size_of::<Continuation<'_>>()).ok_or_else(overflow)?)?;
         let mut arguments = Vec::with_capacity(args.len());
         for expr in args {
-            let argument = prepare(expr,frame)?.await?;
+            let argument = prepare(expr, frame)?.await?;
             if argument.is_null() && shortcut_null { return nil(frame); }
             arguments.push(argument);
         }
-        if crate::interval_constructor::is_name(&name) {
-            let recipe = rtdb_plan::interval_constructor(&name,args)?.ok_or_else(|| invalid(&name))?;
-            let input = arguments.into_iter().next().ok_or_else(|| invalid(&name))?;
-            return deferred(ty,async move {
+        if let ResolvedFunction::Known(ScalarFunction::Interval(interval_fn)) = function {
+            let name = interval_fn.canonical_name();
+            let recipe = rtdb_plan::interval_constructor(name, args)?.ok_or_else(|| invalid(name))?;
+            let input = arguments.into_iter().next().ok_or_else(|| invalid(name))?;
+            return deferred(ty, async move {
                 let value = input.demand().await?;
-                from_value(crate::interval_constructor::construct(scalar_ref(&value)?,&recipe)?,frame)
-            },frame);
+                from_value(crate::interval_constructor::construct(scalar_ref(&value)?, &recipe)?, frame)
+            }, frame);
         }
-        if matches!(&*name,"null_eq" | "distinct_from") && arguments.len() == 2 { rtdb_plan::validate_equality_types(&arguments[0].ty,&arguments[1].ty)?; }
+        if matches!(function, ResolvedFunction::Known(ScalarFunction::NullEq | ScalarFunction::DistinctFrom)) && arguments.len() == 2 {
+            rtdb_plan::validate_equality_types(&arguments[0].ty, &arguments[1].ty)?;
+        }
         if let [argument] = arguments.as_slice() {
-            if matches!(&*name,"_meta_double" | "get_field") && rtdb_plan::function_type(&name,std::slice::from_ref(&argument.ty))? == LogicalType::Null { return nil(frame); }
+            if matches!(function, ResolvedFunction::Known(ScalarFunction::MetaDouble | ScalarFunction::GetField))
+                && rtdb_plan::function_type(&function.canonical_name(), std::slice::from_ref(&argument.ty))? == LogicalType::Null
+            {
+                return nil(frame);
+            }
             let boolean = argument.ty == LogicalType::Scalar(rtdb_types::ScalarType::Bool);
-            let constant = match &*name {
-                "nil?" | "is_null" => Some(argument.is_null()),
-                "true?" | "is_true" | "false?" | "is_false" if !boolean => Some(false),
-                "boolean" if !boolean => Some(!argument.is_null()),
+            let constant = match function {
+                ResolvedFunction::Known(ScalarFunction::NilQ | ScalarFunction::IsNull) => Some(argument.is_null()),
+                ResolvedFunction::Known(ScalarFunction::TrueQ | ScalarFunction::IsTrue | ScalarFunction::FalseQ | ScalarFunction::IsFalse) if !boolean => Some(false),
+                ResolvedFunction::Known(ScalarFunction::Boolean) if !boolean => Some(!argument.is_null()),
                 _ => None,
             };
-            if let Some(value) = constant { return ready(scalar(Value::Bool(value)),frame); }
+            if let Some(value) = constant { return ready(scalar(Value::Bool(value)), frame); }
         }
-        if name == "like_regex" {
-            if arguments.len() != 3 { return Err(invalid(&name)); }
-            let _flags = arguments.pop().ok_or_else(||invalid(&name))?;
-            let pattern = arguments.pop().ok_or_else(||invalid(&name))?;
-            let input = arguments.pop().ok_or_else(||invalid(&name))?;
+        if function == ResolvedFunction::Known(ScalarFunction::LikeRegex) {
+            if arguments.len() != 3 { return Err(invalid("like_regex")); }
+            let _flags = arguments.pop().ok_or_else(|| invalid("like_regex"))?;
+            let pattern = arguments.pop().ok_or_else(|| invalid("like_regex"))?;
+            let input = arguments.pop().ok_or_else(|| invalid("like_regex"))?;
             let flags = match &args[2] { Expr::Literal(Value::Utf8(flags)) => flags.as_str(), _ => "" };
-            return deferred(ty,async move {
+            return deferred(ty, async move {
                 let pattern = pattern.demand().await?;
                 let Value::Utf8(pattern) = scalar_ref(&pattern)? else { return Err(invalid("like_regex")); };
-                let pattern = crate::string::pattern::compile(pattern,flags,frame.context)?;
+                let pattern = crate::string::pattern::compile(pattern, flags, frame.context)?;
                 let input = input.demand().await?;
                 let Value::Utf8(input) = scalar_ref(&input)? else { return Err(invalid("like_regex")); };
-                pattern.search(input,frame.context).map(|value|scalar(Value::Bool(value)))
-            },frame);
+                pattern.search(input, frame.context).map(|value| scalar(Value::Bool(value)))
+            }, frame);
         }
-        if matches!(&*name,"like" | "ilike") {
-            let pattern = arguments.pop().ok_or_else(||invalid(&name))?;
-            let input = arguments.pop().ok_or_else(||invalid(&name))?;
-            return deferred(ty,async move {
+        if let ResolvedFunction::Known(ScalarFunction::String(func @ (StringFunction::Like | StringFunction::Ilike))) = function {
+            let name = func.canonical_name();
+            let case_insensitive = func == StringFunction::Ilike;
+            let pattern = arguments.pop().ok_or_else(|| invalid(name))?;
+            let input = arguments.pop().ok_or_else(|| invalid(name))?;
+            return deferred(ty, async move {
                 let pattern = pattern.demand().await?;
                 let scratch = frame.context.allocation.map(crate::EvaluationScope::scratch);
                 let context = crate::EvalContext { allocation: scratch.as_ref().or(frame.context.allocation), ..*frame.context };
-                let pattern = crate::string::pattern::compile_like(scalar_ref(&pattern)?,None,name == "ilike",&context)?;
+                let pattern = crate::string::pattern::compile_like(scalar_ref(&pattern)?, None, case_insensitive, &context)?;
                 let input = input.demand().await?;
-                pattern.search(scalar_ref(&input)?,false,&context).map(scalar)
-            },frame);
+                pattern.search(scalar_ref(&input)?, false, &context).map(scalar)
+            }, frame);
         }
-        if matches!(&*name,"array_lower" | "array_upper" | "array_length") {
+        if let ResolvedFunction::Known(ScalarFunction::Collection(func @ (CollectionFunction::ArrayLower | CollectionFunction::ArrayUpper | CollectionFunction::ArrayLength))) = function {
+            let name = func.canonical_name();
             let dimension = arguments.pop().expect("validated array dimension");
             let input = arguments.pop().expect("validated array input");
-            return deferred(ty,async move {
+            return deferred(ty, async move {
                 let dimension = dimension.demand().await?;
-                let dimension = integer(scalar_ref(&dimension)?).and_then(|value| i64::try_from(value).ok()).ok_or_else(|| invalid(&name))?;
-                crate::collection::dimension(&name,dimension)?;
-                if name == "array_lower" { return Ok(scalar(Value::I32(1))); }
+                let dimension = integer(scalar_ref(&dimension)?).and_then(|value| i64::try_from(value).ok()).ok_or_else(|| invalid(name))?;
+                crate::collection::dimension(name, dimension)?;
+                if func == CollectionFunction::ArrayLower { return Ok(scalar(Value::I32(1))); }
                 Ok(scalar(Value::I32(size(&input.demand().await?)?)))
-            },frame);
+            }, frame);
         }
-        if name == "null_eq" && arguments.iter().any(Continuation::is_null) {
-            return ready(scalar(Value::Bool(arguments.iter().all(Continuation::is_null))),frame);
+        if function == ResolvedFunction::Known(ScalarFunction::NullEq) && arguments.iter().any(Continuation::is_null) {
+            return ready(scalar(Value::Bool(arguments.iter().all(Continuation::is_null))), frame);
         }
-        if name == "distinct_from" && arguments.iter().any(Continuation::is_null) {
-            return ready(scalar(Value::Bool(!arguments.iter().all(Continuation::is_null))),frame);
+        if function == ResolvedFunction::Known(ScalarFunction::DistinctFrom) && arguments.iter().any(Continuation::is_null) {
+            return ready(scalar(Value::Bool(!arguments.iter().all(Continuation::is_null))), frame);
         }
-        if matches!(&*name,"compare_nulls_first" | "compare_nulls_last") && arguments.iter().any(Continuation::is_null) {
+        if matches!(function, ResolvedFunction::Known(ScalarFunction::CompareNullsFirst | ScalarFunction::CompareNullsLast)) && arguments.iter().any(Continuation::is_null) {
+            let nulls_first = function == ResolvedFunction::Known(ScalarFunction::CompareNullsFirst);
             let result = if arguments.iter().all(Continuation::is_null) { 0 }
-                else if arguments[0].is_null() == (name == "compare_nulls_first") { -1 } else { 1 };
-            return ready(scalar(Value::I32(result)),frame);
+                else if arguments[0].is_null() == nulls_first { -1 } else { 1 };
+            return ready(scalar(Value::I32(result)), frame);
         }
-        if name == "===" && arguments.iter().all(Continuation::is_null) { return ready(scalar(Value::Bool(true)),frame); }
-        if matches!(&*name,"col_description" | "pg_indexam_has_property") || matches!(&*name,"format_type" | "string_to_array") && arguments.first().is_some_and(Continuation::is_null) { return nil(frame); }
-        if name == "round" && arguments.len() == 2 && matches!(arguments[0].ty,LogicalType::Scalar(rtdb_types::ScalarType::F32 | rtdb_types::ScalarType::F64)) {
+        if function == ResolvedFunction::Known(ScalarFunction::StrictEq) && arguments.iter().all(Continuation::is_null) {
+            return ready(scalar(Value::Bool(true)), frame);
+        }
+        if matches!(function, ResolvedFunction::Known(ScalarFunction::ColDescription | ScalarFunction::PgIndexamHasProperty))
+            || matches!(function, ResolvedFunction::Known(ScalarFunction::FormatType | ScalarFunction::String(StringFunction::StringToArray))) && arguments.first().is_some_and(Continuation::is_null)
+        {
+            return nil(frame);
+        }
+        if function == ResolvedFunction::Known(ScalarFunction::Round) && arguments.len() == 2 && matches!(arguments[0].ty, LogicalType::Scalar(rtdb_types::ScalarType::F32 | rtdb_types::ScalarType::F64)) {
             let scale = arguments.pop().expect("validated scale");
             let input = arguments.pop().expect("validated input");
-            return deferred(ty,async move {
+            return deferred(ty, async move {
                 let input = input.demand().await?;
                 let number = crate::numeric::number(scalar_ref(&input)?).ok_or_else(|| invalid("round"))?;
                 if !number.is_finite() { return Ok(scalar(Value::F64(number))); }
                 frame.context.reserve(2 * std::mem::size_of::<EvalValue<'_>>())?;
-                calls::apply(name,vec![input,scale.demand().await?],frame)?.await
-            },frame);
+                calls::apply(function, vec![input, scale.demand().await?], frame)?.await
+            }, frame);
         }
-        if let Some(math) = crate::functions::FloatMath::resolve(&name) && matches!(arguments.len(), 1 | 2) {
+        if let ResolvedFunction::Known(ScalarFunction::FloatMath(math)) = function && matches!(arguments.len(), 1 | 2) {
             let second = if arguments.len() == 2 { arguments.pop() } else { None };
             let first = arguments.pop().expect("validated numeric argument");
             return deferred_output(ty, async move {
-                let (left, right) = if name == "log" && second.is_some() {
+                let (left, right) = if math == FloatMath::Log && second.is_some() {
                     let right = second.unwrap().demand_output().await?;
                     (first.demand_output().await?, Some(right))
                 } else {
@@ -569,7 +573,7 @@ fn call<'a>(name: std::borrow::Cow<'a, str>,args: &'a [Expr],ty: LogicalType,fra
                     let bytes = numbers[..count].iter().flatten().copied().map(number_value_bytes).sum::<usize>();
                     frame.context.reserve((bytes + 256) * 16)?;
                     let types = types.map(|ty| ty.unwrap_or(LogicalType::Null));
-                    rtdb_plan::function_type(&name, &types[..count])?;
+                    rtdb_plan::function_type(math.canonical_name(), &types[..count])?;
                     let x = numbers[0].and_then(NumericCell::as_f64).unwrap();
                     let y = numbers[1].and_then(NumericCell::as_f64);
                     return math.apply(x, y).map(|value| Output::Number(NumericCell::F64(value)));
@@ -577,19 +581,19 @@ fn call<'a>(name: std::borrow::Cow<'a, str>,args: &'a [Expr],ty: LogicalType,fra
                 let mut values = Vec::with_capacity(count);
                 values.push(left.into_value());
                 if let Some(right) = right { values.push(right.into_value()); }
-                calls::apply(name, values, frame)?.await.map(Output::Value)
+                calls::apply(function, values, frame)?.await.map(Output::Value)
             }, frame);
         }
-        let selects_element = name == "nth";
-        if selects_element { rtdb_plan::function_type("nth", &[arguments[0].ty.clone(),arguments[1].ty.clone()])?; }
-        if selects_element && !matches!(arguments[0].ty,LogicalType::List { kind: ListKind::List | ListKind::FixedSizeList(_),.. }) { return nil(frame); }
-        let demand_null = name == "format";
+        let selects_element = function == ResolvedFunction::Known(ScalarFunction::Nth);
+        if selects_element { rtdb_plan::function_type("nth", &[arguments[0].ty.clone(), arguments[1].ty.clone()])?; }
+        if selects_element && !matches!(arguments[0].ty, LogicalType::List { kind: ListKind::List | ListKind::FixedSizeList(_), .. }) { return nil(frame); }
+        let demand_null = function == ResolvedFunction::Known(ScalarFunction::String(StringFunction::Format));
         let payload = async move {
             frame.context.reserve(arguments.len().checked_mul(std::mem::size_of::<EvalValue<'_>>()).ok_or_else(overflow)?)?;
             let mut values = Vec::with_capacity(arguments.len());
             for argument in arguments { values.push(if argument.is_null() && !demand_null { scalar(Value::Null) } else { argument.demand().await? }); }
-            calls::apply(name,values,frame)?.await
+            calls::apply(function, values, frame)?.await
         };
-        if selects_element { ready(payload.await?,frame) } else { deferred(ty,payload,frame) }
-    },frame)
+        if selects_element { ready(payload.await?, frame) } else { deferred(ty, payload, frame) }
+    }, frame)
 }

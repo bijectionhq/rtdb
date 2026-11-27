@@ -1,5 +1,9 @@
 use std::{cmp::Ordering, mem::size_of};
 
+use crate::collection::CollectionFunction;
+use crate::functions::{ResolvedFunction, ScalarFunction};
+use crate::string::StringFunction;
+use crate::temporal_functions::TemporalFunction;
 use crate::vector::{VectorInput, score_pair};
 
 use super::*;
@@ -57,31 +61,29 @@ pub(super) fn binary_values<'a>(op: BinaryOp,left: EvalValue<'a>,right: EvalValu
     },frame)
 }
 
-fn type_predicate(name: &str,value: &EvalValue<'_>) -> Option<bool> {
-    match name {
-        "nil?" | "is_null" => Some(is_null(value)),
-        "true?" | "is_true" => Some(matches!(value,EvalValue::Scalar(Value::Bool(true)))),
-        "false?" | "is_false" => Some(matches!(value,EvalValue::Scalar(Value::Bool(false)))),
-        "boolean" => Some(!is_null(value) && !matches!(value,EvalValue::Scalar(Value::Bool(false)))),
+fn type_predicate(function: ResolvedFunction<'_>, value: &EvalValue<'_>) -> Option<bool> {
+    let ResolvedFunction::Known(function) = function else { return None; };
+    match function {
+        ScalarFunction::NilQ | ScalarFunction::IsNull => Some(is_null(value)),
+        ScalarFunction::TrueQ | ScalarFunction::IsTrue => Some(matches!(value, EvalValue::Scalar(Value::Bool(true)))),
+        ScalarFunction::FalseQ | ScalarFunction::IsFalse => Some(matches!(value, EvalValue::Scalar(Value::Bool(false)))),
+        ScalarFunction::Boolean => Some(!is_null(value) && !matches!(value, EvalValue::Scalar(Value::Bool(false)))),
         _ => None,
     }
 }
 
-pub(super) fn is_cosine(name: &str) -> bool {
-    name.eq_ignore_ascii_case("cosine_distance") || name.eq_ignore_ascii_case("cosine-distance")
-}
-
-pub(super) fn validate(expr: &Expr, name: &str, args: &[Expr], frame: &EvaluationFrame<'_>) -> Result<()> {
-    if name == "cosine_distance" {
-        if args.len() != 2 { rtdb_plan::function_type(name, &[])?; }
+pub(super) fn validate(expr: &Expr, function: ResolvedFunction<'_>, args: &[Expr], frame: &EvaluationFrame<'_>) -> Result<()> {
+    if function.is_cosine() {
+        if args.len() != 2 { rtdb_plan::function_type("cosine_distance", &[])?; }
         return Ok(());
     }
+    let canonical = function.canonical_name();
     if let Some(invocation) = frame.replacements
         && args.iter().any(|arg| invocation.list(arg).is_some())
     {
-        return invocation.validate_call(expr, name, args);
+        return invocation.validate_call(expr, &canonical, args);
     }
-    rtdb_plan::function_type_with_args(name, args)?;
+    rtdb_plan::function_type_with_args(&canonical, args)?;
     Ok(())
 }
 
@@ -107,9 +109,10 @@ impl<'a> CosineArgument<'a> {
     }
 }
 
-pub(super) fn call<'a>(expr: &'a Expr,name: &'a str,args: &'a [Expr],frame: &'a EvaluationFrame<'a>) -> Result<Pending<'a,EvalValue<'a>>> {
+pub(super) fn call<'a>(expr: &'a Expr, name: &'a str, args: &'a [Expr], frame: &'a EvaluationFrame<'a>) -> Result<Pending<'a, EvalValue<'a>>> {
     boxed(async move {
-        if is_cosine(name) && let [left, right] = args && args.iter().all(|arg| !required(arg)) {
+        let function = frame.resolved_call(expr, name);
+        if function.is_cosine() && let [left, right] = args && args.iter().all(|arg| !required_with(arg, frame.replacements)) {
             let left_cell = frame.arrow_input(left).filter(|cell| packed_numeric_cell(*cell));
             let right_cell = frame.arrow_input(right).filter(|cell| packed_numeric_cell(*cell));
             if left_cell.is_none() && right_cell.is_none() { return evaluate_scalar(expr, frame).await; }
@@ -120,46 +123,56 @@ pub(super) fn call<'a>(expr: &'a Expr,name: &'a str,args: &'a [Expr],frame: &'a 
             return Ok(scalar(crate::vector::score_pair(left.vector()?, right.vector()?)?));
         }
         frame.context.reserve(name.len().checked_mul(8).and_then(|n|n.checked_add(256)).ok_or_else(overflow)?)?;
-        let name = crate::functions::canonical_name(name);
         frame.context.reserve(args.iter().try_fold(0usize,|bytes,expr|bytes.checked_add(expression_type_bound(expr, frame.replacements)?).ok_or_else(overflow))?.checked_mul(8).ok_or_else(overflow)?)?;
-        validate(expr, &name, args, frame)?;
-        if name == "_id_eq_any" { return id_eq_any(&args[0], &args[1], frame).await; }
-        if name == "set" { return make_list(Kind::Set,ListReader::Expressions(args),frame); }
-        if name == "coalesce" {
-            for expr in args { let value = evaluate(expr,frame)?.await?;if !is_null(&value) { return Ok(value); } }
-            return Ok(scalar(Value::Null));
-        }
-        if name == "nullif" {
-            let mut left = evaluate(&args[0],frame)?.await?;
-            let mut right = evaluate(&args[1],frame)?.await?;
-            if let (EvalValue::Scalar(left),EvalValue::Scalar(right)) = (&mut left,&mut right) {
-                super::super::coerce_comparison_literals(false,matches!(&args[1],Expr::Literal(Value::Utf8(_))),left,right,frame.context.timezone)?;
+        validate(expr, function, args, frame)?;
+        match function {
+            ResolvedFunction::Known(ScalarFunction::IdEqAny) => return id_eq_any(&args[0], &args[1], frame).await,
+            ResolvedFunction::Known(ScalarFunction::Set) => return make_list(Kind::Set, ListReader::Expressions(args), frame),
+            ResolvedFunction::Known(ScalarFunction::Coalesce) => {
+                for expr in args { let value = evaluate(expr, frame)?.await?; if !is_null(&value) { return Ok(value); } }
+                return Ok(scalar(Value::Null));
             }
-            return Ok(if compare::equal(clone_value(&left,frame)?,right,false,frame)?.await? == Some(true) { scalar(Value::Null) } else { left });
-        }
-        if name == "greatest" || name == "least" {
-            let Some(first) = args.first() else { return Ok(scalar(Value::Null)); };
-            let mut best = evaluate(first,frame)?.await?;
-            for expr in &args[1..] {
-                if is_null(&best) { return Ok(scalar(Value::Null)); }
-                let next = evaluate(expr,frame)?.await?;
-                if is_null(&next) { return Ok(next); }
-                let unordered = [&best,&next].iter().any(|value| matches!(value,EvalValue::Scalar(value) if crate::numeric::number(value).is_some_and(f64::is_nan)));
-                let ordering = if unordered { Ordering::Equal } else { compare::order(clone_value(&best,frame)?,clone_value(&next,frame)?,frame)?.await? };
-                if ordering != if name == "greatest" { Ordering::Greater } else { Ordering::Less } { best = next; }
+            ResolvedFunction::Known(ScalarFunction::Nullif) => {
+                let mut left = evaluate(&args[0], frame)?.await?;
+                let mut right = evaluate(&args[1], frame)?.await?;
+                if let (EvalValue::Scalar(left), EvalValue::Scalar(right)) = (&mut left, &mut right) {
+                    super::super::coerce_comparison_literals(false, matches!(&args[1], Expr::Literal(Value::Utf8(_))), left, right, frame.context.timezone)?;
+                }
+                return Ok(if compare::equal(clone_value(&left, frame)?, right, false, frame)?.await? == Some(true) { scalar(Value::Null) } else { left });
             }
-            return Ok(best);
+            ResolvedFunction::Known(ScalarFunction::Greatest | ScalarFunction::Least) => {
+                let is_greatest = function == ResolvedFunction::Known(ScalarFunction::Greatest);
+                let Some(first) = args.first() else { return Ok(scalar(Value::Null)); };
+                let mut best = evaluate(first, frame)?.await?;
+                for expr in &args[1..] {
+                    if is_null(&best) { return Ok(scalar(Value::Null)); }
+                    let next = evaluate(expr, frame)?.await?;
+                    if is_null(&next) { return Ok(next); }
+                    let unordered = [&best, &next].iter().any(|value| matches!(value, EvalValue::Scalar(value) if crate::numeric::number(value).is_some_and(f64::is_nan)));
+                    let ordering = if unordered { Ordering::Equal } else { compare::order(clone_value(&best, frame)?, clone_value(&next, frame)?, frame)?.await? };
+                    if ordering != if is_greatest { Ordering::Greater } else { Ordering::Less } { best = next; }
+                }
+                return Ok(best);
+            }
+            ResolvedFunction::Known(ScalarFunction::Collection(CollectionFunction::TrimArray)) => return trim(args, frame)?.await,
+            _ => {}
         }
-        if name == "trim_array" { return trim(args,frame)?.await; }
+        let short_circuit_null = matches!(
+            function,
+            ResolvedFunction::Known(
+                ScalarFunction::String(StringFunction::Concat)
+                | ScalarFunction::Collection(CollectionFunction::ArrayUpper | CollectionFunction::ArrayLower | CollectionFunction::ArrayLength)
+            )
+        );
         frame.context.reserve(args.len().checked_mul(std::mem::size_of::<EvalValue<'_>>()).ok_or_else(overflow)?)?;
         let mut values = Vec::with_capacity(args.len());
         for expr in args {
-            let value = evaluate(expr,frame)?.await?;
-            if matches!(&*name,"concat" | "array_upper" | "array_lower" | "array_length") && is_null(&value) { return Ok(scalar(Value::Null)); }
+            let value = evaluate(expr, frame)?.await?;
+            if short_circuit_null && is_null(&value) { return Ok(scalar(Value::Null)); }
             values.push(value);
         }
-        apply(name,values,frame)?.await
-    },frame)
+        apply(function, values, frame)?.await
+    }, frame)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -375,42 +388,45 @@ async fn cosine_components<'a>(input: &EvalValue<'a>, frame: &'a EvaluationFrame
     Ok(components)
 }
 
-pub(super) fn apply<'a>(name: std::borrow::Cow<'a, str>,mut values: Vec<EvalValue<'a>>,frame: &'a EvaluationFrame<'a>) -> Result<Pending<'a,EvalValue<'a>>> {
+pub(super) fn apply<'a>(function: ResolvedFunction<'a>, mut values: Vec<EvalValue<'a>>, frame: &'a EvaluationFrame<'a>) -> Result<Pending<'a, EvalValue<'a>>> {
     boxed(async move {
-        if name == "get_field" { return field(values.remove(0),None,frame); }
-        if name == "range_bins" {
-            frame.context.reserve(values.len().checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?)?;
-            let arguments = values.iter().map(|value|scalar_ref(value).and_then(|value|super::super::retained_clone(value,frame.context))).collect::<Result<Vec<_>>>()?;
-            return match crate::temporal_functions::RangeBins::prepare(&arguments,frame.context)? {
-                Some(bins) => make_list(Kind::List,ListReader::RangeBins(bins),frame),None => Ok(scalar(Value::Null)),
-            };
-        }
-        if name == "generate_series" {
-            frame.context.reserve(values.len().checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?)?;
-            let arguments = values.iter().map(|value|scalar_ref(value).and_then(|value|super::super::retained_clone(value,frame.context))).collect::<Result<Vec<_>>>()?;
-            return match crate::series::prepare(&arguments,frame.context)? {
-                crate::series::GeneratedSeries::Null => Ok(scalar(Value::Null)),
-                crate::series::GeneratedSeries::Integer(series) => make_list(Kind::List,ListReader::IntegerSeries(series),frame),
-                series => {
-                    let value = if frame.asynchronous { series.materialize_async(frame.context).await? } else { series.materialize(frame.context)? };
-                    from_value(value,frame)
-                }
-            };
+        match function {
+            ResolvedFunction::Known(ScalarFunction::GetField) => return field(values.remove(0), None, frame),
+            ResolvedFunction::Known(ScalarFunction::Temporal(TemporalFunction::RangeBins)) => {
+                frame.context.reserve(values.len().checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?)?;
+                let arguments = values.iter().map(|value| scalar_ref(value).and_then(|value| super::super::retained_clone(value, frame.context))).collect::<Result<Vec<_>>>()?;
+                return match crate::temporal_functions::RangeBins::prepare(&arguments, frame.context)? {
+                    Some(bins) => make_list(Kind::List, ListReader::RangeBins(bins), frame), None => Ok(scalar(Value::Null)),
+                };
+            }
+            ResolvedFunction::Known(ScalarFunction::GenerateSeries) => {
+                frame.context.reserve(values.len().checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?)?;
+                let arguments = values.iter().map(|value| scalar_ref(value).and_then(|value| super::super::retained_clone(value, frame.context))).collect::<Result<Vec<_>>>()?;
+                return match crate::series::prepare(&arguments, frame.context)? {
+                    crate::series::GeneratedSeries::Null => Ok(scalar(Value::Null)),
+                    crate::series::GeneratedSeries::Integer(series) => make_list(Kind::List, ListReader::IntegerSeries(series), frame),
+                    series => {
+                        let value = if frame.asynchronous { series.materialize_async(frame.context).await? } else { series.materialize(frame.context)? };
+                        from_value(value, frame)
+                    }
+                };
+            }
+            _ => {}
         }
         if let [value] = values.as_slice() {
-            if let Some(value) = type_predicate(&name,value) { return Ok(scalar(Value::Bool(value))); }
-            if matches!(&*name,"length" | "cardinality") {
+            if let Some(value) = type_predicate(function, value) { return Ok(scalar(Value::Bool(value))); }
+            if matches!(function, ResolvedFunction::Known(ScalarFunction::Length | ScalarFunction::Cardinality)) {
                 if is_null(value) { return Ok(scalar(Value::Null)); }
-                if matches!(value,EvalValue::List(_,_)) { return Ok(scalar(Value::I32(size(value)?))); }
+                if matches!(value, EvalValue::List(_, _)) { return Ok(scalar(Value::I32(size(value)?))); }
                 let count = match value {
-                    EvalValue::List(_,_) => Some(len(value)?),
-                    EvalValue::Struct(fields) if name == "length" => Some(fields.values().filter(|value| !is_null(value)).count()),
+                    EvalValue::List(_, _) => Some(len(value)?),
+                    EvalValue::Struct(fields) if function == ResolvedFunction::Known(ScalarFunction::Length) => Some(fields.values().filter(|value| !is_null(value)).count()),
                     _ => None,
                 };
                 if let Some(count) = count { return Ok(scalar(Value::I32(i32::try_from(count).map_err(|_| overflow())?))); }
             }
         }
-        if name == "cosine_distance" && let [left, right] = values.as_slice() {
+        if function.is_cosine() && let [left, right] = values.as_slice() {
             let allows_packed = |input: &EvalValue<'_>, other: &EvalValue<'_>| {
                 !matches!((input, other), (EvalValue::List(_, input), EvalValue::List(_, other))
                     if matches!(input.as_ref(), ListReader::Prepared(_))
@@ -441,50 +457,55 @@ pub(super) fn apply<'a>(name: std::borrow::Cow<'a, str>,mut values: Vec<EvalValu
                 return Ok(scalar(score_pair(left, right)?));
             }
         }
-        if name == "nth" { return subscript(values.remove(0),values.remove(0),frame)?.await; }
-        if matches!(&*name,"array_upper" | "array_lower" | "array_length") {
-            if values.iter().any(is_null) { return Ok(scalar(Value::Null)); }
-            let count = integer(scalar_ref(&values[1])?).and_then(|count| i64::try_from(count).ok()).ok_or_else(|| invalid(&name))?;
-            let input = values.remove(0);
-            if !matches!(&input,EvalValue::List(Kind::List,_)) { return Err(invalid(&name)); }
-            crate::collection::dimension(&name,count)?;
-            return Ok(scalar(Value::I32(if name == "array_lower" { 1 } else { size(&input)? })));
-        }
-        if name == "===" || name == "null_eq" {
-            let left = values.remove(0);let right = values.remove(0);
-            let equal = if name == "null_eq" && (is_null(&left) || is_null(&right)) { is_null(&left) && is_null(&right) }
-                else { compare::equal(left,right,name == "===",frame)?.await? == Some(true) };
-            return Ok(scalar(Value::Bool(equal)));
-        }
-        if name == "distinct_from" {
-            return binary_values(BinaryOp::IsDistinctFrom,values.remove(0),values.remove(0),frame)?.await;
-        }
-        if name == "_patch" {
-            let left = values.remove(0);let right = values.remove(0);
-            let EvalValue::Struct(right) = right else { return Err(invalid("_patch")); };
-            let mut fields = rtdb_types::StructFields::new();
-            if let EvalValue::Struct(left) = &left {
-                for (key,value) in left.iter() {
-                    frame.context.reserve(key.len().checked_add(4096).ok_or_else(overflow)?)?;
-                    fields.insert(key.clone(),clone_value(value,frame)?);
-                }
-            } else if !is_null(&left) { return Err(invalid("_patch")); }
-            for (key,value) in right.iter() {
-                if !is_null(value) || !fields.contains_key(key) {
-                    frame.context.reserve(key.len().checked_add(4096).ok_or_else(overflow)?)?;
-                    fields.insert(key.clone(),clone_value(value,frame)?);
-                }
+        match function {
+            ResolvedFunction::Known(ScalarFunction::Nth) => return subscript(values.remove(0), values.remove(0), frame)?.await,
+            ResolvedFunction::Known(ScalarFunction::Collection(func @ (CollectionFunction::ArrayUpper | CollectionFunction::ArrayLower | CollectionFunction::ArrayLength))) => {
+                if values.iter().any(is_null) { return Ok(scalar(Value::Null)); }
+                let name = func.canonical_name();
+                let count = integer(scalar_ref(&values[1])?).and_then(|count| i64::try_from(count).ok()).ok_or_else(|| invalid(name))?;
+                let input = values.remove(0);
+                if !matches!(&input, EvalValue::List(Kind::List, _)) { return Err(invalid(name)); }
+                crate::collection::dimension(name, count)?;
+                return Ok(scalar(Value::I32(if func == CollectionFunction::ArrayLower { 1 } else { size(&input)? })));
             }
-            frame.context.reserve(256)?;
-            return Ok(EvalValue::Struct(Arc::new(fields)));
+            ResolvedFunction::Known(ScalarFunction::StrictEq | ScalarFunction::NullEq) => {
+                let strict = function == ResolvedFunction::Known(ScalarFunction::StrictEq);
+                let left = values.remove(0); let right = values.remove(0);
+                let equal = if !strict && (is_null(&left) || is_null(&right)) { is_null(&left) && is_null(&right) }
+                    else { compare::equal(left, right, strict, frame)?.await? == Some(true) };
+                return Ok(scalar(Value::Bool(equal)));
+            }
+            ResolvedFunction::Known(ScalarFunction::DistinctFrom) => {
+                return binary_values(BinaryOp::IsDistinctFrom, values.remove(0), values.remove(0), frame)?.await;
+            }
+            ResolvedFunction::Known(ScalarFunction::Patch) => {
+                let left = values.remove(0); let right = values.remove(0);
+                let EvalValue::Struct(right) = right else { return Err(invalid("_patch")); };
+                let mut fields = rtdb_types::StructFields::new();
+                if let EvalValue::Struct(left) = &left {
+                    for (key, value) in left.iter() {
+                        frame.context.reserve(key.len().checked_add(4096).ok_or_else(overflow)?)?;
+                        fields.insert(key.clone(), clone_value(value, frame)?);
+                    }
+                } else if !is_null(&left) { return Err(invalid("_patch")); }
+                for (key, value) in right.iter() {
+                    if !is_null(value) || !fields.contains_key(key) {
+                        frame.context.reserve(key.len().checked_add(4096).ok_or_else(overflow)?)?;
+                        fields.insert(key.clone(), clone_value(value, frame)?);
+                    }
+                }
+                frame.context.reserve(256)?;
+                return Ok(EvalValue::Struct(Arc::new(fields)));
+            }
+            _ => {}
         }
         frame.context.reserve(values.len().checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?)?;
         let mut materialized = Vec::with_capacity(values.len());
-        for value in values { materialized.push(materialize(value,frame)?.await?); }
-        let result = if frame.asynchronous { crate::functions::scalar_call_async(&name,&materialized,frame.context).await? }
-            else { crate::functions::scalar_call(&name,&materialized,frame.context)? };
-        from_value(result,frame)
-    },frame)
+        for value in values { materialized.push(materialize(value, frame)?.await?); }
+        let result = if frame.asynchronous { crate::functions::call_resolved_async(function, &materialized, frame.context).await? }
+            else { crate::functions::call_resolved(function, &materialized, frame.context)? };
+        from_value(result, frame)
+    }, frame)
 }
 
 

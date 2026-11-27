@@ -3,6 +3,7 @@ use std::{future::Future, pin::Pin, sync::Arc, task::{Context, Poll, Waker}};
 use rtdb_columnar::{ArrowCell, MemoryReservation};
 use rtdb_plan::{BinaryOp, CastTarget, Expr, Schema, UnaryOp};
 use rtdb_types::{Anomaly, ListKind, ListValue, LogicalType, Result, Value};
+use crate::functions::ResolvedFunction;
 use super::invocation::{PreparedList, Replacements};
 use super::{EvalContext, ExpressionRow, boolean, integer, nullish, overflow};
 
@@ -77,6 +78,18 @@ impl<'a> EvaluationFrame<'a> {
 
     fn prepared_list(&self, expr: &Expr) -> Option<&'a PreparedList> {
         self.replacements.and_then(|invocation| invocation.list(expr))
+    }
+
+    fn resolved_call<'b>(&self, expr: &'b Expr, name: &'b str) -> ResolvedFunction<'b> {
+        super::invocation::resolve_call(self.replacements, expr, name)
+    }
+
+    fn dispatch_prepared(&self, expr: &Expr, name: &str, return_type: &LogicalType) -> bool {
+        if let Some(call) = self.replacements.and_then(|invocation| invocation.prepared_call(expr)) {
+            return call.dispatch_prepared;
+        }
+        let function = ResolvedFunction::resolve(name);
+        null_typed(function, return_type) || function.is_prepared_call() || function.is_strict_temporal()
     }
 }
 
@@ -258,45 +271,39 @@ pub(super) fn expression_type(expr: &Expr,schema: &Schema,context: &EvalContext<
     scalar::emitted_type(expr,&EvaluationFrame { schema,row: ExpressionRow::Values(&[]),context,asynchronous: false,replacements: None })
 }
 
-/// Whether `name`, in any case and with hyphens or underscores, is one of `names`, given in their canonical spelling.
-fn named(name: &str, names: &[&str]) -> bool {
-    names.iter().any(|candidate| name.bytes().map(|byte| if byte == b'-' { b'_' } else { byte.to_ascii_lowercase() }).eq(candidate.bytes()))
-}
-
-/// Calls whose null type still comes from their own evaluation.
-const SELF_TYPED_CALLS: [&str; 3] = ["set", "trim_array", "regexp_replace"];
-/// Calls prepared as scalar continuations, beside the ordinary, strict temporal, interval and bitwise ones.
-const PREPARED_CALLS: [&str; 20] = ["nth", "col_description", "pg_indexam_has_property", "mod", "array_upper", "array_lower", "array_length",
-    "generate_series", "range_bins", "date_bin", "is_true", "is_false", "distinct_from", "_meta_double", "get_field", "compare",
-    "compare_nulls_first", "compare_nulls_last", "like", "ilike"];
-/// Calls the collection evaluator computes itself.
-const COLLECTION_CALLS: [&str; 3] = ["_id_eq_any", "set", "trim_array"];
-
 /// A call typed null whose value is the null result, prepared without reading its arguments' values.
-fn null_typed(name: &str, return_type: &LogicalType) -> bool {
-    matches!(return_type, LogicalType::Null | LogicalType::Nothing) && !named(name, &SELF_TYPED_CALLS)
+pub(super) fn null_typed(function: ResolvedFunction<'_>, return_type: &LogicalType) -> bool {
+    matches!(return_type, LogicalType::Null | LogicalType::Nothing) && !function.is_self_typed()
 }
 
-/// A call `evaluate` prepares as a scalar continuation whatever its arguments; strict temporal calls are left out,
-/// since `required` admits them only with arguments.
-fn prepared_call(name: &str) -> bool {
-    scalar::ordinary_call(name) || crate::interval_constructor::is_name(name) || crate::bitwise::is_name(name) || named(name, &PREPARED_CALLS)
-}
-
-pub(super) fn required(expr: &Expr) -> bool {
+pub(super) fn required_with(expr: &Expr, prepared: Option<&Replacements<'_>>) -> bool {
     match expr {
-        Expr::List(_) | Expr::Struct(_) | Expr::RegexReplace {..} => true,
+        Expr::List(_) | Expr::Struct(_) | Expr::RegexReplace { .. } => true,
         Expr::Literal(Value::List(_) | Value::Set(_) | Value::FixedSizeList(_) | Value::Struct(_)) => true,
         Expr::Unary { .. } | Expr::Binary { .. } | Expr::Cast { .. } | Expr::Field { .. } => true,
-        Expr::Call { name, return_type, .. } if null_typed(name, return_type) => true,
-        Expr::Call { name, args, .. } => calls::is_cosine(name) || (!args.is_empty() && crate::temporal_functions::strict_call(name))
-            || prepared_call(name) || named(name, &COLLECTION_CALLS) || args.iter().any(required),
+        Expr::Call { name, args, return_type } => {
+            if let Some(call) = prepared.and_then(|invocation| invocation.prepared_call(expr)) {
+                return call.requires_reader;
+            }
+            let function = ResolvedFunction::resolve(name);
+            null_typed(function, return_type)
+                || function.is_cosine()
+                || (!args.is_empty() && function.is_strict_temporal())
+                || function.is_prepared_call()
+                || function.is_collection_call()
+                || args.iter().any(|arg| required_with(arg, prepared))
+        }
         Expr::Subscript { .. } => true,
         Expr::Case { .. } | Expr::SimpleCase { .. } | Expr::Between { .. } | Expr::Coalesce(_) => true,
-        Expr::In { expr,values, .. } => required(expr) || values.iter().any(required),
+        Expr::In { expr, values, .. } => required_with(expr, prepared) || values.iter().any(|arg| required_with(arg, prepared)),
         Expr::Like { .. } => true,
         _ => false,
     }
+}
+
+#[cfg(test)]
+fn required(expr: &Expr) -> bool {
+    required_with(expr, None)
 }
 
 pub(super) fn execute_sync(expr: &Expr,schema: &Schema,row: ExpressionRow<'_>,context: &EvalContext<'_>) -> Result<Value> {
@@ -772,7 +779,7 @@ fn evaluate<'a>(expr: &'a Expr,frame: &'a EvaluationFrame<'a>) -> Result<Pending
             let value = from_arrow(cell, frame.arrow_backing(expr), frame)?;
             return if matches!(expr, Expr::Field { .. }) { box_cell(value) } else { Ok(value) };
         }
-        if !required(expr) { return evaluate_scalar(expr, frame).await; }
+        if !required_with(expr, frame.replacements) { return evaluate_scalar(expr, frame).await; }
         match expr {
             Expr::List(items) => {
                 let list = frame.prepared_list(expr).map_or(ListReader::Expressions(items), ListReader::Prepared);
@@ -791,9 +798,13 @@ fn evaluate<'a>(expr: &'a Expr,frame: &'a EvaluationFrame<'a>) -> Result<Pending
             Expr::Field { .. } => scalar::prepare(expr,frame)?.await?.demand().await,
             Expr::Subscript { .. } | Expr::RegexReplace {..} => scalar::prepare(expr,frame)?.await?.demand().await,
             Expr::Coalesce(_) | Expr::Case { .. } | Expr::SimpleCase { .. } | Expr::Between { .. } | Expr::Cast { .. } => scalar::prepare(expr,frame)?.await?.demand().await,
-            Expr::Call { name, return_type, .. } if null_typed(name, return_type) || prepared_call(name) || crate::temporal_functions::strict_call(name) =>
-                scalar::prepare(expr,frame)?.await?.demand().await,
-            Expr::Call { name,args, .. } => calls::call(expr,name,args,frame)?.await,
+            Expr::Call { name, args, return_type } => {
+                if frame.dispatch_prepared(expr, name, return_type) {
+                    scalar::prepare(expr, frame)?.await?.demand().await
+                } else {
+                    calls::call(expr, name, args, frame)?.await
+                }
+            }
             Expr::Unary { .. } | Expr::Binary { .. } => scalar::prepare(expr,frame)?.await?.demand().await,
             Expr::In { expr,values,negated } => {
                 let value = evaluate(expr,frame)?.await?;
@@ -816,8 +827,8 @@ async fn evaluate_scalar<'a>(expr: &Expr, frame: &'a EvaluationFrame<'a>) -> Res
 }
 
 async fn scalar_value(expr: &Expr, frame: &EvaluationFrame<'_>) -> Result<Value> {
-    if frame.asynchronous { super::evaluate_async_inner(expr,frame.schema,frame.row,frame.context).await }
-    else { super::evaluate_inner(expr,frame.schema,frame.row,frame.context) }
+    if frame.asynchronous { super::evaluate_async_inner(expr,frame.schema,frame.row,frame.context,frame.replacements).await }
+    else { super::evaluate_inner(expr,frame.schema,frame.row,frame.context,frame.replacements) }
 }
 
 #[cfg(test)]
@@ -850,13 +861,14 @@ mod tests {
     #[test]
     fn dispatch_reads_every_spelling_of_a_call_name_alike() {
         let call = |name: &str| Expr::Call { name: name.into(), args: vec![], return_type: LogicalType::Scalar(rtdb_types::ScalarType::I64) };
+        let prepared_call = |name: &str| ResolvedFunction::resolve(name).is_prepared_call();
         for (hyphenated, underscored) in [("trim-array", "TRIM_ARRAY"), ("compare-nulls-first", "Compare_Nulls_First"), ("_meta-double", "_META_DOUBLE"), ("date-bin", "date_bin")] {
             assert!(required(&call(hyphenated)) && required(&call(underscored)), "{hyphenated} / {underscored}");
             assert_eq!(prepared_call(hyphenated), prepared_call(underscored), "{hyphenated} / {underscored}");
-            assert_eq!(null_typed(hyphenated, &LogicalType::Null), null_typed(underscored, &LogicalType::Null), "{hyphenated} / {underscored}");
+            assert_eq!(null_typed(ResolvedFunction::resolve(hyphenated), &LogicalType::Null), null_typed(ResolvedFunction::resolve(underscored), &LogicalType::Null), "{hyphenated} / {underscored}");
         }
-        assert!(!null_typed("Regexp-Replace", &LogicalType::Null));
-        assert!(null_typed("upper", &LogicalType::Nothing));
+        assert!(!null_typed(ResolvedFunction::resolve("Regexp-Replace"), &LogicalType::Null));
+        assert!(null_typed(ResolvedFunction::resolve("upper"), &LogicalType::Nothing));
         assert!(!prepared_call("_id_eq_any") && required(&call("_id-eq-any")));
     }
 }

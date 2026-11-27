@@ -24,18 +24,94 @@ fn language_or_root(language: Result<String>) -> rtdb_types::CaseLanguage {
 /// Fixes the process defaults the evaluator reads at startup, as the JVM does.
 pub fn host_defaults() { let _ = case_language(); }
 
-pub(crate) fn call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Option<Result<Value>> {
-    if matches!(name,"like" | "ilike") { return Some(pattern::like(&args[0],&args[1],None,name == "ilike",false,context)); }
-    if !matches!(name, "str" | "format" | "concat" | "trim" | "trim_leading" | "trim_trailing" | "substring" | "overlay" | "position" | "octet_position" | "character_length" | "octet_length" | "default_overlay_length" | "replace" | "reverse" | "string_to_array" | "parse_ident" | "quote_ident") { return None; }
-    Some((|| {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StringFunction {
+    Like,
+    Ilike,
+    Str,
+    Format,
+    Concat,
+    Trim,
+    TrimLeading,
+    TrimTrailing,
+    Substring,
+    Overlay,
+    Position,
+    OctetPosition,
+    CharacterLength,
+    OctetLength,
+    DefaultOverlayLength,
+    Replace,
+    Reverse,
+    StringToArray,
+    ParseIdent,
+    QuoteIdent,
+}
+
+impl StringFunction {
+    pub(crate) fn from_canonical(name: &str) -> Option<Self> {
+        Some(match name {
+            "like" => Self::Like,
+            "ilike" => Self::Ilike,
+            "str" => Self::Str,
+            "format" => Self::Format,
+            "concat" => Self::Concat,
+            "trim" => Self::Trim,
+            "trim_leading" => Self::TrimLeading,
+            "trim_trailing" => Self::TrimTrailing,
+            "substring" => Self::Substring,
+            "overlay" => Self::Overlay,
+            "position" => Self::Position,
+            "octet_position" => Self::OctetPosition,
+            "character_length" => Self::CharacterLength,
+            "octet_length" => Self::OctetLength,
+            "default_overlay_length" => Self::DefaultOverlayLength,
+            "replace" => Self::Replace,
+            "reverse" => Self::Reverse,
+            "string_to_array" => Self::StringToArray,
+            "parse_ident" => Self::ParseIdent,
+            "quote_ident" => Self::QuoteIdent,
+            _ => return None,
+        })
+    }
+
+    pub(crate) fn canonical_name(self) -> &'static str {
+        match self {
+            Self::Like => "like",
+            Self::Ilike => "ilike",
+            Self::Str => "str",
+            Self::Format => "format",
+            Self::Concat => "concat",
+            Self::Trim => "trim",
+            Self::TrimLeading => "trim_leading",
+            Self::TrimTrailing => "trim_trailing",
+            Self::Substring => "substring",
+            Self::Overlay => "overlay",
+            Self::Position => "position",
+            Self::OctetPosition => "octet_position",
+            Self::CharacterLength => "character_length",
+            Self::OctetLength => "octet_length",
+            Self::DefaultOverlayLength => "default_overlay_length",
+            Self::Replace => "replace",
+            Self::Reverse => "reverse",
+            Self::StringToArray => "string_to_array",
+            Self::ParseIdent => "parse_ident",
+            Self::QuoteIdent => "quote_ident",
+        }
+    }
+
+    pub(crate) fn eval(self, args: &[Value], context: &EvalContext<'_>) -> Result<Value> {
+        if matches!(self, Self::Like | Self::Ilike) {
+            return pattern::like(&args[0], &args[1], None, self == Self::Ilike, false, context);
+        }
         let input_bytes = args.iter().try_fold(1024usize, |bytes, value| bytes.checked_add(value.retained_bytes()?).ok_or_else(overflow))?;
         context.reserve(input_bytes.checked_mul(16).ok_or_else(overflow)?)?;
-        if name == "format" { return format::format(args, context); }
-        if name == "str" {
+        if self == Self::Format { return format::format(args, context); }
+        if self == Self::Str {
             let parts = args.iter().map(|value| if nullish(value) { Ok(String::new()) } else { scalar_text(value, context) }).collect::<Result<Vec<_>>>()?;
             return Ok(Value::Utf8(concat_text(&parts)?));
         }
-        if name == "string_to_array" {
+        if self == Self::StringToArray {
             if nullish(&args[0]) { return Ok(Value::Null); }
             let source = text(&args[0])?;
             context.reserve(source.len().checked_mul(std::mem::size_of::<Value>() * 2 + 64).and_then(|bytes| bytes.checked_add(256)).ok_or_else(overflow)?)?;
@@ -46,20 +122,20 @@ pub(crate) fn call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Opt
         }
         if args.iter().any(nullish) { return Ok(Value::Null); }
         let binary = matches!(args[0], Value::Binary(_));
-        Ok(match name {
-            "concat" => {
+        Ok(match self {
+            Self::Concat => {
                 let length = args.iter().try_fold(0usize, |length, value| add(length, bytes(value)?.len()))?;
                 let mut output = Vec::with_capacity(length);
                 for value in args { output.extend_from_slice(bytes(value)?); }
                 from_bytes(output, binary)?
             }
-            "substring" => {
+            Self::Substring => {
                 let position = int(&args[1])?;
                 let length = args.get(2).map(int).transpose()?;
                 let source = bytes(&args[0])?;
                 from_bytes(substring(source, position, length, !binary)?.to_vec(), binary)?
             }
-            "overlay" => {
+            Self::Overlay => {
                 let source = bytes(&args[0])?;
                 let placing = bytes(&args[1])?;
                 let start = int(&args[2])?;
@@ -70,16 +146,16 @@ pub(crate) fn call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Opt
                 output.extend_from_slice(prefix); output.extend_from_slice(placing); output.extend_from_slice(suffix);
                 from_bytes(output, binary)?
             }
-            "position" | "octet_position" => {
+            Self::Position | Self::OctetPosition => {
                 let needle = bytes(&args[0])?;
                 let haystack = bytes(&args[1])?;
                 let position = if needle.is_empty() { Some(0) } else { haystack.windows(needle.len()).position(|candidate| candidate == needle) };
-                count(position.map_or(0, |index| if name == "position" { utf8_length(&haystack[..index]) + 1 } else { index + 1 }))?
+                count(position.map_or(0, |index| if self == Self::Position { utf8_length(&haystack[..index]) + 1 } else { index + 1 }))?
             }
-            "character_length" => count(utf8_length(bytes(&args[0])?))?,
-            "default_overlay_length" => count(if binary { bytes(&args[0])?.len() } else { utf8_length(bytes(&args[0])?) })?,
-            "octet_length" => count(bytes(&args[0])?.len())?,
-            "trim" | "trim_leading" | "trim_trailing" => {
+            Self::CharacterLength => count(utf8_length(bytes(&args[0])?))?,
+            Self::DefaultOverlayLength => count(if binary { bytes(&args[0])?.len() } else { utf8_length(bytes(&args[0])?) })?,
+            Self::OctetLength => count(bytes(&args[0])?.len())?,
+            Self::Trim | Self::TrimLeading | Self::TrimTrailing => {
                 if binary {
                     let source = bytes(&args[0])?;
                     let octet = match args.get(1) {
@@ -87,20 +163,20 @@ pub(crate) fn call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Opt
                         Some(value) => numeric_octet(value)?,
                         None => b' ',
                     };
-                    let start = if name == "trim_trailing" { 0 } else { source.iter().position(|byte| *byte != octet).unwrap_or(source.len()) };
-                    let end = if name == "trim_leading" { source.len() } else { source.iter().rposition(|byte| *byte != octet).map_or(0, |index| index + 1) };
+                    let start = if self == Self::TrimTrailing { 0 } else { source.iter().position(|byte| *byte != octet).unwrap_or(source.len()) };
+                    let end = if self == Self::TrimLeading { source.len() } else { source.iter().rposition(|byte| *byte != octet).map_or(0, |index| index + 1) };
                     Value::Binary(source[start.min(end)..end].to_vec())
                 } else {
                     let source = text(&args[0])?;
                     let trim = args.get(1).map(text).transpose()?.unwrap_or(" ");
                     let mut characters = trim.chars();
                     let character = characters.next().filter(|_| characters.next().is_none()).ok_or_else(|| Anomaly::incorrect("xtdb.expression/data-exception", "Data Exception - trim error."))?;
-                    let source = if name == "trim_trailing" { source } else { source.trim_start_matches(character) };
-                    let source = if name == "trim_leading" || character.len_utf16() == 2 { source } else { source.trim_end_matches(character) };
+                    let source = if self == Self::TrimTrailing { source } else { source.trim_start_matches(character) };
+                    let source = if self == Self::TrimLeading || character.len_utf16() == 2 { source } else { source.trim_end_matches(character) };
                     Value::Utf8(source.into())
                 }
             }
-            "replace" => {
+            Self::Replace => {
                 let source = text(&args[0])?;
                 let target = text(&args[1])?;
                 let replacement = text(&args[2])?;
@@ -121,16 +197,16 @@ pub(crate) fn call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Opt
                     Value::Utf8(source.replace(target, replacement))
                 }
             }
-            "reverse" => Value::Utf8(text(&args[0])?.chars().rev().collect()),
-            "parse_ident" => {
+            Self::Reverse => Value::Utf8(text(&args[0])?.chars().rev().collect()),
+            Self::ParseIdent => {
                 let source = text(&args[0])?;
                 context.reserve(source.len().checked_mul(std::mem::size_of::<Value>() * 2 + 64).and_then(|bytes| bytes.checked_add(256)).ok_or_else(overflow)?)?;
                 Value::list(parse_ident(source)?.into_iter().map(Value::Utf8).collect())
             }
-            "quote_ident" => Value::Utf8(quote_ident(text(&args[0])?)),
-            _ => unreachable!(),
+            Self::QuoteIdent => Value::Utf8(quote_ident(text(&args[0])?)),
+            Self::Like | Self::Ilike | Self::Str | Self::Format | Self::StringToArray => unreachable!(),
         })
-    })())
+    }
 }
 
 fn scalar_text(value: &Value, context: &EvalContext<'_>) -> Result<String> {

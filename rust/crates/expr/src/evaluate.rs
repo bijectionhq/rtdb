@@ -1,5 +1,5 @@
 use rtdb_types::StructFields;
-use crate::{arithmetic_in_timezone, compare::predicate_order, functions::scalar_call};
+use crate::{arithmetic_in_timezone, compare::predicate_order};
 use crate::compare::{nullish,sql_eq_scoped,sql_not_eq_scoped};
 use crate::numeric::{inapplicable, integer, integer_value, number, overflow};
 use arrow_array::RecordBatch;
@@ -310,7 +310,7 @@ fn unary_value(op: UnaryOp, value: Value) -> Result<Value> {
             } else { Err(inapplicable("negate", &[&value])) }
         }
         UnaryOp::BitNot => {
-            crate::bitwise::call("bit_not", &[value]).unwrap()
+            crate::bitwise::BitwiseFunction::BitNot.eval(&[value])
         }
     }
 }
@@ -383,8 +383,8 @@ fn borrowed_cosine_columns(args: &[Expr], schema: &Schema, row: ExpressionRow<'_
 }
 
 macro_rules! expression_body {
-    ($expression:expr, $input_schema:expr, $input_row:expr, $inputs:expr, $eval:ident, $call:ident, $reader:ident) => {{
-    let (expr, schema, row, context) = ($expression, $input_schema, $input_row, $inputs);
+    ($expression:expr, $input_schema:expr, $input_row:expr, $inputs:expr, $prepared:expr, $eval:ident, $call:ident, $reader:ident) => {{
+    let (expr, schema, row, context, replacements) = ($expression, $input_schema, $input_row, $inputs, $prepared);
     match expr {
         Expr::Literal(value) => retained_clone(value, context),
         Expr::DurationLiteral(value) => {
@@ -423,52 +423,60 @@ macro_rules! expression_body {
             }
             binary_value(*op,left,right,context)
         }
-        Expr::Call { name, args, .. } if name == "coalesce" => {
-            for expr in args { let value = $eval!(expr)?; if !nullish(&value) { return Ok(value); } }
-            Ok(Value::Null)
-        }
-        Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("date_bin") || name.eq_ignore_ascii_case("date-bin") => {
-            let stride = $eval!(&args[0])?;
-            let origin = if let Some(origin) = args.get(2) { $eval!(origin)? } else { Value::Timestamp { value: 0,unit: rtdb_types::TimeUnit::Microsecond,timezone: Some("UTC".into()) } };
-            if nullish(&stride) || nullish(&origin) { return Ok(Value::Null); }
-            let source = $eval!(&args[1])?;
-            $call!(name, &[stride,source,origin])
-        }
-        Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("concat") => {
-            context.reserve(args.len().checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?)?;
-            let mut values = Vec::with_capacity(args.len());
-            for expr in args {
-                let value = $eval!(expr)?;
-                if nullish(&value) { return Ok(Value::Null); }
-                values.push(value);
-            }
-            $call!(name, &values)
-        }
-        Expr::Call { name, args, .. } if name == "nullif" => {
-            let mut left = $eval!(&args[0])?;
-            let mut right = $eval!(&args[1])?;
-            coerce_comparison_literals(false, matches!(&args[1], Expr::Literal(Value::Utf8(_))), &mut left, &mut right, context.timezone)?;
-            Ok(if sql_eq_scoped(&left, &right, context.timezone, context.allocation)? == Some(true) { Value::Null } else { left })
-        }
-        Expr::Call { name, args, .. } if name == "greatest" || name == "least" => {
-            let Some(first) = args.first() else { return Ok(Value::Null); };
-            let mut best = $eval!(first)?;
-            for expr in &args[1..] {
-                if nullish(&best) { return Ok(Value::Null); }
-                best = $call!(name, &[best, $eval!(expr)?])?;
-            }
-            Ok(best)
-        }
         Expr::Call { name, args, .. } => {
-            if (name.eq_ignore_ascii_case("cosine_distance") || name.eq_ignore_ascii_case("cosine-distance"))
-                && let Some(score) = borrowed_cosine_columns(args, schema, row)
-            {
-                return Ok(score);
+            use crate::functions::{ResolvedFunction, ScalarFunction};
+            use crate::string::StringFunction;
+            use crate::temporal_functions::TemporalFunction;
+            let function = invocation::resolve_call(replacements, expr, name);
+            match function {
+                ResolvedFunction::Known(ScalarFunction::Coalesce) => {
+                    for expr in args { let value = $eval!(expr)?; if !nullish(&value) { return Ok(value); } }
+                    Ok(Value::Null)
+                }
+                ResolvedFunction::Known(ScalarFunction::Temporal(TemporalFunction::DateBin)) => {
+                    let stride = $eval!(&args[0])?;
+                    let origin = if let Some(origin) = args.get(2) { $eval!(origin)? } else { Value::Timestamp { value: 0,unit: rtdb_types::TimeUnit::Microsecond,timezone: Some("UTC".into()) } };
+                    if nullish(&stride) || nullish(&origin) { return Ok(Value::Null); }
+                    let source = $eval!(&args[1])?;
+                    $call!(function, &[stride,source,origin])
+                }
+                ResolvedFunction::Known(ScalarFunction::String(StringFunction::Concat)) => {
+                    context.reserve(args.len().checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?)?;
+                    let mut values = Vec::with_capacity(args.len());
+                    for expr in args {
+                        let value = $eval!(expr)?;
+                        if nullish(&value) { return Ok(Value::Null); }
+                        values.push(value);
+                    }
+                    $call!(function, &values)
+                }
+                ResolvedFunction::Known(ScalarFunction::Nullif) => {
+                    let mut left = $eval!(&args[0])?;
+                    let mut right = $eval!(&args[1])?;
+                    coerce_comparison_literals(false, matches!(&args[1], Expr::Literal(Value::Utf8(_))), &mut left, &mut right, context.timezone)?;
+                    Ok(if sql_eq_scoped(&left, &right, context.timezone, context.allocation)? == Some(true) { Value::Null } else { left })
+                }
+                ResolvedFunction::Known(ScalarFunction::Greatest | ScalarFunction::Least) => {
+                    let Some(first) = args.first() else { return Ok(Value::Null); };
+                    let mut best = $eval!(first)?;
+                    for expr in &args[1..] {
+                        if nullish(&best) { return Ok(Value::Null); }
+                        best = $call!(function, &[best, $eval!(expr)?])?;
+                    }
+                    Ok(best)
+                }
+                function => {
+                    if function == ResolvedFunction::Known(ScalarFunction::CosineDistance)
+                        && let Some(score) = borrowed_cosine_columns(args, schema, row)
+                    {
+                        return Ok(score);
+                    }
+                    context.reserve(args.len().checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?)?;
+                    let mut values = Vec::with_capacity(args.len());
+                    for argument in args { values.push($eval!(argument)?); }
+                    $call!(function, &values)
+                }
             }
-            context.reserve(args.len().checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?)?;
-            let mut values = Vec::with_capacity(args.len());
-            for argument in args { values.push($eval!(argument)?); }
-            $call!(name, &values)
         }
         Expr::Cast { expr, target } => {
             let value = $eval!(expr)?;
@@ -485,7 +493,7 @@ macro_rules! expression_body {
             Ok(Value::Null)
         }
         Expr::Field { expr, name, .. } => crate::field::get(&$eval!(expr)?,Some(name),context),
-        Expr::Subscript { expr, index, .. } => $call!("nth", &[$eval!(expr)?, $eval!(index)?]),
+        Expr::Subscript { expr, index, .. } => $call!(crate::functions::ResolvedFunction::Known(crate::functions::ScalarFunction::Nth), &[$eval!(expr)?, $eval!(index)?]),
         Expr::List(items) => {
             context.reserve(items.len().checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?)?;
             let mut values = rtdb_types::ListBuilder::with_capacity(items.len());
@@ -533,11 +541,14 @@ pub fn evaluate(expr: &Expr, schema: &Schema, row: &[Value], context: &EvalConte
     ExpressionInvocation::prepare(expr,schema,context)?.evaluate(row,context)
 }
 
-fn evaluate_inner(expr: &Expr, schema: &Schema, row: ExpressionRow<'_>, context: &EvalContext<'_>) -> Result<Value> {
-    macro_rules! eval { ($child:expr) => { evaluate_inner($child, schema, row, context) }; }
-    macro_rules! call { ($name:expr, $args:expr) => { scalar_call($name, $args, context) }; }
-    macro_rules! reader { ($expression:expr) => { reader::execute_sync($expression,schema,row,context) }; }
-    expression_body!(expr, schema, row, context, eval, call, reader)
+fn evaluate_inner(expr: &Expr, schema: &Schema, row: ExpressionRow<'_>, context: &EvalContext<'_>, replacements: Option<&invocation::Replacements<'_>>) -> Result<Value> {
+    macro_rules! eval { ($child:expr) => { evaluate_inner($child, schema, row, context, replacements) }; }
+    macro_rules! call { ($function:expr, $args:expr) => { crate::functions::call_resolved($function, $args, context) }; }
+    macro_rules! reader { ($expression:expr) => { match replacements {
+        Some(replacements) => reader::execute_sync_prepared($expression, schema, row, context, replacements),
+        None => reader::execute_sync($expression, schema, row, context),
+    } }; }
+    expression_body!(expr, schema, row, context, replacements, eval, call, reader)
 }
 
 /// Evaluates on the caller's future, suspending for reached SLEEP calls and yielding during temporal series construction.
@@ -547,17 +558,20 @@ pub async fn evaluate_async(expr: &Expr, schema: &Schema, row: &[Value], context
     ExpressionInvocation::prepare(expr,schema,context)?.evaluate_async(row,context).await
 }
 
-async fn evaluate_async_inner(expr: &Expr, schema: &Schema, row: ExpressionRow<'_>, context: &EvalContext<'_>) -> Result<Value> {
-    if !expr.requires_suspension() { return evaluate_inner(expr, schema, row, context); }
-    evaluate_suspending(expr, schema, row, context)?.await
+async fn evaluate_async_inner(expr: &Expr, schema: &Schema, row: ExpressionRow<'_>, context: &EvalContext<'_>, replacements: Option<&invocation::Replacements<'_>>) -> Result<Value> {
+    if !expr.requires_suspension() { return evaluate_inner(expr, schema, row, context, replacements); }
+    evaluate_suspending(expr, schema, row, context, replacements)?.await
 }
 
-fn evaluate_suspending<'a>(expr: &'a Expr, schema: &'a Schema, row: ExpressionRow<'a>, context: &'a EvalContext<'a>) -> Result<std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send + 'a>>> {
+fn evaluate_suspending<'a>(expr: &'a Expr, schema: &'a Schema, row: ExpressionRow<'a>, context: &'a EvalContext<'a>, replacements: Option<&'a invocation::Replacements<'a>>) -> Result<std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send + 'a>>> {
     let future = async move {
-        macro_rules! eval { ($child:expr) => { evaluate_async_inner($child, schema, row, context).await }; }
-        macro_rules! call { ($name:expr, $args:expr) => { crate::functions::scalar_call_async($name, $args, context).await }; }
-        macro_rules! reader { ($expression:expr) => { reader::execute_async($expression,schema,row,context).await }; }
-        expression_body!(expr, schema, row, context, eval, call, reader)
+        macro_rules! eval { ($child:expr) => { evaluate_async_inner($child, schema, row, context, replacements).await }; }
+        macro_rules! call { ($function:expr, $args:expr) => { crate::functions::call_resolved_async($function, $args, context).await }; }
+        macro_rules! reader { ($expression:expr) => { match replacements {
+            Some(replacements) => reader::execute_async_prepared($expression, schema, row, context, replacements).await,
+            None => reader::execute_async($expression, schema, row, context).await,
+        } }; }
+        expression_body!(expr, schema, row, context, replacements, eval, call, reader)
     };
     context.reserve(std::mem::size_of_val(&future).checked_add(256).ok_or_else(overflow)?)?;
     Ok(Box::pin(future))

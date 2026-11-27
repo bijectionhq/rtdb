@@ -4,45 +4,83 @@ use crate::numeric::integer;
 use rtdb_text::{Analyzer, Corpus, Query, Scorer, stored_length};
 use rtdb_types::{Anomaly, Result, Value, text_pair_fingerprint};
 
-/// Only the UTF-8 leg of a column is indexed, so any other value matches nothing and scores nothing.
-pub(crate) fn call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Option<Result<Value>> {
-    if !matches!(
-        name,
-        "match" | "search_score" | "search_length" | "search_terms" | "search_corpus_fingerprint"
-            | "search_token_count" | "search_term_matches"
-    ) {
-        return None;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SearchFunction {
+    Match,
+    SearchScore,
+    SearchLength,
+    SearchTerms,
+    SearchCorpusFingerprint,
+    SearchTokenCount,
+    SearchTermMatches,
+}
+
+impl SearchFunction {
+    pub(crate) fn from_canonical(name: &str) -> Option<Self> {
+        Some(match name {
+            "match" => Self::Match,
+            "search_score" => Self::SearchScore,
+            "search_length" => Self::SearchLength,
+            "search_terms" => Self::SearchTerms,
+            "search_corpus_fingerprint" => Self::SearchCorpusFingerprint,
+            "search_token_count" => Self::SearchTokenCount,
+            "search_term_matches" => Self::SearchTermMatches,
+            _ => return None,
+        })
     }
-    Some((|| {
+
+    pub(crate) fn canonical_name(self) -> &'static str {
+        match self {
+            Self::Match => "match",
+            Self::SearchScore => "search_score",
+            Self::SearchLength => "search_length",
+            Self::SearchTerms => "search_terms",
+            Self::SearchCorpusFingerprint => "search_corpus_fingerprint",
+            Self::SearchTokenCount => "search_token_count",
+            Self::SearchTermMatches => "search_term_matches",
+        }
+    }
+
+    fn analyzer_index(self, arity: usize) -> Option<usize> {
+        match (self, arity) {
+            (Self::Match | Self::SearchScore | Self::SearchTermMatches, 3)
+            | (Self::SearchTerms | Self::SearchLength | Self::SearchTokenCount, 2) => Some(arity - 1),
+            (Self::SearchScore, 6) => Some(5),
+            _ => None,
+        }
+    }
+
+    /// Only the UTF-8 leg of a column is indexed, so any other value matches nothing and scores nothing.
+    pub(crate) fn eval(self, args: &[Value], context: &EvalContext<'_>) -> Result<Value> {
         if args.iter().any(nullish) {
             return Ok(Value::Null);
         }
-        let (analyzer, args) = match rtdb_plan::analyzer_index(name, args.len()) {
+        let (analyzer, args) = match self.analyzer_index(args.len()) {
             Some(index) => match &args[index] {
                 Value::Utf8(analyzer) => (rtdb_plan::parse_analyzer(analyzer)?, &args[..index]),
-                _ => return Err(Anomaly::incorrect("xtdb.expression/type-error", format!("The analyzer argument to `{name}` must be a string"))),
+                _ => return Err(Anomaly::incorrect("xtdb.expression/type-error", format!("The analyzer argument to `{}` must be a string", self.canonical_name()))),
             },
             None => (Analyzer::Simple, args),
         };
-        match (name, args) {
-            ("search_terms", [Value::Utf8(query)]) => {
+        match (self, args) {
+            (Self::SearchTerms, [Value::Utf8(query)]) => {
                 let query = parse_query(query, analyzer, context)?;
                 Ok(Value::list(
                     query.terms().iter().cloned().map(Value::Utf8).collect(),
                 ))
             }
-            ("search_length" | "search_token_count", [Value::Utf8(text)]) => {
+            (Self::SearchLength | Self::SearchTokenCount, [Value::Utf8(text)]) => {
                 let count = analyzer.count_tokens(text);
                 context.reserve(count.arrow_bytes().saturating_add(256))?;
-                Ok(Value::I64(if name == "search_length" { i64::from(stored_length(count.len())) } else { count.len() as i64 }))
+                Ok(Value::I64(if self == Self::SearchLength { i64::from(stored_length(count.len())) } else { count.len() as i64 }))
             }
-            ("search_term_matches", [Value::Utf8(text), Value::Utf8(query)]) => {
+            (Self::SearchTermMatches, [Value::Utf8(text), Value::Utf8(query)]) => {
                 let query = parse_query(query, analyzer, context)?;
                 let (count, frequencies, _) = query.text_terms(text, false);
                 context.reserve(count.arrow_bytes().saturating_add(256))?;
                 Ok(Value::list(frequencies.into_iter().map(|count| Value::Bool(count != 0)).collect()))
             }
-            ("search_corpus_fingerprint", [Value::List(ids), Value::List(bodies)]) => {
+            (Self::SearchCorpusFingerprint, [Value::List(ids), Value::List(bodies)]) => {
                 if ids.is_empty() || ids.len() != bodies.len() {
                     return Err(invalid_documents());
                 }
@@ -50,23 +88,28 @@ pub(crate) fn call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Opt
                 let pairs = (0..ids.len()).map(|i| ids.utf8(i).zip(bodies.utf8(i)).ok_or_else(invalid_documents));
                 Ok(Value::Binary(text_pair_fingerprint(pairs)?.into()))
             }
-            ("match", [text, Value::Utf8(query)]) => {
+            (Self::Match, [text, Value::Utf8(query)]) => {
                 let (_, _, matched) = document_terms(&Query::analyzed(analyzer, query), text, true, context)?;
                 Ok(Value::Bool(matched))
             }
-            ("search_score", [text, Value::Utf8(query)]) => {
+            (Self::SearchScore, [text, Value::Utf8(query)]) => {
                 let query = Query::analyzed(analyzer, query);
                 let (length, frequencies, _) = document_terms(&query, text, false, context)?;
                 Ok(Value::F64(Scorer::new(query, None).score(&frequencies, length)))
             }
-            ("search_score", [text, Value::Utf8(query), documents, total, frequencies]) => {
+            (Self::SearchScore, [text, Value::Utf8(query), documents, total, frequencies]) => {
                 let query = parse_query(query, analyzer, context)?;
                 let (length, counts, _) = document_terms(&query, text, false, context)?;
                 Ok(Value::F64(search_corpus_scorer(query, documents, total, frequencies)?.score(&counts, length)))
             }
             _ => Ok(Value::Null),
         }
-    })())
+    }
+}
+
+#[cfg(test)]
+fn call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Option<Result<Value>> {
+    SearchFunction::from_canonical(name).map(|function| function.eval(args, context))
 }
 
 fn invalid_documents() -> Anomaly {
