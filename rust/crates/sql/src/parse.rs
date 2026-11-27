@@ -264,6 +264,7 @@ pub(crate) struct TemporalClause {
     pub owner_end: Location,
     pub system: bool,
     pub clamp: bool,
+    pub portion: bool,
     pub extent: TemporalExtent,
 }
 
@@ -421,7 +422,7 @@ pub(super) fn parse_statement_syntax<'input>(
         let table = parser.parse_object_name(false).map_err(|error| parser_error(error, sql, slice[0].span))?;
         if patch {
             let end = table.0.last().and_then(ast::ObjectNamePart::as_ident).map(|name| name.span.end);
-            if temporal.iter().any(|clause| Some(clause.owner_end) == end && matches!(clause.extent, TemporalExtent::All)) {
+            if temporal.iter().any(|clause| Some(clause.owner_end) == end && (clause.system || clause.clamp || !matches!(clause.extent, TemporalExtent::FromTo(_, _)))) {
                 return Err(sql_error("PATCH valid time requires FROM with an optional TO", sql, slice[0].span));
             }
         }
@@ -566,7 +567,8 @@ pub(crate) fn extract_temporal(tokens: Vec<TokenWithSpan>, source: &str) -> Resu
         let mut at = index + 1;
         let leading_all = word(tokens.get(at), "ALL");
         if leading_all { at += 1; }
-        if word(tokens.get(at), "PORTION") {
+        let portion = word(tokens.get(at), "PORTION");
+        if portion {
             at += 1;
             if !word(tokens.get(at), "OF") { return Err(sql_error("Expected OF after PORTION", source, tokens[start].span)); }
             at += 1;
@@ -574,9 +576,30 @@ pub(crate) fn extract_temporal(tokens: Vec<TokenWithSpan>, source: &str) -> Resu
         let system = word(tokens.get(at), "SYSTEM_TIME");
         if !system && !word(tokens.get(at), "VALID_TIME") { output.push(tokens[index].clone()); index += 1; continue; }
         at += 1;
+        if leading_all && portion {
+            return Err(sql_error("FOR ALL cannot be combined with PORTION OF", source, tokens[start].span));
+        }
+        if portion && system {
+            return Err(sql_error("FOR PORTION OF only applies to VALID_TIME", source, tokens[start].span));
+        }
+        let starts_extent = word(tokens.get(at), "ALL")
+            || word(tokens.get(at), "ONLY")
+            || (word(tokens.get(at), "AS") && word(tokens.get(at + 1), "OF"))
+            || word(tokens.get(at), "FROM")
+            || word(tokens.get(at), "BETWEEN");
+        if !leading_all && !portion && !starts_extent {
+            output.push(tokens[index].clone());
+            index += 1;
+            continue;
+        }
         let owner_end = output.last().filter(|token| matches!(token.token, Token::Word(_))).map(|token| token.span.end).ok_or_else(|| sql_error("Temporal clause must follow a table name", source, tokens[start].span))?;
         let clamp = word(tokens.get(at), "ONLY");
-        if clamp { at += 1; }
+        if clamp {
+            if leading_all || portion || system {
+                return Err(sql_error("ONLY only applies to FOR VALID_TIME FROM ... TO ...", source, tokens[start].span));
+            }
+            at += 1;
+        }
         let extent = if leading_all { TemporalExtent::All }
         else if word(tokens.get(at), "ALL") { at += 1; TemporalExtent::All }
         else if word(tokens.get(at), "AS") && word(tokens.get(at + 1), "OF") {
@@ -596,8 +619,14 @@ pub(crate) fn extract_temporal(tokens: Vec<TokenWithSpan>, source: &str) -> Resu
             let (to, used) = expression(&tokens[at..], source, 20)?; at += used;
             TemporalExtent::Between(from, to)
         } else { return Err(sql_error("Invalid temporal extent", source, tokens[start].span)); };
+        if clamp && !matches!(extent, TemporalExtent::FromTo(_, Some(_))) {
+            return Err(sql_error("FOR VALID_TIME ONLY requires FROM ... TO ...", source, tokens[start].span));
+        }
+        if portion && !matches!(extent, TemporalExtent::FromTo(_, _)) {
+            return Err(sql_error("FOR PORTION OF VALID_TIME requires FROM ... [TO ...]", source, tokens[start].span));
+        }
         if temporal.iter().any(|previous: &TemporalClause| previous.owner_end == owner_end && previous.system == system) { return Err(sql_error("Duplicate temporal dimension", source, tokens[start].span)); }
-        temporal.push(TemporalClause { owner_end, system, clamp, extent });
+        temporal.push(TemporalClause { owner_end, system, clamp, portion, extent });
         index = at;
     }
     Ok((output, temporal))

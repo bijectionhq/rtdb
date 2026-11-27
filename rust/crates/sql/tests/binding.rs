@@ -439,3 +439,66 @@ fn repeated_submissions_prepare_the_same_static_source_or_error_each_time() {
         }
     }
 }
+
+#[test]
+fn temporal_period_specifications_follow_xtdb_grammar_and_reject_misplaced_clauses() {
+    let options = PrepareOptions::default();
+    for rejected in [
+        // Misplaced temporal clauses that previously vanished silently.
+        "SELECT * FROM foo AS f FOR ALL VALID_TIME",
+        "SELECT * FROM foo f FOR ALL VALID_TIME",
+        "SELECT * FROM (SELECT 1) AS x FOR ALL VALID_TIME",
+        "INSERT INTO foo FOR ALL VALID_TIME (_id) VALUES (1)",
+        "UPDATE foo AS f FOR PORTION OF VALID_TIME FROM DATE '2020-01-01' TO DATE '2021-01-01' SET price = 1",
+        "DELETE FROM foo AS f FOR ALL VALID_TIME",
+        "ERASE FROM foo AS f FOR ALL VALID_TIME",
+        "CREATE TABLE foo FOR ALL VALID_TIME (a INT)",
+        // Invalid ONLY combinations.
+        "SELECT * FROM foo FOR SYSTEM_TIME ONLY FROM DATE '2020-01-01' TO DATE '2021-01-01'",
+        "SELECT * FROM foo FOR VALID_TIME ONLY ALL",
+        "SELECT * FROM foo FOR VALID_TIME ONLY AS OF DATE '2020-01-01'",
+        "SELECT * FROM foo FOR VALID_TIME ONLY BETWEEN DATE '2020-01-01' AND DATE '2021-01-01'",
+        "SELECT * FROM foo FOR VALID_TIME ONLY FROM DATE '2020-01-01'",
+        "SELECT * FROM foo FOR ALL VALID_TIME ONLY",
+        "UPDATE foo FOR VALID_TIME ONLY FROM DATE '2020-01-01' TO DATE '2021-01-01' SET price = 1",
+        "DELETE FROM foo FOR VALID_TIME ONLY FROM DATE '2020-01-01' TO DATE '2021-01-01'",
+        // Invalid PORTION OF combinations.
+        "SELECT * FROM foo FOR PORTION OF VALID_TIME FROM DATE '2020-01-01' TO DATE '2021-01-01'",
+        "SELECT * FROM foo FOR PORTION OF SYSTEM_TIME FROM DATE '2020-01-01' TO DATE '2021-01-01'",
+        "UPDATE foo FOR ALL PORTION OF VALID_TIME SET price = 1",
+        "UPDATE foo FOR PORTION OF VALID_TIME ALL SET price = 1",
+        "UPDATE foo FOR PORTION OF VALID_TIME AS OF DATE '2020-01-01' SET price = 1",
+        "UPDATE foo FOR PORTION OF VALID_TIME BETWEEN DATE '2020-01-01' AND DATE '2021-01-01' SET price = 1",
+        "UPDATE foo FOR PORTION OF VALID_TIME ONLY FROM DATE '2020-01-01' TO DATE '2021-01-01' SET price = 1",
+        // Missing TO in query / SETTING DEFAULT FROM clauses.
+        "SELECT * FROM foo FOR VALID_TIME FROM DATE '2020-01-01'",
+        "SELECT * FROM foo FOR SYSTEM_TIME FROM DATE '2020-01-01'",
+        "SETTING DEFAULT VALID_TIME FROM DATE '2020-01-01' SELECT * FROM foo",
+        "SETTING DEFAULT SYSTEM_TIME FROM DATE '2020-01-01' SELECT * FROM foo",
+        // Invalid PATCH temporal clauses.
+        "PATCH INTO foo FOR VALID_TIME AS OF DATE '2020-01-01' RECORDS {_id: 1}",
+        "PATCH INTO foo FOR VALID_TIME BETWEEN DATE '2020-01-01' AND DATE '2021-01-01' RECORDS {_id: 1}",
+        "PATCH INTO foo FOR VALID_TIME ONLY FROM DATE '2020-01-01' TO DATE '2021-01-01' RECORDS {_id: 1}",
+        "PATCH INTO foo FOR SYSTEM_TIME ALL RECORDS {_id: 1}",
+        // Truncated temporal clauses without an extent.
+        "SELECT * FROM foo FOR VALID_TIME",
+        "SELECT * FROM foo FOR SYSTEM_TIME",
+    ] {
+        assert!(prepare(rejected, &Fixture, &options).is_err(), "expected rejection: {rejected}");
+    }
+    assert!(rtdb_sql::prepare_static("INSERT INTO foo FOR ALL VALID_TIME (_id) VALUES (1)", &Fixture, &options).is_err());
+    assert!(rtdb_sql::prepare_static("PATCH INTO foo FOR VALID_TIME AS OF DATE '2020-01-01' RECORDS {_id: 1}", &Fixture, &options).is_err());
+    assert!(rtdb_sql::prepare_static("PATCH INTO foo FOR VALID_TIME ONLY FROM DATE '2020-01-01' TO DATE '2021-01-01' RECORDS {_id: 1}", &Fixture, &options).is_err());
+
+    for accepted in [
+        "SELECT * FROM foo FOR ALL VALID_TIME FOR ALL SYSTEM_TIME AS f",
+        "SELECT * FROM foo FOR VALID_TIME ONLY FROM DATE '2020-01-01' TO NULL AS f",
+        "UPDATE foo FOR PORTION OF VALID_TIME FROM DATE '2020-01-01' AS f SET price = 1",
+        "DELETE FROM foo FOR VALID_TIME FROM DATE '2020-01-01' AS f",
+        "PATCH INTO foo FOR PORTION OF VALID_TIME FROM DATE '2020-01-01' RECORDS {_id: 1}",
+        "SELECT SUBSTRING('abcdef' FROM 1 FOR valid_time) FROM (VALUES (3)) t(valid_time)",
+    ] {
+        assert!(prepare(accepted, &Fixture, &options).is_ok(), "expected acceptance: {accepted}");
+    }
+    assert!(rtdb_sql::prepare_static("PATCH INTO foo FOR PORTION OF VALID_TIME FROM DATE '2020-01-01' RECORDS {_id: 1}", &Fixture, &options).unwrap().is_some());
+}

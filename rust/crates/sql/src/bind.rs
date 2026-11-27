@@ -67,6 +67,7 @@ pub(crate) struct Context<'a> {
     pub cast_timezone: Option<&'a str>,
     pub binder: Binder,
     temporal: Vec<TemporalClause>,
+    used_temporal: BTreeSet<usize>,
     inline_xtql: Vec<crate::inline_xtql::InlineXtql>,
     pub(crate) wildcard_renames: Vec<crate::wildcard::WildcardRename>,
     ctes: BTreeMap<String, Cte>,
@@ -106,7 +107,7 @@ pub(crate) fn control_expression(source: &str, expression: &ast::Expr, options: 
         fn table(&self, _: &QualifiedTable) -> Result<Option<TableBinding>> { Err(error("Control expression cannot read a table")) }
         fn tables(&self, _: &str) -> Result<Vec<TableBinding>> { Err(error("Control expression cannot read a table")) }
     }
-    let mut context = Context { forms, literals: Default::default(), source, catalog: &ScalarCatalog, options, cast_timezone: None, binder: Binder::default(), temporal: Vec::new(), inline_xtql: Vec::new(), wildcard_renames: Vec::new(), ctes: BTreeMap::new(), next_symbol: 0, next_rewrite_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), inferred_group_scopes: Vec::new(), next_parameter: 0, period_columns: BTreeSet::new(), notices: Vec::new(), diagnostics: Vec::new(), default_valid: None, default_system: None };
+    let mut context = Context { forms, literals: Default::default(), source, catalog: &ScalarCatalog, options, cast_timezone: None, binder: Binder::default(), temporal: Vec::new(), used_temporal: BTreeSet::new(), inline_xtql: Vec::new(), wildcard_renames: Vec::new(), ctes: BTreeMap::new(), next_symbol: 0, next_rewrite_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), inferred_group_scopes: Vec::new(), next_parameter: 0, period_columns: BTreeSet::new(), notices: Vec::new(), diagnostics: Vec::new(), default_valid: None, default_system: None };
     context.admit_expression_literals(expression)?;
     let expression = context.expr(expression, &Schema::default(), &BTreeMap::new())?;
     context.literals.check()?;
@@ -116,7 +117,10 @@ pub(crate) fn control_expression(source: &str, expression: &ast::Expr, options: 
 pub(crate) fn bind(parsed: ParsedStatement<'_>, catalog: &dyn Catalog, options: &PrepareOptions) -> Result<PreparedStatement> {
     let source = parsed.source();
     bind_using(parsed, catalog, options, |context, statement, settings| {
-        let statement = context.statement(statement);
+        let statement = context.statement(statement).and_then(|statement| {
+            context.check_unconsumed_temporal()?;
+            Ok(statement)
+        });
         Ok(PreparedStatement {
             statement: context.check_bound(statement)?,
             parameter_types: context.binder.parameter_types().clone(),
@@ -157,7 +161,10 @@ pub(crate) fn bind_static_document_source(
                 }
             }
             _ => return Ok(None),
-        };
+        }.and_then(|mutation| {
+            if mutation.is_some() { context.check_unconsumed_temporal()?; }
+            Ok(mutation)
+        });
         context.check_bound(result)
     })
 }
@@ -201,7 +208,7 @@ fn bind_parsed<T>(
     let crate::parse::StatementTree { source, statement, temporal, period_columns, settings, wildcard_renames } = parsed.tree;
     let scoped_catalog = TransactionCatalog(catalog);
     let catalog: &dyn Catalog = if matches!(&statement, Syntax::Records { .. } | Syntax::CreateTable { .. } | Syntax::CreateSearchIndex { .. } | Syntax::DropSearchIndex { .. } | Syntax::CreateOrderedIndex { .. } | Syntax::DropOrderedIndex { .. } | Syntax::CreateVectorIndex { .. } | Syntax::DropVectorIndex { .. } | Syntax::GrantRole { .. } | Syntax::Erase(_) | Syntax::Assert(_, _) | Syntax::Standard(ast::Statement::Insert(_) | ast::Statement::Update(_) | ast::Statement::Delete(_))) { &scoped_catalog } else { catalog };
-    let mut context = Context { forms, literals: Default::default(), source: source.input, catalog, options, cast_timezone: Some(&options.default_timezone), binder: Binder::default(), temporal, inline_xtql: parsed.inline_xtql, wildcard_renames, ctes: BTreeMap::new(), next_symbol: 0, next_rewrite_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), inferred_group_scopes: Vec::new(), next_parameter, period_columns, notices: Vec::new(), diagnostics: Vec::new(), default_valid: None, default_system: None };
+    let mut context = Context { forms, literals: Default::default(), source: source.input, catalog, options, cast_timezone: Some(&options.default_timezone), binder: Binder::default(), temporal, used_temporal: BTreeSet::new(), inline_xtql: parsed.inline_xtql, wildcard_renames, ctes: BTreeMap::new(), next_symbol: 0, next_rewrite_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), inferred_group_scopes: Vec::new(), next_parameter, period_columns, notices: Vec::new(), diagnostics: Vec::new(), default_valid: None, default_system: None };
     let (settings, valid, system) = settings.bind(&mut context)?;
     context.default_valid = valid;
     context.default_system = system;
@@ -388,8 +395,10 @@ impl Context<'_> {
     fn record_rows(&mut self, patch: bool, table: &ast::ObjectName, records: &[ast::Expr]) -> Result<crate::StaticMutation> {
         let input = self.bind_records(records).and_then(|records| self.records(records))?;
         let target = self.target(table)?;
-        let (valid_time, system_time, _) = self.temporal_filters(table)?;
-        if system_time != TemporalFilter::Default || (!patch && valid_time != TemporalFilter::Default) {
+        let (valid_time, system_time, clamp) = self.temporal_filters(table, patch)?;
+        if system_time != TemporalFilter::Default || clamp || (!patch && valid_time != TemporalFilter::Default)
+            || (patch && !matches!(valid_time, TemporalFilter::Default | TemporalFilter::FromTo { .. }))
+        {
             return Err(error("Invalid temporal clause for RECORDS"));
         }
         if patch && matches!(valid_time, TemporalFilter::At(_) | TemporalFilter::Between { .. } | TemporalFilter::All) {
@@ -1119,7 +1128,13 @@ impl Context<'_> {
                     let cte_name = names[0].normalized();
                     if let Some(cte) = self.ctes.get(&cte_name).cloned() {
                         let end = name.0.last().and_then(ast::ObjectNamePart::as_ident).map(|name| name.span.end);
-                        if self.temporal.iter().any(|clause| Some(clause.owner_end) == end) {
+                        let matched: Vec<_> = self.temporal.iter().enumerate()
+                            .filter(|(_, clause)| Some(clause.owner_end) == end).map(|(index, _)| index).collect();
+                        if !matched.is_empty() {
+                            if matched.iter().any(|&index| self.temporal[index].portion || matches!(self.temporal[index].extent, TemporalExtent::FromTo(_, None))) {
+                                return Err(grammar_rejected("A DML-only temporal period specification in a query"));
+                            }
+                            self.used_temporal.extend(matched);
                             use rtdb_types::transit_value::{TransitValue, to_json_value};
                             let diagnostic = PlanningDiagnostic::new(format!("Period specifications not allowed on CTE reference: {cte_name}"))
                                 .with_detail("table-name", to_json_value(&TransitValue::Symbol(cte_name.clone()))?);
@@ -1133,7 +1148,7 @@ impl Context<'_> {
                     }
                 }
                 if purpose != TablePurpose::Query && names.len() > 2 { return Err(grammar_rejected("A three-part DML target name")); }
-                let (valid_time, system_time, clamp_valid_time) = self.temporal_filters(name)?;
+                let (valid_time, system_time, clamp_valid_time) = self.temporal_filters(name, purpose == TablePurpose::Mutation)?;
                 let binding = resolve_table(self.catalog, &names, &self.options.search_path)?;
                 let qualifier = alias.as_ref().map(|alias| identifier(&alias.name).normalized()).unwrap_or_else(|| binding.name.table.table.clone());
                 if purpose != TablePurpose::Query && alias.as_ref().is_some_and(|alias| !alias.columns.is_empty()) { return Err(error("Mutation targets do not accept column lists")); }
@@ -1496,13 +1511,35 @@ impl Context<'_> {
         Ok(Arc::new(Relation::scan(scan)?))
     }
 
-    fn temporal_filters(&mut self, table: &ast::ObjectName) -> Result<(TemporalFilter, TemporalFilter, bool)> {
+    fn check_unconsumed_temporal(&self) -> Result<()> {
+        if self.used_temporal.len() < self.temporal.len() {
+            return Err(grammar_rejected("A misplaced temporal period specification"));
+        }
+        Ok(())
+    }
+
+    fn temporal_filters(&mut self, table: &ast::ObjectName, allow_dml_forms: bool) -> Result<(TemporalFilter, TemporalFilter, bool)> {
         let end = table.0.last().and_then(ast::ObjectNamePart::as_ident).map(|name| name.span.end);
-        let clauses: Vec<_> = self.temporal.iter().filter(|clause| Some(clause.owner_end) == end).cloned().collect();
+        let mut clauses = Vec::new();
+        for (index, clause) in self.temporal.iter().enumerate() {
+            if Some(clause.owner_end) == end {
+                self.used_temporal.insert(index);
+                clauses.push(clause.clone());
+            }
+        }
         let mut valid = self.default_valid.clone();
         let mut system = self.default_system.clone();
         let mut clamp = false;
         for clause in clauses {
+            if !allow_dml_forms && clause.portion {
+                return Err(grammar_rejected("FOR PORTION OF in a query"));
+            }
+            if !allow_dml_forms && matches!(clause.extent, TemporalExtent::FromTo(_, None)) {
+                return Err(grammar_rejected("FOR ... FROM without TO in a query"));
+            }
+            if allow_dml_forms && clause.clamp {
+                return Err(grammar_rejected("FOR VALID_TIME ONLY in DML"));
+            }
             if clause.system { system = Some(clause.extent); } else { valid = Some(clause.extent); clamp = clause.clamp; }
         }
         let valid = valid.map(|extent| self.bind_extent(extent)).transpose()?.unwrap_or(TemporalFilter::Default);
