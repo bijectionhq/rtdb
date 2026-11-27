@@ -965,6 +965,34 @@ mod tests {
     }
 
     #[test]
+    fn compaction_aligns_selected_nested_union_cells_when_whole_layout_scratch_is_unfunded() {
+        let int = LogicalType::Scalar(ScalarType::I64);
+        let text = LogicalType::Scalar(ScalarType::Utf8);
+        let target = LogicalType::list(int.join(&text));
+        let fields = Some(StructFields::from([("v".into(), target.clone())]));
+        let field = to_field("v", &target).unwrap();
+        let values = (0..64).map(|i| Value::list(vec![
+            if i % 2 == 0 { Value::I64(i) } else { Value::Utf8(i.to_string()) }
+        ])).collect::<Vec<_>>();
+        let sources = values.iter().map(|value| {
+            let logical = value.logical_type();
+            (to_field("v", &logical).unwrap(), copy_array(&logical, std::slice::from_ref(value)).unwrap())
+        }).collect::<Vec<_>>();
+        let events = sources.iter().map(|(field, array)| ArrowOnly(PutColumn::Stored(field, array.as_ref(), 0))).collect::<Vec<_>>();
+        let memory = MemoryBudget::new(768 << 10);
+        let (mut builder, _) = super::super::event_builder(events.len(), fields.as_ref(), &memory).unwrap();
+        let refs = events.iter().collect::<Vec<_>>();
+        assert!(super::super::columns::gather_column(&refs, &field, &target, Some(&mut builder)).unwrap().is_none());
+        drop(builder);
+        let actual = copy_compaction_batch(&events, fields.clone(), None, false, false, &memory).unwrap();
+        let expected = copy_event_batch_with_recency(&stored(values), fields, None, false).unwrap();
+        assert_eq!(write_stream(expected.schema_ref(), std::slice::from_ref(&expected)).unwrap(),
+            write_stream(actual.batch().schema_ref(), std::slice::from_ref(actual.batch())).unwrap());
+        drop(actual);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
     fn native_selection_defers_scalar_sizing_for_a_bounded_layout() {
         let ty = LogicalType::list(LogicalType::Scalar(ScalarType::I64));
         let field = to_field("v", &ty).unwrap();

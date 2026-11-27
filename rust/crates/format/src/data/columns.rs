@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, cast::AsArray, types::{Int16Type, Int32Type, Int64Type}};
 use arrow_schema::{DataType, Field, UnionMode};
-use rtdb_columnar::{BatchBuilder, EXTENSION_NAME_KEY, copy_event_cells, copy_selected_cells, estimate_copy_cell_bytes,
+use rtdb_columnar::{BatchBuilder, FundedColumn, EXTENSION_NAME_KEY, copy_event_cells, copy_selected_cells, estimate_copy_cell_bytes,
     estimate_event_copy_cell_bytes, estimate_event_null_cell_bytes, event_relayout_bound, from_field, relayout_event_column};
 use rtdb_types::{LogicalType, Result, UriParts};
 
@@ -27,7 +27,13 @@ pub(super) fn gather_column<E: EncodedEvent>(
     if target_type != *logical { return Ok(None); }
     let schema_bytes = schema_bound(target)?;
     let base = documents.len().checked_mul(256).and_then(|bytes| bytes.checked_add(schema_bytes)).ok_or_else(event_size)?;
-    let _plan = builder.as_deref().map(|builder| builder.reserve_scratch(base)).transpose()?;
+    let _plan = match builder.as_deref() {
+        Some(builder) => {
+            let Some(plan) = builder.try_reserve_scratch(base) else { return Ok(None); };
+            Some(plan)
+        }
+        None => None,
+    };
     let mut slots = HashMap::new();
     let mut sources: Vec<Source<'_>> = Vec::new();
     let mut cells = Vec::with_capacity(documents.len());
@@ -39,7 +45,13 @@ pub(super) fn gather_column<E: EncodedEvent>(
                 let slot = if let Some(&slot) = slots.get(&key) {
                     slot
                 } else {
-                    let _schema = builder.as_deref().map(|builder| builder.reserve_scratch(schema_bound(field)?)).transpose()?;
+                    let _schema = match builder.as_deref() {
+                        Some(builder) => {
+                            let Some(schema) = builder.try_reserve_scratch(schema_bound(field)?) else { return Ok(None); };
+                            Some(schema)
+                        }
+                        None => None,
+                    };
                     let stored = from_field(field)?;
                     if field.data_type() != array.data_type()
                         || (*logical != LogicalType::Nothing && stored == LogicalType::Nothing)
@@ -81,14 +93,16 @@ pub(super) fn gather_column<E: EncodedEvent>(
             let bound = source.picks.iter().try_fold(schema_bound(source.field)?, |bytes, &(_, row)| {
                 add_copy_bound(bytes, estimate_copy_cell_bytes(source.field, source.array, row)?)
             })?;
-            scratch.push(builder.reserve_scratch(bound)?);
+            let Some(charge) = builder.try_reserve_scratch(bound) else { return Ok(None); };
+            scratch.push(charge);
         }
         let Ok(selection) = copy_selected_cells(&[source.array], &source.picks) else {
             return Ok(None);
         };
         if let Some(builder) = builder.as_deref() {
             let bound = event_relayout_bound(selection.as_ref(), source.field, target)?;
-            scratch.push(builder.reserve_scratch(bound)?);
+            let Some(charge) = builder.try_reserve_scratch(bound) else { return Ok(None); };
+            scratch.push(charge);
         }
         let Ok((field, array)) = relayout_event_column(selection, source.field, target) else {
             return Ok(None);
@@ -122,7 +136,11 @@ pub(super) fn gather_column<E: EncodedEvent>(
             };
             add_copy_bound(bytes, cell_size)
         })?;
-        builder.column(bound, build)?
+        match builder.try_funded_column(bound, || build().map(Some))? {
+            FundedColumn::Built(Some(array)) => array,
+            FundedColumn::Built(None) => unreachable!("An admitted event gather builds a column"),
+            FundedColumn::Unfunded => return Ok(None),
+        }
     } else {
         build()?
     };

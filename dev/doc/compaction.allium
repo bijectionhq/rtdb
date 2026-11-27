@@ -156,6 +156,7 @@ config {
 -- Decompression preserves the rows and metadata supplied to the merge.
 -- A compatible fixed-size float column preserves its float values and list and component validity when gathered into an output page.
 -- A single aligned selection can supply a complete output column when it has the recorded offsets and padding.
+-- If the budget cannot fund whole-layout alignment, compaction can gather admitted nested cells and union legs directly from their selected positions.
 -- Bloom metadata sets each distinct position derived from a page's cells before serializing the bitmap.
 -- Similarly to the scan operator, we calculate a list of merge tasks.
 -- An input page from an unresolved segment (an L0 file, or the live index) first has its same-system-time events resolved against each other.

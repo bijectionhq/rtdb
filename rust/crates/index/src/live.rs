@@ -949,20 +949,24 @@ impl BlockPages<'_> {
     ) -> Result<Option<ArrayRef>> {
         let DataType::Union(source_legs, UnionMode::Dense) = source.data_type() else { return Ok(None); };
         let DataType::Union(target_legs, UnionMode::Dense) = target.data_type() else { return Ok(None); };
-        if source_legs.iter().any(|(tag, field)| !target_legs.iter().any(|(candidate, leg)| candidate == tag && leg.name() == field.name())) {
-            return Ok(None);
+        let mut target_tags = [0; 128];
+        let mut remap = false;
+        for (source_tag, field) in source_legs.iter() {
+            let Some((target_tag, _)) = target_legs.iter().find(|(_, target)| target.name() == field.name()) else { return Ok(None); };
+            target_tags[source_tag as usize] = target_tag;
+            remap |= source_tag != target_tag;
         }
         let ops = array.as_any().downcast_ref::<UnionArray>().ok_or_else(|| invalid("Live operations must be a union"))?;
         let mut children = Vec::with_capacity(target_legs.len());
-        for (tag, target) in target_legs.iter() {
-            let Some((_, source)) = source_legs.iter().find(|(candidate, _)| *candidate == tag) else {
+        for (_, target) in target_legs.iter() {
+            let Some((source_tag, source)) = source_legs.iter().find(|(_, source)| source.name() == target.name()) else {
                 children.push(arrow_array::new_empty_array(target.data_type()));
                 continue;
             };
-            let source_array = ops.child(tag);
+            let source_array = ops.child(source_tag);
             if target.name() == "put" {
-                if has_run_end(target.data_type()) || source_array.null_count() != 0
-                    || selected.iter().any(|&row| ops.type_id(row) == tag
+                if (remap && source != target) || has_run_end(target.data_type()) || source_array.null_count() != 0
+                    || selected.iter().any(|&row| ops.type_id(row) == source_tag
                         && !rtdb_format::data::can_copy_put_cell(source, source_array.as_ref(), ops.value_offset(row))) {
                     return Ok(None);
                 }
@@ -978,7 +982,14 @@ impl BlockPages<'_> {
             };
             children.push(aligned);
         }
-        let array = UnionArray::try_new(target_legs.clone(), ops.type_ids().clone(), ops.offsets().cloned(), children).map_err(invalid)?;
+        let tags = if remap {
+            let bytes = ops.len().checked_add(1024).ok_or_else(|| invalid("Page operation allocation overflow"))?;
+            scratch.push(self.memory.reserve(bytes)?);
+            ops.type_ids().iter().map(|&tag| target_tags[tag as usize]).collect::<Vec<_>>().into()
+        } else {
+            ops.type_ids().clone()
+        };
+        let array = UnionArray::try_new(target_legs.clone(), tags, ops.offsets().cloned(), children).map_err(invalid)?;
         Ok(Some(Arc::new(array)))
     }
 }
@@ -1945,6 +1956,46 @@ fn block_pages_preserve_order_and_layout_across_live_batches() {
             assert_eq!(bytes(actual.batch()), bytes(expected.arrow()));
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn block_relayout_remaps_legacy_operation_tags_without_reordering_nested_values() {
+    let memory = MemoryBudget::new(16 << 20);
+    let table = TableRef::new("public", "docs");
+    let doc = Value::Struct(StructFields::from([("v".into(), Value::list(vec![
+        Value::I64(42), Value::Utf8("text".into()), Value::Null,
+    ]))]));
+    let fields = StructFields::from([("nested".into(), doc.logical_type().maybe())]);
+    let operations = [
+        StoredOperation::Put(StructFields::from([("nested".into(), doc)])),
+        StoredOperation::Delete,
+        StoredOperation::Erase,
+        StoredOperation::Put(StructFields::new()),
+    ];
+    let events: Vec<_> = operations.into_iter().enumerate().map(|(index, operation)| StoredEvent {
+        position: Some(EventPosition { transaction: rtdb_types::TxId(1), ordinal: index as u64 }),
+        origin: None,
+        entity_key: None,
+        iid: Iid([index as u8; 16]),
+        system_from: Timestamp(1),
+        commit_position: 0,
+        valid_time: Interval::ALL,
+        operation,
+        recency: None,
+    }).collect();
+    let legacy = rtdb_format::data::copy_event_batch(&events, Some(fields.clone()), None).unwrap();
+    let batch = IndexBatch::new(legacy, &memory).unwrap();
+    let table = LiveTable::new(table, BlockIndex(0), TrieConfig::default())
+        .append(&TableWrite::new(fields, Some(batch)), Timestamp(1)).unwrap();
+    let pages = table.block_pages(&memory).unwrap();
+    assert!(pages.sources.is_none());
+    let order = [3, 1, 0, 2];
+    let output = pages.copy_relayout(&order).unwrap().unwrap();
+    let expected: Vec<_> = order.into_iter().map(|row| events[row as usize].clone()).collect();
+    let expected = IndexBatch::copy_events_with_put_schema(&expected, table.column_types(), &memory).unwrap();
+    let bytes = |batch: &RecordBatch| rtdb_format::ipc::write_file(batch.schema_ref(), std::slice::from_ref(batch)).unwrap();
+    assert_eq!(bytes(output.batch()), bytes(expected.arrow()));
 }
 
 #[cfg(test)]
