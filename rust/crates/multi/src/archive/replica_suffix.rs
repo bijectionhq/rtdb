@@ -1317,6 +1317,7 @@ mod custody_tests {
             block_index: Some(0), term_id: Some(1), boundary_term_seq: Some(0), boundary_replica_msg_id: Some(0),
             latest_processed_msg_id: Some(0),
             latest_completed_tx: Some(block_proto::TxKey { tx_id: Some(0), system_time: Some(10) }),
+            table_block_manifest: Some(Default::default()),
             ..Default::default()
         })?;
         let root = key(&block_key(BlockIndex(0))?)?;
@@ -1329,7 +1330,7 @@ mod custody_tests {
                 root_sha256: Some(rtdb_format::catalog::publication_digest(&root_bytes)) },
         };
         let archive_key = keys.archive_key(&archive_key_id(&point), true, IoRegion::new()).await?;
-        let sealed = archive_key.seal(root.as_str(), root_bytes.into()).await?;
+        let sealed = archive_key.seal_object(&root, root_bytes.into()).await?;
         let captured = Capture {
             point: point.clone(), format: rtdb_format::catalog::CheckpointContents::Replay,
             objects: vec![ArchivedObject { name: root.to_string(), bytes: sealed.len() as u64, sha256: digest(&sealed), frame_header_sha256: None }],
@@ -1428,13 +1429,18 @@ mod custody_tests {
         let target_key = keys.existing_key(&target.key_id()).await?.unwrap();
         assert_ne!(source_key, target_key);
         let target_files = PrefixedStore::new(Arc::clone(&bucket), target_root);
-        let foreign = key(&rtdb_format::keys::oversized_key(BlockIndex(1), "unadmitted")?)?;
-        target_files.put(&foreign, Bytes::from_static(b"unrelated")).await?;
+        let target_payloads = PrefixedStore::new(broker_media.bucket(IoRegion::new()).await?, crate::replay_broker::residence(&target));
+        let sealed = target_payloads.get_fresh(&later_path).await?;
+        target_payloads.delete(&later_path).await?;
+        target_payloads.put(&later_path, Bytes::from_static(b"invalid detached body")).await?;
         assert!(Box::pin(seed_checkpoint_transfer_target(directory.clone(), &storage, keys.as_ref(), selector.clone(), Some(&broker), None)).await.is_err());
-        target_files.delete(&foreign).await?;
+        target_payloads.delete(&later_path).await?;
+        target_payloads.put(&later_path, sealed).await?;
         let activated = Box::pin(activate_checkpoint_transfer_target(directory.clone(), &storage, keys.as_ref(), selector, Some(&broker), None)).await?;
         assert_eq!(activated.replica, seeded);
         drop((broker, directory));
+        broker_tasks.close();
+        broker_tasks.wait().await;
 
         let target_objects = Arc::new(EncryptingStore::new(Arc::new(target_files), &target_key)?);
         let memory = MemoryBudget::new(256 << 20);
@@ -1450,8 +1456,10 @@ mod custody_tests {
             let rtdb_directory::ReplaceOutcome::Applied(holder) = directory.replace_deployment(holder, version).await else {
                 panic!("the transfer holder lost its placement");
             };
+            let broker_tasks = tokio_util::task::TaskTracker::new();
+            let recovery_tasks = tokio_util::task::TaskTracker::new();
             let broker = Client::standalone(directory.clone(), broker_media.clone(), &storage, broker_keys.clone(), broker_tasks.clone(), cancellation.child_token())?;
-            let holdings = Arc::new(RecoveryHolds { directory: directory.clone(), keys: keys.clone(), broker: Some(broker), custody: ReplayCustody::Local, tasks: Default::default(), stop: cancellation.child_token() });
+            let holdings = Arc::new(RecoveryHolds { directory: directory.clone(), keys: keys.clone(), broker: Some(broker), custody: ReplayCustody::Local, tasks: recovery_tasks.clone(), stop: cancellation.child_token() });
             let factory = LogkeeperLogFactory::new(MAXIMUM_LOG_MESSAGE_BYTES, Default::default(), holdings);
             let config = holder_config(&holder, seeded.journals.clone(), &storage, Role::Holder);
             let Some(database_config::Log::OtherLog(config)) = config.log else { panic!("target did not use Logkeeper"); };
@@ -1461,7 +1469,7 @@ mod custody_tests {
             if next == terminal_source + 1 {
                 let exact = opened.replica.read_range(LogOffset(3), LogOffset(4)).await?.pop().unwrap();
                 let logs = rtdb_replication::PartitionLogs::new(
-                    Arc::new(MemoryLog::starting_at(1024, LogOffset(0))), opened.replica,
+                    Arc::new(MemoryLog::starting_at(1024, LogOffset(0))), Arc::clone(&opened.replica),
                     StorageEpoch(0), StorageEpoch(0), CURRENT_STORAGE_VERSION, StorageEpoch(0),
                     target_objects.clone(), Arc::clone(&cache), Arc::clone(&memory),
                 )?;
@@ -1472,6 +1480,11 @@ mod custody_tests {
                 let update = large_transaction(next, 31, 3)?;
                 logs.enqueue_replica(&update, BlockIndex(1), Timestamp(31)).await?.durable().await?;
             }
+            drop((opened, factory, directory));
+            recovery_tasks.close();
+            recovery_tasks.wait().await;
+            broker_tasks.close();
+            broker_tasks.wait().await;
         }
         cancellation.cancel();
         server.await.unwrap()?;
