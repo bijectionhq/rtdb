@@ -62,7 +62,7 @@ impl RangePredicate {
     pub(super) fn selection(
         &self, batch: &ColumnBatch, parameters: Parameters<'_>, memory: &Arc<MemoryBudget>,
     ) -> Result<Option<PredicateSelection>> {
-        let Some(cells) = Cells::of(&batch.columns[self.position]) else { return Ok(None) };
+        let Some(cells) = Cells::of(&batch.columns[self.position], true) else { return Ok(None) };
         let reservation = memory.reserve(PredicateSelection::bitmap_bound(batch.len))?;
         let mut bits = BooleanBufferBuilder::new(batch.len);
         let mut count = 0;
@@ -79,7 +79,7 @@ impl RangePredicate {
     pub(super) fn truth(
         &self, batch: &ColumnBatch, parameters: Parameters<'_>,
     ) -> Result<Option<Vec<Option<bool>>>> {
-        let Some(cells) = Cells::of(&batch.columns[self.position]) else { return Ok(None) };
+        let Some(cells) = Cells::of(&batch.columns[self.position], true) else { return Ok(None) };
         let _scratch = batch.reservation.budget().reserve(
             batch.len.checked_mul(size_of::<Option<bool>>()).ok_or_else(size_error)?,
         )?;
@@ -172,11 +172,11 @@ impl Bound {
 }
 
 fn numeric_layout(ty: &LogicalType) -> bool {
-    predicate::cell_kinds(ty).is_some_and(|kinds| kinds.iter().all(|kind| matches!(kind, CellKind::Int | CellKind::Float)))
+    predicate::cell_kinds(ty, true).is_some_and(|kinds| kinds.iter().all(|kind| matches!(kind, CellKind::Int | CellKind::Float)))
 }
 
 fn numeric_value(value: &Value) -> Option<Option<Cell<'static>>> {
-    numeric_cell(predicate::scalar(value).ok()?)
+    numeric_cell(predicate::scalar(value, true).ok()?)
 }
 
 fn numeric_cell(cell: Option<Cell<'_>>) -> Option<Option<Cell<'static>>> {

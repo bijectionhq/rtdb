@@ -371,9 +371,9 @@ enum Kind {
     Cast(Box<Node>),
     Not(Box<Node>),
     /// `=`, `<>`, `<`, `<=`, `>` or `>=`.
-    Compare { op: BinaryOp, left: Box<Node>, right: Box<Node> },
+    Compare { op: BinaryOp, left: Box<Node>, right: Box<Node>, allow_half: bool },
     /// `===`, which reads both sides at every row and holds of two nulls.
-    Identical { left: Box<Node>, right: Box<Node> },
+    Identical { left: Box<Node>, right: Box<Node>, allow_half: bool },
     /// IS NULL or IS UNKNOWN, or IS NOT NULL where `negated`.
     IsNull { operand: Box<Node>, negated: bool },
     /// LIKE over a literal or bound pattern.
@@ -415,7 +415,7 @@ impl Projection {
     /// parameter is copied elsewhere.
     pub(crate) fn bind(expr: &Expr, schema: &Schema) -> Option<Self> {
         if matches!(expr, Expr::Column { .. } | Expr::Literal(_) | Expr::Parameter { .. }) { return None; }
-        Node::bind_vector(expr, schema, None).map(|(node, _)| Self(node))
+        Node::bind_root(expr, schema, None).map(|(node, _)| Self(node))
             .or_else(|| Self::bind_double_column_cast(expr, schema))
     }
 
@@ -434,7 +434,7 @@ impl Projection {
 
     fn bind_with_parameters(expr: &Expr, schema: &Schema, parameters: &[Option<LogicalType>]) -> Option<Self> {
         if matches!(expr, Expr::Column { .. } | Expr::Literal(_) | Expr::Parameter { .. }) { return None; }
-        Node::bind_vector(expr, schema, Some(parameters)).map(|(node, _)| Self(node))
+        Node::bind_root(expr, schema, Some(parameters)).map(|(node, _)| Self(node))
     }
 
     pub(crate) fn retained_bytes(&self) -> Result<usize> { self.0.retained_bytes() }
@@ -468,7 +468,7 @@ impl Predicate {
         if let Some(range) = range::RangePredicate::bind(expr, schema) {
             return Some(Self(PredicatePlan::Range(range)));
         }
-        let (node, ty) = Node::bind_vector(expr, schema, None)?;
+        let (node, ty) = Node::bind_root(expr, schema, None)?;
         matches!(ty, VectorType::Bool | VectorType::Null).then_some(Self(PredicatePlan::Vector(node)))
     }
 
@@ -630,23 +630,29 @@ fn literal_temporal_coercion(expr: &Expr, other_kinds: &[predicate::CellKind]) -
 }
 
 impl Node {
+    fn bind_root(expr: &Expr, schema: &Schema, params: Option<&[Option<LogicalType>]>) -> Option<(Self, VectorType)> {
+        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || Self::bind_vector_at(expr, schema, params, true))
+    }
+
     fn bind_vector(expr: &Expr, schema: &Schema, params: Option<&[Option<LogicalType>]>) -> Option<(Self, VectorType)> {
-        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || Self::bind_vector_at(expr, schema, params))
+        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || Self::bind_vector_at(expr, schema, params, false))
     }
 
     fn bind_operand(expr: &Expr, schema: &Schema, params: Option<&[Option<LogicalType>]>) -> Option<(Self, Vec<predicate::CellKind>)> {
-        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || Self::bind_operand_at(expr, schema, params))
+        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || Self::bind_operand_at(expr, schema, params, false))
     }
 
-    fn bind_operand_at(expr: &Expr, schema: &Schema, params: Option<&[Option<LogicalType>]>) -> Option<(Self, Vec<predicate::CellKind>)> {
+    fn bind_operand_at(
+        expr: &Expr, schema: &Schema, params: Option<&[Option<LogicalType>]>, half: bool,
+    ) -> Option<(Self, Vec<predicate::CellKind>)> {
         match expr {
             Expr::Column { id, .. } => {
                 let position = schema.position(*id)?;
-                let kinds = predicate::cell_kinds(&schema.fields()[position].data_type)?;
+                let kinds = predicate::cell_kinds(&schema.fields()[position].data_type, half)?;
                 Some((Self { kind: Kind::Column(position), declared: expr.data_type() }, kinds))
             }
             Expr::Literal(value) => {
-                let kinds = predicate::value_cell_kind(value)?.into_iter().collect();
+                let kinds = predicate::value_cell_kind(value, half)?.into_iter().collect();
                 Some((Self { kind: Kind::Literal(value.clone()), declared: expr.data_type() }, kinds))
             }
             Expr::Parameter { index, data_type } => {
@@ -655,7 +661,7 @@ impl Node {
                 } else {
                     data_type
                 };
-                let kinds = predicate::cell_kinds(resolved)?;
+                let kinds = predicate::cell_kinds(resolved, half)?;
                 Some((Self { kind: Kind::Parameter(*index), declared: resolved.clone() }, kinds))
             }
             _ => {
@@ -665,7 +671,7 @@ impl Node {
         }
     }
 
-    fn bind_vector_at(expr: &Expr, schema: &Schema, params: Option<&[Option<LogicalType>]>) -> Option<(Self, VectorType)> {
+    fn bind_vector_at(expr: &Expr, schema: &Schema, params: Option<&[Option<LogicalType>]>, root: bool) -> Option<(Self, VectorType)> {
         let declared = expr.data_type();
         match expr {
             Expr::Column { id, .. } => {
@@ -693,6 +699,10 @@ impl Node {
             _ => {}
         }
         let result_ty = VectorType::of(&declared)?;
+        let half_comparison = |left: &Expr, right: &Expr| {
+            let leaf = |expr: &Expr| matches!(expr, Expr::Column { .. } | Expr::Literal(_));
+            root && leaf(left) && leaf(right)
+        };
         let (kind, ty) = match expr {
             Expr::Field { expr, name, .. } => {
                 let Expr::Column { id, .. } = expr.as_ref() else { return None; };
@@ -705,10 +715,11 @@ impl Node {
             Expr::Call { name, args, .. } if name == "===" => match args.as_slice() {
                 [left, right] => {
                     if result_ty != VectorType::Bool { return None; }
-                    let (left, left_kinds) = Self::bind_operand(left, schema, params)?;
-                    let (right, right_kinds) = Self::bind_operand(right, schema, params)?;
+                    let allow_half = half_comparison(left, right);
+                    let (left, left_kinds) = Self::bind_operand_at(left, schema, params, allow_half)?;
+                    let (right, right_kinds) = Self::bind_operand_at(right, schema, params, allow_half)?;
                     if !predicate::all_identical(&left_kinds, &right_kinds) { return None; }
-                    (Kind::Identical { left: Box::new(left), right: Box::new(right) }, VectorType::Bool)
+                    (Kind::Identical { left: Box::new(left), right: Box::new(right), allow_half }, VectorType::Bool)
                 }
                 _ => return None,
             },
@@ -829,8 +840,9 @@ impl Node {
             Expr::Binary { op: op @ (BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide | BinaryOp::Modulo), left, right } =>
                 Self::bind_arithmetic(*op, left, right, &declared, &result_ty, schema, params)?,
             Expr::Binary { op: op @ (BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq), left, right } => {
-                let (left_node, left_kinds) = Self::bind_operand(left, schema, params)?;
-                let (right_node, right_kinds) = Self::bind_operand(right, schema, params)?;
+                let allow_half = half_comparison(left, right);
+                let (left_node, left_kinds) = Self::bind_operand_at(left, schema, params, allow_half)?;
+                let (right_node, right_kinds) = Self::bind_operand_at(right, schema, params, allow_half)?;
                 if !strict_args_settle(&[&left_node, &right_node]) { return None; }
                 if literal_temporal_coercion(left, &right_kinds) || literal_temporal_coercion(right, &left_kinds) { return None; }
                 if !predicate::all_orderable(&left_kinds, &right_kinds) { return None; }
@@ -841,7 +853,7 @@ impl Node {
                     if result_ty != VectorType::Bool { return None; }
                     VectorType::Bool
                 };
-                (Kind::Compare { op: *op, left: Box::new(left_node), right: Box::new(right_node) }, ty)
+                (Kind::Compare { op: *op, left: Box::new(left_node), right: Box::new(right_node), allow_half }, ty)
             }
             Expr::Binary { op: op @ (BinaryOp::And | BinaryOp::Or), left, right } => {
                 let (left_node, left_ty) = Self::bind_vector(left, schema, params)?;
@@ -989,7 +1001,7 @@ impl Node {
     fn bind_round(value: &Expr, scale: Option<i64>, declared: &LogicalType, result_ty: &VectorType,
         schema: &Schema, params: Option<&[Option<LogicalType>]>,
     ) -> Option<(Kind, VectorType)> {
-        let floating = |logical: &LogicalType| predicate::cell_kinds(logical).is_some_and(|kinds| kinds == [predicate::CellKind::Float]);
+        let floating = |logical: &LogicalType| predicate::cell_kinds(logical, false).is_some_and(|kinds| kinds == [predicate::CellKind::Float]);
         if *result_ty == VectorType::F64 && let Expr::Column { id, data_type } = value && floating(data_type) {
             let position = schema.position(*id)?;
             if floating(&schema.fields()[position].data_type) {
@@ -1059,7 +1071,7 @@ impl Node {
                     if let Some(length) = length { bytes = add(bytes, length.retained_bytes()?)?; }
                 }
                 Kind::Arithmetic { left, right, .. } | Kind::Compare { left, right, .. }
-                | Kind::Identical { left, right } | Kind::Logical { left, right, .. } => {
+                | Kind::Identical { left, right, .. } | Kind::Logical { left, right, .. } => {
                     bytes = add(bytes, left.retained_bytes()?)?;
                     bytes = add(bytes, right.retained_bytes()?)?;
                 }
@@ -1092,7 +1104,7 @@ impl Node {
     fn settles(&self) -> bool {
         stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || match &self.kind {
             Kind::Column(_) | Kind::StructField { .. } | Kind::Literal(_) | Kind::Parameter(_) | Kind::RoundFloatColumn { .. } => true,
-            Kind::Compare { left, right, .. } | Kind::Identical { left, right } => left.prepares() && right.prepares(),
+            Kind::Compare { left, right, .. } | Kind::Identical { left, right, .. } => left.prepares() && right.prepares(),
             Kind::Like { input, pattern, .. } => input.prepares() && pattern.prepares(),
             Kind::Length { operand, .. } | Kind::Double(_, operand) => operand.prepares(),
             Kind::IsNull { operand, .. } => operand.prepares(),
@@ -1115,7 +1127,7 @@ impl Node {
         stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || match &self.kind {
             Kind::Column(_) | Kind::StructField { .. } | Kind::Literal(_) | Kind::Parameter(_) => true,
             Kind::Not(operand) | Kind::IsNull { operand, .. } => operand.infallible(),
-            Kind::Compare { left, right, .. } | Kind::Identical { left, right } | Kind::Logical { left, right, .. } => left.infallible() && right.infallible(),
+            Kind::Compare { left, right, .. } | Kind::Identical { left, right, .. } | Kind::Logical { left, right, .. } => left.infallible() && right.infallible(),
             Kind::Between { operand, low, high } => operand.infallible() && low.infallible() && high.infallible(),
             Kind::Like { input, pattern, compiled, .. } =>
                 input.infallible() && (compiled.is_some() || matches!(&pattern.kind, Kind::Literal(Value::Null))),
@@ -1270,7 +1282,7 @@ impl Evaluation<'_> {
             }
             Kind::RoundFloatColumn { position, scale } => {
                 if len == 0 { return null(); }
-                let Some(cells) = Cells::of(&self.columns[*position]) else { return Ok(None) };
+                let Some(cells) = Cells::of(&self.columns[*position], false) else { return Ok(None) };
                 self.map_operand::<Float64Type>(&Operand::Cells(cells), selection, Vector::F64, |cell| match cell {
                     Cell::Float(value) => Some(kernels::round_double(value, *scale)),
                     _ => None,
@@ -1449,16 +1461,20 @@ impl Evaluation<'_> {
     /// The cells of a predicate's operand over `rows`: read in place from a column, a bound parameter or a literal, or
     /// computed.
     fn operand<'s>(&'s self, node: &'s Node, rows: Selection<'_>) -> Result<Option<Operand<'s>>> {
+        self.operand_with_half(node, rows, false)
+    }
+
+    fn operand_with_half<'s>(&'s self, node: &'s Node, rows: Selection<'_>, allow_half: bool) -> Result<Option<Operand<'s>>> {
         Ok(match &node.kind {
-            Kind::Column(position) => Cells::of(&self.columns[*position]).map(Operand::Cells),
-            Kind::Literal(value) => predicate::scalar(value).ok().map(Operand::Constant),
+            Kind::Column(position) => Cells::of(&self.columns[*position], allow_half).map(Operand::Cells),
+            Kind::Literal(value) => predicate::scalar(value, allow_half).ok().map(Operand::Constant),
             Kind::Parameter(index) => match self.parameters {
                 // An Arrow-bound parameter is decoded on its first read, which `known` alone would leave undone.
                 Parameters::Values(parameters) => match parameters.get(*index)? {
-                    Some(value) => predicate::scalar(value).ok().map(Operand::Constant),
+                    Some(value) => predicate::scalar(value, allow_half).ok().map(Operand::Constant),
                     None => None,
                 },
-                Parameters::Columns(arguments) => arguments.get(*index).and_then(Cells::of).map(Operand::Cells),
+                Parameters::Columns(arguments) => arguments.get(*index).and_then(|column| Cells::of(column, allow_half)).map(Operand::Cells),
             },
             _ => self.vector(node, rows)?.map(Operand::Computed),
         })
@@ -1506,8 +1522,8 @@ impl Evaluation<'_> {
     /// A predicate's truths over the rows `selection` picks, as a vector of truths of its declared type.
     fn predicate(&self, node: &Node, selection: Selection<'_>) -> Result<Option<Charged>> {
         let truths = match &node.kind {
-            Kind::Compare { op, left, right } => self.compare(*op, left, right, selection)?,
-            Kind::Identical { left, right } => self.identical(left, right, selection)?,
+            Kind::Compare { op, left, right, allow_half } => self.compare(*op, left, right, selection, *allow_half)?,
+            Kind::Identical { left, right, allow_half } => self.identical(left, right, selection, *allow_half)?,
             Kind::IsNull { operand, negated } => self.is_null(operand, *negated, selection)?,
             Kind::Like { input, pattern, escape, case_insensitive, negated, compiled } =>
                 self.like(input, pattern, (*escape, *case_insensitive, *negated), compiled.as_deref(), selection)?,
@@ -1530,7 +1546,7 @@ impl Evaluation<'_> {
     }
 
     /// A comparison, strict in both operands.
-    fn compare(&self, op: BinaryOp, left: &Node, right: &Node, selection: Selection<'_>) -> Result<Option<Truths>> {
+    fn compare(&self, op: BinaryOp, left: &Node, right: &Node, selection: Selection<'_>, allow_half: bool) -> Result<Option<Truths>> {
         use std::cmp::Ordering::{self, Equal, Greater, Less};
         let (equality_only, accept): (bool, fn(Option<Ordering>) -> bool) = match op {
             BinaryOp::Eq => (true, |ordering| ordering == Some(Equal)),
@@ -1541,7 +1557,8 @@ impl Evaluation<'_> {
             BinaryOp::GtEq => (false, |ordering| matches!(ordering, Some(Greater | Equal))),
             _ => return Ok(None),
         };
-        let Some(prepared) = self.prepared(&[left, right], selection, |operand, rows| self.operand(operand, rows))? else { return Ok(None) };
+        let Some(prepared) = self.prepared(&[left, right], selection, |operand, rows| self.operand_with_half(operand, rows, allow_half))?
+            else { return Ok(None) };
         let Prepared::Live { rows, arguments } = prepared else { return Ok(Some(Truths::Null)) };
         let [left, right] = arguments.as_slice() else { unreachable!("a comparison has two operands") };
         let live = |row: usize| reads(rows.as_deref(), row);
@@ -1562,9 +1579,9 @@ impl Evaluation<'_> {
     }
 
     /// `left === right`, both read at every row.
-    fn identical(&self, left: &Node, right: &Node, selection: Selection<'_>) -> Result<Option<Truths>> {
-        let Some(left) = self.operand(left, selection)? else { return Ok(None) };
-        let Some(right) = self.operand(right, selection)? else { return Ok(None) };
+    fn identical(&self, left: &Node, right: &Node, selection: Selection<'_>, allow_half: bool) -> Result<Option<Truths>> {
+        let Some(left) = self.operand_with_half(left, selection, allow_half)? else { return Ok(None) };
+        let Some(right) = self.operand_with_half(right, selection, allow_half)? else { return Ok(None) };
         let _scratch = self.truth_scratch()?;
         let mut truths = Vec::with_capacity(self.len);
         for row in 0..self.len {
@@ -2671,6 +2688,37 @@ mod tests {
             assert_eq!((0..batch.len).map(|row| selection.contains(row)).collect::<Vec<_>>(),
                 expected.into_iter().map(|truth| truth == Some(true)).collect::<Vec<_>>());
         }
+    }
+
+    #[test]
+    fn half_float_comparison_keeps_fallible_compound_predicates_in_row_order() {
+        let field = |id, name: &str, scalar| Field {
+            id: ColumnId(id), name: name.into(), qualifier: None, qualified_only: false, unnamed: false,
+            data_type: LogicalType::Scalar(scalar),
+        };
+        let half = field(0, "half", ScalarType::F16);
+        let number = field(1, "number", ScalarType::I64);
+        let schema = Schema::new(vec![half.clone(), number.clone()]).unwrap();
+        let integer = |value| Expr::Literal(Value::I64(value));
+        let comparison = Expr::binary(BinaryOp::Eq, half.expression(), Expr::Literal(Value::F16(0x3c00)));
+        let add = Expr::binary(BinaryOp::Eq,
+            Expr::binary(BinaryOp::Add, number.expression(), integer(1)), integer(0));
+        let divide = Expr::binary(BinaryOp::Eq,
+            Expr::binary(BinaryOp::Divide, integer(1), number.expression()), integer(0));
+        let predicate = Expr::binary(BinaryOp::Or,
+            Expr::binary(BinaryOp::And, comparison.clone(), add.clone()), divide.clone());
+        let context = rtdb_expr::EvalContext::default();
+        let first = [Value::F16(0x3c00), Value::I64(0)];
+        let second = [Value::F16(0x3c00), Value::I64(i64::MAX)];
+        let divide_by_zero = rtdb_expr::evaluate(&divide, &schema, &first, &context).unwrap_err();
+        let overflow = rtdb_expr::evaluate(&add, &schema, &second, &context).unwrap_err();
+        assert_ne!(divide_by_zero.code, overflow.code);
+        assert_eq!(rtdb_expr::evaluate(&predicate, &schema, &first, &context).unwrap_err().code, divide_by_zero.code);
+        assert_eq!(rtdb_expr::evaluate(&predicate, &schema, &second, &context).unwrap_err().code, overflow.code);
+        assert!(Predicate::bind(&comparison, &schema).is_some());
+        assert!(Projection::bind(&comparison, &schema).is_some());
+        assert!(Predicate::bind(&predicate, &schema).is_none());
+        assert!(Projection::bind(&predicate, &schema).is_none());
     }
 
     #[test]

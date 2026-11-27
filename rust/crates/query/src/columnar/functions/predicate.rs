@@ -26,10 +26,11 @@ pub(super) enum CellKind {
 }
 
 impl CellKind {
-    fn of_scalar(scalar: &ScalarType) -> Option<Self> {
+    fn of_scalar(scalar: &ScalarType, half: bool) -> Option<Self> {
         Some(match scalar {
             ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64 => Self::Int,
-            ScalarType::F16 | ScalarType::F32 | ScalarType::F64 => Self::Float,
+            ScalarType::F16 if half => Self::Float,
+            ScalarType::F32 | ScalarType::F64 => Self::Float,
             ScalarType::Utf8 => Self::Text,
             ScalarType::Bool => Self::Bool,
             ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone } => Self::Micros(timezone.clone()),
@@ -40,15 +41,15 @@ impl CellKind {
 }
 
 /// The non-null cell categories a schema type may yield, or `None` where any leg is outside these comparisons.
-pub(super) fn cell_kinds(logical: &LogicalType) -> Option<Vec<CellKind>> {
-    fn collect(logical: &LogicalType, out: &mut Vec<CellKind>) -> Option<()> {
+pub(super) fn cell_kinds(logical: &LogicalType, half: bool) -> Option<Vec<CellKind>> {
+    fn collect(logical: &LogicalType, half: bool, out: &mut Vec<CellKind>) -> Option<()> {
         match logical {
             LogicalType::Nothing => return None,
             LogicalType::Null => {}
-            LogicalType::Maybe(inner) | LogicalType::RunEndEncoded { value: inner, .. } => collect(inner, out)?,
-            LogicalType::Union(legs) => for leg in legs { collect(leg, out)?; },
+            LogicalType::Maybe(inner) | LogicalType::RunEndEncoded { value: inner, .. } => collect(inner, half, out)?,
+            LogicalType::Union(legs) => for leg in legs { collect(leg, half, out)?; },
             LogicalType::Scalar(scalar) => {
-                let kind = CellKind::of_scalar(scalar)?;
+                let kind = CellKind::of_scalar(scalar, half)?;
                 if !out.contains(&kind) { out.push(kind); }
             }
             _ => return None,
@@ -56,16 +57,17 @@ pub(super) fn cell_kinds(logical: &LogicalType) -> Option<Vec<CellKind>> {
         Some(())
     }
     let mut kinds = Vec::new();
-    collect(logical, &mut kinds)?;
+    collect(logical, half, &mut kinds)?;
     Some(kinds)
 }
 
 /// The cell category of a literal scalar value: `Some(None)` for null, `None` for a type outside these comparisons.
-pub(super) fn value_cell_kind(value: &Value) -> Option<Option<CellKind>> {
+pub(super) fn value_cell_kind(value: &Value, half: bool) -> Option<Option<CellKind>> {
     Some(match value {
         Value::Null => None,
         Value::I8(_) | Value::I16(_) | Value::I32(_) | Value::I64(_) => Some(CellKind::Int),
-        Value::F16(_) | Value::F32(_) | Value::F64(_) => Some(CellKind::Float),
+        Value::F16(_) if half => Some(CellKind::Float),
+        Value::F32(_) | Value::F64(_) => Some(CellKind::Float),
         Value::Utf8(_) => Some(CellKind::Text),
         Value::Bool(_) => Some(CellKind::Bool),
         Value::Timestamp { unit: TimeUnit::Microsecond, timezone, .. } => Some(CellKind::Micros(timezone.clone())),
@@ -110,7 +112,7 @@ pub(super) enum Cell<'a> {
 pub(super) enum Cells<'a> {
     Null, Uuid(&'a FixedSizeBinaryArray), Int(&'a Int64Array), Int32(&'a Int32Array), Int16(&'a Int16Array), Int8(&'a Int8Array),
     Float(&'a Float64Array), Float16(&'a Float16Array), Float32(&'a Float32Array), Text(&'a StringArray), Bool(&'a BooleanArray),
-    Micros(&'a TimestampMicrosecondArray, Option<&'a str>), Values(&'a [Value]),
+    Micros(&'a TimestampMicrosecondArray, Option<&'a str>), Values(&'a [Value], bool),
     /// A dense union whose legs are each a plain cell type, read through the leg each cell's type id names.
     Union { array: &'a UnionArray, legs: Vec<Option<Cells<'a>>> },
     /// A run-end encoded column whose physical values are read as `Cells`.
@@ -121,13 +123,13 @@ pub(super) enum Cells<'a> {
 }
 
 impl<'a> Cells<'a> {
-    pub(super) fn of(column: &'a Column) -> Option<Self> {
+    pub(super) fn of(column: &'a Column, half: bool) -> Option<Self> {
         match column {
-            Column::Values(values) => Some(Self::Values(values)),
-            Column::Arrow { array, field, logical } => Self::arrow(array.as_ref(), field, logical.as_ref()),
+            Column::Values(values) => Some(Self::Values(values, half)),
+            Column::Arrow { array, field, logical } => Self::arrow(array.as_ref(), field, logical.as_ref(), half),
             Column::Selected(selected) => {
                 let sources = selected.sources.iter().map(|source| match source {
-                    Some((array, field, logical, _)) => Self::arrow(array.as_ref(), field, logical.as_ref()).map(Some),
+                    Some((array, field, logical, _)) => Self::arrow(array.as_ref(), field, logical.as_ref(), half).map(Some),
                     None => Some(None),
                 }).collect::<Option<Vec<_>>>()?;
                 Some(Self::Selected { rows: &selected.cells, sources })
@@ -135,7 +137,7 @@ impl<'a> Cells<'a> {
         }
     }
 
-    fn arrow(array: &'a dyn Array, field: &'a ArrowField, logical: Option<&'a LogicalType>) -> Option<Self> {
+    fn arrow(array: &'a dyn Array, field: &'a ArrowField, logical: Option<&'a LogicalType>, half: bool) -> Option<Self> {
         let scalar = logical.and_then(plain_scalar);
         let plain = |expected: ScalarType| match logical { Some(_) => scalar == Some(&expected), None => field.metadata().is_empty() };
         let any = array.as_any();
@@ -145,7 +147,7 @@ impl<'a> Cells<'a> {
             DataType::Int32 if plain(ScalarType::I32) => any.downcast_ref().map(Self::Int32),
             DataType::Int16 if plain(ScalarType::I16) => any.downcast_ref().map(Self::Int16),
             DataType::Int8 if plain(ScalarType::I8) => any.downcast_ref().map(Self::Int8),
-            DataType::Float16 if plain(ScalarType::F16) => any.downcast_ref().map(Self::Float16),
+            DataType::Float16 if half && plain(ScalarType::F16) => any.downcast_ref().map(Self::Float16),
             DataType::Float32 if plain(ScalarType::F32) => any.downcast_ref().map(Self::Float32),
             DataType::Float64 if plain(ScalarType::F64) => any.downcast_ref().map(Self::Float),
             DataType::Utf8 if plain(ScalarType::Utf8) => any.downcast_ref().map(Self::Text),
@@ -173,15 +175,15 @@ impl<'a> Cells<'a> {
                 match ends.data_type() {
                     DataType::Int16 => {
                         let array: &'a RunArray<Int16Type> = any.downcast_ref()?;
-                        Some(Self::RunEnd16 { array, values: Box::new(Self::arrow(array.values().as_ref(), values_field, inner_logical)?) })
+                        Some(Self::RunEnd16 { array, values: Box::new(Self::arrow(array.values().as_ref(), values_field, inner_logical, half)?) })
                     }
                     DataType::Int32 => {
                         let array: &'a RunArray<Int32Type> = any.downcast_ref()?;
-                        Some(Self::RunEnd32 { array, values: Box::new(Self::arrow(array.values().as_ref(), values_field, inner_logical)?) })
+                        Some(Self::RunEnd32 { array, values: Box::new(Self::arrow(array.values().as_ref(), values_field, inner_logical, half)?) })
                     }
                     DataType::Int64 => {
                         let array: &'a RunArray<Int64Type> = any.downcast_ref()?;
-                        Some(Self::RunEnd64 { array, values: Box::new(Self::arrow(array.values().as_ref(), values_field, inner_logical)?) })
+                        Some(Self::RunEnd64 { array, values: Box::new(Self::arrow(array.values().as_ref(), values_field, inner_logical, half)?) })
                     }
                     _ => None,
                 }
@@ -195,7 +197,7 @@ impl<'a> Cells<'a> {
                 for (id, child_field) in fields.iter() {
                     if id < 0 { return None; }
                     let child = array.child(id);
-                    let cells = Self::arrow(child.as_ref(), child_field, None)?;
+                    let cells = Self::arrow(child.as_ref(), child_field, None, half)?;
                     let id = id as usize;
                     if legs.len() <= id { legs.resize_with(id + 1, || None); }
                     legs[id] = Some(cells);
@@ -221,7 +223,7 @@ impl<'a> Cells<'a> {
             Self::Micros(array, _) => array.null_count() == 0,
             Self::Uuid(array) => array.null_count() == 0,
             Self::RunEnd16 { values, .. } | Self::RunEnd32 { values, .. } | Self::RunEnd64 { values, .. } => values.complete(),
-            Self::Null | Self::Values(_) | Self::Union { .. } | Self::Selected { .. } => false,
+            Self::Null | Self::Values(..) | Self::Union { .. } | Self::Selected { .. } => false,
         }
     }
 
@@ -251,7 +253,7 @@ impl<'a> Cells<'a> {
                 Some(bytes) => Some(Cell::Uuid(u128::from_be_bytes(bytes.map_err(|_| ())?))),
                 None => None,
             },
-            Self::Values(values) => scalar(&values[row])?,
+            Self::Values(values, half) => scalar(&values[row], *half)?,
             Self::Union { array, legs } => {
                 let leg = usize::try_from(array.type_id(row)).ok().and_then(|id| legs.get(id)).and_then(Option::as_ref).ok_or(())?;
                 leg.get(array.value_offset(row))?
@@ -278,14 +280,16 @@ where i64: From<T::Native> {
 }
 
 /// The cell of a scalar value, `Err` for a type no comparison here reads.
-pub(super) fn scalar(value: &Value) -> Result<Option<Cell<'_>>, ()> {
+pub(super) fn scalar(value: &Value, half: bool) -> Result<Option<Cell<'_>>, ()> {
     Ok(match value {
         Value::Null => None,
         Value::I8(value) => Some(Cell::Int(i64::from(*value))),
         Value::I16(value) => Some(Cell::Int(i64::from(*value))),
         Value::I32(value) => Some(Cell::Int(i64::from(*value))),
         Value::I64(value) => Some(Cell::Int(*value)),
-        Value::F16(_) | Value::F32(_) | Value::F64(_) => Some(Cell::Float(rtdb_expr::number(value).ok_or(())?)),
+        Value::F16(_) if half => Some(Cell::Float(rtdb_expr::number(value).ok_or(())?)),
+        Value::F32(value) => Some(Cell::Float(f64::from(*value))),
+        Value::F64(value) => Some(Cell::Float(*value)),
         Value::Utf8(value) => Some(Cell::Text(value)),
         Value::Bool(value) => Some(Cell::Bool(*value)),
         Value::Timestamp { value, unit: TimeUnit::Microsecond, timezone } => Some(Cell::Micros(*value, timezone.as_deref())),
