@@ -1,0 +1,60 @@
+= Logkeeper rolling upgrades and RTDB Multi recovery, 2026-11-27
+
+Both process runs used loopback on one Apple Silicon host, real enrolled keeper media, and mutual TLS.
+The keeper runtime in the RTDB runs was Logkeeper `41cf1069d65f8b5956c82d8f871334eaf4a9b299`, which includes the N/N−1 protocol, durable quarantine, decommissioning, and credential reload.
+The release candidate also includes the terminal snapshot fix at Logkeeper `ae7b0d6`.
+
+== Process restart qualification
+
+`rust/bench/v1_consensus_keepers.py --seconds 2 --checkpoints deferred` ran three voter processes, a catalog process and RTDB Multi.
+The existing RTDB release binary had SHA-256 `d31edbdac0a1682cb2f94ef170b28874844df8758b7d11e05d6b495d77c4bb36`.
+The keepers used their default full-sync mode.
+
+[cols="3,1",options="header"]
+|===
+| Recheck | Exact receipts verified
+| After a voter was killed during writes and restarted | 2,199
+| After RTDB was killed and reopened on its data directory | 2,199
+| After every keeper was stopped and restarted | 2,417
+| After writes resumed following the keeper restart | 2,643
+|===
+
+The first run exposed an incorrect peer-frame offset that blocked elections with ordinary keeper UUIDs.
+Logkeeper `8cb95bb` accounts for the encoded UUID length prefixes and uses realistic UUIDs in its N/N−1 compatibility tests.
+The numbers above are from the successful run after the fix.
+
+== Automatic recovery after two voters are lost
+
+RTDB was built from `498b15597a7629dcc4a5c2b62391c837bdffa9fa` with the `multi` feature and three documentation-only additions required by the vendored SQL parser's lint.
+RTDB main subsequently landed those missing comments independently.
+The keeper processes used explicit `fsync` mode for this functional test.
+
+The fixture had three voters, a single catalog keeper, and two spare keepers in the failure domains of the voters to be lost.
+RTDB acknowledged 2,014 transactions before it was stopped.
+SIGHUP caused a keeper to reload its credentials while RTDB was running.
+The test stopped both lost voters, stopped the survivor, and ran `logkeeper keeper recover-stream` on the survivor for the RTDB catalog and database streams.
+Each command named both stopped voters and both replacements.
+After starting the survivor and RTDB, RTDB logged `rtdb/journal-recovered` for both streams and resumed without manual acknowledgement.
+TxStatus returned all 2,014 pre-recovery receipts and 2,502 receipts for new commits after recovery.
+
+== Keeper qualification
+
+* Logkeeper `49c5fab` passed the all-features workspace suite with 443 passing tests, zero failures, and five ignored tests.
+* Five process tests covered the real N−1 Logkeeper binary at `44d3f2aadb`, mixed versions, rolling restart under writes, rollback before finalization, and fencing after finalization.
+* The rolling runbook test drained, restarted, waited for readiness, and undrained each keeper while writers ran.
+* The fault harness reproduced a late restart on a deleted stream at seed 2083.
+  The fix saves a terminal snapshot before closing a replica and lets closed tombstones participate in elections so a restarted voter can apply the deletion.
+  Seed 2083 passed after the fix and wipe seed 5006 passed on isolated replay.
+* Kubeconform validated all 13 deployment resources and promtool validated all 22 alert rules.
+* The Linux ARM64 image built from Logkeeper `052379a` and its CLI ran as UID 10001.
+  Systemd verified the service unit against that image’s keeper binary.
+
+== Monitoring overhead
+
+Eight paired 10-second measurements on an Apple M1 compared `929b46d` with `6de4378` using plain fsync, 128 active streams, and batches of 16 records.
+Median throughput was 72,792 versus 72,152 records/s, a decrease of 0.88%.
+Three idle full-sync pairs put both medians at 0.34 CPU cores.
+The loaded full-sync throughput comparison remains inconclusive.
+
+These local tests exercise the keeper upgrade and RTDB recovery paths.
+The hosted-cell cutover, independent failure-domain measurements, and a completed long soak remain separate qualification steps.
