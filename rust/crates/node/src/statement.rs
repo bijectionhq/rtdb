@@ -21,7 +21,7 @@ struct PreparedData {
     policy: ResultSignaturePolicy,
     sharable: bool,
     _reservation: Arc<MemoryReservation>,
-    plan: std::sync::Mutex<Option<CachedPlan>>,
+    plan: parking_lot::Mutex<Option<CachedPlan>>,
 }
 enum PreparedResult { Query { schema: Schema, pg_types: Vec<PgType>, parameter_projection: bool }, Dml }
 
@@ -174,7 +174,7 @@ impl PreparedSql {
         let bytes = bytes.checked_add(snapshot_selector.retained_bytes()?).ok_or_else(size_error)?;
         let reservation = context.memory.reserve(bytes)?;
         drop(source_reservation);
-        Ok(Self(Arc::new(PreparedData { source, options, parameters, notices, ordered_index_command_tag, snapshot_selector, result, policy, sharable, _reservation: reservation, plan: std::sync::Mutex::new(cached) })))
+        Ok(Self(Arc::new(PreparedData { source, options, parameters, notices, ordered_index_command_tag, snapshot_selector, result, policy, sharable, _reservation: reservation, plan: parking_lot::Mutex::new(cached) })))
     }
 
     pub fn search_path(&self) -> &[String] { &self.0.options.search_path }
@@ -410,16 +410,14 @@ impl PreparedSql {
         context.check_cancelled()?;
         if self.is_dml() { return Err(kind_error()); }
         if argument_types.len() != self.parameter_count() { return Err(parameter_error("Parameter field count differs from the prepared statement")); }
-        let cached = self.0.plan.lock().ok().and_then(|plan| plan.as_ref()
+        let cached = self.0.plan.lock().as_ref()
             .filter(|plan| self.binds_to(&plan.options, &context.timezone, argument_types, execution))
-            .and_then(|plan| plan.plan.lookups_and_query()));
+            .and_then(|plan| plan.plan.lookups_and_query());
         if let Some((lookups, query)) = cached && lookups.replay(&context.catalog)? { return query.recharged(&context.memory); }
         let options = self.bound_options(&context.timezone, argument_types, execution);
         if let Some(shared) = self.0.sharable.then(|| shared_plan(&self.0.source, context, &options)).transpose()?.flatten() {
             let query = shared.query.recharged(&context.memory)?;
-            if let Ok(mut plan) = self.0.plan.lock() {
-                *plan = Some(CachedPlan { options, plan: KeptPlan::Shared(Arc::downgrade(&shared)) });
-            }
+            *self.0.plan.lock() = Some(CachedPlan { options, plan: KeptPlan::Shared(Arc::downgrade(&shared)) });
             return Ok(query);
         }
         let _syntax = admit_sql_syntax(&self.0.source, &context.memory)?;
@@ -436,8 +434,8 @@ impl PreparedSql {
             result => result?,
         };
         let query = kept.recharged(&context.memory)?;
-        if let Some(lookups) = lookups && let Ok(mut plan) = self.0.plan.lock() {
-            *plan = Some(CachedPlan { options, plan: KeptPlan::Own { lookups: Arc::new(lookups), query: kept } });
+        if let Some(lookups) = lookups {
+            *self.0.plan.lock() = Some(CachedPlan { options, plan: KeptPlan::Own { lookups: Arc::new(lookups), query: kept } });
         }
         Ok(query)
     }
@@ -501,8 +499,8 @@ impl KeptPlan {
 }
 
 /// The node's shared plan for `source`, planning it into the node's cache on a miss.
-/// None where the context carries no cache, or where the statement is not a query the cache can keep; the caller then
-/// plans it itself, so a statement that fails to plan reports the caller's error.
+/// Returns `Ok(None)` when no cache is present, the statement is not a sharable query, or the plan exceeds the cache's
+/// per-entry budget; every other planning error propagates directly so the caller does not plan a failing query twice.
 fn shared_plan(source: &str, context: &QueryContext, options: &PrepareOptions) -> Result<Option<Arc<SharedPlan>>> {
     let Some(plans) = context.shared_plans() else { return Ok(None); };
     context.check_cancelled()?;
@@ -512,7 +510,12 @@ fn shared_plan(source: &str, context: &QueryContext, options: &PrepareOptions) -
         timezone: default_timezone.clone(), generate_series_end_exclusive: *generate_series_end_exclusive,
     };
     if let Some(shared) = plans.get(&key) && shared.lookups.replay(&context.catalog)? { return Ok(Some(shared)); }
-    let Ok(Some((lookups, query, inferred, notices))) = plan_for_sharing(source, context, options, &plans.entry_budget()) else { return Ok(None); };
+    let (lookups, query, inferred, notices) = match plan_for_sharing(source, context, options, &plans.entry_budget()) {
+        Ok(Some(plan)) => plan,
+        Ok(None) => return Ok(None),
+        Err(error) if error.is(AnomalyKind::ResourceExhausted) => return Ok(None),
+        Err(error) => return Err(error),
+    };
     Ok(plans.insert(key, lookups, query, inferred, notices))
 }
 
@@ -612,7 +615,7 @@ fn arrow_surface_preparation_reuses_the_first_plan_across_query_budgets() {
     let statement_budget = MemoryBudget::new(1 << 20);
     let context = QueryContext::new(catalog, Arc::clone(&statement_budget), rtdb_types::Timestamp(0), "UTC", QueryOptions::default(), &cancellation).unwrap();
     let prepared = PreparedSql::prepare("SELECT 1", &context, Default::default(), ResultSignaturePolicy::Dynamic).unwrap();
-    let original = prepared.0.plan.lock().unwrap().as_ref().unwrap().plan.lookups_and_query().unwrap().1.relation().clone();
+    let original = prepared.0.plan.lock().as_ref().unwrap().plan.lookups_and_query().unwrap().1.relation().clone();
     let query_budget = MemoryBudget::new(1 << 20);
     let mut query_context = context;
     Arc::make_mut(&mut query_context).memory = Arc::clone(&query_budget);
@@ -869,6 +872,22 @@ mod shared_plan_tests {
             used
         };
         assert_eq!(after_eviction(true), after_eviction(false));
+    }
+
+    #[test]
+    fn shared_plan_propagates_planning_errors_and_declines_only_on_cache_budget() {
+        let state = PartitionState::empty(Default::default()).unwrap();
+        let plans = Arc::new(SharedPlans::new(&MemoryBudget::new(1 << 30)));
+        let context = session(&[("xtdb", &state)], "xtdb", "UTC", &plans);
+        let error = super::shared_plan("SELECT * FROM (SELECT 1) AS a CROSS JOIN (SELECT 2) AS a", &context, &Default::default())
+            .err().expect("a binder error must propagate instead of being swallowed and re-planned");
+        assert!(!error.is(AnomalyKind::ResourceExhausted));
+
+        let tiny_node = MemoryBudget::new(1);
+        let tiny_plans = Arc::new(SharedPlans::new(&tiny_node));
+        let tiny_context = session(&[("xtdb", &state)], "xtdb", "UTC", &tiny_plans);
+        assert!(super::shared_plan("SELECT 1 AS one", &tiny_context, &Default::default()).unwrap().is_none(),
+            "a plan that exceeds the shared cache's entry budget declines sharing rather than failing the query");
     }
 }
 
