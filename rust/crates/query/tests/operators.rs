@@ -536,6 +536,44 @@ async fn group_ids_preserve_nonreflexive_keys_and_top_level_null_groups() {
 }
 
 #[tokio::test]
+async fn grouping_packs_computed_text_keys_under_pressure() -> Result<()> {
+    use arrow_array::{RecordBatch, StringArray};
+    use rtdb_columnar::{OwnedBatch, to_field};
+    use rtdb_plan::LiteralArrowPages;
+
+    let context = query_context(Default::default());
+    let memory = &context.memory;
+    let baseline = memory.used_bytes();
+    let pressure = memory.reserve(memory.available_bytes() - (4 << 20))?;
+    let text = scalar(ScalarType::Utf8).maybe();
+    let arrow_schema = Arc::new(arrow_schema::Schema::new(vec![to_field("name", &text)?]));
+    let keys: Vec<_> = (0..64).map(|index| match index {
+        0 => None,
+        1 => Some(String::new()),
+        _ => Some(format!("{index}-éß")),
+    }).collect();
+    let page = |repeats| -> Result<OwnedBatch> {
+        let rows = keys.len() * repeats;
+        let array = StringArray::from_iter(keys.iter().cycle().take(rows).map(|key| key.as_deref()));
+        let batch = RecordBatch::try_new(Arc::clone(&arrow_schema), vec![Arc::new(array)]).unwrap();
+        OwnedBatch::new(batch, memory)
+    };
+    let input = Arc::new(Relation::new(Schema::new(vec![field(0, "name", text.clone())])?, RelationNode::ArrowLiteralPages {
+        pages: LiteralArrowPages::new(vec![page(1)?, page(128)?]),
+    })?);
+    let group = NamedExpr {
+        field: field(1, "key", text),
+        expr: Expr::binary(BinaryOp::Concat, input.schema().fields()[0].expression(), Expr::Literal(Value::Utf8(String::new()))),
+    };
+    let count = agg(2, AggregateFunction::CountStar, None, scalar(ScalarType::I64));
+    let expected: Vec<_> = keys.into_iter().map(|key| vec![key.map_or(Value::Null, Value::Utf8), Value::I64(129)]).collect();
+    assert_eq!(collect(aggregate(input, vec![group], vec![count]), Arc::clone(&context)).await?, expected);
+    drop(pressure);
+    assert_eq!(memory.used_bytes(), baseline);
+    Ok(())
+}
+
+#[tokio::test]
 async fn array_aggregate_orders_selected_rows_and_distinct_retains_null_arguments() {
     let input = values(0, "v", scalar(ScalarType::I64).maybe(), vec![Value::I64(2), Value::Null, Value::I64(1), Value::I64(2), Value::Null]);
     let argument = input.schema().fields()[0].expression();

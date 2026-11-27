@@ -13,7 +13,7 @@ use std::{collections::{HashMap, HashSet}, ops::Range, sync::Arc};
 
 use arrow_array::{
     Array, ArrayRef, BooleanArray, FixedSizeListArray, ListArray, MapArray, NullArray, StructArray, UnionArray,
-    builder::{BooleanBuilder, Float32Builder, Float64Builder, Int8Builder, Int16Builder, Int32Builder, Int64Builder},
+    builder::{BooleanBuilder, Float32Builder, Float64Builder, Int8Builder, Int16Builder, Int32Builder, Int64Builder, StringBuilder},
 };
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
 use arrow_schema::{DataType, Field as ArrowField};
@@ -5668,11 +5668,37 @@ fn repeat_cell(value: &Value, count: usize) -> Result<Column> {
 }
 
 fn pack_scalar_values(values: &[Value], ty: LogicalType, memory: &Arc<MemoryBudget>) -> Result<(Column, Arc<MemoryReservation>)> {
-    let bound = rtdb_columnar::estimate_builder_bytes(&ty, values)?;
-    let scratch = memory.reserve(bound)?;
-    let array = rtdb_columnar::copy_array(&ty, values)?;
+    let (array, scratch) = if plain_scalar(&ty) == Some(&ScalarType::Utf8) {
+        pack_utf8_values(values, memory)?
+    } else {
+        let scratch = memory.reserve(rtdb_columnar::estimate_builder_bytes(&ty, values)?)?;
+        (rtdb_columnar::copy_array(&ty, values)?, scratch)
+    };
     let field = Arc::new(rtdb_columnar::to_field("value", &ty)?);
     Ok((Column::Arrow { array, field, logical: Some(ty) }, scratch))
+}
+
+fn pack_utf8_values(values: &[Value], memory: &Arc<MemoryBudget>) -> Result<(ArrayRef, Arc<MemoryReservation>)> {
+    let texts = values.iter().map(|value| match value {
+        Value::Utf8(text) => Some(text.as_str()),
+        Value::Null => None,
+        _ => unreachable!("The scalar result type admitted only strings and nulls"),
+    });
+    let payload = texts.clone().flatten().try_fold(0usize, |bytes, text| {
+        bytes.checked_add(text.len()).ok_or_else(size_error)
+    })?;
+    i32::try_from(payload).map_err(|_| size_error())?;
+    // The input values are already charged, and the pre-sized builder copies only their bytes into Arrow.
+    let bound = values.len().checked_add(1)
+        .and_then(|offsets| offsets.checked_mul(size_of::<i32>()))
+        .and_then(|bytes| bytes.checked_add(payload))
+        .and_then(|bytes| bytes.checked_add(values.len().div_ceil(8)))
+        .and_then(|bytes| bytes.checked_add(4096))
+        .ok_or_else(size_error)?;
+    let scratch = memory.reserve(bound)?;
+    let mut builder = StringBuilder::with_capacity(values.len(), payload);
+    for text in texts { builder.append_option(text); }
+    Ok((Arc::new(builder.finish()), scratch))
 }
 
 pub(crate) fn pack_evaluated_column(values: &[Value], memory: &Arc<MemoryBudget>) -> Result<(Column, Arc<MemoryReservation>)> {

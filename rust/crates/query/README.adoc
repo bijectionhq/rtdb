@@ -131,6 +131,7 @@ The public `EXPLAIN ANALYZE` report uses its existing schema.
 * Set operations use exact equality checks against spill files, including occurrence tracking for INTERSECT ALL and EXCEPT ALL.
 * Sort preserves complete input-page accumulation, applies the configured stable object sorter within each run, and merges four adjacent runs per pass.
 * Grouping assigns first-seen group IDs across complete input pages, then updates each aggregate column in specification order.
+  Evaluated UTF-8 keys pack into pre-sized Arrow buffers under the query budget while the grouping state is retained.
   Count, sum, average, min/max, boolean, variance, standard deviation, ordered array aggregates, and `vec-agg` share that page schedule.
   Groups and their per-group state stay in memory until the input ends, as in XTDB's group-by, and an ordered `ARRAY_AGG` sorts its rows in memory as XTDB's does; a query whose groups the memory budget cannot hold fails with a memory error rather than spilling.
   Percentiles are the exception: XTDB sorts their values with its external sorter, and so they spill as a sort does.
