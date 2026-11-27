@@ -745,16 +745,17 @@ mod tests {
         assert_eq!(times, vec![Timestamp(100), Timestamp(101), Timestamp(102), Timestamp(103)]);
         assert!(released.iter().all(|receipt| receipt.outcome == Outcome::Then));
 
-        // Two commits sampled at the same microsecond both commit, ordered by version.
+        // Two commits sampled at the same microsecond get distinct times, as XTDB's do: the second one tick later.
         let mut shared = TransactPipeline::new(TransactState::new(INCARNATION), 1, 8).unwrap();
         let decisions = shared.decide_batch(&requests[..2], &|| Timestamp(100), FEATURES, &claims());
         assert!(matches!(decisions[0], Ok(Decision::Append { position: 1, .. })));
         assert!(matches!(decisions[1], Ok(Decision::Append { position: 2, .. })));
-        let tied = shared.acknowledge(2).unwrap();
-        assert_eq!(tied.iter().map(|r| r.system_time).collect::<Vec<_>>(), vec![Timestamp(100), Timestamp(100)]);
-        // A regressed sample below the last commit faults rather than waiting or clamping.
-        let regressed = shared.decide(&requests[2], Timestamp(99), FEATURES, &claims());
-        assert!(matches!(regressed, Err(error) if error.code == STORE_CLOCK_REGRESSED));
+        let smoothed = shared.acknowledge(2).unwrap();
+        assert_eq!(smoothed.iter().map(|r| r.system_time).collect::<Vec<_>>(), vec![Timestamp(100), Timestamp(101)]);
+        // A sample behind the last commit follows it by one tick rather than faulting.
+        assert!(matches!(shared.decide(&requests[2], Timestamp(99), FEATURES, &claims()), Ok(Decision::Append { position: 3, .. })));
+        let behind = shared.acknowledge(3).unwrap();
+        assert_eq!(behind.iter().map(|r| r.system_time).collect::<Vec<_>>(), vec![Timestamp(102)]);
     }
 
     #[test]

@@ -91,11 +91,15 @@ fn a_store_append_is_judged_and_stamped_at_its_clock_sample() {
     assert_eq!(&page.entries[0].key[4..], stamp.as_slice());
     assert_eq!(page.entries[0].value.as_deref(), Some(stamp.as_slice()));
 
-    // Ties at the head's time commit in version order; a regressed sample faults.
-    assert_eq!(refused(&state, &store_append(2, 1, Vec::new(), vec![other.clone()], Window::default()), 2, 99), STORE_CLOCK_REGRESSED);
-    let tied = plan(&state, &store_append(2, 1, Vec::new(), vec![other.clone()], Window::default()), 2, 100, DEFAULT);
-    let tied_receipt = apply(&mut state, 2, tied.record()).unwrap();
-    assert_eq!((tied_receipt.basis, tied_receipt.system_time, tied_receipt.outcome), (basis(2), Timestamp(100), Outcome::Then));
+    // A sample at or below the head's time commits one tick past it, as XTDB smooths system time.
+    for sample in [99, 100] {
+        let smoothed = plan(&state, &store_append(2, 1, Vec::new(), vec![other.clone()], Window::default()), 2, sample, DEFAULT);
+        let TransactionRecord::Tx(resolved) = smoothed.record() else { panic!("expected a transaction record") };
+        assert_eq!((resolved.receipt.basis, resolved.receipt.system_time), (basis(2), Timestamp(101)), "{sample}");
+    }
+    let smoothed = plan(&state, &store_append(2, 1, Vec::new(), vec![other.clone()], Window::default()), 2, 100, DEFAULT);
+    let smoothed_receipt = apply(&mut state, 2, smoothed.record()).unwrap();
+    assert_eq!((smoothed_receipt.basis, smoothed_receipt.system_time, smoothed_receipt.outcome), (basis(2), Timestamp(101), Outcome::Then));
     // Outside the window nothing is decided.
     let closed = Window { not_before: None, before: Some(Timestamp(150)) };
     let unopened = Window { not_before: Some(Timestamp(300)), before: None };

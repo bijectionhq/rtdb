@@ -1146,9 +1146,8 @@ impl MultiDatabase {
     /// only once its clock passes the predecessor's lease end plus the drift
     /// bound. It waits once, at takeover, on the lease alone: never on the
     /// last stamp, which would make the wait depend on hidden commits, and
-    /// never per append. Its samples then exceed every predecessor sample, so
-    /// a sample below the head's time is a clock fault
-    /// (`rtdb.store/clock-regressed`).
+    /// never per append. A sample at or below the head's time is still
+    /// smoothed one tick past it, as XTDB smooths system time.
     fn observed_lapse(&self) -> bool {
         self.state()
             .lease

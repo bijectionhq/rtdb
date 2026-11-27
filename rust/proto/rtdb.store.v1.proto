@@ -17,10 +17,10 @@ syntax = "proto3";
 // with FAILED_PRECONDITION and the caller starts again from a fresh read.
 //
 // A stamp is what the store assigns a committing append under its ordering:
-// its version, and the writer's clock sampled at the ordering point, in
-// microseconds. Micros never decrease along versions and are never raised to
-// a predecessor's; ties are admitted and ordered by version. Regression is a
-// fault of the writer clock, never a per-append wait. Its 16-byte encoding is
+// its version, and its time in microseconds: the writer's clock sampled at the
+// ordering point, or one microsecond past the predecessor's when the sample
+// does not exceed it, as XTDB smooths system time. Micros strictly increase
+// along versions, so no two commits share a time. Its 16-byte encoding is
 // the micros big-endian with the sign bit flipped, then the version big-endian,
 // so encoded stamps sort in commit order.
 package rtdb.store.v1;

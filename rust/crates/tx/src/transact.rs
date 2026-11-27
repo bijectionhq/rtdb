@@ -344,9 +344,6 @@ pub struct StoreAppend {
     pub window: Window,
 }
 
-/// The writer's clock sample regressed below the store's last stamp: a fault,
-/// never raised to a predecessor's time and never waited out per append.
-pub const STORE_CLOCK_REGRESSED: &str = "rtdb.store/clock-regressed";
 /// The clock sample is before the store window's `not_before`.
 pub const STORE_OUTSIDE_EARLY: &str = "rtdb.store/outside-early";
 /// The clock sample is at or past the store window's `before`.
@@ -356,6 +353,12 @@ pub const STORE_BOUND: &str = "rtdb.store/bound";
 /// A derive's unique claim, filled at the stamp, counted a second claimant
 /// (Bijection T7-4, `store_derive::claim_exceeded`); nothing was written.
 pub const STORE_CLAIM: &str = "rtdb.store/claim";
+
+/// The append's time is smoothed past the head's, so the judge never sees a
+/// regressed reading.
+fn store_time_order() -> Anomaly {
+    Anomaly::fault("rtdb.tx/system-time", "The store append's time does not follow the head's")
+}
 
 fn store_append_shape() -> Anomaly {
     Anomaly::incorrect("rtdb.store/append-shape", "A store append carries only its store operation and read guards")
@@ -1283,7 +1286,7 @@ impl TransactState {
                 .and_then(FundingInput::appointment_observed_at).unwrap_or(Timestamp::MIN);
             BranchCut {
                 basis: Basis::new(head.basis.incarnation(), receipt_position),
-                system_time: now.max(head.system_time).max(receiver_time),
+                system_time: now.max(head.system_time.next()?).max(receiver_time),
             }
         };
         let appointment = match appointment {
@@ -1378,17 +1381,17 @@ impl TransactState {
         }
     }
 
-    /// `rtdb.store.v1.Append`, resolved at the ordering point. Its reads are judged
-    /// first. The writer's clock sample `now` is then judged by
+    /// `rtdb.store.v1.Append`, resolved at the ordering point. Its time is the
+    /// writer's clock sample `now` smoothed past the head's as XTDB's `TxResolver`
+    /// smooths every transaction, `max(now, head + 1 µs)`, so a classic head stamped
+    /// one tick past its predecessor or at a supplied time ahead of the clock is
+    /// followed, never refused. Its reads are judged first, then that time by
     /// [`store_clock::judge_store_clock`], the vendored `store_judge::admit`
-    /// (Bijection's `fact_store::persistence::judge::admit`, V9′):
-    /// ties at the head's time are admitted and ordered by position, a sample below
-    /// the head's time faults as [`STORE_CLOCK_REGRESSED`] (never raised, never
-    /// waited out per append), and a sample outside the window decides and records
-    /// nothing so a retry is judged again.
+    /// (Bijection's `fact_store::persistence::judge::admit`, V9′); a time outside
+    /// the window decides and records nothing so a retry is judged again.
     ///
     /// Every other outcome is a receipt under the request's key, so a retry returns
-    /// the first one: a commit with its stamp `{ micros: now, version: position }`,
+    /// the first one: a commit with its stamp `{ micros: time, version: position }`,
     /// a conflict, or a write-free append's validation. A validation is recorded at
     /// its own position with no effects; that position is the version it validated
     /// its reads through.
@@ -1416,13 +1419,16 @@ impl TransactState {
             key: request.key.clone(), basis, system_time, outcome, replayed: false, erasure: None, decision_clock: None,
         };
 
+        let last = (head.basis.position() > 0).then_some(head.system_time.0);
+        let sample = now;
+        let now = crate::system_time::automatic_time(last, sample.0).map(Timestamp)
+            .ok_or_else(|| Anomaly::incorrect("xtdb/time-overflow", "Timestamp has no following chronon"))?;
         let guard_time = now;
         let mut failed = Vec::new();
         for (i, guard) in request.guards.iter().enumerate() {
             if !guard.evaluate(view.index, guard_time, claims, None)? { failed.push(i); }
         }
 
-        let last = (head.basis.position() > 0).then_some(head.system_time.0);
         if failed.is_empty() {
             match store_clock::judge_store_clock(
                 head.basis.position(),
@@ -1432,12 +1438,7 @@ impl TransactState {
                 before.map(|t| t.0),
                 !mutates,
             ) {
-                store_judge::Admitted::Regressed => {
-                    return Err(Anomaly::fault(
-                        STORE_CLOCK_REGRESSED,
-                        "The writer clock regressed below the store's last commit",
-                    ));
-                }
+                store_judge::Admitted::Regressed => return Err(store_time_order()),
                 store_judge::Admitted::Outside(store_judge::Side::Early) => {
                     return Err(Anomaly::new(
                         AnomalyCategory::Busy,
@@ -1458,16 +1459,6 @@ impl TransactState {
                 }
                 store_judge::Admitted::Validated(_) | store_judge::Admitted::Committed { .. } => {}
             }
-        } else if matches!(
-            // A conflict's record takes the sample as its time too, so a
-            // regressed sample faults whatever the reads decided.
-            store_clock::judge_store_clock(head.basis.position(), last, now.0, None, None, true),
-            store_judge::Admitted::Regressed
-        ) {
-            return Err(Anomaly::fault(
-                STORE_CLOCK_REGRESSED,
-                "The writer clock regressed below the store's last commit",
-            ));
         }
 
         // Evaluate bounded-counter ops against the live store state at the
@@ -1513,9 +1504,8 @@ impl TransactState {
             Vec::new()
         };
         let commits = mutates && failed.is_empty() && failed_bound.is_none() && failed_claim.is_none();
-        // Every store record takes the writer's own clock sample: a conflict's,
-        // a bound refusal's and a validation's too. Ties are admitted and ordered
-        // by position, so no record's time is minted past the head's.
+        // Every store record takes the append's time: a conflict's, a bound
+        // refusal's and a validation's too.
         let system_time = now;
         let cut = BranchCut { basis: Basis::new(head.basis.incarnation(), position), system_time };
         let mut index = view.index.clone();
@@ -1555,7 +1545,7 @@ impl TransactState {
         };
         let record = TransactionRecord::Tx(ResolvedTransact {
             fingerprint, receipt: receipt(cut.basis, cut.system_time, outcome), effects, before: None,
-            receipt_namespace: None, admitted_at: now, workload: None, workload_digest: None,
+            receipt_namespace: None, admitted_at: sample, workload: None, workload_digest: None,
             request: Some(canonical_request),
         });
         Ok((Resolution::Append(PreparedAppend { position, record }), Some(after)))
