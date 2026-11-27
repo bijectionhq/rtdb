@@ -1,0 +1,137 @@
+{
+  "schema_version": 1,
+  "upstream_commit": "0b9fa440f23d2165250d215209f7fa9bd7c26a6f",
+  "test_check_version": "1.1.3",
+  "sources": {
+    "src/test/clojure/xtdb/block_boundary_test.clj": "9fb4986238c0f0a21c2e1f6cb9a5631fe58f858d970b1fbc0fa9cada5b2a2d5f",
+    "src/test/clojure/xtdb/operator/patch_test.clj": "664d5579f766e5004b0bfb30744080d74ecc3f0702d6545d5d1b2001227f8283",
+    "src/test/clojure/xtdb/expression_test.clj": "1f92f54831a52072a0422229a008c56ee8c7ea71f998e6affb5ed46d2318b3e1",
+    "src/test/clojure/xtdb/expression/temporal_test.clj": "151f452204762423429435b8e785ed23941b69ab19f32d3d09737dd9abd88df3",
+    "src/test/clojure/xtdb/vector/reader_test.clj": "51be12fa78df3ea92d097b735b402576c65570aab1b76e174ea75f258f3e7877",
+    "src/testFixtures/clojure/xtdb/test_generators.clj": "885faf1b3d10b089ea7a15e39903618979f9640eb329eac7bce1ebedac7d03ce",
+    "src/testFixtures/clojure/xtdb/test_util.clj": "01b0fb0ab7c1c53a79d6f78376344b5bc8a1aa7c30209f9ede6633ccf6d5d782"
+  },
+  "families": [
+    {
+      "id": "document-history",
+      "namespace": "xtdb.block-boundary-test",
+      "source": "src/test/clojure/xtdb/block_boundary_test.clj",
+      "kind": "test",
+      "default_trials": 8,
+      "cases": [
+        {"name": "delete-and-re-add-record-across-flush-boundaries", "line": 214},
+        {"name": "multiple-writes-to-doc", "line": 17},
+        {"name": "multiple-writes-to-doc-in-same-tx", "line": 40},
+        {"name": "mixed-records-flush-boundary", "line": 64},
+        {"name": "mixed-records-flush-and-compact-boundary", "line": 84, "unported": "requires a native compact-all observer"},
+        {"name": "mixed-records-flush-and-live-boundary", "line": 106},
+        {"name": "mixed-records-live-boundary", "line": 125},
+        {"name": "type-change-across-blocks", "line": 142, "unported": "requires a native compact-all observer"},
+        {"name": "single-typed-value-to-nils-across-blocks", "line": 167, "unported": "requires a native compact-all observer"},
+        {"name": "delete-records-across-flush-boundaries", "line": 191},
+        {"name": "deleting-all-from-table-across-flush-boundaries", "line": 245},
+        {"name": "erase-records-across-flush-boundaries", "line": 268},
+        {"name": "erase-and-re-add-record-across-flush-boundaries", "line": 288},
+        {"name": "erasing-all-from-table-across-flush-boundaries", "line": 319},
+        {"name": "mixed-ops-across-boundaries", "line": 339, "unported": "requires a native compact-all observer and a mapping for the original CREATE TABLE setup"},
+        {"name": "local-log-restart-block-boundary", "line": 360},
+        {"name": "updates-adding-new-keys-cross-boundaries", "line": 409},
+        {"name": "update-deduplication", "line": 470},
+        {"name": "update-same-keys-new-values", "line": 512}
+      ]
+    },
+    {
+      "id": "patch-merge",
+      "namespace": "xtdb.operator.patch-test",
+      "source": "src/test/clojure/xtdb/operator/patch_test.clj",
+      "kind": "test",
+      "default_trials": 8,
+      "cases": [
+        {"name": "multiple-patches-on-record", "line": 177}
+      ]
+    },
+    {
+      "id": "string-expression",
+      "namespace": "xtdb.expression-test",
+      "source": "src/test/clojure/xtdb/expression_test.clj",
+      "kind": "defspec",
+      "default_trials": 32,
+      "cases": [
+        {"name": "character-length-is-equiv-to-code-point-count-prop", "line": 494},
+        {"name": "octet-length-is-equiv-to-byte-count-prop", "line": 498},
+        {"name": "binary-like-is-equiv-to-string-like-on-utf8-prop", "line": 717},
+        {"name": "sql-trim-is-equiv-to-java-trim-on-space-prop", "line": 801},
+        {"name": "bin-trim-is-equiv-to-str-trim-on-utf8-prop", "line": 930},
+        {"name": "upper-is-equiv-to-java-upper-prop", "line": 951},
+        {"name": "lower-is-equiv-to-java-lower-prop", "line": 966},
+        {"name": "concat-equiv-to-str-prop", "line": 984},
+        {"name": "bin-concat-equiv-to-str-concat-on-utf8-prop", "line": 1005},
+        {"name": "variadic-str-concat-prop", "line": 1011},
+        {"name": "variadic-bin-concat-prop", "line": 1016},
+        {"name": "position-is-codepoint-count-from-idx-prop", "line": 1051},
+        {"name": "position-is-equiv-to-idx-of-on-ascii-prop", "line": 1060},
+        {"name": "position-on-octet-is-equiv-to-idx-of-on-ascii-prop", "line": 1069},
+        {"name": "binary-position-equiv-to-octet-position-prop", "line": 1091},
+        {"name": "substring-with-no-len-is-equiv-to-remaining-str-prop", "line": 1146},
+        {"name": "substring-is-equiv-to-clj-on-ascii-when-idx-within-bounds-prop", "line": 1152},
+        {"name": "bin-substring-is-equiv-to-substring-on-ascii-prop", "line": 1183},
+        {"name": "overlay-is-equiv-to-ss-concat-on-ascii-prop", "line": 1240},
+        {"name": "binary-overlay-is-equiv-to-str-overlay-on-ascii-prop", "line": 1274},
+        {"name": "overlay-len-default-is-len-of-placing-prop", "line": 1283},
+        {"name": "binary-overlay-len-default-is-len-of-placing-prop", "line": 1288}
+      ]
+    },
+    {
+      "id": "numeric-expression",
+      "namespace": "xtdb.expression-test",
+      "source": "src/test/clojure/xtdb/expression_test.clj",
+      "kind": "defspec",
+      "default_trials": 0,
+      "cases": [
+        {"name": "mod-double-is-equiv-to-core-mod-prop", "line": 1644, "unported": "requires an adapter for the JVM helper and numeric exception outcome"},
+        {"name": "mod-is-equiv-to-core-mod-cast-to-lub-prop", "line": 1662, "unported": "requires a native typed projection and anomaly comparison adapter"}
+      ]
+    },
+    {
+      "id": "temporal-expression",
+      "namespace": "xtdb.expression.temporal-test",
+      "source": "src/test/clojure/xtdb/expression/temporal_test.clj",
+      "kind": "defspec",
+      "default_trials": 32,
+      "cases": [
+        {"name": "test-cast-to-date", "line": 750},
+        {"name": "test-cast-to-time", "line": 761},
+        {"name": "test-cast-to-ts", "line": 775},
+        {"name": "test-cast-to-tstz", "line": 791},
+        {"name": "test-lt", "line": 918},
+        {"name": "test-lte", "line": 932},
+        {"name": "test-eq", "line": 946},
+        {"name": "test-neq", "line": 960},
+        {"name": "test-gte", "line": 974},
+        {"name": "test-gt", "line": 988},
+        {"name": "single-field-interval-string-parse-same-as-int-prop", "line": 1094},
+        {"name": "interval-sub-identity-prop", "line": 1405},
+        {"name": "interval-mul-factor-identity-prop", "line": 1409},
+        {"name": "interval-mul-by-zero-prop", "line": 1413},
+        {"name": "interval-add-sub-round-trip-prop", "line": 1417},
+        {"name": "all-possible-interval-literals-can-be-constructed-prop", "line": 1588}
+      ]
+    },
+    {
+      "id": "vector-reader",
+      "namespace": "xtdb.vector.reader-test",
+      "source": "src/test/clojure/xtdb/vector/reader_test.clj",
+      "kind": "test",
+      "default_trials": 0,
+      "cases": [
+        {"name": "vector-read-what-you-write", "line": 13, "unported": "directly exercises JVM Arrow vector classes and layout"},
+        {"name": "full-vector-copy-preserves-data", "line": 35, "unported": "directly exercises JVM Arrow vector classes and layout"},
+        {"name": "partial-vector-copy-preserves-data", "line": 43, "unported": "directly exercises JVM Arrow vector classes and layout"},
+        {"name": "copy-two-distinct-single-typed-vectors", "line": 64, "unported": "directly exercises JVM Arrow vector classes and layout"},
+        {"name": "copy-two-duvs", "line": 75, "unported": "directly exercises JVM Arrow vector classes and layout"},
+        {"name": "multiple-type-promotions", "line": 86, "unported": "directly exercises JVM Arrow vector classes and layout"},
+        {"name": "multiple-open-slice-calls", "line": 101, "unported": "directly exercises JVM Arrow vector classes and layout"}
+      ]
+    }
+  ]
+}

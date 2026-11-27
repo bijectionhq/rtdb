@@ -1,0 +1,29 @@
+import org.gradle.api.tasks.JavaExec
+import org.gradle.process.CommandLineArgumentProvider
+
+gradle.projectsEvaluated {
+    def root = gradle.rootProject
+    def bindings = root.project(":bindings:xtdb-rust-bindings")
+    def corpus = bindings.tasks.named("corpus", JavaExec)
+    bindings.tasks.register("propertyCorpus", JavaExec) {
+        def source = corpus.get()
+        dependsOn bindings.tasks.named("testClasses")
+        classpath = source.classpath
+        javaLauncher.set(source.javaLauncher)
+        jvmArgs(source.jvmArgs)
+        systemProperties(source.systemProperties)
+        systemProperty("file.encoding", "UTF-8")
+        systemProperty("user.language", "en")
+        systemProperty("user.country", "US")
+        systemProperty("user.timezone", "UTC")
+        workingDir = source.workingDir
+        mainClass.set("clojure.main")
+        argumentProviders.add({
+            ["-m", "xtdb.rust.property-corpus",
+             root.providers.gradleProperty("rtdb.propertyPlan").get(),
+             root.providers.gradleProperty("rtdb.propertyManifest").get(),
+             root.providers.gradleProperty("corpusSources").get(),
+             root.providers.gradleProperty("rtdb.propertyOutput").get()]
+        } as CommandLineArgumentProvider)
+    }
+}
