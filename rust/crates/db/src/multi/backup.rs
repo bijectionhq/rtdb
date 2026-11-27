@@ -4,7 +4,7 @@ use journal_contract::{CheckpointAnchor, Lsn};
 use rtdb_crypt::{Context, Generation, Kms, RecoveryKeyHold};
 use rtdb_format::journal::{Checkpoint, Manifest, ObjectId, Record};
 use rtdb_index::branches::BranchCut;
-use rtdb_store::{ObjectStore, ObjectVersionHold, read_file_bounded, read_fresh_manifest, read_held_file, read_held_manifest};
+use rtdb_store::{ObjectStore, ObjectVersionHold, read_file_bounded, read_fresh_manifest, read_versioned_file, read_versioned_manifest};
 use rtdb_tx::transact::{Receipt, TransactState};
 use rtdb_types::{Anomaly, AnomalyCategory, PhysicalObjectVersion, Result, Timestamp, rtdb_v1::Basis};
 use sha2::{Digest, Sha256};
@@ -341,6 +341,17 @@ impl MultiDatabase {
     pub async fn check_installed_backup_object_holds(
         &mut self, archive_sha256: [u8; 32], holds: &dyn ObjectVersionHold,
     ) -> Result<BackupObjectReadback> {
+        self.read_installed_backup_objects(archive_sha256, Some(holds)).await
+    }
+
+    /// Authenticates the staged backup's object closure and observes the exact versions read.
+    pub async fn observe_installed_backup_object_versions(&mut self, archive_sha256: [u8; 32]) -> Result<BackupObjectReadback> {
+        self.read_installed_backup_objects(archive_sha256, None).await
+    }
+
+    async fn read_installed_backup_objects(
+        &mut self, archive_sha256: [u8; 32], holds: Option<&dyn ObjectVersionHold>,
+    ) -> Result<BackupObjectReadback> {
         self.refresh().await?;
         self.require_active()?;
         let installed = self.applied_backup().filter(|installed| {
@@ -351,11 +362,14 @@ impl MultiDatabase {
         let checkpoint = self.staged_backup_checkpoint()?.clone();
         let store = self.store.as_ref();
         let kms = self.stream.kms.as_ref();
-        let (manifest, checkpoint_version) = read_held_manifest(store, kms, checkpoint.manifest, holds).await?;
+        let (manifest, checkpoint_version) = read_versioned_manifest(store, kms, checkpoint.manifest, holds).await?;
         if manifest.generation.number != checkpoint.key_generation || !manifest.contents().pins.is_empty() {
             return Err(invalid_backup());
         }
         let members = &manifest.contents().files;
+        if members.iter().any(|file| file.database != self.options.database) {
+            return Err(invalid_backup());
+        }
         let mut versions = Vec::with_capacity(members.len() + 2);
         versions.push(checkpoint_version);
         let index_id = state.coordinates.origin.and_then(|origin| origin.portable_file_index);
@@ -363,7 +377,7 @@ impl MultiDatabase {
             if !members.contains(&index_id) {
                 return Err(invalid_backup());
             }
-            let (index, version) = read_held_file(store, kms, index_id, files::MAX_INDEX_BYTES, holds).await?;
+            let (index, version) = read_versioned_file(store, kms, index_id, files::MAX_INDEX_BYTES, holds).await?;
             let relocations = files::decode_relocations(&index.bytes, installed.source_incarnation(), index_id)?;
             if relocations.iter().any(|relocation| !members.contains(&relocation.destination_file)) {
                 return Err(invalid_backup());
@@ -372,11 +386,11 @@ impl MultiDatabase {
         }
         for &file in members {
             if Some(file) != index_id {
-                let (_, version) = read_held_file(store, kms, file, PortableBackup::MAX_BYTES, holds).await?;
+                let (_, version) = read_versioned_file(store, kms, file, PortableBackup::MAX_BYTES, holds).await?;
                 versions.push(version);
             }
         }
-        versions.push(self.token_keys.check_object_hold(checkpoint.key_generation, kms, holds).await?);
+        versions.push(self.token_keys.read_object_version(checkpoint.key_generation, kms, holds).await?);
         let journal_anchor = if let Some(base) = &self.state().base {
             self.stream.certify_checkpoint(base, head).await?.immutable_anchor()
         } else {

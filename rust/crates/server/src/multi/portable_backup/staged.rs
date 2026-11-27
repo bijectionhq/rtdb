@@ -1,5 +1,6 @@
 use journal_contract::Lsn;
 use rtdb_crypt::RecoveryKeyHold;
+use rtdb_types::S3ObjectNamespace;
 
 use crate::multi::activation::{
     ActivationAuthority, Binding,
@@ -36,6 +37,19 @@ pub(super) struct StageReceipt {
     pub(super) manifest_sha256: String,
     pub(super) intent: Intent,
     pub(super) key_hold: RecoveryKeyHold,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) object_namespace: Option<S3ObjectNamespace>,
+}
+
+impl StageReceipt {
+    pub(super) async fn require_pending(&self, authority: &ActivationAuthority, source_lsn: Lsn) -> Result<()> {
+        let operation = Operation { predecessor: self.intent.expected, operation_id: self.intent.operation_id };
+        let candidate = Candidate::pending(authority, operation, source_lsn).await?;
+        if candidate.intent != self.intent || authority.connection_digest()? != self.key_hold.authority_sha256 {
+            return Err(stage_source());
+        }
+        Ok(())
+    }
 }
 
 impl Stage {
@@ -68,7 +82,7 @@ impl Stage {
         if backup.source_basis().incarnation() != *self.operation.predecessor.incarnation.as_bytes() {
             return Err(stage_source());
         }
-        let candidate = self.candidate(authority, source_lsn).await?;
+        let candidate = Candidate::pending(authority, self.operation, source_lsn).await?;
         let evidence = KeyEvidence {
             generation: 1,
             authority_sha256: authority.connection_digest()?,
@@ -76,7 +90,8 @@ impl Stage {
         let hold = candidate.intent.archive_key_hold(&backup, evidence)?;
         let root = rtdb_storage::ObjectKey::new("multi")?;
         let remotes = BTreeMap::new();
-        self.destination.objects.versioned_inventory(&root, &remotes).await?.require_versioned().await?;
+        let inventory = self.destination.objects.versioned_inventory(&root, &remotes).await?;
+        inventory.require_versioned().await?;
         let credentials = crate::cli::journal_credentials(&self.destination.journal_tls)?;
         let JournalBackend { journal, batch, .. } =
             connect_stream_journal(&self.destination.journal_url, &credentials).await?;
@@ -112,7 +127,7 @@ impl Stage {
                 return Err(stage_source());
             }
             keys.require_recovery_key(hold).await?;
-            self.candidate(authority, source_lsn).await?;
+            Candidate::pending(authority, self.operation, source_lsn).await?;
             Ok::<_, Anomaly>(installed)
         }.await;
         io.close_and_wait().await;
@@ -127,12 +142,16 @@ impl Stage {
             manifest_sha256: digest_hex(&installed.manifest_sha256()),
             intent: candidate.intent,
             key_hold: hold,
+            object_namespace: Some(inventory.namespace().clone()),
         }).map_err(|error| Anomaly::fault("rtdb/backup-stage-receipt", error.to_string()))
     }
 
-    async fn candidate(&self, authority: &ActivationAuthority, source_lsn: Lsn) -> Result<Candidate> {
+}
+
+impl Candidate {
+    async fn pending(authority: &ActivationAuthority, operation: Operation, source_lsn: Lsn) -> Result<Self> {
         let Status::Pending { intent, candidate: incarnation, final_source_lsn, installation: None, .. } =
-            authority.recovery_status(DEVELOPMENT_DATABASE, self.operation).await?
+            authority.recovery_status(DEVELOPMENT_DATABASE, operation).await?
         else {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb/backup-stage-intent", "Staging requires a pending recovery before installation is recorded"));
         };
@@ -145,8 +164,8 @@ impl Stage {
         let intent = Intent {
             authority_id: authority.identity(),
             database: DEVELOPMENT_DATABASE.to_owned(),
-            expected: self.operation.predecessor,
-            operation_id: self.operation.operation_id,
+            expected: operation.predecessor,
+            operation_id: operation.operation_id,
             cell: Some(cell),
         };
         let scope = intent.scope()?;

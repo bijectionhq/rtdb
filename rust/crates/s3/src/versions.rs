@@ -107,6 +107,23 @@ impl VersionedInventory {
         self.observed_path(key, version).map(drop)
     }
 
+    /// Turns the caller's selected version's legal hold on and confirms it from S3.
+    /// A confirmation error can leave that version held. Retry the same target.
+    pub async fn acquire_legal_hold(&self, key: &ObjectKey, version: &PhysicalObjectVersion) -> Result<()> {
+        let path = self.observed_path(key, version)?;
+        self.inspect((path.to_string(), version.version.clone()), |owner, (path, version)| async move {
+            let hold = ObjectLockLegalHold::builder().status(ObjectLockLegalHoldStatus::On).build();
+            owner.client.put_object_legal_hold().bucket(&owner.namespace.bucket)
+                .key(&path).version_id(&version).legal_hold(hold)
+                .set_request_payer(owner.request_payer.clone()).send().await
+                .map_err(|error| unavailable(format!("Acquiring the S3 legal hold failed: {error}")))?;
+            if owner.legal_hold_status(&path, &version).await? != Some(ObjectLockLegalHoldStatus::On) {
+                return Err(unavailable("S3 did not confirm the exact version's legal hold"));
+            }
+            Ok(())
+        }).await
+    }
+
     /// Turns the caller's selected version's legal hold off and confirms the result from S3.
     /// The caller authorizes the release.
     pub async fn release_legal_hold(&self, key: &ObjectKey, version: &PhysicalObjectVersion) -> Result<()> {
@@ -163,7 +180,8 @@ impl VersionedInventory {
         }).await?
     }
 
-    pub(crate) fn namespace(&self) -> &S3ObjectNamespace { &self.namespace }
+    /// Returns the resolved provider namespace for this inventory's version identities.
+    pub fn namespace(&self) -> &S3ObjectNamespace { &self.namespace }
 
     pub(crate) fn with_terminal_allocation(mut self, allocation: uuid::Uuid) -> Self {
         self.terminal_allocation = Some(allocation);

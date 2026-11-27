@@ -238,33 +238,35 @@ pub async fn read_fresh_manifest(
     decode_manifest(id, open(kms, id, &bytes).await?)
 }
 
-/// Reopens the manifest and checks the hold on the provider version that supplied its bytes.
-pub async fn read_held_manifest(
-    store: &dyn ObjectStore, kms: &dyn Kms, id: ObjectId, hold: &dyn ObjectVersionHold,
+/// Authenticates the manifest version returned by the supplied store.
+/// When `hold` is supplied, verifies the hold on that version.
+pub async fn read_versioned_manifest(
+    store: &dyn ObjectStore, kms: &dyn Kms, id: ObjectId, hold: Option<&dyn ObjectVersionHold>,
 ) -> Result<(VerifiedManifest, PhysicalObjectVersion)> {
     require_kind(id, ObjectKind::Manifest)?;
-    let (plaintext, version) = read_held(store, kms, id, usize::MAX, hold).await?;
+    let (plaintext, version) = read_versioned(store, kms, id, usize::MAX, hold).await?;
     Ok((decode_manifest(id, plaintext)?, version))
 }
 
-/// Authenticates a bounded file and checks the hold on its exact provider version.
-pub async fn read_held_file(
-    store: &dyn ObjectStore, kms: &dyn Kms, id: ObjectId, limit: usize, hold: &dyn ObjectVersionHold,
+/// Authenticates the bounded file version returned by the supplied store.
+/// When `hold` is supplied, verifies the hold on that version.
+pub async fn read_versioned_file(
+    store: &dyn ObjectStore, kms: &dyn Kms, id: ObjectId, limit: usize, hold: Option<&dyn ObjectVersionHold>,
 ) -> Result<(Plaintext, PhysicalObjectVersion)> {
     require_kind(id, ObjectKind::File)?;
-    read_held(store, kms, id, limit, hold).await
+    read_versioned(store, kms, id, limit, hold).await
 }
 
-async fn read_held(
-    store: &dyn ObjectStore, kms: &dyn Kms, id: ObjectId, limit: usize, hold: &dyn ObjectVersionHold,
+async fn read_versioned(
+    store: &dyn ObjectStore, kms: &dyn Kms, id: ObjectId, limit: usize, hold: Option<&dyn ObjectVersionHold>,
 ) -> Result<(Plaintext, PhysicalObjectVersion)> {
     let key = key(id)?;
-    let (bytes, version) = read_held_bytes(store, &key, limit, hold).await?;
+    let (bytes, version) = read_versioned_bytes(store, &key, limit, hold).await?;
     Ok((open(kms, id, &bytes).await?, version))
 }
 
-pub(crate) async fn read_held_bytes(
-    store: &dyn ObjectStore, key: &ObjectKey, limit: usize, hold: &dyn ObjectVersionHold,
+pub(crate) async fn read_versioned_bytes(
+    store: &dyn ObjectStore, key: &ObjectKey, limit: usize, hold: Option<&dyn ObjectVersionHold>,
 ) -> Result<(Bytes, PhysicalObjectVersion)> {
     let size = usize::try_from(store.head_fresh(key).await?.size).ok().filter(|size| *size <= limit)
         .ok_or_else(|| Anomaly::unsupported("rtdb.store/file-size", "The encrypted object exceeds the read budget"))?;
@@ -272,7 +274,9 @@ pub(crate) async fn read_held_bytes(
     let version = version.ok_or_else(|| Anomaly::unsupported(
         "rtdb.store/backup-object-version", "The provider did not identify an immutable version of the backup object",
     ))?;
-    hold.require_held(key, &version).await?;
+    if let Some(hold) = hold {
+        hold.require_held(key, &version).await?;
+    }
     Ok((value, version))
 }
 

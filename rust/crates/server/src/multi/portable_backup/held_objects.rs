@@ -4,7 +4,12 @@ use crate::multi::activation::operator::attestation::KeyEvidence;
 
 use super::*;
 use rtdb_crypt::RecoveryKeyHold;
+use rtdb_db::BackupObjectReadback;
+use rtdb_storage::ObjectVersionHold;
 use rtdb_types::PhysicalObjectVersion;
+
+mod acquire;
+pub(super) use acquire::Acquirer;
 
 #[derive(Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
@@ -20,6 +25,18 @@ pub(super) struct Readback {
 }
 
 impl Readback {
+    fn confirmed(incarnation: Uuid, checked: BackupObjectReadback, key_hold: Option<RecoveryKeyHold>) -> Self {
+        Self {
+            incarnation,
+            archive_sha256: digest_hex(&checked.installation.manifest_sha256()),
+            journal_head: checked.journal_head.0,
+            checkpoint: checked.checkpoint.to_string(),
+            held_versions: checked.versions,
+            object_holds_verified: true,
+            key_hold,
+        }
+    }
+
     #[cfg(unix)]
     pub(super) fn digest(&self) -> Result<[u8; 32]> {
         let bytes = serde_json::to_vec(self).map_err(|error| Anomaly::fault("rtdb/backup-object-readback", error.to_string()))?;
@@ -38,6 +55,11 @@ struct VerifiedReadback {
     intent: Option<Intent>,
     #[cfg(unix)]
     journal_anchor: Option<journal_contract::CheckpointAnchor>,
+}
+
+struct StagedBackup {
+    archive_sha256: [u8; 32],
+    receipt: Option<staged::StageReceipt>,
 }
 
 #[derive(Clone, Copy)]
@@ -92,37 +114,69 @@ impl Verifier {
             .map_err(|error| Anomaly::fault("rtdb/backup-object-readback", error.to_string()))
     }
 
-    async fn verify(self, source: ReadSource) -> Result<VerifiedReadback> {
-        let digest = Sha256::digest(read_archive(&self.archive)?).into();
+    fn staged_backup(&self) -> Result<StagedBackup> {
+        let archive_sha256 = Sha256::digest(read_archive(&self.archive)?).into();
         let receipt = self.stage_receipt.as_deref()
             .map(|path| read_receipt::<staged::StageReceipt>(path, 4096)).transpose()?;
         if let Some(receipt) = &receipt {
             if receipt.intent.authority_id != self.authority || receipt.intent.scope()? != self.scope
-                || receipt.intent.candidate()? != self.incarnation || receipt.manifest_sha256 != digest_hex(&digest)
+                || receipt.intent.candidate()? != self.incarnation || receipt.manifest_sha256 != digest_hex(&archive_sha256)
             {
                 return Err(invalid_readback());
             }
         }
+        Ok(StagedBackup { archive_sha256, receipt })
+    }
+
+    async fn verify(self, source: ReadSource) -> Result<VerifiedReadback> {
+        let staged = self.staged_backup()?;
         let requested = self.readback.as_deref().map(|path| read_receipt::<Readback>(path, 32 << 20)).transpose()?;
         if requested.as_ref().is_some_and(|readback| {
-            readback.incarnation != self.incarnation || readback.archive_sha256 != digest_hex(&digest)
+            readback.incarnation != self.incarnation || readback.archive_sha256 != digest_hex(&staged.archive_sha256)
                 || !readback.object_holds_verified || readback.held_versions.is_empty()
-                || readback.key_hold != receipt.as_ref().map(|receipt| receipt.key_hold)
+                || readback.key_hold != staged.receipt.as_ref().map(|receipt| receipt.key_hold)
         }) {
             return Err(invalid_readback());
         }
-        let credentials = crate::cli::journal_credentials(&self.destination.journal_tls)?;
-        let JournalBackend { journal, batch, .. } = connect_stream_journal(&self.destination.journal_url, &credentials).await?;
-        let keys = Arc::new(FileKms::open(&self.destination.key_vault, || SystemClock.now().0)?);
         let root = rtdb_storage::ObjectKey::new("multi")?;
         let remotes = BTreeMap::new();
         let inventory = self.destination.objects.versioned_inventory(&root, &remotes).await?;
         inventory.require_versioned().await?;
         let io = IoRegion::new();
-        let store = match (&requested, source) {
-            (Some(readback), ReadSource::SavedVersions) => inventory.pinned_read_store(&readback.held_versions)?,
-            _ => self.destination.objects.open(&root, &remotes, Arc::clone(&io)).await?,
-        };
+        let result = async {
+            let store = match (&requested, source) {
+                (Some(readback), ReadSource::SavedVersions) => inventory.pinned_read_store(&readback.held_versions)?,
+                _ => self.destination.objects.open(&root, &remotes, Arc::clone(&io)).await?,
+            };
+            self.inspect(&staged, store, Some(&inventory)).await
+        }.await;
+        io.close_and_wait().await;
+        let (checked, key_hold) = result?;
+        #[cfg(unix)]
+        let installation = checked.installation;
+        #[cfg(unix)]
+        let journal_anchor = checked.journal_anchor;
+        let current = Readback::confirmed(self.incarnation, checked, key_hold);
+        if requested.is_some_and(|previous| previous != current) {
+            return Err(invalid_readback());
+        }
+        Ok(VerifiedReadback {
+            report: current,
+            #[cfg(unix)]
+            installation,
+            #[cfg(unix)]
+            intent: staged.receipt.map(|receipt| receipt.intent),
+            #[cfg(unix)]
+            journal_anchor,
+        })
+    }
+
+    async fn inspect(
+        &self, staged: &StagedBackup, store: Arc<dyn ObjectStore>, holds: Option<&dyn ObjectVersionHold>,
+    ) -> Result<(BackupObjectReadback, Option<RecoveryKeyHold>)> {
+        let credentials = crate::cli::journal_credentials(&self.destination.journal_tls)?;
+        let JournalBackend { journal, batch, .. } = connect_stream_journal(&self.destination.journal_url, &credentials).await?;
+        let keys = Arc::new(FileKms::open(&self.destination.key_vault, || SystemClock.now().0)?);
         let mut database = MultiDatabase::new(
             MultiOptions {
                 database: self.incarnation,
@@ -132,10 +186,11 @@ impl Verifier {
             },
             journal, store, keys.clone(), Arc::new(|| SystemClock.now()),
         )?.with_immutable_journal().with_batch_appender(batch).with_activation_scope(self.scope)?;
-        let checked = database.check_installed_backup_object_holds(digest, &inventory).await;
-        io.close_and_wait().await;
-        let checked = checked?;
-        let key_hold = if let Some(receipt) = &receipt {
+        let checked = match holds {
+            Some(holds) => database.check_installed_backup_object_holds(staged.archive_sha256, holds).await?,
+            None => database.observe_installed_backup_object_versions(staged.archive_sha256).await?,
+        };
+        let key_hold = if let Some(receipt) = &staged.receipt {
             let key = KeyEvidence { generation: checked.generation.number, authority_sha256: receipt.key_hold.authority_sha256 };
             let hold = receipt.intent.installed_key_hold(&checked.installation, key)?;
             if hold != receipt.key_hold || hold.generation != checked.generation {
@@ -144,27 +199,7 @@ impl Verifier {
             keys.require_recovery_key(hold).await?;
             Some(hold)
         } else { None };
-        let current = Readback {
-            incarnation: self.incarnation,
-            archive_sha256: digest_hex(&checked.installation.manifest_sha256()),
-            journal_head: checked.journal_head.0,
-            checkpoint: checked.checkpoint.to_string(),
-            held_versions: checked.versions,
-            object_holds_verified: true,
-            key_hold,
-        };
-        if requested.is_some_and(|previous| previous != current) {
-            return Err(invalid_readback());
-        }
-        Ok(VerifiedReadback {
-            report: current,
-            #[cfg(unix)]
-            installation: checked.installation,
-            #[cfg(unix)]
-            intent: receipt.map(|receipt| receipt.intent),
-            #[cfg(unix)]
-            journal_anchor: checked.journal_anchor,
-        })
+        Ok((checked, key_hold))
     }
 }
 
@@ -234,6 +269,7 @@ mod tests {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     use super::*;
+    use rtdb_storage::ObjectKey;
     use crate::multi::activation::{
         ActivationAuthority, ActivationOptions, journal_custody::KeeperJournal, operator::attestation::Attestation,
         recovery::{Intent, LossPolicy, Operation, Status},
@@ -435,6 +471,10 @@ mod tests {
         let mut substituted = receipt.clone();
         substituted["key_hold"]["operation"] = json!(Uuid::new_v4());
         fs::write(&wrong_receipt_path, serde_json::to_vec(&substituted).unwrap()).unwrap();
+        let wrong_namespace_path = home.path().join("wrong-namespace-stage-receipt.json");
+        let mut wrong_namespace = receipt.clone();
+        wrong_namespace["object_namespace"]["bucket"] = json!("other-staging-allocation");
+        fs::write(&wrong_namespace_path, serde_json::to_vec(&wrong_namespace).unwrap()).unwrap();
         let hosted_options = |operation: &str, readback: Option<&Path>, receipt: &Path, key: Option<&Path>| MultiBackupOptions::parse([
             operation.to_owned(), "--archive".into(), archive_path.display().to_string(),
             "--incarnation".into(), incarnation.to_string(), "--authority-id".into(), authority.to_string(),
@@ -451,6 +491,11 @@ mod tests {
         ]))).unwrap();
         let verify = |readback: Option<&Path>, receipt: &Path|
             hosted_options("verify-object-holds", readback, receipt, None).run(rtdb_storage::AppleSync::Full);
+        let acquire = |receipt: &Path| {
+            let BackupCommand::AcquireObjects(acquirer) = hosted_options("acquire-object-holds", None, receipt, None).0
+            else { panic!("expected hosted acquisition"); };
+            acquirer.run_with_authority(&authority_reader)
+        };
         let attest = |readback: &Path| {
             let options = hosted_options("attest", Some(readback), &receipt_path, Some(&signing_key));
             let BackupCommand::AttestObjects(attester) = options.0 else { panic!("expected hosted attestation"); };
@@ -464,6 +509,9 @@ mod tests {
             aws("put-object-legal-hold", &["--key", &version.key,
                 "--version-id", &version.version, "--legal-hold", "Status=ON"]);
         };
+        let observe_hold = |version: &PhysicalObjectVersion| {
+            aws("get-object-legal-hold", &["--key", &version.key, "--version-id", &version.version])
+        };
         for entry in objects.iter().filter(|entry| entry.key != file && &entry.key != token) {
             hold(&store.observe_head(&entry.key).await.unwrap().version.unwrap());
         }
@@ -471,9 +519,11 @@ mod tests {
         let physical = store.observe_head(&file).await.unwrap().version.unwrap();
         hold(&physical);
         assert!(verify(None, &receipt_path).await.is_err());
-        hold(&store.observe_head(token).await.unwrap().version.unwrap());
-        assert!(verify(None, &wrong_receipt_path).await.is_err());
-        let result = verify(None, &receipt_path).await.unwrap();
+        assert!(acquire(&wrong_receipt_path).await.is_err());
+        assert!(acquire(&wrong_namespace_path).await.is_err());
+        assert!(verify(None, &receipt_path).await.is_err());
+        let result = acquire(&receipt_path).await.unwrap();
+        assert_eq!(verify(None, &receipt_path).await.unwrap(), result);
         assert_eq!(result["object_holds_verified"], true);
         assert_eq!(result["key_hold"], receipt["key_hold"]);
         assert_eq!(result["incarnation"], incarnation.to_string());
@@ -481,6 +531,22 @@ mod tests {
         assert_eq!(result["journal_head"], head.0);
         assert_eq!(result["held_versions"].as_array().unwrap().len(), 4);
         assert!(result["held_versions"].as_array().unwrap().contains(&json!(physical)));
+        let plan = ObjectKey::new(format!("recovery-custody/{authority}/{incarnation}/acquisition")).unwrap();
+        let plan_before = store.get_fresh(&plan).await.unwrap();
+        let retry_bytes = home.path().join("retry-file-bytes");
+        fs::write(&retry_bytes, store.get_fresh(&file).await.unwrap()).unwrap();
+        aws("put-object", &["--key", &physical.key, "--body", retry_bytes.to_str().unwrap()]);
+        let newer = store.observe_head(&file).await.unwrap().version.unwrap();
+        assert_ne!(physical, newer);
+        for version in [&physical, &newer] {
+            aws("put-object-legal-hold", &["--key", &version.key,
+                "--version-id", &version.version, "--legal-hold", "Status=OFF"]);
+        }
+        assert_eq!(acquire(&receipt_path).await.unwrap(), result);
+        assert_eq!(store.get_fresh(&plan).await.unwrap(), plan_before);
+        assert_eq!(observe_hold(&physical)["LegalHold"]["Status"], "ON");
+        assert_eq!(observe_hold(&newer)["LegalHold"]["Status"], "OFF");
+        aws("delete-object", &["--key", &newer.key, "--version-id", &newer.version]);
 
         let readback = home.path().join("readback.json");
         fs::write(&readback, serde_json::to_vec(&result).unwrap()).unwrap();
@@ -609,6 +675,7 @@ mod tests {
         };
         activation.begin_recovery(DEVELOPMENT_DATABASE, replacement_intent, Some(operation_id)).await.unwrap();
         assert!(stage(operation_id).await.is_err());
+        assert!(acquire(&receipt_path).await.is_err());
         assert!(attest(&new_readback).await.is_err());
         assert!(release_objects(&new_readback, &proof_path).await.is_err());
         let altered_signature = home.path().join("altered-signature.json");
@@ -622,9 +689,6 @@ mod tests {
         assert_eq!(settled["incarnation"], incarnation.to_string());
         assert_eq!(settled["operation_id"], operation_id.to_string());
         assert_eq!(settled["released_versions"], verified_readback.held_versions.len());
-        let observe_hold = |version: &PhysicalObjectVersion| {
-            aws("get-object-legal-hold", &["--key", &version.key, "--version-id", &version.version])
-        };
         for target in &verified_readback.held_versions {
             assert_eq!(observe_hold(target)["LegalHold"]["Status"], "OFF");
         }

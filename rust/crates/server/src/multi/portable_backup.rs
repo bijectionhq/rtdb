@@ -26,6 +26,9 @@ Usage: rtdb multi-backup export --data DIR --archive FILE [--journal-url URL --t
        rtdb multi-backup verify-object-holds --archive FILE --incarnation UUID --authority-id UUID [--cell-id UUID]
                     --journal-url URL --tls-dir DIR --key-vault DIR --bucket BUCKET [--region REGION] [--s3-endpoint URL]
                     [--readback FILE] [--stage-receipt FILE]
+       rtdb multi-backup acquire-object-holds --archive FILE --incarnation UUID --authority-id UUID --cell-id UUID
+                    --journal-url URL --tls-dir DIR --key-vault DIR --bucket BUCKET [--region REGION] [--s3-endpoint URL]
+                    --stage-receipt FILE
        rtdb multi-backup attest --archive FILE --incarnation UUID --authority-id UUID --cell-id UUID
                     --journal-url URL --tls-dir DIR --key-vault DIR --bucket BUCKET [--region REGION] [--s3-endpoint URL]
                     --readback FILE --stage-receipt FILE --attestation-signing-key PKCS8 --journal-custodian-tls-dir DIR
@@ -36,6 +39,7 @@ Export-hosted reads one commissioned immutable source and its original S3 alloca
 Stage installs a pending activation's backup in S3 and holds its destination key.
 Verify-object-holds reads a staged immutable journal and an S3 allocation.
 Pass a saved readback to reopen and verify its exact S3 versions.
+Acquire-object-holds selects and retains the staged backup's exact S3 versions, then emits their verified readback.
 Hosted backup commands require the backup-object-holds build feature.
 Attest emits the signed installation proof for the activation broker and requires Unix.
 Release-object-holds settles an abandoned candidate or a published candidate with a replacement checkpoint. It requires Unix.
@@ -70,6 +74,8 @@ enum BackupCommand {
     Stage(staged::Stage),
     #[cfg(feature = "backup-object-holds")]
     VerifyObjects(held_objects::Verifier),
+    #[cfg(feature = "backup-object-holds")]
+    AcquireObjects(held_objects::Acquirer),
     #[cfg(all(unix, feature = "backup-object-holds"))]
     AttestObjects(held_objects::Attester),
     #[cfg(all(unix, feature = "backup-object-holds"))]
@@ -91,13 +97,16 @@ impl MultiBackupOptions {
                 return Err(arguments_error());
             }
         }
-        if matches!(operation.as_str(), "export-hosted" | "stage" | "verify-object-holds" | "attest" | "release-object-holds") {
+        if matches!(operation.as_str(), "export-hosted" | "stage" | "verify-object-holds"
+            | "acquire-object-holds" | "attest" | "release-object-holds")
+        {
             if immutable_streams { return Err(arguments_error()); }
             #[cfg(feature = "backup-object-holds")]
             return Ok(Self(match operation.as_str() {
                 "export-hosted" => BackupCommand::HostedExport(hosted_export::Export::parse(fields)?),
                 "stage" => BackupCommand::Stage(staged::Stage::parse(fields)?),
                 "verify-object-holds" => BackupCommand::VerifyObjects(held_objects::Verifier::parse(fields)?),
+                "acquire-object-holds" => BackupCommand::AcquireObjects(held_objects::Acquirer::parse(fields)?),
                 #[cfg(unix)]
                 "release-object-holds" => BackupCommand::ReleaseObjects(settle_objects::Release::parse(fields)?),
                 #[cfg(unix)]
@@ -156,6 +165,8 @@ impl MultiBackupOptions {
             BackupCommand::Stage(stage) => stage.run().await,
             #[cfg(feature = "backup-object-holds")]
             BackupCommand::VerifyObjects(verifier) => verifier.run().await,
+            #[cfg(feature = "backup-object-holds")]
+            BackupCommand::AcquireObjects(acquirer) => acquirer.run().await,
             #[cfg(all(unix, feature = "backup-object-holds"))]
             BackupCommand::AttestObjects(attester) => attester.run().await,
             #[cfg(all(unix, feature = "backup-object-holds"))]

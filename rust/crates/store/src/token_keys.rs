@@ -6,7 +6,7 @@ use rtdb_storage::{Error, ObjectKey, ObjectStore, ObjectVersionHold};
 use rtdb_types::{Anomaly, AnomalyCategory, PhysicalObjectVersion, Result};
 use uuid::Uuid;
 
-use crate::objects::read_held_bytes;
+use crate::objects::read_versioned_bytes;
 
 pub struct StoredTokenKeys {
     store: Arc<dyn ObjectStore>,
@@ -37,11 +37,12 @@ impl StoredTokenKeys {
         ObjectKey::new(format!("{}/keys/{number:016x}", self.prefix)).map_err(Into::into)
     }
 
-    /// Checks the held provider version and wrapping of the selected token key envelope.
-    pub async fn check_object_hold(
-        &self, number: u64, kms: &dyn Kms, hold: &dyn ObjectVersionHold,
+    /// Authenticates the token key envelope version returned by the key store.
+    /// When `hold` is supplied, verifies the hold on that version.
+    pub async fn read_object_version(
+        &self, number: u64, kms: &dyn Kms, hold: Option<&dyn ObjectVersionHold>,
     ) -> Result<PhysicalObjectVersion> {
-        let (bytes, version) = read_held_bytes(self.store.as_ref(), &self.path(number)?, TokenKey::MAX_ENCODED_BYTES, hold).await?;
+        let (bytes, version) = read_versioned_bytes(self.store.as_ref(), &self.path(number)?, TokenKey::MAX_ENCODED_BYTES, hold).await?;
         self.decode(number, &bytes)?.verify_wrapping(kms).await?;
         Ok(version)
     }

@@ -318,7 +318,19 @@ The destination vault retains the exact generation before the staging writer put
 Save the stage result with the archive.
 It reports the destination and the key hold bound to the same consensus trust and installation coordinates used by the activation proof.
 A retry before the authority records the installation reopens the original checkpoint and checks its active key hold.
-The object custodian places legal holds on the staged versions before readback.
+Run `rtdb multi-backup acquire-object-holds` as the object custodian with the same archive, destination incarnation, authority and cell, destination journal reader TLS, key vault and S3 allocation.
+Give it the stage receipt and configure the independent activation reader used for staging.
+Acquisition requires the original S3 namespace in that receipt.
+For an earlier receipt without that namespace, rerun `stage` against the original allocation while the recovery is pending.
+Acquisition authenticates the staged checkpoint, files and token key envelope and records their exact versions before applying legal holds.
+Use the same settings and stage receipt to retry a partial acquisition.
+The command reopens the recorded versions on retry and returns the verified readback after the original provider confirms every hold.
+Keep current-name visibility on the held versions for the later `attest` step.
+Finish acquisition and save the signed installation proof before recording or superseding the installation.
+If acquisition was interrupted after placing some holds, resume it while the recovery is pending and retain the signed proof even when abandoning the candidate.
+The custodian owns the create-only `multi/recovery-custody/` ledger prefix and needs to read its records, with absence distinguishable from denied access.
+Protect acquisition records against deletion and replacement through settlement.
+Scope the custodian's S3 version reads and legal-hold writes to the operation-exclusive candidate paths.
 
 With the `backup-object-holds` build feature, run `rtdb multi-backup verify-object-holds` against a commissioned portable install staged in the S3 serving allocation.
 Supply the selected archive, destination incarnation, authority and cell, journal reader TLS, destination key vault and S3 bucket.
