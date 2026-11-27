@@ -2306,6 +2306,7 @@ surface QueryAccess {
         -- For columnar query output, stacked filters apply in plan order to the surviving vectors and row positions.
         -- A columnar limit applies its offset and row count to batches and slices compatible Arrow arrays.
         -- DISTINCT and set operations with columnar inputs select their output positions from those Arrow batches.
+        -- DISTINCT holds its seen keys in memory and fails when the memory budget cannot hold them.
         -- Their key index retains Arrow batches and hashes and compares compatible scalar and floating-point vector cells at their indexed positions.
         -- Key readers follow logical union leg names and run ends to borrow the selected scalar or vector values.
         -- URI keys retain the raw hash check and the SQL comparison of their spellings.
@@ -2313,11 +2314,12 @@ surface QueryAccess {
         -- A composite set key reads an owned scalar cell for each column that requires scalar hashing or equality.
         -- Compatible global counts and floating-point sums and averages reduce Arrow columns and emit scalar result vectors.
         -- Compatible grouping columns can use the first Arrow position of each key and emit scalar aggregates in that first-seen order.
+        -- GROUP BY, scalar aggregates and ordered list aggregates hold their state in memory and fail when the memory budget cannot hold them.
         -- Grouped output keeps the configured transport row limit.
         -- Scalar aggregates reduce compatible numeric Arrow operands in input order and write compatible results as Arrow columns.
         -- Aggregate DISTINCT indexes its selected argument positions within each group and retains arguments whose SQL equality is unknown.
-        -- List aggregates collect selected Arrow positions after applying filters and distinctness, and sort Arrow keys when the aggregate specifies an order.
-        -- Percentile aggregates order each group's selected positions and read the ranked arguments from their source vectors.
+        -- List aggregates collect selected Arrow positions after applying filters and distinctness, and sort Arrow keys in memory when the aggregate specifies an order.
+        -- Percentile aggregates order each group's selected positions through the spilling sort path and read the ranked arguments from their source vectors.
         -- Continuous percentiles interpolate compatible numeric operands into a nullable Arrow result.
         -- A compatible scalar membership join indexes the build key vectors and appends nullable Boolean marks to the probe batches.
         -- Scalar membership uses the raw vector hash to select candidates before comparing them.
@@ -2326,11 +2328,11 @@ surface QueryAccess {
         -- Hash join fan-out shares one charged run per contributing probe row across the retained Arrow probe columns.
         -- Join partitions retain flat and nested layouts in Arrow IPC, including selected cells whose physical fields differ.
         -- An Arrow equijoin uses the raw vector hash of compatible floating-point list keys and compares their selected components.
-        -- Join, sort, membership, and materialized-relation spills replay Arrow batches under the query's spill budget.
+        -- Join, sort, membership, and materialized-relation spills replay Arrow batches under the query's spill budget, which is unlimited by default and refuses bytes past any configured limit (including zero).
+        -- Each spilled page is written whole under its encoding reservation, and a budget or quota refusal fails the query.
         -- Compatible mixed-layout spill vectors retain their charged IPC body storage through replay.
         -- A replayed fragment shares the decoded buffers' existing admission, and a nested fragment column selects its complete decoded span.
-        -- If retained IPC decoding runs out of memory, fragment and mixed-layout spill replay release partial results and decode detached batches.
-        -- A detached fragment copy admits its own Arrow storage before allocating it.
+        -- Fragment and mixed-layout spill replay always retain their decoded frames and fail the query when the memory budget refuses them.
         -- A shared mark can replay its candidate Arrow pages to evaluate arbitrary Boolean comparisons.
         -- Direct floating-point list comparisons in a shared mark preserve SQL unknown results across candidate pages.
         -- Materialized bindings retain their semantic page boundaries and physical fields in Arrow IPC.
@@ -2393,7 +2395,7 @@ surface QueryAccess {
         -- A sparse selection of compatible in-memory maps also stays in Arrow.
         -- A delegated scan sends selected source vectors in Arrow IPC in their scan order.
         -- Each fragment frame preserves its source fields and the coordinator can filter its Arrow vectors by position.
-        -- Adjacent frames of a page can share an admitted wire field descriptor for the same physical field, logical type and column position.
+        -- Each fragment frame builds its own wire field descriptors, and frame boundaries are chosen up front (including at run-end selection width limits) so a memory refusal fails the query.
         -- Compatible contiguous nested selections keep their funded source buffers through reply encoding even across frame splits.
         -- Reply encoding admits the selected nested spans and any rebased offsets before writing the frame.
         -- A fragment vector that borrows its reply's IPC body keeps the reply allocation charged through its last use.
