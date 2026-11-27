@@ -135,3 +135,22 @@ fn an_integer_grouping_element_is_a_constant_expression_not_an_output_position()
     let error = rejection("SELECT a, COUNT(*) FROM docs GROUP BY 1");
     assert_eq!((error.category, error.code.as_str()), (AnomalyCategory::Incorrect, "xtdb/sql-error"));
 }
+
+#[test]
+fn joins_without_specification_and_global_joins_are_grammar_rejections() {
+    for sql in [
+        "SELECT * FROM docs JOIN docs AS d2",
+        "SELECT * FROM docs INNER JOIN docs AS d2",
+        "SELECT * FROM docs LEFT JOIN docs AS d2",
+        "SELECT * FROM docs RIGHT JOIN docs AS d2",
+        "SELECT * FROM docs FULL OUTER JOIN docs AS d2",
+        "SELECT * FROM docs GLOBAL JOIN docs AS d2 ON docs._id = d2._id",
+        "SELECT * FROM docs GLOBAL CROSS JOIN docs AS d2",
+    ] {
+        let error = rejection(sql);
+        assert_eq!((error.category, error.code.as_str()), (AnomalyCategory::Incorrect, "xtdb/sql-error"), "{sql}");
+        assert!(error.message.as_deref().unwrap().starts_with("Errors parsing SQL statement:\n  - "), "{sql}");
+    }
+    prepare("SELECT * FROM docs CROSS JOIN docs AS d2", &Fixture, &PrepareOptions::default()).unwrap();
+    prepare("SELECT * FROM docs NATURAL JOIN docs AS d2", &Fixture, &PrepareOptions::default()).unwrap();
+}

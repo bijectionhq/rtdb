@@ -932,6 +932,7 @@ impl Context<'_> {
     fn joined_table(&mut self, table: &ast::TableWithJoins, lateral_start: usize) -> Result<Arc<Relation>> {
         let mut left = self.table_for(&table.relation, TablePurpose::Query, lateral_start)?;
         for joined in &table.joins {
+            if joined.global { return Err(grammar_rejected("GLOBAL JOIN")); }
             let (kind, constraint) = match &joined.join_operator {
                 ast::JoinOperator::Inner(constraint) | ast::JoinOperator::Join(constraint) => (JoinKind::Inner, Some(constraint)),
                 ast::JoinOperator::LeftOuter(constraint) | ast::JoinOperator::Left(constraint) => (JoinKind::Left, Some(constraint)),
@@ -1008,7 +1009,8 @@ impl Context<'_> {
             }
             let condition = match constraint {
                 Some(ast::JoinConstraint::On(expr)) => Some(self.expr(expr, &schema, &BTreeMap::new())?),
-                Some(ast::JoinConstraint::None) | None => None,
+                Some(ast::JoinConstraint::None) => return Err(grammar_rejected("A JOIN without ON or USING")),
+                None => None,
                 _ => return Err(error("Named join constraint was not lowered")),
             };
             left = if kind == JoinKind::Cross {
