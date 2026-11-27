@@ -1,11 +1,11 @@
 use std::{cmp::Reverse, collections::{BTreeMap, BTreeSet}, sync::Arc};
 
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_format::data::{EventBatch, StoredEvent, StoredOperation};
+use rtdb_format::data::{EncodedEvent, EventBatch, StoredEvent, StoredOperation};
 use rtdb_index::{Snapshot, StagedWrite, TransactionBuffer, branches::{BranchCut, BranchEffect, BranchIndex, BranchTable, BranchView, RankedIndexKind, RowImage}};
 use rtdb_storage::{HeldView, IoRegion, cache::BufferPool};
 use rtdb_tx::transact::Receipt;
-use rtdb_types::{Anomaly, EntityId, Interval, Iid, LogicalType, Result, SourcePosition, StructFields, TableRef, Timestamp, TransactionKey, TxId, Value,
+use rtdb_types::{Anomaly, EntityId, EventHeader, EventOp, Interval, Iid, LogicalType, Result, SourcePosition, StructFields, TableRef, Timestamp, TransactionKey, TxId, Value,
     rtdb_v1::{At, Basis, Layer, MAIN_BRANCH, SEARCH_BUILD_CATALOG, SPATIAL_BUILD_CATALOG, VECTOR_BUILD_CATALOG, ranked_build_id}};
 use tokio_util::sync::CancellationToken;
 
@@ -39,7 +39,7 @@ pub(super) fn apply_live(index: &mut BranchIndex, position: u64, write: &StagedW
         if let Some(batch) = write.batch() {
             for row in 0..batch.len() {
                 let (event, charge) = read_event(batch.view(), row, memory)?;
-                index.apply_classic_event(table, event, transaction)?;
+                event.apply(index, table, transaction)?;
                 charges.push(charge);
             }
         }
@@ -48,7 +48,7 @@ pub(super) fn apply_live(index: &mut BranchIndex, position: u64, write: &StagedW
 }
 
 pub(super) struct PreparedEffects {
-    tables: Vec<Vec<StoredEvent>>,
+    tables: Vec<Vec<ClassicEvent>>,
     charges: Vec<Arc<MemoryReservation>>,
     _inventory: Arc<MemoryReservation>,
 }
@@ -58,7 +58,7 @@ impl PreparedEffects {
         let overflow = || Anomaly::incorrect("rtdb/classic-projection-size", "Classic effect exceeds addressable memory")
             .with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded);
         let rows = usize::try_from(write.row_count()?).map_err(|_| overflow())?;
-        let bytes = rows.checked_mul(std::mem::size_of::<StoredEvent>() + std::mem::size_of::<Arc<MemoryReservation>>())
+        let bytes = rows.checked_mul(std::mem::size_of::<ClassicEvent>() + std::mem::size_of::<Arc<MemoryReservation>>())
             .and_then(|bytes| bytes.checked_add(write.tables().len().checked_mul(128)?))
             .ok_or_else(overflow)?;
         let _inventory = memory.reserve(bytes)?;
@@ -86,17 +86,36 @@ impl PreparedEffects {
         let transaction = Some(write.tx_key().tx_id);
         for ((table, write), events) in write.tables().iter().filter(|(table, _)| data_table(table)).zip(self.tables) {
             if !write.declared_columns().is_empty() { declare(index, table, write.declared_columns())?; }
-            for event in events { index.apply_classic_event(table, event, transaction)?; }
+            for event in events { event.apply(index, table, transaction)?; }
         }
         Ok(self.charges)
     }
 }
 
-fn read_event(batch: &EventBatch, row: usize, memory: &Arc<MemoryBudget>) -> Result<(StoredEvent, Arc<MemoryReservation>)> {
-    let bytes = batch.borrow_event(row)?.document_allocation_bound()?.checked_add(512)
+struct ClassicEvent {
+    header: EventHeader,
+    operation: StoredOperation,
+}
+
+impl ClassicEvent {
+    fn apply(self, index: &mut BranchIndex, table: &TableRef, transaction: Option<TxId>) -> Result<()> {
+        index.apply_classic_operation(table, self.header.iid, self.header.valid_time, self.operation, transaction)
+    }
+}
+
+fn read_event(batch: &EventBatch, row: usize, memory: &Arc<MemoryBudget>) -> Result<(ClassicEvent, Arc<MemoryReservation>)> {
+    let event = batch.borrow_event(row)?;
+    let bytes = event.document_allocation_bound()?.checked_add(512)
         .ok_or_else(|| Anomaly::incorrect("rtdb/classic-projection-size", "Classic effect exceeds addressable memory").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded))?;
     let charge = memory.reserve(bytes)?;
-    Ok((batch.read_event(row)?, charge))
+    let header = event.header();
+    let operation = match header.op {
+        EventOp::Put => StoredOperation::Put(batch.read_put_document(row)?),
+        EventOp::Delete => StoredOperation::Delete,
+        EventOp::Erase => StoredOperation::Erase,
+        EventOp::Redacted => StoredOperation::Redacted,
+    };
+    Ok((ClassicEvent { header, operation }, charge))
 }
 
 pub(super) async fn recover(index: &mut BranchIndex, snapshot: Snapshot, storage: &Arc<BufferPool>,
@@ -120,16 +139,16 @@ pub(super) async fn recover(index: &mut BranchIndex, snapshot: Snapshot, storage
                 }).await?;
             }
         }
-        events.sort_unstable_by_key(|(_, event, encountered)| (event.header().precedence(), Reverse(*encountered)));
+        events.sort_unstable_by_key(|(_, event, encountered)| (event.header.precedence(), Reverse(*encountered)));
         let mut previous = None;
         for (table, event, _) in events {
-            let written = event.position.map(|position| position.transaction);
-            let transaction = (event.system_from, written);
+            let written = event.header.position.map(|position| position.transaction);
+            let transaction = (event.header.system_from, written);
             if previous != Some(transaction) {
-                advance(index, event.system_from)?;
+                advance(index, event.header.system_from)?;
                 previous = Some(transaction);
             }
-            index.apply_classic_event(&table, event, written)?;
+            event.apply(index, &table, written)?;
         }
         if let Some(key) = snapshot.tx_basis() {
             advance(index, key.system_time)?;
@@ -453,17 +472,28 @@ mod tests {
             position: None, origin: None, commit_position: 0, entity_key: None, iid, system_from,
             valid_time: Interval::ALL, operation, recency: None,
         };
-        advance(&mut index, Timestamp(1)).unwrap();
-        index.apply_classic_event(&table, event(StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(1))])), Timestamp(1)), Some(TxId(19))).unwrap();
-        assert_eq!(index.physical_iid(&table, &id), iid);
-        let cut = index.head();
-        advance(&mut index, Timestamp(1)).unwrap();
-        index.apply_classic_event(&table, event(StoredOperation::Delete, Timestamp(1)), Some(TxId(20))).unwrap();
+        let memory = MemoryBudget::new(1 << 20);
+        let types = StructFields::from([("_id".into(), LogicalType::Scalar(rtdb_types::ScalarType::I64))]);
+        let arrow = rtdb_format::data::build_event_batch(&[
+            event(StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(1))])), Timestamp(1)),
+            event(StoredOperation::Delete, Timestamp(1)),
+            event(StoredOperation::Erase, Timestamp(2)),
+        ], Some(types), None).unwrap();
+        let batch = EventBatch::new(arrow).unwrap();
+        let mut apply = |row, time, tx| {
+            advance(&mut index, Timestamp(time)).unwrap();
+            let (event, _charge) = read_event(&batch, row, &memory).unwrap();
+            event.apply(&mut index, &table, Some(TxId(tx))).unwrap();
+            index.clone()
+        };
+        let projected = apply(0, 1, 19);
+        assert_eq!(projected.physical_iid(&table, &id), iid);
+        let cut = projected.head();
+        let index = apply(1, 1, 20);
         let root = index.view(MAIN_BRANCH, At::Latest, Layer::Merged, Timestamp(1)).unwrap();
         assert!(root.row(&table, &id, Timestamp(0)).is_none());
         assert_eq!(root.history(&table, &id).len(), 2);
-        advance(&mut index, Timestamp(2)).unwrap();
-        index.apply_classic_event(&table, event(StoredOperation::Erase, Timestamp(2)), Some(TxId(21))).unwrap();
+        let index = apply(2, 2, 21);
         let root = index.view(MAIN_BRANCH, At::Latest, Layer::Merged, Timestamp(2)).unwrap();
         assert!(root.history(&table, &id).is_empty());
         assert!(matches!(index.view(MAIN_BRANCH, At::Exactly(cut.basis), Layer::Merged, Timestamp(2)),

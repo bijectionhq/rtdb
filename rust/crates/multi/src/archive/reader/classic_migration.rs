@@ -19,7 +19,7 @@ use rtdb_columnar::MemoryBudget;
 use rtdb_directory::{
     CheckpointTransferBootstrap, DeploymentRecord, Directory, HostedTask, Lifecycle,
 };
-use rtdb_format::{catalog::CheckpointContents, data::EventBatch};
+use rtdb_format::{catalog::CheckpointContents, data::{EncodedEvent, EventBatch}};
 use rtdb_node::ReadFence;
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, QueryContext};
 use rtdb_storage::cache::BufferPool;
@@ -414,30 +414,30 @@ async fn inspect_relation(
             if stop.is_cancelled() {
                 return Err(unavailable("Classic migration inspection was cancelled"));
             }
-            let bound = batch
-                .borrow_event(row)?
-                .document_allocation_bound()?
-                .checked_add(512)
+            let borrowed = batch.borrow_event(row)?;
+            let bound = borrowed.document_allocation_bound()?.checked_add(512)
                 .ok_or_else(|| inconsistent("A Classic migration row exceeds the memory bound"))?;
             let copies = if projection.is_some() || receipt.is_some() { 2 } else { 1 };
             let charge = memory.reserve(bound.checked_mul(copies)
                 .ok_or_else(|| inconsistent("A Classic migration row exceeds the memory bound"))?)?;
-            let event = batch.read_event(row)?;
-            let header = event.header();
+            let header = borrowed.header();
             relation.events += 1;
             relation.unpositioned += header.position.is_none() as u64;
             relation.erasures += (header.op == EventOp::Erase) as u64;
             relation.redacted += (header.op == EventOp::Redacted) as u64;
             let fingerprint = if projection.is_some() || receipt.is_some() {
-                let fingerprint = event.clone().history_fingerprint()?;
+                let event = batch.read_event(row)?;
+                let fingerprint = event.retained_history_fingerprint()?;
                 if let Some(projection) = projection.as_deref_mut() {
                     projection.observe(&relation.table, event, fingerprint, charge)?;
                 } else if let Some(receipt) = receipt.as_deref_mut() {
                     receipt.observe(&relation.table, event, fingerprint, charge)?;
                 }
                 fingerprint
+            } else if let Some(fingerprint) = borrowed.history_fingerprint_without_document() {
+                fingerprint?
             } else {
-                event.history_fingerprint()?
+                batch.read_event(row)?.history_fingerprint()?
             };
             digest.update(&fingerprint);
         }

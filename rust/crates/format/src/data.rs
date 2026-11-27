@@ -47,17 +47,6 @@ impl StoredEvent {
     /// Commits the original fact and its coordinates independently of Arrow
     /// field order and compaction's physical recency annotation.
     pub fn history_fingerprint(mut self) -> Result<[u8; 32]> {
-        use sha2::{Digest, Sha256};
-
-        struct HashWriter(Sha256);
-        impl std::io::Write for HashWriter {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.update(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
-        }
-
         let header = self.header();
         let document = match &mut self.operation {
             StoredOperation::Put(document) => {
@@ -66,12 +55,59 @@ impl StoredEvent {
             }
             StoredOperation::Delete | StoredOperation::Erase | StoredOperation::Redacted => None,
         };
-        let mut writer = HashWriter(Sha256::new());
-        writer.0.update(b"rtdb/positioned-fact-event/v1\0");
-        serde_json::to_writer(&mut writer, &(header, self.origin.map(|origin| origin.0), self.entity_key.as_deref(), document))
-            .map_err(invalid)?;
-        Ok(writer.0.finalize().into())
+        history_fingerprint(header, self.origin, self.entity_key.as_deref(), document)
     }
+
+    pub fn retained_history_fingerprint(&self) -> Result<[u8; 32]> {
+        let document = match &self.operation {
+            StoredOperation::Put(document) => Some(FingerprintDocument(document)),
+            StoredOperation::Delete | StoredOperation::Erase | StoredOperation::Redacted => None,
+        };
+        history_fingerprint(self.header(), self.origin, self.entity_key.as_deref(), document)
+    }
+}
+
+struct FingerprintDocument<'a>(&'a StructFields<Value>);
+
+impl serde::Serialize for FingerprintDocument<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+
+        let mut map = serializer.serialize_map(None)?;
+        for (name, value) in self.0.sorted() {
+            match value {
+                Value::Undefined => (),
+                Value::Struct(_) | Value::List(_) | Value::FixedSizeList(_) | Value::Set(_) | Value::Map { .. } => {
+                    let mut value = value.clone();
+                    order_document_fields(&mut value);
+                    map.serialize_entry(name, &value)?;
+                }
+                _ => map.serialize_entry(name, value)?,
+            }
+        }
+        map.end()
+    }
+}
+
+fn history_fingerprint(
+    header: EventHeader, origin: Option<EventOrigin>, entity_key: Option<&[u8]>, document: Option<impl serde::Serialize>,
+) -> Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+
+    struct HashWriter(Sha256);
+    impl std::io::Write for HashWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    let mut writer = HashWriter(Sha256::new());
+    writer.0.update(b"rtdb/positioned-fact-event/v1\0");
+    serde_json::to_writer(&mut writer, &(header, origin.map(|origin| origin.0), entity_key, document))
+        .map_err(invalid)?;
+    Ok(writer.0.finalize().into())
 }
 
 fn order_document(document: &mut StructFields<Value>) {
@@ -306,6 +342,10 @@ impl<'a> EventRef<'a> {
     }
 
     pub fn physical_entity_key(&self) -> Option<&'a [u8]> { self.entity_key }
+
+    pub fn history_fingerprint_without_document(&self) -> Option<Result<[u8; 32]>> {
+        self.put.is_none().then(|| history_fingerprint(self.header, self.origin, self.entity_key, None::<&StructFields<Value>>))
+    }
 
     pub fn put_identity(&self) -> Result<Option<rtdb_columnar::EntityIdRef<'a>>> {
         match self.put.map(|put| put.column("_id")) {
@@ -690,20 +730,23 @@ impl EventBatch {
     pub fn read_event(&self, row: usize) -> Result<StoredEvent> {
         let header = self.header(row)?;
         let operation = match header.op {
-            EventOp::Put => {
-                let (field, array, offset) = self.operation(row)?;
-                let logical = self.put_layout(field)?;
-                let Value::Struct(document) = rtdb_columnar::read_value_as(logical, field, array.as_ref(), offset)? else {
-                    return Err(invalid("A put operation must contain a document struct"));
-                };
-                StoredOperation::Put(document)
-            }
+            EventOp::Put => StoredOperation::Put(self.read_put_document(row)?),
             EventOp::Delete => StoredOperation::Delete,
             EventOp::Erase => StoredOperation::Erase,
             EventOp::Redacted => StoredOperation::Redacted,
         };
         Ok(StoredEvent { position: header.position, origin: self.origin(row)?, commit_position: header.commit_position, entity_key: self.entity_key(row)?.map(Arc::from), iid: header.iid, system_from: header.system_from, valid_time: header.valid_time, operation,
             recency: self.recency.map(|index| self.timestamp(index, row)).transpose()? })
+    }
+
+    pub fn read_put_document(&self, row: usize) -> Result<StructFields<Value>> {
+        if row >= self.len() { return Err(invalid("Event row exceeds batch length")); }
+        let (field, array, offset) = self.operation(row)?;
+        if field.name() != "put" { return Err(invalid("Only a put event has document cells")); }
+        let Value::Struct(document) = rtdb_columnar::read_value_as(self.put_layout(field)?, field, array.as_ref(), offset)? else {
+            return Err(invalid("A put operation must contain a document struct"));
+        };
+        Ok(document)
     }
 
     fn timestamp(&self, index: usize, row: usize) -> Result<Timestamp> {
@@ -723,6 +766,37 @@ impl EventBatch {
 /// All rows must either carry recency or omit it; the caller supplies the put schema captured with the rows.
 pub fn build_event_batch(events: &[StoredEvent], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>) -> Result<RecordBatch> {
     event_batch(events, put_fields, iid_encoding, false, None, PutLeg::First, false)
+}
+
+#[test]
+fn retained_and_header_only_fingerprints_match_the_canonical_event() {
+    let mask = StoredEvent {
+        position: Some(EventPosition { transaction: rtdb_types::TxId(5), ordinal: 1 }),
+        origin: Some(EventOrigin([4; 32])),
+        entity_key: None, iid: Iid([9; 16]), system_from: Timestamp(12), commit_position: 0,
+        valid_time: Interval::ALL, operation: StoredOperation::Delete, recency: Some(Timestamp(20)),
+    };
+    let masks = build_event_batch(std::slice::from_ref(&mask), None, None).unwrap();
+    let masks = EventBatch::new(masks).unwrap();
+    let from_arrow = masks.borrow_event(0).unwrap().history_fingerprint_without_document().unwrap().unwrap();
+    assert_eq!(from_arrow, mask.retained_history_fingerprint().unwrap());
+    assert_eq!(from_arrow, mask.clone().history_fingerprint().unwrap());
+
+    let event = StoredEvent {
+        operation: StoredOperation::Put(StructFields::from([
+            ("z".into(), Value::Null),
+            ("unused".into(), Value::Undefined),
+            ("a".into(), Value::list(vec![Value::Struct(StructFields::from([
+                ("this".into(), Value::Utf8("text".into())),
+                ("absent".into(), Value::Undefined),
+                ("nan".into(), Value::F64(f64::from_bits(0x7ff8_0000_0000_0001))),
+            ]))])),
+        ])),
+        ..mask
+    };
+    assert_eq!(event.retained_history_fingerprint().unwrap(), event.clone().history_fingerprint().unwrap());
+    let StoredOperation::Put(document) = &event.operation else { panic!("expected put"); };
+    assert_eq!(document.keys().map(String::as_str).collect::<Vec<_>>(), ["z", "unused", "a"]);
 }
 
 #[test]

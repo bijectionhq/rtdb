@@ -708,6 +708,7 @@ contract LogService {
         -- An identical retry observes the same retained source terminal.
         -- The verifier can retain independently sealed replay frames and detached bodies under the exact scratch stage with the terminal transaction and lifetime floors preserved.
         -- An import inventory reader authenticates the staged checkpoint, every replay segment and detached body, and the ordered replay commitment before reporting the exact source relation inventory.
+        -- The source relation inventory commits each original event in inspection order with its original coordinates and canonical document, independently of physical recency.
         -- The reader holds scratch storage while examining the replay and observes the original fence and retained obligations without acquiring original journal or object write authority.
         -- The authenticated Original can reopen the independent application writer closure at its exact committed cut from the selected sealed replay.
         -- The Original installed application layout fixes the closure and writer points and the disposition relations before any retained read.

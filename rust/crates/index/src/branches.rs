@@ -711,12 +711,18 @@ impl BranchIndex {
     }
 
     pub fn apply_classic_event(&mut self, table: &TableRef, event: rtdb_format::data::StoredEvent, classic_transaction: Option<TxId>) -> Result<()> {
+        self.apply_classic_operation(table, event.iid, event.valid_time, event.operation, classic_transaction)
+    }
+
+    pub fn apply_classic_operation(
+        &mut self, table: &TableRef, iid: Iid, valid: Interval,
+        operation: rtdb_format::data::StoredOperation, classic_transaction: Option<TxId>,
+    ) -> Result<()> {
         use rtdb_format::data::StoredOperation;
 
         let cut = self.head;
-        let iid = event.iid;
         let written = classic_transaction.map_or(WrittenVersion::Unpositioned, WrittenVersion::Classic);
-        match event.operation {
+        match operation {
             StoredOperation::Put(cells) => {
                 let id = cells.get("_id").ok_or_else(classic_identity)?.entity_id().map_err(|_| classic_identity())?;
                 let address = (table.clone(), id.clone());
@@ -730,7 +736,7 @@ impl BranchIndex {
                 }
                 let image = Some(Arc::new(RowImage { cells, expires_at: None, custody_group: None, custody_payload: None }));
                 self.apply(BranchEffect::Write { branch: MAIN_BRANCH.into(), table: table.clone(), event: BranchEvent {
-                    id, valid: event.valid_time, cut, image, written,
+                    id, valid, cut, image, written,
                 } })
             }
             operation @ (StoredOperation::Delete | StoredOperation::Erase) => {
@@ -743,7 +749,7 @@ impl BranchIndex {
                         BranchEffect::Erase { branch: Some(MAIN_BRANCH.into()), table: table.clone(), id }
                     } else {
                         BranchEffect::Write { branch: MAIN_BRANCH.into(), table: table.clone(), event: BranchEvent {
-                            id, valid: event.valid_time, cut, image: None, written,
+                            id, valid, cut, image: None, written,
                         } }
                     };
                     self.apply(effect)?;
