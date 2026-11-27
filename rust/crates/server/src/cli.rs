@@ -13,6 +13,7 @@ pub use memory::{UNKNOWN_MEMORY_LIMIT_BYTES, default_memory_limit_bytes, scaled_
 #[cfg(feature = "multi")]
 pub use crate::multi::activation::ActivationOptions;
 
+#[cfg(feature = "multi")]
 mod admin;
 #[cfg(feature = "multi")]
 pub use admin::AdminOptions;
