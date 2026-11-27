@@ -81,7 +81,11 @@ async fn select_star_lateral_join_and_lateral_with_unnest_4009_keep_aliases_and_
 async fn left_lateral_filters_before_null_extension_and_preserves_many_rows() {
     for suffix in ["WHERE y = l.x) AS r ON TRUE", ") AS r ON r.y = l.x", ") AS r ON EXISTS (SELECT 1 WHERE r.y = l.x)"] {
         let sql = format!("SELECT l.x, r.y FROM (VALUES (1), (2)) AS l(x) LEFT JOIN LATERAL (SELECT y FROM (VALUES (2), (2), (3)) AS t(y) WHERE l.x > 0 {}", suffix.replace("WHERE y", "AND y"));
-        assert_eq!(query(&sql, vec![]).await.unwrap(), vec![vec![Value::I64(1), Value::Null], vec![Value::I64(2), Value::I64(2)], vec![Value::I64(2), Value::I64(2)]], "{sql}");
+        let mut actual = query(&sql, vec![]).await.unwrap();
+        let mut expected = vec![vec![Value::I64(1), Value::Null], vec![Value::I64(2), Value::I64(2)], vec![Value::I64(2), Value::I64(2)]];
+        actual.sort_by_key(|row| format!("{row:?}"));
+        expected.sort_by_key(|row| format!("{row:?}"));
+        assert_eq!(actual, expected, "{sql}");
     }
     assert_eq!(query("SELECT l.x, r.y FROM (VALUES (1), (2)) AS l(x) LEFT JOIN LATERAL (SELECT l.x AS y WHERE FALSE) AS r ON TRUE", vec![]).await.unwrap(), vec![vec![Value::I64(1), Value::Null], vec![Value::I64(2), Value::Null]]);
     assert_eq!(query("SELECT l.x, r.y FROM (VALUES (1), (2)) AS l(x) CROSS JOIN LATERAL (SELECT l.x AS y WHERE FALSE) AS r", vec![]).await.unwrap(), Vec::<Vec<Value>>::new());

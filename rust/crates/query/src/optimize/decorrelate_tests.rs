@@ -210,6 +210,125 @@ fn corpus() -> Vec<(&'static str, Arc<Relation>, bool)> {
     ]).unwrap());
     let defaulted = Expr::Coalesce(vec![lookup_name().expression(), literal(0)]);
     let defaulted_name = Arc::new(customer_lookup().project(vec![NamedExpr { field: typed(32, "defaulted", defaulted.data_type()), expr: defaulted }]).unwrap());
+    let correlated_lookup_value = Arc::new(customer_lookup().project(vec![
+        NamedExpr { field: integer(33, "summed"), expr: Expr::binary(BinaryOp::Add, Expr::Coalesce(vec![lookup_name().expression(), literal(0)]), parameter(1, &customer_region())) },
+    ]).unwrap());
+    let outer_only_scalar = Arc::new(customer_lookup().project(vec![
+        NamedExpr { field: integer(34, "outer_region"), expr: parameter(1, &customer_region()) },
+    ]).unwrap());
+    let mark_field = typed(60, "_mark_60", bool_type().maybe());
+    let exists_field = typed(61, "_exists_61", bool_type());
+    let empty_orders = values(vec![order_customer(), order_amount()], &[]);
+    let single_row = values(vec![lookup_key(), lookup_name()], &[&[Some(9), Some(900)]]);
+    let mark_dep = Arc::new(select(orders(), Expr::binary(BinaryOp::Gt, order_amount().expression(), parameter(1, &customer_region())))
+        .project(vec![NamedExpr { field: typed(62, "cmp", bool_type().maybe()), expr: equals(parameter(0, &customer_id()), order_customer().expression()) }]).unwrap());
+    let uncorrelated_mark_dep = Arc::new(orders().project(vec![
+        NamedExpr { field: typed(63, "flag", bool_type().maybe()), expr: Expr::binary(BinaryOp::Gt, order_amount().expression(), literal(120)) },
+    ]).unwrap());
+    let correlated_mark_rel = Arc::new(Relation::new(
+        customers().schema().concat(&Schema::new(vec![mark_field.clone()]).unwrap()).unwrap(),
+        RelationNode::Mark {
+            input: customers(),
+            dependent: select(orders(), Expr::binary(BinaryOp::Gt, order_amount().expression(), parameter(0, &customer_region()))),
+            arguments: vec![(0, customer_region().expression())],
+            condition: None,
+            comparison: equals(customer_id().expression(), order_customer().expression()),
+            output: mark_field.clone(),
+        },
+    ).unwrap());
+    let uncorrelated_mark_rel = Arc::new(Relation::new(
+        customers().schema().concat(&Schema::new(vec![mark_field.clone()]).unwrap()).unwrap(),
+        RelationNode::Mark {
+            input: customers(),
+            dependent: orders(),
+            arguments: Vec::new(),
+            condition: None,
+            comparison: equals(customer_id().expression(), order_customer().expression()),
+            output: mark_field.clone(),
+        },
+    ).unwrap());
+    let left_only_orders = select(orders(), Expr::binary(BinaryOp::Gt, parameter(0, &customer_region()), literal(10)));
+    let left_only_lookup = select(single_row.clone(), Expr::binary(BinaryOp::Gt, parameter(0, &customer_region()), literal(10)));
+    let count_per_amount = typed(22, "per_amount", int());
+    let having_uncorrelated = select(Arc::clone(&per_amount), Expr::binary(BinaryOp::Gt, count_per_amount.expression(), literal(1)));
+    let having_correlated = select(Arc::clone(&per_amount), Expr::binary(BinaryOp::Lt, count_per_amount.expression(), parameter(1, &customer_region())));
+    let nested_agg_project = Arc::new(Arc::new(summed.clone().project(vec![
+        NamedExpr { field: integer(64, "inner_total"), expr: total.expression() },
+    ]).unwrap()).project(vec![
+        NamedExpr { field: integer(65, "outer_total"), expr: Expr::binary(BinaryOp::Add, integer(64, "inner_total").expression(), parameter(1, &customer_region())) },
+    ]).unwrap());
+    let uncorr_agg_corr_proj = Arc::new(aggregate(orders(), vec![counted(count.clone(), AggregateFunction::CountStar, None, None)])
+        .project(vec![NamedExpr { field: integer(66, "shifted_count"), expr: Expr::binary(BinaryOp::Add, count.expression(), parameter(0, &customer_region())) }]).unwrap());
+    let ungrouped_count = aggregate(customer_orders(), vec![counted(count.clone(), AggregateFunction::CountStar, None, None)]);
+    let ungrouped_having = select(Arc::clone(&ungrouped_count), Expr::binary(BinaryOp::Gt, count.expression(), literal(0)));
+    let ungrouped_array_agg = aggregate(customer_orders(), vec![
+        counted(typed(67, "amounts", LogicalType::list(int().maybe()).maybe()), AggregateFunction::ArrayAgg, Some(order_amount().expression()), None),
+    ]);
+    let tag_element = integer(41, "tag");
+    let tag_table = Arc::new(Relation::new(Schema::new(vec![tag_element.clone()]).unwrap(), RelationNode::ColumnTable { expr: parameter(0, &tags()), element: tag_element.clone() }).unwrap());
+    let tag_table_ord = Arc::new(Arc::clone(&tag_table).with_ordinality(typed(42, "n", int()), rtdb_plan::OrdinalityScope::Page).unwrap());
+    let scalar_unnest_count = apply(
+        &tagged(),
+        aggregate(Arc::clone(&tag_table), vec![counted(count.clone(), AggregateFunction::CountStar, None, None)]),
+        vec![(0, tags().expression())],
+        ApplyKind::Scalar,
+        Some(typed(68, "_sq_68", int().maybe())),
+    );
+    let scalar_unnest_filtered_sum = apply(
+        &tagged(),
+        aggregate(select(Arc::clone(&tag_table), Expr::binary(BinaryOp::Gt, tag_element.expression(), literal(10))), vec![
+            counted(total.clone(), AggregateFunction::Sum, Some(tag_element.expression()), None),
+        ]),
+        vec![(0, tags().expression())],
+        ApplyKind::Scalar,
+        Some(integer(69, "_sq_69")),
+    );
+    let scalar_unnest_null_filter = apply(
+        &tagged(),
+        aggregate(select(Arc::clone(&tag_table), Expr::unary(UnaryOp::IsNull, tag_element.expression())), vec![
+            counted(count.clone(), AggregateFunction::CountStar, None, None),
+        ]),
+        vec![(0, tags().expression())],
+        ApplyKind::Scalar,
+        Some(typed(70, "_sq_70", int().maybe())),
+    );
+    let corr_on_left_join_lhs = Arc::new(Relation::join(customer_orders(), lookup(), JoinKind::Left, Some(equals(order_amount().expression(), lookup_name().expression()))).unwrap());
+    let corr_on_semi_join_lhs = Arc::new(Relation::join(customer_orders(), lookup(), JoinKind::Semi, Some(equals(order_amount().expression(), lookup_name().expression()))).unwrap());
+    let corr_on_anti_join_lhs = Arc::new(Relation::join(customer_orders(), lookup(), JoinKind::Anti, Some(equals(order_amount().expression(), lookup_name().expression()))).unwrap());
+    let corr_on_right_join_rhs = Arc::new(Relation::join(lookup(), customer_orders(), JoinKind::Right, Some(equals(lookup_name().expression(), order_amount().expression()))).unwrap());
+    let corr_on_mark_input = Arc::new(Relation::new(
+        customer_orders().schema().concat(&Schema::new(vec![mark_field.clone()]).unwrap()).unwrap(),
+        RelationNode::Mark {
+            input: customer_orders(),
+            dependent: lookup(),
+            arguments: Vec::new(),
+            condition: None,
+            comparison: equals(order_amount().expression(), lookup_name().expression()),
+            output: mark_field.clone(),
+        },
+    ).unwrap());
+    // Pulling a correlated selection out of the RHS of a LEFT OUTER JOIN is unsound: unmatched LHS rows would be dropped.
+    let corr_on_left_join_rhs = Arc::new(Relation::join(lookup(), customer_orders(), JoinKind::Left, Some(equals(lookup_name().expression(), order_amount().expression()))).unwrap());
+    let fallible_unnest_input = values(vec![integer(72, "x")], &[&[Some(1)], &[Some(0)]]);
+    let div_list = Expr::List(vec![Expr::binary(BinaryOp::Divide, literal(1), integer(72, "x").expression())]);
+    let staged_div = typed(73, "_unnest_div", div_list.data_type());
+    let fallible_unnest_elem = integer(74, "v");
+    let fallible_unnest = Arc::new(Relation::new(
+        Schema::new(vec![integer(72, "x"), staged_div.clone(), fallible_unnest_elem.clone()]).unwrap(),
+        RelationNode::Unnest {
+            input: Arc::new(fallible_unnest_input.extend(vec![NamedExpr { field: staged_div.clone(), expr: div_list }]).unwrap()),
+            expr: staged_div.expression(),
+            element: fallible_unnest_elem.clone(),
+            ordinality: None,
+            outer: false,
+        },
+    ).unwrap());
+    let fallible_unnest_dep = keep(select(fallible_unnest, equals(integer(72, "x").expression(), parameter(0, &customer_id()))), &[fallible_unnest_elem]);
+    let uncorr_distinct_limit_corr_proj = Arc::new(
+        Arc::new(Arc::new(Relation::new(Schema::new(vec![order_amount()]).unwrap(), RelationNode::Distinct { input: keep(orders(), &[order_amount()]) }).unwrap())
+            .limit(None, Some(literal(3))).unwrap())
+            .project(vec![NamedExpr { field: integer(71, "shifted_amt"), expr: Expr::binary(BinaryOp::Add, order_amount().expression(), parameter(0, &customer_region())) }]).unwrap()
+    );
     vec![
         ("exists", exists(one(customer_orders()), by_customer(), false, None), true),
         ("not exists", exists(one(customer_orders()), by_customer(), true, None), true),
@@ -220,15 +339,44 @@ fn corpus() -> Vec<(&'static str, Arc<Relation>, bool)> {
             Some(Expr::binary(BinaryOp::Gt, customer_region().expression(), literal(10)))), true),
         ("exists over distinct and limit", exists(Arc::new(Arc::clone(&distinct).limit(None, Some(literal(1))).unwrap()), by_customer(), false, None), true),
         ("not exists over distinct and limit", exists(Arc::new(Arc::clone(&distinct).limit(None, Some(literal(1))).unwrap()), by_customer(), true, None), true),
+        ("exists as a value", apply(&customers(), one(customer_orders()), by_customer(), ApplyKind::Exists, Some(exists_field.clone())), true),
+        ("uncorrelated exists as a value", apply(&customers(), one(orders()), by_customer(), ApplyKind::Exists, Some(exists_field.clone())), true),
+        ("uncorrelated exists over empty dependent", apply(&customers(), one(Arc::clone(&empty_orders)), by_customer(), ApplyKind::Exists, Some(exists_field.clone())), true),
+        ("uncorrelated filtered exists", exists(one(orders()), by_customer(), false, None), true),
+        ("uncorrelated filtered not exists", exists(one(Arc::clone(&empty_orders)), by_customer(), true, None), true),
+        ("exists with a left-only correlation", exists(one(Arc::clone(&left_only_orders)), vec![(0, customer_region().expression())], false, None), true),
+        ("not exists with a left-only correlation", exists(one(Arc::clone(&left_only_orders)), vec![(0, customer_region().expression())], true, None), true),
+        ("uncorrelated left apply", apply(&customers(), lookup(), by_customer(), ApplyKind::Left, None), true),
+        ("uncorrelated left apply over empty dependent", apply(&customers(), Arc::clone(&empty_orders), by_customer(), ApplyKind::Left, None), true),
+        ("uncorrelated semi apply", apply(&customers(), lookup(), by_customer(), ApplyKind::Semi, None), true),
+        ("uncorrelated semi apply over empty dependent", apply(&customers(), Arc::clone(&empty_orders), by_customer(), ApplyKind::Semi, None), true),
+        ("uncorrelated anti apply", apply(&customers(), lookup(), by_customer(), ApplyKind::Anti, None), true),
+        ("uncorrelated anti apply over empty dependent", apply(&customers(), Arc::clone(&empty_orders), by_customer(), ApplyKind::Anti, None), true),
+        ("uncorrelated mark apply", apply(&customers(), uncorrelated_mark_dep, by_customer(), ApplyKind::Mark, Some(mark_field.clone())), true),
+        ("correlated mark apply as a value", apply(&customers(), Arc::clone(&mark_dep), vec![(0, customer_id().expression()), (1, customer_region().expression())], ApplyKind::Mark, Some(mark_field.clone())), true),
+        ("filtered correlated mark apply", keep(select(apply(&customers(), Arc::clone(&mark_dep), vec![(0, customer_id().expression()), (1, customer_region().expression())], ApplyKind::Mark, Some(mark_field.clone())), mark_field.expression()), &[customer_id(), customer_region()]), true),
+        ("negated filtered correlated mark apply", keep(select(apply(&customers(), mark_dep, vec![(0, customer_id().expression()), (1, customer_region().expression())], ApplyKind::Mark, Some(mark_field.clone())), Expr::unary(UnaryOp::Not, mark_field.expression())), &[customer_id(), customer_region()]), true),
+        ("correlated mark relation as a value", Arc::clone(&correlated_mark_rel), true),
+        ("filtered correlated mark relation", keep(select(correlated_mark_rel, mark_field.expression()), &[customer_id(), customer_region()]), true),
+        ("filtered uncorrelated mark relation", keep(select(Arc::clone(&uncorrelated_mark_rel), mark_field.expression()), &[customer_id(), customer_region()]), true),
+        ("negated filtered uncorrelated mark relation", keep(select(uncorrelated_mark_rel, Expr::unary(UnaryOp::Not, mark_field.expression())), &[customer_id(), customer_region()]), true),
         ("lateral inner", keep(apply(&customers(), customer_orders(), by_customer(), ApplyKind::Inner, None),
             &[customer_id(), customer_region(), order_customer(), order_amount()]), true),
+        ("lateral inner with dependent-only outer filter", select(apply(&customers(), customer_orders(), by_customer(), ApplyKind::Inner, None), Expr::binary(BinaryOp::Gt, order_amount().expression(), literal(50))), true),
         ("lateral left", apply(&customers(), customer_orders(), by_customer(), ApplyKind::Left, None), true),
         ("lateral left with smaller right input", apply(&customers(), customer_lookup(), by_customer(), ApplyKind::Left, None), true),
+        ("lateral left with computed dependent column", apply(&customers(), Arc::clone(&defaulted_name), by_customer(), ApplyKind::Left, None), true),
+        ("lateral left with correlated computed dependent column", apply(&customers(), Arc::clone(&correlated_lookup_value), vec![(0, customer_id().expression()), (1, customer_region().expression())], ApplyKind::Left, None), true),
+        ("lateral single with correlated computed dependent column", apply(&customers(), correlated_lookup_value, vec![(0, customer_id().expression()), (1, customer_region().expression())], ApplyKind::Single, None), true),
+        ("lateral left with a left-only correlation", apply(&customers(), left_only_lookup.clone(), vec![(0, customer_region().expression())], ApplyKind::Left, None), true),
         ("scalar count", scalar(aggregate(customer_orders(), vec![counted(count.clone(), AggregateFunction::CountStar, None, None)]), by_customer()), true),
+        ("scalar count with a left-only correlation", scalar(aggregate(Arc::clone(&left_only_orders), vec![counted(count.clone(), AggregateFunction::CountStar, None, None)]), vec![(0, customer_region().expression())]), true),
         ("scalar sum", scalar(Arc::clone(&summed), by_customer()), true),
         ("scalar sum plus one", scalar(Arc::new(summed.project(vec![NamedExpr {
             field: plus_one.clone(), expr: Expr::binary(BinaryOp::Add, total.expression(), literal(1)),
         }]).unwrap()), by_customer()), true),
+        ("scalar aggregate under nested projections", scalar(nested_agg_project, vec![(0, customer_id().expression()), (1, customer_region().expression())]), true),
+        ("uncorrelated scalar aggregate with correlated projection", scalar(uncorr_agg_corr_proj, vec![(0, customer_region().expression())]), true),
         ("scalar count with a correlated filter", scalar(aggregate(customer_orders(), vec![
             counted(count, AggregateFunction::Count, Some(order_amount().expression()), Some(large)),
         ]), vec![(0, customer_id().expression()), (1, customer_region().expression())]), true),
@@ -237,14 +385,30 @@ fn corpus() -> Vec<(&'static str, Arc<Relation>, bool)> {
         ("in as a value", quantified(false, false), true),
         ("scalar subquery of several rows", scalar(keep(customer_orders(), &[order_amount()]), by_customer()), true),
         ("scalar value of at most one row", scalar(keep(customer_lookup(), &[lookup_name()]), by_customer()), true),
+        ("scalar value with a left-only correlation", scalar(keep(left_only_lookup, &[lookup_name()]), vec![(0, customer_region().expression())]), true),
         ("scalar computed value", scalar(defaulted_name, by_customer()), true),
+        ("scalar returning outer column stays null when unmatched", scalar(outer_only_scalar, vec![(0, customer_id().expression()), (1, customer_region().expression())]), true),
         ("lateral single", apply(&customers(), customer_lookup(), by_customer(), ApplyKind::Single, None), true),
         ("lateral grouped", apply(&customers(), Arc::clone(&per_amount), by_customer(), ApplyKind::Inner, None), true),
         ("lateral grouped with a correlated projection", apply(&customers(), per_amount_shifted,
             vec![(0, customer_id().expression()), (1, customer_region().expression())], ApplyKind::Inner, None), true),
+        ("lateral grouped with uncorrelated having", apply(&customers(), having_uncorrelated, by_customer(), ApplyKind::Inner, None), true),
+        ("lateral grouped with correlated having", apply(&customers(), having_correlated, vec![(0, customer_id().expression()), (1, customer_region().expression())], ApplyKind::Inner, None), true),
+        ("lateral ungrouped aggregate", apply(&customers(), Arc::clone(&ungrouped_count), by_customer(), ApplyKind::Inner, None), true),
+        ("lateral left ungrouped aggregate", apply(&customers(), Arc::clone(&ungrouped_count), by_customer(), ApplyKind::Left, None), true),
+        ("lateral single ungrouped aggregate", apply(&customers(), ungrouped_count, by_customer(), ApplyKind::Single, None), true),
+        ("lateral ungrouped aggregate with having", apply(&customers(), ungrouped_having, by_customer(), ApplyKind::Inner, None), true),
+        ("lateral ungrouped collecting aggregate keeps apply", apply(&customers(), ungrouped_array_agg, by_customer(), ApplyKind::Inner, None), false),
+        ("lateral correlated projection over uncorrelated distinct limit", apply(&customers(), uncorr_distinct_limit_corr_proj, vec![(0, customer_region().expression())], ApplyKind::Inner, None), true),
         ("lateral unnest", unnested(false, None), true),
         ("lateral unnest with ordinality", unnested(true, None), true),
         ("lateral unnest with a correlated selection", unnested(true, Some(Expr::binary(BinaryOp::Gt, integer(41, "tag").expression(), parameter(1, &customer_id())))), true),
+        ("lateral left unnest", apply(&tagged(), Arc::clone(&tag_table), vec![(0, tags().expression())], ApplyKind::Left, None), true),
+        ("lateral left unnest with ordinality", apply(&tagged(), tag_table_ord, vec![(0, tags().expression())], ApplyKind::Left, None), true),
+        ("scalar count over lateral unnest", scalar_unnest_count, true),
+        ("scalar filtered sum over lateral unnest", scalar_unnest_filtered_sum, true),
+        ("scalar is-null count over lateral unnest", scalar_unnest_null_filter, true),
+        ("lateral grouped over non-reflexive list input", apply(&tagged(), Arc::clone(&per_amount), by_customer(), ApplyKind::Inner, None), true),
         ("lateral unnest of a correlated selection", apply(&customers(), customer_tags(false, false), by_customer(), ApplyKind::Inner, None), true),
         ("lateral left outer unnest of a correlated selection with ordinality", apply(&customers(), customer_tags(true, true), by_customer(), ApplyKind::Left, None), true),
         ("exists over an unnest of a correlated selection", exists(one(customer_tags(false, false)), by_customer(), false, None), true),
@@ -256,6 +420,13 @@ fn corpus() -> Vec<(&'static str, Arc<Relation>, bool)> {
         ("lateral left grouped on another column", apply(&customers(), Arc::clone(&per_amount), by_customer(), ApplyKind::Left, None), false),
         ("lateral left over a computed column only its selection reads", apply(&customers(), shifted_orders(),
             vec![(0, customer_id().expression()), (1, customer_region().expression())], ApplyKind::Left, None), true),
+        ("correlated selection on left outer join lhs", apply(&customers(), corr_on_left_join_lhs, by_customer(), ApplyKind::Left, None), true),
+        ("correlated selection on semi join lhs", apply(&customers(), corr_on_semi_join_lhs, by_customer(), ApplyKind::Inner, None), true),
+        ("correlated selection on anti join lhs", apply(&customers(), corr_on_anti_join_lhs, by_customer(), ApplyKind::Left, None), true),
+        ("correlated selection on right outer join rhs", apply(&customers(), corr_on_right_join_rhs, by_customer(), ApplyKind::Inner, None), true),
+        ("correlated selection on mark join input", apply(&customers(), corr_on_mark_input, by_customer(), ApplyKind::Left, None), true),
+        ("correlated selection on left outer join rhs keeps apply", apply(&customers(), corr_on_left_join_rhs, by_customer(), ApplyKind::Inner, None), false),
+        ("correlated selection guarding fallible unnest keeps apply", apply(&customers(), fallible_unnest_dep, by_customer(), ApplyKind::Left, None), false),
     ]
 }
 
@@ -297,7 +468,12 @@ fn both_ways(relation: &Arc<Relation>) -> (PreparedQuery, PreparedQuery) {
 fn count_nodes(relation: &Relation, matches: &impl Fn(&RelationNode) -> bool) -> usize {
     usize::from(matches(relation.node())) + relation.children().into_iter().map(|child| count_nodes(child, matches)).sum::<usize>()
 }
-fn applies(relation: &Relation) -> usize { count_nodes(relation, &|node: &RelationNode| matches!(node, RelationNode::Apply { .. })) }
+fn applies(relation: &Relation) -> usize {
+    count_nodes(relation, &|node: &RelationNode| {
+        matches!(node, RelationNode::Apply { .. })
+            || matches!(node, RelationNode::Mark { arguments, .. } if !arguments.is_empty())
+    })
+}
 fn joins(relation: &Relation, kind: JoinKind) -> usize {
     count_nodes(relation, &|node: &RelationNode| matches!(node, RelationNode::Join { kind: found, .. } if *found == kind))
 }
@@ -387,11 +563,49 @@ fn a_correlated_selection_beneath_an_unnest_moves_above_it() {
 }
 
 #[test]
-fn an_ungrouped_lateral_aggregate_keeps_its_apply() {
-    // It has a row for every customer, including those without orders, which a grouping over the join would drop.
+fn an_ungrouped_lateral_aggregate_becomes_a_grouped_left_join_unless_collecting() {
     let count = aggregate(customer_orders(), vec![counted(typed(12, "count", int()), AggregateFunction::CountStar, None, None)]);
     let prepared = prepare(apply(&customers(), count, by_customer(), ApplyKind::Inner, None)).unwrap();
-    assert_eq!(applies(&prepared), 1, "{prepared:?}");
+    assert_eq!((applies(&prepared), joins(&prepared, JoinKind::Left)), (0, 1), "{prepared:?}");
+    let collected = aggregate(customer_orders(), vec![
+        counted(typed(12, "amounts", LogicalType::list(int().maybe()).maybe()), AggregateFunction::ArrayAgg, Some(order_amount().expression()), None),
+    ]);
+    let kept = prepare(apply(&customers(), collected, by_customer(), ApplyKind::Inner, None)).unwrap();
+    assert_eq!(applies(&kept), 1, "{kept:?}");
+}
+
+#[test]
+fn a_selected_mark_join_becomes_a_semi_join_and_standalone_exists_a_shared_mark() {
+    let mark = typed(60, "_mark_60", bool_type().maybe());
+    let marked = Arc::new(Relation::new(
+        customers().schema().concat(&Schema::new(vec![mark.clone()]).unwrap()).unwrap(),
+        RelationNode::Mark {
+            input: customers(),
+            dependent: orders(),
+            arguments: Vec::new(),
+            condition: None,
+            comparison: equals(customer_id().expression(), order_customer().expression()),
+            output: mark.clone(),
+        },
+    ).unwrap());
+    let semi = prepare(keep(select(marked, mark.expression()), &[customer_id(), customer_region()])).unwrap();
+    assert_eq!((applies(&semi), joins(&semi, JoinKind::Semi)), (0, 1), "{semi:?}");
+    assert_eq!(count_nodes(&semi, &|node: &RelationNode| matches!(node, RelationNode::Mark { .. })), 0, "{semi:?}");
+
+    let exists_field = typed(61, "_exists_61", bool_type());
+    let projected = prepare(apply(&customers(), one(customer_orders()), by_customer(), ApplyKind::Exists, Some(exists_field))).unwrap();
+    assert_eq!(applies(&projected), 0, "{projected:?}");
+    assert_eq!(count_nodes(&projected, &|node: &RelationNode| matches!(node, RelationNode::Mark { arguments, .. } if arguments.is_empty())), 1, "{projected:?}");
+}
+
+#[test]
+fn an_uncorrelated_aggregate_with_a_correlated_projection_uses_a_single_join_without_ordinality() {
+    let count = typed(12, "count", int());
+    let dependent = Arc::new(aggregate(orders(), vec![counted(count.clone(), AggregateFunction::CountStar, None, None)])
+        .project(vec![NamedExpr { field: integer(66, "shifted"), expr: Expr::binary(BinaryOp::Add, count.expression(), parameter(0, &customer_region())) }]).unwrap());
+    let prepared = prepare(scalar(dependent, vec![(0, customer_region().expression())])).unwrap();
+    assert_eq!((applies(&prepared), joins(&prepared, JoinKind::Single)), (0, 1), "{prepared:?}");
+    assert_eq!(count_nodes(&prepared, &|node: &RelationNode| matches!(node, RelationNode::Ordinality { .. })), 0, "{prepared:?}");
 }
 
 #[test]

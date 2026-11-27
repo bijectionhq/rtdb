@@ -359,18 +359,18 @@ The source fixtures in `rtdb-sql/tests/explain.rs` and `rtdb-node/tests/explain.
 Private page and replay tests cover retained-buffer lifetime and cancellation while materialization is suspended.
 These tests have not run.
 Full optimizer equivalence, including decorrelation, projection fusion, symbol allocation, and scan-column order, remains unqualified.
-Decorrelation ports the reference's rules 1, 2, 8 and 9, `apply-table-col->unnest`, `select-mark-join->semi-join` and selection pushdown past applies: a correlated scalar subquery becomes a single join, which keeps its cardinality check, and a lateral subquery over an aggregate with groups becomes a grouping over the join with numbered input rows.
-Its selection lifting also ports `push-decorrelated-selection-down-past-unnest`, `-past-group-by`, `push-decorrelated-predicate-down-past-period-constructor` and `push-decorrelated-selections-with-fewer-variables-down`: a correlated selection on grouping columns moves above an aggregate with groups, the uncorrelated selections staying beneath it or beneath an unnest, and a computed column, such as a period, that only a selection reads no longer keeps a left or single apply.
+Decorrelation ports the reference's rules 1, 2, 3, 4, 8 and 9, `apply-table-col->unnest`, `select-mark-join->semi-join` and selection pushdown past applies (to both inputs of an inner apply): uncorrelated applies of all relational, scalar, exists and mark modes become joins or shared marks; correlated applies and marks lift selections (spanning or one-sided) into joins or shared marks; left and single applies with computed dependent values keep them null over unmatched rows; cross applies peel selections (including HAVING) and projections via rules 3 and 4; ungrouped aggregates (except collecting/ordered aggregates) under scalar, single, inner and left applies follow rule 9's grouped left join (and outer unnest for correlated column tables), while grouped aggregates under inner applies follow rule 8.
+Its selection lifting also ports `pull-correlated-selection-up-towards-apply` past projections, inner joins, left/semi/anti join left inputs, right join right inputs, mark join inputs, unnests and groupings, along with `push-decorrelated-selection-down-past-unnest`, `-past-group-by`, `push-decorrelated-predicate-down-past-period-constructor` and `push-decorrelated-selections-with-fewer-variables-down`.
 Selections are lifted conjunct by conjunct, so their order never matters.
-Unlike the reference, which pulls no correlated selection above an unnest, a correlated selection beneath an unnest whose list reads no bound parameter moves above it, which keeps the same rows.
+Unlike the reference, which pulls no correlated selection above an unnest, a correlated selection beneath an unnest whose list reads no bound parameter moves above it, which keeps the same rows; and unlike the reference's LOJ RHS rule, correlated selections are not lifted from the null-supplying side of an outer join, which would drop unmatched rows.
 These shapes still run once per input row, and keep their applies:
 
 * a dependent plan with a volatile call, or an outer reference to an enclosing apply;
-* an ungrouped aggregate under a lateral join, which gives a row even for an input row with no matches;
+* an ungrouped collecting or ordered aggregate (such as `ARRAY_AGG` or `VEC_AGG`) under a scalar, single, inner or left apply;
 * outside a lateral inner join, which rule 8 handles, a correlated selection beneath a grouping that reads a column the grouping drops, or a grouping or aggregate that reads a bound parameter itself, including a percentile fraction;
-* outside a lateral inner join, which `apply-table-col->unnest` handles, an unnest whose list reads a bound parameter, or a computed column that does;
-* a correlated selection beneath an outer, semi, anti, single or mark join, a set operation, a window, a row numbering or ordinality, or, outside an existence test, DISTINCT, a sort or a limit;
-* a left or single apply whose dependent returns a value computed from a bound parameter, which over the rows the join supplies nulls for could differ from the apply's null.
+* a correlated unnest under a filtered left apply, or an unnest whose list reads a bound parameter inside a semi/anti/mark/exists apply or below another operator;
+* a correlated selection beneath the null-supplying side of an outer join, a full outer or single join, a set operation, a window, a row numbering or ordinality, or, outside an existence test, DISTINCT, a sort or a limit;
+* `PULL` and `PULL_MANY` applies (`NEST_ONE` / `NEST_MANY`).
 Append projections, windows and UNNEST retain the input columns required by their expressions and those requested by their parents.
 For conjunctive filters, expressions with fewer column dependencies can reach the scan before multi-column expressions.
 Scan explanations use the reference traversal order of the symbol set and the resulting text set.
