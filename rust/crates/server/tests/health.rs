@@ -71,6 +71,17 @@ async fn node_metrics_report_the_memory_cache_and_available_compaction_jobs() {
     assert_eq!(gauge("memory-cache.freeBytes"), Some(limit - retained));
     assert!(rows.rows().iter().any(|metric| matches!(metric, CatalogMetric::Gauge { name, tags, value, .. }
         if name == "compactor.jobs.available" && *value == 0.0 && tags.get("db").is_some_and(|db| db == "xtdb"))));
+    let allocator_gauge = |expected: &str, allocator: &str, database: &str| rows.rows().iter().find_map(|metric| match metric {
+        CatalogMetric::Gauge { name, tags, unit: Some(rtdb_plan::CatalogMetricUnit::Bytes), value }
+            if name == expected && tags.get("allocator").map(String::as_str) == Some(allocator) && tags.get("database").map(String::as_str) == Some(database) => Some(*value),
+        _ => None,
+    });
+    assert_eq!(allocator_gauge("xtdb.allocator.memory.allocated", "memory-cache", ""), Some(retained));
+    assert_eq!(allocator_gauge("xtdb.allocator.memory.limit", "memory-cache", ""), Some(limit));
+    assert!(allocator_gauge("xtdb.allocator.memory.allocated", "query", "").is_some());
+    assert!(allocator_gauge("xtdb.allocator.memory.limit", "query", "").is_some());
+    assert!(allocator_gauge("xtdb.allocator.memory.allocated", "buffer-pool", "xtdb").is_some());
+    assert_eq!(allocator_gauge("xtdb.allocator.memory.limit", "buffer-pool", "xtdb"), Some(limit));
     drop(rows);
     node.shutdown();
     node_task.await.unwrap().unwrap();
