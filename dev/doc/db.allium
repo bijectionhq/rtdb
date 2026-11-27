@@ -2502,6 +2502,8 @@ surface QueryAccess {
         -- A persisted page body that lands at an unaligned address in its storage buffer uses aligned storage during Arrow decoding.
         -- A reserved projected decode charges that aligned storage with its page.
         -- The scan retains the event headers and exact entity keys required for temporal resolution.
+        -- At one system-time point, an admitted history resolver tracks the union of valid times covered by eligible overwrites and emits the surviving gaps.
+        -- An erase fences lower-precedence events for the same IID even when the erase follows the requested system time.
         -- A point in both time dimensions selects the same visible fragment as history resolution, including its valid-time endpoints and the effects of deletes and erases.
         -- A located point read checks ambiguous event identities before returning the event that determines visibility.
         -- A point read for one IID can seek its complete range in a cached primary page after the page's IID order has been checked.

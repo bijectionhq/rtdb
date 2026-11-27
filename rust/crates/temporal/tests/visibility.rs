@@ -176,6 +176,83 @@ fn window_keeps_erased_retracted_and_readable_winners_at_their_positions() {
 }
 
 #[test]
+fn point_system_coverage_preserves_gap_endpoints_and_winner_order() {
+    let span = |from, to| Interval::from_micros(from, to).unwrap();
+    let events = [
+        (1, 60, -5, 19, EventOp::Put),
+        (1, 50, 9, 12, EventOp::Put),
+        (1, 49, 2, 5, EventOp::Delete),
+        (1, 48, 5, 10, EventOp::Redacted),
+        (1, 48, 16, i64::MAX, EventOp::Put),
+        (1, 47, 1, 18, EventOp::Put),
+        (1, 46, 0, 0, EventOp::Put),
+        (1, 45, -5, 19, EventOp::Erase),
+        (1, 44, -5, 19, EventOp::Put),
+        (2, 60, -5, 19, EventOp::Erase),
+        (2, 20, -5, 19, EventOp::Put),
+        (3, 41, -5, 19, EventOp::Put),
+    ].map(|(iid, system, from, to, op)| EventHeader {
+        position: None, commit_position: 0, iid: Iid([iid; 16]), system_from: Timestamp(system), valid_time: span(from, to), op,
+    });
+    for valid_time in [Interval::ALL, span(3, 17), span(10, 11)] {
+        for clamp in [false, true] {
+            let bounds = TemporalBounds { valid_time, system_time: span(50, 51) };
+            let run = |mut resolver: HistoryResolver| {
+                let mut output = Vec::new();
+                for (ordinal, header) in events.iter().enumerate() {
+                    resolver.visit_winners(header, |image, rectangle| {
+                        output.push((ordinal, image, rectangle));
+                        Ok(())
+                    }).unwrap();
+                }
+                output
+            };
+            let expected = run(HistoryResolver::new(bounds, clamp));
+            let memory = MemoryBudget::new(4096);
+            assert_eq!(run(HistoryResolver::new_in(bounds, clamp, Arc::clone(&memory))), expected);
+            assert_eq!(memory.used_bytes(), 0);
+        }
+    }
+}
+
+#[test]
+fn point_system_coverage_refuses_an_unfunded_gap_before_emitting_or_advancing() {
+    let span = |from, to| Interval::from_micros(from, to).unwrap();
+    let bounds = TemporalBounds { valid_time: Interval::ALL, system_time: span(10, 11) };
+    let memory = MemoryBudget::new(0);
+    let mut resolver = HistoryResolver::new_in(bounds, false, Arc::clone(&memory));
+    let start = EventHeader {
+        position: None, commit_position: 0, iid: Iid([1; 16]), system_from: Timestamp(10), valid_time: span(0, 1), op: EventOp::Put,
+    };
+    assert_eq!(resolver.resolve(&start, ()).unwrap().len(), 1);
+    let disjoint = EventHeader { system_from: Timestamp(8), valid_time: span(3, 4), ..start };
+    let error = resolver.visit_winners(&disjoint, |_, _| panic!("Unfunded coverage cannot emit")).unwrap_err();
+    assert!(error.is(rtdb_types::AnomalyKind::ResourceExhausted));
+    let adjoining = EventHeader { system_from: Timestamp(9), valid_time: span(1, 2), ..start };
+    assert_eq!(resolver.resolve(&adjoining, ()).unwrap()[0].valid_time, span(1, 2));
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn point_system_coverage_consumes_the_whole_event_when_visiting_a_gap_fails() {
+    let span = |from, to| Interval::from_micros(from, to).unwrap();
+    let bounds = TemporalBounds { valid_time: Interval::ALL, system_time: span(10, 11) };
+    let mut resolver = HistoryResolver::new_in(bounds, false, MemoryBudget::new(0));
+    let middle = EventHeader {
+        position: None, commit_position: 0, iid: Iid([1; 16]), system_from: Timestamp(10), valid_time: span(2, 4), op: EventOp::Put,
+    };
+    assert_eq!(resolver.resolve(&middle, ()).unwrap().len(), 1);
+    let across = EventHeader { system_from: Timestamp(9), valid_time: span(0, 6), ..middle };
+    let error = resolver.visit_winners(&across, |_, first| {
+        assert_eq!(first.valid_time, span(0, 2));
+        Err(rtdb_types::Anomaly::fault("test/visit", "Stop after the first gap"))
+    }).unwrap_err();
+    assert_eq!(error.code, "test/visit");
+    let older = EventHeader { system_from: Timestamp(8), valid_time: span(4, 6), ..middle };
+    assert!(resolver.resolve(&older, ()).unwrap().is_empty());
+}
+
+#[test]
 fn a_scan_at_any_bounds_sees_exactly_the_events_whose_rectangles_meet_them() {
     let mut random = Seeded(17);
     for case in 0..3_000 {

@@ -356,6 +356,95 @@ impl<R> ResolvedRows<R> {
 enum HistoryCalculator {
     Legacy(PolygonCalculator),
     Admitted(AdmittedPolygonCalculator),
+    PointSystem(PointSystemCoverage),
+}
+
+/// At a fixed system-time cut, each eligible overwrite hides its entire valid-time interval.
+struct PointSystemCoverage {
+    state: CalculatorState<()>,
+    first: Option<Interval>,
+    spans: Vec<Interval>,
+    capacity: usize,
+    _reservation: Option<Arc<MemoryReservation>>,
+    memory: Arc<MemoryBudget>,
+}
+
+impl PointSystemCoverage {
+    fn new(bounds: TemporalBounds, memory: Arc<MemoryBudget>) -> Self {
+        Self {
+            state: CalculatorState::new(Some(bounds)), first: None, spans: Vec::new(), capacity: 0,
+            _reservation: None, memory,
+        }
+    }
+
+    fn spans(&self) -> &[Interval] {
+        if self.first.is_some() { self.first.as_slice() } else { &self.spans }
+    }
+
+    fn admit(&mut self, required: usize) -> Result<()> {
+        if required <= self.capacity.max(1) { return Ok(()); }
+        let capacity = self.capacity.checked_mul(2).ok_or_else(ceiling_size)?.max(required);
+        let bytes = capacity.checked_mul(std::mem::size_of::<Interval>())
+            .and_then(|bytes| bytes.checked_add(256)).ok_or_else(ceiling_size)?;
+        let reservation = self.memory.reserve(bytes)?;
+        let mut spans = Vec::new();
+        spans.try_reserve_exact(capacity).map_err(|error| {
+            Anomaly::incorrect("rtdb/allocation-failed", error.to_string())
+                .with_kind(rtdb_types::AnomalyKind::ResourceExhausted)
+        })?;
+        spans.extend_from_slice(&self.spans);
+        self.spans = spans;
+        self.capacity = capacity;
+        self._reservation = Some(reservation);
+        Ok(())
+    }
+
+    fn visit(&mut self, header: &EventHeader, mut emit: impl FnMut(Interval) -> Result<()>) -> Result<()> {
+        let step = self.state.classify(header)?;
+        if !step.same_entity {
+            self.first = None;
+            self.spans.clear();
+        }
+        let valid = header.valid_time;
+        if !step.applies || header.op == EventOp::Erase || valid.is_empty() {
+            self.state.advance(header, step);
+            return Ok(());
+        }
+        let spans = self.spans();
+        let from = spans.partition_point(|span| span.upper() < valid.lower());
+        let to = from + spans[from..].partition_point(|span| span.lower() <= valid.upper());
+        let merged = if from == to {
+            valid
+        } else {
+            Interval::new(valid.lower().min(spans[from].lower()), valid.upper().max(spans[to - 1].upper()))?
+        };
+        self.admit(self.spans().len() - (to - from) + 1)?;
+        let result = (|| {
+            let mut lower = valid.lower();
+            for span in &self.spans()[from..to] {
+                if lower < span.lower() { emit(Interval::new(lower, span.lower())?)?; }
+                lower = lower.max(span.upper());
+            }
+            if lower < valid.upper() { emit(Interval::new(lower, valid.upper())?)?; }
+            Ok(())
+        })();
+        if let Some(first) = self.first.take() {
+            if from == to {
+                self.spans.extend(if from == 0 { [merged, first] } else { [first, merged] });
+            } else {
+                self.first = Some(merged);
+            }
+        } else if self.spans.is_empty() {
+            self.first = Some(merged);
+        } else if from == to {
+            self.spans.insert(from, merged);
+        } else {
+            self.spans[from] = merged;
+            drop(self.spans.drain(from + 1..to));
+        }
+        self.state.advance(header, step);
+        result
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -376,10 +465,15 @@ impl HistoryResolver {
         Self { calculator: HistoryCalculator::Legacy(PolygonCalculator::new(Some(bounds))), bounds, clamp_valid_time }
     }
 
-    /// Charges the retained ceiling to `memory`.
+    /// Charges the retained resolution state to `memory`.
     /// [`Self::resolve_in`] accepts the budget for its separate output allocation.
     pub fn new_in(bounds: TemporalBounds, clamp_valid_time: bool, memory: Arc<MemoryBudget>) -> Self {
-        Self { calculator: HistoryCalculator::Admitted(AdmittedPolygonCalculator::new(Some(bounds), memory)), bounds, clamp_valid_time }
+        let calculator = if bounds.system_time.is_point() {
+            HistoryCalculator::PointSystem(PointSystemCoverage::new(bounds, memory))
+        } else {
+            HistoryCalculator::Admitted(AdmittedPolygonCalculator::new(Some(bounds), memory))
+        };
+        Self { calculator, bounds, clamp_valid_time }
     }
 
     pub fn resolve<R: Clone>(&mut self, header: &EventHeader, source: R) -> Result<Vec<ResolvedRow<R>>> {
@@ -420,20 +514,23 @@ impl HistoryResolver {
     pub fn visit_winners(&mut self, header: &EventHeader, mut emit: impl FnMut(ResolvedImage, Rectangle) -> Result<()>) -> Result<()> {
         let bounds = self.bounds;
         let clamp_valid_time = self.clamp_valid_time;
-        let mut emit_polygon = |polygon: PolygonView<'_>| {
+        let mut emit_fragment = |valid_time, system_to| {
             let image = match header.op {
                 EventOp::Put => ResolvedImage::Value,
                 EventOp::Delete => ResolvedImage::Absent,
                 EventOp::Redacted => ResolvedImage::Erased,
                 EventOp::Erase => return Ok(()),
             };
+            if header.system_from >= system_to { return Ok(()); }
+            let system_time = Interval::new(header.system_from, system_to)?;
+            if let Some(fragment) = bounds.admit_fragment(TemporalBounds { valid_time, system_time }, clamp_valid_time) {
+                emit(image, Rectangle { valid_time: fragment.valid_time, system_time: fragment.system_time })?;
+            }
+            Ok(())
+        };
+        let mut emit_polygon = |polygon: PolygonView<'_>| {
             for (valid_from, valid_to, system_to) in polygon.ranges() {
-                let valid_time = Interval::new(valid_from, valid_to)?;
-                if header.system_from >= system_to { continue; }
-                let system_time = Interval::new(header.system_from, system_to)?;
-                if let Some(fragment) = bounds.admit_fragment(TemporalBounds { valid_time, system_time }, clamp_valid_time) {
-                    emit(image, Rectangle { valid_time: fragment.valid_time, system_time: fragment.system_time })?;
-                }
+                emit_fragment(Interval::new(valid_from, valid_to)?, system_to)?;
             }
             Ok(())
         };
@@ -443,6 +540,7 @@ impl HistoryResolver {
                 emit_polygon(PolygonView { valid_times: polygon.valid_times(), system_time_ceilings: polygon.system_time_ceilings(), interval: header.valid_time })
             }
             HistoryCalculator::Admitted(calculator) => calculator.visit(header, emit_polygon).map(|_| ()),
+            HistoryCalculator::PointSystem(coverage) => coverage.visit(header, |valid_time| emit_fragment(valid_time, Timestamp::MAX)),
         }
     }
 }
