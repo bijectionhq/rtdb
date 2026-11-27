@@ -2,31 +2,162 @@ use std::collections::VecDeque;
 use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 use std::time::{SystemTime, UNIX_EPOCH};
 use parking_lot::Mutex;
+use prost::Message;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_plan::{SpanContext, TraceSpan, TraceValue, Tracer};
 use rtdb_types::{Anomaly, Result};
 use tokio::sync::Notify;
 
+/// Content-Type for OTLP/HTTP protobuf trace requests and responses, matching upstream `OtlpHttpSpanExporter`.
+pub const OTLP_PROTOBUF_CONTENT_TYPE: &str = "application/x-protobuf";
+
+/// `opentelemetry.proto.collector.trace.v1.ExportTraceServiceRequest`.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct OtlpExportTraceRequest {
+    #[prost(message, repeated, tag = "1")]
+    pub resource_spans: Vec<OtlpResourceSpans>,
+}
+
+/// `opentelemetry.proto.trace.v1.ResourceSpans`.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct OtlpResourceSpans {
+    #[prost(message, optional, tag = "1")]
+    pub resource: Option<OtlpResource>,
+    #[prost(message, repeated, tag = "2")]
+    pub scope_spans: Vec<OtlpScopeSpans>,
+}
+
+/// `opentelemetry.proto.resource.v1.Resource`.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct OtlpResource {
+    #[prost(message, repeated, tag = "1")]
+    pub attributes: Vec<OtlpKeyValue>,
+}
+
+/// `opentelemetry.proto.trace.v1.ScopeSpans`.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct OtlpScopeSpans {
+    #[prost(message, optional, tag = "1")]
+    pub scope: Option<OtlpInstrumentationScope>,
+    #[prost(message, repeated, tag = "2")]
+    pub spans: Vec<OtlpSpan>,
+}
+
+/// `opentelemetry.proto.common.v1.InstrumentationScope`.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct OtlpInstrumentationScope {
+    #[prost(string, tag = "1")]
+    pub name: String,
+}
+
+/// `opentelemetry.proto.trace.v1.Span`.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct OtlpSpan {
+    #[prost(bytes = "vec", tag = "1")]
+    pub trace_id: Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub span_id: Vec<u8>,
+    #[prost(bytes = "vec", tag = "4")]
+    pub parent_span_id: Vec<u8>,
+    #[prost(string, tag = "5")]
+    pub name: String,
+    #[prost(int32, tag = "6")]
+    pub kind: i32,
+    #[prost(fixed64, tag = "7")]
+    pub start_time_unix_nano: u64,
+    #[prost(fixed64, tag = "8")]
+    pub end_time_unix_nano: u64,
+    #[prost(message, repeated, tag = "9")]
+    pub attributes: Vec<OtlpKeyValue>,
+    #[prost(uint32, tag = "10")]
+    pub dropped_attributes_count: u32,
+    #[prost(fixed32, tag = "16")]
+    pub flags: u32,
+}
+
+/// `opentelemetry.proto.common.v1.KeyValue`.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct OtlpKeyValue {
+    #[prost(string, tag = "1")]
+    pub key: String,
+    #[prost(message, optional, tag = "2")]
+    pub value: Option<OtlpAnyValue>,
+}
+
+/// `opentelemetry.proto.common.v1.AnyValue`.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct OtlpAnyValue {
+    #[prost(oneof = "OtlpValue", tags = "1, 2, 3")]
+    pub value: Option<OtlpValue>,
+}
+
+/// Supported scalar legs of `opentelemetry.proto.common.v1.AnyValue`.
+#[derive(Clone, PartialEq, prost::Oneof)]
+pub enum OtlpValue {
+    #[prost(string, tag = "1")]
+    StringValue(String),
+    #[prost(bool, tag = "2")]
+    BoolValue(bool),
+    #[prost(int64, tag = "3")]
+    IntValue(i64),
+}
+
+/// `opentelemetry.proto.collector.trace.v1.ExportTraceServiceResponse`.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct OtlpExportTraceResponse {
+    #[prost(message, optional, tag = "1")]
+    pub partial_success: Option<OtlpExportTracePartialSuccess>,
+}
+
+/// `opentelemetry.proto.collector.trace.v1.ExportTracePartialSuccess`.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct OtlpExportTracePartialSuccess {
+    #[prost(int64, tag = "1")]
+    pub rejected_spans: i64,
+    #[prost(string, tag = "2")]
+    pub error_message: String,
+}
+
+/// Decodes an OTLP/HTTP protobuf `ExportTraceServiceRequest`.
+pub fn decode_trace_request(bytes: &[u8]) -> Result<OtlpExportTraceRequest> {
+    OtlpExportTraceRequest::decode(bytes).map_err(|error| Anomaly::incorrect("rtdb.tracing/decode", error.to_string()))
+}
+
+/// Decodes an OTLP/HTTP protobuf `ExportTraceServiceResponse`.
+pub fn decode_trace_response(bytes: &[u8]) -> Result<OtlpExportTraceResponse> {
+    OtlpExportTraceResponse::decode(bytes).map_err(|error| Anomaly::incorrect("rtdb.tracing/decode", error.to_string()))
+}
+
+/// Encodes an OTLP/HTTP protobuf `ExportTraceServiceResponse`.
+pub fn encode_trace_response(response: &OtlpExportTraceResponse) -> Vec<u8> {
+    response.encode_to_vec()
+}
+
+fn string_attribute(key: &str, value: &str) -> OtlpKeyValue {
+    OtlpKeyValue { key: key.into(), value: Some(OtlpAnyValue { value: Some(OtlpValue::StringValue(value.into())) }) }
+}
+
 const ATTRIBUTES: usize = 128;
 struct Attribute { name: String, value: AttributeValue, _reservation: Arc<MemoryReservation> }
 
-enum AttributeValue { Text(String), Integer(String), Boolean(bool) }
+enum AttributeValue { Text(String), Integer(i64, String), Boolean(bool) }
 
 impl AttributeValue {
     fn text(&self) -> &str {
         match self {
-            Self::Text(value) | Self::Integer(value) => value,
+            Self::Text(value) | Self::Integer(_, value) => value,
             Self::Boolean(true) => "true",
             Self::Boolean(false) => "false",
         }
     }
 
-    fn otlp(&self) -> serde_json::Value {
-        match self {
-            Self::Text(value) => serde_json::json!({"stringValue": value}),
-            Self::Integer(value) => serde_json::json!({"intValue": value}),
-            Self::Boolean(value) => serde_json::json!({"boolValue": value}),
-        }
+    fn otlp(&self) -> OtlpAnyValue {
+        let value = match self {
+            Self::Text(value) => OtlpValue::StringValue(value.clone()),
+            Self::Integer(value, _) => OtlpValue::IntValue(*value),
+            Self::Boolean(value) => OtlpValue::BoolValue(*value),
+        };
+        OtlpAnyValue { value: Some(value) }
     }
 }
 pub struct TraceRecord {
@@ -41,25 +172,41 @@ pub struct TraceRecord {
 }
 impl TraceRecord {
     pub fn attributes(&self) -> impl Iterator<Item = (&str, &str)> { self.attributes.iter().map(|attribute| (attribute.name.as_str(), attribute.value.text())) }
-    /// Encodes one span using the OTLP JSON mapping, retaining the complete payload allocation.
+    /// Encodes one span as an OTLP/HTTP protobuf `ExportTraceServiceRequest`, retaining the complete payload allocation.
     pub fn encode(&self, service: &str, memory: &Arc<MemoryBudget>) -> Result<TracePayload> {
         let bytes = self.attributes.iter().try_fold(size(size(self.name.len(), service.len())?, 8192)?, |bytes, attribute| size(bytes, size(attribute.name.len(), attribute.value.text().len())?))?;
         let reservation = memory.reserve(bytes.checked_mul(16).ok_or_else(overflow)?)?;
-        let attributes: Vec<_> = self.attributes.iter().map(|attribute| serde_json::json!({"key": attribute.name, "value": attribute.value.otlp()})).collect();
-        let span = serde_json::json!({
-            "traceId": hex(&self.context.trace_id), "spanId": hex(&self.context.span_id),
-            "parentSpanId": self.parent.map_or_else(String::new, |parent| hex(&parent.span_id)),
-            "name": self.name, "kind": 1, "flags": 1,
-            "startTimeUnixNano": nanos(self.started).to_string(), "endTimeUnixNano": nanos(self.ended).to_string(),
-            "attributes": attributes, "droppedAttributesCount": self.dropped_attributes,
-        });
-        let request = serde_json::json!({"resourceSpans": [{"resource": {"attributes": [
-            {"key":"service.name", "value":{"stringValue":service}},
-            {"key":"telemetry.sdk.language", "value":{"stringValue":"rust"}},
-            {"key":"telemetry.sdk.name", "value":{"stringValue":"rtdb"}},
-            {"key":"telemetry.sdk.version", "value":{"stringValue":env!("CARGO_PKG_VERSION")}}
-        ]}, "scopeSpans":[{"scope":{"name":"xtdb"},"spans":[span]}]}]});
-        let bytes = serde_json::to_vec(&request).map_err(|error| Anomaly::fault("rtdb.tracing/encode", error.to_string()))?;
+        let request = OtlpExportTraceRequest {
+            resource_spans: vec![OtlpResourceSpans {
+                resource: Some(OtlpResource {
+                    attributes: vec![
+                        string_attribute("service.name", service),
+                        string_attribute("telemetry.sdk.language", "rust"),
+                        string_attribute("telemetry.sdk.name", "rtdb"),
+                        string_attribute("telemetry.sdk.version", env!("CARGO_PKG_VERSION")),
+                    ],
+                }),
+                scope_spans: vec![OtlpScopeSpans {
+                    scope: Some(OtlpInstrumentationScope { name: "xtdb".into() }),
+                    spans: vec![OtlpSpan {
+                        trace_id: self.context.trace_id.to_vec(),
+                        span_id: self.context.span_id.to_vec(),
+                        parent_span_id: self.parent.map_or_else(Vec::new, |parent| parent.span_id.to_vec()),
+                        name: self.name.clone(),
+                        kind: 1,
+                        start_time_unix_nano: nanos(self.started),
+                        end_time_unix_nano: nanos(self.ended),
+                        attributes: self.attributes.iter().map(|attribute| OtlpKeyValue {
+                            key: attribute.name.clone(),
+                            value: Some(attribute.value.otlp()),
+                        }).collect(),
+                        dropped_attributes_count: self.dropped_attributes,
+                        flags: 1,
+                    }],
+                }],
+            }],
+        };
+        let bytes = request.encode_to_vec();
         Ok(TracePayload { bytes, _reservation: reservation })
     }
 }
@@ -117,8 +264,11 @@ impl TraceSpan for RecordedSpan {
         let Some(reservation) = reservation else { record.dropped_attributes = record.dropped_attributes.saturating_add(1); return; };
         let value = match value {
             TraceValue::Text(value) => AttributeValue::Text(value.to_owned()),
-            TraceValue::Integer(value) => AttributeValue::Integer(value.to_string()),
-            TraceValue::Unsigned(value) => AttributeValue::Integer(value.min(i64::MAX as u64).to_string()),
+            TraceValue::Integer(value) => AttributeValue::Integer(value, value.to_string()),
+            TraceValue::Unsigned(value) => {
+                let clamped = value.min(i64::MAX as u64) as i64;
+                AttributeValue::Integer(clamped, clamped.to_string())
+            }
             TraceValue::Boolean(value) => AttributeValue::Boolean(value),
         };
         let attribute = Attribute { name: name.into(), value, _reservation: reservation };
@@ -152,6 +302,5 @@ impl Drop for TraceReceiver {
     fn drop(&mut self) { let mut queue = self.shared.queue.lock(); queue.closed = true; self.shared.dropped.fetch_add(queue.records.len() as u64, Ordering::Relaxed); queue.records.clear(); drop(queue); self.shared.ready.notify_waiters(); }
 }
 fn nanos(time: SystemTime) -> u64 { time.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos().min(u64::MAX as u128) as u64 }
-fn hex(bytes: &[u8]) -> String { const DIGITS: &[u8; 16] = b"0123456789abcdef"; let mut output = String::with_capacity(bytes.len() * 2); for byte in bytes { output.push(DIGITS[(byte >> 4) as usize] as char); output.push(DIGITS[(byte & 15) as usize] as char); } output }
 fn size(left: usize, right: usize) -> Result<usize> { left.checked_add(right).ok_or_else(overflow) }
 fn overflow() -> Anomaly { Anomaly::incorrect("rtdb.tracing/size", "Trace allocation size overflow") }

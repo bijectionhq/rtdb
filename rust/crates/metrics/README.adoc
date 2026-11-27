@@ -77,7 +77,7 @@ These internal pull boundaries and reserved-byte peaks are not asserted equivale
 Every operator span is a child of its query span, including operators below other operators.
 Cancellation and close end owned spans once and retain any independently exported Arrow allocation leases.
 
-The server exporter uses the https://opentelemetry.io/docs/specs/otlp/[OTLP HTTP JSON mapping] with configured endpoint and service name, hexadecimal trace identifiers and string-valued Micrometer tags.
+The server exporter uses the https://opentelemetry.io/docs/specs/otlp/[OTLP HTTP protobuf mapping] (`application/x-protobuf`) with configured endpoint and service name, matching upstream `OtlpHttpSpanExporter`.
 It publishes the native SDK language, name and version in resource attributes.
 Its bounded queue and single in-flight request are a native lifetime choice; the reference configures Java `SimpleSpanProcessor`.
 The exporter retries transient HTTP failures within a ten-second request deadline, reports partial rejection without retrying and drains for at most thirty seconds after node shutdown.

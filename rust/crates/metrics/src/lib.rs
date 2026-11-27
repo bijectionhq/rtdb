@@ -4,7 +4,12 @@ mod trace;
 mod step;
 mod processor;
 pub mod logging;
-pub use trace::{TracePayload, TraceReceiver, TraceRecord, TraceRecorder, TraceStats};
+pub use trace::{
+    OTLP_PROTOBUF_CONTENT_TYPE, OtlpAnyValue, OtlpExportTracePartialSuccess, OtlpExportTraceRequest,
+    OtlpExportTraceResponse, OtlpInstrumentationScope, OtlpKeyValue, OtlpResource, OtlpResourceSpans,
+    OtlpScopeSpans, OtlpSpan, OtlpValue, TracePayload, TraceReceiver, TraceRecord, TraceRecorder,
+    TraceStats, decode_trace_request, decode_trace_response, encode_trace_response,
+};
 #[cfg(feature = "pg-source")]
 mod postgres;
 #[cfg(feature = "kafka")]

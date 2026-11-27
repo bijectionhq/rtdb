@@ -48,7 +48,7 @@ impl TraceExporter {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         let work = async {
             for attempt in 0..5 {
-                let response = self.client.post(self.endpoint.clone()).header("content-type", "application/json").body(payload.clone()).send().await;
+                let response = self.client.post(self.endpoint.clone()).header("content-type", rtdb_metrics::OTLP_PROTOBUF_CONTENT_TYPE).body(payload.clone()).send().await;
                 let mut delay = Duration::from_millis(1000u64 << attempt);
                 match response {
                     Ok(mut response) => {
@@ -63,12 +63,10 @@ impl TraceExporter {
                                 body.extend_from_slice(&chunk);
                             }
                             if body.is_empty() { return Ok(()); }
-                            let response: serde_json::Value = serde_json::from_slice(&body).map_err(|_| invalid("OTLP endpoint returned invalid JSON"))?;
-                            if let Some(partial) = response.get("partialSuccess") {
-                                let rejected = partial.get("rejectedSpans").and_then(|value| value.as_u64().or_else(|| value.as_str().and_then(|value| value.parse().ok()))).unwrap_or(0);
-                                let message = partial.get("errorMessage").and_then(serde_json::Value::as_str).unwrap_or("");
-                                if rejected > 0 { return Err(invalid(format!("OTLP rejected {rejected} span(s): {message}"))); }
-                                if !message.is_empty() { ::tracing::warn!("OTLP export warning: {message}"); }
+                            let response = rtdb_metrics::decode_trace_response(&body).map_err(|_| invalid("OTLP endpoint returned invalid protobuf"))?;
+                            if let Some(partial) = response.partial_success {
+                                if partial.rejected_spans > 0 { return Err(invalid(format!("OTLP rejected {} span(s): {}", partial.rejected_spans, partial.error_message))); }
+                                if !partial.error_message.is_empty() { ::tracing::warn!("OTLP export warning: {}", partial.error_message); }
                             }
                             return Ok(());
                         }

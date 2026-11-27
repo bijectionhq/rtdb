@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use rtdb_columnar::MemoryBudget;
-use rtdb_metrics::TraceRecorder;
+use rtdb_metrics::{OtlpValue, TraceRecorder, decode_trace_request};
 use rtdb_plan::{TraceValue, Tracer};
 
 #[tokio::test]
@@ -23,15 +23,30 @@ async fn bounded_queue_preserves_parentage_attributes_and_payload_lease_after_re
     assert_eq!(child.parent, Some(parent.context));
     assert_eq!(child.context.trace_id, parent.context.trace_id);
     assert_ne!(child.context.span_id, parent.context.span_id);
+    let child_payload = child.encode("native-test", &memory).unwrap().into_bytes();
+    let child_request = decode_trace_request(&child_payload).unwrap();
+    let encoded_child = &child_request.resource_spans[0].scope_spans[0].spans[0];
+    assert_eq!(encoded_child.trace_id, child.context.trace_id.as_slice());
+    assert_eq!(encoded_child.span_id, child.context.span_id.as_slice());
+    assert_eq!(encoded_child.parent_span_id, parent.context.span_id.as_slice());
+    drop(child_payload);
     let payload = parent.encode("native-test", &memory).unwrap().into_bytes();
-    let json: serde_json::Value = serde_json::from_slice(&payload).unwrap();
-    let encoded = &json["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
-    assert_eq!(encoded["name"], "xtdb.query");
-    assert_eq!(encoded["traceId"].as_str().unwrap().len(), 32);
-    assert_eq!(encoded["attributes"][0]["value"]["stringValue"], "SELECT 1");
-    assert_eq!(encoded["attributes"][1]["value"]["intValue"], "120");
-    assert_eq!(encoded["attributes"][2]["value"]["intValue"], "-4");
-    assert_eq!(encoded["attributes"][3]["value"]["boolValue"], true);
+    let request = decode_trace_request(&payload).unwrap();
+    let resource_attrs = &request.resource_spans[0].resource.as_ref().unwrap().attributes;
+    assert_eq!(resource_attrs[0].key, "service.name");
+    assert_eq!(resource_attrs[0].value.as_ref().unwrap().value, Some(OtlpValue::StringValue("native-test".into())));
+    assert_eq!(request.resource_spans[0].scope_spans[0].scope.as_ref().unwrap().name, "xtdb");
+    let encoded = &request.resource_spans[0].scope_spans[0].spans[0];
+    assert_eq!(encoded.name, "xtdb.query");
+    assert_eq!(encoded.trace_id.len(), 16);
+    assert_eq!(encoded.span_id.len(), 8);
+    assert!(encoded.parent_span_id.is_empty());
+    assert_eq!(encoded.kind, 1);
+    assert_eq!(encoded.flags, 1);
+    assert_eq!(encoded.attributes[0].value.as_ref().unwrap().value, Some(OtlpValue::StringValue("SELECT 1".into())));
+    assert_eq!(encoded.attributes[1].value.as_ref().unwrap().value, Some(OtlpValue::IntValue(120)));
+    assert_eq!(encoded.attributes[2].value.as_ref().unwrap().value, Some(OtlpValue::IntValue(-4)));
+    assert_eq!(encoded.attributes[3].value.as_ref().unwrap().value, Some(OtlpValue::BoolValue(true)));
     assert!(receiver.next().await.is_none());
     drop(child); drop(parent); drop(receiver); drop(recorder);
     assert!(memory.used_bytes() > 0);
@@ -61,6 +76,6 @@ async fn span_attribute_limit_counts_drops_and_replacement_keeps_last_value() {
     assert_eq!(record.attributes().count(), 128);
     assert_eq!(record.attributes().next(), Some(("a0", "replacement")));
     let payload = record.encode("test", &memory).unwrap();
-    let encoded: serde_json::Value = serde_json::from_slice(payload.as_ref()).unwrap();
-    assert_eq!(encoded["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["droppedAttributesCount"], 2);
+    let request = decode_trace_request(payload.as_ref()).unwrap();
+    assert_eq!(request.resource_spans[0].scope_spans[0].spans[0].dropped_attributes_count, 2);
 }
