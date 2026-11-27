@@ -2297,9 +2297,9 @@ async fn compactor_reset_preserves_checkpoint_history_and_resumes_retirement_aft
         let old_reader = database.snapshot();
         let published = plan.apply(&CancellationToken::new()).await.unwrap();
         assert!(database.status().adopted_block.as_ref().is_some_and(|block| block.block_index() >= published));
-        for key in &compacted { assert!(storage_root.join(key.as_str()).is_file()); }
+        for key in &compacted { assert!(!storage_root.join(key.as_str()).exists()); }
         let pending = rtdb_format::trie_retirement::journal_directory(cut) + "/reset-pending";
-        assert!(std::fs::read_dir(storage_root.join(&pending)).unwrap().next().is_some());
+        assert!(std::fs::read_dir(storage_root.join(&pending)).unwrap().next().is_none());
         let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
         assert_eq!(rows(session.query_sql(sql, vec![]).await.unwrap()).await, before);
         drop((session, database));
