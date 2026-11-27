@@ -313,7 +313,7 @@ impl AggregateCursor {
             }
         }
         drop(batches);
-        Ok(index.group_keys(group_width, context)?.map(|keys| ReducedGroups { keys, columns, _reservation: reservation }))
+        Ok(index.into_group_keys(group_width, context)?.map(|keys| ReducedGroups { keys, columns, _reservation: reservation }))
     }
 }
 

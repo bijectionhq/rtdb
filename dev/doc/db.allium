@@ -2356,6 +2356,8 @@ surface QueryAccess {
         -- DISTINCT and set operations with columnar inputs select their output positions from those Arrow batches.
         -- DISTINCT holds its seen keys in memory and fails when the memory budget cannot hold them.
         -- Their key index retains Arrow batches and hashes and compares compatible scalar and floating-point vector cells at their indexed positions.
+        -- Each hash bucket stores the position of its collision chain's tail.
+        -- Probes visit retained candidates in insertion order.
         -- A grouping batch with bound scalar columns hashes each column in turn and compares same-batch key candidates through those readers.
         -- Typed probes compare earlier keys at their retained positions and borrow compatible text cells.
         -- The per-page grouping index stages a position only for each new key and releases its chains before retaining the page.
@@ -2371,6 +2373,7 @@ surface QueryAccess {
         -- A null-extended selected position contributes a row to COUNT(*) and is null for argument reductions.
         -- Each COUNT stores one signed 64-bit accumulator per group and can use the same buffer for its Arrow result.
         -- Compatible grouping columns can use the first Arrow position of each key and emit scalar aggregates in that first-seen order.
+        -- Grouped output releases its hash chains and decoded comparison keys before gathering the first-seen key positions.
         -- GROUP BY, scalar aggregates and ordered list aggregates hold their state in memory and fail when the memory budget cannot hold them.
         -- Grouped output keeps the configured transport row limit.
         -- Primitive numeric sums retain their state at the declared accumulation width within each group.

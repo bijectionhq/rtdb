@@ -444,48 +444,42 @@ impl<'a> Key<'a> {
 struct Position {
     batch: usize,
     row: usize,
-    link: PositionLink,
+    next: usize,
     consumed: bool,
-}
-
-#[derive(Clone, Copy)]
-enum PositionLink {
-    Pending(u32),
-    Next(usize),
-    End,
 }
 
 #[derive(Default)]
 struct Positions {
     rows: Vec<Position>,
-    // The first and last position in each hash chain, in input order.
-    chains: HashMap<u64, (usize, usize)>,
+    // Each chain's last position links back to its first.
+    tails: HashMap<u64, usize>,
 }
 
 impl Positions {
     fn allocation_bound(rows: usize) -> Result<usize> {
-        rows.checked_mul(4 * size_of::<Position>() + 4 * (size_of::<(u64, (usize, usize))>() + 1))
+        rows.checked_mul(4 * size_of::<Position>() + 4 * (size_of::<(u64, usize)>() + 1))
             .and_then(|bytes| bytes.checked_add(512))
             .ok_or_else(size_error)
     }
 
     fn push(&mut self, bucket: u64, batch: usize, row: usize) {
         let index = self.rows.len();
-        self.rows.push(Position { batch, row, link: PositionLink::End, consumed: false });
+        self.rows.push(Position { batch, row, next: index, consumed: false });
         self.link(bucket, index);
     }
 
     fn link(&mut self, bucket: u64, index: usize) {
         use std::collections::hash_map::Entry;
-        self.rows[index].link = PositionLink::End;
-        match self.chains.entry(bucket) {
+        match self.tails.entry(bucket) {
             Entry::Occupied(mut entry) => {
-                let (_, last) = entry.get_mut();
-                self.rows[*last].link = PositionLink::Next(index);
-                *last = index;
+                let tail = entry.get_mut();
+                self.rows[index].next = self.rows[*tail].next;
+                self.rows[*tail].next = index;
+                *tail = index;
             }
             Entry::Vacant(entry) => {
-                entry.insert((index, index));
+                self.rows[index].next = index;
+                entry.insert(index);
             }
         }
     }
@@ -500,6 +494,7 @@ impl Positions {
             rows
         });
         let rows = grown.as_mut().unwrap_or(&mut self.rows);
+        // The unlinked suffix carries its hashes until every row in the page has validated.
         for row in 0..len {
             let hash = match hash(row) {
                 Ok(hash) => hash,
@@ -508,13 +503,13 @@ impl Positions {
                     return Err(error);
                 }
             };
-            rows.push(Position { batch: page, row, link: PositionLink::Pending(hash), consumed: false });
+            rows.push(Position { batch: page, row, next: hash as usize, consumed: false });
         }
         if let Some(grown) = grown {
             self.rows = grown;
         }
         for index in start..end {
-            let PositionLink::Pending(hash) = self.rows[index].link else { unreachable!("The build page is unlinked") };
+            let hash = self.rows[index].next as u32;
             self.link(u64::from(hash), index);
         }
         Ok(())
@@ -527,9 +522,10 @@ impl Positions {
         context: &QueryContext,
         mut equal: impl FnMut(usize, Position) -> Result<bool>,
     ) -> Result<Option<usize>> {
-        let mut next = self.chains.get(&bucket).map(|&(first, _)| first);
+        let Some(&tail) = self.tails.get(&bucket) else { return Ok(None); };
+        let mut index = self.rows[tail].next;
         let mut checked = 0usize;
-        while let Some(index) = next {
+        loop {
             context.check_cancelled_at(checked)?;
             checked += 1;
             let position = self.rows[index];
@@ -539,13 +535,11 @@ impl Positions {
                 }
                 return Ok(Some(index));
             }
-            next = match position.link {
-                PositionLink::Next(index) => Some(index),
-                PositionLink::End => None,
-                PositionLink::Pending(_) => unreachable!("Hash chains contain only linked positions"),
-            };
+            if index == tail {
+                return Ok(None);
+            }
+            index = position.next;
         }
-        Ok(None)
     }
 }
 
@@ -687,16 +681,23 @@ impl BatchKeyIndex {
         self.batches.len() - 1
     }
 
-    pub fn group_keys(&self, width: usize, context: &QueryContext) -> Result<Option<ColumnBatch>> {
+    pub fn into_group_keys(self, width: usize, context: &QueryContext) -> Result<Option<ColumnBatch>> {
         if self.len() == 0 {
             return Ok(None);
         }
-        let bytes = self
-            .len()
+        let Self { batches, positions: Positions { rows: positions, tails }, mut reservation, decoded, .. } = self;
+        drop((tails, decoded));
+        let batch_bytes = batches.capacity().checked_mul(size_of::<(ColumnBatch, bool)>()).ok_or_else(size_error)?;
+        let retained = positions.capacity().checked_mul(size_of::<Position>())
+            .and_then(|bytes| bytes.checked_add(batch_bytes))
+            .ok_or_else(size_error)?;
+        let lease = Arc::get_mut(&mut reservation).expect("The key index owns its reservation");
+        lease.shrink_to(retained)?;
+
+        let bytes = positions.len()
             .checked_mul(size_of::<(usize, usize)>())
             .and_then(|bytes| {
-                self.batches
-                    .len()
+                batches.len()
                     .checked_mul(size_of::<&ColumnBatch>())
                     .and_then(|batches| bytes.checked_add(batches))
             })
@@ -707,15 +708,12 @@ impl BatchKeyIndex {
             })
             .ok_or_else(size_error)?;
         let _scratch = context.memory.reserve(bytes)?;
-        let batches: Vec<_> = self.batches.iter().map(|(batch, _)| batch).collect();
-        let rows: Vec<_> = self
-            .positions
-            .rows
-            .iter()
-            .map(|position| (position.batch, position.row))
-            .collect();
+        let rows: Vec<_> = positions.iter().map(|position| (position.batch, position.row)).collect();
+        drop(positions);
+        lease.shrink_to(batch_bytes)?;
+        let sources: Vec<_> = batches.iter().map(|(batch, _)| batch).collect();
         let columns: Vec<_> = (0..width).collect();
-        ColumnBatch::take_rows_with_custody(&batches, &rows, &columns, true, &context.memory)
+        ColumnBatch::take_rows_with_custody(&sources, &rows, &columns, true, &context.memory)
             .map(Some)
     }
 
@@ -1177,7 +1175,7 @@ mod tests {
             (0, false), (2, false), (4, true), (5, true), (6, true),
             (4, false), (3, false), (7, true),
         ]);
-        let keys = index.group_keys(2, &context).unwrap().unwrap();
+        let keys = index.into_group_keys(2, &context).unwrap().unwrap();
         assert_eq!(keys.len, 8);
         for (row, expected) in [Value::I64(large), Value::I64(large + 1), Value::Null, Value::I64(0), Value::F32(-0.0)]
             .into_iter().enumerate()
@@ -1214,12 +1212,64 @@ mod tests {
                 Ok(())
             }).unwrap();
             assert_eq!(context.memory.used_bytes(), retained);
-            let keys = index.group_keys(2, &context).unwrap().unwrap();
+            let keys = index.into_group_keys(2, &context).unwrap().unwrap();
             assert_eq!(keys.len, count + 1);
             for (row, text) in texts.iter().enumerate() {
                 assert_eq!(keys.columns[1].value(row).unwrap(), Value::Utf8(text.clone()));
             }
             assert_eq!(keys.columns[1].value(count).unwrap(), Value::Null);
+        }
+    }
+
+    #[test]
+    fn grouping_and_distinct_keep_high_cardinality_keys_within_the_budget() {
+        const PAGE_ROWS: usize = 256;
+        const TOTAL_ROWS: usize = 8 * PAGE_ROWS;
+        const FIRST_KEY: i64 = 1 << 55;
+
+        let context = context();
+        let memory = &context.memory;
+        let schema = rtdb_plan::Schema::default();
+        for grouped in [true, false] {
+            let pressure = memory.reserve(memory.available_bytes() - (512 << 10)).unwrap();
+            let mut index = if grouped {
+                BatchKeyIndex::vector_hashing(&context).unwrap()
+            } else {
+                BatchKeyIndex::new(&context).unwrap()
+            };
+            for repeated in [false, true] {
+                for start in (0..TOTAL_ROWS).step_by(PAGE_ROWS) {
+                    let numbers = Int64Array::from_iter_values(
+                        (start..start + PAGE_ROWS).map(|row| FIRST_KEY + row as i64),
+                    );
+                    let input = batch(Arc::new(numbers), vec![Some("key"); PAGE_ROWS], &context);
+                    if grouped {
+                        index.identify(&input, false, &context, &schema, |row, ordinal, first| {
+                            assert_eq!((ordinal, first), (start + row, !repeated));
+                            Ok(())
+                        }).unwrap();
+                    } else {
+                        let selection = PredicateSelection::build(PAGE_ROWS, memory, |bits| {
+                            index.distinct(&input, false, bits, &context, &schema, |_| Ok(true))
+                        }).unwrap();
+                        assert!((0..PAGE_ROWS).all(|row| selection.contains(row) != repeated));
+                    }
+                }
+                assert_eq!(index.len(), TOTAL_ROWS);
+            }
+            if grouped {
+                let _finish_pressure = memory.reserve(memory.available_bytes() - (16 << 10)).unwrap();
+                let output = index.into_group_keys(2, &context).unwrap().unwrap();
+                assert_eq!(output.len, TOTAL_ROWS);
+                for row in 0..output.len {
+                    assert_eq!(output.columns[0].value(row).unwrap(), Value::I64(FIRST_KEY + row as i64));
+                    assert_eq!(output.columns[1].value(row).unwrap(), Value::Utf8("key".into()));
+                }
+            } else {
+                drop(index);
+            }
+            drop(pressure);
+            assert_eq!(memory.used_bytes(), 0);
         }
     }
 
