@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use rtdb_directory::{Cas, DeploymentRecord, Directory, Lifecycle, ReplayCustody, StorageRegion};
+use rtdb_directory::{DeploymentRecord, Directory, Lifecycle, ReplaceOutcome, ReplayCustody, StorageRegion};
 use rtdb_columnar::MemoryBudget;
 use rtdb_format::{envelope::ReplicaFrame, keys::CURRENT_STORAGE_VERSION};
 use rtdb_storage::{Error, ObjectKey, Result,
@@ -219,14 +219,22 @@ impl RecoveryAdmission {
             let (mut record, first_required) = self.checked_record(after).await?;
             let version = record.version;
             record.storage_regions.insert(id, StorageRegion::ReplicaReplay { first_required, through: through.0, custody: self.holds.custody.clone() });
-            *attempted = true;
-            if let Cas::Applied(stored) = self.holds.directory.replace_deployment(record, version).await.map_err(|error| self.directory_error(error))? {
-                crate::residence_trace::record("admit-recovery", || serde_json::json!({
-                    "lineage": stored.lineage, "installation": stored.id, "incarnation": stored.incarnation, "revision": stored.version,
-                    "stream": self.stream, "epoch": self.log_epoch, "hold": id, "residence": stored.storage_prefix(),
-                    "first_required": first_required, "through": through.0,
-                }));
-                return History::of(&stored).map_err(broker_error);
+            match self.holds.directory.replace_deployment(record, version).await {
+                ReplaceOutcome::Applied(stored) => {
+                    *attempted = true;
+                    crate::residence_trace::record("admit-recovery", || serde_json::json!({
+                        "lineage": stored.lineage, "installation": stored.id, "incarnation": stored.incarnation, "revision": stored.version,
+                        "stream": self.stream, "epoch": self.log_epoch, "hold": id, "residence": stored.storage_prefix(),
+                        "first_required": first_required, "through": through.0,
+                    }));
+                    return History::of(&stored).map_err(broker_error);
+                }
+                ReplaceOutcome::Conflict(_) => {}
+                ReplaceOutcome::Refused(error) => return Err(self.directory_error(error)),
+                ReplaceOutcome::Unknown(error) => {
+                    *attempted = true;
+                    return Err(self.directory_error(error));
+                }
             }
         }
         Err(Error::Remote { key: self.stream.clone(), message: "The directory kept changing while registering a replay hold".into() })
@@ -289,7 +297,7 @@ mod tests {
         record.holder = Some(rtdb_directory::MemberId("writer".into()));
         record.epoch = 1;
         let version = record.version;
-        let Cas::Applied(record) = directory.replace_deployment(record, version).await.unwrap() else {
+        let ReplaceOutcome::Applied(record) = directory.replace_deployment(record, version).await else {
             panic!("the writer should be admitted");
         };
         let stream = crate::admin::administration_stream(directory.as_ref(), &record, process::MAXIMUM_LOG_MESSAGE_BYTES).await.unwrap();

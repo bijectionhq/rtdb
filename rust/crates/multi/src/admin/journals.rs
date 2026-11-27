@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use rtdb_directory::{Cas, DeploymentRecord, Directory, JournalPlacement, MemberId, MemberRecord, MemberRole, MemberState, effective_holder, now_ms};
+use rtdb_directory::{DeploymentRecord, Directory, JournalPlacement, MemberId, MemberRecord, MemberRole, MemberState, ReplaceOutcome, effective_holder, now_ms};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 
 use crate::control::{ControlKey, Request};
@@ -48,7 +48,11 @@ pub async fn balance_journals(directory: &dyn Directory, moves: usize) -> Result
         let mut next = current.clone();
         record_placement(&mut next, uuid::Uuid::new_v4(), &destination);
         if next == *current { continue; }
-        if let Cas::Applied(_) = directory.replace_deployment(next, current.version).await? { placed += 1; }
+        match directory.replace_deployment(next, current.version).await {
+            ReplaceOutcome::Applied(_) => placed += 1,
+            ReplaceOutcome::Conflict(_) => {}
+            ReplaceOutcome::Refused(error) | ReplaceOutcome::Unknown(error) => return Err(error),
+        }
     }
     Ok(placed)
 }

@@ -6,7 +6,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{Cas, Checkpoint, CheckpointStage, CheckpointStageIntent, CheckpointTransferFence, ClassicMigrationSource, DeploymentRecord, Directory, Lifecycle, Version};
+use crate::{Checkpoint, CheckpointStage, CheckpointStageIntent, CheckpointTransferFence, ClassicMigrationSource, DeploymentRecord, Directory, Lifecycle, ReplaceOutcome, Version};
 
 pub const MAX_GENERATIONS: usize = 128;
 const MAX_CAS_ATTEMPTS: usize = 8;
@@ -322,8 +322,10 @@ async fn apply(directory: &dyn Directory, source: Uuid, exact: &Commission, chan
         if current.classic_flight.as_deref() == Some(&next) { return Ok(()); }
         let version = current.version;
         current.classic_flight = Some(Box::new(next));
-        if matches!(directory.replace_deployment(current, version).await?, Cas::Applied(_)) {
-            return Ok(());
+        match directory.replace_deployment(current, version).await {
+            ReplaceOutcome::Applied(_) => return Ok(()),
+            ReplaceOutcome::Conflict(_) => {}
+            ReplaceOutcome::Refused(error) | ReplaceOutcome::Unknown(error) => return Err(error),
         }
     }
     Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.directory/classic-flight-order",
@@ -455,7 +457,7 @@ async fn overtaken_capture_rebind_preserves_joined_and_live_generations() {
     advanced.checkpoint = Some(new_stage.checkpoint);
     advanced.checkpoint_captures.insert(new_stage.intent.capture, new_capture);
     let version = advanced.version;
-    let advanced = directory.replace_deployment(advanced, version).await.unwrap().applied().unwrap();
+    let advanced = directory.replace_deployment(advanced, version).await.applied().unwrap();
     let roster = advanced.classic_flight.as_deref().unwrap().owners.clone();
     let new_scratch = directory.create_deployment(new_scratch).await.unwrap();
     let mut seal = CheckpointTransferSelection {
@@ -476,7 +478,7 @@ async fn overtaken_capture_rebind_preserves_joined_and_live_generations() {
     }));
     assert!(prepare_rebind(&advanced, &ambiguous, Some(&new_scratch), &previous, &replacement).is_err());
     let version = old_scratch.version;
-    assert!(directory.replace_deployment(old_scratch, version).await.unwrap().applied().is_some());
+    assert!(directory.replace_deployment(old_scratch, version).await.applied().is_some());
     let wrong_coverage = Commission { coverage_sha256: [8; 32], ..replacement.clone() };
     assert!(install(directory.as_ref(), &wrong_coverage).await.is_err());
 

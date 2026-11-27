@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::executor::block_on;
-use rtdb_directory::{Cas, DeploymentRecord, Directory, MemberId, MemberPool, MemberRecord, MemberRole, MemberState, MemoryDirectory, claim, park};
+use rtdb_directory::{DeploymentRecord, Directory, MemberId, MemberPool, MemberRecord, MemberRole, MemberState, MemoryDirectory, ReplaceOutcome, claim, park};
 use rtdb_logkeeper::simulation::{Entry, ResponseBody};
 
 use crate::check::{Checker, Snapshot};
@@ -218,15 +218,16 @@ impl World {
         let member = process.member.clone();
         let record = self.record();
         let Some(next) = claim(&record, &member, &self.members(), self.now) else { return Ok(()) };
-        match block_on(self.directory.replace_deployment(next, record.version)).expect("claim") {
-            Cas::Applied(stored) => {
+        match block_on(self.directory.replace_deployment(next, record.version)) {
+            ReplaceOutcome::Applied(stored) => {
                 self.checker.claimed(stored.epoch, member.as_str())?;
                 self.summary.claims += 1;
                 self.note(format!("{member} claims epoch {}", stored.epoch));
                 let bug = self.config.bug;
                 self.with_writer(slot, |writer, io| { *writer = Some(Writer::open(stored.epoch, bug, io)); })?;
             }
-            Cas::Conflict(_) => self.note(format!("{member} loses a claim race")),
+            ReplaceOutcome::Conflict(_) => self.note(format!("{member} loses a claim race")),
+            ReplaceOutcome::Refused(error) | ReplaceOutcome::Unknown(error) => panic!("claim: {error}"),
         }
         Ok(())
     }
@@ -240,7 +241,7 @@ impl World {
         let (member, epoch) = (process.member.clone(), writer.epoch);
         let record = self.record();
         let Some(next) = park(&record, &member, epoch) else { return Ok(()) };
-        if let Cas::Applied(stored) = block_on(self.directory.replace_deployment(next, record.version)).expect("park") {
+        if let ReplaceOutcome::Applied(stored) = block_on(self.directory.replace_deployment(next, record.version)) {
             self.note(format!("{member} parks epoch {epoch}; the record is at epoch {}", stored.epoch));
             self.slots[slot].process.as_mut().unwrap().writer = None;
         }

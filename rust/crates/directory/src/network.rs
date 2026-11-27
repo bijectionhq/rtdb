@@ -21,7 +21,7 @@ use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use crate::{Cas, ChangeFeed, DeploymentRecord, Directory, ForkPreparation, ForkPublication, ReferenceDisposal, LineageChange, LineageRetirement, LineageState, MemberId, MemberRecord, Version};
+use crate::{Cas, ChangeFeed, DeploymentRecord, Directory, ForkPreparation, ForkPublication, ReferenceDisposal, ReplaceOutcome, LineageChange, LineageRetirement, LineageState, MemberId, MemberRecord, Version};
 
 /// A longer line closes the connection rather than growing the buffer without bound.
 const MAX_LINE: u64 = 64 << 20;
@@ -88,6 +88,7 @@ enum Reply {
     OptionalDeployment(Option<DeploymentRecord>),
     Deployments(Vec<DeploymentRecord>),
     DeploymentCas(Cas<DeploymentRecord>),
+    DeploymentReplace(ReplaceOutcome<DeploymentRecord>),
     SharedReferenceRevision(Version),
     LineageState(LineageState),
     ReferenceDisposal(ReferenceDisposal),
@@ -151,7 +152,7 @@ async fn dispatch(directory: &dyn Directory, op: Op) -> Result<Reply> {
         Op::DeploymentByName { name } => Reply::OptionalDeployment(directory.deployment_by_name(&name).await?),
         Op::Deployments => Reply::Deployments(directory.deployments().await?),
         Op::DeploymentsHeldBy { member } => Reply::Deployments(directory.deployments_held_by(&member).await?),
-        Op::ReplaceDeployment { record, expected } => Reply::DeploymentCas(directory.replace_deployment(record, expected).await?),
+        Op::ReplaceDeployment { record, expected } => Reply::DeploymentReplace(directory.replace_deployment(record, expected).await),
         Op::RegisterMember { record } => Reply::Member(directory.register_member(record).await?),
         Op::Member { id } => Reply::OptionalMember(directory.member(&id).await?),
         Op::Members => Reply::Members(directory.members().await?),
@@ -395,6 +396,12 @@ impl Drop for Waiting<'_> {
     fn drop(&mut self) { self.connection.pending.lock().remove(&self.id); }
 }
 
+enum CallOutcome {
+    Answered(Result<Reply>),
+    Refused(Anomaly),
+    Unknown(Anomaly),
+}
+
 enum Attempt {
     Answered(Result<Reply>),
     /// The request never left this process, so it may be resent whatever it is.
@@ -443,7 +450,7 @@ impl RemoteDirectory {
         unavailable("rtdb.directory/timeout", message).with_context("address", self.address.clone().into())
     }
 
-    async fn attempt(&self, connection: &Connection, op: &Op) -> Attempt {
+    async fn attempt(&self, connection: &Connection, op: &Op, sent: &mut bool) -> Attempt {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = oneshot::channel();
         {
@@ -452,31 +459,50 @@ impl RemoteDirectory {
             pending.insert(id, sender);
         }
         let waiting = Waiting { connection, id };
-        let sent = tokio::select! {
+        let queued = tokio::select! {
             _ = connection.closed.cancelled() => return Attempt::NotSent,
-            sent = connection.outgoing.send(encode(&Outgoing { id, op })) => sent,
+            queued = connection.outgoing.send(encode(&Outgoing { id, op })) => queued,
         };
-        if sent.is_err() { return Attempt::NotSent; }
+        if queued.is_err() { return Attempt::NotSent; }
+        *sent = true;
         let answer = receiver.await;
         drop(waiting);
         match answer { Ok(result) => Attempt::Answered(result), Err(_) => Attempt::Lost }
     }
 
-    async fn call(&self, op: Op) -> Result<Reply> {
+    async fn call_tracked(&self, op: Op) -> CallOutcome {
         let write = !op.is_read();
+        let mut sent = false;
         let exchange = async {
             let mut resent = false;
             loop {
-                let connection = self.connection().await?;
-                match self.attempt(&connection, &op).await {
-                    Attempt::Answered(result) => return result,
+                let connection = match self.connection().await {
+                    Ok(connection) => connection,
+                    Err(error) => return CallOutcome::Refused(error),
+                };
+                match self.attempt(&connection, &op, &mut sent).await {
+                    Attempt::Answered(result) => return CallOutcome::Answered(result),
                     Attempt::NotSent => continue,
-                    Attempt::Lost if !write && !resent => resent = true,
-                    Attempt::Lost => return Err(lost(write)),
+                    Attempt::Lost if !write && !resent => {
+                        sent = false;
+                        resent = true;
+                    }
+                    Attempt::Lost => return CallOutcome::Unknown(lost(write)),
                 }
             }
         };
-        tokio::time::timeout(self.request_timeout, exchange).await.map_err(|_| self.timed_out(write))?
+        match tokio::time::timeout(self.request_timeout, exchange).await {
+            Ok(outcome) => outcome,
+            Err(_) if sent => CallOutcome::Unknown(self.timed_out(write)),
+            Err(_) => CallOutcome::Refused(self.timed_out(false)),
+        }
+    }
+
+    async fn call(&self, op: Op) -> Result<Reply> {
+        match self.call_tracked(op).await {
+            CallOutcome::Answered(result) => result,
+            CallOutcome::Refused(error) | CallOutcome::Unknown(error) => Err(error),
+        }
     }
 }
 
@@ -601,8 +627,13 @@ impl Directory for RemoteDirectory {
     async fn deployments_held_by(&self, member: &MemberId) -> Result<Vec<DeploymentRecord>> {
         match self.call(Op::DeploymentsHeldBy { member: member.clone() }).await? { Reply::Deployments(records) => Ok(records), other => Err(protocol(other)) }
     }
-    async fn replace_deployment(&self, record: DeploymentRecord, expected: Version) -> Result<Cas<DeploymentRecord>> {
-        match self.call(Op::ReplaceDeployment { record, expected }).await? { Reply::DeploymentCas(cas) => Ok(cas), other => Err(protocol(other)) }
+    async fn replace_deployment(&self, record: DeploymentRecord, expected: Version) -> ReplaceOutcome<DeploymentRecord> {
+        match self.call_tracked(Op::ReplaceDeployment { record, expected }).await {
+            CallOutcome::Answered(Ok(Reply::DeploymentReplace(outcome))) => outcome,
+            CallOutcome::Answered(Ok(other)) => ReplaceOutcome::Unknown(protocol(other)),
+            CallOutcome::Answered(Err(error)) | CallOutcome::Refused(error) => ReplaceOutcome::Refused(error),
+            CallOutcome::Unknown(error) => ReplaceOutcome::Unknown(error),
+        }
     }
     async fn register_member(&self, record: MemberRecord) -> Result<MemberRecord> {
         match self.call(Op::RegisterMember { record }).await? { Reply::Member(record) => Ok(record), other => Err(protocol(other)) }
@@ -761,7 +792,7 @@ mod tests {
 
         let mut changed = created.clone();
         changed.epoch = 7;
-        let changed = directory.replace_deployment(changed, created.version).await.unwrap().applied().unwrap();
+        let changed = directory.replace_deployment(changed, created.version).await.applied().unwrap();
         let socket = tokio::net::TcpSocket::new_v4().unwrap();
         socket.set_reuseaddr(true).unwrap();
         socket.bind(address.parse().unwrap()).unwrap();
@@ -786,7 +817,7 @@ mod tests {
         for epoch in 1..=10_000 {
             let mut changed = record.clone();
             changed.epoch = epoch;
-            record = directory.replace_deployment(changed, record.version).await.unwrap().applied().unwrap();
+            record = directory.replace_deployment(changed, record.version).await.applied().unwrap();
         }
         let lost = tokio::time::timeout(Duration::from_secs(60), async {
             while let Some(line) = lines.next_line().await.unwrap() {
@@ -841,11 +872,61 @@ mod tests {
 
         let mut changed = created.clone();
         changed.epoch = 1;
-        let changed = remote.replace_deployment(changed, created.version).await.unwrap().applied().unwrap();
+        let changed = remote.replace_deployment(changed, created.version).await.applied().unwrap();
         tokio::time::timeout(Duration::from_millis(500), watched.changed()).await.expect("the change arrives long before the next poll").unwrap();
         assert_eq!(watched.borrow().as_ref().unwrap().version, changed.version);
         drop(watched);
         drop(remote);
         served.stop().await;
+    }
+
+    #[tokio::test]
+    async fn replace_deployment_distinguishes_refused_from_unknown_over_the_network() {
+        let directory = MemoryDirectory::new();
+        let served = served(directory.clone()).await;
+        let remote = RemoteDirectory::connect(&served.address).await.unwrap();
+        let created = remote.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
+
+        let mut renamed = created.clone();
+        renamed.name = "renamed".into();
+        let refused = remote.replace_deployment(renamed, created.version).await.refused().expect("rename is definitely refused");
+        assert_eq!(refused.code, "rtdb.directory/rename");
+
+        // An unreachable server refuses before sending (first clear the closed connection with a read).
+        served.stop().await;
+        assert!(remote.deployment(&created.id).await.is_err());
+        let mut next = created.clone();
+        next.epoch = 1;
+        let unreachable = remote.replace_deployment(next.clone(), created.version).await.refused().expect("unreached server never received the write");
+        assert_eq!(unreachable.code, "rtdb.directory/connect");
+        drop(remote);
+
+        // A server that reads the request and drops the connection leaves the outcome unknown.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let dropper = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line).await;
+        });
+        let remote = RemoteDirectory::connect_with_timeout(&address, Duration::from_secs(5)).await.unwrap();
+        let dropped = remote.replace_deployment(next.clone(), created.version).await.unknown().expect("dropped connection after send is unknown");
+        assert_eq!(dropped.code, "rtdb.directory/connection-lost");
+        dropper.await.unwrap();
+        drop(remote);
+
+        // A silent server that accepts the request leaves the replace outcome unknown on timeout.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let silent = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            drop(stream);
+        });
+        let remote = RemoteDirectory::connect_with_timeout(&address, Duration::from_millis(100)).await.unwrap();
+        let timed_out = remote.replace_deployment(next, created.version).await.unknown().expect("sent write with no reply is unknown");
+        assert_eq!(timed_out.code, "rtdb.directory/timeout");
+        silent.abort();
     }
 }

@@ -59,7 +59,7 @@ pub(crate) mod tests {
 
     use async_trait::async_trait;
     use parking_lot::Mutex;
-    use rtdb_directory::{Cas, DeploymentRecord, Directory, MemberId, MemberRecord, MemoryDirectory, Version};
+    use rtdb_directory::{Cas, DeploymentRecord, Directory, MemberId, MemberRecord, MemoryDirectory, ReplaceOutcome, Version};
     use rtdb_types::{AnomalyCategory, Result};
 
     use super::*;
@@ -71,6 +71,8 @@ pub(crate) mod tests {
         Read,
         /// The next deployment read is refused with an error no retry can clear.
         Refuse,
+        /// The next deployment replace is definitely refused without applying.
+        RefuseReplace,
         /// The next replace applies and then loses its reply.
         LostReply,
     }
@@ -132,9 +134,17 @@ pub(crate) mod tests {
         async fn deployment_by_name(&self, name: &str) -> Result<Option<DeploymentRecord>> { self.inner.deployment_by_name(name).await }
         async fn deployments(&self) -> Result<Vec<DeploymentRecord>> { self.inner.deployments().await }
         async fn deployments_held_by(&self, id: &MemberId) -> Result<Vec<DeploymentRecord>> { self.inner.deployments_held_by(id).await }
-        async fn replace_deployment(&self, record: DeploymentRecord, expected: Version) -> Result<Cas<DeploymentRecord>> {
+        async fn replace_deployment(&self, record: DeploymentRecord, expected: Version) -> ReplaceOutcome<DeploymentRecord> {
+            if self.take(|fault| matches!(fault, Fault::RefuseReplace)) {
+                return ReplaceOutcome::Refused(Anomaly::incorrect("rtdb.test/replace-refused", "The scripted directory refused the replace"));
+            }
             let replaced = self.inner.replace_deployment(record, expected).await;
-            if self.take(|fault| matches!(fault, Fault::LostReply)) { replaced?; return Err(unavailable()); }
+            if self.take(|fault| matches!(fault, Fault::LostReply)) {
+                return match replaced {
+                    ReplaceOutcome::Applied(_) | ReplaceOutcome::Conflict(_) | ReplaceOutcome::Unknown(_) => ReplaceOutcome::Unknown(unavailable()),
+                    ReplaceOutcome::Refused(error) => ReplaceOutcome::Refused(error),
+                };
+            }
             replaced
         }
         async fn register_member(&self, member: MemberRecord) -> Result<MemberRecord> { self.inner.register_member(member).await }
@@ -171,6 +181,9 @@ pub(crate) mod tests {
         assert!(matches!(&refused, ChangeFailure::NotApplied(error) if error.code == "rtdb.test/refused"));
         directory.inject(Fault::Read);
         assert!(!change_installation(directory.as_ref(), &created.id, rename).await.unwrap_err().may_have_applied());
+        directory.inject(Fault::RefuseReplace);
+        let refused_replace = change_installation(directory.as_ref(), &created.id, rename).await.unwrap_err();
+        assert!(matches!(&refused_replace, ChangeFailure::NotApplied(error) if error.code == "rtdb.test/replace-refused"));
         assert!(!change_installation(directory.as_ref(), "missing", rename).await.unwrap_err().may_have_applied());
         assert_eq!(directory.deployment(&created.id).await.unwrap().unwrap().version, created.version);
     }

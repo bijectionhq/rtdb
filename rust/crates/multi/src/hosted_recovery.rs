@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use rtdb_directory::{Cas, Checkpoint, DeploymentRecord, Directory, JournalAnchor, MemberId, MemberRecord, ReplicaJournalUnit, ReplicaPayloadCandidate, ReplicaPayloadTrim};
+use rtdb_directory::{Checkpoint, DeploymentRecord, Directory, JournalAnchor, MemberId, MemberRecord, ReplicaJournalUnit, ReplicaPayloadCandidate, ReplicaPayloadTrim, ReplaceOutcome};
 use rtdb_format::{envelope::ReplicaEnvelope, keys::CURRENT_STORAGE_VERSION};
 use rtdb_logkeeper::{JournalDigest, StreamConfig};
 use rtdb_storage::{Error, IoRegion, log::LogOffset};
@@ -172,8 +172,10 @@ impl ReplicaTrimPlan {
         }
         let stored = if changed {
             let version = self.record.version;
-            let Cas::Applied(stored) = directory.replace_deployment(self.record, version).await? else {
-                return Ok(None);
+            let stored = match directory.replace_deployment(self.record, version).await {
+                ReplaceOutcome::Applied(stored) => stored,
+                ReplaceOutcome::Conflict(_) => return Ok(None),
+                ReplaceOutcome::Refused(error) | ReplaceOutcome::Unknown(error) => return Err(error),
             };
             stored
         } else {
@@ -277,7 +279,11 @@ pub(crate) async fn advance_body_fence(
     let version = record.version;
     let mut next = record;
     next.replica_payload_trim = Some(Box::new(work));
-    let Cas::Applied(stored) = directory.replace_deployment(next, version).await? else { return Ok(None); };
+    let stored = match directory.replace_deployment(next, version).await {
+        ReplaceOutcome::Applied(stored) => stored,
+        ReplaceOutcome::Conflict(_) => return Ok(None),
+        ReplaceOutcome::Refused(error) | ReplaceOutcome::Unknown(error) => return Err(error),
+    };
     let work = stored.replica_payload_trim.as_ref().expect("the CAS stored the detached census");
     let residence = crate::replay_broker::residence(&stored);
     crate::residence_trace::record("detached-recovery-fence", || {

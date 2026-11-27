@@ -1871,7 +1871,7 @@ mod tests {
         };
         let mut fenced = owner.clone();
         fenced.storage_regions.insert(retirement.token, StorageRegion::ExactRetirement { object, release: Some(marker) });
-        let fenced = directory.replace_deployment(fenced, owner.version).await.unwrap().applied().unwrap();
+        let fenced = directory.replace_deployment(fenced, owner.version).await.applied().unwrap();
         directory.change_lineage(&owner.lineage, LineageChange::ReserveRetirement {
             retirement: retirement.clone(), observed_references: 0, generation: 0,
         }).await.unwrap();
@@ -2029,20 +2029,20 @@ mod tests {
         let hold = Uuid::new_v4();
         current.storage_regions.insert(hold, StorageRegion::ReplicaReplay { first_required: 1, through: 1, custody: ReplayCustody::Local });
         let version = current.version;
-        let current = directory.replace_deployment(current, version).await.unwrap().applied().unwrap();
+        let current = directory.replace_deployment(current, version).await.applied().unwrap();
         reap(directory.as_ref(), &bucket, &provider, &current, None, None).await.unwrap();
         assert!(provider.calls.lock().is_empty());
         let mut current = directory.deployment(&held.id).await.unwrap().unwrap();
         current.storage_regions.insert(hold, StorageRegion::ReferenceRead { custody: ReplayCustody::Local, archive_source: None, object: Some(object.to_string()) });
         let version = current.version;
-        let held = directory.replace_deployment(current, version).await.unwrap().applied().unwrap();
+        let held = directory.replace_deployment(current, version).await.applied().unwrap();
         assert_eq!(reap(directory.as_ref(), &bucket, &provider, &held, None, None).await.unwrap_err().code, changed().code);
         assert!(provider.calls.lock().is_empty());
         let after_blocked_attempt = directory.lineage_state(&held.lineage).await.unwrap().open_generation().unwrap();
         let mut unheld = directory.deployment(&held.id).await.unwrap().unwrap();
         unheld.storage_regions.remove(&hold);
         let version = unheld.version;
-        let owner = directory.replace_deployment(unheld, version).await.unwrap().applied().unwrap();
+        let owner = directory.replace_deployment(unheld, version).await.applied().unwrap();
 
         let error = reap(directory.as_ref(), &bucket, &provider, &owner, None, None).await.unwrap_err();
         assert_eq!(error.code, "fixture/lost-marker-reply");

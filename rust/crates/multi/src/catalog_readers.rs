@@ -165,7 +165,7 @@ fn closed() -> Anomaly {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rtdb_directory::{Cas, CatalogReader, MemoryDirectory};
+    use rtdb_directory::{CatalogReader, MemoryDirectory, ReplaceOutcome};
     use rtdb_format::keys::CURRENT_STORAGE_VERSION;
 
     async fn serving() -> (CatalogReaders, Arc<MemoryDirectory>, DeploymentRecord) {
@@ -262,6 +262,6 @@ mod tests {
         let stale_version = stale.version;
         assert!(readers.advance(newer).await.unwrap());
         stale.catalog_admission_floors.clear();
-        assert!(!matches!(directory.replace_deployment(stale, stale_version).await.unwrap(), Cas::Applied(_)));
+        assert!(!matches!(directory.replace_deployment(stale, stale_version).await, ReplaceOutcome::Applied(_)));
     }
 }

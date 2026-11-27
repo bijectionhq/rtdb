@@ -3,7 +3,7 @@ use std::num::{NonZeroU32, NonZeroU64};
 use std::time::Duration;
 
 use futures::StreamExt;
-use rtdb_directory::{Cas, Directory, Lifecycle, MemberId, MemberPool, MemberState, now_ms};
+use rtdb_directory::{Directory, Lifecycle, MemberId, MemberPool, MemberState, ReplaceOutcome, now_ms};
 use rtdb_types::Result;
 use serde::{Deserialize, Serialize};
 
@@ -145,8 +145,12 @@ impl ReadWidthScaler {
             record.read_width = next;
             adjusted += 1;
             self.last_adjusted = Some(deployment.clone());
-            if let Cas::Applied(_) = directory.replace_deployment(record, expected).await? {
-                self.quiet.remove(&deployment);
+            match directory.replace_deployment(record, expected).await {
+                ReplaceOutcome::Applied(_) => {
+                    self.quiet.remove(&deployment);
+                }
+                ReplaceOutcome::Conflict(_) => {}
+                ReplaceOutcome::Refused(error) | ReplaceOutcome::Unknown(error) => return Err(error),
             }
         }
         Ok(())

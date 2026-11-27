@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use rtdb_types::JournalEndpoint;
 
-use crate::{claim, now_ms, park, Cas, DecommissionCertificate, LogkeeperDecommission, DeploymentRecord, Directory, DisposalReceipt, ForkPreparation, ForkPublication, Lifecycle, ServingInventory, LineageChange, LineageRetirement, MemberId, MemberRecord, MemberRole, MemberState};
+use crate::{claim, now_ms, park, Cas, DecommissionCertificate, LogkeeperDecommission, DeploymentRecord, Directory, DisposalReceipt, ForkPreparation, ForkPublication, Lifecycle, ReplaceOutcome, ServingInventory, LineageChange, LineageRetirement, MemberId, MemberRecord, MemberRole, MemberState};
 
 /// Panics on the first violation.
 /// Uses fresh ids and names, so it can run against a shared, non-empty directory.
@@ -20,7 +20,7 @@ pub async fn run(directory: &dyn Directory) {
     directory.reserve_installed_journal(id).await.unwrap();
     directory.reserve_installed_journal(id).await.unwrap();
     assert_eq!(directory.create_deployment(installed.clone()).await.unwrap_err().code, "rtdb.directory/exists");
-    assert!(matches!(directory.replace_deployment(installed.clone(), 1).await.unwrap(), Cas::Conflict(None)));
+    assert!(matches!(directory.replace_deployment(installed.clone(), 1).await, ReplaceOutcome::Conflict(None)));
     assert!(directory.deployment(&installed.id).await.unwrap().is_none());
     assert!(directory.deployment_by_name(&installed.name).await.unwrap().is_none());
     assert!(directory.deployments().await.unwrap().iter().all(|record| record.id != installed.id));
@@ -34,16 +34,16 @@ pub async fn run(directory: &dyn Directory) {
     let mut claimed = created.clone();
     claimed.epoch = 1;
     claimed.holder = Some(holder.clone());
-    let applied = directory.replace_deployment(claimed.clone(), created.version).await.unwrap().applied().expect("a replace at the current version applies");
+    let applied = directory.replace_deployment(claimed.clone(), created.version).await.applied().expect("a replace at the current version applies");
     assert_eq!(applied.version, created.version + 1);
-    match directory.replace_deployment(claimed.clone(), created.version).await.unwrap() {
-        Cas::Conflict(Some(current)) => assert_eq!(current, applied, "a stale replace sees the current record"),
+    match directory.replace_deployment(claimed.clone(), created.version).await {
+        ReplaceOutcome::Conflict(Some(current)) => assert_eq!(current, applied, "a stale replace sees the current record"),
         other => panic!("a stale replace must conflict: {other:?}"),
     }
     assert!(directory.deployments_held_by(&holder).await.unwrap().iter().any(|record| record.id == created.id));
     let mut renamed = applied.clone();
     renamed.name = format!("{name}-renamed");
-    assert!(directory.replace_deployment(renamed, applied.version).await.is_err(), "a deployment's name never changes");
+    assert!(matches!(directory.replace_deployment(renamed, applied.version).await, ReplaceOutcome::Refused(_)), "a deployment's name never changes");
 
     let mut child = DeploymentRecord::new(format!("{name}-child"), &applied.org, vec![], 0);
     child.parent = Some(applied.id.clone());
@@ -102,7 +102,7 @@ pub async fn run(directory: &dyn Directory) {
     deleting.lifecycle = Lifecycle::Deleting;
     deleting.holder = None;
     deleting.epoch += 1;
-    let deleting = directory.replace_deployment(deleting, applied.version).await.unwrap().applied().unwrap();
+    let deleting = directory.replace_deployment(deleting, applied.version).await.applied().unwrap();
     assert!(directory.deployments_held_by(&holder).await.unwrap().is_empty());
     let mut refused = DeploymentRecord::new(format!("{name}-refused"), &deleting.org, vec![], 0);
     refused.parent = Some(deleting.id.clone());
@@ -162,7 +162,7 @@ pub async fn run(directory: &dyn Directory) {
     assert!(directory.members().await.unwrap().iter().any(|member| member.id == renewed.id));
 
     let missing = DeploymentRecord::new(format!("missing-{suffix}"), "acme", vec![], 0);
-    assert!(matches!(directory.replace_deployment(missing, 1).await.unwrap(), Cas::Conflict(None)), "replacing an absent record conflicts");
+    assert!(matches!(directory.replace_deployment(missing, 1).await, ReplaceOutcome::Conflict(None)), "replacing an absent record conflicts");
 
     journal_references_are_fenced(directory, &suffix).await;
 }
@@ -189,16 +189,16 @@ async fn journal_references_are_fenced(directory: &dyn Directory, suffix: &str) 
     assert_eq!(refused.code, "rtdb.directory/journal-retiring", "a new record cannot name a certified journal");
     let mut gaining = unnamed.clone();
     gaining.replica_journals.insert(JournalEndpoint::Address(journal.address.clone()));
-    let refused = directory.replace_deployment(gaining, unnamed.version).await.unwrap_err();
+    let refused = directory.replace_deployment(gaining, unnamed.version).await.refused().expect("retiring journal is definitely refused");
     assert_eq!(refused.code, "rtdb.directory/journal-retiring", "a record cannot gain a certified journal's address");
     let mut gaining = unnamed.clone();
     gaining.log_copy_servers.push(endpoint.clone());
-    assert_eq!(directory.replace_deployment(gaining, unnamed.version).await.unwrap_err().code, "rtdb.directory/journal-retiring");
+    assert_eq!(directory.replace_deployment(gaining, unnamed.version).await.refused().unwrap().code, "rtdb.directory/journal-retiring");
 
     let mut kept = named.clone();
     kept.read_width += 1;
     kept.replica_journals.insert(endpoint);
-    directory.replace_deployment(kept, named.version).await.unwrap().applied().expect("a record that already names the journal may still change");
+    directory.replace_deployment(kept, named.version).await.applied().expect("a record that already names the journal may still change");
 }
 
 async fn hosted_fork_staging(directory: &dyn Directory, parent: &DeploymentRecord, name: &str) {
@@ -221,13 +221,13 @@ async fn hosted_fork_staging(directory: &dyn Directory, parent: &DeploymentRecor
     assert_eq!(directory.deployment(&staged.id).await.unwrap().as_ref(), Some(&staged));
     assert!(directory.deployment_by_name(&staged.name).await.unwrap().is_none());
     assert_eq!(directory.create_deployment(child.clone()).await.unwrap_err().code, "rtdb.directory/exists");
-    assert_eq!(directory.replace_deployment(child.clone(), staged.version).await.unwrap_err().code, "rtdb.directory/fork-stage-changed");
+    assert_eq!(directory.replace_deployment(child.clone(), staged.version).await.refused().unwrap().code, "rtdb.directory/fork-stage-changed");
     let mut altered = child.clone();
     altered.incarnation += 1;
     assert_eq!(directory.publish_fork(child.clone(), parent.version, publication(preparation)).await.unwrap_err().code, "rtdb.directory/fork-stage-changed");
     let mut drained = staged.clone();
     assert!(drained.storage_regions.remove(&preparation.token).is_some());
-    let drained = directory.replace_deployment(drained, staged.version).await.unwrap().applied().unwrap();
+    let drained = directory.replace_deployment(drained, staged.version).await.applied().unwrap();
     assert_eq!(directory.publish_fork(altered, parent.version, publication(preparation)).await.unwrap_err().code, "rtdb.directory/fork-stage-changed");
 
     let published = directory.publish_fork(child, parent.version, publication(preparation)).await.unwrap();
@@ -237,15 +237,15 @@ async fn hosted_fork_staging(directory: &dyn Directory, parent: &DeploymentRecor
     let mut stale_close = drained.clone();
     stale_close.lifecycle = Lifecycle::Deleting;
     stale_close.epoch += 1;
-    assert_eq!(directory.replace_deployment(stale_close, drained.version).await.unwrap(), Cas::Conflict(Some(published.clone())));
+    assert_eq!(directory.replace_deployment(stale_close, drained.version).await, ReplaceOutcome::Conflict(Some(published.clone())));
     let mut drained = abandoned_stage.clone();
     assert!(drained.storage_regions.remove(&abandoned.token).is_some());
-    let drained = directory.replace_deployment(drained, abandoned_stage.version).await.unwrap().applied().unwrap();
+    let drained = directory.replace_deployment(drained, abandoned_stage.version).await.applied().unwrap();
     assert_eq!(directory.publish_fork(rejected.clone(), parent.version, publication(abandoned)).await.unwrap_err().code, "rtdb.directory/exists");
     let mut closed = drained.clone();
     closed.epoch += 1;
     closed.lifecycle = Lifecycle::Deleting;
-    let closed = directory.replace_deployment(closed, drained.version).await.unwrap().applied().unwrap();
+    let closed = directory.replace_deployment(closed, drained.version).await.applied().unwrap();
     assert_eq!(directory.publish_fork(rejected, parent.version, publication(abandoned)).await.unwrap_err().code, "rtdb.directory/fork-stage-changed");
     assert_eq!(directory.deployment_by_name(&closed.name).await.unwrap(), Some(published));
     directory.change_lineage(&parent.lineage, LineageChange::ReleaseFork { preparation: abandoned }).await.unwrap();
@@ -341,11 +341,11 @@ async fn exact_retirement(directory: &dyn Directory, parent: &DeploymentRecord, 
     assert!(directory.authorize_owned_retirement(&owner.id, owner.version, retirement.clone()).await.is_err());
     let mut partial = owner.clone();
     partial.storage_regions.insert(retirement.token, crate::StorageRegion::ExactRetirement { object: target.clone(), release: None });
-    let partial = directory.replace_deployment(partial, owner.version).await.unwrap().applied().unwrap();
+    let partial = directory.replace_deployment(partial, owner.version).await.applied().unwrap();
     assert!(directory.authorize_owned_retirement(&owner.id, partial.version, retirement.clone()).await.is_err());
     let mut fenced = partial.clone();
     fenced.storage_regions.insert(retirement.token, crate::StorageRegion::ExactRetirement { object: target, release: Some(release) });
-    let fenced = directory.replace_deployment(fenced, partial.version).await.unwrap().applied().unwrap();
+    let fenced = directory.replace_deployment(fenced, partial.version).await.applied().unwrap();
     assert!(directory.authorize_owned_retirement(&owner.id, partial.version, retirement.clone()).await.is_err());
     assert!(!directory.lineage_state(lineage).await.unwrap().exact_erasure_authorized());
     assert!(directory.settle_owned_version(&owner.id, fenced.version, retirement.clone()).await.is_err());
@@ -410,7 +410,7 @@ pub async fn concurrent_claims(directories: &[Arc<dyn Directory>], claimants: us
             attempts.spawn(async move {
                 let current = directory.deployment(&id).await.expect("read").expect("the deployment exists");
                 let next = claim(&current, &claimant, &members, now_ms())?;
-                directory.replace_deployment(next, current.version).await.expect("replace").applied()
+                directory.replace_deployment(next, current.version).await.into_cas().expect("replace").applied()
             });
         }
         let mut winners = Vec::new();
@@ -422,6 +422,6 @@ pub async fn concurrent_claims(directories: &[Arc<dyn Directory>], claimants: us
         assert!(won.epoch > last_epoch, "EpochsOnlyRise: {} after {last_epoch}", won.epoch);
         let holder = won.holder.clone().expect("a claim names its holder");
         let parked = park(&won, &holder, won.epoch).expect("the winner may park");
-        last_epoch = admin.replace_deployment(parked, won.version).await.expect("park").applied().expect("nobody else writes a held deployment").epoch;
+        last_epoch = admin.replace_deployment(parked, won.version).await.into_cas().expect("park").applied().expect("nobody else writes a held deployment").epoch;
     }
 }

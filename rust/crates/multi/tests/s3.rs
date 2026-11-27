@@ -148,7 +148,7 @@ async fn exercise_replay_pack_retirement(storage: CellStorage, archive: CellStor
             assert!(leased.active_s3_write_lease(now).is_some());
             leased.s3_write_lease_until_ms = Some(now - 1);
             let version = leased.version;
-            assert!(cell.directory.replace_deployment(leased, version).await.unwrap().applied().is_some());
+            assert!(cell.directory.replace_deployment(leased, version).await.applied().is_some());
             fixture.upload.armed.store(true, Ordering::Relaxed);
         }
         let stop = tokio_util::sync::CancellationToken::new();
@@ -367,7 +367,7 @@ async fn prove_rejected_fork_disposal(cell: &Cell, published: &rtdb_directory::D
         let mut current = directory.deployment(id).await.unwrap().unwrap();
         current.deletion_observation = Some(observation);
         let version = current.version;
-        assert!(directory.replace_deployment(current, version).await.unwrap().applied().is_some());
+        assert!(directory.replace_deployment(current, version).await.applied().is_some());
     };
     assert_eq!(finish().await.unwrap_err().code, "rtdb.multi/storage-lease-active");
     replace_observation(DeletionObservation::Fenced { leases_expire_at_ms: 0 }).await;
@@ -434,7 +434,7 @@ async fn prove_s3_erasure(cell: &Cell, id: &str, inject_late_object: bool) -> rt
     let directory = cell.directory.as_ref();
     let update = |record: rtdb_directory::DeploymentRecord| async move {
         let version = record.version;
-        directory.replace_deployment(record, version).await.unwrap().applied().unwrap()
+        directory.replace_deployment(record, version).await.applied().unwrap()
     };
     let delete = || admin::delete_deployment(directory, &storage, &keys, "shop", 4 << 20);
     let age = (rtdb_s3::SCOPED_S3_WRITE_TTL + rtdb_s3::SCOPED_S3_CLOCK_ALLOWANCE).as_millis() as i64;

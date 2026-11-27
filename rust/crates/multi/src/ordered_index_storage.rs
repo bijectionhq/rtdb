@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use rtdb_directory::{Cas, DeploymentRecord, Directory, LegacyIndexPages, Lifecycle, OrderedIndexCatalog, OrderedIndexStorage, StoragePublication, StorageRegion};
+use rtdb_directory::{DeploymentRecord, Directory, LegacyIndexPages, Lifecycle, OrderedIndexCatalog, OrderedIndexStorage, ReplaceOutcome, StoragePublication, StorageRegion};
 use rtdb_format::keys::ORDERED_INDEX_ROOT;
 use rtdb_storage::{
     Error, IoRegion, ObjectKey, ObjectStore,
@@ -296,8 +296,10 @@ async fn release_permit(
             permits.remove(&permit);
         }
         let version = record.version;
-        if let Cas::Applied(_) = directory.replace_deployment(record, version).await? {
-            return Ok(());
+        match directory.replace_deployment(record, version).await {
+            ReplaceOutcome::Applied(_) => return Ok(()),
+            ReplaceOutcome::Conflict(_) => {}
+            ReplaceOutcome::Refused(error) | ReplaceOutcome::Unknown(error) => return Err(error),
         }
     }
     Err(closed_scope())

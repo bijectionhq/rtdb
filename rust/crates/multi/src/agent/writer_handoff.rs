@@ -223,7 +223,8 @@ impl NodeAgent {
             match self
                 .directory
                 .replace_deployment(next, record.version)
-                .await?
+                .await
+                .into_cas()?
             {
                 Cas::Applied(_) | Cas::Conflict(Some(_)) => {}
                 Cas::Conflict(None) => return Err(handoff_changed()),

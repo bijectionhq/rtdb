@@ -4,7 +4,7 @@ use std::{collections::{BTreeMap, BTreeSet}, path::Path, sync::Arc, time::Durati
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
-use rtdb_directory::{Cas, DeploymentRecord, Directory, Lifecycle, ReplayCustody, ReplicaPayloadCandidate, ReplicaPreparedPublication, ReplicaPublicationRoute as PublishRoute, StoragePublication, StorageRegion};
+use rtdb_directory::{DeploymentRecord, Directory, Lifecycle, ReplaceOutcome, ReplayCustody, ReplicaPayloadCandidate, ReplicaPreparedPublication, ReplicaPublicationRoute as PublishRoute, StoragePublication, StorageRegion};
 use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope}, keys::{CURRENT_STORAGE_VERSION, oversized_block_index, oversized_key}};
 use rtdb_storage::{HeldView, IoRegion, ObjectKey, ObjectStore, remote::PublicationJournal, log::{ReplicaPayload, ReplicaPayloadReference}, sealing::{DeliveryIo, PlaintextView}};
 use rtdb_types::{Anomaly, AnomalyCategory, MemoryBudget, PhysicalObjectVersion, Result, StorageEpoch};
@@ -1128,8 +1128,7 @@ impl Service {
         let deployment = history.deployment.to_string();
         let mut attempted = false;
         let result = async {
-            attempted = true;
-            let record = crate::admin::update_installation(self.directory.as_ref(), &deployment, |record| {
+            let record = match crate::admin::change_installation(self.directory.as_ref(), &deployment, |record| {
                 require_publication(history, route, record, key)?;
                 if record.replica_payload_trim.as_deref().is_some_and(|trim| trim.belongs_to(record)
                     && trim.candidates.iter().any(|candidate| candidate.key == key.as_str() && candidate.grant.is_some()))
@@ -1148,7 +1147,16 @@ impl Service {
                     key: key.to_string(), custody: self.custody.clone(), closed: false, publications: Default::default(), draft,
                 });
                 Ok(())
-            }).await?;
+            }).await {
+                Ok(record) => {
+                    attempted = true;
+                    record
+                }
+                Err(failure) => {
+                    attempted = failure.may_have_applied();
+                    return Err(Anomaly::from(failure));
+                }
+            };
             let mut io = IoRegion::new();
             if let Some(witness) = &local {
                 io = io.child_holding(Some(witness.clone()));
@@ -1215,16 +1223,24 @@ impl Service {
             record.storage_regions.insert(region, StorageRegion::ReplicaReplay {
                 first_required: position, through: position, custody: self.custody.clone(),
             });
-            *attempted = true;
-            if let Cas::Applied(stored) = self.directory.replace_deployment(record, version).await? {
-                crate::residence_trace::record("admit-recovery", || serde_json::json!({
-                    "lineage": stored.lineage, "installation": stored.id, "incarnation": stored.incarnation,
-                    "revision": stored.version, "stream": stored.stream("replica"), "epoch": stored.log_epoch,
-                    "hold": region, "residence": residence(&stored),
-                    "first_required": position, "through": position,
-                    "source_hold": source_hold(&stored, ticket),
-                }));
-                return Ok(stored);
+            match self.directory.replace_deployment(record, version).await {
+                ReplaceOutcome::Applied(stored) => {
+                    *attempted = true;
+                    crate::residence_trace::record("admit-recovery", || serde_json::json!({
+                        "lineage": stored.lineage, "installation": stored.id, "incarnation": stored.incarnation,
+                        "revision": stored.version, "stream": stored.stream("replica"), "epoch": stored.log_epoch,
+                        "hold": region, "residence": residence(&stored),
+                        "first_required": position, "through": position,
+                        "source_hold": source_hold(&stored, ticket),
+                    }));
+                    return Ok(stored);
+                }
+                ReplaceOutcome::Conflict(_) => {}
+                ReplaceOutcome::Refused(error) => return Err(error),
+                ReplaceOutcome::Unknown(error) => {
+                    *attempted = true;
+                    return Err(error);
+                }
             }
         }
         Err(Anomaly::new(AnomalyCategory::Busy, "rtdb.multi/replay-broker-contended",
@@ -1565,8 +1581,7 @@ mod tests {
         record.holder = Some(MemberId("writer".into()));
         record.epoch = 1;
         record.lifecycle = Lifecycle::Live;
-        let record = directory.replace_deployment(record.clone(), record.version).await.unwrap();
-        let Cas::Applied(mut record) = record else { panic!("the directory refused the test holder"); };
+        let ReplaceOutcome::Applied(mut record) = directory.replace_deployment(record.clone(), record.version).await else { panic!("the directory refused the test holder"); };
         let stream = crate::admin::administration_stream(directory.as_ref(), &record, process::MAXIMUM_LOG_MESSAGE_BYTES).await.unwrap();
         let shutdown = CancellationToken::new();
         let writer = rtdb_logkeeper::open_writer(stream, record.epoch, shutdown.clone()).await.unwrap();
@@ -1621,8 +1636,7 @@ mod tests {
                 first_required: position, through: position, custody: ReplayCustody::Local,
             });
         }
-        let installed = directory.replace_deployment(record.clone(), record.version).await.unwrap();
-        let Cas::Applied(record) = installed else { panic!("the directory refused the checkpoint"); };
+        let ReplaceOutcome::Applied(record) = directory.replace_deployment(record.clone(), record.version).await else { panic!("the directory refused the checkpoint"); };
         observe_checkpoint(&record, checkpoint, manifest, Some(fingerprint));
 
         assert!(ReplicaTrimPlan::new(record.clone(), None, checkpoint.boundary, -1, 0).is_none());

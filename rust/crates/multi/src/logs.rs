@@ -176,7 +176,7 @@ impl EnsembleRecorder for DirectoryRecorder {
             if endpoints == record.replica_journals { return Ok(()); }
             record.replica_journals = endpoints;
             let version = record.version;
-            if let rtdb_directory::Cas::Applied(_) = self.directory.replace_deployment(record, version).await? { return Ok(()); }
+            if self.directory.replace_deployment(record, version).await.into_applied()?.is_some() { return Ok(()); }
         }
         Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.multi/record-contended", "The deployment kept changing while its log copy was reserved"))
     }
@@ -214,7 +214,7 @@ impl EnsembleRecorder for DirectoryRecorder {
             if next.journal_placement.as_ref().is_some_and(|placement| placement.reached_by(&ensemble)) {
                 next.journal_placement = None;
             }
-            if let rtdb_directory::Cas::Applied(_) = self.directory.replace_deployment(next, current.version).await? { return Ok(()); }
+            if self.directory.replace_deployment(next, current.version).await.into_applied()?.is_some() { return Ok(()); }
         }
         Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.multi/record-contended", "The deployment kept changing while its new ensemble was recorded"))
     }
@@ -1028,7 +1028,7 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_refuses_a_pending_trim_before_the_logkeeper_applies_it() {
-        use rtdb_directory::{Cas, Checkpoint, DeploymentRecord, Directory, JournalAnchor, MemoryDirectory, ReplayCustody};
+        use rtdb_directory::{Checkpoint, DeploymentRecord, Directory, JournalAnchor, MemoryDirectory, ReplaceOutcome, ReplayCustody};
         use rtdb_storage::Error;
 
         let directory = MemoryDirectory::new();
@@ -1070,7 +1070,7 @@ mod tests {
         let version = record.version;
         record.checkpoint = Some(Checkpoint { block: 1, boundary: 5, source: 1, system_time: 0, root_sha256: None });
         record.replica_anchor = Some(Box::new(JournalAnchor { root_incarnation: record.incarnation, interval: [0, 4], digest: [0; 32] }));
-        let Cas::Applied(mut record) = directory.replace_deployment(record, version).await.unwrap() else { panic!("failed to authorize trim"); };
+        let ReplaceOutcome::Applied(mut record) = directory.replace_deployment(record, version).await else { panic!("failed to authorize trim"); };
         assert_eq!(provider.first_retained(), LogOffset(0));
         assert!(provider.recovery_tail(LogOffset(3)).await.unwrap().is_some());
         assert!(matches!(replica.tail(LogOffset(3)).await,
@@ -1083,7 +1083,7 @@ mod tests {
         record = directory.deployment(&record.id).await.unwrap().unwrap();
         let version = record.version;
         record.epoch += 1;
-        let Cas::Applied(mut record) = directory.replace_deployment(record, version).await.unwrap() else { panic!("failed to change writer epoch"); };
+        let ReplaceOutcome::Applied(mut record) = directory.replace_deployment(record, version).await else { panic!("failed to change writer epoch"); };
         assert!(matches!(replica.recovery_tail(LogOffset(3)).await,
             Err(Error::UnavailableLogRange { requested: 4, first_retained: 5 })));
         assert!(replica.recovery_tail(LogOffset(5)).await.unwrap().is_some());
@@ -1092,7 +1092,7 @@ mod tests {
         record = directory.deployment(&record.id).await.unwrap().unwrap();
         let version = record.version;
         record.log_epoch += 1;
-        assert!(matches!(directory.replace_deployment(record, version).await.unwrap(), Cas::Applied(_)));
+        assert!(matches!(directory.replace_deployment(record, version).await, ReplaceOutcome::Applied(_)));
         assert!(matches!(replica.recovery_tail(LogOffset(5)).await, Err(Error::Closed(_))));
     }
 

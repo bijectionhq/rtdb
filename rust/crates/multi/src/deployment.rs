@@ -415,7 +415,7 @@ mod tests {
         moved.holder = Some(MemberId("isolated".into()));
         moved.epoch += 1;
         moved.lifecycle = rtdb_directory::Lifecycle::Quarantined;
-        let moved = directory.replace_deployment(moved, active.version).await.unwrap().applied().unwrap();
+        let moved = directory.replace_deployment(moved, active.version).await.applied().unwrap();
         assert!(directory.deployments_held_by(&MemberId("node".into())).await.unwrap().is_empty());
         assert_eq!(live_holdings(directory.as_ref(), &members, 10).await.unwrap(), [moved]);
     }

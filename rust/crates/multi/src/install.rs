@@ -499,7 +499,7 @@ mod tests {
         returned.incarnation = 3;
         returned.epoch = 7;
         returned.lifecycle = Lifecycle::Live;
-        let returned = directory.replace_deployment(returned, first.version).await.unwrap().applied().unwrap();
+        let returned = directory.replace_deployment(returned, first.version).await.applied().unwrap();
         assert!(matches!(
             installer.handle(directory.as_ref(), &request("schedule_disposal", &disposal, authority)).await,
             Reply::Refused

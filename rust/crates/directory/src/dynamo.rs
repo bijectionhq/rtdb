@@ -24,7 +24,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::{Cas, ChangeFeed, DeploymentRecord, Directory, ForkPublication, ReferenceDisposal, HostedTask, LineageChange, LineageRetirement, LineageState, MemberId, MemberRecord, REFERENCE_REVISION_PREFIX, Version, exists, fork_conflict, fork_parent_id, require_deployment_name, shared_fork_lineage};
+use crate::{Cas, ChangeFeed, DeploymentRecord, Directory, ForkPublication, ReferenceDisposal, ReplaceOutcome, HostedTask, LineageChange, LineageRetirement, LineageState, MemberId, MemberRecord, REFERENCE_REVISION_PREFIX, Version, exists, fork_conflict, fork_parent_id, require_deployment_name, shared_fork_lineage};
 use crate::lineage::{disposal_changed, lineage_busy};
 use crate::{AUDIENCE_SEAT_PREFIX, AudienceSeatClaim, reserved_deployment_name};
 use audience_seat::{SeatCondition, SeatPredecessor, SeatRevision, acquire_condition, claim_predecessor, release_condition};
@@ -198,8 +198,10 @@ impl DynamoDirectory {
 
     /// Writes `item` only if the stored item's version is `expected` and, when `name` is given, its name is `name`.
     /// On a failed condition, returns the stored item, if there is one.
-    async fn put_conditional(&self, table: &str, item: Item, expected: Version, name: Option<&str>) -> Result<std::result::Result<(), Option<Item>>> {
-        let key = item.get(ID).cloned().ok_or_else(|| Anomaly::fault("rtdb.directory/item", "A directory item has no id"))?;
+    async fn put_conditional(&self, table: &str, item: Item, expected: Version, name: Option<&str>) -> PutConditional {
+        let Some(key) = item.get(ID).cloned() else {
+            return PutConditional::Refused(Anomaly::fault("rtdb.directory/item", "A directory item has no id"));
+        };
         let staged = item.contains_key(FORK_STAGE);
         let transfer = item.contains_key(CHECKPOINT_TRANSFER_FENCE);
         let writer_handoff = item.contains_key(WRITER_HANDOFF);
@@ -214,7 +216,7 @@ impl DynamoDirectory {
                     (false, false) => "#v = :expected AND #n = :name AND attribute_not_exists(#stage) AND attribute_not_exists(#transfer)",
                     (true, false) => "#v = :expected AND #n = :name AND attribute_exists(#stage) AND attribute_not_exists(#transfer)",
                     (false, true) => "#v = :expected AND #n = :name AND attribute_not_exists(#stage) AND attribute_exists(#transfer)",
-                    (true, true) => return Err(transfer_changed()),
+                    (true, true) => return PutConditional::Refused(transfer_changed()),
                 };
                 request = request.expression_attribute_names("#n", NAME).expression_attribute_names("#stage", FORK_STAGE)
                     .expression_attribute_names("#transfer", CHECKPOINT_TRANSFER_FENCE)
@@ -233,21 +235,36 @@ impl DynamoDirectory {
             None => request.condition_expression(EXACT_VERSION),
         };
         match request.send().await {
-            Ok(_) => Ok(Ok(())),
+            Ok(_) => PutConditional::Applied,
             Err(error) => match error.as_service_error() {
                 Some(service) if service.is_conditional_check_failed_exception() => {
                     let returned = match service { aws_sdk_dynamodb::operation::put_item::PutItemError::ConditionalCheckFailedException(failed) => failed.item.clone(), _ => None };
                     let current = match returned {
                         Some(item) => Some(item),
-                        None => { let AttributeValue::S(id) = &key else { return Err(Anomaly::fault("rtdb.directory/item", "A directory item's id is not a string")) };
-                            self.get(table, ID, id).await? }
+                        None => {
+                            let AttributeValue::S(id) = &key else {
+                                return PutConditional::Refused(Anomaly::fault("rtdb.directory/item", "A directory item's id is not a string"));
+                            };
+                            match self.get(table, ID, id).await {
+                                Ok(item) => item,
+                                Err(error) => return PutConditional::Refused(error),
+                            }
+                        }
                     };
-                    Ok(Err(current))
+                    PutConditional::Conflict(current)
                 }
-                _ => Err(sdk_anomaly("PutItem", error)),
+                _ if write_error_is_unknown(&error) => PutConditional::Unknown(sdk_anomaly("PutItem", error)),
+                _ => PutConditional::Refused(sdk_anomaly("PutItem", error)),
             },
         }
     }
+}
+
+enum PutConditional {
+    Applied,
+    Conflict(Option<Item>),
+    Refused(Anomaly),
+    Unknown(Anomaly),
 }
 
 const SEAT_REVISION: &str = "seat_revision";
@@ -359,6 +376,33 @@ fn key_schema(name: &str) -> Result<KeySchemaElement> {
 }
 
 fn build_fault(error: aws_sdk_dynamodb::error::BuildError) -> Anomaly { Anomaly::fault("rtdb.directory/dynamodb-request", error.to_string()) }
+
+fn write_error_is_unknown<E, R>(error: &SdkError<E, R>) -> bool
+where
+    E: ProvideErrorMetadata,
+{
+    match error {
+        SdkError::TimeoutError(_) | SdkError::DispatchFailure(_) | SdkError::ResponseError(_) => true,
+        SdkError::ServiceError(service) => matches!(
+            service.err().code(),
+            Some("InternalServerError" | "ServiceUnavailable") | None
+        ),
+        SdkError::ConstructionFailure(_) => false,
+        _ => true,
+    }
+}
+
+fn write_sdk_outcome<E, R, T>(operation: &str, error: SdkError<E, R>) -> ReplaceOutcome<T>
+where
+    E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
+    R: std::fmt::Debug,
+{
+    if write_error_is_unknown(&error) {
+        ReplaceOutcome::Unknown(sdk_anomaly(operation, error))
+    } else {
+        ReplaceOutcome::Refused(sdk_anomaly(operation, error))
+    }
+}
 
 fn sdk_anomaly<E, R>(operation: &str, error: SdkError<E, R>) -> Anomaly
 where E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static, R: std::fmt::Debug {
@@ -562,26 +606,53 @@ impl DynamoDirectory {
 
     /// Replaces a deployment that may newly name a logkeeper in one transaction with the fence on its eligibility, or None when the write needs no fence.
     /// The record it diffs against is the one at `expected`, which the conditional put then requires, so the fence covers exactly what the write adds.
-    async fn replace_fenced_deployment(&self, record: &DeploymentRecord, expected: Version) -> Result<Option<Cas<DeploymentRecord>>> {
+    async fn replace_fenced_deployment(&self, record: &DeploymentRecord, expected: Version) -> Option<ReplaceOutcome<DeploymentRecord>> {
+        use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
+
         for _ in 0..8 {
-            let Some(current) = self.deployment(&record.id).await? else { return Ok(Some(Cas::Conflict(None))) };
-            if current.version != expected { return Ok(Some(Cas::Conflict(Some(current)))); }
-            let fence = self.journal_fence(Some(&current), record).await?;
-            if fence.is_empty() { return Ok(None); }
-            if current.name != record.name { return Err(Anomaly::incorrect("rtdb.directory/rename", "A deployment's name never changes")); }
-            require_fork_stage_update(&current, record)?;
-            require_transfer_update(&current, record)?;
-            crate::require_writer_handoff_update(&current, record)?;
+            let current = match self.deployment(&record.id).await {
+                Ok(Some(current)) => current,
+                Ok(None) => return Some(ReplaceOutcome::Conflict(None)),
+                Err(error) => return Some(ReplaceOutcome::Refused(error)),
+            };
+            if current.version != expected { return Some(ReplaceOutcome::Conflict(Some(current))); }
+            let fence = match self.journal_fence(Some(&current), record).await {
+                Ok(fence) => fence,
+                Err(error) => return Some(ReplaceOutcome::Refused(error)),
+            };
+            if fence.is_empty() { return None; }
+            if current.name != record.name {
+                return Some(ReplaceOutcome::Refused(Anomaly::incorrect("rtdb.directory/rename", "A deployment's name never changes")));
+            }
+            if let Err(error) = require_fork_stage_update(&current, record) { return Some(ReplaceOutcome::Refused(error)); }
+            if let Err(error) = require_transfer_update(&current, record) { return Some(ReplaceOutcome::Refused(error)); }
+            if let Err(error) = crate::require_writer_handoff_update(&current, record) { return Some(ReplaceOutcome::Refused(error)); }
             let mut next = record.clone();
             next.version = expected + 1;
-            let put = Put::builder().table_name(&self.tables.deployments).set_item(Some(deployment_item(&next, self.pack_parked_records)?))
+            let item = match deployment_item(&next, self.pack_parked_records) {
+                Ok(item) => item,
+                Err(error) => return Some(ReplaceOutcome::Refused(error)),
+            };
+            let put = match Put::builder().table_name(&self.tables.deployments).set_item(Some(item))
                 .condition_expression(EXACT_VERSION).expression_attribute_names("#v", VERSION)
-                .expression_attribute_values(":expected", number(expected)).build().map_err(build_fault)?;
+                .expression_attribute_values(":expected", number(expected)).build().map_err(build_fault)
+            {
+                Ok(put) => put,
+                Err(error) => return Some(ReplaceOutcome::Refused(error)),
+            };
             let mut items = vec![TransactWriteItem::builder().put(put).build()];
             items.extend(fence);
-            if self.write_retirement(items).await? { return Ok(Some(Cas::Applied(next))); }
+            match self.client.transact_write_items().set_transact_items(Some(items)).send().await {
+                Ok(_) => return Some(ReplaceOutcome::Applied(next)),
+                Err(error) => match error.as_service_error() {
+                    Some(TransactWriteItemsError::TransactionCanceledException(refusal))
+                        if refusal.cancellation_reasons().iter().any(|reason|
+                            matches!(reason.code(), Some("ConditionalCheckFailed" | "TransactionConflict"))) => {}
+                    _ => return Some(write_sdk_outcome("TransactWriteItems", error)),
+                },
+            }
         }
-        Err(journal_eligibility_changed(&record.id))
+        Some(ReplaceOutcome::Refused(journal_eligibility_changed(&record.id)))
     }
 
     async fn write_retirement(&self, items: Vec<TransactWriteItem>) -> Result<bool> {
@@ -1087,29 +1158,45 @@ impl Directory for DynamoDirectory {
         Ok(activation.clone())
     }
 
-    async fn replace_deployment(&self, mut record: DeploymentRecord, expected: Version) -> Result<Cas<DeploymentRecord>> {
+    async fn replace_deployment(&self, mut record: DeploymentRecord, expected: Version) -> ReplaceOutcome<DeploymentRecord> {
         if !record.writer_handoffs.is_empty() || record.fork_stage.is_some() || record.classic_flight.is_some() || record.classic_catalog_drain.is_some() || record.checkpoint_transfer_fence.is_some() || record.checkpoint_transfer_terminal.is_some() || record.checkpoint_transfer_bootstrap.is_some() || record.checkpoint_transfer_replica.is_some() || record.checkpoint_transfer_activation.is_some() {
-            let Some(current) = self.deployment(&record.id).await? else { return Ok(Cas::Conflict(None)); };
-            if current.version != expected { return Ok(Cas::Conflict(Some(current))); }
-            require_fork_stage_update(&current, &record)?;
-            require_transfer_update(&current, &record)?;
-            crate::require_writer_handoff_update(&current, &record)?;
+            let current = match self.deployment(&record.id).await {
+                Ok(Some(current)) => current,
+                Ok(None) => return ReplaceOutcome::Conflict(None),
+                Err(error) => return ReplaceOutcome::Refused(error),
+            };
+            if current.version != expected { return ReplaceOutcome::Conflict(Some(current)); }
+            if let Err(error) = require_fork_stage_update(&current, &record) { return ReplaceOutcome::Refused(error); }
+            if let Err(error) = require_transfer_update(&current, &record) { return ReplaceOutcome::Refused(error); }
+            if let Err(error) = crate::require_writer_handoff_update(&current, &record) { return ReplaceOutcome::Refused(error); }
         }
-        if let Some(fenced) = self.replace_fenced_deployment(&record, expected).await? { return Ok(fenced); }
+        if let Some(fenced) = self.replace_fenced_deployment(&record, expected).await { return fenced; }
         record.version = expected + 1;
         let name = record.name.clone();
-        match self.put_conditional(&self.tables.deployments, deployment_item(&record, self.pack_parked_records)?, expected, Some(&name)).await? {
-            Ok(()) => Ok(Cas::Applied(record)),
-            Err(None) => Ok(Cas::Conflict(None)),
-            Err(Some(current)) => {
-                let Some(current) = deployment_record(Some(&current))? else { return Ok(Cas::Conflict(None)); };
-                if current.version == expected && current.name != name { return Err(Anomaly::incorrect("rtdb.directory/rename", "A deployment's name never changes")); }
-                if current.version == expected {
-                    require_fork_stage_update(&current, &record)?;
-                    require_transfer_update(&current, &record)?;
-                    crate::require_writer_handoff_update(&current, &record)?;
+        let item = match deployment_item(&record, self.pack_parked_records) {
+            Ok(item) => item,
+            Err(error) => return ReplaceOutcome::Refused(error),
+        };
+        match self.put_conditional(&self.tables.deployments, item, expected, Some(&name)).await {
+            PutConditional::Applied => ReplaceOutcome::Applied(record),
+            PutConditional::Refused(error) => ReplaceOutcome::Refused(error),
+            PutConditional::Unknown(error) => ReplaceOutcome::Unknown(error),
+            PutConditional::Conflict(None) => ReplaceOutcome::Conflict(None),
+            PutConditional::Conflict(Some(current)) => {
+                let current = match deployment_record(Some(&current)) {
+                    Ok(Some(current)) => current,
+                    Ok(None) => return ReplaceOutcome::Conflict(None),
+                    Err(error) => return ReplaceOutcome::Refused(error),
+                };
+                if current.version == expected && current.name != name {
+                    return ReplaceOutcome::Refused(Anomaly::incorrect("rtdb.directory/rename", "A deployment's name never changes"));
                 }
-                Ok(Cas::Conflict(Some(current)))
+                if current.version == expected {
+                    if let Err(error) = require_fork_stage_update(&current, &record) { return ReplaceOutcome::Refused(error); }
+                    if let Err(error) = require_transfer_update(&current, &record) { return ReplaceOutcome::Refused(error); }
+                    if let Err(error) = crate::require_writer_handoff_update(&current, &record) { return ReplaceOutcome::Refused(error); }
+                }
+                ReplaceOutcome::Conflict(Some(current))
             }
         }
     }
@@ -1321,14 +1408,14 @@ mod tests {
         let holder = MemberId::fresh();
         next.holder = Some(holder.clone());
         next.epoch = 1;
-        let held = writer.replace_deployment(next, packed.version).await.unwrap().applied().unwrap();
+        let held = writer.replace_deployment(next, packed.version).await.applied().unwrap();
         assert_eq!(reader.deployments_held_by(&holder).await.unwrap(), [held.clone()]);
         let mut parked = crate::park(&held, &holder, held.epoch).unwrap();
         parked.checkpoint = Some(crate::Checkpoint { block: 0, boundary: 2, source: 1, system_time: 65, root_sha256: None });
-        let parked = writer.replace_deployment(parked, held.version).await.unwrap().applied().unwrap();
+        let parked = writer.replace_deployment(parked, held.version).await.applied().unwrap();
         await_versions(&mut feed, std::slice::from_ref(&parked)).await;
         assert_eq!(reader.deployment(&parked.id).await.unwrap().as_ref(), Some(&parked));
-        assert!(matches!(writer.replace_deployment(packed, held.version).await.unwrap(), Cas::Conflict(Some(current)) if current == parked));
+        assert!(matches!(writer.replace_deployment(packed, held.version).await, ReplaceOutcome::Conflict(Some(current)) if current == parked));
     }
 
     #[tokio::test]
@@ -1367,10 +1454,10 @@ mod tests {
         let mut held = created.clone();
         held.holder = Some(holder.clone());
         held.epoch = 1;
-        let held = directory.replace_deployment(held, created.version).await.unwrap().applied().unwrap();
+        let held = directory.replace_deployment(held, created.version).await.applied().unwrap();
         assert_eq!(directory.deployments_held_by(&holder).await.unwrap(), vec![held.clone()]);
         let parked = crate::park(&held, &holder, held.epoch).unwrap();
-        directory.replace_deployment(parked, held.version).await.unwrap().applied().unwrap();
+        directory.replace_deployment(parked, held.version).await.applied().unwrap();
         assert_eq!(directory.deployments_held_by(&holder).await.unwrap(), vec![]);
     }
 
@@ -1454,7 +1541,7 @@ mod tests {
 
         record.epoch = 1;
         let version = record.version;
-        writer.replace_deployment(record, version).await.unwrap().applied().unwrap();
+        writer.replace_deployment(record, version).await.applied().unwrap();
         ready.store(true, std::sync::atomic::Ordering::Relaxed);
         drop(tokio::time::timeout(Duration::from_secs(10), watched.wait_for(|record| {
             record.as_ref().is_some_and(|record| record.epoch == 1)
@@ -1474,8 +1561,45 @@ mod tests {
 
         let mut changed = created.clone();
         changed.epoch = 1;
-        let changed = directory.replace_deployment(changed, created.version).await.unwrap().applied().unwrap();
+        let changed = directory.replace_deployment(changed, created.version).await.applied().unwrap();
         tokio::time::timeout(Duration::from_secs(5), watched.changed()).await.expect("the change arrives long before the next poll").unwrap();
         assert_eq!(watched.borrow().as_ref().unwrap().version, changed.version);
+    }
+
+    #[test]
+    fn write_error_classification_distinguishes_refusals_from_unknown_outcomes() {
+        use aws_sdk_dynamodb::error::ErrorMetadata;
+        use aws_sdk_dynamodb::operation::put_item::PutItemError;
+        use aws_sdk_dynamodb::types::error::{InternalServerError, ProvisionedThroughputExceededException, ResourceNotFoundException};
+
+        let meta = |code: &str| ErrorMetadata::builder().code(code).build();
+
+        let internal: SdkError<PutItemError, ()> = SdkError::service_error(
+            PutItemError::InternalServerError(InternalServerError::builder().meta(meta("InternalServerError")).build()),
+            (),
+        );
+        assert!(write_error_is_unknown(&internal));
+
+        let throttled: SdkError<PutItemError, ()> = SdkError::service_error(
+            PutItemError::ProvisionedThroughputExceededException(
+                ProvisionedThroughputExceededException::builder().meta(meta("ProvisionedThroughputExceededException")).build(),
+            ),
+            (),
+        );
+        assert!(!write_error_is_unknown(&throttled));
+
+        let missing_table: SdkError<PutItemError, ()> = SdkError::service_error(
+            PutItemError::ResourceNotFoundException(
+                ResourceNotFoundException::builder().meta(meta("ResourceNotFoundException")).build(),
+            ),
+            (),
+        );
+        assert!(!write_error_is_unknown(&missing_table));
+
+        let construction: SdkError<PutItemError, ()> = SdkError::construction_failure("bad request");
+        assert!(!write_error_is_unknown(&construction));
+
+        let timeout: SdkError<PutItemError, ()> = SdkError::timeout_error("timed out");
+        assert!(write_error_is_unknown(&timeout));
     }
 }

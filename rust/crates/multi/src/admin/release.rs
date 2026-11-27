@@ -4,7 +4,8 @@
 //! A release ends that custody early for one draining journal the deployment has moved off: it retires the copy on that journal, then drops the journal from the record under a release certificate in one conditional write.
 
 use rtdb_directory::{
-    Cas, CopyDependent, CopyObservation, DeploymentRecord, Directory, EnsembleHandoff, JournalCopyRelease, Lifecycle, LogkeeperDecommission,
+    CopyDependent, CopyObservation, DeploymentRecord, Directory, EnsembleHandoff, JournalCopyRelease, Lifecycle, LogkeeperDecommission,
+    ReplaceOutcome,
     MemberId, MemberRecord, MemberRole, MemberState, StorageRegion, copy_dependent, now_ms,
 };
 use rtdb_logkeeper::StreamConfig;
@@ -105,7 +106,11 @@ pub async fn release_journal_copy(directory: &dyn Directory, id: &str, journal: 
             journal: member.id.clone(), address: member.address.clone(), incarnation: record.incarnation, epoch: record.epoch,
             journal_epoch: member.eligibility_epoch, handoff, released_at_ms: now_ms(),
         });
-        if let Cas::Applied(stored) = directory.replace_deployment(next, record.version).await? { return Ok(stored); }
+        match directory.replace_deployment(next, record.version).await {
+            ReplaceOutcome::Applied(stored) => return Ok(stored),
+            ReplaceOutcome::Conflict(_) => {}
+            ReplaceOutcome::Refused(error) | ReplaceOutcome::Unknown(error) => return Err(error),
+        }
     }
     Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/journal-release-contended", format!("Deployment {id} kept changing while its copy on {journal} was being released")))
 }

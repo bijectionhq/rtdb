@@ -87,7 +87,7 @@ async fn next_change(changes: &mut Option<broadcast::Receiver<DeploymentRecord>>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Cas, ChangeFeed, MemberId, MemberRecord, MemoryDirectory, Version};
+    use crate::{Cas, ChangeFeed, MemberId, MemberRecord, MemoryDirectory, ReplaceOutcome, Version};
     use async_trait::async_trait;
     use parking_lot::Mutex;
     use rtdb_types::Result;
@@ -118,7 +118,7 @@ mod tests {
         async fn deployment_by_name(&self, name: &str) -> Result<Option<DeploymentRecord>> { self.inner.deployment_by_name(name).await }
         async fn deployments(&self) -> Result<Vec<DeploymentRecord>> { self.inner.deployments().await }
         async fn deployments_held_by(&self, member: &MemberId) -> Result<Vec<DeploymentRecord>> { self.inner.deployments_held_by(member).await }
-        async fn replace_deployment(&self, record: DeploymentRecord, expected: Version) -> Result<Cas<DeploymentRecord>> { self.inner.replace_deployment(record, expected).await }
+        async fn replace_deployment(&self, record: DeploymentRecord, expected: Version) -> ReplaceOutcome<DeploymentRecord> { self.inner.replace_deployment(record, expected).await }
         async fn register_member(&self, record: MemberRecord) -> Result<MemberRecord> { self.inner.register_member(record).await }
         async fn member(&self, id: &MemberId) -> Result<Option<MemberRecord>> { self.inner.member(id).await }
         async fn members(&self) -> Result<Vec<MemberRecord>> { self.inner.members().await }
@@ -137,7 +137,7 @@ mod tests {
         let created = inner.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
         let mut held = created.clone();
         held.epoch = 1;
-        let held = inner.replace_deployment(held, created.version).await.unwrap().applied().unwrap();
+        let held = inner.replace_deployment(held, created.version).await.applied().unwrap();
         let stale = created.clone();
         let directory = Arc::new(Scripted { replies: Mutex::new(vec![held.clone(), stale]), inner: inner.clone(), changes: None });
 
@@ -146,7 +146,7 @@ mod tests {
 
         let mut parked = held.clone();
         parked.epoch = 2;
-        let parked = inner.replace_deployment(parked, held.version).await.unwrap().applied().unwrap();
+        let parked = inner.replace_deployment(parked, held.version).await.applied().unwrap();
         assert_eq!(next_version(&mut receiver).await, parked.version, "the stale reply between them is never published");
         assert_eq!(receiver.borrow().as_ref().unwrap().epoch, 2);
     }
@@ -154,7 +154,7 @@ mod tests {
     async fn advanced(directory: &dyn Directory, record: &DeploymentRecord) -> DeploymentRecord {
         let mut next = record.clone();
         next.epoch += 1;
-        directory.replace_deployment(next, record.version).await.unwrap().applied().unwrap()
+        directory.replace_deployment(next, record.version).await.applied().unwrap()
     }
 
     #[tokio::test]

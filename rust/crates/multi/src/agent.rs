@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use rtdb_directory::{Cas, Checkpoint, CheckpointSuffixCustody, CheckpointSuffixPin, DeploymentRecord, Directory, Lifecycle, MAX_RETAINED_WORLDS, MemberId, MemberRecord, MemberState, Version, claim, effective_holder, now_ms, park, suspend_holding};
+use rtdb_directory::{Checkpoint, CheckpointSuffixCustody, CheckpointSuffixPin, DeploymentRecord, Directory, Lifecycle, MAX_RETAINED_WORLDS, MemberId, MemberRecord, MemberState, ReplaceOutcome, Version, claim, effective_holder, now_ms, park, suspend_holding};
 use rtdb_format::catalog::BlockCatalog;
 use rtdb_node::{Database, Node};
 use rtdb_replication::Role as DriverRole;
@@ -452,12 +452,13 @@ impl NodeAgent {
                 admitted = true;
             }
             next.storage_namespaces = Some(self.storage_namespaces);
-            match self.directory.replace_deployment(next, record.version).await? {
-                Cas::Applied(held) => {
+            match self.directory.replace_deployment(next, record.version).await {
+                ReplaceOutcome::Applied(held) => {
                     self.cancel_resident_deadline(&record);
                     return self.open(held, &members).await;
                 }
-                Cas::Conflict(_) => continue,
+                ReplaceOutcome::Conflict(_) => continue,
+                ReplaceOutcome::Refused(error) | ReplaceOutcome::Unknown(error) => return Err(error),
             }
         }
         Err(Anomaly::new(AnomalyCategory::Conflict, CLAIM_CONTENDED, format!("{name} kept changing while being claimed")))
@@ -879,7 +880,7 @@ impl NodeAgent {
                     next.lifecycle = Lifecycle::Quarantined;
                 }
             }
-            if let Ok(Cas::Applied(_)) = self.directory.replace_deployment(next, record.version).await { return; }
+            if let ReplaceOutcome::Applied(_) = self.directory.replace_deployment(next, record.version).await { return; }
         }
     }
 
@@ -1293,7 +1294,7 @@ impl NodeAgent {
             let Some(record) = self.directory.deployment(&id).await? else { break };
             if !is_requested(&record) { return Err(stale_handoff(name)); }
             let Some(parked) = park(&record, &self.member(), epoch) else { break };
-            if let Cas::Applied(_) = self.directory.replace_deployment(parked, record.version).await? {
+            if self.directory.replace_deployment(parked, record.version).await.into_applied()?.is_some() {
                 self.stop_serving(name).await;
                 drop(write_pause);
                 if moving.is_none() { self.wait_until_detached(name).await; }
@@ -1375,7 +1376,7 @@ impl NodeAgent {
                 return Err(stale_handoff(name));
             }
             let parked = park(&record, &member, record.epoch).expect("the resident holder matches");
-            if let Cas::Applied(_) = self.directory.replace_deployment(parked, record.version).await? {
+            if self.directory.replace_deployment(parked, record.version).await.into_applied()?.is_some() {
                 self.cancel_resident_deadline(&record);
                 return Ok(Response::Done);
             }
@@ -1406,7 +1407,7 @@ impl NodeAgent {
             let last_activity = now.saturating_sub(last_touch.elapsed().as_millis().min(i64::MAX as u128) as i64);
             let Some(suspended) = suspend_holding(&record, &member, expected.epoch, now, last_activity) else { return Ok(()) };
             if !unchanged() { return Ok(()); }
-            if let Cas::Applied(suspended) = self.directory.replace_deployment(suspended, record.version).await? {
+            if let Some(suspended) = self.directory.replace_deployment(suspended, record.version).await.into_applied()? {
                 if let Some(deadline) = self.resident_deadline(&suspended) {
                     self.resident_deadlines.lock().insert(deadline);
                 }
@@ -1637,14 +1638,15 @@ impl NodeAgent {
                 manifest: digest,
                 stable: prost::Message::encode_to_vec(proof),
             }));
-            match self.directory.replace_deployment(next, record.version).await? {
-                Cas::Applied(stored) => {
+            match self.directory.replace_deployment(next, record.version).await {
+                ReplaceOutcome::Applied(stored) => {
                     crate::hosted_recovery::observe_checkpoint(&stored, checkpoint, digest,
                         covered.decision().map(|proof| proof.certificate.statement.fingerprint()));
                     return Ok(Some((stored, checkpoint)));
                 }
-                Cas::Conflict(Some(current)) => record = current,
-                Cas::Conflict(None) => return Err(deposed()),
+                ReplaceOutcome::Conflict(Some(current)) => record = current,
+                ReplaceOutcome::Conflict(None) => return Err(deposed()),
+                ReplaceOutcome::Refused(error) | ReplaceOutcome::Unknown(error) => return Err(error),
             }
         }
         Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/checkpoint-contended", "The deployment kept changing while publishing its checkpoint"))

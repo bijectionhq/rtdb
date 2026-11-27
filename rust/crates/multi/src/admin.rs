@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use rtdb_directory::DeletionRecord;
-use rtdb_directory::{Cas, CellMedia, CellResidence, CellTransfer, CellTransferIntent, PreparedCellTransfer, RetiredResidence, DeletionFacts, DeploymentRecord, DisposalReceipt, DeletionObservation, DeletionInventory, ServingInventory, Directory, ForkPreparation, ForkPublication, Lifecycle, LineageChange, MemberId, MemberPool, MemberRecord, MemberRole, MemberState, PlacementMove, StorageNamespaces, effective_holder, now_ms};
+use rtdb_directory::{Cas, CellMedia, CellResidence, CellTransfer, CellTransferIntent, PreparedCellTransfer, RetiredResidence, DeletionFacts, DeploymentRecord, DisposalReceipt, DeletionObservation, DeletionInventory, ServingInventory, Directory, ForkPreparation, ForkPublication, Lifecycle, LineageChange, MemberId, MemberPool, MemberRecord, MemberRole, MemberState, PlacementMove, ReplaceOutcome, StorageNamespaces, effective_holder, now_ms};
 use rtdb_format::{catalog::BlockCatalog, keys::block_key};
 use rtdb_logkeeper::StreamConfig;
 use rtdb_storage::{IoRegion, ObjectStore, log::Log};
@@ -143,7 +143,7 @@ async fn update(directory: &dyn Directory, name: &str, change: impl Fn(&mut Depl
         let mut next = current.clone();
         change(&mut next)?;
         if next == current { return Ok(current); }
-        if let Cas::Applied(stored) = directory.replace_deployment(next, current.version).await? { return Ok(stored); }
+        if let Cas::Applied(stored) = directory.replace_deployment(next, current.version).await.into_cas()? { return Ok(stored); }
     }
     Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/update-contended", format!("{name} kept changing while being updated")))
 }
@@ -467,7 +467,7 @@ async fn clear_move_reservation(directory: &dyn Directory, id: &str, request: uu
         if !current.placement_move.as_ref().is_some_and(|reservation| reservation.request == request) { return Ok(()); }
         current.placement_move = None;
         let version = current.version;
-        if let Cas::Applied(_) = directory.replace_deployment(current, version).await? { return Ok(()); }
+        if let Cas::Applied(_) = directory.replace_deployment(current, version).await.into_cas()? { return Ok(()); }
     }
     Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/update-contended", "The deployment kept changing while clearing its move reservation"))
 }
@@ -912,7 +912,7 @@ async fn close_fork_stage(directory: &dyn Directory, mut stage: DeploymentRecord
     stage.epoch = stage.epoch.checked_add(1).ok_or_else(|| {
         Anomaly::fault("rtdb.multi/epoch-exhausted", format!("Installation {} has no remaining writer epochs", stage.id))
     })?;
-    directory.replace_deployment(stage, version).await?;
+    directory.replace_deployment(stage, version).await.into_cas()?;
     Ok(())
 }
 
@@ -1528,7 +1528,7 @@ async fn prepare_cell_move(
             }
         }
         let result = if let Some(prior) = prior_residence {
-            to.directory.replace_deployment(staged.clone(), prior.version).await
+            to.directory.replace_deployment(staged.clone(), prior.version).await.into_cas()
                 .and_then(|result| result.applied().ok_or_else(&conflict))
         } else {
             to.directory.create_deployment(staged.clone()).await
@@ -1735,12 +1735,22 @@ async fn change_installation_under_disposal(
         if next == current {
             return Ok(current);
         }
-        let replaced = match disposal {
-            Some(permit) => directory.settle_reference_disposal(permit, next, current.version).await,
-            None => directory.replace_deployment(next, current.version).await,
-        };
-        if let Cas::Applied(stored) = replaced.map_err(ChangeFailure::Unknown)? {
-            return Ok(stored);
+        match disposal {
+            Some(permit) => {
+                if let Cas::Applied(stored) = directory
+                    .settle_reference_disposal(permit, next, current.version)
+                    .await
+                    .map_err(ChangeFailure::Unknown)?
+                {
+                    return Ok(stored);
+                }
+            }
+            None => match directory.replace_deployment(next, current.version).await {
+                ReplaceOutcome::Applied(stored) => return Ok(stored),
+                ReplaceOutcome::Conflict(_) => {}
+                ReplaceOutcome::Refused(error) => return Err(ChangeFailure::NotApplied(error)),
+                ReplaceOutcome::Unknown(error) => return Err(ChangeFailure::Unknown(error)),
+            },
         }
     }
     Err(ChangeFailure::NotApplied(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/installation-contended", format!("Installation {id} kept changing"))))
@@ -1782,7 +1792,7 @@ pub async fn bind_journal_inventory(
     };
     record.replica_journals = record.replica_journals.into_iter().flat_map(&bind).collect();
     record.log_copy_servers = record.log_copy_servers.into_iter().flat_map(bind).collect();
-    directory.replace_deployment(record, expected).await?.applied().ok_or_else(changed)
+    directory.replace_deployment(record, expected).await.into_cas()?.applied().ok_or_else(changed)
 }
 
 /// Accepts serving disposal by fencing this installation in the directory.
@@ -2804,7 +2814,7 @@ mod tests {
             block, boundary: 0, source: 0, system_time: 1, root_sha256: catalog.publication_sha256(),
         });
         let version = record.version;
-        directory.replace_deployment(record, version).await.unwrap().applied().unwrap()
+        directory.replace_deployment(record, version).await.applied().unwrap()
     }
 
     #[tokio::test]
@@ -3129,7 +3139,7 @@ mod tests {
 
         let mut updated = source.clone();
         updated.read_width = 2;
-        let updated = directory.replace_deployment(updated, source.version).await.unwrap().applied().unwrap();
+        let updated = directory.replace_deployment(updated, source.version).await.applied().unwrap();
         let child = super::with_fork_access(directory.as_ref(), &storage, &keys, &source, None, |access|
             super::fork_with_tail(directory.clone(), &storage, access, &keys, &source,
                 super::ForkDestination { name: "child", org: None, hosted_task: None, broker: Some(&broker) }, None, Vec::new(), 4 << 20)).await.unwrap();
@@ -3139,7 +3149,7 @@ mod tests {
         let mut deleting = updated.clone();
         deleting.lifecycle = Lifecycle::Deleting;
         deleting.epoch += 1;
-        directory.replace_deployment(deleting, updated.version).await.unwrap().applied().unwrap();
+        directory.replace_deployment(deleting, updated.version).await.applied().unwrap();
         let error = super::with_fork_access(directory.as_ref(), &storage, &keys, &updated, None, |access|
             super::fork_with_tail(directory.clone(), &storage, access, &keys, &updated,
                 super::ForkDestination { name: "refused", org: None, hosted_task: None, broker: Some(&broker) }, None, Vec::new(), 4 << 20)).await.unwrap_err();

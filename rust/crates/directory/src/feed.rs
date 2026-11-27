@@ -183,7 +183,7 @@ pub(crate) mod tests {
                 for _ in 0..rounds {
                     record.epoch += 1;
                     let expected = record.version;
-                    record = directory.replace_deployment(record, expected).await.expect("replace").applied().expect("one writer per record");
+                    record = directory.replace_deployment(record, expected).await.applied().expect("one writer per record");
                 }
                 (record.id, record.version)
             });
@@ -267,7 +267,7 @@ pub(crate) mod tests {
         drop(receivers);
         let mut next = created.clone();
         next.epoch = 1;
-        let next = directory.replace_deployment(next, created.version).await.unwrap().applied().unwrap();
+        let next = directory.replace_deployment(next, created.version).await.applied().unwrap();
         let seen = tokio::time::timeout(Duration::from_secs(1), last.wait_for(|record| record.as_ref() == Some(&next))).await.unwrap().unwrap();
         drop(seen);
         drop(last);
@@ -288,7 +288,7 @@ pub(crate) mod tests {
             let version = created.version;
             let mut next = created;
             next.epoch += 1;
-            directory.replace_deployment(next, version).await.unwrap().applied().unwrap()
+            directory.replace_deployment(next, version).await.applied().unwrap()
         });
         let finished = tokio::time::timeout(Duration::from_secs(1), write).await;
         drop(snapshot);

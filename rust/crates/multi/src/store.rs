@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use prost_types::Any;
-use rtdb_directory::{Cas, CatalogAdmissionFloor, DeploymentRecord, Directory, Lifecycle, LineageChange, LineageRetirement, MemberId, MemberPool, MemberRole, MemberState, HostedTask, ReplayCustody, RetirementWork, StoragePublication, StorageRegion, now_ms};
+use rtdb_directory::{CatalogAdmissionFloor, DeploymentRecord, Directory, Lifecycle, LineageChange, LineageRetirement, MemberId, MemberPool, MemberRole, MemberState, HostedTask, ReplaceOutcome, ReplayCustody, RetirementWork, StoragePublication, StorageRegion, now_ms};
 use rtdb_format::{keys::StorageRoot, trie_retirement::InstalledRetirement};
 use rtdb_node::{AudienceReadStorage, OpenedRecoveryStore, OpenedServingStores, RemoteStorageFactory};
 use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectObservation, ObjectStore, ReadReservation, RetainedBytes, ObjectReadAllocation, object_store::{IndexPageLifecycle, StoredObject}, remote::PublicationJournal};
@@ -215,7 +215,11 @@ impl rtdb_s3::WriteAuthorization for ScopedWriter {
                 else { return Ok(()); };
             current.s3_write_lease_until_ms = Some(lease_until);
             let version = current.version;
-            if let Cas::Applied(_) = self.directory.replace_deployment(current, version).await? { return Ok(()); }
+            match self.directory.replace_deployment(current, version).await {
+                ReplaceOutcome::Applied(_) => return Ok(()),
+                ReplaceOutcome::Conflict(_) => {}
+                ReplaceOutcome::Refused(error) | ReplaceOutcome::Unknown(error) => return Err(error),
+            }
         }
         Err(Anomaly::new(rtdb_types::AnomalyCategory::Busy, "rtdb.multi/storage-lease-contended", "The deployment kept changing while recording a write session"))
     }
@@ -725,8 +729,10 @@ impl DirectoryPublications {
                 rejected: false, container: Some(fresh),
             });
             let version = record.version;
-            if let Cas::Applied(_) = self.directory.replace_deployment(record, version).await
+            if self.directory.replace_deployment(record, version).await
+                .into_applied()
                 .map_err(|error| publication_error(pack, error))?
+                .is_some()
             {
                 return Ok(Some(fresh));
             }
@@ -910,8 +916,10 @@ impl PublicationJournal for DirectoryPublications {
             // lost. Even when absent, bump this record's version so that
             // admission cannot land after we confirm it was never sent.
             let version = record.version;
-            if let Cas::Applied(_) = self.directory.replace_deployment(record, version).await
+            if self.directory.replace_deployment(record, version).await
+                .into_applied()
                 .map_err(|error| publication_error(key, error))?
+                .is_some()
             {
                 return Ok(());
             }
@@ -940,7 +948,7 @@ pub(crate) async fn release_region(directory: &dyn Directory, deployment: &str, 
             _ => { record.storage_regions.remove(&region); }
         }
         let version = record.version;
-        if let Cas::Applied(_) = directory.replace_deployment(record, version).await? {
+        if directory.replace_deployment(record, version).await.into_applied()?.is_some() {
             return Ok(());
         }
     }
@@ -2701,7 +2709,7 @@ mod tests {
         });
         current.recovery_manifest_sha256 = Some([1; 32]);
         let version = current.version;
-        let current = directory.replace_deployment(current, version).await.unwrap().applied().unwrap();
+        let current = directory.replace_deployment(current, version).await.applied().unwrap();
         let mut foreign = current.clone();
         foreign.storage_namespaces.as_mut().unwrap().objects = Uuid::new_v4();
         reap_as_of(bucket.as_ref(), &foreign, i64::MAX, Duration::ZERO, &refs).await.unwrap();
@@ -3033,11 +3041,11 @@ mod tests {
         store.put(&key("tables/orders/data/l01-before"), Bytes::from_static(b"data")).await.unwrap();
         let mut next = record.clone();
         next.epoch += 1;
-        let next = directory.replace_deployment(next, record.version).await.unwrap().applied().unwrap();
+        let next = directory.replace_deployment(next, record.version).await.applied().unwrap();
         store.put(&key("tables/orders/data/l01-after-move"), Bytes::from_static(b"data")).await.unwrap();
         let mut deleting = next.clone();
         deleting.lifecycle = Lifecycle::Deleting;
-        directory.replace_deployment(deleting, next.version).await.unwrap().applied().unwrap();
+        directory.replace_deployment(deleting, next.version).await.applied().unwrap();
         assert!(matches!(store.put(&key("tables/orders/data/l01-after-fence"), Bytes::from_static(b"data")).await, Err(Error::ReadOnlyLog(_))));
         assert_eq!(store.list(None).await.unwrap().len(), 2);
     }
@@ -3190,14 +3198,14 @@ mod tests {
         let mut record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
         record.epoch = 1;
         record.holder = Some(rtdb_directory::MemberId("holder".into()));
-        record = directory.replace_deployment(record.clone(), record.version).await.unwrap().applied().unwrap();
+        record = directory.replace_deployment(record.clone(), record.version).await.applied().unwrap();
         let store = FencedStore {
             inner: Arc::new(MemoryStore::default()), fence: Fence::Writer { epoch: 1 },
             directory: directory.clone(), deployment: record.id.clone(), prefix: record.storage_prefix(), local_publications: None, _release: None,
         };
         store.put(&key("blocks/a"), Bytes::from_static(b"a")).await.unwrap();
         record.epoch = 2;
-        directory.replace_deployment(record.clone(), record.version).await.unwrap().applied().unwrap();
+        directory.replace_deployment(record.clone(), record.version).await.applied().unwrap();
         assert!(matches!(store.put(&key("blocks/b"), Bytes::from_static(b"b")).await, Err(Error::Deposed { epoch: 1, promised: 2 })));
     }
 
@@ -3214,7 +3222,7 @@ mod tests {
         };
         store.put(&key("blocks/a"), Bytes::from_static(b"a")).await.unwrap();
         record.epoch = 2;
-        directory.replace_deployment(record.clone(), record.version).await.unwrap();
+        directory.replace_deployment(record.clone(), record.version).await.applied().unwrap();
         assert!(matches!(store.put(&key("blocks/b"), Bytes::from_static(b"b")).await, Err(Error::Deposed { epoch: 1, promised: 2 })), "a deposed holder writes nothing");
         assert!(store.delete(&key("blocks/a")).await.is_err(), "and releases nothing");
         assert_eq!(store.get(&key("blocks/a")).await.unwrap().as_ref(), b"a", "reads still serve its snapshots");
@@ -3707,7 +3715,7 @@ mod tests {
         assert_eq!(crate::replica_retention::replica_trim_through(8, first_required.unwrap()), Some(1));
         let version = current.version;
         current.checkpoint = Some(checkpoint(1));
-        let held = directory.replace_deployment(current, version).await.unwrap().applied().unwrap();
+        let held = directory.replace_deployment(current, version).await.applied().unwrap();
         let stale = storage_factory.open_for_recovery(&configuration(Some(0)), &key("v06"), IoRegion::new()).await.err().unwrap();
         assert_eq!(stale.code, CHECKPOINT_ADVANCED);
         let refs = crate::reference::References::default();
@@ -3918,12 +3926,12 @@ mod tests {
         assert_eq!(writer.authorize(None).await.unwrap_err().code, rtdb_node::NOT_HELD);
 
         record.epoch += 1;
-        record = directory.replace_deployment(record.clone(), record.version).await.unwrap().applied().unwrap();
+        record = directory.replace_deployment(record.clone(), record.version).await.applied().unwrap();
         assert_eq!(writer.authorize(None).await.unwrap_err().code, rtdb_node::NOT_HELD);
         compactor.authorize(None).await.unwrap();
 
         record.lifecycle = Lifecycle::Deleting;
-        directory.replace_deployment(record.clone(), record.version).await.unwrap().applied().unwrap();
+        directory.replace_deployment(record.clone(), record.version).await.applied().unwrap();
         assert_eq!(compactor.authorize(Some(latest + Duration::from_secs(30))).await.unwrap_err().code, rtdb_node::NOT_HELD);
         assert_eq!(directory.deployment(&record.id).await.unwrap().unwrap().s3_write_lease_until_ms, recorded);
     }

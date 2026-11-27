@@ -183,7 +183,7 @@ mod tests {
         let mut current = directory.deployment_by_name("shop").await.unwrap().unwrap();
         let version = current.version;
         current.log_copy_servers.push(JournalEndpoint::Member { address: "d:7000".into(), journal: "d".into() });
-        directory.replace_deployment(current, version).await.unwrap().applied().expect("an uncertified draining journal accepts references");
+        directory.replace_deployment(current, version).await.applied().expect("an uncertified draining journal accepts references");
         let member = directory.member(&MemberId("d".into())).await.unwrap().unwrap();
         assert!(!certifying_scan.iter().any(|record| retains_custody(record, &member)), "the scan predates the reference");
         let (deployments_sha256, deployments_checked) = checked(&certifying_scan);
@@ -215,7 +215,7 @@ mod tests {
         let certified = directory.member(&eligible.id).await.unwrap().unwrap();
         assert_eq!(certified.eligibility_epoch, eligible.eligibility_epoch + 2, "the drain and the certificate each move the epoch on");
 
-        let refused = directory.replace_deployment(stale_placement(&observed), observed.version).await.unwrap_err();
+        let refused = directory.replace_deployment(stale_placement(&observed), observed.version).await.refused().expect("certified journal refuses new references");
         assert_eq!(refused.code, "rtdb.directory/journal-retiring");
         let refused = directory.create_deployment(deployment("late", &["a", "d"])).await.unwrap_err();
         assert_eq!(refused.code, "rtdb.directory/journal-retiring", "an initial placement is fenced the same way");
@@ -228,7 +228,7 @@ mod tests {
     struct RaceDecommission {
         inner: std::sync::Arc<MemoryDirectory>,
         placement: parking_lot::Mutex<Option<DeploymentRecord>>,
-        placed: parking_lot::Mutex<Option<Result<rtdb_directory::Cas<DeploymentRecord>>>>,
+        placed: parking_lot::Mutex<Option<rtdb_directory::ReplaceOutcome<DeploymentRecord>>>,
     }
 
     #[async_trait::async_trait]
@@ -255,7 +255,7 @@ mod tests {
         async fn deployment_by_name(&self, name: &str) -> Result<Option<DeploymentRecord>> { self.inner.deployment_by_name(name).await }
         async fn deployments(&self) -> Result<Vec<DeploymentRecord>> { self.inner.deployments().await }
         async fn deployments_held_by(&self, id: &MemberId) -> Result<Vec<DeploymentRecord>> { self.inner.deployments_held_by(id).await }
-        async fn replace_deployment(&self, record: DeploymentRecord, expected: rtdb_directory::Version) -> Result<rtdb_directory::Cas<DeploymentRecord>> {
+        async fn replace_deployment(&self, record: DeploymentRecord, expected: rtdb_directory::Version) -> rtdb_directory::ReplaceOutcome<DeploymentRecord> {
             self.inner.replace_deployment(record, expected).await
         }
         async fn register_member(&self, member: MemberRecord) -> Result<MemberRecord> { self.inner.register_member(member).await }
@@ -287,7 +287,7 @@ mod tests {
 
         let retired = decommission_logkeeper(&race, &id).await.unwrap();
         let placed = race.placed.lock().take().expect("the placement raced the decommission");
-        assert_eq!(placed.unwrap_err().code, "rtdb.directory/journal-retiring");
+        assert_eq!(placed.refused().expect("raced placement is refused").code, "rtdb.directory/journal-retiring");
         assert!(matches!(retired.decommission, Some(LogkeeperDecommission::Decommissioned { .. })));
         assert!(!race.deployments().await.unwrap().iter().any(|record| record.names_journal(&retired)),
             "no deployment names a decommissioned logkeeper");

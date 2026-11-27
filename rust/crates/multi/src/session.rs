@@ -1172,7 +1172,7 @@ mod tests {
 
         record.epoch = 2;
         let version = record.version;
-        directory.replace_deployment(record, version).await.unwrap().applied().unwrap();
+        directory.replace_deployment(record, version).await.applied().unwrap();
         drop(session.record.as_mut().unwrap().wait_for(|snapshot| snapshot.as_ref().is_some_and(|snapshot| snapshot.epoch == 2)).await.unwrap());
         assert!(session.stale(&backend));
     }
@@ -1586,7 +1586,7 @@ mod tests {
             assert_eq!(tokio::time::timeout(Duration::from_secs(5), stale.read(&mut byte)).await.unwrap().unwrap(), 0);
             let mut next = record.clone();
             next.epoch += 1;
-            directory.replace_deployment(next, record.version).await.unwrap();
+            directory.replace_deployment(next, record.version).await.applied().unwrap();
         } else {
             send(&mut refusing, b'E', format!("SERROR\0C57P03\0M{}\0\0", rtdb_node::NOT_HELD).as_bytes()).await;
             if matches!(replacement, ReplacementKey::Expired) { send(&mut refusing, b'Z', b"I").await; }

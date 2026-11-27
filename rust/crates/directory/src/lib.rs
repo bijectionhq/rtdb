@@ -1577,6 +1577,58 @@ impl<T> Cas<T> {
     pub fn applied(self) -> Option<T> { match self { Self::Applied(value) => Some(value), Self::Conflict(_) => None } }
 }
 
+/// The outcome of a conditional deployment replace.
+///
+/// Unlike `Result<Cas<T>>`, every failure tells the caller whether the
+/// directory definitely refused the write (`Refused`) or lost the reply after
+/// the write may already have applied (`Unknown`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReplaceOutcome<T = DeploymentRecord> {
+    /// The replace applied; this is the stored record, with its new version.
+    Applied(T),
+    /// The version did not match; this is the current record, absent if there is none.
+    Conflict(Option<T>),
+    /// The directory definitely did not apply the replace.
+    Refused(Anomaly),
+    /// The replace was submitted without a definite reply, so it may or may not have applied.
+    Unknown(Anomaly),
+}
+
+impl<T> ReplaceOutcome<T> {
+    pub fn applied(self) -> Option<T> {
+        match self {
+            Self::Applied(value) => Some(value),
+            Self::Conflict(_) | Self::Refused(_) | Self::Unknown(_) => None,
+        }
+    }
+
+    pub fn into_cas(self) -> Result<Cas<T>> {
+        match self {
+            Self::Applied(value) => Ok(Cas::Applied(value)),
+            Self::Conflict(current) => Ok(Cas::Conflict(current)),
+            Self::Refused(error) | Self::Unknown(error) => Err(error),
+        }
+    }
+
+    pub fn into_applied(self) -> Result<Option<T>> {
+        self.into_cas().map(Cas::applied)
+    }
+
+    pub fn refused(self) -> Option<Anomaly> {
+        match self {
+            Self::Refused(error) => Some(error),
+            _ => None,
+        }
+    }
+
+    pub fn unknown(self) -> Option<Anomaly> {
+        match self {
+            Self::Unknown(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
 #[async_trait]
 pub trait AudienceSeatClaim: Send + Sync {
     async fn acquire(&self) -> Result<bool>;
@@ -1651,7 +1703,7 @@ pub trait Directory: Send + Sync {
     async fn deployments_held_by(&self, member: &MemberId) -> Result<Vec<DeploymentRecord>>;
     /// Replaces the record with `record` only if the stored version is `expected`; the stored version becomes `expected + 1`.
     /// The name of a deployment never changes.
-    async fn replace_deployment(&self, record: DeploymentRecord, expected: Version) -> Result<Cas<DeploymentRecord>>;
+    async fn replace_deployment(&self, record: DeploymentRecord, expected: Version) -> ReplaceOutcome<DeploymentRecord>;
 
     async fn rebind_classic_flight(&self, _previous: &classic_flight::Commission, _replacement: &classic_flight::Commission) -> Result<()> {
         Err(Anomaly::unsupported("rtdb.directory/classic-flight-rebind", "This directory cannot rebind a Classic Flight commission"))
@@ -2189,19 +2241,27 @@ impl MemoryDirectory {
         }
         Ok(())
     }
-    fn replace_record(&self, mut record: DeploymentRecord, expected: Version, disposal: Option<&ReferenceDisposal>) -> Result<Cas<DeploymentRecord>> {
-        let mut state = self.state()?;
+    fn replace_record(&self, mut record: DeploymentRecord, expected: Version, disposal: Option<&ReferenceDisposal>) -> ReplaceOutcome<DeploymentRecord> {
+        let mut state = match self.state() {
+            Ok(state) => state,
+            Err(error) => return ReplaceOutcome::Refused(error),
+        };
         let MemoryState { deployments, held, reference_revisions, members, .. } = &mut *state;
-        let Some(current) = deployments.get_mut(&record.id) else { return Ok(Cas::Conflict(None)); };
-        if current.version != expected { return Ok(Cas::Conflict(Some(current.as_ref().clone()))); }
-        if current.name != record.name { return Err(Anomaly::incorrect("rtdb.directory/rename", "A deployment's name never changes")); }
-        require_fork_stage_update(current, &record)?;
-        require_transfer_update(current, &record)?;
-        require_writer_handoff_update(current, &record)?;
-        journal_fence(Some(current), &record, members.values())?;
+        let Some(current) = deployments.get_mut(&record.id) else { return ReplaceOutcome::Conflict(None); };
+        if current.version != expected { return ReplaceOutcome::Conflict(Some(current.as_ref().clone())); }
+        if current.name != record.name {
+            return ReplaceOutcome::Refused(Anomaly::incorrect("rtdb.directory/rename", "A deployment's name never changes"));
+        }
+        if let Err(error) = require_fork_stage_update(current, &record) { return ReplaceOutcome::Refused(error); }
+        if let Err(error) = require_transfer_update(current, &record) { return ReplaceOutcome::Refused(error); }
+        if let Err(error) = require_writer_handoff_update(current, &record) { return ReplaceOutcome::Refused(error); }
+        if let Err(error) = journal_fence(Some(current), &record, members.values()) { return ReplaceOutcome::Refused(error); }
         if let Some(permit) = disposal {
             let references = reference_revisions.get(&permit.lineage).map(StoredLineage::state).unwrap_or_default();
-            let next = references.finish_disposal(permit, current, &record)?;
+            let next = match references.finish_disposal(permit, current, &record) {
+                Ok(next) => next,
+                Err(error) => return ReplaceOutcome::Refused(error),
+            };
             reference_revisions.insert(permit.lineage.clone(), StoredLineage::Current(next));
         }
         if current.holder != record.holder {
@@ -2217,9 +2277,11 @@ impl MemoryDirectory {
         }
         record.version = expected + 1;
         **current = record.clone();
-        self.persist(&mut state)?;
+        if let Err(error) = self.persist(&mut state) {
+            return ReplaceOutcome::Unknown(error);
+        }
         self.changes.publish(record.clone());
-        Ok(Cas::Applied(record))
+        ReplaceOutcome::Applied(record)
     }
 
     fn insert_deployment(&self, state: &mut MemoryState, mut record: DeploymentRecord,
@@ -2353,7 +2415,7 @@ impl Directory for MemoryDirectory {
         Ok(permit)
     }
     async fn settle_reference_disposal(&self, permit: &ReferenceDisposal, record: DeploymentRecord, expected: Version) -> Result<Cas<DeploymentRecord>> {
-        self.replace_record(record, expected, Some(permit))
+        self.replace_record(record, expected, Some(permit)).into_cas()
     }
     async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>> { Ok(self.state()?.deployments.get(id).map(Box::as_ref).cloned()) }
     async fn deployment_by_name(&self, name: &str) -> Result<Option<DeploymentRecord>> {
@@ -2469,7 +2531,7 @@ impl Directory for MemoryDirectory {
         Ok(activation.clone())
     }
 
-    async fn replace_deployment(&self, record: DeploymentRecord, expected: Version) -> Result<Cas<DeploymentRecord>> {
+    async fn replace_deployment(&self, record: DeploymentRecord, expected: Version) -> ReplaceOutcome<DeploymentRecord> {
         self.replace_record(record, expected, None)
     }
     async fn register_member(&self, mut record: MemberRecord) -> Result<MemberRecord> {
@@ -2636,6 +2698,29 @@ mod tests {
     #[tokio::test]
     async fn memory_directory_meets_the_contract() {
         contract::run(MemoryDirectory::new().as_ref()).await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_local_persist_is_unknown_and_subsequent_replaces_are_refused() {
+        let root = std::env::temp_dir().join(format!("rtdb-persist-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        MemoryDirectory::initialize(&root).unwrap();
+        let directory = MemoryDirectory::open(&root).unwrap();
+        let created = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
+        std::fs::create_dir(root.join("directory.pending")).unwrap();
+
+        let mut next = created.clone();
+        next.epoch = 1;
+        let unknown = directory.replace_deployment(next.clone(), created.version).await.unknown()
+            .expect("persist failure after state mutation is unknown");
+        assert_eq!(unknown.code, "rtdb.directory/state");
+
+        let refused = directory.replace_deployment(next, created.version + 1).await.refused()
+            .expect("a write blocked before mutation on an uncertain directory is refused");
+        assert_eq!(refused.code, "rtdb.directory/state-uncertain");
+
+        drop(directory);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

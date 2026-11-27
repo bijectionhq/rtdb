@@ -18,8 +18,9 @@ use super::{
     inconsistent, read_object, require_capture_open, unavailable, verified_archive,
 };
 use crate::{
-    admin::{begin_disposal, cell_media, installation_record, update_installation},
+    admin::{begin_disposal, cell_media, change_installation, installation_record, update_installation},
     deployment::CellStorage,
+    hold_release::ChangeFailure,
     keys::KeyService,
     reference::{PrefixedStore, key},
     store::{
@@ -393,7 +394,7 @@ where
             None => (),
         }
     }
-    let admitted = update_installation(directory, deployment, |record| {
+    let admitted = change_installation(directory, deployment, |record| {
         let first_required = admit(record)?;
         let mut state = state.clone();
         if let rtdb_directory::StorageRegion::Local { checkpoint_replay_from, .. }
@@ -405,8 +406,8 @@ where
         Ok(())
     })
     .await;
-    let uncertain = admitted.is_err();
-    let result = match admitted {
+    let uncertain = admitted.as_ref().is_err_and(ChangeFailure::may_have_applied);
+    let result = match admitted.map_err(rtdb_types::Anomaly::from) {
         Ok(record) => {
             let work = run(record, region, io.clone());
             if capture.is_some() {

@@ -207,31 +207,36 @@ impl Directory for ObservedDirectory {
         self.holder_queries.fetch_add(1, Ordering::Relaxed);
         self.inner.deployments_held_by(id).await
     }
-    async fn replace_deployment(&self, record: DeploymentRecord, expected: rtdb_directory::Version) -> Result<rtdb_directory::Cas<DeploymentRecord>> {
+    async fn replace_deployment(&self, record: DeploymentRecord, expected: rtdb_directory::Version) -> rtdb_directory::ReplaceOutcome<DeploymentRecord> {
         let anchor_reply = self.lost_anchor_reply.lock().unwrap().clone();
         let anchor_update = if let Some((epoch, gate)) = anchor_reply
             && record.epoch == epoch && record.replica_anchor.is_some()
-            && self.inner.deployment(&record.id).await?.is_some_and(|before| before.replica_anchor != record.replica_anchor)
-        { Some(gate) } else { None };
+        {
+            match self.inner.deployment(&record.id).await {
+                Ok(Some(before)) if before.replica_anchor != record.replica_anchor => Some(gate),
+                Ok(_) => None,
+                Err(error) => return rtdb_directory::ReplaceOutcome::Refused(error),
+            }
+        } else { None };
         let interrupted = || Anomaly::new(AnomalyCategory::Unavailable, "test/restore-interrupted", "Restore lost its directory response");
         if record.checkpoint_recovery.as_ref().is_some_and(|recovery| recovery.completed_at_ms.is_some())
             && self.restore_interruption.compare_exchange(2, 3, Ordering::Relaxed, Ordering::Relaxed).is_ok()
         {
-            return Err(interrupted());
+            return rtdb_directory::ReplaceOutcome::Unknown(interrupted());
         }
-        let result = self.inner.replace_deployment(record, expected).await?;
-        if matches!(&result, rtdb_directory::Cas::Applied(record) if record.lifecycle == Lifecycle::Restoring)
+        let result = self.inner.replace_deployment(record, expected).await;
+        if matches!(&result, rtdb_directory::ReplaceOutcome::Applied(record) if record.lifecycle == Lifecycle::Restoring)
             && self.restore_interruption.compare_exchange(1, 2, Ordering::Relaxed, Ordering::Relaxed).is_ok()
         {
-            return Err(interrupted());
+            return rtdb_directory::ReplaceOutcome::Unknown(interrupted());
         }
-        if let Some(gate) = anchor_update && matches!(&result, rtdb_directory::Cas::Applied(_)) {
+        if let Some(gate) = anchor_update && matches!(&result, rtdb_directory::ReplaceOutcome::Applied(_)) {
             gate.registered.notify_one();
             gate.resume.notified().await;
-            return Err(Anomaly::new(AnomalyCategory::Unavailable, "test/anchor-reply-lost", "The anchor update reply was lost"));
+            return rtdb_directory::ReplaceOutcome::Unknown(Anomaly::new(AnomalyCategory::Unavailable, "test/anchor-reply-lost", "The anchor update reply was lost"));
         }
         let opening = match &result {
-            rtdb_directory::Cas::Applied(record) if !record.storage_regions.is_empty() => {
+            rtdb_directory::ReplaceOutcome::Applied(record) if !record.storage_regions.is_empty() => {
                 let mut gate = self.opening_gate.lock().unwrap();
                 if gate.as_ref().is_some_and(|(deployment, _)| deployment == &record.id) {
                     gate.take().map(|(_, gate)| gate)
@@ -246,7 +251,7 @@ impl Directory for ObservedDirectory {
             gate.resume.notified().await;
         }
         let gate = match &result {
-            rtdb_directory::Cas::Applied(record) if record.storage_regions.values().any(|region| matches!(region, rtdb_directory::StorageRegion::ReplicaReplay { .. })) => {
+            rtdb_directory::ReplaceOutcome::Applied(record) if record.storage_regions.values().any(|region| matches!(region, rtdb_directory::StorageRegion::ReplicaReplay { .. })) => {
                 self.recovery_gate.lock().unwrap().take()
             }
             _ => None,
@@ -255,7 +260,7 @@ impl Directory for ObservedDirectory {
             gate.registered.notify_one();
             gate.resume.notified().await;
         }
-        Ok(result)
+        result
     }
     async fn register_member(&self, member: rtdb_directory::MemberRecord) -> Result<rtdb_directory::MemberRecord> { self.inner.register_member(member).await }
     async fn member(&self, id: &MemberId) -> Result<Option<rtdb_directory::MemberRecord>> { self.inner.member(id).await }
@@ -305,7 +310,7 @@ async fn idle_holdings_follow_the_shared_feed_without_reconcile_point_reads() {
     let version = record.version;
     record.holder = None;
     record.epoch += 1;
-    directory.inner.replace_deployment(record, version).await.unwrap().applied().unwrap();
+    directory.inner.replace_deployment(record, version).await.applied().unwrap();
     tokio::time::timeout(Duration::from_secs(2), async {
         while node.agent.held().contains_key("shop") { tokio::time::sleep(Duration::from_millis(20)).await; }
     }).await.expect("the holder observes the newer placement through the feed");
@@ -384,14 +389,14 @@ async fn the_local_directory_reopens_the_same_installation_and_fence() {
     let mut fenced = initial.clone();
     fenced.epoch += 1;
     fenced.lifecycle = Lifecycle::Deleting;
-    let fenced = directory.replace_deployment(fenced, initial.version).await.unwrap().applied().unwrap();
+    let fenced = directory.replace_deployment(fenced, initial.version).await.applied().unwrap();
     drop(directory);
 
     assert!(MemoryDirectory::initialize(state.path()).is_err());
     let directory = MemoryDirectory::open(state.path()).unwrap();
     assert_eq!(directory.deployment_by_name("shop").await.unwrap(), Some(fenced.clone()));
-    assert_eq!(directory.replace_deployment(initial.clone(), initial.version).await.unwrap(),
-        rtdb_directory::Cas::Conflict(Some(fenced)));
+    assert_eq!(directory.replace_deployment(initial.clone(), initial.version).await,
+        rtdb_directory::ReplaceOutcome::Conflict(Some(fenced)));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -539,7 +544,7 @@ async fn placement_status_counts_general_and_isolation_demand_separately() {
     let mut isolated = directory.deployment_by_name("isolated").await.unwrap().unwrap();
     isolated.lifecycle = rtdb_directory::Lifecycle::Quarantined;
     let version = isolated.version;
-    assert!(directory.replace_deployment(isolated, version).await.unwrap().applied().is_some());
+    assert!(directory.replace_deployment(isolated, version).await.applied().is_some());
     cell.node(0).agent.activate("shop").await.unwrap();
     cell.node(1).agent.activate("isolated").await.unwrap();
 
@@ -937,7 +942,7 @@ async fn the_hosted_source_barrier_refuses_a_missing_directory_checkpoint() {
     let mut record = directory.deployment(&history.to_string()).await.unwrap().unwrap();
     let expected_version = record.version;
     record.checkpoint = Some(rtdb_directory::Checkpoint { block: 7, boundary: 11, source: 11, system_time: 100, root_sha256: None });
-    assert!(matches!(directory.replace_deployment(record, expected_version).await.unwrap(), rtdb_directory::Cas::Applied(_)));
+    assert!(matches!(directory.replace_deployment(record, expected_version).await, rtdb_directory::ReplaceOutcome::Applied(_)));
 
     let refusal = client.simple_query("SHOW rtdb_hosted_source_barrier").await.unwrap_err();
     assert!(refusal.as_db_error().unwrap().message().contains("has not recovered the directory's durable checkpoint"));
@@ -1614,7 +1619,7 @@ async fn a_deployment_whose_activations_crash_is_quarantined_to_the_isolation_po
             let current = cell.directory.deployment(&record.id).await.unwrap().unwrap();
             let mut broken = current.clone();
             broken.ensemble = vec![MemberId("no-such-logkeeper".into())];
-            if cell.directory.replace_deployment(broken, current.version).await.unwrap().applied().is_some() {
+            if cell.directory.replace_deployment(broken, current.version).await.applied().is_some() {
                 break current.ensemble;
             }
             tokio::task::yield_now().await;
@@ -1630,7 +1635,7 @@ async fn a_deployment_whose_activations_crash_is_quarantined_to_the_isolation_po
 
     let mut repaired = quarantined.clone();
     repaired.ensemble = original_ensemble;
-    cell.directory.replace_deployment(repaired, quarantined.version).await.unwrap().applied().unwrap();
+    cell.directory.replace_deployment(repaired, quarantined.version).await.applied().unwrap();
     let isolated = cell.connect("shop").await;
     assert_eq!(cell.holder("shop").await, Some(1));
     let released = admin::unquarantine(cell.directory.as_ref(), "shop").await.unwrap();
@@ -1762,7 +1767,7 @@ async fn an_unopened_root_can_be_deleted_and_a_legacy_fenced_deletion_can_resume
             legacy.epoch += 1;
             legacy.lifecycle = Lifecycle::Deleting;
             legacy.storage_namespaces = None;
-            if let Some(fenced) = cell.directory.replace_deployment(legacy, version).await.unwrap().applied() {
+            if let Some(fenced) = cell.directory.replace_deployment(legacy, version).await.applied() {
                 break fenced;
             }
             tokio::task::yield_now().await;
@@ -2532,7 +2537,7 @@ async fn cold_snapshot_refuses_a_mismatched_recovery_manifest() {
             let mut current = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
             let version = current.version;
             current.recovery_manifest_sha256 = Some(digest);
-            if cell.directory.replace_deployment(current, version).await.unwrap().applied().is_some() {
+            if cell.directory.replace_deployment(current, version).await.applied().is_some() {
                 return;
             }
         }
@@ -4993,7 +4998,7 @@ async fn edit(directory: &Arc<dyn Directory>, id: &str, change: impl FnOnce(&mut
     let mut record = directory.deployment(id).await.unwrap().unwrap();
     let version = record.version;
     change(&mut record);
-    assert!(directory.replace_deployment(record, version).await.unwrap().applied().is_some());
+    assert!(directory.replace_deployment(record, version).await.applied().is_some());
 }
 
 async fn exercise_interrupted_replacement(case: Replacement) {

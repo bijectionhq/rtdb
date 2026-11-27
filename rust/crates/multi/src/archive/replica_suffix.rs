@@ -1411,7 +1411,7 @@ mod custody_tests {
             holder.epoch += 1;
             holder.holder = Some(MemberId::fresh());
             let version = holder.version;
-            let rtdb_directory::Cas::Applied(holder) = directory.replace_deployment(holder, version).await? else {
+            let rtdb_directory::ReplaceOutcome::Applied(holder) = directory.replace_deployment(holder, version).await else {
                 panic!("the transfer holder lost its placement");
             };
             let broker = Client::standalone(directory.clone(), broker_media.clone(), &storage, broker_keys.clone(), broker_tasks.clone())?;
