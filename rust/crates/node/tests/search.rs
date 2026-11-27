@@ -320,7 +320,7 @@ async fn verify_owned_search_artefacts(format: u32, wrapped: bool) {
     let settled: Vec<_> = catalog.current_tries(&table).into_iter().filter(|trie| trie.key.level() > 0).collect();
     assert!(!settled.is_empty(), "compaction produced no settled owned trie");
     assert!(settled.iter().all(|trie| trie.artefacts.iter().any(|record| {
-        record.kind() == "search" && record.definition_id().starts_with("owned-body~a")
+        record.kind() == "search" && record.definition_id().starts_with(&format!("owned-body~{}.a", rtdb_text::Analyzer::Simple))
             && record.definition_id().ends_with(&format!("f{format}"))
             && record.definition_version() == accepted.tx_key().tx_id.0
     })));
