@@ -138,12 +138,14 @@ pub struct CacheBudget {
     pools: AtomicU64,
     /// Reads any pool on this budget sent to its store, upstream's `memory-cache-misses`.
     misses: AtomicU64,
+    /// Record batches requested from any pool on this budget, upstream's `record-batch-requests`.
+    record_batch_requests: AtomicU64,
 }
 
 impl CacheBudget {
     pub fn new(limit: usize) -> Arc<Self> { Self::with_memory(MemoryBudget::new(limit)) }
     pub fn with_memory(memory: Arc<MemoryBudget>) -> Arc<Self> {
-        Arc::new(Self { memory, lru: Mutex::new(Lru::new()), pools: AtomicU64::new(0), misses: AtomicU64::new(0) })
+        Arc::new(Self { memory, lru: Mutex::new(Lru::new()), pools: AtomicU64::new(0), misses: AtomicU64::new(0), record_batch_requests: AtomicU64::new(0) })
     }
     pub fn prepaid_by(&self, parent: &Arc<MemoryBudget>) -> bool { self.memory.prepaid_by(parent) }
     pub fn retained_bytes(&self) -> usize { self.memory.used_bytes() }
@@ -151,6 +153,9 @@ impl CacheBudget {
     /// The reads, since the budget opened, that its pools could not serve from memory.
     pub fn misses(&self) -> u64 { self.misses.load(Ordering::Relaxed) }
     fn missed(&self) { self.misses.fetch_add(1, Ordering::Relaxed); }
+    /// Record batches requested, since the budget opened, from any pool on this budget.
+    pub fn record_batch_requests(&self) -> u64 { self.record_batch_requests.load(Ordering::Relaxed) }
+    pub fn record_batch_requested(&self) { self.record_batch_requests.fetch_add(1, Ordering::Relaxed); }
 
     fn limit_error(&self, requested: usize) -> Error {
         Error::MemoryLimit { requested, limit: self.limit_bytes(), retained: self.retained_bytes() }
@@ -311,6 +316,8 @@ impl BufferPool {
 
     pub fn retained_bytes(&self) -> usize { self.budget.retained_bytes() }
     pub fn budget(&self) -> &Arc<CacheBudget> { &self.budget }
+    /// Records a record-batch lookup against this pool's cache budget, upstream's `record-batch-requests`.
+    pub fn record_batch_requested(&self) { self.budget.record_batch_requested(); }
     pub fn scan_merge_gap(&self) -> u64 { self.scan_timing.merge_gap() }
     pub fn scan_byte_limit(&self) -> usize { self.memory.limit_bytes() }
 

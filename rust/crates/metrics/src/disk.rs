@@ -10,9 +10,13 @@ use crate::{MetricRegistration, Registry, step::ObservedCounter, wall_time_milli
 const TRAFFIC: [&str; 3] = ["disk-cache-misses", "buffer-pool.network.read", "buffer-pool.network.write"];
 fn traffic_totals(traffic: DiskCacheTraffic) -> [u64; 3] { [traffic.misses, traffic.network_read_bytes, traffic.network_write_bytes] }
 
+/// Upstream's `LocalStorage` / `RemoteBufferPool` memory-cache counters, in the order `memory_totals` lists them.
+const MEMORY_COUNTERS: [&str; 2] = ["memory-cache-misses", "record-batch-requests"];
+fn memory_totals(cache: &CacheBudget) -> [u64; 2] { [cache.misses(), cache.record_batch_requests()] }
+
 struct DiskCacheMetrics { cache: Weak<DiskCache>, memory: Arc<MemoryBudget>, traffic: Mutex<[ObservedCounter; 3]>, _reservation: Arc<MemoryReservation> }
-/// Upstream's `memory-cache-misses`, counted across every pool sharing the node's cache budget.
-struct MemoryCacheMetrics { cache: Weak<CacheBudget>, memory: Arc<MemoryBudget>, misses: Mutex<ObservedCounter>, _reservation: Arc<MemoryReservation> }
+/// Upstream's `memory-cache-misses` and `record-batch-requests`, counted across every pool sharing the node's cache budget.
+struct MemoryCacheMetrics { cache: Weak<CacheBudget>, memory: Arc<MemoryBudget>, counters: Mutex<[ObservedCounter; 2]>, _reservation: Arc<MemoryReservation> }
 impl Registry {
     /// The registration observes the cache without extending its lifetime.
     /// Retain the returned guard for as long as the cache's gauges should be published.
@@ -21,10 +25,11 @@ impl Registry {
         let now = wall_time_millis();
         self.register_provider(Arc::new(DiskCacheMetrics { cache: Arc::downgrade(&cache), memory: Arc::clone(&self.memory), traffic: Mutex::new([ObservedCounter::new(now); 3]), _reservation: reservation }))
     }
-    /// Publishes `memory-cache-misses` for the pools drawing on `cache`, without extending its lifetime.
+    /// Publishes `memory-cache-misses` and `record-batch-requests` for the pools drawing on `cache`, without extending its lifetime.
     pub fn register_memory_cache(&self, cache: &Arc<CacheBudget>) -> Result<MetricRegistration> {
         let reservation = self.memory.reserve(512)?;
-        self.register_provider(Arc::new(MemoryCacheMetrics { cache: Arc::downgrade(cache), memory: Arc::clone(&self.memory), misses: Mutex::new(ObservedCounter::new(wall_time_millis())), _reservation: reservation }))
+        let now = wall_time_millis();
+        self.register_provider(Arc::new(MemoryCacheMetrics { cache: Arc::downgrade(cache), memory: Arc::clone(&self.memory), counters: Mutex::new([ObservedCounter::new(now); 2]), _reservation: reservation }))
     }
 }
 impl DiskCacheMetrics {
@@ -55,21 +60,27 @@ impl CatalogMetrics for DiskCacheMetrics {
 }
 impl MemoryCacheMetrics {
     fn rows(&self, step: bool) -> Result<CatalogRows<CatalogMetric>> {
-        let reservation = self.memory.reserve(1024)?;
+        let reservation = self.memory.reserve(2048)?;
         let Some(cache) = self.cache.upgrade() else { return Ok(CatalogRows::new(Vec::new(), reservation)); };
-        let mut misses = self.misses.lock();
-        misses.observe(cache.misses());
-        let count = misses.value(wall_time_millis(), step);
-        Ok(CatalogRows::new(vec![CatalogMetric::Counter { name: "memory-cache-misses".into(), tags: BTreeMap::new(), count }], reservation))
+        let now = wall_time_millis();
+        let mut counters = self.counters.lock();
+        let mut rows = Vec::with_capacity(MEMORY_COUNTERS.len());
+        for ((name, counter), total) in MEMORY_COUNTERS.into_iter().zip(counters.iter_mut()).zip(memory_totals(&cache)) {
+            counter.observe(total);
+            rows.push(CatalogMetric::Counter { name: name.into(), tags: BTreeMap::new(), count: counter.value(now, step) });
+        }
+        Ok(CatalogRows::new(rows, reservation))
     }
 }
 #[async_trait::async_trait]
 impl CatalogMetrics for MemoryCacheMetrics {
     fn metrics(&self) -> Result<CatalogRows<CatalogMetric>> { self.rows(false) }
     fn roll_step(&self, now_ms: i64, closing: bool) {
-        let mut misses = self.misses.lock();
-        if let Some(cache) = self.cache.upgrade() { misses.observe(cache.misses()); }
-        misses.poll(now_ms, closing);
+        let totals = self.cache.upgrade().map(|cache| memory_totals(&cache));
+        for (index, counter) in self.counters.lock().iter_mut().enumerate() {
+            if let Some(totals) = totals { counter.observe(totals[index]); }
+            counter.poll(now_ms, closing);
+        }
     }
     async fn sample_step(&self) -> Result<CatalogRows<CatalogMetric>> { self.rows(true) }
 }
@@ -115,10 +126,16 @@ mod tests {
         let pool = rtdb_storage::cache::BufferPool::with_budget(store, Arc::clone(&budget));
         drop(pool.get(&key).await.unwrap());
         drop(pool.get(&key).await.unwrap());
-        let misses = |rows: &CatalogRows<CatalogMetric>| rows.rows().iter().find_map(|row| match row { CatalogMetric::Counter { name, count, .. } if name == "memory-cache-misses" => Some(*count), _ => None });
-        assert_eq!(misses(&registry.metrics().unwrap()), Some(1.0));
+        let counter = |rows: &CatalogRows<CatalogMetric>, expected: &str| rows.rows().iter().find_map(|row| match row { CatalogMetric::Counter { name, count, .. } if name == expected => Some(*count), _ => None });
+        assert_eq!(counter(&registry.metrics().unwrap(), "memory-cache-misses"), Some(1.0));
+        assert_eq!(counter(&registry.metrics().unwrap(), "record-batch-requests"), Some(0.0));
+        pool.record_batch_requested();
+        pool.record_batch_requested();
+        assert_eq!(counter(&registry.metrics().unwrap(), "record-batch-requests"), Some(2.0));
         registry.roll_step(wall_time_millis(), true);
-        assert_eq!(misses(&registry.sample_step().await.unwrap()), Some(1.0), "a provider with a counter steps rather than failing the exporter");
+        let step = registry.sample_step().await.unwrap();
+        assert_eq!(counter(&step, "memory-cache-misses"), Some(1.0), "a provider with a counter steps rather than failing the exporter");
+        assert_eq!(counter(&step, "record-batch-requests"), Some(2.0));
         drop(registration);
     }
 }

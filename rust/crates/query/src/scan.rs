@@ -72,6 +72,7 @@ impl DataFileReader {
     async fn decode_event_page(
         &mut self, page: usize, memory: &Arc<MemoryBudget>, projection: DataProjection<'_>, include_builder_bound: bool,
     ) -> Result<(arrow_array::RecordBatch, Arc<MemoryReservation>)> {
+        self.storage.record_batch_requested();
         self.open(memory).await?;
         let opened = self.opened.as_ref().expect("the data file is open");
         let reader = &opened.layout.decoder;
@@ -90,6 +91,7 @@ impl DataFileReader {
     async fn decode_scan_page(
         &mut self, page: usize, memory: &Arc<MemoryBudget>, put_columns: impl FnOnce() -> Vec<String>,
     ) -> Result<(Arc<IndexBatch>, Option<Arc<MemoryReservation>>)> {
+        self.storage.record_batch_requested();
         self.open(memory).await?;
         let opened = self.opened.as_ref().expect("the data file is open");
         let reader = &opened.layout.decoder;
@@ -130,6 +132,7 @@ impl DataFileReader {
     }
 
     async fn decode_spatial_page(&mut self, page: usize, memory: &Arc<MemoryBudget>, projection: PageProjection<'_>, expected_metadata: Option<&[u8]>) -> Result<(arrow_array::RecordBatch, Arc<MemoryReservation>)> {
+        self.storage.record_batch_requested();
         self.open(memory).await?;
         let opened = self.opened.as_ref().expect("the data file is open");
         let reader = &opened.layout.decoder;
@@ -238,6 +241,7 @@ pub async fn visit_trie_iids(
     for page in 0..pages {
         context.check_cancelled()?;
         if let Some(held) = file.storage.view::<CachedPage>(&file.key, View::Page(page)) {
+            file.storage.record_batch_requested();
             let batch = held.batch.view();
             if batch.len() > limit - rows { return Ok(None); }
             visit_iids(context, batch.iids()?, &mut visit)?;
@@ -408,6 +412,7 @@ pub(crate) async fn primary_point_events(
         }
         let (batch, _charged) = match held {
             Some(held) => {
+                file.storage.record_batch_requested();
                 audience_work::decode_bytes(held.bound)?;
                 (held.batch.view().clone(), memory.reserve(held.bound)?)
             }
@@ -1956,6 +1961,7 @@ impl ScanVerifier<'_> {
                 let cached = (!memory.is_prepaid()).then(|| file.storage.view::<CachedPage>(&file.key, View::Page(page as usize))).flatten();
                 let batch = match cached {
                     Some(cached) => {
+                        file.storage.record_batch_requested();
                         audience_work::decode_bytes(cached.bound)?;
                         Arc::clone(&cached.batch)
                     }
@@ -2311,7 +2317,8 @@ impl PartitionScan {
         };
         let rows = match (&page.source, hit) {
             (PageSource::Live { table, rows }, _) => ActiveRows::Live { table: Arc::clone(table), rows: Arc::clone(rows) },
-            (PageSource::File { .. }, Some(held)) => {
+            (PageSource::File { file, .. }, Some(held)) => {
+                self.files.entries[*file].reader.storage.record_batch_requested();
                 if !self.execution.context.spatial_refinement {
                     audience_work::decode_bytes(held.bound)?;
                     charge = Some(self.execution.context.memory.reserve(held.bound)?);
