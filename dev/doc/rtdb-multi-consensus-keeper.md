@@ -81,6 +81,9 @@ A cached grant expires at the earlier of its original monotonic deadline and the
 The authority assumes a bound of 250 milliseconds on real-time clock offset across all its participants.
 
 Every member serving an activated database name must enforce the same authority.
+Commission every serving endpoint with the activation configuration before accepting client traffic.
+Keep the authority in a failure domain separate from both the predecessor and the successor.
+The current implementation gives grant renewals and operator actions the same underlying journal write capability and assumes trusted participants.
 The runtime gates client operations, peer writes, journal mutations, and retained result delivery on the incarnation's grant.
 Transactions with an external custody or erasure effect, funded dispatch, and the existing local catalog's create, erase and checkpoint-transfer operations return an explicit refusal in activation mode.
 Those capabilities require separately commissioned effect fences before they can serve an activated database name.
@@ -93,6 +96,7 @@ All replicas of the authority protect its state against rewind and survive failu
 `rtdb multi-activation` supplies `bootstrap`, `status`, `freeze`, and `publish` operator actions.
 `freeze` and `publish` compare the expected incarnation and activation revision.
 `publish` independently opens the stopped destination, reads its committed portable restore, and binds the successor to that proof.
+If the predecessor still holds a serving grant, retry with the same operation ID after the grant window closes.
 A local rehearsal can use an exclusively opened authority file in the same process as its participating runtimes.
 Separate development processes can use a loopback immutable consensus authority through the installed activation environment variables.
 
@@ -194,3 +198,13 @@ python3 bench/v1_journal_comparison.py --rtdb target/release/rtdb \
 
 The process run needs OpenSSL, PyArrow and a release `logkeeper` built with
 the `stream` feature at the pinned revision.
+
+To qualify a local Logkeeper change before the Git dependency is published, pass a Cargo override containing both workspace crates:
+
+```toml
+[patch."https://github.com/bijectionhq/logkeeper.git"]
+logkeeper = { path = "/path/to/logkeeper" }
+journal-contract = { path = "/path/to/logkeeper/contract" }
+```
+
+Use `cargo --config /path/to/local-logkeeper.toml test ...` and keep the lockfile changes local to the qualification.
