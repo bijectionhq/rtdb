@@ -151,7 +151,7 @@ Separate development processes can use a loopback immutable consensus authority 
 `rtdb multi-backup export` captures a settled cut from a stopped, initialized development deployment, using its journal and object store to verify the current checkpoint dependencies.
 For an ordinary inline cut, the archive carries the complete checkpoint and retained receipt index under the source key generation.
 Its authenticated header binds the source incarnation, basis, system time, and journal position.
-The archive contains no key material.
+The archive contains a wrapped data key. The source generation key remains in its vault.
 
 `rtdb multi-backup restore` reads the archive with an explicitly supplied source key vault and installs the cut into a fresh development incarnation and journal stream.
 The source journal, object store, and process can be absent.
