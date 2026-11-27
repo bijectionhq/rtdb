@@ -20,7 +20,7 @@ pub use store_filter::ValueFilter;
 
 /// SHA-256 of Bijection's `crates/store_read/src/derive.rs`, vendored verbatim
 /// as `rust/vendor/bijection-store-derive/src/lib.rs`.
-pub const DERIVE_DIGEST: &str = "393bb8281a901e3edcc1c8cfff3e1837563e567920a4b04c58636193c7a6649b";
+pub const DERIVE_DIGEST: &str = "a6dc8ba5abd7044dd63137f324b267faa2d7bd117d7311e2d83462aaa0d02a88";
 
 pub const STORE_SCHEMA: &str = "store";
 pub const STORE_RELATION: &str = "entries";

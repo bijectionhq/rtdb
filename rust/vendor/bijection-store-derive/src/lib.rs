@@ -13,7 +13,7 @@
 //! maintenance rule covers every write, and conflicts and wakes are exact per
 //! row: a write that leaves an entry unchanged writes no key for it.
 //!
-//! Five entry kinds, five exact laws:
+//! Six entry kinds, six exact laws:
 //! - [`EntryKind::Marker`] (path and posting entries): a stamped enter where
 //!   coverage begins and a stamped leave marker (empty value) where an entry
 //!   the new image does not re-enter loses coverage. Readers resolve each
@@ -23,6 +23,14 @@
 //!   reach the line's horizon (the furthest valid instant any of its writes
 //!   asserted), so the store emits exactly the multiset difference of that
 //!   live set: an identical re-put emits nothing.
+//! - [`EntryKind::Present`] (presence counts, D23 row facts): a stamped
+//!   precomputed delta like a statistic's, live while ANY segment of the
+//!   line holds it. The row contributes each such entry once, however many
+//!   of its valid-time slices hold it, so a count over a valid-timed row
+//!   (a bounded period or a switching copy, whose every segment is a
+//!   current slice) counts the row while some slice holds the value, not
+//!   only its latest one. The store emits exactly the difference of that
+//!   distinct live set.
 //! - [`EntryKind::Edged`] (timeline aggregates, the D63 boundary deltas): a
 //!   record keyed by its valid-time edge, `identity ‖ ordered(edge) ‖ stamp ‖
 //!   ordinal`, `+v` where coverage begins and `−v` where it ends (an open end
@@ -230,6 +238,14 @@ pub enum EntryKind {
     /// line's horizon: enter writes `identity ‖ stamp ‖ ordinal →
     /// enter_value`, leave writes `identity ‖ stamp ‖ ordinal → leave_value`.
     Boundary,
+    /// Presence count delta (D23 row facts), live while any segment of the
+    /// line holds it, each distinct entry once: enter writes `identity ‖
+    /// stamp ‖ ordinal → enter_value` when the line comes to hold it, leave
+    /// writes `identity ‖ stamp ‖ ordinal → leave_value` when no segment
+    /// holds it any more. For a line whose every segment is a current slice
+    /// (a valid-timed row); an acceptance row's line keeps its superseded
+    /// versions as earlier segments, so its presence is a [`Self::Boundary`].
+    Present,
     /// Timeline aggregate delta, keyed by valid-time edge: coverage of
     /// `[from, to)` writes `identity ‖ ordered(from) ‖ stamp ‖ ordinal →
     /// enter_value` and, when `to` is not [`OPEN_END`], `identity ‖
@@ -272,7 +288,7 @@ pub struct DeriveEntry {
     /// Value written where coverage begins.
     pub enter_value: Vec<u8>,
     /// Value written where coverage ends (`[]` for `Marker` and `Single`,
-    /// the negated delta for `Boundary` and `Edged`).
+    /// the negated delta for `Boundary`, `Present` and `Edged`).
     pub leave_value: Vec<u8>,
 }
 
@@ -344,10 +360,10 @@ pub struct Manifest {
     pub segments: Vec<Segment>,
     /// The furthest valid instant any write of the row asserted
     /// (`i64::MIN` for an empty line): a `Boundary` entry is live while its
-    /// segment reaches it.
+    /// segment reaches it (a `Present` entry while any segment holds it).
     pub horizon: i64,
     /// Every concrete key this step emitted: `Marker` enters and leaves,
-    /// `Single` keys, `Boundary` deltas and unretained `Edged` records (the
+    /// `Single` keys, `Boundary` and `Present` deltas and unretained `Edged` records (the
     /// exact inventory `Purge` deletes across history, so no erased value or
     /// contribution survives in any index, statistic or aggregate at any
     /// cut). Retained `Edged` records are never listed: they outlive erasure.
@@ -1045,15 +1061,30 @@ fn record(written_keys: &mut Vec<Vec<u8>>, retain: bool, key: &[u8]) {
     }
 }
 
-/// The `Boundary` entries live on a line: those of segments reaching its
-/// horizon, as `(identity, enter, leave)`.
+/// The counted entries live on a line, as `(identity, enter, leave)`: each
+/// `Boundary` entry of a segment reaching its horizon (a multiset), and each
+/// distinct `Present` entry some segment holds, once. A compaction base at a
+/// cut folded in exactly the live entries of the row's line as of that cut
+/// ([`line_through`]), which the engine subtracts when the row is purged.
 #[cfg_attr(verus_keep_ghost, verifier::external)]
-fn live_boundaries(segments: &[Segment], horizon: i64) -> Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> {
-    segments
-        .iter()
-        .filter(|segment| segment.kind == EntryKind::Boundary && segment.to == horizon)
-        .map(|segment| (segment.identity.clone(), segment.enter_value.clone(), segment.leave_value.clone()))
-        .collect()
+pub fn live_counts(segments: &[Segment], horizon: i64) -> Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let mut present: Vec<&Segment> = Vec::new();
+    let mut live = Vec::new();
+    for segment in segments {
+        let held = match segment.kind {
+            EntryKind::Boundary => segment.to == horizon,
+            EntryKind::Present if present.iter().any(|seen| same_entry(seen, segment)) => false,
+            EntryKind::Present => {
+                present.push(segment);
+                true
+            },
+            _ => false,
+        };
+        if held {
+            live.push((segment.identity.clone(), segment.enter_value.clone(), segment.leave_value.clone()));
+        }
+    }
+    live
 }
 
 /// Apply one `DeriveMode::Replace` step to the row's previous line (which
@@ -1167,7 +1198,7 @@ pub fn apply(
                 }
             },
             // The live set's difference, below.
-            EntryKind::Boundary => {},
+            EntryKind::Boundary | EntryKind::Present => {},
             EntryKind::Edged { .. } | EntryKind::Claim => {
                 let retain = segment.kind == (EntryKind::Edged { retain: true });
                 let overlap_from = segment.from.max(interval.from);
@@ -1215,7 +1246,7 @@ pub fn apply(
                 written_keys.push(key.clone());
                 writes.push(put(key, entry.enter_value.clone()));
             },
-            EntryKind::Boundary => {},
+            EntryKind::Boundary | EntryKind::Present => {},
             EntryKind::Edged { .. } | EntryKind::Claim => {
                 let retain = entry.kind == (EntryKind::Edged { retain: true });
                 let key = edged_key(&entry.identity, entry.from, &stamp, ordinal);
@@ -1246,10 +1277,10 @@ pub fn apply(
         next.push(entry);
     }
 
-    // 6. Statistics: the live set changes by exactly its multiset
-    //    difference, so an unchanged document writes nothing.
-    let before = live_boundaries(&prev, previous.horizon);
-    let mut after = live_boundaries(&next, horizon);
+    // 6. Statistics and presence counts: the live set changes by exactly
+    //    its multiset difference, so an unchanged document writes nothing.
+    let before = live_counts(&prev, previous.horizon);
+    let mut after = live_counts(&next, horizon);
     for (identity, _, leave) in before {
         if let Some(index) = after.iter().position(|(other, _, other_leave)| *other == identity && *other_leave == leave) {
             after.remove(index);
@@ -1484,6 +1515,7 @@ fn encode_kind(kind: EntryKind) -> u8 {
         EntryKind::Edged { retain: false } => 5,
         EntryKind::Edged { retain: true } => 6,
         EntryKind::Claim => 7,
+        EntryKind::Present => 8,
     }
 }
 
@@ -1497,6 +1529,7 @@ fn decode_kind(tag: u8) -> Result<EntryKind, DeriveError> {
         5 => Ok(EntryKind::Edged { retain: false }),
         6 => Ok(EntryKind::Edged { retain: true }),
         7 => Ok(EntryKind::Claim),
+        8 => Ok(EntryKind::Present),
         _ => Err(DeriveError::new("Unknown derive entry kind")),
     }
 }
@@ -1866,6 +1899,30 @@ mod tests {
         assert_eq!(second.writes.iter().map(|w| w.value.clone()).collect::<Vec<_>>(), vec![Some(vec![0x81]), Some(vec![2])], "old document out, new in");
         let deleted = apply(&prefix(), &second.manifest, ValidInterval { from: 30, to: OPEN_END }, &[], stamp(30, 3), DERIVE_ORDINAL_BASE);
         assert_eq!(deleted.writes.iter().map(|w| w.value.clone()).collect::<Vec<_>>(), vec![Some(vec![0x82])], "a delete takes the live document out");
+    }
+
+    #[test]
+    fn presence_counts_a_valid_timed_row_once_while_any_slice_holds_it() {
+        let present = entry(EntryKind::Present, PERSISTENCE, b"presence", &[1], &[0x81]);
+        let values = |applied: &Applied| applied.writes.iter().map(|w| w.value.clone()).collect::<Vec<_>>();
+        // Two slices hold the value: the row counts once.
+        let first = apply(&prefix(), &Manifest::empty(), ValidInterval { from: 10, to: 20 }, std::slice::from_ref(&present), stamp(1, 1), DERIVE_ORDINAL_BASE);
+        assert_eq!(values(&first), vec![Some(vec![1])]);
+        let second = apply(&prefix(), &first.manifest, ValidInterval { from: 20, to: 30 }, std::slice::from_ref(&present), stamp(2, 2), DERIVE_ORDINAL_BASE);
+        assert!(second.writes.is_empty(), "a second slice holding it counts nothing more");
+        // The latest slice drops it; an earlier slice still holds it, so the
+        // row still counts (a horizon rule would count it out here).
+        let third = apply(&prefix(), &second.manifest, ValidInterval { from: 20, to: 30 }, &[], stamp(3, 3), DERIVE_ORDINAL_BASE);
+        assert!(third.writes.is_empty(), "the earlier slice keeps the row counted");
+        let boundary = entry(EntryKind::Boundary, PERSISTENCE, b"presence", &[1], &[0x81]);
+        let horizon = apply(&prefix(), &Manifest::empty(), ValidInterval { from: 10, to: 20 }, std::slice::from_ref(&boundary), stamp(1, 1), DERIVE_ORDINAL_BASE);
+        let horizon = apply(&prefix(), &horizon.manifest, ValidInterval { from: 20, to: 30 }, &[], stamp(3, 3), DERIVE_ORDINAL_BASE);
+        assert_eq!(values(&horizon), vec![Some(vec![0x81])], "a Boundary counts only the slice at the horizon");
+        // No slice holds it any more: the row counts out once.
+        let fourth = apply(&prefix(), &third.manifest, ValidInterval { from: 0, to: 40 }, &[], stamp(4, 4), DERIVE_ORDINAL_BASE);
+        assert_eq!(values(&fourth), vec![Some(vec![0x81])]);
+        assert_eq!(live_counts(&fourth.manifest.segments, fourth.manifest.horizon), Vec::new());
+        assert_eq!(Manifest::decode(&second.manifest.encode()).unwrap(), second.manifest, "the kind round-trips");
     }
 
     #[test]
