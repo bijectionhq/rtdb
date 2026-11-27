@@ -815,6 +815,7 @@ async fn start_disposal_node(
 
 #[test]
 fn installed_owned_reads_hold_their_cut_and_retry_a_discarded_reply() {
+    const WORKFLOW_DEADLINE: Duration = Duration::from_secs(60);
     std::thread::Builder::new().stack_size(rtdb_node::WORKER_STACK_BYTES).spawn(|| {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
@@ -824,7 +825,8 @@ fn installed_owned_reads_hold_their_cut_and_retry_a_discarded_reply() {
             .unwrap();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             runtime.block_on(async {
-                tokio::time::timeout(DEADLINE, exercise_installed_owned_reads()).await.unwrap();
+                tokio::time::timeout(WORKFLOW_DEADLINE, exercise_installed_owned_reads()).await
+                    .expect("installed owned reads and node shutdown should finish within the workflow deadline");
             });
         }));
         runtime.shutdown_timeout(DEADLINE);
