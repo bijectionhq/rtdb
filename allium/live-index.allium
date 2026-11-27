@@ -66,6 +66,7 @@
 --        THIS is where a committed transaction becomes queryable, and where an external caller's durability handle completes.
 --
 --   Resolution and apply never interleave, so a transaction is never half-applied.
+--   A source batch resolves back to back; what is read back meanwhile is held and applied once the batch is resolved (db.allium, Leader pipelining).
 --   Applying does not refresh the shared snapshot: that is a lazily-advanced cache, rebuilt on the next demanding read (see RefreshSharedSnapshot).
 --
 --   A FOLLOWER has no resolver and no read-back: the messages it imports are already durable, so it advances the durable head directly.

@@ -124,6 +124,10 @@
 --   That read-back IS the fence.
 --   Four stages: RESOLVE a transaction against what the leader already holds and stage it; APPEND it to the replica log, stamped with the term and its position within the term; READ BACK, this node's own replica read delivering each record to whichever role is live; APPLY what the fence admits.
 --   Resolution and apply never interleave, so a transaction is never half-applied.
+--   Both reads deliver a batch, as upstream's poll does: the records durable when the read begins.
+--   A source batch resolves back to back, holding the records read back meanwhile until it is resolved or the leader stops resolving it.
+--   A replica batch is applied in log order before the next read, so the writers whose records one flush made durable are answered together.
+--   That keeps the transactions one flush carried together into the next, so each flush carries every commit queued behind it.
 --   Staging, ownership and the durability handles: live-index.allium. The role lifecycle, the claim and the term: log-processor-lifecycle.allium.
 --
 -- A native hosted Proposal source record carries the ordered operations for preparation by the installed writer at the authenticated durable predecessor.
@@ -1218,6 +1222,7 @@ rule ClientSubmitsTransactionToExternalSourceDb {
 -- Nothing here touches the durable live index and nothing here advances the watchers: both follow from apply, on read-back.
 -- Resolution therefore runs AHEAD of durability.
 --
+-- A source batch is the records durable when its first record begins resolving.
 -- At the start of each source batch the leader checks the block flush timeout.
 -- A batch that a block cut pauses part-way is set aside and resumed after the upload, and is reported complete only once fully drained, so that source delivery stays in step with resolution.
 

@@ -1095,6 +1095,42 @@ async fn source_transaction_reads_back_applies_flushes_and_recovers() {
 }
 
 #[tokio::test]
+async fn a_source_batch_resolves_back_to_back_before_its_read_back_applies() {
+    // As upstream's SourceLogProcessor: each record of the batch starts resolving as the previous one finishes, and
+    // what is read back meanwhile is held until the whole batch has been resolved.
+    let mut fixture = fixture(ReplicationConfig { idle_heartbeat: false, ..Default::default() }, 1 << 27).await;
+    let opening = raw(0, 1, 0, ReplicaBody::NoOp(proto::NoOp::default()));
+    fixture.replica.enqueue(opening.payload.clone(), opening.metadata.timestamp).await.unwrap().durable().await.unwrap();
+    fixture.driver.consume(opening).await.unwrap();
+    fixture.driver.promote().await.unwrap();
+    for id in 0..3 {
+        let documents = Documents::new(vec![StructFields::from([("_id".into(), Value::I64(id))])], &fixture.memory).unwrap();
+        let transaction = SourceTransaction::new(vec![TxOp::PutDocs { table: TableRef::new("public", "docs"), documents, valid_from: Some(Timestamp(0)), valid_to: None }], SubmitOptions::default(), &fixture.memory).unwrap();
+        fixture.handle.submit_source_encoded(transaction.encode().unwrap().into_bytes(), Timestamp(100 + id)).await.unwrap();
+    }
+    let records = fixture.source.read_range(LogOffset(0), LogOffset(3)).await.unwrap();
+    let leader = fixture.driver.leader.as_mut().unwrap();
+    leader.source_batch.extend(records);
+    leader.source_batch_end = Some(fixture.logs.latest_source_position().unwrap());
+    fixture.driver.resolve_next_source().await.unwrap();
+    let mut replica = fixture.replica.tail(LogOffset(0)).await.unwrap();
+    for resolved in 1..3 {
+        let (resolver, result) = super::pending_resolution(&mut fixture.driver.leader.as_mut().unwrap().resolution).await;
+        fixture.driver.resolution_finished(resolver, result).await.unwrap();
+        assert!(fixture.driver.leader.as_ref().unwrap().resolution.is_some(), "the batch's next record resolves at once");
+        fixture.driver.consume(next_local_record(replica.as_mut()).await).await.unwrap();
+        assert_eq!(fixture.driver.leader.as_ref().unwrap().held.len(), resolved);
+        assert_eq!(fixture.handle.progress().current().tx_id(), TxId(-1));
+    }
+    let (resolver, result) = super::pending_resolution(&mut fixture.driver.leader.as_mut().unwrap().resolution).await;
+    fixture.driver.resolution_finished(resolver, result).await.unwrap();
+    let leader = fixture.driver.leader.as_ref().unwrap();
+    assert!(leader.resolution.is_none() && leader.held.is_empty() && leader.source_batch_end.is_none());
+    assert_eq!(fixture.handle.progress().current().tx_id(), TxId(1));
+    fixture.driver.demote().await.unwrap();
+}
+
+#[tokio::test]
 async fn block_production_records_the_upload_timer_once_the_block_is_appended() {
     #[derive(Default)]
     struct Timers(Mutex<Vec<rtdb_plan::ExecutionTimer>>);

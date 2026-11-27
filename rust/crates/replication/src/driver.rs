@@ -478,6 +478,10 @@ struct LeaderState {
     deferred_commands: VecDeque<Command>,
     compactor_reset: Option<CompactorReset>,
     trie_removals: Vec<AppliedTrieRemoval>,
+    /// The last source record of the batch being resolved: the source tip when its first record began resolving.
+    /// As upstream's `SourceLogProcessor` resolves a poll batch in one go, the batch's records resolve back to back,
+    /// and the records read back meanwhile wait until it has been resolved.
+    source_batch_end: Option<SourcePosition>,
 }
 
 struct SourceInput {
@@ -745,9 +749,7 @@ impl ReplicationDriver {
         capacity_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             if self.cancellation.is_cancelled() { return Ok(()); }
-            self.drive_serving_terminal().await?;
-            self.drive_default_erasure().await?;
-            self.drive_placed_slot()?;
+            self.prepare_turn().await?;
             self.prepare_polls();
             enum Event { ReplicaBatch(PartitionReplay, Result<TailPoll>), Replica, SourceBatch(PartitionReplay, Result<TailPoll>), Source, Command(Option<Command>), Deferred, Appender(Result<()>), Resolved(TxResolver, Result<Arc<ResolvedTx>>), Produced(ProductionResult), Claimed(Result<crate::ReplicaMetadata>), Capacity }
             let ready_replica = self.replica_head.is_some() || !self.replica_batch.is_empty();
@@ -755,7 +757,7 @@ impl ReplicationDriver {
             let placed_open = self.placed_slot.is_some();
             let serving_timed = self.serving_holds_checkpoint();
             let erasure_pending = self.default_erasure.is_some();
-            let serving_source_ready = !erasure_pending && self.serving.as_ref().is_none_or(NativeServing::source_ready);
+            let ready_source = self.ready_source((self.clock)());
             let accept_commands = self.leader.as_ref().is_none_or(|leader| {
                 (!waiting_for_checkpoint && !placed_open && !serving_timed && !erasure_pending && leader.accepting_commands())
                     || leader.deferred_commands.len() < 128
@@ -769,7 +771,6 @@ impl ReplicationDriver {
             let mut empty_production = None;
             let (source_poll, job, resolution, production, ready_source, ready_deferred) = match self.leader.as_mut() {
                 Some(leader) => {
-                    let ready_source = !waiting_for_checkpoint && !placed_open && serving_source_ready && leader.ready_source();
                     let ready_deferred = !waiting_for_checkpoint && !placed_open && !serving_timed && !erasure_pending && leader.accepting_commands()
                         && !leader.deferred_commands.is_empty();
                     (&mut leader.source_poll, &mut leader.job, &mut leader.resolution, &mut leader.production, ready_source, ready_deferred)
@@ -807,23 +808,19 @@ impl ReplicationDriver {
                     };
                     self.lead_after_empty_read(record_count).await?;
                 }
-                Event::Replica => if let Some(head) = self.replica_head {
-                    let tail = self.replica_tail.as_mut().ok_or_else(|| invalid("Prepared replica head has no tail"))?;
-                    let Some(record) = read_replay_head(tail, head, self.logs.memory(), replica_decode_bound, &self.cancellation).await? else { return Ok(()); };
-                    self.replica_head = None;
-                    self.consume_record(record.raw, Some(record.decode_reservation)).await?;
+                Event::Replica => if self.replica_head.is_some() {
+                    if !self.consume_replica_batch().await? { return Ok(()); }
                 } else if let Some(record) = self.replica_batch.pop_front() {
                     self.consume(record).await?;
                 },
-                Event::SourceBatch(tail, records) => if let Some(leader) = &mut self.leader {
-                    leader.source_poll = None; leader.source_tail = Some(tail);
-                    match records? {
-                        TailPoll::Prepared(head) => leader.source_head = head,
-                        TailPoll::Legacy(records) => leader.source_batch.extend(records),
+                Event::SourceBatch(tail, records) => self.source_polled(tail, records).await?,
+                Event::Source => {
+                    if let Some(leader) = &mut self.leader && leader.source_batch_end.is_none() {
+                        leader.source_batch_end = Some(self.logs.latest_source_position()?);
                     }
-                    self.flush_if_due().await?;
-                },
-                Event::Source => self.resolve_next_source().await?,
+                    self.resolve_next_source().await?;
+                    self.continue_source_batch().await?;
+                }
                 Event::Resolved(resolver, result) => self.resolution_finished(resolver, result).await?,
                 Event::Produced(result) => self.production_finished(result).await?,
                 Event::Claimed(result) => self.claim_finished(result).await?,
@@ -861,6 +858,82 @@ impl ReplicationDriver {
                     }
                 }
             }
+        }
+    }
+    /// The work each turn of the event loop does before it waits, which a batch also does between its records.
+    async fn prepare_turn(&mut self) -> Result<()> {
+        self.drive_serving_terminal().await?;
+        self.drive_default_erasure().await?;
+        self.drive_placed_slot()
+    }
+    /// Whether the leader may resolve its next source record at `now`.
+    fn ready_source(&self, now: Timestamp) -> bool {
+        let serving_source_ready = self.default_erasure.is_none() && self.serving.as_ref().is_none_or(NativeServing::source_ready);
+        !self.waiting_for_checkpoint() && self.placed_slot.is_none() && serving_source_ready
+            && self.leader.as_ref().is_some_and(|leader| leader.ready_source() && leader.clock_lease_admits(now))
+    }
+    async fn source_polled(&mut self, tail: PartitionReplay, records: Result<TailPoll>) -> Result<()> {
+        let Some(leader) = &mut self.leader else { return Ok(()); };
+        leader.source_poll = None; leader.source_tail = Some(tail);
+        match records? {
+            TailPoll::Prepared(head) => leader.source_head = head,
+            TailPoll::Legacy(records) => leader.source_batch.extend(records),
+        }
+        self.flush_if_due().await
+    }
+    /// Applies the replica records durable when the first of them was read, in log order, as upstream's replica tail
+    /// applies each poll's records before it polls again: one flush's records are applied, and their writers answered,
+    /// together rather than a turn of the event loop apart.
+    /// Returns false when cancelled.
+    async fn consume_replica_batch(&mut self) -> Result<bool> {
+        let end = self.logs.latest_replica_position()?;
+        while let Some(head) = self.replica_head {
+            let tail = self.replica_tail.as_mut().ok_or_else(|| invalid("Prepared replica head has no tail"))?;
+            let Some(record) = read_replay_head(tail, head, self.logs.memory(), replica_decode_bound, &self.cancellation).await? else { return Ok(false); };
+            self.replica_head = None;
+            self.consume_record(record.raw, Some(record.decode_reservation)).await?;
+            if self.cancellation.is_cancelled() { return Ok(false); }
+            if self.read_position >= end { break; }
+            self.prepare_turn().await?;
+            if self.replica_poll.is_some() || self.replica_head.is_some() || !self.replica_batch.is_empty() { break; }
+            let Some(replay) = self.replica_tail.as_mut().and_then(PartitionReplay::replay) else { break; };
+            match replay.poll_head(Duration::ZERO).await {
+                Ok(head) => self.replica_head = head,
+                Err(StorageError::LogFetchPending { .. }) => break,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(true)
+    }
+    /// Resolves the rest of the source batch, a record at a time, while the leader may resolve and the next record is
+    /// already durable and within the batch. A record whose resolution is in flight ends this call; its completion
+    /// continues the batch. The batch ends where the leader stops.
+    async fn continue_source_batch(&mut self) -> Result<()> {
+        loop {
+            let Some(leader) = &mut self.leader else { return Ok(()); };
+            if leader.resolution.is_some() { return Ok(()); }
+            let Some(end) = leader.source_batch_end else { return Ok(()); };
+            if leader.source_head.is_none() && leader.source_batch.is_empty() && leader.waiting_strict_source.is_none() {
+                if let Some(polled) = leader.source_poll.as_mut().and_then(futures::FutureExt::now_or_never) {
+                    let (tail, records) = polled;
+                    self.source_polled(tail, records).await?;
+                }
+            }
+            self.prepare_turn().await?;
+            let now = (self.clock)();
+            let ready = self.ready_source(now);
+            let Some(leader) = &mut self.leader else { return Ok(()); };
+            let next = match (leader.source_head, leader.source_batch.front()) {
+                (Some(head), _) => Some(head.metadata),
+                (None, Some(record)) => Some(record.metadata),
+                (None, None) => None,
+            };
+            let within = match next { Some(metadata) => self.logs.source_position(metadata)? <= end, None => false };
+            if !ready || !within || leader.waiting_strict_source.is_some() {
+                leader.source_batch_end = None;
+                return Ok(());
+            }
+            self.resolve_next_source().await?;
         }
     }
     fn waiting_for_checkpoint(&self) -> bool {
@@ -1111,7 +1184,7 @@ impl ReplicationDriver {
         self.leader = Some(LeaderState { term, resolver: Some(TxResolver::new(progress.tx_key, progress.source_position, progress.external_token.as_deref().map(<[u8]>::to_vec), &self.resolve.memory)?), resolution: None,
             production: None, confirmed, activation: writer_activation(self.logs.fences_writer_terms()),
             recovery_write, held: VecDeque::new(), held_bytes: 0, cycle,
-            pending: VecDeque::new(), source_tail, source_poll: None, source_batch: VecDeque::new(), source_head: None, waiting_strict_source: None, awaiting_placed: None, settling_placed: false, appender, job: Some(tokio::spawn(job)), cancellation, deferred_commands: VecDeque::new(), compactor_reset: None, trie_removals: Vec::new() });
+            pending: VecDeque::new(), source_tail, source_poll: None, source_batch: VecDeque::new(), source_head: None, waiting_strict_source: None, awaiting_placed: None, settling_placed: false, appender, job: Some(tokio::spawn(job)), cancellation, deferred_commands: VecDeque::new(), compactor_reset: None, trie_removals: Vec::new(), source_batch_end: None });
         if produce_inherited {
             self.produce_pending()?;
         }
@@ -1940,8 +2013,6 @@ impl ReplicationDriver {
         let mut resolution = leader.resolution.take().ok_or_else(|| invalid("Resolved transaction has no in-flight owner"))?;
         let external = resolution.completion.0.is_some();
         leader.resolver = Some(resolver);
-        let held = std::mem::take(&mut leader.held);
-        leader.held_bytes = 0;
         match result {
             Ok(resolved) => self.enqueue_resolved(resolved, resolution.completion.0.take()).await?,
             Err(error) => {
@@ -1949,6 +2020,12 @@ impl ReplicationDriver {
                 if !external || !error.is_caller_error() { return Err(error); }
             }
         }
+        // Records read back meanwhile stay held while the next record of the batch resolves.
+        self.continue_source_batch().await?;
+        let Some(leader) = self.leader.as_mut() else { return Ok(()); };
+        if leader.resolution.is_some() { return Ok(()); }
+        let held = std::mem::take(&mut leader.held);
+        leader.held_bytes = 0;
         for record in held { self.apply_admitted(record).await?; }
         let previous = self.installed;
         self.update_installed_prefix()?;
