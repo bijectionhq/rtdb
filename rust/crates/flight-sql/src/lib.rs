@@ -10,6 +10,7 @@ mod protocol;
 mod server;
 mod service;
 mod state;
+mod store_release;
 mod ticket;
 mod wire;
 #[cfg(feature = "multi")]

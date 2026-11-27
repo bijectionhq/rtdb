@@ -1,0 +1,36 @@
+use tonic::{Status, metadata::{Ascii, MetadataMap, MetadataValue}};
+
+pub(crate) const HEADER: &str = "x-rtdb-store-release";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StoreRelease(&'static str);
+
+impl StoreRelease {
+    // Set from store::CONTRACT_VERSION when derive and rank use the published crate.
+    const LINKED: Option<Self> = None;
+
+    pub(crate) fn negotiate(headers: &MetadataMap, verified_credential: bool) -> Result<Self, Status> {
+        if !verified_credential {
+            return Err(Status::unauthenticated("A store release handshake requires verified credentials"));
+        }
+        let mut offers = headers.get_all(HEADER).iter();
+        let offer = offers.next().filter(|_| offers.next().is_none())
+            .ok_or_else(|| Status::invalid_argument("A store release handshake requires exactly one release"))?;
+        let linked = Self::LINKED.ok_or_else(|| Status::failed_precondition("RTDB has no linked store release"))?;
+        if offer.as_encoded_bytes() != linked.0.as_bytes() {
+            return Err(Status::failed_precondition("The store release does not match the linked release"));
+        }
+        Ok(linked)
+    }
+
+    pub(crate) fn require(binding: Option<Self>) -> Result<(), Status> {
+        if Self::LINKED.is_some() && binding != Self::LINKED {
+            return Err(Status::permission_denied("The store action requires a release-checked Flight session"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn metadata(self) -> MetadataValue<Ascii> {
+        MetadataValue::from_static(self.0)
+    }
+}

@@ -6,7 +6,7 @@ use rtdb_node::{Database, NativeSession, Node, PreparedSql};
 use tokio_util::sync::CancellationToken;
 use tonic::Status;
 use uuid::Uuid;
-use crate::{error::status, lease::Leased, wire::BoundParameters};
+use crate::{error::status, lease::Leased, store_release::StoreRelease, wire::BoundParameters};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Owner { Anonymous, Authenticated(Uuid) }
@@ -50,15 +50,17 @@ pub(crate) struct Session {
     pub id: String,
     pub caller: Arc<Caller>,
     pub fresh_replica: bool,
+    pub(crate) store_release: Option<StoreRelease>,
     placement: Option<Placement>,
     state: Mutex<SessionState>,
     _reservation: Arc<MemoryReservation>,
 }
 impl Session {
-    pub fn new(id: String, caller: Arc<Caller>, local: Option<&Arc<Database>>, fresh_replica: bool, reservation: Arc<MemoryReservation>) -> Self {
+    pub fn new(id: String, caller: Arc<Caller>, local: Option<&Arc<Database>>, fresh_replica: bool,
+        store_release: Option<StoreRelease>, reservation: Arc<MemoryReservation>) -> Self {
         let placement = local.map(|database| Placement { name: database.name().into(), attachment: Arc::downgrade(database) });
         Self {
-            id, caller, placement, fresh_replica,
+            id, caller, placement, fresh_replica, store_release,
             state: Mutex::new(SessionState::Open { connections: BTreeMap::new(), catalog: None }),
             _reservation: reservation,
         }

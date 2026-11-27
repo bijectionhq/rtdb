@@ -13,6 +13,7 @@ use tonic::{Request, Response, Status, Streaming};
 use uuid::Uuid;
 use rtdb_storage::sealing::{DeliveryDeadline, PlaintextDelivery};
 use crate::{FORWARDED_PEER_HEADER, FlightConfig, auth::{self, Authentication, Credentials}, error::{arrow, cancelled, status, unsupported}, lease::{Leased, Lookup, Registry}, server::{Binding, ServerStatus}, state::{ConnectionResource, Prepared, PreparedScope, Session, Transaction}, wire};
+use crate::store_release::{self, StoreRelease};
 
 pub(crate) const CLOSE_SESSION: &str = "CloseSession";
 const CLASSIC_RETAINED_PROOF: &str = "x-rtdb-classic-retained-proof";
@@ -295,6 +296,12 @@ impl Service {
         }
         let transport = request.extensions().get::<crate::server::FlightConnectInfo>();
         let is_handshake = matches!(kind, CallKind::Handshake);
+        let store_action = matches!(kind, CallKind::Store);
+        let offers_store_release = request.metadata().contains_key(store_release::HEADER);
+        let store_handshake = is_handshake && offers_store_release;
+        if store_action && offers_store_release {
+            return Err(Status::invalid_argument("A store release belongs on the Flight handshake"));
+        }
         let sessions = &self.0.sessions;
         let permit = Arc::clone(&self.0.permits).try_acquire_owned().map_err(|_| Status::resource_exhausted("Flight concurrent-call limit reached"))?;
         let admission = Arc::new(Admission::new(self.clone(), permit));
@@ -363,6 +370,9 @@ impl Service {
                 Lookup::Unknown => return Err(session_error(bearer.is_some(), "unknown session")),
             };
             let lease = AcquiredSession { service: self.clone(), session: Arc::clone(&session) };
+            if store_handshake {
+                return Err(Status::failed_precondition("A store release handshake opens a new Flight session"));
+            }
             if session.fresh_replica && !matches!(kind, CallKind::Action | CallKind::OwnedAction | CallKind::OpenFresh | CallKind::V1Capabilities | CallKind::V1Action | CallKind::Store | CallKind::V1Appointment | CallKind::TxStatus) {
                 return Err(Status::permission_denied("The fresh Flight session carries owned read actions"));
             }
@@ -375,6 +385,7 @@ impl Service {
                 return Err(auth::auth_error(error));
             }
             admit_workload(&session.caller.principal, session.fresh_replica)?;
+            if store_action { StoreRelease::require(session.store_release)?; }
             (session, false, lease, None)
         } else {
             let catalog = self.0.node.catalog();
@@ -394,6 +405,7 @@ impl Service {
                 (transport.and_then(|transport| transport.peer.remote_addr()).or_else(|| request.remote_addr()).map(|address| address.ip().to_string()), None, false)
             };
             let caller = self.0.cancellation.run_until_cancelled(self.0.auth.authenticate(&credentials, peer.as_deref())).await.ok_or_else(cancelled)??;
+            if store_action { StoreRelease::require(None)?; }
             if self.follower_only() && (!caller.verified_credential || caller.principal.label_scope().is_some()) {
                 return Err(auth::unauthenticated("The assigned follower requires verified unscoped credentials"));
             }
@@ -426,9 +438,17 @@ impl Service {
             if excluded && (fresh_replica || matches!(kind, CallKind::OpenFresh)) {
                 return Err(classic_flight_refusal());
             }
+            let store_release = if store_handshake {
+                if self.follower_only() || fresh_replica || caller.principal.label_scope().is_some()
+                    || caller.principal.workload_grant().is_some_and(|grant| !grant.is_store_grant())
+                {
+                    return Err(Status::permission_denied("This credential or route does not serve the store contract"));
+                }
+                Some(StoreRelease::negotiate(request.metadata(), caller.verified_credential)?)
+            } else { None };
             let capacity = 1024 + placement.as_ref().map_or(0, |database| database.name().len());
             let session = Arc::new(Session::new(Uuid::new_v4().to_string(), Arc::clone(&caller),
-                placement.as_ref(), fresh_replica, self.memory().reserve(capacity).map_err(status)?));
+                placement.as_ref(), fresh_replica, store_release, self.memory().reserve(capacity).map_err(status)?));
             sessions.insert(session.id.clone(), Arc::clone(&session), self.0.config.session_idle_timeout,
                 self.0.config.session_unclaimed_timeout, true, session.id.len()).map_err(status)?;
             let lease = AcquiredSession { service: self.clone(), session: Arc::clone(&session) };
@@ -552,7 +572,12 @@ impl FlightService for Service {
         if crate::v1::original_family_readback::is_readback(&call) {
             self.check_family_readback_handshake(&call).await.map_err(|status| call.error(status))?;
         }
-        result_stream(call, Vec::new())
+        let release = if call.minted { call.session.store_release } else { None };
+        let mut reply = result_stream(call, Vec::new())?;
+        if let Some(release) = release {
+            reply.metadata_mut().insert(store_release::HEADER, release.metadata());
+        }
+        Ok(reply)
     }
     async fn list_flights(&self, request: Request<flight::Criteria>) -> Result<Response<Self::ListFlightsStream>, Status> { let call = self.call(&request, request.get_ref().encoded_len()).await?; Err(call.error(unsupported())) }
     async fn poll_flight_info(&self, request: Request<flight::FlightDescriptor>) -> Result<Response<flight::PollInfo>, Status> { let call = self.call(&request, request.get_ref().encoded_len()).await?; Err(call.error(unsupported())) }

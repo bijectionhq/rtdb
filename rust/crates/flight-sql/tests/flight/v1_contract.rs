@@ -7,6 +7,63 @@ use rtdb_types::EntityId;
 
 const CHANGE_IMAGE_HEADER: &str = "x-rtdb-changes-images";
 
+#[tokio::test]
+async fn an_unlinked_store_release_does_not_establish_a_flight_session() {
+    const RELEASE: &str = "x-rtdb-store-release";
+    let running = Running::start(Some("secret"), FlightConfig::default()).await;
+    let channel = Channel::from_shared(format!("http://{}", running.server.address())).unwrap()
+        .connect().await.unwrap();
+    let mut client = FlightServiceClient::new(channel);
+    let handshake = || {
+        let mut request = Request::new(futures::stream::iter([arrow_flight::HandshakeRequest::default()]));
+        request.metadata_mut().insert("authorization", "Basic eHRkYjpzZWNyZXQ=".parse().unwrap());
+        request
+    };
+
+    let mut offered = handshake();
+    offered.metadata_mut().insert(RELEASE, "unreleased".parse().unwrap());
+    let status = client.handshake(offered).await.err().expect("the release offer is refused");
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    for header in [RELEASE, "authorization", "set-cookie"] {
+        assert!(!status.metadata().contains_key(header));
+    }
+    assert_eq!(running.server.status().sessions, 0);
+
+    let mut duplicate = handshake();
+    duplicate.metadata_mut().append(RELEASE, "unreleased".parse().unwrap());
+    duplicate.metadata_mut().append(RELEASE, "unreleased".parse().unwrap());
+    let status = client.handshake(duplicate).await.err().expect("the repeated offer is refused");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert_eq!(running.server.status().sessions, 0);
+
+    let direct = |authorization| {
+        let mut request = Request::new(Action { r#type: "rtdb.store.v1.Read".into(), body: Bytes::new() });
+        request.metadata_mut().insert("authorization", authorization);
+        request
+    };
+    let status = client.do_action(direct("Basic eHRkYjpzZWNyZXQ=".parse().unwrap())).await
+        .err().expect("the empty store read is refused");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert_eq!(status.message(), "A read names at least one range");
+
+    let reply = client.handshake(handshake()).await.unwrap();
+    assert!(!reply.metadata().contains_key(RELEASE));
+    let bearer = reply.metadata().get("authorization").unwrap().clone();
+    assert!(reply.into_inner().message().await.unwrap().is_none());
+
+    let mut reuse = handshake();
+    reuse.metadata_mut().insert("authorization", bearer.clone());
+    reuse.metadata_mut().insert(RELEASE, "unreleased".parse().unwrap());
+    let status = client.handshake(reuse).await.err().expect("a session cannot be upgraded");
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+
+    let mut action = direct(bearer);
+    action.metadata_mut().insert(RELEASE, "unreleased".parse().unwrap());
+    let status = client.do_action(action).await.err().expect("store actions cannot negotiate a release");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    running.stop().await;
+}
+
 #[cfg(feature = "multi")]
 #[path = "managed_workload_qualification.rs"]
 mod managed_workload_qualification;

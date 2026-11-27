@@ -187,6 +187,12 @@ surface StatelessDatabase {
         -- A standalone installation's Flight listener serves rtdb.store.v1 and rtdb.admin.v1 of the v1 surface, and nothing else of it.
         -- It refuses every other rtdb.v1 action and every rtdb.v1 query or changes ticket.
 
+    @guarantee StoreReleaseAgreement
+        -- A caller offers one store release in the x-rtdb-store-release metadata of a new Flight handshake using verified credentials.
+        -- A listener without a linked store release refuses an offer before it issues session credentials.
+        -- A listener with a linked store release confirms only an exact match and returns its linked release in the handshake metadata.
+        -- Each store action on a listener with a linked release requires the session established by that agreement.
+
     @guarantee OrderedIndexCatalog
         -- An ordered index declaration preserves its columns in the order sent by the caller.
         -- Query of xt.ordered_indexes reads the definitions present at its selected applied cut.
