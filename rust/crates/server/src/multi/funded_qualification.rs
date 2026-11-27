@@ -361,6 +361,63 @@ async fn funded_acceptance_proof_survives_replacement_and_expiry_until_checkpoin
     keepers.shutdown().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn offloaded_funded_record_keeps_its_exact_timed_proof() {
+    const PRINCIPAL: &str = "urn:logkeeper:client:funded-offload-proof";
+    let objects = tempfile::tempdir().unwrap();
+    let offload = serde_json::from_value(serde_json::json!({
+        "url": format!("file://{}", objects.path().display()),
+        "batch_interval_ms": 3_600_000,
+        "retain_local_bytes": 0,
+    }))
+    .unwrap();
+    let mut keepers = LocalCluster::start_timed(&[PRINCIPAL]).await.unwrap();
+    keepers.enable_offload(PRINCIPAL, offload).await.unwrap();
+    let journal = Arc::new(
+        keepers
+            .journal(PRINCIPAL, &keepers.journal_config(1 << 20, 4096))
+            .unwrap()
+            .with_timed_original(keepers.timed_verifier(), Some(2048)),
+    );
+    let stream = StreamId(Uuid::new_v4().as_u128());
+    journal.create_immutable(stream).await.unwrap();
+    let writer = journal
+        .seal_session(stream, Epoch(0), WriterSessionId(1))
+        .await
+        .unwrap();
+    let batch = ConsensusJournalBatch(journal.clone());
+    let payload = bytes::Bytes::from_static(b"offloaded funded stage");
+    let original = TimedOriginal {
+        stream,
+        epoch: writer.fence.writer_epoch,
+        at: Lsn(1),
+        payload_sha256: Sha256::digest(&payload).into(),
+        cutoff: TimedJournalCutoff::new(Timestamp(SystemClock.now().0 + 60_000_000), [9; 32])
+            .unwrap(),
+    };
+    let accepted = batch
+        .append_session_timed_original(writer.fence, original, payload.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        batch.prove_timed_original(original).await.unwrap(),
+        accepted
+    );
+
+    let status = journal.client().offload_status(stream, true).await.unwrap();
+    assert_eq!(status.offloaded_through, original.at);
+    assert_eq!(status.head, original.at);
+    assert_eq!(status.floor, original.at);
+    assert_eq!(status.local_floor, Lsn(2));
+    let page = journal
+        .read(stream, original.at, 1, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(page.records, vec![(original.at, payload)]);
+    assert_eq!(batch.prove_timed_original(original).await, Ok(accepted));
+    keepers.shutdown().await.unwrap();
+}
+
 struct WithholdTimedAppend {
     keeper_trust: Arc<dyn TimedOriginalVerifier>,
     verified_samples: AtomicUsize,
