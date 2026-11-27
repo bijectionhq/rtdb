@@ -200,7 +200,7 @@ async fn registry_reference_paths_and_nested_message_indexes_produce_connect_val
         .decode(
             "events",
             Some(&framed(&[
-                4, 2, 2, 10, 4, 10, 2, 8, 42, 34, 7, 40, 1, 50, 2, 1, 4,
+                4, 2, 2, 10, 4, 10, 2, 8, 42, 32, 7, 40, 1, 50, 2, 1, 4,
             ])),
             &mut context(),
         )

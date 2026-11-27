@@ -176,7 +176,7 @@ impl Document {
         let (&first, nested) = indexes.split_first().ok_or_else(invalid)?;
         let mut message = self.root.messages().nth(first).ok_or_else(invalid)?;
         for &index in nested {
-            message = message
+            let child = message
                 .child_messages()
                 .filter(|child| {
                     // A map field introduces a synthetic descriptor but no entry in Confluent's index path.
@@ -195,6 +195,7 @@ impl Document {
                 })
                 .nth(index)
                 .ok_or_else(invalid)?;
+            message = child;
         }
         Ok(message)
     }
