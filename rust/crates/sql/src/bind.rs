@@ -397,7 +397,12 @@ impl Context<'_> {
     }
 
     fn bind_records(&mut self, records: &[ast::Expr]) -> Result<Vec<Expr>> {
-        records.iter().map(|expr| self.expr(expr, &Schema::default(), &BTreeMap::new())).collect()
+        records.iter().map(|expr| {
+            let allowed = matches!(expr, ast::Expr::Dictionary(_))
+                || matches!(expr, ast::Expr::Value(value) if matches!(value.value, ast::Value::Placeholder(_)));
+            if !allowed { return Err(grammar_rejected("A non-record expression in RECORDS")); }
+            self.expr(expr, &Schema::default(), &BTreeMap::new())
+        }).collect()
     }
 
     fn records_query(&mut self, records: &[ast::Expr]) -> Result<Arc<Relation>> {
@@ -667,8 +672,14 @@ impl Context<'_> {
         match set {
             ast::SetExpr::Select(select) => self.select(select, None),
             ast::SetExpr::FromPipeline(pipeline) => self.from_pipeline(pipeline, None),
-            ast::SetExpr::Query(query) => self.query(query),
-            ast::SetExpr::Values(values) => self.values(&values.rows),
+            ast::SetExpr::Query(query) => {
+                if query.with.is_some() { return Err(grammar_rejected("WITH inside a parenthesised query body")); }
+                self.query(query)
+            }
+            ast::SetExpr::Values(values) => {
+                if values.value_keyword { return Err(grammar_rejected("VALUE instead of VALUES")); }
+                self.values(&values.rows)
+            }
             ast::SetExpr::Records(records) => self.records_query(records),
             ast::SetExpr::SetOperation { left, op, set_quantifier, right } => {
                 let left = self.set_expr(left)?;
@@ -1112,6 +1123,7 @@ impl Context<'_> {
                 let binding = resolve_table(self.catalog, &names, &self.options.search_path)?;
                 let qualifier = alias.as_ref().map(|alias| identifier(&alias.name).normalized()).unwrap_or_else(|| binding.name.table.table.clone());
                 if purpose != TablePurpose::Query && alias.as_ref().is_some_and(|alias| !alias.columns.is_empty()) { return Err(error("Mutation targets do not accept column lists")); }
+                if alias.as_ref().is_some_and(|alias| alias.columns.iter().any(|column| column.data_type.is_some())) { return Err(grammar_rejected("Typed table alias columns")); }
                 let mut visible = alias.as_ref().filter(|alias| !alias.columns.is_empty()).map(|alias| alias.columns.iter().map(|column| identifier(&column.name).normalized()).collect::<Vec<_>>())
                     .unwrap_or_else(|| binding.columns.keys().cloned().collect());
                 let archive_column = |name: &str| matches!(name, rtdb_types::ARCHIVE_TX_FROM | rtdb_types::ARCHIVE_TX_TO);
@@ -1168,7 +1180,8 @@ impl Context<'_> {
                 }).collect::<Result<_>>()?;
                 Ok(Arc::new(relation.project(expressions)?))
             }
-            ast::TableFactor::Derived { subquery, alias, lateral, .. } => {
+            ast::TableFactor::Derived { subquery, alias, lateral, sample } => {
+                if sample.is_some() { return Err(grammar_rejected("TABLESAMPLE on a derived table")); }
                 if *lateral && alias.is_none() { return Err(error("LATERAL derived tables require an alias")); }
                 let relation = if *lateral { self.lateral_scope(lateral_start, |context| context.query(subquery))? } else { self.query(subquery)? };
                 match alias { Some(alias) => self.alias(relation, alias), None => Ok(relation) }
@@ -1200,8 +1213,8 @@ impl Context<'_> {
                 }
             }
             ast::TableFactor::NestedJoin { table_with_joins, alias } => {
-                let relation = self.joined_table(table_with_joins, lateral_start)?;
-                match alias { Some(alias) => self.alias(relation, alias), None => Ok(relation) }
+                if alias.is_some() { return Err(grammar_rejected("An alias on a parenthesised table reference")); }
+                self.joined_table(table_with_joins, lateral_start)
             }
             ast::TableFactor::UNNEST { array_exprs, alias, with_ordinality, with_offset, .. } => {
                 if array_exprs.len() != 1 || *with_offset { return Err(grammar_rejected("Multi-array UNNEST or WITH OFFSET")); }
@@ -1397,6 +1410,7 @@ impl Context<'_> {
 
     fn list_table(&mut self, expr: Expr, alias: Option<&ast::TableAlias>, with_ordinality: bool, kind: ListTableKind) -> Result<Arc<Relation>> {
         let alias = alias.ok_or_else(|| error("List tables require an alias"))?;
+        if alias.columns.iter().any(|column| column.data_type.is_some()) { return Err(grammar_rejected("Typed table alias columns")); }
         if !alias.columns.is_empty() && alias.columns.len() != 1 + usize::from(with_ordinality) {
             let name = identifier(&alias.name).normalized();
             let columns = alias.columns.iter().map(|column| identifier(&column.name).normalized()).collect();
@@ -1494,6 +1508,7 @@ impl Context<'_> {
     }
 
     fn alias(&mut self, input: Arc<Relation>, alias: &ast::TableAlias) -> Result<Arc<Relation>> {
+        if alias.columns.iter().any(|column| column.data_type.is_some()) { return Err(grammar_rejected("Typed table alias columns")); }
         let columns = if alias.columns.is_empty() { None } else { Some(alias.columns.iter().map(|column| identifier(&column.name).normalized()).collect()) };
         self.rename(input, Some(identifier(&alias.name).normalized()), columns)
     }

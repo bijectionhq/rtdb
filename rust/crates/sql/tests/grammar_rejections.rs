@@ -170,3 +170,26 @@ fn clickhouse_query_modifiers_cte_without_as_and_bare_from_values_are_rejected()
     }
     prepare("SELECT * FROM (VALUES (1, 2)) AS t(x, y)", &Fixture, &PrepareOptions::default()).unwrap();
 }
+
+#[test]
+fn non_grammar_query_bodies_and_table_factors_are_rejected() {
+    for sql in [
+        "(WITH c AS (SELECT 1 AS a) SELECT * FROM c)",
+        "VALUE (1, 2)",
+        "RECORDS ({a: 1})",
+        "RECORDS COALESCE({a: 1}, {a: 2})",
+        "INSERT INTO docs RECORDS ({_id: 1})",
+        "SELECT * FROM (SELECT 1 AS a) AS t TABLESAMPLE BERNOULLI (50)",
+        "SELECT * FROM (docs JOIN docs AS d2 ON docs._id = d2._id) AS j",
+        "SELECT * FROM docs AS d(_id INT, a INT)",
+        "SELECT * FROM (SELECT 1) AS t(x INT)",
+        "SELECT * FROM UNNEST([1]) AS u(x INT)",
+    ] {
+        let error = rejection(sql);
+        assert_eq!((error.category, error.code.as_str()), (AnomalyCategory::Incorrect, "xtdb/sql-error"), "{sql}");
+        assert!(error.message.as_deref().unwrap().starts_with("Errors parsing SQL statement:\n  - "), "{sql}");
+    }
+    prepare("RECORDS {a: 1}", &Fixture, &PrepareOptions::default()).unwrap();
+    prepare("RECORDS OBJECT(a: 1)", &Fixture, &PrepareOptions::default()).unwrap();
+    prepare("INSERT INTO docs RECORDS {_id: 1}", &Fixture, &PrepareOptions::default()).unwrap();
+}
