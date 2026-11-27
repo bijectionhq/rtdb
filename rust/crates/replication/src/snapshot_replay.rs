@@ -96,14 +96,6 @@ impl SqlErasureSource {
 }
 
 impl RecoveredPartition {
-    /// Rebuild an installed SQL cut in a private partition using its protected replica interval.
-    /// The caller retains the interval owner through result delivery.
-    pub async fn replay_snapshot_suffix(
-        &mut self, logs: &PartitionLogs, replay: SnapshotReplay, cancellation: &CancellationToken,
-    ) -> Result<Option<Arc<dyn Send + Sync>>> {
-        self.replay_snapshot_suffix_with(logs, replay, cancellation, |_, _, _| Ok(()), false).await
-    }
-
     /// Collect every committed erase on this exact certified head, including
     /// markers that applied while the broker was closing admission.
     pub async fn replay_sql_erasure(

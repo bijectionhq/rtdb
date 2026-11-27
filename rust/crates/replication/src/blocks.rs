@@ -18,9 +18,6 @@ use crate::logs::PartitionReplay;
 use crate::serving::ServingCheckpoint;
 use crate::{AppliedProgress, PartitionLogs, ReplicaRecord, TermFence};
 
-mod default_erasure;
-pub use default_erasure::{NativeErasureCut, VerifiedNativeErasureCheckpoint};
-
 pub struct RecoveredPartition {
     pub partition: Arc<PartitionState>,
     pub block: Option<BlockCatalog>,
