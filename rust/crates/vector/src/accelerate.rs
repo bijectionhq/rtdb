@@ -135,7 +135,7 @@ async fn partition_filter(request: &ScanRequest<'_>, definition: &VectorDefiniti
         if matches!(value, Value::Null | Value::Undefined) { return Ok(None); }
         parts.push(Some(std::borrow::Cow::Owned(value)));
     }
-    Partition::of(parts).map(Some).or_else(|error| if error.code == "rtdb.vector/partition-type" { Ok(None) } else { Err(error) })
+    Ok(Partition::try_of(parts))
 }
 
 fn conjuncts<'a>(expression: &'a Expr, visit: &mut impl FnMut(&'a Expr)) {

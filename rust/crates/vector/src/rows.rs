@@ -20,15 +20,20 @@ impl Partition {
 
     /// Absent and null values share one encoding, as an equality filter can match neither.
     pub fn of<'a>(parts: impl IntoIterator<Item = Option<Cow<'a, Value>>>) -> Result<Self> {
+        Self::try_of(parts).ok_or_else(partition_type)
+    }
+
+    /// Encodes a partition key, returning `None` if any value has an unsupported partition type.
+    pub fn try_of<'a>(parts: impl IntoIterator<Item = Option<Cow<'a, Value>>>) -> Option<Self> {
         let mut hasher = Sha256::new();
         for part in parts {
             hash_value_part(&mut hasher, part.as_deref())?;
         }
-        Ok(Self(hasher.finalize().into()))
+        Some(Self(hasher.finalize().into()))
     }
 }
 
-fn hash_value_part(hasher: &mut Sha256, part: Option<&Value>) -> Result<()> {
+fn hash_value_part(hasher: &mut Sha256, part: Option<&Value>) -> Option<()> {
     match part {
         None | Some(Value::Null | Value::Undefined) => hash_part(hasher, 0, &[]),
         Some(Value::Bool(value)) => hash_part(hasher, 1, &[u8::from(*value)]),
@@ -46,9 +51,9 @@ fn hash_value_part(hasher: &mut Sha256, part: Option<&Value>) -> Result<()> {
         Some(Value::Utf8(text)) => hash_part(hasher, 4, text.as_bytes()),
         Some(Value::Binary(bytes) | Value::FixedSizeBinary(bytes)) => hash_part(hasher, 5, bytes),
         Some(Value::Uuid(bytes)) => hash_part(hasher, 6, bytes),
-        Some(_) => return Err(partition_type()),
+        Some(_) => return None,
     }
-    Ok(())
+    Some(())
 }
 
 fn partition_type() -> Anomaly {
@@ -92,7 +97,7 @@ fn arrow_partition(event: &EventRef<'_>, columns: &[String], memory: &Arc<Memory
             let _scratch = reserve_decode(field, array, row, memory)?;
             let value = read_execution_value(field, array, row)?;
             // A later cell's decode error precedes a digest type error.
-            invalid_type |= hash_value_part(&mut hasher, Some(&value)).is_err();
+            invalid_type |= hash_value_part(&mut hasher, Some(&value)).is_none();
         }
     }
     if invalid_type { return Err(partition_type()); }
@@ -498,5 +503,14 @@ mod tests {
         }
         assert!(append_unit_with(&mut output, [Some(0.0), Some(1.0)].into_iter(), |_| Ok(())).unwrap());
         assert_eq!(output, [1.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn partition_try_of_returns_none_for_unsupported_types_and_matches_of_for_supported_values() {
+        let supported = [Some(Cow::Owned(Value::Utf8("eu".into()))), Some(Cow::Owned(Value::I64(7)))];
+        assert_eq!(Partition::try_of(supported.clone()), Some(Partition::of(supported).unwrap()));
+        let unsupported = [Some(Cow::Owned(Value::F64(1.5)))];
+        assert_eq!(Partition::try_of(unsupported.clone()), None);
+        assert_eq!(Partition::of(unsupported).unwrap_err().code, "rtdb.vector/partition-type");
     }
 }
