@@ -1178,6 +1178,8 @@ contract PortableApplicationBackup {
         -- Installation readback reopens the selected replay checkpoint from its backing store and verifies the installed relocation index and every relocated file named by that checkpoint.
         -- A hosted object-hold check binds the commissioned staged checkpoint, every direct member and the token key envelope to the provider versions that supplied their authenticated ciphertext.
         -- The check requires an affirmative provider hold for each of those versions and the same staged journal cut at readback.
+        -- A saved object readback selects only its recorded physical versions when reopening that staged cut.
+        -- Reopening verifies the same archive, incarnation, journal head, checkpoint and complete object inventory and rereads each provider hold.
         -- The retained destination journal selects the checkpoint used to recover the installation receipt.
         -- Installation and activation are separate decisions.
         -- An independent destination verifier checks its scoped committed install and dependency closure before signing the authority, database, predecessor binding, operation, destination cell, candidate, archive digest and exact source cut.

@@ -14,8 +14,10 @@ Usage: rtdb multi-backup export --data DIR --archive FILE [--journal-url URL --t
                                  [--journal-url URL --tls-dir DIR] [--immutable-streams] [--authority-id UUID [--cell-id UUID]]
        rtdb multi-backup verify-object-holds --archive FILE --incarnation UUID --authority-id UUID [--cell-id UUID]
                     --journal-url URL --tls-dir DIR --key-vault DIR --bucket BUCKET [--region REGION] [--s3-endpoint URL]
+                    [--readback FILE]
 Export and restore operate on stopped, local RTDB Multi development data.
 Verify-object-holds reads a staged immutable journal and an S3 allocation.
+Pass a saved readback to reopen and verify its exact S3 versions.
 It requires the backup-object-holds build feature. These commands run without a serving listener.
 ";
 

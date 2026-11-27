@@ -12,6 +12,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, PhysicalObjectVersion, Result, S3Obje
 #[path = "never_versioned.rs"]
 mod never_versioned;
 pub use never_versioned::{NeverVersionedObject, NeverVersionedRetirement, ObservedTerminalObject};
+mod pinned_reads;
 mod retirement_decision;
 use retirement_decision::{VersionStatus, exact_version_status, matches_terminal_target};
 
@@ -68,15 +69,15 @@ enum VersionedRetirementHead {
 #[async_trait::async_trait]
 impl ClassicVersionRetirement for VersionedInventory {
     async fn available(&self, key: &ObjectKey, version: &PhysicalObjectVersion) -> rtdb_storage::Result<bool> {
-        self.exact_retirement_available(key, version).await.map_err(|error| retirement_error(key, error))
+        self.exact_retirement_available(key, version).await.map_err(|error| version_error(key, error))
     }
 
     async fn erase(&self, key: &ObjectKey, version: &PhysicalObjectVersion) -> rtdb_storage::Result<()> {
-        self.retire_observed_version(key, version).await.map_err(|error| retirement_error(key, error))
+        self.retire_observed_version(key, version).await.map_err(|error| version_error(key, error))
     }
 
     async fn require_never_versioned(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
-        self.never_versioned_retirement().await.map(drop).map_err(|error| retirement_error(key, error))
+        self.never_versioned_retirement().await.map(drop).map_err(|error| version_error(key, error))
     }
 
     async fn settle_staging_upload(&self, upload: uuid::Uuid, version: Option<&str>) -> rtdb_storage::Result<()> {
@@ -99,7 +100,7 @@ impl ClassicVersionRetirement for VersionedInventory {
 
 }
 
-fn retirement_error(key: &ObjectKey, error: Anomaly) -> Error {
+fn version_error(key: &ObjectKey, error: Anomaly) -> Error {
     Error::Remote { key: key.to_string(), message: error.to_string() }
 }
 
@@ -443,11 +444,15 @@ impl VersionedInventory {
     }
 
     fn observed_path(&self, key: &ObjectKey, observed: &PhysicalObjectVersion) -> Result<Path> {
-        let path = self.key_layout.provider_path(&format!("{}/{key}", self.root))?;
+        let path = self.object_path(key)?;
         if observed.namespace != self.namespace || observed.key != path.as_ref() || !valid_object_version(observed.version.as_bytes()) {
             return Err(unavailable("The retirement does not identify an immutable version of this key"));
         }
         Ok(path)
+    }
+
+    fn object_path(&self, key: &ObjectKey) -> rtdb_storage::Result<Path> {
+        self.key_layout.provider_path(&format!("{}/{key}", self.root))
     }
 
     async fn version_status(&self, key: &str, version: &str) -> Result<VersionStatus> {

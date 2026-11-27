@@ -286,7 +286,14 @@ With the `backup-object-holds` build feature, run `rtdb multi-backup verify-obje
 Supply the selected archive, destination incarnation, authority and cell, journal reader TLS, destination key vault and S3 bucket.
 The command checks the archive digest, rereads the staged checkpoint, all of its files and the wrapped token key, and requires S3 legal hold `ON` on the exact versions that supplied those bytes.
 It accepts a staged cut whose retained suffix contains the selected checkpoint and ordinary lease records.
-The result reports the checkpoint, journal head and exact held versions for the custodian's recovery records.
+Save the JSON result with the archive and the custodian's recovery records.
+Pass it back with `--readback FILE` and the same archive and destination settings to reopen the recorded versions, including when a delete marker or a newer version masks a held object.
+The command checks the complete inventory and journal cut against the saved readback and obtains fresh legal-hold status from S3.
+On AWS S3, grant the verifier `s3:GetBucketVersioning` on the allocation and `s3:GetObjectLegalHold` on the staged objects.
+Reading the current object names uses `s3:GetObject` and reopening from a saved readback uses `s3:GetObjectVersion`. [S3 GetObject permissions](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html#API_GetObject_RequestSyntax)
+Reserve permission to change a legal hold or delete a version for the object custodian.
+In the loopback MinIO qualification, the version reader could also read the current object name.
+The pinned verifier always supplies the recorded version ID.
 Journal retention, generation-key holds and permission to publish require their own authority.
 
 The installed server opens its generation keys through `FileKms` at `RTDB_KEY_DIRECTORY`.

@@ -1,8 +1,37 @@
 use super::*;
+use rtdb_types::PhysicalObjectVersion;
+
+#[derive(Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct Readback {
+    incarnation: Uuid,
+    archive_sha256: String,
+    journal_head: u64,
+    checkpoint: String,
+    held_versions: Vec<PhysicalObjectVersion>,
+    object_holds_verified: bool,
+}
+
+impl Readback {
+    fn read(path: &Path) -> Result<Self> {
+        const MAX_BYTES: u64 = 32 << 20;
+        let file = File::open(path).map_err(io_error)?;
+        if !file.metadata().map_err(io_error)?.is_file() {
+            return Err(invalid_readback());
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_BYTES + 1).read_to_end(&mut bytes).map_err(io_error)?;
+        if bytes.len() as u64 > MAX_BYTES {
+            return Err(invalid_readback());
+        }
+        serde_json::from_slice(&bytes).map_err(|_| invalid_readback())
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct Verifier {
     archive: PathBuf,
+    readback: Option<PathBuf>,
     incarnation: Uuid,
     scope: ActivationScope,
     journal_url: String,
@@ -26,16 +55,24 @@ impl Verifier {
         let mut objects = rtdb_s3::S3Config::new(take("--bucket")?);
         objects.region = fields.remove("--region");
         objects.endpoint = fields.remove("--s3-endpoint");
+        let readback = fields.remove("--readback").map(PathBuf::from);
         let cell = fields.remove("--cell-id").as_deref().map(uuid).transpose()?;
         let scope = ActivationScope::for_cell(authority, DEVELOPMENT_DATABASE, cell)?;
         if !fields.is_empty() {
             return Err(arguments_error());
         }
-        Ok(Self { archive, incarnation, scope, journal_url, journal_tls, key_vault, objects })
+        Ok(Self { archive, readback, incarnation, scope, journal_url, journal_tls, key_vault, objects })
     }
 
     pub(super) async fn run(self) -> Result<Value> {
         let digest = Sha256::digest(read_archive(&self.archive)?).into();
+        let requested = self.readback.as_deref().map(Readback::read).transpose()?;
+        if requested.as_ref().is_some_and(|readback| {
+            readback.incarnation != self.incarnation || readback.archive_sha256 != digest_hex(&digest)
+                || !readback.object_holds_verified || readback.held_versions.is_empty()
+        }) {
+            return Err(invalid_readback());
+        }
         let credentials = crate::cli::journal_credentials(&self.journal_tls)?;
         let JournalBackend { journal, batch, .. } = connect_stream_journal(&self.journal_url, &credentials).await?;
         let keys = Arc::new(FileKms::open(&self.key_vault, || SystemClock.now().0)?);
@@ -44,7 +81,10 @@ impl Verifier {
         let inventory = self.objects.versioned_inventory(&root, &remotes).await?;
         inventory.require_versioned().await?;
         let io = IoRegion::new();
-        let store = self.objects.open(&root, &remotes, Arc::clone(&io)).await?;
+        let store = match &requested {
+            Some(readback) => inventory.pinned_read_store(&readback.held_versions)?,
+            None => self.objects.open(&root, &remotes, Arc::clone(&io)).await?,
+        };
         let mut database = MultiDatabase::new(
             MultiOptions {
                 database: self.incarnation,
@@ -57,15 +97,24 @@ impl Verifier {
         let checked = database.check_installed_backup_object_holds(digest, &inventory).await;
         io.close_and_wait().await;
         let checked = checked?;
-        Ok(json!({
-            "incarnation": self.incarnation,
-            "archive_sha256": digest_hex(&checked.installation.manifest_sha256()),
-            "journal_head": checked.journal_head.0,
-            "checkpoint": checked.checkpoint.to_string(),
-            "held_versions": checked.versions,
-            "object_holds_verified": true,
-        }))
+        let current = Readback {
+            incarnation: self.incarnation,
+            archive_sha256: digest_hex(&checked.installation.manifest_sha256()),
+            journal_head: checked.journal_head.0,
+            checkpoint: checked.checkpoint.to_string(),
+            held_versions: checked.versions,
+            object_holds_verified: true,
+        };
+        if requested.is_some_and(|previous| previous != current) {
+            return Err(invalid_readback());
+        }
+        serde_json::to_value(current)
+            .map_err(|error| Anomaly::fault("rtdb/backup-object-readback", error.to_string()))
     }
+}
+
+fn invalid_readback() -> Anomaly {
+    Anomaly::incorrect("rtdb/backup-object-readback", "The object readback must match the verified staged backup")
 }
 
 fn uuid(value: &str) -> Result<Uuid> {
@@ -162,20 +211,22 @@ mod tests {
         let file = rtdb_storage::ObjectKey::new(relocated.destination_file.to_string()).unwrap();
         drop(staged);
 
-        let verify = || MultiBackupOptions::parse([
+        let verify = |readback: Option<&Path>| MultiBackupOptions::parse([
             "verify-object-holds".to_owned(), "--archive".into(), archive_path.display().to_string(),
             "--incarnation".into(), incarnation.to_string(), "--authority-id".into(), authority.to_string(),
             "--cell-id".into(), cell.to_string(), "--key-vault".into(), vault.display().to_string(),
             "--journal-url".into(), journal_url.clone(), "--tls-dir".into(), tls.display().to_string(),
             "--bucket".into(), bucket.clone(), "--region".into(), "us-east-1".into(),
             "--s3-endpoint".into(), endpoint.clone(),
-        ].into_iter()).unwrap().run(rtdb_storage::AppleSync::Full);
+        ].into_iter().chain(readback.into_iter().flat_map(|path| [
+            "--readback".into(), path.display().to_string(),
+        ]))).unwrap().run(rtdb_storage::AppleSync::Full);
         let stream = StreamId(incarnation.as_u128());
         let head = journal.head(stream).await.unwrap();
         let objects = store.list(None).await.unwrap();
         assert_eq!(objects.len(), 4);
         let token = &objects.iter().find(|entry| entry.key.as_str().starts_with("~rtdb-v1/")).unwrap().key;
-        assert!(verify().await.is_err());
+        assert!(verify(None).await.is_err());
         let hold = |version: &rtdb_types::PhysicalObjectVersion| {
             aws("put-object-legal-hold", &["--key", &version.key,
                 "--version-id", &version.version, "--legal-hold", "Status=ON"]);
@@ -183,12 +234,12 @@ mod tests {
         for entry in objects.iter().filter(|entry| entry.key != file && &entry.key != token) {
             hold(&store.observe_head(&entry.key).await.unwrap().version.unwrap());
         }
-        assert!(verify().await.is_err());
+        assert!(verify(None).await.is_err());
         let physical = store.observe_head(&file).await.unwrap().version.unwrap();
         hold(&physical);
-        assert!(verify().await.is_err());
+        assert!(verify(None).await.is_err());
         hold(&store.observe_head(token).await.unwrap().version.unwrap());
-        let result = verify().await.unwrap();
+        let result = verify(None).await.unwrap();
         assert_eq!(result["object_holds_verified"], true);
         assert_eq!(result["incarnation"], incarnation.to_string());
         assert_eq!(result["archive_sha256"], digest_hex(&Sha256::digest(&archive).into()));
@@ -201,14 +252,32 @@ mod tests {
         aws("put-object", &["--key", &physical.key, "--body", same_bytes.to_str().unwrap()]);
         let replacement = store.observe_head(&file).await.unwrap().version.unwrap();
         assert_ne!(physical, replacement);
-        assert!(verify().await.is_err());
+        assert!(verify(None).await.is_err());
         hold(&replacement);
-        let new = verify().await.unwrap();
+        let new = verify(None).await.unwrap();
         assert_eq!(new["checkpoint"], result["checkpoint"]);
         assert_eq!(new["archive_sha256"], result["archive_sha256"]);
         let verified = new["held_versions"].as_array().unwrap();
         assert!(!verified.contains(&json!(physical)));
         assert!(verified.contains(&json!(replacement)));
+
+        let readback = home.path().join("readback.json");
+        fs::write(&readback, serde_json::to_vec(&result).unwrap()).unwrap();
+        let checkpoint = rtdb_storage::ObjectKey::new(result["checkpoint"].as_str().unwrap()).unwrap();
+        let checkpoint_version = store.observe_head(&checkpoint).await.unwrap().version.unwrap();
+        aws("delete-object", &["--key", &checkpoint_version.key]);
+        assert!(verify(None).await.is_err());
+        assert_eq!(verify(Some(&readback)).await.unwrap(), result);
+
+        let wrong_readback = home.path().join("wrong-readback.json");
+        let mut wrong = result.clone();
+        wrong["journal_head"] = json!(head.0 + 1);
+        fs::write(&wrong_readback, serde_json::to_vec(&wrong).unwrap()).unwrap();
+        assert!(verify(Some(&wrong_readback)).await.is_err());
+
+        aws("put-object-legal-hold", &["--key", &physical.key,
+            "--version-id", &physical.version, "--legal-hold", "Status=OFF"]);
+        assert!(verify(Some(&readback)).await.is_err());
         assert_eq!(journal.head(stream).await.unwrap(), head);
         io.close_and_wait().await;
         keepers.shutdown().await.unwrap();
