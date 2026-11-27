@@ -1668,6 +1668,125 @@ async fn multi_resumes_after_a_real_keeper_recovery_and_followers_rebuild() {
     keepers.shutdown().await.unwrap();
 }
 
+/// A MinIO server on loopback with its own port and data directory, from
+/// `RTDB_MINIO` or the co-design machine's install. `None` skips.
+struct Minio {
+    child: std::process::Child,
+    port: u16,
+    _dir: tempfile::TempDir,
+}
+
+impl Minio {
+    fn start(bucket: &str) -> Option<Self> {
+        let binary = std::env::var_os("RTDB_MINIO")
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".local/share/mise/installs/go/1.26.8/bin/minio")))
+            .filter(|path| path.exists())?;
+        let dir = tempfile::tempdir().unwrap();
+        // A directory in the data root is a bucket on a fresh single drive.
+        std::fs::create_dir_all(dir.path().join("data").join(bucket)).unwrap();
+        let free = || std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let (port, console) = (free(), free());
+        let child = std::process::Command::new(binary)
+            .arg("server")
+            .arg(dir.path().join("data"))
+            .args(["--address", &format!("127.0.0.1:{port}")])
+            .args(["--console-address", &format!("127.0.0.1:{console}")])
+            .env("MINIO_ROOT_USER", "rtdb-offload")
+            .env("MINIO_ROOT_PASSWORD", "rtdb-offload-secret")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        Some(Self { child, port, _dir: dir })
+    }
+}
+
+impl Drop for Minio {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// With Logkeeper offload retention on, keepers drop offloaded records
+/// below their newest few kilobytes and serve them back from the object
+/// store. A follower that falls far behind, and one that joins late and
+/// replays from the journal floor, both rebuild the writer's state while
+/// part of the history comes from MinIO below the keepers' local floor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_followers_rebuild_from_history_offloaded_below_the_keepers_local_floor() {
+    use stream_logkeeper::stream::consensus::{OffloadConfig, testing::LocalCluster};
+    let bucket = "rtdb-offload";
+    let Some(minio) = Minio::start(bucket) else {
+        eprintln!("skipped: no MinIO binary (set RTDB_MINIO)");
+        return;
+    };
+    let principals = [NODE_1_IDENTITY, NODE_2_IDENTITY, NODE_3_IDENTITY].map(|identity| keeper_principal(&identity));
+    let principals = principals.iter().map(String::as_str).collect::<Vec<_>>();
+    let mut keepers = LocalCluster::start(&principals).await.unwrap();
+    let offload: OffloadConfig = serde_json::from_value(serde_json::json!({
+        "url": format!("s3://{bucket}/rtdb"),
+        "endpoint": format!("http://127.0.0.1:{}", minio.port),
+        "allow_http": true,
+        "access_key_id": "rtdb-offload",
+        "secret_access_key": "rtdb-offload-secret",
+        "batch_bytes": 2048,
+        "batch_interval_ms": 100,
+        "retain_local_bytes": 4096,
+    }))
+    .unwrap();
+    // MinIO takes a moment to listen; enabling offload finalizes the
+    // cluster version and retries until the keepers answer.
+    keepers.enable_offload(principals[0], offload).await.unwrap();
+    let config = keepers.journal_config(8 << 30, 4 << 20);
+    let handle = |identity: Identity| -> Arc<dyn Journal> { Arc::new(keepers.journal(&keeper_principal(&identity), &config).unwrap()) };
+
+    let cluster = Cluster::new();
+    let mut writer = cluster.node(1, handle(NODE_1_IDENTITY));
+    let mut behind = cluster.node(2, handle(NODE_2_IDENTITY));
+    writer.create().await.unwrap();
+    assert_eq!(writer.tick(&live(1)).await.unwrap(), Role::Writer(Epoch(1)));
+    let body = "x".repeat(400);
+    let mut last = None;
+    for id in 1..=5 {
+        last = Some(writer.transact(&put(id as u8, id, &body)).await.unwrap());
+    }
+    cluster.at(last.as_ref().unwrap().system_time.0);
+    assert_eq!(text_at(&mut behind, MAIN_BRANCH, 5).await, Some(Value::Utf8(body.clone())));
+    let behind_at = behind.committed.as_ref().unwrap().head;
+    for id in 6..=80 {
+        last = Some(writer.transact(&put(id as u8, id, &format!("{body}{id}"))).await.unwrap());
+    }
+    cluster.at(last.as_ref().unwrap().system_time.0);
+    let head = writer.stream.head().await.unwrap();
+
+    // Wait until the keepers offloaded the history and dropped it locally.
+    let client = keepers.journal(principals[0], &config).unwrap();
+    let stream = writer.journal_stream();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+    let status = loop {
+        let status = client.client().offload_status(stream, true).await;
+        match &status {
+            Ok(status) if status.offloaded_through >= head && status.local_floor > Lsn(behind_at.0 + 1) => break status.clone(),
+            _ if tokio::time::Instant::now() < deadline => tokio::time::sleep(Duration::from_millis(100)).await,
+            _ => panic!("the keepers did not offload the history below their local floor: {status:?}"),
+        }
+    };
+    assert_eq!(status.floor, Lsn(1), "the writer trimmed nothing; the store holds the prefix");
+
+    // The far-behind follower resumes from a position the keepers no longer
+    // hold, and a late reader replays everything from the journal floor.
+    let mut late = cluster.node(3, handle(NODE_3_IDENTITY));
+    for node in [&mut behind, &mut late] {
+        assert_eq!(text_at(node, MAIN_BRANCH, 1).await, Some(Value::Utf8(body.clone())));
+        assert_eq!(text_at(node, MAIN_BRANCH, 80).await, Some(Value::Utf8(format!("{body}80"))));
+        assert_eq!(node.committed.as_ref().unwrap().head, head);
+        assert_eq!(node.role(), Role::Follower);
+    }
+    keepers.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn multi_writers_racing_to_acknowledge_a_journal_recovery_record_it_once() {
     let cluster = Cluster::new();
