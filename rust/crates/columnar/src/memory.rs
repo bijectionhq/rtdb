@@ -222,16 +222,14 @@ impl OwnedBatch {
     ) -> Result<Self> {
         let first = sources.first().ok_or_else(|| Anomaly::incorrect("rtdb/interleave", "Row selection has no input batch"))?;
         let schema = first.batch.schema();
-        let base = rows.len().checked_mul(128).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(allocation_overflow)?;
-        let bound = sources.iter().try_fold(base, |bytes, source| {
+        for source in sources.iter().skip(1) {
             if source.batch.schema() != schema { return Err(Anomaly::incorrect("rtdb/interleave", "Input batch schemas differ")); }
-            source.batch.get_array_memory_size().checked_mul(4)
-                .and_then(|size| size.checked_add(bytes)).ok_or_else(allocation_overflow)
-        })?;
+        }
+        let bound = interleave_bound(sources, rows)?;
         let mut reservation = memory.reserve(bound)?;
         let mut seen = BTreeSet::new();
         for &(batch, row) in rows {
-            if sources.get(batch).is_none_or(|source| row >= source.batch.num_rows()) || !seen.insert((batch, row)) {
+            if !seen.insert((batch, row)) {
                 return Err(Anomaly::incorrect("rtdb/interleave", "Row selection contains an invalid or repeated position"));
             }
         }
@@ -675,6 +673,29 @@ fn array_descriptors(array: &ArrayRef) -> Result<usize> {
 }
 
 fn sum(left: usize, right: usize) -> Result<usize> { left.checked_add(right).ok_or_else(allocation_overflow) }
+
+fn interleave_bound(sources: &[&OwnedBatch], rows: &[(usize, usize)]) -> Result<usize> {
+    let first = &sources[0].batch;
+    // Account for the index table, deduplication set, and output batch header plus one descriptor overhead per column.
+    let mut bound = rows.len().checked_mul(std::mem::size_of::<(usize, usize)>().saturating_mul(4))
+        .and_then(|bytes| bytes.checked_add(4096))
+        .ok_or_else(allocation_overflow)?;
+    for &(batch, row) in rows {
+        if sources.get(batch).is_none_or(|source| row >= source.batch.num_rows()) {
+            return Err(Anomaly::incorrect("rtdb/interleave", "Row selection contains an invalid or repeated position"));
+        }
+    }
+    for column in 0..first.num_columns() {
+        let overhead = allocation_overhead(&first.column(column).to_data())?;
+        bound = bound.checked_add(overhead).ok_or_else(allocation_overflow)?;
+        for &(batch, row) in rows {
+            let slice = sources[batch].batch.column(column).slice(row, 1).to_data();
+            let bytes = slice.get_slice_memory_size().map_err(super::arrow_error)?;
+            bound = bound.checked_add(bytes).ok_or_else(allocation_overflow)?;
+        }
+    }
+    Ok(bound)
+}
 
 fn selection_bound(batch: &RecordBatch, indices: &[u32]) -> Result<usize> {
     let mut bound = indices.len().checked_mul(std::mem::size_of::<u32>()).ok_or_else(allocation_overflow)?;

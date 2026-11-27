@@ -196,3 +196,32 @@ fn a_builder_estimate_grows_linearly_with_value_nesting() {
     let (shallow, deep) = (estimate(8), estimate(16));
     assert!(deep < shallow * 8, "doubling the depth grew the estimate from {shallow} to {deep}");
 }
+
+#[test]
+fn interleave_distinct_rows_bounds_reservation_by_selected_rows_not_full_sources() {
+    use std::sync::Arc;
+    use arrow_array::{RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use rtdb_columnar::{MemoryBudget, OwnedBatch};
+
+    let source_budget = MemoryBudget::new(8 << 20);
+    let schema = Arc::new(Schema::new(vec![Field::new("payload", DataType::Utf8, false)]));
+    let rows: Vec<String> = (0..1024).map(|i| format!("{i:04}-{}", "x".repeat(1024))).collect();
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(rows))]).unwrap();
+    assert!(batch.get_array_memory_size() > 1 << 20);
+    let source = OwnedBatch::new(batch, &source_budget).unwrap();
+
+    // Copying 2 rows (~2 KiB) must fit in a 32 KiB budget rather than reserving 4x the full 1 MiB source.
+    let copy_budget = MemoryBudget::new(32 << 10);
+    let copied = OwnedBatch::interleave_distinct_rows(&[&source], &[(0, 0), (0, 512)], &copy_budget).unwrap();
+    assert_eq!(copied.batch().num_rows(), 2);
+    assert!(copy_budget.peak_bytes() <= 32 << 10);
+    assert!(copy_budget.used_bytes() > 0);
+    drop(copied);
+    assert_eq!(copy_budget.used_bytes(), 0);
+
+    // Invalid and repeated positions are still rejected without leaking budget.
+    assert!(OwnedBatch::interleave_distinct_rows(&[&source], &[(0, 2000)], &copy_budget).is_err());
+    assert!(OwnedBatch::interleave_distinct_rows(&[&source], &[(0, 1), (0, 1)], &copy_budget).is_err());
+    assert_eq!(copy_budget.used_bytes(), 0);
+}
