@@ -13,7 +13,15 @@
     (doseq [changed [(assoc manifest :closed false) (assoc manifest :storage_version 7) (assoc manifest :storage_epoch 1)
                      (assoc manifest :prefix "other") (assoc manifest :fixture_sha256 "different") (assoc manifest :external_source_token "wal")]]
       (t/is (thrown? clojure.lang.ExceptionInfo (recovery/validate-request request fixture changed))))
-    (t/is (thrown? clojure.lang.ExceptionInfo (recovery/validate-request (assoc request :action "canary") fixture manifest)))))
+    (t/is (thrown? clojure.lang.ExceptionInfo (recovery/validate-request (assoc request :action "canary") fixture manifest)))
+    (let [retry (assoc request :retry_compaction true :compaction_target "l01-rc-b01")
+          l0 {:path "storage/v06/tables/public$products/data/l00-rc-b01.arrow"}
+          orphan {:path "storage/v06/tables/public$products/data/l01-rc-b01.arrow"}]
+      (t/is (= retry (recovery/validate-request retry fixture (assoc manifest :files [l0]))))
+      (t/is (thrown-with-msg? clojure.lang.ExceptionInfo #"unoccupied compaction keys"
+                            (recovery/validate-request retry fixture (assoc manifest :files [l0 orphan]))))
+      (t/is (thrown-with-msg? clojure.lang.ExceptionInfo #"Invalid recovery compaction target"
+                            (recovery/validate-request (dissoc retry :compaction_target) fixture manifest))))))
 
 (defn -main [& _]
   (let [result (t/run-tests 'rtdb.conformance.recovery-test)]

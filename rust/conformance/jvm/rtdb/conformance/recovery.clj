@@ -16,6 +16,9 @@
 
 (set! *warn-on-reflection* true)
 
+(defn- compacted-object? [path]
+  (boolean (re-matches #"storage/v06/tables/[^/]+/(?:data|meta)/l(?!00-)[^/]+\.arrow" path)))
+
 (defn validate-request [request fixture manifest]
   (history/validate-fixture fixture)
   (when-not (and (= 1 (:schema_version request))
@@ -26,12 +29,20 @@
                  (= 6 (:storage_version manifest)) (= 0 (:storage_epoch manifest)) (= 1 (:partitions manifest)) (nil? (:external_source_token manifest))
                  (= "C" (get-in request [:canary :id])) (= 991 (get-in request [:canary :price])))
     (throw (ex-info "Invalid recovery request or protected manifest" {})))
+  (when (or (:retry_compaction request) (:compaction_target request))
+    (let [target (:compaction_target request)]
+      (when-not (and (= "recover" (:action request)) (true? (:retry_compaction request))
+                     (string? target) (re-matches #"l01-rc-b[0-9a-f]{2,17}" target))
+        (throw (ex-info "Invalid recovery compaction target" {:target target})))
+      (when-let [occupied (some #(when (compacted-object? (:path %)) (:path %)) (:files manifest))]
+        (throw (ex-info "JVM local compaction requires unoccupied compaction keys" {:target target, :occupied occupied})))))
   request)
 
 (defn- open-node ^Xtdb [^Path directory clock read-only?]
   (let [^Xtdb$Config config (node/->config {:log [:local {:path (.resolve directory "log"), :instant-src (tu/->settable-clock clock), :instant-source-for-non-tx-msgs? false}]
                                          :storage [:local {:path (.resolve directory "storage"), :epoch 0}]
-                                         :compactor {:threads 1}, :garbage-collector {:enabled? false}, :default-tz (ZoneId/of "UTC")})]
+                                         :compactor {:threads 1, :ree-iids? false, :within-file-recency-branching? false}
+                                         :garbage-collector {:enabled? false}, :default-tz (ZoneId/of "UTC")})]
     (.readOnlyDatabases config (boolean read-only?))
     (binding [compactor/*ignore-signal-block?* true] (node/start-node config))))
 
@@ -70,6 +81,7 @@
       (util/with-open [node (open-node directory clock false)]
         (log/sync-node node (Duration/ofSeconds 30))
         (compactor/compact-all! node (Duration/ofSeconds 60))
+        (log/sync-node node (Duration/ofSeconds 30))
         (let [checkpoint (#'history/checkpoint node)]
           (assoc result :after_retry {:checkpoint checkpoint, :observations (observations node fixture request (assoc manifest :checkpoint checkpoint))}))))))
 

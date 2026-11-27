@@ -1,6 +1,7 @@
 import copy
 import hashlib
 import os
+import re
 import shutil
 import struct
 from pathlib import Path
@@ -225,16 +226,72 @@ def compare_recovery(fixture, baseline, execution, protected, canary=None):
     return {"recovery_selection_passed": not failures, "complete_parity": False, "failures": failures}
 
 
-def verify_partial(directory, boundary, retried=False, original_files=None):
-    root = Path(directory) / "storage/v06"
-    data, metadata = root / boundary["data_key"], root / boundary["metadata_key"]
-    if not data.is_file() or data.is_symlink() or data.stat().st_size != boundary["data_bytes"]:
-        raise ValueError("partial compaction boundary has no retained data object")
-    if metadata.exists() != retried:
-        raise ValueError("partial compaction metadata completion differs from required boundary")
-    if retried:
-        relative = data.relative_to(directory).as_posix()
-        previous = next(value for value in original_files if value["path"] == relative)
-        with data.open("rb") as stream:
-            if hashlib.file_digest(stream, "sha256").hexdigest() != previous["sha256"]:
-                raise ValueError("fallback changed an existing immutable compaction output")
+PRODUCTS = "storage/v06/tables/public$products"
+
+
+def compaction_paths(target):
+    if not re.fullmatch(r"l01-rc-b[0-9a-f]{2,17}", target):
+        raise ValueError(f"invalid current L1 products key: {target}")
+    block = target.removeprefix("l01-rc-b")
+    if int(block[0], 16) != len(block) - 2 or (len(block) > 2 and block[1] == "0"):
+        raise ValueError(f"noncanonical block in products key: {target}")
+    return tuple(f"{PRODUCTS}/{kind}/{target}.arrow" for kind in ("data", "meta"))
+
+
+def compaction_target(checkpoint):
+    index = checkpoint["adopted_block"]["index"]
+    if not integer(index) or index < 0:
+        raise ValueError("compaction input has no adopted block")
+    body = format(index, "x")
+    block = f"b{len(body) - 1:x}{body}"
+    l0 = f"l00-rc-{block}"
+    tries = checkpoint["live_product_tries"]
+    if checkpoint["live_product_segments"] != 0 or len(tries) != 1 or tries[0]["level"] != 0 or tries[0]["key"] != l0:
+        raise ValueError("compaction input must have exactly one products trie in the adopted L0 block")
+    return f"l01-rc-{block}", f"{PRODUCTS}/data/{l0}.arrow"
+
+
+def verify_partial(directory, target, boundary):
+    data, metadata = compaction_paths(target)
+    files = {file["path"]: file for file in file_manifest(directory)}
+    if (boundary.get("data_key"), boundary.get("metadata_key")) != tuple(path.removeprefix("storage/v06/") for path in (data, metadata)):
+        raise ValueError(f"crash did not intercept the selected products key: {target}")
+    if data not in files or (files[data]["bytes"], files[data]["sha256"]) != (boundary.get("data_bytes"), boundary.get("data_sha256")):
+        raise ValueError(f"crash data differs from the durable boundary receipt: {data}")
+    if metadata in files:
+        raise ValueError(f"crashed writer already published metadata: {metadata}")
+
+
+def verify_preserved_storage(before, after):
+    current = {entry["path"]: entry for entry in after}
+    for entry in before:
+        if entry["path"].startswith("storage/") and current.get(entry["path"]) != entry:
+            raise ValueError(f"compaction changed a protected object: {entry['path']}")
+
+
+def products_compaction_inventory(files):
+    return [entry for entry in files if any(entry["path"].startswith(f"{PRODUCTS}/{kind}/l")
+            and not entry["path"].startswith(f"{PRODUCTS}/{kind}/l00-") for kind in ("data", "meta"))]
+
+
+def catalogued(checkpoint, target):
+    return [entry for entry in checkpoint["live_product_tries"] if entry["key"] == target]
+
+
+def classify_compaction_retry(target, predecessor, clean, after, retry, same_inode):
+    data_key = compaction_paths(target)[0].removeprefix("storage/v06/")
+    if not same_inode or after["data"] != predecessor["data"]:
+        raise ValueError(f"retry replaced the immutable predecessor: {data_key}")
+    if predecessor["metadata"] is not None:
+        raise ValueError(f"retry input already had metadata: {target}")
+    trie = catalogued(retry["checkpoint"], target)
+    error = retry.get("compaction_error")
+    if predecessor["data"] != clean["data"]:
+        if (not error or error.get("code") != "rtdb.storage/immutable-object-conflict"
+                or error.get("context", {}).get("key") != data_key or error["context"].get("operation") != "put_file"
+                or after["metadata"] is not None or trie):
+            raise ValueError(f"conflicting predecessor was not refused at the selected data publication: {data_key}")
+        return "immutable_conflict"
+    if error or after != clean or trie != [{"key": target, "level": 1, "data_file_size": clean["data"]["bytes"]}]:
+        raise ValueError(f"retry did not publish the clean native output at the selected key: {target}")
+    return "reused"

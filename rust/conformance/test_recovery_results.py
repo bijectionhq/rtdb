@@ -6,7 +6,8 @@ import unittest
 from pathlib import Path
 
 from history_results import micros
-from recovery_results import clone_closed, compare_recovery, file_manifest, local_log_head, replica_boundary, verify_files, verify_partial
+from recovery_results import (classify_compaction_retry, clone_closed, compare_recovery, compaction_paths, compaction_target,
+                              file_manifest, local_log_head, replica_boundary, verify_files, verify_partial)
 from test_history_results import HistoryComparisonTests
 
 
@@ -91,22 +92,71 @@ class RecoveryEvidenceTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     local_log_head(path)
 
-    def test_partial_retry_must_keep_uploaded_data_and_complete_its_metadata(self):
+    def test_data_only_boundary_requires_selected_key_and_durable_digest(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            data = root / "storage/v06/tables/products/data/l1.arrow"
-            metadata = root / "storage/v06/tables/products/meta/l1.arrow"
+            target = "l01-rc-b01"
+            data, metadata = (root / path for path in compaction_paths(target))
             data.parent.mkdir(parents=True)
             data.write_bytes(b"immutable")
-            boundary = {"data_key": "tables/products/data/l1.arrow", "metadata_key": "tables/products/meta/l1.arrow", "data_bytes": 9}
-            files = file_manifest(root)
-            verify_partial(root, boundary)
+            boundary = {"data_key": data.relative_to(root / "storage/v06").as_posix(),
+                        "metadata_key": metadata.relative_to(root / "storage/v06").as_posix(),
+                        "data_bytes": 9, "data_sha256": hashlib.sha256(b"immutable").hexdigest()}
+            verify_partial(root, target, boundary)
+            with self.assertRaisesRegex(ValueError, "selected products key"):
+                verify_partial(root, "l01-rc-b00", boundary)
+            data.write_bytes(b"different")
+            with self.assertRaisesRegex(ValueError, "boundary receipt"):
+                verify_partial(root, target, boundary)
+            data.write_bytes(b"immutable")
             metadata.parent.mkdir()
             metadata.write_bytes(b"complete")
-            verify_partial(root, boundary, True, files)
-            data.write_bytes(b"different")
+            with self.assertRaisesRegex(ValueError, "already published metadata"):
+                verify_partial(root, target, boundary)
+
+    def test_deterministic_target_is_the_current_l1_of_the_adopted_canary_block(self):
+        checkpoint = {"adopted_block": {"index": 17}, "live_product_segments": 0,
+                      "live_product_tries": [{"level": 0, "key": "l00-rc-b111"}]}
+        self.assertEqual(compaction_target(checkpoint),
+                         ("l01-rc-b111", "storage/v06/tables/public$products/data/l00-rc-b111.arrow"))
+        checkpoint["live_product_tries"].append({"level": 0, "key": "l00-rc-b0f"})
+        with self.assertRaises(ValueError):
+            compaction_target(checkpoint)
+        for bad_key in ("l01-rc-b100", "l01-rc-b001", "../../l01-rc-b01"):
             with self.assertRaises(ValueError):
-                verify_partial(root, boundary, True, files)
+                compaction_paths(bad_key)
+
+    def test_retry_requires_same_object_and_exact_catalogued_clean_output(self):
+        target = "l01-rc-b01"
+        clean = {"data": {"bytes": 9, "sha256": "native"}, "metadata": {"sha256": "meta"},
+                 "events": ["logical events"], "page_rows": [1], "metadata_leaves": [[[], 0]]}
+        orphan = {**clean, "metadata": None, "metadata_leaves": None}
+        retry = {"checkpoint": {"live_product_tries": [{"key": target, "level": 1, "data_file_size": 9}]}}
+        self.assertEqual(classify_compaction_retry(target, orphan, clean, clean, retry, True), "reused")
+        with self.assertRaisesRegex(ValueError, "replaced"):
+            classify_compaction_retry(target, orphan, clean, clean, retry, False)
+        with self.assertRaisesRegex(ValueError, "did not publish"):
+            classify_compaction_retry(target, orphan, clean, orphan, retry, True)
+        with self.assertRaisesRegex(ValueError, "did not publish"):
+            classify_compaction_retry(target, orphan, clean, clean, {"checkpoint": {"live_product_tries": []}}, True)
+
+    def test_conflict_requires_exact_key_operation_and_unpublished_predecessor(self):
+        target = "l01-rc-b01"
+        clean = {"data": {"bytes": 9, "sha256": "native"}, "metadata": {"sha256": "meta"}}
+        orphan = {"data": {"bytes": 9, "sha256": "other"}, "metadata": None}
+        retry = {"checkpoint": {"live_product_tries": []},
+                 "compaction_error": {"code": "rtdb.storage/immutable-object-conflict",
+                                      "context": {"key": compaction_paths(target)[0].removeprefix("storage/v06/"), "operation": "put_file"}}}
+        self.assertEqual(classify_compaction_retry(target, orphan, clean, orphan, retry, True), "immutable_conflict")
+        with self.assertRaisesRegex(ValueError, "not refused"):
+            classify_compaction_retry(target, orphan, clean, {**orphan, "metadata": clean["metadata"]}, retry, True)
+        retry["checkpoint"]["live_product_tries"] = [{"key": target}]
+        with self.assertRaisesRegex(ValueError, "not refused"):
+            classify_compaction_retry(target, orphan, clean, orphan, retry, True)
+        retry["checkpoint"]["live_product_tries"] = []
+        retry["compaction_error"]["context"]["key"] = "different-key"
+        with self.assertRaisesRegex(ValueError, "not refused"):
+            classify_compaction_retry(target, orphan, clean, orphan, retry, True)
 
     def test_replica_manifest_keeps_term_sequence_and_exact_payload_digest(self):
         with tempfile.TemporaryDirectory() as temporary:

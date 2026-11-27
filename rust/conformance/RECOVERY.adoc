@@ -41,13 +41,30 @@ The current canary read must return its acknowledged price and exact valid/syste
 Historical A/B reads still compare with the pre-canary observations, including history erased at the September prefix.
 An independent Rust follower copy and the designated JVM fallback copy both perform these reads.
 
-The partial-compaction cases first acknowledge the same canary and flush its block.
-A passive object-store wrapper admits a compaction data upload, verifies its paired metadata is absent, persists the boundary marker, and holds that caller before metadata publication.
-After SIGKILL and process-group join, the runner protects those bytes and opens separate recovery copies.
-The JVM fallback then acquires leadership and runs ordinary deterministic compaction.
-Its retry must complete the missing metadata and preserve the already-uploaded data bytes under the same key.
-Current and historical reads are checked both before and after the retry.
-This fault case covers Rust partial output retried by the JVM; the reverse partial-output direction remains a separate qualification.
+The partial-compaction cases append the same canary to each JVM live prefix, flush its block, and close one protected pre-compaction checkpoint.
+The flush creates the sole products L0 trie, so the selected job consumes the exact same object in both engines.
+On independent byte-identical copies, the pinned JVM and native leaders each compact the same inputs.
+The selected key is the current L1 products trie for the adopted canary block.
+Both clean controls must publish that exact trie in their catalog.
+The report retains both products compaction inventories, data and metadata hashes, and file page layouts at the selected key.
+The native offline reader decodes both files and compares the sorted fingerprints of the stored logical events with multiplicity.
+The reader checks that completed metadata addresses each data page exactly once.
+Current and historical SQL observations also compare across the controls after each compactor has published its result.
+
+A passive object-store wrapper interrupts another native copy after the selected data upload and before its paired metadata write.
+The durable marker binds the selected data and metadata keys to the retained data size and SHA-256 digest.
+After SIGKILL and process-group join, the runner verifies the boundary, protects the orphan, and checks both engines' read-only recovery.
+The native retry on that orphan must keep its inode and bytes and publish the metadata and catalog entry seen in the native clean control.
+Two further native copies start from the protected pre-compaction checkpoint with only the selected data key seeded.
+One holds the JVM clean output at that key and the other holds the L0 products file from the separately retained pre-canary flushed prefix.
+Any different predecessor bytes must be refused with the immutable conflict code at that exact data key, with its inode, bytes, absent metadata, and absent catalog entry preserved.
+A successful reuse must preserve the same object and publish the exact native clean output.
+Both outcomes retain current and historical SQL results before and after the attempt.
+
+The pinned JVM's local Arrow writer installs output using an atomic move that can replace an occupied destination.
+The JVM adapter permits compaction only on clean copies without pre-existing compacted trie files.
+It opens the actual orphan for read-only fallback and reports the missing no-clobber guarantee alongside the candidate and predecessor hashes.
+The partial-compaction selection stays unqualified while that reverse writer boundary remains unresolved.
 
 Ordinary adapter returns close their nodes and join drivers before enumerating artifacts.
 Forced-kill receipts explicitly distinguish an intentional process crash from graceful closure.
@@ -60,5 +77,5 @@ The JVM adapter references its private harness Vars; their source directory is p
 Production JVM sources and original tests remain unchanged.
 Native hooks are limited to the conformance CLI and a history helper accepting an explicit resource factory and read-only mode.
 
-Written tests cover exact immutable copying, malformed log tails, missing and duplicate observations, incorrect canary identity, partial-output conflicts, forced-kill descendant joins, timeout and cancellation cleanup, native manifest rejection before node open, and JVM request validation.
+Written tests cover exact immutable copying, malformed log tails, missing and duplicate observations, incorrect canary identity, data-only digests, exact immutable conflicts, metadata page coverage, forced-kill descendant joins, timeout and cancellation cleanup, native manifest rejection before node open, and rejection of occupied JVM outputs.
 Success sets only `recovery_selection_passed`; `complete_parity` and production, mixed-writer, and external-source qualification remain false.
