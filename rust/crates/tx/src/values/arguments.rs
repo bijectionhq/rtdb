@@ -64,7 +64,7 @@ fn argument_vector(chunk: &ArgumentChunk, position: usize, target: &Field, ty: &
                 return Ok((Arc::clone(array), None));
             }
             if *source_layout == SourceArgumentLayout::Canonical
-                && matches!(field.data_type(), DataType::List(_) | DataType::FixedSizeList(..) | DataType::Struct(_))
+                && matches!(field.data_type(), DataType::List(_) | DataType::FixedSizeList(..) | DataType::Map(..) | DataType::Struct(_))
                 && *ty == ty.unencoded() && ty.join(source) == *ty
                 && canonical::selectable(field) && canonical::selectable(target)
                 && validate_readable_column(field, array.as_ref(), source, memory).is_ok()
@@ -649,6 +649,40 @@ fn canonical_fixed_float_union_arguments_preserve_padding_under_null_vectors() {
 }
 
 #[test]
+fn canonical_source_map_arguments_keep_buffers_and_match_row_bytes() {
+    use arrow_array::StringArray;
+    use rtdb_types::Value;
+
+    let memory = MemoryBudget::new(1 << 20);
+    for sorted in [false, true] {
+        let first_key = if sorted { "a" } else { "z" };
+        let rows = vec![
+            vec![Value::Map { sorted, entries: vec![
+                (Value::Utf8(first_key.into()), Value::I64(12)),
+                (Value::Utf8(first_key.into()), Value::Null),
+                (Value::Utf8("m".into()), Value::I64(13)),
+            ] }],
+            vec![Value::Null],
+            vec![Value::Map { sorted, entries: Vec::new() }],
+        ];
+        let reference = SqlArguments::from_rows(rows.clone(), &memory).unwrap();
+        let ty = &reference.types()[0];
+        let field = to_field("binding", ty).unwrap();
+        let array = rtdb_columnar::copy_array(ty, &rows.into_iter().map(|mut row| row.remove(0)).collect::<Vec<_>>()).unwrap();
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field.clone()])), vec![Arc::clone(&array)]).unwrap();
+        let arguments = SqlArguments::from_arrow_with_canonical_source(OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap();
+        let keys = |array: &dyn Array| {
+            array.as_map().entries().column(0).as_any().downcast_ref::<StringArray>().unwrap().value(0).as_ptr()
+        };
+        let (kept, scratch) = argument_vector(&arguments.chunks[0].1, 0, &field, ty, &memory).unwrap();
+        assert!(scratch.is_none());
+        assert_eq!(keys(kept.as_ref()), keys(arguments.first_arrow_page().unwrap().batch().column(0).as_ref()));
+        assert_eq!(crate::source::encode_arguments(&arguments, &memory).unwrap().as_slice(),
+            crate::source::encode_arguments(&reference, &memory).unwrap().as_slice());
+    }
+}
+
+#[test]
 fn canonical_source_arguments_preserve_the_null_map_key_error() {
     use arrow_array::{Int64Array, ListArray, MapArray, NullArray, StringArray, UnionArray};
     use arrow_buffer::OffsetBuffer;
@@ -670,14 +704,19 @@ fn canonical_source_arguments_preserve_the_null_map_key_error() {
     let entries = rtdb_columnar::build_struct_array(fields, &[Arc::new(keys), Arc::new(Int64Array::from(vec![42]))], 1, None).unwrap();
     let map = MapArray::new(Arc::new(Field::new("entries", entries.data_type().clone(), false)),
         OffsetBuffer::new(vec![0, 1].into()), entries.as_struct().clone(), None, false);
+    let map_value = Value::Map { sorted: false, entries: vec![(Value::Null, Value::I64(42))] };
     let list = ListArray::new(Arc::new(Field::new("$data$", map.data_type().clone(), false)),
-        OffsetBuffer::new(vec![0, 1].into()), Arc::new(map), None);
-    let field = Field::new("binding", list.data_type().clone(), false);
-    let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![Arc::new(list)]).unwrap();
-    let arguments = SqlArguments::from_arrow_with_canonical_source(OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap();
-    let rows = vec![vec![Value::list(vec![Value::Map { sorted: false, entries: vec![(Value::Null, Value::I64(42))] }])]];
-    let reference = SqlArguments::new(arguments.types().to_vec(), rows, &memory).unwrap();
-    let expected = crate::source::encode_arguments(&reference, &memory).unwrap_err();
-    assert_eq!(expected.code, "rtdb/null-map-key");
-    assert_eq!(crate::source::encode_arguments(&arguments, &memory).unwrap_err().code, expected.code);
+        OffsetBuffer::new(vec![0, 1].into()), Arc::new(map.clone()), None);
+    for (column, value) in [
+        (Arc::new(map) as ArrayRef, map_value.clone()),
+        (Arc::new(list) as ArrayRef, Value::list(vec![map_value])),
+    ] {
+        let field = Field::new("binding", column.data_type().clone(), false);
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![column]).unwrap();
+        let arguments = SqlArguments::from_arrow_with_canonical_source(OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap();
+        let reference = SqlArguments::new(arguments.types().to_vec(), vec![vec![value]], &memory).unwrap();
+        let expected = crate::source::encode_arguments(&reference, &memory).unwrap_err();
+        assert_eq!(expected.code, "rtdb/null-map-key");
+        assert_eq!(crate::source::encode_arguments(&arguments, &memory).unwrap_err().code, expected.code);
+    }
 }
