@@ -794,7 +794,7 @@ async fn query_parameter_binding_tracks_the_same_row_as_scalar_binding() {
 
 #[tokio::test]
 async fn tracked_query_retains_mixed_integer_list_parameters_without_changing_claims() {
-    use arrow_array::{Int64Array, ListArray, UInt64Array};
+    use arrow_array::{Array, Int64Array, ListArray, UInt64Array};
     use arrow_buffer::OffsetBuffer;
 
     let running = Running::start(Some("secret"), FlightConfig::default()).await;
@@ -828,7 +828,7 @@ async fn tracked_query_retains_mixed_integer_list_parameters_without_changing_cl
 
 #[tokio::test]
 async fn scalar_run_query_conversion_preserves_rows_and_tracked_claims() {
-    use arrow_array::{Int32Array, Int64Array, RunArray, types::Int32Type};
+    use arrow_array::{Array, Int32Array, Int64Array, RunArray, types::Int32Type};
 
     let running = Running::start(Some("secret"), FlightConfig::default()).await;
     let mut client = Client::connect(&running.server, Some("xtdb:secret")).await;

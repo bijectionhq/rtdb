@@ -92,6 +92,7 @@ impl rtdb_node::ResourceFactory for HostedFixtureResources {
             codec: Box::new(HostedFixtureReceipts(rtdb_types::PlacedAttemptScope::new(name, 1)?)),
             recovery: rtdb_node::ClosedEpochRecovery::Opened(rtdb_storage::log::LogOffset(-1)),
             placed_receipt_retirement: false,
+            admits_direct_commits: true,
         };
         Ok(logs)
     }
