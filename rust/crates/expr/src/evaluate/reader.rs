@@ -630,7 +630,7 @@ async fn append_list_element<'a>(
             builder.push_numeric(decimal.into_cell()?);
             return Ok(());
         }
-        Some(computed::Output::Value(cell)) => materialize(box_cell(cell)?, frame)?.await?,
+        Some(cell) => materialize(box_cell(cell.into_value()?)?, frame)?.await?,
         None => materialize(nth(clone_value(value, frame)?, index, frame)?.await?, frame)?.await?,
     };
     if projection {

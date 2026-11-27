@@ -818,6 +818,10 @@ mod tests {
             panic!("Expected COALESCE to keep the original borrowed string");
         };
         assert_eq!(winner.as_ptr(), array.value(1).as_ptr());
+        let list = Expr::List(vec![coalesce.clone()]);
+        let items = vec![Value::Utf8(original.into())];
+        assert_eq!(materialize(evaluate(&list, &frame).unwrap().await.unwrap(), &frame).unwrap().await.unwrap(),
+            Value::List(items.into()));
         for expression in [
             Expr::binary(BinaryOp::Concat, coalesce.clone(), suffix.clone()),
             named_concat(vec![coalesce.clone(), suffix.clone()]),
