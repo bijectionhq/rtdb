@@ -3,7 +3,7 @@ use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{bloom::BloomFilter, transit::{TransitValue, encode_msgpack}};
 use rtdb_plan::{BinaryOp, ColumnId, Expr, Field, NamedExpr, Relation, RelationNode, Schema};
 use rtdb_types::{EntityId, Iid, LogicalType, Result, ScalarType, Value};
-use crate::{columnar::ColumnBatch, context::Execution, invalid, scalar_key::ScalarKey};
+use crate::{columnar::ColumnBatch, context::Execution, invalid, join_key::BorrowedListKey, scalar_key::ScalarKey};
 
 struct IidEntries {
     values: BTreeSet<Iid>,
@@ -395,6 +395,15 @@ impl PushdownBuilder {
                 }
                 continue;
             }
+            if let Some(list) = BorrowedListKey::read(column, row) {
+                let (xxhash, murmur3) = list.hashes::<true>();
+                key.add(rtdb_format::bloom::hashes(xxhash, murmur3));
+                if matches!(list, BorrowedListKey::Values { .. })
+                    && !matches!(key.filter.iids, Some(IidCandidates::LimitExceeded(_))) {
+                    key.filter.iids = None;
+                }
+                continue;
+            }
             let scope = rtdb_expr::EvaluationScope::new(memory)?;
             let value = column.expression_value(row, true, Some(&scope))?;
             key.add(BloomFilter::value_positions(&value)?);
@@ -589,6 +598,47 @@ mod tests {
         assert!(filters.sorted_iid_probe(schema.fields(), false, Iid::MIN).is_none());
         let candidates = filters.iid_filter(schema.fields(), true).unwrap();
         assert_eq!(candidates, &[EntityId::keyword_iid(&spelling)]);
+    }
+
+    #[test]
+    fn borrowed_join_list_bloom_hashes_selected_cells_without_admitting_a_decoded_list() {
+        use crate::columnar::Column;
+
+        for fixed in [false, true] {
+            let memory = MemoryBudget::new(16 << 10);
+            let values = vec![Value::Utf8("key".repeat(32 * 1024)), Value::Null];
+            let list = if fixed { Value::FixedSizeList(values.into()) } else { Value::list(values) };
+            let logical = list.logical_type().maybe();
+            let field = Field { id: ColumnId(0), name: "_iid".into(), qualifier: None, qualified_only: false,
+                unnamed: false, data_type: logical.clone() };
+            let schema = Schema::new(vec![field.clone()]).unwrap();
+            let array = rtdb_columnar::build_array(&logical, &[list.clone(), Value::Null]).unwrap();
+            let custody = MemoryBudget::new(1 << 20).reserve(array.get_array_memory_size() + 4096).unwrap();
+            let source = ColumnBatch::settled(vec![Column::Arrow {
+                array, field: Arc::new(rtdb_columnar::to_field("_iid", &logical).unwrap()), logical: Some(logical),
+            }], 2, custody).unwrap();
+            let selected = ColumnBatch::take_rows(&[&source], &[(0, 1), (0, 0)], &[0], &memory).unwrap();
+            assert!(selected.columns[0].bound(1).unwrap() > memory.limit_bytes());
+            let mut builder = PushdownBuilder {
+                keys: vec![Key {
+                    expression: field.expression(), probe: field.id,
+                    filter: ColumnFilter { bloom: Some(BloomFilter::default()), iids: IidCandidates::for_probe(&field, 1),
+                        _reservation: memory.reserve(1024).unwrap() },
+                    pending: Pending::Sorted(Vec::new()),
+                    recorded: RecordedIntegers::default(),
+                }],
+                _reservation: memory.reserve(1024).unwrap(),
+            };
+            builder.insert_arrow(&schema, &selected, 0, &memory).unwrap();
+            assert!(matches!(builder.keys[0].filter.iids, Some(IidCandidates::Raw(_))));
+            builder.insert_arrow(&schema, &selected, 1, &memory).unwrap();
+            let filters = builder.finish(&memory).unwrap().unwrap();
+            assert!(filters.iid_filter(schema.fields(), true).is_none());
+            let mut expected = BloomFilter::default();
+            expected.insert_value(&Value::Null).unwrap();
+            expected.insert_value(&list).unwrap();
+            assert_eq!(filters.columns[0].1.bloom.as_ref(), Some(&expected));
+        }
     }
 
     #[test]

@@ -316,3 +316,59 @@ async fn arrow_equijoin_matches_float_widths_and_rejects_unknown_vector_keys_acr
         assert_eq!(count, 1);
     }
 }
+
+#[tokio::test]
+async fn borrowed_join_list_keys_keep_typed_matches_and_null_semantics_across_spill() {
+    for fixed in [false, true] {
+        let list = |values: Vec<Value>| if fixed { Value::FixedSizeList(values.into()) } else { Value::list(values) };
+        let key = |value: &str| list(vec![Value::Utf8(value.into()), Value::Utf8("tail".into())]);
+        let a = key("a");
+        let b = key("b");
+        let unknown = list(vec![Value::Null, Value::Utf8("tail".into())]);
+        let build = [a.clone(), b.clone(), a.clone(), unknown.clone(), Value::Null];
+        let probe = [a.clone(), b.clone(), unknown, Value::Null, key("absent")];
+        for threshold in [1, 100] {
+            let execution = execution(32, threshold);
+            let baseline = execution.context.memory.used_bytes();
+            let left = table(0, &build);
+            let right = table(1, &probe);
+            let condition = equal(&left, &right);
+            let actual = collect(open(join(left, right, JoinKind::Inner, Some(condition)), &execution).await).await;
+            let mut expected_keys = [a.clone(), a.clone(), b.clone()];
+            if threshold == 1 {
+                expected_keys.sort_by_key(|value| crate::join_storage::hash_values([value]).unwrap() & 1);
+            }
+            assert_eq!(actual.into_iter().flatten().collect::<Vec<_>>(),
+                expected_keys.map(|value| vec![value.clone(), value]));
+            assert_eq!(execution.context.spill_peak_bytes() > 0, threshold == 1);
+            assert_eq!(execution.context.spill_bytes(), 0);
+            assert_eq!(execution.context.memory.used_bytes(), baseline);
+        }
+    }
+}
+
+#[test]
+fn borrowed_join_list_hash_preserves_composite_order_and_zero_policy_under_the_decode_budget() {
+    use crate::{columnar::Column, join_key::hash_join_row, join_storage::hash_values, set_keys::JoinHash};
+
+    let execution = execution(32, 0);
+    let context = &execution.context;
+    let memory = &context.memory;
+    let list = Value::list(vec![Value::Utf8("key".repeat(32 * 1024)), Value::Null]);
+    let zero = Value::F64(-0.0);
+    let columns = [&list, &zero].map(|value| {
+        let logical = value.logical_type();
+        let field = Arc::new(rtdb_columnar::to_field("key", &logical).unwrap());
+        let array = rtdb_columnar::build_array_refs(&logical, &[value]).unwrap();
+        Column::Arrow { array, field, logical: Some(logical) }
+    });
+    let batch = ColumnBatch::settled(Vec::from(columns), 1, memory.reserve(1 << 20).unwrap()).unwrap();
+    let _held = memory.reserve(memory.available_bytes() - (4 << 10)).unwrap();
+    assert!(batch.columns[0].bound(0).unwrap() > memory.available_bytes());
+
+    let raw = hash_values([&zero, &list]).unwrap();
+    let canonical = hash_values([&Value::F64(0.0), &list]).unwrap();
+    assert_ne!(raw, canonical);
+    assert_eq!(hash_join_row(&batch, 0, &[1, 0], false, JoinHash::Vector, context).unwrap(), raw);
+    assert_eq!(hash_join_row(&batch, 0, &[1, 0], false, JoinHash::CanonicalZero, context).unwrap(), canonical);
+}

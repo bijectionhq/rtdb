@@ -11,9 +11,10 @@ use crate::{
     QueryContext,
     columnar::{Column, ColumnBatch, relayout_output},
     invalid,
+    join_key::hash_join_row,
     join_storage::partition_count,
     runtime_schema::schema_bound,
-    set_keys::{JoinHash, Key, KeyColumns},
+    set_keys::{JoinHash, KeyColumns},
     spill::{SpillFile, SpillReader, SpillWriter},
 };
 
@@ -284,7 +285,7 @@ impl SpilledBlocks {
                 return partition_rows(batch.len, partitions, context, |row| Ok(hashes[row]));
             }
             partition_rows(batch.len, partitions, context, |row| {
-                Key::for_columns(batch, row, projected, positions, context)?.join_hash(hashing)
+                hash_join_row(batch, row, positions, projected, hashing, context)
             })
         })
     }

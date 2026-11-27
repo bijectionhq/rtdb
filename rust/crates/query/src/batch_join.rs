@@ -767,7 +767,7 @@ impl Spec {
             } else {
                 for row in 0..batch.len {
                     context.check_cancelled_at(row)?;
-                    hashes.push(self.key_hash(batch, row, 0)?);
+                    hashes.push(crate::join_key::hash_join_row(batch, row, &self.build_keys, self.projected[0], self.hash, context)?);
                 }
             }
         }

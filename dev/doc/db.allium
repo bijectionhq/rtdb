@@ -2483,7 +2483,8 @@ surface QueryAccess {
         -- This search keeps a probe row when any of its key cells is NULL or every candidate fails to match.
         -- Other batch anti joins visit the build rows available to the probe in build order, including rows with different hashes, and stop at the first true result or reached error.
         -- Join partitions retain flat and nested layouts in Arrow IPC, including selected cells whose physical fields differ.
-        -- Equijoin shuffle and partition replay hash admitted scalar key columns in equality-pair order, using ordered row hashing for other layouts.
+        -- Equijoin shuffle and build indexing hash admitted scalar and plain scalar-list keys from their Arrow positions in equality-pair order.
+        -- Other key layouts use ordered row hashing.
         -- Equijoins over compatible primitive scalar key types hash either floating zero sign as positive zero in the join index and both shuffles.
         -- Anti joins with fallible predicates or keys keep their raw partition routing and ordered comparison of the reached build rows.
         -- A hash join cursor span reports bytes written in completed spill files, including frame overhead, for its input spools and shuffles.

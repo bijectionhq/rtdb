@@ -1,8 +1,88 @@
-use std::sync::Arc;
+use std::{convert::Infallible, ops::Range, sync::Arc};
+use arrow_array::{Array, FixedSizeListArray, ListArray};
+use arrow_schema::DataType;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_plan::{BinaryOp, ColumnId, Expr, Field, Relation, RelationNode, Schema};
-use rtdb_types::Result;
-use crate::{context::Execution, invalid, runtime_schema::{expression_bound, schema_bound}};
+use rtdb_types::{ListKind, LogicalType, Result};
+use crate::{
+    QueryContext, columnar::{Column, ColumnBatch, float_vector::nonnull}, context::Execution, invalid,
+    join_storage::combine_cell_hash, runtime_schema::{expression_bound, schema_bound},
+    scalar_key::{ScalarColumn, ScalarKey}, set_keys::{JoinHash, Key},
+};
+
+pub(crate) enum BorrowedListKey<'a> {
+    Null,
+    Values { children: ScalarColumn<'a>, rows: Range<usize> },
+}
+
+impl<'a> BorrowedListKey<'a> {
+    pub(crate) fn read(column: &'a Column, row: usize) -> Option<Self> {
+        let (array, field, logical, row) = column.arrow_cell(row)??;
+        if row >= array.len() || field.data_type() != array.data_type() || !field.metadata().is_empty() {
+            return None;
+        }
+        let LogicalType::List { kind, element } = nonnull(logical?) else { return None; };
+        let (children, rows) = match (kind, field.data_type()) {
+            (ListKind::List, DataType::List(child)) => {
+                let list = array.as_any().downcast_ref::<ListArray>()?;
+                let offsets = list.value_offsets();
+                let children = ScalarColumn::bind(list.values().as_ref(), child, Some(element))?;
+                (children, offsets[row] as usize..offsets[row + 1] as usize)
+            }
+            (ListKind::FixedSizeList(width), DataType::FixedSizeList(child, physical)) if width == physical => {
+                let list = array.as_any().downcast_ref::<FixedSizeListArray>()?;
+                let start = list.value_offset(row) as usize;
+                let children = ScalarColumn::bind(list.values().as_ref(), child, Some(element))?;
+                (children, start..start + *physical as usize)
+            }
+            _ => return None,
+        };
+        Some(if array.is_null(row) { Self::Null } else { Self::Values { children, rows } })
+    }
+
+    pub(crate) fn hashes<const BLOOM: bool>(&self) -> (i32, i32) {
+        let Self::Values { children, rows } = self else { return (0, 0); };
+        let mut xx = 0i32;
+        let mut murmur = 0i32;
+        children.visit(rows.clone().map(Some), |key| {
+            xx = xx.wrapping_mul(31).wrapping_add(key.hash() as i32);
+            if BLOOM {
+                murmur = murmur.wrapping_mul(31).wrapping_add(key.murmur3() as i32);
+            }
+            Ok::<_, Infallible>(())
+        }).unwrap();
+        (xx, murmur)
+    }
+}
+
+enum BorrowedHashCell<'a> {
+    Scalar(ScalarKey<'a>),
+    List(BorrowedListKey<'a>),
+}
+
+impl<'a> BorrowedHashCell<'a> {
+    fn read(column: &'a Column, row: usize) -> Option<Self> {
+        if let Some(key) = ScalarKey::read(column, row) { return Some(Self::Scalar(key)); }
+        BorrowedListKey::read(column, row).map(Self::List)
+    }
+
+    fn hash(self, hashing: JoinHash) -> i32 {
+        match self {
+            Self::Scalar(key) => hashing.scalar(key) as i32,
+            Self::List(key) => key.hashes::<false>().0,
+        }
+    }
+}
+
+pub(crate) fn hash_join_row(
+    batch: &ColumnBatch, row: usize, positions: &[usize], projected: bool, hashing: JoinHash, context: &QueryContext,
+) -> Result<u32> {
+    let cells = positions.iter().map(|&position| BorrowedHashCell::read(batch.columns.get(position)?, row));
+    if cells.clone().any(|cell| cell.is_none()) {
+        return Key::for_columns(batch, row, projected, positions, context)?.join_hash(hashing);
+    }
+    Ok(cells.fold(0, |hash, cell| combine_cell_hash(hash, cell.expect("All hash cells were admitted").hash(hashing))))
+}
 
 pub(crate) struct JoinInput {
     pub original: Schema,
