@@ -3944,6 +3944,8 @@ impl PredicateSelection {
 
     pub(crate) fn is_empty(&self) -> bool { self.count == 0 }
 
+    pub(crate) fn is_all(&self) -> bool { self.count == self.mask.len() }
+
     pub(crate) fn validate_len(&self, len: usize) -> Result<()> {
         if self.mask.len() != len {
             return Err(invalid("column-filter", "Filter predicate length differs from its batch"));
@@ -5507,7 +5509,7 @@ impl Column {
         }
     }
 
-    fn duplicate_for_projection(&self, owner: &Arc<MemoryReservation>, memory: &Arc<MemoryBudget>)
+    pub(crate) fn duplicate_for_projection(&self, owner: &Arc<MemoryReservation>, memory: &Arc<MemoryBudget>)
         -> Result<(Self, Arc<MemoryReservation>)> {
         let reservation = match self {
             Self::Arrow { logical, .. } => {

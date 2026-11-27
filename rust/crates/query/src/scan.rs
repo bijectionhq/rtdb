@@ -24,7 +24,7 @@ use rtdb_trie::{PageSummary, PruningOptions, TemporalSummary, select_pages_from_
 use rtdb_types::{ARCHIVE_TX_FROM, ARCHIVE_TX_TO, HOSTED_RECEIPT_TX_ID, OWNED_EVENT_POSITION_COLUMN,
     Anomaly, AnomalyKind, EntityId, EventHeader, EventOp, EventPosition, Iid, Interval, Result, TemporalBounds, TimeUnit, Timestamp, Value};
 
-use crate::columnar::{BatchCursor, BatchFilter, BoxBatchCursor, Column, admitted_predicate_selection};
+use crate::columnar::{BatchCursor, BatchFilter, BoxBatchCursor, Column, ColumnBatch, admitted_predicate_selection};
 use crate::compiled::{Admission, Predicates};
 use crate::{CandidateIids, ConstantEvaluator, PreparedSearchQuery, QueryContext, accelerate::{ExecutionConstants, SearchQueries}, context::Execution, fragment::{ScanFragment, ScanFragmenter}, pages::{OwnedPage,PageBuilder}, scan_tasks::{PageRange,ScanTask,ScanTaskPlan}, invalid};
 
@@ -701,15 +701,21 @@ impl FilteredScan {
                 selection.validate_len(rows.len())?;
                 scan.execution.context.check_cancelled()?;
                 if selection.is_empty() { continue; }
-                drop(input);
-                let mut row = 0;
-                rows.retain(|_| {
-                    let keep = selection.contains(row);
-                    row += 1;
-                    keep
-                });
+                let predicate_page = if selection.is_all() {
+                    Some(input)
+                } else {
+                    drop(input);
+                    let mut row = 0;
+                    rows.retain(|_| {
+                        let keep = selection.contains(row);
+                        row += 1;
+                        keep
+                    });
+                    None
+                };
                 drop(selection);
-                let output = scan.gather_group(page, &rows, &task.batches, true).await?;
+                let output = scan.gather_group(page, &rows, &task.batches, true,
+                    predicate_page.as_ref().map(|input| (&filter.schema, input))).await?;
                 self.pending = Some((task, group));
                 return Ok(Some(output));
             }
@@ -2900,14 +2906,16 @@ impl PartitionScan {
     async fn buffer_task(&mut self, task: ResolvedScanTask) -> Result<()> {
         let ResolvedScanTask { selected, groups, batches, reservation, _group_reservations } = task;
         for (group, rows) in groups.iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
-            let output = self.gather_group(selected[group], rows, &batches, false).await?;
+            let output = self.gather_group(selected[group], rows, &batches, false, None).await?;
             self.output.push_back(output);
         }
         self.output_reservation = Some(reservation);
         Ok(())
     }
 
-    async fn gather_group(&mut self, page: usize, rows: &[ResolvedRow<(u32, u32)>], batches: &[Arc<IndexBatch>], filtered: bool) -> Result<crate::columnar::ColumnBatch> {
+    async fn gather_group(&mut self, page: usize, rows: &[ResolvedRow<(u32, u32)>], batches: &[Arc<IndexBatch>],
+        filtered: bool, predicate_page: Option<(&Schema, &ColumnBatch)>,
+    ) -> Result<ColumnBatch> {
         let archive_history = projects_archive_history(&self.scan);
         let keyed = self.scan.table.name.table.is_owned_event_data();
         let owned = self.execution.context.catalog.admits_owned_event_positions(&self.scan.table.name);
@@ -2925,7 +2933,17 @@ impl PartitionScan {
             if !archive_history && field.name == "user_metadata" && let Some((column, charge)) = metadata.take() {
                 return Ok(Some((column, Some(charge))));
             }
-            self.slots[position].map(|slot| self.match_column(slot, page, rows, batches).map(|column| (column, None))).transpose()
+            if let Some(slot) = self.slots[position] {
+                return self.match_column(slot, page, rows, batches).map(|column| Some((column, None)));
+            }
+            if let Some((schema, input)) = predicate_page
+                && let Some(index) = schema.position(field.id)
+                && schema.fields()[index] == *field
+            {
+                let (column, charge) = input.columns[index].duplicate_for_projection(input.column_reservation(index), memory)?;
+                return Ok(Some((column, Some(charge))));
+            }
+            Ok(None)
         })?;
         let flow = arrow_flow::sample();
         if self.evidence.is_some() || flow.is_some() {
@@ -3614,6 +3632,44 @@ mod tests {
             outer: OuterRows::empty(&memory).unwrap(), context, bindings: None, analysis: None,
         };
         (scan, execution, memory)
+    }
+
+    #[tokio::test]
+    async fn late_scan_reuses_all_passing_predicate_columns_and_their_charge() {
+        let (state, table, _) = live_table();
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let (mut scan, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        for (id, name) in [(1, "_valid_to"), (2, "_system_from")] {
+            scan.columns.push(Field { id: ColumnId(id), name: name.into(), qualifier: None, qualified_only: false,
+                unnamed: false, data_type: scan.table.scan_column_type(name) });
+        }
+        let time = Value::Timestamp { value: 100, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) };
+        let predicate = Expr::binary(BinaryOp::And,
+            Expr::binary(BinaryOp::Gt, scan.columns[0].expression(), Expr::Literal(Value::I64(0))),
+            Expr::binary(BinaryOp::GtEq, scan.columns[2].expression(), Expr::Literal(time.clone())),
+        );
+        let schema = Schema::new(scan.columns.clone()).unwrap();
+        let predicates = Predicates::new(Arc::new(schema), vec![predicate].into());
+        let cursor = ScanCursor::new(scan, execution.clone(), None).await.unwrap();
+        let mut filtered = cursor.filtered(&predicates, execution).unwrap();
+        let mut pages = Vec::new();
+        while let Some(page) = filtered.next_batch().await.unwrap() { pages.push(page); }
+        drop(filtered);
+
+        let mut values = Vec::new();
+        for page in pages {
+            assert!(Arc::ptr_eq(page.column_reservation(0), page.column_reservation(2)));
+            assert!(!Arc::ptr_eq(page.column_reservation(0), page.column_reservation(1)));
+            for row in 0..page.len {
+                let Value::I64(value) = page.columns[0].value(row).unwrap() else { panic!("Expected i64 payload"); };
+                values.push(value);
+                assert_eq!(page.columns[1].value(row).unwrap(), Value::Null);
+                assert_eq!(page.columns[2].value(row).unwrap(), time);
+            }
+        }
+        values.sort_unstable();
+        assert_eq!(values, [1, 2, 3]);
+        assert_eq!(memory.used_bytes(), 0);
     }
 
     #[tokio::test]

@@ -2421,6 +2421,7 @@ surface QueryAccess {
         -- A point in both time dimensions selects the same visible fragment as history resolution, including its valid-time endpoints and the effects of deletes and erases.
         -- An eligible range predicate on a local scan reads its referenced columns from the resolved rows, and payload projection gathers only the positions the predicate keeps.
         -- An ordinary scan can apply a bound, total scalar predicate to its referenced columns after bitemporal resolution and gather other columns from the surviving positions.
+        -- When every resolved row in a group passes, the scan can reuse the predicate's gathered columns and their charges for matching output fields.
         -- A bound predicate over UTC microsecond timestamps can use those resolved positions, including the nullable bounds of a visible fragment.
         -- Scan traces distinguish the Arrow buffer bytes of freshly decoded data from the buffers materialized by output gathering and the filtered rows retained by position.
         -- Gathered bytes exclude Arrow buffers that share their backing with a resolved source page.
