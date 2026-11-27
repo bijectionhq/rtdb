@@ -64,7 +64,11 @@ fn argument_vector(chunk: &ArgumentChunk, position: usize, target: &Field, ty: &
                 return Ok((Arc::clone(array), None));
             }
             if *source_layout == SourceArgumentLayout::Canonical
-                && matches!(field.data_type(), DataType::List(_) | DataType::FixedSizeList(..) | DataType::Map(..) | DataType::Struct(_))
+                && (matches!(field.data_type(), DataType::List(_) | DataType::FixedSizeList(..) | DataType::Map(..) | DataType::Struct(_))
+                    || matches!(field.data_type(), DataType::RunEndEncoded(_, child)
+                        if child.data_type() == target.data_type() && canonical_argument_field(child)
+                            && (matches!(ty, LogicalType::Scalar(_))
+                                || matches!(ty, LogicalType::Maybe(inner) if matches!(inner.as_ref(), LogicalType::Scalar(_))))))
                 && *ty == ty.unencoded() && ty.join(source) == *ty
                 && canonical::selectable(field) && canonical::selectable(target)
                 && validate_readable_column(field, array.as_ref(), source, memory).is_ok()
@@ -680,6 +684,34 @@ fn canonical_source_map_arguments_keep_buffers_and_match_row_bytes() {
         assert_eq!(crate::source::encode_arguments(&arguments, &memory).unwrap().as_slice(),
             crate::source::encode_arguments(&reference, &memory).unwrap().as_slice());
     }
+}
+
+#[test]
+fn canonical_source_arguments_expand_plain_scalar_runs_when_coalescing_unencoded_rows() {
+    use arrow_array::{Int32Array, Int64Array, RunArray, types::{Int32Type, Int64Type}};
+    use arrow_buffer::NullBuffer;
+    use rtdb_types::Value;
+
+    let memory = MemoryBudget::new(1 << 20);
+    let ends = Int32Array::from(vec![2, 4, 5]);
+    let values = Int64Array::new(vec![10, 867, 20].into(), Some(NullBuffer::from(vec![true, false, true])));
+    let run = RunArray::<Int32Type>::try_new(&ends, &values).unwrap();
+    let field = Field::new("runs", run.data_type().clone(), false);
+    let page = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![Arc::new(run)]).unwrap();
+    let mut arguments = SqlArguments::from_arrow_with_canonical_source(OwnedBatch::new(page, &memory).unwrap(), &memory).unwrap();
+    arguments.append(SqlArguments::from_rows(vec![vec![Value::I64(30)]], &memory).unwrap()).unwrap();
+    let reference = SqlArguments::from_rows([Value::I64(10), Value::I64(10), Value::Null, Value::Null, Value::I64(20), Value::I64(30)]
+        .into_iter().map(|value| vec![value]).collect(), &memory).unwrap();
+    assert_eq!(arguments.types(), reference.types());
+
+    let ty = &arguments.types()[0];
+    let target = to_field("?_0", ty).unwrap();
+    let (expanded, _scratch) = argument_vector(&arguments.chunks[0].1, 0, &target, ty, &memory).unwrap();
+    let values = expanded.as_primitive::<Int64Type>();
+    assert_eq!(values.values().as_ref(), &[10, 10, 0, 0, 20]);
+    assert_eq!(values.iter().collect::<Vec<_>>(), [Some(10), Some(10), None, None, Some(20)]);
+    assert_eq!(crate::source::encode_arguments(&arguments, &memory).unwrap().as_slice(),
+        crate::source::encode_arguments(&reference, &memory).unwrap().as_slice());
 }
 
 #[test]

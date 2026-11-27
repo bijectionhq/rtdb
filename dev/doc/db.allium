@@ -587,6 +587,7 @@ variant TxMessage : SourceMessage {
     -- Assertions and mutations whose argument rows can observe earlier writes resolve each binding in order against the transaction snapshot.
     -- Compatible nested SQL arguments align directly from their Arrow buffers and retain the canonical source bytes.
     -- Compatible SQL map arguments align their ordered entries in Arrow while preserving the canonical null-key rejection.
+    -- A coalesced plain scalar argument column can expand a compatible run-end chunk by Arrow position when its canonical target is unencoded.
     -- Compatible temporal SQL arguments keep their stored unit, value and zone label when aligned into the canonical source stream.
     -- SQL source replay binds Arrow argument rows by position and reads a scalar parameter when evaluation reaches it.
     -- Source encoding writes IID lists from their fixed-size bytes.
