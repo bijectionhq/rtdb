@@ -117,4 +117,11 @@ impl<J: Journal + ?Sized> Journal for FaultJournal<J> {
             self.journal.delete(stream).await
         })
     }
+
+    fn acknowledge_recovery(&self, stream: StreamId) -> BoxFuture<'_, Result<Lsn>> {
+        Box::pin(async move {
+            self.before(false).await?;
+            self.journal.acknowledge_recovery(stream).await
+        })
+    }
 }
