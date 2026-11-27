@@ -1,6 +1,6 @@
 use rtdb_plan::{ControlAccessOptions, ControlCommitMode, ControlStatement, ControlValue, CopyFormat, Expr};
-use rtdb_sql::{PrepareOptions, parse_control};
-use rtdb_types::{LogicalType, ScalarType, Value};
+use rtdb_sql::{ExecutableSyntax, ExtendedStatement, PrepareOptions, SqlPrepareChild, parse_admitted_control_in, parse_control, parse_extended_statement, parse_statement_batch};
+use rtdb_types::{LogicalType, MemoryBudget, ScalarType, Value};
 
 fn parse(source: &str) -> ControlStatement { parse_control(source, &PrepareOptions::default()).unwrap().unwrap() }
 
@@ -32,6 +32,76 @@ fn sql_parser_start_transaction_and_set_transaction_share_characteristics() {
     assert_eq!(parse("COMMIT ASYNC"), ControlStatement::Commit(Some(ControlCommitMode::Async)));
     assert_eq!(parse("COMMIT SYNC"), ControlStatement::Commit(Some(ControlCommitMode::Sync)));
     assert!(parse_control("SET TRANSACTION READ WRITE, ASYNC ?", &Default::default()).is_err());
+}
+
+#[test]
+fn control_grammar_is_shared_by_bare_commands_and_prepared_children() {
+    let memory = MemoryBudget::new(1 << 20);
+    let options = PrepareOptions::default();
+    for source in [
+        "BEGIN TRANSACTION READ ONLY WITH (,, CLOCK_TIME = ?,)",
+        "START TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ WRITE WITH (ASYNC OFF)",
+        "SET TRANSACTION AWAIT_TOKEN = ?, READ ONLY, TIMEZONE DEFAULT",
+        "SET SESSION TIME ZONE ?",
+        "SET TIMEZONE TO 'UTC'",
+        "SHOW TRANSACTION ISOLATION LEVEL",
+        "SHOW \"MiXeD-Parameter\"",
+        "COMMIT SYNC",
+        "ROLLBACK",
+    ] {
+        let command = parse(source);
+        let admitted = parse_admitted_control_in(source, &options, &memory).unwrap().unwrap();
+        assert_eq!(admitted.statement(), &command, "{source}");
+
+        let prepared = format!("PREPARE p AS {source}");
+        let batch = parse_statement_batch(&prepared, &memory).unwrap().next().unwrap();
+        let ExecutableSyntax::Control(simple) = batch.command else { panic!("{source}"); };
+        assert_eq!(simple.bind(&options).unwrap(), command, "{source}");
+
+        let ExtendedStatement::Prepare(extended) = parse_extended_statement(&prepared, &memory).unwrap().statement else { panic!("{source}"); };
+        let SqlPrepareChild::Command { syntax: ExecutableSyntax::Control(child), .. } = extended.child(&memory).unwrap() else { panic!("{source}"); };
+        assert_eq!(child.bind(&options).unwrap(), command, "{source}");
+    }
+}
+
+#[test]
+fn non_reference_controls_are_rejected_in_simple_extended_and_generic_paths() {
+    let memory = MemoryBudget::new(1 << 20);
+    for source in [
+        "END", "ABORT", "BEGIN WORK", "BEGIN TRAN", "BEGIN DEFERRED", "COMMIT WORK", "ROLLBACK WORK",
+        "COMMIT AND NO CHAIN", "ROLLBACK AND NO CHAIN", "START TRANSACTION READ ONLY, READ WRITE",
+        "BEGIN READ ONLY,", "BEGIN ISOLATION LEVEL SERIALIZABLE,", "BEGIN READ ONLY WITH (),",
+        "BEGIN READ ONLY WITH (), TIMEZONE 'UTC'", "BEGIN TIMEZONE 'UTC', READ ONLY WITH ()",
+        "BEGIN READ ONLY WITH (), READ WRITE", "BEGIN READ ONLY WITH (SYSTEM_TIME DEFAULT)",
+        "BEGIN READ WRITE WITH (\"metadata\" NULL)", "BEGIN READ ONLY, \"TIMEZONE\" 'UTC'",
+        "SET TRANSACTION", "SET TRANSACTION READ ONLY WITH ()", "SET TIME ZONE = 'UTC'", "SET TIME ZONE TO 'UTC'",
+        "SET TIMEZONE = ?", "SET LOCAL foo = 'bar'", "SET \"time\" ZONE 'UTC'", "SHOW", "SHOW a b c",
+    ] {
+        let prepared = format!("PREPARE p AS {source}");
+        assert_eq!(rtdb_sql::parse(source).unwrap_err().code, "xtdb/sql-error", "{source}");
+        assert_eq!(parse_statement_batch(source, &memory).unwrap_err().code, "xtdb/sql-error", "{source}");
+        assert_eq!(parse_statement_batch(&prepared, &memory).unwrap_err().code, "xtdb/sql-error", "{source}");
+        assert_eq!(parse_extended_statement(&prepared, &memory).unwrap_err().code, "xtdb/sql-error", "{source}");
+    }
+}
+
+#[test]
+fn repeated_with_groups_take_the_last_access_options_and_keep_the_last_zone() {
+    let control = parse("BEGIN READ ONLY WITH (SNAPSHOT_TIME DEFAULT, TIMEZONE 'Europe/Paris'), \
+        ISOLATION LEVEL READ COMMITTED, READ WRITE WITH (ASYNC TRUE), READ ONLY WITH ()");
+    let ControlStatement::Begin(options) = control else { panic!(); };
+    assert_eq!(options.timezone, Some(ControlValue::Expression(Expr::Literal(Value::Utf8("Europe/Paris".into())))));
+    assert_eq!(options.access, Some(ControlAccessOptions::ReadOnly(Default::default())));
+}
+
+#[test]
+fn session_parameter_names_fold_case_and_preserve_punctuation() {
+    assert_eq!(parse("SET \"MiXeD-Parameter\" TO 'x'"), ControlStatement::SetParameter {
+        name: "mixed-parameter".into(), value: Expr::Literal(Value::Utf8("x".into())),
+    });
+    assert_eq!(parse("SHOW \"MIXED-Parameter\""), ControlStatement::Show { name: "mixed-parameter".into() });
+    assert!(matches!(parse("SET ROLE = 'x'"), ControlStatement::SetParameter { name, .. } if name == "role"));
+    assert!(matches!(parse("SET TIMEZONE = 'UTC'"), ControlStatement::SetParameter { name, .. } if name == "timezone"));
 }
 
 #[test]
@@ -123,9 +193,6 @@ fn control_names_follow_the_reference_identifier_rule() {
         ("SHOW snapshot_token", "snapshot_token"), ("SHOW CLOCK_TIME", "clock_time"), ("SHOW TIME ZONE", "timezone"), ("SHOW database", "database")] {
         assert_eq!(parse(source), ControlStatement::Show { name: name.into() }, "{source}");
     }
-    assert_eq!(parse("SHOW TRANSACTION ISOLATION LEVEL"), ControlStatement::ShowTransactionIsolationLevel);
-    assert!(parse("SHOW TRANSACTION ISOLATION LEVEL").requires_read_transaction());
-    assert!(!parse("SHOW transaction_isolation").requires_read_transaction());
     assert_eq!(parse("SET ROLE NONE"), ControlStatement::SetRole);
     assert!(matches!(parse("SET AWAIT_TOKEN = 'x'"), ControlStatement::SetAwaitToken(_)));
 }

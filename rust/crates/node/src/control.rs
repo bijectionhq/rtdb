@@ -226,9 +226,7 @@ impl NativeSession {
             ControlStatement::SetTimeZone(expression) => {
                 let eval = self.control_context(arguments, &allocation, catalog);
                 let timezone = control_string(expression, &eval, "TIME ZONE").await?.ok_or_else(|| invalid("TIME ZONE requires a string"))?;
-                self.state.set_timezone(timezone)?;
-                allocation.reserve(self.state.effective_timezone().len())?;
-                Ok(ControlResult::Command { tag: "SET TIME ZONE".into(), transaction: None, parameter_status: Some(("TimeZone".into(), self.state.effective_timezone().into())), allocation })
+                self.set_control_timezone(&timezone, options.frontend, "SET TIME ZONE", allocation)
             }
             ControlStatement::SetAwaitToken(expression) => {
                 let eval = self.control_context(arguments, &allocation, catalog);
@@ -246,6 +244,10 @@ impl NativeSession {
                     return Ok(command("SET", allocation));
                 }
                 let value = session_parameter_text(value, &eval, &allocation).await?;
+                if name == "timezone" && matches!(options.frontend, ControlFrontend::PostgreSql | ControlFrontend::Native) {
+                    let timezone = value.ok_or_else(|| invalid("TIME ZONE requires a string"))?;
+                    return self.set_control_timezone(&timezone, options.frontend, "SET", allocation);
+                }
                 allocation.reserve(name.len().checked_mul(4).ok_or_else(|| invalid("SET name allocation overflow"))?)?;
                 self.state.set_parameter(name.clone(), value.clone())?;
                 Ok(ControlResult::Command { tag: "SET".into(), transaction: None, parameter_status: value.map(|value| (name.clone(), value)), allocation })
@@ -276,9 +278,6 @@ impl NativeSession {
                 };
                 self.show(name, statement.requires_read_transaction(), source, cancellation).await.map(ControlResult::Rows)
             },
-            ControlStatement::ShowTransactionIsolationLevel => {
-                self.show_transaction_isolation(cancellation).await.map(ControlResult::Rows)
-            }
             ControlStatement::Prepare { name, source } => {
                 allocation.reserve(size(name.len(), source.len())?)?;
                 Ok(ControlResult::Prepare { name: name.clone(), source: source.clone(), allocation })
@@ -324,6 +323,18 @@ impl NativeSession {
                 Ok(ControlResult::Command { tag: "DETACH DATABASE".into(), transaction: Some(CommitResult::Executed(result)), parameter_status: None, allocation })
             }
         }
+    }
+
+    fn set_control_timezone(&mut self, timezone: &str, frontend: ControlFrontend, tag: &str, allocation: Arc<EvaluationScope>) -> Result<ControlResult> {
+        let timezone = rtdb_expr::normalize_timezone(timezone).map_err(|mut error| {
+            if frontend == ControlFrontend::PostgreSql && error.code == "xtdb/invalid-timezone" {
+                error.category = AnomalyCategory::Fault;
+            }
+            error
+        })?;
+        allocation.reserve(timezone.len())?;
+        self.state.set_timezone(timezone.clone())?;
+        Ok(ControlResult::Command { tag: tag.into(), transaction: None, parameter_status: Some(("TimeZone".into(), timezone)), allocation })
     }
 
     fn control_context<'a>(&'a self, parameters: Parameters<'a>, allocation: &'a EvaluationScope, catalog: Option<&'a dyn rtdb_expr::PgCatalogLookup>) -> EvalContext<'a> {
@@ -424,14 +435,6 @@ impl NativeSession {
         QueryCursor::from_rows(schema, rows, context, reservation)
     }
 
-    async fn show_transaction_isolation(&mut self, cancellation: &CancellationToken) -> Result<QueryCursor> {
-        let basis = self.state.read_basis().await?;
-        let context = self.instrument_query_context(self.service.query_context(self.state.database(), &basis, cancellation).await?);
-        let reservation = context.memory.reserve(8192)?;
-        let mut binder = Binder::default();
-        let schema = Schema::new(vec![binder.field("transaction_isolation", None, LogicalType::Scalar(ScalarType::Utf8))?])?;
-        QueryCursor::from_rows(schema, vec![vec![Value::Utf8("read committed".into())]], context, reservation)
-    }
 }
 
 /// Retain `allocation` until returned settings are installed into charged session state or dropped.

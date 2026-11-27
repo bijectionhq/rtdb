@@ -42,6 +42,7 @@ pub enum Statement {
     Set { name: Vec<Identifier>, value: Expr, local: bool },
     Show { name: Vec<Identifier> },
     Explain { relation: Arc<Relation>, mode: crate::ExplainMode },
+    Control(Box<crate::ControlStatement>),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

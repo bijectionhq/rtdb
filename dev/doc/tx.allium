@@ -447,9 +447,9 @@
 --
 -- All three frontends — pgwire, ADBC and Flight SQL — drive one shared Connection, and the model reaches each through the entry points that frontend owns.
 --
---   1. pgwire: BEGIN / START TRANSACTION [modes], BEGIN [READ ONLY | READ WRITE] WITH (...),
+--   1. pgwire: BEGIN / START TRANSACTION [modes], BEGIN {READ ONLY | READ WRITE} WITH (...),
 --      COMMIT [SYNC | ASYNC] and ROLLBACK sent as SQL are pgwire's alone.
---      pgwire parses them itself.
+--      Simple Query, extended Parse and SQL PREPARE use the same transaction-control grammar.
 --      BEGIN evaluates and validates its characteristics, then publishes the open transaction with those characteristics atomically.
 --      COMMIT and ROLLBACK call the connection's commit and rollback.
 --      COPY (query) TO STDOUT WITH (FORMAT 'arrow-stream') uses the connection's read basis.
@@ -1146,6 +1146,8 @@ rule FirstStatementResolvesWriting {
 -- scoping — the broader SET / SHOW session surface is out of frame (as with SET SESSION
 -- CHARACTERISTICS, referenced only as a source of default_access_mode).
 -- A TIMEZONE on BEGIN or SET TRANSACTION stays tx-scoped (it sets tx_default_tz, never session_default_tz); a mid-tx SET TIME ZONE writes both, so it persists on COMMIT and reverts on ROLLBACK.
+-- Pgwire's literal SET TIMEZONE parameter form applies the same timezone update as the SET TIME ZONE expression form.
+-- Pgwire reports invalid zone names from these SQL SET forms with SQLSTATE XX000.
 
 rule SetTimeZoneInTx {
     -- Mid-transaction SET TIME ZONE writes BOTH the tx's tx_default_tz (so this tx's DML and

@@ -1,8 +1,9 @@
-use std::{collections::BTreeMap, mem::size_of, sync::Arc};
+use std::{collections::BTreeMap, mem::size_of, ops::ControlFlow, sync::Arc};
 
 use rtdb_plan::{AccessMode, ControlAccessOptions, ControlCommitMode, ControlStatement, ControlValue, CopyFormat, CopyOutFormat, DiscardTarget, Identifier, ReadOnlyOptions, ReadWriteOptions, TransactionOptions};
 use rtdb_types::{Anomaly, MemoryBudget, MemoryReservation, Result};
 use sqlparser::{ast, parser::Parser, tokenizer::{Span, Token, TokenWithSpan}};
+use sqlparser::ast::VisitMut;
 
 use crate::{PrepareOptions, parse::{StatementSource, source_span, sql_error}, split::{SplitTokens, boundary_lexical_bytes}};
 
@@ -107,15 +108,47 @@ impl<'input> ParsedControl<'input> {
 
     /// Compiles the control expressions using their original source and raw metadata budget.
     pub fn bind(self, options: &PrepareOptions) -> Result<ControlStatement> {
-        let source = self.source.input;
-        let bind = |expression| crate::bind::control_expression(source, &expression, options, self.forms);
-        self.syntax.try_map_expressions(bind, |expression| {
-            match crate::settings::clock_timestamp_literal(&expression)? {
-                Some(text) => Ok(ControlValue::TimestampLiteral(text)),
-                None => bind(expression).map(ControlValue::Expression),
-            }
-        })
+        bind_control_expressions(self.syntax, self.source.input, options, self.forms)
     }
+}
+
+pub(super) fn bind_control_expressions(
+    syntax: ControlStatement<ast::Expr>, source: &str, options: &PrepareOptions, forms: crate::bind::FormAllocation<'_>,
+) -> Result<ControlStatement> {
+    let bind = |expression| crate::bind::control_expression(source, &expression, options, forms);
+    syntax.try_map_expressions(bind, |expression| {
+        match crate::settings::clock_timestamp_literal(&expression)? {
+            Some(text) => Ok(ControlValue::TimestampLiteral(text)),
+            None => bind(expression).map(ControlValue::Expression),
+        }
+    })
+}
+
+pub(super) fn visit_control_expressions<V: ast::VisitorMut>(
+    control: &mut ControlStatement<ast::Expr>, visitor: &mut V,
+) -> ControlFlow<V::Break> {
+    match control {
+        ControlStatement::Begin(options) | ControlStatement::SetTransaction(options) => {
+            let mut visit = |value: &mut Option<ControlValue<ast::Expr>>| -> ControlFlow<V::Break> {
+                if let Some(ControlValue::Expression(expression)) = value { expression.visit(visitor)?; }
+                ControlFlow::Continue(())
+            };
+            visit(&mut options.timezone)?;
+            match &mut options.access {
+                Some(ControlAccessOptions::ReadOnly(options)) => {
+                    for value in [&mut options.snapshot_token, &mut options.snapshot_time, &mut options.clock_time, &mut options.await_token] { visit(value)?; }
+                }
+                Some(ControlAccessOptions::ReadWrite(options)) => {
+                    for value in [&mut options.system_time, &mut options.metadata, &mut options.asynchronous] { visit(value)?; }
+                }
+                None => (),
+            }
+        }
+        ControlStatement::SetTimeZone(value) | ControlStatement::SetAwaitToken(value) | ControlStatement::SetParameter { value, .. } => value.visit(visitor)?,
+        ControlStatement::Execute { arguments, .. } => arguments.visit(visitor)?,
+        _ => (),
+    }
+    ControlFlow::Continue(())
 }
 
 impl RetainedControlSyntax {
@@ -170,13 +203,15 @@ pub(super) fn prepare_name(input: &str, tokens: &[TokenWithSpan]) -> Result<Opti
 pub(super) fn parse_control_tokens<'input>(
     source: StatementSource<'input>, tokens: &[TokenWithSpan], forms: crate::bind::FormAllocation<'input>,
 ) -> Result<Option<ParsedControl<'input>>> {
+    Ok(parse_control_tree(source, tokens)?.map(|syntax| ParsedControl { source, forms, syntax }))
+}
+
+pub(super) fn parse_control_tree(source: StatementSource<'_>, tokens: &[TokenWithSpan]) -> Result<Option<ControlStatement<ast::Expr>>> {
     let Some(first) = tokens.first() else { return Ok(None); };
     if !is_control_head(first) { return Ok(None); }
     if let Some(name) = prepare_name(source.input, tokens)? {
         let inner = StatementSource::tokens(source.input, &tokens[3], tokens.last().expect("PREPARE body was checked"));
-        return Ok(Some(ParsedControl {
-            source, forms, syntax: ControlStatement::Prepare { name, source: inner.text().into() },
-        }));
+        return Ok(Some(ControlStatement::Prepare { name, source: inner.text().into() }));
     }
     let mut next_parameter = 1usize;
     let mut tokens = tokens.to_vec();
@@ -188,7 +223,7 @@ pub(super) fn parse_control_tokens<'input>(
     let mut parser = ControlParser { source: source.input, tokens, index: 0 };
     let syntax = parser.statement()?;
     if parser.index != parser.tokens.len() { return Err(parser.error("Unexpected input after control statement")); }
-    Ok(Some(ParsedControl { source, forms, syntax }))
+    Ok(Some(syntax))
 }
 
 struct ControlParser<'a> { source: &'a str, tokens: Vec<TokenWithSpan>, index: usize }
@@ -269,46 +304,82 @@ impl ControlParser<'_> {
         else if self.eat("REPEATABLE") { self.expect("READ")?; return Ok(()); }
         Err(self.error("Invalid transaction isolation level"))
     }
+    fn access_mode(&mut self) -> Result<AccessMode> {
+        self.expect("READ")?;
+        if self.eat("ONLY") { return Ok(AccessMode::ReadOnly); }
+        self.expect("WRITE")?;
+        Ok(AccessMode::ReadWrite)
+    }
     fn transaction_options(&mut self, begin: bool) -> Result<TransactionOptions<ast::Expr>> {
+        if self.index == self.tokens.len() {
+            return if begin { Ok(TransactionOptions::default()) }
+                else { Err(self.error("SET TRANSACTION requires transaction characteristics")) };
+        }
+        while self.eat("ISOLATION") {
+            self.isolation()?;
+            if !self.token(Token::Comma) { return Ok(TransactionOptions::default()); }
+        }
+        if begin && word(self.tokens.get(self.index), "READ") && word(self.tokens.get(self.index + 2), "WITH") {
+            return self.begin_with_options();
+        }
         let mut access = None;
         let mut values = BTreeMap::new();
-        let mut in_with = false;
-        let mut saw_mode = false;
-        while self.index < self.tokens.len() {
-            if in_with && self.token(Token::RParen) { in_with = false; if !self.token(Token::Comma) { break; } continue; }
-            if in_with && self.token(Token::Comma) { continue; }
-            if self.eat("READ") {
-                if in_with { return Err(self.error("READ mode cannot appear inside WITH options")); }
-                let mode = if self.eat("ONLY") { AccessMode::ReadOnly } else { self.expect("WRITE")?; AccessMode::ReadWrite };
+        loop {
+            if word(self.tokens.get(self.index), "READ") {
                 if access.is_some() { return Err(self.error("Transaction access mode was specified more than once")); }
-                access = Some(mode); saw_mode = true;
-                if self.eat("WITH") {
-                    if !begin || !self.token(Token::LParen) { return Err(self.error("WITH options require BEGIN and parentheses")); }
-                    in_with = true; continue;
-                }
+                access = Some(self.access_mode()?);
             } else if self.eat("ISOLATION") {
-                if in_with { return Err(self.error("Isolation level cannot appear inside WITH options")); }
-                self.isolation()?; saw_mode = true;
+                self.isolation()?;
             } else {
-                let mut name = self.identifier()?.normalized();
-                if name == "time" { self.expect("ZONE")?; name = "timezone".into(); }
-                if !["timezone", "snapshot_token", "snapshot_time", "clock_time", "await_token", "system_time", "metadata", "async"].contains(&name.as_str()) {
-                    return Err(self.error(format!("Unknown transaction option: {name}")));
-                }
-                let value = self.option_value(name == "async")?;
-                values.insert(name, value); saw_mode = true;
+                let (name, value) = self.transaction_option()?;
+                values.insert(name, value);
             }
-            if !self.token(Token::Comma) {
-                if in_with {
-                    if !self.token(Token::RParen) { return Err(self.error("Expected closing WITH parenthesis")); }
-                    in_with = false;
-                    if self.token(Token::Comma) { continue; }
-                }
-                break;
-            }
+            if !self.token(Token::Comma) { break; }
         }
-        if in_with { return Err(self.error("Unclosed WITH options")); }
-        if !begin && !saw_mode { return Err(self.error("SET TRANSACTION requires transaction characteristics")); }
+        self.finish_transaction_options(access, values)
+    }
+    fn begin_with_options(&mut self) -> Result<TransactionOptions<ast::Expr>> {
+        let mut options = TransactionOptions::default();
+        loop {
+            if self.eat("ISOLATION") {
+                self.isolation()?;
+            } else {
+                let mode = self.access_mode()?;
+                self.expect("WITH")?;
+                if !self.token(Token::LParen) { return Err(self.error("Expected opening WITH parenthesis")); }
+                let mut values = BTreeMap::new();
+                while !self.token(Token::RParen) {
+                    if self.token(Token::Comma) { continue; }
+                    let (name, value) = self.transaction_option()?;
+                    values.insert(name, value);
+                    if self.token(Token::RParen) { break; }
+                    if !self.token(Token::Comma) { return Err(self.error("Expected comma between WITH options")); }
+                }
+                let group = self.finish_transaction_options(Some(mode), values)?;
+                options.access = group.access;
+                if group.timezone.is_some() { options.timezone = group.timezone; }
+            }
+            if !self.token(Token::Comma) { break; }
+        }
+        Ok(options)
+    }
+    fn transaction_option(&mut self) -> Result<(&'static str, ControlValue<ast::Expr>)> {
+        let name = if self.eat("TIME") {
+            self.expect("ZONE")?;
+            "timezone"
+        } else {
+            let Some((_, name)) = [
+                ("TIMEZONE", "timezone"), ("SNAPSHOT_TOKEN", "snapshot_token"), ("SNAPSHOT_TIME", "snapshot_time"),
+                ("CLOCK_TIME", "clock_time"), ("AWAIT_TOKEN", "await_token"), ("SYSTEM_TIME", "system_time"),
+                ("METADATA", "metadata"), ("ASYNC", "async"),
+            ].into_iter().find(|(keyword, _)| self.eat(keyword)) else { return Err(self.error("Expected a transaction option")); };
+            name
+        };
+        Ok((name, self.option_value(name == "async")?))
+    }
+    fn finish_transaction_options(
+        &self, access: Option<AccessMode>, mut values: BTreeMap<&str, ControlValue<ast::Expr>>,
+    ) -> Result<TransactionOptions<ast::Expr>> {
         let timezone = values.remove("timezone");
         let access = match access {
             Some(AccessMode::ReadOnly) => Some(ControlAccessOptions::ReadOnly(ReadOnlyOptions {
@@ -331,7 +402,10 @@ impl ControlParser<'_> {
         if self.eat("ROLLBACK") { return Ok(ControlStatement::Rollback); }
         if self.eat("SET") {
             if self.eat("TRANSACTION") { return Ok(ControlStatement::SetTransaction(self.transaction_options(false)?)); }
-            if self.eat("ROLE") { if !self.eat("NONE") { self.grammar_identifier()?; } return Ok(ControlStatement::SetRole); }
+            if !self.set_separator_at(self.index + 1) && self.eat("ROLE") {
+                if !self.eat("NONE") { self.grammar_identifier()?; }
+                return Ok(ControlStatement::SetRole);
+            }
             let session = self.eat("SESSION");
             if session && self.eat("CHARACTERISTICS") {
                 self.expect("AS")?; self.expect("TRANSACTION")?;
@@ -344,24 +418,26 @@ impl ControlParser<'_> {
                 }
                 return Ok(ControlStatement::SetSessionCharacteristics(access));
             }
-            let await_token = !session && self.eat("AWAIT_TOKEN");
-            let mut name = if await_token { "await_token".into() } else { self.grammar_identifier()?.normalized() };
+            if self.eat("TIME") {
+                self.expect("ZONE")?;
+                return Ok(ControlStatement::SetTimeZone(self.expression()?));
+            }
+            if !self.set_separator_at(self.index + 1) && self.eat("TIMEZONE") {
+                return Ok(ControlStatement::SetTimeZone(self.expression()?));
+            }
+            if !session && self.eat("AWAIT_TOKEN") {
+                self.set_separator()?;
+                return Ok(ControlStatement::SetAwaitToken(self.expression()?));
+            }
+            let mut name = self.grammar_identifier()?.text.to_lowercase();
             if name == "bijection" && self.token(Token::Period) {
                 self.expect("AT")?;
                 name = "bijection.at".into();
             }
-            if name == "time" { self.expect("ZONE")?; name = "timezone".into(); }
-            let separator = self.token(Token::Eq) || self.eat("TO");
-            if name != "timezone" && !separator { return Err(self.error("SET requires TO or =")); }
+            self.set_separator()?;
             let value = self.expression()?;
-            return Ok(match name.as_str() {
-                "timezone" => ControlStatement::SetTimeZone(value),
-                _ if await_token => ControlStatement::SetAwaitToken(value),
-                _ => {
-                    if !is_literal(&value) { return Err(self.error("Session parameter requires a literal")); }
-                    ControlStatement::SetParameter { name, value }
-                }
-            });
+            if !is_literal(&value) { return Err(self.error("Session parameter requires a literal")); }
+            return Ok(ControlStatement::SetParameter { name, value });
         }
         if self.eat("DISCARD") {
             return Ok(ControlStatement::Discard(if self.eat("ALL") { DiscardTarget::All }
@@ -381,7 +457,7 @@ impl ControlParser<'_> {
                 self.expect("ZONE")?;
                 return Ok(ControlStatement::Show { name: "timezone".into() });
             }
-            let name = self.grammar_identifier()?.normalized();
+            let name = self.grammar_identifier()?.text.to_lowercase();
             return Ok(ControlStatement::Show { name });
         }
         if self.eat("EXECUTE") {
@@ -452,6 +528,15 @@ impl ControlParser<'_> {
             if !self.token(Token::Comma) { return Err(self.error("Expected comma between COPY options")); }
         }
         Ok(ControlStatement::CopyIn { table, format: format.flatten() })
+    }
+
+    fn set_separator_at(&self, index: usize) -> bool {
+        let token = self.tokens.get(index);
+        token.is_some_and(|token| token.token == Token::Eq) || word(token, "TO")
+    }
+
+    fn set_separator(&mut self) -> Result<()> {
+        if self.token(Token::Eq) || self.eat("TO") { Ok(()) } else { Err(self.error("SET requires TO or =")) }
     }
 }
 

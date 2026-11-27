@@ -99,6 +99,19 @@ fn standard_isolation_levels_are_accepted_and_ignored() {
 }
 
 #[test]
+fn generic_preparation_keeps_control_options_and_parameter_types() {
+    let parameter_type = LogicalType::Scalar(ScalarType::Utf8);
+    let options = PrepareOptions { parameter_types: [(0, parameter_type.clone())].into(), ..Default::default() };
+    let prepared = prepare("BEGIN READ ONLY WITH (TIME ZONE ?, CLOCK_TIME TIMESTAMP '2024-01-01T00:00:00Z')", &Fixture, &options).unwrap();
+    assert_eq!(prepared.parameter_types, options.parameter_types);
+    let Statement::Control(control) = prepared.statement else { panic!(); };
+    let ControlStatement::Begin(options) = *control else { panic!(); };
+    assert_eq!(options.timezone, Some(ControlValue::Expression(Expr::Parameter { index: 0, data_type: parameter_type })));
+    let Some(ControlAccessOptions::ReadOnly(options)) = options.access else { panic!(); };
+    assert_eq!(options.clock_time, Some(ControlValue::TimestampLiteral("2024-01-01T00:00:00Z".into())));
+}
+
+#[test]
 fn quoted_identifiers_after_a_date_keyword_and_out_of_range_integers_are_sql_errors() {
     let date = rejection(r#"INSERT INTO docs (_id, a) VALUES (1, DATE "2020-01-01")"#);
     assert_eq!((date.category, date.code.as_str()), (AnomalyCategory::Incorrect, "xtdb/sql-error"));

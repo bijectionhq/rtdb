@@ -146,13 +146,15 @@ fn map_control_value<E, T>(
 
 impl ControlStatement {
     pub fn parameter_count(&self) -> usize {
-        let expressions: Vec<&Expr> = match self {
+        self.expressions().into_iter().map(Expr::parameter_count).max().unwrap_or(0)
+    }
+    pub fn expressions(&self) -> Vec<&Expr> {
+        match self {
             Self::Begin(options) | Self::SetTransaction(options) => options.expressions(),
             Self::SetTimeZone(expr) | Self::SetAwaitToken(expr) | Self::SetParameter { value: expr, .. } => vec![expr],
             Self::Execute { arguments, .. } => arguments.iter().collect(),
             _ => Vec::new(),
-        };
-        expressions.into_iter().map(Expr::parameter_count).max().unwrap_or(0)
+        }
     }
     pub fn is_show(&self) -> bool {
         matches!(self, Self::Show { .. } | Self::ShowTransactionIsolationLevel)

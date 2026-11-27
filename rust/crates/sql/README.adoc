@@ -359,7 +359,14 @@ Compilation, execution, differential assertions, and exact diagnostic matching r
 `parse_control` recognizes BEGIN and START TRANSACTION characteristics, SET TRANSACTION, COMMIT modes, ROLLBACK, session settings, SHOW, SQL PREPARE and EXECUTE, COPY input, and database attachment controls.
 Control parsing retains expression syntax for scalar binding independently of a live database catalog.
 Names in SHOW, SET, SET ROLE, ATTACH and DETACH DATABASE and the COPY FROM target follow the reference `identifier` rule: an unquoted reserved word is an `xtdb/sql-error`, so `SHOW ALL` fails to parse as it does in the reference.
+Bare controls, extended Parse and SQL PREPARE bodies use the same control grammar.
+Transaction characteristics use a comma-separated list with at most one access mode, or a list of `READ ONLY WITH (...)` and `READ WRITE WITH (...)` groups and isolation levels.
+Only BEGIN and START TRANSACTION accept WITH groups, and the final group supplies the access options while the last explicit timezone survives.
+`COMMIT` accepts an optional `SYNC` or `ASYNC` keyword, and `ROLLBACK` takes no suffix.
 `SHOW TRANSACTION ISOLATION LEVEL`, `SHOW AWAIT_TOKEN`, `SHOW SNAPSHOT_TOKEN`, `SHOW CLOCK_TIME`, `SET AWAIT_TOKEN` and `SET ROLE NONE` keep their dedicated reference productions; `SET SESSION AWAIT_TOKEN` is rejected.
+SET and SHOW session parameter names fold case and preserve punctuation.
+`SET TIME ZONE <expression>` and `SET TIMEZONE <expression>` take their operand directly.
+Pgwire also sets the session timezone with the literal parameter form `SET TIMEZONE TO 'Europe/Paris'`, whose command tag is `SET`.
 Session parameter values admit no `X'hex'` literal.
 The parser checks the literal positions in session settings and transaction ASYNC options before collecting the command.
 Binding compiles the final transaction options in option order and resolves a CLOCK_TIME timestamp literal at that stage.

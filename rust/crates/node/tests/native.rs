@@ -1633,6 +1633,37 @@ async fn shared_show_controls_pin_snapshot_reads_and_keep_generic_show_unresolve
     assert!(!session.state().cancellation().is_cancelled());
     stop(&node, driver).await;
 }
+
+#[tokio::test]
+async fn pgwire_timezone_controls_have_distinct_tags_and_rollback_together() {
+    let (node, driver) = running(options(), services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let token = session.state().cancellation().child_token();
+    let options = ControlExecutionOptions { frontend: ControlFrontend::PostgreSql, ..Default::default() };
+    let parse = |sql| rtdb_sql::parse_control(sql, &Default::default()).unwrap().unwrap();
+    let initial_zone = session.state().effective_timezone().to_owned();
+    session.execute_control_with(&parse("BEGIN"), &[], &token, options).await.unwrap();
+    for (sql, expected_tag, zone) in [
+        ("SET TIME ZONE 'Europe/Paris'", "SET TIME ZONE", "Europe/Paris"),
+        ("SET SESSION \"TIMEZONE\" TO 'America/New_York'", "SET", "America/New_York"),
+    ] {
+        let result = session.execute_control_with(&parse(sql), &[], &token, options).await.unwrap();
+        let ControlResult::Command { tag, parameter_status, .. } = result else { panic!("{sql}"); };
+        assert_eq!(tag, expected_tag);
+        assert_eq!(parameter_status, Some(("TimeZone".into(), zone.into())));
+        assert_eq!(session.state().effective_timezone(), zone);
+    }
+    let invalid = parse("SET TIME ZONE 'Mars/Olympus'");
+    let Err(error) = session.execute_control_with(&invalid, &[], &token, options).await else { panic!("unknown zone accepted"); };
+    assert_eq!(error.category, rtdb_types::AnomalyCategory::Fault);
+    assert_eq!(error.code, "xtdb/invalid-timezone");
+    assert_eq!(error.message.as_deref(), Some("Unknown time-zone ID: Mars/Olympus"));
+    assert_eq!(session.state().effective_timezone(), "America/New_York");
+    session.execute_control_with(&parse("ROLLBACK"), &[], &token, options).await.unwrap();
+    assert_eq!(session.state().effective_timezone(), initial_zone);
+    stop(&node, driver).await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn cancelled_sleep_in_begin_options_does_not_publish_a_partial_transaction() {
     let (node, driver) = running(options(), services()).await;

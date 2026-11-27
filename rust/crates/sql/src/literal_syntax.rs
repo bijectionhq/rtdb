@@ -12,8 +12,8 @@ impl Context<'_> {
                 self.admit_table_temporal_literals(table)?;
                 for expression in records { self.admit_expression_literals(expression)?; }
             }
-            S::Set { value, .. } | S::Assert(value, _) => self.admit_expression_literals(value)?,
-            S::CreateTable { .. } | S::CreateSearchIndex { .. } | S::DropSearchIndex { .. } | S::CreateOrderedIndex { .. } | S::DropOrderedIndex { .. } | S::CreateVectorIndex { .. } | S::DropVectorIndex { .. } | S::GrantRole { .. } | S::Show(_) => (),
+            S::Assert(value, _) => self.admit_expression_literals(value)?,
+            S::Control(_) | S::CreateTable { .. } | S::CreateSearchIndex { .. } | S::DropSearchIndex { .. } | S::CreateOrderedIndex { .. } | S::DropOrderedIndex { .. } | S::CreateVectorIndex { .. } | S::DropVectorIndex { .. } | S::GrantRole { .. } => (),
         }
         Ok(())
     }

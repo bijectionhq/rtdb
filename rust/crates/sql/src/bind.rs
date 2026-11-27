@@ -382,14 +382,44 @@ impl Context<'_> {
                     }
                 }))
             }
-            Syntax::Set { name, value, local } => Ok(Statement::Set { name: name.clone(), value: self.expr(value, &Schema::default(), &BTreeMap::new())?, local: *local }),
-            Syntax::Show(name) => Ok(Statement::Show { name: name.clone() }),
+            Syntax::Control(control) => self.control(control),
             Syntax::Assert(expression, message) => {
                 let mut input = Arc::new(Relation::unit());
                 let predicate = self.relational_expr(expression, &mut input, &BTreeMap::new())?;
                 Ok(Statement::Dml(Dml::Assert { input: Arc::new(input.filter(predicate)?), message: message.clone() }))
             }
         }
+    }
+
+    fn control(&mut self, syntax: &ControlStatement<ast::Expr>) -> Result<Statement> {
+        let control = crate::control::bind_control_expressions(syntax.clone(), self.source, self.options, self.forms)?;
+        for expression in control.expressions() {
+            expression.visit(&mut |expression| {
+                if let Expr::Parameter { index, data_type } = expression {
+                    self.binder.parameter(*index, data_type.clone());
+                }
+            });
+        }
+        Ok(match control {
+            ControlStatement::Begin(ref options) if options.timezone.is_none() => {
+                let access_mode = match &options.access {
+                    None => None,
+                    Some(ControlAccessOptions::ReadOnly(options)) if *options == ReadOnlyOptions::default() => Some(AccessMode::ReadOnly),
+                    Some(ControlAccessOptions::ReadWrite(options)) if *options == ReadWriteOptions::default() => Some(AccessMode::ReadWrite),
+                    _ => return Ok(Statement::Control(Box::new(control))),
+                };
+                Statement::Begin { access_mode }
+            }
+            ControlStatement::Commit(None) => Statement::Commit,
+            ControlStatement::Rollback => Statement::Rollback,
+            ControlStatement::SetParameter { name, value } => Statement::Set {
+                name: vec![Identifier { quoted: name.contains('-'), text: name }], value, local: false,
+            },
+            ControlStatement::Show { name } => Statement::Show {
+                name: vec![Identifier { quoted: name.contains('-'), text: name }],
+            },
+            _ => Statement::Control(Box::new(control)),
+        })
     }
 
     fn record_rows(&mut self, patch: bool, table: &ast::ObjectName, columns: &[ast::Ident], records: &[ast::Expr]) -> Result<crate::StaticMutation> {
@@ -553,28 +583,6 @@ impl Context<'_> {
                 Statement::Dml(Dml::Update { table: target, input, target_columns, assignments, valid_time })
             }
             ast::Statement::Delete(delete) => return self.delete(delete, false),
-            ast::Statement::StartTransaction { modes, transaction, modifier, statements, has_end_keyword, .. } => {
-                if !statements.is_empty() || *has_end_keyword || modifier.is_some()
-                    || matches!(transaction, Some(ast::BeginTransactionKind::Work | ast::BeginTransactionKind::Tran))
-                {
-                    return Err(grammar_rejected("A non-standard transaction modifier or block"));
-                }
-                let mut access_mode = None;
-                for mode in modes {
-                    match mode {
-                        ast::TransactionMode::AccessMode(mode) => {
-                            if access_mode.is_some() { return Err(grammar_rejected("Duplicate transaction access mode")); }
-                            access_mode = Some(match mode { ast::TransactionAccessMode::ReadOnly => AccessMode::ReadOnly, ast::TransactionAccessMode::ReadWrite => AccessMode::ReadWrite });
-                        }
-                        ast::TransactionMode::IsolationLevel(ast::TransactionIsolationLevel::ReadUncommitted | ast::TransactionIsolationLevel::ReadCommitted
-                            | ast::TransactionIsolationLevel::RepeatableRead | ast::TransactionIsolationLevel::Serializable) => (),
-                        _ => return Err(grammar_rejected("A transaction isolation level other than the four standard levels")),
-                    }
-                }
-                Statement::Begin { access_mode }
-            }
-            ast::Statement::Commit { chain, end, modifier } if !chain && !end && modifier.is_none() => Statement::Commit,
-            ast::Statement::Rollback { chain, savepoint, .. } if !chain && savepoint.is_none() => Statement::Rollback,
             ast::Statement::Explain { statement, analyze, describe_alias, verbose, query_plan, estimate, format, options } => {
                 if *describe_alias != ast::DescribeAlias::Explain || *verbose || *query_plan || *estimate || format.is_some() || options.is_some() { return Err(grammar_rejected("An EXPLAIN option other than ANALYZE")); }
                 let Statement::Query(relation) = self.standard(statement)? else { return Err(error("EXPLAIN requires a query expression")); };

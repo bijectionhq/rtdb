@@ -105,9 +105,12 @@ pub(crate) fn restore(syntax: &mut crate::parse::Syntax, temporal: &mut [crate::
     match syntax {
         Syntax::Standard(statement) => visitor.apply(statement)?,
         Syntax::Erase(delete) => visitor.apply(delete)?,
-        Syntax::Assert(expression, _) | Syntax::Set { value: expression, .. } => visitor.apply(expression)?,
+        Syntax::Assert(expression, _) => visitor.apply(expression)?,
+        Syntax::Control(control) => {
+            if let ControlFlow::Break(error) = crate::control::visit_control_expressions(control, &mut visitor) { return Err(error); }
+        }
         Syntax::Records { records, .. } => visitor.apply(records)?,
-        Syntax::CreateTable { .. } | Syntax::CreateSearchIndex { .. } | Syntax::DropSearchIndex { .. } | Syntax::CreateOrderedIndex { .. } | Syntax::DropOrderedIndex { .. } | Syntax::CreateVectorIndex { .. } | Syntax::DropVectorIndex { .. } | Syntax::GrantRole { .. } | Syntax::Show(_) => {},
+        Syntax::CreateTable { .. } | Syntax::CreateSearchIndex { .. } | Syntax::DropSearchIndex { .. } | Syntax::CreateOrderedIndex { .. } | Syntax::DropOrderedIndex { .. } | Syntax::CreateVectorIndex { .. } | Syntax::DropVectorIndex { .. } | Syntax::GrantRole { .. } => {},
     }
     visitor.apply_temporal(temporal)?;
     visitor.finish()
@@ -133,8 +136,8 @@ mod tests {
         let mut statements = crate::parse("ASSERT EXISTS (WITH MATERIALIZED c AS (SELECT 1 AS n) SELECT n FROM c)").unwrap();
         let Syntax::Assert(expression, _) = &statements.remove(0).tree.statement else { panic!("ASSERT") };
         marked(expression);
-        let mut statements = crate::parse("SET application_name = (WITH MATERIALIZED c AS (SELECT 1 AS n) SELECT n FROM c)").unwrap();
-        let Syntax::Set { value, .. } = &statements.remove(0).tree.statement else { panic!("SET") };
+        let mut statements = crate::parse("SET TIME ZONE (WITH MATERIALIZED c AS (SELECT 'UTC' AS n) SELECT n FROM c)").unwrap();
+        let Syntax::Control(rtdb_plan::ControlStatement::SetTimeZone(value)) = &statements.remove(0).tree.statement else { panic!("SET TIME ZONE") };
         marked(value);
         let mut statements = crate::parse("INSERT INTO docs RECORDS {_id: 1, v: (WITH MATERIALIZED c AS (SELECT 1 AS n) SELECT n FROM c)}").unwrap();
         let Syntax::Records { records, .. } = &statements.remove(0).tree.statement else { panic!("RECORDS") };

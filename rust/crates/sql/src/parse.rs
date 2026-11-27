@@ -158,9 +158,10 @@ impl<S> VisitMut for StatementTree<S> {
         match &mut self.statement {
             Syntax::Standard(statement) => statement.visit(visitor)?,
             Syntax::Erase(delete) => delete.visit(visitor)?,
-            Syntax::Assert(value, _) | Syntax::Set { value, .. } => value.visit(visitor)?,
+            Syntax::Assert(value, _) => value.visit(visitor)?,
+            Syntax::Control(control) => crate::control::visit_control_expressions(control, visitor)?,
             Syntax::Records { records, .. } => records.visit(visitor)?,
-            Syntax::CreateTable { .. } | Syntax::CreateSearchIndex { .. } | Syntax::DropSearchIndex { .. } | Syntax::CreateOrderedIndex { .. } | Syntax::DropOrderedIndex { .. } | Syntax::CreateVectorIndex { .. } | Syntax::DropVectorIndex { .. } | Syntax::GrantRole { .. } | Syntax::Show(_) => (),
+            Syntax::CreateTable { .. } | Syntax::CreateSearchIndex { .. } | Syntax::DropSearchIndex { .. } | Syntax::CreateOrderedIndex { .. } | Syntax::DropOrderedIndex { .. } | Syntax::CreateVectorIndex { .. } | Syntax::DropVectorIndex { .. } | Syntax::GrantRole { .. } => (),
         }
         for clause in &mut self.temporal { clause.extent.visit(visitor)?; }
         self.settings.visit(visitor)
@@ -255,8 +256,7 @@ pub(crate) enum Syntax {
     DropOrderedIndex { name: Identifier },
     CreateVectorIndex { name: Identifier, table: ast::ObjectName, column: Identifier, partition: Vec<Identifier>, dimensions: i64, method: String, recall: f64, if_not_exists: bool },
     DropVectorIndex { name: Identifier },
-    Set { name: Vec<Identifier>, value: ast::Expr, local: bool },
-    Show(Vec<Identifier>),
+    Control(rtdb_plan::ControlStatement<ast::Expr>),
 }
 
 #[derive(Clone, Debug)]
@@ -429,6 +429,16 @@ pub(super) fn parse_statement_syntax<'input>(
     let (tokens, settings) = crate::settings::extract(tokens, sql)?;
     let (tokens, wildcard_renames) = crate::wildcard::extract(tokens, sql)?;
     let (tokens, materialized) = crate::materialized::cte_tokens(tokens, sql)?;
+    if ["BEGIN", "START", "SET", "SHOW", "COMMIT", "ROLLBACK"].into_iter().any(|head| word(tokens.first(), head)) {
+        if !settings.is_empty() {
+            return Err(sql_error("SETTING requires a query expression", sql, slice[0].span));
+        }
+        let control = crate::control::parse_control_tree(source, &tokens)?.expect("recognized control head");
+        let mut statement = Syntax::Control(control);
+        crate::materialized::restore(&mut statement, &mut [], materialized, sql)?;
+        let tree = StatementTree { source, statement, temporal: Vec::new(), period_columns, settings, wildcard_renames };
+        return Ok(DeferredStatementSyntax { span, tree, parameters });
+    }
     let (mut tokens, mut temporal) = extract_temporal(tokens, sql)?;
     let mut statement = if word(tokens.first(), "PATCH") || starts_insert_records(&tokens) {
         let patch = word(tokens.first(), "PATCH");
@@ -556,19 +566,6 @@ pub(super) fn parse_statement_syntax<'input>(
         } else { None };
         if parser.peek_token().token != Token::EOF { return Err(sql_error("Unexpected input after ASSERT", sql, parser.peek_token().span)); }
         Syntax::Assert(expression, message)
-    } else if word(tokens.first(), "SHOW") {
-        Syntax::Show(tokens[1..].iter().map(identifier_token).collect::<Result<_>>()?)
-    } else if word(tokens.first(), "SET") && !word(tokens.get(1), "TRANSACTION") && !word(tokens.get(1), "ROLE") {
-        let mut index = 1;
-        let local = word(tokens.get(index), "LOCAL");
-        if local || word(tokens.get(index), "SESSION") { index += 1; }
-        let mut name = vec![identifier_token(tokens.get(index).ok_or_else(|| sql_error("SET requires a variable", sql, slice[0].span))?)?];
-        index += 1;
-        if name[0].normalized() == "time" && word(tokens.get(index), "ZONE") { name.push(identifier_token(&tokens[index])?); index += 1; }
-        if tokens.get(index).is_some_and(|token| token.token == Token::Eq) || word(tokens.get(index), "TO") { index += 1; }
-        let (value, used) = expression(&tokens[index..], sql, 0)?;
-        if index + used != tokens.len() { return Err(sql_error("Unexpected input after SET", sql, tokens[index + used].span)); }
-        Syntax::Set { name, value, local }
     } else { Syntax::Standard(standard(tokens, sql)?) };
     if !settings.is_empty() && !(matches!(&statement, Syntax::Standard(ast::Statement::Query(_)))
         || (leading_explain && matches!(&statement, Syntax::Standard(ast::Statement::Explain { .. }))))
