@@ -29,9 +29,13 @@ struct SealedBasis {
     times: TimeBasis,
 }
 
-/// The system time each partition of each database in `view` reads at: its cap, or its head when it has no lower cap.
-/// As XTDB's default basis, a database with no completed transaction is left out.
-fn capture(view: &rtdb_query::SqlSnapshotView) -> Result<TimeBasis> {
+fn capture(view: &rtdb_query::SqlSnapshotView, include_empty: bool) -> Result<TimeBasis> {
+    if let Some(basis) = &view.token_basis {
+        for name in view.catalog.database_names() {
+            if view.catalog.database(name)?.partitions.iter().any(rtdb_index::Snapshot::has_overlays) { return Err(overlaid()); }
+        }
+        return Ok(basis.clone());
+    }
     let mut databases = BTreeMap::new();
     for name in view.catalog.database_names() {
         let mut times = Vec::new();
@@ -39,21 +43,19 @@ fn capture(view: &rtdb_query::SqlSnapshotView) -> Result<TimeBasis> {
             if snapshot.has_overlays() { return Err(overlaid()); }
             times.push(snapshot.system_time_cap().or(snapshot.tx_basis().map(|head| head.system_time)).map(Instant::from));
         }
-        if times.iter().any(Option::is_some) { databases.insert(name.to_owned(), times); }
+        if include_empty || times.iter().any(Option::is_some) { databases.insert(name.to_owned(), times); }
     }
     Ok(TimeBasis { databases })
 }
 
-fn encode(view: &rtdb_query::SqlSnapshotView, owner: Option<&str>, codec: Option<&dyn crate::placed_receipts::PlacedReceiptCodec>) -> Result<String> {
-    let times = capture(view)?;
+fn encode(view: &rtdb_query::SqlSnapshotView, owner: Option<&str>, codec: Option<&dyn crate::placed_receipts::PlacedReceiptCodec>, include_empty: bool) -> Result<String> {
+    let times = capture(view, include_empty)?;
     let Some(codec) = codec else { return Ok(rtdb_format::basis::encode_time_basis(&times)); };
     let cut = view.catalog.database(view.database())?.partitions.first().and_then(|snapshot| snapshot.catalog_cut());
     let sealed = SealedBasis { owner: owner.map(str::to_owned), history: codec.scope().history_fingerprint(), cut, times };
     Ok(format!("{SEALED_PREFIX}{}", codec.seal_snapshot(&serde_json::to_vec(&sealed).map_err(|error| invalid_basis(error.to_string()))?)?))
 }
 
-/// Decodes a token for `owner`: XTDB's `TimeBasis`, or a sealed token, which needs the codec that sealed it.
-/// Every failure is XTDB's `xtdb.basis/invalid-basis`.
 fn decode(token: &str, owner: Option<&str>, codec: Option<&dyn crate::placed_receipts::PlacedReceiptCodec>) -> Result<(TimeBasis, Option<CatalogCut>)> {
     let Some(sealed) = token.strip_prefix(SEALED_PREFIX) else {
         return Ok((rtdb_format::basis::decode_time_basis(token)?, None));
@@ -70,28 +72,28 @@ fn decode(token: &str, owner: Option<&str>, codec: Option<&dyn crate::placed_rec
 /// Caps each partition at its time in the token, as XTDB reads a snapshot token against the snapshot it opens.
 /// A partition the token gives no time keeps its current read, through its head, as in XTDB. A time after the
 /// partition's latest completed transaction refuses with `xtdb/unindexed-tx`, as `validate-basis-not-before` does.
-fn read_at(times: Option<&Vec<Option<Instant>>>, current: &[rtdb_index::Snapshot]) -> Result<Vec<rtdb_index::Snapshot>> {
+fn read_at(times: Option<&[Option<Instant>]>, current: &[rtdb_index::Snapshot]) -> Result<Vec<rtdb_index::Snapshot>> {
     current.iter().enumerate().map(|(index, snapshot)| {
         if snapshot.has_overlays() { return Err(overlaid()); }
         let Some(time) = times.and_then(|times| times.get(index)).copied().flatten() else {
             return snapshot.clone().with_system_time_cap(snapshot.tx_basis().map(|head| head.system_time));
         };
-        let system_time = time.as_micros()?;
-        if snapshot.tx_basis().is_none_or(|head| head.system_time < system_time) {
+        if snapshot.tx_basis().is_none_or(|head| Instant::from(head.system_time) < time) {
             return Err(rtdb_query::unindexed_tx(time, snapshot.tx_basis()));
         }
-        snapshot.clone().with_system_time_cap(Some(system_time))
+        snapshot.clone().with_system_time_cap(Some(time.as_micros()?))
     }).collect()
 }
 
 /// Lets `context` issue tokens for the views it executes.
 pub(crate) fn with_issuer(context: Arc<QueryContext>, owner: Option<&str>, database: Option<Weak<crate::Database>>) -> Arc<QueryContext> {
     let owner = owner.map(Arc::<str>::from);
+    let include_empty = database.is_none();
     context.with_snapshot_token_issuer(Arc::new(move |view| {
         let database = database.as_ref().and_then(Weak::upgrade);
         let codec = database.as_deref().filter(|database| database.name() == view.database())
             .and_then(|database| database.await_authority.codec());
-        encode(&view, owner.as_deref(), codec)
+        encode(&view, owner.as_deref(), codec, include_empty)
     }))
 }
 
@@ -134,9 +136,10 @@ impl SqlSnapshotAdmission {
             return Err(invalid_basis("the sealed token was read from another storage generation"));
         }
         let partitions = current.catalog.database_names().map(|name| {
-            Ok((name.to_owned(), read_at(times.databases.get(name), &current.catalog.database(name)?.partitions)?))
+            Ok((name.to_owned(), read_at(times.databases.get(name).map(Vec::as_slice), &current.catalog.database(name)?.partitions)?))
         }).collect::<Result<BTreeMap<_, _>>>()?;
-        let view = rtdb_query::SqlSnapshotView::from_partitions(current, partitions)?;
+        let mut view = rtdb_query::SqlSnapshotView::from_partitions(current, partitions)?;
+        if !self.node.catalog().is_placed() { view.token_basis = Some(times); }
         self.node.admit_retained_catalog(&view.catalog, self.identity.as_ref(), cancellation).await?;
         Ok(view)
     }
@@ -193,6 +196,8 @@ mod tests {
 
         let ahead = vec![Some(Instant::from(Timestamp(90)))];
         assert_eq!(read_at(Some(&ahead), &[partition.snapshot()]).unwrap_err().code, "xtdb/unindexed-tx");
+        let within_head_microsecond = [Some(Instant::new(0, 30_001).unwrap())];
+        assert_eq!(read_at(Some(&within_head_microsecond), &[partition.snapshot()]).unwrap_err().code, "xtdb/unindexed-tx");
         // XTDB bounds such a scan by nothing but the snapshot it opened, so it sees through the head; an RTDB
         // snapshot already carries its head as its cap, which redeeming leaves alone.
         let uncapped = read_at(None, &[partition.snapshot()]).unwrap().pop().unwrap();

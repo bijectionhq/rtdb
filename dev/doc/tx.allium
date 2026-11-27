@@ -314,7 +314,10 @@
 -- Attempt recovery can join that position to its original receiver observation on the retained Root cut.
 -- A SQL snapshot token is XTDB's base64 protobuf `TimeBasis` (`xtdb.basis/->time-basis-str`), carrying one system time per partition of each database read so XTDB-issued and RTDB-issued tokens redeem interchangeably.
 -- It carries no clock or zone: redeeming reads the current catalog capped at those times with the redeeming session's clock and zone, across restarts and nodes, with no server-side table, catalog hold or expiry.
+-- A Classic connection's default basis includes an absent time for each empty partition.
 -- A database or partition the token omits reads through its head.
+-- Capping a portable token with SNAPSHOT_TIME preserves its database and partition entries and caps each time at the requested instant, including its nanosecond fraction.
+-- The system-time bound is checked against the latest completed transaction at the precision supplied in the token.
 -- A database is read by name at the token's times: a missing database propagates `xtdb/unknown-db`, a time after a partition's latest completed transaction refuses with `xtdb/unindexed-tx`, a token that does not decode refuses with `xtdb.basis/invalid-basis` (incorrect), and erased rows stay erased.
 -- Issuing or redeeming a snapshot token for a view with world overlays refuses with `rtdb/snapshot-token-overlay` (unsupported).
 -- RTDB-only: a placed database seals the token (`rtdb-sealed-snapshot-v4:`), binding it to the issuing principal, journal history and storage generation.

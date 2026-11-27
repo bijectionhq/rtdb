@@ -1658,9 +1658,14 @@ async fn sql_snapshot_tokens_are_xtdb_time_bases_read_at_the_redeeming_clock() {
         ..services()
     };
     let (node, driver) = running(options(), services).await;
+    let mut reader = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let empty = rtdb_format::basis::encode_time_basis(&rtdb_types::TimeBasis {
+        databases: BTreeMap::from([("xtdb".to_owned(), vec![None])]),
+    });
+    let initial = rows(reader.query_sql("SELECT SNAPSHOT_TOKEN", vec![]).await.unwrap()).await;
+    assert_eq!(initial, [vec![Value::Utf8(empty)]]);
     let mut writer = node.session("xtdb", Arc::new(Authority)).unwrap();
     let first = writer.state_mut().execute_operation(put(&node, 1, 10)).await.unwrap().unwrap().tx_key();
-    let mut reader = node.session("xtdb", Arc::new(Authority)).unwrap();
     let original = rows(reader.query_sql("SELECT value, SNAPSHOT_TOKEN FROM docs FOR ALL VALID_TIME", vec![]).await.unwrap()).await;
     let Value::Utf8(token) = original[0][1].clone() else { panic!("expected a snapshot token"); };
     let expected = rtdb_format::basis::encode_time_basis(&rtdb_types::TimeBasis {
@@ -1689,6 +1694,59 @@ async fn sql_snapshot_tokens_are_xtdb_time_bases_read_at_the_redeeming_clock() {
     let reopened = rows(reader.query_sql("SELECT value, SNAPSHOT_TOKEN, CURRENT_TIMESTAMP FROM docs FOR ALL VALID_TIME", vec![]).await.unwrap()).await;
     assert_eq!(reopened.iter().map(|row| row[..2].to_vec()).collect::<Vec<_>>(), original);
     assert_ne!(reopened[0][2], Value::Null, "the clock comes from the redeeming session, not the token");
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
+async fn capping_a_portable_snapshot_token_preserves_sparse_entries_and_nanoseconds() {
+    use rtdb_format::basis::encode_time_basis;
+    use rtdb_types::{Instant, TimeBasis};
+
+    let services = NodeServices {
+        resources: Arc::new(NativeResources::default().with_log_clock(Arc::new(|| Ok(Timestamp(1_000_010))))),
+        ..services()
+    };
+    let (node, driver) = running(options(), services).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let head = session.state_mut().execute_operation(put(&node, 1, 20)).await.unwrap().unwrap().tx_key();
+    let requested = Instant::new(1, 5_999).unwrap();
+    assert!(requested < Instant::from(head.system_time));
+    let cap = Instant::new(1, 5_123).unwrap();
+    let token = encode_time_basis(&TimeBasis {
+        databases: BTreeMap::from([
+            ("xtdb".to_owned(), vec![Some(requested)]),
+            ("another_database".to_owned(), vec![None]),
+        ]),
+    });
+    let expected = encode_time_basis(&TimeBasis {
+        databases: BTreeMap::from([
+            ("xtdb".to_owned(), vec![Some(cap)]),
+            ("another_database".to_owned(), vec![Some(cap)]),
+        ]),
+    });
+    let actual = rows(session.query_sql(
+        "SETTING SNAPSHOT_TOKEN=?, SNAPSHOT_TIME=TIMESTAMP '1970-01-01T00:00:01.000005123Z' SELECT SNAPSHOT_TOKEN",
+        vec![Value::Utf8(token)],
+    ).await.unwrap()).await;
+    assert_eq!(actual, [vec![Value::Utf8(expected)]]);
+
+    let omitted = encode_time_basis(&TimeBasis::default());
+    let visible = rows(session.query_sql(
+        "SETTING SNAPSHOT_TOKEN=?, SNAPSHOT_TIME=TIMESTAMP '1970-01-01T00:00:00Z' SELECT value, SNAPSHOT_TOKEN FROM docs FOR ALL VALID_TIME",
+        vec![Value::Utf8(omitted.clone())],
+    ).await.unwrap()).await;
+    assert_eq!(visible, [vec![Value::I64(20), Value::Utf8(omitted)]]);
+
+    let older = encode_time_basis(&TimeBasis { databases: BTreeMap::from([("xtdb".to_owned(), vec![Some(requested)])]) });
+    session.state_mut().begin_with(TransactionSettings {
+        access: Some(AccessSettings::ReadOnly(ReadOnlySettings { snapshot_token: OptionUpdate::Set(older), ..Default::default() })),
+        ..Default::default()
+    }).unwrap();
+    let fallback = rows(session.query_sql("SETTING SNAPSHOT_TOKEN=NULL SELECT value FROM docs FOR ALL VALID_TIME", vec![]).await.unwrap()).await;
+    assert_eq!(fallback, [vec![Value::I64(20)]]);
+    let pinned = rows(session.query_sql("SELECT value FROM docs FOR ALL VALID_TIME", vec![]).await.unwrap()).await;
+    assert!(pinned.is_empty());
+    session.state_mut().rollback_tx().unwrap();
     stop(&node, driver).await;
 }
 
