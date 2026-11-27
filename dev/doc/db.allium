@@ -2138,7 +2138,7 @@ contract XtdbRefusesRtdbExtensionRecords {
     @invariant ExtensionReplicaRecords
         -- The replica framing header is 4, followed by XTDB_REFUSAL_PREFIX (one zero byte), for a TablesRetired, an ArtefactsAdded or ArtefactsRemoved,
         -- a ResolvedTxMessage carrying a placed attempt, acceptance stage, search delta or placed slot terminal, or writing an RTDB-only table,
-        -- a NoOp carrying a placed slot reservation, serving record or clock lease, a TriesAddedMessage or BlockUploadedMessage naming a trie of a naming epoch above 0, of an RTDB-only table or carrying artefacts,
+        -- a NoOp carrying a placed slot reservation or serving record, a TriesAddedMessage or BlockUploadedMessage naming a trie of a naming epoch above 0, of an RTDB-only table or carrying artefacts,
         -- a TriesDeletedMessage naming such a trie, an L0 trie or an RTDB-only table, a BlockUploadedMessage carrying a naming epoch above 0, and an OversizedMessage bound to an object publication.
         -- XTDB ignores the replica header byte and parses the protobuf from the next byte; a zero tag fails every protobuf parser before it reads a field,
         -- so XTDB fails with "InvalidProtocolBufferException: Protocol message contained an invalid tag (zero)." before fencing or applying the record.

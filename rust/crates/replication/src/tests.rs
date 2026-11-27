@@ -3015,7 +3015,7 @@ async fn one_clock_stamps_the_boot_claim_external_transaction_and_source_flush()
         let claim = ReplicaEnvelope::decode(&claim.payload).unwrap().unwrap();
         assert_eq!(claim.term, Term(1));
         assert_eq!(claim.term_sequence, Some(TermSequence(0)));
-        assert!(matches!(claim.message, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, placed_slot_reservation: None, serving_record: None, clock_lease_micros: None })));
+        assert!(matches!(claim.message, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, placed_slot_reservation: None, serving_record: None })));
 
         time.store(3_000_000, Ordering::SeqCst);
         let result = observer.term().unwrap()

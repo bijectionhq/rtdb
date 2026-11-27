@@ -189,7 +189,6 @@ fn extension_replica_bodies() -> Vec<(Option<(&'static str, u32)>, ReplicaBody)>
         (None, resolved(|tx| tx.table_data = [("xt/idempotency_receipts".to_owned(), vec![1].into())].into_iter().collect())),
         (Some(("NoOp", 1000)), ReplicaBody::NoOp(pb::NoOp { placed_slot_reservation: Some(vec![1].into()), ..Default::default() })),
         (Some(("NoOp", 1001)), ReplicaBody::NoOp(pb::NoOp { src_msg_id: Some(4), serving_record: Some(vec![1].into()), ..Default::default() })),
-        (Some(("NoOp", 4)), ReplicaBody::NoOp(pb::NoOp { clock_lease_micros: Some(9), ..Default::default() })),
         (None, ReplicaBody::TriesAdded(tries_added(vec![trie("l01-rc-b00-e01")]))),
         (Some(("TrieDetails", 1000)), ReplicaBody::TriesAdded(tries_added(vec![with_artefact(trie("l01-rc-b00"))]))),
         (None, ReplicaBody::TriesAdded(tries_added(vec![pb::TrieDetails { table_name: Some("xt/bounded_retry_receipts".into()), ..trie("l00-rc-b02") }]))),

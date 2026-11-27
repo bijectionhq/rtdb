@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::{Arc, atomic::{AtomicI64, Ordering}};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -476,8 +476,6 @@ struct LeaderState {
     deferred_commands: VecDeque<Command>,
     compactor_reset: Option<CompactorReset>,
     trie_removals: Vec<AppliedTrieRemoval>,
-    /// The latest clock lease this term's appender enqueued, when it serves decisions (T7).
-    clock_lease: Option<Arc<AtomicI64>>,
 }
 
 struct SourceInput {
@@ -537,13 +535,6 @@ impl LeaderState {
         }
     }
     fn accepting_commands(&self) -> bool { self.accepting() && self.waiting_strict_source.is_none() }
-    /// Whether this term's clock lease admits a decision sampled at `now`: its
-    /// clock plus the drift bound is before the lease the term issued (T7).
-    fn clock_lease_admits(&self, now: Timestamp) -> bool {
-        self.clock_lease.as_ref().is_none_or(|issued| {
-            now.0.saturating_add(SERVING_CLOCK_UNCERTAINTY_MICROS) < issued.load(Ordering::Acquire)
-        })
-    }
     fn pending_serving_at(&self, sequence: Option<TermSequence>) -> Option<&proto::NoOp> {
         let sequence = sequence?;
         self.pending.iter().find_map(|write| {
@@ -590,9 +581,6 @@ pub struct ReplicationDriver {
     required_append_bytes: Option<u64>,
     deferred_cut: bool,
     placed_slot: Option<OrderedPlaced>,
-    /// The latest leader clock lease applied from the replica log (T7): the
-    /// fence a newly promoted term's clock must pass before it decides.
-    clock_lease: i64,
 }
 
 #[derive(Clone, Copy)]
@@ -640,7 +628,7 @@ impl ReplicationDriver {
         let replica_tail = recovered.take_replay_tail(&logs, read_position)?;
         let restart = if config.enabled { progress.prepare_driver_restart() } else { None };
         Ok((handle, Self { config, logs, blocks, partition: recovered.partition, progress, restart, resolve, effects, cancellation, clock, recovered_confirmation, compaction_replay_cutoff: recovered.compaction_replay_cutoff, track_catalog_cut, recognized_prefix: true, applied_prefix, installed: None, first_erasure: None, historical_confirmations: VecDeque::new(), fence: recovered.fence,
-            read_position, pending_block: None, claim: None, claiming: None, replica_tail, replica_poll: None, replica_batch: VecDeque::new(), replica_head: None, leader: None, commands, status, flush_timer, serving_search: None, serving: None, default_erasure: None, default_erasure_read_fence: None, local_erasure_read_fence: None, default_erasure_grant_micros: None, required_append_bytes: None, deferred_cut: false, placed_slot: None, clock_lease: i64::MIN }))
+            read_position, pending_block: None, claim: None, claiming: None, replica_tail, replica_poll: None, replica_batch: VecDeque::new(), replica_head: None, leader: None, commands, status, flush_timer, serving_search: None, serving: None, default_erasure: None, default_erasure_read_fence: None, local_erasure_read_fence: None, default_erasure_grant_micros: None, required_append_bytes: None, deferred_cut: false, placed_slot: None }))
     }
 
     pub fn with_serving_search(mut self, builder: Arc<dyn ServingSearchBuilder>) -> Self {
@@ -777,11 +765,9 @@ impl ReplicationDriver {
             let mut empty_job = None;
             let mut empty_resolution = None;
             let mut empty_production = None;
-            let now = (self.clock)();
             let (source_poll, job, resolution, production, ready_source, ready_deferred) = match self.leader.as_mut() {
                 Some(leader) => {
-                    let ready_source = !waiting_for_checkpoint && !placed_open && serving_source_ready && leader.ready_source()
-                        && leader.clock_lease_admits(now);
+                    let ready_source = !waiting_for_checkpoint && !placed_open && serving_source_ready && leader.ready_source();
                     let ready_deferred = !waiting_for_checkpoint && !placed_open && !serving_timed && !erasure_pending && leader.accepting_commands()
                         && !leader.deferred_commands.is_empty();
                     (&mut leader.source_poll, &mut leader.job, &mut leader.resolution, &mut leader.production, ready_source, ready_deferred)
@@ -1108,12 +1094,6 @@ impl ReplicationDriver {
             term, self.config.assertion_interval, cancellation.clone(), Arc::clone(&self.clock));
         // Without a claim, the term's first appended record opens it.
         let pump = pump.starting_at(TermSequence(initial_term_sequence(self.logs.fences_writer_terms())));
-        // A serving leader holds a clock lease past every lease applied before its term (T7).
-        let clock_lease = self.serving.is_some().then(|| Arc::new(AtomicI64::new(i64::MIN)));
-        let pump = match &clock_lease {
-            Some(issued) => pump.with_clock_lease(self.clock_lease, SERVING_CLOCK_UNCERTAINTY_MICROS, Arc::clone(issued)),
-            None => pump,
-        };
         let pump = match self.resolve.execution_observer.clone() {
             Some(observer) => pump.with_durable_commit_observer(move |basis, lag| match basis {
                 CommitLagBasis::Ordered => observer.record_durable_commit_lag(lag),
@@ -1129,7 +1109,7 @@ impl ReplicationDriver {
         self.leader = Some(LeaderState { term, resolver: Some(TxResolver::new(progress.tx_key, progress.source_position, progress.external_token.as_deref().map(<[u8]>::to_vec), &self.resolve.memory)?), resolution: None,
             production: None, confirmed, activation: writer_activation(self.logs.fences_writer_terms()),
             recovery_write, held: VecDeque::new(), held_bytes: 0, cycle,
-            pending: VecDeque::new(), source_tail, source_poll: None, source_batch: VecDeque::new(), source_head: None, waiting_strict_source: None, awaiting_placed: None, settling_placed: false, appender, job: Some(tokio::spawn(job)), cancellation, deferred_commands: VecDeque::new(), compactor_reset: None, trie_removals: Vec::new(), clock_lease });
+            pending: VecDeque::new(), source_tail, source_poll: None, source_batch: VecDeque::new(), source_head: None, waiting_strict_source: None, awaiting_placed: None, settling_placed: false, appender, job: Some(tokio::spawn(job)), cancellation, deferred_commands: VecDeque::new(), compactor_reset: None, trie_removals: Vec::new() });
         if produce_inherited {
             self.produce_pending()?;
         }
@@ -1706,9 +1686,6 @@ impl ReplicationDriver {
                 }
                 ReplicaBody::BlockUploaded(_) => return Err(invalid("Block upload has no matching pending boundary")),
                 ReplicaBody::NoOp(message) => {
-                    if let Some(until) = message.clock_lease_micros {
-                        self.clock_lease = self.clock_lease.max(until);
-                    }
                     if self.apply_default_erasure_control(message, record.metadata.position).await? {
                         self.record_applied(record.metadata.position)?;
                         self.complete_control(&record);
@@ -2158,18 +2135,8 @@ impl ReplicationDriver {
                 request = Err(rtdb_tx::transact::funding_unsupported());
             }
         }
-        // The decision's stamp is sampled here, at its ordering point; the term's
-        // lease must admit it, or the request waits for the next renewal (T7).
-        let now = (self.clock)();
-        let request = match request {
-            Ok(request) if !leader.clock_lease_admits(now) => {
-                leader.waiting_strict_source = Some(StrictSource::Serving { position, request });
-                return Ok(());
-            }
-            request => request,
-        };
         let serving = self.serving.as_mut().ok_or_else(serving::unavailable)?;
-        let message = serving.decide_source(position, now, request)?;
+        let message = serving.decide_source(position, (self.clock)(), request)?;
         let block = self.partition.value().live().block_index();
         leader.cycle.resolved(1)?;
         leader.enqueue(WriteBody::Message(ReplicaBody::NoOp(message)), block, None, &self.resolve.memory)?;

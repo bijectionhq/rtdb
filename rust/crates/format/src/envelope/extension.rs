@@ -36,8 +36,7 @@ pub fn replica_uses_extension(body: &ReplicaBody) -> bool {
     match body {
         ReplicaBody::TablesRetired(_) | ReplicaBody::ArtefactsAdded(_) | ReplicaBody::ArtefactsRemoved(_) => true,
         ReplicaBody::ResolvedTx(tx) => resolved_uses_extension(tx),
-        ReplicaBody::NoOp(noop) => noop.placed_slot_reservation.is_some() || noop.serving_record.is_some()
-            || noop.clock_lease_micros.is_some(),
+        ReplicaBody::NoOp(noop) => noop.placed_slot_reservation.is_some() || noop.serving_record.is_some(),
         ReplicaBody::TriesAdded(added) => added.tries.iter().any(trie_uses_extension),
         ReplicaBody::TriesDeleted(deleted) => deleted.table_name.as_deref().is_some_and(rtdb_only_table)
             || deleted.trie_keys.iter().any(|key| rtdb_only_trie_key(key, |key| key.level() == 0)),

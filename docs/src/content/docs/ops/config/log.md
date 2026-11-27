@@ -143,7 +143,7 @@ Retry guards and placed transactions
 
 Native serving
 
-: Serving records, slot reservations and clock leases in the replica log, and blocks that carry a serving checkpoint.
+: Serving records and slot reservations in the replica log, and blocks that carry a serving checkpoint.
 
 Search, vector, spatial, ordered-index and entity-history artefacts
 
