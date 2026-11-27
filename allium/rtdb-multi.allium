@@ -1163,7 +1163,7 @@ contract EpochScopedStorage {
 contract PortableApplicationBackup {
     @invariant AuthenticatedCut
         -- The writer captures one settled applied cut and binds its source incarnation, basis, system time and journal position to the encrypted checkpoint.
-        -- An immutable stream can capture its settled application state at a quorum-confirmed head with read authority.
+        -- An immutable stream can capture its settled application state at a quorum-confirmed head with read authority and without provisioning any source streams.
         -- The checkpoint contains its inline application state and exact retained receipt index.
         -- A portable cut requires ordinary receipt and row custody state and a closed export-pin inventory.
         -- The archive authenticates each ordinary checkpoint file under its exact source object identity.

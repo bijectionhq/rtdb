@@ -95,11 +95,16 @@ impl MultiBackupOptions {
                 (Some(*incarnation), Some(backup))
             }
             Operation::Export => {
-                if !self.data.join("database-id").is_file() || !self.data.join("journal").is_file() {
-                    return Err(Anomaly::incorrect("rtdb/backup-source", "An initialized local Multi deployment is required"));
-                }
                 if self.archive.try_exists().map_err(io_error)? {
                     return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb/backup-exists", "The portable backup path is already occupied"));
+                }
+                if !self.data.join("database-id").is_file() || !self.data.join("journal").is_file() {
+                    return Err(backup_source());
+                }
+                if self.immutable_streams {
+                    let (url, directory) = self.journal.as_ref().ok_or_else(arguments_error)?;
+                    let connection = crate::cli::development_stream_journal(url, directory)?;
+                    return self.export_immutable(connection, apple_sync).await;
                 }
                 (None, None)
             }
@@ -124,17 +129,70 @@ impl MultiBackupOptions {
         result
     }
 
+    async fn export_immutable(&self, connection: DevelopmentStreamJournal, apple_sync: rtdb_storage::AppleSync) -> Result<Value> {
+        let mut journal_marker = File::open(self.data.join("journal")).map_err(io_error)?;
+        match fs2::FileExt::try_lock_exclusive(&journal_marker) {
+            Ok(()) => (),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                return Err(Anomaly::new(AnomalyCategory::Busy, "rtdb.multi/development-journal",
+                    "Multi development data already has a local writer"));
+            }
+            Err(error) => return Err(io_error(error)),
+        }
+        let expected: [u8; 32] = Sha256::digest(connection.url.as_bytes()).into();
+        if read_marker::<32>(&mut journal_marker)? != expected {
+            return Err(invalid("Multi development data belongs to another journal URL"));
+        }
+        let mut database_marker = File::open(self.data.join("database-id")).map_err(io_error)?;
+        let incarnation = Uuid::from_bytes(read_marker(&mut database_marker)?);
+        let objects = self.data.join("objects");
+        if incarnation.is_nil() || !objects.is_dir() {
+            return Err(backup_source());
+        }
+        let keys = Arc::new(FileKms::open(&self.data.join("keys"), || SystemClock.now().0)?);
+        let JournalBackend { journal, batch, .. } =
+            connect_stream_journal(&connection.url, &connection.credentials).await?;
+        let stream = StreamId(incarnation.as_u128());
+        if journal.head(stream).await.map_err(|error| match error {
+            JournalError::NotFound => backup_source(),
+            error => Anomaly::new(AnomalyCategory::Unavailable, "rtdb/journal-unavailable", error.to_string()),
+        })?.0 == 0 {
+            return Err(backup_source());
+        }
+        let io = IoRegion::new();
+        let store = Arc::new(LocalStore::open_in(objects, Arc::clone(&io))?.with_apple_sync(apple_sync));
+        let mut database = MultiDatabase::new(
+            MultiOptions {
+                database: incarnation,
+                node: Ipv4Addr::LOCALHOST.into(),
+                lease_micros: WRITER_LEASE_MICROS,
+                drift_micros: CLOCK_DRIFT_MICROS,
+            },
+            journal,
+            store,
+            keys,
+            Arc::new(|| SystemClock.now()),
+        )?
+            .with_immutable_journal()
+            .with_batch_appender(batch)
+            .with_manifest_budget(MemoryBudget::new(PortableBackup::MAX_BYTES));
+        if let Some(scope) = self.activation_scope {
+            database = database.with_activation_scope(scope)?;
+        }
+        let backup = database.portable_backup().await;
+        io.close_and_wait().await;
+        self.publish(backup?, apple_sync)
+    }
+
     async fn transfer(&self, runtime: &MultiRuntime, backup: Option<VerifiedBackup>) -> Result<Value> {
         let database = runtime.ensure_driver(DEVELOPMENT_DATABASE, runtime.bootstrap[DEVELOPMENT_DATABASE]).await?;
-        if backup.is_some() || !self.immutable_streams {
-            let live = BTreeSet::from([runtime.backends.node]);
-            tokio::time::timeout(Duration::from_secs(12), async {
-                loop {
-                    if matches!(database.tick(&live).await?, Role::Writer(_)) { return Ok::<(), Anomaly>(()); }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-            }).await.map_err(|_| Anomaly::new(AnomalyCategory::Busy, "rtdb/backup-writer", "The local Multi writer lease did not become available"))??;
-        }
+        let live = BTreeSet::from([runtime.backends.node]);
+        tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                if matches!(database.tick(&live).await?, Role::Writer(_)) { return Ok::<(), Anomaly>(()); }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }).await.map_err(|_| Anomaly::new(AnomalyCategory::Busy, "rtdb/backup-writer", "The local Multi writer lease did not become available"))??;
 
         match backup {
             Some(backup) => {
@@ -148,14 +206,29 @@ impl MultiBackupOptions {
                     "manifest_sha256": digest_hex(&installed.manifest_sha256()),
                 }))
             }
-            None => {
-                let bytes = database.portable_backup().await?.into_bytes();
-                let digest: [u8; 32] = Sha256::digest(&bytes).into();
-                publish_archive(&self.archive, &bytes, runtime.backends.store.apple_sync())?;
-                Ok(json!({ "manifest_sha256": digest_hex(&digest) }))
-            }
+            None => self.publish(database.portable_backup().await?, runtime.backends.store.apple_sync()),
         }
     }
+
+    fn publish(&self, backup: PortableBackup, apple_sync: rtdb_storage::AppleSync) -> Result<Value> {
+        let bytes = backup.into_bytes();
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        publish_archive(&self.archive, &bytes, apple_sync)?;
+        Ok(json!({ "manifest_sha256": digest_hex(&digest) }))
+    }
+}
+
+fn read_marker<const N: usize>(file: &mut File) -> Result<[u8; N]> {
+    if !file.metadata().map_err(io_error)?.is_file() {
+        return Err(backup_source());
+    }
+    let mut bytes = Vec::new();
+    file.take(N as u64 + 1).read_to_end(&mut bytes).map_err(io_error)?;
+    bytes.try_into().map_err(|_| backup_source())
+}
+
+fn backup_source() -> Anomaly {
+    Anomaly::incorrect("rtdb/backup-source", "An initialized local Multi deployment is required")
 }
 
 fn read_archive(path: &Path) -> Result<Vec<u8>> {
@@ -183,4 +256,93 @@ fn digest_hex(digest: &[u8; 32]) -> String {
 
 fn arguments_error() -> Anomaly {
     Anomaly::incorrect("rtdb.cli/arguments", "Invalid multi-backup arguments. Use rtdb multi-backup --help")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stream_logkeeper::stream::consensus::{CLUSTER_VERSION_CURRENT, Config, testing::LocalCluster};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn commissioned_backup_exports_without_creating_a_catalog() {
+        const PRINCIPAL: &str = "urn:logkeeper:client:commissioned-backup";
+        const READER: &str = "urn:logkeeper:client:commissioned-backup-reader";
+        let mut keepers = LocalCluster::start_replicated_catalog(&[PRINCIPAL]).await.unwrap();
+        let config = keepers.journal_config(64 << 20, 4 << 20);
+        let journal = Arc::new(keepers.journal(PRINCIPAL, &config).unwrap());
+        journal.finalize_version(CLUSTER_VERSION_CURRENT).await.unwrap();
+        let reader_credentials = keepers.credentials(READER).unwrap();
+        let configs: Vec<_> = keepers.keepers().keys().map(|id| {
+            let mut config = Config::read(&keepers.write_config(*id).unwrap()).unwrap();
+            config.readers.push(READER.into());
+            config
+        }).collect();
+        keepers.shutdown().await.unwrap();
+        let stop = CancellationToken::new();
+        let mut tasks = Vec::new();
+        for config in configs {
+            let listener = tokio::net::TcpListener::bind(config.listen).await.unwrap();
+            tasks.push(tokio::spawn(config.serve(listener, stop.child_token())));
+        }
+        let reader = keepers.journal(READER, &config).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let config_path = home.path().join("journal.json");
+        fs::write(&config_path, serde_json::to_vec(&json!({
+            "keepers": config.keepers, "catalog": config.catalog, "voters": config.voters,
+            "catalog_voters": config.catalog_voters,
+            "quota_bytes": config.quota_bytes, "max_record_bytes": config.max_record_bytes,
+        })).unwrap()).unwrap();
+        let url = format!("{CONSENSUS_SCHEME}{}", config_path.display());
+        let connection = || DevelopmentStreamJournal::new(&url, reader_credentials.clone()).unwrap();
+        let data = home.path().join("source");
+        fs::create_dir(&data).unwrap();
+        let incarnation = Uuid::new_v4();
+        fs::write(data.join("database-id"), incarnation.as_bytes()).unwrap();
+        fs::write(data.join("journal"), Sha256::digest(url.as_bytes())).unwrap();
+        let vault = data.join("keys");
+        FileKms::create_directory(&vault).unwrap();
+        let keys = Arc::new(FileKms::open(&vault, || SystemClock.now().0).unwrap());
+        let store = Arc::new(LocalStore::open(data.join("objects")).unwrap());
+        let scope = ActivationScope::for_cell(Uuid::new_v4(), DEVELOPMENT_DATABASE, Some(Uuid::new_v4())).unwrap();
+        let database = MultiDatabase::new(
+            MultiOptions {
+                database: incarnation, node: Ipv4Addr::LOCALHOST.into(),
+                lease_micros: WRITER_LEASE_MICROS, drift_micros: CLOCK_DRIFT_MICROS,
+            },
+            journal.clone(), store, keys.clone(), Arc::new(|| SystemClock.now()),
+        ).unwrap().with_immutable_journal().with_activation_scope(scope).unwrap();
+        let stream = database.journal_stream();
+        let catalog = StreamId(catalog::identity(b"catalog", incarnation, "").as_u128());
+        let mut options = MultiBackupOptions {
+            operation: Operation::Export,
+            data,
+            archive: home.path().join("cut"),
+            journal: None,
+            immutable_streams: true,
+            activation_scope: Some(scope),
+        };
+        assert!(reader.create_immutable(stream).await.is_err());
+        assert_eq!(options.export_immutable(connection(), rtdb_storage::AppleSync::Full).await.unwrap_err().code, "rtdb/backup-source");
+        assert_eq!(journal.head(stream).await, Err(JournalError::NotFound));
+        assert!(!options.archive.exists());
+
+        database.create().await.unwrap();
+        let head = journal.head(stream).await.unwrap();
+        options.activation_scope = Some(ActivationScope::new(Uuid::new_v4(), DEVELOPMENT_DATABASE).unwrap());
+        assert_eq!(options.export_immutable(connection(), rtdb_storage::AppleSync::Full).await.unwrap_err().code, "rtdb/activation-scope");
+        assert!(!options.archive.exists());
+
+        options.activation_scope = Some(scope);
+        options.export_immutable(connection(), rtdb_storage::AppleSync::Full).await.unwrap();
+        let backup = PortableBackup::verify(&fs::read(options.archive).unwrap(), keys).await.unwrap();
+        assert_eq!(backup.source_basis().incarnation(), *incarnation.as_bytes());
+        assert_eq!(backup.source_lsn(), head);
+        assert_eq!(journal.head(stream).await.unwrap(), head);
+        assert_eq!(journal.head(catalog).await, Err(JournalError::NotFound));
+        assert!(!options.data.join("catalog").exists());
+        stop.cancel();
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+    }
 }

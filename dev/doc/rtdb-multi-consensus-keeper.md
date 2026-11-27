@@ -326,7 +326,7 @@ closure before a hosted verifier can certify it.
 ## Portable application backups
 
 `rtdb multi-backup export` captures a settled cut from a stopped, initialized development deployment, using its journal and object store to verify the current checkpoint dependencies.
-An immutable export replays a quorum-confirmed head without acquiring the writer lease.
+An immutable export takes the existing local journal lock and replays a quorum-confirmed head directly from the application stream using reader credentials.
 Legacy exports and destination installation acquire the writer lease.
 For an ordinary cut, the archive carries the complete checkpoint, retained receipt index, and verified checkpoint files under the source key generation.
 Its authenticated header binds the source incarnation, basis, system time, and journal position.
