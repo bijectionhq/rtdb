@@ -507,7 +507,7 @@ variant Detach : DbOp {
 -- Messages on the source log. Written by clients, by the leader (flush-block), and by the block upload and the compactor (tries-added).
 -- An append retains its encoded record for as long as the log holds those bytes.
 -- The encoder releases temporary memory before handing the record to the log.
--- A writable native local log collects ready appends in queue order within a byte budget and collection deadline.
+-- A writable native local log collects up to ten ready appends in queue order within a byte budget.
 -- A frame above the byte budget occupies its own batch.
 -- A successful flush makes the batch's records visible and completes their append receipts.
 -- Reopening checks each frame in order and reports an incomplete final frame at its offset.
