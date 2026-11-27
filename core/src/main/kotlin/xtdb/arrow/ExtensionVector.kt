@@ -90,6 +90,8 @@ sealed class ExtensionVector : MonoVector() {
 
             override fun readObject() = readObject { it }
             override fun readObject(keyFn: IKeyFn<*>) = getObject(pos, keyFn)
+            override fun copyIdentityTo(dest: VectorWriter) =
+                dest is ExtensionVector && dest.arrowType == arrowType && inner.copyIdentityTo(dest.inner)
         }
     }
 

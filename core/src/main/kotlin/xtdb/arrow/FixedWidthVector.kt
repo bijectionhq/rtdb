@@ -179,6 +179,11 @@ sealed class FixedWidthVector : MonoVector() {
         writeNotNull()
     }
 
+    internal fun copyNonNullValue(src: FixedWidthVector, idx: Int) {
+        dataBuffer.writeBytes(src.dataBuffer, idx.toLong() * byteWidth, byteWidth.toLong())
+        writeNotNull()
+    }
+
     override fun getPointer(idx: Int, reuse: ArrowBufPointer) =
         dataBuffer.getPointer(idx * byteWidth, byteWidth, reuse)
 
@@ -298,6 +303,15 @@ private class FixedWidthRows(private val vec: FixedWidthVector) :
     override fun readAsDouble() = vec.getAsDouble(pos)
     override fun readBytes() = vec.getBytes(pos)
     override fun readObject(keyFn: IKeyFn<*>) = vec.getObject(pos, keyFn)
-    override fun copyIdentityTo(dest: VectorWriter) =
-        vec is DecimalVector && dest is DecimalVector && dest.tryCopyValue(vec, pos)
+    override fun copyIdentityTo(dest: VectorWriter): Boolean = when (vec) {
+        is DecimalVector -> dest is DecimalVector && dest.tryCopyValue(vec, pos)
+        is IntervalYearMonthVector, is IntervalDayTimeVector, is IntervalMonthDayNanoVector -> {
+            if (dest !is FixedWidthVector || dest.arrowType != vec.arrowType) false
+            else {
+                dest.copyNonNullValue(vec, pos)
+                true
+            }
+        }
+        else -> false
+    }
 }

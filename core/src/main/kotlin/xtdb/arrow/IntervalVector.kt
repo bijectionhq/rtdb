@@ -46,7 +46,9 @@ class IntervalYearMonthVector private constructor(
         }
     }
 
-    override fun writeValue0(v: ValueReader) = writeObject(v.readObject())
+    override fun writeValue0(v: ValueReader) {
+        if (!v.copyIdentityTo(this)) writeObject(v.readObject())
+    }
 
     override val metadataFlavours get() = listOf(this)
 
@@ -104,7 +106,9 @@ class IntervalDayTimeVector private constructor(
             else -> throw InvalidWriteObjectException(this, value)
         }
 
-    override fun writeValue0(v: ValueReader) = writeObject(v.readObject())
+    override fun writeValue0(v: ValueReader) {
+        if (!v.copyIdentityTo(this)) writeObject(v.readObject())
+    }
 
     override val metadataFlavours get() = listOf(this)
 
@@ -171,7 +175,9 @@ class IntervalMonthDayNanoVector private constructor(
             else -> throw InvalidWriteObjectException(this, value)
         }
 
-    override fun writeValue0(v: ValueReader) = writeObject(v.readObject())
+    override fun writeValue0(v: ValueReader) {
+        if (!v.copyIdentityTo(this)) writeObject(v.readObject())
+    }
 
     override val metadataFlavours get() = listOf(this)
 
@@ -190,6 +196,9 @@ class IntervalMonthDayMicroVector(
 
     override fun getObject0(idx: Int, keyFn: IKeyFn<*>) = inner.getObject0(idx, keyFn)
     override fun writeObject0(value: Any) = inner.writeObject(value)
+    override fun writeValue0(v: ValueReader) {
+        if (!v.copyIdentityTo(this)) writeObject(v.readObject())
+    }
 
     override val metadataFlavours get() = listOf(this)
 

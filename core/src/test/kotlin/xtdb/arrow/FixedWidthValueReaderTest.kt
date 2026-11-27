@@ -3,12 +3,16 @@ package xtdb.arrow
 import org.apache.arrow.memory.BufferAllocator
 import org.apache.arrow.vector.ipc.message.ArrowFieldNode
 import org.apache.arrow.vector.types.TimeUnit
+import org.apache.arrow.vector.types.Types.MinorType
 import org.apache.arrow.vector.types.pojo.ArrowType
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.extension.ExtendWith
+import org.junit.jupiter.api.assertThrows
 import xtdb.api.query.IKeyFn.KeyFn.SNAKE_CASE_STRING
+import xtdb.arrow.extensions.IntervalMDMType
 import xtdb.test.AllocatorResolver
 import xtdb.time.Interval
 import java.math.BigDecimal
@@ -18,6 +22,53 @@ import java.time.ZoneId
 @ExtendWith(AllocatorResolver::class)
 class FixedWidthValueReaderTest {
     private val rowCount = 200
+
+    @Test
+    fun `positioned interval writes preserve signed components and physical units`(al: BufferAllocator) {
+        val cases = listOf(
+            MinorType.INTERVALYEAR.type to Interval(Int.MIN_VALUE, 0, 0),
+            MinorType.INTERVALDAY.type to Interval(0, Int.MAX_VALUE, Int.MIN_VALUE.toLong() * 1_000_000),
+            MinorType.INTERVALMONTHDAYNANO.type to Interval(Int.MIN_VALUE, Int.MAX_VALUE, Long.MIN_VALUE),
+            IntervalMDMType to Interval(Int.MAX_VALUE, Int.MIN_VALUE, Long.MAX_VALUE)
+        )
+        for ((type, value) in cases) {
+            Vector.open(al, "src", VectorType.Scalar(type)).use { src ->
+                src.writeObject(Interval.ZERO)
+                src.writeNull()
+                src.writeObject(value)
+
+                Vector.open(al, "dst", VectorType.Scalar(type)).use { dst ->
+                    val rows = src.select(intArrayOf(2, 1, 0)).valueReader()
+                    assertTrue(rows.next().copyIdentityTo(dst))
+                    assertFalse(dst.nullable)
+                    dst.writeValue(rows.next())
+                    dst.writeValue(object : ValueReader by rows.next() {
+                        override fun readObject(): Any? = error("unexpected interval decoding")
+                    })
+                    assertEquals(listOf(value, null, Interval.ZERO), dst.asList)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `interval layout changes retain the object writer's validation`(al: BufferAllocator) {
+        IntervalMonthDayMicroVector(IntervalMonthDayNanoVector(al, "src", false)).use { src ->
+            src.writeObject(Interval(0, 1, 1))
+            val row = src.valueReader().next()
+
+            IntervalMonthDayNanoVector(al, "nanos", false).use { dst ->
+                assertFalse(row.copyIdentityTo(dst))
+                dst.writeValue(row)
+                assertEquals(listOf(Interval(0, 1, 1)), dst.asList)
+            }
+            IntervalDayTimeVector(al, "millis", false).use { dst ->
+                assertFalse(row.copyIdentityTo(dst))
+                assertThrows<InvalidWriteObjectException> { dst.writeValue(row) }
+                assertEquals(0, dst.valueCount)
+            }
+        }
+    }
 
     private fun isNullRow(idx: Int) = idx % 7 == 3 || idx == 63 || idx == 64
 
