@@ -226,6 +226,37 @@ async fn computed_column_table_lends_an_arrow_parameter_through_the_list_reader(
 }
 
 #[tokio::test]
+async fn binary_list_cast_keeps_null_elements_and_one_column_table_page() {
+    use arrow_array::RecordBatch;
+    use arrow_schema::Schema as ArrowSchema;
+    use rtdb_columnar::{OwnedBatch, build_array, to_field};
+
+    let mut execution = execution(2, vec![]);
+    let memory = Arc::clone(&execution.context.memory);
+    let baseline = memory.used_bytes();
+    let ty = LogicalType::list(LogicalType::Scalar(ScalarType::Binary).maybe());
+    let items = vec![Value::Binary(vec![1, 255]), Value::Null, Value::Binary(Vec::new())];
+    let array = build_array(&ty, &[Value::list(items.clone())]).unwrap();
+    let schema = Arc::new(ArrowSchema::new(vec![to_field("items", &ty).unwrap()]));
+    let record = RecordBatch::try_new(schema, vec![array]).unwrap();
+    let input = OwnedBatch::new(record, &memory).unwrap();
+    let parameters = BoundParameters::from_arrow(input, 0, vec![ty.clone()], &memory).unwrap();
+    let original = std::mem::replace(&mut execution.parameters, Arc::new(parameters));
+    let expr = Expr::Cast {
+        expr: Box::new(Expr::Parameter { index: 0, data_type: ty }),
+        target: rtdb_plan::CastTarget::fixed(LogicalType::list(LogicalType::Scalar(ScalarType::Binary))),
+    };
+    let mut cursor = crate::column_table::open_columns(&execution, expr).await.unwrap();
+    let page = cursor.next_batch().await.unwrap().unwrap();
+    assert!(cursor.next_batch().await.unwrap().is_none());
+    assert_eq!(page.len, items.len());
+    assert_eq!((0..page.len).map(|row| page.columns[0].value(row).unwrap()).collect::<Vec<_>>(), items);
+    drop((page, cursor));
+    execution.parameters = original;
+    assert_eq!(memory.used_bytes(), baseline);
+}
+
+#[tokio::test]
 async fn captured_fixed_list_keeps_its_numeric_union_tags_and_real_null() {
     use arrow_array::{RecordBatch, cast::AsArray};
     use arrow_schema::Schema as ArrowSchema;

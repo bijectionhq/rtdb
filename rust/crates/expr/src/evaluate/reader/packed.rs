@@ -1,7 +1,7 @@
 use std::ops::Range;
 
 use rtdb_plan::CastTarget;
-use rtdb_types::{ListValue, ListView, Result};
+use rtdb_types::{AnomalyKind, ListValue, ListView, LogicalType, Result, ScalarType};
 
 use super::{EvalValue, Kind, ListReader, PackedList, Target};
 use crate::{evaluate::EvalContext, list_cast, scalar_list_cast};
@@ -52,6 +52,24 @@ pub(super) fn cast(
         ListReader::Arrow { cell, backing } => {
             let Some((field, array, range)) = cell.sequence_range() else { return Ok(None); };
             if selection.end > range.len() { return Ok(None); }
+            if matches!(target, CastTarget::Fixed(LogicalType::Scalar(ScalarType::Binary)))
+                && field.data_type() == &arrow_schema::DataType::Binary
+                && field.metadata().is_empty()
+            {
+                let rows = (range.start + selection.start)..(range.start + selection.end);
+                let output = rtdb_columnar::repack_scalar_list(field, array, rows.clone(), true, || {
+                    let bound = rows.clone().try_fold(4096usize, |bytes, row| {
+                        rtdb_columnar::estimate_copy_cell_bytes(field, array, row)?.checked_mul(4)
+                            .and_then(|size| bytes.checked_add(size))
+                            .ok_or_else(crate::numeric::overflow)
+                    })?;
+                    context.reserve(bound)
+                });
+                return match output {
+                    Err(error) if error.is(AnomalyKind::ResourceExhausted) => Ok(None),
+                    result => result.map(|list| list.map(PackedList::from)),
+                };
+            }
             if target_is_float(target) {
                 let values = array.slice(range.start + selection.start, selection.len());
                 if let Some((values, shared)) = crate::float_list_cast::cast_with_backing(
@@ -85,9 +103,43 @@ mod tests {
 
     use arrow_schema::Field;
     use rtdb_columnar::ArrowCell;
-    use rtdb_types::{LogicalType, ScalarType, Value};
+    use rtdb_types::Value;
 
     use super::*;
+
+    #[test]
+    fn binary_identity_cast_gathers_only_reached_child_cells() {
+        let element = LogicalType::Scalar(ScalarType::Binary).maybe();
+        let ty = LogicalType::list(element.clone());
+        let items = [Value::Binary(vec![0, 255]), Value::Null, Value::Binary(Vec::new())];
+        let lists = rtdb_columnar::build_array(&ty, &[
+            Value::list(vec![Value::Binary(vec![42])]),
+            Value::list(items.to_vec()),
+            Value::list(vec![Value::Binary(vec![43])]),
+        ]).unwrap();
+        let field = rtdb_columnar::to_field("items", &ty).unwrap();
+        let input = EvalValue::List(Kind::List, Arc::new(ListReader::Arrow {
+            cell: ArrowCell { array: lists.as_ref(), field: &field, row: 1 }, backing: None,
+        }));
+        let target = CastTarget::fixed(LogicalType::Scalar(ScalarType::Binary));
+        let context = EvalContext::default();
+        for projection in [false, true] {
+            let list = cast(&input, Target::Cast(&target), false, 0..items.len(), projection, &context)
+                .unwrap().unwrap().values;
+            let (field, array) = list.packed_column().unwrap();
+            assert_eq!(array.data_type(), &arrow_schema::DataType::Binary);
+            assert!(field.is_nullable());
+            assert_eq!(list.iter().map(|value| value.into_owned()).collect::<Vec<_>>(), items);
+        }
+        assert!(cast(&input, Target::Cast(&target), false, 1..2, true, &context).unwrap().is_none());
+        assert!(cast(&input, Target::Cast(&target), false, 0..4, true, &context).unwrap().is_none());
+        let memory = rtdb_columnar::MemoryBudget::new(4096);
+        let scope = crate::EvaluationScope::new(&memory).unwrap();
+        let limited = context.with_allocation(&scope);
+        assert!(cast(&input, Target::Cast(&target), false, 0..items.len(), false, &limited)
+            .unwrap().is_none());
+        assert_eq!(memory.used_bytes(), 4096);
+    }
 
     #[test]
     fn accepted_borrowed_union_list_cast_packs_only_the_selected_children() {
