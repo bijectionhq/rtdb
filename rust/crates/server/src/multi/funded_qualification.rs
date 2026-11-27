@@ -464,17 +464,43 @@ async fn portable_backup_reopens_a_reconciled_funded_receipt_without_its_source(
     original.tick(&BTreeSet::from([node])).await.unwrap();
     // The issuer retained a booking even though its admission never reached the data journal.
     let key = vec![7; 16];
+    let request = Transact {
+        key: key.clone(),
+        require: vec![DECISION_CLOCK_OFFER.into()],
+        window: Default::default(),
+        guards: Vec::new(),
+        requires: Vec::new(),
+        otherwise: Vec::new(),
+        custody_request_digest: None,
+        request_memory: None,
+        ops: vec![Op::Put {
+            branch: MAIN_BRANCH.into(),
+            table: TableRef::new("public", "funded"),
+            if_absent: false,
+            rows: vec![Row {
+                id: EntityId::Integer(1),
+                valid: Some(Interval::ALL.into()),
+                cells: StructFields::from([("reading".into(), Cell::TxTime)]),
+                custody_group: None,
+                protected_columns: Vec::new(),
+                custody_payload: None,
+            }],
+        }],
+    };
+    request.check_funded_shape(false).unwrap();
     let outcome = FundedOutcome {
         booking: [8; 16],
         owner: [9; 32],
         predecessor: Basis::new(*source_incarnation.as_bytes(), 0),
-        intent_sha256: [10; 32],
+        intent_sha256: request.logical_sha256().unwrap(),
         appointment: false,
         activation_lsn: None,
         consumption_lsn: None,
         evidence_sha256: [11; 32],
     };
     let scoped_key = vec![12; 16];
+    let scoped_request = Transact { key: scoped_key.clone(), ops: Vec::new(), ..request.clone() };
+    scoped_request.check_funded_shape(true).unwrap();
     let appointment_key = vec![8; 16];
     let appointment_owner = [17; 32];
     let original_namespace = [13; 32];
@@ -487,7 +513,9 @@ async fn portable_backup_reopens_a_reconciled_funded_receipt_without_its_source(
         },
         FundedSettlement {
             namespace: Some(original_namespace), key: scoped_key.clone(),
-            outcome: FundedOutcome { owner: original_namespace, booking: [15; 16], ..outcome },
+            outcome: FundedOutcome {
+                owner: original_namespace, booking: [15; 16], intent_sha256: scoped_request.logical_sha256().unwrap(), ..outcome
+            },
         },
     ];
     let digest = funded_settlement_digest(*source_incarnation.as_bytes(), &settlements).unwrap();
@@ -517,6 +545,17 @@ async fn portable_backup_reopens_a_reconciled_funded_receipt_without_its_source(
     let receipt = reopened.tx_status(&key).await.unwrap();
     assert!(matches!(&receipt.outcome, Outcome::Refused { error } if error.code == "rtdb/funded-booking-closed"));
     assert!(receipt.replayed && receipt.decision_clock.is_none());
+    let destination_head = destination_journal.head(reopened.journal_stream()).await.unwrap();
+    assert_eq!(reopened.retry_retired_funding(&request, [8; 16], None, FundedStatus::Owner([9; 32]))
+        .await.unwrap(), Some(receipt));
+    assert!(reopened.retry_retired_funding(&request, [8; 16], None, FundedStatus::Owner([19; 32]))
+        .await.unwrap().is_none());
+    assert!(reopened.retry_retired_funding(&request, [19; 16], None, FundedStatus::Owner([9; 32]))
+        .await.unwrap().is_none());
+    let mut changed_request = request.clone();
+    changed_request.window.before = Some(Timestamp(100));
+    assert_eq!(reopened.retry_retired_funding(&changed_request, [8; 16], None, FundedStatus::Owner([9; 32]))
+        .await.unwrap_err().code, "rtdb/idempotency-key");
     assert_eq!(reopened.tx_status(&appointment_key).await.unwrap_err().code, "rtdb/unknown-transaction");
     assert_eq!(reopened.tx_status_with_funded_history(&appointment_key, None, FundedStatus::Owner([19; 32]))
         .await.unwrap_err().code, "rtdb/unknown-transaction");
@@ -538,6 +577,11 @@ async fn portable_backup_reopens_a_reconciled_funded_receipt_without_its_source(
     let receipt = reopened.tx_status_with_funded_history(&scoped_key, Some(scoped), FundedStatus::Scoped(&same_caller)).await.unwrap();
     assert_eq!(receipt.key, scoped_key);
     assert!(matches!(&receipt.outcome, Outcome::Refused { error } if error.code == "rtdb/funded-booking-closed"));
+    assert_eq!(reopened.retry_retired_funding(&scoped_request, [15; 16], Some(scoped), FundedStatus::Scoped(&same_caller))
+        .await.unwrap(), Some(receipt));
+    assert!(reopened.retry_retired_funding(&scoped_request, [15; 16], Some(scoped), FundedStatus::Scoped(&unrelated))
+        .await.unwrap().is_none());
+    assert_eq!(destination_journal.head(reopened.journal_stream()).await.unwrap(), destination_head);
     destination.shutdown().await.unwrap();
 }
 

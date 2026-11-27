@@ -516,6 +516,7 @@ contract OriginalFundedAdmission {
         -- A successor uses its own commissioned scope and preserves the original booking identity for retry and outcome lookup.
         -- A label-scoped status request authenticates against the current binding before looking up a retained funded receipt under the original incarnation.
         -- A retained unscoped appointment receipt is visible through status only to the authenticated original owner.
+        -- A retired ordinary funded consume can read its terminal receipt by exact owner, scope, booking, key and canonical request without creating a new effect.
         -- That lookup requires the original receipt's issuer, caller, database and label scope to match, and projects the result through the current label scope.
 }
 

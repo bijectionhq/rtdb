@@ -921,6 +921,19 @@ impl ServingDriver for MultiServing {
         }).await
     }
 
+    async fn retry_retired_funding(
+        &self, request: &Transact, booking: [u8; 16], scope: Option<&ServingScope>,
+        funding: FundedStatus<'_>, cancellation: &CancellationToken,
+    ) -> Result<Option<Receipt>> {
+        self.serve(async {
+            cancellation.run_until_cancelled(async {
+                self.database.lock().await
+                    .retry_retired_funding(request, booking, scope.map(ServingScope::transaction_scope), funding)
+                    .await
+            }).await.ok_or_else(interrupted)?
+        }).await
+    }
+
     async fn changes_scoped(&self, request: Changes, scope: &ServingScope,
                             cancellation: &CancellationToken) -> Result<ChangePage> {
         self.serve(async {

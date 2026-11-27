@@ -675,6 +675,21 @@ impl MultiDatabase {
         self.tx_status_in(key, scope, Some(funding)).await
     }
 
+    pub async fn retry_retired_funding(
+        &mut self, request: &Transact, booking: [u8; 16], scope: Option<ScopedTransact<'_>>,
+        funding: FundedStatus<'_>,
+    ) -> Result<Option<Receipt>> {
+        self.refresh().await?;
+        self.require_active()?;
+        match (self.current_tx_status(&request.key, scope), scope, &funding) {
+            (Ok(_), None, FundedStatus::Owner(_)) => (),
+            (Err(error), Some(_), FundedStatus::Scoped(_)) if error.code == "rtdb/unknown-transaction" => (),
+            _ => return Ok(None),
+        }
+        self.durable_transactions().retry_retired_funding(request, booking, funding)?
+            .map(|receipt| self.project_receipt(receipt, scope)).transpose()
+    }
+
     async fn tx_status_in(
         &mut self,
         key: &[u8],
@@ -683,13 +698,7 @@ impl MultiDatabase {
     ) -> Result<Receipt> {
         self.refresh().await?;
         self.require_active()?;
-        let writer = self.writer.as_ref().filter(|writer| !writer.recovering);
-        let receipt = match (writer, scope) {
-            (Some(writer), Some(scope)) => writer.pipeline.tx_status_scoped(key, scope),
-            (Some(writer), None) => writer.pipeline.tx_status(key),
-            (None, Some(scope)) => self.state().transactions.tx_status_scoped(key, scope),
-            (None, None) => self.state().transactions.tx_status(key),
-        };
+        let receipt = self.current_tx_status(key, scope);
         let receipt = match (receipt, scope, funding) {
             (Err(error), None, Some(funding @ FundedStatus::Owner(_)))
             | (Err(error), Some(_), Some(funding @ FundedStatus::Scoped(_)))
@@ -703,6 +712,16 @@ impl MultiDatabase {
             return Err(erasure_pending());
         }
         self.project_receipt(receipt, scope)
+    }
+
+    fn current_tx_status(&self, key: &[u8], scope: Option<ScopedTransact<'_>>) -> Result<Receipt> {
+        let writer = self.writer.as_ref().filter(|writer| !writer.recovering);
+        match (writer, scope) {
+            (Some(writer), Some(scope)) => writer.pipeline.tx_status_scoped(key, scope),
+            (Some(writer), None) => writer.pipeline.tx_status(key),
+            (None, Some(scope)) => self.state().transactions.tx_status_scoped(key, scope),
+            (None, None) => self.state().transactions.tx_status(key),
+        }
     }
 
     fn project_receipt(

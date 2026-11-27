@@ -380,6 +380,13 @@ pub trait ServingDriver: Send + Sync {
         }
     }
 
+    async fn retry_retired_funding(
+        &self, _request: &Transact, _booking: [u8; 16], _scope: Option<&ServingScope>,
+        _funding: FundedStatus<'_>, _cancellation: &CancellationToken,
+    ) -> Result<Option<Receipt>> {
+        Ok(None)
+    }
+
     async fn changes_scoped(&self, _request: Changes, _scope: &ServingScope,
                             _cancellation: &CancellationToken) -> Result<ChangePage> {
         Err(visibility::unsupported())

@@ -267,6 +267,50 @@ impl TransactState {
         }
         matched.ok_or_else(unknown_receipt)
     }
+
+    /// Replays an exact retired funded transaction without authorizing a new consume.
+    pub fn retry_retired_funding(
+        &self,
+        request: &Transact,
+        booking: [u8; 16],
+        access: FundedStatus<'_>,
+    ) -> Result<Option<Receipt>> {
+        let key = &request.key;
+        validate_key(key)?;
+        let matches_booking = |history: &HistoricalFunding, owner| {
+            !history.outcome.appointment
+                && history.outcome.booking == booking
+                && history.outcome.owner == owner
+        };
+        let matched = match access {
+            FundedStatus::Owner(owner) => self
+                .historical_funding(key, None)?
+                .filter(|(_, history)| matches_booking(history, owner)),
+            FundedStatus::Scoped(namespace_at) => {
+                let mut matched = None;
+                for &origin in &self.scoped_funding_origins {
+                    let namespace = namespace_at(origin);
+                    let Some((receipt, history)) = self.historical_funding(key, Some(namespace))? else {
+                        continue;
+                    };
+                    if history.source == origin
+                        && matches_booking(&history, namespace)
+                        && matched.replace((receipt, history)).is_some()
+                    {
+                        return Err(conflicting_key());
+                    }
+                }
+                matched
+            }
+        };
+        let Some((receipt, history)) = matched else {
+            return Ok(None);
+        };
+        if request.logical_sha256()? != history.outcome.intent_sha256 {
+            return Err(conflicting_key());
+        }
+        Ok(Some(receipt))
+    }
 }
 
 fn retire(

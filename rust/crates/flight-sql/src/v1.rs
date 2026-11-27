@@ -6,7 +6,7 @@ use prost::{Message, Name};
 use rtdb_node::serving::{FundingSubmission, ROW_VISIBILITY, ServingDriver, ServingScope};
 use rtdb_node::{Database, DatabaseAccess, SessionIdentity};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions};
-use rtdb_tx::transact::{DECISION_CLOCK_OFFER, FundingCommand, PHYSICAL_ERASURE, REVIEWED_CUSTODY_PLACEMENT, ROW_CUSTODY, TIMED_TRANSACT, TRANSACT_REQUIRES};
+use rtdb_tx::transact::{DECISION_CLOCK_OFFER, FundedStatus, FundingCommand, PHYSICAL_ERASURE, REVIEWED_CUSTODY_PLACEMENT, ROW_CUSTODY, TIMED_TRANSACT, TRANSACT_REQUIRES};
 use rtdb_types::{Timestamp, rtdb_v1::{CLEAR_RANK_INPUT, RANKED_ARTEFACT_READINESS, RANKED_IVF}};
 use tonic::{Response, Status, metadata::MetadataMap};
 
@@ -432,10 +432,21 @@ impl Service {
         let owner = funding_owner(call).ok_or_else(|| error::unsupported(DECISION_CLOCK_OFFER))?;
         let database = self.wire_attachment(call, DatabaseAccess::Write).await?;
         let driver = database.serving_driver().ok_or_else(|| error::unsupported(DECISION_CLOCK_OFFER))?;
-        let clock = self.0.node.funded_offer_clock().ok_or_else(|| error::unsupported(DECISION_CLOCK_OFFER))?;
         let scope = self.serving_scope(call, driver)?;
         let mut request = transact::request(request, call.memory())?;
         request.check_funded_shape(scope.is_some()).map_err(error::anomaly)?;
+        if let FundingCommand::Consume { booking } = command {
+            let credential = call.session.caller.principal.label_scope();
+            let namespace_at = |incarnation| credential.expect("admitted label scope").funded_receipt_namespace_at(incarnation);
+            let funding = if credential.is_some() { FundedStatus::Scoped(&namespace_at) } else { FundedStatus::Owner(owner) };
+            if let Some(receipt) = driver.retry_retired_funding(&request, booking, scope.as_ref(), funding, &call.cancellation)
+                .await.map_err(error::anomaly)?
+            {
+                self.check_attachment(call, &database)?;
+                return Ok(receipt);
+            }
+        }
+        let clock = self.0.node.funded_offer_clock().ok_or_else(|| error::unsupported(DECISION_CLOCK_OFFER))?;
         request.request_memory = Some(call.request_reservation());
         let receipt = driver.transact_funded(request, scope, FundingSubmission { command, owner, clock }, &call.cancellation)
             .await.map_err(error::anomaly)?;
@@ -470,8 +481,6 @@ impl Service {
         let driver = database
             .serving_driver()
             .ok_or_else(|| error::unsupported("tx-status"))?;
-        use rtdb_tx::transact::FundedStatus;
-
         let receipt = match self.serving_scope(call, driver)? {
             Some(scope) => {
                 let credential = call.session.caller.principal.label_scope().expect("admitted label scope");
