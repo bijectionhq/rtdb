@@ -5,7 +5,7 @@ use arrow_array::{Array, ArrayRef, Int32Array, MapArray, NullArray, TimestampMic
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer, ScalarBuffer};
 use arrow_data::{ArrayData, transform::MutableArrayData};
 use arrow_schema::{DataType, Field, UnionMode};
-use rtdb_columnar::{BatchBuilder, ColumnPresence, EXTENSION_NAME_KEY, copy_event_cells, estimate_event_copy_cell_bytes,
+use rtdb_columnar::{BatchBuilder, ColumnPresence, FundedColumn, EXTENSION_NAME_KEY, copy_event_cells, estimate_event_copy_cell_bytes,
     estimate_event_null_cell_bytes, from_field, pack_runs};
 use rtdb_types::{Anomaly, ListKind, LogicalType, Result, RunEndWidth, ScalarType, TimeUnit, Value};
 
@@ -74,14 +74,14 @@ pub(super) fn column<E: EncodedEvent>(
         };
         Anomaly::incorrect("rtdb/column-type-mismatch", message)
     };
-    let reserve_plan = |bytes| {
-        builder.as_deref().map(|builder| builder.reserve_scratch(bytes)).transpose()
+    // Without room for the gather plan the caller takes its per-cell path, so a refusal yields `None`.
+    enum Plan { Funded(Option<Arc<rtdb_columnar::MemoryReservation>>), Unfunded }
+    let reserve_plan = |bytes| match builder.as_deref() {
+        None => Plan::Funded(None),
+        Some(builder) => builder.try_reserve_scratch(bytes).map_or(Plan::Unfunded, |charge| Plan::Funded(Some(charge))),
     };
     let plan_size = events.len().checked_mul(128).ok_or_else(event_size)?;
-    let _plan = match reserve_plan(plan_size) {
-        Err(error) if error.code == "rtdb/memory-budget-exceeded" => return Ok(None),
-        result => result?,
-    };
+    let Plan::Funded(_plan) = reserve_plan(plan_size) else { return Ok(None); };
     let mut cells = Vec::with_capacity(events.len());
     let mut aliases = Vec::new();
     let mut source_types = HashMap::new();
@@ -96,10 +96,8 @@ pub(super) fn column<E: EncodedEvent>(
                     std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                     std::collections::hash_map::Entry::Vacant(entry) => {
                         let bytes = field.size().checked_mul(8).ok_or_else(event_size)?;
-                        match reserve_plan(bytes) {
-                            Err(error) if error.code == "rtdb/memory-budget-exceeded" => return Ok(None),
-                            result => field_charges.extend(result?),
-                        }
+                        let Plan::Funded(charge) = reserve_plan(bytes) else { return Ok(None); };
+                        field_charges.extend(charge);
                         entry.insert(ColumnPresence::new(field)?)
                     }
                 };
@@ -107,10 +105,8 @@ pub(super) fn column<E: EncodedEvent>(
                     match reader.stored_alias(array, index)? {
                         Some(field) => {
                             let bytes = field.size().checked_mul(2).ok_or_else(event_size)?;
-                            match reserve_plan(bytes) {
-                                Err(error) if error.code == "rtdb/memory-budget-exceeded" => return Ok(None),
-                                result => field_charges.extend(result?),
-                            }
+                            let Plan::Funded(charge) = reserve_plan(bytes) else { return Ok(None); };
+                            field_charges.extend(charge);
                             aliases.push((cells.len(), field));
                         }
                         None => can_gather = false,
@@ -163,9 +159,9 @@ pub(super) fn column<E: EncodedEvent>(
         None => gather(target, &cells),
     };
     if let Some((builder, bound)) = builder.zip(bound) {
-        match builder.try_column(bound, build) {
-            Err(error) if error.code == "rtdb/memory-budget-exceeded" => Ok(None),
-            result => result,
+        match builder.try_funded_column(bound, build)? {
+            FundedColumn::Built(column) => Ok(column),
+            FundedColumn::Unfunded => Ok(None),
         }
     } else {
         build()

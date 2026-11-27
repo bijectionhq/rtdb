@@ -934,19 +934,13 @@ fn put_batch(
             if selected >= retained { break; }
         }
     }
-    // A source record can share one large document buffer across thousands of small puts.
+    // A source record can share one large document buffer across thousands of small puts, so they are compacted;
+    // keeping the shared buffer when the copy cannot be funded would hold more memory exactly when there is least.
     let (documents, copy) = if selected < retained {
         let layout = crate::ipc::schema_translation_bound(&Schema::new(vec![field]))?;
-        let scratch = selected.checked_add(layout).ok_or_else(event_size)?;
-        match memory.reserve(scratch) {
-            Ok(scratch) => {
-                let cells = (0..documents.len()).map(|row| Some((0, row))).collect::<Vec<_>>();
-                let compact = rtdb_columnar::copy_event_cells(&[documents.as_ref()], &cells)?;
-                (compact, Some(scratch))
-            }
-            Err(error) if error.code == "rtdb/memory-budget-exceeded" => (documents, None),
-            Err(error) => return Err(error),
-        }
+        let scratch = memory.reserve(selected.checked_add(layout).ok_or_else(event_size)?)?;
+        let cells = (0..documents.len()).map(|row| Some((0, row))).collect::<Vec<_>>();
+        (rtdb_columnar::copy_event_cells(&[documents.as_ref()], &cells)?, Some(scratch))
     } else {
         (documents, None)
     };
@@ -1483,6 +1477,21 @@ mod tests {
         assert_eq!(source_memory.used_bytes(), 0);
         let event = EventBatch::new(batch.batch().clone()).unwrap().read_event(0).unwrap();
         assert_eq!(event.operation, StoredOperation::Put(StructFields::from([("v".into(), Value::Utf8("kept".into()))])));
+    }
+
+    #[test]
+    fn a_staged_put_that_cannot_fund_its_compaction_fails_instead_of_keeping_the_shared_buffer() {
+        use arrow_array::{StringArray, StructArray};
+
+        let other = "x".repeat(1 << 20);
+        let strings = Arc::new(StringArray::from(vec!["selected", other.as_str()]));
+        let documents = StructArray::try_new(vec![Field::new("v", DataType::Utf8, false)].into(), vec![strings], None).unwrap();
+        let memory = MemoryBudget::new(16 << 10);
+        let header = EventHeader { position: None, commit_position: 0, iid: EntityId::Integer(1).iid(), system_from: Timestamp(1), valid_time: Interval::ALL, op: EventOp::Put };
+
+        let error = funded_put_batch(Arc::new(documents.slice(0, 1)), &[header], &memory).unwrap_err();
+        assert_eq!(error.kind, Some(rtdb_types::AnomalyKind::ResourceExhausted));
+        assert_eq!(memory.used_bytes(), 0);
     }
 
     fn page(value: Value) -> Vec<PageEvent> {

@@ -8,6 +8,12 @@ use rtdb_types::{Anomaly, Result};
 
 pub use rtdb_types::{MemoryBudget, MemoryReservation};
 
+/// The outcome of [BatchBuilder::try_funded_column].
+pub enum FundedColumn {
+    Built(Option<ArrayRef>),
+    Unfunded,
+}
+
 /// Holds the retained arrays of one batch while admitting only one column's construction scratch.
 pub struct BatchBuilder { reservation: Arc<MemoryReservation> }
 
@@ -18,6 +24,11 @@ impl BatchBuilder {
 
     pub fn reserve_scratch(&self, bytes: usize) -> Result<Arc<MemoryReservation>> {
         self.reservation.budget().reserve(bytes)
+    }
+
+    /// Reserves scratch if the budget has room for it, for a caller that picks a cheaper strategy otherwise.
+    pub fn try_reserve_scratch(&self, bytes: usize) -> Option<Arc<MemoryReservation>> {
+        self.reservation.budget().try_reserve(bytes)
     }
 
     /// Moves the charge for metadata discovered during column decoding to the batch.
@@ -42,6 +53,19 @@ impl BatchBuilder {
         let added = array.as_ref().map_or(0, |array| array.get_array_memory_size());
         reservation.shrink_to(retained.checked_add(added).ok_or_else(allocation_overflow)?)?;
         Ok(array)
+    }
+
+    /// As `try_column`, but `Unfunded` when the budget has no room for the construction scratch, for a caller that
+    /// picks a cheaper strategy then.
+    pub fn try_funded_column(&mut self, temporary: usize, build: impl FnOnce() -> Result<Option<ArrayRef>>) -> Result<FundedColumn> {
+        let Some(mut scratch) = self.reservation.budget().try_reserve(temporary) else { return Ok(FundedColumn::Unfunded); };
+        let reservation = Arc::get_mut(&mut self.reservation).expect("batch construction owns its reservation");
+        let retained = reservation.bytes();
+        reservation.absorb(Arc::get_mut(&mut scratch).expect("column scratch has a single owner"))?;
+        let array = build()?;
+        let added = array.as_ref().map_or(0, |array| array.get_array_memory_size());
+        reservation.shrink_to(retained.checked_add(added).ok_or_else(allocation_overflow)?)?;
+        Ok(FundedColumn::Built(array))
     }
 
     pub fn finish(self, batch: RecordBatch) -> Result<OwnedBatch> {
