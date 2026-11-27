@@ -2177,6 +2177,9 @@ fn io_error(error: io::Error) -> Anomaly {
 }
 
 #[cfg(test)]
+mod endgame_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use rtdb_flight_sql::{

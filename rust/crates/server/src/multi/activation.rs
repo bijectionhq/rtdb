@@ -45,6 +45,16 @@ pub struct VerifiedSuccessor {
     manifest_digest: [u8; 32],
 }
 
+impl VerifiedSuccessor {
+    pub fn from_installation(installed: &rtdb_db::InstalledBackup) -> Self {
+        Self {
+            predecessor: installed.source_incarnation(),
+            successor: Uuid::from_bytes(installed.destination_basis().incarnation()),
+            manifest_digest: installed.manifest_sha256(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct State {
     version: u8,
