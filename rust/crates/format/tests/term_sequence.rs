@@ -1,6 +1,7 @@
 use prost::{Message, bytes::Bytes};
 use rtdb_format::catalog::BlockCatalog;
-use rtdb_format::envelope::{ReplicaBody, ReplicaEnvelope, ReplicaFrame, ReplicaPeek, ReplicaPeekBody};
+use rtdb_format::envelope::{ReplicaBody, ReplicaEnvelope, ReplicaFrame, ReplicaPeek, ReplicaPeekBody, replica_uses_extension};
+use rtdb_format::{PROTOBUF_LOG_HEADER, RTDB_EXTENSION_LOG_HEADER, XTDB_REFUSAL_PREFIX};
 use rtdb_format::generated::xtdb::{block::proto::Block, log::proto as pb};
 use rtdb_types::{BlockIndex, PlacedAttemptScope, SourcePosition, StorageEpoch, StorageVersion, Term, TermSequence, Timestamp};
 
@@ -18,9 +19,14 @@ fn arrow_byte_path_every_message_kind_keeps_prost_envelope_bytes() {
             entries: vec![pb::ArtefactEntry { trie_key: Some("l01-rc-b00".into()), record: Some(pb::ArtefactRecord { kind: Some("search".into()), definition_id: Some("docs_body".into()), definition_version: Some(1), stats: Some(vec![1, 2]), scope: None, file_size: None, published_version: None, pack_members: Vec::new() }) }] }),
     ];
     for message in messages {
-        let stamped = ReplicaEnvelope { term: Term(3), term_sequence: Some(TermSequence(5)), message };
+        let stamped = ReplicaEnvelope { term: Term(3), term_sequence: Some(TermSequence(5)), message: message.clone() };
         assert_eq!(stamped.encoded_len(), stamped.encode().len());
-        let mut expected = vec![3];
+        // An RTDB-only record keeps the same prost payload behind the header and prefix XTDB refuses.
+        let mut expected = if replica_uses_extension(&message) {
+            [&[RTDB_EXTENSION_LOG_HEADER][..], &XTDB_REFUSAL_PREFIX].concat()
+        } else {
+            vec![PROTOBUF_LOG_HEADER]
+        };
         pb::ReplicaLogMessage { term_id: Some(3), term_seq: Some(5), message: Some(stamped.message.clone()) }.encode(&mut expected).unwrap();
         assert_eq!(stamped.encode(), expected);
         assert_eq!(ReplicaEnvelope::decode(&stamped.encode()).unwrap(), Some(stamped));
