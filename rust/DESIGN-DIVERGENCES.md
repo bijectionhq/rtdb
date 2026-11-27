@@ -86,15 +86,16 @@ Sealed, retired, or lineage-headed local logs cannot be opened by upstream XTDB.
 
 **What differs.**
 Upstream `LocalLog` uses a 10-element channel and drains up to 10 queued messages per `force(true)` call.
-RTDB uses a 64-element channel (`log_queue_capacity`) and batches queued records up to `256 KiB` (`APPEND_BATCH_BYTES`) or `1 ms` (`APPEND_BATCH_TIME`), writing and syncing each batch via `tokio::task::spawn_blocking`.
+RTDB uses a dedicated blocking writer and a queue with a default capacity of 64.
+The writer drains up to 10 queued records per batch and stops grouping at 256 KiB.
+Plain inline tails can read recent frames in one file read.
 On Apple platforms, RTDB calls `F_FULLFSYNC` (falling back to `fsync` on `ENOTSUP`/`EINVAL`/`ENOTTY`) and exposes `RTDB_APPLE_SYNC=fsync` to weaken sync for local development.
 
 **Why.**
-Byte- and time-bounded batches smooth local-disk group commits under Rust's async runtime without blocking executor threads.
-The Apple opt-out lets developers trade full-flush durability for speed on macOS without changing code.
+The writer owns the journal handle and keeps filesystem synchronization off the async executor.
+The Apple opt-out allows local development with ordinary `fsync`.
 
 **What a user sees.**
-Write batching and latency characteristics under concurrent local-log writers can differ from XTDB's 10-message batches.
 Setting `RTDB_APPLE_SYNC=fsync` on macOS weakens crash durability compared to `F_FULLFSYNC`.
 
 **Where in the code.**
@@ -378,7 +379,8 @@ Unsupported window forms use SQLSTATE `0A000`.
 **What differs.**
 Upstream XTDB delegates regexes to `java.util.regex` with no compile or backtracking cap, parses XTQL with the Clojure reader, and splices computed `regexp-replace` patterns directly into Clojure codegen.
 RTDB translates Java regex syntax onto a vendored `fancy-regex` engine plus a UTF-16 interpreter for `\b{g}` and `\R`, enforcing hard limits (64 KiB pattern, nesting 128, repetition 10,000, 128 groups, and backtracking budgets) that fail with `rtdb.expr/regex-limit` (`ProgramLimitExceeded`, `54000`).
-RTDB parses XTQL with its own EDN reader (rejecting `#=`, reader conditionals, regex literals, ratios, and arbitrary Java tags), does not support XTQL percentile aggregates or subqueries in temporal filters, and evaluates computed `regexp-replace` patterns through a whitelisted host-form interpreter (core string/number functions, `java.util.regex.Pattern/quote`, `clojure.string/*`) rather than arbitrary Clojure code.
+RTDB parses XTQL with a native EDN reader that supports portable escapes, tagged values and integral ratios.
+Computed `regexp-replace` patterns use a whitelist of string and number functions, including `java.util.regex.Pattern/quote` and supported `clojure.string/*` operations.
 
 **Why.**
 Hard regex limits prevent catastrophic backtracking DoS on native worker threads.
@@ -386,7 +388,8 @@ A non-JVM engine cannot execute arbitrary Clojure reader macros or host expressi
 
 **What a user sees.**
 Pathological or oversized regex patterns fail with SQLSTATE `54000` (`rtdb.expr/regex-limit`) instead of hanging.
-XTQL queries relying on arbitrary Clojure host forms or reader macros fail at parse or bind time.
+Use literal strings for regex patterns and resolve Clojure reader conditionals before submitting XTQL.
+An arbitrary JVM host expression or Java object tag fails during read or preparation.
 
 **Where in the code.**
 - `RC/expr/src/string/pattern.rs`
@@ -588,7 +591,9 @@ RTDB implements several core engine internals differently from XTDB while preser
   Later versions share the prefix, and readers keep their original version.
   XTDB appends to a growable in-place `Relation`.
   RTDB's trie catalog shares immutable table and block maps across catalog versions.
-- **Scan merge and temporal resolution:** `PartitionScan` runs a `BinaryHeap` k-way merge and general `HistoryResolver` polygon calculation rather than per-page `SingleIidSelector` binary search and `AsOfResolver` early exit.
+- **Scan merge and temporal resolution.** `PartitionScan` runs a heap-based merge across event sources.
+  Eligible Classic point scans track the valid-time gap around the point and seek to the next IID once the result is settled.
+  Eligible range predicates run before payload gathering, and historical cuts that require full bounds use the polygon resolver.
 - **Metadata pruning:** leaf statistics are decoded lazily into `Value` trees (`LeafColumns`) per visited leaf and roaring bloom filters are deserialized per check rather than queried zero-copy.
 - **Value boundaries:** while system columns (`_iid`, `_valid_*`, `_system_*`) are Arrow arrays, spill uses Arrow IPC, and pgwire encodes directly from Arrow where supported, several operators (non-columnar joins, aggregates, window, set ops), DML writes (`TransactionBuffer`), Flight bulk ingest, and compaction merges (`SegmentCompactor`, running parallel jobs on `spawn_blocking`) still convert through owned `Value` / `StoredEvent` trees.
 - **Cancellation:** RTDB uses per-query `CancellationToken` trees and cooperative checks rather than JVM thread interrupts.
@@ -711,7 +716,8 @@ YAML files using RTDB-only keys (such as `search.*`, `grants`, `query.spillLimit
 Upstream XTDB ships an Alpine image running as user `xtdb` (UID/GID 20000) on a custom JRE with runtime backend modules.
 RTDB's image matches upstream's `/usr/local/lib/xtdb` workdir, `-f config.yaml` command, `VOLUME /var/lib/xtdb`, default no-password / `XTDB_PASSWORD` auth, and `wget` `HEALTHCHECK`, while deliberately using Debian Bookworm, user `rtdb` (same UID/GID 20000), and `LD_PRELOAD=libjemalloc.so.2` (with legacy fallbacks in `rtdb-entrypoint` for `/etc/rtdb/config.yaml` and `/var/lib/rtdb`).
 Remote storage and Kafka backends (`s3`, `azure`, `gcs`, `kafka`, `pg-source`, `cloudwatch`) are compile-time Cargo features rather than runtime modules, so `--variant local` omits them and `all-backends` bundles them.
-Outside Docker, `rtdb` uses system `malloc` rather than a compiled-in `#[global_allocator]`.
+The normal `rtdb` binary uses mimalloc as its Rust global allocator.
+The heap-profiling build selects the `dhat` allocator.
 The bundled `/etc/rtdb/cluster-default.yaml` and `/etc/rtdb/cluster-multi.yaml` files are RTDB-only cluster configs that read `RTDB_ROOT_PASSWORD`.
 
 **Why.**
@@ -731,7 +737,9 @@ Container tooling inside the image sees Debian (`apt`) and user `rtdb` instead o
 ### 5.6 Observability: logging targets, JSON templates, metrics, tracing export, and crash logs
 
 **What differs.**
-RTDB's `tracing` subscriber honours `XTDB_LOG_FORMAT`, `XTDB_LOGGING_LEVEL[_NS]`, and `XTDB_LOG_JSON_TEMPLATE` (compiling bundled `classpath:` templates or `file:` Log4j2 `JsonTemplateLayout` templates at startup, refusing startup on unsupported resolvers) and aliases 18 core `rtdb_*` targets to upstream `xtdb.*` logger names; unaliased Rust modules report as `xtdb.<crate>.<module>`.
+RTDB's `tracing` subscriber honours `XTDB_LOG_FORMAT`, `XTDB_LOGGING_LEVEL[_NS]`, and `XTDB_LOG_JSON_TEMPLATE`.
+It compiles bundled `classpath:` and supported `file:` Log4j2 templates at startup.
+Native aliases accept upstream log-level selectors for components such as pgwire, indexing, Kafka Connect and cloud storage.
 Metrics use 16 per-thread sample shards, publish native allocator gauges, omit JVM-only binders (`jvm.*`), and add RTDB-only metrics (`rtdb.cache.{limit,retained}.bytes`, `rtdb.gc.error`, `rtdb.kafka.warning`, `rtdb.replica.commit.*`, `query.linearizable`, `query.page`, `query.track`).
 OTLP traces use HTTP protobuf.
 CloudWatch and Azure metric exporters build native JSON payloads.
@@ -742,7 +750,7 @@ The driver currently supplies no query relation to the crash writer.
 Native Rust binaries replace JVM-only libraries (Log4j2, Micrometer, OpenTelemetry Java SDK) with `tracing` and lightweight JSON exporters while preserving upstream environment variables, Prometheus exposition, and core metric names.
 
 **What a user sees.**
-`XTDB_LOG_FORMAT`, `XTDB_LOG_JSON_TEMPLATE` (for bundled and `file:` templates using supported resolvers), and `XTDB_LOGGING_LEVEL` work as in XTDB, though fine-grained sub-logger names outside the 18 aliases follow Rust module names.
+Fine-grained Rust targets beyond the aliases use native module names.
 Prometheus exposes native allocator and replica metrics alongside RTDB-specific counters.
 The transaction crash path currently omits `query-rel.arrow`.
 
