@@ -50,7 +50,9 @@ impl Number {
     /// Parses a signed Java decimal long, rejecting whitespace and overflow.
     pub fn parse_long(text: &str) -> Result<Self> { parse::long(text) }
     /// Parses Java Double text, including hexadecimal literals, suffixes and ASCII control-space trimming.
-    pub fn parse_double(text: &str) -> Result<Self> { parse::double(text) }
+    pub fn parse_double(text: &str) -> Result<Self> { parse::float(text, false) }
+    /// Parses Java Float text and rounds the input directly to binary32.
+    pub fn parse_float(text: &str) -> Result<Self> { parse::float(text, true) }
     /// Tests floating payloads without coercing or copying other numeric categories.
     pub fn is_nan(&self) -> bool { matches!(self,Self::Float(value) if value.is_nan()) || matches!(self,Self::Double(value) if value.is_nan()) }
     /// Parses a signed decimal integer into the Clojure BigInt category, including values that fit a long.

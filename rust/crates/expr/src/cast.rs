@@ -1,7 +1,7 @@
 use crate::numeric::{decimal, decimal_value, floating_value, inapplicable, integer, integer_value, number, number_format, overflow};
 use crate::timezone::zone;
 use num_bigint::BigInt;
-use rtdb_types::{Anomaly, CivilDate, DateUnit, Instant, LogicalType, Result, ScalarType, TimeUnit, Timestamp, Value};
+use rtdb_types::{Anomaly, CivilDate, DateUnit, Instant, LogicalType, NumericCell, Result, ScalarType, TimeUnit, Timestamp, Value, jvm_number::Number};
 use std::str::FromStr;
 
 pub fn parse_timestamp(text: &str, timezone: &str) -> Result<Timestamp> {
@@ -73,30 +73,33 @@ pub fn query_clock_instant(value: &Value, timezone: &str) -> Result<Instant> {
 /// `Byte/parseByte` through `Long/parseLong`, which the reference's text casts call.
 pub(crate) fn parse_java_integer(text: &str, target: &ScalarType) -> Result<i128> {
     let invalid = || number_format(format!("For input string: \"{text}\""));
+    let Number::Long(value) = Number::parse_long(text).map_err(|_| invalid())? else { unreachable!() };
     Ok(match target {
-        ScalarType::I64 => i128::from(text.parse::<i64>().map_err(|_| invalid())?),
-        ScalarType::I32 => i128::from(text.parse::<i32>().map_err(|_| invalid())?),
-        _ => {
-            let value = text.parse::<i32>().map_err(|_| invalid())?;
+        ScalarType::I64 => i128::from(value),
+        ScalarType::I32 => i128::from(i32::try_from(value).map_err(|_| invalid())?),
+        ScalarType::I8 | ScalarType::I16 => {
+            let value = i32::try_from(value).map_err(|_| invalid())?;
             let out_of_range = || number_format(format!("Value out of range. Value:\"{text}\" Radix:10"));
             if *target == ScalarType::I8 { i128::from(i8::try_from(value).map_err(|_| out_of_range())?) }
             else { i128::from(i16::try_from(value).map_err(|_| out_of_range())?) }
         }
+        _ => unreachable!(),
     })
 }
 
-/// `Double/parseDouble`: surrounding control characters and spaces are trimmed, a trailing `f`/`d` is allowed,
-/// and only `NaN` and `Infinity` are spelled out.
-pub(crate) fn parse_java_float(text: &str) -> Result<f64> {
+pub(crate) fn parse_java_float(text: &str, target: &ScalarType) -> Result<NumericCell> {
     let trimmed = text.trim_matches(|ch: char| ch <= ' ');
     if trimmed.is_empty() { return Err(number_format("empty String".into())); }
-    let invalid = || number_format(format!("For input string: \"{trimmed}\""));
-    let unsigned = trimmed.strip_prefix(['+', '-']).unwrap_or(trimmed);
-    if matches!(unsigned, "NaN" | "Infinity") { return trimmed.replace("Infinity", "inf").parse().map_err(|_| invalid()); }
-    let decimal = trimmed.strip_suffix(['f', 'F', 'd', 'D']).unwrap_or(trimmed);
-    let digits = decimal.strip_prefix(['+', '-']).unwrap_or(decimal);
-    if !digits.starts_with(|ch: char| ch.is_ascii_digit() || ch == '.') { return Err(invalid()); }
-    decimal.parse().map_err(|_| invalid())
+    let number = match target {
+        ScalarType::F32 => Number::parse_float(trimmed),
+        _ => Number::parse_double(trimmed),
+    }.map_err(|_| number_format(format!("For input string: \"{trimmed}\"")))?;
+    Ok(match number {
+        Number::Float(value) => NumericCell::F32(value),
+        Number::Double(value) if *target == ScalarType::F16 => NumericCell::F16(half::f16::from_f64(value).to_bits()),
+        Number::Double(value) => NumericCell::F64(value),
+        _ => unreachable!(),
+    })
 }
 
 pub(crate) fn decimal_integer(number: f64) -> Result<i128> {
@@ -128,7 +131,10 @@ pub(crate) fn timestamp_from_nanos(nanos: i128, unit: TimeUnit) -> Result<i64> {
 
 pub(crate) fn duration_seconds(seconds: f64, unit: TimeUnit) -> Result<i64> {
     let value = seconds * unit.units_per_second() as f64;
-    if !value.is_finite() || value < i64::MIN as f64 || value >= -(i64::MIN as f64) { return Err(overflow()); }
+    if value < i64::MIN as f64 || value > i64::MAX as f64 {
+        return Err(Anomaly::incorrect("xtdb.expression/illegal-argument-exception",
+            format!("Value out of range for long: {}", rtdb_types::java_f64_text(value))));
+    }
     Ok(value as i64)
 }
 
@@ -208,8 +214,8 @@ fn cast_from(value: &Value, source: &LogicalType, data_type: &LogicalType, timez
             integer_value(value, target)
         }
         S::F16 | S::F32 | S::F64 => {
-            let number = match value { Value::Utf8(text) => parse_java_float(text)?, value => number(value).ok_or_else(|| inapplicable("float", &[value]))? };
-            Ok(floating_value(number, target))
+            if let Value::Utf8(text) = value { return parse_java_float(text, target).map(NumericCell::into_value); }
+            Ok(floating_value(number(value).ok_or_else(|| inapplicable("float", &[value]))?, target))
         }
         S::Decimal { precision, scale, bit_width } => {
             let decimal = match value {
@@ -260,7 +266,7 @@ fn cast_from(value: &Value, source: &LogicalType, data_type: &LogicalType, timez
                 return Ok(Value::Time { value: rescale_units(*value, *source_unit, *target_unit)?, unit: *target_unit, bit_width: *bit_width });
             }
             let nanos = match value {
-                Value::Utf8(text) => rtdb_types::parse_iso_local_time(text)? as i64,
+                Value::Utf8(text) => crate::temporal_cast::time_nanos(text)? as i64,
                 Value::Timestamp { value, unit, timezone: source_zone } => {
                     let value = timestamp_to_time(*value, *unit, *target_unit, source_zone.as_ref().map(|_| timezone))?;
                     return Ok(Value::Time { value, unit: *target_unit, bit_width: *bit_width });

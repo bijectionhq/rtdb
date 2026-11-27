@@ -182,10 +182,7 @@ pub(crate) fn cast_text_number(text: &str, target: Target<'_>) -> Result<Numeric
             let params = DecimalParameters { precision: *precision, scale: *scale, bit_width: *bit_width };
             NumericCell::Decimal(crate::decimal::cast_coefficient(value, params)?, params)
         }
-        S::F16 | S::F32 | S::F64 => {
-            let number = crate::cast::parse_java_float(text)?;
-            cast_number(NumericCell::F64(number), &S::F64, Target::Scalar(target))?
-        }
+        S::F16 | S::F32 | S::F64 => crate::cast::parse_java_float(text, target)?,
         S::I8 | S::I16 | S::I32 | S::I64 => {
             crate::numeric::integer_cell(crate::cast::parse_java_integer(text, target)?, target)?
         }

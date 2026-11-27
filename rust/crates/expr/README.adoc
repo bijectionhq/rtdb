@@ -125,6 +125,8 @@ Zoned timestamp casts require an explicit input offset or region, while local ti
 Timestamp text casts check the epoch-second conversion before adding the fractional component.
 Time-to-timestamp evaluation reads the query clock's calendar date in the session zone through `EvalContext`; the context-free `cast_target` helper cannot perform that conversion.
 The target unit must represent midnight on that date before the time of day is added.
+Text-to-TIME casts report the same invalid temporal string error with or without a precision descriptor.
+Double-to-duration casts use Clojure's checked long conversion after scaling to the destination unit.
 
 Qualified interval casts retain the requested fields and source-dependent precision checks.
 Single-field text SECOND casts retain nanoseconds with micro-interval metadata, irrespective of the requested fractional truncation.
@@ -187,6 +189,8 @@ Native type predicates such as `integer?` preserve their existing nonnullable Bo
 `tests/equality_demand.rs` covers both public evaluation entry points, scalar and composite results, literal coercion, discarded payloads and retained control/effect demands.
 The numeric catalogue includes `log10`, `sinh`, `cosh`, `tanh` and `mod`; expression and XTQL callers also expose the `double` conversion.
 `tests/math_catalogue.rs` covers nulls, result types and native numeric dispatch as unexecuted source.
+Signed integer text casts accept Java's BMP decimal digits.
+Text casts to REAL and DOUBLE PRECISION accept hexadecimal floating literals and round directly to the destination width.
 
 == Temporal fields, bins and clocks
 

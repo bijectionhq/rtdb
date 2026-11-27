@@ -23,6 +23,9 @@ The following types are available within XTDB:
 
 The Postgres spellings (`INT2`, `INT4`, `INT8`, `FLOAT4`, `FLOAT8`, and `BOOL`, `BPCHAR` and `NAME` below) are accepted as cast targets (v2.2+).
 
+Text casts to floating-point types accept decimal and hexadecimal forms, such as `CAST('0x1.8p1' AS REAL)`.
+The value rounds directly to the target type's precision.
+
 ### Decimal type
 
 `NUMERIC` | `DECIMAL`

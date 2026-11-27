@@ -393,7 +393,7 @@ fn cast_temporal(
             cast::timestamp_text_raw(text, *unit, timezone.is_some())?
         }
         (TemporalValue::Text(text), _, S::Time { unit, .. }) => {
-            (rtdb_types::parse_iso_local_time(text)? as i64) / (1_000_000_000 / unit.units_per_second())
+            (crate::temporal_cast::time_nanos(text)? as i64) / (1_000_000_000 / unit.units_per_second())
         }
         (TemporalValue::Text(text), _, S::Duration(unit)) => {
             cast::rescale_units(crate::temporal_text::duration(text)?, Nanosecond, *unit)?

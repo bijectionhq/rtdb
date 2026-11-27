@@ -67,7 +67,7 @@ fn text_nanos(text: &str, target: &TemporalCast) -> Result<i128> {
                     else { invalid_temporal_text(text, if zoned { "timestamp with timezone" } else { "timestamp without timezone" }) }
                 })
             }
-        TemporalKind::Time => time(text),
+        TemporalKind::Time => time_nanos(text).map(i128::from),
         TemporalKind::Duration => crate::temporal_text::duration_nanos(text),
     }
 }
@@ -91,14 +91,6 @@ fn quantize(nanos: i128, target: &TemporalCast) -> Result<i64> {
 
 pub(crate) fn invalid_temporal_text(text: &str, kind: &str) -> Anomaly { Anomaly::incorrect("xtdb.expression/invalid-temporal-string", format!("String '{text}' has invalid format for type {kind}")).with_context("s", text.into()).with_context("date-type", kind.into()) }
 
-fn time(text: &str) -> Result<i128> {
-    let (clock, fraction) = text.split_once('.').map_or((text, None), |(clock, fraction)| (clock, Some(fraction)));
-    let fields = clock.split(':').collect::<Vec<_>>();
-    if !(2..=3).contains(&fields.len()) || fields.iter().any(|field| field.len() != 2 || !field.bytes().all(|byte| byte.is_ascii_digit())) { return Err(invalid_temporal_text(text, "time without timezone")); }
-    if fraction.is_some_and(|fraction| fields.len() != 3 || fraction.len() > 9 || !fraction.bytes().all(|byte| byte.is_ascii_digit())) { return Err(invalid_temporal_text(text, "time without timezone")); }
-    let number = |index: usize| fields.get(index).map_or(Ok(0u32), |field| field.parse::<u32>().map_err(|_| invalid_temporal_text(text, "time without timezone")));
-    let (hours, minutes, seconds) = (number(0)?, number(1)?, number(2)?);
-    if hours > 23 || minutes > 59 || seconds > 59 { return Err(invalid_temporal_text(text, "time without timezone")); }
-    let fraction = fraction.filter(|fraction| !fraction.is_empty()).map_or(Ok(0i128), |fraction| fraction.parse::<i128>().map(|nanos| nanos * 10i128.pow(9 - fraction.len() as u32)).map_err(|_| invalid_temporal_text(text, "time without timezone")))?;
-    Ok(i128::from(hours * 3600 + minutes * 60 + seconds) * 1_000_000_000 + fraction)
+pub(crate) fn time_nanos(text: &str) -> Result<u64> {
+    rtdb_types::parse_iso_local_time(text).map_err(|_| invalid_temporal_text(text, "time without timezone"))
 }

@@ -50,6 +50,22 @@ fn packed_numeric_lists_cast_to_float_elements_with_the_scalar_casts_bits() {
 }
 
 #[test]
+fn packed_text_to_real_preserves_direct_rounding_and_null_elements() {
+    let source = V::list(vec![
+        V::Utf8("1.0000000596046447753906250000000000001".into()),
+        V::Null,
+        V::Utf8("0x1.00000100000000000001p0".into()),
+    ]);
+    let cast = Expr::Cast {
+        expr: Box::new(Expr::Literal(source)),
+        target: CastTarget::List(Box::new(CastTarget::Fixed(L::Scalar(S::F32)))),
+    };
+    let rounded = V::F32(f32::from_bits(0x3f80_0001));
+    assert_eq!(evaluate(&cast, &Schema::default(), &[], &EvalContext::default()).unwrap(),
+        V::list(vec![rounded.clone(), V::Null, rounded]));
+}
+
+#[test]
 fn same_width_float_cast_retains_only_a_proportionate_funded_slice() {
     use arrow_array::{RecordBatch, cast::AsArray, types::Float32Type};
     use arrow_schema::Schema as ArrowSchema;

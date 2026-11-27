@@ -79,6 +79,30 @@ fn time_to_timestamp_checks_the_query_dates_midnight_before_adding_the_time() {
 }
 
 #[test]
+fn malformed_time_text_reports_the_same_cast_error_for_fixed_and_temporal_targets() {
+    let target = temporal(TemporalKind::Time, U::Microsecond, Some(6));
+    let fixed = CastTarget::Fixed(target.result_type(&LogicalType::Scalar(ScalarType::Utf8)));
+    for target in [target, fixed] {
+        let source = V::Utf8("24:00:00".into());
+        let error = cast_target(&source, &target, "UTC").unwrap_err();
+        assert_eq!(error.code, "xtdb.expression/invalid-temporal-string");
+        assert_eq!(error.context.get("date-type"), Some(&serde_json::json!("time without timezone")));
+        assert_eq!(error.context.get("s"), Some(&serde_json::json!("24:00:00")));
+    }
+}
+
+#[test]
+fn double_to_duration_uses_clojures_long_conversion_after_scaling() {
+    let target = temporal(TemporalKind::Duration, U::Second, None);
+    for (input, expected) in [(f64::NAN, 0), (-1.25, -1), (i64::MAX as f64, i64::MAX), (i64::MIN as f64, i64::MIN)] {
+        assert_eq!(cast_target(&V::F64(input), &target, "UTC").unwrap(), V::Duration { value: expected, unit: U::Second });
+    }
+    let error = cast_target(&V::F64(f64::INFINITY), &target, "UTC").unwrap_err();
+    assert_eq!(error.code, "xtdb.expression/illegal-argument-exception");
+    assert_eq!(error.message.as_deref(), Some("Value out of range for long: Infinity"));
+}
+
+#[test]
 fn cast_interval_to_duration_precision_precedes_nanos_overflow_and_month_check() {
     let value = V::IntervalMonthDayNano { months: 0, days: 1, nanoseconds: 3_601_111_111_111 };
     assert_eq!(cast_target(&value, &temporal(TemporalKind::Duration, U::Millisecond, Some(2)), "UTC").unwrap(), V::Duration { value: 90_001_110, unit: U::Millisecond });
