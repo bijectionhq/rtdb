@@ -13,6 +13,17 @@ impl ExecutionError { pub fn name(self) -> &'static str { match self { Self::Que
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnectionEvent { Opened, Cancelled, Refused }
 
+/// The replica log records a follower times, as the reference's `FollowerLogProcessor` does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplicaRecordKind { ResolvedTx, TriesAdded, BlockBoundary, BlockUploaded, TriesDeleted }
+impl ReplicaRecordKind {
+    pub const ALL: [Self; 5] = [Self::ResolvedTx, Self::TriesAdded, Self::BlockBoundary, Self::BlockUploaded, Self::TriesDeleted];
+    /// The reference's `msg.type` tag.
+    pub fn name(self) -> &'static str {
+        match self { Self::ResolvedTx => "ResolvedTx", Self::TriesAdded => "TriesAdded", Self::BlockBoundary => "BlockBoundary", Self::BlockUploaded => "BlockUploaded", Self::TriesDeleted => "TriesDeleted" }
+    }
+}
+
 /// Callbacks complete synchronously and must not panic or retain operation payloads.
 pub trait ExecutionObserver: Send + Sync {
     fn record_duration(&self, timer: ExecutionTimer, elapsed: Duration);
@@ -30,6 +41,11 @@ pub trait ExecutionObserver: Send + Sync {
     fn record_staged_commit_lag(&self, lag: Option<Duration>) {
         if let Some(lag) = lag { self.record_duration(ExecutionTimer::StagedCommitLag, lag); }
     }
+    /// A follower applied one replica log record of `database`: the reference's `xtdb.replica.process.timer`.
+    fn record_replica_process(&self, _database: &str, _kind: ReplicaRecordKind, _elapsed: Duration) {}
+    /// A follower adopted a block of `database`, `elapsed` after its boundary, having held `records` records meanwhile:
+    /// the reference's `xtdb.replica.block.buffer.timer` and `xtdb.replica.block.buffered.records`.
+    fn record_replica_block_buffer(&self, _database: &str, _elapsed: Duration, _records: usize) {}
 }
 
 pub struct ExecutionSample { observer: Option<Arc<dyn ExecutionObserver>>, timer: ExecutionTimer, started: Instant }

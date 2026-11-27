@@ -16,12 +16,14 @@ pub struct PendingBlock {
     buffered_bytes: usize,
     max_records: usize,
     max_bytes: usize,
+    /// When the boundary opened the block, for the reference's `xtdb.replica.block.buffer.timer`.
+    opened: std::time::Instant,
 }
 impl PendingBlock {
     pub fn new(boundary: ReplicaRecord, prepared: BlockPreparation, max_records: usize, max_bytes: usize) -> Result<Self> {
         let ReplicaBody::BlockBoundary(message) = &boundary.envelope.message else { return Err(invalid("Pending block requires a boundary")); };
         if BlockIndex(message.block_index.unwrap_or_default()) != prepared.block_index() { return Err(invalid("Boundary does not match the open block")); }
-        Ok(Self { boundary, prepared, buffered: VecDeque::new(), buffered_bytes: 0, max_records, max_bytes })
+        Ok(Self { boundary, prepared, buffered: VecDeque::new(), buffered_bytes: 0, max_records, max_bytes, opened: std::time::Instant::now() })
     }
     pub fn block_index(&self) -> BlockIndex { self.prepared.block_index() }
     pub fn matches_upload(&self, message: &rtdb_format::log::proto::BlockUploaded, version: StorageVersion, epoch: StorageEpoch) -> bool {
@@ -40,6 +42,7 @@ impl PendingBlock {
         Ok(())
     }
     pub fn buffered_len(&self) -> usize { self.buffered.len() }
+    pub fn opened(&self) -> std::time::Instant { self.opened }
     pub(crate) fn into_records(self) -> VecDeque<AdmittedReplica> { self.buffered }
 }
 

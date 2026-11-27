@@ -27,14 +27,26 @@ pub use template::{DEFAULT_TEMPLATE_URI, JsonTemplate};
 
 /// RTDB targets that stand for one of upstream's main loggers: the target prefix, then the upstream logger name.
 /// Each target keeps its own `xtdb.<crate>.<module>` name too, and the more specific configured level of the two applies.
-pub const UPSTREAM_ALIASES: [(&str, &str); 7] = [
+pub const UPSTREAM_ALIASES: [(&str, &str); 18] = [
     ("rtdb_tx", "xtdb.indexer"),
     ("rtdb_index", "xtdb.indexer"),
+    // The reference's leader and follower log processors live in `xtdb.indexer`.
+    ("rtdb_replication", "xtdb.indexer"),
     ("rtdb_maintenance::gc", "xtdb.garbage-collector"),
     ("rtdb_maintenance::retention", "xtdb.garbage-collector"),
     ("rtdb_maintenance", "xtdb.compactor"),
     ("rtdb_pgwire", "xtdb.pgwire"),
     ("rtdb_flight_sql", "xtdb.flight-sql"),
+    ("rtdb_expr", "xtdb.expression"),
+    ("rtdb_columnar", "xtdb.arrow"),
+    ("rtdb_plan", "xtdb.logical-plan"),
+    ("rtdb_auth", "xtdb.authn"),
+    ("rtdb_server::health", "xtdb.healthz"),
+    ("rtdb_server::prometheus", "xtdb.metrics"),
+    ("rtdb_server::tracing", "xtdb.tracer"),
+    ("rtdb_s3", "xtdb.aws"),
+    ("rtdb_gcs", "xtdb.gcp"),
+    ("rtdb_pg_source", "xtdb.postgres"),
 ];
 
 /// The upstream logger a target also answers to: the first, so most specific, alias whose prefix matches whole components.
@@ -337,6 +349,13 @@ mod tests {
         assert!(!configured.enabled("rtdb_maintenance::merge", Level::INFO));
         assert!(configured.enabled("rtdb_maintenance::merge", Level::WARN));
         assert!(!configured.enabled("rtdb_txx", Level::DEBUG), "an alias prefix only matches whole components");
+        assert!(configured.enabled("rtdb_replication::driver", Level::DEBUG), "the log processors are the reference's indexer");
+
+        let more = config(&[("XTDB_LOGGING_LEVEL_HEALTHZ", "debug"), ("XTDB_LOGGING_LEVEL_EXPRESSION", "error"), ("XTDB_LOGGING_LEVEL_AWS", "debug")]).unwrap();
+        assert!(more.enabled("rtdb_server::health", Level::DEBUG));
+        assert!(!more.enabled("rtdb_server::cli", Level::DEBUG));
+        assert!(!more.enabled("rtdb_expr::kernels", Level::WARN));
+        assert!(more.enabled("rtdb_s3::terminal", Level::DEBUG));
 
         let own_name_wins_when_more_specific = config(&[("XTDB_LOGGING_LEVEL_INDEXER", "debug"), ("XTDB_LOGGING_LEVEL_TX_TRANSACT", "error")]).unwrap();
         assert!(!own_name_wins_when_more_specific.enabled("rtdb_tx::transact", Level::WARN));

@@ -1464,6 +1464,18 @@ impl ReplicationDriver {
         else { Err(invalid("Replica record was applied twice or without admission to the applied prefix")) }
     }
 
+    /// Times a record this node applies as a follower, however its handling ends, as the reference's `FollowerLogProcessor` does.
+    fn replica_process_timer(&self, message: &ReplicaBody) -> Option<ReplicaProcessTimer> {
+        use rtdb_plan::ReplicaRecordKind as Kind;
+        if self.leader.is_some() { return None; }
+        let kind = match message {
+            ReplicaBody::ResolvedTx(_) => Kind::ResolvedTx, ReplicaBody::TriesAdded(_) => Kind::TriesAdded, ReplicaBody::BlockBoundary(_) => Kind::BlockBoundary,
+            ReplicaBody::BlockUploaded(_) => Kind::BlockUploaded, ReplicaBody::TriesDeleted(_) => Kind::TriesDeleted, _ => return None,
+        };
+        let observer = Arc::clone(self.resolve.execution_observer.as_ref()?);
+        Some(ReplicaProcessTimer { observer, database: self.resolve.database.clone(), kind, started: std::time::Instant::now() })
+    }
+
     async fn apply_admitted(&mut self, record: AdmittedReplica) -> Result<()> {
         if matches!(&record.envelope.message, ReplicaBody::NoOp(message)
             if message.src_msg_id.is_none() && message.placed_slot_reservation.is_none() && message.serving_record.is_none())
@@ -1490,6 +1502,10 @@ impl ReplicationDriver {
                 _ => false,
             };
             if closes {
+                let _timer = self.replica_process_timer(&record.envelope.message);
+                if self.leader.is_none() && let (Some(observer), Some(pending)) = (&self.resolve.execution_observer, &self.pending_block) {
+                    observer.record_replica_block_buffer(&self.resolve.database, pending.opened().elapsed(), pending.buffered_len());
+                }
                 if let Some(production) = self.leader.as_mut().and_then(|leader| leader.production.take()) {
                     match production {
                         Production::Writing(_, future) => { future.await?; self.record_block_upload(); }
@@ -1550,6 +1566,7 @@ impl ReplicationDriver {
                 self.complete_control(&record);
                 continue;
             }
+            let _timer = self.replica_process_timer(&record.envelope.message);
             match &record.envelope.message {
                 ReplicaBody::ResolvedTx(message) => {
                     let placed = self.check_placed_terminal(record.envelope.term, message)?;
@@ -2682,4 +2699,10 @@ fn arrow_build_leader_installs_only_the_readback_delta_and_reuses_prepared_buffe
         panic!("different read-back bytes must use the replay path");
     };
     assert_eq!(other.as_ptr(), replayed.as_ptr());
+}
+
+/// Records one follower record's handling time when dropped.
+struct ReplicaProcessTimer { observer: Arc<dyn rtdb_plan::ExecutionObserver>, database: String, kind: rtdb_plan::ReplicaRecordKind, started: std::time::Instant }
+impl Drop for ReplicaProcessTimer {
+    fn drop(&mut self) { self.observer.record_replica_process(&self.database, self.kind, self.started.elapsed()); }
 }

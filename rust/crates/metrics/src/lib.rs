@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use parking_lot::Mutex;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_maintenance::CollectionObserver;
-use rtdb_plan::{CatalogMetric, CatalogMetrics, CatalogRows, ConnectionEvent, ExecutionError, ExecutionObserver, ExecutionTimer};
+use rtdb_plan::{CatalogMetric, CatalogMetrics, CatalogRows, ConnectionEvent, ExecutionError, ExecutionObserver, ExecutionTimer, ReplicaRecordKind};
 use rtdb_types::{Anomaly, Result, TableRef};
 
 const TIMERS: [ExecutionTimer; 11] = [ExecutionTimer::Query, ExecutionTimer::TxAwait, ExecutionTimer::TxSubmit, ExecutionTimer::TxExecute, ExecutionTimer::PgwireTransaction, ExecutionTimer::TxOp, ExecutionTimer::CompactorJob, ExecutionTimer::DurableCommitLag, ExecutionTimer::StagedCommitLag, ExecutionTimer::BlockUpload, ExecutionTimer::TrieDelete];
@@ -47,6 +47,17 @@ impl State {
         for sample in self.pending.drain(..) { self.timers[sample.timer].record(sample.elapsed, sample.now_ms); }
     }
 }
+/// One database's follower meters, the reference's `FollowerLogProcessor` ones, registered on its first observation.
+struct ReplicaMeters { process: [histogram::Timer; 5], buffer: histogram::Timer, buffered: histogram::CommitLag, _reservation: Arc<MemoryReservation> }
+impl ReplicaMeters {
+    const RETAINED_BYTES: usize = std::mem::size_of::<Self>() + 6 * histogram::Timer::RETAINED_BYTES + histogram::CommitLag::RETAINED_BYTES;
+    fn roll_step(&mut self, now: i64, closing: bool) {
+        for timer in self.process.iter_mut().chain(std::iter::once(&mut self.buffer)) { timer.roll_step(now, closing); }
+        self.buffered.roll_step(now, closing);
+    }
+}
+fn replica_index(kind: ReplicaRecordKind) -> usize { ReplicaRecordKind::ALL.iter().position(|candidate| *candidate == kind).unwrap_or(0) }
+
 struct Provider { value: Arc<dyn CatalogMetrics>, _reservation: Arc<MemoryReservation> }
 #[derive(Default)]
 struct Providers { next: u64, entries: BTreeMap<u64, Provider> }
@@ -59,6 +70,7 @@ pub struct Registry {
     state: Mutex<State>,
     shards: Box<[Shard]>,
     processor: Mutex<processor::CpuSampler>,
+    replica: Mutex<BTreeMap<String, ReplicaMeters>>,
     _reservation: Arc<MemoryReservation>,
     providers: Arc<Mutex<Providers>>,
     #[cfg(feature = "kafka")]
@@ -73,12 +85,25 @@ impl Registry {
         let now = wall_time_millis();
         Ok(Arc::new(Self { node_id: node_id.to_owned(), memory,
             state: Mutex::new(State { timers: TIMERS.iter().map(|_| histogram::Timer::new(now)).collect(), counters: Counters { query_errors: step::Counter::new(now), query_warnings: step::Counter::new(now), transaction_errors: step::Counter::new(now), collection_errors: step::Counter::new(now), durable_commit_clock_invalid: step::Counter::new(now), staged_commit_clock_invalid: step::Counter::new(now), kafka_warnings: [step::Counter::new(now); 5], connections: [step::Counter::new(now); 3] }, pending: Vec::with_capacity(SAMPLE_SHARDS * SHARD_SAMPLES) }),
-            shards: (0..SAMPLE_SHARDS).map(|_| Shard(Mutex::new(Vec::with_capacity(SHARD_SAMPLES)))).collect(), processor: Mutex::new(processor::CpuSampler::new()), _reservation: reservation, providers: Arc::new(Mutex::new(Providers::default())),
+            shards: (0..SAMPLE_SHARDS).map(|_| Shard(Mutex::new(Vec::with_capacity(SHARD_SAMPLES)))).collect(), processor: Mutex::new(processor::CpuSampler::new()), replica: Mutex::new(BTreeMap::new()), _reservation: reservation, providers: Arc::new(Mutex::new(Providers::default())),
             #[cfg(feature = "kafka")]
             sources: Arc::new(Mutex::new(kafka::Sources::default())),
         }))
     }
     fn tags(&self) -> BTreeMap<String, String> { BTreeMap::from([("node-id".into(), self.node_id.clone())]) }
+    /// Runs `record` on `database`'s follower meters, registering them first; a database whose meters cannot be charged goes unmeasured.
+    fn replica_meters(&self, database: &str, record: impl FnOnce(&mut ReplicaMeters, i64)) {
+        let now = wall_time_millis();
+        let mut replica = self.replica.lock();
+        if !replica.contains_key(database) {
+            let Ok(reservation) = self.memory.reserve(ReplicaMeters::RETAINED_BYTES.saturating_add(database.len())) else { return; };
+            replica.insert(database.to_owned(), ReplicaMeters {
+                process: std::array::from_fn(|_| histogram::Timer::new(now)), buffer: histogram::Timer::new(now),
+                buffered: histogram::CommitLag::new(now), _reservation: reservation,
+            });
+        }
+        if let Some(meters) = replica.get_mut(database) { record(meters, now); }
+    }
     fn counter(&self, name: &str, count: f64) -> CatalogMetric { CatalogMetric::Counter { name: name.into(), tags: self.tags(), count } }
     fn gauge(&self, name: &str, value: f64) -> CatalogMetric { CatalogMetric::Gauge { name: name.into(), tags: self.tags(), unit: Some(rtdb_plan::CatalogMetricUnit::Bytes), value } }
     /// The provider must not sample or roll this registry recursively, mutate its registrations during rollover, or retain its node through a strong ownership cycle.
@@ -125,6 +150,12 @@ impl ExecutionObserver for Registry {
             None => self.state.lock().counters.staged_commit_clock_invalid.add(1),
         }
     }
+    fn record_replica_process(&self, database: &str, kind: ReplicaRecordKind, elapsed: Duration) {
+        self.replica_meters(database, |meters, now| meters.process[replica_index(kind)].record(elapsed, now));
+    }
+    fn record_replica_block_buffer(&self, database: &str, elapsed: Duration, records: usize) {
+        self.replica_meters(database, |meters, now| { meters.buffer.record(elapsed, now); meters.buffered.record(records as f64, now); });
+    }
 }
 impl CollectionObserver for Registry {
     fn table_failed(&self, table: Option<&TableRef>, error: &Anomaly) {
@@ -153,6 +184,10 @@ impl Registry {
         let labels = { count = count.checked_add(sources.len().checked_mul(6).ok_or_else(overflow)?).ok_or_else(overflow)?; sources.label_bytes()? };
         #[cfg(not(feature = "kafka"))]
         let labels = 0usize;
+        let mut replica = self.replica.lock();
+        let replica_labels = replica.keys().try_fold(0usize, |bytes, database| bytes.checked_add(database.len().checked_mul(7)?)).ok_or_else(overflow)?;
+        count = count.checked_add(replica.len().checked_mul(7).ok_or_else(overflow)?).ok_or_else(overflow)?;
+        let labels = labels.checked_add(replica_labels).ok_or_else(overflow)?;
         let per_metric = self.node_id.len().checked_add(2048).ok_or_else(overflow)?;
         let bound = count.checked_mul(per_metric).and_then(|bytes| bytes.checked_add(labels)).and_then(|bytes| bytes.checked_add(provided_bytes)).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?;
         let reservation = self.memory.reserve(bound)?;
@@ -179,6 +214,26 @@ impl Registry {
             rows.push(CatalogMetric::Counter { name: "rtdb.kafka.warning".into(), tags, count: count.value(now, step) });
         }
         drop(state);
+        for (database, meters) in replica.iter_mut() {
+            let timer = |name: &str, tags: BTreeMap<String, String>, value: &mut histogram::Timer| {
+                let snapshot = if step { value.step_snapshot(now) } else { value.snapshot(now) };
+                CatalogMetric::Timer { name: name.into(), tags, count: snapshot.count, total_ns: snapshot.total, percentiles_ns: snapshot.percentiles,
+                    mean_ns: Some(snapshot.mean), max_ns: Some(snapshot.maximum), p75_ns: Some(snapshot.percentiles[0] as i64), p95_ns: Some(snapshot.percentiles[2] as i64),
+                    p99_ns: Some(snapshot.percentiles[4] as i64), p999_ns: Some(snapshot.percentiles[5] as i64) }
+            };
+            let mut tags = self.tags();
+            tags.insert("db".into(), database.clone());
+            for (kind, value) in ReplicaRecordKind::ALL.into_iter().zip(&mut meters.process) {
+                let mut tags = tags.clone();
+                tags.insert("msg.type".into(), kind.name().into());
+                rows.push(timer("xtdb.replica.process.timer", tags, value));
+            }
+            rows.push(timer("xtdb.replica.block.buffer.timer", tags.clone(), &mut meters.buffer));
+            let summary = if step { meters.buffered.step_snapshot(now) } else { meters.buffered.snapshot(now) };
+            rows.push(CatalogMetric::DistributionSummary { name: "xtdb.replica.block.buffered.records".into(), tags, unit: None,
+                count: summary.count, total: summary.total, maximum: summary.maximum, percentiles: summary.percentiles });
+        }
+        drop(replica);
         rows.push(self.gauge("xtdb.allocator.root.memory.allocated", allocated as f64));
         rows.push(self.gauge("xtdb.allocator.root.memory.limit", self.memory.limit_bytes() as f64));
         let processors = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
@@ -213,6 +268,7 @@ impl CatalogMetrics for Registry {
     }
     fn roll_step(&self, now_ms: i64, closing: bool) {
         { let mut state = self.state.lock(); state.absorb(&self.shards); for timer in &mut state.timers { timer.roll_step(now_ms, closing); } state.counters.roll(now_ms, closing); }
+        for meters in self.replica.lock().values_mut() { meters.roll_step(now_ms, closing); }
         #[cfg(feature = "kafka")]
         self.sources.lock().roll_step(now_ms, closing);
         for provider in self.providers.lock().entries.values() { provider.value.roll_step(now_ms, closing); }
@@ -272,6 +328,23 @@ mod tests {
         registry.record_query_warning();
         registry.record_query_warning();
         assert_eq!(warnings(&registry), Some(2.0));
+    }
+    #[test]
+    fn follower_records_are_timed_per_database_and_message_type_under_the_reference_names() {
+        let memory = MemoryBudget::new(1 << 24);
+        let registry = Registry::new("node-1", Arc::clone(&memory)).unwrap();
+        assert!(!registry.metrics().unwrap().rows().iter().any(|row| row.name().starts_with("xtdb.replica.")), "a database is listed from its first record, as the reference registers on its follower's start");
+        registry.record_replica_process("xtdb", ReplicaRecordKind::TriesAdded, Duration::from_micros(5));
+        registry.record_replica_block_buffer("xtdb", Duration::from_millis(3), 12);
+        let rows = registry.metrics().unwrap();
+        let tagged = |row: &CatalogMetric, kind: Option<&str>| row.tags().get("db").map(String::as_str) == Some("xtdb") && row.tags().get("msg.type").map(String::as_str) == kind;
+        assert!(rows.rows().iter().any(|row| matches!(row, CatalogMetric::Timer { name, count: 1, .. } if name == "xtdb.replica.process.timer") && tagged(row, Some("TriesAdded"))));
+        assert!(rows.rows().iter().any(|row| matches!(row, CatalogMetric::Timer { name, count: 0, .. } if name == "xtdb.replica.process.timer") && tagged(row, Some("ResolvedTx"))));
+        assert!(rows.rows().iter().any(|row| matches!(row, CatalogMetric::Timer { name, count: 1, .. } if name == "xtdb.replica.block.buffer.timer") && tagged(row, None)));
+        assert!(rows.rows().iter().any(|row| matches!(row, CatalogMetric::DistributionSummary { name, count: 1, total, .. } if name == "xtdb.replica.block.buffered.records" && *total == 12.0)));
+        drop(rows);
+        drop(registry);
+        assert_eq!(memory.used_bytes(), 0);
     }
     #[test]
     fn the_processor_count_is_a_gauge() {
