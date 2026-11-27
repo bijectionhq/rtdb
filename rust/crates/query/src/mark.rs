@@ -287,8 +287,9 @@ fn mark_keys(schema: &Schema, comparison: &Expr, probe_width: usize) -> Option<(
             LogicalType::Null => true,
             LogicalType::Scalar(ScalarType::Timestamp { .. }) => !child,
             LogicalType::List { kind: ListKind::List | ListKind::FixedSizeList(_), element } => !child && admitted(element, true),
+            LogicalType::Scalar(ScalarType::Utf8 | ScalarType::Binary) => true,
             LogicalType::Scalar(ScalarType::Bool | ScalarType::I8 | ScalarType::I16 | ScalarType::I32
-                | ScalarType::I64 | ScalarType::F32 | ScalarType::F64 | ScalarType::Utf8 | ScalarType::Binary) => child,
+                | ScalarType::I64 | ScalarType::F32 | ScalarType::F64) => child,
             _ => false,
         }
     }
@@ -545,6 +546,67 @@ mod facts_tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn mark_compares_funded_text_and_binary_cells_below_the_decode_budget() {
+        use arrow_array::{ArrayRef, BinaryArray, StringArray};
+        use rtdb_plan::{BinaryOp, ColumnId, Expr, Field, Schema};
+        use rtdb_types::ScalarType;
+        use crate::{columnar::BatchRow, context::{Execution, OuterRows}, parameters::BoundParameters};
+
+        let context = hash_context();
+        let execution = Execution {
+            parameters: Arc::new(BoundParameters::infer(vec![], &context.memory).unwrap()),
+            outer: OuterRows::empty(&context.memory).unwrap(),
+            context: Arc::clone(&context), bindings: None, analysis: None,
+        };
+        let field = |id, scalar| Field { id: ColumnId(id), name: format!("k{id}"), qualifier: None,
+            qualified_only: false, unnamed: false, data_type: LogicalType::Scalar(scalar).maybe() };
+        let left = field(0, ScalarType::Utf8);
+        let right = field(1, ScalarType::Binary);
+        let comparison = Expr::binary(BinaryOp::Eq, right.expression(), left.expression());
+        let schema = Schema::new(vec![left.clone(), right.clone()]).unwrap();
+        let keys = super::mark_keys(&schema, &comparison, 1);
+        assert_eq!(keys, Some((0, 0)));
+
+        let source = MemoryBudget::new(1 << 20);
+        let batch = |field: &Field, array: ArrayRef| {
+            let len = array.len();
+            let arrow = Arc::new(rtdb_columnar::to_field(&field.name, &field.data_type).unwrap());
+            ColumnBatch::settled(vec![Column::Arrow { array, field: arrow, logical: Some(field.data_type.clone()) }],
+                len, source.reserve(1 << 18).unwrap()).unwrap()
+        };
+        let spelling = "été".repeat(16_384);
+        let probe = batch(&left, Arc::new(StringArray::from(vec![spelling.as_str()])));
+        let unequal = batch(&right, Arc::new(BinaryArray::from(vec![b"other".as_slice()])));
+        let unknown = batch(&right, Arc::new(BinaryArray::from(vec![None::<&[u8]>])));
+        let matched = batch(&right, Arc::new(BinaryArray::from(vec![Some(spelling.as_bytes())])));
+        assert!(probe.columns[0].bound(0).unwrap() > context.memory.limit_bytes());
+        assert!(matched.columns[0].bound(0).unwrap() > context.memory.limit_bytes());
+        let probe = BatchRow { batch: &probe, row: 0, admit_dates: true };
+        let metadata = execution.scope().unwrap();
+        let invocation = execution.prepare_expression(&comparison, &schema, &metadata).unwrap();
+        for short_circuit in [true, false] {
+            let mut mark = Some(false);
+            super::compare_page(&probe, &unequal, &invocation, &mut mark, short_circuit, keys, &execution).await.unwrap();
+            assert_eq!(mark, Some(false));
+            super::compare_page(&probe, &unknown, &invocation, &mut mark, short_circuit, keys, &execution).await.unwrap();
+            assert_eq!(mark, None);
+            super::compare_page(&probe, &matched, &invocation, &mut mark, short_circuit, keys, &execution).await.unwrap();
+            assert_eq!(mark, Some(true));
+        }
+
+        let small = batch(&left, Arc::new(StringArray::from(vec!["match"])));
+        let probe = BatchRow { batch: &small, row: 0, admit_dates: true };
+        let missing = ColumnBatch::settled(vec![Column::Values(vec![Value::Binary(b"match".to_vec())])],
+            2, source.reserve(4096).unwrap()).unwrap();
+        let mut mark = Some(false);
+        super::compare_page(&probe, &missing, &invocation, &mut mark, true, keys, &execution).await.unwrap();
+        assert_eq!(mark, Some(true));
+        let mut mark = Some(false);
+        let error = super::compare_page(&probe, &missing, &invocation, &mut mark, false, keys, &execution).await.unwrap_err();
+        assert_eq!(error.code, "rtdb.query/column-row");
     }
 
     #[test]

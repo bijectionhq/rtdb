@@ -2566,6 +2566,8 @@ surface QueryAccess {
         -- Membership shuffle, indexing and probing hash compatible timestamp keys directly from their Arrow positions.
         -- The membership probe can use the same reached value for its null check and lookup.
         -- A generic mark comparing two compatible plain list columns evaluates their child keys at the reached positions.
+        -- A correlated mark can compare compatible text and binary keys at their reached positions with SQL null propagation.
+        -- A shared mark over a supported union with a list leg can also compare reached text and binary keys by position.
         -- An Arrow join can evaluate a residual predicate from borrowed cells on either side while gathering the result payloads from the input batches.
         -- A single residual testing whether a period contains a zoned microsecond timestamp can compare the stored endpoints and timestamp directly.
         -- This comparison includes the lower endpoint and excludes the upper endpoint, and null operands do not match.
