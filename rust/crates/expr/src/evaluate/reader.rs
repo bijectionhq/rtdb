@@ -70,10 +70,20 @@ impl<'a> EvaluationFrame<'a> {
         }
     }
 
-    fn arrow_backing(&self, mut expr: &Expr) -> Option<&'a Arc<MemoryReservation>> {
+    fn arrow_backing(&self, mut expr: &Expr, cell: ArrowCell<'_>) -> Option<&'a Arc<MemoryReservation>> {
+        use arrow_schema::DataType;
+
+        if !matches!(cell.field.data_type(),
+            DataType::List(_) | DataType::FixedSizeList(..) | DataType::Union(..) | DataType::RunEndEncoded(..))
+        {
+            return None;
+        }
         while let Expr::Field { expr: parent, .. } = expr { expr = parent; }
-        let Expr::Parameter { index, .. } = expr else { return None; };
-        self.context.parameters.arrow_backing(*index)
+        match expr {
+            Expr::Parameter { index, .. } => self.context.parameters.arrow_backing(*index),
+            Expr::Column { id, .. } => self.row.arrow_backing(self.schema.position(*id)?),
+            _ => None,
+        }
     }
 
     fn prepared_list(&self, expr: &Expr) -> Option<&'a PreparedList> {
@@ -329,15 +339,15 @@ async fn execute(expr: &Expr,schema: &Schema,row: ExpressionRow<'_>,context: &Ev
 
 pub(super) async fn execute_with_arrow_list<T>(
     expr: &Expr, schema: &Schema, row: ExpressionRow<'_>, context: &EvalContext<'_>, replacements: &super::invocation::Replacements<'_>,
-    retain: impl FnOnce(ArrowCell<'_>) -> Result<Option<T>>,
+    retain: impl FnOnce(ArrowCell<'_>, Option<&Arc<MemoryReservation>>) -> Result<Option<T>>,
 ) -> Result<std::ops::ControlFlow<T, Value>> {
     use std::ops::ControlFlow;
 
     let frame = EvaluationFrame { schema, row, context, asynchronous: true, replacements: Some(replacements) };
     let value = evaluate(expr, &frame)?.await?;
     if let EvalValue::List(Kind::List | Kind::Fixed, reader) = &value
-        && let ListReader::Arrow { cell, .. } = reader.as_ref()
-        && let Some(output) = retain(*cell)?
+        && let ListReader::Arrow { cell, backing } = reader.as_ref()
+        && let Some(output) = retain(*cell, *backing)?
     {
         return Ok(ControlFlow::Break(output));
     }
@@ -395,14 +405,23 @@ pub(super) fn list_events<'a>(expr: &'a Expr, schema: &'a Schema, row: &'a [Valu
 pub(super) async fn execute_list_async(expr: &Expr, schema: &Schema, row: ExpressionRow<'_>, context: &EvalContext<'_>,replacements: Option<&super::invocation::Replacements<'_>>) -> Result<super::EvaluatedList> {
     let frame = EvaluationFrame { schema, row, context, asynchronous: true,replacements };
     let continuation = scalar::prepare(expr, &frame)?.await?;
-    if !continuation.is_list() { return Ok(super::EvaluatedList { storage: super::ListStorage::Values(Vec::new()) }); }
+    if !continuation.is_list() {
+        return Ok(super::EvaluatedList { storage: super::ListStorage::Values(Vec::new()), backing: None });
+    }
     let value = continuation.demand().await?;
     if let EvalValue::List(_, reader) = &value {
         if let ListReader::IntegerSeries(series) = reader.as_ref() {
-            return Ok(super::EvaluatedList { storage: super::ListStorage::Integer(*series) });
+            return Ok(super::EvaluatedList { storage: super::ListStorage::Integer(*series), backing: None });
         }
         if let ListReader::RangeBins(bins) = reader.as_ref() {
-            return Ok(super::EvaluatedList { storage: super::ListStorage::Bins { reader: *bins,length: bins.len()? } });
+            return Ok(super::EvaluatedList { storage: super::ListStorage::Bins { reader: *bins,length: bins.len()? }, backing: None });
+        }
+        if let ListReader::Arrow { cell, backing: Some(backing) } = reader.as_ref()
+            && matches!(&value, EvalValue::List(Kind::List | Kind::Fixed, _))
+            && let Some((field, array, range)) = cell.sequence_range()
+            && let Some(PackedList { values, backing }) = lend_list_child(field, array, range, backing, context)?
+        {
+            return Ok(super::EvaluatedList { storage: super::ListStorage::List(values), backing });
         }
     }
     let mut value = materialize(value, &frame)?.await?;
@@ -413,7 +432,7 @@ pub(super) async fn execute_list_async(expr: &Expr, schema: &Schema, row: Expres
         Value::List(values) | Value::FixedSizeList(values) => super::ListStorage::List(values),
         _ => super::ListStorage::Values(Vec::new()),
     };
-    Ok(super::EvaluatedList { storage })
+    Ok(super::EvaluatedList { storage, backing: None })
 }
 
 pub(super) async fn append_list_items(
@@ -551,6 +570,33 @@ fn borrowed_vector<'a>(value: &'a EvalValue<'a>) -> Option<crate::vector::Vector
     }
 }
 
+fn lend_list_child(
+    field: &arrow_schema::Field, array: &dyn arrow_array::Array, rows: std::ops::Range<usize>,
+    backing: &Arc<MemoryReservation>, context: &EvalContext<'_>,
+) -> Result<Option<PackedList>> {
+    if rows.is_empty() || !rtdb_columnar::lendable_list_child(field) {
+        return Ok(None);
+    }
+    let bytes = field.size().checked_mul(4).and_then(|bytes| bytes.checked_add(512)).ok_or_else(overflow)?;
+    context.reserve(bytes)?;
+    let slice = array.slice(rows.start, rows.len());
+    let visible = slice.to_data().get_slice_memory_size().unwrap_or(0);
+    if backing.bytes().max(slice.get_buffer_memory_size()) > visible.saturating_mul(2).saturating_add(4096) {
+        return Ok(None);
+    }
+    let numeric = ListValue::supports_numeric_arrow(field);
+    let nulls = slice.logical_null_count();
+    if !numeric && nulls == slice.len() { return Ok(None); }
+    let slice = rtdb_columnar::retain_array(slice, backing)?;
+    let field = Arc::new(field.clone().with_nullable(nulls != 0));
+    let values = if numeric {
+        ListValue::from_numeric_arrow(field, slice)
+    } else {
+        ListValue::from_scalar_arrow(field, slice)
+    };
+    Ok(values.map(|values| PackedList { values, backing: Some(Arc::clone(backing)) }))
+}
+
 fn packed_slice(value: &EvalValue<'_>, offset: usize, count: usize, projection: bool, context: &EvalContext<'_>) -> Result<Option<PackedList>> {
     let EvalValue::List(Kind::List | Kind::Fixed, reader) = value else { return Ok(None); };
     let end = offset.checked_add(count).ok_or_else(overflow)?;
@@ -575,10 +621,15 @@ fn packed_slice(value: &EvalValue<'_>, offset: usize, count: usize, projection: 
             context.reserve(slice.retained_payload_bytes()?)?;
             Ok(Some(slice.into()))
         }
-        ListReader::Arrow { cell, .. } => {
+        ListReader::Arrow { cell, backing } => {
             let Some((field, array, range)) = cell.sequence_range() else { return Ok(None); };
             if end > range.len() { return Ok(None); }
             let rows = (range.start + offset)..(range.start + end);
+            if projection && let Some(backing) = backing
+                && let Some(list) = lend_list_child(field, array, rows.clone(), backing, context)?
+            {
+                return Ok(Some(list));
+            }
             let reserve = || {
                 let bound = rows.clone().try_fold(4096usize, |bytes, row| {
                     rtdb_columnar::estimate_copy_cell_bytes(field, array, row)?.checked_mul(4)
@@ -691,8 +742,14 @@ fn materialize<'a>(value: EvalValue<'a>,frame: &'a EvaluationFrame<'a>) -> Resul
                 }
                 if let EvalValue::List(Kind::List, reader) = &value
                     && let ListReader::Cast { input, element, union_admitted } = reader.as_ref()
-                    && let Some(PackedList { values, .. }) = packed::cast(input, *element, *union_admitted, 0..len(input)?, false, frame.context)?
+                    && let Some(PackedList { mut values, backing }) = packed::cast(input, *element, *union_admitted, 0..len(input)?, false, frame.context)?
                 {
+                    if let Some(backing) = backing {
+                        let (field, array) = values.packed_column().expect("Shared cast has an Arrow layout");
+                        frame.context.reserve(1024usize.checked_add(field.size()).ok_or_else(overflow)?)?;
+                        let array = rtdb_columnar::retain_array(array, &backing)?;
+                        values = ListValue::from_numeric_arrow(field, array).expect("Shared floating cast is numeric");
+                    }
                     return Ok(Value::List(values));
                 }
                 let size = len(&value)?;
@@ -795,7 +852,7 @@ fn cast_value<'a>(value: EvalValue<'a>,target: Target<'a>,frame: &'a EvaluationF
 fn evaluate<'a>(expr: &'a Expr,frame: &'a EvaluationFrame<'a>) -> Result<Pending<'a,EvalValue<'a>>> {
     boxed(async move {
         if let Some(cell) = frame.arrow_input(expr) {
-            let value = from_arrow(cell, frame.arrow_backing(expr), frame)?;
+            let value = from_arrow(cell, frame.arrow_backing(expr, cell), frame)?;
             return if matches!(expr, Expr::Field { .. }) { box_cell(value) } else { Ok(value) };
         }
         if !required_with(expr, frame.replacements) { return evaluate_scalar(expr, frame).await; }

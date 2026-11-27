@@ -8,6 +8,28 @@ use rtdb_types::{Anomaly, AnomalyKind, ListBuilder, LogicalType, Result, ScalarT
 use super::{BatchRow, Column, ColumnBatch, owned_projection_bytes, size_error, stable_read_layout};
 use crate::context::Execution;
 
+pub(crate) fn column_constructor(
+    expr: &Expr, schema: &Schema, batch: &ColumnBatch, execution: &Execution,
+) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
+    let Expr::List(items) = expr else { return Ok(None); };
+    if !items.iter().all(|item| {
+        let Expr::Column { id, .. } = item else { return false; };
+        let Some(position) = schema.position(*id) else { return false; };
+        matches!(&batch.columns[position], Column::Arrow { field, .. } if rtdb_columnar::lendable_list_child(field))
+    }) {
+        return Ok(None);
+    }
+    let Some(bound) = super::projection::bound(expr, schema, batch)? else { return Ok(None); };
+    let Some(mut owner) = execution.context.memory.try_reserve(bound) else { return Ok(None); };
+    execution.context.check_cancelled()?;
+    let Some(column) = super::projection::column(expr, schema, batch, execution.parameters.evaluator())? else { return Ok(None); };
+    execution.context.check_cancelled()?;
+    let bytes = owned_projection_bytes(&column)?;
+    let lease = Arc::get_mut(&mut owner).expect("The list constructor owns its reservation");
+    if bytes <= lease.bytes() { lease.shrink_to(bytes)?; } else { lease.grow_to(bytes)?; }
+    Ok(Some((column, owner)))
+}
+
 fn primitive_numeric(ty: &LogicalType) -> bool {
     match ty {
         LogicalType::Null => true,
@@ -28,6 +50,10 @@ pub(super) fn readable_numeric_union(field: &Field) -> bool {
             primitive_numeric(ty) && rtdb_columnar::leg_name(ty).is_ok_and(|name| name == *leg.name())
         })
     })
+}
+
+pub(crate) fn captured_list_child(field: &Field) -> bool {
+    rtdb_columnar::lendable_list_child(field) || readable_numeric_union(field)
 }
 
 fn numeric_item(expr: &Expr, schema: &Schema, batch: &ColumnBatch) -> bool {

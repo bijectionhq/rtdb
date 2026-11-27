@@ -58,6 +58,36 @@ impl ArrowBinding {
         Some(Self { batch, column, row, memory, scalar: LazyValue::default() })
     }
 
+    pub(crate) fn from_list_cell(
+        cell: rtdb_columnar::ArrowCell<'_>, backing: &Arc<MemoryReservation>,
+        declared: &LogicalType, memory: &Arc<MemoryBudget>,
+    ) -> Result<Option<Self>> {
+        use arrow_schema::DataType;
+        use crate::columnar::{Column, ColumnBatch};
+
+        let (DataType::List(child) | DataType::FixedSizeList(child, _)) = cell.field.data_type() else {
+            return Ok(None);
+        };
+        if !cell.field.metadata().is_empty() || !crate::columnar::lists::captured_list_child(child) {
+            return Ok(None);
+        }
+        let bytes = cell.field.size().checked_mul(8).and_then(|bytes| bytes.checked_add(2048)).ok_or_else(size_error)?;
+        let reservation = match memory.reserve_with_backing(bytes, std::iter::once(Arc::clone(backing))) {
+            Ok(reservation) => reservation,
+            Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let Ok(logical) = rtdb_columnar::from_field(cell.field) else { return Ok(None); };
+        if declared.join(&logical) != *declared { return Ok(None); }
+        let column = Column::Arrow {
+            array: cell.array.slice(cell.row, 1),
+            field: Arc::new(cell.field.clone()),
+            logical: Some(logical),
+        };
+        let batch = Arc::new(ColumnBatch::sharing(vec![column], 1, reservation));
+        Ok(Some(Self { batch, column: 0, row: 0, memory: Arc::clone(memory), scalar: LazyValue::default() }))
+    }
+
     fn cell(&self) -> Option<rtdb_expr::ArrowParameterCell<'_>> {
         let rtdb_columnar::ArrowCell { field, array, row } = self.batch.columns[self.column].expression_cell(self.row)?;
         Some(rtdb_expr::ArrowParameterCell { field, array, row })
@@ -168,7 +198,11 @@ impl rtdb_expr::ParameterLookup for BoundParameters {
     }
 
     fn arrow_backing(&self, index: usize) -> Option<&Arc<MemoryReservation>> {
-        self.arrow_input(index)?.0.buffer_backing()
+        if let Some(cell) = self.captured_arrow_cell(index) {
+            Some(cell.owner)
+        } else {
+            self.arrow_input(index)?.0.buffer_backing()
+        }
     }
 }
 

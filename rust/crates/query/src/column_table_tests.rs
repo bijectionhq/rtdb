@@ -131,6 +131,141 @@ async fn captured_arrow_list_lends_one_semantic_page_and_retains_the_source_char
     assert_eq!(source_memory.used_bytes(), 0);
 }
 
+#[tokio::test]
+async fn computed_capture_lends_the_reached_float_list_with_its_source_charge() {
+    use arrow_array::{Float32Array, RecordBatch, cast::AsArray};
+    use arrow_schema::Schema as ArrowSchema;
+    use rtdb_columnar::{OwnedBatch, build_array, to_field};
+    use crate::{columnar::{Column, ColumnBatch}, context::ApplyArguments};
+
+    let execution = execution(1, vec![]);
+    let source_memory = MemoryBudget::new(1 << 20);
+    let element = LogicalType::Scalar(ScalarType::F32).maybe();
+    let ty = LogicalType::list(element.clone());
+    let field = Field {
+        id: ColumnId(1), name: "items".into(), data_type: ty.clone(),
+        qualifier: None, qualified_only: false, unnamed: false,
+    };
+    let items = vec![Value::F32(-0.0), Value::Null, Value::F32(f32::from_bits(0x7fc0_1234))];
+    let array = build_array(&ty, &[Value::list(items)]).unwrap();
+    let child = array.as_list::<i32>().values().as_any().downcast_ref::<Float32Array>().unwrap();
+    let address = child.values().as_ptr();
+    let schema = Arc::new(ArrowSchema::new(vec![to_field("items", &ty).unwrap()]));
+    let record = RecordBatch::try_new(schema, vec![array]).unwrap();
+    let source = Arc::new(ColumnBatch::from_owned(OwnedBatch::new(record, &source_memory).unwrap()).unwrap());
+    let expression = Expr::Case {
+        branches: vec![(Expr::Literal(Value::Bool(true)), field.expression())],
+        otherwise: Box::new(Expr::Cast {
+            expr: Box::new(Expr::Literal(Value::Utf8("invalid array".into()))),
+            target: rtdb_plan::CastTarget::fixed(ty),
+        }),
+    };
+    let schema = Schema::new(vec![field]).unwrap();
+    let schema = RuntimeSchema::fixed(&schema, &execution.context.memory).unwrap();
+    let arguments = ApplyArguments::new(schema, vec![(0, expression)]);
+    let bound = arguments.bind(&execution, source, 0).await.unwrap();
+    let mut cursor = crate::column_table::open_arrow(&bound, 0).unwrap().unwrap();
+    drop(bound);
+    let page = cursor.next_batch().await.unwrap().unwrap();
+    assert!(cursor.next_batch().await.unwrap().is_none());
+    drop(cursor);
+
+    let [Column::Arrow { array, logical: Some(logical), .. }] = page.columns.as_slice() else {
+        panic!("Expected the reached Arrow child and its logical type");
+    };
+    assert_eq!(logical, &element);
+    let child = array.as_any().downcast_ref::<Float32Array>().unwrap();
+    assert_eq!(child.values().as_ptr(), address);
+    assert_eq!(child.iter().map(|value| value.map(f32::to_bits)).collect::<Vec<_>>(), [
+        Some((-0.0_f32).to_bits()), None, Some(0x7fc0_1234),
+    ]);
+    assert!(source_memory.used_bytes() > 0);
+    drop(page);
+    assert_eq!(source_memory.used_bytes(), 0);
+}
+
+#[tokio::test]
+async fn computed_column_table_lends_an_arrow_parameter_through_the_list_reader() {
+    use arrow_array::{RecordBatch, cast::AsArray};
+    use arrow_schema::Schema as ArrowSchema;
+    use rtdb_columnar::{OwnedBatch, build_array, to_field};
+    use crate::columnar::Column;
+
+    let mut execution = execution(1, vec![]);
+    let source_memory = MemoryBudget::new(1 << 20);
+    let element = LogicalType::Scalar(ScalarType::Binary).maybe();
+    let ty = LogicalType::list(element.clone());
+    let items = vec![Value::Binary(vec![1, 2]), Value::Null, Value::Binary(vec![3])];
+    let array = build_array(&ty, &[Value::list(items.clone())]).unwrap();
+    let address = array.as_list::<i32>().values().as_binary::<i32>().value(0).as_ptr();
+    let schema = Arc::new(ArrowSchema::new(vec![to_field("items", &ty).unwrap()]));
+    let record = RecordBatch::try_new(schema, vec![array]).unwrap();
+    let reservation = source_memory.reserve(record.get_array_memory_size()).unwrap();
+    let arguments = OwnedBatch::with_reservation(record, reservation).unwrap();
+    execution.parameters = Arc::new(BoundParameters::from_arrow(arguments, 0, vec![ty.clone()], &execution.context.memory).unwrap());
+    let expr = Expr::Case {
+        branches: vec![(Expr::Literal(Value::Bool(true)), Expr::Parameter { index: 0, data_type: ty })],
+        otherwise: Box::new(Expr::Literal(Value::Null)),
+    };
+    let mut cursor = crate::column_table::open_columns(&execution, expr).await.unwrap();
+    drop(execution);
+    let page = cursor.next_batch().await.unwrap().unwrap();
+    assert!(cursor.next_batch().await.unwrap().is_none());
+    drop(cursor);
+
+    let [Column::Arrow { array, logical: Some(logical), .. }] = page.columns.as_slice() else {
+        panic!("Expected a typed binary child");
+    };
+    assert_eq!(page.len, items.len());
+    assert_eq!(logical, &element);
+    assert_eq!(array.as_binary::<i32>().value(0).as_ptr(), address);
+    assert_eq!((0..page.len).map(|row| page.columns[0].value(row).unwrap()).collect::<Vec<_>>(), items);
+    assert!(source_memory.used_bytes() > 0);
+    drop(page);
+    assert_eq!(source_memory.used_bytes(), 0);
+}
+
+#[tokio::test]
+async fn captured_fixed_list_keeps_its_numeric_union_tags_and_real_null() {
+    use arrow_array::{RecordBatch, cast::AsArray};
+    use arrow_schema::Schema as ArrowSchema;
+    use rtdb_columnar::{OwnedBatch, build_array, to_field};
+    use rtdb_types::ListKind;
+    use crate::{columnar::{Column, ColumnBatch}, context::ApplyArguments};
+
+    let execution = execution(1, vec![]);
+    let memory = &execution.context.memory;
+    let element = LogicalType::from_legs([
+        LogicalType::Scalar(ScalarType::I64), LogicalType::Scalar(ScalarType::F32), LogicalType::Null,
+    ]);
+    let ty = LogicalType::List { kind: ListKind::FixedSizeList(3), element: Box::new(element.clone()) }.maybe();
+    let field = Field {
+        id: ColumnId(1), name: "items".into(), data_type: ty.clone(),
+        qualifier: None, qualified_only: false, unnamed: false,
+    };
+    let items = vec![Value::F32(-0.0), Value::Null, Value::I64(19)];
+    let array = build_array(&ty, &[Value::Null, Value::FixedSizeList(items.clone().into())]).unwrap();
+    let list = array.as_fixed_size_list();
+    let tags = list.values().as_union().type_ids()[3..6].to_vec();
+    let schema = Arc::new(ArrowSchema::new(vec![to_field("items", &ty).unwrap()]));
+    let record = RecordBatch::try_new(schema, vec![array]).unwrap();
+    let source = Arc::new(ColumnBatch::from_owned(OwnedBatch::new(record, memory).unwrap()).unwrap());
+    let schema = Schema::new(vec![field.clone()]).unwrap();
+    let schema = RuntimeSchema::fixed(&schema, memory).unwrap();
+    let arguments = ApplyArguments::new(schema, vec![(0, field.expression())]);
+    let bound = arguments.bind(&execution, source, 1).await.unwrap();
+
+    let mut cursor = crate::column_table::open_arrow(&bound, 0).unwrap().unwrap();
+    let page = cursor.next_batch().await.unwrap().unwrap();
+    let [Column::Arrow { array, logical: Some(logical), .. }] = page.columns.as_slice() else {
+        panic!("Expected a typed union child");
+    };
+    assert_eq!(logical, &element);
+    assert_eq!(array.as_union().type_ids().as_ref(), tags.as_slice());
+    assert_eq!((0..page.len).map(|row| page.columns[0].value(row).unwrap()).collect::<Vec<_>>(), items);
+    assert!(matches!(page.columns[0].value(0).unwrap(), Value::F32(value) if value.to_bits() == (-0.0_f32).to_bits()));
+}
+
 #[derive(Deserialize)]
 struct Fixture {
     cases: Vec<Assertion>,
@@ -319,6 +454,10 @@ async fn column_tables_publish_one_complete_page_including_empty_and_undemanded_
             let (mut cursor, types) = open(column_table("v", expr), &execution).await.unwrap();
             let page = cursor.next_batch().await.unwrap().unwrap();
             assert_eq!(page.len, expected_len);
+            if expected_len != 0 {
+                assert!(matches!(&page.columns[0], crate::columnar::Column::Arrow { logical: Some(ty), .. }
+                    if *ty == LogicalType::Scalar(ScalarType::I64)));
+            }
             assert!(cursor.next_batch().await.unwrap().is_none());
             drop(cursor);
             drop(types);
@@ -435,7 +574,8 @@ async fn computed_column_table_moves_one_span_and_assembles_multiple_float_spans
         let mut cursor = crate::column_table::open_columns(&execution, expression).await.unwrap();
         let page = cursor.next_batch().await.unwrap().unwrap();
         assert_eq!(page.len, count);
-        let Column::Arrow { array, .. } = &page.columns[0] else { panic!("expected a single float vector"); };
+        let Column::Arrow { array, logical: Some(logical), .. } = &page.columns[0] else { panic!("expected a typed float vector"); };
+        assert_eq!(*logical, LogicalType::Scalar(ScalarType::F32).maybe());
         let array = array.as_any().downcast_ref::<Float32Array>().unwrap();
         assert_eq!(array.iter().map(|value| value.map(f32::to_bits)).collect::<Vec<_>>(), expected);
         if count == 3 {

@@ -172,6 +172,7 @@
 -- A computed column table demands every input batch during opening before it can publish the page, including when the result is empty.
 -- Numeric list expression pages retain typed child arrays and validity through the list cursor.
 -- A packed list page carries its backing reservation into the query batch, whose slices retain the charge for the buffers they keep alive.
+-- A packed child page with an admitted execution layout carries the logical type of its physical field.
 -- Owned numeric list reads copy the selected child range into buffers charged to the result and preserve the bits of present components and their validity.
 -- Dense-union list copies retain their leg identifiers and compact the child offsets in selection order.
 -- Fixed-width list read bounds account for the selected length and any null-sensitive payload charge.
@@ -194,6 +195,7 @@
 -- The row-evaluated score projection builds a typed Arrow result with the scalar projection's observed nullability.
 -- The integer series cursor writes the generated page directly into a signed 64-bit Arrow vector.
 -- Computed UNNEST repeats the original Arrow parent positions per list and retains compatible evaluated child spans.
+-- An admitted list constructor can interleave compatible source columns in parent and element order.
 -- Its ordinal vector marks the synthetic outer row of an empty list as null.
 -- Query analysis measures a batch-capable operator using its emitted Arrow batches.
 -- A batch join can gather matching payload positions from selected Arrow vectors.
@@ -222,6 +224,7 @@
 -- A single equijoin fails when more than one build row matches a probe row.
 -- A columnar cross join retains its Arrow inputs and maps output positions in left-major order within each batch pair.
 -- Correlated Apply retains independent Arrow payload positions and binds direct column arguments as Arrow cells.
+-- A computed argument can capture a compatible list selected by its expression under the backing charge of the reached cell.
 -- Apply and correlated Mark share one admitted parameter type layout across reached rows of an execution with the same input and parent schemas.
 -- The first reached row admits each argument type in evaluation order.
 -- Each outer row frame retains its source position, the emitted schema owner, and its parent frame in nesting order.
@@ -229,6 +232,7 @@
 -- Joined Apply retains dependent pages in order and uses the same outer position across each page.
 -- Joined and document Apply can reuse completed dependent pages for an admitted lookup within the current outer page.
 -- Apply documents retain compatible dependent fields and arrays in field-name order.
+-- The collected list of documents retains the backing charges of its dependent pages while its child buffers are reachable.
 -- A document Apply with no dependent rows returns null.
 -- A dependent row with zero fields contributes a present empty document.
 -- Relation ordinality and unpartitioned ROW_NUMBER with supported ordering append a signed 64-bit ordinal vector to Arrow batch inputs.

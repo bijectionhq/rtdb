@@ -24,6 +24,7 @@ use rtdb_types::{LogicalType, Result};
 use std::sync::Arc;
 
 pub(crate) fn open_arrow(execution: &Execution, position: usize) -> Result<Option<BoxBatchCursor>> {
+    let Some(parameter_type) = execution.parameters.types().get(position) else { return Ok(None); };
     let cell = if let Some((input, row)) = execution.parameters.arrow_input(position) {
         FundedArrowCell {
             field: &input.batch().schema_ref().fields()[position],
@@ -34,17 +35,20 @@ pub(crate) fn open_arrow(execution: &Execution, position: usize) -> Result<Optio
         }
     } else if let Some(cell) = execution.parameters.captured_arrow_cell(position) {
         let (DataType::List(child) | DataType::FixedSizeList(child, _)) = cell.field.data_type() else { return Ok(None); };
-        // The list expression path also validates computed elements and normalizes dates.
-        if !cell.field.metadata().is_empty() || !child.metadata().is_empty() || !matches!(child.data_type(),
-            DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::Utf8)
+        if !cell.field.metadata().is_empty() || !crate::columnar::lists::captured_list_child(child)
         {
             return Ok(None);
         }
-        cell
+        let Ok(actual) = rtdb_columnar::from_field(cell.field) else { return Ok(None); };
+        if cell.logical.is_some_and(|logical| *logical != actual) || parameter_type.join(&actual) != *parameter_type {
+            return Ok(None);
+        }
+        let output = ColumnBatch::from_list_parameter(cell, &actual, &execution.context.memory)?;
+        return Ok(output.map(|output| single_batch(Some(output), Arc::clone(&execution.context))));
     } else {
         return Ok(None);
     };
-    let output = ColumnBatch::from_list_parameter(cell, &execution.parameters.types()[position], &execution.context.memory)?;
+    let output = ColumnBatch::from_list_parameter(cell, parameter_type, &execution.context.memory)?;
     Ok(output.map(|output| single_batch(Some(output), Arc::clone(&execution.context))))
 }
 

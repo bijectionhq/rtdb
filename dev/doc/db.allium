@@ -2571,9 +2571,10 @@ surface QueryAccess {
         -- A parent with a null list, an empty list, or zero surviving candidates yields one row with null dependent columns.
         -- Batched expansion preserves the reached input validation and retains selected child spans under their source owners.
         -- The dependent Apply evaluates fallible predicates and bindings and handles input layouts outside the batch admission.
-        -- A column table over a compatible captured Arrow list of plain signed integers, Booleans or UTF-8 can lend its elements as one dependent page under the source owner.
+        -- A column table can lend the children of a compatible captured Arrow list as one dependent page under the source owner.
+        -- A compatible child has an equivalent plain scalar layout or a dense union with matching numeric leg names.
         -- Apply builds its document from funded child arrays when their physical fields are admitted.
-        -- A document whose fields all match their declared scalar layouts can retain the child arrays when a field's logical type is absent from the page.
+        -- A document whose fields all match their declared admitted scalar or list layouts can retain the child arrays when a field's logical type is absent from the page.
         -- A joined or document Apply can replay a completed dependent result within its current outer page when the captured scan key or lexical reference is the same.
         -- At the page's reuse limit, a newly completed key takes the place of the least recently used key.
         -- Reuse binds each reached outer row and preserves dependent row order, duplicates, null extension and cardinality checks.
@@ -2585,6 +2586,7 @@ surface QueryAccess {
         -- UNNEST over compatible Arrow lists retains each selected child span under its source owner and repeats the corresponding parent position for its elements.
         -- A computed numeric list constructor evaluates items in row and expression order and can publish one Arrow list column per input page.
         -- UNNEST of that constructor uses its shared child array and preserves element nulls, active numeric types, and per-list ordinality.
+        -- UNNEST can interleave compatible direct scalar column items and can borrow a compatible child span from the list selected by a computed expression.
         -- A RANGE_BINS projection over a compatible period column with a constant stride and default origin can write one Arrow list column of bin endpoints and weights per input page.
         -- A null period or an unbounded upper endpoint produces a null list.
         -- A period projection can write compatible zoned microsecond endpoints directly to Arrow.

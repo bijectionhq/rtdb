@@ -30,7 +30,7 @@ pub trait ParameterLookup: Sync {
     fn value(&self, index: usize) -> Result<Option<&Value>>;
     fn known_value(&self, index: usize) -> Option<&Value>;
     fn arrow_cell(&self, index: usize) -> Option<ArrowParameterCell<'_>>;
-    /// The full backing charge, when the corresponding Arrow cell carries it in its buffers.
+    /// The backing charge of the corresponding Arrow cell, when available.
     fn arrow_backing(&self, _index: usize) -> Option<&Arc<rtdb_types::MemoryReservation>> { None }
     fn correlated_value(&self, _depth: usize, _position: usize, _scope: Option<&crate::EvaluationScope>) -> Result<Option<Value>> {
         Ok(None)
@@ -210,10 +210,15 @@ enum ListStorage { Integer(crate::series::IntegerSeries), Bins { reader: crate::
 
 /// Owned list cells or an immutable generated-list descriptor.
 /// Retain the evaluation scope until the result is dropped or its `retained_bytes` charge is transferred.
-pub struct EvaluatedList { storage: ListStorage }
+pub struct EvaluatedList {
+    storage: ListStorage,
+    backing: Option<Arc<rtdb_types::MemoryReservation>>,
+}
 impl EvaluatedList {
     pub fn len(&self) -> usize { match &self.storage { ListStorage::Integer(series) => series.len(), ListStorage::Bins { length,.. } => *length, ListStorage::List(list) => list.len(), ListStorage::Values(values) => values.len() } }
     pub fn is_empty(&self) -> bool { self.len() == 0 }
+    /// The source grant for shared Arrow buffers.
+    pub fn backing(&self) -> Option<&Arc<rtdb_types::MemoryReservation>> { self.backing.as_ref() }
     /// Borrows scalar cells if present, and returns an empty slice for an empty packed list.
     pub fn scalar_values(&self) -> Option<&[Value]> {
         match &self.storage {
@@ -350,6 +355,8 @@ fn binary_value(op: BinaryOp, left: Value, right: Value, context: &EvalContext<'
 pub trait RowInput: Sync {
     fn value(&self, index: usize, allocation: Option<&crate::EvaluationScope>) -> Result<Option<Value>>;
     fn arrow_cell(&self, _index: usize) -> Option<ArrowParameterCell<'_>> { None }
+    /// The backing charge of the corresponding Arrow cell, when available.
+    fn arrow_backing(&self, _index: usize) -> Option<&Arc<rtdb_types::MemoryReservation>> { None }
 }
 
 #[derive(Clone, Copy)]
@@ -363,6 +370,13 @@ impl<'a> ExpressionRow<'a> {
         match self {
             Self::Values(_) => None,
             Self::Borrowed(row) => row.arrow_cell(index),
+        }
+    }
+
+    fn arrow_backing(self, index: usize) -> Option<&'a Arc<rtdb_types::MemoryReservation>> {
+        match self {
+            Self::Values(_) => None,
+            Self::Borrowed(row) => row.arrow_backing(index),
         }
     }
 

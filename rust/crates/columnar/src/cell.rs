@@ -9,6 +9,21 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, UnionMode};
 use rtdb_types::{Anomaly, ListKind, LogicalType, Result, StructFields};
 
+/// Whether a plain list child can be lent to an expression without changing its read semantics.
+pub fn lendable_list_child(field: &Field) -> bool {
+    field.metadata().is_empty() && match field.data_type() {
+        DataType::Null => field.is_nullable(),
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+        | DataType::Float16 | DataType::Float32 | DataType::Float64 => true,
+        _ => matches!(rtdb_types::ScalarList::supported_type(field), Some(
+            rtdb_types::ScalarType::Bool | rtdb_types::ScalarType::Utf8
+            | rtdb_types::ScalarType::Binary | rtdb_types::ScalarType::FixedSizeBinary(_)
+            | rtdb_types::ScalarType::Time { .. } | rtdb_types::ScalarType::Timestamp { .. }
+            | rtdb_types::ScalarType::Duration(_)
+        )),
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct ArrowCell<'a> {
     pub field: &'a Field,
@@ -391,13 +406,9 @@ impl<'a> ArrowCell<'a> {
                 }
                 DataType::FixedSizeList(element, width) => {
                     let list = array.as_fixed_size_list();
-                    let from = list.value_offset(row) as usize;
-                    (
-                        element,
-                        list.values().as_ref(),
-                        from,
-                        from.checked_add(usize::try_from(*width).ok()?)?,
-                    )
+                    let width = usize::try_from(*width).ok()?;
+                    let from = row.checked_mul(width)?;
+                    (element, list.values().as_ref(), from, from.checked_add(width)?)
                 }
                 DataType::Map(element, _) => {
                     let map = array.as_map();

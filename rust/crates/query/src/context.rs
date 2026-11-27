@@ -729,6 +729,11 @@ impl rtdb_expr::RowInput for OuterInput {
     fn arrow_cell(&self, index: usize) -> Option<rtdb_columnar::ArrowCell<'_>> {
         self.batch.columns.get(index)?.expression_cell(self.row)
     }
+
+    fn arrow_backing(&self, index: usize) -> Option<&Arc<MemoryReservation>> {
+        let column = self.batch.columns.get(index)?;
+        Some(column.funded_arrow_cell(self.row, self.batch.column_reservation(index))??.owner)
+    }
 }
 
 struct OuterFrame {
@@ -847,8 +852,8 @@ impl ApplyArguments {
                 continue;
             }
             let invocation = execution.prepare_expression(expression, schema, &scope)?;
-            let value = execution.evaluate_invocation_row(&scope, &invocation, rtdb_expr::ExpressionRow::Borrowed(&outer_input)).await?;
-            parameters.push((*index, OverlayValue::Scalar(value)));
+            let value = execution.evaluate_apply_argument(&scope, &invocation, &outer_input).await?;
+            parameters.push((*index, value));
         }
         let outer = execution.outer.prepend(&self.schema, outer_input, memory)?;
         let prepared = draft.map(|(types, scope)| ParameterTypes::from_scope(types, scope)).transpose()?;
@@ -916,6 +921,30 @@ impl Execution {
         let context = rtdb_expr::EvalContext { parameters: rtdb_expr::Parameters::Lookup(&inputs), parameter_types: Some(self.parameters.types()), current_time: self.context.current_time, timezone: &self.context.timezone, outer_rows: &outer_rows, snapshot_token: self.context.snapshot_token(), allocation: Some(scope), catalog: Some(&self.context.catalog) };
         self.context.owner_cancellation.run_until_cancelled(self.context.cancellation.run_until_cancelled(
             invocation.evaluate_projection_row_async(row,&context))).await.flatten().ok_or_else(cancelled)?
+    }
+    async fn evaluate_apply_argument(
+        &self, scope: &rtdb_expr::EvaluationScope, invocation: &rtdb_expr::ExpressionInvocation<'_>, row: &OuterInput,
+    ) -> Result<OverlayValue> {
+        use std::ops::ControlFlow;
+
+        self.context.check_cancelled()?;
+        scope.reserve(4096)?;
+        scope.reserve(self.outer.len.checked_mul(std::mem::size_of::<rtdb_expr::OuterRow<'_>>()).ok_or_else(outer_bindings_size)?)?;
+        let outer_rows = self.outer.expression_rows();
+        let inputs = ExpressionInputs { parameters: &self.parameters, outer: &self.outer };
+        let context = rtdb_expr::EvalContext { parameters: rtdb_expr::Parameters::Lookup(&inputs), parameter_types: Some(self.parameters.types()), current_time: self.context.current_time, timezone: &self.context.timezone, outer_rows: &outer_rows, snapshot_token: self.context.snapshot_token(), allocation: Some(scope), catalog: Some(&self.context.catalog) };
+        let value = invocation.evaluate_projection_row_with_arrow_list(rtdb_expr::ExpressionRow::Borrowed(row), &context, |cell, backing| {
+            match backing {
+                Some(backing) => ArrowBinding::from_list_cell(cell, backing, invocation.data_type(), &self.context.memory),
+                None => Ok(None),
+            }
+        });
+        match self.context.owner_cancellation.run_until_cancelled(self.context.cancellation.run_until_cancelled(value))
+            .await.flatten().ok_or_else(cancelled)??
+        {
+            ControlFlow::Break(binding) => Ok(OverlayValue::Arrow(binding)),
+            ControlFlow::Continue(value) => Ok(OverlayValue::Scalar(value)),
+        }
     }
     pub async fn open_list(&self, expression: rtdb_plan::Expr, page_rows: Option<std::num::NonZeroUsize>) -> Result<crate::list::ListCursor> {
         let execution = self.clone();

@@ -40,6 +40,97 @@ fn table(rows: &[i64]) -> Arc<Relation> {
 }
 
 #[tokio::test]
+async fn computed_unnest_lends_reached_text_and_marks_only_outer_rows_without_ordinality() {
+    use arrow_array::{Array, ListArray, StringArray};
+    use arrow_buffer::{NullBuffer, OffsetBuffer};
+    use arrow_schema::{DataType, Field as ArrowField};
+    use crate::columnar::{Column, single_batch};
+
+    let execution = execution(1);
+    let memory = &execution.context.memory;
+    let baseline = memory.used_bytes();
+    let source_memory = MemoryBudget::new(1 << 20);
+    let values = StringArray::from(vec![Some("alpha"), None, Some("unreached")]);
+    let address = values.value(0).as_ptr();
+    let child = Arc::new(ArrowField::new("item", DataType::Utf8, true));
+    let lists = ListArray::new(child, OffsetBuffer::new(vec![0_i32, 2, 2, 3].into()),
+        Arc::new(values), Some(NullBuffer::from(vec![true, true, false])));
+    let physical = Arc::new(ArrowField::new("items", lists.data_type().clone(), true));
+    let data_type = rtdb_columnar::from_field(&physical).unwrap();
+    let items = Field {
+        id: ColumnId(0), name: "items".into(), qualifier: None, qualified_only: false, unnamed: false,
+        data_type: data_type.clone(),
+    };
+    let schema = Schema::new(vec![items.clone()]).unwrap();
+    let input = ColumnBatch::settled(vec![Column::Arrow { array: Arc::new(lists), field: physical, logical: Some(data_type) }],
+        3, source_memory.reserve(4096).unwrap()).unwrap();
+    let expr = Expr::Case {
+        branches: vec![(Expr::Literal(Value::Bool(true)), items.expression())],
+        otherwise: Box::new(Expr::Literal(Value::Null)),
+    };
+    let mut cursor = BatchUnnest {
+        input: single_batch(Some(input), Arc::clone(&execution.context)), position: None, expr, schema, projected: false,
+        ordinality: Some("n".into()), outer: true, execution: execution.clone(),
+    };
+    let result = cursor.next_batch().await.unwrap().unwrap();
+    assert!(cursor.next_batch().await.unwrap().is_none());
+    drop(cursor);
+
+    let Column::Selected(elements) = &result.columns[1] else { panic!("Expected selected child spans"); };
+    let ((array, _, logical), range) = elements.fragment_source(0..2).unwrap();
+    assert_eq!(range, 0..2);
+    assert_eq!(logical, Some(LogicalType::Scalar(ScalarType::Utf8).maybe()));
+    let string = array.as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(string.value(0).as_ptr(), address);
+    let output = (0..result.len).map(|row| [result.columns[1].value(row).unwrap(), result.columns[2].value(row).unwrap()])
+        .collect::<Vec<_>>();
+    assert_eq!(output, [
+        [Value::Utf8("alpha".into()), Value::I32(1)],
+        [Value::Null, Value::I32(2)],
+        [Value::Null, Value::Null],
+        [Value::Null, Value::Null],
+    ]);
+    assert!(source_memory.used_bytes() > 0);
+    drop((array, result));
+    assert_eq!(source_memory.used_bytes(), 0);
+    assert_eq!(memory.used_bytes(), baseline);
+}
+
+#[tokio::test]
+async fn computed_unnest_interleaves_compatible_text_columns_into_one_child_vector() {
+    use arrow_array::StringArray;
+    use arrow_schema::{DataType, Field as ArrowField};
+    use crate::columnar::{Column, single_batch};
+
+    let execution = execution(1);
+    let memory = &execution.context.memory;
+    let ty = LogicalType::Scalar(ScalarType::Utf8).maybe();
+    let fields = [output_field(0, ty.clone()), output_field(1, ty.clone())];
+    let schema = Schema::new(fields.to_vec()).unwrap();
+    let columns = [vec![Some("a"), Some("c")], vec![None, Some("d")]].into_iter().zip(&fields).map(|(values, field)| {
+        Column::Arrow {
+            array: Arc::new(StringArray::from(values)),
+            field: Arc::new(ArrowField::new(&field.name, DataType::Utf8, true)),
+            logical: Some(ty.clone()),
+        }
+    }).collect();
+    let batch = ColumnBatch::settled(columns, 2, memory.reserve(4096).unwrap()).unwrap();
+    let expr = Expr::List(fields.iter().map(Field::expression).collect());
+    let mut cursor = BatchUnnest {
+        input: single_batch(Some(batch), Arc::clone(&execution.context)), position: None, expr, schema, projected: false,
+        ordinality: Some("n".into()), outer: false, execution: execution.clone(),
+    };
+    let result = cursor.next_batch().await.unwrap().unwrap();
+    let Column::Selected(elements) = &result.columns[2] else { panic!("Expected selected child spans"); };
+    let ((array, _, logical), rows) = elements.fragment_source(0..result.len).unwrap();
+    assert_eq!((logical, rows), (Some(ty), 0..4));
+    let values = array.as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(values.iter().collect::<Vec<_>>(), [Some("a"), None, Some("c"), Some("d")]);
+    let ordinals = (0..result.len).map(|row| result.columns[3].value(row).unwrap()).collect::<Vec<_>>();
+    assert_eq!(ordinals, [Value::I32(1), Value::I32(2), Value::I32(1), Value::I32(2)]);
+}
+
+#[tokio::test]
 async fn top_slices_source_pages_and_does_not_pull_after_its_limit() {
     for batch_rows in [1,128] {
         let execution = execution(batch_rows);

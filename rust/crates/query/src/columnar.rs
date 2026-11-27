@@ -1482,34 +1482,42 @@ impl ColumnBatch {
             if bound > lease.bytes() { lease.grow_to(bound)?; }
             Arc::new(Arc::unwrap_or_clone(field).with_name("value"))
         };
-        let retained = occupied(&field)?;
+        let metadata_bound = occupied(&field)?.checked_add(field.size().checked_mul(8).ok_or_else(size_error)?)
+            .ok_or_else(size_error)?;
+        let logical = if metadata_bound <= lease.bytes() || lease.grow_to(metadata_bound).is_ok() {
+            rtdb_columnar::from_field(&field).ok().filter(|ty| {
+                *ty != LogicalType::Nothing && rtdb_columnar::execution_type(ty) == *ty
+            })
+        } else {
+            None
+        };
+        let retained = occupied(&field)?
+            .checked_add(logical.as_ref().map_or(Ok(0), LogicalType::retained_bytes)?).ok_or_else(size_error)?;
         if retained > lease.bytes() { lease.grow_to(retained)?; } else { lease.shrink_to(retained)?; }
         let reservation = match backing {
             Some(backing) => reservation.budget().reserve_with_backing(0, [Arc::clone(&reservation), backing].into_iter())?,
             None => reservation,
         };
         let len = array.len();
-        Ok(Self::sharing(vec![Column::Arrow { array, field, logical: None }], len, reservation))
+        Ok(Self::sharing(vec![Column::Arrow { array, field, logical }], len, reservation))
     }
 
     pub(crate) fn from_list_parameter(
         cell: FundedArrowCell<'_>,
         parameter_type: &LogicalType, memory: &Arc<MemoryBudget>,
     ) -> Result<Option<Self>> {
-        use arrow_array::cast::AsArray;
         let FundedArrowCell { array, field, owner, row, .. } = cell;
         let mut reservation = memory.reserve(field.size().checked_mul(8).and_then(|bytes| bytes.checked_add(512)).ok_or_else(size_error)?)?;
-        if !stable_read_layout(parameter_type, field) || !readable_list_type(parameter_type, field, false) {
+        if !stable_read_layout(parameter_type, field) || !readable_list_type(parameter_type, field, true) {
             return Ok(None);
         }
         if array.is_null(row) || *parameter_type == LogicalType::Null {
             return Self::settled(vec![Column::Values(Vec::new())], 0, memory.reserve(256)?).map(Some);
         }
-        let (child, array) = match field.data_type() {
-            DataType::List(child) => (child, array.as_list::<i32>().value(row)),
-            DataType::FixedSizeList(child, _) => (child, array.as_fixed_size_list().value(row)),
-            _ => return Ok(None),
-        };
+        let (DataType::List(child) | DataType::FixedSizeList(child, _)) = field.data_type() else { return Ok(None); };
+        let cell = rtdb_columnar::ArrowCell { field, array: array.as_ref(), row };
+        let Some((_, values, rows)) = cell.sequence_range() else { return Ok(None); };
+        let array = values.slice(rows.start, rows.len());
         let len = array.len();
         if len == 0 {
             return Self::settled(vec![Column::Values(Vec::new())], 0, reservation).map(Some);
@@ -4375,6 +4383,11 @@ impl Column {
 impl rtdb_expr::RowInput for BatchRow<'_> {
     fn arrow_cell(&self, index: usize) -> Option<rtdb_columnar::ArrowCell<'_>> {
         self.batch.columns.get(index)?.expression_cell(self.row)
+    }
+
+    fn arrow_backing(&self, index: usize) -> Option<&Arc<MemoryReservation>> {
+        let column = self.batch.columns.get(index)?;
+        Some(column.funded_arrow_cell(self.row, self.batch.column_reservation(index))??.owner)
     }
 
     fn value(&self, index: usize, allocation: Option<&rtdb_expr::EvaluationScope>) -> Result<Option<Value>> {

@@ -54,6 +54,23 @@ fn leaf_sequences_derive_the_element_types_their_elements_observe_in_first_seen_
 }
 
 #[test]
+fn fixed_size_sequence_keeps_child_offsets_above_i32_max() {
+    let width = 1_i32 << 30;
+    let values = Arc::new(arrow_array::StructArray::new_empty_fields(3 * width as usize, None));
+    let child = Arc::new(Field::new("item", values.data_type().clone(), false));
+    let array = FixedSizeListArray::new(child, width, values, None);
+    let field = Field::new("items", array.data_type().clone(), false);
+    let cell = ArrowCell { field: &field, array: &array, row: 2 };
+
+    let (_, _, rows) = cell.sequence_range().unwrap();
+    assert_eq!(rows, 2 * width as usize..3 * width as usize);
+    let sliced = array.slice(2, 1);
+    let cell = ArrowCell { field: &field, array: &sliced, row: 0 };
+    let (_, _, rows) = cell.sequence_range().unwrap();
+    assert_eq!(rows, 0..width as usize);
+}
+
+#[test]
 fn float_union_sequences_derive_their_element_types_per_selected_leg() {
     let fields = UnionFields::try_new(
         vec![0, 1, 2],

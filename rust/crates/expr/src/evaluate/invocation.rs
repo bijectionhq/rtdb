@@ -141,7 +141,7 @@ impl<'expr> ExpressionInvocation<'expr> {
         if !self.requires_reader {
             return self.evaluate_row_async(row, context).await.map(ControlFlow::Continue);
         }
-        match reader::execute_with_arrow_list(self.expression, self.schema, row, context, &self.replacements, retain).await? {
+        match reader::execute_with_arrow_list(self.expression, self.schema, row, context, &self.replacements, |cell, _| retain(cell)).await? {
             ControlFlow::Break(output) => Ok(ControlFlow::Break(output)),
             ControlFlow::Continue(mut value) => {
                 value.admit_expression_dates()?;
@@ -173,6 +173,27 @@ impl<'expr> ExpressionInvocation<'expr> {
         let value = self.evaluate_row_async(row, context).await?;
         self.validate(&value)?;
         Ok(value)
+    }
+
+    /// Offers a reached Arrow list and its backing to a caller that can preserve projection semantics.
+    /// A declined list uses the ordinary materialization and validation of that same evaluation.
+    pub async fn evaluate_projection_row_with_arrow_list<T>(
+        &self, row: ExpressionRow<'_>, context: &EvalContext<'_>,
+        retain: impl FnOnce(super::ArrowParameterCell<'_>, Option<&Arc<rtdb_types::MemoryReservation>>) -> Result<Option<T>> + Send,
+    ) -> Result<std::ops::ControlFlow<T, Value>> {
+        use std::ops::ControlFlow;
+
+        if !self.requires_reader {
+            return self.evaluate_projection_row_async(row, context).await.map(ControlFlow::Continue);
+        }
+        match reader::execute_with_arrow_list(self.expression, self.schema, row, context, &self.replacements, retain).await? {
+            ControlFlow::Break(output) => Ok(ControlFlow::Break(output)),
+            ControlFlow::Continue(mut value) => {
+                value.admit_expression_dates()?;
+                self.validate(&value)?;
+                Ok(ControlFlow::Continue(value))
+            }
+        }
     }
 
     /// Retains generated list descriptors under the same scope contract as `evaluate_list_async`.

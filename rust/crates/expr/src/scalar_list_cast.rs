@@ -119,6 +119,9 @@ pub(crate) fn cast_list(
 fn boolean(
     cells: &Cells<'_>, target: &CastTarget, mut reserve: impl FnMut(usize) -> Result<()>,
 ) -> Result<Option<ListValue>> {
+    if matches!(cells, Cells::Values(values) if values.iter().any(|value| matches!(value, Value::Undefined))) {
+        return Ok(None);
+    }
     if !cells.all(|cell| match cell {
         Cell::Null | Cell::Bool(_) | Cell::Text(_) => true,
         Cell::Number(number) => !matches!(number, NumericCell::Decimal(..)),
@@ -573,6 +576,9 @@ mod tests {
 
         let nulls = [Value::Null, Value::Null];
         let source = Source::Stored(ListView::Values(&nulls));
+        assert!(cast_list(source, &checked, "UTC", None, true, |_| Ok(())).unwrap().is_none());
+        let bottom = [Value::Bool(true), Value::Undefined];
+        let source = Source::Stored(ListView::Values(&bottom));
         assert!(cast_list(source, &checked, "UTC", None, true, |_| Ok(())).unwrap().is_none());
     }
 

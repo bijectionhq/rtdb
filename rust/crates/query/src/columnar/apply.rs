@@ -352,13 +352,13 @@ impl ColumnBatch {
     ) -> Result<Self> {
         let base = crate::runtime_schema::schema_bound(schema)?;
         let mut reservation = memory.reserve(base)?;
-        let (fields, arrays) = match self.apply_document_fields(positions, schema, &mut reservation, memory)? {
-            Some((fields, arrays)) => (fields.into(), arrays),
+        let (fields, arrays, fallback) = match self.apply_document_fields(positions, schema, &mut reservation, memory)? {
+            Some((fields, arrays)) => (fields.into(), arrays, None),
             None => {
                 Arc::get_mut(&mut reservation).expect("Apply owns its document reservation").shrink_to(base)?;
                 let projection = self.key_projection(positions, memory)?;
                 let output = crate::cursor::column_batch(schema, memory, projection)?;
-                (output.batch().schema_ref().fields().clone(), output.batch().columns().to_vec())
+                (output.batch().schema_ref().fields().clone(), output.batch().columns().to_vec(), Some(Arc::clone(output.reservation())))
             }
         };
         let record = StructArray::try_new_with_length(fields, arrays, None, self.len)
@@ -366,6 +366,9 @@ impl ColumnBatch {
         let field = Arc::new(ArrowField::new("doc", record.data_type().clone(), false));
         let logical = rtdb_columnar::from_field(&field)?;
         admit(&mut reservation, field.size().checked_add(logical.retained_bytes()?).ok_or_else(size_error)?)?;
+        if let Some(fallback) = fallback {
+            reservation = memory.reserve_with_backing(0, [reservation, fallback].into_iter())?;
+        }
         Ok(Self::sharing(
             vec![Column::Arrow { array: Arc::new(record), field, logical: Some(logical) }],
             self.len,
@@ -382,7 +385,7 @@ impl ColumnBatch {
     ) -> Result<Option<(Vec<ArrowField>, Vec<ArrayRef>)>> {
         let mut fields = Vec::with_capacity(positions.len());
         let mut arrays = Vec::with_capacity(positions.len());
-        let mut all_declared_scalars = None;
+        let mut all_declared_layouts = None;
         for (&position, output) in positions.iter().zip(schema.fields()) {
             let owner = self.column_reservation(position);
             let (array, field, logical, custody) = match &self.columns[position] {
@@ -414,13 +417,14 @@ impl ColumnBatch {
             };
             let compatible = match logical.as_ref() {
                 Some(ty) => *ty != LogicalType::Nothing && stable_read_layout(ty, &field),
-                // A missing logical type used to send every child through declared conformance.
-                None => *all_declared_scalars.get_or_insert_with(|| positions.iter().zip(schema.fields()).all(|(&position, output)| {
+                None => *all_declared_layouts.get_or_insert_with(|| positions.iter().zip(schema.fields()).all(|(&position, output)| {
                     matches!(&self.columns[position], Column::Arrow { array, field, logical }
                         if field.metadata().is_empty() && array.data_type() == field.data_type() && array.len() == self.len
                             && (field.is_nullable() || array.null_count() == 0)
                             && logical.as_ref().is_none_or(|ty| *ty == output.data_type)
-                            && plain_scalar(&output.data_type).is_some_and(copyable)
+                            && (plain_scalar(&output.data_type).is_some_and(copyable)
+                                || matches!(field.data_type(), DataType::List(child) | DataType::FixedSizeList(child, _)
+                                    if super::lists::captured_list_child(child)))
                             && stable_read_layout(&output.data_type, field)
                             && rtdb_columnar::to_field(field.name(), &output.data_type).is_ok_and(|declared| declared == **field))
                 })),
@@ -453,7 +457,7 @@ impl ColumnBatch {
         let DataType::List(item) = physical.data_type() else {
             return Err(invalid("column-list", "Expected a list result field"));
         };
-        let (item, child) = pages.list_child(item, memory)?;
+        let (item, child) = pages.list_child(item, &mut reservation, memory)?;
         admit(&mut reservation, item.size().checked_mul(4).ok_or_else(size_error)?)?;
         let offsets = ScalarBuffer::from(offsets);
         let offsets =
@@ -481,7 +485,7 @@ impl ColumnBatch {
 }
 
 impl ApplyPages {
-    fn list_child(&self, item: &Arc<ArrowField>, memory: &Arc<MemoryBudget>) -> Result<(Arc<ArrowField>, ArrayRef)> {
+    fn list_child(&self, item: &Arc<ArrowField>, reservation: &mut Arc<MemoryReservation>, memory: &Arc<MemoryBudget>) -> Result<(Arc<ArrowField>, ArrayRef)> {
         if self.pages.is_empty() {
             return Ok((Arc::clone(item), arrow_array::new_empty_array(item.data_type())));
         }
@@ -494,7 +498,10 @@ impl ApplyPages {
             && let Column::Arrow { array, field, .. } = &page.columns[0]
             && stable(&page.columns[0])
         {
-            return Ok((Arc::new(field.as_ref().clone().with_name(item.name())), Arc::clone(array)));
+            let descriptors = array.get_array_memory_size().saturating_sub(array.get_buffer_memory_size());
+            admit(reservation, descriptors.checked_mul(4).ok_or_else(size_error)?)?;
+            let array = retain_array(Arc::clone(array), page.column_reservation(0))?;
+            return Ok((Arc::new(field.as_ref().clone().with_name(item.name())), array));
         }
 
         let (column, _inventory) = self.column(0, memory)?;
@@ -520,8 +527,67 @@ impl ApplyPages {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::Int64Array;
+    use arrow_array::{Int64Array, cast::AsArray};
     use rtdb_types::{ScalarType, Value};
+
+    #[test]
+    fn apply_document_shares_a_declared_list_without_cached_logical_metadata() {
+        let memory = MemoryBudget::new(1 << 20);
+        let source_memory = MemoryBudget::new(1 << 20);
+        let logical = LogicalType::list(LogicalType::Scalar(ScalarType::Utf8).maybe()).maybe();
+        let field = Arc::new(rtdb_columnar::to_field("values", &logical).unwrap());
+        let values = [Value::Null, Value::list(vec![Value::Utf8("text".into()), Value::Null])];
+        let array = rtdb_columnar::build_array(&logical, &values).unwrap();
+        let address = array.as_list::<i32>().values().as_string::<i32>().value(0).as_ptr();
+        let source = ColumnBatch::settled(vec![Column::Arrow { array, field, logical: None }],
+            2, source_memory.reserve(4096).unwrap()).unwrap();
+        let schema = Schema::new(vec![Field {
+            id: rtdb_plan::ColumnId(0), name: "values".into(), data_type: logical,
+            qualifier: None, qualified_only: false, unnamed: false,
+        }]).unwrap();
+        let document = source.apply_document(&[0], &schema, &memory).unwrap();
+        drop(source);
+        let [Column::Arrow { array, .. }] = document.columns.as_slice() else { panic!("Expected a document array"); };
+        let lists = array.as_struct().column(0).as_list::<i32>();
+        assert!(lists.is_null(0));
+        let child = lists.value(1);
+        assert_eq!(child.as_string::<i32>().iter().collect::<Vec<_>>(), [Some("text"), None]);
+        assert_eq!(child.as_string::<i32>().value(0).as_ptr(), address);
+        assert!(source_memory.used_bytes() > 0);
+        drop((child, document));
+        assert_eq!(source_memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn a_single_apply_document_span_funds_the_collected_list_child() {
+        let memory = MemoryBudget::new(1 << 20);
+        let source_memory = MemoryBudget::new(1 << 20);
+        let field = ArrowField::new("n", DataType::Int64, false);
+        let numbers = Int64Array::from(vec![17, 19]);
+        let address = numbers.values().as_ptr();
+        let array = Arc::new(StructArray::new(vec![field].into(), vec![Arc::new(numbers)], None));
+        let field = Arc::new(ArrowField::new("doc", array.data_type().clone(), false));
+        let logical = rtdb_columnar::from_field(&field).unwrap();
+        let page = ColumnBatch::settled(vec![Column::Arrow { array, field, logical: Some(logical.clone()) }],
+            2, source_memory.reserve(4096).unwrap()).unwrap();
+        let mut pages = ApplyPages::new(&memory).unwrap();
+        pages.push(0, Some(page)).unwrap();
+        let output = Field {
+            id: rtdb_plan::ColumnId(0), name: "docs".into(), data_type: LogicalType::list(logical).maybe(),
+            qualifier: None, qualified_only: false, unnamed: false,
+        };
+        let mut result = ColumnBatch::settled(Vec::new(), 1, memory.reserve(256).unwrap()).unwrap();
+        result.append_apply_lists(&pages, vec![0, 2], vec![true], &output, memory.reserve(512).unwrap(), &memory).unwrap();
+        drop(pages);
+        let [Column::Arrow { array, .. }] = result.columns.as_slice() else { panic!("Expected a document list"); };
+        let list = array.as_list::<i32>();
+        let child = list.values().as_struct().column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(child.values().as_ptr(), address);
+        assert_eq!(child.values().as_ref(), [17, 19]);
+        assert!(source_memory.used_bytes() > 0);
+        drop(result);
+        assert_eq!(source_memory.used_bytes(), 0);
+    }
 
     #[test]
     fn apply_document_conforms_a_scalar_without_cached_logical_metadata_by_sharing() {

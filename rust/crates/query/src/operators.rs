@@ -1146,11 +1146,17 @@ impl crate::columnar::BatchCursor for BatchUnnest {
             let ordinality = self.ordinality.as_deref();
             let output = if let Some(position) = self.position {
                 batch.expand_list(position, ordinality, self.outer, &context)?
-            } else if let Some((column, owner)) = crate::columnar::lists::numeric_constructor(&self.expr, &self.schema, &batch, &self.execution).await? {
-                let expanded = batch.expand_list_column((&column, &owner), ordinality, self.outer, &context)?;
-                Some(expanded.ok_or_else(|| rtdb_types::Anomaly::fault("rtdb.query/list-result", "An Arrow list constructor produced an unreadable list"))?)
             } else {
-                None
+                let constructed = match crate::columnar::lists::numeric_constructor(&self.expr, &self.schema, &batch, &self.execution).await? {
+                    Some(column) => Some(column),
+                    None => crate::columnar::lists::column_constructor(&self.expr, &self.schema, &batch, &self.execution)?,
+                };
+                if let Some((column, owner)) = constructed {
+                    let expanded = batch.expand_list_column((&column, &owner), ordinality, self.outer, &context)?;
+                    Some(expanded.ok_or_else(|| rtdb_types::Anomaly::fault("rtdb.query/list-result", "An Arrow list constructor produced an unreadable list"))?)
+                } else {
+                    None
+                }
             };
             if let Some(output) = output {
                 if output.len != 0 { return Ok(Some(output)); }
@@ -1167,7 +1173,7 @@ impl crate::columnar::BatchCursor for BatchUnnest {
 
 impl BatchUnnest {
     async fn expand_expression(&mut self, batch: &crate::columnar::ColumnBatch) -> Result<Option<crate::columnar::ColumnBatch>> {
-        use crate::columnar::{BatchRow, Column, ColumnBatch, UnnestRows, pack_evaluated_column};
+        use crate::columnar::{BatchRow, ColumnBatch, UnnestRows, pack_evaluated_column};
 
         let context = &self.execution.context;
         let memory = &context.memory;
@@ -1198,15 +1204,18 @@ impl BatchUnnest {
                 children.reserve_exact(capacity - children.len());
                 inventory = charge;
             }
-            let (column, custody) = if let Some((field, array)) = elements.arrow_column(&evaluation)? {
-                let bytes = array.get_array_memory_size().checked_add(field.size()).ok_or_else(too_large)?;
-                (Column::Arrow { array, field, logical: None }, memory.reserve(bytes)?)
+            let child = if let Some((field, array)) = elements.arrow_column(&evaluation)? {
+                let backing = elements.backing().cloned();
+                drop(elements);
+                let reservation = evaluation.into_reservation()?.expect("An evaluated list owns its allocation scope");
+                ColumnBatch::from_packed_list(array, field, reservation, backing)?
             } else {
                 let values = elements.scalar_values().expect("non-Arrow list has evaluated cells");
-                pack_evaluated_column(values, memory)?
+                let (column, custody) = pack_evaluated_column(values, memory)?;
+                let mut child = ColumnBatch::settled(Vec::new(), count, memory.reserve(256)?)?;
+                child.append_column(column, custody, memory)?;
+                child
             };
-            let mut child = ColumnBatch::settled(Vec::new(), count, memory.reserve(256)?)?;
-            child.append_column(column, custody, memory)?;
             children.push(child);
         }
         let output = batch.expand_evaluated_lists(runs, &children, self.ordinality.as_deref(), self.outer, context);
