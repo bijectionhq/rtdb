@@ -1666,11 +1666,10 @@ impl crate::CandidateVerifier for ScanVerifier<'_> {
         if self.scan.table.name.table.is_owned_event_data() || self.execution.context.catalog.uses_owned_event_cut() {
             return Ok(None);
         }
-        if let Some(rows) = rows {
-            match self.verify_ranked_rows(rows, column, ascending_id, scorer).await {
-                Err(error) if error.code.starts_with("rtdb.storage/") || error.code == "rtdb.query/search-row" => {}
-                result => return result,
-            }
+        // Rows an index resolved against tries this snapshot no longer reads are re-read from the primary index;
+        // any error reading rows this snapshot does hold is a fault, and propagates.
+        if let Some(rows) = rows.filter(|rows| self.resolved_rows_resident(rows)) {
+            return self.verify_ranked_rows(rows, column, ascending_id, scorer).await;
         }
         let rows = self.primary_ranked_rows(iids).await?;
         self.verify_ranked_rows(rows, column, ascending_id, scorer).await
@@ -1873,6 +1872,18 @@ impl ScanVerifier<'_> {
 
     fn within_pushdowns(&self, iid: Iid) -> bool {
         self.pushdowns.as_ref().is_none_or(|pushdowns| pushdowns.iid_matches(&self.scan.columns, iid, self.canonical_entity_iids))
+    }
+
+    /// Whether this snapshot can read every resolved row where its location names it: a live row is held by its batch,
+    /// and a persisted row needs the scanned table's entry and a live trie of that table.
+    /// A search index may resolve rows against tries a later compaction replaced, which this decides before any read.
+    fn resolved_rows_resident(&self, rows: &[crate::ResolvedSearchRow]) -> bool {
+        let table = &self.scan.table.name.table;
+        let mut tries = rows.iter().filter_map(|row| row.location.persisted_page().map(|(trie, _)| trie)).peekable();
+        if tries.peek().is_none() { return true; }
+        let catalog = self.partition.trie_catalog();
+        self.partition.table_entry(table).is_some()
+            && tries.all(|trie| catalog.trie(table, trie).is_some_and(|entry| entry.state == TrieState::Live))
     }
 
     async fn score_iids(&self, iids: BTreeSet<Iid>, column: rtdb_plan::ColumnId, ascending_id: Option<rtdb_plan::ColumnId>,
@@ -3467,6 +3478,44 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].version(), version);
         assert_eq!(result[0].score().to_bits(), expected.to_bits());
+    }
+
+    /// A row resolved against a trie this snapshot does not read is re-read from the primary index,
+    /// while a resolved row this snapshot holds under another version is a fault, not a reason to re-read.
+    #[tokio::test]
+    async fn arrow_search_ranked_verification_rereads_only_rows_the_snapshot_does_not_hold() {
+        use crate::CandidateVerifier;
+
+        let (state, table, _) = live_table_with_values([Value::Utf8("open invoice".into()), Value::Utf8("paid invoice".into())]);
+        let snapshot = state.value().snapshot();
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let (mut scan, execution, _) = descriptor_scan(snapshot.clone(), table.clone(), Arc::clone(&storage));
+        let query = rtdb_text::Query::parse("invoice");
+        scan.predicates.push(Expr::Call { name: "match".into(), args: vec![
+            scan.columns[0].expression(), Expr::Literal(Value::Utf8("invoice".into())),
+        ], return_type: LogicalType::Scalar(ScalarType::Bool).maybe() });
+        let bounds = bounds(&scan, &snapshot, &execution).await.unwrap();
+        let search_queries = SearchQueries::default();
+        let constants = &ExecutionConstants { execution: &execution, search_queries: &search_queries };
+        let verifier = ScanVerifier { scan: &scan, execution: &execution, constants, pushdowns: None, partition: &snapshot, storage: &storage,
+            canonical_entity_iids: false, counts: Default::default(), ranked_projection_memory: None };
+        let segment = snapshot.iter_segments(&table).next().unwrap();
+        let (first, second) = (segment.row(0).unwrap(), segment.row(1).unwrap());
+        let version = first.header().unwrap().version();
+        assert_ne!(second.header().unwrap().version(), version);
+        let scorer = rtdb_text::Scorer::new(query, None);
+
+        let replaced = crate::ResolvedSearchRow { version, origin: None, visibility: bounds,
+            location: crate::SearchRowLocation::Persisted { trie: TrieKey::l0(state.value().live().block_index()).unwrap(), page: 0, row: 0 } };
+        let reread = verifier.verify_ranked(&BTreeSet::from([version.iid]), Some(vec![replaced]), ColumnId(0), None, &scorer)
+            .await.unwrap().unwrap();
+        assert_eq!(reread.len(), 1);
+        assert_eq!(reread[0].version(), version);
+
+        let misplaced = crate::ResolvedSearchRow { version, origin: None, location: crate::SearchRowLocation::Live(second), visibility: bounds };
+        let error = verifier.verify_ranked(&BTreeSet::from([version.iid]), Some(vec![misplaced]), ColumnId(0), None, &scorer)
+            .await.unwrap_err();
+        assert_eq!(error.code, "rtdb.query/search-row");
     }
 
     #[tokio::test]
