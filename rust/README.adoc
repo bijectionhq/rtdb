@@ -71,3 +71,5 @@ The presence of a package, an interface, or an unexecuted assertion is not compl
 
 Verification follows the repository's `xtdb-testing` workflow for Gradle runs and preserves separate reference, native, and comparison receipts.
 The historical results recorded in the design are reference results, not a Rust baseline.
+
+The link:bench/budget-benchmark.adoc[matched 512 MiB pgwire probes] use the original differential fixtures and report per-engine allocation, plan, result and timing evidence.

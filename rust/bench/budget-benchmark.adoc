@@ -1,0 +1,126 @@
+= Matched 512 MiB pgwire budget probes
+
+This fixture replays E1 through E4 and both L12 window scales from the RTDB versus XTDB pgwire differential harness.
+It supplies a bounded comparison for MEM-3 and VE-9.
+MEM-3's original TPC-H and expression-property corpus assertions and VE-9's upstream TSBS, EDGAR, food-prices and other workload suites require separate execution.
+The JVM reference is upstream XTDB `0b9fa440f23d2165250d215209f7fa9bd7c26a6f`.
+The historical differential timings used release `c6c19623d90c658c15400fb46dc056f3735ed57b` and remain historical.
+
+== Fixed inputs and execution order
+
+The original differential SQL and generator are checked in as `budget_fixture.py`.
+Both engines receive the same Python `random.Random(42)` sequence at each scale, 1,000-row insert batches, pgwire int8 and text parameters, explicit valid-from timestamps, and the original `small`, `regions`, `custN`, `accN` and `ntN` seed inputs.
+The runner checks full ordered typed readback of the participating accounts and labels, plus customer, region and nested-table setup checks before timing.
+It does not load unrelated functional probes or perform DML after seeding.
+The original input probes retain the following result contracts.
+
+[cols="1,2,3",options="header"]
+|===
+|Probe |Input |Required result
+|E1 |10,000,000 cross-joined rows, 1,000,000 groups |First five ordered keys from account zero, each with count 10.
+|E2 |Same cross join, descending concatenated key |Five copies of the maximum key and ID 99,999.
+|E3 |Same cross join, complete descending order with offset 10 |Count 9,999,990, with spill-file evidence on the separate diagnostic execution.
+|E4 |Same cross join, DISTINCT name and label |Count 1,000,000.
+|L12 |10,000 and 100,000 accounts, eight region partitions |Count 80 at each scale. The projection exposes no identity or ordering among equal balances.
+|===
+
+Each engine runs twice with alternating engine order, one active process at a time.
+Each repetition uses three empty local stores, one for E1 through E4 together and one per L12 scale.
+It runs one warmup and three measured executions per case in fixed order, then runs separate `EXPLAIN` and `EXPLAIN ANALYZE` diagnostics.
+Named cases and repetitions stay in the denominator after failures.
+
+== Budget and measurement
+
+Each engine receives a 536,870,912-byte configured envelope.
+XTDB uses a 268,435,456-byte heap maximum plus 268,435,456 bytes of direct memory.
+Its Arrow root uses 90% of the direct ceiling (241,591,910 bytes), shared with other Arrow consumers.
+RTDB gets the same total and reserves 295,279,002 bytes for the memory cache, leaving 241,591,910 bytes of shared execution admission.
+The historical RTDB run used a half-cache, half-execution split.
+The paired run requires the production allocator ceilings from both metrics endpoints before and after each workload.
+Compare like admission ceilings while retaining the engines' different charging rules.
+The envelope covers configured engine budgets. Process RSS, code, JVM native overhead, and filesystem page cache have their own accounting.
+The worker must have sufficient physical headroom for these and retain the same CPU, storage and host cache policy throughout.
+The process high-water mark is captured under Linux `/proc`.
+
+Timed samples include pgwire execution and complete result fetch on one connection.
+The summary retains median query latency, queries per second, logical input rows per second and returned rows per second.
+Logical input rows count fixture rows entering the requested operation and can differ from actual plan counters.
+The pair reports the median across each engine's two repetition medians and the RTDB/XTDB latency ratio.
+No speed threshold is imposed.
+Plan and per-operator row and allocation evidence come from a separate diagnostic execution, with full pgwire columns, OIDs and rows.
+E3 requires a sort operator in the analyzed plan and a newly observed nonempty run in the active process's private spill directory.
+The maximum observed size per file is a sampled observation.
+A missing spill observation leaves E3 unqualified for external sorting even when its count is correct.
+A lack of sampled files does not establish that no spill occurred.
+
+The report retains raw server/protocol failures, full SQLSTATE diagnostics, client errors, cancellations, wrong rows, setup failures, allocator metrics and server liveness and shutdown evidence.
+Failures in any warmup, sample, required diagnostic or effective ceiling exclude that invocation from throughput.
+Every case needs two qualifying invocations on each engine for a latency ratio.
+Successful attempts in a failed invocation remain visible in `execution.json`.
+A query refusal remains a measured workload outcome even when its timing is excluded from the throughput calculation.
+
+== Authorized run
+
+Use an idle native Linux worker, a common filesystem for both engine data paths, a 64-bit JDK 25, Python 3.11 or newer, and psycopg with libpq 17 or newer.
+Reserve loopback ports 35432, 33000 and 38080 for the runner.
+Use an output root outside both clean source checkouts.
+The client and engines inherit the same CPU affinity. No synthetic cache drop is applied.
+The runner does not build an artifact or download any input.
+
+Build or obtain the two matching artifacts in a separately authorized build step.
+From a clean RTDB checkout at the revision under comparison, the native release build must compile `RTDB_REVISION` with the full Git commit.
+The JVM artifact must be the standalone shadow JAR from the clean pinned upstream checkout with the full revision in its build-time implementation version.
+Keep the clean build logs and the two resulting SHA-256 values alongside the run evidence.
+Sample preparation commands for the authorized build are below.
+
+[source,sh]
+----
+# Set these to existing clean checkout directories and the selected JDK installation.
+RTDB_CHECKOUT=/path/to/clean/rtdb
+XTDB_CHECKOUT=/path/to/clean/pinned/xtdb
+JDK25=/path/to/jdk-25
+EVIDENCE=/path/to/new-budget-evidence
+
+RTDB_REVISION=$(git -C "$RTDB_CHECKOUT" rev-parse HEAD)
+XTDB_REVISION=0b9fa440f23d2165250d215209f7fa9bd7c26a6f
+test "$(git -C "$XTDB_CHECKOUT" rev-parse HEAD)" = "$XTDB_REVISION" || exit 1
+(cd "$RTDB_CHECKOUT/rust" && RTDB_REVISION="$RTDB_REVISION" cargo build --locked --release -p rtdb-server --bin rtdb)
+XTDB_VERSION="$XTDB_REVISION" JAVA_HOME="$JDK25" JAVA_HOME_25_X64="$JDK25" \
+  "$XTDB_CHECKOUT/gradlew" -p "$XTDB_CHECKOUT" --no-daemon -PfullJdk :docker:standalone:shadowJar
+
+NATIVE="$RTDB_CHECKOUT/rust/target/release/rtdb"
+JAR="$XTDB_CHECKOUT/docker/standalone/build/libs/xtdb-standalone.jar"
+sha256sum "$NATIVE" "$JAR"
+----
+
+For the evidence run, supply the recorded build SHA-256 values as `NATIVE_SHA256` and `JVM_SHA256` below.
+The runner validates both hashes, each artifact's build-time revision, both checkout revisions and their clean status.
+The clean reference build receipt links the JVM jar hash to its build revision.
+The plan retains those artifact hashes, the Java executable and module image hashes, and both generated YAML configuration hashes.
+It also retains the runtime arguments and environment for each invocation.
+Any selected input change prevents the paired result from being published.
+
+[source,sh]
+----
+# If needed, provision the shared pgwire client in a reusable venv outside the checkouts.
+python3 -m venv /path/to/budget-venv
+/path/to/budget-venv/bin/pip install 'psycopg[binary]==3.3.6'
+
+/path/to/budget-venv/bin/python -B "$RTDB_CHECKOUT/rust/bench/budget_benchmark.py" \
+  --phase-two --revision "$RTDB_REVISION" --reference "$XTDB_CHECKOUT" \
+  --native "$NATIVE" --native-sha256 "$NATIVE_SHA256" --jvm-sha256 "$JVM_SHA256" \
+  --java "$JDK25/bin/java" --output "$EVIDENCE"
+----
+
+`plan.json` identifies the inputs, expected rows, limits and denominators.
+Each invocation retains `execution.json`, raw Prometheus observables, process status and server logs.
+`comparison.json` contains pair qualification and throughput eligibility.
+Exit 0 means both engines qualified on all six probe/scale cases, exit 1 with a comparison means at least one case did not qualify, and a raised error leaves failure evidence when the output directory has been created.
+
+The fixture and receipt regression tests can run without server artifacts.
+
+[source,sh]
+----
+cd "$RTDB_CHECKOUT"
+python3 -B -m unittest discover -s rust/bench -p test_budget_benchmark.py
+----
