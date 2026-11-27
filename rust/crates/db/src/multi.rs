@@ -1121,8 +1121,10 @@ impl MultiDatabase {
         if let Some(writer) = self.writer.as_mut() {
             writer.retired_store_checkpoints.extend(retired);
         }
-        if let Some(state) = self.committed.as_mut() {
-            state.advance_floor(base, until, lease.epoch, store_history_floor);
+        if let Some(state) = self.committed.as_mut()
+            && (installed || base.checkpoint.through >= state.floor.0)
+        {
+            state.adopt_checkpoint(base, until, lease.epoch, store_history_floor);
         }
         self.refresh().await
     }

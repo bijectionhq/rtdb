@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use rtdb_crypt::Generation;
-use rtdb_format::journal::{Checkpoint, Manifest, ObjectId, Record};
+use rtdb_format::journal::{Checkpoint, Manifest, ObjectId};
 use rtdb_store::{ObjectStore, ReservedManifest};
 use rtdb_tx::transact::TransactState;
 use rtdb_types::{Anomaly, Result};

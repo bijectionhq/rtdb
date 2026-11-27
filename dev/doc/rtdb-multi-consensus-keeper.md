@@ -52,7 +52,7 @@ Followers request pages that cover their observed head and resume at the next LS
 On a cluster with atomic checkpoint installation finalized, Multi installs an authenticated checkpoint and advances the logical floor through its cut in one keeper decision.
 The decision retains the checkpoint position for replay and preserves every record after its cut, including writes made while a deferred checkpoint was built.
 A key rotation can stage a clean checkpoint and select it once the provider has armed retirement. Multi verifies the exact committed announcement and the keeper checks its position, cut and digest under the current writer fence.
-Older clusters use the same verified selection after appending the announcement. A cold reader can discover the selected checkpoint directly where the keeper has retained its position.
+Older clusters use the same verified selection after appending the announcement. A cold reader uses the keeper's selected checkpoint when available, including when an earlier retained announcement covers the same cut.
 A history change under the same ID faults the residence.
 The keeper manages replica replacement for immutable streams.
 To adopt this mode for existing databases, restore a verified application cut into a fresh database incarnation and stream before changing the database route.

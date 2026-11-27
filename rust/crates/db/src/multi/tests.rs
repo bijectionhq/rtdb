@@ -3349,6 +3349,44 @@ async fn immutable_checkpoint_installs_and_replays_the_exact_cut_after_keeper_re
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cold_replay_uses_the_selected_checkpoint_at_an_unchanged_floor() {
+    use stream_logkeeper::stream::consensus::{CLUSTER_VERSION_CURRENT, testing::LocalCluster};
+
+    const PRINCIPAL: &str = "urn:logkeeper:client:checkpoint-reselection-rtdb";
+    let mut keepers = LocalCluster::start_replicated_catalog(&[PRINCIPAL]).await.unwrap();
+    let config = keepers.journal_config(8 << 30, 4 << 20);
+    let journal = Arc::new(keepers.journal(PRINCIPAL, &config).unwrap());
+    journal.client().finalize_version(CLUSTER_VERSION_CURRENT).await.unwrap();
+    let cluster = Cluster::new();
+    let mut writer = cluster.node(1, journal.clone()).with_immutable_journal();
+    writer.create().await.unwrap();
+    assert_eq!(writer.tick(&live(1)).await.unwrap(), Role::Writer(Epoch(1)));
+
+    let before = put(1, 1, "captured");
+    let captured = writer.transact(&before).await.unwrap();
+    writer.checkpoint(Vec::new()).await.unwrap();
+    let stream = writer.journal_stream();
+    let original = journal.selected_checkpoint(stream).await.unwrap().unwrap();
+    assert_eq!(original.checkpoint_lsn, original.logical_floor_lsn);
+
+    let checkpoint = writer.state().checkpoint_at(original.checkpoint_lsn).unwrap().checkpoint;
+    let lease = writer.authority().unwrap();
+    writer.install_checkpoint(lease, checkpoint, lease.until, 0).await.unwrap();
+    let selected = journal.selected_checkpoint(stream).await.unwrap().unwrap();
+    assert_eq!(selected.logical_floor_lsn, original.logical_floor_lsn);
+    assert!(selected.checkpoint_lsn > original.checkpoint_lsn);
+    assert_eq!(writer.state().base.as_ref().unwrap().announced, selected.checkpoint_lsn);
+
+    let after = put(2, 2, "suffix");
+    let suffix = writer.transact(&after).await.unwrap();
+    let mut reader = cluster.node(2, journal).with_immutable_journal();
+    assert_eq!(reader.tx_status(&before.key).await.unwrap().basis, captured.basis);
+    assert_eq!(reader.tx_status(&after.key).await.unwrap().basis, suffix.basis);
+    assert_eq!(reader.state().base.as_ref().unwrap().announced, selected.checkpoint_lsn);
+    keepers.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multi_driver_resumes_after_every_keeper_restarts() {
     let mut journal = journals().await;
     let cluster = Cluster::new();

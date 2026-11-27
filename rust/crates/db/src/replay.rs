@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use journal_contract::{Epoch, JournalError, Lsn};
+use journal_contract::{Epoch, JournalError, Lsn, Page};
 use rtdb_format::journal::{Checkpoint, ObjectId, ObjectKind, Record};
 use rtdb_index::branches::{BranchCut, BranchEffect, BranchIndex};
 use rtdb_store::{ObjectStore, Reachability, VerifiedManifest, read_manifest};
@@ -377,25 +377,19 @@ impl Committed {
                 .take()
                 .unwrap_or_else(|| Self::empty(stream, page.floor));
             if state.awaiting_base() {
-                let classic = match page.records.first() {
-                    Some((lsn, bytes)) if *lsn == state.floor => matches!(
-                        stream.decode(*lsn, bytes).await.map_err(|error| ReplayError::failed(error, None))?.record,
-                        Record::Checkpoint(checkpoint) if checkpoint.through.checked_add(1) == Some(state.floor.0)
-                    ),
-                    _ => false,
-                };
-                if !classic {
-                    match find_deferred_base(stream, state.floor).await.map_err(|error| ReplayError::failed(error, None))? {
-                        BaseSearch::Found { announced, epoch, checkpoint } => {
-                            state.install_checkpoint(stream, store, announced, epoch, &checkpoint).await
-                                .map_err(|error| ReplayError::failed(error, None))?;
-                            state.generation = checkpoint.key_generation;
-                            state.base = Some(ReplayBase { announced, checkpoint });
-                        }
-                        BaseSearch::Moved(floor) => {
-                            from = floor;
-                            continue;
-                        }
+                match find_replay_base(stream, &page).await
+                    .map_err(|error| ReplayError::failed(error, None))?
+                {
+                    BaseSearch::AtFloor => (),
+                    BaseSearch::Deferred { announced, epoch, checkpoint } => {
+                        state.install_checkpoint(stream, store, announced, epoch, &checkpoint).await
+                            .map_err(|error| ReplayError::failed(error, None))?;
+                        state.generation = checkpoint.key_generation;
+                        state.base = Some(ReplayBase { announced, checkpoint });
+                    }
+                    BaseSearch::Moved(floor) => {
+                        from = floor;
+                        continue;
                     }
                 }
             }
@@ -1007,14 +1001,15 @@ impl Committed {
         }
     }
 
-    /// Drops the records before `floor` after this writer trimmed through a
-    /// checkpoint it announced, without reading the journal or the manifest
-    /// again. The result is the state a fresh replay from `floor` installs:
+    /// Adopts an installed replay base and drops any newly trimmed records
+    /// without reading the journal or manifest again. The result is the state
+    /// a fresh replay from `floor` installs:
     /// the transaction state is unchanged, and the lease, release and rotation
     /// are those the base installs unless a retained record set them.
-    pub(crate) fn advance_floor(&mut self, base: ReplayBase, until: i64, epoch: Epoch, store_history_floor: u64) -> bool {
+    pub(crate) fn adopt_checkpoint(&mut self, base: ReplayBase, until: i64, epoch: Epoch, store_history_floor: u64) -> bool {
         let floor = Lsn(base.checkpoint.through + 1);
-        if floor <= self.floor || floor > next(self.head).unwrap_or(self.head) || base.announced < floor
+        if floor < self.floor || floor > next(self.head).unwrap_or(self.head) || base.announced < floor
+            || (floor == self.floor && self.base.as_ref().is_some_and(|current| current.announced >= base.announced))
             || base.announced > self.head || self.rotation.is_some() || self.retired.is_some()
             || base.checkpoint.restore || base.checkpoint.key_generation != self.generation
             || !matches!(self.records.get((base.announced.0 - self.floor.0) as usize),
@@ -1098,57 +1093,79 @@ async fn closure(
 }
 
 enum BaseSearch {
-    Found { announced: Lsn, epoch: Epoch, checkpoint: Checkpoint },
+    AtFloor,
+    Deferred { announced: Lsn, epoch: Epoch, checkpoint: Checkpoint },
     /// The floor advanced during the search. Replay starts again from it.
     Moved(Lsn),
 }
 
-/// Reads the selected deferred base directly. Floors written before the
-/// journal kept a selection are recovered by scanning the retained suffix.
-async fn find_deferred_base(stream: &Stream, floor: Lsn) -> Result<BaseSearch> {
-    if let Some(receipt) = stream.selected_checkpoint().await? {
-        if receipt.logical_floor_lsn > floor {
-            return Ok(BaseSearch::Moved(receipt.logical_floor_lsn));
+impl BaseSearch {
+    fn found(floor: Lsn, announced: Lsn, epoch: Epoch, checkpoint: Checkpoint) -> Self {
+        if announced == floor {
+            Self::AtFloor
+        } else {
+            Self::Deferred { announced, epoch, checkpoint }
         }
-        if receipt.logical_floor_lsn != floor
-            || next(receipt.covered_through_lsn)? != floor
-            || receipt.checkpoint_lsn < floor
-        {
-            return Err(invalid("The selected checkpoint has invalid journal bounds"));
-        }
-        let announced = receipt.checkpoint_lsn;
-        let page = match stream.read_checkpoint_record(announced).await {
+    }
+}
+
+/// A keeper selection identifies the base even when an earlier checkpoint
+/// at the retained floor covers the same cut.
+async fn find_replay_base(stream: &Stream, first_page: &Page) -> Result<BaseSearch> {
+    let Some(receipt) = stream.selected_checkpoint().await? else {
+        return scan_legacy_base(stream, first_page).await;
+    };
+    let floor = first_page.floor;
+    if receipt.logical_floor_lsn > floor {
+        return Ok(BaseSearch::Moved(receipt.logical_floor_lsn));
+    }
+    if receipt.logical_floor_lsn != floor
+        || next(receipt.covered_through_lsn)? != floor
+        || receipt.checkpoint_lsn < floor
+    {
+        return Err(invalid("The selected checkpoint has invalid journal bounds"));
+    }
+    let announced = receipt.checkpoint_lsn;
+    let fetched;
+    let bytes = if let Some((_, bytes)) = first_page.records.iter().find(|(lsn, _)| *lsn == announced) {
+        bytes
+    } else {
+        fetched = match stream.read_checkpoint_record(announced).await {
             Ok(page) => page,
             Err(JournalError::Trimmed { floor: moved }) if moved > floor => {
                 return Ok(BaseSearch::Moved(moved));
             }
             Err(error) => return Err(journal_error(error)),
         };
-        if page.floor > floor {
-            return Ok(BaseSearch::Moved(page.floor));
+        if fetched.floor > floor {
+            return Ok(BaseSearch::Moved(fetched.floor));
         }
-        let [(lsn, bytes)] = page.records.as_slice() else {
+        let [(lsn, bytes)] = fetched.records.as_slice() else {
             return Err(journal_error(JournalError::Unavailable));
         };
-        if *lsn != announced || page.floor != floor {
+        if *lsn != announced || fetched.floor != floor {
             return Err(journal_error(JournalError::Unavailable));
         }
-        let entry = stream.decode(announced, bytes).await?;
-        if let Record::Checkpoint(checkpoint) = entry.record
-            && checkpoint.through == receipt.covered_through_lsn.0
-            && checkpoint.key_generation == entry.generation
-        {
-            return Ok(BaseSearch::Found { announced, epoch: entry.epoch, checkpoint });
-        }
-        return Err(invalid("The selected record does not announce the committed checkpoint"));
+        bytes
+    };
+    let entry = stream.decode(announced, bytes).await?;
+    if let Record::Checkpoint(checkpoint) = entry.record
+        && checkpoint.through == receipt.covered_through_lsn.0
+        && checkpoint.key_generation == entry.generation
+    {
+        return Ok(BaseSearch::found(floor, announced, entry.epoch, checkpoint));
     }
+    Err(invalid("The selected record does not announce the committed checkpoint"))
+}
+
+/// Before the journal retained a checkpoint selection, replay discovered
+/// the base in the retained suffix.
+async fn scan_legacy_base(stream: &Stream, first_page: &Page) -> Result<BaseSearch> {
+    let floor = first_page.floor;
     let mut at = floor;
+    let mut fetched = None;
     loop {
-        let page = match stream.read(at).await {
-            Ok(page) => page,
-            Err(JournalError::Trimmed { floor: moved }) if moved > floor => return Ok(BaseSearch::Moved(moved)),
-            Err(error) => return Err(journal_error(error)),
-        };
+        let page = fetched.as_ref().unwrap_or(first_page);
         if page.floor > floor {
             return Ok(BaseSearch::Moved(page.floor));
         }
@@ -1158,17 +1175,22 @@ async fn find_deferred_base(stream: &Stream, floor: Lsn) -> Result<BaseSearch> {
             }
             return Err(journal_error(JournalError::Unavailable));
         }
-        for (lsn, bytes) in page.records {
-            if lsn != at {
+        for (lsn, bytes) in &page.records {
+            if *lsn != at {
                 return Err(journal_error(JournalError::Unavailable));
             }
-            if let Entry { epoch, record: Record::Checkpoint(checkpoint), .. } = stream.decode(lsn, &bytes).await?
+            if let Entry { epoch, record: Record::Checkpoint(checkpoint), .. } = stream.decode(*lsn, bytes).await?
                 && checkpoint.through.checked_add(1) == Some(floor.0)
             {
-                return Ok(BaseSearch::Found { announced: lsn, epoch, checkpoint });
+                return Ok(BaseSearch::found(floor, *lsn, epoch, checkpoint));
             }
-            at = next(lsn)?;
+            at = next(*lsn)?;
         }
+        fetched = Some(match stream.read(at).await {
+            Ok(page) => page,
+            Err(JournalError::Trimmed { floor: moved }) if moved > floor => return Ok(BaseSearch::Moved(moved)),
+            Err(error) => return Err(journal_error(error)),
+        });
     }
 }
 
