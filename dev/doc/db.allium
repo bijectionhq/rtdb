@@ -2406,6 +2406,14 @@ surface QueryAccess {
         -- An execution spanning several databases holds one such snapshot per database.
         -- Derived ordered-index state belongs to the captured snapshot and observes the same catalog, system-time cap, and staged writes.
 
+    @guarantee JvmValuesAndRecordExpressions
+        -- JVM VALUES retains the order of rows and evaluates each reached cell in its existing expression order.
+        -- Compatible scalar parameters and children of bound records are copied at their Arrow positions.
+        -- Compatible computed scalar cells write to the result column as they are evaluated.
+        -- Computed records with compatible scalar children evaluate all their fields before writing the record.
+        -- A nested field read follows the reached child through each valid ancestor and yields null for a null ancestor.
+        -- A compatible PATCH result selects each right-hand field when it supplies a non-null value and otherwise keeps the corresponding left-hand field when present.
+
     @guarantee ColumnarScanProjection
         -- Native relational operators consume and produce column batches that retain compatible payloads as Arrow arrays and selections.
         -- A projection that shares input buffers retains their original charges through aliases, struct children, and assembled records.

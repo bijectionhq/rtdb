@@ -75,3 +75,35 @@ interface VectorWriter : VectorReader, AutoCloseable {
     fun appendRange(r: VectorReader, startIdx: Int, length: Int) =
         r.rowCopier(this).copyRange(startIdx, length)
 }
+
+internal fun ArrowType.hasScalarObjectIdentity() = when (this) {
+    BOOL_TYPE, I8_TYPE, I16_TYPE, I32_TYPE, I64_TYPE, F32_TYPE, F64_TYPE, VAR_BINARY_TYPE -> true
+    else -> false
+}
+
+internal fun VectorReader.isAscii(idx: Int): Boolean {
+    val bytes = getBytes(idx)
+    return (bytes.position() until bytes.limit()).all { bytes.get(it) >= 0 }
+}
+
+internal fun VectorWriter.scalarObjectTarget(src: VectorReader, idx: Int): VectorWriter? {
+    val sourceType = src.arrowType
+    if (src.type.encoding != Encoding.Plain) return null
+    if (!sourceType.hasScalarObjectIdentity() &&
+        !(sourceType == UTF8_TYPE && (src.isNull(idx) || src.isAscii(idx)))) return null
+
+    val target = if (this is DenseUnionVector) vectorForOrNull(sourceType.toLeg()) else this
+    return target?.takeIf { it.arrowType == sourceType }
+}
+
+internal fun VectorWriter.copyNonNullScalar(src: VectorReader, idx: Int) {
+    if (src.nullable && !nullable) writeValue(src.valueReader().also { it.pos = idx })
+    else src.rowCopier(this).copyRow(idx)
+}
+
+fun VectorWriter.writeScalarCell(src: VectorReader, idx: Int) {
+    val target = scalarObjectTarget(src, idx)
+    if (target == null) writeObject(src.getObject(idx))
+    else if (src.isNull(idx)) writeObject(null)
+    else target.copyNonNullScalar(src, idx)
+}

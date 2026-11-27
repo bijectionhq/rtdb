@@ -46,6 +46,25 @@ interface RelationWriter : RelationReader {
         endRow()
     }
 
+    /** Appends a compatible struct row to the existing columns. Returns false before any writes if it cannot copy. */
+    fun tryCopyStructRow(src: VectorReader, idx: Int): Boolean {
+        if (src.arrowType != STRUCT_TYPE || src.type.encoding != Encoding.Plain || src.isNull(idx)) return false
+
+        val children = src.keyNames?.mapNotNull { name ->
+            val child = src.vectorFor(name)
+            val out = vectorForOrNull(name) ?: return false
+            val target = out.scalarObjectTarget(child, idx) ?: return false
+            if (child.isNull(idx)) null else child to target
+        } ?: return false
+
+        for ((child, target) in children) {
+            target.copyNonNullScalar(child, idx)
+        }
+
+        endRow()
+        return true
+    }
+
     fun writeRows(vararg rows: Map<*, *>) {
         rows.forEach(::writeRow)
     }

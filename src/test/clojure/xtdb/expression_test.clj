@@ -1880,6 +1880,18 @@
               :res-type #xt/type :f64}
              (run-projection rel '(.. {:x {:y y}} x y))))))
 
+(t/deftest computed-struct-fields-observe-nullable-ancestors
+  (with-open [rel (tu/open-rel {:s [{:a {:value 4}} nil {:a nil} {:a {:value nil}} {:a {:value 8}}]})]
+    (t/is (= [{:selected-value 5, :present true}
+              {:present false}
+              {:present false}
+              {:present false}
+              {:selected-value 9, :present true}]
+             (:res (run-projection rel '{:selected_value (+ (.. s a value) 1)
+                                         :present (not (nil? (.. s a value)))})))))
+  (t/is (anomalous? [:incorrect nil #"division by zero"]
+                    (project1 '(. {:selected 7 :other (/ 1.0 0.0)} selected) {}))))
+
 (t/deftest test-struct-equals
   (t/is (= true (project1 '(== {} {}) {})))
   (t/is (= false (project1 '(== {:a 1, :b 2} {:a 1, :b 2, :c 3}) {})))
@@ -2461,6 +2473,18 @@
                     [{:a1 1.0, :a2 2.4}
                      {:a1 1, :a2 nil}
                      {:a1 3, :a2 "3"}]))))
+
+(t/deftest patch-selects-present-right-fields-and-keeps-left-fields-for-null
+  (with-open [rel (tu/open-rel {:l [{:value 1, :keep 10, :flag true}
+                                   {:value 2, :keep 20, :flag true}
+                                   {:value 3, :keep 30, :flag false}]
+                                :r [{:value nil, :flag false}
+                                    {:value 9, :flag nil}
+                                    {:value 5, :flag true}]})]
+    (t/is (= [{:value 1, :keep 10, :flag false}
+              {:value 9, :keep 20, :flag true}
+              {:value 5, :keep 30, :flag true}]
+             (:res (run-projection rel '(_patch l r)))))))
 
 (t/deftest list-equality-batch-bindings-5047
   (t/is (false? (->> (tu/query-ra '[:project {:projections [{ret (== [#xt/instant "1970-01-01T00:00:00Z"]

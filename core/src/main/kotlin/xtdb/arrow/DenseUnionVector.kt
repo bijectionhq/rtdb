@@ -135,6 +135,7 @@ class DenseUnionVector private constructor(
                 override fun readObject(keyFn: IKeyFn<*>) = rdr.readObject(keyFn)
                 override fun readList() = rdr.readList()
                 override fun readStruct() = rdr.readStruct()
+                override fun readField(name: String) = rdr.readField(name)
             }
         }
 
@@ -351,6 +352,7 @@ class DenseUnionVector private constructor(
             override fun readObject(keyFn: IKeyFn<*>) = legReader.readObject(keyFn)
             override fun readList() = legReader.readList()
             override fun readStruct() = legReader.readStruct()
+            override fun readField(name: String) = legReader.readField(name)
         }
     }
 

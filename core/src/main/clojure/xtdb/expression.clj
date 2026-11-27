@@ -20,7 +20,7 @@
            (org.apache.arrow.vector PeriodDuration)
            (org.apache.arrow.vector.types.pojo ArrowType$Decimal)
            (org.apache.commons.codec.binary Hex)
-           (xtdb.arrow ListValueReader RelationReader RowMask ValueBox ValueReader Vector VectorReader VectorType VectorType$Listy VectorType$Mono VectorType$Nothing VectorType$Poly VectorType$Struct)
+           (xtdb.arrow ListValueReader RelationReader RowMask ValueBox ValueReader Vector VectorReader VectorType VectorType$Listy VectorType$Mono VectorType$Nothing VectorType$Poly VectorType$Struct VectorWriter VectorWriterKt)
            (xtdb.expression PgFormat)
            (xtdb.operator ProjectionSpec ProjectionSpec$Factory SelectionSpec SelectionSpec$Factory)
            (xtdb.pgwire PgTypes)
@@ -435,7 +435,9 @@
   (defmethod write-value-code k [_ & args] `(.writeObject ~@args)))
 
 (defmethod read-value-code :struct [_ & args]
-  (-> `(.readStruct ~@args) (with-tag Map)))
+  (-> `(.readStruct ~@args)
+      (with-tag Map)
+      (vary-meta assoc ::struct-reader (first args))))
 
 (defmethod write-value-code :struct [_ & args] `(.writeObject ~@args))
 
@@ -1952,22 +1954,15 @@
                                     {:k k
                                      :val-box (gensym (str (util/symbol->normal-form-symbol k) "-box"))
                                      :emitted-expr (codegen-expr expr opts)}))))
-        map-sym (gensym 'map)]
+        fields (into {} (map (fn [{:keys [k val-box]}] [(str k) val-box])) emitted-vals)
+        return-type (VectorType/structOf
+                     (into {} (map (fn [{:keys [k emitted-expr]}] [(str k) (:return-type emitted-expr)])) emitted-vals))
+        map-sym (with-tag (gensym 'map) Map)]
 
-    {:return-type (VectorType/structOf 
-                    (into {}
-                          (map (fn [{:keys [k], {:keys [return-type]} :emitted-expr}]
-                                 {(str k) return-type}))
-                          emitted-vals))
+    {:return-type return-type
 
-     :batch-bindings (conj (->> emitted-vals
-                                (mapv (fn [{:keys [val-box]}]
-                                        [val-box `(ValueBox.)])))
-
-                           [(-> map-sym (with-tag Map))
-                            (->> emitted-vals
-                                 (into {} (map (fn [{:keys [k val-box]}]
-                                                 [(str k) val-box]))))])
+     :batch-bindings (conj (mapv (fn [{:keys [val-box]}] [val-box `(ValueBox.)]) emitted-vals)
+                           [map-sym fields])
 
      :children (mapv :emitted-expr emitted-vals)
      :continue (fn [f]
@@ -1976,18 +1971,19 @@
                         (continue (fn [^VectorType val-type code]
                                     (write-value-code val-type val-box (types/arrow-type->leg (.getArrowType val-type)) code))))
 
-                    ~(f (types/->type [:struct (into {}
-                                                 (map (fn [{:keys [k], {:keys [return-type]} :emitted-expr}]
-                                                        {(str k) return-type}))
-                                                 emitted-vals)]) map-sym)))}))
+                    ~(f return-type (vary-meta map-sym assoc ::struct-fields fields))))}))
 
 (defmethod codegen-call [:get_field :struct] [{[^VectorType$Struct struct-type] :arg-types, :keys [field]}]
   (if-let [val-type (.get (.getChildren struct-type) (str field))]
     {:return-type val-type
      :continue-call (fn [f [struct-code]]
-                      (continue-read f val-type
-                                     (-> `(.get ~struct-code ~(str field))
-                                         (with-tag ValueReader))))}
+                      (let [{::keys [struct-reader struct-fields struct-bindings]} (meta struct-code)
+                            field (str field)
+                            child-code (cond
+                                         struct-reader `(.readField ~(with-tag struct-reader ValueReader) ~field)
+                                         (and struct-fields (empty? struct-bindings)) (get struct-fields field)
+                                         :else `(.get ~(with-tag struct-code Map) ~field))]
+                        (continue-read f val-type (with-tag child-code ValueReader))))}
 
     {:return-type #xt/type :null, :->call-code (constantly nil)}))
 
@@ -2128,22 +2124,27 @@
                                             r-ks))]
     {:return-type ret-type
      :->call-code (fn [[l r]]
-                    (let [l-sym (gensym 'l)
-                          r-sym (gensym 'r)]
-                      `(let [~l-sym ~l, ~r-sym ~r]
-                         ~(-> {}
-                              (into (map (fn [k]
-                                           (let [k-str (str k)]
-                                             [k-str `(get ~l-sym ~k-str)])))
-                                    (keys l-ks))
-                              (into (map (fn [k]
-                                           (let [k-str (str k)]
-                                             [k-str
-                                              (if (and (contains? l-ks k)
-                                                       (get-in flattened-r-types [k #xt/type :null]))
-                                                `(-patch (get ~l-sym ~k-str) (get ~r-sym ~k-str))
-                                                `(get ~r-sym ~k-str))])))
-                                    (keys r-ks))))))}))
+                    (letfn [(fields [read-l read-r]
+                              (-> (into {} (map (juxt identity read-l)) (keys l-ks))
+                                  (into (map (fn [k]
+                                               [k (if (and (contains? l-ks k)
+                                                           (contains? (get flattened-r-types k) #xt/type :null))
+                                                    `(-patch ~(read-l k) ~(read-r k))
+                                                    (read-r k))]))
+                                        (keys r-ks))))
+                            (read-field [sym struct-reader]
+                              (if struct-reader
+                                (fn [k] `(.readField ~(with-tag sym ValueReader) ~k))
+                                (fn [k] `(get ~sym ~k))))]
+                      (let [l-sym (gensym 'l)
+                            r-sym (gensym 'r)
+                            l-reader (::struct-reader (meta l))
+                            r-reader (::struct-reader (meta r))]
+                        (vary-meta `(let [~l-sym ~l, ~r-sym ~r]
+                                      ~(fields (read-field l-sym nil) (read-field r-sym nil)))
+                                   assoc
+                                   ::struct-fields (fields (read-field l-sym l-reader) (read-field r-sym r-reader))
+                                   ::struct-bindings [l-sym (or l-reader l), r-sym (or r-reader r)]))))}))
 
 (defmethod codegen-call [:_patch :null :struct] [{[_ ^VectorType$Struct r-type] :arg-types}]
   {:return-type r-type
@@ -2504,8 +2505,31 @@
        :write-value-out! (fn [vec-type code]
                            (write-value-code vec-type (get writer-syms vec-type) code))})
 
-    {:write-value-out! (fn [value-type code]
-                         (write-value-code value-type out-vec-sym code))}))
+    (let [struct-type (some #(when (instance? VectorType$Struct %) %) (.getLegs return-type))
+          children (when struct-type (.getChildren ^VectorType$Struct struct-type))
+          child-writers (when (and children
+                                   (every? (fn [^VectorType child-type]
+                                             (and (= child-type (.getUnencoded child-type))
+                                                  (or (= #xt/type :null child-type)
+                                                      (VectorWriterKt/hasScalarObjectIdentity (.getArrowType child-type))
+                                                      (= #xt.arrow/type :utf8 (.getArrowType child-type)))))
+                                           (vals children)))
+                          (update-vals children (fn [_] (with-tag (gensym 'out-child) VectorWriter))))]
+      {:writer-bindings (into [] (mapcat (fn [[k writer]] [writer `(.vectorFor ~out-vec-sym ~k)])) child-writers)
+       :write-value-out! (fn [value-type code]
+                           (let [{::keys [struct-fields struct-bindings]} (meta code)]
+                             (if (and child-writers
+                                      (= struct-type value-type)
+                                      (= (set (keys child-writers)) (set (keys struct-fields)))
+                                      struct-fields)
+                               (let [readers (mapv (fn [[k reader-code]]
+                                                     [(with-tag (gensym 'field) ValueReader) reader-code (get child-writers k)])
+                                                   struct-fields)]
+                                 `(let [~@struct-bindings ~@(mapcat #(take 2 %) readers)]
+                                    ~@(for [[reader _ writer] readers]
+                                        `(.writeValue ~writer ~reader))
+                                    (.endStruct ~out-vec-sym)))
+                               (write-value-code value-type out-vec-sym code))))})))
 
 (defn wrap-zone-id-cache-buster [f]
   (fn [expr opts]
@@ -2634,23 +2658,42 @@
         (fn [{:keys [var-types param-types]}]
           (emit expr {:param-types param-types, :var-types var-types}))))
 
-(defn ->expression-projection-spec ^ProjectionSpec$Factory [col-name expr {:keys [var-types param-types]}]
-  (let [;; HACK - this runs the analyser (we discard the emission) to get the widest possible out-type.
-        widest-out-type (-> (emit-projection expr {:param-types param-types
-                                                   :var-types var-types})
-                            :return-type)
+(defn- projection-emitter [expr var-types param-types]
+  (let [{:keys [return-type]} (emit-projection expr {:var-types var-types, :param-types param-types})
         var-syms (->var-syms expr)
         emit-cache (->emit-cache)]
+    {:return-type return-type
+     :emit-batch (partial emit-for-batch emit-cache emit-projection expr var-syms)}))
 
+(defn ->table-cell-writer [expr {:keys [schema var-types param-types]}]
+  (let [{:keys [return-type emit-batch]} (projection-emitter expr var-types param-types)
+        in-rel RelationReader/DUAL]
+    {:return-type return-type
+     :write-cell! (fn [{:keys [allocator args]} ^VectorWriter out]
+                    (let [{:keys [^VectorType return-type !projection-fn]}
+                          (emit-batch (->param-types args) in-rel)
+                          arrow-type (.getArrowType return-type)]
+                      (if (and (instance? Vector out)
+                               (= arrow-type (.getArrowType out))
+                               (VectorWriterKt/hasScalarObjectIdentity arrow-type))
+                        (rethrowing-anomalies
+                          (@!projection-fn in-rel schema args out))
+                        (with-open [value (Vector/open allocator "_scalar" return-type)]
+                          (rethrowing-anomalies
+                            (@!projection-fn in-rel schema args value))
+                          (.writeObject out (.getObject value 0))))))}))
+
+(defn ->expression-projection-spec ^ProjectionSpec$Factory [col-name expr {:keys [var-types param-types]}]
+  (let [{:keys [return-type emit-batch]} (projection-emitter expr var-types param-types)]
     (reify ProjectionSpec$Factory
       (getToName [_] (str col-name))
-      (getType [_] widest-out-type)
+      (getType [_] return-type)
 
       (open [_ al schema args]
         (let [param-types (->param-types args)]
           (reify ProjectionSpec
             (project [_ in-rel]
-              (let [{:keys [return-type !projection-fn]} (emit-for-batch emit-cache emit-projection expr var-syms param-types in-rel)]
+              (let [{:keys [return-type !projection-fn]} (emit-batch param-types in-rel)]
                 (util/with-close-on-catch [out-vec (Vector/open al (str col-name) return-type)]
                   (rethrowing-anomalies
                     (@!projection-fn in-rel schema args out-vec))

@@ -181,6 +181,22 @@
            (tu/query-ra '[:table {:rows [{:a 4.2} ?record {:a 1, :b 2}]}]
                         {:args {:record {:a 0, :b "1", :c 2}}}))))
 
+(t/deftest values-row-parameters-and-computed-cells-preserve-column-types
+  (t/is (= '{:res [{:numeric-value 12, :label "record"}
+                   {:numeric-value 8, :label "é", :flag false}
+                   {:flag true}]
+             :types {numeric_value #xt/type [:? :i64]
+                     label #xt/type [:? :utf8]
+                     flag #xt/type [:? :bool]}}
+           (tu/query-ra '[:table {:rows [?record
+                                        {:numeric_value (if false (/ 1 0) (+ ?n 1)),
+                                         :label ?label,
+                                         :flag ?flag}
+                                        {:flag true}]}]
+                        {:args {:record {:numeric-value 12, :label "record"}
+                                :n 7, :label "é", :flag false}
+                         :with-types? true}))))
+
 (t/deftest test-table-stats
   (t/testing "row table stats - should return stats/row-count"
     (t/is (= {:row-count 4}

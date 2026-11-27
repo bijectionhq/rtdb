@@ -14,7 +14,7 @@
            (org.apache.arrow.memory BufferAllocator)
            (org.apache.arrow.vector.types.pojo ArrowType$Union)
            (xtdb.api ICursor)
-           (xtdb.arrow ListExpression Relation RelationReader RelationWriter Vector VectorType VectorWriter)))
+           (xtdb.arrow ListExpression Relation RelationReader RelationWriter Vector VectorType VectorWriter VectorWriterKt)))
 
 (s/def ::output-cols (s/coll-of ::lp/column :kind vector?))
 (s/def ::rows (s/coll-of (s/or :map (s/map-of simple-ident? any?)
@@ -53,7 +53,7 @@
     output-cols (-> (->> (merge (zipmap output-cols (repeat #xt/type :null))))
                     (select-keys output-cols))))
 
-(defn- emit-rows-table [rows table-opts {:keys [param-types schema] :as opts}]
+(defn- emit-rows-table [rows table-opts {:keys [param-types] :as opts}]
   (let [type-sets (HashMap.)
         out-rows (->> rows
                       (mapv (fn [[row-tag row-arg]]
@@ -77,7 +77,8 @@
                                          {:ks ks
                                           :write-row! (fn write-param-row! [{:keys [^RelationReader args]}, ^RelationWriter out-rel]
                                                         (let [param-rdr (.vectorForOrNull args (str row-arg))]
-                                                          (.writeRow out-rel (.getObject param-rdr 0))))})
+                                                          (when-not (.tryCopyStructRow out-rel param-rdr 0)
+                                                            (.writeRow out-rel (.getObject param-rdr 0)))))})
 
                                 :map (let [out-row (->> row-arg
                                                         (into {}
@@ -99,20 +100,12 @@
                                                                                       ^VectorType param-type (get param-types param)]
                                                                                   (.add type-set param-type)
                                                                                   (MapEntry/create k (fn write-param! [{:keys [^RelationReader args]} ^VectorWriter out-col]
-                                                                                                       (.writeObject out-col
-                                                                                                                     (-> (.vectorForOrNull args (str param))
-                                                                                                                         (.getObject 0))))))
+                                                                                                       (VectorWriterKt/writeScalarCell
+                                                                                                        out-col (.vectorForOrNull args (str param)) 0))))
 
-                                                                         ;; HACK: this is quite heavyweight to calculate a single value -
-                                                                         ;; the EE doesn't yet have an efficient means to do so...
-                                                                         (let [input-types (assoc opts :param-types param-types)
-                                                                               expr (expr/form->expr v input-types)
-                                                                               projection-spec (expr/->expression-projection-spec "_scalar" expr input-types)]
-                                                                           (.add type-set (.getType projection-spec))
-                                                                           (MapEntry/create k (fn write-expr! [{:keys [allocator args]} ^VectorWriter out-col]
-                                                                                                (util/with-open [projection (.open projection-spec allocator schema args)
-                                                                                                                 out-vec (.project projection (vr/rel-reader [] 1))]
-                                                                                                  (.writeObject out-col (.getObject out-vec 0))))))))))))]
+                                                                         (let [{:keys [return-type write-cell!]} (expr/->table-cell-writer expr opts)]
+                                                                           (.add type-set return-type)
+                                                                           (MapEntry/create k write-cell!))))))))]
 
                                        {:ks (set (keys out-row))
                                         :write-row! (fn write-row! [opts ^RelationWriter out-rel]

@@ -160,6 +160,7 @@ class StructVector private constructor(
 
     override fun valueReader() = object : RowValueReader {
         val readers = childWriters.mapValues { it.value.valueReader() }
+        private var structRead = false
 
         private val rowCount = valueCount
         override fun hasNext() = pos + 1 < rowCount
@@ -167,12 +168,21 @@ class StructVector private constructor(
         override var pos = -1
             set(value) {
                 field = value
-                if (!isNull) readers.forEach { it.value.pos = value }
+                if (structRead && !isNull) readers.values.forEach { it.pos = value }
             }
 
         override val isNull get() = this@StructVector.isNull(pos)
 
-        override fun readStruct() = readers
+        override fun readField(name: String) =
+            if (pos >= 0 && !isNull) readers[name]?.also { it.pos = pos } else null
+
+        override fun readStruct(): Map<String, ValueReader> {
+            if (!structRead) {
+                structRead = true
+                if (pos >= 0 && !isNull) readers.values.forEach { it.pos = pos }
+            }
+            return readers
+        }
         override fun readObject(keyFn: IKeyFn<*>) = getObject(pos, keyFn)
     }
 

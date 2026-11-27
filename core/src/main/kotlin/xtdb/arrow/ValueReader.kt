@@ -29,6 +29,9 @@ interface ValueReader {
     fun readList(): ListValueReader = unsupported("readList")
     fun readStruct(): Map<String, ValueReader> = unsupported("readStruct")
 
+    /** Reads one child of the positioned, non-null struct. */
+    fun readField(name: String): ValueReader? = readStruct()[name]
+
     class ForVector(private val vec: VectorReader) : RowValueReader {
         override var pos: Int = -1
 
