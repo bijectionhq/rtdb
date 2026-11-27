@@ -2384,7 +2384,9 @@ async fn restoring_the_current_archive_preserves_the_ordered_tail_and_authority(
     assert_eq!(retried_after_return, restored);
     assert!(from.directory.deployment(&id.to_string()).await.unwrap().unwrap().checkpoint_recovery.is_none());
     assert!(from.keys.existing_key(&record.key_id()).await.is_err());
-    assert_eq!(from.keys.existing_key(&active.key_id()).await.unwrap(), to.keys.existing_key(&arrived.key_id()).await.unwrap());
+    let returned_key = from.keys.existing_key(&active.key_id()).await.unwrap().unwrap();
+    let previous_key = to.keys.existing_key(&arrived.key_id()).await.unwrap().unwrap();
+    assert!(returned_key != previous_key, "each cell residence owns an independent key");
     assert!(rtdb_multi::archive::begin_retirement(from.directory.as_ref(), id).await.is_err());
 
     let moved = connect_eventually(&cell, "shop").await;
