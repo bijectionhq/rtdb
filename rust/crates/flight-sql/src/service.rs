@@ -41,11 +41,11 @@ pub(crate) struct Inner {
 }
 
 #[derive(Clone, Copy)]
-enum CallKind { Ordinary, Handshake, Action, OwnedAction, OpenFresh, V1Query, V1Changes, V1Capabilities, V1ExactRead, V1Action, V1CustodyRelease, V1OriginalFamily, V1OriginalFamilyReadback, V1OriginalPrivateReplay, V1Appointment, ManagedCreate, ManagedWorkload, TxStatus, Store }
+enum CallKind { Ordinary, Handshake, Action, OwnedAction, OpenFresh, V1Query, V1Changes, V1Capabilities, V1ExactRead, V1Action, V1CustodyRelease, V1OriginalFamily, V1OriginalFamilyReadback, V1OriginalPrivateReplay, V1Appointment, ManagedCreate, ManagedWorkload, TxStatus, Store, StoreRead }
 
 impl CallKind {
     fn allows_label_scope(self) -> bool {
-        matches!(self, Self::Handshake | Self::V1Query | Self::V1Changes | Self::V1Capabilities | Self::V1Action | Self::Store | Self::V1Appointment | Self::TxStatus)
+        matches!(self, Self::Handshake | Self::V1Query | Self::V1Changes | Self::V1Capabilities | Self::V1Action | Self::Store | Self::StoreRead | Self::V1Appointment | Self::TxStatus)
     }
 
     fn serves_assigned_follower(self) -> bool {
@@ -75,7 +75,7 @@ impl CallKind {
     /// A store grant (a placement fence or a provisioning grant) reaches only
     /// the store contract, whose actions keep it inside its scope.
     fn allows_store_grant(self) -> bool {
-        matches!(self, Self::Handshake | Self::Store)
+        matches!(self, Self::Handshake | Self::Store | Self::StoreRead)
     }
 
     fn allows_funded_appointment(self) -> bool {
@@ -288,7 +288,8 @@ impl Service {
         if retained_proof && !matches!(kind, CallKind::OwnedAction | CallKind::OpenFresh) {
             return Err(classic_retained_refusal());
         }
-        if self.follower_only() && (!kind.serves_assigned_follower()
+        let linked_store_read = matches!(kind, CallKind::StoreRead) && StoreRelease::is_linked();
+        if self.follower_only() && (!(kind.serves_assigned_follower() || linked_store_read)
             || request.metadata().contains_key(FORWARDED_PEER_HEADER)
             || request.metadata().contains_key(crate::GATEWAY_ANSWER_DEADLINE_HEADER))
         {
@@ -296,7 +297,7 @@ impl Service {
         }
         let transport = request.extensions().get::<crate::server::FlightConnectInfo>();
         let is_handshake = matches!(kind, CallKind::Handshake);
-        let store_action = matches!(kind, CallKind::Store);
+        let store_action = matches!(kind, CallKind::Store | CallKind::StoreRead);
         let offers_store_release = request.metadata().contains_key(store_release::HEADER);
         let store_handshake = is_handshake && offers_store_release;
         if store_action && offers_store_release {
@@ -373,7 +374,7 @@ impl Service {
             if store_handshake {
                 return Err(Status::failed_precondition("A store release handshake opens a new Flight session"));
             }
-            if session.fresh_replica && !matches!(kind, CallKind::Action | CallKind::OwnedAction | CallKind::OpenFresh | CallKind::V1Capabilities | CallKind::V1Action | CallKind::Store | CallKind::V1Appointment | CallKind::TxStatus) {
+            if session.fresh_replica && !linked_store_read && !matches!(kind, CallKind::Action | CallKind::OwnedAction | CallKind::OpenFresh | CallKind::V1Capabilities | CallKind::V1Action | CallKind::V1Appointment | CallKind::TxStatus) {
                 return Err(Status::permission_denied("The fresh Flight session carries owned read actions"));
             }
             if let Some(raw) = credentials.raw() {
@@ -704,6 +705,7 @@ impl FlightService for Service {
                 crate::v1::original_family_readback::ACTION => CallKind::V1OriginalFamilyReadback,
                 crate::v1::original_family_landing::private_replay::ACTION => CallKind::V1OriginalPrivateReplay,
                 crate::v1::appointment::PREPARE | crate::v1::appointment::ACTIVATE | "rtdb.v1.Transact" => CallKind::V1Appointment,
+                name if crate::v1::is_store_reader_action(name) => CallKind::StoreRead,
                 name if crate::v1::is_store_action(name) => CallKind::Store,
                 _ => CallKind::V1Action,
             };
@@ -749,7 +751,7 @@ fn classic_retained_refusal() -> Status {
 }
 
 fn follower_refusal() -> Status {
-    Status::permission_denied("The assigned follower serves only native Query and its read actions")
+    Status::permission_denied("The assigned follower does not serve this call")
 }
 
 pub(crate) fn query_ticket(ticket: Bytes, memory: &Arc<MemoryBudget>) -> Result<Bytes, Status> {

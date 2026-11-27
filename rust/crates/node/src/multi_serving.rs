@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use rtdb_crypt::tokens::TokenAuthority;
 use rtdb_db::{ChangeHistory, MultiDatabase, NativeCheckpointInstallation, NativeDependentCarrier, NativeDependentOriginal, PinnedExport, Role, ServingAuthority, WritePipeline};
 use rtdb_index::branches::{BranchCut, BranchEffect, BranchIndex, BranchWrite};
-use rtdb_index::branches::store::sizes::StorageSizes;
+use rtdb_index::branches::store::{StorePage, StoreRead, sizes::StorageSizes};
 use rtdb_tx::transact::{
     CustodyGroupId, CustodyWriterFence, PHYSICAL_ERASURE, ROW_CUSTODY, Receipt, Transact, TrustedCustodyCommand, workload,
 };
@@ -92,6 +92,42 @@ impl MultiFollower {
 
     pub fn supports_ranked_ivf(&self) -> bool {
         self.serving.supports_ranked_ivf()
+    }
+
+    pub async fn read_store(
+        &self, read: StoreRead, at: At, now: Timestamp, cancellation: &CancellationToken,
+    ) -> Result<StorePage> {
+        let (page, generation) = self.serving.serve(async {
+            cancellation.run_until_cancelled(async {
+                let (index, generation) = self.serving.database.lock().await.follower_view(&self.owner)?;
+                require_plain_follower(&index)?;
+                if let At::Exactly(basis) = at {
+                    index.cut(At::AtLeast(basis))?;
+                }
+                let page = index.view(rtdb_types::rtdb_v1::MAIN_BRANCH, at, Layer::Merged, now)?.store_page(&read)?;
+                Ok((page, generation))
+            }).await.ok_or_else(interrupted)?
+        }).await?;
+        self.check_retained_delivery(generation, cancellation).await?;
+        Ok(page)
+    }
+
+    pub async fn store_changes(&self, request: Changes, cancellation: &CancellationToken) -> Result<ChangePage> {
+        if request.branch != rtdb_types::rtdb_v1::MAIN_BRANCH
+            || request.tables.len() != 1
+            || !request.tables.contains(&rtdb_index::branches::store::store_table())
+            || !matches!(request.images, crate::serving::ChangeImages::Keys)
+        {
+            return Err(Anomaly::unsupported("rtdb/follower-source", "A byte-store watch selects keys from the store table"));
+        }
+        {
+            let (index, _) = self.serving.database.lock().await.follower_view(&self.owner)?;
+            require_plain_follower(&index)?;
+        }
+        let page = self.serving.changes(request, cancellation).await?;
+        let generation = page.key_generation.ok_or_else(interrupted)?;
+        self.check_retained_delivery(generation, cancellation).await?;
+        Ok(page)
     }
 
     pub async fn query_ranked_ivf(&self, source: QuerySource, target: &crate::serving::ranked_ivf::Target,
@@ -1479,6 +1515,14 @@ mod tests {
         let second = writer.transact(&write(2, "two", Some(Timestamp(20)))).await.unwrap();
         let cancellation = CancellationToken::new();
         let select = |at, progress| reader.query(at, Timestamp(10), progress, &cancellation);
+        let read = || StoreRead {
+            range: rtdb_index::branches::store::KeyRange { start: Vec::new(), end: None },
+            after: None, limit: 1, projection: rtdb_index::branches::store::Projection::Keys,
+            filter: None, reverse: false,
+        };
+        assert_eq!(reader.read_store(read(), At::Latest, Timestamp(10), &cancellation).await.unwrap().cut.basis, first.basis);
+        assert_eq!(reader.read_store(read(), At::Exactly(second.basis), Timestamp(10), &cancellation).await
+            .err().unwrap().code, "rtdb/basis-ahead");
 
         for selector in [At::AtLeast(second.basis), At::Exactly(second.basis)] {
             assert_eq!(select(selector, false).await.err().unwrap().code, "rtdb/basis-ahead");

@@ -9,6 +9,10 @@ impl StoreRelease {
     // Set from store::CONTRACT_VERSION when derive and rank use the published crate.
     const LINKED: Option<Self> = None;
 
+    pub(crate) fn is_linked() -> bool {
+        Self::LINKED.is_some()
+    }
+
     pub(crate) fn negotiate(headers: &MetadataMap, verified_credential: bool) -> Result<Self, Status> {
         if !verified_credential {
             return Err(Status::unauthenticated("A store release handshake requires verified credentials"));

@@ -94,6 +94,13 @@ async fn a_forwarded_reader_checks_the_release_before_issuing_a_session() {
     assert!(!status.metadata().contains_key("set-cookie"));
     assert!(!status.metadata().contains_key("x-rtdb-store-release"));
     assert_eq!(running.server.status().sessions, 0);
+
+    let mut replica = Client::connect_with_peer(
+        &running.server, Some("xtdb:secret"), Some("application"), Some("fresh-fixture"),
+    ).await;
+    for action in ["rtdb.store.v1.Read", "rtdb.store.v1.Watch", "rtdb.store.v1.Rank", "rtdb.store.v1.Append"] {
+        assert_eq!(replica.action(action, Bytes::new()).await.unwrap_err().code(), tonic::Code::PermissionDenied);
+    }
     running.stop().await;
 }
 

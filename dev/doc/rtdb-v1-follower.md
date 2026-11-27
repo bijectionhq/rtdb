@@ -91,6 +91,7 @@ The bound address identifies the transport, while a successful authenticated pro
 The worker can pass that endpoint, the TLS trust and the Basic credential to `native_store_runtime::rtdb::FollowerRoute::plain_multi`.
 Send exactly one `x-xtdb-database` header on each call with the value `NAME@INCARNATION`, where the incarnation is 32 lowercase hex digits without hyphens.
 The listener admits authenticated Flight handshake, `rtdb.v1.Capabilities`, the exact scope actions and Query DoGet.
+With a linked Store release, a verified handshake that agrees on that release also admits `rtdb.store.v1.Read`, `Watch` and `Rank` for the assigned database.
 Capabilities advertises `query`, `query.track`, `query.page`, `query.applied-position`, `query.follower-progress` and `query.exact-scope`.
 Transact, including effect-free validation, TxStatus, Changes, ordinary Flight SQL, administration, custody operations and other Flight actions are refused at dispatch.
 Forwarded peer headers cannot admit a call on this listener, and the legacy fresh-replica proxy keeps its existing Query refusal.

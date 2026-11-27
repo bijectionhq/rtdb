@@ -27,7 +27,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use prost::Message;
 use rtdb_index::branches::store::{
-    DERIVE_DIGEST, KeyRange, MAX_PAGE_ENTRIES, Projection, StoreBound, StoreRead, StoreWrite, ValueFilter, check_bounds,
+    DERIVE_DIGEST, KeyRange, MAX_PAGE_ENTRIES, Projection, StoreBound, StorePage, StoreRead, StoreWrite, ValueFilter, check_bounds,
     check_derives, check_placeholders, store_table,
 };
 use rtdb_node::{DatabaseAccess, serving::{ChangeImages, ChangeOrder, Changes}};
@@ -69,6 +69,7 @@ pub(crate) fn check_rank_digest() -> rtdb_types::Result<()> {
 /// The store's ordered entries as the ranges `store_read` reads: each read
 /// takes one cut, selected by its first range, as `Read` does.
 struct StoreRanges<'a> {
+    service: &'a Service,
     driver: &'a dyn rtdb_node::serving::ServingDriver,
     scope: Option<&'a StoreScope>,
     incarnation: [u8; 16],
@@ -93,7 +94,7 @@ impl store_read::source::RangeSource for StoreRanges<'_> {
             for range in read_ranges {
                 let after = read.after.clone().filter(|after| range.contains(after));
                 let request = StoreRead { range, after, limit, projection: Projection::Values, filter: None, reverse: false };
-                let page = self.driver.read_store(request, at, self.now, self.cancellation).await.map_err(error::anomaly)?;
+                let page = self.service.read_store_page(self.driver, request, at, self.now, self.cancellation).await?;
                 at = At::Exactly(page.cut.basis);
                 read_at = Some(page.cut.basis.position());
                 pages.push(store_read::source::RangePage {
@@ -166,7 +167,16 @@ impl Service {
         if call.session.caller.principal.label_scope().is_some() {
             return Err(error::unsupported("rtdb.store.v1 on a scoped route"));
         }
-        let database = self.wire_attachment(call, access).await?;
+        let database = if self.follower_only() || call.session.fresh_replica {
+            if call.session.store_release.is_none() || !matches!(access, DatabaseAccess::Read) {
+                return Err(error::unsupported("rtdb.v1.route"));
+            }
+            call.session.caller.principal.authorize_database(&call.database, access).map_err(error::anomaly)?;
+            let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
+            attachment.ok_or_else(|| error::unsupported("rtdb.v1.route"))?
+        } else {
+            self.wire_attachment(call, access).await?
+        };
         let driver = database.serving_driver().ok_or_else(|| error::unsupported("rtdb.store.v1"))?;
         let current = driver.incarnation();
         let scope = match call.session.caller.principal.workload_grant().filter(|grant| grant.is_store_grant()) {
@@ -179,6 +189,17 @@ impl Service {
             return Err(Status::failed_precondition("The store incarnation changed"));
         }
         Ok((database, current, scope))
+    }
+
+    async fn read_store_page(
+        &self, driver: &dyn rtdb_node::serving::ServingDriver, read: StoreRead, at: At, now: Timestamp,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<StorePage, Status> {
+        #[cfg(feature = "multi")]
+        if let Some(follower) = self.follower() {
+            return follower.reader.read_store(read, at, now, cancellation).await.map_err(error::follower);
+        }
+        driver.read_store(read, at, now, cancellation).await.map_err(error::anomaly)
     }
 
     async fn store_read(&self, call: &Call, request: proto::ReadRequest) -> Result<Vec<u8>, Status> {
@@ -211,7 +232,7 @@ impl Service {
         for key_range in read_ranges {
             let after = request.after.clone().filter(|after| key_range.contains(after));
             let read = StoreRead { range: key_range, after, limit, projection, filter: filter.clone(), reverse: request.reverse };
-            let page = driver.read_store(read, at, clock, &call.cancellation).await.map_err(error::anomaly)?;
+            let page = self.read_store_page(driver, read, at, clock, &call.cancellation).await?;
             // Every later range reads the cut the first one selected.
             at = At::Exactly(page.cut.basis);
             read_at = Some(page.cut.basis.position());
@@ -336,7 +357,7 @@ impl Service {
         let mut after = Basis::new(incarnation, request.after);
         let touched = loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let page = driver.changes(Changes {
+            let request = Changes {
                 branch: MAIN_BRANCH.into(),
                 tables: [store_table()].into(),
                 after: Some(after),
@@ -345,7 +366,15 @@ impl Service {
                 images: ChangeImages::Keys,
                 limit: MAX_CHANGE_GROUPS as usize,
                 wait: remaining,
-            }, &call.cancellation).await.map_err(error::anomaly)?;
+            };
+            #[cfg(feature = "multi")]
+            let page = if let Some(follower) = self.follower() {
+                follower.reader.store_changes(request, &call.cancellation).await.map_err(error::follower)?
+            } else {
+                driver.changes(request, &call.cancellation).await.map_err(error::anomaly)?
+            };
+            #[cfg(not(feature = "multi"))]
+            let page = driver.changes(request, &call.cancellation).await.map_err(error::anomaly)?;
             let hit = page.groups.iter().find(|group| group.rows.iter().any(|row| match &row.id {
                 EntityId::Binary(key) => watched.iter().any(|range| range.contains(key)),
                 _ => false,
@@ -375,7 +404,7 @@ impl Service {
         let program = store_read::rank::RankRequest::decode(&request.program).map_err(|refused| error::incorrect(&refused.to_string()))?;
         let (database, incarnation, scope) = self.store_database(call, DatabaseAccess::Read, Some(&request.incarnation)).await?;
         let driver = database.serving_driver().ok_or_else(|| error::unsupported("rtdb.store.v1"))?;
-        let source = StoreRanges { driver, scope, incarnation, now: self.0.node.now(), cancellation: &call.cancellation };
+        let source = StoreRanges { service: self, driver, scope, incarnation, now: self.0.node.now(), cancellation: &call.cancellation };
         let reply = store_read::rank::rank(&source, program).await.map_err(|refused| {
             let refused = match refused.downcast::<Status>() {
                 Ok(status) => return status,

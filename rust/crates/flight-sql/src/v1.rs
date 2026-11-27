@@ -94,6 +94,10 @@ pub(crate) fn is_store_action(name: &str) -> bool {
     store::ACTIONS.contains(&name)
 }
 
+pub(crate) fn is_store_reader_action(name: &str) -> bool {
+    matches!(name, store::READ | store::WATCH | store::RANK)
+}
+
 pub(crate) fn is_action(name: &str) -> bool {
     ACTIONS.contains(&name) || store::ACTIONS.contains(&name) || name == custody::RELEASE || name == scoped_hold::ACTION || name == original_family_landing::ACTION || name == original_family_readback::ACTION || name == original_family_landing::private_replay::ACTION || name.starts_with("rtdb.admin.v1.")
 }
@@ -643,6 +647,14 @@ fn trailer(message: impl Message) -> FlightData {
 #[cfg(test)]
 mod store_only_tests {
     use super::*;
+
+    #[test]
+    fn release_checked_readers_admit_only_read_watch_and_rank() {
+        let actions = store::ACTIONS.into_iter()
+            .filter(|name| is_store_reader_action(name))
+            .collect::<Vec<_>>();
+        assert_eq!(actions, [store::READ, store::WATCH, store::RANK]);
+    }
 
     #[test]
     fn a_store_only_listener_admits_the_store_and_administration_alone() {
