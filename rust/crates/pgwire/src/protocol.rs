@@ -383,7 +383,21 @@ impl ProtocolSession {
             b'D' => {
                 let kind = input.byte()?; let name = input.string()?; input.end()?;
                 match kind {
-                    b'S' => { if let Some(statement) = self.statements.get(name) { let statement = &statement.prepared; if !matches!(statement.ordinary_kind(), Some(PreparedKind::Empty | PreparedKind::Keywords)) { writer.parameters(&statement.oids).await?; } Self::description(statement.columns.as_deref(), self.fallback(), writer).await?; } else { writer.empty(b'n').await?; } },
+                    b'S' => {
+                        if let Some(statement) = self.statements.get(name) {
+                            let statement = &statement.prepared;
+                            if !matches!(statement.ordinary_kind(), Some(PreparedKind::Empty | PreparedKind::Keywords)) {
+                                writer.parameters(&statement.oids).await?;
+                            }
+                            let columns = match statement.control() {
+                                Some(ControlStatement::Execute { name, .. }) => self.statements.get(name).and_then(|inner| inner.prepared.columns.as_deref()),
+                                _ => statement.columns.as_deref(),
+                            };
+                            Self::description(columns, self.fallback(), writer).await?;
+                        } else {
+                            writer.empty(b'n').await?;
+                        }
+                    },
                     b'P' => Self::description(self.portals.get(name).and_then(|portal| portal.columns.as_deref()), self.fallback(), writer).await?,
                     _ => return Err(protocol("Invalid describe target")),
                 }
@@ -480,7 +494,7 @@ impl ProtocolSession {
             .map_err(|error| extended_syntax_error(source, original, error, self.node.memory()))? {
             match control.statement() {
                 ControlStatement::CopyOut { query, format } => self.prepare_copy_out(query, *format, options, &oids, settings).await?,
-                _ => self.execute_columns(control_shape(PreparedControl::Extended(control), oids.len())?),
+                _ => control_shape(PreparedControl::Extended(control), oids.len())?,
             }
         } else {
             let context = self.session.prepare_context_with_timezone(settings.map(|settings| settings.timezone), &self.token()).await?;
@@ -501,7 +515,7 @@ impl ProtocolSession {
             ExecutableSyntax::FrontendResponse(_) => keyword_shape(),
             ExecutableSyntax::Control(control) => match control.bind(&options)? {
                 ControlStatement::CopyOut { query, format } => self.prepare_copy_out(&query, format, options, &[], settings).await?,
-                control => self.execute_columns(control_shape(PreparedControl::Batch(control), 0)?),
+                control => control_shape(PreparedControl::Batch(control), 0)?,
             },
             ExecutableSyntax::Sql(syntax) => {
                 let context = self.session.prepare_context_with_timezone(settings.map(|settings| settings.timezone), &self.token()).await?;
@@ -644,13 +658,6 @@ impl ProtocolSession {
         Ok(portal)
         }).await
     }
-    /// An EXECUTE describes the rows of the statement it names, as that statement is prepared when the EXECUTE is.
-    fn execute_columns(&self, mut shape: PreparedShape) -> PreparedShape {
-        if let PreparedKind::Control(control) = &shape.kind && let ControlStatement::Execute { name, .. } = control.statement() {
-            shape.columns = self.statements.get(name).and_then(|statement| statement.prepared.columns.clone());
-        }
-        shape
-    }
     fn control_options(&self) -> ControlExecutionOptions { ControlExecutionOptions { frontend: ControlFrontend::PostgreSql, implicit_transaction: self.implicit } }
     fn record_transaction_error(&self) { if let Some(observer) = self.node.execution_observer() { observer.record_error(rtdb_plan::ExecutionError::Transaction); } }
     async fn description<W: AsyncWrite + Unpin>(columns: Option<&[Column]>, fallback: PgType, writer: &mut Writer<W>) -> Result<()> { match columns { Some(columns) => writer.columns(columns, fallback).await, None => writer.empty(b'n').await } }
@@ -671,6 +678,8 @@ impl ProtocolSession {
             (PreparedKind::Query(_), _) | (PreparedKind::Control(_), Some(ControlStatement::Show { .. } | ControlStatement::ShowTransactionIsolationLevel)) => {
                 if matches!(kind, PreparedKind::Query(_)) {
                     if self.session.state().is_read_write() && !is_type_probe(source) { return Err(Anomaly::incorrect("xtdb/queries-in-read-write-tx", "Queries are unsupported in a DML transaction").with_context("query", source.into())); }
+                    self.begin_implicit(Some(true))?;
+                } else if control.is_some_and(ControlStatement::requires_read_transaction) {
                     self.begin_implicit(Some(true))?;
                 }
                 let token = portal.cancellation.clone(); let _active = self.cancellations.enter(&token);

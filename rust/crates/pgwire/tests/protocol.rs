@@ -2057,3 +2057,50 @@ async fn startup_sends_default_application_name_before_server_parameters() {
     drop((default_client, custom_client));
     running.stop().await;
 }
+
+#[tokio::test]
+async fn describe_on_extended_execute_reads_the_current_prepared_statement() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+
+    client.parse("exec_stmt", "EXECUTE target ($1)", &[20]).await;
+    let mut describe = vec![b'S'];
+    describe.extend_from_slice(&cstring("exec_stmt"));
+    client.send(b'D', &describe).await;
+    client.send(b'S', &[]).await;
+    let before = client.through(b'Z').await;
+    assert_eq!(tags(&before), b"1tnZ");
+
+    assert_eq!(tags(&client.query("PREPARE target AS SELECT $1::bigint AS first_col").await), b"CZ");
+    client.send(b'D', &describe).await;
+    client.send(b'S', &[]).await;
+    let first = client.through(b'Z').await;
+    assert_eq!(tags(&first), b"tTZ");
+    assert!(first[1].1.windows(9).any(|name| name == b"first_col"));
+
+    assert_eq!(tags(&client.query("PREPARE target AS SELECT $1::bigint AS second_col").await), b"CZ");
+    client.send(b'D', &describe).await;
+    client.send(b'S', &[]).await;
+    let second = client.through(b'Z').await;
+    assert_eq!(tags(&second), b"tTZ");
+    assert!(second[1].1.windows(10).any(|name| name == b"second_col"));
+    assert!(!second[1].1.windows(9).any(|name| name == b"first_col"));
+
+    for (stmt, sql, expected) in [
+        ("tz_stmt", "SHOW TIME ZONE", b"UTC".as_slice()),
+        ("iso_stmt", "SHOW TRANSACTION ISOLATION LEVEL", b"read committed".as_slice()),
+    ] {
+        client.parse(stmt, sql, &[]).await;
+        for _ in 0..2 {
+            client.bind("reused_portal", stmt).await;
+            client.execute("reused_portal", 0).await;
+            client.send(b'S', &[]).await;
+            let frames = client.through(b'Z').await;
+            assert!(tags(&frames).ends_with(b"2DCZ"), "{stmt}: {frames:?}");
+            assert_eq!(rows(&frames), [vec![Some(expected.to_vec())]]);
+        }
+    }
+
+    drop(client);
+    running.stop().await;
+}
