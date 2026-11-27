@@ -140,6 +140,14 @@ impl BranchIndex {
         })
     }
 
+    pub(super) fn has_custody_group(&self, group: CustodyGroupId) -> bool {
+        self.custody.contains_key(&group)
+    }
+
+    pub(super) fn has_live_custody_group(&self, group: CustodyGroupId) -> bool {
+        self.custody.get(&group).is_some_and(|group| group.revoked.is_none())
+    }
+
     pub(super) fn live_custody(&self, group: CustodyGroupId) -> Result<&CustodyGroup> {
         if !self.custody_group_live(group)? {
             return Err(Anomaly::new(AnomalyCategory::NotFound, "rtdb/erased-under-view", "The custody group has been revoked"));

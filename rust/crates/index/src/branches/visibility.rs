@@ -163,8 +163,10 @@ impl BranchIndex {
                     (old != Some(new)).then_some((table, old, new))
                 })
                 .collect::<Vec<_>>();
+            // The projected index only creates custody groups referenced by rows visible to this scope,
+            // so a revocation on main for an unprojected group is absent here.
             let revocations = touched.revocations.into_iter().filter(|group| {
-                index.custody_group_live(*group).unwrap_or(false)
+                index.has_live_custody_group(*group)
             }).collect::<Vec<_>>();
             previous = current;
             if rows.is_empty() && declarations.is_empty() && revocations.is_empty() && erasures.is_empty() {
@@ -203,7 +205,7 @@ impl BranchIndex {
                     continue;
                 }
                 if let Some(group) = row.after.as_ref().and_then(|image| image.custody_group)
-                    && index.custody_group_live(group).is_err()
+                    && !index.has_custody_group(group)
                 {
                     index.create_custody_group(group)?;
                 }
