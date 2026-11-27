@@ -108,6 +108,14 @@ impl BloomFilter {
         positions.iter().all(|&position| self.bitmap.contains(position))
     }
 
+    pub fn contains_serialized_positions(bytes: &[u8], positions: &[u32; BLOOM_K as usize]) -> Result<bool> {
+        match probe_serialized(bytes, positions) {
+            Some(matches) => Ok(matches),
+            // The checked decoder reads bodies in sequence and derives run cardinality from the intervals.
+            None => Ok(Self::from_bytes(bytes)?.contains_positions(positions)),
+        }
+    }
+
     pub fn contains_cell(&self, field: &Field, array: &dyn Array, row: usize) -> Result<bool> {
         let (first, second) = cell_hashes(field, array, row)?.unwrap_or((0, 0));
         Ok(self.contains_hashes(first, second))
@@ -126,6 +134,118 @@ impl BloomFilter {
 
     pub fn intersects(&self, other: &Self) -> bool { !self.bitmap.is_disjoint(&other.bitmap) }
     pub fn cardinality(&self) -> u64 { self.bitmap.len() }
+}
+
+fn probe_serialized(bytes: &[u8], positions: &[u32; BLOOM_K as usize]) -> Option<bool> {
+    const NO_RUN_COOKIE: u32 = 12346;
+    const RUN_COOKIE: u16 = 12347;
+    const NO_OFFSET_THRESHOLD: usize = 4;
+
+    let (cookie, mut body) = bytes.split_first_chunk::<4>()?;
+    let cookie = u32::from_le_bytes(*cookie);
+    let (count, run_flags) = match cookie {
+        NO_RUN_COOKIE => (
+            u32::from_le_bytes(take(&mut body, 4)?.try_into().ok()?) as usize,
+            &[][..],
+        ),
+        cookie if cookie as u16 == RUN_COOKIE => {
+            let count = (cookie >> 16) as usize + 1;
+            (count, take(&mut body, count.div_ceil(8))?)
+        }
+        _ => return None,
+    };
+    if count > usize::from(u16::MAX) + 1 {
+        return None;
+    }
+    let descriptions = take(&mut body, 4 * count)?.as_chunks::<4>().0;
+    let offsets = if run_flags.is_empty() || count >= NO_OFFSET_THRESHOLD {
+        take(&mut body, 4 * count)?.as_chunks::<4>().0
+    } else {
+        &[]
+    };
+
+    let mut matched = 0;
+    let mut previous_key = None;
+    for (index, &[key_lo, key_hi, card_lo, card_hi]) in descriptions.iter().enumerate() {
+        let key = u16::from_le_bytes([key_lo, key_hi]);
+        if previous_key.replace(key).is_some_and(|previous| previous >= key) {
+            return None;
+        }
+        if let Some(offset) = offsets.get(index)
+            && u32::from_le_bytes(*offset) as usize != bytes.len() - body.len()
+        {
+            return None;
+        }
+        let cardinality = usize::from(u16::from_le_bytes([card_lo, card_hi])) + 1;
+        let is_run = run_flags.get(index / 8).is_some_and(|&flags| flags & (1 << (index % 8)) != 0);
+        let container = SerializedContainer::read(&mut body, cardinality, is_run)?;
+        matched += positions.iter()
+            .filter(|&&position| (position >> 16) as u16 == key && container.contains(position as u16))
+            .count();
+    }
+    body.is_empty().then_some(matched == positions.len())
+}
+
+fn take<'a>(bytes: &mut &'a [u8], len: usize) -> Option<&'a [u8]> {
+    let (prefix, suffix) = bytes.split_at_checked(len)?;
+    *bytes = suffix;
+    Some(prefix)
+}
+
+enum SerializedContainer<'a> {
+    Array(&'a [[u8; 2]]),
+    Bitmap(&'a [u8]),
+    Run(&'a [[u8; 4]]),
+}
+
+impl<'a> SerializedContainer<'a> {
+    fn read(body: &mut &'a [u8], cardinality: usize, is_run: bool) -> Option<Self> {
+        if is_run {
+            let count = usize::from(u16::from_le_bytes(take(body, 2)?.try_into().ok()?));
+            if count == 0 {
+                return None;
+            }
+            let runs = take(body, 4 * count)?.as_chunks::<4>().0;
+            let mut previous_end: Option<u16> = None;
+            let mut bits = 0;
+            for &[start_lo, start_hi, len_lo, len_hi] in runs {
+                let start = u16::from_le_bytes([start_lo, start_hi]);
+                let length_minus_one = u16::from_le_bytes([len_lo, len_hi]);
+                let end = start.checked_add(length_minus_one)?;
+                if previous_end.replace(end).is_some_and(|previous| start <= previous.saturating_add(1)) {
+                    return None;
+                }
+                bits += usize::from(length_minus_one) + 1;
+            }
+            (bits == cardinality).then_some(Self::Run(runs))
+        } else if cardinality <= 4096 {
+            let values = take(body, 2 * cardinality)?.as_chunks::<2>().0;
+            values.windows(2)
+                .all(|pair| u16::from_le_bytes(pair[0]) < u16::from_le_bytes(pair[1]))
+                .then_some(Self::Array(values))
+        } else {
+            let bitmap = take(body, 8192)?;
+            let bits: usize = bitmap.as_chunks::<8>().0.iter()
+                .map(|word| u64::from_le_bytes(*word).count_ones() as usize)
+                .sum();
+            (bits == cardinality).then_some(Self::Bitmap(bitmap))
+        }
+    }
+
+    fn contains(&self, low: u16) -> bool {
+        match self {
+            Self::Array(values) => values.binary_search_by_key(&low, |value| u16::from_le_bytes(*value)).is_ok(),
+            Self::Bitmap(bytes) => bytes[usize::from(low) / 8] & (1 << (low % 8)) != 0,
+            Self::Run(runs) => {
+                let index = runs.partition_point(|&[lo, hi, _, _]| u16::from_le_bytes([lo, hi]) <= low);
+                if index == 0 {
+                    return false;
+                }
+                let [start_lo, start_hi, len_lo, len_hi] = runs[index - 1];
+                low - u16::from_le_bytes([start_lo, start_hi]) <= u16::from_le_bytes([len_lo, len_hi])
+            }
+        }
+    }
 }
 
 fn cell_hashes(field: &Field, array: &dyn Array, row: usize) -> Result<Option<(i32, i32)>> {
@@ -213,7 +333,92 @@ fn invalid(error: impl std::fmt::Display) -> Anomaly {
 
 #[cfg(test)]
 mod bulk_tests {
-    use super::*;
+    use arrow_schema::Field;
+    use roaring::RoaringBitmap;
+    use rtdb_types::{LogicalType, Value};
+    use super::{BloomFilter, byte_hashes, probe_serialized};
+
+    #[test]
+    fn borrowed_probes_match_owned_probes_across_portable_layouts() {
+        let mut bitmap: RoaringBitmap = [7, 65_535].into_iter()
+            .chain((65_536..=73_728).step_by(2))
+            .chain(131_072..196_608)
+            .chain(196_623..196_628)
+            .chain(196_631..196_635)
+            .collect();
+        let mut plain = vec![0];
+        bitmap.serialize_into(&mut plain).unwrap();
+        assert_eq!(&plain[1..5], &[58, 48, 0, 0]);
+        assert!(bitmap.optimize());
+        let mut mixed = vec![0];
+        bitmap.serialize_into(&mut mixed).unwrap();
+        assert_eq!(&mixed[1..6], &[59, 48, 3, 0, 0b1100]);
+
+        for bytes in [&plain[1..], &mixed[1..]] {
+            let owned = BloomFilter::from_bytes(bytes).unwrap();
+            for (positions, expected) in [
+                ([65_535, 73_728, 196_607, 196_623, 196_634], true),
+                ([65_536; 5], true),
+                ([65_537; 5], false),
+                ([7, 73_728, 196_607, 196_622, 196_634], false),
+                ([7, 73_728, 196_607, 196_629, 196_634], false),
+                ([7, 73_728, 196_607, 196_623, 196_635], false),
+                ([u32::MAX; 5], false),
+            ] {
+                assert_eq!(probe_serialized(bytes, &positions), Some(expected), "{positions:?}");
+                assert_eq!(owned.contains_positions(&positions), expected);
+            }
+        }
+
+        let empty = [58, 48, 0, 0, 0, 0, 0, 0];
+        let run_without_offsets = [59, 48, 0, 0, 1, 3, 0, 4, 0, 1, 0, 2, 0, 4, 0];
+        assert_eq!(probe_serialized(&empty, &[0; 5]), Some(false));
+        assert_eq!(
+            probe_serialized(&run_without_offsets, &[196_610, 196_611, 196_612, 196_613, 196_614]),
+            Some(true),
+        );
+        assert_eq!(probe_serialized(&run_without_offsets, &[196_615; 5]), Some(false));
+    }
+
+    #[test]
+    fn borrowed_probes_preserve_checked_errors_even_for_a_missing_key() {
+        let bitmap: RoaringBitmap = (0..=8192).step_by(2).collect();
+        let mut wrong_bit_count = Vec::new();
+        bitmap.serialize_into(&mut wrong_bit_count).unwrap();
+        wrong_bit_count[16] ^= 1;
+        let duplicate_lows = [58, 48, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 16, 0, 0, 0, 5, 0, 5, 0];
+        let duplicate_keys = [
+            58, 48, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 24, 0, 0, 0, 26, 0, 0, 0, 1, 0, 2, 0,
+        ];
+        let overlapping_runs = [59, 48, 0, 0, 1, 0, 0, 4, 0, 2, 0, 2, 0, 2, 0, 4, 0, 1, 0];
+        let overflowing_run = [59, 48, 0, 0, 1, 0, 0, 1, 0, 1, 0, 255, 255, 1, 0];
+        let truncated_offset_table = [58, 48, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0];
+        let probe = [u32::MAX; 5];
+        for bytes in [
+            wrong_bit_count.as_slice(), &duplicate_lows, &duplicate_keys, &overlapping_runs, &overflowing_run,
+            &truncated_offset_table,
+        ] {
+            assert_eq!(probe_serialized(bytes, &probe), None);
+            assert_eq!(
+                BloomFilter::contains_serialized_positions(bytes, &probe).unwrap_err(),
+                BloomFilter::from_bytes(bytes).unwrap_err(),
+            );
+        }
+    }
+
+    #[test]
+    fn noncanonical_headers_use_the_existing_sequential_decoder() {
+        let mut bitmap = BloomFilter::default();
+        bitmap.insert_sorted_positions([1, 65_538]);
+        let mut wrong_offset = bitmap.to_bytes().unwrap();
+        wrong_offset[16..20].copy_from_slice(&26u32.to_le_bytes());
+        let wrong_run_cardinality = [59, 48, 0, 0, 1, 0, 0, 0, 0, 1, 0, 1, 0, 4, 0];
+        for bytes in [wrong_offset.as_slice(), &wrong_run_cardinality] {
+            let positions = [1; 5];
+            assert_eq!(probe_serialized(bytes, &positions), None);
+            assert!(BloomFilter::contains_serialized_positions(bytes, &positions).unwrap());
+        }
+    }
 
     #[test]
     fn metadata_bloom_cells_hash_active_byte_legs_and_nulls() {

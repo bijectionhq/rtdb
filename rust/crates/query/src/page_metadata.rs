@@ -102,7 +102,7 @@ impl PageTest {
             Self::Bloom { column: name, positions } => match columns.root_column(name) {
                 None => false,
                 Some(column) => match column.bloom() {
-                    Some(bytes) => BloomFilter::from_bytes(bytes)?.contains_positions(positions),
+                    Some(bytes) => BloomFilter::contains_serialized_positions(bytes, positions)?,
                     _ => true,
                 },
             },
@@ -194,7 +194,12 @@ mod tests {
         ).unwrap();
         let mut trailing = BloomFilter::default().to_bytes().unwrap();
         trailing.push(0);
-        for bytes in [vec![0], trailing] {
+        let mut bloom = BloomFilter::default();
+        bloom.insert_sorted_positions([0, 65_536, 65_793]);
+        let mut duplicate_in_last_container = bloom.to_bytes().unwrap();
+        let last_low = duplicate_in_last_container.len() - 2;
+        duplicate_in_last_container[last_low..].copy_from_slice(&0u16.to_le_bytes());
+        for bytes in [vec![0], trailing, duplicate_in_last_container] {
             let page = LeafColumns::new(vec![
                 byte_statistics("unfiltered", None),
                 byte_statistics("payload", Some(bytes)),
