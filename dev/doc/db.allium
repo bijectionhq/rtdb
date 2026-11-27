@@ -915,6 +915,7 @@ config {
 -- An admitted upload after a recovered boundary in the configured replica epoch confirms its checkpoint when the block index, storage version and epoch, source watermark, and external token match its recorded identity.
 -- An omitted upload storage epoch means zero.
 -- A writable restart also checks contiguous retained older catalogs whose replica history admits the exact selected boundary with a compatible fence.
+-- An admitted unrecognized body invalidates the historical witness used to repair older confirmations.
 -- If opening the historical tail reports that its first requested position precedes the retained log, the writer tries the next newer retained catalog when one exists.
 -- For a positive-term selected boundary without a sequence, a same-term unsequenced witness satisfies an unknown startup position.
 -- Ordinary replica replay uses the fence seeded from the selected checkpoint.
@@ -1000,7 +1001,7 @@ config {
 -- Missing outcomes from a frozen checkpoint remain retryable.
 -- Snapshots captured before the advance retain their original cut.
 -- Exact and restored recovery modes and checkpoints without a matching journal boundary leave the cut unavailable.
--- An unrecognized replica body marks its position applied and stops further prefix advances and promotion on that open partition.
+-- An admitted unrecognized replica body consumes its position and stops installed-prefix publication and promotion on that open partition.
 -- A compactor reset prepares its primary inventory from the adopted checkpoint or rebuilds it from a retained checkpoint and the held journal.
 -- It publishes the replacement compacted files under fresh names before submitting the reset against the captured block and catalog.
 -- The driver suspends new cuts until it adopts the replacement checkpoint.

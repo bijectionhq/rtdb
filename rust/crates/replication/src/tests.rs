@@ -81,6 +81,13 @@ fn raw(position: i64, term: i64, sequence: i64, body: ReplicaBody) -> LogRecord 
     LogRecord::new(LogMetadata { offset: LogOffset(position), timestamp: Timestamp(position * 100 + 1) },
         ReplicaEnvelope { term: Term(term), term_sequence: Some(TermSequence(sequence)), message: body }.encode().into())
 }
+fn unrecognized_replica_frame(term: u8, sequence: u8, unknown_field: bool) -> Bytes {
+    let mut frame = vec![rtdb_format::PROTOBUF_LOG_HEADER, 7 << 3, term, 9 << 3, sequence];
+    if unknown_field { frame.extend([15 << 3 | 2, 0]); }
+    let frame = Bytes::from(frame);
+    assert!(ReplicaEnvelope::decode(&frame).unwrap().is_none());
+    frame
+}
 fn boundary(index: i64, source: i64) -> ReplicaBody { ReplicaBody::BlockBoundary(proto::BlockBoundary { block_index: Some(index), latest_processed_msg_id: Some(source), external_source_token: None }) }
 fn resolved(id: i64, source: i64) -> ReplicaBody { ReplicaBody::ResolvedTx(proto::ResolvedTx { tx_id: Some(id), system_time_micros: Some(id * 100 + 100), committed: Some(true), src_msg_id: Some(source), ..Default::default() }) }
 fn upload(index: i64, source: i64) -> ReplicaBody {
@@ -387,18 +394,37 @@ async fn catalog_cut_tracks_the_captured_catalog_after_a_pending_block_drains() 
 
 #[tokio::test]
 async fn catalog_cut_cannot_cross_an_unrecognized_replica_body() {
-    let mut fixture = fixture(ReplicationConfig { may_lead: false, ..Default::default() }, 1 << 27).await;
+    let mut fixture = fixture(ReplicationConfig::default(), 1 << 27).await;
     let partition = Arc::clone(&fixture.driver.partition);
     fixture.driver.consume(raw(0, 1, 0, resolved(0, 0))).await.unwrap();
     let mut unknown = raw(1, 1, 1, resolved(1, 1));
-    unknown.payload = unknown.payload.slice(..1);
+    unknown.payload = unrecognized_replica_frame(1, 1, true);
     fixture.driver.consume(unknown).await.unwrap();
-    fixture.driver.consume(raw(2, 1, 1, resolved(2, 2))).await.unwrap();
+    fixture.driver.consume(raw(2, 1, 2, resolved(2, 2))).await.unwrap();
 
     assert_eq!(fixture.handle.status().replica_position, ReplicaPosition(2));
     assert_eq!(fixture.handle.status().installed.map(|prefix| prefix.replica), Some(ReplicaPosition(0)));
     assert_eq!(partition.snapshot().tx_basis().unwrap().tx_id, TxId(2));
     assert_eq!(partition.snapshot().catalog_cut().unwrap().through, ReplicaPosition(0));
+    fixture.driver.lead_after_empty_read(0).await.unwrap();
+    assert!(fixture.driver.claiming.is_none());
+}
+
+#[tokio::test]
+async fn a_durable_claim_cannot_promote_after_an_unrecognized_same_term_record() {
+    let mut fixture = fixture(ReplicationConfig::default(), 1 << 27).await;
+    fixture.driver.claiming = Some(super::Claim { term: Term(1), observed: None, future: Box::pin(futures::future::pending()) });
+    fixture.driver.consume(raw(0, 1, 0, ReplicaBody::NoOp(proto::NoOp::default()))).await.unwrap();
+    let position = ReplicaPosition(0);
+    assert_eq!(fixture.driver.claiming.as_ref().unwrap().observed, Some(position));
+    let mut unknown = raw(1, 1, 1, resolved(1, 1));
+    unknown.payload = unrecognized_replica_frame(1, 1, true);
+    fixture.driver.consume(unknown).await.unwrap();
+
+    fixture.driver.claim_finished(Ok(crate::ReplicaMetadata { position, timestamp: Timestamp(1) })).await.unwrap();
+
+    assert_eq!(fixture.handle.status().role, Role::Following);
+    assert!(fixture.driver.leader.is_none());
 }
 
 #[tokio::test]
@@ -2193,6 +2219,30 @@ async fn historical_confirmation_recovers_an_older_block_at_a_legacy_selected_bo
 }
 
 #[tokio::test]
+async fn historical_block_confirmation_requires_a_recognized_admitted_prefix() {
+    for (term, expected_confirmations) in [(1, Some(1)), (2, None)] {
+        let fixture = produced_memory_checkpoint(true).await;
+        let (_, mut prior) = reopen_memory_checkpoint_with_config(&fixture, ReplicationConfig {
+            may_lead: false, ..Default::default()
+        }).await;
+        let payload = unrecognized_replica_frame(term, 0, true);
+        let metadata = fixture.replica.enqueue(payload.clone(), Timestamp(1)).await.unwrap().durable().await.unwrap();
+        prior.consume(LogRecord::new(metadata, payload)).await.unwrap();
+        deliver_checkpoint_record(&fixture, &mut prior, 3, 0, ReplicaBody::NoOp(proto::NoOp::default())).await.unwrap();
+        deliver_checkpoint_record(&fixture, &mut prior, 3, 1, boundary(1, -1)).await.unwrap();
+        let pending = prior.pending_block.as_ref().unwrap();
+        prior.blocks.produce(&pending.prepared, &pending.boundary, BTreeMap::new()).await.unwrap();
+
+        let (_, mut reopened) = reopen_memory_checkpoint(&fixture).await;
+        let history = reopened.prove_historical_confirmations().await;
+        match expected_confirmations {
+            Some(count) => assert_eq!(history.unwrap().len(), count),
+            None => assert_eq!(history.err().unwrap(), super::invalid("Historical replica prefix contains an admitted unrecognized frame")),
+        }
+    }
+}
+
+#[tokio::test]
 async fn unavailable_older_confirmation_evidence_keeps_latest_checkpoint_reopen_and_writes_live() {
     for missing_catalog in [false, true] {
         let fixture = produced_memory_checkpoint(true).await;
@@ -2842,26 +2892,16 @@ async fn unrecognized_readback_only_faults_an_admitted_pending_transaction() {
         let (mut fixture, operation, mut called, _finish) = attach_readback_fixture(1 << 27).await;
         let (_, mut receipt, readback) = queued_attach_readback(&mut fixture, &operation, SourcePosition(0)).await;
         let before = fixture.driver.partition.value();
-        let frame = |term, sequence| {
-            let mut frame = vec![rtdb_format::PROTOBUF_LOG_HEADER, 7 << 3, term, 9 << 3, sequence];
-            if unknown_field { frame.extend([15 << 3 | 2, 0]); }
-            let frame = Bytes::from(frame);
-            assert!(ReplicaEnvelope::decode(&frame).unwrap().is_none());
-            frame
-        };
         let mut discarded = readback.clone();
-        discarded.payload = frame(1, 0);
+        discarded.payload = unrecognized_replica_frame(1, 0, unknown_field);
         fixture.driver.consume(discarded).await.unwrap();
-        let mut foreign = readback.clone();
-        foreign.metadata.offset = LogOffset(readback.metadata.offset.0 + 1);
-        foreign.payload = frame(2, 1);
-        fixture.driver.consume(foreign).await.unwrap();
+        assert!(fixture.driver.recognized_prefix);
         let advanced = fixture.driver.read_position;
         assert!(matches!(receipt.try_recv(), Err(Empty)));
 
         let mut own = readback;
-        own.metadata.offset = LogOffset(own.metadata.offset.0 + 2);
-        own.payload = frame(1, 1);
+        own.metadata.offset = LogOffset(own.metadata.offset.0 + 1);
+        own.payload = unrecognized_replica_frame(1, 1, unknown_field);
         let error = fixture.driver.consume(own).await.unwrap_err();
         assert_eq!(error.code, "xtdb.indexer/leader-read-back-mismatch");
         assert_eq!(receipt.try_recv().unwrap().unwrap_err(), error);
@@ -2887,6 +2927,28 @@ async fn confirmed_append_cannot_publish_without_its_staged_head() {
     assert!(Arc::ptr_eq(&fixture.driver.partition.value(), &before));
     assert!(fixture.handle.progress().current().tx_key.is_none());
     fixture.driver.demote().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_unrecognized_higher_term_fences_the_previous_leaders_readback() {
+    for sequence in [0, 1] {
+        let (mut fixture, operation, mut called, _finish) = attach_readback_fixture(1 << 27).await;
+        let (_, mut receipt, mut readback) = queued_attach_readback(&mut fixture, &operation, SourcePosition(0)).await;
+        let before = fixture.driver.partition.value();
+        let mut foreign = readback.clone();
+        foreign.payload = unrecognized_replica_frame(2, sequence, true);
+        fixture.driver.consume(foreign).await.unwrap();
+        assert_eq!(fixture.handle.status().highest_term, Term(2));
+        assert_eq!(fixture.handle.status().role, Role::Following);
+        assert_eq!(fixture.driver.recognized_prefix, sequence != 0);
+        assert_eq!(receipt.try_recv().unwrap().unwrap_err(), super::term_ended());
+
+        readback.metadata.offset = LogOffset(readback.metadata.offset.0 + 1);
+        fixture.driver.consume(readback).await.unwrap();
+        assert!(matches!(called.try_recv(), Err(Empty)));
+        assert!(Arc::ptr_eq(&before, &fixture.driver.partition.value()));
+        assert!(fixture.handle.progress().current().tx_key.is_none());
+    }
 }
 
 #[tokio::test]

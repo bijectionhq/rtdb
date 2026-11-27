@@ -1017,11 +1017,18 @@ impl ReplicationDriver {
                 return Err(invalid("Retained replica history did not reach the selected boundary in order"));
             }
             position = next;
-            let record = self.logs.decode_reserved_replica(selected_record.raw, selected_record.decode_reservation)?;
-            let record = if let Some(record) = record {
-                let admission = witness.admit(record.envelope.term, record.envelope.term_sequence)?;
-                if admission.verdict == Verdict::Apply { Some(self.logs.resolve_oversized(record).await?) } else { None }
-            } else { None };
+            let record = match self.logs.decode_readback(selected_record.raw, Some(selected_record.decode_reservation), None, None)? {
+                DecodedReplica::Known(record) => {
+                    let admission = witness.admit(record.envelope.term, record.envelope.term_sequence)?;
+                    if admission.verdict == Verdict::Apply { Some(self.logs.resolve_oversized(record).await?) } else { None }
+                }
+                DecodedReplica::Unrecognized { term, sequence } => {
+                    if witness.admit(term, sequence)?.verdict == Verdict::Apply {
+                        return Err(invalid("Historical replica prefix contains an admitted unrecognized frame"));
+                    }
+                    None
+                }
+            };
             if position == end {
                 let matches_fence = witness == self.fence
                     || (selected.boundary_term() > Term(0)
@@ -1104,6 +1111,7 @@ impl ReplicationDriver {
         Ok(())
     }
     fn start_claim(&mut self) -> Result<()> {
+        if !self.recognized_prefix { return Ok(()); }
         if self.logs.placed_transfer().is_some_and(|transfer|
             self.read_position.after_offset(self.logs.replica_epoch) < transfer.through)
         {
@@ -1137,6 +1145,7 @@ impl ReplicationDriver {
         Ok(())
     }
     async fn try_promote(&mut self) -> Result<()> {
+        if !self.recognized_prefix { return Ok(()); }
         if let Err(error) = self.promote().await {
             self.promotion_failed(error).await?;
         } else { self.status.send_modify(|status| status.promotion_failure = None); }
@@ -1333,44 +1342,41 @@ impl ReplicationDriver {
                 .and_then(|pending| pending.append_stamp()?.fingerprint);
             self.logs.decode_readback(raw, decode_reservation, own_term, immediate.then_some(&expected as &dyn Fn(_) -> _))?
         };
-        let record = match decoded {
-            DecodedReplica::Known(record) => record,
+        let (observed_term, admission, record, lost_prefix) = match decoded {
+            DecodedReplica::Known(record) => {
+                let term = record.envelope.term;
+                let (admission, record) = self.fence.admit_record(record)?;
+                (term, admission, record, false)
+            }
             DecodedReplica::Unrecognized { term, sequence } => {
-                if let Some(pending) = self.own_pending_tx_at(term, sequence)
-                    && self.fence.clone().admit(term, sequence)?.verdict == Verdict::Apply
-                {
-                    let error = readback_mismatch(None);
-                    pending.finish_readback_failure(error.clone());
-                    return Err(error);
+                let admission = self.fence.admit(term, sequence)?;
+                let lost_prefix = admission.verdict == Verdict::Apply;
+                if lost_prefix {
+                    if let Some(pending) = self.own_pending_tx_at(term, sequence) {
+                        let error = readback_mismatch(None);
+                        pending.finish_readback_failure(error.clone());
+                        return Err(error);
+                    }
+                    if self.leader.as_ref().is_some_and(|leader| leader.term == term && leader.pending_serving_at(sequence).is_some()) {
+                        return Err(invalid("Read-back omitted the writer's serving decision"));
+                    }
                 }
-                if self.leader.as_ref().is_some_and(|leader| leader.term == term && leader.pending_serving_at(sequence).is_some())
-                    && self.fence.clone().admit(term, sequence)?.verdict == Verdict::Apply
-                {
-                    return Err(invalid("Read-back omitted the writer's serving decision"));
-                }
-                // The protobuf body can be omitted or too new for this reader to recognize.
                 if self.logs.is_copied_replica_position(position) {
                     return Err(invalid("The held transfer contains an unrecognized replica frame"));
                 }
                 if self.logs.fences_writer_terms() && self.leader.is_some() {
                     return Err(invalid("The current writer cannot apply an unrecognized replica frame"));
                 }
-                self.recognized_prefix = false;
-                // Its effects are unknown, so `recognized_prefix` now withholds promotion and publication for good.
-                self.record_applied(position)?;
-                self.read_position = position;
-                self.complete_trie_removals();
-                return Ok(());
+                self.recognized_prefix &= !lost_prefix;
+                (term, admission, None, lost_prefix)
             }
         };
-        let observed_term = record.envelope.term;
-        let (admission, record) = self.fence.admit_record(record)?;
         let wins = self.claim == Some(position) && admission.opens_term();
         if let Some(claim) = &mut self.claiming {
-            if observed_term == claim.term && admission.opens_term() { claim.observed = Some(position); }
+            if record.is_some() && observed_term == claim.term && admission.opens_term() { claim.observed = Some(position); }
         }
         if self.claim == Some(position) { self.claim = None; }
-        if self.leader.as_ref().is_some_and(|leader| admission.highest_term > leader.term || admission.verdict == Verdict::Voided) {
+        if self.leader.as_ref().is_some_and(|leader| lost_prefix || admission.highest_term > leader.term || admission.verdict == Verdict::Voided) {
             let held = self.demote().await?;
             for held in held { self.apply_admitted(held).await?; }
         }

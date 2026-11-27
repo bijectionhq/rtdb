@@ -87,6 +87,8 @@ The status stream announces block adoption after the leader has durably re-publi
 
 The replica reader folds each delivered envelope into `TermFence` exactly once, including claims, stale records, and records later buffered behind a block.
 Fenced and voided records are consumed without applying their bodies.
+An unrecognized body still participates in fencing through its term and sequence.
+An admitted unrecognized body blocks promotion and installed-prefix publication for the lifetime of the open partition.
 An admitted oversized envelope is fetched and checked against its outer term and sequence before the resolved body is retained or applied.
 Held records replay below the fence that already admitted them.
 

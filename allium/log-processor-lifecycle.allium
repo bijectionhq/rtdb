@@ -115,7 +115,7 @@ contract DurableTotalOrder {
         -- The ordered reader opens the certified checkpoint and advances one record at a time inside its held suffix.
         -- Renewal starts at the same authenticated cut, and delivery matches the prepared head and the hold's checkpoint and terminal cut.
         -- Every admitted replica position is tracked in strictly increasing replica order and applied once before promotion, writer activation, or installed-prefix publication.
-        -- An unrecognized replica record marks its position applied while withholding promotion and installed-prefix publication.
+        -- An admitted unrecognized replica record marks its position applied while withholding promotion and installed-prefix publication.
         -- A grant holder requires a complete applied, recognized prefix before an empty read can trigger promotion.
         -- A replacement term may finish an inherited checkpoint while following.
         -- Public leadership and source intake begin after confirmation is read back and the applied, recognized prefix is installed through the received position.
@@ -344,7 +344,10 @@ rule ClaimWhenNoTermHasLed {
 -- Rules: fold a record into the term position
 --
 -- Every reader folds every record through these before either role acts on it, so every reader reaches the same verdict on each whatever its role.
--- A record these neither discard nor void is applied, which is db.allium's.
+-- A decoded term and sequence participate in the fold even when the message body is unrecognized.
+-- An unrecognized body admitted by the fence prevents this open partition from publishing a later installed prefix or taking leadership.
+-- An active Classic leader withdraws on such a body, and faults if it occupies the position of its pending transaction.
+-- A recognized record admitted here goes to its role for apply, which db.allium specifies.
 -- Claim adjudication reads highest_term_read as it stood before the claim's own fold.
 ------------------------------------------------------------
 
