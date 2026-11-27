@@ -508,15 +508,18 @@ pub(crate) fn validate_argument_columns(record: &RecordBatch, types: &[LogicalTy
     Ok(())
 }
 
-pub(crate) fn first_query_row(batch: &RecordBatch, types: &[LogicalType], memory: &Arc<MemoryBudget>) -> Result<(Vec<Value>, Arc<MemoryReservation>), Status> {
+pub(crate) fn reserve_first_query_row(batch: &RecordBatch, width: usize, memory: &Arc<MemoryBudget>) -> Result<Arc<MemoryReservation>, Status> {
     if batch.num_rows() == 0 { return Err(invalid("Query parameter batch has no rows")); }
-    let columns = || batch.schema_ref().fields().iter().zip(batch.columns());
-    let bound = columns().try_fold(mul(types.len(), std::mem::size_of::<Value>())?, |bytes, (field, array)| {
+    let bound = batch.schema_ref().fields().iter().zip(batch.columns()).try_fold(mul(width, std::mem::size_of::<Value>())?, |bytes, (field, array)| {
         add(bytes, rtdb_columnar::estimate_read_value_bytes(field, array.as_ref(), 0).map_err(status)?)
     })?;
-    let charge = memory.reserve(bound).map_err(status)?;
+    memory.reserve(bound).map_err(status)
+}
+
+pub(crate) fn first_query_row(batch: &RecordBatch, types: &[LogicalType], memory: &Arc<MemoryBudget>) -> Result<(Vec<Value>, Arc<MemoryReservation>), Status> {
+    let charge = reserve_first_query_row(batch, types.len(), memory)?;
     let mut row = Vec::with_capacity(types.len());
-    for ((field, array), ty) in columns().zip(types) {
+    for ((field, array), ty) in batch.schema_ref().fields().iter().zip(batch.columns()).zip(types) {
         row.push(rtdb_columnar::read_value_as(ty, field, array.as_ref(), 0).map_err(status)?);
     }
     row.iter_mut().try_for_each(Value::admit_object_dates).map_err(status)?;

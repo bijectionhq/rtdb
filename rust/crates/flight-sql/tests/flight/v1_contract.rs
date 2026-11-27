@@ -827,6 +827,45 @@ async fn tracked_query_retains_mixed_integer_list_parameters_without_changing_cl
 }
 
 #[tokio::test]
+async fn scalar_run_query_conversion_preserves_rows_and_tracked_claims() {
+    use arrow_array::{Int32Array, Int64Array, RunArray, types::Int32Type};
+
+    let running = Running::start(Some("secret"), FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, Some("xtdb:secret")).await;
+    client.update("INSERT INTO run_claim_rows (_id, n) VALUES (-1, 10), (1, 20)", None).await;
+    let sql = "SELECT n, CAST($2 AS BIGINT) AS bound_value FROM run_claim_rows WHERE _id = $1";
+    let parameters = |annotate| {
+        let run = RunArray::<Int32Type>::try_new(&Int32Array::from(vec![1]), &Int64Array::from(vec![7])).unwrap();
+        let mut field = Field::new("bound", run.data_type().clone(), false);
+        if annotate {
+            field = field.with_metadata([("client".into(), "scalar".into())].into());
+        }
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false), field])),
+            vec![Arc::new(Int64Array::from(vec![-1])), Arc::new(run)]).unwrap();
+        rtdb_format::ipc::write_stream(batch.schema_ref(), std::slice::from_ref(&batch)).unwrap()
+    };
+    for track in [false, true] {
+        let mut request = input(sql);
+        request.source.as_mut().unwrap().at = Some(v1::At { selection: Some(Selection::Linearizable(())) });
+        request.track = track;
+        request.params_ipc = Some(parameters(true));
+        let (expected_rows, expected) = query(&mut client, request.clone()).await;
+        assert_eq!(ints(&expected_rows), [10]);
+        assert_eq!(integer(&expected_rows[0], 1, 0), 7);
+
+        request.source.as_mut().unwrap().at = Some(v1::At { selection: expected.basis.clone().map(Selection::Exactly) });
+        request.params_ipc = Some(parameters(false));
+        let (rows, actual) = query(&mut client, request).await;
+        assert_eq!(ints(&rows), [10]);
+        assert_eq!(integer(&rows[0], 1, 0), 7);
+        assert_eq!(rows[0].schema_ref(), expected_rows[0].schema_ref());
+        assert_eq!(actual.basis, expected.basis);
+        assert_eq!(actual.claim, expected.claim);
+    }
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn rtdb_v1_capabilities_paging_and_stable_errors() {
     let running = Running::start(None, FlightConfig::default()).await;
     let mut client = Client::connect(&running.server, None).await;

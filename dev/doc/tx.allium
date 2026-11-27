@@ -24,6 +24,7 @@
 -- List and positive-width FixedSizeList cells can bind in Arrow when their fields are unannotated and their Float32 or Float64 children use the canonical name.
 -- A v1 Query can also bind a mixed parameter row in Arrow when each additional plain record or list has the declared type at its selected position.
 -- A tracked v1 Query can use the same Arrow bindings when their representation preserves claim identity.
+-- A v1 Query with non-null plain scalar arguments can retain the unchanged columns when run-end scalar cells need conversion.
 -- Unsigned scalar columns share their value and validity buffers with signed columns at the same width during execution.
 -- Other parameter layouts and plans that decline direct binding use the scalar binding path.
 -- Embedded Clojure SQL plans bind compatible positional arguments as one C Data row with their native widths and nulls.

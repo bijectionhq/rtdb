@@ -915,8 +915,27 @@ impl Parameters {
         let skip_row_admission = self.binds_arrow_without_row_admission();
         if !skip_row_admission {
             let admit_collections = track || prepared.notices().is_empty() || context.execution_observer().is_none();
-            if prepared.parameter_count() != types.len() || !self.can_bind_arrow(track, admit_collections, &context.memory) {
+            if prepared.parameter_count() != types.len() {
                 return Ok(None);
+            }
+            if !self.can_bind_arrow(track, admit_collections, &context.memory) {
+                if !admit_collections || !self.can_bind_plain_scalar_runs() {
+                    return Ok(None);
+                }
+                let _row_admission = wire::reserve_first_query_row(self.batch.batch(), types.len(), &context.memory)
+                    .map_err(error::map_status)?;
+                let _type_charge = context.memory.reserve(wire::mul(types.len(), size_of::<LogicalType>())?)
+                    .map_err(error::anomaly)?;
+                let observed = types.iter().map(|ty| {
+                    let ty = match ty { LogicalType::RunEndEncoded { value, .. } => value.as_ref(), ty => ty };
+                    match ty { LogicalType::Maybe(inner) => inner.as_ref(), ty => ty }.clone()
+                }).collect::<Vec<_>>();
+                if track {
+                    return prepared.open_tracked_query_arrow(Arc::clone(context), &self.batch, &observed)
+                        .await.map(Some).map_err(error::anomaly);
+                }
+                return prepared.try_open_query_arrow(Arc::clone(context), &self.batch, &observed).await
+                    .map(|cursor| cursor.map(|cursor| (cursor, ClaimFootprint::default()))).map_err(error::anomaly);
             }
             if !track {
                 drop(self.reserve_scalar_row_bound(&context.memory)?);
@@ -971,6 +990,32 @@ impl Parameters {
                 .await
         };
         result.map(|cursor| cursor.map(|cursor| (cursor, ClaimFootprint::default()))).map_err(error::anomaly)
+    }
+
+    fn can_bind_plain_scalar_runs(&self) -> bool {
+        fn plain_scalar(field: &Field) -> bool {
+            field.metadata().is_empty() && matches!(field.data_type(),
+                DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+                | DataType::Float32 | DataType::Float64 | DataType::Utf8 | DataType::Binary)
+        }
+
+        let batch = self.batch.batch();
+        let mut has_run = false;
+        let mut has_plain = false;
+        let compatible = batch.schema_ref().fields().iter().zip(batch.columns()).all(|(field, array)| {
+            let plain = match field.data_type() {
+                DataType::RunEndEncoded(_, value) => {
+                    has_run = true;
+                    field.metadata().is_empty() && plain_scalar(value)
+                }
+                _ => {
+                    has_plain = true;
+                    plain_scalar(field)
+                }
+            };
+            plain && (ArrowCell { field, array: array.as_ref(), row: 0 }).is_null().is_ok_and(|is_null| !is_null)
+        });
+        compatible && has_run && has_plain
     }
 
     fn signed_batch(&self) -> Option<OwnedBatch> {
