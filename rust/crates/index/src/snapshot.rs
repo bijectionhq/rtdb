@@ -25,10 +25,6 @@ impl std::fmt::Debug for SnapshotMemos {
     }
 }
 
-/// Each table's column types joined with the table catalog's, for the snapshot whose memos hold them.
-#[derive(Default)]
-struct JoinedColumnTypes(parking_lot::Mutex<BTreeMap<TableRef, StructFields<LogicalType>>>);
-
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     trie_catalog: Arc<TrieCatalog>,
@@ -243,13 +239,9 @@ impl Snapshot {
         declarations
     }
 
-    /// A table's column types, joined once per snapshot.
+    /// A table's column types: the table catalog's joined with each live segment's.
     pub fn column_types(&self, table: &TableRef) -> StructFields<LogicalType> {
-        let memo = self.memo::<JoinedColumnTypes>();
-        if let Some(types) = memo.0.lock().get(table) { return types.clone(); }
-        let types = self.column_types_for(table, self.column_names(table));
-        memo.0.lock().insert(table.clone(), types.clone());
-        types
+        self.column_types_for(table, self.column_names(table))
     }
     pub fn column_types_for(&self, table: &TableRef, columns: impl IntoIterator<Item = String>) -> StructFields<LogicalType> {
         let sources: Vec<_> = self.durable.tables().get(table).into_iter().chain(self.layered.get(table).into_iter().flatten()).map(|segment| segment.column_types()).collect();
@@ -356,7 +348,6 @@ fn column_types_are_joined_again_under_another_table_catalog() {
     let types = applied.column_types(&table);
     assert_eq!(types, applied.column_types_for(&table, applied.column_names(&table)));
     assert!(types.get("v").is_some());
-    assert_eq!(state.value().snapshot().column_types(&table), types, "a later snapshot of the same segment reuses the join");
     let other = Snapshot::new(Arc::new(TrieCatalog::default()), Arc::new(TableCatalog::default()), Arc::clone(&applied.durable));
     assert_eq!(other.column_types(&table), other.column_types_for(&table, other.column_names(&table)));
 }
