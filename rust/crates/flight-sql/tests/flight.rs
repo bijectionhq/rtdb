@@ -747,19 +747,22 @@ async fn prepared_update_replays_non_ordinal_union_arguments_from_classic_source
         Field::new("i64", DataType::Int64, false),
         Field::new("utf8", DataType::Utf8, false),
     ]).unwrap();
-    let union = UnionArray::try_new(legs, vec![3, 42, 42].into(), Some(vec![0, 0, 1].into()), vec![
-        Arc::new(Int64Array::from(vec![7, 9])),
-        Arc::new(StringArray::from(vec!["tag"])),
-    ]).unwrap();
-    let item = Arc::new(Field::new("item", union.data_type().clone(), true));
-    let values = ListArray::new(item, OffsetBuffer::new(vec![0, 1, 2, 3].into()), Arc::new(union), None);
-    let page = RecordBatch::try_from_iter([
-        ("client", Arc::new(values) as ArrayRef),
-        ("client", Arc::new(Int64Array::from(vec![2, 1, 3]))),
-    ]).unwrap();
+    let page = |tags: Vec<i8>, offsets: Vec<i32>, ids: Vec<i64>| {
+        let union = UnionArray::try_new(legs.clone(), tags.into(), Some(offsets.into()), vec![
+            Arc::new(Int64Array::from(vec![7, 9])),
+            Arc::new(StringArray::from(vec!["tag"])),
+        ]).unwrap();
+        let item = Arc::new(Field::new("item", union.data_type().clone(), true));
+        let list_offsets = (0..=ids.len() as i32).collect::<Vec<_>>();
+        let values = ListArray::new(item, OffsetBuffer::new(list_offsets.into()), Arc::new(union), None);
+        RecordBatch::try_from_iter([
+            ("client", Arc::new(values) as ArrayRef),
+            ("client", Arc::new(Int64Array::from(ids))),
+        ]).unwrap()
+    };
     client.upload(
         CommandPreparedStatementUpdate { prepared_statement_handle: prepared.prepared_statement_handle },
-        vec![page.slice(0, 1), page.slice(1, 2)],
+        vec![page(vec![3], vec![0], vec![2]), page(vec![42, 42], vec![0, 1], vec![1, 3])],
     ).await;
 
     let log = client.query("SELECT tx_ops FROM xt.source_log_msgs WHERE msg_id BETWEEN 0 AND 100 ORDER BY msg_id DESC LIMIT 1").await;
@@ -939,6 +942,8 @@ async fn table_metadata_preserves_flight_filters_order_and_selected_schemas() {
 #[tokio::test]
 async fn bulk_ingest_refuses_dictionary_and_view_columns_before_submission() {
     use arrow_array::{ArrayRef, StringViewArray, builder::StringDictionaryBuilder, types::Int8Type};
+    use arrow_flight::FlightData;
+    use arrow_ipc::writer::{CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions};
 
     let running = Running::start(None, FlightConfig::default()).await;
     let mut client = Client::connect(&running.server, None).await;
@@ -947,11 +952,15 @@ async fn bulk_ingest_refuses_dictionary_and_view_columns_before_submission() {
     let columns: [ArrayRef; 2] = [Arc::new(dictionary.finish()), Arc::new(StringViewArray::from(vec!["view"]))];
     for label in columns {
         let batch = RecordBatch::try_from_iter([("_id", Arc::new(Int64Array::from(vec![1])) as ArrayRef), ("label", label)]).unwrap();
-        let schema = batch.schema();
-        let mut data = arrow_flight::utils::batches_to_flight_data(schema.as_ref(), vec![batch]).unwrap();
+        let encoder = IpcDataGenerator::default();
+        let options = IpcWriteOptions::default();
+        let mut dictionaries = DictionaryTracker::new(false);
+        let mut schema: FlightData = encoder.schema_to_bytes_with_dictionary_tracker(batch.schema_ref(), &mut dictionaries, &options).into();
+        let (dictionaries, record) = encoder.encode(&batch, &mut dictionaries, &options, &mut CompressionContext::default()).unwrap();
         let command = CommandStatementIngest { table: "docs".into(), ..Default::default() };
-        data[0].flight_descriptor = Some(FlightDescriptor::new_cmd(command.as_any().encode_to_vec()));
-        let request = client.request(futures::stream::iter(data));
+        schema.flight_descriptor = Some(FlightDescriptor::new_cmd(command.as_any().encode_to_vec()));
+        let records = dictionaries.into_iter().chain(std::iter::once(record)).map(FlightData::from);
+        let request = client.request(futures::stream::iter(std::iter::once(schema).chain(records)));
         let error = match client.client.do_put(request).await {
             Ok(response) => response.into_inner().try_collect::<Vec<_>>().await.unwrap_err(),
             Err(error) => error,
