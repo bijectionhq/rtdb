@@ -347,6 +347,7 @@ fn watch_parent(arguments: &Arguments, cancellation: &CancellationToken) {
 
 async fn run(arguments: Vec<String>) -> Result<()> {
     rtdb_server::config::install_apple_sync(&|key| std::env::var(key).ok())?;
+    rtdb_server::config::install_process_settings(&|key| std::env::var(key).ok())?;
     rtdb_server::logging::install(rtdb_server::logging::LogConfig::from_environment(rtdb_server::logging::process_environment())?, rtdb_server::logging::LogOutput::Stderr)?;
     let Some((command, rest)) = arguments.split_first() else { print!("{HELP}"); return Ok(()); };
     if command == "--build-info" {

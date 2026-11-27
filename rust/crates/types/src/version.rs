@@ -35,18 +35,25 @@ impl Version {
     }
 }
 
-fn selected() -> &'static Version {
-    static VERSION: OnceLock<Version> = OnceLock::new();
-    VERSION.get_or_init(|| Version::from_sources(std::env::var("XTDB_VERSION").ok().as_deref(),
-        std::env::var("GIT_SHA").ok().as_deref(), option_env!("RTDB_REVISION")))
+static VERSION: OnceLock<Version> = OnceLock::new();
+
+fn selected() -> &'static Version { VERSION.get_or_init(|| Version::from_sources(None, None, option_env!("RTDB_REVISION"))) }
+
+/// Installs the process version from the server's startup `XTDB_VERSION` and `GIT_SHA` overrides, before anything reports it.
+/// - Errors: the version was already reported or installed with different values.
+pub fn install_runtime_version(xtdb_version: Option<&str>, git_sha: Option<&str>) -> crate::Result<()> {
+    let version = Version::from_sources(xtdb_version, git_sha, option_env!("RTDB_REVISION"));
+    let installed = VERSION.get_or_init(|| Version { number: version.number.clone(), revision: version.revision.clone() });
+    if installed.number == version.number && installed.revision == version.revision { Ok(()) }
+    else { Err(crate::Anomaly::fault("rtdb.version/already-selected", "The process version was reported before its overrides were installed")) }
 }
 
-/// Returns the process version, shared by SQL version functions and the native command line.
-/// The first call captures a nonblank `XTDB_VERSION` override or `DEFAULT_RUNTIME_VERSION`; later calls reuse that immutable value.
+/// Returns the process version, shared by SQL version functions and the native command line:
+/// the installed `XTDB_VERSION` override, else `DEFAULT_RUNTIME_VERSION`.
 pub fn runtime_version() -> &'static str { &selected().number }
 
-/// Returns up to seven characters of the captured `GIT_SHA` override or build-time `RTDB_REVISION`.
-/// Absent, blank and `unknown` candidates are skipped; initialization shares the first-call boundary of `runtime_version`.
+/// Returns up to seven characters of the installed `GIT_SHA` override or build-time `RTDB_REVISION`.
+/// Absent, blank and `unknown` candidates are skipped.
 pub fn runtime_revision() -> Option<&'static str> { selected().revision.as_deref() }
 
 #[cfg(test)]
@@ -71,5 +78,14 @@ mod tests {
             assert_eq!(Version::from_sources(None, missing, Some("embedded")).revision.as_deref(), Some("embedde"));
         }
         assert_eq!(Version::from_sources(None, Some("abc"), None).revision.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn the_installed_overrides_are_the_reported_version_and_cannot_change() {
+        install_runtime_version(Some("installed-version"), Some("0123456789")).unwrap();
+        install_runtime_version(Some(" installed-version "), Some("0123456")).unwrap();
+        assert_eq!(runtime_version(), "installed-version");
+        assert_eq!(runtime_revision(), Some("0123456"));
+        assert!(install_runtime_version(None, None).is_err());
     }
 }

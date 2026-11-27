@@ -21,6 +21,6 @@ The build validates at most one MiB and records the bundled version and exact in
 Cargo tracks both the selection environment variable and the selected file for rebuilds.
 Qualification against a JVM artifact requires its actual installed TZDB version and digest to match these values.
 
-Set `RTDB_TZDB_FILE` in a process's environment to load another OpenJDK format-version-1 file in place of the bundled one, without a rebuild; this is RTDB's counterpart of replacing a JDK's `lib/tzdb.dat`, for instance with the output of Oracle's `tzupdater`.
+Set `RTDB_TZDB_FILE` in the server's environment to load another OpenJDK format-version-1 file in place of the bundled one, without a rebuild; this is RTDB's counterpart of replacing a JDK's `lib/tzdb.dat`, for instance with the output of Oracle's `tzupdater`.
 The file is read once, on the process's first region lookup, under the same one-MiB bound and validation; a file that cannot be read or decoded fails region lookups with `xtdb/tzdb-unavailable` rather than falling back to the bundled rules.
 The build-information report still names the bundled file.

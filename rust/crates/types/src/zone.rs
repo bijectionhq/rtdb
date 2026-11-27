@@ -1,4 +1,4 @@
-use std::{fmt, io::Read, path::Path, sync::OnceLock};
+use std::{fmt, io::Read, path::{Path, PathBuf}, sync::OnceLock};
 use crate::{Anomaly, CivilDate, CivilDateTime, Instant, Result};
 use crate::tzdb::{self, Database, Rule, Rules, legacy::LegacyRules};
 
@@ -228,7 +228,7 @@ impl fmt::Display for ZoneId {
 /// - Errors: `xtdb/tzdb-unavailable` when the zone database cannot be loaded.
 pub fn timezone_names() -> Result<impl ExactSizeIterator<Item = &'static str>> { Ok(database()?.zones.iter().map(|zone| zone.name.as_str())) }
 
-/// The version of the zone database this process uses: `TZDB_VERSION` unless `RTDB_TZDB_FILE` names a replacement.
+/// The version of the zone database this process uses: `TZDB_VERSION` unless [`install_tzdb_file`] named a replacement.
 /// - Errors: `xtdb/tzdb-unavailable` when the zone database cannot be loaded.
 pub fn tzdb_version() -> Result<&'static str> { Ok(database()?.version.as_str()) }
 
@@ -240,16 +240,27 @@ pub(crate) fn legacy_rules(name: &str) -> Result<Option<(&'static str,&'static s
     Ok(Some((zone.name.as_str(),zone.legacy_name.as_str(),&database.legacy[zone.rules])))
 }
 
-/// The OpenJDK `tzdb.dat` the build selected and validated, which the zone database uses unless `RTDB_TZDB_FILE` replaces it.
+/// The OpenJDK `tzdb.dat` the build selected and validated, which the zone database uses unless [`install_tzdb_file`] replaces it.
 static BUNDLED_TZDB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tzdb.dat"));
 
+static TZDB_FILE: OnceLock<Option<PathBuf>> = OnceLock::new();
+static DATABASE: OnceLock<Result<Database>> = OnceLock::new();
+
+/// Names the OpenJDK `tzdb.dat` that replaces the bundled one (the server reads it from `RTDB_TZDB_FILE`), as replacing
+/// a JDK's `lib/tzdb.dat` does; `None` keeps the bundled file. Install it before the first region lookup.
+/// - Errors: a different file was already installed, or a region lookup already loaded the database.
+pub fn install_tzdb_file(path: Option<PathBuf>) -> Result<()> {
+    let installed = TZDB_FILE.get_or_init(|| path.clone());
+    if *installed != path { return Err(Anomaly::fault("xtdb/tzdb-unavailable", "A different tzdb.dat was already installed")); }
+    if DATABASE.get().is_some() && path.is_some() { return Err(Anomaly::fault("xtdb/tzdb-unavailable", "The zone database was loaded before its tzdb.dat was installed")); }
+    Ok(())
+}
+
 /// The process's zone database, loaded on first use as the JVM loads its `lib/tzdb.dat`, so that, as there, the rules
-/// can be updated without a new build: from the OpenJDK `tzdb.dat` file a non-empty `RTDB_TZDB_FILE` names, otherwise
-/// from the bundled one. A failed load fails every later region lookup the same way.
+/// can be updated without a new build: from the installed OpenJDK `tzdb.dat` file, otherwise from the bundled one.
+/// A failed load fails every later region lookup the same way.
 fn database() -> Result<&'static Database> {
-    static DATABASE: OnceLock<Result<Database>> = OnceLock::new();
-    DATABASE.get_or_init(|| load(std::env::var_os("RTDB_TZDB_FILE").filter(|path| !path.is_empty()).as_deref().map(Path::new)))
-        .as_ref().map_err(Clone::clone)
+    DATABASE.get_or_init(|| load(TZDB_FILE.get_or_init(|| None).as_deref())).as_ref().map_err(Clone::clone)
 }
 
 /// Decodes the `tzdb.dat` at `path`, or the bundled one, reading at most the format's one-MiB bound.
@@ -334,6 +345,6 @@ mod tests {
     #[test]
     fn the_bundled_tzdb_is_the_one_the_build_selected() {
         assert_eq!(load(None).unwrap().version, TZDB_VERSION);
-        if std::env::var_os("RTDB_TZDB_FILE").is_none() { assert_eq!(tzdb_version().unwrap(), TZDB_VERSION); }
+        assert_eq!(tzdb_version().unwrap(), TZDB_VERSION);
     }
 }

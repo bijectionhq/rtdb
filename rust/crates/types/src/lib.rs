@@ -62,7 +62,7 @@ mod murmur3;
 
 pub use error::{Anomaly, AnomalyCategory, AnomalyKind, Result};
 pub use calendar::{CalendarDate, CivilDate, CivilDateTime, DateUnit, parse_iso_local_time, MIN_CALENDAR_YEAR, MAX_CALENDAR_YEAR, MIN_EPOCH_DAY, MAX_EPOCH_DAY, NANOS_PER_DAY};
-pub use zone::{FixedOffset, ZoneId, timezone_names, tzdb_version, TZDB_VERSION, TZDB_SHA256};
+pub use zone::{FixedOffset, ZoneId, install_tzdb_file, timezone_names, tzdb_version, TZDB_VERSION, TZDB_SHA256};
 pub use legacy_zone::LegacyTimeZone;
 pub use java_case::CaseLanguage;
 pub use float_text::{java_f32_text, java_f64_text, write_java_float};
@@ -83,7 +83,7 @@ pub use scalar_list::ScalarList;
 pub use value::{DecimalValue, Value};
 pub use uri::UriParts;
 pub use utf8::decode_java_utf8;
-pub use version::{BuildInfo, DEFAULT_RUNTIME_VERSION, XTDB_COMPATIBLE_VERSION, compiled_build_info, runtime_version, runtime_revision};
+pub use version::{BuildInfo, DEFAULT_RUNTIME_VERSION, XTDB_COMPATIBLE_VERSION, compiled_build_info, install_runtime_version, runtime_version, runtime_revision};
 pub use object_sort::ObjectSort;
 pub use memory::{MemoryBudget, MemoryReservation};
 pub use allocation::AllocationScope;

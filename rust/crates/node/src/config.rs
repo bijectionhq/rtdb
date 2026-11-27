@@ -46,7 +46,7 @@ impl NodeOptions {
     /// The fixed UTC offset used when no node time zone is configured.
     pub const DEFAULT_TIMEZONE: &str = "Z";
 
-    /// The reference's `CompactorConfig` default, which the server configuration also falls back to: a parseable `XTDB_COMPACTOR_THREADS`, else half the available processors and at least one.
+    /// The reference's `CompactorConfig` default, which the server configuration falls back to with its startup environment: a parseable `XTDB_COMPACTOR_THREADS`, else half the available processors and at least one.
     pub fn default_compaction_threads(environment: impl Fn(&str) -> Option<String>) -> usize {
         match environment("XTDB_COMPACTOR_THREADS").and_then(|value| value.parse::<i32>().ok()) {
             Some(threads) => threads.max(0) as usize,
@@ -61,7 +61,7 @@ impl Default for NodeOptions {
             default_timezone: Self::DEFAULT_TIMEZONE.into(), execution_memory_bytes: 512 * 1024 * 1024, cache_bytes: 256 * 1024 * 1024,
             command_capacity: 64, file_size_target: 100 * 1024 * 1024, trie: TrieConfig::default(), query: QueryOptions::default(),
             replication: ReplicationConfig::default(), compaction: MergeConfig::default(),
-            compaction_threads: Self::default_compaction_threads(|name| std::env::var(name).ok()),
+            compaction_threads: Self::default_compaction_threads(|_| None),
             garbage: GarbageConfig::default(), automatic_compaction: true, automatic_gc: true,
             artefact_threads: 1, automatic_artefacts: true, scan_acceleration: true, ordered_index_arrow_references: false,
             ordered_index_arrow_references_on_private_storage: true }
@@ -136,7 +136,7 @@ mod tests {
         let options = NodeOptions::default();
         assert_eq!(options.replication.rows_per_block, 102_400);
         assert_eq!(options.replication.flush_timeout, Duration::from_secs(15 * 60));
-        assert_eq!(options.compaction_threads, NodeOptions::default_compaction_threads(|name| std::env::var(name).ok()));
+        assert_eq!(options.compaction_threads, NodeOptions::default_compaction_threads(|_| None));
     }
 
     #[test]

@@ -279,6 +279,14 @@ pub fn install_apple_sync(environment: &impl Fn(&str) -> Option<String>) -> Resu
     Ok(policy)
 }
 
+/// Installs the process-wide settings the libraries read no environment for: the `XTDB_VERSION` and `GIT_SHA` version
+/// overrides, and the `RTDB_TZDB_FILE` replacement for the bundled time-zone rules.
+/// - Errors: a setting already installed or used with a different value.
+pub fn install_process_settings(environment: &impl Fn(&str) -> Option<String>) -> Result<()> {
+    rtdb_types::install_runtime_version(environment("XTDB_VERSION").as_deref(), environment("GIT_SHA").as_deref())?;
+    rtdb_types::install_tzdb_file(environment("RTDB_TZDB_FILE").filter(|path| !path.is_empty()).map(std::path::PathBuf::from))
+}
+
 /// The process setting that caps one query's spill files when the YAML sets no `query.spillLimitBytes`.
 pub const QUERY_SPILL_LIMIT_SETTING: &str = "RTDB_QUERY_SPILL_LIMIT_BYTES";
 

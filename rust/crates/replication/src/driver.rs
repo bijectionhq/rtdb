@@ -89,9 +89,9 @@ impl ReplicationConfig {
     pub const DEFAULT_ROWS_PER_BLOCK: u64 = 102_400;
     pub const DEFAULT_FLUSH_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
-    /// The reference's node identity default: `XTDB_NODE_ID`, else the first group of a random UUID.
+    /// The reference's node identity default without `XTDB_NODE_ID`, which the server configuration reads: the first group of a random UUID.
     pub fn default_node_id() -> String {
-        std::env::var("XTDB_NODE_ID").unwrap_or_else(|_| uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or_default().to_owned())
+        uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or_default().to_owned()
     }
 }
 impl Default for ReplicationConfig {

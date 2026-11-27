@@ -38,6 +38,7 @@ fn main() -> ExitCode {
 
 async fn run() -> Result<()> {
     rtdb_server::config::install_apple_sync(&|key| std::env::var(key).ok())?;
+    rtdb_server::config::install_process_settings(&|key| std::env::var(key).ok())?;
     let command = cli::parse(std::env::args().skip(1), &|key| std::env::var(key).ok())?;
     rtdb_server::logging::install(rtdb_server::logging::LogConfig::from_environment(rtdb_server::logging::process_environment())?, log_output(&command))?;
     match command {

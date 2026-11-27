@@ -153,8 +153,9 @@ impl AuthConfig {
     }
 }
 
+/// Trusts every connection: the server configuration, not the library, reads `XTDB_PASSWORD`.
 impl Default for AuthConfig {
-    fn default() -> Self { Self::SingleRootUser { password: std::env::var("XTDB_PASSWORD").ok().map(Secret::new) } }
+    fn default() -> Self { Self::SingleRootUser { password: None } }
 }
 
 enum Authentication {
