@@ -75,6 +75,7 @@ fn serve(script: Vec<(u16, String)>) -> (String, mpsc::Receiver<()>, thread::Joi
                     Err(err) => panic!("Token endpoint stopped accepting requests: {err}"),
                 }
             };
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
