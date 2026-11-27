@@ -113,7 +113,7 @@ pub fn qualify(configuration: &str, format: InputFormat, environment_json: &[u8]
         ],
         unsupported_jvm_extensions: vec![
             "Programmatic JVM module factories, classpath registrations and custom lifecycle objects require a native adapter or separately deployed bridge.",
-            "Arbitrary Java/Kotlin/Clojure callbacks, custom PostgreSQL indexers and Kafka Connect converter classes are not executable native configuration.",
+            "Arbitrary Java/Kotlin/Clojure callbacks, custom PostgreSQL indexers and unregistered Kafka Connect converter classes require native adapters.",
             "EDN reader evaluation, object constructors and executable Clojure configuration require an explicit data-only migration.",
             "Custom credential-provider classes and unsupported JAAS login modules require a native credential adapter.",
         ], reservations: vec![reservation],
@@ -142,7 +142,7 @@ pub fn qualify(configuration: &str, format: InputFormat, environment_json: &[u8]
         Ok(parsed) => {
             report.reservations.push(memory.reserve(parsed.allocation_bound().checked_mul(2).ok_or_else(|| invalid("Qualification size overflow"))?)?);
             if !parsed.warnings().is_empty() { report.gap("ignored-edn-options", "configuration", "The production decoder reported ignored configuration keys; none are accepted for cutover."); }
-            resolved::describe(parsed.configuration(), &mut report);
+            resolved::describe(parsed.configuration(), &environment, &mut report);
         }
         Err(error) if error.is(AnomalyKind::ResourceExhausted) => return Err(error),
         Err(_) => report.gap("production-decoder-rejected", "configuration", "The bounded production decoder rejected the configuration or its environment; diagnostic values are withheld to protect secrets."),
@@ -153,6 +153,12 @@ pub fn qualify(configuration: &str, format: InputFormat, environment_json: &[u8]
 }
 
 struct ExplicitEnvironment { values: BTreeMap<String, String>, requested: RefCell<BTreeSet<String>> }
+impl ExplicitEnvironment {
+    fn get(&self, name: &str) -> Option<&str> {
+        self.requested.borrow_mut().insert(name.into());
+        self.values.get(name).map(String::as_str)
+    }
+}
 struct EnvironmentMap(BTreeMap<String, String>);
 impl<'de> Deserialize<'de> for EnvironmentMap {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
@@ -173,8 +179,7 @@ impl<'de> Deserialize<'de> for EnvironmentMap {
 }
 impl ConfigurationEnvironment for ExplicitEnvironment {
     fn lookup(&self, name: &str, memory: &Arc<MemoryBudget>) -> Result<Option<EnvironmentValue>> {
-        self.requested.borrow_mut().insert(name.into());
-        self.values.get(name).map(|value| EnvironmentValue::copy(value, memory)).transpose()
+        self.get(name).map(|value| EnvironmentValue::copy(value, memory)).transpose()
     }
 }
 impl Drop for ExplicitEnvironment {

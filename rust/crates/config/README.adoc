@@ -62,8 +62,29 @@ The CLI accepts regular files and bounds reads; on Unix it opens inputs without 
 The data-only production EDN adapter can ignore nested JVM options when projecting recognized fields.
 Every EDN report therefore contains a blocking projection qualification finding, even if decoding succeeds.
 Convert to explicit YAML and compare every original setting before treating that deployment's configuration as compatible.
-Executable reader forms, custom JVM objects, programmatic module factories, custom indexers, converter classes and credential-provider callbacks require a native adapter, bridge or explicit migration.
-Kafka Connect option validation that would instantiate plugin or registry clients is reported as unqualified; this tool never creates those clients.
+Executable reader forms, custom JVM objects, programmatic module factories, custom indexers, unsupported converter classes and credential-provider callbacks require a native adapter, bridge or explicit migration.
+
+== Kafka
+
+Kafka log and remote descriptions require the `kafka` feature.
+Kafka Connect external sources also require `kafka-connect`.
+With Connect support compiled in, qualification uses the native Connect configuration parser and built-in converter constructors to check portable converter settings.
+This includes Confluent Protobuf with dynamic message types, the converter's own `schema.registry.url` list, supported Schema Registry credential sources and subject-name strategies, and the Protobuf projection settings accepted by the native converter.
+Supply the Registry URL separately for each Confluent key or value converter.
+A remote's `schemaRegistryUrl` is inventory metadata and does not supply a converter's Registry URL.
+Unknown converter options and unsupported classes produce blocking findings.
+Transforms, predicates, and Registry rule or DLQ settings require separate runtime qualification.
+Registry transport setup, TLS material, registered schemas and references, and record conversion are checked when the source uses them.
+
+With Kafka support compiled in, inline broker properties are checked using the native property translator.
+This covers supported OAuthBearer client-credentials options, including the built-in Kafka callback, retriever and validator classes used by the native adapter.
+Put the comma-separated `RTDB_KAFKA_OAUTHBEARER_ALLOWED_URLS` in the explicit environment JSON for secured broker OAuthBearer.
+Include the exact token endpoint, including any query string.
+The report records the variable's name and omits its value and the broker and converter option values.
+Custom OAuth hooks, file token retrieval, and client assertions require a native adapter.
+Broker authentication, token issuance and refresh, TLS material, and librdkafka client construction require deployment-time verification.
+
+== Cutover inventory
 
 Ordinary node YAML names the primary database while attached database configurations live in its durable catalog.
 That report explicitly blocks an uninventoried attached-database set.

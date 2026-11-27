@@ -1,6 +1,8 @@
 use rtdb_format::config::Yaml;
 use crate::QualificationReport;
 
+pub(crate) mod kafka;
+
 #[derive(Clone, Copy)]
 enum Shape { Node, Ingest, Database, Log, Storage, Store, Remote, Auth, Module, Source, Indexer, Fields(&'static [&'static str]), NamedDatabase, NamedRemote, Rules, Users, Opaque }
 
@@ -97,25 +99,9 @@ fn walk(value: &Yaml, shape: Shape, path: &str, report: &mut QualificationReport
                     _ => Shape::Opaque,
                 },
             };
-            if matches!(key, "propertiesMap" | "connectConfig") { property_keys(value, key == "connectConfig", &next, report); }
             walk(value, child, &next, report);
         }
     } else if let Yaml::Sequence(values) = value {
         for (index, value) in values.iter().enumerate() { walk(value, shape, &format!("{path}[{index}]"), report); }
-    }
-}
-fn property_keys(value: &Yaml, connect: bool, path: &str, report: &mut QualificationReport) {
-    let Some(values) = value.as_mapping() else { return; };
-    for (key, value) in values {
-        let Some(key) = key.as_str() else { continue; };
-        let path = format!("{path}.{key}");
-        if key.ends_with(".class") || key.contains("callback.handler") || key == "plugin.path" || key == "interceptor.classes" {
-            report.gap("jvm-property-hook", path, "This JVM class or plugin property requires a native adapter.");
-        } else if connect && matches!(key, "key.converter" | "value.converter") {
-            let supported = matches!(value.as_str(), Some("org.apache.kafka.connect.json.JsonConverter" | "org.apache.kafka.connect.storage.StringConverter" | "org.apache.kafka.connect.converters.ByteArrayConverter" | "io.confluent.connect.avro.AvroConverter" | "io.confluent.connect.json.JsonSchemaConverter" | "org.apache.kafka.connect.converters.BooleanConverter" | "org.apache.kafka.connect.converters.ShortConverter" | "org.apache.kafka.connect.converters.IntegerConverter" | "org.apache.kafka.connect.converters.LongConverter" | "org.apache.kafka.connect.converters.FloatConverter" | "org.apache.kafka.connect.converters.DoubleConverter"));
-            if !supported { report.gap("unsupported-connect-converter", path, "This converter has no native Kafka Connect implementation."); }
-        } else if connect {
-            report.gap("connect-plugin-options-unqualified", path, "This converter, transform or predicate option requires native factory validation; offline qualification does not construct plugin clients.");
-        }
     }
 }

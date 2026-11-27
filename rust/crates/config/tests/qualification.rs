@@ -125,3 +125,325 @@ fn qualification_does_not_create_any_configured_local_roots() {
     assert!(report.configuration_compatible);
     assert!(!logs.exists()); assert!(!objects.exists());
 }
+
+const PROTOBUF_SOURCE: &str = r#"
+remotes:
+  events: !Kafka
+    bootstrapServers: broker.invalid:9092
+    schemaRegistryUrl: https://remote-only.invalid
+databases:
+  inventory:
+    log: !Kafka {cluster: events, topic: transactions}
+    storage: !Local {path: /unopened/objects}
+    externalSource: !KafkaConnect
+      remote: events
+      topic: events
+      indexer: !Docs {table: public.events}
+      connectConfig:
+        key.converter: io.confluent.connect.protobuf.ProtobufConverter
+        key.converter.schema.registry.url: https://user:REGISTRY_URL_SECRET@registry.invalid
+        key.converter.basic.auth.credentials.source: URL
+        key.converter.key.subject.name.strategy: io.confluent.kafka.serializers.subject.RecordNameStrategy
+        key.converter.int.for.enums: 'true'
+        value.converter: io.confluent.connect.protobuf.ProtobufConverter
+        value.converter.schema.registry.url: 'https://registry.invalid, https://backup-registry.invalid'
+        value.converter.schema.registry.basic.auth.credentials.source: USER_INFO
+        value.converter.schema.registry.basic.auth.user.info: 'reader:REGISTRY_BASIC_SECRET'
+        value.converter.schema.registry.ssl.truststore.location: /unopened/REGISTRY_TRUSTSTORE_PATH
+        value.converter.schema.registry.ssl.truststore.password: REGISTRY_TLS_SECRET
+        value.converter.flatten.unions: 'true'
+        value.converter.use.latest.version: 'true'
+"#;
+
+#[test]
+fn protobuf_registry_configuration_qualifies_with_compiled_connect_support() {
+    let report = assess(PROTOBUF_SOURCE, InputFormat::IngestYaml, b"{}");
+    let missing_features: Vec<_> = report
+        .configuration_gaps
+        .iter()
+        .map(|finding| {
+            assert_eq!(finding.code, "feature-not-compiled");
+            finding.path.as_str()
+        })
+        .collect();
+    let mut expected = Vec::new();
+    if !cfg!(feature = "kafka") {
+        expected.extend(["remotes.events", "databases.inventory.log"]);
+    }
+    if !cfg!(feature = "kafka-connect") {
+        expected.push("databases.inventory.externalSource");
+    }
+    assert_eq!(missing_features, expected);
+    assert_eq!(
+        report.configuration_compatible,
+        cfg!(feature = "kafka-connect")
+    );
+    assert_eq!(
+        report.databases[0].external_source.as_ref().unwrap()["kind"],
+        "kafka-connect"
+    );
+    assert!(!report.cutover_eligible);
+    let encoded = serde_json::to_string(&report).unwrap();
+    for secret in [
+        "REGISTRY_URL_SECRET",
+        "REGISTRY_BASIC_SECRET",
+        "REGISTRY_TLS_SECRET",
+        "REGISTRY_TRUSTSTORE_PATH",
+    ] {
+        assert!(!encoded.contains(secret));
+    }
+}
+
+#[test]
+fn connect_source_requires_a_kafka_remote_and_valid_docs_table() {
+    let config = PROTOBUF_SOURCE
+        .replace("remote: events", "remote: absent")
+        .replace("table: public.events", "table: 'public.'");
+    let report = assess(&config, InputFormat::IngestYaml, b"{}");
+    for code in ["missing-or-wrong-remote", "invalid-connect-indexer-table"] {
+        assert!(report.configuration_gaps.iter().any(|finding| {
+            finding.code == code && finding.path == "databases.inventory.externalSource"
+        }));
+    }
+}
+
+#[cfg(feature = "kafka-connect")]
+#[test]
+fn registry_bearer_provider_class_must_have_a_native_implementation() {
+    let config = PROTOBUF_SOURCE
+        .replace("value.converter.schema.registry.basic.auth.credentials.source: USER_INFO",
+            "value.converter.bearer.auth.credentials.source: CUSTOM")
+        .replace("value.converter.schema.registry.basic.auth.user.info: 'reader:REGISTRY_BASIC_SECRET'",
+            "value.converter.bearer.auth.token: REGISTRY_TOKEN_SECRET\n        value.converter.bearer.auth.custom.provider.class: io.confluent.kafka.schemaregistry.client.security.bearerauth.StaticTokenCredentialProvider");
+    let report = assess(&config, InputFormat::IngestYaml, b"{}");
+    assert!(report.configuration_compatible);
+    assert!(
+        !serde_json::to_string(&report)
+            .unwrap()
+            .contains("REGISTRY_TOKEN_SECRET")
+    );
+
+    let config = config.replace(
+        "io.confluent.kafka.schemaregistry.client.security.bearerauth.StaticTokenCredentialProvider",
+        "custom.BEARER_PROVIDER_SECRET",
+    );
+    let report = assess(&config, InputFormat::IngestYaml, b"{}");
+    assert!(
+        report
+            .configuration_gaps
+            .iter()
+            .any(|finding| finding.code == "invalid-connect-converter-options")
+    );
+    let encoded = serde_json::to_string(&report).unwrap();
+    assert!(!encoded.contains("REGISTRY_TOKEN_SECRET"));
+    assert!(!encoded.contains("BEARER_PROVIDER_SECRET"));
+}
+
+#[cfg(feature = "kafka-connect")]
+#[test]
+fn connect_rejects_unsupported_or_invalid_converter_configuration_without_values() {
+    let prefix = "databases.inventory.externalSource.connectConfig";
+    for (from, to, code, option) in [
+        (
+            "value.converter: io.confluent.connect.protobuf.ProtobufConverter",
+            "value.converter: custom.CONVERTER_CLASS_SECRET",
+            "unsupported-connect-converter",
+            "value.converter",
+        ),
+        (
+            "        value.converter.schema.registry.url: 'https://registry.invalid, https://backup-registry.invalid'\n",
+            "",
+            "invalid-connect-converter-options",
+            "value.converter",
+        ),
+        (
+            "value.converter.flatten.unions: 'true'",
+            "value.converter.specific.protobuf.value.type: custom.GENERATED_CLASS_SECRET",
+            "invalid-connect-converter-options",
+            "value.converter",
+        ),
+        (
+            "value.converter.schema.registry.basic.auth.credentials.source: USER_INFO",
+            "value.converter.schema.registry.basic.auth.credentials.source: JVM_PROVIDER_SECRET",
+            "invalid-connect-converter-options",
+            "value.converter",
+        ),
+        (
+            "value.converter.flatten.unions: 'true'",
+            "value.converter.value.subject.name.strategy: custom.STRATEGY_SECRET",
+            "connect-plugin-options-unqualified",
+            "value.converter.value.subject.name.strategy",
+        ),
+        (
+            "value.converter.flatten.unions: 'true'",
+            "value.converter.unknown.option: OPTION_VALUE_SECRET",
+            "connect-plugin-options-unqualified",
+            "value.converter.unknown.option",
+        ),
+    ] {
+        let report = assess(
+            &PROTOBUF_SOURCE.replace(from, to),
+            InputFormat::IngestYaml,
+            b"{}",
+        );
+        assert!(!report.configuration_compatible);
+        assert!(report.configuration_gaps.iter().any(|finding| finding.code == code && finding.path == format!("{prefix}.{option}")), "{option}");
+        assert!(!serde_json::to_string(&report).unwrap().contains("_SECRET"));
+    }
+}
+
+#[cfg(feature = "kafka-connect")]
+#[test]
+fn connect_parser_diagnostics_do_not_expose_values_and_transforms_remain_unqualified() {
+    let transform = r#"
+        transforms: route
+        transforms.route.type: org.apache.kafka.connect.transforms.RegexRouter
+        transforms.route.predicate: select
+        transforms.route.negate: 'false'
+        predicates: select
+        predicates.select.type: org.apache.kafka.connect.transforms.predicates.TopicNameMatches
+"#;
+    for (transform, code) in [
+        (transform.to_owned(), "connect-plugin-options-unqualified"),
+        (
+            transform.replace("'false'", "NEGATE_VALUE_SECRET"),
+            "invalid-connect-description",
+        ),
+    ] {
+        let report = assess(
+            &format!("{PROTOBUF_SOURCE}{transform}"),
+            InputFormat::IngestYaml,
+            b"{}",
+        );
+        assert!(!report.configuration_compatible);
+        assert!(
+            report
+                .configuration_gaps
+                .iter()
+                .any(|finding| finding.code == code)
+        );
+        assert!(
+            !serde_json::to_string(&report)
+                .unwrap()
+                .contains("NEGATE_VALUE_SECRET")
+        );
+    }
+}
+
+#[cfg(feature = "kafka")]
+const BROKER_OIDC: &str = r#"
+logClusters:
+  events: !Kafka
+    bootstrapServers: broker.invalid:9092
+    propertiesMap:
+      security.protocol: SASL_SSL
+      sasl.mechanism: OAUTHBEARER
+      sasl.login.callback.handler.class: org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginCallbackHandler
+      sasl.login.class: org.apache.kafka.common.security.oauthbearer.internals.OAuthBearerRefreshingLogin
+      sasl.oauthbearer.jwt.retriever.class: org.apache.kafka.common.security.oauthbearer.ClientCredentialsJwtRetriever
+      sasl.oauthbearer.jwt.validator.class: org.apache.kafka.common.security.oauthbearer.ClientJwtValidator
+      sasl.oauthbearer.token.endpoint.url: ' https://issuer.invalid/token?tenant=ENDPOINT_SECRET '
+      sasl.jaas.config: 'org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required extension_logicalCluster="EXTENSION_SECRET";'
+      sasl.oauthbearer.client.credentials.client.id: fixture
+      sasl.oauthbearer.client.credentials.client.secret: !Env BROKER_PASSWORD
+      sasl.oauthbearer.scope: 'fixtures write'
+      sasl.oauthbearer.header.urlencode: 'true'
+      sasl.oauthbearer.sub.claim.name: principal
+      sasl.oauthbearer.scope.claim.name: permissions
+      sasl.login.connect.timeout.ms: '2000'
+      sasl.login.read.timeout.ms: '3000'
+      sasl.login.retry.backoff.ms: '100'
+      sasl.login.retry.backoff.max.ms: '500'
+      sasl.login.refresh.window.factor: '0.75'
+      sasl.login.refresh.window.jitter: '0.05'
+      sasl.login.refresh.min.period.seconds: '60'
+      sasl.login.refresh.buffer.seconds: '300'
+databases:
+  inventory:
+    log: !Kafka {cluster: events, topic: transactions}
+    storage: !Local {path: /unopened/objects}
+"#;
+
+#[cfg(feature = "kafka")]
+const ALLOWED_BROKER_ENV: &[u8] = br#"{
+    "BROKER_PASSWORD":"BROKER_SECRET",
+    "RTDB_KAFKA_OAUTHBEARER_ALLOWED_URLS":"https://other.invalid/token, https://issuer.invalid/token?tenant=ENDPOINT_SECRET "
+}"#;
+
+#[cfg(feature = "kafka")]
+#[test]
+fn broker_oidc_checks_the_supplied_exact_endpoint_and_redacts_credentials() {
+    let report = assess(BROKER_OIDC, InputFormat::IngestYaml, ALLOWED_BROKER_ENV);
+    assert!(report.configuration_compatible);
+    assert!(
+        report
+            .environment_lookups
+            .contains("RTDB_KAFKA_OAUTHBEARER_ALLOWED_URLS")
+    );
+    let encoded = serde_json::to_string(&report).unwrap();
+    for secret in ["BROKER_SECRET", "ENDPOINT_SECRET", "EXTENSION_SECRET"] {
+        assert!(!encoded.contains(secret));
+    }
+    for environment in [
+        br#"{"BROKER_PASSWORD":"BROKER_SECRET"}"#.as_slice(),
+        br#"{"BROKER_PASSWORD":"BROKER_SECRET","RTDB_KAFKA_OAUTHBEARER_ALLOWED_URLS":"https://issuer.invalid/token"}"#.as_slice(),
+    ] {
+        let report = assess(BROKER_OIDC, InputFormat::IngestYaml, environment);
+        assert!(!report.configuration_compatible);
+        assert_eq!(report.configuration_gaps.len(), 1);
+        assert_eq!(report.configuration_gaps[0].code, "kafka-oauth-endpoint-not-allowed");
+        let encoded = serde_json::to_string(&report).unwrap();
+        assert!(!encoded.contains("ENDPOINT_SECRET"));
+        assert!(!encoded.contains("BROKER_SECRET"));
+    }
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn broker_oauth_custom_classes_and_assertions_still_block_qualification() {
+    for (from, to, code) in [
+        (
+            "org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginCallbackHandler",
+            "custom.CALLBACK_SECRET",
+            "unsupported-kafka-auth-properties",
+        ),
+        (
+            "org.apache.kafka.common.security.oauthbearer.ClientCredentialsJwtRetriever",
+            "org.apache.kafka.common.security.oauthbearer.FileJwtRetriever",
+            "unsupported-kafka-auth-properties",
+        ),
+        (
+            "sasl.oauthbearer.scope: 'fixtures write'",
+            "sasl.oauthbearer.assertion.file: ASSERTION_PATH_SECRET",
+            "unsupported-kafka-auth-properties",
+        ),
+        (
+            "sasl.oauthbearer.scope: 'fixtures write'",
+            "sasl.oauthbearer.jwks.endpoint.url: 'https://issuer.invalid/JWKS_SECRET'",
+            "unqualified-kafka-property",
+        ),
+    ] {
+        let report = assess(
+            &BROKER_OIDC.replace(from, to),
+            InputFormat::IngestYaml,
+            ALLOWED_BROKER_ENV,
+        );
+        assert!(!report.configuration_compatible);
+        assert!(
+            report
+                .configuration_gaps
+                .iter()
+                .any(|finding| finding.code == code)
+        );
+        let encoded = serde_json::to_string(&report).unwrap();
+        for secret in [
+            "CALLBACK_SECRET",
+            "ASSERTION_PATH_SECRET",
+            "JWKS_SECRET",
+            "BROKER_SECRET",
+            "ENDPOINT_SECRET",
+        ] {
+            assert!(!encoded.contains(secret));
+        }
+    }
+}
