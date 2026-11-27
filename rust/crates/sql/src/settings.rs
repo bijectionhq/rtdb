@@ -132,13 +132,10 @@ fn parse_extent(tokens: &[TokenWithSpan], source: &str, span: sqlparser::tokeniz
     }
     if word(tokens.first(), "FROM") {
         let (from, used) = expression(&tokens[1..], source, 0)?;
-        let mut at = used + 1;
-        let to = if word(tokens.get(at), "TO") {
-            let (to, used) = expression(&tokens[at + 1..], source, 0)?;
-            at += used + 1;
-            Some(to)
-        } else { None };
-        return Ok((TemporalExtent::FromTo(from, to), at));
+        let at = used + 1;
+        if !word(tokens.get(at), "TO") { return Err(sql_error("FROM requires TO", source, span)); }
+        let (to, used) = expression(&tokens[at + 1..], source, 0)?;
+        return Ok((TemporalExtent::FromTo(from, Some(to)), at + used + 1));
     }
     if word(tokens.first(), "BETWEEN") {
         let (from, used) = expression(&tokens[1..], source, 20)?;

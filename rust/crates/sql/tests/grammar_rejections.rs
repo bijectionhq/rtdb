@@ -222,3 +222,17 @@ fn non_grammar_dml_ddl_and_transaction_forms_are_rejected() {
         assert_eq!((error.category, error.code.as_str()), (AnomalyCategory::Incorrect, "xtdb/sql-error"), "{sql}");
     }
 }
+
+#[test]
+fn setting_before_explain_and_setting_from_without_to_are_rejected() {
+    for sql in [
+        "SETTING DEFAULT VALID_TIME ALL EXPLAIN SELECT 1",
+        "SETTING CLOCK_TIME = TIMESTAMP '2020-01-01T00:00:00Z' EXPLAIN ANALYZE SELECT 1",
+        "SETTING DEFAULT VALID_TIME FROM TIMESTAMP '2020-01-01T00:00:00Z' SELECT * FROM docs",
+        "SETTING DEFAULT SYSTEM_TIME FROM TIMESTAMP '2020-01-01T00:00:00Z' SELECT * FROM docs",
+    ] {
+        let error = rejection(sql);
+        assert_eq!((error.category, error.code.as_str()), (AnomalyCategory::Incorrect, "xtdb/sql-error"), "{sql}");
+    }
+    prepare("EXPLAIN SETTING DEFAULT VALID_TIME ALL SELECT * FROM docs", &Fixture, &PrepareOptions::default()).unwrap();
+}

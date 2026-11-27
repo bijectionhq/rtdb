@@ -408,6 +408,7 @@ pub(super) fn parse_statement_syntax<'input>(
         _ => None,
     }).collect();
     let (tokens, parameters) = crate::inline_xtql::extract(prefix, sql)?;
+    let leading_explain = word(tokens.first(), "EXPLAIN");
     let (tokens, settings) = crate::settings::extract(tokens, sql)?;
     let (tokens, wildcard_renames) = crate::wildcard::extract(tokens, sql)?;
     let (tokens, materialized) = crate::materialized::cte_tokens(tokens, sql)?;
@@ -537,7 +538,9 @@ pub(super) fn parse_statement_syntax<'input>(
         if index + used != tokens.len() { return Err(sql_error("Unexpected input after SET", sql, tokens[index + used].span)); }
         Syntax::Set { name, value, local }
     } else { Syntax::Standard(standard(tokens, sql)?) };
-    if !settings.is_empty() && !matches!(&statement, Syntax::Standard(ast::Statement::Query(_) | ast::Statement::Explain { .. })) {
+    if !settings.is_empty() && !(matches!(&statement, Syntax::Standard(ast::Statement::Query(_)))
+        || (leading_explain && matches!(&statement, Syntax::Standard(ast::Statement::Explain { .. }))))
+    {
         return Err(sql_error("SETTING requires a query expression", sql, slice[0].span));
     }
     crate::materialized::restore(&mut statement, &mut temporal, materialized, sql)?;
