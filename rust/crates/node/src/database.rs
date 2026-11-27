@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use rtdb_columnar::MemoryBudget;
 use rtdb_format::{database::proto::{DatabaseConfig, database_config}, keys::TrieKey, log::proto::{ArtefactsAdded, ArtefactsRemoved, TriesAdded}};
 use rtdb_index::PartitionState;
-use rtdb_maintenance::{ArtefactBuilder, ArtefactDatabase, ArtefactDriver, ArtefactHandle, ArtefactKind, ArtefactPublisher, BlockCollector, CollectionObserver, CompactionDriver, CompactionExecutor, CompactionHandle, CompactionJob, CompactionPublisher, CycleDriver, CycleHandle, SegmentCompactor, SnapshotSource, TrieCollector, TrieDeletionPublisher};
+use rtdb_maintenance::{ArtefactBuilder, ArtefactDatabase, ArtefactDriver, ArtefactHandle, ArtefactKind, ArtefactPublisher, BlockCollector, CollectionObserver, CompactionDriver, CompactionExecutor, CompactionHandle, CompactionJob, CompactionPublisher, CycleDriver, CycleHandle, CycleWorker, SegmentCompactor, SnapshotSource, TrieCollector, TrieDeletionPublisher};
 use rtdb_replication::{BlockStore, PartitionLogs, ProgressMonitor, ReplicationDriver, ReplicationHandle, Role, TermHandle};
 use rtdb_storage::{IoRegion, ObjectStore, cache::{BufferPool, CacheBudget}};
 use rtdb_tx::{ResolveContext, TransactionAuthorization};
@@ -858,7 +858,20 @@ impl TrieDeletionPublisher for PublishDeletions {
     async fn publish(&self, table: TableRef, keys: Vec<TrieKey>) -> Result<ReplicaPosition> { self.0.publish_deletions(table, keys).await }
 }
 
-struct TermRegion { term: Term, cancellation: CancellationToken, trie: CycleHandle, blocks: CycleHandle, ordered: Option<CycleHandle>, tasks: JoinSet<Result<()>> }
+struct GarbageCycle {
+    trie: Arc<TrieCollector>,
+    blocks: Arc<BlockCollector>,
+}
+
+#[async_trait]
+impl CycleWorker for GarbageCycle {
+    async fn collect(&self, cancellation: &CancellationToken) -> Result<()> {
+        self.trie.collect(cancellation).await?;
+        self.blocks.collect(cancellation).await
+    }
+}
+
+struct TermRegion { term: Term, cancellation: CancellationToken, garbage: CycleHandle, ordered: Option<CycleHandle>, tasks: JoinSet<Result<()>> }
 impl TermRegion {
     async fn join(mut self) -> Result<()> {
         self.cancellation.cancel();
@@ -897,14 +910,13 @@ impl MaintenanceSupervisor {
             memory: Arc::clone(&self.memory), term: handle.clone(),
         })));
         let block_collector = Arc::new(BlockCollector::new(Arc::clone(&self.store), self.partition.clone(), Arc::clone(&self.observer), self.options.garbage.clone())?);
-        let (trie_driver, trie) = CycleDriver::new(trie_collector, self.options.automatic_gc, self.options.command_capacity)?;
-        let (block_driver, blocks) = CycleDriver::new(block_collector, self.options.automatic_gc, self.options.command_capacity)?;
+        let garbage_cycle: Arc<dyn CycleWorker> = Arc::new(GarbageCycle { trie: trie_collector, blocks: block_collector });
+        let (garbage_driver, garbage) = CycleDriver::new(garbage_cycle, self.options.automatic_gc, self.options.command_capacity)?;
         let source = match &mut self.source {
             Some(source) => Some(source.assign().await?), None => None,
         };
         let mut tasks = JoinSet::new();
-        tasks.spawn(trie_driver.run(cancellation.clone()));
-        tasks.spawn(block_driver.run(cancellation.clone()));
+        tasks.spawn(garbage_driver.run(cancellation.clone()));
         if let Some(source) = source {
             let term = handle.clone();
             let after = self.replication.progress().current().external_token;
@@ -913,14 +925,14 @@ impl MaintenanceSupervisor {
             tasks.spawn(async move { source.run(term, after, status, token).await });
         }
         let ordered = if let Some(worker) = &self.ordered_worker {
-            let worker: Arc<dyn rtdb_maintenance::CycleWorker> = worker.clone();
+            let worker: Arc<dyn CycleWorker> = worker.clone();
             let (driver, handle) = CycleDriver::new(worker, self.options.automatic_artefacts, self.options.command_capacity)?;
             tasks.spawn(driver.run(cancellation.clone()));
             handle.signal();
             Some(handle)
         } else { None };
         if let Some(cycle) = &self.ordered_cycle { cycle.send_replace(ordered.clone()); }
-        Ok(TermRegion { term: handle.term(), cancellation, trie, blocks, ordered, tasks })
+        Ok(TermRegion { term: handle.term(), cancellation, garbage, ordered, tasks })
     }
     async fn run(mut self, cancellation: CancellationToken) -> Result<()> {
         let mut status = self.replication.watch_status();
@@ -951,8 +963,7 @@ impl MaintenanceSupervisor {
                 if let Some(compaction) = &self.compaction { compaction.signal_block(); }
                 for lane in &self.artefacts { lane.signal_block(); }
                 if let Some(region) = &region {
-                    region.trie.signal();
-                    region.blocks.signal();
+                    region.garbage.signal();
                     if let Some(ordered) = &region.ordered { ordered.signal(); }
                 }
             }
