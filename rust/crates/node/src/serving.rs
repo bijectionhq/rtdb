@@ -403,7 +403,7 @@ pub trait ServingDriver: Send + Sync {
     async fn store_version_hold(
         &self, _reader: [u8; 32], _request: StoreVersionHoldRequest, _cancellation: &CancellationToken,
     ) -> Result<StoreVersionHoldReply> {
-        Err(Anomaly::unsupported("rtdb.store/hold-unsupported", "This route cannot order a Store Version hold"))
+        Err(rtdb_types::Anomaly::unsupported("rtdb.store/hold-unsupported", "This route cannot order a Store Version hold"))
     }
 
     /// Success confirms the durable floor in `since`'s incarnation after checking the exact retained basis and guards.
