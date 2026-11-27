@@ -467,6 +467,7 @@
 -- Adopted compound records keep canonical field order including the empty first field, and native Date and Instant cells must remain inside hosted years 0001 through 9999.
 -- The virgin successor receives the original coordinates, assertion ordinals, origin, valid intervals and SQL history times with its changed field carrier and intrinsic order roles.
 -- The receiver interprets a stored null in an optional non-nullable field as absence before checking the successor declaration.
+-- An unchanged record or list copied with its exact layout retains child order, values and nulls in the successor.
 -- The Root declaration switch, successor partition head, attempt marker and source retirement publish with the copied history in one resolved transaction.
 -- A direct historical read of the successor must select a cut at or after the adoption, and an earlier held Root catalog continues to select the predecessor.
 -- A hosted Root publication may include read conditions issued by placed held worlds in the same attachment.

@@ -418,7 +418,7 @@ fn try_copy_positioned_journal<'a>(
     let mut columns = BTreeMap::new();
     for field in &target {
         let name = field.name().as_str();
-        if !plain_journal_field(field) || !exact_column(&positions, events, name, field) {
+        if !plain_history_field(field) || !exact_column(&positions, events, name, field) {
             return Ok(None);
         }
         columns.insert(name, name);
@@ -437,7 +437,7 @@ fn try_copy_positioned_data<'a>(
     let mut columns = BTreeMap::new();
     for field in &target {
         let name = field.name().as_str();
-        if name == converted || !plain_data_field(field) { continue; }
+        if name == converted || !plain_history_field(field) { continue; }
         let source = orders.iter().find_map(|(old, new)| (*new == name).then_some(*old)).unwrap_or(name);
         if exact_column(&positions, events, source, field) {
             columns.insert(name, source);
@@ -494,13 +494,6 @@ fn exact_column(positions: &[EventRef<'_>], events: &[StoredEvent], name: &str, 
     })
 }
 
-fn plain_data_field(field: &Field) -> bool {
-    field.metadata().is_empty() && matches!(field.data_type(),
-        DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
-        | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64
-        | DataType::Utf8 | DataType::Binary)
-}
-
 fn positioned_cell<'a>(source: &'a EventRef<'_>, name: &str, value: Option<&Value>) -> Option<PutColumn<'a>> {
     if matches!(value, None | Some(Value::Null)) {
         return Some(PutColumn::Absent);
@@ -521,11 +514,13 @@ fn write_positioned_history<'a>(
     IndexBatch::from_owned(owned_event_batch(&positioned, Some(fields), true, memory)?)
 }
 
-fn plain_journal_field(field: &Field) -> bool {
+fn plain_history_field(field: &Field) -> bool {
     field.metadata().is_empty() && match field.data_type() {
-        DataType::Null | DataType::Int64 | DataType::Utf8 | DataType::Binary => true,
-        DataType::List(item) => plain_journal_field(item),
-        DataType::Struct(fields) => fields.iter().all(|field| plain_journal_field(field)),
+        DataType::Null | DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+        | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64
+        | DataType::Utf8 | DataType::Binary => true,
+        DataType::List(item) => plain_history_field(item),
+        DataType::Struct(fields) => fields.iter().all(|field| plain_history_field(field)),
         _ => false,
     }
 }
@@ -608,7 +603,7 @@ pub(super) fn uncovered(reason: impl Into<String>) -> Anomaly {
 mod tests {
     use std::{num::NonZeroU32, sync::Arc};
 
-    use rtdb_columnar::MemoryBudget;
+    use rtdb_columnar::{MemoryBudget, to_field};
     use rtdb_format::{data::{StoredEvent, StoredOperation}, envelope::ReplicaBody};
     use rtdb_index::{IndexBatch, PartitionState};
     use rtdb_query::QueryOptions;
@@ -621,7 +616,8 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use crate::{Documents, HostedAuthority, HostedControlWrite, SourceTransaction, SubmitOptions, TxOp, bind_installed_authority};
-    use super::{copy_adoption_journal, intrinsic_orders, try_copy_positioned_data, try_copy_positioned_journal, verify_journal};
+    use super::{copy_adoption_journal, exact_column, intrinsic_orders, live_history_positions, plain_history_field,
+        try_copy_positioned_data, try_copy_positioned_journal, verify_journal};
     use super::super::{OpenTransaction, OwnedPathKind, ResolveContext, TransactionAuthorization, TxResolver, attempt_marker_document};
 
     const PAYLOAD: &str = "c_0123456789abcdef0123456789abcdef";
@@ -694,11 +690,16 @@ mod tests {
         first.insert(PAYLOAD.into(), Value::Binary(vec![12, 6]));
         first.insert("caption".into(), Value::Utf8("unchanged".into()));
         first.insert("nullable".into(), Value::Bool(true));
+        first.insert("details".into(), Value::Struct(StructFields::from([
+            ("labels".into(), Value::list(vec![Value::Utf8("one".into()), Value::Utf8("two".into())])),
+            ("score".into(), Value::I64(12)),
+        ])));
         let mut second = document(2);
         second.insert(PAYLOAD.into(), Value::Binary(vec![2]));
         second.insert("nullable".into(), Value::Null);
         let mut third = document(3);
         third.insert("caption".into(), Value::Null);
+        third.insert("details".into(), Value::Null);
         let valid_time = Interval::new(Timestamp(180), Timestamp(900))?;
         let event = |id, transaction, ordinal, operation| {
             let id = EntityId::Binary(vec![id]);
@@ -739,8 +740,13 @@ mod tests {
             ("v2_value".into(), Value::Decimal(DecimalValue::new((-123i128).to_be_bytes().to_vec(), 38, 0, 128)?)),
         ])));
 
-        let copied = try_copy_positioned_data(&events, [new.view(), old.view()].into_iter(), PAYLOAD, orders, &memory)?
-            .expect("both renamed binary order columns are positioned");
+        let live = [new.view(), old.view()];
+        let fields = IndexBatch::inferred_event_put_types(&events).unwrap();
+        let details = to_field("details", &fields["details"])?;
+        assert!(plain_history_field(&details));
+        assert!(exact_column(&live_history_positions(&events, live.into_iter())?.unwrap(), &events, "details", &details));
+        let copied = try_copy_positioned_data(&events, live.into_iter(), PAYLOAD, orders, &memory)?
+            .expect("the order columns and plain nested sibling are positioned");
         drop((old, new));
         let scalar = IndexBatch::copy_events(&events, &StructFields::new(), &memory)?;
         let wire = |batch: &IndexBatch| crate::ipc::encode(batch.arrow().schema_ref(), [batch.arrow()], &memory);
