@@ -302,6 +302,13 @@ internal fun <T> withUserMetadata(al: BufferAllocator, bytes: ByteString?, useMe
 fun deserializeUserMetadata(al: BufferAllocator, bytes: ByteString): Any? =
     withUserMetadata(al, bytes) { it!!.getObject(0) }
 
+private fun VectorReader.isDirectMetadataScalar(): Boolean = when (this) {
+    is Utf8Vector, is KeywordVector -> (0 until valueCount).all { UnsafeByteOperations.unsafeWrap(getBytes(it)).isValidUtf8 }
+    is BitVector, is ByteVector, is ShortVector, is IntVector, is LongVector,
+    is FloatVector, is DoubleVector, is VarBinaryVector, is UuidVector, is DateDayVector -> true
+    else -> false
+}
+
 private fun Vector.isDirectMetadata(): Boolean {
     if (valueCount == 0) return this is NullVector
 
@@ -311,10 +318,8 @@ private fun Vector.isDirectMetadata(): Boolean {
             getListStartIndex(0) == 0 && getListEndIndex(valueCount - 1) == elements.valueCount &&
                 (!elements.nullable || elements.valueCount == 0) && elements.isDirectMetadata()
         }
-        is Utf8Vector -> (0 until valueCount).all { UnsafeByteOperations.unsafeWrap(getBytes(it)).isValidUtf8 }
-        is BitVector, is ByteVector, is ShortVector, is IntVector, is LongVector,
-        is FloatVector, is DoubleVector, is VarBinaryVector, is UuidVector, is DateDayVector -> true
-        else -> false
+        is RunEndEncodedVector -> valueCount == 1 && runCount == 1 && runValues.isDirectMetadataScalar()
+        else -> isDirectMetadataScalar()
     }
 }
 
@@ -327,6 +332,7 @@ private fun Vector.matchesMetadataDestination(dest: VectorWriter?): Boolean {
         is ListVector -> dest is ListVector && dest.listElements.let { elements ->
             (elements is NullVector && elements.valueCount == 0) || listElements.matchesMetadataDestination(elements)
         }
+        is RunEndEncodedVector -> dest.type.encoding == Encoding.Plain
         else -> true
     }
 }
