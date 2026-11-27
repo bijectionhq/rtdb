@@ -68,7 +68,7 @@ As in upstream's image, the default root account trusts every connection unless 
 The cluster configurations (`/etc/rtdb/cluster-default.yaml` and `/etc/rtdb/cluster-multi.yaml`) still read the root password from `RTDB_ROOT_PASSWORD`, which the Terraform module supplies, and still cache under `/var/lib/rtdb/cache`; they are RTDB's own deployment, with no upstream counterpart.
 The image serves pgwire on 5432, Flight SQL on 3000 and health/metrics on 8080.
 Its `HEALTHCHECK` polls `/healthz/alive` with `wget` after a fifteen-second start period, as upstream's does.
-Logs go to stdout; `XTDB_LOG_FORMAT=json`, `XTDB_LOG_JSON_TEMPLATE` (upstream's three bundled templates only) and `XTDB_LOGGING_LEVEL[_NS]` behave as upstream's.
+Logs go to stdout; `XTDB_LOG_FORMAT=json`, `XTDB_LOG_JSON_TEMPLATE` (a bundled `classpath:` template or a `file:` URI; a resolver RTDB cannot honour refuses startup) and `XTDB_LOGGING_LEVEL[_NS]` behave as upstream's.
 The image uses jemalloc with a background purge thread, a one-second dirty-page decay and immediate release of muzzy pages.
 `playground --port 5439 --flight-sql-port 3000` selects the original client-suite mode.
 The process receives SIGTERM directly and drains its database and listener owners before returning.

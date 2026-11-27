@@ -2,7 +2,7 @@
 //!
 //! `XTDB_LOG_FORMAT` selects `text` (the default) or `json`.
 //! `XTDB_LOGGING_LEVEL` sets the `xtdb` logger and `XTDB_LOGGING_LEVEL_<NS>` sets `xtdb.<ns>`, with `_` separating components.
-//! `XTDB_LOG_JSON_TEMPLATE` selects one of upstream's bundled JSON templates; any other template is refused at startup.
+//! `XTDB_LOG_JSON_TEMPLATE` names a log4j `JsonTemplateLayout` event template: one of the bundled ones or a `file:` URI.
 //! RTDB's `rtdb_<crate>::<module>` targets are named `xtdb.<crate>.<module>`, with `_` inside a component written as `-`.
 //! A target in one of [`UPSTREAM_ALIASES`] also answers to the upstream logger it stands for, so `XTDB_LOGGING_LEVEL_INDEXER`
 //! reaches RTDB's indexer as it reaches upstream's.
@@ -22,29 +22,8 @@ pub enum LogFormat { Text, Json }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LogOutput { Stdout, Stderr }
 
-/// Upstream's bundled `JsonTemplateLayout` templates, by the URI `XTDB_LOG_JSON_TEMPLATE` names them with.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum JsonLayout {
-    /// `classpath:xtdb/logging/AwsCloudWatchLayout.json`, upstream's default.
-    AwsCloudWatch,
-    /// `classpath:xtdb/logging/AzureMonitorLayout.json`, set by upstream's Azure image.
-    AzureMonitor,
-    /// `classpath:GcpLayout.json`, log4j's own template, set by upstream's Google Cloud image.
-    Gcp,
-}
-impl JsonLayout {
-    const TEMPLATES: [(&'static str, Self); 3] = [
-        ("classpath:xtdb/logging/AwsCloudWatchLayout.json", Self::AwsCloudWatch),
-        ("classpath:xtdb/logging/AzureMonitorLayout.json", Self::AzureMonitor),
-        ("classpath:GcpLayout.json", Self::Gcp),
-    ];
-    fn parse(value: &str) -> Result<Self> {
-        Self::TEMPLATES.iter().find(|(uri, _)| *uri == value).map(|(_, layout)| *layout).ok_or_else(|| {
-            let known = Self::TEMPLATES.iter().map(|(uri, _)| *uri).collect::<Vec<_>>().join(", ");
-            Anomaly::incorrect("rtdb.logging/json-template", format!("XTDB_LOG_JSON_TEMPLATE names {value:?}, but RTDB only has upstream's bundled templates: {known}"))
-        })
-    }
-}
+mod template;
+pub use template::{DEFAULT_TEMPLATE_URI, JsonTemplate};
 
 /// RTDB targets that stand for one of upstream's main loggers: the target prefix, then the upstream logger name.
 /// Each target keeps its own `xtdb.<crate>.<module>` name too, and the more specific configured level of the two applies.
@@ -66,7 +45,7 @@ fn upstream_alias(target: &str) -> Option<&'static str> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LogConfig { format: LogFormat, json_layout: JsonLayout, levels: LogLevels }
+pub struct LogConfig { format: LogFormat, json_template: JsonTemplate, levels: LogLevels }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LogLevels {
@@ -102,15 +81,15 @@ impl LogLevels {
 
 impl LogConfig {
     /// Reads every `XTDB_LOGGING_LEVEL[_NS]` variable, `XTDB_LOG_FORMAT` and `XTDB_LOG_JSON_TEMPLATE`,
-    /// failing on a level or format upstream would reject and on a template RTDB does not have.
+    /// failing on a level or format upstream would reject and on a template RTDB cannot read or honour.
     pub fn from_environment(variables: impl IntoIterator<Item = (String, String)>) -> Result<Self> {
         let mut levels = LogLevels { root: LevelFilter::WARN, loggers: vec![("xtdb".into(), LevelFilter::INFO)] };
         let mut format = LogFormat::Text;
-        let mut json_layout = JsonLayout::AwsCloudWatch;
+        let mut template_uri = None;
         for (name, value) in variables {
             if name == "XTDB_LOG_JSON_TEMPLATE" {
                 // Upstream's `${env:XTDB_LOG_JSON_TEMPLATE:-…}` falls back to its default for an empty value as for an unset one.
-                if !value.is_empty() { json_layout = JsonLayout::parse(&value)?; }
+                if !value.is_empty() { template_uri = Some(value); }
             } else if name == "XTDB_LOG_FORMAT" {
                 format = match value.as_str() {
                     "text" => LogFormat::Text,
@@ -121,10 +100,11 @@ impl LogConfig {
                 levels.set(logger, parse_level(&name, &value)?);
             }
         }
-        Ok(Self { format, json_layout, levels })
+        let json_template = JsonTemplate::load(template_uri.as_deref().unwrap_or(DEFAULT_TEMPLATE_URI))?;
+        Ok(Self { format, json_template, levels })
     }
     pub fn format(&self) -> LogFormat { self.format }
-    pub fn json_layout(&self) -> JsonLayout { self.json_layout }
+    pub fn json_template(&self) -> &JsonTemplate { &self.json_template }
     /// Whether an event from `target` at `level` would be written.
     pub fn enabled(&self, target: &str, level: Level) -> bool { level <= self.levels.level(&logger_name(target), upstream_alias(target)) }
 }
@@ -203,54 +183,14 @@ impl Logger {
                 line
             }
             LogFormat::Json => {
-                let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
                 let thread = std::thread::current().name().unwrap_or("unnamed").to_owned();
-                let context = |fields: &[(&'static str, String)]| fields.iter().map(|(name, value)| ((*name).to_owned(), serde_json::Value::from(value.clone()))).collect::<serde_json::Map<String, serde_json::Value>>();
-                let lookup = |key: &str| fields.context.iter().find(|(name, _)| *name == key).map(|(_, value)| value.clone());
-                let mut object = serde_json::Map::new();
-                match self.config.json_layout {
-                    JsonLayout::AwsCloudWatch => {
-                        object.insert("timestamp".into(), timestamp.into());
-                        object.insert("level".into(), metadata.level().as_str().into());
-                        object.insert("logger".into(), logger.into());
-                        object.insert("message".into(), fields.message.clone().into());
-                        object.insert("thread".into(), thread.into());
-                        if !fields.context.is_empty() { object.insert("context".into(), context(fields.context.as_slice()).into()); }
-                    }
-                    JsonLayout::AzureMonitor => {
-                        object.insert("Timestamp".into(), timestamp.into());
-                        object.insert("Severity".into(), metadata.level().as_str().into());
-                        object.insert("Message".into(), fields.message.clone().into());
-                        if let Some(trace) = lookup("trace_id") { object.insert("OperationId".into(), trace.into()); }
-                        if let Some(span) = lookup("span_id") { object.insert("ParentId".into(), span.into()); }
-                        let mut attributes = serde_json::Map::new();
-                        attributes.insert("log.logger.name".into(), logger.into());
-                        attributes.insert("thread.name".into(), thread.into());
-                        if !fields.context.is_empty() { attributes.insert("custom.context".into(), context(fields.context.as_slice()).into()); }
-                        object.insert("Attributes".into(), attributes.into());
-                    }
-                    JsonLayout::Gcp => {
-                        // log4j's GcpLayout.json maps WARN to WARNING and TRACE to DEBUG, Cloud Logging's severity names.
-                        let level = *metadata.level();
-                        let severity = if level == Level::WARN { "WARNING" } else if level == Level::TRACE { "DEBUG" } else { level.as_str() };
-                        object.insert("timestamp".into(), timestamp.into());
-                        object.insert("severity".into(), severity.into());
-                        object.insert("message".into(), fields.message.clone().into());
-                        if !fields.context.is_empty() { object.insert("logging.googleapis.com/labels".into(), context(fields.context.as_slice()).into()); }
-                        if let Some(trace) = lookup("trace_id") { object.insert("logging.googleapis.com/trace".into(), trace.into()); }
-                        if let Some(span) = lookup("span_id") { object.insert("logging.googleapis.com/spanId".into(), span.into()); }
-                        let mut location = serde_json::Map::new();
-                        if let Some(file) = metadata.file() { location.insert("file".into(), file.into()); }
-                        if let Some(line) = metadata.line() { location.insert("line".into(), line.into()); }
-                        if let Some(module) = metadata.module_path() { location.insert("function".into(), module.into()); }
-                        if !location.is_empty() { object.insert("logging.googleapis.com/sourceLocation".into(), location.into()); }
-                        let inserted = self.inserted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        object.insert("logging.googleapis.com/insertId".into(), inserted.to_string().into());
-                        object.insert("_thread".into(), thread.into());
-                        object.insert("_logger".into(), logger.into());
-                    }
-                }
-                let mut line = serde_json::Value::Object(object).to_string();
+                let template = &self.config.json_template;
+                let counter = if template.uses_counter() { self.inserted.fetch_add(1, std::sync::atomic::Ordering::Relaxed) } else { 0 };
+                let event = template::Event {
+                    timestamp: chrono::Utc::now(), level: *metadata.level(), logger: &logger, message: &fields.message, thread: &thread,
+                    context: &fields.context, file: metadata.file(), line: metadata.line(), module: metadata.module_path(), counter,
+                };
+                let mut line = template.render(&event).to_string();
                 line.push('\n');
                 line
             }
@@ -341,14 +281,21 @@ mod tests {
     }
 
     #[test]
-    fn json_templates_are_upstreams_bundled_ones_or_refused() {
-        assert_eq!(config(&[]).unwrap().json_layout(), JsonLayout::AwsCloudWatch);
-        assert_eq!(config(&[("XTDB_LOG_JSON_TEMPLATE", "")]).unwrap().json_layout(), JsonLayout::AwsCloudWatch);
-        assert_eq!(config(&[("XTDB_LOG_JSON_TEMPLATE", "classpath:xtdb/logging/AzureMonitorLayout.json")]).unwrap().json_layout(), JsonLayout::AzureMonitor);
-        assert_eq!(config(&[("XTDB_LOG_JSON_TEMPLATE", "classpath:GcpLayout.json")]).unwrap().json_layout(), JsonLayout::Gcp);
-        let refused = config(&[("XTDB_LOG_JSON_TEMPLATE", "file:///etc/xtdb/layout.json")]).unwrap_err();
+    fn json_templates_are_bundled_or_read_from_a_file() {
+        assert_eq!(config(&[]).unwrap().json_template().uri(), DEFAULT_TEMPLATE_URI);
+        assert_eq!(config(&[("XTDB_LOG_JSON_TEMPLATE", "")]).unwrap().json_template().uri(), "classpath:xtdb/logging/AwsCloudWatchLayout.json");
+        assert_eq!(config(&[("XTDB_LOG_JSON_TEMPLATE", "classpath:GcpLayout.json")]).unwrap().json_template().uri(), "classpath:GcpLayout.json");
+        let refused = config(&[("XTDB_LOG_JSON_TEMPLATE", "file:///nonexistent/xtdb/layout.json")]).unwrap_err();
         assert_eq!(refused.code, "rtdb.logging/json-template");
-        assert!(refused.message.as_deref().unwrap_or("").contains("AwsCloudWatchLayout.json"), "{refused:?}");
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("layout.json");
+        std::fs::write(&path, r#"{"lvl": {"$resolver": "level", "field": "name"}, "msg": {"$resolver": "message"}, "app": "xtdb"}"#).unwrap();
+        let uri = format!("file://{}", path.display());
+        let output = capture(config(&[("XTDB_LOG_FORMAT", "json"), ("XTDB_LOG_JSON_TEMPLATE", uri.as_str())]).unwrap(), || {
+            tracing::warn!(target: "rtdb_node::database", "Slow");
+        });
+        assert_eq!(output, "{\"lvl\":\"WARN\",\"msg\":\"Slow\",\"app\":\"xtdb\"}\n");
     }
 
     #[test]
@@ -363,6 +310,7 @@ mod tests {
         assert_eq!(line["Attributes"]["log.logger.name"], "xtdb.node.database");
         assert_eq!(line["Attributes"]["custom.context"]["database"], "xtdb");
         assert!(line["Timestamp"].as_str().unwrap().ends_with('Z'));
+        assert!(line.get("Exception").is_none());
 
         let gcp = capture(config(&[("XTDB_LOG_FORMAT", "json"), ("XTDB_LOG_JSON_TEMPLATE", "classpath:GcpLayout.json")]).unwrap(), || {
             tracing::warn!(target: "rtdb_node::database", database = "xtdb", "Slow");
@@ -372,9 +320,11 @@ mod tests {
         assert_eq!(lines[0]["severity"], "WARNING");
         assert_eq!(lines[1]["severity"], "ERROR");
         assert_eq!(lines[0]["message"], "Slow");
-        assert_eq!(lines[0]["_logger"], "xtdb.node.database");
+        assert_eq!(lines[0]["logger"], "xtdb.node.database");
         assert_eq!(lines[0]["logging.googleapis.com/labels"]["database"], "xtdb");
-        assert_ne!(lines[0]["logging.googleapis.com/insertId"], lines[1]["logging.googleapis.com/insertId"]);
+        assert_eq!(lines[0]["logging.googleapis.com/trace_sampled"], true);
+        assert!(lines[0]["timestampSeconds"].is_i64());
+        assert!(lines[0]["timestampNanos"].is_i64());
     }
 
     #[test]
