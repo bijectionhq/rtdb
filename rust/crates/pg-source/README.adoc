@@ -32,6 +32,9 @@ A custom indexer must keep its resources and work inside the supplied future so 
 The source checks that the publication exists before choosing a snapshot or resume path.
 An incomplete snapshot token is an ingestion fault because PostgreSQL's exported snapshot cannot survive the creating connection.
 A new source creates a failover-enabled logical slot with an exported snapshot, requiring PostgreSQL 17 or later.
+A duplicate slot is reported as a conflict.
+Other upstream command failures report the PostgreSQL 17 primary requirement.
+Both diagnostics identify the slot and include the upstream message and SQLSTATE when available.
 The slot connection stays open without another command while a second connection imports that snapshot in a repeatable-read transaction.
 Publication tables and table rows use bounded server cursors with pages of 1,000 rows.
 The source submits snapshot pages in order with an incomplete token and awaits the final complete-token transaction after all pages.
@@ -121,6 +124,3 @@ The broad Java-specific JSON-LD/Transit object families require fixture qualific
 Float4 text parses directly at single precision, and interval parsing rejects exponents beyond the bounded native decimal conversion range.
 Frame/row/relation reservations precede decoding, but TLS/authentication internals, remote configuration allocations, and all nested JSON/Transit amplification still need a complete retained-allocation audit.
 Native protocol integration, failover, authentication, permission, reconnect fault injection, simulation/property parity, and source-level performance remain unexecuted Phase 2 work.
-
-Slot-creation error reclassification preserves an optional native message.
-The native wrapper currently forwards that message without the contextual wording constructed by the pinned `PgWireDriver`; that diagnostic parity work remains separate.
