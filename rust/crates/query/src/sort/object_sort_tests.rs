@@ -286,6 +286,8 @@ mod limited {
             Some(vec![0]),
             Some(b"wide-key".to_vec()),
             Some([b"wide-key".as_slice(), &[0]].concat()),
+            Some(b"name-0099999-abL8".to_vec()),
+            Some(b"name-0099999-abL9".to_vec()),
             Some([common.as_slice(), &[0]].concat()),
             Some([common.as_slice(), &[1]].concat()),
             Some(vec![255]),

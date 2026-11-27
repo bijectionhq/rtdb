@@ -293,14 +293,30 @@ enum Key<'a> {
 #[derive(Clone, Copy)]
 pub(super) enum BytePrefix {
     Null,
-    Bytes { word: u64, len: usize },
+    Bytes { bytes: [u8; PREFIX_BYTES], len: u8 },
 }
 
-const PREFIX_BYTES: usize = size_of::<u64>();
+const PREFIX_BYTES: usize = 3 * size_of::<usize>() - 2;
+const TRUNCATED_LENGTH: u8 = (PREFIX_BYTES + 1) as u8;
 
 pub(super) struct ByteKey<'a> {
     pub prefix: BytePrefix,
     pub tail: &'a [u8],
+}
+
+impl<'a> ByteKey<'a> {
+    fn from_bytes(bytes: &'a [u8]) -> Self {
+        let (first, tail) = bytes.split_at(bytes.len().min(PREFIX_BYTES));
+        let mut prefix = [0; PREFIX_BYTES];
+        prefix[..first.len()].copy_from_slice(first);
+        Self {
+            prefix: BytePrefix::Bytes {
+                bytes: prefix,
+                len: bytes.len().min(usize::from(TRUNCATED_LENGTH)) as u8,
+            },
+            tail,
+        }
+    }
 }
 
 impl BytePrefix {
@@ -309,10 +325,12 @@ impl BytePrefix {
             (Self::Null, Self::Null) => return Some(Ordering::Equal),
             (Self::Null, _) => return Some(if order.nulls_first { Ordering::Less } else { Ordering::Greater }),
             (_, Self::Null) => return Some(if order.nulls_first { Ordering::Greater } else { Ordering::Less }),
-            (Self::Bytes { word: left, len }, Self::Bytes { word: right, len: other_len }) => {
+            (Self::Bytes { bytes: left, len }, Self::Bytes { bytes: right, len: other_len }) => {
                 match left.cmp(&right) {
-                    Ordering::Equal if len.min(other_len) <= PREFIX_BYTES => len.cmp(&other_len),
-                    Ordering::Equal => return None,
+                    Ordering::Equal if len == TRUNCATED_LENGTH && other_len == TRUNCATED_LENGTH => {
+                        return None;
+                    }
+                    Ordering::Equal => len.cmp(&other_len),
                     comparison => comparison,
                 }
             }
@@ -410,12 +428,7 @@ impl NativeOrder {
     pub fn leading_bytes<'a>(&self, batch: &'a ColumnBatch, row: usize) -> ByteKey<'a> {
         match self.leading_key(batch, row) {
             Key::Null => ByteKey { prefix: BytePrefix::Null, tail: &[] },
-            Key::Text(bytes) => {
-                let (first, tail) = bytes.split_at(bytes.len().min(PREFIX_BYTES));
-                let mut word = [0; PREFIX_BYTES];
-                word[..first.len()].copy_from_slice(first);
-                ByteKey { prefix: BytePrefix::Bytes { word: u64::from_be_bytes(word), len: bytes.len() }, tail }
-            }
+            Key::Text(bytes) => ByteKey::from_bytes(bytes),
             _ => unreachable!("expected a byte sort key"),
         }
     }
@@ -474,6 +487,73 @@ impl NativeOrder {
             }
         }
         Ok(Ordering::Equal)
+    }
+}
+
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn byte_prefix_resolves_concatenated_name_and_label_keys_inline() {
+    use rtdb_plan::ColumnId;
+
+    let order = SortExpr {
+        expr: Expr::Column {
+            id: ColumnId(0),
+            data_type: LogicalType::Scalar(ScalarType::Utf8),
+        },
+        descending: false,
+        nulls_first: false,
+    };
+    let left = ByteKey::from_bytes("name-0000000-éßL8".as_bytes());
+    let right = ByteKey::from_bytes("name-0000000-éßL9".as_bytes());
+    assert!(left.tail.is_empty() && right.tail.is_empty());
+    assert_eq!(
+        left.prefix.compare(right.prefix, &order),
+        Some(Ordering::Less)
+    );
+}
+
+#[test]
+fn byte_prefix_orders_zero_padding_and_leaves_equal_truncated_prefixes_to_the_tail() {
+    use rtdb_plan::ColumnId;
+
+    assert!(size_of::<BytePrefix>() <= 3 * size_of::<usize>());
+    let exact = [0; PREFIX_BYTES];
+    let longer = [0; PREFIX_BYTES + 1];
+    let longest = [0; PREFIX_BYTES + 2];
+    let shorter = &exact[..PREFIX_BYTES - 1];
+    for (descending, nulls_first) in [(false, false), (true, false), (false, true), (true, true)] {
+        let order = SortExpr {
+            expr: Expr::Column {
+                id: ColumnId(0),
+                data_type: LogicalType::Scalar(ScalarType::Binary),
+            },
+            descending,
+            nulls_first,
+        };
+        let directed = |ordering: Ordering| {
+            if descending { ordering.reverse() } else { ordering }
+        };
+        for (left, right, resolved_inline) in [
+            (shorter, exact.as_slice(), true),
+            (exact.as_slice(), longer.as_slice(), true),
+            (longer.as_slice(), longest.as_slice(), false),
+            (exact.as_slice(), exact.as_slice(), true),
+        ] {
+            let (a, b) = (ByteKey::from_bytes(left), ByteKey::from_bytes(right));
+            let expected = directed(left.cmp(right));
+            let prefix = a.prefix.compare(b.prefix, &order);
+            assert_eq!(prefix, resolved_inline.then_some(expected));
+            assert_eq!(
+                prefix.unwrap_or_else(|| directed(a.tail.cmp(b.tail))),
+                expected
+            );
+        }
+        let empty = ByteKey::from_bytes(&[]);
+        let null_order = if nulls_first { Ordering::Less } else { Ordering::Greater };
+        assert_eq!(
+            BytePrefix::Null.compare(empty.prefix, &order),
+            Some(null_order)
+        );
     }
 }
 
