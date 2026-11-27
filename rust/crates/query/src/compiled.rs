@@ -195,9 +195,14 @@ pub(crate) enum OperatorTemplate {
     Other,
 }
 
-/// Predicates over a fixed input schema, with whether each has been admitted for it.
+/// Predicates over a fixed input schema, with each stage's plan-time column binding and whether it has been admitted.
 #[derive(Debug)]
-pub(crate) struct Predicates { pub(crate) schema: Arc<Schema>, pub(crate) stages: Arc<[Expr]>, pub(crate) admissions: Arc<[Admission]> }
+pub(crate) struct Predicates {
+    pub(crate) schema: Arc<Schema>,
+    pub(crate) stages: Arc<[Expr]>,
+    pub(crate) compiled: Arc<[Option<crate::columnar::functions::Predicate>]>,
+    pub(crate) admissions: Arc<[Admission]>,
+}
 
 impl PartialEq for Predicates {
     fn eq(&self, other: &Self) -> bool { self.schema == other.schema && self.stages == other.stages }
@@ -205,12 +210,16 @@ impl PartialEq for Predicates {
 
 impl Predicates {
     pub(crate) fn new(schema: Arc<Schema>, stages: Arc<[Expr]>) -> Self {
+        let compiled = stages.iter().map(|stage| crate::columnar::functions::Predicate::bind(stage, &schema)).collect();
         let admissions = stages.iter().map(Admission::of).collect();
-        Self { schema, stages, admissions }
+        Self { schema, stages, compiled, admissions }
     }
     fn retained_bytes(&self) -> Result<usize> {
         let bytes = schema_bound(&self.schema)?;
         let bytes = self.stages.iter().try_fold(bytes, |bytes, stage| bytes.checked_add(expression_bound(stage)?).ok_or_else(size_error))?;
+        let slots = self.compiled.len().checked_mul(std::mem::size_of::<Option<crate::columnar::functions::Predicate>>()).ok_or_else(size_error)?;
+        let bytes = bytes.checked_add(slots).ok_or_else(size_error)?;
+        let bytes = self.compiled.iter().flatten().try_fold(bytes, |bytes, predicate| bytes.checked_add(predicate.retained_bytes()?).ok_or_else(size_error))?;
         self.admissions.len().checked_mul(std::mem::size_of::<Admission>()).and_then(|admissions| bytes.checked_add(admissions)).ok_or_else(size_error)
     }
 }
@@ -219,9 +228,17 @@ impl Predicates {
 #[derive(Debug, PartialEq)]
 pub(crate) struct StackedFilters { pub(crate) predicates: Predicates, pub(crate) bounds: Arc<[usize]> }
 
-/// Expressions over a fixed input schema, with whether any falls back to row evaluation and whether each has been admitted.
+/// Expressions over a fixed input schema, with each expression's plan-time column binding, whether any falls back to
+/// row evaluation, and whether each has been admitted.
 #[derive(Debug)]
-pub(crate) struct Projections { pub(crate) schema: Arc<Schema>, pub(crate) expressions: Arc<[Expr]>, pub(crate) scalar_fallback: bool, pub(crate) admissions: Arc<[Admission]> }
+pub(crate) struct Projections {
+    pub(crate) schema: Arc<Schema>,
+    pub(crate) expressions: Arc<[Expr]>,
+    pub(crate) scalar_fallback: bool,
+    pub(crate) has_clock: bool,
+    pub(crate) functions: Arc<[Option<crate::columnar::functions::Projection>]>,
+    pub(crate) admissions: Arc<[Admission]>,
+}
 
 impl PartialEq for Projections {
     fn eq(&self, other: &Self) -> bool {
@@ -231,12 +248,21 @@ impl PartialEq for Projections {
 
 impl Projections {
     pub(crate) fn new(schema: Arc<Schema>, expressions: Arc<[Expr]>, scalar_fallback: bool) -> Self {
+        let has_clock = expressions.iter().any(crate::columnar::projection::has_clock);
+        let functions = expressions.iter().map(|expression| {
+            (!crate::columnar::projection::has_clock(expression))
+                .then(|| crate::columnar::functions::Projection::bind(expression, &schema))
+                .flatten()
+        }).collect();
         let admissions = expressions.iter().map(Admission::of).collect();
-        Self { schema, expressions, scalar_fallback, admissions }
+        Self { schema, expressions, scalar_fallback, has_clock, functions, admissions }
     }
     fn retained_bytes(&self) -> Result<usize> {
         let bytes = schema_bound(&self.schema)?;
         let bytes = self.expressions.iter().try_fold(bytes, |bytes, expression| bytes.checked_add(expression_bound(expression)?).ok_or_else(size_error))?;
+        let slots = self.functions.len().checked_mul(std::mem::size_of::<Option<crate::columnar::functions::Projection>>()).ok_or_else(size_error)?;
+        let bytes = bytes.checked_add(slots).ok_or_else(size_error)?;
+        let bytes = self.functions.iter().flatten().try_fold(bytes, |bytes, projection| bytes.checked_add(projection.retained_bytes()?).ok_or_else(size_error))?;
         self.admissions.len().checked_mul(std::mem::size_of::<Admission>()).and_then(|admissions| bytes.checked_add(admissions)).ok_or_else(size_error)
     }
 }

@@ -3498,20 +3498,23 @@ impl PredicateSelection {
     }
 }
 
-/// Filters batches, evaluating the predicate over whole columns where its shape and the columns' types allow,
-/// and row by row, exactly as the row filter does, for any batch where they don't.
+/// Filters batches, evaluating the predicate over whole columns where its plan-time binding against the schema allows,
+/// and row by row, exactly as the row filter does, otherwise.
 pub(crate) struct BatchFilter {
     input: BoxBatchCursor, schema: Arc<rtdb_plan::Schema>, stages: Arc<[rtdb_plan::Expr]>,
+    compiled: Arc<[Option<functions::Predicate>]>,
     admissions: Option<Arc<[crate::compiled::Admission]>>, execution: crate::context::Execution,
     stage_analysis: Vec<Option<Arc<crate::analysis::AnalysisNode>>>,
 }
 impl BatchFilter {
     pub fn new(input: BoxBatchCursor, schema: rtdb_plan::Schema, predicate: rtdb_plan::Expr, execution: crate::context::Execution) -> Self {
-        Self { input, schema: Arc::new(schema), stages: vec![predicate].into(), admissions: None, execution, stage_analysis: Vec::new() }
+        let compiled: Arc<[Option<functions::Predicate>]> = Arc::from([functions::Predicate::bind(&predicate, &schema)]);
+        Self { input, schema: Arc::new(schema), stages: vec![predicate].into(), compiled, admissions: None, execution, stage_analysis: Vec::new() }
     }
-    /// Applies a compiled plan's predicates, sharing their admissions with every execution of that plan.
+    /// Applies a compiled plan's predicates, sharing their plan-time bindings and admissions with every execution of that plan.
     pub(crate) fn admitted(input: BoxBatchCursor, predicates: &crate::compiled::Predicates, execution: crate::context::Execution) -> Self {
         Self { input, schema: Arc::clone(&predicates.schema), stages: Arc::clone(&predicates.stages),
+            compiled: Arc::clone(&predicates.compiled),
             admissions: Some(Arc::clone(&predicates.admissions)), execution, stage_analysis: Vec::new() }
     }
     /// Measures each stage, innermost first, as the filter it was fused from; `None` leaves a stage to its operator's wrapper.
@@ -3539,7 +3542,7 @@ impl BatchCursor for BatchFilter {
             };
             for (index, predicate) in self.stages.iter().enumerate() {
                 let admission = self.admissions.as_ref().map(|admissions| &admissions[index]);
-                let selection = admitted_predicate_selection(&batch, predicate, &self.schema, &self.execution, admission).await?;
+                let selection = admitted_predicate_selection(&batch, predicate, &self.schema, &self.execution, self.compiled[index].as_ref(), admission).await?;
                 if selection.count == 0 {
                     self.observe_stages(index, stages, started, None)?;
                     continue 'batches;
@@ -3565,13 +3568,15 @@ pub(crate) fn typed_predicate_mask(
 pub(crate) async fn predicate_selection(
     batch: &ColumnBatch, predicate: &rtdb_plan::Expr, schema: &rtdb_plan::Schema, execution: &crate::context::Execution,
 ) -> Result<PredicateSelection> {
-    admitted_predicate_selection(batch, predicate, schema, execution, None).await
+    let compiled = functions::Predicate::bind(predicate, schema);
+    admitted_predicate_selection(batch, predicate, schema, execution, compiled.as_ref(), None).await
 }
 
-/// As `predicate_selection`, skipping the type admission of a kernel-evaluated predicate that `admission` already passed.
+/// As `predicate_selection`, using `compiled`'s plan-time binding and skipping the type admission of a kernel-evaluated
+/// predicate that `admission` already passed.
 async fn admitted_predicate_selection(
     batch: &ColumnBatch, predicate: &rtdb_plan::Expr, schema: &rtdb_plan::Schema, execution: &crate::context::Execution,
-    admission: Option<&crate::compiled::Admission>,
+    compiled: Option<&functions::Predicate>, admission: Option<&crate::compiled::Admission>,
 ) -> Result<PredicateSelection> {
     execution.context.check_cancelled()?;
     let params = execution.parameters.evaluator();
@@ -3592,7 +3597,7 @@ async fn admitted_predicate_selection(
         }
         Ok(())
     };
-    if let Some(truth) = functions::truth(predicate, schema, batch, params)? {
+    if let Some(compiled) = compiled && let Some(truth) = compiled.truth(batch, params)? {
         prepare_typed()?;
         return PredicateSelection::from_bits(truth.into_iter().map(|value| value == Some(true)), memory);
     }
@@ -3638,7 +3643,7 @@ pub(crate) async fn predicate_truth(
         }
         Ok(())
     };
-    if let Some(truth) = functions::truth(predicate, schema, batch, params)? {
+    if let Some(compiled) = functions::Predicate::bind(predicate, schema) && let Some(truth) = compiled.truth(batch, params)? {
         prepare_typed()?;
         return Ok((truth.into_iter().collect(), reservation));
     }
@@ -4679,21 +4684,31 @@ impl Column {
     }
 }
 
-/// Projects batches through expressions computed over whole columns where the kernel's arithmetic is exactly the
-/// evaluator's, and row by row through the evaluator for any expression or batch where it isn't.
+/// Projects batches through expressions computed over whole columns where their plan-time binding against the schema
+/// allows, and row by row through the evaluator otherwise.
 pub(crate) struct BatchExpressions {
     input: BoxBatchCursor, schema: Arc<rtdb_plan::Schema>, expressions: Arc<[rtdb_plan::Expr]>, clocked: Option<Arc<[rtdb_plan::Expr]>>,
-    cosine: Option<Vec<Option<crate::cosine::Projection>>>, functions: Option<Vec<Option<functions::Projection>>>,
-    admissions: Option<Arc<[crate::compiled::Admission]>>, execution: crate::context::Execution, validate_input: bool,
+    cosine: Option<Vec<Option<crate::cosine::Projection>>>,
+    functions: Arc<[Option<functions::Projection>]>, functions_clocked: bool,
+    admissions: Arc<[crate::compiled::Admission]>, execution: crate::context::Execution, validate_input: bool,
 }
 impl BatchExpressions {
     pub fn new(input: BoxBatchCursor, schema: rtdb_plan::Schema, expressions: Vec<rtdb_plan::Expr>, execution: crate::context::Execution) -> Self {
-        Self { input, schema: Arc::new(schema), expressions: expressions.into(), clocked: None, cosine: None, functions: None, admissions: None, execution, validate_input: false }
+        let expressions: Arc<[rtdb_plan::Expr]> = expressions.into();
+        let has_clock = expressions.iter().any(projection::has_clock);
+        let functions = expressions.iter().map(|expr| {
+            (!projection::has_clock(expr)).then(|| functions::Projection::bind(expr, &schema)).flatten()
+        }).collect();
+        let admissions = expressions.iter().map(crate::compiled::Admission::of).collect();
+        let clocked = (!has_clock).then(|| Arc::clone(&expressions));
+        Self { input, schema: Arc::new(schema), expressions, clocked, cosine: None, functions, functions_clocked: !has_clock, admissions, execution, validate_input: false }
     }
-    /// Computes a compiled plan's projections, sharing their admissions with every execution of that plan.
+    /// Computes a compiled plan's projections, sharing their plan-time bindings and admissions with every execution of that plan.
     pub(crate) fn admitted(input: BoxBatchCursor, projections: &crate::compiled::Projections, execution: crate::context::Execution) -> Self {
-        Self { input, schema: Arc::clone(&projections.schema), expressions: Arc::clone(&projections.expressions), clocked: None, cosine: None,
-            functions: None, admissions: Some(Arc::clone(&projections.admissions)), execution, validate_input: false }
+        let clocked = (!projections.has_clock).then(|| Arc::clone(&projections.expressions));
+        Self { input, schema: Arc::clone(&projections.schema), expressions: Arc::clone(&projections.expressions), clocked, cosine: None,
+            functions: Arc::clone(&projections.functions), functions_clocked: !projections.has_clock,
+            admissions: Arc::clone(&projections.admissions), execution, validate_input: false }
     }
     pub fn validating_input(mut self, validate: bool) -> Self {
         self.validate_input = validate;
@@ -4729,14 +4744,22 @@ impl BatchCursor for BatchExpressions {
         self.execution.context.check_cancelled()?;
         if self.validate_input { batch.validate_readable(&self.execution.context)?; }
         if self.clocked.is_none() { self.clocked = Some(read_clock(&self.expressions, &self.execution).await?); }
+        if !self.functions_clocked {
+            let clocked = self.clocked.as_deref().unwrap_or_default();
+            self.functions = clocked.iter().enumerate().map(|(index, expr)| {
+                if projection::has_clock(&self.expressions[index]) {
+                    functions::Projection::bind(expr, &self.schema)
+                } else {
+                    self.functions[index].clone()
+                }
+            }).collect();
+            self.functions_clocked = true;
+        }
         let clocked = self.clocked.as_deref().unwrap_or_default();
         if self.cosine.is_none() && batch.len != 0 {
             self.cosine = Some(clocked.iter().map(|expr| {
                 crate::cosine::Projection::bind(expr, &self.schema, &self.execution.parameters, &self.execution.context.memory)
             }).collect::<Result<_>>()?);
-        }
-        if self.functions.is_none() {
-            self.functions = Some(clocked.iter().map(|expr| functions::Projection::bind(expr, &self.schema)).collect());
         }
         let parameters = self.execution.parameters.evaluator();
         let memory = &self.execution.context.memory;
@@ -4820,43 +4843,22 @@ impl BatchCursor for BatchExpressions {
                     Err(error) => return Err(error),
                 }
             }
-            if batch.len != 0
-                && matches!(plain_scalar(&expression.data_type()), Some(rtdb_types::ScalarType::Bool))
-                && let Some(truth) = functions::truth(kernel, &self.schema, &batch, parameters)?
-            {
-                let admission = self.admissions.as_ref().map(|admissions| &admissions[index]);
-                if !admission.is_some_and(crate::compiled::Admission::admitted) {
+            if let Some(projection) = self.functions[index].as_ref() {
+                let admission = &self.admissions[index];
+                if !admission.admitted() {
                     let metadata = self.execution.scope()?;
                     self.execution.prepare_expression(expression, &self.schema, &metadata)?;
-                    if let Some(admission) = admission { admission.admit(); }
+                    admission.admit();
                 }
-                let logical = if truth.iter().all(Option::is_none) {
-                    LogicalType::Null
-                } else {
-                    let boolean = LogicalType::Scalar(rtdb_types::ScalarType::Bool);
-                    if truth.iter().any(Option::is_none) { boolean.maybe() } else { boolean }
-                };
-                let array: ArrayRef = if logical == LogicalType::Null {
-                    Arc::new(arrow_array::NullArray::new(batch.len))
-                } else {
-                    Arc::new(arrow_array::BooleanArray::from(truth))
-                };
-                let field = Arc::new(rtdb_columnar::to_field("value", &logical)?);
-                let column = Column::Arrow { array, field, logical: Some(logical) };
-                let lease = Arc::get_mut(&mut reservation).expect("Batch projection owns its reservation");
-                lease.grow_to(lease.bytes().checked_add(column.retained_bytes()?).ok_or_else(size_error)?)?;
-                columns.push(column);
-                continue;
+                if let Some(column) = projection.column(&batch, parameters, memory)? {
+                    let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("column-size", "A column page's charge is shared"))?;
+                    lease.grow_to(lease.bytes().checked_add(column.retained_bytes()?).ok_or_else(size_error)?)?;
+                    columns.push(column);
+                    continue;
+                }
             }
             let metadata = self.execution.scope()?;
             let invocation = self.execution.prepare_expression(expression, &self.schema, &metadata)?;
-            if let Some(projection) = self.functions.as_ref().and_then(|items| items[index].as_ref())
-                && let Some(column) = projection.column(&batch, parameters, memory)? {
-                let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("column-size", "A column page's charge is shared"))?;
-                lease.grow_to(lease.bytes().checked_add(column.retained_bytes()?).ok_or_else(size_error)?)?;
-                columns.push(column);
-                continue;
-            }
             let scope = self.execution.scope()?;
             let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("column-size", "A column page's charge is shared"))?;
             let retained = lease.bytes();
@@ -5291,6 +5293,12 @@ pub(crate) mod projection {
     }
     /// The query clock, which `BatchExpressions` reads once and hands the kernels as a literal.
     pub(crate) fn clock(name: &str, args: &[Expr]) -> bool { args.is_empty() && matches!(name, "current_timestamp" | "current-timestamp" | "now") }
+    /// Whether `expr` contains a query-clock read that `BatchExpressions` substitutes once per execution.
+    pub(crate) fn has_clock(expr: &Expr) -> bool {
+        let mut found = false;
+        expr.visit(&mut |expr| if let Expr::Call { name, args, .. } = expr && clock(name, args) { found = true; });
+        found
+    }
 
     pub(super) fn shared_column(expr: &Expr, schema: &Schema, batch: &ColumnBatch, memory: &Arc<MemoryBudget>)
         -> Result<Option<(Column, Arc<MemoryReservation>)>> {

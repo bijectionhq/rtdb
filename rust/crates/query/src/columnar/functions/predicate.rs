@@ -1,26 +1,109 @@
 //! The cells a predicate compares, read from any plain layout a batch column holds, and their order, as the row
 //! evaluator orders scalar values.
 
-use std::{cmp::Ordering, sync::Arc};
+use std::cmp::Ordering;
 
-use arrow_array::{Array, BooleanArray, FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, PrimitiveArray, StringArray, TimestampMicrosecondArray, UnionArray, types::ArrowPrimitiveType};
+use arrow_array::{
+    Array, BooleanArray, FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+    Int64Array, PrimitiveArray, RunArray, StringArray, TimestampMicrosecondArray, UnionArray,
+    types::{ArrowPrimitiveType, Int16Type, Int32Type, Int64Type},
+};
 use arrow_schema::{DataType, Field as ArrowField, TimeUnit as ArrowUnit, UnionMode};
-use rtdb_columnar::MemoryReservation;
 use rtdb_types::{LogicalType, ScalarType, TimeUnit, Value};
 
 use super::super::{Column, SelectedRows, plain_scalar};
 use super::{Charged, Vector};
 
-/// A comparable cell; integers and floats compare only where the conversion between them is exact.
+/// The comparable category of a cell, decided once from a column's or expression's schema type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum CellKind {
+    Int,
+    Float,
+    Text,
+    Bool,
+    Micros(Option<String>),
+    Uuid,
+}
+
+impl CellKind {
+    fn of_scalar(scalar: &ScalarType) -> Option<Self> {
+        Some(match scalar {
+            ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64 => Self::Int,
+            ScalarType::F32 | ScalarType::F64 => Self::Float,
+            ScalarType::Utf8 => Self::Text,
+            ScalarType::Bool => Self::Bool,
+            ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone } => Self::Micros(timezone.clone()),
+            ScalarType::Uuid => Self::Uuid,
+            _ => return None,
+        })
+    }
+}
+
+/// The non-null cell categories a schema type may yield, or `None` where any leg is outside these comparisons.
+pub(super) fn cell_kinds(logical: &LogicalType) -> Option<Vec<CellKind>> {
+    fn collect(logical: &LogicalType, out: &mut Vec<CellKind>) -> Option<()> {
+        match logical {
+            LogicalType::Nothing => return None,
+            LogicalType::Null => {}
+            LogicalType::Maybe(inner) | LogicalType::RunEndEncoded { value: inner, .. } => collect(inner, out)?,
+            LogicalType::Union(legs) => for leg in legs { collect(leg, out)?; },
+            LogicalType::Scalar(scalar) => {
+                let kind = CellKind::of_scalar(scalar)?;
+                if !out.contains(&kind) { out.push(kind); }
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+    let mut kinds = Vec::new();
+    collect(logical, &mut kinds)?;
+    Some(kinds)
+}
+
+/// The cell category of a literal scalar value: `Some(None)` for null, `None` for a type outside these comparisons.
+pub(super) fn value_cell_kind(value: &Value) -> Option<Option<CellKind>> {
+    Some(match value {
+        Value::Null => None,
+        Value::I8(_) | Value::I16(_) | Value::I32(_) | Value::I64(_) => Some(CellKind::Int),
+        Value::F32(_) | Value::F64(_) => Some(CellKind::Float),
+        Value::Utf8(_) => Some(CellKind::Text),
+        Value::Bool(_) => Some(CellKind::Bool),
+        Value::Timestamp { unit: TimeUnit::Microsecond, timezone, .. } => Some(CellKind::Micros(timezone.clone())),
+        Value::Uuid(_) => Some(CellKind::Uuid),
+        _ => return None,
+    })
+}
+
+/// Whether `order` compares every pair of cells from `left` and `right` with the row evaluator's semantics.
+pub(super) fn all_orderable(left: &[CellKind], right: &[CellKind]) -> bool {
+    left.iter().all(|l| right.iter().all(|r| match (l, r) {
+        (CellKind::Int | CellKind::Float, CellKind::Int | CellKind::Float)
+        | (CellKind::Text, CellKind::Text)
+        | (CellKind::Bool, CellKind::Bool)
+        | (CellKind::Uuid, CellKind::Uuid) => true,
+        (CellKind::Micros(a), CellKind::Micros(b)) => a.is_some() == b.is_some(),
+        _ => false,
+    }))
+}
+
+/// Whether `identical` compares every pair of cells from `left` and `right` with the row evaluator's semantics.
+pub(super) fn all_identical(left: &[CellKind], right: &[CellKind]) -> bool {
+    left.iter().all(|l| right.iter().all(|r| matches!(
+        (l, r),
+        (CellKind::Int | CellKind::Float, CellKind::Int | CellKind::Float)
+            | (CellKind::Text, CellKind::Text)
+            | (CellKind::Bool, CellKind::Bool)
+            | (CellKind::Uuid, CellKind::Uuid)
+            | (CellKind::Micros(_), CellKind::Micros(_))
+    )))
+}
+
+/// A comparable cell.
 #[derive(Clone, Copy, PartialEq, PartialOrd)]
 pub(super) enum Cell<'a> {
     Int(i64), Float(f64), Text(&'a str), Bool(bool), Micros(i64, Option<&'a str>),
     /// A UUID as the big-endian integer of its bytes, which orders as the bytes do.
     Uuid(u128),
-}
-
-impl Cell<'_> {
-    pub(super) fn is_nan(&self) -> bool { matches!(self, Self::Float(value) if value.is_nan()) }
 }
 
 /// A batch column's cells, read in place.
@@ -30,6 +113,10 @@ pub(super) enum Cells<'a> {
     Micros(&'a TimestampMicrosecondArray, Option<&'a str>), Values(&'a [Value]),
     /// A dense union whose legs are each a plain cell type, read through the leg each cell's type id names.
     Union { array: &'a UnionArray, legs: Vec<Option<Cells<'a>>> },
+    /// A run-end encoded column whose physical values are read as `Cells`.
+    RunEnd16 { array: &'a RunArray<Int16Type>, values: Box<Cells<'a>> },
+    RunEnd32 { array: &'a RunArray<Int32Type>, values: Box<Cells<'a>> },
+    RunEnd64 { array: &'a RunArray<Int64Type>, values: Box<Cells<'a>> },
     Selected { rows: &'a SelectedRows, sources: Vec<Option<Cells<'a>>> },
 }
 
@@ -62,8 +149,11 @@ impl<'a> Cells<'a> {
             DataType::Float64 if plain(ScalarType::F64) => any.downcast_ref().map(Self::Float),
             DataType::Utf8 if plain(ScalarType::Utf8) => any.downcast_ref().map(Self::Text),
             DataType::Boolean if plain(ScalarType::Bool) => any.downcast_ref().map(Self::Bool),
-            // Sixteen bytes are a UUID only where the column's logical type says so.
-            DataType::FixedSizeBinary(16) if scalar == Some(&ScalarType::Uuid) => any.downcast_ref().map(Self::Uuid),
+            // Sixteen bytes are a UUID only where the column's logical type or Arrow extension metadata says so.
+            DataType::FixedSizeBinary(16)
+                if scalar == Some(&ScalarType::Uuid)
+                    || (logical.is_none() && rtdb_columnar::from_field(field).ok().as_ref().and_then(plain_scalar) == Some(&ScalarType::Uuid)) =>
+                any.downcast_ref().map(Self::Uuid),
             // A cell reads its zone from the column's logical type, or from the layout where it has none.
             DataType::Timestamp(ArrowUnit::Microsecond, zone) => {
                 let zone = match (logical, scalar) {
@@ -73,27 +163,38 @@ impl<'a> Cells<'a> {
                 };
                 any.downcast_ref().map(|array| Self::Micros(array, zone))
             }
+            DataType::RunEndEncoded(ends, values_field) => {
+                let inner_logical = match logical {
+                    Some(LogicalType::RunEndEncoded { value, .. }) => Some(value.as_ref()),
+                    None if field.metadata().is_empty() => None,
+                    _ => return None,
+                };
+                match ends.data_type() {
+                    DataType::Int16 => {
+                        let array: &'a RunArray<Int16Type> = any.downcast_ref()?;
+                        Some(Self::RunEnd16 { array, values: Box::new(Self::arrow(array.values().as_ref(), values_field, inner_logical)?) })
+                    }
+                    DataType::Int32 => {
+                        let array: &'a RunArray<Int32Type> = any.downcast_ref()?;
+                        Some(Self::RunEnd32 { array, values: Box::new(Self::arrow(array.values().as_ref(), values_field, inner_logical)?) })
+                    }
+                    DataType::Int64 => {
+                        let array: &'a RunArray<Int64Type> = any.downcast_ref()?;
+                        Some(Self::RunEnd64 { array, values: Box::new(Self::arrow(array.values().as_ref(), values_field, inner_logical)?) })
+                    }
+                    _ => None,
+                }
+            }
             DataType::Union(fields, UnionMode::Dense) => {
                 if logical.is_some_and(|logical| rtdb_columnar::from_field(field).ok().as_ref() != Some(logical)) {
                     return None;
                 }
                 let array: &UnionArray = any.downcast_ref()?;
                 let mut legs: Vec<Option<Self>> = Vec::new();
-                for (id, field) in fields.iter() {
-                    if id < 0 || !field.metadata().is_empty() { return None; }
+                for (id, child_field) in fields.iter() {
+                    if id < 0 { return None; }
                     let child = array.child(id);
-                    let leg = child.as_any();
-                    let cells = match child.data_type() {
-                        DataType::Int64 => Self::Int(leg.downcast_ref()?),
-                        DataType::Int32 => Self::Int32(leg.downcast_ref()?),
-                        DataType::Int16 => Self::Int16(leg.downcast_ref()?),
-                        DataType::Int8 => Self::Int8(leg.downcast_ref()?),
-                        DataType::Float32 => Self::Float32(leg.downcast_ref()?),
-                        DataType::Float64 => Self::Float(leg.downcast_ref()?),
-                        DataType::Utf8 => Self::Text(leg.downcast_ref()?),
-                        DataType::Boolean => Self::Bool(leg.downcast_ref()?),
-                        _ => return None,
-                    };
+                    let cells = Self::arrow(child.as_ref(), child_field, None)?;
                     let id = id as usize;
                     if legs.len() <= id { legs.resize_with(id + 1, || None); }
                     legs[id] = Some(cells);
@@ -117,6 +218,7 @@ impl<'a> Cells<'a> {
             Self::Bool(array) => array.null_count() == 0,
             Self::Micros(array, _) => array.null_count() == 0,
             Self::Uuid(array) => array.null_count() == 0,
+            Self::RunEnd16 { values, .. } | Self::RunEnd32 { values, .. } | Self::RunEnd64 { values, .. } => values.complete(),
             Self::Null | Self::Values(_) | Self::Union { .. } | Self::Selected { .. } => false,
         }
     }
@@ -151,6 +253,18 @@ impl<'a> Cells<'a> {
                 let leg = usize::try_from(array.type_id(row)).ok().and_then(|id| legs.get(id)).and_then(Option::as_ref).ok_or(())?;
                 leg.get(array.value_offset(row))?
             }
+            Self::RunEnd16 { array, values } => {
+                if row >= array.len() { return Err(()); }
+                values.get(array.get_physical_index(row))?
+            }
+            Self::RunEnd32 { array, values } => {
+                if row >= array.len() { return Err(()); }
+                values.get(array.get_physical_index(row))?
+            }
+            Self::RunEnd64 { array, values } => {
+                if row >= array.len() { return Err(()); }
+                values.get(array.get_physical_index(row))?
+            }
         })
     }
 }
@@ -178,34 +292,31 @@ pub(super) fn scalar(value: &Value) -> Result<Option<Cell<'_>>, ()> {
     })
 }
 
-/// Whether a stored layout without a direct cell reader can be read once into its values for comparison.
-pub(super) fn readable_values(data_type: &DataType) -> bool {
-    match data_type {
-        DataType::Union(fields, UnionMode::Dense) => fields.iter().all(|(_, field)| readable_values(field.data_type())),
-        DataType::RunEndEncoded(_, field) => readable_values(field.data_type()),
-        DataType::Null | DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
-        | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 | DataType::Float32 | DataType::Float64
-        | DataType::Timestamp(ArrowUnit::Microsecond, _) => true,
-        _ => false,
-    }
-}
-
-const EXACT: i64 = 1 << 53;
-
-/// Orders two non-NaN cells as the scalar comparison does, or `Err` where the pair is outside these comparisons.
-pub(super) fn order(left: Cell<'_>, right: Cell<'_>, equality_only: bool) -> Result<Ordering, ()> {
-    let float = |value: f64| if value.is_nan() { Err(()) } else { Ok(value) };
-    // Equality is IEEE (`-0.0 = 0.0`), ordering is total (`-0.0 < 0.0`), as in the scalar evaluator.
-    let floats = |a: f64, b: f64| if equality_only { a.partial_cmp(&b).ok_or(()) } else { Ok(a.total_cmp(&b)) };
+/// Orders two cells as XTDB's expression engine does: `Ok(None)` where a numeric comparison involves NaN (unordered:
+/// `=` and ordering predicates are false, `<>` is true), or `Err` where the pair is outside these comparisons.
+pub(super) fn order(left: Cell<'_>, right: Cell<'_>, equality_only: bool) -> Result<Option<Ordering>, ()> {
+    // Equality is IEEE (`-0.0 = 0.0`, NaN unordered); non-NaN ordering is total (`-0.0 < 0.0`), matching the scalar
+    // evaluator and XTDB's expression semantics.
+    let floats = |a: f64, b: f64| -> Option<Ordering> {
+        if a.is_nan() || b.is_nan() {
+            None
+        } else if equality_only {
+            a.partial_cmp(&b)
+        } else {
+            Some(a.total_cmp(&b))
+        }
+    };
     match (left, right) {
-        (Cell::Int(a), Cell::Int(b)) => Ok(a.cmp(&b)),
-        (Cell::Micros(a, zoned), Cell::Micros(b, other)) if zoned.is_some() == other.is_some() => Ok(a.cmp(&b)),
-        (Cell::Float(a), Cell::Float(b)) => floats(float(a)?, float(b)?),
-        (Cell::Int(a), Cell::Float(b)) if a.unsigned_abs() < EXACT as u64 => floats(a as f64, float(b)?),
-        (Cell::Float(a), Cell::Int(b)) if b.unsigned_abs() < EXACT as u64 => floats(float(a)?, b as f64),
-        (Cell::Text(a), Cell::Text(b)) if equality_only || (a.is_ascii() && b.is_ascii()) => Ok(a.cmp(b)),
-        (Cell::Bool(a), Cell::Bool(b)) if equality_only => Ok(if a == b { Ordering::Equal } else { Ordering::Less }),
-        (Cell::Uuid(a), Cell::Uuid(b)) => Ok(a.cmp(&b)),
+        (Cell::Int(a), Cell::Int(b)) => Ok(Some(a.cmp(&b))),
+        (Cell::Micros(a, zoned), Cell::Micros(b, other)) if zoned.is_some() == other.is_some() => Ok(Some(a.cmp(&b))),
+        (Cell::Float(a), Cell::Float(b)) => Ok(floats(a, b)),
+        // XTDB widens integer operands to double when comparing an integer with a float.
+        (Cell::Int(a), Cell::Float(b)) => Ok(floats(a as f64, b)),
+        (Cell::Float(a), Cell::Int(b)) => Ok(floats(a, b as f64)),
+        // XTDB compares UTF-8 buffers as unsigned bytes (`util/compare-nio-buffers-unsigned`), for ASCII and non-ASCII alike.
+        (Cell::Text(a), Cell::Text(b)) => Ok(Some(a.as_bytes().cmp(b.as_bytes()))),
+        (Cell::Bool(a), Cell::Bool(b)) => Ok(Some(a.cmp(&b))),
+        (Cell::Uuid(a), Cell::Uuid(b)) => Ok(Some(a.cmp(&b))),
         _ => Err(()),
     }
 }
@@ -229,13 +340,11 @@ pub(super) fn identical(left: Option<Cell<'_>>, right: Option<Cell<'_>>) -> Resu
     })
 }
 
-/// An operand of a comparison: cells read in place from a batch column or a bound parameter, a constant, the values
-/// of a column without a direct cell reader, or a vector the evaluator computed.
+/// An operand of a comparison: cells read in place from a batch column or a bound parameter, a constant, or a vector
+/// the evaluator computed.
 pub(super) enum Operand<'a> {
     Cells(Cells<'a>),
     Constant(Option<Cell<'a>>),
-    /// Values read once, with the charge for holding them; unread rows are null.
-    Values { values: Vec<Value>, _charge: Arc<MemoryReservation> },
     Computed(Charged),
 }
 
@@ -245,7 +354,6 @@ impl Operand<'_> {
         match self {
             Self::Cells(cells) => cells.get(row),
             Self::Constant(cell) => Ok(*cell),
-            Self::Values { values, .. } => scalar(&values[row]),
             Self::Computed(charged) => Ok(match &charged.vector {
                 Vector::Null => None,
                 Vector::I32(array) => integral(array, row),

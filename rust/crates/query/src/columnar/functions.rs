@@ -1,11 +1,12 @@
 //! Column-at-a-time evaluation of scalar expressions over plain scalar cells: calls, arithmetic, negation, numeric
 //! casts, searched CASE and predicates (comparisons, `===`, LIKE, BETWEEN, IS NULL, NOT, AND and OR), the scalar
 //! functions through `rtdb_expr::kernels`, which share their per-value code.
+//! Shape, schema type, comparison compatibility and strict-argument settling are decided at bind/plan time in
+//! `Projection::bind` and `Predicate::bind`, so unsupported expressions go to the row evaluator by plan rather than
+//! per-batch trial.
 //! A failing cell raises the row evaluator's error for that cell. Each CASE branch and each condition after the first
 //! is computed only over the rows that reach it, and the right side of AND and OR only over the rows the left side
 //! leaves open, so a cell fails only where the row evaluator would evaluate it.
-//! `Ok(None)` leaves a batch to the row evaluator where a layout, a cell type or a result is outside these vectors;
-//! every error is raised.
 //! Every vector built along the way is charged to the query's memory budget while it lives.
 
 use std::sync::Arc;
@@ -207,11 +208,69 @@ fn constant(value: &Value, len: usize) -> Option<Vector> {
     })
 }
 
-/// A projected expression, its calls resolved once to the kernels that compute them.
+/// A projected expression, its calls and schema layout checks resolved once at plan/preparation time.
+#[derive(Clone, Debug)]
 pub(crate) struct Projection(Node);
 
+/// A predicate expression, its calls and schema layout checks resolved once at plan/preparation time.
+#[derive(Clone, Debug)]
+pub(crate) struct Predicate(Node);
+
+/// The static vector type of a bound node, decided from the schema and expression types at bind time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum VectorType {
+    Null,
+    I32,
+    I64,
+    F64,
+    Text,
+    Bool,
+    Micros(Option<String>),
+}
+
+impl VectorType {
+    fn of(logical: &LogicalType) -> Option<Self> {
+        if *logical == LogicalType::Null { return Some(Self::Null); }
+        Some(match plain_scalar(logical)? {
+            ScalarType::I32 => Self::I32,
+            ScalarType::I64 => Self::I64,
+            ScalarType::F64 => Self::F64,
+            ScalarType::Utf8 => Self::Text,
+            ScalarType::Bool => Self::Bool,
+            ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone } => Self::Micros(timezone.clone()),
+            _ => return None,
+        })
+    }
+
+    fn of_value(value: &Value) -> Option<Self> {
+        Some(match value {
+            Value::Null => Self::Null,
+            Value::I32(_) => Self::I32,
+            Value::I64(_) => Self::I64,
+            Value::F64(_) => Self::F64,
+            Value::Utf8(_) => Self::Text,
+            Value::Bool(_) => Self::Bool,
+            Value::Timestamp { unit: TimeUnit::Microsecond, timezone, .. } => Self::Micros(timezone.clone()),
+            _ => return None,
+        })
+    }
+
+    fn cell_kinds(self) -> Vec<predicate::CellKind> {
+        match self {
+            Self::Null => Vec::new(),
+            Self::I32 | Self::I64 => vec![predicate::CellKind::Int],
+            Self::F64 => vec![predicate::CellKind::Float],
+            Self::Text => vec![predicate::CellKind::Text],
+            Self::Bool => vec![predicate::CellKind::Bool],
+            Self::Micros(zone) => vec![predicate::CellKind::Micros(zone)],
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 struct Node { kind: Kind, declared: LogicalType }
 
+#[derive(Clone, Debug)]
 enum Kind {
     /// The batch column at this position.
     Column(usize),
@@ -269,11 +328,19 @@ impl Kind {
 }
 
 impl Projection {
-    /// `None` for an expression no batch can compute here; a bare column, literal or parameter is copied elsewhere.
+    /// `None` for an expression whose shape or schema types cannot be computed here; a bare column, literal or
+    /// parameter is copied elsewhere.
     pub(crate) fn bind(expr: &Expr, schema: &Schema) -> Option<Self> {
         if matches!(expr, Expr::Column { .. } | Expr::Literal(_) | Expr::Parameter { .. }) { return None; }
-        Node::bind(expr, schema).map(Self)
+        Node::bind_vector(expr, schema, None).map(|(node, _)| Self(node))
     }
+
+    fn bind_with_parameters(expr: &Expr, schema: &Schema, parameters: &[Option<LogicalType>]) -> Option<Self> {
+        if matches!(expr, Expr::Column { .. } | Expr::Literal(_) | Expr::Parameter { .. }) { return None; }
+        Node::bind_vector(expr, schema, Some(parameters)).map(|(node, _)| Self(node))
+    }
+
+    pub(crate) fn retained_bytes(&self) -> Result<usize> { self.0.retained_bytes() }
 
     /// The column over `batch`, typed as the evaluator's packed results are, or `Ok(None)` where the evaluator must
     /// compute it.
@@ -298,6 +365,27 @@ impl Projection {
     }
 }
 
+impl Predicate {
+    /// `None` where the predicate's shape or schema types cannot be evaluated here.
+    pub(crate) fn bind(expr: &Expr, schema: &Schema) -> Option<Self> {
+        let (node, ty) = Node::bind_vector(expr, schema, None)?;
+        matches!(ty, VectorType::Bool | VectorType::Null).then_some(Self(node))
+    }
+
+    pub(crate) fn retained_bytes(&self) -> Result<usize> { self.0.retained_bytes() }
+
+    /// Each row's three-valued truth over `batch`, keeping unknown (null) apart from false.
+    pub(crate) fn truth(&self, batch: &ColumnBatch, parameters: rtdb_expr::Parameters<'_>) -> Result<Option<Vec<Option<bool>>>> {
+        let evaluation = Evaluation { columns: &batch.columns, len: batch.len, parameters: Parameters::Values(parameters), memory: batch.reservation.budget() };
+        let Some(charged) = evaluation.vector(&self.0, None)? else { return Ok(None) };
+        Ok(match &charged.vector {
+            Vector::Null => Some(vec![None; batch.len]),
+            Vector::Bool(values) => Some(values.iter().collect()),
+            _ => None,
+        })
+    }
+}
+
 /// The column of `expr` over `batch`, `Ok(None)` where the row evaluator computes it.
 pub(crate) fn column(expr: &Expr, schema: &Schema, batch: &ColumnBatch, parameters: rtdb_expr::Parameters<'_>, memory: &Arc<MemoryBudget>) -> Result<Option<Column>> {
     match Projection::bind(expr, schema) {
@@ -309,21 +397,28 @@ pub(crate) fn column(expr: &Expr, schema: &Schema, batch: &ColumnBatch, paramete
 /// Each row's three-valued truth under `predicate` over `batch`, keeping unknown (null) apart from false, or
 /// `Ok(None)` where the row evaluator computes it. The vectors built along the way are charged to the batch's budget.
 pub(crate) fn truth(predicate: &Expr, schema: &Schema, batch: &ColumnBatch, parameters: rtdb_expr::Parameters<'_>) -> Result<Option<Vec<Option<bool>>>> {
-    let Some(node) = Node::bind(predicate, schema).filter(Node::truth) else { return Ok(None) };
-    let evaluation = Evaluation { columns: &batch.columns, len: batch.len, parameters: Parameters::Values(parameters), memory: batch.reservation.budget() };
-    let Some(charged) = evaluation.vector(&node, None)? else { return Ok(None) };
-    Ok(match &charged.vector {
-        Vector::Null => Some(vec![None; batch.len]),
-        Vector::Bool(values) => Some(values.iter().collect()),
+    match Predicate::bind(predicate, schema) {
+        Some(predicate) => predicate.truth(batch, parameters),
+        None => Ok(None),
+    }
+}
+
+fn column_logical(column: &Column) -> Option<LogicalType> {
+    match column {
+        Column::Arrow { field, logical, .. } => match logical {
+            Some(ty) => Some(ty.clone()),
+            None => rtdb_columnar::from_field(field).ok(),
+        },
         _ => None,
-    })
+    }
 }
 
 /// The one-row column of `expr` over `columns`, reading its parameters from the one-row `arguments`, charged to
 /// `memory` for as long as it lives.
 pub(crate) fn bound_column(expr: &Expr, schema: &Schema, columns: &[Column], arguments: &[Column], memory: &Arc<MemoryBudget>) -> Result<Option<Column>> {
     if !bound_lowerable(expr) { return Ok(None); }
-    let Some(projection) = Projection::bind(expr, schema) else { return Ok(None) };
+    let parameter_types: Vec<Option<LogicalType>> = arguments.iter().map(column_logical).collect();
+    let Some(projection) = Projection::bind_with_parameters(expr, schema, &parameter_types) else { return Ok(None) };
     let evaluation = Evaluation { columns, len: 1, parameters: Parameters::Columns(arguments), memory };
     let Some(Column::Arrow { array, field, logical }) = projection.evaluated(&evaluation)? else { return Ok(None) };
     // A null result keeps the expression's declared type, as the query's result schema gives it.
@@ -381,65 +476,460 @@ fn lowerable_at(expr: &Expr, bound: bool) -> bool {
     })
 }
 
+/// Whether a strict node's deferred single-leg arguments all settle before any null or nullable argument, so masking
+/// out null rows cannot skip an error the row evaluator raises while preparing an earlier argument.
+fn strict_args_settle(arguments: &[&Node]) -> bool {
+    let mut non_settling_deferred = false;
+    for argument in arguments {
+        if argument.declared == LogicalType::Null || argument.declared.legs().len() >= 2 {
+            if non_settling_deferred { return false; }
+        } else if !argument.settles() {
+            non_settling_deferred = true;
+        }
+    }
+    true
+}
+
+/// Whether the row evaluator coerces a UTF-8 string literal against a temporal operand using the session timezone.
+fn literal_temporal_coercion(expr: &Expr, other_kinds: &[predicate::CellKind]) -> bool {
+    matches!(expr, Expr::Literal(Value::Utf8(_)))
+        && other_kinds.iter().any(|kind| matches!(kind, predicate::CellKind::Micros(_)))
+}
+
 impl Node {
-    fn bind(expr: &Expr, schema: &Schema) -> Option<Self> {
-        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || Self::bind_at(expr, schema))
+    fn bind_vector(expr: &Expr, schema: &Schema, params: Option<&[Option<LogicalType>]>) -> Option<(Self, VectorType)> {
+        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || Self::bind_vector_at(expr, schema, params))
     }
 
-    fn bind_at(expr: &Expr, schema: &Schema) -> Option<Self> {
-        let child = |expr: &Expr| Self::bind(expr, schema).map(Box::new);
-        let kind = match expr {
-            Expr::Column { id, .. } => Kind::Column(schema.position(*id)?),
-            Expr::Literal(value) => Kind::Literal(value.clone()),
-            Expr::Parameter { index, .. } => Kind::Parameter(*index),
+    fn bind_operand(expr: &Expr, schema: &Schema, params: Option<&[Option<LogicalType>]>) -> Option<(Self, Vec<predicate::CellKind>)> {
+        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || Self::bind_operand_at(expr, schema, params))
+    }
+
+    fn bind_operand_at(expr: &Expr, schema: &Schema, params: Option<&[Option<LogicalType>]>) -> Option<(Self, Vec<predicate::CellKind>)> {
+        match expr {
+            Expr::Column { id, .. } => {
+                let position = schema.position(*id)?;
+                let kinds = predicate::cell_kinds(&schema.fields()[position].data_type)?;
+                Some((Self { kind: Kind::Column(position), declared: expr.data_type() }, kinds))
+            }
+            Expr::Literal(value) => {
+                let kinds = predicate::value_cell_kind(value)?.into_iter().collect();
+                Some((Self { kind: Kind::Literal(value.clone()), declared: expr.data_type() }, kinds))
+            }
+            Expr::Parameter { index, data_type } => {
+                let resolved = if *data_type == LogicalType::Nothing {
+                    params.and_then(|types| types.get(*index)).and_then(Option::as_ref)?
+                } else {
+                    data_type
+                };
+                let kinds = predicate::cell_kinds(resolved)?;
+                Some((Self { kind: Kind::Parameter(*index), declared: resolved.clone() }, kinds))
+            }
+            _ => {
+                let (node, ty) = Self::bind_vector(expr, schema, params)?;
+                Some((node, ty.cell_kinds()))
+            }
+        }
+    }
+
+    fn bind_vector_at(expr: &Expr, schema: &Schema, params: Option<&[Option<LogicalType>]>) -> Option<(Self, VectorType)> {
+        let declared = expr.data_type();
+        match expr {
+            Expr::Column { id, .. } => {
+                let position = schema.position(*id)?;
+                let source_ty = VectorType::of(&schema.fields()[position].data_type)?;
+                let result_ty = VectorType::of(&declared)?;
+                if source_ty != result_ty && !(source_ty == VectorType::Null && declared.nullable()) {
+                    return None;
+                }
+                return Some((Self { kind: Kind::Column(position), declared }, source_ty));
+            }
+            Expr::Literal(value) => {
+                let ty = VectorType::of_value(value)?;
+                return Some((Self { kind: Kind::Literal(value.clone()), declared }, ty));
+            }
+            Expr::Parameter { index, data_type } => {
+                let resolved = if *data_type == LogicalType::Nothing {
+                    params.and_then(|types| types.get(*index)).and_then(Option::as_ref)?
+                } else {
+                    data_type
+                };
+                let ty = VectorType::of(resolved)?;
+                return Some((Self { kind: Kind::Parameter(*index), declared: resolved.clone() }, ty));
+            }
+            _ => {}
+        }
+        let result_ty = VectorType::of(&declared)?;
+        let (kind, ty) = match expr {
             Expr::Call { name, args, .. } if name == "===" => match args.as_slice() {
-                [left, right] => Kind::Identical { left: child(left)?, right: child(right)? },
+                [left, right] => {
+                    if result_ty != VectorType::Bool { return None; }
+                    let (left, left_kinds) = Self::bind_operand(left, schema, params)?;
+                    let (right, right_kinds) = Self::bind_operand(right, schema, params)?;
+                    if !predicate::all_identical(&left_kinds, &right_kinds) { return None; }
+                    (Kind::Identical { left: Box::new(left), right: Box::new(right) }, VectorType::Bool)
+                }
                 _ => return None,
             },
             Expr::Call { name, args, .. } => match (Function::resolve(name)?, args.as_slice()) {
-                (Function::Extract, [Expr::Literal(Value::Utf8(field)), source]) => Kind::Extract { field: field.clone(), source: child(source)? },
-                (Function::Round, [value]) => Kind::Round { value: child(value)?, scale: None },
-                (Function::Round, [value, Expr::Literal(Value::I64(scale))]) => Kind::Round { value: child(value)?, scale: Some(*scale) },
-                (Function::Round, [value, Expr::Literal(Value::I32(scale))]) => Kind::Round { value: child(value)?, scale: Some(i64::from(*scale)) },
-                (Function::Abs, [value]) => Kind::Abs(child(value)?),
-                (Function::Upper, [text]) => Kind::TextCase { text: child(text)?, upper: true },
-                (Function::Lower, [text]) => Kind::TextCase { text: child(text)?, upper: false },
-                (Function::Length, [text]) => Kind::Length(child(text)?),
-                (Function::Substring, [text, position]) => Kind::Substring { text: child(text)?, position: child(position)?, length: None },
-                (Function::Substring, [text, position, length]) => Kind::Substring { text: child(text)?, position: child(position)?, length: Some(child(length)?) },
-                (Function::Mod, [left, right]) => Kind::Arithmetic { op: BinaryOp::Modulo, left: child(left)?, right: child(right)? },
-                (function, [value]) => Kind::Double(function.double()?, child(value)?),
+                (Function::Extract, [Expr::Literal(Value::Utf8(field)), source]) => {
+                    let (source, source_ty) = Self::bind_vector(source, schema, params)?;
+                    if !strict_args_settle(&[&source]) { return None; }
+                    let ty = match &source_ty {
+                        VectorType::Null => { if !declared.nullable() { return None; } VectorType::Null }
+                        VectorType::Micros(zone) => {
+                            if result_ty != VectorType::I32 { return None; }
+                            // Validate the extract field and timezone once at bind time through the same kernel check.
+                            let empty = TimestampMicrosecondArray::from(Vec::<Option<i64>>::new());
+                            if kernels::extract_timestamps(field, &empty, zone.as_deref(), None).ok().flatten().is_none() {
+                                return None;
+                            }
+                            VectorType::I32
+                        }
+                        _ => return None,
+                    };
+                    (Kind::Extract { field: field.clone(), source: Box::new(source) }, ty)
+                }
+                (Function::Round, [value]) => {
+                    let (value, v_ty) = Self::bind_vector(value, schema, params)?;
+                    if !strict_args_settle(&[&value]) { return None; }
+                    let ty = match v_ty {
+                        VectorType::Null => { if !declared.nullable() { return None; } VectorType::Null }
+                        ty @ (VectorType::I32 | VectorType::I64 | VectorType::F64) if result_ty == ty => ty,
+                        _ => return None,
+                    };
+                    (Kind::Round { value: Box::new(value), scale: None }, ty)
+                }
+                (Function::Round, [value, Expr::Literal(Value::I64(scale))]) => {
+                    let (value, v_ty) = Self::bind_vector(value, schema, params)?;
+                    if !strict_args_settle(&[&value]) { return None; }
+                    let ty = match v_ty {
+                        VectorType::Null => { if !declared.nullable() { return None; } VectorType::Null }
+                        VectorType::F64 if result_ty == VectorType::F64 => VectorType::F64,
+                        _ => return None,
+                    };
+                    (Kind::Round { value: Box::new(value), scale: Some(*scale) }, ty)
+                }
+                (Function::Round, [value, Expr::Literal(Value::I32(scale))]) => {
+                    let (value, v_ty) = Self::bind_vector(value, schema, params)?;
+                    if !strict_args_settle(&[&value]) { return None; }
+                    let ty = match v_ty {
+                        VectorType::Null => { if !declared.nullable() { return None; } VectorType::Null }
+                        VectorType::F64 if result_ty == VectorType::F64 => VectorType::F64,
+                        _ => return None,
+                    };
+                    (Kind::Round { value: Box::new(value), scale: Some(i64::from(*scale)) }, ty)
+                }
+                (Function::Abs, [value]) => {
+                    let (value, v_ty) = Self::bind_vector(value, schema, params)?;
+                    if !strict_args_settle(&[&value]) { return None; }
+                    let ty = match v_ty {
+                        VectorType::Null => { if !declared.nullable() { return None; } VectorType::Null }
+                        ty @ (VectorType::F64 | VectorType::I64) if result_ty == ty => ty,
+                        _ => return None,
+                    };
+                    (Kind::Abs(Box::new(value)), ty)
+                }
+                (Function::Upper, [text]) => {
+                    let (text, t_ty) = Self::bind_vector(text, schema, params)?;
+                    if !strict_args_settle(&[&text]) { return None; }
+                    let ty = match t_ty {
+                        VectorType::Null => { if !declared.nullable() { return None; } VectorType::Null }
+                        VectorType::Text if result_ty == VectorType::Text => VectorType::Text,
+                        _ => return None,
+                    };
+                    (Kind::TextCase { text: Box::new(text), upper: true }, ty)
+                }
+                (Function::Lower, [text]) => {
+                    let (text, t_ty) = Self::bind_vector(text, schema, params)?;
+                    if !strict_args_settle(&[&text]) { return None; }
+                    let ty = match t_ty {
+                        VectorType::Null => { if !declared.nullable() { return None; } VectorType::Null }
+                        VectorType::Text if result_ty == VectorType::Text => VectorType::Text,
+                        _ => return None,
+                    };
+                    (Kind::TextCase { text: Box::new(text), upper: false }, ty)
+                }
+                (Function::Length, [text]) => {
+                    let (text, t_ty) = Self::bind_vector(text, schema, params)?;
+                    if !strict_args_settle(&[&text]) { return None; }
+                    let ty = match t_ty {
+                        VectorType::Null => { if !declared.nullable() { return None; } VectorType::Null }
+                        VectorType::Text if result_ty == VectorType::I32 => VectorType::I32,
+                        _ => return None,
+                    };
+                    (Kind::Length(Box::new(text)), ty)
+                }
+                (Function::Substring, [text, position]) => {
+                    let (text, t_ty) = Self::bind_vector(text, schema, params)?;
+                    let (position, p_ty) = Self::bind_vector(position, schema, params)?;
+                    if !strict_args_settle(&[&text, &position]) { return None; }
+                    if !matches!(t_ty, VectorType::Null | VectorType::Text) || !matches!(p_ty, VectorType::Null | VectorType::I32 | VectorType::I64) {
+                        return None;
+                    }
+                    let ty = if t_ty == VectorType::Null || p_ty == VectorType::Null {
+                        if !declared.nullable() { return None; }
+                        VectorType::Null
+                    } else {
+                        if result_ty != VectorType::Text { return None; }
+                        VectorType::Text
+                    };
+                    (Kind::Substring { text: Box::new(text), position: Box::new(position), length: None }, ty)
+                }
+                (Function::Substring, [text, position, length]) => {
+                    let (text, t_ty) = Self::bind_vector(text, schema, params)?;
+                    let (position, p_ty) = Self::bind_vector(position, schema, params)?;
+                    let (length, l_ty) = Self::bind_vector(length, schema, params)?;
+                    if !strict_args_settle(&[&text, &position, &length]) { return None; }
+                    if !matches!(t_ty, VectorType::Null | VectorType::Text)
+                        || !matches!(p_ty, VectorType::Null | VectorType::I32 | VectorType::I64)
+                        || !matches!(l_ty, VectorType::Null | VectorType::I32 | VectorType::I64)
+                    {
+                        return None;
+                    }
+                    let ty = if t_ty == VectorType::Null || p_ty == VectorType::Null || l_ty == VectorType::Null {
+                        if !declared.nullable() { return None; }
+                        VectorType::Null
+                    } else {
+                        if result_ty != VectorType::Text { return None; }
+                        VectorType::Text
+                    };
+                    (Kind::Substring { text: Box::new(text), position: Box::new(position), length: Some(Box::new(length)) }, ty)
+                }
+                (Function::Mod, [left, right]) => Self::bind_arithmetic(BinaryOp::Modulo, left, right, &declared, &result_ty, schema, params)?,
+                (function, [value]) => {
+                    let function = function.double()?;
+                    let (value, v_ty) = Self::bind_vector(value, schema, params)?;
+                    if !strict_args_settle(&[&value]) { return None; }
+                    let ty = match v_ty {
+                        VectorType::Null => { if !declared.nullable() { return None; } VectorType::Null }
+                        VectorType::F64 | VectorType::I64 | VectorType::I32 if result_ty == VectorType::F64 => VectorType::F64,
+                        _ => return None,
+                    };
+                    (Kind::Double(function, Box::new(value)), ty)
+                }
                 _ => return None,
             },
             Expr::Binary { op: op @ (BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide | BinaryOp::Modulo), left, right } =>
-                Kind::Arithmetic { op: *op, left: child(left)?, right: child(right)? },
-            Expr::Binary { op: op @ (BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq), left, right } =>
-                Kind::Compare { op: *op, left: child(left)?, right: child(right)? },
-            Expr::Binary { op: op @ (BinaryOp::And | BinaryOp::Or), left, right } =>
-                Kind::Logical { and: *op == BinaryOp::And, left: child(left)?.filter_truth()?, right: child(right)?.filter_truth()? },
-            Expr::Unary { op: UnaryOp::Negate, expr: operand } => Kind::Negate(child(operand)?),
-            Expr::Unary { op: UnaryOp::Not, expr: operand } => Kind::Not(child(operand)?),
-            Expr::Unary { op: op @ (UnaryOp::IsNull | UnaryOp::IsUnknown | UnaryOp::IsNotNull), expr: operand } =>
-                Kind::IsNull { operand: child(operand)?, negated: *op == UnaryOp::IsNotNull },
+                Self::bind_arithmetic(*op, left, right, &declared, &result_ty, schema, params)?,
+            Expr::Binary { op: op @ (BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq), left, right } => {
+                let (left_node, left_kinds) = Self::bind_operand(left, schema, params)?;
+                let (right_node, right_kinds) = Self::bind_operand(right, schema, params)?;
+                if !strict_args_settle(&[&left_node, &right_node]) { return None; }
+                if literal_temporal_coercion(left, &right_kinds) || literal_temporal_coercion(right, &left_kinds) { return None; }
+                if !predicate::all_orderable(&left_kinds, &right_kinds) { return None; }
+                let ty = if left_kinds.is_empty() || right_kinds.is_empty() {
+                    if !declared.nullable() { return None; }
+                    VectorType::Null
+                } else {
+                    if result_ty != VectorType::Bool { return None; }
+                    VectorType::Bool
+                };
+                (Kind::Compare { op: *op, left: Box::new(left_node), right: Box::new(right_node) }, ty)
+            }
+            Expr::Binary { op: op @ (BinaryOp::And | BinaryOp::Or), left, right } => {
+                let (left_node, left_ty) = Self::bind_vector(left, schema, params)?;
+                let (right_node, right_ty) = Self::bind_vector(right, schema, params)?;
+                if !matches!(left_ty, VectorType::Bool | VectorType::Null) || !matches!(right_ty, VectorType::Bool | VectorType::Null) {
+                    return None;
+                }
+                let ty = if left_ty == VectorType::Null && right_ty == VectorType::Null {
+                    if !declared.nullable() { return None; }
+                    VectorType::Null
+                } else {
+                    if result_ty != VectorType::Bool { return None; }
+                    VectorType::Bool
+                };
+                (Kind::Logical { and: *op == BinaryOp::And, left: Box::new(left_node), right: Box::new(right_node) }, ty)
+            }
+            Expr::Unary { op: UnaryOp::Negate, expr: operand } => {
+                let (operand, o_ty) = Self::bind_vector(operand, schema, params)?;
+                if !strict_args_settle(&[&operand]) { return None; }
+                let ty = match o_ty {
+                    VectorType::Null => { if !declared.nullable() { return None; } VectorType::Null }
+                    ty @ (VectorType::F64 | VectorType::I64 | VectorType::I32) if result_ty == ty => ty,
+                    _ => return None,
+                };
+                (Kind::Negate(Box::new(operand)), ty)
+            }
+            Expr::Unary { op: UnaryOp::Not, expr: operand } => {
+                let (operand, o_ty) = Self::bind_vector(operand, schema, params)?;
+                if !strict_args_settle(&[&operand]) { return None; }
+                let ty = match o_ty {
+                    VectorType::Null => { if !declared.nullable() { return None; } VectorType::Null }
+                    VectorType::Bool if result_ty == VectorType::Bool => VectorType::Bool,
+                    _ => return None,
+                };
+                (Kind::Not(Box::new(operand)), ty)
+            }
+            Expr::Unary { op: op @ (UnaryOp::IsNull | UnaryOp::IsUnknown | UnaryOp::IsNotNull), expr: operand } => {
+                if result_ty != VectorType::Bool { return None; }
+                let operand_declared = operand.data_type();
+                let computed_single = !matches!(operand.as_ref(), Expr::Column { .. } | Expr::Literal(_) | Expr::Parameter { .. } | Expr::Case { .. })
+                    && operand_declared != LogicalType::Null && operand_declared.legs().len() < 2;
+                let operand_node = if computed_single {
+                    let (node, _) = Self::bind_vector(operand, schema, params)?;
+                    if !node.settles() { return None; }
+                    node
+                } else {
+                    Self::bind_operand(operand, schema, params)?.0
+                };
+                (Kind::IsNull { operand: Box::new(operand_node), negated: *op == UnaryOp::IsNotNull }, VectorType::Bool)
+            }
             Expr::Like { expr: input, pattern, escape, case_insensitive, negated }
                 if matches!(pattern.as_ref(), Expr::Literal(Value::Utf8(_) | Value::Null) | Expr::Parameter { .. }) =>
-                Kind::Like { input: child(input)?, pattern: child(pattern)?, escape: *escape, case_insensitive: *case_insensitive, negated: *negated },
-            Expr::Between { operand, low, high, symmetric: false } => Kind::Between { operand: child(operand)?, low: child(low)?, high: child(high)? },
-            Expr::Cast { expr: operand, target: CastTarget::Fixed(_) } => Kind::Cast(child(operand)?),
-            Expr::Case { branches, otherwise } => Kind::Case {
-                conditions: branches.iter().map(|(condition, _)| Self::bind(condition, schema).filter(Self::truth)).collect::<Option<_>>()?,
-                values: branches.iter().map(|(_, value)| value).chain(std::iter::once(otherwise.as_ref()))
-                    .map(|value| Self::bind(value, schema)).collect::<Option<_>>()?,
-            },
+            {
+                let (input_node, input_kinds) = Self::bind_operand(input, schema, params)?;
+                let (pattern_node, pattern_kinds) = Self::bind_operand(pattern, schema, params)?;
+                if !strict_args_settle(&[&input_node, &pattern_node]) { return None; }
+                if !input_kinds.iter().all(|kind| *kind == predicate::CellKind::Text)
+                    || !pattern_kinds.iter().all(|kind| *kind == predicate::CellKind::Text)
+                {
+                    return None;
+                }
+                let ty = if input_kinds.is_empty() || pattern_kinds.is_empty() {
+                    if !declared.nullable() { return None; }
+                    VectorType::Null
+                } else {
+                    if result_ty != VectorType::Bool { return None; }
+                    VectorType::Bool
+                };
+                (Kind::Like {
+                    input: Box::new(input_node),
+                    pattern: Box::new(pattern_node),
+                    escape: *escape,
+                    case_insensitive: *case_insensitive,
+                    negated: *negated,
+                }, ty)
+            }
+            Expr::Between { operand, low, high, symmetric: false } => {
+                let (operand_node, operand_kinds) = Self::bind_operand(operand, schema, params)?;
+                let (low_node, low_kinds) = Self::bind_operand(low, schema, params)?;
+                let (high_node, high_kinds) = Self::bind_operand(high, schema, params)?;
+                if literal_temporal_coercion(low, &operand_kinds) || literal_temporal_coercion(high, &operand_kinds) { return None; }
+                if !predicate::all_orderable(&operand_kinds, &low_kinds) || !predicate::all_orderable(&operand_kinds, &high_kinds) { return None; }
+                let ty = if operand_kinds.is_empty() || (low_kinds.is_empty() && high_kinds.is_empty()) {
+                    if !declared.nullable() { return None; }
+                    VectorType::Null
+                } else {
+                    if result_ty != VectorType::Bool { return None; }
+                    VectorType::Bool
+                };
+                (Kind::Between { operand: Box::new(operand_node), low: Box::new(low_node), high: Box::new(high_node) }, ty)
+            }
+            Expr::Cast { expr: operand, target: CastTarget::Fixed(_) } => {
+                if result_ty == VectorType::Null { return None; }
+                let (operand, o_ty) = Self::bind_vector(operand, schema, params)?;
+                if !strict_args_settle(&[&operand]) { return None; }
+                let ty = match (&o_ty, &result_ty) {
+                    (VectorType::Null, _) => { if !declared.nullable() { return None; } VectorType::Null }
+                    (a, b) if a == b && !matches!(a, VectorType::Micros(_)) => result_ty.clone(),
+                    (VectorType::I32, VectorType::I64 | VectorType::F64)
+                    | (VectorType::I64, VectorType::I32 | VectorType::F64) => result_ty.clone(),
+                    _ => return None,
+                };
+                (Kind::Cast(Box::new(operand)), ty)
+            }
+            Expr::Case { branches, otherwise } => {
+                let conditions = branches.iter().map(|(condition, _)| {
+                    let (node, ty) = Self::bind_vector(condition, schema, params)?;
+                    matches!(ty, VectorType::Bool | VectorType::Null).then_some(node)
+                }).collect::<Option<Vec<_>>>()?;
+                let mut values = Vec::with_capacity(branches.len() + 1);
+                let mut non_null = None;
+                for value in branches.iter().map(|(_, value)| value).chain(std::iter::once(otherwise.as_ref())) {
+                    let (node, ty) = Self::bind_vector(value, schema, params)?;
+                    if ty != VectorType::Null {
+                        if let Some(expected) = &non_null {
+                            if *expected != ty { return None; }
+                        } else {
+                            non_null = Some(ty);
+                        }
+                    }
+                    values.push(node);
+                }
+                let ty = match non_null {
+                    None => { if !declared.nullable() { return None; } VectorType::Null }
+                    Some(ty) if ty == result_ty => ty,
+                    Some(_) => return None,
+                };
+                (Kind::Case { conditions, values }, ty)
+            }
             _ => return None,
         };
-        Some(Self { kind, declared: expr.data_type() })
+        Some((Self { kind, declared }, ty))
     }
 
-    /// Whether this node yields truths: it is typed boolean or null.
-    fn truth(&self) -> bool { self.declared == LogicalType::Null || plain_scalar(&self.declared) == Some(&ScalarType::Bool) }
+    fn bind_arithmetic(
+        op: BinaryOp, left: &Expr, right: &Expr, declared: &LogicalType, result_ty: &VectorType,
+        schema: &Schema, params: Option<&[Option<LogicalType>]>,
+    ) -> Option<(Kind, VectorType)> {
+        let (left, l_ty) = Self::bind_vector(left, schema, params)?;
+        let (right, r_ty) = Self::bind_vector(right, schema, params)?;
+        if !strict_args_settle(&[&left, &right]) { return None; }
+        if !matches!(l_ty, VectorType::Null | VectorType::I32 | VectorType::I64 | VectorType::F64)
+            || !matches!(r_ty, VectorType::Null | VectorType::I32 | VectorType::I64 | VectorType::F64)
+        {
+            return None;
+        }
+        let ty = if l_ty == VectorType::Null || r_ty == VectorType::Null {
+            if !declared.nullable() { return None; }
+            VectorType::Null
+        } else if l_ty == VectorType::F64 || r_ty == VectorType::F64 {
+            if *result_ty != VectorType::F64 { return None; }
+            VectorType::F64
+        } else if l_ty == VectorType::I64 || r_ty == VectorType::I64 {
+            if *result_ty != VectorType::I64 { return None; }
+            VectorType::I64
+        } else {
+            if *result_ty != VectorType::I32 { return None; }
+            VectorType::I32
+        };
+        Some((Kind::Arithmetic { op, left: Box::new(left), right: Box::new(right) }, ty))
+    }
 
-    fn filter_truth(self: Box<Self>) -> Option<Box<Self>> { self.truth().then_some(self) }
+    fn retained_bytes(&self) -> Result<usize> {
+        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
+            let add = |a: usize, b: usize| a.checked_add(b).ok_or_else(super::size_error);
+            let mut bytes = add(size_of::<Self>(), self.declared.retained_bytes()?)?;
+            match &self.kind {
+                Kind::Column(_) | Kind::Parameter(_) => {}
+                Kind::Literal(value) => bytes = add(bytes, value.retained_bytes()?)?,
+                Kind::Extract { field, source } => {
+                    bytes = add(bytes, field.capacity())?;
+                    bytes = add(bytes, source.retained_bytes()?)?;
+                }
+                Kind::Round { value: child, .. } | Kind::Abs(child) | Kind::TextCase { text: child, .. }
+                | Kind::Length(child) | Kind::Double(_, child) | Kind::Negate(child) | Kind::Cast(child)
+                | Kind::Not(child) | Kind::IsNull { operand: child, .. } => {
+                    bytes = add(bytes, child.retained_bytes()?)?;
+                }
+                Kind::Substring { text, position, length } => {
+                    bytes = add(bytes, text.retained_bytes()?)?;
+                    bytes = add(bytes, position.retained_bytes()?)?;
+                    if let Some(length) = length { bytes = add(bytes, length.retained_bytes()?)?; }
+                }
+                Kind::Arithmetic { left, right, .. } | Kind::Compare { left, right, .. }
+                | Kind::Identical { left, right } | Kind::Logical { left, right, .. } => {
+                    bytes = add(bytes, left.retained_bytes()?)?;
+                    bytes = add(bytes, right.retained_bytes()?)?;
+                }
+                Kind::Like { input, pattern, .. } => {
+                    bytes = add(bytes, input.retained_bytes()?)?;
+                    bytes = add(bytes, pattern.retained_bytes()?)?;
+                }
+                Kind::Between { operand, low, high } => {
+                    bytes = add(bytes, operand.retained_bytes()?)?;
+                    bytes = add(bytes, low.retained_bytes()?)?;
+                    bytes = add(bytes, high.retained_bytes()?)?;
+                }
+                Kind::Case { conditions, values } => {
+                    for child in conditions.iter().chain(values) { bytes = add(bytes, child.retained_bytes()?)?; }
+                }
+            }
+            Ok(bytes)
+        })
+    }
 
     fn leaf(&self) -> bool { matches!(self.kind, Kind::Column(_) | Kind::Literal(_) | Kind::Parameter(_)) }
 
@@ -525,7 +1015,7 @@ impl Argument for Operand<'_> {
             Self::Constant(None) | Self::Cells(Cells::Null) => Some(Validity::Null),
             Self::Constant(Some(_)) => Some(Validity::Valid),
             Self::Cells(cells) if cells.complete() => Some(Validity::Valid),
-            Self::Cells(_) | Self::Values { .. } => {
+            Self::Cells(_) => {
                 let mut valid = Vec::with_capacity(len);
                 for row in 0..len { valid.push(reads(rows, row) && self.get(row).ok()?.is_some()); }
                 Some(Validity::Rows(valid))
@@ -786,7 +1276,7 @@ impl Evaluation<'_> {
     /// computed.
     fn operand<'s>(&'s self, node: &'s Node, rows: Selection<'_>) -> Result<Option<Operand<'s>>> {
         Ok(match &node.kind {
-            Kind::Column(position) => self.cells(&self.columns[*position], rows)?,
+            Kind::Column(position) => Cells::of(&self.columns[*position]).map(Operand::Cells),
             Kind::Literal(value) => predicate::scalar(value).ok().map(Operand::Constant),
             Kind::Parameter(index) => match self.parameters {
                 // An Arrow-bound parameter is decoded on its first read, which `known` alone would leave undone.
@@ -794,32 +1284,10 @@ impl Evaluation<'_> {
                     Some(value) => predicate::scalar(value).ok().map(Operand::Constant),
                     None => None,
                 },
-                Parameters::Columns(arguments) => match arguments.get(*index) {
-                    Some(argument) => self.cells(argument, rows)?,
-                    None => None,
-                },
+                Parameters::Columns(arguments) => arguments.get(*index).and_then(Cells::of).map(Operand::Cells),
             },
             _ => self.vector(node, rows)?.map(Operand::Computed),
         })
-    }
-
-    /// A column's cells, read in place where a reader takes its layout, else read once into values over `rows`.
-    fn cells<'s>(&'s self, column: &'s Column, rows: Selection<'_>) -> Result<Option<Operand<'s>>> {
-        if let Some(cells) = Cells::of(column) { return Ok(Some(Operand::Cells(cells))); }
-        match column {
-            Column::Selected(_) => return Ok(None),
-            Column::Arrow { array, .. } if !predicate::readable_values(array.data_type()) => return Ok(None),
-            _ => {}
-        }
-        let mut charge = self.memory.reserve(self.len.checked_mul(size_of::<Value>()).ok_or_else(super::size_error)?)?;
-        let lease = Arc::get_mut(&mut charge).expect("a new reservation is unshared");
-        let mut values = Vec::with_capacity(self.len);
-        for row in 0..self.len {
-            let value = if reads(rows, row) { column.value(row)? } else { Value::Null };
-            lease.grow_to(lease.bytes().checked_add(value.retained_bytes()?).ok_or_else(super::size_error)?)?;
-            values.push(value);
-        }
-        Ok(Some(Operand::Values { values, _charge: charge }))
     }
 
     /// A predicate's truths over the rows `selection` picks, as a vector of truths of its declared type.
@@ -846,10 +1314,13 @@ impl Evaluation<'_> {
     /// A comparison, strict in both operands.
     fn compare(&self, op: BinaryOp, left: &Node, right: &Node, selection: Selection<'_>) -> Result<Option<Truths>> {
         use std::cmp::Ordering::{self, Equal, Greater, Less};
-        let (equality_only, accept): (bool, fn(Ordering) -> bool) = match op {
-            BinaryOp::Eq => (true, |ordering| ordering == Equal), BinaryOp::NotEq => (true, |ordering| ordering != Equal),
-            BinaryOp::Lt => (false, |ordering| ordering == Less), BinaryOp::LtEq => (false, |ordering| ordering != Greater),
-            BinaryOp::Gt => (false, |ordering| ordering == Greater), BinaryOp::GtEq => (false, |ordering| ordering != Less),
+        let (equality_only, accept): (bool, fn(Option<Ordering>) -> bool) = match op {
+            BinaryOp::Eq => (true, |ordering| ordering == Some(Equal)),
+            BinaryOp::NotEq => (true, |ordering| ordering != Some(Equal)),
+            BinaryOp::Lt => (false, |ordering| ordering == Some(Less)),
+            BinaryOp::LtEq => (false, |ordering| matches!(ordering, Some(Less | Equal))),
+            BinaryOp::Gt => (false, |ordering| ordering == Some(Greater)),
+            BinaryOp::GtEq => (false, |ordering| matches!(ordering, Some(Greater | Equal))),
             _ => return Ok(None),
         };
         let Some(prepared) = self.prepared(&[left, right], selection, |operand, rows| self.operand(operand, rows))? else { return Ok(None) };
@@ -861,9 +1332,9 @@ impl Evaluation<'_> {
         // An integer column against an integer constant compares the values in place.
         match (left, right) {
             (Operand::Cells(Cells::Int(array)), Operand::Constant(Some(Cell::Int(constant)))) =>
-                return Ok(Some(Truths::Rows((0..len).map(|row| (live(row) && array.is_valid(row)).then(|| accept(array.value(row).cmp(constant)))).collect()))),
+                return Ok(Some(Truths::Rows((0..len).map(|row| (live(row) && array.is_valid(row)).then(|| accept(Some(array.value(row).cmp(constant))))).collect()))),
             (Operand::Constant(Some(Cell::Int(constant))), Operand::Cells(Cells::Int(array))) =>
-                return Ok(Some(Truths::Rows((0..len).map(|row| (live(row) && array.is_valid(row)).then(|| accept(constant.cmp(&array.value(row))))).collect()))),
+                return Ok(Some(Truths::Rows((0..len).map(|row| (live(row) && array.is_valid(row)).then(|| accept(Some(constant.cmp(&array.value(row)))))).collect()))),
             _ => {}
         }
         let mut truths = Vec::with_capacity(len);
@@ -871,9 +1342,10 @@ impl Evaluation<'_> {
             if !live(row) { truths.push(None); continue; }
             let (Ok(a), Ok(b)) = (left.get(row), right.get(row)) else { return Ok(None) };
             truths.push(match (a, b) {
-                // An ordering with NaN on either side is false, as the scalar comparison answers.
-                (Some(a), Some(b)) if !equality_only && (a.is_nan() || b.is_nan()) => Some(false),
-                (Some(a), Some(b)) => match predicate::order(a, b, equality_only) { Ok(ordering) => Some(accept(ordering)), Err(()) => return Ok(None) },
+                (Some(a), Some(b)) => match predicate::order(a, b, equality_only) {
+                    Ok(ordering) => Some(accept(ordering)),
+                    Err(()) => return Ok(None),
+                },
                 _ => None,
             });
         }
@@ -904,8 +1376,13 @@ impl Evaluation<'_> {
         if computed && operand.declared != LogicalType::Null && operand.declared.legs().len() < 2 {
             return Ok(operand.settles().then(|| Truths::Rows((0..len).map(|row| if reads(selection, row) { answer(false) } else { None }).collect())));
         }
-        if let Kind::Column(position) = &operand.kind && let Column::Selected(column) = &self.columns[*position] {
-            return Ok(column.null_test(!negated).map(Truths::Rows));
+        if selection.is_none()
+            && let Kind::Column(position) = &operand.kind
+            && let Column::Selected(column) = &self.columns[*position]
+            && let Some(truths) = column.null_test(!negated)
+        {
+            let _scratch = self.truth_scratch()?;
+            return Ok(Some(Truths::Rows(truths)));
         }
         let Some(value) = self.operand(operand, selection)? else { return Ok(None) };
         let _scratch = self.truth_scratch()?;
@@ -947,7 +1424,7 @@ impl Evaluation<'_> {
     /// `operand BETWEEN low AND high`: the operand is demanded first, the low bound only where it is present, and the
     /// high bound only where the low one doesn't already answer false.
     fn between(&self, operand: &Node, low: &Node, high: &Node, selection: Selection<'_>) -> Result<Option<Truths>> {
-        use std::cmp::Ordering::{Greater, Less};
+        use std::cmp::Ordering::{Equal, Greater, Less};
         let len = self.len;
         let Some(value) = self.operand(operand, selection)? else { return Ok(None) };
         let mut present = vec![false; len];
@@ -957,9 +1434,9 @@ impl Evaluation<'_> {
             *present = cell.is_some();
         }
         let _scratch = self.truth_scratch()?;
-        let Some(lower) = self.bound(&value, low, &present, |ordering| ordering != Less)? else { return Ok(None) };
+        let Some(lower) = self.bound(&value, low, &present, |ordering| matches!(ordering, Some(Greater | Equal)))? else { return Ok(None) };
         let open: Vec<bool> = (0..len).map(|row| present[row] && lower[row] != Some(false)).collect();
-        let Some(upper) = self.bound(&value, high, &open, |ordering| ordering != Greater)? else { return Ok(None) };
+        let Some(upper) = self.bound(&value, high, &open, |ordering| matches!(ordering, Some(Less | Equal)))? else { return Ok(None) };
         Ok(Some(Truths::Rows((0..len).map(|row| {
             if !present[row] { return None; }
             match (lower[row], upper[row]) { (Some(false), _) | (_, Some(false)) => Some(false), (Some(true), Some(true)) => Some(true), _ => None }
@@ -968,7 +1445,7 @@ impl Evaluation<'_> {
 
     /// One bound of BETWEEN against `value` over `rows`: whether each row's value lies on its side, null where the
     /// bound is.
-    fn bound(&self, value: &Operand<'_>, bound: &Node, rows: &[bool], accept: fn(std::cmp::Ordering) -> bool) -> Result<Option<Vec<Option<bool>>>> {
+    fn bound(&self, value: &Operand<'_>, bound: &Node, rows: &[bool], accept: fn(Option<std::cmp::Ordering>) -> bool) -> Result<Option<Vec<Option<bool>>>> {
         let mut truths = vec![None; self.len];
         if !rows.contains(&true) { return Ok(Some(truths)); }
         let Some(bound) = self.operand(bound, Some(rows))? else { return Ok(None) };
@@ -977,8 +1454,10 @@ impl Evaluation<'_> {
             let (Ok(Some(a)), Ok(b)) = (value.get(row), bound.get(row)) else { return Ok(None) };
             *truth = match b {
                 None => None,
-                Some(b) if a.is_nan() || b.is_nan() => Some(false),
-                Some(b) => match predicate::order(a, b, false) { Ok(ordering) => Some(accept(ordering)), Err(()) => return Ok(None) },
+                Some(b) => match predicate::order(a, b, false) {
+                    Ok(ordering) => Some(accept(ordering)),
+                    Err(()) => return Ok(None),
+                },
             };
         }
         Ok(Some(truths))
@@ -1476,5 +1955,240 @@ mod tests {
         let expected = evaluated_truths(&like, &schema, &batch).expect_err("a pattern ending in its escape is invalid");
         let error = truth(&like, &schema, &batch, rtdb_expr::Parameters::Values(&[])).expect_err("the vectors raise it too");
         assert_eq!(error.code, expected.code);
+    }
+
+    #[test]
+    fn non_ascii_text_ordering_uses_unsigned_utf8_byte_order_without_declining() {
+        let memory = MemoryBudget::new(1 << 20);
+        let logical = LogicalType::Scalar(ScalarType::Utf8).maybe();
+        let make_field = |id: u32, name: &str| Field {
+            id: ColumnId(id), name: name.into(), qualifier: None, qualified_only: false, unnamed: false, data_type: logical.clone(),
+        };
+        let (a_field, b_field) = (make_field(0, "a"), make_field(1, "b"));
+        let schema = Schema::new(vec![a_field.clone(), b_field.clone()]).unwrap();
+        let samples = [
+            None, Some(""), Some("a"), Some("z"), Some("B"), Some("ß"), Some("straße"),
+            Some("é"), Some("e\u{0301}"), Some("İx"), Some("日本語"), Some("😀"), Some("😁"),
+        ];
+        let mut left_cells = Vec::new();
+        let mut right_cells = Vec::new();
+        for &l in &samples {
+            for &r in &samples {
+                left_cells.push(l);
+                right_cells.push(r);
+            }
+        }
+        let rows = left_cells.len();
+        let arrow_field = Arc::new(rtdb_columnar::to_field("t", &logical).unwrap());
+        let left_col = Column::Arrow { array: Arc::new(StringArray::from(left_cells)), field: Arc::clone(&arrow_field), logical: Some(logical.clone()) };
+        let right_col = Column::Arrow { array: Arc::new(StringArray::from(right_cells)), field: arrow_field, logical: Some(logical) };
+        let batch = ColumnBatch::settled(vec![left_col, right_col], rows, memory.reserve(0).unwrap()).unwrap();
+        let (a, b) = (a_field.expression(), b_field.expression());
+        let ops = [BinaryOp::Eq, BinaryOp::NotEq, BinaryOp::Lt, BinaryOp::LtEq, BinaryOp::Gt, BinaryOp::GtEq];
+        for op in ops {
+            let expr = Expr::binary(op, a.clone(), b.clone());
+            let compiled = Predicate::bind(&expr, &schema).unwrap_or_else(|| panic!("non-ASCII text comparison {op:?} binds at plan time"));
+            let actual = compiled.truth(&batch, rtdb_expr::Parameters::Values(&[])).unwrap()
+                .unwrap_or_else(|| panic!("non-ASCII text comparison {op:?} must not decline"));
+            let expected = evaluated_truths(&expr, &schema, &batch).unwrap();
+            assert_eq!(actual, expected, "{op:?}");
+        }
+        let between = Expr::Between {
+            operand: Box::new(a.clone()),
+            low: Box::new(Expr::Literal(Value::Utf8("ß".into()))),
+            high: Box::new(Expr::Literal(Value::Utf8("😀".into()))),
+            symmetric: false,
+        };
+        let compiled = Predicate::bind(&between, &schema).expect("non-ASCII BETWEEN binds at plan time");
+        let actual = compiled.truth(&batch, rtdb_expr::Parameters::Values(&[])).unwrap().expect("non-ASCII BETWEEN must not decline");
+        assert_eq!(actual, evaluated_truths(&between, &schema, &batch).unwrap());
+    }
+
+    #[test]
+    fn nan_equality_inequality_ordering_and_between_match_xtdb_without_declining() {
+        let memory = MemoryBudget::new(1 << 20);
+        let f64_ty = LogicalType::Scalar(ScalarType::F64).maybe();
+        let i64_ty = LogicalType::Scalar(ScalarType::I64).maybe();
+        let bool_ty = LogicalType::Scalar(ScalarType::Bool).maybe();
+        let mk = |id: u32, name: &str, data_type: LogicalType| Field {
+            id: ColumnId(id), name: name.into(), qualifier: None, qualified_only: false, unnamed: false, data_type,
+        };
+        let (fa, fb, ic, bd) = (mk(0, "fa", f64_ty.clone()), mk(1, "fb", f64_ty.clone()), mk(2, "ic", i64_ty.clone()), mk(3, "bd", bool_ty.clone()));
+        let schema = Schema::new(vec![fa.clone(), fb.clone(), ic.clone(), bd.clone()]).unwrap();
+        let payload_nan = f64::from_bits(0x7ff8_0000_0000_0042);
+        let floats_a = vec![
+            Some(f64::NAN), Some(f64::NAN), Some(-f64::NAN), Some(payload_nan),
+            Some(-0.0), Some(0.0), Some(1.0), Some(f64::INFINITY), Some(f64::NEG_INFINITY),
+            Some((1i64 << 53) as f64), None,
+        ];
+        let floats_b = vec![
+            Some(f64::NAN), Some(1.0), Some(payload_nan), Some(0.0),
+            Some(0.0), Some(-0.0), Some(f64::NAN), Some(f64::NAN), Some(f64::INFINITY),
+            Some((1i64 << 53) as f64), Some(f64::NAN),
+        ];
+        let ints = vec![
+            Some(1), Some(0), Some(i64::MAX), Some(i64::MIN),
+            Some(0), Some(0), Some((1i64 << 53) + 1), Some(i64::MAX), Some(-1),
+            Some((1i64 << 53) + 1), None,
+        ];
+        let bools = vec![
+            Some(false), Some(true), Some(false), Some(true),
+            Some(false), Some(true), None, Some(false), Some(true),
+            Some(false), None,
+        ];
+        let rows = floats_a.len();
+        let col = |array: ArrayRef, logical: &LogicalType| Column::Arrow {
+            field: Arc::new(rtdb_columnar::to_field("c", logical).unwrap()),
+            array,
+            logical: Some(logical.clone()),
+        };
+        let batch = ColumnBatch::settled(vec![
+            col(Arc::new(Float64Array::from(floats_a)), &f64_ty),
+            col(Arc::new(Float64Array::from(floats_b)), &f64_ty),
+            col(Arc::new(Int64Array::from(ints)), &i64_ty),
+            col(Arc::new(BooleanArray::from(bools)), &bool_ty),
+        ], rows, memory.reserve(0).unwrap()).unwrap();
+
+        let ops = [BinaryOp::Eq, BinaryOp::NotEq, BinaryOp::Lt, BinaryOp::LtEq, BinaryOp::Gt, BinaryOp::GtEq];
+        for op in ops {
+            for (left, right) in [
+                (fa.expression(), fb.expression()),
+                (fa.expression(), ic.expression()),
+                (ic.expression(), fa.expression()),
+                (fa.expression(), Expr::Literal(Value::F64(f64::NAN))),
+                (bd.expression(), Expr::Literal(Value::Bool(true))),
+            ] {
+                let expr = Expr::binary(op, left, right);
+                let compiled = Predicate::bind(&expr, &schema).unwrap_or_else(|| panic!("comparison binds at plan time: {expr:?}"));
+                let actual = compiled.truth(&batch, rtdb_expr::Parameters::Values(&[])).unwrap()
+                    .unwrap_or_else(|| panic!("comparison must not decline: {expr:?}"));
+                let expected = evaluated_truths(&expr, &schema, &batch).unwrap();
+                assert_eq!(actual, expected, "{expr:?}");
+            }
+        }
+        // NaN = NaN is false; NaN <> NaN is true; NaN === NaN is false.
+        let eq_nan = Predicate::bind(&Expr::binary(BinaryOp::Eq, fa.expression(), fb.expression()), &schema).unwrap();
+        assert_eq!(eq_nan.truth(&batch, rtdb_expr::Parameters::Values(&[])).unwrap().unwrap()[0], Some(false));
+        let ne_nan = Predicate::bind(&Expr::binary(BinaryOp::NotEq, fa.expression(), fb.expression()), &schema).unwrap();
+        assert_eq!(ne_nan.truth(&batch, rtdb_expr::Parameters::Values(&[])).unwrap().unwrap()[0], Some(true));
+        let strict_nan = Expr::Call { name: "===".into(), args: vec![fa.expression(), fb.expression()], return_type: LogicalType::Scalar(ScalarType::Bool) };
+        let compiled_strict = Predicate::bind(&strict_nan, &schema).unwrap();
+        assert_eq!(compiled_strict.truth(&batch, rtdb_expr::Parameters::Values(&[])).unwrap().unwrap(), evaluated_truths(&strict_nan, &schema, &batch).unwrap());
+
+        for (low, high) in [
+            (Expr::Literal(Value::F64(0.0)), Expr::Literal(Value::F64(1.0))),
+            (Expr::Literal(Value::F64(f64::NAN)), Expr::Literal(Value::F64(1.0))),
+            (Expr::Literal(Value::Null), Expr::Literal(Value::F64(1.0))),
+            (Expr::Literal(Value::Null), Expr::Literal(Value::Null)),
+        ] {
+            let between = Expr::Between { operand: Box::new(fa.expression()), low: Box::new(low), high: Box::new(high), symmetric: false };
+            let compiled = Predicate::bind(&between, &schema).unwrap();
+            let actual = compiled.truth(&batch, rtdb_expr::Parameters::Values(&[])).unwrap().expect("NaN BETWEEN must not decline");
+            assert_eq!(actual, evaluated_truths(&between, &schema, &batch).unwrap(), "{between:?}");
+        }
+    }
+
+    #[test]
+    fn plan_time_binding_decides_column_vs_row_path_from_schema() {
+        let memory = MemoryBudget::new(1 << 20);
+        let mk = |id: u32, name: &str, data_type: LogicalType| Field {
+            id: ColumnId(id), name: name.into(), qualifier: None, qualified_only: false, unnamed: false, data_type,
+        };
+        let i64_f = mk(0, "i64", LogicalType::Scalar(ScalarType::I64).maybe());
+        let i32_f = mk(1, "i32", LogicalType::Scalar(ScalarType::I32).maybe());
+        let f32_f = mk(2, "f32", LogicalType::Scalar(ScalarType::F32).maybe());
+        let text_f = mk(3, "text", LogicalType::Scalar(ScalarType::Utf8).maybe());
+        let date_f = mk(4, "date", LogicalType::Scalar(ScalarType::DateDay).maybe());
+        let utc_f = mk(5, "utc", LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) }).maybe());
+        let local_f = mk(6, "local", LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: None }).maybe());
+        let bad_tz_f = mk(7, "bad_tz", LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("Not/A_Zone".into()) }).maybe());
+        let uuid_f = mk(8, "uuid", LogicalType::Scalar(ScalarType::Uuid).maybe());
+        let ree_ty = LogicalType::RunEndEncoded { width: rtdb_types::RunEndWidth::I32, value: Box::new(LogicalType::Scalar(ScalarType::I64).maybe()) };
+        let ree_f = mk(9, "ree", ree_ty.clone());
+        let schema = Schema::new(vec![
+            i64_f.clone(), i32_f.clone(), f32_f.clone(), text_f.clone(), date_f.clone(),
+            utc_f.clone(), local_f.clone(), bad_tz_f.clone(), uuid_f.clone(), ree_f.clone(),
+        ]).unwrap();
+
+        // Unsupported layouts, types, casts, extract fields, literal coercions and non-settling deferred arguments
+        // are rejected at bind/plan time rather than declined per batch.
+        let rejected_predicates = [
+            Expr::binary(BinaryOp::Eq, date_f.expression(), Expr::Literal(Value::DateDay(0))),
+            Expr::binary(BinaryOp::Lt, i64_f.expression(), text_f.expression()),
+            Expr::binary(BinaryOp::Lt, utc_f.expression(), local_f.expression()),
+            Expr::binary(BinaryOp::Eq, utc_f.expression(), Expr::Literal(Value::Utf8("2020-01-01T00:00:00Z".into()))),
+            Expr::binary(BinaryOp::Eq, i64_f.expression(), Expr::Parameter { index: 0, data_type: LogicalType::Nothing }),
+            Expr::Call { name: "===".into(), args: vec![text_f.expression(), uuid_f.expression()], return_type: LogicalType::Scalar(ScalarType::Bool) },
+            Expr::Call { name: "===".into(), args: vec![i64_f.expression(), utc_f.expression()], return_type: LogicalType::Scalar(ScalarType::Bool) },
+            // Non-settling single-leg CASE before a nullable column must go to the row evaluator so row-0 prepare errors are preserved.
+            Expr::binary(
+                BinaryOp::Eq,
+                Expr::Case {
+                    branches: vec![(
+                        Expr::binary(BinaryOp::Eq, Expr::binary(BinaryOp::Divide, Expr::Literal(Value::I64(1)), Expr::Literal(Value::I64(0))), Expr::Literal(Value::I64(1))),
+                        Expr::Literal(Value::I64(1)),
+                    )],
+                    otherwise: Box::new(Expr::Literal(Value::I64(2))),
+                },
+                i64_f.expression(),
+            ),
+            Expr::Unary {
+                op: UnaryOp::IsNull,
+                expr: Box::new(Expr::binary(
+                    BinaryOp::Add,
+                    Expr::Case {
+                        branches: vec![(
+                            Expr::binary(BinaryOp::Eq, Expr::binary(BinaryOp::Divide, Expr::Literal(Value::I64(1)), Expr::Literal(Value::I64(0))), Expr::Literal(Value::I64(1))),
+                            Expr::Literal(Value::I64(1)),
+                        )],
+                        otherwise: Box::new(Expr::Literal(Value::I64(2))),
+                    },
+                    Expr::Literal(Value::I64(1)),
+                )),
+            },
+        ];
+        for expr in rejected_predicates {
+            assert!(Predicate::bind(&expr, &schema).is_none(), "expected bind-time rejection for predicate {expr:?}");
+        }
+
+        let rejected_projections = [
+            Expr::binary(BinaryOp::Add, f32_f.expression(), Expr::Literal(Value::F64(1.0))),
+            Expr::binary(BinaryOp::Add, ree_f.expression(), Expr::Literal(Value::I64(1))),
+            Expr::Cast { expr: Box::new(text_f.expression()), target: CastTarget::Fixed(LogicalType::Scalar(ScalarType::I64)) },
+            Expr::Cast { expr: Box::new(utc_f.expression()), target: CastTarget::Fixed(LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) })) },
+            call("abs", vec![i32_f.expression()]),
+            call("round", vec![i32_f.expression(), Expr::Literal(Value::I64(2))]),
+            Expr::Call { name: "extract".into(), args: vec![Expr::Literal(Value::Utf8("BOGUS".into())), utc_f.expression()], return_type: LogicalType::Scalar(ScalarType::I32).maybe() },
+            Expr::Call { name: "extract".into(), args: vec![Expr::Literal(Value::Utf8("YEAR".into())), bad_tz_f.expression()], return_type: LogicalType::Scalar(ScalarType::I32).maybe() },
+            Expr::Case {
+                branches: vec![(Expr::Literal(Value::Bool(true)), i64_f.expression())],
+                otherwise: Box::new(i32_f.expression()),
+            },
+        ];
+        for expr in rejected_projections {
+            assert!(Projection::bind(&expr, &schema).is_none(), "expected bind-time rejection for projection {expr:?}");
+        }
+
+        // F32 and RunEndEncoded columns are rejected for arithmetic vectors, but bind and evaluate directly in predicates.
+        let f32_pred = Expr::binary(BinaryOp::Lt, f32_f.expression(), Expr::Literal(Value::F32(1.5)));
+        assert!(Predicate::bind(&f32_pred, &schema).is_some());
+
+        let ree_schema = Schema::new(vec![mk(0, "ree", ree_ty.clone())]).unwrap();
+        let ree_array: ArrayRef = Arc::new(
+            arrow_array::RunArray::<arrow_array::types::Int32Type>::try_new(
+                &Int32Array::from(vec![2, 3, 5]),
+                &Int64Array::from(vec![Some(10), None, Some(25)]),
+            ).unwrap(),
+        );
+        let ree_field = Arc::new(rtdb_columnar::to_field("ree", &ree_ty).unwrap());
+        let ree_batch = ColumnBatch::settled(
+            vec![Column::Arrow { array: ree_array, field: ree_field, logical: Some(ree_ty) }],
+            5,
+            memory.reserve(0).unwrap(),
+        ).unwrap();
+        let ree_pred = Expr::binary(BinaryOp::Gt, ree_schema.fields()[0].expression(), Expr::Literal(Value::I64(15)));
+        let compiled = Predicate::bind(&ree_pred, &ree_schema).expect("RunEndEncoded predicate binds at plan time");
+        let actual = compiled.truth(&ree_batch, rtdb_expr::Parameters::Values(&[])).unwrap().expect("RunEndEncoded predicate evaluates in place");
+        assert_eq!(actual, evaluated_truths(&ree_pred, &ree_schema, &ree_batch).unwrap());
     }
 }
