@@ -3158,7 +3158,6 @@ fn write_arguments(
 
 pub(crate) fn decode_arguments(bytes: impl Into<Buffer>, memory: &Arc<MemoryBudget>) -> Result<SqlArguments> {
     let bytes = bytes.into();
-    let _value_reservation = memory.reserve(crate::ipc::allocation_bound(&bytes)?)?;
     let stream = rtdb_format::ipc::OwnedStream::read_buffer(bytes, memory)?;
     let schema = Arc::clone(stream.schema());
     for (index, field) in schema.fields().iter().enumerate() {
@@ -3192,7 +3191,6 @@ fn metadata_batch(metadata: &UserMetadata, memory: &Arc<MemoryBudget>) -> Result
     OwnedBatch::with_reservation(batch, reservation)
 }
 fn decode_metadata(bytes: &Bytes, memory: &Arc<MemoryBudget>) -> Result<UserMetadata> {
-    let _value_reservation = memory.reserve(crate::ipc::allocation_bound(bytes)?)?;
     let pages = crate::ipc::decode(bytes, memory)?;
     if pages.len() != 1 || pages[0].batch().num_rows() != 1 { return Err(invalid("User metadata must contain one row")); }
     UserMetadata::new(cell(pages[0].batch(), "user-metadata", 0)?, memory)

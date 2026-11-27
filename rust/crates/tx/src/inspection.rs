@@ -23,9 +23,9 @@ impl OperationRows {
 impl OperationValue { fn is_null(&self) -> bool { matches!(self, Self::Scalar(Value::Null | Value::Undefined)) } }
 
 pub fn decode_operation_rows(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result<OperationRows> {
-    let mut scratch = RowScratch { reservation: memory.reserve(crate::ipc::allocation_bound(bytes)?)?, used: 0 };
     let stream = OwnedStream::read(bytes, memory)?;
     let _schema_scratch = memory.reserve(schema_translation_bound(stream.schema())?)?;
+    let mut scratch = RowScratch { reservation: memory.reserve(0)?, used: 0 };
     let mut rows = Vec::new();
     for page in stream.into_pages() {
         for row in 0..page.batch().num_rows() {
