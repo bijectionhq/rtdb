@@ -207,10 +207,12 @@ fn table_fields(schema: &Schema, render: bool) -> Result<Option<String>> {
     let mut text = render.then(|| String::from("{"));
     for (index, field) in schema.fields().iter().enumerate() {
         let logical = rtdb_columnar::from_field(field)?;
-        let form = logical.type_form()?;
         if let Some(text) = &mut text {
+            let form = logical.type_form()?;
             if index != 0 { text.push_str(", "); }
             write!(text, "{} {form}", edn::quoted(field.name())).expect("writing to String");
+        } else {
+            logical.validate_type_form()?;
         }
     }
     Ok(text.map(|mut text| { text.push('}'); text }))
@@ -532,8 +534,13 @@ mod tests {
 
     #[test]
     fn unprojected_inspection_values_still_validate_persisted_fields() {
-        let schema = Schema::new(vec![Field::new("unsupported", arrow_schema::DataType::UInt8, false)]);
-        assert_eq!(table_fields(&schema, false).unwrap_err().code, "xtdb/unsupported-type-rendering");
+        let item = rtdb_columnar::to_field("unsupported", &rtdb_types::LogicalType::list(
+            rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::U8),
+        )).unwrap();
+        let schema = Schema::new(vec![item]);
+        for render in [true, false] {
+            assert_eq!(table_fields(&schema, render).unwrap_err().code, "xtdb/unsupported-type-rendering");
+        }
         let wire = TableBlockProto { column_name_to_hll: [("bad".into(), vec![0; 3])].into(), ..Default::default() };
         let metadata = TableBlock::decode(&wire.encode_to_vec()).unwrap();
         assert_eq!(table_hlls(&metadata, false).unwrap_err().code, "rtdb.format/invalid-hll");
@@ -541,6 +548,23 @@ mod tests {
         let expected = rtdb_format::transit::decode_anomaly(&error).unwrap_err().code;
         let body = ReplicaBody::ResolvedTx(proto::ResolvedTx { error: Some(error.into()), ..Default::default() });
         assert_eq!(replica_message(&body, false).unwrap_err().code, expected);
+    }
+
+    #[test]
+    fn inspection_values_render_structural_fields_in_physical_order() {
+        use rtdb_types::{LogicalType, ScalarType};
+
+        let first = LogicalType::Struct([
+            ("b".into(), LogicalType::list(LogicalType::Scalar(ScalarType::I64).maybe())),
+            ("a".into(), LogicalType::Scalar(ScalarType::Utf8)),
+        ].into()).maybe();
+        let schema = Schema::new(vec![
+            rtdb_columnar::to_field("z", &first).unwrap(),
+            rtdb_columnar::to_field("a", &LogicalType::Scalar(ScalarType::Bool)).unwrap(),
+        ]);
+        assert_eq!(table_fields(&schema, false).unwrap(), None);
+        assert_eq!(table_fields(&schema, true).unwrap().as_deref(),
+            Some(r#"{"z" [:? :struct {"b" [:list [:? :i64]], "a" :utf8}], "a" :bool}"#));
     }
 
     #[test]

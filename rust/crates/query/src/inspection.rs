@@ -2,8 +2,9 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rtdb_plan::{BinaryOp, CatalogInspection, ColumnId, Expr, InspectionRequest, Scan, Schema};
-use rtdb_types::{Anomaly, Result, TableRef, Value};
+use rtdb_columnar::{MemoryBudget, OwnedBatch};
+use rtdb_plan::{BinaryOp, CatalogInspection, ColumnId, Expr, Field, InspectionRequest, Scan, Schema};
+use rtdb_types::{Anomaly, LogicalType, Result, TableRef, Value};
 
 use crate::{columnar::{BatchCursor, Column, ColumnBatch}, context::Execution, cursor::OwnedRow, invalid, pages::PageBuilder};
 
@@ -109,22 +110,7 @@ impl BatchCursor for InspectionCursor {
         let limit = self.execution.context.options.batch_rows;
         if input.supports_arrow() {
             let Some(batch) = input.next_arrow_projected(limit, &self.scan.columns).await? else { self.done = true; self.input = None; return Ok(None); };
-            let record = batch.batch();
-            let columns = self.scan.columns.iter().map(|field| {
-                match record.schema_ref().column_with_name(&field.name) {
-                    Some((position, _)) => Column::Arrow {
-                        field: Arc::clone(&record.schema_ref().fields()[position]),
-                        array: Arc::clone(record.column(position)),
-                        logical: None,
-                    },
-                    None => Column::Arrow {
-                        field: Arc::new(arrow_schema::Field::new(&field.name, arrow_schema::DataType::Null, true)),
-                        array: Arc::new(arrow_array::NullArray::new(record.num_rows())),
-                        logical: None,
-                    },
-                }
-            }).collect();
-            return Ok(Some(ColumnBatch::sharing(columns, record.num_rows(), Arc::clone(batch.reservation()))));
+            return arrow_batch(&batch, &self.scan.columns, &self.execution.context.memory).map(Some);
         }
 
         let mut page = PageBuilder::new(limit, &self.execution.context.memory)?;
@@ -135,6 +121,28 @@ impl BatchCursor for InspectionCursor {
         if page.len() == 0 { return Ok(None); }
         ColumnBatch::from_page(&page.finish(), &self.execution.context.memory).map(Some)
     }
+}
+
+fn arrow_batch(batch: &OwnedBatch, projection: &[Field], memory: &Arc<MemoryBudget>) -> Result<ColumnBatch> {
+    let record = batch.batch();
+    let fields = record.schema_ref().fields();
+    let bytes = projection.iter().try_fold(256usize, |bytes, field| {
+        let layout = fields.find(&field.name).map_or_else(|| field.name.len(), |(_, field)| field.size());
+        bytes.checked_add(512).and_then(|bytes| bytes.checked_add(layout))
+            .ok_or_else(|| invalid("inspection-size", "Inspection column allocation overflow"))
+    })?;
+    let reservation = memory.reserve_with_backing(bytes, std::iter::once(Arc::clone(batch.reservation())))?;
+    let columns = projection.iter().map(|field| {
+        match fields.find(&field.name) {
+            Some((position, source)) => Column::borrow_plain_arrow(record.column(position), source),
+            None => Column::Arrow {
+                field: Arc::new(arrow_schema::Field::new(&field.name, arrow_schema::DataType::Null, true)),
+                array: Arc::new(arrow_array::NullArray::new(record.num_rows())),
+                logical: Some(LogicalType::Null),
+            },
+        }
+    }).collect();
+    Ok(ColumnBatch::sharing(columns, record.num_rows(), reservation))
 }
 
 fn flip(op: BinaryOp) -> BinaryOp { match op { BinaryOp::Lt => BinaryOp::Gt, BinaryOp::LtEq => BinaryOp::GtEq, BinaryOp::Gt => BinaryOp::Lt, BinaryOp::GtEq => BinaryOp::LtEq, op => op } }
@@ -162,6 +170,64 @@ fn range(values: &[(BinaryOp, Value)], parse: impl Fn(&Value) -> Result<i64>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::{ArrayRef, RecordBatch, StringArray, TimestampMicrosecondArray};
+    use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+    use rtdb_types::{ScalarType, TimeUnit};
+
+    #[test]
+    fn inspection_output_metadata_keeps_nulls_edn_and_utc_timestamps_on_their_buffers() {
+        let memory = MemoryBudget::new(1 << 18);
+        let text = LogicalType::Scalar(ScalarType::Utf8).maybe();
+        let utc = LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) });
+        let parts: Vec<(ArrowField, ArrayRef)> = vec![
+            (rtdb_columnar::to_field("system_time", &utc).unwrap(), Arc::new(TimestampMicrosecondArray::from(vec![0, 123]).with_timezone("UTC"))),
+            (rtdb_columnar::to_field("msg", &text).unwrap(), Arc::new(StringArray::from(vec![Some("{:type :tx}"), None]))),
+        ];
+        let (fields, arrays): (Vec<_>, Vec<_>) = parts.into_iter().unzip();
+        let record = RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), arrays).unwrap();
+        let input = OwnedBatch::new(record, &memory).unwrap();
+        let lease = Arc::downgrade(input.reservation());
+        let mut binder = rtdb_plan::Binder::default();
+        let schema = Schema::new(vec![
+            binder.field("msg", None, text).unwrap(),
+            binder.field("missing", None, LogicalType::Null).unwrap(),
+            binder.field("system_time", None, utc.maybe()).unwrap(),
+        ]).unwrap();
+        let text_ptr = |array: &ArrayRef| array.as_any().downcast_ref::<StringArray>().unwrap().value_data().as_ptr();
+        let time_ptr = |array: &ArrayRef| array.as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap().values().as_ptr();
+        let expected = (text_ptr(input.batch().column(1)), time_ptr(input.batch().column(0)));
+        let page = arrow_batch(&input, schema.fields(), &memory).unwrap();
+        drop(input);
+        let result = crate::cursor::column_batch(&schema, &memory, page).unwrap();
+        let batch = result.batch();
+        assert_eq!((text_ptr(batch.column(0)), time_ptr(batch.column(2))), expected);
+        assert_eq!(batch.column(0).as_any().downcast_ref::<StringArray>().unwrap().iter().collect::<Vec<_>>(), [Some("{:type :tx}"), None]);
+        assert_eq!(batch.column(1).logical_null_count(), 2);
+        let time = batch.column(2).as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
+        assert_eq!(time.timezone(), Some("UTC"));
+        assert_eq!(time.values().as_ref(), &[0, 123]);
+        assert!(batch.schema_ref().field(2).is_nullable());
+        let time = Arc::clone(batch.column(2));
+        drop(result);
+        assert!(lease.upgrade().is_some());
+        drop(time);
+        assert!(lease.upgrade().is_none());
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn inspection_output_metadata_leaves_extension_validation_at_cell_read() {
+        let memory = MemoryBudget::new(1 << 16);
+        let field = ArrowField::new("msg", arrow_schema::DataType::Utf8, false).with_metadata(
+            [(rtdb_columnar::EXTENSION_NAME_KEY.into(), "custom/unknown".into())].into(),
+        );
+        let record = RecordBatch::try_new(Arc::new(ArrowSchema::new(vec![field])), vec![Arc::new(StringArray::from(vec!["msg"]))]).unwrap();
+        let input = OwnedBatch::new(record, &memory).unwrap();
+        let field = rtdb_plan::Binder::default().field("msg", None, LogicalType::Scalar(ScalarType::Utf8)).unwrap();
+        let page = arrow_batch(&input, &[field], &memory).unwrap();
+        assert_eq!(page.columns[0].value(0).unwrap_err().code, "rtdb/unknown-arrow-extension");
+    }
+
     #[test]
     fn block_tables_test_bounds_accept_reference_noncanonical_prefix_and_exclusive_comparisons() {
         assert_eq!(range(&[(BinaryOp::GtEq, Value::Utf8("00".into())), (BinaryOp::LtEq, Value::Utf8("264".into()))], block_index).unwrap(), Some((0, 101)));

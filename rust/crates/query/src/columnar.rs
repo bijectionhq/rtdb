@@ -630,6 +630,18 @@ fn arrow_value_bound(array: &dyn Array, field: &ArrowField, logical: Option<&Log
 }
 
 impl Column {
+    pub(crate) fn borrow_plain_arrow(array: &ArrayRef, field: &Arc<ArrowField>) -> Self {
+        let logical = match field.data_type() {
+            DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+            | DataType::Float32 | DataType::Float64 | DataType::Utf8 | DataType::Binary
+            | DataType::Date32 | DataType::Timestamp(_, _) | DataType::Null if field.metadata().is_empty() => {
+                rtdb_columnar::from_field(field).ok().filter(|ty| *ty != LogicalType::Nothing)
+            }
+            _ => None,
+        };
+        Self::Arrow { array: Arc::clone(array), field: Arc::clone(field), logical }
+    }
+
     pub(crate) fn funded_arrow_cell<'a>(&'a self, row: usize, owner: &'a Arc<MemoryReservation>)
         -> Option<Option<FundedArrowCell<'a>>> {
         match self {

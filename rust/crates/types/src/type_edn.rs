@@ -64,6 +64,22 @@ impl LogicalType {
     /// EDN spelling used by `information_schema.columns.xt_type` and live column metadata.
     pub fn to_edn(&self) -> Result<String> { Ok(self.type_form()?.to_string()) }
 
+    /// Checks whether this type has an XTDB EDN spelling without allocating the form.
+    pub fn validate_type_form(&self) -> Result<()> {
+        match self {
+            Self::List { kind: ListKind::TimestampTzRange, .. } => Ok(()),
+            Self::List { element, .. } | Self::Maybe(element) | Self::RunEndEncoded { value: element, .. } => {
+                element.validate_type_form()
+            }
+            Self::Struct(fields) => fields.values().try_for_each(Self::validate_type_form),
+            Self::Union(legs) => legs.iter().try_for_each(Self::validate_type_form),
+            Self::Scalar(scalar @ (ScalarType::U8 | ScalarType::U16 | ScalarType::U32 | ScalarType::U64 | ScalarType::F16)) => {
+                scalar_type_form(scalar).map(|_| ())
+            }
+            Self::Scalar(_) | Self::Nothing | Self::Null => Ok(()),
+        }
+    }
+
     pub fn type_form(&self) -> Result<TypeForm<'_>> {
         use LogicalType as L;
         use TypeForm::{Boolean, Integer, Keyword, Map, Set, Text, Vector};
@@ -162,6 +178,16 @@ mod tests {
             Text("quoted \"field\""), Vector(vec![Keyword("?"), Keyword("list"), Set(vec![Keyword("i64"), Keyword("utf8")])]),
         )])]));
         assert_eq!(ty.to_edn().unwrap(), "[:? :struct {\"quoted \\\"field\\\"\" [:? :list #{:i64 :utf8}]}]");
+    }
+
+    #[test]
+    fn type_form_validation_preserves_opaque_and_rendered_components() {
+        let unsupported = LogicalType::Scalar(ScalarType::U8);
+        let list = LogicalType::list(unsupported.clone()).maybe();
+        assert_eq!(list.validate_type_form().unwrap_err().code, list.type_form().unwrap_err().code);
+        let range = LogicalType::List { kind: ListKind::TimestampTzRange, element: Box::new(unsupported) };
+        range.validate_type_form().unwrap();
+        assert_eq!(range.to_edn().unwrap(), ":tstz-range");
     }
 
     #[test]

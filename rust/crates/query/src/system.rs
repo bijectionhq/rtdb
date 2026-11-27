@@ -9,7 +9,7 @@ use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{keys::TrieKey, log::proto::ArtefactRecord};
 use rtdb_index::{CatalogTrie, Snapshot, TrieState};
 use rtdb_plan::{CatalogMetric, CatalogRows, CatalogUser, Scan, TableBinding};
-use rtdb_types::{Anomaly, ListKind, LogicalType, PgType, Result, ScalarType, TableRef, pg_name_oid, pg_table_oid};
+use rtdb_types::{Anomaly, LogicalType, PgType, Result, ScalarType, TableRef, pg_name_oid, pg_table_oid};
 
 use crate::{columnar::{BatchCursor, Column, ColumnBatch}, context::{Execution, QueryContext}, invalid, system_schema::{definition, instant}};
 
@@ -21,7 +21,7 @@ enum Cell<'a> {
 }
 
 struct CatalogColumns {
-    fields: Vec<(Arc<Field>, Option<Box<dyn ArrayBuilder>>)>,
+    fields: Vec<(Arc<Field>, LogicalType, Option<Box<dyn ArrayBuilder>>)>,
     rows: usize,
     reservation: Arc<MemoryReservation>,
     bound: usize,
@@ -35,7 +35,8 @@ impl CatalogColumns {
         })?;
         let reservation = memory.reserve(bound)?;
         let fields = scan.columns.iter().map(|field| {
-            let field = rtdb_columnar::to_field(&field.name, &catalog.runtime_scan_type(&scan.table, field))?;
+            let logical = catalog.runtime_scan_type(&scan.table, field);
+            let field = rtdb_columnar::to_field(&field.name, &logical)?;
             let builder: Option<Box<dyn ArrayBuilder>> = match field.data_type() {
                 arrow_schema::DataType::Map(entries, _) => {
                     let arrow_schema::DataType::Struct(fields) = entries.data_type() else { unreachable!() };
@@ -46,13 +47,13 @@ impl CatalogColumns {
                 arrow_schema::DataType::Null => None,
                 ty => Some(arrow_array::builder::make_builder(ty, 0)),
             };
-            Ok((Arc::new(field), builder))
+            Ok((Arc::new(field), logical, builder))
         }).collect::<Result<_>>()?;
         Ok(Self { fields, rows: 0, reservation, bound })
     }
 
     fn push<'a>(&mut self, mut cell: impl FnMut(&str) -> Result<Cell<'a>>) -> Result<()> {
-        for (field, builder) in &mut self.fields {
+        for (field, _, builder) in &mut self.fields {
             let Some(builder) = builder else { continue; };
             let value = cell(field.name())?;
             let _text_scratch = match &value {
@@ -154,12 +155,15 @@ impl CatalogColumns {
         let Self { fields, rows, mut reservation, .. } = self;
         let mut columns = Vec::with_capacity(fields.len());
         let mut retained = checked(256, scale(columns.capacity(), std::mem::size_of::<Column>())?)?;
-        for (field, builder) in fields {
+        for (field, logical, builder) in fields {
             let array: ArrayRef = builder.map_or_else(|| arrow_array::new_null_array(field.data_type(), rows), |mut builder| builder.finish());
             let actual = Arc::new(field.as_ref().clone().with_data_type(array.data_type().clone())
                 .with_nullable(field.is_nullable() || array.null_count() != 0));
+            let logical = (field.data_type() == actual.data_type() && logical != LogicalType::Nothing)
+                .then(|| if actual.is_nullable() && !field.is_nullable() { logical.maybe() } else { logical });
             retained = checked(retained, checked(array.get_array_memory_size(), actual.size())?)?;
-            columns.push(Column::Arrow { array, field: actual, logical: None });
+            retained = checked(retained, logical.as_ref().map_or(Ok(0), LogicalType::retained_bytes)?)?;
+            columns.push(Column::Arrow { array, field: actual, logical });
         }
         if retained > reservation.bytes() { return Err(Anomaly::fault("rtdb.query/catalog-allocation-bound", "System catalog rows exceed their reserved allocation")); }
         Arc::get_mut(&mut reservation).expect("A catalog batch owns its allocation").shrink_to(retained)?;
@@ -318,7 +322,7 @@ fn catalog_pages(scan: Scan, context: Arc<QueryContext>) -> impl futures::Stream
                         context.check_cancelled_at(index)?;
                         ordinal(index)?;
                         validate_pg_type(ty)?;
-                        if xt_type_projected { validate_type_edn(ty)?; }
+                        if xt_type_projected { ty.validate_type_form()?; }
                     }
                 }
 
@@ -501,7 +505,7 @@ fn catalog_pages(scan: Scan, context: Arc<QueryContext>) -> impl futures::Stream
                             for segment in snapshot.iter_segments(table).filter(|segment| segment.row_count() > 0) {
                                 for (index, ty) in segment.column_types().values().enumerate() {
                                     context.check_cancelled_at(index)?;
-                                    validate_type_edn(ty)?;
+                                    ty.validate_type_form()?;
                                 }
                             }
                         }
@@ -656,17 +660,6 @@ fn validate_pg_type(ty: &LogicalType) -> Result<()> {
         LogicalType::Scalar(ScalarType::I8 | ScalarType::U8 | ScalarType::F16) => {
             Err(Anomaly::fault("rtdb.types/pg-type", "PostgreSQL has no mapping for this numeric width"))
         }
-        _ => Ok(()),
-    }
-}
-
-fn validate_type_edn(ty: &LogicalType) -> Result<()> {
-    match ty {
-        LogicalType::List { kind: ListKind::TimestampTzRange, .. } => Ok(()),
-        LogicalType::List { element: value, .. } | LogicalType::Maybe(value) | LogicalType::RunEndEncoded { value, .. } => validate_type_edn(value),
-        LogicalType::Struct(fields) => fields.values().try_for_each(validate_type_edn),
-        LogicalType::Union(legs) => legs.iter().try_for_each(validate_type_edn),
-        LogicalType::Scalar(ScalarType::U8 | ScalarType::U16 | ScalarType::U32 | ScalarType::U64 | ScalarType::F16) => ty.type_form().map(|_| ()),
         _ => Ok(()),
     }
 }
@@ -835,16 +828,72 @@ mod tests {
         assert_eq!(array.as_any().downcast_ref::<arrow_array::Int32Array>().unwrap().values().as_ref(), &[7]);
     }
 
+    #[tokio::test]
+    async fn inspection_output_metadata_keeps_catalog_text_buffers_charged() {
+        let context = test_context(2, 1 << 16);
+        let baseline = context.memory.used_bytes();
+        let scan = system_scan("pg_catalog", "pg_namespace", &["nspname", "nspacl"]);
+        let schema = rtdb_plan::Schema::new(scan.columns.clone()).unwrap();
+        let mut pages = Box::pin(catalog_pages(scan, Arc::clone(&context)));
+        let page = pages.next().await.unwrap().unwrap();
+        let lease = Arc::downgrade(page.column_reservation(0));
+        let bytes = |array: &ArrayRef| array.as_any().downcast_ref::<arrow_array::StringArray>()
+            .unwrap().value_data().as_ptr();
+        let Column::Arrow { array, .. } = &page.columns[0] else { panic!("expected Arrow column") };
+        let address = bytes(array);
+        let output = crate::cursor::column_batch(&schema, &context.memory, page).unwrap();
+        assert_eq!(bytes(output.batch().column(0)), address);
+        assert_eq!(output.batch().column(1).logical_null_count(), 2);
+        let text = Arc::clone(output.batch().column(0));
+        drop((pages, output));
+        assert!(lease.upgrade().is_some());
+        drop(text);
+        assert!(lease.upgrade().is_none());
+        assert_eq!(context.memory.used_bytes(), baseline);
+    }
+
+    #[tokio::test]
+    async fn inspection_output_metadata_reuses_prepacked_literal_text() -> Result<()> {
+        use arrow_array::{RecordBatch, StringArray};
+        use rtdb_columnar::{OwnedBatch, to_field};
+        use rtdb_plan::{Relation, RelationNode, Schema};
+
+        let context = test_context(2, 1 << 20);
+        let memory = Arc::clone(&context.memory);
+        let text = LogicalType::Scalar(ScalarType::Utf8).maybe();
+        let field = rtdb_plan::Binder::default().field("text", None, text.clone())?;
+        let strings = StringArray::from(vec![Some("literal"), None]);
+        let address = strings.value_data().as_ptr();
+        let record = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(vec![to_field("text", &text)?])), vec![Arc::new(strings)]).unwrap();
+        let page = OwnedBatch::new(record, &memory)?;
+        let lease = Arc::downgrade(page.reservation());
+        let relation = Relation::new(Schema::new(vec![field])?, RelationNode::ArrowLiteralPages {
+            pages: rtdb_plan::LiteralArrowPages::new(vec![page]),
+        })?;
+        let query = crate::PreparedQuery::new_in(Arc::new(relation), &memory)?;
+        let mut cursor = query.execute_pages(context, vec![]).await?;
+        let result = cursor.next_batch().await?.unwrap();
+        let array = Arc::clone(result.batch().column(0));
+        drop((result, cursor, query));
+        let strings = array.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(strings.value_data().as_ptr(), address);
+        assert_eq!(strings.iter().collect::<Vec<_>>(), [Some("literal"), None]);
+        assert!(lease.upgrade().is_some());
+        drop(array);
+        assert_eq!(memory.used_bytes(), 0);
+        Ok(())
+    }
+
     #[test]
     fn catalog_type_validation_keeps_pg_mapping_and_edn_errors_distinct() {
         let narrow = LogicalType::Scalar(ScalarType::I8).maybe();
         assert!(validate_pg_type(&narrow).is_err());
-        assert!(validate_type_edn(&narrow).is_ok());
+        assert!(narrow.validate_type_form().is_ok());
 
         let nested = LogicalType::Struct([("u".into(), LogicalType::Scalar(ScalarType::U8))].into());
         assert!(validate_pg_type(&nested).is_ok());
         assert_eq!(column_pg_type(&nested).unwrap(), PgType::Json);
-        assert!(validate_type_edn(&nested).is_err());
+        assert!(nested.validate_type_form().is_err());
     }
 
     #[tokio::test]

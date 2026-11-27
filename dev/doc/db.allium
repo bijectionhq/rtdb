@@ -2398,7 +2398,9 @@ surface QueryAccess {
         -- Native relational operators consume and produce column batches that retain compatible payloads as Arrow arrays and selections.
         -- A projection that shares input buffers retains their original charges through aliases, struct children, and assembled records.
         -- The projection admits its own copied values, descriptors, and validity storage.
-        -- System catalog and inspection scans batch their produced rows at the scan boundary.
+        -- System catalog and native inspection scans publish typed Arrow pages at the scan boundary.
+        -- Direct outputs from those scans and from prepacked literal pages retain compatible scalar Arrow buffers.
+        -- The table block files relation validates its persisted schema types even when the projection omits their rendered forms.
         -- A scan preserves compatible list and struct columns as Arrow arrays when projecting selected rows.
         -- Transaction metadata projection selects compatible receipt or original event payloads by Arrow position and keeps their backing charged while the selection is held.
         -- A transaction metadata projection requiring value reads owns its decoded results under a separate charge.

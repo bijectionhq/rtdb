@@ -796,12 +796,13 @@ impl crate::columnar::BatchCursor for ArrowLiteralCursor {
         let Some(page) = pages.pages().get(self.next) else { return Ok(None); };
         self.next += 1;
         let batch = page.batch();
-        let bytes = batch.num_columns().checked_mul(512).and_then(|bytes| bytes.checked_add(256))
-            .ok_or_else(|| invalid("table-size", "Table column allocation overflow"))?;
-        let reservation = self.execution.context.memory.reserve(bytes)?;
-        let columns = batch.columns().iter().zip(batch.schema_ref().fields()).map(|(array, field)| {
-            Column::Arrow { array: Arc::clone(array), field: Arc::clone(field), logical: None }
-        }).collect();
+        let bytes = batch.schema_ref().fields().iter().try_fold(256usize, |bytes, field| {
+            bytes.checked_add(512).and_then(|bytes| bytes.checked_add(field.size()))
+                .ok_or_else(|| invalid("table-size", "Table column allocation overflow"))
+        })?;
+        let reservation = self.execution.context.memory.reserve_with_backing(bytes, std::iter::once(Arc::clone(page.reservation())))?;
+        let columns = batch.columns().iter().zip(batch.schema_ref().fields())
+            .map(|(array, field)| Column::borrow_plain_arrow(array, field)).collect();
         Ok(Some(ColumnBatch::sharing(columns, batch.num_rows(), reservation)))
     }
 }
