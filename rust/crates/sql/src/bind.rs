@@ -152,7 +152,7 @@ pub(crate) fn bind_static_document_source(
     bind_using(parsed, catalog, options, |context, statement, _settings| {
         if context.literals.has_errors() { return Ok(None); }
         let result = match statement {
-            Syntax::Records { patch, table, records } => context.record_rows(*patch, table, records).map(Some),
+            Syntax::Records { patch, table, columns, records } => context.record_rows(*patch, table, columns, records).map(Some),
             Syntax::Standard(ast::Statement::Insert(insert)) => {
                 match context.insert_rows(insert) {
                     Ok(InsertRows { table, input }) => Ok(Some(StaticMutation { table, input, kind: StaticMutationKind::Put })),
@@ -361,9 +361,9 @@ impl Context<'_> {
                     dimensions: *dimensions, method: method.clone(), recall: *recall, if_not_exists: *if_not_exists }))
             }
             Syntax::DropVectorIndex { name } => Ok(Statement::Dml(Dml::DropVectorIndex { name: name.normalized() })),
-            Syntax::Records { patch, table, records } => {
+            Syntax::Records { patch, table, columns, records } => {
                 use crate::{StaticMutation, StaticMutationKind};
-                let StaticMutation { table, input, kind } = self.record_rows(*patch, table, records)?;
+                let StaticMutation { table, input, kind } = self.record_rows(*patch, table, columns, records)?;
                 Ok(Statement::Dml(match kind {
                     StaticMutationKind::Put => {
                         self.validate_insert_columns(&input)?;
@@ -392,8 +392,11 @@ impl Context<'_> {
         }
     }
 
-    fn record_rows(&mut self, patch: bool, table: &ast::ObjectName, records: &[ast::Expr]) -> Result<crate::StaticMutation> {
-        let input = self.bind_records(records).and_then(|records| self.records(records))?;
+    fn record_rows(&mut self, patch: bool, table: &ast::ObjectName, columns: &[ast::Ident], records: &[ast::Expr]) -> Result<crate::StaticMutation> {
+        let columns = columns.iter().map(|column| identifier(column).normalized()).collect::<Vec<_>>();
+        if columns.iter().collect::<BTreeSet<_>>().len() != columns.len() { return Err(error("INSERT repeats a column")); }
+        let records = self.bind_records(records)?;
+        let input = self.records(records, columns)?;
         let target = self.target(table)?;
         let (valid_time, system_time, clamp) = self.temporal_filters(table, patch)?;
         if system_time != TemporalFilter::Default || clamp || (!patch && valid_time != TemporalFilter::Default)
@@ -422,15 +425,23 @@ impl Context<'_> {
         if records.iter().any(|record| matches!(record, Expr::Parameter { data_type, .. } if data_type.legs().is_empty())) {
             return Err(Anomaly::incorrect("xtdb.sql/records-param-outside-DML", "RECORDS ? not supported outside of DML"));
         }
-        self.records(records)
+        self.records(records, Vec::new())
     }
 
-    fn records(&mut self, expressions: Vec<Expr>) -> Result<Arc<Relation>> {
-        let mut types = BTreeMap::<String, LogicalType>::new();
-        let mut order = Vec::new();
+    fn records(&mut self, mut expressions: Vec<Expr>, mut order: Vec<String>) -> Result<Arc<Relation>> {
+        let explicit = !order.is_empty();
+        let mut types: BTreeMap<_, _> = order.iter().cloned().map(|name| (name, LogicalType::Nothing)).collect();
+        if explicit {
+            for expression in &mut expressions {
+                if let Expr::Struct(entries) = expression {
+                    entries.retain(|(name, _)| types.contains_key(name));
+                }
+            }
+        }
         let mut register = |name: String, ty: LogicalType| match types.entry(name) {
             std::collections::btree_map::Entry::Occupied(mut entry) => { let joined = entry.get().join(&ty); entry.insert(joined); }
-            std::collections::btree_map::Entry::Vacant(entry) => { order.push(entry.key().clone()); entry.insert(ty); }
+            std::collections::btree_map::Entry::Vacant(entry) if !explicit => { order.push(entry.key().clone()); entry.insert(ty); }
+            std::collections::btree_map::Entry::Vacant(_) => (),
         };
         for expression in &expressions {
             if let Expr::Struct(fields) = expression {

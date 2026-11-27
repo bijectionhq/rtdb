@@ -89,6 +89,8 @@ Typed columns contribute their nullable native shape to the catalog even before 
 Declarations contribute types to the existing row-derived union and do not coerce or constrain writes.
 GROUP BY accepts and ignores an ALL or DISTINCT set quantifier before its grouping elements, as the pinned visitor does.
 A RECORDS query's columns are the union of its record keys in first-appearance order, with null where a record omits a key; the pinned planner orders them by hash-set iteration instead.
+An explicit column list on INSERT INTO … RECORDS selects fields by name in the declared order.
+Records can omit selected fields, which appear as null in the input projection.
 Canonical mutation lowering preserves unassigned document fields, derives valid-time windows, and builds PATCH gap filling and shallow merge plans.
 Static mutation preparation exposes literal and parameter sources to the transaction submitter.
 All execution results remain pending for Phase 2.

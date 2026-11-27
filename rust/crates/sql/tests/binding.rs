@@ -150,6 +150,51 @@ fn sql_to_static_ops_non_dml_5856_and_dynamic_expressions_remain_unexpanded() {
 }
 
 #[test]
+fn insert_records_selects_named_fields_in_column_list_order() {
+    let sql = r#"INSERT INTO foo ("Where", _id, absent) RECORDS
+        {_id: 1, "Where": 2, discarded: 1 / 0}, {_id: 3, discarded: 4}"#;
+    let options = PrepareOptions::default();
+    let Statement::Dml(Dml::Insert { input, .. }) = prepare(sql, &Fixture, &options).unwrap().statement else {
+        panic!("Expected an INSERT");
+    };
+    let static_plan = rtdb_sql::prepare_static(sql, &Fixture, &options).unwrap().unwrap();
+    assert_eq!(static_plan.input, input);
+    let fields = input.schema().fields();
+    assert_eq!(fields.iter().map(|field| field.name.as_str()).collect::<Vec<_>>(), ["Where", "_id", "absent"]);
+    assert_eq!(fields[2].data_type, LogicalType::Null);
+    let RelationNode::Values { rows } = input.node() else { panic!("Expected record rows"); };
+    for (row, names) in rows.iter().zip([&["_id", "Where"][..], &["_id"][..]]) {
+        for field in row {
+            let Expr::Field { expr, .. } = field else { panic!("Expected a field projection"); };
+            let Expr::Struct(entries) = expr.as_ref() else { panic!("Expected a record"); };
+            assert_eq!(entries.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), names);
+        }
+    }
+
+    let parameters = PrepareOptions { parameter_types: BTreeMap::from([(0, LogicalType::Struct(StructFields::from([
+        ("_id".into(), LogicalType::Scalar(ScalarType::I64)),
+        ("discarded".into(), LogicalType::Scalar(ScalarType::Utf8)),
+    ])))]), ..options };
+    let static_plan = rtdb_sql::prepare_static("INSERT INTO foo (_id) RECORDS ?", &Fixture, &parameters).unwrap().unwrap();
+    assert_eq!(static_plan.input.schema().fields().iter().map(|field| field.name.as_str()).collect::<Vec<_>>(), ["_id"]);
+    assert_eq!(static_plan.input.parameter_count(), 1);
+}
+
+#[test]
+fn insert_records_uses_reference_column_grammar_and_keeps_nested_sources() {
+    let options = PrepareOptions::default();
+    for sql in [
+        "INSERT INTO foo (_id, where) RECORDS {_id: 1}",
+        "INSERT INTO foo (foo._id) RECORDS {_id: 1}",
+        "PATCH INTO foo (_id) RECORDS {_id: 1}",
+    ] {
+        assert_eq!(prepare(sql, &Fixture, &options).unwrap_err().code, "xtdb/sql-error", "{sql}");
+    }
+    let sql = "INSERT INTO foo (_id) SELECT r._id FROM (RECORDS {_id: 1}) AS r";
+    assert!(matches!(prepare(sql, &Fixture, &options).unwrap().statement, Statement::Dml(Dml::Insert { .. })));
+}
+
+#[test]
 fn patch_records_null_valid_time_4448_binds_gap_operator_and_merge() {
     let mutation = rtdb_sql::prepare_tx("PATCH INTO foo FOR PORTION OF VALID_TIME FROM NULL TO NULL RECORDS {_id: 1, price: 42}", &Fixture, &PrepareOptions::default()).unwrap();
     let rtdb_sql::Mutation::Put { input, .. } = mutation else { panic!("Expected put plan") };

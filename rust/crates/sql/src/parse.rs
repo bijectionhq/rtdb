@@ -246,7 +246,7 @@ pub(crate) enum Syntax {
     Standard(ast::Statement),
     Erase(ast::Delete),
     Assert(ast::Expr, Option<String>),
-    Records { patch: bool, table: ast::ObjectName, records: Vec<ast::Expr> },
+    Records { patch: bool, table: ast::ObjectName, columns: Vec<ast::Ident>, records: Vec<ast::Expr> },
     CreateTable { table: ast::ObjectName, columns: Vec<(Identifier, Option<ast::DataType>)> },
     GrantRole { user: Identifier, role: Identifier, revoke: bool },
     CreateSearchIndex { name: Identifier, table: ast::ObjectName, columns: Vec<Identifier>, analyzer: rtdb_plan::Analyzer, history: bool, if_not_exists: bool },
@@ -430,7 +430,7 @@ pub(super) fn parse_statement_syntax<'input>(
     let (tokens, wildcard_renames) = crate::wildcard::extract(tokens, sql)?;
     let (tokens, materialized) = crate::materialized::cte_tokens(tokens, sql)?;
     let (mut tokens, mut temporal) = extract_temporal(tokens, sql)?;
-    let mut statement = if word(tokens.first(), "PATCH") || (word(tokens.first(), "INSERT") && tokens.iter().any(|token| word(Some(token), "RECORDS"))) {
+    let mut statement = if word(tokens.first(), "PATCH") || starts_insert_records(&tokens) {
         let patch = word(tokens.first(), "PATCH");
         if !word(tokens.get(1), "INTO") { return Err(sql_error("Expected INTO after INSERT or PATCH", sql, slice[0].span)); }
         let start = 2;
@@ -442,10 +442,25 @@ pub(super) fn parse_statement_syntax<'input>(
                 return Err(sql_error("PATCH valid time requires FROM with an optional TO", sql, slice[0].span));
             }
         }
+        let mut columns = Vec::new();
+        if !patch && parser.consume_token(&Token::LParen) {
+            loop {
+                let next = parser.next_token();
+                let Token::Word(name) = next.token else {
+                    return Err(sql_error("Expected an INSERT column name", sql, next.span));
+                };
+                if name.quote_style.is_none() && !crate::parser::is_unquoted_identifier(&name.value) {
+                    return Err(sql_error("Expected an INSERT column name", sql, next.span));
+                }
+                columns.push(name.to_ident(next.span));
+                if parser.consume_token(&Token::RParen) { break; }
+                parser.expect_token(&Token::Comma).map_err(|error| parser_error(error, sql, parser.peek_token().span))?;
+            }
+        }
         if !word(Some(&parser.next_token()), "RECORDS") { return Err(sql_error("Expected RECORDS after mutation target", sql, slice[0].span)); }
         let records = dialect.checked(parser.parse_comma_separated(|parser| parser.parse_expr())).map_err(|error| parser_error(error, sql, slice[0].span))?;
         if parser.peek_token().token != Token::EOF { return Err(sql_error("Unexpected input after RECORDS", sql, parser.peek_token().span)); }
-        Syntax::Records { patch, table, records }
+        Syntax::Records { patch, table, columns, records }
     } else if word(tokens.first(), "CREATE") && (word(tokens.get(1), "TABLE") || (word(tokens.get(1), "OR") && word(tokens.get(2), "ALTER") && word(tokens.get(3), "TABLE"))) {
         let start = if word(tokens.get(1), "TABLE") { 2 } else { 4 };
         let mut parser = Parser::new(&dialect).with_recursion_limit(STATEMENT_RECURSION_LIMIT).with_tokens_with_locations(tokens[start..].to_vec());
@@ -571,6 +586,22 @@ fn standard(tokens: Vec<TokenWithSpan>, source: &str) -> Result<ast::Statement> 
     let mut statements = dialect.checked(Parser::new(&dialect).with_recursion_limit(STATEMENT_RECURSION_LIMIT).with_tokens_with_locations(tokens).parse_statements()).map_err(|error| parser_error(error, source, at))?;
     if statements.len() != 1 { return Err(sql_error("Expected one SQL statement", source, at)); }
     Ok(statements.remove(0))
+}
+
+fn starts_insert_records(tokens: &[TokenWithSpan]) -> bool {
+    if !word(tokens.first(), "INSERT") { return false; }
+    let target = if word(tokens.get(1), "INTO") { 2 } else { 1 };
+    let Some((name, mut source)) = tokens.get(target..).and_then(|tokens| tokens.split_first()) else { return false; };
+    if !matches!(name.token, Token::Word(_)) { return false; }
+    while let [period, name, rest @ ..] = source {
+        if period.token != Token::Period || !matches!(name.token, Token::Word(_)) { break; }
+        source = rest;
+    }
+    if source.first().is_some_and(|token| token.token == Token::LParen) {
+        let Some(close) = source.iter().position(|token| token.token == Token::RParen) else { return false; };
+        source = &source[close + 1..];
+    }
+    word(source.first(), "RECORDS")
 }
 
 pub(crate) fn extract_temporal(tokens: Vec<TokenWithSpan>, source: &str) -> Result<(Vec<TokenWithSpan>, Vec<TemporalClause>)> {
