@@ -90,7 +90,13 @@ The file key provider can hold an existing destination generation for an exact a
 Holding, releasing, and retiring a generation serialize in its original vault.
 Custody survives reopening the vault, and exact release retries recover the original result even after the key is destroyed.
 The provider accepts holds before retirement is admitted, preserving every existing erasure deadline.
-Activation and hosted provider integration must establish when to retain the generation and when publication or supersession permits release.
+For a stopped local destination, pass the activation `--authority-url` and `--authority-tls-dir` to `attest` to retain the destination generation before emitting the proof.
+The verifier requires a pending durable recovery and uses activation reader credentials.
+The broker records the retained generation with the verified installation and advances that name to activation protocol 5.
+Upgrade its readers and brokers before recording this proof.
+Run `release-recovery-key` against the original vault with the installation proof and the same consensus configuration and CA after publication or supersession.
+The provider can settle the hold after the verifier has exited.
+Hosted journal and object custody still require their own provider evidence.
 
 ## Independent database activation
 

@@ -405,6 +405,7 @@ impl Kms for FileKms {
 
 fn validate_hold(hold: RecoveryKeyHold) -> Result<()> {
     if hold.authority.is_nil()
+        || hold.authority_sha256 == [0; 32]
         || hold.operation.is_nil()
         || hold.generation.database.is_nil()
         || hold.installation_sha256 == [0; 32]

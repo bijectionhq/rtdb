@@ -15,6 +15,7 @@ fn generation(number: u64) -> Generation {
 fn recovery_hold(generation: Generation) -> RecoveryKeyHold {
     RecoveryKeyHold {
         authority: Uuid::from_u128(23),
+        authority_sha256: [27; 32],
         operation: Uuid::from_u128(24),
         generation,
         installation_sha256: [25; 32],

@@ -1,5 +1,6 @@
 use super::{
-    ActivationAuthority, Binding, Publication, RECOVERY_INTENT_PROTOCOL, State, VerifiedSuccessor,
+    ActivationAuthority, Binding, Publication, RECOVERY_INTENT_PROTOCOL, RECOVERY_KEY_CUSTODY_PROTOCOL,
+    State, VerifiedSuccessor,
     clock, conflict, journal_error, unavailable,
 };
 
@@ -44,6 +45,8 @@ pub(crate) struct SourceCut {
 pub(crate) struct Installation {
     pub(super) manifest_digest: [u8; 32],
     pub(super) source_cut: SourceCut,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) key_hold: Option<rtdb_crypt::RecoveryKeyHold>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -60,6 +63,8 @@ pub(super) struct Completed {
     loss_policy: LossPolicy,
     source_cut: SourceCut,
     final_source_lsn: Option<Lsn>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    key_hold: Option<rtdb_crypt::RecoveryKeyHold>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -102,6 +107,7 @@ impl State {
                 && (pending.final_source_lsn.is_none() || self.grants_closed)
                 && pending.installation.is_none_or(|installation| {
                     installation.source_cut.lsn != 0
+                        && (installation.key_hold.is_none() || self.version >= RECOVERY_KEY_CUSTODY_PROTOCOL)
                         && match pending.intent.loss_policy {
                             LossPolicy::Lossless => {
                                 pending.final_source_lsn == Some(Lsn(installation.source_cut.lsn))
@@ -113,6 +119,7 @@ impl State {
         let publication_valid = self.publication.is_some_and(|publication| {
             if let Some(completed) = publication.recovery {
                 completed.source_cut.lsn != 0
+                    && (completed.key_hold.is_none() || self.version >= RECOVERY_KEY_CUSTODY_PROTOCOL)
                     && publication.predecessor.revision.checked_add(1)
                         == Some(self.binding.revision)
                     && match completed.loss_policy {
@@ -159,6 +166,7 @@ impl State {
             installation: Installation {
                 manifest_digest: publication.manifest_digest,
                 source_cut: completed.source_cut,
+                key_hold: completed.key_hold,
             },
             final_source_lsn: completed.final_source_lsn,
         }))
@@ -214,7 +222,7 @@ impl ActivationAuthority {
                 } else if supersedes.is_some() {
                     return Err(conflict());
                 }
-                next.version = RECOVERY_INTENT_PROTOCOL;
+                next.version = state.version.max(RECOVERY_INTENT_PROTOCOL);
                 next.recovery = Some(Pending {
                     intent,
                     installation: None,
@@ -229,6 +237,44 @@ impl ActivationAuthority {
     pub(crate) async fn recovery_status(&self, name: &str, operation: Operation) -> Result<Status> {
         let (_, state) = self.read(self.stream_id(name)?).await?;
         self.recovery_status_at(name, &state.ok_or_else(unavailable)?, operation)
+    }
+
+    pub(super) async fn require_custody_release(
+        &self, name: &str, operation: Operation, cell: Option<Uuid>, candidate: Uuid,
+    ) -> Result<()> {
+        let derived = self.successor_incarnation_in_cell(
+            name, operation.predecessor, operation.operation_id, cell,
+        )?;
+        if derived != candidate { return Err(conflict()); }
+        let (_, state) = self.read(self.stream_id(name)?).await?;
+        let state = state.ok_or_else(unavailable)?;
+        if state.version < RECOVERY_INTENT_PROTOCOL {
+            return Err(conflict());
+        }
+        let selected_revision = operation.predecessor.revision.checked_add(1).ok_or_else(conflict)?;
+        if state.binding == operation.predecessor
+            && state.superseded_recoveries.contains(&operation.operation_id)
+        {
+            return Ok(());
+        }
+        if state.binding.revision > selected_revision {
+            return Ok(());
+        }
+        if state.binding.revision == selected_revision
+            && let Some(publication) = state.publication
+            && publication.predecessor == operation.predecessor
+            && (publication.operation != operation.operation_id
+                || (publication.recovery.is_some()
+                    && publication.destination_cell == cell
+                    && state.binding.incarnation == candidate))
+        {
+            return Ok(());
+        }
+        Err(Anomaly::new(
+            rtdb_types::AnomalyCategory::Conflict,
+            "rtdb/activation-custody-pending",
+            "The recovery authority has not settled this candidate",
+        ))
     }
 
     fn recovery_status_at(
@@ -278,6 +324,7 @@ impl ActivationAuthority {
         let installation = Installation {
             manifest_digest: installed.manifest_digest,
             source_cut: installed.source_cut,
+            key_hold: installed.key_hold,
         };
         if installation.source_cut.lsn == 0 {
             return Err(conflict());
@@ -293,6 +340,12 @@ impl ActivationAuthority {
             if installed.predecessor != operation.predecessor.incarnation
                 || installed.successor != self.candidate(name, intent)?
                 || installed.destination_cell != intent.destination_cell
+                || installed.key_hold.is_some_and(|hold| {
+                    hold.authority != self.identity
+                        || Some(hold.authority_sha256) != self.connection_sha256
+                        || hold.operation != operation.operation_id
+                        || hold.generation.database != installed.successor
+                })
                 || installed.activation_scope != Some(rtdb_db::ActivationScope::for_cell(
                     self.identity, name, intent.destination_cell,
                 )?)
@@ -316,6 +369,9 @@ impl ActivationAuthority {
             }
             pending.installation = Some(installation);
             let mut next = state.clone();
+            if installation.key_hold.is_some() {
+                next.version = state.version.max(RECOVERY_KEY_CUSTODY_PROTOCOL);
+            }
             next.recovery = Some(pending);
             Ok(Some(next))
         }).await?;
@@ -423,6 +479,7 @@ impl ActivationAuthority {
                 loss_policy: pending.intent.loss_policy,
                 source_cut: installation.source_cut,
                 final_source_lsn: pending.final_source_lsn,
+                key_hold: installation.key_hold,
             }),
         };
         clock::wait_out(
@@ -570,6 +627,7 @@ mod tests {
             successor: candidate,
             manifest_digest: [7; 32],
             destination_cell: None,
+            key_hold: None,
             activation_scope: Some(rtdb_db::ActivationScope::new(identity, "xtdb").unwrap()),
             source_cut: SourceCut {
                 lsn,

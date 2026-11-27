@@ -11,6 +11,7 @@ use std::{
 #[cfg(unix)]
 use ring::signature::Ed25519KeyPair;
 use ring::signature::{ED25519, UnparsedPublicKey};
+use rtdb_crypt::{Generation, RecoveryKeyHold};
 use rtdb_db::ActivationScope;
 use rtdb_types::{Anomaly, Result};
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,7 @@ use uuid::Uuid;
 use super::super::{Binding, VerifiedSuccessor, recovery::SourceCut, successor_incarnation};
 
 const VERSION: u8 = 1;
+const HELD_KEY_VERSION: u8 = 2;
 
 pub(super) type Attestors = BTreeMap<Uuid, [u8; 32]>;
 
@@ -60,6 +62,15 @@ struct Evidence {
     source_system_time: i64,
     source_lsn: u64,
     manifest_sha256: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    key: Option<KeyEvidence>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct KeyEvidence {
+    pub generation: u64,
+    pub authority_sha256: [u8; 32],
 }
 
 impl Evidence {
@@ -79,7 +90,27 @@ impl Evidence {
         bytes.extend_from_slice(&self.source_system_time.to_be_bytes());
         bytes.extend_from_slice(&self.source_lsn.to_be_bytes());
         bytes.extend_from_slice(&self.manifest_sha256);
+        match (self.version, self.key) {
+            (VERSION, None) => (),
+            (HELD_KEY_VERSION, Some(key)) if key.authority_sha256 != [0; 32] => {
+                bytes.extend_from_slice(&key.generation.to_be_bytes());
+                bytes.extend_from_slice(&key.authority_sha256);
+            }
+            _ => return Err(invalid()),
+        }
         Ok(bytes)
+    }
+
+    fn key_hold(&self) -> Result<Option<RecoveryKeyHold>> {
+        let Some(key) = self.key else { return Ok(None); };
+        let digest = ring::digest::digest(&ring::digest::SHA256, &self.message()?);
+        Ok(Some(RecoveryKeyHold {
+            authority: self.intent.authority_id,
+            authority_sha256: key.authority_sha256,
+            operation: self.intent.operation_id,
+            generation: Generation { database: self.candidate, number: key.generation },
+            installation_sha256: digest.as_ref().try_into().expect("SHA-256 width"),
+        }))
     }
 }
 
@@ -98,6 +129,17 @@ impl Attestation {
         installed: &rtdb_db::InstalledBackup,
         key: &Ed25519KeyPair,
     ) -> Result<Self> {
+        Self::sign_installation(intent, manifest_sha256, installed, None, key)
+    }
+
+    #[cfg(unix)]
+    pub(super) fn sign_installation(
+        intent: Intent,
+        manifest_sha256: [u8; 32],
+        installed: &rtdb_db::InstalledBackup,
+        key_custody: Option<KeyEvidence>,
+        signing_key: &Ed25519KeyPair,
+    ) -> Result<Self> {
         let candidate = intent.candidate()?;
         if intent.cell.is_none()
             || installed.activation_scope() != Some(intent.scope()?)
@@ -109,15 +151,16 @@ impl Attestation {
             return Err(invalid());
         }
         let evidence = Evidence {
-            version: VERSION,
+            version: if key_custody.is_some() { HELD_KEY_VERSION } else { VERSION },
             intent,
             candidate,
             source_position: installed.source_basis().position(),
             source_system_time: installed.source_system_time().0,
             source_lsn: installed.source_lsn().0,
             manifest_sha256,
+            key: key_custody,
         };
-        Self::signed(evidence, key)
+        Self::signed(evidence, signing_key)
     }
 
     #[cfg(unix)]
@@ -134,6 +177,15 @@ impl Attestation {
         serde_json::from_slice(&read_file(path, 4096, false)?).map_err(|_| invalid())
     }
 
+    #[cfg(unix)]
+    pub(super) fn held_key(&self) -> Result<(&Intent, RecoveryKeyHold)> {
+        if self.evidence.candidate != self.evidence.intent.candidate()? {
+            return Err(invalid());
+        }
+        let hold = self.evidence.key_hold()?.ok_or_else(invalid)?;
+        Ok((&self.evidence.intent, hold))
+    }
+
     pub(super) fn verify(
         &self,
         intent: &Intent,
@@ -143,8 +195,7 @@ impl Attestation {
         let evidence = &self.evidence;
         let cell = intent.cell.ok_or_else(invalid)?;
         let key = attestors.get(&cell).ok_or_else(invalid)?;
-        if evidence.version != VERSION
-            || &evidence.intent != intent
+        if &evidence.intent != intent
             || evidence.candidate != intent.candidate()?
             || evidence.manifest_sha256 != manifest_sha256
             || evidence.source_lsn == 0
@@ -160,6 +211,7 @@ impl Attestation {
             manifest_digest: evidence.manifest_sha256,
             activation_scope: Some(intent.scope()?),
             destination_cell: Some(cell),
+            key_hold: evidence.key_hold()?,
             source_cut: SourceCut {
                 lsn: evidence.source_lsn,
                 position: evidence.source_position,
@@ -233,6 +285,92 @@ mod tests {
         key.public_key().as_ref().try_into().unwrap()
     }
 
+    #[tokio::test]
+    async fn recovery_key_custody_releases_only_after_exact_authority_settlement() {
+        use crate::multi::activation::{
+            ActivationAuthority,
+            recovery::{Intent as RecoveryIntent, LossPolicy, Operation, Status},
+        };
+        use rtdb_crypt::{FileKms, Kms};
+        use std::{sync::{Arc, atomic::{AtomicU64, Ordering}}, time::Duration};
+
+        let directory = tempfile::tempdir().unwrap();
+        let authority_path = directory.path().join("authority");
+        let identity = Uuid::new_v4();
+        let fingerprint = [4; 32];
+        let open_authority = || {
+            let mut authority = ActivationAuthority::open_local(&authority_path, identity).unwrap();
+            let state = Arc::get_mut(&mut authority).unwrap();
+            let ticks = AtomicU64::new(0);
+            state.clock = Arc::new(move || Some(Duration::from_secs(ticks.fetch_add(6, Ordering::SeqCst))));
+            state.connection_sha256 = Some(fingerprint);
+            authority
+        };
+        let authority = open_authority();
+        let predecessor = authority.bootstrap("xtdb", Uuid::new_v4()).await.unwrap();
+        let cell = Uuid::new_v4();
+        let path = directory.path().join("vault");
+        FileKms::create_directory(&path).unwrap();
+        let kms = FileKms::open(&path, || 0).unwrap();
+        let signer = key(7);
+        let trusted = Attestors::from([(cell, public_key(&signer))]);
+        let make = |operation_id| {
+            let intent = Intent {
+                authority_id: identity, database: "xtdb".to_owned(), expected: predecessor,
+                operation_id, cell: Some(cell),
+            };
+            Attestation::signed(Evidence {
+                version: HELD_KEY_VERSION,
+                candidate: intent.candidate().unwrap(),
+                intent,
+                source_position: 11, source_system_time: 13, source_lsn: 17,
+                manifest_sha256: [5; 32],
+                key: Some(KeyEvidence { generation: 1, authority_sha256: fingerprint }),
+            }, &signer).unwrap()
+        };
+        let recovery = |operation_id| RecoveryIntent {
+            operation: Operation { predecessor, operation_id },
+            destination_cell: Some(cell),
+            loss_policy: LossPolicy::AcceptUnknownTail,
+        };
+        let first = recovery(Uuid::new_v4());
+        authority.begin_recovery("xtdb", first, None).await.unwrap();
+        let old_proof = make(first.operation.operation_id);
+        let (_, old_hold) = old_proof.held_key().unwrap();
+        kms.create(old_hold.generation).await.unwrap();
+        kms.retain_recovery_key(old_hold).await.unwrap();
+        assert!(super::super::release_recovery_key(&authority, "xtdb", &old_proof, &kms).await.is_err());
+        kms.require_recovery_key(old_hold).await.unwrap();
+
+        let selected = recovery(Uuid::new_v4());
+        authority.begin_recovery("xtdb", selected, Some(first.operation.operation_id)).await.unwrap();
+        assert_eq!(super::super::release_recovery_key(&authority, "xtdb", &old_proof, &kms).await.unwrap(), old_hold);
+        let proof = make(selected.operation.operation_id);
+        let (intent, hold) = proof.held_key().unwrap();
+        kms.create(hold.generation).await.unwrap();
+        kms.retain_recovery_key(hold).await.unwrap();
+        let installation = proof.verify(intent, [5; 32], &trusted).unwrap();
+        authority.record_recovery_installation("xtdb", selected.operation, installation).await.unwrap();
+        authority.freeze_recovery("xtdb", selected.operation).await.unwrap();
+        assert!(super::super::release_recovery_key(&authority, "xtdb", &proof, &kms).await.is_err());
+        assert!(kms.retire(hold.generation, 1).await.is_err());
+        authority.publish_recovery("xtdb", selected.operation).await.unwrap();
+        drop(authority);
+        drop(kms);
+
+        let authority = open_authority();
+        let kms = FileKms::open(&path, || 0).unwrap();
+        let published = authority.recovery_status("xtdb", selected.operation).await.unwrap();
+        assert!(matches!(published, Status::Published { installation, .. } if installation.key_hold == Some(hold)));
+        let mut substituted = proof.clone();
+        substituted.evidence.key.as_mut().unwrap().authority_sha256 = [22; 32];
+        assert!(super::super::release_recovery_key(&authority, "xtdb", &substituted, &kms).await.is_err());
+        kms.require_recovery_key(hold).await.unwrap();
+        assert_eq!(super::super::release_recovery_key(&authority, "xtdb", &proof, &kms).await.unwrap(), hold);
+        assert_eq!(super::super::release_recovery_key(&authority, "xtdb", &proof, &kms).await.unwrap(), hold);
+        kms.retire(hold.generation, 1).await.unwrap();
+    }
+
     #[test]
     fn exact_intent_archive_cut_and_destination_are_authenticated() {
         let intent = intent();
@@ -248,6 +386,7 @@ mod tests {
                 source_system_time: 364100,
                 source_lsn: 605,
                 manifest_sha256,
+                key: None,
             },
             &key,
         )

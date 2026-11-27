@@ -451,6 +451,9 @@ contract RecoveryGenerationCustody {
     @invariant RecoveryHoldReleaseIsTerminal
         -- Release retains the exact hold identity, including after generation retirement and destruction.
         -- A released hold cannot be reacquired.
+        -- A stopped-destination attestation with key custody follows a durable hold for the exact pending recovery.
+        -- The activation record retains the held generation and the issuing authority connection identity with the verified installation.
+        -- The provider releases the hold only after reading publication or supersession from that same activation authority.
 }
 
 contract Directory {

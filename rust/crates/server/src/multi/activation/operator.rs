@@ -34,6 +34,9 @@ pub const HELP: &str = "Usage: rtdb multi-activation status DATABASE AUTHORITY
        rtdb multi-activation attest xtdb --authority-id UUID --expected-incarnation UUID --expected-revision N --operation-id UUID
                  --data DIR --journal-url URL --tls-dir DIR --immutable-streams
                  --cell-id UUID --attestation-signing-key PKCS8 --manifest-sha256 HEX
+                 [--authority-url URL --authority-tls-dir DIR]
+       rtdb multi-activation release-recovery-key DATABASE --authority-id UUID --authority-url URL --authority-tls-dir DIR
+                 --installation-proof FILE --key-vault DIR
        rtdb multi-activation serve --authority-socket PATH --broker-config PATH
 
 AUTHORITY is --authority-socket PATH for a local operator broker, or
@@ -43,6 +46,8 @@ also requires --data DIR --journal-url URL --tls-dir DIR --immutable-streams.
 The broker owns its writer TLS. It can verify a signed installation proof from
 a registered destination or read its configured stopped development destination.
 Run attest on the stopped destination with its own protected signing key.
+Supplying activation reader credentials lets attest retain the destination generation
+for a pending durable recovery. Release it from the original vault after settlement.
 ";
 
 #[derive(Clone, Debug)]
@@ -195,6 +200,16 @@ enum Command {
         manifest_sha256: [u8; 32],
         signing_key: PathBuf,
         destination: Destination,
+        hold_authority: Option<(String, PathBuf)>,
+    },
+    #[cfg(unix)]
+    ReleaseRecoveryKey {
+        database: String,
+        identity: Uuid,
+        url: String,
+        tls: PathBuf,
+        proof: PathBuf,
+        vault: PathBuf,
     },
     #[cfg(unix)]
     ServeBroker { socket: PathBuf, config: PathBuf },
@@ -233,6 +248,11 @@ impl Options {
             let manifest_sha256 = manifest_digest(take(&mut fields, "--manifest-sha256")?)?;
             let signing_key = take(&mut fields, "--attestation-signing-key")?.into();
             let destination = destination(&mut fields)?;
+            let hold_authority = match (fields.remove("--authority-url"), fields.remove("--authority-tls-dir")) {
+                (Some(url), Some(tls)) => Some((url, tls.into())),
+                (None, None) => None,
+                _ => return Err(arguments_error()),
+            };
             if !fields.is_empty() {
                 return Err(arguments_error());
             }
@@ -241,7 +261,18 @@ impl Options {
                 manifest_sha256,
                 signing_key,
                 destination,
+                hold_authority,
             }));
+        }
+        #[cfg(unix)]
+        if operation == "release-recovery-key" {
+            let identity = id(take(&mut fields, "--authority-id")?)?;
+            let url = take(&mut fields, "--authority-url")?;
+            let tls = take(&mut fields, "--authority-tls-dir")?.into();
+            let proof = take(&mut fields, "--installation-proof")?.into();
+            let vault = take(&mut fields, "--key-vault")?.into();
+            if immutable_streams || !fields.is_empty() { return Err(arguments_error()); }
+            return Ok(Self(Command::ReleaseRecoveryKey { database, identity, url, tls, proof, vault }));
         }
 
         let action = match operation.as_str() {
@@ -418,12 +449,33 @@ impl Options {
                 manifest_sha256,
                 signing_key,
                 destination,
+                hold_authority,
             } => {
                 broker::validate_destination(&destination)?;
                 let key = attestation::signing_key(&signing_key)?;
-                let proof =
-                    attest_installation(&destination, intent, manifest_sha256, &key).await?;
+                let authority = if let Some((url, tls)) = hold_authority {
+                    super::require_independent_journals(&url, &destination.journal_url)?;
+                    Some(ActivationAuthority::connect(
+                        &url, crate::cli::journal_credentials(&tls)?, intent.authority_id, Access::ConsensusReader,
+                    ).await?)
+                } else { None };
+                let proof = attest_installation(
+                    &destination, intent, manifest_sha256, &key, authority.as_deref(),
+                ).await?;
                 Ok(json!(proof))
+            }
+            #[cfg(unix)]
+            Command::ReleaseRecoveryKey { database, identity, url, tls, proof, vault } => {
+                let proof = Attestation::read(&proof)?;
+                let authority = ActivationAuthority::connect(
+                    &url, crate::cli::journal_credentials(&tls)?, identity, Access::ConsensusReader,
+                ).await?;
+                let kms = rtdb_crypt::FileKms::open(&vault, || {
+                    use rtdb_node::Clock;
+                    rtdb_node::SystemClock.now().0
+                })?;
+                let hold = release_recovery_key(&authority, &database, &proof, &kms).await?;
+                Ok(json!({ "released": hold }))
             }
             #[cfg(unix)]
             Command::ServeBroker { socket, config } => {
@@ -507,6 +559,7 @@ impl Request {
                         &destination.read(&intent, apple_sync).await?,
                     )
                 };
+                if ready.key_hold.is_some() { return Err(super::conflict()); }
                 let published = authority
                     .publish(&database, expected, operation_id, ready)
                     .await?;
@@ -753,18 +806,65 @@ async fn attest_installation(
     intent: Intent,
     manifest_sha256: [u8; 32],
     key: &ring::signature::Ed25519KeyPair,
+    authority: Option<&ActivationAuthority>,
 ) -> Result<Attestation> {
+    use rtdb_crypt::Kms;
+
     let mut stopped = StoppedDatabase::open(destination, intent.candidate()?, intent.scope()?)?;
-    let result = stopped.database.installed_backup().await;
+    let result = async {
+        let installed = stopped.database.installed_backup().await?.ok_or_else(missing_installation)?;
+        let Some(authority) = authority else {
+            return Attestation::sign(intent, manifest_sha256, &installed, key);
+        };
+        let operation = recovery::Operation {
+            predecessor: intent.expected, operation_id: intent.operation_id,
+        };
+        let candidate = intent.candidate()?;
+        if !matches!(authority.recovery_status(&intent.database, operation).await?,
+            recovery::Status::Pending { intent: pending, candidate: selected, .. }
+                if candidate == selected && intent.cell == pending.destination_cell)
+        {
+            return Err(super::conflict());
+        }
+        let evidence = attestation::KeyEvidence {
+            generation: stopped.database.generation().ok_or_else(missing_installation)?,
+            authority_sha256: authority.connection_sha256.ok_or_else(super::configuration)?,
+        };
+        let proof = Attestation::sign_installation(intent, manifest_sha256, &installed, Some(evidence), key)?;
+        let (_, hold) = proof.held_key()?;
+        stopped.keys.retain_recovery_key(hold).await?;
+        Ok(proof)
+    }.await;
     stopped.io.close_and_wait().await;
-    let installed = result?.ok_or_else(missing_installation)?;
-    Attestation::sign(intent, manifest_sha256, &installed, key)
+    result
+}
+
+#[cfg(unix)]
+async fn release_recovery_key(
+    authority: &ActivationAuthority,
+    database: &str,
+    proof: &Attestation,
+    kms: &dyn rtdb_crypt::Kms,
+) -> Result<rtdb_crypt::RecoveryKeyHold> {
+    let (intent, hold) = proof.held_key()?;
+    if intent.database != database || authority.identity() != hold.authority
+        || authority.connection_sha256 != Some(hold.authority_sha256)
+    {
+        return Err(super::conflict());
+    }
+    let operation = recovery::Operation {
+        predecessor: intent.expected, operation_id: intent.operation_id,
+    };
+    authority.require_custody_release(database, operation, intent.cell, hold.generation.database).await?;
+    kms.release_recovery_key(hold).await?;
+    Ok(hold)
 }
 
 #[cfg(unix)]
 struct StoppedDatabase {
     _lock: std::fs::File,
     journal: std::sync::Arc<dyn journal_contract::Journal>,
+    keys: std::sync::Arc<rtdb_crypt::FileKms>,
     database: rtdb_db::MultiDatabase,
     io: std::sync::Arc<rtdb_storage::IoRegion>,
 }
@@ -832,12 +932,12 @@ impl StoppedDatabase {
             },
             journal.clone(),
             store,
-            keys,
+            keys.clone(),
             Arc::new(|| SystemClock.now()),
         )?
         .with_immutable_journal()
         .with_activation_scope(scope)?;
-        Ok(Self { _lock: lock, journal, database, io })
+        Ok(Self { _lock: lock, journal, keys, database, io })
     }
 }
 
@@ -955,6 +1055,7 @@ mod tests {
                     successor,
                     manifest_digest: [2; 32],
                     destination_cell: None,
+                    key_hold: None,
                     source_cut: recovery::SourceCut::default(),
                     activation_scope: Some(
                         rtdb_db::ActivationScope::new(authority.identity(), &database).unwrap(),

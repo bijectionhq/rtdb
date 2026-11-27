@@ -33,6 +33,7 @@ pub struct Generation {
 #[serde(deny_unknown_fields)]
 pub struct RecoveryKeyHold {
     pub authority: Uuid,
+    pub authority_sha256: [u8; 32],
     pub operation: Uuid,
     pub generation: Generation,
     pub installation_sha256: [u8; 32],
